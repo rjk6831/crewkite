@@ -19,6 +19,14 @@ I want one workspace that knows those limits, routes work by them, and keeps the
 - Records each task as durable facts and files, so a successor route continues from the work itself. A final summary from the stopped model is optional.
 - Works in scratch copies of your repository. Accepting a result creates one new local branch. Your checkout, remotes and deployments stay untouched.
 
+## Workspace preview
+
+Interface preview with fixture data; controller integration is in progress.
+
+![Dark workspace preview](docs/images/workspace-dark.png)
+
+![Light workspace preview](docs/images/workspace-light.png)
+
 ## How it fits together
 
 ```mermaid
