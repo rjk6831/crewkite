@@ -1,36 +1,13 @@
 import { relative } from 'node:path';
 import type { TestEvent } from 'node:test/reporters';
+import { type CheckEvent, CheckEventSchema } from '@crewkite/contracts';
 
-export type CheckEvent =
-  | { type: 'start'; version: 1 }
-  | {
-      type: 'test';
-      file: string;
-      name: string;
-      kind?: 'test' | 'suite';
-      passed: boolean;
-      skipped: boolean;
-      todo: boolean;
-    }
-  | {
-      type: 'summary';
-      file: string | null;
-      success: boolean;
-      counts: {
-        tests: number;
-        passed: number;
-        failed: number;
-        cancelled: number;
-        skipped: number;
-        todo: number;
-        suites: number;
-      };
-    }
-  | { type: 'output'; channel: 'stdout' | 'stderr'; text: string }
-  | { type: 'end' };
+function encode(event: CheckEvent): string {
+  return `${JSON.stringify(CheckEventSchema.parse(event))}\n`;
+}
 
 export default async function* report(source: AsyncIterable<TestEvent>) {
-  yield `${JSON.stringify({ type: 'start', version: 1 })}\n`;
+  yield encode({ type: 'start', version: 1 });
   for await (const event of source) {
     let row: CheckEvent | undefined;
     if (event.type === 'test:pass' || event.type === 'test:fail') {
@@ -50,7 +27,15 @@ export default async function* report(source: AsyncIterable<TestEvent>) {
         type: 'summary',
         file: event.data.file ? relative(process.cwd(), event.data.file) : null,
         success: event.data.success,
-        counts: { ...counts, failed: Number('failed' in counts ? counts.failed : undefined) },
+        counts: {
+          tests: counts.tests,
+          passed: counts.passed,
+          failed: Number('failed' in counts ? counts.failed : undefined),
+          cancelled: counts.cancelled,
+          skipped: counts.skipped,
+          todo: counts.todo,
+          suites: counts.suites,
+        },
       };
     } else if (event.type === 'test:stdout' || event.type === 'test:stderr') {
       row = {
@@ -59,7 +44,7 @@ export default async function* report(source: AsyncIterable<TestEvent>) {
         text: event.data.message,
       };
     }
-    if (row) yield `${JSON.stringify(row)}\n`;
+    if (row) yield encode(row);
   }
-  yield `${JSON.stringify({ type: 'end' })}\n`;
+  yield encode({ type: 'end' });
 }

@@ -7,6 +7,7 @@ import {
   ArtifactSchema,
   type Candidate,
   CandidateSchema,
+  CheckEventSchema,
   type CheckResult,
   CheckResultSchema,
   canonicalJson,
@@ -26,7 +27,6 @@ import {
   treeFromFiles,
 } from '../host/source.ts';
 import type { IdPrefix } from '../store/ids.ts';
-import type { CheckEvent } from './reporter.ts';
 
 type Manifest = { base: string; files: FileEntry[] };
 export type CheckPlan = {
@@ -122,7 +122,7 @@ function report(
   const rows = text
     .trimEnd()
     .split('\n')
-    .map((line) => JSON.parse(line) as CheckEvent);
+    .map((line) => CheckEventSchema.parse(JSON.parse(line)));
   const first = rows[0];
   if (
     !text.endsWith('\n') ||
@@ -133,8 +133,7 @@ function report(
     return { complete: false, tests: 0 };
   if (
     rows.filter((row) => row.type === 'start').length !== 1 ||
-    rows.filter((row) => row.type === 'end').length !== 1 ||
-    rows.some((row) => !['start', 'test', 'summary', 'output', 'end'].includes(row.type))
+    rows.filter((row) => row.type === 'end').length !== 1
   )
     return { complete: false, tests: 0 };
   const summaries = rows.filter((row) => row.type === 'summary' && row.file === null);
