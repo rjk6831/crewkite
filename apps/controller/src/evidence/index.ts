@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   type Artifact,
   ArtifactSchema,
@@ -13,6 +14,7 @@ import {
   ReadDataSchema,
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
+import { syntheticCheckDefinition } from '@crewkite/testkit/repository';
 import type { ArtifactFiles } from '../artifacts/index.ts';
 import {
   type FileContent,
@@ -24,6 +26,7 @@ import {
   treeFromFiles,
 } from '../host/source.ts';
 import type { IdPrefix } from '../store/ids.ts';
+import type { CheckEvent } from './reporter.ts';
 
 type Manifest = { base: string; files: FileEntry[] };
 export type CheckPlan = {
@@ -35,10 +38,13 @@ export type CheckPlan = {
   evaluator: string;
   criteria: string[];
   collection: FileEntry[];
+  required: { path: string; hash: string; tests: string[]; count: number };
+  reporterHash: string;
 };
 
 const MAX_BYTES = 64 * 1024 * 1024;
 const MAX_PREVIEW = 262144;
+const reporterPath = fileURLToPath(new URL('./reporter.ts', import.meta.url));
 const digest = (content: Buffer) => createHash('sha256').update(content).digest('hex');
 const entry = ({ path, mode, hash, bytes }: FileEntry): FileEntry => ({ path, mode, hash, bytes });
 
@@ -93,50 +99,66 @@ function evaluator(): string {
 }
 
 function definition(
-  plan: Pick<CheckPlan, 'argv' | 'collection' | 'criteria' | 'evaluator'>,
+  plan: Pick<
+    CheckPlan,
+    'argv' | 'collection' | 'criteria' | 'evaluator' | 'required' | 'reporterHash'
+  >,
 ): string {
   return hashCanonical({
     argv: plan.argv,
     collection: plan.collection,
     criteria: plan.criteria,
     evaluator: plan.evaluator,
+    required: plan.required,
+    reporterHash: plan.reporterHash,
   });
 }
 
-function report(output: Buffer): { complete: boolean; tests: number } {
+function report(
+  output: Buffer,
+  required: CheckPlan['required'],
+): { complete: boolean; tests: number } {
   const text = new TextDecoder('utf-8', { fatal: true }).decode(output);
-  const lines = text.trimEnd().split(/\r?\n/);
-  const names = ['tests', 'pass', 'fail', 'cancelled', 'skipped', 'todo'] as const;
-  const counts = Object.fromEntries(
-    names.map((name) => {
-      const matches = lines.filter((line) => new RegExp(`^# ${name} [0-9]+$`).test(line));
-      return [name, matches.length === 1 ? Number(matches[0].split(' ')[2]) : -1];
-    }),
-  ) as Record<(typeof names)[number], number>;
-  const plans = lines.filter((line) => /^1\.\.[0-9]+$/.test(line));
-  const results = lines.filter((line) => /^(?:not )?ok [0-9]+(?: |$)/.test(line));
-  const tail = lines.slice(lines.findIndex((line) => /^# tests [0-9]+$/.test(line)));
+  const rows = text
+    .trimEnd()
+    .split('\n')
+    .map((line) => JSON.parse(line) as CheckEvent);
+  const first = rows[0];
+  if (
+    !text.endsWith('\n') ||
+    first?.type !== 'start' ||
+    first.version !== 1 ||
+    rows.at(-1)?.type !== 'end'
+  )
+    return { complete: false, tests: 0 };
+  if (
+    rows.filter((row) => row.type === 'start').length !== 1 ||
+    rows.filter((row) => row.type === 'end').length !== 1 ||
+    rows.some((row) => !['start', 'test', 'summary', 'output', 'end'].includes(row.type))
+  )
+    return { complete: false, tests: 0 };
+  const summaries = rows.filter((row) => row.type === 'summary' && row.file === null);
+  const summary = summaries[0];
+  if (summaries.length !== 1 || summary.type !== 'summary') return { complete: false, tests: 0 };
+  const counts = summary.counts;
+  const tests = rows.filter((row) => row.type === 'test');
   const complete =
-    text.endsWith('\n') &&
-    lines[0] === 'TAP version 13' &&
-    plans.length === 1 &&
-    Number(plans[0].slice(3)) > 0 &&
-    results.length === Number(plans[0].slice(3)) &&
-    results.every((line, index) => line.startsWith(`ok ${index + 1} `)) &&
-    !lines.some((line) => /^\s*(?:not ok [0-9]+|Bail out!)/.test(line)) &&
-    counts.tests > 0 &&
-    counts.pass === counts.tests &&
-    names.every((name) => Number.isSafeInteger(counts[name])) &&
-    ['fail', 'cancelled', 'skipped', 'todo'].every(
-      (name) => counts[name as (typeof names)[number]] === 0,
+    summary.success === true &&
+    Number.isSafeInteger(counts.tests) &&
+    counts.tests >= required.count &&
+    counts.passed === counts.tests &&
+    ['failed', 'cancelled', 'skipped', 'todo'].every(
+      (name) => counts[name as keyof typeof counts] === 0,
     ) &&
-    tail.length === 8 &&
-    /^# suites [0-9]+$/.test(tail[1]) &&
-    ['tests', 'suites', 'pass', 'fail', 'cancelled', 'skipped', 'todo'].every((name, index) =>
-      new RegExp(`^# ${name} [0-9]+$`).test(tail[index]),
-    ) &&
-    /^# duration_ms [0-9.]+$/.test(tail[7]);
-  return { complete, tests: Math.max(0, counts.tests) };
+    tests.length === counts.tests + counts.suites &&
+    tests.every((test) => test.passed === true && test.skipped === false && test.todo === false) &&
+    required.tests.every(
+      (name) =>
+        tests.filter(
+          (test) => test.file === required.path && test.kind === 'test' && test.name === name,
+        ).length === 1,
+    );
+  return { complete, tests: counts.tests };
 }
 
 export class CandidateEvidence {
@@ -308,9 +330,17 @@ export class CandidateEvidence {
   }): CheckPlan {
     const { base, files } = this.read(input.candidate);
     verified(base, input.sourceFiles);
+    const originals = input.sourceFiles.filter((file) => isTest(file.path));
+    // shortcut: only the synthetic check definition is qualified. Upgrade: project definitions.
+    if (
+      originals.length !== 1 ||
+      originals[0].path !== syntheticCheckDefinition.path ||
+      originals[0].hash !== syntheticCheckDefinition.hash
+    )
+      throw new Error('The original check definition is unqualified in D0.');
     const byPath = new Map(files.map((file) => [file.path, file]));
     // A smaller or rewritten baseline could make an unchanged defect disappear from checks.
-    for (const original of input.sourceFiles.filter((file) => isTest(file.path))) {
+    for (const original of originals) {
       const current = byPath.get(original.path);
       if (!current || canonicalJson(entry(current)) !== canonicalJson(entry(original)))
         throw new Error('The original test collection or content changed.');
@@ -320,10 +350,22 @@ export class CandidateEvidence {
     const directory = mkdtempSync(join(this.home, 'check-'));
     materialize(directory, files);
     const fields = {
-      argv: ['--test', '--test-reporter=tap', '--', ...collection.map((file) => `./${file.path}`)],
+      argv: [
+        '--test',
+        `--test-reporter=${reporterPath}`,
+        '--',
+        ...collection.map((file) => `./${file.path}`),
+      ],
       collection,
       criteria: [...input.criteria],
       evaluator: evaluator(),
+      required: {
+        path: syntheticCheckDefinition.path,
+        hash: syntheticCheckDefinition.hash,
+        tests: [...syntheticCheckDefinition.requiredTests],
+        count: syntheticCheckDefinition.requiredTests.length,
+      },
+      reporterHash: digest(readFileSync(reporterPath)),
     };
     return {
       directory,
@@ -353,8 +395,10 @@ export class CandidateEvidence {
       // Exit zero cannot bless a test that rewrites the code it just evaluated.
       unchanged =
         this.hash(base, readFiles(plan.directory)) === candidate.hash &&
-        evaluator() === plan.evaluator;
-      ({ complete, tests } = report(input.output));
+        evaluator() === plan.evaluator &&
+        digest(readFileSync(reporterPath)) === plan.reporterHash;
+      // Node can pass a file that exits during import without running its original tests.
+      ({ complete, tests } = report(input.output, plan.required));
     } catch {
       // An unreadable copy or incomplete report cannot establish a passing check.
     }

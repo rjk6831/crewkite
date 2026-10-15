@@ -56,6 +56,14 @@ test('amounts reject negative fractional and unsafe integers', () => {
   }
 });
 `;
+export const syntheticCheckDefinition = Object.freeze({
+  path: 'net.test.mjs',
+  hash: createHash('sha256').update(checks).digest('hex'),
+  requiredTests: Object.freeze([
+    'discounts clamp at the subtotal',
+    'amounts reject negative fractional and unsafe integers',
+  ]),
+});
 const page = `<!doctype html>
 <html lang="en">
 <meta charset="utf-8">
