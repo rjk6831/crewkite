@@ -1,5 +1,10 @@
 # CrewKite
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="apps/desktop/src/renderer/assets/crewkite-wordmark-inverse.png">
+  <img src="apps/desktop/src/renderer/assets/crewkite-wordmark.png" alt="CrewKite" width="320" height="107">
+</picture>
+
 CrewKite is a desktop workspace and CLI for coding with local models and the official coding clients from OpenAI, Anthropic and Google in one place. It shows what each subscription reports about usage and reset windows, assigns work using those limits, and keeps every task recoverable so another provider can continue it when one stops mid-task.
 
 Status: early prototype. The first milestone runs the whole journey against scripted fake providers. No live provider route is qualified yet.
@@ -26,6 +31,17 @@ Interface preview with fixture data; controller integration is in progress.
 ![Dark workspace preview](docs/images/workspace-dark.png)
 
 ![Light workspace preview](docs/images/workspace-light.png)
+
+<details>
+<summary>Keyboard navigation</summary>
+
+Press `Cmd+K` to open the command palette. Saved tasks show their project and task ID suffix, with five tasks per page. Previous and Next keep the rest reachable.
+
+Review pending approval opens the existing approval card and focuses its review region. Read the exact target and consequence, then choose Approve once or Deny as a separate action. `Escape` closes the palette and dialogs. Arrow keys move between task and launch tabs.
+
+![Command palette with scripted tasks and a pending approval](docs/images/command-palette.png)
+
+</details>
 
 ## How it fits together
 

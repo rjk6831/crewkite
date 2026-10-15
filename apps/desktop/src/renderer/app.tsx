@@ -41,7 +41,9 @@ import {
   Wallet,
   X,
 } from 'lucide-react';
-import { type FormEvent, type ReactNode, useEffect, useRef, useState } from 'react';
+import { type FormEvent, type ReactNode, type RefObject, useEffect, useRef, useState } from 'react';
+import wordmark from './assets/crewkite-wordmark.png';
+import inverseWordmark from './assets/crewkite-wordmark-inverse.png';
 import {
   Dialog,
   Fact,
@@ -178,6 +180,9 @@ export function App() {
   const [create, setCreate] = useState(false);
   const [launch, setLaunch] = useState(false);
   const [palette, setPalette] = useState(false);
+  const [palettePage, setPalettePage] = useState(0);
+  const [approvalToReview, setApprovalToReview] = useState<string | null>(null);
+  const approvalCard = useRef<HTMLElement>(null);
   const [about, setAbout] = useState(false);
   const task = snapshot?.tasks.find(({ id }) => id === selected) ?? snapshot?.tasks[0];
   const run = snapshot?.runs.find(({ id }) => id === task?.runId);
@@ -185,6 +190,15 @@ export function App() {
     (value) => value.taskId === task?.id && value.status === 'pending',
   );
   const taskEvents = workspace.events.filter((event) => event.taskId === task?.id);
+  const taskCount = snapshot?.tasks.length ?? 0;
+  const taskPage = Math.min(palettePage, Math.max(0, Math.ceil(taskCount / 5) - 1));
+  const taskOffset = taskPage * 5;
+  useEffect(() => {
+    if (palette || !approvalToReview) return;
+    if (page === 'tasks' && tab === 'Activity' && approval?.approvalId === approvalToReview)
+      approvalCard.current?.focus();
+    setApprovalToReview(null);
+  }, [palette, page, tab, approval?.approvalId, approvalToReview]);
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem('crewkite-theme', theme);
@@ -219,13 +233,13 @@ export function App() {
           onClick={() => setAbout(true)}
           aria-label="About CrewKite"
         >
-          <span className="brand-mark">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M4 4 21 10 12 14 8 22 4 4Z" fill="currentColor" />
-              <path d="m4 4 8 10" stroke="var(--sidebar)" strokeWidth="1.5" />
-            </svg>
-          </span>
-          <span>CrewKite</span>
+          <img
+            className="brand-wordmark"
+            src={theme === 'light' ? wordmark : inverseWordmark}
+            alt="CrewKite"
+            width={1024}
+            height={341}
+          />
           <span className="prototype-tag">D0</span>
         </button>
         <button type="button" className="search-button" onClick={() => setPalette(true)}>
@@ -565,7 +579,12 @@ export function App() {
                     {tab === 'Activity' && (
                       <>
                         {approval && (
-                          <ApprovalCard approval={approval} task={task} workspace={workspace} />
+                          <ApprovalCard
+                            approval={approval}
+                            task={task}
+                            workspace={workspace}
+                            focusRef={approvalCard}
+                          />
                         )}
                         <ActivityView events={taskEvents} task={task} snapshot={snapshot} />
                       </>
@@ -660,6 +679,17 @@ export function App() {
                 },
               },
               {
+                label: 'Review pending approval',
+                icon: <ShieldCheck size={17} />,
+                disabled: !approval,
+                action: () => {
+                  if (!approval) return;
+                  setPage('tasks');
+                  setTab('Activity');
+                  setApprovalToReview(approval.approvalId);
+                },
+              },
+              {
                 label: 'Stop current run',
                 icon: <Square size={15} />,
                 action: stop,
@@ -685,6 +715,50 @@ export function App() {
                 <ArrowRight size={14} />
               </button>
             ))}
+            {taskCount > 0 && (
+              <>
+                <p className="muted small">
+                  Tasks {taskOffset + 1}-{Math.min(taskOffset + 5, taskCount)} of {taskCount}
+                </p>
+                {snapshot?.tasks.slice(taskOffset, taskOffset + 5).map((value) => (
+                  <button
+                    type="button"
+                    key={value.id}
+                    onClick={() => {
+                      setSelected(value.id);
+                      setPage('tasks');
+                      setTab('Activity');
+                      setPalette(false);
+                    }}
+                  >
+                    <FileCode size={17} />
+                    Open task: {value.title} ·{' '}
+                    {snapshot.projects.find(({ id }) => id === value.projectId)?.name ??
+                      value.projectId}{' '}
+                    · {value.id.slice(-6)}
+                    <ArrowRight size={14} />
+                  </button>
+                ))}
+                {taskCount > 5 && (
+                  <div className="button-row">
+                    <button
+                      type="button"
+                      disabled={taskPage === 0}
+                      onClick={() => setPalettePage(taskPage - 1)}
+                    >
+                      Previous tasks
+                    </button>
+                    <button
+                      type="button"
+                      disabled={taskOffset + 5 >= taskCount}
+                      onClick={() => setPalettePage(taskPage + 1)}
+                    >
+                      Next tasks
+                    </button>
+                  </div>
+                )}
+              </>
+            )}
           </div>
         </Dialog>
       )}
@@ -696,10 +770,12 @@ function ApprovalCard({
   approval,
   task,
   workspace,
+  focusRef,
 }: {
   approval: Approval;
   task: Task;
   workspace: Workspace;
+  focusRef?: RefObject<HTMLElement | null>;
 }) {
   function resolve(decision: 'approved' | 'denied') {
     const binding = {
@@ -720,7 +796,7 @@ function ApprovalCard({
       .catch(() => {});
   }
   return (
-    <section className="approval-card" aria-label="Pending approval">
+    <section className="approval-card" aria-label="Pending approval" ref={focusRef} tabIndex={-1}>
       <div className="approval-title">
         <span className="approval-symbol">
           <ShieldCheck size={18} />
@@ -1270,11 +1346,20 @@ function Checks({
                 <span className={`result-symbol ${value.passed ? 'passed' : 'failed'}`}>
                   {value.passed ? <Check size={14} /> : <X size={14} />}
                 </span>
-                <div>
-                  <strong>{value.evaluator}</strong>
-                  <code>
-                    Definition {short(value.definitionHash)} · {short(value.candidateHash)}
-                  </code>
+                <div className="evidence-copy">
+                  <strong>
+                    {value.review
+                      ? `Scripted ${titleCase(value.review.job.methodId.replaceAll('-', ' '))} · cycle ${value.review.job.cycle}`
+                      : value.evaluator.startsWith('node:')
+                        ? 'Node checks'
+                        : 'Recorded check'}
+                  </strong>
+                  <details>
+                    <summary>Evidence identity</summary>
+                    <code>Evaluator {value.evaluator}</code>
+                    <code>Definition {value.definitionHash}</code>
+                    <code>Candidate {value.candidateHash}</code>
+                  </details>
                 </div>
                 <StateChip state={value.passed ? 'ready' : 'failed'} />
               </div>
