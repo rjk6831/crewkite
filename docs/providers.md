@@ -13,6 +13,14 @@ I qualify exact routes: a specific client build, account type, model, effort set
 
 These are planned pilots. A fake family label does not establish a client's capabilities, authentication or billing behavior. The Local fixture loads no model.
 
+## OpenAI discovery preparation
+
+The controller has a fixture-tested parser for the [Codex app-server](https://learn.chatgpt.com/docs/app-server) metadata transcript, pinned to [0.159.0 protocol fields](https://github.com/openai/codex/tree/687a119f0fcaace47e1f1abcc77cec6c813fd6da/codex-rs/app-server-protocol/src/protocol). It covers initialization, account metadata without a forced token refresh, rate-limit metadata and one bounded model catalog page. Replies must match the outstanding request. Missing or non-ChatGPT account metadata stops discovery before limits or models are requested. Native email, account IDs, credential fields and raw diagnostics are excluded from the projected output. Model and effort IDs remain bounded, untrusted provider text.
+
+This module launches no process, performs no network or filesystem work and is not registered as a route. Completing its transcript establishes metadata only. It proves no authentication, billing, process completion or live-provider qualification.
+
+A live turn can include upstream retries and tool continuations. A turn cap does not establish an inference-request cap. [Included subscription usage can extend into available paid credits](https://learn.chatgpt.com/docs/pricing#credits-overview); an included-only hard limit remains unverified. Both limits block live dispatch.
+
 ## Qualification
 
 A route is qualified when dated evidence covers:
