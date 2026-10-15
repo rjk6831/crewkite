@@ -24,9 +24,13 @@ I skip tests for trivial getters, framework behavior, type-only code and markup 
 | Interface | One journey through desktop and CLI on the same task, keyboard path, hostile output stays inert | Playwright driving Electron, CLI in a subprocess | Under 2 minutes |
 | Package | Installed app finds its runtime, survives removal of the source tree | Manual or scheduled on macOS hardware | Per release |
 
-`pnpm verify` must stay under five minutes on a laptop. The current suite has 25 tests: five policy tests, two contract tests, seven allocation and continuity tests, four client and CLI tests, and seven controller tests. It also runs lint, types and the desktop build. The desktop journey and installed-package checks remain pending.
+`pnpm verify` must stay under five minutes on a laptop. The current suite has 26 tests: five policy tests, two contract tests, seven allocation and continuity tests, four client and CLI tests, seven controller tests, and one desktop journey. It also runs lint, types and the desktop build. CI runs the full suite natively on macOS 15 with Chromium sandboxing enabled. Linux desktop startup remains unqualified. Installed-package recovery remains a separate check.
 
 The controller tests cover mutation retries and changed-key rejection, stale revisions, intent-before-spawn recovery, retained descendants, candidate evidence identity and local publication. The full flow uses a manual check approval, reserve transfer, real Node checks and two scripted review jobs. It verifies a new branch over several source ancestors, an immutable patch, unchanged sentinels and index bytes, and an inert clean-filter canary. The same acceptance claim covers reserve and manual transfer. Manual transfer preserves a healthy primary pin, honors a pause during stop, retains its target across restart without dispatch, and rechecks that target on explicit resume. Pending-action cancellation and export approval preserve coherent task state.
+
+The desktop journey uses the real Electron main, sandboxed preload, renderer, socket and controller. It creates and prepares one task, approves the first gate, observes a reserve handoff, kills the controller during retained work, restarts the same home and resumes explicitly. A CLI review approval appears in the GUI's recorded evidence. Real Node checks and two scripted reviews precede acceptance into a new branch. Exported bytes match the artifact checksum, and the original checkout, index and sentinel modes remain unchanged. The path includes keyboard activation, theme changes and inert hostile output.
+
+Automated export selects a destination through the native dialog API in the test process. Native OS picker and save interaction need a manual check. Screenshots come from a separate connected capture script and make no assertion about visual correctness.
 
 The fixed synthetic check definition requires the original test file and its expected file-qualified completions. Added tests cannot substitute for those assertions. Skips, early import exits, incomplete reports and a changed evaluated copy fail the evidence boundary. Arbitrary repository checks are unqualified.
 
@@ -49,7 +53,7 @@ The repository also carries staged, unstaged, untracked, binary and executable s
 | Combined failure | Two passing slices that disagree on a field name fail the combined check |
 | Publication crash | The exact ref reconciles once. Conflicts are never overwritten |
 
-The challenge table is the acceptance plan. The current suite covers the named controller subset above. It does not claim disk-full recovery, a crash after ref creation, billing qualification or the desktop journey from the build alone.
+The challenge table is the acceptance plan. The current suite covers the named controller subset above. It does not claim disk-full recovery, a crash after ref creation, billing qualification or installed-package recovery. Native OS dialogs remain separate from automated dialog selection.
 
 ## What fakes can and cannot prove
 

@@ -7,6 +7,7 @@ import type {
   Task,
   Window as UsageWindow,
 } from '@crewkite/contracts';
+import { ProjectSchema } from '@crewkite/contracts';
 import { createDemoFixtures } from '@crewkite/testkit';
 import {
   Activity,
@@ -66,12 +67,73 @@ const roleNames: Role['role'][] = [
   'advisor',
   'overseer',
 ];
-const terminalStates = new Set(['draft', 'stopped', 'interrupted', 'ready', 'accepted', 'failed']);
 function duration(milliseconds: number) {
   const minutes = Math.max(0, Math.ceil(milliseconds / 60000));
   if (minutes >= 1440) return `${Math.round(minutes / 1440)} days`;
   if (minutes >= 60) return `${Math.round(minutes / 60)} hours`;
   return `${minutes} min`;
+}
+
+function RouteSwitch({
+  task,
+  run,
+  snapshot,
+  workspace,
+}: {
+  task: Task;
+  run: Run;
+  snapshot: Snapshot;
+  workspace: Workspace;
+}) {
+  const coder = run.roles.find((role) => role.role === 'coder');
+  const ids = coder ? [coder.routeId, ...coder.approvedFallbacks] : [];
+  const choices = snapshot.routes.filter((route) => ids.includes(route.id));
+  const [selected, setSelected] = useState('');
+  const target = selected || choices.find((route) => route.id !== run.decision.chosen)?.id || '';
+  if (choices.length < 2) return null;
+  return (
+    <form
+      className="route-switch"
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (!target || !ids.includes(target)) return;
+        void workspace
+          .command({
+            command: 'SwitchRoute',
+            expectedRevision: task.revision,
+            payload: { taskId: task.id, runId: run.id, routeId: target },
+          })
+          .catch(() => {});
+      }}
+    >
+      <label>
+        Saved coder route
+        <select value={target} onChange={(event) => setSelected(event.target.value)}>
+          {choices.map((route) => (
+            <option key={route.id} value={route.id}>
+              {familyName(route.family)} · {route.model}
+              {route.id === run.decision.chosen ? ' (current)' : ''}
+            </option>
+          ))}
+        </select>
+      </label>
+      <button
+        type="submit"
+        className="button secondary"
+        disabled={
+          !target ||
+          target === run.decision.chosen ||
+          workspace.pending ||
+          workspace.connection !== 'connected'
+        }
+      >
+        Switch route
+      </button>
+      <span className="muted small">
+        Stops the current writer and rechecks the saved pin and remaining limits.
+      </span>
+    </form>
+  );
 }
 
 function StateChip({ state }: { state: string }) {
@@ -147,7 +209,7 @@ export function App() {
         })
         .catch(() => {});
   }
-  const stopAllowed = task?.runId && (!terminalStates.has(task.state) || task.state === 'unknown');
+  const stopAllowed = task?.runId && !['draft', 'ready', 'accepted', 'failed'].includes(task.state);
   return (
     <div className="app-shell">
       <aside className="navigation" aria-label="Workspace navigation">
@@ -214,6 +276,17 @@ export function App() {
             )}
           </div>
         ))}
+        {workspace.canPickProject && (
+          <button
+            type="button"
+            className="add-task"
+            disabled={workspace.pending || connection !== 'connected'}
+            onClick={() => void workspace.pickProject().catch(() => {})}
+          >
+            <Folder size={14} />
+            Add project
+          </button>
+        )}
         <button
           type="button"
           className="add-task"
@@ -246,6 +319,17 @@ export function App() {
                   ? 'Controller connected'
                   : titleCase(connection)}
             </span>
+            {!preview && connection !== 'connected' && (
+              <button
+                type="button"
+                className="icon-button"
+                onClick={() => void workspace.reconnect()}
+                disabled={workspace.pending || connection === 'connecting'}
+                aria-label="Reconnect controller"
+              >
+                <RefreshCw size={15} />
+              </button>
+            )}
             <button
               type="button"
               className="icon-button"
@@ -293,6 +377,48 @@ export function App() {
             <span>Interface preview. No worker, checks or provider calls run here.</span>
           </div>
         )}
+        {workspace.retryAvailable && (
+          <div className="recovery-banner" role="status">
+            <AlertTriangle size={15} />
+            <span>
+              An action has an uncertain outcome. Retry its saved command before another change.
+            </span>
+            <button
+              type="button"
+              className="button secondary"
+              disabled={workspace.pending || connection !== 'connected'}
+              onClick={() => void workspace.retryCommand().catch(() => {})}
+            >
+              Retry exact command
+            </button>
+          </div>
+        )}
+        {workspace.historyGap && (
+          <div className="recovery-banner" role="status">
+            <Info size={15} />
+            <span>Some activity history is unavailable. This timeline is incomplete.</span>
+          </div>
+        )}
+        {workspace.exportNotice && (
+          <div className="recovery-banner" role="status">
+            <Download size={15} />
+            <span>
+              {workspace.exportNotice.outcome === 'saved'
+                ? 'Patch saved.'
+                : workspace.exportNotice.outcome === 'cancelled'
+                  ? 'Export available. Save cancelled.'
+                  : 'Export available. The file could not be saved.'}
+            </span>
+            <button
+              type="button"
+              className="icon-button"
+              aria-label="Dismiss export notice"
+              onClick={workspace.dismissExportNotice}
+            >
+              <X size={14} />
+            </button>
+          </div>
+        )}
         {error && (
           <div className="error-banner" role="alert">
             <AlertTriangle size={16} />
@@ -318,7 +444,7 @@ export function App() {
             <button
               type="button"
               className="button secondary"
-              onClick={() => void workspace.refresh().catch(() => {})}
+              onClick={() => void workspace.reconnect()}
             >
               <RefreshCw size={14} />
               Retry connection
@@ -337,8 +463,10 @@ export function App() {
                       <StateChip state={task.state} />
                       <span className="revision">Revision {task.revision}</span>
                     </div>
-                    <h1>{task.title}</h1>
-                    <p className="task-outcome">{task.outcome}</p>
+                    <section className="task-summary" aria-label="Task summary">
+                      <h1>{task.title}</h1>
+                      <p className="task-outcome">{task.outcome}</p>
+                    </section>
                     <div className="task-actions">
                       <div className="next-action">
                         <span className={`status-dot state-${task.state}`} />
@@ -389,6 +517,16 @@ export function App() {
                         </button>
                       </div>
                     </div>
+                    {run &&
+                      ['running', 'waiting', 'stopped', 'interrupted'].includes(task.state) && (
+                        <RouteSwitch
+                          key={run.id}
+                          task={task}
+                          run={run}
+                          snapshot={snapshot}
+                          workspace={workspace}
+                        />
+                      )}
                   </section>
                   <div
                     className="tab-bar"
@@ -835,6 +973,34 @@ function Roster({
   task?: Task;
   onConfigure: () => void;
 }) {
+  const activity = snapshot.attempts
+    .filter(
+      (attempt) =>
+        attempt.runId === run?.id && ['running', 'stopping', 'unknown'].includes(attempt.state),
+    )
+    .map((attempt) => {
+      const job = snapshot.reviewJobs?.find(
+        (value) =>
+          value.attemptId === attempt.id &&
+          value.runId === run?.id &&
+          value.taskId === task?.id &&
+          value.routeId === attempt.routeId,
+      );
+      const method = run?.policy.policy.methods?.find((value) => value.id === job?.methodId);
+      const role = job
+        ? method?.reviewerRole
+        : task &&
+            ['running', 'waiting', 'handing_off'].includes(task.state) &&
+            attempt.routeId === run?.decision.chosen
+          ? 'coder'
+          : undefined;
+      return { attempt, role };
+    });
+  const unclassified = activity.filter(({ role }) => !role);
+  const routeName = (id: string) => {
+    const route = snapshot.routes.find((value) => value.id === id);
+    return route ? `${familyName(route.family)} · ${route.model}` : id;
+  };
   return (
     <aside className="roster" aria-label="Team roster">
       <div className="roster-heading">
@@ -849,22 +1015,33 @@ function Roster({
         .filter((role) => run?.roles.some((assignment) => assignment.role === role))
         .map((role) => {
           const assignment = run?.roles.find((value) => value.role === role);
-          const route = snapshot.routes.find(({ id }) => id === assignment?.routeId);
-          const running = snapshot.attempts.some(
-            (value) =>
-              value.routeId === route?.id &&
-              value.runId === task?.runId &&
-              ['running', 'stopping'].includes(value.state),
-          );
+          const jobs = activity.filter((value) => value.role === role);
+          const routeId =
+            role === 'coder'
+              ? (run?.decision.chosen ?? assignment?.routeId)
+              : (jobs[0]?.attempt.routeId ?? assignment?.routeId);
+          const route = snapshot.routes.find(({ id }) => id === routeId);
+          const unknown =
+            jobs.some(({ attempt }) => attempt.state === 'unknown') ||
+            unclassified.some(
+              ({ attempt }) => attempt.routeId === routeId && attempt.state === 'unknown',
+            );
+          const running = jobs.some(({ attempt }) => attempt.state === 'running');
+          const stopping = jobs.some(({ attempt }) => attempt.state === 'stopping');
+          const status = unknown
+            ? 'Ownership unknown'
+            : stopping
+              ? 'Stopping'
+              : running
+                ? 'Running'
+                : 'Idle';
           return (
             <section className={`role-card ${assignment ? 'assigned' : ''}`} key={role}>
               <div className="role-card-title">
                 <span>{roleLabels[role]}</span>
                 {assignment?.pinned && <Pin size={12} />}
                 {assignment && (
-                  <span className={`role-status ${running ? 'running' : ''}`}>
-                    {running ? 'Running' : 'Idle'}
-                  </span>
+                  <span className={`role-status ${running ? 'running' : ''}`}>{status}</span>
                 )}
               </div>
               {route ? (
@@ -876,6 +1053,20 @@ function Roster({
                   </div>
                   <code className="role-model">{route.model}</code>
                   <dl>
+                    {role === 'coder' && assignment && (
+                      <>
+                        <div>
+                          <dt>Saved primary</dt>
+                          <dd>{routeName(assignment.routeId)}</dd>
+                        </div>
+                        <div>
+                          <dt>Saved fallbacks</dt>
+                          <dd>
+                            {assignment.approvedFallbacks.map(routeName).join(', ') || 'None'}
+                          </dd>
+                        </div>
+                      </>
+                    )}
                     <div>
                       <dt>Requested effort</dt>
                       <dd>{route.effort.requested}</dd>
@@ -887,7 +1078,8 @@ function Roster({
                     <div>
                       <dt>Slots in this run</dt>
                       <dd>
-                        {running ? 1 : 0} / {run?.policy.policy.limits.concurrency ?? 1}
+                        {unknown ? 'Unknown' : jobs.length} /{' '}
+                        {run?.policy.policy.limits.concurrency ?? 1}
                       </dd>
                     </div>
                   </dl>
@@ -898,6 +1090,12 @@ function Roster({
             </section>
           );
         })}
+      {unclassified.map(({ attempt }) => (
+        <p className="roster-note" key={attempt.id}>
+          {attempt.state === 'unknown' ? 'Route ownership unknown' : 'Unclassified route activity'}:{' '}
+          {routeName(attempt.routeId)}. {titleCase(attempt.state)}.
+        </p>
+      ))}
       {!run?.roles.length && (
         <p className="roster-empty">
           No roles assigned. Choose a team or build your own when configuring the run.
@@ -1240,7 +1438,7 @@ function Handoffs({ events, snapshot }: { events: Event[]; snapshot: Snapshot })
                 <GitBranch size={16} />
               </span>
               <ArrowRight size={16} />
-              <span>{targets.join(', ') || 'No successor approved'}</span>
+              <span>Allowed routes: {targets.join(', ') || 'None'}</span>
             </div>
             <div className="section-heading">
               <h2>Retained task packet</h2>
@@ -1608,6 +1806,25 @@ function CreateTask({
             ))}
           </select>
         </label>
+        {workspace.canPickProject && (
+          <button
+            type="button"
+            className="button secondary"
+            disabled={workspace.pending}
+            onClick={() =>
+              void workspace
+                .pickProject()
+                .then((result) => {
+                  const project = ProjectSchema.safeParse(result?.entity);
+                  if (project.success) setProjectId(project.data.id);
+                })
+                .catch(() => {})
+            }
+          >
+            <Folder size={14} />
+            Choose another project
+          </button>
+        )}
         <label>
           Task title
           <input

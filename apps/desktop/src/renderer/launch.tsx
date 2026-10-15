@@ -64,8 +64,6 @@ const principles = [
   'Stop on failed checks.',
   'Approve only a named local effect.',
 ];
-// shortcut: review execution awaits host qualification. Upgrade: enable after the scripted journey passes.
-const reviewExecutionReady = false;
 
 export function Launch({
   task,
@@ -147,6 +145,14 @@ export function Launch({
       });
   }
   const minimumAttempts = 2 + resolvedMethods.reduce((total, method) => total + method.cycles, 0);
+  const recoveryAttempts = minimumAttempts + 2;
+  const reviewExecutionReady =
+    !workspace.preview &&
+    workspace.connection === 'connected' &&
+    resolvedMethods.every((method) => {
+      const assigned = roles.find((role) => role.role === method.reviewerRole);
+      return qualified.some((route) => route.id === assigned?.routeId && route.fake);
+    });
   useEffect(() => {
     let active = true;
     void workspace
@@ -239,7 +245,7 @@ export function Launch({
       quality: name === 'Glide' ? 'quick' : name === 'Expedition' ? 'thorough' : 'standard',
       limits: {
         ...value.limits,
-        attempts: name === 'Expedition' ? 6 : name === 'Formation' ? 5 : value.limits.attempts,
+        attempts: name === 'Expedition' ? 7 : name === 'Formation' ? 6 : value.limits.attempts,
       },
     }));
   }
@@ -289,9 +295,22 @@ export function Launch({
       })),
     }));
   }
-  function resolvedEffects(): Policy['effects'] {
-    const base = policy.effects.filter(({ action }) => action !== 'run-review');
-    const expiry = base[0]?.expiresAt ?? fixtures.policy.effects[0].expiresAt;
+  function resolvedEffects(expiresAt?: string): Policy['effects'] {
+    const project = snapshot.projects.find((project) => project.id === task.projectId);
+    const base = policy.effects
+      .filter(({ action }) => action !== 'run-review')
+      .map((grant) => ({
+        ...grant,
+        taskId: task.id,
+        target:
+          grant.action === 'write-scratch'
+            ? (project?.name ?? grant.target)
+            : grant.action === 'export-patch'
+              ? task.id
+              : grant.target,
+        expiresAt: expiresAt ?? grant.expiresAt,
+      }));
+    const expiry = expiresAt ?? base[0]?.expiresAt ?? fixtures.policy.effects[0].expiresAt;
     return [
       ...base,
       ...resolvedMethods.flatMap((method) =>
@@ -309,10 +328,10 @@ export function Launch({
       ),
     ];
   }
-  function resolvedPolicy(): Policy {
+  function resolvedPolicy(expiresAt?: string): Policy {
     return PolicySchema.parse({
       ...policy,
-      effects: resolvedEffects(),
+      effects: resolvedEffects(expiresAt),
       methods: resolvedMethods,
       guidance,
     });
@@ -356,7 +375,11 @@ export function Launch({
       const result = await workspace.command({
         command: 'PrepareRun',
         expectedRevision: task.revision,
-        payload: { taskId: task.id, policy: resolvedPolicy(), roles },
+        payload: {
+          taskId: task.id,
+          policy: resolvedPolicy(new Date(Date.now() + 86_400_000).toISOString()),
+          roles,
+        },
       });
       const run = RunSchema.safeParse(result.entity);
       if (run.success) setPrepared(run.data);
@@ -436,6 +459,17 @@ export function Launch({
                 <span>Frozen for this run</span>
               </div>
               <EffectSummary policy={prepared.policy.policy} />
+              {prepared.policy.policy.effects.length > 0 && (
+                <p className="muted small">
+                  Earliest saved grant expiry:{' '}
+                  {new Date(
+                    Math.min(
+                      ...prepared.policy.policy.effects.map((grant) => Date.parse(grant.expiresAt)),
+                    ),
+                  ).toLocaleString()}
+                  . Expiry stays fixed after preparation.
+                </p>
+              )}
               <div className="resolved-limits">
                 <span>{prepared.policy.policy.limits.attempts} attempts maximum</span>
                 <span>{prepared.policy.policy.limits.minutes} min maximum</span>
@@ -1119,8 +1153,8 @@ export function Launch({
                 {resolvedMethods.length > 0 && !reviewExecutionReady && (
                   <p className="notice">
                     <Info size={14} />
-                    Method configuration is a draft until the scripted evaluation host is qualified.
-                    A run with selected methods cannot start yet.
+                    Selected methods require a connected controller and an assigned qualified fake
+                    review route. Preview does not execute reviews.
                   </p>
                 )}
               </>
@@ -1140,6 +1174,16 @@ export function Launch({
             {minimumAttempts - 2} scripted review cycle(s). A handoff needs another writer attempt.
           </p>
         )}
+        {!prepared &&
+          policy.limits.attempts >= minimumAttempts &&
+          policy.limits.attempts < recoveryAttempts && (
+            <p className="notice">
+              <Info size={14} />
+              The scripted handoff and restart walkthrough needs {recoveryAttempts} attempts,
+              including all selected review cycles. Raise the visible limit before preparing that
+              walkthrough.
+            </p>
+          )}
         {!prepared && missingReviewer && (
           <p className="notice">
             <Info size={14} />
