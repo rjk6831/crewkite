@@ -51,7 +51,7 @@ jobs:
         run: node --test scripts/policy.test.mjs
 
   verify:
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -69,7 +69,7 @@ jobs:
       - name: Install pinned desktop runtime
         run: pnpm desktop:install
       - name: Verify workspace and desktop journey
-        run: xvfb-run --auto-servernum pnpm verify
+        run: pnpm verify
         env:
           DEBUG: pw:browser
           PROVENANCE_PATTERN: ${{ vars.PROVENANCE_PATTERN }}
