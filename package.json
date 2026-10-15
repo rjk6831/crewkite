@@ -12,7 +12,7 @@
     "lint": "biome check .",
     "format": "biome check --write .",
     "types": "tsc --noEmit",
-    "test": "node --test scripts/policy.test.mjs packages/contracts/src/contracts.test.ts",
+    "test": "node scripts/test.mjs",
     "build": "pnpm --filter @crewkite/desktop build",
     "verify": "pnpm policy && pnpm lint && pnpm types && pnpm test && pnpm build",
     "crewkite": "node apps/cli/src/main.ts",

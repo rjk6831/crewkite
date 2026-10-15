@@ -9,7 +9,8 @@ export const MinorAmountSchema = RevisionSchema;
 export const CursorSchema = z.string().regex(/^(0|[1-9][0-9]{0,19})$/);
 export const HashSchema = z.string().regex(/^[a-f0-9]{64}$/);
 export const TimestampSchema = z.iso.datetime();
-const id = (prefix: string) => z.string().regex(new RegExp(`^${prefix}_[0-9A-HJKMNP-TV-Z]{26}$`));
+const id = (prefix: string) =>
+  z.string().regex(new RegExp(`^${prefix}_[0-7][0-9A-HJKMNP-TV-Z]{25}$`));
 export const ProjectIdSchema = id('prj');
 export const TaskIdSchema = id('tsk');
 export const RunIdSchema = id('run');
