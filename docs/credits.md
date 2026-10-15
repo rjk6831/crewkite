@@ -295,3 +295,5 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
 ## Distribution scope
 
 This file records the prose adaptation and renderer assets above. It is not a complete notice inventory for an installed application. A packaged build also needs the notices for its complete dependency closure, Electron and Chromium, and the separate Node runtime. I check the actual package before claiming that inventory is complete. See [ADR 0018](adr/0018-apache-2-license.md).
+
+The [local staging script](../scripts/package.mjs) copies complete component texts into the package's `notices/` directory and records their hashes in its manifest. This includes the emitted bundler runtime helper, Node's full component license and the Electron distribution's Chromium notice file. Staging those files does not qualify the installed recovery journey described in [distribution](distribution.md).
