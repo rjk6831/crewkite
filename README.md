@@ -92,6 +92,10 @@ The controller, CLI and desktop journey are still under construction. The curren
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md). Branch names, commit messages and documentation style are checked in CI.
 
+## Credits
+
+The review methods draw on Ponytail, ADHD and multi. The [credits and notices](docs/credits.md) record pinned sources, the adapted contribution ladder and licenses for bundled icons and fonts.
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).
