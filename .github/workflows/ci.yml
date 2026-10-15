@@ -71,7 +71,6 @@ jobs:
       - name: Verify workspace and desktop journey
         run: pnpm verify
         env:
-          DEBUG: pw:browser
           PROVENANCE_PATTERN: ${{ vars.PROVENANCE_PATTERN }}
 
   # Single required check. It fails unless every predecessor succeeded,
