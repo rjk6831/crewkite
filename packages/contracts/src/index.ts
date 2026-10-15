@@ -548,6 +548,7 @@ export const FakeWorkerInputSchema = z.discriminatedUnion('type', [
     scratchPath: text,
     scenario: z.enum(['complete', 'approval', 'approval-reserve', 'reserve', 'crash', 'stubborn']),
     outcome: text,
+    handoff: SealedHandoffPacketSchema.optional(),
   }),
   z.strictObject({
     type: z.literal('approval'),

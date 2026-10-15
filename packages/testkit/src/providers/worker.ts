@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { MessageChannel } from 'node:worker_threads';
 import { type FakeWorkerEvent, type FakeWorkerInput, MAX_FRAME_BYTES } from '@crewkite/contracts';
+import { hashCanonical, verifyHandoff } from '@crewkite/contracts/hash';
 import { writeChallengeSolution } from '../repository.ts';
 import { FakeWorkerEventSchema, FakeWorkerInputSchema } from './protocol.ts';
 
@@ -75,8 +76,40 @@ function runWorker() {
     if (finished) throw new Error('Worker already reached a terminal state.');
     if (input.type === 'start') {
       if (start) throw new Error('Worker accepts one start binding.');
+      if (input.generation > 0 && !input.handoff)
+        throw new Error('A successor requires sealed handoff context.');
+      if (input.handoff) {
+        const { packet } = input.handoff;
+        const candidate = packet.candidate;
+        const artifact = packet.artifacts.find(({ id }) => id === candidate?.artifactId);
+        // The controller owns admission and current bytes. This verifies the received context.
+        if (
+          !verifyHandoff(input.handoff) ||
+          packet.generation + 1 !== input.generation ||
+          packet.attemptId === input.attemptId ||
+          packet.outcome !== input.outcome ||
+          !candidate ||
+          candidate.taskId !== packet.taskId ||
+          artifact?.hash !== candidate.hash ||
+          hashCanonical(packet.policy.policy) !== packet.policy.hash ||
+          packet.policy.policy.effects.some((grant) => grant.taskId !== packet.taskId) ||
+          !packet.allowedRouteIds.includes(process.env.CREWKITE_FAKE_ROUTE_ID ?? '')
+        )
+          throw new Error('Successor handoff context is invalid.');
+      }
       start = input;
       emit({ type: 'ready', attemptId: start.attemptId, generation: start.generation });
+      if (start.handoff)
+        emit({
+          type: 'output',
+          channel: 'stdout',
+          text: JSON.stringify({
+            fixture: 'handoff-context',
+            checksum: start.handoff.checksum,
+            runId: start.handoff.packet.runId,
+            candidateId: start.handoff.packet.candidate?.id,
+          }),
+        });
       writeChallengeSolution(start.scratchPath);
       emit({
         type: 'output',
