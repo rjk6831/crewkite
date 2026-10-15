@@ -2379,3 +2379,29 @@ kbd {
   color: var(--text-dim);
   font-size: 10px;
 }
+
+.recovery-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  font-size: 12px;
+}
+.recovery-banner > span {
+  flex: 1;
+}
+.route-switch {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 16px;
+}
+.route-switch label {
+  min-width: 220px;
+}
+.route-switch .muted {
+  flex-basis: 100%;
+}

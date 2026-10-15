@@ -1,5 +1,8 @@
 import {
+  type CommandResult,
   CommandResultSchema,
+  type DesktopNotice,
+  DesktopNoticeSchema,
   type Event,
   EventSchema,
   type Snapshot,
@@ -25,7 +28,15 @@ export function useWorkspace() {
   const [events, setEvents] = useState<Event[]>([]);
   const [connection, setConnection] = useState('connecting');
   const [error, setError] = useState<string | null>(null);
+  const [transportError, setTransportError] = useState<string | null>(null);
   const [pending, setPending] = useState(0);
+  const [retryAvailable, setRetryAvailable] = useState(false);
+  const [historyGap, setHistoryGap] = useState<string | null>(null);
+  const [exportNotice, setExportNotice] = useState<Extract<
+    DesktopNotice,
+    { kind: 'export' }
+  > | null>(null);
+  const connectionState = useRef('connecting');
   const reading = useRef<Promise<Snapshot> | null>(null);
   const dirty = useRef(false);
   const refresh = useCallback((): Promise<Snapshot> => {
@@ -38,16 +49,26 @@ export function useWorkspace() {
       return reading.current;
     }
     const read = async () => {
-      let next: Snapshot;
-      do {
+      for (;;) {
         dirty.current = false;
-        next = SnapshotSchema.parse(await source.getSnapshot());
+        let next: Snapshot;
+        try {
+          next = SnapshotSchema.parse(await source.getSnapshot());
+        } catch (failure) {
+          // A connection notice can arrive while the initial offline read is still settling.
+          if (dirty.current && connectionState.current === 'connected') continue;
+          throw failure;
+        }
         setSnapshot((current) =>
           current === null || BigInt(next.cursor) >= BigInt(current.cursor) ? next : current,
         );
-        setConnection('connected');
-      } while (dirty.current);
-      return next;
+        setTransportError(null);
+        if (!source.onNotice && !source.onConnection) {
+          connectionState.current = 'connected';
+          setConnection('connected');
+        }
+        if (!dirty.current) return next;
+      }
     };
     reading.current = read().finally(() => {
       reading.current = null;
@@ -57,9 +78,12 @@ export function useWorkspace() {
   useEffect(() => {
     let active = true;
     void refresh().catch((failure: unknown) => {
-      if (active) {
-        setConnection('offline');
-        setError(
+      if (active && connectionState.current !== 'connected') {
+        if (!source?.onNotice && !source?.onConnection) {
+          connectionState.current = 'offline';
+          setConnection('offline');
+        }
+        setTransportError(
           failure instanceof Error ? failure.message : 'The controller could not be reached.',
         );
       }
@@ -80,17 +104,39 @@ export function useWorkspace() {
       });
       void refresh().catch((failure: unknown) => {
         if (active)
-          setError(failure instanceof Error ? failure.message : 'Workspace refresh failed.');
+          setTransportError(
+            failure instanceof Error ? failure.message : 'Workspace refresh failed.',
+          );
       });
     });
-    const disconnect = source?.onConnection?.((state) => {
+    const changedConnection = (state: string) => {
       if (!active) return;
+      connectionState.current = state;
       setConnection(state);
       if (state === 'connected') {
-        setError(null);
+        setTransportError(null);
         void refresh().catch((failure: unknown) => {
           if (active)
-            setError(failure instanceof Error ? failure.message : 'Workspace recovery failed.');
+            setTransportError(
+              failure instanceof Error ? failure.message : 'Workspace recovery failed.',
+            );
+        });
+      }
+    };
+    const disconnect = source?.onNotice ? undefined : source?.onConnection?.(changedConnection);
+    const stopNotices = source?.onNotice?.((value) => {
+      if (!active) return;
+      const parsed = DesktopNoticeSchema.safeParse(value);
+      if (!parsed.success) return;
+      const notice = parsed.data;
+      if (notice.kind === 'connection') changedConnection(notice.state);
+      else if (notice.kind === 'retry') setRetryAvailable(notice.available);
+      else if (notice.kind === 'export') setExportNotice(notice);
+      else {
+        setHistoryGap(notice.after);
+        void refresh().catch(() => {
+          if (active)
+            setTransportError('History is incomplete. Reconnect to refresh current task state.');
         });
       }
     });
@@ -98,15 +144,17 @@ export function useWorkspace() {
       active = false;
       unsubscribe?.();
       disconnect?.();
+      stopNotices?.();
     };
   }, [source, refresh]);
-  const command = useCallback(
-    async (input: DesktopCommand) => {
-      if (!source) throw new Error('The desktop bridge is unavailable.');
+  const perform = useCallback(
+    async <T extends CommandResult | null>(action: () => Promise<T>): Promise<T> => {
       setPending((value) => value + 1);
       setError(null);
       try {
-        const result = CommandResultSchema.parse(await source.command(input));
+        const value = await action();
+        const result = value === null ? null : CommandResultSchema.parse(value);
+        if (!result) return value;
         if (result.outcome !== 'applied' && result.outcome !== 'already-applied') {
           setError([result.reason ?? result.outcome, result.next].filter(Boolean).join(' '));
         }
@@ -124,7 +172,7 @@ export function useWorkspace() {
               .join(' '),
           );
         }
-        return result;
+        return value;
       } catch (failure) {
         setError(failure instanceof Error ? failure.message : 'The command failed.');
         throw failure;
@@ -132,18 +180,59 @@ export function useWorkspace() {
         setPending((value) => value - 1);
       }
     },
-    [source, refresh],
+    [refresh],
   );
+  const command = useCallback(
+    (input: DesktopCommand) =>
+      perform(async () => {
+        if (!source) throw new Error('The desktop bridge is unavailable.');
+        return source.command(input);
+      }),
+    [source, perform],
+  );
+  const pickProject = () =>
+    perform(async () => {
+      if (!source?.pickProject) throw new Error('Project selection is unavailable in this view.');
+      return source.pickProject();
+    });
+  const retryCommand = () =>
+    perform(async () => {
+      if (!source?.retryCommand)
+        throw new Error('Exact command retry is unavailable in this view.');
+      return source.retryCommand();
+    });
+  const reconnect = async () => {
+    setTransportError(null);
+    try {
+      if (source?.reconnect) await source.reconnect();
+      await refresh();
+    } catch (failure) {
+      setTransportError(
+        failure instanceof Error ? failure.message : 'The controller could not reconnect.',
+      );
+    }
+  };
   return {
     snapshot,
     events,
     connection,
     preview,
     pending: pending > 0,
-    error,
-    setError,
+    error: error ?? transportError,
+    setError: (value: string | null) => {
+      setError(value);
+      if (value === null) setTransportError(null);
+    },
     refresh,
     command,
+    pickProject,
+    canPickProject: !!source?.pickProject,
+    reconnect,
+    retryCommand,
+    retryAvailable,
+    historyGap,
+    exportNotice,
+    dismissExportNotice: () => setExportNotice(null),
   };
 }
 

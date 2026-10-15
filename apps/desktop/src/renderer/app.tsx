@@ -7,6 +7,7 @@ import type {
   Task,
   Window as UsageWindow,
 } from '@crewkite/contracts';
+import { ProjectSchema } from '@crewkite/contracts';
 import { createDemoFixtures } from '@crewkite/testkit';
 import {
   Activity,
@@ -66,12 +67,73 @@ const roleNames: Role['role'][] = [
   'advisor',
   'overseer',
 ];
-const terminalStates = new Set(['draft', 'stopped', 'interrupted', 'ready', 'accepted', 'failed']);
 function duration(milliseconds: number) {
   const minutes = Math.max(0, Math.ceil(milliseconds / 60000));
   if (minutes >= 1440) return `${Math.round(minutes / 1440)} days`;
   if (minutes >= 60) return `${Math.round(minutes / 60)} hours`;
   return `${minutes} min`;
+}
+
+function RouteSwitch({
+  task,
+  run,
+  snapshot,
+  workspace,
+}: {
+  task: Task;
+  run: Run;
+  snapshot: Snapshot;
+  workspace: Workspace;
+}) {
+  const coder = run.roles.find((role) => role.role === 'coder');
+  const ids = coder ? [coder.routeId, ...coder.approvedFallbacks] : [];
+  const choices = snapshot.routes.filter((route) => ids.includes(route.id));
+  const [selected, setSelected] = useState('');
+  const target = selected || choices.find((route) => route.id !== run.decision.chosen)?.id || '';
+  if (choices.length < 2) return null;
+  return (
+    <form
+      className="route-switch"
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (!target || !ids.includes(target)) return;
+        void workspace
+          .command({
+            command: 'SwitchRoute',
+            expectedRevision: task.revision,
+            payload: { taskId: task.id, runId: run.id, routeId: target },
+          })
+          .catch(() => {});
+      }}
+    >
+      <label>
+        Saved coder route
+        <select value={target} onChange={(event) => setSelected(event.target.value)}>
+          {choices.map((route) => (
+            <option key={route.id} value={route.id}>
+              {familyName(route.family)} · {route.model}
+              {route.id === run.decision.chosen ? ' (current)' : ''}
+            </option>
+          ))}
+        </select>
+      </label>
+      <button
+        type="submit"
+        className="button secondary"
+        disabled={
+          !target ||
+          target === run.decision.chosen ||
+          workspace.pending ||
+          workspace.connection !== 'connected'
+        }
+      >
+        Switch route
+      </button>
+      <span className="muted small">
+        Stops the current writer and rechecks the saved pin and remaining limits.
+      </span>
+    </form>
+  );
 }
 
 function StateChip({ state }: { state: string }) {
@@ -147,7 +209,7 @@ export function App() {
         })
         .catch(() => {});
   }
-  const stopAllowed = task?.runId && (!terminalStates.has(task.state) || task.state === 'unknown');
+  const stopAllowed = task?.runId && !['draft', 'ready', 'accepted', 'failed'].includes(task.state);
   return (
     <div className="app-shell">
       <aside className="navigation" aria-label="Workspace navigation">
@@ -214,6 +276,17 @@ export function App() {
             )}
           </div>
         ))}
+        {workspace.canPickProject && (
+          <button
+            type="button"
+            className="add-task"
+            disabled={workspace.pending || connection !== 'connected'}
+            onClick={() => void workspace.pickProject().catch(() => {})}
+          >
+            <Folder size={14} />
+            Add project
+          </button>
+        )}
         <button
           type="button"
           className="add-task"
@@ -246,6 +319,17 @@ export function App() {
                   ? 'Controller connected'
                   : titleCase(connection)}
             </span>
+            {!preview && connection !== 'connected' && (
+              <button
+                type="button"
+                className="icon-button"
+                onClick={() => void workspace.reconnect()}
+                disabled={workspace.pending || connection === 'connecting'}
+                aria-label="Reconnect controller"
+              >
+                <RefreshCw size={15} />
+              </button>
+            )}
             <button
               type="button"
               className="icon-button"
@@ -293,6 +377,48 @@ export function App() {
             <span>Interface preview. No worker, checks or provider calls run here.</span>
           </div>
         )}
+        {workspace.retryAvailable && (
+          <div className="recovery-banner" role="status">
+            <AlertTriangle size={15} />
+            <span>
+              An action has an uncertain outcome. Retry its saved command before another change.
+            </span>
+            <button
+              type="button"
+              className="button secondary"
+              disabled={workspace.pending || connection !== 'connected'}
+              onClick={() => void workspace.retryCommand().catch(() => {})}
+            >
+              Retry exact command
+            </button>
+          </div>
+        )}
+        {workspace.historyGap && (
+          <div className="recovery-banner" role="status">
+            <Info size={15} />
+            <span>Some activity history is unavailable. This timeline is incomplete.</span>
+          </div>
+        )}
+        {workspace.exportNotice && (
+          <div className="recovery-banner" role="status">
+            <Download size={15} />
+            <span>
+              {workspace.exportNotice.outcome === 'saved'
+                ? 'Patch saved.'
+                : workspace.exportNotice.outcome === 'cancelled'
+                  ? 'Export available. Save cancelled.'
+                  : 'Export available. The file could not be saved.'}
+            </span>
+            <button
+              type="button"
+              className="icon-button"
+              aria-label="Dismiss export notice"
+              onClick={workspace.dismissExportNotice}
+            >
+              <X size={14} />
+            </button>
+          </div>
+        )}
         {error && (
           <div className="error-banner" role="alert">
             <AlertTriangle size={16} />
@@ -318,7 +444,7 @@ export function App() {
             <button
               type="button"
               className="button secondary"
-              onClick={() => void workspace.refresh().catch(() => {})}
+              onClick={() => void workspace.reconnect()}
             >
               <RefreshCw size={14} />
               Retry connection
@@ -389,6 +515,16 @@ export function App() {
                         </button>
                       </div>
                     </div>
+                    {run &&
+                      ['running', 'waiting', 'stopped', 'interrupted'].includes(task.state) && (
+                        <RouteSwitch
+                          key={run.id}
+                          task={task}
+                          run={run}
+                          snapshot={snapshot}
+                          workspace={workspace}
+                        />
+                      )}
                   </section>
                   <div
                     className="tab-bar"
@@ -1608,6 +1744,25 @@ function CreateTask({
             ))}
           </select>
         </label>
+        {workspace.canPickProject && (
+          <button
+            type="button"
+            className="button secondary"
+            disabled={workspace.pending}
+            onClick={() =>
+              void workspace
+                .pickProject()
+                .then((result) => {
+                  const project = ProjectSchema.safeParse(result?.entity);
+                  if (project.success) setProjectId(project.data.id);
+                })
+                .catch(() => {})
+            }
+          >
+            <Folder size={14} />
+            Choose another project
+          </button>
+        )}
         <label>
           Task title
           <input
