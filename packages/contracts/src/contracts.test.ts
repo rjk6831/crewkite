@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { hashCanonical } from './hash.ts';
+import { hashCanonical, sealHandoff } from './hash.ts';
 import {
   CheckResultSchema,
   CommandResultSchema,
@@ -110,6 +110,65 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     methods: [{ id: 'keep-it-simple', cycles: 1, reviewerRole: 'reviewer' }],
   };
   assert.ok(PolicySchema.safeParse(policy).success);
+  const handoff = sealHandoff({
+    version: 1,
+    id: `hnd_${suffix}`,
+    taskId: job.taskId,
+    runId: job.runId,
+    attemptId: job.attemptId,
+    generation: 0,
+    outcome: 'Finish the bounded task.',
+    criteria: ['Preserve source.'],
+    decisions: [],
+    deniedActions: [],
+    source: {
+      projectId: `prj_${suffix}`,
+      base: 'd'.repeat(40),
+      branch: 'main',
+      dirtyCount: 0,
+      untrackedCount: 0,
+    },
+    candidate: {
+      id: job.candidateId,
+      taskId: job.taskId,
+      hash: job.candidateHash,
+      artifactId: `art_${suffix}`,
+      revision: 0,
+    },
+    artifacts: [
+      { id: `art_${suffix}`, hash: job.candidateHash, bytes: 1, mediaType: 'application/json' },
+    ],
+    unfinished: [],
+    unverified: [],
+    failedChecks: [],
+    unrunChecks: [],
+    scope: ['net.mjs'],
+    remainingBudgets: { attempts: 2, minutes: 20, concurrency: 1 },
+    unresolvedExposure: [],
+    policy: { policy: PolicySchema.parse(policy), hash: hashCanonical(policy) },
+    allowedRouteIds: [job.routeId],
+    createdAt: '2026-10-15T17:00:00.000Z',
+  });
+  const start = {
+    type: 'start',
+    attemptId: 'att_01ARZ3NDEKTSV4RRFFQ69G5FAW',
+    generation: 1,
+    scratchPath: '/fixture/scratch',
+    scenario: 'complete',
+    outcome: handoff.packet.outcome,
+  };
+  assert.ok(FakeWorkerInputSchema.safeParse({ ...start, generation: 0 }).success);
+  assert.ok(FakeWorkerInputSchema.safeParse({ ...start, handoff }).success);
+  for (const invalid of [
+    { ...handoff, checksum: 'invalid' },
+    { ...handoff, extra: true },
+    { ...handoff, packet: { ...handoff.packet, generation: -1 } },
+    {
+      ...handoff,
+      packet: { ...handoff.packet, source: { ...handoff.packet.source, extra: true } },
+    },
+  ])
+    assert.equal(FakeWorkerInputSchema.safeParse({ ...start, handoff: invalid }).success, false);
   assert.equal(
     PolicySchema.safeParse({ ...policy, methods: [...policy.methods, ...policy.methods] }).success,
     false,
