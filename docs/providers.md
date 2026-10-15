@@ -1,8 +1,8 @@
 # Provider routes
 
-CrewKite drives the official clients you already use and pay for. It supports exact routes: a specific client build, account type, model, effort setting and billing mode. A logo or a model name in a menu is not support.
+I qualify exact routes: a specific client build, account type, model, effort setting and billing mode. A logo or a model name in a menu is not support. The current D0 prototype runs scripted fakes for all four families. No live provider route is qualified.
 
-## Route families
+## Qualification targets
 
 | Family | First route to qualify | Facts still to establish |
 |--------|------------------------|--------------------------|
@@ -11,7 +11,7 @@ CrewKite drives the official clients you already use and pay for. It supports ex
 | Google | Gemini CLI in ACP mode with a Google account | Approval and cancel behavior, which billing path applies |
 | Local | An authenticated loopback runtime such as LM Studio | Locality, memory use, a useful role, cancellation |
 
-No route is qualified today. The D0 prototype uses scripted fakes for all four families.
+These are planned pilots. A fake family label does not establish a client's capabilities, authentication or billing behavior. The Local fixture loads no model.
 
 ## Qualification
 
@@ -37,4 +37,4 @@ Each fact is recorded as supported, unsupported or unknown. Discovery spends no 
 
 ## Local models
 
-Local inference is optional. Every feature works with no local route configured. When one is configured, it needs authenticated loopback access, narrow CORS and no remote redirect. The first profile on a 48 GB Apple Silicon machine runs one resident model and one generation at a time, and grows as measured memory, latency and quality allow.
+Local inference is planned and optional. A qualified local route needs authenticated loopback access, narrow CORS and no remote redirect. The first planned profile for a 48 GB Apple Silicon machine permits one resident model and one generation at a time. Memory use, latency and quality need measurement before that profile grows. D0 establishes none of those runtime measurements.
