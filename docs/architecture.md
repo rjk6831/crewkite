@@ -38,6 +38,8 @@ Results use a finite set of outcomes: `applied`, `already-applied`, `stale-revis
 
 Reads use snapshot plus subscription. `GetSnapshot` returns state at cursor C, and `Subscribe` replays ordered events after C. A gap in retained history forces a fresh snapshot. Slow clients are disconnected and resync; they never hold up work.
 
+The current D0 controller runs scripted routes. `SwitchRoute` and `ExportDiagnostics` return `unsupported`. Live provider qualification and the desktop journey remain separate gates. The table describes the first-release command contract.
+
 The command set for the first release:
 
 | Command | Contract |
@@ -105,6 +107,10 @@ Admission is one short SQLite transaction that runs before any provider I/O:
 
 The process spawns after the commit. If the controller restarts with an intent that has no acknowledgment, the attempt becomes `outcome-unknown`. Nothing replays it automatically, and nothing refunds reservations on a guess.
 
+Read requests validate their payloads and return current state without storing mutation receipts. Launch intents retain admission and observed completion times. The scheduler enforces the remaining wall-time budget while each process runs. Whole-minute charges round up. Missing or invalid timing keeps the full allowance charged.
+
+An acknowledged process group keeps that provenance across restarts while ownership is unknown. Once the recorded group is absent, recovery charges through the current recovery time as an upper bound and marks the task interrupted. Recovery never signals a recorded PID or starts a successor. An unacknowledged intent remains ambiguous.
+
 ## Execution and source safety
 
 Each writer works in an independent scratch copy of a selected committed base. The copy has no shared writable Git metadata, hooks or ambient configuration from the source repository.
@@ -113,11 +119,27 @@ Each writer works in an independent scratch copy of a selected committed base. T
 - Traversal, collisions, unsupported symlinks, submodules and unexpected file modes are rejected with a reason.
 - Stopping forwards the client's native interrupt and waits for evidence that every owned writer has exited. A child exit code or a quiet directory alone is not that evidence.
 
+Source inspection compares raw file bytes and executable modes with the index. Clean filters and line-ending conversions can make a transformed checkout appear changed. Inspection does not run those filters. Git reads disable hooks, filesystem monitors, replacement objects and lazy fetches. Missing committed objects block preparation.
+
+The current host uses Unix process groups and requires closed output streams before it releases ownership. Missing proof blocks checks and publication. Source copies reject links, devices and named pipes before reading them.
+
 ## Evidence and acceptance
 
 After quiescence, the controller imports the scratch changes, hashes them and stores an immutable candidate. Checks and reviews bind to the exact candidate hash, check definition and evaluator. Changing one byte, shrinking the collected test set or altering the evaluator invalidates the evidence that depended on it.
 
+D0 check qualification requires the fixed synthetic `netMinor` definition, its original test file hash and the expected file-qualified test completions. An import that exits before registering tests must fail that boundary. The current reporter has not completed this qualification gate. Other repositories can be registered and inspected; their checks are unqualified.
+
+Standard quality requires the scripted `second-opinion` and `keep-it-simple` jobs. Thorough adds `challenge-assumptions`. Explicit methods retain their bounded cycles. Quick still requires declared checks and labels missing independent review. These jobs inspect fixture patterns. They provide no model judgment or live provider qualification.
+
+A handoff carries its task's candidate bytes, changes and retained evidence by immutable identity. Writer generations advance on writer transfers. Check and review jobs consume the same run's attempt and minute budgets without advancing writer generation. Explicit coding recovery captures current retained bytes into a fresh packet and labels unverified work.
+
+A scratch grant allocates one workspace for one bounded run. Every successor still passes admission. Check and review dispatch freeze the candidate, evaluator and one-use authority. Stopping closes unresolved approvals. Resolving an export restores the task's prior state, including an already accepted publication.
+
+Publication writes an immutable prepared pack before recording its effect. Acceptance imports the exact commit and candidate tree and verifies the original parent. D0 publication supports SHA-1 repositories. Export returns an immutable patch artifact; native save is a client action.
+
 Accepting a candidate creates one new local branch in the source repository with create-if-absent semantics. Existing refs are never overwritten. After a crash, the controller reconciles the exact prepared ref before it reports `already-applied` or a conflict. Acceptance never merges, pushes or deploys.
+
+Snapshots and frames are bounded. Replay beyond 1,000 events requires a fresh snapshot. A check or review interrupted during execution cannot be resumed as a new coder. Its retained work remains inspectable and exportable; preparing a new bounded run is explicit.
 
 ## Desktop security
 

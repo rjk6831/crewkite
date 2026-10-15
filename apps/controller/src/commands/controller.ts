@@ -539,7 +539,7 @@ export class Controller {
         return {
           outcome: 'unsupported',
           reason: 'command-not-implemented',
-          next: 'This controller slice currently supports project and task metadata.',
+          next: 'This command has no qualified D0 implementation.',
         };
     }
   }
@@ -928,6 +928,10 @@ export class Controller {
         next: 'Resolve the current exact action first.',
       };
     }
+    const boundRequest = {
+      ...(request as Record<string, unknown>),
+      previousStatus: { state: task.state, waitingReason: task.waitingReason, next: task.next },
+    };
     const approval = ApprovalSchema.parse({
       approvalId: this.id('apr'),
       taskId: task.id,
@@ -955,8 +959,8 @@ export class Controller {
         task.id,
         attempt.id,
         updated.revision,
-        hashCanonical(request),
-        canonicalJson(request),
+        hashCanonical(boundRequest),
+        canonicalJson(boundRequest),
       );
     this.event('approval.requested', task.id, updated.revision, approval);
     return { outcome: 'applied', entity: updated, revision: updated.revision };
@@ -1266,6 +1270,13 @@ export class Controller {
         .run(this.now(), attempt.id);
       this.store.db.prepare('DELETE FROM writer_leases WHERE attempt_id=?').run(attempt.id);
       this.store.db.prepare('DELETE FROM reservations WHERE attempt_id=?').run(attempt.id);
+      this.closePendingEffects(
+        task,
+        !!runtime.failure ||
+          !runtime.terminal ||
+          runtime.terminal.outcome === 'failed' ||
+          runtime.reason === 'stop',
+      );
       this.event('attempt.stopped', task.id, task.revision, updated);
       const failed = runtime.failure || !runtime.terminal || runtime.terminal.outcome === 'failed';
       this.updateTask(task, {
@@ -1303,6 +1314,47 @@ export class Controller {
     }
   }
 
+  private closePendingEffects(
+    task: Task,
+    includeApproved = true,
+  ): Pick<Task, 'state' | 'waitingReason' | 'next'> | undefined {
+    let restore: Pick<Task, 'state' | 'waitingReason' | 'next'> | undefined;
+    for (const row of this.store.db
+      .prepare(
+        "SELECT approval_id,attempt_id,request FROM pending_effects WHERE task_id=? AND (state='pending' OR (?=1 AND state='approved'))",
+      )
+      .all(task.id, includeApproved ? 1 : 0)) {
+      const request = JSON.parse(row.request as string) as {
+        kind: string;
+        previousStatus?: Pick<Task, 'state' | 'waitingReason' | 'next'>;
+      };
+      if ((request.kind === 'accept' || request.kind === 'export') && request.previousStatus)
+        restore = request.previousStatus;
+      this.store.db
+        .prepare("UPDATE pending_effects SET state='denied' WHERE approval_id=?")
+        .run(row.approval_id as string);
+      const approval = this.store.get<Approval>('approval', row.approval_id as string);
+      if (approval) {
+        const closed = {
+          ...approval,
+          status: 'denied' as const,
+          revision: approval.revision + 1,
+          consequence: 'This unused action was closed when the run stopped.',
+        };
+        this.store.put('approval', closed.approvalId, closed.revision, closed);
+        this.event('approval.resolved', task.id, task.revision, closed);
+      }
+      const attempt = this.store.get<Attempt>('attempt', row.attempt_id as string);
+      if (attempt && !this.store.intents().some((intent) => intent.attempt_id === attempt.id))
+        this.store.put('attempt', attempt.id, attempt.revision + 1, {
+          ...attempt,
+          state: 'stopped',
+          revision: attempt.revision + 1,
+        });
+    }
+    return restore;
+  }
+
   private stop(
     command: Extract<Command, { command: 'StopRun' }>,
     effects: (() => void)[],
@@ -1310,18 +1362,21 @@ export class Controller {
     const task = this.store.get<Task>('task', command.payload.taskId);
     if (!task || task.runId !== command.payload.runId)
       return { outcome: 'blocked', reason: 'run-not-current' };
+    const restore = this.closePendingEffects(task);
     const active = this.store
       .intents()
       .find((intent) => intent.task_id === task.id && intent.state !== 'stopped');
-    if (!active)
-      return {
-        outcome: 'applied',
-        entity: this.updateTask(task, {
-          state: 'stopped',
+    if (!active) {
+      const updated = this.updateTask(
+        task,
+        restore ?? {
+          state: task.state === 'accepted' ? 'accepted' : 'stopped',
           waitingReason: null,
-          next: 'Work is stopped.',
-        }),
-      };
+          next: task.state === 'accepted' ? task.next : 'Work is stopped.',
+        },
+      );
+      return { outcome: 'applied', entity: updated, revision: updated.revision };
+    }
     const check = this.jobs.get(active.attempt_id);
     const review = this.reviewWorkers.get(active.attempt_id);
     if (check || review) {
@@ -1468,6 +1523,7 @@ export class Controller {
       job?: ReviewJob;
       identity?: GitIdentity;
       at?: string;
+      previousStatus?: Pick<Task, 'state' | 'waitingReason' | 'next'>;
     };
     if (hashCanonical(request) !== pending.effect_hash)
       return { outcome: 'denied', reason: 'pending-effect-changed' };
@@ -1525,9 +1581,9 @@ export class Controller {
       return {
         outcome: 'applied',
         entity: this.updateTask(task, {
-          state: 'stopped',
-          waitingReason: null,
-          next: 'The action was denied.',
+          ...((request.kind === 'accept' || request.kind === 'export') && request.previousStatus
+            ? request.previousStatus
+            : { state: 'stopped', waitingReason: null, next: 'The action was denied.' }),
         }),
       };
     if (
@@ -1544,6 +1600,17 @@ export class Controller {
       this.store.db
         .prepare('UPDATE pending_effects SET state=? WHERE approval_id=?')
         .run(result.outcome === 'applied' ? 'applied' : 'stale', approval.approvalId);
+      if (result.outcome !== 'applied') {
+        const current = this.store.get<Task>('task', task.id) as Task;
+        const stopped = this.updateTask(current, {
+          state: 'stopped',
+          waitingReason: null,
+          next:
+            result.next ??
+            'The approved action could not be admitted. Prepare or request a new bounded action.',
+        });
+        return { ...result, entity: stopped, revision: stopped.revision };
+      }
       return result;
     }
     if (
@@ -1559,11 +1626,29 @@ export class Controller {
         request.identity,
         request.at,
       );
-    if (request.kind === 'export' && request.command?.command === 'ExportPatch')
-      return this.exportPatch(
+    if (request.kind === 'export' && request.command?.command === 'ExportPatch') {
+      const result = this.exportPatch(
         { ...request.command, key: command.key, expectedRevision: task.revision },
         approval.approvalId,
       );
+      if (result.outcome === 'applied')
+        this.updateTask(
+          this.store.get<Task>('task', task.id) as Task,
+          request.previousStatus ?? {
+            state: 'stopped',
+            waitingReason: null,
+            next: 'The patch is available as an immutable artifact.',
+          },
+        );
+      else
+        this.updateTask(this.store.get<Task>('task', task.id) as Task, {
+          state: 'stopped',
+          waitingReason: null,
+          next:
+            result.next ?? 'The approved export could not complete. Inspect the retained artifact.',
+        });
+      return result;
+    }
     if (
       (request.kind === 'check' || request.kind === 'review') &&
       request.writerAttemptId &&
@@ -2882,11 +2967,15 @@ export class Controller {
         if (resultKey)
           this.store.db.prepare('UPDATE receipts SET result=? WHERE command_key=?').run(
             canonicalJson(
-              CommandResultSchema.parse({
-                outcome: 'applied',
-                entity: updated,
-                revision: updated.revision,
-              }),
+              CommandResultSchema.parse(
+                belongs
+                  ? { outcome: 'applied', entity: updated, revision: updated.revision }
+                  : {
+                      outcome: 'applied',
+                      entity: candidate,
+                      next: 'The prior publication was verified. The current run keeps its state.',
+                    },
+              ),
             ),
             resultKey,
           );

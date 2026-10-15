@@ -9,7 +9,7 @@ import {
 } from '@crewkite/contracts';
 
 export function groupAbsent(group: number | null): boolean {
-  if (group === null) return false;
+  if (group === null || !Number.isSafeInteger(group) || group <= 0) return false;
   try {
     process.kill(-group, 0);
     return false;
@@ -191,7 +191,13 @@ export class OwnedCommand {
     this.child.stdin.end();
   }
   stop() {
-    if (this.child.exitCode !== null || this.child.signalCode !== null) return;
+    if (
+      !Number.isSafeInteger(this.group) ||
+      this.group <= 0 ||
+      this.child.exitCode !== null ||
+      this.child.signalCode !== null
+    )
+      return;
     try {
       process.kill(-this.group, 'SIGTERM');
     } catch {

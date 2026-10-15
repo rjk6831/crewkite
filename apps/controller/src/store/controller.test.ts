@@ -438,8 +438,49 @@ test('acceptance creates one checked branch and preserves the original source', 
       approvedFallbacks: [],
     },
   ];
+  const ungranted = {
+    ...policy,
+    effects: policy.effects.filter((grant) => grant.action !== 'write-scratch'),
+  };
+  const planned = await controller.execute(
+    command('PrepareRun', { taskId: task.id, policy: ungranted, roles }, 0),
+    'local-owner',
+  );
+  const plannedRun = RunSchema.parse(planned.entity);
+  const waiting = await controller.execute(
+    command('StartRun', { taskId: task.id, runId: plannedRun.id }, planned.revision),
+    'local-owner',
+  );
+  const cancelled = controller
+    .snapshot()
+    .approvals.find((value) => value.status === 'pending') as Approval;
+  const stopped = await controller.execute(
+    command('StopRun', { taskId: task.id, runId: plannedRun.id }, waiting.revision),
+    'local-owner',
+  );
+  assert.equal(
+    controller.snapshot().approvals.filter((value) => value.status === 'pending').length,
+    0,
+  );
+  assert.equal(
+    (
+      await controller.execute(
+        command(
+          'ResolveApproval',
+          { binding: binding(cancelled), decision: 'approved' },
+          stopped.revision,
+        ),
+        'local-owner',
+      )
+    ).reason,
+    'approval-not-pending',
+  );
   const prepared = await controller.execute(
-    command('PrepareRun', { taskId: task.id, policy, roles }, 0),
+    command(
+      'PrepareRun',
+      { taskId: task.id, policy, roles },
+      controller.snapshot().tasks[0].revision,
+    ),
     'local-owner',
   );
   const run = RunSchema.parse(prepared.entity);
@@ -483,7 +524,7 @@ test('acceptance creates one checked branch and preserves the original source', 
     'ready',
     snapshot.tasks[0].next ?? 'Task did not become ready.',
   );
-  assert.equal(snapshot.attempts.length, 5);
+  assert.equal(snapshot.attempts.filter((attempt) => attempt.runId === run.id).length, 5);
   assert.equal(snapshot.evidence.filter((check) => check.review).length, 2);
   assert.ok(snapshot.evidence.every((check) => check.passed));
   const handoffs = controller.store
@@ -572,6 +613,46 @@ test('acceptance creates one checked branch and preserves the original source', 
   assert.equal(chunk.data?.kind, 'artifact');
   if (chunk.data?.kind === 'artifact')
     assert.match(Buffer.from(chunk.data.content, 'base64').toString(), /netMinor/);
+  for (const resolution of ['denied', 'stop', 'approved'] as const) {
+    const askedExport = await controller.execute(
+      command(
+        'ExportPatch',
+        { taskId: task.id, candidateId: candidate.id },
+        controller.snapshot().tasks[0].revision,
+      ),
+      'local-owner',
+    );
+    const exportApproval = controller
+      .snapshot()
+      .approvals.find(
+        (value) => value.action === 'export-patch' && value.status === 'pending',
+      ) as Approval;
+    assert.ok(exportApproval);
+    assert.equal(controller.snapshot().tasks[0].waitingReason, 'approval');
+    if (resolution === 'stop')
+      await controller.execute(
+        command('StopRun', { taskId: task.id, runId: run.id }, askedExport.revision),
+        'local-owner',
+      );
+    else {
+      const result = await controller.execute(
+        command(
+          'ResolveApproval',
+          { binding: binding(exportApproval), decision: resolution },
+          askedExport.revision,
+        ),
+        'local-owner',
+      );
+      assert.equal(result.outcome, 'applied');
+      if (resolution === 'approved') ArtifactSchema.parse(result.entity);
+    }
+    assert.equal(controller.snapshot().tasks[0].state, 'accepted');
+    assert.equal(controller.snapshot().tasks[0].waitingReason, null);
+    assert.equal(
+      controller.snapshot().approvals.filter((value) => value.status === 'pending').length,
+      0,
+    );
+  }
   assert.deepEqual(readFileSync(join(source.directory, '.git', 'index')), index);
   for (const sentinel of sentinels) {
     assert.deepEqual(readFileSync(join(source.directory, sentinel.path)), sentinel.bytes);
