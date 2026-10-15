@@ -971,6 +971,34 @@ function Roster({
   task?: Task;
   onConfigure: () => void;
 }) {
+  const activity = snapshot.attempts
+    .filter(
+      (attempt) =>
+        attempt.runId === run?.id && ['running', 'stopping', 'unknown'].includes(attempt.state),
+    )
+    .map((attempt) => {
+      const job = snapshot.reviewJobs?.find(
+        (value) =>
+          value.attemptId === attempt.id &&
+          value.runId === run?.id &&
+          value.taskId === task?.id &&
+          value.routeId === attempt.routeId,
+      );
+      const method = run?.policy.policy.methods?.find((value) => value.id === job?.methodId);
+      const role = job
+        ? method?.reviewerRole
+        : task &&
+            ['running', 'waiting', 'handing_off'].includes(task.state) &&
+            attempt.routeId === run?.decision.chosen
+          ? 'coder'
+          : undefined;
+      return { attempt, role };
+    });
+  const unclassified = activity.filter(({ role }) => !role);
+  const routeName = (id: string) => {
+    const route = snapshot.routes.find((value) => value.id === id);
+    return route ? `${familyName(route.family)} · ${route.model}` : id;
+  };
   return (
     <aside className="roster" aria-label="Team roster">
       <div className="roster-heading">
@@ -985,22 +1013,33 @@ function Roster({
         .filter((role) => run?.roles.some((assignment) => assignment.role === role))
         .map((role) => {
           const assignment = run?.roles.find((value) => value.role === role);
-          const route = snapshot.routes.find(({ id }) => id === assignment?.routeId);
-          const running = snapshot.attempts.some(
-            (value) =>
-              value.routeId === route?.id &&
-              value.runId === task?.runId &&
-              ['running', 'stopping'].includes(value.state),
-          );
+          const jobs = activity.filter((value) => value.role === role);
+          const routeId =
+            role === 'coder'
+              ? (run?.decision.chosen ?? assignment?.routeId)
+              : (jobs[0]?.attempt.routeId ?? assignment?.routeId);
+          const route = snapshot.routes.find(({ id }) => id === routeId);
+          const unknown =
+            jobs.some(({ attempt }) => attempt.state === 'unknown') ||
+            unclassified.some(
+              ({ attempt }) => attempt.routeId === routeId && attempt.state === 'unknown',
+            );
+          const running = jobs.some(({ attempt }) => attempt.state === 'running');
+          const stopping = jobs.some(({ attempt }) => attempt.state === 'stopping');
+          const status = unknown
+            ? 'Ownership unknown'
+            : stopping
+              ? 'Stopping'
+              : running
+                ? 'Running'
+                : 'Idle';
           return (
             <section className={`role-card ${assignment ? 'assigned' : ''}`} key={role}>
               <div className="role-card-title">
                 <span>{roleLabels[role]}</span>
                 {assignment?.pinned && <Pin size={12} />}
                 {assignment && (
-                  <span className={`role-status ${running ? 'running' : ''}`}>
-                    {running ? 'Running' : 'Idle'}
-                  </span>
+                  <span className={`role-status ${running ? 'running' : ''}`}>{status}</span>
                 )}
               </div>
               {route ? (
@@ -1012,6 +1051,20 @@ function Roster({
                   </div>
                   <code className="role-model">{route.model}</code>
                   <dl>
+                    {role === 'coder' && assignment && (
+                      <>
+                        <div>
+                          <dt>Saved primary</dt>
+                          <dd>{routeName(assignment.routeId)}</dd>
+                        </div>
+                        <div>
+                          <dt>Saved fallbacks</dt>
+                          <dd>
+                            {assignment.approvedFallbacks.map(routeName).join(', ') || 'None'}
+                          </dd>
+                        </div>
+                      </>
+                    )}
                     <div>
                       <dt>Requested effort</dt>
                       <dd>{route.effort.requested}</dd>
@@ -1023,7 +1076,8 @@ function Roster({
                     <div>
                       <dt>Slots in this run</dt>
                       <dd>
-                        {running ? 1 : 0} / {run?.policy.policy.limits.concurrency ?? 1}
+                        {unknown ? 'Unknown' : jobs.length} /{' '}
+                        {run?.policy.policy.limits.concurrency ?? 1}
                       </dd>
                     </div>
                   </dl>
@@ -1034,6 +1088,12 @@ function Roster({
             </section>
           );
         })}
+      {unclassified.map(({ attempt }) => (
+        <p className="roster-note" key={attempt.id}>
+          {attempt.state === 'unknown' ? 'Route ownership unknown' : 'Unclassified route activity'}:{' '}
+          {routeName(attempt.routeId)}. {titleCase(attempt.state)}.
+        </p>
+      ))}
       {!run?.roles.length && (
         <p className="roster-empty">
           No roles assigned. Choose a team or build your own when configuring the run.
@@ -1376,7 +1436,7 @@ function Handoffs({ events, snapshot }: { events: Event[]; snapshot: Snapshot })
                 <GitBranch size={16} />
               </span>
               <ArrowRight size={16} />
-              <span>{targets.join(', ') || 'No successor approved'}</span>
+              <span>Allowed routes: {targets.join(', ') || 'None'}</span>
             </div>
             <div className="section-heading">
               <h2>Retained task packet</h2>
