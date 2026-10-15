@@ -176,7 +176,7 @@ export function inspectSource(projectId: string, path: string): SourceFacts {
   return { projectId, base, branch, dirtyCount: dirty.size, untrackedCount: untracked.length };
 }
 
-function safePath(path: string, seen: Set<string>, prefixes: Map<string, string>) {
+export function safePath(path: string, seen: Set<string>, prefixes: Map<string, string>) {
   if (
     !path ||
     isAbsolute(path) ||
