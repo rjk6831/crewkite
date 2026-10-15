@@ -1,0 +1,101 @@
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { hashCanonical } from './hash.ts';
+import {
+  CommandResultSchema,
+  CommandSchema,
+  CursorSchema,
+  canonicalJson,
+  GrantSchema,
+  MinorAmountSchema,
+  ObservationSchema,
+  RemainingBudgetsSchema,
+  SourceSchema,
+  TransportMessageSchema,
+} from './index.ts';
+
+const suffix = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
+const command = {
+  protocol: 1,
+  key: `cmd_${suffix}`,
+  actor: { id: 'terminal', kind: 'cli' },
+  expectedRevision: 0,
+  command: 'StartRun',
+  payload: { taskId: `tsk_${suffix}`, runId: `run_${suffix}` },
+};
+
+test('process boundaries reject unknown fields and invalid command identity', () => {
+  assert.ok(CommandSchema.safeParse(command).success);
+  const grant = {
+    taskId: `tsk_${suffix}`,
+    action: 'accept-candidate',
+    target: 'refs/heads/result',
+    expiresAt: '2026-10-16T00:00:00.000Z',
+    revoked: false,
+    usesRemaining: 1,
+  };
+  assert.ok(GrantSchema.safeParse(grant).success);
+  for (const invalid of [
+    { ...grant, taskId: undefined },
+    { ...grant, expiresAt: undefined },
+    { ...grant, usesRemaining: 2 },
+  ])
+    assert.equal(GrantSchema.safeParse(invalid).success, false);
+  assert.ok(RemainingBudgetsSchema.safeParse({ attempts: 0, minutes: 0, concurrency: 0 }).success);
+  const source = {
+    projectId: `prj_${suffix}`,
+    base: 'a'.repeat(40),
+    branch: 'main',
+    dirtyCount: 0,
+    untrackedCount: 0,
+  };
+  assert.ok(SourceSchema.safeParse(source).success);
+  assert.ok(SourceSchema.safeParse({ ...source, base: 'a'.repeat(64) }).success);
+  for (const size of [39, 41, 63, 65])
+    assert.equal(SourceSchema.safeParse({ ...source, base: 'a'.repeat(size) }).success, false);
+  assert.ok(
+    CommandResultSchema.safeParse({ outcome: 'applied', data: { kind: 'source', source } }).success,
+  );
+
+  for (const invalid of [
+    { ...command, protocol: 2 },
+    { ...command, expectedRevision: undefined },
+    { ...command, expectedRevision: -1 },
+    { ...command, key: 'arbitrary-key' },
+    { ...command, command: 'ExecuteShell' },
+    { ...command, payload: { ...command.payload, path: '/tmp/file' } },
+    { ...command, actor: { ...command.actor, authority: 'autopilot' } },
+  ])
+    assert.equal(CommandSchema.safeParse(invalid).success, false);
+  const hello = { type: 'hello', protocol: 1, token: 'a'.repeat(64), actor: command.actor };
+  assert.ok(TransportMessageSchema.safeParse(hello).success);
+  assert.equal(TransportMessageSchema.safeParse({ ...hello, protocol: 2 }).success, false);
+  for (const value of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1, Infinity])
+    assert.equal(MinorAmountSchema.safeParse(value).success, false);
+  for (const value of ['-1', '01', '1.5', '1'.repeat(21)])
+    assert.equal(CursorSchema.safeParse(value).success, false);
+  assert.equal(
+    ObservationSchema.safeParse({
+      routeId: `rte_${suffix}`,
+      windowId: 'weekly',
+      kind: 'weekly',
+      remaining: { value: 101, unit: 'percent' },
+      resetsAt: null,
+      observedAt: '2026-10-15T17:00:00.000Z',
+      source: 'fixture',
+      confidence: 'reported',
+    }).success,
+    false,
+  );
+});
+
+test('canonical identity ignores key order and detects changed content', () => {
+  assert.equal(canonicalJson({ b: [2, { c: true }], a: 1 }), '{"a":1,"b":[2,{"c":true}]}');
+  assert.equal(hashCanonical({ a: 1, b: 2 }), hashCanonical({ b: 2, a: 1 }));
+  assert.notEqual(hashCanonical({ a: 1 }), hashCanonical({ a: 2 }));
+  for (const value of [undefined, NaN, Infinity, { a: undefined }, new Date(0), Array(2)])
+    assert.throws(() => canonicalJson(value));
+  const cycle: { self?: unknown } = {};
+  cycle.self = cycle;
+  assert.throws(() => canonicalJson(cycle));
+});

@@ -24,7 +24,7 @@ I skip tests for trivial getters, framework behavior, type-only code and markup 
 | Interface | One journey through desktop and CLI on the same task, keyboard path, hostile output stays inert | Playwright driving Electron, CLI in a subprocess | Under 2 minutes |
 | Package | Installed app finds its runtime, survives removal of the source tree | Manual or scheduled on macOS hardware | Per release |
 
-`pnpm verify` runs every layer except Package and must stay under five minutes on a laptop.
+`pnpm verify` must stay under five minutes on a laptop. The workspace foundation runs policy checks, lint, types, seven policy and contract tests, and the desktop build. Controller, domain and interface coverage is pending. The challenge pack below defines the claims those later tests must protect.
 
 ## The challenge pack
 
