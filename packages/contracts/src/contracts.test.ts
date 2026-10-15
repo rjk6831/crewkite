@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { hashCanonical, sealHandoff } from './hash.ts';
 import {
+  CheckEventSchema,
   CheckResultSchema,
   CommandResultSchema,
   CommandSchema,
@@ -31,6 +32,49 @@ const command = {
 
 test('process boundaries reject unknown fields and invalid command identity', () => {
   assert.ok(CommandSchema.safeParse(command).success);
+  const checkSummary = {
+    type: 'summary',
+    file: null,
+    success: true,
+    counts: { tests: 2, passed: 2, failed: 0, cancelled: 0, skipped: 0, todo: 0, suites: 0 },
+  };
+  const checkLeaf = {
+    type: 'test',
+    file: 'net.test.mjs',
+    name: 'required leaf',
+    kind: 'test',
+    passed: true,
+    skipped: false,
+    todo: false,
+  };
+  for (const valid of [
+    { type: 'start', version: 1 },
+    checkLeaf,
+    { ...checkLeaf, file: '', name: '' },
+    checkSummary,
+    { type: 'output', channel: 'stdout', text: '' },
+    { type: 'end' },
+  ])
+    assert.ok(CheckEventSchema.safeParse(valid).success);
+  for (const count of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity])
+    assert.equal(
+      CheckEventSchema.safeParse({
+        ...checkSummary,
+        counts: { ...checkSummary.counts, tests: count },
+      }).success,
+      false,
+    );
+  for (const invalid of [
+    { type: 'start', version: 2 },
+    { type: 'end', extra: true },
+    { ...checkLeaf, passed: 'true' },
+    { ...checkLeaf, file: 'a'.repeat(4097) },
+    { ...checkLeaf, name: 'a'.repeat(4097) },
+    { ...checkSummary, file: '' },
+    { ...checkSummary, counts: { ...checkSummary.counts, extra: 0 } },
+    { type: 'output', channel: 'stdout', text: 'a'.repeat(65537) },
+  ])
+    assert.equal(CheckEventSchema.safeParse(invalid).success, false);
   const job = {
     taskId: `tsk_${suffix}`,
     runId: `run_${suffix}`,

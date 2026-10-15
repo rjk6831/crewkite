@@ -417,6 +417,40 @@ export const CheckResultSchema = z
         path: ['review'],
       });
   });
+export const CheckEventSchema = z.discriminatedUnion('type', [
+  z.strictObject({ type: z.literal('start'), version: z.literal(1) }),
+  z.strictObject({
+    type: z.literal('test'),
+    file: z.string().max(4096),
+    name: z.string().max(4096),
+    kind: z.enum(['test', 'suite']).optional(),
+    passed: z.boolean(),
+    skipped: z.boolean(),
+    todo: z.boolean(),
+  }),
+  z.strictObject({
+    type: z.literal('summary'),
+    file: text.nullable(),
+    success: z.boolean(),
+    counts: z.strictObject({
+      tests: RevisionSchema,
+      passed: RevisionSchema,
+      failed: RevisionSchema,
+      cancelled: RevisionSchema,
+      skipped: RevisionSchema,
+      todo: RevisionSchema,
+      suites: RevisionSchema,
+    }),
+  }),
+  z.strictObject({
+    type: z.literal('output'),
+    channel: z.enum(['stdout', 'stderr']),
+    text: z.string().max(65536),
+  }),
+  z.strictObject({ type: z.literal('end') }),
+]);
+export type CheckEvent = z.infer<typeof CheckEventSchema>;
+
 export const SnapshotSchema = z.strictObject({
   protocol: z.literal(1),
   cursor: CursorSchema,
