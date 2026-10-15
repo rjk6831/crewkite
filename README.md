@@ -27,6 +27,17 @@ Interface preview with fixture data; controller integration is in progress.
 
 ![Light workspace preview](docs/images/workspace-light.png)
 
+<details>
+<summary>Keyboard navigation</summary>
+
+Press `Cmd+K` to open the command palette. Saved tasks show their project and task ID suffix, with five tasks per page. Previous and Next keep the rest reachable.
+
+Review pending approval opens the existing approval card and focuses its review region. Read the exact target and consequence, then choose Approve once or Deny as a separate action. `Escape` closes the palette and dialogs. Arrow keys move between task and launch tabs.
+
+![Command palette with scripted tasks and a pending approval](docs/images/command-palette.png)
+
+</details>
+
 ## How it fits together
 
 ```mermaid
