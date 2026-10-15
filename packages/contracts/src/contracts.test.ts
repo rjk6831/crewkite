@@ -62,6 +62,7 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     { ...command, expectedRevision: undefined },
     { ...command, expectedRevision: -1 },
     { ...command, key: 'arbitrary-key' },
+    { ...command, key: `cmd_Z${suffix.slice(1)}` },
     { ...command, command: 'ExecuteShell' },
     { ...command, payload: { ...command.payload, path: '/tmp/file' } },
     { ...command, actor: { ...command.actor, authority: 'autopilot' } },

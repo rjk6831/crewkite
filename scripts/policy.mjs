@@ -63,7 +63,7 @@ const PROSE_ALL = [
   [/\bthe\s+founder\b/i, 'third-person reference to the author; write in first person'],
 ];
 
-const TEXT = /\.(md|mdx|ts|tsx|js|mjs|cjs|json|ya?ml|css|html|sh|txt)$|(^|\/)[^.]+$/;
+const TEXT = /\.(md|mdx|ts|tsx|js|mjs|cjs|json|ya?ml|css|html|sh|sql|txt)$|(^|\/)[^.]+$/;
 const SKIP = /(^|\/)(pnpm-lock\.yaml|LICENSE|NOTICE)$/;
 // Agent and model product names may appear only where the product integrates with them.
 const PROVIDER_PATH = /(^|\/)providers(\/|\.md$)/;
