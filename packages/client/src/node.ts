@@ -51,7 +51,10 @@ export function readControllerEndpoint(home: string): { socketPath: string; toke
     directory.uid !== process.getuid?.()
   )
     throw new Error('Controller home must be private to its owner.');
-  const file = openSync(join(home, 'token'), constants.O_RDONLY | constants.O_NOFOLLOW);
+  const file = openSync(
+    join(home, 'token'),
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
   try {
     const state = fstatSync(file);
     if (
