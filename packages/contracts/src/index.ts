@@ -460,7 +460,7 @@ export const FakeWorkerInputSchema = z.discriminatedUnion('type', [
     attemptId: AttemptIdSchema,
     generation: RevisionSchema,
     scratchPath: text,
-    scenario: z.enum(['complete', 'approval', 'reserve', 'crash', 'stubborn']),
+    scenario: z.enum(['complete', 'approval', 'approval-reserve', 'reserve', 'crash', 'stubborn']),
     outcome: text,
   }),
   z.strictObject({
