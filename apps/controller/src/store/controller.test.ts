@@ -5,6 +5,7 @@ import {
   appendFileSync,
   existsSync,
   lstatSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -29,6 +30,7 @@ import { CandidateEvidence } from '../evidence/index.ts';
 import { committedFiles, git, inspectSource, materialize, readFiles } from '../host/source.ts';
 
 async function setup(t: TestContext, options: Partial<ControllerOptions> = {}) {
+  mkdirSync(resolve('internal'), { recursive: true });
   const directory = mkdtempSync(join(resolve('internal'), 'controller-test-'));
   const clock = createTestClock();
   const id = createTestIds(clock.now(), 1000n);
