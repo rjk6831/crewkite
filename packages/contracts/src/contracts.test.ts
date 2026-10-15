@@ -2,14 +2,19 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { hashCanonical } from './hash.ts';
 import {
+  CheckResultSchema,
   CommandResultSchema,
   CommandSchema,
   CursorSchema,
   canonicalJson,
+  FakeWorkerEventSchema,
+  FakeWorkerInputSchema,
   GrantSchema,
   MinorAmountSchema,
   ObservationSchema,
+  PolicySchema,
   RemainingBudgetsSchema,
+  ReviewJobSchema,
   SourceSchema,
   TransportMessageSchema,
 } from './index.ts';
@@ -26,6 +31,90 @@ const command = {
 
 test('process boundaries reject unknown fields and invalid command identity', () => {
   assert.ok(CommandSchema.safeParse(command).success);
+  const job = {
+    taskId: `tsk_${suffix}`,
+    runId: `run_${suffix}`,
+    attemptId: `att_${suffix}`,
+    generation: 1,
+    routeId: `rte_${suffix}`,
+    candidateId: `cnd_${suffix}`,
+    candidateHash: 'a'.repeat(64),
+    methodId: 'keep-it-simple',
+    cycle: 1,
+    limitMinutes: 1,
+    scripted: true,
+  };
+  assert.ok(ReviewJobSchema.safeParse(job).success);
+  for (const invalid of [
+    { ...job, cycle: 4 },
+    { ...job, scripted: false },
+    { ...job, limitMinutes: 0 },
+  ])
+    assert.equal(ReviewJobSchema.safeParse(invalid).success, false);
+  const review = { job, outcome: 'passed', findings: [], summary: 'Scripted scope check passed.' };
+  assert.ok(
+    FakeWorkerInputSchema.safeParse({
+      type: 'review',
+      job,
+      scratchPath: '/fixture/review',
+      criteria: ['Preserve source.'],
+    }).success,
+  );
+  assert.ok(FakeWorkerEventSchema.safeParse({ type: 'review', result: review }).success);
+  assert.ok(
+    GrantSchema.safeParse({
+      taskId: job.taskId,
+      action: 'run-review',
+      target: 'keep-it-simple/cycle-1',
+      expiresAt: '2026-10-16T00:00:00.000Z',
+      revoked: false,
+      usesRemaining: 1,
+    }).success,
+  );
+  assert.ok(
+    CheckResultSchema.safeParse({
+      candidateId: job.candidateId,
+      candidateHash: job.candidateHash,
+      definitionHash: 'b'.repeat(64),
+      evaluator: 'scripted-scope',
+      passed: true,
+      artifactId: `art_${suffix}`,
+      review,
+    }).success,
+  );
+  for (const invalid of [
+    { ...review, job: { ...job, candidateHash: 'b'.repeat(64) } },
+    { ...review, outcome: 'blocked' },
+    { ...review, findings: [{ severity: 'blocking', message: 'Scope changed.' }] },
+  ])
+    assert.equal(
+      CheckResultSchema.safeParse({
+        candidateId: job.candidateId,
+        candidateHash: job.candidateHash,
+        definitionHash: 'b'.repeat(64),
+        evaluator: 'scripted-scope',
+        passed: true,
+        artifactId: `art_${suffix}`,
+        review: invalid,
+      }).success,
+      false,
+    );
+  const policy = {
+    authority: 'balanced',
+    quality: 'standard',
+    effects: [],
+    limits: { attempts: 4, minutes: 30, concurrency: 1 },
+    reserves: [],
+    unknownUsage: { rule: 'waiting' },
+    guidance: { goal: 'Finish the bounded task.', principles: ['Preserve source.'] },
+    methods: [{ id: 'keep-it-simple', cycles: 1, reviewerRole: 'reviewer' }],
+  };
+  assert.ok(PolicySchema.safeParse(policy).success);
+  assert.equal(
+    PolicySchema.safeParse({ ...policy, methods: [...policy.methods, ...policy.methods] }).success,
+    false,
+  );
+
   const grant = {
     taskId: `tsk_${suffix}`,
     action: 'accept-candidate',

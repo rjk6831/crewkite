@@ -102,7 +102,14 @@ export const RoleSchema = z.strictObject({
   approvedFallbacks: z.array(RouteIdSchema).max(32),
 });
 export const EffectSchema = z.strictObject({
-  action: z.enum(['read-source', 'write-scratch', 'run-check', 'accept-candidate', 'export-patch']),
+  action: z.enum([
+    'read-source',
+    'write-scratch',
+    'run-check',
+    'run-review',
+    'accept-candidate',
+    'export-patch',
+  ]),
   target: text,
 });
 export const GrantSchema = EffectSchema.extend({
@@ -136,6 +143,26 @@ export const UnknownUsagePolicySchema = z.discriminatedUnion('rule', [
   z.strictObject({ rule: z.literal('manual'), approvedRouteIds: z.array(RouteIdSchema).max(32) }),
   z.strictObject({ rule: z.literal('waiting') }),
 ]);
+export const GuidanceSchema = z.strictObject({ goal: text, principles: z.array(text).max(16) });
+export const ReviewMethodIdSchema = z.enum([
+  'keep-it-simple',
+  'challenge-assumptions',
+  'second-opinion',
+  'round-robin',
+]);
+export const ReviewMethodSchema = z.strictObject({
+  id: ReviewMethodIdSchema,
+  cycles: z.number().int().min(1).max(3),
+  reviewerRole: z.enum(['reviewer', 'advisor']),
+});
+const reviewMethods = z
+  .array(ReviewMethodSchema)
+  .max(4)
+  .refine(
+    (methods) => new Set(methods.map((method) => method.id)).size === methods.length,
+    'Review methods must be unique.',
+  );
+
 export const PolicySchema = z.strictObject({
   authority: z.enum(['guided', 'balanced', 'autopilot']),
   quality: z.enum(['quick', 'standard', 'thorough']),
@@ -143,6 +170,8 @@ export const PolicySchema = z.strictObject({
   limits: LimitsSchema,
   reserves: z.array(ReserveSchema).max(100),
   unknownUsage: UnknownUsagePolicySchema,
+  guidance: GuidanceSchema.optional(),
+  methods: reviewMethods.optional(),
 });
 export const ResolvedPolicySchema = z.strictObject({ policy: PolicySchema, hash: HashSchema });
 export const RouterDecisionSchema = z.strictObject({
@@ -212,6 +241,40 @@ export const CandidateSchema = z.strictObject({
   artifactId: ArtifactIdSchema,
   revision: RevisionSchema,
 });
+export const ReviewJobSchema = z.strictObject({
+  taskId: TaskIdSchema,
+  runId: RunIdSchema,
+  attemptId: AttemptIdSchema,
+  generation: RevisionSchema,
+  routeId: RouteIdSchema,
+  candidateId: CandidateIdSchema,
+  candidateHash: HashSchema,
+  methodId: ReviewMethodIdSchema,
+  cycle: z.number().int().min(1).max(3),
+  limitMinutes: z.number().int().min(1).max(1440),
+  scripted: z.literal(true),
+});
+export const ReviewResultSchema = z
+  .strictObject({
+    job: ReviewJobSchema,
+    outcome: z.enum(['passed', 'failed', 'blocked']),
+    findings: z
+      .array(z.strictObject({ severity: z.enum(['info', 'warning', 'blocking']), message: text }))
+      .max(50),
+    summary: text,
+  })
+  .superRefine((result, context) => {
+    if (
+      result.outcome === 'passed' &&
+      result.findings.some((finding) => finding.severity === 'blocking')
+    )
+      context.addIssue({
+        code: 'custom',
+        message: 'A blocking finding cannot pass review.',
+        path: ['outcome'],
+      });
+  });
+
 export const RunSchema = z.strictObject({
   id: RunIdSchema,
   taskId: TaskIdSchema,
@@ -331,14 +394,29 @@ export const CommandSchema = z.discriminatedUnion('command', [
   read('GetHealth', empty),
   read('ExportDiagnostics', z.strictObject({ previewHash: HashSchema })),
 ]);
-export const CheckResultSchema = z.strictObject({
-  candidateId: CandidateIdSchema,
-  candidateHash: HashSchema,
-  definitionHash: HashSchema,
-  evaluator: label,
-  passed: z.boolean(),
-  artifactId: ArtifactIdSchema,
-});
+export const CheckResultSchema = z
+  .strictObject({
+    candidateId: CandidateIdSchema,
+    candidateHash: HashSchema,
+    definitionHash: HashSchema,
+    evaluator: label,
+    review: ReviewResultSchema.optional(),
+    passed: z.boolean(),
+    artifactId: ArtifactIdSchema,
+  })
+  .superRefine((result, context) => {
+    if (
+      result.review &&
+      (result.review.job.candidateId !== result.candidateId ||
+        result.review.job.candidateHash !== result.candidateHash ||
+        result.passed !== (result.review.outcome === 'passed'))
+    )
+      context.addIssue({
+        code: 'custom',
+        message: 'Review evidence must bind the same candidate and outcome.',
+        path: ['review'],
+      });
+  });
 export const SnapshotSchema = z.strictObject({
   protocol: z.literal(1),
   cursor: CursorSchema,
@@ -352,6 +430,7 @@ export const SnapshotSchema = z.strictObject({
   approvals: z.array(ApprovalSchema).max(1000),
   usage: z.array(WindowSchema).max(1000),
   candidates: z.array(CandidateSchema).max(1000),
+  reviewJobs: z.array(ReviewJobSchema).max(1000).optional(),
 });
 
 export const ChangeFileSchema = z.strictObject({
@@ -456,6 +535,13 @@ export const EventSchema = z.discriminatedUnion('type', [
 ]);
 export const FakeWorkerInputSchema = z.discriminatedUnion('type', [
   z.strictObject({
+    type: z.literal('review'),
+    job: ReviewJobSchema,
+    scratchPath: text,
+    criteria: z.array(text).min(1).max(100),
+    guidance: GuidanceSchema.optional(),
+  }),
+  z.strictObject({
     type: z.literal('start'),
     attemptId: AttemptIdSchema,
     generation: RevisionSchema,
@@ -472,6 +558,7 @@ export const FakeWorkerInputSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('stop') }),
 ]);
 export const FakeWorkerEventSchema = z.discriminatedUnion('type', [
+  z.strictObject({ type: z.literal('review'), result: ReviewResultSchema }),
   z.strictObject({
     type: z.literal('ready'),
     attemptId: AttemptIdSchema,
@@ -552,3 +639,8 @@ export type Effect = z.infer<typeof EffectSchema>;
 export type ReadData = z.infer<typeof ReadDataSchema>;
 export type CheckResult = z.infer<typeof CheckResultSchema>;
 export type RemainingBudgets = z.infer<typeof RemainingBudgetsSchema>;
+
+export type Guidance = z.infer<typeof GuidanceSchema>;
+export type ReviewMethod = z.infer<typeof ReviewMethodSchema>;
+export type ReviewJob = z.infer<typeof ReviewJobSchema>;
+export type ReviewResult = z.infer<typeof ReviewResultSchema>;

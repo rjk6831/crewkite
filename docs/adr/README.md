@@ -23,6 +23,7 @@ Each record states one decision, the context that forced it, why I chose it and 
 | [0017](0017-tests-protect-stated-claims.md) | Write tests that each protect a stated claim | Accepted |
 | [0018](0018-apache-2-license.md) | License CrewKite under Apache 2.0 | Accepted |
 | [0019](0019-transport-seam-for-team-and-remote.md) | Defer team, remote and hosted features behind a transport seam | Accepted |
+| [0020](0020-profiles-resolve-to-finite-gates.md) | Resolve profiles to finite effect gates and bounded reviews | Proposed |
 
 ## Writing a new record
 
