@@ -24,7 +24,11 @@ I skip tests for trivial getters, framework behavior, type-only code and markup 
 | Interface | One journey through desktop and CLI on the same task, keyboard path, hostile output stays inert | Playwright driving Electron, CLI in a subprocess | Under 2 minutes |
 | Package | Installed app finds its runtime, survives removal of the source tree | Manual or scheduled on macOS hardware | Per release |
 
-`pnpm verify` must stay under five minutes on a laptop. The workspace foundation runs policy checks, lint, types, seven policy and contract tests, and the desktop build. Controller, domain and interface coverage is pending. The challenge pack below defines the claims those later tests must protect.
+`pnpm verify` must stay under five minutes on a laptop. The current suite has 25 tests: five policy tests, two contract tests, seven allocation and continuity tests, four client and CLI tests, and seven controller tests. It also runs lint, types and the desktop build. The desktop journey and installed-package checks remain pending.
+
+The controller tests cover mutation retries and changed-key rejection, stale revisions, intent-before-spawn recovery, retained descendants, candidate evidence identity and local publication. The full flow uses a manual check approval, reserve transfer, real Node checks and two scripted review jobs. It verifies a new branch over several source ancestors, an immutable patch, unchanged sentinels and index bytes, and an inert clean-filter canary. Pending-action cancellation and export approval preserve coherent task state.
+
+The fixed synthetic check definition requires the original test file and its expected file-qualified completions. Added tests cannot substitute for those assertions. Skips, early import exits, incomplete reports and a changed evaluated copy fail the evidence boundary. Arbitrary repository checks are unqualified.
 
 ## The challenge pack
 
@@ -45,7 +49,7 @@ The repository also carries staged, unstaged, untracked, binary and executable s
 | Combined failure | Two passing slices that disagree on a field name fail the combined check |
 | Publication crash | The exact ref reconciles once. Conflicts are never overwritten |
 
-Each challenge maps to one integration test. A milestone claims only the challenges it actually runs.
+The challenge table is the acceptance plan. The current suite covers the named controller subset above. It does not claim disk-full recovery, a crash after ref creation, billing qualification or the desktop journey from the build alone.
 
 ## What fakes can and cannot prove
 
