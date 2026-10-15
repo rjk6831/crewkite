@@ -406,11 +406,19 @@ function binding(approval: Approval) {
 }
 
 test('acceptance creates one checked branch and preserves the original source', async (t) => {
+  for (const transfer of ['reserve', 'manual'] as const)
+    await acceptsTransferredCandidate(t, transfer);
+});
+
+async function acceptsTransferredCandidate(t: TestContext, transfer: 'reserve' | 'manual') {
   const identity = { name: 'Fixture owner', email: 'owner@example.invalid' };
-  const { controller, command, draft, fixtures, source, directory, clock } = await setup(t, {
+  let { controller, command, draft, fixtures, source, directory, clock, id } = await setup(t, {
     identity,
     scenarioForRoute: (route, generation) =>
-      route.family === 'anthropic' && generation === 0 ? 'approval-reserve' : 'complete',
+      (route.family === 'anthropic' && generation === 0) ||
+      (transfer === 'manual' && generation === 1)
+        ? 'approval-reserve'
+        : 'complete',
   });
   let base = source.base;
   const tree = git(source.directory, ['rev-parse', `${base}^{tree}`])
@@ -451,7 +459,7 @@ test('acceptance creates one checked branch and preserves the original source', 
   const methods = ['second-opinion', 'keep-it-simple'] as const;
   const policy = {
     ...fixtures.policy,
-    limits: { attempts: 5, minutes: 30, concurrency: 1 },
+    limits: { attempts: transfer === 'manual' ? 6 : 5, minutes: 30, concurrency: 1 },
     effects: [
       ...fixtures.policy.effects
         .filter((grant) => !['run-check', 'accept-candidate'].includes(grant.action))
@@ -471,7 +479,7 @@ test('acceptance creates one checked branch and preserves the original source', 
     ],
   };
   const roles = [
-    ...fixtures.roles,
+    ...fixtures.roles.map((role) => ({ ...role, pinned: transfer === 'manual' })),
     {
       role: 'reviewer',
       routeId: fixtures.snapshot.routes[0].id,
@@ -525,30 +533,199 @@ test('acceptance creates one checked branch and preserves the original source', 
     'local-owner',
   );
   const run = RunSchema.parse(prepared.entity);
-  const approvalReady = new Promise<Approval>((resolve) => {
-    const off = controller.subscribe((event) => {
-      if (event.type === 'approval.requested' && event.payload.action === 'run-check') {
-        off();
-        resolve(event.payload);
-      }
+  const nextApproval = () =>
+    new Promise<Approval>((resolve) => {
+      const off = controller.subscribe((event) => {
+        if (event.type === 'approval.requested' && event.payload.action === 'run-check') {
+          off();
+          resolve(event.payload);
+        }
+      });
     });
-  });
-  const completed = new Promise<void>((resolve) => {
-    const off = controller.subscribe((event) => {
-      if (
-        event.type === 'task.updated' &&
-        ['ready', 'failed', 'unknown'].includes(event.payload.state)
-      ) {
-        off();
-        resolve();
-      }
+  if (transfer === 'manual')
+    assert.equal(
+      (
+        await controller.execute(
+          command(
+            'SwitchRoute',
+            { taskId: task.id, runId: run.id, routeId: fixtures.snapshot.routes[0].id },
+            prepared.revision,
+          ),
+          'local-owner',
+        )
+      ).reason,
+      'switch-needs-writer',
+    );
+  const approvalReady = nextApproval();
+  const completion = () =>
+    new Promise<void>((resolve) => {
+      const off = controller.subscribe((event) => {
+        if (
+          event.type === 'task.updated' &&
+          ['ready', 'failed', 'unknown'].includes(event.payload.state)
+        ) {
+          off();
+          resolve();
+        }
+      });
     });
-  });
+  let completed = completion();
   await controller.execute(
     command('StartRun', { taskId: task.id, runId: run.id }, prepared.revision),
     'local-owner',
   );
-  const approval = await approvalReady;
+  let approval = await approvalReady;
+  if (transfer === 'manual') {
+    const target = fixtures.snapshot.routes[0].id;
+    const unrelated = fixtures.snapshot.routes[2].id;
+    assert.equal(
+      (
+        await controller.execute(
+          command(
+            'SwitchRoute',
+            { taskId: task.id, runId: run.id, routeId: unrelated },
+            controller.snapshot().tasks[0].revision,
+          ),
+          'local-owner',
+        )
+      ).reason,
+      'route-not-approved',
+    );
+    assert.equal(
+      (
+        await controller.execute(
+          command(
+            'SwitchRoute',
+            { taskId: task.id, runId: run.id, routeId: target },
+            controller.snapshot().tasks[0].revision,
+          ),
+          'local-owner',
+        )
+      ).reason,
+      'route-not-admissible',
+    );
+    assert.equal(controller.snapshot().tasks[0].state, 'waiting');
+    const primary = fixtures.snapshot.usage[1].observation;
+    const setPrimary = (value: number) =>
+      controller.store.transaction(() =>
+        controller.store.put('window', `${primary.routeId}/${primary.windowId}`, 0, {
+          ...primary,
+          remaining: { value, unit: 'percent' },
+        }),
+      );
+    setPrimary(5);
+    const restorePin = controller.subscribe((event) => {
+      if (event.type === 'attempt.stopped' && event.payload.generation === 0) {
+        restorePin();
+        setPrimary(30);
+      }
+    });
+    const targetBlocked = new Promise<void>((resolve) => {
+      const off = controller.subscribe((event) => {
+        if (
+          event.type === 'task.updated' &&
+          event.payload.state === 'stopped' &&
+          event.payload.next?.includes('Admissions are paused')
+        ) {
+          off();
+          resolve();
+        }
+      });
+    });
+    const switchCommand = command(
+      'SwitchRoute',
+      { taskId: task.id, runId: run.id, routeId: target },
+      controller.snapshot().tasks[0].revision,
+    );
+    assert.equal((await controller.execute(switchCommand, 'local-owner')).outcome, 'applied');
+    assert.equal(
+      (await controller.execute(switchCommand, 'local-owner')).outcome,
+      'already-applied',
+    );
+    assert.equal(
+      (
+        await controller.execute(
+          command(
+            'PauseAdmissions',
+            { taskId: task.id, runId: run.id },
+            controller.snapshot().tasks[0].revision,
+          ),
+          'local-owner',
+        )
+      ).outcome,
+      'applied',
+    );
+    await targetBlocked;
+    assert.equal(controller.snapshot().tasks[0].state, 'stopped');
+    assert.ok(controller.store.receipt(`paused:${run.id}`));
+    assert.equal(
+      (
+        await controller.execute(
+          command(
+            'ResumeRun',
+            { taskId: task.id, runId: run.id },
+            controller.snapshot().tasks[0].revision,
+          ),
+          'local-owner',
+        )
+      ).reason,
+      'route-not-admissible',
+    );
+    assert.equal(controller.store.intents().filter((intent) => intent.run_id === run.id).length, 1);
+    assert.equal(controller.store.receipt(`switch:${run.id}`)?.result.outcome, 'outcome-unknown');
+    const home = controller.home;
+    controller.close();
+    controller = new Controller({
+      home,
+      now: clock.now,
+      id,
+      identity,
+      scenarioForRoute: (_route, generation) =>
+        generation === 1 ? 'approval-reserve' : 'complete',
+    });
+    t.after(() => controller.close());
+    assert.equal(controller.store.intents().filter((intent) => intent.run_id === run.id).length, 1);
+    controller.store.transaction(() =>
+      controller.store.put('window', `${primary.routeId}/${primary.windowId}`, 0, {
+        ...primary,
+        remaining: { value: 5, unit: 'percent' },
+      }),
+    );
+    completed = completion();
+    const checkApproval = nextApproval();
+    const resumed = await controller.execute(
+      command(
+        'ResumeRun',
+        { taskId: task.id, runId: run.id },
+        controller.snapshot().tasks[0].revision,
+      ),
+      'local-owner',
+    );
+    assert.equal(resumed.outcome, 'applied');
+    approval = await checkApproval;
+    setPrimary(30);
+    const finalApproval = nextApproval();
+    const secondSwitch = command(
+      'SwitchRoute',
+      { taskId: task.id, runId: run.id, routeId: primary.routeId },
+      controller.snapshot().tasks[0].revision,
+    );
+    assert.equal((await controller.execute(secondSwitch, 'local-owner')).outcome, 'applied');
+    assert.equal(
+      (await controller.execute(secondSwitch, 'local-owner')).outcome,
+      'already-applied',
+    );
+    approval = await finalApproval;
+    assert.equal(
+      controller
+        .snapshot()
+        .approvals.find(
+          (item) =>
+            item.approvalId !== approval.approvalId && item.attemptId !== cancelled.attemptId,
+        )?.status,
+      'denied',
+    );
+  }
   const approved = await controller.execute(
     command(
       'ResolveApproval',
@@ -565,20 +742,39 @@ test('acceptance creates one checked branch and preserves the original source', 
     'ready',
     snapshot.tasks[0].next ?? 'Task did not become ready.',
   );
-  assert.equal(snapshot.attempts.filter((attempt) => attempt.runId === run.id).length, 5);
+  assert.equal(
+    snapshot.attempts.filter((attempt) => attempt.runId === run.id).length,
+    transfer === 'manual' ? 6 : 5,
+  );
+  assert.deepEqual(snapshot.runs.find((value) => value.id === run.id)?.policy, run.policy);
+  assert.deepEqual(snapshot.runs.find((value) => value.id === run.id)?.roles, run.roles);
+  if (transfer === 'manual') {
+    assert.equal(controller.store.receipt(`switch:${run.id}`)?.result.outcome, 'applied');
+    assert.deepEqual(
+      controller.store
+        .intents()
+        .filter((intent) => intent.scratch_path === join(controller.home, 'scratch', run.id))
+        .map((intent) => intent.route_id),
+      [
+        fixtures.snapshot.routes[1].id,
+        fixtures.snapshot.routes[0].id,
+        fixtures.snapshot.routes[1].id,
+      ],
+    );
+  }
   assert.equal(snapshot.evidence.filter((check) => check.review).length, 2);
   assert.ok(snapshot.evidence.every((check) => check.passed));
   const handoffs = controller.store
     .eventsAfter('0')
     .filter((event) => event.type === 'handoff.sealed');
-  assert.equal(handoffs.length, 1);
+  assert.equal(handoffs.length, transfer === 'manual' ? 4 : 1);
   assert.ok(handoffs[0].payload.packet.artifacts.length > 3);
   assert.deepEqual(
     controller.store
       .intents()
       .filter((intent) => intent.scratch_path === join(controller.home, 'scratch', run.id))
       .map((intent) => intent.generation),
-    [0, 1],
+    transfer === 'manual' ? [0, 1, 2] : [0, 1],
   );
   const candidate = snapshot.candidates[0];
   git(source.directory, ['update-ref', 'refs/heads/feat/existing', base, '0'.repeat(40)]);
@@ -700,4 +896,5 @@ test('acceptance creates one checked branch and preserves the original source', 
     assert.equal(lstatSync(join(source.directory, sentinel.path)).mode & 0o777, sentinel.mode);
   }
   assert.equal(existsSync(canary), false);
-});
+  controller.close();
+}

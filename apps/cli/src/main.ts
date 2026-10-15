@@ -18,7 +18,8 @@ import {
   type Task,
 } from '@crewkite/contracts';
 
-const help = `Usage: crewkite task <list|show|watch|start|stop|resume|approve|deny> [id] [--json] [--home path]
+const help = `Usage: crewkite task <list|show|watch|start|stop|resume|switch|approve|deny> [id] [--json] [--home path]
+       crewkite task switch <task-id> <route-id> [--json] [--home path]
        crewkite health [--json] [--home path]
        crewkite retry <receipt-file> [--json] [--home path]
 
@@ -53,13 +54,27 @@ export async function runCli(
       return 0;
     }
     const [area, action, id, ...extra] = positionals;
-    if (extra.length || !['task', 'health', 'retry'].includes(area))
+    if (
+      (extra.length && !(area === 'task' && action === 'switch' && extra.length === 1)) ||
+      !['task', 'health', 'retry'].includes(area)
+    )
       throw new Error('Unknown command. Use --help.');
-    const supported = ['list', 'show', 'watch', 'start', 'stop', 'resume', 'approve', 'deny'];
+    const supported = [
+      'list',
+      'show',
+      'watch',
+      'start',
+      'stop',
+      'resume',
+      'switch',
+      'approve',
+      'deny',
+    ];
     if (
       area === 'task' &&
       (!action ||
         !supported.includes(action) ||
+        (action === 'switch' && extra.length !== 1) ||
         (action === 'list' ? id !== undefined : id === undefined))
     )
       throw new Error('Invalid task command. Use --help.');
@@ -206,6 +221,15 @@ export async function runCli(
     }
     if (!task.runId)
       throw new Error('Prepare this task in the desktop before controlling its run.');
+    if (action === 'switch') {
+      const result = await request(
+        'SwitchRoute',
+        { taskId: task.id, runId: task.runId, routeId: extra[0] },
+        task.revision,
+      );
+      receipt(result);
+      return succeeded(result) ? 0 : 2;
+    }
     const names = { start: 'StartRun', stop: 'StopRun', resume: 'ResumeRun' } as const;
     const result = await request(
       names[action as keyof typeof names],

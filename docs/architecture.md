@@ -38,7 +38,7 @@ Results use a finite set of outcomes: `applied`, `already-applied`, `stale-revis
 
 Reads use snapshot plus subscription. `GetSnapshot` returns state at cursor C, and `Subscribe` replays ordered events after C. A gap in retained history forces a fresh snapshot. Slow clients are disconnected and resync; they never hold up work.
 
-The current D0 controller runs scripted routes. `SwitchRoute` and `ExportDiagnostics` return `unsupported`. Live provider qualification and the desktop journey remain separate gates. The table describes the first-release command contract.
+The current D0 controller runs scripted routes. `ExportDiagnostics` returns `unsupported`. Live provider qualification and the desktop journey remain separate gates. The table describes the first-release command contract.
 
 The command set for the first release:
 
@@ -47,6 +47,7 @@ The command set for the first release:
 | `RegisterProject`, `InspectSource` | Explicit path selection, base revision, dirty and untracked counts, stable project ID |
 | `CreateTask`, `AmendTask`, `PrepareRun` | Saved criteria, versioned amendments, a frozen preview of source, routes, checks and limits |
 | `StartRun`, `GetSnapshot`, `Subscribe` | Atomic admission, consistent state with ordered events, no duplicate dispatch |
+| `SwitchRoute` | Save an allowed coder target, stop the outgoing writer, seal retained work and recheck normal admission |
 | `PauseAdmissions`, `StopRun` | Pausing stops new dispatch. Stopping requests cancellation and waits for proven quiescence |
 | `ResolveApproval` | Binds the exact pending action, target, attempt, generation and revision |
 | `GetChanges`, `GetArtifact`, `GetUsage` | Bounded reads of immutable content and sourced usage observations |

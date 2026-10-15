@@ -126,7 +126,7 @@ export class Controller {
     {
       worker: OwnedWorker;
       terminal?: Extract<FakeWorkerEvent, { type: 'terminal' }>;
-      reason?: 'handoff' | 'stop';
+      reason?: 'handoff' | 'stop' | 'switch';
       failure?: string;
       cancel?: () => void;
     }
@@ -344,7 +344,7 @@ export class Controller {
   private apply(command: Command, effects: (() => void)[]): CommandResult {
     if (
       'taskId' in command.payload &&
-      ['AcceptCandidate', 'ExportPatch', 'GetChanges', 'SwitchRoute'].includes(command.command) &&
+      ['AcceptCandidate', 'ExportPatch', 'GetChanges'].includes(command.command) &&
       this.hasUncertainWriter(command.payload.taskId)
     )
       return {
@@ -452,6 +452,8 @@ export class Controller {
         return this.start(command, effects);
       case 'ResolveApproval':
         return this.resolve(command, effects);
+      case 'SwitchRoute':
+        return this.switchRoute(command, effects);
       case 'StopRun':
         return this.stop(command, effects);
       case 'PauseAdmissions': {
@@ -547,13 +549,17 @@ export class Controller {
   private routing(
     run: Pick<Run, 'roles' | 'policy'> & Partial<Pick<Run, 'id'>>,
     roleName: Run['roles'][number]['role'] = 'coder',
+    target?: string,
+    releasing?: string,
   ) {
     const coder = run.roles.find((role) => role.role === roleName);
     if (!coder) throw new Error('Choose one coder route before starting.');
     const observations = this.store.list<Observation>('window');
     const routes = this.store.list<Route>('route');
-    const active = this.store.intents().filter((intent) => intent.state !== 'stopped');
-    return chooseRoute({
+    const active = this.store
+      .intents()
+      .filter((intent) => intent.state !== 'stopped' && intent.attempt_id !== releasing);
+    const input = {
       nowMs: Date.parse(this.now()),
       maxAgeMs: 300000,
       candidates: routes
@@ -581,8 +587,9 @@ export class Controller {
       observations,
       reserves: run.policy.policy.reserves,
       reservations: this.store.db
-        .prepare('SELECT route_id,window_id,value,unit FROM reservations')
+        .prepare('SELECT attempt_id,route_id,window_id,value,unit FROM reservations')
         .all()
+        .filter((row) => row.attempt_id !== releasing)
         .map((row) => ({
           routeId: row.route_id as string,
           windowId: row.window_id as string,
@@ -616,7 +623,24 @@ export class Controller {
             : run.policy.policy.limits.minutes,
         };
       }),
+    };
+    const automatic = chooseRoute(input);
+    if (!target) return automatic;
+    if (coder.pinned && automatic.chosen === coder.routeId && target !== coder.routeId)
+      return { ...automatic, chosen: null, rule: 'waiting' as const };
+    const manual = chooseRoute({
+      ...input,
+      candidates: input.candidates.filter(({ route }) => route.id === target),
     });
+    return {
+      ...manual,
+      rule: manual.chosen ? ('manual' as const) : manual.rule,
+      inputsHash: hashCanonical({
+        automatic: automatic.inputsHash,
+        target,
+        admission: manual.inputsHash,
+      }),
+    };
   }
 
   private prepare(command: Extract<Command, { command: 'PrepareRun' }>): CommandResult {
@@ -735,12 +759,15 @@ export class Controller {
         reason: 'source-preview-changed',
         next: 'Prepare the launch card again.',
       };
-    const decision = this.routing(run);
+    const target = this.pendingSwitch(run);
+    const decision = this.routing(run, 'coder', target);
     if (!decision.chosen)
       return {
         outcome: 'blocked',
-        reason: 'capacity-unavailable',
-        next: 'Wait for usable allowance or choose an approved route.',
+        reason: target ? 'route-not-admissible' : 'capacity-unavailable',
+        next: target
+          ? `Selected route ${target} cannot pass the saved pin, allowance or slot gates. Resume to recheck, or stop to cancel the switch.`
+          : 'Wait for usable allowance or choose an approved route.',
       };
     if (command.command === 'StartRun' && decision.chosen !== run.decision.chosen)
       return {
@@ -852,6 +879,10 @@ export class Controller {
         );
     const admitted = { ...run, decision, revision: run.revision + 1 };
     this.store.put('run', run.id, admitted.revision, admitted);
+    if (target)
+      this.store.db
+        .prepare('UPDATE receipts SET result=? WHERE command_key=?')
+        .run(canonicalJson({ outcome: 'applied', entity: admitted }), `switch:${run.id}`);
     const updated = this.updateTask(task, {
       state: 'running',
       waitingReason: null,
@@ -1275,7 +1306,8 @@ export class Controller {
         !!runtime.failure ||
           !runtime.terminal ||
           runtime.terminal.outcome === 'failed' ||
-          runtime.reason === 'stop',
+          runtime.reason === 'stop' ||
+          runtime.reason === 'switch',
       );
       this.event('attempt.stopped', task.id, task.revision, updated);
       const failed = runtime.failure || !runtime.terminal || runtime.terminal.outcome === 'failed';
@@ -1292,6 +1324,10 @@ export class Controller {
     if (quiescent) {
       try {
         const candidate = this.sealCandidate(attempt);
+        if (runtime.reason === 'switch') {
+          this.continueSwitch(attempt);
+          return;
+        }
         if (
           runtime.terminal &&
           runtime.terminal.outcome !== 'failed' &&
@@ -1362,6 +1398,9 @@ export class Controller {
     const task = this.store.get<Task>('task', command.payload.taskId);
     if (!task || task.runId !== command.payload.runId)
       return { outcome: 'blocked', reason: 'run-not-current' };
+    this.store.db
+      .prepare('DELETE FROM receipts WHERE command_key=?')
+      .run(`switch:${command.payload.runId}`);
     const restore = this.closePendingEffects(task);
     const active = this.store
       .intents()
@@ -2599,7 +2638,7 @@ export class Controller {
         decisions: [
           checked
             ? 'Stopped at the configured reserve. Exact candidate checks passed.'
-            : 'Retained bytes were captured after positive process-group absence. Resume remains explicit.',
+            : 'Retained bytes were captured after positive process-group absence. Current checks and selected reviews remain required.',
         ],
         deniedActions: this.store
           .list<Approval>('approval')
@@ -2629,6 +2668,176 @@ export class Controller {
     if (Buffer.byteLength(canonicalJson(packet)) > MAX_FRAME_BYTES - 65536)
       throw new Error('The handoff context exceeds its bounded worker frame.');
     return packet;
+  }
+
+  private pendingSwitch(run: Run): string | undefined {
+    const receipt = this.store.receipt(`switch:${run.id}`);
+    if (receipt?.result.outcome !== 'outcome-unknown') return;
+    const frozen = RunSchema.parse(receipt.result.entity);
+    if (
+      frozen.id !== run.id ||
+      frozen.taskId !== run.taskId ||
+      hashCanonical({ source: frozen.source, policy: frozen.policy, roles: frozen.roles }) !==
+        hashCanonical({ source: run.source, policy: run.policy, roles: run.roles })
+    )
+      throw new Error('The saved switch no longer matches this run.');
+    return frozen.decision.chosen ?? undefined;
+  }
+
+  private switchRoute(
+    command: Extract<Command, { command: 'SwitchRoute' }>,
+    effects: (() => void)[],
+  ): CommandResult {
+    const task = this.store.get<Task>('task', command.payload.taskId);
+    const run = this.store.get<Run>('run', command.payload.runId);
+    if (!task || !run || task.runId !== run.id || run.taskId !== task.id)
+      return { outcome: 'blocked', reason: 'run-not-current' };
+    const coder = run.roles.find((role) => role.role === 'coder');
+    const target = command.payload.routeId;
+    if (!coder || ![coder.routeId, ...coder.approvedFallbacks].includes(target))
+      return {
+        outcome: 'denied',
+        reason: 'route-not-approved',
+        next: 'Choose a saved coder route or prepare a new bounded run.',
+      };
+    if (this.pendingSwitch(run))
+      return {
+        outcome: 'blocked',
+        reason: 'switch-already-pending',
+        next: 'Resume to recheck the saved target, or stop to cancel it.',
+      };
+    const last = this.store
+      .intents()
+      .filter((intent) => intent.run_id === run.id)
+      .at(-1);
+    if (last && last.scratch_path !== join(this.home, 'scratch', run.id))
+      return {
+        outcome: 'blocked',
+        reason: 'pending-evaluator-stage',
+        next: 'Stop the check or review explicitly. A route switch cannot replace it with a coder.',
+      };
+    if (task.state === 'unknown')
+      return {
+        outcome: 'blocked',
+        reason: 'writer-ownership-unknown',
+        next: 'Prove the prior process group is gone before switching.',
+      };
+    if (!last || !['running', 'waiting', 'stopped', 'interrupted'].includes(task.state))
+      return {
+        outcome: 'blocked',
+        reason: 'switch-needs-writer',
+        next: 'Switch only an active or stopped coding attempt in the current run.',
+      };
+    const runtime = this.workers.get(last.attempt_id);
+    if (last.state !== 'stopped' && !runtime)
+      return {
+        outcome: 'blocked',
+        reason: 'writer-ownership-unknown',
+        next: 'Prove the outgoing process group is gone before switching.',
+      };
+    if (last.route_id === target)
+      return {
+        outcome: 'blocked',
+        reason: 'route-already-current',
+        next: 'Choose another saved coder route.',
+      };
+    const route = this.store.get<Route>('route', target);
+    if (!route?.fake || !route.qualified)
+      return {
+        outcome: 'blocked',
+        reason: 'route-not-admissible',
+        next: 'Choose a qualified scripted route.',
+      };
+    // Preflight excludes only this writer's held capacity. Admission repeats after proven stop.
+    if (!this.routing(run, 'coder', target, runtime ? last.attempt_id : undefined).chosen)
+      return {
+        outcome: 'blocked',
+        reason: 'route-not-admissible',
+        next: `Selected route ${target} cannot pass the saved pin, allowance or slot gates. The current writer keeps its ownership.`,
+      };
+    this.closePendingEffects(task);
+    this.store.db.prepare('DELETE FROM receipts WHERE command_key=?').run(`switch:${run.id}`);
+    this.store.saveReceipt(
+      `switch:${run.id}`,
+      hashCanonical({ runId: run.id, target }),
+      'local-owner',
+      {
+        outcome: 'outcome-unknown',
+        entity: {
+          ...run,
+          decision: {
+            chosen: target,
+            rejected: [],
+            rule: 'manual',
+            inputsHash: hashCanonical({ runId: run.id, target }),
+          },
+        },
+      },
+    );
+    const updated = this.updateTask(task, {
+      state: runtime ? 'stopping' : 'stopped',
+      waitingReason: null,
+      next: `Selected route ${target} is saved. Stop the outgoing writer, then recheck the original policy and remaining limits.`,
+    });
+    const writer = this.store.get<Attempt>('attempt', last.attempt_id) as Attempt;
+    if (runtime) {
+      runtime.reason = 'switch';
+      effects.push(() => {
+        void runtime.worker
+          .stop({ schedule: this.options.schedule })
+          .then((exit) => this.finishAttempt(writer.id, exit.quiescent));
+      });
+    } else effects.push(() => this.continueSwitch(writer));
+    return { outcome: 'applied', entity: updated, revision: updated.revision };
+  }
+
+  private continueSwitch(writer: Attempt) {
+    if (this.closed) return;
+    const run = this.store.get<Run>('run', writer.runId) as Run;
+    const target = this.pendingSwitch(run);
+    if (!target) return;
+    try {
+      this.prepareResumeContext(run.taskId, run.id);
+    } catch {
+      this.store.transaction(() =>
+        this.updateTask(this.store.get<Task>('task', run.taskId) as Task, {
+          state: 'stopped',
+          waitingReason: null,
+          next: `Selected route ${target} has no readable retained context. Inspect the saved work, then resume to retry or stop to cancel.`,
+        }),
+      );
+      return;
+    }
+    const effects: (() => void)[] = [];
+    this.store.transaction(() => {
+      const task = this.store.get<Task>('task', run.taskId) as Task;
+      if (this.store.receipt(`paused:${run.id}`)) {
+        this.updateTask(task, {
+          state: 'stopped',
+          waitingReason: null,
+          next: `Selected route ${target} is retained. Admissions are paused. Resume explicitly to recheck, or stop to cancel.`,
+        });
+        return;
+      }
+      const command = CommandSchema.parse({
+        protocol: 1,
+        key: this.id('cmd'),
+        actor: { id: 'controller', kind: 'controller' },
+        command: 'ResumeRun',
+        expectedRevision: task.revision,
+        payload: { taskId: task.id, runId: run.id },
+      });
+      const result = this.start(command as Extract<Command, { command: 'ResumeRun' }>, effects);
+      if (result.outcome !== 'applied')
+        this.updateTask(this.store.get<Task>('task', task.id) as Task, {
+          state: 'stopped',
+          waitingReason: null,
+          next:
+            result.next ??
+            'The saved target could not be admitted. Resume to recheck, or stop to cancel the switch.',
+        });
+    });
+    for (const effect of effects) effect();
   }
 
   private resumeGate(task: Task, runId: string): CommandResult | undefined {

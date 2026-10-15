@@ -42,6 +42,14 @@ It references retained content by hash. It excludes credentials, unrelated histo
 
 Pins, denied capabilities, remaining budgets and unresolved exposure carry over. A provider limit never authorizes another account, a new data recipient, a paid API route or a weaker quality gate.
 
+## Manual route switching
+
+`SwitchRoute` saves one exact target from the current run's coder route and approved fallbacks. The CLI sends it through `task switch <task-id> <route-id>` with the current task revision. Selecting a target does not mean it has been admitted.
+
+The controller stops the owned coding worker and waits for process-group absence and closed output streams. It seals the current partial bytes as unverified work, then applies the original pin, allowance, slot and remaining-budget gates. A healthy pinned primary still takes priority. The run keeps its saved policy and authority.
+
+A blocked target stays visible on the stopped task. Explicit resume rechecks that exact target. Stop cancels it. Pausing during the outgoing stop leaves the target pending until explicit resume. Restart retains the request and never dispatches it automatically. Draft tasks and check or review stages cannot become a successor coder through this command.
+
 ## Restart
 
 On startup the controller reconciles attempts and effects before it dispatches anything.
