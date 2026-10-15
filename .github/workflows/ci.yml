@@ -66,8 +66,10 @@ jobs:
           echo "$PWD/.ci-tools/node_modules/.bin" >> "$GITHUB_PATH"
       - name: Install workspace
         run: pnpm install --frozen-lockfile
-      - name: Verify foundation
-        run: pnpm verify
+      - name: Install pinned desktop runtime
+        run: pnpm desktop:install
+      - name: Verify workspace and desktop journey
+        run: xvfb-run --auto-servernum pnpm verify
         env:
           PROVENANCE_PATTERN: ${{ vars.PROVENANCE_PATTERN }}
 

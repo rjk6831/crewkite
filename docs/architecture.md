@@ -38,7 +38,7 @@ Results use a finite set of outcomes: `applied`, `already-applied`, `stale-revis
 
 Reads use snapshot plus subscription. `GetSnapshot` returns state at cursor C, and `Subscribe` replays ordered events after C. A gap in retained history forces a fresh snapshot. Slow clients are disconnected and resync; they never hold up work.
 
-The current D0 controller runs scripted routes. `ExportDiagnostics` returns `unsupported`. Live provider qualification and the desktop journey remain separate gates. The table describes the first-release command contract.
+The current D0 controller runs scripted routes. `ExportDiagnostics` returns `unsupported`. Live provider qualification and installed-package recovery remain separate gates. The table describes the first-release command contract.
 
 The command set for the first release:
 
@@ -144,7 +144,13 @@ Snapshots and frames are bounded. Replay beyond 1,000 events requires a fresh sn
 
 ## Desktop security
 
-The renderer treats all provider content as inert text. The window runs with context isolation and sandboxing, a narrow preload API, sender and argument validation, restricted navigation and controlled external links.
+Main loads bundled renderer assets through an allowlisted application protocol. The window uses sandboxing and context isolation, with no Node integration. Its CommonJS preload exposes payload-only callbacks and finite capabilities. Main validates the invoking window, main frame, exact page URL and shared payload schema for each request. Browser permissions, new windows, downloads and navigation are denied. Provider content renders as text.
+
+One authenticated socket client in main serves the renderer. Main supplies command identity and keeps bounded replay while the page loads. Missing history remains visible after a snapshot repairs current state. Uncertain mutation receipts belong to the selected profile and retain their exact keys and content for explicit retry. Reconnection never resumes a run.
+
+Project registration uses a parented native directory picker. Generic renderer commands cannot supply a registration path. Export remains a controller effect: main reads the returned immutable artifact, verifies its length and checksum, then offers a parented save dialog. A saved patch uses an unused destination and durable file and directory writes. Cancellation keeps the artifact available. The CLI receives the artifact result independently of desktop saving.
+
+The demo has an explicit bootstrap with a persisted fake catalog and a separate private home and profile. Main verifies the standalone Node version, platform, architecture and checksum before launch. The staged runtime resolves fixed entries inside its package. A connected source journey does not establish installed recovery.
 
 ## Repository layout
 

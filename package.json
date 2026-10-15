@@ -14,12 +14,14 @@
     "types": "tsc --noEmit",
     "test": "node scripts/test.mjs",
     "build": "pnpm --filter @crewkite/desktop build",
-    "verify": "pnpm policy && pnpm lint && pnpm types && pnpm test && pnpm build",
+    "verify": "pnpm policy && pnpm lint && pnpm types && pnpm test && pnpm build && pnpm test:desktop",
     "crewkite": "node apps/cli/src/main.ts",
     "controller": "node apps/controller/src/main.ts",
     "desktop:install": "pnpm --filter @crewkite/desktop exec install-electron",
     "demo": "pnpm build && node scripts/demo.ts",
-    "demo:controller": "node scripts/demo-controller.ts"
+    "demo:controller": "node scripts/demo-controller.ts",
+    "test:desktop": "playwright test e2e/desktop.spec.ts --workers=1 --reporter=line --output=internal/test-results",
+    "screenshots": "node scripts/capture-desktop.mjs"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.15",

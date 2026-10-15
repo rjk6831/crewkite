@@ -55,7 +55,7 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
     if (mutation && result.outcome !== 'outcome-unknown') retain(command, false);
     return result;
   }
-  async function save(result: CommandResult) {
+  async function save(result: CommandResult, assertCurrent: () => void) {
     const parsed = ArtifactSchema.safeParse(result.entity);
     if (!applied(result) || !parsed.success) return;
     const artifact = parsed.data;
@@ -101,14 +101,13 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
         createHash('sha256').update(bytes).digest('hex') !== artifact.hash
       )
         throw new Error('The patch checksum changed.');
-      if (window.isDestroyed()) return;
+      assertCurrent();
       const choice = await dialog.showSaveDialog(window, {
         title: 'Save exported patch',
         defaultPath: 'candidate.patch',
         filters: [{ name: 'Patch', extensions: ['patch'] }],
       });
-      if (window.isDestroyed() || window.webContents.getURL() !== 'app://crewkite/index.html')
-        return;
+      assertCurrent();
       if (choice.canceled || !choice.filePath) {
         notice({ kind: 'export', artifactId: artifact.id, outcome: 'cancelled' });
         return;
@@ -130,14 +129,14 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       notice({ kind: 'export', artifactId: artifact.id, outcome: 'failed' });
     }
   }
-  async function execute(command: Command) {
+  async function execute(command: Command, assertCurrent: () => void) {
     const exportResult =
       command.command === 'ExportPatch' ||
       (command.command === 'ResolveApproval' &&
         command.payload.decision === 'approved' &&
         command.payload.binding.action === 'export-patch');
     const result = await send(command);
-    if (exportResult) await save(result);
+    if (exportResult) await save(result, assertCurrent);
     return result;
   }
   const handlers = ['snapshot', 'command', 'pick-project', 'reconnect', 'retry', 'events'];
@@ -186,7 +185,7 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       throw new Error('Retry the existing uncertain stop with its exact command key.');
     busy = true;
     try {
-      const result = await execute(command);
+      const result = await execute(command, () => assertSender(event, window));
       assertSender(event, window);
       return result;
     } finally {
@@ -227,7 +226,7 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
     if (!receipts.commands.length) return null;
     busy = true;
     try {
-      const result = await execute(receipts.commands[0]);
+      const result = await execute(receipts.commands[0], () => assertSender(event, window));
       assertSender(event, window);
       return result;
     } finally {
