@@ -1,5 +1,10 @@
 # CrewKite
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="apps/desktop/src/renderer/assets/crewkite-wordmark-inverse.png">
+  <img src="apps/desktop/src/renderer/assets/crewkite-wordmark.png" alt="CrewKite" width="320" height="107">
+</picture>
+
 CrewKite is a desktop workspace and CLI for coding with local models and the official coding clients from OpenAI, Anthropic and Google in one place. It shows what each subscription reports about usage and reset windows, assigns work using those limits, and keeps every task recoverable so another provider can continue it when one stops mid-task.
 
 Status: early prototype. The first milestone runs the whole journey against scripted fake providers. No live provider route is qualified yet.

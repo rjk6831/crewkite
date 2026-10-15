@@ -42,6 +42,8 @@ import {
   X,
 } from 'lucide-react';
 import { type FormEvent, type ReactNode, type RefObject, useEffect, useRef, useState } from 'react';
+import wordmark from './assets/crewkite-wordmark.png';
+import inverseWordmark from './assets/crewkite-wordmark-inverse.png';
 import {
   Dialog,
   Fact,
@@ -231,13 +233,13 @@ export function App() {
           onClick={() => setAbout(true)}
           aria-label="About CrewKite"
         >
-          <span className="brand-mark">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M4 4 21 10 12 14 8 22 4 4Z" fill="currentColor" />
-              <path d="m4 4 8 10" stroke="var(--sidebar)" strokeWidth="1.5" />
-            </svg>
-          </span>
-          <span>CrewKite</span>
+          <img
+            className="brand-wordmark"
+            src={theme === 'light' ? wordmark : inverseWordmark}
+            alt="CrewKite"
+            width={1024}
+            height={341}
+          />
           <span className="prototype-tag">D0</span>
         </button>
         <button type="button" className="search-button" onClick={() => setPalette(true)}>
@@ -1344,11 +1346,20 @@ function Checks({
                 <span className={`result-symbol ${value.passed ? 'passed' : 'failed'}`}>
                   {value.passed ? <Check size={14} /> : <X size={14} />}
                 </span>
-                <div>
-                  <strong>{value.evaluator}</strong>
-                  <code>
-                    Definition {short(value.definitionHash)} · {short(value.candidateHash)}
-                  </code>
+                <div className="evidence-copy">
+                  <strong>
+                    {value.review
+                      ? `Scripted ${titleCase(value.review.job.methodId.replaceAll('-', ' '))} · cycle ${value.review.job.cycle}`
+                      : value.evaluator.startsWith('node:')
+                        ? 'Node checks'
+                        : 'Recorded check'}
+                  </strong>
+                  <details>
+                    <summary>Evidence identity</summary>
+                    <code>Evaluator {value.evaluator}</code>
+                    <code>Definition {value.definitionHash}</code>
+                    <code>Candidate {value.candidateHash}</code>
+                  </details>
                 </div>
                 <StateChip state={value.passed ? 'ready' : 'failed'} />
               </div>

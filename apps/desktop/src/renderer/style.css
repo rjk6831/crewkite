@@ -313,19 +313,18 @@ td:first-child .provider-dot {
   font-weight: 600;
   letter-spacing: -0.35px;
 }
-.brand-mark {
-  display: grid;
-  place-items: center;
-  width: 28px;
-  height: 28px;
-  color: var(--accent);
-}
-.brand-mark svg {
-  width: 25px;
-  height: 25px;
+.brand-wordmark {
+  display: block;
+  flex: 1;
+  min-width: 0;
+  max-width: 148px;
+  height: 50px;
+  object-fit: contain;
+  object-position: left center;
 }
 .prototype-tag {
   margin-left: auto;
+  flex-shrink: 0;
   font-family: "JetBrains Mono", monospace;
   font-size: 9px;
   letter-spacing: 0.3px;
@@ -1381,11 +1380,21 @@ kbd {
   font-size: 11px;
   font-weight: 500;
 }
+.evidence-copy {
+  flex: 1;
+  min-width: 0;
+}
+.evidence-list summary {
+  margin-top: 5px;
+  font-size: 10px;
+  color: var(--text-dim);
+}
 .evidence-list code {
   display: block;
   margin-top: 5px;
   font-size: 9px;
   color: var(--text-dim);
+  overflow-wrap: anywhere;
 }
 .evidence-list .state-chip {
   margin-left: auto;
