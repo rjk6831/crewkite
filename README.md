@@ -75,7 +75,7 @@ The controller is a headless Node process. It owns permissions, budgets, task ow
 
 | Milestone | Outcome | Status |
 |-----------|---------|--------|
-| D0 | Desktop and CLI run the full task journey against fake providers | In progress |
+| D0 | Desktop and CLI run the full task journey against fake providers | Local demo verified |
 | D1a | One qualified official client does useful supervised work with manual export | Planned |
 | D1b | Checked results: immutable candidates, independent checks and review, local branch acceptance | Planned |
 | D2 | Local, OpenAI, Anthropic and Google routes with handoff, honest usage and two-slice parallel work | Planned |
