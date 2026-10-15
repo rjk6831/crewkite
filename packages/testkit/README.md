@@ -49,3 +49,11 @@ Approval frames authorize the named host action. The controller must honor a den
 Stubborn mode acknowledges descendant readiness before emitting its checkpoint. The output marker is JSON text with `fixture: "stubborn-child-ready"` and its PID. The descendant inherits the worker process group and stdout. It ignores SIGINT and SIGTERM. Parent exit cannot prove quiescence.
 
 The host must launch an isolated process group. Cleanup explicitly kills that group and waits for stdout to close. SIGUSR2 releases the descendant alone when a test needs that control. Every test that starts stubborn mode owns cleanup, including failure paths.
+
+## Scripted reviews
+
+`fakeReviewWorkerPath` selects a separate executable. Send one shared `review` input with the full job, fresh candidate directory, criteria and optional guidance. It emits `ready`, a job-bound `review` result and a terminal event. A completed process can still return a failed or blocked review.
+
+Each method inspects fixed patterns in the synthetic `net.mjs` challenge. Keep it simple checks its export scope. Challenge assumptions checks its input guard. Second opinion checks its clamp. Round-robin checks one of those facts per cycle. Results identify themselves as SCRIPTED. These patterns prove job plumbing; they make no claim about model judgment or general code quality.
+
+The executable opens candidate files for reading only. It never runs candidate code or changes files. Missing, linked, oversized or invalid UTF-8 source blocks the review. The controller owns the full candidate manifest check before and after execution and matches every returned job field before recording evidence.
