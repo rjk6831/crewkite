@@ -322,6 +322,33 @@ export const SealedHandoffPacketSchema = z.strictObject({
   checksum: HashSchema,
 });
 
+export const DesktopNoticeSchema = z.discriminatedUnion('kind', [
+  z.strictObject({
+    kind: z.literal('connection'),
+    state: z.enum(['connecting', 'connected', 'offline']),
+    reconnectAvailable: z.boolean(),
+  }),
+  z.strictObject({ kind: z.literal('history-gap'), after: CursorSchema }),
+  z.strictObject({ kind: z.literal('retry'), available: z.boolean() }),
+  z.strictObject({
+    kind: z.literal('export'),
+    artifactId: ArtifactIdSchema,
+    outcome: z.enum(['saved', 'cancelled', 'failed']),
+  }),
+]);
+export type DesktopNotice = z.infer<typeof DesktopNoticeSchema>;
+export const RuntimeManifestSchema = z.strictObject({
+  version: z.literal(1),
+  node: z.strictObject({
+    version: z.literal('24.22.0'),
+    platform: z.enum(['darwin', 'linux']),
+    arch: z.enum(['arm64', 'x64']),
+    sha256: HashSchema,
+  }),
+  mode: z.literal('demo'),
+});
+export type RuntimeManifest = z.infer<typeof RuntimeManifestSchema>;
+
 const actor = z.strictObject({ id: label, kind: z.enum(['desktop', 'cli', 'controller']) });
 const envelope = { protocol: z.literal(1), key: CommandIdSchema, actor };
 const mutation = { ...envelope, expectedRevision: RevisionSchema };

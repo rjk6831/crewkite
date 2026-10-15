@@ -8,6 +8,7 @@ import {
   CommandSchema,
   CursorSchema,
   canonicalJson,
+  DesktopNoticeSchema,
   FakeWorkerEventSchema,
   FakeWorkerInputSchema,
   GrantSchema,
@@ -16,6 +17,7 @@ import {
   PolicySchema,
   RemainingBudgetsSchema,
   ReviewJobSchema,
+  RuntimeManifestSchema,
   SourceSchema,
   TransportMessageSchema,
 } from './index.ts';
@@ -32,6 +34,51 @@ const command = {
 
 test('process boundaries reject unknown fields and invalid command identity', () => {
   assert.ok(CommandSchema.safeParse(command).success);
+  const notices = [
+    { kind: 'connection', state: 'offline', reconnectAvailable: true },
+    { kind: 'history-gap', after: '0' },
+    { kind: 'retry', available: false },
+    { kind: 'export', artifactId: `art_${suffix}`, outcome: 'cancelled' },
+  ];
+  for (const notice of notices) {
+    assert.ok(DesktopNoticeSchema.safeParse(notice).success);
+    assert.equal(DesktopNoticeSchema.safeParse({ ...notice, extra: true }).success, false);
+  }
+  for (const invalid of [
+    { ...notices[0], state: 'ready' },
+    { ...notices[0], reconnectAvailable: 'true' },
+    { ...notices[1], after: '-1' },
+    { ...notices[2], available: 1 },
+    { ...notices[3], artifactId: 'arbitrary' },
+    { ...notices[3], outcome: 'created' },
+    { ...notices[3], path: '/private/file' },
+  ])
+    assert.equal(DesktopNoticeSchema.safeParse(invalid).success, false);
+  const manifest = {
+    version: 1,
+    node: { version: '24.22.0', platform: 'darwin', arch: 'arm64', sha256: 'a'.repeat(64) },
+    mode: 'demo',
+  };
+  assert.ok(RuntimeManifestSchema.safeParse(manifest).success);
+  assert.ok(
+    RuntimeManifestSchema.safeParse({
+      ...manifest,
+      node: { ...manifest.node, platform: 'linux', arch: 'x64' },
+    }).success,
+  );
+  for (const invalid of [
+    { ...manifest, version: 2 },
+    { ...manifest, mode: 'production' },
+    { ...manifest, entry: '/arbitrary/entry' },
+    ...[
+      { version: '24.21.0' },
+      { platform: 'win32' },
+      { arch: 'ia32' },
+      { sha256: 'invalid' },
+      { path: '/arbitrary/node' },
+    ].map((node) => ({ ...manifest, node: { ...manifest.node, ...node } })),
+  ])
+    assert.equal(RuntimeManifestSchema.safeParse(invalid).success, false);
   const checkSummary = {
     type: 'summary',
     file: null,
