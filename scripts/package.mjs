@@ -38,17 +38,33 @@ if (execFileSync(node, ['--version'], { encoding: 'utf8' }).trim() !== `v${nodeV
 
 const stage = join(primary, 'internal/packages/d0', values.id);
 const build = join(primary, 'internal/package-build', values.id);
+if (Buffer.byteLength(join(stage, 'state/home/control.sock')) > 100)
+  throw new Error('Choose a shorter build name for the packaged controller socket.');
 if (existsSync(stage) || existsSync(build))
   throw new Error('Build or package directory already exists. Choose an unused --id.');
+const revision = git('rev-parse', 'HEAD');
+const bootstrapFiles = ['scripts/demo-controller.ts', 'scripts/demo-state.ts'];
+for (const path of bootstrapFiles) {
+  try {
+    execFileSync('git', ['cat-file', '-e', `${revision}:${path}`], {
+      cwd: source,
+      stdio: 'ignore',
+    });
+  } catch {
+    throw new Error(`The committed desktop bootstrap is unavailable: ${path}.`);
+  }
+}
 mkdirSync(build, { recursive: true });
 const checkout = join(build, 'source');
 mkdirSync(checkout);
-const revision = git('rev-parse', 'HEAD');
 const archive = execFileSync('git', ['archive', '--format=tar', revision], {
   cwd: source,
   maxBuffer: 64 * 1024 * 1024,
 });
 execFileSync('tar', ['-xf', '-', '-C', checkout], { input: archive });
+for (const path of bootstrapFiles)
+  if (!lstatSync(join(checkout, path)).isFile())
+    throw new Error(`The committed desktop bootstrap must be a regular file: ${path}.`);
 const lockHash = hash(join(checkout, 'pnpm-lock.yaml'));
 if (hash(join(primary, 'pnpm-lock.yaml')) !== lockHash)
   throw new Error('The installed dependency source uses a different lockfile.');
@@ -112,6 +128,9 @@ const built = spawnSync(node, [join(dirname(builder), 'bin/electron-vite.js'), '
 });
 if (built.error) throw built.error;
 if (built.status !== 0) throw new Error('The isolated package build failed.');
+const preload = join(checkout, 'apps/desktop/out/preload/index.cjs');
+if (!existsSync(preload) || !lstatSync(preload).isFile() || lstatSync(preload).size === 0)
+  throw new Error('The desktop build must produce the sandboxed CommonJS preload.');
 
 mkdirSync(stage, { recursive: true });
 function copy(from, to) {
@@ -155,10 +174,7 @@ writeFileSync(
     2,
   )}\n`,
 );
-const bootstrap = join(checkout, 'scripts/demo-controller.ts');
-if (existsSync(bootstrap))
-  for (const name of ['demo-controller.ts', 'demo-state.ts'])
-    copy(join(checkout, 'scripts', name), join(runtime, 'scripts', name));
+for (const path of bootstrapFiles) copy(join(checkout, path), join(runtime, path));
 mkdirSync(join(stage, 'bin'));
 const launcherRoot = '#!/bin/sh\nset -eu\nroot=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)\n';
 writeFileSync(
@@ -270,7 +286,10 @@ function inspect(directory) {
 for (const entry of [
   'Electron.app/Contents/MacOS/Electron',
   `app/${desktop.main}`,
+  'app/out/preload/index.cjs',
   'app/runtime/bin/node',
+  'app/runtime/scripts/demo-controller.ts',
+  'app/runtime/scripts/demo-state.ts',
   'app/runtime/apps/controller/src/main.ts',
   'app/runtime/apps/controller/src/evidence/reporter.ts',
   'app/runtime/apps/cli/src/main.ts',
@@ -293,7 +312,7 @@ writeFileSync(
       platform: 'darwin',
       architecture: 'arm64',
       qualification: 'static-stage-only',
-      bootstrap: existsSync(bootstrap) ? 'present' : 'not-built',
+      bootstrap: 'present',
       runtime: { path: 'app/runtime/bin/node', version: nodeVersion, sha256: nodeHash },
       electron: { version: electronVersion },
       notices,

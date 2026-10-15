@@ -31,4 +31,4 @@ Three open-source projects shaped the review methods:
 - [ADHD](https://github.com/UditAkhourii/adhd) for bounded assumption challenges during planning
 - [multi](https://github.com/szarkans/multi) for independent and round-robin review
 
-CrewKite implements its own versions of these methods as finite jobs. No code from them is copied.
+CrewKite implements these methods as finite jobs. D0 uses scripted review jobs bound to the method, cycle, route and immutable candidate. They establish fixture behavior and job identity; model review remains unqualified. No upstream runtime source is copied. The contribution ladder is a prose adaptation recorded in the [credits and notices](credits.md).
