@@ -2,12 +2,27 @@
   "name": "crewkite",
   "private": true,
   "type": "module",
+  "packageManager": "pnpm@12.11.2",
   "engines": {
-    "node": ">=24"
+    "node": ">=24 <25"
   },
   "scripts": {
-    "prepare": "git config core.hooksPath .githooks || true",
+    "prepare": "git config core.hooksPath .githooks",
     "policy": "node scripts/policy.mjs all",
-    "verify": "node scripts/policy.mjs all && node --test scripts/policy.test.mjs"
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "types": "tsc --noEmit",
+    "test": "node --test scripts/policy.test.mjs packages/contracts/src/contracts.test.ts",
+    "build": "pnpm --filter @crewkite/desktop build",
+    "verify": "pnpm policy && pnpm lint && pnpm types && pnpm test && pnpm build",
+    "crewkite": "node apps/cli/src/main.ts",
+    "controller": "node apps/controller/src/main.ts",
+    "desktop:install": "pnpm --filter @crewkite/desktop exec install-electron"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.15",
+    "@playwright/test": "1.64.1",
+    "@types/node": "24.19.2",
+    "typescript": "7.0.2"
   }
 }

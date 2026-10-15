@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "target": "ES2024",
+    "lib": ["ES2024", "DOM", "DOM.Iterable"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+    "jsx": "react-jsx",
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["apps/**/*.ts", "apps/**/*.tsx", "packages/**/*.ts", "e2e/**/*.ts"]
+}

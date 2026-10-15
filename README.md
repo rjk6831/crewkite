@@ -60,7 +60,15 @@ Details live in [docs/roadmap.md](docs/roadmap.md).
 
 ## Run the prototype
 
-Setup instructions arrive with the D0 prototype. The reference platform is macOS on Apple Silicon with Node 24 and pnpm.
+The workspace foundation requires Node 24 and pnpm 12.11.2 on macOS with Apple Silicon.
+
+```sh
+pnpm install
+pnpm desktop:install
+pnpm verify
+```
+
+The controller, CLI and desktop journey are still under construction. The current checks cover repository policy and shared contract boundaries. They do not run the D0 demo.
 
 ## Documentation
 

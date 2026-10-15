@@ -29,6 +29,7 @@ jobs:
         run: node scripts/policy.mjs branch "$HEAD_REF"
         env:
           HEAD_REF: ${{ github.head_ref }}
+          PROVENANCE_PATTERN: ${{ vars.PROVENANCE_PATTERN }}
       - name: Commit messages
         run: |
           if [ "$EVENT" = pull_request ]; then range="$BASE..$HEAD"
@@ -49,11 +50,32 @@ jobs:
       - name: Policy self-tests
         run: node --test scripts/policy.test.mjs
 
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+      - name: Install pinned package manager
+        run: |
+          npm install --prefix .ci-tools --no-package-lock pnpm@12.11.2
+          echo "$PWD/.ci-tools/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Install workspace
+        run: pnpm install --frozen-lockfile
+      - name: Verify foundation
+        run: pnpm verify
+        env:
+          PROVENANCE_PATTERN: ${{ vars.PROVENANCE_PATTERN }}
+
   # Single required check. It fails unless every predecessor succeeded,
   # so a skipped or cancelled job never counts as coverage.
   required:
     if: always()
-    needs: [policy]
+    needs: [policy, verify]
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
