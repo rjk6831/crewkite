@@ -5,6 +5,7 @@
   "type": "module",
   "exports": "./src/main.ts",
   "dependencies": {
+    "@crewkite/client": "workspace:*",
     "@crewkite/contracts": "workspace:*"
   }
 }

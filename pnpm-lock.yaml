@@ -181,15 +181,24 @@ importers:
 
   apps/cli:
     dependencies:
+      '@crewkite/client':
+        specifier: workspace:*
+        version: link:../../packages/client
       '@crewkite/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
 
   apps/controller:
     dependencies:
+      '@crewkite/client':
+        specifier: workspace:*
+        version: link:../../packages/client
       '@crewkite/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@crewkite/testkit':
+        specifier: workspace:*
+        version: link:../../packages/testkit
 
   apps/desktop:
     dependencies:
@@ -199,6 +208,9 @@ importers:
       '@crewkite/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@crewkite/testkit':
+        specifier: workspace:*
+        version: link:../../packages/testkit
       '@fontsource/inter':
         specifier: 5.3.0
         version: 5.3.0
