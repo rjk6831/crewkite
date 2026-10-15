@@ -17,7 +17,9 @@
     "verify": "pnpm policy && pnpm lint && pnpm types && pnpm test && pnpm build",
     "crewkite": "node apps/cli/src/main.ts",
     "controller": "node apps/controller/src/main.ts",
-    "desktop:install": "pnpm --filter @crewkite/desktop exec install-electron"
+    "desktop:install": "pnpm --filter @crewkite/desktop exec install-electron",
+    "demo": "pnpm build && node scripts/demo.ts",
+    "demo:controller": "node scripts/demo-controller.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.15",

@@ -1,6 +1,7 @@
 import type {
   Command,
   CommandResult,
+  DesktopNotice,
   Event,
   Snapshot,
   TransportMessage,
@@ -19,6 +20,10 @@ export interface DesktopSource {
   command(input: DesktopCommand): Promise<CommandResult>;
   subscribe(onEvent: (event: Event) => void): () => void;
   onConnection?(listener: (state: ConnectionState) => void): () => void;
+  pickProject?(): Promise<CommandResult | null>;
+  reconnect?(): Promise<void>;
+  retryCommand?(): Promise<CommandResult | null>;
+  onNotice?(listener: (notice: DesktopNotice) => void): () => void;
 }
 
 export class ProtocolError extends Error {
