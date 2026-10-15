@@ -1,0 +1,11 @@
+#!/bin/sh
+# Reject pushes to branch names outside the <type>/<kebab-topic> convention.
+zero=0000000000000000000000000000000000000000
+status=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "$zero" ] && continue
+  case "$remote_ref" in
+    refs/heads/*) node scripts/policy.mjs branch "${remote_ref#refs/heads/}" || status=1 ;;
+  esac
+done
+exit $status

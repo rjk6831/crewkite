@@ -1,0 +1,13 @@
+{
+  "name": "crewkite",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "prepare": "git config core.hooksPath .githooks || true",
+    "policy": "node scripts/policy.mjs all",
+    "verify": "node scripts/policy.mjs all && node --test scripts/policy.test.mjs"
+  }
+}

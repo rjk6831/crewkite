@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+      - name: Branch name
+        if: github.event_name == 'pull_request'
+        run: node scripts/policy.mjs branch "$HEAD_REF"
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+      - name: Commit messages
+        run: |
+          if [ "$EVENT" = pull_request ]; then range="$BASE..$HEAD"
+          elif [ "$BEFORE" != 0000000000000000000000000000000000000000 ]; then range="$BEFORE..$AFTER"
+          else range=""; fi
+          node scripts/policy.mjs commits $range
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          PROVENANCE_PATTERN: ${{ vars.PROVENANCE_PATTERN }}
+      - name: Tree, prose and provenance
+        run: node scripts/policy.mjs all
+        env:
+          PROVENANCE_PATTERN: ${{ vars.PROVENANCE_PATTERN }}
+      - name: Policy self-tests
+        run: node --test scripts/policy.test.mjs
+
+  # Single required check. It fails unless every predecessor succeeded,
+  # so a skipped or cancelled job never counts as coverage.
+  required:
+    if: always()
+    needs: [policy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Every predecessor succeeded
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: exit 1

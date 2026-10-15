@@ -1,0 +1,39 @@
+# Dependencies, builds and local runtime state
+node_modules/
+dist/
+out/
+coverage/
+test-results/
+playwright-report/
+*.tsbuildinfo
+*.log
+.DS_Store
+
+# Private working material: specifications, prompts, handoffs, notes.
+/internal/
+
+# Upper-case Markdown names are reserved for the public files below.
+# Instruction files for local tools stay untracked at every level.
+[A-Z]*.md
+!README.md
+!CHANGELOG.md
+!/CONTRIBUTING.md
+!/SECURITY.md
+!/docs/architecture.md
+!/docs/continuity.md
+!/docs/history.md
+!/docs/providers.md
+!/docs/roadmap.md
+!/docs/routing.md
+!/docs/testing.md
+
+# Root dot entries are allowlisted. Editor and tool folders stay untracked.
+/.*
+!/.gitignore
+!/.gitattributes
+!/.editorconfig
+!/.nvmrc
+!/.npmrc
+!/.github/
+!/.githooks/
+!/.github/pull_request_template.md
