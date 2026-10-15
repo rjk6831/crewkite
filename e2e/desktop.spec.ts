@@ -181,6 +181,7 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     await observer.subscribe('0', (event) => timeline.append(event));
     application = await _electron.launch({
       executablePath: require('electron'),
+      chromiumSandbox: true,
       args: [join(root, 'apps/desktop')],
       env: {
         ...environment(home),

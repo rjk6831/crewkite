@@ -17,6 +17,7 @@ const profile = join(home, 'capture-profile');
 const require = createRequire(join(root, 'apps/desktop/package.json'));
 const application = await _electron.launch({
   executablePath: require('electron'),
+  chromiumSandbox: true,
   args: [join(root, 'apps/desktop')],
   env: {
     PATH: process.env.PATH,
