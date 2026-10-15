@@ -25,7 +25,10 @@ export function useWorkspace() {
   const preview = new URLSearchParams(window.location.search).get('preview') === '1';
   const source = useMemo(() => (preview ? createPreviewSource() : window.crewkite), [preview]);
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
-  const [events, setEvents] = useState<Event[]>([]);
+  const [{ events, droppedThrough }, setActivity] = useState<{
+    events: Event[];
+    droppedThrough: string | null;
+  }>({ events: [], droppedThrough: null });
   const [connection, setConnection] = useState('connecting');
   const [error, setError] = useState<string | null>(null);
   const [transportError, setTransportError] = useState<string | null>(null);
@@ -95,12 +98,17 @@ export function useWorkspace() {
         setError('An invalid controller event was rejected. Reconnect to refresh the workspace.');
         return;
       }
-      setEvents((current) => {
-        if (current.some(({ id }) => id === parsed.data.id)) return current;
+      setActivity((current) => {
+        if (current.events.some(({ id }) => id === parsed.data.id)) return current;
         // shortcut: retain 200 activity rows in this view. Upgrade: page older events by cursor.
-        return [...current, parsed.data]
-          .sort((a, b) => (BigInt(a.cursor) < BigInt(b.cursor) ? -1 : 1))
-          .slice(-200);
+        const ordered = [...current.events, parsed.data].sort((a, b) =>
+          BigInt(a.cursor) < BigInt(b.cursor) ? -1 : 1,
+        );
+        return {
+          events: ordered.slice(-200),
+          droppedThrough:
+            ordered.length > 200 ? ordered[ordered.length - 201].cursor : current.droppedThrough,
+        };
       });
       void refresh().catch((failure: unknown) => {
         if (active)
@@ -230,7 +238,7 @@ export function useWorkspace() {
     reconnect,
     retryCommand,
     retryAvailable,
-    historyGap,
+    historyGap: historyGap ?? droppedThrough,
     exportNotice,
     dismissExportNotice: () => setExportNotice(null),
   };

@@ -463,8 +463,10 @@ export function App() {
                       <StateChip state={task.state} />
                       <span className="revision">Revision {task.revision}</span>
                     </div>
-                    <h1>{task.title}</h1>
-                    <p className="task-outcome">{task.outcome}</p>
+                    <section className="task-summary" aria-label="Task summary">
+                      <h1>{task.title}</h1>
+                      <p className="task-outcome">{task.outcome}</p>
+                    </section>
                     <div className="task-actions">
                       <div className="next-action">
                         <span className={`status-dot state-${task.state}`} />
