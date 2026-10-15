@@ -27,7 +27,12 @@ export type FileEntry = { path: string; mode: '100644' | '100755'; hash: string;
 export type FileContent = FileEntry & { content: Buffer };
 const MAX_SOURCE_BYTES = 64 * 1024 * 1024;
 
-export function git(directory: string, args: string[], input?: Buffer | string): Buffer {
+export function git(
+  directory: string,
+  args: string[],
+  input?: Buffer | string,
+  identity?: { name: string; email: string; at: string },
+): Buffer {
   return execFileSync(
     'git',
     [
@@ -59,6 +64,16 @@ export function git(directory: string, args: string[], input?: Buffer | string):
         GIT_CONFIG_GLOBAL: devNull,
         GIT_TERMINAL_PROMPT: '0',
         GIT_OPTIONAL_LOCKS: '0',
+        ...(identity
+          ? {
+              GIT_AUTHOR_NAME: identity.name,
+              GIT_AUTHOR_EMAIL: identity.email,
+              GIT_AUTHOR_DATE: identity.at,
+              GIT_COMMITTER_NAME: identity.name,
+              GIT_COMMITTER_EMAIL: identity.email,
+              GIT_COMMITTER_DATE: identity.at,
+            }
+          : {}),
       },
       stdio: ['pipe', 'pipe', 'pipe'],
     },
@@ -181,21 +196,26 @@ export function safePath(path: string, seen: Set<string>, prefixes: Map<string, 
     !path ||
     isAbsolute(path) ||
     path.includes('\\') ||
+    path.includes('\0') ||
     path
       .split('/')
       .some((part) => !part || part === '.' || part === '..' || part.toLowerCase() === '.git')
   )
     throw new Error('Source contains an unsupported path.');
+  const canonical = path.normalize('NFC').toLowerCase();
+  if (seen.has(canonical) || prefixes.has(canonical))
+    throw new Error('Source contains a path collision.');
   const parts = path.split('/');
   for (let end = 1; end <= parts.length; end++) {
     const prefix = parts.slice(0, end).join('/');
     const key = prefix.normalize('NFC').toLowerCase();
-    if (prefixes.has(key) && prefixes.get(key) !== prefix)
+    if (
+      (end < parts.length && seen.has(key)) ||
+      (prefixes.has(key) && prefixes.get(key) !== prefix)
+    )
       throw new Error('Source contains a directory collision.');
     prefixes.set(key, prefix);
   }
-  const canonical = path.normalize('NFC').toLowerCase();
-  if (seen.has(canonical)) throw new Error('Source contains a path collision.');
   seen.add(canonical);
 }
 

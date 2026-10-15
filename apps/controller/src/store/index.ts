@@ -30,6 +30,8 @@ export type LaunchIntent = {
   state: 'intent' | 'acknowledged' | 'outcome-unknown' | 'interrupted' | 'stopped';
   pid: number | null;
   process_group: number | null;
+  admitted_at: string | null;
+  finished_at: string | null;
 };
 
 export class Store {
@@ -171,10 +173,11 @@ export class Store {
 
   eventsAfter(cursor: string): Event[] {
     if (BigInt(cursor) > BigInt(this.cursor())) throw new Error('history-gap');
-    return this.db
-      .prepare('SELECT body FROM events WHERE cursor>? ORDER BY cursor')
-      .all(BigInt(cursor))
-      .map((row) => EventSchema.parse(JSON.parse(row.body as string)));
+    const rows = this.db
+      .prepare('SELECT body FROM events WHERE cursor>? ORDER BY cursor LIMIT 1001')
+      .all(BigInt(cursor));
+    if (rows.length > 1000) throw new Error('history-gap');
+    return rows.map((row) => EventSchema.parse(JSON.parse(row.body as string)));
   }
 
   intents(): LaunchIntent[] {

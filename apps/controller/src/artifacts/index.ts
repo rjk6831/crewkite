@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import {
   closeSync,
   constants,
+  fstatSync,
   fsyncSync,
   linkSync,
   lstatSync,
@@ -60,10 +61,17 @@ export class ArtifactFiles {
 
   read(hash: string): Buffer {
     const path = this.path(hash);
-    const state = lstatSync(path);
-    if (!state.isFile() || state.isSymbolicLink())
-      throw new Error('Artifact is not a regular file.');
-    const content = readFileSync(path);
+    const file = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    let content: Buffer;
+    try {
+      const state = fstatSync(file);
+      if (!state.isFile() || state.nlink !== 1 || state.size > 64 * 1024 * 1024)
+        throw new Error('Artifact is not a bounded regular file.');
+      content = readFileSync(file);
+      if (content.length !== state.size) throw new Error('Artifact changed during its read.');
+    } finally {
+      closeSync(file);
+    }
     if (createHash('sha256').update(content).digest('hex') !== hash)
       throw new Error('Artifact checksum failed.');
     return content;
