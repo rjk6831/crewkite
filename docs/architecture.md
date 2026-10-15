@@ -127,7 +127,7 @@ The current host uses Unix process groups and requires closed output streams bef
 
 After quiescence, the controller imports the scratch changes, hashes them and stores an immutable candidate. Checks and reviews bind to the exact candidate hash, check definition and evaluator. Changing one byte, shrinking the collected test set or altering the evaluator invalidates the evidence that depended on it.
 
-D0 check qualification requires the fixed synthetic `netMinor` definition, its original test file hash and the expected file-qualified test completions. An import that exits before registering tests must fail that boundary. The current reporter has not completed this qualification gate. Other repositories can be registered and inspected; their checks are unqualified.
+D0 checks qualify the fixed synthetic `netMinor` definition. The original test file hash, required file-qualified test completions and reporter identity are part of the check definition. An import that exits before registering tests cannot establish a pass. Other repositories can be registered and inspected; their checks are unqualified.
 
 Standard quality requires the scripted `second-opinion` and `keep-it-simple` jobs. Thorough adds `challenge-assumptions`. Explicit methods retain their bounded cycles. Quick still requires declared checks and labels missing independent review. These jobs inspect fixture patterns. They provide no model judgment or live provider qualification.
 

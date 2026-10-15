@@ -15,6 +15,7 @@ import { join, resolve } from 'node:path';
 import { type TestContext, test } from 'node:test';
 import {
   type Approval,
+  type Artifact,
   ArtifactSchema,
   ProjectSchema,
   RunSchema,
@@ -22,7 +23,9 @@ import {
 } from '@crewkite/contracts';
 import { createDemoFixtures, createTestClock, createTestIds } from '@crewkite/testkit';
 import { createSyntheticRepository } from '@crewkite/testkit/repository';
+import { ArtifactFiles } from '../artifacts/index.ts';
 import { Controller, type ControllerOptions } from '../commands/controller.ts';
+import { CandidateEvidence } from '../evidence/index.ts';
 import { committedFiles, git, inspectSource, materialize, readFiles } from '../host/source.ts';
 
 async function setup(t: TestContext, options: Partial<ControllerOptions> = {}) {
@@ -301,8 +304,8 @@ test('a retained descendant blocks sealing and transfer after its leader exits',
   );
 });
 
-test('one changed candidate byte invalidates passing check authority', async (t) => {
-  const { controller, command, draft, fixtures } = await setup(t);
+test('candidate evidence requires unchanged bytes and completed checks', async (t) => {
+  const { controller, command, draft, fixtures, directory, id, source } = await setup(t);
   const task = TaskSchema.parse((await controller.execute(draft, 'local-owner')).entity);
   const policy = {
     ...fixtures.policy,
@@ -349,6 +352,42 @@ test('one changed candidate byte invalidates passing check authority', async (t)
       )
     ).reason,
     'candidate-binding-changed',
+  );
+  const scratch = join(controller.home, 'scratch', run.id);
+  const module = join(scratch, 'net.mjs');
+  writeFileSync(module, Buffer.concat([Buffer.from('process.exit(0);\n'), readFileSync(module)]));
+  const metadata = new Map<string, Artifact>();
+  const evidence = new CandidateEvidence({
+    home: directory,
+    artifacts: new ArtifactFiles(join(directory, 'negative-artifacts')),
+    id,
+    getArtifact: (artifactId) => {
+      const artifact = metadata.get(artifactId);
+      if (!artifact) throw new Error('Missing fixture artifact.');
+      return artifact;
+    },
+  });
+  const captured = evidence.capture({
+    taskId: task.id,
+    base: source.base,
+    files: readFiles(scratch),
+    existing: [],
+  });
+  for (const artifact of captured.artifacts) metadata.set(artifact.id, artifact);
+  const plan = evidence.prepareChecks({
+    candidate: captured.candidate,
+    sourceFiles: committedFiles(source.directory, source.base),
+    criteria: task.criteria,
+  });
+  const output = execFileSync(process.execPath, plan.argv, {
+    cwd: plan.directory,
+    env: { PATH: process.env.PATH, LANG: 'C', HOME: controller.home },
+    maxBuffer: 1024 * 1024,
+  });
+  assert.equal(
+    evidence.recordCheck({ candidate: captured.candidate, plan, passed: true, output }).evidence
+      .passed,
+    false,
   );
 });
 

@@ -28,7 +28,7 @@ I skip tests for trivial getters, framework behavior, type-only code and markup 
 
 The controller tests cover mutation retries and changed-key rejection, stale revisions, intent-before-spawn recovery, retained descendants, candidate evidence identity and local publication. The full flow uses a manual check approval, reserve transfer, real Node checks and two scripted review jobs. It verifies a new branch over several source ancestors, an immutable patch, unchanged sentinels and index bytes, and an inert clean-filter canary. Pending-action cancellation and export approval preserve coherent task state.
 
-Passing these tests does not yet qualify the synthetic check runner. That boundary also requires the original test file and its expected file-qualified completions. Added tests cannot substitute for those assertions. An import that exits before registering tests must fail. Reporter qualification remains pending; arbitrary repository checks are unqualified.
+The fixed synthetic check definition requires the original test file and its expected file-qualified completions. Added tests cannot substitute for those assertions. Skips, early import exits, incomplete reports and a changed evaluated copy fail the evidence boundary. Arbitrary repository checks are unqualified.
 
 ## The challenge pack
 
