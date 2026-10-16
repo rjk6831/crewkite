@@ -921,12 +921,30 @@ function ActivityView({
               'reason' in event.payload && typeof event.payload.reason === 'string'
                 ? event.payload.reason
                 : null;
+            const outcome =
+              event.type === 'check.completed' || event.type === 'review.completed'
+                ? (event.payload.review?.outcome ??
+                  (event.payload.passed ? 'passed' : 'not passed'))
+                : null;
+            const tone =
+              outcome === 'passed' || event.type === 'candidate.accepted'
+                ? 'success'
+                : outcome === 'failed' || outcome === 'not passed' || event.type === 'run.failed'
+                  ? 'failure'
+                  : outcome === 'blocked' ||
+                      event.type === 'approval.requested' ||
+                      event.type === 'ownership.unknown' ||
+                      event.type === 'run.interrupted' ||
+                      event.type === 'route.reserve_reached' ||
+                      event.type === 'admissions.paused'
+                    ? 'warning'
+                    : 'neutral';
             return (
               <article
-                className={`timeline-row event-${event.type.replaceAll('.', '-')}`}
+                className={`timeline-row timeline-${tone} event-${event.type.replaceAll('.', '-')}`}
                 key={event.id}
               >
-                <div className="timeline-marker">
+                <div className="timeline-marker" aria-hidden="true">
                   {event.type === 'handoff.sealed' ? (
                     <GitBranch size={13} />
                   ) : event.type === 'approval.requested' ? (
@@ -939,7 +957,10 @@ function ActivityView({
                 </div>
                 <div className="timeline-content">
                   <div className="timeline-title">
-                    <strong>{eventNames[event.type]}</strong>
+                    <strong>
+                      {eventNames[event.type]}
+                      {outcome && ` · ${titleCase(outcome)}`}
+                    </strong>
                     {provider && (
                       <span className={`provider-label ${familyClass(provider.family)}`}>
                         {provider.family}

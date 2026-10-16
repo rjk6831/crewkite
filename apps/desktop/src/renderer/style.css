@@ -854,8 +854,6 @@ kbd {
 .timeline-row {
   position: relative;
   padding: 0 0 24px 23px;
-  content-visibility: auto;
-  contain-intrinsic-size: auto 60px;
 }
 .timeline-marker {
   position: absolute;
@@ -865,14 +863,18 @@ kbd {
   place-items: center;
   width: 19px;
   height: 19px;
+  border-radius: 50%;
   background: var(--background);
   color: var(--text-dim);
 }
-.event-handoff-sealed .timeline-marker {
-  color: var(--accent);
+.timeline-success .timeline-marker {
+  color: var(--green);
 }
-.event-approval-requested .timeline-marker {
+.timeline-warning .timeline-marker {
   color: var(--amber);
+}
+.timeline-failure .timeline-marker {
+  color: var(--red);
 }
 .timeline-title {
   display: flex;
