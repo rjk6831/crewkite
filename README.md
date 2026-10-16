@@ -7,7 +7,7 @@
 
 CrewKite is a desktop workspace and CLI for coding tasks that share one local controller. It tracks approvals, usage observations and retained work across provider routes.
 
-Status: D0 prototype. The supported demo uses four scripted fake routes. No live provider route is qualified.
+Status: early prototype for macOS on Apple Silicon. The supported demo uses a synthetic project and four scripted fake routes. No live provider route is qualified.
 
 ## Why I am building it
 
@@ -105,7 +105,7 @@ CREWKITE_HOME="$PWD/internal/demo-home" pnpm crewkite task watch <task-id> --jso
 
 Scripted observations intentionally become stale after five minutes. Before preparing a run after an idle period, you can explicitly choose Policy > Unknown usage > Allow selected routes within run limits. The displayed assigned routes use the shown finite limits. Stale labels, reserves and pins remain; percentage-based routing still requires fresh observations.
 
-`pnpm verify` runs 30 tests, including the real desktop and CLI recovery journey, plus policy, lint, types and the desktop build. [Testing](docs/testing.md) separates fixed synthetic evidence, native OS interaction and package checks. The [local directory package](docs/distribution.md) carries its own Node and Electron runtime; Git remains a prerequisite.
+`pnpm verify` runs the test suite, including the real desktop and CLI recovery journey, plus policy, lint, types and the desktop build. [Testing](docs/testing.md) separates fixed synthetic evidence, native OS interaction and package checks. The [local directory package](docs/distribution.md) carries its own Node and Electron runtime; Git remains a prerequisite.
 
 ## Documentation
 
