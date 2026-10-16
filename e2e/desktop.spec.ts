@@ -747,7 +747,23 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     assert.equal(preparedEvaluation.attempts.length, beforeEvaluation.attempts.length);
     assert.equal(preparedEvaluation.candidateEvaluations[0].creditPolicy, 'ordinary');
     assert.equal(cli(home, 'task', 'show', nativeTask.id).evaluation.stage, 'prepared');
+    const evaluation = preparedEvaluation.candidateEvaluations.find(
+      (value) => value.taskId === nativeTask.id,
+    );
+    assert(evaluation);
+    const checkFrom = nativeEvents.rows.length;
     await enter(evaluationPanel.getByRole('button', { name: 'Start local checks', exact: true }));
+    const checked = await nativeEvents.wait(
+      (event) =>
+        event.type === 'check.completed' &&
+        event.taskId === nativeTask.id &&
+        event.payload.candidateId === evaluation.candidateId &&
+        event.payload.candidateHash === evaluation.candidateHash &&
+        event.payload.definitionHash === evaluation.definitionHash,
+      checkFrom,
+    );
+    assert.equal(checked.type, 'check.completed');
+    assert.equal(checked.payload.passed, true);
     await expect(
       evaluationPanel.getByRole('button', { name: 'Start native review', exact: true }),
     ).toBeEnabled();
@@ -755,7 +771,21 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     await expect(
       evaluationPanel.getByRole('button', { name: 'Start local checks', exact: true }),
     ).toBeDisabled();
+    const reviewFrom = nativeEvents.rows.length;
     await enter(evaluationPanel.getByRole('button', { name: 'Start native review', exact: true }));
+    const reviewed = await nativeEvents.wait(
+      (event) =>
+        event.type === 'review.completed' &&
+        event.taskId === nativeTask.id &&
+        event.payload.candidateId === evaluation.candidateId &&
+        event.payload.candidateHash === evaluation.candidateHash &&
+        event.payload.review?.job.scripted === false &&
+        event.payload.review.job.runId === evaluation.runId &&
+        event.payload.review.job.preparationId === evaluation.preparationId,
+      reviewFrom,
+    );
+    assert.equal(reviewed.type, 'review.completed');
+    assert.equal(reviewed.payload.passed, true);
     await expect(evaluationPanel).toContainText('Native review passed.');
     await expect(evaluationPanel).toContainText('separate process only');
     await expect(
