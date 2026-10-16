@@ -4,7 +4,7 @@ import { lstatSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { groupAbsent, type Schedule } from '../../host/worker.ts';
-import { type DiscoveryMetadata, OpenAiDiscovery } from './discovery.ts';
+import { type DiscoveryMetadata, type DiscoveryRequest, OpenAiDiscovery } from './discovery.ts';
 
 type Launch = {
   executable: string;
@@ -19,12 +19,16 @@ type Outcome<T = DiscoveryMetadata> = {
   quiescent: boolean;
   exitCode: number | null;
   signal: NodeJS.Signals | null;
+  lastRequest: DiscoveryRequest;
+  stdoutBytes: number;
+  stderrBytes: number;
 };
 type Transcript<T> = {
   next: () => Uint8Array | null;
   push: (bytes: Uint8Array) => void;
   finish: () => T;
   readonly complete: boolean;
+  readonly pendingRequest: DiscoveryRequest;
 };
 type Spawn = (
   executable: string,
@@ -173,6 +177,8 @@ function startTranscript<T>(
   let closed = false;
   let finished = false;
   let received = 0;
+  let stdoutBytes = 0;
+  let stderrBytes = 0;
   let stopping = false;
   let exitCode: number | null = null;
   let exitSignal: NodeJS.Signals | null = null;
@@ -191,6 +197,9 @@ function startTranscript<T>(
       quiescent,
       exitCode,
       signal: exitSignal,
+      lastRequest: reader.pendingRequest,
+      stdoutBytes,
+      stderrBytes,
     });
   };
   const absent = () => group === 0 || groupAbsent(group);
@@ -229,9 +238,10 @@ function startTranscript<T>(
   child.stdin.on('error', () => stop('protocol'));
   child.on('error', () => stop('launch'));
   child.stdout.on('data', (bytes: Buffer) => {
-    if (stopping || finished) return;
+    stdoutBytes += bytes.length;
     received += bytes.length;
     if (received > 1_048_576) return stop('output-limit');
+    if (stopping || finished) return;
     try {
       reader.push(bytes);
       advance();
@@ -240,6 +250,7 @@ function startTranscript<T>(
     }
   });
   child.stderr.on('data', (bytes: Buffer) => {
+    stderrBytes += bytes.length;
     received += bytes.length;
     if (received > 1_048_576) stop('output-limit');
   });
@@ -274,6 +285,7 @@ type DisabledFeatures = Record<(typeof disabledFeatures)[number], false>;
 class FeatureList implements Transcript<DisabledFeatures> {
   private bytes = Buffer.alloc(0);
   readonly complete = false;
+  readonly pendingRequest = 'features-list' as const;
   next() {
     return null;
   }

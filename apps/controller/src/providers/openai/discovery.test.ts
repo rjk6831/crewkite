@@ -357,6 +357,11 @@ test('provider discovery emits only correlated metadata and excludes private fie
             .split('\n')
             .map((value) => JSON.parse(value)),
         );
+        if (index === 0)
+          assert.deepEqual(
+            (emitted[0] as { params: { capabilities: unknown } }).params.capabilities,
+            { experimentalApi: false, explicitGatewayOauth: true },
+          );
         assert.equal(reader.next(), null, scenario.name);
         const bytes =
           scenario.wire?.(values[index], index) ?? line({ id: index + 1, result: values[index] });

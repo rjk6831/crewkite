@@ -37,6 +37,7 @@ const input = createInterface({ input: process.stdin });
 input.on('line', line => {
   const message = JSON.parse(line);
   if (!message.id) return;
+  if (message.method === 'initialize' && (message.params.capabilities.explicitGatewayOauth !== true || message.params.capabilities.experimentalApi !== false)) process.exit(3);
   if (mode === 'invalid' || mode === 'stubborn') {
     if (mode === 'stubborn') spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], { stdio: 'inherit' });
     process.stdout.write(JSON.stringify({ id: 99, method: 'auth/request', secret: 'private-native-diagnostic' }) + '\\n');
@@ -145,6 +146,14 @@ test('native discovery returns metadata only after its owned process and descend
         mode,
       );
       assert.equal(result.quiescent, true, mode);
+      assert(Number.isSafeInteger(result.stdoutBytes) && result.stdoutBytes >= 0, mode);
+      assert(Number.isSafeInteger(result.stderrBytes) && result.stderrBytes >= 0, mode);
+      if (mode === 'feature-enabled' || mode === 'feature-missing')
+        assert.equal(result.lastRequest, 'features-list', mode);
+      if (mode === 'invalid' || mode === 'stubborn')
+        assert.equal(result.lastRequest, 'initialize', mode);
+      if (mode === 'policy-change')
+        assert.equal(result.lastRequest, 'configRequirements/read', mode);
       for (const group of handle.groups) if (group > 0) assert(groupAbsent(group), mode);
       assert(!JSON.stringify(result).includes('private-native-diagnostic'), mode);
       if (mode === 'success' || mode === 'descendant') {

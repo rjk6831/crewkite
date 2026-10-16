@@ -15,7 +15,10 @@ const outgoing = z.union([
         title: z.literal('CrewKite'),
         version: z.literal('0.0.0'),
       }),
-      capabilities: z.strictObject({ experimentalApi: z.literal(false) }),
+      capabilities: z.strictObject({
+        experimentalApi: z.literal(false),
+        explicitGatewayOauth: z.literal(true),
+      }),
     }),
   }),
   z.strictObject({ method: z.literal('initialized') }),
@@ -51,7 +54,7 @@ const requests: z.input<typeof outgoing>[][] = [
       method: 'initialize',
       params: {
         clientInfo: { name: 'crewkite', title: 'CrewKite', version: '0.0.0' },
-        capabilities: { experimentalApi: false },
+        capabilities: { experimentalApi: false, explicitGatewayOauth: true },
       },
     },
   ],
@@ -212,6 +215,15 @@ export type DiscoveryMetadata = {
   configuration?: z.output<typeof configuration>;
   requirements?: z.output<typeof requirements>;
 };
+export type DiscoveryRequest =
+  | 'features-list'
+  | 'initialize'
+  | 'account/read'
+  | 'config/read'
+  | 'configRequirements/read'
+  | 'account/rateLimits/read'
+  | 'model/list'
+  | 'complete';
 type Failure =
   | 'invalid-message'
   | 'unexpected-message'
@@ -396,5 +408,16 @@ export class OpenAiDiscovery {
 
   get complete(): boolean {
     return this.step === requests.length && this.failed === null && this.pending.length === 0;
+  }
+
+  get pendingRequest(): DiscoveryRequest {
+    if (this.step === 0) return 'initialize';
+    if (this.step === 1) return 'account/read';
+    if (this.step === 2) {
+      if (this.readConfiguration && !this.configuration) return 'config/read';
+      if (this.readConfiguration && !this.requirements) return 'configRequirements/read';
+      return 'account/rateLimits/read';
+    }
+    return this.step === 3 ? 'model/list' : 'complete';
   }
 }
