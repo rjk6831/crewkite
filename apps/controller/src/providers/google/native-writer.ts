@@ -33,6 +33,7 @@ const text = (max: number) =>
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
 const count = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
 const effort = z.enum(['low', 'medium', 'high', 'xhigh', 'max']);
+const permissionMode = z.enum(['request-review', 'strict', 'always-proceed', 'proceed-in-sandbox']);
 const path = text(512).refine(
   (value) =>
     !isAbsolute(value) &&
@@ -61,7 +62,7 @@ const init = z.strictObject({
   init: z.strictObject({
     cwd: text(4096),
     tools: z.array(text(200)).max(256),
-    permission_mode: z.enum(['request-review', 'strict']),
+    permission_mode: permissionMode,
     model: text(200),
     agent: text(200).optional(),
     json_schema: z.unknown().optional(),
@@ -141,7 +142,7 @@ type Expectation = {
   attemptId: string;
   directory: string;
   model: string;
-  permissionMode: 'request-review' | 'strict';
+  permissionMode: z.infer<typeof permissionMode>;
   path: string;
   baseHash: string;
 };
@@ -329,7 +330,7 @@ const admission = z.strictObject({
   clientSha256: hash,
   checkedAt: z.iso.datetime(),
   nativeTrust: z.literal('accepted'),
-  permissions: z.enum(['request-review', 'strict']),
+  permissions: permissionMode,
   billing: z.literal('subscription-only'),
   extraCredits: z.literal('disabled'),
   evidence: z.strictObject({
