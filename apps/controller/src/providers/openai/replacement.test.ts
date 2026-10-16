@@ -440,20 +440,98 @@ test('a replacement requires one matching completed turn and bounded original-fi
       refusedEnvelope: malformed.refusedEnvelope,
     }).includes(canary),
   );
-  for (const ordinaryUsageAllowed of [false, undefined]) {
-    const blocked = new ReplacementTranscript(plan(directory), {
+  const available = { limitId: 'codex', credits: { hasCredits: true, unlimited: false } };
+  for (const row of [
+    { ordinaryUsageAllowed: true, allowed: true },
+    { ordinaryUsageAllowed: false, allowed: false },
+    { ordinaryUsageAllowed: undefined, allowed: false },
+    { policy: 'existing-credits', ordinaryUsageAllowed: true, rateLimits: {}, allowed: true },
+    { policy: 'existing-credits', ordinaryUsageAllowed: false, allowed: true },
+    { policy: 'existing-credits', ordinaryUsageAllowed: null, allowed: false },
+    { policy: 'existing-credits', ordinaryUsageAllowed: undefined, allowed: false },
+    ...[
+      { credits: null },
+      { credits: { hasCredits: false, unlimited: false } },
+      { limitId: null },
+      { limitId: 'other' },
+      { spendControlReached: true },
+      ...[
+        'workspace_owner_credits_depleted',
+        'workspace_member_credits_depleted',
+        'workspace_owner_usage_limit_reached',
+        'workspace_member_usage_limit_reached',
+      ].map((rateLimitReachedType) => ({ rateLimitReachedType })),
+    ].map((override) => ({
+      policy: 'existing-credits',
+      ordinaryUsageAllowed: false,
+      rateLimits: { ...available, ...override },
+      allowed: false,
+    })),
+    ...[
+      { balance: null },
+      { balance: '1234.5678900000' },
+      { unlimited: true, hasCredits: false },
+    ].map((override) => ({
+      policy: 'existing-credits',
+      ordinaryUsageAllowed: false,
+      rateLimits: { ...available, credits: { ...available.credits, ...override } },
+      allowed: true,
+    })),
+    ...[
+      { codex: { ...available, limitId: null } },
+      { codex: { ...available, rateLimitReachedType: 'rate_limit_reached' } },
+    ].map((rateLimitsByLimitId) => ({
+      policy: 'existing-credits',
+      ordinaryUsageAllowed: false,
+      rateLimits: {},
+      rateLimitsByLimitId,
+      allowed: true,
+    })),
+    ...[
+      {},
+      { other: available },
+      { codex: { ...available, limitId: 'other' } },
+      { codex: { ...available, spendControlReached: true } },
+      { codex: { ...available, credits: null } },
+    ].map((rateLimitsByLimitId) => ({
+      policy: 'existing-credits',
+      ordinaryUsageAllowed: false,
+      rateLimitsByLimitId,
+      allowed: false,
+    })),
+  ]) {
+    const selected = replacementPlan({
+      ...plan(directory),
+      ...('policy' in row ? { creditPolicy: row.policy as 'existing-credits' } : {}),
+    });
+    assert(Object.isFrozen(selected));
+    assert.equal(selected.creditPolicy, 'policy' in row ? row.policy : 'ordinary');
+    const reader = new ReplacementTranscript(selected, {
       now: () => 1,
       timeoutMs: 300_000,
     });
-    assert.throws(() =>
-      metadata(blocked, {
+    const admit = () =>
+      metadata(reader, {
         'account/rateLimits/read': {
-          ordinaryUsageAllowed,
-          rateLimits: { credits: { hasCredits: true, unlimited: false } },
+          ordinaryUsageAllowed: row.ordinaryUsageAllowed,
+          rateLimits: 'rateLimits' in row ? row.rateLimits : available,
+          ...('rateLimitsByLimitId' in row ? { rateLimitsByLimitId: row.rateLimitsByLimitId } : {}),
         },
-      }),
-    );
-    assert.equal(blocked.submitted, false);
+      });
+    if (row.allowed) {
+      assert.equal(admit().method, 'thread/start');
+      reader.push(bytes({ id: 10, result: threadResult(directory) }));
+      assert.equal(
+        JSON.parse(Buffer.from(reader.next() as Uint8Array).toString()).method,
+        'turn/start',
+      );
+      reader.push(bytes({ id: 11, result: { turn: running } }));
+      for (const frame of output(directory)) reader.push(bytes(frame));
+      assert.deepEqual(reader.finish().replacement, edit(directory));
+    } else {
+      assert.throws(admit);
+      assert.equal(reader.submitted, false);
+    }
   }
   for (const mcp_servers of [
     undefined,
