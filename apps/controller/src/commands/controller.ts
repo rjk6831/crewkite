@@ -79,7 +79,12 @@ import { fakeReviewWorkerPath, fakeWorkerPath } from '@crewkite/testkit/worker';
 import { z } from 'zod';
 import { ArtifactFiles } from '../artifacts/index.ts';
 import { buildHandoff } from '../continuity/index.ts';
-import { CandidateEvidence, type CheckPlan, NodeCheckDefinitionSchema } from '../evidence/index.ts';
+import {
+  CandidateEvidence,
+  type CheckPlan,
+  completedCheckDefinitionMatches,
+  NodeCheckDefinitionSchema,
+} from '../evidence/index.ts';
 import {
   applyPublication,
   type GitIdentity,
@@ -2317,7 +2322,7 @@ export class Controller {
       ),
       criteria: proof.evaluation.context.criteria,
     });
-    if (hashCanonical(definition) !== hashCanonical(proof.evaluation.definition))
+    if (!completedCheckDefinitionMatches(proof.evaluation.definition, definition))
       throw Error('evidence-incomplete');
     return proof;
   }

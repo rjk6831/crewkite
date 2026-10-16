@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   type Artifact,
@@ -140,6 +140,39 @@ function definition(
     required: plan.required,
     reporterHash: plan.reporterHash,
   });
+}
+
+export function completedCheckDefinitionMatches(
+  saved: NodeCheckDefinition,
+  current: NodeCheckDefinition,
+): boolean {
+  const historical = NodeCheckDefinitionSchema.safeParse(saved);
+  const observed = NodeCheckDefinitionSchema.safeParse(current);
+  if (!historical.success || !observed.success) return false;
+  const previous = historical.data;
+  const present = observed.data;
+  for (const value of [previous, present]) {
+    const reporter = value.argv[1] ?? '';
+    if (
+      definition(value) !== value.definitionHash ||
+      value.argv.length !== value.collection.length + 3 ||
+      value.argv[0] !== '--test' ||
+      !reporter.startsWith('--test-reporter=') ||
+      !isAbsolute(reporter.slice('--test-reporter='.length)) ||
+      value.argv[2] !== '--' ||
+      value.collection.some((file, index) => value.argv[index + 3] !== `./${file.path}`)
+    )
+      return false;
+  }
+  if (present.argv[1] !== `--test-reporter=${reporterPath}`) return false;
+  // Completed evidence survives moving identical runtime files. Saved argv is never executed here.
+  return (
+    hashCanonical({
+      ...previous,
+      argv: previous.argv.map((argument, index) => (index === 1 ? present.argv[1] : argument)),
+      definitionHash: present.definitionHash,
+    }) === hashCanonical(present)
+  );
 }
 
 function report(

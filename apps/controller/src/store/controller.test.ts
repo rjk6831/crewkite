@@ -36,7 +36,11 @@ import {
   type ControllerOptions,
   type NativePilotAppointment,
 } from '../commands/controller.ts';
-import { CandidateEvidence } from '../evidence/index.ts';
+import {
+  CandidateEvidence,
+  completedCheckDefinitionMatches,
+  type NodeCheckDefinition,
+} from '../evidence/index.ts';
 import { refValue } from '../host/publication.ts';
 import { committedFiles, git, inspectSource, materialize, readFiles } from '../host/source.ts';
 import { groupAbsent } from '../host/worker.ts';
@@ -778,6 +782,72 @@ test('candidate evidence requires unchanged bytes and completed checks', async (
     sourceFiles: committedFiles(source.directory, source.base),
     criteria: task.criteria,
   });
+  const withDigest = (value: NodeCheckDefinition): NodeCheckDefinition => {
+    const {
+      recipeId: _recipe,
+      candidateId: _candidate,
+      candidateHash: _hash,
+      definitionHash: _definition,
+      ...fields
+    } = value;
+    return { ...value, definitionHash: hashCanonical(fields) };
+  };
+  const historical = withDigest({
+    ...definition,
+    argv: definition.argv.map((argument, index) =>
+      index === 1
+        ? `--test-reporter=${join(directory, 'former-runtime', 'reporter.ts')}`
+        : argument,
+    ),
+  });
+  for (const { name, saved, current = definition, matches = false } of [
+    { name: 'same runtime', saved: definition, matches: true },
+    { name: 'identical relocated reporter', saved: historical, matches: true },
+    { name: 'saved digest', saved: { ...historical, definitionHash: '0'.repeat(64) } },
+    {
+      name: 'relative reporter',
+      saved: withDigest({
+        ...historical,
+        argv: historical.argv.map((value, index) =>
+          index === 1 ? '--test-reporter=./reporter.ts' : value,
+        ),
+      }),
+    },
+    { name: 'reporter bytes', saved: withDigest({ ...historical, reporterHash: '0'.repeat(64) }) },
+    { name: 'evaluator', saved: withDigest({ ...historical, evaluator: 'node:changed' }) },
+    {
+      name: 'flags',
+      saved: withDigest({ ...historical, argv: ['--test-only', ...historical.argv.slice(1)] }),
+    },
+    {
+      name: 'test scope',
+      saved: withDigest({
+        ...historical,
+        collection: historical.collection.map((file, index) =>
+          index === 0 ? { ...file, path: 'other.test.mjs' } : file,
+        ),
+        argv: historical.argv.map((value, index) => (index === 3 ? './other.test.mjs' : value)),
+      }),
+    },
+    {
+      name: 'criteria',
+      saved: withDigest({ ...historical, criteria: [...historical.criteria, 'Changed criterion'] }),
+    },
+    {
+      name: 'required tests',
+      saved: withDigest({
+        ...historical,
+        required: { ...historical.required, count: historical.required.count + 1 },
+      }),
+    },
+    { name: 'candidate', saved: { ...historical, candidateHash: '0'.repeat(64) } },
+    {
+      name: 'current reporter location',
+      saved: historical,
+      current: withDigest({ ...definition, argv: historical.argv }),
+    },
+  ])
+    assert.equal(completedCheckDefinitionMatches(saved, current), matches, name);
   assert.throws(
     () =>
       evidence.prepareChecks({
