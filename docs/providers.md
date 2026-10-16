@@ -15,13 +15,13 @@ These are planned pilots. A fake family label does not establish a client's capa
 
 Google [ended consumer sign-in for Gemini CLI on June 18, 2026](https://developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals), including Google AI Pro and Ultra. That consumer subscription path is unavailable. Google's [migration guide points to Antigravity CLI](https://www.antigravity.google/docs/cli/gcli-migration).
 
-The 16 October 2026 check on the M5 Mac found Anthropic client 2.1.301 signed out. Its account, plan and billing identity remain unknown.
+The 16 October 2026 check on the M5 Mac found Anthropic client 2.1.301 authenticated through `claude.ai`. Its streams closed and owned process group was absent. This establishes a subscription authentication candidate. Account entitlement, plan and billing identity remain unverified.
 
 ## Google writer preparation
 
 The Google adapter reads [structured headless output](https://www.antigravity.google/docs/cli/headless) and returns a bounded file replacement tied to an attempt, relative path and original content hash. It requires an exact client identity and dated controller-owned admission evidence. It applies no file changes and registers no route. Its scripted fixture covers malformed output, session binding, refusal before launch and process cleanup.
 
-The 16 October 2026 metadata check on the M2 Mac used client 1.4.0 and reported credit fallback disabled and request-review permissions. The M5 check of the same build required authentication. Account entitlement and subscription billing identity remain unverified. The adapter preserves the native authentication location, excludes ambient API and billing overrides, and uses the opt-in [native trust profile](adr/0009-native-client-trust-profile.md). It claims no tool absence. [Credit fallback settings](https://www.antigravity.google/docs/cli/credits/) are separate from subscription identity.
+The 16 October 2026 metadata check on the M5 Mac used client 1.4.0 and reported credit fallback disabled and request-review permissions. It completed with zero turns, closed streams and an absent owned process group. Account entitlement and subscription billing identity remain unverified. The adapter preserves the native authentication location, excludes ambient API and billing overrides, and uses the opt-in [native trust profile](adr/0009-native-client-trust-profile.md). It claims no tool absence. [Credit fallback settings](https://www.antigravity.google/docs/cli/credits/) are separate from subscription identity.
 
 The [official changelog](https://antigravity.google/docs/changelog?tab=cli) records permission fixes in 1.1.11 and headless mode fixes in 1.1.12. The former installed 1.1.10 build is refused. A version floor alone cannot qualify a later build. No Google inference task or six-check native pilot has completed.
 
