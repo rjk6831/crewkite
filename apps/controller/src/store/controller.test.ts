@@ -1412,51 +1412,18 @@ async function acceptsTransferredCandidate(t: TestContext, transfer: 'reserve' |
 }
 
 async function nativeWait<T>(
-  controller: Controller,
   stage: string,
   pending: Promise<T>,
   milliseconds = 30_000,
 ): Promise<T> {
+  console.error(`Native fixture stage: ${stage}`);
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
       pending,
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
-          let facts: unknown = 'unreadable';
-          try {
-            const intents = controller.store.intents().slice(-8);
-            facts = {
-              tasks: controller
-                .snapshot()
-                .tasks.slice(-2)
-                .map(({ id, state }) => ({ id, state })),
-              intents,
-              phases: intents.flatMap((intent) =>
-                controller.store.nativeProcesses(intent.attempt_id),
-              ),
-              completion: intents.map((intent) => {
-                const artifact = controller.store.receipt(`native-completion:${intent.attempt_id}`)
-                  ?.result.entity;
-                if (
-                  !artifact ||
-                  !('hash' in artifact) ||
-                  !('bytes' in artifact) ||
-                  artifact.bytes > 4096
-                )
-                  return null;
-                const value = JSON.parse(
-                  readFileSync(join(controller.home, 'artifacts', artifact.hash), 'utf8'),
-                );
-                return {
-                  attemptId: intent.attempt_id,
-                  reason: value.reason,
-                  quiescent: value.quiescent,
-                };
-              }),
-            };
-          } catch {}
-          reject(new Error(`Native fixture ${stage} timed out: ${JSON.stringify(facts)}`));
+          reject(new Error(`Native fixture ${stage} timed out.`));
         }, milliseconds);
       }),
     ]);
@@ -1606,7 +1573,11 @@ async function nativeSetup(
   };
   const close = async (controller: Controller) => {
     try {
-      await nativeWait(controller, 'cleanup', Promise.resolve(controller.close()), 10_000);
+      await nativeWait(
+        'cleanup',
+        Promise.resolve().then(() => controller.close()),
+        10_000,
+      );
       if (callbackError) throw callbackError;
     } catch (error) {
       for (const child of children) {
@@ -1616,12 +1587,15 @@ async function nativeSetup(
           } catch {}
         }
       }
-      await nativeWait(controller, 'forced fixture cleanup', Promise.all(childrenClosed), 2000);
+      await nativeWait('forced fixture cleanup', Promise.all(childrenClosed), 2000);
       assert(children.every((child) => !child.pid || groupAbsent(child.pid)));
       throw error;
     }
   };
-  const context = await setup(t, nativeOptions, close);
+  const context = await nativeWait(
+    `${mode}/${targetPath}/setup`,
+    Promise.resolve().then(() => setup(t, nativeOptions, close)),
+  );
   if (targetPath !== 'net.mjs') {
     const files = [
       { path: targetPath, content: Buffer.from('# Provider notes\nOriginal café notes.\n') },
@@ -1707,23 +1681,25 @@ async function nativeSetup(
     fixtureProfile,
     restart: async () => {
       await close(context.controller);
-      context.controller = new Controller({
-        ...nativeOptions,
-        home: context.controller.home,
-        now: context.clock.now,
-        id: context.id,
-      });
+      context.controller = await nativeWait(
+        `${mode}/${targetPath}/restart`,
+        Promise.resolve().then(
+          () =>
+            new Controller({
+              ...nativeOptions,
+              home: context.controller.home,
+              now: context.clock.now,
+              id: context.id,
+            }),
+        ),
+      );
       t.after(() => close(context.controller));
       return context.controller;
     },
     children,
     observe,
-    wait: <T>(stage: string, pending: Promise<T>, controller = context.controller) =>
-      nativeWait(
-        controller,
-        `${mode}/${targetPath}/${stage}`,
-        Promise.race([pending, failure.promise]),
-      ),
+    wait: <T>(stage: string, pending: Promise<T>) =>
+      nativeWait(`${mode}/${targetPath}/${stage}`, Promise.race([pending, failure.promise])),
     ready: ready.promise,
     submissions: () => submissions,
     onSpawn: (listener: typeof onSpawn) => {
@@ -1774,6 +1750,9 @@ test('an appointed native proposal is retained and applied once after every phas
     { consent: 'explicit', path: 'docs/providers.md', publicRun: true },
     { consent: 'policy', path: 'docs/案内.md', publicRun: true },
   ] as const) {
+    console.error(
+      `Native fixture row: retained/${consent}/${path}/${publicRun ? 'public' : 'private'}`,
+    );
     const context = await nativeSetup(t, 'success', {}, path);
     const {
       controller: initialController,
@@ -2172,7 +2151,12 @@ test('an appointed native proposal is retained and applied once after every phas
         'native-pilot-retain-only',
       );
     }
-    await nativeWait(controller, 'controller close', Promise.resolve(controller.close()), 10_000);
+    await nativeWait(
+      'controller close',
+      Promise.resolve().then(() => controller.close()),
+      10_000,
+    );
+    console.error('Native fixture stage: ordinary reopen');
     const reopened = new Controller({
       home: controller.home,
       now: clock.now,
@@ -2269,8 +2253,8 @@ test('an appointed native proposal is retained and applied once after every phas
         ).outcome,
         'applied',
       );
-      await context.wait('ordinary candidate', resealed, reopened);
-      if (stopped) await context.wait('ordinary stop', stopped, reopened);
+      await context.wait('ordinary candidate', resealed);
+      if (stopped) await context.wait('ordinary stop', stopped);
       const ordinaryCandidate = reopened.snapshot().candidates.at(-1);
       assert(ordinaryCandidate);
       assert.equal(ordinaryCandidate.hash, candidate.hash);
@@ -2293,7 +2277,11 @@ test('an appointed native proposal is retained and applied once after every phas
         'candidate-not-current',
       );
     } finally {
-      await nativeWait(reopened, 'reopened close', Promise.resolve(reopened.close()), 10_000);
+      await nativeWait(
+        'reopened close',
+        Promise.resolve().then(() => reopened.close()),
+        10_000,
+      );
     }
   }
   for (const scenario of [
@@ -2307,6 +2295,7 @@ test('an appointed native proposal is retained and applied once after every phas
     'review-close',
     'review-journal-read',
   ]) {
+    console.error(`Native fixture row: evaluation/${scenario}`);
     const context = await nativeSetup(
       t,
       scenario === 'failed'
@@ -2869,6 +2858,7 @@ test('an appointed native proposal is retained and applied once after every phas
     'oversized-plan',
     'credit-unavailable',
   ]) {
+    console.error(`Native fixture row: preparation/${boundary}`);
     const context = await nativeSetup(t);
     const { controller, appointment, task, command, clock } = context;
     if (boundary === 'credit-unavailable')
@@ -2998,6 +2988,7 @@ test('an appointed native proposal is retained and applied once after every phas
     assert.equal(controller.store.intents().length, 0);
   }
   {
+    console.error('Native fixture row: parallel tasks');
     const context = await nativeSetup(t, 'hold');
     const { controller, appointment, task, command } = context;
     const payload = {
@@ -3086,7 +3077,11 @@ test('an appointed native proposal is retained and applied once after every phas
       controller.store.db.prepare('SELECT COUNT(*) AS count FROM writer_leases').get()?.count,
       2,
     );
-    await nativeWait(controller, 'controller close', Promise.resolve(controller.close()), 10_000);
+    await nativeWait(
+      'controller close',
+      Promise.resolve().then(() => controller.close()),
+      10_000,
+    );
     assert.equal(context.submissions(), 2);
   }
 });
@@ -3114,6 +3109,7 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
   ] as const) {
     const publicRun = scenario.startsWith('public-');
     const boundary = scenario.replace(/^public-/, '');
+    console.error(`Native fixture row: stop/${scenario}`);
     const context = await nativeSetup(
       t,
       boundary === 'after-submit' || boundary === 'close' ? 'hold' : 'success',
@@ -3283,7 +3279,11 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
         undefined,
       );
     }
-    await nativeWait(controller, 'controller close', Promise.resolve(controller.close()), 10_000);
+    await nativeWait(
+      'controller close',
+      Promise.resolve().then(() => controller.close()),
+      10_000,
+    );
     if (boundary === 'journal-read') {
       const journal = new DatabaseSync(join(controller.home, 'state.sqlite'));
       try {
@@ -3358,7 +3358,11 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
           .every((phase) => groupAbsent(phase.process_group)),
       );
     } finally {
-      await nativeWait(reopened, 'reopened close', Promise.resolve(reopened.close()), 10_000);
+      await nativeWait(
+        'reopened close',
+        Promise.resolve().then(() => reopened.close()),
+        10_000,
+      );
     }
   }
 });
