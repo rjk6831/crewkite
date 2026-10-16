@@ -24,6 +24,7 @@ import {
   type Candidate,
   type CheckResult,
   canonicalJson,
+  GoogleNativeProfileSchema,
   ProjectSchema,
   RunSchema,
   TaskSchema,
@@ -46,11 +47,14 @@ import { refValue } from '../host/publication.ts';
 import { committedFiles, git, inspectSource, materialize, readFiles } from '../host/source.ts';
 import { groupAbsent } from '../host/worker.ts';
 import { replacementFixture as anthropicFixture } from '../providers/anthropic/replacement-fixture.ts';
+import { replacementFixture as googleFixture } from '../providers/google/replacement-fixture.ts';
 import {
   type NativeProfileResolution,
   unavailableNativeProfile,
 } from '../providers/openai/profile.ts';
 import { fixture, fixtureContent, fixtureModel } from '../providers/openai/replacement-fixture.ts';
+
+const fixtureClientHash = createHash('sha256').update(readFileSync(process.execPath)).digest('hex');
 
 async function setup(
   t: TestContext,
@@ -2054,6 +2058,7 @@ async function nativeSetup(
   targetPath = 'net.mjs',
 ) {
   const anthropic = mode.startsWith('anthropic-');
+  const google = mode.startsWith('google-');
   let submissions = 0;
   const ready = Promise.withResolvers<void>();
   const failure = Promise.withResolvers<never>();
@@ -2090,7 +2095,7 @@ async function nativeSetup(
     },
     client: {
       executable: process.execPath,
-      sha256: createHash('sha256').update(readFileSync(process.execPath)).digest('hex'),
+      sha256: fixtureClientHash,
       version: process.version,
     },
     environment: { ...process.env },
@@ -2120,9 +2125,35 @@ async function nativeSetup(
         }),
         locationHash: '2'.repeat(64),
       }
-    : reviewerProfile;
+    : google
+      ? {
+          ...reviewerProfile,
+          client: {
+            executable: process.execPath,
+            sha256: fixtureClientHash,
+            version: '1.4.0',
+          },
+          facts: GoogleNativeProfileSchema.parse({
+            ...reviewerProfile.facts,
+            id: 'google-file-v1',
+            family: 'google',
+            displayName: 'Google fixture',
+            clientVersion: '1.4.0',
+            effort: 'low',
+            effectiveEffort: 'unknown',
+            accountClass: 'unknown',
+            serviceTier: 'unknown',
+            billingBasis: 'requires-user-attestation',
+            qualifiedAt: null,
+            creditPolicies: ['ordinary'],
+            reason: 'qualification-pending',
+            permissionModes: ['request-review', 'strict', 'always-proceed', 'proceed-in-sandbox'],
+          }),
+          locationHash: '3'.repeat(64),
+        }
+      : reviewerProfile;
   const nativeOptions: Partial<ControllerOptions> = {
-    ...(anthropic
+    ...(anthropic || google
       ? { nativeProfiles: () => [reviewerProfile, fixtureProfile] }
       : { nativeProfile: () => fixtureProfile }),
     ...options,
@@ -2132,15 +2163,26 @@ async function nativeSetup(
         .flatMap((intent) => context.controller.store.nativeProcesses(intent.attempt_id))
         .filter((row) => row.state === 'intent')
         .at(-1);
-      const anthropicChild = pending?.phase === 'auth-status' || pending?.phase === 'native-task';
+      const googleChild =
+        !!pending &&
+        context.controller.store.get<{ family: string }>(
+          'route',
+          context.controller.store
+            .intents()
+            .find((intent) => intent.attempt_id === pending.attempt_id)?.route_id ?? '',
+        )?.family === 'google';
+      const anthropicChild =
+        !googleChild && (pending?.phase === 'auth-status' || pending?.phase === 'native-task');
       const phase =
-        pending?.phase === 'auth-status'
-          ? 'auth'
-          : args.at(-1) === 'list'
-            ? 'features'
-            : pending?.phase === 'metadata-preparation'
-              ? 'prepare'
-              : 'task';
+        pending?.phase === 'google-config'
+          ? 'config'
+          : pending?.phase === 'auth-status'
+            ? 'auth'
+            : args.at(-1) === 'list'
+              ? 'features'
+              : pending?.phase === 'metadata-preparation'
+                ? 'prepare'
+                : 'task';
       let transcript = fixture;
       if (mode.includes('checked')) {
         const proposal = join(context.directory, 'checked-proposal');
@@ -2178,6 +2220,41 @@ async function nativeSetup(
                   : 'success',
         });
       }
+      if (googleChild) {
+        transcript = googleFixture(args, {
+          content: mode.includes('checked')
+            ? readFileSync(join(context.directory, 'checked-proposal/net.mjs'), 'utf8')
+            : fixtureContent(targetPath),
+          permissionMode:
+            mode === 'google-strict'
+              ? 'strict'
+              : mode === 'google-always-proceed'
+                ? 'always-proceed'
+                : mode === 'google-proceed-in-sandbox'
+                  ? 'proceed-in-sandbox'
+                  : 'request-review',
+          mode:
+            mode === 'google-hold'
+              ? 'hold'
+              : mode === 'google-credits'
+                ? 'credits'
+                : mode === 'google-mode-mismatch'
+                  ? 'mode-mismatch'
+                  : mode === 'google-config-error'
+                    ? 'config-error'
+                    : 'success',
+        });
+        if (phase === 'task') {
+          assert(pending);
+          assert.equal(pending.state, 'intent');
+          assert(
+            context.controller.store.receipt(`native-submission:${pending.attempt_id}`),
+            'the argv prompt marker commits before spawn',
+          );
+          submissions++;
+          onInput?.({ method: 'prompt' }, phase);
+        }
+      }
       const child = spawn(
         executable,
         ['-e', transcript, mode.includes('checked') || anthropic ? 'success' : mode, phase],
@@ -2185,8 +2262,8 @@ async function nativeSetup(
       );
       children.push(child);
       childrenClosed.push(new Promise((resolve) => child.once('close', () => resolve())));
-      const write = child.stdin.write.bind(child.stdin);
-      if (!anthropicChild)
+      const write = child.stdin?.write.bind(child.stdin);
+      if (!anthropicChild && !googleChild)
         child.stdin.write = ((data: Uint8Array) => {
           try {
             const messages = Buffer.from(data)
@@ -2216,6 +2293,7 @@ async function nativeSetup(
               }
               onInput?.(message, phase);
             }
+            if (!write) throw Error('Missing fixture input.');
             const result = write(data);
             for (const message of messages) onWritten?.(message, phase);
             if (messages.some((message) => message.method === 'turn/start')) ready.resolve();
@@ -2247,6 +2325,10 @@ async function nativeSetup(
             throw error;
           }
         }) as typeof child.stdin.end;
+      }
+      if (googleChild && phase === 'task') {
+        onWritten?.({ method: 'prompt' }, phase);
+        ready.resolve();
       }
       try {
         onSpawn?.(phase);
@@ -2338,7 +2420,7 @@ async function nativeSetup(
     },
     client: {
       executable: process.execPath,
-      sha256: createHash('sha256').update(readFileSync(process.execPath)).digest('hex'),
+      sha256: fixtureClientHash,
       version: process.version,
     },
     creditPolicy: 'ordinary',
@@ -2429,6 +2511,103 @@ function nativeCandidate(controller: Controller) {
 }
 
 test('an appointed native proposal is retained and applied once after every phase stops', async (t) => {
+  for (const permissionMode of [
+    'request-review',
+    'strict',
+    'always-proceed',
+    'proceed-in-sandbox',
+  ] as const) {
+    const context = await nativeSetup(t, `google-${permissionMode}`);
+    let controller = context.controller;
+    const { task, command, appointment } = context;
+    const payload = {
+      taskId: task.id,
+      profileId: context.fixtureProfile.facts.id,
+      targetPath: 'net.mjs',
+      policy: appointment.policy,
+      consent: 'explicit',
+      permissionMode,
+      billingAttestation: {
+        source: 'user-attested',
+        subscriptionLoginConfirmed: true,
+        paidExtraUsageDisabled: true,
+      },
+    };
+    let prepared = await controller.execute(
+      command('PrepareNativeRun', payload, task.revision),
+      'local-owner',
+    );
+    assert.equal(prepared.outcome, 'applied');
+    const before = controller.snapshot();
+    assert.equal(
+      (
+        await controller.execute(
+          command(
+            'PrepareNativeRun',
+            {
+              ...payload,
+              consent: 'saved',
+              permissionMode: permissionMode === 'strict' ? 'request-review' : 'strict',
+            },
+            taskRevision(controller, task.id),
+          ),
+          'local-owner',
+        )
+      ).outcome,
+      'blocked',
+    );
+    assert.deepEqual(controller.snapshot(), before);
+    prepared = await controller.execute(
+      command(
+        'PrepareNativeRun',
+        { ...payload, consent: 'saved' },
+        taskRevision(controller, task.id),
+      ),
+      'local-owner',
+    );
+    assert.equal(prepared.outcome, 'applied');
+    const run = RunSchema.parse(prepared.entity);
+    assert.equal(
+      controller.snapshot().routes.filter((route) => route.family === 'google' && !route.fake)
+        .length,
+      1,
+    );
+    controller = await context.restart();
+    const retained = nativeCandidate(controller);
+    const start = command(
+      'StartRun',
+      { taskId: task.id, runId: run.id },
+      taskRevision(controller, task.id),
+    );
+    assert.equal((await controller.execute(start, 'local-owner')).outcome, 'applied');
+    await context.wait(`Google ${permissionMode} candidate`, retained);
+    assert.equal((await controller.execute(start, 'local-owner')).outcome, 'already-applied');
+    assert.equal(context.submissions(), 1);
+    assert.equal(context.children.length, 2);
+    const attempt = controller.snapshot().attempts[0];
+    assert(controller.store.nativePhasesComplete(attempt.id, 'google'));
+    assert.equal(controller.store.nativePhasesComplete(attempt.id, 'anthropic'), false);
+    assert.equal(
+      controller.store.receipt(`native-application:${attempt.id}`)?.result.outcome,
+      'applied',
+    );
+    const artifact = ArtifactSchema.parse(
+      controller.store.receipt(`native-config:${attempt.id}`)?.result.entity,
+    );
+    const observed = JSON.parse(
+      new ArtifactFiles(join(controller.home, 'artifacts')).read(artifact.hash).toString(),
+    );
+    assert.equal(observed.metadata.permissionMode, permissionMode);
+    assert.equal(observed.metadata.creditFallback, 'disabled');
+    assert.equal(observed.metadata.account, 'unknown');
+    assert.equal(observed.metadata.billing, 'unknown');
+    assert.equal(observed.billingAttestationHash, hashCanonical(payload.billingAttestation));
+    assert.deepEqual(inspectSource(task.projectId, context.source.directory), run.source);
+    controller = await context.restart();
+    assert.equal(context.submissions(), 1);
+    assert.equal(controller.snapshot().attempts.length, 1);
+  }
+
   for (const { consent, path, publicRun } of [
     { consent: 'explicit', path: 'net.mjs', publicRun: false },
     { consent: 'policy', path: 'net.mjs', publicRun: false },
@@ -2453,6 +2632,7 @@ test('an appointed native proposal is retained and applied once after every phas
     let controller = initialController;
     appointment.id += `-${consent}`;
     appointment.consent.source = consent;
+    const committedTargets = committedFiles(source.directory, appointment.consent.sourceBase);
     for (const change of [
       { maximumSubmissions: 2 },
       { target: { ...appointment.target, baseHash: '0'.repeat(64) } },
@@ -2466,9 +2646,8 @@ test('an appointed native proposal is retained and applied once after every phas
         target: {
           path,
           baseHash:
-            committedFiles(source.directory, appointment.consent.sourceBase).find(
-              (file) => file.path === path,
-            )?.hash ?? appointment.target.baseHash,
+            committedTargets.find((file) => file.path === path)?.hash ??
+            appointment.target.baseHash,
         },
       })),
       { consent: { ...appointment.consent, nativeTrust: 'denied' } },
@@ -2677,7 +2856,7 @@ test('an appointed native proposal is retained and applied once after every phas
       );
       controller.store.applyMigrations(new URL('../../migrations/', import.meta.url).pathname);
       assert.deepEqual(controller.store.nativeProcesses(attempt.attempt_id), previous);
-      assert.equal(controller.store.db.prepare('PRAGMA user_version').get()?.user_version, 5);
+      assert.equal(controller.store.db.prepare('PRAGMA user_version').get()?.user_version, 6);
     }
 
     assert(
@@ -2992,6 +3171,7 @@ test('an appointed native proposal is retained and applied once after every phas
     'checked',
     'project-checked',
     'anthropic-checked',
+    'google-checked',
     'failed',
     'stop-intent',
     'expired-intent',
@@ -3002,11 +3182,14 @@ test('an appointed native proposal is retained and applied once after every phas
     'review-journal-read',
   ]) {
     const passedReview =
-      scenario === 'checked' || scenario === 'project-checked' || scenario === 'anthropic-checked';
+      scenario === 'checked' ||
+      scenario === 'project-checked' ||
+      scenario === 'anthropic-checked' ||
+      scenario === 'google-checked';
     console.error(`Native fixture row: evaluation/${scenario}`);
     const context = await nativeSetup(
       t,
-      scenario === 'anthropic-checked'
+      scenario === 'anthropic-checked' || scenario === 'google-checked'
         ? scenario
         : scenario === 'failed'
           ? 'success'
@@ -3024,7 +3207,7 @@ test('an appointed native proposal is retained and applied once after every phas
           {
             taskId: task.id,
             profileId: context.fixtureProfile.facts.id,
-            ...(scenario === 'anthropic-checked'
+            ...(scenario === 'anthropic-checked' || scenario === 'google-checked'
               ? {
                   billingAttestation: {
                     source: 'user-attested',
@@ -3033,6 +3216,7 @@ test('an appointed native proposal is retained and applied once after every phas
                   },
                 }
               : {}),
+            ...(scenario === 'google-checked' ? { permissionMode: 'request-review' } : {}),
             targetPath: 'net.mjs',
             policy: appointment.policy,
             consent: 'explicit',
@@ -3117,12 +3301,12 @@ test('an appointed native proposal is retained and applied once after every phas
         assert.deepEqual(controller.snapshot(), before);
       }
     }
-    if (scenario === 'anthropic-checked') {
+    if (scenario === 'anthropic-checked' || scenario === 'google-checked') {
       assert.deepEqual(
         controller.store
           .nativeProcesses(controller.snapshot().attempts[0].id)
           .map((phase) => phase.phase),
-        ['auth-status', 'native-task'],
+        [scenario === 'google-checked' ? 'google-config' : 'auth-status', 'native-task'],
       );
       assert.equal(
         (
@@ -3272,7 +3456,10 @@ test('an appointed native proposal is retained and applied once after every phas
     const snapshot = controller.snapshot();
     assert.equal(snapshot.attempts.length, 2);
     assert.equal(context.submissions(), 1);
-    assert.equal(context.children.length, scenario === 'anthropic-checked' ? 2 : 3);
+    assert.equal(
+      context.children.length,
+      scenario === 'anthropic-checked' || scenario === 'google-checked' ? 2 : 3,
+    );
     assert.equal(snapshot.reviewJobs?.length, 0);
     assert.equal(snapshot.evidence.length, scenario.endsWith('intent') ? 0 : 1);
     if (!scenario.endsWith('intent')) {
@@ -3479,7 +3666,10 @@ test('an appointed native proposal is retained and applied once after every phas
       assert.equal(job.preparationId, artifact.id);
       assert.equal(job.independence, 'process-only');
       assert.equal(context.submissions(), 2, scenario);
-      assert.equal(context.children.length, scenario === 'anthropic-checked' ? 5 : 6);
+      assert.equal(
+        context.children.length,
+        scenario === 'anthropic-checked' || scenario === 'google-checked' ? 5 : 6,
+      );
       assert.equal(result.attempts.length, 3);
       assert.equal(result.candidates.length, 1);
       assert.deepEqual(result.runs.at(-1), originalRun);
@@ -3933,6 +4123,108 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
     controller = await context.restart();
     assert.equal(controller.snapshot().attempts.length, 1);
     assert.equal(context.submissions(), scenario === 'overage' || scenario === 'stop-task' ? 1 : 0);
+  }
+  for (const scenario of [
+    'config-error',
+    'credits',
+    'mode-mismatch',
+    'stop-config',
+    'stop-task',
+  ] as const) {
+    const context = await nativeSetup(
+      t,
+      scenario === 'stop-task' ? 'google-hold' : `google-${scenario}`,
+    );
+    let controller = context.controller;
+    const { command, task, appointment } = context;
+    const payload = {
+      taskId: task.id,
+      profileId: context.fixtureProfile.facts.id,
+      targetPath: 'net.mjs',
+      policy: appointment.policy,
+      consent: 'explicit',
+      permissionMode: 'request-review',
+      billingAttestation: {
+        source: 'user-attested',
+        subscriptionLoginConfirmed: true,
+        paidExtraUsageDisabled: true,
+      },
+    };
+    const before = controller.snapshot();
+    for (const change of [
+      { permissionMode: undefined },
+      { billingAttestation: undefined },
+      { creditPolicy: 'existing-credits' },
+      { consent: 'saved' },
+    ]) {
+      const changed: Record<string, unknown> = { ...payload, ...change };
+      for (const key of Object.keys(changed)) if (changed[key] === undefined) delete changed[key];
+      const refused = await controller.execute(
+        command('PrepareNativeRun', changed, task.revision),
+        'local-owner',
+      );
+      assert.equal(refused.outcome, 'blocked');
+      assert.deepEqual(controller.snapshot(), before);
+    }
+    const prepared = await controller.execute(
+      command('PrepareNativeRun', payload, task.revision),
+      'local-owner',
+    );
+    assert.equal(prepared.outcome, 'applied');
+    const run = RunSchema.parse(prepared.entity);
+    assert.equal(controller.snapshot().nativeRuns[0].permissionMode, 'request-review');
+    assert.deepEqual(
+      controller.snapshot().nativeRuns[0].billingAttestation,
+      payload.billingAttestation,
+    );
+    controller = await context.restart();
+    let stopping: Promise<unknown> | undefined;
+    context.onSpawn((phase) => {
+      if (
+        (scenario === 'stop-config' && phase === 'config') ||
+        (scenario === 'stop-task' && phase === 'task')
+      )
+        queueMicrotask(() => {
+          stopping = controller.execute(
+            command(
+              'StopRun',
+              { taskId: task.id, runId: run.id },
+              taskRevision(controller, task.id),
+            ),
+            'local-owner',
+          );
+        });
+    });
+    const retained = nativeCandidate(controller);
+    assert.equal(
+      (
+        await controller.execute(
+          command(
+            'StartRun',
+            { taskId: task.id, runId: run.id },
+            taskRevision(controller, task.id),
+          ),
+          'local-owner',
+        )
+      ).outcome,
+      'applied',
+    );
+    await context.wait(`Google ${scenario} retention`, retained);
+    if (stopping) await context.wait(`Google ${scenario} Stop`, stopping);
+    assert.equal(context.submissions(), scenario === 'stop-task' ? 1 : 0);
+    const attempt = controller.snapshot().attempts[0];
+    const phases = controller.store.nativeProcesses(attempt.id);
+    assert.deepEqual(
+      phases.map((row) => row.phase),
+      scenario === 'stop-task' ? ['google-config', 'native-task'] : ['google-config'],
+    );
+    assert(phases.every((row) => row.state === 'quiescent' && groupAbsent(row.process_group)));
+    assert.equal(controller.store.receipt(`native-application:${attempt.id}`), undefined);
+    assert.equal(controller.snapshot().tasks[0].state, 'interrupted');
+    assert.deepEqual(inspectSource(task.projectId, context.source.directory), run.source);
+    controller = await context.restart();
+    assert.equal(controller.snapshot().attempts.length, 1);
+    assert.equal(context.submissions(), scenario === 'stop-task' ? 1 : 0);
   }
   for (const scenario of [
     'before-submit',

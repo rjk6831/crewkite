@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -8,8 +9,11 @@ import {
   GoogleWriterError,
   GoogleWriterOutput,
   googleVersionEligible,
+  projectGoogleConfig,
   projectGoogleCreditSetting,
   runGoogleWriter,
+  startGoogleConfig,
+  startGoogleWriter,
 } from './native-writer.ts';
 
 const hash = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
@@ -290,6 +294,17 @@ else {
           { ...end, result: { ...end.result, usage: { ...usage, input_tokens: -1 } } },
         ],
       },
+      {
+        name: 'NUL replacement text',
+        field: 'content',
+        events: [
+          start,
+          {
+            ...end,
+            result: { ...end.result, structured_output: { ...replacement, content: 'text\0tail' } },
+          },
+        ],
+      },
       { name: 'terminal duplication', events: [start, end, end] },
       { name: 'incomplete stream', events: [start] },
       {
@@ -346,6 +361,248 @@ else {
         );
       }
     }
+    const config = {
+      status: 'SUCCESS',
+      num_turns: 0,
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        thinking_tokens: 0,
+        cache_read_tokens: 0,
+        total_tokens: 0,
+      },
+      command: {
+        data: {
+          config: {
+            toolPermission: 'request-review',
+            useG1Credits: false,
+            artifactReviewPolicy: 'agent-decides',
+            enableTerminalSandbox: false,
+            allowNonWorkspaceAccess: false,
+            email: 'private@example.test',
+            token: 'private-canary',
+          },
+        },
+      },
+    };
+    const projected = projectGoogleConfig(Buffer.from(JSON.stringify(config)));
+    assert.deepEqual(projected, {
+      permissionMode: 'request-review',
+      creditFallback: 'disabled',
+      artifactReviewPolicy: 'agent-decides',
+      allowNonWorkspaceAccess: false,
+      enableTerminalSandbox: false,
+      account: 'unknown',
+      billing: 'unknown',
+      observedTurns: 0,
+    });
+    assert(!JSON.stringify(projected).includes('private'));
+    for (const invalid of [
+      { ...config, status: 'ERROR' },
+      { ...config, num_turns: 1 },
+      { ...config, usage: { ...config.usage, total_tokens: 1 } },
+      {
+        ...config,
+        command: { data: { config: { ...config.command.data.config, useG1Credits: true } } },
+      },
+      {
+        ...config,
+        command: {
+          data: { config: { ...config.command.data.config, toolPermission: 'unrecognized' } },
+        },
+      },
+    ])
+      assert.throws(
+        () => projectGoogleConfig(Buffer.from(JSON.stringify(invalid))),
+        GoogleWriterError,
+      );
+    assert.throws(
+      () => projectGoogleConfig(Buffer.from('private-canary')),
+      (error) => error instanceof GoogleWriterError && !error.message.includes('private'),
+    );
+    for (const row of [
+      'success',
+      'nonzero',
+      'unexpected-turn',
+      'auth-needed',
+      'owned-reject',
+      'quiescent-reject',
+    ] as const) {
+      const events: string[] = [];
+      const output = row === 'unexpected-turn' ? { ...config, num_turns: 1 } : config;
+      const script = `${row === 'auth-needed' ? "process.stderr.write('authentication required private-canary');" : ''}process.stdout.write(${JSON.stringify(JSON.stringify(output))});${row === 'nonzero' ? 'process.exitCode=1;' : ''}`;
+      const handle = startGoogleConfig({
+        client,
+        repositoryRoot: resolve('.'),
+        directory,
+        temporaryDirectory: runtime,
+        timeoutMs: 3000,
+        environment: {
+          ...process.env,
+          GOOGLE_API_KEY: 'private-canary',
+          GOOGLE_APPLICATION_CREDENTIALS: 'private-canary',
+        },
+        spawn: (_, args, options) => {
+          assert.deepEqual(args.slice(0, 4), ['-p', '/config', '--output-format', 'json']);
+          events.push('spawn');
+          const child = spawn(process.execPath, ['-e', script], options);
+          if (child.pid) groups.push(child.pid);
+          assert(!('GOOGLE_API_KEY' in (options?.env ?? {})));
+          return child;
+        },
+        lifecycle: {
+          beforePhase: (phase) => {
+            assert.equal(phase, 'config');
+            events.push('intent');
+          },
+          owned: (_, group) => {
+            assert(group > 0);
+            events.push('owned');
+            if (row === 'owned-reject') return Promise.reject(new Error('private-canary')) as never;
+          },
+          quiescent: (_, group) => {
+            assert(groupAbsent(group));
+            events.push('quiescent');
+            if (row === 'quiescent-reject') throw new Error('private-canary');
+          },
+        },
+      });
+      const outcome = await handle.result;
+      assert.equal(outcome.quiescent, true, row);
+      assert(groupAbsent(handle.group));
+      assert.deepEqual(events, ['intent', 'spawn', 'owned', 'quiescent']);
+      if (row === 'success') {
+        assert.equal(outcome.reason, null);
+        assert.deepEqual(outcome.metadata, projected);
+      } else {
+        assert.equal(outcome.metadata, null);
+        assert(outcome.reason, row);
+        assert(!JSON.stringify(outcome).includes('private'));
+      }
+    }
+    for (const row of [
+      'success',
+      'before-reject',
+      'before-deadline',
+      'missing-submission-hook',
+      'submission-reject',
+      'submission-deadline',
+      'submission-abort',
+      'owned-reject',
+      'owned-thenable',
+      'quiescent-reject',
+      'quiescent-deadline',
+      'stop',
+    ] as const) {
+      let tick = 0;
+      const events: string[] = [];
+      const abort = new AbortController();
+      const selected = { ...file, path: 'src/日本 語.js' };
+      const options = {
+        client,
+        admission,
+        attemptId,
+        repositoryRoot: resolve('.'),
+        directory,
+        temporaryDirectory: runtime,
+        file: selected,
+        task: 'good',
+        timeoutMs: 3000,
+        deadline: 3000,
+        now: () => tick,
+        signal: abort.signal,
+        onSubmitted: (row === 'missing-submission-hook'
+          ? undefined
+          : () => {
+              events.push('submitted');
+              if (row === 'submission-reject') throw new Error('private-canary');
+              if (row === 'submission-deadline') tick = 1600;
+              if (row === 'submission-abort') abort.abort();
+            }) as () => void,
+        spawn: (command, args, options) => {
+          events.push('spawn');
+          assert(events.includes('submitted'));
+          const child = spawn(command, args, options);
+          if (child.pid) groups.push(child.pid);
+          return child;
+        },
+        lifecycle: {
+          beforePhase: (phase) => {
+            assert.equal(phase, 'task');
+            events.push('intent');
+            if (row === 'before-reject') throw new Error('private-canary');
+            if (row === 'before-deadline') tick = 1600;
+          },
+          owned: () => {
+            events.push('owned');
+            if (row === 'owned-reject') throw new Error('private-canary');
+            if (row === 'owned-thenable')
+              return Promise.reject(new Error('private-canary')) as never;
+          },
+          quiescent: (_, group: number) => {
+            assert(groupAbsent(group));
+            events.push('quiescent');
+            if (row === 'quiescent-reject') throw new Error('private-canary');
+            if (row === 'quiescent-deadline') tick = 3001;
+          },
+        },
+      } satisfies Parameters<typeof startGoogleWriter>[0];
+      if (
+        [
+          'before-reject',
+          'before-deadline',
+          'missing-submission-hook',
+          'submission-reject',
+          'submission-deadline',
+          'submission-abort',
+        ].includes(row)
+      ) {
+        assert.throws(
+          () => startGoogleWriter(options),
+          (error) => error instanceof GoogleWriterError && !error.message.includes('private'),
+          row,
+        );
+        assert(!events.includes('spawn'), row);
+        assert.equal(
+          events.filter((value) => value === 'submitted').length,
+          row.startsWith('submission-') ? 1 : 0,
+          row,
+        );
+      } else {
+        const handle = startGoogleWriter(options);
+        if (row === 'stop') handle.stop();
+        const outcome = await handle.result;
+        assert.equal(outcome.quiescent, true, row);
+        assert(groupAbsent(handle.group));
+        assert.deepEqual(events, ['intent', 'submitted', 'spawn', 'owned', 'quiescent']);
+        if (row === 'success') {
+          assert.equal(outcome.reason, null);
+          assert.equal(outcome.metadata?.replacement.path, selected.path);
+          assert.equal(outcome.metadata?.conversationId, 'session');
+        } else {
+          assert.equal(outcome.metadata, null);
+          assert(outcome.reason, row);
+          assert(!JSON.stringify(outcome).includes('private'));
+        }
+      }
+    }
+    for (const content of ['text\0tail', '\ud800'])
+      await assert.rejects(
+        runGoogleWriter({
+          client,
+          admission,
+          attemptId,
+          repositoryRoot: resolve('.'),
+          directory,
+          temporaryDirectory: runtime,
+          logFile: join(runtime, 'invalid-text.log'),
+          file: { ...file, content, baseHash: hash(content) },
+          task: 'good',
+          timeoutMs: 3000,
+          onSpawn: () => assert.fail('invalid text must not spawn'),
+        }),
+        GoogleWriterError,
+      );
     for (const mode of [
       'good',
       ...permissionModes.slice(1),

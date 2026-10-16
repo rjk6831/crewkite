@@ -101,6 +101,21 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     { billingBasis: 'provider-observed' },
   ])
     assert.equal(NativeProfileSchema.safeParse({ ...pendingProfile, ...change }).success, false);
+  const googleProfile = {
+    ...pendingProfile,
+    id: 'google-file-v1',
+    family: 'google',
+    effort: 'low',
+    permissionModes: ['request-review', 'strict', 'always-proceed', 'proceed-in-sandbox'],
+  };
+  assert.deepEqual(NativeProfileSchema.parse(googleProfile), googleProfile);
+  for (const change of [
+    { permissionModes: ['request-review'] },
+    { permissionModes: ['unknown', 'strict', 'always-proceed', 'proceed-in-sandbox'] },
+    { accountClass: 'pro' },
+    { creditPolicies: ['existing-credits'] },
+  ])
+    assert.equal(NativeProfileSchema.safeParse({ ...googleProfile, ...change }).success, false);
   const historicalRun = {
     runId: `run_${suffix}`,
     profileId: historicalProfile.id,

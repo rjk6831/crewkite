@@ -4,6 +4,7 @@ import { pathToFileURL } from 'node:url';
 import { Controller, type ControllerOptions } from './commands/controller.ts';
 import { configuredIdentity } from './host/publication.ts';
 import { resolveAnthropicNativeProfile } from './providers/anthropic/profile.ts';
+import { resolveGoogleNativeProfile } from './providers/google/profile.ts';
 import { resolveNativeProfile } from './providers/openai/profile.ts';
 import { serve } from './server/index.ts';
 
@@ -11,7 +12,11 @@ export async function startController(options: ControllerOptions) {
   const controller = new Controller({
     nativeProfiles: options.nativeProfile
       ? undefined
-      : () => [resolveNativeProfile(), resolveAnthropicNativeProfile()],
+      : () => [
+          resolveNativeProfile(),
+          resolveAnthropicNativeProfile(),
+          resolveGoogleNativeProfile(),
+        ],
     ...options,
   });
   try {

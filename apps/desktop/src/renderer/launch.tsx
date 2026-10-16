@@ -622,6 +622,13 @@ export function Launch(props: LaunchProps) {
   );
 }
 
+const permissionModeLabels = {
+  'request-review': 'Request permission',
+  strict: 'Strict',
+  'always-proceed': 'Always proceed',
+  'proceed-in-sandbox': 'Proceed in sandbox',
+};
+
 function NativeLaunch({
   task,
   snapshot,
@@ -639,7 +646,11 @@ function NativeLaunch({
       '',
   );
   const profile = snapshot.nativeProfiles.find((value) => value.id === profileId);
-  const anthropic = profile?.family === 'anthropic';
+  const google = profile?.family === 'google';
+  const attestedBilling = profile?.family === 'anthropic' || google;
+  const [permissionMode, setPermissionMode] = useState<
+    NonNullable<Snapshot['nativeRuns'][number]['permissionMode']> | ''
+  >(current?.permissionMode ?? '');
   const [subscriptionLogin, setSubscriptionLogin] = useState(false);
   const [extraUsageDisabled, setExtraUsageDisabled] = useState(false);
   const [prepared, setPrepared] = useState<Run | null>(saved ?? null);
@@ -685,7 +696,7 @@ function NativeLaunch({
   const connected = workspace.connection === 'connected' && !workspace.preview;
   const allowed = connected && profile?.available && !workspace.pending;
   const validConsent = savedConsent || (nativeTrust && sourceConsent);
-  const billingAttestation = anthropic
+  const billingAttestation = attestedBilling
     ? savedConsent
       ? current?.profileId === profile.id
         ? current.billingAttestation
@@ -698,7 +709,16 @@ function NativeLaunch({
           }
         : undefined
     : undefined;
-  const validBilling = !anthropic || !!billingAttestation;
+  const validBilling = !attestedBilling || !!billingAttestation;
+  const selectedPermissionMode = google
+    ? savedConsent
+      ? current?.profileId === profile.id
+        ? current.permissionMode
+        : undefined
+      : permissionMode || undefined
+    : undefined;
+  const validPermissionMode =
+    !google || profile.permissionModes.some((mode) => mode === selectedPermissionMode);
   function resetConsent() {
     setNativeTrust(false);
     setSourceConsent(false);
@@ -709,13 +729,15 @@ function NativeLaunch({
     resetConsent();
     setSubscriptionLogin(false);
     setExtraUsageDisabled(false);
+    setPermissionMode('');
   }
   const startable =
     allowed &&
     prepared &&
     task.runId === prepared.id &&
     capability?.stage === 'prepared' &&
-    (!anthropic || !!capability.billingAttestation) &&
+    (!attestedBilling || !!capability.billingAttestation) &&
+    (!google || !!capability.permissionMode) &&
     !!capability.expiresAt &&
     Date.parse(capability.expiresAt) > Date.now();
   const unavailable = profile
@@ -738,6 +760,7 @@ function NativeLaunch({
       !allowed ||
       !validConsent ||
       !validBilling ||
+      !validPermissionMode ||
       !NativeTargetPathSchema.safeParse(targetPath).success ||
       !profile
     )
@@ -776,6 +799,7 @@ function NativeLaunch({
           creditPolicy: existingCredits ? 'existing-credits' : 'ordinary',
           consent: savedConsent ? 'saved' : 'explicit',
           ...(billingAttestation ? { billingAttestation } : {}),
+          ...(selectedPermissionMode ? { permissionMode: selectedPermissionMode } : {}),
         },
       });
       const run = RunSchema.safeParse(result.entity);
@@ -810,7 +834,7 @@ function NativeLaunch({
         <section className="card">
           <div className="section-heading">
             <h2>{profile?.displayName ?? 'Native proposal'}</h2>
-            <span>{anthropic ? 'Subscription confirmation required' : 'Requires Pro'}</span>
+            <span>{attestedBilling ? 'Subscription confirmation required' : 'Requires Pro'}</span>
           </div>
           {!prepared && (
             <label>
@@ -837,12 +861,14 @@ function NativeLaunch({
               <span>{profile.model}</span>
               <span>
                 {profile.effort}
-                {anthropic ? ' requested effort' : ' effort'}
+                {attestedBilling ? ' requested effort' : ' effort'}
               </span>
-              {anthropic && <span>Effective effort unknown</span>}
-              {anthropic && <span>Account class unknown</span>}
-              <span>{anthropic ? 'Service tier unknown' : `${profile.serviceTier} tier`}</span>
-              {anthropic && (
+              {attestedBilling && <span>Effective effort unknown</span>}
+              {attestedBilling && <span>Account class unknown</span>}
+              <span>
+                {attestedBilling ? 'Service tier unknown' : `${profile.serviceTier} tier`}
+              </span>
+              {attestedBilling && (
                 <span>
                   {profile.qualifiedAt
                     ? `Qualified ${profile.qualifiedAt.slice(0, 10)}`
@@ -852,8 +878,8 @@ function NativeLaunch({
             </div>
           )}
           <p className="muted small">
-            Account, model and configuration are checked when the run starts. A provider hard
-            spending cap remains unverified.
+            Required native client metadata is checked when the run starts. A provider hard spending
+            cap remains unverified.
           </p>
           {!profile?.available && (
             <p className="notice" role="status">
@@ -877,8 +903,16 @@ function NativeLaunch({
                   ? new Date(capability.expiresAt).toLocaleString()
                   : 'Unknown'}
               </p>
+              {google && (
+                <p>
+                  Expected native permission mode:{' '}
+                  {capability?.permissionMode
+                    ? permissionModeLabels[capability.permissionMode]
+                    : 'Unknown'}
+                </p>
+              )}
               <p>
-                {anthropic
+                {attestedBilling
                   ? 'Subscription login and disabled paid extra usage are user-attested.'
                   : snapshot.routes.find((route) => route.id === prepared.roles[0]?.routeId)
                         ?.billing === 'credits'
@@ -907,7 +941,44 @@ function NativeLaunch({
               Choose one existing text file in {project?.name ?? 'this project'}. The controller
               freezes its committed base, hash and size before Start.
             </p>
-            {anthropic && (
+            {google && (
+              <>
+                <label>
+                  Expected native permission mode
+                  <select
+                    value={selectedPermissionMode ?? ''}
+                    onChange={(event) => {
+                      const mode = profile.permissionModes.find(
+                        (value) => value === event.target.value,
+                      );
+                      resetScope();
+                      setPermissionMode(mode ?? '');
+                    }}
+                  >
+                    <option value="">Choose the current client setting</option>
+                    {profile.permissionModes.map((mode) => (
+                      <option key={mode} value={mode}>
+                        {permissionModeLabels[mode]}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <p className="muted small">
+                  {selectedPermissionMode
+                    ? {
+                        'request-review': 'The client can ask permission for native actions.',
+                        strict: 'The client uses its strict permission setting.',
+                        'always-proceed': 'The client can proceed without interactive approval.',
+                        'proceed-in-sandbox':
+                          'The client uses its native sandbox permission setting.',
+                      }[selectedPermissionMode]
+                    : 'Choose the expected native permission mode.'}{' '}
+                  This must match the existing client setting. CrewKite does not change it.
+                  Interactive approval and tool containment remain unqualified.
+                </p>
+              </>
+            )}
+            {attestedBilling && (
               <>
                 <p className="muted small">
                   These confirmations describe your existing login and settings. They are supplied
@@ -980,7 +1051,7 @@ function NativeLaunch({
               Native global and project guidance may apply. Tool containment remains unqualified.
               Saved consent must match the controller's exact recorded scope.
             </p>
-            {!anthropic && (
+            {!attestedBilling && (
               <>
                 <label className="checkbox-label">
                   <input
@@ -1080,6 +1151,7 @@ function NativeLaunch({
               !allowed ||
               !validConsent ||
               !validBilling ||
+              !validPermissionMode ||
               !NativeTargetPathSchema.safeParse(targetPath).success
             }
             onClick={() => void prepareNative()}

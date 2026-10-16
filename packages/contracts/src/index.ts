@@ -98,14 +98,37 @@ export const AnthropicNativeProfileSchema = z.strictObject({
   available: z.boolean(),
   reason: z.enum([...OpenAiNativeProfileSchema.shape.reason.options, 'qualification-pending']),
 });
+export const GoogleNativePermissionModeSchema = z.enum([
+  'request-review',
+  'strict',
+  'always-proceed',
+  'proceed-in-sandbox',
+]);
+export const GoogleNativeProfileSchema = AnthropicNativeProfileSchema.omit({
+  id: true,
+  family: true,
+  effort: true,
+}).extend({
+  id: z.literal('google-file-v1'),
+  family: z.literal('google'),
+  effort: z.literal('low'),
+  permissionModes: z.tuple([
+    z.literal('request-review'),
+    z.literal('strict'),
+    z.literal('always-proceed'),
+    z.literal('proceed-in-sandbox'),
+  ]),
+});
 export const NativeProfileSchema = z.discriminatedUnion('family', [
   OpenAiNativeProfileSchema,
   AnthropicNativeProfileSchema,
+  GoogleNativeProfileSchema,
 ]);
 export const NativeRunSchema = z.strictObject({
   runId: RunIdSchema,
   profileId: label,
   billingAttestation: NativeBillingAttestationSchema.optional(),
+  permissionMode: GoogleNativePermissionModeSchema.optional(),
   stage: z.enum(['prepared', 'retain-only']),
   expiresAt: TimestampSchema.optional(),
   target: z
@@ -579,6 +602,7 @@ export const CommandSchema = z.discriminatedUnion('command', [
       taskId: TaskIdSchema,
       profileId: label,
       billingAttestation: NativeBillingAttestationSchema.optional(),
+      permissionMode: GoogleNativePermissionModeSchema.optional(),
       targetPath: NativeTargetPathSchema,
       policy: PolicySchema,
       creditPolicy: z.enum(['ordinary', 'existing-credits']).default('ordinary'),
@@ -815,7 +839,7 @@ export const SnapshotSchema = z
   .strictObject({
     nativeProfiles: z
       .array(NativeProfileSchema)
-      .max(2)
+      .max(3)
       .refine((profiles) => new Set(profiles.map((profile) => profile.id)).size === profiles.length)
       .default([]),
     nativeRuns: z.array(NativeRunSchema).max(10000).default([]),

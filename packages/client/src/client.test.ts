@@ -189,6 +189,15 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     available: true,
     reason: 'qualification-pending',
   };
+  const googleProfile: Snapshot['nativeProfiles'][number] = {
+    ...anthropicProfile,
+    id: 'google-file-v1',
+    family: 'google',
+    displayName: 'Google single-file proposal',
+    clientVersion: '0.14.0',
+    effort: 'low',
+    permissionModes: ['request-review', 'strict', 'always-proceed', 'proceed-in-sandbox'],
+  };
   const billingAttestation = {
     source: 'user-attested' as const,
     subscriptionLoginConfirmed: true as const,
@@ -309,6 +318,19 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     'anthropic-wrong-command',
     'anthropic-reviewer',
     'anthropic-show',
+    'google-request-review',
+    'google-strict',
+    'google-always-proceed',
+    'google-proceed-in-sandbox',
+    'google-saved',
+    'google-missing-confirmations',
+    'google-missing-mode',
+    'google-invalid-mode',
+    'google-credits',
+    'google-wrong-provider',
+    'google-wrong-command',
+    'google-reviewer',
+    'google-show',
     'explicit',
     'saved',
     'unavailable',
@@ -345,11 +367,20 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     'accept-approval-ambiguous',
   ]) {
     const anthropicSaved = scenario === 'anthropic-saved' || scenario === 'anthropic-show';
+    const googleSaved = scenario === 'google-saved' || scenario === 'google-show';
     const selectedNativeRun: Snapshot['nativeRuns'][number] = anthropicSaved
       ? { ...nativeRun, profileId: anthropicProfile.id, billingAttestation }
-      : nativeRun;
+      : googleSaved
+        ? {
+            ...nativeRun,
+            profileId: googleProfile.id,
+            billingAttestation,
+            permissionMode: 'strict',
+          }
+        : nativeRun;
     const evaluating =
       scenario === 'anthropic-reviewer' ||
+      scenario === 'google-reviewer' ||
       scenario.startsWith('evaluation-') ||
       scenario.startsWith('accept-') ||
       ['start-checks', 'start-review'].includes(scenario);
@@ -468,7 +499,11 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
               ...snapshot,
               tasks: pendingCommand
                 ? [pendingTask]
-                : scenario === 'native-show' || anthropicSaved || evaluating || needsApproval
+                : scenario === 'native-show' ||
+                    anthropicSaved ||
+                    googleSaved ||
+                    evaluating ||
+                    needsApproval
                   ? [
                       {
                         ...task,
@@ -478,7 +513,11 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
                     ]
                   : snapshot.tasks,
               runs:
-                scenario === 'native-show' || anthropicSaved || evaluating || needsApproval
+                scenario === 'native-show' ||
+                anthropicSaved ||
+                googleSaved ||
+                evaluating ||
+                needsApproval
                   ? [run]
                   : [],
               attempts: needsApproval
@@ -494,7 +533,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
                   ]
                 : snapshot.attempts,
               nativeRuns:
-                scenario === 'native-show' || anthropicSaved || evaluating
+                scenario === 'native-show' || anthropicSaved || googleSaved || evaluating
                   ? [selectedNativeRun]
                   : [],
               candidates: evaluating || needsApproval ? [candidate] : [],
@@ -503,6 +542,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
               evidence: reviewEvidence,
               approvals,
               nativeProfiles: [
+                googleProfile,
                 anthropicProfile,
                 {
                   ...profile,
@@ -697,7 +737,78 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
                   ...(scenario === 'anthropic-credits' ? ['--existing-credits'] : []),
                 ];
     }
+    const googleMode: Snapshot['nativeRuns'][number]['permissionMode'] =
+      googleProfile.permissionModes.find((mode) => scenario === `google-${mode}`);
+    if (scenario.startsWith('google-')) {
+      args =
+        scenario === 'google-show'
+          ? ['task', 'show', task.id]
+          : scenario === 'google-wrong-command'
+            ? ['native', 'profiles', '--permission-mode', 'strict']
+            : scenario === 'google-reviewer'
+              ? ['task', 'prepare-evaluation', task.id, googleProfile.id, '--grants', grantsFile]
+              : [
+                  'task',
+                  'prepare-native',
+                  task.id,
+                  scenario === 'google-wrong-provider' ? anthropicProfile.id : googleProfile.id,
+                  'docs/providers.md',
+                  '--policy',
+                  policyFile,
+                  ...(scenario === 'google-saved' ? [] : ['--native-trust', '--source-consent']),
+                  ...(scenario === 'google-missing-confirmations' || scenario === 'google-saved'
+                    ? []
+                    : ['--confirm-subscription-only']),
+                  ...(scenario === 'google-missing-mode' || scenario === 'google-saved'
+                    ? []
+                    : [
+                        '--permission-mode',
+                        scenario === 'google-invalid-mode' ? 'automatic' : (googleMode ?? 'strict'),
+                      ]),
+                  ...(scenario === 'google-credits' ? ['--existing-credits'] : []),
+                ];
+    }
     const result = await execute(args, scenario !== 'changes');
+    if (scenario.startsWith('google-')) {
+      if (scenario === 'google-show') {
+        assert.equal(result.code, 0, result.errors);
+        assert.deepEqual(JSON.parse(result.output).nativeRun, selectedNativeRun);
+        const plain = await execute(args, false);
+        assert.match(plain.output, /Expected native permission mode: strict/u);
+        assert.match(plain.output, /user-attested subscription login, paid extra usage disabled/u);
+      } else if (googleMode || scenario === 'google-saved') {
+        assert.equal(result.code, 0, result.errors);
+        const receipt = JSON.parse(result.output);
+        assert.equal(receipt.command.command, 'PrepareNativeRun');
+        assert.equal(receipt.command.expectedRevision, task.revision);
+        assert.deepEqual(receipt.command.payload, {
+          taskId: task.id,
+          profileId: googleProfile.id,
+          targetPath: 'docs/providers.md',
+          policy,
+          creditPolicy: 'ordinary',
+          consent: scenario === 'google-saved' ? 'saved' : 'explicit',
+          billingAttestation,
+          permissionMode: googleMode ?? 'strict',
+        });
+        assert.deepEqual(
+          received.map((value) => value.command),
+          ['GetSnapshot', 'PrepareNativeRun'],
+        );
+      } else {
+        assert.equal(result.code, 1, scenario);
+        assert.equal(
+          received.some((value) => value.command !== 'GetSnapshot'),
+          false,
+        );
+        if (scenario === 'google-wrong-command') assert.deepEqual(received, []);
+        if (scenario === 'google-reviewer')
+          assert.match(result.errors, /Choose a supported OpenAI reviewer profile/u);
+        if (scenario === 'google-missing-mode' || scenario === 'google-invalid-mode')
+          assert.match(result.errors, /Choose the current Google client setting/u);
+      }
+      continue;
+    }
     if (scenario.startsWith('anthropic-')) {
       if (scenario === 'anthropic-show') {
         assert.equal(result.code, 0, result.errors);
@@ -940,6 +1051,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     if (scenario === 'profiles') {
       assert.equal(result.code, 0);
       assert.deepEqual(JSON.parse(result.output).profiles, [
+        googleProfile,
         anthropicProfile,
         { ...profile, creditPolicies: [...profile.creditPolicies] },
       ]);

@@ -39,6 +39,7 @@ import {
   EventSchema,
   type FakeWorkerEvent,
   formatReviewTarget,
+  GoogleNativePermissionModeSchema,
   type Grant,
   GrantSchema,
   HashSchema,
@@ -121,6 +122,12 @@ import {
   startReplacement as startAnthropicReplacement,
 } from '../providers/anthropic/replacement.ts';
 import {
+  type GoogleNativeLifecycle,
+  googleWriterPlan,
+  startGoogleConfig,
+  startGoogleWriter,
+} from '../providers/google/native-writer.ts';
+import {
   type NativeProfileResolution,
   unavailableNativeProfile,
 } from '../providers/openai/profile.ts';
@@ -148,6 +155,7 @@ const NativeAppointmentSchema = z.strictObject({
   }),
   creditPolicy: z.enum(['ordinary', 'existing-credits']),
   billingAttestation: NativeBillingAttestationSchema.optional(),
+  permissionMode: GoogleNativePermissionModeSchema.optional(),
   target: z.strictObject({ path: ReplacementPathSchema, baseHash: HashSchema }),
   consent: z.strictObject({
     nativeTrust: z.literal('accepted'),
@@ -242,6 +250,16 @@ type NativeOutcome = {
         effectiveEffort: 'unknown';
         authHash: string;
         billingAttestation: z.infer<typeof NativeBillingAttestationSchema>;
+      })
+    | (NonNullable<Awaited<ReturnType<typeof startGoogleWriter>['result']>['metadata']> & {
+        family: 'google';
+        model: string;
+        requestedEffort: 'low';
+        effectiveEffort: 'unknown';
+        permissionMode: z.infer<typeof GoogleNativePermissionModeSchema>;
+        configHash: string;
+        billingAttestation: z.infer<typeof NativeBillingAttestationSchema>;
+        qualified: false;
       })
     | null;
   reason: string | null;
@@ -1213,7 +1231,7 @@ export class Controller {
       this.options.nativeProfile?.() ?? unavailableNativeProfile(),
     ];
     if (
-      profiles.length > 2 ||
+      profiles.length > 3 ||
       new Set(profiles.map((profile) => profile.facts.id)).size !== profiles.length
     )
       throw Error('Native profile identities are invalid.');
@@ -1253,6 +1271,7 @@ export class Controller {
             ...(appointment.billingAttestation
               ? { billingAttestation: appointment.billingAttestation }
               : {}),
+            ...(appointment.permissionMode ? { permissionMode: appointment.permissionMode } : {}),
             target: {
               ...appointment.target,
               bytes: plan.manifest.find(
@@ -1317,7 +1336,7 @@ export class Controller {
       model: profile.facts.model,
       effort: {
         requested: profile.facts.effort,
-        effective: profile.facts.family === 'anthropic' ? 'unknown' : profile.facts.effort,
+        effective: profile.facts.family === 'openai' ? profile.facts.effort : 'unknown',
         supported: [profile.facts.effort],
       },
       billing: creditPolicy === 'ordinary' ? 'included' : 'credits',
@@ -1354,8 +1373,15 @@ export class Controller {
           reason: 'native-profile-unavailable',
           next: 'Use the supported installed client and native account location.',
         };
-      if ((facts.family === 'anthropic') !== !!command.payload.billingAttestation)
+      if ((facts.family !== 'openai') !== !!command.payload.billingAttestation)
         throw Error('The subscription billing attestation is unavailable.');
+      if (
+        (facts.family === 'google') !== !!command.payload.permissionMode ||
+        (facts.family === 'google' &&
+          (!command.payload.permissionMode ||
+            !facts.permissionModes.includes(command.payload.permissionMode)))
+      )
+        throw Error('The native permission mode is unavailable.');
       const task = this.store.get<Task>('task', command.payload.taskId);
       if (task?.state !== 'draft' || this.draftEditGate(task))
         return { outcome: 'blocked', reason: 'task-not-preparable' };
@@ -1388,6 +1414,9 @@ export class Controller {
         ...(command.payload.billingAttestation
           ? { billingAttestation: command.payload.billingAttestation }
           : {}),
+        ...(command.payload.permissionMode
+          ? { permissionMode: command.payload.permissionMode }
+          : {}),
       });
       if (command.payload.consent === 'saved')
         expiresAt = new Date(
@@ -1405,7 +1434,7 @@ export class Controller {
             model: facts.model,
             effort: {
               requested: facts.effort,
-              effective: facts.family === 'anthropic' ? 'unknown' : facts.effort,
+              effective: facts.family === 'openai' ? facts.effort : 'unknown',
               supported: [facts.effort],
             },
             billing: command.payload.creditPolicy === 'ordinary' ? 'included' : 'credits',
@@ -1416,6 +1445,9 @@ export class Controller {
           creditPolicy: command.payload.creditPolicy,
           ...(command.payload.billingAttestation
             ? { billingAttestation: command.payload.billingAttestation }
+            : {}),
+          ...(command.payload.permissionMode
+            ? { permissionMode: command.payload.permissionMode }
             : {}),
           target: { path: original.path, baseHash: original.hash },
           consent: {
@@ -1500,6 +1532,7 @@ export class Controller {
       public: NativePublicScopeSchema.optional(),
     }).parse(JSON.parse(this.artifacts.read(artifact.hash).toString('utf8')));
     this.anthropicWriterEvidence(plan);
+    this.googleWriterEvidence(plan);
     const writer = this.store.get<Attempt>('attempt', plan.attempt.id);
     const completionArtifact = ArtifactSchema.parse(
       this.store.receipt(`native-completion:${plan.attempt.id}`)?.result.entity,
@@ -2181,6 +2214,79 @@ export class Controller {
       throw Error('evidence-incomplete');
   }
 
+  private googleWriterEvidence(
+    plan: Omit<z.infer<typeof NativePreparationSchema>, 'public'> & {
+      public?: z.infer<typeof NativePublicScopeSchema>;
+    },
+  ) {
+    if (plan.appointment.route.family !== 'google') return;
+    const config = this.nativeRecord(`native-config:${plan.attempt.id}`, 4096);
+    const observed = z
+      .object({
+        attemptId: z.string(),
+        clientHash: HashSchema,
+        locationHash: HashSchema,
+        billingAttestationHash: HashSchema,
+        metadata: z.object({
+          permissionMode: GoogleNativePermissionModeSchema,
+          creditFallback: z.literal('disabled'),
+          account: z.literal('unknown'),
+          billing: z.literal('unknown'),
+          observedTurns: z.literal(0),
+        }),
+        reason: z.null(),
+        quiescent: z.literal(true),
+        exitCode: z.literal(0),
+        signal: z.null(),
+      })
+      .parse(config.value);
+    const proposal = this.nativeRecord(`native-proposal:${plan.attempt.id}`);
+    const output = z
+      .object({
+        family: z.literal('google'),
+        conversationId: z.string().min(1).max(200),
+        model: z.string(),
+        requestedEffort: z.literal('low'),
+        effectiveEffort: z.literal('unknown'),
+        permissionMode: GoogleNativePermissionModeSchema,
+        configHash: HashSchema,
+        billingAttestation: NativeBillingAttestationSchema,
+        qualified: z.literal(false),
+        replacement: z.object({
+          attemptId: z.string(),
+          path: ReplacementPathSchema,
+          baseHash: HashSchema,
+        }),
+      })
+      .parse(proposal.value);
+    const applied = this.nativeRecord(`native-application:${plan.attempt.id}`);
+    const application = z
+      .object({ attemptId: z.string(), proposalHash: HashSchema })
+      .parse(applied.value);
+    if (
+      !plan.public ||
+      !plan.appointment.billingAttestation ||
+      !plan.appointment.permissionMode ||
+      plan.appointment.creditPolicy !== 'ordinary' ||
+      observed.attemptId !== plan.attempt.id ||
+      observed.clientHash !== plan.appointment.client.sha256 ||
+      observed.locationHash !== plan.public.locationHash ||
+      observed.billingAttestationHash !== hashCanonical(plan.appointment.billingAttestation) ||
+      observed.metadata.permissionMode !== plan.appointment.permissionMode ||
+      output.permissionMode !== plan.appointment.permissionMode ||
+      output.model !== plan.appointment.route.model ||
+      output.configHash !== config.artifact.hash ||
+      hashCanonical(output.billingAttestation) !==
+        hashCanonical(plan.appointment.billingAttestation) ||
+      output.replacement.attemptId !== plan.attempt.id ||
+      output.replacement.path !== plan.appointment.target.path ||
+      output.replacement.baseHash !== plan.appointment.target.baseHash ||
+      application.attemptId !== plan.attempt.id ||
+      application.proposalHash !== hashCanonical(proposal.value)
+    )
+      throw Error('evidence-incomplete');
+  }
+
   private nativePublicationEvidence(run: Run, candidate: Candidate) {
     const same = (left: unknown, right: unknown) => hashCanonical(left) === hashCanonical(right);
     const origin = this.nativeRecord(`native-run:${run.id}`);
@@ -2188,6 +2294,7 @@ export class Controller {
       public: NativePublicScopeSchema.optional(),
     }).parse(origin.value);
     this.anthropicWriterEvidence(native);
+    this.googleWriterEvidence(native);
     const prepared = ArtifactSchema.parse(
       this.store.receipt(`evaluation-started:${run.id}`)?.result.entity,
     );
@@ -3056,15 +3163,17 @@ export class Controller {
     if (
       route.fake ||
       route.qualified ||
-      !['openai', 'anthropic'].includes(route.family) ||
+      !['openai', 'anthropic', 'google'].includes(route.family) ||
       route.billing !== (appointment.creditPolicy === 'ordinary' ? 'included' : 'credits') ||
       route.speed ||
       (route.family === 'openai'
         ? route.effort.requested !== route.effort.effective || !!appointment.billingAttestation
-        : route.effort.requested !== 'medium' ||
+        : route.effort.requested !== (route.family === 'anthropic' ? 'medium' : 'low') ||
           route.effort.effective !== 'unknown' ||
           appointment.creditPolicy !== 'ordinary' ||
           !appointment.billingAttestation) ||
+      (route.family === 'google') !== !!appointment.permissionMode ||
+      (route.family === 'google' && !publicScope) ||
       !route.effort.supported.includes(route.effort.requested) ||
       (this.store.get('route', route.id) &&
         (!publicScope ||
@@ -3348,6 +3457,22 @@ export class Controller {
       baseHash: binding.baseHash,
       criteria,
     };
+    if (appointment.route.family === 'google') {
+      if (
+        !appointment.billingAttestation ||
+        !appointment.permissionMode ||
+        appointment.creditPolicy !== 'ordinary' ||
+        binding.anthropicSessionId
+      )
+        throw Error('The subscription writer binding is unavailable.');
+      return googleWriterPlan({
+        attemptId: attempt.id,
+        file: { path: fields.path, baseHash: fields.baseHash, content: fields.original },
+        task: JSON.stringify(criteria),
+        model: appointment.route.model,
+        effort: 'low',
+      });
+    }
     if (appointment.route.family === 'anthropic') {
       if (
         !binding.anthropicSessionId ||
@@ -3470,6 +3595,143 @@ export class Controller {
                 billingAttestation: NativeBillingAttestationSchema.parse(
                   appointment.billingAttestation,
                 ),
+              }
+            : null,
+          reason: outcome.reason,
+          quiescent: outcome.quiescent,
+          diagnostic: outcome.diagnostic,
+        };
+      } catch {
+        return { metadata: null, reason: 'launch', quiescent, diagnostic: null };
+      }
+    })();
+    return { result, stop: () => active?.stop() };
+  }
+
+  private launchGoogle(
+    runtime: NativeRuntime,
+    directory: string,
+    timeoutMs: number,
+    onSubmitted: () => void,
+  ): NonNullable<NativeRuntime['handle']> {
+    const { binding } = runtime;
+    const { appointment, attempt } = binding;
+    const deadline = performance.now() + timeoutMs;
+    let active: { stop: () => void } | undefined;
+    let quiescent = false;
+    const journal = this.nativeLifecycle(attempt, () => this.nativeCurrent(runtime));
+    const phase = (kind: 'config' | 'task') =>
+      kind === 'config'
+        ? { sequence: 0, kind: 'google-config' as const }
+        : { sequence: 1, kind: 'native-task' as const };
+    const lifecycle: GoogleNativeLifecycle = {
+      beforePhase: (kind) => journal.beforePhase(phase(kind)),
+      owned: (kind, group) => journal.owned(phase(kind), group),
+      quiescent: (kind, group) => journal.quiescent(phase(kind), group),
+    };
+    const result = (async (): Promise<NativeOutcome> => {
+      try {
+        if (!appointment.permissionMode || !appointment.billingAttestation || !binding.public)
+          throw Error();
+        const locationHash = binding.public.locationHash;
+        const temporaryDirectory = join(directory, 'temporary');
+        const configDirectory = join(directory, 'config');
+        mkdirSync(temporaryDirectory, { mode: 0o700 });
+        mkdirSync(configDirectory, { mode: 0o700 });
+        const launch = {
+          client: appointment.client,
+          repositoryRoot: this.home,
+          temporaryDirectory,
+          environment: binding.environment ?? process.env,
+          timeoutMs,
+          deadline,
+          schedule: this.options.schedule,
+          spawn: this.options.nativeSpawn as typeof import('node:child_process').spawn,
+          lifecycle,
+        };
+        const config = startGoogleConfig({
+          ...launch,
+          directory: configDirectory,
+          timeoutMs: Math.min(timeoutMs, 20000),
+        });
+        active = config;
+        if (runtime.stopped || this.closed) active.stop();
+        const observed = await config.result;
+        active = undefined;
+        quiescent = observed.quiescent;
+        let configHash = '';
+        this.store.transaction(() => {
+          const artifact = this.nativeArtifact({
+            attemptId: attempt.id,
+            clientHash: appointment.client.sha256,
+            locationHash,
+            billingAttestationHash: hashCanonical(appointment.billingAttestation),
+            ...observed,
+          });
+          configHash = artifact.hash;
+          this.store.saveReceipt(`native-config:${attempt.id}`, artifact.hash, 'local-owner', {
+            outcome: 'applied',
+            entity: artifact,
+          });
+        });
+        if (
+          observed.reason ||
+          !observed.quiescent ||
+          !observed.metadata ||
+          observed.metadata.permissionMode !== appointment.permissionMode
+        )
+          return {
+            metadata: null,
+            reason: observed.reason ?? 'configuration',
+            quiescent,
+            diagnostic: null,
+          };
+        this.nativeCurrent(runtime);
+        const taskDirectory = join(directory, 'task');
+        mkdirSync(taskDirectory, { mode: 0o700 });
+        const plan = this.nativeWriterPlan(binding) as ReturnType<typeof googleWriterPlan>;
+        const writer = startGoogleWriter({
+          ...launch,
+          directory: taskDirectory,
+          attemptId: attempt.id,
+          file: plan.file,
+          task: plan.task,
+          onSubmitted,
+          admission: {
+            clientExecutable: appointment.client.executable,
+            clientVersion: appointment.client.version,
+            clientSha256: appointment.client.sha256,
+            checkedAt: this.now(),
+            nativeTrust: 'accepted',
+            permissions: appointment.permissionMode,
+            billing: 'subscription-only',
+            extraCredits: 'disabled',
+            evidence: {
+              nativePermissions: configHash,
+              subscriptionBilling: hashCanonical(appointment.billingAttestation),
+              paidCreditsDisabled: configHash,
+            },
+            model: appointment.route.model,
+            effort: 'low',
+          },
+        });
+        active = writer;
+        quiescent = false;
+        if (runtime.stopped || this.closed) active.stop();
+        const outcome = await writer.result;
+        active = undefined;
+        return {
+          metadata: outcome.metadata
+            ? {
+                ...outcome.metadata,
+                family: 'google',
+                model: appointment.route.model,
+                requestedEffort: 'low',
+                effectiveEffort: 'unknown',
+                permissionMode: appointment.permissionMode,
+                configHash,
+                billingAttestation: appointment.billingAttestation,
+                qualified: false,
               }
             : null,
           reason: outcome.reason,
@@ -3626,7 +3888,9 @@ export class Controller {
           );
         });
       };
-      if (appointment.route.family === 'anthropic') {
+      if (appointment.route.family === 'google') {
+        runtime.handle = this.launchGoogle(runtime, directory, timeoutMs, onSubmitted);
+      } else if (appointment.route.family === 'anthropic') {
         runtime.handle = this.launchAnthropic(runtime, directory, timeoutMs, onSubmitted);
       } else
         runtime.handle = startReplacement(
