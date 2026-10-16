@@ -164,6 +164,15 @@ const assistant = identity.extend({
   type: z.literal('assistant'),
   message: z.object({ role: z.literal('assistant'), content: z.array(z.unknown()).max(128) }),
 });
+const user = identity.extend({
+  type: z.literal('user'),
+  parent_tool_use_id: z.null(),
+  isReplay: z.never().optional(),
+  message: z.object({
+    role: z.literal('user'),
+    content: z.union([z.string().max(MAX_BYTES), z.array(z.unknown()).max(128)]),
+  }),
+});
 const retry = identity.extend({
   type: z.literal('system'),
   subtype: z.literal('api_retry'),
@@ -273,6 +282,8 @@ const fields = [
   'baseHash',
   'uuid',
   'rate_limit_info',
+  'parent_tool_use_id',
+  'isReplay',
 ] as const;
 export type ReplacementDiagnostic = Readonly<{
   stage: 'before-init' | 'output' | 'complete';
@@ -281,6 +292,7 @@ export type ReplacementDiagnostic = Readonly<{
     | 'identity'
     | 'init'
     | 'assistant'
+    | 'user'
     | 'retry'
     | 'rate-limit'
     | 'result'
@@ -381,6 +393,10 @@ export class ReplacementStream {
         } else if (type === 'assistant') {
           this.site = 'assistant';
           assistant.parse(value);
+        } else if (type === 'user') {
+          this.site = 'user';
+          // Native user-role output is discarded. Only the terminal result can supply a proposal.
+          user.parse(value);
         } else if (type === 'system') {
           this.site = 'retry';
           retry.parse(value);

@@ -49,6 +49,12 @@ const result = {
 };
 const line = (value: unknown) => Buffer.from(`${JSON.stringify(value)}\n`);
 const secret = 'private-account@example.test';
+const user = {
+  type: 'user',
+  session_id: input.sessionId,
+  parent_tool_use_id: null,
+  message: { role: 'user', content: secret },
+};
 const rateLimit = {
   type: 'rate_limit_event',
   session_id: input.sessionId,
@@ -95,6 +101,63 @@ test('native text replacement stays bound to one proposal and owned task deadlin
     diagnostic?: Record<string, unknown>;
   }> = [
     { name: 'valid', frames: [init, result], pass: true },
+    { name: 'user text is discarded output', frames: [init, user, result], pass: true },
+    {
+      name: 'native formatter result is discarded output',
+      frames: [
+        init,
+        {
+          type: 'assistant',
+          session_id: input.sessionId,
+          message: {
+            role: 'assistant',
+            content: [
+              { type: 'tool_use', id: 'formatter-1', name: 'StructuredOutput', input: edit },
+            ],
+          },
+        },
+        {
+          ...user,
+          message: {
+            role: 'user',
+            content: [{ type: 'tool_result', tool_use_id: 'formatter-1', content: secret }],
+          },
+          tool_use_result: { private: secret },
+        },
+        result,
+      ],
+      pass: true,
+    },
+    { name: 'user output needs init', frames: [user, result] },
+    { name: 'user output cannot follow terminal result', frames: [init, result, user] },
+    {
+      name: 'user output cannot seal a proposal',
+      frames: [init, { ...user, message: { role: 'user', content: JSON.stringify(edit) } }],
+    },
+    {
+      name: 'user output session remains bound',
+      frames: [init, { ...user, session_id: '46eb17cd-01e8-480d-99f4-a741f189715e' }, result],
+    },
+    {
+      name: 'user output role remains bound',
+      frames: [init, { ...user, message: { role: 'assistant', content: secret } }, result],
+    },
+    {
+      name: 'subagent user output remains refused',
+      frames: [init, { ...user, parent_tool_use_id: 'foreign-tool' }, result],
+    },
+    {
+      name: 'replayed user output remains refused',
+      frames: [init, { ...user, isReplay: true }, result],
+    },
+    {
+      name: 'user output blocks remain bounded',
+      frames: [
+        init,
+        { ...user, message: { role: 'user', content: Array(129).fill(secret) } },
+        result,
+      ],
+    },
     {
       name: 'rate limit metadata grants no proposal authority',
       frames: [
