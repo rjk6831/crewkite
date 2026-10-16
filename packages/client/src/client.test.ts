@@ -1210,6 +1210,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     if (scenario === 'profiles') {
       assert.equal(result.code, 0);
       assert.deepEqual(JSON.parse(result.output).profiles, [
+        repositoryProfile,
         googleProfile,
         anthropicProfile,
         { ...profile, creditPolicies: [...profile.creditPolicies] },
