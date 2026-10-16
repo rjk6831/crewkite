@@ -2,8 +2,9 @@ import {
   EffectSchema,
   type Policy,
   PolicySchema,
+  parseReviewTarget,
   type ReviewMethod,
-  ReviewMethodIdSchema,
+  ReviewTargetSchema,
   type Role,
   RoleSchema,
   type Route,
@@ -62,17 +63,15 @@ export function loadTeams(): SavedTeam[] {
           const action = EffectSchema.shape.action.safeParse(gate.action);
           if (action.success && (gate.mode === 'ask' || gate.mode === 'once')) {
             if (action.data === 'run-review') {
-              const method = ReviewMethodIdSchema.safeParse(gate.methodId);
-              if (
-                method.success &&
-                Number.isInteger(gate.cycle) &&
-                gate.cycle >= 1 &&
-                gate.cycle <= 3
-              )
+              const target = ReviewTargetSchema.safeParse({
+                methodId: gate.methodId,
+                cycle: gate.cycle,
+              });
+              if (target.success)
                 gates.push({
                   action: action.data,
-                  methodId: method.data,
-                  cycle: gate.cycle,
+                  methodId: target.data.methodId,
+                  cycle: target.data.cycle,
                   mode: gate.mode,
                 });
             } else gates.push({ action: action.data, mode: gate.mode });
@@ -113,10 +112,9 @@ export function saveTeam(
     gates: policy.effects.flatMap((grant): SavedTeam['gates'] => {
       const mode = grant.usesRemaining === 1 ? ('once' as const) : ('ask' as const);
       if (grant.action !== 'run-review') return [{ action: grant.action, mode }];
-      const [id, cycleText] = grant.target.split('/cycle-');
-      const method = ReviewMethodIdSchema.safeParse(id);
-      return method.success
-        ? [{ action: grant.action, methodId: method.data, cycle: Number(cycleText), mode }]
+      const target = parseReviewTarget(grant.target);
+      return target
+        ? [{ action: grant.action, methodId: target.methodId, cycle: target.cycle, mode }]
         : [];
     }),
   };

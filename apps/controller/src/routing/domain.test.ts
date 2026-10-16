@@ -76,6 +76,14 @@ test('reset preference uses the near-reset route until its reserve is reached', 
     assert.equal(result.chosen, chosen);
     assert.deepEqual(chooseRoute(value), result);
     assert.equal(result.rejected.length, chosen === null ? 2 : 1);
+    value.role.selection = 'reset-aware';
+    assert.equal(chooseRoute(value).chosen, chosen);
+    value.role.selection = 'ordered';
+    value.previous = { routeId: b, sinceMs: nowMs };
+    value.minimumTenureMs = hour;
+    assert.equal(chooseRoute(value).chosen, remainingA > 40 ? a : null);
+    value.baseOrder = [b, a];
+    assert.equal(chooseRoute(value).chosen, remainingB > 5 ? b : remainingA > 40 ? a : null);
   }
 });
 

@@ -24,6 +24,7 @@ Each record states one decision, the context that forced it, why I chose it and 
 | [0018](0018-apache-2-license.md) | License CrewKite under Apache 2.0 | Accepted |
 | [0019](0019-transport-seam-for-team-and-remote.md) | Defer team, remote and hosted features behind a transport seam | Accepted |
 | [0020](0020-profiles-resolve-to-finite-gates.md) | Resolve profiles to finite effect gates and bounded reviews | Proposed |
+| [0021](0021-explicit-route-order-and-review-floors.md) | Resolve explicit route order and minimum review methods | Proposed |
 
 ## Writing a new record
 

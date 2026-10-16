@@ -23,6 +23,7 @@ import {
   type Attempt,
   AttemptSchema,
   type Candidate,
+  CandidateSchema,
   type CheckResult,
   CheckResultSchema,
   type Command,
@@ -33,6 +34,7 @@ import {
   type Event,
   EventSchema,
   type FakeWorkerEvent,
+  formatReviewTarget,
   type Grant,
   MAX_FRAME_BYTES,
   type Observation,
@@ -48,6 +50,7 @@ import {
   RouteSchema,
   type Run,
   RunSchema,
+  requiredReviewMethodIds,
   type SealedHandoffPacket,
   SealedHandoffPacketSchema,
   type Snapshot,
@@ -71,6 +74,7 @@ import {
 import {
   committedFiles,
   inspectSource,
+  inspectSourceDetails,
   materialize,
   projectRoot,
   readFiles,
@@ -401,7 +405,7 @@ export class Controller {
         if (!path) return { outcome: 'blocked', reason: 'project-not-found' };
         return {
           outcome: 'applied',
-          data: { kind: 'source', source: inspectSource(command.payload.projectId, path) },
+          data: { kind: 'source', ...inspectSourceDetails(command.payload.projectId, path) },
         };
       }
       case 'CreateTask': {
@@ -428,6 +432,8 @@ export class Controller {
             reason: 'task-not-amendable',
             next: 'Stop the current work before changing its criteria.',
           };
+        const gate = this.draftEditGate(task);
+        if (gate) return gate;
         const updated = TaskSchema.parse({
           ...task,
           title: command.payload.title,
@@ -436,6 +442,7 @@ export class Controller {
           id: task.id,
           revision: task.revision + 1,
           runId: null,
+          next: 'Prepare the run.',
         });
         this.store.put('task', updated.id, updated.revision, updated);
         this.event('task.updated', updated.id, updated.revision, updated);
@@ -643,10 +650,45 @@ export class Controller {
     };
   }
 
+  private draftEditGate(task: Task): CommandResult | undefined {
+    if (task.state !== 'draft') return;
+    const run = task.runId ? this.store.get<Run>('run', task.runId) : undefined;
+    const lease = this.store.db
+      .prepare('SELECT attempt_id FROM writer_leases WHERE task_id=?')
+      .get(task.id);
+    const effect = this.store.db
+      .prepare(
+        "SELECT approval_id FROM pending_effects WHERE task_id=? AND state IN ('pending','approved','unknown') LIMIT 1",
+      )
+      .get(task.id);
+    if (this.hasUncertainWriter(task.id) || lease || effect)
+      return {
+        outcome: 'blocked',
+        reason: 'draft-has-pending-work',
+        next: 'Resolve or stop the exact pending work before editing this task.',
+      };
+    if (task.runId && (!run || run.taskId !== task.id))
+      return { outcome: 'blocked', reason: 'run-not-current' };
+    if (
+      run &&
+      (run.revision !== 0 ||
+        this.store.list<Attempt>('attempt').some((attempt) => attempt.runId === run.id) ||
+        this.store.intents().some((intent) => intent.run_id === run.id) ||
+        this.store.receipt(`allocation:${run.id}`))
+    )
+      return {
+        outcome: 'blocked',
+        reason: 'prepared-run-started',
+        next: 'Inspect the retained run. Only a never-started draft can be edited here.',
+      };
+  }
+
   private prepare(command: Extract<Command, { command: 'PrepareRun' }>): CommandResult {
     const task = this.store.get<Task>('task', command.payload.taskId);
     if (!task || !['draft', 'stopped', 'interrupted', 'failed', 'ready'].includes(task.state))
       return { outcome: 'blocked', reason: 'task-not-preparable' };
+    const editGate = this.draftEditGate(task);
+    if (editGate) return editGate;
     if (this.hasUncertainWriter(task.id))
       return {
         outcome: 'blocked',
@@ -669,18 +711,36 @@ export class Controller {
           return { outcome: 'denied', reason: 'route-not-available' };
     }
     const resolved = PolicySchema.parse(command.payload.policy);
-    const required: NonNullable<Policy['methods']>[number]['id'][] =
-      resolved.quality === 'quick'
-        ? []
-        : resolved.quality === 'standard'
-          ? ['second-opinion', 'keep-it-simple']
-          : ['second-opinion', 'keep-it-simple', 'challenge-assumptions'];
+    if (resolved.methods?.some((method) => method.id === 'round-robin'))
+      return {
+        outcome: 'blocked',
+        reason: 'review-panel-unavailable',
+        next: 'Round-robin needs an explicit review panel. Choose another supported method for this run.',
+      };
+    if (
+      resolved.methods?.some(
+        (method) => method.id === 'second-opinion' && method.reviewerRole !== 'reviewer',
+      )
+    )
+      return {
+        outcome: 'blocked',
+        reason: 'review-role-ineligible',
+        next: 'Assign Second opinion to the Reviewer role. Advisor findings do not fulfill independent review.',
+      };
+    const required = requiredReviewMethodIds(resolved.quality);
     const defaultRole = roles.some((role) => role.role === 'reviewer') ? 'reviewer' : 'advisor';
     const methods = [...(resolved.methods ?? [])];
     for (const id of required)
       if (!methods.some((method) => method.id === id))
-        methods.push({ id, cycles: 1, reviewerRole: defaultRole });
-    resolved.methods = methods;
+        methods.push({
+          id,
+          cycles: 1,
+          reviewerRole: id === 'second-opinion' ? 'reviewer' : defaultRole,
+        });
+    const methodOrder = requiredReviewMethodIds('thorough');
+    resolved.methods = methods.sort(
+      (a, b) => methodOrder.indexOf(a.id) - methodOrder.indexOf(b.id),
+    );
     for (const method of resolved.methods ?? [])
       if (!roles.some((role) => role.role === method.reviewerRole))
         return {
@@ -2155,6 +2215,39 @@ export class Controller {
       });
   }
 
+  private attestedReviewWriter(run: Run, candidate: Candidate, writer: Attempt): boolean {
+    const current = this.store
+      .intents()
+      .filter(
+        (intent) =>
+          intent.run_id === run.id && intent.scratch_path === join(this.home, 'scratch', run.id),
+      )
+      .at(-1);
+    const stored = this.store.get<Attempt>('attempt', writer.id);
+    const receipt = this.store.receipt(`candidate:${writer.id}`);
+    const sealed = CandidateSchema.safeParse(receipt?.result.entity);
+    return (
+      !!current &&
+      current.attempt_id === writer.id &&
+      current.task_id === run.taskId &&
+      current.route_id === writer.routeId &&
+      current.generation === writer.generation &&
+      current.state === 'stopped' &&
+      stored?.state === 'stopped' &&
+      stored.runId === run.id &&
+      stored.routeId === writer.routeId &&
+      stored.generation === writer.generation &&
+      writer.runId === run.id &&
+      candidate.taskId === run.taskId &&
+      receipt?.hash === candidate.hash &&
+      receipt.result.outcome === 'applied' &&
+      sealed.success &&
+      sealed.data.taskId === run.taskId &&
+      sealed.data.id === candidate.id &&
+      sealed.data.hash === candidate.hash
+    );
+  }
+
   private reviewIdentity(run: Run, job: ReviewJob) {
     const digest = createHash('sha256')
       .update(readFileSync(fakeReviewWorkerPath))
@@ -2167,6 +2260,9 @@ export class Controller {
         cycle: job.cycle,
         routeId: job.routeId,
         policyHash: run.policy.hash,
+        ...(job.writerAttemptId
+          ? { writerAttemptId: job.writerAttemptId, writerRouteId: job.writerRouteId }
+          : {}),
       }),
     };
   }
@@ -2177,6 +2273,7 @@ export class Controller {
     method: NonNullable<Policy['methods']>[number],
     cycle: number,
     candidate: Candidate,
+    expectedWriter?: Attempt,
   ): boolean {
     const job = check.review?.job;
     const role = run.roles.find((value) => value.role === method.reviewerRole);
@@ -2194,6 +2291,16 @@ export class Controller {
       ![role.routeId, ...role.approvedFallbacks].includes(job.routeId)
     )
       return false;
+    if (job.writerAttemptId) {
+      const writer = this.store.get<Attempt>('attempt', job.writerAttemptId);
+      if (
+        !writer ||
+        writer.routeId !== job.writerRouteId ||
+        (expectedWriter && expectedWriter.id !== writer.id) ||
+        !this.attestedReviewWriter(run, candidate, writer)
+      )
+        return false;
+    }
     const identity = this.reviewIdentity(run, job);
     if (check.evaluator !== identity.evaluator || check.definitionHash !== identity.definitionHash)
       return false;
@@ -2239,6 +2346,8 @@ export class Controller {
     }
     if (this.hasUncertainWriter(task.id) || this.latestCandidate(run.id)?.hash !== candidate.hash)
       throw new Error('Review candidate binding changed.');
+    if (!this.attestedReviewWriter(run, candidate, writer))
+      throw new Error('Review writer provenance is not attested.');
     const completed = this.store.db
       .prepare(
         "SELECT body FROM evidence WHERE candidate_id=? AND candidate_hash=? AND kind='review'",
@@ -2248,7 +2357,11 @@ export class Controller {
     let pending: { method: NonNullable<Policy['methods']>[number]; cycle: number } | undefined;
     methods: for (const method of run.policy.policy.methods ?? [])
       for (let cycle = 1; cycle <= method.cycles; cycle++)
-        if (!completed.some((check) => this.reviewMatches(check, run, method, cycle, candidate))) {
+        if (
+          !completed.some((check) =>
+            this.reviewMatches(check, run, method, cycle, candidate, writer),
+          )
+        ) {
           pending = { method, cycle };
           break methods;
         }
@@ -2257,9 +2370,12 @@ export class Controller {
         this.updateTask(this.store.get<Task>('task', task.id) as Task, {
           state: 'ready',
           waitingReason: null,
-          next:
-            (run.policy.policy.methods?.length ?? 0) > 0
-              ? 'Declared checks and selected scripted reviews passed. Review the exact changes before acceptance.'
+          next: run.policy.policy.methods?.some((method) =>
+            ['second-opinion', 'round-robin'].includes(method.id),
+          )
+            ? 'Declared checks and selected scripted reviews passed. Review the exact changes before acceptance.'
+            : (run.policy.policy.methods?.length ?? 0) > 0
+              ? 'Declared checks and selected scripted methods passed. No independent review was selected.'
               : 'Declared checks passed. No independent review was selected.',
         });
       if (effects) ready();
@@ -2292,6 +2408,8 @@ export class Controller {
         attemptId: attempt.id,
         generation: attempt.generation,
         routeId: decision.chosen,
+        writerAttemptId: writer.id,
+        writerRouteId: writer.routeId,
         candidateId: candidate.id,
         candidateHash: candidate.hash,
         methodId: pending.method.id,
@@ -2303,10 +2421,12 @@ export class Controller {
       job.routeId !== decision.chosen ||
       job.methodId !== pending.method.id ||
       job.cycle !== pending.cycle ||
-      job.candidateHash !== candidate.hash
+      job.candidateHash !== candidate.hash ||
+      (job.writerAttemptId !== undefined &&
+        (job.writerAttemptId !== writer.id || job.writerRouteId !== writer.routeId))
     )
       throw new Error('Approved review binding changed.');
-    const target = `${job.methodId}/cycle-${job.cycle}`;
+    const target = formatReviewTarget({ methodId: job.methodId, cycle: job.cycle });
     const grant = this.grant(run, 'run-review', target);
     if (!grant && !approved) {
       const ask = () => {

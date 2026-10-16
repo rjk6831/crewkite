@@ -42,6 +42,8 @@ if (Buffer.byteLength(join(stage, 'state/home/control.sock')) > 100)
   throw new Error('Choose a shorter build name for the packaged controller socket.');
 if (existsSync(stage) || existsSync(build))
   throw new Error('Build or package directory already exists. Choose an unused --id.');
+if (git('status', '--porcelain', '--untracked-files=no'))
+  throw new Error('Commit the tracked source changes before packaging.');
 const revision = git('rev-parse', 'HEAD');
 const bootstrapFiles = ['scripts/demo-controller.ts', 'scripts/demo-state.ts'];
 for (const path of bootstrapFiles) {
@@ -66,10 +68,10 @@ for (const path of bootstrapFiles)
   if (!lstatSync(join(checkout, path)).isFile())
     throw new Error(`The committed desktop bootstrap must be a regular file: ${path}.`);
 const lockHash = hash(join(checkout, 'pnpm-lock.yaml'));
-if (hash(join(primary, 'pnpm-lock.yaml')) !== lockHash)
+if (hash(join(source, 'pnpm-lock.yaml')) !== lockHash)
   throw new Error('The installed dependency source uses a different lockfile.');
 // The existing installation has already passed repository checks. No lifecycle code runs here.
-cpSync(join(primary, 'node_modules'), join(checkout, 'node_modules'), {
+cpSync(join(source, 'node_modules'), join(checkout, 'node_modules'), {
   recursive: true,
   verbatimSymlinks: true,
   filter: (path) => !['.pnpm-store', '.pnpm-cache', '.pnpm-state'].includes(basename(path)),
@@ -84,8 +86,10 @@ const workspaces = [
 ];
 const buildDependencies = [];
 for (const path of ['.', ...workspaces]) {
-  if (path !== '.') copy(join(primary, path, 'node_modules'), join(checkout, path, 'node_modules'));
+  if (path !== '.') copy(join(source, path, 'node_modules'), join(checkout, path, 'node_modules'));
   const manifestPath = join(checkout, path, 'package.json');
+  if (hash(join(source, path, 'package.json')) !== hash(manifestPath))
+    throw new Error('The installed dependency source uses a different workspace manifest.');
   const manifest = json(manifestPath);
   for (const [name, version] of Object.entries({
     ...manifest.dependencies,
@@ -140,8 +144,8 @@ function copy(from, to) {
 function json(path) {
   return JSON.parse(readFileSync(path, 'utf8'));
 }
-const primaryDesktop = createRequire(join(primary, 'apps/desktop/package.json'));
-const electron = dirname(primaryDesktop.resolve('electron/package.json'));
+const sourceDesktop = createRequire(join(source, 'apps/desktop/package.json'));
+const electron = dirname(sourceDesktop.resolve('electron/package.json'));
 const electronVersion = json(join(electron, 'package.json')).version;
 if (electronVersion !== json(join(checkout, 'apps/desktop/package.json')).devDependencies.electron)
   throw new Error('The installed Electron version differs from the frozen desktop manifest.');

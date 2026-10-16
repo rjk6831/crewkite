@@ -11,13 +11,20 @@ import {
   DesktopNoticeSchema,
   FakeWorkerEventSchema,
   FakeWorkerInputSchema,
+  formatReviewTarget,
   GrantSchema,
   MinorAmountSchema,
   ObservationSchema,
   PolicySchema,
+  parseReviewTarget,
+  ReadDataSchema,
   RemainingBudgetsSchema,
   ReviewJobSchema,
+  RoleSchema,
+  RouteSchema,
   RuntimeManifestSchema,
+  requiredReviewMethodIds,
+  SourceDetailsSchema,
   SourceSchema,
   TransportMessageSchema,
 } from './index.ts';
@@ -34,6 +41,51 @@ const command = {
 
 test('process boundaries reject unknown fields and invalid command identity', () => {
   assert.ok(CommandSchema.safeParse(command).success);
+  for (const [quality, methods] of [
+    ['quick', ['keep-it-simple']],
+    ['standard', ['keep-it-simple', 'second-opinion']],
+    ['thorough', ['keep-it-simple', 'second-opinion', 'challenge-assumptions']],
+  ] as const)
+    assert.deepEqual(requiredReviewMethodIds(quality), methods);
+  const route = {
+    id: `rte_${suffix}`,
+    family: 'openai',
+    displayName: 'Fixture',
+    model: 'fixture',
+    effort: { requested: 'standard', effective: 'standard', supported: ['standard'] },
+    billing: 'included',
+    qualified: true,
+    fake: true,
+  };
+  assert.ok(RouteSchema.safeParse(route).success);
+  assert.ok(
+    RouteSchema.safeParse({
+      ...route,
+      speed: { requested: 'fast', effective: 'fast', supported: ['normal', 'fast'] },
+    }).success,
+  );
+  assert.ok(
+    RouteSchema.safeParse({
+      ...route,
+      qualified: false,
+      speed: { requested: 'fast', effective: null, supported: [] },
+    }).success,
+  );
+  for (const speed of [
+    { requested: 'fast', effective: 'normal', supported: ['normal', 'fast'] },
+    { requested: 'fast', effective: null, supported: ['fast'] },
+    { requested: 'fast', effective: 'fast', supported: ['normal'] },
+    { requested: 'normal', effective: 'normal', supported: ['normal', 'normal'] },
+    { requested: 'turbo', effective: 'turbo', supported: ['turbo'] },
+    { requested: 'normal', effective: 'normal', supported: ['normal'], extra: true },
+  ])
+    assert.equal(RouteSchema.safeParse({ ...route, speed }).success, false);
+
+  const role = { role: 'coder', routeId: `rte_${suffix}`, pinned: false, approvedFallbacks: [] };
+  assert.equal(RoleSchema.parse(role).selection, undefined);
+  for (const selection of ['ordered', 'reset-aware'])
+    assert.ok(RoleSchema.safeParse({ ...role, selection }).success);
+  assert.equal(RoleSchema.safeParse({ ...role, selection: 'random' }).success, false);
   const notices = [
     { kind: 'connection', state: 'offline', reconnectAvailable: true },
     { kind: 'history-gap', after: '0' },
@@ -136,6 +188,45 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     scripted: true,
   };
   assert.ok(ReviewJobSchema.safeParse(job).success);
+  const boundJob = { ...job, writerAttemptId: `att_${suffix}`, writerRouteId: job.routeId };
+  assert.ok(ReviewJobSchema.safeParse(boundJob).success);
+  assert.equal(
+    ReviewJobSchema.safeParse({ ...job, writerAttemptId: `att_${suffix}` }).success,
+    false,
+  );
+  assert.equal(ReviewJobSchema.safeParse({ ...job, writerRouteId: job.routeId }).success, false);
+  for (const methodId of [
+    'keep-it-simple',
+    'second-opinion',
+    'challenge-assumptions',
+    'round-robin',
+  ] as const)
+    for (const cycle of [1, 2, 3]) {
+      const target = { methodId, cycle };
+      assert.equal(formatReviewTarget(target), `${methodId}/cycle-${cycle}`);
+      assert.deepEqual(parseReviewTarget(formatReviewTarget(target)), target);
+    }
+  for (const value of [
+    'second-opinion/cycle-0',
+    'second-opinion/cycle-4',
+    'second-opinion/cycle-01',
+    'second-opinion/cycle-1 ',
+    ' second-opinion/cycle-1',
+    'unknown/cycle-1',
+    'second-opinion/cycle-1\n',
+    null,
+    {},
+  ])
+    assert.equal(parseReviewTarget(value), null);
+  for (const value of [
+    { methodId: 'unknown', cycle: 1 },
+    { methodId: 'second-opinion', cycle: 0 },
+    { methodId: 'second-opinion', cycle: 1.5 },
+    { methodId: 'second-opinion', cycle: 4 },
+    { methodId: 'second-opinion', cycle: 1, extra: true },
+  ])
+    assert.throws(() => formatReviewTarget(value as Parameters<typeof formatReviewTarget>[0]));
+
   for (const invalid of [
     { ...job, cycle: 4 },
     { ...job, scripted: false },
@@ -295,6 +386,97 @@ test('process boundaries reject unknown fields and invalid command identity', ()
   assert.ok(
     CommandResultSchema.safeParse({ outcome: 'applied', data: { kind: 'source', source } }).success,
   );
+
+  const sourceDetails = {
+    files: [
+      { path: 'src/main.ts', status: 'modified', staged: false, unstaged: true },
+      { path: 'scratch.txt', status: 'untracked', staged: false, unstaged: true },
+    ],
+    omittedDirty: 0,
+    omittedUntracked: 0,
+  };
+  const inspection = {
+    kind: 'source',
+    source: { ...source, dirtyCount: 1, untrackedCount: 1 },
+    details: sourceDetails,
+  };
+  assert.ok(ReadDataSchema.safeParse(inspection).success);
+  assert.ok(
+    ReadDataSchema.safeParse({
+      ...inspection,
+      details: { files: [], omittedDirty: 1, omittedUntracked: 1 },
+    }).success,
+  );
+  for (const path of [
+    '/etc/file',
+    'C:/file',
+    '../file',
+    './file',
+    'a//file',
+    '.git/config',
+    'a\\file',
+    'a\0file',
+  ])
+    assert.equal(
+      ReadDataSchema.safeParse({
+        ...inspection,
+        details: {
+          ...sourceDetails,
+          files: [{ ...sourceDetails.files[0], path }, sourceDetails.files[1]],
+        },
+      }).success,
+      false,
+    );
+  for (const invalid of [
+    { ...sourceDetails, omittedDirty: 1 },
+    { ...sourceDetails, omittedUntracked: -1 },
+    {
+      ...sourceDetails,
+      files: [{ ...sourceDetails.files[0], status: 'executed' }, sourceDetails.files[1]],
+    },
+    {
+      ...sourceDetails,
+      files: [
+        { ...sourceDetails.files[0], staged: false, unstaged: false },
+        sourceDetails.files[1],
+      ],
+    },
+    {
+      ...sourceDetails,
+      files: [sourceDetails.files[0], { ...sourceDetails.files[1], staged: true }],
+    },
+    {
+      ...sourceDetails,
+      files: [sourceDetails.files[0], { ...sourceDetails.files[1], path: 'src/main.ts' }],
+    },
+    {
+      ...sourceDetails,
+      files: [{ ...sourceDetails.files[0], content: 'private' }, sourceDetails.files[1]],
+    },
+  ])
+    assert.equal(ReadDataSchema.safeParse({ ...inspection, details: invalid }).success, false);
+
+  assert.ok(
+    SourceDetailsSchema.safeParse({
+      ...sourceDetails,
+      files: Array.from({ length: 200 }, (_, index) => ({
+        ...sourceDetails.files[0],
+        path: `file-${index}`,
+      })),
+    }).success,
+  );
+  for (const files of [
+    Array.from({ length: 201 }, (_, index) => ({
+      ...sourceDetails.files[0],
+      path: `file-${index}`,
+    })),
+    Array.from({ length: 100 }, (_, index) => ({
+      ...sourceDetails.files[0],
+      path: `${index}${'a'.repeat(4000)}`,
+    })),
+    [{ ...sourceDetails.files[0], path: 'a'.repeat(4097) }],
+  ])
+    assert.equal(SourceDetailsSchema.safeParse({ ...sourceDetails, files }).success, false);
 
   for (const invalid of [
     { ...command, protocol: 2 },

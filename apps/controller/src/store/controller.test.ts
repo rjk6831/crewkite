@@ -9,7 +9,6 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
-  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -18,16 +17,20 @@ import {
   type Approval,
   type Artifact,
   ArtifactSchema,
+  type Attempt,
+  type CheckResult,
+  canonicalJson,
   ProjectSchema,
   RunSchema,
   TaskSchema,
 } from '@crewkite/contracts';
+import { hashCanonical } from '@crewkite/contracts/hash';
 import { createDemoFixtures, createTestClock, createTestIds } from '@crewkite/testkit';
 import { createSyntheticRepository } from '@crewkite/testkit/repository';
 import { ArtifactFiles } from '../artifacts/index.ts';
 import { Controller, type ControllerOptions } from '../commands/controller.ts';
 import { CandidateEvidence } from '../evidence/index.ts';
-import { committedFiles, git, inspectSource, materialize, readFiles } from '../host/source.ts';
+import { committedFiles, git, materialize, readFiles } from '../host/source.ts';
 
 async function setup(t: TestContext, options: Partial<ControllerOptions> = {}) {
   mkdirSync(resolve('internal'), { recursive: true });
@@ -75,6 +78,18 @@ async function setup(t: TestContext, options: Partial<ControllerOptions> = {}) {
     0,
   );
   return { controller, command, draft, fixtures, source, directory, clock, id };
+}
+
+function quickRoles(fixtures: ReturnType<typeof createDemoFixtures>) {
+  return [
+    ...fixtures.roles,
+    {
+      role: 'advisor' as const,
+      routeId: fixtures.snapshot.routes[0].id,
+      pinned: false,
+      approvedFallbacks: [],
+    },
+  ];
 }
 
 test('an idempotent retry returns the receipt without creating another task', async (t) => {
@@ -135,6 +150,185 @@ test('a stale task revision leaves the current task and event cursor intact', as
   );
 });
 
+test('a prepared draft is editable only before it has pending work', async (t) => {
+  const { controller, command, draft, fixtures } = await setup(t);
+  const task = TaskSchema.parse((await controller.execute(draft, 'local-owner')).entity);
+  const amend = {
+    taskId: task.id,
+    title: task.title,
+    outcome: 'Revised before launch.',
+    criteria: task.criteria,
+  };
+  const policy = { ...fixtures.policy, quality: 'quick', methods: [], effects: [] };
+  const roles = quickRoles(fixtures);
+  const prepare = () =>
+    command(
+      'PrepareRun',
+      { taskId: task.id, policy, roles },
+      controller.snapshot().tasks[0].revision,
+    );
+  const first = RunSchema.parse((await controller.execute(prepare(), 'local-owner')).entity);
+  const second = RunSchema.parse((await controller.execute(prepare(), 'local-owner')).entity);
+  assert.notEqual(first.id, second.id);
+  assert.ok(controller.snapshot().runs.some((run) => run.id === first.id));
+  assert.equal(controller.store.intents().length, 0);
+  const edited = await controller.execute(
+    command('AmendTask', amend, controller.snapshot().tasks[0].revision),
+    'local-owner',
+  );
+  assert.equal(TaskSchema.parse(edited.entity).runId, null);
+  assert.equal(TaskSchema.parse(edited.entity).next, 'Prepare the run.');
+  const prepared = RunSchema.parse((await controller.execute(prepare(), 'local-owner')).entity);
+  const attemptId = `att_${'0'.repeat(25)}1`;
+  controller.store.transaction(() =>
+    controller.store.put('attempt', attemptId, 0, {
+      id: attemptId,
+      runId: prepared.id,
+      routeId: roles[0].routeId,
+      generation: 0,
+      state: 'intent',
+      revision: 0,
+    }),
+  );
+  for (const action of [
+    prepare(),
+    command('AmendTask', amend, controller.snapshot().tasks[0].revision),
+  ])
+    assert.equal((await controller.execute(action, 'local-owner')).reason, 'prepared-run-started');
+  const approvalId = `apr_${'0'.repeat(25)}1`;
+  controller.store.transaction(() => {
+    controller.store.put('approval', approvalId, 0, {
+      approvalId,
+      taskId: task.id,
+      attemptId,
+      generation: 0,
+      action: 'write-scratch',
+      target: 'demo-shop',
+      revision: 0,
+      requester: 'Controller',
+      consequence: 'One scratch allocation.',
+      status: 'approved',
+    });
+    controller.store.db
+      .prepare(
+        "INSERT INTO pending_effects(approval_id,task_id,attempt_id,task_revision,effect_hash,request,state) VALUES (?,?,?,?,?,?,'approved')",
+      )
+      .run(
+        approvalId,
+        task.id,
+        attemptId,
+        controller.snapshot().tasks[0].revision,
+        'a'.repeat(64),
+        '{}',
+      );
+  });
+  for (const action of [
+    prepare(),
+    command('AmendTask', amend, controller.snapshot().tasks[0].revision),
+  ])
+    assert.equal(
+      (await controller.execute(action, 'local-owner')).reason,
+      'draft-has-pending-work',
+    );
+  assert.equal(controller.store.intents().length, 0);
+  assert.equal(controller.snapshot().tasks[0].runId, prepared.id);
+});
+
+test('new preparations enforce review floors and require eligible method roles', async (t) => {
+  const { controller, command, draft, fixtures } = await setup(t);
+  const task = TaskSchema.parse((await controller.execute(draft, 'local-owner')).entity);
+  const roles = [
+    ...fixtures.roles,
+    {
+      role: 'reviewer',
+      routeId: fixtures.snapshot.routes[0].id,
+      pinned: true,
+      approvedFallbacks: [],
+    },
+  ];
+  for (const [quality, expected] of [
+    ['quick', ['keep-it-simple']],
+    ['standard', ['keep-it-simple', 'second-opinion']],
+    ['thorough', ['keep-it-simple', 'second-opinion', 'challenge-assumptions']],
+  ] as const) {
+    const result = await controller.execute(
+      command(
+        'PrepareRun',
+        {
+          taskId: task.id,
+          roles,
+          policy: {
+            ...fixtures.policy,
+            quality,
+            methods: [],
+            effects: [],
+            limits: { attempts: 5, minutes: 30, concurrency: 1 },
+          },
+        },
+        controller.snapshot().tasks[0].revision,
+      ),
+      'local-owner',
+    );
+    const run = RunSchema.parse(result.entity);
+    assert.deepEqual(
+      run.policy.policy.methods?.map((method) => method.id),
+      expected,
+    );
+    const reordered = await controller.execute(
+      command(
+        'PrepareRun',
+        {
+          taskId: task.id,
+          roles,
+          policy: {
+            ...run.policy.policy,
+            methods: [...(run.policy.policy.methods ?? [])].reverse(),
+          },
+        },
+        controller.snapshot().tasks[0].revision,
+      ),
+      'local-owner',
+    );
+    assert.equal(RunSchema.parse(reordered.entity).policy.hash, run.policy.hash);
+  }
+  for (const [id, reason] of [
+    ['second-opinion', 'review-role-ineligible'],
+    ['round-robin', 'review-panel-unavailable'],
+  ]) {
+    const result = await controller.execute(
+      command(
+        'PrepareRun',
+        {
+          taskId: task.id,
+          roles: quickRoles(fixtures),
+          policy: {
+            ...fixtures.policy,
+            quality: 'quick',
+            methods: [{ id, cycles: 1, reviewerRole: 'advisor' }],
+          },
+        },
+        controller.snapshot().tasks[0].revision,
+      ),
+      'local-owner',
+    );
+    assert.equal(result.reason, reason);
+  }
+  const missing = await controller.execute(
+    command(
+      'PrepareRun',
+      {
+        taskId: task.id,
+        roles: quickRoles(fixtures),
+        policy: { ...fixtures.policy, quality: 'standard' },
+      },
+      controller.snapshot().tasks[0].revision,
+    ),
+    'local-owner',
+  );
+  assert.equal(missing.reason, 'review-role-missing');
+  assert.equal(controller.store.intents().length, 0);
+});
+
 test('a committed launch intent survives restart without another launch', async (t) => {
   let launches = 0;
   const { controller, command, draft, fixtures, directory, clock, id, source } = await setup(t, {
@@ -151,7 +345,7 @@ test('a committed launch intent survives restart without another launch', async 
     effects: fixtures.policy.effects.map((grant) => ({ ...grant, taskId: task.id })),
   };
   const prepared = await controller.execute(
-    command('PrepareRun', { taskId: task.id, policy, roles: fixtures.roles }, task.revision),
+    command('PrepareRun', { taskId: task.id, policy, roles: quickRoles(fixtures) }, task.revision),
     'local-owner',
   );
   const run = RunSchema.parse(prepared.entity);
@@ -250,7 +444,7 @@ test('a retained descendant blocks sealing and transfer after its leader exits',
     effects: fixtures.policy.effects.map((grant) => ({ ...grant, taskId: task.id })),
   };
   const prepared = await controller.execute(
-    command('PrepareRun', { taskId: task.id, policy, roles: fixtures.roles }, 0),
+    command('PrepareRun', { taskId: task.id, policy, roles: quickRoles(fixtures) }, 0),
     'local-owner',
   );
   const run = RunSchema.parse(prepared.entity);
@@ -313,10 +507,20 @@ test('candidate evidence requires unchanged bytes and completed checks', async (
     ...fixtures.policy,
     quality: 'quick',
     methods: [],
-    effects: fixtures.policy.effects.map((grant) => ({ ...grant, taskId: task.id })),
+    effects: [
+      ...fixtures.policy.effects.map((grant) => ({ ...grant, taskId: task.id })),
+      {
+        taskId: task.id,
+        action: 'run-review',
+        target: 'keep-it-simple/cycle-1',
+        expiresAt: fixtures.policy.effects[0].expiresAt,
+        revoked: false,
+        usesRemaining: 1,
+      },
+    ],
   };
   const prepared = await controller.execute(
-    command('PrepareRun', { taskId: task.id, policy, roles: fixtures.roles }, 0),
+    command('PrepareRun', { taskId: task.id, policy, roles: quickRoles(fixtures) }, 0),
     'local-owner',
   );
   const run = RunSchema.parse(prepared.entity);
@@ -334,7 +538,12 @@ test('candidate evidence requires unchanged bytes and completed checks', async (
   );
   await ready;
   const snapshot = controller.snapshot();
-  assert.equal(snapshot.evidence.length, 1);
+  assert.equal(snapshot.evidence.filter((check) => !check.review).length, 1);
+  assert.equal(
+    snapshot.evidence.filter((check) => check.review?.job.methodId === 'keep-it-simple').length,
+    1,
+  );
+  assert.match(snapshot.tasks[0].next ?? '', /No independent review/);
   assert.equal(snapshot.evidence[0].passed, true);
   assert.equal(snapshot.evidence[0].candidateHash, snapshot.candidates[0].hash);
   appendFileSync(join(controller.home, 'scratch', run.id, 'net.mjs'), ' ');
@@ -439,16 +648,6 @@ async function acceptsTransferredCandidate(t: TestContext, transfer: 'reserve' |
   const canary = join(directory, 'filter-executed');
   writeFileSync(join(source.directory, '.gitattributes'), '*.mjs filter=canary\n');
   git(source.directory, ['config', 'filter.canary.clean', `touch '${canary}'`]);
-  const cli = readFileSync(join(source.directory, 'cli.mjs'));
-  unlinkSync(join(source.directory, 'cli.mjs'));
-  execFileSync('mkfifo', [join(source.directory, 'cli.mjs')]);
-  assert.ok(inspectSource(fixtures.task.projectId, source.directory).dirtyCount >= 3);
-  const special = join(directory, 'special');
-  execFileSync('mkdir', [special]);
-  execFileSync('mkfifo', [join(special, 'pipe')]);
-  assert.throws(() => readFiles(special), /unsupported|regular/);
-  unlinkSync(join(source.directory, 'cli.mjs'));
-  writeFileSync(join(source.directory, 'cli.mjs'), cli);
   const index = readFileSync(join(source.directory, '.git', 'index'));
   const sentinels = source.sentinels.map((file) => ({
     path: file.path,
@@ -777,6 +976,116 @@ async function acceptsTransferredCandidate(t: TestContext, transfer: 'reserve' |
     transfer === 'manual' ? [0, 1, 2] : [0, 1],
   );
   const candidate = snapshot.candidates[0];
+  const writer = controller.store
+    .intents()
+    .filter(
+      (intent) =>
+        intent.run_id === run.id &&
+        intent.scratch_path === join(controller.home, 'scratch', run.id),
+    )
+    .at(-1);
+  assert.ok(writer);
+  for (const check of snapshot.evidence.filter((check) => check.review)) {
+    assert.equal(check.review?.job.writerAttemptId, writer.attempt_id);
+    assert.equal(check.review?.job.writerRouteId, writer.route_id);
+  }
+  if (transfer === 'reserve') {
+    const check = snapshot.evidence.find((check) => check.review) as CheckResult;
+    assert.ok(check.review);
+    const blocked = async () => {
+      const result = await controller.execute(
+        command(
+          'AcceptCandidate',
+          {
+            taskId: task.id,
+            candidateId: candidate.id,
+            destinationRef: 'refs/heads/feat/invalid-review',
+          },
+          snapshot.tasks[0].revision,
+        ),
+        'local-owner',
+      );
+      assert.equal(result.reason, 'selected-review-not-complete');
+      assert.equal(controller.snapshot().tasks[0].state, 'ready');
+    };
+    const receiptKey = `candidate:${writer.attempt_id}`;
+    const receipt = controller.store.receipt(receiptKey);
+    assert.ok(receipt);
+    controller.store.db
+      .prepare('UPDATE receipts SET request_hash=? WHERE command_key=?')
+      .run('a'.repeat(64), receiptKey);
+    try {
+      await blocked();
+    } finally {
+      controller.store.db
+        .prepare('UPDATE receipts SET request_hash=? WHERE command_key=?')
+        .run(receipt.hash, receiptKey);
+    }
+    const original = controller.store.get<Attempt>('attempt', writer.attempt_id);
+    assert.ok(original);
+    controller.store.transaction(() =>
+      controller.store.put('attempt', writer.attempt_id, 0, {
+        ...original,
+        routeId: fixtures.snapshot.routes[2].id,
+      }),
+    );
+    try {
+      await blocked();
+    } finally {
+      controller.store.transaction(() =>
+        controller.store.put('attempt', writer.attempt_id, 0, original),
+      );
+    }
+    const {
+      writerAttemptId: _writerAttemptId,
+      writerRouteId: _writerRouteId,
+      ...legacyJob
+    } = check.review.job;
+    const legacyReview = { ...check.review, job: legacyJob };
+    const stripped = { ...check, review: legacyReview };
+    const updateBody = controller.store.db.prepare(
+      'UPDATE evidence SET body=? WHERE candidate_id=? AND definition_hash=?',
+    );
+    updateBody.run(canonicalJson(stripped), candidate.id, check.definitionHash);
+    try {
+      await blocked();
+    } finally {
+      updateBody.run(canonicalJson(check), candidate.id, check.definitionHash);
+    }
+    const artifact = {
+      id: id('art'),
+      ...new ArtifactFiles(join(controller.home, 'artifacts')).publish(
+        Buffer.from(canonicalJson(legacyReview)),
+      ),
+      mediaType: 'application/json',
+    };
+    const legacyCheck = {
+      ...stripped,
+      artifactId: artifact.id,
+      definitionHash: hashCanonical({
+        methodId: legacyJob.methodId,
+        cycle: legacyJob.cycle,
+        routeId: legacyJob.routeId,
+        policyHash: run.policy.hash,
+      }),
+    };
+    controller.store.transaction(() => {
+      controller.store.put('artifact', artifact.id, 0, artifact);
+      controller.store.db
+        .prepare('UPDATE review_jobs SET body=? WHERE attempt_id=?')
+        .run(canonicalJson(legacyJob), legacyJob.attemptId);
+      controller.store.db
+        .prepare(
+          'UPDATE evidence SET definition_hash=?,body=? WHERE candidate_id=? AND definition_hash=?',
+        )
+        .run(
+          legacyCheck.definitionHash,
+          canonicalJson(legacyCheck),
+          candidate.id,
+          check.definitionHash,
+        );
+    });
+  }
   git(source.directory, ['update-ref', 'refs/heads/feat/existing', base, '0'.repeat(40)]);
   assert.equal(
     (

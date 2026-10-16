@@ -5,6 +5,8 @@ import {
   closeSync,
   constants,
   fstatSync,
+  fsyncSync,
+  ftruncateSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -12,9 +14,16 @@ import {
   readFileSync,
   realpathSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs';
 import { devNull } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import {
+  type SourceDetails,
+  SourceDetailsSchema,
+  type SourceFileDetail,
+  SourceFileDetailSchema,
+} from '@crewkite/contracts';
 
 export type SourceFacts = {
   projectId: string;
@@ -88,6 +97,40 @@ export function projectRoot(path: string): string {
 }
 
 export function inspectSource(projectId: string, path: string): SourceFacts {
+  return scanSource(projectId, path).source;
+}
+
+export function inspectSourceDetails(projectId: string, path: string) {
+  const scanned = scanSource(projectId, path);
+  const details: SourceDetails = {
+    files: [],
+    omittedDirty: scanned.source.dirtyCount,
+    omittedUntracked: scanned.source.untrackedCount,
+  };
+  const seen = new Set<string>();
+  const append = (file: SourceFileDetail) => {
+    if (
+      details.files.length === 200 ||
+      seen.has(file.path) ||
+      !SourceFileDetailSchema.safeParse(file).success
+    )
+      return;
+    const next = {
+      files: [...details.files, file],
+      omittedDirty: details.omittedDirty - (file.status === 'untracked' ? 0 : 1),
+      omittedUntracked: details.omittedUntracked - (file.status === 'untracked' ? 1 : 0),
+    };
+    if (!SourceDetailsSchema.safeParse(next).success) return;
+    Object.assign(details, next);
+    seen.add(file.path);
+  };
+  for (const file of scanned.files) append(file);
+  for (const path of scanned.untracked)
+    append({ path, status: 'untracked', staged: false, unstaged: true });
+  return { source: scanned.source, details: SourceDetailsSchema.parse(details) };
+}
+
+function scanSource(projectId: string, path: string) {
   const base = git(path, ['rev-parse', '--verify', 'HEAD^{commit}']).toString().trim();
   let branch = 'detached';
   try {
@@ -108,6 +151,25 @@ export function inspectSource(projectId: string, path: string): SourceFacts {
       }),
   );
   const dirty = new Set<string>();
+  const files = new Map<string, SourceFileDetail>();
+  const changed = (
+    path: string,
+    status: SourceFileDetail['status'],
+    staged: boolean,
+    unstaged: boolean,
+  ) => {
+    dirty.add(path);
+    const previous = files.get(path);
+    files.set(path, {
+      path,
+      status:
+        previous?.status === 'unmerged' || (previous?.status === 'added' && status === 'modified')
+          ? previous.status
+          : status,
+      staged: staged || previous?.staged || false,
+      unstaged: unstaged || previous?.unstaged || false,
+    });
+  };
   const indexed = new Set<string>();
   const records = git(path, ['ls-files', '--stage', '-z']).toString().split('\0').filter(Boolean);
   for (const record of records) {
@@ -115,7 +177,19 @@ export function inspectSource(projectId: string, path: string): SourceFacts {
     if (!match) throw new Error('Source index metadata is invalid.');
     const [, mode, oid, stage, name] = match;
     indexed.add(name);
-    if (stage !== '0' || baseEntries.get(name) !== `${mode} ${oid}`) dirty.add(name);
+    if (stage !== '0' || baseEntries.get(name) !== `${mode} ${oid}`)
+      changed(
+        name,
+        stage !== '0'
+          ? 'unmerged'
+          : !baseEntries.has(name)
+            ? 'added'
+            : baseEntries.get(name)?.split(' ')[0] !== mode
+              ? 'type-changed'
+              : 'modified',
+        true,
+        stage !== '0',
+      );
     if (stage !== '0' || !['100644', '100755'].includes(mode)) {
       dirty.add(name);
       continue;
@@ -138,19 +212,19 @@ export function inspectSource(projectId: string, path: string): SourceFacts {
       }
     }
     if (!readable) {
-      dirty.add(name);
+      changed(name, 'type-changed', false, true);
       continue;
     }
     let fd: number;
     try {
       const selected = lstatSync(join(path, name));
       if (!selected.isFile() || selected.isSymbolicLink()) {
-        dirty.add(name);
+        changed(name, 'type-changed', false, true);
         continue;
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        dirty.add(name);
+        changed(name, 'deleted', false, true);
         continue;
       }
       throw error;
@@ -162,7 +236,7 @@ export function inspectSource(projectId: string, path: string): SourceFacts {
       );
     } catch (error) {
       if (['ENOENT', 'ELOOP', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) {
-        dirty.add(name);
+        changed(name, 'type-changed', false, true);
         continue;
       }
       throw error;
@@ -178,17 +252,23 @@ export function inspectSource(projectId: string, path: string): SourceFacts {
         .update(`blob ${bytes.length}\0`)
         .update(bytes)
         .digest('hex');
-      if (digest !== oid || (state.mode & 0o111 ? '100755' : '100644') !== mode) dirty.add(name);
+      if (digest !== oid || (state.mode & 0o111 ? '100755' : '100644') !== mode)
+        changed(name, 'modified', false, true);
     } finally {
       closeSync(fd);
     }
   }
-  for (const name of baseEntries.keys()) if (!indexed.has(name)) dirty.add(name);
+  for (const name of baseEntries.keys())
+    if (!indexed.has(name)) changed(name, 'deleted', true, false);
   const untracked = git(path, ['ls-files', '--others', '--exclude-standard', '-z'])
     .toString()
     .split('\0')
     .filter(Boolean);
-  return { projectId, base, branch, dirtyCount: dirty.size, untrackedCount: untracked.length };
+  return {
+    source: { projectId, base, branch, dirtyCount: dirty.size, untrackedCount: untracked.length },
+    files: [...files.values()].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)),
+    untracked: untracked.sort(),
+  };
 }
 
 export function safePath(path: string, seen: Set<string>, prefixes: Map<string, string>) {
@@ -298,6 +378,82 @@ export function readFiles(root: string): FileContent[] {
   }
   visit(root);
   return files;
+}
+
+export function applyReplacement(
+  root: string,
+  expected: readonly FileEntry[],
+  replacement: { path: string; baseHash: string; content: string },
+) {
+  safePath(replacement.path, new Set(), new Map());
+  if (typeof replacement.content !== 'string' || replacement.content.length > 65_536)
+    throw new Error('Replacement must be bounded UTF-8 text.');
+  const bytes = Buffer.from(replacement.content, 'utf8');
+  if (
+    bytes.length > 65_536 ||
+    bytes.toString('utf8') !== replacement.content ||
+    replacement.content.includes('\0')
+  )
+    throw new Error('Replacement must be bounded UTF-8 text.');
+  const seen = new Set<string>();
+  const prefixes = new Map<string, string>();
+  let total = 0;
+  if (expected.length > 10000) throw new Error('Replacement source exceeds the file limit.');
+  for (const file of expected) {
+    if (
+      !['100644', '100755'].includes(file.mode) ||
+      !/^[a-f0-9]{64}$/.test(file.hash) ||
+      !Number.isSafeInteger(file.bytes) ||
+      file.bytes < 0
+    )
+      throw new Error('Replacement source metadata is invalid.');
+    safePath(file.path, seen, prefixes);
+    total += file.bytes;
+    if (total > MAX_SOURCE_BYTES) throw new Error('Replacement source exceeds the byte limit.');
+  }
+  const manifest = (files: readonly FileEntry[]) =>
+    JSON.stringify(
+      files
+        .map(({ path, mode, hash, bytes }) => ({ path, mode, hash, bytes }))
+        .sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0)),
+    );
+  if (manifest(readFiles(root)) !== manifest(expected))
+    throw new Error('Replacement source manifest changed.');
+  const target = expected.find((file) => file.path === replacement.path);
+  if (!target || target.hash !== replacement.baseHash)
+    throw new Error('Replacement target identity changed.');
+  // Open without truncation so every precondition can fail without changing the file.
+  const fd = openSync(
+    join(root, target.path),
+    constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
+  try {
+    const state = fstatSync(fd);
+    if (
+      !state.isFile() ||
+      state.nlink !== 1 ||
+      state.mode & 0o6000 ||
+      state.size !== target.bytes ||
+      (state.mode & 0o111 ? '100755' : '100644') !== target.mode
+    )
+      throw new Error('Replacement target metadata changed.');
+    const original = readFileSync(fd);
+    if (
+      original.length !== target.bytes ||
+      createHash('sha256').update(original).digest('hex') !== target.hash
+    )
+      throw new Error('Replacement target bytes changed.');
+    let written = 0;
+    while (written < bytes.length) {
+      const count = writeSync(fd, bytes, written, bytes.length - written, written);
+      if (count === 0) throw new Error('Replacement write made no progress.');
+      written += count;
+    }
+    ftruncateSync(fd, bytes.length);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 export function materialize(root: string, files: readonly FileContent[]) {
