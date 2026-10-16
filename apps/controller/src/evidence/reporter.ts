@@ -1,9 +1,9 @@
 import { relative } from 'node:path';
 import type { TestEvent } from 'node:test/reporters';
-import { type CheckEvent, CheckEventSchema } from '@crewkite/contracts';
+import type { CheckEvent } from '@crewkite/contracts';
 
 function encode(event: CheckEvent): string {
-  return `${JSON.stringify(CheckEventSchema.parse(event))}\n`;
+  return `${JSON.stringify(event)}\n`;
 }
 
 export default async function* report(source: AsyncIterable<TestEvent>) {

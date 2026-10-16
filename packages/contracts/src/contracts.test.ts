@@ -200,6 +200,59 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     independence: 'process-only',
   };
   assert.ok(ReviewJobSchema.safeParse(nativeJob).success);
+  const evaluation = {
+    ...command,
+    command: 'PrepareCandidateEvaluation',
+    payload: {
+      taskId: job.taskId,
+      candidateId: job.candidateId,
+      checkRecipeId: 'node-tests-v1',
+      reviewer: { profileId: 'openai-file-v1', methodId: 'keep-it-simple', cycles: 1 },
+      consent: 'explicit',
+      grants: ['run-check', 'run-review'].map((action) => ({
+        taskId: job.taskId,
+        action,
+        target: action === 'run-check' ? 'node --test' : 'keep-it-simple/cycle-1',
+        expiresAt: '2026-10-16T00:00:00.000Z',
+        revoked: false,
+        usesRemaining: 1,
+      })),
+    },
+  };
+  assert.ok(CommandSchema.safeParse(evaluation).success);
+  const projectChecks = {
+    ...evaluation,
+    payload: {
+      ...evaluation.payload,
+      checkRecipeId: 'project-node-tests-v1',
+      testFiles: ['tests/日本語.test.mjs', 'test with spaces.cjs'],
+    },
+  };
+  assert.ok(CommandSchema.safeParse(projectChecks).success);
+  for (const testFiles of [
+    [],
+    ['a.test.mjs', 'a.test.mjs'],
+    ['../a.test.mjs'],
+    ['/a.test.mjs'],
+    ['--test-only'],
+    ['tests/*.mjs'],
+    ['tests/[ab].mjs'],
+    Array.from({ length: 33 }, (_, index) => `${index}.test.mjs`),
+  ])
+    assert.equal(
+      CommandSchema.safeParse({
+        ...projectChecks,
+        payload: { ...projectChecks.payload, testFiles },
+      }).success,
+      false,
+    );
+  assert.equal(
+    CommandSchema.safeParse({
+      ...evaluation,
+      payload: { ...evaluation.payload, testFiles: ['a.test.mjs'] },
+    }).success,
+    false,
+  );
   const localAcceptance = CandidateEvaluationPreviewSchema.shape.localAcceptance;
   assert.deepEqual(localAcceptance.parse(undefined), {
     available: false,

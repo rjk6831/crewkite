@@ -243,6 +243,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     candidateHash: candidate.hash,
     preparationId: artifact.id,
     recipe: 'node-tests-v1',
+    testFiles: [],
     definitionHash: 'f'.repeat(64),
     target: { path: 'net.mjs', baseHash: 'b'.repeat(64), candidateContentHash: 'c'.repeat(64) },
     reviewer: {
