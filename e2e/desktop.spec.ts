@@ -779,6 +779,22 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     await enter(page.getByRole('button', { name: 'Accept candidate', exact: true }));
     await page.getByRole('tab', { name: 'Activity', exact: true }).click();
     await expect(page.getByRole('region', { name: 'Pending approval' })).toContainText(acceptedRef);
+    const pendingAcceptance = (await observer.snapshot()).approvals.find(
+      (value) => value.taskId === nativeTask.id && value.status === 'pending',
+    );
+    assert(pendingAcceptance);
+    const pendingReceipt = cli(home, 'task', 'accept', nativeTask.id, acceptedRef);
+    assert.equal(pendingReceipt.result.outcome, 'already-applied');
+    assert.equal(pendingReceipt.result.entity.id, nativeTask.id);
+    assert.deepEqual(pendingReceipt.nextCommand, [
+      'crewkite',
+      'task',
+      'approve',
+      pendingAcceptance.approvalId,
+      '--home',
+      home,
+      '--json',
+    ]);
     await enter(page.getByRole('button', { name: 'Approve once', exact: true }));
     await nativeEvents.wait(
       (event) => event.type === 'candidate.accepted' && event.taskId === nativeTask.id,

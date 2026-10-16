@@ -19,7 +19,6 @@ import {
   readControllerEndpoint,
 } from '@crewkite/client/node';
 import {
-  ApprovalSchema,
   ArtifactSchema,
   type Command,
   type CommandResult,
@@ -28,6 +27,7 @@ import {
   MAX_FRAME_BYTES,
   type Snapshot,
   type Task,
+  TaskSchema,
 } from '@crewkite/contracts';
 
 const help = `Usage: crewkite task <list|show|watch|start|stop|resume|switch|approve|deny> [id] [--json] [--home path]
@@ -206,19 +206,54 @@ export async function runCli(
       const command = sent;
       let savedTo: string | undefined;
       try {
-        const acceptance = ApprovalSchema.safeParse(result.entity);
+        const pending = TaskSchema.safeParse(result.entity);
         if (
-          command?.command === 'AcceptCandidate' &&
+          command &&
+          (command.command === 'AcceptCandidate' || command.command === 'ExportPatch') &&
           succeeded(result) &&
-          acceptance.success &&
-          acceptance.data.status === 'pending' &&
-          acceptance.data.action === 'accept-candidate'
+          pending.success &&
+          pending.data.state === 'waiting' &&
+          pending.data.waitingReason === 'approval'
         ) {
+          const fresh = await connected.snapshot();
+          const task = fresh.tasks.find((value) => value.id === command.payload.taskId);
+          const candidate = fresh.candidates.filter((value) => value.taskId === task?.id).at(-1);
+          const action =
+            command.command === 'AcceptCandidate' ? 'accept-candidate' : 'export-patch';
+          const target =
+            command.command === 'AcceptCandidate'
+              ? command.payload.destinationRef
+              : command.payload.taskId;
+          const matches = fresh.approvals.filter((approval) => {
+            const attempt = fresh.attempts.find((value) => value.id === approval.attemptId);
+            return (
+              approval.status === 'pending' &&
+              approval.taskId === command.payload.taskId &&
+              approval.action === action &&
+              approval.target === target &&
+              attempt?.runId === task?.runId &&
+              attempt?.generation === approval.generation
+            );
+          });
+          if (
+            pending.data.id !== command.payload.taskId ||
+            !task?.runId ||
+            !fresh.runs.some((run) => run.id === task.runId && run.taskId === task.id) ||
+            canonicalJson(task) !== canonicalJson(pending.data) ||
+            candidate?.id !== command.payload.candidateId ||
+            matches.length !== 1
+          )
+            throw new Error(
+              'The pending action changed. Inspect the current task and approval before retrying.',
+            );
           receipt(result, command, undefined, [
             'crewkite',
             'task',
             'approve',
-            acceptance.data.approvalId,
+            matches[0].approvalId,
+            ...(command.command === 'ExportPatch' && values.output
+              ? ['--output', resolve(values.output)]
+              : []),
             '--home',
             home,
             ...(values.json ? ['--json'] : []),
@@ -226,25 +261,6 @@ export async function runCli(
           return 0;
         }
         if (values.output && succeeded(result)) {
-          const approval = ApprovalSchema.safeParse(result.entity);
-          if (
-            approval.success &&
-            approval.data.status === 'pending' &&
-            approval.data.action === 'export-patch'
-          ) {
-            receipt(result, command, undefined, [
-              'crewkite',
-              'task',
-              'approve',
-              approval.data.approvalId,
-              '--output',
-              resolve(values.output),
-              '--home',
-              home,
-              ...(values.json ? ['--json'] : []),
-            ]);
-            return 0;
-          }
           const artifact = ArtifactSchema.parse(result.entity);
           if (artifact.bytes > 64 * 1024 * 1024)
             throw new Error('The patch exceeds the save bound.');

@@ -298,11 +298,32 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     'accept-approval',
     'accept-uncertain',
     'accept-invalid-ref',
+    'approval-missing',
+    'accept-approval-mismatch',
+    'accept-approval-ambiguous',
   ]) {
     const evaluating =
       scenario.startsWith('evaluation-') ||
       scenario.startsWith('accept-') ||
       ['start-checks', 'start-review'].includes(scenario);
+    const needsApproval =
+      scenario === 'approval' ||
+      scenario === 'approval-missing' ||
+      scenario.startsWith('accept-approval');
+    const pendingTask: Snapshot['tasks'][number] = {
+      ...task,
+      runId: run.id,
+      state: 'waiting',
+      waitingReason: 'approval',
+      revision: task.revision + 1,
+      next: 'Review the exact pending action.',
+    };
+    let pendingCommand:
+      | Extract<
+          import('@crewkite/contracts').Command,
+          { command: 'AcceptCandidate' | 'ExportPatch' }
+        >
+      | undefined;
     const received: import('@crewkite/contracts').Command[] = [];
     const preview: Snapshot['candidateEvaluations'][number] =
       scenario === 'evaluation-reviewed'
@@ -360,6 +381,26 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       const command = message.command;
       received.push(command);
       let result: import('@crewkite/contracts').CommandResult = { outcome: 'applied' };
+      const pendingApproval: Snapshot['approvals'][number] =
+        pendingCommand?.command === 'AcceptCandidate'
+          ? {
+              ...approval,
+              action: 'accept-candidate',
+              target:
+                scenario === 'accept-approval-mismatch'
+                  ? 'refs/heads/feat/other'
+                  : pendingCommand.payload.destinationRef,
+            }
+          : approval;
+      const approvals =
+        !pendingCommand || scenario === 'approval-missing'
+          ? []
+          : scenario === 'accept-approval-ambiguous'
+            ? [
+                pendingApproval,
+                { ...pendingApproval, approvalId: 'apr_01ARZ3NDEKTSV4RRFFQ69G5FAW' },
+              ]
+            : [pendingApproval];
       if (command.command === 'GetSnapshot')
         result = {
           outcome: 'applied',
@@ -367,8 +408,9 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
             kind: 'snapshot',
             snapshot: {
               ...snapshot,
-              tasks:
-                scenario === 'native-show' || evaluating
+              tasks: pendingCommand
+                ? [pendingTask]
+                : scenario === 'native-show' || evaluating || needsApproval
                   ? [
                       {
                         ...task,
@@ -377,13 +419,25 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
                       },
                     ]
                   : snapshot.tasks,
-              runs: scenario === 'native-show' || evaluating ? [run] : [],
+              runs: scenario === 'native-show' || evaluating || needsApproval ? [run] : [],
+              attempts: needsApproval
+                ? [
+                    {
+                      id: approval.attemptId,
+                      runId: run.id,
+                      routeId: `rte_${suffix}`,
+                      generation: approval.generation,
+                      state: 'stopped',
+                      revision: 0,
+                    },
+                  ]
+                : snapshot.attempts,
               nativeRuns: scenario === 'native-show' || evaluating ? [nativeRun] : [],
-              candidates: evaluating ? [candidate] : [],
+              candidates: evaluating || needsApproval ? [candidate] : [],
               artifacts: evaluating ? [artifact] : [],
               candidateEvaluations: evaluating ? [preview] : [],
               evidence: reviewEvidence,
-              approvals: scenario === 'approval' ? [approval] : [],
+              approvals,
               nativeProfiles: [
                 {
                   ...profile,
@@ -401,13 +455,19 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         result =
           scenario === 'uncertain'
             ? { outcome: 'outcome-unknown', reason: 'connection-lost' }
-            : { outcome: 'applied', entity: scenario === 'approval' ? approval : artifact };
+            : { outcome: 'applied', entity: artifact };
       if (command.command === 'ResolveApproval') result = { outcome: 'applied', entity: artifact };
-      if (command.command === 'AcceptCandidate' && scenario === 'accept-approval')
+      if (
+        (command.command === 'AcceptCandidate' || command.command === 'ExportPatch') &&
+        needsApproval
+      ) {
         result = {
-          outcome: 'applied',
-          entity: { ...approval, action: 'accept-candidate', target: 'refs/heads/feat/checked' },
+          outcome: pendingCommand ? 'already-applied' : 'applied',
+          entity: pendingTask,
+          revision: pendingTask.revision,
         };
+        pendingCommand = command;
+      }
       if (command.command === 'AcceptCandidate' && scenario === 'accept-uncertain')
         result = { outcome: 'outcome-unknown', reason: 'publication-prepared' };
       if (command.command === 'GetArtifact') {
@@ -512,6 +572,28 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         scenario === 'accept-invalid-ref' ? 'main' : 'refs/heads/feat/checked',
       ];
     const result = await execute(args, scenario !== 'changes');
+    if (
+      ['approval-missing', 'accept-approval-mismatch', 'accept-approval-ambiguous'].includes(
+        scenario,
+      )
+    ) {
+      assert.equal(result.code, 1);
+      const receipt = JSON.parse(result.output);
+      assert.deepEqual(receipt.result.entity, pendingTask);
+      assert.equal(receipt.nextCommand, undefined);
+      const original = received.find(
+        (value) =>
+          value.command === (scenario === 'approval-missing' ? 'ExportPatch' : 'AcceptCandidate'),
+      );
+      assert.deepEqual(receipt.command, original);
+      assert.equal(received.filter((value) => value.command === 'GetSnapshot').length, 2);
+      assert.equal(
+        received.some((value) => ['ResolveApproval', 'GetArtifact'].includes(value.command)),
+        false,
+      );
+      assert.equal(existsSync(destination), false);
+      continue;
+    }
     if (scenario.startsWith('accept-')) {
       if (scenario === 'accept-invalid-ref') {
         assert.equal(result.code, 1);
@@ -532,9 +614,13 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       });
       assert.deepEqual(
         received.map((value) => value.command),
-        ['GetSnapshot', 'AcceptCandidate'],
+        scenario === 'accept-approval'
+          ? ['GetSnapshot', 'AcceptCandidate', 'GetSnapshot']
+          : ['GetSnapshot', 'AcceptCandidate'],
       );
       if (scenario === 'accept-approval') {
+        assert.deepEqual(receipt.result.entity, pendingTask);
+        assert.deepEqual(receipt.command, received[1]);
         assert.deepEqual(receipt.nextCommand, [
           'crewkite',
           'task',
@@ -548,6 +634,12 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         assert.equal(plain.code, 0);
         assert(plain.output.includes('Local branch approval required.'));
         assert(plain.output.includes(approval.approvalId));
+        const saved = join(fixture.home, 'pending-acceptance.receipt.json');
+        writeFileSync(saved, result.output);
+        const retry = await execute(['retry', saved]);
+        assert.equal(retry.code, 0, retry.errors);
+        assert.deepEqual(JSON.parse(retry.output).command, receipt.command);
+        assert.deepEqual(JSON.parse(retry.output).nextCommand, receipt.nextCommand);
       }
       if (scenario === 'accept-uncertain') {
         const receiptFile = join(fixture.home, 'accept-receipt.json');
@@ -701,6 +793,12 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     });
     if (scenario === 'approval') {
       assert.equal(result.code, 0, result.errors);
+      assert.deepEqual(receipt.result.entity, pendingTask);
+      assert.deepEqual(
+        receipt.command,
+        received.find((value) => value.command === 'ExportPatch'),
+      );
+      assert.equal(received.filter((value) => value.command === 'GetSnapshot').length, 2);
       assert.equal(existsSync(destination), false);
       assert.deepEqual(receipt.nextCommand, [
         'crewkite',
