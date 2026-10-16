@@ -502,7 +502,8 @@ export function NativeEvaluation({
         </article>
       ))}
       <p className="notice">
-        Acceptance remains unavailable. Inspect Changes and export the retained patch.
+        Inspect Changes and retained evidence before local branch acceptance. Export remains
+        available.
       </p>
     </section>
   );
@@ -780,8 +781,9 @@ function NativeLaunch({
         )}
         <p className="notice">
           One proposal is retained for inspection and patch export. A supported candidate can
-          prepare separate checks and review after the writer stops. Handoff and acceptance are
-          unavailable. The original checkout stays unchanged.
+          prepare separate checks and review after the writer stops, then request local branch
+          acceptance with its own permission. Handoff remains unavailable. The original checkout
+          stays unchanged.
         </p>
         {prepared && capability?.stage !== 'prepared' && (
           <p className="notice" role="status">

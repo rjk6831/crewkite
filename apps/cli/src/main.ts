@@ -36,6 +36,7 @@ const help = `Usage: crewkite task <list|show|watch|start|stop|resume|switch|app
        crewkite task prepare-native <task-id> <profile-id> <path> --policy file [--native-trust --source-consent] [--existing-credits]
        crewkite task prepare-evaluation <task-id> <profile-id> --grants file [--native-trust --source-consent] [--existing-credits]
        crewkite task <start-checks|start-review> <task-id> [--json] [--home path]
+       crewkite task accept <task-id> <destination-ref> [--json] [--home path]
        crewkite task changes <task-id> [--json] [--home path]
        crewkite task export <task-id> --output new-file [--json] [--home path]
        crewkite health [--json] [--home path]
@@ -89,7 +90,7 @@ export async function runCli(
       (extra.length &&
         !(
           area === 'task' &&
-          ((action === 'switch' && extra.length === 1) ||
+          ((['switch', 'accept'].includes(action) && extra.length === 1) ||
             (action === 'prepare-native' && extra.length === 2) ||
             (action === 'prepare-evaluation' && extra.length === 1))
         )) ||
@@ -104,6 +105,7 @@ export async function runCli(
       'stop',
       'resume',
       'switch',
+      'accept',
       'approve',
       'deny',
       'prepare-native',
@@ -117,7 +119,7 @@ export async function runCli(
       area === 'task' &&
       (!action ||
         !supported.includes(action) ||
-        (action === 'switch' && extra.length !== 1) ||
+        (['switch', 'accept'].includes(action) && extra.length !== 1) ||
         (action === 'prepare-native' && extra.length !== 2) ||
         (action === 'prepare-evaluation' && extra.length !== 1) ||
         (action === 'list' ? id !== undefined : id === undefined))
@@ -198,12 +200,31 @@ export async function runCli(
           ...(savedTo ? { savedTo } : {}),
           ...(nextCommand ? { nextCommand } : {}),
         },
-        `${nextCommand ? 'Export approval required.' : (result.reason ?? result.outcome)}\nCommand key ${command?.key}${savedTo ? `\nPatch saved to ${savedTo}` : ''}${nextCommand ? `\nNext: ${nextCommand.map((arg) => `'${arg.replaceAll("'", "'\\''")}'`).join(' ')}` : ''}`,
+        `${nextCommand ? (command?.command === 'AcceptCandidate' ? 'Local branch approval required.' : 'Export approval required.') : (result.reason ?? result.outcome)}\nCommand key ${command?.key}${savedTo ? `\nPatch saved to ${savedTo}` : ''}${nextCommand ? `\nNext: ${nextCommand.map((arg) => `'${arg.replaceAll("'", "'\\''")}'`).join(' ')}` : ''}`,
       );
     const finishAction = async (result: CommandResult) => {
       const command = sent;
       let savedTo: string | undefined;
       try {
+        const acceptance = ApprovalSchema.safeParse(result.entity);
+        if (
+          command?.command === 'AcceptCandidate' &&
+          succeeded(result) &&
+          acceptance.success &&
+          acceptance.data.status === 'pending' &&
+          acceptance.data.action === 'accept-candidate'
+        ) {
+          receipt(result, command, undefined, [
+            'crewkite',
+            'task',
+            'approve',
+            acceptance.data.approvalId,
+            '--home',
+            home,
+            ...(values.json ? ['--json'] : []),
+          ]);
+          return 0;
+        }
         if (values.output && succeeded(result)) {
           const approval = ApprovalSchema.safeParse(result.entity);
           if (
@@ -429,6 +450,17 @@ export async function runCli(
         ),
       );
     }
+    if (action === 'accept') {
+      const candidate = snapshot.candidates.filter((value) => value.taskId === task.id).at(-1);
+      if (!candidate) throw new Error('No retained candidate is available.');
+      return await finishAction(
+        await request(
+          'AcceptCandidate',
+          { taskId: task.id, candidateId: candidate.id, destinationRef: extra[0] },
+          task.revision,
+        ),
+      );
+    }
     if (action === 'changes' || action === 'export') {
       const changes = await request('GetChanges', { taskId: task.id });
       if (action === 'changes') {
@@ -483,7 +515,8 @@ export async function runCli(
             `Remaining total attempts ${evaluation.remainingBudgets.attempts}, minutes ${evaluation.remainingBudgets.minutes}`,
             `Checks ${evaluation.check?.passed ?? 'unrecorded'}, ${evaluation.checkStart.reason}, artifact ${evaluation.check?.artifactId ?? 'unrecorded'}`,
             `Review ${evaluation.review?.outcome ?? 'unrecorded'}, ${evaluation.reviewStart.reason}, artifact ${evaluation.review?.artifactId ?? 'unrecorded'}`,
-            'Supplemental allowance: one local check and one additional native review. Acceptance is unavailable.',
+            'Supplemental allowance: one local check and one additional native review.',
+            `Local acceptance ${evaluation.localAcceptance.available ? 'available' : 'unavailable'}, ${evaluation.localAcceptance.reason}. The destination needs its own grant or approval.`,
             ...evidence.flatMap((value) =>
               value.review
                 ? [

@@ -18,6 +18,7 @@ Task commands use IDs returned by the controller:
 | `task resume <task-id>` | Resume an interrupted run through controller admission |
 | `task approve <approval-id>` | Approve the exact pending binding from the snapshot |
 | `task deny <approval-id>` | Deny that binding |
+| `task accept <task-id> <destination-ref>` | Request the checked candidate as a new local branch |
 | `task changes <task-id>` | Read the retained candidate diff |
 | `task export <task-id> --output new.patch` | Request export and save verified patch bytes to a new file |
 | `task prepare-evaluation <task-id> <profile-id> --grants file` | Freeze separate check and reviewer authority for the current native candidate |
@@ -83,7 +84,7 @@ Preparation spends no inference. Start rechecks controller admission and launche
 
 Existing-credit spending defaults off. Add `--existing-credits` only when choosing that policy explicitly. Available included usage does not establish a provider-enforced hard billing cap. Native trust and billing limits are described in [provider routes](../../docs/providers.md).
 
-The native path retains a single-file candidate. Stop waits for owned cleanup. Resume cannot submit another native writer turn for retained work. Checks and review require separate preparation and explicit starts. Handoff and acceptance remain unavailable.
+The native path retains a single-file candidate. Stop waits for owned cleanup. Resume cannot submit another native writer turn for retained work. Checks and review require separate preparation and explicit starts. Handoff remains unavailable. Local acceptance requires matching completed checks and review, plus its own destination permission.
 
 ```sh
 pnpm crewkite task changes <task-id>
@@ -131,7 +132,24 @@ pnpm crewkite task start-review <task-id> --json
 
 Preparation starts no work. Omitting both consent flags requests exact saved evaluation consent. Reviewer credit spending defaults off independently of the writer. Add `--existing-credits` during evaluation preparation only when choosing that policy explicitly.
 
-Task show reports the controller's evaluation stage, exact file and hashes, saved reviewer and process-only independence, expiry, current start availability and remaining total attempts and minutes. The supplemental allowance permits one local check and one additional native review beneath those original run limits. Completed evidence remains visible after start permission expires. A failed or blocked check cannot authorize review. Review results do not enable acceptance; inspection and export remain available.
+Task show reports the controller's evaluation stage, exact file and hashes, saved reviewer and process-only independence, expiry, current start availability and remaining total attempts and minutes. The supplemental allowance permits one local check and one additional native review beneath those original run limits. Completed evidence remains visible after start permission expires. A failed or blocked check cannot authorize review. Task show also reports current local acceptance availability and its reason. Completed checks and review can make acceptance available. The destination still needs its own current grant or approval; inspection and export remain available.
+
+## Local branch acceptance
+
+Inspect Changes and the retained evidence before requesting a branch:
+
+```sh
+pnpm crewkite task show <task-id> --json
+pnpm crewkite task accept <task-id> refs/heads/feat/checked-result --json
+```
+
+The controller revalidates the candidate, original source and exact successful checks and review. It uses a current acceptance grant for that destination or returns a pending local approval with a `nextCommand`. Review the destination in the receipt, then approve once:
+
+```sh
+pnpm crewkite task approve <approval-id> --json
+```
+
+Acceptance creates one local branch without checking it out. It preserves the original checkout and index. Existing refs are never overwritten, and nothing is merged or pushed. Expired inference consent or an unavailable provider does not erase completed evidence. Source changes or incomplete ownership proof can still block publication. Keep an uncertain action receipt and retry its exact saved command after inspection.
 
 ## Uncertain actions
 

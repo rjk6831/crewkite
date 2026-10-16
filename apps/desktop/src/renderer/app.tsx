@@ -224,8 +224,9 @@ export function App() {
   }
   const stopAllowed =
     task?.runId &&
-    (nativeRun?.stage === 'prepared' ||
-      !['draft', 'ready', 'accepted', 'failed'].includes(task.state));
+    (nativeRun
+      ? nativeRun.stage === 'prepared' || ['running', 'checking', 'unknown'].includes(task.state)
+      : !['draft', 'ready', 'accepted', 'failed'].includes(task.state));
   return (
     <div className="app-shell">
       <aside className="navigation" aria-label="Workspace navigation">
@@ -1073,8 +1074,8 @@ function Plan({
               </div>
               <p className="muted">
                 Retained changes can be inspected and exported after the native process stops.
-                Prepare supported checks and a separate review in Checks and review. Handoff and
-                acceptance remain unavailable.
+                Prepare supported checks and a separate review in Checks and review, then request
+                local branch acceptance with its own permission. Handoff remains unavailable.
               </p>
               {native.stage === 'prepared' && (
                 <button type="button" className="button primary" onClick={onPrepare}>
@@ -1410,11 +1411,34 @@ function Checks({
   const candidate = snapshot.candidates.filter(({ taskId }) => taskId === task.id).at(-1);
   const evidence = snapshot.evidence.filter(({ candidateId }) => candidateId === candidate?.id);
   const [destination, setDestination] = useState('refs/heads/feat/net-minor');
-  const eligible = candidate && task.state === 'ready';
   const native = snapshot.nativeRuns.some((value) => value.runId === task.runId);
-  if (native)
-    return (
-      <div className="view-stack">
+  const evaluation = snapshot.candidateEvaluations.find(
+    (value) =>
+      value.taskId === task.id &&
+      value.runId === task.runId &&
+      value.candidateId === candidate?.id &&
+      value.candidateHash === candidate.hash,
+  );
+  const eligible = native
+    ? evaluation?.localAcceptance.available
+    : candidate && task.state === 'ready';
+  const acceptanceReason = evaluation?.localAcceptance.reason ?? 'evidence-incomplete';
+  const acceptanceReasons = {
+    available: 'Checks and native review passed. Request acceptance for the destination below.',
+    'evidence-incomplete':
+      'Matching checks, native review and ownership evidence are required before acceptance.',
+    'ownership-unknown': 'Execution ownership is unknown. Resolve it before acceptance.',
+    'candidate-changed': 'The candidate or task changed. Inspect the current retained work.',
+    'source-changed': 'The original project changed. Acceptance is unavailable for this source.',
+    'git-identity-missing': 'Configure a Git name and email before acceptance.',
+    'approval-pending': 'Review the pending approval in Activity.',
+    'publication-prepared': 'A local publication is prepared. Inspect its receipt before retrying.',
+    accepted: 'The candidate was accepted to a local branch.',
+  };
+
+  return (
+    <div className="view-stack">
+      {native ? (
         <NativeEvaluation
           key={`${task.id}:${task.runId}:${candidate?.id}:${candidate?.hash}`}
           task={task}
@@ -1422,157 +1446,119 @@ function Checks({
           snapshot={snapshot}
           workspace={workspace}
         />
-        <section className="card acceptance-card">
-          <div className="section-heading">
-            <h2>Native retained changes</h2>
-            <span>Inspection and export</span>
-          </div>
-          <p className="muted">
-            Inspect the exact patch in Changes before exporting. Acceptance remains unavailable
-            after check or review evidence.
-          </p>
-          <div className="button-row">
-            <button
-              type="button"
-              className="button secondary"
-              disabled={!candidate || workspace.pending}
-              onClick={() =>
-                candidate &&
-                void workspace
-                  .command({
-                    command: 'ExportPatch',
-                    expectedRevision: task.revision,
-                    payload: { taskId: task.id, candidateId: candidate.id },
-                  })
-                  .catch(() => {})
-              }
-            >
-              <Download size={14} />
-              Export patch
-            </button>
-            <button
-              type="button"
-              className="button primary"
-              disabled
-              title="Acceptance is unavailable for native proposals"
-            >
-              <Check size={14} />
-              Accept candidate
-            </button>
-          </div>
-        </section>
-      </div>
-    );
-
-  return (
-    <div className="view-stack">
-      <section className="card">
-        <div className="section-heading">
-          <h2>
-            <ListChecks size={15} />
-            Recorded evaluations
-          </h2>
-          <span>{candidate ? `Candidate ${short(candidate.hash)}` : 'No candidate sealed'}</span>
-        </div>
-        {evidence.length ? (
-          <div className="evidence-list">
-            {evidence.map((value) => (
-              <div key={`${value.evaluator}-${value.definitionHash}`}>
-                <span className={`result-symbol ${value.passed ? 'passed' : 'failed'}`}>
-                  {value.passed ? <Check size={14} /> : <X size={14} />}
-                </span>
-                <div className="evidence-copy">
-                  <strong>
-                    {value.review
-                      ? `Scripted ${methodName(value.review.job.methodId)} · round ${value.review.job.cycle}`
-                      : value.evaluator.startsWith('node:')
-                        ? 'Node checks'
-                        : 'Recorded check'}
-                  </strong>
-                  <details>
-                    <summary>Evidence identity</summary>
-                    <code>Evaluator {value.evaluator}</code>
-                    <code>Definition {value.definitionHash}</code>
-                    <code>Candidate {value.candidateHash}</code>
-                  </details>
-                </div>
-                <StateChip state={value.passed ? 'ready' : 'failed'} />
-              </div>
-            ))}
-          </div>
-        ) : (
-          <Empty icon={<ListChecks />} title="No check evidence recorded">
-            Checks bind to the exact candidate hash and appear after the controller records their
-            result.
-          </Empty>
-        )}
-      </section>
-      <section className="card">
-        <div className="section-heading">
-          <h2>Scripted review methods</h2>
-          <span>Bound to the candidate hash</span>
-        </div>
-        {evidence.filter((value) => value.review).length ? (
-          <div className="review-results">
-            {evidence
-              .flatMap((value) => (value.review ? [value.review] : []))
-              .map((result) => {
-                const route = snapshot.routes.find(({ id }) => id === result.job.routeId);
-                return (
-                  <article key={`${result.job.methodId}-${result.job.cycle}`}>
-                    <div className="section-heading">
-                      <h3>{methodName(result.job.methodId)}</h3>
-                      <span className="scripted-badge">SCRIPTED · {result.outcome}</span>
-                    </div>
-                    <p>{result.summary}</p>
-                    <p className="muted small">
-                      {result.job.writerRouteId === undefined
-                        ? 'Last writer route unknown for this saved review.'
-                        : result.job.writerRouteId === result.job.routeId
-                          ? 'Same route as the last writer. Separate review invocation.'
-                          : 'Different route from the last writer.'}{' '}
-                      Model diversity is not established.
-                    </p>
-                    <div className="review-identity">
-                      <span>Round {result.job.cycle}</span>
-                      <span>{route ? familyName(route.family) : 'Unavailable route'}</span>
-                      <code>{short(result.job.candidateHash)}</code>
-                    </div>
-                    {result.job.writerAttemptId && result.job.writerRouteId && (
-                      <details className="technical-details">
-                        <summary>Details</summary>
-                        <code>Last writer attempt {result.job.writerAttemptId}</code>
-                        <code>Last writer route {result.job.writerRouteId}</code>
+      ) : (
+        <>
+          <section className="card">
+            <div className="section-heading">
+              <h2>
+                <ListChecks size={15} />
+                Recorded evaluations
+              </h2>
+              <span>
+                {candidate ? `Candidate ${short(candidate.hash)}` : 'No candidate sealed'}
+              </span>
+            </div>
+            {evidence.length ? (
+              <div className="evidence-list">
+                {evidence.map((value) => (
+                  <div key={`${value.evaluator}-${value.definitionHash}`}>
+                    <span className={`result-symbol ${value.passed ? 'passed' : 'failed'}`}>
+                      {value.passed ? <Check size={14} /> : <X size={14} />}
+                    </span>
+                    <div className="evidence-copy">
+                      <strong>
+                        {value.review
+                          ? `Scripted ${methodName(value.review.job.methodId)} · round ${value.review.job.cycle}`
+                          : value.evaluator.startsWith('node:')
+                            ? 'Node checks'
+                            : 'Recorded check'}
+                      </strong>
+                      <details>
+                        <summary>Evidence identity</summary>
+                        <code>Evaluator {value.evaluator}</code>
+                        <code>Definition {value.definitionHash}</code>
+                        <code>Candidate {value.candidateHash}</code>
                       </details>
-                    )}
-                    <ul>
-                      {result.findings.map((finding) => (
-                        <li key={`${finding.severity}-${finding.message}`}>
-                          {finding.severity}: {finding.message}
-                        </li>
-                      ))}
-                    </ul>
-                  </article>
-                );
-              })}
-          </div>
-        ) : (
-          <p className="muted">
-            No scripted review evidence is recorded for this candidate. New runs require{' '}
-            {(['quick', 'standard', 'thorough'] as const)
-              .map(
-                (quality) =>
-                  `${titleCase(quality)}: ${requiredReviewMethodIds(quality).map(methodName).join(', ')}`,
-              )
-              .join('; ')}
-            . Existing runs keep their saved requirements.
-          </p>
-        )}
-        <p className="muted small">
-          D0 inspects fixed challenge patterns in separate read-only jobs. Its results prove bounded
-          job plumbing and carry no model judgment.
-        </p>
-      </section>
+                    </div>
+                    <StateChip state={value.passed ? 'ready' : 'failed'} />
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <Empty icon={<ListChecks />} title="No check evidence recorded">
+                Checks bind to the exact candidate hash and appear after the controller records
+                their result.
+              </Empty>
+            )}
+          </section>
+          <section className="card">
+            <div className="section-heading">
+              <h2>Scripted review methods</h2>
+              <span>Bound to the candidate hash</span>
+            </div>
+            {evidence.filter((value) => value.review).length ? (
+              <div className="review-results">
+                {evidence
+                  .flatMap((value) => (value.review ? [value.review] : []))
+                  .map((result) => {
+                    const route = snapshot.routes.find(({ id }) => id === result.job.routeId);
+                    return (
+                      <article key={`${result.job.methodId}-${result.job.cycle}`}>
+                        <div className="section-heading">
+                          <h3>{methodName(result.job.methodId)}</h3>
+                          <span className="scripted-badge">SCRIPTED · {result.outcome}</span>
+                        </div>
+                        <p>{result.summary}</p>
+                        <p className="muted small">
+                          {result.job.writerRouteId === undefined
+                            ? 'Last writer route unknown for this saved review.'
+                            : result.job.writerRouteId === result.job.routeId
+                              ? 'Same route as the last writer. Separate review invocation.'
+                              : 'Different route from the last writer.'}{' '}
+                          Model diversity is not established.
+                        </p>
+                        <div className="review-identity">
+                          <span>Round {result.job.cycle}</span>
+                          <span>{route ? familyName(route.family) : 'Unavailable route'}</span>
+                          <code>{short(result.job.candidateHash)}</code>
+                        </div>
+                        {result.job.writerAttemptId && result.job.writerRouteId && (
+                          <details className="technical-details">
+                            <summary>Details</summary>
+                            <code>Last writer attempt {result.job.writerAttemptId}</code>
+                            <code>Last writer route {result.job.writerRouteId}</code>
+                          </details>
+                        )}
+                        <ul>
+                          {result.findings.map((finding) => (
+                            <li key={`${finding.severity}-${finding.message}`}>
+                              {finding.severity}: {finding.message}
+                            </li>
+                          ))}
+                        </ul>
+                      </article>
+                    );
+                  })}
+              </div>
+            ) : (
+              <p className="muted">
+                No scripted review evidence is recorded for this candidate. New runs require{' '}
+                {(['quick', 'standard', 'thorough'] as const)
+                  .map(
+                    (quality) =>
+                      `${titleCase(quality)}: ${requiredReviewMethodIds(quality).map(methodName).join(', ')}`,
+                  )
+                  .join('; ')}
+                . Existing runs keep their saved requirements.
+              </p>
+            )}
+            <p className="muted small">
+              D0 inspects fixed challenge patterns in separate read-only jobs. Its results prove
+              bounded job plumbing and carry no model judgment.
+            </p>
+          </section>
+        </>
+      )}
       <section className="card acceptance-card">
         <div className="section-heading">
           <h2>
@@ -1582,21 +1568,24 @@ function Checks({
           <span>Local actions</span>
         </div>
         <p className="muted">
-          Acceptance creates a new local branch. Existing refs cannot be overwritten.
+          Acceptance creates a new local branch. Existing refs cannot be overwritten. The exact
+          destination needs its own permission or approval. Nothing is merged or pushed.
         </p>
-        <label>
-          Destination ref
-          <input
-            value={destination}
-            onChange={(event) => setDestination(event.target.value)}
-            spellCheck={false}
-          />
-        </label>
+        {!(native && acceptanceReason === 'accepted') && (
+          <label>
+            Destination ref
+            <input
+              value={destination}
+              onChange={(event) => setDestination(event.target.value)}
+              spellCheck={false}
+            />
+          </label>
+        )}
         <div className="button-row">
           <button
             type="button"
             className="button secondary"
-            disabled={!candidate || workspace.pending}
+            disabled={!candidate || workspace.pending || workspace.connection !== 'connected'}
             onClick={() =>
               candidate &&
               void workspace
@@ -1617,6 +1606,7 @@ function Checks({
             disabled={
               !eligible ||
               workspace.pending ||
+              workspace.connection !== 'connected' ||
               !/^refs\/heads\/[a-z0-9][a-z0-9/-]{0,199}$/.test(destination)
             }
             onClick={() =>
@@ -1638,8 +1628,16 @@ function Checks({
             Accept candidate
           </button>
         </div>
-        {!eligible && (
-          <p className="muted small">The controller must mark this task ready before acceptance.</p>
+        {native ? (
+          <p className="muted small" role="status">
+            {acceptanceReasons[acceptanceReason]}
+          </p>
+        ) : (
+          !eligible && (
+            <p className="muted small">
+              The controller must mark this task ready before acceptance.
+            </p>
+          )
         )}
       </section>
     </div>

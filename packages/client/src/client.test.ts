@@ -261,6 +261,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     review: null,
     checkStart: { available: true, reason: 'available' },
     reviewStart: { available: false, reason: 'checks-required' },
+    localAcceptance: { available: false, reason: 'evidence-incomplete' },
   };
   const grants = ['run-check', 'run-review'].map((action) => ({
     action,
@@ -293,9 +294,15 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     'evaluation-invalid-grants',
     'start-checks',
     'start-review',
+    'accept-native',
+    'accept-approval',
+    'accept-uncertain',
+    'accept-invalid-ref',
   ]) {
     const evaluating =
-      scenario.startsWith('evaluation-') || ['start-checks', 'start-review'].includes(scenario);
+      scenario.startsWith('evaluation-') ||
+      scenario.startsWith('accept-') ||
+      ['start-checks', 'start-review'].includes(scenario);
     const received: import('@crewkite/contracts').Command[] = [];
     const preview: Snapshot['candidateEvaluations'][number] =
       scenario === 'evaluation-reviewed'
@@ -306,6 +313,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
             review: { artifactId: artifact.id, outcome: 'passed' },
             checkStart: { available: false, reason: 'already-started' },
             reviewStart: { available: false, reason: 'already-started' },
+            localAcceptance: { available: true, reason: 'available' },
           }
         : evaluation;
     const reviewEvidence: Snapshot['evidence'] =
@@ -395,6 +403,13 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
             ? { outcome: 'outcome-unknown', reason: 'connection-lost' }
             : { outcome: 'applied', entity: scenario === 'approval' ? approval : artifact };
       if (command.command === 'ResolveApproval') result = { outcome: 'applied', entity: artifact };
+      if (command.command === 'AcceptCandidate' && scenario === 'accept-approval')
+        result = {
+          outcome: 'applied',
+          entity: { ...approval, action: 'accept-candidate', target: 'refs/heads/feat/checked' },
+        };
+      if (command.command === 'AcceptCandidate' && scenario === 'accept-uncertain')
+        result = { outcome: 'outcome-unknown', reason: 'publication-prepared' };
       if (command.command === 'GetArtifact') {
         const offset = command.payload.offset;
         const chunk = bytes.subarray(offset, offset + command.payload.limit);
@@ -473,7 +488,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       args = ['task', 'show', task.id];
     if (['start-checks', 'start-review'].includes(scenario)) args = ['task', scenario, task.id];
     if (
-      evaluating &&
+      scenario.startsWith('evaluation-') &&
       !['evaluation-show', 'evaluation-reviewed', 'start-checks', 'start-review'].includes(scenario)
     )
       args = [
@@ -489,7 +504,60 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
             ? ['--native-trust']
             : ['--native-trust', '--source-consent']),
       ];
+    if (scenario.startsWith('accept-'))
+      args = [
+        'task',
+        'accept',
+        task.id,
+        scenario === 'accept-invalid-ref' ? 'main' : 'refs/heads/feat/checked',
+      ];
     const result = await execute(args, scenario !== 'changes');
+    if (scenario.startsWith('accept-')) {
+      if (scenario === 'accept-invalid-ref') {
+        assert.equal(result.code, 1);
+        assert.equal(
+          received.some((value) => value.command === 'AcceptCandidate'),
+          false,
+        );
+        continue;
+      }
+      assert.equal(result.code, scenario === 'accept-uncertain' ? 2 : 0, result.errors);
+      const receipt = JSON.parse(result.output);
+      assert.equal(receipt.command.command, 'AcceptCandidate');
+      assert.equal(receipt.command.expectedRevision, task.revision);
+      assert.deepEqual(receipt.command.payload, {
+        taskId: task.id,
+        candidateId: candidate.id,
+        destinationRef: 'refs/heads/feat/checked',
+      });
+      assert.deepEqual(
+        received.map((value) => value.command),
+        ['GetSnapshot', 'AcceptCandidate'],
+      );
+      if (scenario === 'accept-approval') {
+        assert.deepEqual(receipt.nextCommand, [
+          'crewkite',
+          'task',
+          'approve',
+          approval.approvalId,
+          '--home',
+          fixture.home,
+          '--json',
+        ]);
+        const plain = await execute(args, false);
+        assert.equal(plain.code, 0);
+        assert(plain.output.includes('Local branch approval required.'));
+        assert(plain.output.includes(approval.approvalId));
+      }
+      if (scenario === 'accept-uncertain') {
+        const receiptFile = join(fixture.home, 'accept-receipt.json');
+        writeFileSync(receiptFile, result.output);
+        const retried = await execute(['retry', receiptFile]);
+        assert.equal(retried.code, 2);
+        assert.deepEqual(JSON.parse(retried.output).command, receipt.command);
+      }
+      continue;
+    }
     if (['evaluation-partial-consent', 'evaluation-invalid-grants'].includes(scenario)) {
       assert.equal(result.code, 1, result.errors);
       assert.equal(
@@ -512,7 +580,9 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         'process-only',
         'Remaining total attempts 2, minutes 3',
         scenario === 'evaluation-reviewed' ? 'already-started' : 'checks-required',
-        'Acceptance is unavailable',
+        scenario === 'evaluation-reviewed'
+          ? 'Local acceptance available, available'
+          : 'Local acceptance unavailable, evidence-incomplete',
       ])
         assert(plain.output.includes(value), value);
       if (scenario === 'evaluation-reviewed') {

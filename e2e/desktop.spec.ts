@@ -58,7 +58,7 @@ function launchController(home: string, nativeFixture = false) {
       .replace('const path = message.params.outputSchema.properties.path.const;','const path = message.params.outputSchema.properties.path?.const;')
       .replace(replacement,'const edit = message.params.outputSchema.properties.bindingHash ? {version:1,bindingHash:message.params.outputSchema.properties.bindingHash.const,methodId:message.params.outputSchema.properties.methodId.const,cycle:1,outcome:"passed",findings:[],summary:"The bounded review completed."} : '+replacement.slice('const edit = '.length));
     const profile={...unavailableNativeProfile(),facts:{...unavailableNativeProfile().facts,displayName:'OpenAI scripted proposal fixture',model:fixtureModel,clientVersion:process.version,available:true,reason:'available'},client:{executable:process.execPath,sha256:createHash('sha256').update(readFileSync(process.execPath)).digest('hex'),version:process.version},environment:{...process.env},locationHash:'1'.repeat(64)};
-    const runtime=await startController({home:process.env.CREWKITE_HOME,nativeProfile:()=>profile,nativeSpawn:(executable,args,options)=>spawn(executable,['-e',transcript,'success',args.at(-1)==='list'?'features':++phases%2===1?'prepare':'task'],options)});
+    const runtime=await startController({home:process.env.CREWKITE_HOME,identity:{name:'CrewKite fixture',email:'fixture@example.invalid'},nativeProfile:()=>profile,nativeSpawn:(executable,args,options)=>spawn(executable,['-e',transcript,'success',args.at(-1)==='list'?'features':++phases%2===1?'prepare':'task'],options)});
     console.log('CREWKITE_CONTROLLER_READY');
     process.once('SIGTERM',()=>void runtime.close().then(()=>process.exit(0)));
   `;
@@ -670,7 +670,9 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     await expect(
       page.getByRole('button', { name: 'Accept candidate', exact: true }),
     ).toBeDisabled();
-    await expect(page.getByText('Native retained changes', { exact: true })).toBeVisible();
+    await expect(
+      page.getByRole('heading', { name: 'Accept or export', exact: true }),
+    ).toBeVisible();
     await enter(page.getByRole('button', { name: 'Dismiss export notice', exact: true }));
     const nativeDestination = join(home, 'native.patch');
     await application.evaluate(({ dialog }, path) => {
@@ -759,9 +761,8 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     await expect(
       evaluationPanel.getByRole('button', { name: 'Start native review', exact: true }),
     ).toBeDisabled();
-    await expect(
-      page.getByRole('button', { name: 'Accept candidate', exact: true }),
-    ).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Accept candidate', exact: true })).toBeEnabled();
+    await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeDisabled();
     const evaluated = await observer.snapshot();
     const nativeReview = evaluated.evidence.find(
       (value) => value.review && !value.review.job.scripted,
@@ -772,7 +773,55 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
       path: join(internal, 'candidate-evaluation-dark.png'),
       animations: 'disabled',
     });
-    nativeSnapshot = evaluated;
+    const acceptedRef = 'refs/heads/feat/native-checked';
+    const priorBranch = git(source, ['rev-parse', 'refs/heads/feat/net-minor']);
+    await page.getByLabel('Destination ref', { exact: true }).fill(acceptedRef);
+    await enter(page.getByRole('button', { name: 'Accept candidate', exact: true }));
+    await page.getByRole('tab', { name: 'Activity', exact: true }).click();
+    await expect(page.getByRole('region', { name: 'Pending approval' })).toContainText(acceptedRef);
+    await enter(page.getByRole('button', { name: 'Approve once', exact: true }));
+    await nativeEvents.wait(
+      (event) => event.type === 'candidate.accepted' && event.taskId === nativeTask.id,
+    );
+    const accepted = await observer.snapshot();
+    const acceptedTask = accepted.tasks.find((value) => value.id === nativeTask.id);
+    assert.equal(acceptedTask?.state, 'accepted');
+    const acceptedRun = accepted.runs.find((value) => value.id === acceptedTask?.runId);
+    assert(acceptedRun);
+    const acceptedCommit = git(source, ['rev-parse', acceptedRef]).toString().trim();
+    assert.equal(
+      git(source, ['rev-parse', `${acceptedCommit}^`])
+        .toString()
+        .trim(),
+      acceptedRun.source.base,
+    );
+    assert.deepEqual(
+      git(source, ['show', `${acceptedRef}:net.mjs`]),
+      readFileSync(join(home, 'scratch', acceptedRun.id, 'net.mjs')),
+    );
+    assert.deepEqual(git(source, ['rev-parse', 'refs/heads/feat/net-minor']), priorBranch);
+    assert.deepEqual(sourceIdentity(source), original);
+    const acceptedAgain = cli(home, 'task', 'accept', nativeTask.id, acceptedRef);
+    assert.equal(acceptedAgain.result.outcome, 'applied');
+    assert.equal(git(source, ['rev-parse', acceptedRef]).toString().trim(), acceptedCommit);
+    assert.equal(
+      cli(home, 'task', 'show', nativeTask.id).evaluation.localAcceptance.reason,
+      'accepted',
+    );
+    await page.getByRole('tab', { name: 'Checks and review', exact: true }).click();
+    await expect(
+      page.getByRole('button', { name: 'Accept candidate', exact: true }),
+    ).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeDisabled();
+    await page
+      .getByRole('button', { name: 'Accept candidate', exact: true })
+      .scrollIntoViewIfNeeded();
+    await page.screenshot({
+      path: join(internal, 'native-acceptance-dark.png'),
+      animations: 'disabled',
+    });
+    nativeSnapshot = await observer.snapshot();
+    assert.equal(nativeSnapshot.attempts.length, evaluated.attempts.length);
     observer.close();
     observer = undefined;
     await stop(controller);
@@ -789,6 +838,13 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     assert.deepEqual(reopenedNative.candidateEvaluations, nativeSnapshot.candidateEvaluations);
     assert.equal(reopenedNative.attempts.length, nativeSnapshot.attempts.length);
     await expect(page.getByRole('button', { name: 'Resume', exact: true })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeDisabled();
+    assert.equal(
+      reopenedNative.tasks.find((value) => value.id === nativeTask.id)?.state,
+      'accepted',
+    );
+    assert.equal(git(source, ['rev-parse', acceptedRef]).toString().trim(), acceptedCommit);
+    assert.deepEqual(sourceIdentity(source), original);
 
     console.log(`Connected journey home: ${home}`);
   } finally {
