@@ -12,7 +12,7 @@ import {
   type RefusedEnvelope,
 } from './discovery.ts';
 
-type Launch = {
+export type NativeLaunch = {
   executable: string;
   sha256: string;
   directory: string;
@@ -32,7 +32,7 @@ type Outcome<T = DiscoveryMetadata> = {
   stdoutBytes: number;
   stderrBytes: number;
 };
-type Transcript<T> = {
+export type NativeTranscript<T> = {
   next: () => Uint8Array | null;
   push: (bytes: Uint8Array) => void;
   finish: () => T;
@@ -120,14 +120,14 @@ export function nativeDiscoveryEnvironment(source: NodeJS.ProcessEnv): NodeJS.Pr
 
 /** Metadata completion requires closed streams and absence of the owned process group. */
 function startTranscript<T>(
-  launch: Launch,
+  launch: NativeLaunch,
   options: {
     timeoutMs: number;
     now?: () => number;
     schedule?: Schedule;
     spawn?: Spawn;
     arguments: (directory: string) => string[];
-    reader: Transcript<T>;
+    reader: NativeTranscript<T>;
     closeInput?: boolean;
   },
 ): { group: number; result: Promise<Outcome<T>>; stop: () => void } {
@@ -298,7 +298,7 @@ function startTranscript<T>(
 const disabledFeatures = ['plugins', 'remote_plugin', 'apps', 'hooks', 'multi_agent'] as const;
 type DisabledFeatures = Record<(typeof disabledFeatures)[number], false>;
 
-class FeatureList implements Transcript<DisabledFeatures> {
+class FeatureList implements NativeTranscript<DisabledFeatures> {
   private bytes = Buffer.alloc(0);
   readonly complete = false;
   readonly pendingRequest = 'features-list' as const;
@@ -332,14 +332,15 @@ class FeatureList implements Transcript<DisabledFeatures> {
 }
 
 /** Each process has independent ownership evidence. Policy can change between observations. */
-export function startNativeDiscovery(
-  launch: Launch,
+export function startNativeSession<T>(
+  launch: NativeLaunch,
   options: {
     timeoutMs: number;
     now?: () => number;
     schedule?: Schedule;
     spawn?: Spawn;
   },
+  createReader: (remainingMs: number) => NativeTranscript<T>,
 ) {
   const now = options.now ?? (() => performance.now());
   const started = now();
@@ -364,18 +365,13 @@ export function startNativeDiscovery(
   });
   let current: { group: number; stop: () => void } = preflight;
   const groups = [preflight.group];
-  const result: Promise<Outcome> = preflight.result.then(async (outcome) => {
+  const result: Promise<Outcome<T>> = preflight.result.then(async (outcome) => {
     if (!outcome.quiescent || outcome.reason || stopped)
       return { ...outcome, metadata: null, reason: outcome.reason ?? 'stopped' };
     const remaining = Math.floor(options.timeoutMs - (now() - started));
     if (remaining < 1) return { ...outcome, metadata: null, reason: 'deadline' };
     try {
-      const reader = new OpenAiDiscovery({
-        now,
-        timeoutMs: remaining,
-        readConfiguration: true,
-        configurationDirectory: resolve(launch.directory),
-      });
+      const reader = createReader(remaining);
       const discovery = startTranscript(launch, {
         ...options,
         now,
@@ -403,4 +399,23 @@ export function startNativeDiscovery(
       current.stop();
     },
   };
+}
+
+/** Discovery keeps the fixed metadata transcript and caller bound. */
+export function startNativeDiscovery(
+  launch: NativeLaunch,
+  options: { timeoutMs: number; now?: () => number; schedule?: Schedule; spawn?: Spawn },
+) {
+  const now = options.now ?? (() => performance.now());
+  return startNativeSession(
+    launch,
+    options,
+    (remaining) =>
+      new OpenAiDiscovery({
+        now,
+        timeoutMs: remaining,
+        readConfiguration: true,
+        configurationDirectory: resolve(launch.directory),
+      }),
+  );
 }
