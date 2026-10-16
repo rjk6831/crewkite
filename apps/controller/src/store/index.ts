@@ -47,6 +47,7 @@ export type NativeProcess = {
     | 'effective-features'
     | 'metadata-preparation'
     | 'app-server-task'
+    | 'google-config'
     | 'auth-status'
     | 'native-task';
   state: 'intent' | 'owned' | 'quiescent';
@@ -72,7 +73,9 @@ export function nativePhaseSequence(
         ]
       : family === 'anthropic'
         ? [['auth-status', 'native-task']]
-        : [];
+        : family === 'google'
+          ? [['google-config', 'native-task']]
+          : [];
   return sequences.some(
     (sequence) =>
       phases.length <= sequence.length &&

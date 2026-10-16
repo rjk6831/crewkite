@@ -729,6 +729,56 @@ function ownedNativeCommand(
   return { group, result: complete.promise, stop: () => stop('cancelled') };
 }
 
+export function googleWriterPlan(input: {
+  attemptId: string;
+  file: { path: string; baseHash: string; content: string };
+  task: string;
+  model: string;
+  effort: GoogleWriterAdmission['effort'];
+}) {
+  let file: ReturnType<typeof fileSchema.parse>, task: string;
+  try {
+    file = fileSchema.parse(input.file);
+    AttemptIdSchema.parse(input.attemptId);
+    task = z
+      .string()
+      .min(1)
+      .max(16384)
+      .refine((value) => value.isWellFormed() && !value.includes('\0'))
+      .parse(input.task);
+    admission.shape.model.parse(input.model);
+    effort.parse(input.effort);
+    if (
+      Buffer.byteLength(file.content) > 65536 ||
+      createHash('sha256').update(file.content).digest('hex') !== file.baseHash
+    )
+      throw new Error();
+  } catch {
+    throw new GoogleWriterError('admission');
+  }
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      attemptId: { const: input.attemptId },
+      path: { const: file.path },
+      baseHash: { const: file.baseHash },
+      content: { type: 'string', maxLength: 65536 },
+    },
+    required: ['attemptId', 'path', 'baseHash', 'content'],
+  };
+  const prompt = `Return only the requested replacement object. Do not run tools or change files.\nTask: ${task}\nFile: ${JSON.stringify({ attemptId: input.attemptId, ...file })}`;
+  return {
+    prompt,
+    schema,
+    attemptId: input.attemptId,
+    file,
+    task,
+    model: input.model,
+    effort: input.effort,
+  };
+}
+
 export function startGoogleWriter(
   options: Omit<WriterOptions, 'onSpawn' | 'logFile'> & {
     onSpawn?: WriterOptions['onSpawn'];
@@ -741,16 +791,7 @@ export function startGoogleWriter(
   try {
     if (typeof options.onSubmitted !== 'function') throw new Error();
     allowed = admission.parse(options.admission);
-    fileSchema.parse(options.file);
-    AttemptIdSchema.parse(options.attemptId);
-    z.string()
-      .min(1)
-      .max(16384)
-      .refine((value) => !value.includes('\0'))
-      .parse(options.task);
     if (
-      Buffer.byteLength(options.file.content) > 65536 ||
-      createHash('sha256').update(options.file.content).digest('hex') !== options.file.baseHash ||
       allowed.clientExecutable !== options.client.executable ||
       allowed.clientVersion !== options.client.version ||
       allowed.clientSha256 !== options.client.sha256
@@ -759,20 +800,15 @@ export function startGoogleWriter(
   } catch {
     throw new GoogleWriterError('admission');
   }
+  const plan = googleWriterPlan({
+    attemptId: options.attemptId,
+    file: options.file,
+    task: options.task,
+    model: allowed.model,
+    effort: allowed.effort,
+  });
   const logFile = options.logFile ?? '/dev/null';
   const launch = nativeLaunch(options, logFile);
-  const schema = {
-    type: 'object',
-    additionalProperties: false,
-    properties: {
-      attemptId: { const: options.attemptId },
-      path: { const: options.file.path },
-      baseHash: { const: options.file.baseHash },
-      content: { type: 'string', maxLength: 65536 },
-    },
-    required: ['attemptId', 'path', 'baseHash', 'content'],
-  };
-  const prompt = `Return only the requested replacement object. Do not run tools or change files.\nTask: ${options.task}\nFile: ${JSON.stringify({ attemptId: options.attemptId, ...options.file })}`;
   const reader = new GoogleWriterOutput({
     attemptId: options.attemptId,
     permissionMode: allowed.permissions,
@@ -788,11 +824,11 @@ export function startGoogleWriter(
     'task',
     (workMs) => [
       '--print',
-      prompt,
+      plan.prompt,
       '--output-format',
       'stream-json',
       '--json-schema',
-      JSON.stringify(schema),
+      JSON.stringify(plan.schema),
       '--model',
       allowed.model,
       '--effort',
