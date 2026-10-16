@@ -96,18 +96,29 @@ async function closeDesktop(
   owned: DesktopProcess | undefined,
 ) {
   assert(owned, 'Desktop ownership was not captured.');
-  void application.evaluate(({ app }) => app.quit()).catch(() => {});
+  let request: 'pending' | 'fulfilled' | 'rejected' = 'pending';
+  // Normal application close also disconnects the main-process inspector.
+  const requested = application.close().then(
+    () => {
+      request = 'fulfilled';
+    },
+    (error: unknown) => {
+      request = 'rejected';
+      throw error;
+    },
+  );
+  const facts = () =>
+    `request=${request}, pid=${owned.child.pid}, exit=${owned.child.exitCode}, signal=${owned.child.signalCode}, close=${owned.closeObserved}, killed=${owned.child.killed}, stdoutEnded=${owned.child.stdout?.readableEnded}, stdoutDestroyed=${owned.child.stdout?.destroyed}, stderrEnded=${owned.child.stderr?.readableEnded}, stderrDestroyed=${owned.child.stderr?.destroyed}`;
   try {
-    await bounded(owned.closed, 10000, 'Desktop close');
+    await bounded(Promise.all([requested, owned.closed]), 10000, 'Desktop close');
     assert.equal(owned.child.exitCode, 0, 'Desktop exit code');
     assert.equal(owned.child.signalCode, null, 'Desktop exit signal');
   } catch (error) {
-    const before = `exit=${owned.child.exitCode}, signal=${owned.child.signalCode}, close=${owned.closeObserved}`;
+    const before = facts();
     await stop(owned.child);
-    throw new Error(
-      `Desktop graceful close failed (${before}; after cleanup exit=${owned.child.exitCode}, signal=${owned.child.signalCode}, close=${owned.closeObserved}).`,
-      { cause: error },
-    );
+    throw new Error(`Desktop graceful close failed (${before}; after cleanup ${facts()}).`, {
+      cause: error,
+    });
   }
 }
 class Timeline {
