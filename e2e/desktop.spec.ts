@@ -90,13 +90,24 @@ async function stop(child: ChildProcess | undefined, signal: NodeJS.Signals = 'S
     await bounded(closed, 2000, 'Owned child forced exit');
   }
 }
-async function closeDesktop(application: Awaited<ReturnType<typeof _electron.launch>>) {
-  const child = application.process();
+type DesktopProcess = { child: ChildProcess; closed: Promise<void>; closeObserved: boolean };
+async function closeDesktop(
+  application: Awaited<ReturnType<typeof _electron.launch>>,
+  owned: DesktopProcess | undefined,
+) {
+  assert(owned, 'Desktop ownership was not captured.');
+  void application.evaluate(({ app }) => app.quit()).catch(() => {});
   try {
-    await bounded(application.close(), 10000, 'Desktop close');
+    await bounded(owned.closed, 10000, 'Desktop close');
+    assert.equal(owned.child.exitCode, 0, 'Desktop exit code');
+    assert.equal(owned.child.signalCode, null, 'Desktop exit signal');
   } catch (error) {
-    await stop(child);
-    throw error;
+    const before = `exit=${owned.child.exitCode}, signal=${owned.child.signalCode}, close=${owned.closeObserved}`;
+    await stop(owned.child);
+    throw new Error(
+      `Desktop graceful close failed (${before}; after cleanup exit=${owned.child.exitCode}, signal=${owned.child.signalCode}, close=${owned.closeObserved}).`,
+      { cause: error },
+    );
   }
 }
 class Timeline {
@@ -191,6 +202,7 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
   let watcher: ChildProcess | undefined;
   let retainedGroup: number | undefined;
   let application: Awaited<ReturnType<typeof _electron.launch>> | undefined;
+  let desktop: DesktopProcess | undefined;
   try {
     const initial = launchController(home);
     controller = initial.child;
@@ -215,6 +227,14 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
         CREWKITE_SOURCE_NODE_HASH: createHash('sha256').update(readFileSync(node)).digest('hex'),
       },
       timeout: 15000,
+    });
+    const child = application.process();
+    assert(child);
+    const closed = Promise.withResolvers<void>();
+    desktop = { child, closed: closed.promise, closeObserved: false };
+    child.once('close', () => {
+      if (desktop) desktop.closeObserved = true;
+      closed.resolve();
     });
     const page = await application.firstWindow();
     await page.setViewportSize({ width: 1440, height: 900 });
@@ -713,9 +733,9 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     }
     const children = await Promise.allSettled([
       stop(watcher),
-      application ? closeDesktop(application) : Promise.resolve(),
-      stop(controller),
+      application ? closeDesktop(application, desktop) : Promise.resolve(),
     ]);
+    children.push(...(await Promise.allSettled([stop(controller)])));
     const workers = await Promise.allSettled([...groups].map(cleanupGroup));
     const failures = [...children, ...workers]
       .filter((result) => result.status === 'rejected')
