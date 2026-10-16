@@ -11,11 +11,14 @@ import {
   type CheckResult,
   CheckResultSchema,
   canonicalJson,
+  HashSchema,
+  NativeTargetPathSchema,
   type ReadData,
   ReadDataSchema,
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { syntheticCheckDefinition } from '@crewkite/testkit/repository';
+import { z } from 'zod';
 import type { ArtifactFiles } from '../artifacts/index.ts';
 import {
   type FileContent,
@@ -29,6 +32,31 @@ import {
 import type { IdPrefix } from '../store/ids.ts';
 
 type Manifest = { base: string; files: FileEntry[] };
+const checkFile = z.strictObject({
+  path: NativeTargetPathSchema,
+  mode: z.enum(['100644', '100755']),
+  hash: HashSchema,
+  bytes: z.number().int().nonnegative(),
+});
+export const NodeCheckDefinitionSchema = z.strictObject({
+  recipeId: z.literal('node-tests-v1'),
+  argv: z.array(z.string().min(1).max(4096)).min(1).max(1003),
+  candidateId: CandidateSchema.shape.id,
+  candidateHash: HashSchema,
+  definitionHash: HashSchema,
+  evaluator: z.string().min(1).max(200),
+  criteria: z.array(z.string().min(1).max(4096)).min(1).max(100),
+  collection: z.array(checkFile).min(1).max(1000),
+  required: z.strictObject({
+    path: NativeTargetPathSchema,
+    hash: HashSchema,
+    tests: z.array(z.string().min(1).max(4096)).min(1).max(1000),
+    count: z.number().int().min(1).max(1000),
+  }),
+  reporterHash: HashSchema,
+});
+export type NodeCheckDefinition = z.infer<typeof NodeCheckDefinitionSchema>;
+
 export type CheckPlan = {
   directory: string;
   argv: string[];
@@ -322,11 +350,11 @@ export class CandidateEvidence {
     return { data, artifacts: [artifact], repository, treeOid, baseTreeOid };
   }
 
-  prepareChecks(input: {
+  describeChecks(input: {
     candidate: Candidate;
     sourceFiles: FileContent[];
     criteria: string[];
-  }): CheckPlan {
+  }): NodeCheckDefinition {
     const { base, files } = this.read(input.candidate);
     verified(base, input.sourceFiles);
     const originals = input.sourceFiles.filter((file) => isTest(file.path));
@@ -346,8 +374,6 @@ export class CandidateEvidence {
     }
     const collection = files.filter((file) => isTest(file.path)).map(entry);
     if (collection.length === 0) throw new Error('No required Node tests were collected.');
-    const directory = mkdtempSync(join(this.home, 'check-'));
-    materialize(directory, files);
     const fields = {
       argv: [
         '--test',
@@ -366,13 +392,27 @@ export class CandidateEvidence {
       },
       reporterHash: digest(readFileSync(reporterPath)),
     };
-    return {
-      directory,
+    return NodeCheckDefinitionSchema.parse({
+      recipeId: 'node-tests-v1',
       candidateId: input.candidate.id,
       candidateHash: input.candidate.hash,
       ...fields,
       definitionHash: definition(fields),
-    };
+    });
+  }
+
+  prepareChecks(input: {
+    candidate: Candidate;
+    sourceFiles: FileContent[];
+    criteria: string[];
+    expected?: NodeCheckDefinition;
+  }): CheckPlan {
+    const current = this.describeChecks(input);
+    if (input.expected && hashCanonical(current) !== hashCanonical(input.expected))
+      throw new Error('The frozen check definition changed.');
+    const directory = mkdtempSync(join(this.home, 'check-'));
+    materialize(directory, this.read(input.candidate).files);
+    return { ...current, directory };
   }
 
   recordCheck(input: { candidate: Candidate; plan: CheckPlan; passed: boolean; output: Buffer }): {

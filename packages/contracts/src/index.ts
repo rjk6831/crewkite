@@ -516,6 +516,30 @@ export const CommandSchema = z.discriminatedUnion('command', [
       consent: z.enum(['explicit', 'saved']),
     }),
   ),
+  mutate(
+    'PrepareCandidateEvaluation',
+    z.strictObject({
+      taskId: TaskIdSchema,
+      candidateId: CandidateIdSchema,
+      checkRecipeId: z.literal('node-tests-v1'),
+      reviewer: z.strictObject({
+        profileId: label,
+        methodId: ReviewMethodIdSchema,
+        cycles: z.literal(1),
+      }),
+      creditPolicy: z.enum(['ordinary', 'existing-credits']).default('ordinary'),
+      consent: z.enum(['explicit', 'saved']),
+      grants: z.array(GrantSchema).length(2),
+    }),
+  ),
+  mutate(
+    'StartCandidateEvaluation',
+    z.strictObject({
+      taskId: TaskIdSchema,
+      candidateId: CandidateIdSchema,
+      preparationId: ArtifactIdSchema,
+    }),
+  ),
   mutate('StartRun', runRef),
   mutate('ResumeRun', runRef),
   mutate('PauseAdmissions', runRef),
