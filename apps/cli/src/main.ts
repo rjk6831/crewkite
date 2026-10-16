@@ -25,6 +25,7 @@ import {
   CommandSchema,
   canonicalJson,
   MAX_FRAME_BYTES,
+  ProjectNodeTestFilesSchema,
   type Snapshot,
   type Task,
   TaskSchema,
@@ -34,7 +35,7 @@ const help = `Usage: crewkite task <list|show|watch|start|stop|resume|switch|app
        crewkite task switch <task-id> <route-id> [--json] [--home path]
        crewkite native profiles [--json] [--home path]
        crewkite task prepare-native <task-id> <profile-id> <path> --policy file [--native-trust --source-consent] [--existing-credits]
-       crewkite task prepare-evaluation <task-id> <profile-id> --grants file [--native-trust --source-consent] [--existing-credits]
+       crewkite task prepare-evaluation <task-id> <profile-id> --grants file [--recipe node-tests-v1|project-node-tests-v1] [--test-file path ...] [--native-trust --source-consent] [--existing-credits]
        crewkite task <start-checks|start-review> <task-id> [--json] [--home path]
        crewkite task accept <task-id> <destination-ref> [--json] [--home path]
        crewkite task changes <task-id> [--json] [--home path]
@@ -75,6 +76,8 @@ export async function runCli(
         help: { type: 'boolean', short: 'h' },
         policy: { type: 'string' },
         grants: { type: 'string' },
+        recipe: { type: 'string' },
+        'test-file': { type: 'string', multiple: true },
         'native-trust': { type: 'boolean' },
         'source-consent': { type: 'boolean' },
         'existing-credits': { type: 'boolean' },
@@ -133,6 +136,20 @@ export async function runCli(
       throw new Error('Use native profiles to list supported profiles.');
     const preparing = area === 'task' && action === 'prepare-native';
     const evaluating = area === 'task' && action === 'prepare-evaluation';
+    if (!evaluating && (values.recipe !== undefined || values['test-file'] !== undefined))
+      throw new Error('Check recipe options require task prepare-evaluation.');
+    const recipe = values.recipe ?? 'node-tests-v1';
+    if (!['node-tests-v1', 'project-node-tests-v1'].includes(recipe))
+      throw new Error('Choose node-tests-v1 or project-node-tests-v1.');
+    if (recipe === 'node-tests-v1' && values['test-file'] !== undefined)
+      throw new Error('Test files require --recipe project-node-tests-v1.');
+    const checkRecipe =
+      recipe === 'project-node-tests-v1'
+        ? {
+            checkRecipeId: 'project-node-tests-v1' as const,
+            testFiles: ProjectNodeTestFilesSchema.parse(values['test-file'] ?? []),
+          }
+        : { checkRecipeId: 'node-tests-v1' as const };
     if (
       !preparing &&
       !evaluating &&
@@ -419,7 +436,7 @@ export async function runCli(
           {
             taskId: task.id,
             candidateId: candidate.id,
-            checkRecipeId: 'node-tests-v1',
+            ...checkRecipe,
             reviewer: { profileId: profile.id, methodId: methods[0].id, cycles: 1 },
             creditPolicy,
             consent: values['native-trust'] && values['source-consent'] ? 'explicit' : 'saved',
@@ -520,6 +537,10 @@ export async function runCli(
             `Evaluation ${evaluation.stage}`,
             `Preparation ${evaluation.preparationId}`,
             `Recipe ${evaluation.recipe}`,
+            ...evaluation.testFiles.map(
+              (file) =>
+                `Test file ${terminalText(file.path)}, ${file.hash}, ${file.bytes} bytes, ${file.mode}`,
+            ),
             `Candidate ${evaluation.candidateHash}`,
             `Target ${evaluation.target.path}`,
             `Original file hash ${evaluation.target.baseHash}`,

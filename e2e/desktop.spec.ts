@@ -726,13 +726,53 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
       { exact: true },
     );
     await expect(reviewerCredits).not.toBeChecked();
-    for (const label of [
+    const recipe = evaluationPanel.getByRole('combobox', { name: 'Test setup', exact: true });
+    await expect(recipe).toHaveValue('node-tests-v1');
+    const nativeTrust = evaluationPanel.getByLabel(
+      'Trust the existing native client and login for the review',
+      { exact: true },
+    );
+    await nativeTrust.check();
+    await reviewerCredits.check();
+    await recipe.selectOption('project-node-tests-v1');
+    await expect(nativeTrust).not.toBeChecked();
+    await expect(reviewerCredits).not.toBeChecked();
+    const evaluationPermissions = [
       'Trust the existing native client and login for the review',
       'Share the original file, proposed change and task text with the reviewer',
-      'Allow one local test run',
+      'Allow one local run of the selected project tests',
       'Allow one Keep it simple review',
-    ])
+    ];
+    for (const label of evaluationPermissions)
       await evaluationPanel.getByLabel(label, { exact: true }).check();
+    await reviewerCredits.check();
+    await expect(
+      evaluationPanel.getByRole('button', { name: 'Prepare candidate evaluation', exact: true }),
+    ).toBeDisabled();
+    const testFiles = evaluationPanel.getByRole('textbox', {
+      name: 'Committed test files (one relative path per line)',
+      exact: true,
+    });
+    await testFiles.fill('../outside.test.mjs');
+    await expect(testFiles).toHaveAttribute('aria-invalid', 'true');
+    await expect(evaluationPanel.getByRole('alert')).toContainText(
+      'Enter 1 to 32 distinct relative file paths.',
+    );
+    await testFiles.fill('net.test.mjs');
+    await expect(testFiles).toHaveAttribute('aria-invalid', 'false');
+    for (const label of evaluationPermissions) {
+      const permission = evaluationPanel.getByLabel(label, { exact: true });
+      await expect(permission).not.toBeChecked();
+      await permission.check();
+    }
+    await expect(reviewerCredits).not.toBeChecked();
+    await expect(evaluationPanel).toContainText('Local code runs with your system permissions.');
+    await expect(evaluationPanel).toContainText('Dependencies are not installed.');
+    await testFiles.scrollIntoViewIfNeeded();
+    await page.screenshot({
+      path: join(internal, 'project-node-tests-preparation-dark.png'),
+      animations: 'disabled',
+    });
     const beforeEvaluation = await observer.snapshot();
     await enter(
       evaluationPanel.getByRole('button', { name: 'Prepare candidate evaluation', exact: true }),
@@ -751,6 +791,18 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
       (value) => value.taskId === nativeTask.id,
     );
     assert(evaluation);
+    assert.equal(evaluation.recipe, 'project-node-tests-v1');
+    const testFile = readFileSync(join(source, 'net.test.mjs'));
+    assert.deepEqual(evaluation.testFiles, [
+      {
+        path: 'net.test.mjs',
+        hash: createHash('sha256').update(testFile).digest('hex'),
+        bytes: testFile.length,
+        mode: '100644',
+      },
+    ]);
+    await expect(evaluationPanel).toContainText('Project Node tests');
+    await expect(evaluationPanel.getByText('net.test.mjs', { exact: true })).toBeVisible();
     const checkFrom = nativeEvents.rows.length;
     await enter(evaluationPanel.getByRole('button', { name: 'Start local checks', exact: true }));
     const checked = await nativeEvents.wait(

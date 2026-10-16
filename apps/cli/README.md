@@ -21,7 +21,7 @@ Task commands use IDs returned by the controller:
 | `task accept <task-id> <destination-ref>` | Request the checked candidate as a new local branch |
 | `task changes <task-id>` | Read the retained candidate diff |
 | `task export <task-id> --output new.patch` | Request export and save verified patch bytes to a new file |
-| `task prepare-evaluation <task-id> <profile-id> --grants file` | Freeze separate check and reviewer authority for the current native candidate |
+| `task prepare-evaluation <task-id> <profile-id> --grants file [--recipe id] [--test-file path ...]` | Freeze separate check and reviewer authority for the current native candidate |
 | `task start-checks <task-id>` | Start the saved local check once |
 | `task start-review <task-id>` | Start the saved native review after matching checks pass |
 
@@ -95,7 +95,7 @@ Export reads bounded artifact pages and verifies identity, offsets, length and c
 
 ## Candidate checks and review
 
-The current trusted `node-tests-v1` recipe covers the synthetic `net.mjs` project. Other projects are blocked before execution. The saved run must select one `keep-it-simple` review cycle and retain enough of its original budget for a local check and a separate native review. Preparation does not lower the saved quality floor.
+The default `node-tests-v1` recipe covers the synthetic `net.mjs` project. The `project-node-tests-v1` recipe uses 1 to 32 explicit committed Node test files. The saved run must select one `keep-it-simple` review cycle and retain enough of its original budget for a local check and a separate native review. Preparation does not lower the saved quality floor.
 
 Save a JSON array containing exactly two one-use grants. Replace the task ID and choose a future expiration:
 
@@ -130,9 +130,17 @@ pnpm crewkite task show <task-id> --json
 pnpm crewkite task start-review <task-id> --json
 ```
 
+For project tests, add the recipe and repeat `--test-file` for each exact relative path:
+
+```sh
+pnpm crewkite task prepare-evaluation <task-id> <profile-id> --grants evaluation-grants.json --recipe project-node-tests-v1 --test-file test/pricing.test.mjs --test-file test/tax.test.mjs --native-trust --source-consent --json
+```
+
+Local code runs with your system permissions. Dependencies are not installed. Imports can use Node built-ins and files in the check copy. Paths are literal, with no globs or discovery; names with spaces need shell quotes. The controller freezes the committed files and refuses changed definitions before execution. Inspect `task show` before starting checks.
+
 Preparation starts no work. Omitting both consent flags requests exact saved evaluation consent. Reviewer credit spending defaults off independently of the writer. Add `--existing-credits` during evaluation preparation only when choosing that policy explicitly.
 
-Task show reports the controller's evaluation stage, exact file and hashes, saved reviewer and process-only independence, expiry, current start availability and remaining total attempts and minutes. The supplemental allowance permits one local check and one additional native review beneath those original run limits. Completed evidence remains visible after start permission expires. A failed or blocked check cannot authorize review. Task show also reports current local acceptance availability and its reason. Completed checks and review can make acceptance available. The destination still needs its own current grant or approval; inspection and export remain available.
+Task show reports the controller's evaluation stage, selected recipe and test files, exact file and hashes, saved reviewer and process-only independence, expiry, current start availability and remaining total attempts and minutes. The supplemental allowance permits one local check and one additional native review beneath those original run limits. Completed evidence remains visible after start permission expires. A failed or blocked check cannot authorize review. Task show also reports current local acceptance availability and its reason. Completed checks and review can make acceptance available. The destination still needs its own current grant or approval; inspection and export remain available.
 
 ## Local branch acceptance
 
