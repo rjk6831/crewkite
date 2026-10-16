@@ -28,9 +28,14 @@ export type NativeProfileResolution = {
   locationHash?: string;
 };
 export function unavailableNativeProfile(
-  reason: NativeProfileResolution['facts']['reason'] = 'not-configured',
-): NativeProfileResolution {
-  return { facts: NativeProfileSchema.parse({ ...descriptor, available: false, reason }) };
+  reason: Extract<
+    NativeProfileResolution['facts'],
+    { family: 'openai' }
+  >['reason'] = 'not-configured',
+) {
+  return {
+    facts: NativeProfileSchema.options[0].parse({ ...descriptor, available: false, reason }),
+  };
 }
 
 /** Resolve the supported installation without executing it or reading authentication files. */

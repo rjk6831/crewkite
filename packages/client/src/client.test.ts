@@ -170,6 +170,30 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     available: true,
     reason: 'available' as const,
   };
+  const anthropicProfile: Snapshot['nativeProfiles'][number] = {
+    id: 'anthropic-file-v1',
+    family: 'anthropic',
+    displayName: 'Anthropic single-file proposal',
+    clientVersion: '2.1.302',
+    model: 'native-model',
+    effort: 'medium',
+    effectiveEffort: 'unknown',
+    accountClass: 'unknown',
+    serviceTier: 'unknown',
+    billingBasis: 'requires-user-attestation',
+    qualifiedAt: null,
+    creditPolicies: ['ordinary'],
+    maximumTaskMs: 300000,
+    maximumFileBytes: 65536,
+    maximumSubmissions: 1,
+    available: true,
+    reason: 'qualification-pending',
+  };
+  const billingAttestation = {
+    source: 'user-attested' as const,
+    subscriptionLoginConfirmed: true as const,
+    paidExtraUsageDisabled: true as const,
+  };
   const policy: import('@crewkite/contracts').Policy = {
     authority: 'balanced',
     quality: 'quick',
@@ -277,6 +301,14 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     'show',
     'native-show',
     'profiles',
+    'anthropic-explicit',
+    'anthropic-saved',
+    'anthropic-missing',
+    'anthropic-credits',
+    'anthropic-wrong-provider',
+    'anthropic-wrong-command',
+    'anthropic-reviewer',
+    'anthropic-show',
     'explicit',
     'saved',
     'unavailable',
@@ -312,7 +344,12 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     'accept-approval-mismatch',
     'accept-approval-ambiguous',
   ]) {
+    const anthropicSaved = scenario === 'anthropic-saved' || scenario === 'anthropic-show';
+    const selectedNativeRun: Snapshot['nativeRuns'][number] = anthropicSaved
+      ? { ...nativeRun, profileId: anthropicProfile.id, billingAttestation }
+      : nativeRun;
     const evaluating =
+      scenario === 'anthropic-reviewer' ||
       scenario.startsWith('evaluation-') ||
       scenario.startsWith('accept-') ||
       ['start-checks', 'start-review'].includes(scenario);
@@ -431,7 +468,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
               ...snapshot,
               tasks: pendingCommand
                 ? [pendingTask]
-                : scenario === 'native-show' || evaluating || needsApproval
+                : scenario === 'native-show' || anthropicSaved || evaluating || needsApproval
                   ? [
                       {
                         ...task,
@@ -440,7 +477,10 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
                       },
                     ]
                   : snapshot.tasks,
-              runs: scenario === 'native-show' || evaluating || needsApproval ? [run] : [],
+              runs:
+                scenario === 'native-show' || anthropicSaved || evaluating || needsApproval
+                  ? [run]
+                  : [],
               attempts: needsApproval
                 ? [
                     {
@@ -453,13 +493,17 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
                     },
                   ]
                 : snapshot.attempts,
-              nativeRuns: scenario === 'native-show' || evaluating ? [nativeRun] : [],
+              nativeRuns:
+                scenario === 'native-show' || anthropicSaved || evaluating
+                  ? [selectedNativeRun]
+                  : [],
               candidates: evaluating || needsApproval ? [candidate] : [],
               artifacts: evaluating ? [artifact] : [],
               candidateEvaluations: evaluating ? [preview] : [],
               evidence: reviewEvidence,
               approvals,
               nativeProfiles: [
+                anthropicProfile,
                 {
                   ...profile,
                   creditPolicies: [...profile.creditPolicies],
@@ -617,7 +661,79 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         task.id,
         scenario === 'accept-invalid-ref' ? 'main' : 'refs/heads/feat/checked',
       ];
+    if (scenario.startsWith('anthropic-')) {
+      args =
+        scenario === 'anthropic-show'
+          ? ['task', 'show', task.id]
+          : scenario === 'anthropic-wrong-command'
+            ? ['native', 'profiles', '--confirm-subscription-only']
+            : scenario === 'anthropic-reviewer'
+              ? [
+                  'task',
+                  'prepare-evaluation',
+                  task.id,
+                  anthropicProfile.id,
+                  '--grants',
+                  grantsFile,
+                  '--native-trust',
+                  '--source-consent',
+                ]
+              : [
+                  'task',
+                  'prepare-native',
+                  task.id,
+                  scenario === 'anthropic-wrong-provider' ? profile.id : anthropicProfile.id,
+                  'docs/providers.md',
+                  '--policy',
+                  policyFile,
+                  ...(scenario === 'anthropic-saved' ? [] : ['--native-trust', '--source-consent']),
+                  ...([
+                    'anthropic-explicit',
+                    'anthropic-credits',
+                    'anthropic-wrong-provider',
+                  ].includes(scenario)
+                    ? ['--confirm-subscription-only']
+                    : []),
+                  ...(scenario === 'anthropic-credits' ? ['--existing-credits'] : []),
+                ];
+    }
     const result = await execute(args, scenario !== 'changes');
+    if (scenario.startsWith('anthropic-')) {
+      if (scenario === 'anthropic-show') {
+        assert.equal(result.code, 0, result.errors);
+        assert.deepEqual(JSON.parse(result.output).nativeRun, selectedNativeRun);
+        const plain = await execute(args, false);
+        assert.match(plain.output, /user-attested subscription login, paid extra usage disabled/u);
+      } else if (scenario === 'anthropic-explicit' || scenario === 'anthropic-saved') {
+        assert.equal(result.code, 0, result.errors);
+        const receipt = JSON.parse(result.output);
+        assert.equal(receipt.command.command, 'PrepareNativeRun');
+        assert.equal(receipt.command.expectedRevision, task.revision);
+        assert.deepEqual(receipt.command.payload, {
+          taskId: task.id,
+          profileId: anthropicProfile.id,
+          targetPath: 'docs/providers.md',
+          policy,
+          creditPolicy: 'ordinary',
+          consent: scenario === 'anthropic-saved' ? 'saved' : 'explicit',
+          billingAttestation,
+        });
+        assert.deepEqual(
+          received.map((value) => value.command),
+          ['GetSnapshot', 'PrepareNativeRun'],
+        );
+      } else {
+        assert.equal(result.code, 1, scenario);
+        assert.equal(
+          received.some((value) => value.command !== 'GetSnapshot'),
+          false,
+        );
+        if (scenario === 'anthropic-wrong-command') assert.deepEqual(received, []);
+        if (scenario === 'anthropic-reviewer')
+          assert.match(result.errors, /Choose a supported OpenAI reviewer profile/u);
+      }
+      continue;
+    }
     if (
       [
         'evaluation-project-empty',
@@ -824,8 +940,17 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     if (scenario === 'profiles') {
       assert.equal(result.code, 0);
       assert.deepEqual(JSON.parse(result.output).profiles, [
+        anthropicProfile,
         { ...profile, creditPolicies: [...profile.creditPolicies] },
       ]);
+      const plain = await execute(args, false);
+      assert.match(
+        plain.output,
+        /medium requested effort.*effective effort unknown.*service tier unknown.*qualification pending/u,
+      );
+      assert(
+        plain.output.includes(`${profile.id}  ${profile.model}  ${profile.effort}  available`),
+      );
       continue;
     }
     if (scenario === 'changes') {

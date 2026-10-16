@@ -37,7 +37,7 @@ Create the project and draft task in the desktop. List the controller's supporte
 pnpm crewkite native profiles --json
 ```
 
-The snapshot reports profile availability, its reason, client version, model, effort and bounds. The CLI accepts a listed profile ID. It accepts no executable, digest or model override.
+The snapshot reports profile availability, its reason, client version, model, effort and bounds. Anthropic reports requested effort separately from unobserved effective effort and service tier. A missing qualification date is shown as pending. The CLI accepts a listed profile ID. It accepts no executable, digest or model override.
 
 Save a policy JSON file using the existing policy schema. This example grants one scratch write and one export. Replace the sample task ID and project name with the desktop values, and choose a future expiration before preparing the run:
 
@@ -78,9 +78,11 @@ pnpm crewkite task show <task-id> --json
 pnpm crewkite task start <task-id> --json
 ```
 
-Task show includes the matching native run and source, frozen target path, base hash, byte count, consent expiry and stage. Older retained runs can report unknown target facts or expiry.
+For an Anthropic writer, add `--confirm-subscription-only` to confirm both that the existing native login uses your subscription and that paid extra usage is disabled. This flag records your attestation. It does not change account settings or establish a provider hard spending cap. OpenAI preparation rejects this flag. Anthropic supports ordinary usage only.
 
-Preparation spends no inference. Start rechecks controller admission and launches the saved run. Without both consent flags, preparation requests the controller's exact saved consent. A single flag is rejected. Changed source, target, criteria, policy, profile or billing choice can invalidate that consent.
+Task show includes the matching native run and source, frozen target path, base hash, byte count, consent expiry and stage. Saved billing confirmations appear with their user-attested provenance. Older retained runs can report unknown target facts or expiry.
+
+Preparation spends no inference. Start rechecks controller admission and launches the saved run. Without both consent flags, preparation requests the controller's exact saved consent. A single flag is rejected. Changed source, target, criteria, policy, profile or billing choice can invalidate that consent. Anthropic requires billing confirmations even with saved consent. Omitting the confirmation flag can reuse only the matching current native run's saved attestation; missing confirmations are never inferred.
 
 Existing-credit spending defaults off. Add `--existing-credits` only when choosing that policy explicitly. Available included usage does not establish a provider-enforced hard billing cap. Native trust and billing limits are described in [provider routes](../../docs/providers.md).
 
@@ -120,7 +122,7 @@ Save a JSON array containing exactly two one-use grants. Replace the task ID and
 ]
 ```
 
-Prepare consent for sending the original file, candidate and task text to a fresh reviewer process:
+Select a supported OpenAI reviewer independently of the writer. Prepare consent for sending the original file, candidate and task text to a fresh reviewer process:
 
 ```sh
 pnpm crewkite task prepare-evaluation <task-id> <profile-id> --grants evaluation-grants.json --native-trust --source-consent --json

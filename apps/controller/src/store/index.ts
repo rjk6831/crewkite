@@ -9,6 +9,7 @@ import {
   type Event,
   EventSchema,
   NativeReviewJobSchema,
+  type Route,
   type Run,
   type Task,
   TimestampSchema,
@@ -42,13 +43,43 @@ export type LaunchIntent = {
 export type NativeProcess = {
   attempt_id: string;
   sequence: number;
-  phase: 'effective-features' | 'metadata-preparation' | 'app-server-task';
+  phase:
+    | 'effective-features'
+    | 'metadata-preparation'
+    | 'app-server-task'
+    | 'auth-status'
+    | 'native-task';
   state: 'intent' | 'owned' | 'quiescent';
   pid: number | null;
   process_group: number | null;
   intent_at: string;
   quiescent_at: string | null;
 };
+
+/** Historical short preflight sequences remain readable; success requires the full task sequence. */
+export function nativePhaseSequence(
+  family: Route['family'],
+  phases: readonly NativeProcess['phase'][],
+  complete = false,
+): boolean {
+  const sequences: NativeProcess['phase'][][] =
+    family === 'openai'
+      ? [
+          ['effective-features', 'metadata-preparation', 'app-server-task'],
+          ...(complete
+            ? []
+            : [['effective-features', 'app-server-task'] as NativeProcess['phase'][]]),
+        ]
+      : family === 'anthropic'
+        ? [['auth-status', 'native-task']]
+        : [];
+  return sequences.some(
+    (sequence) =>
+      phases.length <= sequence.length &&
+      (!complete || phases.length === sequence.length) &&
+      phases.every((phase, index) => phase === sequence[index]),
+  );
+}
 
 export class Store {
   readonly db: DatabaseSync;
@@ -206,18 +237,40 @@ export class Store {
     const rows = this.db
       .prepare('SELECT * FROM native_processes WHERE attempt_id=? ORDER BY sequence')
       .all(attemptId) as NativeProcess[];
-    for (const [sequence, row] of rows.entries()) {
-      if (
-        row.sequence !== sequence ||
-        (sequence === 0 && row.phase !== 'effective-features') ||
-        (sequence === 1 && row.phase === 'effective-features') ||
-        (sequence === 2 &&
-          (rows[1]?.phase !== 'metadata-preparation' || row.phase !== 'app-server-task')) ||
-        (sequence > 0 && rows[sequence - 1]?.state !== 'quiescent')
+    if (!rows.length) return rows;
+    const attempt = this.get<Attempt>('attempt', attemptId);
+    const route = attempt && this.get<Route>('route', attempt.routeId);
+    if (
+      !route ||
+      route.fake ||
+      !nativePhaseSequence(
+        route.family,
+        rows.map((row) => row.phase),
       )
+    )
+      throw new Error('Native process sequence is invalid.');
+    for (const [sequence, row] of rows.entries()) {
+      if (row.sequence !== sequence || (sequence > 0 && rows[sequence - 1]?.state !== 'quiescent'))
         throw new Error('Native process sequence is invalid.');
     }
     return rows;
+  }
+
+  nativePhasesComplete(attemptId: string, expectedFamily: Route['family']): boolean {
+    const attempt = this.get<Attempt>('attempt', attemptId);
+    const route = attempt && this.get<Route>('route', attempt.routeId);
+    const phases = this.nativeProcesses(attemptId);
+    return (
+      !!route &&
+      !route.fake &&
+      route.family === expectedFamily &&
+      nativePhaseSequence(
+        route.family,
+        phases.map((phase) => phase.phase),
+        true,
+      ) &&
+      phases.every((phase) => phase.state === 'quiescent')
+    );
   }
 
   private nativeWriter(attemptId: string) {
@@ -269,13 +322,13 @@ export class Store {
     if (!['intent', 'running'].includes(attempt.state) || (task.state !== 'running' && !reviewing))
       throw new Error('Native phases require a current writer or native review.');
     const previous = this.nativeProcesses(attemptId);
+    const route = this.get<Route>('route', attempt.routeId);
     if (
+      !route ||
+      route.fake ||
+      (reviewing && route.family !== 'openai') ||
       sequence !== previous.length ||
-      sequence > 2 ||
-      (sequence === 0 && phase !== 'effective-features') ||
-      (sequence === 1 && !['metadata-preparation', 'app-server-task'].includes(phase)) ||
-      (sequence === 2 &&
-        (previous[1]?.phase !== 'metadata-preparation' || phase !== 'app-server-task')) ||
+      !nativePhaseSequence(route.family, [...previous.map((row) => row.phase), phase]) ||
       previous.some((row) => row.state !== 'quiescent')
     )
       throw new Error('Native phase requires its preceding process to be quiescent.');

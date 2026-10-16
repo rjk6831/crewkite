@@ -92,6 +92,29 @@ test('native text replacement stays bound to one proposal and owned task deadlin
   assert(!plan.argv.includes(original));
   assert.throws(() => replacementPlan({ ...input, original: 'changed' }), ReplacementError);
   assert.throws(() => replacementPlan({ ...input, model: '--bad' }), ReplacementError);
+  assert.deepEqual(plan.input, input);
+  for (const path of ['docs/日本 語.md', 'docs/"schema} instruction.md']) {
+    const selected = replacementPlan({ ...input, path });
+    const schema = JSON.parse(selected.argv[selected.argv.indexOf('--json-schema') + 1]);
+    assert.equal(schema.properties.path.const, path);
+    assert.equal(JSON.parse(selected.prompt.slice(selected.prompt.indexOf('\n') + 1)).path, path);
+    const reader = new ReplacementStream(selected);
+    reader.push(line(init));
+    reader.push(line({ ...result, structured_output: { ...edit, path } }));
+    assert.equal(reader.finish().replacement.path, path);
+  }
+  for (const path of ['../net.mjs', '/net.mjs', 'a\\b', 'a\0b', 'a\nb'])
+    assert.throws(() => replacementPlan({ ...input, path }), ReplacementError);
+  const nul = `${original}\0`;
+  assert.throws(
+    () =>
+      replacementPlan({
+        ...input,
+        original: nul,
+        baseHash: createHash('sha256').update(nul).digest('hex'),
+      }),
+    ReplacementError,
+  );
   const cases: Array<{
     name: string;
     frames: unknown[];
@@ -101,6 +124,14 @@ test('native text replacement stays bound to one proposal and owned task deadlin
     diagnostic?: Record<string, unknown>;
   }> = [
     { name: 'valid', frames: [init, result], pass: true },
+    {
+      name: 'different regular path',
+      frames: [init, { ...result, structured_output: { ...edit, path: 'other.mjs' } }],
+    },
+    {
+      name: 'NUL output',
+      frames: [init, { ...result, structured_output: { ...edit, content: 'a\0b' } }],
+    },
     { name: 'user text is discarded output', frames: [init, user, result], pass: true },
     {
       name: 'native formatter result is discarded output',
@@ -436,10 +467,24 @@ process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(
       'stderr',
       'trailing',
       'exit',
+      'owned-throw',
+      'owned-promise',
+      'owned-deadline',
+      'submitted-throw',
+      'submitted-promise',
+      'submitted-thenable',
+      'submitted-deadline',
+      'quiescent-throw',
+      'quiescent-promise',
+      'quiescent-deadline',
+      'write-failure',
     ]) {
       const directory = join(root, mode);
       mkdirSync(directory, { mode: 0o700 });
       let deadline: (() => void) | undefined;
+      let time = 0;
+      const trace: string[] = [];
+      const shortened = mode.includes('deadline') && mode !== 'deadline';
       let received!: () => void;
       const output = new Promise<void>((resolve) => {
         received = resolve;
@@ -454,9 +499,47 @@ process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(
           plan: { ...plan, argv: ['--dangerously-skip-permissions'] },
         },
         {
-          now: () => 0,
+          now: () => time,
+          ...(shortened ? { deadline: 6000 } : {}),
+          lifecycle: {
+            beforePhase: (kind) => {
+              assert.equal(kind, 'task');
+              trace.push('before');
+            },
+            owned: (kind, group) => {
+              assert.equal(kind, 'task');
+              trace.push('owned');
+              const child = owned.at(-1)?.child;
+              assert.equal(child?.pid, group);
+              assert(
+                child && child.listenerCount('error') > 0 && child.stdin.listenerCount('error') > 0,
+              );
+              if (mode === 'owned-throw') throw Error(secret);
+              if (mode === 'owned-promise') return Promise.reject(Error(secret));
+              if (mode === 'owned-deadline') time = 5000;
+            },
+            quiescent: (kind, group) => {
+              assert.equal(kind, 'task');
+              assert(groupAbsent(group));
+              trace.push('quiescent');
+              if (mode === 'quiescent-throw') throw Error(secret);
+              if (mode === 'quiescent-promise') return Promise.reject(Error(secret));
+              if (mode === 'quiescent-deadline') time = 6000;
+            },
+          },
+          onSubmitted: () => {
+            trace.push('submitted');
+            if (mode === 'submitted-throw') throw Error(secret);
+            if (mode === 'submitted-promise') return Promise.reject(Error(secret));
+            if (mode === 'submitted-thenable')
+              return {
+                // biome-ignore lint/suspicious/noThenProperty: This fixture proves thenable hooks are refused.
+                then: (_resolve: unknown, reject: (error: Error) => void) => reject(Error(secret)),
+              };
+            if (mode === 'submitted-deadline') time = 5000;
+          },
           schedule: (work, delay) => {
-            if (delay === 298000) {
+            if (delay === (shortened ? 4000 : 298000)) {
               deadline = work;
               return () => {
                 deadline = undefined;
@@ -480,6 +563,14 @@ process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(
             );
             child.stdout.once('data', () => received());
             owned.push({ child, closed: new Promise((resolve) => child.once('close', resolve)) });
+            const end = child.stdin.end;
+            child.stdin.end = function (...args: unknown[]) {
+              if (typeof args[0] === 'string') {
+                trace.push('write');
+                if (mode === 'write-failure') throw Error(secret);
+              }
+              return Reflect.apply(end, this, args);
+            };
             return child;
           }) as typeof spawn,
         },
@@ -495,6 +586,20 @@ process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(
       assert(outcome.quiescent, mode);
       assert(groupAbsent(handle.group), mode);
       assert(!JSON.stringify(outcome).includes(secret), mode);
+      assert.deepEqual(trace.slice(0, 2), ['before', 'owned'], mode);
+      assert.equal(trace.filter((step) => step === 'quiescent').length, 1, mode);
+      assert.equal(
+        trace.filter((step) => step === 'submitted').length,
+        mode.startsWith('owned-') ? 0 : 1,
+        mode,
+      );
+      const writes = trace.filter((step) => step === 'write').length;
+      assert.equal(
+        writes,
+        mode.startsWith('owned-') || mode.startsWith('submitted-') ? 0 : 1,
+        mode,
+      );
+      if (writes) assert.equal(trace.indexOf('submitted') + 1, trace.indexOf('write'), mode);
       if (mode === 'refusal')
         assert.deepEqual(outcome.diagnostic, {
           stage: 'before-init',
@@ -520,11 +625,77 @@ process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(
               trailing: 'protocol',
               refusal: 'protocol',
               exit: 'protocol',
+              'owned-throw': 'ownership',
+              'owned-promise': 'ownership',
+              'owned-deadline': 'deadline',
+              'submitted-throw': 'ownership',
+              'submitted-promise': 'ownership',
+              'submitted-thenable': 'ownership',
+              'submitted-deadline': 'deadline',
+              'quiescent-throw': 'ownership',
+              'quiescent-promise': 'ownership',
+              'quiescent-deadline': 'deadline',
+              'write-failure': 'launch',
             } as Record<string, string>
           )[mode],
           mode,
         );
       }
+    }
+    for (const mode of [
+      'expired',
+      'validation-time',
+      'before-time',
+      'before-throw',
+      'before-promise',
+      'before-thenable',
+    ]) {
+      const directory = join(root, mode);
+      mkdirSync(directory, { mode: 0o700 });
+      let time = 0;
+      let ticks = 0;
+      let launched = false;
+      assert.throws(
+        () =>
+          startReplacement(
+            {
+              executable: process.execPath,
+              sha256,
+              repositoryRoot: root,
+              directory,
+              environment: { HOME: root },
+              plan,
+            },
+            {
+              deadline: mode === 'expired' ? 2000 : 6000,
+              now: () => (mode === 'validation-time' && ++ticks > 2 ? 5000 : time),
+              lifecycle: {
+                beforePhase: () => {
+                  if (mode === 'before-time') time = 5000;
+                  if (mode === 'before-throw') throw Error(secret);
+                  if (mode === 'before-promise') return Promise.reject(Error(secret));
+                  if (mode === 'before-thenable')
+                    return {
+                      // biome-ignore lint/suspicious/noThenProperty: This fixture proves thenable hooks are refused.
+                      then: (_resolve: unknown, reject: (error: Error) => void) =>
+                        reject(Error(secret)),
+                    };
+                },
+                owned: () => assert.fail('No child should be owned.'),
+                quiescent: () => assert.fail('No child should close.'),
+              },
+              spawn: (() => {
+                launched = true;
+                throw Error(secret);
+              }) as typeof spawn,
+            },
+          ),
+        (error: unknown) =>
+          error instanceof ReplacementError &&
+          error.reason ===
+            (mode.startsWith('before-') && mode !== 'before-time' ? 'ownership' : 'deadline'),
+      );
+      assert.equal(launched, false, mode);
     }
   } finally {
     for (const { child } of owned)

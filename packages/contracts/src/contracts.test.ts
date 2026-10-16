@@ -15,6 +15,9 @@ import {
   formatReviewTarget,
   GrantSchema,
   MinorAmountSchema,
+  NativeBillingAttestationSchema,
+  NativeProfileSchema,
+  NativeRunSchema,
   ObservationSchema,
   PolicySchema,
   parseReviewTarget,
@@ -41,6 +44,69 @@ const command = {
 };
 
 test('process boundaries reject unknown fields and invalid command identity', () => {
+  const attestation = {
+    source: 'user-attested',
+    subscriptionLoginConfirmed: true,
+    paidExtraUsageDisabled: true,
+  };
+  assert(NativeBillingAttestationSchema.safeParse(attestation).success);
+  for (const invalid of [
+    { ...attestation, source: 'provider-observed' },
+    { ...attestation, subscriptionLoginConfirmed: false },
+    { ...attestation, paidExtraUsageDisabled: false },
+    { ...attestation, plan: 'personal-plan' },
+  ])
+    assert.equal(NativeBillingAttestationSchema.safeParse(invalid).success, false);
+
+  const historicalProfile = {
+    id: 'openai-file-v1',
+    family: 'openai',
+    displayName: 'OpenAI fixture',
+    clientVersion: 'fixture',
+    model: 'fixture',
+    effort: 'low',
+    accountClass: 'pro',
+    serviceTier: 'default',
+    qualifiedAt: '2026-10-16',
+    creditPolicies: ['ordinary', 'existing-credits'],
+    maximumTaskMs: 300000,
+    maximumFileBytes: 65536,
+    maximumSubmissions: 1,
+    available: true,
+    reason: 'available',
+  };
+  assert.deepEqual(NativeProfileSchema.parse(historicalProfile), historicalProfile);
+  assert.equal(
+    hashCanonical(NativeProfileSchema.parse(historicalProfile)),
+    hashCanonical(historicalProfile),
+  );
+  const pendingProfile = {
+    ...historicalProfile,
+    id: 'anthropic-file-v1',
+    family: 'anthropic',
+    effort: 'medium',
+    effectiveEffort: 'unknown',
+    accountClass: 'unknown',
+    serviceTier: 'unknown',
+    qualifiedAt: null,
+    creditPolicies: ['ordinary'],
+    billingBasis: 'requires-user-attestation',
+    reason: 'qualification-pending',
+  };
+  assert.deepEqual(NativeProfileSchema.parse(pendingProfile), pendingProfile);
+  for (const change of [
+    { effectiveEffort: 'medium' },
+    { accountClass: 'pro' },
+    { creditPolicies: ['existing-credits'] },
+    { billingBasis: 'provider-observed' },
+  ])
+    assert.equal(NativeProfileSchema.safeParse({ ...pendingProfile, ...change }).success, false);
+  const historicalRun = {
+    runId: `run_${suffix}`,
+    profileId: historicalProfile.id,
+    stage: 'retain-only',
+  };
+  assert.deepEqual(NativeRunSchema.parse(historicalRun), historicalRun);
   assert.ok(CommandSchema.safeParse(command).success);
   for (const [quality, methods] of [
     ['quick', ['keep-it-simple']],

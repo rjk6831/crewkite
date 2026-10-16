@@ -46,7 +46,7 @@ export const ProjectNodeTestFilesSchema = z
   .min(1)
   .max(32)
   .refine((paths) => new Set(paths).size === paths.length, 'Node test files must be distinct.');
-export const NativeProfileSchema = z.strictObject({
+const OpenAiNativeProfileSchema = z.strictObject({
   id: label,
   family: z.literal('openai'),
   displayName: label,
@@ -74,9 +74,38 @@ export const NativeProfileSchema = z.strictObject({
     'client-build-mismatch',
   ]),
 });
+export const NativeBillingAttestationSchema = z.strictObject({
+  source: z.literal('user-attested'),
+  subscriptionLoginConfirmed: z.literal(true),
+  paidExtraUsageDisabled: z.literal(true),
+});
+export const AnthropicNativeProfileSchema = z.strictObject({
+  id: z.literal('anthropic-file-v1'),
+  family: z.literal('anthropic'),
+  displayName: label,
+  clientVersion: label,
+  model: label,
+  effort: z.literal('medium'),
+  effectiveEffort: z.literal('unknown'),
+  accountClass: z.literal('unknown'),
+  serviceTier: z.literal('unknown'),
+  billingBasis: z.literal('requires-user-attestation'),
+  qualifiedAt: z.iso.date().nullable(),
+  creditPolicies: z.tuple([z.literal('ordinary')]),
+  maximumTaskMs: z.literal(300000),
+  maximumFileBytes: z.literal(65536),
+  maximumSubmissions: z.literal(1),
+  available: z.boolean(),
+  reason: z.enum([...OpenAiNativeProfileSchema.shape.reason.options, 'qualification-pending']),
+});
+export const NativeProfileSchema = z.discriminatedUnion('family', [
+  OpenAiNativeProfileSchema,
+  AnthropicNativeProfileSchema,
+]);
 export const NativeRunSchema = z.strictObject({
   runId: RunIdSchema,
   profileId: label,
+  billingAttestation: NativeBillingAttestationSchema.optional(),
   stage: z.enum(['prepared', 'retain-only']),
   expiresAt: TimestampSchema.optional(),
   target: z
@@ -549,6 +578,7 @@ export const CommandSchema = z.discriminatedUnion('command', [
     z.strictObject({
       taskId: TaskIdSchema,
       profileId: label,
+      billingAttestation: NativeBillingAttestationSchema.optional(),
       targetPath: NativeTargetPathSchema,
       policy: PolicySchema,
       creditPolicy: z.enum(['ordinary', 'existing-credits']).default('ordinary'),
@@ -783,7 +813,11 @@ export type CandidateEvaluationPreview = z.infer<typeof CandidateEvaluationPrevi
 
 export const SnapshotSchema = z
   .strictObject({
-    nativeProfiles: z.array(NativeProfileSchema).max(1).default([]),
+    nativeProfiles: z
+      .array(NativeProfileSchema)
+      .max(2)
+      .refine((profiles) => new Set(profiles.map((profile) => profile.id)).size === profiles.length)
+      .default([]),
     nativeRuns: z.array(NativeRunSchema).max(10000).default([]),
     candidateEvaluations: z.array(CandidateEvaluationPreviewSchema).max(10000).default([]),
     protocol: z.literal(1),

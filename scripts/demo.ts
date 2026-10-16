@@ -36,6 +36,7 @@ const child = spawn(executable, [join(root, 'apps/desktop')], {
     PATH: process.env.PATH,
     HOME: process.env.HOME,
     CODEX_HOME: process.env.CODEX_HOME,
+    CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
     DISPLAY: process.env.DISPLAY,
     XAUTHORITY: process.env.XAUTHORITY,
     LANG: 'en_US.UTF-8',
