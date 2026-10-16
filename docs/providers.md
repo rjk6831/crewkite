@@ -15,23 +15,29 @@ These are planned pilots. A fake family label does not establish a client's capa
 
 Google [ended consumer sign-in for Gemini CLI on June 18, 2026](https://developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals), including Google AI Pro and Ultra. That consumer subscription path is unavailable. Google's [migration guide points to Antigravity CLI](https://www.antigravity.google/docs/cli/gcli-migration).
 
-Local native checks have returned OpenAI account, allowance and model metadata, and Anthropic subscription-candidate authentication metadata. Neither establishes live inference or route qualification.
+The 16 October 2026 check on the M5 Mac found Anthropic client 2.1.301 signed out. Its account, plan and billing identity remain unknown.
 
 ## Google writer preparation
 
 The Google adapter reads [structured headless output](https://www.antigravity.google/docs/cli/headless) and returns a bounded file replacement tied to an attempt, relative path and original content hash. It requires an exact client identity and dated controller-owned admission evidence. It applies no file changes and registers no route. Its scripted fixture covers malformed output, session binding, refusal before launch and process cleanup.
 
-The 16 October 2026 metadata check used client 1.4.0 and reported credit fallback disabled and request-review permissions. Account entitlement and subscription billing identity remain unverified. The adapter preserves the native authentication location, excludes ambient API and billing overrides, and uses the opt-in [native trust profile](adr/0009-native-client-trust-profile.md). It claims no tool absence. [Credit fallback settings](https://www.antigravity.google/docs/cli/credits/) are separate from subscription identity.
+The 16 October 2026 metadata check on the M2 Mac used client 1.4.0 and reported credit fallback disabled and request-review permissions. The M5 check of the same build required authentication. Account entitlement and subscription billing identity remain unverified. The adapter preserves the native authentication location, excludes ambient API and billing overrides, and uses the opt-in [native trust profile](adr/0009-native-client-trust-profile.md). It claims no tool absence. [Credit fallback settings](https://www.antigravity.google/docs/cli/credits/) are separate from subscription identity.
 
 The [official changelog](https://antigravity.google/docs/changelog?tab=cli) records permission fixes in 1.1.11 and headless mode fixes in 1.1.12. The former installed 1.1.10 build is refused. A version floor alone cannot qualify a later build. No Google inference task or six-check native pilot has completed.
 
-## OpenAI discovery preparation
+## OpenAI writer preparation
 
-The controller has a fixture-tested parser for the [Codex app-server](https://learn.chatgpt.com/docs/app-server) metadata transcript, pinned to [0.159.0 protocol fields](https://github.com/openai/codex/tree/687a119f0fcaace47e1f1abcc77cec6c813fd6da/codex-rs/app-server-protocol/src/protocol). It covers initialization, account metadata without a forced token refresh, rate-limit metadata and one bounded model catalog page. Replies must match the outstanding request. Missing or non-ChatGPT account metadata stops discovery before limits or models are requested. Native email, account IDs, credential fields and raw diagnostics are excluded from the projected output. Model and effort IDs remain bounded, untrusted provider text.
+The provider-local parser follows the [Codex app-server](https://learn.chatgpt.com/docs/app-server) metadata transcript and [0.159.0 protocol fields](https://github.com/openai/codex/tree/687a119f0fcaace47e1f1abcc77cec6c813fd6da/codex-rs/app-server-protocol/src/protocol). It covers initialization, account metadata without a forced token refresh, rate-limit metadata and one bounded model catalog page. Replies must match the outstanding request. Missing or non-ChatGPT account metadata stops discovery before limits or models are requested. Native email, account IDs, credential fields and raw diagnostics are excluded from the projected output. Model and effort IDs remain bounded, untrusted provider text. The process owner checks the executable digest and native configuration, then requires closed streams and absent process groups before returning a result.
 
-This module launches no process, performs no network or filesystem work and is not registered as a route. Completing its transcript establishes metadata only. It proves no authentication, billing, process completion or live-provider qualification.
+On 16 October 2026, client 0.163.0 on the M5 Mac completed that metadata transcript. It reported ChatGPT Pro, available ordinary usage and seven model entries. Both owned process groups closed and were absent. No thread, turn or inference task was submitted by that check.
 
-A live turn can include upstream retries and tool continuations. A turn cap does not establish an inference-request cap. [Included subscription usage can extend into available paid credits](https://learn.chatgpt.com/docs/pricing#credits-overview); an included-only hard limit remains unverified. CrewKite bounds submitted tasks and elapsed time. It cannot count every upstream inference request. Included-only billing remains unverified.
+The prepared writer requires Pro account metadata with ordinary usage available. It requests `gpt-6.1-sol` at low effort on the default service tier through one thread and one turn. The total deadline is at most 300 seconds, including metadata startup and owned cleanup. The proposal must bind the attempt, literal `net.mjs` path and original content hash to at most 64 KiB of UTF-8 text. A result requires a matching completed turn and quiescent processes. The writer applies no files and registers no route. Its native turn behavior remains unqualified.
+
+A live turn can include upstream retries and tool continuations. A turn cap does not establish an inference-request cap. [Included subscription usage can extend into available paid credits](https://learn.chatgpt.com/docs/pricing#credits-overview); an included-only hard limit remains unverified. Reported ordinary usage availability does not enforce that boundary. CrewKite bounds submitted tasks and elapsed time. It cannot count every upstream inference request.
+
+## Applying a replacement
+
+The source helper separately rechecks the full saved scratch manifest and the opened target before replacing one existing regular file. It refuses links, mismatched hashes and stale file metadata. It preserves permissions, truncates to the replacement length and syncs the file. Native provider output is not wired to this helper in the controller. A write failure can retain unverified scratch and requires explicit recovery.
 
 ## Qualification
 
