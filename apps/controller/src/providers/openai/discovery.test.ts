@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { DiscoveryError, OpenAiDiscovery } from './discovery.ts';
+import { DiscoveryError, OpenAiDiscovery, type RefusedEnvelope } from './discovery.ts';
 
 const privateText = 'private-token-email@example.test';
 const catalog = () => ({
@@ -54,6 +54,11 @@ type Scenario = {
   notices?: unknown[];
   fragmentedNotice?: boolean;
   pendingNotice?: boolean;
+  refusal?: {
+    kind: RefusedEnvelope['kind'];
+    fields?: Partial<RefusedEnvelope['fields']>;
+    extraParamsFields?: boolean;
+  };
   deadline?: boolean;
   timeoutMs?: number;
   incomplete?: boolean;
@@ -117,6 +122,35 @@ test('provider discovery emits only correlated metadata and excludes private fie
         line({ method: 'configWarning', params: { summary: privateText, details: null } }),
       reason: 'unexpected-message',
     },
+    ...[
+      {
+        params: { summary: privateText, details: null, path: null },
+        fields: { path: 'null' as const },
+        extraParamsFields: false,
+      },
+      {
+        params: { summary: privateText, details: null, range: null },
+        fields: { range: 'null' as const },
+        extraParamsFields: false,
+      },
+      {
+        params: { summary: privateText, details: 7 },
+        fields: { details: 'number' as const },
+        extraParamsFields: false,
+      },
+      {
+        params: { summary: privateText, 'private-field-name': privateText },
+        fields: { details: 'missing' as const },
+        extraParamsFields: true,
+      },
+    ].map(
+      ({ params, fields, extraParamsFields }): Scenario => ({
+        name: 'refused notice reveals only fixed field kinds',
+        notices: [{ method: 'configWarning', params }],
+        reason: 'invalid-message',
+        refusal: { kind: 'config-warning', fields, extraParamsFields },
+      }),
+    ),
     {
       name: 'startup notice count is bounded',
       notices: Array(33).fill({
@@ -464,6 +498,7 @@ test('provider discovery emits only correlated metadata and excludes private fie
       }
       const metadata = reader.finish();
       assert.equal(scenario.reason, undefined, scenario.name);
+      assert.equal(reader.refusedEnvelope, null, scenario.name);
       const serialized = JSON.stringify(metadata);
       assert(!serialized.includes(privateText), scenario.name);
       assert(!serialized.includes('qualified') && !serialized.includes('ready'), scenario.name);
@@ -479,6 +514,24 @@ test('provider discovery emits only correlated metadata and excludes private fie
       assert(error instanceof DiscoveryError, scenario.name);
       assert.equal(error.reason, scenario.reason, scenario.name);
       assert(!error.message.includes(privateText), scenario.name);
+      const diagnostic = reader.refusedEnvelope;
+      const safe = JSON.stringify(diagnostic);
+      for (const privateValue of [privateText, 'private-field-name', 'unknown/private-method'])
+        assert(!safe.includes(privateValue), scenario.name);
+      if (scenario.refusal) {
+        assert.equal(diagnostic?.kind, scenario.refusal.kind, scenario.name);
+        assert.equal(
+          diagnostic?.extraParamsFields,
+          scenario.refusal.extraParamsFields,
+          scenario.name,
+        );
+        for (const [field, kind] of Object.entries(scenario.refusal.fields ?? {}))
+          assert.equal(
+            diagnostic?.fields[field as keyof RefusedEnvelope['fields']],
+            kind,
+            scenario.name,
+          );
+      }
       assert.throws(
         () => reader.next(),
         (next) => next instanceof DiscoveryError && next.reason === error.reason,

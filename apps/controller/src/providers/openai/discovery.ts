@@ -135,6 +135,93 @@ export type DiscoveryEnvelope =
   | 'invalid'
   | null;
 
+type FieldKind = 'missing' | 'null' | 'object' | 'array' | 'string' | 'number' | 'boolean';
+export type RefusedEnvelope = {
+  kind:
+    | 'invalid-json'
+    | 'response'
+    | 'error'
+    | 'config-warning'
+    | 'account-updated'
+    | 'other-notification'
+    | 'other';
+  extraEnvelopeFields: boolean;
+  extraParamsFields: boolean | null;
+  fields: Record<
+    | 'id'
+    | 'result'
+    | 'error'
+    | 'params'
+    | 'summary'
+    | 'details'
+    | 'path'
+    | 'range'
+    | 'authMode'
+    | 'planType',
+    FieldKind
+  >;
+};
+const record = (value: unknown): Record<string, unknown> | null =>
+  value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+function fieldKind(value: Record<string, unknown> | null, key: string): FieldKind {
+  if (!value || !Object.hasOwn(value, key)) return 'missing';
+  const field = value[key];
+  if (field === null) return 'null';
+  if (Array.isArray(field)) return 'array';
+  if (typeof field === 'object') return 'object';
+  if (typeof field === 'string') return 'string';
+  if (typeof field === 'number') return 'number';
+  return 'boolean';
+}
+function refusedEnvelope(value: unknown, invalidJson = false): RefusedEnvelope {
+  const envelope = record(value);
+  const params = record(envelope?.params);
+  const method = envelope?.method;
+  const kind: RefusedEnvelope['kind'] = invalidJson
+    ? 'invalid-json'
+    : method === 'configWarning'
+      ? 'config-warning'
+      : method === 'account/updated'
+        ? 'account-updated'
+        : envelope && Object.hasOwn(envelope, 'method')
+          ? 'other-notification'
+          : envelope && Object.hasOwn(envelope, 'result')
+            ? 'response'
+            : envelope && Object.hasOwn(envelope, 'error')
+              ? 'error'
+              : 'other';
+  const envelopeKeys =
+    kind.endsWith('notification') || kind === 'config-warning' || kind === 'account-updated'
+      ? ['method', 'params']
+      : ['id', 'result', 'error'];
+  const paramsKeys =
+    kind === 'config-warning'
+      ? ['summary', 'details', 'path', 'range']
+      : kind === 'account-updated'
+        ? ['authMode', 'planType']
+        : [];
+  return {
+    kind,
+    extraEnvelopeFields:
+      !!envelope && Object.keys(envelope).some((key) => !envelopeKeys.includes(key)),
+    extraParamsFields: params ? Object.keys(params).some((key) => !paramsKeys.includes(key)) : null,
+    fields: {
+      id: fieldKind(envelope, 'id'),
+      result: fieldKind(envelope, 'result'),
+      error: fieldKind(envelope, 'error'),
+      params: fieldKind(envelope, 'params'),
+      summary: fieldKind(params, 'summary'),
+      details: fieldKind(params, 'details'),
+      path: fieldKind(params, 'path'),
+      range: fieldKind(params, 'range'),
+      authMode: fieldKind(params, 'authMode'),
+      planType: fieldKind(params, 'planType'),
+    },
+  };
+}
+
 // Project only the metadata this reader uses. Native identity and extra fields stay private.
 const platform = z
   .object({ userAgent: text(512), platformFamily: text(32), platformOs: text(32) })
@@ -315,6 +402,7 @@ export class OpenAiDiscovery {
   private pending: number[] = [];
   private frameRequest: number | null = null;
   private envelope: DiscoveryEnvelope = null;
+  private refused: RefusedEnvelope | null = null;
   private notificationCount = 0;
   private failed: Failure | null = null;
   private platform?: DiscoveryMetadata['platform'];
@@ -400,11 +488,13 @@ export class OpenAiDiscovery {
         this.pending.push(byte);
         continue;
       }
+      let diagnostic = refusedEnvelope(undefined, true);
       try {
         const line = new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array(this.pending));
         this.pending = [];
         this.envelope = 'invalid';
         const decoded: unknown = JSON.parse(line);
+        diagnostic = refusedEnvelope(decoded);
         if (decoded !== null && typeof decoded === 'object' && 'method' in decoded) {
           const value = notification.parse(decoded);
           if (this.step === 0) this.fail('unexpected-message');
@@ -457,6 +547,7 @@ export class OpenAiDiscovery {
         this.awaiting = false;
         this.step++;
       } catch (error) {
+        this.refused = diagnostic;
         if (error instanceof DiscoveryError) throw error;
         this.fail('invalid-message');
       }
@@ -492,6 +583,10 @@ export class OpenAiDiscovery {
 
   get lastEnvelope(): DiscoveryEnvelope {
     return this.envelope;
+  }
+
+  get refusedEnvelope(): RefusedEnvelope | null {
+    return this.refused;
   }
 
   get notifications(): number {

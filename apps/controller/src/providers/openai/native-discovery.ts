@@ -9,6 +9,7 @@ import {
   type DiscoveryMetadata,
   type DiscoveryRequest,
   OpenAiDiscovery,
+  type RefusedEnvelope,
 } from './discovery.ts';
 
 type Launch = {
@@ -26,6 +27,7 @@ type Outcome<T = DiscoveryMetadata> = {
   signal: NodeJS.Signals | null;
   lastRequest: DiscoveryRequest;
   lastEnvelope: DiscoveryEnvelope;
+  refusedEnvelope: RefusedEnvelope | null;
   notifications: number;
   stdoutBytes: number;
   stderrBytes: number;
@@ -37,6 +39,7 @@ type Transcript<T> = {
   readonly complete: boolean;
   readonly pendingRequest: DiscoveryRequest;
   readonly lastEnvelope: DiscoveryEnvelope;
+  readonly refusedEnvelope: RefusedEnvelope | null;
   readonly notifications: number;
 };
 type Spawn = (
@@ -208,6 +211,7 @@ function startTranscript<T>(
       signal: exitSignal,
       lastRequest: reader.pendingRequest,
       lastEnvelope: reader.lastEnvelope,
+      refusedEnvelope: reader.refusedEnvelope,
       notifications: reader.notifications,
       stdoutBytes,
       stderrBytes,
@@ -299,6 +303,7 @@ class FeatureList implements Transcript<DisabledFeatures> {
   readonly complete = false;
   readonly pendingRequest = 'features-list' as const;
   readonly lastEnvelope = null;
+  readonly refusedEnvelope = null;
   readonly notifications = 0;
   next() {
     return null;

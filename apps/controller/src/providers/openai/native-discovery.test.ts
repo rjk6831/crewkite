@@ -157,8 +157,12 @@ test('native discovery returns metadata only after its owned process and descend
       assert(Number.isSafeInteger(result.stderrBytes) && result.stderrBytes >= 0, mode);
       if (mode === 'feature-enabled' || mode === 'feature-missing')
         assert.equal(result.lastRequest, 'features-list', mode);
-      if (mode === 'invalid' || mode === 'stubborn')
+      if (mode === 'invalid' || mode === 'stubborn') {
         assert.equal(result.lastRequest, 'initialize', mode);
+        assert.equal(result.refusedEnvelope?.kind, 'other-notification', mode);
+        assert.equal(result.refusedEnvelope?.extraEnvelopeFields, true, mode);
+        assert(!JSON.stringify(result.refusedEnvelope).includes('auth/request'), mode);
+      }
       if (mode === 'policy-change')
         assert.equal(result.lastRequest, 'configRequirements/read', mode);
       for (const group of handle.groups) if (group > 0) assert(groupAbsent(group), mode);
@@ -172,6 +176,7 @@ test('native discovery returns metadata only after its owned process and descend
         assert.equal(result.reason, null, mode);
         assert.equal(result.notifications, mode === 'notifications' ? 2 : 0);
         assert.equal(result.lastEnvelope, 'response');
+        assert.equal(result.refusedEnvelope, null);
         assert.equal(result.metadata?.configuration?.model_provider, 'openai', mode);
       } else {
         assert.equal(result.metadata, null, mode);
