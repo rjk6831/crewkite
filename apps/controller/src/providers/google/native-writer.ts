@@ -72,8 +72,20 @@ const step = z.strictObject({
   step_update: z.strictObject({
     conversation_id: text(200),
     step_index: count,
-    state: z.enum(['ACTIVE', 'DONE']),
-    step_type: z.enum(['user_input', 'agent_response', 'tool', 'checkpoint']).optional(),
+    state: z.enum(['ACTIVE', 'DONE', 'ERROR']),
+    step_type: z
+      .enum([
+        'user_input',
+        'agent_response',
+        'tool',
+        'checkpoint',
+        'finish',
+        'unknown',
+        'subagent',
+        'system_message',
+        'error_message',
+      ])
+      .optional(),
     text_delta: z.string().max(65_536).optional(),
     duration_seconds: z.number().finite().nonnegative().optional(),
     usage: usage.optional(),

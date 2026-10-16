@@ -123,20 +123,31 @@ else {
     const decoderCases = [
       { name: 'fragmented valid stream', events: [start, end], ok: true },
       {
-        name: 'step category may be omitted across active and done updates',
+        name: 'step category may be omitted across producer state transitions',
         events: [
           start,
           step,
+          { ...step, step_update: { ...step.step_update, state: 'ERROR' } },
           { ...step, step_update: { ...step.step_update, state: 'DONE' } },
           end,
         ],
         ok: true,
       },
       {
-        name: 'documented step categories remain bounded metadata',
+        name: 'producer step categories remain bounded metadata',
         events: [
           start,
-          ...['user_input', 'agent_response', 'tool', 'checkpoint'].map((step_type) => ({
+          ...[
+            'user_input',
+            'agent_response',
+            'tool',
+            'checkpoint',
+            'finish',
+            'unknown',
+            'subagent',
+            'system_message',
+            'error_message',
+          ].map((step_type) => ({
             ...step,
             step_update: { ...step.step_update, step_type },
           })),
@@ -192,6 +203,10 @@ else {
         ],
       },
 
+      {
+        name: 'error step alone supplies no successful terminal result',
+        events: [start, { ...step, step_update: { ...step.step_update, state: 'ERROR' } }],
+      },
       { name: 'result before init', events: [end] },
       { name: 'duplicate init', events: [start, start, end] },
       {
