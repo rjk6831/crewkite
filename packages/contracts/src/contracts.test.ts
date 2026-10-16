@@ -386,6 +386,40 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     false,
   );
   const localAcceptance = CandidateEvaluationPreviewSchema.shape.localAcceptance;
+  const preview = {
+    taskId: nativeJob.taskId,
+    runId: nativeJob.runId,
+    candidateId: nativeJob.candidateId,
+    candidateHash: nativeJob.candidateHash,
+    preparationId: nativeJob.preparationId,
+    recipe: 'node-tests-v1',
+    testFiles: [],
+    definitionHash: 'b'.repeat(64),
+    target: { path: 'net.mjs', baseHash: 'a'.repeat(64), candidateContentHash: 'b'.repeat(64) },
+    reviewer: {
+      profileId: nativeJob.profileId,
+      assignedRole: 'reviewer',
+      methodId: 'keep-it-simple',
+      cycle: 1,
+      independence: 'process-only',
+    },
+    creditPolicy: 'ordinary',
+    expiresAt: '2026-10-16T00:00:00.000Z',
+    remainingBudgets: { attempts: 2, minutes: 5, concurrency: 1 },
+    allowance: { source: 'supplemental-evaluation', localChecks: 1, nativeReviews: 1 },
+    stage: 'prepared',
+    check: null,
+    review: null,
+    checkStart: { available: true, reason: 'available' },
+    reviewStart: { available: false, reason: 'checks-required' },
+    localAcceptance: { available: false, reason: 'evidence-incomplete' },
+  };
+  assert.deepEqual(CandidateEvaluationPreviewSchema.parse(preview), preview);
+  const { target: _previewTarget, ...previewFields } = preview;
+  const repositoryPreview = { ...previewFields, repository: repositoryRun.repository };
+  assert.deepEqual(CandidateEvaluationPreviewSchema.parse(repositoryPreview), repositoryPreview);
+  for (const invalid of [previewFields, { ...repositoryPreview, target: preview.target }])
+    assert.equal(CandidateEvaluationPreviewSchema.safeParse(invalid).success, false);
   assert.deepEqual(localAcceptance.parse(undefined), {
     available: false,
     reason: 'evidence-incomplete',

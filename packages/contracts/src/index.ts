@@ -831,11 +831,14 @@ export const CandidateEvaluationPreviewSchema = z
       .max(32)
       .default([]),
     definitionHash: HashSchema,
-    target: z.strictObject({
-      path: NativeTargetPathSchema,
-      baseHash: HashSchema,
-      candidateContentHash: HashSchema,
-    }),
+    target: z
+      .strictObject({
+        path: NativeTargetPathSchema,
+        baseHash: HashSchema,
+        candidateContentHash: HashSchema,
+      })
+      .optional(),
+    repository: NativeRepositoryScopeSchema.optional(),
     reviewer: z.strictObject({
       profileId: label,
       assignedRole: ReviewMethodSchema.shape.reviewerRole,
@@ -872,6 +875,8 @@ export const CandidateEvaluationPreviewSchema = z
     localAcceptance,
   })
   .superRefine((value, context) => {
+    if (!!value.target === !!value.repository)
+      context.addIssue({ code: 'custom', message: 'Evaluation needs one exact source scope.' });
     const paths = value.testFiles.map((file) => file.path);
     if (
       (value.recipe === 'project-node-tests-v1' && paths.length === 0) ||
