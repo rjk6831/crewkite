@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { hashCanonical, sealHandoff } from './hash.ts';
 import {
+  CandidateEvaluationPreviewSchema,
   CheckEventSchema,
   CheckResultSchema,
   CommandResultSchema,
@@ -199,6 +200,17 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     independence: 'process-only',
   };
   assert.ok(ReviewJobSchema.safeParse(nativeJob).success);
+  const localAcceptance = CandidateEvaluationPreviewSchema.shape.localAcceptance;
+  assert.deepEqual(localAcceptance.parse(undefined), {
+    available: false,
+    reason: 'evidence-incomplete',
+  });
+  for (const value of [
+    { available: true, reason: 'evidence-incomplete' },
+    { available: false, reason: 'available' },
+    { available: true, reason: 'automatic-grant' },
+  ])
+    assert.equal(localAcceptance.safeParse(value).success, false);
   for (const change of [
     { independence: 'model-diversity' },
     { writerAttemptId: undefined },

@@ -37,6 +37,7 @@ import {
   type NativePilotAppointment,
 } from '../commands/controller.ts';
 import { CandidateEvidence } from '../evidence/index.ts';
+import { refValue } from '../host/publication.ts';
 import { committedFiles, git, inspectSource, materialize, readFiles } from '../host/source.ts';
 import { groupAbsent } from '../host/worker.ts';
 import {
@@ -820,7 +821,288 @@ function binding(approval: Approval) {
 test('acceptance creates one checked branch and preserves the original source', async (t) => {
   for (const transfer of ['reserve', 'manual'] as const)
     await acceptsTransferredCandidate(t, transfer);
+  await acceptsNativeCandidate(t);
 });
+
+async function acceptsNativeCandidate(t: TestContext) {
+  const context = await nativeSetup(t, 'checked', {
+    identity: { name: 'Fixture owner', email: 'owner@example.invalid' },
+  });
+  let controller = context.controller;
+  const { command, task, source, clock, appointment } = context;
+  const original = inspectSource(task.projectId, source.directory);
+  const index = readFileSync(join(source.directory, '.git', 'index'));
+  const sentinels = source.sentinels.map((file) => ({
+    ...file,
+    bytes: readFileSync(join(source.directory, file.path)),
+    mode: lstatSync(join(source.directory, file.path)).mode & 0o777,
+  }));
+  const revision = () => controller.snapshot().tasks[0].revision;
+  const retained = nativeCandidate(controller);
+  const prepared = await controller.execute(
+    command(
+      'PrepareNativeRun',
+      {
+        taskId: task.id,
+        profileId: context.fixtureProfile.facts.id,
+        targetPath: 'net.mjs',
+        policy: appointment.policy,
+        consent: 'explicit',
+      },
+      revision(),
+    ),
+    'local-owner',
+  );
+  assert.equal(prepared.outcome, 'applied');
+  const run = RunSchema.parse(prepared.entity);
+  assert.equal(
+    (
+      await controller.execute(
+        command(
+          'StartRun',
+          {
+            taskId: task.id,
+            runId: run.id,
+          },
+          revision(),
+        ),
+        'local-owner',
+      )
+    ).outcome,
+    'applied',
+  );
+  await context.wait('native acceptance candidate', retained);
+  const candidate = controller.snapshot().candidates.at(-1);
+  assert(candidate);
+  const evaluation = await controller.execute(
+    command(
+      'PrepareCandidateEvaluation',
+      {
+        taskId: task.id,
+        candidateId: candidate.id,
+        checkRecipeId: 'node-tests-v1',
+        reviewer: {
+          profileId: context.fixtureProfile.facts.id,
+          methodId: 'keep-it-simple',
+          cycles: 1,
+        },
+        consent: 'explicit',
+        grants: [
+          { action: 'run-check', target: 'node --test' },
+          { action: 'run-review', target: 'keep-it-simple/cycle-1' },
+        ].map((grant) => ({
+          ...grant,
+          taskId: task.id,
+          revoked: false,
+          usesRemaining: 1,
+          expiresAt: new Date(Date.parse(clock.now()) + 86400000).toISOString(),
+        })),
+      },
+      revision(),
+    ),
+    'local-owner',
+  );
+  const preparation = ArtifactSchema.parse(evaluation.entity);
+  const evaluationPayload = {
+    taskId: task.id,
+    candidateId: candidate.id,
+    preparationId: preparation.id,
+  };
+  for (const action of ['StartCandidateEvaluation', 'StartCandidateReview']) {
+    const finished = Promise.withResolvers<void>();
+    const off = context.observe(controller, (event) => {
+      if (
+        event.type === 'task.updated' &&
+        ['stopped', 'ready', 'failed', 'unknown'].includes(event.payload.state)
+      )
+        finished.resolve();
+    });
+    assert.equal(
+      (await controller.execute(command(action, evaluationPayload, revision()), 'local-owner'))
+        .outcome,
+      'applied',
+    );
+    await context.wait(`native acceptance ${action}`, finished.promise);
+    off();
+  }
+  const checked = controller.snapshot();
+  assert.equal(checked.tasks[0].state, 'ready');
+  assert.equal(checked.candidateEvaluations[0]?.localAcceptance.available, true);
+  assert.equal(context.submissions(), 2);
+  const destinationRef = 'refs/heads/feat/native-checked';
+  const payload = { taskId: task.id, candidateId: candidate.id, destinationRef };
+  const evidence = checked.evidence.find((value) => value.review);
+  assert(evidence?.review && !evidence.review.job.scripted);
+  const job = evidence.review.job;
+  const quiescentAt = controller.store.nativeProcesses(job.attemptId)[2]?.quiescent_at;
+  assert(quiescentAt);
+  const check = checked.evidence.find((value) => !value.review);
+  assert(check);
+  const resultKey = `native-review-result:${job.attemptId}`;
+  const resultReceipt = controller.store.receipt(resultKey);
+  assert(resultReceipt);
+  const artifactFiles = new ArtifactFiles(join(controller.home, 'artifacts'));
+  const metadata = JSON.parse(
+    artifactFiles.read((resultReceipt.result.entity as Artifact).hash).toString('utf8'),
+  );
+  const changed = { ...metadata, review: { ...metadata.review, bindingHash: '0'.repeat(64) } };
+  const altered = {
+    ...artifactFiles.publish(Buffer.from(canonicalJson(changed))),
+    id: context.id('art'),
+    mediaType: 'application/vnd.crewkite.native+json',
+  };
+  const scratchTarget = join(controller.home, 'scratch', run.id, 'net.mjs');
+  const targetBytes = readFileSync(scratchTarget);
+  for (const boundary of ['candidate', 'check', 'job', 'result', 'phase']) {
+    controller.store.transaction(() => {
+      if (boundary === 'check')
+        controller.store.db
+          .prepare("UPDATE evidence SET body=? WHERE candidate_id=? AND kind='check'")
+          .run(canonicalJson({ ...check, definitionHash: '0'.repeat(64) }), candidate.id);
+      if (boundary === 'job')
+        controller.store.db
+          .prepare('UPDATE review_jobs SET body=? WHERE attempt_id=?')
+          .run(canonicalJson({ ...job, generation: job.generation + 1 }), job.attemptId);
+      if (boundary === 'result') {
+        controller.store.put('artifact', altered.id, 0, altered);
+        controller.store.db
+          .prepare('UPDATE receipts SET request_hash=?,result=? WHERE command_key=?')
+          .run(altered.hash, canonicalJson({ outcome: 'applied', entity: altered }), resultKey);
+      }
+      if (boundary === 'phase')
+        controller.store.db
+          .prepare(
+            "UPDATE native_processes SET state='owned',quiescent_at=NULL WHERE attempt_id=? AND sequence=2",
+          )
+          .run(job.attemptId);
+    });
+    if (boundary === 'candidate') appendFileSync(scratchTarget, '\n');
+    assert.equal(
+      controller.snapshot().candidateEvaluations[0]?.localAcceptance.available,
+      false,
+      boundary,
+    );
+    assert.equal(
+      (await controller.execute(command('AcceptCandidate', payload, revision()), 'local-owner'))
+        .outcome,
+      'blocked',
+      boundary,
+    );
+    assert.equal(controller.snapshot().approvals.length, 0);
+    writeFileSync(scratchTarget, targetBytes);
+    controller.store.transaction(() => {
+      if (boundary === 'check')
+        controller.store.db
+          .prepare("UPDATE evidence SET body=? WHERE candidate_id=? AND kind='check'")
+          .run(canonicalJson(check), candidate.id);
+      if (boundary === 'job')
+        controller.store.db
+          .prepare('UPDATE review_jobs SET body=? WHERE attempt_id=?')
+          .run(canonicalJson(job), job.attemptId);
+      if (boundary === 'result')
+        controller.store.db
+          .prepare('UPDATE receipts SET request_hash=?,result=? WHERE command_key=?')
+          .run(resultReceipt.hash, canonicalJson(resultReceipt.result), resultKey);
+      if (boundary === 'phase')
+        controller.store.db
+          .prepare(
+            "UPDATE native_processes SET state='quiescent',quiescent_at=? WHERE attempt_id=? AND sequence=2",
+          )
+          .run(quiescentAt, job.attemptId);
+    });
+  }
+  clock.advance(86400001);
+  context.fixtureProfile.facts.available = false;
+  context.fixtureProfile.facts.reason = 'client-unavailable';
+  assert.equal(controller.snapshot().candidateEvaluations[0]?.localAcceptance.available, true);
+  const ask = command('AcceptCandidate', payload, revision());
+  const asked = await controller.execute(ask, 'local-owner');
+  const approval = controller.snapshot().approvals.find((value) => value.status === 'pending');
+  assert(approval);
+  assert.equal(approval.action, 'accept-candidate');
+  assert.equal(approval.target, destinationRef);
+  assert.equal(approval.attemptId, checked.attempts[0].id);
+  assert.equal(
+    controller.snapshot().candidateEvaluations[0]?.localAcceptance.reason,
+    'approval-pending',
+  );
+  const sourceTarget = join(source.directory, 'net.mjs');
+  const sourceBytes = readFileSync(sourceTarget);
+  appendFileSync(sourceTarget, '\n');
+  assert.equal(
+    (
+      await controller.execute(
+        command(
+          'ResolveApproval',
+          { binding: binding(approval), decision: 'approved' },
+          asked.revision,
+        ),
+        'local-owner',
+      )
+    ).outcome,
+    'blocked',
+  );
+  assert.equal(
+    controller.snapshot().approvals.find((value) => value.approvalId === approval.approvalId)
+      ?.status,
+    'pending',
+  );
+  writeFileSync(sourceTarget, sourceBytes);
+  const accept = command(
+    'ResolveApproval',
+    { binding: binding(approval), decision: 'approved' },
+    revision(),
+  );
+  assert.equal((await controller.execute(accept, 'local-owner')).outcome, 'applied');
+  assert.equal((await controller.execute(accept, 'local-owner')).outcome, 'already-applied');
+  assert.equal(controller.snapshot().tasks[0].state, 'accepted');
+  const commit = git(source.directory, ['rev-parse', destinationRef]).toString().trim();
+  assert.equal(
+    git(source.directory, ['rev-parse', `${commit}^`])
+      .toString()
+      .trim(),
+    run.source.base,
+  );
+  assert.deepEqual(git(source.directory, ['show', `${destinationRef}:net.mjs`]), targetBytes);
+  assert.equal(
+    controller.store.db.prepare('SELECT COUNT(*) AS count FROM publications').get()?.count,
+    1,
+  );
+  for (const boundary of ['changed-source', 'missing-ref', 'conflict', 'existing-ref']) {
+    if (
+      (boundary === 'changed-source' || boundary === 'missing-ref') &&
+      refValue(source.directory, destinationRef) !== null
+    )
+      git(source.directory, ['update-ref', '-d', destinationRef, commit]);
+    if (boundary === 'changed-source' || boundary === 'existing-ref')
+      appendFileSync(sourceTarget, '\n');
+    if (boundary === 'conflict')
+      git(source.directory, ['update-ref', destinationRef, run.source.base, commit]);
+    controller.store.transaction(() =>
+      controller.store.db
+        .prepare("UPDATE publications SET state='prepared' WHERE candidate_id=?")
+        .run(candidate.id),
+    );
+    controller = await context.restart();
+    const observed = refValue(source.directory, destinationRef);
+    if (boundary === 'changed-source') {
+      assert.equal(observed, null);
+      writeFileSync(sourceTarget, sourceBytes);
+    } else if (boundary === 'conflict') {
+      assert.equal(observed, run.source.base);
+      git(source.directory, ['update-ref', destinationRef, commit, run.source.base]);
+    } else assert.equal(observed, commit);
+    if (boundary === 'existing-ref') writeFileSync(sourceTarget, sourceBytes);
+    assert.equal(context.submissions(), 2);
+    assert.equal(controller.snapshot().attempts.length, 3);
+  }
+  assert.deepEqual(inspectSource(task.projectId, source.directory), original);
+  assert.deepEqual(readFileSync(join(source.directory, '.git', 'index')), index);
+  for (const file of sentinels) {
+    assert.deepEqual(readFileSync(join(source.directory, file.path)), file.bytes);
+    assert.equal(lstatSync(join(source.directory, file.path)).mode & 0o777, file.mode);
+  }
+}
 
 async function acceptsTransferredCandidate(t: TestContext, transfer: 'reserve' | 'manual') {
   const identity = { name: 'Fixture owner', email: 'owner@example.invalid' };
@@ -2664,7 +2946,7 @@ test('an appointed native proposal is retained and applied once after every phas
             .then((result) => assert.equal(result.outcome, 'already-applied'));
         if (
           event.type === 'task.updated' &&
-          ['stopped', 'failed', 'unknown'].includes(event.payload.state)
+          ['stopped', 'ready', 'failed', 'unknown'].includes(event.payload.state)
         )
           reviewed.resolve();
       });
@@ -2761,7 +3043,7 @@ test('an appointed native proposal is retained and applied once after every phas
               groupAbsent(phase.process_group),
           ),
       );
-      assert.notEqual(result.tasks[0].state, 'ready');
+      assert.equal(result.tasks[0].state === 'ready', scenario === 'checked');
       const retainedPreview = result.candidateEvaluations[0];
       assert(retainedPreview);
       assert.equal(
@@ -2830,7 +3112,7 @@ test('an appointed native proposal is retained and applied once after every phas
           'local-owner',
         )
       ).reason,
-      'native-pilot-retain-only',
+      scenario === 'checked' ? 'git-identity-missing' : 'native-pilot-retain-only',
     );
     controller = await context.restart();
     const intents = controller.store.intents().length;

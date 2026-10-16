@@ -523,10 +523,7 @@ export class Controller {
   }
 
   private apply(command: Command, effects: (() => void)[]): CommandResult {
-    if (
-      'taskId' in command.payload &&
-      ['ResumeRun', 'SwitchRoute', 'AcceptCandidate'].includes(command.command)
-    ) {
+    if ('taskId' in command.payload && ['ResumeRun', 'SwitchRoute'].includes(command.command)) {
       const task = this.store.get<Task>('task', command.payload.taskId);
       if (task?.runId && this.store.receipt(`native-run:${task.runId}`))
         return { outcome: 'blocked', reason: 'native-pilot-retain-only' };
@@ -1827,6 +1824,7 @@ export class Controller {
               : null,
             checkStart: this.evaluationStartAvailability(artifact, plan, false, checked),
             reviewStart: this.evaluationStartAvailability(artifact, plan, true, checked),
+            localAcceptance: this.nativeAcceptanceAvailability(plan.run, plan.candidate),
           }),
         ];
       } catch {
@@ -2015,6 +2013,313 @@ export class Controller {
     if (hashCanonical(definition) !== hashCanonical(plan.definition))
       throw Error('preparation-changed');
     return { ...origin, plan, definition, environment: { ...this.profile.environment } };
+  }
+
+  private nativeRecord(
+    key: string,
+    maximum = MAX_FRAME_BYTES,
+    outcome: CommandResult['outcome'] = 'applied',
+  ) {
+    const receipt = this.store.receipt(key);
+    if (receipt?.result.outcome !== outcome) throw Error('evidence-incomplete');
+    const artifact = ArtifactSchema.parse(receipt.result.entity);
+    if (
+      artifact.bytes > maximum ||
+      hashCanonical(this.store.get<Artifact>('artifact', artifact.id)) !== hashCanonical(artifact)
+    )
+      throw Error('evidence-incomplete');
+    const content = this.artifacts.read(artifact.hash);
+    if (content.length !== artifact.bytes) throw Error('evidence-incomplete');
+    return { artifact, value: JSON.parse(content.toString('utf8')) as unknown };
+  }
+
+  private nativePublicationEvidence(run: Run, candidate: Candidate) {
+    const same = (left: unknown, right: unknown) => hashCanonical(left) === hashCanonical(right);
+    const origin = this.nativeRecord(`native-run:${run.id}`);
+    const native = NativePreparationSchema.extend({
+      public: NativePublicScopeSchema.optional(),
+    }).parse(origin.value);
+    const prepared = ArtifactSchema.parse(
+      this.store.receipt(`evaluation-started:${run.id}`)?.result.entity,
+    );
+    const evaluation = this.evaluationPlan(prepared);
+    const record = this.nativeRecord(`native-review-started:${run.id}`);
+    const saved = z
+      .strictObject({
+        preparation: ArtifactSchema,
+        job: NativeReviewJobSchema,
+        input: z.unknown(),
+        check: ArtifactSchema,
+        identity: z.strictObject({
+          evaluator: z.string().min(1).max(200),
+          definitionHash: HashSchema,
+        }),
+        allowance: z.strictObject({
+          source: z.literal('supplemental-evaluation'),
+          maximumSubmissions: z.literal(1),
+          grantHash: HashSchema,
+          maximumTaskMs: z.number().int().min(60000).max(300000),
+          originalPolicyHash: HashSchema,
+        }),
+      })
+      .parse(record.value);
+    const { job } = saved;
+    const input = reviewPlan(saved.input as Parameters<typeof reviewPlan>[0]);
+    const writer = this.store.get<Attempt>('attempt', native.attempt.id);
+    const attempt = this.store.get<Attempt>('attempt', job.attemptId);
+    const storedJob = this.store.db
+      .prepare('SELECT body FROM review_jobs WHERE attempt_id=?')
+      .get(job.attemptId);
+    const grant = evaluation.grants.find((value) => value.action === 'run-review');
+    const methods = run.policy.policy.methods ?? [];
+    const files = this.evidence.read(candidate).files;
+    const file = files.find((value) => value.path === input.path);
+    const submission = z
+      .strictObject({ attemptId: z.string(), preparationHash: HashSchema, bindingHash: HashSchema })
+      .parse(
+        this.nativeRecord(`native-review-submission:${job.attemptId}`, 4096, 'outcome-unknown')
+          .value,
+      );
+    const submittedWriter = z
+      .strictObject({ attemptId: z.string(), plan: HashSchema })
+      .parse(
+        this.nativeRecord(`native-submission:${native.attempt.id}`, 4096, 'outcome-unknown').value,
+      );
+    const original = committedFiles(
+      this.projectPath(run.source.projectId) as string,
+      run.source.base,
+    ).find((value) => value.path === input.path);
+    if (
+      !writer ||
+      !attempt ||
+      !storedJob ||
+      !grant ||
+      !file ||
+      !original ||
+      !this.attestedReviewWriter(run, candidate, writer) ||
+      !same(evaluation.run, run) ||
+      !same(evaluation.writer, writer) ||
+      !same(evaluation.candidate, candidate) ||
+      native.run.id !== run.id ||
+      !same(native.run.policy, run.policy) ||
+      !same(native.run.source, run.source) ||
+      !same(native.run.roles, run.roles) ||
+      this.store.receipt(`native-run:${run.id}`)?.hash !== hashCanonical(native.appointment) ||
+      this.store.receipt(`native-application:${writer.id}`)?.result.outcome !== 'applied' ||
+      native.appointment.consent.criteriaHash !== hashCanonical(evaluation.context.criteria) ||
+      (native.public &&
+        !same(native.public.context, {
+          title: evaluation.context.title,
+          outcome: evaluation.context.outcome,
+        })) ||
+      !same(saved.preparation, prepared) ||
+      this.store.receipt(`native-review-started:${run.id}`)?.hash !== prepared.hash ||
+      this.store.receipt(`native-review-input:${job.attemptId}`)?.hash !== record.artifact.hash ||
+      this.store.receipt(`native-review-input:${job.attemptId}`)?.result.outcome !== 'applied' ||
+      submittedWriter.attemptId !== writer.id ||
+      submittedWriter.plan !== origin.artifact.hash ||
+      submission.attemptId !== job.attemptId ||
+      submission.preparationHash !== prepared.hash ||
+      submission.bindingHash !== hashCanonical(input.binding) ||
+      this.store.receipt(`native-review-submission:${job.attemptId}`)?.hash !== prepared.hash ||
+      this.store.receipt(`evaluation-result:${prepared.id}`)?.hash !== prepared.hash ||
+      !same(this.store.receipt(`evaluation-result:${prepared.id}`)?.result.entity, saved.check) ||
+      !same(JSON.parse(storedJob.body as string), job) ||
+      job.taskId !== run.taskId ||
+      job.runId !== run.id ||
+      job.writerAttemptId !== writer.id ||
+      job.writerRouteId !== writer.routeId ||
+      job.candidateId !== candidate.id ||
+      job.candidateHash !== candidate.hash ||
+      job.preparationId !== prepared.id ||
+      job.profileId !== evaluation.reviewer.profileId ||
+      job.assignedRole !== evaluation.reviewer.role ||
+      attempt.runId !== run.id ||
+      attempt.routeId !== job.routeId ||
+      attempt.generation !== job.generation ||
+      attempt.state !== 'stopped' ||
+      methods.length !== 1 ||
+      methods[0].id !== job.methodId ||
+      methods[0].cycles !== job.cycle ||
+      methods[0].reviewerRole !== job.assignedRole ||
+      !requiredReviewMethodIds(run.policy.policy.quality).every((id) => id === job.methodId) ||
+      evaluation.reviewer.methodId !== job.methodId ||
+      evaluation.reviewer.cycles !== job.cycle ||
+      !same(input.binding, { ...job, scopeHash: evaluation.scopeHash }) ||
+      !same(input.context, evaluation.context) ||
+      input.creditPolicy !== evaluation.creditPolicy ||
+      input.path !== native.appointment.target.path ||
+      input.baseHash !== native.originalHash ||
+      original.hash !== input.baseHash ||
+      file.hash !== input.candidateContentHash ||
+      file.mode !== original.mode ||
+      !same(
+        files
+          .filter((value) => value.path !== input.path)
+          .map(({ content: _content, ...entry }) => entry),
+        native.manifest.filter((value) => value.path !== input.path),
+      ) ||
+      input.model !== evaluation.reviewer.profile.model ||
+      input.effort !== evaluation.reviewer.profile.effort ||
+      saved.allowance.originalPolicyHash !== run.policy.hash ||
+      saved.allowance.maximumTaskMs !== job.limitMinutes * 60000 ||
+      saved.allowance.grantHash !== hashCanonical(grant) ||
+      this.store.receipt(this.grantKey(grant))?.hash !== saved.allowance.grantHash ||
+      !this.checks(candidate).some(
+        (check) =>
+          check.artifactId === saved.check.id &&
+          this.checkMatches(check, candidate, evaluation.definition),
+      )
+    )
+      throw Error('evidence-incomplete');
+    for (const [owned, key] of [
+      [writer, `native-completion:${writer.id}`],
+      [attempt, `native-review-completion:${attempt.id}`],
+    ] as const) {
+      const completed = z
+        .object({ attemptId: z.string(), reason: z.null(), quiescent: z.literal(true) })
+        .parse(this.nativeRecord(key, 4096).value);
+      const intent = this.store.intents().find((value) => value.attempt_id === owned.id);
+      const phases = this.store.nativeProcesses(owned.id);
+      if (
+        completed.attemptId !== owned.id ||
+        intent?.state !== 'stopped' ||
+        phases.length !== 3 ||
+        phases.some((phase) => phase.state !== 'quiescent')
+      )
+        throw Error('evidence-incomplete');
+    }
+    const identity = this.nativeReviewIdentity(evaluation, job, saved.check);
+    if (!same(saved.identity, identity)) throw Error('evidence-incomplete');
+    const review = this.store.db
+      .prepare(
+        "SELECT body FROM evidence WHERE candidate_id=? AND candidate_hash=? AND kind='review'",
+      )
+      .all(candidate.id, candidate.hash)
+      .map((row) => CheckResultSchema.parse(JSON.parse(row.body as string)))
+      .find(
+        (check) =>
+          check.passed &&
+          check.review &&
+          same(check.review.job, job) &&
+          check.evaluator === identity.evaluator &&
+          check.definitionHash === identity.definitionHash,
+      );
+    if (review?.review?.outcome !== 'passed') throw Error('evidence-incomplete');
+    const result = this.store.get<Artifact>('artifact', review.artifactId);
+    const metadata = z
+      .object({
+        review: z.unknown(),
+        model: z.string(),
+        requestedEffort: z.string(),
+        qualified: z.literal(false),
+        threadId: z.string().min(1),
+        turnId: z.string().min(1),
+        observedRetries: z.number().int().nonnegative(),
+      })
+      .parse(this.nativeRecord(`native-review-result:${attempt.id}`).value);
+    if (
+      !result ||
+      result.bytes > MAX_FRAME_BYTES ||
+      !same(JSON.parse(this.artifacts.read(result.hash).toString('utf8')), review.review) ||
+      metadata.model !== input.model ||
+      metadata.requestedEffort !== input.effort ||
+      !same(metadata.review, {
+        version: 1,
+        bindingHash: hashCanonical(input.binding),
+        methodId: job.methodId,
+        cycle: job.cycle,
+        outcome: review.review.outcome,
+        findings: review.review.findings,
+        summary: review.review.summary,
+      })
+    )
+      throw Error('evidence-incomplete');
+    return { evaluation, writer, review, prepared };
+  }
+
+  private nativeAcceptanceAvailability(
+    run: Run,
+    candidate: Candidate,
+  ): CandidateEvaluationPreview['localAcceptance'] {
+    const refused = (reason: CandidateEvaluationPreview['localAcceptance']['reason']) => ({
+      available: false,
+      reason,
+    });
+    const task = this.store.get<Task>('task', run.taskId);
+    if (this.hasUncertainWriter(run.taskId) || task?.state === 'unknown')
+      return refused('ownership-unknown');
+    const publication = this.store.db
+      .prepare('SELECT state FROM publications WHERE candidate_id=?')
+      .get(candidate.id);
+    if (task?.state === 'accepted' || publication?.state === 'applied') return refused('accepted');
+    if (publication) return refused('publication-prepared');
+    if (
+      this.store.db
+        .prepare("SELECT approval_id FROM pending_effects WHERE task_id=? AND state='pending'")
+        .get(run.taskId)
+    )
+      return refused('approval-pending');
+    if (!task || task.runId !== run.id || this.latestCandidate(run.id)?.id !== candidate.id)
+      return refused('candidate-changed');
+    try {
+      if (
+        hashCanonical(inspectSource(task.projectId, this.projectPath(task.projectId) as string)) !==
+        hashCanonical(run.source)
+      )
+        return refused('source-changed');
+      if (
+        this.evidence.hash(run.source.base, readFiles(join(this.home, 'scratch', run.id))) !==
+        candidate.hash
+      )
+        return refused('candidate-changed');
+      this.nativePublicationCurrent(run, candidate);
+      const identity =
+        typeof this.options.identity === 'function'
+          ? this.options.identity()
+          : this.options.identity;
+      if (!identity) return refused('git-identity-missing');
+      try {
+        validateIdentity(identity);
+      } catch {
+        return refused('git-identity-missing');
+      }
+      return { available: true, reason: 'available' };
+    } catch (error) {
+      const result = CandidateEvaluationPreviewSchema.shape.localAcceptance.safeParse({
+        available: false,
+        reason: error instanceof Error ? error.message : undefined,
+      });
+      return result.success ? result.data : refused('evidence-incomplete');
+    }
+  }
+
+  private nativePublicationCurrent(
+    run: Run,
+    candidate: Candidate,
+    proof = this.nativePublicationEvidence(run, candidate),
+  ) {
+    const origin = this.evaluationOrigin(run.taskId, candidate.id);
+    if (
+      !['checking', 'stopped', 'ready', 'waiting', 'accepted'].includes(origin.task.state) ||
+      hashCanonical({
+        title: origin.task.title,
+        outcome: origin.task.outcome,
+        criteria: origin.task.criteria,
+      }) !== hashCanonical(proof.evaluation.context)
+    )
+      throw Error('candidate-changed');
+    const definition = this.evidence.describeChecks({
+      candidate,
+      sourceFiles: committedFiles(
+        this.projectPath(run.source.projectId) as string,
+        run.source.base,
+      ),
+      criteria: proof.evaluation.context.criteria,
+    });
+    if (hashCanonical(definition) !== hashCanonical(proof.evaluation.definition))
+      throw Error('evidence-incomplete');
+    return proof;
   }
 
   private candidateReviewAuthority(artifact: Artifact, ownedAttemptId?: string) {
@@ -2436,13 +2741,29 @@ export class Controller {
         if (this.settleJob(attempt, quiescent, true))
           this.store.transaction(() => {
             const task = this.store.get<Task>('task', job.taskId) as Task;
+            let ready = false;
+            if (!runtime.stopped && !this.closed && review?.outcome === 'passed') {
+              try {
+                this.nativePublicationCurrent(
+                  this.store.get<Run>('run', job.runId) as Run,
+                  this.store.get<Candidate>('candidate', job.candidateId) as Candidate,
+                );
+                ready = true;
+              } catch {}
+            }
             this.updateTask(task, {
-              state: runtime.stopped || review?.outcome === 'passed' ? 'stopped' : 'failed',
+              state: ready
+                ? 'ready'
+                : runtime.stopped || review?.outcome === 'passed'
+                  ? 'stopped'
+                  : 'failed',
               waitingReason: null,
               next: runtime.stopped
                 ? 'Native review stopped. Inspect retained evidence.'
                 : review?.outcome === 'passed'
-                  ? 'Native review passed with process independence only. Acceptance remains unavailable.'
+                  ? ready
+                    ? 'Checks and native review passed. Request local branch acceptance or export the patch.'
+                    : 'Native review passed. Current publication evidence is unavailable.'
                   : 'Native review failed or is unverified. Inspect retained evidence.',
             });
           });
@@ -3742,6 +4063,7 @@ export class Controller {
       task.runId &&
       this.store.receipt(`native-run:${task.runId}`) &&
       request.kind !== 'export' &&
+      request.kind !== 'accept' &&
       command.payload.decision !== 'denied'
     )
       return { outcome: 'blocked', reason: 'native-pilot-retain-only' };
@@ -3766,6 +4088,37 @@ export class Controller {
           reason: 'candidate-binding-changed',
           next: 'Refresh the candidate and request a new exact action.',
         };
+    }
+    if (
+      request.kind === 'accept' &&
+      command.payload.decision === 'approved' &&
+      task.runId &&
+      this.store.receipt(`native-run:${task.runId}`)
+    ) {
+      const run = this.store.get<Run>('run', task.runId) as Run;
+      let native: ReturnType<Controller['nativePublicationEvidence']>;
+      try {
+        native = this.nativePublicationEvidence(run, this.latestCandidate(run.id) as Candidate);
+      } catch {
+        return { outcome: 'blocked', reason: 'native-pilot-retain-only' };
+      }
+      if (
+        request.command?.command !== 'AcceptCandidate' ||
+        request.command.payload.taskId !== task.id ||
+        request.command.payload.candidateId !== request.candidateId ||
+        approval.action !== 'accept-candidate' ||
+        approval.target !== request.command.payload.destinationRef
+      )
+        return { outcome: 'blocked', reason: 'pending-lineage-changed' };
+      try {
+        this.nativePublicationCurrent(
+          run,
+          this.store.get<Candidate>('candidate', request.command.payload.candidateId) as Candidate,
+          native,
+        );
+      } catch {
+        return { outcome: 'blocked', reason: 'native-evidence-not-current' };
+      }
     }
     const updated = {
       ...approval,
@@ -5301,9 +5654,15 @@ export class Controller {
       'candidate',
       command.payload.candidateId,
     ) as Candidate;
-    if (this.store.receipt(`native-run:${run.id}`))
-      return { outcome: 'blocked', reason: 'native-pilot-retain-only' };
-    if (!['ready', 'accepted', 'waiting'].includes(task.state))
+    let native: ReturnType<Controller['nativePublicationEvidence']> | undefined;
+    if (this.store.receipt(`native-run:${run.id}`)) {
+      try {
+        native = this.nativePublicationEvidence(run, candidate);
+      } catch {
+        return { outcome: 'blocked', reason: 'native-pilot-retain-only' };
+      }
+    }
+    if (!['ready', 'accepted', 'waiting', ...(native ? ['stopped'] : [])].includes(task.state))
       return { outcome: 'blocked', reason: 'candidate-not-ready' };
     if (
       this.hasUncertainWriter(task.id) ||
@@ -5336,23 +5695,31 @@ export class Controller {
         reason: 'destination-ref-exists',
         next: 'Choose an unused local branch name.',
       };
-    const plan = this.evidence.prepareChecks({
-      candidate,
-      sourceFiles: committedFiles(path, run.source.base),
-      criteria: task.criteria,
-    });
-    if (!this.checks(candidate).some((check) => this.checkMatches(check, candidate, plan)))
-      return { outcome: 'blocked', reason: 'checks-not-current' };
-    const reviews = this.store.db
-      .prepare(
-        "SELECT body FROM evidence WHERE candidate_id=? AND candidate_hash=? AND kind='review'",
-      )
-      .all(candidate.id, candidate.hash)
-      .map((row) => CheckResultSchema.parse(JSON.parse(row.body as string)));
-    for (const method of run.policy.policy.methods ?? [])
-      for (let cycle = 1; cycle <= method.cycles; cycle++)
-        if (!reviews.some((check) => this.reviewMatches(check, run, method, cycle, candidate)))
-          return { outcome: 'blocked', reason: 'selected-review-not-complete' };
+    if (native) {
+      try {
+        this.nativePublicationCurrent(run, candidate, native);
+      } catch {
+        return { outcome: 'blocked', reason: 'native-evidence-not-current' };
+      }
+    } else {
+      const plan = this.evidence.prepareChecks({
+        candidate,
+        sourceFiles: committedFiles(path, run.source.base),
+        criteria: task.criteria,
+      });
+      if (!this.checks(candidate).some((check) => this.checkMatches(check, candidate, plan)))
+        return { outcome: 'blocked', reason: 'checks-not-current' };
+      const reviews = this.store.db
+        .prepare(
+          "SELECT body FROM evidence WHERE candidate_id=? AND candidate_hash=? AND kind='review'",
+        )
+        .all(candidate.id, candidate.hash)
+        .map((row) => CheckResultSchema.parse(JSON.parse(row.body as string)));
+      for (const method of run.policy.policy.methods ?? [])
+        for (let cycle = 1; cycle <= method.cycles; cycle++)
+          if (!reviews.some((check) => this.reviewMatches(check, run, method, cycle, candidate)))
+            return { outcome: 'blocked', reason: 'selected-review-not-complete' };
+    }
     const identity =
       frozenIdentity ??
       (typeof this.options.identity === 'function'
@@ -5367,19 +5734,22 @@ export class Controller {
     validateIdentity(identity);
     const at = frozenAt ?? this.now();
     const grant = this.grant(run, 'accept-candidate', command.payload.destinationRef);
-    const writer = this.store
+    const writerIntent = this.store
       .intents()
       .filter(
         (intent) =>
           intent.run_id === run.id && intent.scratch_path === join(this.home, 'scratch', run.id),
       )
       .at(-1);
+    const writer =
+      native?.writer ??
+      (writerIntent ? this.store.get<Attempt>('attempt', writerIntent.attempt_id) : undefined);
     if (!writer) return { outcome: 'blocked', reason: 'candidate-origin-missing' };
     if (!grant && !approved)
       return this.requestAction(
         task,
         run,
-        this.store.get<Attempt>('attempt', writer.attempt_id) as Attempt,
+        writer,
         'accept-candidate',
         command.payload.destinationRef,
         {
@@ -5464,8 +5834,10 @@ export class Controller {
       const origin = this.store.receipt(`publication-run:${candidateId}`)?.result.entity as
         | Run
         | undefined;
-      if (origin && this.store.receipt(`native-run:${origin.id}`))
-        throw new Error('The native pilot permits retention and export only.');
+      const native =
+        origin && this.store.receipt(`native-run:${origin.id}`)
+          ? this.nativePublicationEvidence(origin, candidate)
+          : undefined;
       const source = this.projectPath(task.projectId) as string;
       const observed = refValue(source, publication.destination_ref as string);
       if (observed !== publication.commit_oid) {
@@ -5484,6 +5856,7 @@ export class Controller {
           hashCanonical(inspectSource(task.projectId, source)) !== hashCanonical(origin.source)
         )
           throw new Error('Prepared publication authority is no longer current.');
+        if (native) this.nativePublicationCurrent(currentRun, candidate, native);
       }
       applyPublication({
         source: this.projectPath(task.projectId) as string,
