@@ -54,6 +54,8 @@ import {
 } from '../providers/openai/profile.ts';
 import { fixture, fixtureContent, fixtureModel } from '../providers/openai/replacement-fixture.ts';
 
+const fixtureClientHash = createHash('sha256').update(readFileSync(process.execPath)).digest('hex');
+
 async function setup(
   t: TestContext,
   options: Partial<ControllerOptions> = {},
@@ -2093,7 +2095,7 @@ async function nativeSetup(
     },
     client: {
       executable: process.execPath,
-      sha256: createHash('sha256').update(readFileSync(process.execPath)).digest('hex'),
+      sha256: fixtureClientHash,
       version: process.version,
     },
     environment: { ...process.env },
@@ -2128,7 +2130,7 @@ async function nativeSetup(
           ...reviewerProfile,
           client: {
             executable: process.execPath,
-            sha256: createHash('sha256').update(readFileSync(process.execPath)).digest('hex'),
+            sha256: fixtureClientHash,
             version: '1.4.0',
           },
           facts: GoogleNativeProfileSchema.parse({
@@ -2418,7 +2420,7 @@ async function nativeSetup(
     },
     client: {
       executable: process.execPath,
-      sha256: createHash('sha256').update(readFileSync(process.execPath)).digest('hex'),
+      sha256: fixtureClientHash,
       version: process.version,
     },
     creditPolicy: 'ordinary',
@@ -2630,6 +2632,7 @@ test('an appointed native proposal is retained and applied once after every phas
     let controller = initialController;
     appointment.id += `-${consent}`;
     appointment.consent.source = consent;
+    const committedTargets = committedFiles(source.directory, appointment.consent.sourceBase);
     for (const change of [
       { maximumSubmissions: 2 },
       { target: { ...appointment.target, baseHash: '0'.repeat(64) } },
@@ -2643,9 +2646,8 @@ test('an appointed native proposal is retained and applied once after every phas
         target: {
           path,
           baseHash:
-            committedFiles(source.directory, appointment.consent.sourceBase).find(
-              (file) => file.path === path,
-            )?.hash ?? appointment.target.baseHash,
+            committedTargets.find((file) => file.path === path)?.hash ??
+            appointment.target.baseHash,
         },
       })),
       { consent: { ...appointment.consent, nativeTrust: 'denied' } },
