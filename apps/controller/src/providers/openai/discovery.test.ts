@@ -51,6 +51,7 @@ type Scenario = {
   whole?: boolean;
   afterResponse?: boolean;
   deadline?: boolean;
+  timeoutMs?: number;
   incomplete?: boolean;
   reason?: DiscoveryError['reason'];
   check?: (value: ReturnType<OpenAiDiscovery['finish']>) => void;
@@ -61,6 +62,7 @@ type Scenario = {
 test('provider discovery emits only correlated metadata and excludes private fields', () => {
   const scenarios: Scenario[] = [
     { name: 'fragmented transcript retains exact native model and effort' },
+    { name: 'sixty-second metadata bound is accepted', timeoutMs: 60_000 },
     ...[false, true].map(
       (mismatch): Scenario => ({
         name: mismatch
@@ -319,7 +321,7 @@ test('provider discovery emits only correlated metadata and excludes private fie
     let now = 0;
     const reader = new OpenAiDiscovery({
       now: () => now,
-      timeoutMs: 100,
+      timeoutMs: scenario.timeoutMs ?? 100,
       readConfiguration: !!scenario.configuration,
       configurationDirectory: '/workspace',
     });
@@ -428,4 +430,8 @@ test('provider discovery emits only correlated metadata and excludes private fie
         ],
       );
   }
+  assert.throws(() => new OpenAiDiscovery({ now: () => 0, timeoutMs: 60_001 }), {
+    name: 'DiscoveryError',
+    reason: 'deadline',
+  });
 });

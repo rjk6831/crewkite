@@ -328,7 +328,7 @@ export function startNativeDiscovery(
     !Number.isFinite(started) ||
     !Number.isSafeInteger(options.timeoutMs) ||
     options.timeoutMs < 1 ||
-    options.timeoutMs > 30_000
+    options.timeoutMs > 60_000
   )
     throw new Error('Discovery deadline is invalid.');
   let stopped = false;

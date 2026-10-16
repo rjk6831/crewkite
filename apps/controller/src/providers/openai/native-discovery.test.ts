@@ -68,6 +68,7 @@ test('native discovery returns metadata only after its owned process and descend
   try {
     for (const mode of [
       'success',
+      'maximum-bound',
       'descendant',
       'invalid',
       'oversized',
@@ -93,7 +94,7 @@ test('native discovery returns metadata only after its owned process and descend
           environment: sourceEnvironment,
         },
         {
-          timeoutMs: 5000,
+          timeoutMs: mode === 'maximum-bound' ? 60_000 : 5000,
           ...(mode === 'truncated'
             ? {
                 schedule: (work: () => void, _milliseconds: number) => {
@@ -156,7 +157,7 @@ test('native discovery returns metadata only after its owned process and descend
         assert.equal(result.lastRequest, 'configRequirements/read', mode);
       for (const group of handle.groups) if (group > 0) assert(groupAbsent(group), mode);
       assert(!JSON.stringify(result).includes('private-native-diagnostic'), mode);
-      if (mode === 'success' || mode === 'descendant') {
+      if (mode === 'success' || mode === 'maximum-bound' || mode === 'descendant') {
         assert.equal(result.reason, null, mode);
         assert.equal(result.metadata?.configuration?.model_provider, 'openai', mode);
       } else {
@@ -184,6 +185,27 @@ test('native discovery returns metadata only after its owned process and descend
           },
         ),
       /identity changed/,
+    );
+    assert.equal(spawned, false);
+    assert.throws(
+      () =>
+        startNativeDiscovery(
+          {
+            executable: process.execPath,
+            sha256,
+            directory: root,
+            repositoryRoot: resolve('internal'),
+            environment: sourceEnvironment,
+          },
+          {
+            timeoutMs: 60_001,
+            spawn: () => {
+              spawned = true;
+              throw new Error('unexpected');
+            },
+          },
+        ),
+      /deadline is invalid/,
     );
     assert.equal(spawned, false);
     const publicDirectory = resolve(root, 'public');

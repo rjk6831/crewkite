@@ -275,7 +275,7 @@ export class OpenAiDiscovery {
       !Number.isFinite(start) ||
       !Number.isSafeInteger(options.timeoutMs) ||
       options.timeoutMs < 1 ||
-      options.timeoutMs > 30_000
+      options.timeoutMs > 60_000
     )
       throw new DiscoveryError('deadline');
     this.deadline = start + options.timeoutMs;
