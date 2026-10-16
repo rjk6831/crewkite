@@ -34,7 +34,7 @@ import {
 const help = `Usage: crewkite task <list|show|watch|start|stop|resume|switch|approve|deny> [id] [--json] [--home path]
        crewkite task switch <task-id> <route-id> [--json] [--home path]
        crewkite native profiles [--json] [--home path]
-       crewkite task prepare-native <task-id> <profile-id> <path> --policy file [--native-trust --source-consent] [--existing-credits] [--confirm-subscription-only]
+       crewkite task prepare-native <task-id> <profile-id> <path> --policy file [--native-trust --source-consent] [--existing-credits] [--confirm-subscription-only] [--permission-mode mode]
        crewkite task prepare-evaluation <task-id> <profile-id> --grants file [--recipe node-tests-v1|project-node-tests-v1] [--test-file path ...] [--native-trust --source-consent] [--existing-credits]
        crewkite task <start-checks|start-review> <task-id> [--json] [--home path]
        crewkite task accept <task-id> <destination-ref> [--json] [--home path]
@@ -45,7 +45,8 @@ const help = `Usage: crewkite task <list|show|watch|start|stop|resume|switch|app
 
 Approval commands take an approval ID. Other task commands take a task ID.
 Create tasks in the desktop. Native preparation uses explicit consent or the controller's exact saved consent.
-For an Anthropic writer, --confirm-subscription-only confirms subscription login and disabled paid extra usage.
+For an Anthropic or Google writer, --confirm-subscription-only confirms subscription login and disabled paid extra usage.
+For Google, --permission-mode must match the existing client setting: request-review, strict, always-proceed or proceed-in-sandbox.
 `;
 interface Output {
   out: (text: string) => void;
@@ -83,6 +84,7 @@ export async function runCli(
         'source-consent': { type: 'boolean' },
         'existing-credits': { type: 'boolean' },
         'confirm-subscription-only': { type: 'boolean' },
+        'permission-mode': { type: 'string' },
         output: { type: 'string' },
       },
     });
@@ -140,6 +142,8 @@ export async function runCli(
     const evaluating = area === 'task' && action === 'prepare-evaluation';
     if (values['confirm-subscription-only'] && !preparing)
       throw new Error('Subscription confirmation requires task prepare-native.');
+    if (values['permission-mode'] !== undefined && !preparing)
+      throw new Error('Permission mode requires task prepare-native.');
     if (!evaluating && (values.recipe !== undefined || values['test-file'] !== undefined))
       throw new Error('Check recipe options require task prepare-evaluation.');
     const recipe = values.recipe ?? 'node-tests-v1';
@@ -371,8 +375,8 @@ export async function runCli(
         { profiles: snapshot.nativeProfiles },
         snapshot.nativeProfiles
           .map((profile) =>
-            profile.family === 'anthropic'
-              ? `${profile.id}  ${profile.model}  ${profile.effort} requested effort  effective effort unknown  account class unknown  service tier unknown  ${profile.available ? 'available' : profile.reason}  ${profile.qualifiedAt ? `qualified ${profile.qualifiedAt}` : 'qualification pending'}  billing requires user attestation`
+            profile.family !== 'openai'
+              ? `${profile.id}  ${profile.model}  ${profile.effort} requested effort  effective effort unknown  account class unknown  service tier unknown  ${profile.available ? 'available' : profile.reason}  ${profile.qualifiedAt ? `qualified ${profile.qualifiedAt}` : 'qualification pending'}  billing requires user attestation${profile.family === 'google' ? `  permission modes ${profile.permissionModes.join(', ')}` : ''}`
               : `${profile.id}  ${profile.model}  ${profile.effort}  ${profile.available ? 'available' : profile.reason}`,
           )
           .join('\n') || 'No native profiles.',
@@ -475,14 +479,16 @@ export async function runCli(
       const creditPolicy = values['existing-credits'] ? 'existing-credits' : 'ordinary';
       if (!profile.creditPolicies.some((value) => value === creditPolicy))
         throw new Error('This profile does not support the selected credit policy.');
-      if (values['confirm-subscription-only'] && profile.family !== 'anthropic')
-        throw new Error('Subscription confirmation is supported only for an Anthropic writer.');
+      if (values['confirm-subscription-only'] && profile.family === 'openai')
+        throw new Error(
+          'Subscription confirmation is supported only for an Anthropic or Google writer.',
+        );
       const explicit = !!values['native-trust'] && !!values['source-consent'];
       const savedNative = snapshot.nativeRuns.find(
         (value) => value.runId === task.runId && value.profileId === profile.id,
       );
       const billingAttestation =
-        profile.family === 'anthropic'
+        profile.family !== 'openai'
           ? values['confirm-subscription-only']
             ? {
                 source: 'user-attested' as const,
@@ -493,9 +499,24 @@ export async function runCli(
               ? savedNative?.billingAttestation
               : undefined
           : undefined;
-      if (profile.family === 'anthropic' && !billingAttestation)
+      if (profile.family !== 'openai' && !billingAttestation)
         throw new Error(
           'Confirm subscription login and disabled paid extra usage with --confirm-subscription-only, or use exact saved billing confirmations.',
+        );
+      if (values['permission-mode'] !== undefined && profile.family !== 'google')
+        throw new Error('Permission mode is supported only for a Google writer.');
+      const permissionMode =
+        profile.family === 'google'
+          ? profile.permissionModes.find(
+              (mode) =>
+                mode ===
+                (values['permission-mode'] ??
+                  (!explicit ? savedNative?.permissionMode : undefined)),
+            )
+          : undefined;
+      if (profile.family === 'google' && !permissionMode)
+        throw new Error(
+          'Choose the current Google client setting with --permission-mode: request-review, strict, always-proceed or proceed-in-sandbox. Exact saved consent can reuse its saved mode.',
         );
       return await finishAction(
         await request(
@@ -508,6 +529,7 @@ export async function runCli(
             creditPolicy,
             consent: explicit ? 'explicit' : 'saved',
             ...(billingAttestation ? { billingAttestation } : {}),
+            ...(permissionMode ? { permissionMode } : {}),
           },
           task.revision,
         ),
@@ -557,8 +579,11 @@ export async function runCli(
       const billingText = nativeRun?.billingAttestation
         ? '\nBilling: user-attested subscription login, paid extra usage disabled'
         : '';
+      const permissionText = nativeRun?.permissionMode
+        ? `\nExpected native permission mode: ${nativeRun.permissionMode}`
+        : '';
       const preview = nativeRun
-        ? `\nNative ${nativeRun.profileId}, ${nativeRun.stage}\nTarget ${nativeRun.target?.path ?? 'unknown'}\nBase hash ${nativeRun.target?.baseHash ?? 'unknown'}\nBytes ${nativeRun.target?.bytes ?? 'unknown'}\nExpires ${nativeRun.expiresAt ?? 'unknown'}\nSource base ${run?.source.base ?? 'unknown'}${billingText}`
+        ? `\nNative ${nativeRun.profileId}, ${nativeRun.stage}\nTarget ${nativeRun.target?.path ?? 'unknown'}\nBase hash ${nativeRun.target?.baseHash ?? 'unknown'}\nBytes ${nativeRun.target?.bytes ?? 'unknown'}\nExpires ${nativeRun.expiresAt ?? 'unknown'}\nSource base ${run?.source.base ?? 'unknown'}${billingText}${permissionText}`
         : '';
       const evaluation = snapshot.candidateEvaluations.find((value) => value.taskId === task.id);
       const evidence = evaluation
