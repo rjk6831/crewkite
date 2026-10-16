@@ -77,9 +77,16 @@ const position = z.strictObject({
   line: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
   column: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
 });
+const emittedAtMs = z
+  .number()
+  .int()
+  .min(Number.MIN_SAFE_INTEGER)
+  .max(Number.MAX_SAFE_INTEGER)
+  .optional();
 const notification = z.union([
   z.strictObject({
     method: z.literal('configWarning'),
+    emittedAtMs,
     params: z.strictObject({
       summary: z.string().max(4096),
       details: z.string().max(16_384).nullable(),
@@ -89,6 +96,7 @@ const notification = z.union([
   }),
   z.strictObject({
     method: z.literal('account/updated'),
+    emittedAtMs,
     params: z.strictObject({
       authMode: z
         .enum([
@@ -126,12 +134,23 @@ const notification = z.union([
         .nullable(),
     }),
   }),
+  z.strictObject({
+    method: z.literal('remoteControl/status/changed'),
+    emittedAtMs,
+    params: z.strictObject({
+      status: z.literal('disabled'),
+      serverName: z.string().max(4096),
+      installationId: z.string().max(4096),
+      environmentId: z.string().max(4096).nullable(),
+    }),
+  }),
 ]);
 export type DiscoveryEnvelope =
   | 'response'
   | 'error'
   | 'config-warning'
   | 'account-updated'
+  | 'remote-control-status'
   | 'invalid'
   | null;
 
@@ -143,6 +162,7 @@ export type RefusedEnvelope = {
     | 'error'
     | 'config-warning'
     | 'account-updated'
+    | 'remote-control-status'
     | 'other-notification'
     | 'other';
   extraEnvelopeFields: boolean;
@@ -185,23 +205,30 @@ function refusedEnvelope(value: unknown, invalidJson = false): RefusedEnvelope {
       ? 'config-warning'
       : method === 'account/updated'
         ? 'account-updated'
-        : envelope && Object.hasOwn(envelope, 'method')
-          ? 'other-notification'
-          : envelope && Object.hasOwn(envelope, 'result')
-            ? 'response'
-            : envelope && Object.hasOwn(envelope, 'error')
-              ? 'error'
-              : 'other';
+        : method === 'remoteControl/status/changed'
+          ? 'remote-control-status'
+          : envelope && Object.hasOwn(envelope, 'method')
+            ? 'other-notification'
+            : envelope && Object.hasOwn(envelope, 'result')
+              ? 'response'
+              : envelope && Object.hasOwn(envelope, 'error')
+                ? 'error'
+                : 'other';
   const envelopeKeys =
-    kind.endsWith('notification') || kind === 'config-warning' || kind === 'account-updated'
-      ? ['method', 'params']
+    kind.endsWith('notification') ||
+    kind === 'config-warning' ||
+    kind === 'account-updated' ||
+    kind === 'remote-control-status'
+      ? ['method', 'params', 'emittedAtMs']
       : ['id', 'result', 'error'];
   const paramsKeys =
     kind === 'config-warning'
       ? ['summary', 'details', 'path', 'range']
       : kind === 'account-updated'
         ? ['authMode', 'planType']
-        : [];
+        : kind === 'remote-control-status'
+          ? ['status', 'serverName', 'installationId', 'environmentId']
+          : [];
   return {
     kind,
     extraEnvelopeFields:
@@ -498,7 +525,12 @@ export class OpenAiDiscovery {
         if (decoded !== null && typeof decoded === 'object' && 'method' in decoded) {
           const value = notification.parse(decoded);
           if (this.step === 0) this.fail('unexpected-message');
-          this.envelope = value.method === 'configWarning' ? 'config-warning' : 'account-updated';
+          this.envelope =
+            value.method === 'configWarning'
+              ? 'config-warning'
+              : value.method === 'account/updated'
+                ? 'account-updated'
+                : 'remote-control-status';
           if (++this.notificationCount > 32) this.fail('limit');
           continue;
         }

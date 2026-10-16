@@ -81,6 +81,7 @@ test('provider discovery emits only correlated metadata and excludes private fie
         notices: [
           {
             method: 'configWarning',
+            ...(fragmentedNotice ? {} : { emittedAtMs: 1234 }),
             params: {
               summary: privateText,
               details: privateText,
@@ -88,7 +89,21 @@ test('provider discovery emits only correlated metadata and excludes private fie
               range: { start: { line: 1, column: 1 }, end: { line: 1, column: 2 } },
             },
           },
-          { method: 'account/updated', params: { authMode: null, planType: null } },
+          {
+            method: 'account/updated',
+            emittedAtMs: -1,
+            params: { authMode: null, planType: null },
+          },
+          {
+            method: 'remoteControl/status/changed',
+            emittedAtMs: 1234,
+            params: {
+              status: 'disabled',
+              serverName: privateText,
+              installationId: privateText,
+              environmentId: null,
+            },
+          },
         ],
       }),
     ),
@@ -113,6 +128,41 @@ test('provider discovery emits only correlated metadata and excludes private fie
       (value): Scenario => ({
         name: 'malformed or unknown startup notice stops',
         notices: [value],
+        reason: 'invalid-message',
+      }),
+    ),
+    ...[null, 1.5, Number.MAX_SAFE_INTEGER + 1, privateText].map(
+      (emittedAtMs): Scenario => ({
+        name: 'notification timestamp must be an optional safe integer',
+        notices: [{ method: 'configWarning', emittedAtMs, params: { summary: '', details: null } }],
+        reason: 'invalid-message',
+      }),
+    ),
+    ...[
+      {
+        status: 'connected',
+        serverName: privateText,
+        installationId: privateText,
+        environmentId: null,
+      },
+      { status: 'disabled', serverName: privateText, installationId: privateText },
+      {
+        status: 'disabled',
+        serverName: privateText,
+        installationId: privateText,
+        environmentId: null,
+        extra: privateText,
+      },
+      {
+        status: 'disabled',
+        serverName: privateText,
+        installationId: 'a'.repeat(4097),
+        environmentId: null,
+      },
+    ].map(
+      (params): Scenario => ({
+        name: 'unexpected or malformed remote status stops metadata',
+        notices: [{ method: 'remoteControl/status/changed', emittedAtMs: 1234, params }],
         reason: 'invalid-message',
       }),
     ),

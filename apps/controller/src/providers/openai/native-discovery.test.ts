@@ -48,8 +48,9 @@ input.on('line', line => {
   if (message.method === 'model/list' && mode === 'descendant')
     spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'inherit' });
   const notices = mode === 'notifications' && message.method === 'initialize' ?
-    JSON.stringify({ method: 'configWarning', params: { summary: 'private-native-diagnostic', details: null } }) + '\\n' +
-    JSON.stringify({ method: 'account/updated', params: { authMode: null, planType: null } }) + '\\n' : '';
+    JSON.stringify({ method: 'configWarning', emittedAtMs: 1234, params: { summary: 'private-native-diagnostic', details: null } }) + '\\n' +
+    JSON.stringify({ method: 'account/updated', emittedAtMs: 1234, params: { authMode: null, planType: null } }) + '\\n' +
+    JSON.stringify({ method: 'remoteControl/status/changed', emittedAtMs: 1234, params: { status: 'disabled', serverName: 'private-native-diagnostic', installationId: 'private-native-diagnostic', environmentId: null } }) + '\\n' : '';
   process.stdout.write(JSON.stringify({ id: message.id, result: replies[message.method] }) + '\\n' + notices);
 });
 input.on('close', () => { if (mode !== 'stubborn' && mode !== 'trailing-partial') process.exit(mode === 'bad-exit' ? 1 : 0); });
@@ -174,7 +175,7 @@ test('native discovery returns metadata only after its owned process and descend
         mode === 'descendant'
       ) {
         assert.equal(result.reason, null, mode);
-        assert.equal(result.notifications, mode === 'notifications' ? 2 : 0);
+        assert.equal(result.notifications, mode === 'notifications' ? 3 : 0);
         assert.equal(result.lastEnvelope, 'response');
         assert.equal(result.refusedEnvelope, null);
         assert.equal(result.metadata?.configuration?.model_provider, 'openai', mode);
