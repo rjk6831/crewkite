@@ -68,6 +68,12 @@ test('authentication metadata waits for bounded owned child and descendant clean
       'bad-exit',
       'launch',
       'spawn-throw',
+      'owned-throw',
+      'owned-promise',
+      'owned-deadline',
+      'quiescent-throw',
+      'quiescent-promise',
+      'quiescent-deadline',
     ]) {
       const directory = join(root, mode);
       mkdirSync(directory, { mode: 0o700 });
@@ -77,12 +83,46 @@ test('authentication metadata waits for bounded owned child and descendant clean
       });
       let deadline: (() => void) | undefined;
       let launches = 0;
+      let time = 0;
+      const trace: string[] = [];
       const handle = startNativeAuthStatus(
         { executable: process.execPath, sha256, directory, repositoryRoot: root, environment },
         {
-          now: () => 0,
+          now: () => time,
+          ...(mode.endsWith('-deadline') && mode !== 'descendant-deadline'
+            ? { deadline: 6000 }
+            : {}),
+          lifecycle: {
+            beforePhase: (kind) => {
+              assert.equal(kind, 'auth-status');
+              trace.push('before');
+            },
+            owned: (kind, group) => {
+              assert.equal(kind, 'auth-status');
+              trace.push('owned');
+              const child = owned.at(-1)?.child;
+              assert.equal(child?.pid, group);
+              assert(
+                child && child.listenerCount('error') > 0 && child.stdin.listenerCount('error') > 0,
+              );
+              if (mode === 'owned-throw') throw Error(secret);
+              if (mode === 'owned-promise') return Promise.reject(Error(secret));
+              if (mode === 'owned-deadline') time = 5000;
+            },
+            quiescent: (kind, group) => {
+              assert.equal(kind, 'auth-status');
+              assert(groupAbsent(group));
+              trace.push('quiescent');
+              if (mode === 'quiescent-throw') throw Error(secret);
+              if (mode === 'quiescent-promise') return Promise.reject(Error(secret));
+              if (mode === 'quiescent-deadline') time = 6000;
+            },
+          },
           schedule: (work, milliseconds) => {
-            if (milliseconds === 30000) {
+            if (
+              milliseconds ===
+              (mode.endsWith('-deadline') && mode !== 'descendant-deadline' ? 4000 : 28000)
+            ) {
               deadline = work;
               return () => {
                 deadline = undefined;
@@ -141,6 +181,13 @@ test('authentication metadata waits for bounded owned child and descendant clean
       assert.equal(result.quiescent, true, mode);
       if (handle.group > 0) assert(groupAbsent(handle.group), mode);
       assert(!JSON.stringify(result).includes(secret), mode);
+      assert.equal(trace[0], 'before', mode);
+      assert.equal(trace.filter((step) => step === 'owned').length, handle.group > 0 ? 1 : 0, mode);
+      assert.equal(
+        trace.filter((step) => step === 'quiescent').length,
+        handle.group > 0 ? 1 : 0,
+        mode,
+      );
       if (['success', 'signed-out', 'descendant'].includes(mode)) {
         assert.equal(result.reason, null, mode);
         assert.equal(
@@ -165,10 +212,57 @@ test('authentication metadata waits for bounded owned child and descendant clean
             'bad-exit': 'protocol',
             launch: 'launch',
             'spawn-throw': 'launch',
+            'owned-throw': 'ownership',
+            'owned-promise': 'ownership',
+            'owned-deadline': 'deadline',
+            'quiescent-throw': 'ownership',
+            'quiescent-promise': 'ownership',
+            'quiescent-deadline': 'deadline',
           }[mode],
           mode,
         );
       }
+    }
+    for (const mode of [
+      'expired',
+      'validation-time',
+      'before-time',
+      'before-throw',
+      'before-promise',
+    ]) {
+      const directory = join(root, mode);
+      mkdirSync(directory, { mode: 0o700 });
+      let time = 0;
+      let ticks = 0;
+      let launched = false;
+      assert.throws(
+        () =>
+          startNativeAuthStatus(
+            { executable: process.execPath, sha256, repositoryRoot: root, directory, environment },
+            {
+              deadline: mode === 'expired' ? 2000 : 6000,
+              now: () => (mode === 'validation-time' && ++ticks > 2 ? 5000 : time),
+              lifecycle: {
+                beforePhase: () => {
+                  if (mode === 'before-time') time = 5000;
+                  if (mode === 'before-throw') throw Error(secret);
+                  if (mode === 'before-promise') return Promise.reject(Error(secret));
+                },
+                owned: () => assert.fail('No child should be owned.'),
+                quiescent: () => assert.fail('No child should close.'),
+              },
+              spawn: () => {
+                launched = true;
+                throw Error(secret);
+              },
+            },
+          ),
+        (error: unknown) =>
+          error instanceof NativeDiscoveryError &&
+          error.reason ===
+            (mode === 'before-throw' || mode === 'before-promise' ? 'ownership' : 'deadline'),
+      );
+      assert.equal(launched, false, mode);
     }
     const directory = join(root, 'refused');
     mkdirSync(directory, { mode: 0o700 });

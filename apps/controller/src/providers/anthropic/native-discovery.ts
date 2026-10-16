@@ -34,6 +34,22 @@ type Outcome = {
   exitCode: number | null;
   signal: NodeJS.Signals | null;
 };
+export type NativePhase = 'auth-status' | 'task';
+export type NativeLifecycle = {
+  beforePhase: (kind: NativePhase) => void;
+  owned: (kind: NativePhase, group: number) => void;
+  quiescent: (kind: NativePhase, group: number) => void;
+};
+
+// A journal callback must finish before protocol input can authorize native work.
+export function nativeSynchronousHook(work: () => unknown) {
+  const result = work();
+  if (result && (typeof result === 'object' || typeof result === 'function') && 'then' in result) {
+    void Promise.resolve(result).catch(() => {});
+    throw new NativeDiscoveryError('ownership');
+  }
+}
+
 type Spawn = (
   executable: string,
   args: string[],
@@ -88,13 +104,36 @@ export function startNativeAuthStatus(
     directory: string;
     environment: NodeJS.ProcessEnv;
   },
-  options: { now?: () => number; schedule?: Schedule; spawn?: Spawn } = {},
+  options: {
+    now?: () => number;
+    deadline?: number;
+    schedule?: Schedule;
+    spawn?: Spawn;
+    lifecycle?: NativeLifecycle;
+  } = {},
 ) {
   if (process.platform === 'win32') throw new NativeDiscoveryError('ownership');
   const plan = metadataCommand('auth-status');
   const now = options.now ?? (() => performance.now());
   const started = now();
-  if (!Number.isFinite(started)) throw new NativeDiscoveryError('deadline');
+  if (
+    !Number.isFinite(started) ||
+    (options.deadline !== undefined && !Number.isFinite(options.deadline))
+  )
+    throw new NativeDiscoveryError('deadline');
+  const end = Math.min(started + plan.timeoutMs, options.deadline ?? Infinity);
+  let previous = started;
+  let invalidClock = false;
+  const remaining = () => {
+    const current = now();
+    if (invalidClock || !Number.isFinite(current) || current < previous) {
+      invalidClock = true;
+      return 0;
+    }
+    previous = current;
+    return Math.max(0, end - current);
+  };
+  if (remaining() <= 2000) throw new NativeDiscoveryError('deadline');
   const schedule: Schedule =
     options.schedule ??
     ((work, milliseconds) => {
@@ -153,9 +192,13 @@ export function startNativeAuthStatus(
   } catch {
     throw new NativeDiscoveryError('storage');
   }
-  const elapsed = now() - started;
-  if (!Number.isFinite(elapsed) || elapsed < 0 || elapsed >= plan.timeoutMs)
-    throw new NativeDiscoveryError('deadline');
+  if (remaining() <= 2000) throw new NativeDiscoveryError('deadline');
+  try {
+    nativeSynchronousHook(() => options.lifecycle?.beforePhase('auth-status'));
+  } catch {
+    throw new NativeDiscoveryError('ownership');
+  }
+  if (remaining() <= 2000) throw new NativeDiscoveryError('deadline');
   let child: ChildProcessWithoutNullStreams;
   try {
     child = (options.spawn ?? spawn)(executable, plan.argv, {
@@ -201,12 +244,24 @@ export function startNativeAuthStatus(
     const quiescent = closed && absent();
     let metadata: AuthMetadata | null = null;
     if (!quiescent) reason = 'ownership';
+    if (quiescent && group > 0) {
+      try {
+        nativeSynchronousHook(() => options.lifecycle?.quiescent('auth-status', group));
+      } catch {
+        reason = 'ownership';
+      }
+    }
+    if (remaining() === 0) reason ??= 'deadline';
     if (quiescent && reason === null) {
       try {
         metadata = projectAuthStatus({ stdout: Buffer.concat(stdout), stderrBytes, exitCode });
       } catch {
         reason = 'protocol';
       }
+    }
+    if (remaining() === 0) {
+      reason ??= 'deadline';
+      metadata = null;
     }
     stdout.length = 0;
     resolveResult({ metadata, reason, quiescent, exitCode, signal: exitSignal });
@@ -228,11 +283,16 @@ export function startNativeAuthStatus(
     }
     if (stopping) return;
     stopping = true;
-    child.stdin.end();
+    try {
+      child.stdin.end();
+    } catch {
+      reason ??= 'launch';
+    }
     if (closed && absent()) return settle();
     signal('SIGTERM');
-    cancellations.push(schedule(() => signal('SIGKILL'), 1000));
-    cancellations.push(schedule(settle, 2000));
+    const cleanup = Math.min(2000, remaining());
+    cancellations.push(schedule(() => signal('SIGKILL'), Math.min(1000, cleanup)));
+    cancellations.push(schedule(settle, cleanup));
   };
   child.stdin.on('error', () => stop('launch'));
   child.on('error', () => stop('launch'));
@@ -257,8 +317,20 @@ export function startNativeAuthStatus(
     if (absent()) settle();
     else stop(null);
   });
-  cancelDeadline = schedule(() => stop('deadline'), plan.timeoutMs - elapsed);
+  cancelDeadline = schedule(() => stop('deadline'), Math.max(0, remaining() - 2000));
   cancellations.push(cancelDeadline);
-  child.stdin.end();
+  try {
+    if (group > 0) nativeSynchronousHook(() => options.lifecycle?.owned('auth-status', group));
+    if (remaining() <= 2000) stop('deadline');
+    else {
+      try {
+        child.stdin.end();
+      } catch {
+        stop('launch');
+      }
+    }
+  } catch {
+    stop('ownership');
+  }
   return { group, result, stop: () => stop('stopped') };
 }
