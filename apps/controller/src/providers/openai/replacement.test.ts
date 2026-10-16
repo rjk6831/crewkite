@@ -88,6 +88,16 @@ const threadNotices = (directory: string) => [
     },
   },
   { method: 'thread/queue/changed', params: { threadId: 'thread-1' } },
+  { method: 'deprecationNotice', params: { summary: 'private guidance' } },
+  {
+    method: 'configWarning',
+    params: {
+      summary: 'private guidance',
+      details: 'private details',
+      path: '/private/config.toml',
+      range: { start: { line: 1, column: 0 }, end: { line: 1, column: 1 } },
+    },
+  },
 ];
 const running = { id: 'turn-1', status: 'inProgress', items: [], error: null };
 const edit = (directory: string) => ({
@@ -254,6 +264,16 @@ test('a replacement requires one matching completed turn and bounded original-fi
     { method: 'thread/name/updated', params: { threadId: 'foreign', threadName: null } },
     { method: 'thread/queue/changed', params: { threadId: 'foreign' } },
     { method: 'thread/readState/changed', params: { threadId: 'thread-1' } },
+    { method: 'deprecationNotice', params: { details: 'missing summary' } },
+    { method: 'configWarning', params: { summary: 'guidance', range: { start: null } } },
+    {
+      method: 'thread/environment/connected',
+      params: { threadId: 'thread-1', environmentId: 'remote' },
+    },
+    {
+      method: 'thread/environment/disconnected',
+      params: { threadId: 'thread-1', environmentId: 'local' },
+    },
     {
       method: 'thread/settings/updated',
       params: { threadId: 'foreign', threadSettings: threadSettings(directory) },
@@ -292,7 +312,10 @@ test('a replacement requires one matching completed turn and bounded original-fi
     rejected.next();
     assert.throws(() => rejected.push(bytes(notice)));
     assert.equal(rejected.complete, false);
-    assert.equal(rejected.diagnostic?.method, notice.method);
+    assert.equal(
+      rejected.diagnostic?.method,
+      notice.method.startsWith('thread/environment/') ? 'other' : notice.method,
+    );
   }
   const canary = 'private-diagnostic-canary';
   for (const row of [
@@ -345,6 +368,12 @@ test('a replacement requires one matching completed turn and bounded original-fi
       code: null,
     },
     {
+      frame: { method: canary.repeat(20), params: { text: canary } },
+      envelope: 'notification',
+      cause: 'validation',
+      code: null,
+    },
+    {
       frame: { id: 12, result: { text: canary } },
       envelope: 'response',
       cause: 'correlation',
@@ -367,6 +396,12 @@ test('a replacement requires one matching completed turn and bounded original-fi
     assert.equal(first.cause, row.cause);
     assert.equal(first.rpcCode, row.code);
     assert.equal(first.rpcField, 'rpcField' in row ? row.rpcField : null);
+    assert.equal(
+      first.methodHash,
+      typeof row.frame.method === 'string' && row.frame.method.length <= 200
+        ? createHash('sha256').update(row.frame.method).digest('hex')
+        : null,
+    );
     if ('field' in row) assert.equal(first.field, row.field);
     assert.equal(diagnostic.lastEnvelope, row.envelope);
     assert.throws(() => diagnostic.push(bytes({ id: 11, result: { turn: running } })));
@@ -390,6 +425,7 @@ test('a replacement requires one matching completed turn and bounded original-fi
   malformed.next();
   assert.throws(() => malformed.push(Buffer.from(`{"${canary}":\n`)));
   assert.equal(malformed.diagnostic?.cause, 'invalid-json');
+  assert.equal(malformed.diagnostic?.methodHash, null);
   assert.equal(malformed.lastEnvelope, 'invalid');
   assert(
     !JSON.stringify({
