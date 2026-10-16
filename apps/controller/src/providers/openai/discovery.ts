@@ -285,32 +285,65 @@ const bucket = z
     limitId: id.nullish(),
     primary: window.optional(),
     secondary: window.optional(),
-    credits: z.object({ hasCredits: z.boolean(), unlimited: z.boolean() }).nullish(),
+    credits: z
+      .object({
+        hasCredits: z.boolean(),
+        unlimited: z.boolean(),
+        balance: z
+          .string()
+          .max(128)
+          .regex(/^-?\d+(?:\.\d+)?$/)
+          .nullish(),
+      })
+      .nullish(),
+    spendControlReached: z.boolean().nullish(),
+    rateLimitReachedType: z
+      .enum([
+        'rate_limit_reached',
+        'workspace_owner_credits_depleted',
+        'workspace_member_credits_depleted',
+        'workspace_owner_usage_limit_reached',
+        'workspace_member_usage_limit_reached',
+      ])
+      .nullish(),
   })
-  .transform(({ limitId, primary, secondary, credits }) => ({
-    limitId: limitId ?? null,
-    primary: primary ?? null,
-    secondary: secondary ?? null,
-    credits: !credits
-      ? ('unknown' as const)
-      : credits.unlimited
-        ? ('unlimited' as const)
-        : credits.hasCredits
-          ? ('available' as const)
-          : ('none' as const),
+  .transform(
+    ({ limitId, primary, secondary, credits, spendControlReached, rateLimitReachedType }) => ({
+      limitId: limitId ?? null,
+      primary: primary ?? null,
+      secondary: secondary ?? null,
+      credits: !credits
+        ? ('unknown' as const)
+        : credits.unlimited
+          ? ('unlimited' as const)
+          : credits.hasCredits
+            ? ('available' as const)
+            : ('none' as const),
+      creditBalance: credits?.balance ?? null,
+      spendControlReached: spendControlReached ?? null,
+      rateLimitReachedType: rateLimitReachedType ?? null,
+    }),
+  );
+const limits = z
+  .object({
+    ordinaryUsageAllowed: z
+      .boolean()
+      .nullish()
+      .transform((value) => value ?? null),
+    rateLimits: bucket,
+    rateLimitsByLimitId: z
+      .record(id, bucket)
+      .refine((value) => Object.keys(value).length <= 32)
+      .nullish()
+      .transform((value) => value ?? null),
+    rateLimitResetCredits: z
+      .object({ availableCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) })
+      .nullish(),
+  })
+  .transform(({ rateLimitResetCredits, ...limits }) => ({
+    ...limits,
+    availableResetCount: rateLimitResetCredits?.availableCount ?? null,
   }));
-const limits = z.object({
-  ordinaryUsageAllowed: z
-    .boolean()
-    .nullish()
-    .transform((value) => value ?? null),
-  rateLimits: bucket,
-  rateLimitsByLimitId: z
-    .record(id, bucket)
-    .refine((value) => Object.keys(value).length <= 32)
-    .nullish()
-    .transform((value) => value ?? null),
-});
 const models = z.object({
   data: z
     .array(
