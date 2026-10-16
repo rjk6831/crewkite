@@ -17,6 +17,14 @@ Google [ended consumer sign-in for Gemini CLI on June 18, 2026](https://develope
 
 The 16 October 2026 check on the M5 Mac found Anthropic client 2.1.301 authenticated through `claude.ai`. Its streams closed and owned process group was absent. This establishes a subscription authentication candidate. Account entitlement, plan and billing identity remain unverified.
 
+## Anthropic writer preparation
+
+The provider-local helpers project bounded authentication metadata and own a structured text proposal process. The writer requires an exact executable digest, model and session. A successful result must bind one attempt, the literal `net.mjs` path and the original content hash to at most 64 KiB of UTF-8 text. The five-minute deadline includes owned process cleanup. The writer applies no files and registers no route.
+
+The launch uses transient [safe and restricted modes](https://code.claude.com/docs/en/cli-reference), requests no built-in tools and denies MCP tools with an empty strict MCP configuration. The init stream must report no MCP servers. The parser reports whether init tool and plugin lists are empty. Plugin metadata can include built-in components and does not establish external effects. Names and paths are discarded. Managed hooks can still apply despite the session's hook setting. These controls use the [native trust profile](adr/0009-native-client-trust-profile.md). Managed hook execution remains unknown.
+
+Five synthetic tasks were submitted on 16 October 2026. Four ended with protocol refusals. The fifth used client 2.1.301 with `claude-sonnet-5-5` at requested medium effort and retained a bounded `net.mjs` proposal after 6.584 seconds. Its streams closed and owned process group was absent. No files were applied or route registered. The parser discards bounded, session-bound subscription metadata and top-level user-role output. A proposal requires the final successful structured result. Reported extra usage enabled or in use stops the task; missing values remain unknown. Effective effort, account entitlement, request-level billing and the six native pilot checks remain unverified. No live route is qualified.
+
 ## Google writer preparation
 
 The Google adapter reads [structured headless output](https://www.antigravity.google/docs/cli/headless) and returns a bounded file replacement tied to an attempt, relative path and original content hash. It requires an exact client identity and dated controller-owned admission evidence. It applies no file changes and registers no route. Its scripted fixture covers malformed output, session binding, refusal before launch and process cleanup.
