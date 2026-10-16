@@ -41,13 +41,24 @@ function launchController(home: string, nativeFixture = false) {
   const bootstrap = `
     import {spawn} from 'node:child_process';
     import {createHash} from 'node:crypto';
-    import {readFileSync} from 'node:fs';
+    import {mkdirSync,readFileSync,writeFileSync} from 'node:fs';
+    import {join} from 'node:path';
     import {startController} from ${JSON.stringify(join(root, 'apps/controller/src/main.ts'))};
     import {unavailableNativeProfile} from ${JSON.stringify(join(root, 'apps/controller/src/providers/openai/profile.ts'))};
-    import {fixture, fixtureModel} from ${JSON.stringify(join(root, 'apps/controller/src/providers/openai/replacement-fixture.ts'))};
+    import {fixture, fixtureContent, fixtureModel} from ${JSON.stringify(join(root, 'apps/controller/src/providers/openai/replacement-fixture.ts'))};
+    import {writeChallengeSolution} from ${JSON.stringify(join(root, 'packages/testkit/src/repository.ts'))};
     let phases=0;
+    const proposal=join(process.env.CREWKITE_HOME,'native-fixture-proposal');
+    mkdirSync(proposal,{recursive:true});
+    writeFileSync(join(proposal,'net.mjs'),'');
+    writeChallengeSolution(proposal);
+    const replacement='const edit = {version:1,attemptId:message.params.outputSchema.properties.attemptId.const,path,baseHash:message.params.outputSchema.properties.baseHash.const,content:content(path)};';
+    const transcript=fixture
+      .replace('const content = '+fixtureContent.toString()+';','const content = () => '+JSON.stringify(readFileSync(join(proposal,'net.mjs'),'utf8'))+';')
+      .replace('const path = message.params.outputSchema.properties.path.const;','const path = message.params.outputSchema.properties.path?.const;')
+      .replace(replacement,'const edit = message.params.outputSchema.properties.bindingHash ? {version:1,bindingHash:message.params.outputSchema.properties.bindingHash.const,methodId:message.params.outputSchema.properties.methodId.const,cycle:1,outcome:"passed",findings:[],summary:"The bounded review completed."} : '+replacement.slice('const edit = '.length));
     const profile={...unavailableNativeProfile(),facts:{...unavailableNativeProfile().facts,displayName:'OpenAI scripted proposal fixture',model:fixtureModel,clientVersion:process.version,available:true,reason:'available'},client:{executable:process.execPath,sha256:createHash('sha256').update(readFileSync(process.execPath)).digest('hex'),version:process.version},environment:{...process.env},locationHash:'1'.repeat(64)};
-    const runtime=await startController({home:process.env.CREWKITE_HOME,nativeProfile:()=>profile,nativeSpawn:(executable,args,options)=>spawn(executable,['-e',fixture,'success',args.at(-1)==='list'?'features':++phases===1?'prepare':'task'],options)});
+    const runtime=await startController({home:process.env.CREWKITE_HOME,nativeProfile:()=>profile,nativeSpawn:(executable,args,options)=>spawn(executable,['-e',transcript,'success',args.at(-1)==='list'?'features':++phases%2===1?'prepare':'task'],options)});
     console.log('CREWKITE_CONTROLLER_READY');
     process.once('SIGTERM',()=>void runtime.close().then(()=>process.exit(0)));
   `;
@@ -703,6 +714,65 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
       ).length,
       0,
     );
+    await page.getByRole('tab', { name: 'Checks and review', exact: true }).click();
+    const evaluationPanel = page.getByRole('region', { name: 'Candidate evaluation', exact: true });
+    await expect(
+      evaluationPanel.getByRole('button', { name: 'Prepare candidate evaluation', exact: true }),
+    ).toBeDisabled();
+    const reviewerCredits = evaluationPanel.getByLabel(
+      'Allow existing credits for this review after included usage',
+      { exact: true },
+    );
+    await expect(reviewerCredits).not.toBeChecked();
+    for (const label of [
+      'Trust the existing native client and login for the review',
+      'Share the original file, proposed change and task text with the reviewer',
+      'Allow one local test run',
+      'Allow one Keep it simple review',
+    ])
+      await evaluationPanel.getByLabel(label, { exact: true }).check();
+    const beforeEvaluation = await observer.snapshot();
+    await enter(
+      evaluationPanel.getByRole('button', { name: 'Prepare candidate evaluation', exact: true }),
+    );
+    await expect(
+      evaluationPanel.getByRole('button', { name: 'Start local checks', exact: true }),
+    ).toBeEnabled();
+    await expect(
+      evaluationPanel.getByRole('button', { name: 'Start native review', exact: true }),
+    ).toBeDisabled();
+    const preparedEvaluation = await observer.snapshot();
+    assert.equal(preparedEvaluation.attempts.length, beforeEvaluation.attempts.length);
+    assert.equal(preparedEvaluation.candidateEvaluations[0].creditPolicy, 'ordinary');
+    assert.equal(cli(home, 'task', 'show', nativeTask.id).evaluation.stage, 'prepared');
+    await enter(evaluationPanel.getByRole('button', { name: 'Start local checks', exact: true }));
+    await expect(
+      evaluationPanel.getByRole('button', { name: 'Start native review', exact: true }),
+    ).toBeEnabled();
+    await expect(evaluationPanel).toContainText('Local checks passed.');
+    await expect(
+      evaluationPanel.getByRole('button', { name: 'Start local checks', exact: true }),
+    ).toBeDisabled();
+    await enter(evaluationPanel.getByRole('button', { name: 'Start native review', exact: true }));
+    await expect(evaluationPanel).toContainText('Native review passed.');
+    await expect(evaluationPanel).toContainText('separate process only');
+    await expect(
+      evaluationPanel.getByRole('button', { name: 'Start native review', exact: true }),
+    ).toBeDisabled();
+    await expect(
+      page.getByRole('button', { name: 'Accept candidate', exact: true }),
+    ).toBeDisabled();
+    const evaluated = await observer.snapshot();
+    const nativeReview = evaluated.evidence.find(
+      (value) => value.review && !value.review.job.scripted,
+    );
+    assert(nativeReview?.passed);
+    assert.deepEqual(sourceIdentity(source), original);
+    await page.screenshot({
+      path: join(internal, 'candidate-evaluation-dark.png'),
+      animations: 'disabled',
+    });
+    nativeSnapshot = evaluated;
     observer.close();
     observer = undefined;
     await stop(controller);
@@ -716,6 +786,7 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     await enter(page.getByRole('button', { name: 'Reconnect controller', exact: true }));
     const reopenedNative = await observer.snapshot();
     assert.deepEqual(reopenedNative.nativeRuns, nativeSnapshot.nativeRuns);
+    assert.deepEqual(reopenedNative.candidateEvaluations, nativeSnapshot.candidateEvaluations);
     assert.equal(reopenedNative.attempts.length, nativeSnapshot.attempts.length);
     await expect(page.getByRole('button', { name: 'Resume', exact: true })).toHaveCount(0);
 

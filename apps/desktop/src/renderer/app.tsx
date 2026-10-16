@@ -59,7 +59,7 @@ import {
   short,
   titleCase,
 } from './components.tsx';
-import { Launch } from './launch.tsx';
+import { Launch, NativeEvaluation } from './launch.tsx';
 import { useWorkspace, type Workspace } from './source.ts';
 import { roleLabels } from './templates.ts';
 
@@ -1072,8 +1072,9 @@ function Plan({
                 />
               </div>
               <p className="muted">
-                Checks, review, handoff and acceptance are unavailable. Retained changes can be
-                inspected and exported after the native process stops.
+                Retained changes can be inspected and exported after the native process stops.
+                Prepare supported checks and a separate review in Checks and review. Handoff and
+                acceptance remain unavailable.
               </p>
               {native.stage === 'prepared' && (
                 <button type="button" className="button primary" onClick={onPrepare}>
@@ -1413,45 +1414,54 @@ function Checks({
   const native = snapshot.nativeRuns.some((value) => value.runId === task.runId);
   if (native)
     return (
-      <section className="card acceptance-card">
-        <div className="section-heading">
-          <h2>Native retained changes</h2>
-          <span>Inspection and export</span>
-        </div>
-        <p className="muted">
-          Checks, review and acceptance are unavailable for this proposal. Inspect its exact patch
-          in Changes before exporting.
-        </p>
-        <div className="button-row">
-          <button
-            type="button"
-            className="button secondary"
-            disabled={!candidate || workspace.pending}
-            onClick={() =>
-              candidate &&
-              void workspace
-                .command({
-                  command: 'ExportPatch',
-                  expectedRevision: task.revision,
-                  payload: { taskId: task.id, candidateId: candidate.id },
-                })
-                .catch(() => {})
-            }
-          >
-            <Download size={14} />
-            Export patch
-          </button>
-          <button
-            type="button"
-            className="button primary"
-            disabled
-            title="Acceptance is unavailable for native proposals"
-          >
-            <Check size={14} />
-            Accept candidate
-          </button>
-        </div>
-      </section>
+      <div className="view-stack">
+        <NativeEvaluation
+          key={`${task.id}:${task.runId}:${candidate?.id}:${candidate?.hash}`}
+          task={task}
+          candidate={candidate}
+          snapshot={snapshot}
+          workspace={workspace}
+        />
+        <section className="card acceptance-card">
+          <div className="section-heading">
+            <h2>Native retained changes</h2>
+            <span>Inspection and export</span>
+          </div>
+          <p className="muted">
+            Inspect the exact patch in Changes before exporting. Acceptance remains unavailable
+            after check or review evidence.
+          </p>
+          <div className="button-row">
+            <button
+              type="button"
+              className="button secondary"
+              disabled={!candidate || workspace.pending}
+              onClick={() =>
+                candidate &&
+                void workspace
+                  .command({
+                    command: 'ExportPatch',
+                    expectedRevision: task.revision,
+                    payload: { taskId: task.id, candidateId: candidate.id },
+                  })
+                  .catch(() => {})
+              }
+            >
+              <Download size={14} />
+              Export patch
+            </button>
+            <button
+              type="button"
+              className="button primary"
+              disabled
+              title="Acceptance is unavailable for native proposals"
+            >
+              <Check size={14} />
+              Accept candidate
+            </button>
+          </div>
+        </section>
+      </div>
     );
 
   return (

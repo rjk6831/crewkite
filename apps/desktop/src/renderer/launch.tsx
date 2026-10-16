@@ -1,4 +1,5 @@
 import {
+  type Candidate,
   formatReviewTarget,
   type Guidance,
   NativeTargetPathSchema,
@@ -34,11 +35,13 @@ import {
   CurrentCheckoutChanges,
   Dialog,
   effectTarget,
+  Fact,
   familyName,
   Help,
   moveTabFocus,
   RouterCard,
   SourceFacts,
+  titleCase,
 } from './components.tsx';
 import type { Workspace } from './source.ts';
 import { loadTeams, roleLabels, type SavedTeam, saveTeam } from './templates.ts';
@@ -87,6 +90,423 @@ type LaunchProps = {
   workspace: Workspace;
   onClose: () => void;
 };
+
+const evaluationReasons = {
+  available: 'Available',
+  'already-started': 'This action already started. Inspect its retained evidence.',
+  'checks-required': 'Start the prepared local checks first.',
+  'checks-failed': 'The local checks did not pass.',
+  expired: 'The prepared evaluation expired.',
+  paused: 'This run is paused.',
+  'ownership-unknown': 'Execution ownership is unknown. Nothing will start.',
+  'not-stopped': 'Wait for the current work to stop.',
+  'preparation-changed': 'The candidate, source or evaluation definition changed.',
+  'consent-unavailable': 'Matching evaluation consent is unavailable.',
+  'profile-unavailable': 'The saved reviewer profile is unavailable or changed.',
+  'grant-unavailable': 'The exact permission is expired, revoked or already used.',
+  'budget-exhausted': 'The original run has no remaining execution slot.',
+};
+const evaluationStages = {
+  prepared: 'Prepared',
+  checking: 'Running local checks',
+  'check-failed': 'Local checks failed',
+  'awaiting-review': 'Ready for review',
+  reviewing: 'Running native review',
+  reviewed: 'Review completed',
+  blocked: 'Start unavailable',
+};
+
+export function NativeEvaluation({
+  task,
+  candidate,
+  snapshot,
+  workspace,
+}: {
+  task: Task;
+  candidate?: Candidate;
+  snapshot: Snapshot;
+  workspace: Workspace;
+}) {
+  const run = snapshot.runs.find((value) => value.id === task.runId);
+  const native = snapshot.nativeRuns.find((value) => value.runId === task.runId);
+  const prepared = snapshot.candidateEvaluations.find((value) => value.taskId === task.id);
+  const [profileId, setProfileId] = useState(snapshot.nativeProfiles[0]?.id ?? '');
+  const [nativeTrust, setNativeTrust] = useState(false);
+  const [sourceConsent, setSourceConsent] = useState(false);
+  const [savedConsent, setSavedConsent] = useState(false);
+  const [existingCredits, setExistingCredits] = useState(false);
+  const [checkPermission, setCheckPermission] = useState(false);
+  const [reviewPermission, setReviewPermission] = useState(false);
+  const [expiresAt, setExpiresAt] = useState(() => new Date(Date.now() + 3600000).toISOString());
+  const [message, setMessage] = useState<string | null>(null);
+  const [editing, setEditing] = useState(false);
+  const profile = snapshot.nativeProfiles.find(
+    (value) => value.id === (profileId || snapshot.nativeProfiles[0]?.id),
+  );
+  const methods = run?.policy.policy.methods ?? [];
+  const method = methods[0];
+  const supported =
+    !!method &&
+    methods.length === 1 &&
+    method.id === 'keep-it-simple' &&
+    method.cycles === 1 &&
+    requiredReviewMethodIds(run?.policy.policy.quality ?? 'quick').every((id) => id === method.id);
+  const connected =
+    workspace.connection === 'connected' && !workspace.preview && !workspace.pending;
+  const permissionExpiry = Date.parse(expiresAt);
+  const expiryInput = Number.isFinite(permissionExpiry)
+    ? new Date(permissionExpiry - new Date(permissionExpiry).getTimezoneOffset() * 60000)
+        .toISOString()
+        .slice(0, 19)
+    : '';
+  const preparedProfile = snapshot.nativeProfiles.find(
+    (value) => value.id === prepared?.reviewer.profileId,
+  );
+  const methodName = (id: ReviewMethod['id']) =>
+    methodCatalog.find((value) => value.id === id)?.name ?? 'Unavailable method';
+  const allowed =
+    connected &&
+    candidate &&
+    task.state === 'stopped' &&
+    supported &&
+    profile?.available &&
+    profile.creditPolicies.includes(existingCredits ? 'existing-credits' : 'ordinary') &&
+    (savedConsent || (nativeTrust && sourceConsent)) &&
+    checkPermission &&
+    reviewPermission &&
+    Number.isFinite(permissionExpiry) &&
+    permissionExpiry > Date.now();
+  async function prepare() {
+    if (!allowed || !method || !candidate || !profile) return;
+    try {
+      const result = await workspace.command({
+        command: 'PrepareCandidateEvaluation',
+        expectedRevision: task.revision,
+        payload: {
+          taskId: task.id,
+          candidateId: candidate.id,
+          checkRecipeId: 'node-tests-v1',
+          reviewer: { profileId: profile.id, methodId: method.id, cycles: 1 },
+          creditPolicy: existingCredits ? 'existing-credits' : 'ordinary',
+          consent: savedConsent ? 'saved' : 'explicit',
+          grants: [
+            { action: 'run-check' as const, target: 'node --test' },
+            {
+              action: 'run-review' as const,
+              target: formatReviewTarget({ methodId: method.id, cycle: 1 }),
+            },
+          ].map((effect) => ({
+            ...effect,
+            taskId: task.id,
+            usesRemaining: 1,
+            revoked: false,
+            expiresAt: new Date(permissionExpiry).toISOString(),
+          })),
+        },
+      });
+      setMessage(
+        result.outcome === 'applied' || result.outcome === 'already-applied'
+          ? null
+          : (result.next ??
+              'Evaluation preparation was refused. Review the candidate and permissions.'),
+      );
+      if (result.outcome === 'applied' || result.outcome === 'already-applied') setEditing(false);
+    } catch {
+      setMessage('Preparation could not be confirmed. Inspect the saved task before retrying.');
+    }
+  }
+  async function start(command: 'StartCandidateEvaluation' | 'StartCandidateReview') {
+    if (!prepared || !connected) return;
+    const readiness =
+      command === 'StartCandidateEvaluation' ? prepared.checkStart : prepared.reviewStart;
+    if (!readiness.available) return;
+    try {
+      const result = await workspace.command({
+        command,
+        expectedRevision: task.revision,
+        payload: {
+          taskId: task.id,
+          candidateId: prepared.candidateId,
+          preparationId: prepared.preparationId,
+        },
+      });
+      setMessage(
+        result.outcome === 'applied' || result.outcome === 'already-applied'
+          ? null
+          : (result.next ?? 'Start was refused. Refresh the retained evaluation.'),
+      );
+    } catch {
+      setMessage('Start could not be confirmed. Inspect the saved task before retrying.');
+    }
+  }
+  const reviews = snapshot.evidence.flatMap((value) =>
+    value.candidateId === candidate?.id && value.review && !value.review.job.scripted
+      ? [{ artifactId: value.artifactId, result: value.review }]
+      : [],
+  );
+  return (
+    <section className="card view-stack" aria-label="Candidate evaluation">
+      <div className="section-heading">
+        <h2>Candidate evaluation</h2>
+        <span>{prepared ? evaluationStages[prepared.stage] : 'Separate preparation'}</span>
+      </div>
+      <p className="muted">
+        Prepare one local check and one additional native review. Both use the remaining original
+        run limits. The review uses a fresh process. It can use the same model as the writer.
+      </p>
+      {message && (
+        <p className="notice" role="status">
+          {message}
+        </p>
+      )}
+      {prepared && !editing ? (
+        <>
+          <div className="facts-grid">
+            <Fact label="Target" value={prepared.target.path} />
+            <Fact label="Checks" value="Sample project tests" />
+            <Fact label="Reviewer" value={preparedProfile?.displayName ?? 'Unavailable profile'} />
+            <Fact label="Role" value={roleLabels[prepared.reviewer.assignedRole]} />
+            <Fact label="Method" value={methodName(prepared.reviewer.methodId)} />
+            <Fact label="Review cycles" value={1} />
+            <Fact label="Independence" value="Separate process only" />
+            <Fact
+              label="Usage"
+              value={
+                prepared.creditPolicy === 'ordinary'
+                  ? 'Included usage only'
+                  : 'Included usage and existing credits'
+              }
+            />
+            <Fact label="Expires" value={new Date(prepared.expiresAt).toLocaleString()} />
+            <Fact label="Remaining total attempts" value={prepared.remainingBudgets.attempts} />
+            <Fact label="Remaining total minutes" value={prepared.remainingBudgets.minutes} />
+          </div>
+          <details className="technical-details">
+            <summary>Evaluation identity</summary>
+            <code>Preparation {prepared.preparationId}</code>
+            <code>Candidate tree {prepared.candidateHash}</code>
+            <code>Original file {prepared.target.baseHash}</code>
+            <code>Candidate content {prepared.target.candidateContentHash}</code>
+            <code>Check definition {prepared.definitionHash}</code>
+            <code>Check recipe {prepared.recipe}</code>
+            <code>Reviewer profile {prepared.reviewer.profileId}</code>
+            <code>Review method {prepared.reviewer.methodId}, cycle 1, process-only</code>
+            {prepared.check && <code>Check artifact {prepared.check.artifactId}</code>}
+            {prepared.review && <code>Review artifact {prepared.review.artifactId}</code>}
+          </details>
+          <div className="button-row">
+            <button
+              type="button"
+              className="button secondary"
+              disabled={!connected || !prepared.checkStart.available}
+              onClick={() => void start('StartCandidateEvaluation')}
+            >
+              Start local checks
+            </button>
+            <button
+              type="button"
+              className="button secondary"
+              disabled={!connected || !prepared.reviewStart.available}
+              onClick={() => void start('StartCandidateReview')}
+            >
+              Start native review
+            </button>
+          </div>
+          <p className="muted small" role="status">
+            Checks: {evaluationReasons[prepared.checkStart.reason]} Review:{' '}
+            {evaluationReasons[prepared.reviewStart.reason]}
+          </p>
+          {!prepared.check &&
+            !prepared.review &&
+            task.state === 'stopped' &&
+            prepared.checkStart.reason !== 'already-started' && (
+              <button
+                type="button"
+                className="button secondary"
+                disabled={!connected}
+                onClick={() => {
+                  setProfileId(prepared.reviewer.profileId);
+                  setExpiresAt(prepared.expiresAt);
+                  setNativeTrust(false);
+                  setSourceConsent(false);
+                  setSavedConsent(false);
+                  setCheckPermission(false);
+                  setReviewPermission(false);
+                  setExistingCredits(false);
+                  setEditing(true);
+                  setMessage(null);
+                }}
+              >
+                Edit evaluation permissions
+              </button>
+            )}
+          {prepared.check && <p>Local checks {prepared.check.passed ? 'passed' : 'failed'}.</p>}
+          {prepared.review && <p>Native review {prepared.review.outcome}.</p>}
+        </>
+      ) : (
+        <>
+          <p>
+            File <code>{native?.target?.path ?? 'Unavailable'}</code>
+          </p>
+          <details className="technical-details">
+            <summary>File details</summary>
+            <code>Candidate tree {candidate?.hash ?? 'Unavailable'}</code>
+            <code>Original file {native?.target?.baseHash ?? 'Unavailable'}</code>
+            <code>Source base {run?.source.base ?? 'Unavailable'}</code>
+          </details>
+          <p className="muted small">
+            The built-in checks cover the sample net.mjs project. Other projects cannot run checks
+            yet. Preparation starts no work.
+          </p>
+          {!supported && (
+            <p className="notice">
+              This run needs review methods or repeat cycles that are unavailable. Its saved
+              requirements stay unchanged.
+            </p>
+          )}
+          <label>
+            Reviewer profile
+            <select
+              value={profile?.id ?? ''}
+              onChange={(event) => setProfileId(event.target.value)}
+            >
+              {snapshot.nativeProfiles.map((value) => (
+                <option key={value.id} value={value.id}>
+                  {value.displayName}
+                  {value.available ? '' : ' (unavailable)'}
+                </option>
+              ))}
+            </select>
+          </label>
+          {profile && (
+            <details className="technical-details">
+              <summary>Reviewer details</summary>
+              <code>Client {profile.clientVersion}</code>
+              <code>Model {profile.model}</code>
+              <code>
+                {titleCase(profile.effort)} effort, {titleCase(profile.serviceTier)} service tier
+              </code>
+            </details>
+          )}
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={savedConsent}
+              onChange={(event) => setSavedConsent(event.target.checked)}
+            />
+            Use saved consent for this exact evaluation
+          </label>
+          {!savedConsent && (
+            <>
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={nativeTrust}
+                  onChange={(event) => setNativeTrust(event.target.checked)}
+                />
+                Trust the existing native client and login for the review
+              </label>
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={sourceConsent}
+                  onChange={(event) => setSourceConsent(event.target.checked)}
+                />
+                Share the original file, proposed change and task text with the reviewer
+              </label>
+            </>
+          )}
+          <p className="muted small">
+            Native guidance may apply. Tool containment and a provider hard spending cap remain
+            unqualified. The original source checkout stays unchanged.
+          </p>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={existingCredits}
+              disabled={!profile?.creditPolicies.includes('existing-credits')}
+              onChange={(event) => setExistingCredits(event.target.checked)}
+            />
+            Allow existing credits for this review after included usage
+          </label>
+          <p className="muted small">
+            This separate choice defaults off. No reset, purchase or top-up is requested.
+          </p>
+          <label>
+            Permission expiry (local time)
+            <input
+              type="datetime-local"
+              step="1"
+              value={expiryInput}
+              onChange={(event) =>
+                setExpiresAt(event.target.value ? new Date(event.target.value).toISOString() : '')
+              }
+            />
+          </label>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={checkPermission}
+              onChange={(event) => setCheckPermission(event.target.checked)}
+            />
+            Allow one local test run
+          </label>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={reviewPermission}
+              onChange={(event) => setReviewPermission(event.target.checked)}
+            />
+            Allow one {method ? methodName(method.id) : ''} review
+          </label>
+          <button
+            type="button"
+            className="button primary"
+            disabled={!allowed}
+            onClick={() => void prepare()}
+          >
+            Prepare candidate evaluation
+          </button>
+          {editing && (
+            <button
+              type="button"
+              className="button secondary"
+              onClick={() => {
+                setEditing(false);
+                setMessage(null);
+              }}
+            >
+              Cancel permission edit
+            </button>
+          )}
+        </>
+      )}
+      {reviews.map(({ artifactId, result }) => (
+        <article key={artifactId}>
+          <h3>
+            Native {methodName(result.job.methodId)}: {titleCase(result.outcome)}
+          </h3>
+          <p className="muted small">
+            {!result.job.scripted && roleLabels[result.job.assignedRole]} · {result.job.cycle}{' '}
+            review cycle · separate process only
+          </p>
+          <p>{result.summary}</p>
+          <ul>
+            {result.findings.map((finding) => (
+              <li key={`${finding.severity}-${finding.message}`}>
+                {finding.severity === 'info' ? 'Note' : titleCase(finding.severity)}:{' '}
+                {finding.message}
+              </li>
+            ))}
+          </ul>
+        </article>
+      ))}
+      <p className="notice">
+        Acceptance remains unavailable. Inspect Changes and export the retained patch.
+      </p>
+    </section>
+  );
+}
 
 export function Launch(props: LaunchProps) {
   const [native, setNative] = useState(
@@ -359,8 +779,9 @@ function NativeLaunch({
           </section>
         )}
         <p className="notice">
-          One proposal is retained for inspection and patch export. Checks, review, handoff and
-          acceptance are unavailable. The original checkout stays unchanged.
+          One proposal is retained for inspection and patch export. A supported candidate can
+          prepare separate checks and review after the writer stops. Handoff and acceptance are
+          unavailable. The original checkout stays unchanged.
         </p>
         {prepared && capability?.stage !== 'prepared' && (
           <p className="notice" role="status">
