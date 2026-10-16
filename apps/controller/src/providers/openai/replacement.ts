@@ -71,6 +71,10 @@ const encode = (value: unknown) => Buffer.from(`${JSON.stringify(value)}\n`);
 const methods = [
   'thread/started',
   'thread/status/changed',
+  'thread/settings/updated',
+  'thread/name/updated',
+  'thread/readState/changed',
+  'thread/queue/changed',
   'account/rateLimits/updated',
   'warning',
   'turn/started',
@@ -104,6 +108,12 @@ const fields = [
   'serviceTier',
   'turn',
   'status',
+  'threadSettings',
+  'effort',
+  'threadName',
+  'readState',
+  'revision',
+  'firstUnread',
   'items',
   'threadId',
   'turnId',
@@ -147,6 +157,8 @@ type Site =
   | 'thread-response'
   | 'turn-response'
   | 'thread-event'
+  | 'thread-settings'
+  | 'thread-metadata'
   | 'status'
   | 'allowance'
   | 'warning'
@@ -474,6 +486,54 @@ export class ReplacementTranscript {
       if (!this.threadId || value.threadId !== this.threadId) this.refuse();
       return;
     }
+    // Thread metadata can arrive before turn/start returns a turn identity.
+    if (method === 'thread/settings/updated') {
+      this.site = 'thread-settings';
+      const value = z
+        .object({
+          threadId: id,
+          threadSettings: z.object({
+            model: z.literal(this.plan.model),
+            modelProvider: z.literal('openai'),
+            effort: z.literal(this.plan.effort),
+            serviceTier: z.literal('default'),
+            cwd: z.literal(this.plan.directory),
+            approvalPolicy: z.literal('on-request'),
+            approvalsReviewer: z.literal('user'),
+            sandboxPolicy: z.object({
+              type: z.literal('readOnly'),
+              networkAccess: z.literal(false).optional(),
+            }),
+          }),
+        })
+        .parse(params);
+      if (!this.threadId || value.threadId !== this.threadId) this.refuse();
+      return;
+    }
+    if (
+      method === 'thread/name/updated' ||
+      method === 'thread/readState/changed' ||
+      method === 'thread/queue/changed'
+    ) {
+      this.site = 'thread-metadata';
+      const value = z.object({ threadId: id }).parse(params);
+      if (!this.threadId || value.threadId !== this.threadId) this.refuse();
+      if (method === 'thread/name/updated')
+        z.object({ threadName: z.string().max(4096).nullish() }).parse(params);
+      if (method === 'thread/readState/changed')
+        z.object({
+          readState: z.object({
+            revision: id,
+            firstUnread: z
+              .union([
+                z.object({ type: z.literal('threadStart') }),
+                z.object({ type: z.literal('turn'), turnId: id }),
+              ])
+              .nullish(),
+          }),
+        }).parse(params);
+      return;
+    }
     if (method === 'account/rateLimits/updated') {
       this.site = 'allowance';
       z.object({ rateLimits: z.record(z.string(), z.unknown()) }).parse(params);
@@ -486,6 +546,10 @@ export class ReplacementTranscript {
         .parse(params);
       if (value.threadId != null && value.threadId !== this.threadId) this.refuse();
       return;
+    }
+    if (!methods.some((known) => known === method)) {
+      this.site = 'unsupported';
+      this.refuse('unsupported');
     }
     this.site = 'identity';
     const identity = z.object({ threadId: id, turnId: id });

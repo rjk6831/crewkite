@@ -61,6 +61,34 @@ const threadResult = (directory: string) => ({
   reasoningEffort: 'low',
   serviceTier: 'default',
 });
+const threadSettings = (directory: string) => ({
+  model: 'gpt-6.1-sol',
+  modelProvider: 'openai',
+  effort: 'low',
+  serviceTier: 'default',
+  cwd: directory,
+  approvalPolicy: 'on-request',
+  approvalsReviewer: 'user',
+  sandboxPolicy: { type: 'readOnly', networkAccess: false },
+});
+const threadNotices = (directory: string) => [
+  {
+    method: 'thread/settings/updated',
+    params: { threadId: 'thread-1', threadSettings: threadSettings(directory) },
+  },
+  {
+    method: 'thread/name/updated',
+    params: { threadId: 'thread-1', threadName: 'private thread name' },
+  },
+  {
+    method: 'thread/readState/changed',
+    params: {
+      threadId: 'thread-1',
+      readState: { revision: 'private revision', firstUnread: null },
+    },
+  },
+  { method: 'thread/queue/changed', params: { threadId: 'thread-1' } },
+];
 const running = { id: 'turn-1', status: 'inProgress', items: [], error: null };
 const edit = (directory: string) => ({
   version: 1,
@@ -164,6 +192,7 @@ test('a replacement requires one matching completed turn and bounded original-fi
     'success',
     'fragmented',
     'reasoning-retry',
+    'thread-notices',
     'wrong-attempt',
     'wrong-path',
     'wrong-hash',
@@ -192,6 +221,10 @@ test('a replacement requires one matching completed turn and bounded original-fi
     assert.equal(request.params.serviceTier, 'default');
     assert.equal(request.params.outputSchema.properties.attemptId.const, plan(directory).attemptId);
     assert.equal(reader.submitted, true);
+    if (mode === 'thread-notices') {
+      for (const notice of threadNotices(directory)) reader.push(bytes(notice));
+      assert.equal(reader.complete, false, 'thread metadata cannot complete a turn');
+    }
     reader.push(bytes({ id: 11, result: { turn: running } }));
     const perform = () => {
       for (const message of output(directory, mode)) {
@@ -202,7 +235,12 @@ test('a replacement requires one matching completed turn and bounded original-fi
       if (mode === 'partial') reader.push(Buffer.from('{'));
       return reader.finish();
     };
-    if (mode === 'success' || mode === 'fragmented' || mode === 'reasoning-retry') {
+    if (
+      mode === 'success' ||
+      mode === 'fragmented' ||
+      mode === 'reasoning-retry' ||
+      mode === 'thread-notices'
+    ) {
       const result = perform();
       assert.deepEqual(result.replacement, edit(directory));
       assert.equal(result.qualified, false);
@@ -212,6 +250,50 @@ test('a replacement requires one matching completed turn and bounded original-fi
     } else assert.throws(perform, mode);
   }
   const directory = resolve('internal/replacement-fixture');
+  for (const notice of [
+    { method: 'thread/name/updated', params: { threadId: 'foreign', threadName: null } },
+    { method: 'thread/queue/changed', params: { threadId: 'foreign' } },
+    { method: 'thread/readState/changed', params: { threadId: 'thread-1' } },
+    {
+      method: 'thread/settings/updated',
+      params: { threadId: 'foreign', threadSettings: threadSettings(directory) },
+    },
+    {
+      method: 'thread/settings/updated',
+      params: {
+        threadId: 'thread-1',
+        threadSettings: { ...threadSettings(directory), model: 'other' },
+      },
+    },
+    {
+      method: 'thread/settings/updated',
+      params: {
+        threadId: 'thread-1',
+        threadSettings: { ...threadSettings(directory), effort: undefined },
+      },
+    },
+    {
+      method: 'thread/settings/updated',
+      params: {
+        threadId: 'thread-1',
+        threadSettings: {
+          ...threadSettings(directory),
+          sandboxPolicy: { type: 'readOnly', networkAccess: true },
+        },
+      },
+    },
+  ]) {
+    const rejected = new ReplacementTranscript(plan(directory), {
+      now: () => 1,
+      timeoutMs: 300_000,
+    });
+    metadata(rejected);
+    rejected.push(bytes({ id: 10, result: threadResult(directory) }));
+    rejected.next();
+    assert.throws(() => rejected.push(bytes(notice)));
+    assert.equal(rejected.complete, false);
+    assert.equal(rejected.diagnostic?.method, notice.method);
+  }
   const canary = 'private-diagnostic-canary';
   for (const row of [
     {
@@ -253,7 +335,7 @@ test('a replacement requires one matching completed turn and bounded original-fi
         },
       },
       envelope: 'notification',
-      cause: 'correlation',
+      cause: 'unsupported',
       code: null,
     },
     {
