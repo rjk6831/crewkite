@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import {
   appendFileSync,
@@ -12,12 +13,14 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { type TestContext, test } from 'node:test';
 import {
   type Approval,
   type Artifact,
   ArtifactSchema,
   type Attempt,
+  type Candidate,
   type CheckResult,
   canonicalJson,
   ProjectSchema,
@@ -28,9 +31,15 @@ import { hashCanonical } from '@crewkite/contracts/hash';
 import { createDemoFixtures, createTestClock, createTestIds } from '@crewkite/testkit';
 import { createSyntheticRepository } from '@crewkite/testkit/repository';
 import { ArtifactFiles } from '../artifacts/index.ts';
-import { Controller, type ControllerOptions } from '../commands/controller.ts';
+import {
+  Controller,
+  type ControllerOptions,
+  type NativePilotAppointment,
+} from '../commands/controller.ts';
 import { CandidateEvidence } from '../evidence/index.ts';
-import { committedFiles, git, materialize, readFiles } from '../host/source.ts';
+import { committedFiles, git, inspectSource, materialize, readFiles } from '../host/source.ts';
+import { groupAbsent } from '../host/worker.ts';
+import { fixture, fixtureModel } from '../providers/openai/replacement-fixture.ts';
 
 async function setup(t: TestContext, options: Partial<ControllerOptions> = {}) {
   mkdirSync(resolve('internal'), { recursive: true });
@@ -47,8 +56,8 @@ async function setup(t: TestContext, options: Partial<ControllerOptions> = {}) {
     routes: fixtures.snapshot.routes,
     observations: fixtures.snapshot.usage.map((window) => window.observation),
   });
-  t.after(() => {
-    controller.close();
+  t.after(async () => {
+    await controller.close();
     rmSync(directory, { recursive: true, force: true });
   });
   const command = (name: string, payload: unknown, revision?: number) => ({
@@ -1377,3 +1386,707 @@ async function acceptsTransferredCandidate(t: TestContext, transfer: 'reserve' |
   assert.equal(existsSync(canary), false);
   controller.close();
 }
+
+async function nativeSetup(
+  t: TestContext,
+  mode = 'success',
+  options: Partial<ControllerOptions> = {},
+) {
+  let phases = 0;
+  let submissions = 0;
+  const ready = Promise.withResolvers<void>();
+  const children: ReturnType<typeof spawn>[] = [];
+  let onSpawn: ((phase: string) => void) | undefined;
+  let onInput: ((message: { method?: string }, phase: string) => void) | undefined;
+  const context = await setup(t, {
+    ...options,
+    nativeSpawn: (executable, args, spawnOptions) => {
+      const phase = args.at(-1) === 'list' ? 'features' : ++phases === 1 ? 'prepare' : 'task';
+      const child = spawn(executable, ['-e', fixture, mode, phase], spawnOptions);
+      children.push(child);
+      const write = child.stdin.write.bind(child.stdin);
+      child.stdin.write = ((data: Uint8Array) => {
+        const messages = Buffer.from(data)
+          .toString()
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { method?: string });
+        const attempt = context.controller.store.intents()[0];
+        assert(attempt, 'the controller commits admission before native input');
+        assert.equal(
+          context.controller.store.nativeProcesses(attempt.attempt_id).at(-1)?.state,
+          'owned',
+        );
+        for (const message of messages) {
+          if (message.method === 'turn/start') {
+            submissions++;
+            assert(context.controller.store.receipt(`native-submission:${attempt.attempt_id}`));
+          }
+          onInput?.(message, phase);
+        }
+        const result = write(data);
+        if (messages.some((message) => message.method === 'turn/start')) ready.resolve();
+        return result;
+      }) as typeof child.stdin.write;
+      onSpawn?.(phase);
+      return child;
+    },
+  });
+  const task = TaskSchema.parse(
+    (await context.controller.execute(context.draft, 'local-owner')).entity,
+  );
+  const source = inspectSource(task.projectId, context.source.directory);
+  const policy: NativePilotAppointment['policy'] = {
+    ...context.fixtures.policy,
+    quality: 'quick',
+    methods: [{ id: 'keep-it-simple', cycles: 1, reviewerRole: 'reviewer' }],
+    reserves: [],
+    limits: { attempts: 4, minutes: 5, concurrency: 1 },
+    unknownUsage: { rule: 'fixed-allowance', allowance: { launches: 1, minutes: 5 } },
+    effects: context.fixtures.policy.effects.map((grant) => ({
+      ...grant,
+      taskId: task.id,
+      ...(grant.action === 'export-patch' ? { target: task.id } : {}),
+    })),
+  };
+  const appointment: NativePilotAppointment = {
+    id: 'controller-native-fixture',
+    taskId: task.id,
+    route: {
+      ...context.fixtures.snapshot.routes[0],
+      id: context.id('rte'),
+      family: 'openai',
+      model: fixtureModel,
+      effort: { requested: 'low', effective: 'low', supported: ['low'] },
+      billing: 'included',
+      qualified: false,
+      fake: false,
+    },
+    client: {
+      executable: process.execPath,
+      sha256: createHash('sha256').update(readFileSync(process.execPath)).digest('hex'),
+      version: process.version,
+    },
+    creditPolicy: 'ordinary',
+    consent: {
+      nativeTrust: 'accepted',
+      source: 'explicit',
+      policyHash: hashCanonical(policy),
+      sourceBase: source.base,
+      criteriaHash: hashCanonical(task.criteria),
+    },
+    policy,
+    expiresAt: new Date(Date.parse(context.clock.now()) + 300_000).toISOString(),
+    maximumTaskMs: 300_000,
+    maximumSubmissions: 1,
+  };
+  return {
+    ...context,
+    task,
+    appointment,
+    children,
+    ready: ready.promise,
+    submissions: () => submissions,
+    onSpawn: (listener: typeof onSpawn) => {
+      onSpawn = listener;
+    },
+    onInput: (listener: typeof onInput) => {
+      onInput = listener;
+    },
+  };
+}
+
+function nativeCandidate(controller: Controller) {
+  const candidate = Promise.withResolvers<void>();
+  const off = controller.subscribe((event) => {
+    if (event.type === 'task.updated' && event.payload.state === 'unknown') {
+      off();
+      candidate.reject(new Error('Native ownership became unknown.'));
+    }
+    if (event.type === 'candidate.sealed') {
+      off();
+      candidate.resolve();
+    }
+  });
+  return candidate.promise;
+}
+
+test('an appointed native proposal is retained and applied once after every phase stops', async (t) => {
+  for (const consent of ['explicit', 'policy'] as const) {
+    const context = await nativeSetup(t);
+    const { controller, appointment, task, command, source, clock, id } = context;
+    appointment.id += `-${consent}`;
+    appointment.consent.source = consent;
+    for (const change of [
+      { maximumSubmissions: 2 },
+      { consent: { ...appointment.consent, nativeTrust: 'denied' } },
+      { consent: { ...appointment.consent, policyHash: '0'.repeat(64) } },
+      { expiresAt: clock.now() },
+      { route: { ...appointment.route, fake: true } },
+      { route: { ...appointment.route, qualified: true } },
+      {
+        policy: {
+          ...appointment.policy,
+          reserves: [
+            { routeId: appointment.route.id, windowId: 'weekly', value: 5, unit: 'percent' },
+          ],
+        },
+      },
+      {
+        policy: {
+          ...appointment.policy,
+          unknownUsage: { rule: 'fixed-allowance', allowance: { launches: 0, minutes: 5 } },
+        },
+      },
+    ]) {
+      assert.equal(
+        controller.startNativePilot({
+          ...appointment,
+          ...change,
+          ...('policy' in change
+            ? { consent: { ...appointment.consent, policyHash: hashCanonical(change.policy) } }
+            : {}),
+        } as NativePilotAppointment).outcome,
+        'blocked',
+      );
+      assert.equal(controller.store.intents().length, 0);
+    }
+    assert.equal(
+      (await controller.execute(command('StartNativePilot', appointment), 'local-owner')).outcome,
+      'unsupported',
+    );
+    assert(!controller.snapshot().routes.some((route) => route.id === appointment.route.id));
+    const frozen = structuredClone(appointment);
+    const sealed = nativeCandidate(controller);
+    context.onInput((message) => {
+      if (message.method === 'turn/start') {
+        const intents = controller.store.intents().length;
+        const submissions = context.submissions();
+        const processes = context.children.length;
+        assert.equal(controller.startNativePilot(frozen).outcome, 'already-applied');
+        assert.equal(controller.store.intents().length, intents);
+        assert.equal(context.submissions(), submissions);
+        assert.equal(context.children.length, processes);
+      }
+    });
+    assert.equal(controller.startNativePilot(appointment).outcome, 'applied');
+    appointment.consent.nativeTrust = 'denied' as 'accepted';
+    appointment.policy.effects.length = 0;
+    appointment.route.qualified = true;
+    await sealed;
+    const run = controller.snapshot().runs.at(-1);
+    assert(run);
+    const attempt = controller.store.intents()[0];
+    assert.equal(context.submissions(), 1);
+    assert.equal(context.children.length, 3);
+    const completion = controller.store.receipt(`native-completion:${attempt.attempt_id}`)?.result
+      .entity as Artifact;
+    const facts = JSON.parse(
+      new ArtifactFiles(join(controller.home, 'artifacts')).read(completion.hash).toString(),
+    );
+    assert.equal(facts.reason, null);
+    assert.equal(facts.quiescent, true);
+    assert(
+      controller.store
+        .nativeProcesses(attempt.attempt_id)
+        .every((phase) => phase.state === 'quiescent' && groupAbsent(phase.process_group)),
+    );
+    assert.equal(
+      controller.store.receipt(`native-application:${attempt.attempt_id}`)?.result.outcome,
+      'applied',
+    );
+    assert.equal(controller.snapshot().tasks[0].state, 'stopped');
+    assert.equal(
+      controller.snapshot().routes.find((route) => route.id === frozen.route.id)?.qualified,
+      false,
+    );
+    assert.equal(
+      controller.snapshot().routes.find((route) => route.id === frozen.route.id)?.fake,
+      false,
+    );
+    assert.equal(controller.startNativePilot(frozen).outcome, 'already-applied');
+    assert.equal(
+      controller.startNativePilot({ ...frozen, creditPolicy: 'existing-credits' }).outcome,
+      'denied',
+    );
+    const candidate = controller.store.list<Candidate>('candidate').at(-1);
+    assert(candidate);
+    const expected = committedFiles(source.directory, run.source.base).map(
+      ({ content: _content, ...file }) => file,
+    );
+    const actual = readFiles(join(controller.home, 'scratch', run.id)).map(
+      ({ content: _content, ...file }) => file,
+    );
+    assert.deepEqual(
+      actual.filter((file) => file.path !== 'net.mjs'),
+      expected.filter((file) => file.path !== 'net.mjs'),
+    );
+    assert.equal(
+      controller.store.db.prepare('SELECT COUNT(*) AS count FROM evidence').get()?.count,
+      0,
+    );
+    assert.equal(
+      readFileSync(join(controller.home, 'scratch', run.id, 'net.mjs'), 'utf8'),
+      'export function netMinor() { return 0; }\n',
+    );
+    assert.equal(
+      git(source.directory, ['show', `${run.source.base}:net.mjs`]).toString(),
+      readFileSync(join(source.directory, 'net.mjs'), 'utf8'),
+    );
+    for (const kind of ['command', 'accept', 'check', 'review']) {
+      const approval: Approval = {
+        approvalId: id('apr'),
+        taskId: task.id,
+        attemptId: attempt.attempt_id,
+        generation: 0,
+        action: 'run-check',
+        target: 'node --test',
+        revision: 0,
+        requester: 'Controller',
+        consequence: 'A synthetic pending continuation.',
+        status: 'pending',
+      };
+      const {
+        status: _status,
+        requester: _requester,
+        consequence: _consequence,
+        ...binding
+      } = approval;
+      const request = { kind };
+      controller.store.transaction(() => {
+        controller.store.put('approval', approval.approvalId, 0, approval);
+        controller.store.db
+          .prepare(
+            "INSERT INTO pending_effects(approval_id,task_id,attempt_id,task_revision,effect_hash,request,state) VALUES (?,?,?,?,?,?,'pending')",
+          )
+          .run(
+            approval.approvalId,
+            task.id,
+            attempt.attempt_id,
+            controller.snapshot().tasks[0].revision,
+            hashCanonical(request),
+            canonicalJson(request),
+          );
+      });
+      assert.equal(
+        (
+          await controller.execute(
+            command(
+              'ResolveApproval',
+              { binding, decision: 'approved' },
+              controller.snapshot().tasks[0].revision,
+            ),
+            'local-owner',
+          )
+        ).reason,
+        'native-pilot-retain-only',
+      );
+      assert.equal(
+        controller.store.get<Approval>('approval', approval.approvalId)?.status,
+        'pending',
+      );
+      assert.equal(
+        (
+          await controller.execute(
+            command(
+              'ResolveApproval',
+              { binding, decision: 'denied' },
+              controller.snapshot().tasks[0].revision,
+            ),
+            'local-owner',
+          )
+        ).outcome,
+        'applied',
+      );
+    }
+    assert.equal(controller.store.intents().length, 1);
+    assert.equal(
+      controller.store.db.prepare('SELECT COUNT(*) AS count FROM evidence').get()?.count,
+      0,
+    );
+    const changes = await controller.execute(
+      command('GetChanges', { taskId: task.id }),
+      'local-owner',
+    );
+    assert.equal(changes.data?.kind, 'changes');
+    const proposal = controller.store.receipt(`native-proposal:${attempt.attempt_id}`)?.result
+      .entity as Artifact;
+    const retained = await controller.execute(
+      command('GetArtifact', { artifactId: proposal.id, offset: 0, limit: 65536 }),
+      'local-owner',
+    );
+    assert.equal(retained.data?.kind, 'artifact');
+    const exported = await controller.execute(
+      command(
+        'ExportPatch',
+        { taskId: task.id, candidateId: candidate.id },
+        controller.snapshot().tasks[0].revision,
+      ),
+      'local-owner',
+    );
+    assert.equal(exported.outcome, 'applied');
+    const patch = ArtifactSchema.parse(exported.entity);
+    for (const name of ['StartRun', 'ResumeRun', 'SwitchRoute', 'AcceptCandidate'] as const) {
+      const payload: Record<string, unknown> =
+        name === 'AcceptCandidate'
+          ? {
+              taskId: task.id,
+              candidateId: candidate.id,
+              destinationRef: 'refs/heads/feat/native-fixture',
+            }
+          : {
+              taskId: task.id,
+              runId: run.id,
+              ...(name === 'SwitchRoute'
+                ? { routeId: context.fixtures.snapshot.routes[0].id }
+                : {}),
+            };
+      assert.equal(
+        (
+          await controller.execute(
+            command(name, payload, controller.snapshot().tasks[0].revision),
+            'local-owner',
+          )
+        ).reason,
+        'native-pilot-retain-only',
+      );
+    }
+    await controller.close();
+    const reopened = new Controller({
+      home: controller.home,
+      now: clock.now,
+      id,
+      scenarioForRoute: () => 'approval',
+    });
+    try {
+      assert.equal(reopened.startNativePilot(frozen).outcome, 'already-applied');
+      assert.equal(
+        (
+          await reopened.execute(
+            command(
+              'ResumeRun',
+              { taskId: task.id, runId: run.id },
+              reopened.snapshot().tasks[0].revision,
+            ),
+            'local-owner',
+          )
+        ).reason,
+        'native-pilot-retain-only',
+      );
+      const chunk = await reopened.execute(
+        command('GetArtifact', { artifactId: patch.id, offset: 0, limit: 65536 }),
+        'local-owner',
+      );
+      assert.equal(chunk.data?.kind, 'artifact');
+      assert.equal(reopened.store.intents().length, 1);
+      const amended = await reopened.execute(
+        command(
+          'AmendTask',
+          { taskId: task.id, title: task.title, outcome: task.outcome, criteria: task.criteria },
+          reopened.snapshot().tasks[0].revision,
+        ),
+        'local-owner',
+      );
+      assert.equal(amended.outcome, 'applied');
+      assert.equal(TaskSchema.parse(amended.entity).runId, null);
+      assert(reopened.store.receipt(`native-run:${run.id}`));
+      const freshPolicy = {
+        ...frozen.policy,
+        methods: frozen.policy.methods?.map((method) => ({
+          ...method,
+          reviewerRole: 'advisor' as const,
+        })),
+        effects: frozen.policy.effects.map((grant) => ({
+          ...grant,
+          expiresAt: new Date(Date.parse(grant.expiresAt) + 1).toISOString(),
+        })),
+      };
+      const prepared = await reopened.execute(
+        command(
+          'PrepareRun',
+          { taskId: task.id, policy: freshPolicy, roles: quickRoles(context.fixtures) },
+          reopened.snapshot().tasks[0].revision,
+        ),
+        'local-owner',
+      );
+      assert.equal(prepared.outcome, 'applied', JSON.stringify(prepared));
+      const ordinary = RunSchema.parse(prepared.entity);
+      const resealed = nativeCandidate(reopened);
+      let stopped: Promise<unknown> | undefined;
+      const off = reopened.subscribe((event) => {
+        if (event.type === 'attempt.output' && event.payload.attemptId !== attempt.attempt_id) {
+          off();
+          writeFileSync(
+            join(reopened.home, 'scratch', ordinary.id, 'net.mjs'),
+            'export function netMinor() { return 0; }\n',
+          );
+          stopped = reopened.execute(
+            command(
+              'StopRun',
+              { taskId: task.id, runId: ordinary.id },
+              reopened.snapshot().tasks[0].revision,
+            ),
+            'local-owner',
+          );
+        }
+      });
+      assert.equal(
+        (
+          await reopened.execute(
+            command('StartRun', { taskId: task.id, runId: ordinary.id }, prepared.revision),
+            'local-owner',
+          )
+        ).outcome,
+        'applied',
+      );
+      await resealed;
+      await stopped;
+      const ordinaryCandidate = reopened.snapshot().candidates.at(-1);
+      assert(ordinaryCandidate);
+      assert.equal(ordinaryCandidate.hash, candidate.hash);
+      assert.notEqual(ordinaryCandidate.id, candidate.id);
+      assert.equal(
+        (
+          await reopened.execute(
+            command(
+              'AcceptCandidate',
+              {
+                taskId: task.id,
+                candidateId: candidate.id,
+                destinationRef: 'refs/heads/feat/native-fixture',
+              },
+              reopened.snapshot().tasks[0].revision,
+            ),
+            'local-owner',
+          )
+        ).reason,
+        'candidate-not-current',
+      );
+    } finally {
+      await reopened.close();
+    }
+  }
+});
+
+test('stop or restart cannot submit or apply late native work', async (t) => {
+  for (const boundary of [
+    'before-submit',
+    'restart-intent',
+    'close-at-admission',
+    'owned-features',
+    'owned-prepare',
+    'owned-task',
+    'close-before-handle',
+    'deadline',
+    'manifest',
+    'after-submit',
+    'close',
+    'changed-source',
+    'application-intent',
+    'journal-read',
+  ] as const) {
+    const context = await nativeSetup(
+      t,
+      boundary === 'after-submit' || boundary === 'close' ? 'hold' : 'success',
+      boundary === 'restart-intent'
+        ? {
+            afterIntent: () => {
+              throw new Error('synthetic crash before the first phase');
+            },
+          }
+        : {},
+    );
+    const { controller, task, appointment, command, clock, id } = context;
+    let action: Promise<unknown> | undefined;
+    const unknown = Promise.withResolvers<void>();
+    const sealed =
+      boundary === 'journal-read'
+        ? unknown.promise
+        : boundary === 'restart-intent' || boundary === 'close-at-admission'
+          ? Promise.resolve()
+          : nativeCandidate(controller);
+    if (boundary === 'journal-read') {
+      controller.subscribe((event) => {
+        if (event.type === 'task.updated' && event.payload.state === 'unknown') unknown.resolve();
+      });
+      context.onSpawn((phase) => {
+        if (phase === 'task')
+          context.children.at(-1)?.once('close', () =>
+            queueMicrotask(() => {
+              controller.store.db.exec(
+                'ALTER TABLE native_processes RENAME TO native_processes_unreadable',
+              );
+            }),
+          );
+      });
+    }
+    if (boundary === 'close-at-admission')
+      controller.subscribe((event) => {
+        if (event.type === 'run.admitted') action = Promise.resolve(controller.close());
+      });
+    if (boundary.startsWith('owned-') || boundary === 'close-before-handle')
+      context.onSpawn((phase) => {
+        if (boundary === `owned-${phase}` || boundary === 'close-before-handle') {
+          if (boundary === 'close-before-handle') action = Promise.resolve(controller.close());
+          else
+            action = controller.execute(
+              command(
+                'StopRun',
+                { taskId: task.id, runId: controller.snapshot().tasks[0].runId },
+                controller.snapshot().tasks[0].revision,
+              ),
+              'local-owner',
+            );
+        }
+      });
+    if (boundary === 'deadline' || boundary === 'manifest')
+      context.onInput((message) => {
+        if (message.method === 'turn/start') {
+          if (boundary === 'deadline') clock.advance(300_001);
+          else
+            writeFileSync(
+              join(
+                controller.home,
+                'scratch',
+                controller.snapshot().tasks[0].runId as string,
+                'sibling.txt',
+              ),
+              'changed sibling\n',
+            );
+        }
+      });
+    if (boundary === 'before-submit')
+      context.onInput((message, phase) => {
+        if (phase === 'prepare' && message.method === 'initialize')
+          action = controller.execute(
+            command(
+              'StopRun',
+              { taskId: task.id, runId: controller.snapshot().tasks[0].runId },
+              controller.snapshot().tasks[0].revision,
+            ),
+            'local-owner',
+          );
+      });
+    if (boundary === 'changed-source')
+      context.onInput((message) => {
+        if (message.method === 'turn/start')
+          writeFileSync(join(context.source.directory, 'README.md'), 'source changed\n');
+      });
+    if (boundary === 'application-intent') {
+      const statement = controller.store.db.prepare.bind(controller.store.db);
+      controller.store.db.prepare = ((sql: string) => {
+        if (sql === 'UPDATE receipts SET result=? WHERE command_key=?')
+          throw new Error('synthetic application receipt failure');
+        return statement(sql);
+      }) as typeof controller.store.db.prepare;
+    }
+    const started = controller.startNativePilot(appointment);
+    assert.equal(started.outcome, 'applied');
+    const runId = TaskSchema.parse(started.entity).runId;
+    assert(runId);
+    const original = git(context.source.directory, [
+      'show',
+      `${appointment.consent.sourceBase}:net.mjs`,
+    ]).toString();
+    if (boundary === 'after-submit' || boundary === 'close') {
+      await context.ready;
+      if (boundary === 'close') {
+        const first = controller.close();
+        assert.equal(controller.close(), first);
+        await first;
+      } else {
+        await controller.execute(
+          command('StopRun', { taskId: task.id, runId }, controller.snapshot().tasks[0].revision),
+          'local-owner',
+        );
+        await sealed;
+      }
+    } else {
+      await sealed;
+      await action;
+    }
+    if (
+      boundary !== 'application-intent' &&
+      boundary !== 'restart-intent' &&
+      boundary !== 'close-at-admission'
+    )
+      assert.equal(
+        readFileSync(join(controller.home, 'scratch', runId, 'net.mjs'), 'utf8'),
+        original,
+      );
+    if (boundary === 'journal-read') {
+      assert.equal(controller.snapshot().tasks[0].state, 'unknown');
+      assert.equal(
+        controller.store.db.prepare('SELECT COUNT(*) AS count FROM writer_leases').get()?.count,
+        1,
+      );
+      assert.equal(
+        controller.store.db.prepare('SELECT COUNT(*) AS count FROM reservations').get()?.count,
+        1,
+      );
+      assert.equal(
+        controller.store.receipt(`native-application:${controller.store.intents()[0].attempt_id}`),
+        undefined,
+      );
+    }
+    await controller.close();
+    if (boundary === 'journal-read') {
+      const journal = new DatabaseSync(join(controller.home, 'state.sqlite'));
+      try {
+        journal.exec('ALTER TABLE native_processes_unreadable RENAME TO native_processes');
+      } finally {
+        journal.close();
+      }
+    }
+    const reopened = new Controller({ home: controller.home, now: clock.now, id });
+    try {
+      assert.equal(reopened.store.intents().length, 1);
+      assert.equal(reopened.startNativePilot(appointment).outcome, 'already-applied');
+      assert.equal(
+        (
+          await reopened.execute(
+            command('ResumeRun', { taskId: task.id, runId }, reopened.snapshot().tasks[0].revision),
+            'local-owner',
+          )
+        ).reason,
+        'native-pilot-retain-only',
+      );
+      assert.equal(
+        context.submissions(),
+        boundary === 'before-submit' ||
+          boundary === 'restart-intent' ||
+          boundary === 'close-at-admission' ||
+          boundary.startsWith('owned-') ||
+          boundary === 'close-before-handle'
+          ? 0
+          : 1,
+      );
+      if (boundary === 'journal-read')
+        assert(reopened.store.eventsAfter('0').some((event) => event.type === 'ownership.unknown'));
+      if (boundary === 'restart-intent' || boundary === 'close-at-admission') {
+        assert.equal(reopened.snapshot().tasks[0].state, 'unknown');
+        assert.equal(
+          reopened.store.db.prepare('SELECT COUNT(*) AS count FROM writer_leases').get()?.count,
+          1,
+        );
+        assert.equal(context.children.length, 0);
+      }
+      const application = reopened.store.receipt(
+        `native-application:${reopened.store.intents()[0].attempt_id}`,
+      );
+      assert.equal(
+        application?.result.outcome,
+        boundary === 'application-intent' || boundary === 'manifest'
+          ? 'outcome-unknown'
+          : undefined,
+      );
+      assert(
+        reopened.store
+          .nativeProcesses(reopened.store.intents()[0].attempt_id)
+          .every((phase) => groupAbsent(phase.process_group)),
+      );
+    } finally {
+      await reopened.close();
+    }
+  }
+});

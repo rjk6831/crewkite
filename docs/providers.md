@@ -53,7 +53,9 @@ A live turn can include upstream retries and tool continuations. A turn cap does
 
 ## Applying a replacement
 
-The source helper separately rechecks the full saved scratch manifest and the opened target before replacing one existing regular file. It refuses links, mismatched hashes and stale file metadata. It preserves permissions, truncates to the replacement length and syncs the file. Native provider output is not wired to this helper in the controller. A write failure can retain unverified scratch and requires explicit recovery.
+The source helper separately rechecks the full saved scratch manifest and the opened target before replacing one existing regular file. It refuses links, mismatched hashes and stale file metadata. It preserves permissions, truncates to the replacement length and syncs the file. A write failure can retain unverified scratch and requires explicit recovery.
+
+A private in-process controller appointment connects the OpenAI writer to this helper for the literal `net.mjs` pilot. It freezes native trust, source consent, credit policy and an exact unqualified route. Process intent and ownership are journaled before input. The controller retains the proposal, waits for quiescence and rechecks authority before application. Inspection and patch export survive restart. Public launch, handoff and acceptance stay blocked for that pilot. Checks and review do not start automatically. Native cleanup finishes before SQLite closes. No live route is qualified.
 
 ## Qualification
 

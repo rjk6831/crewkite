@@ -11,7 +11,7 @@ import {
   openSync,
   readFileSync,
 } from 'node:fs';
-import { basename, join } from 'node:path';
+import { basename, isAbsolute, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import {
@@ -36,6 +36,7 @@ import {
   type FakeWorkerEvent,
   formatReviewTarget,
   type Grant,
+  HashSchema,
   MAX_FRAME_BYTES,
   type Observation,
   ObservationSchema,
@@ -47,6 +48,7 @@ import {
   ReviewJobSchema,
   type ReviewResult,
   type Route,
+  type RouterDecision,
   RouteSchema,
   type Run,
   RunSchema,
@@ -56,11 +58,13 @@ import {
   type Snapshot,
   SnapshotSchema,
   type Task,
+  TaskIdSchema,
   TaskSchema,
   TimestampSchema,
 } from '@crewkite/contracts';
 import { hashCanonical, verifyHandoff } from '@crewkite/contracts/hash';
 import { fakeReviewWorkerPath, fakeWorkerPath } from '@crewkite/testkit/worker';
+import { z } from 'zod';
 import { ArtifactFiles } from '../artifacts/index.ts';
 import { buildHandoff } from '../continuity/index.ts';
 import { CandidateEvidence, type CheckPlan } from '../evidence/index.ts';
@@ -72,6 +76,7 @@ import {
   validateIdentity,
 } from '../host/publication.ts';
 import {
+  applyReplacement,
   committedFiles,
   inspectSource,
   inspectSourceDetails,
@@ -87,11 +92,72 @@ import {
   OwnedWorker,
   type Schedule,
 } from '../host/worker.ts';
+import {
+  replacementPlan,
+  startReplacement,
+  type WriterPlan,
+} from '../providers/openai/replacement.ts';
 import { chooseRoute } from '../routing/index.ts';
 import { createIds, type IdPrefix } from '../store/ids.ts';
 import { type LaunchIntent, Store } from '../store/index.ts';
 import { deriveWindow } from '../usage/index.ts';
 import { chargedMinutes, remainingBudgets } from './budgets.ts';
+
+const NativeAppointmentSchema = z.strictObject({
+  id: z.string().regex(/^[a-zA-Z0-9-]{1,80}$/),
+  taskId: TaskIdSchema,
+  route: RouteSchema,
+  client: z.strictObject({
+    executable: z.string().max(4096).refine(isAbsolute),
+    sha256: HashSchema,
+    version: z.string().min(1).max(200),
+  }),
+  creditPolicy: z.enum(['ordinary', 'existing-credits']),
+  consent: z.strictObject({
+    nativeTrust: z.literal('accepted'),
+    source: z.enum(['explicit', 'policy']),
+    policyHash: HashSchema,
+    sourceBase: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/),
+    criteriaHash: HashSchema,
+  }),
+  policy: PolicySchema,
+  expiresAt: TimestampSchema,
+  maximumTaskMs: z.number().int().min(2001).max(300_000),
+  maximumSubmissions: z.literal(1),
+});
+export type NativePilotAppointment = z.infer<typeof NativeAppointmentSchema>;
+type NativeBinding = {
+  appointment: NativePilotAppointment;
+  run: Run;
+  attempt: Attempt;
+  original: string;
+  baseHash: string;
+  manifest: Omit<ReturnType<typeof readFiles>[number], 'content'>[];
+  planArtifact: Artifact;
+};
+type NativeRuntime = {
+  kind: 'native';
+  binding: NativeBinding;
+  stopped: boolean;
+  handle?: ReturnType<typeof startReplacement>;
+  done?: Promise<void>;
+  reason?: 'handoff' | 'stop' | 'switch';
+};
+type FakeRuntime = {
+  kind: 'fake';
+  worker: OwnedWorker;
+  terminal?: Extract<FakeWorkerEvent, { type: 'terminal' }>;
+  reason?: 'handoff' | 'stop' | 'switch';
+  failure?: string;
+  cancel?: () => void;
+};
+function freezeNative<T>(value: T): T {
+  if (value && typeof value === 'object') {
+    for (const child of Object.values(value)) freezeNative(child);
+    Object.freeze(value);
+  }
+  return value;
+}
 
 export type ControllerOptions = {
   home: string;
@@ -107,6 +173,7 @@ export type ControllerOptions = {
   ) => Extract<import('@crewkite/contracts').FakeWorkerInput, { type: 'start' }>['scenario'];
   afterIntent?: (intent: LaunchIntent) => void;
   schedule?: Schedule;
+  nativeSpawn?: Parameters<typeof startReplacement>[2]['spawn'];
 };
 const migrations = fileURLToPath(new URL('../../migrations/', import.meta.url));
 
@@ -125,16 +192,8 @@ export class Controller {
   private readonly owner: DatabaseSync;
   private closed = false;
   private readonly options: ControllerOptions;
-  private readonly workers = new Map<
-    string,
-    {
-      worker: OwnedWorker;
-      terminal?: Extract<FakeWorkerEvent, { type: 'terminal' }>;
-      reason?: 'handoff' | 'stop' | 'switch';
-      failure?: string;
-      cancel?: () => void;
-    }
-  >();
+  private closing?: Promise<void>;
+  private readonly workers = new Map<string, FakeRuntime | NativeRuntime>();
 
   constructor(options: ControllerOptions) {
     this.options = options;
@@ -203,6 +262,7 @@ export class Controller {
   }
 
   async execute(input: unknown, principal: string): Promise<CommandResult> {
+    if (this.closed) return { outcome: 'blocked', reason: 'controller-closing' };
     if (principal !== 'local-owner')
       return {
         outcome: 'denied',
@@ -217,6 +277,11 @@ export class Controller {
         next: 'Send a valid protocol 1 command.',
       };
     const command = parsed.data;
+    if (
+      command.command === 'ResumeRun' &&
+      this.store.receipt(`native-run:${command.payload.runId}`)
+    )
+      return { outcome: 'blocked', reason: 'native-pilot-retain-only' };
     if (!('expectedRevision' in command)) {
       try {
         return CommandResultSchema.parse(this.apply(command, []));
@@ -305,21 +370,33 @@ export class Controller {
   subscribe(listener: (event: Event) => void): () => void {
     return this.store.subscribe(listener);
   }
-  close() {
-    if (this.closed) return;
+  close(): void | Promise<void> {
+    if (this.closed) return this.closing;
     this.closed = true;
+    const native: Promise<void>[] = [];
     for (const runtime of this.workers.values()) {
-      runtime.cancel?.();
-      runtime.worker.child.stdin.end();
+      if (runtime.kind === 'native') {
+        runtime.stopped = true;
+        runtime.handle?.stop();
+        if (runtime.done) native.push(runtime.done);
+      } else {
+        runtime.cancel?.();
+        runtime.worker.child.stdin.end();
+      }
     }
     for (const cancel of this.jobCancels.values()) cancel();
     for (const job of this.jobs.values()) job.stop();
     for (const worker of this.reviewWorkers.values()) worker.child.stdin.end();
-    try {
-      this.store.close();
-    } finally {
-      this.owner.close();
-    }
+    const finish = () => {
+      try {
+        this.store.close();
+      } finally {
+        this.owner.close();
+      }
+    };
+    if (!native.length) finish();
+    else this.closing = Promise.allSettled(native).then(finish);
+    return this.closing;
   }
 
   private checkRevision(command: Command): CommandResult | undefined {
@@ -346,6 +423,14 @@ export class Controller {
   }
 
   private apply(command: Command, effects: (() => void)[]): CommandResult {
+    if (
+      'taskId' in command.payload &&
+      ['StartRun', 'ResumeRun', 'SwitchRoute', 'AcceptCandidate'].includes(command.command)
+    ) {
+      const task = this.store.get<Task>('task', command.payload.taskId);
+      if (task?.runId && this.store.receipt(`native-run:${task.runId}`))
+        return { outcome: 'blocked', reason: 'native-pilot-retain-only' };
+    }
     if (
       'taskId' in command.payload &&
       ['AcceptCandidate', 'ExportPatch', 'GetChanges'].includes(command.command) &&
@@ -787,10 +872,14 @@ export class Controller {
     approved?: string,
     planned?: Attempt,
     transfer = false,
+    native?: NativeBinding,
   ): CommandResult {
     const task = this.store.get<Task>('task', command.payload.taskId);
     const run = this.store.get<Run>('run', command.payload.runId);
-    if (task && !approved && !transfer) {
+    if (this.closed) return { outcome: 'blocked', reason: 'controller-closing' };
+    if (!native && run && this.store.receipt(`native-run:${run.id}`))
+      return { outcome: 'blocked', reason: 'native-pilot-retain-only' };
+    if (task && !approved && !transfer && !native) {
       const gate = this.resumeGate(task, command.payload.runId);
       if (gate) return gate;
     }
@@ -820,7 +909,9 @@ export class Controller {
         next: 'Prepare the launch card again.',
       };
     const target = this.pendingSwitch(run);
-    const decision = this.routing(run, 'coder', target);
+    const decision = native
+      ? this.nativeDecision(native.appointment, run)
+      : this.routing(run, 'coder', target);
     if (!decision.chosen)
       return {
         outcome: 'blocked',
@@ -953,10 +1044,397 @@ export class Controller {
       .intents()
       .find((value) => value.attempt_id === attempt.id) as LaunchIntent;
     effects.push(() => {
-      this.options.afterIntent?.(intent);
-      this.launch(intent, admitted, attempt);
+      if (!native) this.options.afterIntent?.(intent);
+      if (native) this.launchNative(intent, freezeNative({ ...native, run: admitted, attempt }));
+      else this.launch(intent, admitted, attempt);
     });
     return { outcome: 'applied', entity: updated, revision: updated.revision };
+  }
+
+  startNativePilot(input: NativePilotAppointment): CommandResult {
+    const effects: (() => void)[] = [];
+    try {
+      const appointment = freezeNative(NativeAppointmentSchema.parse(input));
+      const result = this.store.transaction<CommandResult>(() => {
+        if (this.closed) throw new Error('Controller is closing.');
+        const key = `native-appointment:${appointment.id}`;
+        const hash = hashCanonical(appointment);
+        const prior = this.store.receipt(key);
+        if (prior)
+          return prior.hash === hash
+            ? { ...prior.result, outcome: 'already-applied' }
+            : { outcome: 'denied', reason: 'native-appointment-changed' };
+        const task = this.store.get<Task>('task', appointment.taskId);
+        if (task?.state !== 'draft' || this.draftEditGate(task))
+          throw new Error('The appointment needs an unstarted draft.');
+        const route = appointment.route;
+        if (
+          route.fake ||
+          route.qualified ||
+          route.family !== 'openai' ||
+          route.billing !== (appointment.creditPolicy === 'ordinary' ? 'included' : 'credits') ||
+          route.speed ||
+          route.effort.requested !== route.effort.effective ||
+          !route.effort.supported.includes(route.effort.requested) ||
+          this.store.get('route', route.id)
+        )
+          throw new Error('The appointment route identity is invalid.');
+        if (
+          appointment.consent.policyHash !== hashCanonical(appointment.policy) ||
+          appointment.consent.criteriaHash !== hashCanonical(task.criteria) ||
+          Date.parse(appointment.expiresAt) <= Date.parse(this.now())
+        )
+          throw new Error('The appointment consent is stale.');
+        const source = inspectSource(task.projectId, this.projectPath(task.projectId) as string);
+        if (source.base !== appointment.consent.sourceBase)
+          throw new Error('The appointed source base changed.');
+        const files = committedFiles(this.projectPath(task.projectId) as string, source.base);
+        const original = files.find((file) => file.path === 'net.mjs');
+        if (!original || original.content.toString('utf8').length > 65_536)
+          throw new Error('The appointed target is unavailable.');
+        const methods = appointment.policy.methods ?? [];
+        if (
+          !requiredReviewMethodIds(appointment.policy.quality).every((id) =>
+            methods.some((method) => method.id === id),
+          ) ||
+          appointment.policy.limits.attempts <
+            methods.reduce((sum, method) => sum + method.cycles, 0) + 2
+        )
+          throw new Error('The appointed policy lacks check and review headroom.');
+        const attemptId = this.id('att');
+        const run = RunSchema.parse({
+          id: this.id('run'),
+          taskId: task.id,
+          source,
+          policy: { policy: appointment.policy, hash: hashCanonical(appointment.policy) },
+          roles: [{ role: 'coder', routeId: route.id, pinned: true, approvedFallbacks: [] }],
+          decision: { chosen: route.id, rejected: [], rule: 'manual', inputsHash: hash },
+          revision: 0,
+        });
+        const attempt = AttemptSchema.parse({
+          id: attemptId,
+          runId: run.id,
+          routeId: route.id,
+          generation: 0,
+          state: 'intent',
+          revision: 0,
+        });
+        // Validate the exact model and payload through the provider's existing boundary.
+        replacementPlan({
+          attemptId,
+          model: route.model as WriterPlan['model'],
+          effort: route.effort.requested as WriterPlan['effort'],
+          creditPolicy: appointment.creditPolicy,
+          directory: join(this.home, 'native', attemptId),
+          original: original.content.toString('utf8'),
+          baseHash: original.hash,
+          criteria: task.criteria,
+        });
+        this.nativeDecision(appointment, run);
+        const project = this.store.get<Project>('project', task.projectId) as Project;
+        if (!this.grant(run, 'write-scratch', project.name))
+          throw new Error('The appointment needs a saved scratch grant.');
+        const manifest = files.map(({ content: _content, ...file }) => file);
+        const planArtifact = this.nativeArtifact({
+          appointment,
+          run,
+          attempt,
+          manifest,
+          originalHash: original.hash,
+        });
+        const binding = freezeNative({
+          appointment,
+          run,
+          attempt,
+          manifest,
+          original: original.content.toString('utf8'),
+          baseHash: original.hash,
+          planArtifact,
+        });
+        this.store.put('route', route.id, 0, route);
+        this.store.put('run', run.id, 0, run);
+        this.updateTask(task, { runId: run.id });
+        this.store.saveReceipt(`native-run:${run.id}`, hash, 'local-owner', {
+          outcome: 'applied',
+          entity: planArtifact,
+        });
+        const result = this.start(
+          {
+            protocol: 1,
+            key: this.id('cmd'),
+            actor: { id: 'local-owner', kind: 'cli' },
+            command: 'StartRun',
+            expectedRevision: task.revision + 1,
+            payload: { taskId: task.id, runId: run.id },
+          },
+          effects,
+          undefined,
+          attempt,
+          false,
+          binding,
+        );
+        if (result.outcome !== 'applied') throw new Error('The appointed run failed admission.');
+        this.store.saveReceipt(key, hash, 'local-owner', result);
+        return result;
+      });
+      for (const effect of effects) effect();
+      return result;
+    } catch {
+      return {
+        outcome: 'blocked',
+        reason: 'native-appointment-unavailable',
+        next: 'Inspect the exact appointment, consent and retained ownership.',
+      };
+    }
+  }
+
+  private nativeDecision(appointment: NativePilotAppointment, run: Run): RouterDecision {
+    const policy = run.policy.policy;
+    const allowance = policy.unknownUsage;
+    const active = this.store.intents().filter((intent) => intent.state !== 'stopped');
+    // Native observations cannot yet establish a reserve in the controller's usage units.
+    if (
+      policy.reserves.length ||
+      allowance.rule !== 'fixed-allowance' ||
+      allowance.allowance.launches < 1 ||
+      allowance.allowance.minutes < policy.limits.minutes ||
+      policy.limits.minutes * 60_000 < appointment.maximumTaskMs ||
+      active.some((intent) => intent.route_id === appointment.route.id) ||
+      Date.parse(appointment.expiresAt) <= Date.parse(this.now())
+    )
+      throw new Error('The appointed allowance or reserve premise is unavailable.');
+    return {
+      chosen: appointment.route.id,
+      rejected: [],
+      rule: 'manual',
+      inputsHash: hashCanonical({ appointment, runId: run.id, active }),
+    };
+  }
+
+  private nativeArtifact(value: unknown): Artifact {
+    const artifact = ArtifactSchema.parse({
+      id: this.id('art'),
+      ...this.artifacts.publish(Buffer.from(canonicalJson(value))),
+      mediaType: 'application/vnd.crewkite.native+json',
+    });
+    this.saveArtifacts([artifact]);
+    return artifact;
+  }
+
+  private nativeCurrent(runtime: NativeRuntime) {
+    const { appointment, run, attempt } = runtime.binding;
+    const task = this.store.get<Task>('task', run.taskId);
+    const current = this.store.get<Attempt>('attempt', attempt.id);
+    const saved = this.store.get<Run>('run', run.id);
+    const lease = this.store.db
+      .prepare('SELECT attempt_id,generation FROM writer_leases WHERE task_id=?')
+      .get(run.taskId);
+    if (
+      this.closed ||
+      runtime.stopped ||
+      runtime.reason === 'stop' ||
+      task?.runId !== run.id ||
+      task.state !== 'running' ||
+      !current ||
+      !['intent', 'running'].includes(current.state) ||
+      current.generation !== attempt.generation ||
+      lease?.attempt_id !== attempt.id ||
+      lease.generation !== attempt.generation ||
+      saved?.policy.hash !== appointment.consent.policyHash ||
+      hashCanonical(task.criteria) !== appointment.consent.criteriaHash ||
+      Date.parse(appointment.expiresAt) <= Date.parse(this.now()) ||
+      this.jobDeadline(attempt.id, appointment.maximumTaskMs / 60_000) === 0 ||
+      hashCanonical(inspectSource(task.projectId, this.projectPath(task.projectId) as string)) !==
+        hashCanonical(run.source)
+    )
+      throw new Error('The native appointment is no longer current.');
+  }
+
+  private launchNative(intent: LaunchIntent, binding: NativeBinding) {
+    if (this.closed) return;
+    const runtime: NativeRuntime = { kind: 'native', binding, stopped: false };
+    const completion = Promise.withResolvers<void>();
+    runtime.done = completion.promise;
+    this.workers.set(binding.attempt.id, runtime);
+    const { appointment, run, attempt } = binding;
+    const finish = (outcome: Awaited<ReturnType<typeof startReplacement>['result']> | null) => {
+      try {
+        let applied = false;
+        const phases = this.store.nativeProcesses(attempt.id);
+        const quiescent =
+          outcome?.quiescent === true &&
+          phases.length > 0 &&
+          phases.every((phase) => phase.state === 'quiescent');
+        try {
+          this.store.transaction(() => {
+            const artifact = this.nativeArtifact({
+              attemptId: attempt.id,
+              reason: outcome ? outcome.reason : 'launch',
+              quiescent,
+              diagnostic: outcome?.diagnostic ?? null,
+            });
+            this.store.saveReceipt(
+              `native-completion:${attempt.id}`,
+              artifact.hash,
+              'local-owner',
+              {
+                outcome: 'applied',
+                entity: artifact,
+              },
+            );
+            if (outcome?.metadata) {
+              const proposal = this.nativeArtifact(outcome.metadata);
+              this.store.saveReceipt(
+                `native-proposal:${attempt.id}`,
+                proposal.hash,
+                'local-owner',
+                {
+                  outcome: 'applied',
+                  entity: proposal,
+                },
+              );
+            }
+          });
+          if (quiescent && outcome?.metadata && !outcome.reason) {
+            this.nativeCurrent(runtime);
+            this.store.transaction(() => {
+              this.nativeCurrent(runtime);
+              const artifact = this.nativeArtifact({
+                attemptId: attempt.id,
+                proposalHash: hashCanonical(outcome.metadata),
+                manifest: binding.manifest,
+              });
+              this.store.saveReceipt(
+                `native-application:${attempt.id}`,
+                artifact.hash,
+                'local-owner',
+                { outcome: 'outcome-unknown', entity: artifact },
+              );
+            });
+            this.nativeCurrent(runtime);
+            applyReplacement(intent.scratch_path, binding.manifest, outcome.metadata.replacement);
+            this.store.transaction(() =>
+              this.store.db.prepare('UPDATE receipts SET result=? WHERE command_key=?').run(
+                canonicalJson({
+                  outcome: 'applied',
+                  entity: this.store.receipt(`native-application:${attempt.id}`)?.result.entity,
+                }),
+                `native-application:${attempt.id}`,
+              ),
+            );
+            applied = true;
+          }
+        } catch {
+          // A committed intent can outlive an interrupted write. Recovery never reapplies it.
+        }
+        try {
+          if (this.settleJob(attempt, quiescent, true)) {
+            this.store.transaction(() => {
+              const task = this.store.get<Task>('task', run.taskId) as Task;
+              this.closePendingEffects(task);
+              this.updateTask(task, {
+                state: applied ? 'stopped' : 'interrupted',
+                waitingReason: null,
+                next: applied
+                  ? 'Native work is retained. Checks and review remain pending.'
+                  : 'Native work is unverified. Inspect retained ownership and artifacts.',
+              });
+            });
+            this.sealCandidate(attempt);
+          }
+        } catch {
+          // Preserve the journal and bytes when capture cannot finish.
+        } finally {
+          if (quiescent) this.workers.delete(attempt.id);
+        }
+      } catch {
+        // Unreadable ownership cannot release a lease or justify application.
+        try {
+          this.settleJob(attempt, false, true);
+        } catch {}
+      } finally {
+        completion.resolve();
+      }
+    };
+    try {
+      this.options.afterIntent?.(intent);
+      this.nativeCurrent(runtime);
+      if (!existsSync(intent.scratch_path))
+        materialize(
+          intent.scratch_path,
+          committedFiles(this.projectPath(run.source.projectId) as string, run.source.base),
+        );
+      const directory = join(this.home, 'native', attempt.id);
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
+      const plan = replacementPlan({
+        attemptId: attempt.id,
+        model: appointment.route.model as WriterPlan['model'],
+        effort: appointment.route.effort.requested as WriterPlan['effort'],
+        creditPolicy: appointment.creditPolicy,
+        directory,
+        original: binding.original,
+        baseHash: binding.baseHash,
+        criteria: [...(this.store.get<Task>('task', run.taskId) as Task).criteria],
+      });
+      const timeoutMs = Math.min(
+        appointment.maximumTaskMs,
+        this.jobDeadline(attempt.id, appointment.maximumTaskMs / 60_000),
+        Date.parse(appointment.expiresAt) - Date.parse(this.now()),
+      );
+      runtime.handle = startReplacement(
+        {
+          ...appointment.client,
+          directory,
+          repositoryRoot: this.home,
+          environment: process.env,
+        },
+        plan,
+        {
+          timeoutMs,
+          schedule: this.options.schedule,
+          spawn: this.options.nativeSpawn,
+          onSubmitted: () => {
+            this.nativeCurrent(runtime);
+            this.store.transaction(() => {
+              this.nativeCurrent(runtime);
+              const artifact = this.nativeArtifact({
+                attemptId: attempt.id,
+                plan: binding.planArtifact.hash,
+              });
+              this.store.saveReceipt(
+                `native-submission:${attempt.id}`,
+                binding.planArtifact.hash,
+                'local-owner',
+                { outcome: 'outcome-unknown', entity: artifact },
+              );
+            });
+          },
+          lifecycle: {
+            beforePhase: (phase) => {
+              this.nativeCurrent(runtime);
+              this.store.transaction(() =>
+                this.store.intendNativePhase(attempt.id, phase.sequence, phase.kind, this.now()),
+              );
+            },
+            owned: (phase, group) => {
+              this.store.transaction(() => {
+                this.store.ownNativePhase(attempt.id, phase.sequence, group);
+              });
+              if (phase.sequence === 0) this.acknowledgeJob(attempt, group);
+              this.nativeCurrent(runtime);
+            },
+            quiescent: (phase, group) =>
+              this.store.transaction(() =>
+                this.store.finishNativePhase(attempt.id, phase.sequence, group, this.now()),
+              ),
+          },
+        },
+      );
+      if (runtime.stopped || this.closed) runtime.handle.stop();
+      void runtime.handle.result.then(finish, () => finish(null));
+    } catch {
+      finish(null);
+    }
   }
 
   private hasUncertainWriter(taskId: string): boolean {
@@ -1132,11 +1610,12 @@ export class Controller {
         onEvent: (event) => this.workerEvent(attempt.id, event),
         onFailure: (reason) => this.workerFailure(attempt.id, reason),
       });
-      this.workers.set(attempt.id, { worker });
+      this.workers.set(attempt.id, { kind: 'fake', worker });
       const deadline = this.jobDeadline(attempt.id, reserved);
       const runtime = this.workers.get(attempt.id) as NonNullable<
         ReturnType<typeof this.workers.get>
-      >;
+      > &
+        FakeRuntime;
       runtime.cancel = (this.options.schedule ?? defaultSchedule)(() => {
         if (this.closed) return;
         runtime.failure = 'The run minute limit was reached.';
@@ -1191,7 +1670,7 @@ export class Controller {
 
   private workerEvent(attemptId: string, event: FakeWorkerEvent) {
     const runtime = this.workers.get(attemptId);
-    if (!runtime || this.closed) return;
+    if (runtime?.kind !== 'fake' || this.closed) return;
     const attempt = this.store.get<Attempt>('attempt', attemptId);
     if (!attempt || attempt.state === 'unknown' || attempt.state === 'stopped') return;
     const run = this.store.get<Run>('run', attempt.runId) as Run;
@@ -1320,7 +1799,7 @@ export class Controller {
 
   private workerFailure(attemptId: string, reason: string) {
     const runtime = this.workers.get(attemptId);
-    if (!runtime || this.closed) return;
+    if (runtime?.kind !== 'fake' || this.closed) return;
     runtime.failure = reason;
     runtime.worker.child.stdin.end();
   }
@@ -1332,6 +1811,7 @@ export class Controller {
     if (
       this.closed ||
       !runtime ||
+      runtime.kind !== 'fake' ||
       !attempt ||
       attempt.state === 'stopped' ||
       (attempt.state === 'unknown' && !quiescent) ||
@@ -1522,9 +2002,13 @@ export class Controller {
       next: 'Waiting for process-group quiescence.',
     });
     effects.push(() => {
-      void runtime.worker
-        .stop({ schedule: this.options.schedule })
-        .then((exit) => this.finishAttempt(active.attempt_id, exit.quiescent));
+      if (runtime.kind === 'native') {
+        runtime.stopped = true;
+        runtime.handle?.stop();
+      } else
+        void runtime.worker
+          .stop({ schedule: this.options.schedule })
+          .then((exit) => this.finishAttempt(active.attempt_id, exit.quiescent));
     });
     return { outcome: 'applied', entity: updated, revision: updated.revision };
   }
@@ -1629,6 +2113,13 @@ export class Controller {
       at?: string;
       previousStatus?: Pick<Task, 'state' | 'waitingReason' | 'next'>;
     };
+    if (
+      task.runId &&
+      this.store.receipt(`native-run:${task.runId}`) &&
+      request.kind !== 'export' &&
+      command.payload.decision !== 'denied'
+    )
+      return { outcome: 'blocked', reason: 'native-pilot-retain-only' };
     if (hashCanonical(request) !== pending.effect_hash)
       return { outcome: 'denied', reason: 'pending-effect-changed' };
     if (request.kind !== 'worker' && this.hasUncertainWriter(task.id))
@@ -1661,9 +2152,16 @@ export class Controller {
       .prepare('UPDATE pending_effects SET state=? WHERE approval_id=?')
       .run(command.payload.decision === 'approved' ? 'approved' : 'denied', approval.approvalId);
     this.event('approval.resolved', task.id, task.revision, updated);
+    if (
+      task.runId &&
+      this.store.receipt(`native-run:${task.runId}`) &&
+      command.payload.decision === 'denied'
+    )
+      return { outcome: 'applied', entity: task, revision: task.revision };
     if (request.kind === 'worker') {
       const runtime = this.workers.get(approval.attemptId);
-      if (!runtime) return { outcome: 'blocked', reason: 'approval-worker-not-active' };
+      if (runtime?.kind !== 'fake')
+        return { outcome: 'blocked', reason: 'approval-worker-not-active' };
       const next = this.updateTask(task, {
         state: command.payload.decision === 'approved' ? 'running' : 'stopping',
         waitingReason: null,
@@ -1806,11 +2304,25 @@ export class Controller {
       .intents()
       .find((value) => value.attempt_id === attempt.id) as LaunchIntent;
     const files = readFiles(intent.scratch_path);
+    const native = !!this.store.receipt(`native-run:${run.id}`);
+    const nativeCandidates = new Set(
+      this.store
+        .intents()
+        .filter((value) => this.store.receipt(`native-run:${value.run_id}`))
+        .map(
+          (value) =>
+            CandidateSchema.safeParse(
+              this.store.receipt(`candidate:${value.attempt_id}`)?.result.entity,
+            ).data?.id,
+        ),
+    );
     const captured = this.evidence.capture({
       taskId: run.taskId,
       base: run.source.base,
       files,
-      existing: this.store.list<Candidate>('candidate'),
+      existing: this.store
+        .list<Candidate>('candidate')
+        .filter((candidate) => nativeCandidates.has(candidate.id) === native),
     });
     const changes = this.store.receipt(`changes:${captured.candidate.id}`)
       ? undefined
@@ -1987,8 +2499,8 @@ export class Controller {
     );
   }
 
-  private settleJob(attempt: Attempt, quiescent: boolean): boolean {
-    if (this.closed) return false;
+  private settleJob(attempt: Attempt, quiescent: boolean, closing = false): boolean {
+    if (this.closed && !closing) return false;
     const current = this.store.get<Attempt>('attempt', attempt.id) as Attempt;
     if (current.state === 'stopped' || (current.state === 'unknown' && !quiescent)) return false;
     this.store.transaction(() => {
@@ -2033,6 +2545,8 @@ export class Controller {
   ) {
     const run = this.store.get<Run>('run', writer.runId) as Run;
     const task = this.store.get<Task>('task', run.taskId) as Task;
+    if (this.store.receipt(`native-run:${run.id}`))
+      throw new Error('The native pilot permits retention and export only.');
     if (this.hasUncertainWriter(task.id) || this.latestCandidate(run.id)?.hash !== candidate.hash)
       throw new Error('Candidate binding changed.');
     const plan = this.evidence.prepareChecks({
@@ -2351,6 +2865,8 @@ export class Controller {
     }
     if (this.hasUncertainWriter(task.id) || this.latestCandidate(run.id)?.hash !== candidate.hash)
       throw new Error('Review candidate binding changed.');
+    if (this.store.receipt(`native-run:${run.id}`))
+      throw new Error('The native pilot permits retention and export only.');
     if (!this.attestedReviewWriter(run, candidate, writer))
       throw new Error('Review writer provenance is not attested.');
     const completed = this.store.db
@@ -2637,7 +3153,7 @@ export class Controller {
   }
 
   private afterChecks(writer: Attempt, candidate: Candidate, handoff: boolean) {
-    if (this.closed) return;
+    if (this.closed || this.store.receipt(`native-run:${writer.runId}`)) return;
     if (this.store.receipt(`paused:${writer.runId}`)) {
       this.stoppedJob(writer);
       return;
@@ -2718,6 +3234,17 @@ export class Controller {
         .prepare('SELECT body FROM evidence WHERE candidate_id=? AND candidate_hash=?')
         .all(candidate.id, candidate.hash))
         evidenceRoot(CheckResultSchema.parse(JSON.parse(row.body as string)));
+    }
+    for (const intent of this.store.intents().filter((intent) => intent.task_id === taskId)) {
+      for (const key of [
+        `native-run:${intent.run_id}`,
+        ...['submission', 'proposal', 'application', 'completion'].map(
+          (kind) => `native-${kind}:${intent.attempt_id}`,
+        ),
+      ]) {
+        const artifact = this.store.receipt(key)?.result.entity;
+        if (artifact && 'mediaType' in artifact) include(ArtifactSchema.parse(artifact));
+      }
     }
     const received = this.store.db
       .prepare(
@@ -2853,6 +3380,8 @@ export class Controller {
         reason: 'switch-needs-writer',
         next: 'Switch only an active or stopped coding attempt in the current run.',
       };
+    if (this.store.receipt(`native-run:${run.id}`))
+      return { outcome: 'blocked', reason: 'native-pilot-retain-only' };
     const runtime = this.workers.get(last.attempt_id);
     if (last.state !== 'stopped' && !runtime)
       return {
@@ -2905,6 +3434,8 @@ export class Controller {
       next: `Selected route ${target} is saved. Stop the outgoing writer, then recheck the original policy and remaining limits.`,
     });
     const writer = this.store.get<Attempt>('attempt', last.attempt_id) as Attempt;
+    if (runtime?.kind === 'native')
+      return { outcome: 'blocked', reason: 'native-pilot-retain-only' };
     if (runtime) {
       runtime.reason = 'switch';
       effects.push(() => {
@@ -2917,7 +3448,7 @@ export class Controller {
   }
 
   private continueSwitch(writer: Attempt) {
-    if (this.closed) return;
+    if (this.closed || this.store.receipt(`native-run:${writer.runId}`)) return;
     const run = this.store.get<Run>('run', writer.runId) as Run;
     const target = this.pendingSwitch(run);
     if (!target) return;
@@ -2993,6 +3524,8 @@ export class Controller {
   }
 
   private prepareResumeContext(taskId: string, runId: string) {
+    if (this.store.receipt(`native-run:${runId}`))
+      throw new Error('The native pilot permits retention and export only.');
     const task = this.store.get<Task>('task', taskId);
     const run = this.store.get<Run>('run', runId);
     if (
@@ -3039,6 +3572,8 @@ export class Controller {
   private transfer(writer: Attempt, candidate: Candidate) {
     const run = this.store.get<Run>('run', writer.runId) as Run;
     const task = this.store.get<Task>('task', run.taskId) as Task;
+    if (this.store.receipt(`native-run:${run.id}`))
+      throw new Error('The native pilot permits retention and export only.');
     if (this.hasUncertainWriter(task.id)) throw new Error('Handoff requires quiescence.');
     const outgoing = this.store.get<Attempt>('attempt', writer.id) as Attempt;
     const packet = this.contextPacket(outgoing, candidate, true);
@@ -3088,6 +3623,8 @@ export class Controller {
       'candidate',
       command.payload.candidateId,
     ) as Candidate;
+    if (this.store.receipt(`native-run:${run.id}`))
+      return { outcome: 'blocked', reason: 'native-pilot-retain-only' };
     if (!['ready', 'accepted', 'waiting'].includes(task.state))
       return { outcome: 'blocked', reason: 'candidate-not-ready' };
     if (
@@ -3249,6 +3786,8 @@ export class Controller {
       const origin = this.store.receipt(`publication-run:${candidateId}`)?.result.entity as
         | Run
         | undefined;
+      if (origin && this.store.receipt(`native-run:${origin.id}`))
+        throw new Error('The native pilot permits retention and export only.');
       const source = this.projectPath(task.projectId) as string;
       const observed = refValue(source, publication.destination_ref as string);
       if (observed !== publication.commit_oid) {

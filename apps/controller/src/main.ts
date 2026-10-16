@@ -9,19 +9,31 @@ export async function startController(options: ControllerOptions) {
   const controller = new Controller(options);
   try {
     const server = await serve(controller);
+    let closing: Promise<void> | undefined;
     return {
       controller,
       socketPath: server.socketPath,
-      close: async () => {
+      close: () => {
+        if (closing) return closing;
+        const completion = Promise.withResolvers<void>();
+        closing = completion.promise;
         try {
-          await server.close();
-        } finally {
-          controller.close();
+          const stopped = controller.close();
+          void (async () => {
+            try {
+              await server.close();
+            } finally {
+              await stopped;
+            }
+          })().then(completion.resolve, completion.reject);
+        } catch (error) {
+          completion.reject(error);
         }
+        return closing;
       },
     };
   } catch (error) {
-    controller.close();
+    await controller.close();
     throw error;
   }
 }

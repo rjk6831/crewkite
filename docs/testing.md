@@ -24,7 +24,9 @@ I skip tests for trivial getters, framework behavior, type-only code and markup 
 | Interface | One journey through desktop and CLI on the same task, keyboard path, hostile output stays inert | Playwright driving Electron, CLI in a subprocess | Under 2 minutes |
 | Package | Installed app finds its runtime, survives removal of the source tree | Manual or scheduled on macOS hardware | Per release |
 
-`pnpm verify` must stay under five minutes on a laptop. The current suite has 38 tests: five policy tests, two contract tests, seven allocation and continuity tests, four client and CLI tests, nine controller tests, two source claims, eight provider claims, and one desktop journey. It also runs lint, types and the desktop build. CI runs the full suite natively on macOS 15 with Chromium sandboxing enabled. Linux desktop startup remains unqualified. Installed-package recovery remains a separate check.
+`pnpm verify` must stay under five minutes on a laptop. The current suite has 40 tests: five policy tests, two contract tests, seven allocation and continuity tests, four client and CLI tests, eleven controller tests, two source claims, eight provider claims, and one desktop journey. It also runs lint, types and the desktop build. CI runs the full suite natively on macOS 15 with Chromium sandboxing enabled. Linux desktop startup remains unqualified. Installed-package recovery remains a separate check.
+
+Two controller claims connect the native owner to retained artifacts and patch export with the same scripted protocol fixture used at the provider boundary. They cover frozen appointment data, submission uniqueness, phase ownership, Stop, deadline and stale-source refusal, awaited cleanup and uncertain application receipts across restart. They spend no inference and establish no native qualification.
 
 The provider claims use fixed transcripts and scripted child processes to check metadata projection, request and attempt correlation, bounded replacement output and owned cleanup. The fixtures establish no native account, billing or route readiness.
 
