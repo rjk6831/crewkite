@@ -36,6 +36,7 @@ import {
   type FakeWorkerEvent,
   formatReviewTarget,
   type Grant,
+  GrantSchema,
   HashSchema,
   MAX_FRAME_BYTES,
   NativeProfileSchema,
@@ -46,8 +47,11 @@ import {
   PolicySchema,
   type Project,
   ProjectSchema,
+  RemainingBudgetsSchema,
   type ReviewJob,
   ReviewJobSchema,
+  ReviewMethodIdSchema,
+  ReviewMethodSchema,
   type ReviewResult,
   type Route,
   type RouterDecision,
@@ -69,7 +73,7 @@ import { fakeReviewWorkerPath, fakeWorkerPath } from '@crewkite/testkit/worker';
 import { z } from 'zod';
 import { ArtifactFiles } from '../artifacts/index.ts';
 import { buildHandoff } from '../continuity/index.ts';
-import { CandidateEvidence, type CheckPlan } from '../evidence/index.ts';
+import { CandidateEvidence, type CheckPlan, NodeCheckDefinitionSchema } from '../evidence/index.ts';
 import {
   applyPublication,
   type GitIdentity,
@@ -171,6 +175,36 @@ type NativeBinding = {
   public?: z.infer<typeof NativePublicScopeSchema>;
   environment?: NodeJS.ProcessEnv;
 };
+const EvaluationConsentSchema = z.strictObject({
+  scopeHash: HashSchema,
+  expiresAt: TimestampSchema,
+});
+const CandidateEvaluationSchema = z.strictObject({
+  run: RunSchema,
+  writer: AttemptSchema,
+  candidate: CandidateSchema,
+  context: z.strictObject({
+    title: z.string().min(1).max(200),
+    outcome: z.string().min(1).max(4096),
+    criteria: z.array(z.string().min(1).max(4096)).min(1).max(100),
+  }),
+  definition: NodeCheckDefinitionSchema,
+  reviewer: z.strictObject({
+    profileId: z.string().min(1).max(200),
+    methodId: ReviewMethodIdSchema,
+    cycles: z.literal(1),
+    role: ReviewMethodSchema.shape.reviewerRole,
+    profile: NativeProfileSchema,
+    client: NativeAppointmentSchema.shape.client,
+    locationHash: HashSchema,
+  }),
+  creditPolicy: z.enum(['ordinary', 'existing-credits']),
+  grants: z.array(GrantSchema).length(2),
+  remaining: RemainingBudgetsSchema,
+  maximumCheckMinutes: z.literal(1),
+  scopeHash: HashSchema,
+  expiresAt: TimestampSchema,
+});
 type NativeRuntime = {
   kind: 'native';
   binding: NativeBinding;
@@ -582,6 +616,10 @@ export class Controller {
         return this.prepare(command);
       case 'PrepareNativeRun':
         return this.prepareNative(command);
+      case 'PrepareCandidateEvaluation':
+        return this.prepareEvaluation(command);
+      case 'StartCandidateEvaluation':
+        return this.startEvaluation(command, effects);
       case 'StartRun':
       case 'ResumeRun':
         return this.start(command, effects);
@@ -1341,6 +1379,362 @@ export class Controller {
     });
     this.event('run.prepared', task.id, updated.revision, binding.run);
     return { outcome: 'applied', entity: binding.run, revision: updated.revision };
+  }
+
+  private evaluationOrigin(taskId: string, candidateId: string) {
+    const task = this.store.get<Task>('task', taskId);
+    const run = task?.runId ? this.store.get<Run>('run', task.runId) : undefined;
+    const candidate = this.store.get<Candidate>('candidate', candidateId);
+    if (
+      !task ||
+      !run ||
+      !candidate ||
+      candidate.taskId !== task.id ||
+      this.latestCandidate(run.id)?.id !== candidate.id ||
+      this.hasUncertainWriter(task.id)
+    )
+      throw Error('Evaluation needs the current stopped candidate.');
+    const origin = this.store.receipt(`native-run:${run.id}`);
+    const artifact = ArtifactSchema.parse(origin?.result.entity);
+    if (artifact.bytes > MAX_FRAME_BYTES) throw Error('Native origin exceeds its bound.');
+    const plan = NativePreparationSchema.extend({
+      public: NativePublicScopeSchema.optional(),
+    }).parse(JSON.parse(this.artifacts.read(artifact.hash).toString('utf8')));
+    const writer = this.store.get<Attempt>('attempt', plan.attempt.id);
+    const completionArtifact = ArtifactSchema.parse(
+      this.store.receipt(`native-completion:${plan.attempt.id}`)?.result.entity,
+    );
+    if (completionArtifact.bytes > 4096) throw Error('Native completion exceeds its bound.');
+    const completion = JSON.parse(this.artifacts.read(completionArtifact.hash).toString('utf8'));
+    if (
+      !writer ||
+      !this.attestedReviewWriter(run, candidate, writer) ||
+      completion.attemptId !== writer.id ||
+      completion.reason !== null ||
+      completion.quiescent !== true ||
+      this.store.receipt(`native-application:${writer.id}`)?.result.outcome !== 'applied' ||
+      plan.run.id !== run.id ||
+      plan.run.taskId !== run.taskId ||
+      hashCanonical(plan.run.policy) !== hashCanonical(run.policy) ||
+      hashCanonical(plan.run.source) !== hashCanonical(run.source) ||
+      hashCanonical(plan.run.roles) !== hashCanonical(run.roles) ||
+      plan.appointment.consent.criteriaHash !== hashCanonical(task.criteria) ||
+      (plan.public &&
+        (plan.public.context.title !== task.title ||
+          plan.public.context.outcome !== task.outcome)) ||
+      hashCanonical(inspectSource(task.projectId, this.projectPath(task.projectId) as string)) !==
+        hashCanonical(run.source) ||
+      this.evidence.hash(run.source.base, readFiles(join(this.home, 'scratch', run.id))) !==
+        candidate.hash
+    )
+      throw Error('Evaluation origin or saved context changed.');
+    return { task, run, writer, candidate };
+  }
+
+  private prepareEvaluation(
+    command: Extract<Command, { command: 'PrepareCandidateEvaluation' }>,
+  ): CommandResult {
+    let plan: z.infer<typeof CandidateEvaluationSchema>;
+    let scopeHash: string;
+    try {
+      const { task, run, writer, candidate } = this.evaluationOrigin(
+        command.payload.taskId,
+        command.payload.candidateId,
+      );
+      if (
+        task.state !== 'stopped' ||
+        this.store.receipt(`evaluation-started:${run.id}`) ||
+        this.store.receipt(`paused:${run.id}`)
+      )
+        throw Error('Evaluation is unavailable.');
+      const methods = run.policy.policy.methods ?? [];
+      const selected = command.payload.reviewer;
+      if (
+        methods.length !== 1 ||
+        methods[0].id !== selected.methodId ||
+        methods[0].cycles !== selected.cycles ||
+        !requiredReviewMethodIds(run.policy.policy.quality).every(
+          (method) => method === selected.methodId,
+        )
+      )
+        throw Error('The selected evaluation cannot cover the saved quality floor.');
+      this.profile = this.options.nativeProfile?.() ?? unavailableNativeProfile();
+      const profile = this.profile;
+      if (
+        !profile.facts.available ||
+        profile.facts.id !== selected.profileId ||
+        !profile.facts.creditPolicies.includes(command.payload.creditPolicy) ||
+        !profile.client ||
+        !profile.locationHash ||
+        !profile.environment
+      )
+        throw Error('The reviewer profile is unavailable.');
+      const remaining = remainingBudgets(run, this.store.intents());
+      if (remaining.attempts < 2 || remaining.minutes < 2 || remaining.concurrency < 1)
+        throw Error('The saved budget cannot cover one check and one review.');
+      const expected = [
+        'node --test',
+        formatReviewTarget({ methodId: selected.methodId, cycle: 1 }),
+      ];
+      const grants = command.payload.grants;
+      if (
+        grants.some(
+          (grant) =>
+            grant.taskId !== task.id ||
+            grant.revoked ||
+            grant.usesRemaining !== 1 ||
+            Date.parse(grant.expiresAt) <= Date.parse(this.now()) ||
+            this.store.receipt(this.grantKey(grant)),
+        ) ||
+        grants.filter((grant) => grant.action === 'run-check' && grant.target === expected[0])
+          .length !== 1 ||
+        grants.filter((grant) => grant.action === 'run-review' && grant.target === expected[1])
+          .length !== 1
+      )
+        throw Error('Exact check and review grants are required.');
+      const definition = this.evidence.describeChecks({
+        candidate,
+        sourceFiles: committedFiles(this.projectPath(task.projectId) as string, run.source.base),
+        criteria: task.criteria,
+      });
+      const fields = {
+        run,
+        writer,
+        candidate,
+        context: { title: task.title, outcome: task.outcome, criteria: task.criteria },
+        definition,
+        reviewer: {
+          ...selected,
+          role: methods[0].reviewerRole,
+          profile: profile.facts,
+          client: profile.client,
+          locationHash: profile.locationHash,
+        },
+        creditPolicy: command.payload.creditPolicy,
+        grants,
+        remaining,
+        maximumCheckMinutes: 1 as const,
+      };
+      scopeHash = hashCanonical(fields);
+      let expiresAt = grants
+        .map((grant) => Date.parse(grant.expiresAt))
+        .reduce((a, b) => Math.min(a, b));
+      const saved = this.store.receipt(`evaluation-consent:${scopeHash}`);
+      if (saved) {
+        const artifact = ArtifactSchema.parse(saved.result.entity);
+        if (artifact.bytes > 4096) throw Error('Evaluation consent exceeds its bound.');
+        const consent = EvaluationConsentSchema.parse(
+          JSON.parse(this.artifacts.read(artifact.hash).toString('utf8')),
+        );
+        if (
+          consent.scopeHash !== scopeHash ||
+          Date.parse(consent.expiresAt) <= Date.parse(this.now())
+        )
+          throw Error('Evaluation consent expired.');
+        expiresAt = Math.min(expiresAt, Date.parse(consent.expiresAt));
+      } else if (command.payload.consent === 'saved')
+        throw Error('Matching evaluation consent is unavailable.');
+      plan = CandidateEvaluationSchema.parse({
+        ...fields,
+        scopeHash,
+        expiresAt: new Date(expiresAt).toISOString(),
+      });
+      if (Buffer.byteLength(canonicalJson(plan)) > MAX_FRAME_BYTES)
+        throw Error('Evaluation preparation exceeds its bound.');
+    } catch {
+      return {
+        outcome: 'blocked',
+        reason: 'candidate-evaluation-unavailable',
+        next: 'Review the stopped candidate, trusted check recipe, reviewer consent and remaining limits.',
+      };
+    }
+    const artifact = this.nativeArtifact(plan);
+    this.store.saveReceipt(`evaluation-plan:${artifact.id}`, artifact.hash, 'local-owner', {
+      outcome: 'applied',
+      entity: artifact,
+    });
+    if (!this.store.receipt(`evaluation-consent:${scopeHash}`)) {
+      const consent = this.nativeArtifact({ scopeHash, expiresAt: plan.expiresAt });
+      this.store.saveReceipt(`evaluation-consent:${scopeHash}`, scopeHash, 'local-owner', {
+        outcome: 'applied',
+        entity: consent,
+      });
+    }
+    this.store.db
+      .prepare('DELETE FROM receipts WHERE command_key=?')
+      .run(`evaluation-ready:${plan.run.id}`);
+    this.store.saveReceipt(`evaluation-ready:${plan.run.id}`, artifact.hash, 'local-owner', {
+      outcome: 'applied',
+      entity: artifact,
+    });
+    const task = this.updateTask(this.store.get<Task>('task', command.payload.taskId) as Task, {
+      next: 'Review the frozen candidate evaluation and start its local checks. Native review remains unavailable.',
+    });
+    return { outcome: 'applied', entity: artifact, revision: task.revision };
+  }
+
+  private evaluationPlan(artifact: Artifact) {
+    const stored = this.store.get<Artifact>('artifact', artifact.id);
+    if (
+      !stored ||
+      hashCanonical(stored) !== hashCanonical(artifact) ||
+      artifact.bytes > MAX_FRAME_BYTES ||
+      this.store.receipt(`evaluation-plan:${artifact.id}`)?.hash !== artifact.hash
+    )
+      throw Error('Evaluation preparation is unavailable.');
+    const bytes = this.artifacts.read(artifact.hash);
+    if (bytes.length !== artifact.bytes) throw Error('Evaluation preparation size changed.');
+    return CandidateEvaluationSchema.parse(JSON.parse(bytes.toString('utf8')));
+  }
+
+  private startEvaluation(
+    command: Extract<Command, { command: 'StartCandidateEvaluation' }>,
+    effects: (() => void)[],
+  ): CommandResult {
+    let plan: z.infer<typeof CandidateEvaluationSchema>;
+    let artifact: Artifact;
+    let check: CheckPlan;
+    let route: Route;
+    try {
+      artifact = ArtifactSchema.parse(
+        this.store.get<Artifact>('artifact', command.payload.preparationId),
+      );
+      plan = this.evaluationPlan(artifact);
+      const task = this.store.get<Task>('task', command.payload.taskId);
+      if (
+        task?.runId !== plan.run.id ||
+        plan.run.taskId !== task.id ||
+        plan.candidate.id !== command.payload.candidateId
+      )
+        throw Error('Evaluation lineage changed.');
+      const prior = this.store.receipt(`evaluation-started:${plan.run.id}`);
+      if (prior)
+        return prior.hash === artifact.hash
+          ? { outcome: 'already-applied', entity: artifact, revision: task.revision }
+          : { outcome: 'blocked', reason: 'candidate-evaluation-already-started' };
+      const origin = this.evaluationOrigin(command.payload.taskId, command.payload.candidateId);
+      if (
+        origin.task.state !== 'stopped' ||
+        this.store.receipt(`paused:${plan.run.id}`) ||
+        this.store.receipt(`evaluation-ready:${plan.run.id}`)?.hash !== artifact.hash ||
+        Date.parse(plan.expiresAt) <= Date.parse(this.now()) ||
+        hashCanonical(origin.run) !== hashCanonical(plan.run) ||
+        hashCanonical(origin.writer) !== hashCanonical(plan.writer) ||
+        hashCanonical(origin.candidate) !== hashCanonical(plan.candidate) ||
+        hashCanonical({
+          title: origin.task.title,
+          outcome: origin.task.outcome,
+          criteria: origin.task.criteria,
+        }) !== hashCanonical(plan.context)
+      )
+        throw Error('Evaluation preparation changed.');
+      const consent = ArtifactSchema.parse(
+        this.store.receipt(`evaluation-consent:${plan.scopeHash}`)?.result.entity,
+      );
+      if (
+        consent.bytes > 4096 ||
+        EvaluationConsentSchema.parse(
+          JSON.parse(this.artifacts.read(consent.hash).toString('utf8')),
+        ).scopeHash !== plan.scopeHash
+      )
+        throw Error('Evaluation consent is unavailable.');
+      this.profile = this.options.nativeProfile?.() ?? unavailableNativeProfile();
+      if (
+        hashCanonical(this.profile.facts) !== hashCanonical(plan.reviewer.profile) ||
+        hashCanonical(this.profile.client) !== hashCanonical(plan.reviewer.client) ||
+        this.profile.locationHash !== plan.reviewer.locationHash ||
+        !this.profile.environment
+      )
+        throw Error('Reviewer profile changed.');
+      const remaining = remainingBudgets(plan.run, this.store.intents());
+      if (
+        remaining.attempts < 2 ||
+        remaining.minutes < 2 ||
+        remaining.concurrency < 1 ||
+        plan.grants.some((grant) => this.store.receipt(this.grantKey(grant)))
+      )
+        throw Error('Evaluation authority or budget changed.');
+      check = this.evidence.prepareChecks({
+        candidate: origin.candidate,
+        sourceFiles: committedFiles(
+          this.projectPath(origin.task.projectId) as string,
+          plan.run.source.base,
+        ),
+        criteria: plan.context.criteria,
+        expected: plan.definition,
+      });
+      const priorRoute = this.store.receipt('node-check-route')?.result.entity;
+      route = RouteSchema.parse(
+        priorRoute
+          ? JSON.parse(this.artifacts.read(ArtifactSchema.parse(priorRoute).hash).toString('utf8'))
+          : {
+              id: this.id('rte'),
+              family: 'local',
+              displayName: 'Local Node checks',
+              model: process.version,
+              effort: { requested: 'none', effective: 'none', supported: ['none'] },
+              billing: 'local',
+              qualified: false,
+              fake: false,
+            },
+      );
+      if (
+        route.fake ||
+        route.qualified ||
+        route.family !== 'local' ||
+        route.billing !== 'local' ||
+        route.model !== process.version
+      )
+        throw Error('Local evaluator route changed.');
+    } catch {
+      return {
+        outcome: 'blocked',
+        reason: 'candidate-evaluation-unavailable',
+        next: 'Prepare the exact candidate evaluation again before running checks.',
+      };
+    }
+    if (!this.store.receipt('node-check-route')) {
+      const routeArtifact = this.nativeArtifact(route);
+      this.store.put('route', route.id, 0, route);
+      this.store.saveReceipt('node-check-route', routeArtifact.hash, 'local-owner', {
+        outcome: 'applied',
+        entity: routeArtifact,
+      });
+    } else if (hashCanonical(this.store.get<Route>('route', route.id)) !== hashCanonical(route))
+      throw Error('Local evaluator catalog changed.');
+    const attempt = this.jobAttempt(plan.run, route.id);
+    const minutes = this.admitJob(plan.run, attempt, check.directory, plan.maximumCheckMinutes);
+    this.store.saveReceipt(`evaluation-started:${plan.run.id}`, artifact.hash, 'local-owner', {
+      outcome: 'applied',
+      entity: artifact,
+    });
+    this.store.saveReceipt(`evaluation-check:${attempt.id}`, artifact.hash, 'local-owner', {
+      outcome: 'applied',
+      entity: artifact,
+    });
+    this.consumeGrant(plan.run, plan.grants.find((grant) => grant.action === 'run-check') as Grant);
+    this.updateTask(this.store.get<Task>('task', plan.run.taskId) as Task, {
+      state: 'checking',
+      waitingReason: null,
+      next: 'Running the frozen Node checks. Native review and acceptance remain unavailable.',
+    });
+    effects.push(() =>
+      this.launchCheck(
+        plan.run,
+        attempt,
+        plan.writer,
+        plan.candidate,
+        check,
+        false,
+        minutes,
+        artifact,
+      ),
+    );
+    return {
+      outcome: 'applied',
+      entity: artifact,
+      revision: (this.store.get<Task>('task', plan.run.taskId) as Task).revision,
+    };
   }
 
   private preparedNativeBinding(run: Run): NativeBinding {
@@ -2372,6 +2766,9 @@ export class Controller {
       this.store.db
         .prepare('DELETE FROM receipts WHERE command_key=?')
         .run(`native-prepared:${command.payload.runId}`);
+    this.store.db
+      .prepare('DELETE FROM receipts WHERE command_key=?')
+      .run(`evaluation-ready:${command.payload.runId}`);
     const restore = this.closePendingEffects(task);
     const active = this.store
       .intents()
@@ -2415,6 +2812,18 @@ export class Controller {
             if (this.settleJob(attempt, quiescent)) this.stoppedJob(attempt);
           });
         }
+      });
+      return { outcome: 'applied', entity: updated, revision: updated.revision };
+    }
+    if (this.store.receipt(`evaluation-check:${active.attempt_id}`) && active.state === 'intent') {
+      this.cancelledJobs.add(active.attempt_id);
+      effects.push(() =>
+        this.settleJob(this.store.get<Attempt>('attempt', active.attempt_id) as Attempt, true),
+      );
+      const updated = this.updateTask(task, {
+        state: 'stopped',
+        waitingReason: null,
+        next: 'Evaluation stopped before launch.',
       });
       return { outcome: 'applied', entity: updated, revision: updated.revision };
     }
@@ -2867,7 +3276,7 @@ export class Controller {
     });
   }
 
-  private admitJob(run: Run, attempt: Attempt, directory: string) {
+  private admitJob(run: Run, attempt: Attempt, directory: string, maximumMinutes?: number) {
     const remaining = remainingBudgets(run, this.store.intents());
     if (
       remaining.attempts === 0 ||
@@ -2897,8 +3306,13 @@ export class Controller {
       .prepare(
         "INSERT INTO reservations(attempt_id,route_id,window_id,unit,value,launches,minutes) VALUES (?,?,?,'minutes',0,1,?)",
       )
-      .run(attempt.id, attempt.routeId, 'local-execution', remaining.minutes);
-    return remaining.minutes;
+      .run(
+        attempt.id,
+        attempt.routeId,
+        'local-execution',
+        Math.min(remaining.minutes, maximumMinutes ?? remaining.minutes),
+      );
+    return Math.min(remaining.minutes, maximumMinutes ?? remaining.minutes);
   }
 
   private acknowledgeJob(attempt: Attempt, pid: number) {
@@ -3080,8 +3494,30 @@ export class Controller {
     plan: CheckPlan,
     handoff: boolean,
     minutes: number,
+    evaluation?: Artifact,
   ) {
-    if (this.jobDeadline(attempt.id, minutes) === 0) {
+    if (this.closed || this.store.get<Attempt>('attempt', attempt.id)?.state !== 'intent') return;
+    let prepared: z.infer<typeof CandidateEvaluationSchema> | undefined;
+    try {
+      prepared = evaluation ? this.evaluationPlan(evaluation) : undefined;
+      if (prepared && !this.store.receipt(`evaluation-consent:${prepared.scopeHash}`))
+        throw Error('Evaluation consent was revoked before launch.');
+    } catch {
+      this.settleJob(attempt, true);
+      this.stoppedJob(attempt);
+      return;
+    }
+    const deadline = () =>
+      Math.max(
+        0,
+        Math.min(
+          this.jobDeadline(attempt.id, minutes),
+          prepared
+            ? Date.parse(prepared.expiresAt) - Date.parse(this.now())
+            : Number.POSITIVE_INFINITY,
+        ),
+      );
+    if (deadline() === 0) {
       this.settleJob(attempt, true);
       this.stoppedJob(attempt);
       return;
@@ -3101,16 +3537,13 @@ export class Controller {
       this.settleJob(attempt, false);
       return;
     }
-    const cancel = schedule(
-      () => {
-        timedOut = true;
-        job.stop();
-        schedule(() => {
-          this.settleJob(attempt, false);
-        }, 1000);
-      },
-      this.jobDeadline(attempt.id, minutes),
-    );
+    const cancel = schedule(() => {
+      timedOut = true;
+      job.stop();
+      schedule(() => {
+        this.settleJob(attempt, false);
+      }, 1000);
+    }, deadline());
     this.jobCancels.set(attempt.id, cancel);
     void job.exited
       .then(async (exit) => {
@@ -3124,7 +3557,13 @@ export class Controller {
         const result = this.evidence.recordCheck({
           candidate,
           plan,
-          passed: exit.code === 0 && !job.failed && !timedOut,
+          passed:
+            exit.code === 0 &&
+            !job.failed &&
+            !timedOut &&
+            (!prepared ||
+              (Date.parse(prepared.expiresAt) > Date.parse(this.now()) &&
+                !!this.store.receipt(`evaluation-consent:${prepared.scopeHash}`))),
           output: Buffer.concat(job.stdout),
         });
         this.store.transaction(() => {
@@ -3141,6 +3580,16 @@ export class Controller {
               check.evaluator,
               canonicalJson(check),
             );
+          if (evaluation)
+            this.store.saveReceipt(
+              `evaluation-result:${evaluation.id}`,
+              evaluation.hash,
+              'local-owner',
+              {
+                outcome: 'applied',
+                entity: result.artifacts.find((artifact) => artifact.id === check.artifactId),
+              },
+            );
           const task = this.store.get<Task>('task', run.taskId) as Task;
           this.event('check.completed', task.id, task.revision, check);
           if (!check.passed)
@@ -3150,7 +3599,15 @@ export class Controller {
               next: 'Checks failed or were incomplete. Inspect the retained evidence.',
             });
         });
-        if (result.evidence.passed) this.afterChecks(writer, candidate, handoff);
+        if (result.evidence.passed && evaluation) {
+          this.store.transaction(() =>
+            this.updateTask(this.store.get<Task>('task', run.taskId) as Task, {
+              state: 'stopped',
+              waitingReason: null,
+              next: 'Local checks passed. Native review is unavailable. Inspect the evidence or export the patch.',
+            }),
+          );
+        } else if (result.evidence.passed) this.afterChecks(writer, candidate, handoff);
       })
       .catch(() => {
         if (!this.closed)

@@ -29,7 +29,7 @@ import {
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { createDemoFixtures, createTestClock, createTestIds } from '@crewkite/testkit';
-import { createSyntheticRepository } from '@crewkite/testkit/repository';
+import { createSyntheticRepository, writeChallengeSolution } from '@crewkite/testkit/repository';
 import { ArtifactFiles } from '../artifacts/index.ts';
 import {
   Controller,
@@ -768,10 +768,26 @@ test('candidate evidence requires unchanged bytes and completed checks', async (
     existing: [],
   });
   for (const artifact of captured.artifacts) metadata.set(artifact.id, artifact);
+  const definition = evidence.describeChecks({
+    candidate: captured.candidate,
+    sourceFiles: committedFiles(source.directory, source.base),
+    criteria: task.criteria,
+  });
+  assert.throws(
+    () =>
+      evidence.prepareChecks({
+        candidate: captured.candidate,
+        sourceFiles: committedFiles(source.directory, source.base),
+        criteria: task.criteria,
+        expected: { ...definition, required: { ...definition.required, tests: [] } },
+      }),
+    /frozen check definition changed/,
+  );
   const plan = evidence.prepareChecks({
     candidate: captured.candidate,
     sourceFiles: committedFiles(source.directory, source.base),
     criteria: task.criteria,
+    expected: definition,
   });
   const output = execFileSync(process.execPath, plan.argv, {
     cwd: plan.directory,
@@ -1434,7 +1450,22 @@ async function nativeSetup(
           : pending?.phase === 'metadata-preparation'
             ? 'prepare'
             : 'task';
-      const child = spawn(executable, ['-e', fixture, mode, phase], spawnOptions);
+      let transcript = fixture;
+      if (mode === 'checked') {
+        const proposal = join(context.directory, 'checked-proposal');
+        mkdirSync(proposal, { recursive: true });
+        writeFileSync(join(proposal, 'net.mjs'), '');
+        writeChallengeSolution(proposal);
+        transcript = fixture.replace(
+          `const content = ${fixtureContent.toString()};`,
+          `const content = () => ${JSON.stringify(readFileSync(join(proposal, 'net.mjs'), 'utf8'))};`,
+        );
+      }
+      const child = spawn(
+        executable,
+        ['-e', transcript, mode === 'checked' ? 'success' : mode, phase],
+        spawnOptions,
+      );
       children.push(child);
       const write = child.stdin.write.bind(child.stdin);
       child.stdin.write = ((data: Uint8Array) => {
@@ -2116,6 +2147,252 @@ test('an appointed native proposal is retained and applied once after every phas
     } finally {
       await reopened.close();
     }
+  }
+  for (const scenario of ['checked', 'failed', 'stop-intent', 'expired-intent', 'revoked-intent']) {
+    const context = await nativeSetup(t, scenario === 'failed' ? 'success' : 'checked');
+    let controller = context.controller;
+    const { command, task, appointment, clock } = context;
+    const retained = nativeCandidate(controller);
+    if (scenario === 'checked') {
+      const prepared = await controller.execute(
+        command(
+          'PrepareNativeRun',
+          {
+            taskId: task.id,
+            profileId: context.fixtureProfile.facts.id,
+            targetPath: 'net.mjs',
+            policy: appointment.policy,
+            consent: 'explicit',
+          },
+          task.revision,
+        ),
+        'local-owner',
+      );
+      assert.equal(prepared.outcome, 'applied');
+      const nativeRun = RunSchema.parse(prepared.entity);
+      assert.equal(
+        (
+          await controller.execute(
+            command('StartRun', { taskId: task.id, runId: nativeRun.id }, prepared.revision),
+            'local-owner',
+          )
+        ).outcome,
+        'applied',
+      );
+    } else assert.equal(controller.startNativePilot(appointment).outcome, 'applied');
+    await retained;
+    const run = controller.snapshot().runs.at(-1);
+    const candidate = controller.snapshot().candidates.at(-1);
+    assert(run && candidate);
+    const originalRun = structuredClone(run);
+    const payload = {
+      taskId: task.id,
+      candidateId: candidate.id,
+      checkRecipeId: 'node-tests-v1',
+      reviewer: {
+        profileId: context.fixtureProfile.facts.id,
+        methodId: 'keep-it-simple',
+        cycles: 1,
+      },
+      consent: 'explicit',
+      grants: [
+        {
+          taskId: task.id,
+          action: 'run-check',
+          target: 'node --test',
+          expiresAt: new Date(Date.parse(clock.now()) + 86400000).toISOString(),
+          revoked: false,
+          usesRemaining: 1,
+        },
+        {
+          taskId: task.id,
+          action: 'run-review',
+          target: 'keep-it-simple/cycle-1',
+          expiresAt: new Date(Date.parse(clock.now()) + 86400000).toISOString(),
+          revoked: false,
+          usesRemaining: 1,
+        },
+      ],
+    };
+    const revision = () => controller.snapshot().tasks[0].revision;
+    if (scenario === 'checked') {
+      for (const change of [
+        { consent: 'saved' },
+        { reviewer: { ...payload.reviewer, methodId: 'second-opinion' } },
+        {
+          grants: payload.grants.map((grant, index) =>
+            index ? grant : { ...grant, revoked: true },
+          ),
+        },
+        {
+          grants: payload.grants.map((grant, index) =>
+            index ? grant : { ...grant, action: 'accept-candidate' },
+          ),
+        },
+      ]) {
+        const before = controller.snapshot();
+        assert.equal(
+          (
+            await controller.execute(
+              command('PrepareCandidateEvaluation', { ...payload, ...change }, revision()),
+              'local-owner',
+            )
+          ).outcome,
+          'blocked',
+        );
+        assert.deepEqual(controller.snapshot(), before);
+      }
+    }
+    const prepare = command('PrepareCandidateEvaluation', payload, revision());
+    const prepared = await controller.execute(prepare, 'local-owner');
+    assert.equal(prepared.outcome, 'applied');
+    let artifact = ArtifactSchema.parse(prepared.entity);
+    assert.equal((await controller.execute(prepare, 'local-owner')).outcome, 'already-applied');
+    assert.equal(controller.snapshot().attempts.length, 1);
+    assert.equal(controller.snapshot().evidence.length, 0);
+    assert.deepEqual(controller.snapshot().runs.at(-1), originalRun);
+    const startPayload = () => ({
+      taskId: task.id,
+      candidateId: candidate.id,
+      preparationId: artifact.id,
+    });
+    if (scenario === 'checked') {
+      assert.equal(
+        (
+          await controller.execute(
+            command('PrepareCandidateEvaluation', { ...payload, consent: 'saved' }, revision()),
+            'local-owner',
+          )
+        ).outcome,
+        'applied',
+      );
+      const latest = controller.store.receipt(`evaluation-ready:${run.id}`)?.result.entity;
+      artifact = ArtifactSchema.parse(latest);
+      context.fixtureProfile.facts.creditPolicies = ['existing-credits'];
+      assert.equal(
+        (
+          await controller.execute(
+            command('StartCandidateEvaluation', startPayload(), revision()),
+            'local-owner',
+          )
+        ).outcome,
+        'blocked',
+      );
+      assert.equal(controller.snapshot().attempts.length, 1);
+      context.fixtureProfile.facts.creditPolicies = ['ordinary', 'existing-credits'];
+      await controller.execute(
+        command('StopRun', { taskId: task.id, runId: run.id }, revision()),
+        'local-owner',
+      );
+      assert.equal(
+        (
+          await controller.execute(
+            command('StartCandidateEvaluation', startPayload(), revision()),
+            'local-owner',
+          )
+        ).outcome,
+        'blocked',
+      );
+      const renewed = await controller.execute(
+        command('PrepareCandidateEvaluation', payload, revision()),
+        'local-owner',
+      );
+      artifact = ArtifactSchema.parse(renewed.entity);
+      controller = await context.restart();
+    }
+    let checkLaunches = 0;
+    let replay: Promise<unknown> | undefined;
+    const finished = Promise.withResolvers<void>();
+    const off = controller.subscribe((event) => {
+      if (event.type === 'attempt.launched') {
+        checkLaunches++;
+        replay = controller
+          .execute(command('StartCandidateEvaluation', startPayload(), revision()), 'local-owner')
+          .then((result) => assert.equal(result.outcome, 'already-applied'));
+      }
+      if (event.type === 'task.updated' && event.payload.state === 'checking') {
+        if (scenario === 'expired-intent') clock.advance(86400001);
+        if (scenario === 'revoked-intent') {
+          const artifactFiles = new ArtifactFiles(join(controller.home, 'artifacts'));
+          const plan = JSON.parse(artifactFiles.read(artifact.hash).toString('utf8'));
+          controller.store.transaction(() =>
+            controller.store.db
+              .prepare('DELETE FROM receipts WHERE command_key=?')
+              .run(`evaluation-consent:${plan.scopeHash}`),
+          );
+        }
+      }
+      if (
+        scenario === 'stop-intent' &&
+        event.type === 'task.updated' &&
+        event.payload.state === 'checking'
+      )
+        void controller
+          .execute(
+            command('StopRun', { taskId: task.id, runId: run.id }, event.payload.revision),
+            'local-owner',
+          )
+          .then((result) => assert.equal(result.outcome, 'applied'));
+      if (event.type === 'task.updated' && ['stopped', 'failed'].includes(event.payload.state))
+        finished.resolve();
+    });
+    const started = await controller.execute(
+      command('StartCandidateEvaluation', startPayload(), revision()),
+      'local-owner',
+    );
+    assert.equal(started.outcome, 'applied');
+    await finished.promise;
+    await replay;
+    off();
+    assert.equal(checkLaunches, scenario.endsWith('intent') ? 0 : 1);
+    const snapshot = controller.snapshot();
+    assert.equal(snapshot.attempts.length, 2);
+    assert.equal(context.submissions(), 1);
+    assert.equal(context.children.length, 3);
+    assert.equal(snapshot.reviewJobs?.length, 0);
+    assert.equal(snapshot.evidence.length, scenario.endsWith('intent') ? 0 : 1);
+    if (!scenario.endsWith('intent')) {
+      assert.equal(snapshot.evidence[0].passed, scenario === 'checked');
+      assert.equal(snapshot.evidence[0].evaluator.startsWith('node:'), true);
+      const intent = controller.store.intents().at(-1);
+      assert(intent);
+      const route = snapshot.routes.find((route) => route.id === intent.route_id);
+      assert.equal(route?.fake, false);
+      assert.equal(route?.qualified, false);
+      assert.equal(route?.family, 'local');
+    }
+    assert.deepEqual(snapshot.runs.at(-1), originalRun);
+    assert.notEqual(snapshot.tasks[0].state, 'ready');
+    assert.equal(
+      (
+        await controller.execute(
+          command(
+            'AcceptCandidate',
+            {
+              taskId: task.id,
+              candidateId: candidate.id,
+              destinationRef: 'refs/heads/feat/native-evaluated',
+            },
+            revision(),
+          ),
+          'local-owner',
+        )
+      ).reason,
+      'native-pilot-retain-only',
+    );
+    controller = await context.restart();
+    const intents = controller.store.intents().length;
+    assert.equal(
+      (
+        await controller.execute(
+          command('StartCandidateEvaluation', startPayload(), revision()),
+          'local-owner',
+        )
+      ).outcome,
+      'already-applied',
+    );
+    assert.equal(controller.store.intents().length, intents);
+    assert.equal(context.submissions(), 1);
   }
   for (const boundary of [
     'stop-prepared',

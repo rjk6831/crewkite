@@ -26,7 +26,7 @@ The controller runs as one headless Node process per user. The desktop app and t
 
 These measures keep other clients and workers off the control channel. They do not defend against malware running as the same user, and the docs make no such claim.
 
-Native writer preparation includes per-phase ownership hooks and a SQLite journal for preflight and task processes. The journal separates launch intent, the actual process group and proven quiescence. Recovery checks every recorded group; ambiguous ownership stays blocked, and no native phase restarts automatically. A supervised native file proposal uses `PrepareNativeRun` to save an immutable preview without provider I/O. `StartRun` rechecks its installed profile, scoped consent and source before entering the same admission and process owner. Each run permits one submission. Retained native work can be inspected and exported; resume, handoff, scripted evaluation and acceptance stay unavailable.
+Native writer preparation includes per-phase ownership hooks and a SQLite journal for preflight and task processes. The journal separates launch intent, the actual process group and proven quiescence. Recovery checks every recorded group; ambiguous ownership stays blocked, and no native phase restarts automatically. A supervised native file proposal uses `PrepareNativeRun` to save an immutable preview without provider I/O. `StartRun` rechecks its installed profile, scoped consent and source before entering the same admission and process owner. Each run permits one submission. Retained native work can be inspected and exported; resume, handoff, scripted evaluation and acceptance stay unavailable. A separate candidate evaluation freezes its own scoped consent and reviewer assignment without changing the original run policy. The first recipe can run the trusted synthetic Node collection in an independent copy through the existing local process owner. Passing checks retain evidence and wait for native review. Native review and acceptance remain unavailable.
 
 ## Commands and events
 
@@ -49,6 +49,7 @@ The command set for the first release:
 | `RegisterProject`, `InspectSource` | Explicit path selection, base revision, bounded dirty and untracked file details, stable project ID |
 | `CreateTask`, `AmendTask`, `PrepareRun` | Saved criteria, versioned amendments, a frozen preview of source, routes, checks and limits |
 | `PrepareNativeRun` | Freeze a controller-owned profile, one committed target, task text, explicit or matching saved consent and policy; perform no provider I/O |
+| `PrepareCandidateEvaluation`, `StartCandidateEvaluation` | Freeze supplemental authority for a stopped native candidate, then run its exact trusted Node recipe once; retain checks without starting review |
 | `StartRun`, `GetSnapshot`, `Subscribe` | Atomic admission, consistent state with ordered events, no duplicate dispatch |
 | `SwitchRoute` | Save an allowed coder target, stop the outgoing writer, seal retained work and recheck normal admission |
 | `PauseAdmissions`, `StopRun` | Pausing stops new dispatch. Stopping requests cancellation and waits for proven quiescence |
