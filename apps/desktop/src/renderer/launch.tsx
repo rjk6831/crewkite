@@ -501,9 +501,10 @@ export function NativeEvaluation({
           </ul>
         </article>
       ))}
-      <p className="notice">
-        Inspect Changes and retained evidence before local branch acceptance. Export remains
-        available.
+      <p className={task.state === 'accepted' ? 'muted small' : 'notice'}>
+        {task.state === 'accepted'
+          ? 'Review the saved checks and review. Patch export remains available.'
+          : 'Inspect Changes and retained evidence before local branch acceptance. Export remains available.'}
       </p>
     </section>
   );
