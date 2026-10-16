@@ -212,14 +212,14 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     await dialog.getByRole('button', { name: 'Formation', exact: false }).click();
     await dialog.getByRole('tab', { name: 'Policy', exact: true }).click();
     await dialog.getByLabel('Attempts', { exact: true }).fill('6');
-    await dialog.getByLabel(/write-scratch .* approval gate/).selectOption('once');
     await dialog
-      .getByLabel(/run-review .* approval gate/)
-      .first()
+      .getByLabel('Write the scratch copy: demo-shop workspace approval gate', { exact: true })
+      .selectOption('once');
+    await dialog
+      .getByLabel('Run a review: Second opinion · round 1 approval gate', { exact: true })
       .selectOption('ask');
     await dialog
-      .getByLabel(/run-review .* approval gate/)
-      .last()
+      .getByLabel('Run a review: Keep it simple · round 1 approval gate', { exact: true })
       .selectOption('once');
     await enter(dialog.getByRole('button', { name: 'Resolve and review', exact: true }));
     await expect(
@@ -227,11 +227,52 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     ).toBeVisible();
     await expect(dialog.getByText('Anthropic fixture', { exact: true }).first()).toBeVisible();
     await expect(dialog.getByText(/untracked/i).first()).toBeVisible();
+    const previewSnapshot = await observer.snapshot();
+    const preview = previewSnapshot.runs.find(
+      ({ id }) => id === previewSnapshot.tasks.find(({ id }) => id === taskId)?.runId,
+    );
+    assert(preview);
+    assert.deepEqual(
+      preview.policy.policy.methods?.map(({ id }) => id),
+      ['keep-it-simple', 'second-opinion'],
+    );
+    await enter(dialog.getByRole('button', { name: 'Edit configuration', exact: true }));
+    await expect(
+      dialog.getByLabel('Write the scratch copy: demo-shop workspace approval gate', {
+        exact: true,
+      }),
+    ).toHaveValue('ask');
+    await expect(
+      dialog.getByLabel('Run a review: Keep it simple · round 1 approval gate', { exact: true }),
+    ).toHaveValue('ask');
+    await expect(
+      dialog.getByLabel('Run a review: Second opinion · round 1 approval gate', { exact: true }),
+    ).toHaveValue('ask');
+    await dialog.getByLabel('Unknown usage', { exact: true }).selectOption('fixed-allowance');
+    await expect(
+      dialog.getByRole('button', { name: 'Resolve and review', exact: true }),
+    ).toBeDisabled();
+    await expect(dialog.getByText(/current 30-minute plan cannot start/)).toBeVisible();
+    await dialog.getByLabel('Unknown usage', { exact: true }).selectOption('waiting');
+    await dialog
+      .getByLabel('Write the scratch copy: demo-shop workspace approval gate', { exact: true })
+      .selectOption('once');
+    await dialog
+      .getByLabel('Run a review: Keep it simple · round 1 approval gate', { exact: true })
+      .selectOption('once');
+    await enter(dialog.getByRole('button', { name: 'Resolve and review', exact: true }));
+    await expect(
+      page.getByRole('dialog', { name: 'Review the prepared run', exact: true }),
+    ).toBeVisible();
+    await dialog.locator('.checkout-changes > summary').click();
+    await expect(dialog.getByText('sentinels/staged.txt', { exact: true })).toBeVisible();
+
     await enter(dialog.getByRole('button', { name: 'Start run', exact: true }));
     const firstApproval = await timeline.wait((event) => event.type === 'approval.requested');
     assert.equal(firstApproval.type, 'approval.requested');
+    assert.equal(firstApproval.payload.action, 'run-check');
     await expect(page.getByRole('region', { name: 'Pending approval' })).toContainText(
-      firstApproval.payload.target,
+      'Run candidate checks',
     );
     const list = cli(home, 'task', 'list');
     const shown = cli(home, 'task', 'show', taskId);
@@ -370,8 +411,9 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
         next.payload.action === 'run-review' &&
         !cliChangedState
       ) {
+        assert.equal(next.payload.target, 'second-opinion/cycle-1');
         await expect(page.getByRole('region', { name: 'Pending approval' })).toContainText(
-          next.payload.target,
+          'Second opinion · round 1',
         );
         const approved = cli(home, 'task', 'approve', next.payload.approvalId);
         assert.equal(approved.result.outcome, 'applied');
