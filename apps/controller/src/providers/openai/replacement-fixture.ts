@@ -90,3 +90,48 @@ input.on('close',()=>process.exit(0));
 `;
 
 export const fixtureModel = 'gpt-6.1-sol' as const;
+
+/** The child edits only its admitted scratch cwd; transport storage stays separate. */
+export function repositoryFixture(
+  files: readonly { path: string; content: string | null }[] = [
+    { path: 'net.mjs', content: fixtureContent('net.mjs') },
+  ],
+) {
+  const start = fixture.indexOf("  if (message.method === 'turn/start' && mode === 'success') {");
+  const end = fixture.indexOf('\n});', start);
+  if (start < 0 || end < 0) throw new Error('The repository fixture template changed.');
+  return (
+    fixture
+      .slice(0, start)
+      .replace(
+        "if (message.method === 'thread/start') result = thread(process.cwd());",
+        "if (message.method === 'thread/start') result = {...thread(message.params.cwd),approvalPolicy:'never',sandbox:{type:'workspaceWrite',writableRoots:[message.params.cwd],networkAccess:false}};",
+      ) +
+    `
+  if (message.method === 'thread/start') globalThis.scratch = message.params.cwd;
+  if (message.method === 'turn/start' && mode === 'success') {
+    const {mkdirSync,writeFileSync,rmSync} = require('node:fs');
+    const {resolve,dirname,relative,isAbsolute} = require('node:path');
+    for (const file of ${JSON.stringify(files)}) {
+      const target = resolve(globalThis.scratch,file.path);
+      const local = relative(globalThis.scratch,target);
+      if (!local || local.startsWith('..') || isAbsolute(local)) throw new Error('Fixture path escapes scratch.');
+      if (file.content === null) { rmSync(target); continue; }
+      mkdirSync(dirname(target),{recursive:true});
+      writeFileSync(target,file.content);
+    }
+    const identity = {threadId:'thread-1',turnId:'turn-1'};
+    const command = {id:'command-1',type:'commandExecution',command:'fixture edit',cwd:globalThis.scratch,status:'inProgress',commandActions:[],aggregatedOutput:null,exitCode:null,durationMs:null};
+    const change = {id:'change-1',type:'fileChange',changes:[],status:'inProgress'};
+    for (const [method,params] of [
+      ['turn/started',{threadId:'thread-1',turn:running}],
+      ['item/started',{...identity,item:command,startedAtMs:1}],
+      ['item/completed',{...identity,item:{...command,status:'completed',exitCode:0},completedAtMs:2}],
+      ['item/started',{...identity,item:change,startedAtMs:3}],
+      ['item/completed',{...identity,item:{...change,status:'completed'},completedAtMs:4}],
+      ['turn/completed',{threadId:'thread-1',turn:{...running,status:'completed'}}],
+    ]) process.stdout.write(JSON.stringify({method,params})+'\\n');
+  }` +
+    fixture.slice(end)
+  );
+}

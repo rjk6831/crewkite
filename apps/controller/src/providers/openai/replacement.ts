@@ -218,6 +218,33 @@ export type StructuredCodec<T extends Record<string, unknown>> = Readonly<{
   parse: (value: unknown) => T | null;
 }>;
 
+/** Writer and reviewer admission use the same fresh account and allowance facts. */
+export function nativeTaskAdmitted(metadata: DiscoveryMetadata, plan: StructuredSession) {
+  const model = metadata.models.find((model) => model.model === plan.model);
+  const limits = metadata.limits;
+  const creditBucket = limits.rateLimitsByLimitId
+    ? limits.rateLimitsByLimitId.codex
+    : limits.rateLimits.limitId === 'codex'
+      ? limits.rateLimits
+      : null;
+  const existingCreditsAllowed =
+    plan.creditPolicy === 'existing-credits' &&
+    limits.ordinaryUsageAllowed === false &&
+    creditBucket &&
+    (creditBucket.limitId === null || creditBucket.limitId === 'codex') &&
+    (creditBucket.credits === 'available' || creditBucket.credits === 'unlimited') &&
+    creditBucket.spendControlReached !== true &&
+    (creditBucket.rateLimitReachedType === null ||
+      creditBucket.rateLimitReachedType === 'rate_limit_reached');
+  return (
+    metadata.account.plan === 'pro' &&
+    (limits.ordinaryUsageAllowed === true || !!existingCreditsAllowed) &&
+    !!model?.supportedReasoningEfforts.includes(plan.effort) &&
+    !!metadata.mcpServers &&
+    !Object.values(metadata.mcpServers).some((enabled) => enabled)
+  );
+}
+
 /** One metadata transcript, one thread and one turn. Output remains a proposal. */
 export class StructuredTranscript<T extends Record<string, unknown>> {
   private readonly plan: StructuredSession;
@@ -374,33 +401,7 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
           this.discovery.push(line);
           if (this.discovery.complete) {
             this.metadata = this.discovery.finish();
-            const model = this.metadata.models.find((model) => model.model === this.plan.model);
-            const limits = this.metadata.limits;
-            const creditBucket = limits.rateLimitsByLimitId
-              ? limits.rateLimitsByLimitId.codex
-              : limits.rateLimits.limitId === 'codex'
-                ? limits.rateLimits
-                : null;
-            const existingCreditsAllowed =
-              this.plan.creditPolicy === 'existing-credits' &&
-              limits.ordinaryUsageAllowed === false &&
-              creditBucket &&
-              (creditBucket.limitId === null || creditBucket.limitId === 'codex') &&
-              (creditBucket.credits === 'available' || creditBucket.credits === 'unlimited') &&
-              creditBucket.spendControlReached !== true &&
-              (creditBucket.rateLimitReachedType === null ||
-                creditBucket.rateLimitReachedType === 'rate_limit_reached');
-            if (
-              this.metadata.account.plan !== 'pro' ||
-              (limits.ordinaryUsageAllowed !== true && !existingCreditsAllowed) ||
-              !model?.supportedReasoningEfforts.includes(this.plan.effort)
-            )
-              this.refuse('admission');
-            if (
-              !this.metadata.mcpServers ||
-              Object.values(this.metadata.mcpServers).some((enabled) => enabled)
-            )
-              this.refuse('admission');
+            if (!nativeTaskAdmitted(this.metadata, this.plan)) this.refuse('admission');
             this.step = 'thread';
           }
           continue;

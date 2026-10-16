@@ -83,3 +83,32 @@ export function resolveNativeProfile(environment = process.env): NativeProfileRe
   }
   return unavailableNativeProfile(found ? 'client-build-mismatch' : 'client-unavailable');
 }
+
+export function unavailableRepositoryProfile(
+  reason: Parameters<typeof unavailableNativeProfile>[0] = 'not-configured',
+): NativeProfileResolution {
+  return repositoryResolution(unavailableNativeProfile(reason));
+}
+
+/** Repository work reuses the installation identity without inheriting file consent. */
+export function resolveRepositoryProfile(environment = process.env): NativeProfileResolution {
+  return repositoryResolution(resolveNativeProfile(environment));
+}
+
+function repositoryResolution(resolved: NativeProfileResolution): NativeProfileResolution {
+  const { maximumFileBytes: _fileLimit, ...common } = descriptor;
+  return {
+    ...resolved,
+    facts: NativeProfileSchema.parse({
+      ...common,
+      id: 'openai-repository-v1',
+      displayName: 'OpenAI repository work',
+      qualifiedAt: null,
+      maximumSourceFiles: 10000,
+      maximumSourceBytes: 67108864,
+      execution: { sandbox: 'workspace-write', approvalPolicy: 'never', networkAccess: false },
+      available: resolved.facts.available,
+      reason: resolved.facts.available ? 'qualification-pending' : resolved.facts.reason,
+    }),
+  };
+}

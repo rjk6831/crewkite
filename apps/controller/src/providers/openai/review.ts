@@ -47,23 +47,56 @@ const binding = z.strictObject({
   scripted: z.literal(false),
   independence: z.literal('process-only'),
 });
-const input = z.strictObject({
+const commonInput = {
   binding,
   model: z.literal('gpt-6.1-sol'),
   effort: z.literal('low'),
   creditPolicy: z.enum(['ordinary', 'existing-credits']).default('ordinary'),
   directory: z.string().min(1).max(4096).refine(isAbsolute),
-  path: NativeTargetPathSchema,
-  baseHash: HashSchema,
-  original: content,
-  candidate: content,
-  candidateContentHash: HashSchema,
   context: z.strictObject({
     title: z.string().min(1).max(200),
     outcome: message,
     criteria: z.array(message).min(1).max(100),
   }),
+};
+const { context: taskContext, ...sessionInput } = commonInput;
+const fileInput = z.strictObject({
+  ...sessionInput,
+  path: NativeTargetPathSchema,
+  baseHash: HashSchema,
+  original: content,
+  candidate: content,
+  candidateContentHash: HashSchema,
+  context: taskContext,
 });
+const repositoryFile = z.strictObject({
+  mode: z.enum(['100644', '100755']),
+  hash: HashSchema,
+  content: z
+    .string()
+    .max(262_144)
+    .refine((value) => utf8(value, 262_144)),
+});
+const repositoryInput = z.strictObject({
+  ...commonInput,
+  repository: z.strictObject({
+    version: z.literal(1),
+    sourceBase: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/),
+    sourceManifestHash: HashSchema,
+    candidateManifestHash: HashSchema,
+    changes: z
+      .array(
+        z.strictObject({
+          path: NativeTargetPathSchema,
+          original: repositoryFile.nullable(),
+          candidate: repositoryFile.nullable(),
+        }),
+      )
+      .min(1)
+      .max(10_000),
+  }),
+});
+const input = z.union([fileInput, repositoryInput]);
 const result = z
   .strictObject({
     version: z.literal(1),
@@ -87,9 +120,11 @@ export type NativeReview = z.output<typeof result>;
 export type ReviewPlan = ReturnType<typeof reviewPlan>;
 
 function task(plan: z.output<typeof input>) {
+  const common = { binding: plan.binding, bindingHash: hashCanonical(plan.binding) };
+  if ('repository' in plan)
+    return { ...common, repository: plan.repository, context: plan.context };
   return {
-    binding: plan.binding,
-    bindingHash: hashCanonical(plan.binding),
+    ...common,
     path: plan.path,
     baseHash: plan.baseHash,
     original: plan.original,
@@ -102,11 +137,23 @@ function task(plan: z.output<typeof input>) {
 export function reviewPlan(value: z.input<typeof input>) {
   const data = input.parse(value);
   const digest = (text: string) => createHash('sha256').update(text).digest('hex');
-  if (
-    digest(data.original) !== data.baseHash ||
-    digest(data.candidate) !== data.candidateContentHash ||
-    !utf8(JSON.stringify(task(data)), 262_144)
-  )
+  const valid =
+    'repository' in data
+      ? data.repository.candidateManifestHash === data.binding.candidateHash &&
+        data.repository.changes.every(
+          (change, index, changes) =>
+            (index === 0 || changes[index - 1].path < change.path) &&
+            (change.original !== null || change.candidate !== null) &&
+            (!change.original || digest(change.original.content) === change.original.hash) &&
+            (!change.candidate || digest(change.candidate.content) === change.candidate.hash) &&
+            (!change.original ||
+              !change.candidate ||
+              change.original.hash !== change.candidate.hash ||
+              change.original.mode !== change.candidate.mode),
+        )
+      : digest(data.original) === data.baseHash &&
+        digest(data.candidate) === data.candidateContentHash;
+  if (!valid || !utf8(JSON.stringify(task(data)), 262_144))
     throw new Error('The native review input exceeds its bounds or differs from its hashes.');
   return Object.freeze({ ...data, directory: resolve(data.directory) });
 }
