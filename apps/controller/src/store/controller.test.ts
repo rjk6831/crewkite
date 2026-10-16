@@ -25,6 +25,7 @@ import {
   type CheckResult,
   canonicalJson,
   GoogleNativeProfileSchema,
+  NativeRepositoryProfileSchema,
   ProjectSchema,
   RunSchema,
   TaskSchema,
@@ -52,7 +53,12 @@ import {
   type NativeProfileResolution,
   unavailableNativeProfile,
 } from '../providers/openai/profile.ts';
-import { fixture, fixtureContent, fixtureModel } from '../providers/openai/replacement-fixture.ts';
+import {
+  fixture,
+  fixtureContent,
+  fixtureModel,
+  repositoryFixture,
+} from '../providers/openai/replacement-fixture.ts';
 
 const fixtureClientHash = createHash('sha256').update(readFileSync(process.execPath)).digest('hex');
 
@@ -2059,6 +2065,8 @@ async function nativeSetup(
 ) {
   const anthropic = mode.startsWith('anthropic-');
   const google = mode.startsWith('google-');
+  const repository = mode.startsWith('repository-');
+  let repositoryCli = '';
   let submissions = 0;
   const ready = Promise.withResolvers<void>();
   const failure = Promise.withResolvers<never>();
@@ -2101,6 +2109,7 @@ async function nativeSetup(
     environment: { ...process.env },
     locationHash: '1'.repeat(64),
   };
+  const { maximumFileBytes: _fileLimit, ...repositoryFields } = unavailableNativeProfile().facts;
   const fixtureProfile: NativeProfileResolution = anthropic
     ? {
         ...reviewerProfile,
@@ -2151,9 +2160,31 @@ async function nativeSetup(
           }),
           locationHash: '3'.repeat(64),
         }
-      : reviewerProfile;
+      : repository
+        ? {
+            ...reviewerProfile,
+            facts: NativeRepositoryProfileSchema.parse({
+              ...repositoryFields,
+              id: 'openai-repository-v1',
+              model: fixtureModel,
+              clientVersion: process.version,
+              displayName: 'Repository fixture',
+              available: true,
+              reason: 'qualification-pending',
+              qualifiedAt: null,
+              maximumSourceFiles: 10000,
+              maximumSourceBytes: 67108864,
+              execution: {
+                sandbox: 'workspace-write',
+                approvalPolicy: 'never',
+                networkAccess: false,
+              },
+            }),
+            locationHash: '4'.repeat(64),
+          }
+        : reviewerProfile;
   const nativeOptions: Partial<ControllerOptions> = {
-    ...(anthropic || google
+    ...(anthropic || google || repository
       ? { nativeProfiles: () => [reviewerProfile, fixtureProfile] }
       : { nativeProfile: () => fixtureProfile }),
     ...options,
@@ -2204,6 +2235,30 @@ async function nativeSetup(
         replacement,
         `const edit = message.params.outputSchema.properties.bindingHash ? {version:1,bindingHash:message.params.outputSchema.properties.bindingHash.const,methodId:message.params.outputSchema.properties.methodId.const,cycle:1,outcome:${JSON.stringify(mode === 'checked-blocked' ? 'blocked' : 'passed')},findings:[],summary:'The bounded review completed.'} : ${replacement.slice('const edit = '.length)}`,
       );
+      const repositoryWriter =
+        repository &&
+        pending &&
+        !context.controller.store.db
+          .prepare('SELECT attempt_id FROM review_jobs WHERE attempt_id=?')
+          .get(pending.attempt_id);
+      if (repositoryWriter)
+        transcript = repositoryFixture([
+          {
+            path: 'net.mjs',
+            content: mode.includes('checked')
+              ? readFileSync(join(context.directory, 'checked-proposal/net.mjs'), 'utf8')
+              : fixtureContent(targetPath),
+          },
+          {
+            path: 'cli.mjs',
+            content: `${repositoryCli}// The command keeps the same interface.\n`,
+          },
+          {
+            path: 'docs/日本語.md',
+            content: '# Calculation notes\nThe discount clamps at zero.\n',
+          },
+          { path: 'index.html', content: null },
+        ]);
       if (anthropicChild) {
         const content = mode.includes('checked')
           ? readFileSync(join(context.directory, 'checked-proposal/net.mjs'), 'utf8')
@@ -2257,7 +2312,16 @@ async function nativeSetup(
       }
       const child = spawn(
         executable,
-        ['-e', transcript, mode.includes('checked') || anthropic ? 'success' : mode, phase],
+        [
+          '-e',
+          transcript,
+          mode.includes('checked') || anthropic || repository
+            ? mode === 'repository-hold'
+              ? 'hold'
+              : 'success'
+            : mode,
+          phase,
+        ],
         spawnOptions,
       );
       children.push(child);
@@ -2392,6 +2456,12 @@ async function nativeSetup(
     (await context.controller.execute(context.draft, 'local-owner')).entity,
   );
   const source = inspectSource(task.projectId, context.source.directory);
+  const sourceFiles = committedFiles(context.source.directory, source.base);
+  if (repository) {
+    const cli = sourceFiles.find((file) => file.path === 'cli.mjs');
+    assert(cli);
+    repositoryCli = cli.content.toString('utf8');
+  }
   const policy: NativePilotAppointment['policy'] = {
     ...context.fixtures.policy,
     quality: 'quick',
@@ -2405,6 +2475,15 @@ async function nativeSetup(
       ...(grant.action === 'export-patch' ? { target: task.id } : {}),
     })),
   };
+  if (repository) {
+    const write = policy.effects.find((grant) => grant.action === 'write-scratch');
+    assert(write);
+    policy.effects.push({
+      ...write,
+      action: 'run-native-tools',
+      expiresAt: new Date(Date.parse(context.clock.now()) + 180000).toISOString(),
+    });
+  }
   const appointment: NativePilotAppointment = {
     id: 'controller-native-fixture',
     taskId: task.id,
@@ -2426,9 +2505,7 @@ async function nativeSetup(
     creditPolicy: 'ordinary',
     target: {
       path: targetPath,
-      baseHash: committedFiles(context.source.directory, source.base).find(
-        (file) => file.path === targetPath,
-      )?.hash as string,
+      baseHash: sourceFiles.find((file) => file.path === targetPath)?.hash as string,
     },
     consent: {
       nativeTrust: 'accepted',
@@ -3170,6 +3247,7 @@ test('an appointed native proposal is retained and applied once after every phas
   for (const scenario of [
     'checked',
     'project-checked',
+    'repository-checked',
     'anthropic-checked',
     'google-checked',
     'failed',
@@ -3184,12 +3262,15 @@ test('an appointed native proposal is retained and applied once after every phas
     const passedReview =
       scenario === 'checked' ||
       scenario === 'project-checked' ||
+      scenario === 'repository-checked' ||
       scenario === 'anthropic-checked' ||
       scenario === 'google-checked';
     console.error(`Native fixture row: evaluation/${scenario}`);
     const context = await nativeSetup(
       t,
-      scenario === 'anthropic-checked' || scenario === 'google-checked'
+      scenario === 'anthropic-checked' ||
+        scenario === 'google-checked' ||
+        scenario === 'repository-checked'
         ? scenario
         : scenario === 'failed'
           ? 'success'
@@ -3201,6 +3282,56 @@ test('an appointed native proposal is retained and applied once after every phas
     const { command, task, appointment, clock } = context;
     const retained = nativeCandidate(controller);
     if (passedReview) {
+      if (scenario === 'repository-checked') {
+        const payload = {
+          taskId: task.id,
+          profileId: context.fixtureProfile.facts.id,
+          policy: appointment.policy,
+          consent: 'explicit',
+        };
+        for (const change of [
+          {
+            policy: {
+              ...appointment.policy,
+              effects: appointment.policy.effects.filter(
+                (grant) => grant.action !== 'run-native-tools',
+              ),
+            },
+          },
+          {
+            policy: {
+              ...appointment.policy,
+              effects: appointment.policy.effects.map((grant) =>
+                grant.action === 'run-native-tools' ? { ...grant, revoked: true } : grant,
+              ),
+            },
+          },
+          {
+            policy: {
+              ...appointment.policy,
+              effects: appointment.policy.effects.map((grant) =>
+                grant.action === 'run-native-tools'
+                  ? { ...grant, target: 'another-project' }
+                  : grant,
+              ),
+            },
+          },
+          { consent: 'saved' },
+        ]) {
+          const before = controller.snapshot();
+          assert.equal(
+            (
+              await controller.execute(
+                command('PrepareNativeRun', { ...payload, ...change }, task.revision),
+                'local-owner',
+              )
+            ).outcome,
+            'blocked',
+          );
+          assert.deepEqual(controller.snapshot(), before);
+          assert.equal(controller.store.intents().length, 0);
+        }
+      }
       const prepared = await controller.execute(
         command(
           'PrepareNativeRun',
@@ -3217,7 +3348,7 @@ test('an appointed native proposal is retained and applied once after every phas
                 }
               : {}),
             ...(scenario === 'google-checked' ? { permissionMode: 'request-review' } : {}),
-            targetPath: 'net.mjs',
+            ...(scenario === 'repository-checked' ? {} : { targetPath: 'net.mjs' }),
             policy: appointment.policy,
             consent: 'explicit',
           },
@@ -3227,6 +3358,15 @@ test('an appointed native proposal is retained and applied once after every phas
       );
       assert.equal(prepared.outcome, 'applied');
       const nativeRun = RunSchema.parse(prepared.entity);
+      if (scenario === 'repository-checked') {
+        const tools = appointment.policy.effects.find(
+          (grant) => grant.action === 'run-native-tools',
+        );
+        assert(tools);
+        assert.equal(controller.snapshot().nativeRuns[0].expiresAt, tools.expiresAt);
+        const key = `grant:${hashCanonical({ taskId: tools.taskId, action: tools.action, target: tools.target, expiresAt: tools.expiresAt })}`;
+        assert.equal(controller.store.receipt(key), undefined);
+      }
       assert.equal(
         (
           await controller.execute(
@@ -3325,6 +3465,26 @@ test('an appointed native proposal is retained and applied once after every phas
         'blocked',
       );
     }
+    if (scenario === 'repository-checked') {
+      const before = controller.snapshot();
+      assert.equal(
+        (
+          await controller.execute(
+            command(
+              'PrepareCandidateEvaluation',
+              {
+                ...payload,
+                reviewer: { ...payload.reviewer, profileId: context.fixtureProfile.facts.id },
+              },
+              revision(),
+            ),
+            'local-owner',
+          )
+        ).outcome,
+        'blocked',
+      );
+      assert.deepEqual(controller.snapshot(), before);
+    }
     const prepare = command('PrepareCandidateEvaluation', payload, revision());
     const prepared = await controller.execute(prepare, 'local-owner');
     assert.equal(prepared.outcome, 'applied');
@@ -3345,8 +3505,24 @@ test('an appointed native proposal is retained and applied once after every phas
     assert.deepEqual(preview.reviewStart, { available: false, reason: 'checks-required' });
     assert.equal(preview.creditPolicy, 'ordinary');
     assert.equal(preview.reviewer.independence, 'process-only');
-    assert.equal(preview.target.baseHash, appointment.target.baseHash);
-    assert.notEqual(preview.target.candidateContentHash, preview.candidateHash);
+    if (scenario === 'repository-checked') {
+      assert(preview.repository);
+      assert.equal(preview.target, undefined);
+      assert.deepEqual(preview.repository, controller.snapshot().nativeRuns[0].repository);
+      assert.equal(
+        controller.store.receipt(`native-application:${controller.store.intents()[0].attempt_id}`),
+        undefined,
+      );
+      assert.equal(
+        controller.store.receipt(`native-capture:${controller.store.intents()[0].attempt_id}`)
+          ?.result.outcome,
+        'applied',
+      );
+    } else {
+      assert(preview.target);
+      assert.equal(preview.target.baseHash, appointment.target.baseHash);
+      assert.notEqual(preview.target.candidateContentHash, preview.candidateHash);
+    }
     const readState = () => ({
       cursor: controller.store.cursor(),
       receipts: controller.store.db.prepare('SELECT COUNT(*) AS count FROM receipts').get()?.count,
@@ -3661,6 +3837,34 @@ test('an appointed native proposal is retained and applied once after every phas
       const result = controller.snapshot();
       const job = result.reviewJobs?.at(-1);
       assert(job && !job.scripted);
+      if (scenario === 'repository-checked') {
+        const artifact = ArtifactSchema.parse(
+          controller.store.receipt(`native-review-input:${job.attemptId}`)?.result.entity,
+        );
+        const saved = JSON.parse(
+          new ArtifactFiles(join(controller.home, 'artifacts'))
+            .read(artifact.hash)
+            .toString('utf8'),
+        );
+        assert.equal(saved.input.repository.candidateManifestHash, candidate.hash);
+        assert.deepEqual(
+          saved.input.repository.changes.map((change: { path: string }) => change.path),
+          ['cli.mjs', 'docs/日本語.md', 'index.html', 'net.mjs'],
+        );
+        assert.equal(
+          saved.input.repository.changes.find(
+            (change: { path: string }) => change.path === 'index.html',
+          ).candidate,
+          null,
+        );
+        assert.equal(
+          saved.input.repository.changes.find(
+            (change: { path: string }) => change.path === 'docs/日本語.md',
+          ).original,
+          null,
+        );
+      }
+
       assert.equal(job.writerAttemptId, result.attempts[0].id);
       assert.equal(job.candidateId, candidate.id);
       assert.equal(job.preparationId, artifact.id);
@@ -4243,15 +4447,24 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
     'journal-read',
     'public-before-submit',
     'public-after-submit',
+    'public-repository-after-submit',
+    'public-repository-capture-failure',
     'public-close-at-admission',
     'public-restart-intent',
   ] as const) {
     const publicRun = scenario.startsWith('public-');
-    const boundary = scenario.replace(/^public-/, '');
+    const repository = scenario.startsWith('public-repository-');
+    const boundary = scenario.replace(/^public-/, '').replace(/^repository-/, '');
     console.error(`Native fixture row: stop/${scenario}`);
     const context = await nativeSetup(
       t,
-      boundary === 'after-submit' || boundary === 'close' ? 'hold' : 'success',
+      repository
+        ? boundary === 'capture-failure'
+          ? 'repository-success'
+          : 'repository-hold'
+        : boundary === 'after-submit' || boundary === 'close'
+          ? 'hold'
+          : 'success',
       boundary === 'restart-intent'
         ? {
             afterIntent: () => {
@@ -4264,11 +4477,28 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
     let action: Promise<unknown> | undefined;
     const unknown = Promise.withResolvers<void>();
     const sealed =
-      boundary === 'journal-read'
+      boundary === 'journal-read' || boundary === 'capture-failure'
         ? unknown.promise
         : boundary === 'restart-intent' || boundary === 'close-at-admission'
           ? Promise.resolve()
           : nativeCandidate(controller);
+    if (boundary === 'capture-failure') {
+      context.observe(controller, (event) => {
+        if (event.type === 'task.updated' && event.payload.state === 'interrupted')
+          unknown.resolve();
+      });
+      context.onWritten((message) => {
+        if (message.method === 'turn/start')
+          mkdirSync(
+            join(
+              controller.home,
+              'scratch',
+              controller.snapshot().tasks[0].runId as string,
+              '.git',
+            ),
+          );
+      });
+    }
     if (boundary === 'journal-read') {
       context.observe(controller, (event) => {
         if (event.type === 'task.updated' && event.payload.state === 'unknown') unknown.resolve();
@@ -4352,7 +4582,7 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
           {
             taskId: task.id,
             profileId: context.fixtureProfile.facts.id,
-            targetPath: appointment.target.path,
+            ...(repository ? {} : { targetPath: appointment.target.path }),
             policy: appointment.policy,
             consent: 'explicit',
           },
@@ -4396,6 +4626,7 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
     }
     if (
       boundary !== 'application-intent' &&
+      boundary !== 'capture-failure' &&
       boundary !== 'restart-intent' &&
       boundary !== 'close-at-admission'
     )
@@ -4416,6 +4647,32 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
       assert.equal(
         controller.store.receipt(`native-application:${controller.store.intents()[0].attempt_id}`),
         undefined,
+      );
+    }
+    if (boundary === 'capture-failure') {
+      const snapshot = controller.snapshot();
+      assert.equal(snapshot.tasks[0].state, 'interrupted');
+      assert.equal(typeof snapshot.tasks[0].next, 'string');
+      assert.match(snapshot.tasks[0].next as string, /capture failed/);
+      assert.equal(snapshot.candidates.length, 0);
+      assert.equal(
+        controller.store.receipt(`native-capture:${snapshot.attempts[0].id}`),
+        undefined,
+      );
+      const failure = ArtifactSchema.parse(
+        controller.store.receipt(`native-capture-failure:${snapshot.attempts[0].id}`)?.result
+          .entity,
+      );
+      assert.deepEqual(
+        JSON.parse(
+          new ArtifactFiles(join(controller.home, 'artifacts')).read(failure.hash).toString('utf8'),
+        ),
+        { attemptId: snapshot.attempts[0].id, reason: 'capture-unavailable' },
+      );
+      assert(existsSync(join(controller.home, 'scratch', runId, '.git')));
+      assert.deepEqual(
+        inspectSource(task.projectId, context.source.directory),
+        snapshot.runs[0].source,
       );
     }
     await nativeWait(
@@ -4485,6 +4742,11 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
       const application = reopened.store.receipt(
         `native-application:${reopened.store.intents()[0].attempt_id}`,
       );
+      if (repository)
+        assert.equal(
+          reopened.store.receipt(`native-capture:${reopened.store.intents()[0].attempt_id}`),
+          undefined,
+        );
       assert.equal(
         application?.result.outcome,
         boundary === 'application-intent' || boundary === 'manifest'

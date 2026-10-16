@@ -7,8 +7,22 @@ import test from 'node:test';
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { groupAbsent } from '../../host/worker.ts';
 import { startNativeTask } from './native-discovery.ts';
+import { resolveRepositoryProfile } from './profile.ts';
 import { ReplacementTranscript, replacementPlan, startReplacement } from './replacement.ts';
-import { configuration, fixture, replies, running, threadResult } from './replacement-fixture.ts';
+import {
+  configuration,
+  fixture,
+  replies,
+  repositoryFixture,
+  running,
+  threadResult,
+} from './replacement-fixture.ts';
+import {
+  type RepositoryActivity,
+  RepositoryTranscript,
+  repositoryPlan,
+  startRepository,
+} from './repository.ts';
 import { ReviewTranscript, reviewPlan, startReview } from './review.ts';
 
 const original = 'export function netMinor() { throw new Error(); }\n';
@@ -707,6 +721,298 @@ test('native proposals and reviews require one matching completed turn and bound
       );
     else assert.throws(() => reviewPlan(value as Parameters<typeof reviewPlan>[0]));
   }
+  const digestText = (value: string) => createHash('sha256').update(value).digest('hex');
+  const repositoryData = {
+    binding: reviewData.binding,
+    model: reviewData.model,
+    effort: reviewData.effort,
+    directory,
+    context: reviewData.context,
+    repository: {
+      version: 1 as const,
+      sourceBase: 'a'.repeat(40),
+      sourceManifestHash: 'b'.repeat(64),
+      candidateManifestHash: reviewData.binding.candidateHash,
+      changes: [
+        {
+          path: 'added.mjs',
+          original: null,
+          candidate: { mode: '100644' as const, hash: digestText(candidate), content: candidate },
+        },
+        {
+          path: 'deleted.mjs',
+          original: { mode: '100644' as const, hash: digestText(original), content: original },
+          candidate: null,
+        },
+        {
+          path: 'mode.mjs',
+          original: { mode: '100644' as const, hash: digestText(original), content: original },
+          candidate: { mode: '100755' as const, hash: digestText(original), content: original },
+        },
+      ],
+    },
+  };
+  const repositoryReview = reviewPlan(repositoryData);
+  const collection = new ReviewTranscript(repositoryReview, { now: () => 1, timeoutMs: 180_000 });
+  metadata(collection);
+  collection.push(bytes({ id: 10, result: threadResult(directory) }));
+  const collectionRequest = JSON.parse(Buffer.from(collection.next() as Uint8Array).toString());
+  const collectionTask = JSON.parse(
+    collectionRequest.params.input[0].text.split('\n').slice(1).join('\n'),
+  );
+  assert.deepEqual(collectionTask.repository, repositoryData.repository);
+  assert.equal(collectionTask.path, undefined);
+  assert.equal(collectionTask.bindingHash, hashCanonical(repositoryData.binding));
+  const changes = repositoryData.repository.changes;
+  for (const repository of [
+    { ...repositoryData.repository, version: 2 },
+    { ...repositoryData.repository, candidateManifestHash: '0'.repeat(64) },
+    { ...repositoryData.repository, changes: [] },
+    { ...repositoryData.repository, changes: [changes[1], changes[0]] },
+    { ...repositoryData.repository, changes: [changes[0], changes[0]] },
+    { ...repositoryData.repository, changes: [{ ...changes[0], original: null, candidate: null }] },
+    { ...repositoryData.repository, changes: [{ ...changes[2], candidate: changes[2].original }] },
+    ...['text\0tail', '\ud800', 'x'.repeat(262_144)].map((content) => ({
+      ...repositoryData.repository,
+      changes: [
+        { ...changes[0], candidate: { mode: '100644', content, hash: digestText(content) } },
+      ],
+    })),
+    {
+      ...repositoryData.repository,
+      changes: [{ ...changes[0], candidate: { ...changes[0].candidate, hash: '0'.repeat(64) } }],
+    },
+    { ...repositoryData.repository, changes: [{ ...changes[0], path: '../outside' }] },
+  ])
+    assert.throws(() =>
+      reviewPlan({ ...repositoryData, repository } as Parameters<typeof reviewPlan>[0]),
+    );
+  assert.throws(() =>
+    reviewPlan({ ...repositoryData, path: 'net.mjs' } as Parameters<typeof reviewPlan>[0]),
+  );
+
+  const repositoryInput = repositoryPlan({
+    attemptId: plan(directory).attemptId,
+    model: 'gpt-6.1-sol',
+    effort: 'low',
+    scratchPath: resolve(directory, 'scratch'),
+    sourceBase: 'a'.repeat(40),
+    manifestHash: 'b'.repeat(64),
+    execution: { sandbox: 'workspace-write', approvalPolicy: 'never', networkAccess: false },
+    context: {
+      title: 'Fix arithmetic',
+      outcome: 'Preserve the bounds.',
+      criteria: ['Return the bounded net.'],
+    },
+  });
+  assert.equal(repositoryInput.creditPolicy, 'ordinary');
+  assert.equal(resolveRepositoryProfile({}).facts.id, 'openai-repository-v1');
+  for (const invalid of [
+    { ...repositoryInput, scratchPath: 'relative' },
+    { ...repositoryInput, execution: { ...repositoryInput.execution, networkAccess: true } },
+    { ...repositoryInput, context: { ...repositoryInput.context, outcome: 'text\0tail' } },
+    {
+      ...repositoryInput,
+      context: {
+        ...repositoryInput.context,
+        criteria: Array.from({ length: 100 }, () => 'x'.repeat(4096)),
+      },
+    },
+  ])
+    assert.throws(() => repositoryPlan(invalid as Parameters<typeof repositoryPlan>[0]));
+  for (const mode of [
+    'success',
+    'fragmented',
+    'failed-command',
+    'activity-throw',
+    'activity-promise',
+    'approval',
+    'wrong-approval',
+    'malformed-approval',
+    'unknown-request',
+    'network',
+    'cwd',
+    'incomplete-item',
+    'failed-turn',
+    'duplicate-item',
+    'wrong-turn',
+    'reroute',
+    'deadline',
+  ]) {
+    let clock = 1;
+    const activities: RepositoryActivity[] = [];
+    const native = new RepositoryTranscript(repositoryInput, {
+      now: () => clock,
+      timeoutMs: 300_000,
+      directory,
+      onActivity: (activity) => {
+        activities.push(activity);
+        if (mode === 'activity-throw') throw new Error('private-repository-canary');
+        if (mode === 'activity-promise')
+          return Promise.reject(new Error('private-repository-canary'));
+      },
+    });
+    const threadRequest = metadata(native);
+    assert.equal(threadRequest.params.cwd, repositoryInput.scratchPath);
+    assert.equal(threadRequest.params.sandbox, 'workspace-write');
+    assert.equal(threadRequest.params.approvalPolicy, 'never');
+    const thread = {
+      ...threadResult(repositoryInput.scratchPath),
+      approvalPolicy: 'never',
+      sandbox: {
+        type: 'workspaceWrite',
+        writableRoots: [repositoryInput.scratchPath],
+        networkAccess: mode === 'network',
+      },
+    };
+    if (mode === 'cwd') thread.cwd = directory;
+    if (mode === 'network' || mode === 'cwd') {
+      assert.throws(() => native.push(bytes({ id: 10, result: thread })));
+      continue;
+    }
+    native.push(bytes({ id: 10, result: thread }));
+    if (mode === 'deadline') {
+      clock = 300_001;
+      assert.throws(() => native.next());
+      assert.equal(native.submitted, false);
+      continue;
+    }
+    const request = JSON.parse(Buffer.from(native.next() as Uint8Array).toString());
+    assert.equal(request.params.outputSchema, undefined);
+    assert.equal(request.params.cwd, repositoryInput.scratchPath);
+    assert.deepEqual(request.params.sandboxPolicy.writableRoots, [repositoryInput.scratchPath]);
+    native.push(bytes({ id: 11, result: { turn: running } }));
+    const identity = { threadId: 'thread-1', turnId: 'turn-1' };
+    const command = {
+      id: 'command-1',
+      type: 'commandExecution',
+      status: 'inProgress',
+      command: 'private-repository-canary',
+      cwd: repositoryInput.scratchPath,
+    };
+    const frames: unknown[] = [
+      { method: 'turn/started', params: { threadId: identity.threadId, turn: running } },
+      { method: 'item/started', params: { ...identity, item: command, startedAtMs: 1 } },
+    ];
+    if (mode.includes('approval') || mode === 'unknown-request') {
+      for (const frame of frames) native.push(bytes(frame));
+      const approval = {
+        id: 'approval-1',
+        method:
+          mode === 'unknown-request'
+            ? 'item/tool/request'
+            : 'item/commandExecution/requestApproval',
+        params: {
+          ...identity,
+          turnId: mode === 'wrong-approval' ? 'other' : identity.turnId,
+          itemId: command.id,
+          ...(mode === 'malformed-approval' ? {} : { startedAtMs: 1 }),
+        },
+      };
+      if (mode === 'approval') {
+        native.push(bytes(approval));
+        const cancellation = Buffer.from(native.next() as Uint8Array)
+          .toString()
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line));
+        assert.deepEqual(cancellation, [
+          { id: approval.id, result: { decision: 'cancel' } },
+          { id: 12, method: 'turn/interrupt', params: identity },
+        ]);
+        assert.equal(native.interrupt(), null);
+      } else {
+        assert.throws(() => native.push(bytes(approval)), mode);
+        assert.equal(
+          JSON.parse(Buffer.from(native.interrupt() as Uint8Array).toString()).method,
+          'turn/interrupt',
+        );
+      }
+      assert.throws(() => native.finish());
+      assert.equal(native.complete, false);
+      continue;
+    }
+    if (mode === 'duplicate-item') frames.push(frames[1]);
+    if (mode === 'reroute') frames.push({ method: 'model/rerouted', params: identity });
+    frames.push({
+      method: 'item/commandExecution/outputDelta',
+      params: {
+        ...identity,
+        turnId: mode === 'wrong-turn' ? 'other' : identity.turnId,
+        itemId: command.id,
+        delta: 'private-repository-canary',
+      },
+    });
+    if (mode !== 'incomplete-item')
+      frames.push({
+        method: 'item/completed',
+        params: {
+          ...identity,
+          item: { ...command, status: mode === 'failed-command' ? 'failed' : 'completed' },
+          completedAtMs: 2,
+        },
+      });
+    const fileItem = {
+      id: 'files-1',
+      type: 'fileChange',
+      status: 'inProgress',
+      changes: [
+        {
+          path: resolve(repositoryInput.scratchPath, 'net.mjs'),
+          kind: { type: 'update' },
+          diff: 'private-repository-canary',
+        },
+        {
+          path: resolve(directory, 'outside.mjs'),
+          kind: { type: 'update' },
+          diff: 'private-repository-canary',
+        },
+      ],
+    };
+    frames.push(
+      { method: 'item/started', params: { ...identity, item: fileItem, startedAtMs: 3 } },
+      {
+        method: 'item/completed',
+        params: { ...identity, item: { ...fileItem, status: 'completed' }, completedAtMs: 4 },
+      },
+    );
+    frames.push({
+      method: 'turn/completed',
+      params: {
+        threadId: identity.threadId,
+        turn: { ...running, status: mode === 'failed-turn' ? 'failed' : 'completed' },
+      },
+    });
+    const perform = () => {
+      for (const frame of frames) {
+        const buffer = bytes(frame);
+        if (mode === 'fragmented') for (const byte of buffer) native.push(new Uint8Array([byte]));
+        else native.push(buffer);
+      }
+      return native.finish();
+    };
+    if (['success', 'fragmented', 'failed-command'].includes(mode)) {
+      const result = perform();
+      assert.deepEqual(activities, [
+        { kind: 'command', state: 'started' },
+        { kind: 'command', state: mode === 'failed-command' ? 'failed' : 'completed' },
+        { kind: 'file-change', state: 'started', fileCount: 2, paths: ['net.mjs'] },
+        { kind: 'file-change', state: 'completed', fileCount: 2, paths: ['net.mjs'] },
+      ]);
+      assert(!JSON.stringify(activities).includes('private-repository-canary'));
+      assert.equal(result.manifestHash, repositoryInput.manifestHash);
+      assert.equal(result.qualified, false);
+      assert.equal('replacement' in result, false);
+      assert(!JSON.stringify(result).includes('private-repository-canary'));
+    } else assert.throws(perform, mode);
+    assert(
+      !JSON.stringify({
+        diagnostic: native.diagnostic,
+        refused: native.refusedEnvelope,
+        last: native.lastEnvelope,
+      }).includes('private-repository-canary'),
+    );
+  }
   const selectedReview = reviewPlan(reviewData);
   assert.equal(selectedReview.creditPolicy, 'ordinary');
   assert.throws(() =>
@@ -944,6 +1250,81 @@ test('native task submission and interruption share one deadline through owned c
         }
       }
     }
+    const repositoryDirectory = resolve(root, 'repository-transport');
+    const scratchPath = resolve(root, 'repository-scratch');
+    mkdirSync(repositoryDirectory, { mode: 0o700 });
+    mkdirSync(scratchPath, { mode: 0o700 });
+    let repositoryPhases = 0;
+    let repositorySubmissions = 0;
+    const ownedActivities: RepositoryActivity[] = [];
+    const repository = startRepository(
+      {
+        executable: process.execPath,
+        sha256: digest,
+        directory: repositoryDirectory,
+        repositoryRoot: root,
+        environment: { HOME: root },
+      },
+      repositoryPlan({
+        attemptId: plan(root).attemptId,
+        model: 'gpt-6.1-sol',
+        effort: 'low',
+        scratchPath,
+        sourceBase: 'a'.repeat(40),
+        manifestHash: 'b'.repeat(64),
+        execution: { sandbox: 'workspace-write', approvalPolicy: 'never', networkAccess: false },
+        context: { title: 'Bound net', outcome: 'Return the net.', criteria: ['Keep the bound.'] },
+      }),
+      {
+        timeoutMs: 300_000,
+        onSubmitted: () => {
+          repositorySubmissions++;
+        },
+        onActivity: (activity) => {
+          ownedActivities.push(activity);
+        },
+        spawn: (executable, args, options) => {
+          const phase =
+            args.at(-1) === 'list' ? 'features' : ++repositoryPhases === 1 ? 'prepare' : 'task';
+          const child = spawn(
+            executable,
+            [
+              '-e',
+              repositoryFixture([
+                { path: 'net.mjs', content: 'export const net = 0;\n' },
+                { path: 'docs/note.md', content: '# Bounds\n' },
+              ]),
+              'success',
+              phase,
+            ],
+            options,
+          );
+          owned.push({
+            child,
+            closed: new Promise((resolve) => child.once('close', () => resolve())),
+          });
+          return child;
+        },
+      },
+    );
+    const captured = await repository.result;
+    assert.equal(captured.reason, null, JSON.stringify(captured));
+    assert.equal(captured.quiescent, true);
+    assert.equal(repositorySubmissions, 1);
+    assert.deepEqual(
+      ownedActivities.map(({ kind, state }) => [kind, state]),
+      [
+        ['command', 'started'],
+        ['command', 'completed'],
+        ['file-change', 'started'],
+        ['file-change', 'completed'],
+      ],
+    );
+    assert.equal(repository.groups.length, 3);
+    assert(repository.groups.every(groupAbsent));
+    assert.equal(readFileSync(resolve(scratchPath, 'net.mjs'), 'utf8'), 'export const net = 0;\n');
+    assert.equal(readFileSync(resolve(scratchPath, 'docs/note.md'), 'utf8'), '# Bounds\n');
+    assert.throws(() => readFileSync(resolve(repositoryDirectory, 'net.mjs')));
     const directory = resolve(root, 'factory-deadline');
     mkdirSync(directory, { mode: 0o700 });
     let now = 0;

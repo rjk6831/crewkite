@@ -198,6 +198,25 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     effort: 'low',
     permissionModes: ['request-review', 'strict', 'always-proceed', 'proceed-in-sandbox'],
   };
+  const repositoryProfile: Snapshot['nativeProfiles'][number] = {
+    id: 'openai-repository-v1',
+    family: 'openai',
+    displayName: 'OpenAI repository work',
+    clientVersion: profile.clientVersion,
+    model: profile.model,
+    effort: 'low',
+    accountClass: 'pro',
+    serviceTier: 'default',
+    qualifiedAt: null,
+    creditPolicies: ['ordinary', 'existing-credits'],
+    maximumTaskMs: 300000,
+    maximumSourceFiles: 10000,
+    maximumSourceBytes: 67108864,
+    maximumSubmissions: 1,
+    execution: { sandbox: 'workspace-write', approvalPolicy: 'never', networkAccess: false },
+    available: true,
+    reason: 'qualification-pending',
+  };
   const billingAttestation = {
     source: 'user-attested' as const,
     subscriptionLoginConfirmed: true as const,
@@ -297,6 +316,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     reviewStart: { available: false, reason: 'checks-required' },
     localAcceptance: { available: false, reason: 'evidence-incomplete' },
   };
+  assert(evaluation.target);
   const grants = ['run-check', 'run-review'].map((action) => ({
     action,
     target: action === 'run-check' ? 'node --test' : 'keep-it-simple/cycle-1',
@@ -310,6 +330,18 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     'show',
     'native-show',
     'profiles',
+    'repository-explicit',
+    'repository-saved',
+    'repository-credits',
+    'repository-missing-tools',
+    'repository-revoked-tools',
+    'repository-expired-tools',
+    'repository-wrong-profile',
+    'repository-file-command',
+    'repository-billing-option',
+    'repository-mode-option',
+    'repository-reviewer',
+    'repository-show',
     'anthropic-explicit',
     'anthropic-saved',
     'anthropic-missing',
@@ -366,19 +398,54 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     'accept-approval-mismatch',
     'accept-approval-ambiguous',
   ]) {
+    const repositorySaved = scenario === 'repository-saved' || scenario === 'repository-show';
+    const repositoryPolicy = {
+      ...policy,
+      effects:
+        scenario === 'repository-missing-tools'
+          ? []
+          : [
+              {
+                taskId: task.id,
+                action: 'run-native-tools' as const,
+                target: 'fixture-project',
+                expiresAt:
+                  scenario === 'repository-expired-tools'
+                    ? '2020-01-01T00:00:00.000Z'
+                    : nativeRun.expiresAt,
+                revoked: scenario === 'repository-revoked-tools',
+                usesRemaining: 1 as const,
+              },
+            ],
+    };
     const anthropicSaved = scenario === 'anthropic-saved' || scenario === 'anthropic-show';
     const googleSaved = scenario === 'google-saved' || scenario === 'google-show';
-    const selectedNativeRun: Snapshot['nativeRuns'][number] = anthropicSaved
-      ? { ...nativeRun, profileId: anthropicProfile.id, billingAttestation }
-      : googleSaved
-        ? {
-            ...nativeRun,
-            profileId: googleProfile.id,
-            billingAttestation,
-            permissionMode: 'strict',
-          }
-        : nativeRun;
+    const selectedNativeRun: Snapshot['nativeRuns'][number] = repositorySaved
+      ? {
+          runId: run.id,
+          profileId: repositoryProfile.id,
+          stage: 'prepared',
+          expiresAt: nativeRun.expiresAt,
+          repository: {
+            sourceBase: run.source.base,
+            manifestHash: '9'.repeat(64),
+            files: 4,
+            bytes: 2048,
+          },
+          execution: repositoryProfile.execution,
+        }
+      : anthropicSaved
+        ? { ...nativeRun, profileId: anthropicProfile.id, billingAttestation }
+        : googleSaved
+          ? {
+              ...nativeRun,
+              profileId: googleProfile.id,
+              billingAttestation,
+              permissionMode: 'strict',
+            }
+          : nativeRun;
     const evaluating =
+      scenario === 'repository-reviewer' ||
       scenario === 'anthropic-reviewer' ||
       scenario === 'google-reviewer' ||
       scenario.startsWith('evaluation-') ||
@@ -497,11 +564,15 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
             kind: 'snapshot',
             snapshot: {
               ...snapshot,
+              projects: scenario.startsWith('repository-')
+                ? [{ id: task.projectId, name: 'fixture-project', revision: 0 }]
+                : snapshot.projects,
               tasks: pendingCommand
                 ? [pendingTask]
                 : scenario === 'native-show' ||
                     anthropicSaved ||
                     googleSaved ||
+                    repositorySaved ||
                     evaluating ||
                     needsApproval
                   ? [
@@ -516,6 +587,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
                 scenario === 'native-show' ||
                 anthropicSaved ||
                 googleSaved ||
+                repositorySaved ||
                 evaluating ||
                 needsApproval
                   ? [run]
@@ -533,7 +605,11 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
                   ]
                 : snapshot.attempts,
               nativeRuns:
-                scenario === 'native-show' || anthropicSaved || googleSaved || evaluating
+                scenario === 'native-show' ||
+                anthropicSaved ||
+                googleSaved ||
+                repositorySaved ||
+                evaluating
                   ? [selectedNativeRun]
                   : [],
               candidates: evaluating || needsApproval ? [candidate] : [],
@@ -542,6 +618,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
               evidence: reviewEvidence,
               approvals,
               nativeProfiles: [
+                repositoryProfile,
                 googleProfile,
                 anthropicProfile,
                 {
@@ -595,7 +672,10 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     context.after(() => fixture.close());
     const policyFile = join(fixture.home, 'policy.json'),
       destination = join(fixture.home, 'saved.patch');
-    writeFileSync(policyFile, JSON.stringify(policy));
+    writeFileSync(
+      policyFile,
+      JSON.stringify(scenario.startsWith('repository-') ? repositoryPolicy : policy),
+    );
     const grantsFile = join(fixture.home, 'grants.json');
     writeFileSync(
       grantsFile,
@@ -768,7 +848,86 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
                   ...(scenario === 'google-credits' ? ['--existing-credits'] : []),
                 ];
     }
+    if (scenario.startsWith('repository-')) {
+      args =
+        scenario === 'repository-show'
+          ? ['task', 'show', task.id]
+          : scenario === 'repository-reviewer'
+            ? ['task', 'prepare-evaluation', task.id, repositoryProfile.id, '--grants', grantsFile]
+            : scenario === 'repository-file-command'
+              ? [
+                  'task',
+                  'prepare-native',
+                  task.id,
+                  repositoryProfile.id,
+                  'net.mjs',
+                  '--policy',
+                  policyFile,
+                ]
+              : [
+                  'task',
+                  'prepare-repository',
+                  task.id,
+                  scenario === 'repository-wrong-profile' ? profile.id : repositoryProfile.id,
+                  '--policy',
+                  policyFile,
+                  ...(scenario === 'repository-saved'
+                    ? []
+                    : ['--native-trust', '--source-consent']),
+                  ...(scenario === 'repository-credits' ? ['--existing-credits'] : []),
+                  ...(scenario === 'repository-billing-option'
+                    ? ['--confirm-subscription-only']
+                    : []),
+                  ...(scenario === 'repository-mode-option' ? ['--permission-mode', 'strict'] : []),
+                ];
+    }
     const result = await execute(args, scenario !== 'changes');
+    if (scenario.startsWith('repository-')) {
+      if (scenario === 'repository-show') {
+        assert.equal(result.code, 0, result.errors);
+        assert.deepEqual(JSON.parse(result.output).nativeRun, selectedNativeRun);
+        const plain = await execute(args, false);
+        for (const fact of [
+          'Repository 4 files, 2048 bytes',
+          'Native sandbox workspace-write',
+          'Native approval never',
+          'Native network off',
+          '9'.repeat(64),
+        ])
+          assert(plain.output.includes(fact), fact);
+        assert(!plain.output.includes('Target unknown'));
+      } else if (
+        ['repository-explicit', 'repository-saved', 'repository-credits'].includes(scenario)
+      ) {
+        assert.equal(result.code, 0, result.errors);
+        const receipt = JSON.parse(result.output);
+        assert.equal(receipt.command.command, 'PrepareNativeRun');
+        assert.equal(receipt.command.expectedRevision, task.revision);
+        assert.deepEqual(receipt.command.payload, {
+          taskId: task.id,
+          profileId: repositoryProfile.id,
+          policy: repositoryPolicy,
+          creditPolicy: scenario === 'repository-credits' ? 'existing-credits' : 'ordinary',
+          consent: scenario === 'repository-saved' ? 'saved' : 'explicit',
+        });
+        assert.deepEqual(
+          received.map((value) => value.command),
+          ['GetSnapshot', 'PrepareNativeRun'],
+        );
+      } else {
+        assert.equal(result.code, 1, scenario);
+        assert.equal(
+          received.some((value) => value.command !== 'GetSnapshot'),
+          false,
+        );
+        if (scenario === 'repository-reviewer')
+          assert.match(result.errors, /Choose a supported OpenAI reviewer profile/u);
+        if (scenario.endsWith('-tools')) assert.match(result.errors, /run-native-tools grant/u);
+        if (scenario === 'repository-file-command')
+          assert.match(result.errors, /Use task prepare-repository/u);
+      }
+      continue;
+    }
     if (scenario.startsWith('google-')) {
       if (scenario === 'google-show') {
         assert.equal(result.code, 0, result.errors);
@@ -1051,6 +1210,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     if (scenario === 'profiles') {
       assert.equal(result.code, 0);
       assert.deepEqual(JSON.parse(result.output).profiles, [
+        repositoryProfile,
         googleProfile,
         anthropicProfile,
         { ...profile, creditPolicies: [...profile.creditPolicies] },

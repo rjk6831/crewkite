@@ -1063,9 +1063,33 @@ function Plan({
           <SourceFacts source={run.source} />
           {native ? (
             <section className="card">
-              <h2>Native file proposal</h2>
+              <h2>{native.repository ? 'Repository work' : 'Native file proposal'}</h2>
               <div className="facts-grid">
-                <Fact label="Target" value={native.target?.path ?? 'Unavailable'} />
+                {native.repository ? (
+                  <>
+                    <Fact label="Committed base" value={short(native.repository.sourceBase)} />
+                    <Fact label="Source files" value={native.repository.files} />
+                    <Fact label="Source bytes" value={native.repository.bytes} />
+                    <Fact
+                      label="Native sandbox"
+                      value={native.execution?.sandbox ?? 'Unavailable'}
+                    />
+                    <Fact
+                      label="Native approval"
+                      value={
+                        native.execution?.approvalPolicy === 'never'
+                          ? 'Requests refused'
+                          : 'Unavailable'
+                      }
+                    />
+                    <Fact
+                      label="Native network"
+                      value={native.execution?.networkAccess === false ? 'Off' : 'Unavailable'}
+                    />
+                  </>
+                ) : (
+                  <Fact label="Target" value={native.target?.path ?? 'Unavailable'} />
+                )}
                 <Fact label="Submissions per run" value={profile?.maximumSubmissions ?? 1} />
                 <Fact
                   label="Time limit"

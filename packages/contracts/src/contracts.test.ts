@@ -28,6 +28,7 @@ import {
   RouteSchema,
   RuntimeManifestSchema,
   requiredReviewMethodIds,
+  SnapshotSchema,
   SourceDetailsSchema,
   SourceSchema,
   TransportMessageSchema,
@@ -80,6 +81,31 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     hashCanonical(NativeProfileSchema.parse(historicalProfile)),
     hashCanonical(historicalProfile),
   );
+  const execution = {
+    sandbox: 'workspace-write',
+    approvalPolicy: 'never',
+    networkAccess: false,
+  };
+  const { maximumFileBytes: _fileLimit, ...repositoryFields } = historicalProfile;
+  const repositoryProfile = {
+    ...repositoryFields,
+    id: 'openai-repository-v1',
+    qualifiedAt: null,
+    reason: 'qualification-pending',
+    maximumSourceFiles: 10000,
+    maximumSourceBytes: 67108864,
+    execution,
+  };
+  assert.deepEqual(NativeProfileSchema.parse(repositoryProfile), repositoryProfile);
+  for (const change of [
+    { maximumFileBytes: 65536 },
+    { maximumSourceFiles: 2 },
+    { maximumSourceBytes: 67108865 },
+    { execution: { ...execution, sandbox: 'danger-full-access' } },
+    { execution: { ...execution, approvalPolicy: 'on-request' } },
+    { execution: { ...execution, networkAccess: true } },
+  ])
+    assert.equal(NativeProfileSchema.safeParse({ ...repositoryProfile, ...change }).success, false);
   const pendingProfile = {
     ...historicalProfile,
     id: 'anthropic-file-v1',
@@ -109,6 +135,15 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     permissionModes: ['request-review', 'strict', 'always-proceed', 'proceed-in-sandbox'],
   };
   assert.deepEqual(NativeProfileSchema.parse(googleProfile), googleProfile);
+  const profiles = [historicalProfile, pendingProfile, googleProfile, repositoryProfile];
+  assert.deepEqual(SnapshotSchema.shape.nativeProfiles.parse(profiles), profiles);
+  assert.equal(
+    SnapshotSchema.shape.nativeProfiles.safeParse([
+      ...profiles,
+      { ...historicalProfile, id: 'extra-profile' },
+    ]).success,
+    false,
+  );
   for (const change of [
     { permissionModes: ['request-review'] },
     { permissionModes: ['unknown', 'strict', 'always-proceed', 'proceed-in-sandbox'] },
@@ -122,6 +157,22 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     stage: 'retain-only',
   };
   assert.deepEqual(NativeRunSchema.parse(historicalRun), historicalRun);
+  const repositoryRun = {
+    ...historicalRun,
+    profileId: repositoryProfile.id,
+    repository: { sourceBase: 'a'.repeat(40), manifestHash: 'b'.repeat(64), files: 8, bytes: 4096 },
+    execution,
+  };
+  assert.deepEqual(NativeRunSchema.parse(repositoryRun), repositoryRun);
+  for (const change of [
+    { repository: undefined },
+    { execution: undefined },
+    { profileId: historicalProfile.id },
+    { target: { path: 'net.mjs', baseHash: 'a'.repeat(64), bytes: 1 } },
+    { billingAttestation: attestation },
+    { permissionMode: 'request-review' },
+  ])
+    assert.equal(NativeRunSchema.safeParse({ ...repositoryRun, ...change }).success, false);
   assert.ok(CommandSchema.safeParse(command).success);
   for (const [quality, methods] of [
     ['quick', ['keep-it-simple']],
@@ -335,6 +386,40 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     false,
   );
   const localAcceptance = CandidateEvaluationPreviewSchema.shape.localAcceptance;
+  const preview = {
+    taskId: nativeJob.taskId,
+    runId: nativeJob.runId,
+    candidateId: nativeJob.candidateId,
+    candidateHash: nativeJob.candidateHash,
+    preparationId: nativeJob.preparationId,
+    recipe: 'node-tests-v1',
+    testFiles: [],
+    definitionHash: 'b'.repeat(64),
+    target: { path: 'net.mjs', baseHash: 'a'.repeat(64), candidateContentHash: 'b'.repeat(64) },
+    reviewer: {
+      profileId: nativeJob.profileId,
+      assignedRole: 'reviewer',
+      methodId: 'keep-it-simple',
+      cycle: 1,
+      independence: 'process-only',
+    },
+    creditPolicy: 'ordinary',
+    expiresAt: '2026-10-16T00:00:00.000Z',
+    remainingBudgets: { attempts: 2, minutes: 5, concurrency: 1 },
+    allowance: { source: 'supplemental-evaluation', localChecks: 1, nativeReviews: 1 },
+    stage: 'prepared',
+    check: null,
+    review: null,
+    checkStart: { available: true, reason: 'available' },
+    reviewStart: { available: false, reason: 'checks-required' },
+    localAcceptance: { available: false, reason: 'evidence-incomplete' },
+  };
+  assert.deepEqual(CandidateEvaluationPreviewSchema.parse(preview), preview);
+  const { target: _previewTarget, ...previewFields } = preview;
+  const repositoryPreview = { ...previewFields, repository: repositoryRun.repository };
+  assert.deepEqual(CandidateEvaluationPreviewSchema.parse(repositoryPreview), repositoryPreview);
+  for (const invalid of [previewFields, { ...repositoryPreview, target: preview.target }])
+    assert.equal(CandidateEvaluationPreviewSchema.safeParse(invalid).success, false);
   assert.deepEqual(localAcceptance.parse(undefined), {
     available: false,
     reason: 'evidence-incomplete',
@@ -479,6 +564,49 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     methods: [{ id: 'keep-it-simple', cycles: 1, reviewerRole: 'reviewer' }],
   };
   assert.ok(PolicySchema.safeParse(policy).success);
+  const filePreparation = {
+    ...command,
+    command: 'PrepareNativeRun',
+    payload: {
+      taskId: job.taskId,
+      profileId: 'openai-file-v1',
+      targetPath: 'net.mjs',
+      policy: PolicySchema.parse(policy),
+      creditPolicy: 'ordinary',
+      consent: 'explicit',
+    },
+  };
+  assert.deepEqual(CommandSchema.parse(filePreparation), filePreparation);
+  const { targetPath: _target, ...preparationFields } = filePreparation.payload;
+  const repositoryPreparation = {
+    ...filePreparation,
+    payload: { ...preparationFields, profileId: 'openai-repository-v1' },
+  };
+  assert.deepEqual(CommandSchema.parse(repositoryPreparation), repositoryPreparation);
+  for (const change of [
+    { targetPath: 'net.mjs' },
+    { billingAttestation: attestation },
+    { permissionMode: 'request-review' },
+    { execution },
+    { profileId: 'openai-file-v1' },
+  ])
+    assert.equal(
+      CommandSchema.safeParse({
+        ...repositoryPreparation,
+        payload: { ...repositoryPreparation.payload, ...change },
+      }).success,
+      false,
+    );
+  assert.ok(
+    GrantSchema.safeParse({
+      taskId: job.taskId,
+      action: 'run-native-tools',
+      target: 'fixture-project',
+      expiresAt: '2026-10-16T00:00:00.000Z',
+      revoked: false,
+      usesRemaining: 1,
+    }).success,
+  );
   const handoff = sealHandoff({
     version: 1,
     id: `hnd_${suffix}`,

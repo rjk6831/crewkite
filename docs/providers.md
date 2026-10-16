@@ -75,6 +75,18 @@ An explicit, frozen writer policy can allow existing credits after included usag
 
 A live turn can include upstream retries and tool continuations. A turn cap does not establish an inference-request cap. [Included subscription usage can extend into available paid credits](https://learn.chatgpt.com/docs/pricing#credits-overview); an included-only hard limit remains unverified. Reported ordinary usage availability does not enforce that boundary. CrewKite bounds submitted tasks and elapsed time. It cannot count every upstream inference request.
 
+### Repository work
+
+The separate `openai-repository-v1` profile uses the exact 0.163.0 client build, Pro metadata, `gpt-6.1-sol` at low effort and the default tier. It freezes the committed source base and manifest, bounded to 10,000 files and 64 MiB. Preparation requires scratch-write and `run-native-tools` grants for that task and project. The tools grant is consumed once at launch and permits multiple local commands during the bounded task. File consent cannot authorize it. Existing credits default off.
+
+The native settings are fixed: `workspace-write`, approval `never` and network access off. The requested policy retains the native `TMPDIR` and `/tmp` write exceptions. Requests needing native approval are cancelled and the turn is interrupted. These controls add no CrewKite filesystem, process or network containment. [ADR 0009](adr/0009-native-client-trust-profile.md) records the native trust boundary.
+
+The controller captures actual scratch after owned processes are quiescent. A matching completed turn and bound capture receipt permit separate evaluation. Partial work after failure or Stop remains unverified and inspectable; uncertain ownership blocks capture. Native command output establishes no check evidence. Review includes every changed text file, with original and candidate hashes, content and modes, including additions and deletions. The full structured review input is capped at 256 KiB. Unsupported text or an oversized collection blocks review. Local checks and destination-specific acceptance keep their separate grants.
+
+One supervised synthetic task used the normal [desktop preparation and Start path](../apps/cli/README.md#native-repository-work). It completed after 68.528 seconds with one submission, changed `net.mjs`, added `docs/calculation.md` and retained a 1,177-byte patch. The run recorded native command activity, and the desktop displayed the full diff. The CLI exported the same candidate, and the same home reopened it without another submission. Original source, index, refs and unselected files stayed unchanged. All three native phases were quiescent with groups absent, and every owned process closed with zero status.
+
+That run used explicitly enabled existing credits. It ran no CrewKite checks, review or acceptance and did not exercise active Stop. Live repository Stop, package recovery and useful repository work checked through explicit project test selection remain pending. The profile's qualification date remains unset; existing single-file pilot evidence keeps its separate scope.
+
 ## Applying a replacement
 
 The source helper separately rechecks the full saved scratch manifest and the opened target before replacing one existing regular file. It refuses links, mismatched hashes and stale file metadata. It preserves permissions, truncates to the replacement length and syncs the file. A write failure can retain unverified scratch and requires explicit recovery.
