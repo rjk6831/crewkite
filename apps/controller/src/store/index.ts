@@ -2,11 +2,15 @@ import { chmodSync, lstatSync, mkdirSync, readdirSync, readFileSync } from 'node
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import {
+  type Attempt,
   type CommandResult,
   CommandResultSchema,
   canonicalJson,
   type Event,
   EventSchema,
+  type Run,
+  type Task,
+  TimestampSchema,
 } from '@crewkite/contracts';
 
 export type EntityKind =
@@ -32,6 +36,17 @@ export type LaunchIntent = {
   process_group: number | null;
   admitted_at: string | null;
   finished_at: string | null;
+};
+
+export type NativeProcess = {
+  attempt_id: string;
+  sequence: number;
+  phase: 'effective-features' | 'metadata-preparation' | 'app-server-task';
+  state: 'intent' | 'owned' | 'quiescent';
+  pid: number | null;
+  process_group: number | null;
+  intent_at: string;
+  quiescent_at: string | null;
 };
 
 export class Store {
@@ -184,6 +199,100 @@ export class Store {
     return this.db
       .prepare('SELECT * FROM launch_intents ORDER BY attempt_id')
       .all() as LaunchIntent[];
+  }
+
+  nativeProcesses(attemptId: string): NativeProcess[] {
+    const rows = this.db
+      .prepare('SELECT * FROM native_processes WHERE attempt_id=? ORDER BY sequence')
+      .all(attemptId) as NativeProcess[];
+    for (const [sequence, row] of rows.entries()) {
+      if (
+        row.sequence !== sequence ||
+        (sequence === 0 && row.phase !== 'effective-features') ||
+        (sequence === 1 && row.phase === 'effective-features') ||
+        (sequence === 2 &&
+          (rows[1]?.phase !== 'metadata-preparation' || row.phase !== 'app-server-task')) ||
+        (sequence > 0 && rows[sequence - 1]?.state !== 'quiescent')
+      )
+        throw new Error('Native process sequence is invalid.');
+    }
+    return rows;
+  }
+
+  private nativeWriter(attemptId: string) {
+    if (!this.transactionEvents) throw new Error('Native ownership writes require a transaction.');
+    const intent = this.intents().find((value) => value.attempt_id === attemptId);
+    const attempt = this.get<Attempt>('attempt', attemptId);
+    const run = intent && this.get<Run>('run', intent.run_id);
+    const task = intent && this.get<Task>('task', intent.task_id);
+    const lease = this.db
+      .prepare('SELECT attempt_id,generation FROM writer_leases WHERE task_id=?')
+      .get(intent?.task_id ?? '');
+    if (
+      !intent ||
+      intent.state === 'stopped' ||
+      !attempt ||
+      !run ||
+      !task ||
+      attempt.runId !== run.id ||
+      run.taskId !== task.id ||
+      task.runId !== run.id ||
+      attempt.routeId !== intent.route_id ||
+      attempt.generation !== intent.generation ||
+      lease?.attempt_id !== attemptId ||
+      lease.generation !== intent.generation
+    )
+      throw new Error('Native process writer lineage is invalid.');
+    return { attempt, task };
+  }
+
+  intendNativePhase(
+    attemptId: string,
+    sequence: number,
+    phase: NativeProcess['phase'],
+    at: string,
+  ) {
+    const { attempt, task } = this.nativeWriter(attemptId);
+    if (!['intent', 'running'].includes(attempt.state) || task.state !== 'running')
+      throw new Error('Native phases require a current running writer.');
+    const previous = this.nativeProcesses(attemptId);
+    if (
+      sequence !== previous.length ||
+      sequence > 2 ||
+      (sequence === 0 && phase !== 'effective-features') ||
+      (sequence === 1 && !['metadata-preparation', 'app-server-task'].includes(phase)) ||
+      (sequence === 2 &&
+        (previous[1]?.phase !== 'metadata-preparation' || phase !== 'app-server-task')) ||
+      previous.some((row) => row.state !== 'quiescent')
+    )
+      throw new Error('Native phase requires its preceding process to be quiescent.');
+    this.db
+      .prepare(
+        "INSERT INTO native_processes(attempt_id,sequence,phase,state,intent_at) VALUES (?,?,?,'intent',?)",
+      )
+      .run(attemptId, sequence, phase, TimestampSchema.parse(at));
+  }
+
+  ownNativePhase(attemptId: string, sequence: number, group: number) {
+    this.nativeWriter(attemptId);
+    if (!Number.isSafeInteger(group) || group <= 0)
+      throw new Error('Native process group must be a positive integer.');
+    const result = this.db
+      .prepare(
+        "UPDATE native_processes SET state='owned',pid=?,process_group=? WHERE attempt_id=? AND sequence=? AND state='intent'",
+      )
+      .run(group, group, attemptId, sequence);
+    if (result.changes !== 1) throw new Error('Native phase intent is missing or already owned.');
+  }
+
+  finishNativePhase(attemptId: string, sequence: number, group: number, at: string) {
+    this.nativeWriter(attemptId);
+    const result = this.db
+      .prepare(
+        "UPDATE native_processes SET state='quiescent',quiescent_at=? WHERE attempt_id=? AND sequence=? AND state='owned' AND process_group=?",
+      )
+      .run(TimestampSchema.parse(at), attemptId, sequence, group);
+    if (result.changes !== 1) throw new Error('Native phase ownership does not match its closure.');
   }
 
   subscribe(listener: (event: Event) => void): () => void {

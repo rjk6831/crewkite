@@ -430,6 +430,176 @@ test('a committed launch intent survives restart without another launch', async 
   );
   assert.equal(launches, 2);
   absent.close();
+  const phases = ['effective-features', 'metadata-preparation', 'app-server-task'] as const;
+  for (const entry of [
+    { sequence: 0, state: 'intent', unknown: true },
+    { sequence: 1, state: 'intent', unknown: true },
+    { sequence: 2, state: 'intent', unknown: true },
+    { sequence: 2, state: 'owned-present', unknown: true },
+    { sequence: 2, state: 'owned-absent', unknown: false },
+    { sequence: 0, state: 'quiescent', unknown: false },
+    { sequence: 1, state: 'quiescent', unknown: false },
+    { sequence: 2, state: 'quiescent', unknown: false },
+  ]) {
+    let submissions = 0;
+    const fixture = await setup(t, {
+      afterIntent: () => {
+        submissions++;
+        throw new Error('Native fixture stopped after admission.');
+      },
+    });
+    const task = TaskSchema.parse(
+      (await fixture.controller.execute(fixture.draft, 'local-owner')).entity,
+    );
+    const prepared = await fixture.controller.execute(
+      fixture.command(
+        'PrepareRun',
+        {
+          taskId: task.id,
+          policy: {
+            ...fixture.fixtures.policy,
+            quality: 'quick',
+            methods: [],
+            effects: fixture.fixtures.policy.effects.map((grant) => ({
+              ...grant,
+              taskId: task.id,
+            })),
+          },
+          roles: quickRoles(fixture.fixtures),
+        },
+        task.revision,
+      ),
+      'local-owner',
+    );
+    const run = RunSchema.parse(prepared.entity);
+    await assert.rejects(
+      fixture.controller.execute(
+        fixture.command('StartRun', { taskId: task.id, runId: run.id }, prepared.revision),
+        'local-owner',
+      ),
+      /Native fixture stopped/,
+    );
+    const intent = fixture.controller.store.intents()[0];
+    const processes: Array<{ child: ReturnType<typeof spawn>; closed: Promise<void> }> = [];
+    t.after(async () => {
+      for (const process of processes) process.child.stdin?.end();
+      await Promise.all(processes.map((process) => process.closed));
+    });
+    assert.throws(
+      () =>
+        fixture.controller.store.intendNativePhase(
+          intent.attempt_id,
+          0,
+          phases[0],
+          fixture.clock.now(),
+        ),
+      /require a transaction/,
+    );
+    for (let sequence = 0; sequence <= entry.sequence; sequence++) {
+      fixture.controller.store.transaction(() => {
+        assert.throws(
+          () =>
+            fixture.controller.store.intendNativePhase(
+              intent.attempt_id,
+              sequence + 1,
+              phases[sequence],
+              fixture.clock.now(),
+            ),
+          /preceding process/,
+        );
+        fixture.controller.store.intendNativePhase(
+          intent.attempt_id,
+          sequence,
+          phases[sequence],
+          fixture.clock.now(),
+        );
+      });
+      if (sequence === entry.sequence && entry.state === 'intent') break;
+      const child = spawn(
+        process.execPath,
+        ['-e', "process.stdin.resume();process.stdout.write('ready\\n');"],
+        {
+          detached: true,
+          stdio: ['pipe', 'pipe', 'pipe'],
+          env: {},
+        },
+      );
+      const closed = new Promise<void>((resolve) => child.once('close', () => resolve()));
+      processes.push({ child, closed });
+      await once(child.stdout, 'data');
+      const group = child.pid as number;
+      fixture.controller.store.transaction(() => {
+        assert.throws(
+          () => fixture.controller.store.ownNativePhase(intent.attempt_id, sequence, 0),
+          /positive integer/,
+        );
+        fixture.controller.store.ownNativePhase(intent.attempt_id, sequence, group);
+        assert.throws(
+          () =>
+            fixture.controller.store.intendNativePhase(
+              intent.attempt_id,
+              sequence + 1,
+              phases[Math.min(2, sequence + 1)],
+              fixture.clock.now(),
+            ),
+          /preceding process/,
+        );
+      });
+      if (sequence === entry.sequence && entry.state === 'owned-present') break;
+      child.stdin.end();
+      await closed;
+      if (sequence === entry.sequence && entry.state === 'owned-absent') break;
+      fixture.controller.store.transaction(() => {
+        assert.throws(
+          () =>
+            fixture.controller.store.finishNativePhase(
+              intent.attempt_id,
+              sequence,
+              0,
+              fixture.clock.now(),
+            ),
+          /ownership does not match/,
+        );
+        fixture.controller.store.finishNativePhase(
+          intent.attempt_id,
+          sequence,
+          group,
+          fixture.clock.now(),
+        );
+      });
+    }
+    fixture.controller.close();
+    const recovered = new Controller({
+      home: join(fixture.directory, 'home'),
+      now: fixture.clock.now,
+      id: fixture.id,
+      afterIntent: () => {
+        submissions++;
+      },
+    });
+    try {
+      assert.equal(
+        recovered.snapshot().tasks[0].state,
+        entry.unknown ? 'unknown' : 'interrupted',
+        `${entry.sequence}/${entry.state}`,
+      );
+      assert.equal(
+        recovered.snapshot().candidates.length,
+        0,
+        'restart cannot apply or seal native output',
+      );
+      assert.equal(recovered.store.nativeProcesses(intent.attempt_id).length, entry.sequence + 1);
+      assert.equal(
+        recovered.store.db.prepare('SELECT COUNT(*) AS count FROM writer_leases').get()?.count,
+        entry.unknown ? 1 : 0,
+      );
+      assert.equal(submissions, 1, 'restart cannot resubmit or advance a native phase');
+    } finally {
+      recovered.close();
+      for (const process of processes) process.child.stdin?.end();
+      await Promise.all(processes.map((process) => process.closed));
+    }
+  }
 });
 
 test('a retained descendant blocks sealing and transfer after its leader exits', async (t) => {
