@@ -178,7 +178,7 @@ export function CurrentCheckoutChanges({
     <details className="card checkout-changes">
       <summary>
         Current checkout changes
-        <span>
+        <span className="checkout-count">
           {source.dirtyCount} changed · {source.untrackedCount} untracked
         </span>
       </summary>

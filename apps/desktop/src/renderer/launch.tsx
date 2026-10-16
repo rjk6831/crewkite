@@ -55,16 +55,16 @@ const methodCatalog: Array<{ id: MethodId; name: string; description: string; cr
     credit: 'Ponytail',
   },
   {
-    id: 'challenge-assumptions',
-    name: 'Challenge assumptions',
-    description: 'Test the assumptions behind the plan before accepting its claims.',
-    credit: 'ADHD',
-  },
-  {
     id: 'second-opinion',
     name: 'Second opinion',
     description: 'Request one independent review against the candidate and criteria.',
     credit: 'multi',
+  },
+  {
+    id: 'challenge-assumptions',
+    name: 'Challenge assumptions',
+    description: 'Test the assumptions behind the plan before accepting its claims.',
+    credit: 'ADHD',
   },
   {
     id: 'round-robin',
@@ -77,7 +77,7 @@ const principles = [
   'Keep the source checkout untouched.',
   'Require review for dependency and configuration changes.',
   'Stop on failed checks.',
-  'Approve only a named local effect.',
+  'Allow only the specific action approved for this task.',
 ];
 
 export function Launch({
@@ -1392,9 +1392,7 @@ export function Launch({
                             })
                           }
                         />
-                        {principle === 'Approve only a named local effect.'
-                          ? 'Approve a specific action in this workspace.'
-                          : principle}
+                        {principle}
                       </label>
                     ))}
                   </div>
