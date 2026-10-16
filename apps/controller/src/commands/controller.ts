@@ -23,6 +23,7 @@ import {
   type Attempt,
   AttemptSchema,
   type Candidate,
+  CandidateSchema,
   type CheckResult,
   CheckResultSchema,
   type Command,
@@ -33,6 +34,7 @@ import {
   type Event,
   EventSchema,
   type FakeWorkerEvent,
+  formatReviewTarget,
   type Grant,
   MAX_FRAME_BYTES,
   type Observation,
@@ -2213,6 +2215,39 @@ export class Controller {
       });
   }
 
+  private attestedReviewWriter(run: Run, candidate: Candidate, writer: Attempt): boolean {
+    const current = this.store
+      .intents()
+      .filter(
+        (intent) =>
+          intent.run_id === run.id && intent.scratch_path === join(this.home, 'scratch', run.id),
+      )
+      .at(-1);
+    const stored = this.store.get<Attempt>('attempt', writer.id);
+    const receipt = this.store.receipt(`candidate:${writer.id}`);
+    const sealed = CandidateSchema.safeParse(receipt?.result.entity);
+    return (
+      !!current &&
+      current.attempt_id === writer.id &&
+      current.task_id === run.taskId &&
+      current.route_id === writer.routeId &&
+      current.generation === writer.generation &&
+      current.state === 'stopped' &&
+      stored?.state === 'stopped' &&
+      stored.runId === run.id &&
+      stored.routeId === writer.routeId &&
+      stored.generation === writer.generation &&
+      writer.runId === run.id &&
+      candidate.taskId === run.taskId &&
+      receipt?.hash === candidate.hash &&
+      receipt.result.outcome === 'applied' &&
+      sealed.success &&
+      sealed.data.taskId === run.taskId &&
+      sealed.data.id === candidate.id &&
+      sealed.data.hash === candidate.hash
+    );
+  }
+
   private reviewIdentity(run: Run, job: ReviewJob) {
     const digest = createHash('sha256')
       .update(readFileSync(fakeReviewWorkerPath))
@@ -2225,6 +2260,9 @@ export class Controller {
         cycle: job.cycle,
         routeId: job.routeId,
         policyHash: run.policy.hash,
+        ...(job.writerAttemptId
+          ? { writerAttemptId: job.writerAttemptId, writerRouteId: job.writerRouteId }
+          : {}),
       }),
     };
   }
@@ -2235,6 +2273,7 @@ export class Controller {
     method: NonNullable<Policy['methods']>[number],
     cycle: number,
     candidate: Candidate,
+    expectedWriter?: Attempt,
   ): boolean {
     const job = check.review?.job;
     const role = run.roles.find((value) => value.role === method.reviewerRole);
@@ -2252,6 +2291,16 @@ export class Controller {
       ![role.routeId, ...role.approvedFallbacks].includes(job.routeId)
     )
       return false;
+    if (job.writerAttemptId) {
+      const writer = this.store.get<Attempt>('attempt', job.writerAttemptId);
+      if (
+        !writer ||
+        writer.routeId !== job.writerRouteId ||
+        (expectedWriter && expectedWriter.id !== writer.id) ||
+        !this.attestedReviewWriter(run, candidate, writer)
+      )
+        return false;
+    }
     const identity = this.reviewIdentity(run, job);
     if (check.evaluator !== identity.evaluator || check.definitionHash !== identity.definitionHash)
       return false;
@@ -2297,6 +2346,8 @@ export class Controller {
     }
     if (this.hasUncertainWriter(task.id) || this.latestCandidate(run.id)?.hash !== candidate.hash)
       throw new Error('Review candidate binding changed.');
+    if (!this.attestedReviewWriter(run, candidate, writer))
+      throw new Error('Review writer provenance is not attested.');
     const completed = this.store.db
       .prepare(
         "SELECT body FROM evidence WHERE candidate_id=? AND candidate_hash=? AND kind='review'",
@@ -2306,7 +2357,11 @@ export class Controller {
     let pending: { method: NonNullable<Policy['methods']>[number]; cycle: number } | undefined;
     methods: for (const method of run.policy.policy.methods ?? [])
       for (let cycle = 1; cycle <= method.cycles; cycle++)
-        if (!completed.some((check) => this.reviewMatches(check, run, method, cycle, candidate))) {
+        if (
+          !completed.some((check) =>
+            this.reviewMatches(check, run, method, cycle, candidate, writer),
+          )
+        ) {
           pending = { method, cycle };
           break methods;
         }
@@ -2353,6 +2408,8 @@ export class Controller {
         attemptId: attempt.id,
         generation: attempt.generation,
         routeId: decision.chosen,
+        writerAttemptId: writer.id,
+        writerRouteId: writer.routeId,
         candidateId: candidate.id,
         candidateHash: candidate.hash,
         methodId: pending.method.id,
@@ -2364,10 +2421,12 @@ export class Controller {
       job.routeId !== decision.chosen ||
       job.methodId !== pending.method.id ||
       job.cycle !== pending.cycle ||
-      job.candidateHash !== candidate.hash
+      job.candidateHash !== candidate.hash ||
+      (job.writerAttemptId !== undefined &&
+        (job.writerAttemptId !== writer.id || job.writerRouteId !== writer.routeId))
     )
       throw new Error('Approved review binding changed.');
-    const target = `${job.methodId}/cycle-${job.cycle}`;
+    const target = formatReviewTarget({ methodId: job.methodId, cycle: job.cycle });
     const grant = this.grant(run, 'run-review', target);
     if (!grant && !approved) {
       const ask = () => {

@@ -17,10 +17,14 @@ import {
   type Approval,
   type Artifact,
   ArtifactSchema,
+  type Attempt,
+  type CheckResult,
+  canonicalJson,
   ProjectSchema,
   RunSchema,
   TaskSchema,
 } from '@crewkite/contracts';
+import { hashCanonical } from '@crewkite/contracts/hash';
 import { createDemoFixtures, createTestClock, createTestIds } from '@crewkite/testkit';
 import { createSyntheticRepository } from '@crewkite/testkit/repository';
 import { ArtifactFiles } from '../artifacts/index.ts';
@@ -270,6 +274,22 @@ test('new preparations enforce review floors and require eligible method roles',
       run.policy.policy.methods?.map((method) => method.id),
       expected,
     );
+    const reordered = await controller.execute(
+      command(
+        'PrepareRun',
+        {
+          taskId: task.id,
+          roles,
+          policy: {
+            ...run.policy.policy,
+            methods: [...(run.policy.policy.methods ?? [])].reverse(),
+          },
+        },
+        controller.snapshot().tasks[0].revision,
+      ),
+      'local-owner',
+    );
+    assert.equal(RunSchema.parse(reordered.entity).policy.hash, run.policy.hash);
   }
   for (const [id, reason] of [
     ['second-opinion', 'review-role-ineligible'],
@@ -956,6 +976,116 @@ async function acceptsTransferredCandidate(t: TestContext, transfer: 'reserve' |
     transfer === 'manual' ? [0, 1, 2] : [0, 1],
   );
   const candidate = snapshot.candidates[0];
+  const writer = controller.store
+    .intents()
+    .filter(
+      (intent) =>
+        intent.run_id === run.id &&
+        intent.scratch_path === join(controller.home, 'scratch', run.id),
+    )
+    .at(-1);
+  assert.ok(writer);
+  for (const check of snapshot.evidence.filter((check) => check.review)) {
+    assert.equal(check.review?.job.writerAttemptId, writer.attempt_id);
+    assert.equal(check.review?.job.writerRouteId, writer.route_id);
+  }
+  if (transfer === 'reserve') {
+    const check = snapshot.evidence.find((check) => check.review) as CheckResult;
+    assert.ok(check.review);
+    const blocked = async () => {
+      const result = await controller.execute(
+        command(
+          'AcceptCandidate',
+          {
+            taskId: task.id,
+            candidateId: candidate.id,
+            destinationRef: 'refs/heads/feat/invalid-review',
+          },
+          snapshot.tasks[0].revision,
+        ),
+        'local-owner',
+      );
+      assert.equal(result.reason, 'selected-review-not-complete');
+      assert.equal(controller.snapshot().tasks[0].state, 'ready');
+    };
+    const receiptKey = `candidate:${writer.attempt_id}`;
+    const receipt = controller.store.receipt(receiptKey);
+    assert.ok(receipt);
+    controller.store.db
+      .prepare('UPDATE receipts SET request_hash=? WHERE command_key=?')
+      .run('a'.repeat(64), receiptKey);
+    try {
+      await blocked();
+    } finally {
+      controller.store.db
+        .prepare('UPDATE receipts SET request_hash=? WHERE command_key=?')
+        .run(receipt.hash, receiptKey);
+    }
+    const original = controller.store.get<Attempt>('attempt', writer.attempt_id);
+    assert.ok(original);
+    controller.store.transaction(() =>
+      controller.store.put('attempt', writer.attempt_id, 0, {
+        ...original,
+        routeId: fixtures.snapshot.routes[2].id,
+      }),
+    );
+    try {
+      await blocked();
+    } finally {
+      controller.store.transaction(() =>
+        controller.store.put('attempt', writer.attempt_id, 0, original),
+      );
+    }
+    const {
+      writerAttemptId: _writerAttemptId,
+      writerRouteId: _writerRouteId,
+      ...legacyJob
+    } = check.review.job;
+    const legacyReview = { ...check.review, job: legacyJob };
+    const stripped = { ...check, review: legacyReview };
+    const updateBody = controller.store.db.prepare(
+      'UPDATE evidence SET body=? WHERE candidate_id=? AND definition_hash=?',
+    );
+    updateBody.run(canonicalJson(stripped), candidate.id, check.definitionHash);
+    try {
+      await blocked();
+    } finally {
+      updateBody.run(canonicalJson(check), candidate.id, check.definitionHash);
+    }
+    const artifact = {
+      id: id('art'),
+      ...new ArtifactFiles(join(controller.home, 'artifacts')).publish(
+        Buffer.from(canonicalJson(legacyReview)),
+      ),
+      mediaType: 'application/json',
+    };
+    const legacyCheck = {
+      ...stripped,
+      artifactId: artifact.id,
+      definitionHash: hashCanonical({
+        methodId: legacyJob.methodId,
+        cycle: legacyJob.cycle,
+        routeId: legacyJob.routeId,
+        policyHash: run.policy.hash,
+      }),
+    };
+    controller.store.transaction(() => {
+      controller.store.put('artifact', artifact.id, 0, artifact);
+      controller.store.db
+        .prepare('UPDATE review_jobs SET body=? WHERE attempt_id=?')
+        .run(canonicalJson(legacyJob), legacyJob.attemptId);
+      controller.store.db
+        .prepare(
+          'UPDATE evidence SET definition_hash=?,body=? WHERE candidate_id=? AND definition_hash=?',
+        )
+        .run(
+          legacyCheck.definitionHash,
+          canonicalJson(legacyCheck),
+          candidate.id,
+          check.definitionHash,
+        );
+    });
+  }
   git(source.directory, ['update-ref', 'refs/heads/feat/existing', base, '0'.repeat(40)]);
   assert.equal(
     (
