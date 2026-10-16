@@ -19,6 +19,7 @@ export type NativeLaunch = {
   repositoryRoot: string;
   environment: NodeJS.ProcessEnv;
 };
+type NativeEnvelope = DiscoveryEnvelope | 'notification' | 'request';
 type NativeRequest = DiscoveryRequest | 'thread/start' | 'turn/start' | 'turn/completed';
 type Outcome<T = DiscoveryMetadata> = {
   metadata: T | null;
@@ -27,7 +28,7 @@ type Outcome<T = DiscoveryMetadata> = {
   exitCode: number | null;
   signal: NodeJS.Signals | null;
   lastRequest: NativeRequest;
-  lastEnvelope: DiscoveryEnvelope;
+  lastEnvelope: NativeEnvelope;
   refusedEnvelope: RefusedEnvelope | null;
   notifications: number;
   stdoutBytes: number;
@@ -41,7 +42,7 @@ export type NativeTranscript<T> = {
   readonly pendingRequest: NativeRequest;
   readonly submitted?: boolean;
   interrupt?: () => Uint8Array | null;
-  readonly lastEnvelope: DiscoveryEnvelope;
+  readonly lastEnvelope: NativeEnvelope;
   readonly refusedEnvelope: RefusedEnvelope | null;
   readonly notifications: number;
 };

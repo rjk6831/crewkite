@@ -212,6 +212,109 @@ test('a replacement requires one matching completed turn and bounded original-fi
     } else assert.throws(perform, mode);
   }
   const directory = resolve('internal/replacement-fixture');
+  const canary = 'private-diagnostic-canary';
+  for (const row of [
+    {
+      frame: {
+        id: 11,
+        error: {
+          code: -32602,
+          message: `Unsupported outputSchema ${canary}`,
+          data: { [canary]: canary },
+        },
+      },
+      rpcField: 'outputSchema',
+      envelope: 'error',
+      cause: 'rpc-error',
+      code: -32602,
+    },
+    {
+      frame: { id: 11, error: { code: canary, message: canary } },
+      envelope: 'error',
+      cause: 'rpc-error',
+      code: null,
+    },
+    {
+      frame: { id: 11, result: { turn: { ...running, id: canary, status: canary } } },
+      envelope: 'response',
+      cause: 'validation',
+      code: null,
+      field: 'status',
+    },
+    {
+      frame: {
+        method: canary,
+        params: {
+          threadId: 'thread-1',
+          turnId: canary,
+          account: canary,
+          text: canary,
+          reasoning: canary,
+        },
+      },
+      envelope: 'notification',
+      cause: 'correlation',
+      code: null,
+    },
+    {
+      frame: { id: 11, result: { turn: running }, [canary]: canary },
+      envelope: 'response',
+      cause: 'validation',
+      code: null,
+    },
+    {
+      frame: { id: 12, result: { text: canary } },
+      envelope: 'response',
+      cause: 'correlation',
+      code: null,
+    },
+  ]) {
+    const diagnostic = new ReplacementTranscript(plan(directory), {
+      now: () => 1,
+      timeoutMs: 300_000,
+    });
+    metadata(diagnostic);
+    diagnostic.push(bytes({ id: 10, result: threadResult(directory) }));
+    diagnostic.next();
+    const frame = bytes(row.frame);
+    diagnostic.push(frame.subarray(0, 3));
+    assert.throws(() => diagnostic.push(frame.subarray(3)));
+    const first = diagnostic.diagnostic;
+    assert(first && Object.isFrozen(first));
+    assert.equal(first.stage, 'turn');
+    assert.equal(first.cause, row.cause);
+    assert.equal(first.rpcCode, row.code);
+    assert.equal(first.rpcField, 'rpcField' in row ? row.rpcField : null);
+    if ('field' in row) assert.equal(first.field, row.field);
+    assert.equal(diagnostic.lastEnvelope, row.envelope);
+    assert.throws(() => diagnostic.push(bytes({ id: 11, result: { turn: running } })));
+    assert.equal(diagnostic.diagnostic, first, 'the first writer refusal remains authoritative');
+    assert(
+      !JSON.stringify({
+        diagnostic: first,
+        lastEnvelope: diagnostic.lastEnvelope,
+        refusedEnvelope: diagnostic.refusedEnvelope,
+        pendingRequest: diagnostic.pendingRequest,
+        notifications: diagnostic.notifications,
+      }).includes(canary),
+    );
+  }
+  const malformed = new ReplacementTranscript(plan(directory), {
+    now: () => 1,
+    timeoutMs: 300_000,
+  });
+  metadata(malformed);
+  malformed.push(bytes({ id: 10, result: threadResult(directory) }));
+  malformed.next();
+  assert.throws(() => malformed.push(Buffer.from(`{"${canary}":\n`)));
+  assert.equal(malformed.diagnostic?.cause, 'invalid-json');
+  assert.equal(malformed.lastEnvelope, 'invalid');
+  assert(
+    !JSON.stringify({
+      diagnostic: malformed.diagnostic,
+      refusedEnvelope: malformed.refusedEnvelope,
+    }).includes(canary),
+  );
   for (const ordinaryUsageAllowed of [false, undefined]) {
     const blocked = new ReplacementTranscript(plan(directory), {
       now: () => 1,
@@ -281,6 +384,10 @@ input.on('line', line => {
   }
   let result = replies[message.method];
   if (message.method === 'thread/start') result = thread(process.cwd());
+  if (message.method === 'turn/start' && mode === 'rpc-error') {
+    process.stdout.write(JSON.stringify({id:message.id,error:{code:-32602,message:'private-diagnostic-canary',data:{account:'private-diagnostic-canary'}}})+'\\n');
+    return;
+  }
   if (message.method === 'turn/start') result = {turn:running};
   process.stdout.write(JSON.stringify({id:message.id,result})+'\\n');
   if (message.method === 'turn/start' && mode === 'success') {
@@ -303,7 +410,7 @@ test('native task submission and interruption share one deadline through owned c
   const digest = createHash('sha256').update(readFileSync(process.execPath)).digest('hex');
   const owned: Array<{ child: ChildProcessWithoutNullStreams; closed: Promise<void> }> = [];
   try {
-    for (const mode of ['success', 'cancel', 'deadline', 'unknown']) {
+    for (const mode of ['success', 'cancel', 'deadline', 'unknown', 'rpc-error']) {
       const directory = resolve(root, mode);
       mkdirSync(directory, { mode: 0o700 });
       const calls: Array<{ milliseconds: number; work: () => void; active: boolean }> = [];
@@ -400,14 +507,25 @@ test('native task submission and interruption share one deadline through owned c
         assert.equal(result.metadata, null, mode);
         assert.equal(
           result.reason,
-          mode === 'unknown' ? 'ownership' : mode === 'cancel' ? 'stopped' : 'deadline',
+          mode === 'unknown'
+            ? 'ownership'
+            : mode === 'rpc-error'
+              ? 'protocol'
+              : mode === 'cancel'
+                ? 'stopped'
+                : 'deadline',
           mode,
         );
         assert.equal(
           writes.filter((value) => value.includes('"method":"turn/interrupt"')).length,
-          1,
+          mode === 'rpc-error' ? 0 : 1,
           mode,
         );
+        if (mode === 'rpc-error') {
+          assert.equal(result.diagnostic?.cause, 'rpc-error');
+          assert.equal(result.diagnostic?.rpcCode, -32602);
+          assert(!JSON.stringify(result).includes('private-diagnostic-canary'));
+        }
       }
     }
     const directory = resolve(root, 'factory-deadline');

@@ -68,6 +68,127 @@ const item = z.union([
   z.object({ id, type: z.literal('userMessage'), content: z.array(z.unknown()).max(32) }),
 ]);
 const encode = (value: unknown) => Buffer.from(`${JSON.stringify(value)}\n`);
+const methods = [
+  'thread/started',
+  'thread/status/changed',
+  'account/rateLimits/updated',
+  'warning',
+  'turn/started',
+  'turn/completed',
+  'item/started',
+  'item/completed',
+  'item/agentMessage/delta',
+  'error',
+  'item/reasoning/summaryTextDelta',
+  'item/reasoning/summaryPartAdded',
+  'item/reasoning/textDelta',
+  'thread/tokenUsage/updated',
+] as const;
+const fields = [
+  'id',
+  'result',
+  'error',
+  'method',
+  'params',
+  'thread',
+  'ephemeral',
+  'model',
+  'modelProvider',
+  'cwd',
+  'approvalPolicy',
+  'approvalsReviewer',
+  'sandbox',
+  'type',
+  'networkAccess',
+  'reasoningEffort',
+  'serviceTier',
+  'turn',
+  'status',
+  'items',
+  'threadId',
+  'turnId',
+  'activeFlags',
+  'rateLimits',
+  'message',
+  'item',
+  'text',
+  'phase',
+  'summary',
+  'content',
+  'itemId',
+  'delta',
+  'willRetry',
+  'contentIndex',
+  'summaryIndex',
+  'tokenUsage',
+  'total',
+  'last',
+  'totalTokens',
+  'version',
+  'attemptId',
+  'path',
+  'baseHash',
+] as const;
+const rpcFields = [
+  'outputSchema',
+  'sandboxPolicy',
+  'serviceTier',
+  'experimentalApi',
+  'text_elements',
+  'threadId',
+  'model',
+  'effort',
+] as const;
+type Stage = 'metadata' | 'thread' | 'turn' | 'output' | 'complete';
+type Site =
+  | 'metadata'
+  | 'frame'
+  | 'envelope'
+  | 'thread-response'
+  | 'turn-response'
+  | 'thread-event'
+  | 'status'
+  | 'allowance'
+  | 'warning'
+  | 'turn-event'
+  | 'identity'
+  | 'item-event'
+  | 'replacement'
+  | 'delta'
+  | 'retry'
+  | 'reasoning'
+  | 'usage'
+  | 'unsupported'
+  | 'deadline'
+  | 'finish';
+type Cause =
+  | 'correlation'
+  | 'validation'
+  | 'invalid-json'
+  | 'rpc-error'
+  | 'unsupported'
+  | 'limit'
+  | 'deadline'
+  | 'incomplete'
+  | 'admission';
+type Frame =
+  | 'none'
+  | 'response'
+  | 'rpc-error'
+  | 'notification'
+  | 'request'
+  | 'other'
+  | 'invalid-json';
+export type ReplacementDiagnostic = Readonly<{
+  stage: Stage;
+  site: Site;
+  cause: Cause;
+  envelope: Frame;
+  method: (typeof methods)[number] | 'other' | null;
+  rpcCode: number | null;
+  rpcField: (typeof rpcFields)[number] | null;
+  field: (typeof fields)[number] | 'other' | null;
+}>;
 
 /** One metadata transcript, one thread and one turn. Output remains a proposal. */
 export class ReplacementTranscript {
@@ -79,7 +200,13 @@ export class ReplacementTranscript {
   private pending: number[] = [];
   private bytes = 0;
   private failed = false;
-  private step: 'metadata' | 'thread' | 'turn' | 'output' | 'complete' = 'metadata';
+  private step: Stage = 'metadata';
+  private site: Site = 'metadata';
+  private frame: Frame = 'none';
+  private method: ReplacementDiagnostic['method'] = null;
+  private rpcCode: number | null = null;
+  private rpcField: ReplacementDiagnostic['rpcField'] = null;
+  private failure: ReplacementDiagnostic | null = null;
   private awaiting = false;
   private frameRequest: number | null = null;
   private threadId: string | null = null;
@@ -113,14 +240,34 @@ export class ReplacementTranscript {
       configurationDirectory: this.plan.directory,
     });
   }
-  private refuse(): never {
+  private refuse(cause: Cause = 'correlation', error?: unknown): never {
+    if (!this.failure) {
+      const path = error instanceof z.ZodError ? error.issues[0]?.path : undefined;
+      const segment = path?.at(-1);
+      const field =
+        segment === undefined ? null : (fields.find((value) => value === segment) ?? 'other');
+      this.failure = Object.freeze({
+        stage: this.step,
+        site: this.site,
+        cause,
+        envelope: this.frame,
+        method: this.method,
+        rpcCode: this.rpcCode,
+        rpcField: this.rpcField,
+        field,
+      });
+    }
     this.failed = true;
     this.final = null;
     throw new Error('The native replacement transcript was refused.');
   }
   private check() {
     const now = this.now();
-    if (this.failed || !Number.isFinite(now) || now >= this.deadline) this.refuse();
+    if (this.failed) this.refuse();
+    if (!Number.isFinite(now) || now >= this.deadline) {
+      this.site = 'deadline';
+      this.refuse('deadline');
+    }
   }
   next(): Uint8Array | null {
     this.check();
@@ -192,12 +339,12 @@ export class ReplacementTranscript {
   push(bytes: Uint8Array) {
     this.check();
     this.bytes += bytes.length;
-    if (this.bytes > 1_048_576) this.refuse();
+    if (this.bytes > 1_048_576) this.refuse('limit');
     for (const byte of bytes) {
       if (this.pending.length === 0)
         this.frameRequest = this.awaiting ? (this.step === 'thread' ? 10 : 11) : null;
       if (byte !== 10) {
-        if (this.pending.length >= 524_288) this.refuse();
+        if (this.pending.length >= 524_288) this.refuse('limit');
         this.pending.push(byte);
         continue;
       }
@@ -205,6 +352,7 @@ export class ReplacementTranscript {
       this.pending = [];
       try {
         if (this.step === 'metadata') {
+          this.site = 'metadata';
           this.discovery.push(line);
           if (this.discovery.complete) {
             this.metadata = this.discovery.finish();
@@ -214,18 +362,58 @@ export class ReplacementTranscript {
               this.metadata.limits.ordinaryUsageAllowed !== true ||
               !model?.supportedReasoningEfforts.includes(this.plan.effort)
             )
-              this.refuse();
+              this.refuse('admission');
             this.step = 'thread';
           }
           continue;
         }
-        const value = envelope.parse(
-          JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(line)),
-        );
-        if ('error' in value) this.refuse();
+        this.site = 'frame';
+        this.frame = 'invalid-json';
+        this.method = null;
+        this.rpcCode = null;
+        this.rpcField = null;
+        let decoded: unknown;
+        try {
+          decoded = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(line));
+        } catch {
+          this.refuse('invalid-json');
+        }
+        const shape =
+          decoded !== null && typeof decoded === 'object' && !Array.isArray(decoded)
+            ? (decoded as Record<string, unknown>)
+            : null;
+        this.frame =
+          shape && 'method' in shape
+            ? 'id' in shape
+              ? 'request'
+              : 'notification'
+            : shape && 'error' in shape
+              ? 'rpc-error'
+              : shape && 'result' in shape
+                ? 'response'
+                : 'other';
+        this.method =
+          shape && 'method' in shape
+            ? (methods.find((value) => value === shape.method) ?? 'other')
+            : null;
+        this.site = 'envelope';
+        const value = envelope.parse(decoded);
+        if ('error' in value) {
+          this.rpcCode =
+            z
+              .object({ code: z.number().int().min(-2_147_483_648).max(2_147_483_647) })
+              .safeParse(value.error).data?.code ?? null;
+          const message = z.object({ message: z.string().max(16_384) }).safeParse(value.error)
+            .data?.message;
+          this.rpcField = message
+            ? (rpcFields.find((field) => new RegExp(`\\b${field}\\b`).test(message)) ?? null)
+            : null;
+          this.refuse('rpc-error');
+        }
         if ('result' in value) {
           if (!this.awaiting || value.id !== this.frameRequest) this.refuse();
           if (this.step === 'thread' && value.id === 10) {
+            this.site = 'thread-response';
             const response = z
               .object({
                 thread: z.object({ id, ephemeral: z.literal(true) }),
@@ -246,6 +434,7 @@ export class ReplacementTranscript {
             this.threadId = response.thread.id;
             this.step = 'turn';
           } else if (this.step === 'turn' && value.id === 11) {
+            this.site = 'turn-response';
             const response = z.object({ turn }).parse(value.result).turn;
             if (response.status !== 'inProgress' || (this.turnId && this.turnId !== response.id))
               this.refuse();
@@ -255,15 +444,16 @@ export class ReplacementTranscript {
           this.awaiting = false;
           continue;
         }
-        if (++this.notificationCount > 4096) this.refuse();
+        if (++this.notificationCount > 4096) this.refuse('limit');
         this.notification(value.method, value.params);
-      } catch {
-        this.refuse();
+      } catch (error) {
+        this.refuse('validation', error);
       }
     }
   }
   private notification(method: string, params: unknown) {
     if (method === 'thread/started') {
+      this.site = 'thread-event';
       const value = z.object({ thread: z.object({ id }) }).parse(params);
       if (this.step !== 'thread' && this.step !== 'turn') this.refuse();
       if (this.threadId && this.threadId !== value.thread.id) this.refuse();
@@ -271,6 +461,7 @@ export class ReplacementTranscript {
       return;
     }
     if (method === 'thread/status/changed') {
+      this.site = 'status';
       const value = z
         .object({
           threadId: id,
@@ -284,18 +475,22 @@ export class ReplacementTranscript {
       return;
     }
     if (method === 'account/rateLimits/updated') {
+      this.site = 'allowance';
       z.object({ rateLimits: z.record(z.string(), z.unknown()) }).parse(params);
       return;
     }
     if (method === 'warning') {
+      this.site = 'warning';
       const value = z
         .object({ message: z.string().max(16_384), threadId: id.nullish() })
         .parse(params);
       if (value.threadId != null && value.threadId !== this.threadId) this.refuse();
       return;
     }
+    this.site = 'identity';
     const identity = z.object({ threadId: id, turnId: id });
     if (method === 'turn/started' || method === 'turn/completed') {
+      this.site = 'turn-event';
       const value = z.object({ threadId: id, turn }).parse(params);
       if (
         !this.submission ||
@@ -329,6 +524,7 @@ export class ReplacementTranscript {
     )
       this.refuse();
     if (method === 'item/started' || method === 'item/completed') {
+      this.site = 'item-event';
       const value = z.object({ item }).parse(params).item;
       if (method === 'item/started') {
         if (this.startedItems.has(value.id) || this.startedItems.size >= 128) this.refuse();
@@ -342,6 +538,7 @@ export class ReplacementTranscript {
           (value.phase == null || value.phase === 'final_answer')
         ) {
           if (this.final) this.refuse();
+          this.site = 'replacement';
           const edit = replacement.parse(JSON.parse(value.text));
           if (edit.attemptId !== this.plan.attemptId || edit.baseHash !== this.plan.baseHash)
             this.refuse();
@@ -352,6 +549,7 @@ export class ReplacementTranscript {
       return;
     }
     if (method === 'item/agentMessage/delta') {
+      this.site = 'delta';
       const value = z.object({ itemId: id, delta: z.string().max(524_288) }).parse(params);
       if (
         this.startedItems.get(value.itemId) !== 'agentMessage' ||
@@ -361,6 +559,7 @@ export class ReplacementTranscript {
       return;
     }
     if (method === 'error') {
+      this.site = 'retry';
       z.object({
         willRetry: z.literal(true),
         error: z.object({ message: z.string().max(16_384) }),
@@ -373,6 +572,7 @@ export class ReplacementTranscript {
       method === 'item/reasoning/summaryPartAdded' ||
       method === 'item/reasoning/textDelta'
     ) {
+      this.site = 'reasoning';
       const value = z.object({ itemId: id }).parse(params);
       if (
         this.startedItems.get(value.itemId) !== 'reasoning' ||
@@ -392,6 +592,7 @@ export class ReplacementTranscript {
       return;
     }
     if (method === 'thread/tokenUsage/updated') {
+      this.site = 'usage';
       z.object({
         tokenUsage: z.object({
           total: z.object({ totalTokens: z.number().safe().nonnegative() }),
@@ -400,7 +601,8 @@ export class ReplacementTranscript {
       }).parse(params);
       return;
     }
-    this.refuse();
+    this.site = 'unsupported';
+    this.refuse('unsupported');
   }
   interrupt() {
     if (this.interrupted || !this.threadId || !this.turnId || this.step === 'complete') return null;
@@ -413,6 +615,7 @@ export class ReplacementTranscript {
   }
   finish() {
     this.check();
+    this.site = 'finish';
     if (
       !this.complete ||
       !this.final ||
@@ -421,7 +624,7 @@ export class ReplacementTranscript {
       !this.turnId ||
       !this.finalItem
     )
-      this.refuse();
+      this.refuse('incomplete');
     return {
       replacement: this.final,
       threadId: this.threadId,
@@ -449,11 +652,21 @@ export class ReplacementTranscript {
             ? ('complete' as const)
             : ('turn/completed' as const);
   }
+  get diagnostic() {
+    return this.failure;
+  }
   get lastEnvelope() {
-    return this.discovery.lastEnvelope;
+    if (this.step === 'metadata') return this.discovery.lastEnvelope;
+    return this.frame === 'rpc-error'
+      ? ('error' as const)
+      : this.frame === 'response' || this.frame === 'notification' || this.frame === 'request'
+        ? this.frame
+        : this.frame === 'none'
+          ? null
+          : ('invalid' as const);
   }
   get refusedEnvelope() {
-    return this.discovery.refusedEnvelope;
+    return this.step === 'metadata' ? this.discovery.refusedEnvelope : null;
   }
   get notifications() {
     return this.discovery.notifications + this.notificationCount;
@@ -469,9 +682,22 @@ export function startReplacement(
   if (trusted.directory !== resolve(launch.directory))
     throw new Error('The replacement directory differs from the owned session.');
   const now = options.now ?? (() => performance.now());
-  return startNativeTask(
-    launch,
-    { ...options, now },
-    (remaining) => new ReplacementTranscript(trusted, { now, timeoutMs: remaining }),
-  );
+  let reader: ReplacementTranscript | undefined;
+  const handle = startNativeTask(launch, { ...options, now }, (remaining) => {
+    reader = new ReplacementTranscript(trusted, { now, timeoutMs: remaining });
+    return reader;
+  });
+  return {
+    get group() {
+      return handle.group;
+    },
+    get groups() {
+      return handle.groups;
+    },
+    stop: handle.stop,
+    result: handle.result.then((outcome) => ({
+      ...outcome,
+      diagnostic: reader?.diagnostic ?? null,
+    })),
+  };
 }
