@@ -59,7 +59,7 @@ Each fact is recorded as supported, unsupported or unknown. Discovery spends no 
 - CrewKite never collects, copies, remaps or logs provider credentials.
 - Ambient API keys and billing overrides are excluded from child environments.
 - Unknown billing blocks the route. There is no hidden fallback to paid API usage.
-- Using existing paid credits is off by default per provider. When enabled, the card states whether the provider enforces a hard cap.
+- Paid-credit controls are planned. They will default off per provider and show whether the provider enforces a hard cap.
 - CrewKite never buys credits, tops up an account or changes a plan.
 - A code license on an open-source proxy or SDK never grants a right to reuse subscription credentials.
 
