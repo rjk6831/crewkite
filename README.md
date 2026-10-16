@@ -7,7 +7,7 @@
 
 CrewKite is a desktop workspace and CLI for coding tasks that share one local controller. It tracks approvals, usage observations and retained work across provider routes.
 
-Status: early prototype for macOS on Apple Silicon. The supported demo uses a synthetic project and four scripted fake routes. One opt-in OpenAI single-file workflow has passed desktop and fresh package launch, retention and manual export. General live routing remains unqualified.
+Status: early prototype for macOS on Apple Silicon. The supported demo uses a synthetic project and four scripted fake routes. One opt-in OpenAI single-file workflow has passed desktop and fresh package launch, retention and manual export. A retained sample candidate passed real local checks, one native review and acceptance into a new local branch. General live routing remains unqualified.
 
 ## Why I am building it
 
@@ -32,7 +32,7 @@ The scripted prototype exercises controller behavior. The bounded native single-
 - Records each task as durable facts and files, so a successor route continues from the work itself. A final summary from the stopped model is optional.
 - Works in scratch copies of your repository. The qualified scripted journey can accept a result as one new local branch. Native single-file work supports inspection and manual export, with separate check and review preparation for the sample project. A matching checked and reviewed native result can request local branch acceptance with its own destination permission. Your checkout, remotes and deployments stay untouched.
 
-The qualified walkthrough uses the bundled synthetic project. Its real checks require the original test file and expected completions. Arbitrary repository checks remain unqualified. Scripted review results establish fixture behavior and candidate binding. The separate native review path supports one Keep it simple cycle with process independence only. One live review passed for the retained sample candidate. Local native acceptance evidence remains pending.
+The qualified walkthrough uses the bundled synthetic project. Its real checks require the original test file and expected completions. Arbitrary repository checks remain unqualified. Scripted review results establish fixture behavior and candidate binding. The separate native review path supports one Keep it simple cycle with process independence only. The retained sample candidate passed two real Node tests and one live review, then became a new local branch through a separate destination approval. The same home reopened with its evidence intact. D1b still needs useful project check definitions; the current recipe covers the sample project.
 
 ## Workspace
 
