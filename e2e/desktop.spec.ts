@@ -248,12 +248,12 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     await expect(
       dialog.getByLabel('Run a review: Second opinion · round 1 approval gate', { exact: true }),
     ).toHaveValue('ask');
-    await dialog.getByLabel('Unknown usage', { exact: true }).selectOption('fixed-allowance');
+    await dialog.getByLabel(/^Unknown usage/).selectOption('fixed-allowance');
     await expect(
       dialog.getByRole('button', { name: 'Resolve and review', exact: true }),
     ).toBeDisabled();
     await expect(dialog.getByText(/current 30-minute plan cannot start/)).toBeVisible();
-    await dialog.getByLabel('Unknown usage', { exact: true }).selectOption('waiting');
+    await dialog.getByLabel(/^Unknown usage/).selectOption('waiting');
     await dialog
       .getByLabel('Write the scratch copy: demo-shop workspace approval gate', { exact: true })
       .selectOption('once');
@@ -347,7 +347,9 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
       element.scrollTop = 0;
     });
     const current = await observer.snapshot();
-    const currentRun = current.runs.find((run) => run.taskId === taskId);
+    const currentRun = current.runs.find(
+      (run) => run.id === current.tasks.find((task) => task.id === taskId)?.runId,
+    );
     assert(currentRun?.decision.chosen);
     const switchControl = page.getByLabel('Saved coder route');
     await switchControl.selectOption(currentRun.decision.chosen);
