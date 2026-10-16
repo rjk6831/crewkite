@@ -4,7 +4,12 @@ import { lstatSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { groupAbsent, type Schedule } from '../../host/worker.ts';
-import { type DiscoveryMetadata, type DiscoveryRequest, OpenAiDiscovery } from './discovery.ts';
+import {
+  type DiscoveryEnvelope,
+  type DiscoveryMetadata,
+  type DiscoveryRequest,
+  OpenAiDiscovery,
+} from './discovery.ts';
 
 type Launch = {
   executable: string;
@@ -20,6 +25,8 @@ type Outcome<T = DiscoveryMetadata> = {
   exitCode: number | null;
   signal: NodeJS.Signals | null;
   lastRequest: DiscoveryRequest;
+  lastEnvelope: DiscoveryEnvelope;
+  notifications: number;
   stdoutBytes: number;
   stderrBytes: number;
 };
@@ -29,6 +36,8 @@ type Transcript<T> = {
   finish: () => T;
   readonly complete: boolean;
   readonly pendingRequest: DiscoveryRequest;
+  readonly lastEnvelope: DiscoveryEnvelope;
+  readonly notifications: number;
 };
 type Spawn = (
   executable: string,
@@ -198,6 +207,8 @@ function startTranscript<T>(
       exitCode,
       signal: exitSignal,
       lastRequest: reader.pendingRequest,
+      lastEnvelope: reader.lastEnvelope,
+      notifications: reader.notifications,
       stdoutBytes,
       stderrBytes,
     });
@@ -241,7 +252,7 @@ function startTranscript<T>(
     stdoutBytes += bytes.length;
     received += bytes.length;
     if (received > 1_048_576) return stop('output-limit');
-    if (stopping || finished) return;
+    if (finished || (stopping && reason !== null)) return;
     try {
       reader.push(bytes);
       advance();
@@ -255,7 +266,8 @@ function startTranscript<T>(
     if (received > 1_048_576) stop('output-limit');
   });
   child.stdout.once('end', () => {
-    if (finished || stopping || metadata) return;
+    // A completed response can still be followed by an incomplete frame before EOF.
+    if (finished || reason !== null) return;
     try {
       metadata = reader.finish();
     } catch {
@@ -286,6 +298,8 @@ class FeatureList implements Transcript<DisabledFeatures> {
   private bytes = Buffer.alloc(0);
   readonly complete = false;
   readonly pendingRequest = 'features-list' as const;
+  readonly lastEnvelope = null;
+  readonly notifications = 0;
   next() {
     return null;
   }

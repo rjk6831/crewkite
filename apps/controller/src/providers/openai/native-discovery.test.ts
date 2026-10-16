@@ -47,9 +47,13 @@ input.on('line', line => {
   if (mode === 'truncated') return process.stdout.write('{"id":1');
   if (message.method === 'model/list' && mode === 'descendant')
     spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'inherit' });
-  process.stdout.write(JSON.stringify({ id: message.id, result: replies[message.method] }) + '\\n');
+  const notices = mode === 'notifications' && message.method === 'initialize' ?
+    JSON.stringify({ method: 'configWarning', params: { summary: 'private-native-diagnostic', details: null } }) + '\\n' +
+    JSON.stringify({ method: 'account/updated', params: { authMode: null, planType: null } }) + '\\n' : '';
+  process.stdout.write(JSON.stringify({ id: message.id, result: replies[message.method] }) + '\\n' + notices);
 });
-input.on('close', () => { if (mode !== 'stubborn') process.exit(mode === 'bad-exit' ? 1 : 0); });
+input.on('close', () => { if (mode !== 'stubborn' && mode !== 'trailing-partial') process.exit(mode === 'bad-exit' ? 1 : 0); });
+if (mode === 'trailing-partial') process.stdin.on('end', () => { process.stdout.write('{', () => process.exit(0)); });
 `;
 
 test('native discovery returns metadata only after its owned process and descendants stop', async () => {
@@ -68,6 +72,8 @@ test('native discovery returns metadata only after its owned process and descend
   try {
     for (const mode of [
       'success',
+      'notifications',
+      'trailing-partial',
       'maximum-bound',
       'descendant',
       'invalid',
@@ -157,8 +163,15 @@ test('native discovery returns metadata only after its owned process and descend
         assert.equal(result.lastRequest, 'configRequirements/read', mode);
       for (const group of handle.groups) if (group > 0) assert(groupAbsent(group), mode);
       assert(!JSON.stringify(result).includes('private-native-diagnostic'), mode);
-      if (mode === 'success' || mode === 'maximum-bound' || mode === 'descendant') {
+      if (
+        mode === 'success' ||
+        mode === 'notifications' ||
+        mode === 'maximum-bound' ||
+        mode === 'descendant'
+      ) {
         assert.equal(result.reason, null, mode);
+        assert.equal(result.notifications, mode === 'notifications' ? 2 : 0);
+        assert.equal(result.lastEnvelope, 'response');
         assert.equal(result.metadata?.configuration?.model_provider, 'openai', mode);
       } else {
         assert.equal(result.metadata, null, mode);

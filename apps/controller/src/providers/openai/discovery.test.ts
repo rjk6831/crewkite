@@ -50,6 +50,10 @@ type Scenario = {
   before?: Uint8Array;
   whole?: boolean;
   afterResponse?: boolean;
+  unboundPartial?: boolean;
+  notices?: unknown[];
+  fragmentedNotice?: boolean;
+  pendingNotice?: boolean;
   deadline?: boolean;
   timeoutMs?: number;
   incomplete?: boolean;
@@ -63,6 +67,64 @@ test('provider discovery emits only correlated metadata and excludes private fie
   const scenarios: Scenario[] = [
     { name: 'fragmented transcript retains exact native model and effort' },
     { name: 'sixty-second metadata bound is accepted', timeoutMs: 60_000 },
+    ...[false, true].map(
+      (fragmentedNotice): Scenario => ({
+        name: fragmentedNotice
+          ? 'fragmented startup notices block the next request'
+          : 'coalesced startup notices carry no authority',
+        fragmentedNotice,
+        notices: [
+          {
+            method: 'configWarning',
+            params: {
+              summary: privateText,
+              details: privateText,
+              path: privateText,
+              range: { start: { line: 1, column: 1 }, end: { line: 1, column: 2 } },
+            },
+          },
+          { method: 'account/updated', params: { authMode: null, planType: null } },
+        ],
+      }),
+    ),
+    {
+      name: 'account notice does not complete outstanding account request',
+      pendingNotice: true,
+      reason: 'incomplete',
+    },
+    ...[
+      { method: 'configWarning', params: { summary: privateText, details: null, extra: true } },
+      { method: 'account/updated', params: { authMode: 'future-auth', planType: null } },
+      {
+        method: 'configWarning',
+        params: {
+          summary: '',
+          details: null,
+          range: { start: { line: 0, column: 1 }, end: { line: 1, column: 1 } },
+        },
+      },
+      { method: 'unknown/private-method', params: { secret: privateText } },
+    ].map(
+      (value): Scenario => ({
+        name: 'malformed or unknown startup notice stops',
+        notices: [value],
+        reason: 'invalid-message',
+      }),
+    ),
+    {
+      name: 'known notification cannot precede initialize response',
+      wire: () =>
+        line({ method: 'configWarning', params: { summary: privateText, details: null } }),
+      reason: 'unexpected-message',
+    },
+    {
+      name: 'startup notice count is bounded',
+      notices: Array(33).fill({
+        method: 'configWarning',
+        params: { summary: privateText, details: null },
+      }),
+      reason: 'limit',
+    },
     ...[false, true].map(
       (mismatch): Scenario => ({
         name: mismatch
@@ -203,6 +265,7 @@ test('provider discovery emits only correlated metadata and excludes private fie
     },
     {
       name: 'partial next reply in same chunk',
+      unboundPartial: true,
       wire: (value) =>
         new TextEncoder().encode(`${JSON.stringify({ id: 1, result: value })}\n{"id":2`),
       whole: true,
@@ -211,6 +274,7 @@ test('provider discovery emits only correlated metadata and excludes private fie
     {
       name: 'partial next reply before next request',
       afterResponse: true,
+      unboundPartial: true,
       reason: 'unexpected-message',
     },
     {
@@ -220,7 +284,7 @@ test('provider discovery emits only correlated metadata and excludes private fie
           `${JSON.stringify({ id: index + 1, result: value })}\n${index === 3 ? '{' : ''}`,
         ),
       whole: true,
-      reason: 'unexpected-message',
+      reason: 'incomplete',
     },
     {
       name: 'wrong id',
@@ -365,12 +429,37 @@ test('provider discovery emits only correlated metadata and excludes private fie
             { experimentalApi: false, explicitGatewayOauth: true },
           );
         assert.equal(reader.next(), null, scenario.name);
+        if (index === 1 && scenario.pendingNotice) {
+          reader.push(
+            line({ method: 'account/updated', params: { authMode: 'chatgpt', planType: 'pro' } }),
+          );
+          assert.equal(reader.next(), null);
+          assert.equal(reader.pendingRequest, 'account/read');
+          assert.throws(() => reader.finish(), { reason: 'incomplete' });
+          break;
+        }
         const bytes =
           scenario.wire?.(values[index], index) ?? line({ id: index + 1, result: values[index] });
         if (!scenario.whole && bytes.length < 65_537) {
           for (const byte of bytes) reader.push(new Uint8Array([byte]));
         } else reader.push(bytes);
         if (scenario.afterResponse) reader.push(new TextEncoder().encode('{"id":2'));
+        if (scenario.unboundPartial) {
+          assert.equal(reader.next(), null, scenario.name);
+          reader.push(new TextEncoder().encode(',"result":{}}\n'));
+        }
+        if (index === 0 && scenario.notices) {
+          const notices = new TextEncoder().encode(
+            `${scenario.notices.map((value) => JSON.stringify(value)).join('\n')}\n`,
+          );
+          if (scenario.fragmentedNotice) {
+            reader.push(notices.subarray(0, 5));
+            assert.equal(reader.next(), null);
+            reader.push(notices.subarray(5));
+          } else reader.push(notices);
+          assert.equal(reader.notifications, scenario.notices.length);
+          assert.equal(reader.pendingRequest, 'account/read');
+        }
         if (scenario.incomplete) break;
       }
       const metadata = reader.finish();

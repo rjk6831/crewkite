@@ -73,6 +73,68 @@ const response = z.union([
   z.strictObject({ id: z.number().int().min(1).max(6), error: z.unknown() }),
 ]);
 
+const position = z.strictObject({
+  line: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
+  column: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
+});
+const notification = z.union([
+  z.strictObject({
+    method: z.literal('configWarning'),
+    params: z.strictObject({
+      summary: z.string().max(4096),
+      details: z.string().max(16_384).nullable(),
+      path: z.string().max(4096).optional(),
+      range: z.strictObject({ start: position, end: position }).optional(),
+    }),
+  }),
+  z.strictObject({
+    method: z.literal('account/updated'),
+    params: z.strictObject({
+      authMode: z
+        .enum([
+          'apikey',
+          'chatgpt',
+          'chatgptAuthTokens',
+          'headers',
+          'agentIdentity',
+          'personalAccessToken',
+          'bedrockApiKey',
+          'bedrockAccessKeys',
+        ])
+        .nullable(),
+      planType: z
+        .enum([
+          'free',
+          'go',
+          'plus',
+          'pro',
+          'prolite',
+          'promax',
+          'team',
+          'self_serve_business_prolite',
+          'self_serve_business_usage_based',
+          'business',
+          'ent26',
+          'enterprise_cbp_automation',
+          'enterprise_cbp_usage_based',
+          'enterprise',
+          'edu',
+          'edu_plus',
+          'edu_pro',
+          'unknown',
+        ])
+        .nullable(),
+    }),
+  }),
+]);
+export type DiscoveryEnvelope =
+  | 'response'
+  | 'error'
+  | 'config-warning'
+  | 'account-updated'
+  | 'invalid'
+  | null;
+
 // Project only the metadata this reader uses. Native identity and extra fields stay private.
 const platform = z
   .object({ userAgent: text(512), platformFamily: text(32), platformOs: text(32) })
@@ -251,6 +313,9 @@ export class OpenAiDiscovery {
   private awaiting = false;
   private received = 0;
   private pending: number[] = [];
+  private frameRequest: number | null = null;
+  private envelope: DiscoveryEnvelope = null;
+  private notificationCount = 0;
   private failed: Failure | null = null;
   private platform?: DiscoveryMetadata['platform'];
   private account?: DiscoveryMetadata['account'];
@@ -299,7 +364,7 @@ export class OpenAiDiscovery {
 
   next(): Uint8Array | null {
     this.check();
-    if (this.awaiting || this.step === requests.length) return null;
+    if (this.awaiting || this.pending.length || this.step === requests.length) return null;
     if (this.readConfiguration && this.step === 2 && !this.configuration) {
       this.configurationRequested = true;
       this.awaiting = true;
@@ -326,7 +391,10 @@ export class OpenAiDiscovery {
     this.received += bytes.byteLength;
     if (this.received > MAX_TOTAL_BYTES) this.fail('limit');
     for (const byte of bytes) {
-      if (!this.awaiting) this.fail('unexpected-message');
+      if (this.pending.length === 0) {
+        if (this.step === 0 && !this.awaiting) this.fail('unexpected-message');
+        this.frameRequest = this.awaiting ? this.expectedId() : null;
+      }
       if (byte !== 10) {
         if (this.pending.length === MAX_LINE_BYTES) this.fail('limit');
         this.pending.push(byte);
@@ -335,13 +403,25 @@ export class OpenAiDiscovery {
       try {
         const line = new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array(this.pending));
         this.pending = [];
-        const value = response.parse(JSON.parse(line));
-        const expectedId = this.configurationRequested
-          ? 5
-          : this.requirementsRequested
-            ? 6
-            : this.step + 1;
-        if (!this.awaiting || value.id !== expectedId) this.fail('unexpected-message');
+        this.envelope = 'invalid';
+        const decoded: unknown = JSON.parse(line);
+        if (decoded !== null && typeof decoded === 'object' && 'method' in decoded) {
+          const value = notification.parse(decoded);
+          if (this.step === 0) this.fail('unexpected-message');
+          this.envelope = value.method === 'configWarning' ? 'config-warning' : 'account-updated';
+          if (++this.notificationCount > 32) this.fail('limit');
+          continue;
+        }
+        const value = response.parse(decoded);
+        this.envelope = 'error' in value ? 'error' : 'response';
+        // A response begun between requests cannot acquire authority from a later request.
+        if (
+          !this.awaiting ||
+          this.frameRequest === null ||
+          value.id !== this.frameRequest ||
+          value.id !== this.expectedId()
+        )
+          this.fail('unexpected-message');
         if ('error' in value) this.fail('upstream-error');
         if (this.requirementsRequested) {
           this.requirements = requirements.parse(value.result);
@@ -404,6 +484,18 @@ export class OpenAiDiscovery {
       ...(this.configuration ? { configuration: this.configuration } : {}),
       ...(this.requirements ? { requirements: this.requirements } : {}),
     };
+  }
+
+  private expectedId(): number {
+    return this.configurationRequested ? 5 : this.requirementsRequested ? 6 : this.step + 1;
+  }
+
+  get lastEnvelope(): DiscoveryEnvelope {
+    return this.envelope;
+  }
+
+  get notifications(): number {
+    return this.notificationCount;
   }
 
   get complete(): boolean {
