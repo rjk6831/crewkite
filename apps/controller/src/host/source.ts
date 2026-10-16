@@ -15,6 +15,12 @@ import {
 } from 'node:fs';
 import { devNull } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import {
+  type SourceDetails,
+  SourceDetailsSchema,
+  type SourceFileDetail,
+  SourceFileDetailSchema,
+} from '@crewkite/contracts';
 
 export type SourceFacts = {
   projectId: string;
@@ -88,6 +94,40 @@ export function projectRoot(path: string): string {
 }
 
 export function inspectSource(projectId: string, path: string): SourceFacts {
+  return scanSource(projectId, path).source;
+}
+
+export function inspectSourceDetails(projectId: string, path: string) {
+  const scanned = scanSource(projectId, path);
+  const details: SourceDetails = {
+    files: [],
+    omittedDirty: scanned.source.dirtyCount,
+    omittedUntracked: scanned.source.untrackedCount,
+  };
+  const seen = new Set<string>();
+  const append = (file: SourceFileDetail) => {
+    if (
+      details.files.length === 200 ||
+      seen.has(file.path) ||
+      !SourceFileDetailSchema.safeParse(file).success
+    )
+      return;
+    const next = {
+      files: [...details.files, file],
+      omittedDirty: details.omittedDirty - (file.status === 'untracked' ? 0 : 1),
+      omittedUntracked: details.omittedUntracked - (file.status === 'untracked' ? 1 : 0),
+    };
+    if (!SourceDetailsSchema.safeParse(next).success) return;
+    Object.assign(details, next);
+    seen.add(file.path);
+  };
+  for (const file of scanned.files) append(file);
+  for (const path of scanned.untracked)
+    append({ path, status: 'untracked', staged: false, unstaged: true });
+  return { source: scanned.source, details: SourceDetailsSchema.parse(details) };
+}
+
+function scanSource(projectId: string, path: string) {
   const base = git(path, ['rev-parse', '--verify', 'HEAD^{commit}']).toString().trim();
   let branch = 'detached';
   try {
@@ -108,6 +148,25 @@ export function inspectSource(projectId: string, path: string): SourceFacts {
       }),
   );
   const dirty = new Set<string>();
+  const files = new Map<string, SourceFileDetail>();
+  const changed = (
+    path: string,
+    status: SourceFileDetail['status'],
+    staged: boolean,
+    unstaged: boolean,
+  ) => {
+    dirty.add(path);
+    const previous = files.get(path);
+    files.set(path, {
+      path,
+      status:
+        previous?.status === 'unmerged' || (previous?.status === 'added' && status === 'modified')
+          ? previous.status
+          : status,
+      staged: staged || previous?.staged || false,
+      unstaged: unstaged || previous?.unstaged || false,
+    });
+  };
   const indexed = new Set<string>();
   const records = git(path, ['ls-files', '--stage', '-z']).toString().split('\0').filter(Boolean);
   for (const record of records) {
@@ -115,7 +174,19 @@ export function inspectSource(projectId: string, path: string): SourceFacts {
     if (!match) throw new Error('Source index metadata is invalid.');
     const [, mode, oid, stage, name] = match;
     indexed.add(name);
-    if (stage !== '0' || baseEntries.get(name) !== `${mode} ${oid}`) dirty.add(name);
+    if (stage !== '0' || baseEntries.get(name) !== `${mode} ${oid}`)
+      changed(
+        name,
+        stage !== '0'
+          ? 'unmerged'
+          : !baseEntries.has(name)
+            ? 'added'
+            : baseEntries.get(name)?.split(' ')[0] !== mode
+              ? 'type-changed'
+              : 'modified',
+        true,
+        stage !== '0',
+      );
     if (stage !== '0' || !['100644', '100755'].includes(mode)) {
       dirty.add(name);
       continue;
@@ -138,19 +209,19 @@ export function inspectSource(projectId: string, path: string): SourceFacts {
       }
     }
     if (!readable) {
-      dirty.add(name);
+      changed(name, 'type-changed', false, true);
       continue;
     }
     let fd: number;
     try {
       const selected = lstatSync(join(path, name));
       if (!selected.isFile() || selected.isSymbolicLink()) {
-        dirty.add(name);
+        changed(name, 'type-changed', false, true);
         continue;
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        dirty.add(name);
+        changed(name, 'deleted', false, true);
         continue;
       }
       throw error;
@@ -162,7 +233,7 @@ export function inspectSource(projectId: string, path: string): SourceFacts {
       );
     } catch (error) {
       if (['ENOENT', 'ELOOP', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) {
-        dirty.add(name);
+        changed(name, 'type-changed', false, true);
         continue;
       }
       throw error;
@@ -178,17 +249,23 @@ export function inspectSource(projectId: string, path: string): SourceFacts {
         .update(`blob ${bytes.length}\0`)
         .update(bytes)
         .digest('hex');
-      if (digest !== oid || (state.mode & 0o111 ? '100755' : '100644') !== mode) dirty.add(name);
+      if (digest !== oid || (state.mode & 0o111 ? '100755' : '100644') !== mode)
+        changed(name, 'modified', false, true);
     } finally {
       closeSync(fd);
     }
   }
-  for (const name of baseEntries.keys()) if (!indexed.has(name)) dirty.add(name);
+  for (const name of baseEntries.keys())
+    if (!indexed.has(name)) changed(name, 'deleted', true, false);
   const untracked = git(path, ['ls-files', '--others', '--exclude-standard', '-z'])
     .toString()
     .split('\0')
     .filter(Boolean);
-  return { projectId, base, branch, dirtyCount: dirty.size, untrackedCount: untracked.length };
+  return {
+    source: { projectId, base, branch, dirtyCount: dirty.size, untrackedCount: untracked.length },
+    files: [...files.values()].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)),
+    untracked: untracked.sort(),
+  };
 }
 
 export function safePath(path: string, seen: Set<string>, prefixes: Map<string, string>) {

@@ -48,6 +48,7 @@ import {
   RouteSchema,
   type Run,
   RunSchema,
+  requiredReviewMethodIds,
   type SealedHandoffPacket,
   SealedHandoffPacketSchema,
   type Snapshot,
@@ -71,6 +72,7 @@ import {
 import {
   committedFiles,
   inspectSource,
+  inspectSourceDetails,
   materialize,
   projectRoot,
   readFiles,
@@ -401,7 +403,7 @@ export class Controller {
         if (!path) return { outcome: 'blocked', reason: 'project-not-found' };
         return {
           outcome: 'applied',
-          data: { kind: 'source', source: inspectSource(command.payload.projectId, path) },
+          data: { kind: 'source', ...inspectSourceDetails(command.payload.projectId, path) },
         };
       }
       case 'CreateTask': {
@@ -428,6 +430,8 @@ export class Controller {
             reason: 'task-not-amendable',
             next: 'Stop the current work before changing its criteria.',
           };
+        const gate = this.draftEditGate(task);
+        if (gate) return gate;
         const updated = TaskSchema.parse({
           ...task,
           title: command.payload.title,
@@ -436,6 +440,7 @@ export class Controller {
           id: task.id,
           revision: task.revision + 1,
           runId: null,
+          next: 'Prepare the run.',
         });
         this.store.put('task', updated.id, updated.revision, updated);
         this.event('task.updated', updated.id, updated.revision, updated);
@@ -643,10 +648,45 @@ export class Controller {
     };
   }
 
+  private draftEditGate(task: Task): CommandResult | undefined {
+    if (task.state !== 'draft') return;
+    const run = task.runId ? this.store.get<Run>('run', task.runId) : undefined;
+    const lease = this.store.db
+      .prepare('SELECT attempt_id FROM writer_leases WHERE task_id=?')
+      .get(task.id);
+    const effect = this.store.db
+      .prepare(
+        "SELECT approval_id FROM pending_effects WHERE task_id=? AND state IN ('pending','approved','unknown') LIMIT 1",
+      )
+      .get(task.id);
+    if (this.hasUncertainWriter(task.id) || lease || effect)
+      return {
+        outcome: 'blocked',
+        reason: 'draft-has-pending-work',
+        next: 'Resolve or stop the exact pending work before editing this task.',
+      };
+    if (task.runId && (!run || run.taskId !== task.id))
+      return { outcome: 'blocked', reason: 'run-not-current' };
+    if (
+      run &&
+      (run.revision !== 0 ||
+        this.store.list<Attempt>('attempt').some((attempt) => attempt.runId === run.id) ||
+        this.store.intents().some((intent) => intent.run_id === run.id) ||
+        this.store.receipt(`allocation:${run.id}`))
+    )
+      return {
+        outcome: 'blocked',
+        reason: 'prepared-run-started',
+        next: 'Inspect the retained run. Only a never-started draft can be edited here.',
+      };
+  }
+
   private prepare(command: Extract<Command, { command: 'PrepareRun' }>): CommandResult {
     const task = this.store.get<Task>('task', command.payload.taskId);
     if (!task || !['draft', 'stopped', 'interrupted', 'failed', 'ready'].includes(task.state))
       return { outcome: 'blocked', reason: 'task-not-preparable' };
+    const editGate = this.draftEditGate(task);
+    if (editGate) return editGate;
     if (this.hasUncertainWriter(task.id))
       return {
         outcome: 'blocked',
@@ -669,18 +709,36 @@ export class Controller {
           return { outcome: 'denied', reason: 'route-not-available' };
     }
     const resolved = PolicySchema.parse(command.payload.policy);
-    const required: NonNullable<Policy['methods']>[number]['id'][] =
-      resolved.quality === 'quick'
-        ? []
-        : resolved.quality === 'standard'
-          ? ['second-opinion', 'keep-it-simple']
-          : ['second-opinion', 'keep-it-simple', 'challenge-assumptions'];
+    if (resolved.methods?.some((method) => method.id === 'round-robin'))
+      return {
+        outcome: 'blocked',
+        reason: 'review-panel-unavailable',
+        next: 'Round-robin needs an explicit review panel. Choose another supported method for this run.',
+      };
+    if (
+      resolved.methods?.some(
+        (method) => method.id === 'second-opinion' && method.reviewerRole !== 'reviewer',
+      )
+    )
+      return {
+        outcome: 'blocked',
+        reason: 'review-role-ineligible',
+        next: 'Assign Second opinion to the Reviewer role. Advisor findings do not fulfill independent review.',
+      };
+    const required = requiredReviewMethodIds(resolved.quality);
     const defaultRole = roles.some((role) => role.role === 'reviewer') ? 'reviewer' : 'advisor';
     const methods = [...(resolved.methods ?? [])];
     for (const id of required)
       if (!methods.some((method) => method.id === id))
-        methods.push({ id, cycles: 1, reviewerRole: defaultRole });
-    resolved.methods = methods;
+        methods.push({
+          id,
+          cycles: 1,
+          reviewerRole: id === 'second-opinion' ? 'reviewer' : defaultRole,
+        });
+    const methodOrder = requiredReviewMethodIds('thorough');
+    resolved.methods = methods.sort(
+      (a, b) => methodOrder.indexOf(a.id) - methodOrder.indexOf(b.id),
+    );
     for (const method of resolved.methods ?? [])
       if (!roles.some((role) => role.role === method.reviewerRole))
         return {
@@ -2257,9 +2315,12 @@ export class Controller {
         this.updateTask(this.store.get<Task>('task', task.id) as Task, {
           state: 'ready',
           waitingReason: null,
-          next:
-            (run.policy.policy.methods?.length ?? 0) > 0
-              ? 'Declared checks and selected scripted reviews passed. Review the exact changes before acceptance.'
+          next: run.policy.policy.methods?.some((method) =>
+            ['second-opinion', 'round-robin'].includes(method.id),
+          )
+            ? 'Declared checks and selected scripted reviews passed. Review the exact changes before acceptance.'
+            : (run.policy.policy.methods?.length ?? 0) > 0
+              ? 'Declared checks and selected scripted methods passed. No independent review was selected.'
               : 'Declared checks passed. No independent review was selected.',
         });
       if (effects) ready();

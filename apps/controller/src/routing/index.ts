@@ -203,16 +203,17 @@ export function chooseRoute(input: RoutingInput): RouterDecision {
     const index = input.baseOrder.indexOf(id);
     return index < 0 ? input.baseOrder.length : index;
   };
+  const ordered = role.selection === 'ordered';
   eligible.sort(
     (a, b) =>
-      (a.reset ?? Infinity) - (b.reset ?? Infinity) ||
+      (ordered ? 0 : (a.reset ?? Infinity) - (b.reset ?? Infinity)) ||
       rank(a.id) - rank(b.id) ||
       (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
   );
   let chosen = eligible[0];
   const pinned = role.pinned ? eligible.find(({ id }) => id === role.routeId) : undefined;
   if (pinned !== undefined) chosen = pinned;
-  else if (chosen !== undefined && input.previous !== undefined) {
+  else if (!ordered && chosen !== undefined && input.previous !== undefined) {
     const previous = eligible.find(({ id }) => id === input.previous?.routeId);
     if (
       previous !== undefined &&
@@ -229,7 +230,9 @@ export function chooseRoute(input: RoutingInput): RouterDecision {
         reason:
           pinned !== undefined
             ? 'The available pinned route takes priority.'
-            : 'Another eligible route takes priority under reset order or selection tenure.',
+            : ordered
+              ? 'An earlier eligible route takes priority in the saved order.'
+              : 'Another eligible route takes priority under reset order or selection tenure.',
       });
   }
   return RouterDecisionSchema.parse({

@@ -35,11 +35,13 @@ The router is a deterministic function of the task, the resolved policy, the obs
 2. Resolve every window that applies to each candidate route. Apply the stale or unknown usage policy the user chose.
 3. Subtract controller reservations. Keep the configured review and recovery headroom.
 4. Filter by slot capacity: per route, per provider, per role, local residency.
-5. Apply the user's base order, then the reset-aware preference among the routes that remain.
-6. Apply hysteresis and minimum tenure so small fluctuations do not bounce work between providers.
+5. Apply the role's saved selection rule: ordered priority or reset-aware preference.
+6. For reset-aware selection, apply hysteresis and minimum tenure so small fluctuations do not bounce work between providers.
 7. Recheck revisions and observations inside the admission transaction, reserve, and record the receipt with chosen and rejected routes.
 
 A pin outranks every soft preference. If a pinned route becomes unavailable, the router uses only a fallback the user approved for that role. Otherwise the task waits.
+
+Ordered selection chooses the first eligible route in the saved primary and fallback order. Reset timing and selection tenure do not move a later route ahead of it. Reset-aware selection keeps the reset preference below, with saved order breaking ties. A role without an explicit selection rule retains reset-aware behavior. Both choices pass the same hard admission gates. [ADR 0021](adr/0021-explicit-route-order-and-review-floors.md) records the proposed extension.
 
 ## Reset-aware preference
 
