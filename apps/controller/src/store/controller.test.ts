@@ -45,7 +45,11 @@ import {
 } from '../providers/openai/profile.ts';
 import { fixture, fixtureContent, fixtureModel } from '../providers/openai/replacement-fixture.ts';
 
-async function setup(t: TestContext, options: Partial<ControllerOptions> = {}) {
+async function setup(
+  t: TestContext,
+  options: Partial<ControllerOptions> = {},
+  close: (controller: Controller) => void | Promise<void> = (controller) => controller.close(),
+) {
   mkdirSync(resolve('internal'), { recursive: true });
   const directory = mkdtempSync(join(resolve('internal'), 'controller-test-'));
   const clock = createTestClock();
@@ -61,7 +65,7 @@ async function setup(t: TestContext, options: Partial<ControllerOptions> = {}) {
     observations: fixtures.snapshot.usage.map((window) => window.observation),
   });
   t.after(async () => {
-    await controller.close();
+    await close(controller);
     rmSync(directory, { recursive: true, force: true });
   });
   const command = (name: string, payload: unknown, revision?: number) => ({
@@ -1407,6 +1411,60 @@ async function acceptsTransferredCandidate(t: TestContext, transfer: 'reserve' |
   controller.close();
 }
 
+async function nativeWait<T>(
+  controller: Controller,
+  stage: string,
+  pending: Promise<T>,
+  milliseconds = 30_000,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      pending,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          let facts: unknown = 'unreadable';
+          try {
+            const intents = controller.store.intents().slice(-8);
+            facts = {
+              tasks: controller
+                .snapshot()
+                .tasks.slice(-2)
+                .map(({ id, state }) => ({ id, state })),
+              intents,
+              phases: intents.flatMap((intent) =>
+                controller.store.nativeProcesses(intent.attempt_id),
+              ),
+              completion: intents.map((intent) => {
+                const artifact = controller.store.receipt(`native-completion:${intent.attempt_id}`)
+                  ?.result.entity;
+                if (
+                  !artifact ||
+                  !('hash' in artifact) ||
+                  !('bytes' in artifact) ||
+                  artifact.bytes > 4096
+                )
+                  return null;
+                const value = JSON.parse(
+                  readFileSync(join(controller.home, 'artifacts', artifact.hash), 'utf8'),
+                );
+                return {
+                  attemptId: intent.attempt_id,
+                  reason: value.reason,
+                  quiescent: value.quiescent,
+                };
+              }),
+            };
+          } catch {}
+          reject(new Error(`Native fixture ${stage} timed out: ${JSON.stringify(facts)}`));
+        }, milliseconds);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function nativeSetup(
   t: TestContext,
   mode = 'success',
@@ -1415,6 +1473,25 @@ async function nativeSetup(
 ) {
   let submissions = 0;
   const ready = Promise.withResolvers<void>();
+  const failure = Promise.withResolvers<never>();
+  let callbackError: unknown;
+  const fail = (error: unknown) => {
+    callbackError ??= error;
+    failure.reject(error);
+  };
+  void failure.promise.catch(() => {});
+  t.after(() => {
+    if (callbackError) throw callbackError;
+  });
+  const observe = (controller: Controller, listener: Parameters<Controller['subscribe']>[0]) =>
+    controller.subscribe((event) => {
+      try {
+        listener(event);
+      } catch (error) {
+        fail(error);
+      }
+    });
+  const childrenClosed: Promise<void>[] = [];
   const children: ReturnType<typeof spawn>[] = [];
   let onSpawn: ((phase: string) => void) | undefined;
   let onInput: ((message: { method?: string }, phase: string) => void) | undefined;
@@ -1467,35 +1544,63 @@ async function nativeSetup(
         spawnOptions,
       );
       children.push(child);
+      childrenClosed.push(new Promise((resolve) => child.once('close', () => resolve())));
       const write = child.stdin.write.bind(child.stdin);
       child.stdin.write = ((data: Uint8Array) => {
-        const messages = Buffer.from(data)
-          .toString()
-          .trim()
-          .split('\n')
-          .map((line) => JSON.parse(line) as { method?: string });
-        const attempt = context.controller.store.intents()[0];
-        assert(attempt, 'the controller commits admission before native input');
-        assert.equal(
-          context.controller.store.nativeProcesses(attempt.attempt_id).at(-1)?.state,
-          'owned',
-        );
-        for (const message of messages) {
-          if (message.method === 'turn/start') {
-            submissions++;
-            assert(context.controller.store.receipt(`native-submission:${attempt.attempt_id}`));
+        try {
+          const messages = Buffer.from(data)
+            .toString()
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { method?: string });
+          const attempt = context.controller.store.intents()[0];
+          assert(attempt, 'the controller commits admission before native input');
+          assert.equal(
+            context.controller.store.nativeProcesses(attempt.attempt_id).at(-1)?.state,
+            'owned',
+          );
+          for (const message of messages) {
+            if (message.method === 'turn/start') {
+              submissions++;
+              assert(context.controller.store.receipt(`native-submission:${attempt.attempt_id}`));
+            }
+            onInput?.(message, phase);
           }
-          onInput?.(message, phase);
+          const result = write(data);
+          if (messages.some((message) => message.method === 'turn/start')) ready.resolve();
+          return result;
+        } catch (error) {
+          fail(error);
+          throw error;
         }
-        const result = write(data);
-        if (messages.some((message) => message.method === 'turn/start')) ready.resolve();
-        return result;
       }) as typeof child.stdin.write;
-      onSpawn?.(phase);
+      try {
+        onSpawn?.(phase);
+      } catch (error) {
+        fail(error);
+        throw error;
+      }
       return child;
     },
   };
-  const context = await setup(t, nativeOptions);
+  const close = async (controller: Controller) => {
+    try {
+      await nativeWait(controller, 'cleanup', Promise.resolve(controller.close()), 10_000);
+      if (callbackError) throw callbackError;
+    } catch (error) {
+      for (const child of children) {
+        if (child.pid && !groupAbsent(child.pid)) {
+          try {
+            process.kill(-child.pid, 'SIGKILL');
+          } catch {}
+        }
+      }
+      await nativeWait(controller, 'forced fixture cleanup', Promise.all(childrenClosed), 2000);
+      assert(children.every((child) => !child.pid || groupAbsent(child.pid)));
+      throw error;
+    }
+  };
+  const context = await setup(t, nativeOptions, close);
   if (targetPath !== 'net.mjs') {
     const files = [
       { path: targetPath, content: Buffer.from('# Provider notes\nOriginal café notes.\n') },
@@ -1580,17 +1685,24 @@ async function nativeSetup(
     appointment,
     fixtureProfile,
     restart: async () => {
-      await context.controller.close();
+      await close(context.controller);
       context.controller = new Controller({
         ...nativeOptions,
         home: context.controller.home,
         now: context.clock.now,
         id: context.id,
       });
-      t.after(() => context.controller.close());
+      t.after(() => close(context.controller));
       return context.controller;
     },
     children,
+    observe,
+    wait: <T>(stage: string, pending: Promise<T>, controller = context.controller) =>
+      nativeWait(
+        controller,
+        `${mode}/${targetPath}/${stage}`,
+        Promise.race([pending, failure.promise]),
+      ),
     ready: ready.promise,
     submissions: () => submissions,
     onSpawn: (listener: typeof onSpawn) => {
@@ -1604,14 +1716,26 @@ async function nativeSetup(
 
 function nativeCandidate(controller: Controller) {
   const candidate = Promise.withResolvers<void>();
+  let settled = false;
   const off = controller.subscribe((event) => {
-    if (event.type === 'task.updated' && event.payload.state === 'unknown') {
-      off();
-      candidate.reject(new Error('Native ownership became unknown.'));
-    }
     if (event.type === 'candidate.sealed') {
+      settled = true;
       off();
       candidate.resolve();
+    }
+    if (
+      event.type === 'task.updated' &&
+      ['stopped', 'interrupted', 'failed', 'unknown'].includes(event.payload.state)
+    ) {
+      // Successful capture follows the stopped event in the same call stack.
+      queueMicrotask(() => {
+        if (settled) return;
+        settled = true;
+        off();
+        candidate.reject(
+          new Error(`Native fixture ended ${event.payload.state} without a sealed candidate.`),
+        );
+      });
     }
   });
   return candidate.promise;
@@ -1835,8 +1959,8 @@ test('an appointed native proposal is retained and applied once after every phas
     appointment.route.qualified = true;
     appointment.target.path = 'docs/other.md';
     appointment.target.baseHash = '0'.repeat(64);
-    await sealed;
-    await activeReplay;
+    await context.wait('candidate', sealed);
+    if (activeReplay) await context.wait('active replay', activeReplay);
     const run = controller.snapshot().runs.at(-1);
     assert(run);
     const attempt = controller.store.intents()[0];
@@ -2024,7 +2148,7 @@ test('an appointed native proposal is retained and applied once after every phas
         'native-pilot-retain-only',
       );
     }
-    await controller.close();
+    await nativeWait(controller, 'controller close', Promise.resolve(controller.close()), 10_000);
     const reopened = new Controller({
       home: controller.home,
       now: clock.now,
@@ -2091,7 +2215,7 @@ test('an appointed native proposal is retained and applied once after every phas
       const ordinary = RunSchema.parse(prepared.entity);
       const resealed = nativeCandidate(reopened);
       let stopped: Promise<unknown> | undefined;
-      const off = reopened.subscribe((event) => {
+      const off = context.observe(reopened, (event) => {
         if (event.type === 'attempt.output' && event.payload.attemptId !== attempt.attempt_id) {
           off();
           writeFileSync(
@@ -2121,8 +2245,8 @@ test('an appointed native proposal is retained and applied once after every phas
         ).outcome,
         'applied',
       );
-      await resealed;
-      await stopped;
+      await context.wait('ordinary candidate', resealed, reopened);
+      if (stopped) await context.wait('ordinary stop', stopped, reopened);
       const ordinaryCandidate = reopened.snapshot().candidates.at(-1);
       assert(ordinaryCandidate);
       assert.equal(ordinaryCandidate.hash, candidate.hash);
@@ -2145,7 +2269,7 @@ test('an appointed native proposal is retained and applied once after every phas
         'candidate-not-current',
       );
     } finally {
-      await reopened.close();
+      await nativeWait(reopened, 'reopened close', Promise.resolve(reopened.close()), 10_000);
     }
   }
   for (const scenario of ['checked', 'failed', 'stop-intent', 'expired-intent', 'revoked-intent']) {
@@ -2180,7 +2304,7 @@ test('an appointed native proposal is retained and applied once after every phas
         'applied',
       );
     } else assert.equal(controller.startNativePilot(appointment).outcome, 'applied');
-    await retained;
+    await context.wait(`${scenario} candidate`, retained);
     const run = controller.snapshot().runs.at(-1);
     const candidate = controller.snapshot().candidates.at(-1);
     assert(run && candidate);
@@ -2303,7 +2427,7 @@ test('an appointed native proposal is retained and applied once after every phas
     let checkLaunches = 0;
     let replay: Promise<unknown> | undefined;
     const finished = Promise.withResolvers<void>();
-    const off = controller.subscribe((event) => {
+    const off = context.observe(controller, (event) => {
       if (event.type === 'attempt.launched') {
         checkLaunches++;
         replay = controller
@@ -2333,16 +2457,19 @@ test('an appointed native proposal is retained and applied once after every phas
             'local-owner',
           )
           .then((result) => assert.equal(result.outcome, 'applied'));
-      if (event.type === 'task.updated' && ['stopped', 'failed'].includes(event.payload.state))
-        finished.resolve();
+      if (event.type === 'task.updated') {
+        if (['interrupted', 'unknown'].includes(event.payload.state))
+          finished.reject(new Error(`Check fixture ended ${event.payload.state}.`));
+        if (['stopped', 'failed'].includes(event.payload.state)) finished.resolve();
+      }
     });
     const started = await controller.execute(
       command('StartCandidateEvaluation', startPayload(), revision()),
       'local-owner',
     );
     assert.equal(started.outcome, 'applied');
-    await finished.promise;
-    await replay;
+    await context.wait(`${scenario} check completion`, finished.promise);
+    if (replay) await context.wait(`${scenario} replay`, replay);
     off();
     assert.equal(checkLaunches, scenario.endsWith('intent') ? 0 : 1);
     const snapshot = controller.snapshot();
@@ -2563,7 +2690,7 @@ test('an appointed native proposal is retained and applied once after every phas
       ).outcome,
       'applied',
     );
-    await context.ready;
+    await context.wait('submission ready', context.ready);
     const secondTask = TaskSchema.parse(
       (
         await controller.execute(
@@ -2617,13 +2744,13 @@ test('an appointed native proposal is retained and applied once after every phas
       ).outcome,
       'applied',
     );
-    await submitted.promise;
+    await context.wait('second submission', submitted.promise);
     assert.equal(controller.store.intents().length, 2);
     assert.equal(
       controller.store.db.prepare('SELECT COUNT(*) AS count FROM writer_leases').get()?.count,
       2,
     );
-    await controller.close();
+    await nativeWait(controller, 'controller close', Promise.resolve(controller.close()), 10_000);
     assert.equal(context.submissions(), 2);
   }
 });
@@ -2672,7 +2799,7 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
           ? Promise.resolve()
           : nativeCandidate(controller);
     if (boundary === 'journal-read') {
-      controller.subscribe((event) => {
+      context.observe(controller, (event) => {
         if (event.type === 'task.updated' && event.payload.state === 'unknown') unknown.resolve();
       });
       context.onSpawn((phase) => {
@@ -2687,7 +2814,7 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
       });
     }
     if (boundary === 'close-at-admission')
-      controller.subscribe((event) => {
+      context.observe(controller, (event) => {
         if (event.type === 'run.admitted') action = Promise.resolve(controller.close());
       });
     if (boundary.startsWith('owned-') || boundary === 'close-before-handle')
@@ -2780,21 +2907,21 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
       `${appointment.consent.sourceBase}:net.mjs`,
     ]).toString();
     if (boundary === 'after-submit' || boundary === 'close') {
-      await context.ready;
+      await context.wait('submission ready', context.ready);
       if (boundary === 'close') {
         const first = controller.close();
         assert.equal(controller.close(), first);
-        await first;
+        await context.wait(`${scenario} close`, Promise.resolve(first));
       } else {
         await controller.execute(
           command('StopRun', { taskId: task.id, runId }, controller.snapshot().tasks[0].revision),
           'local-owner',
         );
-        await sealed;
+        await context.wait('candidate', sealed);
       }
     } else {
-      await sealed;
-      await action;
+      await context.wait('candidate', sealed);
+      if (action) await context.wait(`${scenario} action`, action);
     }
     if (
       boundary !== 'application-intent' &&
@@ -2820,7 +2947,7 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
         undefined,
       );
     }
-    await controller.close();
+    await nativeWait(controller, 'controller close', Promise.resolve(controller.close()), 10_000);
     if (boundary === 'journal-read') {
       const journal = new DatabaseSync(join(controller.home, 'state.sqlite'));
       try {
@@ -2895,7 +3022,7 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
           .every((phase) => groupAbsent(phase.process_group)),
       );
     } finally {
-      await reopened.close();
+      await nativeWait(reopened, 'reopened close', Promise.resolve(reopened.close()), 10_000);
     }
   }
 });
