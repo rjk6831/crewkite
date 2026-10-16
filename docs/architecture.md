@@ -26,6 +26,8 @@ The controller runs as one headless Node process per user. The desktop app and t
 
 These measures keep other clients and workers off the control channel. They do not defend against malware running as the same user, and the docs make no such claim.
 
+Native writer preparation includes per-phase ownership hooks and a SQLite journal for preflight and task processes. The journal separates launch intent, the actual process group and proven quiescence. Recovery checks every recorded group; ambiguous ownership stays blocked, and no native phase restarts automatically. Native dispatch remains disabled.
+
 ## Commands and events
 
 Every mutation carries a protocol version, an idempotency key, the expected entity revision and a validated payload. The controller stores a digest of each request with its receipt.

@@ -1545,9 +1545,16 @@ export class Controller {
           attempt.generation !== intent.generation
         )
           throw new Error('Persisted writer lineage is invalid.');
+        const phases = this.store.nativeProcesses(intent.attempt_id);
+        const native = phases.length > 0;
+        const known = native
+          ? phases.every((phase) => phase.state !== 'intent')
+          : ['acknowledged', 'interrupted'].includes(intent.state);
         const stopped =
-          ['acknowledged', 'interrupted'].includes(intent.state) &&
-          groupAbsent(intent.process_group);
+          known &&
+          (native
+            ? phases.every((phase) => groupAbsent(phase.process_group))
+            : groupAbsent(intent.process_group));
         const updated = {
           ...attempt,
           state: stopped ? ('stopped' as const) : ('unknown' as const),
@@ -1557,11 +1564,7 @@ export class Controller {
         this.store.db
           .prepare('UPDATE launch_intents SET state=?,finished_at=? WHERE attempt_id=?')
           .run(
-            stopped
-              ? 'stopped'
-              : ['acknowledged', 'interrupted'].includes(intent.state)
-                ? 'acknowledged'
-                : 'outcome-unknown',
+            stopped ? 'stopped' : known ? 'acknowledged' : 'outcome-unknown',
             stopped ? this.now() : null,
             attempt.id,
           );
@@ -1579,7 +1582,9 @@ export class Controller {
         this.event('run.interrupted', task.id, task.revision + 1, {
           runId: run.id,
           reason: stopped
-            ? 'Controller restarted after the process group exited.'
+            ? native
+              ? 'Controller restarted after every recorded native process group exited.'
+              : 'Controller restarted after the process group exited.'
             : 'An intent has no proven completed launch.',
         });
       }
