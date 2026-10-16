@@ -39,6 +39,10 @@ import {
 import { CandidateEvidence } from '../evidence/index.ts';
 import { committedFiles, git, inspectSource, materialize, readFiles } from '../host/source.ts';
 import { groupAbsent } from '../host/worker.ts';
+import {
+  type NativeProfileResolution,
+  unavailableNativeProfile,
+} from '../providers/openai/profile.ts';
 import { fixture, fixtureContent, fixtureModel } from '../providers/openai/replacement-fixture.ts';
 
 async function setup(t: TestContext, options: Partial<ControllerOptions> = {}) {
@@ -1393,16 +1397,43 @@ async function nativeSetup(
   options: Partial<ControllerOptions> = {},
   targetPath = 'net.mjs',
 ) {
-  let phases = 0;
   let submissions = 0;
   const ready = Promise.withResolvers<void>();
   const children: ReturnType<typeof spawn>[] = [];
   let onSpawn: ((phase: string) => void) | undefined;
   let onInput: ((message: { method?: string }, phase: string) => void) | undefined;
-  const context = await setup(t, {
+  const fixtureProfile: NativeProfileResolution = {
+    ...unavailableNativeProfile(),
+    facts: {
+      ...unavailableNativeProfile().facts,
+      available: true,
+      reason: 'available',
+      model: fixtureModel,
+      clientVersion: process.version,
+    },
+    client: {
+      executable: process.execPath,
+      sha256: createHash('sha256').update(readFileSync(process.execPath)).digest('hex'),
+      version: process.version,
+    },
+    environment: { ...process.env },
+    locationHash: '1'.repeat(64),
+  };
+  const nativeOptions: Partial<ControllerOptions> = {
+    nativeProfile: () => fixtureProfile,
     ...options,
     nativeSpawn: (executable, args, spawnOptions) => {
-      const phase = args.at(-1) === 'list' ? 'features' : ++phases === 1 ? 'prepare' : 'task';
+      const pending = context.controller.store
+        .intents()
+        .flatMap((intent) => context.controller.store.nativeProcesses(intent.attempt_id))
+        .filter((row) => row.state === 'intent')
+        .at(-1);
+      const phase =
+        args.at(-1) === 'list'
+          ? 'features'
+          : pending?.phase === 'metadata-preparation'
+            ? 'prepare'
+            : 'task';
       const child = spawn(executable, ['-e', fixture, mode, phase], spawnOptions);
       children.push(child);
       const write = child.stdin.write.bind(child.stdin);
@@ -1432,7 +1463,8 @@ async function nativeSetup(
       onSpawn?.(phase);
       return child;
     },
-  });
+  };
+  const context = await setup(t, nativeOptions);
   if (targetPath !== 'net.mjs') {
     const files = [
       { path: targetPath, content: Buffer.from('# Provider notes\nOriginal café notes.\n') },
@@ -1515,6 +1547,18 @@ async function nativeSetup(
     ...context,
     task,
     appointment,
+    fixtureProfile,
+    restart: async () => {
+      await context.controller.close();
+      context.controller = new Controller({
+        ...nativeOptions,
+        home: context.controller.home,
+        now: context.clock.now,
+        id: context.id,
+      });
+      t.after(() => context.controller.close());
+      return context.controller;
+    },
     children,
     ready: ready.promise,
     submissions: () => submissions,
@@ -1543,14 +1587,25 @@ function nativeCandidate(controller: Controller) {
 }
 
 test('an appointed native proposal is retained and applied once after every phase stops', async (t) => {
-  for (const { consent, path } of [
-    { consent: 'explicit', path: 'net.mjs' },
-    { consent: 'policy', path: 'net.mjs' },
-    { consent: 'explicit', path: 'docs/providers.md' },
-    { consent: 'policy', path: 'docs/案内.md' },
+  for (const { consent, path, publicRun } of [
+    { consent: 'explicit', path: 'net.mjs', publicRun: false },
+    { consent: 'policy', path: 'net.mjs', publicRun: false },
+    { consent: 'explicit', path: 'docs/providers.md', publicRun: false },
+    { consent: 'policy', path: 'docs/案内.md', publicRun: false },
+    { consent: 'explicit', path: 'docs/providers.md', publicRun: true },
+    { consent: 'policy', path: 'docs/案内.md', publicRun: true },
   ] as const) {
     const context = await nativeSetup(t, 'success', {}, path);
-    const { controller, appointment, task, command, source, clock, id } = context;
+    const {
+      controller: initialController,
+      appointment,
+      task,
+      command,
+      source,
+      clock,
+      id,
+    } = context;
+    let controller = initialController;
     appointment.id += `-${consent}`;
     appointment.consent.source = consent;
     for (const change of [
@@ -1609,25 +1664,148 @@ test('an appointed native proposal is retained and applied once after every phas
     );
     assert(!controller.snapshot().routes.some((route) => route.id === appointment.route.id));
     const frozen = structuredClone(appointment);
+    let startCommand: ReturnType<typeof command> | undefined;
+    let nativeRouteId = frozen.route.id;
+    if (publicRun) {
+      const payload = {
+        taskId: task.id,
+        profileId: context.fixtureProfile.facts.id,
+        targetPath: path,
+        policy: frozen.policy,
+        consent: 'explicit',
+      };
+      const before = controller.snapshot();
+      for (const change of [
+        { consent: 'saved' },
+        { targetPath: 'missing.md' },
+        { policy: { ...frozen.policy, effects: [] } },
+        { policy: { ...frozen.policy, limits: { ...frozen.policy.limits, attempts: 1 } } },
+      ]) {
+        assert.equal(
+          (
+            await controller.execute(
+              command('PrepareNativeRun', { ...payload, ...change }, task.revision),
+              'local-owner',
+            )
+          ).outcome,
+          'blocked',
+        );
+        assert.deepEqual(controller.snapshot(), before);
+      }
+      const prepare = command('PrepareNativeRun', payload, task.revision);
+      let prepared = await controller.execute(prepare, 'local-owner');
+      assert.equal(prepared.outcome, 'applied', JSON.stringify(prepared));
+      assert.equal((await controller.execute(prepare, 'local-owner')).outcome, 'already-applied');
+      assert.equal(context.children.length, 0);
+      assert.equal(controller.store.intents().length, 0);
+      if (consent === 'explicit') {
+        const ordinaryRoute = RunSchema.parse(prepared.entity).roles[0].routeId;
+        const count = controller.snapshot().routes.length;
+        const beforeCredit = controller.snapshot();
+        assert.equal(
+          (
+            await controller.execute(
+              command(
+                'PrepareNativeRun',
+                { ...payload, creditPolicy: 'existing-credits', consent: 'saved' },
+                controller.snapshot().tasks[0].revision,
+              ),
+              'local-owner',
+            )
+          ).outcome,
+          'blocked',
+        );
+        assert.deepEqual(controller.snapshot(), beforeCredit);
+        const credit = await controller.execute(
+          command(
+            'PrepareNativeRun',
+            { ...payload, creditPolicy: 'existing-credits' },
+            controller.snapshot().tasks[0].revision,
+          ),
+          'local-owner',
+        );
+        assert.equal(credit.outcome, 'applied');
+        assert.notEqual(RunSchema.parse(credit.entity).roles[0].routeId, ordinaryRoute);
+        assert.equal(controller.snapshot().routes.length, count + 1);
+        prepared = await controller.execute(
+          command(
+            'PrepareNativeRun',
+            { ...payload, consent: 'saved' },
+            controller.snapshot().tasks[0].revision,
+          ),
+          'local-owner',
+        );
+        assert.equal(prepared.outcome, 'applied');
+        assert.equal(RunSchema.parse(prepared.entity).roles[0].routeId, ordinaryRoute);
+        assert.equal(controller.snapshot().routes.length, count + 1);
+      }
+      if (consent === 'policy') {
+        const routeId = RunSchema.parse(prepared.entity).roles[0].routeId;
+        const routeCount = controller.snapshot().routes.length;
+        prepared = await controller.execute(
+          command(
+            'PrepareNativeRun',
+            { ...payload, consent: 'saved' },
+            controller.snapshot().tasks[0].revision,
+          ),
+          'local-owner',
+        );
+        assert.equal(prepared.outcome, 'applied');
+        assert.equal(RunSchema.parse(prepared.entity).roles[0].routeId, routeId);
+        assert.equal(controller.snapshot().routes.length, routeCount);
+        controller = await context.restart();
+      }
+      const preview = RunSchema.parse(prepared.entity);
+      nativeRouteId = preview.roles[0].routeId;
+      assert.equal(
+        controller.snapshot().nativeRuns.find((value) => value.runId === preview.id)?.stage,
+        'prepared',
+      );
+      const plan = controller.store.receipt(`native-run:${preview.id}`)?.result.entity as Artifact;
+      const retained = JSON.parse(
+        new ArtifactFiles(join(controller.home, 'artifacts')).read(plan.hash).toString(),
+      );
+      assert.equal(retained.appointment.creditPolicy, 'ordinary');
+      assert.equal(
+        retained.appointment.expiresAt,
+        frozen.policy.effects.find((grant) => grant.action === 'write-scratch')?.expiresAt,
+      );
+      startCommand = command(
+        'StartRun',
+        { taskId: task.id, runId: preview.id },
+        controller.snapshot().tasks[0].revision,
+      );
+    }
     const sealed = nativeCandidate(controller);
+    let activeReplay: Promise<unknown> | undefined;
     context.onInput((message) => {
       if (message.method === 'turn/start') {
         const intents = controller.store.intents().length;
         const submissions = context.submissions();
         const processes = context.children.length;
-        assert.equal(controller.startNativePilot(frozen).outcome, 'already-applied');
+        if (startCommand)
+          activeReplay = controller
+            .execute(startCommand, 'local-owner')
+            .then((result) => assert.equal(result.outcome, 'already-applied'));
+        else assert.equal(controller.startNativePilot(frozen).outcome, 'already-applied');
         assert.equal(controller.store.intents().length, intents);
         assert.equal(context.submissions(), submissions);
         assert.equal(context.children.length, processes);
       }
     });
-    assert.equal(controller.startNativePilot(appointment).outcome, 'applied');
+    assert.equal(
+      startCommand
+        ? (await controller.execute(startCommand, 'local-owner')).outcome
+        : controller.startNativePilot(appointment).outcome,
+      'applied',
+    );
     appointment.consent.nativeTrust = 'denied' as 'accepted';
     appointment.policy.effects.length = 0;
     appointment.route.qualified = true;
     appointment.target.path = 'docs/other.md';
     appointment.target.baseHash = '0'.repeat(64);
     await sealed;
+    await activeReplay;
     const run = controller.snapshot().runs.at(-1);
     assert(run);
     const attempt = controller.store.intents()[0];
@@ -1651,17 +1829,27 @@ test('an appointed native proposal is retained and applied once after every phas
     );
     assert.equal(controller.snapshot().tasks[0].state, 'stopped');
     assert.equal(
-      controller.snapshot().routes.find((route) => route.id === frozen.route.id)?.qualified,
+      controller.snapshot().routes.find((route) => route.id === nativeRouteId)?.qualified,
       false,
     );
     assert.equal(
-      controller.snapshot().routes.find((route) => route.id === frozen.route.id)?.fake,
+      controller.snapshot().routes.find((route) => route.id === nativeRouteId)?.fake,
       false,
     );
-    assert.equal(controller.startNativePilot(frozen).outcome, 'already-applied');
     assert.equal(
-      controller.startNativePilot({ ...frozen, creditPolicy: 'existing-credits' }).outcome,
-      'denied',
+      startCommand
+        ? (await controller.execute(startCommand, 'local-owner')).outcome
+        : controller.startNativePilot(frozen).outcome,
+      'already-applied',
+    );
+    if (!publicRun)
+      assert.equal(
+        controller.startNativePilot({ ...frozen, creditPolicy: 'existing-credits' }).outcome,
+        'denied',
+      );
+    assert.equal(
+      controller.snapshot().nativeRuns.find((value) => value.runId === run.id)?.stage,
+      'retain-only',
     );
     const candidate = controller.store.list<Candidate>('candidate').at(-1);
     assert(candidate);
@@ -1813,7 +2001,12 @@ test('an appointed native proposal is retained and applied once after every phas
       scenarioForRoute: () => 'approval',
     });
     try {
-      assert.equal(reopened.startNativePilot(frozen).outcome, 'already-applied');
+      assert.equal(
+        startCommand
+          ? (await reopened.execute(startCommand, 'local-owner')).outcome
+          : reopened.startNativePilot(frozen).outcome,
+        'already-applied',
+      );
       assert.equal(
         (
           await reopened.execute(
@@ -1924,10 +2117,242 @@ test('an appointed native proposal is retained and applied once after every phas
       await reopened.close();
     }
   }
+  for (const boundary of [
+    'stop-prepared',
+    'client-changed',
+    'model-changed',
+    'credit-withdrawn',
+    'consent-revoked',
+    'expired',
+    'context-changed',
+    'unrelated-expired-grant',
+    'oversized-plan',
+    'credit-unavailable',
+  ]) {
+    const context = await nativeSetup(t);
+    const { controller, appointment, task, command, clock } = context;
+    if (boundary === 'credit-unavailable')
+      context.fixtureProfile.facts.creditPolicies = ['ordinary'];
+    const policy = structuredClone(appointment.policy);
+    if (boundary === 'oversized-plan')
+      while (policy.effects.length < 100)
+        policy.effects.push({
+          ...policy.effects[0],
+          action: 'run-check',
+          target: `${'界'.repeat(2000)}${policy.effects.length}`,
+        });
+    if (boundary === 'unrelated-expired-grant')
+      for (const grant of policy.effects)
+        if (grant.action !== 'write-scratch') grant.expiresAt = clock.now();
+    const payload = {
+      taskId: task.id,
+      profileId: context.fixtureProfile.facts.id,
+      targetPath: 'net.mjs',
+      policy,
+      consent: 'explicit',
+      creditPolicy:
+        boundary === 'credit-unavailable' || boundary === 'credit-withdrawn'
+          ? 'existing-credits'
+          : 'ordinary',
+    };
+    const before = controller.snapshot();
+    assert(
+      Buffer.byteLength(canonicalJson(command('PrepareNativeRun', payload, task.revision))) <
+        1024 * 1024,
+    );
+    const prepared = await controller.execute(
+      command('PrepareNativeRun', payload, task.revision),
+      'local-owner',
+    );
+    if (boundary === 'oversized-plan' || boundary === 'credit-unavailable') {
+      assert.equal(prepared.outcome, 'blocked');
+      assert.deepEqual(controller.snapshot(), before);
+      assert.equal(controller.store.intents().length, 0);
+      continue;
+    }
+    assert.equal(prepared.outcome, 'applied', JSON.stringify(prepared));
+    assert.equal(context.children.length, 0);
+    const run = RunSchema.parse(prepared.entity);
+    if (boundary === 'unrelated-expired-grant') continue;
+    if (boundary === 'stop-prepared') {
+      assert.equal(
+        (
+          await controller.execute(
+            command(
+              'StopRun',
+              { taskId: task.id, runId: run.id },
+              controller.snapshot().tasks[0].revision,
+            ),
+            'local-owner',
+          )
+        ).outcome,
+        'applied',
+      );
+      assert.equal(
+        controller.snapshot().nativeRuns.find((value) => value.runId === run.id)?.stage,
+        'retain-only',
+      );
+    }
+    if (boundary === 'credit-withdrawn') context.fixtureProfile.facts.creditPolicies = ['ordinary'];
+    if (boundary === 'model-changed') context.fixtureProfile.facts.model = 'changed-profile-model';
+    if (boundary === 'client-changed')
+      context.fixtureProfile.client = {
+        ...(context.fixtureProfile.client as NonNullable<typeof context.fixtureProfile.client>),
+        sha256: '0'.repeat(64),
+      };
+    if (boundary === 'expired')
+      clock.advance(
+        Date.parse(
+          appointment.policy.effects.find((grant) => grant.action === 'write-scratch')
+            ?.expiresAt as string,
+        ) -
+          Date.parse(clock.now()) +
+          1,
+      );
+    if (boundary === 'context-changed') {
+      await controller.execute(
+        command(
+          'AmendTask',
+          {
+            taskId: task.id,
+            title: `${task.title} changed`,
+            outcome: task.outcome,
+            criteria: task.criteria,
+          },
+          controller.snapshot().tasks[0].revision,
+        ),
+        'local-owner',
+      );
+      assert.equal(
+        (
+          await controller.execute(
+            command(
+              'PrepareNativeRun',
+              { ...payload, consent: 'saved' },
+              controller.snapshot().tasks[0].revision,
+            ),
+            'local-owner',
+          )
+        ).outcome,
+        'blocked',
+      );
+    }
+    if (boundary === 'consent-revoked')
+      controller.store.db
+        .prepare("UPDATE receipts SET result=? WHERE command_key LIKE 'native-consent:%'")
+        .run(canonicalJson({ outcome: 'denied', reason: 'consent-revoked' }));
+    assert.equal(
+      (
+        await controller.execute(
+          command(
+            'StartRun',
+            { taskId: task.id, runId: run.id },
+            controller.snapshot().tasks[0].revision,
+          ),
+          'local-owner',
+        )
+      ).outcome,
+      'blocked',
+    );
+    assert.equal(context.children.length, 0);
+    assert.equal(controller.store.intents().length, 0);
+  }
+  {
+    const context = await nativeSetup(t, 'hold');
+    const { controller, appointment, task, command } = context;
+    const payload = {
+      taskId: task.id,
+      profileId: context.fixtureProfile.facts.id,
+      targetPath: appointment.target.path,
+      policy: appointment.policy,
+      consent: 'explicit',
+    };
+    const prepared = await controller.execute(
+      command('PrepareNativeRun', payload, task.revision),
+      'local-owner',
+    );
+    assert.equal(prepared.outcome, 'applied');
+    const first = RunSchema.parse(prepared.entity);
+    assert.equal(
+      (
+        await controller.execute(
+          command(
+            'StartRun',
+            { taskId: task.id, runId: first.id },
+            controller.snapshot().tasks[0].revision,
+          ),
+          'local-owner',
+        )
+      ).outcome,
+      'applied',
+    );
+    await context.ready;
+    const secondTask = TaskSchema.parse(
+      (
+        await controller.execute(
+          command(
+            'CreateTask',
+            {
+              projectId: task.projectId,
+              title: 'A separate bounded native task',
+              outcome: task.outcome,
+              criteria: task.criteria,
+            },
+            0,
+          ),
+          'local-owner',
+        )
+      ).entity,
+    );
+    const policy = {
+      ...appointment.policy,
+      effects: appointment.policy.effects.map((grant) => ({
+        ...grant,
+        taskId: secondTask.id,
+        ...(grant.action === 'export-patch' ? { target: secondTask.id } : {}),
+      })),
+    };
+    const secondPrepared = await controller.execute(
+      command(
+        'PrepareNativeRun',
+        { ...payload, taskId: secondTask.id, policy },
+        secondTask.revision,
+      ),
+      'local-owner',
+    );
+    assert.equal(secondPrepared.outcome, 'applied');
+    const second = RunSchema.parse(secondPrepared.entity);
+    assert.equal(second.roles[0].routeId, first.roles[0].routeId);
+    const submitted = Promise.withResolvers<void>();
+    context.onInput((message) => {
+      if (message.method === 'turn/start' && context.submissions() === 2) submitted.resolve();
+    });
+    assert.equal(
+      (
+        await controller.execute(
+          command(
+            'StartRun',
+            { taskId: secondTask.id, runId: second.id },
+            controller.snapshot().tasks.find((value) => value.id === secondTask.id)?.revision,
+          ),
+          'local-owner',
+        )
+      ).outcome,
+      'applied',
+    );
+    await submitted.promise;
+    assert.equal(controller.store.intents().length, 2);
+    assert.equal(
+      controller.store.db.prepare('SELECT COUNT(*) AS count FROM writer_leases').get()?.count,
+      2,
+    );
+    await controller.close();
+    assert.equal(context.submissions(), 2);
+  }
 });
 
 test('stop or restart cannot submit or apply late native work', async (t) => {
-  for (const boundary of [
+  for (const scenario of [
     'before-submit',
     'restart-intent',
     'close-at-admission',
@@ -1942,7 +2367,13 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
     'changed-source',
     'application-intent',
     'journal-read',
+    'public-before-submit',
+    'public-after-submit',
+    'public-close-at-admission',
+    'public-restart-intent',
   ] as const) {
+    const publicRun = scenario.startsWith('public-');
+    const boundary = scenario.replace(/^public-/, '');
     const context = await nativeSetup(
       t,
       boundary === 'after-submit' || boundary === 'close' ? 'hold' : 'success',
@@ -2038,7 +2469,32 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
         return statement(sql);
       }) as typeof controller.store.db.prepare;
     }
-    const started = controller.startNativePilot(appointment);
+    let startCommand: ReturnType<typeof command> | undefined;
+    if (publicRun) {
+      const prepared = await controller.execute(
+        command(
+          'PrepareNativeRun',
+          {
+            taskId: task.id,
+            profileId: context.fixtureProfile.facts.id,
+            targetPath: appointment.target.path,
+            policy: appointment.policy,
+            consent: 'explicit',
+          },
+          task.revision,
+        ),
+        'local-owner',
+      );
+      assert.equal(prepared.outcome, 'applied');
+      startCommand = command(
+        'StartRun',
+        { taskId: task.id, runId: RunSchema.parse(prepared.entity).id },
+        controller.snapshot().tasks[0].revision,
+      );
+    }
+    const started = startCommand
+      ? await controller.execute(startCommand, 'local-owner')
+      : controller.startNativePilot(appointment);
     assert.equal(started.outcome, 'applied');
     const runId = TaskSchema.parse(started.entity).runId;
     assert(runId);
@@ -2099,7 +2555,25 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
     const reopened = new Controller({ home: controller.home, now: clock.now, id });
     try {
       assert.equal(reopened.store.intents().length, 1);
-      assert.equal(reopened.startNativePilot(appointment).outcome, 'already-applied');
+      assert.equal(
+        startCommand
+          ? (await reopened.execute(startCommand, 'local-owner')).outcome
+          : reopened.startNativePilot(appointment).outcome,
+        'already-applied',
+      );
+      assert.equal(
+        reopened.snapshot().nativeRuns.find((value) => value.runId === runId)?.stage,
+        'retain-only',
+      );
+      assert.equal(
+        (
+          await reopened.execute(
+            command('StartRun', { taskId: task.id, runId }, reopened.snapshot().tasks[0].revision),
+            'local-owner',
+          )
+        ).outcome,
+        'blocked',
+      );
       assert.equal(
         (
           await reopened.execute(

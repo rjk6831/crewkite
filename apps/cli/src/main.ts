@@ -1,4 +1,13 @@
-import { closeSync, constants, fstatSync, openSync, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  fsyncSync,
+  openSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -10,9 +19,12 @@ import {
   readControllerEndpoint,
 } from '@crewkite/client/node';
 import {
+  ApprovalSchema,
+  ArtifactSchema,
   type Command,
   type CommandResult,
   CommandSchema,
+  canonicalJson,
   MAX_FRAME_BYTES,
   type Snapshot,
   type Task,
@@ -20,11 +32,15 @@ import {
 
 const help = `Usage: crewkite task <list|show|watch|start|stop|resume|switch|approve|deny> [id] [--json] [--home path]
        crewkite task switch <task-id> <route-id> [--json] [--home path]
+       crewkite native profiles [--json] [--home path]
+       crewkite task prepare-native <task-id> <profile-id> <path> --policy file [--native-trust --source-consent] [--existing-credits]
+       crewkite task changes <task-id> [--json] [--home path]
+       crewkite task export <task-id> --output new-file [--json] [--home path]
        crewkite health [--json] [--home path]
-       crewkite retry <receipt-file> [--json] [--home path]
+       crewkite retry <receipt-file> [--output new-file] [--json] [--home path]
 
 Approval commands take an approval ID. Other task commands take a task ID.
-The desktop prepares task policy and source before start.
+Create tasks in the desktop. Native preparation uses explicit consent or the controller's exact saved consent.
 `;
 interface Output {
   out: (text: string) => void;
@@ -47,6 +63,11 @@ export async function runCli(
         json: { type: 'boolean' },
         home: { type: 'string' },
         help: { type: 'boolean', short: 'h' },
+        policy: { type: 'string' },
+        'native-trust': { type: 'boolean' },
+        'source-consent': { type: 'boolean' },
+        'existing-credits': { type: 'boolean' },
+        output: { type: 'string' },
       },
     });
     if (values.help || positionals.length === 0) {
@@ -55,8 +76,13 @@ export async function runCli(
     }
     const [area, action, id, ...extra] = positionals;
     if (
-      (extra.length && !(area === 'task' && action === 'switch' && extra.length === 1)) ||
-      !['task', 'health', 'retry'].includes(area)
+      (extra.length &&
+        !(
+          area === 'task' &&
+          ((action === 'switch' && extra.length === 1) ||
+            (action === 'prepare-native' && extra.length === 2))
+        )) ||
+      !['task', 'native', 'health', 'retry'].includes(area)
     )
       throw new Error('Unknown command. Use --help.');
     const supported = [
@@ -69,12 +95,16 @@ export async function runCli(
       'switch',
       'approve',
       'deny',
+      'prepare-native',
+      'changes',
+      'export',
     ];
     if (
       area === 'task' &&
       (!action ||
         !supported.includes(action) ||
         (action === 'switch' && extra.length !== 1) ||
+        (action === 'prepare-native' && extra.length !== 2) ||
         (action === 'list' ? id !== undefined : id === undefined))
     )
       throw new Error('Invalid task command. Use --help.');
@@ -82,6 +112,31 @@ export async function runCli(
       throw new Error('Health takes no positional arguments.');
     if (area === 'retry' && (!action || id !== undefined))
       throw new Error('Retry takes one receipt file.');
+    if (area === 'native' && (action !== 'profiles' || id !== undefined))
+      throw new Error('Use native profiles to list supported profiles.');
+    const preparing = area === 'task' && action === 'prepare-native';
+    if (
+      !preparing &&
+      (values.policy ||
+        values['native-trust'] ||
+        values['source-consent'] ||
+        values['existing-credits'])
+    )
+      throw new Error('Native policy and consent options require task prepare-native.');
+    if (
+      preparing &&
+      (!values.policy || Boolean(values['native-trust']) !== Boolean(values['source-consent']))
+    )
+      throw new Error(
+        'Supply a policy file and both native consent flags, or neither consent flag for saved consent.',
+      );
+    if (
+      values.output &&
+      !(area === 'retry' || (area === 'task' && ['export', 'approve'].includes(action ?? '')))
+    )
+      throw new Error('Output requires an export action or its saved receipt.');
+    if (area === 'task' && action === 'export' && !values.output)
+      throw new Error('Export requires --output with a new file path.');
     const home = resolve(values.home ?? process.env.CREWKITE_HOME ?? join(homedir(), '.crewkite'));
     const actor = { id: 'terminal', kind: 'cli' as const };
     const connected = await connectController({ ...readControllerEndpoint(home), actor });
@@ -104,27 +159,119 @@ export async function runCli(
     };
     const print = (data: unknown, text: string) =>
       output.out(values.json ? `${JSON.stringify(data)}\n` : `${text}\n`);
-    const receipt = (result: CommandResult) =>
+    const receipt = (
+      result: CommandResult,
+      command = sent,
+      savedTo?: string,
+      nextCommand?: string[],
+    ) =>
       print(
-        { command: sent, result },
-        `${result.reason ?? result.outcome}\nCommand key ${sent?.key}`,
+        {
+          command,
+          result,
+          ...(savedTo ? { savedTo } : {}),
+          ...(nextCommand ? { nextCommand } : {}),
+        },
+        `${nextCommand ? 'Export approval required.' : (result.reason ?? result.outcome)}\nCommand key ${command?.key}${savedTo ? `\nPatch saved to ${savedTo}` : ''}${nextCommand ? `\nNext: ${nextCommand.map((arg) => `'${arg.replaceAll("'", "'\\''")}'`).join(' ')}` : ''}`,
       );
-    if (area === 'retry') {
-      const file = openSync(action, constants.O_RDONLY | constants.O_NONBLOCK);
+    const finishAction = async (result: CommandResult) => {
+      const command = sent;
+      let savedTo: string | undefined;
       try {
-        const state = fstatSync(file);
-        if (!state.isFile() || state.size > MAX_FRAME_BYTES)
-          throw new Error('Receipt must be a bounded JSON file.');
-        const value: unknown = JSON.parse(readFileSync(file, 'utf8'));
-        if (value === null || typeof value !== 'object' || !('command' in value))
-          throw new Error('Receipt has no saved command.');
-        sent = CommandSchema.parse(value.command);
-      } finally {
-        closeSync(file);
+        if (values.output && succeeded(result)) {
+          const approval = ApprovalSchema.safeParse(result.entity);
+          if (
+            approval.success &&
+            approval.data.status === 'pending' &&
+            approval.data.action === 'export-patch'
+          ) {
+            receipt(result, command, undefined, [
+              'crewkite',
+              'task',
+              'approve',
+              approval.data.approvalId,
+              '--output',
+              resolve(values.output),
+              '--home',
+              home,
+              ...(values.json ? ['--json'] : []),
+            ]);
+            return 0;
+          }
+          const artifact = ArtifactSchema.parse(result.entity);
+          if (artifact.bytes > 64 * 1024 * 1024)
+            throw new Error('The patch exceeds the save bound.');
+          const chunks: Buffer[] = [];
+          let offset = 0;
+          while (offset < artifact.bytes || offset === 0) {
+            const part = await request('GetArtifact', {
+              artifactId: artifact.id,
+              offset,
+              limit: 65536,
+            });
+            if (!succeeded(part) || part.data?.kind !== 'artifact')
+              throw new Error('The patch is unavailable.');
+            const data = part.data;
+            if (
+              canonicalJson(data.artifact) !== canonicalJson(artifact) ||
+              data.offset !== offset ||
+              data.encoding !== 'base64'
+            )
+              throw new Error('The patch identity changed.');
+            const bytes = Buffer.from(data.content, 'base64');
+            if (
+              bytes.toString('base64') !== data.content ||
+              bytes.length > 65536 ||
+              (bytes.length === 0 && offset !== artifact.bytes)
+            )
+              throw new Error('The patch chunk is invalid.');
+            chunks.push(bytes);
+            offset += bytes.length;
+            if (offset > artifact.bytes || data.eof !== (offset === artifact.bytes))
+              throw new Error('The patch length changed.');
+            if (data.eof) break;
+          }
+          const bytes = Buffer.concat(chunks);
+          if (
+            bytes.length !== artifact.bytes ||
+            createHash('sha256').update(bytes).digest('hex') !== artifact.hash
+          )
+            throw new Error('The patch checksum changed.');
+          savedTo = resolve(values.output);
+          const file = openSync(
+            savedTo,
+            constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+            0o600,
+          );
+          try {
+            writeFileSync(file, bytes);
+            fsyncSync(file);
+          } finally {
+            closeSync(file);
+          }
+        }
+      } catch (error) {
+        receipt(result, command);
+        throw error;
       }
-      const result = await connected.command(sent);
-      receipt(result);
+      receipt(result, command, savedTo);
       return succeeded(result) ? 0 : 2;
+    };
+    if (area === 'retry') {
+      const value = readJson(action);
+      if (value === null || typeof value !== 'object' || !('command' in value))
+        throw new Error('Receipt has no saved command.');
+      sent = CommandSchema.parse(value.command);
+      if (values.output && !['ExportPatch', 'ResolveApproval'].includes(sent.command))
+        throw new Error('This receipt cannot export a patch.');
+      if (
+        values.output &&
+        sent.command === 'ResolveApproval' &&
+        sent.payload.binding.action !== 'export-patch'
+      )
+        throw new Error('This approval does not export a patch.');
+      const result = await connected.command(sent);
+      return await finishAction(result);
     }
     if (area === 'health') {
       const result = await request('GetHealth', {});
@@ -135,6 +282,18 @@ export async function runCli(
       return succeeded(result) ? 0 : 2;
     }
     const snapshot = await client.snapshot();
+    if (area === 'native') {
+      print(
+        { profiles: snapshot.nativeProfiles },
+        snapshot.nativeProfiles
+          .map(
+            (profile) =>
+              `${profile.id}  ${profile.model}  ${profile.effort}  ${profile.available ? 'available' : profile.reason}`,
+          )
+          .join('\n') || 'No native profiles.',
+      );
+      return 0;
+    }
     if (action === 'list') {
       print(
         { cursor: snapshot.cursor, tasks: snapshot.tasks },
@@ -157,6 +316,8 @@ export async function runCli(
         target,
         revision,
       } = approval;
+      if (values.output && effect !== 'export-patch')
+        throw new Error('This approval does not export a patch.');
       const result = await request(
         'ResolveApproval',
         {
@@ -165,15 +326,72 @@ export async function runCli(
         },
         task.revision,
       );
-      receipt(result);
-      return succeeded(result) ? 0 : 2;
+      return await finishAction(result);
     }
     if (!id) throw new Error('A task ID is required.');
     const task = requireTask(snapshot, id);
+    if (action === 'prepare-native') {
+      const profile = snapshot.nativeProfiles.find((profile) => profile.id === extra[0]);
+      if (!profile?.available)
+        throw new Error(`Native profile unavailable: ${profile?.reason ?? 'not-found'}.`);
+      const creditPolicy = values['existing-credits'] ? 'existing-credits' : 'ordinary';
+      if (!profile.creditPolicies.includes(creditPolicy))
+        throw new Error('This profile does not support the selected credit policy.');
+      return await finishAction(
+        await request(
+          'PrepareNativeRun',
+          {
+            taskId: task.id,
+            profileId: profile.id,
+            targetPath: extra[1],
+            policy: readJson(values.policy as string),
+            creditPolicy,
+            consent: values['native-trust'] && values['source-consent'] ? 'explicit' : 'saved',
+          },
+          task.revision,
+        ),
+      );
+    }
+    if (action === 'changes' || action === 'export') {
+      const changes = await request('GetChanges', { taskId: task.id });
+      if (action === 'changes') {
+        if (!values.json && changes.data?.kind === 'changes' && changes.data.truncated)
+          output.out('Diff preview is truncated. Export retains the complete patch.\n');
+        print(
+          changes,
+          changes.data?.kind === 'changes'
+            ? changes.data.diff.replace(/\p{Cc}/gu, (value) =>
+                ['\n', '\t'].includes(value)
+                  ? value
+                  : `\\u${value.charCodeAt(0).toString(16).padStart(4, '0')}`,
+              )
+            : (changes.reason ?? changes.outcome),
+        );
+        return succeeded(changes) ? 0 : 2;
+      }
+      if (changes.data?.kind !== 'changes' || !changes.data.candidateId) {
+        print(changes, changes.reason ?? 'No retained candidate is available.');
+        return 2;
+      }
+      return await finishAction(
+        await request(
+          'ExportPatch',
+          { taskId: task.id, candidateId: changes.data.candidateId },
+          task.revision,
+        ),
+      );
+    }
     if (action === 'show') {
+      const nativeRun = snapshot.nativeRuns.find((value) => value.runId === task.runId);
+      const run = nativeRun
+        ? snapshot.runs.find((value) => value.id === nativeRun.runId)
+        : undefined;
+      const preview = nativeRun
+        ? `\nNative ${nativeRun.profileId}, ${nativeRun.stage}\nTarget ${nativeRun.target?.path ?? 'unknown'}\nBase hash ${nativeRun.target?.baseHash ?? 'unknown'}\nBytes ${nativeRun.target?.bytes ?? 'unknown'}\nExpires ${nativeRun.expiresAt ?? 'unknown'}\nSource base ${run?.source.base ?? 'unknown'}`
+        : '';
       print(
-        { cursor: snapshot.cursor, task },
-        `${task.id}\n${task.title}\n${task.state}, revision ${task.revision}`,
+        { cursor: snapshot.cursor, task, ...(nativeRun ? { nativeRun, run } : {}) },
+        `${task.id}\n${task.title}\n${task.state}, revision ${task.revision}${preview}`,
       );
       return 0;
     }
@@ -243,6 +461,18 @@ export async function runCli(
     return 1;
   } finally {
     client?.close();
+  }
+}
+
+function readJson(path: string): unknown {
+  const file = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+  try {
+    const state = fstatSync(file);
+    if (!state.isFile() || state.size > MAX_FRAME_BYTES)
+      throw new Error('Input must be a bounded JSON file.');
+    return JSON.parse(readFileSync(file, 'utf8'));
+  } finally {
+    closeSync(file);
   }
 }
 

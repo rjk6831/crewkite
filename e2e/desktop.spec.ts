@@ -11,6 +11,7 @@ import { groupAbsent } from '../apps/controller/src/host/worker.ts';
 import {
   type ControllerClient,
   connectController,
+  createCommandKey,
   readControllerEndpoint,
 } from '../packages/client/src/node.ts';
 import { type Event, EventSchema, SnapshotSchema } from '../packages/contracts/src/index.ts';
@@ -24,6 +25,8 @@ const require = createRequire(join(root, 'apps/desktop/package.json'));
 const environment = (home: string) => ({
   PATH: process.env.PATH ?? '',
   LANG: 'en_US.UTF-8',
+  ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
+  ...(process.env.CODEX_HOME ? { CODEX_HOME: process.env.CODEX_HOME } : {}),
   CREWKITE_HOME: home,
   CREWKITE_FIXTURE_IDENTITY: '1',
 });
@@ -34,12 +37,31 @@ function bounded<T>(pending: Promise<T>, milliseconds: number, label: string): P
   });
   return Promise.race([pending, deadline]).finally(() => clearTimeout(timer));
 }
-function launchController(home: string) {
-  const child = spawn(node, [join(root, 'scripts/demo-controller.ts')], {
-    cwd: root,
-    env: environment(home),
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+function launchController(home: string, nativeFixture = false) {
+  const bootstrap = `
+    import {spawn} from 'node:child_process';
+    import {createHash} from 'node:crypto';
+    import {readFileSync} from 'node:fs';
+    import {startController} from ${JSON.stringify(join(root, 'apps/controller/src/main.ts'))};
+    import {unavailableNativeProfile} from ${JSON.stringify(join(root, 'apps/controller/src/providers/openai/profile.ts'))};
+    import {fixture, fixtureModel} from ${JSON.stringify(join(root, 'apps/controller/src/providers/openai/replacement-fixture.ts'))};
+    let phases=0;
+    const profile={...unavailableNativeProfile(),facts:{...unavailableNativeProfile().facts,displayName:'OpenAI scripted proposal fixture',model:fixtureModel,clientVersion:process.version,available:true,reason:'available'},client:{executable:process.execPath,sha256:createHash('sha256').update(readFileSync(process.execPath)).digest('hex'),version:process.version},environment:{...process.env},locationHash:'1'.repeat(64)};
+    const runtime=await startController({home:process.env.CREWKITE_HOME,nativeProfile:()=>profile,nativeSpawn:(executable,args,options)=>spawn(executable,['-e',fixture,'success',args.at(-1)==='list'?'features':++phases===1?'prepare':'task'],options)});
+    console.log('CREWKITE_CONTROLLER_READY');
+    process.once('SIGTERM',()=>void runtime.close().then(()=>process.exit(0)));
+  `;
+  const child = spawn(
+    node,
+    nativeFixture
+      ? ['--input-type=module', '--eval', bootstrap]
+      : [join(root, 'scripts/demo-controller.ts')],
+    {
+      cwd: root,
+      env: environment(home),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  );
   const ready = new Promise<void>((ready, reject) => {
     let output = '';
     let errors = '';
@@ -69,10 +91,11 @@ async function stop(child: ChildProcess | undefined, signal: NodeJS.Signals = 'S
   }
 }
 async function closeDesktop(application: Awaited<ReturnType<typeof _electron.launch>>) {
+  const child = application.process();
   try {
     await bounded(application.close(), 10000, 'Desktop close');
   } catch (error) {
-    await stop(application.process());
+    await stop(child);
     throw error;
   }
 }
@@ -464,6 +487,207 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
     await page.screenshot({ path: join(internal, 'connected-checkpoint-light.png') });
     assert(watchText.includes(taskId));
+    await stop(watcher);
+    watcher = undefined;
+    observer.close();
+    observer = undefined;
+    await stop(controller);
+    const nativeController = launchController(home, true);
+    controller = nativeController.child;
+    await nativeController.ready;
+    observer = await connectController({
+      ...readControllerEndpoint(home),
+      actor: { id: 'native-journey-observer', kind: 'cli' },
+    });
+    const nativeEvents = new Timeline();
+    await observer.subscribe('0', (event) => nativeEvents.append(event));
+    await enter(page.getByRole('button', { name: 'Reconnect controller', exact: true }));
+    await expect
+      .poll(
+        async () =>
+          (await page.evaluate(() => window.crewkite?.getSnapshot()))?.nativeProfiles[0]
+            ?.displayName,
+      )
+      .toBe('OpenAI scripted proposal fixture');
+    await enter(page.getByRole('button', { name: 'New task', exact: true }).first());
+    await page.getByLabel('Task title', { exact: true }).fill('Retain one native file proposal');
+    await enter(page.getByRole('dialog').getByRole('button', { name: 'Create task', exact: true }));
+    await enter(
+      page.getByRole('dialog').getByRole('button', { name: 'Native file proposal', exact: true }),
+    );
+    const nativeDialog = page.getByRole('dialog');
+    await expect(nativeDialog.getByText('Requires Pro', { exact: true })).toBeVisible();
+    await nativeDialog.getByLabel('Committed file path', { exact: true }).fill('net.mjs');
+    const credits = nativeDialog.getByLabel('Allow existing credits after included usage', {
+      exact: true,
+    });
+    await expect(credits).not.toBeChecked();
+    const trust = nativeDialog.getByLabel('Trust the existing native client and login', {
+      exact: true,
+    });
+    const consent = nativeDialog.getByLabel(
+      'Send this committed file and task text; allow its replacement in independent scratch',
+      { exact: true },
+    );
+    await trust.check();
+    await consent.check();
+    await enter(nativeDialog.getByRole('button', { name: 'Prepare native proposal', exact: true }));
+    await expect(
+      page.getByRole('dialog', { name: 'Review the native proposal', exact: true }),
+    ).toBeVisible();
+    await expect(nativeDialog.getByLabel('Prepared native target')).toContainText('net.mjs');
+    let nativeSnapshot = await observer.snapshot();
+    const nativeTask = nativeSnapshot.tasks.find(
+      (task) => task.title === 'Retain one native file proposal',
+    );
+    assert(nativeTask?.runId);
+    assert.equal(
+      nativeSnapshot.attempts.filter((attempt) => attempt.runId === nativeTask.runId).length,
+      0,
+    );
+    assert.equal(cli(home, 'task', 'show', nativeTask.id).nativeRun.stage, 'prepared');
+    const nativeRun = nativeSnapshot.runs.find((run) => run.id === nativeTask.runId);
+    assert(nativeRun);
+    const hiddenPolicy = {
+      ...nativeRun.policy.policy,
+      effects: [
+        ...nativeRun.policy.policy.effects,
+        {
+          taskId: nativeTask.id,
+          action: 'accept-candidate' as const,
+          target: 'refs/heads/feat/hidden-grant',
+          expiresAt: new Date(0).toISOString(),
+          revoked: true,
+          usesRemaining: 0 as const,
+        },
+        {
+          taskId: nativeTask.id,
+          action: 'run-check' as const,
+          target: 'node --test',
+          expiresAt: new Date(0).toISOString(),
+          revoked: true,
+          usesRemaining: 0 as const,
+        },
+      ],
+    };
+    const fromCli = await observer.command({
+      protocol: 1,
+      key: createCommandKey(),
+      actor: { id: 'native-journey-observer', kind: 'cli' },
+      command: 'PrepareNativeRun',
+      expectedRevision: nativeSnapshot.tasks.find((task) => task.id === nativeTask.id)
+        ?.revision as number,
+      payload: {
+        taskId: nativeTask.id,
+        profileId: nativeSnapshot.nativeProfiles[0].id,
+        targetPath: 'net.mjs',
+        creditPolicy: 'ordinary',
+        policy: hiddenPolicy,
+        consent: 'explicit',
+      },
+    });
+    assert.equal(fromCli.outcome, 'applied');
+    await enter(nativeDialog.getByRole('button', { name: 'Cancel', exact: true }));
+    await enter(
+      page.getByRole('button', { name: 'Review prepared proposal', exact: true }).first(),
+    );
+    await enter(nativeDialog.getByRole('button', { name: 'Edit proposal', exact: true }));
+    await expect(trust).not.toBeChecked();
+    await expect(consent).not.toBeChecked();
+    await expect(credits).not.toBeChecked();
+    await expect(
+      nativeDialog.getByRole('button', { name: 'Prepare native proposal', exact: true }),
+    ).toBeDisabled();
+    await trust.check();
+    await consent.check();
+    await enter(nativeDialog.getByRole('button', { name: 'Prepare native proposal', exact: true }));
+    await expect(
+      page.getByRole('dialog', { name: 'Review the native proposal', exact: true }),
+    ).toBeVisible();
+    const renewed = await observer.snapshot();
+    const renewedRun = renewed.runs.find(
+      (run) => run.id === renewed.tasks.find((task) => task.id === nativeTask.id)?.runId,
+    );
+    assert(renewedRun);
+    assert.deepEqual(
+      renewedRun.policy.policy.effects.filter((grant) => grant.action !== 'write-scratch'),
+      hiddenPolicy.effects.filter((grant) => grant.action !== 'write-scratch'),
+    );
+    await page.screenshot({
+      path: join(internal, 'public-native-prepared-light.png'),
+      animations: 'disabled',
+    });
+    await enter(nativeDialog.getByRole('button', { name: 'Start native proposal', exact: true }));
+    await nativeEvents.wait(
+      (event) => event.type === 'candidate.sealed' && event.payload.taskId === nativeTask.id,
+    );
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Resume', exact: true })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Switch route', exact: true })).toHaveCount(0);
+    await page.getByRole('tab', { name: 'Checks and review', exact: true }).click();
+    await expect(
+      page.getByRole('button', { name: 'Accept candidate', exact: true }),
+    ).toBeDisabled();
+    await expect(page.getByText('Native retained changes', { exact: true })).toBeVisible();
+    await enter(page.getByRole('button', { name: 'Dismiss export notice', exact: true }));
+    const nativeDestination = join(home, 'native.patch');
+    await application.evaluate(({ dialog }, path) => {
+      dialog.showSaveDialog = async () => ({ canceled: false, filePath: path });
+    }, nativeDestination);
+    await enter(page.getByRole('button', { name: 'Export patch', exact: true }));
+    const nativeExport = await nativeEvents.wait(
+      (event) => event.type === 'export.created' && event.taskId === nativeTask.id,
+    );
+    assert.equal(nativeExport.type, 'export.created');
+    await expect(page.getByText(/Patch saved/).first()).toBeVisible();
+    assert.equal(
+      createHash('sha256').update(readFileSync(nativeDestination)).digest('hex'),
+      nativeExport.payload.hash,
+    );
+    assert.deepEqual(
+      cli(home, 'task', 'changes', nativeTask.id).data.files.map(
+        (file: { path: string }) => file.path,
+      ),
+      ['net.mjs'],
+    );
+    assert.deepEqual(sourceIdentity(source), original);
+    await page.getByRole('tab', { name: 'Changes', exact: true }).click();
+    await enter(page.getByRole('button', { name: 'Switch to dark theme', exact: true }));
+    await expect(page.getByText('net.mjs', { exact: true }).first()).toBeVisible();
+    await page.screenshot({
+      path: join(internal, 'public-native-retained-dark.png'),
+      animations: 'disabled',
+    });
+    nativeSnapshot = await observer.snapshot();
+    const retainedNative = nativeSnapshot.nativeRuns.find(
+      (value) =>
+        value.runId === nativeSnapshot.tasks.find((task) => task.id === nativeTask.id)?.runId,
+    );
+    assert.equal(retainedNative?.stage, 'retain-only');
+    assert.equal(
+      nativeSnapshot.evidence.filter((value) =>
+        nativeSnapshot.candidates.some(
+          (candidate) => candidate.id === value.candidateId && candidate.taskId === nativeTask.id,
+        ),
+      ).length,
+      0,
+    );
+    observer.close();
+    observer = undefined;
+    await stop(controller);
+    const nativeRestart = launchController(home, true);
+    controller = nativeRestart.child;
+    await nativeRestart.ready;
+    observer = await connectController({
+      ...readControllerEndpoint(home),
+      actor: { id: 'native-reopened-observer', kind: 'cli' },
+    });
+    await enter(page.getByRole('button', { name: 'Reconnect controller', exact: true }));
+    const reopenedNative = await observer.snapshot();
+    assert.deepEqual(reopenedNative.nativeRuns, nativeSnapshot.nativeRuns);
+    assert.equal(reopenedNative.attempts.length, nativeSnapshot.attempts.length);
+    await expect(page.getByRole('button', { name: 'Resume', exact: true })).toHaveCount(0);
+
     console.log(`Connected journey home: ${home}`);
   } finally {
     observer?.close();

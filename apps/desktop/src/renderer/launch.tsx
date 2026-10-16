@@ -1,6 +1,7 @@
 import {
   formatReviewTarget,
   type Guidance,
+  NativeTargetPathSchema,
   type Policy,
   PolicySchema,
   type ReviewMethod,
@@ -80,12 +81,380 @@ const principles = [
   'Allow only the specific action approved for this task.',
 ];
 
-export function Launch({
+type LaunchProps = {
+  task: Task;
+  snapshot: Snapshot;
+  workspace: Workspace;
+  onClose: () => void;
+};
+
+export function Launch(props: LaunchProps) {
+  const [native, setNative] = useState(
+    props.snapshot.nativeRuns.some((run) => run.runId === props.task.runId),
+  );
+  return native ? (
+    <NativeLaunch {...props} onBack={() => setNative(false)} />
+  ) : (
+    <ScriptedLaunch {...props} onNative={() => setNative(true)} />
+  );
+}
+
+function NativeLaunch({
   task,
   snapshot,
   workspace,
   onClose,
+  onBack,
+}: LaunchProps & { onBack: () => void }) {
+  const project = snapshot.projects.find((value) => value.id === task.projectId);
+  const profile = snapshot.nativeProfiles[0];
+  const current = snapshot.nativeRuns.find((value) => value.runId === task.runId);
+  const saved = current ? snapshot.runs.find((value) => value.id === task.runId) : undefined;
+  const [prepared, setPrepared] = useState<Run | null>(saved ?? null);
+  const [targetPath, setTargetPath] = useState(current?.target?.path ?? '');
+  const [nativeTrust, setNativeTrust] = useState(false);
+  const [sourceConsent, setSourceConsent] = useState(false);
+  const [savedConsent, setSavedConsent] = useState(false);
+  const [existingCredits, setExistingCredits] = useState(
+    !!saved &&
+      snapshot.routes.find((route) => route.id === saved.roles[0]?.routeId)?.billing === 'credits',
+  );
+  const [message, setMessage] = useState<string | null>(null);
+  const [policy, setPolicy] = useState<Policy>(
+    () =>
+      saved?.policy.policy ?? {
+        authority: 'guided',
+        quality: 'quick',
+        methods: [{ id: 'keep-it-simple', cycles: 1, reviewerRole: 'reviewer' }],
+        limits: { attempts: 3, minutes: 5, concurrency: 1 },
+        reserves: [],
+        unknownUsage: { rule: 'fixed-allowance', allowance: { launches: 1, minutes: 5 } },
+        effects: [
+          {
+            taskId: task.id,
+            action: 'write-scratch',
+            target: project?.name ?? task.projectId,
+            usesRemaining: 1,
+            revoked: false,
+            expiresAt: new Date(Date.now() + 86400000).toISOString(),
+          },
+          {
+            taskId: task.id,
+            action: 'export-patch',
+            target: task.id,
+            usesRemaining: 1,
+            revoked: false,
+            expiresAt: new Date(Date.now() + 86400000).toISOString(),
+          },
+        ],
+      },
+  );
+  const capability = snapshot.nativeRuns.find((value) => value.runId === prepared?.id);
+  const connected = workspace.connection === 'connected' && !workspace.preview;
+  const allowed = connected && profile?.available && !workspace.pending;
+  const validConsent = savedConsent || (nativeTrust && sourceConsent);
+  const startable =
+    allowed &&
+    prepared &&
+    task.runId === prepared.id &&
+    capability?.stage === 'prepared' &&
+    !!capability.expiresAt &&
+    Date.parse(capability.expiresAt) > Date.now();
+  const unavailable = profile
+    ? {
+        'not-configured': 'The controller has no supported native profile.',
+        'unsupported-platform': 'This profile requires macOS on Apple silicon.',
+        'native-home-unavailable':
+          'The existing native home is unavailable. Restart from the signed-in desktop session.',
+        'configuration-location-unsupported':
+          'This native configuration location has not been qualified.',
+        'client-unavailable':
+          'Install the supported official client before preparing this proposal.',
+        'client-build-mismatch': 'The installed client build does not match this profile.',
+        available: '',
+      }[profile.reason]
+    : 'The controller has no supported native profile.';
+  async function prepareNative() {
+    if (
+      !allowed ||
+      !validConsent ||
+      !NativeTargetPathSchema.safeParse(targetPath).success ||
+      !profile
+    )
+      return;
+    try {
+      const expiresAt = new Date(Date.now() + 86400000).toISOString();
+      const writeIndex = policy.effects.findIndex(
+        (grant) =>
+          grant.taskId === task.id &&
+          grant.action === 'write-scratch' &&
+          grant.target === project?.name,
+      );
+      const submittedPolicy = savedConsent
+        ? policy
+        : {
+            ...policy,
+            effects: policy.effects.map((grant, index) =>
+              index === writeIndex
+                ? {
+                    ...grant,
+                    expiresAt,
+                    revoked: false,
+                    usesRemaining: 1 as const,
+                  }
+                : grant,
+            ),
+          };
+      const result = await workspace.command({
+        command: 'PrepareNativeRun',
+        expectedRevision: task.revision,
+        payload: {
+          taskId: task.id,
+          profileId: profile.id,
+          targetPath,
+          policy: submittedPolicy,
+          creditPolicy: existingCredits ? 'existing-credits' : 'ordinary',
+          consent: savedConsent ? 'saved' : 'explicit',
+        },
+      });
+      const run = RunSchema.safeParse(result.entity);
+      if (result.outcome === 'applied' && run.success) {
+        setPrepared(run.data);
+        setPolicy(run.data.policy.policy);
+        setMessage(null);
+      } else
+        setMessage(
+          result.next ??
+            'The target, native consent or saved policy is unavailable. Review the proposal again.',
+        );
+    } catch {
+      setMessage(
+        'Preparation could not be confirmed. Check the connection and retained task before retrying.',
+      );
+    }
+  }
+  return (
+    <Dialog
+      title={prepared ? 'Review the native proposal' : 'Native file proposal'}
+      eyebrow="ONE EXISTING COMMITTED FILE"
+      onClose={onClose}
+      wide
+    >
+      <div className="launch-content view-stack">
+        {message && (
+          <p className="notice" role="status">
+            {message}
+          </p>
+        )}
+        <section className="card">
+          <div className="section-heading">
+            <h2>{profile?.displayName ?? 'Native proposal'}</h2>
+            <span>Requires Pro</span>
+          </div>
+          {profile && (
+            <div className="facts-grid">
+              <span>Client {profile.clientVersion}</span>
+              <span>{profile.model}</span>
+              <span>{profile.effort} effort</span>
+              <span>{profile.serviceTier} tier</span>
+            </div>
+          )}
+          <p className="muted small">
+            Account, model and configuration are checked when the run starts. A provider hard
+            spending cap remains unverified.
+          </p>
+          {!profile?.available && (
+            <p className="notice" role="status">
+              {unavailable}
+            </p>
+          )}
+        </section>
+        {prepared ? (
+          <>
+            <SourceFacts source={prepared.source} />
+            <section className="card" aria-label="Prepared native target">
+              <h2>Saved target</h2>
+              <code>{capability?.target?.path ?? targetPath}</code>
+              <p className="muted small">
+                Original hash{' '}
+                <code>{capability?.target?.baseHash ?? 'Waiting for saved target facts'}</code>
+              </p>
+              <p>
+                {capability?.target?.bytes ?? 'Unknown'} bytes · Consent expires{' '}
+                {capability?.expiresAt
+                  ? new Date(capability.expiresAt).toLocaleString()
+                  : 'Unknown'}
+              </p>
+              <p>
+                {snapshot.routes.find((route) => route.id === prepared.roles[0]?.routeId)
+                  ?.billing === 'credits'
+                  ? 'Existing credits explicitly allowed after included usage.'
+                  : 'Ordinary usage must be available. Existing credits were not opted in.'}
+              </p>
+            </section>
+          </>
+        ) : (
+          <section className="card">
+            <label>
+              Committed file path
+              <input
+                autoFocus
+                value={targetPath}
+                maxLength={4096}
+                spellCheck={false}
+                placeholder="docs/providers.md"
+                onChange={(event) => setTargetPath(event.target.value)}
+              />
+            </label>
+            <p className="muted small">
+              Choose one existing text file in {project?.name ?? 'this project'}. The controller
+              freezes its committed base, hash and size before Start.
+            </p>
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                checked={savedConsent}
+                onChange={(event) => setSavedConsent(event.target.checked)}
+              />
+              Use saved consent for this exact file and policy
+            </label>
+            {!savedConsent && (
+              <>
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={nativeTrust}
+                    onChange={(event) => setNativeTrust(event.target.checked)}
+                  />
+                  Trust the existing native client and login
+                </label>
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={sourceConsent}
+                    onChange={(event) => setSourceConsent(event.target.checked)}
+                  />
+                  Send this committed file and task text; allow its replacement in independent
+                  scratch
+                </label>
+              </>
+            )}
+            <p className="muted small">
+              Native global and project guidance may apply. Tool containment remains unqualified.
+              Saved consent must match the controller's exact recorded scope.
+            </p>
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                checked={existingCredits}
+                disabled={!profile?.creditPolicies.includes('existing-credits')}
+                onChange={(event) => setExistingCredits(event.target.checked)}
+              />
+              Allow existing credits after included usage
+            </label>
+            <p className="muted small">
+              This choice does not establish a provider hard spending cap. No reset, purchase or
+              top-up is requested.
+            </p>
+          </section>
+        )}
+        <p className="notice">
+          One proposal is retained for inspection and patch export. Checks, review, handoff and
+          acceptance are unavailable. The original checkout stays unchanged.
+        </p>
+        {prepared && capability?.stage !== 'prepared' && (
+          <p className="notice" role="status">
+            This run cannot start again. Inspect Changes or export its retained patch.
+          </p>
+        )}
+        {prepared && capability?.expiresAt && Date.parse(capability.expiresAt) <= Date.now() && (
+          <p className="notice" role="status">
+            The saved consent expired. Edit the proposal and review its permissions.
+          </p>
+        )}
+      </div>
+      <div className="dialog-footer">
+        <button type="button" className="button secondary" onClick={onClose}>
+          Cancel
+        </button>
+        {!prepared && (
+          <button type="button" className="button secondary" onClick={onBack}>
+            Scripted run
+          </button>
+        )}
+        <span className="muted small">
+          {profile?.maximumSubmissions ?? 1} submission per run ·{' '}
+          {(profile?.maximumTaskMs ?? 300000) / 60000} minutes maximum ·{' '}
+          {(profile?.maximumFileBytes ?? 65536) / 1024} KiB maximum
+        </span>
+        {prepared ? (
+          <>
+            {capability?.stage === 'prepared' && (
+              <button
+                type="button"
+                className="button secondary"
+                disabled={workspace.pending}
+                onClick={() => {
+                  setPrepared(null);
+                  setNativeTrust(false);
+                  setSourceConsent(false);
+                  setSavedConsent(false);
+                  setMessage(null);
+                }}
+              >
+                Edit proposal
+              </button>
+            )}
+            <button
+              type="button"
+              className="button primary"
+              disabled={!startable}
+              onClick={() =>
+                void workspace
+                  .command({
+                    command: 'StartRun',
+                    expectedRevision: task.revision,
+                    payload: { taskId: task.id, runId: prepared.id },
+                  })
+                  .then((result) => {
+                    if (result.outcome === 'applied') onClose();
+                    else setMessage(result.next ?? 'Start was refused. Review the saved proposal.');
+                  })
+                  .catch(() =>
+                    setMessage('Start could not be confirmed. Inspect the task before retrying.'),
+                  )
+              }
+            >
+              Start native proposal
+              <ArrowRight size={14} />
+            </button>
+          </>
+        ) : (
+          <button
+            type="button"
+            className="button primary"
+            disabled={
+              !allowed || !validConsent || !NativeTargetPathSchema.safeParse(targetPath).success
+            }
+            onClick={() => void prepareNative()}
+          >
+            Prepare native proposal
+            <ArrowRight size={14} />
+          </button>
+        )}
+      </div>
+    </Dialog>
+  );
+}
+
+function ScriptedLaunch({
+  task,
+  snapshot,
+  workspace,
+  onClose,
+  onNative,
 }: {
+  onNative: () => void;
   task: Task;
   snapshot: Snapshot;
   workspace: Workspace;
@@ -522,6 +891,12 @@ export function Launch({
       onClose={onClose}
       wide
     >
+      {!prepared && (
+        <button type="button" className="button secondary" onClick={onNative}>
+          Native file proposal
+          <ArrowRight size={14} />
+        </button>
+      )}
       <div className="launch-summary">
         <span>
           <Users size={13} />

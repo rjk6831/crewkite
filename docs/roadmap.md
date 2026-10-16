@@ -12,6 +12,8 @@ I deliver CrewKite in milestones that each make one claim I can test. Dates foll
 | D2 Daily-driver release 0.1 | Local, OpenAI, Anthropic and Google routes in useful roles, durable handoff, honest usage, finite review, two coding slices with a combined check, safe self-development | Ten real tasks from my own backlog, observed end to end |
 | D3 Distribution | Package provenance, install, recovery, compatibility, notices, privacy and signing for a stated audience | A clean install on a machine that never saw the source tree |
 
+D1a is in progress. One opt-in OpenAI profile supports an existing committed text file. A useful documentation task has produced a retained patch. A later synthetic task passed normal desktop creation, preparation and start, CLI export, and same-home reopen through the Mac directory package. The original source stayed unchanged. Native candidates remain unverified, with checks, review, handoff and acceptance unavailable. General live routing, the other provider families and local inference still need qualification. [Provider routes](providers.md) records the evidence and limits. The [CLI setup](../apps/cli/README.md#native-single-file-runs) describes preparation and export.
+
 A two-provider demo is an intermediate step on the way to D2.
 
 ## Work packets

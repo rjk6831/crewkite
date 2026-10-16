@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { isAbsolute, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
-import { AttemptIdSchema, HashSchema, SourceFileDetailSchema } from '@crewkite/contracts';
+import { AttemptIdSchema, HashSchema, NativeTargetPathSchema } from '@crewkite/contracts';
 import { z } from 'zod';
 import { type DiscoveryMetadata, OpenAiDiscovery } from './discovery.ts';
 import { type NativeLaunch, startNativeTask } from './native-discovery.ts';
@@ -10,10 +10,7 @@ const MAX_CONTENT = 65_536;
 const id = z.string().min(1).max(200);
 const utf8 = (value: string) =>
   value.isWellFormed() && !value.includes('\0') && Buffer.byteLength(value, 'utf8') <= MAX_CONTENT;
-export const ReplacementPathSchema = SourceFileDetailSchema.shape.path.refine(
-  (value) => value.isWellFormed() && !/\p{Cc}/u.test(value),
-  'A replacement needs a relative path without control characters.',
-);
+export const ReplacementPathSchema = NativeTargetPathSchema;
 const input = z.strictObject({
   attemptId: AttemptIdSchema,
   model: z.literal('gpt-6.1-sol'),

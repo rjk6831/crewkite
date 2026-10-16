@@ -26,7 +26,7 @@ The controller runs as one headless Node process per user. The desktop app and t
 
 These measures keep other clients and workers off the control channel. They do not defend against malware running as the same user, and the docs make no such claim.
 
-Native writer preparation includes per-phase ownership hooks and a SQLite journal for preflight and task processes. The journal separates launch intent, the actual process group and proven quiescence. Recovery checks every recorded group; ambiguous ownership stays blocked, and no native phase restarts automatically. Native dispatch remains disabled.
+Native writer preparation includes per-phase ownership hooks and a SQLite journal for preflight and task processes. The journal separates launch intent, the actual process group and proven quiescence. Recovery checks every recorded group; ambiguous ownership stays blocked, and no native phase restarts automatically. A supervised native file proposal uses `PrepareNativeRun` to save an immutable preview without provider I/O. `StartRun` rechecks its installed profile, scoped consent and source before entering the same admission and process owner. Each run permits one submission. Retained native work can be inspected and exported; resume, handoff, scripted evaluation and acceptance stay unavailable.
 
 ## Commands and events
 
@@ -40,7 +40,7 @@ Results use a finite set of outcomes: `applied`, `already-applied`, `stale-revis
 
 Reads use snapshot plus subscription. `GetSnapshot` returns state at cursor C, and `Subscribe` replays ordered events after C. A gap in retained history forces a fresh snapshot. Slow clients are disconnected and resync; they never hold up work.
 
-The current D0 controller runs scripted routes. `ExportDiagnostics` returns `unsupported`. Live provider qualification and installed-package recovery remain separate gates. The table describes the first-release command contract.
+Team routing runs scripted routes. One separately supported native profile can propose a replacement for an existing committed text file through the desktop or CLI. Its exact provider limits are in [Provider routes](providers.md). `ExportDiagnostics` returns `unsupported`. General live routing and installer recovery remain separate gates. The table describes the first-release command contract.
 
 The command set for the first release:
 
@@ -48,6 +48,7 @@ The command set for the first release:
 |---------|----------|
 | `RegisterProject`, `InspectSource` | Explicit path selection, base revision, bounded dirty and untracked file details, stable project ID |
 | `CreateTask`, `AmendTask`, `PrepareRun` | Saved criteria, versioned amendments, a frozen preview of source, routes, checks and limits |
+| `PrepareNativeRun` | Freeze a controller-owned profile, one committed target, task text, explicit or matching saved consent and policy; perform no provider I/O |
 | `StartRun`, `GetSnapshot`, `Subscribe` | Atomic admission, consistent state with ordered events, no duplicate dispatch |
 | `SwitchRoute` | Save an allowed coder target, stop the outgoing writer, seal retained work and recheck normal admission |
 | `PauseAdmissions`, `StopRun` | Pausing stops new dispatch. Stopping requests cancellation and waits for proven quiescence |

@@ -34,6 +34,8 @@ const child = spawn(executable, [join(root, 'apps/desktop')], {
   stdio: 'inherit',
   env: {
     PATH: process.env.PATH,
+    HOME: process.env.HOME,
+    CODEX_HOME: process.env.CODEX_HOME,
     DISPLAY: process.env.DISPLAY,
     XAUTHORITY: process.env.XAUTHORITY,
     LANG: 'en_US.UTF-8',

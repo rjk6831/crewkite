@@ -38,6 +38,8 @@ import {
   type Grant,
   HashSchema,
   MAX_FRAME_BYTES,
+  NativeProfileSchema,
+  NativeRunSchema,
   type Observation,
   ObservationSchema,
   type Policy,
@@ -93,6 +95,10 @@ import {
   type Schedule,
 } from '../host/worker.ts';
 import {
+  type NativeProfileResolution,
+  unavailableNativeProfile,
+} from '../providers/openai/profile.ts';
+import {
   ReplacementPathSchema,
   replacementPlan,
   startReplacement,
@@ -128,6 +134,32 @@ const NativeAppointmentSchema = z.strictObject({
   maximumSubmissions: z.literal(1),
 });
 export type NativePilotAppointment = z.infer<typeof NativeAppointmentSchema>;
+const NativePublicScopeSchema = z.strictObject({
+  profileId: z.string().min(1).max(200),
+  locationHash: HashSchema,
+  scopeHash: HashSchema,
+  context: z.strictObject({
+    title: z.string().min(1).max(200),
+    outcome: z.string().min(1).max(4096),
+  }),
+});
+const NativePreparationSchema = z.strictObject({
+  appointment: NativeAppointmentSchema,
+  run: RunSchema,
+  attempt: AttemptSchema,
+  manifest: z
+    .array(
+      z.strictObject({
+        path: z.string().min(1).max(4096),
+        mode: z.enum(['100644', '100755']),
+        hash: HashSchema,
+        bytes: z.number().int().nonnegative(),
+      }),
+    )
+    .max(10000),
+  originalHash: HashSchema,
+  public: NativePublicScopeSchema,
+});
 type NativeBinding = {
   appointment: NativePilotAppointment;
   run: Run;
@@ -136,6 +168,8 @@ type NativeBinding = {
   baseHash: string;
   manifest: Omit<ReturnType<typeof readFiles>[number], 'content'>[];
   planArtifact: Artifact;
+  public?: z.infer<typeof NativePublicScopeSchema>;
+  environment?: NodeJS.ProcessEnv;
 };
 type NativeRuntime = {
   kind: 'native';
@@ -175,6 +209,7 @@ export type ControllerOptions = {
   ) => Extract<import('@crewkite/contracts').FakeWorkerInput, { type: 'start' }>['scenario'];
   afterIntent?: (intent: LaunchIntent) => void;
   schedule?: Schedule;
+  nativeProfile?: () => NativeProfileResolution;
   nativeSpawn?: Parameters<typeof startReplacement>[2]['spawn'];
 };
 const migrations = fileURLToPath(new URL('../../migrations/', import.meta.url));
@@ -194,11 +229,13 @@ export class Controller {
   private readonly owner: DatabaseSync;
   private closed = false;
   private readonly options: ControllerOptions;
+  private profile: NativeProfileResolution;
   private closing?: Promise<void>;
   private readonly workers = new Map<string, FakeRuntime | NativeRuntime>();
 
   constructor(options: ControllerOptions) {
     this.options = options;
+    this.profile = options.nativeProfile?.() ?? unavailableNativeProfile();
     this.home = options.home;
     this.now = () => TimestampSchema.parse((options.now ?? (() => new Date().toISOString()))());
     this.id = options.id ?? createIds(this.now);
@@ -344,6 +381,8 @@ export class Controller {
   snapshot(): Snapshot {
     return SnapshotSchema.parse({
       protocol: 1,
+      nativeProfiles: [this.profile.facts],
+      nativeRuns: this.nativeRuns(),
       cursor: this.store.cursor(),
       projects: this.store.list('project'),
       tasks: this.store.list('task'),
@@ -427,7 +466,7 @@ export class Controller {
   private apply(command: Command, effects: (() => void)[]): CommandResult {
     if (
       'taskId' in command.payload &&
-      ['StartRun', 'ResumeRun', 'SwitchRoute', 'AcceptCandidate'].includes(command.command)
+      ['ResumeRun', 'SwitchRoute', 'AcceptCandidate'].includes(command.command)
     ) {
       const task = this.store.get<Task>('task', command.payload.taskId);
       if (task?.runId && this.store.receipt(`native-run:${task.runId}`))
@@ -541,6 +580,8 @@ export class Controller {
         return this.exportPatch(command);
       case 'PrepareRun':
         return this.prepare(command);
+      case 'PrepareNativeRun':
+        return this.prepareNative(command);
       case 'StartRun':
       case 'ResumeRun':
         return this.start(command, effects);
@@ -879,8 +920,24 @@ export class Controller {
     const task = this.store.get<Task>('task', command.payload.taskId);
     const run = this.store.get<Run>('run', command.payload.runId);
     if (this.closed) return { outcome: 'blocked', reason: 'controller-closing' };
-    if (!native && run && this.store.receipt(`native-run:${run.id}`))
-      return { outcome: 'blocked', reason: 'native-pilot-retain-only' };
+    if (!native && run && this.store.receipt(`native-run:${run.id}`)) {
+      if (
+        command.command !== 'StartRun' ||
+        !this.store.receipt(`native-prepared:${run.id}`) ||
+        this.store.intents().some((intent) => intent.run_id === run.id)
+      )
+        return { outcome: 'blocked', reason: 'native-pilot-retain-only' };
+      try {
+        native = this.preparedNativeBinding(run);
+        planned = native.attempt;
+      } catch {
+        return {
+          outcome: 'blocked',
+          reason: 'native-preparation-unavailable',
+          next: 'Prepare the native proposal again after reviewing its source, consent and client.',
+        };
+      }
+    }
     if (task && !approved && !transfer && !native) {
       const gate = this.resumeGate(task, command.payload.runId);
       if (gate) return gate;
@@ -912,7 +969,7 @@ export class Controller {
       };
     const target = this.pendingSwitch(run);
     const decision = native
-      ? this.nativeDecision(native.appointment, run)
+      ? this.nativeDecision(native.appointment, run, !!native.public)
       : this.routing(run, 'coder', target);
     if (!decision.chosen)
       return {
@@ -1053,6 +1110,452 @@ export class Controller {
     return { outcome: 'applied', entity: updated, revision: updated.revision };
   }
 
+  private nativeRuns(): z.infer<typeof NativeRunSchema>[] {
+    return this.store.list<Run>('run').flatMap((run) => {
+      const origin = this.store.receipt(`native-run:${run.id}`);
+      if (!origin) return [];
+      const prepared = this.store.receipt(`native-prepared:${run.id}`);
+      try {
+        const artifact = ArtifactSchema.parse(origin.result.entity);
+        if (artifact.bytes > MAX_FRAME_BYTES) throw Error('Native plan exceeds its bound.');
+        const plan = JSON.parse(this.artifacts.read(artifact.hash).toString('utf8'));
+        const appointment = NativeAppointmentSchema.parse(plan.appointment);
+        const publicScope = NativePublicScopeSchema.safeParse(plan.public).data;
+        return [
+          NativeRunSchema.parse({
+            runId: run.id,
+            profileId: publicScope?.profileId ?? 'private-native-file',
+            stage:
+              prepared &&
+              this.store.get<Task>('task', run.taskId)?.runId === run.id &&
+              this.store.get<Task>('task', run.taskId)?.state === 'draft' &&
+              publicScope &&
+              !this.store.intents().some((intent) => intent.run_id === run.id)
+                ? 'prepared'
+                : 'retain-only',
+            expiresAt: appointment.expiresAt,
+            target: {
+              ...appointment.target,
+              bytes: plan.manifest.find(
+                (file: { path: string }) => file.path === appointment.target.path,
+              )?.bytes,
+            },
+          }),
+        ];
+      } catch {
+        return [
+          { runId: run.id, profileId: 'unavailable-native-plan', stage: 'retain-only' as const },
+        ];
+      }
+    });
+  }
+
+  private consentRecord(scopeHash: string) {
+    const receipt = this.store.receipt(`native-consent:${scopeHash}`);
+    if (receipt?.result.outcome !== 'applied') throw Error('Native consent is unavailable.');
+    const artifact = ArtifactSchema.parse(receipt.result.entity);
+    if (artifact.bytes > 4096) throw Error('Native consent exceeds its bound.');
+    const consent = z
+      .strictObject({ scopeHash: HashSchema, expiresAt: TimestampSchema })
+      .parse(JSON.parse(this.artifacts.read(artifact.hash).toString('utf8')));
+    if (consent.scopeHash !== scopeHash || Date.parse(consent.expiresAt) <= Date.parse(this.now()))
+      throw Error('Native consent expired.');
+    return consent;
+  }
+
+  private nativeConsentCurrent(binding: NativeBinding): boolean {
+    if (!binding.public) return true;
+    try {
+      this.consentRecord(binding.public.scopeHash);
+      const task = this.store.get<Task>('task', binding.run.taskId);
+      return (
+        !!task &&
+        task.title === binding.public.context.title &&
+        task.outcome === binding.public.context.outcome &&
+        hashCanonical(task.criteria) === binding.appointment.consent.criteriaHash
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  private nativeProfileRoute(
+    profile: NativeProfileResolution,
+    creditPolicy: NativePilotAppointment['creditPolicy'],
+  ): Route | undefined {
+    const receipt = this.store.receipt(`native-profile-route:${profile.facts.id}:${creditPolicy}`);
+    if (!receipt) return;
+    const artifact = ArtifactSchema.parse(receipt.result.entity);
+    if (artifact.bytes > MAX_FRAME_BYTES) throw Error('Native route binding exceeds its bound.');
+    const plan = NativePreparationSchema.parse(
+      JSON.parse(this.artifacts.read(artifact.hash).toString('utf8')),
+    );
+    const route = this.store.get<Route>('route', plan.appointment.route.id);
+    const expected = RouteSchema.parse({
+      id: plan.appointment.route.id,
+      family: profile.facts.family,
+      displayName: profile.facts.displayName,
+      model: profile.facts.model,
+      effort: {
+        requested: profile.facts.effort,
+        effective: profile.facts.effort,
+        supported: [profile.facts.effort],
+      },
+      billing: creditPolicy === 'ordinary' ? 'included' : 'credits',
+      qualified: false,
+      fake: false,
+    });
+    if (
+      receipt.result.outcome !== 'applied' ||
+      plan.public.profileId !== profile.facts.id ||
+      plan.appointment.creditPolicy !== creditPolicy ||
+      hashCanonical(plan.appointment.client) !== hashCanonical(profile.client) ||
+      hashCanonical(route) !== hashCanonical(expected)
+    )
+      throw Error('Native route binding changed.');
+    return expected;
+  }
+
+  private prepareNative(command: Extract<Command, { command: 'PrepareNativeRun' }>): CommandResult {
+    let plan: Omit<NativeBinding, 'planArtifact'>;
+    let expiresAt: string;
+    try {
+      this.profile = this.options.nativeProfile?.() ?? unavailableNativeProfile();
+      const profile = this.profile;
+      const facts = NativeProfileSchema.parse(profile.facts);
+      if (
+        !facts.available ||
+        !profile.client ||
+        !profile.environment ||
+        !profile.locationHash ||
+        facts.id !== command.payload.profileId ||
+        !facts.creditPolicies.includes(command.payload.creditPolicy)
+      )
+        return {
+          outcome: 'blocked',
+          reason: 'native-profile-unavailable',
+          next: 'Use the supported installed client and native account location.',
+        };
+      const task = this.store.get<Task>('task', command.payload.taskId);
+      if (task?.state !== 'draft' || this.draftEditGate(task))
+        return { outcome: 'blocked', reason: 'task-not-preparable' };
+      const source = inspectSource(task.projectId, this.projectPath(task.projectId) as string);
+      const files = committedFiles(this.projectPath(task.projectId) as string, source.base);
+      const original = files.find((file) => file.path === command.payload.targetPath);
+      if (!original) throw Error('Target is unavailable.');
+      const policy = PolicySchema.parse(command.payload.policy);
+      const runId = this.id('run');
+      const project = this.store.get<Project>('project', task.projectId) as Project;
+      const writeGrant = this.grant(
+        { id: runId, taskId: task.id, policy: { policy, hash: hashCanonical(policy) } },
+        'write-scratch',
+        project.name,
+      );
+      if (!writeGrant) throw Error('The native proposal needs a live scratch grant.');
+      expiresAt = writeGrant.expiresAt;
+      const context = { title: task.title, outcome: task.outcome };
+      const scopeHash = hashCanonical({
+        profile: facts,
+        client: profile.client,
+        locationHash: profile.locationHash,
+        projectId: task.projectId,
+        source,
+        target: { path: original.path, hash: original.hash },
+        context,
+        criteria: task.criteria,
+        policy,
+        creditPolicy: command.payload.creditPolicy,
+      });
+      if (command.payload.consent === 'saved')
+        expiresAt = new Date(
+          Math.min(Date.parse(expiresAt), Date.parse(this.consentRecord(scopeHash).expiresAt)),
+        ).toISOString();
+      const savedRoute = this.nativeProfileRoute(profile, command.payload.creditPolicy);
+      const appointment = freezeNative(
+        NativeAppointmentSchema.parse({
+          id: command.key.replaceAll('_', '-'),
+          taskId: task.id,
+          route: savedRoute ?? {
+            id: this.id('rte'),
+            family: facts.family,
+            displayName: facts.displayName,
+            model: facts.model,
+            effort: { requested: facts.effort, effective: facts.effort, supported: [facts.effort] },
+            billing: command.payload.creditPolicy === 'ordinary' ? 'included' : 'credits',
+            qualified: false,
+            fake: false,
+          },
+          client: profile.client,
+          creditPolicy: command.payload.creditPolicy,
+          target: { path: original.path, baseHash: original.hash },
+          consent: {
+            nativeTrust: 'accepted',
+            source: command.payload.consent === 'explicit' ? 'explicit' : 'policy',
+            policyHash: hashCanonical(policy),
+            sourceBase: source.base,
+            criteriaHash: hashCanonical(task.criteria),
+          },
+          policy,
+          expiresAt,
+          maximumTaskMs: facts.maximumTaskMs,
+          maximumSubmissions: facts.maximumSubmissions,
+        }),
+      );
+      const publicScope = {
+        profileId: facts.id,
+        locationHash: profile.locationHash,
+        scopeHash,
+        context,
+      };
+      plan = this.planNativeAppointment(appointment, publicScope, runId);
+      if (this.store.receipt(`native-consent:${scopeHash}`)) this.consentRecord(scopeHash);
+    } catch {
+      return {
+        outcome: 'blocked',
+        reason: 'native-preparation-unavailable',
+        next: 'Review the target, native trust, source consent and policy bounds.',
+      };
+    }
+    const binding = this.saveNativePlan(plan);
+    const { scopeHash } = plan.public as z.infer<typeof NativePublicScopeSchema>;
+    const task = this.store.get<Task>('task', command.payload.taskId) as Task;
+    const publicScope = plan.public;
+    if (
+      command.payload.consent === 'explicit' &&
+      !this.store.receipt(`native-consent:${scopeHash}`)
+    ) {
+      const artifact = this.nativeArtifact({ scopeHash, expiresAt });
+      this.store.saveReceipt(`native-consent:${scopeHash}`, scopeHash, 'local-owner', {
+        outcome: 'applied',
+        entity: artifact,
+      });
+    }
+    this.store.saveReceipt(
+      `native-prepared:${binding.run.id}`,
+      hashCanonical(publicScope),
+      'local-owner',
+      { outcome: 'applied', entity: binding.planArtifact },
+    );
+    const updated = this.updateTask(this.store.get<Task>('task', task.id) as Task, {
+      next: 'Review the native file proposal and start. Checks and acceptance remain unavailable.',
+    });
+    this.event('run.prepared', task.id, updated.revision, binding.run);
+    return { outcome: 'applied', entity: binding.run, revision: updated.revision };
+  }
+
+  private preparedNativeBinding(run: Run): NativeBinding {
+    const receipt = this.store.receipt(`native-prepared:${run.id}`);
+    if (receipt?.result.outcome !== 'applied') throw Error('Native preparation is unavailable.');
+    const artifact = ArtifactSchema.parse(receipt.result.entity);
+    if (artifact.bytes > MAX_FRAME_BYTES) throw Error('Native preparation exceeds its bound.');
+    const plan = NativePreparationSchema.parse(
+      JSON.parse(this.artifacts.read(artifact.hash).toString('utf8')),
+    );
+    this.profile = this.options.nativeProfile?.() ?? unavailableNativeProfile();
+    const profile = this.profile;
+    if (
+      !profile.facts.available ||
+      profile.facts.id !== plan.public.profileId ||
+      !profile.facts.creditPolicies.includes(plan.appointment.creditPolicy) ||
+      this.nativeProfileRoute(profile, plan.appointment.creditPolicy)?.id !==
+        plan.appointment.route.id ||
+      profile.locationHash !== plan.public.locationHash ||
+      hashCanonical(profile.client) !== hashCanonical(plan.appointment.client) ||
+      !profile.environment
+    )
+      throw Error('Native profile changed.');
+    const task = this.store.get<Task>('task', run.taskId);
+    if (
+      !task ||
+      task.runId !== run.id ||
+      hashCanonical(run) !== hashCanonical(plan.run) ||
+      plan.attempt.runId !== run.id ||
+      plan.attempt.generation !== 0 ||
+      plan.appointment.taskId !== task.id ||
+      plan.appointment.consent.sourceBase !== run.source.base ||
+      plan.appointment.consent.policyHash !== run.policy.hash ||
+      Date.parse(plan.appointment.expiresAt) <= Date.parse(this.now())
+    )
+      throw Error('Native preparation changed.');
+    const files = committedFiles(this.projectPath(task.projectId) as string, run.source.base);
+    const manifest = files.map(({ content: _content, ...file }) => file);
+    if (hashCanonical(manifest) !== hashCanonical(plan.manifest))
+      throw Error('Native manifest changed.');
+    const original = files.find((file) => file.path === plan.appointment.target.path);
+    if (
+      !original ||
+      original.hash !== plan.originalHash ||
+      original.hash !== plan.appointment.target.baseHash
+    )
+      throw Error('Native target changed.');
+    const binding = freezeNative({
+      appointment: plan.appointment,
+      run,
+      attempt: plan.attempt,
+      original: original.content.toString('utf8'),
+      baseHash: original.hash,
+      manifest,
+      planArtifact: artifact,
+      public: plan.public,
+      environment: { ...profile.environment },
+    });
+    if (!this.nativeConsentCurrent(binding)) throw Error('Native consent changed.');
+    replacementPlan({
+      attemptId: binding.attempt.id,
+      model: plan.appointment.route.model as WriterPlan['model'],
+      effort: plan.appointment.route.effort.requested as WriterPlan['effort'],
+      directory: join(this.home, 'native', binding.attempt.id),
+      creditPolicy: plan.appointment.creditPolicy,
+      path: plan.appointment.target.path,
+      original: binding.original,
+      baseHash: binding.baseHash,
+      criteria: [plan.public.context.title, plan.public.context.outcome, ...task.criteria],
+    });
+    return binding;
+  }
+
+  private planNativeAppointment(
+    appointment: NativePilotAppointment,
+    publicScope?: z.infer<typeof NativePublicScopeSchema>,
+    runId = this.id('run'),
+  ): Omit<NativeBinding, 'planArtifact'> {
+    const task = this.store.get<Task>('task', appointment.taskId);
+    if (task?.state !== 'draft' || this.draftEditGate(task))
+      throw new Error('The appointment needs an unstarted draft.');
+    const route = appointment.route;
+    if (
+      route.fake ||
+      route.qualified ||
+      route.family !== 'openai' ||
+      route.billing !== (appointment.creditPolicy === 'ordinary' ? 'included' : 'credits') ||
+      route.speed ||
+      route.effort.requested !== route.effort.effective ||
+      !route.effort.supported.includes(route.effort.requested) ||
+      (this.store.get('route', route.id) &&
+        (!publicScope ||
+          this.nativeProfileRoute(this.profile, appointment.creditPolicy)?.id !== route.id))
+    )
+      throw new Error('The appointment route identity is invalid.');
+    if (
+      appointment.consent.policyHash !== hashCanonical(appointment.policy) ||
+      appointment.consent.criteriaHash !== hashCanonical(task.criteria) ||
+      Date.parse(appointment.expiresAt) <= Date.parse(this.now())
+    )
+      throw new Error('The appointment consent is stale.');
+    const source = inspectSource(task.projectId, this.projectPath(task.projectId) as string);
+    if (source.base !== appointment.consent.sourceBase)
+      throw new Error('The appointed source base changed.');
+    const files = committedFiles(this.projectPath(task.projectId) as string, source.base);
+    const original = files.find((file) => file.path === appointment.target.path);
+    if (!original || original.bytes > 65_536 || original.hash !== appointment.target.baseHash)
+      throw new Error('The appointed target is unavailable.');
+    const methods = appointment.policy.methods ?? [];
+    if (
+      !requiredReviewMethodIds(appointment.policy.quality).every((id) =>
+        methods.some((method) => method.id === id),
+      ) ||
+      appointment.policy.limits.attempts <
+        methods.reduce((sum, method) => sum + method.cycles, 0) + 2
+    )
+      throw new Error('The appointed policy lacks check and review headroom.');
+    const attemptId = this.id('att');
+    const run = RunSchema.parse({
+      id: runId,
+      taskId: task.id,
+      source,
+      policy: { policy: appointment.policy, hash: hashCanonical(appointment.policy) },
+      roles: [{ role: 'coder', routeId: route.id, pinned: true, approvedFallbacks: [] }],
+      decision: {
+        chosen: route.id,
+        rejected: [],
+        rule: 'manual',
+        inputsHash: hashCanonical(appointment),
+      },
+      revision: 0,
+    });
+    const attempt = AttemptSchema.parse({
+      id: attemptId,
+      runId: run.id,
+      routeId: route.id,
+      generation: 0,
+      state: 'intent',
+      revision: 0,
+    });
+    // Validate the exact model and payload through the provider's existing boundary.
+    replacementPlan({
+      attemptId,
+      model: route.model as WriterPlan['model'],
+      effort: route.effort.requested as WriterPlan['effort'],
+      creditPolicy: appointment.creditPolicy,
+      directory: join(this.home, 'native', attemptId),
+      path: appointment.target.path,
+      original: original.content.toString('utf8'),
+      baseHash: original.hash,
+      criteria: publicScope
+        ? [publicScope.context.title, publicScope.context.outcome, ...task.criteria]
+        : task.criteria,
+    });
+    this.nativeDecision(appointment, run, !!publicScope);
+    const project = this.store.get<Project>('project', task.projectId) as Project;
+    if (!this.grant(run, 'write-scratch', project.name))
+      throw new Error('The appointment needs a saved scratch grant.');
+    const manifest = files.map(({ content: _content, ...file }) => file);
+    const plan = freezeNative({
+      appointment,
+      run,
+      attempt,
+      manifest,
+      original: original.content.toString('utf8'),
+      baseHash: original.hash,
+      ...(publicScope ? { public: publicScope } : {}),
+    });
+    if (Buffer.byteLength(canonicalJson(this.nativePlanPayload(plan))) > MAX_FRAME_BYTES)
+      throw Error('Native plan exceeds its bound.');
+    return plan;
+  }
+
+  private nativePlanPayload(plan: Omit<NativeBinding, 'planArtifact'>) {
+    const { appointment, run, attempt, manifest } = plan;
+    return {
+      appointment,
+      run,
+      attempt,
+      manifest,
+      originalHash: plan.baseHash,
+      ...(plan.public ? { public: plan.public } : {}),
+    };
+  }
+
+  private saveNativePlan(plan: Omit<NativeBinding, 'planArtifact'>): NativeBinding {
+    const { appointment, run } = plan;
+    const task = this.store.get<Task>('task', appointment.taskId) as Task;
+    const planArtifact = this.nativeArtifact(this.nativePlanPayload(plan));
+    this.store.put('route', appointment.route.id, 0, appointment.route);
+    if (
+      plan.public &&
+      !this.store.receipt(
+        `native-profile-route:${plan.public.profileId}:${appointment.creditPolicy}`,
+      )
+    )
+      this.store.saveReceipt(
+        `native-profile-route:${plan.public.profileId}:${appointment.creditPolicy}`,
+        hashCanonical({
+          profileId: plan.public.profileId,
+          client: appointment.client,
+          route: appointment.route,
+        }),
+        'local-owner',
+        { outcome: 'applied', entity: planArtifact },
+      );
+    this.store.put('run', run.id, 0, run);
+    this.updateTask(task, { runId: run.id });
+    this.store.saveReceipt(`native-run:${run.id}`, hashCanonical(appointment), 'local-owner', {
+      outcome: 'applied',
+      entity: planArtifact,
+    });
+    return freezeNative({ ...plan, planArtifact });
+  }
+
   startNativePilot(input: NativePilotAppointment): CommandResult {
     const effects: (() => void)[] = [];
     try {
@@ -1066,108 +1569,16 @@ export class Controller {
           return prior.hash === hash
             ? { ...prior.result, outcome: 'already-applied' }
             : { outcome: 'denied', reason: 'native-appointment-changed' };
-        const task = this.store.get<Task>('task', appointment.taskId);
-        if (task?.state !== 'draft' || this.draftEditGate(task))
-          throw new Error('The appointment needs an unstarted draft.');
-        const route = appointment.route;
-        if (
-          route.fake ||
-          route.qualified ||
-          route.family !== 'openai' ||
-          route.billing !== (appointment.creditPolicy === 'ordinary' ? 'included' : 'credits') ||
-          route.speed ||
-          route.effort.requested !== route.effort.effective ||
-          !route.effort.supported.includes(route.effort.requested) ||
-          this.store.get('route', route.id)
-        )
-          throw new Error('The appointment route identity is invalid.');
-        if (
-          appointment.consent.policyHash !== hashCanonical(appointment.policy) ||
-          appointment.consent.criteriaHash !== hashCanonical(task.criteria) ||
-          Date.parse(appointment.expiresAt) <= Date.parse(this.now())
-        )
-          throw new Error('The appointment consent is stale.');
-        const source = inspectSource(task.projectId, this.projectPath(task.projectId) as string);
-        if (source.base !== appointment.consent.sourceBase)
-          throw new Error('The appointed source base changed.');
-        const files = committedFiles(this.projectPath(task.projectId) as string, source.base);
-        const original = files.find((file) => file.path === appointment.target.path);
-        if (!original || original.bytes > 65_536 || original.hash !== appointment.target.baseHash)
-          throw new Error('The appointed target is unavailable.');
-        const methods = appointment.policy.methods ?? [];
-        if (
-          !requiredReviewMethodIds(appointment.policy.quality).every((id) =>
-            methods.some((method) => method.id === id),
-          ) ||
-          appointment.policy.limits.attempts <
-            methods.reduce((sum, method) => sum + method.cycles, 0) + 2
-        )
-          throw new Error('The appointed policy lacks check and review headroom.');
-        const attemptId = this.id('att');
-        const run = RunSchema.parse({
-          id: this.id('run'),
-          taskId: task.id,
-          source,
-          policy: { policy: appointment.policy, hash: hashCanonical(appointment.policy) },
-          roles: [{ role: 'coder', routeId: route.id, pinned: true, approvedFallbacks: [] }],
-          decision: { chosen: route.id, rejected: [], rule: 'manual', inputsHash: hash },
-          revision: 0,
-        });
-        const attempt = AttemptSchema.parse({
-          id: attemptId,
-          runId: run.id,
-          routeId: route.id,
-          generation: 0,
-          state: 'intent',
-          revision: 0,
-        });
-        // Validate the exact model and payload through the provider's existing boundary.
-        replacementPlan({
-          attemptId,
-          model: route.model as WriterPlan['model'],
-          effort: route.effort.requested as WriterPlan['effort'],
-          creditPolicy: appointment.creditPolicy,
-          directory: join(this.home, 'native', attemptId),
-          path: appointment.target.path,
-          original: original.content.toString('utf8'),
-          baseHash: original.hash,
-          criteria: task.criteria,
-        });
-        this.nativeDecision(appointment, run);
-        const project = this.store.get<Project>('project', task.projectId) as Project;
-        if (!this.grant(run, 'write-scratch', project.name))
-          throw new Error('The appointment needs a saved scratch grant.');
-        const manifest = files.map(({ content: _content, ...file }) => file);
-        const planArtifact = this.nativeArtifact({
-          appointment,
-          run,
-          attempt,
-          manifest,
-          originalHash: original.hash,
-        });
-        const binding = freezeNative({
-          appointment,
-          run,
-          attempt,
-          manifest,
-          original: original.content.toString('utf8'),
-          baseHash: original.hash,
-          planArtifact,
-        });
-        this.store.put('route', route.id, 0, route);
-        this.store.put('run', run.id, 0, run);
-        this.updateTask(task, { runId: run.id });
-        this.store.saveReceipt(`native-run:${run.id}`, hash, 'local-owner', {
-          outcome: 'applied',
-          entity: planArtifact,
-        });
+        const binding = this.saveNativePlan(this.planNativeAppointment(appointment));
+        const { run, attempt } = binding;
+        const task = this.store.get<Task>('task', appointment.taskId) as Task;
         const result = this.start(
           {
             protocol: 1,
             key: this.id('cmd'),
             actor: { id: 'local-owner', kind: 'cli' },
             command: 'StartRun',
-            expectedRevision: task.revision + 1,
+            expectedRevision: task.revision,
             payload: { taskId: task.id, runId: run.id },
           },
           effects,
@@ -1191,7 +1602,11 @@ export class Controller {
     }
   }
 
-  private nativeDecision(appointment: NativePilotAppointment, run: Run): RouterDecision {
+  private nativeDecision(
+    appointment: NativePilotAppointment,
+    run: Run,
+    publicProfile = false,
+  ): RouterDecision {
     const policy = run.policy.policy;
     const allowance = policy.unknownUsage;
     const active = this.store.intents().filter((intent) => intent.state !== 'stopped');
@@ -1202,7 +1617,7 @@ export class Controller {
       allowance.allowance.launches < 1 ||
       allowance.allowance.minutes < policy.limits.minutes ||
       policy.limits.minutes * 60_000 < appointment.maximumTaskMs ||
-      active.some((intent) => intent.route_id === appointment.route.id) ||
+      (!publicProfile && active.some((intent) => intent.route_id === appointment.route.id)) ||
       Date.parse(appointment.expiresAt) <= Date.parse(this.now())
     )
       throw new Error('The appointed allowance or reserve premise is unavailable.');
@@ -1234,6 +1649,7 @@ export class Controller {
       .get(run.taskId);
     if (
       this.closed ||
+      (runtime.binding.public && !this.nativeConsentCurrent(runtime.binding)) ||
       runtime.stopped ||
       runtime.reason === 'stop' ||
       task?.runId !== run.id ||
@@ -1378,7 +1794,10 @@ export class Controller {
         path: appointment.target.path,
         original: binding.original,
         baseHash: binding.baseHash,
-        criteria: [...(this.store.get<Task>('task', run.taskId) as Task).criteria],
+        criteria: [
+          ...(binding.public ? [binding.public.context.title, binding.public.context.outcome] : []),
+          ...(this.store.get<Task>('task', run.taskId) as Task).criteria,
+        ],
       });
       const timeoutMs = Math.min(
         appointment.maximumTaskMs,
@@ -1390,7 +1809,7 @@ export class Controller {
           ...appointment.client,
           directory,
           repositoryRoot: this.home,
-          environment: process.env,
+          environment: binding.environment ?? process.env,
         },
         plan,
         {
@@ -1447,7 +1866,11 @@ export class Controller {
       .some((intent) => intent.task_id === taskId && intent.state !== 'stopped');
   }
 
-  private grant(run: Run, action: Grant['action'], target: string): Grant | undefined {
+  private grant(
+    run: Pick<Run, 'id' | 'taskId' | 'policy'>,
+    action: Grant['action'],
+    target: string,
+  ): Grant | undefined {
     return run.policy.policy.effects.find(
       (grant) =>
         grant.taskId === run.taskId &&
@@ -1945,6 +2368,10 @@ export class Controller {
     this.store.db
       .prepare('DELETE FROM receipts WHERE command_key=?')
       .run(`switch:${command.payload.runId}`);
+    if (this.store.receipt(`native-prepared:${command.payload.runId}`))
+      this.store.db
+        .prepare('DELETE FROM receipts WHERE command_key=?')
+        .run(`native-prepared:${command.payload.runId}`);
     const restore = this.closePendingEffects(task);
     const active = this.store
       .intents()

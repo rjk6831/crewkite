@@ -88,6 +88,7 @@ function RouteSwitch({
   const ids = coder ? [coder.routeId, ...coder.approvedFallbacks] : [];
   const choices = snapshot.routes.filter((route) => ids.includes(route.id));
   const [selected, setSelected] = useState('');
+  if (snapshot.nativeRuns.some((native) => native.runId === run.id)) return null;
   const target = selected || choices.find((route) => route.id !== run.decision.chosen)?.id || '';
   if (choices.length < 2) return null;
   return (
@@ -183,6 +184,7 @@ export function App() {
   const [about, setAbout] = useState(false);
   const task = snapshot?.tasks.find(({ id }) => id === selected) ?? snapshot?.tasks[0];
   const run = snapshot?.runs.find(({ id }) => id === task?.runId);
+  const nativeRun = snapshot?.nativeRuns.find((value) => value.runId === task?.runId);
   const approval = snapshot?.approvals.find(
     (value) => value.taskId === task?.id && value.status === 'pending',
   );
@@ -220,7 +222,10 @@ export function App() {
         })
         .catch(() => {});
   }
-  const stopAllowed = task?.runId && !['draft', 'ready', 'accepted', 'failed'].includes(task.state);
+  const stopAllowed =
+    task?.runId &&
+    (nativeRun?.stage === 'prepared' ||
+      !['draft', 'ready', 'accepted', 'failed'].includes(task.state));
   return (
     <div className="app-shell">
       <aside className="navigation" aria-label="Workspace navigation">
@@ -494,29 +499,33 @@ export function App() {
                             onClick={() => setLaunch(true)}
                             disabled={workspace.pending}
                           >
-                            Prepare run
+                            {nativeRun?.stage === 'prepared'
+                              ? 'Review prepared proposal'
+                              : 'Prepare run'}
                             <ArrowRight size={14} />
                           </button>
                         )}
-                        {task.runId && ['interrupted', 'stopped'].includes(task.state) && (
-                          <button
-                            type="button"
-                            className="button primary"
-                            disabled={workspace.pending}
-                            onClick={() =>
-                              void workspace
-                                .command({
-                                  command: 'ResumeRun',
-                                  expectedRevision: task.revision,
-                                  payload: { taskId: task.id, runId: task.runId as string },
-                                })
-                                .catch(() => {})
-                            }
-                          >
-                            Resume
-                            <ArrowRight size={14} />
-                          </button>
-                        )}
+                        {task.runId &&
+                          !nativeRun &&
+                          ['interrupted', 'stopped'].includes(task.state) && (
+                            <button
+                              type="button"
+                              className="button primary"
+                              disabled={workspace.pending}
+                              onClick={() =>
+                                void workspace
+                                  .command({
+                                    command: 'ResumeRun',
+                                    expectedRevision: task.revision,
+                                    payload: { taskId: task.id, runId: task.runId as string },
+                                  })
+                                  .catch(() => {})
+                              }
+                            >
+                              Resume
+                              <ArrowRight size={14} />
+                            </button>
+                          )}
                         <button
                           type="button"
                           className="button stop"
@@ -1029,6 +1038,8 @@ function Plan({
   snapshot: Snapshot;
   onPrepare: () => void;
 }) {
+  const native = snapshot.nativeRuns.find((value) => value.runId === run?.id);
+  const profile = snapshot.nativeProfiles.find((value) => value.id === native?.profileId);
   return (
     <div className="view-stack">
       <section className="card">
@@ -1049,19 +1060,48 @@ function Plan({
       {run ? (
         <>
           <SourceFacts source={run.source} />
-          <RouterCard run={run} routes={snapshot.routes} usage={snapshot.usage} />
-          <section className="card">
-            <h2>Run controls</h2>
-            <div className="facts-grid">
-              <Fact label="Authority" value={titleCase(run.policy.policy.authority)} />
-              <Fact label="Quality" value={titleCase(run.policy.policy.quality)} />
-              <Fact label="Attempt limit" value={run.policy.policy.limits.attempts} />
-              <Fact label="Time limit" value={`${run.policy.policy.limits.minutes} min`} />
-              <Fact label="Concurrency" value={run.policy.policy.limits.concurrency} />
-              <Fact label="Unknown usage" value={titleCase(run.policy.policy.unknownUsage.rule)} />
-            </div>
-            <p className="muted small">Policy {short(run.policy.hash)}</p>
-          </section>
+          {native ? (
+            <section className="card">
+              <h2>Native file proposal</h2>
+              <div className="facts-grid">
+                <Fact label="Target" value={native.target?.path ?? 'Unavailable'} />
+                <Fact label="Submissions per run" value={profile?.maximumSubmissions ?? 1} />
+                <Fact
+                  label="Time limit"
+                  value={`${(profile?.maximumTaskMs ?? 300000) / 60000} min`}
+                />
+              </div>
+              <p className="muted">
+                Checks, review, handoff and acceptance are unavailable. Retained changes can be
+                inspected and exported after the native process stops.
+              </p>
+              {native.stage === 'prepared' && (
+                <button type="button" className="button primary" onClick={onPrepare}>
+                  Review prepared proposal
+                  <ArrowRight size={14} />
+                </button>
+              )}
+            </section>
+          ) : (
+            <>
+              <RouterCard run={run} routes={snapshot.routes} usage={snapshot.usage} />
+              <section className="card">
+                <h2>Run controls</h2>
+                <div className="facts-grid">
+                  <Fact label="Authority" value={titleCase(run.policy.policy.authority)} />
+                  <Fact label="Quality" value={titleCase(run.policy.policy.quality)} />
+                  <Fact label="Attempt limit" value={run.policy.policy.limits.attempts} />
+                  <Fact label="Time limit" value={`${run.policy.policy.limits.minutes} min`} />
+                  <Fact label="Concurrency" value={run.policy.policy.limits.concurrency} />
+                  <Fact
+                    label="Unknown usage"
+                    value={titleCase(run.policy.policy.unknownUsage.rule)}
+                  />
+                </div>
+                <p className="muted small">Policy {short(run.policy.hash)}</p>
+              </section>
+            </>
+          )}
         </>
       ) : (
         <section className="card">
@@ -1370,6 +1410,50 @@ function Checks({
   const evidence = snapshot.evidence.filter(({ candidateId }) => candidateId === candidate?.id);
   const [destination, setDestination] = useState('refs/heads/feat/net-minor');
   const eligible = candidate && task.state === 'ready';
+  const native = snapshot.nativeRuns.some((value) => value.runId === task.runId);
+  if (native)
+    return (
+      <section className="card acceptance-card">
+        <div className="section-heading">
+          <h2>Native retained changes</h2>
+          <span>Inspection and export</span>
+        </div>
+        <p className="muted">
+          Checks, review and acceptance are unavailable for this proposal. Inspect its exact patch
+          in Changes before exporting.
+        </p>
+        <div className="button-row">
+          <button
+            type="button"
+            className="button secondary"
+            disabled={!candidate || workspace.pending}
+            onClick={() =>
+              candidate &&
+              void workspace
+                .command({
+                  command: 'ExportPatch',
+                  expectedRevision: task.revision,
+                  payload: { taskId: task.id, candidateId: candidate.id },
+                })
+                .catch(() => {})
+            }
+          >
+            <Download size={14} />
+            Export patch
+          </button>
+          <button
+            type="button"
+            className="button primary"
+            disabled
+            title="Acceptance is unavailable for native proposals"
+          >
+            <Check size={14} />
+            Accept candidate
+          </button>
+        </div>
+      </section>
+    );
+
   return (
     <div className="view-stack">
       <section className="card">
