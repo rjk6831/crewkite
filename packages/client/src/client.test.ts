@@ -46,6 +46,7 @@ const snapshot: Snapshot = {
   candidates: [],
   nativeProfiles: [],
   nativeRuns: [],
+  candidateEvaluations: [],
 };
 
 function rawFrame(value: unknown): Uint8Array {
@@ -176,6 +177,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     limits: { attempts: 4, minutes: 5, concurrency: 1 },
     reserves: [],
     unknownUsage: { rule: 'fixed-allowance', allowance: { launches: 1, minutes: 5 } },
+    methods: [{ id: 'keep-it-simple', cycles: 1, reviewerRole: 'reviewer' }],
   };
   const bytes = Buffer.from(`diff --git a/file.txt b/file.txt\n${'x'.repeat(70000)}`);
   const artifact = {
@@ -227,6 +229,47 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     consequence: 'Export the retained candidate.',
     status: 'pending' as const,
   };
+  const candidate = {
+    id: changes.candidateId,
+    taskId: task.id,
+    hash: 'e'.repeat(64),
+    artifactId: artifact.id,
+    revision: 0,
+  };
+  const evaluation: Snapshot['candidateEvaluations'][number] = {
+    taskId: task.id,
+    runId: run.id,
+    candidateId: candidate.id,
+    candidateHash: candidate.hash,
+    preparationId: artifact.id,
+    recipe: 'node-tests-v1',
+    definitionHash: 'f'.repeat(64),
+    target: { path: 'net.mjs', baseHash: 'b'.repeat(64), candidateContentHash: 'c'.repeat(64) },
+    reviewer: {
+      profileId: profile.id,
+      assignedRole: 'reviewer',
+      methodId: 'keep-it-simple',
+      cycle: 1,
+      independence: 'process-only',
+    },
+    creditPolicy: 'ordinary',
+    expiresAt: '2026-10-18T00:00:00.000Z',
+    remainingBudgets: { attempts: 2, minutes: 3, concurrency: 1 },
+    allowance: { source: 'supplemental-evaluation', localChecks: 1, nativeReviews: 1 },
+    stage: 'prepared',
+    check: null,
+    review: null,
+    checkStart: { available: true, reason: 'available' },
+    reviewStart: { available: false, reason: 'checks-required' },
+  };
+  const grants = ['run-check', 'run-review'].map((action) => ({
+    action,
+    target: action === 'run-check' ? 'node --test' : 'keep-it-simple/cycle-1',
+    taskId: task.id,
+    expiresAt: evaluation.expiresAt,
+    revoked: false,
+    usesRemaining: 1,
+  }));
   for (const scenario of [
     'show',
     'native-show',
@@ -242,8 +285,66 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     'existing',
     'uncertain',
     'approval',
+    'evaluation-show',
+    'evaluation-reviewed',
+    'evaluation-explicit',
+    'evaluation-saved',
+    'evaluation-partial-consent',
+    'evaluation-invalid-grants',
+    'start-checks',
+    'start-review',
   ]) {
+    const evaluating =
+      scenario.startsWith('evaluation-') || ['start-checks', 'start-review'].includes(scenario);
     const received: import('@crewkite/contracts').Command[] = [];
+    const preview: Snapshot['candidateEvaluations'][number] =
+      scenario === 'evaluation-reviewed'
+        ? {
+            ...evaluation,
+            stage: 'reviewed',
+            check: { artifactId: artifact.id, passed: true },
+            review: { artifactId: artifact.id, outcome: 'passed' },
+            checkStart: { available: false, reason: 'already-started' },
+            reviewStart: { available: false, reason: 'already-started' },
+          }
+        : evaluation;
+    const reviewEvidence: Snapshot['evidence'] =
+      scenario === 'evaluation-reviewed'
+        ? [
+            {
+              candidateId: candidate.id,
+              candidateHash: candidate.hash,
+              definitionHash: evaluation.definitionHash,
+              evaluator: 'native:openai:fixture',
+              artifactId: artifact.id,
+              passed: true,
+              review: {
+                job: {
+                  taskId: task.id,
+                  runId: run.id,
+                  attemptId: `att_${suffix}`,
+                  generation: 2,
+                  routeId: `rte_${suffix}`,
+                  writerAttemptId: `att_${suffix}`,
+                  writerRouteId: `rte_${suffix}`,
+                  candidateId: candidate.id,
+                  candidateHash: candidate.hash,
+                  methodId: 'keep-it-simple',
+                  cycle: 1,
+                  limitMinutes: 1,
+                  scripted: false,
+                  preparationId: artifact.id,
+                  profileId: profile.id,
+                  assignedRole: 'reviewer',
+                  independence: 'process-only',
+                },
+                outcome: 'passed',
+                findings: [{ severity: 'info', message: 'review finding\u001b[31m\rkept inert' }],
+                summary: 'Review completed.',
+              },
+            },
+          ]
+        : [];
     const fixture = await serve((message, socket) => {
       if (message.type === 'hello')
         socket.write(encodeFrame({ type: 'welcome', protocol: 1, cursor: snapshot.cursor }));
@@ -259,9 +360,21 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
             snapshot: {
               ...snapshot,
               tasks:
-                scenario === 'native-show' ? [{ ...task, runId: nativeRun.runId }] : snapshot.tasks,
-              runs: scenario === 'native-show' ? [run] : [],
-              nativeRuns: scenario === 'native-show' ? [nativeRun] : [],
+                scenario === 'native-show' || evaluating
+                  ? [
+                      {
+                        ...task,
+                        runId: nativeRun.runId,
+                        ...(evaluating ? { state: 'stopped' as const } : {}),
+                      },
+                    ]
+                  : snapshot.tasks,
+              runs: scenario === 'native-show' || evaluating ? [run] : [],
+              nativeRuns: scenario === 'native-show' || evaluating ? [nativeRun] : [],
+              candidates: evaluating ? [candidate] : [],
+              artifacts: evaluating ? [artifact] : [],
+              candidateEvaluations: evaluating ? [preview] : [],
+              evidence: reviewEvidence,
               approvals: scenario === 'approval' ? [approval] : [],
               nativeProfiles: [
                 {
@@ -303,6 +416,15 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     const policyFile = join(fixture.home, 'policy.json'),
       destination = join(fixture.home, 'saved.patch');
     writeFileSync(policyFile, JSON.stringify(policy));
+    const grantsFile = join(fixture.home, 'grants.json');
+    writeFileSync(
+      grantsFile,
+      JSON.stringify(
+        scenario === 'evaluation-invalid-grants'
+          ? [{ ...grants[0], unexpected: true }, grants[1]]
+          : grants,
+      ),
+    );
     if (scenario === 'existing') writeFileSync(destination, 'original');
     const execute = async (args: string[], json = true) => {
       const child = spawn(
@@ -347,7 +469,91 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         ...(scenario === 'saved' ? ['--existing-credits'] : []),
       ];
     if (scenario === 'changes') args = ['task', 'changes', task.id];
+    if (['evaluation-show', 'evaluation-reviewed'].includes(scenario))
+      args = ['task', 'show', task.id];
+    if (['start-checks', 'start-review'].includes(scenario)) args = ['task', scenario, task.id];
+    if (
+      evaluating &&
+      !['evaluation-show', 'evaluation-reviewed', 'start-checks', 'start-review'].includes(scenario)
+    )
+      args = [
+        'task',
+        'prepare-evaluation',
+        task.id,
+        profile.id,
+        '--grants',
+        grantsFile,
+        ...(scenario === 'evaluation-saved'
+          ? ['--existing-credits']
+          : scenario === 'evaluation-partial-consent'
+            ? ['--native-trust']
+            : ['--native-trust', '--source-consent']),
+      ];
     const result = await execute(args, scenario !== 'changes');
+    if (['evaluation-partial-consent', 'evaluation-invalid-grants'].includes(scenario)) {
+      assert.equal(result.code, 1, result.errors);
+      assert.equal(
+        received.some((command) => command.command === 'PrepareCandidateEvaluation'),
+        false,
+      );
+      continue;
+    }
+    if (['evaluation-show', 'evaluation-reviewed'].includes(scenario)) {
+      assert.equal(result.code, 0, result.errors);
+      assert.deepEqual(JSON.parse(result.output).evaluation, preview);
+      assert.deepEqual(JSON.parse(result.output).evidence, reviewEvidence);
+      const plain = await execute(args, false);
+      assert.equal(plain.code, 0, plain.errors);
+      for (const value of [
+        evaluation.preparationId,
+        evaluation.candidateHash,
+        evaluation.target.path,
+        evaluation.target.candidateContentHash,
+        'process-only',
+        'Remaining total attempts 2, minutes 3',
+        scenario === 'evaluation-reviewed' ? 'already-started' : 'checks-required',
+        'Acceptance is unavailable',
+      ])
+        assert(plain.output.includes(value), value);
+      if (scenario === 'evaluation-reviewed') {
+        assert(plain.output.includes('Review completed.'));
+        assert(plain.output.includes('review finding\\u001b[31m\\u000dkept inert'));
+        assert(!plain.output.includes('\u001b'));
+        assert(!plain.output.includes('\r'));
+      }
+      continue;
+    }
+    if (evaluating) {
+      assert.equal(result.code, 0, result.errors);
+      const receipt = JSON.parse(result.output);
+      const preparing = scenario.startsWith('evaluation-');
+      const command = preparing
+        ? 'PrepareCandidateEvaluation'
+        : scenario === 'start-checks'
+          ? 'StartCandidateEvaluation'
+          : 'StartCandidateReview';
+      assert.equal(receipt.command.command, command);
+      assert.equal(receipt.command.expectedRevision, task.revision);
+      assert.deepEqual(
+        receipt.command.payload,
+        preparing
+          ? {
+              taskId: task.id,
+              candidateId: candidate.id,
+              checkRecipeId: 'node-tests-v1',
+              reviewer: { profileId: profile.id, methodId: 'keep-it-simple', cycles: 1 },
+              creditPolicy: scenario === 'evaluation-saved' ? 'existing-credits' : 'ordinary',
+              consent: scenario === 'evaluation-saved' ? 'saved' : 'explicit',
+              grants,
+            }
+          : { taskId: task.id, candidateId: candidate.id, preparationId: artifact.id },
+      );
+      assert.deepEqual(
+        received.map((value) => value.command),
+        ['GetSnapshot', command],
+      );
+      continue;
+    }
     if (['unavailable', 'partial-consent'].includes(scenario)) {
       assert.equal(result.code, 1, scenario);
       assert.equal(

@@ -190,6 +190,47 @@ test('process boundaries reject unknown fields and invalid command identity', ()
   assert.ok(ReviewJobSchema.safeParse(job).success);
   const boundJob = { ...job, writerAttemptId: `att_${suffix}`, writerRouteId: job.routeId };
   assert.ok(ReviewJobSchema.safeParse(boundJob).success);
+  const nativeJob = {
+    ...boundJob,
+    scripted: false,
+    preparationId: `art_${suffix}`,
+    profileId: 'openai-file-v1',
+    assignedRole: 'reviewer',
+    independence: 'process-only',
+  };
+  assert.ok(ReviewJobSchema.safeParse(nativeJob).success);
+  for (const change of [
+    { independence: 'model-diversity' },
+    { writerAttemptId: undefined },
+    { preparationId: undefined },
+    { profileId: undefined },
+    { assignedRole: undefined },
+    { methodId: 'round-robin' },
+    { cycle: 2 },
+    { scripted: true },
+  ])
+    assert.equal(ReviewJobSchema.safeParse({ ...nativeJob, ...change }).success, false);
+  assert.equal(
+    FakeWorkerInputSchema.safeParse({
+      type: 'review',
+      job: nativeJob,
+      scratchPath: '/fixture/review',
+      criteria: ['Preserve source.'],
+    }).success,
+    false,
+  );
+  assert.ok(
+    CommandSchema.safeParse({
+      ...command,
+      command: 'StartCandidateReview',
+      payload: {
+        taskId: nativeJob.taskId,
+        candidateId: nativeJob.candidateId,
+        preparationId: nativeJob.preparationId,
+      },
+    }).success,
+  );
+
   assert.equal(
     ReviewJobSchema.safeParse({ ...job, writerAttemptId: `att_${suffix}` }).success,
     false,

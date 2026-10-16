@@ -7,7 +7,7 @@
 
 CrewKite is a desktop workspace and CLI for coding tasks that share one local controller. It tracks approvals, usage observations and retained work across provider routes.
 
-Status: early prototype for macOS on Apple Silicon. The supported demo uses a synthetic project and four scripted fake routes. An opt-in OpenAI single-file pilot has passed normal desktop launch, CLI export and same-home package reopen. General live routing remains unqualified.
+Status: early prototype for macOS on Apple Silicon. The supported demo uses a synthetic project and four scripted fake routes. One opt-in OpenAI single-file workflow has passed desktop and fresh package launch, retention and manual export. General live routing remains unqualified.
 
 ## Why I am building it
 
@@ -30,9 +30,9 @@ The scripted prototype exercises controller behavior. The bounded native single-
 - Shows fixture usage per route and window: remaining allowance, reset time, observation time and source. Missing data shows as unknown.
 - Prefers routes whose allowance resets soon, protects reserves you set, and never spends just to empty a gauge.
 - Records each task as durable facts and files, so a successor route continues from the work itself. A final summary from the stopped model is optional.
-- Works in scratch copies of your repository. The qualified scripted journey can accept a result as one new local branch. Native single-file work stays available for inspection and manual export, with checks, review and acceptance disabled. Your checkout, remotes and deployments stay untouched.
+- Works in scratch copies of your repository. The qualified scripted journey can accept a result as one new local branch. Native single-file work supports inspection and manual export, with separate check and review preparation for the sample project. Native acceptance stays disabled. Your checkout, remotes and deployments stay untouched.
 
-The qualified walkthrough uses the bundled synthetic project. Its real checks require the original test file and expected completions. Arbitrary repository checks remain unqualified. Review methods run as bounded jobs labeled SCRIPTED; their results establish fixture behavior and candidate binding. They do not establish model judgment.
+The qualified walkthrough uses the bundled synthetic project. Its real checks require the original test file and expected completions. Arbitrary repository checks remain unqualified. Scripted review results establish fixture behavior and candidate binding. The separate native review path supports one Keep it simple cycle with process independence only. Its live proof remains pending.
 
 ## Workspace
 
@@ -72,7 +72,7 @@ The controller is a headless Node process. It owns permissions, budgets, task ow
 | Milestone | Outcome | Status |
 |-----------|---------|--------|
 | D0 | Desktop and CLI run the full task journey against fake providers | Local demo verified |
-| D1a | One qualified official client does useful supervised work with manual export | Public launch and export verified |
+| D1a | One qualified official client does useful supervised work with manual export | Bounded workflow complete |
 | D1b | Checked results: immutable candidates, independent checks and review, local branch acceptance | In progress |
 | D2 | Local, OpenAI, Anthropic and Google routes with handoff, honest usage and two-slice parallel work | Planned |
 | D3 | Signed, documented distribution for a stated audience | Planned |
@@ -101,7 +101,7 @@ CREWKITE_HOME="$PWD/internal/demo-home" pnpm crewkite task watch <task-id> --jso
 
 Scripted observations intentionally become stale after five minutes. Before preparing a run after an idle period, you can explicitly choose Policy > Unknown usage > Allow selected routes within run limits. The displayed assigned routes use the shown finite limits. Stale labels, reserves and pins remain; percentage-based routing still requires fresh observations.
 
-For native work, create a project and draft task in the desktop. In Configure this run, choose Native file proposal. Enter the committed file path, review the consent and credit choices, then prepare and inspect the saved target before Start. The [single-file CLI setup](apps/cli/README.md#native-single-file-runs) covers the same preparation and launch through the CLI. Native trust and source consent are explicit or bound to an exact saved consent. Existing-credit spending defaults off. The result remains an unverified candidate that can be inspected and exported manually. The [provider notes](docs/providers.md) describe the fixed profile and billing limits.
+For native work, create a project and draft task in the desktop. In Configure this run, choose Native file proposal. Enter the committed file path, review the consent and credit choices, then prepare and inspect the saved target before Start. The [single-file CLI setup](apps/cli/README.md#native-single-file-runs) covers the same preparation and launch through the CLI. Native trust and source consent are explicit or bound to an exact saved consent. Existing-credit spending defaults off. Inspect the retained candidate and export it manually. The sample project can prepare separate checks and one explicit native review in Checks and review, with its own permissions and default-off credit choice. Acceptance stays disabled. The [provider notes](docs/providers.md) describe the fixed profile and billing limits.
 
 `pnpm verify` runs the test suite, including the real desktop and CLI recovery journey, plus policy, lint, types and the desktop build. [Testing](docs/testing.md) separates fixed synthetic evidence, native OS interaction and package checks. The [local directory package](docs/distribution.md) carries its own Node and Electron runtime; Git remains a prerequisite.
 

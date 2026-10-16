@@ -26,7 +26,9 @@ The controller runs as one headless Node process per user. The desktop app and t
 
 These measures keep other clients and workers off the control channel. They do not defend against malware running as the same user, and the docs make no such claim.
 
-Native writer preparation includes per-phase ownership hooks and a SQLite journal for preflight and task processes. The journal separates launch intent, the actual process group and proven quiescence. Recovery checks every recorded group; ambiguous ownership stays blocked, and no native phase restarts automatically. A supervised native file proposal uses `PrepareNativeRun` to save an immutable preview without provider I/O. `StartRun` rechecks its installed profile, scoped consent and source before entering the same admission and process owner. Each run permits one submission. Retained native work can be inspected and exported; resume, handoff, scripted evaluation and acceptance stay unavailable. A separate candidate evaluation freezes its own scoped consent and reviewer assignment without changing the original run policy. The first recipe can run the trusted synthetic Node collection in an independent copy through the existing local process owner. Passing checks retain evidence and wait for native review. Native review and acceptance remain unavailable.
+Native writer preparation includes per-phase ownership hooks and a SQLite journal for preflight and task processes. The journal separates launch intent, the actual process group and proven quiescence. Recovery checks every recorded group; ambiguous ownership stays blocked, and no native phase restarts automatically. A supervised native file proposal uses `PrepareNativeRun` to save an immutable preview without provider I/O. `StartRun` rechecks its installed profile, scoped consent and source before entering the same admission and process owner. Each prepared writer permits one submission. Retained native work can be inspected and exported; resume, handoff, scripted evaluation and acceptance stay unavailable.
+
+A separate candidate evaluation freezes its own scoped consent and reviewer assignment without changing the original run policy. The first recipe can run the trusted synthetic Node collection in an independent copy through the existing local process owner. Passing checks retain evidence and wait for explicit `StartCandidateReview`. That command consumes the supplemental one-use review grant for one fresh native review within the original run's remaining attempt, minute and concurrency caps. The writer's fixed allowance is unchanged. Review input binds the immutable original and candidate bytes, task context, exact successful checks and reviewer profile. Review uses the same three-phase ownership journal and retains evidence only after quiescence. Same-family review establishes process independence only. Acceptance remains unavailable.
 
 ## Commands and events
 
@@ -40,6 +42,8 @@ Results use a finite set of outcomes: `applied`, `already-applied`, `stale-revis
 
 Reads use snapshot plus subscription. `GetSnapshot` returns state at cursor C, and `Subscribe` replays ordered events after C. A gap in retained history forces a fresh snapshot. Slow clients are disconnected and resync; they never hold up work.
 
+The candidate evaluation preview binds the current candidate and saved preparation to its check and review evidence. It shows the remaining original run budget and separate reasons for refusing each start action. Completed evidence stays visible after consent expires. Reading the preview creates no receipt or launch, and each start command rechecks current authority.
+
 Team routing runs scripted routes. One separately supported native profile can propose a replacement for an existing committed text file through the desktop or CLI. Its exact provider limits are in [Provider routes](providers.md). `ExportDiagnostics` returns `unsupported`. General live routing and installer recovery remain separate gates. The table describes the first-release command contract.
 
 The command set for the first release:
@@ -50,6 +54,7 @@ The command set for the first release:
 | `CreateTask`, `AmendTask`, `PrepareRun` | Saved criteria, versioned amendments, a frozen preview of source, routes, checks and limits |
 | `PrepareNativeRun` | Freeze a controller-owned profile, one committed target, task text, explicit or matching saved consent and policy; perform no provider I/O |
 | `PrepareCandidateEvaluation`, `StartCandidateEvaluation` | Freeze supplemental authority for a stopped native candidate, then run its exact trusted Node recipe once; retain checks without starting review |
+| `StartCandidateReview` | Recheck the successful candidate evaluation and separate reviewer authority, then start one bounded native review without applying files or accepting the candidate |
 | `StartRun`, `GetSnapshot`, `Subscribe` | Atomic admission, consistent state with ordered events, no duplicate dispatch |
 | `SwitchRoute` | Save an allowed coder target, stop the outgoing writer, seal retained work and recheck normal admission |
 | `PauseAdmissions`, `StopRun` | Pausing stops new dispatch. Stopping requests cancellation and waits for proven quiescence |

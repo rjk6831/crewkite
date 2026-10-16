@@ -4,10 +4,12 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 import test from 'node:test';
+import { hashCanonical } from '@crewkite/contracts/hash';
 import { groupAbsent } from '../../host/worker.ts';
 import { startNativeTask } from './native-discovery.ts';
 import { ReplacementTranscript, replacementPlan, startReplacement } from './replacement.ts';
 import { configuration, fixture, replies, running, threadResult } from './replacement-fixture.ts';
+import { ReviewTranscript, reviewPlan, startReview } from './review.ts';
 
 const original = 'export function netMinor() { throw new Error(); }\n';
 const plan = (directory: string, path = 'net.mjs') =>
@@ -66,7 +68,7 @@ const edit = (directory: string, path = 'net.mjs') => ({
   baseHash: plan(directory, path).baseHash,
   content: 'export function netMinor(a, b) { return Math.max(0, a - b); }\n',
 });
-const output = (directory: string, mode = 'success', path = 'net.mjs') => {
+const output = (directory: string, mode = 'success', path = 'net.mjs', structured?: unknown) => {
   const value = edit(directory, path);
   if (mode === 'wrong-attempt') value.attemptId = 'att_01M51M322B2AEBXD9MA74CBCFN';
   if (mode === 'wrong-path') value.path = '../net.mjs';
@@ -79,7 +81,7 @@ const output = (directory: string, mode = 'success', path = 'net.mjs') => {
   const item = {
     type: 'agentMessage',
     id: 'message-1',
-    text: JSON.stringify(value),
+    text: JSON.stringify(structured ?? value),
     phase: 'final_answer',
   };
   const identity = {
@@ -144,7 +146,10 @@ const output = (directory: string, mode = 'success', path = 'net.mjs') => {
   return messages;
 };
 const bytes = (message: unknown) => Buffer.from(`${JSON.stringify(message)}\n`);
-function metadata(reader: ReplacementTranscript, overrides: Record<string, unknown> = {}) {
+function metadata(
+  reader: Pick<ReplacementTranscript, 'next' | 'push'>,
+  overrides: Record<string, unknown> = {},
+) {
   for (;;) {
     const request = reader.next();
     assert(request);
@@ -159,7 +164,7 @@ function metadata(reader: ReplacementTranscript, overrides: Record<string, unkno
   }
 }
 
-test('a replacement requires one matching completed turn and bounded original-file output', () => {
+test('native proposals and reviews require one matching completed turn and bounded output', () => {
   for (const mode of [
     'success',
     'fragmented',
@@ -538,6 +543,185 @@ test('a replacement requires one matching completed turn and bounded original-fi
     assert(!['thread/start', 'turn/start'].includes(blocked.pendingRequest));
     assert.equal(blocked.submitted, false);
   }
+  const candidate = 'export function netMinor(a, b) { return Math.max(0, a - b); }\n';
+  const reviewInput = {
+    ...plan(directory),
+    binding: {
+      preparationId: 'art_01M51M322B2AEBXD9MA74CBCFM',
+      scopeHash: '1'.repeat(64),
+      taskId: 'tsk_01M51M322B2AEBXD9MA74CBCFM',
+      runId: 'run_01M51M322B2AEBXD9MA74CBCFM',
+      attemptId: 'att_01M51M322B2AEBXD9MA74CBCFN',
+      generation: 1,
+      routeId: 'rte_01M51M322B2AEBXD9MA74CBCFN',
+      writerAttemptId: 'att_01M51M322B2AEBXD9MA74CBCFM',
+      writerRouteId: 'rte_01M51M322B2AEBXD9MA74CBCFM',
+      candidateId: 'cnd_01M51M322B2AEBXD9MA74CBCFM',
+      candidateHash: '2'.repeat(64),
+      profileId: 'openai-file-v1' as const,
+      assignedRole: 'reviewer' as const,
+      methodId: 'keep-it-simple' as const,
+      cycle: 1 as const,
+      limitMinutes: 3,
+      scripted: false as const,
+      independence: 'process-only' as const,
+    },
+    candidate,
+    candidateContentHash: createHash('sha256').update(candidate).digest('hex'),
+    context: {
+      title: 'Review one edit',
+      outcome: 'Report concrete findings',
+      criteria: ['Check the arithmetic.'],
+    },
+  };
+  const { attemptId: _writerAttempt, criteria: _writerCriteria, ...reviewData } = reviewInput;
+  for (const row of [
+    { mode: 'passed', allowed: true },
+    { mode: 'failed', allowed: true },
+    { mode: 'blocked', allowed: true },
+    { mode: 'fragmented', allowed: true },
+    { mode: 'external-mutation', allowed: true },
+    { mode: 'binding' },
+    { mode: 'method' },
+    { mode: 'cycle' },
+    { mode: 'blocking-pass' },
+    { mode: 'too-many' },
+    { mode: 'message-bytes' },
+    { mode: 'result-bytes' },
+    { mode: 'extra' },
+    { mode: 'wrong-thread' },
+    { mode: 'wrong-turn' },
+    { mode: 'approval' },
+    { mode: 'rerouted' },
+    { mode: 'partial' },
+  ]) {
+    const selected = reviewPlan(reviewData);
+    const expectedBinding = structuredClone(selected.binding);
+    const expectedHash = hashCanonical(expectedBinding);
+    const review = new ReviewTranscript(selected, { now: () => 1, timeoutMs: 180_000 });
+    if (row.mode === 'external-mutation') {
+      selected.binding.writerRouteId = selected.binding.routeId;
+      selected.context.criteria[0] = 'changed after construction';
+    }
+    const thread = metadata(review);
+    assert.equal(thread.params.ephemeral, true);
+    assert.equal(thread.params.threadId, undefined);
+    review.push(bytes({ id: 10, result: threadResult(directory) }));
+    const request = JSON.parse(Buffer.from(review.next() as Uint8Array).toString());
+    const task = JSON.parse(request.params.input[0].text.split('\n').slice(1).join('\n'));
+    assert.deepEqual(task.binding, expectedBinding);
+    assert.equal(task.original, original);
+    assert.equal(task.candidate, candidate);
+    assert.deepEqual(task.context.criteria, ['Check the arithmetic.']);
+    assert.equal(task.bindingHash, expectedHash);
+    assert.equal(request.params.outputSchema.properties.bindingHash.const, expectedHash);
+    assert.equal(request.params.outputSchema.properties.content, undefined);
+    review.push(bytes({ id: 11, result: { turn: running } }));
+    const response = {
+      version: 1,
+      bindingHash: row.mode === 'binding' ? '0'.repeat(64) : expectedHash,
+      methodId: row.mode === 'method' ? 'second-opinion' : 'keep-it-simple',
+      cycle: row.mode === 'cycle' ? 2 : 1,
+      outcome: ['failed', 'blocked'].includes(row.mode) ? row.mode : 'passed',
+      findings:
+        row.mode === 'blocking-pass'
+          ? [{ severity: 'blocking', message: 'A concrete defect.' }]
+          : Array.from(
+              { length: row.mode === 'too-many' ? 51 : row.mode === 'result-bytes' ? 20 : 1 },
+              () => ({
+                severity: 'info',
+                message:
+                  row.mode === 'message-bytes'
+                    ? 'é'.repeat(2049)
+                    : row.mode === 'result-bytes'
+                      ? 'x'.repeat(4096)
+                      : 'No extra layer is needed.',
+              }),
+            ),
+      summary: 'One bounded review.',
+      ...(row.mode === 'extra' ? { command: 'private-review-canary' } : {}),
+    };
+    const perform = () => {
+      for (const frame of output(
+        directory,
+        ['wrong-thread', 'wrong-turn', 'approval', 'rerouted'].includes(row.mode)
+          ? row.mode
+          : 'success',
+        'net.mjs',
+        response,
+      )) {
+        const chunk = bytes(frame);
+        if (row.mode === 'fragmented')
+          for (const byte of chunk) review.push(new Uint8Array([byte]));
+        else review.push(chunk);
+      }
+      if (row.mode === 'partial') review.push(Buffer.from('{'));
+      return review.finish();
+    };
+    if (row.allowed) {
+      const result = perform();
+      assert.deepEqual(result.review, response);
+      assert.equal(result.qualified, false);
+      assert.equal(review.next(), null);
+      assert.equal('replacement' in result, false);
+    } else {
+      assert.throws(perform, row.mode);
+      assert.equal(review.complete, false);
+      assert(!JSON.stringify(review.diagnostic).includes('private-review-canary'));
+    }
+  }
+  const hundredCriteria = {
+    ...reviewData,
+    context: { ...reviewData.context, criteria: Array.from({ length: 100 }, () => 'Check this.') },
+  };
+  for (const value of [
+    hundredCriteria,
+    {
+      ...reviewData,
+      context: {
+        ...reviewData.context,
+        criteria: Array.from({ length: 101 }, () => 'Check this.'),
+      },
+    },
+    { ...reviewData, baseHash: '0'.repeat(64) },
+    { ...reviewData, candidateContentHash: '0'.repeat(64) },
+    { ...reviewData, candidate: 'text\0tail' },
+    { ...reviewData, binding: { ...reviewData.binding, methodId: 'round-robin' } },
+    { ...reviewData, binding: { ...reviewData.binding, cycle: 2 } },
+    {
+      ...reviewData,
+      context: {
+        ...reviewData.context,
+        criteria: Array.from({ length: 32 }, () => 'x'.repeat(4096)),
+      },
+      original: 'x'.repeat(65536),
+      candidate: 'x'.repeat(65536),
+      baseHash: createHash('sha256').update('x'.repeat(65536)).digest('hex'),
+      candidateContentHash: createHash('sha256').update('x'.repeat(65536)).digest('hex'),
+    },
+  ]) {
+    if (value === hundredCriteria)
+      assert.deepEqual(
+        reviewPlan(hundredCriteria).context.criteria,
+        hundredCriteria.context.criteria,
+      );
+    else assert.throws(() => reviewPlan(value as Parameters<typeof reviewPlan>[0]));
+  }
+  const selectedReview = reviewPlan(reviewData);
+  assert.equal(selectedReview.creditPolicy, 'ordinary');
+  assert.throws(() =>
+    startReview(
+      {
+        executable: process.execPath,
+        sha256: '0'.repeat(64),
+        directory,
+        repositoryRoot: directory,
+        environment: {},
+      },
+      selectedReview,
+      { timeoutMs: 181_000, onSubmitted: () => assert.fail('over-budget review cannot submit') },
+    ),
+  );
   const reader = new ReplacementTranscript(plan(directory), { now: () => 1, timeoutMs: 300_000 });
   metadata(reader);
   reader.push(bytes({ id: 10, result: threadResult(directory) }));

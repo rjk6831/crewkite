@@ -34,6 +34,8 @@ const help = `Usage: crewkite task <list|show|watch|start|stop|resume|switch|app
        crewkite task switch <task-id> <route-id> [--json] [--home path]
        crewkite native profiles [--json] [--home path]
        crewkite task prepare-native <task-id> <profile-id> <path> --policy file [--native-trust --source-consent] [--existing-credits]
+       crewkite task prepare-evaluation <task-id> <profile-id> --grants file [--native-trust --source-consent] [--existing-credits]
+       crewkite task <start-checks|start-review> <task-id> [--json] [--home path]
        crewkite task changes <task-id> [--json] [--home path]
        crewkite task export <task-id> --output new-file [--json] [--home path]
        crewkite health [--json] [--home path]
@@ -46,6 +48,13 @@ interface Output {
   out: (text: string) => void;
   err: (text: string) => void;
 }
+
+const terminalText = (value: string) =>
+  value.replace(/\p{Cc}/gu, (character) =>
+    ['\n', '\t'].includes(character)
+      ? character
+      : `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`,
+  );
 
 export async function runCli(
   args: string[],
@@ -64,6 +73,7 @@ export async function runCli(
         home: { type: 'string' },
         help: { type: 'boolean', short: 'h' },
         policy: { type: 'string' },
+        grants: { type: 'string' },
         'native-trust': { type: 'boolean' },
         'source-consent': { type: 'boolean' },
         'existing-credits': { type: 'boolean' },
@@ -80,7 +90,8 @@ export async function runCli(
         !(
           area === 'task' &&
           ((action === 'switch' && extra.length === 1) ||
-            (action === 'prepare-native' && extra.length === 2))
+            (action === 'prepare-native' && extra.length === 2) ||
+            (action === 'prepare-evaluation' && extra.length === 1))
         )) ||
       !['task', 'native', 'health', 'retry'].includes(area)
     )
@@ -96,6 +107,9 @@ export async function runCli(
       'approve',
       'deny',
       'prepare-native',
+      'prepare-evaluation',
+      'start-checks',
+      'start-review',
       'changes',
       'export',
     ];
@@ -105,6 +119,7 @@ export async function runCli(
         !supported.includes(action) ||
         (action === 'switch' && extra.length !== 1) ||
         (action === 'prepare-native' && extra.length !== 2) ||
+        (action === 'prepare-evaluation' && extra.length !== 1) ||
         (action === 'list' ? id !== undefined : id === undefined))
     )
       throw new Error('Invalid task command. Use --help.');
@@ -115,20 +130,31 @@ export async function runCli(
     if (area === 'native' && (action !== 'profiles' || id !== undefined))
       throw new Error('Use native profiles to list supported profiles.');
     const preparing = area === 'task' && action === 'prepare-native';
+    const evaluating = area === 'task' && action === 'prepare-evaluation';
     if (
       !preparing &&
+      !evaluating &&
       (values.policy ||
         values['native-trust'] ||
         values['source-consent'] ||
         values['existing-credits'])
     )
-      throw new Error('Native policy and consent options require task prepare-native.');
+      throw new Error('Native consent options require native or evaluation preparation.');
+    if (values.policy && !preparing) throw new Error('Policy requires task prepare-native.');
+    if (values.grants && !evaluating) throw new Error('Grants require task prepare-evaluation.');
     if (
       preparing &&
       (!values.policy || Boolean(values['native-trust']) !== Boolean(values['source-consent']))
     )
       throw new Error(
         'Supply a policy file and both native consent flags, or neither consent flag for saved consent.',
+      );
+    if (
+      evaluating &&
+      (!values.grants || Boolean(values['native-trust']) !== Boolean(values['source-consent']))
+    )
+      throw new Error(
+        'Supply a grants file and both native consent flags, or neither consent flag for saved consent.',
       );
     if (
       values.output &&
@@ -330,6 +356,57 @@ export async function runCli(
     }
     if (!id) throw new Error('A task ID is required.');
     const task = requireTask(snapshot, id);
+    if (action === 'prepare-evaluation') {
+      const profile = snapshot.nativeProfiles.find((profile) => profile.id === extra[0]);
+      const run = snapshot.runs.find((run) => run.id === task.runId);
+      const candidate = snapshot.candidates.filter((value) => value.taskId === task.id).at(-1);
+      const methods = run?.policy.policy.methods ?? [];
+      if (
+        !profile?.available ||
+        !run ||
+        !candidate ||
+        task.state !== 'stopped' ||
+        !snapshot.nativeRuns.some((value) => value.runId === run.id)
+      )
+        throw new Error('A stopped native candidate and available reviewer profile are required.');
+      if (methods.length !== 1 || methods[0].id !== 'keep-it-simple' || methods[0].cycles !== 1)
+        throw new Error(
+          'Evaluation requires the saved single keep-it-simple method and one cycle.',
+        );
+      const creditPolicy = values['existing-credits'] ? 'existing-credits' : 'ordinary';
+      if (!profile.creditPolicies.includes(creditPolicy))
+        throw new Error('This reviewer profile does not support the selected credit policy.');
+      return await finishAction(
+        await request(
+          'PrepareCandidateEvaluation',
+          {
+            taskId: task.id,
+            candidateId: candidate.id,
+            checkRecipeId: 'node-tests-v1',
+            reviewer: { profileId: profile.id, methodId: methods[0].id, cycles: 1 },
+            creditPolicy,
+            consent: values['native-trust'] && values['source-consent'] ? 'explicit' : 'saved',
+            grants: readJson(values.grants as string),
+          },
+          task.revision,
+        ),
+      );
+    }
+    if (action === 'start-checks' || action === 'start-review') {
+      const evaluation = snapshot.candidateEvaluations.find((value) => value.taskId === task.id);
+      if (!evaluation) throw new Error('Prepare a candidate evaluation first.');
+      return await finishAction(
+        await request(
+          action === 'start-checks' ? 'StartCandidateEvaluation' : 'StartCandidateReview',
+          {
+            taskId: task.id,
+            candidateId: evaluation.candidateId,
+            preparationId: evaluation.preparationId,
+          },
+          task.revision,
+        ),
+      );
+    }
     if (action === 'prepare-native') {
       const profile = snapshot.nativeProfiles.find((profile) => profile.id === extra[0]);
       if (!profile?.available)
@@ -360,11 +437,7 @@ export async function runCli(
         print(
           changes,
           changes.data?.kind === 'changes'
-            ? changes.data.diff.replace(/\p{Cc}/gu, (value) =>
-                ['\n', '\t'].includes(value)
-                  ? value
-                  : `\\u${value.charCodeAt(0).toString(16).padStart(4, '0')}`,
-              )
+            ? terminalText(changes.data.diff)
             : (changes.reason ?? changes.outcome),
         );
         return succeeded(changes) ? 0 : 2;
@@ -389,9 +462,48 @@ export async function runCli(
       const preview = nativeRun
         ? `\nNative ${nativeRun.profileId}, ${nativeRun.stage}\nTarget ${nativeRun.target?.path ?? 'unknown'}\nBase hash ${nativeRun.target?.baseHash ?? 'unknown'}\nBytes ${nativeRun.target?.bytes ?? 'unknown'}\nExpires ${nativeRun.expiresAt ?? 'unknown'}\nSource base ${run?.source.base ?? 'unknown'}`
         : '';
+      const evaluation = snapshot.candidateEvaluations.find((value) => value.taskId === task.id);
+      const evidence = evaluation
+        ? snapshot.evidence.filter((value) => value.candidateId === evaluation.candidateId)
+        : [];
+      const evaluationText = evaluation
+        ? [
+            '',
+            `Evaluation ${evaluation.stage}`,
+            `Preparation ${evaluation.preparationId}`,
+            `Recipe ${evaluation.recipe}`,
+            `Candidate ${evaluation.candidateHash}`,
+            `Target ${evaluation.target.path}`,
+            `Original file hash ${evaluation.target.baseHash}`,
+            `Candidate content hash ${evaluation.target.candidateContentHash}`,
+            `Check definition ${evaluation.definitionHash}`,
+            `Reviewer ${evaluation.reviewer.profileId}, ${evaluation.reviewer.assignedRole}, ${evaluation.reviewer.methodId}, cycle ${evaluation.reviewer.cycle}, process-only`,
+            `Credits ${evaluation.creditPolicy}`,
+            `Expires ${evaluation.expiresAt}`,
+            `Remaining total attempts ${evaluation.remainingBudgets.attempts}, minutes ${evaluation.remainingBudgets.minutes}`,
+            `Checks ${evaluation.check?.passed ?? 'unrecorded'}, ${evaluation.checkStart.reason}, artifact ${evaluation.check?.artifactId ?? 'unrecorded'}`,
+            `Review ${evaluation.review?.outcome ?? 'unrecorded'}, ${evaluation.reviewStart.reason}, artifact ${evaluation.review?.artifactId ?? 'unrecorded'}`,
+            'Supplemental allowance: one local check and one additional native review. Acceptance is unavailable.',
+            ...evidence.flatMap((value) =>
+              value.review
+                ? [
+                    terminalText(value.review.summary),
+                    ...value.review.findings.map(
+                      (finding) => `${finding.severity}: ${terminalText(finding.message)}`,
+                    ),
+                  ]
+                : [],
+            ),
+          ].join('\n')
+        : '';
       print(
-        { cursor: snapshot.cursor, task, ...(nativeRun ? { nativeRun, run } : {}) },
-        `${task.id}\n${task.title}\n${task.state}, revision ${task.revision}${preview}`,
+        {
+          cursor: snapshot.cursor,
+          task,
+          ...(nativeRun ? { nativeRun, run } : {}),
+          ...(evaluation ? { evaluation, evidence } : {}),
+        },
+        `${task.id}\n${task.title}\n${task.state}, revision ${task.revision}${preview}${evaluationText}`,
       );
       return 0;
     }

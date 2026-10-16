@@ -20,6 +20,9 @@ Task commands use IDs returned by the controller:
 | `task deny <approval-id>` | Deny that binding |
 | `task changes <task-id>` | Read the retained candidate diff |
 | `task export <task-id> --output new.patch` | Request export and save verified patch bytes to a new file |
+| `task prepare-evaluation <task-id> <profile-id> --grants file` | Freeze separate check and reviewer authority for the current native candidate |
+| `task start-checks <task-id>` | Start the saved local check once |
+| `task start-review <task-id>` | Start the saved native review after matching checks pass |
 
 `--json` produces one JSON object for reads and actions. Watch emits one object per line, beginning with its task snapshot. A fresh snapshot replaces that state after a history gap. Ctrl+C stops watching.
 
@@ -80,7 +83,7 @@ Preparation spends no inference. Start rechecks controller admission and launche
 
 Existing-credit spending defaults off. Add `--existing-credits` only when choosing that policy explicitly. Available included usage does not establish a provider-enforced hard billing cap. Native trust and billing limits are described in [provider routes](../../docs/providers.md).
 
-The current native path retains an unverified single-file candidate. Stop waits for owned cleanup. Resume cannot submit another native turn for retained work. Scripted checks, review, handoff and acceptance remain unavailable for that candidate.
+The native path retains a single-file candidate. Stop waits for owned cleanup. Resume cannot submit another native writer turn for retained work. Checks and review require separate preparation and explicit starts. Handoff and acceptance remain unavailable.
 
 ```sh
 pnpm crewkite task changes <task-id>
@@ -88,6 +91,47 @@ pnpm crewkite task export <task-id> --output candidate.patch --json
 ```
 
 Export reads bounded artifact pages and verifies identity, offsets, length and checksum before creating the destination. Existing files are never overwritten. Plain diff output escapes terminal control characters. If export needs approval, its receipt contains the pending binding. Approve that export with `task approve <approval-id> --output new.patch`, or retry the saved export approval receipt with `--output new.patch` after inspecting its result.
+
+## Candidate checks and review
+
+The current trusted `node-tests-v1` recipe covers the synthetic `net.mjs` project. Other projects are blocked before execution. The saved run must select one `keep-it-simple` review cycle and retain enough of its original budget for a local check and a separate native review. Preparation does not lower the saved quality floor.
+
+Save a JSON array containing exactly two one-use grants. Replace the task ID and choose a future expiration:
+
+```json
+[
+  {
+    "action": "run-check",
+    "target": "node --test",
+    "taskId": "tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    "expiresAt": "2026-10-18T00:00:00.000Z",
+    "revoked": false,
+    "usesRemaining": 1
+  },
+  {
+    "action": "run-review",
+    "target": "keep-it-simple/cycle-1",
+    "taskId": "tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    "expiresAt": "2026-10-18T00:00:00.000Z",
+    "revoked": false,
+    "usesRemaining": 1
+  }
+]
+```
+
+Prepare consent for sending the original file, candidate and task text to a fresh reviewer process:
+
+```sh
+pnpm crewkite task prepare-evaluation <task-id> <profile-id> --grants evaluation-grants.json --native-trust --source-consent --json
+pnpm crewkite task show <task-id> --json
+pnpm crewkite task start-checks <task-id> --json
+pnpm crewkite task show <task-id> --json
+pnpm crewkite task start-review <task-id> --json
+```
+
+Preparation starts no work. Omitting both consent flags requests exact saved evaluation consent. Reviewer credit spending defaults off independently of the writer. Add `--existing-credits` during evaluation preparation only when choosing that policy explicitly.
+
+Task show reports the controller's evaluation stage, exact file and hashes, saved reviewer and process-only independence, expiry, current start availability and remaining total attempts and minutes. The supplemental allowance permits one local check and one additional native review beneath those original run limits. Completed evidence remains visible after start permission expires. A failed or blocked check cannot authorize review. Review results do not enable acceptance; inspection and export remain available.
 
 ## Uncertain actions
 
