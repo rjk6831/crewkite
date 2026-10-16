@@ -22,6 +22,63 @@ export const CandidateIdSchema = id('cnd');
 export const HandoffIdSchema = id('hnd');
 export const EventIdSchema = id('evt');
 export const CommandIdSchema = id('cmd');
+const RelativeSourcePathSchema = text.refine(
+  (path) =>
+    !path.startsWith('/') &&
+    !/^[a-z]:/i.test(path) &&
+    !path.includes('\\') &&
+    !path.includes('\0') &&
+    !path
+      .split('/')
+      .some((part) => !part || part === '.' || part === '..' || part.toLowerCase() === '.git'),
+  'Source detail needs a relative repository path.',
+);
+export const NativeTargetPathSchema = RelativeSourcePathSchema.refine(
+  (value) => value.isWellFormed() && !/\p{Cc}/u.test(value),
+  'A replacement needs a relative path without control characters.',
+);
+export const NativeProfileSchema = z.strictObject({
+  id: label,
+  family: z.literal('openai'),
+  displayName: label,
+  clientVersion: label,
+  model: label,
+  effort: z.literal('low'),
+  accountClass: z.literal('pro'),
+  serviceTier: z.literal('default'),
+  qualifiedAt: z.iso.date(),
+  creditPolicies: z
+    .array(z.enum(['ordinary', 'existing-credits']))
+    .min(1)
+    .max(2),
+  maximumTaskMs: z.literal(300000),
+  maximumFileBytes: z.literal(65536),
+  maximumSubmissions: z.literal(1),
+  available: z.boolean(),
+  reason: z.enum([
+    'available',
+    'not-configured',
+    'unsupported-platform',
+    'native-home-unavailable',
+    'configuration-location-unsupported',
+    'client-unavailable',
+    'client-build-mismatch',
+  ]),
+});
+export const NativeRunSchema = z.strictObject({
+  runId: RunIdSchema,
+  profileId: label,
+  stage: z.enum(['prepared', 'retain-only']),
+  expiresAt: TimestampSchema.optional(),
+  target: z
+    .strictObject({
+      path: NativeTargetPathSchema,
+      baseHash: HashSchema,
+      bytes: RevisionSchema.max(65536),
+    })
+    .optional(),
+});
+
 export const FamilySchema = z.enum(['openai', 'anthropic', 'google', 'local']);
 export const TaskStateSchema = z.enum([
   'draft',
@@ -448,6 +505,17 @@ export const CommandSchema = z.discriminatedUnion('command', [
       roles: z.array(RoleSchema).min(1).max(6),
     }),
   ),
+  mutate(
+    'PrepareNativeRun',
+    z.strictObject({
+      taskId: TaskIdSchema,
+      profileId: label,
+      targetPath: NativeTargetPathSchema,
+      policy: PolicySchema,
+      creditPolicy: z.enum(['ordinary', 'existing-credits']).default('ordinary'),
+      consent: z.enum(['explicit', 'saved']),
+    }),
+  ),
   mutate('StartRun', runRef),
   mutate('ResumeRun', runRef),
   mutate('PauseAdmissions', runRef),
@@ -538,21 +606,32 @@ export const CheckEventSchema = z.discriminatedUnion('type', [
 ]);
 export type CheckEvent = z.infer<typeof CheckEventSchema>;
 
-export const SnapshotSchema = z.strictObject({
-  protocol: z.literal(1),
-  cursor: CursorSchema,
-  projects: z.array(ProjectSchema).max(1000),
-  tasks: z.array(TaskSchema).max(10000),
-  runs: z.array(RunSchema).max(10000),
-  attempts: z.array(AttemptSchema).max(10000),
-  routes: z.array(RouteSchema).max(100),
-  artifacts: z.array(ArtifactSchema).max(10000),
-  evidence: z.array(CheckResultSchema).max(10000),
-  approvals: z.array(ApprovalSchema).max(1000),
-  usage: z.array(WindowSchema).max(1000),
-  candidates: z.array(CandidateSchema).max(1000),
-  reviewJobs: z.array(ReviewJobSchema).max(1000).optional(),
-});
+export const SnapshotSchema = z
+  .strictObject({
+    nativeProfiles: z.array(NativeProfileSchema).max(1).default([]),
+    nativeRuns: z.array(NativeRunSchema).max(10000).default([]),
+    protocol: z.literal(1),
+    cursor: CursorSchema,
+    projects: z.array(ProjectSchema).max(1000),
+    tasks: z.array(TaskSchema).max(10000),
+    runs: z.array(RunSchema).max(10000),
+    attempts: z.array(AttemptSchema).max(10000),
+    routes: z.array(RouteSchema).max(100),
+    artifacts: z.array(ArtifactSchema).max(10000),
+    evidence: z.array(CheckResultSchema).max(10000),
+    approvals: z.array(ApprovalSchema).max(1000),
+    usage: z.array(WindowSchema).max(1000),
+    candidates: z.array(CandidateSchema).max(1000),
+    reviewJobs: z.array(ReviewJobSchema).max(1000).optional(),
+  })
+  .superRefine((snapshot, ctx) => {
+    const seen = new Set<string>();
+    for (const native of snapshot.nativeRuns) {
+      if (seen.has(native.runId) || !snapshot.runs.some((run) => run.id === native.runId))
+        ctx.addIssue({ code: 'custom', message: 'Native run capability must name one saved run.' });
+      seen.add(native.runId);
+    }
+  });
 
 export const ChangeFileSchema = z.strictObject({
   path: text,
@@ -564,17 +643,7 @@ export const ChangeFileSchema = z.strictObject({
 });
 export const SourceFileDetailSchema = z
   .strictObject({
-    path: text.refine(
-      (path) =>
-        !path.startsWith('/') &&
-        !/^[a-z]:/i.test(path) &&
-        !path.includes('\\') &&
-        !path.includes('\0') &&
-        !path
-          .split('/')
-          .some((part) => !part || part === '.' || part === '..' || part.toLowerCase() === '.git'),
-      'Source detail needs a relative repository path.',
-    ),
+    path: RelativeSourcePathSchema,
     status: z.enum(['added', 'modified', 'deleted', 'type-changed', 'unmerged', 'untracked']),
     staged: z.boolean(),
     unstaged: z.boolean(),

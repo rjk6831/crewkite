@@ -177,6 +177,8 @@ export class DesktopController {
         cwd: this.paths.root,
         env: {
           PATH: process.env.PATH,
+          HOME: process.env.HOME,
+          CODEX_HOME: process.env.CODEX_HOME,
           LANG: 'en_US.UTF-8',
           CREWKITE_HOME: this.paths.home,
           CREWKITE_FIXTURE_IDENTITY:

@@ -1,6 +1,6 @@
 # Provider routes
 
-I qualify exact routes: a specific client build, account type, model, effort setting and billing mode. A logo or a model name in a menu is not support. The current D0 prototype runs scripted fakes for all four families. No live provider route is qualified.
+I qualify exact routes: a specific client build, account type, model, effort setting and billing mode. A logo or a model name in a menu is not support. Team routing runs scripted fakes for all four families. A separate supervised file-proposal path supports one exact OpenAI profile. General live routing remains unqualified.
 
 ## Qualification targets
 
@@ -33,9 +33,9 @@ The initial 16 October 2026 metadata check on the M5 Mac used client 1.4.0 and r
 
 The [official changelog](https://antigravity.google/docs/changelog?tab=cli) records permission fixes in 1.1.11 and headless mode fixes in 1.1.12. The former installed 1.1.10 build is refused. A version floor alone cannot qualify a later build.
 
-Four synthetic tasks were submitted on 16 October 2026. The first two stopped on step-output validation. The third stopped on init permission validation. The fourth used client 1.4.0 with `gemini-3.8-flash-low` at requested low effort and retained a bounded `net.mjs` proposal after 14.969 seconds. Its `always-proceed` mode matched explicit admission evidence. All four runs closed their streams and left no owned process group. No files were applied or route registered. Configuration metadata reported credit fallback disabled.
+Five synthetic tasks were submitted on 16 October 2026. The first two stopped on step-output validation. The third stopped on init permission validation. The fourth used client 1.4.0 with `gemini-3.8-flash-low` at requested low effort and retained a bounded `net.mjs` proposal after 14.969 seconds. Its `always-proceed` mode matched explicit admission evidence. After a native permission change, a fresh zero-turn configuration check reported `request-review` and credit fallback disabled. The fifth used the same client, model and requested effort, matched `request-review` admission and retained a bounded proposal after 8.165 seconds. All five runs closed their streams and left no owned process group. No files were applied or route registered.
 
-The adapter accepts all four native permission modes only when init matches controller-owned admission evidence. It changes no global setting and passes no permission bypass flag. This uses the native trust profile and establishes no tool containment or approval interception. Live evidence applies only to the mode exercised. Effective effort, request-level billing and the six native pilot checks remain unverified. Request-review, strict and proceed-in-sandbox qualification remain pending. No Google live route is qualified.
+The adapter accepts all four native permission modes only when init matches controller-owned admission evidence. It changes no global setting and passes no permission bypass flag. This uses the native trust profile and establishes no tool containment or approval interception. Live evidence covers `always-proceed` and `request-review`. Effective effort, request-level billing and the six native pilot checks remain unverified. Strict and proceed-in-sandbox qualification remain pending. No Google live route is qualified.
 
 ## OpenAI writer preparation
 
@@ -57,7 +57,11 @@ A live turn can include upstream retries and tool continuations. A turn cap does
 
 The source helper separately rechecks the full saved scratch manifest and the opened target before replacing one existing regular file. It refuses links, mismatched hashes and stale file metadata. It preserves permissions, truncates to the replacement length and syncs the file. A write failure can retain unverified scratch and requires explicit recovery.
 
-A private in-process controller appointment connects the OpenAI writer to this helper for one existing committed text file. It freezes the source base, relative path and original file hash alongside native trust, source consent, credit policy and an exact unqualified route. Process intent and ownership are journaled before input. The controller retains the proposal, waits for quiescence and rechecks authority before application. Inspection and patch export survive restart. Public launch, handoff and acceptance stay blocked for that pilot. Checks and review do not start automatically. Native cleanup finishes before SQLite closes. No live route is qualified.
+The desktop and CLI prepare one existing committed text file through `PrepareNativeRun`. The supported profile requires macOS on Apple silicon, the exact 0.163.0 client build, Pro account metadata, `gpt-6.1-sol` at low effort and the default tier. Local executable resolution checks the pinned digest without reading authentication files. Unsupported builds or native configuration locations are unavailable. The native home stays unchanged through desktop and headless startup.
+
+Preparation performs no provider I/O. The controller freezes source base, path, original hash and size, task title, outcome, criteria and policy. Native trust and source consent require an explicit choice or an unexpired controller receipt for that exact scope. Saved teams do not establish native consent. Existing-credit spending defaults off; opting in changes the frozen policy and does not establish a provider hard cap. Preparation expires with its required scratch-write permission. Start rechecks the saved scope, profile and client before its five-minute execution budget begins.
+
+`StartRun` uses the same admission, leases, reservations and owned processes as the retained-patch helper. Fresh account, model, configuration and billing checks occur inside that deadline. The controller retains the proposal, waits for quiescence and rechecks authority before applying one scratch replacement. Inspection and patch export survive restart. Each run permits one submission. Stop cancels an unstarted preparation or waits for active native cleanup. Native runs cannot resume, switch route, run scripted checks or review, hand off or accept a candidate. The original checkout stays unchanged. General live routing remains unqualified.
 
 ## Qualification
 
