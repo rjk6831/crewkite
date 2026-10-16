@@ -74,6 +74,30 @@ const OpenAiNativeProfileSchema = z.strictObject({
     'client-build-mismatch',
   ]),
 });
+export const NativeRepositoryExecutionSchema = z.strictObject({
+  sandbox: z.literal('workspace-write'),
+  approvalPolicy: z.literal('never'),
+  networkAccess: z.literal(false),
+});
+export const NativeRepositoryScopeSchema = z.strictObject({
+  sourceBase: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/),
+  manifestHash: HashSchema,
+  files: RevisionSchema.max(10000),
+  bytes: RevisionSchema.max(64 * 1024 * 1024),
+});
+export const NativeRepositoryProfileSchema = OpenAiNativeProfileSchema.omit({
+  id: true,
+  qualifiedAt: true,
+  maximumFileBytes: true,
+  reason: true,
+}).extend({
+  id: z.literal('openai-repository-v1'),
+  qualifiedAt: z.iso.date().nullable(),
+  maximumSourceFiles: z.literal(10000),
+  maximumSourceBytes: z.literal(67108864),
+  execution: NativeRepositoryExecutionSchema,
+  reason: z.enum([...OpenAiNativeProfileSchema.shape.reason.options, 'qualification-pending']),
+});
 export const NativeBillingAttestationSchema = z.strictObject({
   source: z.literal('user-attested'),
   subscriptionLoginConfirmed: z.literal(true),
@@ -119,26 +143,41 @@ export const GoogleNativeProfileSchema = AnthropicNativeProfileSchema.omit({
     z.literal('proceed-in-sandbox'),
   ]),
 });
-export const NativeProfileSchema = z.discriminatedUnion('family', [
-  OpenAiNativeProfileSchema,
+export const NativeProfileSchema = z.union([
+  OpenAiNativeProfileSchema.refine((profile) => profile.id !== 'openai-repository-v1'),
   AnthropicNativeProfileSchema,
   GoogleNativeProfileSchema,
+  NativeRepositoryProfileSchema,
 ]);
-export const NativeRunSchema = z.strictObject({
-  runId: RunIdSchema,
-  profileId: label,
-  billingAttestation: NativeBillingAttestationSchema.optional(),
-  permissionMode: GoogleNativePermissionModeSchema.optional(),
-  stage: z.enum(['prepared', 'retain-only']),
-  expiresAt: TimestampSchema.optional(),
-  target: z
-    .strictObject({
-      path: NativeTargetPathSchema,
-      baseHash: HashSchema,
-      bytes: RevisionSchema.max(65536),
-    })
-    .optional(),
-});
+export const NativeRunSchema = z
+  .strictObject({
+    runId: RunIdSchema,
+    profileId: label,
+    billingAttestation: NativeBillingAttestationSchema.optional(),
+    permissionMode: GoogleNativePermissionModeSchema.optional(),
+    stage: z.enum(['prepared', 'retain-only']),
+    expiresAt: TimestampSchema.optional(),
+    repository: NativeRepositoryScopeSchema.optional(),
+    execution: NativeRepositoryExecutionSchema.optional(),
+    target: z
+      .strictObject({
+        path: NativeTargetPathSchema,
+        baseHash: HashSchema,
+        bytes: RevisionSchema.max(65536),
+      })
+      .optional(),
+  })
+  .refine(
+    (run) =>
+      run.profileId === 'openai-repository-v1'
+        ? !!run.repository &&
+          !!run.execution &&
+          !run.target &&
+          !run.billingAttestation &&
+          !run.permissionMode
+        : !run.repository && !run.execution,
+    'A repository run needs its complete source scope and native execution profile.',
+  );
 
 export const FamilySchema = z.enum(['openai', 'anthropic', 'google', 'local']);
 export const TaskStateSchema = z.enum([
@@ -251,6 +290,7 @@ export const EffectSchema = z.strictObject({
   action: z.enum([
     'read-source',
     'write-scratch',
+    'run-native-tools',
     'run-check',
     'run-review',
     'accept-candidate',
@@ -567,6 +607,25 @@ const evaluationFields = {
   consent: z.enum(['explicit', 'saved']),
   grants: z.array(GrantSchema).length(2),
 };
+const nativePreparationFields = {
+  taskId: TaskIdSchema,
+  policy: PolicySchema,
+  creditPolicy: z.enum(['ordinary', 'existing-credits']).default('ordinary'),
+  consent: z.enum(['explicit', 'saved']),
+};
+export const NativePreparationPayloadSchema = z.union([
+  z.strictObject({
+    ...nativePreparationFields,
+    profileId: label.refine((id) => id !== 'openai-repository-v1'),
+    billingAttestation: NativeBillingAttestationSchema.optional(),
+    permissionMode: GoogleNativePermissionModeSchema.optional(),
+    targetPath: NativeTargetPathSchema,
+  }),
+  z.strictObject({
+    ...nativePreparationFields,
+    profileId: z.literal('openai-repository-v1'),
+  }),
+]);
 export const CommandSchema = z.discriminatedUnion('command', [
   mutate('RegisterProject', z.strictObject({ path: text })),
   read('InspectSource', z.strictObject({ projectId: ProjectIdSchema })),
@@ -596,19 +655,7 @@ export const CommandSchema = z.discriminatedUnion('command', [
       roles: z.array(RoleSchema).min(1).max(6),
     }),
   ),
-  mutate(
-    'PrepareNativeRun',
-    z.strictObject({
-      taskId: TaskIdSchema,
-      profileId: label,
-      billingAttestation: NativeBillingAttestationSchema.optional(),
-      permissionMode: GoogleNativePermissionModeSchema.optional(),
-      targetPath: NativeTargetPathSchema,
-      policy: PolicySchema,
-      creditPolicy: z.enum(['ordinary', 'existing-credits']).default('ordinary'),
-      consent: z.enum(['explicit', 'saved']),
-    }),
-  ),
+  mutate('PrepareNativeRun', NativePreparationPayloadSchema),
   mutate(
     'PrepareCandidateEvaluation',
     z.discriminatedUnion('checkRecipeId', [
@@ -839,7 +886,7 @@ export const SnapshotSchema = z
   .strictObject({
     nativeProfiles: z
       .array(NativeProfileSchema)
-      .max(3)
+      .max(4)
       .refine((profiles) => new Set(profiles.map((profile) => profile.id)).size === profiles.length)
       .default([]),
     nativeRuns: z.array(NativeRunSchema).max(10000).default([]),
