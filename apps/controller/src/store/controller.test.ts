@@ -504,6 +504,19 @@ test('a committed launch intent survives restart without another launch', async 
       /Native fixture stopped/,
     );
     const intent = fixture.controller.store.intents()[0];
+    const nativeRoute = fixture.fixtures.snapshot.routes.find(
+      (route) => route.id === intent.route_id,
+    );
+    assert(nativeRoute);
+    fixture.controller.store.transaction(() =>
+      fixture.controller.store.put('route', nativeRoute.id, 0, {
+        ...nativeRoute,
+        family: 'openai',
+        fake: false,
+        qualified: false,
+      }),
+    );
+
     const processes: Array<{ child: ReturnType<typeof spawn>; closed: Promise<void> }> = [];
     t.after(async () => {
       for (const process of processes) process.child.stdin?.end();
