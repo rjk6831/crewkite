@@ -2416,6 +2416,24 @@ test('an appointed native proposal is retained and applied once after every phas
     assert.equal(controller.snapshot().attempts.length, 1);
     assert.equal(controller.snapshot().evidence.length, 0);
     assert.deepEqual(controller.snapshot().runs.at(-1), originalRun);
+    const preview = controller.snapshot().candidateEvaluations[0];
+    assert.equal(preview?.preparationId, artifact.id);
+    assert.equal(preview.stage, 'prepared');
+    assert.deepEqual(preview.checkStart, { available: true, reason: 'available' });
+    assert.deepEqual(preview.reviewStart, { available: false, reason: 'checks-required' });
+    assert.equal(preview.creditPolicy, 'ordinary');
+    assert.equal(preview.reviewer.independence, 'process-only');
+    assert.equal(preview.target.baseHash, appointment.target.baseHash);
+    assert.notEqual(preview.target.candidateContentHash, preview.candidateHash);
+    const readState = () => ({
+      cursor: controller.store.cursor(),
+      receipts: controller.store.db.prepare('SELECT COUNT(*) AS count FROM receipts').get()?.count,
+      artifacts: controller.store.list('artifact').length,
+      intents: controller.store.intents().length,
+    });
+    const beforeRead = readState();
+    assert.deepEqual(controller.snapshot().candidateEvaluations[0], preview);
+    assert.deepEqual(readState(), beforeRead);
     const startPayload = () => ({
       taskId: task.id,
       candidateId: candidate.id,
@@ -2531,6 +2549,21 @@ test('an appointed native proposal is retained and applied once after every phas
     }
     assert.deepEqual(snapshot.runs.at(-1), originalRun);
     assert.notEqual(snapshot.tasks[0].state, 'ready');
+    const evaluationPreview = snapshot.candidateEvaluations[0];
+    assert(evaluationPreview);
+    assert.equal(evaluationPreview.checkStart.available, false);
+    assert.equal(
+      evaluationPreview.stage,
+      scenario.endsWith('intent')
+        ? 'blocked'
+        : scenario === 'failed'
+          ? 'check-failed'
+          : 'awaiting-review',
+    );
+    assert.equal(
+      evaluationPreview.reviewStart.available,
+      !scenario.endsWith('intent') && scenario !== 'failed',
+    );
     const reviewPayload = startPayload();
     const shouldReview = scenario === 'checked' || scenario.startsWith('review-');
     if (!shouldReview) {
@@ -2584,6 +2617,17 @@ test('an appointed native proposal is retained and applied once after every phas
           if (boundary === 'changed-profile')
             context.fixtureProfile.facts.creditPolicies = ['existing-credits'];
           const before = controller.snapshot();
+          assert.equal(before.candidateEvaluations[0]?.reviewStart.available, false);
+          assert.equal(
+            before.candidateEvaluations[0]?.reviewStart.reason,
+            boundary === 'used-grant'
+              ? 'grant-unavailable'
+              : boundary === 'revoked-consent'
+                ? 'consent-unavailable'
+                : boundary === 'changed-profile'
+                  ? 'profile-unavailable'
+                  : 'checks-required',
+          );
           assert.equal(
             (
               await controller.execute(
@@ -2729,6 +2773,33 @@ test('an appointed native proposal is retained and applied once after every phas
           ),
       );
       assert.notEqual(result.tasks[0].state, 'ready');
+      const retainedPreview = result.candidateEvaluations[0];
+      assert(retainedPreview);
+      assert.equal(
+        retainedPreview.stage,
+        scenario === 'review-journal-read' ? 'blocked' : 'reviewed',
+      );
+      assert.equal(retainedPreview.reviewStart.available, false);
+      assert.equal(
+        retainedPreview.review?.outcome,
+        scenario === 'review-journal-read'
+          ? undefined
+          : scenario === 'checked'
+            ? 'passed'
+            : 'blocked',
+      );
+      assert.equal(
+        retainedPreview.remainingBudgets.attempts,
+        appointment.policy.limits.attempts - 3,
+      );
+      if (scenario === 'checked') {
+        clock.advance(86400001);
+        const expiredPreview = controller.snapshot().candidateEvaluations[0];
+        assert.equal(expiredPreview?.stage, 'reviewed');
+        assert.deepEqual(expiredPreview.check, retainedPreview.check);
+        assert.deepEqual(expiredPreview.review, retainedPreview.review);
+        assert.equal(expiredPreview.reviewStart.available, false);
+      }
       assert.equal(
         (
           await controller.execute(

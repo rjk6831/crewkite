@@ -656,10 +656,81 @@ export const CheckEventSchema = z.discriminatedUnion('type', [
 ]);
 export type CheckEvent = z.infer<typeof CheckEventSchema>;
 
+export const CandidateEvaluationStartReasonSchema = z.enum([
+  'available',
+  'already-started',
+  'checks-required',
+  'checks-failed',
+  'expired',
+  'paused',
+  'ownership-unknown',
+  'not-stopped',
+  'preparation-changed',
+  'consent-unavailable',
+  'profile-unavailable',
+  'grant-unavailable',
+  'budget-exhausted',
+]);
+const candidateEvaluationStart = z
+  .strictObject({
+    available: z.boolean(),
+    reason: CandidateEvaluationStartReasonSchema,
+  })
+  .refine((value) => value.available === (value.reason === 'available'));
+export const CandidateEvaluationPreviewSchema = z.strictObject({
+  taskId: TaskIdSchema,
+  runId: RunIdSchema,
+  candidateId: CandidateIdSchema,
+  candidateHash: HashSchema,
+  preparationId: ArtifactIdSchema,
+  recipe: z.literal('node-tests-v1'),
+  definitionHash: HashSchema,
+  target: z.strictObject({
+    path: NativeTargetPathSchema,
+    baseHash: HashSchema,
+    candidateContentHash: HashSchema,
+  }),
+  reviewer: z.strictObject({
+    profileId: label,
+    assignedRole: ReviewMethodSchema.shape.reviewerRole,
+    methodId: ReviewMethodIdSchema,
+    cycle: z.literal(1),
+    independence: z.literal('process-only'),
+  }),
+  creditPolicy: z.enum(['ordinary', 'existing-credits']),
+  expiresAt: TimestampSchema,
+  remainingBudgets: RemainingBudgetsSchema,
+  allowance: z.strictObject({
+    source: z.literal('supplemental-evaluation'),
+    localChecks: z.literal(1),
+    nativeReviews: z.literal(1),
+  }),
+  stage: z.enum([
+    'prepared',
+    'checking',
+    'check-failed',
+    'awaiting-review',
+    'reviewing',
+    'reviewed',
+    'blocked',
+  ]),
+  check: z.strictObject({ artifactId: ArtifactIdSchema, passed: z.boolean() }).nullable(),
+  review: z
+    .strictObject({
+      artifactId: ArtifactIdSchema,
+      outcome: z.enum(['passed', 'failed', 'blocked']),
+    })
+    .nullable(),
+  checkStart: candidateEvaluationStart,
+  reviewStart: candidateEvaluationStart,
+});
+export type CandidateEvaluationPreview = z.infer<typeof CandidateEvaluationPreviewSchema>;
+
 export const SnapshotSchema = z
   .strictObject({
     nativeProfiles: z.array(NativeProfileSchema).max(1).default([]),
     nativeRuns: z.array(NativeRunSchema).max(10000).default([]),
+    candidateEvaluations: z.array(CandidateEvaluationPreviewSchema).max(10000).default([]),
     protocol: z.literal(1),
     cursor: CursorSchema,
     projects: z.array(ProjectSchema).max(1000),
@@ -680,6 +751,28 @@ export const SnapshotSchema = z
       if (seen.has(native.runId) || !snapshot.runs.some((run) => run.id === native.runId))
         ctx.addIssue({ code: 'custom', message: 'Native run capability must name one saved run.' });
       seen.add(native.runId);
+    }
+    const evaluated = new Set<string>();
+    for (const evaluation of snapshot.candidateEvaluations) {
+      const task = snapshot.tasks.find((value) => value.id === evaluation.taskId);
+      const candidate = snapshot.candidates.find((value) => value.id === evaluation.candidateId);
+      if (
+        evaluated.has(evaluation.taskId) ||
+        !task ||
+        !candidate ||
+        task.runId !== evaluation.runId ||
+        !snapshot.runs.some((run) => run.id === evaluation.runId && run.taskId === task.id) ||
+        candidate?.taskId !== task.id ||
+        candidate.hash !== evaluation.candidateHash ||
+        ![evaluation.preparationId, evaluation.check?.artifactId, evaluation.review?.artifactId]
+          .filter(Boolean)
+          .every((id) => snapshot.artifacts.some((artifact) => artifact.id === id))
+      )
+        ctx.addIssue({
+          code: 'custom',
+          message: 'Evaluation preview must bind one current saved candidate.',
+        });
+      evaluated.add(evaluation.taskId);
     }
   });
 

@@ -42,6 +42,8 @@ Results use a finite set of outcomes: `applied`, `already-applied`, `stale-revis
 
 Reads use snapshot plus subscription. `GetSnapshot` returns state at cursor C, and `Subscribe` replays ordered events after C. A gap in retained history forces a fresh snapshot. Slow clients are disconnected and resync; they never hold up work.
 
+The candidate evaluation preview binds the current candidate and saved preparation to its check and review evidence. It shows the remaining original run budget and separate reasons for refusing each start action. Completed evidence stays visible after consent expires. Reading the preview creates no receipt or launch, and each start command rechecks current authority.
+
 Team routing runs scripted routes. One separately supported native profile can propose a replacement for an existing committed text file through the desktop or CLI. Its exact provider limits are in [Provider routes](providers.md). `ExportDiagnostics` returns `unsupported`. General live routing and installer recovery remain separate gates. The table describes the first-release command contract.
 
 The command set for the first release:

@@ -46,6 +46,7 @@ const snapshot: Snapshot = {
   candidates: [],
   nativeProfiles: [],
   nativeRuns: [],
+  candidateEvaluations: [],
 };
 
 function rawFrame(value: unknown): Uint8Array {
