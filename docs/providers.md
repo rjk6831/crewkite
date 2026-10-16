@@ -8,10 +8,12 @@ I qualify exact routes: a specific client build, account type, model, effort set
 |--------|------------------------|--------------------------|
 | OpenAI | Codex app-server with native login | Protocol behavior, approvals, tool boundary, billing once included usage runs out |
 | Anthropic | Claude Code structured output stream | Subscription-preserving configuration, permission modes |
-| Google | Gemini CLI in ACP mode with a Google account | Approval and cancel behavior, which billing path applies |
+| Google | Antigravity CLI, pending successor-client research | Supported integration interface, subscription billing, approvals and cancellation |
 | Local | An authenticated loopback runtime such as LM Studio | Locality, memory use, a useful role, cancellation |
 
 These are planned pilots. A fake family label does not establish a client's capabilities, authentication or billing behavior. The Local fixture loads no model.
+
+Google [ended consumer sign-in for Gemini CLI on June 18, 2026](https://developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals), including Google AI Pro and Ultra. That consumer subscription path is unavailable. Google's [migration guide points to Antigravity CLI](https://www.antigravity.google/docs/cli/gcli-migration). Its integration remains under research; CrewKite has no qualified successor route.
 
 ## OpenAI discovery preparation
 
