@@ -34,7 +34,7 @@ import {
 const help = `Usage: crewkite task <list|show|watch|start|stop|resume|switch|approve|deny> [id] [--json] [--home path]
        crewkite task switch <task-id> <route-id> [--json] [--home path]
        crewkite native profiles [--json] [--home path]
-       crewkite task prepare-native <task-id> <profile-id> <path> --policy file [--native-trust --source-consent] [--existing-credits]
+       crewkite task prepare-native <task-id> <profile-id> <path> --policy file [--native-trust --source-consent] [--existing-credits] [--confirm-subscription-only]
        crewkite task prepare-evaluation <task-id> <profile-id> --grants file [--recipe node-tests-v1|project-node-tests-v1] [--test-file path ...] [--native-trust --source-consent] [--existing-credits]
        crewkite task <start-checks|start-review> <task-id> [--json] [--home path]
        crewkite task accept <task-id> <destination-ref> [--json] [--home path]
@@ -45,6 +45,7 @@ const help = `Usage: crewkite task <list|show|watch|start|stop|resume|switch|app
 
 Approval commands take an approval ID. Other task commands take a task ID.
 Create tasks in the desktop. Native preparation uses explicit consent or the controller's exact saved consent.
+For an Anthropic writer, --confirm-subscription-only confirms subscription login and disabled paid extra usage.
 `;
 interface Output {
   out: (text: string) => void;
@@ -81,6 +82,7 @@ export async function runCli(
         'native-trust': { type: 'boolean' },
         'source-consent': { type: 'boolean' },
         'existing-credits': { type: 'boolean' },
+        'confirm-subscription-only': { type: 'boolean' },
         output: { type: 'string' },
       },
     });
@@ -136,6 +138,8 @@ export async function runCli(
       throw new Error('Use native profiles to list supported profiles.');
     const preparing = area === 'task' && action === 'prepare-native';
     const evaluating = area === 'task' && action === 'prepare-evaluation';
+    if (values['confirm-subscription-only'] && !preparing)
+      throw new Error('Subscription confirmation requires task prepare-native.');
     if (!evaluating && (values.recipe !== undefined || values['test-file'] !== undefined))
       throw new Error('Check recipe options require task prepare-evaluation.');
     const recipe = values.recipe ?? 'node-tests-v1';
@@ -366,9 +370,10 @@ export async function runCli(
       print(
         { profiles: snapshot.nativeProfiles },
         snapshot.nativeProfiles
-          .map(
-            (profile) =>
-              `${profile.id}  ${profile.model}  ${profile.effort}  ${profile.available ? 'available' : profile.reason}`,
+          .map((profile) =>
+            profile.family === 'anthropic'
+              ? `${profile.id}  ${profile.model}  ${profile.effort} requested effort  effective effort unknown  account class unknown  service tier unknown  ${profile.available ? 'available' : profile.reason}  ${profile.qualifiedAt ? `qualified ${profile.qualifiedAt}` : 'qualification pending'}  billing requires user attestation`
+              : `${profile.id}  ${profile.model}  ${profile.effort}  ${profile.available ? 'available' : profile.reason}`,
           )
           .join('\n') || 'No native profiles.',
       );
@@ -412,6 +417,8 @@ export async function runCli(
     const task = requireTask(snapshot, id);
     if (action === 'prepare-evaluation') {
       const profile = snapshot.nativeProfiles.find((profile) => profile.id === extra[0]);
+      if (profile && profile.family !== 'openai')
+        throw new Error('Choose a supported OpenAI reviewer profile.');
       const run = snapshot.runs.find((run) => run.id === task.runId);
       const candidate = snapshot.candidates.filter((value) => value.taskId === task.id).at(-1);
       const methods = run?.policy.policy.methods ?? [];
@@ -428,7 +435,7 @@ export async function runCli(
           'Evaluation requires the saved single keep-it-simple method and one cycle.',
         );
       const creditPolicy = values['existing-credits'] ? 'existing-credits' : 'ordinary';
-      if (!profile.creditPolicies.includes(creditPolicy))
+      if (!profile.creditPolicies.some((value) => value === creditPolicy))
         throw new Error('This reviewer profile does not support the selected credit policy.');
       return await finishAction(
         await request(
@@ -466,8 +473,30 @@ export async function runCli(
       if (!profile?.available)
         throw new Error(`Native profile unavailable: ${profile?.reason ?? 'not-found'}.`);
       const creditPolicy = values['existing-credits'] ? 'existing-credits' : 'ordinary';
-      if (!profile.creditPolicies.includes(creditPolicy))
+      if (!profile.creditPolicies.some((value) => value === creditPolicy))
         throw new Error('This profile does not support the selected credit policy.');
+      if (values['confirm-subscription-only'] && profile.family !== 'anthropic')
+        throw new Error('Subscription confirmation is supported only for an Anthropic writer.');
+      const explicit = !!values['native-trust'] && !!values['source-consent'];
+      const savedNative = snapshot.nativeRuns.find(
+        (value) => value.runId === task.runId && value.profileId === profile.id,
+      );
+      const billingAttestation =
+        profile.family === 'anthropic'
+          ? values['confirm-subscription-only']
+            ? {
+                source: 'user-attested' as const,
+                subscriptionLoginConfirmed: true as const,
+                paidExtraUsageDisabled: true as const,
+              }
+            : !explicit
+              ? savedNative?.billingAttestation
+              : undefined
+          : undefined;
+      if (profile.family === 'anthropic' && !billingAttestation)
+        throw new Error(
+          'Confirm subscription login and disabled paid extra usage with --confirm-subscription-only, or use exact saved billing confirmations.',
+        );
       return await finishAction(
         await request(
           'PrepareNativeRun',
@@ -477,7 +506,8 @@ export async function runCli(
             targetPath: extra[1],
             policy: readJson(values.policy as string),
             creditPolicy,
-            consent: values['native-trust'] && values['source-consent'] ? 'explicit' : 'saved',
+            consent: explicit ? 'explicit' : 'saved',
+            ...(billingAttestation ? { billingAttestation } : {}),
           },
           task.revision,
         ),
@@ -524,8 +554,11 @@ export async function runCli(
       const run = nativeRun
         ? snapshot.runs.find((value) => value.id === nativeRun.runId)
         : undefined;
+      const billingText = nativeRun?.billingAttestation
+        ? '\nBilling: user-attested subscription login, paid extra usage disabled'
+        : '';
       const preview = nativeRun
-        ? `\nNative ${nativeRun.profileId}, ${nativeRun.stage}\nTarget ${nativeRun.target?.path ?? 'unknown'}\nBase hash ${nativeRun.target?.baseHash ?? 'unknown'}\nBytes ${nativeRun.target?.bytes ?? 'unknown'}\nExpires ${nativeRun.expiresAt ?? 'unknown'}\nSource base ${run?.source.base ?? 'unknown'}`
+        ? `\nNative ${nativeRun.profileId}, ${nativeRun.stage}\nTarget ${nativeRun.target?.path ?? 'unknown'}\nBase hash ${nativeRun.target?.baseHash ?? 'unknown'}\nBytes ${nativeRun.target?.bytes ?? 'unknown'}\nExpires ${nativeRun.expiresAt ?? 'unknown'}\nSource base ${run?.source.base ?? 'unknown'}${billingText}`
         : '';
       const evaluation = snapshot.candidateEvaluations.find((value) => value.taskId === task.id);
       const evidence = evaluation

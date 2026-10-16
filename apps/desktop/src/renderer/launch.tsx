@@ -131,7 +131,8 @@ export function NativeEvaluation({
   const run = snapshot.runs.find((value) => value.id === task.runId);
   const native = snapshot.nativeRuns.find((value) => value.runId === task.runId);
   const prepared = snapshot.candidateEvaluations.find((value) => value.taskId === task.id);
-  const [profileId, setProfileId] = useState(snapshot.nativeProfiles[0]?.id ?? '');
+  const reviewerProfiles = snapshot.nativeProfiles.filter((value) => value.family === 'openai');
+  const [profileId, setProfileId] = useState(reviewerProfiles[0]?.id ?? '');
   const [nativeTrust, setNativeTrust] = useState(false);
   const [sourceConsent, setSourceConsent] = useState(false);
   const [savedConsent, setSavedConsent] = useState(false);
@@ -144,8 +145,8 @@ export function NativeEvaluation({
   const [expiresAt, setExpiresAt] = useState(() => new Date(Date.now() + 3600000).toISOString());
   const [message, setMessage] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
-  const profile = snapshot.nativeProfiles.find(
-    (value) => value.id === (profileId || snapshot.nativeProfiles[0]?.id),
+  const profile = reviewerProfiles.find(
+    (value) => value.id === (profileId || reviewerProfiles[0]?.id),
   );
   const methods = run?.policy.policy.methods ?? [];
   const method = methods[0];
@@ -188,7 +189,9 @@ export function NativeEvaluation({
     task.state === 'stopped' &&
     supported &&
     profile?.available &&
-    profile.creditPolicies.includes(existingCredits ? 'existing-credits' : 'ordinary') &&
+    profile.creditPolicies.some(
+      (value) => value === (existingCredits ? 'existing-credits' : 'ordinary'),
+    ) &&
     (savedConsent || (nativeTrust && sourceConsent)) &&
     checkPermission &&
     reviewPermission &&
@@ -463,7 +466,7 @@ export function NativeEvaluation({
               value={profile?.id ?? ''}
               onChange={(event) => setProfileId(event.target.value)}
             >
-              {snapshot.nativeProfiles.map((value) => (
+              {reviewerProfiles.map((value) => (
                 <option key={value.id} value={value.id}>
                   {value.displayName}
                   {value.available ? '' : ' (unavailable)'}
@@ -520,7 +523,7 @@ export function NativeEvaluation({
             <input
               type="checkbox"
               checked={existingCredits}
-              disabled={!profile?.creditPolicies.includes('existing-credits')}
+              disabled={!profile?.creditPolicies.some((value) => value === 'existing-credits')}
               onChange={(event) => setExistingCredits(event.target.checked)}
             />
             Allow existing credits for this review after included usage
@@ -627,9 +630,18 @@ function NativeLaunch({
   onBack,
 }: LaunchProps & { onBack: () => void }) {
   const project = snapshot.projects.find((value) => value.id === task.projectId);
-  const profile = snapshot.nativeProfiles[0];
   const current = snapshot.nativeRuns.find((value) => value.runId === task.runId);
   const saved = current ? snapshot.runs.find((value) => value.id === task.runId) : undefined;
+  const [profileId, setProfileId] = useState(
+    current?.profileId ??
+      snapshot.nativeProfiles.find((value) => value.family === 'openai')?.id ??
+      snapshot.nativeProfiles[0]?.id ??
+      '',
+  );
+  const profile = snapshot.nativeProfiles.find((value) => value.id === profileId);
+  const anthropic = profile?.family === 'anthropic';
+  const [subscriptionLogin, setSubscriptionLogin] = useState(false);
+  const [extraUsageDisabled, setExtraUsageDisabled] = useState(false);
   const [prepared, setPrepared] = useState<Run | null>(saved ?? null);
   const [targetPath, setTargetPath] = useState(current?.target?.path ?? '');
   const [nativeTrust, setNativeTrust] = useState(false);
@@ -673,11 +685,37 @@ function NativeLaunch({
   const connected = workspace.connection === 'connected' && !workspace.preview;
   const allowed = connected && profile?.available && !workspace.pending;
   const validConsent = savedConsent || (nativeTrust && sourceConsent);
+  const billingAttestation = anthropic
+    ? savedConsent
+      ? current?.profileId === profile.id
+        ? current.billingAttestation
+        : undefined
+      : subscriptionLogin && extraUsageDisabled
+        ? {
+            source: 'user-attested' as const,
+            subscriptionLoginConfirmed: true as const,
+            paidExtraUsageDisabled: true as const,
+          }
+        : undefined
+    : undefined;
+  const validBilling = !anthropic || !!billingAttestation;
+  function resetConsent() {
+    setNativeTrust(false);
+    setSourceConsent(false);
+    setSavedConsent(false);
+    setExistingCredits(false);
+  }
+  function resetScope() {
+    resetConsent();
+    setSubscriptionLogin(false);
+    setExtraUsageDisabled(false);
+  }
   const startable =
     allowed &&
     prepared &&
     task.runId === prepared.id &&
     capability?.stage === 'prepared' &&
+    (!anthropic || !!capability.billingAttestation) &&
     !!capability.expiresAt &&
     Date.parse(capability.expiresAt) > Date.now();
   const unavailable = profile
@@ -691,6 +729,7 @@ function NativeLaunch({
         'client-unavailable':
           'Install the supported official client before preparing this proposal.',
         'client-build-mismatch': 'The installed client build does not match this profile.',
+        'qualification-pending': 'Qualification pending.',
         available: '',
       }[profile.reason]
     : 'The controller has no supported native profile.';
@@ -698,6 +737,7 @@ function NativeLaunch({
     if (
       !allowed ||
       !validConsent ||
+      !validBilling ||
       !NativeTargetPathSchema.safeParse(targetPath).success ||
       !profile
     )
@@ -735,6 +775,7 @@ function NativeLaunch({
           policy: submittedPolicy,
           creditPolicy: existingCredits ? 'existing-credits' : 'ordinary',
           consent: savedConsent ? 'saved' : 'explicit',
+          ...(billingAttestation ? { billingAttestation } : {}),
         },
       });
       const run = RunSchema.safeParse(result.entity);
@@ -769,14 +810,45 @@ function NativeLaunch({
         <section className="card">
           <div className="section-heading">
             <h2>{profile?.displayName ?? 'Native proposal'}</h2>
-            <span>Requires Pro</span>
+            <span>{anthropic ? 'Subscription confirmation required' : 'Requires Pro'}</span>
           </div>
+          {!prepared && (
+            <label>
+              Writer profile
+              <select
+                value={profileId}
+                onChange={(event) => {
+                  setProfileId(event.target.value);
+                  resetScope();
+                }}
+              >
+                {snapshot.nativeProfiles.map((value) => (
+                  <option key={value.id} value={value.id}>
+                    {value.displayName}
+                    {value.available ? '' : ' (unavailable)'}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
           {profile && (
             <div className="facts-grid">
               <span>Client {profile.clientVersion}</span>
               <span>{profile.model}</span>
-              <span>{profile.effort} effort</span>
-              <span>{profile.serviceTier} tier</span>
+              <span>
+                {profile.effort}
+                {anthropic ? ' requested effort' : ' effort'}
+              </span>
+              {anthropic && <span>Effective effort unknown</span>}
+              {anthropic && <span>Account class unknown</span>}
+              <span>{anthropic ? 'Service tier unknown' : `${profile.serviceTier} tier`}</span>
+              {anthropic && (
+                <span>
+                  {profile.qualifiedAt
+                    ? `Qualified ${profile.qualifiedAt.slice(0, 10)}`
+                    : 'Qualification pending'}
+                </span>
+              )}
             </div>
           )}
           <p className="muted small">
@@ -806,10 +878,12 @@ function NativeLaunch({
                   : 'Unknown'}
               </p>
               <p>
-                {snapshot.routes.find((route) => route.id === prepared.roles[0]?.routeId)
-                  ?.billing === 'credits'
-                  ? 'Existing credits explicitly allowed after included usage.'
-                  : 'Ordinary usage must be available. Existing credits were not opted in.'}
+                {anthropic
+                  ? 'Subscription login and disabled paid extra usage are user-attested.'
+                  : snapshot.routes.find((route) => route.id === prepared.roles[0]?.routeId)
+                        ?.billing === 'credits'
+                    ? 'Existing credits explicitly allowed after included usage.'
+                    : 'Ordinary usage must be available. Existing credits were not opted in.'}
               </p>
             </section>
           </>
@@ -823,13 +897,56 @@ function NativeLaunch({
                 maxLength={4096}
                 spellCheck={false}
                 placeholder="docs/providers.md"
-                onChange={(event) => setTargetPath(event.target.value)}
+                onChange={(event) => {
+                  setTargetPath(event.target.value);
+                  resetScope();
+                }}
               />
             </label>
             <p className="muted small">
               Choose one existing text file in {project?.name ?? 'this project'}. The controller
               freezes its committed base, hash and size before Start.
             </p>
+            {anthropic && (
+              <>
+                <p className="muted small">
+                  These confirmations describe your existing login and settings. They are supplied
+                  by you and do not change the account.
+                </p>
+                {savedConsent ? (
+                  <p className="muted small" role="status">
+                    {billingAttestation
+                      ? 'Using the saved subscription login and disabled paid extra usage confirmations.'
+                      : 'No matching saved billing confirmations. Use explicit consent and confirm both settings.'}
+                  </p>
+                ) : (
+                  <>
+                    <label className="checkbox-label">
+                      <input
+                        type="checkbox"
+                        checked={subscriptionLogin}
+                        onChange={(event) => {
+                          setSubscriptionLogin(event.target.checked);
+                          resetConsent();
+                        }}
+                      />
+                      I confirm this native login uses my existing subscription
+                    </label>
+                    <label className="checkbox-label">
+                      <input
+                        type="checkbox"
+                        checked={extraUsageDisabled}
+                        onChange={(event) => {
+                          setExtraUsageDisabled(event.target.checked);
+                          resetConsent();
+                        }}
+                      />
+                      I confirm paid extra usage is disabled for this login
+                    </label>
+                  </>
+                )}
+              </>
+            )}
             <label className="checkbox-label">
               <input
                 type="checkbox"
@@ -863,19 +980,25 @@ function NativeLaunch({
               Native global and project guidance may apply. Tool containment remains unqualified.
               Saved consent must match the controller's exact recorded scope.
             </p>
-            <label className="checkbox-label">
-              <input
-                type="checkbox"
-                checked={existingCredits}
-                disabled={!profile?.creditPolicies.includes('existing-credits')}
-                onChange={(event) => setExistingCredits(event.target.checked)}
-              />
-              Allow existing credits after included usage
-            </label>
-            <p className="muted small">
-              This choice does not establish a provider hard spending cap. No reset, purchase or
-              top-up is requested.
-            </p>
+            {!anthropic && (
+              <>
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={existingCredits}
+                    disabled={
+                      !profile?.creditPolicies.some((value) => value === 'existing-credits')
+                    }
+                    onChange={(event) => setExistingCredits(event.target.checked)}
+                  />
+                  Allow existing credits after included usage
+                </label>
+                <p className="muted small">
+                  This choice does not establish a provider hard spending cap. No reset, purchase or
+                  top-up is requested.
+                </p>
+              </>
+            )}
           </section>
         )}
         <p className="notice">
@@ -918,9 +1041,7 @@ function NativeLaunch({
                 disabled={workspace.pending}
                 onClick={() => {
                   setPrepared(null);
-                  setNativeTrust(false);
-                  setSourceConsent(false);
-                  setSavedConsent(false);
+                  resetScope();
                   setMessage(null);
                 }}
               >
@@ -956,7 +1077,10 @@ function NativeLaunch({
             type="button"
             className="button primary"
             disabled={
-              !allowed || !validConsent || !NativeTargetPathSchema.safeParse(targetPath).success
+              !allowed ||
+              !validConsent ||
+              !validBilling ||
+              !NativeTargetPathSchema.safeParse(targetPath).success
             }
             onClick={() => void prepareNative()}
           >
