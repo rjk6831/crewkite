@@ -11,10 +11,12 @@ import {
   DesktopNoticeSchema,
   FakeWorkerEventSchema,
   FakeWorkerInputSchema,
+  formatReviewTarget,
   GrantSchema,
   MinorAmountSchema,
   ObservationSchema,
   PolicySchema,
+  parseReviewTarget,
   ReadDataSchema,
   RemainingBudgetsSchema,
   ReviewJobSchema,
@@ -186,6 +188,45 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     scripted: true,
   };
   assert.ok(ReviewJobSchema.safeParse(job).success);
+  const boundJob = { ...job, writerAttemptId: `att_${suffix}`, writerRouteId: job.routeId };
+  assert.ok(ReviewJobSchema.safeParse(boundJob).success);
+  assert.equal(
+    ReviewJobSchema.safeParse({ ...job, writerAttemptId: `att_${suffix}` }).success,
+    false,
+  );
+  assert.equal(ReviewJobSchema.safeParse({ ...job, writerRouteId: job.routeId }).success, false);
+  for (const methodId of [
+    'keep-it-simple',
+    'second-opinion',
+    'challenge-assumptions',
+    'round-robin',
+  ] as const)
+    for (const cycle of [1, 2, 3]) {
+      const target = { methodId, cycle };
+      assert.equal(formatReviewTarget(target), `${methodId}/cycle-${cycle}`);
+      assert.deepEqual(parseReviewTarget(formatReviewTarget(target)), target);
+    }
+  for (const value of [
+    'second-opinion/cycle-0',
+    'second-opinion/cycle-4',
+    'second-opinion/cycle-01',
+    'second-opinion/cycle-1 ',
+    ' second-opinion/cycle-1',
+    'unknown/cycle-1',
+    'second-opinion/cycle-1\n',
+    null,
+    {},
+  ])
+    assert.equal(parseReviewTarget(value), null);
+  for (const value of [
+    { methodId: 'unknown', cycle: 1 },
+    { methodId: 'second-opinion', cycle: 0 },
+    { methodId: 'second-opinion', cycle: 1.5 },
+    { methodId: 'second-opinion', cycle: 4 },
+    { methodId: 'second-opinion', cycle: 1, extra: true },
+  ])
+    assert.throws(() => formatReviewTarget(value as Parameters<typeof formatReviewTarget>[0]));
+
   for (const invalid of [
     { ...job, cycle: 4 },
     { ...job, scripted: false },

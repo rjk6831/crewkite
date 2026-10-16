@@ -178,6 +178,22 @@ export const ReviewMethodIdSchema = z.enum([
   'second-opinion',
   'round-robin',
 ]);
+export const ReviewTargetSchema = z.strictObject({
+  methodId: ReviewMethodIdSchema,
+  cycle: z.number().int().min(1).max(3),
+});
+export type ReviewTarget = z.infer<typeof ReviewTargetSchema>;
+export function formatReviewTarget(value: ReviewTarget): string {
+  const target = ReviewTargetSchema.parse(value);
+  return `${target.methodId}/cycle-${target.cycle}`;
+}
+export function parseReviewTarget(value: unknown): ReviewTarget | null {
+  if (typeof value !== 'string') return null;
+  const match = /^([^/]+)\/cycle-([1-3])$/.exec(value);
+  if (!match) return null;
+  const parsed = ReviewTargetSchema.safeParse({ methodId: match[1], cycle: Number(match[2]) });
+  return parsed.success && formatReviewTarget(parsed.data) === value ? parsed.data : null;
+}
 export const QualitySchema = z.enum(['quick', 'standard', 'thorough']);
 export function requiredReviewMethodIds(
   quality: z.infer<typeof QualitySchema>,
@@ -278,19 +294,26 @@ export const CandidateSchema = z.strictObject({
   artifactId: ArtifactIdSchema,
   revision: RevisionSchema,
 });
-export const ReviewJobSchema = z.strictObject({
-  taskId: TaskIdSchema,
-  runId: RunIdSchema,
-  attemptId: AttemptIdSchema,
-  generation: RevisionSchema,
-  routeId: RouteIdSchema,
-  candidateId: CandidateIdSchema,
-  candidateHash: HashSchema,
-  methodId: ReviewMethodIdSchema,
-  cycle: z.number().int().min(1).max(3),
-  limitMinutes: z.number().int().min(1).max(1440),
-  scripted: z.literal(true),
-});
+export const ReviewJobSchema = z
+  .strictObject({
+    taskId: TaskIdSchema,
+    runId: RunIdSchema,
+    attemptId: AttemptIdSchema,
+    generation: RevisionSchema,
+    routeId: RouteIdSchema,
+    writerAttemptId: AttemptIdSchema.optional(),
+    writerRouteId: RouteIdSchema.optional(),
+    candidateId: CandidateIdSchema,
+    candidateHash: HashSchema,
+    methodId: ReviewMethodIdSchema,
+    cycle: z.number().int().min(1).max(3),
+    limitMinutes: z.number().int().min(1).max(1440),
+    scripted: z.literal(true),
+  })
+  .refine(
+    (job) => (job.writerAttemptId === undefined) === (job.writerRouteId === undefined),
+    'Writer provenance requires both the attempt and route.',
+  );
 export const ReviewResultSchema = z
   .strictObject({
     job: ReviewJobSchema,
