@@ -46,6 +46,8 @@ import {
   MAX_FRAME_BYTES,
   NativeBillingAttestationSchema,
   NativeProfileSchema,
+  NativeRepositoryExecutionSchema,
+  NativeRepositoryScopeSchema,
   type NativeReviewJob,
   NativeReviewJobSchema,
   NativeRunSchema,
@@ -137,6 +139,7 @@ import {
   startReplacement,
   type WriterPlan,
 } from '../providers/openai/replacement.ts';
+import { repositoryPlan, startRepository } from '../providers/openai/repository.ts';
 import { type ReviewPlan, reviewPlan, startReview } from '../providers/openai/review.ts';
 import { chooseRoute } from '../routing/index.ts';
 import { createIds, type IdPrefix } from '../store/ids.ts';
@@ -144,7 +147,7 @@ import { type LaunchIntent, Store } from '../store/index.ts';
 import { deriveWindow } from '../usage/index.ts';
 import { chargedMinutes, remainingBudgets } from './budgets.ts';
 
-const NativeAppointmentSchema = z.strictObject({
+const NativeFileAppointmentSchema = z.strictObject({
   id: z.string().regex(/^[a-zA-Z0-9-]{1,80}$/),
   taskId: TaskIdSchema,
   route: RouteSchema,
@@ -169,6 +172,27 @@ const NativeAppointmentSchema = z.strictObject({
   maximumTaskMs: z.number().int().min(2001).max(300_000),
   maximumSubmissions: z.literal(1),
 });
+const NativeRepositoryAppointmentSchema = NativeFileAppointmentSchema.omit({
+  target: true,
+  billingAttestation: true,
+  permissionMode: true,
+})
+  .extend({
+    repository: NativeRepositoryScopeSchema,
+    execution: NativeRepositoryExecutionSchema,
+    billingAttestation: z.never().optional(),
+    permissionMode: z.never().optional(),
+  })
+  .refine(
+    (appointment) =>
+      appointment.route.family === 'openai' &&
+      !Object.hasOwn(appointment, 'billingAttestation') &&
+      !Object.hasOwn(appointment, 'permissionMode'),
+  );
+const NativeAppointmentSchema = z.union([
+  NativeFileAppointmentSchema,
+  NativeRepositoryAppointmentSchema,
+]);
 export type NativePilotAppointment = z.infer<typeof NativeAppointmentSchema>;
 const NativePublicScopeSchema = z.strictObject({
   profileId: z.string().min(1).max(200),
@@ -179,31 +203,40 @@ const NativePublicScopeSchema = z.strictObject({
     outcome: z.string().min(1).max(4096),
   }),
 });
-const NativePreparationSchema = z.strictObject({
-  appointment: NativeAppointmentSchema,
-  run: RunSchema,
-  attempt: AttemptSchema,
-  manifest: z
-    .array(
-      z.strictObject({
-        path: z.string().min(1).max(4096),
-        mode: z.enum(['100644', '100755']),
-        hash: HashSchema,
-        bytes: z.number().int().nonnegative(),
-      }),
-    )
-    .max(10000),
-  originalHash: HashSchema,
-  anthropicSessionId: z.uuid().optional(),
+const NativeHistoricalPreparationSchema = z
+  .strictObject({
+    appointment: NativeAppointmentSchema,
+    run: RunSchema,
+    attempt: AttemptSchema,
+    manifest: z
+      .array(
+        z.strictObject({
+          path: z.string().min(1).max(4096),
+          mode: z.enum(['100644', '100755']),
+          hash: HashSchema,
+          bytes: z.number().int().nonnegative(),
+        }),
+      )
+      .max(10000),
+    originalHash: HashSchema.optional(),
+    anthropicSessionId: z.uuid().optional(),
+    public: NativePublicScopeSchema.optional(),
+  })
+  .refine((plan) =>
+    'repository' in plan.appointment
+      ? !plan.originalHash && !plan.anthropicSessionId
+      : !!plan.originalHash,
+  );
+const NativePreparationSchema = NativeHistoricalPreparationSchema.safeExtend({
   public: NativePublicScopeSchema,
 });
 type NativeBinding = {
   appointment: NativePilotAppointment;
   run: Run;
   attempt: Attempt;
-  original: string;
+  original?: string;
   anthropicSessionId?: string;
-  baseHash: string;
+  baseHash?: string;
   manifest: Omit<ReturnType<typeof readFiles>[number], 'content'>[];
   planArtifact: Artifact;
   public?: z.infer<typeof NativePublicScopeSchema>;
@@ -229,7 +262,7 @@ const CandidateEvaluationSchema = z.strictObject({
     cycles: z.literal(1),
     role: ReviewMethodSchema.shape.reviewerRole,
     profile: NativeProfileSchema,
-    client: NativeAppointmentSchema.shape.client,
+    client: NativeFileAppointmentSchema.shape.client,
     locationHash: HashSchema,
   }),
   creditPolicy: z.enum(['ordinary', 'existing-credits']),
@@ -242,6 +275,7 @@ const CandidateEvaluationSchema = z.strictObject({
 type NativeOutcome = {
   metadata:
     | Awaited<ReturnType<typeof startReplacement>['result']>['metadata']
+    | Awaited<ReturnType<typeof startRepository>['result']>['metadata']
     | (NonNullable<Awaited<ReturnType<typeof startAnthropicReplacement>['result']>['proposal']> & {
         family: 'anthropic';
         sessionId: string;
@@ -1159,9 +1193,16 @@ export class Controller {
       .prepare('SELECT attempt_id FROM writer_leases WHERE task_id=?')
       .get(task.id);
     if (lease) return { outcome: 'blocked', reason: 'writer-lease-held' };
+    const nativeTools =
+      native && 'repository' in native.appointment
+        ? this.grant(run, 'run-native-tools', project.name)
+        : undefined;
+    if (native && 'repository' in native.appointment && !nativeTools)
+      return { outcome: 'blocked', reason: 'native-tools-grant-unavailable' };
     this.store.db.prepare('DELETE FROM receipts WHERE command_key=?').run(`paused:${run.id}`);
     this.store.put('attempt', attempt.id, attempt.revision, attempt);
     if (allocation) this.consumeGrant(run, allocation);
+    if (nativeTools) this.consumeGrant(run, nativeTools);
     if (!allocated)
       this.store.saveReceipt(
         `allocation:${run.id}`,
@@ -1226,12 +1267,22 @@ export class Controller {
     return { outcome: 'applied', entity: updated, revision: updated.revision };
   }
 
+  private repositoryScope(sourceBase: string, files: NativeBinding['manifest']) {
+    const manifest = files.map(({ path, mode, hash, bytes }) => ({ path, mode, hash, bytes }));
+    return NativeRepositoryScopeSchema.parse({
+      sourceBase,
+      manifestHash: hashCanonical(manifest),
+      files: manifest.length,
+      bytes: manifest.reduce((sum, file) => sum + file.bytes, 0),
+    });
+  }
+
   private resolveProfiles(): NativeProfileResolution[] {
     const profiles = this.options.nativeProfiles?.() ?? [
       this.options.nativeProfile?.() ?? unavailableNativeProfile(),
     ];
     if (
-      profiles.length > 3 ||
+      profiles.length > 4 ||
       new Set(profiles.map((profile) => profile.facts.id)).size !== profiles.length
     )
       throw Error('Native profile identities are invalid.');
@@ -1272,12 +1323,16 @@ export class Controller {
               ? { billingAttestation: appointment.billingAttestation }
               : {}),
             ...(appointment.permissionMode ? { permissionMode: appointment.permissionMode } : {}),
-            target: {
-              ...appointment.target,
-              bytes: plan.manifest.find(
-                (file: { path: string }) => file.path === appointment.target.path,
-              )?.bytes,
-            },
+            ...('repository' in appointment
+              ? { repository: appointment.repository, execution: appointment.execution }
+              : {
+                  target: {
+                    ...appointment.target,
+                    bytes: plan.manifest.find(
+                      (file: { path: string }) => file.path === appointment.target.path,
+                    )?.bytes,
+                  },
+                }),
           }),
         ];
       } catch {
@@ -1373,13 +1428,15 @@ export class Controller {
           reason: 'native-profile-unavailable',
           next: 'Use the supported installed client and native account location.',
         };
-      if ((facts.family !== 'openai') !== !!command.payload.billingAttestation)
+      const filePayload = 'targetPath' in command.payload ? command.payload : undefined;
+      const billingAttestation = filePayload?.billingAttestation;
+      const permissionMode = filePayload?.permissionMode;
+      if ((facts.family !== 'openai') !== !!billingAttestation)
         throw Error('The subscription billing attestation is unavailable.');
       if (
-        (facts.family === 'google') !== !!command.payload.permissionMode ||
+        (facts.family === 'google') !== !!permissionMode ||
         (facts.family === 'google' &&
-          (!command.payload.permissionMode ||
-            !facts.permissionModes.includes(command.payload.permissionMode)))
+          (!permissionMode || !facts.permissionModes.includes(permissionMode)))
       )
         throw Error('The native permission mode is unavailable.');
       const task = this.store.get<Task>('task', command.payload.taskId);
@@ -1387,8 +1444,18 @@ export class Controller {
         return { outcome: 'blocked', reason: 'task-not-preparable' };
       const source = inspectSource(task.projectId, this.projectPath(task.projectId) as string);
       const files = committedFiles(this.projectPath(task.projectId) as string, source.base);
-      const original = files.find((file) => file.path === command.payload.targetPath);
-      if (!original) throw Error('Target is unavailable.');
+      const original = filePayload
+        ? files.find((file) => file.path === filePayload.targetPath)
+        : undefined;
+      if (filePayload && !original) throw Error('Target is unavailable.');
+      const scope = original
+        ? { target: { path: original.path, baseHash: original.hash } }
+        : {
+            repository: this.repositoryScope(source.base, files),
+            execution: NativeRepositoryExecutionSchema.parse(
+              'execution' in facts ? facts.execution : null,
+            ),
+          };
       const policy = PolicySchema.parse(command.payload.policy);
       const runId = this.id('run');
       const project = this.store.get<Project>('project', task.projectId) as Project;
@@ -1398,7 +1465,20 @@ export class Controller {
         project.name,
       );
       if (!writeGrant) throw Error('The native proposal needs a live scratch grant.');
-      expiresAt = writeGrant.expiresAt;
+      const toolsGrant = !filePayload
+        ? this.grant(
+            { id: runId, taskId: task.id, policy: { policy, hash: hashCanonical(policy) } },
+            'run-native-tools',
+            project.name,
+          )
+        : undefined;
+      if (!filePayload && !toolsGrant)
+        throw Error('Repository work needs a live native-tool grant.');
+      expiresAt = toolsGrant
+        ? new Date(
+            Math.min(Date.parse(writeGrant.expiresAt), Date.parse(toolsGrant.expiresAt)),
+          ).toISOString()
+        : writeGrant.expiresAt;
       const context = { title: task.title, outcome: task.outcome };
       const scopeHash = hashCanonical({
         profile: facts,
@@ -1406,17 +1486,13 @@ export class Controller {
         locationHash: profile.locationHash,
         projectId: task.projectId,
         source,
-        target: { path: original.path, hash: original.hash },
+        ...(original ? { target: { path: original.path, hash: original.hash } } : scope),
         context,
         criteria: task.criteria,
         policy,
         creditPolicy: command.payload.creditPolicy,
-        ...(command.payload.billingAttestation
-          ? { billingAttestation: command.payload.billingAttestation }
-          : {}),
-        ...(command.payload.permissionMode
-          ? { permissionMode: command.payload.permissionMode }
-          : {}),
+        ...(billingAttestation ? { billingAttestation: billingAttestation } : {}),
+        ...(permissionMode ? { permissionMode: permissionMode } : {}),
       });
       if (command.payload.consent === 'saved')
         expiresAt = new Date(
@@ -1443,13 +1519,9 @@ export class Controller {
           },
           client: profile.client,
           creditPolicy: command.payload.creditPolicy,
-          ...(command.payload.billingAttestation
-            ? { billingAttestation: command.payload.billingAttestation }
-            : {}),
-          ...(command.payload.permissionMode
-            ? { permissionMode: command.payload.permissionMode }
-            : {}),
-          target: { path: original.path, baseHash: original.hash },
+          ...(billingAttestation ? { billingAttestation: billingAttestation } : {}),
+          ...(permissionMode ? { permissionMode: permissionMode } : {}),
+          ...scope,
           consent: {
             nativeTrust: 'accepted',
             source: command.payload.consent === 'explicit' ? 'explicit' : 'policy',
@@ -1499,7 +1571,7 @@ export class Controller {
       { outcome: 'applied', entity: binding.planArtifact },
     );
     const updated = this.updateTask(this.store.get<Task>('task', task.id) as Task, {
-      next: 'Review the native file proposal and start. Checks and acceptance remain unavailable.',
+      next: 'Review the native preparation and start. Checks and acceptance remain pending.',
     });
     this.event('run.prepared', task.id, updated.revision, binding.run);
     return { outcome: 'applied', entity: binding.run, revision: updated.revision };
@@ -1528,11 +1600,12 @@ export class Controller {
     const origin = this.store.receipt(`native-run:${run.id}`);
     const artifact = ArtifactSchema.parse(origin?.result.entity);
     if (artifact.bytes > MAX_FRAME_BYTES) throw Error('Native origin exceeds its bound.');
-    const plan = NativePreparationSchema.extend({
-      public: NativePublicScopeSchema.optional(),
-    }).parse(JSON.parse(this.artifacts.read(artifact.hash).toString('utf8')));
+    const plan = NativeHistoricalPreparationSchema.parse(
+      JSON.parse(this.artifacts.read(artifact.hash).toString('utf8')),
+    );
     this.anthropicWriterEvidence(plan);
     this.googleWriterEvidence(plan);
+    this.nativeRepositoryEvidence(plan, candidate);
     const writer = this.store.get<Attempt>('attempt', plan.attempt.id);
     const completionArtifact = ArtifactSchema.parse(
       this.store.receipt(`native-completion:${plan.attempt.id}`)?.result.entity,
@@ -1546,7 +1619,9 @@ export class Controller {
       completion.reason !== null ||
       completion.quiescent !== true ||
       !this.store.nativePhasesComplete(writer.id, plan.appointment.route.family) ||
-      this.store.receipt(`native-application:${writer.id}`)?.result.outcome !== 'applied' ||
+      this.store.receipt(
+        `${'repository' in plan.appointment ? 'native-capture' : 'native-application'}:${writer.id}`,
+      )?.result.outcome !== 'applied' ||
       plan.run.id !== run.id ||
       plan.run.taskId !== run.taskId ||
       hashCanonical(plan.run.policy) !== hashCanonical(run.policy) ||
@@ -1596,6 +1671,7 @@ export class Controller {
       if (
         !profile.facts.available ||
         profile.facts.family !== 'openai' ||
+        profile.facts.id !== 'openai-file-v1' ||
         profile.facts.id !== selected.profileId ||
         !profile.facts.creditPolicies.some((policy) => policy === command.payload.creditPolicy) ||
         !profile.client ||
@@ -1827,13 +1903,17 @@ export class Controller {
           this.store.receipt(`native-run:${task.runId}`)?.result.entity,
         );
         if (nativeArtifact.bytes > MAX_FRAME_BYTES) return [];
-        const native = NativePreparationSchema.extend({
-          public: NativePublicScopeSchema.optional(),
-        }).parse(JSON.parse(this.artifacts.read(nativeArtifact.hash).toString('utf8')));
-        const target = this.evidence
-          .read(plan.candidate)
-          .files.find((file) => file.path === native.appointment.target.path);
-        if (!target) return [];
+        const native = NativeHistoricalPreparationSchema.parse(
+          JSON.parse(this.artifacts.read(nativeArtifact.hash).toString('utf8')),
+        );
+        const appointment = native.appointment;
+        const target =
+          'target' in appointment
+            ? this.evidence
+                .read(plan.candidate)
+                .files.find((file) => file.path === appointment.target.path)
+            : undefined;
+        if ('target' in appointment && !target) return [];
         const checkResult = this.store.receipt(`evaluation-result:${artifact.id}`);
         const checkArtifact =
           checkResult?.hash === artifact.hash
@@ -1901,11 +1981,15 @@ export class Controller {
                 ? plan.definition.collection
                 : [],
             definitionHash: plan.definition.definitionHash,
-            target: {
-              path: target.path,
-              baseHash: native.originalHash,
-              candidateContentHash: target.hash,
-            },
+            ...('repository' in appointment
+              ? { repository: appointment.repository }
+              : {
+                  target: {
+                    path: target?.path,
+                    baseHash: native.originalHash,
+                    candidateContentHash: target?.hash,
+                  },
+                }),
             reviewer: {
               profileId: plan.reviewer.profileId,
               assignedRole: plan.reviewer.role,
@@ -2110,6 +2194,7 @@ export class Controller {
     const profile = this.profileFor(plan.reviewer.profileId);
     if (
       profile.facts.family !== 'openai' ||
+      profile.facts.id !== 'openai-file-v1' ||
       hashCanonical(profile.facts) !== hashCanonical(plan.reviewer.profile) ||
       hashCanonical(profile.client) !== hashCanonical(plan.reviewer.client) ||
       profile.locationHash !== plan.reviewer.locationHash ||
@@ -2157,6 +2242,7 @@ export class Controller {
       public?: z.infer<typeof NativePublicScopeSchema>;
     },
   ) {
+    if ('repository' in plan.appointment) return;
     if (plan.appointment.route.family !== 'anthropic') return;
     const auth = this.nativeRecord(`native-auth:${plan.attempt.id}`, 4096);
     const observed = z
@@ -2219,6 +2305,7 @@ export class Controller {
       public?: z.infer<typeof NativePublicScopeSchema>;
     },
   ) {
+    if ('repository' in plan.appointment) return;
     if (plan.appointment.route.family !== 'google') return;
     const config = this.nativeRecord(`native-config:${plan.attempt.id}`, 4096);
     const observed = z
@@ -2287,14 +2374,168 @@ export class Controller {
       throw Error('evidence-incomplete');
   }
 
+  private repositoryResult(appointment: NativePilotAppointment, attemptId: string, value: unknown) {
+    if (!('repository' in appointment)) throw Error('The repository appointment is unavailable.');
+    const result = z
+      .object({
+        attemptId: z.string(),
+        sourceBase: z.string(),
+        manifestHash: HashSchema,
+        execution: NativeRepositoryExecutionSchema,
+        model: z.string(),
+        requestedEffort: z.literal('low'),
+        qualified: z.literal(false),
+        threadId: z.string().min(1).max(200),
+        turnId: z.string().min(1).max(200),
+      })
+      .parse(value);
+    if (
+      result.attemptId !== attemptId ||
+      result.sourceBase !== appointment.repository.sourceBase ||
+      result.manifestHash !== appointment.repository.manifestHash ||
+      hashCanonical(result.execution) !== hashCanonical(appointment.execution) ||
+      result.model !== appointment.route.model ||
+      result.requestedEffort !== appointment.route.effort.requested
+    )
+      throw Error('The repository result binding changed.');
+    return result;
+  }
+
+  private nativeRepositoryEvidence(
+    plan: z.infer<typeof NativeHistoricalPreparationSchema>,
+    candidate: Candidate,
+  ) {
+    const appointment = plan.appointment;
+    if (!('repository' in appointment)) return;
+    const capture = z
+      .strictObject({
+        version: z.literal(1),
+        attemptId: z.string(),
+        planHash: HashSchema,
+        completionHash: HashSchema,
+        metadataHash: HashSchema,
+        candidateId: CandidateSchema.shape.id,
+        candidateHash: HashSchema,
+        repository: NativeRepositoryScopeSchema,
+        execution: NativeRepositoryExecutionSchema,
+      })
+      .parse(this.nativeRecord(`native-capture:${plan.attempt.id}`).value);
+    const metadata = this.nativeRecord(`native-proposal:${plan.attempt.id}`);
+    this.repositoryResult(appointment, plan.attempt.id, metadata.value);
+    if (
+      capture.attemptId !== plan.attempt.id ||
+      capture.planHash !== this.nativeRecord(`native-run:${plan.run.id}`).artifact.hash ||
+      capture.completionHash !==
+        this.nativeRecord(`native-completion:${plan.attempt.id}`, 4096).artifact.hash ||
+      capture.metadataHash !== metadata.artifact.hash ||
+      capture.candidateId !== candidate.id ||
+      capture.candidateHash !== candidate.hash ||
+      hashCanonical(capture.repository) !== hashCanonical(appointment.repository) ||
+      hashCanonical(capture.execution) !== hashCanonical(appointment.execution) ||
+      hashCanonical(this.repositoryScope(plan.run.source.base, plan.manifest)) !==
+        hashCanonical(appointment.repository)
+    )
+      throw Error('Repository capture evidence changed.');
+    const project = this.store.get<Project>('project', plan.run.source.projectId);
+    for (const action of ['write-scratch', 'run-native-tools'] as const) {
+      const grant = plan.run.policy.policy.effects.find(
+        (value) =>
+          value.taskId === plan.run.taskId &&
+          value.action === action &&
+          value.target === project?.name &&
+          !value.revoked &&
+          value.usesRemaining === 1,
+      );
+      const consumed = grant && this.store.receipt(this.grantKey(grant));
+      if (
+        !grant ||
+        consumed?.hash !== hashCanonical(grant) ||
+        (consumed.result.entity as Run | undefined)?.id !== plan.run.id
+      )
+        throw Error('The repository grant was not consumed for this run.');
+    }
+  }
+
+  private nativeReviewSource(
+    plan: z.infer<typeof NativeHistoricalPreparationSchema>,
+    candidate: Candidate,
+  ) {
+    const source = committedFiles(
+      this.projectPath(plan.run.source.projectId) as string,
+      plan.run.source.base,
+    );
+    const files = this.evidence.read(candidate).files;
+    const appointment = plan.appointment;
+    if ('repository' in appointment) {
+      if (
+        hashCanonical(this.repositoryScope(plan.run.source.base, source)) !==
+        hashCanonical(appointment.repository)
+      )
+        throw Error('The review source changed.');
+      const original = new Map(source.map((file) => [file.path, file]));
+      const current = new Map(files.map((file) => [file.path, file]));
+      const side = (file: (typeof files)[number] | undefined) =>
+        file
+          ? {
+              mode: file.mode,
+              hash: file.hash,
+              content: new TextDecoder('utf-8', { fatal: true }).decode(file.content),
+            }
+          : null;
+      const changes = [...new Set([...original.keys(), ...current.keys()])]
+        .sort()
+        .filter((path) => {
+          const left = original.get(path),
+            right = current.get(path);
+          return !left || !right || left.hash !== right.hash || left.mode !== right.mode;
+        })
+        .map((path) => ({
+          path,
+          original: side(original.get(path)),
+          candidate: side(current.get(path)),
+        }));
+      if (!changes.length) throw Error('The repository candidate has no changes.');
+      return {
+        repository: {
+          version: 1 as const,
+          sourceBase: plan.run.source.base,
+          sourceManifestHash: appointment.repository.manifestHash,
+          candidateManifestHash: candidate.hash,
+          changes,
+        },
+      };
+    }
+    const original = source.find((file) => file.path === appointment.target.path);
+    const current = files.find((file) => file.path === appointment.target.path);
+    if (
+      !original ||
+      !current ||
+      original.hash !== plan.originalHash ||
+      original.hash !== appointment.target.baseHash ||
+      current.mode !== original.mode ||
+      hashCanonical(
+        files
+          .filter((file) => file.path !== current.path)
+          .map(({ content: _content, ...entry }) => entry),
+      ) !== hashCanonical(plan.manifest.filter((file) => file.path !== current.path))
+    )
+      throw Error('The review target changed.');
+    return {
+      path: original.path,
+      baseHash: original.hash,
+      original: new TextDecoder('utf-8', { fatal: true }).decode(original.content),
+      candidate: new TextDecoder('utf-8', { fatal: true }).decode(current.content),
+      candidateContentHash: current.hash,
+    };
+  }
+
   private nativePublicationEvidence(run: Run, candidate: Candidate) {
     const same = (left: unknown, right: unknown) => hashCanonical(left) === hashCanonical(right);
     const origin = this.nativeRecord(`native-run:${run.id}`);
-    const native = NativePreparationSchema.extend({
-      public: NativePublicScopeSchema.optional(),
-    }).parse(origin.value);
+    const native = NativeHistoricalPreparationSchema.parse(origin.value);
     this.anthropicWriterEvidence(native);
     this.googleWriterEvidence(native);
+    this.nativeRepositoryEvidence(native, candidate);
     const prepared = ArtifactSchema.parse(
       this.store.receipt(`evaluation-started:${run.id}`)?.result.entity,
     );
@@ -2328,8 +2569,7 @@ export class Controller {
       .get(job.attemptId);
     const grant = evaluation.grants.find((value) => value.action === 'run-review');
     const methods = run.policy.policy.methods ?? [];
-    const files = this.evidence.read(candidate).files;
-    const file = files.find((value) => value.path === input.path);
+    const reviewSource = this.nativeReviewSource(native, candidate);
     const submission = z
       .strictObject({ attemptId: z.string(), preparationHash: HashSchema, bindingHash: HashSchema })
       .parse(
@@ -2341,17 +2581,11 @@ export class Controller {
       .parse(
         this.nativeRecord(`native-submission:${native.attempt.id}`, 4096, 'outcome-unknown').value,
       );
-    const original = committedFiles(
-      this.projectPath(run.source.projectId) as string,
-      run.source.base,
-    ).find((value) => value.path === input.path);
     if (
       !writer ||
       !attempt ||
       !storedJob ||
       !grant ||
-      !file ||
-      !original ||
       !this.attestedReviewWriter(run, candidate, writer) ||
       !same(evaluation.run, run) ||
       !same(evaluation.writer, writer) ||
@@ -2361,7 +2595,9 @@ export class Controller {
       !same(native.run.source, run.source) ||
       !same(native.run.roles, run.roles) ||
       this.store.receipt(`native-run:${run.id}`)?.hash !== hashCanonical(native.appointment) ||
-      this.store.receipt(`native-application:${writer.id}`)?.result.outcome !== 'applied' ||
+      this.store.receipt(
+        `${'repository' in native.appointment ? 'native-capture' : 'native-application'}:${writer.id}`,
+      )?.result.outcome !== 'applied' ||
       native.appointment.consent.criteriaHash !== hashCanonical(evaluation.context.criteria) ||
       (native.public &&
         !same(native.public.context, {
@@ -2404,16 +2640,17 @@ export class Controller {
       !same(input.binding, { ...job, scopeHash: evaluation.scopeHash }) ||
       !same(input.context, evaluation.context) ||
       input.creditPolicy !== evaluation.creditPolicy ||
-      input.path !== native.appointment.target.path ||
-      input.baseHash !== native.originalHash ||
-      original.hash !== input.baseHash ||
-      file.hash !== input.candidateContentHash ||
-      file.mode !== original.mode ||
       !same(
-        files
-          .filter((value) => value.path !== input.path)
-          .map(({ content: _content, ...entry }) => entry),
-        native.manifest.filter((value) => value.path !== input.path),
+        reviewSource,
+        'repository' in input
+          ? { repository: input.repository }
+          : {
+              path: input.path,
+              baseHash: input.baseHash,
+              original: input.original,
+              candidate: input.candidate,
+              candidateContentHash: input.candidateContentHash,
+            },
       ) ||
       input.model !== evaluation.reviewer.profile.model ||
       input.effort !== evaluation.reviewer.profile.effort ||
@@ -2647,6 +2884,8 @@ export class Controller {
     creditPolicy: NativePilotAppointment['creditPolicy'],
     create = true,
   ) {
+    if (profile.facts.family !== 'openai' || profile.facts.id !== 'openai-file-v1')
+      throw Error('The reviewer profile is unavailable.');
     const existing = this.nativeProfileRoute(profile, creditPolicy);
     if (existing) return existing;
     const receipt = this.store.receipt(
@@ -2658,7 +2897,7 @@ export class Controller {
       ? z
           .strictObject({
             profileId: z.string(),
-            client: NativeAppointmentSchema.shape.client,
+            client: NativeFileAppointmentSchema.shape.client,
             route: RouteSchema,
           })
           .parse(JSON.parse(this.artifacts.read(artifact.hash).toString('utf8')))
@@ -2671,7 +2910,7 @@ export class Controller {
       model: profile.facts.model,
       effort: {
         requested: profile.facts.effort,
-        effective: profile.facts.family === 'anthropic' ? 'unknown' : profile.facts.effort,
+        effective: profile.facts.effort,
         supported: [profile.facts.effort],
       },
       billing: creditPolicy === 'ordinary' ? 'included' : 'credits',
@@ -2764,15 +3003,7 @@ export class Controller {
         assignedRole: plan.reviewer.role,
         independence: 'process-only',
       });
-      const original = committedFiles(
-        this.projectPath(task.projectId) as string,
-        plan.run.source.base,
-      ).find((file) => file.path === prepared.native.appointment.target.path);
-      const candidate = this.evidence
-        .read(plan.candidate)
-        .files.find((file) => file.path === prepared.native.appointment.target.path);
-      if (!original || !candidate || original.hash !== prepared.native.originalHash)
-        throw Error('The review target changed.');
+      const reviewSource = this.nativeReviewSource(prepared.native, plan.candidate);
       input = reviewPlan({
         binding: {
           ...job,
@@ -2783,11 +3014,7 @@ export class Controller {
         model: route.model as ReviewPlan['model'],
         effort: route.effort.requested as ReviewPlan['effort'],
         creditPolicy: plan.creditPolicy,
-        path: original.path,
-        baseHash: original.hash,
-        original: new TextDecoder('utf-8', { fatal: true }).decode(original.content),
-        candidate: new TextDecoder('utf-8', { fatal: true }).decode(candidate.content),
-        candidateContentHash: candidate.hash,
+        ...reviewSource,
         context: plan.context,
       });
     } catch {
@@ -3127,8 +3354,20 @@ export class Controller {
     const manifest = files.map(({ content: _content, ...file }) => file);
     if (hashCanonical(manifest) !== hashCanonical(plan.manifest))
       throw Error('Native manifest changed.');
-    const original = files.find((file) => file.path === plan.appointment.target.path);
-    if (
+    const appointment = plan.appointment;
+    const original =
+      'target' in appointment
+        ? files.find((file) => file.path === appointment.target.path)
+        : undefined;
+    if ('repository' in plan.appointment) {
+      if (
+        hashCanonical(this.repositoryScope(run.source.base, manifest)) !==
+          hashCanonical(plan.appointment.repository) ||
+        !('execution' in profile.facts) ||
+        hashCanonical(profile.facts.execution) !== hashCanonical(plan.appointment.execution)
+      )
+        throw Error('Native repository scope changed.');
+    } else if (
       !original ||
       original.hash !== plan.originalHash ||
       original.hash !== plan.appointment.target.baseHash
@@ -3138,9 +3377,8 @@ export class Controller {
       appointment: plan.appointment,
       run,
       attempt: plan.attempt,
-      original: original.content.toString('utf8'),
+      ...(original ? { original: original.content.toString('utf8'), baseHash: original.hash } : {}),
       ...(plan.anthropicSessionId ? { anthropicSessionId: plan.anthropicSessionId } : {}),
-      baseHash: original.hash,
       manifest,
       planArtifact: artifact,
       public: plan.public,
@@ -3160,6 +3398,9 @@ export class Controller {
     if (task?.state !== 'draft' || this.draftEditGate(task))
       throw new Error('The appointment needs an unstarted draft.');
     const route = appointment.route;
+    const billingAttestation =
+      'billingAttestation' in appointment ? appointment.billingAttestation : undefined;
+    const permissionMode = 'permissionMode' in appointment ? appointment.permissionMode : undefined;
     if (
       route.fake ||
       route.qualified ||
@@ -3167,12 +3408,12 @@ export class Controller {
       route.billing !== (appointment.creditPolicy === 'ordinary' ? 'included' : 'credits') ||
       route.speed ||
       (route.family === 'openai'
-        ? route.effort.requested !== route.effort.effective || !!appointment.billingAttestation
+        ? route.effort.requested !== route.effort.effective || !!billingAttestation
         : route.effort.requested !== (route.family === 'anthropic' ? 'medium' : 'low') ||
           route.effort.effective !== 'unknown' ||
           appointment.creditPolicy !== 'ordinary' ||
-          !appointment.billingAttestation) ||
-      (route.family === 'google') !== !!appointment.permissionMode ||
+          !billingAttestation) ||
+      (route.family === 'google') !== !!permissionMode ||
       (route.family === 'google' && !publicScope) ||
       !route.effort.supported.includes(route.effort.requested) ||
       (this.store.get('route', route.id) &&
@@ -3191,8 +3432,22 @@ export class Controller {
     if (source.base !== appointment.consent.sourceBase)
       throw new Error('The appointed source base changed.');
     const files = committedFiles(this.projectPath(task.projectId) as string, source.base);
-    const original = files.find((file) => file.path === appointment.target.path);
-    if (!original || original.bytes > 65_536 || original.hash !== appointment.target.baseHash)
+    const original =
+      'target' in appointment
+        ? files.find((file) => file.path === appointment.target.path)
+        : undefined;
+    if ('repository' in appointment) {
+      if (
+        publicScope?.profileId !== 'openai-repository-v1' ||
+        hashCanonical(this.repositoryScope(source.base, files)) !==
+          hashCanonical(appointment.repository)
+      )
+        throw Error('The appointed repository scope is unavailable.');
+    } else if (
+      !original ||
+      original.bytes > 65_536 ||
+      original.hash !== appointment.target.baseHash
+    )
       throw new Error('The appointed target is unavailable.');
     const methods = appointment.policy.methods ?? [];
     if (
@@ -3233,6 +3488,8 @@ export class Controller {
         : undefined;
     this.nativeDecision(appointment, run, !!publicScope);
     const project = this.store.get<Project>('project', task.projectId) as Project;
+    if ('repository' in appointment && !this.grant(run, 'run-native-tools', project.name))
+      throw Error('The appointment needs a saved native-tool grant.');
     if (!this.grant(run, 'write-scratch', project.name))
       throw new Error('The appointment needs a saved scratch grant.');
     const manifest = files.map(({ content: _content, ...file }) => file);
@@ -3241,8 +3498,7 @@ export class Controller {
       run,
       attempt,
       manifest,
-      original: original.content.toString('utf8'),
-      baseHash: original.hash,
+      ...(original ? { original: original.content.toString('utf8'), baseHash: original.hash } : {}),
       ...(anthropicSessionId ? { anthropicSessionId } : {}),
       ...(publicScope ? { public: publicScope } : {}),
     });
@@ -3259,7 +3515,7 @@ export class Controller {
       run,
       attempt,
       manifest,
-      originalHash: plan.baseHash,
+      ...('repository' in appointment ? {} : { originalHash: plan.baseHash }),
       ...(plan.anthropicSessionId ? { anthropicSessionId: plan.anthropicSessionId } : {}),
       ...(plan.public ? { public: plan.public } : {}),
     };
@@ -3383,6 +3639,34 @@ export class Controller {
     const task = this.store.get<Task>('task', run.taskId);
     const current = this.store.get<Attempt>('attempt', attempt.id);
     const saved = this.store.get<Run>('run', run.id);
+    if ('repository' in appointment) {
+      const project = this.store.get<Project>('project', run.source.projectId);
+      const tools = saved?.policy.policy.effects.find(
+        (grant) =>
+          grant.action === 'run-native-tools' &&
+          grant.taskId === run.taskId &&
+          grant.target === project?.name &&
+          !grant.revoked &&
+          grant.usesRemaining === 1 &&
+          Date.parse(grant.expiresAt) > Date.parse(this.now()),
+      );
+      const consumed = tools && this.store.receipt(this.grantKey(tools));
+      const intent = this.store.intents().find((row) => row.attempt_id === attempt.id);
+      if (
+        !saved ||
+        !project ||
+        !tools ||
+        consumed?.hash !== hashCanonical(tools) ||
+        (consumed.result.entity as Run | undefined)?.id !== run.id ||
+        hashCanonical(saved.policy.policy) !== appointment.consent.policyHash ||
+        !this.grant(saved, 'write-scratch', project.name) ||
+        intent?.run_id !== run.id ||
+        intent.task_id !== run.taskId ||
+        intent.route_id !== attempt.routeId ||
+        intent.generation !== attempt.generation
+      )
+        throw Error('The native repository grants are unavailable.');
+    }
     const lease = this.store.db
       .prepare('SELECT attempt_id,generation FROM writer_leases WHERE task_id=?')
       .get(run.taskId);
@@ -3450,6 +3734,24 @@ export class Controller {
       ...(binding.public ? [binding.public.context.title, binding.public.context.outcome] : []),
       ...(this.store.get<Task>('task', binding.run.taskId) as Task).criteria,
     ];
+    if ('repository' in appointment)
+      return repositoryPlan({
+        attemptId: attempt.id,
+        model: appointment.route.model as WriterPlan['model'],
+        effort: 'low',
+        creditPolicy: appointment.creditPolicy,
+        scratchPath: join(this.home, 'scratch', binding.run.id),
+        sourceBase: appointment.repository.sourceBase,
+        manifestHash: appointment.repository.manifestHash,
+        execution: appointment.execution,
+        context: {
+          title: binding.public?.context.title ?? '',
+          outcome: binding.public?.context.outcome ?? '',
+          criteria: (this.store.get<Task>('task', binding.run.taskId) as Task).criteria,
+        },
+      });
+    if (typeof binding.original !== 'string' || !binding.baseHash)
+      throw Error('The file input is unavailable.');
     const fields = {
       attemptId: attempt.id,
       path: appointment.target.path,
@@ -3506,6 +3808,7 @@ export class Controller {
   ): NonNullable<NativeRuntime['handle']> {
     const { binding } = runtime;
     const { appointment, attempt } = binding;
+    if (!('target' in appointment)) throw Error('The file writer binding changed.');
     const deadline = performance.now() + timeoutMs;
     let active: { stop: () => void } | undefined;
     let quiescent = false;
@@ -3616,6 +3919,7 @@ export class Controller {
   ): NonNullable<NativeRuntime['handle']> {
     const { binding } = runtime;
     const { appointment, attempt } = binding;
+    if (!('target' in appointment)) throw Error('The file writer binding changed.');
     const deadline = performance.now() + timeoutMs;
     let active: { stop: () => void } | undefined;
     let quiescent = false;
@@ -3755,6 +4059,7 @@ export class Controller {
     const finish = (outcome: NativeOutcome | null) => {
       try {
         let applied = false;
+        let repositoryCompleted = false;
         const phases = this.store.nativeProcesses(attempt.id);
         const quiescent =
           outcome?.quiescent === true &&
@@ -3797,50 +4102,118 @@ export class Controller {
             !outcome.reason
           ) {
             this.nativeCurrent(runtime);
-            this.store.transaction(() => {
-              this.nativeCurrent(runtime);
-              const artifact = this.nativeArtifact({
-                attemptId: attempt.id,
-                proposalHash: hashCanonical(outcome.metadata),
-                manifest: binding.manifest,
+            if ('repository' in appointment) {
+              this.repositoryResult(appointment, attempt.id, outcome.metadata);
+              repositoryCompleted = true;
+            } else {
+              this.store.transaction(() => {
+                this.nativeCurrent(runtime);
+                const artifact = this.nativeArtifact({
+                  attemptId: attempt.id,
+                  proposalHash: hashCanonical(outcome.metadata),
+                  manifest: binding.manifest,
+                });
+                this.store.saveReceipt(
+                  `native-application:${attempt.id}`,
+                  artifact.hash,
+                  'local-owner',
+                  { outcome: 'outcome-unknown', entity: artifact },
+                );
               });
-              this.store.saveReceipt(
-                `native-application:${attempt.id}`,
-                artifact.hash,
-                'local-owner',
-                { outcome: 'outcome-unknown', entity: artifact },
+              this.nativeCurrent(runtime);
+              if (!('replacement' in outcome.metadata))
+                throw Error('The file replacement is unavailable.');
+              applyReplacement(intent.scratch_path, binding.manifest, outcome.metadata.replacement);
+              this.store.transaction(() =>
+                this.store.db.prepare('UPDATE receipts SET result=? WHERE command_key=?').run(
+                  canonicalJson({
+                    outcome: 'applied',
+                    entity: this.store.receipt(`native-application:${attempt.id}`)?.result.entity,
+                  }),
+                  `native-application:${attempt.id}`,
+                ),
               );
-            });
-            this.nativeCurrent(runtime);
-            applyReplacement(intent.scratch_path, binding.manifest, outcome.metadata.replacement);
-            this.store.transaction(() =>
-              this.store.db.prepare('UPDATE receipts SET result=? WHERE command_key=?').run(
-                canonicalJson({
-                  outcome: 'applied',
-                  entity: this.store.receipt(`native-application:${attempt.id}`)?.result.entity,
-                }),
-                `native-application:${attempt.id}`,
-              ),
-            );
-            applied = true;
+              applied = true;
+            }
           }
         } catch {
           // A committed intent can outlive an interrupted write. Recovery never reapplies it.
         }
         try {
           if (this.settleJob(attempt, quiescent, true)) {
-            this.store.transaction(() => {
-              const task = this.store.get<Task>('task', run.taskId) as Task;
-              this.closePendingEffects(task);
-              this.updateTask(task, {
-                state: applied ? 'stopped' : 'interrupted',
-                waitingReason: null,
-                next: applied
-                  ? 'Native work is retained. Checks and review remain pending.'
-                  : 'Native work is unverified. Inspect retained ownership and artifacts.',
+            if ('repository' in appointment) {
+              let captured = false,
+                captureFailed = false;
+              try {
+                const candidate = this.sealCandidate(attempt);
+                if (repositoryCompleted) {
+                  this.store.transaction(() => {
+                    const artifact = this.nativeArtifact({
+                      version: 1,
+                      attemptId: attempt.id,
+                      planHash: binding.planArtifact.hash,
+                      completionHash: this.nativeRecord(`native-completion:${attempt.id}`, 4096)
+                        .artifact.hash,
+                      metadataHash: this.nativeRecord(`native-proposal:${attempt.id}`).artifact
+                        .hash,
+                      candidateId: candidate.id,
+                      candidateHash: candidate.hash,
+                      repository: appointment.repository,
+                      execution: appointment.execution,
+                    });
+                    this.store.saveReceipt(
+                      `native-capture:${attempt.id}`,
+                      artifact.hash,
+                      'local-owner',
+                      { outcome: 'applied', entity: artifact },
+                    );
+                  });
+                  captured = true;
+                }
+              } catch {
+                captureFailed = true;
+                try {
+                  this.store.transaction(() => {
+                    const artifact = this.nativeArtifact({
+                      attemptId: attempt.id,
+                      reason: 'capture-unavailable',
+                    });
+                    this.store.saveReceipt(
+                      `native-capture-failure:${attempt.id}`,
+                      artifact.hash,
+                      'local-owner',
+                      { outcome: 'applied', entity: artifact },
+                    );
+                  });
+                } catch {}
+              }
+              this.store.transaction(() => {
+                const task = this.store.get<Task>('task', run.taskId) as Task;
+                this.closePendingEffects(task);
+                this.updateTask(task, {
+                  state: captured ? 'stopped' : 'interrupted',
+                  waitingReason: null,
+                  next: captured
+                    ? 'Native work is retained. Checks and review remain pending.'
+                    : captureFailed
+                      ? 'Native capture failed. Inspect retained scratch; checks and acceptance are unavailable.'
+                      : 'Native work is unverified. Inspect retained changes and export.',
+                });
               });
-            });
-            this.sealCandidate(attempt);
+            } else {
+              this.store.transaction(() => {
+                const task = this.store.get<Task>('task', run.taskId) as Task;
+                this.closePendingEffects(task);
+                this.updateTask(task, {
+                  state: applied ? 'stopped' : 'interrupted',
+                  waitingReason: null,
+                  next: applied
+                    ? 'Native work is retained. Checks and review remain pending.'
+                    : 'Native work is unverified. Inspect retained ownership and artifacts.',
+                });
+              });
+              this.sealCandidate(attempt);
+            }
           }
         } catch {
           // Preserve the journal and bytes when capture cannot finish.
@@ -3892,25 +4265,73 @@ export class Controller {
         runtime.handle = this.launchGoogle(runtime, directory, timeoutMs, onSubmitted);
       } else if (appointment.route.family === 'anthropic') {
         runtime.handle = this.launchAnthropic(runtime, directory, timeoutMs, onSubmitted);
-      } else
-        runtime.handle = startReplacement(
-          {
-            ...appointment.client,
-            directory,
-            repositoryRoot: this.home,
-            environment: binding.environment ?? process.env,
-          },
-          plan as WriterPlan,
-          {
-            timeoutMs,
-            schedule: this.options.schedule,
-            spawn: this.options.nativeSpawn,
-            onSubmitted,
-            lifecycle: this.nativeLifecycle(attempt, () => this.nativeCurrent(runtime)),
-          },
-        );
-      if (runtime.stopped || this.closed) runtime.handle.stop();
-      void runtime.handle.result.then(finish, () => finish(null));
+      } else {
+        const launch = {
+          ...appointment.client,
+          directory,
+          repositoryRoot: this.home,
+          environment: binding.environment ?? process.env,
+        };
+        const options = {
+          timeoutMs,
+          schedule: this.options.schedule,
+          spawn: this.options.nativeSpawn,
+          onSubmitted,
+          lifecycle: this.nativeLifecycle(attempt, () => this.nativeCurrent(runtime)),
+        };
+        runtime.handle =
+          'repository' in appointment
+            ? startRepository(launch, plan as ReturnType<typeof repositoryPlan>, {
+                ...options,
+                onActivity: (activity) => {
+                  const task = this.store.get<Task>('task', run.taskId),
+                    current = this.store.get<Attempt>('attempt', attempt.id),
+                    saved = this.store.get<Run>('run', run.id);
+                  const lease = this.store.db
+                    .prepare('SELECT attempt_id,generation FROM writer_leases WHERE task_id=?')
+                    .get(run.taskId);
+                  const phase = this.store.db
+                    .prepare(
+                      'SELECT phase,state FROM native_processes WHERE attempt_id=? ORDER BY sequence DESC LIMIT 1',
+                    )
+                    .get(attempt.id);
+                  if (
+                    phase?.phase !== 'app-server-task' ||
+                    phase.state !== 'owned' ||
+                    this.closed ||
+                    runtime.stopped ||
+                    this.workers.get(attempt.id) !== runtime ||
+                    task?.runId !== run.id ||
+                    task.state !== 'running' ||
+                    current?.generation !== attempt.generation ||
+                    current.routeId !== attempt.routeId ||
+                    !['intent', 'running'].includes(current.state) ||
+                    saved?.policy.hash !== run.policy.hash ||
+                    lease?.attempt_id !== attempt.id ||
+                    lease.generation !== attempt.generation
+                  )
+                    return;
+                  const paths = ('paths' in activity ? activity.paths : [])
+                    .slice(0, 8)
+                    .map((path) => JSON.stringify(path))
+                    .join(', ');
+                  const text = `Native ${activity.kind === 'command' ? 'command' : 'file changes'} ${activity.state}${paths ? `: ${paths}` : ''}.`;
+                  this.store.transaction(() =>
+                    this.event('attempt.output', task.id, task.revision, {
+                      attemptId: attempt.id,
+                      generation: attempt.generation,
+                      channel: 'stdout',
+                      text,
+                    }),
+                  );
+                },
+              })
+            : startReplacement(launch, plan as WriterPlan, options);
+      }
+      const handle = runtime.handle;
+      if (!handle) throw Error('The native writer owner is unavailable.');
+      if (runtime.stopped || this.closed) handle.stop();
+      void handle.result.then(finish, () => finish(null));
     } catch {
       finish(null);
     }
