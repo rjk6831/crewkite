@@ -1693,6 +1693,10 @@ async function acceptsTransferredCandidate(t: TestContext, transfer: 'reserve' |
   controller.close();
 }
 
+function taskRevision(controller: Controller, taskId: string): number {
+  return TaskSchema.parse(controller.store.get('task', taskId)).revision;
+}
+
 async function nativeWait<T>(
   stage: string,
   pending: Promise<T>,
@@ -2148,7 +2152,7 @@ test('an appointed native proposal is retained and applied once after every phas
               command(
                 'PrepareNativeRun',
                 { ...payload, creditPolicy: 'existing-credits', consent: 'saved' },
-                controller.snapshot().tasks[0].revision,
+                taskRevision(controller, task.id),
               ),
               'local-owner',
             )
@@ -2160,7 +2164,7 @@ test('an appointed native proposal is retained and applied once after every phas
           command(
             'PrepareNativeRun',
             { ...payload, creditPolicy: 'existing-credits' },
-            controller.snapshot().tasks[0].revision,
+            taskRevision(controller, task.id),
           ),
           'local-owner',
         );
@@ -2171,7 +2175,7 @@ test('an appointed native proposal is retained and applied once after every phas
           command(
             'PrepareNativeRun',
             { ...payload, consent: 'saved' },
-            controller.snapshot().tasks[0].revision,
+            taskRevision(controller, task.id),
           ),
           'local-owner',
         );
@@ -2186,7 +2190,7 @@ test('an appointed native proposal is retained and applied once after every phas
           command(
             'PrepareNativeRun',
             { ...payload, consent: 'saved' },
-            controller.snapshot().tasks[0].revision,
+            taskRevision(controller, task.id),
           ),
           'local-owner',
         );
@@ -2213,7 +2217,7 @@ test('an appointed native proposal is retained and applied once after every phas
       startCommand = command(
         'StartRun',
         { taskId: task.id, runId: preview.id },
-        controller.snapshot().tasks[0].revision,
+        taskRevision(controller, task.id),
       );
     }
     const sealed = nativeCandidate(controller);
@@ -2345,7 +2349,7 @@ test('an appointed native proposal is retained and applied once after every phas
             approval.approvalId,
             task.id,
             attempt.attempt_id,
-            controller.snapshot().tasks[0].revision,
+            taskRevision(controller, task.id),
             hashCanonical(request),
             canonicalJson(request),
           );
@@ -2356,7 +2360,7 @@ test('an appointed native proposal is retained and applied once after every phas
             command(
               'ResolveApproval',
               { binding, decision: 'approved' },
-              controller.snapshot().tasks[0].revision,
+              taskRevision(controller, task.id),
             ),
             'local-owner',
           )
@@ -2373,7 +2377,7 @@ test('an appointed native proposal is retained and applied once after every phas
             command(
               'ResolveApproval',
               { binding, decision: 'denied' },
-              controller.snapshot().tasks[0].revision,
+              taskRevision(controller, task.id),
             ),
             'local-owner',
           )
@@ -2402,7 +2406,7 @@ test('an appointed native proposal is retained and applied once after every phas
       command(
         'ExportPatch',
         { taskId: task.id, candidateId: candidate.id },
-        controller.snapshot().tasks[0].revision,
+        taskRevision(controller, task.id),
       ),
       'local-owner',
     );
@@ -2426,7 +2430,7 @@ test('an appointed native proposal is retained and applied once after every phas
       assert.equal(
         (
           await controller.execute(
-            command(name, payload, controller.snapshot().tasks[0].revision),
+            command(name, payload, taskRevision(controller, task.id)),
             'local-owner',
           )
         ).reason,
@@ -2458,7 +2462,7 @@ test('an appointed native proposal is retained and applied once after every phas
             command(
               'ResumeRun',
               { taskId: task.id, runId: run.id },
-              reopened.snapshot().tasks[0].revision,
+              taskRevision(reopened, task.id),
             ),
             'local-owner',
           )
@@ -2475,7 +2479,7 @@ test('an appointed native proposal is retained and applied once after every phas
         command(
           'AmendTask',
           { taskId: task.id, title: task.title, outcome: task.outcome, criteria: task.criteria },
-          reopened.snapshot().tasks[0].revision,
+          taskRevision(reopened, task.id),
         ),
         'local-owner',
       );
@@ -2497,7 +2501,7 @@ test('an appointed native proposal is retained and applied once after every phas
         command(
           'PrepareRun',
           { taskId: task.id, policy: freshPolicy, roles: quickRoles(context.fixtures) },
-          reopened.snapshot().tasks[0].revision,
+          taskRevision(reopened, task.id),
         ),
         'local-owner',
       );
@@ -2520,7 +2524,7 @@ test('an appointed native proposal is retained and applied once after every phas
             command(
               'StopRun',
               { taskId: task.id, runId: ordinary.id },
-              reopened.snapshot().tasks[0].revision,
+              taskRevision(reopened, task.id),
             ),
             'local-owner',
           );
@@ -2551,7 +2555,7 @@ test('an appointed native proposal is retained and applied once after every phas
                 candidateId: candidate.id,
                 destinationRef: 'refs/heads/feat/native-fixture',
               },
-              reopened.snapshot().tasks[0].revision,
+              taskRevision(reopened, task.id),
             ),
             'local-owner',
           )
@@ -2650,7 +2654,7 @@ test('an appointed native proposal is retained and applied once after every phas
         },
       ],
     };
-    const revision = () => controller.snapshot().tasks[0].revision;
+    const revision = () => taskRevision(controller, task.id);
     if (scenario === 'checked') {
       for (const change of [
         { consent: 'saved' },
@@ -3193,7 +3197,7 @@ test('an appointed native proposal is retained and applied once after every phas
             command(
               'StopRun',
               { taskId: task.id, runId: run.id },
-              controller.snapshot().tasks[0].revision,
+              taskRevision(controller, task.id),
             ),
             'local-owner',
           )
@@ -3231,7 +3235,7 @@ test('an appointed native proposal is retained and applied once after every phas
             outcome: task.outcome,
             criteria: task.criteria,
           },
-          controller.snapshot().tasks[0].revision,
+          taskRevision(controller, task.id),
         ),
         'local-owner',
       );
@@ -3241,7 +3245,7 @@ test('an appointed native proposal is retained and applied once after every phas
             command(
               'PrepareNativeRun',
               { ...payload, consent: 'saved' },
-              controller.snapshot().tasks[0].revision,
+              taskRevision(controller, task.id),
             ),
             'local-owner',
           )
@@ -3259,7 +3263,7 @@ test('an appointed native proposal is retained and applied once after every phas
           command(
             'StartRun',
             { taskId: task.id, runId: run.id },
-            controller.snapshot().tasks[0].revision,
+            taskRevision(controller, task.id),
           ),
           'local-owner',
         )
@@ -3292,7 +3296,7 @@ test('an appointed native proposal is retained and applied once after every phas
           command(
             'StartRun',
             { taskId: task.id, runId: first.id },
-            controller.snapshot().tasks[0].revision,
+            taskRevision(controller, task.id),
           ),
           'local-owner',
         )
@@ -3346,7 +3350,7 @@ test('an appointed native proposal is retained and applied once after every phas
           command(
             'StartRun',
             { taskId: secondTask.id, runId: second.id },
-            controller.snapshot().tasks.find((value) => value.id === secondTask.id)?.revision,
+            taskRevision(controller, secondTask.id),
           ),
           'local-owner',
         )
@@ -3440,7 +3444,7 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
               command(
                 'StopRun',
                 { taskId: task.id, runId: controller.snapshot().tasks[0].runId },
-                controller.snapshot().tasks[0].revision,
+                taskRevision(controller, task.id),
               ),
               'local-owner',
             );
@@ -3469,7 +3473,7 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
             command(
               'StopRun',
               { taskId: task.id, runId: controller.snapshot().tasks[0].runId },
-              controller.snapshot().tasks[0].revision,
+              taskRevision(controller, task.id),
             ),
             'local-owner',
           );
@@ -3507,7 +3511,7 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
       startCommand = command(
         'StartRun',
         { taskId: task.id, runId: RunSchema.parse(prepared.entity).id },
-        controller.snapshot().tasks[0].revision,
+        taskRevision(controller, task.id),
       );
     }
     const started = startCommand
@@ -3528,7 +3532,7 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
         await context.wait(`${scenario} close`, Promise.resolve(first));
       } else {
         await controller.execute(
-          command('StopRun', { taskId: task.id, runId }, controller.snapshot().tasks[0].revision),
+          command('StopRun', { taskId: task.id, runId }, taskRevision(controller, task.id)),
           'local-owner',
         );
         await context.wait('candidate', sealed);
@@ -3590,7 +3594,7 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
       assert.equal(
         (
           await reopened.execute(
-            command('StartRun', { taskId: task.id, runId }, reopened.snapshot().tasks[0].revision),
+            command('StartRun', { taskId: task.id, runId }, taskRevision(reopened, task.id)),
             'local-owner',
           )
         ).outcome,
@@ -3599,7 +3603,7 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
       assert.equal(
         (
           await reopened.execute(
-            command('ResumeRun', { taskId: task.id, runId }, reopened.snapshot().tasks[0].revision),
+            command('ResumeRun', { taskId: task.id, runId }, taskRevision(reopened, task.id)),
             'local-owner',
           )
         ).reason,
