@@ -83,7 +83,9 @@ The native settings are fixed: `workspace-write`, approval `never` and network a
 
 The controller captures actual scratch after owned processes are quiescent. A matching completed turn and bound capture receipt permit separate evaluation. Partial work after failure or Stop remains unverified and inspectable; uncertain ownership blocks capture. Native command output establishes no check evidence. Review includes every changed text file, with original and candidate hashes, content and modes, including additions and deletions. The full structured review input is capped at 256 KiB. Unsupported text or an oversized collection blocks review. Local checks and destination-specific acceptance keep their separate grants.
 
-The [desktop and CLI path](../apps/cli/README.md#native-repository-work) is covered by offline fixtures. Connected repository qualification remains pending. Existing single-file pilot evidence does not qualify this profile.
+One supervised synthetic task used the normal [desktop preparation and Start path](../apps/cli/README.md#native-repository-work). It completed after 68.528 seconds with one submission, changed `net.mjs`, added `docs/calculation.md` and retained a 1,177-byte patch. The run recorded native command activity, and the desktop displayed the full diff. The CLI exported the same candidate, and the same home reopened it without another submission. Original source, index, refs and unselected files stayed unchanged. All three native phases were quiescent with groups absent, and every owned process closed with zero status.
+
+That run used explicitly enabled existing credits. It ran no CrewKite checks, review or acceptance and did not exercise active Stop. Live repository Stop, package recovery and useful repository work checked through explicit project test selection remain pending. The profile's qualification date remains unset; existing single-file pilot evidence keeps its separate scope.
 
 ## Applying a replacement
 
