@@ -677,6 +677,23 @@ const candidateEvaluationStart = z
     reason: CandidateEvaluationStartReasonSchema,
   })
   .refine((value) => value.available === (value.reason === 'available'));
+const localAcceptance = z
+  .strictObject({
+    available: z.boolean(),
+    reason: z.enum([
+      'available',
+      'evidence-incomplete',
+      'ownership-unknown',
+      'candidate-changed',
+      'source-changed',
+      'git-identity-missing',
+      'approval-pending',
+      'publication-prepared',
+      'accepted',
+    ]),
+  })
+  .refine((value) => value.available === (value.reason === 'available'))
+  .default({ available: false, reason: 'evidence-incomplete' });
 export const CandidateEvaluationPreviewSchema = z.strictObject({
   taskId: TaskIdSchema,
   runId: RunIdSchema,
@@ -723,6 +740,7 @@ export const CandidateEvaluationPreviewSchema = z.strictObject({
     .nullable(),
   checkStart: candidateEvaluationStart,
   reviewStart: candidateEvaluationStart,
+  localAcceptance,
 });
 export type CandidateEvaluationPreview = z.infer<typeof CandidateEvaluationPreviewSchema>;
 
