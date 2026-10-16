@@ -19,13 +19,14 @@ export type NativeLaunch = {
   repositoryRoot: string;
   environment: NodeJS.ProcessEnv;
 };
+type NativeRequest = DiscoveryRequest | 'thread/start' | 'turn/start' | 'turn/completed';
 type Outcome<T = DiscoveryMetadata> = {
   metadata: T | null;
   reason: 'stopped' | 'deadline' | 'launch' | 'protocol' | 'output-limit' | 'ownership' | null;
   quiescent: boolean;
   exitCode: number | null;
   signal: NodeJS.Signals | null;
-  lastRequest: DiscoveryRequest;
+  lastRequest: NativeRequest;
   lastEnvelope: DiscoveryEnvelope;
   refusedEnvelope: RefusedEnvelope | null;
   notifications: number;
@@ -37,7 +38,9 @@ export type NativeTranscript<T> = {
   push: (bytes: Uint8Array) => void;
   finish: () => T;
   readonly complete: boolean;
-  readonly pendingRequest: DiscoveryRequest;
+  readonly pendingRequest: NativeRequest;
+  readonly submitted?: boolean;
+  interrupt?: () => Uint8Array | null;
   readonly lastEnvelope: DiscoveryEnvelope;
   readonly refusedEnvelope: RefusedEnvelope | null;
   readonly notifications: number;
@@ -129,11 +132,15 @@ function startTranscript<T>(
     arguments: (directory: string) => string[];
     reader: NativeTranscript<T>;
     closeInput?: boolean;
+    task?: boolean;
+    deadline?: number;
+    onSubmitted?: () => void;
   },
 ): { group: number; result: Promise<Outcome<T>>; stop: () => void } {
   if (process.platform === 'win32') throw new Error('Discovery requires Unix process ownership.');
   const now = options.now ?? (() => performance.now());
   const started = now();
+  const deadline = options.deadline ?? started + options.timeoutMs;
   const schedule: Schedule =
     options.schedule ??
     ((work, milliseconds) => {
@@ -177,6 +184,8 @@ function startTranscript<T>(
   const reader = options.reader;
   childDirectory(directory, 'logs');
   childDirectory(directory, 'sqlite');
+  if (options.task && now() >= deadline - 2000)
+    throw new Error('Native task deadline elapsed before launch.');
   const child = (options.spawn ?? spawn)(executable, options.arguments(directory), {
     cwd: directory,
     env: nativeDiscoveryEnvironment(launch.environment),
@@ -231,16 +240,51 @@ function startTranscript<T>(
     reason ??= failure;
     if (stopping) return;
     stopping = true;
-    child.stdin.end();
+    if (options.task) {
+      try {
+        const interrupt = reader.interrupt?.();
+        if (interrupt) child.stdin.write(interrupt);
+      } catch {
+        // Owned termination still runs if the protocol can no longer accept an interrupt.
+      }
+      cancellations.push(
+        schedule(
+          () => {
+            child.stdin.end();
+            signal('SIGTERM');
+          },
+          Math.max(0, Math.min(250, deadline - now())),
+        ),
+      );
+    } else {
+      child.stdin.end();
+    }
     if (closed && absent()) return settle(true);
-    signal('SIGTERM');
-    cancellations.push(schedule(() => signal('SIGKILL'), 1000));
-    cancellations.push(schedule(() => settle(closed && absent()), 2000));
+    if (!options.task) signal('SIGTERM');
+    cancellations.push(
+      schedule(
+        () => signal('SIGKILL'),
+        options.task ? Math.max(0, Math.min(1000, deadline - now())) : 1000,
+      ),
+    );
+    cancellations.push(
+      schedule(
+        () => settle(closed && absent()),
+        options.task ? Math.max(0, Math.min(2000, deadline - now())) : 2000,
+      ),
+    );
   };
+  let submissionReported = false;
   const advance = () => {
     try {
       const request = reader.next();
-      if (request) child.stdin.write(request);
+      if (request) {
+        if (reader.submitted && !submissionReported) {
+          submissionReported = true;
+          options.onSubmitted?.();
+        }
+        child.stdin.write(request);
+      }
       if (reader.complete) {
         metadata = reader.finish();
         child.stdin.end();
@@ -288,7 +332,12 @@ function startTranscript<T>(
     else stop(reason);
   });
   cancellations.push(
-    schedule(() => stop('deadline'), Math.max(0, options.timeoutMs - (now() - started))),
+    schedule(
+      () => stop('deadline'),
+      options.task
+        ? Math.max(0, deadline - now() - 2000)
+        : Math.max(0, options.timeoutMs - (now() - started)),
+    ),
   );
   advance();
   if (options.closeInput) child.stdin.end();
@@ -332,13 +381,15 @@ class FeatureList implements NativeTranscript<DisabledFeatures> {
 }
 
 /** Each process has independent ownership evidence. Policy can change between observations. */
-export function startNativeSession<T>(
+function nativeSession<T>(
   launch: NativeLaunch,
   options: {
     timeoutMs: number;
     now?: () => number;
     schedule?: Schedule;
     spawn?: Spawn;
+    task?: boolean;
+    onSubmitted?: () => void;
   },
   createReader: (remainingMs: number) => NativeTranscript<T>,
 ) {
@@ -347,15 +398,17 @@ export function startNativeSession<T>(
   if (
     !Number.isFinite(started) ||
     !Number.isSafeInteger(options.timeoutMs) ||
-    options.timeoutMs < 1 ||
-    options.timeoutMs > 60_000
+    options.timeoutMs < (options.task ? 2001 : 1) ||
+    options.timeoutMs > (options.task ? 300_000 : 60_000)
   )
     throw new Error('Discovery deadline is invalid.');
+  const deadline = started + options.timeoutMs;
   let stopped = false;
   const preflight = startTranscript(launch, {
     ...options,
     now,
     reader: new FeatureList(),
+    ...(options.task ? { deadline } : {}),
     closeInput: true,
     arguments: (directory) => [
       ...nativeDiscoveryArguments(directory).slice(0, -3),
@@ -369,13 +422,15 @@ export function startNativeSession<T>(
     if (!outcome.quiescent || outcome.reason || stopped)
       return { ...outcome, metadata: null, reason: outcome.reason ?? 'stopped' };
     const remaining = Math.floor(options.timeoutMs - (now() - started));
-    if (remaining < 1) return { ...outcome, metadata: null, reason: 'deadline' };
+    if (remaining < (options.task ? 2001 : 1))
+      return { ...outcome, metadata: null, reason: 'deadline' };
     try {
       const reader = createReader(remaining);
       const discovery = startTranscript(launch, {
         ...options,
         now,
         timeoutMs: remaining,
+        ...(options.task ? { deadline } : {}),
         reader,
         arguments: nativeDiscoveryArguments,
       });
@@ -383,7 +438,11 @@ export function startNativeSession<T>(
       groups.push(discovery.group);
       return discovery.result;
     } catch {
-      return { ...outcome, metadata: null, reason: 'launch' };
+      return {
+        ...outcome,
+        metadata: null,
+        reason: options.task && now() >= deadline - 2000 ? 'deadline' : 'launch',
+      };
     }
   });
   return {
@@ -399,6 +458,30 @@ export function startNativeSession<T>(
       current.stop();
     },
   };
+}
+
+/** Metadata callers retain their original deadline and cleanup behavior. */
+export function startNativeSession<T>(
+  launch: NativeLaunch,
+  options: { timeoutMs: number; now?: () => number; schedule?: Schedule; spawn?: Spawn },
+  createReader: (remainingMs: number) => NativeTranscript<T>,
+) {
+  return nativeSession(launch, options, createReader);
+}
+
+/** A task reserves two seconds for native interruption and owned termination. */
+export function startNativeTask<T>(
+  launch: NativeLaunch,
+  options: {
+    timeoutMs: number;
+    now?: () => number;
+    schedule?: Schedule;
+    spawn?: Spawn;
+    onSubmitted: () => void;
+  },
+  createReader: (remainingMs: number) => NativeTranscript<T>,
+) {
+  return nativeSession(launch, { ...options, task: true }, createReader);
 }
 
 /** Discovery keeps the fixed metadata transcript and caller bound. */
