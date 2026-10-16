@@ -253,6 +253,7 @@ export class ReplacementTranscript {
       now: options.now,
       timeoutMs: Math.min(60_000, options.timeoutMs),
       readConfiguration: true,
+      readMcpConfiguration: true,
       configurationDirectory: this.plan.directory,
     });
   }
@@ -378,6 +379,11 @@ export class ReplacementTranscript {
               this.metadata.account.plan !== 'pro' ||
               this.metadata.limits.ordinaryUsageAllowed !== true ||
               !model?.supportedReasoningEfforts.includes(this.plan.effort)
+            )
+              this.refuse('admission');
+            if (
+              !this.metadata.mcpServers ||
+              Object.values(this.metadata.mcpServers).some((enabled) => enabled)
             )
               this.refuse('admission');
             this.step = 'thread';
@@ -779,10 +785,14 @@ export function startReplacement(
     throw new Error('The replacement directory differs from the owned session.');
   const now = options.now ?? (() => performance.now());
   let reader: ReplacementTranscript | undefined;
-  const handle = startNativeTask(launch, { ...options, now }, (remaining) => {
-    reader = new ReplacementTranscript(trusted, { now, timeoutMs: remaining });
-    return reader;
-  });
+  const handle = startNativeTask(
+    launch,
+    { ...options, now, disableMcpServers: true },
+    (remaining) => {
+      reader = new ReplacementTranscript(trusted, { now, timeoutMs: remaining });
+      return reader;
+    },
+  );
   return {
     get group() {
       return handle.group;

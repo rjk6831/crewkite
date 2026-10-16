@@ -29,6 +29,7 @@ const configuration = {
   chatgpt_base_url: 'https://chatgpt.com/backend-api/',
   openai_base_url: '',
   features: { plugins: false, remote_plugin: false, apps: false, hooks: false, multi_agent: false },
+  mcp_servers: { fixture_server: { enabled: false } },
 };
 const replies: Record<string, unknown> = {
   initialize: { userAgent: 'private-data', platformFamily: 'unix', platformOs: 'fixture' },
@@ -275,6 +276,10 @@ test('a replacement requires one matching completed turn and bounded original-fi
       params: { threadId: 'thread-1', environmentId: 'local' },
     },
     {
+      method: 'mcpServer/startupStatus/updated',
+      params: { threadId: 'thread-1', name: 'private server', status: 'starting' },
+    },
+    {
       method: 'thread/settings/updated',
       params: { threadId: 'foreign', threadSettings: threadSettings(directory) },
     },
@@ -314,7 +319,9 @@ test('a replacement requires one matching completed turn and bounded original-fi
     assert.equal(rejected.complete, false);
     assert.equal(
       rejected.diagnostic?.method,
-      notice.method.startsWith('thread/environment/') ? 'other' : notice.method,
+      notice.method.startsWith('thread/environment/') || notice.method.startsWith('mcpServer/')
+        ? 'other'
+        : notice.method,
     );
   }
   const canary = 'private-diagnostic-canary';
@@ -448,6 +455,25 @@ test('a replacement requires one matching completed turn and bounded original-fi
     );
     assert.equal(blocked.submitted, false);
   }
+  for (const mcp_servers of [
+    undefined,
+    { fixture_server: { enabled: true } },
+    { fixture_server: { enabled: 'false' } },
+    { 'unsafe.name': { enabled: false } },
+    Object.fromEntries(
+      Array.from({ length: 129 }, (_, index) => [`server_${index}`, { enabled: false }]),
+    ),
+  ]) {
+    const blocked = new ReplacementTranscript(plan(directory), {
+      now: () => 1,
+      timeoutMs: 300_000,
+    });
+    assert.throws(() =>
+      metadata(blocked, { 'config/read': { config: { ...configuration, mcp_servers } } }),
+    );
+    assert(!['thread/start', 'turn/start'].includes(blocked.pendingRequest));
+    assert.equal(blocked.submitted, false);
+  }
   const reader = new ReplacementTranscript(plan(directory), { now: () => 1, timeoutMs: 300_000 });
   metadata(reader);
   reader.push(bytes({ id: 10, result: threadResult(directory) }));
@@ -501,6 +527,7 @@ input.on('line', line => {
     return;
   }
   let result = replies[message.method];
+  if (message.method === 'config/read') result = {config:{...replies['config/read'].config,mcp_servers:{fixture_server:{enabled:phase === 'prepare',command:'private-diagnostic-canary',env:{secret:'private-diagnostic-canary'}},...(mode === 'mcp-drift' && phase === 'task' ? {new_server:{enabled:true}} : {})}}};
   if (message.method === 'thread/start') result = thread(process.cwd());
   if (message.method === 'turn/start' && mode === 'rpc-error') {
     process.stdout.write(JSON.stringify({id:message.id,error:{code:-32602,message:'private-diagnostic-canary',data:{account:'private-diagnostic-canary'}}})+'\\n');
@@ -528,12 +555,24 @@ test('native task submission and interruption share one deadline through owned c
   const digest = createHash('sha256').update(readFileSync(process.execPath)).digest('hex');
   const owned: Array<{ child: ChildProcessWithoutNullStreams; closed: Promise<void> }> = [];
   try {
-    for (const mode of ['success', 'cancel', 'deadline', 'unknown', 'rpc-error']) {
+    for (const mode of [
+      'success',
+      'cancel',
+      'deadline',
+      'unknown',
+      'rpc-error',
+      'prepare-cancel',
+      'prepare-deadline',
+      'mcp-drift',
+    ]) {
       const directory = resolve(root, mode);
       mkdirSync(directory, { mode: 0o700 });
       const calls: Array<{ milliseconds: number; work: () => void; active: boolean }> = [];
       const writes: string[] = [];
       let submission = 0;
+      let now = 100;
+      let appServers = 0;
+      const runGroups: number[] = [];
       let requestStop: (() => void) | undefined;
       let stopReady!: () => void;
       const ready = new Promise<void>((resolve) => {
@@ -550,7 +589,7 @@ test('native task submission and interruption share one deadline through owned c
         plan(directory),
         {
           timeoutMs: 300_000,
-          now: () => 100,
+          now: () => now,
           onSubmitted: () => {
             submission++;
           },
@@ -562,20 +601,38 @@ test('native task submission and interruption share one deadline through owned c
             };
           },
           spawn: (executable, args, options) => {
-            const child = spawn(
-              executable,
-              ['-e', fixture, mode, args.at(-1) === 'list' ? 'features' : 'task'],
-              options,
+            const phase =
+              args.at(-1) === 'list' ? 'features' : ++appServers === 1 ? 'prepare' : 'task';
+            assert(
+              runGroups.every(groupAbsent),
+              'each preceding phase must be quiescent before spawn',
             );
+            if (phase === 'task') assert(args.includes('mcp_servers.fixture_server.enabled=false'));
+            else assert(!args.some((arg) => arg.startsWith('mcp_servers.')));
+            const child = spawn(executable, ['-e', fixture, mode, phase], options);
+            if (child.pid) runGroups.push(child.pid);
+            if (phase === 'prepare' && mode === 'prepare-deadline')
+              child.once('close', () => {
+                now = 299_000;
+              });
             owned.push({
               child,
               closed: new Promise((resolve) => child.once('close', () => resolve())),
             });
             const write = child.stdin.write.bind(child.stdin);
             child.stdin.write = ((data: string | Uint8Array) => {
+              assert(handle.groups.includes(child.pid as number), 'journal ownership before input');
               writes.push(Buffer.from(data).toString());
               const result = write(data);
-              if (Buffer.from(data).toString().includes('"method":"turn/start"')) {
+              if (
+                Buffer.from(data).toString().includes('"method":"turn/start"') ||
+                (Buffer.from(data).toString().includes('"method":"config/read"') &&
+                  mode === 'prepare-cancel' &&
+                  phase === 'prepare') ||
+                (Buffer.from(data).toString().includes('"method":"model/list"') &&
+                  mode === 'mcp-drift' &&
+                  phase === 'task')
+              ) {
                 child.stdout.once('data', () => {
                   requestStop?.();
                   stopReady();
@@ -588,11 +645,11 @@ test('native task submission and interruption share one deadline through owned c
         },
       );
       requestStop = () => {
-        if (mode === 'cancel' || mode === 'unknown') handle.stop();
+        if (mode === 'cancel' || mode === 'unknown' || mode === 'prepare-cancel') handle.stop();
         if (mode === 'deadline')
           calls.findLast((value) => value.active && value.milliseconds === 298_000)?.work();
       };
-      if (mode !== 'success') {
+      if (mode !== 'success' && mode !== 'prepare-deadline') {
         await ready;
         // Advance the injected termination grace after the exact native interrupt is written.
         calls
@@ -602,13 +659,16 @@ test('native task submission and interruption share one deadline through owned c
           ?.work();
       }
       const result = await handle.result;
-      assert.equal(submission, 1, mode);
+      const submitted = mode.startsWith('prepare-') || mode === 'mcp-drift' ? 0 : 1;
+      assert.equal(submission, submitted, mode);
       assert.equal(
         writes.filter((value) => value.includes('"method":"turn/start"')).length,
-        1,
+        submitted,
         mode,
       );
       assert.equal(result.quiescent, mode !== 'unknown', mode);
+      assert.equal(handle.groups.length, mode.startsWith('prepare-') ? 2 : 3, mode);
+      assert(!JSON.stringify(result).includes('private-diagnostic-canary'));
       if (mode !== 'unknown')
         assert(
           handle.groups.every((group) => groupAbsent(group)),
@@ -627,16 +687,16 @@ test('native task submission and interruption share one deadline through owned c
           result.reason,
           mode === 'unknown'
             ? 'ownership'
-            : mode === 'rpc-error'
+            : mode === 'rpc-error' || mode === 'mcp-drift'
               ? 'protocol'
-              : mode === 'cancel'
+              : mode === 'cancel' || mode === 'prepare-cancel'
                 ? 'stopped'
                 : 'deadline',
           mode,
         );
         assert.equal(
           writes.filter((value) => value.includes('"method":"turn/interrupt"')).length,
-          mode === 'rpc-error' ? 0 : 1,
+          ['cancel', 'deadline', 'unknown'].includes(mode) ? 1 : 0,
           mode,
         );
         if (mode === 'rpc-error') {
