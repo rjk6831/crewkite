@@ -76,24 +76,7 @@ Current-state tables in SQLite are authoritative. An ordered event log explains 
 
 A task moves through these visible states:
 
-```mermaid
-stateDiagram-v2
-  [*] --> draft
-  draft --> running: start (admitted)
-  running --> waiting: approval, capacity or dependency
-  waiting --> running
-  running --> handing_off: reserve reached or route lost
-  handing_off --> running: successor admitted
-  running --> stopping: stop requested
-  stopping --> stopped: quiescence proven
-  stopping --> unknown: ownership unproven
-  running --> interrupted: controller restart
-  interrupted --> running: reconciled and resumed
-  running --> checking: work sealed as candidate
-  checking --> ready: evidence recorded
-  ready --> accepted: new local branch created
-  running --> failed
-```
+![Task states from draft through running, waiting, handoff, stopping, recovery, checking and acceptance.](images/task-states.svg)
 
 `unknown` blocks sealing, takeover, cleanup and acceptance until the controller proves no writer remains.
 

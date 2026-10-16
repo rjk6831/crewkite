@@ -55,19 +55,7 @@ Review pending approval opens the existing approval card and focuses its review 
 
 ## How it fits together
 
-```mermaid
-flowchart LR
-  desktop[Desktop app] --> client[Shared client]
-  cli[CLI] --> client
-  client -- private socket --> controller
-  subgraph controller[Controller]
-    state[(SQLite state)]
-    artifacts[(Immutable artifacts)]
-    router[Usage-aware router]
-    host[Execution host]
-  end
-  host --> scripted[Scripted fake routes]
-```
+![Desktop and CLI connect through a shared client to one controller and scripted fake routes.](docs/images/controller-overview.svg)
 
 The controller is a headless Node process. It owns permissions, budgets, task ownership, evidence and acceptance. Models propose plans and edits. Deterministic code decides what runs. [Architecture](docs/architecture.md) covers these boundaries. Official subscription clients and local inference remain qualification targets in [provider routes](docs/providers.md).
 
