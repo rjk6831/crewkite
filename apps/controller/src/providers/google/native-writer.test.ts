@@ -16,6 +16,12 @@ const hash = (value: string | Buffer) => createHash('sha256').update(value).dige
 const original = 'export const total = 0;\n';
 const file = { path: 'net.mjs', baseHash: hash(original), content: original };
 const attemptId = 'att_01M51M322B2AEBXD9MA74CBCFM';
+const permissionModes = [
+  'request-review',
+  'strict',
+  'always-proceed',
+  'proceed-in-sandbox',
+] as const;
 const replacement = { attemptId, ...file, content: 'export const total = 1;\n' };
 const usage = {
   input_tokens: 1,
@@ -46,9 +52,11 @@ assert(args.includes('--sandbox')&&args.includes('--disable-slash-commands'));
 assert(!args.includes('--dangerously-skip-permissions'));
 assert(process.env.HOME&&process.env.USER&&process.env.LOGNAME);
 assert(Object.keys(process.env).every(key=>['HOME','USER','LOGNAME','PATH','LANG','TERM','NO_COLOR','TMPDIR','__CF_USER_TEXT_ENCODING'].includes(key)),JSON.stringify(Object.keys(process.env)));
-const start={event:'init',conversation_id:'session',init:{cwd:process.cwd(),tools:['view_file'],permission_mode:'request-review',model:value('--model')}};
+const permissionMode=['strict','always-proceed','proceed-in-sandbox'].includes(mode)?mode:'request-review';
+const start={event:'init',conversation_id:'session',init:{cwd:process.cwd(),tools:['view_file'],permission_mode:permissionMode,model:value('--model')}};
 const result={event:'result',result:{conversation_id:mode==='wrong-session'?'other':'session',status:mode==='failed'?'ERROR':'SUCCESS',response:'discarded',duration_seconds:0,num_turns:1,usage:${JSON.stringify(usage)},structured_output:{...file,content:'export const total = 1;\n'}}};
-if(mode==='invalid-utf8') process.stdout.write(Buffer.from([255,10]));
+if(mode==='startup-notice') process.stdout.write(JSON.stringify({event:'future',message:'private@example.test'})+'\n');
+else if(mode==='invalid-utf8') process.stdout.write(Buffer.from([255,10]));
 else if(mode==='oversized')process.stdout.write('x'.repeat(1048577));
 else {
  process.stdout.write(JSON.stringify(start)+'\n');
@@ -114,9 +122,104 @@ else {
         structured_output: replacement,
       },
     };
+    const step = {
+      event: 'step_update',
+      step_update: { conversation_id: 'session', step_index: 1, state: 'ACTIVE' },
+    };
     const wire = (value: unknown) => new TextEncoder().encode(`${JSON.stringify(value)}\n`);
     const decoderCases = [
       { name: 'fragmented valid stream', events: [start, end], ok: true },
+      ...permissionModes.map((permissionMode) => ({
+        name: `matching native permission mode ${permissionMode}`,
+        permissionMode,
+        events: [{ ...start, init: { ...start.init, permission_mode: permissionMode } }, end],
+        ok: true,
+      })),
+      {
+        name: 'step category may be omitted across producer state transitions',
+        events: [
+          start,
+          step,
+          { ...step, step_update: { ...step.step_update, state: 'ERROR' } },
+          { ...step, step_update: { ...step.step_update, state: 'DONE' } },
+          end,
+        ],
+        ok: true,
+      },
+      {
+        name: 'producer step categories remain bounded metadata',
+        events: [
+          start,
+          ...[
+            'user_input',
+            'agent_response',
+            'tool',
+            'checkpoint',
+            'finish',
+            'unknown',
+            'subagent',
+            'system_message',
+            'error_message',
+          ].map((step_type) => ({
+            ...step,
+            step_update: { ...step.step_update, step_type },
+          })),
+          end,
+        ],
+        ok: true,
+      },
+      {
+        name: 'unknown step category',
+        field: 'step_type',
+        events: [
+          start,
+          { ...step, step_update: { ...step.step_update, step_type: 'private@example.test' } },
+          end,
+        ],
+      },
+      {
+        name: 'unknown step state',
+        field: 'state',
+        events: [
+          start,
+          { ...step, step_update: { ...step.step_update, state: 'private@example.test' } },
+          end,
+        ],
+      },
+      {
+        name: 'step session required',
+        events: [
+          start,
+          { ...step, step_update: { ...step.step_update, conversation_id: undefined } },
+          end,
+        ],
+      },
+      {
+        name: 'step index required',
+        field: 'step_index',
+        events: [
+          start,
+          { ...step, step_update: { ...step.step_update, step_index: undefined } },
+          end,
+        ],
+      },
+      {
+        name: 'step state required',
+        events: [start, { ...step, step_update: { ...step.step_update, state: undefined } }, end],
+      },
+      {
+        name: 'step session remains bound',
+        events: [
+          start,
+          { ...step, step_update: { ...step.step_update, conversation_id: 'foreign' } },
+          end,
+        ],
+      },
+
+      {
+        name: 'error step alone supplies no successful terminal result',
+        events: [start, { ...step, step_update: { ...step.step_update, state: 'ERROR' } }],
+      },
       { name: 'result before init', events: [end] },
       { name: 'duplicate init', events: [start, start, end] },
       {
@@ -124,14 +227,38 @@ else {
         events: [start, { event: 'future', private: 'private@example.test' }],
       },
       {
-        name: 'unrestricted permission mode',
+        name: 'reported permission mode must match admission',
         events: [{ ...start, init: { ...start.init, permission_mode: 'always-proceed' } }, end],
       },
+      {
+        name: 'admitted mode must match reported permission mode',
+        permissionMode: 'always-proceed' as const,
+        events: [start, end],
+      },
+      ...[
+        { name: 'unknown permission mode', value: 'private@example.test' },
+        { name: 'missing permission mode', value: undefined },
+        { name: 'wrong permission mode type', value: 7 },
+      ].map(({ name, value }) => ({
+        name,
+        field: 'permission_mode',
+        events: [{ ...start, init: { ...start.init, permission_mode: value } }, end],
+      })),
       {
         name: 'wrong directory',
         events: [{ ...start, init: { ...start.init, cwd: '/outside' } }, end],
       },
       { name: 'wrong model', events: [{ ...start, init: { ...start.init, model: 'other' } }, end] },
+      {
+        name: 'malformed model',
+        events: [{ ...start, init: { ...start.init, model: 7 } }],
+        field: 'model',
+      },
+      {
+        name: 'malformed tools',
+        events: [{ ...start, init: { ...start.init, tools: 7 } }],
+        field: 'tools',
+      },
       {
         name: 'wrong file',
         events: [
@@ -157,6 +284,7 @@ else {
       },
       {
         name: 'negative usage',
+        field: 'input_tokens',
         events: [
           start,
           { ...end, result: { ...end.result, usage: { ...usage, input_tokens: -1 } } },
@@ -185,7 +313,8 @@ else {
     for (const entry of decoderCases) {
       const reader = new GoogleWriterOutput({
         attemptId,
-        permissionMode: 'request-review',
+        permissionMode:
+          ('permissionMode' in entry ? entry.permissionMode : undefined) ?? 'request-review',
         directory,
         model: admission.model,
         path: file.path,
@@ -198,21 +327,35 @@ else {
         }
         return reader.finish();
       };
-      if (entry.ok) assert.deepEqual(read().replacement, replacement, entry.name);
-      else
+      if ('ok' in entry && entry.ok) assert.deepEqual(read().replacement, replacement, entry.name);
+      else {
         assert.throws(
           read,
           (error) => error instanceof GoogleWriterError && !error.message.includes('private'),
           entry.name,
         );
+        const diagnostic = reader.diagnostic;
+        assert(diagnostic, entry.name);
+        if ('field' in entry) assert.equal(diagnostic.field, entry.field, entry.name);
+        assert(Object.isFrozen(diagnostic), entry.name);
+        assert(!JSON.stringify(diagnostic).includes('private'), entry.name);
+        assert.throws(
+          () => reader.finish(),
+          (error) => error instanceof GoogleWriterError && error.diagnostic === diagnostic,
+          entry.name,
+        );
+      }
     }
     for (const mode of [
       'good',
+      ...permissionModes.slice(1),
+      'unknown-permission',
       'cancelled',
       'wrong-session',
       'failed',
       'truncated',
       'invalid-utf8',
+      'startup-notice',
       'oversized',
       'descendant',
       'old-build',
@@ -226,6 +369,10 @@ else {
         client: mode === 'old-build' ? { ...client, version: '1.1.10' } : client,
         admission: {
           ...admission,
+          permissions:
+            mode === 'unknown-permission'
+              ? 'private@example.test'
+              : (permissionModes.find((value) => value === mode) ?? admission.permissions),
           ...(mode === 'old-build' ? { clientVersion: '1.1.10' } : {}),
           ...(mode === 'missing-evidence' ? { evidence: undefined } : {}),
           ...(mode === 'billing-unknown' ? { billing: 'unknown' } : {}),
@@ -245,21 +392,34 @@ else {
           if (mode === 'cancelled') abort.abort();
         },
       };
-      if (mode === 'good')
+      if (mode === 'good' || permissionModes.some((value) => value === mode))
         assert.deepEqual((await runGoogleWriter(options)).replacement, replacement);
       else
         await assert.rejects(
           runGoogleWriter(options),
           (error) =>
             error instanceof GoogleWriterError &&
-            (mode !== 'cancelled' || error.reason === 'cancelled'),
+            (mode !== 'cancelled' || error.reason === 'cancelled') &&
+            (mode !== 'startup-notice' ||
+              (error.diagnostic?.event === 'other' &&
+                error.diagnostic.stage === 'before-init' &&
+                Object.isFrozen(error.diagnostic) &&
+                !JSON.stringify(error.diagnostic).includes('private'))),
           mode,
         );
       if (mode === 'cancelled') {
         assert.equal(spawned, true);
         assert(groupAbsent(groups.at(-1) ?? null));
       }
-      if (['old-build', 'missing-evidence', 'billing-unknown', 'hash-mismatch'].includes(mode))
+      if (
+        [
+          'old-build',
+          'missing-evidence',
+          'billing-unknown',
+          'hash-mismatch',
+          'unknown-permission',
+        ].includes(mode)
+      )
         assert.equal(spawned, false, mode);
     }
   } finally {

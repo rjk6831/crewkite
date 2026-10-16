@@ -33,6 +33,7 @@ const text = (max: number) =>
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
 const count = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
 const effort = z.enum(['low', 'medium', 'high', 'xhigh', 'max']);
+const permissionMode = z.enum(['request-review', 'strict', 'always-proceed', 'proceed-in-sandbox']);
 const path = text(512).refine(
   (value) =>
     !isAbsolute(value) &&
@@ -61,7 +62,7 @@ const init = z.strictObject({
   init: z.strictObject({
     cwd: text(4096),
     tools: z.array(text(200)).max(256),
-    permission_mode: z.enum(['request-review', 'strict']),
+    permission_mode: permissionMode,
     model: text(200),
     agent: text(200).optional(),
     json_schema: z.unknown().optional(),
@@ -72,8 +73,20 @@ const step = z.strictObject({
   step_update: z.strictObject({
     conversation_id: text(200),
     step_index: count,
-    state: z.enum(['ACTIVE', 'DONE']),
-    step_type: z.enum(['user_input', 'agent_response', 'tool', 'checkpoint']),
+    state: z.enum(['ACTIVE', 'DONE', 'ERROR']),
+    step_type: z
+      .enum([
+        'user_input',
+        'agent_response',
+        'tool',
+        'checkpoint',
+        'finish',
+        'unknown',
+        'subagent',
+        'system_message',
+        'error_message',
+      ])
+      .optional(),
     text_delta: z.string().max(65_536).optional(),
     duration_seconds: z.number().finite().nonnegative().optional(),
     usage: usage.optional(),
@@ -116,9 +129,11 @@ type Reason =
   | 'not-quiescent';
 export class GoogleWriterError extends Error {
   readonly reason: Reason;
-  constructor(reason: Reason) {
+  readonly diagnostic: GoogleWriterDiagnostic | null;
+  constructor(reason: Reason, diagnostic: GoogleWriterDiagnostic | null = null) {
     super(`Google writer refused: ${reason}.`);
     this.reason = reason;
+    this.diagnostic = diagnostic;
   }
 }
 
@@ -127,10 +142,50 @@ type Expectation = {
   attemptId: string;
   directory: string;
   model: string;
-  permissionMode: 'request-review' | 'strict';
+  permissionMode: z.infer<typeof permissionMode>;
   path: string;
   baseHash: string;
 };
+
+const diagnosticFields = [
+  'event',
+  'conversation_id',
+  'init',
+  'cwd',
+  'tools',
+  'permission_mode',
+  'model',
+  'step_update',
+  'step_index',
+  'state',
+  'step_type',
+  'text_delta',
+  'duration_seconds',
+  'tool_name',
+  'tool_info',
+  'subagent_info',
+  'input_tokens',
+  'output_tokens',
+  'thinking_tokens',
+  'cache_read_tokens',
+  'total_tokens',
+  'result',
+  'status',
+  'num_turns',
+  'usage',
+  'structured_output',
+  'attemptId',
+  'path',
+  'baseHash',
+  'content',
+] as const;
+export type GoogleWriterDiagnostic = Readonly<{
+  stage: 'before-init' | 'output' | 'complete';
+  site: 'frame' | 'init' | 'step' | 'result' | 'replacement' | 'finish';
+  cause: 'validation' | 'correlation' | 'invalid-json' | 'limit' | 'incomplete';
+  event: 'none' | 'init' | 'step_update' | 'result' | 'other' | 'invalid-json';
+  field: (typeof diagnosticFields)[number] | 'other' | null;
+}>;
 
 export class GoogleWriterOutput {
   private pending: number[] = [];
@@ -138,27 +193,64 @@ export class GoogleWriterOutput {
   private session: string | null = null;
   private terminal: z.infer<typeof result>['result'] | null = null;
   private invalid = false;
+  private site: GoogleWriterDiagnostic['site'] = 'frame';
+  private eventName: GoogleWriterDiagnostic['event'] = 'none';
+  private failure: GoogleWriterDiagnostic | null = null;
   private readonly expected: Expectation;
   constructor(expected: Expectation) {
     this.expected = expected;
   }
+  private fail(
+    reason: Reason,
+    cause: GoogleWriterDiagnostic['cause'],
+    field: GoogleWriterDiagnostic['field'] = null,
+  ): never {
+    this.failure ??= Object.freeze({
+      stage: this.terminal ? 'complete' : this.session ? 'output' : 'before-init',
+      site: this.site,
+      cause,
+      event: this.eventName,
+      field,
+    });
+    throw new GoogleWriterError(reason, this.failure);
+  }
   push(chunk: Uint8Array) {
-    if (this.invalid) throw new GoogleWriterError('invalid-output');
+    if (this.invalid) this.fail('invalid-output', 'validation');
+    let decoded: unknown;
     try {
       this.bytes += chunk.length;
-      if (this.bytes > MAX_BYTES) throw new Error();
+      if (this.bytes > MAX_BYTES) this.fail('invalid-output', 'limit');
       for (const byte of chunk) {
-        if (this.terminal) throw new Error();
+        if (this.terminal) this.fail('invalid-output', 'correlation');
         if (byte !== 10) {
-          if (this.pending.length >= MAX_LINE_BYTES) throw new Error();
+          if (this.pending.length >= MAX_LINE_BYTES) this.fail('invalid-output', 'limit');
           this.pending.push(byte);
           continue;
         }
-        const value = event.parse(
-          JSON.parse(
+        this.site = 'frame';
+        this.eventName = 'invalid-json';
+        try {
+          decoded = JSON.parse(
             new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array(this.pending)),
-          ),
-        );
+          );
+        } catch {
+          this.fail('invalid-output', 'invalid-json');
+        }
+        const label =
+          decoded !== null && typeof decoded === 'object'
+            ? (decoded as { event?: unknown }).event
+            : undefined;
+        this.eventName =
+          label === 'init' || label === 'step_update' || label === 'result' ? label : 'other';
+        this.site =
+          label === 'init'
+            ? 'init'
+            : label === 'step_update'
+              ? 'step'
+              : label === 'result'
+                ? 'result'
+                : 'frame';
+        const value = event.parse(decoded);
         this.pending = [];
         if (value.event === 'init') {
           if (
@@ -167,23 +259,40 @@ export class GoogleWriterOutput {
             value.init.model !== this.expected.model ||
             value.init.permission_mode !== this.expected.permissionMode
           )
-            throw new Error();
+            this.fail('invalid-output', 'correlation');
           this.session = value.conversation_id;
         } else if (value.event === 'step_update') {
           if (!this.session || value.step_update.conversation_id !== this.session)
-            throw new Error();
+            this.fail('invalid-output', 'correlation', 'conversation_id');
         } else {
-          if (!this.session || value.result.conversation_id !== this.session) throw new Error();
+          if (!this.session || value.result.conversation_id !== this.session)
+            this.fail('invalid-output', 'correlation', 'conversation_id');
           this.terminal = value.result;
         }
       }
-    } catch {
+    } catch (error) {
       this.invalid = true;
-      throw new GoogleWriterError('invalid-output');
+      if (error instanceof GoogleWriterError) throw error;
+      const matched =
+        this.eventName === 'init'
+          ? init.safeParse(decoded)
+          : this.eventName === 'step_update'
+            ? step.safeParse(decoded)
+            : this.eventName === 'result'
+              ? result.safeParse(decoded)
+              : null;
+      const detail = matched?.success === false ? matched.error : error;
+      const label = detail instanceof z.ZodError ? detail.issues[0]?.path.at(-1) : undefined;
+      this.fail(
+        'invalid-output',
+        'validation',
+        label === undefined ? null : (diagnosticFields.find((field) => field === label) ?? 'other'),
+      );
     }
   }
   finish(): { replacement: GoogleReplacement; usage: z.infer<typeof usage> } {
-    if (this.invalid || this.pending.length) throw new GoogleWriterError('invalid-output');
+    this.site = 'finish';
+    if (this.invalid || this.pending.length) this.fail('invalid-output', 'incomplete');
     const value = this.terminal;
     if (
       value?.status !== 'SUCCESS' ||
@@ -191,7 +300,8 @@ export class GoogleWriterOutput {
       value.num_turns !== 1 ||
       !value.structured_output
     )
-      throw new GoogleWriterError('not-complete');
+      this.fail('not-complete', 'incomplete');
+    this.site = 'replacement';
     const file = value.structured_output;
     if (
       file.attemptId !== this.expected.attemptId ||
@@ -199,8 +309,11 @@ export class GoogleWriterOutput {
       file.baseHash !== this.expected.baseHash ||
       Buffer.byteLength(file.content) > 65_536
     )
-      throw new GoogleWriterError('invalid-output');
+      this.fail('invalid-output', 'correlation');
     return { replacement: file, usage: value.usage };
+  }
+  get diagnostic() {
+    return this.failure;
   }
 }
 
@@ -217,7 +330,7 @@ const admission = z.strictObject({
   clientSha256: hash,
   checkedAt: z.iso.datetime(),
   nativeTrust: z.literal('accepted'),
-  permissions: z.enum(['request-review', 'strict']),
+  permissions: permissionMode,
   billing: z.literal('subscription-only'),
   extraCredits: z.literal('disabled'),
   evidence: z.strictObject({
@@ -512,10 +625,10 @@ export async function runGoogleWriter(options: {
     ]);
     if (!closed || !groupAbsent(group)) {
       kill('SIGKILL');
-      throw new GoogleWriterError('not-quiescent');
+      throw new GoogleWriterError('not-quiescent', reader.diagnostic);
     }
-    if (failure) throw new GoogleWriterError(failure);
-    if (exitCode !== 0) throw new GoogleWriterError('not-complete');
+    if (failure) throw new GoogleWriterError(failure, reader.diagnostic);
+    if (exitCode !== 0) throw new GoogleWriterError('not-complete', reader.diagnostic);
     return reader.finish();
   } finally {
     clearTimeout(timer);
