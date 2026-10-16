@@ -5,6 +5,8 @@ import {
   closeSync,
   constants,
   fstatSync,
+  fsyncSync,
+  ftruncateSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -12,6 +14,7 @@ import {
   readFileSync,
   realpathSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs';
 import { devNull } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
@@ -375,6 +378,82 @@ export function readFiles(root: string): FileContent[] {
   }
   visit(root);
   return files;
+}
+
+export function applyReplacement(
+  root: string,
+  expected: readonly FileEntry[],
+  replacement: { path: string; baseHash: string; content: string },
+) {
+  safePath(replacement.path, new Set(), new Map());
+  if (typeof replacement.content !== 'string' || replacement.content.length > 65_536)
+    throw new Error('Replacement must be bounded UTF-8 text.');
+  const bytes = Buffer.from(replacement.content, 'utf8');
+  if (
+    bytes.length > 65_536 ||
+    bytes.toString('utf8') !== replacement.content ||
+    replacement.content.includes('\0')
+  )
+    throw new Error('Replacement must be bounded UTF-8 text.');
+  const seen = new Set<string>();
+  const prefixes = new Map<string, string>();
+  let total = 0;
+  if (expected.length > 10000) throw new Error('Replacement source exceeds the file limit.');
+  for (const file of expected) {
+    if (
+      !['100644', '100755'].includes(file.mode) ||
+      !/^[a-f0-9]{64}$/.test(file.hash) ||
+      !Number.isSafeInteger(file.bytes) ||
+      file.bytes < 0
+    )
+      throw new Error('Replacement source metadata is invalid.');
+    safePath(file.path, seen, prefixes);
+    total += file.bytes;
+    if (total > MAX_SOURCE_BYTES) throw new Error('Replacement source exceeds the byte limit.');
+  }
+  const manifest = (files: readonly FileEntry[]) =>
+    JSON.stringify(
+      files
+        .map(({ path, mode, hash, bytes }) => ({ path, mode, hash, bytes }))
+        .sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0)),
+    );
+  if (manifest(readFiles(root)) !== manifest(expected))
+    throw new Error('Replacement source manifest changed.');
+  const target = expected.find((file) => file.path === replacement.path);
+  if (!target || target.hash !== replacement.baseHash)
+    throw new Error('Replacement target identity changed.');
+  // Open without truncation so every precondition can fail without changing the file.
+  const fd = openSync(
+    join(root, target.path),
+    constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
+  try {
+    const state = fstatSync(fd);
+    if (
+      !state.isFile() ||
+      state.nlink !== 1 ||
+      state.mode & 0o6000 ||
+      state.size !== target.bytes ||
+      (state.mode & 0o111 ? '100755' : '100644') !== target.mode
+    )
+      throw new Error('Replacement target metadata changed.');
+    const original = readFileSync(fd);
+    if (
+      original.length !== target.bytes ||
+      createHash('sha256').update(original).digest('hex') !== target.hash
+    )
+      throw new Error('Replacement target bytes changed.');
+    let written = 0;
+    while (written < bytes.length) {
+      const count = writeSync(fd, bytes, written, bytes.length - written, written);
+      if (count === 0) throw new Error('Replacement write made no progress.');
+      written += count;
+    }
+    ftruncateSync(fd, bytes.length);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 export function materialize(root: string, files: readonly FileContent[]) {

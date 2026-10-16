@@ -1,11 +1,17 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import {
+  chmodSync,
   existsSync,
+  linkSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
+  readlinkSync,
   rmSync,
+  symlinkSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -13,7 +19,14 @@ import { join, resolve } from 'node:path';
 import test from 'node:test';
 import { ReadDataSchema } from '@crewkite/contracts';
 import { createSyntheticRepository } from '@crewkite/testkit/repository';
-import { git, inspectSource, inspectSourceDetails, readFiles } from './source.ts';
+import {
+  applyReplacement,
+  type FileEntry,
+  git,
+  inspectSource,
+  inspectSourceDetails,
+  readFiles,
+} from './source.ts';
 
 test('source inspection bounds file metadata without running filters or reading special files', (t) => {
   mkdirSync(resolve('internal'), { recursive: true });
@@ -66,4 +79,115 @@ test('source inspection bounds file metadata without running filters or reading 
   assert.throws(() => readFiles(special), /unsupported|regular/);
   assert.equal(existsSync(canary), false);
   assert.deepEqual(readFileSync(join(source.directory, '.git', 'index')), index);
+});
+
+test('replacement checks the full source before writing and preserves mode with exact truncation', (t) => {
+  mkdirSync(resolve('internal'), { recursive: true });
+  const directory = mkdtempSync(join(resolve('internal'), 'replacement-test-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const snapshot = (root: string) =>
+    readdirSync(root)
+      .sort()
+      .map((path) => {
+        const file = join(root, path);
+        const state = lstatSync(file);
+        return {
+          path,
+          mode: state.mode,
+          bytes: state.isFile()
+            ? readFileSync(file)
+            : state.isSymbolicLink()
+              ? readlinkSync(file)
+              : null,
+        };
+      });
+  const cases: {
+    name: string;
+    setup?: (root: string, expected: FileEntry[]) => void;
+    proposal?: { path?: string; baseHash?: string; content?: string };
+    accept?: boolean;
+  }[] = [
+    { name: 'shorter executable', accept: true },
+    { name: 'empty text', proposal: { content: '' }, accept: true },
+    { name: 'UTF-8 byte limit', proposal: { content: 'é'.repeat(32_768) }, accept: true },
+    { name: 'wrong base', proposal: { baseHash: '0'.repeat(64) } },
+    { name: 'unsafe target', proposal: { path: '../net.mjs' } },
+    { name: 'invalid UTF-8', proposal: { content: '\ud800' } },
+    { name: 'binary text', proposal: { content: '\0' } },
+    { name: 'oversized UTF-8', proposal: { content: 'é'.repeat(32_769) } },
+    {
+      name: 'changed sibling',
+      setup: (root) => writeFileSync(join(root, 'sibling.mjs'), 'changed\n'),
+    },
+    { name: 'added file', setup: (root) => writeFileSync(join(root, 'extra.mjs'), '') },
+    { name: 'missing target', setup: (root) => unlinkSync(join(root, 'net.mjs')) },
+    { name: 'changed target', setup: (root) => writeFileSync(join(root, 'net.mjs'), 'changed\n') },
+    { name: 'changed mode', setup: (root) => chmodSync(join(root, 'net.mjs'), 0o644) },
+    {
+      name: 'duplicate manifest entry',
+      setup: (_root, expected) => {
+        expected[1] = { ...expected[0] };
+      },
+    },
+    {
+      name: 'invalid manifest bytes',
+      setup: (_root, expected) => {
+        expected[0].bytes = -1;
+      },
+    },
+    {
+      name: 'changed manifest hash',
+      setup: (_root, expected) => {
+        expected[0].hash = '0'.repeat(64);
+      },
+    },
+    {
+      name: 'symlink target',
+      setup: (root) => {
+        unlinkSync(join(root, 'net.mjs'));
+        symlinkSync('sibling.mjs', join(root, 'net.mjs'));
+      },
+    },
+    {
+      name: 'hardlink target',
+      setup: (root) => linkSync(join(root, 'net.mjs'), join(root, 'alias.mjs')),
+    },
+    {
+      name: 'special target',
+      setup: (root) => {
+        unlinkSync(join(root, 'net.mjs'));
+        execFileSync('mkfifo', [join(root, 'net.mjs')]);
+      },
+    },
+  ];
+  for (const [index, example] of cases.entries()) {
+    const root = join(directory, String(index));
+    mkdirSync(root);
+    writeFileSync(join(root, 'net.mjs'), 'export const total = 123456789;\n');
+    chmodSync(join(root, 'net.mjs'), 0o751);
+    writeFileSync(join(root, 'sibling.mjs'), 'export const unchanged = true;\n');
+    const expected = readFiles(root).map(({ path, mode, hash, bytes }) => ({
+      path,
+      mode,
+      hash,
+      bytes,
+    }));
+    const replacement = {
+      path: 'net.mjs',
+      baseHash: expected[0].hash,
+      content: 'export {};\n',
+      ...example.proposal,
+    };
+    example.setup?.(root, expected);
+    const before = snapshot(root);
+    if (example.accept) {
+      applyReplacement(root, expected, replacement);
+      assert.equal(readFileSync(join(root, 'net.mjs'), 'utf8'), replacement.content, example.name);
+      assert.equal(lstatSync(join(root, 'net.mjs')).mode & 0o777, 0o751, example.name);
+      assert.deepEqual(snapshot(root)[1], before[1], example.name);
+    } else {
+      assert.throws(() => applyReplacement(root, expected, replacement), Error, example.name);
+      assert.deepEqual(snapshot(root), before, example.name);
+    }
+  }
 });
