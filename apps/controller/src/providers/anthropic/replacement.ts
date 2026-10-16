@@ -172,6 +172,69 @@ const retry = identity.extend({
   retry_delay_ms: z.number().finite().nonnegative().max(DEADLINE_MS),
 });
 
+const metadataNumber = z.number().finite().nonnegative().max(Number.MAX_SAFE_INTEGER);
+const rateLimitStatus = z.enum(['allowed', 'allowed_warning', 'rejected']);
+const rateLimit = identity.extend({
+  type: z.literal('rate_limit_event'),
+  uuid: z.uuid(),
+  rate_limit_info: z.object({
+    status: rateLimitStatus,
+    resetsAt: metadataNumber.optional(),
+    rateLimitType: z
+      .enum([
+        'five_hour',
+        'seven_day',
+        'seven_day_opus',
+        'seven_day_sonnet',
+        'seven_day_overage_included',
+        'overage',
+      ])
+      .optional(),
+    utilization: metadataNumber.optional(),
+    overageStatus: rateLimitStatus.optional(),
+    overageResetsAt: metadataNumber.optional(),
+    overageDisabledReason: z
+      .enum([
+        'overage_not_provisioned',
+        'org_level_disabled',
+        'org_level_disabled_until',
+        'out_of_credits',
+        'seat_tier_level_disabled',
+        'member_level_disabled',
+        'seat_tier_zero_credit_limit',
+        'group_zero_credit_limit',
+        'member_zero_credit_limit',
+        'org_service_level_disabled',
+        'no_limits_configured',
+        'fetch_error',
+        'unknown',
+      ])
+      .optional(),
+    isUsingOverage: z.boolean().optional(),
+    overageInUse: z.boolean().optional(),
+    overageEnabled: z.boolean().optional(),
+    surpassedThreshold: metadataNumber.optional(),
+    limitScope: z.enum(['service', 'channel', 'group_pool']).optional(),
+    errorCode: z.literal('credits_required').optional(),
+    canUserPurchaseCredits: z.boolean().optional(),
+    hasChargeableSavedPaymentMethod: z.boolean().optional(),
+  }),
+});
+const envelopes = [
+  'system',
+  'assistant',
+  'result',
+  'control_request',
+  'user',
+  'stream_event',
+  'tool_progress',
+  'auth_status',
+  'tool_use_summary',
+  'rate_limit_event',
+  'prompt_suggestion',
+  'conversation_reset',
+] as const;
+
 const subtypes = [
   'init',
   'api_retry',
@@ -208,19 +271,23 @@ const fields = [
   'attemptId',
   'path',
   'baseHash',
+  'uuid',
+  'rate_limit_info',
 ] as const;
 export type ReplacementDiagnostic = Readonly<{
   stage: 'before-init' | 'output' | 'complete';
-  site: 'frame' | 'identity' | 'init' | 'assistant' | 'retry' | 'result' | 'replacement' | 'finish';
-  cause: 'validation' | 'correlation' | 'invalid-json' | 'unsupported' | 'limit' | 'incomplete';
-  envelope:
-    | 'none'
-    | 'system'
+  site:
+    | 'frame'
+    | 'identity'
+    | 'init'
     | 'assistant'
+    | 'retry'
+    | 'rate-limit'
     | 'result'
-    | 'control_request'
-    | 'other'
-    | 'invalid-json';
+    | 'replacement'
+    | 'finish';
+  cause: 'validation' | 'correlation' | 'invalid-json' | 'unsupported' | 'limit' | 'incomplete';
+  envelope: (typeof envelopes)[number] | 'none' | 'other' | 'invalid-json';
   subtype: (typeof subtypes)[number] | 'other' | null;
   field: (typeof fields)[number] | 'other' | null;
 }>;
@@ -282,13 +349,7 @@ export class ReplacementStream {
         this.pending = [];
         const record = value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
         const type = record.type;
-        this.envelope =
-          type === 'system' ||
-          type === 'assistant' ||
-          type === 'result' ||
-          type === 'control_request'
-            ? type
-            : 'other';
+        this.envelope = envelopes.find((envelope) => envelope === type) ?? 'other';
         this.subtype =
           record.subtype === undefined
             ? null
@@ -306,6 +367,17 @@ export class ReplacementStream {
           this.toolsEmpty = message.tools.length === 0;
           this.pluginsEmpty = message.plugins ? message.plugins.length === 0 : null;
           this.initialized = true;
+        } else if (type === 'rate_limit_event') {
+          this.site = 'rate-limit';
+          // Subscription metadata grants no permission, billing or replacement authority.
+          const info = rateLimit.parse(value).rate_limit_info;
+          if (
+            info.isUsingOverage === true ||
+            info.overageInUse === true ||
+            info.overageEnabled === true ||
+            info.rateLimitType === 'overage'
+          )
+            this.fail('protocol', 'unsupported', 'rate_limit_info');
         } else if (type === 'assistant') {
           this.site = 'assistant';
           assistant.parse(value);

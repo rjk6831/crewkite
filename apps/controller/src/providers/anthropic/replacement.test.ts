@@ -49,6 +49,12 @@ const result = {
 };
 const line = (value: unknown) => Buffer.from(`${JSON.stringify(value)}\n`);
 const secret = 'private-account@example.test';
+const rateLimit = {
+  type: 'rate_limit_event',
+  session_id: input.sessionId,
+  uuid: '46eb17cd-01e8-480d-99f4-a741f189715f',
+  rate_limit_info: { status: 'allowed', resetsAt: 123, utilization: 0.5 },
+};
 
 test('native text replacement stays bound to one proposal and owned task deadline', async () => {
   assert.equal(plan.timeoutMs, 300000);
@@ -80,8 +86,88 @@ test('native text replacement stays bound to one proposal and owned task deadlin
   assert(!plan.argv.includes(original));
   assert.throws(() => replacementPlan({ ...input, original: 'changed' }), ReplacementError);
   assert.throws(() => replacementPlan({ ...input, model: '--bad' }), ReplacementError);
-  for (const row of [
+  const cases: Array<{
+    name: string;
+    frames: unknown[];
+    pass?: boolean;
+    toolsEmpty?: boolean;
+    pluginsEmpty?: boolean;
+    diagnostic?: Record<string, unknown>;
+  }> = [
     { name: 'valid', frames: [init, result], pass: true },
+    {
+      name: 'rate limit metadata grants no proposal authority',
+      frames: [
+        init,
+        { ...rateLimit, rate_limit_info: { ...rateLimit.rate_limit_info, private: secret } },
+        result,
+      ],
+      pass: true,
+    },
+    {
+      name: 'included subscription window remains metadata',
+      frames: [
+        init,
+        {
+          ...rateLimit,
+          rate_limit_info: {
+            status: 'allowed',
+            rateLimitType: 'seven_day_overage_included',
+            isUsingOverage: false,
+            overageInUse: false,
+            overageEnabled: false,
+          },
+        },
+        result,
+      ],
+      pass: true,
+    },
+    ...['isUsingOverage', 'overageInUse', 'overageEnabled'].map((field) => ({
+      name: `reported ${field} stops included-only task`,
+      frames: [
+        init,
+        { ...rateLimit, rate_limit_info: { status: 'allowed', [field]: true } },
+        result,
+      ],
+      diagnostic: { site: 'rate-limit', cause: 'unsupported', field: 'rate_limit_info' },
+    })),
+    {
+      name: 'usage credit window stops included-only task',
+      frames: [
+        init,
+        { ...rateLimit, rate_limit_info: { status: 'allowed', rateLimitType: 'overage' } },
+        result,
+      ],
+      diagnostic: { site: 'rate-limit', cause: 'unsupported', field: 'rate_limit_info' },
+    },
+    { name: 'rate limit metadata needs terminal result', frames: [init, rateLimit] },
+    { name: 'rate limit metadata needs init', frames: [rateLimit, result] },
+    {
+      name: 'rate limit session remains bound',
+      frames: [init, { ...rateLimit, session_id: '46eb17cd-01e8-480d-99f4-a741f189715e' }, result],
+    },
+    {
+      name: 'unknown rate limit status',
+      frames: [init, { ...rateLimit, rate_limit_info: { status: secret } }, result],
+    },
+    ...['resetsAt', 'utilization', 'overageResetsAt', 'surpassedThreshold'].map((field) => ({
+      name: `rate limit ${field} remains bounded`,
+      frames: [init, { ...rateLimit, rate_limit_info: { status: 'allowed', [field]: -1 } }, result],
+    })),
+    ...[
+      'user',
+      'stream_event',
+      'tool_progress',
+      'auth_status',
+      'tool_use_summary',
+      'rate_limit_event',
+      'prompt_suggestion',
+      'conversation_reset',
+    ].map((type) => ({
+      name: `known ${type} refusal stays finite`,
+      frames: [init, { type, session_id: input.sessionId, content: secret }],
+      diagnostic: { envelope: type },
+    })),
     {
       name: 'formatter output is data only',
       frames: [
@@ -216,7 +302,8 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       },
     },
     { name: 'missing result', frames: [init] },
-  ]) {
+  ];
+  for (const row of cases) {
     const reader = new ReplacementStream(plan);
     try {
       for (const frame of row.frames) {
