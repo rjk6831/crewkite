@@ -115,9 +115,83 @@ else {
         structured_output: replacement,
       },
     };
+    const step = {
+      event: 'step_update',
+      step_update: { conversation_id: 'session', step_index: 1, state: 'ACTIVE' },
+    };
     const wire = (value: unknown) => new TextEncoder().encode(`${JSON.stringify(value)}\n`);
     const decoderCases = [
       { name: 'fragmented valid stream', events: [start, end], ok: true },
+      {
+        name: 'step category may be omitted across active and done updates',
+        events: [
+          start,
+          step,
+          { ...step, step_update: { ...step.step_update, state: 'DONE' } },
+          end,
+        ],
+        ok: true,
+      },
+      {
+        name: 'documented step categories remain bounded metadata',
+        events: [
+          start,
+          ...['user_input', 'agent_response', 'tool', 'checkpoint'].map((step_type) => ({
+            ...step,
+            step_update: { ...step.step_update, step_type },
+          })),
+          end,
+        ],
+        ok: true,
+      },
+      {
+        name: 'unknown step category',
+        field: 'step_type',
+        events: [
+          start,
+          { ...step, step_update: { ...step.step_update, step_type: 'private@example.test' } },
+          end,
+        ],
+      },
+      {
+        name: 'unknown step state',
+        field: 'state',
+        events: [
+          start,
+          { ...step, step_update: { ...step.step_update, state: 'private@example.test' } },
+          end,
+        ],
+      },
+      {
+        name: 'step session required',
+        events: [
+          start,
+          { ...step, step_update: { ...step.step_update, conversation_id: undefined } },
+          end,
+        ],
+      },
+      {
+        name: 'step index required',
+        field: 'step_index',
+        events: [
+          start,
+          { ...step, step_update: { ...step.step_update, step_index: undefined } },
+          end,
+        ],
+      },
+      {
+        name: 'step state required',
+        events: [start, { ...step, step_update: { ...step.step_update, state: undefined } }, end],
+      },
+      {
+        name: 'step session remains bound',
+        events: [
+          start,
+          { ...step, step_update: { ...step.step_update, conversation_id: 'foreign' } },
+          end,
+        ],
+      },
+
       { name: 'result before init', events: [end] },
       { name: 'duplicate init', events: [start, start, end] },
       {
@@ -168,6 +242,7 @@ else {
       },
       {
         name: 'negative usage',
+        field: 'input_tokens',
         events: [
           start,
           { ...end, result: { ...end.result, usage: { ...usage, input_tokens: -1 } } },
