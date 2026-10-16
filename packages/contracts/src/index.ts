@@ -351,7 +351,7 @@ export const CandidateSchema = z.strictObject({
   artifactId: ArtifactIdSchema,
   revision: RevisionSchema,
 });
-export const ReviewJobSchema = z
+export const ScriptedReviewJobSchema = z
   .strictObject({
     taskId: TaskIdSchema,
     runId: RunIdSchema,
@@ -371,6 +371,24 @@ export const ReviewJobSchema = z
     (job) => (job.writerAttemptId === undefined) === (job.writerRouteId === undefined),
     'Writer provenance requires both the attempt and route.',
   );
+export const NativeReviewJobSchema = z.strictObject({
+  ...ScriptedReviewJobSchema.shape,
+  scripted: z.literal(false),
+  writerAttemptId: AttemptIdSchema,
+  writerRouteId: RouteIdSchema,
+  preparationId: ArtifactIdSchema,
+  profileId: label,
+  assignedRole: ReviewMethodSchema.shape.reviewerRole,
+  independence: z.literal('process-only'),
+  methodId: z.literal('keep-it-simple'),
+  cycle: z.literal(1),
+  limitMinutes: z.number().int().min(1).max(5),
+});
+export const ReviewJobSchema = z.discriminatedUnion('scripted', [
+  ScriptedReviewJobSchema,
+  NativeReviewJobSchema,
+]);
+export type NativeReviewJob = z.infer<typeof NativeReviewJobSchema>;
 export const ReviewResultSchema = z
   .strictObject({
     job: ReviewJobSchema,
@@ -534,6 +552,14 @@ export const CommandSchema = z.discriminatedUnion('command', [
   ),
   mutate(
     'StartCandidateEvaluation',
+    z.strictObject({
+      taskId: TaskIdSchema,
+      candidateId: CandidateIdSchema,
+      preparationId: ArtifactIdSchema,
+    }),
+  ),
+  mutate(
+    'StartCandidateReview',
     z.strictObject({
       taskId: TaskIdSchema,
       candidateId: CandidateIdSchema,
@@ -799,7 +825,7 @@ export const EventSchema = z.discriminatedUnion('type', [
 export const FakeWorkerInputSchema = z.discriminatedUnion('type', [
   z.strictObject({
     type: z.literal('review'),
-    job: ReviewJobSchema,
+    job: ScriptedReviewJobSchema,
     scratchPath: text,
     criteria: z.array(text).min(1).max(100),
     guidance: GuidanceSchema.optional(),

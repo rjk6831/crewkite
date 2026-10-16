@@ -8,6 +8,7 @@ import {
   canonicalJson,
   type Event,
   EventSchema,
+  NativeReviewJobSchema,
   type Run,
   type Task,
   TimestampSchema,
@@ -253,8 +254,20 @@ export class Store {
     at: string,
   ) {
     const { attempt, task } = this.nativeWriter(attemptId);
-    if (!['intent', 'running'].includes(attempt.state) || task.state !== 'running')
-      throw new Error('Native phases require a current running writer.');
+    const review =
+      task.state === 'checking'
+        ? this.db.prepare('SELECT body FROM review_jobs WHERE attempt_id=?').get(attemptId)
+        : undefined;
+    const job = review ? NativeReviewJobSchema.parse(JSON.parse(review.body as string)) : undefined;
+    const reviewing =
+      job &&
+      job.taskId === task.id &&
+      job.runId === attempt.runId &&
+      job.attemptId === attempt.id &&
+      job.routeId === attempt.routeId &&
+      job.generation === attempt.generation;
+    if (!['intent', 'running'].includes(attempt.state) || (task.state !== 'running' && !reviewing))
+      throw new Error('Native phases require a current writer or native review.');
     const previous = this.nativeProcesses(attemptId);
     if (
       sequence !== previous.length ||

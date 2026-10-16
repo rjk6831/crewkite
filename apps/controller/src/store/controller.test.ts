@@ -1495,6 +1495,7 @@ async function nativeSetup(
   const children: ReturnType<typeof spawn>[] = [];
   let onSpawn: ((phase: string) => void) | undefined;
   let onInput: ((message: { method?: string }, phase: string) => void) | undefined;
+  let onWritten: typeof onInput;
   const fixtureProfile: NativeProfileResolution = {
     ...unavailableNativeProfile(),
     facts: {
@@ -1528,7 +1529,7 @@ async function nativeSetup(
             ? 'prepare'
             : 'task';
       let transcript = fixture;
-      if (mode === 'checked') {
+      if (mode.startsWith('checked')) {
         const proposal = join(context.directory, 'checked-proposal');
         mkdirSync(proposal, { recursive: true });
         writeFileSync(join(proposal, 'net.mjs'), '');
@@ -1538,9 +1539,19 @@ async function nativeSetup(
           `const content = () => ${JSON.stringify(readFileSync(join(proposal, 'net.mjs'), 'utf8'))};`,
         );
       }
+      transcript = transcript.replace(
+        'const path = message.params.outputSchema.properties.path.const;',
+        'const path = message.params.outputSchema.properties.path?.const;',
+      );
+      const replacement =
+        'const edit = {version:1,attemptId:message.params.outputSchema.properties.attemptId.const,path,baseHash:message.params.outputSchema.properties.baseHash.const,content:content(path)};';
+      transcript = transcript.replace(
+        replacement,
+        `const edit = message.params.outputSchema.properties.bindingHash ? {version:1,bindingHash:message.params.outputSchema.properties.bindingHash.const,methodId:message.params.outputSchema.properties.methodId.const,cycle:1,outcome:${JSON.stringify(mode === 'checked-blocked' ? 'blocked' : 'passed')},findings:[],summary:'The bounded review completed.'} : ${replacement.slice('const edit = '.length)}`,
+      );
       const child = spawn(
         executable,
-        ['-e', transcript, mode === 'checked' ? 'success' : mode, phase],
+        ['-e', transcript, mode.startsWith('checked') ? 'success' : mode, phase],
         spawnOptions,
       );
       children.push(child);
@@ -1553,7 +1564,9 @@ async function nativeSetup(
             .trim()
             .split('\n')
             .map((line) => JSON.parse(line) as { method?: string });
-          const attempt = context.controller.store.intents()[0];
+          const attempt = context.controller.store
+            .intents()
+            .find((intent) => intent.attempt_id === pending?.attempt_id);
           assert(attempt, 'the controller commits admission before native input');
           assert.equal(
             context.controller.store.nativeProcesses(attempt.attempt_id).at(-1)?.state,
@@ -1562,11 +1575,19 @@ async function nativeSetup(
           for (const message of messages) {
             if (message.method === 'turn/start') {
               submissions++;
-              assert(context.controller.store.receipt(`native-submission:${attempt.attempt_id}`));
+              const review = context.controller.store.db
+                .prepare('SELECT body FROM review_jobs WHERE attempt_id=?')
+                .get(attempt.attempt_id);
+              assert(
+                context.controller.store.receipt(
+                  `${review ? 'native-review-submission' : 'native-submission'}:${attempt.attempt_id}`,
+                ),
+              );
             }
             onInput?.(message, phase);
           }
           const result = write(data);
+          for (const message of messages) onWritten?.(message, phase);
           if (messages.some((message) => message.method === 'turn/start')) ready.resolve();
           return result;
         } catch (error) {
@@ -1710,6 +1731,9 @@ async function nativeSetup(
     },
     onInput: (listener: typeof onInput) => {
       onInput = listener;
+    },
+    onWritten: (listener: typeof onWritten) => {
+      onWritten = listener;
     },
   };
 }
@@ -2272,8 +2296,25 @@ test('an appointed native proposal is retained and applied once after every phas
       await nativeWait(reopened, 'reopened close', Promise.resolve(reopened.close()), 10_000);
     }
   }
-  for (const scenario of ['checked', 'failed', 'stop-intent', 'expired-intent', 'revoked-intent']) {
-    const context = await nativeSetup(t, scenario === 'failed' ? 'success' : 'checked');
+  for (const scenario of [
+    'checked',
+    'failed',
+    'stop-intent',
+    'expired-intent',
+    'revoked-intent',
+    'review-blocked',
+    'review-stop',
+    'review-close',
+    'review-journal-read',
+  ]) {
+    const context = await nativeSetup(
+      t,
+      scenario === 'failed'
+        ? 'success'
+        : scenario === 'review-blocked'
+          ? 'checked-blocked'
+          : 'checked',
+    );
     let controller = context.controller;
     const { command, task, appointment, clock } = context;
     const retained = nativeCandidate(controller);
@@ -2479,7 +2520,7 @@ test('an appointed native proposal is retained and applied once after every phas
     assert.equal(snapshot.reviewJobs?.length, 0);
     assert.equal(snapshot.evidence.length, scenario.endsWith('intent') ? 0 : 1);
     if (!scenario.endsWith('intent')) {
-      assert.equal(snapshot.evidence[0].passed, scenario === 'checked');
+      assert.equal(snapshot.evidence[0].passed, scenario !== 'failed');
       assert.equal(snapshot.evidence[0].evaluator.startsWith('node:'), true);
       const intent = controller.store.intents().at(-1);
       assert(intent);
@@ -2490,6 +2531,230 @@ test('an appointed native proposal is retained and applied once after every phas
     }
     assert.deepEqual(snapshot.runs.at(-1), originalRun);
     assert.notEqual(snapshot.tasks[0].state, 'ready');
+    const reviewPayload = startPayload();
+    const shouldReview = scenario === 'checked' || scenario.startsWith('review-');
+    if (!shouldReview) {
+      assert.equal(
+        (
+          await controller.execute(
+            command('StartCandidateReview', reviewPayload, revision()),
+            'local-owner',
+          )
+        ).outcome,
+        'blocked',
+      );
+    } else {
+      const artifacts = new ArtifactFiles(join(controller.home, 'artifacts'));
+      const evaluation = JSON.parse(artifacts.read(artifact.hash).toString('utf8'));
+      if (scenario === 'checked') {
+        const grant = evaluation.grants.find(
+          (value: { action: string }) => value.action === 'run-review',
+        );
+        const grantKey = `grant:${hashCanonical({ taskId: grant.taskId, action: grant.action, target: grant.target, expiresAt: grant.expiresAt })}`;
+        const consentKey = `evaluation-consent:${evaluation.scopeHash}`;
+        const consent = controller.store.receipt(consentKey);
+        assert(consent);
+        const check = controller.snapshot().evidence.find((value) => !value.review);
+        assert(check);
+        for (const boundary of [
+          'used-grant',
+          'revoked-consent',
+          'changed-check',
+          'changed-profile',
+        ]) {
+          if (boundary === 'used-grant')
+            controller.store.transaction(() =>
+              controller.store.saveReceipt(grantKey, hashCanonical(grant), 'local-owner', {
+                outcome: 'applied',
+                entity: run,
+              }),
+            );
+          if (boundary === 'revoked-consent')
+            controller.store.transaction(() =>
+              controller.store.db
+                .prepare('DELETE FROM receipts WHERE command_key=?')
+                .run(consentKey),
+            );
+          if (boundary === 'changed-check')
+            controller.store.transaction(() =>
+              controller.store.db
+                .prepare("UPDATE evidence SET body=? WHERE candidate_id=? AND kind='check'")
+                .run(canonicalJson({ ...check, definitionHash: '0'.repeat(64) }), candidate.id),
+            );
+          if (boundary === 'changed-profile')
+            context.fixtureProfile.facts.creditPolicies = ['existing-credits'];
+          const before = controller.snapshot();
+          assert.equal(
+            (
+              await controller.execute(
+                command('StartCandidateReview', reviewPayload, revision()),
+                'local-owner',
+              )
+            ).outcome,
+            'blocked',
+            boundary,
+          );
+          assert.deepEqual(controller.snapshot(), before);
+          assert.equal(context.submissions(), 1);
+          assert.equal(context.children.length, 3);
+          if (boundary === 'used-grant')
+            controller.store.transaction(() =>
+              controller.store.db.prepare('DELETE FROM receipts WHERE command_key=?').run(grantKey),
+            );
+          if (boundary === 'revoked-consent')
+            controller.store.transaction(() =>
+              controller.store.saveReceipt(
+                consentKey,
+                consent.hash,
+                consent.principal,
+                consent.result,
+              ),
+            );
+          if (boundary === 'changed-check')
+            controller.store.transaction(() =>
+              controller.store.db
+                .prepare("UPDATE evidence SET body=? WHERE candidate_id=? AND kind='check'")
+                .run(canonicalJson(check), candidate.id),
+            );
+          if (boundary === 'changed-profile')
+            context.fixtureProfile.facts.creditPolicies = ['ordinary', 'existing-credits'];
+        }
+      }
+      let reviewReplay: Promise<unknown> | undefined;
+      let closing: Promise<void> | undefined;
+      let stop: Promise<unknown> | undefined;
+      const reviewed = Promise.withResolvers<void>();
+      const offReview = controller.subscribe((event) => {
+        if (event.type === 'attempt.launched')
+          reviewReplay = controller
+            .execute(command('StartCandidateReview', reviewPayload, revision()), 'local-owner')
+            .then((result) => assert.equal(result.outcome, 'already-applied'));
+        if (
+          event.type === 'task.updated' &&
+          ['stopped', 'failed', 'unknown'].includes(event.payload.state)
+        )
+          reviewed.resolve();
+      });
+      if (scenario === 'review-journal-read')
+        context.onSpawn((phase) => {
+          if (phase === 'task')
+            context.children.at(-1)?.once('close', () =>
+              queueMicrotask(() => {
+                controller.store.db.exec(
+                  'ALTER TABLE native_processes RENAME TO native_processes_unreadable',
+                );
+              }),
+            );
+        });
+      context.onWritten((message) => {
+        if (message.method !== 'turn/start' || context.submissions() !== 2) return;
+        if (scenario === 'review-stop')
+          stop = controller
+            .execute(
+              command('StopRun', { taskId: task.id, runId: run.id }, revision()),
+              'local-owner',
+            )
+            .then((result) => assert.equal(result.outcome, 'applied'));
+        if (scenario === 'review-close') closing = Promise.resolve(controller.close());
+      });
+      const reviewStart = command('StartCandidateReview', reviewPayload, revision());
+      assert.equal((await controller.execute(reviewStart, 'local-owner')).outcome, 'applied');
+      await reviewed.promise;
+      await reviewReplay;
+      await stop;
+      await closing;
+      offReview();
+      if (scenario === 'review-close') controller = await context.restart();
+      if (scenario === 'review-journal-read') {
+        assert.equal(controller.snapshot().tasks[0].state, 'unknown');
+        assert.equal(
+          controller.store.db.prepare('SELECT COUNT(*) AS count FROM writer_leases').get()?.count,
+          1,
+        );
+        assert.equal(
+          controller.store.db.prepare('SELECT COUNT(*) AS count FROM reservations').get()?.count,
+          1,
+        );
+        assert.equal(
+          (
+            await controller.execute(
+              command('StopRun', { taskId: task.id, runId: run.id }, revision()),
+              'local-owner',
+            )
+          ).reason,
+          'writer-ownership-unknown',
+        );
+        assert.equal(controller.snapshot().tasks[0].state, 'unknown');
+        controller.store.db.exec(
+          'ALTER TABLE native_processes_unreadable RENAME TO native_processes',
+        );
+      }
+      const result = controller.snapshot();
+      const job = result.reviewJobs?.at(-1);
+      assert(job && !job.scripted);
+      assert.equal(job.writerAttemptId, result.attempts[0].id);
+      assert.equal(job.candidateId, candidate.id);
+      assert.equal(job.preparationId, artifact.id);
+      assert.equal(job.independence, 'process-only');
+      assert.equal(context.submissions(), 2, scenario);
+      assert.equal(context.children.length, 6);
+      assert.equal(result.attempts.length, 3);
+      assert.equal(result.candidates.length, 1);
+      assert.deepEqual(result.runs.at(-1), originalRun);
+      assert.equal(
+        result.evidence.filter((value) => value.review).length,
+        scenario === 'review-journal-read' ? 0 : 1,
+      );
+      const review = result.evidence.find((value) => value.review);
+      if (scenario !== 'review-journal-read') {
+        assert(review);
+        assert.equal(review.passed, scenario === 'checked');
+        assert.equal(review.evaluator.startsWith('native:openai:'), true);
+        assert.equal(review.review?.job.scripted, false);
+      }
+      assert(controller.store.receipt(`native-review-submission:${job.attemptId}`));
+      assert.equal(
+        !!controller.store.receipt(`native-review-completion:${job.attemptId}`),
+        scenario !== 'review-journal-read',
+      );
+      assert.equal(controller.store.receipt(`native-application:${job.attemptId}`), undefined);
+      assert.equal(controller.store.receipt(`candidate:${job.attemptId}`), undefined);
+      assert(
+        controller.store
+          .nativeProcesses(job.attemptId)
+          .every(
+            (phase) =>
+              (scenario === 'review-journal-read' || phase.state === 'quiescent') &&
+              groupAbsent(phase.process_group),
+          ),
+      );
+      assert.notEqual(result.tasks[0].state, 'ready');
+      assert.equal(
+        (
+          await controller.execute(
+            command('StartCandidateReview', reviewPayload, revision()),
+            'local-owner',
+          )
+        ).outcome,
+        'already-applied',
+      );
+      controller = await context.restart();
+      assert.equal(
+        (
+          await controller.execute(
+            command('StartCandidateReview', reviewPayload, revision()),
+            'local-owner',
+          )
+        ).outcome,
+        'already-applied',
+      );
+      assert.equal(controller.snapshot().attempts.length, 3);
+      assert.equal(context.submissions(), 2);
+      assert.equal(
+        controller.store.db.prepare('SELECT COUNT(*) AS count FROM publications').get()?.count,
+        0,
+      );
+    }
     assert.equal(
       (
         await controller.execute(
@@ -2519,7 +2784,7 @@ test('an appointed native proposal is retained and applied once after every phas
       'already-applied',
     );
     assert.equal(controller.store.intents().length, intents);
-    assert.equal(context.submissions(), 1);
+    assert.equal(context.submissions(), shouldReview ? 2 : 1);
   }
   for (const boundary of [
     'stop-prepared',
