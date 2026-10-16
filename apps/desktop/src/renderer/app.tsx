@@ -45,10 +45,13 @@ import { type FormEvent, type ReactNode, type RefObject, useEffect, useRef, useS
 import wordmark from './assets/crewkite-wordmark.png';
 import inverseWordmark from './assets/crewkite-wordmark-inverse.png';
 import {
+  actionName,
   Dialog,
+  effectTarget,
   Fact,
   familyClass,
   familyName,
+  methodName,
   moveTabFocus,
   RouterCard,
   SourceFacts,
@@ -583,6 +586,9 @@ export function App() {
                             approval={approval}
                             task={task}
                             workspace={workspace}
+                            projectName={
+                              snapshot.projects.find(({ id }) => id === task.projectId)?.name
+                            }
                             focusRef={approvalCard}
                           />
                         )}
@@ -770,11 +776,13 @@ function ApprovalCard({
   approval,
   task,
   workspace,
+  projectName,
   focusRef,
 }: {
   approval: Approval;
   task: Task;
   workspace: Workspace;
+  projectName?: string;
   focusRef?: RefObject<HTMLElement | null>;
 }) {
   function resolve(decision: 'approved' | 'denied') {
@@ -803,18 +811,31 @@ function ApprovalCard({
         </span>
         <div>
           <span className="eyebrow">NEEDS YOUR APPROVAL</span>
-          <h3>{titleCase(approval.action.replaceAll('-', ' '))}</h3>
+          <h3>{actionName(approval.action)}</h3>
         </div>
         <span className="pending-label">Waiting</span>
       </div>
-      <p>{approval.consequence}</p>
+      <p>
+        {approval.consequence === `Permit one ${approval.action} action for this attempt.`
+          ? 'Allow this named action once for this attempt.'
+          : approval.consequence}
+      </p>
       <div className="approval-target">
         <Terminal size={14} />
-        <code>{approval.target}</code>
+        <span>{effectTarget(approval, task, projectName)}</span>
       </div>
+      <details className="technical-details approval-binding">
+        <summary>Details</summary>
+        <code>Action {approval.action}</code>
+        <code>Target {approval.target}</code>
+        <code>Task {approval.taskId}</code>
+        <code>Attempt {approval.attemptId}</code>
+        <code>Approval {approval.approvalId}</code>
+        <p>{approval.consequence}</p>
+      </details>
       <div className="approval-footer">
         <span>
-          {approval.requester} · generation {approval.generation}
+          {titleCase(approval.requester)} · generation {approval.generation}
           <small>Attempt {short(approval.attemptId)}</small>
         </span>
         <div className="button-row">
@@ -953,7 +974,12 @@ function ActivityView({
                   )}
                   {event.type === 'approval.resolved' && (
                     <p>
-                      {titleCase(event.payload.status)} for <code>{event.payload.target}</code>
+                      {titleCase(event.payload.status)}:{' '}
+                      {effectTarget(
+                        event.payload,
+                        task,
+                        snapshot.projects.find(({ id }) => id === task.projectId)?.name,
+                      )}
                     </p>
                   )}
                 </div>
@@ -1349,7 +1375,7 @@ function Checks({
                 <div className="evidence-copy">
                   <strong>
                     {value.review
-                      ? `Scripted ${titleCase(value.review.job.methodId.replaceAll('-', ' '))} · cycle ${value.review.job.cycle}`
+                      ? `Scripted ${methodName(value.review.job.methodId)} · round ${value.review.job.cycle}`
                       : value.evaluator.startsWith('node:')
                         ? 'Node checks'
                         : 'Recorded check'}
@@ -1386,12 +1412,15 @@ function Checks({
                 return (
                   <article key={`${result.job.methodId}-${result.job.cycle}`}>
                     <div className="section-heading">
-                      <h3>{titleCase(result.job.methodId.replaceAll('-', ' '))}</h3>
+                      <h3>{methodName(result.job.methodId)}</h3>
                       <span className="scripted-badge">SCRIPTED · {result.outcome}</span>
                     </div>
                     <p>{result.summary}</p>
+                    <p className="muted small">
+                      Separate review invocation. Model diversity not established.
+                    </p>
                     <div className="review-identity">
-                      <span>Cycle {result.job.cycle}</span>
+                      <span>Round {result.job.cycle}</span>
                       <span>{route ? familyName(route.family) : 'Unavailable route'}</span>
                       <code>{short(result.job.candidateHash)}</code>
                     </div>
@@ -1836,7 +1865,11 @@ function AllowanceWindow({
         <span>{observation.source}</span>
       </div>
       {state === 'stale' && (
-        <p className="window-warning">Stale observation. The percentage rule is unavailable.</p>
+        <p className="window-warning">
+          {observation.source === 'fixture'
+            ? 'Scripted usage expires after five minutes. It does not refresh automatically. Before preparing a run, choose how unknown usage is handled in Policy.'
+            : 'Stale observation. The percentage rule is unavailable until a fresh report arrives.'}
+        </p>
       )}
       {unknown && <p className="window-warning">Waiting for a usable observation.</p>}
     </div>

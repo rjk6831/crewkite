@@ -6,12 +6,16 @@ import {
   type Role,
   type Run,
   RunSchema,
+  requiredReviewMethodIds,
   type Snapshot,
+  type SourceDetails,
   type Task,
 } from '@crewkite/contracts';
 import { createDemoFixtures } from '@crewkite/testkit';
 import {
+  ArrowDown,
   ArrowRight,
+  ArrowUp,
   Check,
   ChevronRight,
   Circle,
@@ -23,7 +27,17 @@ import {
   Users,
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
-import { Dialog, familyName, moveTabFocus, RouterCard, SourceFacts } from './components.tsx';
+import {
+  actionName,
+  CurrentCheckoutChanges,
+  Dialog,
+  effectTarget,
+  familyName,
+  Help,
+  moveTabFocus,
+  RouterCard,
+  SourceFacts,
+} from './components.tsx';
 import type { Workspace } from './source.ts';
 import { loadTeams, roleLabels, type SavedTeam, saveTeam } from './templates.ts';
 
@@ -54,7 +68,7 @@ const methodCatalog: Array<{ id: MethodId; name: string; description: string; cr
   {
     id: 'round-robin',
     name: 'Round-robin review',
-    description: 'Run a finite sequence of critiques with an explicit cycle cap.',
+    description: 'Run a finite sequence of critiques with an explicit round cap.',
     credit: 'multi',
   },
 ];
@@ -77,29 +91,42 @@ export function Launch({
   onClose: () => void;
 }) {
   const fixtures = createDemoFixtures();
+  const project = snapshot.projects.find(({ id }) => id === task.projectId);
   const qualified = snapshot.routes.filter(({ qualified }) => qualified);
   const find = (family: string) => qualified.find((route) => route.family === family)?.id;
   const builder = find('anthropic') ?? qualified[0]?.id;
   const reviewer = find('openai');
-  const [team, setTeam] = useState<string>('Glide');
+  const [team, setTeam] = useState<string>('Formation');
   const [section, setSection] = useState<'Team' | 'Policy' | 'Methods'>('Team');
   const [roles, setRoles] = useState<Role[]>(
     builder
       ? [
           {
             role: 'coder',
+            selection: 'ordered',
             routeId: builder,
             pinned: false,
             approvedFallbacks: reviewer ? [reviewer] : [],
           },
+          ...(reviewer
+            ? [
+                {
+                  role: 'reviewer' as const,
+                  selection: 'ordered' as const,
+                  routeId: reviewer,
+                  pinned: true,
+                  approvedFallbacks: [],
+                },
+              ]
+            : []),
         ]
       : [],
   );
   const [policy, setPolicy] = useState<Policy>(() => ({
     ...fixtures.policy,
     authority: 'guided',
-    quality: 'quick',
-    limits: { ...fixtures.policy.limits, concurrency: 1 },
+    quality: 'standard',
+    limits: { ...fixtures.policy.limits, attempts: 6, concurrency: 1 },
     effects: fixtures.policy.effects.map((grant) => ({
       ...grant,
       taskId: task.id,
@@ -115,7 +142,10 @@ export function Launch({
         unit: 'percent' as const,
       })),
   }));
-  const [methods, setMethods] = useState<Method[]>([]);
+  const [methods, setMethods] = useState<Method[]>(
+    requiredReviewMethodIds('standard').map((id) => ({ id, cycles: 1, reviewerRole: 'reviewer' })),
+  );
+  const [customMethods, setCustomMethods] = useState(false);
   const [reviewGates, setReviewGates] = useState<Record<string, 'ask' | 'once'>>({});
   const [customGates, setCustomGates] = useState(false);
   const [guidance, setGuidance] = useState<Guidance>({
@@ -126,24 +156,29 @@ export function Launch({
   const [saveName, setSaveName] = useState('My custom team');
   const [message, setMessage] = useState<string | null>(null);
   const [source, setSource] = useState<Run['source'] | null>(null);
+  const [inspection, setInspection] = useState<{
+    source: Run['source'];
+    details: SourceDetails;
+    receivedAt: string;
+  } | null>(null);
   const [prepared, setPrepared] = useState<Run | null>(
     snapshot.runs.find(({ id }) => id === task.runId) ?? null,
   );
-  const requiredMethods: MethodId[] =
-    policy.quality === 'quick'
-      ? []
-      : policy.quality === 'standard'
-        ? ['second-opinion', 'keep-it-simple']
-        : ['second-opinion', 'keep-it-simple', 'challenge-assumptions'];
+  const requiredMethods = requiredReviewMethodIds(policy.quality);
   const resolvedMethods = [...methods];
   for (const id of requiredMethods) {
     if (!resolvedMethods.some((method) => method.id === id))
       resolvedMethods.push({
         id,
         cycles: 1,
-        reviewerRole: roles.some(({ role }) => role === 'reviewer') ? 'reviewer' : 'advisor',
+        reviewerRole:
+          id === 'second-opinion' || roles.some(({ role }) => role === 'reviewer')
+            ? 'reviewer'
+            : 'advisor',
       });
   }
+  const methodOrder = requiredReviewMethodIds('thorough');
+  resolvedMethods.sort((a, b) => methodOrder.indexOf(a.id) - methodOrder.indexOf(b.id));
   const minimumAttempts = 2 + resolvedMethods.reduce((total, method) => total + method.cycles, 0);
   const recoveryAttempts = minimumAttempts + 2;
   const reviewExecutionReady =
@@ -158,7 +193,15 @@ export function Launch({
     void workspace
       .command({ command: 'InspectSource', payload: { projectId: task.projectId } })
       .then((result) => {
-        if (active && result.data?.kind === 'source') setSource(result.data.source);
+        if (active && result.data?.kind === 'source') {
+          setSource(result.data.source);
+          if (result.data.details)
+            setInspection({
+              source: result.data.source,
+              details: result.data.details,
+              receivedAt: new Date().toISOString(),
+            });
+        }
       })
       .catch(() => {});
     return () => {
@@ -194,8 +237,18 @@ export function Launch({
   const missingReviewer = resolvedMethods.some(
     (method) => !roles.some(({ role }) => role === method.reviewerRole),
   );
+  const unsupportedPanel = resolvedMethods.some(({ id }) => id === 'round-robin');
+  const ineligibleReview = resolvedMethods.some(
+    ({ id, reviewerRole }) => id === 'second-opinion' && reviewerRole !== 'reviewer',
+  );
+  const fixedAllowanceMismatch =
+    policy.unknownUsage.rule === 'fixed-allowance' &&
+    policy.unknownUsage.allowance.minutes < policy.limits.minutes;
   const canPrepare =
     source &&
+    !fixedAllowanceMismatch &&
+    !unsupportedPanel &&
+    !ineligibleReview &&
     roles.some(({ role }) => role === 'coder') &&
     unavailable.length === 0 &&
     !unmappedReserves &&
@@ -205,6 +258,7 @@ export function Launch({
 
   function applyBuiltin(name: TeamName) {
     setTeam(name);
+    setCustomMethods(false);
     setCustomGates(false);
     setReviewGates({});
     setPrepared(null);
@@ -214,31 +268,39 @@ export function Launch({
         ? [
             {
               role: 'coder',
+              selection: 'ordered',
               routeId: builder,
               pinned: false,
               approvedFallbacks: reviewer ? [reviewer] : [],
             },
           ]
         : [];
-    if (reviewer && ['Formation', 'Expedition'].includes(name))
-      selected.push({ role: 'reviewer', routeId: reviewer, pinned: true, approvedFallbacks: [] });
+    if (reviewer && name !== 'Custom')
+      selected.push({
+        role: 'reviewer',
+        selection: 'ordered',
+        routeId: reviewer,
+        pinned: true,
+        approvedFallbacks: [],
+      });
     const architect = find('google');
     if (architect && name === 'Expedition')
-      selected.push({ role: 'lead', routeId: architect, pinned: false, approvedFallbacks: [] });
+      selected.push({
+        role: 'lead',
+        selection: 'ordered',
+        routeId: architect,
+        pinned: false,
+        approvedFallbacks: [],
+      });
     setRoles(selected);
     setPolicy((value) => ({
       ...value,
       effects: value.effects.map((grant) => ({ ...grant, usesRemaining: 0 })),
     }));
     setMethods(
-      name === 'Formation'
-        ? [{ id: 'second-opinion', cycles: 1, reviewerRole: 'reviewer' }]
-        : name === 'Expedition'
-          ? [
-              { id: 'keep-it-simple', cycles: 1, reviewerRole: 'reviewer' },
-              { id: 'challenge-assumptions', cycles: 1, reviewerRole: 'reviewer' },
-            ]
-          : [],
+      requiredReviewMethodIds(
+        name === 'Glide' ? 'quick' : name === 'Expedition' ? 'thorough' : 'standard',
+      ).map((id) => ({ id, cycles: 1, reviewerRole: 'reviewer' })),
     );
     setPolicy((value) => ({
       ...value,
@@ -258,6 +320,7 @@ export function Launch({
           ? [
               {
                 role,
+                selection: existing ? (existing.selection ?? 'reset-aware') : 'ordered',
                 routeId,
                 pinned: existing?.pinned ?? false,
                 approvedFallbacks: existing?.approvedFallbacks.filter((id) => id !== routeId) ?? [],
@@ -267,8 +330,22 @@ export function Launch({
       ];
     });
   }
+  function moveFallback(role: Role['role'], id: string, direction: -1 | 1) {
+    setRoles((current) =>
+      current.map((entry) => {
+        if (entry.role !== role) return entry;
+        const order = [...entry.approvedFallbacks];
+        const index = order.indexOf(id);
+        const next = index + direction;
+        if (index < 0 || next < 0 || next >= order.length) return entry;
+        [order[index], order[next]] = [order[next], order[index]];
+        return { ...entry, approvedFallbacks: order };
+      }),
+    );
+  }
   function applySaved(value: SavedTeam) {
     setTeam(value.name);
+    setCustomMethods(true);
     setPrepared(null);
     setMessage(null);
     setRoles(structuredClone(value.roles));
@@ -296,7 +373,6 @@ export function Launch({
     }));
   }
   function resolvedEffects(expiresAt?: string): Policy['effects'] {
-    const project = snapshot.projects.find((project) => project.id === task.projectId);
     const base = policy.effects
       .filter(({ action }) => action !== 'run-review')
       .map((grant) => ({
@@ -369,6 +445,47 @@ export function Launch({
       setMessage(error instanceof Error ? error.message : 'The team could not be saved.');
     }
   }
+  const canEditPrepared =
+    prepared &&
+    task.runId === prepared.id &&
+    task.state === 'draft' &&
+    !snapshot.attempts.some(({ runId }) => runId === prepared.id) &&
+    !snapshot.approvals.some(
+      (approval) => approval.taskId === task.id && approval.status === 'pending',
+    );
+  function editPrepared() {
+    if (!canEditPrepared) return;
+    const savedPolicy = structuredClone(prepared.policy.policy);
+    setRoles(structuredClone(prepared.roles));
+    setPolicy({
+      ...savedPolicy,
+      effects: savedPolicy.effects.map((grant) => ({ ...grant, usesRemaining: 0, revoked: false })),
+    });
+    setMethods(savedPolicy.methods ?? []);
+    setGuidance(savedPolicy.guidance ?? { goal: task.outcome, principles: [...principles] });
+    setReviewGates({});
+    setCustomGates(true);
+    setCustomMethods(true);
+    setTeam('Custom');
+    setPrepared(null);
+    setSection('Policy');
+    setMessage(
+      'Saved settings are ready to edit. Review the configuration again before starting. Previous automatic permissions are not reused.',
+    );
+  }
+  function launchFailure(reason: string | undefined) {
+    return (
+      {
+        'draft-has-pending-work':
+          'This draft has pending work or approval. Stop or resolve it before editing.',
+        'prepared-run-started':
+          'This run has already started. Its saved settings cannot be edited.',
+        'run-not-current': 'The task changed. Close this window and reopen its current run.',
+      }[reason ?? ''] ??
+      reason ??
+      'The controller could not complete this action.'
+    );
+  }
   async function prepare() {
     if (!canPrepare) return;
     try {
@@ -382,13 +499,20 @@ export function Launch({
         },
       });
       const run = RunSchema.safeParse(result.entity);
-      if (run.success) setPrepared(run.data);
-    } catch {}
+      if (result.outcome === 'applied' && run.success) {
+        setPrepared(run.data);
+        setMessage(null);
+      } else setMessage(launchFailure(result.reason));
+    } catch {
+      setMessage(
+        'The controller could not confirm preparation. Check the connection before trying again.',
+      );
+    }
   }
   return (
     <Dialog
       title={prepared ? 'Review the prepared run' : 'Configure this run'}
-      eyebrow={prepared ? 'FROZEN SOURCE AND POLICY' : 'TEAM, PERMISSIONS AND REVIEW'}
+      eyebrow={prepared ? 'REVIEW BEFORE START' : 'TEAM, PERMISSIONS AND REVIEW'}
       onClose={onClose}
       wide
     >
@@ -449,38 +573,78 @@ export function Launch({
             {message}
           </p>
         )}
+        {snapshot.usage.some(
+          ({ state, observation }) => state === 'stale' && observation.source === 'fixture',
+        ) && (
+          <p className="notice">
+            <Info size={14} />
+            Scripted usage expires after five minutes and does not refresh automatically.{' '}
+            {prepared
+              ? 'This prepared run keeps its saved usage policy.'
+              : 'Review Policy > Unknown usage before resolving. Waiting requires fresh observations; a finite fallback permits only the displayed allowance.'}
+          </p>
+        )}
+        {inspection && (
+          <CurrentCheckoutChanges
+            source={inspection.source}
+            details={inspection.details}
+            receivedAt={inspection.receivedAt}
+          />
+        )}
         {prepared ? (
           <>
+            {task.runId !== prepared.id && (
+              <p className="notice">
+                <Info size={14} />
+                The task configuration changed. Close this window and reopen its current run.
+              </p>
+            )}
             <SourceFacts source={prepared.source} />
             <RouterCard run={prepared} routes={snapshot.routes} />
+            {!prepared.decision.chosen && canEditPrepared && (
+              <p className="notice">
+                <Info size={14} />
+                No route can start under these saved settings. Edit configuration to review the
+                usage fallback and limits. Scripted observations do not refresh automatically.
+              </p>
+            )}
             <section className="card">
               <div className="section-heading">
-                <h2>Resolved permissions</h2>
-                <span>Frozen for this run</span>
+                <h2>Permissions</h2>
+                <span>Saved for this run</span>
               </div>
-              <EffectSummary policy={prepared.policy.policy} />
+              <EffectSummary
+                policy={prepared.policy.policy}
+                task={task}
+                projectName={project?.name}
+              />
               {prepared.policy.policy.effects.length > 0 && (
                 <p className="muted small">
-                  Earliest saved grant expiry:{' '}
+                  Permissions expire{' '}
                   {new Date(
                     Math.min(
                       ...prepared.policy.policy.effects.map((grant) => Date.parse(grant.expiresAt)),
                     ),
                   ).toLocaleString()}
-                  . Expiry stays fixed after preparation.
+                  .{' '}
+                  <Help label="permission expiry">
+                    This shows the earliest permission expiry. Each permission keeps its own saved
+                    expiry. Editing the configuration requires another review and new permissions
+                    before starting.
+                  </Help>
                 </p>
               )}
               <div className="resolved-limits">
-                <span>{prepared.policy.policy.limits.attempts} attempts maximum</span>
-                <span>{prepared.policy.policy.limits.minutes} min maximum</span>
-                <span>{prepared.policy.policy.limits.concurrency} slot cap</span>
+                <span>{prepared.policy.policy.limits.attempts} total attempts</span>
+                <span>{prepared.policy.policy.limits.minutes} minutes across attempts</span>
+                <span>{prepared.policy.policy.limits.concurrency} simultaneous worker maximum</span>
               </div>
             </section>
             <div className="launch-warning">
               <ShieldCheck size={17} />
               <p>
-                Start uses this exact source, roster and policy. Changes to team preferences apply
-                to the next run. Current revocations and consumed grants still apply.
+                Start uses these saved settings. Team preference changes apply to another run. Used
+                or withdrawn permissions stay unavailable.
               </p>
             </div>
           </>
@@ -564,7 +728,23 @@ export function Launch({
                     const route = qualified.find(({ id }) => id === assignment?.routeId);
                     const candidates = qualified.filter((value) => value.family === route?.family);
                     const models = [...new Set(candidates.map(({ model }) => model))];
-                    const efforts = candidates.filter((value) => value.model === route?.model);
+                    const efforts = candidates.filter(
+                      (value) =>
+                        value.model === route?.model &&
+                        value.billing === route?.billing &&
+                        value.speed?.requested === route?.speed?.requested,
+                    );
+                    const speedVariant = (speed: 'normal' | 'fast') =>
+                      candidates.find(
+                        (value) =>
+                          value.model === route?.model &&
+                          value.billing === route?.billing &&
+                          value.effort.requested === route?.effort.requested &&
+                          value.effort.effective === route?.effort.effective &&
+                          value.speed?.requested === speed &&
+                          value.speed.effective === speed &&
+                          value.speed.supported.includes(speed),
+                      );
                     return (
                       <section
                         className={`assignment-card ${assignment ? 'enabled' : ''}`}
@@ -648,84 +828,194 @@ export function Launch({
                                 <span>Effective effort</span>
                                 <strong>{route?.effort.effective ?? 'Unavailable'}</strong>
                               </div>
+                              <fieldset className="speed-options">
+                                <legend>
+                                  Speed{' '}
+                                  <Help label="model speed">
+                                    Speed is separate from reasoning effort. A choice is enabled
+                                    only when this model and effort have an exact qualified route
+                                    for that speed. Missing metadata leaves speed unavailable.
+                                  </Help>
+                                </legend>
+                                {route?.speed ? (
+                                  <div>
+                                    {(['normal', 'fast'] as const).map((speed) => {
+                                      const variant = speedVariant(speed);
+                                      return (
+                                        <label key={speed} className="speed-choice">
+                                          <input
+                                            type="radio"
+                                            name={`speed-${role}`}
+                                            aria-label={`${roleLabels[role]} ${speed} speed`}
+                                            checked={route?.speed?.requested === speed}
+                                            disabled={!variant}
+                                            onChange={() => {
+                                              if (variant) changeRole(role, variant.id);
+                                            }}
+                                          />
+                                          {speed === 'normal' ? 'Normal' : 'Fast'}
+                                        </label>
+                                      );
+                                    })}
+                                  </div>
+                                ) : (
+                                  <small>Speed not reported</small>
+                                )}
+                                {route?.speed && !speedVariant('fast') && (
+                                  <small>No qualified Fast route for this model and effort.</small>
+                                )}
+                              </fieldset>
                             </div>
                             <div className="assignment-options">
-                              <label className="checkbox-label">
-                                <input
-                                  type="checkbox"
-                                  checked={assignment.pinned}
-                                  onChange={(event) =>
-                                    setRoles((current) =>
-                                      current.map((value) =>
-                                        value.role === role
-                                          ? { ...value, pinned: event.target.checked }
-                                          : value,
-                                      ),
-                                    )
-                                  }
-                                />
-                                <Pin size={11} />
-                                Pin route
-                              </label>
-                              <span>1 useful slot maximum</span>
+                              <div className="pin-control">
+                                <label className="checkbox-label">
+                                  <input
+                                    type="checkbox"
+                                    checked={assignment.pinned}
+                                    onChange={(event) =>
+                                      setRoles((current) =>
+                                        current.map((value) =>
+                                          value.role === role
+                                            ? { ...value, pinned: event.target.checked }
+                                            : value,
+                                        ),
+                                      )
+                                    }
+                                  />
+                                  <Pin size={11} />
+                                  Pin route
+                                </label>
+                                <Help label={`${roleLabels[role]} route pin`}>
+                                  Keep this primary route while it is eligible. Only saved fallbacks
+                                  may replace it when allowance, capacity or another gate blocks it.
+                                  A pin cannot bypass limits or approvals.
+                                </Help>
+                              </div>
+                              <span>1 worker at a time</span>
                             </div>
+                            <label className="route-selection">
+                              Route selection
+                              <select
+                                aria-label={`${roleLabels[role]} route selection`}
+                                value={assignment.selection ?? 'reset-aware'}
+                                onChange={(event) =>
+                                  setRoles((current) =>
+                                    current.map((entry) =>
+                                      entry.role === role
+                                        ? {
+                                            ...entry,
+                                            selection: event.target.value as
+                                              | 'ordered'
+                                              | 'reset-aware',
+                                          }
+                                        : entry,
+                                    ),
+                                  )
+                                }
+                              >
+                                <option value="ordered">Saved order</option>
+                                <option value="reset-aware">Allowance reset timing</option>
+                              </select>
+                            </label>
                             <details className="fallback-details">
                               <summary>
                                 {assignment.approvedFallbacks.length} approved fallback(s)
                                 <ChevronRight size={12} />
                               </summary>
                               <div>
+                                <p className="fallback-help">
+                                  {assignment.selection === 'ordered'
+                                    ? 'Eligible routes follow the primary and numbered fallback order. Limits and pins still apply.'
+                                    : 'Reset timing and eligibility determine selection. Saved order breaks ties.'}
+                                </p>
+                                <ol className="fallback-order">
+                                  {assignment.approvedFallbacks.map((id, index) => {
+                                    const value = qualified.find((route) => route.id === id);
+                                    const name = value
+                                      ? `${familyName(value.family)} · ${value.model} · ${value.effort.effective}`
+                                      : 'Unavailable route';
+                                    return (
+                                      <li key={id}>
+                                        <span className="fallback-number" aria-hidden="true">
+                                          {index + 1}
+                                        </span>
+                                        <label className="checkbox-label">
+                                          <input
+                                            type="checkbox"
+                                            checked
+                                            onChange={() =>
+                                              setRoles((current) =>
+                                                current.map((entry) =>
+                                                  entry.role === role
+                                                    ? {
+                                                        ...entry,
+                                                        approvedFallbacks:
+                                                          entry.approvedFallbacks.filter(
+                                                            (routeId) => routeId !== id,
+                                                          ),
+                                                      }
+                                                    : entry,
+                                                ),
+                                              )
+                                            }
+                                          />
+                                          {name}
+                                        </label>
+                                        <div className="fallback-move">
+                                          <button
+                                            type="button"
+                                            className="icon-button"
+                                            disabled={index === 0}
+                                            aria-label={`Move ${name} fallback earlier`}
+                                            onClick={() => moveFallback(role, id, -1)}
+                                          >
+                                            <ArrowUp size={12} />
+                                          </button>
+                                          <button
+                                            type="button"
+                                            className="icon-button"
+                                            disabled={
+                                              index === assignment.approvedFallbacks.length - 1
+                                            }
+                                            aria-label={`Move ${name} fallback later`}
+                                            onClick={() => moveFallback(role, id, 1)}
+                                          >
+                                            <ArrowDown size={12} />
+                                          </button>
+                                        </div>
+                                      </li>
+                                    );
+                                  })}
+                                </ol>
                                 {qualified
-                                  .filter(({ id }) => id !== assignment.routeId)
+                                  .filter(
+                                    ({ id }) =>
+                                      id !== assignment.routeId &&
+                                      !assignment.approvedFallbacks.includes(id),
+                                  )
                                   .map((value) => (
                                     <label className="checkbox-label" key={value.id}>
                                       <input
                                         type="checkbox"
-                                        checked={assignment.approvedFallbacks.includes(value.id)}
-                                        onChange={(event) =>
-                                          setRoles((current) =>
-                                            current.map((entry) =>
-                                              entry.role === role
-                                                ? {
-                                                    ...entry,
-                                                    approvedFallbacks: event.target.checked
-                                                      ? [...entry.approvedFallbacks, value.id]
-                                                      : entry.approvedFallbacks.filter(
-                                                          (id) => id !== value.id,
-                                                        ),
-                                                  }
-                                                : entry,
-                                            ),
-                                          )
-                                        }
-                                      />
-                                      {familyName(value.family)} · {value.model}
-                                    </label>
-                                  ))}
-                                {assignment.approvedFallbacks
-                                  .filter((id) => !qualified.some((value) => value.id === id))
-                                  .map((id) => (
-                                    <label className="checkbox-label" key={id}>
-                                      <input
-                                        type="checkbox"
-                                        checked
+                                        checked={false}
                                         onChange={() =>
                                           setRoles((current) =>
                                             current.map((entry) =>
                                               entry.role === role
                                                 ? {
                                                     ...entry,
-                                                    approvedFallbacks:
-                                                      entry.approvedFallbacks.filter(
-                                                        (value) => value !== id,
-                                                      ),
+                                                    approvedFallbacks: [
+                                                      ...entry.approvedFallbacks,
+                                                      value.id,
+                                                    ],
                                                   }
                                                 : entry,
                                             ),
                                           )
                                         }
                                       />
-                                      Unavailable fallback: remove or map it above
+                                      Add {familyName(value.family)} · {value.model} ·{' '}
+                                      {value.effort.effective}
                                     </label>
                                   ))}
                               </div>
@@ -739,8 +1029,8 @@ export function Launch({
                   })}
                 </div>
                 <p className="muted small">
-                  D0 uses a finite fake catalog and one writer per task. Slot caps limit concurrent
-                  useful work; they never create work to fill a quota.
+                  D0 uses a finite fake catalog and one writer per task. Checks and review jobs
+                  share the run's limits. Assigning a role does not start another worker.
                 </p>
               </>
             )}
@@ -750,7 +1040,12 @@ export function Launch({
                   <div className="section-heading">
                     <h2>
                       <ShieldCheck size={15} />
-                      Concrete gates
+                      Action approvals
+                      <Help label="automatic approval">
+                        Automatic permits one named action for this task and exact target until its
+                        expiry. Used or revoked permission cannot be reused. A saved team stores
+                        preferences; it grants no permission to a new run.
+                      </Help>
                     </h2>
                     <span>
                       {customGates ? 'Custom gates' : 'Preset gates'} · Quality is independent
@@ -774,9 +1069,22 @@ export function Launch({
                       Quality profile
                       <select
                         value={policy.quality}
-                        onChange={(event) =>
-                          setPolicy({ ...policy, quality: event.target.value as Policy['quality'] })
-                        }
+                        onChange={(event) => {
+                          const quality = event.target.value as Policy['quality'];
+                          setPolicy({ ...policy, quality });
+                          setMethods(
+                            requiredReviewMethodIds(quality).map((id) => ({
+                              id,
+                              cycles: 1,
+                              reviewerRole:
+                                id === 'second-opinion' ||
+                                roles.some(({ role }) => role === 'reviewer')
+                                  ? 'reviewer'
+                                  : 'advisor',
+                            })),
+                          );
+                          setCustomMethods(false);
+                        }}
                       >
                         <option value="quick">Quick</option>
                         <option value="standard">Standard</option>
@@ -793,21 +1101,19 @@ export function Launch({
                     {resolvedEffects().map((grant) => (
                       <div key={`${grant.action}-${grant.target}`}>
                         <div>
-                          <strong>
-                            {grant.action === 'write-scratch'
-                              ? 'Write the scratch copy'
-                              : grant.action === 'run-check'
-                                ? 'Run candidate checks'
-                                : grant.action === 'accept-candidate'
-                                  ? 'Create the named local branch'
-                                  : grant.action === 'export-patch'
-                                    ? 'Export the retained patch'
-                                    : grant.action}
-                          </strong>
-                          <code>{grant.target}</code>
+                          <strong>{actionName(grant.action)}</strong>
+                          <span className="effect-target">
+                            {effectTarget(grant, task, project?.name)}
+                          </span>
+                          <details className="technical-details">
+                            <summary>Details</summary>
+                            <code>
+                              {grant.action} · {grant.target}
+                            </code>
+                          </details>
                         </div>
                         <select
-                          aria-label={`${grant.action} ${grant.target} approval gate`}
+                          aria-label={`${actionName(grant.action)}: ${effectTarget(grant, task, project?.name)} approval gate`}
                           value={grant.usesRemaining === 1 ? 'once' : 'ask'}
                           onChange={(event) => {
                             setCustomGates(true);
@@ -831,19 +1137,28 @@ export function Launch({
                           }}
                         >
                           <option value="ask">Manual approval</option>
-                          <option value="once">Automatic, once</option>
+                          <option value="once">Automatic</option>
                         </select>
                       </div>
                     ))}
                   </div>
                   <p className="muted small">
-                    An automatic gate grants one named effect for this task and target. It expires
-                    and cannot widen itself. Editing a gate creates custom settings.
+                    Automatic permissions expire and stay limited to the named action. Editing an
+                    approval setting creates custom settings.
                   </p>
                 </section>
                 <section className="card">
                   <div className="section-heading">
-                    <h2>Allowance reserves</h2>
+                    <h2>
+                      Allowance reserves{' '}
+                      <Help label="allowance windows and reserves">
+                        Each allowance window belongs to its reported provider and account. A
+                        reserve keeps part of that allowance unused. For a percentage window, a 5%
+                        reserve stops new work before it would spend below 5%. Different windows and
+                        providers keep their own units. A reset needs a fresh report before
+                        allowance can be used again.
+                      </Help>
+                    </h2>
                     <span>Provider units</span>
                   </div>
                   <p className="muted small">
@@ -862,7 +1177,7 @@ export function Launch({
                       return (
                         <div key={identity}>
                           <label>
-                            Observed route and window
+                            Allowance window
                             <select
                               aria-label={`Reserve mapping ${reserve.windowId}`}
                               value={mapped ? identity : ''}
@@ -929,7 +1244,15 @@ export function Launch({
                 </section>
                 <section className="card">
                   <div className="section-heading">
-                    <h2>Hard limits</h2>
+                    <h2>
+                      Hard limits{' '}
+                      <Help label="run limits">
+                        Attempts count writer launches, checks and review jobs. Minutes combine
+                        their elapsed time from when each is allowed to start. Each attempt rounds
+                        up to a whole minute. Resuming uses only remaining minutes. D0 permits one
+                        simultaneous writer.
+                      </Help>
+                    </h2>
                     <span>Maximums, not targets</span>
                   </div>
                   <div className="policy-grid">
@@ -964,7 +1287,7 @@ export function Launch({
                       />
                     </label>
                     <label>
-                      Writer concurrency
+                      Simultaneous writers
                       <input type="number" value={1} disabled />
                     </label>
                     <label>
@@ -995,19 +1318,48 @@ export function Launch({
                         }
                       >
                         <option value="waiting">Wait for fresh observations</option>
-                        <option value="fixed-allowance">One launch, five minutes</option>
-                        <option value="manual">Named roster routes only</option>
+                        <option value="fixed-allowance">
+                          Limit unknown usage to 1 launch and 5 min
+                        </option>
+                        <option value="manual">Allow selected routes within run limits</option>
                       </select>
                     </label>
                   </div>
+                  {policy.unknownUsage.rule === 'fixed-allowance' && (
+                    <p className="notice">
+                      <Info size={14} />
+                      <span>
+                        This choice permits {policy.unknownUsage.allowance.launches} launch(s) per
+                        unknown route, including checks and reviews.{' '}
+                        {fixedAllowanceMismatch
+                          ? `Lower Minutes to ${policy.unknownUsage.allowance.minutes} or less, or choose Allow selected routes within run limits. The current ${policy.limits.minutes}-minute plan cannot start with this allowance.`
+                          : 'It can stop work before all selected reviews finish.'}
+                      </span>
+                    </p>
+                  )}
                   <p className="muted small">
                     Source preservation and failed-check blocking are controller-enforced
-                    boundaries.
+                    boundaries.{' '}
+                    <Help label="unknown usage">
+                      Wait blocks new work until observations are fresh. The finite choice limits
+                      each unknown route to one launch and five minutes, including checks and
+                      reviews. Allow selected routes permits saved team routes despite missing or
+                      stale reports, within the run's remaining limits. Reserves and pins still
+                      apply.
+                    </Help>
                   </p>
                 </section>
                 <section className="card guidance-card">
                   <div className="section-heading">
-                    <h2>Goal and working principles</h2>
+                    <h2>
+                      Goal and working principles{' '}
+                      <Help label="working principles">
+                        These preferences guide the plan and reviews. They grant no permission.
+                        Source preservation and failed-check blocking remain enforced even when
+                        their guidance boxes are unchecked. Dependency and configuration review is
+                        advisory in D0.
+                      </Help>
+                    </h2>
                     <span>Advisory guidance</span>
                   </div>
                   <label>
@@ -1034,7 +1386,9 @@ export function Launch({
                             })
                           }
                         />
-                        {principle}
+                        {principle === 'Approve only a named local effect.'
+                          ? 'Approve a specific action in this workspace.'
+                          : principle}
                       </label>
                     ))}
                   </div>
@@ -1053,16 +1407,38 @@ export function Launch({
                     <Circle size={8} />
                     Scripted D0 evaluation
                   </span>
-                  <h3>Choose only the review this task needs</h3>
+                  <h3>Choose the review this task needs</h3>
+                  <span className="fake-tag">
+                    {customMethods
+                      ? 'Custom review settings'
+                      : `${policy.quality[0].toUpperCase()}${policy.quality.slice(1)} review preset`}
+                  </span>
                   <p>
-                    Each enabled method names a reviewer role and a finite cycle cap. Its jobs share
+                    Each enabled method names a review role and a finite round cap. Its jobs share
                     the run's limits and inspect a read-only candidate copy.
+                  </p>
+                  <p className="method-role-help">
+                    Reviewer supplies the independent review that Standard and Thorough require.
+                    Advisor can run a simplicity or assumptions lens. Both stay within the same
+                    read-only review permissions. Assign the role to a qualified scripted route in
+                    Team.
                   </p>
                 </div>
                 <div className="method-grid">
                   {methodCatalog.map((method) => {
                     const selected = resolvedMethods.find(({ id }) => id === method.id);
                     const required = requiredMethods.includes(method.id);
+                    const eligibleRoles = (['reviewer', 'advisor'] as const).filter(
+                      (role) =>
+                        (method.id !== 'second-opinion' || role === 'reviewer') &&
+                        roles.some(
+                          (assignment) =>
+                            assignment.role === role &&
+                            qualified.some(
+                              (route) => route.id === assignment.routeId && route.fake,
+                            ),
+                        ),
+                    );
                     const reviewerRole = roles.find(({ role }) => role === selected?.reviewerRole);
                     const route = qualified.find(({ id }) => id === reviewerRole?.routeId);
                     return (
@@ -1074,8 +1450,9 @@ export function Launch({
                           <input
                             type="checkbox"
                             checked={!!selected}
-                            disabled={required}
-                            onChange={(event) =>
+                            disabled={required || (method.id === 'round-robin' && !selected)}
+                            onChange={(event) => {
+                              setCustomMethods(true);
                               setMethods((current) =>
                                 event.target.checked
                                   ? [
@@ -1083,43 +1460,55 @@ export function Launch({
                                       { id: method.id, cycles: 1, reviewerRole: 'reviewer' },
                                     ]
                                   : current.filter(({ id }) => id !== method.id),
-                              )
-                            }
+                              );
+                            }}
                           />
                           <strong>{method.name}</strong>
                           {required && <span className="fake-tag">Required by quality</span>}
                         </label>
-                        <p>{method.description}</p>
+                        <p>
+                          {method.id === 'round-robin'
+                            ? 'Needs an ordered review panel. Not available in this build.'
+                            : method.description}
+                        </p>
+                        {method.id === 'round-robin' && selected && (
+                          <p className="method-blocker">
+                            Remove this method before preparing another run. The saved selection has
+                            been retained.
+                          </p>
+                        )}
                         <span className="method-credit">Method influence: {method.credit}</span>
                         {selected && (
                           <>
                             <div className="method-controls">
                               <label>
-                                Cycle cap
+                                Round cap
                                 <select
                                   value={selected.cycles}
-                                  onChange={(event) =>
+                                  onChange={(event) => {
+                                    setCustomMethods(true);
                                     setMethods(
                                       resolvedMethods.map((value) =>
                                         value.id === method.id
                                           ? { ...value, cycles: Number(event.target.value) }
                                           : value,
                                       ),
-                                    )
-                                  }
+                                    );
+                                  }}
                                 >
                                   {[1, 2, 3].map((count) => (
                                     <option key={count} value={count}>
-                                      {count} cycle{count === 1 ? '' : 's'}
+                                      {count} round{count === 1 ? '' : 's'}
                                     </option>
                                   ))}
                                 </select>
                               </label>
                               <label>
-                                Reviewer role
+                                Role
                                 <select
                                   value={selected.reviewerRole}
-                                  onChange={(event) =>
+                                  onChange={(event) => {
+                                    setCustomMethods(true);
                                     setMethods(
                                       resolvedMethods.map((value) =>
                                         value.id === method.id
@@ -1131,18 +1520,29 @@ export function Launch({
                                             }
                                           : value,
                                       ),
-                                    )
-                                  }
+                                    );
+                                  }}
                                 >
-                                  <option value="reviewer">Reviewer</option>
-                                  <option value="advisor">Advisor</option>
+                                  {!eligibleRoles.includes(selected.reviewerRole) && (
+                                    <option value={selected.reviewerRole} disabled>
+                                      {selected.reviewerRole === 'reviewer'
+                                        ? 'Reviewer'
+                                        : 'Advisor'}{' '}
+                                      unavailable for this method
+                                    </option>
+                                  )}
+                                  {eligibleRoles.map((role) => (
+                                    <option key={role} value={role}>
+                                      {role === 'reviewer' ? 'Reviewer' : 'Advisor'}
+                                    </option>
+                                  ))}
                                 </select>
                               </label>
                             </div>
                             <p className={route ? 'method-route' : 'method-blocker'}>
                               {route
                                 ? `${familyName(route.family)} · ${route.model} · ${route.effort.effective} effort`
-                                : 'Assign this reviewer role in Team before resolving.'}
+                                : 'Assign this role in Team before resolving.'}
                             </p>
                           </>
                         )}
@@ -1171,7 +1571,7 @@ export function Launch({
           <p className="notice">
             <Info size={14} />
             This plan needs at least {minimumAttempts} attempts for one writer, declared checks and{' '}
-            {minimumAttempts - 2} scripted review cycle(s). A handoff needs another writer attempt.
+            {minimumAttempts - 2} scripted review round(s). A handoff needs another writer attempt.
           </p>
         )}
         {!prepared &&
@@ -1180,14 +1580,26 @@ export function Launch({
             <p className="notice">
               <Info size={14} />
               The scripted handoff and restart walkthrough needs {recoveryAttempts} attempts,
-              including all selected review cycles. Raise the visible limit before preparing that
+              including all selected review rounds. Raise the visible limit before preparing that
               walkthrough.
             </p>
           )}
+        {!prepared && ineligibleReview && (
+          <p className="notice">
+            <Info size={14} />
+            Second opinion needs the Reviewer role. Choose an eligible Reviewer in Methods.
+          </p>
+        )}
+        {!prepared && unsupportedPanel && (
+          <p className="notice">
+            <Info size={14} />
+            Remove Round-robin before preparing a new run. This build has no ordered review panel.
+          </p>
+        )}
         {!prepared && missingReviewer && (
           <p className="notice">
             <Info size={14} />
-            An enabled method needs its selected reviewer role assigned.
+            An enabled method needs its selected Reviewer or Advisor assigned in Team.
           </p>
         )}
       </div>
@@ -1196,26 +1608,45 @@ export function Launch({
           Cancel
         </button>
         {prepared ? (
-          <button
-            type="button"
-            className="button primary"
-            disabled={workspace.pending || !prepared.decision.chosen}
-            onClick={() =>
-              void workspace
-                .command({
-                  command: 'StartRun',
-                  expectedRevision: task.revision,
-                  payload: { taskId: task.id, runId: prepared.id },
-                })
-                .then((result) => {
-                  if (result.outcome === 'applied') onClose();
-                })
-                .catch(() => {})
-            }
-          >
-            Start run
-            <ArrowRight size={14} />
-          </button>
+          <>
+            {canEditPrepared && (
+              <button
+                type="button"
+                className="button secondary"
+                disabled={workspace.pending}
+                onClick={editPrepared}
+              >
+                Edit configuration
+              </button>
+            )}
+            <button
+              type="button"
+              className="button primary"
+              disabled={
+                workspace.pending || task.runId !== prepared.id || !prepared.decision.chosen
+              }
+              onClick={() =>
+                void workspace
+                  .command({
+                    command: 'StartRun',
+                    expectedRevision: task.revision,
+                    payload: { taskId: task.id, runId: prepared.id },
+                  })
+                  .then((result) => {
+                    if (result.outcome === 'applied') onClose();
+                    else setMessage(launchFailure(result.reason));
+                  })
+                  .catch(() =>
+                    setMessage(
+                      'The controller could not confirm start. Check the task state before trying again.',
+                    ),
+                  )
+              }
+            >
+              Start run
+              <ArrowRight size={14} />
+            </button>
+          </>
         ) : (
           <>
             <span className="muted small">
@@ -1237,17 +1668,33 @@ export function Launch({
   );
 }
 
-function EffectSummary({ policy }: { policy: Policy }) {
+function EffectSummary({
+  policy,
+  task,
+  projectName,
+}: {
+  policy: Policy;
+  task: Task;
+  projectName?: string;
+}) {
   return (
     <div className="effect-summary">
       {policy.effects.map((grant) => (
         <div key={`${grant.action}-${grant.target}`}>
           <span>
             {grant.usesRemaining === 1 ? <Check size={13} /> : <ShieldCheck size={13} />}
-            {grant.action}
+            {actionName(grant.action)}
           </span>
-          <code>{grant.target}</code>
-          <strong>{grant.usesRemaining === 1 ? 'Automatic, once' : 'Manual approval'}</strong>
+          <div>
+            <span>{effectTarget(grant, task, projectName)}</span>
+            <details className="technical-details">
+              <summary>Details</summary>
+              <code>
+                {grant.action} · {grant.target}
+              </code>
+            </details>
+          </div>
+          <strong>{grant.usesRemaining === 1 ? 'Automatic' : 'Manual approval'}</strong>
         </div>
       ))}
     </div>
