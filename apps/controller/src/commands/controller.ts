@@ -1532,6 +1532,10 @@ export class Controller {
         candidate,
         sourceFiles: committedFiles(this.projectPath(task.projectId) as string, run.source.base),
         criteria: task.criteria,
+        selection:
+          command.payload.checkRecipeId === 'project-node-tests-v1'
+            ? { recipeId: command.payload.checkRecipeId, testFiles: command.payload.testFiles }
+            : undefined,
       });
       const fields = {
         run,
@@ -1791,6 +1795,10 @@ export class Controller {
             candidateHash: plan.candidate.hash,
             preparationId: artifact.id,
             recipe: plan.definition.recipeId,
+            testFiles:
+              plan.definition.recipeId === 'project-node-tests-v1'
+                ? plan.definition.collection
+                : [],
             definitionHash: plan.definition.definitionHash,
             target: {
               path: target.path,
@@ -2014,6 +2022,10 @@ export class Controller {
         plan.run.source.base,
       ),
       criteria: plan.context.criteria,
+      selection:
+        plan.definition.recipeId === 'project-node-tests-v1'
+          ? { recipeId: plan.definition.recipeId, testFiles: plan.definition.required.files }
+          : undefined,
     });
     if (hashCanonical(definition) !== hashCanonical(plan.definition))
       throw Error('preparation-changed');
@@ -2321,6 +2333,13 @@ export class Controller {
         run.source.base,
       ),
       criteria: proof.evaluation.context.criteria,
+      selection:
+        proof.evaluation.definition.recipeId === 'project-node-tests-v1'
+          ? {
+              recipeId: proof.evaluation.definition.recipeId,
+              testFiles: proof.evaluation.definition.required.files,
+            }
+          : undefined,
     });
     if (!completedCheckDefinitionMatches(proof.evaluation.definition, definition))
       throw Error('evidence-incomplete');

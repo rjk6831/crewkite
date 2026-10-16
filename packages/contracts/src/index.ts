@@ -37,6 +37,15 @@ export const NativeTargetPathSchema = RelativeSourcePathSchema.refine(
   (value) => value.isWellFormed() && !/\p{Cc}/u.test(value),
   'A replacement needs a relative path without control characters.',
 );
+export const ProjectNodeTestPathSchema = NativeTargetPathSchema.refine(
+  (path) => !path.startsWith('-') && !/[?*[\]{}]/.test(path),
+  'Node tests need exact relative file paths without options or globs.',
+);
+export const ProjectNodeTestFilesSchema = z
+  .array(ProjectNodeTestPathSchema)
+  .min(1)
+  .max(32)
+  .refine((paths) => new Set(paths).size === paths.length, 'Node test files must be distinct.');
 export const NativeProfileSchema = z.strictObject({
   id: label,
   family: z.literal('openai'),
@@ -494,6 +503,18 @@ const mutate = <T extends string, S extends z.ZodType>(command: T, payload: S) =
 const empty = z.strictObject({});
 const taskRef = z.strictObject({ taskId: TaskIdSchema });
 const runRef = z.strictObject({ taskId: TaskIdSchema, runId: RunIdSchema });
+const evaluationFields = {
+  taskId: TaskIdSchema,
+  candidateId: CandidateIdSchema,
+  reviewer: z.strictObject({
+    profileId: label,
+    methodId: ReviewMethodIdSchema,
+    cycles: z.literal(1),
+  }),
+  creditPolicy: z.enum(['ordinary', 'existing-credits']).default('ordinary'),
+  consent: z.enum(['explicit', 'saved']),
+  grants: z.array(GrantSchema).length(2),
+};
 export const CommandSchema = z.discriminatedUnion('command', [
   mutate('RegisterProject', z.strictObject({ path: text })),
   read('InspectSource', z.strictObject({ projectId: ProjectIdSchema })),
@@ -536,19 +557,14 @@ export const CommandSchema = z.discriminatedUnion('command', [
   ),
   mutate(
     'PrepareCandidateEvaluation',
-    z.strictObject({
-      taskId: TaskIdSchema,
-      candidateId: CandidateIdSchema,
-      checkRecipeId: z.literal('node-tests-v1'),
-      reviewer: z.strictObject({
-        profileId: label,
-        methodId: ReviewMethodIdSchema,
-        cycles: z.literal(1),
+    z.discriminatedUnion('checkRecipeId', [
+      z.strictObject({ ...evaluationFields, checkRecipeId: z.literal('node-tests-v1') }),
+      z.strictObject({
+        ...evaluationFields,
+        checkRecipeId: z.literal('project-node-tests-v1'),
+        testFiles: ProjectNodeTestFilesSchema,
       }),
-      creditPolicy: z.enum(['ordinary', 'existing-credits']).default('ordinary'),
-      consent: z.enum(['explicit', 'saved']),
-      grants: z.array(GrantSchema).length(2),
-    }),
+    ]),
   ),
   mutate(
     'StartCandidateEvaluation',
@@ -694,54 +710,75 @@ const localAcceptance = z
   })
   .refine((value) => value.available === (value.reason === 'available'))
   .default({ available: false, reason: 'evidence-incomplete' });
-export const CandidateEvaluationPreviewSchema = z.strictObject({
-  taskId: TaskIdSchema,
-  runId: RunIdSchema,
-  candidateId: CandidateIdSchema,
-  candidateHash: HashSchema,
-  preparationId: ArtifactIdSchema,
-  recipe: z.literal('node-tests-v1'),
-  definitionHash: HashSchema,
-  target: z.strictObject({
-    path: NativeTargetPathSchema,
-    baseHash: HashSchema,
-    candidateContentHash: HashSchema,
-  }),
-  reviewer: z.strictObject({
-    profileId: label,
-    assignedRole: ReviewMethodSchema.shape.reviewerRole,
-    methodId: ReviewMethodIdSchema,
-    cycle: z.literal(1),
-    independence: z.literal('process-only'),
-  }),
-  creditPolicy: z.enum(['ordinary', 'existing-credits']),
-  expiresAt: TimestampSchema,
-  remainingBudgets: RemainingBudgetsSchema,
-  allowance: z.strictObject({
-    source: z.literal('supplemental-evaluation'),
-    localChecks: z.literal(1),
-    nativeReviews: z.literal(1),
-  }),
-  stage: z.enum([
-    'prepared',
-    'checking',
-    'check-failed',
-    'awaiting-review',
-    'reviewing',
-    'reviewed',
-    'blocked',
-  ]),
-  check: z.strictObject({ artifactId: ArtifactIdSchema, passed: z.boolean() }).nullable(),
-  review: z
-    .strictObject({
-      artifactId: ArtifactIdSchema,
-      outcome: z.enum(['passed', 'failed', 'blocked']),
-    })
-    .nullable(),
-  checkStart: candidateEvaluationStart,
-  reviewStart: candidateEvaluationStart,
-  localAcceptance,
-});
+export const CandidateEvaluationPreviewSchema = z
+  .strictObject({
+    taskId: TaskIdSchema,
+    runId: RunIdSchema,
+    candidateId: CandidateIdSchema,
+    candidateHash: HashSchema,
+    preparationId: ArtifactIdSchema,
+    recipe: z.enum(['node-tests-v1', 'project-node-tests-v1']),
+    testFiles: z
+      .array(
+        z.strictObject({
+          path: ProjectNodeTestPathSchema,
+          hash: HashSchema,
+          bytes: RevisionSchema,
+          mode: z.enum(['100644', '100755']),
+        }),
+      )
+      .max(32)
+      .default([]),
+    definitionHash: HashSchema,
+    target: z.strictObject({
+      path: NativeTargetPathSchema,
+      baseHash: HashSchema,
+      candidateContentHash: HashSchema,
+    }),
+    reviewer: z.strictObject({
+      profileId: label,
+      assignedRole: ReviewMethodSchema.shape.reviewerRole,
+      methodId: ReviewMethodIdSchema,
+      cycle: z.literal(1),
+      independence: z.literal('process-only'),
+    }),
+    creditPolicy: z.enum(['ordinary', 'existing-credits']),
+    expiresAt: TimestampSchema,
+    remainingBudgets: RemainingBudgetsSchema,
+    allowance: z.strictObject({
+      source: z.literal('supplemental-evaluation'),
+      localChecks: z.literal(1),
+      nativeReviews: z.literal(1),
+    }),
+    stage: z.enum([
+      'prepared',
+      'checking',
+      'check-failed',
+      'awaiting-review',
+      'reviewing',
+      'reviewed',
+      'blocked',
+    ]),
+    check: z.strictObject({ artifactId: ArtifactIdSchema, passed: z.boolean() }).nullable(),
+    review: z
+      .strictObject({
+        artifactId: ArtifactIdSchema,
+        outcome: z.enum(['passed', 'failed', 'blocked']),
+      })
+      .nullable(),
+    checkStart: candidateEvaluationStart,
+    reviewStart: candidateEvaluationStart,
+    localAcceptance,
+  })
+  .superRefine((value, context) => {
+    const paths = value.testFiles.map((file) => file.path);
+    if (
+      (value.recipe === 'project-node-tests-v1' && paths.length === 0) ||
+      (value.recipe === 'node-tests-v1' && paths.length !== 0) ||
+      new Set(paths).size !== paths.length
+    )
+      context.addIssue({ code: 'custom', message: 'Check files must match the selected recipe.' });
+  });
 export type CandidateEvaluationPreview = z.infer<typeof CandidateEvaluationPreviewSchema>;
 
 export const SnapshotSchema = z

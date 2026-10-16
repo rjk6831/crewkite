@@ -13,6 +13,7 @@ import {
   canonicalJson,
   HashSchema,
   NativeTargetPathSchema,
+  ProjectNodeTestFilesSchema,
   type ReadData,
   ReadDataSchema,
 } from '@crewkite/contracts';
@@ -38,7 +39,7 @@ const checkFile = z.strictObject({
   hash: HashSchema,
   bytes: z.number().int().nonnegative(),
 });
-export const NodeCheckDefinitionSchema = z.strictObject({
+const syntheticNodeCheckDefinition = z.strictObject({
   recipeId: z.literal('node-tests-v1'),
   argv: z.array(z.string().min(1).max(4096)).min(1).max(1003),
   candidateId: CandidateSchema.shape.id,
@@ -55,24 +56,25 @@ export const NodeCheckDefinitionSchema = z.strictObject({
   }),
   reporterHash: HashSchema,
 });
+export const NodeCheckDefinitionSchema = z.discriminatedUnion('recipeId', [
+  syntheticNodeCheckDefinition,
+  syntheticNodeCheckDefinition.extend({
+    recipeId: z.literal('project-node-tests-v1'),
+    collection: z.array(checkFile).min(1).max(32),
+    required: z.strictObject({ files: ProjectNodeTestFilesSchema }),
+    guardHash: HashSchema,
+  }),
+]);
 export type NodeCheckDefinition = z.infer<typeof NodeCheckDefinitionSchema>;
-
-export type CheckPlan = {
-  directory: string;
-  argv: string[];
-  candidateId: string;
-  candidateHash: string;
-  definitionHash: string;
-  evaluator: string;
-  criteria: string[];
-  collection: FileEntry[];
-  required: { path: string; hash: string; tests: string[]; count: number };
-  reporterHash: string;
-};
+export type CheckPlan = NodeCheckDefinition & { directory: string };
+export type NodeCheckSelection =
+  | { recipeId: 'node-tests-v1' }
+  | { recipeId: 'project-node-tests-v1'; testFiles: string[] };
 
 const MAX_BYTES = 64 * 1024 * 1024;
 const MAX_PREVIEW = 262144;
 const reporterPath = fileURLToPath(new URL('./reporter.ts', import.meta.url));
+const guardPath = fileURLToPath(new URL('./import-guard.ts', import.meta.url));
 const digest = (content: Buffer) => createHash('sha256').update(content).digest('hex');
 const entry = ({ path, mode, hash, bytes }: FileEntry): FileEntry => ({ path, mode, hash, bytes });
 
@@ -130,7 +132,7 @@ function definition(
   plan: Pick<
     CheckPlan,
     'argv' | 'collection' | 'criteria' | 'evaluator' | 'required' | 'reporterHash'
-  >,
+  > & { guardHash?: string },
 ): string {
   return hashCanonical({
     argv: plan.argv,
@@ -139,6 +141,7 @@ function definition(
     evaluator: plan.evaluator,
     required: plan.required,
     reporterHash: plan.reporterHash,
+    ...(plan.guardHash ? { guardHash: plan.guardHash } : {}),
   });
 }
 
@@ -151,25 +154,40 @@ export function completedCheckDefinitionMatches(
   if (!historical.success || !observed.success) return false;
   const previous = historical.data;
   const present = observed.data;
+  if (previous.recipeId !== present.recipeId) return false;
+  const project = present.recipeId === 'project-node-tests-v1';
+  const reporterIndex = project ? 2 : 1;
+  const start = project ? 4 : 3;
   for (const value of [previous, present]) {
-    const reporter = value.argv[1] ?? '';
+    const reporter = value.argv[reporterIndex] ?? '';
     if (
       definition(value) !== value.definitionHash ||
-      value.argv.length !== value.collection.length + 3 ||
-      value.argv[0] !== '--test' ||
+      value.argv.length !== value.collection.length + start ||
+      value.argv[project ? 1 : 0] !== '--test' ||
       !reporter.startsWith('--test-reporter=') ||
       !isAbsolute(reporter.slice('--test-reporter='.length)) ||
-      value.argv[2] !== '--' ||
-      value.collection.some((file, index) => value.argv[index + 3] !== `./${file.path}`)
+      value.argv[start - 1] !== '--' ||
+      value.collection.some((file, index) => value.argv[index + start] !== `./${file.path}`) ||
+      (value.recipeId === 'project-node-tests-v1' &&
+        (!value.argv[0].startsWith('--import=') ||
+          !isAbsolute(value.argv[0].slice('--import='.length)) ||
+          hashCanonical(value.required.files) !==
+            hashCanonical(value.collection.map((file) => file.path))))
     )
       return false;
   }
-  if (present.argv[1] !== `--test-reporter=${reporterPath}`) return false;
+  if (
+    present.argv[reporterIndex] !== `--test-reporter=${reporterPath}` ||
+    (project && present.argv[0] !== `--import=${guardPath}`)
+  )
+    return false;
   // Completed evidence survives moving identical runtime files. Saved argv is never executed here.
   return (
     hashCanonical({
       ...previous,
-      argv: previous.argv.map((argument, index) => (index === 1 ? present.argv[1] : argument)),
+      argv: previous.argv.map((argument, index) =>
+        index === reporterIndex || (project && index === 0) ? present.argv[index] : argument,
+      ),
       definitionHash: present.definitionHash,
     }) === hashCanonical(present)
   );
@@ -202,22 +220,37 @@ function report(
   if (summaries.length !== 1 || summary.type !== 'summary') return { complete: false, tests: 0 };
   const counts = summary.counts;
   const tests = rows.filter((row) => row.type === 'test');
+  const fileCountsPass = (row: typeof summary) =>
+    row.success &&
+    row.counts.tests > 0 &&
+    row.counts.passed === row.counts.tests &&
+    row.counts.failed === 0 &&
+    row.counts.cancelled === 0 &&
+    row.counts.skipped === 0 &&
+    row.counts.todo === 0;
+  const requiredComplete =
+    'files' in required
+      ? required.files.every((path) => {
+          const files = rows.filter((row) => row.type === 'summary' && row.file === path);
+          return files.length === 1 && files[0].type === 'summary' && fileCountsPass(files[0]);
+        })
+      : required.tests.every(
+          (name) =>
+            tests.filter(
+              (test) => test.file === required.path && test.kind === 'test' && test.name === name,
+            ).length === 1,
+        );
   const complete =
     summary.success === true &&
     Number.isSafeInteger(counts.tests) &&
-    counts.tests >= required.count &&
+    counts.tests >= ('files' in required ? required.files.length : required.count) &&
     counts.passed === counts.tests &&
     ['failed', 'cancelled', 'skipped', 'todo'].every(
       (name) => counts[name as keyof typeof counts] === 0,
     ) &&
     tests.length === counts.tests + counts.suites &&
     tests.every((test) => test.passed === true && test.skipped === false && test.todo === false) &&
-    required.tests.every(
-      (name) =>
-        tests.filter(
-          (test) => test.file === required.path && test.kind === 'test' && test.name === name,
-        ).length === 1,
-    );
+    requiredComplete;
   return { complete, tests: counts.tests };
 }
 
@@ -387,11 +420,48 @@ export class CandidateEvidence {
     candidate: Candidate;
     sourceFiles: FileContent[];
     criteria: string[];
+    selection?: NodeCheckSelection;
   }): NodeCheckDefinition {
     const { base, files } = this.read(input.candidate);
     verified(base, input.sourceFiles);
+    if (input.selection?.recipeId === 'project-node-tests-v1') {
+      const paths = ProjectNodeTestFilesSchema.parse(input.selection.testFiles).sort();
+      const collection = paths.map((path) => {
+        const original = input.sourceFiles.find((file) => file.path === path);
+        const selected = files.find((file) => file.path === path);
+        if (
+          !original ||
+          !selected ||
+          canonicalJson(entry(original)) !== canonicalJson(entry(selected))
+        )
+          throw Error('A selected committed Node test changed.');
+        return entry(original);
+      });
+      const fields = {
+        argv: [
+          `--import=${guardPath}`,
+          '--test',
+          `--test-reporter=${reporterPath}`,
+          '--',
+          ...paths.map((path) => `./${path}`),
+        ],
+        collection,
+        criteria: [...input.criteria],
+        evaluator: evaluator(),
+        required: { files: paths },
+        reporterHash: digest(readFileSync(reporterPath)),
+        guardHash: digest(readFileSync(guardPath)),
+      };
+      return NodeCheckDefinitionSchema.parse({
+        recipeId: 'project-node-tests-v1',
+        candidateId: input.candidate.id,
+        candidateHash: input.candidate.hash,
+        ...fields,
+        definitionHash: definition(fields),
+      });
+    }
     const originals = input.sourceFiles.filter((file) => isTest(file.path));
-    // shortcut: only the synthetic check definition is qualified. Upgrade: project definitions.
+    // The default recipe preserves the original synthetic assertion contract.
     if (
       originals.length !== 1 ||
       originals[0].path !== syntheticCheckDefinition.path ||
@@ -440,7 +510,13 @@ export class CandidateEvidence {
     criteria: string[];
     expected?: NodeCheckDefinition;
   }): CheckPlan {
-    const current = this.describeChecks(input);
+    const current = this.describeChecks({
+      ...input,
+      selection:
+        input.expected?.recipeId === 'project-node-tests-v1'
+          ? { recipeId: input.expected.recipeId, testFiles: input.expected.required.files }
+          : undefined,
+    });
     if (input.expected && hashCanonical(current) !== hashCanonical(input.expected))
       throw new Error('The frozen check definition changed.');
     const directory = mkdtempSync(join(this.home, 'check-'));
@@ -468,7 +544,9 @@ export class CandidateEvidence {
       unchanged =
         this.hash(base, readFiles(plan.directory)) === candidate.hash &&
         evaluator() === plan.evaluator &&
-        digest(readFileSync(reporterPath)) === plan.reporterHash;
+        digest(readFileSync(reporterPath)) === plan.reporterHash &&
+        (plan.recipeId !== 'project-node-tests-v1' ||
+          digest(readFileSync(guardPath)) === plan.guardHash);
       // Node can pass a file that exits during import without running its original tests.
       ({ complete, tests } = report(input.output, plan.required));
     } catch {

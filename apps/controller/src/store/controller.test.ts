@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import {
@@ -782,7 +782,9 @@ test('candidate evidence requires unchanged bytes and completed checks', async (
     sourceFiles: committedFiles(source.directory, source.base),
     criteria: task.criteria,
   });
-  const withDigest = (value: NodeCheckDefinition): NodeCheckDefinition => {
+  assert.equal(definition.recipeId, 'node-tests-v1');
+  type SyntheticDefinition = Extract<NodeCheckDefinition, { recipeId: 'node-tests-v1' }>;
+  const withDigest = (value: SyntheticDefinition): SyntheticDefinition => {
     const {
       recipeId: _recipe,
       candidateId: _candidate,
@@ -800,7 +802,12 @@ test('candidate evidence requires unchanged bytes and completed checks', async (
         : argument,
     ),
   });
-  for (const { name, saved, current = definition, matches = false } of [
+  const historicalCases: {
+    name: string;
+    saved: SyntheticDefinition;
+    current?: SyntheticDefinition;
+    matches?: boolean;
+  }[] = [
     { name: 'same runtime', saved: definition, matches: true },
     { name: 'identical relocated reporter', saved: historical, matches: true },
     { name: 'saved digest', saved: { ...historical, definitionHash: '0'.repeat(64) } },
@@ -846,8 +853,15 @@ test('candidate evidence requires unchanged bytes and completed checks', async (
       saved: historical,
       current: withDigest({ ...definition, argv: historical.argv }),
     },
-  ])
-    assert.equal(completedCheckDefinitionMatches(saved, current), matches, name);
+  ];
+  for (const row of historicalCases) {
+    const current: SyntheticDefinition = row.current ?? definition;
+    assert.equal(
+      completedCheckDefinitionMatches(row.saved, current),
+      row.matches ?? false,
+      row.name,
+    );
+  }
   assert.throws(
     () =>
       evidence.prepareChecks({
@@ -874,6 +888,192 @@ test('candidate evidence requires unchanged bytes and completed checks', async (
       .passed,
     false,
   );
+  const outside = join(directory, 'outside.cjs');
+  writeFileSync(outside, 'module.exports = 42;');
+  const esm =
+    "import {test} from 'node:test'; import assert from 'node:assert/strict'; test('value',()=>assert.equal(42,42));";
+  const common =
+    "const {test}=require('node:test'); const assert=require('node:assert/strict'); test('value',()=>assert.equal(require('./helper.cjs'),42));";
+  for (const row of [
+    {
+      name: 'ESM and CommonJS',
+      tests: { 'tests/日本 語.test.mjs': esm, 'check.cjs': common },
+      passed: true,
+    },
+    {
+      name: 'dynamic ESM',
+      tests: {
+        'check.mjs':
+          "const {test}=await import('node:test'); const {default:value}=await import('./helper.cjs'); test('value',()=>{if(value!==42)throw Error('value');});",
+      },
+      passed: true,
+    },
+    {
+      name: 'createRequire',
+      tests: {
+        'check.mjs':
+          "import {test} from 'node:test'; import {createRequire} from 'node:module'; const require=createRequire(import.meta.url); test('value',()=>{if(require('./helper.cjs')!==42)throw Error('value');});",
+      },
+      passed: true,
+    },
+    {
+      name: 'missing dependency',
+      tests: { 'check.mjs': "import 'crewkite-missing-test-package';" },
+    },
+    { name: 'outside ESM', tests: { 'check.mjs': `import ${JSON.stringify(outside)}; ${esm}` } },
+    {
+      name: 'outside require',
+      tests: { 'check.cjs': `require(${JSON.stringify(outside)}); ${common}` },
+    },
+    {
+      name: 'outside createRequire',
+      tests: {
+        'check.mjs': `import {createRequire} from 'node:module'; createRequire(import.meta.url)(${JSON.stringify(outside)}); ${esm}`,
+      },
+    },
+    { name: 'no tests', tests: { 'check.mjs': 'export const value=42;' } },
+    { name: 'exit before registration', tests: { 'check.mjs': 'process.exit(0);' } },
+    {
+      name: 'exit after registration',
+      tests: {
+        'check.mjs': "import {test} from 'node:test'; test('lost',()=>{}); process.exit(0);",
+      },
+    },
+    {
+      name: 'exit inside test',
+      tests: { 'check.mjs': "import {test} from 'node:test'; test('lost',()=>process.exit(0));" },
+    },
+    {
+      name: 'one file without tests',
+      tests: { 'check.mjs': esm, 'empty.mjs': 'export const value=42;' },
+    },
+    { name: 'changed evaluated copy', tests: { 'check.mjs': esm }, changeCopy: true },
+  ]) {
+    const contents = { ...row.tests, 'helper.cjs': 'module.exports = 42;' };
+    const files = Object.entries(contents).map(([path, text]) => {
+      const content = Buffer.from(text);
+      return {
+        path,
+        mode: '100644' as const,
+        bytes: content.length,
+        hash: createHash('sha256').update(content).digest('hex'),
+        content,
+      };
+    });
+    const saved = evidence.capture({ taskId: task.id, base: source.base, files, existing: [] });
+    for (const artifact of saved.artifacts) metadata.set(artifact.id, artifact);
+    const selection = {
+      recipeId: 'project-node-tests-v1' as const,
+      testFiles: Object.keys(row.tests).reverse(),
+    };
+    const selected = evidence.describeChecks({
+      candidate: saved.candidate,
+      sourceFiles: files,
+      criteria: task.criteria,
+      selection,
+    });
+    assert.equal(selected.recipeId, 'project-node-tests-v1');
+    assert.deepEqual(
+      selected.collection.map((file) => file.path),
+      [...selection.testFiles].sort(),
+    );
+    const check = evidence.prepareChecks({
+      candidate: saved.candidate,
+      sourceFiles: files,
+      criteria: task.criteria,
+      expected: selected,
+    });
+    const output = spawnSync(process.execPath, check.argv, {
+      cwd: check.directory,
+      env: { PATH: process.env.PATH, LANG: 'C', HOME: controller.home },
+      maxBuffer: 1048576,
+      timeout: 5000,
+    });
+    assert.equal(output.error, undefined, row.name);
+    if (row.changeCopy) appendFileSync(join(check.directory, selection.testFiles[0]), '\n');
+    assert.equal(
+      evidence.recordCheck({
+        candidate: saved.candidate,
+        plan: check,
+        passed: output.status === 0,
+        output: output.stdout,
+      }).evidence.passed,
+      row.passed === true,
+      row.name,
+    );
+    if (row.passed) {
+      const digestDefinition = (value: typeof selected) => {
+        const {
+          recipeId: _recipe,
+          candidateId: _candidate,
+          candidateHash: _hash,
+          definitionHash: _definition,
+          ...fields
+        } = value;
+        return { ...value, definitionHash: hashCanonical(fields) };
+      };
+      const relocated = digestDefinition({
+        ...selected,
+        argv: selected.argv.map((argument, index) =>
+          index === 0
+            ? `--import=${join(directory, 'old', 'import-guard.ts')}`
+            : index === 2
+              ? `--test-reporter=${join(directory, 'old', 'reporter.ts')}`
+              : argument,
+        ),
+      });
+      assert.equal(completedCheckDefinitionMatches(relocated, selected), true);
+      for (const changed of [
+        { guardHash: '0'.repeat(64) },
+        { reporterHash: '0'.repeat(64) },
+        { required: { files: ['other.mjs'] } },
+      ])
+        assert.equal(
+          completedCheckDefinitionMatches(digestDefinition({ ...relocated, ...changed }), selected),
+          false,
+        );
+      const rows = output.stdout
+        .toString('utf8')
+        .trimEnd()
+        .split('\n')
+        .map((line) => JSON.parse(line));
+      const incomplete = Buffer.from(
+        `${rows
+          .filter((row) => row.type !== 'summary' || row.file === null)
+          .map((row) => JSON.stringify(row))
+          .join('\n')}\n`,
+      );
+      assert.equal(
+        evidence.recordCheck({
+          candidate: saved.candidate,
+          plan: check,
+          passed: true,
+          output: incomplete,
+        }).evidence.passed,
+        false,
+      );
+      const altered = files.map((file) =>
+        file.path === selection.testFiles[0]
+          ? {
+              ...file,
+              content: Buffer.from('changed'),
+              bytes: 7,
+              hash: createHash('sha256').update('changed').digest('hex'),
+            }
+          : file,
+      );
+      assert.throws(
+        () =>
+          evidence.describeChecks({
+            candidate: saved.candidate,
+            sourceFiles: altered,
+            criteria: task.criteria,
+            selection,
+          }),
+        /selected committed Node test changed/,
+      );
+    }
+  }
 });
 
 function binding(approval: Approval) {
@@ -2642,6 +2842,7 @@ test('an appointed native proposal is retained and applied once after every phas
   }
   for (const scenario of [
     'checked',
+    'project-checked',
     'failed',
     'stop-intent',
     'expired-intent',
@@ -2651,6 +2852,7 @@ test('an appointed native proposal is retained and applied once after every phas
     'review-close',
     'review-journal-read',
   ]) {
+    const passedReview = scenario === 'checked' || scenario === 'project-checked';
     console.error(`Native fixture row: evaluation/${scenario}`);
     const context = await nativeSetup(
       t,
@@ -2663,7 +2865,7 @@ test('an appointed native proposal is retained and applied once after every phas
     let controller = context.controller;
     const { command, task, appointment, clock } = context;
     const retained = nativeCandidate(controller);
-    if (scenario === 'checked') {
+    if (passedReview) {
       const prepared = await controller.execute(
         command(
           'PrepareNativeRun',
@@ -2698,7 +2900,8 @@ test('an appointed native proposal is retained and applied once after every phas
     const payload = {
       taskId: task.id,
       candidateId: candidate.id,
-      checkRecipeId: 'node-tests-v1',
+      checkRecipeId: scenario === 'project-checked' ? 'project-node-tests-v1' : 'node-tests-v1',
+      ...(scenario === 'project-checked' ? { testFiles: ['net.test.mjs'] } : {}),
       reviewer: {
         profileId: context.fixtureProfile.facts.id,
         methodId: 'keep-it-simple',
@@ -2764,6 +2967,11 @@ test('an appointed native proposal is retained and applied once after every phas
     const preview = controller.snapshot().candidateEvaluations[0];
     assert.equal(preview?.preparationId, artifact.id);
     assert.equal(preview.stage, 'prepared');
+    assert.equal(preview.recipe, payload.checkRecipeId);
+    assert.deepEqual(
+      preview.testFiles.map((file) => file.path),
+      scenario === 'project-checked' ? ['net.test.mjs'] : [],
+    );
     assert.deepEqual(preview.checkStart, { available: true, reason: 'available' });
     assert.deepEqual(preview.reviewStart, { available: false, reason: 'checks-required' });
     assert.equal(preview.creditPolicy, 'ordinary');
@@ -2910,7 +3118,7 @@ test('an appointed native proposal is retained and applied once after every phas
       !scenario.endsWith('intent') && scenario !== 'failed',
     );
     const reviewPayload = startPayload();
-    const shouldReview = scenario === 'checked' || scenario.startsWith('review-');
+    const shouldReview = passedReview || scenario.startsWith('review-');
     if (!shouldReview) {
       assert.equal(
         (
@@ -3097,7 +3305,7 @@ test('an appointed native proposal is retained and applied once after every phas
       const review = result.evidence.find((value) => value.review);
       if (scenario !== 'review-journal-read') {
         assert(review);
-        assert.equal(review.passed, scenario === 'checked');
+        assert.equal(review.passed, passedReview);
         assert.equal(review.evaluator.startsWith('native:openai:'), true);
         assert.equal(review.review?.job.scripted, false);
       }
@@ -3117,7 +3325,7 @@ test('an appointed native proposal is retained and applied once after every phas
               groupAbsent(phase.process_group),
           ),
       );
-      assert.equal(result.tasks[0].state === 'ready', scenario === 'checked');
+      assert.equal(result.tasks[0].state === 'ready', passedReview);
       const retainedPreview = result.candidateEvaluations[0];
       assert(retainedPreview);
       assert.equal(
@@ -3127,11 +3335,7 @@ test('an appointed native proposal is retained and applied once after every phas
       assert.equal(retainedPreview.reviewStart.available, false);
       assert.equal(
         retainedPreview.review?.outcome,
-        scenario === 'review-journal-read'
-          ? undefined
-          : scenario === 'checked'
-            ? 'passed'
-            : 'blocked',
+        scenario === 'review-journal-read' ? undefined : passedReview ? 'passed' : 'blocked',
       );
       assert.equal(
         retainedPreview.remainingBudgets.attempts,
@@ -3186,7 +3390,7 @@ test('an appointed native proposal is retained and applied once after every phas
           'local-owner',
         )
       ).reason,
-      scenario === 'checked' ? 'git-identity-missing' : 'native-pilot-retain-only',
+      passedReview ? 'git-identity-missing' : 'native-pilot-retain-only',
     );
     controller = await context.restart();
     const intents = controller.store.intents().length;

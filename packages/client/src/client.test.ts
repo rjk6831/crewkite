@@ -243,6 +243,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     candidateHash: candidate.hash,
     preparationId: artifact.id,
     recipe: 'node-tests-v1',
+    testFiles: [],
     definitionHash: 'f'.repeat(64),
     target: { path: 'net.mjs', baseHash: 'b'.repeat(64), candidateContentHash: 'c'.repeat(64) },
     reviewer: {
@@ -271,6 +272,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     revoked: false,
     usesRemaining: 1,
   }));
+  const projectTestFiles = ['test/pricing.test.mjs', 'test/税 額.test.mjs'];
   for (const scenario of [
     'show',
     'native-show',
@@ -292,6 +294,14 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     'evaluation-saved',
     'evaluation-partial-consent',
     'evaluation-invalid-grants',
+    'evaluation-project',
+    'evaluation-project-show',
+    'evaluation-project-empty',
+    'evaluation-project-limit',
+    'evaluation-project-duplicate',
+    'evaluation-sample-files',
+    'evaluation-unknown-recipe',
+    'evaluation-recipe-other-command',
     'start-checks',
     'start-review',
     'accept-native',
@@ -336,7 +346,18 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
             reviewStart: { available: false, reason: 'already-started' },
             localAcceptance: { available: true, reason: 'available' },
           }
-        : evaluation;
+        : scenario === 'evaluation-project-show'
+          ? {
+              ...evaluation,
+              recipe: 'project-node-tests-v1',
+              testFiles: projectTestFiles.map((path) => ({
+                path,
+                hash: 'a'.repeat(64),
+                bytes: 42,
+                mode: '100644',
+              })),
+            }
+          : evaluation;
     const reviewEvidence: Snapshot['evidence'] =
       scenario === 'evaluation-reviewed'
         ? [
@@ -544,12 +565,18 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         ...(scenario === 'saved' ? ['--existing-credits'] : []),
       ];
     if (scenario === 'changes') args = ['task', 'changes', task.id];
-    if (['evaluation-show', 'evaluation-reviewed'].includes(scenario))
+    if (['evaluation-show', 'evaluation-reviewed', 'evaluation-project-show'].includes(scenario))
       args = ['task', 'show', task.id];
     if (['start-checks', 'start-review'].includes(scenario)) args = ['task', scenario, task.id];
     if (
       scenario.startsWith('evaluation-') &&
-      !['evaluation-show', 'evaluation-reviewed', 'start-checks', 'start-review'].includes(scenario)
+      ![
+        'evaluation-show',
+        'evaluation-reviewed',
+        'evaluation-project-show',
+        'start-checks',
+        'start-review',
+      ].includes(scenario)
     )
       args = [
         'task',
@@ -564,6 +591,25 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
             ? ['--native-trust']
             : ['--native-trust', '--source-consent']),
       ];
+    if (scenario.startsWith('evaluation-project') && scenario !== 'evaluation-project-show') {
+      const files =
+        scenario === 'evaluation-project-empty'
+          ? []
+          : scenario === 'evaluation-project-limit'
+            ? Array.from({ length: 33 }, (_, index) => `test/${index}.test.mjs`)
+            : scenario === 'evaluation-project-duplicate'
+              ? [projectTestFiles[0], projectTestFiles[0]]
+              : projectTestFiles;
+      args.push(
+        '--recipe',
+        'project-node-tests-v1',
+        ...files.flatMap((path) => ['--test-file', path]),
+      );
+    }
+    if (scenario === 'evaluation-sample-files') args.push('--test-file', projectTestFiles[0]);
+    if (scenario === 'evaluation-unknown-recipe') args.push('--recipe', 'unknown');
+    if (scenario === 'evaluation-recipe-other-command')
+      args = ['health', '--recipe', 'project-node-tests-v1', '--test-file', projectTestFiles[0]];
     if (scenario.startsWith('accept-'))
       args = [
         'task',
@@ -572,6 +618,20 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         scenario === 'accept-invalid-ref' ? 'main' : 'refs/heads/feat/checked',
       ];
     const result = await execute(args, scenario !== 'changes');
+    if (
+      [
+        'evaluation-project-empty',
+        'evaluation-project-limit',
+        'evaluation-project-duplicate',
+        'evaluation-sample-files',
+        'evaluation-unknown-recipe',
+        'evaluation-recipe-other-command',
+      ].includes(scenario)
+    ) {
+      assert.equal(result.code, 1, scenario);
+      assert.deepEqual(received, [], scenario);
+      continue;
+    }
     if (
       ['approval-missing', 'accept-approval-mismatch', 'accept-approval-ambiguous'].includes(
         scenario,
@@ -658,7 +718,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       );
       continue;
     }
-    if (['evaluation-show', 'evaluation-reviewed'].includes(scenario)) {
+    if (['evaluation-show', 'evaluation-reviewed', 'evaluation-project-show'].includes(scenario)) {
       assert.equal(result.code, 0, result.errors);
       assert.deepEqual(JSON.parse(result.output).evaluation, preview);
       assert.deepEqual(JSON.parse(result.output).evidence, reviewEvidence);
@@ -677,6 +737,15 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
           : 'Local acceptance unavailable, evidence-incomplete',
       ])
         assert(plain.output.includes(value), value);
+      if (scenario === 'evaluation-project-show') {
+        assert(plain.output.includes('Recipe project-node-tests-v1'));
+        for (const file of preview.testFiles)
+          assert(
+            plain.output.includes(
+              `Test file ${file.path}, ${file.hash}, ${file.bytes} bytes, ${file.mode}`,
+            ),
+          );
+      }
       if (scenario === 'evaluation-reviewed') {
         assert(plain.output.includes('Review completed.'));
         assert(plain.output.includes('review finding\\u001b[31m\\u000dkept inert'));
@@ -702,7 +771,9 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
           ? {
               taskId: task.id,
               candidateId: candidate.id,
-              checkRecipeId: 'node-tests-v1',
+              ...(scenario === 'evaluation-project'
+                ? { checkRecipeId: 'project-node-tests-v1', testFiles: projectTestFiles }
+                : { checkRecipeId: 'node-tests-v1' }),
               reviewer: { profileId: profile.id, methodId: 'keep-it-simple', cycles: 1 },
               creditPolicy: scenario === 'evaluation-saved' ? 'existing-credits' : 'ordinary',
               consent: scenario === 'evaluation-saved' ? 'saved' : 'explicit',

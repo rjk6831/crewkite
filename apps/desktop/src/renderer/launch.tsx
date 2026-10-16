@@ -5,6 +5,7 @@ import {
   NativeTargetPathSchema,
   type Policy,
   PolicySchema,
+  ProjectNodeTestFilesSchema,
   type ReviewMethod,
   type Role,
   type Run,
@@ -137,6 +138,9 @@ export function NativeEvaluation({
   const [existingCredits, setExistingCredits] = useState(false);
   const [checkPermission, setCheckPermission] = useState(false);
   const [reviewPermission, setReviewPermission] = useState(false);
+  const [recipe, setRecipe] =
+    useState<Snapshot['candidateEvaluations'][number]['recipe']>('node-tests-v1');
+  const [testFileInput, setTestFileInput] = useState('');
   const [expiresAt, setExpiresAt] = useState(() => new Date(Date.now() + 3600000).toISOString());
   const [message, setMessage] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
@@ -164,6 +168,20 @@ export function NativeEvaluation({
   );
   const methodName = (id: ReviewMethod['id']) =>
     methodCatalog.find((value) => value.id === id)?.name ?? 'Unavailable method';
+  const projectTests = recipe === 'project-node-tests-v1';
+  const testFiles = ProjectNodeTestFilesSchema.safeParse(
+    testFileInput.split(/\r?\n/u).filter((path) => path.length > 0),
+  );
+  const invalidTestFiles = projectTests && testFileInput.length > 0 && !testFiles.success;
+  const testFileErrorId = `project-test-files-${task.id}`;
+  function resetConsent() {
+    setNativeTrust(false);
+    setSourceConsent(false);
+    setSavedConsent(false);
+    setCheckPermission(false);
+    setReviewPermission(false);
+    setExistingCredits(false);
+  }
   const allowed =
     connected &&
     candidate &&
@@ -174,10 +192,12 @@ export function NativeEvaluation({
     (savedConsent || (nativeTrust && sourceConsent)) &&
     checkPermission &&
     reviewPermission &&
+    (!projectTests || testFiles.success) &&
     Number.isFinite(permissionExpiry) &&
     permissionExpiry > Date.now();
   async function prepare() {
     if (!allowed || !method || !candidate || !profile) return;
+    if (projectTests && !testFiles.success) return;
     try {
       const result = await workspace.command({
         command: 'PrepareCandidateEvaluation',
@@ -185,7 +205,9 @@ export function NativeEvaluation({
         payload: {
           taskId: task.id,
           candidateId: candidate.id,
-          checkRecipeId: 'node-tests-v1',
+          ...(projectTests && testFiles.success
+            ? { checkRecipeId: 'project-node-tests-v1' as const, testFiles: testFiles.data }
+            : { checkRecipeId: 'node-tests-v1' as const }),
           reviewer: { profileId: profile.id, methodId: method.id, cycles: 1 },
           creditPolicy: existingCredits ? 'existing-credits' : 'ordinary',
           consent: savedConsent ? 'saved' : 'explicit',
@@ -254,6 +276,12 @@ export function NativeEvaluation({
         Prepare one local check and one additional native review. Both use the remaining original
         run limits. The review uses a fresh process. It can use the same model as the writer.
       </p>
+      {(prepared && !editing ? prepared.recipe === 'project-node-tests-v1' : projectTests) && (
+        <p className="muted small">
+          Local code runs with your system permissions. Dependencies are not installed. Imports can
+          use Node built-ins and files in the check copy.
+        </p>
+      )}
       {message && (
         <p className="notice" role="status">
           {message}
@@ -263,7 +291,14 @@ export function NativeEvaluation({
         <>
           <div className="facts-grid">
             <Fact label="Target" value={prepared.target.path} />
-            <Fact label="Checks" value="Sample project tests" />
+            <Fact
+              label="Checks"
+              value={
+                prepared.recipe === 'project-node-tests-v1'
+                  ? 'Project Node tests'
+                  : 'Sample project tests'
+              }
+            />
             <Fact label="Reviewer" value={preparedProfile?.displayName ?? 'Unavailable profile'} />
             <Fact label="Role" value={roleLabels[prepared.reviewer.assignedRole]} />
             <Fact label="Method" value={methodName(prepared.reviewer.methodId)} />
@@ -281,6 +316,18 @@ export function NativeEvaluation({
             <Fact label="Remaining total attempts" value={prepared.remainingBudgets.attempts} />
             <Fact label="Remaining total minutes" value={prepared.remainingBudgets.minutes} />
           </div>
+          {prepared.testFiles.length > 0 && (
+            <div>
+              <p>Committed test files</p>
+              <ul>
+                {prepared.testFiles.map((file) => (
+                  <li key={file.path}>
+                    <code>{file.path}</code>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           <details className="technical-details">
             <summary>Evaluation identity</summary>
             <code>Preparation {prepared.preparationId}</code>
@@ -289,6 +336,11 @@ export function NativeEvaluation({
             <code>Candidate content {prepared.target.candidateContentHash}</code>
             <code>Check definition {prepared.definitionHash}</code>
             <code>Check recipe {prepared.recipe}</code>
+            {prepared.testFiles.map((file) => (
+              <code key={file.path}>
+                Test file {file.path}, {file.hash}, {file.bytes} bytes, {file.mode}
+              </code>
+            ))}
             <code>Reviewer profile {prepared.reviewer.profileId}</code>
             <code>Review method {prepared.reviewer.methodId}, cycle 1, process-only</code>
             {prepared.check && <code>Check artifact {prepared.check.artifactId}</code>}
@@ -327,12 +379,9 @@ export function NativeEvaluation({
                 onClick={() => {
                   setProfileId(prepared.reviewer.profileId);
                   setExpiresAt(prepared.expiresAt);
-                  setNativeTrust(false);
-                  setSourceConsent(false);
-                  setSavedConsent(false);
-                  setCheckPermission(false);
-                  setReviewPermission(false);
-                  setExistingCredits(false);
+                  setRecipe(prepared.recipe);
+                  setTestFileInput(prepared.testFiles.map((file) => file.path).join('\n'));
+                  resetConsent();
                   setEditing(true);
                   setMessage(null);
                 }}
@@ -355,9 +404,53 @@ export function NativeEvaluation({
             <code>Source base {run?.source.base ?? 'Unavailable'}</code>
           </details>
           <p className="muted small">
-            The built-in checks cover the sample net.mjs project. Other projects cannot run checks
-            yet. Preparation starts no work.
+            Preparation saves the check definition and permissions. It starts no work.
           </p>
+          <label>
+            Test setup
+            <select
+              value={recipe}
+              onChange={(event) => {
+                setRecipe(
+                  event.target.value === 'project-node-tests-v1'
+                    ? 'project-node-tests-v1'
+                    : 'node-tests-v1',
+                );
+                resetConsent();
+              }}
+            >
+              <option value="node-tests-v1">Sample project tests</option>
+              <option value="project-node-tests-v1">Project Node tests</option>
+            </select>
+          </label>
+          {projectTests ? (
+            <>
+              <label>
+                Committed test files (one relative path per line)
+                <textarea
+                  rows={4}
+                  value={testFileInput}
+                  aria-invalid={invalidTestFiles}
+                  aria-describedby={invalidTestFiles ? testFileErrorId : undefined}
+                  onChange={(event) => {
+                    setTestFileInput(event.target.value);
+                    resetConsent();
+                  }}
+                />
+              </label>
+              {invalidTestFiles && (
+                <p className="notice" id={testFileErrorId} role="alert">
+                  Enter 1 to 32 distinct relative file paths. Patterns and paths outside the project
+                  are unavailable.
+                </p>
+              )}
+              <p className="muted small">
+                Choose 1 to 32 distinct committed files. Globs are unavailable.
+              </p>
+            </>
+          ) : (
+            <p className="muted small">The built-in checks cover the sample net.mjs project.</p>
+          )}
           {!supported && (
             <p className="notice">
               This run needs review methods or repeat cycles that are unavailable. Its saved
@@ -418,7 +511,10 @@ export function NativeEvaluation({
           )}
           <p className="muted small">
             Native guidance may apply. Tool containment and a provider hard spending cap remain
-            unqualified. The original source checkout stays unchanged.
+            unqualified.{' '}
+            {projectTests
+              ? 'Checks use an independent candidate copy.'
+              : 'The original source checkout stays unchanged.'}
           </p>
           <label className="checkbox-label">
             <input
@@ -449,7 +545,9 @@ export function NativeEvaluation({
               checked={checkPermission}
               onChange={(event) => setCheckPermission(event.target.checked)}
             />
-            Allow one local test run
+            {projectTests
+              ? 'Allow one local run of the selected project tests'
+              : 'Allow one local test run'}
           </label>
           <label className="checkbox-label">
             <input
