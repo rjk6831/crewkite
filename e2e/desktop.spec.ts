@@ -215,10 +215,10 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     const secondOpinion = dialog.locator('.method-card').filter({
       has: page.getByText('Second opinion', { exact: true }),
     });
-    await secondOpinion.getByLabel('Round cap', { exact: true }).selectOption('2');
+    await secondOpinion.getByLabel(/^Round cap/).selectOption('2');
     await expect(dialog.getByText(/Minimum 5 attempts · Configured 6\./)).toBeVisible();
     await expect(dialog.getByText('Custom review settings', { exact: false })).toBeVisible();
-    await secondOpinion.getByLabel('Round cap', { exact: true }).selectOption('1');
+    await secondOpinion.getByLabel(/^Round cap/).selectOption('1');
     await expect(dialog.getByText(/Minimum 4 attempts · Configured 6\./)).toBeVisible();
     await dialog.getByRole('tab', { name: 'Policy', exact: true }).click();
     await dialog.getByLabel('Attempts', { exact: true }).fill('6');
