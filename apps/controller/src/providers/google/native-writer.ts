@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { type ChildProcess, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   closeSync,
@@ -13,9 +13,9 @@ import {
 import { userInfo } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
-import { AttemptIdSchema } from '@crewkite/contracts';
+import { AttemptIdSchema, NativeTargetPathSchema } from '@crewkite/contracts';
 import { z } from 'zod';
-import { groupAbsent } from '../../host/worker.ts';
+import { groupAbsent, type Schedule } from '../../host/worker.ts';
 
 const MAX_BYTES = 1_048_576;
 const MAX_LINE_BYTES = 131_072;
@@ -34,19 +34,14 @@ const hash = z.string().regex(/^[a-f0-9]{64}$/);
 const count = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
 const effort = z.enum(['low', 'medium', 'high', 'xhigh', 'max']);
 const permissionMode = z.enum(['request-review', 'strict', 'always-proceed', 'proceed-in-sandbox']);
-const path = text(512).refine(
-  (value) =>
-    !isAbsolute(value) &&
-    !value.includes('\\') &&
-    value.split('/').every((part) => part !== '' && part !== '.' && part !== '..'),
-);
+const path = NativeTargetPathSchema;
 const fileSchema = z.strictObject({
   path,
   baseHash: hash,
   content: z
     .string()
     .max(65_536)
-    .refine((value) => value.isWellFormed()),
+    .refine((value) => value.isWellFormed() && !value.includes('\0')),
 });
 const replacement = fileSchema.extend({ attemptId: AttemptIdSchema });
 const usage = z.strictObject({
@@ -126,7 +121,9 @@ type Reason =
   | 'cancelled'
   | 'invalid-output'
   | 'not-complete'
-  | 'not-quiescent';
+  | 'not-quiescent'
+  | 'ownership'
+  | 'authentication';
 export class GoogleWriterError extends Error {
   readonly reason: Reason;
   readonly diagnostic: GoogleWriterDiagnostic | null;
@@ -315,6 +312,9 @@ export class GoogleWriterOutput {
   get diagnostic() {
     return this.failure;
   }
+  get conversationId() {
+    return this.session;
+  }
 }
 
 const client = z.strictObject({
@@ -417,86 +417,350 @@ function executableHash(path: string): string {
   }
 }
 
-export async function runGoogleWriter(options: {
+export type GoogleNativePhase = 'config' | 'task';
+export type GoogleNativeLifecycle = {
+  beforePhase: (phase: GoogleNativePhase) => void;
+  owned: (phase: GoogleNativePhase, group: number) => void;
+  quiescent: (phase: GoogleNativePhase, group: number) => void;
+};
+type NativeControls = {
+  environment?: NodeJS.ProcessEnv;
+  now?: () => number;
+  deadline?: number;
+  schedule?: Schedule;
+  spawn?: (
+    executable: string,
+    args: string[],
+    options: {
+      cwd: string;
+      env: NodeJS.ProcessEnv;
+      detached: true;
+      stdio: ['ignore', 'pipe', 'pipe'];
+    },
+  ) => ChildProcess;
+  lifecycle?: GoogleNativeLifecycle;
+};
+type NativeLaunch = NativeControls & {
   client: GoogleClientIdentity;
-  admission: GoogleWriterAdmission;
-  attemptId: string;
   repositoryRoot: string;
   directory: string;
-  logFile: string;
   temporaryDirectory: string;
-  file: { path: string; baseHash: string; content: string };
-  task: string;
   timeoutMs: number;
   signal?: AbortSignal;
+  onSpawn?: (group: number) => void;
+};
+type WriterOptions = NativeLaunch & {
+  admission: GoogleWriterAdmission;
+  attemptId: string;
+  logFile: string;
+  file: { path: string; baseHash: string; content: string };
+  task: string;
   onSpawn: (group: number) => void;
-}): Promise<ReturnType<GoogleWriterOutput['finish']>> {
-  const started = performance.now();
+  onSubmitted?: () => void;
+};
+type NativeExit = {
+  reason: Reason | null;
+  quiescent: boolean;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+};
+const CLEANUP_MS = 1500;
+
+function synchronousHook(work: () => unknown) {
+  const result = work();
+  if (result && (typeof result === 'object' || typeof result === 'function') && 'then' in result) {
+    void Promise.resolve(result).catch(() => {});
+    throw new GoogleWriterError('ownership');
+  }
+}
+
+function nativeClock(options: NativeLaunch, maximum: number) {
+  const now = options.now ?? (() => performance.now());
+  const began = now();
+  if (
+    !Number.isFinite(began) ||
+    !Number.isSafeInteger(options.timeoutMs) ||
+    options.timeoutMs < 1 ||
+    options.timeoutMs > maximum ||
+    (options.deadline !== undefined && !Number.isFinite(options.deadline))
+  )
+    throw new GoogleWriterError('deadline');
+  const end = Math.min(began + options.timeoutMs, options.deadline ?? Infinity);
+  let previous = began,
+    invalid = false;
+  const remaining = () => {
+    const current = now();
+    if (invalid || !Number.isFinite(current) || current < previous) {
+      invalid = true;
+      return 0;
+    }
+    previous = current;
+    return Math.max(0, end - current);
+  };
+  const check = () => {
+    if (remaining() <= CLEANUP_MS) throw new GoogleWriterError('deadline');
+  };
+  check();
+  return { remaining, check };
+}
+
+function nativeLaunch(options: NativeLaunch, logFile: string) {
   let identity: GoogleClientIdentity;
-  let allowed: GoogleWriterAdmission;
   try {
     identity = client.parse(options.client);
+    if (!googleVersionEligible(identity.version) || options.signal?.aborted) throw new Error();
+  } catch {
+    throw new GoogleWriterError('admission');
+  }
+  try {
+    const root = ownedDirectory(options.repositoryRoot);
+    const directory = ownedDirectory(options.directory, root, true);
+    const temporary = ownedDirectory(options.temporaryDirectory, root, true);
+    if (
+      readdirSync(directory).length ||
+      temporary === directory ||
+      temporary.startsWith(`${directory}/`)
+    )
+      throw new Error();
+    if (logFile === '/dev/null') {
+      if (!lstatSync(logFile).isCharacterDevice()) throw new Error();
+    } else {
+      const logDirectory = ownedDirectory(dirname(logFile), root, true);
+      if (
+        logDirectory === directory ||
+        logDirectory.startsWith(`${directory}/`) ||
+        logFile !== `${logDirectory}/${logFile.split('/').at(-1)}`
+      )
+        throw new Error();
+      try {
+        lstatSync(logFile);
+        throw new Error('existing-log');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
+    const source = options.environment ?? process.env;
+    if (
+      process.platform === 'win32' ||
+      !source.HOME ||
+      source.HOME !== userInfo().homedir ||
+      !isAbsolute(identity.executable) ||
+      executableHash(identity.executable) !== identity.sha256
+    )
+      throw new Error();
+    return {
+      identity,
+      directory,
+      environment: {
+        HOME: source.HOME,
+        USER: userInfo().username,
+        LOGNAME: userInfo().username,
+        PATH: '/usr/bin:/bin',
+        LANG: 'en_US.UTF-8',
+        TERM: 'dumb',
+        NO_COLOR: '1',
+        TMPDIR: temporary,
+      },
+    };
+  } catch {
+    throw new GoogleWriterError('identity');
+  }
+}
+
+function ownedNativeCommand(
+  options: NativeLaunch,
+  launch: ReturnType<typeof nativeLaunch>,
+  clock: ReturnType<typeof nativeClock>,
+  phase: GoogleNativePhase,
+  argv: (workMs: number) => string[],
+  onStdout: (chunk: Buffer) => void,
+  onSubmitted?: () => void,
+) {
+  const schedule =
+    options.schedule ??
+    ((work, delay) => {
+      const timer = setTimeout(work, delay);
+      return () => clearTimeout(timer);
+    });
+  const check = () => {
+    clock.check();
+    if (options.signal?.aborted) throw new GoogleWriterError('cancelled');
+  };
+  check();
+  try {
+    synchronousHook(() => options.lifecycle?.beforePhase(phase));
+  } catch {
+    throw new GoogleWriterError('ownership');
+  }
+  check();
+  if (onSubmitted) {
+    try {
+      synchronousHook(onSubmitted);
+    } catch {
+      throw new GoogleWriterError('ownership');
+    }
+    check();
+  }
+  const args = argv(Math.floor(clock.remaining() - CLEANUP_MS));
+  check();
+  let child: ReturnType<typeof spawn>;
+  try {
+    child = (options.spawn ?? spawn)(launch.identity.executable, args, {
+      cwd: launch.directory,
+      env: launch.environment,
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch {
+    throw new GoogleWriterError('start');
+  }
+  const group = Number.isSafeInteger(child.pid) && (child.pid ?? 0) > 0 ? (child.pid ?? 0) : 0;
+  let reason: Reason | null = group > 0 ? null : 'start',
+    closed = false,
+    finished = false,
+    stopping = false;
+  let exitCode: number | null = null,
+    signal: NodeJS.Signals | null = null,
+    bytes = 0,
+    stderrBytes = 0,
+    stderrTail = '';
+  const timers: Array<() => void> = [];
+  const complete = Promise.withResolvers<NativeExit>();
+  const absent = () => group > 0 && groupAbsent(group);
+  const send = (value: NodeJS.Signals) => {
+    if (group > 0 && !absent())
+      try {
+        process.kill(-group, value);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') reason ??= 'not-quiescent';
+      }
+  };
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    for (const cancel of timers) cancel();
+    options.signal?.removeEventListener('abort', abort);
+    stderrTail = '';
+    const quiescent = closed && absent();
+    if (!quiescent) {
+      reason = 'not-quiescent';
+      send('SIGKILL');
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      child.unref();
+    }
+    if (quiescent)
+      try {
+        synchronousHook(() => options.lifecycle?.quiescent(phase, group));
+      } catch {
+        reason = 'ownership';
+      }
+    if (clock.remaining() <= 0) reason ??= 'deadline';
+    if (exitCode !== 0) reason ??= 'not-complete';
+    complete.resolve({ reason, quiescent, exitCode, signal });
+  };
+  const later = (work: () => void, delay: number) =>
+    timers.push(schedule(work, Math.max(0, Math.min(delay, clock.remaining()))));
+  const stop = (failure: Reason | null) => {
+    reason ??= failure;
+    if (stopping) return;
+    stopping = true;
+    if (closed && absent()) return finish();
+    send('SIGTERM');
+    later(() => send('SIGKILL'), 250);
+    later(finish, Math.min(CLEANUP_MS, clock.remaining()));
+  };
+  const abort = () => stop('cancelled');
+  child.stdout?.on('data', (chunk: Buffer) => {
+    if (finished) return;
+    bytes += chunk.length;
+    if (bytes > MAX_BYTES) return stop('invalid-output');
+    if (reason) return;
+    try {
+      onStdout(chunk);
+    } catch {
+      stop('invalid-output');
+    }
+  });
+  child.stderr?.on('data', (chunk: Buffer) => {
+    if (finished) return;
+    bytes += chunk.length;
+    stderrBytes += chunk.length;
+    if (bytes > MAX_BYTES || stderrBytes > 16384) return stop('invalid-output');
+    const value = stderrTail + chunk.toString('utf8');
+    stderrTail = value.slice(-64);
+    if (
+      /authentication required|not authenticated|not logged in|sign.in required|please (?:log|sign).in/i.test(
+        value,
+      )
+    )
+      stop('authentication');
+  });
+  child.once('error', () => stop('start'));
+  child.once('exit', (code, value) => {
+    exitCode = code;
+    signal = value;
+    later(() => {
+      if (!closed || !absent()) stop('not-quiescent');
+    }, 250);
+  });
+  child.once('close', (code, value) => {
+    closed = true;
+    exitCode = code;
+    signal = value;
+    if (absent()) finish();
+    else stop('not-quiescent');
+  });
+  options.signal?.addEventListener('abort', abort, { once: true });
+  later(() => stop('deadline'), clock.remaining() - CLEANUP_MS);
+  try {
+    synchronousHook(() => options.lifecycle?.owned(phase, group));
+  } catch {
+    stop('ownership');
+  }
+  try {
+    synchronousHook(() => options.onSpawn?.(group));
+  } catch {
+    stop('start');
+  }
+  if (options.signal?.aborted) abort();
+  if (clock.remaining() <= CLEANUP_MS) stop('deadline');
+  if (group <= 0 || !child.stdout || !child.stderr) stop('start');
+  return { group, result: complete.promise, stop: () => stop('cancelled') };
+}
+
+export function startGoogleWriter(
+  options: Omit<WriterOptions, 'onSpawn' | 'logFile'> & {
+    onSpawn?: WriterOptions['onSpawn'];
+    logFile?: string;
+    onSubmitted: () => void;
+  },
+) {
+  const clock = nativeClock(options, 300000);
+  let allowed: GoogleWriterAdmission;
+  try {
+    if (typeof options.onSubmitted !== 'function') throw new Error();
     allowed = admission.parse(options.admission);
     fileSchema.parse(options.file);
     AttemptIdSchema.parse(options.attemptId);
     z.string()
       .min(1)
-      .max(16_384)
-      .refine((value) => !value.includes(String.fromCharCode(0)))
+      .max(16384)
+      .refine((value) => !value.includes('\0'))
       .parse(options.task);
-    if (Buffer.byteLength(options.file.content) > 65_536) throw new Error();
     if (
-      !googleVersionEligible(identity.version) ||
-      allowed.clientExecutable !== identity.executable ||
-      allowed.clientVersion !== identity.version ||
-      allowed.clientSha256 !== identity.sha256 ||
-      !Number.isSafeInteger(options.timeoutMs) ||
-      options.timeoutMs < 1 ||
-      options.timeoutMs > 300_000 ||
-      options.signal?.aborted
+      Buffer.byteLength(options.file.content) > 65536 ||
+      createHash('sha256').update(options.file.content).digest('hex') !== options.file.baseHash ||
+      allowed.clientExecutable !== options.client.executable ||
+      allowed.clientVersion !== options.client.version ||
+      allowed.clientSha256 !== options.client.sha256
     )
       throw new Error();
   } catch {
     throw new GoogleWriterError('admission');
   }
-  let directory: string;
-  let temporaryDirectory: string;
-  try {
-    const root = ownedDirectory(options.repositoryRoot);
-    directory = ownedDirectory(options.directory, root, true);
-    temporaryDirectory = ownedDirectory(options.temporaryDirectory, root, true);
-    const logDirectory = ownedDirectory(dirname(options.logFile), root, true);
-    if (readdirSync(directory).length !== 0) throw new Error();
-    try {
-      lstatSync(options.logFile);
-      throw new Error('existing-log');
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
-    if (
-      !directory.startsWith(`${root}/`) ||
-      !temporaryDirectory.startsWith(`${root}/`) ||
-      temporaryDirectory.startsWith(`${directory}/`) ||
-      temporaryDirectory === directory ||
-      !logDirectory.startsWith(`${root}/`) ||
-      logDirectory.startsWith(`${directory}/`) ||
-      logDirectory === directory ||
-      options.logFile !== `${logDirectory}/${options.logFile.split('/').at(-1)}`
-    )
-      throw new Error();
-    if (
-      !isAbsolute(identity.executable) ||
-      executableHash(identity.executable) !== identity.sha256 ||
-      createHash('sha256').update(options.file.content).digest('hex') !== options.file.baseHash ||
-      process.platform === 'win32' ||
-      !process.env.HOME
-    )
-      throw new Error();
-  } catch {
-    throw new GoogleWriterError('identity');
-  }
-  const workMs = Math.floor(options.timeoutMs - (performance.now() - started) - 1500);
-  if (workMs < 1) throw new GoogleWriterError('deadline');
+  const logFile = options.logFile ?? '/dev/null';
+  const launch = nativeLaunch(options, logFile);
   const schema = {
     type: 'object',
     additionalProperties: false,
@@ -504,7 +768,7 @@ export async function runGoogleWriter(options: {
       attemptId: { const: options.attemptId },
       path: { const: options.file.path },
       baseHash: { const: options.file.baseHash },
-      content: { type: 'string', maxLength: 65_536 },
+      content: { type: 'string', maxLength: 65536 },
     },
     required: ['attemptId', 'path', 'baseHash', 'content'],
   };
@@ -512,14 +776,17 @@ export async function runGoogleWriter(options: {
   const reader = new GoogleWriterOutput({
     attemptId: options.attemptId,
     permissionMode: allowed.permissions,
-    directory,
+    directory: launch.directory,
     model: allowed.model,
     path: options.file.path,
     baseHash: options.file.baseHash,
   });
-  const child = spawn(
-    identity.executable,
-    [
+  const handle = ownedNativeCommand(
+    options,
+    launch,
+    clock,
+    'task',
+    (workMs) => [
       '--print',
       prompt,
       '--output-format',
@@ -535,106 +802,140 @@ export async function runGoogleWriter(options: {
       '--print-timeout',
       `${workMs}ms`,
       '--log-file',
-      options.logFile,
+      logFile,
     ],
-    {
-      cwd: directory,
-      detached: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: {
-        HOME: process.env.HOME,
-        USER: userInfo().username,
-        LOGNAME: userInfo().username,
-        PATH: '/usr/bin:/bin',
-        LANG: 'en_US.UTF-8',
-        TERM: 'dumb',
-        NO_COLOR: '1',
-        TMPDIR: temporaryDirectory,
-      },
+    (chunk) => reader.push(chunk),
+    options.onSubmitted,
+  );
+  const result = handle.result.then((outcome) => {
+    let metadata: (ReturnType<GoogleWriterOutput['finish']> & { conversationId: string }) | null =
+      null;
+    let reason = outcome.reason;
+    if (!reason && outcome.quiescent)
+      try {
+        const value = reader.finish();
+        if (!reader.conversationId) throw new GoogleWriterError('not-complete');
+        metadata = { ...value, conversationId: reader.conversationId };
+      } catch (error) {
+        reason = error instanceof GoogleWriterError ? error.reason : 'invalid-output';
+      }
+    if (clock.remaining() <= 0) {
+      reason ??= 'deadline';
+      metadata = null;
+    }
+    return {
+      ...outcome,
+      reason,
+      metadata: reason ? null : metadata,
+      diagnostic: reader.diagnostic,
+    };
+  });
+  return { ...handle, result };
+}
+
+/** Preserve the standalone replacement facade for existing callers. */
+export async function runGoogleWriter(
+  options: WriterOptions,
+): Promise<ReturnType<GoogleWriterOutput['finish']>> {
+  const handle = startGoogleWriter({ ...options, onSubmitted: options.onSubmitted ?? (() => {}) });
+  const outcome = await handle.result;
+  if (outcome.reason || !outcome.quiescent || !outcome.metadata)
+    throw new GoogleWriterError(outcome.reason ?? 'not-quiescent', outcome.diagnostic);
+  return { replacement: outcome.metadata.replacement, usage: outcome.metadata.usage };
+}
+
+const configOutput = z.object({
+  status: z.literal('SUCCESS'),
+  num_turns: z.literal(0),
+  error: z.never().optional(),
+  usage: z.object({
+    input_tokens: z.literal(0),
+    output_tokens: z.literal(0),
+    thinking_tokens: z.literal(0),
+    cache_read_tokens: z.literal(0),
+    total_tokens: z.literal(0),
+  }),
+  command: z.object({
+    data: z.object({
+      config: z.object({
+        toolPermission: permissionMode,
+        useG1Credits: z.literal(false),
+        artifactReviewPolicy: z.unknown().optional(),
+        allowNonWorkspaceAccess: z.unknown().optional(),
+        enableTerminalSandbox: z.unknown().optional(),
+      }),
+    }),
+  }),
+});
+export function projectGoogleConfig(stdout: Uint8Array) {
+  if (stdout.byteLength > 262144) throw new GoogleWriterError('invalid-output');
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder('utf8', { fatal: true }).decode(stdout));
+  } catch {
+    throw new GoogleWriterError('invalid-output');
+  }
+  const parsed = configOutput.safeParse(value);
+  if (!parsed.success) throw new GoogleWriterError('admission');
+  const config = parsed.data.command.data.config;
+  const artifact = z
+    .enum(['asks-for-review', 'agent-decides', 'always-proceed'])
+    .safeParse(config.artifactReviewPolicy);
+  return {
+    permissionMode: config.toolPermission,
+    creditFallback: 'disabled' as const,
+    artifactReviewPolicy: artifact.success ? artifact.data : null,
+    allowNonWorkspaceAccess:
+      typeof config.allowNonWorkspaceAccess === 'boolean' ? config.allowNonWorkspaceAccess : null,
+    enableTerminalSandbox:
+      typeof config.enableTerminalSandbox === 'boolean' ? config.enableTerminalSandbox : null,
+    account: 'unknown' as const,
+    billing: 'unknown' as const,
+    observedTurns: 0 as const,
+  };
+}
+
+export function startGoogleConfig(options: NativeLaunch) {
+  const clock = nativeClock(options, 20000);
+  const launch = nativeLaunch(options, '/dev/null');
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  const handle = ownedNativeCommand(
+    options,
+    launch,
+    clock,
+    'config',
+    (workMs) => [
+      '-p',
+      '/config',
+      '--output-format',
+      'json',
+      '--print-timeout',
+      `${workMs}ms`,
+      '--log-file',
+      '/dev/null',
+    ],
+    (chunk) => {
+      bytes += chunk.length;
+      if (bytes > 262144) throw new GoogleWriterError('invalid-output');
+      chunks.push(chunk);
     },
   );
-  const group = child.pid ?? 0;
-  let failure: Reason | null = null;
-  let bytes = 0;
-  let closed = false;
-  let exitCode: number | null = null;
-  const kill = (signal: NodeJS.Signals) => {
-    if (!Number.isSafeInteger(group) || group <= 0) return;
-    try {
-      process.kill(-group, signal);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') failure ??= 'not-quiescent';
+  const result = handle.result.then((outcome) => {
+    let metadata: ReturnType<typeof projectGoogleConfig> | null = null,
+      reason = outcome.reason;
+    if (!reason && outcome.quiescent)
+      try {
+        metadata = projectGoogleConfig(Buffer.concat(chunks));
+      } catch (error) {
+        reason = error instanceof GoogleWriterError ? error.reason : 'invalid-output';
+      }
+    chunks.length = 0;
+    if (clock.remaining() <= 0) {
+      reason ??= 'deadline';
+      metadata = null;
     }
-  };
-  let force: ReturnType<typeof setTimeout> | undefined;
-  const stop = (reason: Reason) => {
-    failure ??= reason;
-    kill('SIGTERM');
-    force ??= setTimeout(() => kill('SIGKILL'), 250);
-  };
-  const cancel = () => stop('cancelled');
-  options.signal?.addEventListener('abort', cancel, { once: true });
-  if (options.signal?.aborted) cancel();
-  const timer = setTimeout(() => stop('deadline'), workMs);
-  let exitGrace: ReturnType<typeof setTimeout> | undefined;
-  child.once('exit', () => {
-    exitGrace = setTimeout(() => {
-      if (!closed || !groupAbsent(group)) stop('not-quiescent');
-    }, 250);
+    return { ...outcome, reason, metadata: reason ? null : metadata };
   });
-  const completion = new Promise<void>((resolve) => {
-    child.once('close', (code) => {
-      closed = true;
-      exitCode = code;
-      resolve();
-    });
-    child.once('error', () => {
-      failure ??= 'start';
-    });
-  });
-  child.stdout.on('data', (chunk: Buffer) => {
-    bytes += chunk.length;
-    if (bytes > MAX_BYTES) return stop('invalid-output');
-    try {
-      reader.push(chunk);
-    } catch {
-      stop('invalid-output');
-    }
-  });
-  child.stderr.on('data', (chunk: Buffer) => {
-    bytes += chunk.length;
-    if (bytes > MAX_BYTES) stop('invalid-output');
-  });
-  try {
-    try {
-      if (group > 0) options.onSpawn(group);
-      else stop('start');
-    } catch {
-      stop('start');
-    }
-    await Promise.race([
-      completion,
-      new Promise<void>((resolve) => {
-        const timer = setTimeout(
-          resolve,
-          Math.max(1, options.timeoutMs - (performance.now() - started)),
-        );
-        timer.unref();
-        completion.then(() => clearTimeout(timer));
-      }),
-    ]);
-    if (!closed || !groupAbsent(group)) {
-      kill('SIGKILL');
-      throw new GoogleWriterError('not-quiescent', reader.diagnostic);
-    }
-    if (failure) throw new GoogleWriterError(failure, reader.diagnostic);
-    if (exitCode !== 0) throw new GoogleWriterError('not-complete', reader.diagnostic);
-    return reader.finish();
-  } finally {
-    clearTimeout(timer);
-    if (force) clearTimeout(force);
-    if (exitGrace) clearTimeout(exitGrace);
-    options.signal?.removeEventListener('abort', cancel);
-    if (!closed || !groupAbsent(group)) kill('SIGKILL');
-  }
+  return { ...handle, result };
 }
