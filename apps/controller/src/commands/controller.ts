@@ -93,6 +93,7 @@ import {
   type Schedule,
 } from '../host/worker.ts';
 import {
+  ReplacementPathSchema,
   replacementPlan,
   startReplacement,
   type WriterPlan,
@@ -113,6 +114,7 @@ const NativeAppointmentSchema = z.strictObject({
     version: z.string().min(1).max(200),
   }),
   creditPolicy: z.enum(['ordinary', 'existing-credits']),
+  target: z.strictObject({ path: ReplacementPathSchema, baseHash: HashSchema }),
   consent: z.strictObject({
     nativeTrust: z.literal('accepted'),
     source: z.enum(['explicit', 'policy']),
@@ -1089,8 +1091,8 @@ export class Controller {
         if (source.base !== appointment.consent.sourceBase)
           throw new Error('The appointed source base changed.');
         const files = committedFiles(this.projectPath(task.projectId) as string, source.base);
-        const original = files.find((file) => file.path === 'net.mjs');
-        if (!original || original.content.toString('utf8').length > 65_536)
+        const original = files.find((file) => file.path === appointment.target.path);
+        if (!original || original.bytes > 65_536 || original.hash !== appointment.target.baseHash)
           throw new Error('The appointed target is unavailable.');
         const methods = appointment.policy.methods ?? [];
         if (
@@ -1126,6 +1128,7 @@ export class Controller {
           effort: route.effort.requested as WriterPlan['effort'],
           creditPolicy: appointment.creditPolicy,
           directory: join(this.home, 'native', attemptId),
+          path: appointment.target.path,
           original: original.content.toString('utf8'),
           baseHash: original.hash,
           criteria: task.criteria,
@@ -1372,6 +1375,7 @@ export class Controller {
         effort: appointment.route.effort.requested as WriterPlan['effort'],
         creditPolicy: appointment.creditPolicy,
         directory,
+        path: appointment.target.path,
         original: binding.original,
         baseHash: binding.baseHash,
         criteria: [...(this.store.get<Task>('task', run.taskId) as Task).criteria],

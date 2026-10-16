@@ -10,12 +10,13 @@ import { ReplacementTranscript, replacementPlan, startReplacement } from './repl
 import { configuration, fixture, replies, running, threadResult } from './replacement-fixture.ts';
 
 const original = 'export function netMinor() { throw new Error(); }\n';
-const plan = (directory: string) =>
+const plan = (directory: string, path = 'net.mjs') =>
   replacementPlan({
     attemptId: 'att_01M51M322B2AEBXD9MA74CBCFM',
     model: 'gpt-6.1-sol',
     effort: 'low',
     directory,
+    path,
     original,
     baseHash: createHash('sha256').update(original).digest('hex'),
     criteria: ['Return the bounded replacement.'],
@@ -58,17 +59,20 @@ const threadNotices = (directory: string) => [
     },
   },
 ];
-const edit = (directory: string) => ({
+const edit = (directory: string, path = 'net.mjs') => ({
   version: 1,
   attemptId: plan(directory).attemptId,
-  path: 'net.mjs',
-  baseHash: plan(directory).baseHash,
+  path,
+  baseHash: plan(directory, path).baseHash,
   content: 'export function netMinor(a, b) { return Math.max(0, a - b); }\n',
 });
-const output = (directory: string, mode = 'success') => {
-  const value = edit(directory);
+const output = (directory: string, mode = 'success', path = 'net.mjs') => {
+  const value = edit(directory, path);
   if (mode === 'wrong-attempt') value.attemptId = 'att_01M51M322B2AEBXD9MA74CBCFN';
   if (mode === 'wrong-path') value.path = '../net.mjs';
+  if (mode === 'different-path') value.path = 'docs/other.md';
+  if (mode === 'nul-content') value.content = 'text\0tail';
+  if (mode === 'byte-limit') value.content = 'é'.repeat(32768);
   if (mode === 'wrong-hash') value.baseHash = '0'.repeat(64);
   if (mode === 'oversized') value.content = 'é'.repeat(32769);
   if (mode === 'surrogate') value.content = '\ud800';
@@ -161,6 +165,11 @@ test('a replacement requires one matching completed turn and bounded original-fi
     'fragmented',
     'reasoning-retry',
     'thread-notices',
+    'nested-path',
+    'unicode-path',
+    'byte-limit',
+    'different-path',
+    'nul-content',
     'wrong-attempt',
     'wrong-path',
     'wrong-hash',
@@ -178,13 +187,27 @@ test('a replacement requires one matching completed turn and bounded original-fi
     'partial',
   ]) {
     const directory = resolve('internal/replacement-fixture');
-    const reader = new ReplacementTranscript(plan(directory), { now: () => 1, timeoutMs: 300_000 });
+    const path =
+      mode === 'nested-path'
+        ? 'docs/providers.md'
+        : mode === 'unicode-path'
+          ? 'docs/案内.md'
+          : 'net.mjs';
+    const reader = new ReplacementTranscript(plan(directory, path), {
+      now: () => 1,
+      timeoutMs: 300_000,
+    });
     const thread = metadata(reader);
     assert.equal(thread.params.sandbox, 'read-only');
     assert.equal(reader.submitted, false);
     reader.push(bytes({ id: 10, result: threadResult(directory) }));
     const request = JSON.parse(Buffer.from(reader.next() as Uint8Array).toString());
     assert.equal(request.method, 'turn/start');
+    assert.equal(request.params.outputSchema.properties.path.const, path);
+    assert.equal(
+      JSON.parse(request.params.input[0].text.split('\n').slice(1).join('\n')).path,
+      path,
+    );
     assert.equal(request.params.effort, 'low');
     assert.equal(request.params.serviceTier, 'default');
     assert.equal(request.params.outputSchema.properties.attemptId.const, plan(directory).attemptId);
@@ -195,7 +218,7 @@ test('a replacement requires one matching completed turn and bounded original-fi
     }
     reader.push(bytes({ id: 11, result: { turn: running } }));
     const perform = () => {
-      for (const message of output(directory, mode)) {
+      for (const message of output(directory, mode, path)) {
         const chunk = bytes(message);
         if (mode === 'fragmented') for (const byte of chunk) reader.push(new Uint8Array([byte]));
         else reader.push(chunk);
@@ -207,10 +230,16 @@ test('a replacement requires one matching completed turn and bounded original-fi
       mode === 'success' ||
       mode === 'fragmented' ||
       mode === 'reasoning-retry' ||
-      mode === 'thread-notices'
+      mode === 'thread-notices' ||
+      mode === 'nested-path' ||
+      mode === 'unicode-path' ||
+      mode === 'byte-limit'
     ) {
       const result = perform();
-      assert.deepEqual(result.replacement, edit(directory));
+      assert.deepEqual(result.replacement, {
+        ...edit(directory, path),
+        ...(mode === 'byte-limit' ? { content: 'é'.repeat(32768) } : {}),
+      });
       assert.equal(result.qualified, false);
       assert.equal(result.observedRetries, mode === 'reasoning-retry' ? 1 : 0);
       assert(!JSON.stringify(result).includes('private-data'));
@@ -521,6 +550,37 @@ test('a replacement requires one matching completed turn and bounded original-fi
   });
   assert.equal(reader.interrupt(), null);
   assert.throws(() => replacementPlan({ ...plan(directory), baseHash: '0'.repeat(64) }));
+  for (const path of [
+    '/absolute.md',
+    'C:/absolute.md',
+    '../outside.md',
+    'docs/../outside.md',
+    'docs//file.md',
+    '.git/config',
+    'docs/\\file.md',
+    'docs/\0file.md',
+    'docs/\nfile.md',
+    'docs/\u0085file.md',
+    'docs/\ud800.md',
+  ])
+    assert.throws(() => replacementPlan({ ...plan(directory), path }), JSON.stringify(path));
+  const boundedOriginal = 'é'.repeat(32768);
+  assert.equal(
+    replacementPlan({
+      ...plan(directory),
+      original: boundedOriginal,
+      baseHash: createHash('sha256').update(boundedOriginal).digest('hex'),
+    }).original,
+    boundedOriginal,
+  );
+  for (const original of ['text\0tail', '\ud800', 'é'.repeat(32769)])
+    assert.throws(() =>
+      replacementPlan({
+        ...plan(directory),
+        original,
+        baseHash: createHash('sha256').update(original).digest('hex'),
+      }),
+    );
   let now = 1;
   const expired = new ReplacementTranscript(plan(directory), {
     now: () => now,

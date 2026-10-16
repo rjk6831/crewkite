@@ -42,6 +42,10 @@ export const threadResult = (directory: string) => ({
   serviceTier: 'default',
 });
 export const running = { id: 'turn-1', status: 'inProgress', items: [], error: null };
+export const fixtureContent = (path: string) =>
+  path.endsWith('.md')
+    ? '# Updated provider notes\n'
+    : 'export function netMinor() { return 0; }\n';
 export const fixture = `
 const { createInterface } = require('node:readline');
 const mode = process.argv[1], phase = process.argv[2];
@@ -52,6 +56,7 @@ if (phase === 'features') {
 const replies = ${JSON.stringify(replies)};
 const thread = ${threadResult.toString()};
 const running = ${JSON.stringify(running)};
+const content = ${fixtureContent.toString()};
 const input = createInterface({input:process.stdin});
 input.on('line', line => {
   const message = JSON.parse(line);
@@ -70,7 +75,8 @@ input.on('line', line => {
   if (message.method === 'turn/start') result = {turn:running};
   process.stdout.write(JSON.stringify({id:message.id,result})+'\\n');
   if (message.method === 'turn/start' && mode === 'success') {
-    const edit = {version:1,attemptId:message.params.outputSchema.properties.attemptId.const,path:'net.mjs',baseHash:message.params.outputSchema.properties.baseHash.const,content:'export function netMinor() { return 0; }\\n'};
+    const path = message.params.outputSchema.properties.path.const;
+    const edit = {version:1,attemptId:message.params.outputSchema.properties.attemptId.const,path,baseHash:message.params.outputSchema.properties.baseHash.const,content:content(path)};
     const item = {id:'message-1',type:'agentMessage',text:JSON.stringify(edit),phase:'final_answer'};
     for (const [method,params] of [
       ['turn/started',{threadId:'thread-1',turn:running}],

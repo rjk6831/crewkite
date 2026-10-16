@@ -12,7 +12,7 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { type TestContext, test } from 'node:test';
 import {
@@ -39,7 +39,7 @@ import {
 import { CandidateEvidence } from '../evidence/index.ts';
 import { committedFiles, git, inspectSource, materialize, readFiles } from '../host/source.ts';
 import { groupAbsent } from '../host/worker.ts';
-import { fixture, fixtureModel } from '../providers/openai/replacement-fixture.ts';
+import { fixture, fixtureContent, fixtureModel } from '../providers/openai/replacement-fixture.ts';
 
 async function setup(t: TestContext, options: Partial<ControllerOptions> = {}) {
   mkdirSync(resolve('internal'), { recursive: true });
@@ -1391,6 +1391,7 @@ async function nativeSetup(
   t: TestContext,
   mode = 'success',
   options: Partial<ControllerOptions> = {},
+  targetPath = 'net.mjs',
 ) {
   let phases = 0;
   let submissions = 0;
@@ -1432,6 +1433,30 @@ async function nativeSetup(
       return child;
     },
   });
+  if (targetPath !== 'net.mjs') {
+    const files = [
+      { path: targetPath, content: Buffer.from('# Provider notes\nOriginal café notes.\n') },
+      { path: 'docs/nul.txt', content: Buffer.from('text\0tail') },
+      { path: 'docs/invalid.txt', content: Buffer.from([0xc3, 0x28]) },
+      { path: 'docs/large.txt', content: Buffer.alloc(65_537, 97) },
+    ];
+    for (const file of files) {
+      mkdirSync(dirname(join(context.source.directory, file.path)), { recursive: true });
+      writeFileSync(join(context.source.directory, file.path), file.content);
+    }
+    const paths = files.map((file) => file.path);
+    git(context.source.directory, ['add', '--', ...paths]);
+    git(
+      context.source.directory,
+      ['commit', '-s', '--only', '-m', 'test: seed bounded text targets', '--', ...paths],
+      undefined,
+      {
+        name: 'CrewKite fixture',
+        email: 'fixture@example.invalid',
+        at: '2026-10-15T17:00:00Z',
+      },
+    );
+  }
   const task = TaskSchema.parse(
     (await context.controller.execute(context.draft, 'local-owner')).entity,
   );
@@ -1468,6 +1493,12 @@ async function nativeSetup(
       version: process.version,
     },
     creditPolicy: 'ordinary',
+    target: {
+      path: targetPath,
+      baseHash: committedFiles(context.source.directory, source.base).find(
+        (file) => file.path === targetPath,
+      )?.hash as string,
+    },
     consent: {
       nativeTrust: 'accepted',
       source: 'explicit',
@@ -1512,13 +1543,34 @@ function nativeCandidate(controller: Controller) {
 }
 
 test('an appointed native proposal is retained and applied once after every phase stops', async (t) => {
-  for (const consent of ['explicit', 'policy'] as const) {
-    const context = await nativeSetup(t);
+  for (const { consent, path } of [
+    { consent: 'explicit', path: 'net.mjs' },
+    { consent: 'policy', path: 'net.mjs' },
+    { consent: 'explicit', path: 'docs/providers.md' },
+    { consent: 'policy', path: 'docs/案内.md' },
+  ] as const) {
+    const context = await nativeSetup(t, 'success', {}, path);
     const { controller, appointment, task, command, source, clock, id } = context;
     appointment.id += `-${consent}`;
     appointment.consent.source = consent;
     for (const change of [
       { maximumSubmissions: 2 },
+      { target: { ...appointment.target, baseHash: '0'.repeat(64) } },
+      ...[
+        'missing.md',
+        '../outside.md',
+        'docs/\nfile.md',
+        'docs/\ud800.md',
+        ...(path !== 'net.mjs' ? ['docs/nul.txt', 'docs/invalid.txt', 'docs/large.txt'] : []),
+      ].map((path) => ({
+        target: {
+          path,
+          baseHash:
+            committedFiles(source.directory, appointment.consent.sourceBase).find(
+              (file) => file.path === path,
+            )?.hash ?? appointment.target.baseHash,
+        },
+      })),
       { consent: { ...appointment.consent, nativeTrust: 'denied' } },
       { consent: { ...appointment.consent, policyHash: '0'.repeat(64) } },
       { expiresAt: clock.now() },
@@ -1573,6 +1625,8 @@ test('an appointed native proposal is retained and applied once after every phas
     appointment.consent.nativeTrust = 'denied' as 'accepted';
     appointment.policy.effects.length = 0;
     appointment.route.qualified = true;
+    appointment.target.path = 'docs/other.md';
+    appointment.target.baseHash = '0'.repeat(64);
     await sealed;
     const run = controller.snapshot().runs.at(-1);
     assert(run);
@@ -1618,20 +1672,20 @@ test('an appointed native proposal is retained and applied once after every phas
       ({ content: _content, ...file }) => file,
     );
     assert.deepEqual(
-      actual.filter((file) => file.path !== 'net.mjs'),
-      expected.filter((file) => file.path !== 'net.mjs'),
+      actual.filter((file) => file.path !== frozen.target.path),
+      expected.filter((file) => file.path !== frozen.target.path),
     );
     assert.equal(
       controller.store.db.prepare('SELECT COUNT(*) AS count FROM evidence').get()?.count,
       0,
     );
     assert.equal(
-      readFileSync(join(controller.home, 'scratch', run.id, 'net.mjs'), 'utf8'),
-      'export function netMinor() { return 0; }\n',
+      readFileSync(join(controller.home, 'scratch', run.id, frozen.target.path), 'utf8'),
+      fixtureContent(frozen.target.path),
     );
     assert.equal(
-      git(source.directory, ['show', `${run.source.base}:net.mjs`]).toString(),
-      readFileSync(join(source.directory, 'net.mjs'), 'utf8'),
+      git(source.directory, ['show', `${run.source.base}:${frozen.target.path}`]).toString(),
+      readFileSync(join(source.directory, frozen.target.path), 'utf8'),
     );
     for (const kind of ['command', 'accept', 'check', 'review']) {
       const approval: Approval = {
@@ -1818,7 +1872,11 @@ test('an appointed native proposal is retained and applied once after every phas
           off();
           writeFileSync(
             join(reopened.home, 'scratch', ordinary.id, 'net.mjs'),
-            'export function netMinor() { return 0; }\n',
+            git(source.directory, ['show', `${run.source.base}:net.mjs`]),
+          );
+          writeFileSync(
+            join(reopened.home, 'scratch', ordinary.id, frozen.target.path),
+            fixtureContent(frozen.target.path),
           );
           stopped = reopened.execute(
             command(
