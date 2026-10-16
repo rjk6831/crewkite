@@ -48,7 +48,8 @@ assert(process.env.HOME&&process.env.USER&&process.env.LOGNAME);
 assert(Object.keys(process.env).every(key=>['HOME','USER','LOGNAME','PATH','LANG','TERM','NO_COLOR','TMPDIR','__CF_USER_TEXT_ENCODING'].includes(key)),JSON.stringify(Object.keys(process.env)));
 const start={event:'init',conversation_id:'session',init:{cwd:process.cwd(),tools:['view_file'],permission_mode:'request-review',model:value('--model')}};
 const result={event:'result',result:{conversation_id:mode==='wrong-session'?'other':'session',status:mode==='failed'?'ERROR':'SUCCESS',response:'discarded',duration_seconds:0,num_turns:1,usage:${JSON.stringify(usage)},structured_output:{...file,content:'export const total = 1;\n'}}};
-if(mode==='invalid-utf8') process.stdout.write(Buffer.from([255,10]));
+if(mode==='startup-notice') process.stdout.write(JSON.stringify({event:'future',message:'private@example.test'})+'\n');
+else if(mode==='invalid-utf8') process.stdout.write(Buffer.from([255,10]));
 else if(mode==='oversized')process.stdout.write('x'.repeat(1048577));
 else {
  process.stdout.write(JSON.stringify(start)+'\n');
@@ -133,6 +134,16 @@ else {
       },
       { name: 'wrong model', events: [{ ...start, init: { ...start.init, model: 'other' } }, end] },
       {
+        name: 'malformed model',
+        events: [{ ...start, init: { ...start.init, model: 7 } }],
+        field: 'model',
+      },
+      {
+        name: 'malformed tools',
+        events: [{ ...start, init: { ...start.init, tools: 7 } }],
+        field: 'tools',
+      },
+      {
         name: 'wrong file',
         events: [
           start,
@@ -199,12 +210,23 @@ else {
         return reader.finish();
       };
       if (entry.ok) assert.deepEqual(read().replacement, replacement, entry.name);
-      else
+      else {
         assert.throws(
           read,
           (error) => error instanceof GoogleWriterError && !error.message.includes('private'),
           entry.name,
         );
+        const diagnostic = reader.diagnostic;
+        assert(diagnostic, entry.name);
+        if ('field' in entry) assert.equal(diagnostic.field, entry.field, entry.name);
+        assert(Object.isFrozen(diagnostic), entry.name);
+        assert(!JSON.stringify(diagnostic).includes('private'), entry.name);
+        assert.throws(
+          () => reader.finish(),
+          (error) => error instanceof GoogleWriterError && error.diagnostic === diagnostic,
+          entry.name,
+        );
+      }
     }
     for (const mode of [
       'good',
@@ -213,6 +235,7 @@ else {
       'failed',
       'truncated',
       'invalid-utf8',
+      'startup-notice',
       'oversized',
       'descendant',
       'old-build',
@@ -252,7 +275,12 @@ else {
           runGoogleWriter(options),
           (error) =>
             error instanceof GoogleWriterError &&
-            (mode !== 'cancelled' || error.reason === 'cancelled'),
+            (mode !== 'cancelled' || error.reason === 'cancelled') &&
+            (mode !== 'startup-notice' ||
+              (error.diagnostic?.event === 'other' &&
+                error.diagnostic.stage === 'before-init' &&
+                Object.isFrozen(error.diagnostic) &&
+                !JSON.stringify(error.diagnostic).includes('private'))),
           mode,
         );
       if (mode === 'cancelled') {
