@@ -14,6 +14,7 @@ const input = z.strictObject({
   attemptId: AttemptIdSchema,
   model: z.literal('gpt-6.1-sol'),
   effort: z.literal('low'),
+  creditPolicy: z.enum(['ordinary', 'existing-credits']).default('ordinary'),
   directory: z.string().min(1).max(4096).refine(isAbsolute),
   baseHash: HashSchema,
   original: z.string().max(MAX_CONTENT).refine(utf8),
@@ -33,7 +34,7 @@ export function replacementPlan(value: z.input<typeof input>) {
   const data = input.parse(value);
   if (createHash('sha256').update(data.original).digest('hex') !== data.baseHash)
     throw new Error('The replacement original hash does not match.');
-  return { ...data, directory: resolve(data.directory) };
+  return Object.freeze({ ...data, directory: resolve(data.directory) });
 }
 
 const envelope = z.union([
@@ -375,9 +376,24 @@ export class ReplacementTranscript {
           if (this.discovery.complete) {
             this.metadata = this.discovery.finish();
             const model = this.metadata.models.find((model) => model.model === this.plan.model);
+            const limits = this.metadata.limits;
+            const creditBucket = limits.rateLimitsByLimitId
+              ? limits.rateLimitsByLimitId.codex
+              : limits.rateLimits.limitId === 'codex'
+                ? limits.rateLimits
+                : null;
+            const existingCreditsAllowed =
+              this.plan.creditPolicy === 'existing-credits' &&
+              limits.ordinaryUsageAllowed === false &&
+              creditBucket &&
+              (creditBucket.limitId === null || creditBucket.limitId === 'codex') &&
+              (creditBucket.credits === 'available' || creditBucket.credits === 'unlimited') &&
+              creditBucket.spendControlReached !== true &&
+              (creditBucket.rateLimitReachedType === null ||
+                creditBucket.rateLimitReachedType === 'rate_limit_reached');
             if (
               this.metadata.account.plan !== 'pro' ||
-              this.metadata.limits.ordinaryUsageAllowed !== true ||
+              (limits.ordinaryUsageAllowed !== true && !existingCreditsAllowed) ||
               !model?.supportedReasoningEfforts.includes(this.plan.effort)
             )
               this.refuse('admission');

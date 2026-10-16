@@ -36,7 +36,7 @@ const results = (): unknown[] => [
       limitId: 'codex',
       primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 1800000000 },
       secondary: null,
-      credits: { hasCredits: false, unlimited: false, balance: privateText },
+      credits: { hasCredits: false, unlimited: false, balance: null, private: privateText },
     },
     rateLimitsByLimitId: null,
   },
@@ -296,6 +296,10 @@ test('provider discovery emits only correlated metadata and excludes private fie
         assert.equal(value.limits.ordinaryUsageAllowed, null);
         assert.equal(value.limits.rateLimits.primary, null);
         assert.equal(value.limits.rateLimits.credits, 'unknown');
+        assert.equal(value.limits.rateLimits.creditBalance, null);
+        assert.equal(value.limits.rateLimits.spendControlReached, null);
+        assert.equal(value.limits.rateLimits.rateLimitReachedType, null);
+        assert.equal(value.limits.availableResetCount, null);
       },
     },
     {
@@ -327,16 +331,67 @@ test('provider discovery emits only correlated metadata and excludes private fie
       },
       reason: 'unsupported-account',
     },
-    {
-      name: 'credits are metadata only',
-      change: (values) => {
-        values[2] = {
-          rateLimits: { credits: { hasCredits: true, unlimited: true, balance: privateText } },
-        };
-        return values;
-      },
-      check: (value) => assert.equal(value.limits.rateLimits.credits, 'unlimited'),
-    },
+    ...[undefined, null, '1234.5678900000', '-0.125'].map(
+      (balance): Scenario => ({
+        name: 'credit balances retain decimal precision and unknowns without private fields',
+        change: (values) => {
+          values[2] = {
+            rateLimits: {
+              limitId: 'codex',
+              credits: { hasCredits: true, unlimited: true, balance, private: privateText },
+              spendControlReached: false,
+              rateLimitReachedType: 'rate_limit_reached',
+            },
+            rateLimitResetCredits: {
+              availableCount: 1,
+              credits: [{ id: privateText, title: privateText, expiresAt: 1800000000 }],
+            },
+          };
+          return values;
+        },
+        check: (value) => {
+          assert.equal(value.limits.ordinaryUsageAllowed, null);
+          assert.equal(value.limits.rateLimits.credits, 'unlimited');
+          assert.equal(value.limits.rateLimits.creditBalance, balance ?? null);
+          assert.equal(value.limits.rateLimits.spendControlReached, false);
+          assert.equal(value.limits.rateLimits.rateLimitReachedType, 'rate_limit_reached');
+          assert.equal(value.limits.availableResetCount, 1);
+          assert(!JSON.stringify(value.limits).includes('expiresAt'));
+        },
+      }),
+    ),
+    ...[null, { availableCount: 0, credits: null }].map(
+      (rateLimitResetCredits): Scenario => ({
+        name: 'missing reset detail does not turn the reset count into a usage balance',
+        change: (values) => {
+          values[2] = { rateLimits: {}, rateLimitResetCredits };
+          return values;
+        },
+        check: (value) => {
+          assert.equal(value.limits.availableResetCount, rateLimitResetCredits ? 0 : null);
+          assert.equal(value.limits.rateLimits.creditBalance, null);
+        },
+      }),
+    ),
+    ...[
+      { rateLimits: { credits: { hasCredits: true, unlimited: false, balance: privateText } } },
+      { rateLimits: { credits: { hasCredits: true, unlimited: false, balance: 1 } } },
+      { rateLimits: { credits: { hasCredits: true, unlimited: false, balance: '1'.repeat(129) } } },
+      { rateLimits: { spendControlReached: 'false' } },
+      { rateLimits: { rateLimitReachedType: privateText } },
+      { rateLimits: {}, rateLimitResetCredits: { availableCount: -1 } },
+      { rateLimits: {}, rateLimitResetCredits: { availableCount: 1.5 } },
+      { rateLimits: {}, rateLimitResetCredits: { availableCount: Number.MAX_SAFE_INTEGER + 1 } },
+    ].map(
+      (result): Scenario => ({
+        name: 'malformed credit and reset observations stop metadata',
+        change: (values) => {
+          values[2] = result;
+          return values;
+        },
+        reason: 'invalid-message',
+      }),
+    ),
     {
       name: 'reply before request',
       before: line({ id: 1, result: results()[0] }),
