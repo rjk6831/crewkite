@@ -233,6 +233,7 @@ export class ReplacementStream {
   private terminal: Replacement | null = null;
   private failed: Failure | null = null;
   private toolsEmpty: boolean | null = null;
+  private pluginsEmpty: boolean | null = null;
   private retries = 0;
   private site: ReplacementDiagnostic['site'] = 'frame';
   private envelope: ReplacementDiagnostic['envelope'] = 'none';
@@ -302,8 +303,8 @@ export class ReplacementStream {
           const message = init.parse(value);
           if (message.model !== this.plan.model) this.fail('protocol', 'correlation', 'model');
           if (message.mcp_servers.length) this.fail('protocol', 'unsupported', 'mcp_servers');
-          if (message.plugins?.length) this.fail('protocol', 'unsupported', 'plugins');
           this.toolsEmpty = message.tools.length === 0;
+          this.pluginsEmpty = message.plugins ? message.plugins.length === 0 : null;
           this.initialized = true;
         } else if (type === 'assistant') {
           this.site = 'assistant';
@@ -342,6 +343,7 @@ export class ReplacementStream {
     return {
       replacement: this.terminal,
       nativeToolsReportedEmpty: this.toolsEmpty,
+      nativePluginsReportedEmpty: this.pluginsEmpty,
       observedRetries: this.retries,
       qualified: false as const,
     };

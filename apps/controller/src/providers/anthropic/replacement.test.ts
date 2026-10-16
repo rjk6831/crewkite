@@ -149,7 +149,12 @@ test('native text replacement stays bound to one proposal and owned task deadlin
     { name: 'missing init', frames: [result] },
     { name: 'wrong model', frames: [{ ...init, model: 'other' }, result] },
     { name: 'MCP forbidden', frames: [{ ...init, mcp_servers: [{ name: secret }] }, result] },
-    { name: 'plugins forbidden', frames: [{ ...init, plugins: [{ name: secret }] }, result] },
+    {
+      name: 'reported plugins are metadata under native trust',
+      frames: [{ ...init, plugins: [{ name: secret, path: secret }] }, result],
+      pass: true,
+      pluginsEmpty: false,
+    },
     {
       name: 'wrong session',
       diagnostic: { site: 'identity', cause: 'correlation', field: 'session_id' },
@@ -223,6 +228,7 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       assert.equal(row.pass, true, row.name);
       assert.deepEqual(output.replacement, edit, row.name);
       assert.equal(output.nativeToolsReportedEmpty, row.toolsEmpty ?? true, row.name);
+      assert.equal(output.nativePluginsReportedEmpty, row.pluginsEmpty ?? true, row.name);
       assert.equal(output.qualified, false, row.name);
       assert(!JSON.stringify(output).includes(secret), row.name);
     } catch (error) {
