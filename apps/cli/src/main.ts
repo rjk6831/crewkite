@@ -25,6 +25,7 @@ import {
   CommandSchema,
   canonicalJson,
   MAX_FRAME_BYTES,
+  PolicySchema,
   ProjectNodeTestFilesSchema,
   type Snapshot,
   type Task,
@@ -35,6 +36,7 @@ const help = `Usage: crewkite task <list|show|watch|start|stop|resume|switch|app
        crewkite task switch <task-id> <route-id> [--json] [--home path]
        crewkite native profiles [--json] [--home path]
        crewkite task prepare-native <task-id> <profile-id> <path> --policy file [--native-trust --source-consent] [--existing-credits] [--confirm-subscription-only] [--permission-mode mode]
+       crewkite task prepare-repository <task-id> <profile-id> --policy file [--native-trust --source-consent] [--existing-credits]
        crewkite task prepare-evaluation <task-id> <profile-id> --grants file [--recipe node-tests-v1|project-node-tests-v1] [--test-file path ...] [--native-trust --source-consent] [--existing-credits]
        crewkite task <start-checks|start-review> <task-id> [--json] [--home path]
        crewkite task accept <task-id> <destination-ref> [--json] [--home path]
@@ -46,6 +48,7 @@ const help = `Usage: crewkite task <list|show|watch|start|stop|resume|switch|app
 Approval commands take an approval ID. Other task commands take a task ID.
 Create tasks in the desktop. Native preparation uses explicit consent or the controller's exact saved consent.
 For an Anthropic or Google writer, --confirm-subscription-only confirms subscription login and disabled paid extra usage.
+Repository work needs an explicit run-native-tools policy grant. It permits local commands during the bounded task.
 For Google, --permission-mode must match the existing client setting: request-review, strict, always-proceed or proceed-in-sandbox.
 `;
 interface Output {
@@ -99,7 +102,7 @@ export async function runCli(
           area === 'task' &&
           ((['switch', 'accept'].includes(action) && extra.length === 1) ||
             (action === 'prepare-native' && extra.length === 2) ||
-            (action === 'prepare-evaluation' && extra.length === 1))
+            (['prepare-evaluation', 'prepare-repository'].includes(action) && extra.length === 1))
         )) ||
       !['task', 'native', 'health', 'retry'].includes(area)
     )
@@ -116,6 +119,7 @@ export async function runCli(
       'approve',
       'deny',
       'prepare-native',
+      'prepare-repository',
       'prepare-evaluation',
       'start-checks',
       'start-review',
@@ -128,7 +132,7 @@ export async function runCli(
         !supported.includes(action) ||
         (['switch', 'accept'].includes(action) && extra.length !== 1) ||
         (action === 'prepare-native' && extra.length !== 2) ||
-        (action === 'prepare-evaluation' && extra.length !== 1) ||
+        (['prepare-evaluation', 'prepare-repository'].includes(action) && extra.length !== 1) ||
         (action === 'list' ? id !== undefined : id === undefined))
     )
       throw new Error('Invalid task command. Use --help.');
@@ -138,11 +142,13 @@ export async function runCli(
       throw new Error('Retry takes one receipt file.');
     if (area === 'native' && (action !== 'profiles' || id !== undefined))
       throw new Error('Use native profiles to list supported profiles.');
-    const preparing = area === 'task' && action === 'prepare-native';
+    const preparingFile = area === 'task' && action === 'prepare-native';
+    const preparingRepository = area === 'task' && action === 'prepare-repository';
+    const preparing = preparingFile || preparingRepository;
     const evaluating = area === 'task' && action === 'prepare-evaluation';
-    if (values['confirm-subscription-only'] && !preparing)
+    if (values['confirm-subscription-only'] && !preparingFile)
       throw new Error('Subscription confirmation requires task prepare-native.');
-    if (values['permission-mode'] !== undefined && !preparing)
+    if (values['permission-mode'] !== undefined && !preparingFile)
       throw new Error('Permission mode requires task prepare-native.');
     if (!evaluating && (values.recipe !== undefined || values['test-file'] !== undefined))
       throw new Error('Check recipe options require task prepare-evaluation.');
@@ -167,7 +173,8 @@ export async function runCli(
         values['existing-credits'])
     )
       throw new Error('Native consent options require native or evaluation preparation.');
-    if (values.policy && !preparing) throw new Error('Policy requires task prepare-native.');
+    if (values.policy && !preparing)
+      throw new Error('Policy requires task prepare-native or prepare-repository.');
     if (values.grants && !evaluating) throw new Error('Grants require task prepare-evaluation.');
     if (
       preparing &&
@@ -377,7 +384,9 @@ export async function runCli(
           .map((profile) =>
             profile.family !== 'openai'
               ? `${profile.id}  ${profile.model}  ${profile.effort} requested effort  effective effort unknown  account class unknown  service tier unknown  ${profile.available ? 'available' : profile.reason}  ${profile.qualifiedAt ? `qualified ${profile.qualifiedAt}` : 'qualification pending'}  billing requires user attestation${profile.family === 'google' ? `  permission modes ${profile.permissionModes.join(', ')}` : ''}`
-              : `${profile.id}  ${profile.model}  ${profile.effort}  ${profile.available ? 'available' : profile.reason}`,
+              : profile.id === 'openai-repository-v1'
+                ? `${profile.id}  ${profile.model}  ${profile.effort}  ${profile.available ? 'available' : profile.reason}  ${profile.qualifiedAt ? `qualified ${profile.qualifiedAt}` : 'qualification pending'}  workspace-write  approval never  network off`
+                : `${profile.id}  ${profile.model}  ${profile.effort}  ${profile.available ? 'available' : profile.reason}`,
           )
           .join('\n') || 'No native profiles.',
       );
@@ -421,7 +430,7 @@ export async function runCli(
     const task = requireTask(snapshot, id);
     if (action === 'prepare-evaluation') {
       const profile = snapshot.nativeProfiles.find((profile) => profile.id === extra[0]);
-      if (profile && profile.family !== 'openai')
+      if (profile && profile.id !== 'openai-file-v1')
         throw new Error('Choose a supported OpenAI reviewer profile.');
       const run = snapshot.runs.find((run) => run.id === task.runId);
       const candidate = snapshot.candidates.filter((value) => value.taskId === task.id).at(-1);
@@ -472,8 +481,48 @@ export async function runCli(
         ),
       );
     }
+    if (action === 'prepare-repository') {
+      const profile = snapshot.nativeProfiles.find((profile) => profile.id === extra[0]);
+      if (profile?.id !== 'openai-repository-v1')
+        throw new Error('Choose a supported repository profile for repository work.');
+      if (!profile.available) throw new Error(`Native profile unavailable: ${profile.reason}.`);
+      const creditPolicy = values['existing-credits'] ? 'existing-credits' : 'ordinary';
+      if (!profile.creditPolicies.some((value) => value === creditPolicy))
+        throw new Error('This profile does not support the selected credit policy.');
+      const policy = PolicySchema.parse(readJson(values.policy as string));
+      const project = snapshot.projects.find((value) => value.id === task.projectId);
+      if (
+        !policy.effects.some(
+          (grant) =>
+            grant.action === 'run-native-tools' &&
+            grant.taskId === task.id &&
+            grant.target === project?.name &&
+            !grant.revoked &&
+            grant.usesRemaining > 0 &&
+            Date.parse(grant.expiresAt) > Date.now(),
+        )
+      )
+        throw new Error(
+          'Repository work requires an unexpired one-use run-native-tools grant for this task and project.',
+        );
+      return await finishAction(
+        await request(
+          'PrepareNativeRun',
+          {
+            taskId: task.id,
+            profileId: 'openai-repository-v1',
+            policy,
+            creditPolicy,
+            consent: values['native-trust'] && values['source-consent'] ? 'explicit' : 'saved',
+          },
+          task.revision,
+        ),
+      );
+    }
     if (action === 'prepare-native') {
       const profile = snapshot.nativeProfiles.find((profile) => profile.id === extra[0]);
+      if (profile?.id === 'openai-repository-v1')
+        throw new Error('Use task prepare-repository for repository work.');
       if (!profile?.available)
         throw new Error(`Native profile unavailable: ${profile?.reason ?? 'not-found'}.`);
       const creditPolicy = values['existing-credits'] ? 'existing-credits' : 'ordinary';
@@ -582,9 +631,14 @@ export async function runCli(
       const permissionText = nativeRun?.permissionMode
         ? `\nExpected native permission mode: ${nativeRun.permissionMode}`
         : '';
-      const preview = nativeRun
-        ? `\nNative ${nativeRun.profileId}, ${nativeRun.stage}\nTarget ${nativeRun.target?.path ?? 'unknown'}\nBase hash ${nativeRun.target?.baseHash ?? 'unknown'}\nBytes ${nativeRun.target?.bytes ?? 'unknown'}\nExpires ${nativeRun.expiresAt ?? 'unknown'}\nSource base ${run?.source.base ?? 'unknown'}${billingText}${permissionText}`
+      const repositoryText = nativeRun?.repository
+        ? `\nRepository ${nativeRun.repository.files} files, ${nativeRun.repository.bytes} bytes\nSource base ${nativeRun.repository.sourceBase}\nManifest ${nativeRun.repository.manifestHash}\nNative sandbox ${nativeRun.execution?.sandbox}\nNative approval ${nativeRun.execution?.approvalPolicy}\nNative network ${nativeRun.execution?.networkAccess === false ? 'off' : 'unknown'}\nExpires ${nativeRun.expiresAt ?? 'unknown'}`
         : '';
+      const preview = nativeRun?.repository
+        ? `\nNative ${nativeRun.profileId}, ${nativeRun.stage}${repositoryText}`
+        : nativeRun
+          ? `\nNative ${nativeRun.profileId}, ${nativeRun.stage}\nTarget ${nativeRun.target?.path ?? 'unknown'}\nBase hash ${nativeRun.target?.baseHash ?? 'unknown'}\nBytes ${nativeRun.target?.bytes ?? 'unknown'}\nExpires ${nativeRun.expiresAt ?? 'unknown'}\nSource base ${run?.source.base ?? 'unknown'}${billingText}${permissionText}`
+          : '';
       const evaluation = snapshot.candidateEvaluations.find((value) => value.taskId === task.id);
       const evidence = evaluation
         ? snapshot.evidence.filter((value) => value.candidateId === evaluation.candidateId)
@@ -600,9 +654,17 @@ export async function runCli(
                 `Test file ${terminalText(file.path)}, ${file.hash}, ${file.bytes} bytes, ${file.mode}`,
             ),
             `Candidate ${evaluation.candidateHash}`,
-            `Target ${evaluation.target.path}`,
-            `Original file hash ${evaluation.target.baseHash}`,
-            `Candidate content hash ${evaluation.target.candidateContentHash}`,
+            ...(evaluation.repository
+              ? [
+                  `Repository ${evaluation.repository.files} files, ${evaluation.repository.bytes} bytes`,
+                  `Source base ${evaluation.repository.sourceBase}`,
+                  `Source manifest ${evaluation.repository.manifestHash}`,
+                ]
+              : [
+                  `Target ${evaluation.target?.path}`,
+                  `Original file hash ${evaluation.target?.baseHash}`,
+                  `Candidate content hash ${evaluation.target?.candidateContentHash}`,
+                ]),
             `Check definition ${evaluation.definitionHash}`,
             `Reviewer ${evaluation.reviewer.profileId}, ${evaluation.reviewer.assignedRole}, ${evaluation.reviewer.methodId}, cycle ${evaluation.reviewer.cycle}, process-only`,
             `Credits ${evaluation.creditPolicy}`,

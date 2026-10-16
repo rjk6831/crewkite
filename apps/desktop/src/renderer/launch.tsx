@@ -131,7 +131,7 @@ export function NativeEvaluation({
   const run = snapshot.runs.find((value) => value.id === task.runId);
   const native = snapshot.nativeRuns.find((value) => value.runId === task.runId);
   const prepared = snapshot.candidateEvaluations.find((value) => value.taskId === task.id);
-  const reviewerProfiles = snapshot.nativeProfiles.filter((value) => value.family === 'openai');
+  const reviewerProfiles = snapshot.nativeProfiles.filter((value) => value.id === 'openai-file-v1');
   const [profileId, setProfileId] = useState(reviewerProfiles[0]?.id ?? '');
   const [nativeTrust, setNativeTrust] = useState(false);
   const [sourceConsent, setSourceConsent] = useState(false);
@@ -293,7 +293,14 @@ export function NativeEvaluation({
       {prepared && !editing ? (
         <>
           <div className="facts-grid">
-            <Fact label="Target" value={prepared.target.path} />
+            {prepared.repository ? (
+              <>
+                <Fact label="Source files" value={prepared.repository.files} />
+                <Fact label="Source bytes" value={prepared.repository.bytes} />
+              </>
+            ) : (
+              <Fact label="Target" value={prepared.target?.path ?? 'Unavailable'} />
+            )}
             <Fact
               label="Checks"
               value={
@@ -335,8 +342,17 @@ export function NativeEvaluation({
             <summary>Evaluation identity</summary>
             <code>Preparation {prepared.preparationId}</code>
             <code>Candidate tree {prepared.candidateHash}</code>
-            <code>Original file {prepared.target.baseHash}</code>
-            <code>Candidate content {prepared.target.candidateContentHash}</code>
+            {prepared.repository ? (
+              <>
+                <code>Source base {prepared.repository.sourceBase}</code>
+                <code>Source manifest {prepared.repository.manifestHash}</code>
+              </>
+            ) : (
+              <>
+                <code>Original file {prepared.target?.baseHash}</code>
+                <code>Candidate content {prepared.target?.candidateContentHash}</code>
+              </>
+            )}
             <code>Check definition {prepared.definitionHash}</code>
             <code>Check recipe {prepared.recipe}</code>
             {prepared.testFiles.map((file) => (
@@ -508,7 +524,9 @@ export function NativeEvaluation({
                   checked={sourceConsent}
                   onChange={(event) => setSourceConsent(event.target.checked)}
                 />
-                Share the original file, proposed change and task text with the reviewer
+                {native?.repository
+                  ? 'Share the committed source, candidate changes and task text with the reviewer'
+                  : 'Share the original file, proposed change and task text with the reviewer'}
               </label>
             </>
           )}
@@ -612,13 +630,14 @@ export function NativeEvaluation({
 }
 
 export function Launch(props: LaunchProps) {
-  const [native, setNative] = useState(
-    props.snapshot.nativeRuns.some((run) => run.runId === props.task.runId),
-  );
+  const [native, setNative] = useState<'file' | 'repository' | null>(() => {
+    const current = props.snapshot.nativeRuns.find((run) => run.runId === props.task.runId);
+    return current ? (current.profileId === 'openai-repository-v1' ? 'repository' : 'file') : null;
+  });
   return native ? (
-    <NativeLaunch {...props} onBack={() => setNative(false)} />
+    <NativeLaunch {...props} scope={native} onBack={() => setNative(null)} />
   ) : (
-    <ScriptedLaunch {...props} onNative={() => setNative(true)} />
+    <ScriptedLaunch {...props} onNative={setNative} />
   );
 }
 
@@ -635,14 +654,22 @@ function NativeLaunch({
   workspace,
   onClose,
   onBack,
-}: LaunchProps & { onBack: () => void }) {
+  scope,
+}: LaunchProps & { onBack: () => void; scope: 'file' | 'repository' }) {
   const project = snapshot.projects.find((value) => value.id === task.projectId);
-  const current = snapshot.nativeRuns.find((value) => value.runId === task.runId);
+  const repository = scope === 'repository';
+  const profiles = snapshot.nativeProfiles.filter(
+    (value) => (value.id === 'openai-repository-v1') === repository,
+  );
+  const current = snapshot.nativeRuns.find(
+    (value) =>
+      value.runId === task.runId && (value.profileId === 'openai-repository-v1') === repository,
+  );
   const saved = current ? snapshot.runs.find((value) => value.id === task.runId) : undefined;
   const [profileId, setProfileId] = useState(
     current?.profileId ??
-      snapshot.nativeProfiles.find((value) => value.family === 'openai')?.id ??
-      snapshot.nativeProfiles[0]?.id ??
+      profiles.find((value) => value.id === 'openai-file-v1')?.id ??
+      profiles[0]?.id ??
       '',
   );
   const profile = snapshot.nativeProfiles.find((value) => value.id === profileId);
@@ -657,6 +684,7 @@ function NativeLaunch({
   const [targetPath, setTargetPath] = useState(current?.target?.path ?? '');
   const [nativeTrust, setNativeTrust] = useState(false);
   const [sourceConsent, setSourceConsent] = useState(false);
+  const [nativeTools, setNativeTools] = useState(false);
   const [savedConsent, setSavedConsent] = useState(false);
   const [existingCredits, setExistingCredits] = useState(
     !!saved &&
@@ -696,6 +724,7 @@ function NativeLaunch({
   const connected = workspace.connection === 'connected' && !workspace.preview;
   const allowed = connected && profile?.available && !workspace.pending;
   const validConsent = savedConsent || (nativeTrust && sourceConsent);
+  const validTools = !repository || savedConsent || nativeTools;
   const billingAttestation = attestedBilling
     ? savedConsent
       ? current?.profileId === profile.id
@@ -730,6 +759,7 @@ function NativeLaunch({
     setSubscriptionLogin(false);
     setExtraUsageDisabled(false);
     setPermissionMode('');
+    setNativeTools(false);
   }
   const startable =
     allowed &&
@@ -759,9 +789,10 @@ function NativeLaunch({
     if (
       !allowed ||
       !validConsent ||
+      !validTools ||
       !validBilling ||
       !validPermissionMode ||
-      !NativeTargetPathSchema.safeParse(targetPath).success ||
+      (!repository && !NativeTargetPathSchema.safeParse(targetPath).success) ||
       !profile
     )
       return;
@@ -773,12 +804,18 @@ function NativeLaunch({
           grant.action === 'write-scratch' &&
           grant.target === project?.name,
       );
+      const toolsIndex = policy.effects.findIndex(
+        (grant) =>
+          grant.taskId === task.id &&
+          grant.action === 'run-native-tools' &&
+          grant.target === project?.name,
+      );
       const submittedPolicy = savedConsent
         ? policy
         : {
             ...policy,
             effects: policy.effects.map((grant, index) =>
-              index === writeIndex
+              index === writeIndex || (repository && nativeTools && index === toolsIndex)
                 ? {
                     ...grant,
                     expiresAt,
@@ -788,19 +825,36 @@ function NativeLaunch({
                 : grant,
             ),
           };
+      if (!savedConsent && repository && nativeTools && toolsIndex < 0)
+        submittedPolicy.effects.push({
+          taskId: task.id,
+          action: 'run-native-tools',
+          target: project?.name ?? task.projectId,
+          expiresAt,
+          revoked: false,
+          usesRemaining: 1,
+        });
       const result = await workspace.command({
         command: 'PrepareNativeRun',
         expectedRevision: task.revision,
-        payload: {
-          taskId: task.id,
-          profileId: profile.id,
-          targetPath,
-          policy: submittedPolicy,
-          creditPolicy: existingCredits ? 'existing-credits' : 'ordinary',
-          consent: savedConsent ? 'saved' : 'explicit',
-          ...(billingAttestation ? { billingAttestation } : {}),
-          ...(selectedPermissionMode ? { permissionMode: selectedPermissionMode } : {}),
-        },
+        payload: repository
+          ? {
+              taskId: task.id,
+              profileId: 'openai-repository-v1',
+              policy: submittedPolicy,
+              creditPolicy: existingCredits ? 'existing-credits' : 'ordinary',
+              consent: savedConsent ? 'saved' : 'explicit',
+            }
+          : {
+              taskId: task.id,
+              profileId: profile.id,
+              targetPath,
+              policy: submittedPolicy,
+              creditPolicy: existingCredits ? 'existing-credits' : 'ordinary',
+              consent: savedConsent ? 'saved' : 'explicit',
+              ...(billingAttestation ? { billingAttestation } : {}),
+              ...(selectedPermissionMode ? { permissionMode: selectedPermissionMode } : {}),
+            },
       });
       const run = RunSchema.safeParse(result.entity);
       if (result.outcome === 'applied' && run.success) {
@@ -820,8 +874,14 @@ function NativeLaunch({
   }
   return (
     <Dialog
-      title={prepared ? 'Review the native proposal' : 'Native file proposal'}
-      eyebrow="ONE EXISTING COMMITTED FILE"
+      title={
+        prepared
+          ? 'Review the native proposal'
+          : repository
+            ? 'Repository work'
+            : 'Native file proposal'
+      }
+      eyebrow={repository ? 'COMMITTED REPOSITORY' : 'ONE EXISTING COMMITTED FILE'}
       onClose={onClose}
       wide
     >
@@ -836,7 +896,7 @@ function NativeLaunch({
             <h2>{profile?.displayName ?? 'Native proposal'}</h2>
             <span>{attestedBilling ? 'Subscription confirmation required' : 'Requires Pro'}</span>
           </div>
-          {!prepared && (
+          {!prepared && !repository && (
             <label>
               Writer profile
               <select
@@ -846,7 +906,7 @@ function NativeLaunch({
                   resetScope();
                 }}
               >
-                {snapshot.nativeProfiles.map((value) => (
+                {profiles.map((value) => (
                   <option key={value.id} value={value.id}>
                     {value.displayName}
                     {value.available ? '' : ' (unavailable)'}
@@ -868,7 +928,7 @@ function NativeLaunch({
               <span>
                 {attestedBilling ? 'Service tier unknown' : `${profile.serviceTier} tier`}
               </span>
-              {attestedBilling && (
+              {(attestedBilling || repository) && (
                 <span>
                   {profile.qualifiedAt
                     ? `Qualified ${profile.qualifiedAt.slice(0, 10)}`
@@ -891,14 +951,42 @@ function NativeLaunch({
           <>
             <SourceFacts source={prepared.source} />
             <section className="card" aria-label="Prepared native target">
-              <h2>Saved target</h2>
-              <code>{capability?.target?.path ?? targetPath}</code>
-              <p className="muted small">
-                Original hash{' '}
-                <code>{capability?.target?.baseHash ?? 'Waiting for saved target facts'}</code>
-              </p>
+              <h2>{repository ? 'Saved repository' : 'Saved target'}</h2>
+              {repository ? (
+                <>
+                  <p>
+                    {capability?.repository?.files ?? 'Unknown'} files ·{' '}
+                    {capability?.repository?.bytes ?? 'Unknown'} bytes
+                  </p>
+                  <p>Local workspace writes · Native approval requests refused · Network off</p>
+                  <details className="technical-details">
+                    <summary>Repository identity and native settings</summary>
+                    <code>Committed base {capability?.repository?.sourceBase ?? 'Unknown'}</code>
+                    <code>Manifest {capability?.repository?.manifestHash ?? 'Unknown'}</code>
+                    <code>Sandbox {capability?.execution?.sandbox ?? 'Unknown'}</code>
+                    <code>Approval {capability?.execution?.approvalPolicy ?? 'Unknown'}</code>
+                    <code>
+                      Network access{' '}
+                      {capability?.execution?.networkAccess === false ? 'false' : 'Unknown'}
+                    </code>
+                  </details>
+                  <p>
+                    Local-command permission: consumed at launch for{' '}
+                    {project?.name ?? 'this project'}.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <code>{capability?.target?.path ?? targetPath}</code>
+                  <p className="muted small">
+                    Original hash{' '}
+                    <code>{capability?.target?.baseHash ?? 'Waiting for saved target facts'}</code>
+                  </p>
+                  <p>{capability?.target?.bytes ?? 'Unknown'} bytes</p>
+                </>
+              )}
               <p>
-                {capability?.target?.bytes ?? 'Unknown'} bytes · Consent expires{' '}
+                Consent expires{' '}
                 {capability?.expiresAt
                   ? new Date(capability.expiresAt).toLocaleString()
                   : 'Unknown'}
@@ -923,24 +1011,40 @@ function NativeLaunch({
           </>
         ) : (
           <section className="card">
-            <label>
-              Committed file path
-              <input
-                autoFocus
-                value={targetPath}
-                maxLength={4096}
-                spellCheck={false}
-                placeholder="docs/providers.md"
-                onChange={(event) => {
-                  setTargetPath(event.target.value);
-                  resetScope();
-                }}
-              />
-            </label>
-            <p className="muted small">
-              Choose one existing text file in {project?.name ?? 'this project'}. The controller
-              freezes its committed base, hash and size before Start.
-            </p>
+            {repository ? (
+              <>
+                <h2>Committed repository</h2>
+                <p>
+                  The controller freezes the committed base and repository manifest before Start.
+                </p>
+                <p className="muted small">
+                  The native client can edit independent scratch and run local commands. Network
+                  access is disabled by this native profile. Requests needing native approval are
+                  refused.
+                </p>
+              </>
+            ) : (
+              <>
+                <label>
+                  Committed file path
+                  <input
+                    autoFocus
+                    value={targetPath}
+                    maxLength={4096}
+                    spellCheck={false}
+                    placeholder="docs/providers.md"
+                    onChange={(event) => {
+                      setTargetPath(event.target.value);
+                      resetScope();
+                    }}
+                  />
+                </label>
+                <p className="muted small">
+                  Choose one existing text file in {project?.name ?? 'this project'}. The controller
+                  freezes its committed base, hash and size before Start.
+                </p>
+              </>
+            )}
             {google && (
               <>
                 <label>
@@ -1024,8 +1128,32 @@ function NativeLaunch({
                 checked={savedConsent}
                 onChange={(event) => setSavedConsent(event.target.checked)}
               />
-              Use saved consent for this exact file and policy
+              Use saved consent for this exact {repository ? 'repository' : 'file'} and policy
             </label>
+            {repository && !savedConsent && (
+              <>
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={nativeTools}
+                    onChange={(event) => {
+                      setNativeTools(event.target.checked);
+                      resetConsent();
+                    }}
+                  />
+                  Allow local commands for this run
+                </label>
+                <p className="muted small">
+                  The native client may run multiple local commands during this bounded task. This
+                  permission is consumed once when the run starts.
+                </p>
+              </>
+            )}
+            {repository && savedConsent && (
+              <p className="muted small">
+                Saved consent must include the exact local-command permission for this project.
+              </p>
+            )}
             {!savedConsent && (
               <>
                 <label className="checkbox-label">
@@ -1042,8 +1170,9 @@ function NativeLaunch({
                     checked={sourceConsent}
                     onChange={(event) => setSourceConsent(event.target.checked)}
                   />
-                  Send this committed file and task text; allow its replacement in independent
-                  scratch
+                  {repository
+                    ? 'Send this committed repository and task text; allow edits in independent scratch'
+                    : 'Send this committed file and task text; allow its replacement in independent scratch'}
                 </label>
               </>
             )}
@@ -1073,10 +1202,12 @@ function NativeLaunch({
           </section>
         )}
         <p className="notice">
-          One proposal is retained for inspection and patch export. A supported candidate can
-          prepare separate checks and review after the writer stops, then request local branch
-          acceptance with its own permission. Handoff remains unavailable. The original checkout
-          stays unchanged.
+          {repository
+            ? 'Repository changes are retained for inspection and patch export. Native command results do not establish check evidence.'
+            : 'One proposal is retained for inspection and patch export.'}{' '}
+          A supported candidate can prepare separate checks and review after the writer stops, then
+          request local branch acceptance with its own permission. Handoff remains unavailable. The
+          original checkout stays unchanged.
         </p>
         {prepared && capability?.stage !== 'prepared' && (
           <p className="notice" role="status">
@@ -1101,7 +1232,9 @@ function NativeLaunch({
         <span className="muted small">
           {profile?.maximumSubmissions ?? 1} submission per run ·{' '}
           {(profile?.maximumTaskMs ?? 300000) / 60000} minutes maximum ·{' '}
-          {(profile?.maximumFileBytes ?? 65536) / 1024} KiB maximum
+          {profile && 'maximumSourceFiles' in profile
+            ? `${profile.maximumSourceFiles} files / ${profile.maximumSourceBytes / 1024 / 1024} MiB maximum`
+            : `${(profile?.maximumFileBytes ?? 65536) / 1024} KiB maximum`}
         </span>
         {prepared ? (
           <>
@@ -1150,9 +1283,10 @@ function NativeLaunch({
             disabled={
               !allowed ||
               !validConsent ||
+              !validTools ||
               !validBilling ||
               !validPermissionMode ||
-              !NativeTargetPathSchema.safeParse(targetPath).success
+              (!repository && !NativeTargetPathSchema.safeParse(targetPath).success)
             }
             onClick={() => void prepareNative()}
           >
@@ -1172,7 +1306,7 @@ function ScriptedLaunch({
   onClose,
   onNative,
 }: {
-  onNative: () => void;
+  onNative: (scope: 'file' | 'repository') => void;
   task: Task;
   snapshot: Snapshot;
   workspace: Workspace;
@@ -1253,7 +1387,9 @@ function ScriptedLaunch({
     receivedAt: string;
   } | null>(null);
   const [prepared, setPrepared] = useState<Run | null>(
-    snapshot.runs.find(({ id }) => id === task.runId) ?? null,
+    snapshot.nativeRuns.some((run) => run.runId === task.runId)
+      ? null
+      : (snapshot.runs.find(({ id }) => id === task.runId) ?? null),
   );
   const requiredMethods = requiredReviewMethodIds(policy.quality);
   const resolvedMethods = [...methods];
@@ -1610,10 +1746,16 @@ function ScriptedLaunch({
       wide
     >
       {!prepared && (
-        <button type="button" className="button secondary" onClick={onNative}>
-          Native file proposal
-          <ArrowRight size={14} />
-        </button>
+        <div className="button-row">
+          <button type="button" className="button secondary" onClick={() => onNative('file')}>
+            Native file proposal
+            <ArrowRight size={14} />
+          </button>
+          <button type="button" className="button secondary" onClick={() => onNative('repository')}>
+            Repository work
+            <ArrowRight size={14} />
+          </button>
+        </div>
       )}
       <div className="launch-summary">
         <span>

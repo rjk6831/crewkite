@@ -29,6 +29,7 @@ export const actionName = (action: Effect['action']) =>
   ({
     'read-source': 'Read the committed source',
     'write-scratch': 'Write the scratch copy',
+    'run-native-tools': 'Run local commands',
     'run-check': 'Run candidate checks',
     'run-review': 'Run a review',
     'accept-candidate': 'Create the named local branch',
@@ -42,7 +43,7 @@ export function effectTarget(effect: Effect, task: Task, projectName?: string) {
   }
   if (effect.action === 'export-patch') return `Patch for ${task.title}`;
   if (effect.action === 'run-check') return `Checks for ${task.title}`;
-  if (effect.action === 'write-scratch' || effect.action === 'read-source')
+  if (['write-scratch', 'read-source', 'run-native-tools'].includes(effect.action))
     return projectName ? `${projectName} workspace` : 'Named workspace';
   return effect.target;
 }

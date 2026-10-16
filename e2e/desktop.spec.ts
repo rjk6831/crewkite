@@ -44,11 +44,11 @@ function launchController(home: string, nativeFixture = false) {
     import {mkdirSync,readFileSync,writeFileSync} from 'node:fs';
     import {join} from 'node:path';
     import {startController} from ${JSON.stringify(join(root, 'apps/controller/src/main.ts'))};
-    import {unavailableNativeProfile} from ${JSON.stringify(join(root, 'apps/controller/src/providers/openai/profile.ts'))};
+    import {unavailableNativeProfile,unavailableRepositoryProfile} from ${JSON.stringify(join(root, 'apps/controller/src/providers/openai/profile.ts'))};
     import {AnthropicNativeProfileSchema,GoogleNativeProfileSchema} from ${JSON.stringify(join(root, 'packages/contracts/src/index.ts'))};
     import {replacementFixture as anthropicFixture} from ${JSON.stringify(join(root, 'apps/controller/src/providers/anthropic/replacement-fixture.ts'))};
     import {replacementFixture as googleFixture} from ${JSON.stringify(join(root, 'apps/controller/src/providers/google/replacement-fixture.ts'))};
-    import {fixture, fixtureContent, fixtureModel} from ${JSON.stringify(join(root, 'apps/controller/src/providers/openai/replacement-fixture.ts'))};
+    import {fixture, fixtureContent, fixtureModel,repositoryFixture} from ${JSON.stringify(join(root, 'apps/controller/src/providers/openai/replacement-fixture.ts'))};
     import {writeChallengeSolution} from ${JSON.stringify(join(root, 'packages/testkit/src/repository.ts'))};
     let phases=0;
     const proposal=join(process.env.CREWKITE_HOME,'native-fixture-proposal');
@@ -63,16 +63,18 @@ function launchController(home: string, nativeFixture = false) {
     const profile={...unavailableNativeProfile(),facts:{...unavailableNativeProfile().facts,displayName:'OpenAI scripted proposal fixture',model:fixtureModel,clientVersion:process.version,available:true,reason:'available'},client:{executable:process.execPath,sha256:createHash('sha256').update(readFileSync(process.execPath)).digest('hex'),version:process.version},environment:{...process.env},locationHash:'1'.repeat(64)};
     const anthropicProfile={...profile,facts:AnthropicNativeProfileSchema.parse({...profile.facts,id:'anthropic-file-v1',family:'anthropic',displayName:'Anthropic scripted proposal fixture',effort:'medium',effectiveEffort:'unknown',accountClass:'unknown',serviceTier:'unknown',billingBasis:'requires-user-attestation',qualifiedAt:null,creditPolicies:['ordinary'],reason:'qualification-pending'}),locationHash:'2'.repeat(64)};
     const googleProfile={...profile,client:{...profile.client,version:'1.4.0'},facts:GoogleNativeProfileSchema.parse({...anthropicProfile.facts,clientVersion:'1.4.0',id:'google-file-v1',family:'google',displayName:'Google scripted proposal fixture',effort:'low',permissionModes:['request-review','strict','always-proceed','proceed-in-sandbox']}),locationHash:'3'.repeat(64)};
-    const runtime=await startController({home:process.env.CREWKITE_HOME,identity:{name:'CrewKite fixture',email:'fixture@example.invalid'},nativeProfiles:()=>[profile,anthropicProfile,googleProfile],nativeSpawn:(executable,args,options)=>{
+    const repositoryProfile={...profile,facts:{...unavailableRepositoryProfile().facts,model:fixtureModel,clientVersion:process.version,available:true,reason:'qualification-pending'},locationHash:'4'.repeat(64)};
+    const runtime=await startController({home:process.env.CREWKITE_HOME,identity:{name:'CrewKite fixture',email:'fixture@example.invalid'},nativeProfiles:()=>[profile,anthropicProfile,googleProfile,repositoryProfile],nativeSpawn:(executable,args,options)=>{
       const store=runtime.controller.store;
       const intent=store.intents().findLast(intent=>store.nativeProcesses(intent.attempt_id).some(row=>row.state==='intent'));
       const family=intent?store.get('route',intent.route_id)?.family:undefined;
       const content=readFileSync(join(proposal,'net.mjs'),'utf8');
+      const repositoryWriter=family==='openai'&&!store.db.prepare('SELECT 1 FROM review_jobs WHERE attempt_id=?').get(intent.attempt_id);
       return family==='google'
         ?spawn(executable,['-e',googleFixture(args,{content,permissionMode:'strict'})],options)
         :args[0]==='auth'||args.includes('--print')
           ?spawn(executable,['-e',anthropicFixture(args,{content})],options)
-          :spawn(executable,['-e',transcript,'success',args.at(-1)==='list'?'features':++phases%2===1?'prepare':'task'],options);
+          :spawn(executable,['-e',repositoryWriter?repositoryFixture([{path:'net.mjs',content}]):transcript,'success',args.at(-1)==='list'?'features':++phases%2===1?'prepare':'task'],options);
     }});
     console.log('CREWKITE_CONTROLLER_READY');
     process.once('SIGTERM',()=>void runtime.close().then(()=>process.exit(0)));
@@ -789,6 +791,91 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
       path: join(internal, 'public-native-prepared-light.png'),
       animations: 'disabled',
     });
+    await enter(nativeDialog.getByRole('button', { name: 'Edit proposal', exact: true }));
+    await enter(nativeDialog.getByRole('button', { name: 'Scripted run', exact: true }));
+    await expect(
+      page.getByRole('dialog', { name: 'Configure this run', exact: true }),
+    ).toBeVisible();
+    await enter(
+      page.getByRole('dialog').getByRole('button', { name: 'Repository work', exact: true }),
+    );
+    await expect(nativeDialog.getByLabel('Committed file path', { exact: true })).toHaveCount(0);
+    await expect(
+      nativeDialog.getByRole('combobox', { name: 'Writer profile', exact: true }),
+    ).toHaveCount(0);
+    const repositoryConsent = nativeDialog.getByLabel(
+      'Send this committed repository and task text; allow edits in independent scratch',
+      { exact: true },
+    );
+    const nativeTools = nativeDialog.getByLabel('Allow local commands for this run', {
+      exact: true,
+    });
+    await expect(nativeTools).not.toBeChecked();
+    await expect(credits).not.toBeChecked();
+    await expect(trust).not.toBeChecked();
+    await expect(repositoryConsent).not.toBeChecked();
+    await trust.check();
+    await repositoryConsent.check();
+    await expect(
+      nativeDialog.getByRole('button', { name: 'Prepare native proposal', exact: true }),
+    ).toBeDisabled();
+    await nativeTools.check();
+    await expect(trust).not.toBeChecked();
+    await expect(repositoryConsent).not.toBeChecked();
+    await credits.check();
+    await nativeTools.uncheck();
+    await expect(credits).not.toBeChecked();
+    await nativeTools.check();
+    await trust.check();
+    await repositoryConsent.check();
+    await expect(nativeDialog).toContainText('may run multiple local commands');
+    await enter(nativeDialog.getByRole('button', { name: 'Prepare native proposal', exact: true }));
+    const repositoryPrepared = await observer.snapshot();
+    const repositoryTask = repositoryPrepared.tasks.find((value) => value.id === nativeTask.id);
+    const repositoryNative = repositoryPrepared.nativeRuns.find(
+      (value) => value.runId === repositoryTask?.runId,
+    );
+    const repositoryRun = repositoryPrepared.runs.find(
+      (value) => value.id === repositoryTask?.runId,
+    );
+    assert(repositoryNative?.repository && repositoryRun);
+    assert.equal(repositoryNative.profileId, 'openai-repository-v1');
+    assert.equal(repositoryNative.target, undefined);
+    assert.deepEqual(repositoryNative.execution, {
+      sandbox: 'workspace-write',
+      approvalPolicy: 'never',
+      networkAccess: false,
+    });
+    assert.equal(repositoryNative.repository.sourceBase, repositoryRun.source.base);
+    assert(repositoryNative.repository.files > 0);
+    assert(repositoryNative.repository.bytes > 0);
+    const toolsGrant = repositoryRun.policy.policy.effects.find(
+      (grant) => grant.action === 'run-native-tools',
+    );
+    assert.deepEqual(toolsGrant, {
+      taskId: nativeTask.id,
+      action: 'run-native-tools',
+      target: repositoryPrepared.projects.find((value) => value.id === nativeTask.projectId)?.name,
+      revoked: false,
+      usesRemaining: 1,
+      expiresAt: repositoryNative.expiresAt,
+    });
+    assert.equal(
+      repositoryPrepared.attempts.filter((value) => value.runId === repositoryRun.id).length,
+      0,
+    );
+    assert.deepEqual(
+      cli(home, 'task', 'show', nativeTask.id).nativeRun.repository,
+      repositoryNative.repository,
+    );
+    await expect(nativeDialog.getByLabel('Prepared native target')).toContainText(
+      'Saved repository',
+    );
+    await expect(nativeDialog).toContainText('Native approval requests refused');
+    await page.screenshot({
+      path: join(internal, 'repository-native-prepared-light.png'),
+      animations: 'disabled',
+    });
     await enter(nativeDialog.getByRole('button', { name: 'Start native proposal', exact: true }));
     await nativeEvents.wait(
       (event) => event.type === 'candidate.sealed' && event.payload.taskId === nativeTask.id,
@@ -878,7 +965,7 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     await expect(reviewerCredits).not.toBeChecked();
     const evaluationPermissions = [
       'Trust the existing native client and login for the review',
-      'Share the original file, proposed change and task text with the reviewer',
+      'Share the committed source, candidate changes and task text with the reviewer',
       'Allow one local run of the selected project tests',
       'Allow one Keep it simple review',
     ];
@@ -931,6 +1018,8 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     );
     assert(evaluation);
     assert.equal(evaluation.recipe, 'project-node-tests-v1');
+    assert.deepEqual(evaluation.repository, repositoryNative.repository);
+    assert.equal(evaluation.target, undefined);
     const testFile = readFileSync(join(source, 'net.test.mjs'));
     assert.deepEqual(evaluation.testFiles, [
       {

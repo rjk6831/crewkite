@@ -97,6 +97,22 @@ pnpm crewkite task export <task-id> --output candidate.patch --json
 
 Export reads bounded artifact pages and verifies identity, offsets, length and checksum before creating the destination. Existing files are never overwritten. Plain diff output escapes terminal control characters. If export needs approval, its receipt includes the next approval command. Approve that export with `task approve <approval-id> --output new.patch`, or retry the saved export approval receipt with `--output new.patch` after inspecting its result.
 
+## Native repository work
+
+Repository work uses the `openai-repository-v1` profile and the committed repository. It accepts no target path or execution override:
+
+```sh
+pnpm crewkite task prepare-repository <task-id> openai-repository-v1 --policy repository-policy.json --native-trust --source-consent --json
+pnpm crewkite task show <task-id> --json
+pnpm crewkite task start <task-id> --json
+```
+
+The policy must include an unexpired one-use `run-native-tools` grant for the task and project name, alongside `write-scratch`. Add that grant explicitly to the policy above. Preparation never inserts it. The grant is consumed once at launch and permits multiple local commands during the bounded task. Omitting both consent flags requests exact saved repository consent. File consent cannot authorize local commands. Existing credits stay off unless `--existing-credits` is supplied.
+
+The native client can edit independent scratch and run local commands. Its fixed settings are `workspace-write`, approval `never` and network access off. Requests needing native approval are refused. These settings do not establish separate filesystem or process containment by CrewKite. No account or native settings are changed.
+
+Task show reports the frozen committed base, manifest hash, file and byte counts, execution settings and expiry. Inspect retained changes and export through the same commands as file proposals. A native command's exit status or summary establishes no check evidence. Resume and handoff remain unavailable.
+
 ## Candidate checks and review
 
 The default `node-tests-v1` recipe covers the synthetic `net.mjs` project. The `project-node-tests-v1` recipe uses 1 to 32 explicit committed Node test files. The saved run must select one `keep-it-simple` review cycle and retain enough of its original budget for a local check and a separate native review. Preparation does not lower the saved quality floor.
