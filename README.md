@@ -7,7 +7,7 @@
 
 CrewKite is a desktop workspace and CLI for coding tasks that share one local controller. It tracks approvals, usage observations and retained work across provider routes.
 
-Status: early prototype for macOS on Apple Silicon. The supported demo uses a synthetic project and four scripted fake routes. Normal launch also supports an opt-in OpenAI single-file run with manual export. Live qualification of that public flow is pending.
+Status: early prototype for macOS on Apple Silicon. The supported demo uses a synthetic project and four scripted fake routes. An opt-in OpenAI single-file pilot has passed normal desktop launch, CLI export and same-home package reopen. General live routing remains unqualified.
 
 ## Why I am building it
 
@@ -21,7 +21,7 @@ The handoff matters as much as the routing. If a provider stops, I want the next
 
 Community skills and plugins contain work I want to learn from and reuse. Finding the right ones and keeping up with changes takes attention. I want one consistent interface that explains what a tool does and the permissions it needs before I enable it. That should make reuse approachable for everyday AI users who have little interest in maintaining a collection of integrations. I intend to credit the original work and contribute useful improvements upstream where I can, with sources and licenses recorded in the [credits](docs/credits.md).
 
-The scripted prototype exercises controller behavior. A bounded native single-file path is implemented, with offline coverage of public preparation and launch. Local inference and the skills and plugin experience remain planned. I am building in the open for my own daily use first. Finished work and less manual coordination will tell me whether this deserves a place alongside the tools I already use.
+The scripted prototype exercises controller behavior. The bounded native single-file path has passed a supervised desktop launch and retained export, with offline coverage of its authority and recovery rules. Local inference and the skills and plugin experience remain planned. I am building in the open for my own daily use first. Finished work and less manual coordination will tell me whether this deserves a place alongside the tools I already use.
 
 ## Current prototype
 
@@ -72,7 +72,7 @@ The controller is a headless Node process. It owns permissions, budgets, task ow
 | Milestone | Outcome | Status |
 |-----------|---------|--------|
 | D0 | Desktop and CLI run the full task journey against fake providers | Local demo verified |
-| D1a | One qualified official client does useful supervised work with manual export | Public launch implemented; live proof pending |
+| D1a | One qualified official client does useful supervised work with manual export | Public launch and export verified |
 | D1b | Checked results: immutable candidates, independent checks and review, local branch acceptance | Planned |
 | D2 | Local, OpenAI, Anthropic and Google routes with handoff, honest usage and two-slice parallel work | Planned |
 | D3 | Signed, documented distribution for a stated audience | Planned |
