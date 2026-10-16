@@ -37,6 +37,12 @@ const outgoing = z.union([
     method: z.literal('model/list'),
     params: z.strictObject({ limit: z.literal(20), includeHidden: z.literal(false) }),
   }),
+  z.strictObject({
+    id: z.literal(5),
+    method: z.literal('config/read'),
+    params: z.strictObject({ includeLayers: z.literal(false), cwd: text(4096) }),
+  }),
+  z.strictObject({ id: z.literal(6), method: z.literal('configRequirements/read') }),
 ]);
 const requests: z.input<typeof outgoing>[][] = [
   [
@@ -60,8 +66,8 @@ const requests: z.input<typeof outgoing>[][] = [
   [{ id: 4, method: 'model/list', params: { limit: 20, includeHidden: false } }],
 ];
 const response = z.union([
-  z.strictObject({ id: z.number().int().min(1).max(4), result: z.unknown() }),
-  z.strictObject({ id: z.number().int().min(1).max(4), error: z.unknown() }),
+  z.strictObject({ id: z.number().int().min(1).max(6), result: z.unknown() }),
+  z.strictObject({ id: z.number().int().min(1).max(6), error: z.unknown() }),
 ]);
 
 // Project only the metadata this reader uses. Native identity and extra fields stay private.
@@ -147,11 +153,64 @@ const models = z.object({
   nextCursor: text(256).nullable(),
 });
 
+const configuration = z
+  .object({
+    config: z.object({
+      model_provider: z.literal('openai'),
+      service_tier: z.literal('default'),
+      approval_policy: z.literal('on-request'),
+      approvals_reviewer: z.literal('user'),
+      sandbox_mode: z.literal('read-only'),
+      web_search: z.literal('disabled'),
+      chatgpt_base_url: z.literal('https://chatgpt.com/backend-api/'),
+      openai_base_url: z.literal(''),
+      features: z.object({
+        plugins: z.literal(false),
+        remote_plugin: z.literal(false),
+        apps: z.literal(false),
+        hooks: z.literal(false),
+        multi_agent: z.literal(false),
+      }),
+    }),
+  })
+  .transform(({ config: { chatgpt_base_url: _chatgpt, openai_base_url: _openai, ...config } }) => ({
+    ...config,
+    endpoints: 'official' as const,
+  }));
+const requirements = z
+  .object({
+    requirements: z
+      .object({
+        modelProvider: z.literal('openai').nullish(),
+        modelProviders: z
+          .record(text(200), z.unknown())
+          .nullish()
+          .refine((value) => !value || Object.keys(value).length === 0),
+        chatgptBaseUrl: z.literal('https://chatgpt.com/backend-api/').nullish(),
+        featureRequirements: z
+          .record(text(200), z.boolean())
+          .nullish()
+          .refine(
+            (value) =>
+              !value ||
+              (Object.keys(value).length <= 128 &&
+                Object.values(value).every((enabled) => !enabled)),
+          ),
+        hooks: z.null().nullish(),
+      })
+      .nullable(),
+  })
+  .transform(({ requirements }) =>
+    requirements === null ? ('absent' as const) : ('compatible' as const),
+  );
+
 export type DiscoveryMetadata = {
   platform: z.output<typeof platform>;
   account: z.output<typeof account>;
   limits: z.output<typeof limits>;
   models: z.output<typeof models>['data'];
+  configuration?: z.output<typeof configuration>;
+  requirements?: z.output<typeof requirements>;
 };
 type Failure =
   | 'invalid-message'
@@ -185,8 +244,19 @@ export class OpenAiDiscovery {
   private account?: DiscoveryMetadata['account'];
   private limits?: DiscoveryMetadata['limits'];
   private models?: DiscoveryMetadata['models'];
+  private configuration?: DiscoveryMetadata['configuration'];
+  private readonly readConfiguration: boolean;
+  private configurationRequested = false;
+  private requirementsRequested = false;
+  private requirements?: DiscoveryMetadata['requirements'];
+  private readonly configurationDirectory?: string;
 
-  constructor(options: { now: () => number; timeoutMs: number }) {
+  constructor(options: {
+    now: () => number;
+    timeoutMs: number;
+    readConfiguration?: boolean;
+    configurationDirectory?: string;
+  }) {
     this.now = options.now;
     const start = this.now();
     if (
@@ -197,6 +267,10 @@ export class OpenAiDiscovery {
     )
       throw new DiscoveryError('deadline');
     this.deadline = start + options.timeoutMs;
+    this.readConfiguration = options.readConfiguration ?? false;
+    this.configurationDirectory = options.configurationDirectory;
+    if (this.readConfiguration && !text(4096).safeParse(this.configurationDirectory).success)
+      throw new DiscoveryError('invalid-message');
   }
 
   private fail(reason: Failure): never {
@@ -214,6 +288,20 @@ export class OpenAiDiscovery {
   next(): Uint8Array | null {
     this.check();
     if (this.awaiting || this.step === requests.length) return null;
+    if (this.readConfiguration && this.step === 2 && !this.configuration) {
+      this.configurationRequested = true;
+      this.awaiting = true;
+      return new TextEncoder().encode(
+        `${JSON.stringify(outgoing.parse({ id: 5, method: 'config/read', params: { includeLayers: false, cwd: this.configurationDirectory } }))}\n`,
+      );
+    }
+    if (this.readConfiguration && this.step === 2 && !this.requirements) {
+      this.requirementsRequested = true;
+      this.awaiting = true;
+      return new TextEncoder().encode(
+        `${JSON.stringify(outgoing.parse({ id: 6, method: 'configRequirements/read' }))}\n`,
+      );
+    }
     const messages = requests[this.step].map((message) => outgoing.parse(message));
     this.awaiting = true;
     return new TextEncoder().encode(
@@ -236,8 +324,25 @@ export class OpenAiDiscovery {
         const line = new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array(this.pending));
         this.pending = [];
         const value = response.parse(JSON.parse(line));
-        if (!this.awaiting || value.id !== this.step + 1) this.fail('unexpected-message');
+        const expectedId = this.configurationRequested
+          ? 5
+          : this.requirementsRequested
+            ? 6
+            : this.step + 1;
+        if (!this.awaiting || value.id !== expectedId) this.fail('unexpected-message');
         if ('error' in value) this.fail('upstream-error');
+        if (this.requirementsRequested) {
+          this.requirements = requirements.parse(value.result);
+          this.requirementsRequested = false;
+          this.awaiting = false;
+          continue;
+        }
+        if (this.configurationRequested) {
+          this.configuration = configuration.parse(value.result);
+          this.configurationRequested = false;
+          this.awaiting = false;
+          continue;
+        }
         switch (this.step) {
           case 0:
             this.platform = platform.parse(value.result);
@@ -274,7 +379,9 @@ export class OpenAiDiscovery {
       !this.platform ||
       !this.account ||
       !this.limits ||
-      !this.models
+      !this.models ||
+      (this.readConfiguration && !this.configuration) ||
+      (this.readConfiguration && !this.requirements)
     )
       this.fail('incomplete');
     return {
@@ -282,6 +389,12 @@ export class OpenAiDiscovery {
       account: this.account,
       limits: this.limits,
       models: this.models,
+      ...(this.configuration ? { configuration: this.configuration } : {}),
+      ...(this.requirements ? { requirements: this.requirements } : {}),
     };
+  }
+
+  get complete(): boolean {
+    return this.step === requests.length && this.failed === null && this.pending.length === 0;
   }
 }

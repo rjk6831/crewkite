@@ -54,11 +54,90 @@ type Scenario = {
   incomplete?: boolean;
   reason?: DiscoveryError['reason'];
   check?: (value: ReturnType<OpenAiDiscovery['finish']>) => void;
+  configuration?: Record<string, unknown>;
+  requirements?: unknown;
 };
 
 test('provider discovery emits only correlated metadata and excludes private fields', () => {
   const scenarios: Scenario[] = [
     { name: 'fragmented transcript retains exact native model and effort' },
+    ...[false, true].map(
+      (mismatch): Scenario => ({
+        name: mismatch
+          ? 'effective configuration mismatch stops metadata'
+          : 'effective configuration is projected',
+        configuration: {
+          model_provider: mismatch ? 'gateway' : 'openai',
+          openai_base_url: '',
+          chatgpt_base_url: 'https://chatgpt.com/backend-api/',
+          model_providers: { openai: { ignored: privateText } },
+          features: {
+            plugins: false,
+            remote_plugin: false,
+            apps: false,
+            hooks: false,
+            multi_agent: false,
+          },
+          service_tier: 'default',
+          approval_policy: 'on-request',
+          approvals_reviewer: 'user',
+          sandbox_mode: 'read-only',
+          web_search: 'disabled',
+          secret: privateText,
+        },
+        ...(mismatch ? { reason: 'invalid-message' as const } : {}),
+        check: (value) => assert.equal(value.configuration?.model_provider, 'openai'),
+      }),
+    ),
+    ...[
+      { chatgpt_base_url: 'https://gateway.invalid' },
+      { openai_base_url: 'https://gateway.invalid' },
+    ].map(
+      (override): Scenario => ({
+        name: 'effective endpoint override refuses further metadata',
+        configuration: {
+          model_provider: 'openai',
+          openai_base_url: '',
+          chatgpt_base_url: 'https://chatgpt.com/backend-api/',
+          features: {
+            plugins: false,
+            remote_plugin: false,
+            apps: false,
+            hooks: false,
+            multi_agent: false,
+          },
+          service_tier: 'default',
+          approval_policy: 'on-request',
+          approvals_reviewer: 'user',
+          sandbox_mode: 'read-only',
+          web_search: 'disabled',
+          ...override,
+        },
+        reason: 'invalid-message',
+      }),
+    ),
+    {
+      name: 'changed managed startup policy refuses allowance requests',
+      configuration: {
+        model_provider: 'openai',
+        openai_base_url: '',
+        chatgpt_base_url: 'https://chatgpt.com/backend-api/',
+        service_tier: 'default',
+        approval_policy: 'on-request',
+        approvals_reviewer: 'user',
+        sandbox_mode: 'read-only',
+        web_search: 'disabled',
+        features: {
+          plugins: false,
+          remote_plugin: false,
+          apps: false,
+          hooks: false,
+          multi_agent: false,
+        },
+      },
+      requirements: { requirements: { featureRequirements: { plugins: true } } },
+      reason: 'invalid-message',
+    },
     {
       name: 'missing allowance stays unknown',
       change: (values) => {
@@ -238,13 +317,37 @@ test('provider discovery emits only correlated metadata and excludes private fie
   ];
   for (const scenario of scenarios) {
     let now = 0;
-    const reader = new OpenAiDiscovery({ now: () => now, timeoutMs: 100 });
+    const reader = new OpenAiDiscovery({
+      now: () => now,
+      timeoutMs: 100,
+      readConfiguration: !!scenario.configuration,
+      configurationDirectory: '/workspace',
+    });
     const emitted: unknown[] = [];
     try {
       if (scenario.before) reader.push(scenario.before);
       if (scenario.deadline) now = 100;
       const values = scenario.change?.(results()) ?? results();
       for (let index = 0; index < values.length; index++) {
+        if (index === 2 && scenario.configuration) {
+          const request = reader.next();
+          assert(request);
+          const message = JSON.parse(new TextDecoder().decode(request));
+          assert.deepEqual(message.params, { includeLayers: false, cwd: '/workspace' });
+          emitted.push(message);
+          reader.push(
+            line({
+              id: 5,
+              result: { config: scenario.configuration, origins: { secret: privateText } },
+            }),
+          );
+          const requirementsRequest = reader.next();
+          assert(requirementsRequest);
+          const requirementsMessage = JSON.parse(new TextDecoder().decode(requirementsRequest));
+          assert.deepEqual(requirementsMessage, { id: 6, method: 'configRequirements/read' });
+          emitted.push(requirementsMessage);
+          reader.push(line({ id: 6, result: scenario.requirements ?? { requirements: null } }));
+        }
         const request = reader.next();
         assert(request, scenario.name);
         emitted.push(
@@ -294,6 +397,8 @@ test('provider discovery emits only correlated metadata and excludes private fie
           'account/read',
           'account/rateLimits/read',
           'model/list',
+          'config/read',
+          'configRequirements/read',
         ].includes((message as { method: string }).method),
       ),
       scenario.name,
@@ -308,7 +413,14 @@ test('provider discovery emits only correlated metadata and excludes private fie
     if (!scenario.reason)
       assert.deepEqual(
         emitted.map((message) => (message as { method: string }).method),
-        ['initialize', 'initialized', 'account/read', 'account/rateLimits/read', 'model/list'],
+        [
+          'initialize',
+          'initialized',
+          'account/read',
+          ...(scenario.configuration ? ['config/read', 'configRequirements/read'] : []),
+          'account/rateLimits/read',
+          'model/list',
+        ],
       );
   }
 });
