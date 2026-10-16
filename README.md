@@ -7,7 +7,7 @@
 
 CrewKite is a desktop workspace and CLI for coding tasks that share one local controller. It tracks approvals, usage observations and retained work across provider routes.
 
-Status: early prototype for macOS on Apple Silicon. The supported demo uses a synthetic project and four scripted fake routes. An opt-in OpenAI single-file pilot has passed normal desktop launch, CLI export and same-home package reopen. General live routing remains unqualified.
+Status: early prototype for macOS on Apple Silicon. The supported demo uses a synthetic project and four scripted fake routes. One opt-in OpenAI single-file workflow has passed desktop and fresh package launch, retention and manual export. General live routing remains unqualified.
 
 ## Why I am building it
 
@@ -30,7 +30,7 @@ The scripted prototype exercises controller behavior. The bounded native single-
 - Shows fixture usage per route and window: remaining allowance, reset time, observation time and source. Missing data shows as unknown.
 - Prefers routes whose allowance resets soon, protects reserves you set, and never spends just to empty a gauge.
 - Records each task as durable facts and files, so a successor route continues from the work itself. A final summary from the stopped model is optional.
-- Works in scratch copies of your repository. The qualified scripted journey can accept a result as one new local branch. Native single-file work stays available for inspection and manual export, with checks, review and acceptance disabled. Your checkout, remotes and deployments stay untouched.
+- Works in scratch copies of your repository. The qualified scripted journey can accept a result as one new local branch. Native single-file work stays available for inspection and manual export, with review and acceptance disabled. Your checkout, remotes and deployments stay untouched.
 
 The qualified walkthrough uses the bundled synthetic project. Its real checks require the original test file and expected completions. Arbitrary repository checks remain unqualified. Review methods run as bounded jobs labeled SCRIPTED; their results establish fixture behavior and candidate binding. They do not establish model judgment.
 
@@ -72,7 +72,7 @@ The controller is a headless Node process. It owns permissions, budgets, task ow
 | Milestone | Outcome | Status |
 |-----------|---------|--------|
 | D0 | Desktop and CLI run the full task journey against fake providers | Local demo verified |
-| D1a | One qualified official client does useful supervised work with manual export | Public launch and export verified |
+| D1a | One qualified official client does useful supervised work with manual export | Bounded workflow complete |
 | D1b | Checked results: immutable candidates, independent checks and review, local branch acceptance | In progress |
 | D2 | Local, OpenAI, Anthropic and Google routes with handoff, honest usage and two-slice parallel work | Planned |
 | D3 | Signed, documented distribution for a stated audience | Planned |
