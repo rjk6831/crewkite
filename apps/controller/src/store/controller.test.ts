@@ -16,6 +16,7 @@ import { dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { type TestContext, test } from 'node:test';
 import {
+  AnthropicNativeProfileSchema,
   type Approval,
   type Artifact,
   ArtifactSchema,
@@ -44,6 +45,7 @@ import {
 import { refValue } from '../host/publication.ts';
 import { committedFiles, git, inspectSource, materialize, readFiles } from '../host/source.ts';
 import { groupAbsent } from '../host/worker.ts';
+import { replacementFixture as anthropicFixture } from '../providers/anthropic/replacement-fixture.ts';
 import {
   type NativeProfileResolution,
   unavailableNativeProfile,
@@ -1204,7 +1206,10 @@ async function acceptsNativeCandidate(t: TestContext) {
   const evidence = checked.evidence.find((value) => value.review);
   assert(evidence?.review && !evidence.review.job.scripted);
   const job = evidence.review.job;
-  const quiescentAt = controller.store.nativeProcesses(job.attemptId)[2]?.quiescent_at;
+  const reviewPhases = controller.store.nativeProcesses(job.attemptId);
+  const reviewRoute = checked.routes.find((route) => route.id === job.routeId);
+  assert(reviewRoute);
+  const quiescentAt = reviewPhases[2]?.quiescent_at;
   assert(quiescentAt);
   const check = checked.evidence.find((value) => !value.review);
   assert(check);
@@ -1223,7 +1228,7 @@ async function acceptsNativeCandidate(t: TestContext) {
   };
   const scratchTarget = join(controller.home, 'scratch', run.id, 'net.mjs');
   const targetBytes = readFileSync(scratchTarget);
-  for (const boundary of ['candidate', 'check', 'job', 'result', 'phase']) {
+  for (const boundary of ['candidate', 'check', 'job', 'result', 'phase', 'review-family']) {
     controller.store.transaction(() => {
       if (boundary === 'check')
         controller.store.db
@@ -1245,8 +1250,28 @@ async function acceptsNativeCandidate(t: TestContext) {
             "UPDATE native_processes SET state='owned',quiescent_at=NULL WHERE attempt_id=? AND sequence=2",
           )
           .run(job.attemptId);
+      if (boundary === 'review-family') {
+        controller.store.put('route', reviewRoute.id, 0, { ...reviewRoute, family: 'anthropic' });
+        controller.store.db
+          .prepare('DELETE FROM native_processes WHERE attempt_id=? AND sequence=2')
+          .run(job.attemptId);
+        controller.store.db
+          .prepare(
+            "UPDATE native_processes SET phase=CASE sequence WHEN 0 THEN 'auth-status' ELSE 'native-task' END WHERE attempt_id=?",
+          )
+          .run(job.attemptId);
+      }
     });
     if (boundary === 'candidate') appendFileSync(scratchTarget, '\n');
+    if (boundary === 'review-family') {
+      const phases = controller.store.nativeProcesses(job.attemptId);
+      assert.deepEqual(
+        phases.map((phase) => phase.phase),
+        ['auth-status', 'native-task'],
+      );
+      assert(phases.every((phase) => phase.state === 'quiescent'));
+    }
+
     assert.equal(
       controller.snapshot().candidateEvaluations[0]?.localAcceptance.available,
       false,
@@ -1279,6 +1304,27 @@ async function acceptsNativeCandidate(t: TestContext) {
             "UPDATE native_processes SET state='quiescent',quiescent_at=? WHERE attempt_id=? AND sequence=2",
           )
           .run(quiescentAt, job.attemptId);
+      if (boundary === 'review-family') {
+        controller.store.put('route', reviewRoute.id, 0, reviewRoute);
+        controller.store.db
+          .prepare('DELETE FROM native_processes WHERE attempt_id=?')
+          .run(job.attemptId);
+        for (const phase of reviewPhases)
+          controller.store.db
+            .prepare(
+              'INSERT INTO native_processes(attempt_id,sequence,phase,state,pid,process_group,intent_at,quiescent_at) VALUES (?,?,?,?,?,?,?,?)',
+            )
+            .run(
+              phase.attempt_id,
+              phase.sequence,
+              phase.phase,
+              phase.state,
+              phase.pid,
+              phase.process_group,
+              phase.intent_at,
+              phase.quiescent_at,
+            );
+      }
     });
   }
   clock.advance(86400001);
@@ -1994,6 +2040,7 @@ async function nativeSetup(
   options: Partial<ControllerOptions> = {},
   targetPath = 'net.mjs',
 ) {
+  const anthropic = mode.startsWith('anthropic-');
   let submissions = 0;
   const ready = Promise.withResolvers<void>();
   const failure = Promise.withResolvers<never>();
@@ -2019,7 +2066,7 @@ async function nativeSetup(
   let onSpawn: ((phase: string) => void) | undefined;
   let onInput: ((message: { method?: string }, phase: string) => void) | undefined;
   let onWritten: typeof onInput;
-  const fixtureProfile: NativeProfileResolution = {
+  const reviewerProfile: NativeProfileResolution = {
     ...unavailableNativeProfile(),
     facts: {
       ...unavailableNativeProfile().facts,
@@ -2036,8 +2083,35 @@ async function nativeSetup(
     environment: { ...process.env },
     locationHash: '1'.repeat(64),
   };
+  const fixtureProfile: NativeProfileResolution = anthropic
+    ? {
+        ...reviewerProfile,
+        facts: AnthropicNativeProfileSchema.parse({
+          id: 'anthropic-file-v1',
+          family: 'anthropic',
+          displayName: 'Anthropic fixture',
+          clientVersion: process.version,
+          model: fixtureModel,
+          effort: 'medium',
+          effectiveEffort: 'unknown',
+          accountClass: 'unknown',
+          serviceTier: 'unknown',
+          billingBasis: 'requires-user-attestation',
+          qualifiedAt: null,
+          creditPolicies: ['ordinary'],
+          maximumTaskMs: 300000,
+          maximumFileBytes: 65536,
+          maximumSubmissions: 1,
+          available: true,
+          reason: 'qualification-pending',
+        }),
+        locationHash: '2'.repeat(64),
+      }
+    : reviewerProfile;
   const nativeOptions: Partial<ControllerOptions> = {
-    nativeProfile: () => fixtureProfile,
+    ...(anthropic
+      ? { nativeProfiles: () => [reviewerProfile, fixtureProfile] }
+      : { nativeProfile: () => fixtureProfile }),
     ...options,
     nativeSpawn: (executable, args, spawnOptions) => {
       const pending = context.controller.store
@@ -2045,14 +2119,17 @@ async function nativeSetup(
         .flatMap((intent) => context.controller.store.nativeProcesses(intent.attempt_id))
         .filter((row) => row.state === 'intent')
         .at(-1);
+      const anthropicChild = pending?.phase === 'auth-status' || pending?.phase === 'native-task';
       const phase =
-        args.at(-1) === 'list'
-          ? 'features'
-          : pending?.phase === 'metadata-preparation'
-            ? 'prepare'
-            : 'task';
+        pending?.phase === 'auth-status'
+          ? 'auth'
+          : args.at(-1) === 'list'
+            ? 'features'
+            : pending?.phase === 'metadata-preparation'
+              ? 'prepare'
+              : 'task';
       let transcript = fixture;
-      if (mode.startsWith('checked')) {
+      if (mode.includes('checked')) {
         const proposal = join(context.directory, 'checked-proposal');
         mkdirSync(proposal, { recursive: true });
         writeFileSync(join(proposal, 'net.mjs'), '');
@@ -2072,52 +2149,92 @@ async function nativeSetup(
         replacement,
         `const edit = message.params.outputSchema.properties.bindingHash ? {version:1,bindingHash:message.params.outputSchema.properties.bindingHash.const,methodId:message.params.outputSchema.properties.methodId.const,cycle:1,outcome:${JSON.stringify(mode === 'checked-blocked' ? 'blocked' : 'passed')},findings:[],summary:'The bounded review completed.'} : ${replacement.slice('const edit = '.length)}`,
       );
+      if (anthropicChild) {
+        const content = mode.includes('checked')
+          ? readFileSync(join(context.directory, 'checked-proposal/net.mjs'), 'utf8')
+          : fixtureContent(targetPath);
+        transcript = anthropicFixture(args, {
+          content,
+          mode:
+            mode === 'anthropic-hold'
+              ? 'hold'
+              : mode === 'anthropic-overage'
+                ? 'overage'
+                : mode === 'anthropic-auth-api'
+                  ? 'auth-api'
+                  : 'success',
+        });
+      }
       const child = spawn(
         executable,
-        ['-e', transcript, mode.startsWith('checked') ? 'success' : mode, phase],
+        ['-e', transcript, mode.includes('checked') || anthropic ? 'success' : mode, phase],
         spawnOptions,
       );
       children.push(child);
       childrenClosed.push(new Promise((resolve) => child.once('close', () => resolve())));
       const write = child.stdin.write.bind(child.stdin);
-      child.stdin.write = ((data: Uint8Array) => {
-        try {
-          const messages = Buffer.from(data)
-            .toString()
-            .trim()
-            .split('\n')
-            .map((line) => JSON.parse(line) as { method?: string });
-          const attempt = context.controller.store
-            .intents()
-            .find((intent) => intent.attempt_id === pending?.attempt_id);
-          assert(attempt, 'the controller commits admission before native input');
-          assert.equal(
-            context.controller.store.nativeProcesses(attempt.attempt_id).at(-1)?.state,
-            'owned',
-          );
-          for (const message of messages) {
-            if (message.method === 'turn/start') {
-              submissions++;
-              const review = context.controller.store.db
-                .prepare('SELECT body FROM review_jobs WHERE attempt_id=?')
-                .get(attempt.attempt_id);
-              assert(
-                context.controller.store.receipt(
-                  `${review ? 'native-review-submission' : 'native-submission'}:${attempt.attempt_id}`,
-                ),
-              );
+      if (!anthropicChild)
+        child.stdin.write = ((data: Uint8Array) => {
+          try {
+            const messages = Buffer.from(data)
+              .toString()
+              .trim()
+              .split('\n')
+              .map((line) => JSON.parse(line) as { method?: string });
+            const attempt = context.controller.store
+              .intents()
+              .find((intent) => intent.attempt_id === pending?.attempt_id);
+            assert(attempt, 'the controller commits admission before native input');
+            assert.equal(
+              context.controller.store.nativeProcesses(attempt.attempt_id).at(-1)?.state,
+              'owned',
+            );
+            for (const message of messages) {
+              if (message.method === 'turn/start') {
+                submissions++;
+                const review = context.controller.store.db
+                  .prepare('SELECT body FROM review_jobs WHERE attempt_id=?')
+                  .get(attempt.attempt_id);
+                assert(
+                  context.controller.store.receipt(
+                    `${review ? 'native-review-submission' : 'native-submission'}:${attempt.attempt_id}`,
+                  ),
+                );
+              }
+              onInput?.(message, phase);
             }
-            onInput?.(message, phase);
+            const result = write(data);
+            for (const message of messages) onWritten?.(message, phase);
+            if (messages.some((message) => message.method === 'turn/start')) ready.resolve();
+            return result;
+          } catch (error) {
+            fail(error);
+            throw error;
           }
-          const result = write(data);
-          for (const message of messages) onWritten?.(message, phase);
-          if (messages.some((message) => message.method === 'turn/start')) ready.resolve();
-          return result;
-        } catch (error) {
-          fail(error);
-          throw error;
-        }
-      }) as typeof child.stdin.write;
+        }) as typeof child.stdin.write;
+      if (anthropicChild && phase === 'task') {
+        const end = child.stdin.end.bind(child.stdin);
+        child.stdin.end = ((data: string) => {
+          if (data === undefined) return end();
+          try {
+            assert(pending);
+            assert.equal(
+              context.controller.store.nativeProcesses(pending.attempt_id).at(-1)?.state,
+              'owned',
+            );
+            assert(context.controller.store.receipt(`native-submission:${pending.attempt_id}`));
+            submissions++;
+            onInput?.({ method: 'prompt' }, phase);
+            const result = end(data);
+            onWritten?.({ method: 'prompt' }, phase);
+            ready.resolve();
+            return result;
+          } catch (error) {
+            fail(error);
+            throw error;
+          }
+        }) as typeof child.stdin.end;
+      }
       try {
         onSpawn?.(phase);
       } catch (error) {
@@ -2235,6 +2352,7 @@ async function nativeSetup(
     task,
     appointment,
     fixtureProfile,
+    reviewerProfile,
     restart: async () => {
       await close(context.controller);
       context.controller = await nativeWait(
@@ -2532,6 +2650,23 @@ test('an appointed native proposal is retained and applied once after every phas
     );
     assert.equal(facts.reason, null);
     assert.equal(facts.quiescent, true);
+    if (!publicRun && consent === 'explicit' && path === 'net.mjs') {
+      const previous = controller.store.nativeProcesses(attempt.attempt_id);
+      controller.store.db.exec('ALTER TABLE native_processes RENAME TO native_processes_saved');
+      controller.store.db.exec(
+        readFileSync(
+          new URL('../../migrations/004-native-attempt-ownership.sql', import.meta.url),
+          'utf8',
+        ),
+      );
+      controller.store.db.exec(
+        'INSERT INTO native_processes SELECT * FROM native_processes_saved; DROP TABLE native_processes_saved; PRAGMA user_version=4',
+      );
+      controller.store.applyMigrations(new URL('../../migrations/', import.meta.url).pathname);
+      assert.deepEqual(controller.store.nativeProcesses(attempt.attempt_id), previous);
+      assert.equal(controller.store.db.prepare('PRAGMA user_version').get()?.user_version, 5);
+    }
+
     assert(
       controller.store
         .nativeProcesses(attempt.attempt_id)
@@ -2843,6 +2978,7 @@ test('an appointed native proposal is retained and applied once after every phas
   for (const scenario of [
     'checked',
     'project-checked',
+    'anthropic-checked',
     'failed',
     'stop-intent',
     'expired-intent',
@@ -2852,15 +2988,18 @@ test('an appointed native proposal is retained and applied once after every phas
     'review-close',
     'review-journal-read',
   ]) {
-    const passedReview = scenario === 'checked' || scenario === 'project-checked';
+    const passedReview =
+      scenario === 'checked' || scenario === 'project-checked' || scenario === 'anthropic-checked';
     console.error(`Native fixture row: evaluation/${scenario}`);
     const context = await nativeSetup(
       t,
-      scenario === 'failed'
-        ? 'success'
-        : scenario === 'review-blocked'
-          ? 'checked-blocked'
-          : 'checked',
+      scenario === 'anthropic-checked'
+        ? scenario
+        : scenario === 'failed'
+          ? 'success'
+          : scenario === 'review-blocked'
+            ? 'checked-blocked'
+            : 'checked',
     );
     let controller = context.controller;
     const { command, task, appointment, clock } = context;
@@ -2872,6 +3011,15 @@ test('an appointed native proposal is retained and applied once after every phas
           {
             taskId: task.id,
             profileId: context.fixtureProfile.facts.id,
+            ...(scenario === 'anthropic-checked'
+              ? {
+                  billingAttestation: {
+                    source: 'user-attested',
+                    subscriptionLoginConfirmed: true,
+                    paidExtraUsageDisabled: true,
+                  },
+                }
+              : {}),
             targetPath: 'net.mjs',
             policy: appointment.policy,
             consent: 'explicit',
@@ -2903,7 +3051,7 @@ test('an appointed native proposal is retained and applied once after every phas
       checkRecipeId: scenario === 'project-checked' ? 'project-node-tests-v1' : 'node-tests-v1',
       ...(scenario === 'project-checked' ? { testFiles: ['net.test.mjs'] } : {}),
       reviewer: {
-        profileId: context.fixtureProfile.facts.id,
+        profileId: context.reviewerProfile.facts.id,
         methodId: 'keep-it-simple',
         cycles: 1,
       },
@@ -2955,6 +3103,30 @@ test('an appointed native proposal is retained and applied once after every phas
         );
         assert.deepEqual(controller.snapshot(), before);
       }
+    }
+    if (scenario === 'anthropic-checked') {
+      assert.deepEqual(
+        controller.store
+          .nativeProcesses(controller.snapshot().attempts[0].id)
+          .map((phase) => phase.phase),
+        ['auth-status', 'native-task'],
+      );
+      assert.equal(
+        (
+          await controller.execute(
+            command(
+              'PrepareCandidateEvaluation',
+              {
+                ...payload,
+                reviewer: { ...payload.reviewer, profileId: context.fixtureProfile.facts.id },
+              },
+              revision(),
+            ),
+            'local-owner',
+          )
+        ).outcome,
+        'blocked',
+      );
     }
     const prepare = command('PrepareCandidateEvaluation', payload, revision());
     const prepared = await controller.execute(prepare, 'local-owner');
@@ -3087,7 +3259,7 @@ test('an appointed native proposal is retained and applied once after every phas
     const snapshot = controller.snapshot();
     assert.equal(snapshot.attempts.length, 2);
     assert.equal(context.submissions(), 1);
-    assert.equal(context.children.length, 3);
+    assert.equal(context.children.length, scenario === 'anthropic-checked' ? 2 : 3);
     assert.equal(snapshot.reviewJobs?.length, 0);
     assert.equal(snapshot.evidence.length, scenario.endsWith('intent') ? 0 : 1);
     if (!scenario.endsWith('intent')) {
@@ -3294,7 +3466,7 @@ test('an appointed native proposal is retained and applied once after every phas
       assert.equal(job.preparationId, artifact.id);
       assert.equal(job.independence, 'process-only');
       assert.equal(context.submissions(), 2, scenario);
-      assert.equal(context.children.length, 6);
+      assert.equal(context.children.length, scenario === 'anthropic-checked' ? 5 : 6);
       assert.equal(result.attempts.length, 3);
       assert.equal(result.candidates.length, 1);
       assert.deepEqual(result.runs.at(-1), originalRun);
@@ -3647,6 +3819,108 @@ test('an appointed native proposal is retained and applied once after every phas
 });
 
 test('stop or restart cannot submit or apply late native work', async (t) => {
+  for (const scenario of ['auth-api', 'overage', 'stop-auth', 'stop-task'] as const) {
+    const context = await nativeSetup(
+      t,
+      scenario === 'stop-task' ? 'anthropic-hold' : `anthropic-${scenario}`,
+    );
+    let controller = context.controller;
+    const { command, task, appointment } = context;
+    const attestation = {
+      source: 'user-attested',
+      subscriptionLoginConfirmed: true,
+      paidExtraUsageDisabled: true,
+    };
+    const payload = {
+      taskId: task.id,
+      profileId: context.fixtureProfile.facts.id,
+      targetPath: 'net.mjs',
+      policy: appointment.policy,
+      consent: 'explicit',
+      billingAttestation: attestation,
+    };
+    const before = controller.snapshot();
+    for (const change of [
+      { billingAttestation: undefined },
+      { creditPolicy: 'existing-credits' },
+      { consent: 'saved' },
+    ]) {
+      const changed = { ...payload, ...change };
+      if (changed.billingAttestation === undefined) delete changed.billingAttestation;
+      const refused = await controller.execute(
+        command('PrepareNativeRun', changed, task.revision),
+        'local-owner',
+      );
+      assert.equal(refused.outcome, 'blocked');
+      assert.deepEqual(controller.snapshot(), before);
+    }
+    const prepared = await controller.execute(
+      command('PrepareNativeRun', payload, task.revision),
+      'local-owner',
+    );
+    assert.equal(prepared.outcome, 'applied');
+    const run = RunSchema.parse(prepared.entity);
+    assert.deepEqual(controller.snapshot().nativeRuns[0].billingAttestation, attestation);
+    assert.equal(
+      run.roles[0].routeId,
+      controller.snapshot().routes.find((route) => route.family === 'anthropic' && !route.fake)?.id,
+    );
+    assert.equal(
+      controller.snapshot().routes.find((route) => route.id === run.roles[0].routeId)?.effort
+        .effective,
+      'unknown',
+    );
+    controller = await context.restart();
+    let stopping: Promise<unknown> | undefined;
+    const stop = () => {
+      stopping = controller.execute(
+        command('StopRun', { taskId: task.id, runId: run.id }, taskRevision(controller, task.id)),
+        'local-owner',
+      );
+    };
+    if (scenario === 'stop-auth')
+      context.onSpawn((phase) => {
+        if (phase === 'auth') queueMicrotask(stop);
+      });
+    if (scenario === 'stop-task')
+      context.onWritten((message) => {
+        if (message.method === 'prompt') queueMicrotask(stop);
+      });
+    const retained = nativeCandidate(controller);
+    assert.equal(
+      (
+        await controller.execute(
+          command(
+            'StartRun',
+            { taskId: task.id, runId: run.id },
+            taskRevision(controller, task.id),
+          ),
+          'local-owner',
+        )
+      ).outcome,
+      'applied',
+    );
+    await context.wait(`${scenario} retained`, retained);
+    if (stopping) await context.wait(`${scenario} Stop`, stopping);
+    assert.equal(context.submissions(), scenario === 'overage' || scenario === 'stop-task' ? 1 : 0);
+    const attempt = controller.snapshot().attempts[0];
+    const phases = controller.store.nativeProcesses(attempt.id);
+    assert.deepEqual(
+      phases.map((phase) => phase.phase),
+      scenario === 'auth-api' || scenario === 'stop-auth'
+        ? ['auth-status']
+        : ['auth-status', 'native-task'],
+    );
+    assert(
+      phases.every((phase) => phase.state === 'quiescent' && groupAbsent(phase.process_group)),
+    );
+    assert.equal(controller.store.receipt(`native-application:${attempt.id}`), undefined);
+    assert.equal(controller.snapshot().tasks[0].state, 'interrupted');
+    assert.deepEqual(inspectSource(task.projectId, context.source.directory), run.source);
+    controller = await context.restart();
+    assert.equal(controller.snapshot().attempts.length, 1);
+    assert.equal(context.submissions(), scenario === 'overage' || scenario === 'stop-task' ? 1 : 0);
+  }
   for (const scenario of [
     'before-submit',
     'restart-intent',

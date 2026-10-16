@@ -3,11 +3,17 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Controller, type ControllerOptions } from './commands/controller.ts';
 import { configuredIdentity } from './host/publication.ts';
+import { resolveAnthropicNativeProfile } from './providers/anthropic/profile.ts';
 import { resolveNativeProfile } from './providers/openai/profile.ts';
 import { serve } from './server/index.ts';
 
 export async function startController(options: ControllerOptions) {
-  const controller = new Controller({ nativeProfile: resolveNativeProfile, ...options });
+  const controller = new Controller({
+    nativeProfiles: options.nativeProfile
+      ? undefined
+      : () => [resolveNativeProfile(), resolveAnthropicNativeProfile()],
+    ...options,
+  });
   try {
     const server = await serve(controller);
     let closing: Promise<void> | undefined;
