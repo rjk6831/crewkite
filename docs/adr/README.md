@@ -25,6 +25,7 @@ Each record states one decision, the context that forced it, why I chose it and 
 | [0019](0019-transport-seam-for-team-and-remote.md) | Defer team, remote and hosted features behind a transport seam | Accepted |
 | [0020](0020-profiles-resolve-to-finite-gates.md) | Resolve profiles to finite effect gates and bounded reviews | Proposed |
 | [0021](0021-explicit-route-order-and-review-floors.md) | Resolve explicit route order and minimum review methods | Proposed |
+| [0022](0022-attested-billing-for-supervised-pilots.md) | Separate observed billing facts from supervised pilot attestations | Proposed |
 
 ## Writing a new record
 
