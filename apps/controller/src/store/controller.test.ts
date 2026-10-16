@@ -2624,7 +2624,7 @@ test('an appointed native proposal is retained and applied once after every phas
       let closing: Promise<void> | undefined;
       let stop: Promise<unknown> | undefined;
       const reviewed = Promise.withResolvers<void>();
-      const offReview = controller.subscribe((event) => {
+      const offReview = context.observe(controller, (event) => {
         if (event.type === 'attempt.launched')
           reviewReplay = controller
             .execute(command('StartCandidateReview', reviewPayload, revision()), 'local-owner')
@@ -2659,10 +2659,10 @@ test('an appointed native proposal is retained and applied once after every phas
       });
       const reviewStart = command('StartCandidateReview', reviewPayload, revision());
       assert.equal((await controller.execute(reviewStart, 'local-owner')).outcome, 'applied');
-      await reviewed.promise;
-      await reviewReplay;
-      await stop;
-      await closing;
+      await context.wait(`${scenario} review completion`, reviewed.promise);
+      if (reviewReplay) await context.wait(`${scenario} review replay`, reviewReplay);
+      if (stop) await context.wait(`${scenario} review stop`, stop);
+      if (closing) await context.wait(`${scenario} review close`, closing);
       offReview();
       if (scenario === 'review-close') controller = await context.restart();
       if (scenario === 'review-journal-read') {
