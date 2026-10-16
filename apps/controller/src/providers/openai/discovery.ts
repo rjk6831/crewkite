@@ -356,6 +356,19 @@ const configuration = z
     ...config,
     endpoints: 'official' as const,
   }));
+const mcpConfiguration = z
+  .object({
+    config: z.object({
+      mcp_servers: z
+        .record(z.string().regex(/^[A-Za-z0-9_-]{1,200}$/), z.object({ enabled: z.boolean() }))
+        .refine((servers) => Object.keys(servers).length <= 128),
+    }),
+  })
+  .transform(({ config }) =>
+    Object.fromEntries(
+      Object.entries(config.mcp_servers).map(([name, server]) => [name, server.enabled]),
+    ),
+  );
 const requirements = z
   .object({
     requirements: z
@@ -390,6 +403,7 @@ export type DiscoveryMetadata = {
   models: z.output<typeof models>['data'];
   configuration?: z.output<typeof configuration>;
   requirements?: z.output<typeof requirements>;
+  mcpServers?: z.output<typeof mcpConfiguration>;
 };
 export type DiscoveryRequest =
   | 'features-list'
@@ -438,6 +452,8 @@ export class OpenAiDiscovery {
   private models?: DiscoveryMetadata['models'];
   private configuration?: DiscoveryMetadata['configuration'];
   private readonly readConfiguration: boolean;
+  private readonly readMcpConfiguration: boolean;
+  private mcpServers?: DiscoveryMetadata['mcpServers'];
   private configurationRequested = false;
   private requirementsRequested = false;
   private requirements?: DiscoveryMetadata['requirements'];
@@ -447,6 +463,7 @@ export class OpenAiDiscovery {
     now: () => number;
     timeoutMs: number;
     readConfiguration?: boolean;
+    readMcpConfiguration?: boolean;
     configurationDirectory?: string;
   }) {
     this.now = options.now;
@@ -460,6 +477,9 @@ export class OpenAiDiscovery {
       throw new DiscoveryError('deadline');
     this.deadline = start + options.timeoutMs;
     this.readConfiguration = options.readConfiguration ?? false;
+    this.readMcpConfiguration = options.readMcpConfiguration ?? false;
+    if (this.readMcpConfiguration && !this.readConfiguration)
+      throw new DiscoveryError('invalid-message');
     this.configurationDirectory = options.configurationDirectory;
     if (this.readConfiguration && !text(4096).safeParse(this.configurationDirectory).success)
       throw new DiscoveryError('invalid-message');
@@ -553,6 +573,7 @@ export class OpenAiDiscovery {
         }
         if (this.configurationRequested) {
           this.configuration = configuration.parse(value.result);
+          if (this.readMcpConfiguration) this.mcpServers = mcpConfiguration.parse(value.result);
           this.configurationRequested = false;
           this.awaiting = false;
           continue;
@@ -606,6 +627,7 @@ export class OpenAiDiscovery {
       models: this.models,
       ...(this.configuration ? { configuration: this.configuration } : {}),
       ...(this.requirements ? { requirements: this.requirements } : {}),
+      ...(this.mcpServers ? { mcpServers: this.mcpServers } : {}),
     };
   }
 

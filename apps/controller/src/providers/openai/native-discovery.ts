@@ -79,7 +79,16 @@ function childDirectory(root: string, name: string) {
 }
 
 /** Run-local settings do not change the existing native authentication location. */
-export function nativeDiscoveryArguments(directory: string): string[] {
+export function nativeDiscoveryArguments(
+  directory: string,
+  disabledMcpServers: readonly string[] = [],
+): string[] {
+  // The native override parser splits dots without interpreting quoted key segments.
+  if (
+    disabledMcpServers.length > 128 ||
+    disabledMcpServers.some((name) => !/^[A-Za-z0-9_-]{1,200}$/.test(name))
+  )
+    throw new Error('MCP override identifiers cannot be represented safely.');
   const settings = {
     model_provider: 'openai',
     openai_base_url: '',
@@ -102,6 +111,7 @@ export function nativeDiscoveryArguments(directory: string): string[] {
       '-c',
       `${key}=${JSON.stringify(value)}`,
     ]),
+    ...disabledMcpServers.flatMap((name) => ['-c', `mcp_servers.${name}.enabled=false`]),
     'app-server',
     '--stdio',
     '--strict-config',
@@ -136,6 +146,7 @@ function startTranscript<T>(
     task?: boolean;
     deadline?: number;
     onSubmitted?: () => void;
+    onGroup?: (group: number) => void;
   },
 ): { group: number; result: Promise<Outcome<T>>; stop: () => void } {
   if (process.platform === 'win32') throw new Error('Discovery requires Unix process ownership.');
@@ -340,6 +351,7 @@ function startTranscript<T>(
         : Math.max(0, options.timeoutMs - (now() - started)),
     ),
   );
+  options.onGroup?.(group);
   advance();
   if (options.closeInput) child.stdin.end();
   return { group, result, stop: () => stop('stopped') };
@@ -391,6 +403,7 @@ function nativeSession<T>(
     spawn?: Spawn;
     task?: boolean;
     onSubmitted?: () => void;
+    disableMcpServers?: boolean;
   },
   createReader: (remainingMs: number) => NativeTranscript<T>,
 ) {
@@ -405,10 +418,13 @@ function nativeSession<T>(
     throw new Error('Discovery deadline is invalid.');
   const deadline = started + options.timeoutMs;
   let stopped = false;
+  const groups: number[] = [];
+  const onGroup = (group: number) => groups.push(group);
   const preflight = startTranscript(launch, {
     ...options,
     now,
     reader: new FeatureList(),
+    onGroup,
     ...(options.task ? { deadline } : {}),
     closeInput: true,
     arguments: (directory) => [
@@ -418,14 +434,40 @@ function nativeSession<T>(
     ],
   });
   let current: { group: number; stop: () => void } = preflight;
-  const groups = [preflight.group];
   const result: Promise<Outcome<T>> = preflight.result.then(async (outcome) => {
     if (!outcome.quiescent || outcome.reason || stopped)
       return { ...outcome, metadata: null, reason: outcome.reason ?? 'stopped' };
-    const remaining = Math.floor(options.timeoutMs - (now() - started));
-    if (remaining < (options.task ? 2001 : 1))
-      return { ...outcome, metadata: null, reason: 'deadline' };
     try {
+      let disabledMcpServers: string[] = [];
+      if (options.task && options.disableMcpServers) {
+        const remaining = Math.floor(deadline - now());
+        if (remaining < 2001) return { ...outcome, metadata: null, reason: 'deadline' };
+        const preparation = startTranscript(launch, {
+          ...options,
+          now,
+          timeoutMs: Math.min(60_000, remaining),
+          deadline: Math.min(deadline, now() + 60_000),
+          onGroup,
+          reader: new OpenAiDiscovery({
+            now,
+            timeoutMs: Math.min(60_000, remaining),
+            readConfiguration: true,
+            readMcpConfiguration: true,
+            configurationDirectory: resolve(launch.directory),
+          }),
+          arguments: nativeDiscoveryArguments,
+        });
+        current = preparation;
+        const prepared = await preparation.result;
+        if (!prepared.quiescent || prepared.reason || stopped)
+          return { ...prepared, metadata: null, reason: prepared.reason ?? 'stopped' };
+        if (!prepared.metadata?.mcpServers)
+          return { ...prepared, metadata: null, reason: 'protocol' };
+        disabledMcpServers = Object.keys(prepared.metadata.mcpServers);
+      }
+      const remaining = Math.floor(deadline - now());
+      if (remaining < (options.task ? 2001 : 1))
+        return { ...outcome, metadata: null, reason: 'deadline' };
       const reader = createReader(remaining);
       const discovery = startTranscript(launch, {
         ...options,
@@ -433,10 +475,10 @@ function nativeSession<T>(
         timeoutMs: remaining,
         ...(options.task ? { deadline } : {}),
         reader,
-        arguments: nativeDiscoveryArguments,
+        onGroup,
+        arguments: (directory) => nativeDiscoveryArguments(directory, disabledMcpServers),
       });
       current = discovery;
-      groups.push(discovery.group);
       return discovery.result;
     } catch {
       return {
@@ -479,6 +521,7 @@ export function startNativeTask<T>(
     schedule?: Schedule;
     spawn?: Spawn;
     onSubmitted: () => void;
+    disableMcpServers?: boolean;
   },
   createReader: (remainingMs: number) => NativeTranscript<T>,
 ) {

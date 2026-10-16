@@ -77,6 +77,8 @@ const methods = [
   'thread/queue/changed',
   'account/rateLimits/updated',
   'warning',
+  'deprecationNotice',
+  'configWarning',
   'turn/started',
   'turn/completed',
   'item/started',
@@ -197,6 +199,7 @@ export type ReplacementDiagnostic = Readonly<{
   cause: Cause;
   envelope: Frame;
   method: (typeof methods)[number] | 'other' | null;
+  methodHash: string | null;
   rpcCode: number | null;
   rpcField: (typeof rpcFields)[number] | null;
   field: (typeof fields)[number] | 'other' | null;
@@ -216,6 +219,7 @@ export class ReplacementTranscript {
   private site: Site = 'metadata';
   private frame: Frame = 'none';
   private method: ReplacementDiagnostic['method'] = null;
+  private methodHash: string | null = null;
   private rpcCode: number | null = null;
   private rpcField: ReplacementDiagnostic['rpcField'] = null;
   private failure: ReplacementDiagnostic | null = null;
@@ -249,6 +253,7 @@ export class ReplacementTranscript {
       now: options.now,
       timeoutMs: Math.min(60_000, options.timeoutMs),
       readConfiguration: true,
+      readMcpConfiguration: true,
       configurationDirectory: this.plan.directory,
     });
   }
@@ -264,6 +269,7 @@ export class ReplacementTranscript {
         cause,
         envelope: this.frame,
         method: this.method,
+        methodHash: this.methodHash,
         rpcCode: this.rpcCode,
         rpcField: this.rpcField,
         field,
@@ -375,6 +381,11 @@ export class ReplacementTranscript {
               !model?.supportedReasoningEfforts.includes(this.plan.effort)
             )
               this.refuse('admission');
+            if (
+              !this.metadata.mcpServers ||
+              Object.values(this.metadata.mcpServers).some((enabled) => enabled)
+            )
+              this.refuse('admission');
             this.step = 'thread';
           }
           continue;
@@ -382,6 +393,7 @@ export class ReplacementTranscript {
         this.site = 'frame';
         this.frame = 'invalid-json';
         this.method = null;
+        this.methodHash = null;
         this.rpcCode = null;
         this.rpcField = null;
         let decoded: unknown;
@@ -408,6 +420,13 @@ export class ReplacementTranscript {
           shape && 'method' in shape
             ? (methods.find((value) => value === shape.method) ?? 'other')
             : null;
+        if (
+          typeof shape?.method === 'string' &&
+          shape.method.length > 0 &&
+          shape.method.length <= 200 &&
+          shape.method.isWellFormed()
+        )
+          this.methodHash = createHash('sha256').update(shape.method).digest('hex');
         this.site = 'envelope';
         const value = envelope.parse(decoded);
         if ('error' in value) {
@@ -545,6 +564,25 @@ export class ReplacementTranscript {
         .object({ message: z.string().max(16_384), threadId: id.nullish() })
         .parse(params);
       if (value.threadId != null && value.threadId !== this.threadId) this.refuse();
+      return;
+    }
+    // These notices carry guidance only. Admission still uses the native settings.
+    if (method === 'deprecationNotice' || method === 'configWarning') {
+      this.site = 'warning';
+      const position = z.object({
+        line: z.number().int().nonnegative().max(4_294_967_295),
+        column: z.number().int().nonnegative().max(4_294_967_295),
+      });
+      z.object({
+        summary: z.string().max(16_384),
+        details: z.string().max(16_384).nullish(),
+        ...(method === 'configWarning'
+          ? {
+              path: z.string().max(4096).nullish(),
+              range: z.object({ start: position, end: position }).nullish(),
+            }
+          : {}),
+      }).parse(params);
       return;
     }
     if (!methods.some((known) => known === method)) {
@@ -747,10 +785,14 @@ export function startReplacement(
     throw new Error('The replacement directory differs from the owned session.');
   const now = options.now ?? (() => performance.now());
   let reader: ReplacementTranscript | undefined;
-  const handle = startNativeTask(launch, { ...options, now }, (remaining) => {
-    reader = new ReplacementTranscript(trusted, { now, timeoutMs: remaining });
-    return reader;
-  });
+  const handle = startNativeTask(
+    launch,
+    { ...options, now, disableMcpServers: true },
+    (remaining) => {
+      reader = new ReplacementTranscript(trusted, { now, timeoutMs: remaining });
+      return reader;
+    },
+  );
   return {
     get group() {
       return handle.group;
