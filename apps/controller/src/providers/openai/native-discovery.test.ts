@@ -5,7 +5,13 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:
 import { resolve } from 'node:path';
 import test from 'node:test';
 import { groupAbsent } from '../../host/worker.ts';
-import { nativeDiscoveryArguments, startNativeDiscovery } from './native-discovery.ts';
+import { OpenAiDiscovery } from './discovery.ts';
+import {
+  type NativePhase,
+  nativeDiscoveryArguments,
+  startNativeDiscovery,
+  startNativeTask,
+} from './native-discovery.ts';
 
 const fixture = `
 const { createInterface } = require('node:readline');
@@ -23,7 +29,7 @@ const config = {
   openai_base_url: '', chatgpt_base_url: 'https://chatgpt.com/backend-api/',
   features: { plugins: false, remote_plugin: false, apps: false, hooks: false, multi_agent: false },
   approvals_reviewer: 'user', sandbox_mode: 'read-only', web_search: 'disabled',
-  private: 'private-native-diagnostic',
+  private: 'private-native-diagnostic', mcp_servers: {},
 };
 const replies = {
   initialize: { userAgent: 'private-native-diagnostic', platformFamily: 'unix', platformOs: 'fixture' },
@@ -182,6 +188,139 @@ test('native discovery returns metadata only after its owned process and descend
       } else {
         assert.equal(result.metadata, null, mode);
         assert(result.reason, mode);
+      }
+    }
+    const lifecycleCases = [
+      { name: 'three phases', failure: '', sequence: -1 },
+      ...['intent', 'owned', 'quiescent'].flatMap((failure) =>
+        [0, 1, 2].map((sequence) => ({ name: `${failure}-${sequence}`, failure, sequence })),
+      ),
+      { name: 'stop during preparation ownership', failure: 'owned-stop', sequence: 1 },
+      { name: 'stop during task ownership', failure: 'owned-stop', sequence: 2 },
+      { name: 'async intent', failure: 'intent-async', sequence: 0 },
+      { name: 'async ownership', failure: 'owned-async', sequence: 1 },
+      { name: 'async closure', failure: 'quiescent-async', sequence: 1 },
+      { name: 'cancel after features', failure: 'stop', sequence: 0 },
+      { name: 'cancel after preparation', failure: 'stop', sequence: 1 },
+    ];
+    for (const entry of lifecycleCases) {
+      const directory = resolve(root, entry.name);
+      mkdirSync(directory, { mode: 0o700 });
+      const trace: string[] = [];
+      const groups: number[] = [];
+      const ownedGroups = new Set<number>();
+      const closedGroups = new Set<number>();
+      let writesWithoutOwnership = 0;
+      let stop: (() => void) | undefined;
+      const checkpoint = (point: string, phase: NativePhase) => {
+        trace.push(`${point}:${phase.sequence}`);
+        if (entry.failure === point && entry.sequence === phase.sequence)
+          throw new Error('Fixture persistence failure.');
+        if (entry.failure === `${point}-async` && entry.sequence === phase.sequence)
+          return Promise.resolve();
+      };
+      const start = () =>
+        startNativeTask(
+          {
+            executable: process.execPath,
+            sha256,
+            directory,
+            repositoryRoot: root,
+            environment: sourceEnvironment,
+          },
+          {
+            timeoutMs: 300_000,
+            disableMcpServers: true,
+            onSubmitted: () => assert.fail('Metadata fixtures submit no native turn.'),
+            lifecycle: {
+              beforePhase: (phase) => {
+                assert.deepEqual(
+                  phase.kind,
+                  ['effective-features', 'metadata-preparation', 'app-server-task'][phase.sequence],
+                );
+                if (phase.sequence > 0)
+                  assert.equal(trace.at(-1), `quiescent:${phase.sequence - 1}`);
+                return checkpoint('intent', phase);
+              },
+              owned: (phase, group) => {
+                assert.equal(trace.at(-1), `spawn:${phase.sequence}`);
+                const pending = checkpoint('owned', phase);
+                if (pending) return pending;
+                ownedGroups.add(group);
+                if (entry.failure === 'owned-stop' && entry.sequence === phase.sequence) stop?.();
+              },
+              quiescent: (phase, group) => {
+                assert(closedGroups.has(group), 'closure follows closed process streams');
+                assert(groupAbsent(group), 'closure follows process-group absence');
+                const pending = checkpoint('quiescent', phase);
+                if (pending) return pending;
+                if (entry.failure === 'stop' && entry.sequence === phase.sequence) stop?.();
+              },
+            },
+            spawn: (executable, args, options) => {
+              const sequence = groups.length;
+              assert.equal(trace.at(-1), `intent:${sequence}`);
+              trace.push(`spawn:${sequence}`);
+              assert(groups.every(groupAbsent), 'preceding phase has stopped before spawn');
+              const child = spawn(
+                executable,
+                ['-e', fixture, 'success', args.at(-1) === 'list' ? 'features' : 'discovery'],
+                options,
+              );
+              const group = child.pid as number;
+              groups.push(group);
+              const write = child.stdin.write.bind(child.stdin);
+              child.stdin.write = ((data: string | Uint8Array) => {
+                if (!ownedGroups.has(group)) writesWithoutOwnership++;
+                assert(ownedGroups.has(group), 'ownership persists before protocol input');
+                trace.push(`input:${sequence}`);
+                return write(data);
+              }) as typeof child.stdin.write;
+              owned.push({
+                child,
+                closed: new Promise((resolve) =>
+                  child.once('close', () => {
+                    closedGroups.add(group);
+                    resolve();
+                  }),
+                ),
+              });
+              return child;
+            },
+          },
+          (remaining) =>
+            new OpenAiDiscovery({
+              now: () => 1,
+              timeoutMs: Math.min(60_000, remaining),
+              readConfiguration: true,
+              configurationDirectory: directory,
+            }),
+        );
+      if (entry.failure.startsWith('intent') && entry.sequence === 0) {
+        assert.throws(start, /persistence failure|synchronously/, entry.name);
+        assert.equal(groups.length, 0, entry.name);
+        continue;
+      }
+      const handle = start();
+      stop = handle.stop;
+      const result = await handle.result;
+      assert.equal(writesWithoutOwnership, 0, entry.name);
+      if (entry.failure === 'owned-stop')
+        assert.equal(trace.includes(`input:${entry.sequence}`), false, entry.name);
+      assert(groups.every(groupAbsent), entry.name);
+      assert.equal(result.quiescent, true, entry.name);
+      assert.equal(
+        groups.length,
+        entry.failure === '' ? 3 : entry.sequence + (entry.failure.startsWith('intent') ? 0 : 1),
+        entry.name,
+      );
+      if (entry.failure === '') {
+        assert.equal(result.reason, null, entry.name);
+        assert(result.metadata, entry.name);
+        assert.equal(trace.at(-1), 'quiescent:2');
+      } else {
+        assert(result.reason, entry.name);
+        assert.equal(result.metadata, null, entry.name);
       }
     }
     let spawned = false;

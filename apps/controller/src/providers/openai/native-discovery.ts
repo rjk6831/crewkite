@@ -19,6 +19,21 @@ export type NativeLaunch = {
   repositoryRoot: string;
   environment: NodeJS.ProcessEnv;
 };
+export type NativePhase = Readonly<{
+  sequence: number;
+  kind: 'effective-features' | 'metadata-preparation' | 'app-server-task';
+}>;
+export type NativeLifecycle = {
+  beforePhase: (phase: NativePhase) => void;
+  owned: (phase: NativePhase, group: number) => void;
+  quiescent: (phase: NativePhase, group: number) => void;
+};
+function synchronous(result: unknown) {
+  if (result instanceof Promise) {
+    void result.catch(() => {});
+    throw new Error('Native lifecycle callbacks must finish synchronously.');
+  }
+}
 type NativeEnvelope = DiscoveryEnvelope | 'notification' | 'request';
 type NativeRequest = DiscoveryRequest | 'thread/start' | 'turn/start' | 'turn/completed';
 type Outcome<T = DiscoveryMetadata> = {
@@ -147,6 +162,7 @@ function startTranscript<T>(
     deadline?: number;
     onSubmitted?: () => void;
     onGroup?: (group: number) => void;
+    onQuiescent?: (group: number) => void;
   },
 ): { group: number; result: Promise<Outcome<T>>; stop: () => void } {
   if (process.platform === 'win32') throw new Error('Discovery requires Unix process ownership.');
@@ -213,6 +229,7 @@ function startTranscript<T>(
   let stdoutBytes = 0;
   let stderrBytes = 0;
   let stopping = false;
+  let owned = false;
   let exitCode: number | null = null;
   let exitSignal: NodeJS.Signals | null = null;
   const cancellations: Array<() => void> = [];
@@ -224,6 +241,13 @@ function startTranscript<T>(
     if (finished) return;
     finished = true;
     for (const cancel of cancellations) cancel();
+    if (quiescent) {
+      try {
+        options.onQuiescent?.(group);
+      } catch {
+        reason ??= 'protocol';
+      }
+    }
     finish({
       metadata: quiescent && reason === null ? metadata : null,
       reason: quiescent ? reason : 'ownership',
@@ -252,7 +276,7 @@ function startTranscript<T>(
     reason ??= failure;
     if (stopping) return;
     stopping = true;
-    if (options.task) {
+    if (options.task && owned) {
       try {
         const interrupt = reader.interrupt?.();
         if (interrupt) child.stdin.write(interrupt);
@@ -272,7 +296,7 @@ function startTranscript<T>(
       child.stdin.end();
     }
     if (closed && absent()) return settle(true);
-    if (!options.task) signal('SIGTERM');
+    if (!options.task || !owned) signal('SIGTERM');
     cancellations.push(
       schedule(
         () => signal('SIGKILL'),
@@ -351,9 +375,15 @@ function startTranscript<T>(
         : Math.max(0, options.timeoutMs - (now() - started)),
     ),
   );
-  options.onGroup?.(group);
-  advance();
-  if (options.closeInput) child.stdin.end();
+  try {
+    options.onGroup?.(group);
+    owned = true;
+    advance();
+    if (options.closeInput) child.stdin.end();
+  } catch {
+    // Ownership must persist before input. The installed handlers still own failed cleanup.
+    stop('protocol');
+  }
   return { group, result, stop: () => stop('stopped') };
 }
 
@@ -404,6 +434,7 @@ function nativeSession<T>(
     task?: boolean;
     onSubmitted?: () => void;
     disableMcpServers?: boolean;
+    lifecycle?: NativeLifecycle;
   },
   createReader: (remainingMs: number) => NativeTranscript<T>,
 ) {
@@ -419,12 +450,26 @@ function nativeSession<T>(
   const deadline = started + options.timeoutMs;
   let stopped = false;
   const groups: number[] = [];
-  const onGroup = (group: number) => groups.push(group);
+  let sequence = 0;
+  const phase = (kind: NativePhase['kind']) => {
+    if (stopped) throw new Error('Native session was stopped before its next phase.');
+    const identity = Object.freeze({ sequence: sequence++, kind });
+    synchronous(options.lifecycle?.beforePhase(identity));
+    if (stopped) throw new Error('Native session was stopped before its next phase.');
+    return {
+      onGroup: (group: number) => {
+        groups.push(group);
+        synchronous(options.lifecycle?.owned(identity, group));
+        if (stopped) throw new Error('Native session was stopped before protocol input.');
+      },
+      onQuiescent: (group: number) => synchronous(options.lifecycle?.quiescent(identity, group)),
+    };
+  };
   const preflight = startTranscript(launch, {
     ...options,
     now,
     reader: new FeatureList(),
-    onGroup,
+    ...phase('effective-features'),
     ...(options.task ? { deadline } : {}),
     closeInput: true,
     arguments: (directory) => [
@@ -447,7 +492,7 @@ function nativeSession<T>(
           now,
           timeoutMs: Math.min(60_000, remaining),
           deadline: Math.min(deadline, now() + 60_000),
-          onGroup,
+          ...phase('metadata-preparation'),
           reader: new OpenAiDiscovery({
             now,
             timeoutMs: Math.min(60_000, remaining),
@@ -475,7 +520,7 @@ function nativeSession<T>(
         timeoutMs: remaining,
         ...(options.task ? { deadline } : {}),
         reader,
-        onGroup,
+        ...phase('app-server-task'),
         arguments: (directory) => nativeDiscoveryArguments(directory, disabledMcpServers),
       });
       current = discovery;
@@ -484,7 +529,11 @@ function nativeSession<T>(
       return {
         ...outcome,
         metadata: null,
-        reason: options.task && now() >= deadline - 2000 ? 'deadline' : 'launch',
+        reason: stopped
+          ? 'stopped'
+          : options.task && now() >= deadline - 2000
+            ? 'deadline'
+            : 'launch',
       };
     }
   });
@@ -522,6 +571,7 @@ export function startNativeTask<T>(
     spawn?: Spawn;
     onSubmitted: () => void;
     disableMcpServers?: boolean;
+    lifecycle?: NativeLifecycle;
   },
   createReader: (remainingMs: number) => NativeTranscript<T>,
 ) {
