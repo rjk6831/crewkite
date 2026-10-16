@@ -33,6 +33,8 @@ On 16 October 2026, client 0.163.0 on the M5 Mac completed that metadata transcr
 
 The prepared writer requires Pro account metadata with ordinary usage available. It requests `gpt-6.1-sol` at low effort on the default service tier through one thread and one turn. The total deadline is at most 300 seconds, including metadata startup and owned cleanup. The proposal must bind the attempt, literal `net.mjs` path and original content hash to at most 64 KiB of UTF-8 text. A result requires a matching completed turn and quiescent processes. The writer applies no files and registers no route. Its native turn behavior remains unqualified.
 
+One synthetic task was submitted on 16 October 2026. The adapter stopped with a protocol refusal after 20.874 seconds, before returning a replacement proposal. Both owned processes closed and their groups were absent. No files were applied. Live route qualification remains pending.
+
 A live turn can include upstream retries and tool continuations. A turn cap does not establish an inference-request cap. [Included subscription usage can extend into available paid credits](https://learn.chatgpt.com/docs/pricing#credits-overview); an included-only hard limit remains unverified. Reported ordinary usage availability does not enforce that boundary. CrewKite bounds submitted tasks and elapsed time. It cannot count every upstream inference request.
 
 ## Applying a replacement
