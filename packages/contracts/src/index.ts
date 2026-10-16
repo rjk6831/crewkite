@@ -55,16 +55,43 @@ export const RoleNameSchema = z.enum([
   'advisor',
   'overseer',
 ]);
-export const RouteSchema = z.strictObject({
-  id: RouteIdSchema,
-  family: FamilySchema,
-  displayName: label,
-  model: label,
-  effort: z.strictObject({ requested: label, effective: label, supported: z.array(label).max(32) }),
-  billing: z.enum(['included', 'credits', 'local']),
-  qualified: z.boolean(),
-  fake: z.boolean(),
-});
+export const SpeedSchema = z.enum(['normal', 'fast']);
+export const RouteSpeedSchema = z
+  .strictObject({
+    requested: SpeedSchema,
+    effective: SpeedSchema.nullable(),
+    supported: z.array(SpeedSchema).max(2),
+  })
+  .refine(
+    (speed) =>
+      new Set(speed.supported).size === speed.supported.length &&
+      (speed.effective === null || speed.supported.includes(speed.effective)),
+    'Effective speed needs exact route support.',
+  );
+export const RouteSchema = z
+  .strictObject({
+    id: RouteIdSchema,
+    family: FamilySchema,
+    displayName: label,
+    model: label,
+    effort: z.strictObject({
+      requested: label,
+      effective: label,
+      supported: z.array(label).max(32),
+    }),
+    speed: RouteSpeedSchema.optional(),
+    billing: z.enum(['included', 'credits', 'local']),
+    qualified: z.boolean(),
+    fake: z.boolean(),
+  })
+  .refine(
+    (route) =>
+      !route.qualified ||
+      !route.speed ||
+      (route.speed.effective === route.speed.requested &&
+        route.speed.supported.includes(route.speed.requested)),
+    'A qualified speed variant must fulfill its exact requested speed.',
+  );
 export const ObservationSchema = z
   .strictObject({
     routeId: RouteIdSchema,
@@ -100,6 +127,7 @@ export const RoleSchema = z.strictObject({
   routeId: RouteIdSchema,
   pinned: z.boolean(),
   approvedFallbacks: z.array(RouteIdSchema).max(32),
+  selection: z.enum(['ordered', 'reset-aware']).optional(),
 });
 export const EffectSchema = z.strictObject({
   action: z.enum([
@@ -150,6 +178,15 @@ export const ReviewMethodIdSchema = z.enum([
   'second-opinion',
   'round-robin',
 ]);
+export const QualitySchema = z.enum(['quick', 'standard', 'thorough']);
+export function requiredReviewMethodIds(
+  quality: z.infer<typeof QualitySchema>,
+): z.infer<typeof ReviewMethodIdSchema>[] {
+  const methods: z.infer<typeof ReviewMethodIdSchema>[] = ['keep-it-simple'];
+  if (QualitySchema.parse(quality) !== 'quick') methods.push('second-opinion');
+  if (quality === 'thorough') methods.push('challenge-assumptions');
+  return methods;
+}
 export const ReviewMethodSchema = z.strictObject({
   id: ReviewMethodIdSchema,
   cycles: z.number().int().min(1).max(3),
@@ -165,7 +202,7 @@ const reviewMethods = z
 
 export const PolicySchema = z.strictObject({
   authority: z.enum(['guided', 'balanced', 'autopilot']),
-  quality: z.enum(['quick', 'standard', 'thorough']),
+  quality: QualitySchema,
   effects: z.array(GrantSchema).max(100),
   limits: LimitsSchema,
   reserves: z.array(ReserveSchema).max(100),
@@ -502,8 +539,57 @@ export const ChangeFileSchema = z.strictObject({
   additions: RevisionSchema,
   deletions: RevisionSchema,
 });
+export const SourceFileDetailSchema = z
+  .strictObject({
+    path: text.refine(
+      (path) =>
+        !path.startsWith('/') &&
+        !/^[a-z]:/i.test(path) &&
+        !path.includes('\\') &&
+        !path.includes('\0') &&
+        !path
+          .split('/')
+          .some((part) => !part || part === '.' || part === '..' || part.toLowerCase() === '.git'),
+      'Source detail needs a relative repository path.',
+    ),
+    status: z.enum(['added', 'modified', 'deleted', 'type-changed', 'unmerged', 'untracked']),
+    staged: z.boolean(),
+    unstaged: z.boolean(),
+  })
+  .refine(
+    (file) =>
+      file.status === 'untracked' ? !file.staged && file.unstaged : file.staged || file.unstaged,
+    'Source status must describe a changed file.',
+  );
+export const SourceDetailsSchema = z
+  .strictObject({
+    files: z.array(SourceFileDetailSchema).max(200),
+    omittedDirty: RevisionSchema,
+    omittedUntracked: RevisionSchema,
+  })
+  .refine(
+    (details) => new TextEncoder().encode(JSON.stringify(details)).byteLength <= 65_536,
+    'Source details exceed the encoded byte limit.',
+  );
+const sourceInspection = z
+  .strictObject({
+    kind: z.literal('source'),
+    source: SourceSchema,
+    details: SourceDetailsSchema.optional(),
+  })
+  .refine(
+    ({ source, details }) =>
+      !details ||
+      (details.files.filter((file) => file.status !== 'untracked').length + details.omittedDirty ===
+        source.dirtyCount &&
+        details.files.filter((file) => file.status === 'untracked').length +
+          details.omittedUntracked ===
+          source.untrackedCount &&
+        new Set(details.files.map((file) => file.path)).size === details.files.length),
+    'Source details must match the full counts without repeated paths.',
+  );
 export const ReadDataSchema = z.discriminatedUnion('kind', [
-  z.strictObject({ kind: z.literal('source'), source: SourceSchema }),
+  sourceInspection,
   z.strictObject({ kind: z.literal('snapshot'), snapshot: SnapshotSchema }),
   z.strictObject({
     kind: z.literal('changes'),
@@ -706,3 +792,6 @@ export type Guidance = z.infer<typeof GuidanceSchema>;
 export type ReviewMethod = z.infer<typeof ReviewMethodSchema>;
 export type ReviewJob = z.infer<typeof ReviewJobSchema>;
 export type ReviewResult = z.infer<typeof ReviewResultSchema>;
+
+export type SourceDetails = z.infer<typeof SourceDetailsSchema>;
+export type SourceFileDetail = z.infer<typeof SourceFileDetailSchema>;
