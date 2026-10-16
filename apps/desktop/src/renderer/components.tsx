@@ -1,4 +1,5 @@
-import type { Effect, Route, Run, SourceDetails, Task } from '@crewkite/contracts';
+import type { Effect, Route, Run, Snapshot, SourceDetails, Task } from '@crewkite/contracts';
+import { parseReviewTarget } from '@crewkite/contracts';
 import { Check, GitBranch, Info, X } from 'lucide-react';
 import { type KeyboardEvent, type ReactNode, useEffect, useId, useRef } from 'react';
 
@@ -9,6 +10,12 @@ export const familyClass = (family: string) => `family-${family}`;
 export const short = (value: string) => value.slice(0, 10);
 export const titleCase = (value: string) =>
   value[0].toUpperCase() + value.slice(1).replaceAll('_', ' ');
+export function duration(milliseconds: number) {
+  const minutes = Math.max(0, Math.ceil(milliseconds / 60000));
+  if (minutes >= 1440) return `${Math.round(minutes / 1440)} days`;
+  if (minutes >= 60) return `${Math.round(minutes / 60)} hours`;
+  return `${minutes} min`;
+}
 
 export const methodName = (id: string) =>
   ({
@@ -30,8 +37,8 @@ export const actionName = (action: Effect['action']) =>
 
 export function effectTarget(effect: Effect, task: Task, projectName?: string) {
   if (effect.action === 'run-review') {
-    const review = /^([^/]+)\/cycle-([1-3])$/.exec(effect.target);
-    return review ? `${methodName(review[1])} · round ${review[2]}` : 'Named review';
+    const review = parseReviewTarget(effect.target);
+    return review ? `${methodName(review.methodId)} · round ${review.cycle}` : 'Named review';
   }
   if (effect.action === 'export-patch') return `Patch for ${task.title}`;
   if (effect.action === 'run-check') return `Checks for ${task.title}`;
@@ -204,7 +211,15 @@ export function CurrentCheckoutChanges({
     </details>
   );
 }
-export function RouterCard({ run, routes }: { run: Run; routes: Route[] }) {
+export function RouterCard({
+  run,
+  routes,
+  usage,
+}: {
+  run: Run;
+  routes: Route[];
+  usage: Snapshot['usage'];
+}) {
   const chosen = routes.find(({ id }) => id === run.decision.chosen);
   return (
     <section className="card router-card">
@@ -241,10 +256,45 @@ export function RouterCard({ run, routes }: { run: Run; routes: Route[] }) {
               <span>
                 {familyName(routes.find(({ id }) => id === routeId)?.family ?? short(routeId))}
               </span>
-              <p>{reason}</p>
+              <div>
+                <p>{reason}</p>
+                {usage.filter(({ observation }) => observation.routeId === routeId).length ? (
+                  usage
+                    .filter(({ observation }) => observation.routeId === routeId)
+                    .map(({ observation, state }) => {
+                      const age = Date.now() - Date.parse(observation.observedAt);
+                      return (
+                        <p className="muted small" key={observation.windowId}>
+                          {observation.windowId} · {observation.source} · {state} ·{' '}
+                          <time
+                            dateTime={observation.observedAt}
+                            title={new Date(observation.observedAt).toLocaleString()}
+                          >
+                            {age < 0 ? 'future timestamp' : `${duration(age)} ago`}
+                          </time>
+                        </p>
+                      );
+                    })
+                ) : (
+                  <p className="muted small">No current usage observation is available.</p>
+                )}
+              </div>
             </div>
           ))}
         </div>
+      )}
+      <p className="muted small">
+        Decision saved for this run. Observations shown are current reports.
+      </p>
+      {!run.decision.chosen && (
+        <details className="technical-details">
+          <summary>Usage options</summary>
+          <p>
+            For a never-started draft, choose Edit configuration, then Policy &gt; Unknown usage:
+            Wait for fresh observations, Limit unknown usage to 1 launch and 5 min, or Allow
+            selected routes within run limits. Scripted observations do not refresh automatically.
+          </p>
+        </details>
       )}
     </section>
   );

@@ -7,7 +7,7 @@ import type {
   Task,
   Window as UsageWindow,
 } from '@crewkite/contracts';
-import { ProjectSchema } from '@crewkite/contracts';
+import { ProjectSchema, requiredReviewMethodIds } from '@crewkite/contracts';
 import { createDemoFixtures } from '@crewkite/testkit';
 import {
   Activity,
@@ -47,6 +47,7 @@ import inverseWordmark from './assets/crewkite-wordmark-inverse.png';
 import {
   actionName,
   Dialog,
+  duration,
   effectTarget,
   Fact,
   familyClass,
@@ -72,13 +73,6 @@ const roleNames: Role['role'][] = [
   'advisor',
   'overseer',
 ];
-function duration(milliseconds: number) {
-  const minutes = Math.max(0, Math.ceil(milliseconds / 60000));
-  if (minutes >= 1440) return `${Math.round(minutes / 1440)} days`;
-  if (minutes >= 60) return `${Math.round(minutes / 60)} hours`;
-  return `${minutes} min`;
-}
-
 function RouteSwitch({
   task,
   run,
@@ -1034,7 +1028,7 @@ function Plan({
       {run ? (
         <>
           <SourceFacts source={run.source} />
-          <RouterCard run={run} routes={snapshot.routes} />
+          <RouterCard run={run} routes={snapshot.routes} usage={snapshot.usage} />
           <section className="card">
             <h2>Run controls</h2>
             <div className="facts-grid">
@@ -1417,13 +1411,25 @@ function Checks({
                     </div>
                     <p>{result.summary}</p>
                     <p className="muted small">
-                      Separate review invocation. Model diversity not established.
+                      {result.job.writerRouteId === undefined
+                        ? 'Last writer route unknown for this saved review.'
+                        : result.job.writerRouteId === result.job.routeId
+                          ? 'Same route as the last writer. Separate review invocation.'
+                          : 'Different route from the last writer.'}{' '}
+                      Model diversity is not established.
                     </p>
                     <div className="review-identity">
                       <span>Round {result.job.cycle}</span>
                       <span>{route ? familyName(route.family) : 'Unavailable route'}</span>
                       <code>{short(result.job.candidateHash)}</code>
                     </div>
+                    {result.job.writerAttemptId && result.job.writerRouteId && (
+                      <details className="technical-details">
+                        <summary>Details</summary>
+                        <code>Last writer attempt {result.job.writerAttemptId}</code>
+                        <code>Last writer route {result.job.writerRouteId}</code>
+                      </details>
+                    )}
                     <ul>
                       {result.findings.map((finding) => (
                         <li key={`${finding.severity}-${finding.message}`}>
@@ -1437,9 +1443,14 @@ function Checks({
           </div>
         ) : (
           <p className="muted">
-            No scripted review evidence is recorded for this candidate. Quick work can omit
-            independent review. Standard requires Second opinion and Keep it simple; Thorough also
-            requires Challenge assumptions.
+            No scripted review evidence is recorded for this candidate. New runs require{' '}
+            {(['quick', 'standard', 'thorough'] as const)
+              .map(
+                (quality) =>
+                  `${titleCase(quality)}: ${requiredReviewMethodIds(quality).map(methodName).join(', ')}`,
+              )
+              .join('; ')}
+            . Existing runs keep their saved requirements.
           </p>
         )}
         <p className="muted small">

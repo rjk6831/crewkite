@@ -1,4 +1,5 @@
 import {
+  formatReviewTarget,
   type Guidance,
   type Policy,
   PolicySchema,
@@ -94,8 +95,11 @@ export function Launch({
   const project = snapshot.projects.find(({ id }) => id === task.projectId);
   const qualified = snapshot.routes.filter(({ qualified }) => qualified);
   const find = (family: string) => qualified.find((route) => route.family === family)?.id;
-  const builder = find('anthropic') ?? qualified[0]?.id;
-  const reviewer = find('openai');
+  const executable = qualified.filter(({ fake }) => fake);
+  const builder = executable.find(({ family }) => family === 'anthropic')?.id ?? executable[0]?.id;
+  const reviewer =
+    executable.find(({ id }) => id !== builder)?.id ??
+    executable.find(({ id }) => id === builder)?.id;
   const [team, setTeam] = useState<string>('Formation');
   const [section, setSection] = useState<'Team' | 'Policy' | 'Methods'>('Team');
   const [roles, setRoles] = useState<Role[]>(
@@ -106,7 +110,7 @@ export function Launch({
             selection: 'ordered',
             routeId: builder,
             pinned: false,
-            approvedFallbacks: reviewer ? [reviewer] : [],
+            approvedFallbacks: reviewer && reviewer !== builder ? [reviewer] : [],
           },
           ...(reviewer
             ? [
@@ -271,7 +275,7 @@ export function Launch({
               selection: 'ordered',
               routeId: builder,
               pinned: false,
-              approvedFallbacks: reviewer ? [reviewer] : [],
+              approvedFallbacks: reviewer && reviewer !== builder ? [reviewer] : [],
             },
           ]
         : [];
@@ -353,9 +357,11 @@ export function Launch({
     setCustomGates(true);
     setReviewGates(
       Object.fromEntries(
-        value.gates
-          .filter((gate) => gate.methodId && gate.cycle)
-          .map((gate) => [`${gate.methodId}/cycle-${gate.cycle}`, gate.mode]),
+        value.gates.flatMap((gate) =>
+          gate.methodId !== undefined && gate.cycle !== undefined
+            ? [[formatReviewTarget({ methodId: gate.methodId, cycle: gate.cycle }), gate.mode]]
+            : [],
+        ),
       ),
     );
     setMethods(plan.methods ?? []);
@@ -391,7 +397,7 @@ export function Launch({
       ...base,
       ...resolvedMethods.flatMap((method) =>
         Array.from({ length: method.cycles }, (_, index) => {
-          const target = `${method.id}/cycle-${index + 1}`;
+          const target = formatReviewTarget({ methodId: method.id, cycle: index + 1 });
           return {
             action: 'run-review' as const,
             target,
@@ -418,7 +424,7 @@ export function Launch({
       Object.fromEntries(
         resolvedMethods.flatMap((method) =>
           Array.from({ length: method.cycles }, (_, index) => [
-            `${method.id}/cycle-${index + 1}`,
+            formatReviewTarget({ methodId: method.id, cycle: index + 1 }),
             authority === 'autopilot' ? 'once' : 'ask',
           ]),
         ),
@@ -600,7 +606,7 @@ export function Launch({
               </p>
             )}
             <SourceFacts source={prepared.source} />
-            <RouterCard run={prepared} routes={snapshot.routes} />
+            <RouterCard run={prepared} routes={snapshot.routes} usage={snapshot.usage} />
             {!prepared.decision.chosen && canEditPrepared && (
               <p className="notice">
                 <Info size={14} />
@@ -1544,6 +1550,13 @@ export function Launch({
                                 ? `${familyName(route.family)} · ${route.model} · ${route.effort.effective} effort`
                                 : 'Assign this role in Team before resolving.'}
                             </p>
+                            {route && (
+                              <p className="muted small">
+                                {route.id === roles.find(({ role }) => role === 'coder')?.routeId
+                                  ? 'This role uses the Builder route in a separate review invocation.'
+                                  : 'This role uses a separate route. Model diversity is not established.'}
+                              </p>
+                            )}
                           </>
                         )}
                       </section>
@@ -1650,7 +1663,9 @@ export function Launch({
         ) : (
           <>
             <span className="muted small">
-              Source, routes and permissions resolve before launch.
+              Minimum {minimumAttempts} attempts · Configured {policy.limits.attempts}.
+              <br />
+              Review rounds share this limit.
             </span>
             <button
               type="button"
