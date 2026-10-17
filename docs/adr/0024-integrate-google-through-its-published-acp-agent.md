@@ -32,6 +32,5 @@ This costs another identity pin, explicit setup and an unavailable writer while 
 I keep provider-policy assessment and technical client qualification in release engineering. Product acceptance exercises the workflow, controls and retained results.
 
 - This proposal awaits my acceptance. Accepted ADRs 0005, 0009 and 0012 remain unchanged.
-- Editor documentation leaves CrewKite's orchestrator eligibility unresolved. The interface keeps that limit visible.
-- Offline protocol and controller fixtures establish mechanics only. Exact client, authentication, permission, billing, Stop and installed recovery still need their own qualification.
+- Offline protocol and controller fixtures establish mechanics only.
 - A changed client or account invalidates affected evidence. Earlier CLI pilots and context-only exchanges grant no automatic launch authority.
