@@ -266,7 +266,17 @@ export class RepositoryTranscript {
           modelProvider: 'openai',
           sandbox: 'workspace-write',
           ephemeral: true,
-          config: { model_reasoning_effort: this.plan.effort },
+          config: {
+            model_reasoning_effort: this.plan.effort,
+            // Missing scratch dependencies must fail before pnpm tries an implicit install.
+            shell_environment_policy: {
+              set: {
+                PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN: 'error',
+                PNPM_CONFIG_OFFLINE: 'true',
+                COREPACK_ENABLE_NETWORK: '0',
+              },
+            },
+          },
         },
       });
     if (this.step !== 'turn') this.refuse();

@@ -1166,6 +1166,13 @@ test('native proposals and reviews require one matching completed turn and bound
     assert.equal(threadRequest.params.cwd, repositoryInput.scratchPath);
     assert.equal(threadRequest.params.sandbox, 'workspace-write');
     assert.equal(threadRequest.params.approvalPolicy, 'never');
+    assert.deepEqual(threadRequest.params.config.shell_environment_policy, {
+      set: {
+        PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN: 'error',
+        PNPM_CONFIG_OFFLINE: 'true',
+        COREPACK_ENABLE_NETWORK: '0',
+      },
+    });
     const thread = {
       ...threadResult(repositoryInput.scratchPath),
       approvalPolicy: 'never',
