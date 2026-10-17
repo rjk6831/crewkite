@@ -17,6 +17,7 @@ import {
   AttemptIdSchema,
   HashSchema,
   NativeTargetPathSchema,
+  type Observation,
   SealedHandoffPacketSchema,
 } from '@crewkite/contracts';
 import { verifyHandoff } from '@crewkite/contracts/hash';
@@ -213,52 +214,160 @@ const status = z.strictObject({
   compact_output_chars: metadataNumber.int().optional(),
 });
 const rateLimitStatus = z.enum(['allowed', 'allowed_warning', 'rejected']);
+const rateLimitInfo = z.object({
+  status: rateLimitStatus,
+  resetsAt: metadataNumber.optional(),
+  rateLimitType: z
+    .enum([
+      'five_hour',
+      'seven_day',
+      'seven_day_opus',
+      'seven_day_sonnet',
+      'seven_day_overage_included',
+      'overage',
+    ])
+    .optional(),
+  utilization: metadataNumber.optional(),
+  overageStatus: rateLimitStatus.optional(),
+  overageResetsAt: metadataNumber.optional(),
+  overageDisabledReason: z
+    .enum([
+      'overage_not_provisioned',
+      'org_level_disabled',
+      'org_level_disabled_until',
+      'out_of_credits',
+      'seat_tier_level_disabled',
+      'member_level_disabled',
+      'seat_tier_zero_credit_limit',
+      'group_zero_credit_limit',
+      'member_zero_credit_limit',
+      'org_service_level_disabled',
+      'no_limits_configured',
+      'fetch_error',
+      'unknown',
+    ])
+    .optional(),
+  isUsingOverage: z.boolean().optional(),
+  overageInUse: z.boolean().optional(),
+  overageEnabled: z.boolean().optional(),
+  surpassedThreshold: metadataNumber.optional(),
+  limitScope: z.enum(['service', 'channel', 'group_pool']).optional(),
+  errorCode: z.literal('credits_required').optional(),
+  canUserPurchaseCredits: z.boolean().optional(),
+  hasChargeableSavedPaymentMethod: z.boolean().optional(),
+});
 const rateLimit = identity.extend({
   type: z.literal('rate_limit_event'),
   uuid: z.uuid(),
-  rate_limit_info: z.object({
-    status: rateLimitStatus,
-    resetsAt: metadataNumber.optional(),
-    rateLimitType: z
-      .enum([
-        'five_hour',
-        'seven_day',
-        'seven_day_opus',
-        'seven_day_sonnet',
-        'seven_day_overage_included',
-        'overage',
-      ])
+  rate_limit_info: rateLimitInfo,
+});
+
+// Client 2.1.302 reports utilization as the used fraction of a window, above 1 once usage runs
+// past the cap. Reset times are Unix seconds. The five-hour and weekly lengths are documented
+// account windows. The Opus, Sonnet and overage-included buckets are per-model limits with no
+// documented length, so they carry model scope only.
+const usageWindows = {
+  five_hour: { kind: 'rolling', semantics: { scope: 'provider', periodSeconds: 18_000 } },
+  seven_day: { kind: 'weekly', semantics: { scope: 'provider', periodSeconds: 604_800 } },
+  seven_day_opus: { kind: 'model', semantics: { scope: 'model' } },
+  seven_day_sonnet: { kind: 'model', semantics: { scope: 'model' } },
+  seven_day_overage_included: { kind: 'model', semantics: { scope: 'model' } },
+} as const satisfies Record<string, Pick<Observation, 'kind' | 'semantics'>>;
+// The last Unix second that still prints as a four-digit-year ISO timestamp.
+const epochSeconds = z.number().int().nonnegative().max(253_402_300_799);
+// Usage can run past the cap, but a reading above twice the cap is not plausible from this
+// client. It stays missing and never reads as an exhausted window.
+const MAXIMUM_UTILIZATION = 2;
+const usageReading = z.object({ utilization: metadataNumber, resetsAt: epochSeconds });
+// The pinned client adds per-response readings for up to three windows on each event.
+const usageEvent = rateLimit.extend({
+  rate_limit_info: rateLimitInfo.extend({
+    unifiedWindows: z
+      .object({
+        five_hour: usageReading.optional(),
+        seven_day: usageReading.optional(),
+        seven_day_overage_included: usageReading.optional(),
+      })
       .optional(),
-    utilization: metadataNumber.optional(),
-    overageStatus: rateLimitStatus.optional(),
-    overageResetsAt: metadataNumber.optional(),
-    overageDisabledReason: z
-      .enum([
-        'overage_not_provisioned',
-        'org_level_disabled',
-        'org_level_disabled_until',
-        'out_of_credits',
-        'seat_tier_level_disabled',
-        'member_level_disabled',
-        'seat_tier_zero_credit_limit',
-        'group_zero_credit_limit',
-        'member_zero_credit_limit',
-        'org_service_level_disabled',
-        'no_limits_configured',
-        'fetch_error',
-        'unknown',
-      ])
-      .optional(),
-    isUsingOverage: z.boolean().optional(),
-    overageInUse: z.boolean().optional(),
-    overageEnabled: z.boolean().optional(),
-    surpassedThreshold: metadataNumber.optional(),
-    limitScope: z.enum(['service', 'channel', 'group_pool']).optional(),
-    errorCode: z.literal('credits_required').optional(),
-    canUserPurchaseCredits: z.boolean().optional(),
-    hasChargeableSavedPaymentMethod: z.boolean().optional(),
   }),
 });
+export type AnthropicUsageWindow = Readonly<{
+  windowId: keyof typeof usageWindows;
+  kind: Observation['kind'];
+  semantics: NonNullable<Observation['semantics']>;
+  remainingPercent: number;
+  resetsAt: string | null;
+}>;
+export type AnthropicUsage = Readonly<{
+  windows: readonly AnthropicUsageWindow[];
+  // Usage credits are billed money. They never become an included subscription window.
+  paid: Readonly<{ inUse: boolean; usedPercent: number | null; resetsAt: string | null }> | null;
+}>;
+const unixTime = (seconds: number | undefined) => {
+  const parsed = epochSeconds.safeParse(seconds);
+  return parsed.success ? new Date(parsed.data * 1000).toISOString() : null;
+};
+
+/** Map one rate_limit_event to the windows it reports. A window it omits stays unreported. */
+export function projectAnthropicUsage(event: unknown): AnthropicUsage {
+  const parsed = usageEvent.safeParse(event);
+  if (!parsed.success) throw new ReplacementError('protocol');
+  const info = parsed.data.rate_limit_info;
+  const type = info.rateLimitType;
+  const readings = new Map<keyof typeof usageWindows, { utilization: number; resetsAt?: number }>();
+  if (info.unifiedWindows) {
+    for (const windowId of ['five_hour', 'seven_day', 'seven_day_overage_included'] as const) {
+      const reading = info.unifiedWindows[windowId];
+      if (reading) readings.set(windowId, reading);
+    }
+  } else if (type && type !== 'overage' && info.utilization !== undefined) {
+    // The top-level fields name the window closest to its limit and can repeat a reading held
+    // since an earlier response. They count only when the event has no per-response readings.
+    if (info.resetsAt !== undefined && unixTime(info.resetsAt) === null)
+      throw new ReplacementError('protocol');
+    readings.set(type, { utilization: info.utilization, resetsAt: info.resetsAt });
+  }
+  const inUse = info.isUsingOverage === true || info.overageInUse === true;
+  return {
+    windows: [...readings]
+      .filter(([, reading]) => reading.utilization <= MAXIMUM_UTILIZATION)
+      .map(([windowId, reading]) => ({
+        windowId,
+        ...usageWindows[windowId],
+        remainingPercent: Math.max(0, (10_000 - Math.round(reading.utilization * 10_000)) / 100),
+        resetsAt: unixTime(reading.resetsAt),
+      })),
+    // A paid reading never decides whether the included windows count.
+    paid:
+      type === 'overage' || inUse
+        ? {
+            inUse,
+            usedPercent:
+              type === 'overage' && info.utilization !== undefined
+                ? Math.round(info.utilization * 10_000) / 100
+                : null,
+            resetsAt: unixTime(type === 'overage' ? info.resetsAt : info.overageResetsAt),
+          }
+        : null,
+  };
+}
+
+/** The receiver supplies the receive time. Nothing in the event can set or move it. */
+export function anthropicUsageObservations(
+  windows: AnthropicUsage['windows'],
+  observedAt: string,
+): Omit<Observation, 'routeId'>[] {
+  return windows.map((window) => ({
+    windowId: window.windowId,
+    kind: window.kind,
+    semantics: window.semantics,
+    remaining: { value: window.remainingPercent, unit: 'percent' as const },
+    resetsAt: window.resetsAt,
+    observedAt,
+    source: 'client' as const,
+    confidence: 'reported' as const,
+  }));
+}
 const envelopes = [
   'system',
   'assistant',
@@ -412,9 +521,33 @@ export class ReplacementStream {
   private envelope: ReplacementDiagnostic['envelope'] = 'none';
   private subtype: ReplacementDiagnostic['subtype'] = null;
   private failure: ReplacementDiagnostic | null = null;
+  private readonly usage = new Map<string, string>();
   private readonly plan: WriterPlan;
-  constructor(plan: WriterPlan) {
+  private readonly onUsage: ((usage: AnthropicUsage) => void) | undefined;
+  constructor(plan: WriterPlan, onUsage?: (usage: AnthropicUsage) => void) {
     this.plan = replacementPlan(plan.input);
+    this.onUsage = onUsage;
+  }
+  // One client process sends a window again, unchanged, when its status or another window
+  // moves, and an event without per-response readings can repeat one held since an earlier
+  // response. A reading counts as new only when its whole percent or its reset moves, so a
+  // receiver that stamps each arrival never restamps a re-sent reading. Each call carries at
+  // least one new window.
+  private observeUsage(event: unknown) {
+    if (!this.onUsage) return;
+    const key = (window: AnthropicUsageWindow) =>
+      `${Math.round(window.remainingPercent)}@${window.resetsAt}`;
+    try {
+      const usage = projectAnthropicUsage(event);
+      const windows = usage.windows.filter(
+        (window) => this.usage.get(window.windowId) !== key(window),
+      );
+      if (!windows.length) return;
+      this.onUsage({ windows, paid: usage.paid });
+      for (const window of windows) this.usage.set(window.windowId, key(window));
+    } catch {
+      // Usage is advisory. A malformed reading or a failed sink leaves the task as it was.
+    }
   }
   private fail(
     reason: Failure,
@@ -477,6 +610,7 @@ export class ReplacementStream {
           this.site = 'rate-limit';
           // Subscription metadata grants no permission, billing or replacement authority.
           const info = rateLimit.parse(value).rate_limit_info;
+          this.observeUsage(value);
           if (
             info.isUsingOverage === true ||
             info.overageInUse === true ||
@@ -560,6 +694,7 @@ export function startReplacement(
     spawn?: Spawn;
     lifecycle?: NativeLifecycle;
     onSubmitted?: () => void;
+    onUsage?: (usage: AnthropicUsage) => void;
   } = {},
 ) {
   const now = options.now ?? (() => performance.now());
@@ -654,7 +789,7 @@ export function startReplacement(
   } catch {
     throw new ReplacementError('storage');
   }
-  const reader = new ReplacementStream(plan);
+  const reader = new ReplacementStream(plan, options.onUsage);
   if (remaining() <= CLEANUP_MS) throw new ReplacementError('deadline');
   try {
     nativeSynchronousHook(() => options.lifecycle?.beforePhase('task'));

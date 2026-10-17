@@ -70,6 +70,27 @@ const rateLimit = {
   uuid: '46eb17cd-01e8-480d-99f4-a741f189715f',
   rate_limit_info: { status: 'allowed', resetsAt: 123, utilization: 0.5 },
 };
+const usageEvent = (info: Record<string, unknown>) => ({
+  ...rateLimit,
+  rate_limit_info: { status: 'allowed', ...info },
+});
+const reading = (utilization: number, resetsAt: number) => ({ utilization, resetsAt });
+const fiveHourReset = 1_792_000_000;
+const weeklyReset = 1_792_500_000;
+const fiveHour = (remainingPercent: number) => ({
+  windowId: 'five_hour',
+  kind: 'rolling',
+  semantics: { scope: 'provider', periodSeconds: 18_000 },
+  remainingPercent,
+  resetsAt: '2026-10-14T17:46:40.000Z',
+});
+const sevenDay = (remainingPercent: number) => ({
+  windowId: 'seven_day',
+  kind: 'weekly',
+  semantics: { scope: 'provider', periodSeconds: 604_800 },
+  remainingPercent,
+  resetsAt: '2026-10-20T12:40:00.000Z',
+});
 
 test('native text replacement stays bound to one proposal and owned task deadline', async () => {
   const policy = {
@@ -207,6 +228,8 @@ test('native text replacement stays bound to one proposal and owned task deadlin
     pluginsEmpty?: boolean;
     retries?: number;
     diagnostic?: Record<string, unknown>;
+    usage?: unknown[];
+    failingHook?: boolean;
   }> = [
     { name: 'valid', frames: [init, result], pass: true },
     { name: 'request status is progress only', frames: [init, status, result], pass: true },
@@ -390,6 +413,78 @@ test('native text replacement stays bound to one proposal and owned task deadlin
         result,
       ],
       diagnostic: { site: 'rate-limit', cause: 'unsupported', field: 'rate_limit_info' },
+    },
+    {
+      name: 'a window reading reaches the usage hook once per process',
+      frames: [
+        init,
+        usageEvent({
+          unifiedWindows: {
+            five_hour: reading(0.25, fiveHourReset),
+            seven_day: reading(0.5, weeklyReset),
+          },
+        }),
+        // A status change sends both readings again, unchanged.
+        usageEvent({
+          status: 'allowed_warning',
+          rateLimitType: 'seven_day',
+          utilization: 0.5,
+          resetsAt: weeklyReset,
+          unifiedWindows: {
+            five_hour: reading(0.25, fiveHourReset),
+            seven_day: reading(0.5, weeklyReset),
+          },
+        }),
+        // The weekly reading rides along within the same whole percent.
+        usageEvent({
+          unifiedWindows: {
+            five_hour: reading(0.5, fiveHourReset),
+            seven_day: reading(0.5004, weeklyReset),
+          },
+        }),
+        // A top-level reading held since an earlier response.
+        usageEvent({
+          status: 'allowed_warning',
+          rateLimitType: 'five_hour',
+          utilization: 0.5004,
+          resetsAt: fiveHourReset,
+        }),
+        result,
+      ],
+      pass: true,
+      usage: [
+        { windows: [fiveHour(75), sevenDay(50)], paid: null },
+        { windows: [fiveHour(50)], paid: null },
+      ],
+    },
+    {
+      name: 'a malformed usage reading adds nothing and the task continues',
+      frames: [init, usageEvent({ unifiedWindows: { five_hour: reading(0.25, 1.5) } }), result],
+      pass: true,
+    },
+    {
+      name: 'a failing usage hook leaves the task unchanged',
+      frames: [
+        init,
+        usageEvent({ unifiedWindows: { five_hour: reading(0.25, fiveHourReset) } }),
+        result,
+      ],
+      pass: true,
+      failingHook: true,
+      usage: [{ windows: [fiveHour(75)], paid: null }],
+    },
+    {
+      name: 'included readings beside paid credits reach the hook and the refusal stands',
+      frames: [
+        init,
+        usageEvent({
+          isUsingOverage: true,
+          unifiedWindows: { five_hour: reading(1, fiveHourReset) },
+        }),
+        result,
+      ],
+      diagnostic: { site: 'rate-limit', cause: 'unsupported', field: 'rate_limit_info' },
+      usage: [{ windows: [fiveHour(0)], paid: { inUse: true, usedPercent: null, resetsAt: null } }],
     },
     { name: 'rate limit metadata needs terminal result', frames: [init, rateLimit] },
     { name: 'rate limit metadata needs init', frames: [rateLimit, result] },
@@ -575,7 +670,11 @@ test('native text replacement stays bound to one proposal and owned task deadlin
     { name: 'missing result', frames: [init] },
   ];
   for (const row of cases) {
-    const reader = new ReplacementStream(plan);
+    const reported: unknown[] = [];
+    const reader = new ReplacementStream(plan, (usage) => {
+      reported.push(usage);
+      if (row.failingHook) throw new Error(secret);
+    });
     try {
       for (const frame of row.frames) {
         const bytes = line(frame);
@@ -612,6 +711,7 @@ test('native text replacement stays bound to one proposal and owned task deadlin
         row.name,
       );
     }
+    assert.deepEqual(reported, row.usage ?? [], row.name);
   }
   for (const bytes of [Buffer.from('{'), Buffer.from([0xff, 10]), Buffer.alloc(1048577, 32)]) {
     const reader = new ReplacementStream(plan);
