@@ -1,15 +1,33 @@
 import {
+  CommandIdSchema,
+  type CommandResult,
+  type ConversationContextBundle,
+  type ConversationContextRef,
+  ConversationContextRefsSchema,
   type ConversationEntry,
   type ConversationPlanningSelection,
   ConversationPlanningSelectionSchema,
+  canonicalJson,
+  HashSchema,
+  ProjectIdSchema,
+  RevisionSchema,
   type Snapshot,
   type Task,
   type TaskConversationState,
+  TaskIdSchema,
 } from '@crewkite/contracts';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react';
 import { Dialog, familyName, titleCase } from './components.tsx';
 import { Conversation, type ConversationMessage } from './conversation.tsx';
-import type { DesktopCommand, Workspace } from './source.ts';
+import { ConversationContextCaptureError, type DesktopCommand, type Workspace } from './source.ts';
 import { roleLabels } from './templates.ts';
 
 const applied = (outcome: string) => outcome === 'applied' || outcome === 'already-applied';
@@ -188,6 +206,730 @@ function useConversation(task: Task, workspace: Workspace, visible: boolean) {
   };
 }
 
+type CapturedContext = { ref: ConversationContextRef; bundle: ConversationContextBundle };
+type ContextCaptureReceipt = { receiptId: string; projectId: string; base: string };
+type ContextFact = { hash: string; files: number; bytes: number };
+type ContextDraft = {
+  refs: ConversationContextRef[];
+  facts?: Record<string, ContextFact>;
+  priorSend: boolean;
+  captureReceipt?: ContextCaptureReceipt;
+};
+type ContextSendCommand = Extract<
+  DesktopCommand,
+  { command: 'CreateTaskDiscussion' | 'SendTaskMessage' | 'QueueTaskGuidance' }
+>;
+const contextSendReceipts = new Map<
+  string,
+  { command: ContextSendCommand; submitted: string; refs: ConversationContextRef[] }
+>();
+function captureReceipt(value: unknown): ContextCaptureReceipt | undefined {
+  if (!value || typeof value !== 'object') return;
+  const receiptId = 'receiptId' in value ? CommandIdSchema.safeParse(value.receiptId) : undefined;
+  const projectId = 'projectId' in value ? ProjectIdSchema.safeParse(value.projectId) : undefined;
+  const base = 'base' in value && value.base;
+  if (
+    receiptId?.success &&
+    projectId?.success &&
+    typeof base === 'string' &&
+    /^[a-f0-9]{40}$/.test(base)
+  )
+    return { receiptId: receiptId.data, projectId: projectId.data, base };
+}
+const emptyContextDraft: ContextDraft = { refs: [], priorSend: false };
+const contextDraftKey = 'crewkite-context-drafts-v1';
+let contextDraftStore: { drafts: Record<string, ContextDraft>; error?: string } | undefined;
+const contextDraftListeners = new Set<() => void>();
+function readContextDrafts() {
+  if (contextDraftStore) return contextDraftStore;
+  try {
+    const stored: unknown = JSON.parse(localStorage.getItem(contextDraftKey) ?? '{}');
+    const drafts: Record<string, ContextDraft> = {};
+    if (!stored || typeof stored !== 'object' || Array.isArray(stored))
+      throw new Error('Invalid saved context drafts.');
+    const entries = Object.entries(stored);
+    if (entries.length > 2000) throw new Error('Too many saved context drafts.');
+    for (const [key, value] of entries) {
+      const validKey = key.startsWith('goal:')
+        ? ProjectIdSchema.safeParse(key.slice(5)).success
+        : key.startsWith('task:') && TaskIdSchema.safeParse(key.slice(5)).success;
+      if (!validKey || !value || typeof value !== 'object') continue;
+      const refs =
+        'refs' in value ? ConversationContextRefsSchema.safeParse(value.refs) : undefined;
+      if (!refs?.success) continue;
+      const facts: Record<string, ContextFact> = {};
+      if ('facts' in value && value.facts && typeof value.facts === 'object') {
+        for (const ref of refs.data) {
+          const fact = Object.getOwnPropertyDescriptor(value.facts, ref.artifactId)?.value;
+          if (!fact || typeof fact !== 'object') continue;
+          const hash = HashSchema.safeParse(fact.hash);
+          const files = RevisionSchema.min(1).max(32).safeParse(fact.files);
+          const bytes = RevisionSchema.min(1).max(32768).safeParse(fact.bytes);
+          if (hash.success && hash.data === ref.hash && files.success && bytes.success)
+            facts[ref.artifactId] = { hash: hash.data, files: files.data, bytes: bytes.data };
+        }
+      }
+      drafts[key] = {
+        refs: refs.data,
+        facts,
+        priorSend: 'priorSend' in value && value.priorSend === true,
+        captureReceipt:
+          'captureReceipt' in value ? captureReceipt(value.captureReceipt) : undefined,
+      };
+    }
+    contextDraftStore = { drafts };
+  } catch {
+    contextDraftStore = {
+      drafts: {},
+      error: 'Saved context could not be read. New context stays in this window.',
+    };
+  }
+  return contextDraftStore;
+}
+function writeContextDraft(key: string, update: (draft: ContextDraft) => ContextDraft) {
+  const current = readContextDrafts();
+  const updated = update(current.drafts[key] ?? emptyContextDraft);
+  const next = {
+    ...updated,
+    facts: Object.fromEntries(
+      updated.refs.flatMap((ref) => {
+        const fact = updated.facts?.[ref.artifactId];
+        return fact?.hash === ref.hash ? [[ref.artifactId, fact] as const] : [];
+      }),
+    ),
+  };
+  const drafts = { ...current.drafts, [key]: next };
+  if (!next.refs.length && !next.priorSend && !next.captureReceipt) delete drafts[key];
+  if (Object.keys(drafts).length > 2000)
+    throw new Error('The saved context draft limit was reached.');
+  let error = current.error;
+  try {
+    if (!current.error) localStorage.setItem(contextDraftKey, JSON.stringify(drafts));
+  } catch {
+    error = 'Context stays in this window because saved drafts could not be written.';
+  }
+  contextDraftStore = { drafts, error };
+  for (const listener of contextDraftListeners) listener();
+}
+const subscribeContextDrafts = (listener: () => void) => {
+  contextDraftListeners.add(listener);
+  return () => {
+    contextDraftListeners.delete(listener);
+  };
+};
+const contextBytes = (capture: CapturedContext) =>
+  new TextEncoder().encode(canonicalJson(capture.bundle)).length;
+const sameContext = (left: ConversationContextRef[], right: ConversationContextRef[]) =>
+  canonicalJson(left) === canonicalJson(right);
+function ContextPreview({
+  captures,
+  recipient,
+  text,
+  blocked,
+  onClose,
+  onSend,
+  recovery,
+}: {
+  captures: CapturedContext[];
+  recipient?: string;
+  text?: string;
+  blocked?: string;
+  onClose: () => void;
+  onSend?: () => void;
+  recovery?: ReactNode;
+}) {
+  return (
+    <Dialog
+      title={onSend ? 'Review message and context' : 'Captured context'}
+      onClose={onClose}
+      wide
+    >
+      <div className="launch-content" style={{ maxHeight: '55vh', overflowY: 'auto' }}>
+        {recipient && (
+          <p>
+            <strong>Selected planning recipient</strong>
+            <br />
+            {recipient}
+          </p>
+        )}
+        {text && <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{text}</pre>}
+        {captures.map((capture) => (
+          <section key={capture.ref.artifactId}>
+            <p className="muted small">
+              {capture.bundle.files.length} {capture.bundle.files.length === 1 ? 'file' : 'files'} ·{' '}
+              {contextBytes(capture).toLocaleString()} bytes
+              <br />
+              Base <code>{capture.bundle.base}</code>
+              <br />
+              Capture <code>{capture.ref.hash}</code>
+            </p>
+            {capture.bundle.files.map((file) => (
+              <section key={file.path}>
+                <p>
+                  <code>{file.path}</code> · {file.kind} · {file.bytes.toLocaleString()} bytes
+                </p>
+                <pre
+                  style={{
+                    whiteSpace: 'pre-wrap',
+                    overflowWrap: 'anywhere',
+                    maxHeight: 180,
+                    overflowY: 'auto',
+                  }}
+                >
+                  {file.text}
+                </pre>
+              </section>
+            ))}
+          </section>
+        ))}
+        {onSend && (
+          <p className="muted small">
+            The controller binds these captured bytes to the saved input. Execution permissions keep
+            their own review.
+          </p>
+        )}
+        {blocked && (
+          <p className="notice" role="alert">
+            {blocked}
+          </p>
+        )}
+        {recovery}
+      </div>
+      {onSend && (
+        <div className="dialog-footer">
+          <button
+            className="button primary"
+            type="button"
+            disabled={Boolean(blocked)}
+            onClick={onSend}
+          >
+            Send reviewed message
+          </button>
+        </div>
+      )}
+    </Dialog>
+  );
+}
+
+function withContext(
+  command: ContextSendCommand,
+  refs: ConversationContextRef[],
+): ContextSendCommand {
+  if (!refs.length) return command;
+  switch (command.command) {
+    case 'CreateTaskDiscussion':
+      return { ...command, payload: { ...command.payload, context: refs } };
+    case 'SendTaskMessage':
+      return { ...command, payload: { ...command.payload, context: refs } };
+    case 'QueueTaskGuidance':
+      return { ...command, payload: { ...command.payload, context: refs } };
+  }
+}
+function useContextComposer({
+  draftKey,
+  projectId,
+  sourceBase,
+  scope,
+  recipient,
+  workspace,
+  afterApplied,
+}: {
+  draftKey: string;
+  projectId: string;
+  sourceBase?: string;
+  scope: string;
+  recipient: string;
+  workspace: Workspace;
+  afterApplied: (result: CommandResult, submitted: string) => void;
+}) {
+  const saved = useSyncExternalStore(subscribeContextDrafts, readContextDrafts);
+  const draft = saved.drafts[draftKey] ?? emptyContextDraft;
+  const [cache, setCache] = useState<Record<string, CapturedContext>>({});
+  const cacheRef = useRef(cache);
+  cacheRef.current = cache;
+  const reads = useRef(new Map<string, Promise<CapturedContext>>());
+  const [busy, setBusy] = useState(false);
+  const [sending, setSending] = useState(false);
+  const busyRef = useRef(false);
+  const [error, setError] = useState<string>();
+  const [panel, setPanel] = useState<
+    | { kind: 'choose' }
+    | { kind: 'reading' }
+    | {
+        kind: 'preview';
+        captures: CapturedContext[];
+        scope: string;
+        recipient?: string;
+        command?: ContextSendCommand;
+        submitted?: string;
+      }
+    | null
+  >(null);
+  const latest = useRef({ draftKey, projectId, scope, workspace, afterApplied });
+  latest.current = { draftKey, projectId, scope, workspace, afterApplied };
+  const refSignature = canonicalJson(draft.refs);
+  const panelScope = `${scope}:${refSignature}`;
+  const currentPanelScope = useRef(panelScope);
+  currentPanelScope.current = panelScope;
+  const message = (failure: unknown) =>
+    failure instanceof Error ? failure.message : 'Context could not be prepared.';
+  const readCapture = useCallback(
+    async (ref: ConversationContextRef) => {
+      const existing = cacheRef.current[ref.artifactId];
+      if (existing && existing.ref.hash === ref.hash) {
+        if (existing.bundle.projectId !== projectId)
+          throw new Error('The captured context belongs to another project.');
+        return existing;
+      }
+      const identity = `${ref.artifactId}:${ref.hash}`;
+      const pending = reads.current.get(identity);
+      if (pending)
+        return pending.then((capture) => {
+          if (capture.bundle.projectId !== projectId)
+            throw new Error('The captured context belongs to another project.');
+          return capture;
+        });
+      const expectedProject = projectId;
+      const reading = latest.current.workspace
+        .resolveConversationContext(ref)
+        .then((capture) => {
+          if (
+            capture.ref.artifactId !== ref.artifactId ||
+            capture.ref.hash !== ref.hash ||
+            capture.bundle.projectId !== expectedProject
+          )
+            throw new Error('The captured context does not belong to this project.');
+          setCache((current) =>
+            Object.fromEntries([...Object.entries(current), [ref.artifactId, capture]].slice(-8)),
+          );
+          const currentDraft = readContextDrafts().drafts[latest.current.draftKey];
+          if (
+            latest.current.projectId === expectedProject &&
+            currentDraft?.refs.some(
+              (value) => value.artifactId === ref.artifactId && value.hash === ref.hash,
+            )
+          )
+            writeContextDraft(latest.current.draftKey, (current) => ({
+              ...current,
+              facts: {
+                ...current.facts,
+                [ref.artifactId]: {
+                  hash: ref.hash,
+                  files: capture.bundle.files.length,
+                  bytes: contextBytes(capture),
+                },
+              },
+            }));
+          return capture;
+        })
+        .finally(() => {
+          reads.current.delete(identity);
+        });
+      reads.current.set(identity, reading);
+      return reading;
+    },
+    [projectId],
+  );
+  function finish(result: CommandResult, submitted: string, refs: ConversationContextRef[]) {
+    contextSendReceipts.delete(draftKey);
+    writeContextDraft(draftKey, (current) => ({
+      ...current,
+      refs: sameContext(current.refs, refs) ? [] : current.refs,
+      priorSend: false,
+    }));
+    afterApplied(result, submitted);
+  }
+  async function dispatch(command: ContextSendCommand, submitted: string, retry = false) {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    setSending(true);
+    setError(undefined);
+    const refs = 'context' in command.payload ? (command.payload.context ?? []) : [];
+    const receipt = { command, submitted, refs };
+    contextSendReceipts.set(draftKey, receipt);
+    try {
+      writeContextDraft(draftKey, (current) => ({ ...current, priorSend: true }));
+      const result = retry
+        ? await workspace.retryCommand(command)
+        : await workspace.command(command);
+      if (result && applied(result.outcome)) {
+        finish(result, submitted, refs);
+        if (latest.current.draftKey === draftKey) setPanel(null);
+      } else if (!result || result.outcome === 'outcome-unknown') {
+        setError('The send outcome is unknown. Retry this exact send before changing the message.');
+      } else {
+        contextSendReceipts.delete(draftKey);
+        writeContextDraft(draftKey, (current) => ({ ...current, priorSend: false }));
+        setError([result.reason ?? result.outcome, result.next].filter(Boolean).join(' '));
+      }
+    } catch (failure) {
+      setError(
+        `${message(failure)} The draft and context have been kept. A prior send may have been saved.`,
+      );
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+      setSending(false);
+    }
+  }
+  async function review(command: ContextSendCommand, submitted: string) {
+    if (busyRef.current || draft.priorSend || workspace.pending || workspace.retryAvailable) return;
+    const frozenRefs = draft.refs.map((ref) => ({ ...ref }));
+    const frozenCommand = withContext(command, frozenRefs);
+    if (!frozenRefs.length) return dispatch(frozenCommand, submitted);
+    busyRef.current = true;
+    setBusy(true);
+    setError(undefined);
+    setPanel({ kind: 'reading' });
+    const expectedScope = panelScope;
+    try {
+      const captures: CapturedContext[] = [];
+      for (const ref of frozenRefs) {
+        const capture = await readCapture(ref);
+        if (sourceBase && capture.bundle.base !== sourceBase)
+          throw new Error(
+            'Captured context uses an earlier source base. Remove it and capture again.',
+          );
+        captures.push(capture);
+      }
+      if (captures.some((capture) => capture.bundle.base !== captures[0]?.bundle.base))
+        throw new Error(
+          'Captured context uses different source bases. Remove it and capture again.',
+        );
+      if (latest.current.draftKey === draftKey)
+        setPanel({
+          kind: 'preview',
+          captures,
+          scope: expectedScope,
+          recipient,
+          command: frozenCommand,
+          submitted,
+        });
+    } catch (failure) {
+      if (latest.current.draftKey === draftKey) {
+        setPanel({ kind: 'choose' });
+        setError(message(failure));
+      }
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }
+  async function preview(ref: ConversationContextRef, history = false) {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    setError(undefined);
+    setPanel({ kind: 'reading' });
+    try {
+      const capture = await readCapture(ref);
+      if (latest.current.draftKey === draftKey)
+        setPanel({
+          kind: 'preview',
+          captures: [capture],
+          scope: panelScope,
+          recipient: history ? undefined : recipient,
+        });
+    } catch (failure) {
+      setPanel({ kind: 'choose' });
+      setError(message(failure));
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }
+  async function add(
+    mode: 'source-file' | 'source-folder' | 'log-file',
+    retryReceipt?: ContextCaptureReceipt,
+  ) {
+    if (
+      busyRef.current ||
+      workspace.pending ||
+      draft.priorSend ||
+      (!retryReceipt && workspace.retryAvailable)
+    )
+      return;
+    if (draft.refs.length >= 4) {
+      setError('Keep at most four captured context items in one draft.');
+      return;
+    }
+    busyRef.current = true;
+    setBusy(true);
+    setError(undefined);
+    try {
+      let capture: CapturedContext | null;
+      if (retryReceipt) {
+        if (retryReceipt.projectId !== projectId)
+          throw new Error('The capture receipt belongs to another project.');
+        capture = await workspace.retryConversationContext(retryReceipt);
+      } else {
+        let base = sourceBase;
+        if (!base) {
+          const inspection = await workspace.command({
+            command: 'InspectSource',
+            payload: { projectId },
+          });
+          if (
+            !applied(inspection.outcome) ||
+            inspection.data?.kind !== 'source' ||
+            inspection.data.source.projectId !== projectId
+          )
+            throw new Error(inspection.reason ?? 'The committed source is unavailable.');
+          base = inspection.data.source.base;
+        }
+        if (!/^[a-f0-9]{40}$/.test(base))
+          throw new Error('Context capture needs a supported committed source base.');
+        capture = await workspace.pickConversationContext({ projectId, base, mode });
+      }
+      if (!capture) return;
+      if (capture.bundle.projectId !== projectId)
+        throw new Error('The capture belongs to another project.');
+      writeContextDraft(draftKey, (current) => {
+        if (
+          current.refs.some(
+            (ref) => ref.artifactId === capture.ref.artifactId || ref.hash === capture.ref.hash,
+          )
+        )
+          return {
+            ...current,
+            captureReceipt: undefined,
+            facts: {
+              ...current.facts,
+              [capture.ref.artifactId]: {
+                hash: capture.ref.hash,
+                files: capture.bundle.files.length,
+                bytes: contextBytes(capture),
+              },
+            },
+          };
+        const refs = ConversationContextRefsSchema.parse([...current.refs, capture.ref]);
+        return {
+          ...current,
+          refs,
+          captureReceipt: undefined,
+          facts: {
+            ...current.facts,
+            [capture.ref.artifactId]: {
+              hash: capture.ref.hash,
+              files: capture.bundle.files.length,
+              bytes: contextBytes(capture),
+            },
+          },
+        };
+      });
+      setCache((current) => ({ ...current, [capture.ref.artifactId]: capture }));
+      if (latest.current.draftKey === draftKey)
+        setPanel({ kind: 'preview', captures: [capture], scope: panelScope, recipient });
+    } catch (failure) {
+      if (failure instanceof ConversationContextCaptureError) {
+        const receipt = captureReceipt(failure.receipt);
+        if (receipt?.projectId === projectId)
+          writeContextDraft(draftKey, (current) => ({ ...current, captureReceipt: receipt }));
+      }
+      if (latest.current.draftKey === draftKey) setError(message(failure));
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }
+  const uncertain = draft.priorSend
+    ? 'A prior send may have been saved. Resolve its exact retry, then check the saved conversation. The draft has been kept.'
+    : draft.captureReceipt
+      ? 'The context capture is uncertain. Retry the exact capture before sending.'
+      : undefined;
+  const controlsBlocked =
+    busy ||
+    workspace.pending ||
+    workspace.retryAvailable ||
+    workspace.connection !== 'connected' ||
+    draft.priorSend ||
+    Boolean(draft.captureReceipt);
+  const frozen = panel?.kind === 'preview' && Boolean(panel.command);
+  const changed = frozen && panel.scope !== currentPanelScope.current;
+  const previewBlocked = changed
+    ? 'The recipient, draft context or task changed. Close this preview and review again.'
+    : controlsBlocked
+      ? (uncertain ?? 'Wait for the current request before sending.')
+      : undefined;
+  const recovery = (draft.priorSend || draft.captureReceipt) && (
+    <div style={{ flexShrink: 0, maxHeight: '25%', overflowY: 'auto' }}>
+      {uncertain && (
+        <p className="notice" role="status">
+          {uncertain}
+        </p>
+      )}
+      {draft.priorSend && workspace.retryAvailable && contextSendReceipts.has(draftKey) && (
+        <button
+          className="button secondary"
+          type="button"
+          disabled={busy || workspace.pending || workspace.connection !== 'connected'}
+          onClick={() => {
+            const receipt = contextSendReceipts.get(draftKey);
+            if (receipt) void dispatch(receipt.command, receipt.submitted, true);
+          }}
+        >
+          Retry exact message
+        </button>
+      )}
+      {draft.priorSend && !workspace.retryAvailable && !workspace.pending && (
+        <button
+          className="button secondary"
+          type="button"
+          onClick={() => {
+            contextSendReceipts.delete(draftKey);
+            writeContextDraft(draftKey, (current) => ({ ...current, priorSend: false }));
+            setError(undefined);
+          }}
+        >
+          Keep as a new draft after reviewing history
+        </button>
+      )}
+      {draft.captureReceipt && (
+        <button
+          className="button secondary"
+          type="button"
+          disabled={busy || workspace.pending || workspace.connection !== 'connected'}
+          onClick={() => {
+            setPanel({ kind: 'choose' });
+            void add('source-file', draft.captureReceipt);
+          }}
+        >
+          Retry exact context capture
+        </button>
+      )}
+    </div>
+  );
+  return {
+    refs: draft.refs,
+    busy,
+    sending,
+    error: error ?? saved.error,
+    uncertain,
+    review,
+    openHistory: (ref: ConversationContextRef) => {
+      void preview(ref, true);
+    },
+    composer: {
+      attachments: draft.refs.map((ref, index) => ({
+        id: ref.artifactId,
+        label: draft.facts?.[ref.artifactId]
+          ? `Context ${index + 1} · ${draft.facts[ref.artifactId].files} ${draft.facts[ref.artifactId].files === 1 ? 'file' : 'files'} · ${draft.facts[ref.artifactId].bytes.toLocaleString()} bytes`
+          : `Context ${index + 1} · ${ref.hash.slice(0, 8)}`,
+      })),
+      onAddContext: () => {
+        setError(undefined);
+        setPanel({ kind: 'choose' });
+      },
+      onPreviewContext: (id: string) => {
+        const ref = draft.refs.find((ref) => ref.artifactId === id);
+        if (ref) void preview(ref);
+      },
+      onRemoveContext: (id: string) => {
+        if (!controlsBlocked)
+          writeContextDraft(draftKey, (current) => ({
+            ...current,
+            refs: current.refs.filter((ref) => ref.artifactId !== id),
+          }));
+      },
+      contextDisabled: controlsBlocked,
+      addContextDisabled: busy || workspace.pending || workspace.connection !== 'connected',
+    },
+    panel:
+      panel &&
+      (panel.kind === 'preview' ? (
+        <ContextPreview
+          captures={panel.captures}
+          recipient={panel.recipient}
+          text={panel.command?.payload.text}
+          blocked={panel.command ? (error ?? previewBlocked) : error}
+          onClose={() => setPanel(null)}
+          recovery={recovery}
+          onSend={
+            panel.command
+              ? () => {
+                  if (!previewBlocked && !error && panel.command)
+                    void dispatch(panel.command, panel.submitted ?? panel.command.payload.text);
+                }
+              : undefined
+          }
+        />
+      ) : (
+        <Dialog
+          title="Add context"
+          onClose={() => {
+            if (!busy) setPanel(null);
+          }}
+        >
+          <div className="launch-content">
+            <p className="muted small">
+              Choose committed source or one project log. Captured text is reviewed before sending.
+            </p>
+            {panel.kind === 'reading' || busy ? (
+              <p role="status">Reading captured context.</p>
+            ) : (
+              <div className="form-stack">
+                {(['source-file', 'source-folder', 'log-file'] as const).map((mode) => (
+                  <button
+                    className="button secondary"
+                    type="button"
+                    key={mode}
+                    disabled={
+                      controlsBlocked || Boolean(draft.captureReceipt) || draft.refs.length >= 4
+                    }
+                    onClick={() => void add(mode)}
+                  >
+                    {
+                      {
+                        'source-file': 'Source file',
+                        'source-folder': 'Source folder',
+                        'log-file': 'Project log',
+                      }[mode]
+                    }
+                  </button>
+                ))}
+              </div>
+            )}
+            {draft.refs.length >= 4 && (
+              <p className="notice" role="status">
+                This draft has four context captures. Close this dialog and remove context to add
+                more.
+              </p>
+            )}
+            {workspace.retryAvailable && !draft.priorSend && !draft.captureReceipt && (
+              <p className="notice" role="status">
+                Close this dialog and use Retry exact command before adding context.
+              </p>
+            )}
+            {draft.captureReceipt && !workspace.retryAvailable && !workspace.pending && (
+              <button
+                className="button secondary"
+                type="button"
+                disabled={busy}
+                onClick={() => {
+                  writeContextDraft(draftKey, (current) => ({
+                    ...current,
+                    captureReceipt: undefined,
+                  }));
+                  setError(undefined);
+                }}
+              >
+                Choose context again
+              </button>
+            )}
+            {recovery}
+            {error && (
+              <p className="notice" role="alert">
+                {error}
+              </p>
+            )}
+          </div>
+        </Dialog>
+      )),
+    recovery,
+  };
+}
+
 type PlanningFields = {
   role: 'lead' | 'orchestrator';
   attempts: string;
@@ -297,31 +1039,51 @@ export function NewGoal({
   const [planning, setPlanning] = useState(() => initialPlanning());
   const selection = planningSelection(planning);
   const profile = getPlanningProfile(snapshot);
+  const context = useContextComposer({
+    draftKey: `goal:${projectId}`,
+    projectId,
+    scope: canonicalJson({
+      projectId,
+      planning,
+      model: profile?.model ?? null,
+      effort: profile?.effort ?? null,
+    }),
+    recipient: profile
+      ? `${roleLabels[planning.role]} · ${familyName(profile.family)} · Profile ${profile.id} · Requested model ${profile.model} · Requested effort ${profile.effort} · Route selected when planning is admitted`
+      : 'Planning recipient has not been selected.',
+    workspace,
+    afterApplied: (result, submitted) => {
+      if (result.entity && 'state' in result.entity) onCreated(result.entity.id, submitted);
+    },
+  });
   const blocked =
     workspace.connection !== 'connected'
       ? 'Reconnect to send the goal.'
       : workspace.retryAvailable
         ? 'Resolve the uncertain command with exact retry.'
-        : !projectId
-          ? 'Choose a project before sending the goal.'
-          : !profile?.available
-            ? `Planning profile unavailable: ${profile?.reason ?? 'not configured'}.`
-            : !selection.success
-              ? 'Choose finite planning limits within the displayed bounds.'
-              : !planning.consent
-                ? 'Confirm the bounded planning permission above.'
-                : undefined;
+        : context.uncertain
+          ? context.uncertain
+          : context.busy || workspace.pending
+            ? 'Wait for the current request.'
+            : !projectId
+              ? 'Choose a project before sending the goal.'
+              : !profile?.available
+                ? `Planning profile unavailable: ${profile?.reason ?? 'not configured'}.`
+                : !selection.success
+                  ? 'Choose finite planning limits within the displayed bounds.'
+                  : !planning.consent
+                    ? 'Confirm the bounded planning permission above.'
+                    : undefined;
   async function create(goal: string) {
     if (blocked || !selection.success || workspace.pending) return;
-    try {
-      const result = await workspace.command({
+    await context.review(
+      {
         command: 'CreateTaskDiscussion',
         expectedRevision: 0,
         payload: { projectId, text: goal, planning: selection.data },
-      });
-      if (applied(result.outcome) && result.entity && 'state' in result.entity)
-        onCreated(result.entity.id, text);
-    } catch {}
+      },
+      text,
+    );
   }
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0, height: '100%' }}>
@@ -389,18 +1151,22 @@ export function NewGoal({
                 }
               : null
           }
+          detailsStatus={context.uncertain ? 'Outcome uncertain' : undefined}
+          details={context.recovery}
           status="Goal not sent"
           next="Planning route unqualified. Describe the outcome; the lead can propose criteria."
           composer={{
             value: text,
             onChange: onTextChange,
             onSend: (goal) => void create(goal),
-            sending: workspace.pending,
+            sending: context.sending,
             disabledReason: blocked,
+            ...context.composer,
           }}
-          error={workspace.error ?? undefined}
+          error={context.error ?? workspace.error ?? undefined}
         />
       </div>
+      {context.panel}
     </div>
   );
 }
@@ -467,16 +1233,39 @@ export function ConversationView({
           : workspace.pending
             ? 'Waiting for the current request.'
             : undefined;
+  const recipientRoute = snapshot.routes.find(
+    (route) => route.id === state?.configuration?.routeId,
+  );
+  const context = useContextComposer({
+    draftKey: `task:${task.id}`,
+    projectId: task.projectId,
+    sourceBase: snapshot.runs.find((run) => run.id === state?.currentRunId)?.source.base,
+    scope: canonicalJson({
+      taskId: task.id,
+      revision: task.revision,
+      configuration: state?.configuration ?? null,
+      recipientFamily: recipientRoute?.family ?? null,
+    }),
+    recipient: state?.configuration
+      ? `${roleLabels[state.configuration.selection.role]} · ${recipientRoute ? familyName(recipientRoute.family) : 'Provider not yet selected'} · Route ${state.configuration.routeId ?? 'not yet selected'} · Requested model ${state.configuration.requestedModel ?? 'unknown'} · Effective model ${state.configuration.effectiveModel ?? 'unknown'} · Requested effort ${state.configuration.requestedEffort ?? 'unknown'} · Effective effort ${state.configuration.effectiveEffort ?? 'unknown'}`
+      : 'Planning recipient has not been selected.',
+    workspace,
+    afterApplied: (_result, submitted) => onDraftSaved(submitted),
+  });
   const blocked =
     workspace.connection !== 'connected'
       ? 'Reconnect to send a message.'
       : workspace.retryAvailable
         ? 'Resolve the uncertain command with exact retry.'
-        : !current
-          ? 'Refreshing the current conversation state.'
-          : !state?.send.available
-            ? reasonText(state?.send.reason ?? 'not-configured')
-            : undefined;
+        : context.uncertain
+          ? context.uncertain
+          : context.busy || workspace.pending
+            ? 'Wait for the current request.'
+            : !current
+              ? 'Refreshing the current conversation state.'
+              : !state?.send.available
+                ? reasonText(state?.send.reason ?? 'not-configured')
+                : undefined;
   async function mutate(command: DesktopCommand) {
     try {
       return await workspace.command(command);
@@ -494,13 +1283,14 @@ export function ConversationView({
   }
   async function send(text: string) {
     if (blocked || !state || workspace.pending) return;
-    const submitted = draft;
-    const result = await mutate({
-      command: state.send.disposition === 'queue' ? 'QueueTaskGuidance' : 'SendTaskMessage',
-      expectedRevision: task.revision,
-      payload: { taskId: task.id, text },
-    });
-    if (result && applied(result.outcome)) onDraftSaved(submitted);
+    await context.review(
+      {
+        command: state.send.disposition === 'queue' ? 'QueueTaskGuidance' : 'SendTaskMessage',
+        expectedRevision: task.revision,
+        payload: { taskId: task.id, text },
+      },
+      draft,
+    );
   }
   const messages = useMemo<ConversationMessage[]>(() => {
     const included = new Set(
@@ -520,6 +1310,13 @@ export function ConversationView({
           author: author.kind === 'agent' ? roleLabels[author.role] : 'You',
           at: entry.at,
           text: entry.text,
+          attachments:
+            'context' in entry
+              ? entry.context?.map((ref, index) => ({
+                  id: ref.artifactId,
+                  label: `Captured context ${index + 1} · ${ref.hash.slice(0, 8)}`,
+                }))
+              : undefined,
         };
         if (author.kind === 'agent') {
           const route = snapshot.routes.find((value) => value.id === author.routeId);
@@ -690,6 +1487,18 @@ export function ConversationView({
           conversationId={task.id}
           visible={visible}
           messages={messages}
+          onOpenAttachment={(id) => {
+            for (const entry of entries) {
+              const ref =
+                'context' in entry
+                  ? entry.context?.find((ref) => ref.artifactId === id)
+                  : undefined;
+              if (ref) {
+                context.openHistory(ref);
+                return;
+              }
+            }
+          }}
           primary={
             config
               ? {
@@ -708,7 +1517,13 @@ export function ConversationView({
                 }
               : null
           }
-          detailsStatus={history.historyNotice ? 'History refreshed' : undefined}
+          detailsStatus={
+            context.uncertain
+              ? 'Outcome uncertain'
+              : history.historyNotice
+                ? 'History refreshed'
+                : undefined
+          }
           details={
             <>
               {history.historyNotice && (
@@ -727,6 +1542,7 @@ export function ConversationView({
                   <span>{state.queuedInputCount} queued inputs</span>
                 </div>
               )}
+              {context.recovery}
             </>
           }
           activeWorkers={
@@ -754,7 +1570,7 @@ export function ConversationView({
               : (task.next ?? undefined)
           }
           loading={!state && history.reading}
-          error={history.error}
+          error={context.error ?? history.error}
           onLoadEarlier={history.before ? history.loadEarlier : undefined}
           loadingEarlier={history.earlier}
           historyBlocked={history.reading || workspace.pending}
@@ -762,8 +1578,9 @@ export function ConversationView({
             value: draft,
             onChange: onDraftChange,
             onSend: (text) => void send(text),
-            sending: workspace.pending,
+            sending: context.sending,
             disabledReason: blocked,
+            ...context.composer,
             hint:
               state?.send.disposition === 'queue'
                 ? 'Guidance is retained for a later, explicitly admitted planning turn.'
@@ -822,6 +1639,7 @@ export function ConversationView({
           }}
         />
       </div>
+      {context.panel}
       {settings && (
         <Dialog title="Session settings" onClose={() => setSettings(false)}>
           <div className="launch-content">

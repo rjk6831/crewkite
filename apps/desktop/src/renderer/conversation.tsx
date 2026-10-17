@@ -7,10 +7,12 @@ import {
   Circle,
   Clock,
   MessageSquare,
+  Plus,
   Settings2,
   ShieldCheck,
   TriangleAlert,
   Users,
+  X,
 } from 'lucide-react';
 import { type FormEvent, type ReactNode, useEffect, useId, useRef, useState } from 'react';
 import './conversation.css';
@@ -56,6 +58,8 @@ export type ConversationDecision = DecisionBase &
     | { kind: 'approval'; approval: Approval }
   );
 
+export type ConversationAttachment = { id: string; label: string };
+
 export type ConversationMessage = {
   id: string;
   kind: 'user' | 'primary' | 'role' | 'system';
@@ -66,6 +70,7 @@ export type ConversationMessage = {
   effort?: string;
   at?: string;
   text: string;
+  attachments?: ConversationAttachment[];
   delivery?: 'pending' | 'queued' | 'included' | 'unknown' | 'failed';
   stages?: ConversationStage[];
   decision?: ConversationDecision;
@@ -84,6 +89,7 @@ export type ConversationProps = {
   maximumWorkers?: number;
   loading?: boolean;
   error?: string;
+  onOpenAttachment?: (id: string) => void;
   onLoadEarlier?: () => void;
   loadingEarlier?: boolean;
   historyBlocked?: boolean;
@@ -95,6 +101,12 @@ export type ConversationProps = {
     disabledReason?: string;
     placeholder?: string;
     hint?: string;
+    attachments?: ConversationAttachment[];
+    onAddContext?: () => void;
+    onPreviewContext?: (id: string) => void;
+    onRemoveContext?: (id: string) => void;
+    contextDisabled?: boolean;
+    addContextDisabled?: boolean;
   };
   onChoice?: (decisionId: string, choiceId: string) => void;
   onAnswer?: (questionId: string, text: string) => void;
@@ -379,6 +391,7 @@ export function Conversation({
   onAnswerDraftChange,
   onApproval,
   onOpenSettings,
+  onOpenAttachment,
   details,
   detailsStatus,
 }: ConversationProps) {
@@ -571,6 +584,21 @@ export function Conversation({
                     </div>
                   )}
                   {message.text && <div className="conversation-message-text">{message.text}</div>}
+                  {Boolean(message.attachments?.length) && (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                      {message.attachments?.map((attachment) => (
+                        <button
+                          className="button secondary"
+                          type="button"
+                          key={attachment.id}
+                          disabled={!onOpenAttachment}
+                          onClick={() => onOpenAttachment?.(attachment.id)}
+                        >
+                          {attachment.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                   {message.delivery && (
                     <p className={`conversation-delivery delivery-${message.delivery}`}>
                       <StageIcon
@@ -678,11 +706,67 @@ export function Conversation({
             }}
           />
           <div className="conversation-composer-footer">
-            <span id={`${composerId}-hint`}>
+            {composer.onAddContext && (
+              <button
+                type="button"
+                aria-label="Add context"
+                disabled={Boolean(composer.addContextDisabled || loading || composer.sending)}
+                onClick={composer.onAddContext}
+                style={{
+                  background: 'var(--surface-hover)',
+                  color: 'var(--text)',
+                  boxShadow: 'none',
+                }}
+              >
+                <Plus size={17} aria-hidden="true" />
+              </button>
+            )}
+            <span
+              id={`${composerId}-hint`}
+              className={composer.attachments?.length ? 'conversation-sr-only' : undefined}
+            >
               {composer.disabledReason ??
                 composer.hint ??
                 'Messages stay within the approved task scope.'}
             </span>
+            {Boolean(composer.attachments?.length) && (
+              <span style={{ display: 'flex', gap: 6, overflowX: 'auto', whiteSpace: 'nowrap' }}>
+                {composer.attachments?.map((attachment) => (
+                  <span key={attachment.id} style={{ display: 'inline-flex', flexShrink: 0 }}>
+                    <button
+                      type="button"
+                      disabled={composer.contextDisabled}
+                      onClick={() => composer.onPreviewContext?.(attachment.id)}
+                      style={{
+                        width: 'auto',
+                        height: 28,
+                        padding: '0 6px',
+                        background: 'var(--surface-hover)',
+                        color: 'var(--text)',
+                        boxShadow: 'none',
+                      }}
+                    >
+                      {attachment.label}
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={`Remove ${attachment.label}`}
+                      disabled={composer.contextDisabled}
+                      onClick={() => composer.onRemoveContext?.(attachment.id)}
+                      style={{
+                        width: 24,
+                        height: 28,
+                        background: 'var(--surface-hover)',
+                        color: 'var(--text)',
+                        boxShadow: 'none',
+                      }}
+                    >
+                      <X size={12} aria-hidden="true" />
+                    </button>
+                  </span>
+                ))}
+              </span>
+            )}
             <button
               type="submit"
               disabled={disabled || !composer.value.trim()}
@@ -694,9 +778,11 @@ export function Conversation({
         </form>
         <div className="conversation-composer-note">
           <span>
-            {composer.sending
-              ? 'Saving message. Waiting for confirmation.'
-              : 'Plans and permissions require a separate decision.'}
+            {composer.attachments?.length && composer.disabledReason
+              ? composer.disabledReason
+              : composer.sending
+                ? 'Saving message. Waiting for confirmation.'
+                : 'Plans and permissions require a separate decision.'}
           </span>
           <span>Enter to send · Shift+Enter for a new line</span>
         </div>

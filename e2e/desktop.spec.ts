@@ -24,10 +24,13 @@ import {
   readControllerEndpoint,
 } from '../packages/client/src/node.ts';
 import {
+  CONVERSATION_CONTEXT_MEDIA_TYPE,
   type Command,
   type CommandResult,
+  ConversationContextBundleSchema,
   type ConversationEntry,
   ConversationEntrySchema,
+  canonicalJson,
   type Event,
   EventSchema,
   SnapshotSchema,
@@ -754,6 +757,14 @@ async function conversationBridge(
   const sockets = new Set<Socket>();
   let questionId = '';
   let configureAttempts = 0;
+  let refuseContextSend = true;
+  let uncertainCapture = false;
+  let holdContextRead = false;
+  const heldContextReads: (() => void)[] = [];
+  const captured = new Map<
+    string,
+    { artifact: { id: string; hash: string; bytes: number; mediaType: string }; content: Buffer }
+  >();
   const runId = id('run');
   const attemptId = id('att');
   const at = '2026-10-17T12:00:00.000Z';
@@ -791,6 +802,23 @@ async function conversationBridge(
     if (command.command === 'GetSnapshot')
       return { outcome: 'applied', data: { kind: 'snapshot', snapshot } };
     if (command.command === 'Subscribe') return { outcome: 'applied' };
+    if (command.command === 'GetArtifact') {
+      const context = captured.get(command.payload.artifactId);
+      assert(context);
+      const offset = command.payload.offset;
+      const chunk = context.content.subarray(offset, offset + command.payload.limit);
+      return {
+        outcome: 'applied',
+        data: {
+          kind: 'artifact',
+          artifact: context.artifact,
+          offset,
+          content: chunk.toString('base64'),
+          encoding: 'base64',
+          eof: offset + chunk.length === context.content.length,
+        },
+      };
+    }
     if (command.command === 'GetTaskConversationState')
       return {
         outcome: 'applied',
@@ -840,8 +868,61 @@ async function conversationBridge(
           truncated: false,
         },
       };
-    if (receipts.has(command.key)) return receipts.get(command.key) as CommandResult;
+    if (receipts.has(command.key)) {
+      assert.deepEqual(
+        command,
+        received.find((prior) => prior.key === command.key),
+      );
+      return receipts.get(command.key) as CommandResult;
+    }
     received.push(command);
+    if (command.command === 'CaptureConversationContext') {
+      assert.equal(command.expectedRevision, snapshot.projects[0].revision);
+      assert.equal(command.payload.projectId, snapshot.projects[0].id);
+      assert.equal(command.payload.base, 'a'.repeat(40));
+      const selection = command.payload.selections[0];
+      assert(selection.path.startsWith('/registered/project/'));
+      const text = `Captured ${selection.kind} text.\n`;
+      const bundle = ConversationContextBundleSchema.parse({
+        version: 1,
+        projectId: command.payload.projectId,
+        base: command.payload.base,
+        files: [
+          {
+            kind: selection.kind === 'log-file' ? 'log' : 'source',
+            path:
+              selection.kind === 'log-file'
+                ? 'logs/project.log'
+                : selection.kind === 'source-folder'
+                  ? 'src/captured.ts'
+                  : 'README.md',
+            mode: '100644',
+            hash: createHash('sha256').update(text).digest('hex'),
+            bytes: Buffer.byteLength(text),
+            text,
+          },
+        ],
+      });
+      const content = Buffer.from(canonicalJson(bundle));
+      const artifact = {
+        id: id('art'),
+        hash: createHash('sha256').update(content).digest('hex'),
+        bytes: content.length,
+        mediaType: CONVERSATION_CONTEXT_MEDIA_TYPE,
+      };
+      captured.set(artifact.id, { artifact, content });
+      snapshot.artifacts.push(artifact);
+      const result: CommandResult = { outcome: 'applied', entity: artifact };
+      receipts.set(command.key, result);
+      if (uncertainCapture) {
+        uncertainCapture = false;
+        return {
+          outcome: 'outcome-unknown',
+          reason: 'The fixture saved context before its response was lost.',
+        };
+      }
+      return result;
+    }
     if (command.command === 'CreateTaskDiscussion') {
       assert.equal(command.expectedRevision, 0);
       assert.deepEqual(command.payload.planning.limits, {
@@ -867,7 +948,12 @@ async function conversationBridge(
         attemptId,
         routeId: route.id,
       };
-      append({ kind: 'user-message', author: { kind: 'user' }, text: command.payload.text });
+      append({
+        kind: 'user-message',
+        author: { kind: 'user' },
+        text: command.payload.text,
+        ...(command.payload.context ? { context: command.payload.context } : {}),
+      });
       const question = append({
         kind: 'question',
         author,
@@ -991,8 +1077,17 @@ async function conversationBridge(
         reason: 'The fixture saved settings before its response was lost.',
       };
     } else if (command.command === 'SendTaskMessage') {
+      if (command.payload.context?.length && refuseContextSend) {
+        refuseContextSend = false;
+        return { outcome: 'stale-revision', reason: 'The fixture refused a stale context send.' };
+      }
       bump();
-      append({ kind: 'user-message', author: { kind: 'user' }, text: command.payload.text });
+      append({
+        kind: 'user-message',
+        author: { kind: 'user' },
+        text: command.payload.text,
+        ...(command.payload.context ? { context: command.payload.context } : {}),
+      });
       state.phase = 'planning';
       state.activeAttempt = {
         id: attemptId,
@@ -1012,7 +1107,12 @@ async function conversationBridge(
       };
     } else if (command.command === 'QueueTaskGuidance') {
       bump();
-      append({ kind: 'guidance', author: { kind: 'user' }, text: command.payload.text });
+      append({
+        kind: 'guidance',
+        author: { kind: 'user' },
+        text: command.payload.text,
+        ...(command.payload.context ? { context: command.payload.context } : {}),
+      });
       state.queuedInputCount += 1;
     } else if (command.command === 'StopRun') {
       assert.equal(command.payload.runId, runId);
@@ -1035,14 +1135,19 @@ async function conversationBridge(
       for (const message of decoder.push(bytes)) {
         if (message.type === 'hello')
           socket.write(encodeFrame({ type: 'welcome', protocol: 1, cursor: snapshot.cursor }));
-        if (message.type === 'command')
-          socket.write(
-            encodeFrame({
-              type: 'result',
-              key: message.command.key,
-              result: response(message.command),
-            }),
-          );
+        if (message.type === 'command') {
+          const reply = () =>
+            socket.write(
+              encodeFrame({
+                type: 'result',
+                key: message.command.key,
+                result: response(message.command),
+              }),
+            );
+          if (holdContextRead && message.command.command === 'GetArtifact')
+            heldContextReads.push(reply);
+          else reply();
+        }
       }
     });
   });
@@ -1090,11 +1195,79 @@ async function conversationBridge(
     if ((await page.locator('html').getAttribute('data-theme')) !== 'dark')
       await page.getByRole('button', { name: 'Switch to dark theme', exact: true }).click();
     const composer = page.getByRole('textbox', { name: 'Message the primary role', exact: true });
+    const nativeChoice = (paths: string[]) =>
+      application.evaluate(({ dialog }, filePaths) => {
+        const original = dialog.showOpenDialog;
+        dialog.showOpenDialog = async () => {
+          dialog.showOpenDialog = original;
+          return { canceled: filePaths.length === 0, filePaths };
+        };
+      }, paths);
+    const chooseContext = async (
+      kind: 'Source file' | 'Source folder' | 'Project log',
+      path: string,
+    ) => {
+      await page.getByRole('button', { name: 'Add context', exact: true }).click();
+      await nativeChoice([path]);
+      await page
+        .getByRole('dialog', { name: 'Add context', exact: true })
+        .getByRole('button', { name: kind, exact: true })
+        .click();
+      await expect(
+        page.getByRole('dialog', { name: 'Captured context', exact: true }),
+      ).toBeVisible();
+      await expect(page.getByRole('dialog')).toContainText('Selected planning recipient');
+      await page.keyboard.press('Escape');
+    };
+
     await expect(page.getByRole('heading', { name: 'New goal', exact: true })).toBeVisible();
     await composer.fill('Export the currently filtered invoices as CSV.');
+    await page.getByRole('button', { name: 'Add context', exact: true }).click();
+    await nativeChoice([]);
+    await page
+      .getByRole('dialog')
+      .getByRole('button', { name: 'Source file', exact: true })
+      .click();
+    await expect(page.getByRole('dialog', { name: 'Add context', exact: true })).toBeVisible();
+    assert.equal(
+      received.filter((command) => command.command === 'CaptureConversationContext').length,
+      0,
+    );
+    await page.keyboard.press('Escape');
+    await chooseContext('Source file', '/registered/project/README.md');
+    await expect(page.getByRole('button', { name: /^Context 1 · 1 file ·/ })).toBeVisible();
+    await page.getByRole('button', { name: /^Remove Context 1/ }).click();
+    assert.equal(captured.size, 1);
+    await chooseContext('Source folder', '/registered/project/src');
+    await chooseContext('Project log', '/registered/project/logs/project.log');
+    await expect(page.getByRole('button', { name: /^Remove Context/ })).toHaveCount(2);
+    await page.reload();
+    await expect(composer).toHaveValue('Export the currently filtered invoices as CSV.');
+    await expect(page.getByRole('button', { name: /^Remove Context/ })).toHaveCount(2);
+
     await expect(page.getByRole('button', { name: 'Send message', exact: true })).toBeDisabled();
     await page.getByRole('checkbox', { name: /^Allow bounded planning ·/ }).check();
     await composer.press('Enter');
+    const firstReview = page.getByRole('dialog', {
+      name: 'Review message and context',
+      exact: true,
+    });
+    await expect(firstReview).toContainText('Captured source-folder text.');
+    await expect(firstReview).toContainText('Captured log-file text.');
+    await expect(firstReview).toContainText('Requested model fixture-model');
+    assert.equal(
+      received.filter((command) => command.command === 'CreateTaskDiscussion').length,
+      0,
+    );
+    await firstReview.getByRole('button', { name: 'Send reviewed message', exact: true }).click();
+    const createdWithContext = received.find(
+      (command) => command.command === 'CreateTaskDiscussion',
+    );
+    assert(createdWithContext && createdWithContext.command === 'CreateTaskDiscussion');
+    assert.equal(createdWithContext.payload.context?.length, 2);
+    for (const ref of createdWithContext.payload.context ?? [])
+      assert.equal(captured.get(ref.artifactId)?.artifact.hash, ref.hash);
+
     await expect(page.getByRole('tab', { name: 'Conversation', exact: true })).toHaveAttribute(
       'aria-selected',
       'true',
@@ -1148,6 +1321,26 @@ async function conversationBridge(
     await expect(page.locator(`#conversation-message-${questionId}`)).toBeFocused();
     const answer = page.getByRole('textbox', { name: 'Answer for Architect', exact: true });
     await answer.fill('Include the header row even for empty results.');
+    const sendAnswer = page.getByRole('button', { name: 'Send answer', exact: true });
+    await expect(sendAnswer).toBeEnabled();
+    await page.getByRole('button', { name: 'Add context', exact: true }).click();
+    await nativeChoice(['/registered/project/README.md']);
+    holdContextRead = true;
+    await page
+      .getByRole('dialog')
+      .getByRole('button', { name: 'Source file', exact: true })
+      .click();
+    await expect.poll(() => heldContextReads.length).toBe(1);
+    await expect(page.locator('.conversation-answer button[type="submit"]')).toBeDisabled();
+    holdContextRead = false;
+    for (const reply of heldContextReads.splice(0)) reply();
+    await expect(page.getByRole('dialog', { name: 'Captured context', exact: true })).toContainText(
+      'Captured source-file text.',
+    );
+    await page.keyboard.press('Escape');
+    await expect(sendAnswer).toBeEnabled();
+    await page.getByRole('button', { name: /^Remove Context/ }).click();
+
     await page.getByRole('tab', { name: 'Plan', exact: true }).click();
     await page.getByRole('tab', { name: 'Conversation', exact: true }).click();
     await page.getByRole('button', { name: 'Show pending question', exact: true }).click();
@@ -1226,27 +1419,154 @@ async function conversationBridge(
     await page.getByText('Task details', { exact: true }).click();
     await page.getByRole('button', { name: 'Load earlier messages', exact: true }).click();
     await expect(page.getByText('Scope checked.', { exact: true })).toBeAttached();
+    uncertainCapture = true;
+    await page.getByRole('button', { name: 'Add context', exact: true }).click();
+    await nativeChoice(['/registered/project/README.md']);
+    await page
+      .getByRole('dialog')
+      .getByRole('button', { name: 'Source file', exact: true })
+      .click();
+    await expect(page.getByRole('dialog').getByRole('alert')).toContainText(
+      'capture outcome is uncertain',
+    );
+    const pendingCapture = received.findLast(
+      (command) => command.command === 'CaptureConversationContext',
+    );
+    assert(pendingCapture && pendingCapture.command === 'CaptureConversationContext');
+    const beforeWrongRetry = received.length;
+    assert.match(
+      await page.evaluate(
+        async (input) => {
+          try {
+            await window.crewkite?.retryConversationContext?.(input);
+            return '';
+          } catch (failure) {
+            return String(failure);
+          }
+        },
+        { receiptId: pendingCapture.key, projectId: snapshot.projects[0].id, base: 'b'.repeat(40) },
+      ),
+      /does not match this draft/,
+    );
+    assert.match(
+      await page.evaluate(async () => {
+        try {
+          await window.crewkite?.retryCommand?.({ command: 'GetHealth', payload: {} });
+          return '';
+        } catch (failure) {
+          return String(failure);
+        }
+      }),
+      /does not match this draft/,
+    );
+    assert.match(
+      await page.evaluate(
+        async (input) => {
+          try {
+            await window.crewkite?.command({
+              command: 'CaptureConversationContext',
+              expectedRevision: 0,
+              payload: {
+                projectId: input.projectId,
+                base: input.base,
+                selections: [{ kind: 'source-file', path: '/forged' }],
+              },
+            });
+            return '';
+          } catch (failure) {
+            return String(failure);
+          }
+        },
+        { projectId: snapshot.projects[0].id, base: 'a'.repeat(40) },
+      ),
+      /native-only action/,
+    );
+    assert.equal(received.length, beforeWrongRetry);
+    await page.reload();
+    await page.getByRole('button', { name: 'Add context', exact: true }).click();
+    await page
+      .getByRole('dialog')
+      .getByRole('button', { name: 'Retry exact context capture', exact: true })
+      .click();
+    await expect(page.getByRole('dialog', { name: 'Captured context', exact: true })).toContainText(
+      'Captured source-file text.',
+    );
+    await page.keyboard.press('Escape');
+    assert.equal(received.filter((command) => command.key === pendingCapture.key).length, 1);
     await composer.fill('Keep the execution permissions unchanged.');
     await composer.press('Enter');
+    bump();
+    publishTask();
+    await expect(
+      page.getByRole('dialog').getByRole('button', { name: 'Send reviewed message', exact: true }),
+    ).toBeDisabled();
+    await expect(page.getByRole('dialog')).toContainText(
+      'The recipient, draft context or task changed.',
+    );
+    await page.keyboard.press('Escape');
+    await expect(composer).toHaveValue('Keep the execution permissions unchanged.');
+    await expect(page.getByRole('button', { name: /^Remove Context/ })).toHaveCount(1);
+    await composer.press('Enter');
+    await page
+      .getByRole('dialog')
+      .getByRole('button', { name: 'Send reviewed message', exact: true })
+      .click();
+    await expect(page.getByRole('dialog').getByRole('alert')).toContainText(
+      'The fixture refused a stale context send.',
+    );
+    await page.keyboard.press('Escape');
+    await expect(page.getByRole('button', { name: /^Remove Context/ })).toHaveCount(1);
+    await composer.press('Enter');
+    await page
+      .getByRole('dialog')
+      .getByRole('button', { name: 'Send reviewed message', exact: true })
+      .click();
+
     await expect(
       page.getByRole('button', { name: 'Retry exact command', exact: true }),
     ).toBeVisible();
     await expect(composer).toHaveValue('Keep the execution permissions unchanged.');
-    const originalSend = received.find((command) => command.command === 'SendTaskMessage');
-    await page.getByRole('button', { name: 'Retry exact command', exact: true }).click();
+    const originalSend = received.find(
+      (command) => command.command === 'SendTaskMessage' && receipts.has(command.key),
+    );
+    await page
+      .getByRole('dialog')
+      .getByRole('button', { name: 'Retry exact message', exact: true })
+      .click();
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await expect(composer).toHaveValue('');
+    await expect(page.getByRole('button', { name: /^Remove Context/ })).toHaveCount(0);
     await expect(
       page.getByRole('button', { name: 'Retry exact command', exact: true }),
     ).toHaveCount(0);
     assert(originalSend && receipts.has(originalSend.key));
-    assert.equal(received.filter((command) => command.command === 'SendTaskMessage').length, 1);
+    assert.equal(received.filter((command) => command.command === 'SendTaskMessage').length, 2);
+    await page.reload();
+    const savedContext = page.getByRole('button', { name: /^Captured context 1 ·/ }).last();
+    await savedContext.click();
+    await expect(page.getByRole('dialog')).toContainText('Captured source-file text.');
+    await expect(page.getByRole('dialog')).not.toContainText('Selected planning recipient');
+    await page.keyboard.press('Escape');
+    await chooseContext('Project log', '/registered/project/logs/project.log');
     await composer.fill('Do not add a new provider.');
     await composer.press('Enter');
+    await page
+      .getByRole('dialog')
+      .getByRole('button', { name: 'Send reviewed message', exact: true })
+      .click();
+    const queuedContext = received.find((command) => command.command === 'QueueTaskGuidance');
+    assert(
+      queuedContext &&
+        queuedContext.command === 'QueueTaskGuidance' &&
+        queuedContext.payload.context?.length === 1,
+    );
     await expect(
       page.getByText('Queued for the next planning turn', { exact: true }).last(),
     ).toBeVisible();
     await page.getByRole('button', { name: 'Stop', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Resume', exact: true })).toHaveCount(0);
     await expect(page.getByText('Stopped', { exact: true }).last()).toBeVisible();
+    await chooseContext('Source folder', '/registered/project/src');
     await composer.fill('Keep this unsent draft.');
     await page.getByRole('tab', { name: 'Plan', exact: true }).click();
     await page.getByRole('tab', { name: 'Conversation', exact: true }).click();
@@ -1259,6 +1579,7 @@ async function conversationBridge(
     );
     await expect(page.getByText('Do not add a new provider.', { exact: true })).toBeVisible();
     await expect(composer).toHaveValue('Keep this unsent draft.');
+    await expect(page.getByRole('button', { name: /^Remove Context/ })).toHaveCount(1);
     assert.equal(received.length, mutations);
     assert.equal(
       received.some((command) =>
