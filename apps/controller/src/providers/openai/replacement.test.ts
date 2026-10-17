@@ -764,6 +764,113 @@ test('native proposals and reviews require one matching completed turn and bound
   assert.deepEqual(collectionTask.repository, repositoryData.repository);
   assert.equal(collectionTask.path, undefined);
   assert.equal(collectionTask.bindingHash, hashCanonical(repositoryData.binding));
+  const reviewRequest = (value: Parameters<typeof reviewPlan>[0], escaped = false) => {
+    const selected = reviewPlan(value);
+    const reader = new ReviewTranscript(selected, { now: () => 1, timeoutMs: 180_000 });
+    metadata(reader);
+    const response = threadResult(selected.directory);
+    reader.push(
+      bytes({
+        id: 10,
+        result: {
+          ...response,
+          thread: { ...response.thread, id: escaped ? '\x01'.repeat(200) : 'thread-1' },
+        },
+      }),
+    );
+    const frame = Buffer.from(reader.next() as Uint8Array);
+    const request = JSON.parse(frame.toString());
+    const packet = request.params.input[0].text.split('\n').slice(1).join('\n');
+    assert(frame.length < 1024 * 1024);
+    return { frame, packet };
+  };
+  const repositorySides = (original: string, candidate: string) => ({
+    ...repositoryData,
+    repository: {
+      ...repositoryData.repository,
+      changes: [
+        {
+          path: 'large.mjs',
+          original: { mode: '100644' as const, hash: digestText(original), content: original },
+          candidate: { mode: '100644' as const, hash: digestText(candidate), content: candidate },
+        },
+      ],
+    },
+  });
+  const nearRepositoryLimit = repositorySides('x'.repeat(200_000), 'y'.repeat(190_000));
+  const repositoryPadding =
+    384 * 1024 - Buffer.byteLength(reviewRequest(nearRepositoryLimit).packet);
+  assert(repositoryPadding > 0);
+  const atRepositoryLimit = repositorySides(
+    'x'.repeat(200_000),
+    'y'.repeat(190_000 + repositoryPadding),
+  );
+  const escapedOriginal = '"\\'.repeat(45_000);
+  const escapedCandidate = '\\"'.repeat(45_000);
+  const escapedPadding =
+    384 * 1024 -
+    Buffer.byteLength(reviewRequest(repositorySides(escapedOriginal, escapedCandidate)).packet);
+  assert(escapedPadding > 0);
+  const escapedRepository = {
+    ...repositorySides(
+      escapedOriginal,
+      escapedCandidate +
+        '"'.repeat(Math.floor(escapedPadding / 2)) +
+        'y'.repeat(escapedPadding % 2),
+    ),
+    directory: `/${'\x01'.repeat(4095)}`,
+  };
+  for (const [name, value, escaped] of [
+    ['full text', repositorySides('x'.repeat(140_000), 'y'.repeat(140_000)), false],
+    ['repository side limit', repositorySides('', 'x'.repeat(256 * 1024)), false],
+    ['multibyte', repositorySides('é'.repeat(70_000), '界'.repeat(45_000)), false],
+    ['escaping', escapedRepository, true],
+    ['exact repository aggregate', atRepositoryLimit, false],
+  ] as const) {
+    const { packet } = reviewRequest(value, escaped);
+    const size = Buffer.byteLength(packet);
+    assert(size > 256 * 1024 && size <= 384 * 1024, name);
+    if (name === 'exact repository aggregate' || name === 'escaping')
+      assert.equal(size, 384 * 1024);
+    assert.deepEqual(JSON.parse(packet).repository, value.repository, name);
+  }
+  assert.throws(() =>
+    reviewPlan(repositorySides('x'.repeat(200_000), 'y'.repeat(190_001 + repositoryPadding))),
+  );
+  const legacySides = {
+    ...reviewData,
+    original: 'x'.repeat(65_536),
+    candidate: 'y'.repeat(65_536),
+    baseHash: digestText('x'.repeat(65_536)),
+    candidateContentHash: digestText('y'.repeat(65_536)),
+    context: {
+      ...reviewData.context,
+      criteria: Array.from({ length: 32 }, () => 'c'.repeat(4000)),
+    },
+  };
+  let legacyPadding = 256 * 1024 - Buffer.byteLength(reviewRequest(legacySides).packet);
+  assert(legacyPadding > 0);
+  for (let index = 0; legacyPadding > 0 && index < legacySides.context.criteria.length; index++) {
+    const amount = Math.min(96, legacyPadding);
+    legacySides.context.criteria[index] += 'c'.repeat(amount);
+    legacyPadding -= amount;
+  }
+  assert.equal(legacyPadding, 0);
+  assert.equal(Buffer.byteLength(reviewRequest(legacySides).packet), 256 * 1024);
+  const largerCriteria = [...legacySides.context.criteria];
+  const criterion = largerCriteria.findIndex((value) => value.length < 4096);
+  assert(criterion >= 0);
+  largerCriteria[criterion] += 'c';
+  assert.throws(() =>
+    reviewPlan({ ...legacySides, context: { ...legacySides.context, criteria: largerCriteria } }),
+  );
+  assert.throws(() =>
+    reviewPlan({
+      ...reviewData,
+      original: 'x'.repeat(65_537),
+      baseHash: digestText('x'.repeat(65_537)),
+    }),
+  );
   const changes = repositoryData.repository.changes;
   for (const repository of [
     { ...repositoryData.repository, version: 2 },
@@ -773,7 +880,7 @@ test('native proposals and reviews require one matching completed turn and bound
     { ...repositoryData.repository, changes: [changes[0], changes[0]] },
     { ...repositoryData.repository, changes: [{ ...changes[0], original: null, candidate: null }] },
     { ...repositoryData.repository, changes: [{ ...changes[2], candidate: changes[2].original }] },
-    ...['text\0tail', '\ud800', 'x'.repeat(262_144)].map((content) => ({
+    ...['text\0tail', '\ud800', 'x'.repeat(262_145)].map((content) => ({
       ...repositoryData.repository,
       changes: [
         { ...changes[0], candidate: { mode: '100644', content, hash: digestText(content) } },
