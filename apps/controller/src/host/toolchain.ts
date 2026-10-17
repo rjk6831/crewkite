@@ -153,6 +153,8 @@ async function scan(
     if (entries.length >= budget.maximumEntries) throw new Error('Toolchain entry limit exceeded.');
     const absolute = join(root, path);
     const state = await lstat(absolute);
+    if (workspaces && path === 'node_modules/.pnpm-task-run-state-v1' && state.isDirectory())
+      return;
     if (state.isSymbolicLink()) {
       const target = await readlink(absolute);
       if (isAbsolute(target)) throw new Error('Toolchain links must be relative.');

@@ -105,6 +105,8 @@ test('source inspection bounds file metadata without running filters or reading 
     'donor bytes',
     'donor mode',
     'donor link',
+    'nested task state bytes',
+    'workspace task state bytes',
     'staged bytes',
     'staged mode',
     'staged link',
@@ -167,6 +169,16 @@ test('source inspection bounds file metadata without running filters or reading 
     );
     mkdirSync(join(donor, installed, '.pnpm-cache'));
     writeFileSync(join(donor, installed, '.pnpm-cache/omit'), 'omitted');
+    const taskState = 'node_modules/.pnpm-task-run-state-v1';
+    const retainedState = [
+      'node_modules/other/.pnpm-task-run-state-v1',
+      `${workspace}/${taskState}`,
+    ];
+    for (const path of [taskState, ...retainedState]) {
+      mkdirSync(join(donor, path), { recursive: true });
+      writeFileSync(join(donor, path, 'run.finished'), '');
+      writeFileSync(join(donor, path, 'latest.json'), '{"run":"first"}');
+    }
     if (name === 'installed version')
       writeFileSync(join(donor, installed, 'package.json'), '{"name":"tiny","version":"2.0.0"}');
     if (name === 'escaping link') symlinkSync('../../candidate', join(donor, 'node_modules/extra'));
@@ -204,6 +216,16 @@ test('source inspection bounds file metadata without running filters or reading 
       unlinkSync(join(donor, 'node_modules/@tiny/local'));
       symlinkSync('../tiny', join(donor, 'node_modules/@tiny/local'));
     }
+    if (name === 'copy') {
+      unlinkSync(join(donor, taskState, 'run.finished'));
+      writeFileSync(join(donor, taskState, 'next.finished'), '');
+      writeFileSync(join(donor, taskState, 'latest.json'), '{"run":"next"}');
+    }
+    if (name === 'nested task state bytes' || name === 'workspace task state bytes')
+      writeFileSync(
+        join(donor, retainedState[name === 'nested task state bytes' ? 0 : 1], 'latest.json'),
+        '{"run":"changed"}',
+      );
     const changed = (
       {
         lock: 'pnpm-lock.yaml',
@@ -271,6 +293,12 @@ test('source inspection bounds file metadata without running filters or reading 
       ),
     );
     assert.ok(!expected.tree.entries.some((entry) => entry.path === `${installed}/.pnpm-cache`));
+    assert.ok(!expected.tree.entries.some((entry) => entry.path === taskState));
+    assert.equal(existsSync(join(candidate, taskState)), false);
+    for (const path of retainedState) {
+      assert.ok(expected.tree.entries.some((entry) => entry.path === `${path}/latest.json`));
+      assert.equal(readFileSync(join(candidate, path, 'latest.json'), 'utf8'), '{"run":"first"}');
+    }
     const tools = await inventoryTree(join(candidate, installed), budget());
     assert.equal(tools.files, 2);
     assert.equal(tools.entries.find((entry) => entry.path === 'cli.mjs')?.kind, 'file');
