@@ -94,11 +94,19 @@ const principles = [
   'Allow only the specific action approved for this task.',
 ];
 
+export type ExecutionPolicySeed = {
+  taskId: Task['id'];
+  taskRevision: Task['revision'];
+  planningConfigurationRevision: number;
+  authority: Policy['authority'];
+};
+
 type LaunchProps = {
   task: Task;
   snapshot: Snapshot;
   workspace: Workspace;
   onClose: () => void;
+  executionPolicySeed?: ExecutionPolicySeed;
 };
 
 const evaluationReasons = {
@@ -866,7 +874,16 @@ export function NativeEvaluation({
 }
 
 export function Launch(props: LaunchProps) {
+  return <ExecutionLaunch {...props} key={JSON.stringify(props.executionPolicySeed) ?? 'legacy'} />;
+}
+
+function ExecutionLaunch(props: LaunchProps) {
+  const seed = props.executionPolicySeed;
   const saved = props.snapshot.runs.find((run) => run.id === props.task.runId);
+  const savedNative = props.snapshot.nativeRuns.find((run) => run.runId === props.task.runId);
+  const [authority, setAuthority] = useState<Policy['authority']>(
+    savedNative ? (saved?.policy.policy.authority ?? 'guided') : (seed?.authority ?? 'guided'),
+  );
   const scriptedRun =
     !!saved &&
     saved.roles.every((role) =>
@@ -894,14 +911,33 @@ export function Launch(props: LaunchProps) {
         ? 'demo'
         : null;
   });
+  if (
+    seed &&
+    !savedNative &&
+    (seed.taskId !== props.task.id || seed.taskRevision !== props.task.revision)
+  )
+    return (
+      <Dialog title="Future execution draft unavailable" onClose={props.onClose}>
+        <p role="status">
+          The task changed. Close this draft and choose its future execution policy again.
+        </p>
+      </Dialog>
+    );
   if (choice === 'demo' && demoAvailable)
     return <ScriptedLaunch {...props} onBack={() => setChoice(null)} />;
-  if (choice && choice !== 'demo')
+  if (
+    choice &&
+    choice !== 'demo' &&
+    (choice.scope !== 'local' ||
+      authority === 'guided' ||
+      savedNative?.profileId === 'local-file-v1')
+  )
     return choice.scope === 'local' ? (
       <LocalFileLaunch {...props} onBack={() => setChoice(null)} />
     ) : (
       <NativeLaunch
         {...props}
+        initialAuthority={authority}
         scope={choice.scope}
         initialProfileId={choice.profileId}
         onBack={() => setChoice(null)}
@@ -914,6 +950,21 @@ export function Launch(props: LaunchProps) {
         <p>
           Choose a provider and scope. Review its source sharing and permissions before preparing.
         </p>
+        <label>
+          Future execution authority
+          <select
+            value={authority}
+            disabled={blocked}
+            onChange={(event) => {
+              setAuthority(event.target.value as Policy['authority']);
+              setChoice(null);
+            }}
+          >
+            <option value="guided">Guided</option>
+            <option value="balanced">Balanced</option>
+            <option value="autopilot">Autopilot</option>
+          </select>
+        </label>
         {blocked && (
           <p className="notice" role="status">
             Resolve the pending command before choosing another provider.
@@ -942,10 +993,16 @@ export function Launch(props: LaunchProps) {
                 {profile.available ? 'Preparation available' : 'Preparation unavailable'} ·{' '}
                 {titleCase(profile.reason.replaceAll('-', ' '))}
               </p>
+              {profile.family === 'local' && authority !== 'guided' && (
+                <p className="notice" role="status">
+                  Local preparation supports Guided authority only. Choose Guided to prepare with
+                  Local.
+                </p>
+              )}
               <button
                 type="button"
                 className="button secondary"
-                disabled={blocked}
+                disabled={blocked || (profile.family === 'local' && authority !== 'guided')}
                 onClick={() => setChoice({ scope, profileId: profile.id })}
               >
                 {profile.available ? 'Choose' : 'Inspect'} {profile.displayName}
@@ -1399,7 +1456,13 @@ function NativeLaunch({
   onBack,
   scope,
   initialProfileId,
-}: LaunchProps & { onBack: () => void; scope: 'file' | 'repository'; initialProfileId?: string }) {
+  initialAuthority,
+}: LaunchProps & {
+  onBack: () => void;
+  scope: 'file' | 'repository';
+  initialProfileId?: string;
+  initialAuthority?: Policy['authority'];
+}) {
   const project = snapshot.projects.find((value) => value.id === task.projectId);
   const repository = scope === 'repository';
   const profiles = snapshot.nativeProfiles
@@ -1454,7 +1517,7 @@ function NativeLaunch({
   const [policy, setPolicy] = useState<Policy>(
     () =>
       saved?.policy.policy ?? {
-        authority: 'guided',
+        authority: initialAuthority ?? 'guided',
         quality: 'quick',
         methods: [{ id: 'keep-it-simple', cycles: 1, reviewerRole: 'reviewer' }],
         limits: { attempts: 3, minutes: 5, concurrency: 1 },
@@ -1500,6 +1563,7 @@ function NativeLaunch({
   const capability = snapshot.nativeRuns.find((value) => value.runId === prepared?.id);
   const connected = workspace.connection === 'connected' && !workspace.preview;
   const allowed = connected && profile?.available && !workspace.pending;
+  const supportedAuthority = !google || policy.authority !== 'autopilot';
   const validConsent = savedConsent || (nativeTrust && sourceConsent);
   const validTools = !repository || savedConsent || nativeTools;
   const billingAttestation = attestedBilling
@@ -1600,6 +1664,7 @@ function NativeLaunch({
     : 'The controller has no supported native profile.';
   async function prepareNative() {
     if (
+      !supportedAuthority ||
       !allowed ||
       !validConsent ||
       !validTools ||
@@ -1786,6 +1851,10 @@ function NativeLaunch({
         </section>
         {prepared ? (
           <>
+            <p className="notice">
+              Saved execution authority: {titleCase(prepared.policy.policy.authority)}. This
+              prepared policy is frozen.
+            </p>
             <SourceFacts source={prepared.source} />
             <section className="card" aria-label="Prepared native target">
               <h2>{repository ? 'Saved repository' : 'Saved target'}</h2>
@@ -1881,6 +1950,33 @@ function NativeLaunch({
           </>
         ) : (
           <section className="card">
+            <label>
+              Execution authority
+              <select
+                value={policy.authority}
+                disabled={workspace.pending || workspace.retryAvailable}
+                onChange={(event) => {
+                  setPolicy({ ...policy, authority: event.target.value as Policy['authority'] });
+                  resetScope();
+                }}
+              >
+                <option value="guided">Guided</option>
+                <option value="balanced">Balanced</option>
+                <option value="autopilot" disabled={google}>
+                  Autopilot
+                </option>
+              </select>
+            </label>
+            {!supportedAuthority && (
+              <p className="notice" role="status">
+                Google preparation supports Guided or Balanced authority. Choose a supported
+                authority before preparing.
+              </p>
+            )}
+            <p className="muted small">
+              This draft grants nothing until explicit preparation. Source sharing and tool
+              permissions need fresh confirmation after an authority change.
+            </p>
             {repository ? (
               <>
                 <h2>Committed repository</h2>
@@ -2148,22 +2244,6 @@ function NativeLaunch({
                     Thought level unknown. The client advertised no thought selector.
                   </p>
                 )}
-                <label>
-                  Google authority
-                  <select
-                    value={policy.authority}
-                    onChange={(event) => {
-                      setPolicy({
-                        ...policy,
-                        authority: event.target.value === 'balanced' ? 'balanced' : 'guided',
-                      });
-                      resetConsent();
-                    }}
-                  >
-                    <option value="guided">Guided</option>
-                    <option value="balanced">Balanced</option>
-                  </select>
-                </label>
                 <p className="muted small">
                   All returned quota pools must be fresh and above reserve. The quota reader and ACP
                   login are separate sessions.
@@ -2264,6 +2344,7 @@ function NativeLaunch({
               <input
                 type="checkbox"
                 checked={savedConsent}
+                disabled={!saved || JSON.stringify(policy) !== JSON.stringify(saved.policy.policy)}
                 onChange={(event) => setSavedConsent(event.target.checked)}
               />
               Use saved consent for this exact {repository ? 'repository' : 'file'} and policy
@@ -2423,6 +2504,7 @@ function NativeLaunch({
             type="button"
             className="button primary"
             disabled={
+              !supportedAuthority ||
               !allowed ||
               !validConsent ||
               !validTools ||
