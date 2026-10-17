@@ -16,7 +16,12 @@ import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { test } from 'node:test';
 import { inspect } from 'node:util';
-import { localConnectionHash, resolveLocalConnection } from './connection.ts';
+import { hashCanonical } from '@crewkite/contracts/hash';
+import {
+  localConfiguredConnectionHash,
+  localConnectionHash,
+  resolveLocalConnection,
+} from './connection.ts';
 import {
   type LocalInputChild,
   type LocalInputHelper,
@@ -168,6 +173,95 @@ test('Local secret input returns one current private result after helper cleanup
   assert.equal(resolved.facts.family, 'local');
   assert.equal(resolved.facts.billing, 'local');
   assert(!('creditPolicies' in resolved.facts));
+  const runtime = { connectorId: 'local-sdk-v1', version: '0.5.0', build: 9 };
+  const identity = {
+    modelKey: 'fixture/new-model',
+    displayName: 'Installed fixture',
+    format: 'safetensors',
+    sizeBytes: 1234567,
+    quantization: { name: 'fixture-quant', bits: 6 },
+    selectedVariant: 'fixture-variant',
+    metadataHash: digest('runtime metadata'),
+  };
+  const selectionId = hashCanonical({ runtime, metadataHash: identity.metadataHash });
+  const observed = {
+    version: 1,
+    runtime,
+    residentLlms: 1,
+    embeddingInstances: 0,
+    models: [
+      {
+        selectionId,
+        identity,
+        instanceReference: 'new-instance',
+        contextLength: 8192,
+        state: 'loaded-eligible',
+        reasons: [],
+        qualification: 'unqualified',
+      },
+    ],
+  };
+  const selection = {
+    endpoint: prompt.endpoint,
+    connectionRevision: 2,
+    selectionId,
+    observation: { ...observed, observationHash: hashCanonical(observed) },
+  };
+  const selected = resolveLocalConnection(selection, capability);
+  assert.equal(selected.facts.reason, 'qualification-pending');
+  assert.equal(selected.facts.qualifiedAt, null);
+  assert.equal(selected.connection?.modelBinding.modelKey, identity.modelKey);
+  assert.equal(
+    selected.connection?.connectionHash,
+    localConfiguredConnectionHash(prompt.endpoint, 2),
+  );
+  assert.ok(selected.connection && 'version' in selected.connection.modelBinding);
+  assert(!('artifactSha256' in selected.connection.modelBinding));
+  assert.equal(
+    selected.connection.modelBinding.setupHash,
+    hashCanonical({
+      version: 2,
+      connectionHash: selected.connection.connectionHash,
+      observationHash: selection.observation.observationHash,
+      selectionId,
+    }),
+  );
+  const changedConnection = resolveLocalConnection(
+    { ...selection, connectionRevision: 3 },
+    capability,
+  );
+  assert.notEqual(changedConnection.connection?.connectionHash, selected.connection.connectionHash);
+  assert.notEqual(
+    changedConnection.connection?.modelBinding.setupHash,
+    selected.connection.modelBinding.setupHash,
+  );
+  for (const invalid of [
+    { ...selection, selectionId: digest('missing choice') },
+    { ...selection, observation: { ...selection.observation, observationHash: digest('stale') } },
+    { ...selection, connectionRevision: -1 },
+    { ...selection, receipt },
+    { ...selection, observation: { ...selection.observation, models: [] } },
+  ])
+    assert.equal(resolveLocalConnection(invalid, capability).connection, null);
+  const unloaded = {
+    ...observed,
+    residentLlms: 0,
+    models: [
+      {
+        ...observed.models[0],
+        instanceReference: null,
+        contextLength: null,
+        state: 'installed-unloaded',
+      },
+    ],
+  };
+  assert.equal(
+    resolveLocalConnection(
+      { ...selection, observation: { ...unloaded, observationHash: hashCanonical(unloaded) } },
+      capability,
+    ).connection,
+    null,
+  );
   assert.equal(
     resolveLocalConnection(configuration, { ...capability, secretConfigured: false }).facts
       .available,

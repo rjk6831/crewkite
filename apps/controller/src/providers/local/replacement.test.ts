@@ -8,9 +8,15 @@ import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { test } from 'node:test';
 import type { LLMPredictionOpts, PredictionResult } from '@lmstudio/sdk';
+import { resolveLocalConnection } from './connection.ts';
 import { type LocalStart, type LocalTerminal, localPlan } from './profile.ts';
 import { startLocalReplacement } from './replacement.ts';
-import { type LoadedModel, startLocalPrediction } from './sdk.ts';
+import {
+  discoverLocalModels,
+  type LoadedModel,
+  type LocalDiscoveryClient,
+  startLocalPrediction,
+} from './sdk.ts';
 
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 const plan: LocalStart = {
@@ -147,6 +153,21 @@ function fixture() {
 async function flush() {
   for (let i = 0; i < 40; i++) await Promise.resolve();
 }
+function discoveryClient(
+  f: ReturnType<typeof fixture>,
+  downloaded: unknown[] = [info],
+): LocalDiscoveryClient {
+  return {
+    ...f.client,
+    system: {
+      getLMStudioVersion: async () => ({ version: '0.5.0', build: 9 }),
+      listDownloadedModels: async () => downloaded,
+      listDownloadedModelVariants: async () => {
+        throw new Error('No variants were declared.');
+      },
+    },
+  };
+}
 
 test('Local generation requires authenticated loopback and an exact loaded instance within context', async () => {
   for (const endpoint of [
@@ -254,6 +275,170 @@ test('Local generation requires authenticated loopback and an exact loaded insta
     assert.equal(result.kind, 'failed', row.name);
     assert.equal('reason' in result && result.reason, row.reason, row.name);
     assert.equal(f.submitted, 0, row.name);
+  }
+  for (const format of ['gguf', 'safetensors'] as const) {
+    const f = fixture();
+    const metadata = {
+      ...info,
+      format,
+      selectedVariant: 'selected-variant',
+      quantization: { name: 'arbitrary-quantization', bits: 6 },
+    };
+    f.model.getModelInfo = async () => metadata;
+    const client = discoveryClient(f, [metadata]);
+    const discovery = await discoverLocalModels(client, { now: () => 0 });
+    assert.equal(discovery.kind, 'observed');
+    assert(discovery.kind === 'observed');
+    const choice = discovery.observation.models[0];
+    assert.equal(choice.state, 'loaded-eligible');
+    assert.equal(choice.qualification, 'unqualified');
+    assert.equal(f.submitted, 0);
+    assert(!JSON.stringify(discovery).includes(metadata.path));
+    assert(!JSON.stringify(discovery).includes('deviceIdentifier'));
+    const selected = resolveLocalConnection(
+      {
+        endpoint: plan.endpoint,
+        connectionRevision: 1,
+        observation: discovery.observation,
+        selectionId: choice.selectionId,
+      },
+      { platform: 'darwin', arch: 'arm64', secretConfigured: true },
+    );
+    assert(selected.connection);
+    const genericPlan = localPlan({
+      ...plan,
+      binding: {
+        ...selected.connection.modelBinding,
+        attemptId: plan.binding.attemptId,
+        generation: plan.binding.generation,
+        profileHash: plan.binding.profileHash,
+        sourceHash: plan.binding.sourceHash,
+        path: plan.binding.path,
+        baseHash: plan.binding.baseHash,
+      },
+    });
+    assert.throws(() => localPlan({ ...genericPlan, endpoint: 'ws://127.0.0.1:4321' }));
+    const run = startLocalPrediction(genericPlan, {
+      createClient: () => client,
+      schedule: f.schedule,
+      now: () => 0,
+    });
+    await flush();
+    assert.equal(f.submitted, 1);
+    f.resolve({ ...terminal(), modelInfo: metadata });
+    assert.equal((await run.result).kind, 'completed');
+    for (const drift of ['runtime', 'model-path', 'extra-resident'] as const) {
+      const next = fixture();
+      next.model.getModelInfo = async () => metadata;
+      const changed = discoveryClient(next, [metadata]);
+      const refused = startLocalPrediction(genericPlan, {
+        createClient: () => changed,
+        schedule: next.schedule,
+        now: () => 0,
+        onSubmitted: () => {
+          if (drift === 'runtime')
+            changed.system.getLMStudioVersion = async () => ({ version: '0.5.0', build: 10 });
+          if (drift === 'model-path')
+            next.model.getModelInfo = async () => ({ ...metadata, path: 'different-model' });
+          if (drift === 'extra-resident')
+            changed.llm.listLoaded = async () => [next.model, next.model];
+        },
+      });
+      const outcome = await refused.result;
+      assert.equal(outcome.kind, 'failed', drift);
+      assert.equal('reason' in outcome && outcome.reason, 'identity', drift);
+      assert.equal(next.submitted, 0, drift);
+    }
+  }
+  for (const row of [
+    'downloaded-limit',
+    'variant-limit',
+    'loaded-limit',
+    'duplicate',
+    'remote',
+    'unloaded',
+    'unsupported',
+    'deadline',
+    'stopped',
+    'transport',
+  ] as const) {
+    const f = fixture();
+    const client = discoveryClient(f);
+    let clock = 0;
+    const signal = new AbortController();
+    if (row === 'downloaded-limit')
+      client.system.listDownloadedModels = async () => Array(65).fill(info);
+    if (row === 'variant-limit') {
+      client.system.listDownloadedModels = async () => [{ ...info, variants: ['many'] }];
+      client.system.listDownloadedModelVariants = async () => Array(65).fill(info);
+    }
+    if (row === 'loaded-limit') client.llm.listLoaded = async () => Array(9).fill(f.model);
+    if (row === 'duplicate') client.system.listDownloadedModels = async () => [info, info];
+    if (row === 'remote') {
+      const remote = { ...info, deviceIdentifier: 'remote-runtime' };
+      client.system.listDownloadedModels = async () => [remote];
+      f.model.getModelInfo = async () => remote;
+    }
+    if (row === 'unloaded') client.llm.listLoaded = async () => [];
+    if (row === 'unsupported') {
+      client.system.listDownloadedModels = async () => [{ ...info, format: 'unknown-format' }];
+      client.llm.listLoaded = async () => [];
+    }
+    if (row === 'deadline')
+      client.system.listDownloadedModels = async () => {
+        clock = 15000;
+        return [info];
+      };
+    if (row === 'stopped') signal.abort();
+    if (row === 'transport')
+      client.system.listDownloadedModels = async () => {
+        throw new Error('private runtime details');
+      };
+    const outcome = await discoverLocalModels(client, { now: () => clock, signal: signal.signal });
+    const observed = ['remote', 'unloaded', 'unsupported'].includes(row);
+    assert.equal(outcome.kind, observed ? 'observed' : 'unavailable', row);
+    if (outcome.kind === 'observed')
+      assert.equal(
+        outcome.observation.models[0].state,
+        row === 'unloaded' ? 'installed-unloaded' : 'incompatible',
+        row,
+      );
+    else
+      assert.equal(
+        outcome.reason,
+        row.endsWith('limit') ? 'limit' : row === 'duplicate' ? 'metadata' : row,
+        row,
+      );
+    assert.equal(f.submitted, 0, row);
+    assert(!JSON.stringify(outcome).includes('private runtime details'));
+  }
+  for (const reason of ['deadline', 'stopped'] as const) {
+    const f = fixture();
+    const client = discoveryClient(f);
+    let release!: (value: { version: string; build: number }) => void;
+    client.system.getLMStudioVersion = () =>
+      new Promise((resolve) => {
+        release = resolve;
+      });
+    let laterReads = 0;
+    client.system.listDownloadedModels = async () => {
+      laterReads++;
+      return [info];
+    };
+    const signal = new AbortController();
+    const pending = discoverLocalModels(client, {
+      now: () => 0,
+      schedule: f.schedule,
+      signal: signal.signal,
+    });
+    if (reason === 'deadline') f.timers.find((timer) => timer.active)?.work();
+    else signal.abort();
+    assert.deepEqual(await pending, { kind: 'unavailable', reason });
+    release({ version: '0.5.0', build: 9 });
+    await flush();
+    assert.equal(laterReads, 0);
+    assert.equal(f.submitted, 0);
+    assert.equal(f.timers.filter((timer) => timer.active).length, 0);
   }
 });
 

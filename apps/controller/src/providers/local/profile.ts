@@ -1,5 +1,11 @@
 import { createHash } from 'node:crypto';
-import { AttemptIdSchema, HashSchema, NativeTargetPathSchema } from '@crewkite/contracts';
+import {
+  AttemptIdSchema,
+  HashSchema,
+  LocalObservedModelBindingSchema,
+  NativeTargetPathSchema,
+} from '@crewkite/contracts';
+import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
 
 export const CONTEXT_TOKENS = 8192;
@@ -16,19 +22,24 @@ const text = (max: number) =>
       (value) => value.isWellFormed() && !value.includes('\0') && Buffer.byteLength(value) <= max,
     );
 const id = text(200).refine((value) => value.length > 0);
-export const BindingSchema = z.strictObject({
+const attemptBinding = {
   attemptId: AttemptIdSchema,
   generation: z.number().int().nonnegative().safe(),
   profileHash: HashSchema,
   sourceHash: HashSchema,
   path: NativeTargetPathSchema,
   baseHash: HashSchema,
+};
+const legacyBinding = z.strictObject({
+  ...attemptBinding,
   modelKey: id,
   instanceReference: id,
   modelSizeBytes: z.number().int().positive().safe(),
   artifactSha256: HashSchema,
   quantization: z.literal('Q4_K_M'),
 });
+const observedBinding = LocalObservedModelBindingSchema.extend(attemptBinding);
+export const BindingSchema = z.union([legacyBinding, observedBinding]);
 export const StartSchema = z.strictObject({
   binding: BindingSchema,
   endpoint: z
@@ -113,6 +124,16 @@ export function localPlan(value: LocalStart): LocalStart {
   const plan = StartSchema.parse(value);
   if (createHash('sha256').update(plan.original).digest('hex') !== plan.binding.baseHash)
     throw new Error('The Local original hash does not match.');
+  if (
+    'version' in plan.binding &&
+    plan.binding.connectionHash !==
+      hashCanonical({
+        connector: plan.binding.connectorId,
+        endpoint: plan.endpoint,
+        connectionRevision: plan.binding.connectionRevision,
+      })
+  )
+    throw new Error('The Local connection identity does not match.');
   return Object.freeze({ ...plan, binding: Object.freeze(plan.binding) });
 }
 
