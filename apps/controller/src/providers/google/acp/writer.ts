@@ -68,7 +68,19 @@ export const AcpToolMappingSchema = z.discriminatedUnion('schema', [
   }),
 ]);
 export type AcpToolMapping = z.infer<typeof AcpToolMappingSchema>;
-export const GoogleAcpToolMappings: readonly AcpToolMapping[] = Object.freeze([]);
+export const GoogleAcpToolMappings: readonly AcpToolMapping[] = Object.freeze([
+  {
+    client: {
+      version: '1.4.0',
+      sha256: '34e0cd2fe6fcafc4b280a81d38026c55689e54c0619c6729a781f1ebfefa1d88',
+      signerTeamId: 'EQHXZ8M8AV',
+      harnessSha256: 'e7d236a0761ef904cee649e6f42e56861ca953457f8f62bcd0cdf649640d0ff5',
+    },
+    toolTitle: 'Run replace_file_content?',
+    schema: 'replace-hunk-v1',
+    evidenceHash: 'abe9f3af6f37ec81399df78fe1672964f07fe9daf0258398803dd39bc5c2080a',
+  },
+]);
 export type AcpDependencies = {
   reviewMappings?: readonly AcpReviewMapping[];
   toolMappings?: readonly AcpToolMapping[];

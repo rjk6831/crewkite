@@ -25,6 +25,7 @@ import {
   type AcpReviewMapping,
   type AcpSetupProof,
   acpClientPin,
+  GoogleAcpReviewMappings,
   googleAcpDeveloperIdRequirement,
   readGoogleAcpPin,
   resolveGoogleAcpProfile,
@@ -38,6 +39,7 @@ import {
   acpPermissionAfterHash,
   decodeAcpConfiguration,
   decodeAcpPermissionAction,
+  GoogleAcpToolMappings,
   googleAcpWriterPlan,
   startGoogleAcpSetup,
   startGoogleAcpWriter,
@@ -670,6 +672,78 @@ test('the acp protocol consumes one complete live permission and never treats co
         toolMappings: [hunkFixture.hunkMapping],
         readTarget,
       });
+    const productionTool = GoogleAcpToolMappings[0];
+    assert.equal(GoogleAcpToolMappings.length, 1);
+    assert.equal(GoogleAcpReviewMappings.length, 1);
+    assert.equal(productionTool.schema, 'replace-hunk-v1');
+    if (productionTool.schema !== 'replace-hunk-v1') assert.fail('Expected the pinned hunk tool.');
+    const productionClient = {
+      ...productionTool.client,
+      executable: hunkFixture.client.executable,
+    };
+    const productionReview = GoogleAcpReviewMappings[0];
+    assert.equal(productionReview.harnessSha256, productionClient.harnessSha256);
+    assert.equal(productionReview.configId, 'mode');
+    assert.equal(productionReview.valueId, 'default');
+    assert.equal(productionReview.evidenceHash, productionTool.evidenceHash);
+    const productionModes = [
+      { optionId: 'mode', valueId: 'default' },
+      { optionId: 'mode', valueId: 'auto_edit' },
+      { optionId: 'mode', valueId: 'yolo' },
+    ];
+    const productionProof: AcpSetupProof = {
+      ...hunkFixture.proof,
+      client: acpClientPin(productionClient),
+      modeValues: productionModes,
+      reviewMode: {
+        surface: 'config',
+        configId: 'mode',
+        valueId: 'default',
+        semantics: 'request-review',
+        mappingEvidenceHash: productionReview.evidenceHash,
+        discoveryStateHash: hashCanonical({
+          configOptions: hunkFixture.proof.configOptions,
+          modeValues: productionModes,
+        }),
+      },
+    };
+    assert.deepEqual(validateAcpSetupProof(productionProof, productionClient), productionProof);
+    assert.deepEqual(
+      decodeAcpPermissionAction({
+        tool,
+        client: productionClient,
+        scratch: hunkFixture.scratch,
+        target,
+        toolMappings: GoogleAcpToolMappings,
+        readTarget: targetState,
+      }),
+      decode(tool),
+    );
+    for (const change of [
+      { sha256: 'a'.repeat(64) },
+      { harnessSha256: 'a'.repeat(64) },
+      { signerTeamId: 'OTHERTEAM1' },
+    ]) {
+      const changed = { ...productionClient, ...change };
+      assert.throws(() => validateAcpSetupProof(productionProof, changed));
+      assert.throws(() =>
+        decodeAcpPermissionAction({
+          tool,
+          client: changed,
+          scratch: hunkFixture.scratch,
+          target,
+          toolMappings: GoogleAcpToolMappings,
+          readTarget: targetState,
+        }),
+      );
+    }
+    for (const valueId of ['auto_edit', 'yolo'])
+      assert.throws(() =>
+        validateAcpSetupProof(
+          { ...productionProof, reviewMode: { ...productionProof.reviewMode, valueId } },
+          productionClient,
+        ),
+      );
     const action = decode(tool);
     assert.equal(action.type, 'replace-hunk');
     assert.equal(action.baseHash, hash(original));
