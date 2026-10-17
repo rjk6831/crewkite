@@ -201,6 +201,17 @@ const retry = identity.extend({
 });
 
 const metadataNumber = z.number().finite().nonnegative().max(Number.MAX_SAFE_INTEGER);
+const status = z.strictObject({
+  ...identity.shape,
+  type: z.literal('system'),
+  subtype: z.literal('status'),
+  uuid: z.uuid(),
+  status: z.enum(['compacting', 'requesting']).nullable(),
+  permissionMode: z.literal('default').optional(),
+  compact_result: z.enum(['success', 'failed']).optional(),
+  compact_error: z.string().max(4096).optional(),
+  compact_output_chars: metadataNumber.int().optional(),
+});
 const rateLimitStatus = z.enum(['allowed', 'allowed_warning', 'rejected']);
 const rateLimit = identity.extend({
   type: z.literal('rate_limit_event'),
@@ -266,6 +277,24 @@ const envelopes = [
 const subtypes = [
   'init',
   'api_retry',
+  'status',
+  'agents_killed',
+  'away_summary',
+  'compact_boundary',
+  'control_request_progress',
+  'instruction_size_warning',
+  'local_command',
+  'memory_saved',
+  'mirror_error',
+  'model_refusal_fallback',
+  'permission_retry',
+  'post_turn_summary',
+  'session_metadata',
+  'stop_hook_summary',
+  'task_notification',
+  'task_started',
+  'task_summary',
+  'thinking',
   'hook_started',
   'hook_progress',
   'hook_response',
@@ -303,6 +332,11 @@ const fields = [
   'rate_limit_info',
   'parent_tool_use_id',
   'isReplay',
+  'status',
+  'permissionMode',
+  'compact_result',
+  'compact_error',
+  'compact_output_chars',
 ] as const;
 export type ReplacementDiagnostic = Readonly<{
   stage: 'before-init' | 'output' | 'complete';
@@ -313,6 +347,7 @@ export type ReplacementDiagnostic = Readonly<{
     | 'assistant'
     | 'user'
     | 'retry'
+    | 'status'
     | 'rate-limit'
     | 'result'
     | 'replacement'
@@ -416,6 +451,10 @@ export class ReplacementStream {
           this.site = 'user';
           // Native user-role output is discarded. Only the terminal result can supply a proposal.
           user.parse(value);
+        } else if (type === 'system' && record.subtype === 'status') {
+          this.site = 'status';
+          // Progress cannot change the fixed permission mode or supply replacement authority.
+          status.parse(value);
         } else if (type === 'system') {
           this.site = 'retry';
           retry.parse(value);

@@ -49,6 +49,13 @@ const result = {
   structured_output: edit,
   permission_denials: [],
 };
+const status = {
+  type: 'system',
+  subtype: 'status',
+  session_id: input.sessionId,
+  uuid: '46eb17cd-01e8-480d-99f4-a741f189715f',
+  status: 'requesting',
+};
 const line = (value: unknown) => Buffer.from(`${JSON.stringify(value)}\n`);
 const secret = 'private-account@example.test';
 const user = {
@@ -198,9 +205,70 @@ test('native text replacement stays bound to one proposal and owned task deadlin
     pass?: boolean;
     toolsEmpty?: boolean;
     pluginsEmpty?: boolean;
+    retries?: number;
     diagnostic?: Record<string, unknown>;
   }> = [
     { name: 'valid', frames: [init, result], pass: true },
+    { name: 'request status is progress only', frames: [init, status, result], pass: true },
+    {
+      name: 'bounded compaction metadata is discarded',
+      frames: [
+        init,
+        {
+          ...status,
+          status: 'compacting',
+          compact_output_chars: 123,
+          compact_result: 'failed',
+          compact_error: secret,
+        },
+        { ...status, status: null, permissionMode: 'default' },
+        result,
+      ],
+      pass: true,
+    },
+    ...[
+      { ...status, status: secret },
+      { ...status, permissionMode: 'bypassPermissions' },
+      { ...status, permissionMode: 'acceptEdits' },
+      { ...status, compact_result: secret },
+      { ...status, compact_error: 'x'.repeat(4097) },
+      { ...status, compact_output_chars: -1 },
+      { ...status, compact_output_chars: 0.5 },
+      { ...status, compact_output_chars: Number.MAX_SAFE_INTEGER + 1 },
+      { ...status, uuid: secret },
+      { ...status, uuid: undefined },
+      { ...status, command: secret },
+      { ...status, structured_output: edit },
+    ].map((frame, index) => ({
+      name: `malformed or authoritative status ${index} is refused`,
+      frames: [init, frame, result],
+      diagnostic: { site: 'status', subtype: 'status' },
+    })),
+    {
+      name: 'status cannot initialize a session',
+      frames: [status, result],
+      diagnostic: { stage: 'before-init', site: 'init', subtype: 'status' },
+    },
+    { name: 'status cannot complete a proposal', frames: [init, status] },
+    { name: 'status after terminal remains refused', frames: [init, result, status] },
+    {
+      name: 'status remains session bound',
+      frames: [init, { ...status, session_id: '46eb17cd-01e8-480d-99f4-a741f189715e' }, result],
+      diagnostic: { site: 'identity', cause: 'correlation', field: 'session_id' },
+    },
+    ...[
+      'compact_boundary',
+      'task_started',
+      'task_notification',
+      'model_refusal_fallback',
+      'session_metadata',
+      'permission_retry',
+    ].map((subtype) => ({
+      name: `known system ${subtype} stays refused and identifiable`,
+      frames: [init, { type: 'system', subtype, session_id: input.sessionId, content: secret }],
+      diagnostic: { stage: 'output', site: 'retry', subtype, field: 'subtype' },
+    })),
+
     {
       name: 'different regular path',
       frames: [init, { ...result, structured_output: { ...edit, path: 'other.mjs' } }],
@@ -363,6 +431,7 @@ test('native text replacement stays bound to one proposal and owned task deadlin
     },
     {
       name: 'ordinary retry remains one task',
+      retries: 1,
       frames: [
         init,
         {
@@ -488,6 +557,7 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       assert.equal(output.nativeToolsReportedEmpty, row.toolsEmpty ?? true, row.name);
       assert.equal(output.nativePluginsReportedEmpty, row.pluginsEmpty ?? true, row.name);
       assert.equal(output.qualified, false, row.name);
+      assert.equal(output.observedRetries, row.retries ?? 0, row.name);
       assert(!JSON.stringify(output).includes(secret), row.name);
     } catch (error) {
       if (!(error instanceof ReplacementError)) throw error;
