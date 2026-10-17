@@ -866,22 +866,111 @@ export function NativeEvaluation({
 }
 
 export function Launch(props: LaunchProps) {
-  const [native, setNative] = useState<'file' | 'repository' | 'local' | null>(() => {
+  const saved = props.snapshot.runs.find((run) => run.id === props.task.runId);
+  const scriptedRun =
+    !!saved &&
+    saved.roles.every((role) =>
+      [role.routeId, ...role.approvedFallbacks].every((id) =>
+        props.snapshot.routes.some((route) => route.id === id && route.fake),
+      ),
+    );
+  const demoAvailable =
+    scriptedRun || props.snapshot.routes.some((route) => route.fake && route.qualified);
+  const [choice, setChoice] = useState<
+    { scope: 'file' | 'repository' | 'local'; profileId: string } | 'demo' | null
+  >(() => {
     const current = props.snapshot.nativeRuns.find((run) => run.runId === props.task.runId);
     return current
-      ? current.profileId === 'local-file-v1'
-        ? 'local'
-        : current.profileId === 'openai-repository-v1'
-          ? 'repository'
-          : 'file'
-      : null;
+      ? {
+          scope:
+            current.profileId === 'local-file-v1'
+              ? 'local'
+              : current.profileId === 'openai-repository-v1'
+                ? 'repository'
+                : 'file',
+          profileId: current.profileId,
+        }
+      : scriptedRun
+        ? 'demo'
+        : null;
   });
-  return native === 'local' ? (
-    <LocalFileLaunch {...props} onBack={() => setNative(null)} />
-  ) : native ? (
-    <NativeLaunch {...props} scope={native} onBack={() => setNative(null)} />
-  ) : (
-    <ScriptedLaunch {...props} onNative={setNative} />
+  if (choice === 'demo' && demoAvailable)
+    return <ScriptedLaunch {...props} onBack={() => setChoice(null)} />;
+  if (choice && choice !== 'demo')
+    return choice.scope === 'local' ? (
+      <LocalFileLaunch {...props} onBack={() => setChoice(null)} />
+    ) : (
+      <NativeLaunch
+        {...props}
+        scope={choice.scope}
+        initialProfileId={choice.profileId}
+        onBack={() => setChoice(null)}
+      />
+    );
+  const blocked = props.workspace.pending || props.workspace.retryAvailable;
+  return (
+    <Dialog title="Choose execution provider" onClose={props.onClose} wide>
+      <div className="launch-content view-stack">
+        <p>
+          Choose a provider and scope. Review its source sharing and permissions before preparing.
+        </p>
+        {blocked && (
+          <p className="notice" role="status">
+            Resolve the pending command before choosing another provider.
+          </p>
+        )}
+        {!props.snapshot.nativeProfiles.length && (
+          <p className="notice" role="status">
+            The provider catalog is unavailable. Refresh the saved workspace before preparing.
+          </p>
+        )}
+        {props.snapshot.nativeProfiles.map((profile) => {
+          const scope =
+            profile.family === 'local'
+              ? 'local'
+              : profile.id === 'openai-repository-v1'
+                ? 'repository'
+                : 'file';
+          return (
+            <section key={profile.id} className="view-stack">
+              <h3>{profile.displayName}</h3>
+              <p className="muted small">
+                {familyName(profile.family)} · {scope === 'repository' ? 'Repository' : 'One file'}
+                {' · '}Requested model {profile.model}
+              </p>
+              <p className="muted small" role="status">
+                {profile.available ? 'Preparation available' : 'Preparation unavailable'} ·{' '}
+                {titleCase(profile.reason.replaceAll('-', ' '))}
+              </p>
+              <button
+                type="button"
+                className="button secondary"
+                disabled={blocked}
+                onClick={() => setChoice({ scope, profileId: profile.id })}
+              >
+                {profile.available ? 'Choose' : 'Inspect'} {profile.displayName}
+                <ArrowRight size={14} />
+              </button>
+            </section>
+          );
+        })}
+        {demoAvailable && (
+          <button
+            type="button"
+            className="button secondary"
+            disabled={blocked}
+            onClick={() => setChoice('demo')}
+          >
+            Scripted demo
+          </button>
+        )}
+      </div>
+      <div className="dialog-footer">
+        <button type="button" className="button secondary" onClick={props.onClose}>
+          Cancel
+        </button>
+      </div>
+    </Dialog>
   );
 }
 
@@ -1309,7 +1398,8 @@ function NativeLaunch({
   onClose,
   onBack,
   scope,
-}: LaunchProps & { onBack: () => void; scope: 'file' | 'repository' }) {
+  initialProfileId,
+}: LaunchProps & { onBack: () => void; scope: 'file' | 'repository'; initialProfileId?: string }) {
   const project = snapshot.projects.find((value) => value.id === task.projectId);
   const repository = scope === 'repository';
   const profiles = snapshot.nativeProfiles
@@ -1324,6 +1414,7 @@ function NativeLaunch({
   const saved = current ? snapshot.runs.find((value) => value.id === task.runId) : undefined;
   const [profileId, setProfileId] = useState(
     current?.profileId ??
+      initialProfileId ??
       profiles.find((value) => value.id === 'openai-file-v1')?.id ??
       profiles[0]?.id ??
       '',
@@ -2276,7 +2367,7 @@ function NativeLaunch({
         </button>
         {!prepared && (
           <button type="button" className="button secondary" onClick={onBack}>
-            Scripted run
+            Provider choices
           </button>
         )}
         <span className="muted small">
@@ -2717,9 +2808,9 @@ function ScriptedLaunch({
   snapshot,
   workspace,
   onClose,
-  onNative,
+  onBack,
 }: {
-  onNative: (scope: 'file' | 'repository' | 'local') => void;
+  onBack: () => void;
   task: Task;
   snapshot: Snapshot;
   workspace: Workspace;
@@ -3160,16 +3251,8 @@ function ScriptedLaunch({
     >
       {!prepared && (
         <div className="button-row">
-          <button type="button" className="button secondary" onClick={() => onNative('file')}>
-            Native file proposal
-            <ArrowRight size={14} />
-          </button>
-          <button type="button" className="button secondary" onClick={() => onNative('repository')}>
-            Repository work
-            <ArrowRight size={14} />
-          </button>
-          <button type="button" className="button secondary" onClick={() => onNative('local')}>
-            Local file proposal
+          <button type="button" className="button secondary" onClick={onBack}>
+            Provider choices
             <ArrowRight size={14} />
           </button>
         </div>
