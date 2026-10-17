@@ -11,7 +11,7 @@ I checked the following primary-source guidance on 17 October 2026. Client behav
 | OpenAI | Bounded local native file and repository work | The [app-server authentication guidance](https://learn.chatgpt.com/docs/app-server#auth-endpoints) permits continued use by local or open-source applications. It recommends migration to Sign in with ChatGPT and excludes commercial or hosted services from app-server authentication. |
 | Anthropic | Bounded local native single-file work | The [native-binary policy](https://code.claude.com/docs/en/legal-and-compliance#can-customers-offer-claude-code-in-their-products) permits end users to sign in with their own subscription under its product conditions. The [7 October update](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan) preserves subscription-limit use of the Agent SDK, `claude -p` and third-party apps. |
 | Google | Opt-in quota reader and separate ACP setup; both coding profiles unavailable | The [official FAQ](https://antigravity.google/docs/faq/#can-i-use-antigravity-cli-headless-mode-in-third-party-coding-agents-or-automate-account-switching) excludes wrapping the consumer CLI inside third-party applications. Google documents its separate ACP agent for editors. CrewKite is not named. No ACP route is qualified and no API fallback is configured. |
-| Local | Planned authenticated loopback integration | No model is installed or loaded by the scripted Local fixture. Memory, latency, quality and cancellation still need qualification. |
+| Local | Explicit authenticated loopback setup and observed model selection | Models remain unqualified. Discovery installs or loads no model; memory, latency, quality and cancellation still need measurement. |
 
 Running Claude Code in a product requires the publisher's agreement to Anthropic's Commercial Terms, an unmodified official binary with its authentication methods intact, and each user's own login and direct billing. Credentials and usage cannot be intermediated. CrewKite starts the user's installed native client, offers no separate login and does not collect OAuth tokens. It no longer forces a login method. Fresh authentication and billing attestations remain required by this profile. The [account guidance](https://support.claude.com/en/articles/13189465-log-in-to-your-claude-account) reserves third-party usage-credit billing, so these checks establish no provider hard spending cap or guaranteed included billing.
 
@@ -41,7 +41,7 @@ Setup exposes separate Initialize, Authenticate, Discover and Stop actions. Init
 
 ### Prepare, approve and stop
 
-Preparation freezes the selected committed target, original hash and mode, setup proof, client identity, observed model, optional thought level and policy. The target must be existing NUL-free UTF-8 text within 64 KiB. Guided and balanced authority require a human decision for every native permission request. The ordinary-subscription and disabled-overage confirmations remain user assertions. Preparation also requires a separate assertion that CLI quota and ACP sign-in use the same account. Shared native HOME proves no identity or entitlement. Every returned account bucket must be fresh and above reserve; disabled reads, stale or missing windows block Start. Automatic admission refresh remains a separate integration step.
+Preparation freezes the selected committed target, original hash and mode, setup proof, client identity, observed model, optional thought level and policy. The target must be existing NUL-free UTF-8 text within 64 KiB. Guided and balanced authority require a human decision for every native permission request. The ordinary-subscription and disabled-overage confirmations remain user assertions. Preparation also requires a separate assertion that CLI quota and ACP sign-in use the same account. Shared native HOME proves no identity or entitlement. Every returned account bucket must be fresh and above reserve. Start can refresh missing or stale quota once under saved opt-in, subject to the quota reader's ownership and cooldown gates.
 
 Start uses a fresh session, reapplies the exact model, optional thought level and verified review-mode option, then checks the returned configuration before one bounded prompt. A changed or missing option refuses with no fallback. The controller commits the submission marker before prompting. One submission and at most five minutes cover task execution and cleanup. Disabling ACP filesystem and terminal services does not disable the agent's native tools or establish containment under [ADR 0009](adr/0009-native-client-trust-profile.md).
 
@@ -67,7 +67,9 @@ A separate metadata-operation journal records intent, process ownership and clos
 
 All returned buckets attach conservatively to Google routes, without inferred model-group entitlement. A quota-only display row remains unqualified with unknown model and effort; included billing describes intended mode. A read never makes that row selectable for coding. Applying every bucket can refuse a model because another pool is low; I accept that cost.
 
-ACP preparation requires a separate user assertion that CLI quota and ACP sign-in use the same Google account. It remains user-attested, with no verified identity claim. Every returned bucket must be fresh and above reserve before ACP admission. Disabled reads, stale data and missing windows block ACP Start. Automatic admission refresh remains planned. ACP context tokens never substitute for account allowance.
+ACP preparation requires a separate user assertion that CLI quota and ACP sign-in use the same Google account. It remains user-attested, with no verified identity claim. Start can make one read under saved opt-in when quota is missing, stale, unknown or awaiting a reported reset. Fresh exhausted quota or a fresh bucket at reserve refuses without another read. Active or unknown Google ownership, disabled reads and the durable cooldown still block a needed refresh. The thirty-second Start preflight includes the reader's twenty-second process bound. It creates no task attempt before the read completes and authority is rechecked.
+
+Final admission rechecks every returned bucket and reserve, current account assertion, setup proof, source and consent revision. Stop for the exact pending task and run, controller close or consent revocation prevents late admission. A failed read cannot fall back to old windows or a fixed allowance. Fresh quota needs no new read and is unaffected by the read cooldown. These checks establish no ACP qualification or integration permission. ACP context tokens never substitute for account allowance.
 
 ## Google native workspace context
 
@@ -184,7 +186,7 @@ Each fact is recorded as supported, unsupported or unknown. Discovery spends no 
 
 ## Boundaries I hold for every route
 
-- CrewKite never collects, copies, remaps or logs provider credentials.
+- Cloud-provider authentication stays with the native client and its credential store.
 - Ambient API keys and billing overrides are excluded from child environments.
 - Missing required billing evidence or a required subscription attestation blocks launch. There is no hidden fallback to paid API usage.
 - Existing-credit spending defaults off per provider. Controls must state whether the provider enforces a hard cap.
@@ -193,4 +195,8 @@ Each fact is recorded as supported, unsupported or unknown. Discovery spends no 
 
 ## Local models
 
-Local inference is planned and optional. A qualified local route needs authenticated loopback access, narrow CORS and no remote redirect. The first planned profile for a 48 GB Apple Silicon machine permits one resident model and one generation at a time. Memory use, latency and quality need measurement before that profile grows. D0 establishes none of those runtime measurements.
+Local inference is optional. Explicit setup uses a dedicated authenticated loopback connection at `ws://127.0.0.1:<port>`. Discovery reads installed variants and loaded instances without loading or downloading a model. It records the observed runtime and model metadata; no fixed model name, parameter count or machine memory size determines eligibility. An installed model can remain unloaded or incompatible.
+
+An explicit packaged native prompt supplies the dedicated Local connection credential to controller memory. The value is excluded from logs, saved setup, snapshots and model observations. Restart requires credential input again. A source-only launch without the fixed packaged helper has no credential-input capability.
+
+Selection names one observed, loaded, eligible model. The current profile requires one resident language model, no resident embeddings or draft model, an idle instance and an 8,192-token context. Eligibility and selection do not qualify that model. Memory use, latency, quality and cancellation remain unmeasured until separate evidence covers the exact runtime and choice. The scripted Local fixture establishes no installed-model or live inference claim.
