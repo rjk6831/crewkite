@@ -26,6 +26,7 @@ import { canonicalJson, ReadDataSchema } from '@crewkite/contracts';
 import { createSyntheticRepository } from '@crewkite/testkit/repository';
 import { copyRuntimePackages } from '../../../../scripts/runtime-packages.ts';
 import { resolveRuntime } from '../../../desktop/src/main/runtime.ts';
+import { checkOwner } from './check-ownership.ts';
 import {
   applyReplacement,
   captureSingleFileEdit,
@@ -387,7 +388,8 @@ test('source inspection bounds file metadata without running filters or reading 
       .toString()
       .trim(),
   );
-  const runtimeDirectory = mkdtempSync(join(primary, 'internal/runtime-test-'));
+  const runtimeRootDirectory = checkOwner()?.stateRoot ?? join(primary, 'internal');
+  const runtimeDirectory = mkdtempSync(join(runtimeRootDirectory, 'rt-'));
   t.after(() => rmSync(runtimeDirectory, { recursive: true, force: true }));
   const app = join(runtimeDirectory, 'app');
   const runtimeRoot = join(app, 'runtime');
