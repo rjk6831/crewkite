@@ -78,7 +78,7 @@ import {
   short,
   titleCase,
 } from './components.tsx';
-import { ConversationView, NewGoal } from './conversation-view.tsx';
+import { adoptedPlanCurrent, ConversationView, NewGoal } from './conversation-view.tsx';
 import {
   type ExecutionPolicySeed,
   googleAcpLabel,
@@ -695,6 +695,7 @@ export function App() {
         task.revision !== seed.taskRevision ||
         currentConversation?.configuration?.revision !== seed.planningConfigurationRevision ||
         currentConversation.contractStatus !== 'confirmed' ||
+        !adoptedPlanCurrent(currentConversation) ||
         currentConversation.activeAttempt ||
         ['unknown', 'stopping'].includes(currentConversation.phase) ||
         task.state !== 'draft' ||
@@ -1140,6 +1141,7 @@ export function App() {
                         {task.state === 'draft' &&
                           !combined &&
                           currentConversation?.contractStatus === 'confirmed' &&
+                          adoptedPlanCurrent(currentConversation) &&
                           !currentConversation.activeAttempt &&
                           !['unknown', 'stopping'].includes(currentConversation.phase) && (
                             <button
@@ -1912,20 +1914,21 @@ function Plan({
             Conversation retains the proposal and its decisions. Execution needs a separate source,
             team and permission review.
           </p>
-          {conversationState.contractStatus === 'confirmed' && (
-            <button
-              className="button primary"
-              type="button"
-              disabled={
-                Boolean(conversationState.activeAttempt) ||
-                ['unknown', 'stopping'].includes(conversationState.phase)
-              }
-              onClick={onPrepare}
-            >
-              Review execution contract
-              <ArrowRight size={14} />
-            </button>
-          )}
+          {conversationState.contractStatus === 'confirmed' &&
+            adoptedPlanCurrent(conversationState) && (
+              <button
+                className="button primary"
+                type="button"
+                disabled={
+                  Boolean(conversationState.activeAttempt) ||
+                  ['unknown', 'stopping'].includes(conversationState.phase)
+                }
+                onClick={onPrepare}
+              >
+                Review execution contract
+                <ArrowRight size={14} />
+              </button>
+            )}
         </section>
       </div>
     );
@@ -2898,8 +2901,7 @@ function Usage({
 }) {
   const [readerMessage, setReaderMessage] = useState<string | null>(null);
   const [displayTime, setDisplayTime] = useState(Date.now);
-  const fixture =
-    workspace.preview || (snapshot.routes.length > 0 && snapshot.routes.every(({ fake }) => fake));
+  const fixture = workspace.preview;
   useEffect(() => {
     if (fixture) return;
     setDisplayTime(Date.now());
@@ -2995,7 +2997,9 @@ function Usage({
       <section aria-labelledby="allowance-title">
         <div className="section-heading">
           <h2 id="allowance-title">Provider allowances</h2>
-          <span>Reported observations</span>
+          <span>
+            {run ? 'Reserve markers follow the selected task run' : 'Reported observations'}
+          </span>
         </div>
         {cards.length ? (
           <>
