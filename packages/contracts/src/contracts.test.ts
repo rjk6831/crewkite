@@ -284,6 +284,12 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     TaskConversationStateSchema.parse(configuredConversation),
     configuredConversation,
   );
+  assert(
+    TaskConversationStateSchema.safeParse({
+      ...configuredConversation,
+      send: { available: false, reason: 'conversation-input-too-large', disposition: null },
+    }).success,
+  );
   const conversationOwner = {
     id: conversationBinding.attemptId,
     runId: conversationBinding.runId,

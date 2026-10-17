@@ -1212,6 +1212,7 @@ export const ConversationActionReasonSchema = z.enum([
   'planning-consent-required',
   'source-changed',
   'task-contract-changed',
+  'conversation-input-too-large',
   'owner-active',
   'ownership-unknown',
   'admissions-paused',
