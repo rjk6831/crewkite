@@ -74,6 +74,7 @@ import {
   GrantSchema,
   HashSchema,
   LimitsSchema,
+  LocalAuthModeSchema,
   LocalEndpointSchema,
   LocalModelObservationSchema,
   LocalModelSelectionSchema,
@@ -666,6 +667,9 @@ const LocalOperationBindingSchema = z.strictObject({
   connectionRevision: RevisionSchema,
 });
 const LocalControlSchema = z.strictObject({
+  authMode: LocalAuthModeSchema.default('token'),
+  noneConnected: z.boolean().default(false),
+  connectionFailed: z.boolean().default(false),
   revision: RevisionSchema,
   connectionRevision: RevisionSchema,
   endpoint: LocalEndpointSchema.nullable(),
@@ -2386,8 +2390,18 @@ export class Controller {
       !!this.localSecret &&
       this.localSecret.connectionRevision === control.connectionRevision &&
       this.localSecret.connectionHash ===
-        localConfiguredConnectionHash(control.endpoint, control.connectionRevision)
+        localConfiguredConnectionHash(
+          control.endpoint,
+          control.connectionRevision,
+          control.authMode,
+        )
     );
+  }
+
+  private localConnected(control = this.localControl()) {
+    return control.authMode === 'none'
+      ? !!control.endpoint && control.noneConnected
+      : this.localSecretMatches(control);
   }
 
   private localConnection() {
@@ -2401,6 +2415,7 @@ export class Controller {
       current
         ? {
             endpoint: control.endpoint,
+            authMode: control.authMode,
             connectionRevision: control.connectionRevision,
             observation: control.observation,
             selectionId: control.selection?.selectionId,
@@ -2410,6 +2425,7 @@ export class Controller {
         platform: this.options.localInput?.platform ?? process.platform,
         arch: this.options.localInput?.arch ?? process.arch,
         secretConfigured: this.localSecretMatches(control),
+        connected: this.localConnected(control),
       },
     );
   }
@@ -2418,6 +2434,7 @@ export class Controller {
     const control = this.localControl();
     const generation = this.store.localGenerationBlocker();
     const secretConfigured = this.localSecretMatches(control);
+    const connected = this.localConnected(control);
     const choice = control.observation?.models.find(
       (value) => value.selectionId === control.selection?.selectionId,
     );
@@ -2433,23 +2450,25 @@ export class Controller {
             : 'discovery-active'
         : !control.endpoint
           ? 'unconfigured'
-          : !this.options.localInputHelper
+          : control.authMode === 'token' && !this.options.localInputHelper
             ? 'capability-unavailable'
-            : !secretConfigured
-              ? 'connection-required'
-              : !control.observation
-                ? 'discovery-required'
-                : !control.selection
-                  ? 'model-selection-required'
-                  : control.selection.observationHash !== control.observation.observationHash
-                    ? 'selection-stale'
-                    : !choice
-                      ? 'setup-unavailable'
-                      : choice.state === 'installed-unloaded'
-                        ? 'model-unloaded'
-                        : choice.state !== 'loaded-eligible'
-                          ? 'model-incompatible'
-                          : 'qualification-pending');
+            : control.connectionFailed
+              ? 'connection-unavailable'
+              : !connected
+                ? 'connection-required'
+                : !control.observation
+                  ? 'discovery-required'
+                  : !control.selection
+                    ? 'model-selection-required'
+                    : control.selection.observationHash !== control.observation.observationHash
+                      ? 'selection-stale'
+                      : !choice
+                        ? 'setup-unavailable'
+                        : choice.state === 'installed-unloaded'
+                          ? 'model-unloaded'
+                          : choice.state !== 'loaded-eligible'
+                            ? 'model-incompatible'
+                            : 'qualification-pending');
     return LocalSetupSchema.parse({
       revision: control.revision,
       connectionRevision: control.connectionRevision,
@@ -2457,9 +2476,15 @@ export class Controller {
       endpoint: control.endpoint,
       setupHash: control.setupHash,
       connectionHash: control.endpoint
-        ? localConfiguredConnectionHash(control.endpoint, control.connectionRevision)
+        ? localConfiguredConnectionHash(
+            control.endpoint,
+            control.connectionRevision,
+            control.authMode,
+          )
         : null,
       secretConfigured,
+      authMode: control.authMode,
+      connected,
       operation: control.operation
         ? {
             kind: control.operation.kind,
@@ -2499,6 +2524,8 @@ export class Controller {
       control = this.saveLocal({
         ...control,
         connectionRevision: control.connectionRevision + 1,
+        noneConnected: false,
+        connectionFailed: false,
         observation: null,
         selection: null,
         setupHash: null,
@@ -2548,11 +2575,16 @@ export class Controller {
     const blocker = this.store.localStartBlocker();
     if (blocker) return { outcome: 'blocked', reason: blocker };
     if (command.command === 'ConfigureLocal') {
-      if (control.endpoint === command.payload.endpoint) return applied();
+      const authMode = command.payload.authMode ?? 'token';
+      if (control.endpoint === command.payload.endpoint && control.authMode === authMode)
+        return applied();
       this.revokeLocalSecret();
       this.saveLocal({
         ...control,
         endpoint: command.payload.endpoint,
+        authMode,
+        noneConnected: false,
+        connectionFailed: false,
         connectionRevision: control.connectionRevision + 1,
         observation: null,
         selection: null,
@@ -2579,15 +2611,28 @@ export class Controller {
           connectionHash: localConfiguredConnectionHash(
             control.endpoint,
             control.connectionRevision,
+            control.authMode,
           ),
           ...command.payload,
         }),
       });
       return applied();
     }
-    if (!this.options.localInputHelper)
+    if (command.command === 'BeginLocalConnectionInput' && control.authMode === 'none') {
+      this.revokeLocalSecret();
+      this.saveLocal({
+        ...control,
+        noneConnected: true,
+        connectionFailed: false,
+        observation: null,
+        selection: null,
+        setupHash: null,
+      });
+      return applied();
+    }
+    if (control.authMode === 'token' && !this.options.localInputHelper)
       return { outcome: 'blocked', reason: 'local-input-unavailable' };
-    if (command.command === 'RefreshLocalModels' && !this.localSecretMatches(control))
+    if (command.command === 'RefreshLocalModels' && !this.localConnected(control))
       return { outcome: 'blocked', reason: 'local-connection-required' };
     const kind = command.command === 'BeginLocalConnectionInput' ? 'input' : 'discovery';
     if (kind === 'input') this.revokeLocalSecret();
@@ -2599,11 +2644,16 @@ export class Controller {
         connectionRevision: control.connectionRevision,
         at: this.now(),
       }),
-      connectionHash: localConfiguredConnectionHash(control.endpoint, control.connectionRevision),
+      connectionHash: localConfiguredConnectionHash(
+        control.endpoint,
+        control.connectionRevision,
+        control.authMode,
+      ),
       connectionRevision: control.connectionRevision,
     };
     this.saveLocal({
       ...control,
+      connectionFailed: false,
       observation: null,
       selection: null,
       setupHash: null,
@@ -2632,7 +2682,11 @@ export class Controller {
       operation.state === 'unknown' ||
       operation.binding.connectionRevision !== control.connectionRevision ||
       operation.binding.connectionHash !==
-        localConfiguredConnectionHash(control.endpoint, control.connectionRevision) ||
+        localConfiguredConnectionHash(
+          control.endpoint,
+          control.connectionRevision,
+          control.authMode,
+        ) ||
       this.store.localGenerationBlocker()
     )
       throw Error('Local operation authority changed.');
@@ -2688,7 +2742,11 @@ export class Controller {
             current.binding.connectionRevision === control.connectionRevision &&
             !!control.endpoint &&
             current.binding.connectionHash ===
-              localConfiguredConnectionHash(control.endpoint, control.connectionRevision) &&
+              localConfiguredConnectionHash(
+                control.endpoint,
+                control.connectionRevision,
+                control.authMode,
+              ) &&
             !this.store.localGenerationBlocker();
           let observation = control.observation;
           if (known && live && value && 'kind' in value && value.kind === 'ready') {
@@ -2722,8 +2780,16 @@ export class Controller {
             outcome: known ? 'applied' : 'outcome-unknown',
             entity: proof,
           });
+          const failedConnection =
+            control.authMode === 'none' &&
+            known &&
+            live &&
+            current.kind === 'discovery' &&
+            (!value || !('terminal' in value) || value.terminal.kind !== 'observed');
           this.saveLocal({
             ...control,
+            noneConnected: failedConnection ? false : control.noneConnected,
+            connectionFailed: failedConnection,
             observation,
             operation: known ? null : { ...current, state: 'unknown' },
           });
@@ -2798,14 +2864,17 @@ export class Controller {
         const handle = runtime.handle as ReturnType<typeof startLocalSecretInput>;
         void handle.result.then(finish, () => finish(null));
       } else {
-        if (!this.localSecretMatches(control)) throw Error('Local connection is unavailable.');
-        const token = this.localSecret?.secret.toString('utf8') as string;
+        if (!this.localConnected(control)) throw Error('Local connection is unavailable.');
+        const credentials =
+          control.authMode === 'none'
+            ? { authMode: 'none' as const }
+            : { token: this.localSecret?.secret.toString('utf8') as string };
         const handle = startLocalDiscovery(
           {
             kind: 'discovery',
             binding: { ...operation.binding, version: 1 },
             endpoint: control.endpoint as string,
-            token,
+            ...credentials,
             timeoutMs: 20000,
           },
           directory,
@@ -7559,7 +7628,12 @@ export class Controller {
         scopeHash,
         expiresAt,
       });
-      this.localStartInput(plan, original.content.toString('utf8'), 'unsubmitted', 300000);
+      this.localStartInput(
+        plan,
+        original.content.toString('utf8'),
+        plan.localModel.authMode === 'none' ? { authMode: 'none' } : { token: 'unsubmitted' },
+        300000,
+      );
       const artifact = this.nativeArtifact(plan);
       this.store.put('route', route.id, 0, route);
       this.store.put('run', run.id, 0, run);
@@ -7597,7 +7671,7 @@ export class Controller {
   private localStartInput(
     plan: LocalPrepared,
     original: string,
-    token: string,
+    credentials: { token: string } | { authMode: 'none' },
     timeoutMs: number,
   ): LocalStart {
     return localPlan({
@@ -7611,7 +7685,7 @@ export class Controller {
         baseHash: plan.target.baseHash,
       },
       endpoint: plan.endpoint,
-      token,
+      ...credentials,
       original,
       task: JSON.stringify(plan.context),
       timeoutMs,
@@ -7885,12 +7959,15 @@ export class Controller {
       if (!original || original.hash !== plan.target.baseHash) throw Error('Local target changed.');
       const directory = join(this.home, 'scratch', plan.run.id);
       materialize(directory, sourceFiles);
-      const token = Buffer.from(this.localSecret?.secret ?? Buffer.alloc(0));
+      const token =
+        plan.localModel.authMode === 'none'
+          ? null
+          : Buffer.from(this.localSecret?.secret ?? Buffer.alloc(0));
       try {
         const input = this.localStartInput(
           plan,
           original.content.toString('utf8'),
-          token.toString('utf8'),
+          token === null ? { authMode: 'none' } : { token: token.toString('utf8') },
           Math.floor(
             Math.min(
               maximumMs,
@@ -7935,7 +8012,7 @@ export class Controller {
           },
         });
       } finally {
-        token.fill(0);
+        token?.fill(0);
       }
       if (runtime.stopped || this.closed) runtime.handle?.stop();
       void runtime.handle?.result.then(finish, () => finish(null));
@@ -8874,11 +8951,11 @@ export class Controller {
       !('modelBinding' in plan.profile) ||
       !same(plan.profile.modelBinding, plan.localModel) ||
       plan.localModel.connectionHash !==
-        hashCanonical({
-          connector: plan.localModel.connectorId,
-          endpoint: plan.endpoint,
-          connectionRevision: plan.localModel.connectionRevision,
-        }) ||
+        localConfiguredConnectionHash(
+          plan.endpoint,
+          plan.localModel.connectionRevision,
+          plan.localModel.authMode,
+        ) ||
       !route ||
       route.fake ||
       route.family !== 'local' ||

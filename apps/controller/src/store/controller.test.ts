@@ -2817,7 +2817,11 @@ function nativeCandidate(controller: Controller) {
   return candidate.promise;
 }
 
-async function localControllerFixture(t: TestContext, initialMode = 'completed') {
+async function localControllerFixture(
+  t: TestContext,
+  initialMode = 'completed',
+  authMode: 'token' | 'none' = 'token',
+) {
   let mode = initialMode;
   let context: Awaited<ReturnType<typeof setup>>;
   let reopened: Controller | undefined;
@@ -2863,7 +2867,7 @@ const {createInterface}=require('node:readline');const mode=process.argv[1];cons
 let plan;const emit=value=>process.stdout.write(JSON.stringify(value)+'\\n');
 const finish=value=>{emit(value);process.stdin.destroy();};
 createInterface({input:process.stdin}).on('line',line=>{const value=JSON.parse(line);
-if(!plan){plan=value;if(plan.kind==='discovery'){finish({type:'discovery',terminal:{kind:'observed',binding:plan.binding,observation}});return;}emit({type:'ready',binding:plan.binding});return;}
+if(!plan){plan=value;if(plan.kind==='discovery'){finish({type:'discovery',terminal:mode==='discovery-failed'?{kind:'unavailable',binding:plan.binding,reason:'transport'}:{kind:'observed',binding:plan.binding,observation}});return;}emit({type:'ready',binding:plan.binding});return;}
 const content=process.argv[2];const proof={stopReason:value==='stop'?'userStopped':'eosFound',promptTokens:1,predictedTokens:1,renderedPromptTokens:1,outputBytes:Buffer.byteLength(content),contextLength:8192,maxTokens:2048,contextOverflowPolicy:'stopAtLimit',draftModel:''};
 if(value==='submit'&&mode==='hold')return;
 if(value==='submit'&&mode==='client-loss'){process.stdin.destroy();return;}
@@ -2899,6 +2903,10 @@ if(value==='submit')finish({type:'terminal',terminal:{kind:'completed',binding:p
           assert(intent);
           assert(context.controller.store.receipt(`native-submission:${intent.attempt_id}`));
         } else if (typeof value === 'object') {
+          if (authMode === 'none') {
+            assert.equal(value.authMode, 'none');
+            assert.equal('token' in value, false);
+          }
           const local = context.controller.store.localControl() as {
             operation?: { state: string };
           };
@@ -2961,17 +2969,21 @@ if(value==='submit')finish({type:'terminal',terminal:{kind:'completed',binding:p
           },
         } satisfies Partial<ControllerOptions>)
       : {}),
-    localInputHelper: {
-      root: resolve('internal'),
-      sha256: 'a'.repeat(64),
-      sourceHash: 'b'.repeat(64),
-      target: 'darwin-arm64',
-    },
+    localInputHelper:
+      authMode === 'none'
+        ? undefined
+        : {
+            root: resolve('internal'),
+            sha256: 'a'.repeat(64),
+            sourceHash: 'b'.repeat(64),
+            target: 'darwin-arm64',
+          },
     localInput: {
       platform: 'darwin',
       arch: 'arm64',
       verifyHelper: () => process.execPath,
       launch: (executable, settings) => {
+        assert.equal(authMode, 'token', 'No-authentication mode must not open secure input.');
         assert.equal(
           (context.controller.store.localControl() as { operation?: { state: string } }).operation
             ?.state,
@@ -3016,7 +3028,10 @@ if(value==='submit')finish({type:'terminal',terminal:{kind:'completed',binding:p
     assert(operation);
     await nativeWait('Local metadata operation', operation.done);
   };
-  await local('ConfigureLocal', { endpoint: 'ws://127.0.0.1:12345' });
+  await local('ConfigureLocal', {
+    endpoint: 'ws://127.0.0.1:12345',
+    ...(authMode === 'none' ? { authMode } : {}),
+  });
   const connectionRevision = setupState()?.connectionRevision;
   const begin = command(
     'BeginLocalConnectionInput',
@@ -3024,15 +3039,16 @@ if(value==='submit')finish({type:'terminal',terminal:{kind:'completed',binding:p
     setupState()?.revision,
   );
   assert.equal((await controller.execute(begin, 'local-owner')).outcome, 'applied');
-  assert.equal(setupState()?.operation?.kind, 'input');
+  assert.equal(setupState()?.operation?.kind, authMode === 'token' ? 'input' : undefined);
   assert.equal((await controller.execute(begin, 'local-owner')).outcome, 'already-applied');
-  await operationDone();
-  assert.equal(setupState()?.secretConfigured, true);
+  if (authMode === 'token') await operationDone();
+  assert.equal(setupState()?.secretConfigured, authMode === 'token');
+  assert.equal(setupState()?.connected, true);
   await local('RefreshLocalModels', { consent: 'explicit' });
   assert.equal(setupState()?.operation?.kind, 'discovery');
   await operationDone();
   assert.equal(setupState()?.connectionRevision, connectionRevision);
-  assert.equal(setupState()?.secretConfigured, true);
+  assert.equal(setupState()?.secretConfigured, authMode === 'token');
   assert.equal(setupState()?.observation?.observationHash, observation.observationHash);
   assert.equal(
     (
@@ -3177,6 +3193,75 @@ test('an appointed native proposal is retained and applied once after every phas
   assert.equal(refusedLocal.reason, 'local-model-unavailable');
   assert.deepEqual(local.controller.snapshot(), beforeLocal);
   assert.equal(local.controller.store.intents().length, 0);
+  const withoutToken = await localControllerFixture(t, 'checked', 'none');
+  assert.equal((await withoutToken.started()).outcome, 'applied');
+  await nativeWait('Local no-authentication completed writer', withoutToken.terminal);
+  assert.equal(withoutToken.submissions(), 1);
+  assert.equal(
+    withoutToken.controller.snapshot().tasks.find((value) => value.id === withoutToken.task.id)
+      ?.state,
+    'stopped',
+  );
+  const noneCandidate = withoutToken.controller
+    .snapshot()
+    .candidates.find((value) => value.taskId === withoutToken.task.id);
+  assert(noneCandidate);
+  const noneEvaluation = await withoutToken.controller.execute(
+    withoutToken.command(
+      'PrepareCandidateEvaluation',
+      {
+        taskId: withoutToken.task.id,
+        candidateId: noneCandidate.id,
+        checkRecipeId: 'node-tests-v1',
+        reviewer: { profileId: 'openai-file-v1', methodId: 'keep-it-simple', cycles: 1 },
+        consent: 'explicit',
+        grants: [
+          { action: 'run-check', target: 'node --test' },
+          { action: 'run-review', target: 'keep-it-simple/cycle-1' },
+        ].map((grant) => ({
+          ...grant,
+          taskId: withoutToken.task.id,
+          revoked: false,
+          usesRemaining: 1,
+          expiresAt: new Date(Date.parse(withoutToken.clock.now()) + 86400000).toISOString(),
+        })),
+      },
+      taskRevision(withoutToken.controller, withoutToken.task.id),
+    ),
+    'local-owner',
+  );
+  assert.equal(noneEvaluation.outcome, 'applied', JSON.stringify(noneEvaluation));
+  withoutToken.mode('discovery-failed');
+  await withoutToken.local('RefreshLocalModels', { consent: 'explicit' });
+  await withoutToken.operationDone();
+  assert.equal(withoutToken.setupState()?.connected, false);
+  assert.equal(withoutToken.setupState()?.reason, 'connection-unavailable');
+  assert.equal(withoutToken.setupState()?.secretConfigured, false);
+  await withoutToken.local('BeginLocalConnectionInput', { consent: 'explicit' });
+  assert.equal(withoutToken.setupState()?.connected, true);
+  assert.equal(withoutToken.setupState()?.operation, null);
+  const noneReopened = await withoutToken.reopen();
+  assert.equal(noneReopened.snapshot().localSetup?.connected, true);
+  assert.equal(noneReopened.snapshot().localSetup?.secretConfigured, false);
+  const noneRevision = noneReopened.snapshot().localSetup?.connectionRevision;
+  const noneHash = noneReopened.snapshot().localSetup?.connectionHash;
+  const changedMode = await noneReopened.execute(
+    withoutToken.command(
+      'ConfigureLocal',
+      { endpoint: 'ws://127.0.0.1:12345', authMode: 'token' },
+      noneReopened.snapshot().localSetup?.revision,
+    ),
+    'local-owner',
+  );
+  assert.equal(changedMode.outcome, 'applied');
+  assert.equal(noneReopened.snapshot().localSetup?.connected, false);
+  assert.equal(noneReopened.snapshot().localSetup?.authMode, 'token');
+  assert.equal(
+    noneReopened.snapshot().localSetup?.connectionRevision,
+    (noneRevision as number) + 1,
+  );
+  assert.notEqual(noneReopened.snapshot().localSetup?.connectionHash, noneHash);
+  assert.equal(noneReopened.snapshot().localSetup?.selection, null);
   const connectedLocal = await localControllerFixture(t, 'checked');
   assert.equal((await connectedLocal.started()).outcome, 'applied');
   connectedLocal.clock.advance(60000);
