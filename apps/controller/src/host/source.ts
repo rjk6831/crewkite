@@ -417,21 +417,7 @@ export function readFiles(root: string): FileContent[] {
   return files;
 }
 
-export function applyReplacement(
-  root: string,
-  expected: readonly FileEntry[],
-  replacement: { path: string; baseHash: string; content: string },
-) {
-  safePath(replacement.path, new Set(), new Map());
-  if (typeof replacement.content !== 'string' || replacement.content.length > 65_536)
-    throw new Error('Replacement must be bounded UTF-8 text.');
-  const bytes = Buffer.from(replacement.content, 'utf8');
-  if (
-    bytes.length > 65_536 ||
-    bytes.toString('utf8') !== replacement.content ||
-    replacement.content.includes('\0')
-  )
-    throw new Error('Replacement must be bounded UTF-8 text.');
+function sourceManifest(expected: readonly FileEntry[]): string {
   const seen = new Set<string>();
   const prefixes = new Map<string, string>();
   let total = 0;
@@ -448,13 +434,55 @@ export function applyReplacement(
     total += file.bytes;
     if (total > MAX_SOURCE_BYTES) throw new Error('Replacement source exceeds the byte limit.');
   }
-  const manifest = (files: readonly FileEntry[]) =>
-    JSON.stringify(
-      files
-        .map(({ path, mode, hash, bytes }) => ({ path, mode, hash, bytes }))
-        .sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0)),
-    );
-  if (manifest(readFiles(root)) !== manifest(expected))
+  return JSON.stringify(
+    expected
+      .map(({ path, mode, hash, bytes }) => ({ path, mode, hash, bytes }))
+      .sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0)),
+  );
+}
+
+export function captureSingleFileEdit(input: {
+  directory: string;
+  manifest: readonly FileEntry[];
+  target: { path: string; baseHash: string };
+}): { files: FileContent[]; target: FileEntry & { baseHash: string } } {
+  sourceManifest(input.manifest);
+  safePath(input.target.path, new Set(), new Map());
+  const original = input.manifest.find((file) => file.path === input.target.path);
+  if (!original || original.hash !== input.target.baseHash || original.bytes > 65_536)
+    throw Error('Capture target identity changed.');
+  const files = readFiles(input.directory);
+  const target = files.find((file) => file.path === original.path);
+  if (!target || target.mode !== original.mode || target.bytes > 65_536)
+    throw Error('Capture target metadata changed.');
+  const text = new TextDecoder('utf-8', { fatal: true }).decode(target.content);
+  if (text.includes('\0')) throw Error('Capture needs NUL-free UTF-8 text.');
+  if (
+    sourceManifest(files.filter((file) => file.path !== original.path)) !==
+    sourceManifest(input.manifest.filter((file) => file.path !== original.path))
+  )
+    throw Error('Capture source manifest changed.');
+  const { path, mode, hash, bytes } = target;
+  return { files, target: { path, mode, hash, bytes, baseHash: original.hash } };
+}
+
+export function applyReplacement(
+  root: string,
+  expected: readonly FileEntry[],
+  replacement: { path: string; baseHash: string; content: string },
+) {
+  safePath(replacement.path, new Set(), new Map());
+  if (typeof replacement.content !== 'string' || replacement.content.length > 65_536)
+    throw new Error('Replacement must be bounded UTF-8 text.');
+  const bytes = Buffer.from(replacement.content, 'utf8');
+  if (
+    bytes.length > 65_536 ||
+    bytes.toString('utf8') !== replacement.content ||
+    replacement.content.includes('\0')
+  )
+    throw new Error('Replacement must be bounded UTF-8 text.');
+  const expectedManifest = sourceManifest(expected);
+  if (sourceManifest(readFiles(root)) !== expectedManifest)
     throw new Error('Replacement source manifest changed.');
   const target = expected.find((file) => file.path === replacement.path);
   if (!target || target.hash !== replacement.baseHash)
