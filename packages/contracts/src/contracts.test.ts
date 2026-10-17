@@ -43,6 +43,7 @@ import {
   SnapshotSchema,
   SourceDetailsSchema,
   SourceSchema,
+  TaskConversationStateSchema,
   TransportMessageSchema,
   UsageReaderSchema,
 } from './index.ts';
@@ -233,6 +234,129 @@ test('process boundaries reject unknown fields and invalid command identity', ()
       false,
     );
   }
+  const conversationState = {
+    taskId: conversationBinding.taskId,
+    revision: 0,
+    contractStatus: 'confirmed',
+    purpose: null,
+    phase: 'idle',
+    configuration: null,
+    currentRunId: null,
+    activeAttempt: null,
+    budget: null,
+    queuedInputCount: 0,
+    pendingQuestions: [],
+    proposal: null,
+    adoptedProposal: null,
+    send: { available: false, reason: 'not-configured', disposition: null },
+    adopt: { available: false, reason: 'proposal-missing' },
+  };
+  assert.deepEqual(TaskConversationStateSchema.parse(conversationState), conversationState);
+  assert(
+    ReadDataSchema.safeParse({ kind: 'conversation-state', state: conversationState }).success,
+  );
+  const configuredConversation = {
+    ...conversationState,
+    contractStatus: 'provisional',
+    purpose: 'conversation',
+    phase: 'discussion',
+    currentRunId: conversationBinding.runId,
+    configuration: {
+      revision: 1,
+      selection: planning,
+      routeId: conversationBinding.routeId,
+      requestedModel: 'profile-model',
+      effectiveModel: null,
+      requestedEffort: 'low',
+      effectiveEffort: null,
+    },
+    budget: { limits: planning.limits, remaining: { attempts: 7, minutes: 29, concurrency: 4 } },
+    proposal: {
+      id: conversationEntry.id,
+      hash: hashCanonical(proposal),
+      runId: conversationBinding.runId,
+      revision: 1,
+    },
+    send: { available: true, reason: 'available', disposition: 'turn' },
+    adopt: { available: true, reason: 'available' },
+  };
+  assert.deepEqual(
+    TaskConversationStateSchema.parse(configuredConversation),
+    configuredConversation,
+  );
+  const conversationOwner = {
+    id: conversationBinding.attemptId,
+    runId: conversationBinding.runId,
+    routeId: conversationBinding.routeId,
+    generation: 0,
+    state: 'running',
+    revision: 0,
+  };
+  const executionQueue = {
+    ...conversationState,
+    purpose: 'execution',
+    phase: 'execution',
+    currentRunId: conversationBinding.runId,
+    activeAttempt: conversationOwner,
+    send: { available: true, reason: 'queued-at-boundary', disposition: 'queue' },
+  };
+  assert.deepEqual(TaskConversationStateSchema.parse(executionQueue), executionQueue);
+  assert(
+    TaskConversationStateSchema.safeParse({
+      ...configuredConversation,
+      activeAttempt: conversationOwner,
+      send: executionQueue.send,
+      adopt: { available: false, reason: 'owner-active' },
+    }).success,
+  );
+  for (const change of [
+    { activeAttempt: null },
+    { currentRunId: null },
+    { purpose: null },
+    { activeAttempt: { ...conversationOwner, state: 'unknown' } },
+  ])
+    assert.equal(
+      TaskConversationStateSchema.safeParse({ ...executionQueue, ...change }).success,
+      false,
+    );
+  for (const change of [
+    { send: { available: true, reason: 'ownership-unknown', disposition: 'turn' } },
+    { configuration: null },
+    { configuration: { ...configuredConversation.configuration, routeId: null } },
+    { budget: null },
+    { currentRunId: null },
+    { purpose: 'execution' },
+    { phase: 'unknown' },
+    { activeAttempt: conversationOwner },
+    { proposal: { ...configuredConversation.proposal, runId: 'run_01ARZ3NDEKTSV4RRFFQ69G5FAW' } },
+    { send: { available: false, reason: 'available', disposition: null } },
+    { send: { available: true, reason: 'available', disposition: 'queue' } },
+    { send: { available: false, reason: 'invented-reason', disposition: null } },
+    { adopt: { available: true, reason: 'proposal-missing' } },
+    { proposal: null },
+    {
+      budget: { limits: planning.limits, remaining: { attempts: 9, minutes: 29, concurrency: 4 } },
+    },
+    { configuration: { ...configuredConversation.configuration, executable: '/caller/process' } },
+    {
+      pendingQuestions: [
+        { id: conversationEntry.id, cursor: '1' },
+        { id: conversationEntry.id, cursor: '1' },
+      ],
+    },
+  ])
+    assert.equal(
+      TaskConversationStateSchema.safeParse({ ...configuredConversation, ...change }).success,
+      false,
+    );
+  const conversationStateRead = {
+    protocol: 1,
+    key: command.key,
+    actor: command.actor,
+    command: 'GetTaskConversationState',
+    payload: { taskId: conversationBinding.taskId },
+  };
+  assert.deepEqual(CommandSchema.parse(conversationStateRead), conversationStateRead);
   const conversationRead = {
     protocol: 1,
     key: command.key,

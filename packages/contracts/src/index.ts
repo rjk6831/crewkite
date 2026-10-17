@@ -1203,7 +1203,149 @@ export const ConversationPlanningSelectionSchema = z.strictObject({
   consent: z.literal('explicit'),
 });
 export type ConversationPlanningSelection = z.infer<typeof ConversationPlanningSelectionSchema>;
+export const ConversationActionReasonSchema = z.enum([
+  'available',
+  'queued-at-boundary',
+  'not-configured',
+  'profile-unavailable',
+  'planning-role-unavailable',
+  'planning-consent-required',
+  'source-changed',
+  'task-contract-changed',
+  'owner-active',
+  'ownership-unknown',
+  'admissions-paused',
+  'attempt-budget-exhausted',
+  'minute-budget-exhausted',
+  'concurrency-exhausted',
+  'provider-capacity-unavailable',
+  'proposal-missing',
+  'proposal-not-current',
+  'proposal-hash-changed',
+  'pending-question',
+  'pending-input',
+  'effects-unresolved',
+  'execution-active',
+  'task-not-discussing',
+  'controller-closing',
+]);
+const conversationProposalReference = z.strictObject({
+  id: MessageIdSchema,
+  hash: HashSchema,
+  runId: RunIdSchema,
+  revision: RevisionSchema,
+});
+export const TaskConversationStateSchema = z
+  .strictObject({
+    taskId: TaskIdSchema,
+    revision: RevisionSchema,
+    contractStatus: z.enum(['provisional', 'confirmed']),
+    purpose: z.enum(['conversation', 'execution']).nullable(),
+    phase: z.enum([
+      'idle',
+      'discussion',
+      'planning',
+      'planned',
+      'execution',
+      'stopping',
+      'stopped',
+      'interrupted',
+      'unknown',
+    ]),
+    configuration: z
+      .strictObject({
+        revision: RevisionSchema,
+        selection: ConversationPlanningSelectionSchema,
+        routeId: RouteIdSchema.nullable(),
+        requestedModel: label.nullable(),
+        effectiveModel: label.nullable(),
+        requestedEffort: label.nullable(),
+        effectiveEffort: label.nullable(),
+      })
+      .nullable(),
+    currentRunId: RunIdSchema.nullable(),
+    activeAttempt: AttemptSchema.nullable(),
+    budget: z.strictObject({ limits: LimitsSchema, remaining: RemainingBudgetsSchema }).nullable(),
+    queuedInputCount: RevisionSchema,
+    pendingQuestions: z
+      .array(z.strictObject({ id: MessageIdSchema, cursor: CursorSchema }))
+      .max(100),
+    proposal: conversationProposalReference.nullable(),
+    adoptedProposal: conversationProposalReference.nullable(),
+    send: z.strictObject({
+      available: z.boolean(),
+      reason: ConversationActionReasonSchema,
+      disposition: z.enum(['turn', 'queue']).nullable(),
+    }),
+    adopt: z.strictObject({ available: z.boolean(), reason: ConversationActionReasonSchema }),
+  })
+  .superRefine((state, context) => {
+    const fail = (message: string) => context.addIssue({ code: 'custom', message });
+    if (state.activeAttempt && state.activeAttempt.runId !== state.currentRunId)
+      fail('The active conversation attempt must belong to the current run.');
+    if (
+      new Set(state.pendingQuestions.map((question) => question.id)).size !==
+      state.pendingQuestions.length
+    )
+      fail('Pending questions must be distinct.');
+    if (
+      state.budget &&
+      (['attempts', 'minutes', 'concurrency'] as const).some(
+        (axis) => state.budget !== null && state.budget.remaining[axis] > state.budget.limits[axis],
+      )
+    )
+      fail('Remaining task allowance cannot exceed its configured limits.');
+    if (
+      state.send.available
+        ? !(
+            (state.send.reason === 'available' && state.send.disposition === 'turn') ||
+            (state.send.reason === 'queued-at-boundary' && state.send.disposition === 'queue')
+          )
+        : state.send.disposition !== null ||
+          ['available', 'queued-at-boundary'].includes(state.send.reason)
+    )
+      fail('Send availability must state whether a turn can start or input will queue.');
+    if (
+      state.adopt.available
+        ? state.adopt.reason !== 'available' || state.proposal === null
+        : ['available', 'queued-at-boundary'].includes(state.adopt.reason)
+    )
+      fail('Plan adoption availability requires a current proposal.');
+    if (
+      state.send.available &&
+      state.send.disposition === 'turn' &&
+      (!state.configuration?.routeId ||
+        !state.currentRunId ||
+        !state.budget ||
+        state.purpose !== 'conversation' ||
+        state.activeAttempt !== null ||
+        ['unknown', 'stopping'].includes(state.phase))
+    )
+      fail('A fresh planning turn requires configured authority and no active owner.');
+    if (
+      state.send.available &&
+      state.send.disposition === 'queue' &&
+      (!state.currentRunId ||
+        state.purpose === null ||
+        !state.activeAttempt ||
+        !['intent', 'running', 'stopping'].includes(state.activeAttempt.state))
+    )
+      fail('Queued input requires a known active owner for the current run.');
+    if (
+      state.adopt.available &&
+      (!state.configuration ||
+        !state.budget ||
+        state.purpose !== 'conversation' ||
+        !state.currentRunId ||
+        state.proposal?.runId !== state.currentRunId ||
+        state.activeAttempt !== null)
+    )
+      fail('Plan adoption requires the current planning lineage without an active owner.');
+    if (conversationBytes(state) > 32768) fail('Conversation state exceeds 32768 encoded bytes.');
+  });
+export type TaskConversationState = z.infer<typeof TaskConversationStateSchema>;
 export const CommandSchema = z.discriminatedUnion('command', [
+  read('GetTaskConversationState', z.strictObject({ taskId: TaskIdSchema })),
   mutate(
     'CreateTaskDiscussion',
     z.strictObject({
@@ -1665,6 +1807,7 @@ const sourceInspection = z
     'Source details must match the full counts without repeated paths.',
   );
 export const ReadDataSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('conversation-state'), state: TaskConversationStateSchema }),
   ConversationPageSchema,
   z.strictObject({ kind: z.literal('google-acp-setup'), setup: GoogleAcpSetupSchema }),
   sourceInspection,
