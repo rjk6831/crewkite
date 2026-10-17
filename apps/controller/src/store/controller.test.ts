@@ -2868,6 +2868,8 @@ const content=process.argv[2];const proof={stopReason:value==='stop'?'userStoppe
 if(value==='submit'&&mode==='hold')return;
 if(value==='submit'&&mode==='client-loss'){process.stdin.destroy();return;}
 if(value==='submit'&&mode==='unknown'){finish({type:'terminal',terminal:{kind:'unknown',binding:plan.binding,reason:'ownership'}});return;}
+if(value==='submit'&&mode==='configuration-unknown'){finish({type:'terminal',terminal:{kind:'unknown',binding:plan.binding,reason:'configuration',detail:{version:1,stage:'terminal',check:'draft-disabled',status:'missing'}}});return;}
+if(value==='submit'&&mode==='configuration-failed'){finish({type:'terminal',terminal:{kind:'failed',binding:plan.binding,reason:'configuration',proof,detail:{version:1,stage:'terminal',check:'draft-disabled',status:'missing'}}});return;}
 if(value==='stop'){finish({type:'terminal',terminal:{kind:'stopped',binding:plan.binding,proof}});return;}
 if(value==='submit')finish({type:'terminal',terminal:{kind:'completed',binding:plan.binding,proof,proposal:{version:1,attemptId:plan.binding.attemptId,path:plan.binding.path,baseHash:plan.binding.baseHash,content}}});});`;
   const spawnClient = ((
@@ -5221,6 +5223,8 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
     'input-cancel',
     'input-disconnect',
     'input-intent-restart',
+    'configuration-unknown',
+    'configuration-failed',
     'unknown',
     'client-loss',
     'missing-terminal',
@@ -5348,6 +5352,7 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
     const intent = controller.store.intents().find((value) => value.run_id === run.id);
     assert(intent);
     const uncertain = [
+      'configuration-unknown',
       'unknown',
       'client-loss',
       'missing-terminal',
@@ -5360,6 +5365,17 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
       row === 'intent-restart' ? 'active' : uncertain ? 'unknown' : 'idle',
     );
     assert.equal(controller.snapshot().candidates.length, 0);
+    if (row === 'configuration-unknown' || row === 'configuration-failed') {
+      const failedTask = controller.snapshot().tasks.find((value) => value.id === task.id);
+      assert.equal(failedTask?.state, row === 'configuration-unknown' ? 'unknown' : 'stopped');
+      assert.equal(
+        failedTask?.next,
+        row === 'configuration-unknown'
+          ? 'Local settings could not be verified. Execution ownership is unknown. Checks and publication are blocked.'
+          : 'Local settings could not be verified. No replacement was applied.',
+      );
+      assert(!failedTask?.next?.includes(context.secret));
+    }
     assert.equal(
       context.submissions(),
       row === 'admission-stop' || row === 'intent-restart' ? 0 : 1,

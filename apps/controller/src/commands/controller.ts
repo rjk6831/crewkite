@@ -7752,6 +7752,8 @@ export class Controller {
         const phases = this.store.nativeProcesses(plan.attempt.id);
         const terminal = outcome ? LocalTerminalSchema.parse(outcome.terminal) : null;
         const bound = terminal && hashCanonical(terminal.binding) === hashCanonical(binding);
+        const configurationFailed =
+          bound && terminal && 'reason' in terminal && terminal.reason === 'configuration';
         const clientQuiescent =
           outcome?.clientQuiescent === true &&
           phases.length > 0 &&
@@ -7835,17 +7837,27 @@ export class Controller {
           } catch {}
         }
         if (
-          this.settleJob(plan.attempt, known, true, () => {
-            const task = this.store.get<Task>('task', plan.run.taskId) as Task;
-            if (task.runId === plan.run.id)
-              this.updateTask(task, {
-                state: 'stopped',
-                waitingReason: null,
-                next: applied
-                  ? 'Local replacement retained. Prepare separate checks and review before acceptance.'
-                  : 'Local work stopped without an applied replacement.',
-              });
-          })
+          this.settleJob(
+            plan.attempt,
+            known,
+            true,
+            () => {
+              const task = this.store.get<Task>('task', plan.run.taskId) as Task;
+              if (task.runId === plan.run.id)
+                this.updateTask(task, {
+                  state: 'stopped',
+                  waitingReason: null,
+                  next: applied
+                    ? 'Local replacement retained. Prepare separate checks and review before acceptance.'
+                    : configurationFailed
+                      ? 'Local settings could not be verified. No replacement was applied.'
+                      : 'Local work stopped without an applied replacement.',
+                });
+            },
+            configurationFailed
+              ? 'Local settings could not be verified. Execution ownership is unknown. Checks and publication are blocked.'
+              : undefined,
+          )
         ) {
           if (applied) this.sealCandidate(plan.attempt);
           this.localWriters.delete(plan.attempt.id);
@@ -14877,6 +14889,7 @@ export class Controller {
     quiescent: boolean,
     closing = false,
     afterSettled?: () => void,
+    unknownNext = 'Execution ownership is unknown. Checks and publication are blocked.',
   ): boolean {
     if (this.closed && !closing) return false;
     const current = this.store.get<Attempt>('attempt', attempt.id) as Attempt;
@@ -14919,7 +14932,7 @@ export class Controller {
         this.updateTask(task, {
           state: 'unknown',
           waitingReason: null,
-          next: 'Execution ownership is unknown. Checks and publication are blocked.',
+          next: unknownNext,
         });
       }
     });
