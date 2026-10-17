@@ -1552,7 +1552,9 @@ async function conversationBridge(
         binding: binding(),
         text,
       });
-    await modelControl.click();
+    await toolbar
+      .getByRole('button', { name: 'Architect model: fixture-model', exact: true })
+      .click();
     await page.getByRole('menuitemradio', { name: 'fixture-next', exact: true }).click();
     const session = page.getByRole('dialog', { name: 'Session settings', exact: true });
     await expect(
@@ -1629,7 +1631,9 @@ async function conversationBridge(
     assert.notEqual(savedModel.currentRunId, beforeModel.currentRunId);
     assert.deepEqual(savedModel.modelChoices, beforeModel.modelChoices);
     assert.deepEqual(savedModel.budget, originalBudget);
-    await toolbar.getByRole('button', { name: /^Architect effort:/ }).click();
+    await toolbar
+      .getByRole('button', { name: 'Architect effort: low (requested)', exact: true })
+      .click();
     await page.getByRole('menuitemradio', { name: 'high', exact: true }).click();
     await expect(
       session.getByRole('combobox', { name: 'Planning model', exact: true }),
