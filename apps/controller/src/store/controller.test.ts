@@ -2786,6 +2786,24 @@ function taskRevision(controller: Controller, taskId: string): number {
   return TaskSchema.parse(controller.store.get('task', taskId)).revision;
 }
 
+async function nativeRows<T>(rows: readonly T[], run: (row: T) => Promise<void>) {
+  let next = 0;
+  let failed = false;
+  let failure: unknown;
+  const work = async () => {
+    try {
+      while (!failed && next < rows.length) await run(rows[next++]);
+    } catch (error) {
+      if (!failed) {
+        failed = true;
+        failure = error;
+      }
+    }
+  };
+  await Promise.allSettled([work(), work()]);
+  if (failed) throw failure;
+}
+
 async function nativeWait<T>(
   stage: string,
   pending: Promise<T>,
@@ -3747,12 +3765,7 @@ test('an appointed native proposal is retained and applied once after every phas
     localCandidate.hash,
   );
   assert.equal(connectedLocal.submissions(), 1);
-  for (const permissionMode of [
-    'request-review',
-    'strict',
-    'always-proceed',
-    'proceed-in-sandbox',
-  ] as const) {
+  const checkPermissionMode = async (permissionMode: string) => {
     const context = await nativeSetup(t, `google-${permissionMode}`);
     let controller = context.controller;
     const { task, command, appointment } = context;
@@ -3842,16 +3855,21 @@ test('an appointed native proposal is retained and applied once after every phas
     controller = await context.restart();
     assert.equal(context.submissions(), 1);
     assert.equal(controller.snapshot().attempts.length, 1);
-  }
+  };
+  await nativeRows(
+    ['request-review', 'strict', 'always-proceed', 'proceed-in-sandbox'],
+    checkPermissionMode,
+  );
 
-  for (const { consent, path, publicRun } of [
-    { consent: 'explicit', path: 'net.mjs', publicRun: false },
-    { consent: 'policy', path: 'net.mjs', publicRun: false },
-    { consent: 'explicit', path: 'docs/providers.md', publicRun: false },
-    { consent: 'policy', path: 'docs/案内.md', publicRun: false },
-    { consent: 'explicit', path: 'docs/providers.md', publicRun: true },
-    { consent: 'policy', path: 'docs/案内.md', publicRun: true },
-  ] as const) {
+  const retain = async ({
+    consent,
+    path,
+    publicRun,
+  }: {
+    consent: 'explicit' | 'policy';
+    path: string;
+    publicRun: boolean;
+  }) => {
     console.error(
       `Native fixture row: retained/${consent}/${path}/${publicRun ? 'public' : 'private'}`,
     );
@@ -4410,22 +4428,20 @@ test('an appointed native proposal is retained and applied once after every phas
         10_000,
       );
     }
-  }
-  for (const scenario of [
-    'checked',
-    'project-checked',
-    'repository-checked',
-    'anthropic-checked',
-    'google-checked',
-    'failed',
-    'stop-intent',
-    'expired-intent',
-    'revoked-intent',
-    'review-blocked',
-    'review-stop',
-    'review-close',
-    'review-journal-read',
-  ]) {
+  };
+  await nativeRows(
+    [
+      { consent: 'explicit', path: 'net.mjs', publicRun: false },
+      { consent: 'policy', path: 'net.mjs', publicRun: false },
+      { consent: 'explicit', path: 'docs/providers.md', publicRun: false },
+      { consent: 'policy', path: 'docs/案内.md', publicRun: false },
+      { consent: 'explicit', path: 'docs/providers.md', publicRun: true },
+      { consent: 'policy', path: 'docs/案内.md', publicRun: true },
+    ] as const,
+    retain,
+  );
+
+  const evaluate = async (scenario: string) => {
     const passedReview =
       scenario === 'checked' ||
       scenario === 'project-checked' ||
@@ -5289,19 +5305,27 @@ test('an appointed native proposal is retained and applied once after every phas
     );
     assert.equal(controller.store.intents().length, intents);
     assert.equal(context.submissions(), shouldReview ? 2 : 1);
-  }
-  for (const boundary of [
-    'stop-prepared',
-    'client-changed',
-    'model-changed',
-    'credit-withdrawn',
-    'consent-revoked',
-    'expired',
-    'context-changed',
-    'unrelated-expired-grant',
-    'oversized-plan',
-    'credit-unavailable',
-  ]) {
+  };
+  await nativeRows(['checked', 'project-checked'], evaluate);
+  // This row changes process-wide policy. Both row pools stay outside its lifetime.
+  await evaluate('repository-checked');
+  await nativeRows(
+    [
+      'anthropic-checked',
+      'google-checked',
+      'failed',
+      'stop-intent',
+      'expired-intent',
+      'revoked-intent',
+      'review-blocked',
+      'review-stop',
+      'review-close',
+      'review-journal-read',
+    ],
+    evaluate,
+  );
+
+  const prepareBoundary = async (boundary: string) => {
     console.error(`Native fixture row: preparation/${boundary}`);
     const context = await nativeSetup(t);
     const { controller, appointment, task, command, clock } = context;
@@ -5342,12 +5366,12 @@ test('an appointed native proposal is retained and applied once after every phas
       assert.equal(prepared.outcome, 'blocked');
       assert.deepEqual(controller.snapshot(), before);
       assert.equal(controller.store.intents().length, 0);
-      continue;
+      return;
     }
     assert.equal(prepared.outcome, 'applied', JSON.stringify(prepared));
     assert.equal(context.children.length, 0);
     const run = RunSchema.parse(prepared.entity);
-    if (boundary === 'unrelated-expired-grant') continue;
+    if (boundary === 'unrelated-expired-grant') return;
     if (boundary === 'stop-prepared') {
       assert.equal(
         (
@@ -5430,7 +5454,23 @@ test('an appointed native proposal is retained and applied once after every phas
     );
     assert.equal(context.children.length, 0);
     assert.equal(controller.store.intents().length, 0);
-  }
+  };
+  await nativeRows(
+    [
+      'stop-prepared',
+      'client-changed',
+      'model-changed',
+      'credit-withdrawn',
+      'consent-revoked',
+      'expired',
+      'context-changed',
+      'unrelated-expired-grant',
+      'oversized-plan',
+      'credit-unavailable',
+    ],
+    prepareBoundary,
+  );
+
   {
     console.error('Native fixture row: parallel tasks');
     const context = await nativeSetup(t, 'hold');
