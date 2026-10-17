@@ -261,12 +261,24 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       'task_started',
       'task_notification',
       'model_refusal_fallback',
+      'api_error',
+      'thinking_tokens',
+      'session_state_changed',
+      'per_turn_effort_changed',
+      'notification',
+      'model_refusal_no_fallback',
       'session_metadata',
       'permission_retry',
     ].map((subtype) => ({
       name: `known system ${subtype} stays refused and identifiable`,
       frames: [init, { type: 'system', subtype, session_id: input.sessionId, content: secret }],
-      diagnostic: { stage: 'output', site: 'retry', subtype, field: 'subtype' },
+      diagnostic: {
+        stage: 'output',
+        site: 'system',
+        cause: 'unsupported',
+        subtype,
+        field: 'subtype',
+      },
     })),
 
     {
@@ -468,6 +480,25 @@ test('native text replacement stays bound to one proposal and owned task deadlin
         site: 'init',
         cause: 'validation',
         envelope: 'system',
+        subtype: 'other',
+        field: 'subtype',
+      },
+    },
+    {
+      name: 'unrecognized public-looking subtype remains private and refused',
+      frames: [
+        init,
+        {
+          type: 'system',
+          subtype: 'unrecognized_subtype',
+          session_id: input.sessionId,
+          error: secret,
+        },
+      ],
+      diagnostic: {
+        stage: 'output',
+        site: 'system',
+        cause: 'unsupported',
         subtype: 'other',
         field: 'subtype',
       },

@@ -306,6 +306,45 @@ const subtypes = [
   'error_max_turns',
   'error_max_budget_usd',
   'error_max_structured_output_retries',
+  'model_refusal_no_fallback',
+  'model_fallback',
+  'model_consent_fallback',
+  'file_snapshot',
+  'scheduled_task_fire',
+  'peer_message_hold',
+  'turn_duration',
+  'api_error',
+  'local_command_output',
+  'files_persisted',
+  'task_updated',
+  'background_tasks_changed',
+  'feedback_draft_queued',
+  'session_state_changed',
+  'session_title_changed',
+  'worker_shutting_down',
+  'turn_handoff_available',
+  'ui_invalidate',
+  'ui_log',
+  'ui_toast',
+  'ui_status',
+  'ui_panes',
+  'ui_scroll',
+  'ui_focus',
+  'commands_changed',
+  'notification',
+  'task_progress',
+  'thinking_tokens',
+  'memory_recall',
+  'elicitation_complete',
+  'permission_check_status',
+  'code_change_published',
+  'vcs_state_changed',
+  'dev_intent',
+  'turn_preempted',
+  'per_turn_effort_changed',
+  'file_attachments_missing',
+  'cloud_session_delta',
+  'upgrade_relay_marker',
 ] as const;
 const fields = [
   'session_id',
@@ -347,6 +386,7 @@ export type ReplacementDiagnostic = Readonly<{
     | 'assistant'
     | 'user'
     | 'retry'
+    | 'system'
     | 'status'
     | 'rate-limit'
     | 'result'
@@ -456,6 +496,8 @@ export class ReplacementStream {
           // Progress cannot change the fixed permission mode or supply replacement authority.
           status.parse(value);
         } else if (type === 'system') {
+          this.site = 'system';
+          if (record.subtype !== 'api_retry') this.fail('protocol', 'unsupported', 'subtype');
           this.site = 'retry';
           retry.parse(value);
           this.retries++;
