@@ -6319,8 +6319,21 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     let profileAvailable = true;
     let quotaAction: (() => void) | undefined;
     let quotaReset = '2026-10-24T17:00:00.000Z';
+    const planningProfile = {
+      ...unavailableNativeProfile(),
+      facts: {
+        ...unavailableNativeProfile().facts,
+        available: true,
+        reason: 'available',
+        model: fixtureModel,
+        clientVersion: process.version,
+      },
+      client: { executable: process.execPath, sha256: fixtureClientHash, version: process.version },
+      environment: { ...process.env },
+      locationHash: '1'.repeat(64),
+    } satisfies NativeProfileResolution;
     const options: Partial<ControllerOptions> = {
-      nativeProfiles: () => [],
+      nativeProfiles: () => (row === 'approved' ? [planningProfile] : []),
       googleUsageClient: () =>
         row === 'unavailable'
           ? { available: false, reason: 'client-unavailable' }
@@ -6527,11 +6540,11 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       limits: { attempts: 4, minutes: 5, concurrency: 1 },
       effects: fixtures.policy.effects.map((grant) => ({ ...grant, taskId: task.id })),
     };
-    const prepared = await controller.execute(
+    const prepareAcpTask = (target: ReturnType<typeof TaskSchema.parse>) =>
       command(
         'PrepareNativeRun',
         {
-          taskId: task.id,
+          taskId: target.id,
           profileId: 'google-acp-v1',
           proofId: controller.store.googleAcpSetup().proofId,
           modelId: 'fixture-model',
@@ -6545,12 +6558,59 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
             paidExtraUsageDisabled: true,
             quotaAccountConfirmed: true,
           },
-          policy,
+          policy: {
+            ...policy,
+            effects: policy.effects.map((grant) => ({ ...grant, taskId: target.id })),
+          },
         },
-        task.revision,
-      ),
-      'local-owner',
-    );
+        target.revision,
+      );
+    if (row === 'approved') {
+      const planningTask = TaskSchema.parse(
+        (
+          await controller.execute(
+            command(
+              'CreateTask',
+              {
+                projectId: task.projectId,
+                title: 'Confirm the plan before native preparation',
+                outcome: task.outcome,
+                criteria: task.criteria,
+              },
+              0,
+            ),
+            'local-owner',
+          )
+        ).entity,
+      );
+      const configured = await controller.execute(
+        command(
+          'ConfigureTaskConversation',
+          {
+            taskId: planningTask.id,
+            planning: {
+              role: 'lead',
+              profileId: 'openai-file-v1',
+              creditPolicy: 'ordinary',
+              limits: policy.limits,
+              consent: 'explicit',
+            },
+          },
+          planningTask.revision,
+        ),
+        'local-owner',
+      );
+      assert.equal(configured.outcome, 'applied');
+      const unconfirmed = await controller.execute(
+        prepareAcpTask(TaskSchema.parse(configured.entity)),
+        'local-owner',
+      );
+      assert.equal(unconfirmed.reason, 'task-contract-unconfirmed');
+      assert.equal(unconfirmed.next, 'Review and adopt a plan before preparing execution.');
+      assert.equal(controller.store.intents().length, 0);
+      assert.equal(acpLaunches, setupLaunches);
+    }
+    const prepared = await controller.execute(prepareAcpTask(task), 'local-owner');
     assert.equal(prepared.outcome, 'applied', canonicalJson(prepared));
     const run = RunSchema.parse(prepared.entity);
     const start = () =>
@@ -7074,6 +7134,7 @@ test('planning turns keep task authority and allowance across execution', async 
     locationHash: '1'.repeat(64),
   } satisfies NativeProfileResolution;
   const options: Partial<ControllerOptions> = {
+    identity: { name: 'Fixture owner', email: 'owner@example.invalid' },
     nativeProfile: () => profile,
     afterIntent: () => {
       if (crashAfterIntent) throw Error('Interrupted after durable planning admission.');
@@ -7646,6 +7707,19 @@ test('planning turns keep task authority and allowance across execution', async 
     'task-not-preparable',
   );
   await firstReply;
+  const nativePreparation = {
+    profileId: 'openai-file-v1',
+    targetPath: 'net.mjs',
+    policy: {
+      ...policy,
+      methods: [{ id: 'keep-it-simple', cycles: 1, reviewerRole: 'reviewer' }],
+    },
+    creditPolicy: 'ordinary',
+    consent: 'explicit',
+  };
+  const provisionalPreparation = await send('PrepareNativeRun', taskId, nativePreparation);
+  assert.equal(provisionalPreparation.reason, 'task-contract-unconfirmed');
+  assert.equal(provisionalPreparation.next, 'Review and adopt a plan before preparing execution.');
   const admitted = controller.store.intents().find((intent) => intent.task_id === taskId);
   assert(admitted);
   const savedInputReceipt = controller.store.receipt(`conversation-turn:${admitted.attempt_id}`);
@@ -7768,6 +7842,15 @@ test('planning turns keep task authority and allowance across execution', async 
   );
   await send('AdoptTaskPlan', taskId, { proposalId: proposed.id, proposalHash: proposed.hash });
   assert.equal(state(taskId).contractStatus, 'confirmed');
+  const changedSource = join(context.source.directory, 'planning-note.txt');
+  writeFileSync(changedSource, 'Source changed after adoption.\n');
+  const stalePreparation = await send('PrepareNativeRun', taskId, nativePreparation);
+  assert.equal(stalePreparation.reason, 'proposal-not-current');
+  assert.equal(
+    stalePreparation.next,
+    'Adopt the current planning proposal before preparing execution.',
+  );
+  rmSync(changedSource);
   const prepared = await send('PrepareRun', taskId, { policy, roles: quickRoles(fixtures) });
   assert.equal(prepared.outcome, 'applied');
   const execution = RunSchema.parse(prepared.entity);
@@ -7776,6 +7859,51 @@ test('planning turns keep task authority and allowance across execution', async 
     'run-not-current',
   );
   assert.equal(state(taskId).budget?.remaining.attempts, 7);
+  const retainGuidance = async (text: string) => {
+    const before = structuredClone(current(taskId));
+    const snapshot = controller.snapshot();
+    const runs = structuredClone(snapshot.runs);
+    const candidates = structuredClone(snapshot.candidates);
+    const evidence = structuredClone(snapshot.evidence);
+    const allowance = state(taskId).budget;
+    const attempts = controller.store.intents().length;
+    const spawns = children.length;
+    const result = await send('SendTaskMessage', taskId, { text, context: refs });
+    assert.equal(result.outcome, 'applied', JSON.stringify(result));
+    assert.deepEqual({ ...current(taskId), revision: before.revision }, before);
+    assert.deepEqual(controller.snapshot().runs, runs);
+    assert.deepEqual(controller.snapshot().candidates, candidates);
+    assert.deepEqual(controller.snapshot().evidence, evidence);
+    assert.deepEqual(state(taskId).budget, allowance);
+    assert.equal(controller.store.intents().length, attempts);
+    assert.equal(children.length, spawns);
+    assert.equal(state(taskId).send.disposition, 'queue');
+    const entry = controller.store.db
+      .prepare(
+        'SELECT body FROM conversation_entries WHERE task_id=? ORDER BY sequence DESC LIMIT 1',
+      )
+      .get(taskId);
+    const guidance = JSON.parse(entry?.body as string);
+    assert.equal(guidance.kind, 'guidance');
+    assert.equal(guidance.text, text);
+    assert.deepEqual(guidance.context, refs);
+  };
+  await retainGuidance('Keep this prepared run while retaining the question.');
+  const preparedRunId = current(taskId).runId;
+  const reconfigure = await send('ConfigureTaskConversation', taskId, {
+    planning: { ...planning, role: 'orchestrator' },
+  });
+  assert.equal(reconfigure.reason, 'task-not-discussing');
+  assert.equal(current(taskId).runId, preparedRunId);
+  assert.equal(
+    (
+      await send('ConfigureTaskConversation', taskId, {
+        planning: { ...planning, limits: { ...planning.limits, attempts: 11 } },
+      })
+    ).outcome,
+    'applied',
+  );
+  assert.equal(current(taskId).runId, preparedRunId);
   const reviewed = new Promise<void>((done) => {
     const off = controller.subscribe((event) => {
       if (event.type === 'review.completed' && event.taskId === taskId) {
@@ -7837,34 +7965,69 @@ test('planning turns keep task authority and allowance across execution', async 
   const retainedExecution = structuredClone(controller.store.get('run', execution.id));
   const retainedCandidates = structuredClone(controller.snapshot().candidates);
   const retainedEvidence = structuredClone(controller.snapshot().evidence);
-  assert.equal(state(taskId).queuedInputCount, 1);
-  assert.equal(state(taskId).send.disposition, 'planning-turn');
-  const revisionReply = nextReply();
-  await send('SendTaskMessage', taskId, { text: 'Plan the bounded revision now.' });
-  await revisionReply;
-  assert.equal(state(taskId).contractStatus, 'provisional');
-  assert.equal(
-    (await send('PrepareRun', taskId, { policy, roles: quickRoles(fixtures) })).reason,
-    'task-contract-unconfirmed',
-  );
-  const revisionPlan = state(taskId).proposal;
-  assert(revisionPlan);
-  await send('AdoptTaskPlan', taskId, {
-    proposalId: revisionPlan.id,
-    proposalHash: revisionPlan.hash,
-  });
-  const continuation = await send('PrepareRun', taskId, { policy, roles: quickRoles(fixtures) });
-  assert.equal(continuation.outcome, 'applied');
-  assert.equal(state(taskId).budget?.remaining.attempts, 3);
+  assert.equal(state(taskId).queuedInputCount, 2);
+  await retainGuidance('Thanks. Keep the checked candidate current.');
+  assert.equal(current(taskId).runId, execution.id);
   assert.deepEqual(controller.store.get('run', execution.id), retainedExecution);
   assert.deepEqual(controller.store.get('run', proposed.runId), planningRun);
-  assert.deepEqual(controller.snapshot().candidates, retainedCandidates);
-  assert.deepEqual(controller.snapshot().evidence, retainedEvidence);
+  const acceptance = await send('AcceptCandidate', taskId, {
+    candidateId: exportCandidate.id,
+    destinationRef: 'refs/heads/retained-conversation',
+  });
+  assert.equal(acceptance.outcome, 'applied', JSON.stringify(acceptance));
+  const acceptApproval = controller
+    .snapshot()
+    .approvals.find(
+      (approval) =>
+        approval.taskId === taskId &&
+        approval.action === 'accept-candidate' &&
+        approval.status === 'pending',
+    );
+  assert(acceptApproval);
+  assert.equal(
+    (
+      await controller.execute(
+        command(
+          'ResolveApproval',
+          { binding: binding(acceptApproval), decision: 'approved' },
+          current(taskId).revision,
+        ),
+        'local-owner',
+      )
+    ).outcome,
+    'applied',
+  );
+  assert.equal(current(taskId).state, 'accepted');
+  const acceptedHead = refValue(context.source.directory, 'refs/heads/retained-conversation');
+  assert(acceptedHead);
+  await retainGuidance('Keep the accepted result and this follow-up.');
+  assert.equal(current(taskId).state, 'accepted');
+  assert.equal(current(taskId).runId, execution.id);
+  assert.equal(
+    refValue(context.source.directory, 'refs/heads/retained-conversation'),
+    acceptedHead,
+  );
+  assert.equal(
+    (
+      await send('ConfigureTaskConversation', taskId, {
+        planning: { ...planning, role: 'orchestrator' },
+      })
+    ).reason,
+    'task-not-discussing',
+  );
+  assert.equal(
+    (
+      await send('ConfigureTaskConversation', catalogTask.id, {
+        planning: { ...planning, role: 'orchestrator', limits: lowerPlanning.limits },
+      })
+    ).outcome,
+    'applied',
+  );
   crashAfterIntent = true;
   const crash = command(
     'SendTaskMessage',
-    { taskId, text: 'Keep the next turn bounded.', context: refs },
-    current(taskId).revision,
+    { taskId: catalogTask.id, text: 'Keep the next turn bounded.', context: refs },
+    current(catalogTask.id).revision,
   );
   await assert.rejects(
     controller.execute(crash, 'local-owner'),
@@ -7875,7 +8038,7 @@ test('planning turns keep task authority and allowance across execution', async 
   crashAfterIntent = false;
   reopened = new Controller({ ...options, home: controller.home, now: clock.now, id: context.id });
   const afterReopen = await reopened.execute(
-    command('GetTaskConversationState', { taskId }),
+    command('GetTaskConversationState', { taskId: catalogTask.id }),
     'local-owner',
   );
   assert.equal(afterReopen.data?.kind, 'conversation-state');
@@ -7896,7 +8059,7 @@ test('planning turns keep task authority and allowance across execution', async 
     .prepare(
       "SELECT body FROM conversation_entries WHERE task_id=? AND json_extract(body,'$.text')=?",
     )
-    .get(taskId, 'Keep the next turn bounded.');
+    .get(catalogTask.id, 'Keep the next turn bounded.');
   assert.deepEqual(JSON.parse(recoveredEntry?.body as string).context, refs);
   assert.deepEqual(reopened.snapshot().candidates, retainedCandidates);
   assert.deepEqual(reopened.snapshot().evidence, retainedEvidence);

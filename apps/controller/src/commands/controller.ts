@@ -3387,12 +3387,12 @@ export class Controller {
           : { available: false, reason: 'execution-active', disposition: null };
     } else if (active && purpose)
       send = { available: true, reason: 'queued-at-boundary', disposition: 'queue' };
-    else if (
-      config &&
-      run &&
-      (purpose === 'conversation' || purpose === 'execution') &&
-      allowance
-    ) {
+    else if (run && purpose === 'execution') {
+      const boundary = this.conversationBoundary(task.id);
+      send = boundary
+        ? { available: false, reason: boundary, disposition: null }
+        : { available: true, reason: 'queued-at-boundary', disposition: 'queue' };
+    } else if (config && run && purpose === 'conversation' && allowance) {
       send.reason = 'available';
       try {
         this.conversationProfile(config);
@@ -3428,9 +3428,9 @@ export class Controller {
         send = {
           available: true,
           reason: 'available',
-          disposition: purpose === 'conversation' ? 'turn' : 'planning-turn',
+          disposition: 'turn',
         };
-    } else if (run && purpose === 'execution') send.reason = 'task-not-discussing';
+    }
     let adopt: TaskConversationState['adopt'] = { available: false, reason: 'proposal-missing' };
     if (proposal && config && allowance && purpose === 'conversation') {
       const boundary = this.conversationBoundary(task.id);
@@ -3681,6 +3681,12 @@ export class Controller {
         const updated = this.updateTask(task, {});
         return { outcome: 'applied', entity: updated, revision: updated.revision };
       }
+      if (this.store.runPurpose(task.runId ?? '') === 'execution')
+        return {
+          outcome: 'blocked',
+          reason: 'task-not-discussing',
+          next: 'The current execution run is retained. Start a separate task to plan new work.',
+        };
       const boundary = this.conversationBoundary(task.id);
       if (boundary) return { outcome: 'blocked', reason: boundary };
       const modelReason = this.conversationModelReason(task.id, selection);
@@ -3759,16 +3765,13 @@ export class Controller {
         : this.conversation.recordMessage(
             task.id,
             command.payload.text,
-            command.command === 'QueueTaskGuidance' ? 'guidance' : 'user-message',
+            command.command === 'QueueTaskGuidance' || state.purpose === 'execution'
+              ? 'guidance'
+              : 'user-message',
             command.payload.context,
           );
     if (!saved.applied) return { outcome: 'blocked', reason: saved.reason };
-    if (state.send.disposition === 'planning-turn') {
-      const config = this.conversationConfiguration(task.id) as ConversationConfiguration;
-      this.configureConversation(saved.task, config.selection, true);
-    }
-    if (state.send.disposition === 'turn' || state.send.disposition === 'planning-turn')
-      this.admitConversation(task.id, effects);
+    if (state.send.disposition === 'turn') this.admitConversation(task.id, effects);
     const current = this.store.get<Task>('task', task.id) as Task;
     return { outcome: 'applied', entity: current, revision: current.revision };
   }
@@ -7107,8 +7110,9 @@ export class Controller {
       if (!proof.reviewMode || !proof.configOptions || proof.auth.status !== 'authenticated')
         throw Error('ACP setup is incomplete.');
       const task = this.store.get<Task>('task', input.taskId);
-      if (task?.state !== 'draft' || this.draftEditGate(task))
-        throw Error('Task is not preparable.');
+      if (task?.state !== 'draft') return { outcome: 'blocked', reason: 'task-not-preparable' };
+      const gate = this.draftEditGate(task);
+      if (gate) return gate;
       const source = inspectSource(task.projectId, this.projectPath(task.projectId) as string);
       const files = committedFiles(this.projectPath(task.projectId) as string, source.base);
       const target = files.find((file) => file.path === input.targetPath);
@@ -7964,8 +7968,9 @@ export class Controller {
       )
         throw Error('The native permission mode is unavailable.');
       const task = this.store.get<Task>('task', command.payload.taskId);
-      if (task?.state !== 'draft' || this.draftEditGate(task))
-        return { outcome: 'blocked', reason: 'task-not-preparable' };
+      if (task?.state !== 'draft') return { outcome: 'blocked', reason: 'task-not-preparable' };
+      const gate = this.draftEditGate(task);
+      if (gate) return gate;
       const source = inspectSource(task.projectId, this.projectPath(task.projectId) as string);
       const files = committedFiles(this.projectPath(task.projectId) as string, source.base);
       const original = filePayload
