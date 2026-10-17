@@ -36,7 +36,21 @@ import { ConversationContextCaptureError, type DesktopCommand, type Workspace } 
 import { roleLabels } from './templates.ts';
 
 const applied = (outcome: string) => outcome === 'applied' || outcome === 'already-applied';
-const reasonText = (reason: string) => `${titleCase(reason.replaceAll('-', ' '))}.`;
+const reasonText = (reason: string) =>
+  reason === 'task-not-discussing'
+    ? 'The current execution run stays current. Material planning changes are unavailable here.'
+    : `${titleCase(reason.replaceAll('-', ' '))}.`;
+
+// Preparation needs the adopted proposal to remain the controller's current, adoptable proposal.
+export const adoptedPlanCurrent = (state: TaskConversationState) =>
+  state.purpose !== 'conversation' ||
+  Boolean(
+    state.adoptedProposal &&
+      state.adoptedProposal.runId === state.currentRunId &&
+      state.proposal?.id === state.adoptedProposal.id &&
+      state.proposal.hash === state.adoptedProposal.hash &&
+      state.adopt.available,
+  );
 const mergeEntries = (current: ConversationEntry[], incoming: ConversationEntry[]) => {
   const entries = new Map(current.map((entry) => [entry.id, entry]));
   for (const entry of incoming) {
@@ -213,7 +227,7 @@ function useConversation(task: Task, workspace: Workspace, visible: boolean) {
 
 type CapturedContext = { ref: ConversationContextRef; bundle: ConversationContextBundle };
 type ContextCaptureReceipt = { receiptId: string; projectId: string; base: string };
-type ContextFact = { hash: string; files: number; bytes: number };
+type ContextFact = { hash: string; files: number; bytes: number; name?: string };
 type ContextDraft = {
   refs: ConversationContextRef[];
   facts?: Record<string, ContextFact>;
@@ -270,8 +284,15 @@ function readContextDrafts() {
           const hash = HashSchema.safeParse(fact.hash);
           const files = RevisionSchema.min(1).max(32).safeParse(fact.files);
           const bytes = RevisionSchema.min(1).max(32768).safeParse(fact.bytes);
+          const name =
+            typeof fact.name === 'string' && fact.name.length <= 1024 ? fact.name : undefined;
           if (hash.success && hash.data === ref.hash && files.success && bytes.success)
-            facts[ref.artifactId] = { hash: hash.data, files: files.data, bytes: bytes.data };
+            facts[ref.artifactId] = {
+              hash: hash.data,
+              files: files.data,
+              bytes: bytes.data,
+              ...(name ? { name } : {}),
+            };
         }
       }
       drafts[key] = {
@@ -326,6 +347,43 @@ const contextBytes = (capture: CapturedContext) =>
   new TextEncoder().encode(canonicalJson(capture.bundle)).length;
 const sameContext = (left: ConversationContextRef[], right: ConversationContextRef[]) =>
   canonicalJson(left) === canonicalJson(right);
+// A capture is named by its only file, or by the folder its files share.
+const contextName = ({ files }: ConversationContextBundle) => {
+  if (files.length === 1) return files[0].path;
+  const [first, ...rest] = files.map((file) => file.path.split('/'));
+  let shared = first.length - 1;
+  for (const parts of rest) {
+    let index = 0;
+    while (index < shared && parts[index] === first[index]) index++;
+    shared = index;
+  }
+  return shared ? `${first.slice(0, shared).join('/')}/` : 'Project root';
+};
+const contextFact = (capture: CapturedContext): ContextFact => ({
+  hash: capture.ref.hash,
+  files: capture.bundle.files.length,
+  bytes: contextBytes(capture),
+  name: contextName(capture.bundle),
+});
+const contextRefusals = new Map([
+  [
+    'conversation-context-too-large',
+    'The selection is too large. Context takes up to 32 text files, 8 KiB each and 32 KiB in total.',
+  ],
+  [
+    'conversation-context-outside-project',
+    'Choose a file or folder inside the registered project.',
+  ],
+  ['conversation-context-source-changed', 'The project changed during capture. Choose it again.'],
+  [
+    'conversation-context-unavailable',
+    'This selection cannot be captured. Use committed UTF-8 text, or a text log inside the project outside hidden folders. Links, empty or binary files and credential paths are refused.',
+  ],
+  [
+    'conversation-context-invalid',
+    'The captured context no longer matches this project commit. Remove it and capture again.',
+  ],
+]);
 type ContextRecipient = { summary: string; details?: string };
 function ContextPreview({
   captures,
@@ -486,7 +544,9 @@ function useContextComposer({
   const currentPanelScope = useRef(panelScope);
   currentPanelScope.current = panelScope;
   const message = (failure: unknown) =>
-    failure instanceof Error ? failure.message : 'Context could not be prepared.';
+    failure instanceof Error
+      ? (contextRefusals.get(failure.message.split(' ')[0]) ?? failure.message)
+      : 'Context could not be prepared.';
   const readCapture = useCallback(
     async (ref: ConversationContextRef) => {
       const existing = cacheRef.current[ref.artifactId];
@@ -525,14 +585,7 @@ function useContextComposer({
           )
             writeContextDraft(latest.current.draftKey, (current) => ({
               ...current,
-              facts: {
-                ...current.facts,
-                [ref.artifactId]: {
-                  hash: ref.hash,
-                  files: capture.bundle.files.length,
-                  bytes: contextBytes(capture),
-                },
-              },
+              facts: { ...current.facts, [ref.artifactId]: contextFact(capture) },
             }));
           return capture;
         })
@@ -575,7 +628,12 @@ function useContextComposer({
       } else {
         contextSendReceipts.delete(draftKey);
         writeContextDraft(draftKey, (current) => ({ ...current, priorSend: false }));
-        setError([result.reason ?? result.outcome, result.next].filter(Boolean).join(' '));
+        setError(
+          result.reason === 'conversation-context-too-large'
+            ? 'The message and its context exceed the planning input limit. Remove a capture and review again.'
+            : (contextRefusals.get(result.reason ?? '') ??
+                [result.reason ?? result.outcome, result.next].filter(Boolean).join(' ')),
+        );
       }
     } catch (failure) {
       setError(
@@ -709,28 +767,14 @@ function useContextComposer({
           return {
             ...current,
             captureReceipt: undefined,
-            facts: {
-              ...current.facts,
-              [capture.ref.artifactId]: {
-                hash: capture.ref.hash,
-                files: capture.bundle.files.length,
-                bytes: contextBytes(capture),
-              },
-            },
+            facts: { ...current.facts, [capture.ref.artifactId]: contextFact(capture) },
           };
         const refs = ConversationContextRefsSchema.parse([...current.refs, capture.ref]);
         return {
           ...current,
           refs,
           captureReceipt: undefined,
-          facts: {
-            ...current.facts,
-            [capture.ref.artifactId]: {
-              hash: capture.ref.hash,
-              files: capture.bundle.files.length,
-              bytes: contextBytes(capture),
-            },
-          },
+          facts: { ...current.facts, [capture.ref.artifactId]: contextFact(capture) },
         };
       });
       setCache((current) => ({ ...current, [capture.ref.artifactId]: capture }));
@@ -831,9 +875,24 @@ function useContextComposer({
     controls: {
       contextActions: (
         [
-          { id: 'source-file', kind: 'file', label: 'Source file' },
-          { id: 'source-folder', kind: 'folder', label: 'Source folder' },
-          { id: 'log-file', kind: 'log', label: 'Project log' },
+          {
+            id: 'source-file',
+            kind: 'file',
+            label: 'Source file',
+            detail: 'Committed UTF-8 text, 8 KiB at most',
+          },
+          {
+            id: 'source-folder',
+            kind: 'folder',
+            label: 'Source folder',
+            detail: 'Up to 32 committed text files, 8 KiB each, 32 KiB in total',
+          },
+          {
+            id: 'log-file',
+            kind: 'log',
+            label: 'Project log',
+            detail: 'Text log inside the project, outside hidden folders, 8 KiB at most',
+          },
         ] as const
       ).map((action) => ({
         ...action,
@@ -856,7 +915,7 @@ function useContextComposer({
       attachments: draft.refs.map((ref, index) => ({
         id: ref.artifactId,
         label: draft.facts?.[ref.artifactId]
-          ? `Context ${index + 1} · ${draft.facts[ref.artifactId].files} ${draft.facts[ref.artifactId].files === 1 ? 'file' : 'files'} · ${draft.facts[ref.artifactId].bytes.toLocaleString()} bytes`
+          ? `Context ${index + 1} · ${draft.facts[ref.artifactId].files} ${draft.facts[ref.artifactId].files === 1 ? 'file' : 'files'} · ${draft.facts[ref.artifactId].bytes.toLocaleString()} bytes${draft.facts[ref.artifactId].name ? ` · ${draft.facts[ref.artifactId].name}` : ''}`
           : `Context ${index + 1} · ${ref.hash.slice(0, 8)}`,
       })),
       onAddContext: () => {
@@ -1006,39 +1065,51 @@ function planningComposerControls(
     : (profile?.effort ?? 'unknown');
   const advertised =
     controls?.choices?.status === 'last-observed' ? controls.choices.models : undefined;
+  const reason = controls?.choices?.reason;
+  // Until a turn succeeds the effective pair is unknown. Show the requested pair and say so.
+  const unknown = !config?.effectiveModel;
+  const shownModel = config
+    ? (config.effectiveModel ?? config.requestedModel)
+    : (profile?.model ?? null);
+  const shownEffort = config
+    ? (config.effectiveEffort ?? config.requestedEffort)
+    : (profile?.effort ?? null);
+  const mark = (value: string, shown: string | null) =>
+    unknown && value === shown ? `${value} (requested)` : value;
   return {
     primary: {
       roleLabel: roleLabels[role],
       models: advertised
         ? advertised.map((choice) => ({
             id: choice.model,
-            label: choice.model,
+            label: mark(choice.model, shownModel),
             route: 'OpenAI',
-            efforts: choice.efforts.map((effort) => ({ id: effort, label: effort })),
+            efforts: choice.efforts.map((effort) => ({
+              id: effort,
+              label: choice.model === shownModel ? mark(effort, shownEffort) : effort,
+            })),
           }))
-        : profile
+        : shownModel
           ? [
               {
-                id: profile.model,
-                label: profile.model,
-                route: familyName(profile.family),
-                efforts: [{ id: profile.effort, label: profile.effort }],
+                id: shownModel,
+                label: mark(shownModel, shownModel),
+                route: profile ? familyName(profile.family) : undefined,
+                efforts: shownEffort
+                  ? [{ id: shownEffort, label: mark(shownEffort, shownEffort) }]
+                  : [],
               },
             ]
           : [],
-      currentModelId: config?.effectiveModel ?? null,
-      currentEffortId: config?.effectiveEffort ?? null,
-      requestedModelId:
-        advertised && config?.selection.modelRequest && controls?.choices?.reason === 'available'
-          ? config.requestedModel
-          : undefined,
-      requestedEffortId:
-        advertised && config?.selection.modelRequest && controls?.choices?.reason === 'available'
-          ? config.requestedEffort
-          : undefined,
-      scopeLabel: advertised
-        ? 'Last-observed choices. Review and save for a later planning turn.'
-        : 'Planning profile',
+      currentModelId: shownModel,
+      currentEffortId: shownEffort,
+      requestedModelId: config?.selection.modelRequest ? config.requestedModel : undefined,
+      requestedEffortId: config?.selection.modelRequest ? config.requestedEffort : undefined,
+      scopeLabel: config?.selection.modelRequest
+        ? `Saved for later planning turns.${reason && reason !== 'available' ? ` ${reasonText(reason)}` : ''}`
+        : advertised
+          ? 'Last-observed choices. Saving a change needs a newly adopted plan before execution.'
+          : 'Planning profile',
       frozenReason:
         controls?.disabledReason ??
         (advertised
@@ -1150,8 +1221,14 @@ export function NewGoal({
   onCreated: (id: string, submitted: string) => void;
   onManual: () => void;
 }) {
-  const [projectId, setProjectId] = useState(snapshot.projects[0]?.id ?? '');
+  const [chosenProject, setProjectId] = useState(snapshot.projects[0]?.id ?? '');
+  const projectId = snapshot.projects.some((project) => project.id === chosenProject)
+    ? chosenProject
+    : (snapshot.projects[0]?.id ?? '');
   const [planning, setPlanning] = useState(() => initialPlanning());
+  useEffect(() => {
+    if (projectId) setPlanning((value) => (value.consent ? { ...value, consent: false } : value));
+  }, [projectId]);
   const selection = planningSelection(planning);
   const profile = getPlanningProfile(snapshot);
   const context = useContextComposer({
@@ -1186,7 +1263,7 @@ export function NewGoal({
             : !projectId
               ? 'Choose a project before sending the goal.'
               : !profile?.available
-                ? `Planning profile unavailable: ${profile?.reason ?? 'not configured'}.`
+                ? `Planning profile unavailable. ${reasonText(profile?.reason ?? 'not-configured')}`
                 : !selection.success
                   ? 'Choose finite planning limits within the displayed bounds.'
                   : !planning.consent
@@ -1504,16 +1581,25 @@ export function ConversationView({
             ],
             pending: pendingDecision === entry.id,
             disabledReason: decisionBlockedReason,
-            resolution: state?.adoptedProposal?.id === entry.id ? 'Plan adopted.' : undefined,
+            resolution:
+              state?.adoptedProposal?.id === entry.id
+                ? state.contractStatus === 'confirmed' && adoptedPlanCurrent(state)
+                  ? 'Plan adopted.'
+                  : 'Adopted earlier. Execution preparation needs a current adopted plan.'
+                : undefined,
             choices: [
               {
                 id: 'adopt',
                 label: 'Adopt plan',
                 tone: 'primary',
                 disabledReason:
-                  current && state?.adopt.available && state.proposal?.id === entry.id
-                    ? undefined
-                    : reasonText(state?.adopt.reason ?? 'proposal-not-current'),
+                  state?.proposal?.id !== entry.id
+                    ? reasonText('proposal-not-current')
+                    : !current
+                      ? (decisionBlockedReason ?? 'Refreshing the current conversation state.')
+                      : state.adopt.available
+                        ? undefined
+                        : reasonText(state.adopt.reason),
               },
             ],
           };
@@ -1590,10 +1676,9 @@ export function ConversationView({
     if (request) openSettings(request);
   }
   function stageEffort(effort: string) {
-    const model =
-      config?.selection.modelRequest && choices?.reason === 'available'
-        ? config.requestedModel
-        : config?.effectiveModel;
+    const model = config?.selection.modelRequest
+      ? config.requestedModel
+      : (config?.effectiveModel ?? config?.requestedModel);
     if (!model) return;
     const request = requestFor(model, effort);
     if (request) openSettings(request);
@@ -1610,13 +1695,21 @@ export function ConversationView({
   const executionPolicyReason = combinedTask
     ? 'Choose execution authority in Combined task preparation.'
     : (decisionBlockedReason ??
-      (task.state !== 'draft' || executionRun
+      (executionRun
         ? 'The saved execution policy is frozen. Review it in execution preparation.'
-        : state?.contractStatus !== 'confirmed' || !config
-          ? 'Adopt the task plan before choosing execution preparation.'
-          : state.activeAttempt || state.phase === 'unknown' || state.phase === 'stopping'
-            ? 'Resolve current work before preparing execution.'
-            : undefined));
+        : task.state !== 'draft'
+          ? 'Execution preparation opens when planning returns the task to draft.'
+          : !config
+            ? 'Use Prepare run to choose execution authority for this task.'
+            : state?.contractStatus !== 'confirmed'
+              ? 'Adopt the task plan before choosing execution preparation.'
+              : !adoptedPlanCurrent(state)
+                ? state.adopt.available
+                  ? 'A newer plan replaced the adopted one. Adopt it before preparing execution.'
+                  : `The adopted plan cannot be prepared now. ${reasonText(state.adopt.reason)}`
+                : state.activeAttempt || state.phase === 'unknown' || state.phase === 'stopping'
+                  ? 'Resolve current work before preparing execution.'
+                  : undefined));
   const executionPolicy: ComposerControlsProps['policy'] = combinedTask
     ? {
         label: 'Future execution policy',
@@ -1632,11 +1725,25 @@ export function ConversationView({
           {
             id: 'unprepared',
             label: 'Not prepared',
-            disabledReason: 'Choose an authority to open preparation.',
           },
-          { id: 'guided', label: 'Guided' },
-          { id: 'balanced', label: 'Balanced' },
-          { id: 'autopilot', label: 'Autopilot' },
+          {
+            id: 'guided',
+            label: 'Guided',
+            detail:
+              'Local requires Guided. Native file and repository runs keep their reviewed permissions.',
+          },
+          {
+            id: 'balanced',
+            label: 'Balanced',
+            detail:
+              'Google ACP accepts Balanced. Local requires Guided; native file and repository permissions stay as reviewed.',
+          },
+          {
+            id: 'autopilot',
+            label: 'Autopilot',
+            detail:
+              'Google ACP and Local refuse Autopilot. Native file and repository permissions stay as reviewed.',
+          },
         ],
         scopeLabel: 'Opens a future execution draft. Planning stays read-only.',
         disabledReason: executionPolicyReason,
@@ -1685,6 +1792,16 @@ export function ConversationView({
                     ? 'Waiting for a permission decision.'
                     : 'The primary role is idle.';
   const selection = planningSelection(planning);
+  // Only the same selection with equal or lower limits keeps the adopted contract.
+  const materialChange = Boolean(
+    config &&
+      selection.success &&
+      (canonicalJson({ ...selection.data, limits: config.selection.limits }) !==
+        canonicalJson(config.selection) ||
+        (['attempts', 'minutes', 'concurrency'] as const).some(
+          (axis) => selection.data.limits[axis] > config.selection.limits[axis],
+        )),
+  );
   const requestChanged =
     canonicalJson(planning.modelRequest ?? null) !==
     canonicalJson(config?.selection.modelRequest ?? null);
@@ -1703,11 +1820,13 @@ export function ConversationView({
     decisionBlockedReason ??
     ((config?.revision ?? null) !== settingsConfigurationRevision
       ? 'The saved planning settings changed. Close and reopen this dialog to review them. Your draft has been kept.'
-      : state?.activeAttempt || state?.phase === 'unknown' || state?.phase === 'stopping'
-        ? 'This draft applies after current work stops. Save it explicitly at that boundary.'
-        : !requestCurrent
-          ? 'The observed model choices changed. Review and select the pair again before saving.'
-          : undefined);
+      : state?.purpose === 'execution' && materialChange
+        ? reasonText('task-not-discussing')
+        : state?.activeAttempt || state?.phase === 'unknown' || state?.phase === 'stopping'
+          ? 'This draft applies after current work stops. Save it explicitly at that boundary.'
+          : !requestCurrent
+            ? 'The observed model choices changed. Review and select the pair again before saving.'
+            : undefined);
   async function configure() {
     if (!planning.consent || !selection.success || settingsBlocked) return;
     setSettingsError(undefined);
@@ -1906,7 +2025,9 @@ export function ConversationView({
             ) : undefined,
             hint:
               state?.send.disposition === 'queue'
-                ? 'Guidance is retained for a later, explicitly admitted planning turn.'
+                ? state.purpose === 'execution'
+                  ? 'Messages are saved as guidance. The current execution run and result stay current.'
+                  : 'Guidance joins the next planning turn.'
                 : undefined,
           }}
           answerDrafts={answerDrafts}
@@ -2093,6 +2214,13 @@ export function ConversationView({
                 : 'Profile default'}
               . Saving starts no work. The next turn checks availability again.
             </p>
+            {materialChange && state?.contractStatus === 'confirmed' && (
+              <p className="notice" role="status">
+                {state.purpose === 'execution'
+                  ? 'The execution run stays current. Material planning changes cannot be saved here.'
+                  : 'Saving this change returns the task to planning. Execution preparation then needs a newly proposed and adopted plan.'}
+              </p>
+            )}
             <button
               className="button secondary"
               type="button"
@@ -2131,6 +2259,7 @@ export function ConversationView({
               disabled={
                 !current ||
                 state?.contractStatus !== 'confirmed' ||
+                !adoptedPlanCurrent(state) ||
                 Boolean(state.activeAttempt) ||
                 state.phase === 'unknown' ||
                 state.phase === 'stopping'

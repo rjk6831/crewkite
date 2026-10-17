@@ -591,10 +591,10 @@ export function Conversation({
                   )}
                   {message.text && <div className="conversation-message-text">{message.text}</div>}
                   {Boolean(message.attachments?.length) && (
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                    <div className="conversation-message-attachments">
                       {message.attachments?.map((attachment) => (
                         <button
-                          className="button secondary"
+                          className="conversation-message-attachment"
                           type="button"
                           key={attachment.id}
                           disabled={!onOpenAttachment}
@@ -711,6 +711,30 @@ export function Conversation({
               }
             }}
           />
+          {Boolean(composer.attachments?.length) && (
+            <ul className="conversation-attachments" aria-label="Context for the next message">
+              {composer.attachments?.map((attachment) => (
+                <li key={attachment.id} className="conversation-attachment">
+                  <button
+                    type="button"
+                    disabled={composer.contextDisabled}
+                    onClick={() => composer.onPreviewContext?.(attachment.id)}
+                  >
+                    {attachment.label}
+                  </button>
+                  <button
+                    type="button"
+                    className="conversation-attachment-remove"
+                    aria-label={`Remove ${attachment.label}`}
+                    disabled={composer.contextDisabled}
+                    onClick={() => composer.onRemoveContext?.(attachment.id)}
+                  >
+                    <X size={12} aria-hidden="true" />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
           <div className="conversation-composer-footer">
             {!composer.controls && composer.onAddContext && (
               <button
@@ -744,52 +768,6 @@ export function Conversation({
                 <ComposerControls {...composer.controls} contextMeter={composer.contextMeter} />
               </div>
             )}
-            {Boolean(composer.attachments?.length) && (
-              <span
-                style={{
-                  display: 'flex',
-                  gap: 6,
-                  overflowX: 'auto',
-                  whiteSpace: 'nowrap',
-                  maxWidth: composer.controls ? '35%' : undefined,
-                }}
-              >
-                {composer.attachments?.map((attachment) => (
-                  <span key={attachment.id} style={{ display: 'inline-flex', flexShrink: 0 }}>
-                    <button
-                      type="button"
-                      disabled={composer.contextDisabled}
-                      onClick={() => composer.onPreviewContext?.(attachment.id)}
-                      style={{
-                        width: 'auto',
-                        height: 28,
-                        padding: '0 6px',
-                        background: 'var(--surface-hover)',
-                        color: 'var(--text)',
-                        boxShadow: 'none',
-                      }}
-                    >
-                      {attachment.label}
-                    </button>
-                    <button
-                      type="button"
-                      aria-label={`Remove ${attachment.label}`}
-                      disabled={composer.contextDisabled}
-                      onClick={() => composer.onRemoveContext?.(attachment.id)}
-                      style={{
-                        width: 24,
-                        height: 28,
-                        background: 'var(--surface-hover)',
-                        color: 'var(--text)',
-                        boxShadow: 'none',
-                      }}
-                    >
-                      <X size={12} aria-hidden="true" />
-                    </button>
-                  </span>
-                ))}
-              </span>
-            )}
             {!composer.controls && composer.contextMeter}
             <button
               type="submit"
@@ -802,8 +780,9 @@ export function Conversation({
         </form>
         <div className="conversation-composer-note">
           <span>
-            {composer.attachments?.length && composer.disabledReason
-              ? composer.disabledReason
+            {(composer.controls || composer.attachments?.length) &&
+            (composer.disabledReason ?? composer.hint)
+              ? (composer.disabledReason ?? composer.hint)
               : composer.sending
                 ? 'Saving message. Waiting for confirmation.'
                 : 'Plans and permissions require a separate decision.'}
