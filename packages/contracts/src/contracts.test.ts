@@ -297,6 +297,12 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     manifestHash: origin.manifestHash,
     revision: 0,
     generation: 0,
+    evaluationSelection: {
+      recipeId: 'project-node-tests-v1',
+      testFiles: combined.payload.checks.testFiles,
+      reviewer: { profileId: 'openai-file-v1', methodId: 'keep-it-simple', cycles: 1 },
+      creditPolicy: 'ordinary',
+    },
     members: [1, 2].map((index) => ({
       taskId: combinedId('tsk', index),
       runId: combinedId('run', index),
@@ -329,6 +335,19 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     accept: unavailable,
   };
   assert.deepEqual(CombinedRunPreviewSchema.parse(combinedPreview), combinedPreview);
+  for (const evaluationSelection of [
+    { ...combinedPreview.evaluationSelection, recipeId: 'caller-command' },
+    { ...combinedPreview.evaluationSelection, testFiles: ['../outside.test.mjs'] },
+    {
+      ...combinedPreview.evaluationSelection,
+      reviewer: { ...combinedPreview.evaluationSelection.reviewer, profileId: 'local-file-v1' },
+    },
+    { ...combinedPreview.evaluationSelection, command: 'node caller.mjs' },
+  ])
+    assert.equal(
+      CombinedRunPreviewSchema.safeParse({ ...combinedPreview, evaluationSelection }).success,
+      false,
+    );
   assert.equal(
     CombinedRunPreviewSchema.safeParse({ ...combinedPreview, phase: 'ready' }).success,
     false,

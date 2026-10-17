@@ -2336,6 +2336,16 @@ export const CombinedRunPreviewSchema = z
     manifestHash: HashSchema,
     revision: RevisionSchema,
     generation: RevisionSchema,
+    evaluationSelection: z.strictObject({
+      recipeId: z.literal('project-node-tests-v1'),
+      testFiles: ProjectNodeTestFilesSchema,
+      reviewer: z.strictObject({
+        profileId: z.literal('openai-file-v1'),
+        methodId: z.literal('keep-it-simple'),
+        cycles: z.literal(1),
+      }),
+      creditPolicy: z.enum(['ordinary', 'existing-credits']),
+    }),
     members: z.tuple([combinedMemberPreview, combinedMemberPreview]),
     phase: z.enum([
       'prepared',
