@@ -8,6 +8,10 @@ export const acpPeerCases = [
   'complete',
   'session-update',
   'permission',
+  'hunk',
+  'hunk-sequential',
+  'hunk-control',
+  'hunk-drift',
   'permanent',
   'ambiguous',
   'changed-action',
@@ -40,7 +44,8 @@ export function runAcpPeer(scenario: AcpPeerCase) {
   assert(acpPeerCases.includes(scenario));
   let cwd = '',
     promptId: string | number | undefined,
-    submitted = false;
+    submitted = false,
+    hunkStep = 0;
   const config = [
     {
       id: 'model-slot',
@@ -97,6 +102,40 @@ export function runAcpPeer(scenario: AcpPeerCase) {
   function terminal(stopReason: string) {
     assert(promptId !== undefined);
     result(promptId, { stopReason });
+  }
+  function requestHunk() {
+    hunkStep++;
+    const path = join(cwd, 'net.mjs');
+    const oldText = String(hunkStep - 1),
+      newText = String(hunkStep);
+    const tool = {
+      toolCallId: `fixture-hunk-${hunkStep}`,
+      title: 'Run replace_file_content?',
+      kind: 'edit',
+      status: 'pending',
+      rawInput: {
+        TargetFile: path,
+        TargetContent: oldText,
+        ReplacementContent: newText,
+        ...(scenario === 'hunk-control' ? { AllowMultiple: true } : {}),
+      },
+      content: [{ type: 'diff', path, oldText, newText, _meta: { kind: 'modify' } }],
+      locations: [{ path }],
+    };
+    update({ sessionUpdate: 'tool_call', ...tool });
+    emit({
+      jsonrpc: '2.0',
+      id: `permission-${hunkStep}`,
+      method: 'session/request_permission',
+      params: {
+        sessionId: 'fixture-session',
+        toolCall: tool,
+        options: [
+          { optionId: 'once', name: 'Once', kind: 'allow_once' },
+          { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
+        ],
+      },
+    });
   }
   const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
   input.on('line', (line) => {
@@ -199,7 +238,9 @@ export function runAcpPeer(scenario: AcpPeerCase) {
           sessionUpdate: 'agent_thought_chunk',
           content: { type: 'text', text: 'private thought fixture' },
         });
-        if (scenario === 'drift') {
+        if (scenario.startsWith('hunk')) {
+          requestHunk();
+        } else if (scenario === 'drift') {
           config[0].currentValue = 'fixture-other';
           update({ sessionUpdate: 'config_option_update', configOptions: config });
         } else if (
@@ -288,16 +329,20 @@ export function runAcpPeer(scenario: AcpPeerCase) {
           });
         terminal('cancelled');
       } else if (message.method === 'session/close') result(message.id, {});
-      else if (message.id === 'permission-1') {
+      else if (message.id === 'permission-1' || message.id === 'permission-2') {
         if (message.result?.outcome?.outcome === 'selected') {
           assert.equal(message.result.outcome.optionId, 'once');
-          writeFileSync(join(cwd, 'net.mjs'), 'export const total = 1;\n');
+          writeFileSync(join(cwd, 'net.mjs'), `export const total = ${hunkStep || 1};\n`);
           update({
             sessionUpdate: 'tool_call_update',
-            toolCallId: 'fixture-tool',
+            toolCallId: hunkStep ? `fixture-hunk-${hunkStep}` : 'fixture-tool',
             status: 'completed',
           });
-          terminal('end_turn');
+          if (hunkStep === 1 && ['hunk-sequential', 'hunk-drift'].includes(scenario)) {
+            if (scenario === 'hunk-drift')
+              writeFileSync(join(cwd, 'net.mjs'), 'private change 1\n');
+            requestHunk();
+          } else terminal('end_turn');
         } else assert.equal(message.result?.outcome?.outcome, 'cancelled');
       } else throw Error('Unsupported fixture request.');
     } catch {

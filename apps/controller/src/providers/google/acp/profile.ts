@@ -38,6 +38,7 @@ export type AcpClientIdentity = Readonly<
 >;
 export const AcpReviewMappingSchema = z.strictObject({
   client: AcpClientPinSchema,
+  harnessSha256: HashSchema.optional(),
   surface: z.literal('config'),
   configId: identifier,
   valueId: identifier,
@@ -105,6 +106,18 @@ export function acpClientPin(client: AcpClientIdentity | AcpClientPin): AcpClien
   });
 }
 
+export function acpReviewMappingMatchesClient(
+  value: AcpReviewMapping,
+  client: AcpClientIdentity | AcpClientPin,
+): boolean {
+  const mapping = AcpReviewMappingSchema.parse(value);
+  return (
+    hashCanonical(mapping.client) === hashCanonical(acpClientPin(client)) &&
+    (mapping.harnessSha256 === undefined ||
+      ('harnessSha256' in client && mapping.harnessSha256 === client.harnessSha256))
+  );
+}
+
 export function validateAcpClientIdentity(client: AcpClientIdentity): AcpClientIdentity {
   const parsed = z
     .strictObject({ ...AcpImportIdentitySchema.shape, executable: z.string().min(1).max(4096) })
@@ -138,7 +151,7 @@ export function validateAcpSetupProof(
       .map((entry) => AcpReviewMappingSchema.parse(entry))
       .filter(
         (entry) =>
-          hashCanonical(entry.client) === hashCanonical(proof.client) &&
+          acpReviewMappingMatchesClient(entry, client) &&
           entry.surface === mode.surface &&
           entry.configId === mode.configId &&
           entry.valueId === mode.valueId &&

@@ -28,12 +28,16 @@ import {
   googleAcpDeveloperIdRequirement,
   readGoogleAcpPin,
   resolveGoogleAcpProfile,
+  validateAcpSetupProof,
 } from './profile.ts';
 import {
   AcpPermissionActionSchema,
   type AcpPermissionProposal,
+  type AcpTargetSnapshot,
   type AcpToolMapping,
+  acpPermissionAfterHash,
   decodeAcpConfiguration,
+  decodeAcpPermissionAction,
   googleAcpWriterPlan,
   startGoogleAcpSetup,
   startGoogleAcpWriter,
@@ -88,6 +92,12 @@ function fixture(scenario: AcpPeerCase) {
     client: acpClientPin(client),
     toolName: 'fixture-replace',
     schema: 'replace-target-v1',
+    evidenceHash: 'f'.repeat(64),
+  };
+  const hunkMapping: AcpToolMapping = {
+    client: { ...acpClientPin(client), harnessSha256: client.harnessSha256 },
+    toolTitle: 'Run replace_file_content?',
+    schema: 'replace-hunk-v1',
     evidenceHash: 'f'.repeat(64),
   };
   const configOptions = {
@@ -168,6 +178,7 @@ function fixture(scenario: AcpPeerCase) {
     client,
     mapping,
     toolMapping,
+    hunkMapping,
     proof,
     scratch,
     directory,
@@ -623,8 +634,132 @@ test('the acp writer binds an imported client and observed configuration before 
 });
 
 test('the acp protocol consumes one complete live permission and never treats context usage as allowance', async () => {
+  const hunkFixture = fixture('hunk');
+  try {
+    const targetState = (): AcpTargetSnapshot => ({
+      path: target.path,
+      hash: target.baseHash,
+      mode: target.mode,
+      content: original,
+    });
+    const absolutePath = join(hunkFixture.scratch, target.path);
+    const input = { TargetFile: absolutePath, TargetContent: '0', ReplacementContent: '1' };
+    const diff = {
+      type: 'diff',
+      path: absolutePath,
+      oldText: '0',
+      newText: '1',
+      _meta: { kind: 'modify' },
+    };
+    const tool = {
+      toolCallId: 'one',
+      title: 'Run replace_file_content?',
+      kind: 'edit',
+      status: 'pending',
+      rawInput: input,
+      content: [diff],
+      locations: [{ path: absolutePath }],
+    };
+    const decode = (value: unknown, readTarget = targetState) =>
+      decodeAcpPermissionAction({
+        tool: value,
+        client: hunkFixture.client,
+        scratch: hunkFixture.scratch,
+        target,
+        toolMappings: [hunkFixture.hunkMapping],
+        readTarget,
+      });
+    const action = decode(tool);
+    assert.equal(action.type, 'replace-hunk');
+    assert.equal(action.baseHash, hash(original));
+    assert.notEqual(action.baseHash, hash(input.TargetContent));
+    assert.equal(acpPermissionAfterHash(action, targetState()), hash(original.replace('0', '1')));
+    for (const newText of ['界'.repeat(1400), '"'.repeat(2000)])
+      assert.throws(() =>
+        decode({
+          ...tool,
+          rawInput: { ...input, ReplacementContent: newText },
+          content: [{ ...diff, newText }],
+        }),
+      );
+    const maximumContent = `0${'x'.repeat(65535)}`;
+    assert.throws(() =>
+      decode(
+        {
+          ...tool,
+          rawInput: { ...input, ReplacementContent: '11' },
+          content: [{ ...diff, newText: '11' }],
+        },
+        () => ({ ...targetState(), hash: hash(maximumContent), content: maximumContent }),
+      ),
+    );
+    for (const change of [
+      { title: 'Run other_edit?' },
+      { title: `Run replace_file_content? ${target.path}` },
+      { name: 'replace_file_content' },
+      { kind: 'other' },
+      { status: 'in_progress' },
+      { rawInput: { ...input, AllowMultiple: false } },
+      { rawInput: { ...input, StartLine: 1 } },
+      { rawInput: { ...input, TargetContent: '' } },
+      { rawInput: { ...input, TargetFile: '../net.mjs' } },
+      { rawInput: { ...input, path: target.path } },
+      { rawInput: { ...input, ReplacementChunks: [] } },
+      { rawInput: { ...input, ReplacementContent: '界'.repeat(1400) } },
+      { content: [{ ...diff, oldText: original }] },
+      { content: [{ ...diff, newText: '2' }] },
+      { content: [diff, { ...diff, path: join(hunkFixture.scratch, 'other.mjs') }] },
+      { content: [{ ...diff, _meta: { kind: 'add' } }] },
+      { content: [{ ...diff, extra: 'unobserved' }] },
+      { locations: [{ path: join(hunkFixture.scratch, 'other.mjs') }] },
+      { locations: [{ path: absolutePath, line: 1 }] },
+      { _meta: { mcp: {} } },
+      { rawOutput: {} },
+      { unobserved: true },
+    ])
+      assert.throws(() => decode({ ...tool, ...change }));
+    for (const content of ['no match', '0 0', '00'])
+      assert.throws(() => decode(tool, () => ({ ...targetState(), content, hash: hash(content) })));
+    assert.throws(() => decode(tool, () => ({ ...targetState(), hash: 'a'.repeat(64) })));
+    assert.throws(() => decode(tool, () => ({ ...targetState(), mode: '100755' })));
+    assert.throws(() =>
+      acpPermissionAfterHash({ ...action, baseHash: 'a'.repeat(64) }, targetState()),
+    );
+    if (action.type === 'replace-hunk')
+      assert.throws(() =>
+        acpPermissionAfterHash({ ...action, afterHash: 'a'.repeat(64) }, targetState()),
+      );
+    const pinned = { ...hunkFixture.mapping, harnessSha256: hunkFixture.client.harnessSha256 };
+    assert.deepEqual(
+      validateAcpSetupProof(hunkFixture.proof, hunkFixture.client, [pinned]),
+      hunkFixture.proof,
+    );
+    assert.throws(() =>
+      validateAcpSetupProof(
+        hunkFixture.proof,
+        { ...hunkFixture.client, harnessSha256: 'a'.repeat(64) },
+        [pinned],
+      ),
+    );
+    assert.throws(() =>
+      decodeAcpPermissionAction({
+        tool,
+        client: { ...hunkFixture.client, harnessSha256: 'a'.repeat(64) },
+        scratch: hunkFixture.scratch,
+        target,
+        toolMappings: [hunkFixture.hunkMapping],
+        readTarget: targetState,
+      }),
+    );
+  } finally {
+    hunkFixture.dispose();
+  }
   for (const scenario of [
     'permission',
+    'hunk',
+    'hunk-sequential',
+    'hunk-control',
+    'hunk-drift',
     'permanent',
     'ambiguous',
     'changed-action',
@@ -640,6 +775,15 @@ test('the acp protocol consumes one complete live permission and never treats co
     let handle: ReturnType<typeof writer>;
     try {
       handle = writer(f, {
+        ...(scenario.startsWith('hunk')
+          ? {
+              toolMappings: [f.hunkMapping],
+              readTarget: () => {
+                const content = readFileSync(join(f.scratch, target.path), 'utf8');
+                return { path: target.path, hash: hash(content), mode: target.mode, content };
+              },
+            }
+          : {}),
         onActivity: (activity, text) => {
           if (activity.sessionUpdate === 'agent_thought_chunk') assert.equal(text, '');
           if (activity.sessionUpdate === 'usage_update') usages++;
@@ -649,7 +793,7 @@ test('the acp protocol consumes one complete live permission and never treats co
           assert(Buffer.byteLength(proposal.consequence) <= 4096);
           assert.equal(proposal.actionHash, hashCanonical(proposal.detail));
           const bound = binding(proposal);
-          if (scenario === 'permission')
+          if (scenario === 'permission' || scenario.startsWith('hunk'))
             queueMicrotask(() => {
               assert.throws(
                 () => handle.replyPermission({ ...bound, generation: 1 }, 'approved'),
@@ -663,17 +807,22 @@ test('the acp protocol consumes one complete live permission and never treats co
       });
       const outcome = await handle.result;
       assert(outcome.quiescent, scenario);
-      if (scenario === 'permission') {
+      if (['permission', 'hunk', 'hunk-sequential'].includes(scenario)) {
         assert.equal(outcome.reason, null);
-        assert.equal(permissions, 1);
+        assert.equal(permissions, scenario === 'hunk-sequential' ? 2 : 1);
         assert.equal(outcome.metadata?.stopReason, 'end_turn');
+        assert.equal(
+          outcome.metadata?.targetHash,
+          hash(`export const total = ${scenario === 'hunk-sequential' ? 2 : 1};\n`),
+        );
       } else if (scenario === 'usage-refusal') {
         assert.equal(outcome.reason, null);
         assert.equal(outcome.metadata?.stopReason, 'refusal');
         assert.equal(permissions, 0);
       } else {
         assert(outcome.reason, scenario);
-        if (scenario !== 'changed-action') assert.equal(permissions, 0, scenario);
+        if (scenario === 'hunk-drift') assert.equal(permissions, 1, scenario);
+        else if (scenario !== 'changed-action') assert.equal(permissions, 0, scenario);
       }
       assert.equal(usages, 1, scenario);
       assert(!Object.hasOwn(outcome, 'observations'));

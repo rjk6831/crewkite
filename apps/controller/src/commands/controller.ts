@@ -206,6 +206,7 @@ import {
   AcpPermissionActionSchema,
   type AcpPermissionProposal,
   type AcpWriterCompletion,
+  acpPermissionAfterHash,
   googleAcpWriterPlan,
   startGoogleAcpSetup,
   startGoogleAcpWriter,
@@ -10245,6 +10246,7 @@ export class Controller {
         submitted: z.literal(true),
         selectionHash: HashSchema,
         reviewModeHash: HashSchema,
+        targetHash: HashSchema.optional(),
       })
       .parse(metadata.value);
     const proof = this.store.get<Artifact>('artifact', appointment.acp.proofId);
@@ -10271,6 +10273,7 @@ export class Controller {
       !target ||
       target.hash !== capture.target.hash ||
       target.bytes !== capture.target.bytes ||
+      (output.targetHash !== undefined && target.hash !== output.targetHash) ||
       output.selectionHash !== hashCanonical(appointment.acp) ||
       output.reviewModeHash !== hashCanonical(appointment.proof.reviewMode)
     )
@@ -11644,6 +11647,25 @@ export class Controller {
     };
   }
 
+  private acpTargetSnapshot(runtime: NativeRuntime) {
+    this.nativeCurrent(runtime);
+    const appointment = runtime.binding.appointment;
+    if (!('acp' in appointment)) throw Error('ACP permission has no owned attempt.');
+    const captured = captureSingleFileEdit({
+      directory: this.writerScratch(runtime.binding.run),
+      manifest: runtime.binding.manifest,
+      target: appointment.target,
+    });
+    const file = captured.files.find((entry) => entry.path === appointment.target.path);
+    if (!file) throw Error('ACP target is unavailable.');
+    return {
+      path: file.path,
+      hash: file.hash,
+      mode: file.mode,
+      content: file.content.toString('utf8'),
+    };
+  }
+
   private validateAcpPermission(runtime: NativeRuntime, proposal: AcpPermissionProposal) {
     this.nativeCurrent(runtime);
     const appointment = runtime.binding.appointment;
@@ -11660,18 +11682,7 @@ export class Controller {
       !HashSchema.safeParse(proposal.proposalHash).success
     )
       throw Error('ACP action changed.');
-    const captured = captureSingleFileEdit({
-      directory: this.writerScratch(runtime.binding.run),
-      manifest: runtime.binding.manifest,
-      target: appointment.target,
-    });
-    if (
-      captured.target.hash !== detail.baseHash ||
-      captured.target.mode !== detail.mode ||
-      captured.files.find((file) => file.path === detail.path)?.content.toString('utf8') !==
-        detail.oldText
-    )
-      throw Error('ACP action no longer matches scratch.');
+    acpPermissionAfterHash(detail, this.acpTargetSnapshot(runtime));
   }
 
   private requestAcpPermission(
@@ -11798,6 +11809,8 @@ export class Controller {
               target: appointment.target,
             });
             const candidate = this.sealCandidate(attempt, files.files);
+            if (metadata?.targetHash !== undefined && files.target.hash !== metadata.targetHash)
+              eligible = false;
             if (eligible) {
               this.store.transaction(() => {
                 const proof = this.nativeArtifact({
@@ -11893,6 +11906,7 @@ export class Controller {
             ],
             selection: appointment.acp,
             proof: appointment.proof,
+            client: appointment.client,
             ...this.options.googleAcp,
           }),
           mcpServer: context.server,
@@ -11926,6 +11940,7 @@ export class Controller {
             });
           },
           onPermission: (proposal) => this.requestAcpPermission(runtime, proposal),
+          readTarget: () => this.acpTargetSnapshot(runtime),
           onActivity: (activity, text) => {
             if (
               runtime.stopped ||
@@ -13845,6 +13860,7 @@ export class Controller {
                   submitted: z.literal(true),
                   selectionHash: HashSchema,
                   reviewModeHash: HashSchema,
+                  targetHash: HashSchema.optional(),
                 })
                 .parse(metadata.value);
               terminal =
