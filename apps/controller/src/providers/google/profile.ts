@@ -35,7 +35,7 @@ export function resolveGoogleNativeProfile(_environment = process.env): NativePr
   };
 }
 
-// The quota read is a separate, opt-in profile. It runs one zero-turn /usage command
+// The quota reader runs automatically using one zero-turn /usage command
 // on the pinned client and never prepares, starts or submits a task.
 export const googleUsageDescriptor = {
   id: 'google-usage-v1',
