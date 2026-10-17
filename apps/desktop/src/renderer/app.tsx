@@ -68,6 +68,7 @@ import {
 } from './components.tsx';
 import { ConversationView, NewGoal } from './conversation-view.tsx';
 import { googleAcpLabel, Launch, NativeEvaluation, NativeHandoff } from './launch.tsx';
+import { LocalSetup } from './local-setup.tsx';
 import { useWorkspace, type Workspace } from './source.ts';
 import { roleLabels } from './templates.ts';
 
@@ -2274,6 +2275,7 @@ function Usage({
             : 'Controller observations'}
         </span>
       </div>
+      <LocalSetup snapshot={snapshot} workspace={workspace} />
       <GoogleSetup snapshot={snapshot} workspace={workspace} />
       <section className="card" aria-labelledby="google-quota-title">
         <div className="section-heading">
