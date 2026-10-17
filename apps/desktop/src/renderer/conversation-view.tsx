@@ -26,6 +26,7 @@ import {
   useSyncExternalStore,
 } from 'react';
 import { Dialog, familyName, titleCase } from './components.tsx';
+import { ContextGauge } from './context-gauge.tsx';
 import { Conversation, type ConversationMessage } from './conversation.tsx';
 import { ConversationContextCaptureError, type DesktopCommand, type Workspace } from './source.ts';
 import { roleLabels } from './templates.ts';
@@ -1174,6 +1175,14 @@ export function NewGoal({
             sending: context.sending,
             disabledReason: blocked,
             ...context.composer,
+            contextMeter: (
+              <ContextGauge
+                usedTokens={null}
+                capacityTokens={null}
+                measurement="unknown"
+                unavailableReason={`The provider has not reported context usage or capacity. ${workspace.connection === 'connected' ? 'Goal not sent.' : 'Reconnect to inspect current activity.'}`}
+              />
+            ),
           }}
           error={context.error ?? workspace.error ?? undefined}
         />
@@ -1420,6 +1429,36 @@ export function ConversationView({
     decisionBlockedReason,
   ]);
   const config = state?.configuration;
+  const primaryActive = Boolean(
+    workspace.connection === 'connected' &&
+      current &&
+      state?.purpose === 'conversation' &&
+      state.phase === 'planning' &&
+      state.currentRunId === task.runId &&
+      state.activeAttempt?.runId === state.currentRunId &&
+      state.activeAttempt?.routeId === config?.routeId &&
+      ['intent', 'running'].includes(state.activeAttempt?.state ?? ''),
+  );
+  const contextActivity =
+    workspace.connection !== 'connected'
+      ? 'Reconnect to inspect current activity.'
+      : !current
+        ? 'Refreshing current conversation activity.'
+        : state?.phase === 'unknown'
+          ? 'Current conversation activity is unknown.'
+          : state?.phase === 'stopping'
+            ? 'The current work is stopping.'
+            : primaryActive
+              ? 'The primary role is planning.'
+              : state?.activeAttempt
+                ? 'Task work is active. Primary role activity is unknown.'
+                : state?.pendingQuestions.length
+                  ? 'Waiting for an answer.'
+                  : snapshot.approvals.some(
+                        (approval) => approval.taskId === task.id && approval.status === 'pending',
+                      )
+                    ? 'Waiting for a permission decision.'
+                    : 'The primary role is idle.';
   const selection = planningSelection(planning);
   async function configure() {
     if (
@@ -1596,6 +1635,15 @@ export function ConversationView({
             sending: context.sending,
             disabledReason: blocked,
             ...context.composer,
+            contextMeter: visible ? (
+              <ContextGauge
+                usedTokens={null}
+                capacityTokens={null}
+                measurement="unknown"
+                updating={primaryActive}
+                unavailableReason={`The provider has not reported context usage or capacity. ${contextActivity}`}
+              />
+            ) : undefined,
             hint:
               state?.send.disposition === 'queue'
                 ? 'Guidance is retained for a later, explicitly admitted planning turn.'

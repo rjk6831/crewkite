@@ -107,6 +107,7 @@ export type ConversationProps = {
     onRemoveContext?: (id: string) => void;
     contextDisabled?: boolean;
     addContextDisabled?: boolean;
+    contextMeter?: ReactNode;
   };
   onChoice?: (decisionId: string, choiceId: string) => void;
   onAnswer?: (questionId: string, text: string) => void;
@@ -767,6 +768,7 @@ export function Conversation({
                 ))}
               </span>
             )}
+            {composer.contextMeter}
             <button
               type="submit"
               disabled={disabled || !composer.value.trim()}

@@ -1221,6 +1221,15 @@ async function conversationBridge(
     };
 
     await expect(page.getByRole('heading', { name: 'New goal', exact: true })).toBeVisible();
+    const contextMeter = page.getByRole('button', { name: /^Context window, usage unknown/ });
+    await expect(contextMeter).toHaveAttribute('aria-label', 'Context window, usage unknown');
+    await contextMeter.focus();
+    await page.keyboard.press('Shift+Tab');
+    await page.keyboard.press('Tab');
+    await expect(page.locator('.context-gauge-popover:popover-open')).toContainText(
+      'Goal not sent.',
+    );
+    await page.keyboard.press('Escape');
     await composer.fill('Export the currently filtered invoices as CSV.');
     await page.getByRole('button', { name: 'Add context', exact: true }).click();
     await nativeChoice([]);
@@ -1305,6 +1314,7 @@ async function conversationBridge(
     ).toBeVisible();
     await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeEnabled();
     await expect(page.getByRole('log')).toHaveCount(0);
+    await expect(contextMeter).toHaveCount(0);
     await expect(page.getByRole('tab', { name: 'Plan', exact: true })).toBeFocused();
     await page.getByRole('tab', { name: 'Changes', exact: true }).click();
     bump();
@@ -1541,6 +1551,17 @@ async function conversationBridge(
     ).toHaveCount(0);
     assert(originalSend && receipts.has(originalSend.key));
     assert.equal(received.filter((command) => command.command === 'SendTaskMessage').length, 2);
+    await expect(contextMeter).toHaveAttribute(
+      'aria-label',
+      'Context window, usage unknown, updating',
+    );
+    await contextMeter.focus();
+    await page.keyboard.press('Shift+Tab');
+    await page.keyboard.press('Tab');
+    await expect(page.locator('.context-gauge-popover:popover-open')).toContainText(
+      'The primary role is planning.',
+    );
+    await page.keyboard.press('Escape');
     await page.reload();
     const savedContext = page.getByRole('button', { name: /^Captured context 1 ·/ }).last();
     await savedContext.click();
@@ -1566,6 +1587,7 @@ async function conversationBridge(
     await page.getByRole('button', { name: 'Stop', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Resume', exact: true })).toHaveCount(0);
     await expect(page.getByText('Stopped', { exact: true }).last()).toBeVisible();
+    await expect(contextMeter).toHaveAttribute('aria-label', 'Context window, usage unknown');
     await chooseContext('Source folder', '/registered/project/src');
     await composer.fill('Keep this unsent draft.');
     await page.getByRole('tab', { name: 'Plan', exact: true }).click();
