@@ -7,6 +7,7 @@ import test from 'node:test';
 import { hashCanonical, sealHandoff } from '@crewkite/contracts/hash';
 import { spawnCheckChild as spawn } from '../../host/check-ownership.ts';
 import { groupAbsent } from '../../host/worker.ts';
+import type { OpenAiUsage } from './discovery.ts';
 import { startNativeTask } from './native-discovery.ts';
 import { resolveRepositoryProfile } from './profile.ts';
 import { ReplacementTranscript, replacementPlan, startReplacement } from './replacement.ts';
@@ -161,6 +162,18 @@ const output = (directory: string, mode = 'success', path = 'net.mjs', structure
   return messages;
 };
 const bytes = (message: unknown) => Buffer.from(`${JSON.stringify(message)}\n`);
+const weekly = { usedPercent: 34, windowDurationMins: 10080, resetsAt: 1792679628 };
+const codex = { limitId: 'codex', primary: weekly, secondary: null, credits: null };
+const usageRead = { ordinaryUsageAllowed: true, rateLimits: codex, rateLimitsByLimitId: { codex } };
+const weeklyWindow = {
+  windowId: 'codex:primary',
+  kind: 'weekly',
+  semantics: { scope: 'provider', periodSeconds: 604800 },
+  remaining: { value: 66, unit: 'percent' },
+  resetsAt: '2026-10-22T14:33:48.000Z',
+  source: 'client',
+  confidence: 'reported',
+};
 function metadata(
   reader: Pick<ReplacementTranscript, 'next' | 'push'>,
   overrides: Record<string, unknown> = {},
@@ -1411,11 +1424,124 @@ test('native proposals and reviews require one matching completed turn and bound
   assert.equal(unsolicited.submitted, false);
 });
 
+test('transcripts pass rate-limit reads and updates to the usage hook without changing their outcome', () => {
+  const directory = resolve('internal/replacement-fixture');
+  const scratchPath = resolve(directory, 'scratch');
+  // The update merges with the session's read. The receiver drops its repeat. The malformed one
+  // reaches no hook and leaves the turn running.
+  const sparse = { usedPercent: 35, windowDurationMins: null, resetsAt: null };
+  const updates = [sparse, sparse, { ...weekly, usedPercent: -1 }].map((primary) => ({
+    method: 'account/rateLimits/updated',
+    params: { rateLimits: { ...codex, primary } },
+  }));
+  const repositoryInput = repositoryPlan({
+    attemptId: plan(directory).attemptId,
+    model: 'gpt-6.1-sol',
+    effort: 'low',
+    scratchPath,
+    sourceBase: 'a'.repeat(40),
+    manifestHash: 'b'.repeat(64),
+    execution: { sandbox: 'workspace-write', approvalPolicy: 'never', networkAccess: false },
+    context: { title: 'Bound net', outcome: 'Return the net.', criteria: ['Keep the bound.'] },
+  });
+  // Each transcript delivers its complete read, then the merged update and its repeat.
+  const delivered = [
+    [true, [[66, 604800]]],
+    [false, [[65, 604800]]],
+    [false, [[65, 604800]]],
+  ];
+  const outcomes = new Map<string, unknown>();
+  for (const hook of ['absent', 'records', 'throws'] as const) {
+    const reports: OpenAiUsage[] = [];
+    const onUsage =
+      hook === 'absent'
+        ? undefined
+        : (usage: OpenAiUsage) => {
+            reports.push(usage);
+            if (hook === 'throws') throw new Error('private-usage-canary');
+          };
+    const writer = new ReplacementTranscript(plan(directory), {
+      now: () => 1,
+      timeoutMs: 300_000,
+      onUsage,
+    });
+    metadata(writer, { 'account/rateLimits/read': usageRead });
+    writer.push(bytes({ id: 10, result: threadResult(directory) }));
+    writer.next();
+    writer.push(bytes({ id: 11, result: { turn: running } }));
+    const messages = output(directory);
+    messages.splice(1, 0, ...updates);
+    for (const message of messages) writer.push(bytes(message));
+    const native = new RepositoryTranscript(repositoryInput, {
+      now: () => 1,
+      timeoutMs: 300_000,
+      directory,
+      onUsage,
+    });
+    metadata(native, { 'account/rateLimits/read': usageRead });
+    native.push(
+      bytes({
+        id: 10,
+        result: {
+          ...threadResult(scratchPath),
+          approvalPolicy: 'never',
+          sandbox: { type: 'workspaceWrite', writableRoots: [scratchPath], networkAccess: false },
+        },
+      }),
+    );
+    native.next();
+    native.push(bytes({ id: 11, result: { turn: running } }));
+    for (const message of [
+      { method: 'turn/started', params: { threadId: 'thread-1', turn: running } },
+      ...updates,
+      {
+        method: 'turn/completed',
+        params: { threadId: 'thread-1', turn: { ...running, status: 'completed' } },
+      },
+    ])
+      native.push(bytes(message));
+    outcomes.set(hook, { writer: writer.finish(), repository: native.finish() });
+    assert.deepEqual(outcomes.get(hook), outcomes.get('absent'), hook);
+    assert.deepEqual(
+      reports.map((usage) => [
+        usage.complete,
+        usage.windows.map((value) => [value.remaining?.value, value.semantics?.periodSeconds]),
+      ]),
+      hook === 'absent' ? [] : [...delivered, ...delivered],
+      hook,
+    );
+  }
+  // Admission still refuses an over-limit read. Usage reads it first and shows it exhausted.
+  const exhausted: OpenAiUsage[] = [];
+  const refused = new ReplacementTranscript(plan(directory), {
+    now: () => 1,
+    timeoutMs: 300_000,
+    onUsage: (usage) => exhausted.push(usage),
+  });
+  const over = { ...codex, primary: { ...weekly, usedPercent: 101 } };
+  assert.throws(() =>
+    metadata(refused, {
+      'account/rateLimits/read': { ...usageRead, rateLimitsByLimitId: { codex: over } },
+    }),
+  );
+  assert.deepEqual(
+    exhausted.map((usage) => usage.windows.map((value) => value.remaining)),
+    [[{ value: 0, unit: 'percent' }]],
+  );
+});
+
 test('native task submission and interruption share one deadline through owned cleanup', async () => {
   mkdirSync(resolve('internal'), { recursive: true });
   const root = mkdtempSync(resolve('internal/replacement-owner-'));
   const digest = createHash('sha256').update(readFileSync(process.execPath)).digest('hex');
   const owned: Array<{ child: ChildProcessWithoutNullStreams; closed: Promise<void> }> = [];
+  // Both phases read one weekly window. Only the task phase reports it.
+  const withUsage = (script: string) =>
+    script.replace(
+      JSON.stringify(replies),
+      JSON.stringify({ ...replies, 'account/rateLimits/read': usageRead }),
+    );
+  const delivered = [{ complete: true, windows: [weeklyWindow], credits: [] }];
   try {
     for (const mode of [
       'success',
@@ -1434,6 +1560,7 @@ test('native task submission and interruption share one deadline through owned c
       let submission = 0;
       let now = 100;
       let appServers = 0;
+      const usages: OpenAiUsage[] = [];
       const runGroups: number[] = [];
       let requestStop: (() => void) | undefined;
       let stopReady!: () => void;
@@ -1455,6 +1582,9 @@ test('native task submission and interruption share one deadline through owned c
           onSubmitted: () => {
             submission++;
           },
+          onUsage: (usage) => {
+            usages.push(usage);
+          },
           schedule: (work, milliseconds) => {
             const call = { work, milliseconds, active: true };
             calls.push(call);
@@ -1471,7 +1601,7 @@ test('native task submission and interruption share one deadline through owned c
             );
             if (phase === 'task') assert(args.includes('mcp_servers.fixture_server.enabled=false'));
             else assert(!args.some((arg) => arg.startsWith('mcp_servers.')));
-            const child = spawn(executable, ['-e', fixture, mode, phase], options);
+            const child = spawn(executable, ['-e', withUsage(fixture), mode, phase], options);
             if (child.pid) runGroups.push(child.pid);
             if (phase === 'prepare' && mode === 'prepare-deadline')
               child.once('close', () => {
@@ -1543,6 +1673,7 @@ test('native task submission and interruption share one deadline through owned c
       if (mode === 'success') {
         assert.equal(result.reason, null);
         assert.equal(result.metadata?.replacement.path, 'net.mjs');
+        assert.deepEqual(usages, delivered);
       } else {
         assert.equal(result.metadata, null, mode);
         assert.equal(
@@ -1575,6 +1706,7 @@ test('native task submission and interruption share one deadline through owned c
     let repositoryPhases = 0;
     let repositorySubmissions = 0;
     const ownedActivities: RepositoryActivity[] = [];
+    const repositoryUsages: OpenAiUsage[] = [];
     const repository = startRepository(
       {
         executable: process.execPath,
@@ -1601,6 +1733,9 @@ test('native task submission and interruption share one deadline through owned c
         onActivity: (activity) => {
           ownedActivities.push(activity);
         },
+        onUsage: (usage) => {
+          repositoryUsages.push(usage);
+        },
         spawn: (executable, args, options) => {
           const phase =
             args.at(-1) === 'list' ? 'features' : ++repositoryPhases === 1 ? 'prepare' : 'task';
@@ -1608,10 +1743,12 @@ test('native task submission and interruption share one deadline through owned c
             executable,
             [
               '-e',
-              repositoryFixture([
-                { path: 'net.mjs', content: 'export const net = 0;\n' },
-                { path: 'docs/note.md', content: '# Bounds\n' },
-              ]),
+              withUsage(
+                repositoryFixture([
+                  { path: 'net.mjs', content: 'export const net = 0;\n' },
+                  { path: 'docs/note.md', content: '# Bounds\n' },
+                ]),
+              ),
               'success',
               phase,
             ],
@@ -1629,6 +1766,7 @@ test('native task submission and interruption share one deadline through owned c
     assert.equal(captured.reason, null, JSON.stringify(captured));
     assert.equal(captured.quiescent, true);
     assert.equal(repositorySubmissions, 1);
+    assert.deepEqual(repositoryUsages, delivered);
     assert.deepEqual(
       ownedActivities.map(({ kind, state }) => [kind, state]),
       [

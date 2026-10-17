@@ -7,7 +7,7 @@ import {
   NativeTargetPathSchema,
 } from '@crewkite/contracts';
 import { z } from 'zod';
-import { type DiscoveryMetadata, OpenAiDiscovery } from './discovery.ts';
+import { type DiscoveryMetadata, OpenAiDiscovery, type OpenAiUsageHook } from './discovery.ts';
 import { type NativeLaunch, startNativeTask } from './native-discovery.ts';
 import { nativeTaskAdmitted, type ReplacementDiagnostic } from './replacement.ts';
 
@@ -136,6 +136,7 @@ export class RepositoryTranscript {
       timeoutMs: number;
       directory: string;
       onActivity?: ActivityHook;
+      onUsage?: OpenAiUsageHook;
     },
   ) {
     this.plan = repositoryPlan(plan);
@@ -156,6 +157,7 @@ export class RepositoryTranscript {
       readConfiguration: true,
       readMcpConfiguration: true,
       configurationDirectory: resolve(privateOptions.directory),
+      onUsage: privateOptions.onUsage,
     });
   }
   private readonly now: () => number;
@@ -455,6 +457,7 @@ export class RepositoryTranscript {
     }
     if (method === 'account/rateLimits/updated') {
       z.object({ rateLimits: z.record(z.string(), z.unknown()) }).parse(raw);
+      this.discovery.reportUsage(method, raw);
       return;
     }
     if (method === 'thread/started') {
@@ -684,7 +687,10 @@ export class RepositoryTranscript {
 export function startRepository(
   launch: NativeLaunch,
   plan: RepositoryPlan,
-  options: Parameters<typeof startNativeTask>[1] & { onActivity?: ActivityHook },
+  options: Parameters<typeof startNativeTask>[1] & {
+    onActivity?: ActivityHook;
+    onUsage?: OpenAiUsageHook;
+  },
 ) {
   const trusted = repositoryPlan(plan);
   let reader: RepositoryTranscript | undefined;
@@ -698,6 +704,7 @@ export function startRepository(
         timeoutMs: remaining,
         directory: launch.directory,
         onActivity: options.onActivity,
+        onUsage: options.onUsage,
       });
       return reader;
     },

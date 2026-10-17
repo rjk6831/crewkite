@@ -12,7 +12,7 @@ import {
 } from '@crewkite/contracts';
 import { verifyHandoff } from '@crewkite/contracts/hash';
 import { z } from 'zod';
-import { type DiscoveryMetadata, OpenAiDiscovery } from './discovery.ts';
+import { type DiscoveryMetadata, OpenAiDiscovery, type OpenAiUsageHook } from './discovery.ts';
 import { type NativeLaunch, type NativeTranscript, startNativeTask } from './native-discovery.ts';
 
 const MAX_CONTENT = 65_536;
@@ -233,6 +233,11 @@ const session = z.strictObject({
   directory: input.shape.directory,
 });
 export type StructuredSession = z.output<typeof session>;
+export type TranscriptOptions = {
+  now: () => number;
+  timeoutMs: number;
+  onUsage?: OpenAiUsageHook;
+};
 export type StructuredCodec<T extends Record<string, unknown>> = Readonly<{
   text: string;
   outputSchema: Record<string, unknown>;
@@ -308,11 +313,7 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
   private retries = 0;
   private contextUsage: ReturnType<typeof ConversationContextMeasurementSchema.parse> | null = null;
 
-  constructor(
-    plan: StructuredSession,
-    options: { now: () => number; timeoutMs: number },
-    codec: StructuredCodec<T>,
-  ) {
+  constructor(plan: StructuredSession, options: TranscriptOptions, codec: StructuredCodec<T>) {
     this.plan = session.parse({
       model: plan.model,
       effort: plan.effort,
@@ -336,6 +337,7 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
       readConfiguration: true,
       readMcpConfiguration: true,
       configurationDirectory: this.plan.directory,
+      onUsage: options.onUsage,
     });
   }
   private refuse(cause: Cause = 'correlation', error?: unknown): never {
@@ -604,6 +606,7 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
     if (method === 'account/rateLimits/updated') {
       this.site = 'allowance';
       z.object({ rateLimits: z.record(z.string(), z.unknown()) }).parse(params);
+      this.discovery.reportUsage(method, params);
       return;
     }
     if (method === 'warning') {
@@ -845,7 +848,7 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
 }
 
 export class ReplacementTranscript extends StructuredTranscript<{ replacement: Replacement }> {
-  constructor(plan: WriterPlan, options: { now: () => number; timeoutMs: number }) {
+  constructor(plan: WriterPlan, options: TranscriptOptions) {
     const trusted = replacementPlan(plan);
     super(trusted, options, {
       site: 'replacement',
@@ -876,11 +879,13 @@ export class ReplacementTranscript extends StructuredTranscript<{ replacement: R
 
 export function startStructuredTask<T extends Record<string, unknown>>(
   launch: NativeLaunch,
-  options: Omit<Parameters<typeof startNativeTask>[1], 'now'> & { now?: () => number },
-  createReader: (options: {
-    now: () => number;
-    timeoutMs: number;
-  }) => NativeTranscript<T> & { readonly diagnostic: ReplacementDiagnostic | null },
+  options: Omit<Parameters<typeof startNativeTask>[1], 'now'> & {
+    now?: () => number;
+    onUsage?: OpenAiUsageHook;
+  },
+  createReader: (
+    options: TranscriptOptions,
+  ) => NativeTranscript<T> & { readonly diagnostic: ReplacementDiagnostic | null },
 ) {
   const now = options.now ?? (() => performance.now());
   let reader:
@@ -890,7 +895,7 @@ export function startStructuredTask<T extends Record<string, unknown>>(
     launch,
     { ...options, now, disableMcpServers: true },
     (remaining) => {
-      reader = createReader({ now, timeoutMs: remaining });
+      reader = createReader({ now, timeoutMs: remaining, onUsage: options.onUsage });
       return reader;
     },
   );
@@ -912,7 +917,7 @@ export function startStructuredTask<T extends Record<string, unknown>>(
 export function startReplacement(
   launch: NativeLaunch,
   plan: WriterPlan,
-  options: Omit<Parameters<typeof startNativeTask>[1], 'now'> & { now?: () => number },
+  options: Parameters<typeof startStructuredTask>[1],
 ) {
   const trusted = replacementPlan(plan);
   if (trusted.directory !== resolve(launch.directory))

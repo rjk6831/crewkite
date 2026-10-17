@@ -14,7 +14,12 @@ import {
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
 import type { NativeLaunch } from './native-discovery.ts';
-import { StructuredTranscript, type startReplacement, startStructuredTask } from './replacement.ts';
+import {
+  StructuredTranscript,
+  type startReplacement,
+  startStructuredTask,
+  type TranscriptOptions,
+} from './replacement.ts';
 
 const MAX_CONTENT = 65_536;
 const MAX_FILE_INPUT = 256 * 1024;
@@ -173,7 +178,7 @@ export function reviewPlan(value: z.input<typeof input>) {
 }
 
 export class ReviewTranscript extends StructuredTranscript<{ review: NativeReview }> {
-  constructor(plan: ReviewPlan, options: { now: () => number; timeoutMs: number }) {
+  constructor(plan: ReviewPlan, options: TranscriptOptions) {
     const trusted = reviewPlan(plan);
     const bindingHash = hashCanonical(trusted.binding);
     super(trusted, options, {

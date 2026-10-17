@@ -16,7 +16,12 @@ import {
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
 import type { NativeLaunch } from './native-discovery.ts';
-import { StructuredTranscript, type startReplacement, startStructuredTask } from './replacement.ts';
+import {
+  StructuredTranscript,
+  type startReplacement,
+  startStructuredTask,
+  type TranscriptOptions,
+} from './replacement.ts';
 
 const MAX_INPUT = 65_536;
 const utf8 = (value: string, limit: number) =>
@@ -175,7 +180,7 @@ function withinScope(
 export class ConversationTranscript extends StructuredTranscript<{
   conversation: z.output<typeof ConversationTurnResultSchema>;
 }> {
-  constructor(plan: ConversationPlan, options: { now: () => number; timeoutMs: number }) {
+  constructor(plan: ConversationPlan, options: TranscriptOptions) {
     const trusted = conversationPlan(plan);
     if (options.timeoutMs > trusted.binding.limitMinutes * 60_000)
       throw new Error('The conversation transcript exceeds its remaining budget.');
