@@ -1206,7 +1206,7 @@ export const RuntimeManifestSchema = z.strictObject({
     arch: z.enum(['arm64', 'x64']),
     sha256: HashSchema,
   }),
-  mode: z.literal('demo'),
+  mode: z.enum(['workspace', 'demo']),
   localInput: z
     .strictObject({
       sha256: HashSchema,

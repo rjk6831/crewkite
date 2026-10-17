@@ -187,7 +187,12 @@ export async function packageDesktop() {
     } catch {
       throw new Error('The build provenance policy must be a valid regular expression.');
     }
-  const { values } = parseArgs({ options: { id: { type: 'string' } } });
+  const { values } = parseArgs({
+    options: { id: { type: 'string' }, demo: { type: 'boolean', default: false } },
+  });
+  const mode = values.demo ? 'demo' : 'workspace';
+  const controllerEntry =
+    mode === 'demo' ? 'scripts/demo-controller.ts' : 'apps/controller/src/main.ts';
   if (!values.id || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(values.id))
     throw new Error('Supply --id with a new lowercase build name.');
   if (process.platform !== 'darwin' || process.arch !== 'arm64')
@@ -213,7 +218,7 @@ export async function packageDesktop() {
     throw new Error('Commit the tracked source changes before packaging.');
   const revision = git('rev-parse', 'HEAD');
   const bootstrapFiles = ['scripts/demo-controller.ts', 'scripts/demo-state.ts'];
-  const committedInputs = [...bootstrapFiles, helperSourcePath];
+  const committedInputs = [...bootstrapFiles, 'apps/controller/src/main.ts', helperSourcePath];
   for (const path of committedInputs) {
     try {
       execFileSync('git', ['cat-file', '-e', `${revision}:${path}`], {
@@ -356,7 +361,7 @@ export async function packageDesktop() {
       RuntimeManifestSchema.parse({
         version: 1,
         node: { version: nodeVersion, platform: 'darwin', arch: 'arm64', sha256: nodeHash },
-        mode: 'demo',
+        mode,
         localInput: localInput.identity,
       }),
       null,
@@ -373,7 +378,7 @@ export async function packageDesktop() {
   );
   writeFileSync(
     join(stage, 'bin/desktop'),
-    `${launcherRoot}test -f "$root/app/runtime/scripts/demo-controller.ts" || { echo 'The packaged demo bootstrap is unavailable.' >&2; exit 1; }\nexport CREWKITE_HOME="$root/state/home"\nexport CREWKITE_PROFILE="$root/state/profile"\nexec "$root/Electron.app/Contents/MacOS/Electron" "$root/app"\n`,
+    `${launcherRoot}test -f "$root/app/runtime/${controllerEntry}" || { echo 'The packaged controller entry is unavailable.' >&2; exit 1; }\nexport CREWKITE_HOME="$root/state/home"\nexport CREWKITE_PROFILE="$root/state/profile"\nexec "$root/Electron.app/Contents/MacOS/Electron" "$root/app"\n`,
     { mode: 0o755 },
   );
   const workspace = [
@@ -574,6 +579,7 @@ export async function packageDesktop() {
       {
         format: 1,
         id: values.id,
+        mode,
         revision,
         lockHash,
         buildDependencies,

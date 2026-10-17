@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   linkSync,
   lstatSync,
@@ -24,6 +25,7 @@ import { setImmediate } from 'node:timers';
 import { canonicalJson, ReadDataSchema } from '@crewkite/contracts';
 import { createSyntheticRepository } from '@crewkite/testkit/repository';
 import { copyRuntimePackages } from '../../../../scripts/runtime-packages.ts';
+import { resolveRuntime } from '../../../desktop/src/main/runtime.ts';
 import {
   applyReplacement,
   captureSingleFileEdit,
@@ -378,6 +380,58 @@ test('source inspection bounds file metadata without running filters or reading 
     assert.equal(tools.files, 2);
     assert.equal(tools.entries.find((entry) => entry.path === 'cli.mjs')?.kind, 'file');
     await assert.rejects(copyInstalledDependencies(donor, candidate, expected, budget()), /EEXIST/);
+  }
+
+  const primary = dirname(
+    git(resolve('.'), ['rev-parse', '--path-format=absolute', '--git-common-dir'])
+      .toString()
+      .trim(),
+  );
+  const runtimeDirectory = mkdtempSync(join(primary, 'internal/runtime-test-'));
+  t.after(() => rmSync(runtimeDirectory, { recursive: true, force: true }));
+  const app = join(runtimeDirectory, 'app');
+  const runtimeRoot = join(app, 'runtime');
+  const workspaceEntry = join(runtimeRoot, 'apps/controller/src/main.ts');
+  const demoEntry = join(runtimeRoot, 'scripts/demo-controller.ts');
+  for (const path of [dirname(workspaceEntry), dirname(demoEntry), join(runtimeRoot, 'bin')])
+    mkdirSync(path, { recursive: true });
+  writeFileSync(workspaceEntry, 'export {};\n');
+  writeFileSync(demoEntry, 'export {};\n');
+  const bundledNode = join(runtimeRoot, 'bin/node');
+  copyFileSync(process.execPath, bundledNode);
+  chmodSync(bundledNode, 0o700);
+  const environment = {
+    CREWKITE_HOME: join(runtimeDirectory, 'home'),
+    CREWKITE_PROFILE: join(runtimeDirectory, 'profile'),
+  };
+  mkdirSync(environment.CREWKITE_HOME, { mode: 0o700 });
+  const retained = new Map([
+    ['demo-catalog.json', 'historical catalog'],
+    ['state.sqlite', 'historical database'],
+  ]);
+  for (const [name, bytes] of retained)
+    writeFileSync(join(environment.CREWKITE_HOME, name), bytes, { mode: 0o600 });
+  for (const mode of ['workspace', 'demo'] as const) {
+    writeFileSync(
+      join(runtimeRoot, 'manifest.json'),
+      JSON.stringify({
+        version: 1,
+        node: {
+          version: '24.22.0',
+          platform: process.platform,
+          arch: process.arch,
+          sha256: createHash('sha256').update(readFileSync(bundledNode)).digest('hex'),
+        },
+        mode,
+      }),
+    );
+    const paths = resolveRuntime(app, environment);
+    assert.equal(paths.mode, mode);
+    assert.equal(paths.controller, mode === 'workspace' ? workspaceEntry : demoEntry);
+    assert.equal(paths.home, environment.CREWKITE_HOME);
+    for (const [name, bytes] of retained)
+      assert.equal(readFileSync(join(paths.home, name), 'utf8'), bytes);
+    assert.equal(existsSync(join(paths.home, 'demo-shop')), false);
   }
 
   const { buildLocalInputHelper, inspectLocalInputArtifact } = await import(

@@ -116,7 +116,7 @@ For native work, create a project and draft task in the desktop. In Configure th
 
 For work across committed repository files, choose Repository work. This separate OpenAI profile needs source consent and an explicit local-command permission. The native client can edit independent scratch and run multiple local commands during the bounded task. Review the frozen source and permissions before Start. The [repository CLI setup](apps/cli/README.md#native-repository-work) covers the same flow. One supervised synthetic repository run passed capture, export and same-home reopen. A separate live Stop retained interrupted work through same-home reopen. Full profile qualification remains pending.
 
-`pnpm verify` runs the test suite, including the real desktop and CLI recovery journey, plus policy, lint, types and the desktop build. [Testing](docs/testing.md) separates fixed synthetic evidence, native OS interaction and package checks. The [local directory package](docs/distribution.md) carries its own Node and Electron runtime; Git remains a prerequisite.
+`pnpm verify` runs the test suite, including the real desktop and CLI recovery journey, plus policy, lint, types and the desktop build. [Testing](docs/testing.md) separates fixed synthetic evidence, native OS interaction and package checks. The [local directory package](docs/distribution.md) carries its own Node and Electron runtime; Git remains a prerequisite. Its default workspace starts without a synthetic project or scripted route catalog. To stage an explicit demo, add `--demo` to the package command. Existing initialized homes keep their data.
 
 ## Documentation
 

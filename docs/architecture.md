@@ -197,7 +197,7 @@ One authenticated socket client in main serves the renderer. Main supplies comma
 
 Project registration uses a parented native directory picker. Generic renderer commands cannot supply a registration path. Export remains a controller effect: main reads the returned immutable artifact, verifies its length and checksum, then offers a parented save dialog. A saved patch uses an unused destination and durable file and directory writes. Cancellation keeps the artifact available. The CLI receives the artifact result independently of desktop saving.
 
-The demo has an explicit bootstrap with a persisted fake catalog and a separate private home and profile. Main verifies the standalone Node version, platform, architecture and checksum before launch. The staged runtime resolves fixed entries inside its package. A connected source journey does not establish installed recovery.
+The packaged desktop defaults to the normal controller entrypoint. A fresh workspace has no synthetic project or scripted route catalog. The manifest selects one fixed workspace or demo entrypoint; page content and environment variables cannot change that mode. Initialized homes keep their retained state. The explicit demo has a separate bootstrap with a persisted fake catalog and a private home and profile. Main verifies the standalone Node version, platform, architecture and checksum before launch. The staged runtime resolves fixed entries inside its package. A connected source journey does not establish installed recovery.
 
 ## Repository layout
 

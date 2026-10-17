@@ -1804,6 +1804,10 @@ test('process boundaries reject unknown fields and invalid command identity', ()
   };
   assert.ok(RuntimeManifestSchema.safeParse(manifest).success);
   assert.deepEqual(RuntimeManifestSchema.parse(manifest), manifest);
+  assert.deepEqual(RuntimeManifestSchema.parse({ ...manifest, mode: 'workspace' }), {
+    ...manifest,
+    mode: 'workspace',
+  });
   const localInput = {
     sha256: 'b'.repeat(64),
     sourceHash: 'c'.repeat(64),

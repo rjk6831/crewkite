@@ -10,11 +10,13 @@ From the primary checkout, run the staging script with the repository's pinned N
 internal/tools/node-v24.22.0-darwin-arm64/bin/node scripts/package.mjs --id local-check
 ```
 
+The default package opens a workspace without a synthetic project or scripted route catalog. Add `--demo` to the staging command to select the demo bootstrap. The runtime manifest records that choice. Existing initialized homes keep their retained data.
+
 The script builds committed source in a disposable copy under `internal/package-build/`. It copies the existing checked dependency installation, requires the same source lockfile and verifies exact direct package identities. Relative workspace links resolve into the disposable copy. It runs no installer or dependency lifecycle scripts and downloads nothing. The final directory under `internal/packages/d0/` contains the complete installed Electron app, built desktop assets, a separate pinned Node binary, runtime source packages, migrations and their dependency closure. Existing output is never replaced. An overlong controller socket path is rejected before copying or building.
 
 Runtime TypeScript lives outside `node_modules`. Relative workspace links point into that runtime, and the script rejects links or entrypoints that resolve outside the package. It includes Zod's JavaScript package and keeps the source layout needed by workers and migrations. The Local SDK uses a private dependency realm under `node_modules/.runtime/`, keeping its Zod 3 dependency separate from the application's Zod 4. Packaging checks the exact twelve-package closure and copies each license text. Local Git remains a prerequisite.
 
-`manifest.json` records source revision, runtime identity, files, checksums and notices. The script requires both fixed bootstrap files and a nonempty CommonJS preload from the desktop build. A static stage does not establish a working desktop or CLI journey. [ADR 0012](adr/0012-milestones-d0-to-d3.md) requires the packaged fake-provider journey for D0.
+`manifest.json` records source revision, runtime identity, files, checksums and notices. The script requires the fixed controller entrypoint, both demo bootstrap files and a nonempty CommonJS preload from the desktop build. A static stage does not establish a working desktop or CLI journey. [ADR 0012](adr/0012-milestones-d0-to-d3.md) requires the packaged fake-provider journey for D0.
 
 The build compiles the committed Local input helper with the installed Command Line Tools compiler and macOS 26.5 SDK, targeting arm64 and macOS 13.5. Missing tools block staging. The compiler has a thirty-second limit and bounded diagnostic output. Packaging never runs the helper. Each package builds the helper from its committed source. The fixed `runtime/bin/local-secure-input` artifact carries its source and executable hashes in the runtime manifest; the package record also retains the compiler hash and SDK settings hash. End users need no compiler.
 
@@ -22,7 +24,7 @@ The controller resolves Local credential input from that fixed runtime manifest.
 
 The first directory layout resolves its trusted runtime from `app.getAppPath()/runtime`. A later branded app needs an explicit resource layout. Runtime selection never comes from page content or a fallback to an arbitrary Node on PATH.
 
-`bin/crewkite` selects the bundled Node and CLI. `bin/desktop` selects the copied Electron app and fixed demo bootstrap. Both use the package's `state/home`, and the desktop uses a separate `state/profile`. From the primary checkout, use the new stage:
+`bin/crewkite` selects the bundled Node and CLI. `bin/desktop` selects the copied Electron app. Its manifest selects the normal controller entrypoint or the explicit demo bootstrap. Both use the package's `state/home`, and the desktop uses a separate `state/profile`. From the primary checkout, use the new stage:
 
 ```sh
 internal/packages/d0/local-check/bin/desktop
