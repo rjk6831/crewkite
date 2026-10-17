@@ -1035,6 +1035,12 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     manifestHash: 'e'.repeat(64),
     revision: 4,
     generation: 0,
+    evaluationSelection: {
+      recipeId: 'project-node-tests-v1',
+      testFiles: combinedPlan.checks.testFiles,
+      reviewer: { profileId: 'openai-file-v1', methodId: 'keep-it-simple', cycles: 1 },
+      creditPolicy: 'ordinary',
+    },
     members: [1, 2].map((index) => ({
       taskId: combinedId('tsk', index),
       runId: combinedId('run', index),
