@@ -6124,7 +6124,35 @@ test('google quota authority survives retries and restart while sharing one oper
 });
 
 test('an acp scratch permission binds one live action and crash recovery cannot invent completion', async (t) => {
-  for (const row of ['approved', 'denied', 'stop', 'eof', 'preflight'] as const) {
+  for (const row of [
+    'approved',
+    'denied',
+    'stop',
+    'eof',
+    'preflight',
+    'refresh-missing',
+    'refresh-stale',
+    'refresh-unknown',
+    'refresh-reset',
+    'fresh-zero',
+    'refresh-zero',
+    'cooldown',
+    'invalid-read',
+    'unavailable',
+    'active-owner',
+    'unknown-owner',
+    'revoke-read',
+    'reenable-read',
+    'stop-read',
+    'close-read',
+    'deadline-read',
+    'source-read',
+    'proof-read',
+    'profile-read',
+    'unrelated-read',
+    'reserve',
+    'missing-reserve',
+  ] as const) {
     const scenario =
       row === 'eof' ? 'eof-cancel' : row === 'stop' ? 'cancel-permission' : 'permission';
     const fixtureHome = mkdtempSync(resolve('internal/acp-controller-'));
@@ -6154,8 +6182,62 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     let liveController: Controller | undefined;
     let interruptSetup = false;
     let setupStop: Promise<CommandResult> | undefined;
+    let quotaReads = 0;
+    let acpLaunches = 0;
+    let profileAvailable = true;
+    let quotaAction: (() => void) | undefined;
+    let quotaReset = '2026-10-24T17:00:00.000Z';
     const options: Partial<ControllerOptions> = {
       nativeProfiles: () => [],
+      googleUsageClient: () =>
+        row === 'unavailable'
+          ? { available: false, reason: 'client-unavailable' }
+          : {
+              available: true,
+              reason: 'available',
+              client: { executable: process.execPath, version: '1.4.0', sha256: fixtureClientHash },
+              environment: { HOME: userInfo().homedir },
+            },
+      googleUsageSpawn: (_executable, args, spawnOptions) => {
+        quotaReads++;
+        assert.equal(args[1], '/usage');
+        assert.equal(liveController?.store.intents().length, 0);
+        assert.equal(liveController?.store.googleMetadataOperations().at(-1)?.state, 'intent');
+        const report = {
+          status: 'SUCCESS',
+          num_turns: 0,
+          command: {
+            data: {
+              groups: [
+                {
+                  buckets: [
+                    {
+                      id: 'quota',
+                      remaining_fraction: 0.8,
+                      reset_time: quotaReset,
+                    },
+                    {
+                      id: 'satellite',
+                      remaining_fraction: row === 'refresh-zero' ? 0 : 0.7,
+                      reset_time: quotaReset,
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+        };
+        const child = spawn(
+          process.execPath,
+          [
+            '-e',
+            `process.stdout.write(${JSON.stringify(JSON.stringify(row === 'invalid-read' ? {} : report))})`,
+          ],
+          spawnOptions,
+        );
+        if (quotaAction) queueMicrotask(quotaAction);
+        return child;
+      },
       googleAcp: {
         reviewMappings: [mapping],
         toolMappings: [
@@ -6167,6 +6249,7 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
           },
         ],
         spawn: (...args) => {
+          acpLaunches++;
           const child = spawn(...args);
           if (interruptSetup) {
             interruptSetup = false;
@@ -6190,7 +6273,8 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
         },
         resolve: (proof: AcpSetupProof | null) => {
           const config = proof?.configOptions ?? null;
-          const available = !!proof?.reviewMode && proof.auth.status === 'authenticated';
+          const available =
+            profileAvailable && !!proof?.reviewMode && proof.auth.status === 'authenticated';
           return {
             client,
             environment: { HOME: userInfo().homedir, PATH: process.env.PATH },
@@ -6277,12 +6361,37 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     assert.equal(controller.store.googleAcpSetup().state, 'ready');
     assert.equal(controller.store.googleMetadataOperations().length, row === 'stop' ? 4 : 3);
     assert(controller.store.googleMetadataOperations().every((row) => row.state === 'quiescent'));
+    const setupLaunches = acpLaunches;
+    let appointedRouteId: string | undefined;
+    if (row === 'reserve' || row === 'missing-reserve') {
+      appointedRouteId = id('rte');
+      await controller.close();
+      controller = new Controller({
+        ...options,
+        home: context.controller.home,
+        now: clock.now,
+        id: (prefix) => (prefix === 'rte' ? (appointedRouteId as string) : id(prefix)),
+      });
+      liveController = controller;
+    }
     const task = TaskSchema.parse((await controller.execute(context.draft, 'local-owner')).entity);
     const policy = {
       ...fixtures.policy,
       quality: 'quick',
+      ...(row === 'fresh-zero'
+        ? { unknownUsage: { rule: 'fixed-allowance', allowance: { launches: 10, minutes: 5 } } }
+        : {}),
       methods: [{ id: 'keep-it-simple', cycles: 1, reviewerRole: 'reviewer' }],
-      reserves: [],
+      reserves: appointedRouteId
+        ? [
+            {
+              routeId: appointedRouteId,
+              windowId: row === 'missing-reserve' ? 'missing' : 'quota',
+              value: 25,
+              unit: 'percent',
+            },
+          ]
+        : [],
       limits: { attempts: 4, minutes: 5, concurrency: 1 },
       effects: fixtures.policy.effects.map((grant) => ({ ...grant, taskId: task.id })),
     };
@@ -6316,6 +6425,16 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       command('StartRun', { taskId: task.id, runId: run.id }, taskRevision(controller, task.id));
     assert.equal((await controller.execute(start(), 'local-owner')).outcome, 'blocked');
     assert.equal(controller.store.intents().length, 0);
+    quotaReset = new Date(Date.parse(clock.now()) + 3600000).toISOString();
+    const autoRefresh = ![
+      'approved',
+      'denied',
+      'stop',
+      'eof',
+      'preflight',
+      'fresh-zero',
+      'reserve',
+    ].includes(row);
     controller.store.transaction(() => {
       controller.store.setGoogleUsageConsent(true);
       controller.store.recordGoogleUsageObservation(clock.now());
@@ -6323,14 +6442,219 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
         routeId: run.roles[0].routeId,
         windowId: 'quota',
         kind: 'weekly',
-        remaining: { value: 80, unit: 'percent' },
-        resetsAt: new Date(Date.parse(clock.now()) + 3600000).toISOString(),
-        observedAt: clock.now(),
+        remaining:
+          row === 'refresh-unknown'
+            ? null
+            : { value: row === 'fresh-zero' ? 0 : row === 'reserve' ? 20 : 80, unit: 'percent' },
+        resetsAt: row === 'refresh-reset' ? clock.now() : quotaReset,
+        observedAt:
+          autoRefresh && row !== 'refresh-unknown' && row !== 'refresh-reset'
+            ? new Date(Date.parse(clock.now()) - 300001).toISOString()
+            : clock.now(),
         source: 'client',
         confidence: 'reported',
       };
-      controller.store.put('window', `${run.roles[0].routeId}/quota`, 0, observation);
+      if (row !== 'refresh-missing' && row !== 'refresh-zero')
+        controller.store.put('window', `${run.roles[0].routeId}/quota`, 0, observation);
+      if (row === 'fresh-zero')
+        controller.store.put('window', `${run.roles[0].routeId}/old`, 0, {
+          ...observation,
+          windowId: 'old',
+          remaining: null,
+        });
+      if (row === 'cooldown' || row === 'approved')
+        controller.store.recordGoogleUsageAttempt(clock.now());
+      if (row === 'active-owner' || row === 'unknown-owner') {
+        const key = id('cmd');
+        controller.store.beginGoogleMetadata(
+          key,
+          'usage',
+          controller.store.googleUsageReader().authority_revision,
+          clock.now(),
+        );
+        if (row === 'unknown-owner') controller.store.unknownGoogleMetadata(key);
+      }
     });
+    let closeDuringRead: Promise<void> | undefined;
+    let cancellation: Promise<unknown> | undefined;
+    if (
+      [
+        'revoke-read',
+        'reenable-read',
+        'stop-read',
+        'close-read',
+        'deadline-read',
+        'source-read',
+        'proof-read',
+        'profile-read',
+      ].includes(row)
+    )
+      quotaAction = () => {
+        if (row === 'revoke-read' || row === 'reenable-read') {
+          cancellation = controller.execute(
+            command('ObserveUsage', { family: 'google', consent: false }, 0),
+            'local-owner',
+          );
+          if (row === 'reenable-read')
+            void controller.execute(
+              command('ObserveUsage', { family: 'google', consent: true }, 0),
+              'local-owner',
+            );
+        }
+        if (row === 'stop-read')
+          cancellation = controller.execute(
+            command(
+              'StopRun',
+              { taskId: task.id, runId: run.id },
+              taskRevision(controller, task.id),
+            ),
+            'local-owner',
+          );
+        if (row === 'close-read') closeDuringRead = Promise.resolve(controller.close());
+        if (row === 'deadline-read') clock.advance(30001);
+        if (row === 'profile-read') profileAvailable = false;
+        if (row === 'source-read')
+          writeFileSync(join(source.directory, 'net.mjs'), 'source changed');
+        if (row === 'proof-read')
+          controller.store.transaction(() => {
+            const setup = controller.store.googleAcpSetup();
+            controller.store.putGoogleAcpSetup({ ...setup, revision: setup.revision + 1 });
+          });
+      };
+    if (row === 'unrelated-read') {
+      let pendingStart: Promise<CommandResult> | undefined;
+      let pendingStop: Promise<CommandResult> | undefined;
+      quotaAction = () => {
+        pendingStart = controller.execute(start(), 'local-owner');
+        pendingStop = controller.execute(
+          command('StopRun', { taskId: task.id, runId: run.id }, taskRevision(controller, task.id)),
+          'local-owner',
+        );
+      };
+      const manual = await controller.execute(
+        command('ObserveUsage', { family: 'google' }, 0),
+        'local-owner',
+      );
+      assert.equal(manual.outcome, 'applied');
+      assert.equal((await pendingStop)?.outcome, 'applied');
+      assert.notEqual((await pendingStart)?.outcome, 'applied');
+      assert.equal(controller.store.intents().length, 0);
+      assert.equal(controller.store.googleMetadataOperations().at(-1)?.state, 'quiescent');
+      assert.equal(quotaReads, 1);
+      assert.equal(acpLaunches, setupLaunches);
+      await controller.close();
+      continue;
+    }
+    const blockedRows = [
+      'fresh-zero',
+      'reserve',
+      'refresh-zero',
+      'missing-reserve',
+      'cooldown',
+      'invalid-read',
+      'unavailable',
+      'active-owner',
+      'unknown-owner',
+      'revoke-read',
+      'reenable-read',
+      'stop-read',
+      'close-read',
+      'deadline-read',
+      'source-read',
+      'proof-read',
+      'profile-read',
+    ];
+    if (blockedRows.includes(row)) {
+      const before = controller.snapshot().usage;
+      const input = start();
+      const first = controller.execute(input, 'local-owner');
+      const repeated = controller.execute(input, 'local-owner');
+      const refused = await first;
+      assert.deepEqual(await repeated, refused);
+      assert.notEqual(refused.outcome, 'applied', row);
+      if (cancellation) await cancellation;
+      if (closeDuringRead) {
+        await closeDuringRead;
+        controller = new Controller({
+          ...options,
+          home: context.controller.home,
+          now: clock.now,
+          id,
+        });
+        liveController = controller;
+      }
+      assert.equal(controller.store.intents().length, 0, row);
+      assert.equal(acpLaunches, setupLaunches, row);
+      assert.equal(controller.store.receipt(input.key)?.hash, hashCanonical(input));
+      assert.deepEqual(await controller.execute(input, 'local-owner'), refused);
+      assert.equal(
+        quotaReads,
+        [
+          'fresh-zero',
+          'reserve',
+          'cooldown',
+          'unavailable',
+          'active-owner',
+          'unknown-owner',
+        ].includes(row)
+          ? 0
+          : 1,
+        row,
+      );
+      if (
+        [
+          'invalid-read',
+          'unavailable',
+          'cooldown',
+          'revoke-read',
+          'reenable-read',
+          'stop-read',
+          'close-read',
+        ].includes(row)
+      )
+        assert.deepEqual(controller.snapshot().usage, before, row);
+      if (
+        [
+          'invalid-read',
+          'unavailable',
+          'revoke-read',
+          'reenable-read',
+          'stop-read',
+          'close-read',
+        ].includes(row)
+      )
+        assert.equal(controller.store.googleUsageReader().last_attempt_at, context.clock.now());
+      if (row === 'invalid-read' || row === 'unavailable') {
+        const beforeRetry = quotaReads;
+        assert.equal(
+          (await controller.execute(start(), 'local-owner')).reason,
+          'usage-reader-cooldown',
+        );
+        assert.equal(quotaReads, beforeRetry);
+      }
+      if (row === 'unknown-owner') {
+        await controller.close();
+        controller = new Controller({
+          ...options,
+          home: context.controller.home,
+          now: clock.now,
+          id,
+        });
+        liveController = controller;
+        assert.equal(
+          (await controller.execute(start(), 'local-owner')).reason,
+          'google-ownership-unknown',
+        );
+        assert.equal(quotaReads, 0);
+      }
+      if (row === 'cooldown') assert.equal(refused.reason, 'usage-reader-cooldown');
+      if (row === 'unknown-owner') assert.equal(refused.reason, 'google-ownership-unknown');
+      if (row === 'active-owner') assert.equal(refused.reason, 'google-operation-active');
+      if (row === 'deadline-read') assert.equal(refused.reason, 'acp-start-deadline');
+      if (row === 'reenable-read') assert.equal(controller.store.googleUsageReader().enabled, 1);
+      await controller.close();
+      continue;
+    }
     if (row === 'preflight') {
       const input = start();
       const pending = controller.execute(input, 'local-owner');
@@ -6391,6 +6715,18 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     assert.equal((await controller.execute(start(), 'local-owner')).reason, 'acp-start-preparing');
     assert.deepEqual(await first, await retry);
     assert.equal((await first).outcome, 'applied', canonicalJson(await first));
+    assert.equal(quotaReads, autoRefresh ? 1 : 0, row);
+    if (autoRefresh) {
+      assert.equal(controller.store.googleMetadataOperations().at(-1)?.kind, 'usage');
+      assert.equal(controller.store.googleMetadataOperations().at(-1)?.state, 'quiescent');
+      assert.equal(
+        controller
+          .snapshot()
+          .usage.filter(({ observation }) => observation.routeId === run.roles[0].routeId).length,
+        2,
+      );
+      assert.equal(controller.store.intents().length, 1);
+    }
     if (row === 'eof') {
       await nativeWait('acp cancellation readiness', readyToCancel.promise);
       const terminal = Promise.withResolvers<void>();

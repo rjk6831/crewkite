@@ -619,6 +619,11 @@ export class Controller {
     taskId: string;
     runId: string;
     aborted: boolean;
+    usageKey?: string;
+    authorityRevision?: number;
+    deadline: number;
+    wallDeadline: number;
+    expired: boolean;
     promise: Promise<CommandResult>;
   };
 
@@ -1697,6 +1702,8 @@ export class Controller {
         )
           effects.push(() => {
             start.aborted = true;
+            if (start.usageKey && this.usageRead?.key === start.usageKey)
+              this.usageRead.abort.abort();
           });
         const pending = this.verificationPreparation;
         if (result.outcome === 'applied' && pending?.taskId === command.payload.taskId)
@@ -3125,6 +3132,26 @@ export class Controller {
         : undefined;
     if (native && 'repository' in native.appointment && !nativeTools)
       return { outcome: 'blocked', reason: 'native-tools-grant-unavailable' };
+    if (native && 'acp' in native.appointment) {
+      const preparing = this.acpStart;
+      if (
+        !preparing ||
+        preparing.key !== command.key ||
+        preparing.taskId !== task.id ||
+        preparing.runId !== run.id ||
+        preparing.aborted
+      )
+        return { outcome: 'blocked', reason: 'acp-start-revoked' };
+      if (
+        preparing.expired ||
+        performance.now() >= preparing.deadline ||
+        Date.parse(this.now()) >= preparing.wallDeadline
+      )
+        return { outcome: 'blocked', reason: 'acp-start-deadline' };
+      const reader = this.store.googleUsageReader();
+      if (!reader.enabled || reader.authority_revision !== preparing.authorityRevision)
+        return { outcome: 'blocked', reason: 'usage-read-revoked' };
+    }
     this.store.db.prepare('DELETE FROM receipts WHERE command_key=?').run(`paused:${run.id}`);
     this.store.put('attempt', attempt.id, attempt.revision, attempt);
     if (native?.handoff) {
@@ -4213,6 +4240,8 @@ export class Controller {
           });
     if (this.store.receipt(command.key))
       return Promise.resolve(this.commitCommand(command, principal));
+    const deadline = performance.now() + 30000;
+    const wallDeadline = Date.parse(this.now()) + 30000;
     const pending = {
       key: command.key,
       hash,
@@ -4220,28 +4249,113 @@ export class Controller {
       taskId: command.payload.taskId,
       runId: command.payload.runId,
       aborted: false,
+      usageKey: undefined as string | undefined,
+      authorityRevision: undefined as number | undefined,
+      deadline,
+      wallDeadline,
+      expired: false,
       promise: Promise.resolve<CommandResult>({ outcome: 'blocked' }),
     };
+    const cancelDeadline = (this.options.schedule ?? defaultSchedule)(() => {
+      pending.expired = true;
+      if (pending.usageKey && this.usageRead?.key === pending.usageKey)
+        this.usageRead.abort.abort();
+    }, 30000);
     const refuse = (result: CommandResult) => this.commitCommand(command, principal, result);
+    const cancelled = (): CommandResult | undefined => {
+      if (this.closed || pending.aborted)
+        return { outcome: 'blocked', reason: 'acp-start-revoked' };
+      if (
+        pending.expired ||
+        performance.now() >= deadline ||
+        Date.parse(this.now()) >= wallDeadline
+      )
+        return { outcome: 'blocked', reason: 'acp-start-deadline' };
+    };
     const promise = Promise.resolve().then(async () => {
       try {
         const stale = this.checkRevision(command);
         if (stale) return refuse(stale);
+        const cancelledBefore = cancelled();
+        if (cancelledBefore) return refuse(cancelledBefore);
         const task = this.store.get<Task>('task', command.payload.taskId),
           run = this.store.get<Run>('run', command.payload.runId);
         if (!task || !run || task.runId !== run.id)
           return refuse({ outcome: 'blocked', reason: 'run-not-current' });
+        let binding: NativeBinding;
+        try {
+          binding = this.preparedNativeBinding(run);
+        } catch {
+          return refuse({ outcome: 'blocked', reason: 'native-preparation-unavailable' });
+        }
+        const appointment = binding.appointment;
+        if (!('acp' in appointment))
+          return refuse({ outcome: 'blocked', reason: 'native-preparation-unavailable' });
+        const setup = this.store.googleAcpSetup();
+        const quota = this.store.transaction(() => ({
+          ...this.acpQuotaState(appointment.route.id, run),
+          blocker: this.store.googleOperationBlocker(),
+        }));
+        pending.authorityRevision = quota.reader.authority_revision;
+        if (!quota.reader.enabled)
+          return refuse({ outcome: 'blocked', reason: 'usage-reader-not-enabled' });
+        if (quota.blocker) return refuse({ outcome: 'blocked', reason: quota.blocker });
+        if (quota.reserveReason)
+          return refuse({
+            outcome: 'blocked',
+            reason: 'capacity-unavailable',
+            next: quota.reserveReason,
+          });
+        if (quota.needsRefresh) {
+          const cancelledRead = cancelled();
+          if (cancelledRead) return refuse(cancelledRead);
+          pending.usageKey = this.id('cmd');
+          const child = CommandSchema.parse({
+            protocol: 1,
+            key: pending.usageKey,
+            actor: command.actor,
+            command: 'ObserveUsage',
+            expectedRevision: 0,
+            payload: { family: 'google' },
+          }) as Extract<Command, { command: 'ObserveUsage' }>;
+          const result = await this.observeUsageCommand(child, principal);
+          const cancelledReadResult = cancelled();
+          if (cancelledReadResult) return refuse(cancelledReadResult);
+          if (!['applied', 'already-applied'].includes(result.outcome))
+            return refuse({
+              outcome: 'blocked',
+              reason: result.reason ?? 'usage-read-failed',
+              ...(result.next ? { next: result.next } : {}),
+            });
+        }
+        const unchanged = (): CommandResult | undefined => {
+          const revoked = cancelled();
+          if (revoked) return revoked;
+          const reader = this.store.googleUsageReader();
+          if (!reader.enabled || reader.authority_revision !== quota.reader.authority_revision)
+            return { outcome: 'blocked', reason: 'usage-read-revoked' };
+          if (
+            hashCanonical(this.store.googleAcpSetup()) !== hashCanonical(setup) ||
+            hashCanonical(this.store.get<Task>('task', task.id)) !== hashCanonical(task) ||
+            hashCanonical(this.store.get<Run>('run', run.id)) !== hashCanonical(run) ||
+            hashCanonical(
+              inspectSource(task.projectId, this.projectPath(task.projectId) as string),
+            ) !== hashCanonical(run.source)
+          )
+            return { outcome: 'blocked', reason: 'acp-start-changed' };
+          try {
+            if (this.preparedNativeBinding(run).planArtifact.hash !== binding.planArtifact.hash)
+              return { outcome: 'blocked', reason: 'acp-start-changed' };
+          } catch {
+            return { outcome: 'blocked', reason: 'native-preparation-unavailable' };
+          }
+          return cancelled();
+        };
+        const changed = unchanged();
+        if (changed) return refuse(changed);
         const context = await captureContext(this.contextClient(), task.id);
-        if (this.closed || pending.aborted)
-          return refuse({ outcome: 'blocked', reason: 'acp-start-revoked' });
-        if (
-          hashCanonical(this.store.get<Task>('task', task.id)) !== hashCanonical(task) ||
-          hashCanonical(this.store.get<Run>('run', run.id)) !== hashCanonical(run) ||
-          hashCanonical(
-            inspectSource(task.projectId, this.projectPath(task.projectId) as string),
-          ) !== hashCanonical(run.source)
-        )
-          return refuse({ outcome: 'blocked', reason: 'acp-start-changed' });
+        const changedContext = unchanged();
+        if (changedContext) return refuse(changedContext);
         return this.commitCommand(command, principal, undefined, undefined, context);
       } catch {
         return refuse({ outcome: 'blocked', reason: 'acp-context-unavailable' });
@@ -4250,6 +4364,7 @@ export class Controller {
     pending.promise = promise;
     this.acpStart = pending;
     return promise.finally(() => {
+      cancelDeadline();
       if (this.acpStart === pending) this.acpStart = undefined;
     });
   }
@@ -7119,51 +7234,66 @@ export class Controller {
     };
   }
 
-  private acpDecision(
-    appointment: z.infer<typeof NativeAcpAppointmentSchema>,
-    run: Run,
-  ): RouterDecision {
+  private acpQuotaState(routeId: string, run: Run) {
     const reader = this.store.googleUsageReader();
     const windows = this.store
       .list<Observation>('window')
-      .filter((value) => value.routeId === appointment.route.id && value.kind !== 'local');
-    let reason: string | undefined;
-    if (!reader.enabled || !reader.last_observed_at || !windows.length)
-      reason = 'Google quota needs an enabled reader and fresh observations.';
+      .filter((value) => value.routeId === routeId && value.kind !== 'local');
+    let needsRefresh = !reader.last_observed_at || !windows.length;
+    let reserveReason: string | undefined;
+    const nowMs = Date.parse(this.now());
     for (const window of windows) {
       if (
-        deriveWindow(window, { nowMs: Date.parse(this.now()), maxAgeMs: 300000 }).state !==
-          'fresh' ||
+        deriveWindow(window, { nowMs, maxAgeMs: 300000 }).state !== 'fresh' ||
         window.remaining === null ||
         window.source !== 'client' ||
         window.confidence !== 'reported'
       ) {
-        reason = 'Every Google quota bucket must be fresh.';
+        needsRefresh = true;
         continue;
       }
       const reserves = run.policy.policy.reserves.filter(
-        (value) => value.routeId === window.routeId && value.windowId === window.windowId,
+        (value) => value.routeId === routeId && value.windowId === window.windowId,
       );
       const reservations = this.store.db
         .prepare('SELECT unit,value FROM reservations WHERE route_id=? AND window_id=?')
-        .all(window.routeId, window.windowId) as {
+        .all(routeId, window.windowId) as {
         unit: NonNullable<Observation['remaining']>['unit'];
         value: number;
       }[];
-      if (
-        reserves.length > 1 ||
-        availableAllowance({ remaining: window.remaining, reserve: reserves[0], reservations }) <= 0
-      )
-        reason = 'A Google quota bucket has reached its reserve.';
+      try {
+        if (
+          reserves.length > 1 ||
+          availableAllowance({ remaining: window.remaining, reserve: reserves[0], reservations }) <=
+            0
+        )
+          reserveReason = 'A Google quota bucket has reached its reserve.';
+      } catch {
+        reserveReason = 'A Google reserve has incompatible allowance units.';
+      }
     }
     if (
       run.policy.policy.reserves.some(
         (value) =>
-          value.routeId === appointment.route.id &&
+          value.routeId === routeId &&
           !windows.some((window) => window.windowId === value.windowId),
       )
     )
-      reason = 'A Google reserve has no observed bucket.';
+      needsRefresh = true;
+    return { reader, windows, needsRefresh, reserveReason };
+  }
+
+  private acpDecision(
+    appointment: z.infer<typeof NativeAcpAppointmentSchema>,
+    run: Run,
+  ): RouterDecision {
+    const { reader, windows, needsRefresh, reserveReason } = this.acpQuotaState(
+      appointment.route.id,
+      run,
+    );
+    let reason = reserveReason;
+    if (!reader.enabled || needsRefresh)
+      reason ??= 'Every Google quota bucket needs an enabled reader and fresh observations.';
     if (Date.parse(appointment.expiresAt) <= Date.parse(this.now()))
       reason = 'Native consent expired.';
     return {
