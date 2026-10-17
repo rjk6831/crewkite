@@ -23,6 +23,7 @@ import { canonicalJson, ReadDataSchema } from '@crewkite/contracts';
 import { createSyntheticRepository } from '@crewkite/testkit/repository';
 import {
   applyReplacement,
+  captureSingleFileEdit,
   committedFiles,
   type FileContent,
   type FileEntry,
@@ -485,5 +486,88 @@ test('replacement checks the full source before writing and preserves mode with 
       assert.throws(() => applyReplacement(root, expected, replacement), Error, example.name);
       assert.deepEqual(snapshot(root), before, example.name);
     }
+  }
+});
+
+test('single-file capture retains only the exact bounded target edit', (t) => {
+  mkdirSync(resolve('internal'), { recursive: true });
+  const directory = mkdtempSync(join(resolve('internal'), 'capture-test-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const cases: {
+    name: string;
+    content?: Buffer;
+    change?: (root: string, manifest: FileEntry[]) => void;
+    accept?: boolean;
+  }[] = [
+    { name: 'actual edited bytes', content: Buffer.from('export {};\n'), accept: true },
+    { name: 'unchanged target', accept: true },
+    { name: 'empty target', content: Buffer.alloc(0), accept: true },
+    { name: 'UTF-8 byte boundary', content: Buffer.from('é'.repeat(32_768)), accept: true },
+    { name: 'oversized UTF-8', content: Buffer.from('é'.repeat(32_769)) },
+    { name: 'invalid UTF-8', content: Buffer.from([0xc0, 0xaf]) },
+    { name: 'NUL text', content: Buffer.from('a\0b') },
+    { name: 'target mode drift', change: (root) => chmodSync(join(root, 'net.mjs'), 0o644) },
+    { name: 'missing target', change: (root) => unlinkSync(join(root, 'net.mjs')) },
+    {
+      name: 'changed sibling',
+      change: (root) => writeFileSync(join(root, 'sibling.bin'), 'changed'),
+    },
+    { name: 'deleted sibling', change: (root) => unlinkSync(join(root, 'sibling.bin')) },
+    { name: 'sibling mode drift', change: (root) => chmodSync(join(root, 'sibling.bin'), 0o755) },
+    { name: 'added path', change: (root) => writeFileSync(join(root, 'extra'), '') },
+    {
+      name: 'hardlink target',
+      change: (root) => linkSync(join(root, 'net.mjs'), join(root, 'alias')),
+    },
+    {
+      name: 'symlink target',
+      change: (root) => {
+        unlinkSync(join(root, 'net.mjs'));
+        symlinkSync('sibling.bin', join(root, 'net.mjs'));
+      },
+    },
+    {
+      name: 'special target',
+      change: (root) => {
+        unlinkSync(join(root, 'net.mjs'));
+        execFileSync('mkfifo', [join(root, 'net.mjs')]);
+      },
+    },
+    {
+      name: 'changed base identity',
+      change: (_root, manifest) => {
+        manifest[0].hash = '0'.repeat(64);
+      },
+    },
+  ];
+  for (const [index, example] of cases.entries()) {
+    const root = join(directory, String(index));
+    mkdirSync(root);
+    const original = Buffer.from('export const original = true;\n');
+    writeFileSync(join(root, 'net.mjs'), original, { mode: 0o751 });
+    writeFileSync(join(root, 'sibling.bin'), Buffer.from([255, 0]));
+    const manifest = readFiles(root).map(({ content: _content, ...entry }) => entry);
+    const target = { path: 'net.mjs', baseHash: manifest[0].hash };
+    if (example.content) writeFileSync(join(root, 'net.mjs'), example.content);
+    example.change?.(root, manifest);
+    if (!example.accept) {
+      assert.throws(
+        () => captureSingleFileEdit({ directory: root, manifest, target }),
+        Error,
+        example.name,
+      );
+      continue;
+    }
+    const result = captureSingleFileEdit({ directory: root, manifest, target });
+    assert.deepEqual(result.files, readFiles(root), example.name);
+    assert.deepEqual(
+      result.files.find((file) => file.path === target.path)?.content,
+      example.content ?? original,
+      example.name,
+    );
+    assert.deepEqual(result.files[1].content, Buffer.from([255, 0]), example.name);
+    assert.equal(result.target.baseHash, target.baseHash, example.name);
+    assert.equal(result.target.mode, '100755', example.name);
+    assert.equal(lstatSync(join(root, 'net.mjs')).mode & 0o777, 0o751, example.name);
   }
 });

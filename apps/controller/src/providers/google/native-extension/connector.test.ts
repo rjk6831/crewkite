@@ -1,12 +1,26 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { test } from 'node:test';
-import { type CommandResult, type Snapshot, SnapshotSchema } from '@crewkite/contracts';
+import {
+  type CommandResult,
+  canonicalJson,
+  type Snapshot,
+  SnapshotSchema,
+} from '@crewkite/contracts';
 import { createDemoFixtures } from '../../../../../../packages/testkit/src/fixtures.ts';
 import {
   BundleSchema,
@@ -14,6 +28,8 @@ import {
   captureContext,
   createSession,
   MAX_MESSAGE_BYTES,
+  OwnedBundleSchema,
+  prepareOwnedContext,
   privateFile,
   serve,
   writePrivate,
@@ -145,6 +161,75 @@ async function prepared(f = fixture()) {
     ...data,
   });
   return { f, bundle };
+}
+
+async function ownedPrepared(directory: string) {
+  directory = realpathSync(directory);
+  const f = fixture();
+  const context = await captureContext(f.client, f.task.id);
+  const snapshot = await f.client.snapshot();
+  const owner = {
+    taskId: f.task.id,
+    runId: context.binding.run.id,
+    attemptId: `att_${suffix}`,
+    routeId: snapshot.runs[0].roles[0].routeId,
+    generation: 0,
+    policyHash: hash(canonicalJson(snapshot.runs[0].policy.policy)),
+    profileId: 'google-acp-v1' as const,
+    selection: { proofId: `art_${suffix}`, modelId: 'model', thoughtLevelId: null },
+  };
+  const expiresAt = new Date(at + 60000).toISOString();
+  f.change((value) => {
+    value.tasks[0].revision++;
+    value.tasks[0].state = 'running';
+    value.runs[0].revision++;
+    value.runs[0].policy.hash = owner.policyHash;
+    value.attempts = [
+      {
+        id: owner.attemptId,
+        runId: owner.runId,
+        routeId: owner.routeId,
+        generation: 0,
+        state: 'running',
+        revision: 1,
+      },
+    ];
+    value.nativeRuns = [
+      {
+        runId: owner.runId,
+        profileId: owner.profileId,
+        stage: 'retain-only',
+        expiresAt,
+        target: { path: 'net.mjs', baseHash: 'a'.repeat(64), bytes: 1 },
+        acp: owner.selection,
+        permissionMode: 'request-review',
+        billingAttestation: {
+          source: 'user-attested',
+          subscriptionLoginConfirmed: true,
+          paidExtraUsageDisabled: true,
+          quotaAccountConfirmed: true,
+        },
+      },
+    ];
+  });
+  const home = join(directory, 'home');
+  const scratch = join(home, 'scratch');
+  const runtime = join(home, 'runtime');
+  for (const path of [home, scratch, runtime]) mkdirSync(path, { mode: 0o700 });
+  const input = {
+    client: f.client,
+    context,
+    home,
+    scratch,
+    directory: join(runtime, 'context'),
+    expiresAt,
+    owner,
+    now: () => at,
+  };
+  const result = await prepareOwnedContext(input);
+  const bytes = privateFile(result.capability.path, MAX_MESSAGE_BYTES);
+  const bundle = OwnedBundleSchema.parse(JSON.parse(bytes.toString('utf8')));
+  return { f, bundle, result, input, bytes };
 }
 
 async function initialize(session: ReturnType<typeof createSession>) {
@@ -291,6 +376,168 @@ test('native context protocol discloses only the selected current bounded task',
   await bounded;
   oversizedOutput.destroy();
   assert.equal(disclosed, false);
+
+  const directory = mkdtempSync(join(tmpdir(), 'crewkite-owned-context-'));
+  try {
+    const owned = await ownedPrepared(directory);
+    assert.equal(owned.result.capability.sha256, hash(owned.bytes.toString('utf8')));
+    assert.deepEqual(owned.result.server.env, []);
+    assert.equal(owned.result.server.args[1], '--owned-mcp');
+    assert.equal(owned.result.server.args[2], owned.result.capability.path);
+    assert.equal('cwd' in owned.result.server, false);
+    assert.deepEqual(readdirSync(owned.input.scratch), []);
+    assert.deepEqual(owned.f.commands, ['GetChanges', 'GetArtifact']);
+    await assert.rejects(prepareOwnedContext(owned.input), /EEXIST/);
+    await assert.rejects(
+      prepareOwnedContext({
+        ...owned.input,
+        directory: join(owned.input.scratch, 'context'),
+      }),
+      /outside scratch/,
+    );
+    const before = await owned.f.client.snapshot();
+    for (const [name, change, allowed] of [
+      [
+        'task activity revision',
+        (s: Snapshot) => {
+          s.tasks[0].revision++;
+        },
+        true,
+      ],
+      [
+        'run activity revision',
+        (s: Snapshot) => {
+          s.runs[0].revision++;
+        },
+        true,
+      ],
+      [
+        'owned approval',
+        (s: Snapshot) => {
+          s.tasks[0].revision++;
+          s.tasks[0].state = 'waiting';
+          s.tasks[0].waitingReason = 'approval';
+          s.approvals = [
+            {
+              approvalId: `apr_${suffix}`,
+              taskId: owned.bundle.owner.taskId,
+              attemptId: owned.bundle.owner.attemptId,
+              generation: owned.bundle.owner.generation,
+              action: 'write-scratch',
+              target: 'net.mjs',
+              revision: s.tasks[0].revision,
+              requester: 'native',
+              consequence: 'Replace the selected target.',
+              status: 'pending',
+            },
+          ];
+        },
+        true,
+      ],
+      [
+        'unowned approval',
+        (s: Snapshot) => {
+          s.tasks[0].state = 'waiting';
+          s.tasks[0].waitingReason = 'approval';
+        },
+        false,
+      ],
+      [
+        'task criteria',
+        (s: Snapshot) => {
+          s.tasks[0].criteria = ['changed'];
+        },
+        false,
+      ],
+      [
+        'source',
+        (s: Snapshot) => {
+          s.runs[0].source.base = 'e'.repeat(40);
+        },
+        false,
+      ],
+      [
+        'policy',
+        (s: Snapshot) => {
+          s.runs[0].policy.policy.quality = 'thorough';
+        },
+        false,
+      ],
+      [
+        'attempt generation',
+        (s: Snapshot) => {
+          s.attempts[0].generation++;
+        },
+        false,
+      ],
+      [
+        'attempt route',
+        (s: Snapshot) => {
+          s.attempts[0].routeId = `rte_${'0'.repeat(26)}`;
+        },
+        false,
+      ],
+      [
+        'unknown attempt',
+        (s: Snapshot) => {
+          s.attempts[0].state = 'unknown';
+        },
+        false,
+      ],
+      [
+        'stopping',
+        (s: Snapshot) => {
+          s.tasks[0].state = 'stopping';
+        },
+        false,
+      ],
+      [
+        'profile selection',
+        (s: Snapshot) => {
+          const selection = s.nativeRuns[0].acp;
+          assert(selection);
+          selection.modelId = 'other';
+        },
+        false,
+      ],
+      [
+        'expiry changed',
+        (s: Snapshot) => {
+          s.nativeRuns[0].expiresAt = new Date(at + 120000).toISOString();
+        },
+        false,
+      ],
+      [
+        'retained candidate',
+        (s: Snapshot) => {
+          s.candidates[0].hash = 'f'.repeat(64);
+        },
+        false,
+      ],
+    ] as const) {
+      owned.f.change((value) => {
+        Object.assign(value, structuredClone(before));
+        change(value);
+      });
+      const session = createSession(owned.bundle, {
+        client: owned.f.client,
+        now: () => at,
+        save: () => assert.fail('A read cannot save.'),
+      });
+      await initialize(session);
+      const reply = (await session.receive(
+        frame(2, 'tools/call', { name: 'task_context' }),
+      )) as Reply;
+      assert.equal(!reply.result?.isError, allowed, name);
+      if (allowed) {
+        const text = reply.result?.content?.[0].text ?? '';
+        assert(!text.includes('UNRELATED PRIVATE TASK'), name);
+        assert(!text.includes(owned.input.home), name);
+      }
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('native results stay single unverified sidecars bound to current unexpired context', async () => {
@@ -389,6 +636,57 @@ test('native results stay single unverified sidecars bound to current unexpired 
       gate.resolve(await row.f.client.snapshot());
       const reply = (await pending) as Reply;
       assert(reply.result?.isError || reply.error);
+    }
+    const ownedRoot = join(directory, 'owned');
+    mkdirSync(ownedRoot, { mode: 0o700 });
+    const owned = await ownedPrepared(ownedRoot);
+    const ownedResult = join(owned.input.directory, 'result.unverified.json');
+    const ownedSession = createSession(owned.bundle, {
+      client: owned.f.client,
+      now: () => at,
+      save: (text) => writePrivate(ownedResult, text),
+    });
+    await initialize(ownedSession);
+    const accepted = (await ownedSession.receive(
+      frame(2, 'tools/call', {
+        name: 'submit_unverified_result',
+        arguments: { text: 'An owned unverified proposal.' },
+      }),
+    )) as Reply;
+    assert.equal(accepted.result?.isError, undefined);
+    assert.deepEqual(
+      JSON.parse(privateFile(ownedResult, MAX_MESSAGE_BYTES).toString()).owner,
+      owned.bundle.owner,
+    );
+    assert.deepEqual(readdirSync(owned.input.scratch), []);
+    assert.deepEqual(owned.f.commands, ['GetChanges', 'GetArtifact']);
+    for (const mode of ['stopping', 'expired', 'cancelled', 'closed'] as const) {
+      let now = at;
+      const gate = Promise.withResolvers<Snapshot>();
+      const waiting = createSession(owned.bundle, {
+        client: { ...owned.f.client, snapshot: () => gate.promise },
+        now: () => now,
+        save: () => assert.fail('Late owned context cannot save.'),
+      });
+      await initialize(waiting);
+      const pending = waiting.receive(
+        frame(2, 'tools/call', {
+          name: 'submit_unverified_result',
+          arguments: { text: 'late' },
+        }),
+      );
+      if (mode === 'stopping')
+        owned.f.change((s) => {
+          s.tasks[0].state = 'stopping';
+        });
+      if (mode === 'expired') now = at + 60000;
+      if (mode === 'cancelled') waiting.cancel(2);
+      if (mode === 'closed') waiting.close();
+      const snapshot = await owned.f.client.snapshot();
+      if (mode !== 'stopping') snapshot.tasks[0].state = 'running';
+      gate.resolve(snapshot);
+      const reply = (await pending) as Reply;
+      assert(reply.result?.isError || reply.error, mode);
     }
   } finally {
     rmSync(directory, { recursive: true, force: true });

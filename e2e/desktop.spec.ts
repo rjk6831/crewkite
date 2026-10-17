@@ -431,6 +431,125 @@ async function quotaRevocationBridge(
     assert.deepEqual(repeatedRevoke.command, uncertainRevoke.command);
     reply(repeatedRevoke, { outcome: 'applied', data: { kind: 'usage', windows: [] } });
     assert.equal((await retryRevoke)?.outcome, 'applied');
+    await page.getByRole('button', { name: 'Initialize Google ACP', exact: true }).click();
+    const setupRead = await next();
+    assert.equal(setupRead.command.command, 'InitializeGoogleAcp');
+    assert.equal(setupRead.command.expectedRevision, 0);
+    snapshot.googleAcpSetup = {
+      profileId: 'google-acp-v1',
+      revision: 1,
+      state: 'initializing',
+      operationId: setupRead.command.key,
+      proofId: null,
+      client: null,
+      auth: { method: null, status: 'unknown' },
+      reason: null,
+    };
+    const setupPanel = page.getByRole('region', { name: 'Google ACP setup', exact: true });
+    await setupPanel.getByRole('button', { name: 'Stop setup', exact: true }).click();
+    const setupStop = await next();
+    assert.equal(setupStop.command.command, 'StopGoogleAcpSetup');
+    assert.equal(setupStop.command.expectedRevision, 1);
+    assert.deepEqual(setupStop.command.payload, {
+      profileId: 'google-acp-v1',
+      operationId: setupRead.command.key,
+    });
+    assert.match(
+      await rejectCommand({ command: 'GetHealth', payload: {} }),
+      /pending desktop command/u,
+    );
+    assert.match(
+      await rejectCommand({
+        command: 'StopGoogleAcpSetup',
+        expectedRevision: 1,
+        payload: setupStop.command.payload,
+      }),
+      /pending desktop command/u,
+    );
+    snapshot.googleAcpSetup = {
+      ...snapshot.googleAcpSetup,
+      revision: 2,
+      state: 'blocked',
+      operationId: null,
+    };
+    reply(setupStop, {
+      outcome: 'applied',
+      data: { kind: 'google-acp-setup', setup: snapshot.googleAcpSetup },
+    });
+    await expect(setupPanel.getByRole('status').last()).toContainText('Setup blocked');
+    assert.match(
+      await rejectCommand({ command: 'GetHealth', payload: {} }),
+      /pending desktop command/u,
+    );
+    reply(setupRead, { outcome: 'outcome-unknown', reason: 'fixture-setup-unknown' });
+    await expect(setupPanel.getByRole('status').last()).toContainText('fixture-setup-unknown');
+    assert.match(
+      await rejectCommand({
+        command: 'StopGoogleAcpSetup',
+        expectedRevision: 1,
+        payload: setupStop.command.payload,
+      }),
+      /setup operation changed/u,
+    );
+    const setupRetry = page.evaluate(() => window.crewkite?.retryCommand?.());
+    const repeatedSetup = await next();
+    assert.deepEqual(repeatedSetup.command, setupRead.command);
+    reply(repeatedSetup, {
+      outcome: 'applied',
+      data: { kind: 'google-acp-setup', setup: snapshot.googleAcpSetup },
+    });
+    assert.equal((await setupRetry)?.outcome, 'applied');
+    const capacity = await application.evaluate(
+      (_electron, options) => {
+        const load = process.mainModule?.require.bind(process.mainModule);
+        if (!load) throw new Error('The desktop fixture module loader is unavailable.');
+        const { CommandReceipts } = load(
+          options.receipts,
+        ) as typeof import('../apps/desktop/src/main/receipts.ts');
+        const { createCommandKey } = load(
+          options.client,
+        ) as typeof import('../packages/client/src/node.ts');
+        const { desktopActor } = load(
+          options.runtime,
+        ) as typeof import('../apps/desktop/src/main/runtime.ts');
+        const receipts = new CommandReceipts(options.home, `${options.home}/capacity`);
+        const operation = {
+          protocol: 1 as const,
+          key: createCommandKey(),
+          actor: desktopActor,
+          expectedRevision: 0,
+          command: 'InitializeGoogleAcp' as const,
+          payload: { profileId: 'google-acp-v1' as const, consent: 'explicit' as const },
+        };
+        for (let index = 0; index < 32; index++)
+          receipts.retain({ ...operation, key: createCommandKey() }, true);
+        let refused = false;
+        try {
+          receipts.retain(operation, true);
+        } catch {
+          refused = true;
+        }
+        const stop = {
+          ...operation,
+          command: 'StopGoogleAcpSetup' as const,
+          payload: { profileId: 'google-acp-v1' as const, operationId: operation.key },
+        };
+        receipts.retain(stop, true);
+        receipts.load();
+        return {
+          refused,
+          count: receipts.commands.length,
+          last: receipts.commands.at(-1)?.command,
+        };
+      },
+      {
+        home,
+        receipts: join(root, 'apps/desktop/src/main/receipts.ts'),
+        client: join(root, 'packages/client/src/node.ts'),
+        runtime: join(root, 'apps/desktop/src/main/runtime.ts'),
+      },
+    );
+    assert.deepEqual(capacity, { refused: true, count: 33, last: 'StopGoogleAcpSetup' });
     assert.equal(pending.length, 0);
     await page.screenshot({
       path: join(internal, 'google-quota-controls.png'),

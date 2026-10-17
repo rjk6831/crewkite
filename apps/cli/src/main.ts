@@ -34,11 +34,16 @@ import {
   TaskSchema,
 } from '@crewkite/contracts';
 
+const googleAcpLabel =
+  'Google’s published ACP agent, signed in with your own Google account. Google documents this agent for editors; CrewKite is not named.';
+
 const help = `Usage: crewkite project add <path> [--json] [--home path]
        crewkite task create <project-id> --title text --outcome text --criterion text [--criterion text ...] [--json] [--home path]
        crewkite task <list|show|watch|start|stop|resume|switch|approve|deny> [id] [--json] [--home path]
        crewkite task switch <task-id> <route-id> [--json] [--home path]
        crewkite native profiles [--json] [--home path]
+       crewkite native import-google --consent [--json] [--home path]
+       crewkite native setup <show|initialize|authenticate|discover|stop> --family google [--consent] [--json] [--home path]
        crewkite usage show [--json] [--home path]
        crewkite usage refresh --family google [--consent|--no-consent] [--json] [--home path]
        crewkite task prepare-native <task-id> <profile-id> <path> --policy file [--native-trust --source-consent] [--existing-credits] [--confirm-subscription-only] [--permission-mode mode] [--handoff-target profile[:existing-credits] ...]
@@ -106,6 +111,9 @@ export async function runCli(
         family: { type: 'string' },
         consent: { type: 'boolean' },
         'no-consent': { type: 'boolean' },
+        'model-id': { type: 'string' },
+        'thought-level-id': { type: 'string' },
+        'confirm-quota-account': { type: 'boolean' },
       },
     });
     if (values.help || positionals.length === 0) {
@@ -182,13 +190,39 @@ export async function runCli(
       throw new Error('Health takes no positional arguments.');
     if (area === 'retry' && (!action || id !== undefined))
       throw new Error('Retry takes one receipt file.');
-    if (area === 'native' && (action !== 'profiles' || id !== undefined))
-      throw new Error('Use native profiles to list supported profiles.');
+    const settingUpGoogle = area === 'native' && action === 'setup';
+    const importingGoogle = area === 'native' && action === 'import-google';
+    if (
+      area === 'native' &&
+      !(
+        (action === 'profiles' && id === undefined) ||
+        (importingGoogle && id === undefined) ||
+        (settingUpGoogle &&
+          ['show', 'initialize', 'authenticate', 'discover', 'stop'].includes(id ?? ''))
+      )
+    )
+      throw new Error('Use native profiles, import-google or setup.');
+    if (
+      settingUpGoogle &&
+      (values.family !== 'google' ||
+        values['no-consent'] ||
+        (['show', 'stop'].includes(id ?? '') && values.consent))
+    )
+      throw new Error(
+        'Use native setup with --family google. Consent applies only to initialize, authenticate or discover.',
+      );
+    if (
+      ((settingUpGoogle && !['show', 'stop'].includes(id ?? '')) || importingGoogle) &&
+      !values.consent
+    )
+      throw new Error('This action requires explicit --consent.');
     const refreshingUsage = area === 'usage' && action === 'refresh';
     if (area === 'usage' && (!['show', 'refresh'].includes(action) || id !== undefined))
       throw new Error('Use usage show or usage refresh --family google.');
     if (
       !refreshingUsage &&
+      !settingUpGoogle &&
+      !importingGoogle &&
       (values.family !== undefined ||
         values.consent !== undefined ||
         values['no-consent'] !== undefined)
@@ -196,12 +230,23 @@ export async function runCli(
       throw new Error('Quota family and consent options require usage refresh.');
     if (refreshingUsage && values.family !== 'google')
       throw new Error('Quota refresh requires --family google.');
+    if (importingGoogle && (values.family !== undefined || values['no-consent']))
+      throw new Error('Use native import-google --consent.');
     if (values.consent && values['no-consent'])
       throw new Error('Choose --consent or --no-consent.');
     const preparingFile = area === 'task' && action === 'prepare-native';
     const preparingRepository = area === 'task' && action === 'prepare-repository';
     const preparing = preparingFile || preparingRepository;
     const preparingHandoff = area === 'task' && action === 'prepare-handoff';
+    if (
+      !preparingFile &&
+      (values['model-id'] !== undefined ||
+        values['thought-level-id'] !== undefined ||
+        values['confirm-quota-account'])
+    )
+      throw new Error(
+        'Observed configuration and quota account confirmation require task prepare-native.',
+      );
     if (values['handoff-target'] && !preparingFile)
       throw new Error('Manual handoff targets require task prepare-native.');
     const handoffTargets = values['handoff-target']
@@ -272,6 +317,25 @@ export async function runCli(
     if (area === 'task' && action === 'export' && !values.output)
       throw new Error('Export requires --output with a new file path.');
     const home = resolve(values.home ?? process.env.CREWKITE_HOME ?? join(homedir(), '.crewkite'));
+    if (importingGoogle) {
+      const provider = await import(
+        new URL('../../controller/src/providers/google/acp/import.ts', import.meta.url).href
+      );
+      const result = await provider.importGoogleAcp({ home, consent: 'explicit' });
+      const client = result.client
+        ? {
+            version: result.client.version,
+            sha256: result.client.sha256,
+            signerTeamId: result.client.signerTeamId,
+          }
+        : null;
+      output.out(
+        values.json
+          ? `${JSON.stringify({ imported: result.imported, reason: result.reason, client })}\n`
+          : `${result.reason}\n`,
+      );
+      return result.imported ? 0 : 2;
+    }
     const actor = { id: 'terminal', kind: 'cli' as const };
     const creation =
       addingProject || creatingTask
@@ -522,6 +586,42 @@ export async function runCli(
       return 0;
     }
 
+    if (settingUpGoogle) {
+      const setup = snapshot.googleAcpSetup;
+      if (id === 'show') {
+        const profile =
+          snapshot.nativeProfiles.find((value) => value.id === 'google-acp-v1') ?? null;
+        print(
+          { cursor: snapshot.cursor, setup, profile },
+          terminalText(
+            `${googleAcpLabel}\nSetup ${setup?.state ?? 'uninitialized'}, revision ${setup?.revision ?? 0}\nReason ${setup?.reason ?? profile?.reason ?? 'not-configured'}\nProof ${setup?.proofId ?? 'none'}\nOperation ${setup?.operationId ?? 'none'}${profile && 'configOptions' in profile ? `\nModels ${profile.configOptions?.model.supported.join(', ') ?? 'unknown'}\nThought levels ${profile.configOptions?.thoughtLevel?.supported.join(', ') ?? 'unknown'}` : ''}`,
+          ),
+        );
+        return 0;
+      }
+      if ((id === 'authenticate' || id === 'discover') && !setup?.proofId)
+        throw new Error('Initialize Google ACP and inspect its retained proof first.');
+      if (id === 'stop' && !setup?.operationId)
+        throw new Error('No exact setup operation is active. Read setup status first.');
+      const names = {
+        initialize: 'InitializeGoogleAcp',
+        authenticate: 'AuthenticateGoogleAcp',
+        discover: 'DiscoverGoogleAcp',
+        stop: 'StopGoogleAcpSetup',
+      } as const;
+      const result = await request(
+        names[id as keyof typeof names],
+        {
+          profileId: 'google-acp-v1',
+          ...(id === 'stop' ? { operationId: setup?.operationId } : { consent: 'explicit' }),
+          ...(id === 'authenticate' || id === 'discover' ? { proofId: setup?.proofId } : {}),
+          ...(id === 'authenticate' ? { method: 'oauth-personal' } : {}),
+        },
+        setup?.revision ?? 0,
+      );
+      receipt(result);
+      return succeeded(result) ? 0 : 2;
+    }
     if (area === 'native') {
       print(
         { profiles: snapshot.nativeProfiles },
@@ -535,7 +635,10 @@ export async function runCli(
                   ? `${profile.id}  ${profile.model}  ${profile.effort}  ${profile.available ? 'available' : profile.reason}  ${profile.qualifiedAt ? `qualified ${profile.qualifiedAt}` : 'qualification pending'}  workspace-write  approval never  network off`
                   : `${profile.id}  ${profile.model}  ${profile.effort}  ${profile.available ? 'available' : profile.reason}`,
           )
-          .join('\n') || 'No native profiles.',
+          .join('\n') +
+          (snapshot.nativeProfiles.some((profile) => profile.id === 'google-acp-v1')
+            ? `\n${googleAcpLabel}`
+            : '') || 'No native profiles.',
       );
       return 0;
     }
@@ -566,7 +669,16 @@ export async function runCli(
       const result = await request(
         'ResolveApproval',
         {
-          binding: { approvalId, taskId, attemptId, generation, action: effect, target, revision },
+          binding: {
+            approvalId,
+            taskId,
+            attemptId,
+            generation,
+            action: effect,
+            target,
+            revision,
+            ...(approval.acpTarget ? { acpTarget: approval.acpTarget } : {}),
+          },
           decision: action === 'approve' ? 'approved' : 'denied',
         },
         task.revision,
@@ -746,6 +858,93 @@ export async function runCli(
         throw new Error('Use task prepare-repository for repository work.');
       if (!profile?.available)
         throw new Error(`Native profile unavailable: ${profile?.reason ?? 'not-found'}.`);
+      const acp = profile.family === 'google' && profile.id === 'google-acp-v1';
+      if (
+        !acp &&
+        (values['model-id'] !== undefined ||
+          values['thought-level-id'] !== undefined ||
+          values['confirm-quota-account'])
+      )
+        throw new Error('These configuration choices require the Google ACP profile.');
+      if (acp) {
+        const setup = snapshot.googleAcpSetup;
+        const configuration = profile.configOptions;
+        const saved = snapshot.nativeRuns.find(
+          (value) => value.runId === task.runId && value.profileId === profile.id,
+        );
+        const explicit = !!values['native-trust'] && !!values['source-consent'];
+        const modelId = values['model-id'] ?? (!explicit ? saved?.acp?.modelId : undefined);
+        const thoughtLevelId =
+          values['thought-level-id'] ?? (!explicit ? saved?.acp?.thoughtLevelId : null);
+        const policy = PolicySchema.parse(readJson(values.policy as string));
+        const savedAttestation =
+          !explicit &&
+          saved?.billingAttestation &&
+          'quotaAccountConfirmed' in saved.billingAttestation
+            ? saved.billingAttestation
+            : undefined;
+        const attestation =
+          values['confirm-subscription-only'] && values['confirm-quota-account']
+            ? {
+                source: 'user-attested',
+                subscriptionLoginConfirmed: true,
+                paidExtraUsageDisabled: true,
+                quotaAccountConfirmed: true,
+              }
+            : savedAttestation;
+        if (
+          setup?.state !== 'ready' ||
+          !setup.proofId ||
+          !configuration ||
+          !modelId ||
+          !configuration.model.supported.includes(modelId) ||
+          (configuration.thoughtLevel
+            ? !thoughtLevelId || !configuration.thoughtLevel.supported.includes(thoughtLevelId)
+            : thoughtLevelId !== null)
+        )
+          throw new Error('Choose advertised model and thought-level IDs from ready Google setup.');
+        if (
+          !explicit &&
+          (!saved?.acp ||
+            saved.acp.proofId !== setup.proofId ||
+            saved.acp.modelId !== modelId ||
+            saved.acp.thoughtLevelId !== thoughtLevelId)
+        )
+          throw new Error('Saved consent requires the exact retained proof and configuration.');
+        if (!attestation)
+          throw new Error(
+            'Confirm subscription-only billing and that quota and ACP use the same Google account.',
+          );
+        if (
+          policy.authority === 'autopilot' ||
+          values['existing-credits'] ||
+          handoffTargets ||
+          (values['permission-mode'] !== undefined &&
+            values['permission-mode'] !== 'request-review')
+        )
+          throw new Error(
+            'Google ACP requires guided or balanced authority, ordinary billing and request-review, with no handoff.',
+          );
+        return await finishAction(
+          await request(
+            'PrepareNativeRun',
+            {
+              taskId: task.id,
+              profileId: profile.id,
+              targetPath: extra[1],
+              policy,
+              creditPolicy: 'ordinary',
+              consent: explicit ? 'explicit' : 'saved',
+              proofId: setup.proofId,
+              modelId,
+              thoughtLevelId,
+              billingAttestation: attestation,
+              permissionMode: 'request-review',
+            },
+            task.revision,
+          ),
+        );
+      }
       const creditPolicy = values['existing-credits'] ? 'existing-credits' : 'ordinary';
       if (!profile.creditPolicies.some((value) => value === creditPolicy))
         throw new Error('This profile does not support the selected credit policy.');
@@ -843,6 +1042,9 @@ export async function runCli(
       );
     }
     if (action === 'show') {
+      const approvals = snapshot.approvals.filter(
+        (value) => value.taskId === task.id && value.status === 'pending',
+      );
       const nativeRun = snapshot.nativeRuns.find((value) => value.runId === task.runId);
       const run = nativeRun
         ? snapshot.runs.find((value) => value.id === nativeRun.runId)
@@ -929,31 +1131,50 @@ export async function runCli(
         {
           cursor: snapshot.cursor,
           task,
+          approvals,
           ...(nativeRun ? { nativeRun, run } : {}),
           ...(evaluation ? { evaluation, evidence } : {}),
         },
-        `${task.id}\n${task.title}\n${task.state}, revision ${task.revision}${preview}${handoffText}${evaluationText}`,
+        terminalText(
+          `${task.id}\n${task.title}\n${task.state}, revision ${task.revision}${task.next ? `\nNext: ${task.next}` : ''}${approvalText(approvals)}${preview}${handoffText}${evaluationText}`,
+        ),
       );
       return 0;
     }
     if (action === 'watch') {
+      const approvals = snapshot.approvals.filter(
+        (value) => value.taskId === task.id && value.status === 'pending',
+      );
       print(
-        { type: 'snapshot', cursor: snapshot.cursor, task },
-        `${snapshot.cursor} ${task.state}, revision ${task.revision}`,
+        { type: 'snapshot', cursor: snapshot.cursor, task, approvals },
+        terminalText(
+          `${snapshot.cursor} ${task.state}, revision ${task.revision}${task.next ? `\nNext: ${task.next}` : ''}${approvalText(approvals)}`,
+        ),
       );
       const unsubscribe = await client.subscribe(
         snapshot.cursor,
         (event) => {
           if (event.taskId === task.id)
-            print(event, `${event.cursor} ${event.type}, revision ${event.revision}`);
+            print(
+              event,
+              terminalText(
+                `${event.cursor} ${event.type}, revision ${event.revision}${event.type === 'approval.requested' ? approvalText([event.payload]) : event.type === 'task.updated' && event.payload.next ? `\nNext: ${event.payload.next}` : ''}`,
+              ),
+            );
         },
         (fresh) => {
           const current = fresh.tasks.find((item) => item.id === task.id);
-          if (current)
-            print(
-              { type: 'snapshot', cursor: fresh.cursor, task: current },
-              `${fresh.cursor} ${current.state}, revision ${current.revision}`,
+          if (current) {
+            const approvals = fresh.approvals.filter(
+              (value) => value.taskId === current.id && value.status === 'pending',
             );
+            print(
+              { type: 'snapshot', cursor: fresh.cursor, task: current, approvals },
+              terminalText(
+                `${fresh.cursor} ${current.state}, revision ${current.revision}${current.next ? `\nNext: ${current.next}` : ''}${approvalText(approvals)}`,
+              ),
+            );
+          }
         },
       );
       const stopConnection = client.onConnection((state) => {
@@ -1003,6 +1224,15 @@ export async function runCli(
   } finally {
     client?.close();
   }
+}
+
+function approvalText(approvals: Snapshot['approvals']) {
+  return approvals
+    .map(
+      (approval) =>
+        `\nApproval ${approval.approvalId}: ${approval.action} ${approval.target}\n${approval.consequence}\nApprove: crewkite task approve ${approval.approvalId}\nDeny: crewkite task deny ${approval.approvalId}`,
+    )
+    .join('');
 }
 
 function readJson(path: string): unknown {

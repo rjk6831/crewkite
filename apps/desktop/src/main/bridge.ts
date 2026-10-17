@@ -28,7 +28,7 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
   let listening = false;
   let busy = false;
   let activeCommand: Command | null = null;
-  let revokingUsage = false;
+  let cancelling = false;
   const receipts = new CommandReceipts(controller.paths.home, controller.paths.profile);
   let connection: DesktopNotice = {
     kind: 'connection',
@@ -176,13 +176,21 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       actor: desktopActor,
     });
     const revokeUsage = command.command === 'ObserveUsage' && command.payload.consent === false;
+    const stopSetup = command.command === 'StopGoogleAcpSetup';
+    const setupCommands = ['InitializeGoogleAcp', 'AuthenticateGoogleAcp', 'DiscoverGoogleAcp'];
+    const matchesSetup =
+      stopSetup &&
+      activeCommand?.key === command.payload.operationId &&
+      setupCommands.includes(activeCommand.command);
+    const cancellation = revokeUsage || stopSetup;
     if (
-      revokingUsage ||
+      cancelling ||
       (busy &&
         !(
-          revokeUsage &&
-          activeCommand?.command === 'ObserveUsage' &&
-          activeCommand.payload.consent !== false
+          (revokeUsage &&
+            activeCommand?.command === 'ObserveUsage' &&
+            activeCommand.payload.consent !== false) ||
+          matchesSetup
         ))
     )
       throw new Error('Wait for the pending desktop command.');
@@ -190,7 +198,7 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       receipts.commands.length &&
       'expectedRevision' in command &&
       command.command !== 'StopRun' &&
-      !revokeUsage
+      !cancellation
     )
       throw new Error('Resolve the uncertain command with exact retry before another change.');
     if (
@@ -207,17 +215,36 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       )
     )
       throw new Error('Retry the existing uncertain quota disable with its exact command key.');
-    if (revokeUsage) revokingUsage = true;
+    if (
+      stopSetup &&
+      receipts.commands.some(
+        (item) =>
+          item.command === 'StopGoogleAcpSetup' &&
+          item.payload.operationId === command.payload.operationId,
+      )
+    )
+      throw new Error('Retry the existing uncertain setup stop with its exact command key.');
+    if (cancellation) cancelling = true;
     else {
       busy = true;
       activeCommand = command;
     }
     try {
+      if (stopSetup) {
+        const setup = (await client?.snapshot())?.googleAcpSetup;
+        assertSender(event, window);
+        if (
+          !setup ||
+          setup.operationId !== command.payload.operationId ||
+          setup.revision !== command.expectedRevision
+        )
+          throw new Error('The setup operation changed. Read its current state before stopping.');
+      }
       const result = await execute(command, () => assertSender(event, window));
       assertSender(event, window);
       return result;
     } finally {
-      if (revokeUsage) revokingUsage = false;
+      if (cancellation) cancelling = false;
       else {
         busy = false;
         activeCommand = null;
@@ -226,7 +253,7 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
   });
   ipcMain.handle('crewkite:pick-project', async (event) => {
     assertSender(event, window);
-    if (busy || revokingUsage || receipts.commands.length)
+    if (busy || cancelling || receipts.commands.length)
       throw new Error('Resolve the pending desktop command first.');
     busy = true;
     try {
@@ -254,7 +281,7 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
   });
   ipcMain.handle('crewkite:retry', async (event) => {
     assertSender(event, window);
-    if (busy || revokingUsage) throw new Error('Wait for the pending desktop command.');
+    if (busy || cancelling) throw new Error('Wait for the pending desktop command.');
     if (!receipts.commands.length) return null;
     busy = true;
     activeCommand = receipts.commands[0];

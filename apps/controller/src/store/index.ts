@@ -9,6 +9,7 @@ import {
   canonicalJson,
   type Event,
   EventSchema,
+  GoogleAcpSetupSchema,
   NativeReviewJobSchema,
   type Route,
   type Run,
@@ -67,6 +68,7 @@ export type NativeProcess = {
     | 'metadata-preparation'
     | 'app-server-task'
     | 'google-config'
+    | 'google-acp-task'
     | 'auth-status'
     | 'native-task';
   state: 'intent' | 'owned' | 'quiescent';
@@ -81,20 +83,25 @@ export function nativePhaseSequence(
   family: Route['family'],
   phases: readonly NativeProcess['phase'][],
   complete = false,
+  profileId?: string,
 ): boolean {
   const sequences: NativeProcess['phase'][][] =
-    family === 'openai'
-      ? [
-          ['effective-features', 'metadata-preparation', 'app-server-task'],
-          ...(complete
-            ? []
-            : [['effective-features', 'app-server-task'] as NativeProcess['phase'][]]),
-        ]
-      : family === 'anthropic'
-        ? [['auth-status', 'native-task']]
-        : family === 'google'
-          ? [['google-config', 'native-task']]
-          : [];
+    profileId === 'google-acp-v1'
+      ? family === 'google'
+        ? [['google-acp-task']]
+        : []
+      : family === 'openai'
+        ? [
+            ['effective-features', 'metadata-preparation', 'app-server-task'],
+            ...(complete
+              ? []
+              : [['effective-features', 'app-server-task'] as NativeProcess['phase'][]]),
+          ]
+        : family === 'anthropic'
+          ? [['auth-status', 'native-task']]
+          : family === 'google'
+            ? [['google-config', 'native-task']]
+            : [];
   return sequences.some(
     (sequence) =>
       phases.length <= sequence.length &&
@@ -261,6 +268,57 @@ export class Store {
       .get('google') as GoogleUsageReader;
   }
 
+  googleAcpSetup(): ReturnType<typeof GoogleAcpSetupSchema.parse> {
+    const row = this.db
+      .prepare("SELECT body FROM google_acp_setup WHERE profile_id='google-acp-v1'")
+      .get();
+    return GoogleAcpSetupSchema.parse(
+      row
+        ? JSON.parse(row.body as string)
+        : {
+            profileId: 'google-acp-v1',
+            revision: 0,
+            state: 'uninitialized',
+            operationId: null,
+            proofId: null,
+            client: null,
+            auth: { method: null, status: 'unknown' },
+            reason: null,
+          },
+    );
+  }
+
+  putGoogleAcpSetup(input: ReturnType<typeof GoogleAcpSetupSchema.parse>) {
+    this.metadataWrite();
+    const setup = GoogleAcpSetupSchema.parse(input);
+    this.db
+      .prepare(
+        "INSERT INTO google_acp_setup(profile_id,revision,body) VALUES ('google-acp-v1',?,?) ON CONFLICT(profile_id) DO UPDATE SET revision=excluded.revision,body=excluded.body",
+      )
+      .run(setup.revision, canonicalJson(setup));
+  }
+
+  nativeProfileId(attemptId: string): 'google-acp-v1' | undefined {
+    return this.db
+      .prepare('SELECT profile_id FROM native_profile_bindings WHERE attempt_id=?')
+      .get(attemptId)?.profile_id as 'google-acp-v1' | undefined;
+  }
+
+  bindNativeProfile(attemptId: string, profileId: 'google-acp-v1') {
+    this.metadataWrite();
+    const intent = this.intents().find((row) => row.attempt_id === attemptId);
+    if (
+      profileId !== 'google-acp-v1' ||
+      !intent ||
+      this.get<Route>('route', intent.route_id)?.family !== 'google' ||
+      this.get<Route>('route', intent.route_id)?.fake
+    )
+      throw new Error('Native profile binding is invalid.');
+    this.db
+      .prepare('INSERT INTO native_profile_bindings(attempt_id,profile_id) VALUES (?,?)')
+      .run(attemptId, profileId);
+  }
+
   private metadataWrite() {
     if (!this.transactionEvents)
       throw new Error('Metadata ownership writes require a transaction.');
@@ -311,7 +369,11 @@ export class Store {
     );
     if (
       operations.some((row) => row.state === 'unknown') ||
-      writers.some((row) => ['outcome-unknown', 'interrupted'].includes(row.state))
+      writers.some(
+        (row) =>
+          ['outcome-unknown', 'interrupted'].includes(row.state) ||
+          this.get<Attempt>('attempt', row.attempt_id)?.state === 'unknown',
+      )
     )
       return 'google-ownership-unknown';
     if (operations.length || writers.length) return 'google-operation-active';
@@ -389,6 +451,8 @@ export class Store {
       !nativePhaseSequence(
         route.family,
         rows.map((row) => row.phase),
+        false,
+        this.nativeProfileId(attemptId),
       )
     )
       throw new Error('Native process sequence is invalid.');
@@ -411,6 +475,7 @@ export class Store {
         route.family,
         phases.map((phase) => phase.phase),
         true,
+        this.nativeProfileId(attemptId),
       ) &&
       phases.every((phase) => phase.state === 'quiescent')
     );
@@ -471,7 +536,12 @@ export class Store {
       route.fake ||
       (reviewing && route.family !== 'openai') ||
       sequence !== previous.length ||
-      !nativePhaseSequence(route.family, [...previous.map((row) => row.phase), phase]) ||
+      !nativePhaseSequence(
+        route.family,
+        [...previous.map((row) => row.phase), phase],
+        false,
+        this.nativeProfileId(attemptId),
+      ) ||
       previous.some((row) => row.state !== 'quiescent')
     )
       throw new Error('Native phase requires its preceding process to be quiescent.');

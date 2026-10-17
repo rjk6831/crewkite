@@ -10,6 +10,7 @@ import { serve } from './server/index.ts';
 
 export async function startController(options: ControllerOptions) {
   const controller = new Controller({
+    registerGoogleAcp: !options.nativeProfile && !options.nativeProfiles,
     nativeProfiles: options.nativeProfile
       ? undefined
       : () => [

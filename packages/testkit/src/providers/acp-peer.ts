@@ -1,0 +1,310 @@
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { createInterface } from 'node:readline';
+
+export const acpPeerCases = [
+  'complete',
+  'session-update',
+  'permission',
+  'permanent',
+  'ambiguous',
+  'changed-action',
+  'bad-action',
+  'large-action',
+  'cancel',
+  'cancel-permission',
+  'cancel-late',
+  'eof-cancel',
+  'bad-ack',
+  'model-ack-drift',
+  'mode-ack-drift',
+  'lost-mode-ack',
+  'corrected-model-ack',
+  'corrected-mode-ack',
+  'missing-mode',
+  'missing-thought',
+  'drift',
+  'bad-version',
+  'bad-frame',
+  'duplicate',
+  'descendant',
+  'no-close',
+  'usage-refusal',
+] as const;
+export type AcpPeerCase = (typeof acpPeerCases)[number];
+
+/** Each transition follows a received message; the peer uses no clock or network. */
+export function runAcpPeer(scenario: AcpPeerCase) {
+  assert(acpPeerCases.includes(scenario));
+  let cwd = '',
+    promptId: string | number | undefined,
+    submitted = false;
+  const config = [
+    {
+      id: 'model-slot',
+      name: 'Model',
+      category: 'model',
+      type: 'select',
+      currentValue: 'fixture-model',
+      options: [
+        { value: 'fixture-model', name: 'Model' },
+        { value: 'fixture-other', name: 'Other' },
+      ],
+    },
+    ...(scenario === 'missing-thought'
+      ? []
+      : [
+          {
+            id: 'thought-slot',
+            name: 'Thought',
+            category: 'thought_level',
+            type: 'select',
+            currentValue: 'fixture-low',
+            options: [{ value: 'fixture-low', name: 'Low' }],
+          },
+        ]),
+    ...(scenario === 'missing-mode'
+      ? []
+      : [
+          {
+            id: 'mode-slot',
+            name: 'Mode',
+            category: 'mode',
+            type: 'select',
+            currentValue: 'fixture-open',
+            options: [
+              { value: 'fixture-review', name: 'Review' },
+              { value: 'fixture-open', name: 'Open' },
+            ],
+          },
+        ]),
+  ];
+  function emit(value: object) {
+    const line = `${JSON.stringify(value)}\n`;
+    process.stdout.write(line.slice(0, 11));
+    process.stdout.write(line.slice(11));
+  }
+  const result = (id: string | number, value: object) =>
+    emit({ jsonrpc: '2.0', id, result: value });
+  const update = (value: object) =>
+    emit({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: { sessionId: 'fixture-session', update: value },
+    });
+  function terminal(stopReason: string) {
+    assert(promptId !== undefined);
+    result(promptId, { stopReason });
+  }
+  const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
+  input.on('line', (line) => {
+    try {
+      const message = JSON.parse(line);
+      if (message.method === 'initialize') {
+        assert.deepEqual(message.params.clientCapabilities, {
+          fs: { readTextFile: false, writeTextFile: false },
+          terminal: false,
+        });
+        if (scenario === 'bad-frame') {
+          process.stdout.write(Buffer.from([255, 10]));
+          return;
+        }
+        result(message.id, {
+          protocolVersion: scenario === 'bad-version' ? 2 : 1,
+          agentInfo: { name: 'fixture', version: '1.4.0' },
+          agentCapabilities: { sessionCapabilities: scenario === 'no-close' ? {} : { close: {} } },
+          authMethods: [{ id: 'oauth-personal', name: 'Personal' }],
+        });
+      } else if (message.method === 'authenticate') {
+        assert.equal(message.params.methodId, 'oauth-personal');
+        result(message.id, {});
+      } else if (message.method === 'session/new') {
+        cwd = message.params.cwd;
+        assert(Array.isArray(message.params.mcpServers));
+        for (const server of message.params.mcpServers) {
+          assert.deepEqual(server.env, []);
+          assert(!Object.hasOwn(server, 'cwd'));
+        }
+        if (scenario === 'session-update') {
+          process.stdout.write(
+            `${JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId: 'fixture-session', configOptions: config } })}\n${JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'fixture-session', update: { sessionUpdate: 'available_commands_update', availableCommands: [] } } })}\n`,
+          );
+        } else result(message.id, { sessionId: 'fixture-session', configOptions: config });
+      } else if (message.method === 'session/set_config_option') {
+        const option = config.find((v) => v.id === message.params.configId);
+        assert(option);
+        assert(option.options.some((v) => v.value === message.params.value));
+        option.currentValue =
+          scenario === 'bad-ack' && option.id === 'model-slot'
+            ? 'fixture-other'
+            : message.params.value;
+        if (
+          (scenario === 'corrected-model-ack' && option.id === 'model-slot') ||
+          (scenario === 'corrected-mode-ack' && option.id === 'mode-slot')
+        ) {
+          const bad = structuredClone(config);
+          const changed = bad.find((v) => v.id === option.id);
+          assert(changed);
+          changed.currentValue = option.id === 'model-slot' ? 'fixture-other' : 'fixture-open';
+          const ack = { jsonrpc: '2.0', id: message.id, result: { configOptions: bad } };
+          const corrected = {
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'fixture-session',
+              update: { sessionUpdate: 'config_option_update', configOptions: config },
+            },
+          };
+          process.stdout.write(`${JSON.stringify(ack)}\n${JSON.stringify(corrected)}\n`);
+        } else if (
+          (scenario === 'model-ack-drift' && option.id === 'model-slot') ||
+          (scenario === 'mode-ack-drift' && option.id === 'mode-slot')
+        ) {
+          const ack = {
+            jsonrpc: '2.0',
+            id: message.id,
+            result: { configOptions: structuredClone(config) },
+          };
+          config[0].currentValue = 'fixture-other';
+          const drift = {
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'fixture-session',
+              update: { sessionUpdate: 'config_option_update', configOptions: config },
+            },
+          };
+          process.stdout.write(`${JSON.stringify(ack)}\n${JSON.stringify(drift)}\n`);
+        } else
+          result(message.id, {
+            configOptions:
+              scenario === 'lost-mode-ack' && option.id === 'model-slot'
+                ? config.filter((v) => v.id !== 'mode-slot')
+                : config,
+          });
+      } else if (message.method === 'session/prompt') {
+        assert(!submitted);
+        submitted = true;
+        promptId = message.id;
+        assert.equal(config.find((v) => v.id === 'mode-slot')?.currentValue, 'fixture-review');
+        update({
+          sessionUpdate: 'usage_update',
+          used: 12,
+          size: 1024,
+          cost: { amount: 1, currency: 'USD' },
+        });
+        update({
+          sessionUpdate: 'agent_thought_chunk',
+          content: { type: 'text', text: 'private thought fixture' },
+        });
+        if (scenario === 'drift') {
+          config[0].currentValue = 'fixture-other';
+          update({ sessionUpdate: 'config_option_update', configOptions: config });
+        } else if (
+          [
+            'permission',
+            'permanent',
+            'ambiguous',
+            'changed-action',
+            'bad-action',
+            'large-action',
+            'cancel-permission',
+          ].includes(scenario)
+        ) {
+          const rawInput = {
+            path: join(cwd, 'net.mjs'),
+            oldText: 'export const total = 0;\n',
+            newText: scenario === 'large-action' ? 'x'.repeat(4096) : 'export const total = 1;\n',
+            ...(scenario === 'bad-action' ? { command: 'hidden effect' } : {}),
+          };
+          update({
+            sessionUpdate: 'tool_call',
+            toolCallId: 'fixture-tool',
+            name: 'fixture-replace',
+            kind: 'edit',
+            status: 'pending',
+            rawInput,
+          });
+          emit({
+            jsonrpc: '2.0',
+            id: 'permission-1',
+            method: 'session/request_permission',
+            params: {
+              sessionId: 'fixture-session',
+              toolCall: { toolCallId: 'fixture-tool' },
+              options: [
+                {
+                  optionId: 'once',
+                  name: 'Once',
+                  kind: scenario === 'permanent' ? 'allow_always' : 'allow_once',
+                },
+                ...(scenario === 'ambiguous'
+                  ? [{ optionId: 'other', name: 'Other', kind: 'allow_once' }]
+                  : []),
+                { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
+              ],
+            },
+          });
+          if (scenario === 'changed-action')
+            update({
+              sessionUpdate: 'tool_call_update',
+              toolCallId: 'fixture-tool',
+              rawInput: { ...rawInput, newText: 'changed' },
+            });
+        } else if (['cancel', 'cancel-late', 'eof-cancel'].includes(scenario)) {
+          update({
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'fixture-ready-to-cancel' },
+          });
+        } else if (scenario === 'usage-refusal') terminal('refusal');
+        else {
+          writeFileSync(join(cwd, 'net.mjs'), 'export const total = 1;\n');
+          terminal('end_turn');
+          if (scenario === 'duplicate') terminal('end_turn');
+          if (scenario === 'descendant') {
+            const child = spawn(
+              process.execPath,
+              [
+                '-e',
+                'const {MessageChannel}=require("node:worker_threads");const p=new MessageChannel();p.port1.on("message",()=>{});process.on("SIGTERM",()=>{});',
+              ],
+              { stdio: 'inherit' },
+            );
+            child.unref();
+          }
+        }
+      } else if (message.method === 'session/cancel') {
+        if (scenario === 'eof-cancel') {
+          process.stdin.destroy();
+          input.close();
+          return;
+        }
+        if (scenario === 'cancel-late')
+          update({
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'late inert output' },
+          });
+        terminal('cancelled');
+      } else if (message.method === 'session/close') result(message.id, {});
+      else if (message.id === 'permission-1') {
+        if (message.result?.outcome?.outcome === 'selected') {
+          assert.equal(message.result.outcome.optionId, 'once');
+          writeFileSync(join(cwd, 'net.mjs'), 'export const total = 1;\n');
+          update({
+            sessionUpdate: 'tool_call_update',
+            toolCallId: 'fixture-tool',
+            status: 'completed',
+          });
+          terminal('end_turn');
+        } else assert.equal(message.result?.outcome?.outcome, 'cancelled');
+      } else throw Error('Unsupported fixture request.');
+    } catch {
+      process.exitCode = 2;
+      process.stdin.destroy();
+      input.close();
+    }
+  });
+  input.once('close', () => process.stdin.destroy());
+}

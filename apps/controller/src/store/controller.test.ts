@@ -31,6 +31,7 @@ import {
   type CommandResult,
   CommandSchema,
   canonicalJson,
+  GoogleAcpProfileSchema,
   GoogleNativeProfileSchema,
   LocalNativeProfileSchema,
   NativeRepositoryProfileSchema,
@@ -71,6 +72,7 @@ import { refValue } from '../host/publication.ts';
 import { committedFiles, git, inspectSource, materialize, readFiles } from '../host/source.ts';
 import { closedWithin, groupAbsent } from '../host/worker.ts';
 import { replacementFixture as anthropicFixture } from '../providers/anthropic/replacement-fixture.ts';
+import { type AcpSetupProof, acpClientPin } from '../providers/google/acp/profile.ts';
 import { replacementFixture as googleFixture } from '../providers/google/replacement-fixture.ts';
 import {
   type NativeProfileResolution,
@@ -3717,13 +3719,14 @@ test('an appointed native proposal is retained and applied once after every phas
         ),
       );
       controller.store.db.exec(
-        'INSERT INTO native_processes SELECT * FROM native_processes_saved; DROP TABLE native_processes_saved; DROP TABLE google_metadata_operations; DROP TABLE google_usage_reader; PRAGMA user_version=4',
+        'INSERT INTO native_processes SELECT * FROM native_processes_saved; DROP TABLE native_processes_saved; DROP TABLE google_metadata_operations; DROP TABLE google_usage_reader; DROP TABLE native_profile_bindings; DROP TABLE google_acp_setup; PRAGMA user_version=4',
       );
       controller.store.applyMigrations(new URL('../../migrations/', import.meta.url).pathname);
       assert.deepEqual(controller.store.nativeProcesses(attempt.attempt_id), previous);
-      assert.equal(controller.store.db.prepare('PRAGMA user_version').get()?.user_version, 7);
+      assert.equal(controller.store.db.prepare('PRAGMA user_version').get()?.user_version, 8);
       assert.equal(controller.store.googleUsageReader().enabled, 0);
       assert.deepEqual(controller.store.googleMetadataOperations(), []);
+      assert.equal(controller.store.googleAcpSetup().state, 'uninitialized');
     }
 
     assert(
@@ -4600,6 +4603,7 @@ test('an appointed native proposal is retained and applied once after every phas
           'revoked-consent',
           'changed-check',
           'changed-profile',
+          'review-budget',
         ]) {
           if (boundary === 'used-grant')
             controller.store.transaction(() =>
@@ -4622,6 +4626,19 @@ test('an appointed native proposal is retained and applied once after every phas
             );
           if (boundary === 'changed-profile')
             context.fixtureProfile.facts.creditPolicies = ['existing-credits'];
+          const charged = controller.store.intents()[0];
+          if (boundary === 'review-budget')
+            controller.store.transaction(() =>
+              controller.store.db
+                .prepare('UPDATE launch_intents SET admitted_at=? WHERE attempt_id=?')
+                .run(
+                  new Date(
+                    Date.parse(charged.finished_at as string) -
+                      run.policy.policy.limits.minutes * 60000,
+                  ).toISOString(),
+                  charged.attempt_id,
+                ),
+            );
           const before = controller.snapshot();
           assert.equal(before.candidateEvaluations[0]?.reviewStart.available, false);
           assert.equal(
@@ -4632,7 +4649,9 @@ test('an appointed native proposal is retained and applied once after every phas
                 ? 'consent-unavailable'
                 : boundary === 'changed-profile'
                   ? 'profile-unavailable'
-                  : 'checks-required',
+                  : boundary === 'review-budget'
+                    ? 'budget-exhausted'
+                    : 'checks-required',
           );
           assert.equal(
             (
@@ -4668,6 +4687,12 @@ test('an appointed native proposal is retained and applied once after every phas
             );
           if (boundary === 'changed-profile')
             context.fixtureProfile.facts.creditPolicies = ['ordinary', 'existing-credits'];
+          if (boundary === 'review-budget')
+            controller.store.transaction(() =>
+              controller.store.db
+                .prepare('UPDATE launch_intents SET admitted_at=? WHERE attempt_id=?')
+                .run(charged.admitted_at, charged.attempt_id),
+            );
         }
       }
       let reviewReplay: Promise<unknown> | undefined;
@@ -6095,4 +6120,475 @@ test('google quota authority survives retries and restart while sharing one oper
     'google-ownership-unknown',
   );
   assert.equal(launches, beforeRecovery);
+});
+
+test('an acp scratch permission binds one live action and crash recovery cannot invent completion', async (t) => {
+  for (const row of ['approved', 'denied', 'stop', 'eof', 'preflight'] as const) {
+    const scenario =
+      row === 'eof' ? 'eof-cancel' : row === 'stop' ? 'cancel-permission' : 'permission';
+    const fixtureHome = mkdtempSync(resolve('internal/acp-controller-'));
+    t.after(() => rmSync(fixtureHome, { recursive: true, force: true }));
+    const executable = join(fixtureHome, 'peer');
+    const peer = new URL('../../../../packages/testkit/src/providers/acp-peer.ts', import.meta.url)
+      .href;
+    writeFileSync(
+      executable,
+      `#!${process.execPath}\nimport {runAcpPeer} from ${JSON.stringify(peer)};runAcpPeer(${JSON.stringify(scenario)});\n`,
+      { mode: 0o500 },
+    );
+    const client = {
+      executable,
+      version: '1.4.0' as const,
+      signerTeamId: 'TESTTEAM01',
+      sha256: createHash('sha256').update(readFileSync(executable)).digest('hex'),
+    };
+    const mapping = {
+      client: acpClientPin(client),
+      surface: 'config' as const,
+      configId: 'mode-slot',
+      valueId: 'fixture-review',
+      semantics: 'request-review' as const,
+      evidenceHash: 'e'.repeat(64),
+    };
+    let liveController: Controller | undefined;
+    let interruptSetup = false;
+    let setupStop: Promise<CommandResult> | undefined;
+    const options: Partial<ControllerOptions> = {
+      nativeProfiles: () => [],
+      googleAcp: {
+        reviewMappings: [mapping],
+        toolMappings: [
+          {
+            client: acpClientPin(client),
+            toolName: 'fixture-replace',
+            schema: 'replace-target-v1',
+            evidenceHash: 'f'.repeat(64),
+          },
+        ],
+        spawn: (...args) => {
+          const child = spawn(...args);
+          if (interruptSetup) {
+            interruptSetup = false;
+            queueMicrotask(() => {
+              const current = liveController?.store.googleAcpSetup();
+              assert(current?.operationId);
+              setupStop = liveController?.execute(
+                CommandSchema.parse({
+                  protocol: 1,
+                  key: liveController.id('cmd'),
+                  actor: { id: 'terminal', kind: 'cli' },
+                  command: 'StopGoogleAcpSetup',
+                  expectedRevision: current.revision,
+                  payload: { profileId: 'google-acp-v1', operationId: current.operationId },
+                }),
+                'local-owner',
+              );
+            });
+          }
+          return child;
+        },
+        resolve: (proof: AcpSetupProof | null) => {
+          const config = proof?.configOptions ?? null;
+          const available = !!proof?.reviewMode && proof.auth.status === 'authenticated';
+          return {
+            client,
+            environment: { HOME: userInfo().homedir, PATH: process.env.PATH },
+            facts: GoogleAcpProfileSchema.parse({
+              id: 'google-acp-v1',
+              family: 'google',
+              displayName: 'Google ACP single-file proposal',
+              clientVersion: '1.4.0',
+              model: config?.model.currentValue ?? 'unknown',
+              effort: config?.thoughtLevel?.currentValue ?? 'unknown',
+              effortSupported: config?.thoughtLevel?.supported ?? [],
+              effectiveEffort: 'unknown',
+              accountClass: 'unknown',
+              serviceTier: 'unknown',
+              billingBasis: 'requires-user-attestation',
+              qualifiedAt: null,
+              creditPolicies: ['ordinary'],
+              permissionModes: ['request-review'],
+              maximumTaskMs: 300000,
+              maximumFileBytes: 65536,
+              maximumSubmissions: 1,
+              available,
+              reason: available ? 'qualification-pending' : 'acp-capability-missing',
+              configOptions: config,
+              capabilities: proof?.capabilities ?? null,
+            }),
+          };
+        },
+      },
+    };
+    const context = await setup(t, options);
+    let controller = context.controller;
+    liveController = controller;
+    const { command, source, fixtures, clock, id } = context;
+    const original = 'export const total = 0;\n';
+    writeFileSync(join(source.directory, 'net.mjs'), original);
+    git(source.directory, ['add', 'net.mjs']);
+    git(source.directory, [
+      '-c',
+      'user.name=Fixture',
+      '-c',
+      'user.email=fixture@example.test',
+      'commit',
+      '-m',
+      'fixture target',
+    ]);
+    if (row === 'stop') {
+      interruptSetup = true;
+      const firstSetup = command(
+        'InitializeGoogleAcp',
+        { profileId: 'google-acp-v1', consent: 'explicit' },
+        controller.store.googleAcpSetup().revision,
+      );
+      assert.equal(
+        (await controller.execute(firstSetup, 'local-owner')).reason,
+        'acp-setup-stopped',
+      );
+      assert.equal((await setupStop)?.outcome, 'applied');
+      assert.equal(controller.store.googleAcpSetup().state, 'blocked');
+      assert.equal(controller.store.googleMetadataOperations().at(-1)?.state, 'quiescent');
+      assert.equal(
+        (await controller.execute(firstSetup, 'local-owner')).reason,
+        'acp-setup-stopped',
+      );
+    }
+    for (const name of ['InitializeGoogleAcp', 'AuthenticateGoogleAcp', 'DiscoverGoogleAcp']) {
+      const setup = controller.store.googleAcpSetup();
+      const input = command(
+        name,
+        {
+          profileId: 'google-acp-v1',
+          consent: 'explicit',
+          ...(name === 'InitializeGoogleAcp' ? {} : { proofId: setup.proofId }),
+          ...(name === 'AuthenticateGoogleAcp' ? { method: 'oauth-personal' } : {}),
+        },
+        setup.revision,
+      );
+      const first = controller.execute(input, 'local-owner');
+      const retry = controller.execute(input, 'local-owner');
+      assert.deepEqual(await first, await retry);
+      assert.equal((await first).outcome, 'applied', canonicalJson(await first));
+      assert.equal((await controller.execute(input, 'local-owner')).outcome, 'already-applied');
+    }
+    assert.equal(controller.store.googleAcpSetup().state, 'ready');
+    assert.equal(controller.store.googleMetadataOperations().length, row === 'stop' ? 4 : 3);
+    assert(controller.store.googleMetadataOperations().every((row) => row.state === 'quiescent'));
+    const task = TaskSchema.parse((await controller.execute(context.draft, 'local-owner')).entity);
+    const policy = {
+      ...fixtures.policy,
+      quality: 'quick',
+      methods: [{ id: 'keep-it-simple', cycles: 1, reviewerRole: 'reviewer' }],
+      reserves: [],
+      limits: { attempts: 4, minutes: 5, concurrency: 1 },
+      effects: fixtures.policy.effects.map((grant) => ({ ...grant, taskId: task.id })),
+    };
+    const prepared = await controller.execute(
+      command(
+        'PrepareNativeRun',
+        {
+          taskId: task.id,
+          profileId: 'google-acp-v1',
+          proofId: controller.store.googleAcpSetup().proofId,
+          modelId: 'fixture-model',
+          thoughtLevelId: 'fixture-low',
+          targetPath: 'net.mjs',
+          consent: 'explicit',
+          permissionMode: 'request-review',
+          billingAttestation: {
+            source: 'user-attested',
+            subscriptionLoginConfirmed: true,
+            paidExtraUsageDisabled: true,
+            quotaAccountConfirmed: true,
+          },
+          policy,
+        },
+        task.revision,
+      ),
+      'local-owner',
+    );
+    assert.equal(prepared.outcome, 'applied', canonicalJson(prepared));
+    const run = RunSchema.parse(prepared.entity);
+    const start = () =>
+      command('StartRun', { taskId: task.id, runId: run.id }, taskRevision(controller, task.id));
+    assert.equal((await controller.execute(start(), 'local-owner')).outcome, 'blocked');
+    assert.equal(controller.store.intents().length, 0);
+    controller.store.transaction(() => {
+      controller.store.setGoogleUsageConsent(true);
+      controller.store.recordGoogleUsageObservation(clock.now());
+      const observation = {
+        routeId: run.roles[0].routeId,
+        windowId: 'quota',
+        kind: 'weekly',
+        remaining: { value: 80, unit: 'percent' },
+        resetsAt: new Date(Date.parse(clock.now()) + 3600000).toISOString(),
+        observedAt: clock.now(),
+        source: 'client',
+        confidence: 'reported',
+      };
+      controller.store.put('window', `${run.roles[0].routeId}/quota`, 0, observation);
+    });
+    if (row === 'preflight') {
+      const input = start();
+      const pending = controller.execute(input, 'local-owner');
+      assert.equal(
+        (
+          await controller.execute(
+            command(
+              'StopRun',
+              { taskId: task.id, runId: run.id },
+              taskRevision(controller, task.id),
+            ),
+            'local-owner',
+          )
+        ).outcome,
+        'applied',
+      );
+      const refused = await pending;
+      assert.notEqual(refused.outcome, 'applied');
+      assert.deepEqual(await controller.execute(input, 'local-owner'), refused);
+      assert.equal(
+        (
+          await controller.execute(
+            { ...input, payload: { taskId: task.id, runId: id('run') } },
+            'local-owner',
+          )
+        ).reason,
+        'idempotency-key-reused',
+      );
+      assert.equal(controller.store.intents().length, 0);
+      assert.equal(controller.store.receipt(input.key)?.hash, hashCanonical(input));
+      await controller.close();
+      continue;
+    }
+    const permission = Promise.withResolvers<Approval>();
+    const readyToCancel = Promise.withResolvers<void>();
+    const off = controller.subscribe((event) => {
+      if (event.type === 'approval.requested') permission.resolve(event.payload);
+      if (event.type === 'attempt.output' && event.payload.text === 'fixture-ready-to-cancel')
+        readyToCancel.resolve();
+    });
+    t.after(off);
+    const input = start();
+    const first = controller.execute(input, 'local-owner');
+    const retry = controller.execute(input, 'local-owner');
+    assert.equal(
+      (
+        await controller.execute(
+          command(
+            'StopRun',
+            { taskId: task.id, runId: id('run') },
+            taskRevision(controller, task.id),
+          ),
+          'local-owner',
+        )
+      ).reason,
+      'run-not-current',
+    );
+    assert.equal((await controller.execute(start(), 'local-owner')).reason, 'acp-start-preparing');
+    assert.deepEqual(await first, await retry);
+    assert.equal((await first).outcome, 'applied', canonicalJson(await first));
+    if (row === 'eof') {
+      await nativeWait('acp cancellation readiness', readyToCancel.promise);
+      const terminal = Promise.withResolvers<void>();
+      const offUnknown = controller.subscribe((event) => {
+        if (event.type === 'task.updated' && event.payload.state === 'unknown') terminal.resolve();
+      });
+      t.after(offUnknown);
+      assert.equal(
+        (
+          await controller.execute(
+            command(
+              'StopRun',
+              { taskId: task.id, runId: run.id },
+              taskRevision(controller, task.id),
+            ),
+            'local-owner',
+          )
+        ).outcome,
+        'applied',
+      );
+      await nativeWait('acp eof ownership', terminal.promise);
+      const attemptId = controller.store.intents()[0].attempt_id;
+      assert.equal(controller.store.get<Attempt>('attempt', attemptId)?.state, 'unknown');
+      assert.equal(controller.store.receipt(`native-acp-terminal:${attemptId}`), undefined);
+      await controller.close();
+      controller = new Controller({
+        ...options,
+        home: context.controller.home,
+        now: clock.now,
+        id,
+      });
+      assert.equal(controller.store.get<Attempt>('attempt', attemptId)?.state, 'unknown');
+      assert.equal(
+        controller.store.transaction(() =>
+          controller.store.googleStartBlocker(run.roles[0].routeId),
+        ),
+        'google-ownership-unknown',
+      );
+      await controller.close();
+      continue;
+    }
+    const approval = await nativeWait('acp permission', permission.promise);
+    assert.equal(approval.action, 'write-scratch');
+    assert.equal(approval.target, 'net.mjs');
+    assert.equal(approval.acpTarget?.kind, 'allow_once');
+    const action = JSON.parse(approval.consequence);
+    assert.equal(action.oldText, original);
+    assert.equal(action.newText, 'export const total = 1;\n');
+    assert(Buffer.byteLength(approval.consequence) <= 4096);
+    const {
+      requester: _requester,
+      consequence: _consequence,
+      status: _status,
+      ...binding
+    } = approval;
+    const resolveApproval = (value: unknown = binding) =>
+      command(
+        'ResolveApproval',
+        { binding: value, decision: 'approved' },
+        taskRevision(controller, task.id),
+      );
+    assert.equal(
+      (
+        await controller.execute(
+          resolveApproval({
+            ...binding,
+            acpTarget: { ...binding.acpTarget, kind: 'allow_always' },
+          }),
+          'local-owner',
+        )
+      ).outcome,
+      'unsupported',
+    );
+    assert.equal(
+      (
+        await controller.execute(
+          resolveApproval({ ...binding, generation: binding.generation + 1 }),
+          'local-owner',
+        )
+      ).outcome,
+      'denied',
+    );
+    const intent = controller.store.intents()[0];
+    assert.equal(controller.store.nativeProfileId(intent.attempt_id), 'google-acp-v1');
+    assert.deepEqual(
+      controller.store.nativeProcesses(intent.attempt_id).map((phase) => phase.phase),
+      ['google-acp-task'],
+    );
+    writeFileSync(join(intent.scratch_path, 'net.mjs'), 'changed');
+    assert.equal((await controller.execute(resolveApproval(), 'local-owner')).outcome, 'blocked');
+    writeFileSync(join(intent.scratch_path, 'net.mjs'), original);
+    if (row !== 'approved') {
+      const terminal = Promise.withResolvers<void>();
+      const offTerminal = controller.subscribe((event) => {
+        if (
+          event.type === 'task.updated' &&
+          ['interrupted', 'unknown', 'stopped'].includes(event.payload.state)
+        )
+          terminal.resolve();
+      });
+      t.after(offTerminal);
+      const ending =
+        row === 'denied'
+          ? command(
+              'ResolveApproval',
+              { binding, decision: 'denied' },
+              taskRevision(controller, task.id),
+            )
+          : command(
+              'StopRun',
+              { taskId: task.id, runId: run.id },
+              taskRevision(controller, task.id),
+            );
+      assert.equal((await controller.execute(ending, 'local-owner')).outcome, 'applied');
+      await nativeWait(`acp ${row}`, terminal.promise);
+      assert.equal(controller.store.receipt(`native-acp-capture:${intent.attempt_id}`), undefined);
+      await controller.close();
+      controller = new Controller({
+        ...options,
+        home: context.controller.home,
+        now: clock.now,
+        id,
+      });
+      assert.equal(controller.store.get<Attempt>('attempt', intent.attempt_id)?.state, 'stopped');
+      assert.equal(controller.store.intents().length, 1);
+      assert.equal(
+        controller.store.get<Approval>('approval', approval.approvalId)?.status,
+        'denied',
+      );
+      assert.equal(readFileSync(join(source.directory, 'net.mjs'), 'utf8'), original);
+      await controller.close();
+      continue;
+    }
+    const sealed = nativeCandidate(controller);
+    assert.equal((await controller.execute(resolveApproval(), 'local-owner')).outcome, 'applied');
+    await nativeWait('acp capture', sealed);
+    assert.equal(controller.store.intents().length, 1);
+    assert(controller.store.receipt(`native-acp-capture:${intent.attempt_id}`));
+    assert.equal(controller.snapshot().tasks[0].state, 'stopped');
+    assert.equal(readFileSync(join(source.directory, 'net.mjs'), 'utf8'), original);
+    assert.equal(readFileSync(join(intent.scratch_path, 'net.mjs'), 'utf8'), action.newText);
+    assert.equal((await controller.execute(input, 'local-owner')).outcome, 'already-applied');
+    await controller.close();
+    controller = new Controller({ ...options, home: context.controller.home, now: clock.now, id });
+    assert.equal(controller.snapshot().tasks[0].state, 'stopped');
+    assert.equal(controller.store.intents().length, 1);
+    const currentSetup = controller.store.googleAcpSetup();
+    const orphanSetup = command(
+      'InitializeGoogleAcp',
+      { profileId: 'google-acp-v1', consent: 'explicit' },
+      currentSetup.revision,
+    );
+    controller.store.transaction(() => {
+      controller.store.putGoogleAcpSetup({
+        ...currentSetup,
+        revision: currentSetup.revision + 1,
+        state: 'initializing',
+        operationId: orphanSetup.key,
+      });
+      controller.store.beginGoogleMetadata(
+        orphanSetup.key,
+        'acp-initialize',
+        currentSetup.revision + 1,
+        clock.now(),
+      );
+      controller.store.saveReceipt(orphanSetup.key, hashCanonical(orphanSetup), 'local-owner', {
+        outcome: 'outcome-unknown',
+        reason: 'acp-setup-pending',
+      });
+    });
+    assert.equal(
+      (await controller.execute(orphanSetup, 'local-owner')).reason,
+      'google-ownership-unknown',
+    );
+    assert.equal(controller.store.googleAcpSetup().state, 'unknown');
+    assert.equal(controller.store.googleMetadataOperations().at(-1)?.state, 'unknown');
+    controller.store.transaction(() => {
+      controller.store.db
+        .prepare('DELETE FROM receipts WHERE command_key=?')
+        .run(`native-acp-terminal:${intent.attempt_id}`);
+      const attempt = controller.store.get<Attempt>('attempt', intent.attempt_id) as Attempt;
+      controller.store.put('attempt', attempt.id, attempt.revision + 1, {
+        ...attempt,
+        state: 'running',
+        revision: attempt.revision + 1,
+      });
+      controller.store.db
+        .prepare(
+          "UPDATE launch_intents SET state='acknowledged',finished_at=NULL WHERE attempt_id=?",
+        )
+        .run(attempt.id);
+    });
+    await controller.close();
+    controller = new Controller({ ...options, home: context.controller.home, now: clock.now, id });
+    assert.equal(controller.store.get<Attempt>('attempt', intent.attempt_id)?.state, 'unknown');
+    assert.equal(
+      controller.store.transaction(() => controller.store.googleStartBlocker(run.roles[0].routeId)),
+      'google-ownership-unknown',
+    );
+    await controller.close();
+  }
 });

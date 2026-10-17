@@ -7,7 +7,7 @@ import type {
   Task,
   Window as UsageWindow,
 } from '@crewkite/contracts';
-import { ProjectSchema, requiredReviewMethodIds } from '@crewkite/contracts';
+import { CommandSchema, ProjectSchema, requiredReviewMethodIds } from '@crewkite/contracts';
 import { createDemoFixtures } from '@crewkite/testkit';
 import {
   Activity,
@@ -59,7 +59,7 @@ import {
   short,
   titleCase,
 } from './components.tsx';
-import { Launch, NativeEvaluation, NativeHandoff } from './launch.tsx';
+import { googleAcpLabel, Launch, NativeEvaluation, NativeHandoff } from './launch.tsx';
 import { useWorkspace, type Workspace } from './source.ts';
 import { roleLabels } from './templates.ts';
 
@@ -185,6 +185,15 @@ export function App() {
   const [about, setAbout] = useState(false);
   const task = snapshot?.tasks.find(({ id }) => id === selected) ?? snapshot?.tasks[0];
   const run = snapshot?.runs.find(({ id }) => id === task?.runId);
+  const candidate = snapshot?.candidates.filter((value) => value.taskId === task?.id).at(-1);
+  const changesKey = [
+    task?.id,
+    task?.runId,
+    run?.source.base,
+    candidate?.id,
+    candidate?.hash,
+    candidate?.artifactId,
+  ].join(':');
   const nativeRun = snapshot?.nativeRuns.find((value) => value.runId === task?.runId);
   const approval = snapshot?.approvals.find(
     (value) => value.taskId === task?.id && value.status === 'pending',
@@ -623,7 +632,9 @@ export function App() {
                         onPrepare={() => setLaunch(true)}
                       />
                     )}
-                    {tab === 'Changes' && <Changes task={task} workspace={workspace} />}
+                    {tab === 'Changes' && (
+                      <Changes key={changesKey} task={task} workspace={workspace} />
+                    )}
                     {tab === 'Checks and review' && (
                       <Checks task={task} snapshot={snapshot} workspace={workspace} />
                     )}
@@ -823,6 +834,7 @@ function ApprovalCard({
       action: approval.action,
       target: approval.target,
       revision: approval.revision,
+      ...(approval.acpTarget ? { acpTarget: approval.acpTarget } : {}),
     };
     void workspace
       .command({
@@ -849,6 +861,12 @@ function ApprovalCard({
           ? 'Allow this named action once for this attempt.'
           : approval.consequence}
       </p>
+      {approval.acpTarget && (
+        <p className="muted small">
+          Allow once for session {approval.acpTarget.sessionId}, tool call{' '}
+          {approval.acpTarget.toolCallId}, option {approval.acpTarget.optionId}.
+        </p>
+      )}
       <div className="approval-target">
         <Terminal size={14} />
         <span>{effectTarget(approval, task, projectName)}</span>
@@ -1273,6 +1291,10 @@ function Roster({
                     {route.fake && <span className="fake-tag">Fake</span>}
                   </div>
                   <code className="role-model">{route.model}</code>
+                  {role === 'coder' &&
+                    snapshot.nativeRuns.some(
+                      (value) => value.runId === run?.id && value.profileId === 'google-acp-v1',
+                    ) && <p className="muted small">{googleAcpLabel}</p>}
                   <dl>
                     {role === 'coder' && assignment && (
                       <>
@@ -1343,18 +1365,29 @@ function Changes({ task, workspace }: { task: Task; workspace: Workspace }) {
   > | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [readError, setReadError] = useState<string | null>(null);
   useEffect(() => {
     let active = true;
     setLoading(true);
+    setChanges(null);
+    setSelected(null);
+    setReadError(null);
     void workspace
       .command({ command: 'GetChanges', payload: { taskId: task.id } })
       .then((result) => {
-        if (active && result.data?.kind === 'changes') {
+        if (!active) return;
+        if (result.data?.kind === 'changes' && result.data.taskId === task.id) {
           setChanges(result.data);
           setSelected(result.data.files[0]?.path ?? null);
-        }
+        } else
+          setReadError(result.next ?? result.reason ?? 'The retained changes are unavailable.');
       })
-      .catch(() => {})
+      .catch((failure: unknown) => {
+        if (active)
+          setReadError(
+            failure instanceof Error ? failure.message : 'The retained changes could not be read.',
+          );
+      })
       .finally(() => {
         if (active) setLoading(false);
       });
@@ -1366,6 +1399,12 @@ function Changes({ task, workspace }: { task: Task; workspace: Workspace }) {
     return (
       <Empty icon={<RefreshCw className="spin" />} title="Reading retained changes">
         The controller is materializing the immutable preview.
+      </Empty>
+    );
+  if (readError)
+    return (
+      <Empty icon={<AlertTriangle />} title="Retained changes unavailable">
+        {readError}
       </Empty>
     );
   if (!changes?.files.length)
@@ -1794,6 +1833,169 @@ function Handoffs({ events, snapshot }: { events: Event[]; snapshot: Snapshot })
   );
 }
 
+function GoogleSetup({ snapshot, workspace }: { snapshot: Snapshot; workspace: Workspace }) {
+  const setup = snapshot.googleAcpSetup;
+  const profile = snapshot.nativeProfiles.find(
+    (value) => value.family === 'google' && 'configOptions' in value,
+  );
+  const [requested, setRequested] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const connected = workspace.connection === 'connected' && !workspace.preview;
+  const active = !!setup?.operationId;
+  async function action(kind: 'initialize' | 'authenticate' | 'discover' | 'stop') {
+    setMessage(null);
+    if (kind !== 'stop') setRequested(kind);
+    try {
+      const current = kind === 'stop' ? (await workspace.refresh()).googleAcpSetup : setup;
+      if (kind === 'stop' && !current?.operationId) {
+        setMessage('No exact setup operation is active. Refresh status before retrying.');
+        return;
+      }
+      if ((kind === 'authenticate' || kind === 'discover') && !current?.proofId) {
+        setMessage('Initialize Google ACP and inspect its retained proof first.');
+        return;
+      }
+      const result = await workspace.command(
+        kind === 'stop'
+          ? {
+              command: 'StopGoogleAcpSetup',
+              expectedRevision: current?.revision ?? 0,
+              payload: { profileId: 'google-acp-v1', operationId: current?.operationId as string },
+            }
+          : kind === 'initialize'
+            ? {
+                command: 'InitializeGoogleAcp',
+                expectedRevision: current?.revision ?? 0,
+                payload: { profileId: 'google-acp-v1', consent: 'explicit' },
+              }
+            : kind === 'authenticate'
+              ? {
+                  command: 'AuthenticateGoogleAcp',
+                  expectedRevision: current?.revision ?? 0,
+                  payload: {
+                    profileId: 'google-acp-v1',
+                    proofId: current?.proofId as string,
+                    method: 'oauth-personal',
+                    consent: 'explicit',
+                  },
+                }
+              : {
+                  command: 'DiscoverGoogleAcp',
+                  expectedRevision: current?.revision ?? 0,
+                  payload: {
+                    profileId: 'google-acp-v1',
+                    proofId: current?.proofId as string,
+                    consent: 'explicit',
+                  },
+                },
+      );
+      setMessage(
+        result.data?.kind === 'google-acp-setup'
+          ? `Setup ${result.data.setup.state}${result.data.setup.reason ? `: ${result.data.setup.reason}` : ''}.`
+          : (result.reason ?? result.outcome),
+      );
+    } catch {
+      setMessage('The setup action could not be confirmed. Refresh status before retrying.');
+    } finally {
+      if (kind !== 'stop') setRequested(null);
+    }
+  }
+  return (
+    <section className="card view-stack" aria-labelledby="google-setup-title">
+      <div className="section-heading">
+        <h2 id="google-setup-title">Google ACP setup</h2>
+        <span>{setup?.state ?? 'uninitialized'}</span>
+      </div>
+      <p className="muted small">{googleAcpLabel}</p>
+      <p className="muted small">
+        Import the official client through the explicit CLI import command first. Initialization and
+        discovery use no model prompt. Personal sign-in may open in your browser, contact Google and
+        write native authentication state. CrewKite retains result codes and safe proofs.
+      </p>
+      <div className="dialog-footer">
+        <button
+          className="button secondary"
+          type="button"
+          disabled={!connected || workspace.pending || active}
+          onClick={() => void action('initialize')}
+        >
+          Initialize Google ACP
+        </button>
+        <button
+          className="button secondary"
+          type="button"
+          disabled={!connected || workspace.pending || active || !setup?.proofId}
+          onClick={() => void action('authenticate')}
+        >
+          Sign in with Google
+        </button>
+        <button
+          className="button secondary"
+          type="button"
+          disabled={
+            !connected ||
+            workspace.pending ||
+            active ||
+            !setup?.proofId ||
+            setup.auth.status !== 'authenticated'
+          }
+          onClick={() => void action('discover')}
+        >
+          Discover Google choices
+        </button>
+        <button
+          className="button secondary"
+          type="button"
+          disabled={!connected || (!requested && !active)}
+          onClick={() => void action('stop')}
+        >
+          Stop setup
+        </button>
+        <button
+          className="button secondary"
+          type="button"
+          disabled={!connected}
+          onClick={() =>
+            void workspace.refresh().catch(() => setMessage('Setup status could not be read.'))
+          }
+        >
+          Refresh setup status
+        </button>
+      </div>
+      {requested && (
+        <p role="status">
+          {titleCase(requested)} requested. Refresh status to inspect the owned operation.
+        </p>
+      )}
+      <p className="muted small">
+        Authentication: {setup?.auth.status ?? 'unknown'}. Availability:{' '}
+        {profile?.reason ?? 'not-configured'}. Setup revision: {setup?.revision ?? 0}.
+      </p>
+      <p className="muted small">
+        Discovery choices establish configuration facts. A verified review mapping and route
+        qualification remain separate requirements.
+      </p>
+      {profile && (
+        <p className="muted small">
+          Models: {profile.configOptions?.model.supported.join(', ') ?? 'unknown'}. Thought levels:{' '}
+          {profile.configOptions?.thoughtLevel?.supported.join(', ') ?? 'unknown'}.
+        </p>
+      )}
+      {setup?.client && (
+        <details>
+          <summary>Client and proof identity</summary>
+          <p>
+            Version {setup.client.version}. Digest {setup.client.sha256}. Signer{' '}
+            {setup.client.signerTeamId}. Proof {setup.proofId ?? 'none'}. Operation{' '}
+            {setup.operationId ?? 'none'}.
+          </p>
+        </details>
+      )}
+      {message && <p role="status">{message}</p>}
+    </section>
+  );
+}
+
 function Usage({
   snapshot,
   run,
@@ -1805,6 +2007,15 @@ function Usage({
 }) {
   const [readerMessage, setReaderMessage] = useState<string | null>(null);
   const [readerChoice, setReaderChoice] = useState<boolean | null>(null);
+  const [displayTime, setDisplayTime] = useState(Date.now);
+  const fixture =
+    workspace.preview || (snapshot.routes.length > 0 && snapshot.routes.every(({ fake }) => fake));
+  useEffect(() => {
+    if (fixture) return;
+    setDisplayTime(Date.now());
+    const timer = window.setInterval(() => setDisplayTime(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [fixture]);
   const reader = snapshot.usageReaders.find((value) => value.family === 'google');
   const readerEnabled = readerChoice ?? reader?.enabled ?? false;
   useEffect(() => {
@@ -1836,7 +2047,7 @@ function Usage({
     0,
     ...snapshot.usage.map(({ observation }) => Date.parse(observation.observedAt)),
   );
-  const now = snapshot.routes.every(({ fake }) => fake) ? fixtureTime : Date.now();
+  const now = fixture ? fixtureTime : displayTime;
   const cloud = snapshot.routes.filter(({ family }) => family !== 'local');
   const local = snapshot.routes.find(({ family }) => family === 'local');
   return (
@@ -1847,11 +2058,12 @@ function Usage({
         <p>Allowance stays in the provider's own units. Missing observations stay unknown.</p>
         <span className="fixture-clock">
           <Clock size={13} />
-          {snapshot.routes.every(({ fake }) => fake)
+          {fixture
             ? `Fixture clock · ${new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })}`
             : 'Controller observations'}
         </span>
       </div>
+      <GoogleSetup snapshot={snapshot} workspace={workspace} />
       <section className="card" aria-labelledby="google-quota-title">
         <div className="section-heading">
           <h2 id="google-quota-title">Google quota</h2>
@@ -2042,7 +2254,15 @@ function AllowanceWindow({
   now: number;
   reserve: number | null;
 }) {
-  const { observation, state } = window;
+  const { observation } = window;
+  const state =
+    Date.parse(observation.observedAt) > now
+      ? 'unknown'
+      : observation.resetsAt !== null && Date.parse(observation.resetsAt) <= now
+        ? 'reset-pending'
+        : window.state === 'fresh' && now - Date.parse(observation.observedAt) > 300000
+          ? 'stale'
+          : window.state;
   const percentage = observation.remaining?.unit === 'percent' ? observation.remaining.value : null;
   const unknown = state === 'unknown' || observation.remaining === null;
   const pending =
@@ -2155,24 +2375,46 @@ function CreateTask({
   const [outcome, setOutcome] = useState(template.outcome);
   const [criteria, setCriteria] = useState(template.criteria.join('\n'));
   const [projectId, setProjectId] = useState(snapshot.projects[0]?.id ?? '');
+  const [message, setMessage] = useState<string | null>(null);
+  const payload = {
+    projectId,
+    title: title.trim(),
+    outcome: outcome.trim(),
+    criteria: criteria
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean),
+  };
+  const valid =
+    CommandSchema.options
+      .find((option) => option.shape.command.value === 'CreateTask')
+      ?.shape.payload.safeParse(payload).success ?? false;
+  const validation = valid
+    ? null
+    : 'Choose a project, a title, an outcome and 1 to 100 criteria. Each criterion must fit 4096 characters.';
   async function submit(event: FormEvent) {
     event.preventDefault();
+    if (!valid) {
+      setMessage(validation);
+      return;
+    }
+    setMessage(null);
     try {
       const result = await workspace.command({
         command: 'CreateTask',
         expectedRevision: 0,
-        payload: {
-          projectId,
-          title: title.trim(),
-          outcome: outcome.trim(),
-          criteria: criteria
-            .split('\n')
-            .map((line) => line.trim())
-            .filter(Boolean),
-        },
+        payload,
       });
-      if (result.entity && 'state' in result.entity) onCreated(result.entity.id);
-    } catch {}
+      if (
+        (result.outcome === 'applied' || result.outcome === 'already-applied') &&
+        result.entity &&
+        'state' in result.entity
+      )
+        onCreated(result.entity.id);
+      else setMessage(result.next ?? result.reason ?? 'The task could not be created.');
+    } catch (failure) {
+      setMessage(failure instanceof Error ? failure.message : 'The task could not be created.');
+    }
   }
   return (
     <Dialog title="New task" eyebrow="BOUNDED WORK" onClose={onClose}>
@@ -2199,7 +2441,11 @@ function CreateTask({
                   const project = ProjectSchema.safeParse(result?.entity);
                   if (project.success) setProjectId(project.data.id);
                 })
-                .catch(() => {})
+                .catch((failure: unknown) =>
+                  setMessage(
+                    failure instanceof Error ? failure.message : 'The project could not be opened.',
+                  ),
+                )
             }
           >
             <Folder size={14} />
@@ -2227,21 +2473,20 @@ function CreateTask({
           />
         </label>
         <label>
-          Acceptance criteria<span className="field-hint">One concrete claim per line</span>
+          Acceptance criteria
+          <span className="field-hint">One concrete claim per line, up to 100</span>
           <textarea
             rows={5}
             required
+            maxLength={409699}
             value={criteria}
             onChange={(event) => setCriteria(event.target.value)}
           />
         </label>
+        {(message || validation) && <p role="alert">{message ?? validation}</p>}
         <div className="dialog-footer">
           <span className="muted small">You review source and permissions before launch.</span>
-          <button
-            type="submit"
-            className="button primary"
-            disabled={workspace.pending || !projectId || !title.trim() || !criteria.trim()}
-          >
+          <button type="submit" className="button primary" disabled={workspace.pending || !valid}>
             Create task
             <ArrowRight size={14} />
           </button>

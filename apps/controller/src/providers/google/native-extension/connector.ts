@@ -5,12 +5,13 @@ import {
   fstatSync,
   fsyncSync,
   lstatSync,
+  mkdirSync,
   openSync,
   readFileSync,
   realpathSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import type { Readable, Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import {
@@ -22,11 +23,18 @@ import {
 import {
   type Artifact,
   ArtifactSchema,
+  AttemptIdSchema,
   CandidateSchema,
   CommandSchema,
   canonicalJson,
+  GoogleAcpSelectionSchema,
+  HashSchema,
+  RevisionSchema,
+  RouteIdSchema,
+  RunIdSchema,
   RunSchema,
   type Snapshot,
+  TaskIdSchema,
   TaskSchema,
 } from '@crewkite/contracts';
 import { z } from 'zod';
@@ -83,7 +91,35 @@ export const BundleSchema = z
       });
   });
 export type Bundle = z.infer<typeof BundleSchema>;
+export type CapturedContext = Pick<Bundle, 'binding' | 'patch'>;
 export type ContextClient = Pick<ControllerClient, 'snapshot' | 'command'>;
+export const OwnedContextOwnerSchema = z.strictObject({
+  taskId: TaskIdSchema,
+  runId: RunIdSchema,
+  attemptId: AttemptIdSchema,
+  generation: RevisionSchema,
+  routeId: RouteIdSchema,
+  policyHash: HashSchema,
+  profileId: z.literal('google-acp-v1'),
+  selection: GoogleAcpSelectionSchema,
+});
+export type OwnedContextOwner = z.infer<typeof OwnedContextOwnerSchema>;
+export const OwnedBundleSchema = z
+  .strictObject({
+    version: z.literal(2),
+    context: BundleSchema,
+    directory: z.string().min(1).max(4096),
+    nativeExpiresAt: z.iso.datetime(),
+    owner: OwnedContextOwnerSchema,
+  })
+  .refine(
+    (bundle) =>
+      bundle.owner.taskId === bundle.context.binding.task.id &&
+      bundle.owner.runId === bundle.context.binding.run.id &&
+      Date.parse(bundle.context.expiresAt) <= Date.parse(bundle.nativeExpiresAt),
+    'Owned context must match the frozen task, run and expiry.',
+  );
+export type OwnedBundle = z.infer<typeof OwnedBundleSchema>;
 
 function selected(snapshot: Snapshot, taskId: string) {
   const task = snapshot.tasks.find((value) => value.id === taskId);
@@ -145,7 +181,10 @@ async function artifactBytes(client: ContextClient, artifact: Artifact) {
   return text;
 }
 
-export async function captureContext(client: ContextClient, taskId: string) {
+export async function captureContext(
+  client: ContextClient,
+  taskId: string,
+): Promise<CapturedContext> {
   const snapshot = await client.snapshot();
   const binding = { ...selected(snapshot, taskId), patch: null as Artifact | null };
   let patch = '';
@@ -182,6 +221,132 @@ async function current(client: ContextClient, binding: Bundle['binding']) {
       !snapshot.artifacts.some((value) => canonicalJson(value) === canonicalJson(binding.patch)))
   )
     throw new Error('The task changed. Prepare a fresh workspace context.');
+}
+
+async function currentOwned(client: ContextClient, bundle: OwnedBundle) {
+  const snapshot = await client.snapshot();
+  const { owner, context } = bundle;
+  const actual = selected(snapshot, owner.taskId);
+  const run = snapshot.runs.find((value) => value.id === owner.runId);
+  const attempt = snapshot.attempts.find((value) => value.id === owner.attemptId);
+  const native = snapshot.nativeRuns.find((value) => value.runId === owner.runId);
+  const taskContext = ({
+    id,
+    projectId,
+    title,
+    outcome,
+    criteria,
+    runId,
+  }: Bundle['binding']['task']) => ({ id, projectId, title, outcome, criteria, runId });
+  const approval = snapshot.approvals.some(
+    (value) =>
+      value.taskId === owner.taskId &&
+      value.attemptId === owner.attemptId &&
+      value.generation === owner.generation &&
+      value.status === 'pending',
+  );
+  if (
+    !run ||
+    run.taskId !== owner.taskId ||
+    canonicalJson(taskContext(actual.task)) !== canonicalJson(taskContext(context.binding.task)) ||
+    canonicalJson(run.source) !== canonicalJson(context.binding.run.source) ||
+    run.policy.hash !== owner.policyHash ||
+    hash(canonicalJson(run.policy.policy)) !== owner.policyHash ||
+    !attempt ||
+    attempt.runId !== owner.runId ||
+    attempt.routeId !== owner.routeId ||
+    attempt.generation !== owner.generation ||
+    !['intent', 'running'].includes(attempt.state) ||
+    !(
+      actual.task.state === 'running' ||
+      (actual.task.state === 'waiting' && actual.task.waitingReason === 'approval' && approval)
+    ) ||
+    native?.profileId !== owner.profileId ||
+    canonicalJson(native.acp) !== canonicalJson(owner.selection) ||
+    native.expiresAt !== bundle.nativeExpiresAt ||
+    canonicalJson(actual.candidate) !== canonicalJson(context.binding.candidate) ||
+    (context.binding.patch &&
+      !snapshot.artifacts.some(
+        (value) => canonicalJson(value) === canonicalJson(context.binding.patch),
+      ))
+  )
+    throw Error('The owned task context is no longer current.');
+}
+
+const contains = (parent: string, path: string) => {
+  const part = relative(parent, path);
+  return part === '' || (!isAbsolute(part) && part !== '..' && !part.startsWith('../'));
+};
+
+function privateDirectory(path: string, home: string) {
+  if (!isAbsolute(path) || !contains(home, path) || realpathSync(path) !== path)
+    throw Error('Owned context needs canonical controller directories.');
+  for (let current = path; ; current = dirname(current)) {
+    const stat = lstatSync(current);
+    if (
+      !stat.isDirectory() ||
+      stat.isSymbolicLink() ||
+      stat.uid !== process.getuid?.() ||
+      (stat.mode & 0o777) !== 0o700
+    )
+      throw Error('Owned context directories must remain private.');
+    if (current === home) break;
+  }
+}
+
+export async function prepareOwnedContext(input: {
+  client: ContextClient;
+  context: CapturedContext;
+  home: string;
+  scratch: string;
+  directory: string;
+  expiresAt: string;
+  owner: OwnedContextOwner;
+  now?: () => number;
+}) {
+  const now = input.now ?? Date.now;
+  privateDirectory(input.home, input.home);
+  privateDirectory(input.scratch, input.home);
+  privateDirectory(dirname(input.directory), input.home);
+  if (
+    !isAbsolute(input.directory) ||
+    contains(input.scratch, input.directory) ||
+    contains(input.directory, input.scratch)
+  )
+    throw Error('Owned connector state must stay outside scratch.');
+  const snapshot = await input.client.snapshot();
+  const native = snapshot.nativeRuns.find((value) => value.runId === input.owner.runId);
+  const bundle = OwnedBundleSchema.parse({
+    version: 2,
+    context: {
+      version: 1,
+      ...input.context,
+      home: input.home,
+      workspace: input.scratch,
+      expiresAt: input.expiresAt,
+    },
+    directory: join(realpathSync(dirname(input.directory)), basename(input.directory)),
+    nativeExpiresAt: native?.expiresAt,
+    owner: input.owner,
+  });
+  await currentOwned(input.client, bundle);
+  if (now() >= Date.parse(bundle.context.expiresAt)) throw Error('Owned context expired.');
+  mkdirSync(bundle.directory, { mode: 0o700 });
+  privateDirectory(bundle.directory, input.home);
+  const bytes = `${canonicalJson(bundle)}\n`;
+  if (Buffer.byteLength(bytes) > MAX_MESSAGE_BYTES) throw Error('Owned context exceeds its bound.');
+  const path = join(bundle.directory, 'capability.json');
+  writePrivate(path, bytes);
+  const sha256 = hash(bytes);
+  return {
+    server: {
+      name: 'crewkite-context',
+      command: realpathSync(process.execPath),
+      args: [fileURLToPath(import.meta.url), '--owned-mcp', path, sha256],
+      env: [] as { name: string; value: string }[],
+    },
+    capability: { path, sha256 },
+  };
 }
 
 export function privateFile(path: string, maximum: number) {
@@ -262,9 +427,10 @@ const tools = [
 ];
 
 export function createSession(
-  bundle: Bundle,
+  bundle: Bundle | OwnedBundle,
   options: { client: ContextClient; now: () => number; save: (text: string) => void },
 ) {
+  const context = 'context' in bundle ? bundle.context : bundle;
   let initialized = false,
     ready = false,
     closed = false,
@@ -272,7 +438,7 @@ export function createSession(
   const seen = new Set<string | number>(),
     cancelled = new Set<string | number>();
   const live = () => {
-    if (closed || options.now() >= Date.parse(bundle.expiresAt))
+    if (closed || options.now() >= Date.parse(context.expiresAt))
       throw new Error('Connector access ended. Native inference may still be running.');
   };
   const text = (value: unknown) => ({ content: [{ type: 'text', text: canonicalJson(value) }] });
@@ -336,7 +502,9 @@ export function createSession(
               capabilities: { tools: {} },
               serverInfo: { name: 'crewkite-task-context', version: '0.1.0' },
               instructions:
-                'Only the shared task is available. Results are unverified. Use the native app for model selection, approvals and Stop.',
+                'context' in bundle
+                  ? 'Only the shared task is available. Results are unverified. Use CrewKite for approvals and Stop.'
+                  : 'Only the shared task is available. Results are unverified. Use the native app for model selection, approvals and Stop.',
             },
           };
         }
@@ -358,17 +526,18 @@ export function createSession(
             ? ResultSchema.safeParse(args)
             : z.strictObject({}).safeParse(args);
         if (!result.success) return error(-32602, 'Tool arguments exceed the selected capability.');
-        await current(options.client, bundle.binding);
+        if ('context' in bundle) await currentOwned(options.client, bundle);
+        else await current(options.client, context.binding);
         live();
         if (cancelled.has(id))
           return error(-32800, 'Request cancelled. Native inference may still be running.');
         let value: unknown;
-        if (name === 'task_context') value = { status: 'UNVERIFIED CONTEXT', ...bundle.binding };
+        if (name === 'task_context') value = { status: 'UNVERIFIED CONTEXT', ...context.binding };
         else if (name === 'retained_patch')
           value = {
             status: 'UNVERIFIED RETAINED PATCH',
-            artifact: bundle.binding.patch,
-            patch: bundle.patch,
+            artifact: context.binding.patch,
+            patch: context.patch,
           };
         else {
           if (submitted) throw new Error('One unverified result has already been submitted.');
@@ -379,7 +548,8 @@ export function createSession(
             `${canonicalJson({
               version: 1,
               status: 'UNVERIFIED',
-              binding: bundle.binding,
+              binding: context.binding,
+              ...('context' in bundle ? { owner: bundle.owner } : {}),
               submittedAt: new Date(options.now()).toISOString(),
               text: proposal.text,
               textHash: hash(proposal.text),
@@ -491,18 +661,32 @@ export async function serve(
 
 async function main() {
   const [flag, path, digest] = process.argv.slice(2);
-  if (flag !== '--mcp' || !path || !/^[a-f0-9]{64}$/.test(digest ?? ''))
+  if (!['--mcp', '--owned-mcp'].includes(flag) || !path || !/^[a-f0-9]{64}$/.test(digest ?? ''))
     throw new Error('Supply the prepared capability path and checksum.');
   const bytes = privateFile(path, MAX_MESSAGE_BYTES);
   if (hash(bytes) !== digest) throw new Error('The prepared capability changed.');
-  const bundle = BundleSchema.parse(JSON.parse(bytes.toString('utf8')));
-  if (
+  const bundle =
+    flag === '--owned-mcp'
+      ? OwnedBundleSchema.parse(JSON.parse(bytes.toString('utf8')))
+      : BundleSchema.parse(JSON.parse(bytes.toString('utf8')));
+  const context = 'context' in bundle ? bundle.context : bundle;
+  if ('context' in bundle) {
+    privateDirectory(context.home, context.home);
+    privateDirectory(context.workspace, context.home);
+    privateDirectory(bundle.directory, context.home);
+    if (
+      realpathSync(dirname(path)) !== bundle.directory ||
+      contains(context.workspace, bundle.directory) ||
+      contains(bundle.directory, context.workspace)
+    )
+      throw Error('Use the owned connector capability directory.');
+  } else if (
     realpathSync(bundle.workspace) !== bundle.workspace ||
     realpathSync(dirname(path)) !== join(bundle.workspace, '.crewkite-context') ||
     realpathSync(process.cwd()) !== bundle.workspace
   )
     throw new Error('Use the explicitly prepared scratch workspace.');
-  for (const directory of [bundle.workspace, dirname(path)]) {
+  for (const directory of [context.workspace, dirname(path)]) {
     const stat = lstatSync(directory);
     if (
       !stat.isDirectory() ||
@@ -512,14 +696,14 @@ async function main() {
     )
       throw new Error('The connector workspace must remain private.');
   }
-  if (Date.now() >= Date.parse(bundle.expiresAt))
+  if (Date.now() >= Date.parse(context.expiresAt))
     throw new Error('The prepared capability expired.');
   writePrivate(
     join(dirname(path), 'session.json'),
     `${JSON.stringify({ status: 'connector-started', nativeInferenceStopped: false })}\n`,
   );
   const client = await connectController({
-    ...readControllerEndpoint(bundle.home),
+    ...readControllerEndpoint(context.home),
     actor,
     reconnectDelaysMs: [],
   });
