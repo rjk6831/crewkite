@@ -1765,7 +1765,7 @@ test('acceptance creates one checked branch and preserves the original source', 
 });
 
 async function acceptsNativeCandidate(t: TestContext) {
-  const context = await nativeSetup(t, 'checked', {
+  const context = await nativeSetup(t, 'google-checked', {
     identity: { name: 'Fixture owner', email: 'owner@example.invalid' },
   });
   let controller = context.controller;
@@ -1779,14 +1779,26 @@ async function acceptsNativeCandidate(t: TestContext) {
   }));
   const revision = () => controller.snapshot().tasks[0].revision;
   const retained = nativeCandidate(controller);
+  const handoffPolicy = {
+    ...appointment.policy,
+    unknownUsage: {
+      rule: 'fixed-allowance' as const,
+      allowance: { launches: 2, minutes: appointment.policy.limits.minutes },
+    },
+  };
+  const handoffTargets = [
+    { profileId: 'openai-file-v1', creditPolicy: 'ordinary' },
+    { profileId: 'google-file-v1', creditPolicy: 'ordinary' },
+  ];
   const prepared = await controller.execute(
     command(
       'PrepareNativeRun',
       {
         taskId: task.id,
-        profileId: context.fixtureProfile.facts.id,
+        profileId: context.reviewerProfile.facts.id,
         targetPath: 'net.mjs',
-        policy: appointment.policy,
+        policy: handoffPolicy,
+        handoffTargets,
         consent: 'explicit',
       },
       revision(),
@@ -1812,6 +1824,86 @@ async function acceptsNativeCandidate(t: TestContext) {
     'applied',
   );
   await context.wait('native acceptance candidate', retained);
+  const firstIntent = controller.store.intents().find((value) => value.run_id === run.id);
+  assert(firstIntent);
+  const firstBytes = readFiles(firstIntent.scratch_path);
+  const firstCandidate = controller.snapshot().candidates.at(-1);
+  assert(firstCandidate);
+  assert.deepEqual(controller.snapshot().nativeRuns[0]?.handoff?.targets, handoffTargets);
+  assert.deepEqual(
+    controller.store.get<ReturnType<typeof RunSchema.parse>>('run', run.id)?.roles,
+    run.roles,
+  );
+  const transferPayload = {
+    taskId: task.id,
+    runId: run.id,
+    fromAttemptId: firstIntent.attempt_id,
+    profileId: 'google-file-v1',
+    creditPolicy: 'ordinary',
+    consent: 'explicit',
+    permissionMode: 'request-review',
+    billingAttestation: {
+      source: 'user-attested',
+      subscriptionLoginConfirmed: true,
+      paidExtraUsageDisabled: true,
+    },
+  };
+  for (const change of [
+    { fromAttemptId: context.id('att') },
+    { profileId: 'anthropic-file-v1', permissionMode: undefined },
+  ]) {
+    const input = { ...transferPayload, ...change };
+    if (input.permissionMode === undefined) delete input.permissionMode;
+    assert.equal(
+      (await controller.execute(command('PrepareNativeHandoff', input, revision()), 'local-owner'))
+        .outcome,
+      'blocked',
+    );
+  }
+  const transfer = command('PrepareNativeHandoff', transferPayload, revision());
+  assert.equal((await controller.execute(transfer, 'local-owner')).outcome, 'applied');
+  assert.equal((await controller.execute(transfer, 'local-owner')).outcome, 'already-applied');
+  const pending = controller.snapshot().nativeRuns[0]?.handoff?.pending;
+  assert(pending?.start.available);
+  assert.equal(pending.baseHash, firstBytes.find((file) => file.path === 'net.mjs')?.hash);
+  assert.notEqual(pending.baseHash, appointment.target.baseHash);
+  controller = await context.restart();
+  assert.deepEqual(controller.snapshot().nativeRuns[0]?.handoff?.pending, pending);
+  const transferred = nativeCandidate(controller);
+  const startTransfer = command(
+    'StartNativeHandoff',
+    { taskId: task.id, runId: run.id, preparationId: pending.preparationId },
+    revision(),
+  );
+  assert.equal((await controller.execute(startTransfer, 'local-owner')).outcome, 'applied');
+  assert.equal((await controller.execute(startTransfer, 'local-owner')).outcome, 'already-applied');
+  await context.wait('manual native successor candidate', transferred);
+  const writerIntents = controller.store.intents().filter((value) => value.run_id === run.id);
+  assert.equal(writerIntents.length, 2);
+  const successor = writerIntents.at(-1);
+  assert(successor);
+  assert.notEqual(successor.scratch_path, firstIntent.scratch_path);
+  assert.equal(successor.generation, 1);
+  assert.deepEqual(readFiles(firstIntent.scratch_path), firstBytes);
+  assert.equal(
+    controller.store.receipt(`candidate:${firstIntent.attempt_id}`)?.hash,
+    firstCandidate.hash,
+  );
+  const currentRun = RunSchema.parse(controller.store.get('run', run.id));
+  assert.deepEqual(currentRun.roles, run.roles);
+  assert.deepEqual(currentRun.policy, run.policy);
+  assert.equal(currentRun.roles[0].pinned, true);
+  assert.deepEqual(currentRun.roles[0].approvedFallbacks, []);
+  assert(controller.store.receipt(`native-handoff-consumed:${successor.attempt_id}`));
+  assert.equal(
+    (
+      await controller.execute(
+        command('StartNativeHandoff', startTransfer.payload, revision()),
+        'local-owner',
+      )
+    ).outcome,
+    'blocked',
+  );
   const candidate = controller.snapshot().candidates.at(-1);
   assert(candidate);
   const evaluation = await controller.execute(
@@ -1822,7 +1914,7 @@ async function acceptsNativeCandidate(t: TestContext) {
         candidateId: candidate.id,
         checkRecipeId: 'node-tests-v1',
         reviewer: {
-          profileId: context.fixtureProfile.facts.id,
+          profileId: context.reviewerProfile.facts.id,
           methodId: 'keep-it-simple',
           cycles: 1,
         },
@@ -1868,7 +1960,7 @@ async function acceptsNativeCandidate(t: TestContext) {
   const checked = controller.snapshot();
   assert.equal(checked.tasks[0].state, 'ready');
   assert.equal(checked.candidateEvaluations[0]?.localAcceptance.available, true);
-  assert.equal(context.submissions(), 2);
+  assert.equal(context.submissions(), 3);
   const destinationRef = 'refs/heads/feat/native-checked';
   const payload = { taskId: task.id, candidateId: candidate.id, destinationRef };
   const evidence = checked.evidence.find((value) => value.review);
@@ -1894,7 +1986,7 @@ async function acceptsNativeCandidate(t: TestContext) {
     id: context.id('art'),
     mediaType: 'application/vnd.crewkite.native+json',
   };
-  const scratchTarget = join(controller.home, 'scratch', run.id, 'net.mjs');
+  const scratchTarget = join(successor.scratch_path, 'net.mjs');
   const targetBytes = readFileSync(scratchTarget);
   for (const boundary of ['candidate', 'check', 'job', 'result', 'phase', 'review-family']) {
     controller.store.transaction(() => {
@@ -2005,7 +2097,7 @@ async function acceptsNativeCandidate(t: TestContext) {
   assert(approval);
   assert.equal(approval.action, 'accept-candidate');
   assert.equal(approval.target, destinationRef);
-  assert.equal(approval.attemptId, checked.attempts[0].id);
+  assert.equal(approval.attemptId, successor.attempt_id);
   assert.equal(
     controller.snapshot().candidateEvaluations[0]?.localAcceptance.reason,
     'approval-pending',
@@ -2077,8 +2169,8 @@ async function acceptsNativeCandidate(t: TestContext) {
       git(source.directory, ['update-ref', destinationRef, commit, run.source.base]);
     } else assert.equal(observed, commit);
     if (boundary === 'existing-ref') writeFileSync(sourceTarget, sourceBytes);
-    assert.equal(context.submissions(), 2);
-    assert.equal(controller.snapshot().attempts.length, 3);
+    assert.equal(context.submissions(), 3);
+    assert.equal(controller.snapshot().attempts.length, 4);
   }
   assert.deepEqual(inspectSource(task.projectId, source.directory), original);
   assert.deepEqual(readFileSync(join(source.directory, '.git', 'index')), index);

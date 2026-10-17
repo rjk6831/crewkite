@@ -7,6 +7,15 @@ pnpm crewkite task list --json
 pnpm crewkite health --json
 ```
 
+Register a Git checkout and create a draft task without opening the desktop:
+
+```sh
+pnpm crewkite project add /path/to/repository --json
+pnpm crewkite task create <project-id> --title "Repair the total" --outcome "Return the correct total" --criterion "The discount cannot make the total negative" --criterion "Invalid inputs are rejected" --json
+```
+
+Use the project ID returned by registration. Repeating registration for the same checkout returns the existing project. Task creation requires a title, an outcome and at least one `--criterion`. It creates a draft with no run or provider work. Preparation and Start remain separate actions.
+
 Task commands use IDs returned by the controller:
 
 | Command | Behavior |
@@ -31,7 +40,7 @@ Watch retains its cursor while the controller is offline. If the bounded reconne
 
 ## Native single-file runs
 
-Create the project and draft task in the desktop. List the controller's supported native profiles:
+Create the project and draft task through the commands above or the desktop. List the controller's supported native profiles:
 
 ```sh
 pnpm crewkite native profiles --json
@@ -39,7 +48,7 @@ pnpm crewkite native profiles --json
 
 The snapshot reports profile availability, its reason, client version, model, effort and bounds. OpenAI and Anthropic have bounded local native paths. Google consumer automatic launch reports `provider-policy-restricted` and refuses before native discovery. The [dated provider boundaries](../../docs/providers.md#current-availability) explain these restrictions. Anthropic and Google report requested effort separately from unobserved effective effort and service tier. A missing qualification date is shown as pending. Preparation requires an available profile ID. It accepts no executable, digest or model override.
 
-Save a policy JSON file using the existing policy schema. This example grants one scratch write and one export. Replace the sample task ID and project name with the desktop values, and choose a future expiration before preparing the run:
+Save a policy JSON file using the existing policy schema. This example grants one scratch write and one export. Replace the sample task ID and project name with the registered values, and choose a future expiration before preparing the run:
 
 ```json
 {
@@ -88,7 +97,7 @@ Preparation spends no inference. Start rechecks controller admission and launche
 
 Existing-credit spending defaults off. Add `--existing-credits` only when choosing that policy explicitly. Available included usage does not establish a provider-enforced hard billing cap. Native trust and billing limits are described in [provider routes](../../docs/providers.md).
 
-The native path retains a single-file candidate. Stop waits for owned cleanup. Resume cannot submit another native writer turn for retained work. Checks and review require separate preparation and explicit starts. Handoff remains unavailable. Local acceptance requires matching completed checks and review, plus its own destination permission.
+The native path retains a single-file candidate. Stop waits for owned cleanup. Resume cannot submit another native writer turn for retained work. Checks and review require separate preparation and explicit starts. Manual file transfer requires recipients allowed during initial preparation and fresh consent after confirmed Stop. Local acceptance requires matching completed checks and review, plus its own destination permission.
 
 ```sh
 pnpm crewkite task changes <task-id>
@@ -98,6 +107,32 @@ pnpm crewkite task export <task-id> --output candidate.patch --json
 A saved patch can be carried to a provider's native app manually. CrewKite does not open that app or import its result automatically.
 
 Export reads bounded artifact pages and verifies identity, offsets, length and checksum before creating the destination. Existing files are never overwritten. Plain diff output escapes terminal control characters. If export needs approval, its receipt includes the next approval command. Approve that export with `task approve <approval-id> --output new.patch`, or retry the saved export approval receipt with `--output new.patch` after inspecting its result.
+
+## Manual native file transfers
+
+This path currently has offline fixture coverage only. Connected manual transfer remains unqualified, and each recipient still needs its own supported authentication and provider permission. Google consumer CLI launch is unavailable and cannot serve as a transfer recipient.
+
+New file runs can opt into a finite recipient list. Add `--handoff-target` for each allowed file profile during `prepare-native`. Repository work and older runs do not support this option. Targets default to ordinary usage; only `openai-file-v1:existing-credits` opts that recipient into existing credits. The writer's credit choice does not authorize recipient spending.
+
+```sh
+pnpm crewkite task prepare-native <task-id> openai-file-v1 net.mjs --policy native-policy.json --native-trust --source-consent --handoff-target anthropic-file-v1 --handoff-target openai-file-v1 --json
+```
+
+Choose the original limits before preparing. A Quick run with two writers, one check and one review needs at least four overall attempts and two launches per route. Launch allowance is per route; the overall attempt limit still applies. Every writer spends the same original minutes. The desktop offers an explicit two-writer choice of four attempts, twelve minutes and two launches per route. It starts nothing. Two reserved minutes cover the standard check/review path; full verification requires six remaining minutes. Later transfer cannot raise or replenish limits.
+
+After normal Stop and confirmed process cleanup, inspect retained Changes. Prepare one previously allowed recipient with fresh trust and source-sharing consent:
+
+```sh
+pnpm crewkite task prepare-handoff <task-id> anthropic-file-v1 --native-trust --source-consent --confirm-subscription-only --json
+pnpm crewkite task show <task-id> --json
+pnpm crewkite task start-handoff <task-id> --json
+```
+
+OpenAI rejects subscription confirmation and permission-mode flags. Saved Google pilot settings remain readable, but do not authorize a new consumer launch. Add `--existing-credits` only when selecting that exact previously saved OpenAI recipient policy. No outgoing billing confirmation or native setting is inherited.
+
+Preparation freezes the retained unverified file and task packet. It launches nothing and takes no new policy or grants file. Start binds the displayed pending preparation and starts a fresh writer, with no native-session resume. Each successor requires explicit authorization for its saved recipient and preparation. The original pin and role assignments remain unchanged. The controller rechecks source, ownership, recipient and remaining allowance. Files must fit every selected profile's 64 KiB bound. Earlier evidence remains history; changed work needs new checks and review.
+
+Task show reports allowed recipients, current generation, pending recipient, expiry and preparation/start reasons. Reopening submits nothing. Stop cancels an unstarted transfer. If an outcome is uncertain, inspect the task and retry its exact saved receipt; no automatic retry or fallback occurs. Selecting a recipient establishes no provider entitlement or permission to use a subscription through another application. The [provider boundaries](../../docs/providers.md) retain their separate qualification limits.
 
 ## Native repository work
 

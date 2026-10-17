@@ -50,6 +50,12 @@ The controller stops the owned coding worker and waits for process-group absence
 
 A blocked target stays visible on the stopped task. Explicit resume rechecks that exact target. Stop cancels it. Pausing during the outgoing stop leaves the target pending until explicit resume. Restart retains the request and never dispatches it automatically. Draft tasks and check or review stages cannot become a successor coder through this command.
 
+## Manual native file handoffs
+
+New native file runs can opt into a finite recipient list during initial preparation. That list grants no automatic routing authority and changes no saved pin or role assignment. After the current writer is stopped and positively quiescent, `PrepareNativeHandoff` seals the retained file and durable task packet for one allowed recipient. Fresh consent binds its exact identity, credit policy and required billing assertions. Preparation launches nothing. `StartNativeHandoff` consumes that preparation once and admits a fresh writer in independent scratch within the original run limits.
+
+The retained file and packet each have a 64 KiB bound. Original committed source and retained target bytes keep separate identities. Changed work needs new checks and review. A pending transfer survives reopening without submission; Stop cancels it. Legacy and repository runs do not gain this capability. The path has offline fixture coverage only, with no connected-transfer qualification. Google consumer launch remains unavailable. The [CLI guide](../apps/cli/README.md#manual-native-file-transfers) records the explicit commands and consent.
+
 ## Restart
 
 On startup the controller reconciles attempts and effects before it dispatches anything.

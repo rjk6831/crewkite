@@ -25,17 +25,23 @@ import {
   CommandSchema,
   canonicalJson,
   MAX_FRAME_BYTES,
+  NativeHandoffTargetsSchema,
   PolicySchema,
   ProjectNodeTestFilesSchema,
+  ProjectSchema,
   type Snapshot,
   type Task,
   TaskSchema,
 } from '@crewkite/contracts';
 
-const help = `Usage: crewkite task <list|show|watch|start|stop|resume|switch|approve|deny> [id] [--json] [--home path]
+const help = `Usage: crewkite project add <path> [--json] [--home path]
+       crewkite task create <project-id> --title text --outcome text --criterion text [--criterion text ...] [--json] [--home path]
+       crewkite task <list|show|watch|start|stop|resume|switch|approve|deny> [id] [--json] [--home path]
        crewkite task switch <task-id> <route-id> [--json] [--home path]
        crewkite native profiles [--json] [--home path]
-       crewkite task prepare-native <task-id> <profile-id> <path> --policy file [--native-trust --source-consent] [--existing-credits] [--confirm-subscription-only] [--permission-mode mode]
+       crewkite task prepare-native <task-id> <profile-id> <path> --policy file [--native-trust --source-consent] [--existing-credits] [--confirm-subscription-only] [--permission-mode mode] [--handoff-target profile[:existing-credits] ...]
+       crewkite task prepare-handoff <task-id> <profile-id> --native-trust --source-consent [--existing-credits] [--confirm-subscription-only] [--permission-mode mode]
+       crewkite task start-handoff <task-id> [--json] [--home path]
        crewkite task prepare-repository <task-id> <profile-id> --policy file [--native-trust --source-consent] [--existing-credits]
        crewkite task prepare-evaluation <task-id> <profile-id> --grants file [--recipe node-tests-v1|project-node-tests-v1|crewkite-verify-v1] [--test-file path ...] [--native-trust --source-consent] [--existing-credits]
        crewkite task <start-checks|start-review> <task-id> [--json] [--home path]
@@ -45,9 +51,11 @@ const help = `Usage: crewkite task <list|show|watch|start|stop|resume|switch|app
        crewkite health [--json] [--home path]
        crewkite retry <receipt-file> [--output new-file] [--json] [--home path]
 
-Approval commands take an approval ID. Other task commands take a task ID.
-Create tasks in the desktop. Native preparation uses explicit consent or the controller's exact saved consent.
+Approval commands take an approval ID. Task creation takes a project ID. Other task commands take a task ID.
+Project registration and task creation start no work. Native preparation uses explicit consent or the controller's exact saved consent.
 For an Anthropic or Google writer, --confirm-subscription-only confirms subscription login and disabled paid extra usage.
+File handoff targets are optional and permit only later explicit manual transfers within the original budget.
+Handoff preparation requires fresh consent; it starts no writer. Start is a separate command.
 Repository work needs an explicit run-native-tools policy grant. It permits local commands during the bounded task.
 For Google, --permission-mode must match the existing client setting: request-review, strict, always-proceed or proceed-in-sandbox.
 `;
@@ -79,6 +87,9 @@ export async function runCli(
         json: { type: 'boolean' },
         home: { type: 'string' },
         help: { type: 'boolean', short: 'h' },
+        title: { type: 'string' },
+        outcome: { type: 'string' },
+        criterion: { type: 'string', multiple: true },
         policy: { type: 'string' },
         grants: { type: 'string' },
         recipe: { type: 'string' },
@@ -88,6 +99,7 @@ export async function runCli(
         'existing-credits': { type: 'boolean' },
         'confirm-subscription-only': { type: 'boolean' },
         'permission-mode': { type: 'string' },
+        'handoff-target': { type: 'string', multiple: true },
         output: { type: 'string' },
       },
     });
@@ -102,12 +114,14 @@ export async function runCli(
           area === 'task' &&
           ((['switch', 'accept'].includes(action) && extra.length === 1) ||
             (action === 'prepare-native' && extra.length === 2) ||
-            (['prepare-evaluation', 'prepare-repository'].includes(action) && extra.length === 1))
+            (['prepare-evaluation', 'prepare-repository', 'prepare-handoff'].includes(action) &&
+              extra.length === 1))
         )) ||
-      !['task', 'native', 'health', 'retry'].includes(area)
+      !['project', 'task', 'native', 'health', 'retry'].includes(area)
     )
       throw new Error('Unknown command. Use --help.');
     const supported = [
+      'create',
       'list',
       'show',
       'watch',
@@ -120,6 +134,8 @@ export async function runCli(
       'deny',
       'prepare-native',
       'prepare-repository',
+      'prepare-handoff',
+      'start-handoff',
       'prepare-evaluation',
       'start-checks',
       'start-review',
@@ -132,10 +148,31 @@ export async function runCli(
         !supported.includes(action) ||
         (['switch', 'accept'].includes(action) && extra.length !== 1) ||
         (action === 'prepare-native' && extra.length !== 2) ||
-        (['prepare-evaluation', 'prepare-repository'].includes(action) && extra.length !== 1) ||
+        (['prepare-evaluation', 'prepare-repository', 'prepare-handoff'].includes(action) &&
+          extra.length !== 1) ||
         (action === 'list' ? id !== undefined : id === undefined))
     )
       throw new Error('Invalid task command. Use --help.');
+    if (area === 'project' && (action !== 'add' || id === undefined))
+      throw new Error('Use project add with one repository path.');
+    const creatingTask = area === 'task' && action === 'create';
+    const addingProject = area === 'project' && action === 'add';
+    if (
+      !creatingTask &&
+      (values.title !== undefined || values.outcome !== undefined || values.criterion !== undefined)
+    )
+      throw new Error('Title, outcome and criteria require task create.');
+    if (
+      creatingTask &&
+      (!values.title?.trim() ||
+        !values.outcome?.trim() ||
+        !values.criterion?.length ||
+        values.criterion.some((criterion) => !criterion.trim()))
+    )
+      throw new Error(
+        'Task creation requires a title, outcome and at least one nonblank criterion.',
+      );
+    if (addingProject && !id?.trim()) throw new Error('Supply a nonblank repository path.');
     if (area === 'health' && action !== undefined)
       throw new Error('Health takes no positional arguments.');
     if (area === 'retry' && (!action || id !== undefined))
@@ -145,11 +182,24 @@ export async function runCli(
     const preparingFile = area === 'task' && action === 'prepare-native';
     const preparingRepository = area === 'task' && action === 'prepare-repository';
     const preparing = preparingFile || preparingRepository;
+    const preparingHandoff = area === 'task' && action === 'prepare-handoff';
+    if (values['handoff-target'] && !preparingFile)
+      throw new Error('Manual handoff targets require task prepare-native.');
+    const handoffTargets = values['handoff-target']
+      ? NativeHandoffTargetsSchema.parse(
+          values['handoff-target'].map((value) => {
+            const [profileId, credits, ...extra] = value.split(':');
+            if (extra.length || (credits !== undefined && credits !== 'existing-credits'))
+              throw new Error('Use a file profile, optionally followed by :existing-credits.');
+            return { profileId, creditPolicy: credits ?? 'ordinary' };
+          }),
+        )
+      : undefined;
     const evaluating = area === 'task' && action === 'prepare-evaluation';
-    if (values['confirm-subscription-only'] && !preparingFile)
-      throw new Error('Subscription confirmation requires task prepare-native.');
-    if (values['permission-mode'] !== undefined && !preparingFile)
-      throw new Error('Permission mode requires task prepare-native.');
+    if (values['confirm-subscription-only'] && !preparingFile && !preparingHandoff)
+      throw new Error('Subscription confirmation requires task prepare-native or prepare-handoff.');
+    if (values['permission-mode'] !== undefined && !preparingFile && !preparingHandoff)
+      throw new Error('Permission mode requires task prepare-native or prepare-handoff.');
     if (!evaluating && (values.recipe !== undefined || values['test-file'] !== undefined))
       throw new Error('Check recipe options require task prepare-evaluation.');
     const recipe = values.recipe ?? 'node-tests-v1';
@@ -169,12 +219,15 @@ export async function runCli(
     if (
       !preparing &&
       !evaluating &&
+      !preparingHandoff &&
       (values.policy ||
         values['native-trust'] ||
         values['source-consent'] ||
         values['existing-credits'])
     )
       throw new Error('Native consent options require native or evaluation preparation.');
+    if (preparingHandoff && (!values['native-trust'] || !values['source-consent']))
+      throw new Error('Handoff preparation requires fresh --native-trust and --source-consent.');
     if (values.policy && !preparing)
       throw new Error('Policy requires task prepare-native or prepare-repository.');
     if (values.grants && !evaluating) throw new Error('Grants require task prepare-evaluation.');
@@ -201,6 +254,30 @@ export async function runCli(
       throw new Error('Export requires --output with a new file path.');
     const home = resolve(values.home ?? process.env.CREWKITE_HOME ?? join(homedir(), '.crewkite'));
     const actor = { id: 'terminal', kind: 'cli' as const };
+    const creation =
+      addingProject || creatingTask
+        ? CommandSchema.safeParse({
+            protocol: 1,
+            key: createCommandKey(),
+            actor,
+            expectedRevision: 0,
+            command: addingProject ? 'RegisterProject' : 'CreateTask',
+            payload: addingProject
+              ? { path: resolve(id) }
+              : {
+                  projectId: id,
+                  title: values.title,
+                  outcome: values.outcome,
+                  criteria: values.criterion,
+                },
+          })
+        : undefined;
+    if (creation && !creation.success)
+      throw new Error(
+        addingProject
+          ? 'Repository paths must contain 1 to 4096 characters.'
+          : 'Use a project ID, a title up to 200 characters, an outcome up to 4096 characters and 1 to 100 criteria up to 4096 characters each.',
+      );
     const connected = await connectController({ ...readControllerEndpoint(home), actor });
     client = connected;
     let sent: Command | undefined;
@@ -226,7 +303,13 @@ export async function runCli(
       command = sent,
       savedTo?: string,
       nextCommand?: string[],
-    ) =>
+    ) => {
+      const created =
+        succeeded(result) && command?.command === 'RegisterProject'
+          ? ProjectSchema.safeParse(result.entity)
+          : succeeded(result) && command?.command === 'CreateTask'
+            ? TaskSchema.safeParse(result.entity)
+            : undefined;
       print(
         {
           command,
@@ -234,8 +317,9 @@ export async function runCli(
           ...(savedTo ? { savedTo } : {}),
           ...(nextCommand ? { nextCommand } : {}),
         },
-        `${nextCommand ? (command?.command === 'AcceptCandidate' ? 'Local branch approval required.' : 'Export approval required.') : (result.reason ?? result.outcome)}\nCommand key ${command?.key}${savedTo ? `\nPatch saved to ${savedTo}` : ''}${nextCommand ? `\nNext: ${nextCommand.map((arg) => `'${arg.replaceAll("'", "'\\''")}'`).join(' ')}` : ''}`,
+        `${nextCommand ? (command?.command === 'AcceptCandidate' ? 'Local branch approval required.' : 'Export approval required.') : (result.reason ?? result.outcome)}${created?.success ? `\n${command?.command === 'RegisterProject' ? 'Project' : 'Task'} ${created.data.id}` : ''}\nCommand key ${command?.key}${savedTo ? `\nPatch saved to ${savedTo}` : ''}${nextCommand ? `\nNext: ${nextCommand.map((arg) => `'${arg.replaceAll("'", "'\\''")}'`).join(' ')}` : ''}`,
       );
+    };
     const finishAction = async (result: CommandResult) => {
       const command = sent;
       let savedTo: string | undefined;
@@ -354,6 +438,10 @@ export async function runCli(
       receipt(result, command, savedTo);
       return succeeded(result) ? 0 : 2;
     };
+    if (creation?.success) {
+      sent = creation.data;
+      return await finishAction(await connected.command(sent));
+    }
     if (area === 'retry') {
       const value = readJson(action);
       if (value === null || typeof value !== 'object' || !('command' in value))
@@ -483,6 +571,79 @@ export async function runCli(
         ),
       );
     }
+    if (action === 'prepare-handoff' || action === 'start-handoff') {
+      const native = snapshot.nativeRuns.find((value) => value.runId === task.runId);
+      const handoff = native?.handoff;
+      if (!task.runId || !handoff)
+        throw new Error('This run has no saved manual file handoff recipients.');
+      if (action === 'start-handoff') {
+        if (!handoff.pending?.start.available)
+          throw new Error(
+            `Handoff start unavailable: ${handoff.pending?.start.reason ?? 'not-prepared'}.`,
+          );
+        return await finishAction(
+          await request(
+            'StartNativeHandoff',
+            {
+              taskId: task.id,
+              runId: task.runId,
+              preparationId: handoff.pending.preparationId,
+            },
+            task.revision,
+          ),
+        );
+      }
+      if (!handoff.prepare.available)
+        throw new Error(`Handoff preparation unavailable: ${handoff.prepare.reason}.`);
+      const creditPolicy = values['existing-credits'] ? 'existing-credits' : 'ordinary';
+      const recipient = handoff.targets.find(
+        (value) => value.profileId === extra[0] && value.creditPolicy === creditPolicy,
+      );
+      if (!recipient)
+        throw new Error('Choose a previously allowed file recipient and its exact credit policy.');
+      const profile = snapshot.nativeProfiles.find((value) => value.id === recipient.profileId);
+      if (!profile?.available)
+        throw new Error(`Native profile unavailable: ${profile?.reason ?? 'not-found'}.`);
+      if (values['confirm-subscription-only'] && profile.family === 'openai')
+        throw new Error(
+          'Subscription confirmation is supported only for an Anthropic or Google writer.',
+        );
+      if (values['permission-mode'] !== undefined && profile.family !== 'google')
+        throw new Error('Permission mode is supported only for a Google writer.');
+      if (profile.family !== 'openai' && !values['confirm-subscription-only'])
+        throw new Error(
+          'Confirm the recipient subscription login and disabled paid extra usage with --confirm-subscription-only.',
+        );
+      const permissionMode =
+        profile.family === 'google'
+          ? profile.permissionModes.find((mode) => mode === values['permission-mode'])
+          : undefined;
+      if (profile.family === 'google' && !permissionMode)
+        throw new Error('Choose the current Google client setting with --permission-mode.');
+      return await finishAction(
+        await request(
+          'PrepareNativeHandoff',
+          {
+            taskId: task.id,
+            runId: task.runId,
+            fromAttemptId: handoff.currentAttemptId,
+            ...recipient,
+            consent: 'explicit',
+            ...(profile.family !== 'openai'
+              ? {
+                  billingAttestation: {
+                    source: 'user-attested',
+                    subscriptionLoginConfirmed: true,
+                    paidExtraUsageDisabled: true,
+                  },
+                }
+              : {}),
+            ...(permissionMode ? { permissionMode } : {}),
+          },
+          task.revision,
+        ),
+      );
+    }
     if (action === 'prepare-repository') {
       const profile = snapshot.nativeProfiles.find((profile) => profile.id === extra[0]);
       if (profile?.id !== 'openai-repository-v1')
@@ -579,6 +740,7 @@ export async function runCli(
             policy: readJson(values.policy as string),
             creditPolicy,
             consent: explicit ? 'explicit' : 'saved',
+            ...(handoffTargets ? { handoffTargets } : {}),
             ...(billingAttestation ? { billingAttestation } : {}),
             ...(permissionMode ? { permissionMode } : {}),
           },
@@ -641,6 +803,9 @@ export async function runCli(
         : nativeRun
           ? `\nNative ${nativeRun.profileId}, ${nativeRun.stage}\nTarget ${nativeRun.target?.path ?? 'unknown'}\nBase hash ${nativeRun.target?.baseHash ?? 'unknown'}\nBytes ${nativeRun.target?.bytes ?? 'unknown'}\nExpires ${nativeRun.expiresAt ?? 'unknown'}\nSource base ${run?.source.base ?? 'unknown'}${billingText}${permissionText}`
           : '';
+      const handoffText = nativeRun?.handoff
+        ? `\nManual handoff generation ${nativeRun.handoff.generation}\nAllowed recipients ${nativeRun.handoff.targets.map((value) => `${value.profileId}:${value.creditPolicy}`).join(', ')}\nPrepare ${nativeRun.handoff.prepare.reason}\nOriginal limits ${run?.policy.policy.limits.attempts ?? 'unknown'} attempts, ${run?.policy.policy.limits.minutes ?? 'unknown'} minutes${nativeRun.handoff.pending ? `\nPending recipient ${nativeRun.handoff.pending.recipient.profileId}:${nativeRun.handoff.pending.recipient.creditPolicy}\nPreparation ${nativeRun.handoff.pending.preparationId}\nPacket ${nativeRun.handoff.pending.packetId}\nRetained unverified base ${nativeRun.handoff.pending.baseHash}, ${nativeRun.handoff.pending.bytes} bytes\nExpires ${nativeRun.handoff.pending.expiresAt}\nStart ${nativeRun.handoff.pending.start.reason}` : ''}`
+        : '';
       const evaluation = snapshot.candidateEvaluations.find((value) => value.taskId === task.id);
       const evidence = evaluation
         ? snapshot.evidence.filter((value) => value.candidateId === evaluation.candidateId)
@@ -709,7 +874,7 @@ export async function runCli(
           ...(nativeRun ? { nativeRun, run } : {}),
           ...(evaluation ? { evaluation, evidence } : {}),
         },
-        `${task.id}\n${task.title}\n${task.state}, revision ${task.revision}${preview}${evaluationText}`,
+        `${task.id}\n${task.title}\n${task.state}, revision ${task.revision}${preview}${handoffText}${evaluationText}`,
       );
       return 0;
     }

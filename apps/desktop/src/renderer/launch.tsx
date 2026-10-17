@@ -2,6 +2,10 @@ import {
   type Candidate,
   formatReviewTarget,
   type Guidance,
+  NativeFileProfileIdSchema,
+  NativeHandoffPreparationPayloadSchema,
+  type NativeHandoffTarget,
+  NativeHandoffTargetsSchema,
   NativeTargetPathSchema,
   type Policy,
   PolicySchema,
@@ -760,6 +764,10 @@ function NativeLaunch({
     !!saved &&
       snapshot.routes.find((route) => route.id === saved.roles[0]?.routeId)?.billing === 'credits',
   );
+  const [handoffEnabled, setHandoffEnabled] = useState(!!current?.handoff);
+  const [handoffTargets, setHandoffTargets] = useState<NativeHandoffTarget[]>(
+    current?.handoff?.targets ?? [],
+  );
   const [message, setMessage] = useState<string | null>(null);
   const [policy, setPolicy] = useState<Policy>(
     () =>
@@ -790,6 +798,23 @@ function NativeLaunch({
         ],
       },
   );
+  const minimumHandoffAttempts =
+    3 +
+    Math.max(
+      1,
+      (policy.methods ?? []).reduce((sum, method) => sum + method.cycles, 0),
+    );
+  const validHandoff =
+    !handoffEnabled ||
+    (!repository &&
+      PolicySchema.safeParse(policy).success &&
+      NativeHandoffTargetsSchema.safeParse(handoffTargets).success &&
+      handoffTargets.some((recipient) => recipient.profileId !== profileId) &&
+      policy.limits.attempts >= minimumHandoffAttempts &&
+      policy.limits.minutes >= 5 &&
+      policy.unknownUsage.rule === 'fixed-allowance' &&
+      policy.unknownUsage.allowance.launches >= 2 &&
+      policy.unknownUsage.allowance.minutes >= policy.limits.minutes);
   const capability = snapshot.nativeRuns.find((value) => value.runId === prepared?.id);
   const connected = workspace.connection === 'connected' && !workspace.preview;
   const allowed = connected && profile?.available && !workspace.pending;
@@ -830,6 +855,9 @@ function NativeLaunch({
     setExtraUsageDisabled(false);
     setPermissionMode('');
     setNativeTools(false);
+    setHandoffTargets((targets) =>
+      targets.map((target) => ({ ...target, creditPolicy: 'ordinary' })),
+    );
   }
   const startable =
     allowed &&
@@ -864,6 +892,7 @@ function NativeLaunch({
       !validTools ||
       !validBilling ||
       !validPermissionMode ||
+      !validHandoff ||
       (!repository && !NativeTargetPathSchema.safeParse(targetPath).success) ||
       !profile
     )
@@ -924,6 +953,7 @@ function NativeLaunch({
               policy: submittedPolicy,
               creditPolicy: existingCredits ? 'existing-credits' : 'ordinary',
               consent: savedConsent ? 'saved' : 'explicit',
+              ...(handoffEnabled ? { handoffTargets } : {}),
               ...(billingAttestation ? { billingAttestation } : {}),
               ...(selectedPermissionMode ? { permissionMode: selectedPermissionMode } : {}),
             },
@@ -1057,6 +1087,32 @@ function NativeLaunch({
                   <p>{capability?.target?.bytes ?? 'Unknown'} bytes</p>
                 </>
               )}
+              {capability?.handoff && (
+                <>
+                  <p>
+                    Allowed manual writers:{' '}
+                    {capability.handoff.targets
+                      .map(
+                        (target) =>
+                          snapshot.nativeProfiles.find((profile) => profile.id === target.profileId)
+                            ?.displayName ?? target.profileId,
+                      )
+                      .join(', ')}
+                  </p>
+                  <p>
+                    {prepared.policy.policy.limits.attempts} overall attempts ·{' '}
+                    {prepared.policy.policy.limits.minutes} original minutes ·{' '}
+                    {prepared.policy.policy.unknownUsage.rule === 'fixed-allowance'
+                      ? prepared.policy.policy.unknownUsage.allowance.launches
+                      : 'Unknown'}{' '}
+                    launches per route
+                  </p>
+                  <p className="muted small">
+                    Transfers require confirmed Stop and fresh consent. No writer starts
+                    automatically.
+                  </p>
+                </>
+              )}
               <p>
                 Consent expires{' '}
                 {capability?.expiresAt
@@ -1115,6 +1171,193 @@ function NativeLaunch({
                   Choose one existing text file in {project?.name ?? 'this project'}. The controller
                   freezes its committed base, hash and size before Start.
                 </p>
+              </>
+            )}
+            {!repository && (
+              <>
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={handoffEnabled}
+                    onChange={(event) => {
+                      resetScope();
+                      setHandoffEnabled(event.target.checked);
+                      setHandoffTargets([]);
+                    }}
+                  />
+                  Allow manual writer transfers
+                </label>
+                {handoffEnabled && (
+                  <section className="view-stack" aria-label="Manual writer transfer limits">
+                    <p className="muted small">
+                      Choose allowed future writers. Each transfer waits for confirmed Stop and
+                      fresh recipient consent. These choices do not enable automatic routing.
+                    </p>
+                    {profiles
+                      .filter(
+                        (recipient) => NativeFileProfileIdSchema.safeParse(recipient.id).success,
+                      )
+                      .map((recipient) => {
+                        const selected = handoffTargets.find(
+                          (target) => target.profileId === recipient.id,
+                        );
+                        return (
+                          <div key={recipient.id}>
+                            <label className="checkbox-label">
+                              <input
+                                type="checkbox"
+                                checked={!!selected}
+                                disabled={!recipient.available}
+                                onChange={(event) => {
+                                  resetScope();
+                                  setHandoffTargets((targets) =>
+                                    event.target.checked
+                                      ? [
+                                          ...targets,
+                                          {
+                                            profileId:
+                                              recipient.id as NativeHandoffTarget['profileId'],
+                                            creditPolicy: 'ordinary',
+                                          },
+                                        ]
+                                      : targets.filter(
+                                          (target) => target.profileId !== recipient.id,
+                                        ),
+                                  );
+                                }}
+                              />
+                              {recipient.displayName}
+                              {recipient.available ? '' : ' (unavailable)'}
+                            </label>
+                            {selected && recipient.id === 'openai-file-v1' && (
+                              <label className="checkbox-label">
+                                <input
+                                  type="checkbox"
+                                  checked={selected.creditPolicy === 'existing-credits'}
+                                  onChange={(event) => {
+                                    resetScope();
+                                    setHandoffTargets((targets) =>
+                                      targets.map((target) =>
+                                        target.profileId === recipient.id
+                                          ? {
+                                              ...target,
+                                              creditPolicy: event.target.checked
+                                                ? 'existing-credits'
+                                                : 'ordinary',
+                                            }
+                                          : target,
+                                      ),
+                                    );
+                                  }}
+                                />
+                                Allow existing credits for this recipient
+                              </label>
+                            )}
+                          </div>
+                        );
+                      })}
+                    <div className="facts-grid">
+                      <label>
+                        Overall attempts
+                        <input
+                          type="number"
+                          min={minimumHandoffAttempts}
+                          max={100}
+                          value={policy.limits.attempts}
+                          onChange={(event) => {
+                            resetScope();
+                            setPolicy({
+                              ...policy,
+                              limits: { ...policy.limits, attempts: Number(event.target.value) },
+                            });
+                          }}
+                        />
+                      </label>
+                      <label>
+                        Overall minutes
+                        <input
+                          type="number"
+                          min={5}
+                          max={1440}
+                          value={policy.limits.minutes}
+                          onChange={(event) => {
+                            resetScope();
+                            const minutes = Number(event.target.value);
+                            setPolicy({
+                              ...policy,
+                              limits: { ...policy.limits, minutes },
+                              unknownUsage: {
+                                rule: 'fixed-allowance',
+                                allowance: {
+                                  launches:
+                                    policy.unknownUsage.rule === 'fixed-allowance'
+                                      ? policy.unknownUsage.allowance.launches
+                                      : 1,
+                                  minutes,
+                                },
+                              },
+                            });
+                          }}
+                        />
+                      </label>
+                      <label>
+                        Launches per route
+                        <input
+                          type="number"
+                          min={2}
+                          max={100}
+                          value={
+                            policy.unknownUsage.rule === 'fixed-allowance'
+                              ? policy.unknownUsage.allowance.launches
+                              : 0
+                          }
+                          onChange={(event) => {
+                            resetScope();
+                            setPolicy({
+                              ...policy,
+                              unknownUsage: {
+                                rule: 'fixed-allowance',
+                                allowance: {
+                                  launches: Number(event.target.value),
+                                  minutes: policy.limits.minutes,
+                                },
+                              },
+                            });
+                          }}
+                        />
+                      </label>
+                    </div>
+                    <button
+                      type="button"
+                      className="button secondary"
+                      onClick={() => {
+                        resetScope();
+                        setPolicy({
+                          ...policy,
+                          limits: { ...policy.limits, attempts: 4, minutes: 12 },
+                          unknownUsage: {
+                            rule: 'fixed-allowance',
+                            allowance: { launches: 2, minutes: 12 },
+                          },
+                        });
+                      }}
+                    >
+                      Use two-writer limits: 4 attempts, 12 minutes, 2 launches per route
+                    </button>
+                    <p className="muted small">
+                      Every writer spends the same original run budget. The overall attempt cap is
+                      separate from each route's launch allowance. Two reserved minutes cover a
+                      standard check and review; full verification needs six remaining minutes.
+                    </p>
+                    {!validHandoff && (
+                      <p className="notice" role="status">
+                        Choose at least one different writer, {minimumHandoffAttempts} overall
+                        attempts and two launches per route. Review the original time limit before
+                        preparing.
+                      </p>
+                    )}
+                  </section>
+                )}
               </>
             )}
             {google && (
@@ -1278,8 +1521,11 @@ function NativeLaunch({
             ? 'Repository changes are retained for inspection and patch export. Native command results do not establish check evidence.'
             : 'One proposal is retained for inspection and patch export.'}{' '}
           A supported candidate can prepare separate checks and review after the writer stops, then
-          request local branch acceptance with its own permission. Handoff remains unavailable. The
-          original checkout stays unchanged.
+          request local branch acceptance with its own permission.{' '}
+          {handoffEnabled && !repository
+            ? 'Manual transfers require confirmed Stop and fresh recipient consent.'
+            : 'Handoff remains unavailable.'}{' '}
+          The original checkout stays unchanged.
         </p>
         {prepared && capability?.stage !== 'prepared' && (
           <p className="notice" role="status">
@@ -1302,7 +1548,8 @@ function NativeLaunch({
           </button>
         )}
         <span className="muted small">
-          {profile?.maximumSubmissions ?? 1} submission per run ·{' '}
+          {profile?.maximumSubmissions ?? 1} submission per{' '}
+          {handoffEnabled && !repository ? 'writer' : 'run'} ·{' '}
           {(profile?.maximumTaskMs ?? 300000) / 60000} minutes maximum ·{' '}
           {profile && 'maximumSourceFiles' in profile
             ? `${profile.maximumSourceFiles} files / ${profile.maximumSourceBytes / 1024 / 1024} MiB maximum`
@@ -1358,11 +1605,370 @@ function NativeLaunch({
               !validTools ||
               !validBilling ||
               !validPermissionMode ||
+              !validHandoff ||
               (!repository && !NativeTargetPathSchema.safeParse(targetPath).success)
             }
             onClick={() => void prepareNative()}
           >
             Prepare native proposal
+            <ArrowRight size={14} />
+          </button>
+        )}
+      </div>
+    </Dialog>
+  );
+}
+
+const handoffReasons = {
+  available: 'Ready for an explicit manual transfer.',
+  'writer-active': 'Stop the current writer and wait for confirmed cleanup.',
+  'ownership-unknown': 'Writer ownership is uncertain. No transfer can start.',
+  'source-changed': 'The original source changed. Inspect it before continuing.',
+  'retained-work-unavailable': 'Stopped file work is not available for transfer.',
+  'recipient-unavailable': 'The saved recipient is unavailable.',
+  'authority-unavailable': 'The required authority or consent is unavailable.',
+  'budget-exhausted': 'The original run has insufficient remaining allowance.',
+  'admissions-paused': 'Admissions are paused for this run.',
+  'already-started': 'This transfer has already started.',
+};
+
+export function NativeHandoff({ task, snapshot, workspace, onClose }: LaunchProps) {
+  const native = snapshot.nativeRuns.find((value) => value.runId === task.runId);
+  const run = snapshot.runs.find((value) => value.id === task.runId);
+  const handoff = native?.handoff;
+  const [recipientId, setRecipientId] = useState('');
+  const [nativeTrust, setNativeTrust] = useState(false);
+  const [sourceConsent, setSourceConsent] = useState(false);
+  const [existingCredits, setExistingCredits] = useState(false);
+  const [subscriptionLogin, setSubscriptionLogin] = useState(false);
+  const [extraUsageDisabled, setExtraUsageDisabled] = useState(false);
+  const [permissionMode, setPermissionMode] = useState('');
+  const [message, setMessage] = useState<string | null>(null);
+  if (!native || !run || !handoff) return null;
+  const recipient = handoff.targets.find((value) => value.profileId === recipientId);
+  const profile = snapshot.nativeProfiles.find((value) => value.id === recipient?.profileId);
+  const google = profile?.family === 'google';
+  const attested = profile?.family === 'anthropic' || google;
+  const pending = handoff.pending;
+  const connected =
+    workspace.connection === 'connected' && !workspace.preview && !workspace.pending;
+  const permitted =
+    connected &&
+    handoff.prepare.available &&
+    profile?.available &&
+    nativeTrust &&
+    sourceConsent &&
+    !!recipient &&
+    (recipient.creditPolicy !== 'existing-credits' || existingCredits) &&
+    (!attested || (subscriptionLogin && extraUsageDisabled)) &&
+    (!google || profile.permissionModes.some((value) => value === permissionMode));
+  function resetConsent() {
+    setNativeTrust(false);
+    setSourceConsent(false);
+    setExistingCredits(false);
+    setSubscriptionLogin(false);
+    setExtraUsageDisabled(false);
+    setPermissionMode('');
+    setMessage(null);
+  }
+  async function prepare() {
+    if (!permitted || !recipient || !profile || !task.runId || !handoff) return;
+    const result = await workspace.command({
+      command: 'PrepareNativeHandoff',
+      expectedRevision: task.revision,
+      payload: NativeHandoffPreparationPayloadSchema.parse({
+        taskId: task.id,
+        runId: task.runId,
+        fromAttemptId: handoff.currentAttemptId,
+        ...recipient,
+        consent: 'explicit',
+        ...(attested
+          ? {
+              billingAttestation: {
+                source: 'user-attested',
+                subscriptionLoginConfirmed: true,
+                paidExtraUsageDisabled: true,
+              },
+            }
+          : {}),
+        ...(google ? { permissionMode } : {}),
+      }),
+    });
+    setMessage(
+      result.outcome === 'applied' || result.outcome === 'already-applied'
+        ? 'Transfer prepared. Review the saved recipient before Start.'
+        : (result.next ?? 'Preparation was refused. Inspect the current task.'),
+    );
+  }
+  return (
+    <Dialog
+      title="Continue with another writer"
+      eyebrow="MANUAL FILE TRANSFER"
+      onClose={onClose}
+      wide
+    >
+      <div className="launch-content view-stack">
+        {message && (
+          <p className="notice" role="status">
+            {message}
+          </p>
+        )}
+        <section className="card">
+          <h2>Retained unverified work</h2>
+          <code>{native.target?.path ?? 'Unavailable target'}</code>
+          <p>
+            Inspect Changes before sending this retained file and task packet to another writer. A
+            transfer starts a fresh native task after the previous writer is proven stopped.
+          </p>
+          <p className="muted small">
+            Original limits: {run.policy.policy.limits.attempts} overall attempts and{' '}
+            {run.policy.policy.limits.minutes} minutes. Every writer spends this same budget. This
+            view cannot replenish it. The controller rechecks the remaining allowance; full
+            verification needs six remaining minutes.
+          </p>
+          <p className="notice" role="status">
+            {handoffReasons[pending?.start.reason ?? handoff.prepare.reason]}
+          </p>
+          <details className="technical-details">
+            <summary>Writer and packet identity</summary>
+            <code>Current attempt {handoff.currentAttemptId}</code>
+            <code>Generation {handoff.generation}</code>
+            {pending && (
+              <>
+                <code>Packet {pending.packetId}</code>
+                <code>Preparation {pending.preparationId}</code>
+                <code>Retained base {pending.baseHash}</code>
+              </>
+            )}
+          </details>
+        </section>
+        {pending ? (
+          <section className="card" aria-label="Prepared writer transfer">
+            <h2>Prepared recipient</h2>
+            <p>
+              {snapshot.nativeProfiles.find((value) => value.id === pending.recipient.profileId)
+                ?.displayName ?? pending.recipient.profileId}
+            </p>
+            <p>
+              {pending.bytes} retained unverified bytes · generation {pending.generation}
+            </p>
+            <p>
+              {pending.recipient.creditPolicy === 'existing-credits'
+                ? 'Existing credits explicitly allowed for this recipient.'
+                : 'Ordinary usage only. Existing credits are not allowed.'}
+            </p>
+            <p>Consent expires {new Date(pending.expiresAt).toLocaleString()}</p>
+            <p className="muted small">
+              Reopening does not submit work. Start consumes this exact saved preparation once. Stop
+              cancels the pending transfer.
+            </p>
+          </section>
+        ) : (
+          <section className="card">
+            <label>
+              Previously allowed recipient
+              <select
+                value={recipientId}
+                onChange={(event) => {
+                  resetConsent();
+                  setRecipientId(event.target.value);
+                }}
+              >
+                <option value="">Choose a recipient</option>
+                {handoff.targets
+                  .filter((value) => value.profileId !== native.profileId)
+                  .map((value) => {
+                    const option = snapshot.nativeProfiles.find(
+                      (profile) => profile.id === value.profileId,
+                    );
+                    return (
+                      <option
+                        key={value.profileId}
+                        value={value.profileId}
+                        disabled={!option?.available}
+                      >
+                        {option?.displayName ?? value.profileId}
+                        {option?.available ? '' : ' (unavailable)'}
+                      </option>
+                    );
+                  })}
+              </select>
+            </label>
+            {profile && (
+              <p className="muted small">
+                {profile.model} · {profile.effort} requested effort ·{' '}
+                {profile.family === 'openai' ? profile.serviceTier : 'unknown'} service tier.
+                Required metadata is checked at Start. A provider hard spending cap remains
+                unverified.
+              </p>
+            )}
+            {google && (
+              <label>
+                Expected native permission mode
+                <select
+                  value={permissionMode}
+                  onChange={(event) => {
+                    resetConsent();
+                    setPermissionMode(event.target.value);
+                  }}
+                >
+                  <option value="">Choose the current client setting</option>
+                  {profile.permissionModes.map((value) => (
+                    <option key={value} value={value}>
+                      {permissionModeLabels[value]}
+                    </option>
+                  ))}
+                </select>
+                <span className="muted small">
+                  This must match the existing native setting. CrewKite changes no account or global
+                  setting.
+                </span>
+              </label>
+            )}
+            {attested && (
+              <>
+                <p className="muted small">
+                  These are fresh recipient confirmations supplied by you. Account entitlement and
+                  request billing remain unknown.
+                </p>
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={subscriptionLogin}
+                    onChange={(event) => {
+                      setSubscriptionLogin(event.target.checked);
+                      setNativeTrust(false);
+                      setSourceConsent(false);
+                      setExistingCredits(false);
+                    }}
+                  />
+                  I confirm this native login uses my existing subscription
+                </label>
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={extraUsageDisabled}
+                    onChange={(event) => {
+                      setExtraUsageDisabled(event.target.checked);
+                      setNativeTrust(false);
+                      setSourceConsent(false);
+                      setExistingCredits(false);
+                    }}
+                  />
+                  I confirm paid extra usage is disabled for this login
+                </label>
+              </>
+            )}
+            {recipient?.creditPolicy === 'existing-credits' && (
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={existingCredits}
+                  onChange={(event) => {
+                    setExistingCredits(event.target.checked);
+                    setNativeTrust(false);
+                    setSourceConsent(false);
+                  }}
+                />
+                Allow the saved existing-credit policy for this recipient
+              </label>
+            )}
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                checked={nativeTrust}
+                onChange={(event) => setNativeTrust(event.target.checked)}
+              />
+              Trust this recipient's existing native client and login
+            </label>
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                checked={sourceConsent}
+                onChange={(event) => setSourceConsent(event.target.checked)}
+              />
+              Send the retained unverified file and task packet to this recipient; allow its
+              replacement in independent scratch
+            </label>
+            <p className="muted small">
+              Preparation records your chosen successor writer. It adds no automatic fallback,
+              review or acceptance authority.
+            </p>
+          </section>
+        )}
+      </div>
+      <div className="dialog-footer">
+        <button type="button" className="button secondary" onClick={onClose}>
+          Close
+        </button>
+        {pending ? (
+          <>
+            <button
+              type="button"
+              className="button secondary"
+              disabled={!connected}
+              onClick={() =>
+                void workspace
+                  .command({
+                    command: 'StopRun',
+                    expectedRevision: task.revision,
+                    payload: { taskId: task.id, runId: run.id },
+                  })
+                  .then((result) => {
+                    if (result.outcome === 'applied' || result.outcome === 'already-applied')
+                      onClose();
+                    else
+                      setMessage(result.next ?? 'Stop was refused. Inspect the pending transfer.');
+                  })
+                  .catch(() =>
+                    setMessage('Stop could not be confirmed. Inspect the task before retrying.'),
+                  )
+              }
+            >
+              Cancel transfer
+            </button>
+            <button
+              type="button"
+              className="button primary"
+              disabled={!connected || !pending.start.available}
+              onClick={() =>
+                void workspace
+                  .command({
+                    command: 'StartNativeHandoff',
+                    expectedRevision: task.revision,
+                    payload: {
+                      taskId: task.id,
+                      runId: run.id,
+                      preparationId: pending.preparationId,
+                    },
+                  })
+                  .then((result) => {
+                    if (result.outcome === 'applied' || result.outcome === 'already-applied')
+                      onClose();
+                    else
+                      setMessage(result.next ?? 'Start was refused. Inspect the saved transfer.');
+                  })
+                  .catch(() =>
+                    setMessage('Start could not be confirmed. Inspect the task before retrying.'),
+                  )
+              }
+            >
+              Start writer transfer
+              <ArrowRight size={14} />
+            </button>
+          </>
+        ) : (
+          <button
+            type="button"
+            className="button primary"
+            disabled={!permitted}
+            onClick={() =>
+              void prepare().catch(() =>
+                setMessage('Preparation could not be confirmed. Inspect the task before retrying.'),
+              )
+            }
+          >
+            Prepare writer transfer
             <ArrowRight size={14} />
           </button>
         )}

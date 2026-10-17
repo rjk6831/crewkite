@@ -16,6 +16,8 @@ import {
   GrantSchema,
   MinorAmountSchema,
   NativeBillingAttestationSchema,
+  NativeHandoffPreviewSchema,
+  NativeHandoffTargetsSchema,
   NativeProfileSchema,
   NativeRunSchema,
   ObservationSchema,
@@ -655,6 +657,128 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     },
   };
   assert.deepEqual(CommandSchema.parse(filePreparation), filePreparation);
+  const handoffTargets = [
+    { profileId: 'openai-file-v1', creditPolicy: 'existing-credits' },
+    { profileId: 'anthropic-file-v1', creditPolicy: 'ordinary' },
+    { profileId: 'google-file-v1', creditPolicy: 'ordinary' },
+  ];
+  assert.deepEqual(NativeHandoffTargetsSchema.parse(handoffTargets), handoffTargets);
+  const transferable = {
+    ...filePreparation,
+    payload: { ...filePreparation.payload, handoffTargets },
+  };
+  assert.deepEqual(CommandSchema.parse(transferable), transferable);
+  for (const invalid of [
+    [],
+    [...handoffTargets, handoffTargets[0]],
+    [handoffTargets[0], handoffTargets[0]],
+    [{ profileId: 'openai-repository-v1', creditPolicy: 'ordinary' }],
+    [{ profileId: 'anthropic-file-v1', creditPolicy: 'existing-credits' }],
+    [{ ...handoffTargets[0], executable: '/caller/client' }],
+  ])
+    assert.equal(NativeHandoffTargetsSchema.safeParse(invalid).success, false);
+  const handoffPreparation = {
+    ...command,
+    command: 'PrepareNativeHandoff',
+    payload: {
+      taskId: job.taskId,
+      runId: job.runId,
+      fromAttemptId: job.attemptId,
+      profileId: 'openai-file-v1',
+      creditPolicy: 'existing-credits',
+      consent: 'explicit',
+    },
+  };
+  for (const payload of [
+    handoffPreparation.payload,
+    {
+      ...handoffPreparation.payload,
+      profileId: 'anthropic-file-v1',
+      creditPolicy: 'ordinary',
+      billingAttestation: attestation,
+    },
+    {
+      ...handoffPreparation.payload,
+      profileId: 'google-file-v1',
+      creditPolicy: 'ordinary',
+      billingAttestation: attestation,
+      permissionMode: 'request-review',
+    },
+  ])
+    assert.deepEqual(CommandSchema.parse({ ...handoffPreparation, payload }).payload, payload);
+  for (const change of [
+    { consent: 'saved' },
+    { fromAttemptId: undefined },
+    { profileId: 'openai-repository-v1' },
+    { profileId: 'anthropic-file-v1', creditPolicy: 'ordinary' },
+    { profileId: 'google-file-v1', creditPolicy: 'ordinary', billingAttestation: attestation },
+    { billingAttestation: attestation },
+    { permissionMode: 'request-review' },
+    { targetPath: 'another.mjs' },
+    { packetId: `hnd_${suffix}` },
+    { execution },
+  ])
+    assert.equal(
+      CommandSchema.safeParse({
+        ...handoffPreparation,
+        payload: { ...handoffPreparation.payload, ...change },
+      }).success,
+      false,
+    );
+  const startHandoff = {
+    ...command,
+    command: 'StartNativeHandoff',
+    payload: { taskId: job.taskId, runId: job.runId, preparationId: `art_${suffix}` },
+  };
+  assert.deepEqual(CommandSchema.parse(startHandoff), startHandoff);
+  assert.equal(
+    CommandSchema.safeParse({
+      ...startHandoff,
+      payload: { ...startHandoff.payload, profileId: 'google-file-v1' },
+    }).success,
+    false,
+  );
+  const handoffPreview = {
+    targets: handoffTargets,
+    currentAttemptId: job.attemptId,
+    generation: 0,
+    prepare: { available: true, reason: 'available' },
+    pending: {
+      preparationId: `art_${suffix}`,
+      packetId: `hnd_${suffix}`,
+      fromAttemptId: job.attemptId,
+      generation: 1,
+      recipient: handoffTargets[1],
+      baseHash: 'a'.repeat(64),
+      bytes: 65536,
+      expiresAt: '2026-10-18T00:00:00.000Z',
+      start: { available: true, reason: 'available' },
+    },
+  };
+  assert.deepEqual(NativeHandoffPreviewSchema.parse(handoffPreview), handoffPreview);
+  for (const change of [
+    { generation: 0 },
+    { generation: 2 },
+    { fromAttemptId: 'att_01ARZ3NDEKTSV4RRFFQ69G5FAW' },
+    { bytes: 65537 },
+    { recipient: { profileId: 'openai-file-v1', creditPolicy: 'ordinary' } },
+    { start: { available: true, reason: 'ownership-unknown' } },
+  ])
+    assert.equal(
+      NativeHandoffPreviewSchema.safeParse({
+        ...handoffPreview,
+        pending: { ...handoffPreview.pending, ...change },
+      }).success,
+      false,
+    );
+  assert.deepEqual(NativeRunSchema.parse({ ...historicalRun, handoff: handoffPreview }), {
+    ...historicalRun,
+    handoff: handoffPreview,
+  });
+  assert.equal(
+    NativeRunSchema.safeParse({ ...repositoryRun, handoff: handoffPreview }).success,
+    false,
+  );
   const { targetPath: _target, ...preparationFields } = filePreparation.payload;
   const repositoryPreparation = {
     ...filePreparation,
@@ -666,6 +790,7 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     { billingAttestation: attestation },
     { permissionMode: 'request-review' },
     { execution },
+    { handoffTargets },
     { profileId: 'openai-file-v1' },
   ])
     assert.equal(

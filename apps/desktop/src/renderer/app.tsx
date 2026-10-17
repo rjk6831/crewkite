@@ -59,7 +59,7 @@ import {
   short,
   titleCase,
 } from './components.tsx';
-import { Launch, NativeEvaluation } from './launch.tsx';
+import { Launch, NativeEvaluation, NativeHandoff } from './launch.tsx';
 import { useWorkspace, type Workspace } from './source.ts';
 import { roleLabels } from './templates.ts';
 
@@ -177,6 +177,7 @@ export function App() {
   const [theme, setTheme] = useState(() => localStorage.getItem('crewkite-theme') ?? 'dark');
   const [create, setCreate] = useState(false);
   const [launch, setLaunch] = useState(false);
+  const [nativeHandoff, setNativeHandoff] = useState(false);
   const [palette, setPalette] = useState(false);
   const [palettePage, setPalettePage] = useState(0);
   const [approvalToReview, setApprovalToReview] = useState<string | null>(null);
@@ -225,7 +226,9 @@ export function App() {
   const stopAllowed =
     task?.runId &&
     (nativeRun
-      ? nativeRun.stage === 'prepared' || ['running', 'checking', 'unknown'].includes(task.state)
+      ? nativeRun.stage === 'prepared' ||
+        !!nativeRun.handoff?.pending ||
+        ['running', 'checking', 'unknown'].includes(task.state)
       : !['draft', 'ready', 'accepted', 'failed'].includes(task.state));
   return (
     <div className="app-shell">
@@ -527,6 +530,19 @@ export function App() {
                               <ArrowRight size={14} />
                             </button>
                           )}
+                        {nativeRun?.handoff && nativeRun.stage !== 'prepared' && (
+                          <button
+                            type="button"
+                            className="button secondary"
+                            disabled={workspace.pending}
+                            onClick={() => setNativeHandoff(true)}
+                          >
+                            {nativeRun.handoff.pending
+                              ? 'Review prepared transfer'
+                              : 'Continue with another writer'}
+                            <ArrowRight size={14} />
+                          </button>
+                        )}
                         <button
                           type="button"
                           className="button stop"
@@ -667,6 +683,15 @@ export function App() {
           snapshot={snapshot}
           workspace={workspace}
           onClose={() => setLaunch(false)}
+        />
+      )}
+      {nativeHandoff && task && snapshot && nativeRun?.handoff && (
+        <NativeHandoff
+          key={`${task.runId}:${task.revision}:${nativeRun.handoff.currentAttemptId}:${nativeRun.handoff.pending?.preparationId ?? ''}`}
+          task={task}
+          snapshot={snapshot}
+          workspace={workspace}
+          onClose={() => setNativeHandoff(false)}
         />
       )}
       {about && <About onClose={() => setAbout(false)} />}
@@ -1090,16 +1115,29 @@ function Plan({
                 ) : (
                   <Fact label="Target" value={native.target?.path ?? 'Unavailable'} />
                 )}
-                <Fact label="Submissions per run" value={profile?.maximumSubmissions ?? 1} />
                 <Fact
-                  label="Time limit"
+                  label={native.handoff ? 'Submissions per writer' : 'Submissions per run'}
+                  value={profile?.maximumSubmissions ?? 1}
+                />
+                <Fact
+                  label={native.handoff ? 'Writer time limit' : 'Time limit'}
                   value={`${(profile?.maximumTaskMs ?? 300000) / 60000} min`}
                 />
               </div>
+              {native.handoff && (
+                <p className="muted small">
+                  Original run: {run.policy.policy.limits.attempts} overall attempts and{' '}
+                  {run.policy.policy.limits.minutes} minutes. Manual transfer does not reset these
+                  limits.
+                </p>
+              )}
               <p className="muted">
                 Retained changes can be inspected and exported after the native process stops.
                 Prepare supported checks and a separate review in Checks and review, then request
-                local branch acceptance with its own permission. Handoff remains unavailable.
+                local branch acceptance with its own permission.{' '}
+                {native.handoff
+                  ? 'Manual transfers use previously allowed recipients and fresh consent after confirmed Stop.'
+                  : 'Handoff remains unavailable.'}
               </p>
               {native.stage === 'prepared' && (
                 <button type="button" className="button primary" onClick={onPrepare}>

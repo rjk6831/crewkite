@@ -400,10 +400,91 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     }
   }
 
+  const project = { id: task.projectId, name: 'fixture-project', revision: 0 };
+  const createdTask = { ...task, revision: 0 };
+  const createArgs = [
+    'task',
+    'create',
+    project.id,
+    '--title',
+    task.title,
+    '--outcome',
+    task.outcome,
+    '--criterion',
+    task.criteria[0],
+    '--criterion',
+    'The original source stays unchanged',
+  ];
+  const creationCases = [
+    { name: 'project', args: ['project', 'add', '.'], plain: true },
+    { name: 'project-existing', args: ['project', 'add', '/fixture/project'] },
+    { name: 'task', args: createArgs },
+    { name: 'task-plain', args: createArgs, plain: true },
+    { name: 'task-blocked', args: createArgs },
+    { name: 'task-uncertain', args: createArgs },
+    { name: 'missing-path', args: ['project', 'add'], invalid: true },
+    { name: 'blank-path', args: ['project', 'add', ' '], invalid: true },
+    { name: 'extra-path', args: ['project', 'add', '.', 'other'], invalid: true },
+    {
+      name: 'missing-title',
+      args: [...createArgs.slice(0, 3), ...createArgs.slice(5)],
+      invalid: true,
+    },
+    {
+      name: 'missing-outcome',
+      args: [...createArgs.slice(0, 5), ...createArgs.slice(7)],
+      invalid: true,
+    },
+    { name: 'missing-criteria', args: createArgs.slice(0, 7), invalid: true },
+    { name: 'blank-criterion', args: [...createArgs, '--criterion', '  '], invalid: true },
+    {
+      name: 'invalid-project',
+      args: [...createArgs.slice(0, 2), 'not-an-id', ...createArgs.slice(3)],
+      invalid: true,
+    },
+    {
+      name: 'oversized-title',
+      args: [...createArgs.slice(0, 4), 'x'.repeat(201), ...createArgs.slice(5)],
+      invalid: true,
+    },
+    {
+      name: 'oversized-outcome',
+      args: [...createArgs.slice(0, 6), 'x'.repeat(4097), ...createArgs.slice(7)],
+      invalid: true,
+    },
+    {
+      name: 'too-many-criteria',
+      args: [
+        ...createArgs.slice(0, 7),
+        ...Array.from({ length: 101 }, () => ['--criterion', 'A criterion']).flat(),
+      ],
+      invalid: true,
+    },
+    { name: 'wrong-command', args: ['project', 'add', '.', '--title', task.title], invalid: true },
+    { name: 'extra-task', args: [...createArgs, 'other'], invalid: true },
+  ];
+
   for (const scenario of [
+    ...creationCases.map((value) => `setup-${value.name}`),
     'show',
     'native-show',
     'profiles',
+    'handoff-targets',
+    'handoff-target-duplicate',
+    'handoff-target-repository',
+    'handoff-target-wrong-command',
+    'handoff-openai',
+    'handoff-openai-credits',
+    'handoff-anthropic',
+    'handoff-google',
+    'handoff-missing-consent',
+    'handoff-missing-attestation',
+    'handoff-unlisted',
+    'handoff-blocked',
+    'handoff-start',
+    'handoff-start-blocked',
+    'handoff-show',
+    'handoff-uncertain',
     'repository-explicit',
     'repository-saved',
     'repository-credits',
@@ -476,6 +557,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     'accept-approval-mismatch',
     'accept-approval-ambiguous',
   ]) {
+    const handing = scenario.startsWith('handoff-');
     const verification = scenario.startsWith('evaluation-verification');
     const savedEvaluation =
       scenario === 'evaluation-saved' || scenario === 'evaluation-verification-saved';
@@ -506,7 +588,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     };
     const anthropicSaved = scenario === 'anthropic-saved' || scenario === 'anthropic-show';
     const googleSaved = scenario === 'google-saved' || scenario === 'google-show';
-    const selectedNativeRun: Snapshot['nativeRuns'][number] = repositorySaved
+    const baseNativeRun: Snapshot['nativeRuns'][number] = repositorySaved
       ? {
           runId: run.id,
           profileId: repositoryProfile.id,
@@ -530,6 +612,48 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
               permissionMode: 'strict',
             }
           : nativeRun;
+    const handoff: NonNullable<Snapshot['nativeRuns'][number]['handoff']> = {
+      targets: [
+        {
+          profileId: 'openai-file-v1',
+          creditPolicy: scenario === 'handoff-openai-credits' ? 'existing-credits' : 'ordinary',
+        },
+        { profileId: 'anthropic-file-v1', creditPolicy: 'ordinary' },
+        { profileId: 'google-file-v1', creditPolicy: 'ordinary' },
+      ],
+      currentAttemptId: `att_${suffix}`,
+      generation: 0,
+      prepare:
+        scenario === 'handoff-blocked'
+          ? { available: false, reason: 'ownership-unknown' }
+          : { available: true, reason: 'available' },
+      ...(['handoff-start', 'handoff-start-blocked', 'handoff-show', 'handoff-uncertain'].includes(
+        scenario,
+      )
+        ? {
+            pending: {
+              preparationId: artifact.id,
+              packetId: `hnd_${suffix}`,
+              fromAttemptId: `att_${suffix}`,
+              generation: 1,
+              recipient: {
+                profileId: 'google-file-v1' as const,
+                creditPolicy: 'ordinary' as const,
+              },
+              baseHash: '7'.repeat(64),
+              bytes: 35,
+              expiresAt: nativeRun.expiresAt,
+              start:
+                scenario === 'handoff-start-blocked'
+                  ? { available: false as const, reason: 'source-changed' as const }
+                  : { available: true as const, reason: 'available' as const },
+            },
+          }
+        : {}),
+    };
+    const selectedNativeRun: Snapshot['nativeRuns'][number] = handing
+      ? { ...baseNativeRun, stage: 'retain-only', handoff }
+      : baseNativeRun;
     const evaluating =
       scenario === 'repository-reviewer' ||
       scenario === 'anthropic-reviewer' ||
@@ -635,6 +759,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
             },
           ]
         : [];
+    const creationCase = creationCases.find((value) => scenario === `setup-${value.name}`);
     const fixture = await serve((message, socket) => {
       if (message.type === 'hello')
         socket.write(encodeFrame({ type: 'welcome', protocol: 1, cursor: snapshot.cursor }));
@@ -679,7 +804,8 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
                     googleSaved ||
                     repositorySaved ||
                     evaluating ||
-                    needsApproval
+                    needsApproval ||
+                    handing
                   ? [
                       {
                         ...task,
@@ -694,7 +820,8 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
                 googleSaved ||
                 repositorySaved ||
                 evaluating ||
-                needsApproval
+                needsApproval ||
+                handing
                   ? [run]
                   : [],
               attempts: needsApproval
@@ -714,7 +841,8 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
                 anthropicSaved ||
                 googleSaved ||
                 repositorySaved ||
-                evaluating
+                evaluating ||
+                handing
                   ? [selectedNativeRun]
                   : [],
               candidates: evaluating || needsApproval ? [candidate] : [],
@@ -755,6 +883,8 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         };
         pendingCommand = command;
       }
+      if (command.command === 'StartNativeHandoff' && scenario === 'handoff-uncertain')
+        result = { outcome: 'outcome-unknown', reason: 'connection-lost' };
       if (command.command === 'AcceptCandidate' && scenario === 'accept-uncertain')
         result = { outcome: 'outcome-unknown', reason: 'publication-prepared' };
       if (command.command === 'GetArtifact') {
@@ -772,6 +902,19 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
           },
         };
       }
+      if (command.command === 'RegisterProject')
+        result = {
+          outcome: scenario === 'setup-project-existing' ? 'already-applied' : 'applied',
+          entity: project,
+          revision: 0,
+        };
+      if (command.command === 'CreateTask')
+        result =
+          scenario === 'setup-task-blocked'
+            ? { outcome: 'blocked', reason: 'project-not-found' }
+            : scenario === 'setup-task-uncertain' && received.length === 1
+              ? { outcome: 'outcome-unknown', reason: 'connection-lost' }
+              : { outcome: 'applied', entity: createdTask, revision: 0 };
       socket.write(encodeFrame({ type: 'result', key: command.key, result }));
     });
     context.after(() => fixture.close());
@@ -999,7 +1142,210 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
                   ...(scenario === 'repository-mode-option' ? ['--permission-mode', 'strict'] : []),
                 ];
     }
-    const result = await execute(args, scenario !== 'changes');
+    if (handing) {
+      if (scenario.startsWith('handoff-target')) {
+        args = [
+          'task',
+          'prepare-native',
+          task.id,
+          profile.id,
+          'docs/providers.md',
+          '--policy',
+          policyFile,
+          '--native-trust',
+          '--source-consent',
+          '--handoff-target',
+          scenario === 'handoff-target-repository' ? repositoryProfile.id : 'anthropic-file-v1',
+        ];
+        if (scenario === 'handoff-targets')
+          args.push('--handoff-target', 'openai-file-v1:existing-credits');
+        if (scenario === 'handoff-target-duplicate')
+          args.push('--handoff-target', 'anthropic-file-v1');
+        if (scenario === 'handoff-target-wrong-command')
+          args = ['native', 'profiles', '--handoff-target', 'anthropic-file-v1'];
+      } else if (scenario === 'handoff-show') args = ['task', 'show', task.id];
+      else if (['handoff-start', 'handoff-start-blocked', 'handoff-uncertain'].includes(scenario))
+        args = ['task', 'start-handoff', task.id];
+      else {
+        const recipient =
+          scenario === 'handoff-google'
+            ? googleProfile.id
+            : ['handoff-anthropic', 'handoff-missing-attestation'].includes(scenario)
+              ? anthropicProfile.id
+              : scenario === 'handoff-unlisted'
+                ? repositoryProfile.id
+                : profile.id;
+        args = [
+          'task',
+          'prepare-handoff',
+          task.id,
+          recipient,
+          ...(scenario === 'handoff-missing-consent' ? [] : ['--native-trust', '--source-consent']),
+          ...(['handoff-anthropic', 'handoff-google'].includes(scenario)
+            ? ['--confirm-subscription-only']
+            : []),
+          ...(scenario === 'handoff-google' ? ['--permission-mode', 'request-review'] : []),
+          ...(scenario === 'handoff-openai-credits' ? ['--existing-credits'] : []),
+        ];
+      }
+    }
+    if (creationCase) args = creationCase.args;
+    const result = await execute(args, scenario !== 'changes' && !creationCase?.plain);
+    if (creationCase) {
+      if (creationCase.invalid) {
+        assert.equal(result.code, 1, scenario);
+        assert(result.errors.length > 0, scenario);
+        assert.deepEqual(received, [], scenario);
+        continue;
+      }
+      const registering = creationCase.name.startsWith('project');
+      assert.equal(
+        result.code,
+        ['task-blocked', 'task-uncertain'].includes(creationCase.name) ? 2 : 0,
+        scenario,
+      );
+      assert.equal(received.length, 1, scenario);
+      const command = received[0];
+      assert.equal(command.command, registering ? 'RegisterProject' : 'CreateTask');
+      assert.equal(command.expectedRevision, 0);
+      assert.deepEqual(command.actor, actor);
+      assert.deepEqual(
+        command.payload,
+        registering
+          ? { path: resolve(creationCase.args[2]) }
+          : {
+              projectId: project.id,
+              title: task.title,
+              outcome: task.outcome,
+              criteria: [...task.criteria, 'The original source stays unchanged'],
+            },
+      );
+      if (creationCase.plain) {
+        assert(
+          result.output.includes(
+            `${registering ? 'Project' : 'Task'} ${registering ? project.id : createdTask.id}`,
+          ),
+        );
+        assert(result.output.includes(`Command key ${command.key}`));
+      } else {
+        const receipt = JSON.parse(result.output);
+        assert.deepEqual(receipt.command, command);
+        if (creationCase.name === 'task-blocked')
+          assert.equal(receipt.result.reason, 'project-not-found');
+        else if (creationCase.name === 'task-uncertain') {
+          assert.equal(receipt.result.outcome, 'outcome-unknown');
+          const file = join(fixture.home, 'creation-receipt.json');
+          writeFileSync(file, result.output);
+          const retried = await execute(['retry', file]);
+          assert.equal(retried.code, 0);
+          assert.deepEqual(received, [command, command]);
+          assert.deepEqual(JSON.parse(retried.output).result.entity, createdTask);
+        } else assert.deepEqual(receipt.result.entity, registering ? project : createdTask);
+      }
+      continue;
+    }
+    if (handing) {
+      const rejected = [
+        'handoff-target-duplicate',
+        'handoff-target-repository',
+        'handoff-target-wrong-command',
+        'handoff-missing-consent',
+        'handoff-missing-attestation',
+        'handoff-unlisted',
+        'handoff-blocked',
+        'handoff-start-blocked',
+      ].includes(scenario);
+      if (rejected) {
+        assert.equal(result.code, 1, result.errors);
+        assert.equal(
+          received.some((command) => command.command !== 'GetSnapshot'),
+          false,
+        );
+        if (
+          [
+            'handoff-target-duplicate',
+            'handoff-target-repository',
+            'handoff-target-wrong-command',
+            'handoff-missing-consent',
+          ].includes(scenario)
+        )
+          assert.deepEqual(received, []);
+        if (scenario === 'handoff-blocked') assert.match(result.errors, /ownership-unknown/u);
+        if (scenario === 'handoff-start-blocked') assert.match(result.errors, /source-changed/u);
+      } else if (scenario === 'handoff-show') {
+        assert.equal(result.code, 0, result.errors);
+        assert.deepEqual(JSON.parse(result.output).nativeRun.handoff, handoff);
+        const plain = await execute(args, false);
+        for (const value of [
+          handoff.pending?.preparationId,
+          handoff.pending?.packetId,
+          handoff.pending?.baseHash,
+          'Retained unverified base',
+          'Original limits 4 attempts, 5 minutes',
+          'Start available',
+        ])
+          assert(plain.output.includes(value as string));
+        assert(received.every((command) => command.command === 'GetSnapshot'));
+      } else {
+        assert.equal(result.code, scenario === 'handoff-uncertain' ? 2 : 0, result.errors);
+        const receipt = JSON.parse(result.output);
+        assert.equal(receipt.command.expectedRevision, task.revision);
+        if (scenario === 'handoff-targets') {
+          assert.equal(receipt.command.command, 'PrepareNativeRun');
+          assert.deepEqual(receipt.command.payload.handoffTargets, [
+            { profileId: 'anthropic-file-v1', creditPolicy: 'ordinary' },
+            { profileId: 'openai-file-v1', creditPolicy: 'existing-credits' },
+          ]);
+          assert.deepEqual(receipt.command.payload.policy, policy);
+        } else if (scenario === 'handoff-start' || scenario === 'handoff-uncertain') {
+          assert.equal(receipt.command.command, 'StartNativeHandoff');
+          assert.deepEqual(receipt.command.payload, {
+            taskId: task.id,
+            runId: run.id,
+            preparationId: artifact.id,
+          });
+          if (scenario === 'handoff-uncertain') {
+            const file = join(fixture.home, 'handoff-receipt.json');
+            writeFileSync(file, result.output);
+            const retried = await execute(['retry', file]);
+            assert.equal(retried.code, 2);
+            assert.deepEqual(JSON.parse(retried.output).command, receipt.command);
+          }
+        } else {
+          const profileId: string =
+            scenario === 'handoff-google'
+              ? googleProfile.id
+              : scenario === 'handoff-anthropic'
+                ? anthropicProfile.id
+                : profile.id;
+          assert.equal(receipt.command.command, 'PrepareNativeHandoff');
+          assert.deepEqual(receipt.command.payload, {
+            taskId: task.id,
+            runId: run.id,
+            fromAttemptId: handoff.currentAttemptId,
+            profileId,
+            creditPolicy: scenario === 'handoff-openai-credits' ? 'existing-credits' : 'ordinary',
+            consent: 'explicit',
+            ...(['handoff-anthropic', 'handoff-google'].includes(scenario)
+              ? { billingAttestation }
+              : {}),
+            ...(scenario === 'handoff-google' ? { permissionMode: 'request-review' } : {}),
+          });
+        }
+        assert.equal(received[0].command, 'GetSnapshot');
+        assert.equal(
+          received.filter(
+            (command) =>
+              command.command === 'PrepareNativeHandoff' ||
+              command.command === 'StartNativeHandoff' ||
+              command.command === 'PrepareNativeRun',
+          ).length,
+          scenario === 'handoff-uncertain' ? 2 : 1,
+        );
+      }
+      continue;
+    }
+
     if (scenario.startsWith('repository-')) {
       if (scenario === 'repository-show') {
         assert.equal(result.code, 0, result.errors);
