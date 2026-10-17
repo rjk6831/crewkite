@@ -42,7 +42,7 @@ The combined controller claim lives in a separate test file and reuses the nativ
 
 The provider claims use fixed transcripts and scripted child processes to check metadata projection, request and attempt correlation, bounded replacement output and owned cleanup. The fixtures establish no native account, billing or route readiness.
 
-The current desktop host supplies unknown token use and capacity to the context gauge. Its controlled display states establish no retained provider context measurement.
+The OpenAI planning path retains the latest reported last-context token count and any reported capacity after an accepted reply and proven process closure. The gauge labels that immutable observation last observed. Missing capacity leaves the percentage unknown. An absent observation or a different run, model or client remains unknown. The gauge estimates no current fill and borrows no capacity from Local execution.
 
 The retained-proposal table also checks the shared evaluation preview. Repeated reads create no receipts, artifacts or intents. Changed grants, consent, checks or reviewer support make Start unavailable; completed evidence survives later expiry. The preview reports the remaining original run budget. Start commands still enforce their own guards.
 
