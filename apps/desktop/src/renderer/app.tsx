@@ -2945,7 +2945,10 @@ function Usage({
       ...(scope.primary.weekly ? [usageReading(scope.primary.weekly, 'Weekly')] : []),
       ...(scope.primary.fiveHour ? [usageReading(scope.primary.fiveHour, 'Five-hour')] : []),
     ],
-    auxiliary: scope.satellites.map((reading) => usageReading(reading)),
+    featured: scope.featured ? usageReading(scope.featured) : null,
+    auxiliary: scope.satellites
+      .filter((reading) => reading !== scope.featured)
+      .map((reading) => usageReading(reading)),
     emptyText: 'No usage observations.',
   }));
   const local = snapshot.routes.find(({ family }) => family === 'local');
