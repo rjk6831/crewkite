@@ -43,7 +43,7 @@
   <path class="edge" d="M260 428 H320"/>
   <path class="edge" d="M550 428 H610"/>
   <path class="edge" d="M840 428 H900"/>
-  <text x="570" y="515" text-anchor="middle" class="detail">Checks, review and acceptance depend on profile support. Local proposals retain and export only.</text>
+  <text x="570" y="515" text-anchor="middle" class="detail">Checks, review and acceptance depend on profile support and separate authority.</text>
   <text x="570" y="565" text-anchor="middle">Stop path from owned work</text>
   <rect class="node" x="30" y="600" width="250" height="75" rx="8"/>
   <text x="155.0" y="629" text-anchor="middle">Stopping</text>

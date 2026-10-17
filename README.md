@@ -7,7 +7,7 @@
 
 CrewKite is a desktop workspace and CLI for coding tasks that share one local controller. It tracks approvals, usage observations and retained work across provider routes.
 
-I am preparing the D2 candidate for real-project user acceptance on macOS with Apple Silicon. The normal workspace starts without a synthetic project or seeded route catalog. Native profiles connect to their supported clients; Local setup uses an explicit authenticated loopback connection. Availability is separate from qualification. The separate Google ACP profile binds its supported mappings to an exact imported client bundle. The [roadmap](docs/roadmap.md) keeps the required live evidence, ten real tasks and acceptance gates open.
+I am preparing the D2 candidate for real-project user acceptance on macOS with Apple Silicon. The normal workspace starts without a synthetic project or seeded route catalog. Native profiles connect to their supported clients; Local setup uses an explicitly configured loopback connection. Availability is separate from qualification. The separate Google ACP profile binds its supported mappings to an exact imported client bundle. The [roadmap](docs/roadmap.md) keeps the required live evidence, ten real tasks and acceptance gates open.
 
 ## Why I am building it
 
@@ -36,7 +36,7 @@ The [provider notes](docs/providers.md) separate implemented paths from dated qu
 
 ## Task workflow
 
-Open Usage and capacity to inspect route availability and explicit provider setup. Local setup connects to a dedicated loopback runtime, refreshes its observed model list and saves one selection. It loads no model. An eligible loaded model remains unqualified; the [provider notes](docs/providers.md#local-models) describe the current limits.
+Open Usage and capacity to inspect route availability and explicit provider setup. Local setup connects to a dedicated loopback runtime, refreshes its observed model list and saves one selection. Dedicated token is the default. An explicit CLI configuration can select no authentication, this device only; the desktop reports that saved mode without a selector or silent fallback. That mode needs no token input after restart. Setup loads no model. An eligible loaded model remains unqualified; the [provider notes](docs/providers.md#local-models) describe the current limits.
 
 Choose New task, select a registered project and review the planning permission before sending. Conversation is the main task view. Answer the primary role's questions and inspect the proposed criteria and scope before choosing Adopt plan. Adoption saves the task contract and opens separate execution preparation. It starts no coding work.
 

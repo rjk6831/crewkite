@@ -5,13 +5,15 @@
 
 ## Context
 
-A Local runtime exposes authenticated loopback inference. ADR 0005 leaves cloud-provider credentials with their native clients. Reusing a subscription credential for Local access would cross that boundary. I need a separate, explicit credential for the Local connection without turning the renderer or saved configuration into a secret store.
+A Local runtime can require a dedicated connection token or expose inference without authentication on this device's loopback address. ADR 0005 leaves cloud-provider credentials with their native clients. Reusing a subscription credential for Local access would cross that boundary. I need an explicit Local authentication mode without turning the renderer or saved configuration into a secret store.
 
 ## Decision
 
-I propose a narrow exception for a dedicated Local runtime credential entered through the fixed packaged native input helper. The endpoint is a literal loopback address, `ws://127.0.0.1:<port>`. The controller holds the credential in memory, bound to the current connection revision and hash. Logs, snapshots, receipts and persisted setup exclude its value. Restart requires input again. A changed connection or explicit disconnect revokes the in-memory authority.
+I keep dedicated-token mode as the default and propose a narrow exception for its Local runtime credential entered through the fixed packaged native input helper. The endpoint is a literal loopback address, `ws://127.0.0.1:<port>`. The controller holds the credential in memory, bound to the current connection revision and hash. Logs, snapshots, receipts and persisted setup exclude its value. Restart requires token input again. A changed connection or explicit disconnect revokes the in-memory authority.
 
 The runtime manifest binds the packaged Node, helper and native source hashes. Missing capability keeps input unavailable. No renderer field, caller executable path, environment override or cloud credential store supplies this value.
+
+I also allow an explicit no-authentication configuration for a runtime set up that way on this device. The CLI configures that mode; the desktop only reports it. Connect records a nonsecret confirmation that survives restart for the same configuration, with no token prompt. The endpoint remains literal loopback. This sends no credential and never follows a failed token connection automatically. Changing the endpoint or mode, or disconnecting, revokes readiness and model selection. CrewKite does not change the runtime's authentication setting.
 
 Discovery is explicit and reads installed and loaded model metadata without loading a model. Selection binds one observed eligible instance to its runtime and source preparation. Native input, discovery and generation share a durable exclusion gate. Client loss does not prove that external generation stopped; missing terminal and closure proof retains unknown ownership across restart.
 
