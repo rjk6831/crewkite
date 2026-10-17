@@ -21,6 +21,7 @@ import { hashCanonical } from '@crewkite/contracts/hash';
 import { syntheticCheckDefinition } from '@crewkite/testkit/repository';
 import { z } from 'zod';
 import type { ArtifactFiles } from '../artifacts/index.ts';
+import { type CheckOwner, parseCheckOwner } from '../host/check-ownership.ts';
 import {
   type FileContent,
   type FileEntry,
@@ -30,7 +31,15 @@ import {
   safePath,
   treeFromFiles,
 } from '../host/source.ts';
+import { groupAbsent } from '../host/worker.ts';
 import type { IdPrefix } from '../store/ids.ts';
+import {
+  type ToolchainDefinition,
+  ToolchainDefinitionSchema,
+  validToolchainDefinition,
+  verificationStages,
+} from './toolchain-definition.ts';
+import { type VerificationExecution, verificationCommand } from './toolchain-verify.ts';
 
 type Manifest = { base: string; files: FileEntry[] };
 const checkFile = z.strictObject({
@@ -66,6 +75,11 @@ export const NodeCheckDefinitionSchema = z.discriminatedUnion('recipeId', [
   }),
 ]);
 export type NodeCheckDefinition = z.infer<typeof NodeCheckDefinitionSchema>;
+export const CheckDefinitionSchema = z.union([
+  NodeCheckDefinitionSchema,
+  ToolchainDefinitionSchema,
+]);
+export type CheckDefinition = z.infer<typeof CheckDefinitionSchema>;
 export type CheckPlan = NodeCheckDefinition & { directory: string };
 export type NodeCheckSelection =
   | { recipeId: 'node-tests-v1' }
@@ -146,9 +160,16 @@ function definition(
 }
 
 export function completedCheckDefinitionMatches(
-  saved: NodeCheckDefinition,
-  current: NodeCheckDefinition,
+  saved: CheckDefinition,
+  current: CheckDefinition,
 ): boolean {
+  if (saved.recipeId === 'crewkite-verify-v1' || current.recipeId === 'crewkite-verify-v1')
+    return (
+      saved.recipeId === current.recipeId &&
+      validToolchainDefinition(saved) &&
+      validToolchainDefinition(current) &&
+      hashCanonical(saved) === hashCanonical(current)
+    );
   const historical = NodeCheckDefinitionSchema.safeParse(saved);
   const observed = NodeCheckDefinitionSchema.safeParse(current);
   if (!historical.success || !observed.success) return false;
@@ -252,6 +273,244 @@ function report(
     tests.every((test) => test.passed === true && test.skipped === false && test.todo === false) &&
     requiredComplete;
   return { complete, tests: counts.tests };
+}
+
+const positiveInteger = z.number().int().positive();
+const signal = z.custom<NodeJS.Signals>(
+  (value) => typeof value === 'string' && /^SIG[A-Z0-9]+$/.test(value),
+);
+const checkOwner = z.custom<CheckOwner>((value) => {
+  try {
+    parseCheckOwner(value);
+    return true;
+  } catch {
+    return false;
+  }
+});
+const verificationRoot = z
+  .strictObject({
+    id: z.string().regex(/^[a-f0-9-]{36}\.jsonl$/),
+    intent: z.strictObject({
+      type: z.literal('intent'),
+      owner: checkOwner,
+      role: z.enum(['stage', 'fixture', 'worker', 'check', 'controller', 'electron', 'watcher']),
+      detached: z.boolean(),
+    }),
+    acknowledgment: z
+      .strictObject({ type: z.literal('ack'), pid: positiveInteger, group: positiveInteger })
+      .optional(),
+    terminal: z
+      .strictObject({
+        type: z.literal('close'),
+        code: z.number().int().nullable(),
+        signal: signal.nullable(),
+      })
+      .optional(),
+    spawnFailed: z.boolean(),
+  })
+  .refine(
+    (root) => root.spawnFailed || (root.terminal?.code ?? 0) >= 0,
+    'Only a failed spawn may report a negative terminal code.',
+  );
+const treeMode = z.number().int().min(0).max(0o7777);
+const buildInventory = z.strictObject({
+  version: z.literal(1),
+  entries: z
+    .array(
+      z.discriminatedUnion('kind', [
+        z.strictObject({
+          path: NativeTargetPathSchema,
+          kind: z.literal('file'),
+          mode: treeMode,
+          bytes: z
+            .number()
+            .int()
+            .nonnegative()
+            .max(8 * 1024 ** 3),
+          hash: HashSchema,
+        }),
+        z.strictObject({
+          path: z.union([z.literal('.'), NativeTargetPathSchema]),
+          kind: z.literal('directory'),
+          mode: treeMode,
+        }),
+      ]),
+    )
+    .min(1)
+    .max(500000),
+  files: z.number().int().nonnegative(),
+  bytes: z
+    .number()
+    .int()
+    .nonnegative()
+    .max(8 * 1024 ** 3),
+  hash: HashSchema,
+});
+const verificationExecution = z.strictObject({
+  version: z.literal(1),
+  attemptId: z.string().min(1).max(200),
+  generation: z.number().int().nonnegative(),
+  definitionHash: HashSchema,
+  stages: z
+    .array(
+      z.strictObject({
+        stage: z.enum(verificationStages),
+        commandHash: HashSchema,
+        code: z.number().int().nonnegative().nullable(),
+        signal: signal.nullable(),
+        closed: z.boolean(),
+        stdout: z.string().max(24 * 1024 * 1024),
+        stderr: z.string().max(24 * 1024 * 1024),
+      }),
+    )
+    .max(6),
+  roots: z.array(verificationRoot).max(4096),
+  quiescent: z.boolean(),
+  unchanged: z.boolean(),
+  build: buildInventory.nullable(),
+  failure: z.enum(['cancelled', 'deadline', 'identity', 'stage', 'ownership']).nullable(),
+});
+const verificationMetadata = z.strictObject({
+  candidateId: CandidateSchema.shape.id,
+  candidateHash: HashSchema,
+  definitionHash: HashSchema,
+  evaluator: z.string().min(1).max(200),
+  passed: z.boolean(),
+  unchanged: z.boolean(),
+  complete: z.boolean(),
+  tests: z.number().int().nonnegative(),
+  log: ArtifactSchema,
+  verification: z.strictObject({ artifact: ArtifactSchema, owner: checkOwner }),
+});
+
+function verificationReport(
+  definition: ToolchainDefinition,
+  execution: z.infer<typeof verificationExecution>,
+  owner: CheckOwner,
+  fresh: boolean,
+): { complete: boolean; tests: number } {
+  if (
+    !validToolchainDefinition(definition) ||
+    execution.attemptId !== owner.attemptId ||
+    execution.generation !== owner.generation ||
+    execution.definitionHash !== definition.definitionHash ||
+    execution.failure !== null ||
+    !execution.unchanged ||
+    !execution.quiescent ||
+    execution.stages.length !== verificationStages.length ||
+    !execution.build
+  )
+    return { complete: false, tests: 0 };
+  const groups = new Set(
+    execution.roots
+      .filter((root) => root.intent.detached && root.acknowledgment)
+      .map((root) => root.acknowledgment?.group),
+  );
+  if (
+    new Set(execution.roots.map((root) => root.id)).size !== execution.roots.length ||
+    execution.roots.some((root) => {
+      const context = root.intent.owner;
+      const ack = root.acknowledgment;
+      return (
+        context.attemptId !== owner.attemptId ||
+        context.generation !== owner.generation ||
+        context.directory !== owner.directory ||
+        context.stateRoot !== owner.stateRoot ||
+        context.electronExecutable !== owner.electronExecutable ||
+        (root.spawnFailed
+          ? !!ack || root.intent.role === 'stage'
+          : !ack ||
+            !root.terminal ||
+            (root.terminal.code === null && root.terminal.signal === null)) ||
+        (!!ack &&
+          (ack.group !== (root.intent.detached ? ack.pid : context.parentGroup) ||
+            (!root.intent.detached && !groups.has(ack.group)) ||
+            (fresh && !groupAbsent(ack.group))))
+      );
+    })
+  )
+    return { complete: false, tests: 0 };
+  let bytes = 0;
+  let tests = 0;
+  for (const [index, stage] of execution.stages.entries()) {
+    const roots = execution.roots.filter(
+      (root) => root.intent.role === 'stage' && root.intent.owner.stage === stage.stage,
+    );
+    if (
+      stage.stage !== verificationStages[index] ||
+      stage.commandHash !== hashCanonical(verificationCommand(definition, stage.stage)) ||
+      stage.code !== 0 ||
+      stage.signal !== null ||
+      !stage.closed ||
+      roots.length !== 1 ||
+      !roots[0].intent.detached ||
+      roots[0].terminal?.code !== 0 ||
+      roots[0].terminal.signal !== null
+    )
+      return { complete: false, tests: 0 };
+    const outputs = [stage.stdout, stage.stderr].map((text) => {
+      const value = Buffer.from(text, 'base64');
+      if (value.toString('base64') !== text) throw Error('Verification output encoding changed.');
+      bytes += value.length;
+      return value;
+    });
+    if (bytes > 16 * 1024 * 1024) return { complete: false, tests: 0 };
+    if (stage.stage !== 'node-tests' && stage.stage !== 'desktop') continue;
+    const collection =
+      stage.stage === 'node-tests'
+        ? definition.collection.map((file) => ({ path: file.path, tests: file.tests }))
+        : [{ path: definition.journey.file, tests: [definition.journey.title] }];
+    const result = report(outputs[0], { files: collection.map((file) => file.path) });
+    const frames = outputs[0]
+      .toString('utf8')
+      .trimEnd()
+      .split('\n')
+      .map((line) => CheckEventSchema.parse(JSON.parse(line)));
+    const rows = frames.filter((row) => row.type === 'test');
+    const summaries = frames.filter((row) => row.type === 'summary' && row.file !== null);
+    const required = collection.flatMap((file) =>
+      file.tests.map((name) => ({ path: file.path, name })),
+    );
+    if (
+      !result.complete ||
+      result.tests !== required.length ||
+      rows.length !== required.length ||
+      summaries.length !== collection.length ||
+      (stage.stage === 'desktop' &&
+        (frames.length !== 5 ||
+          frames[1].type !== 'test' ||
+          frames[2].type !== 'summary' ||
+          frames[2].file !== definition.journey.file ||
+          frames[3].type !== 'summary' ||
+          frames[3].file !== null)) ||
+      required.some(
+        (test) =>
+          rows.filter(
+            (row) => row.kind === 'test' && row.file === test.path && row.name === test.name,
+          ).length !== 1,
+      )
+    )
+      return { complete: false, tests: 0 };
+    tests += result.tests;
+  }
+  const build = execution.build;
+  const files = build.entries.filter((entry) => entry.kind === 'file');
+  const hash = createHash('sha256');
+  for (const row of [{ version: 1, files: build.files, bytes: build.bytes }, ...build.entries])
+    hash.update(`${JSON.stringify(row)}\n`);
+  if (
+    build.entries[0].path !== '.' ||
+    build.entries[0].kind !== 'directory' ||
+    build.entries.some((entry, index, all) => index > 0 && all[index - 1].path >= entry.path) ||
+    build.files !== files.length ||
+    build.bytes !== files.reduce((sum, file) => sum + file.bytes, 0) ||
+    hash.digest('hex') !== build.hash ||
+    ['main/index.js', 'preload/index.cjs', 'renderer/index.html'].some(
+      (path) => !files.some((file) => file.path === path && file.bytes > 0),
+    )
+  )
+    return { complete: false, tests: 0 };
+  return { complete: true, tests };
 }
 
 export class CandidateEvidence {
@@ -579,5 +838,134 @@ export class CandidateEvidence {
       artifactId: metadata.id,
     });
     return { evidence, artifacts: [log, metadata] };
+  }
+
+  private verificationInventory(definition: ToolchainDefinition): boolean {
+    const content = this.artifacts.read(definition.inventory.hash);
+    const saved = z
+      .object({ version: z.literal(1), hash: HashSchema })
+      .parse(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(content)));
+    return content.length === definition.inventory.bytes && saved.hash === definition.toolchainHash;
+  }
+
+  recordVerification(input: {
+    candidate: Candidate;
+    definition: ToolchainDefinition;
+    execution: VerificationExecution;
+    owner: CheckOwner;
+  }): { evidence: CheckResult; artifacts: Artifact[] } {
+    const { candidate, definition } = input;
+    const owner = parseCheckOwner(input.owner);
+    this.read(candidate);
+    if (
+      !validToolchainDefinition(definition) ||
+      definition.candidateId !== candidate.id ||
+      definition.candidateHash !== candidate.hash
+    )
+      throw Error('Verification does not bind the candidate and definition.');
+    const execution = verificationExecution.parse(input.execution);
+    const proofBytes = Buffer.from(canonicalJson(execution));
+    if (proofBytes.length > MAX_BYTES)
+      throw Error('Verification proof exceeds its artifact bound.');
+    let unchanged = false;
+    let complete = false;
+    let tests = 0;
+    try {
+      unchanged = execution.unchanged && this.verificationInventory(definition);
+      ({ complete, tests } = verificationReport(definition, execution, owner, true));
+    } catch {
+      // Missing records and unreadable artifacts leave a failed check for inspection.
+    }
+    const passed = unchanged && complete;
+    const proof = this.publish(proofBytes, 'application/vnd.crewkite.verification+json');
+    const log = this.publish(
+      Buffer.from(
+        canonicalJson(
+          execution.stages.map(({ stage, code, signal, closed }) => ({
+            stage,
+            code,
+            signal,
+            closed,
+          })),
+        ),
+      ),
+      'text/plain',
+    );
+    const metadata = this.publish(
+      Buffer.from(
+        canonicalJson({
+          candidateId: candidate.id,
+          candidateHash: candidate.hash,
+          definitionHash: definition.definitionHash,
+          evaluator: definition.evaluator,
+          passed,
+          unchanged,
+          complete,
+          tests,
+          log,
+          verification: { artifact: proof, owner },
+        }),
+      ),
+      'application/vnd.crewkite.check+json',
+    );
+    const evidence = CheckResultSchema.parse({
+      candidateId: candidate.id,
+      candidateHash: candidate.hash,
+      definitionHash: definition.definitionHash,
+      evaluator: definition.evaluator,
+      passed,
+      artifactId: metadata.id,
+    });
+    return { evidence, artifacts: [log, proof, metadata] };
+  }
+
+  verificationMatches(input: {
+    candidate: Candidate;
+    definition: ToolchainDefinition;
+    metadata: unknown;
+    owner: CheckOwner;
+  }): boolean {
+    try {
+      const { candidate, definition } = input;
+      const owner = parseCheckOwner(input.owner);
+      const metadata = verificationMetadata.parse(input.metadata);
+      if (
+        !validToolchainDefinition(definition) ||
+        candidate.id !== definition.candidateId ||
+        candidate.hash !== definition.candidateHash ||
+        metadata.candidateId !== candidate.id ||
+        metadata.candidateHash !== candidate.hash ||
+        metadata.definitionHash !== definition.definitionHash ||
+        metadata.evaluator !== definition.evaluator ||
+        !metadata.passed ||
+        !metadata.complete ||
+        !metadata.unchanged ||
+        hashCanonical(metadata.verification.owner) !== hashCanonical(owner) ||
+        !this.verificationInventory(definition)
+      )
+        return false;
+      this.read(candidate);
+      const read = (reference: Artifact) => {
+        if (
+          hashCanonical(ArtifactSchema.parse(this.getArtifact(reference.id))) !==
+          hashCanonical(reference)
+        )
+          throw Error('Verification artifact reference changed.');
+        const bytes = this.artifacts.read(reference.hash);
+        if (bytes.length !== reference.bytes) throw Error('Verification artifact size changed.');
+        return bytes;
+      };
+      read(metadata.log);
+      const execution = verificationExecution.parse(
+        JSON.parse(
+          new TextDecoder('utf-8', { fatal: true }).decode(read(metadata.verification.artifact)),
+        ),
+      );
+      // Saved process identities describe completed work. Reopening never probes reused PIDs.
+      const result = verificationReport(definition, execution, owner, false);
+      return result.complete && result.tests === metadata.tests;
+    } catch {
+      return false;
+    }
   }
 }
