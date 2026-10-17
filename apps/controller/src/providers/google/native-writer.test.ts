@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { userInfo } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
 import { spawnCheckChild as spawn } from '../../host/check-ownership.ts';
@@ -40,6 +41,7 @@ test('the google writer returns a bounded replacement only after its admitted pr
   const home = mkdtempSync(resolve('internal/google-writer-'));
   const directory = join(home, 'scratch');
   const runtime = join(home, 'runtime');
+  const environment = { ...process.env, HOME: userInfo().homedir };
   mkdirSync(directory, { mode: 0o700 });
   mkdirSync(runtime, { mode: 0o700 });
   const groups: number[] = [];
@@ -47,6 +49,7 @@ test('the google writer returns a bounded replacement only after its admitted pr
   const fixture = String.raw`#!${process.execPath}
 import { spawn } from 'node:child_process';
 import assert from 'node:assert/strict';
+import { checkOwner } from ${JSON.stringify(new URL('../../host/check-ownership.ts', import.meta.url).href)};
 const args=process.argv.slice(2);
 const value=flag=>args[args.indexOf(flag)+1];
 const prompt=value('--print');
@@ -55,7 +58,8 @@ const file=JSON.parse(prompt.split('\nFile: ')[1]);
 assert(args.includes('--sandbox')&&args.includes('--disable-slash-commands'));
 assert(!args.includes('--dangerously-skip-permissions'));
 assert(process.env.HOME&&process.env.USER&&process.env.LOGNAME);
-assert(Object.keys(process.env).every(key=>['HOME','USER','LOGNAME','PATH','LANG','TERM','NO_COLOR','TMPDIR','__CF_USER_TEXT_ENCODING'].includes(key)),JSON.stringify(Object.keys(process.env)));
+const owner=checkOwner();
+assert(Object.keys(process.env).every(key=>['HOME','USER','LOGNAME','PATH','LANG','TERM','NO_COLOR','TMPDIR','__CF_USER_TEXT_ENCODING'].includes(key)||(owner&&key==='CREWKITE_CHECK_OWNER')),JSON.stringify(Object.keys(process.env)));
 const permissionMode=['strict','always-proceed','proceed-in-sandbox'].includes(mode)?mode:'request-review';
 const start={event:'init',conversation_id:'session',init:{cwd:process.cwd(),tools:['view_file'],permission_mode:permissionMode,model:value('--model')}};
 const result={event:'result',result:{conversation_id:mode==='wrong-session'?'other':'session',status:mode==='failed'?'ERROR':'SUCCESS',response:'discarded',duration_seconds:0,num_turns:1,usage:${JSON.stringify(usage)},structured_output:{...file,content:'export const total = 1;\n'}}};
@@ -438,7 +442,7 @@ else {
         temporaryDirectory: runtime,
         timeoutMs: 3000,
         environment: {
-          ...process.env,
+          ...environment,
           GOOGLE_API_KEY: 'private-canary',
           GOOGLE_APPLICATION_CREDENTIALS: 'private-canary',
         },
@@ -500,6 +504,7 @@ else {
       const selected = { ...file, path: 'src/日本 語.js' };
       const options = {
         client,
+        environment,
         admission,
         attemptId,
         repositoryRoot: resolve('.'),
@@ -589,6 +594,7 @@ else {
     for (const content of ['text\0tail', '\ud800'])
       await assert.rejects(
         runGoogleWriter({
+          environment,
           client,
           admission,
           attemptId,
@@ -619,11 +625,13 @@ else {
       'missing-evidence',
       'billing-unknown',
       'hash-mismatch',
+      'wrong-home',
     ]) {
       let spawned = false;
       const abort = new AbortController();
       const options = {
         client: mode === 'old-build' ? { ...client, version: '1.1.10' } : client,
+        environment: mode === 'wrong-home' ? { ...environment, HOME: directory } : environment,
         admission: {
           ...admission,
           permissions:
@@ -656,6 +664,7 @@ else {
           runGoogleWriter(options),
           (error) =>
             error instanceof GoogleWriterError &&
+            (mode !== 'wrong-home' || error.reason === 'identity') &&
             (mode !== 'cancelled' || error.reason === 'cancelled') &&
             (mode !== 'startup-notice' ||
               (error.diagnostic?.event === 'other' &&
@@ -675,6 +684,7 @@ else {
           'billing-unknown',
           'hash-mismatch',
           'unknown-permission',
+          'wrong-home',
         ].includes(mode)
       )
         assert.equal(spawned, false, mode);

@@ -14,7 +14,7 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, userInfo } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { type TestContext, test } from 'node:test';
@@ -2567,6 +2567,7 @@ async function nativeSetup(
     : google
       ? {
           ...reviewerProfile,
+          environment: { ...reviewerProfile.environment, HOME: userInfo().homedir },
           client: {
             executable: process.execPath,
             sha256: fixtureClientHash,
