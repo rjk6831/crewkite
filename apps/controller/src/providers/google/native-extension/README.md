@@ -20,7 +20,13 @@ The explicit command authorizes sharing that task's title, outcome, criteria, sa
 
 Preparation creates a private scratch workspace and an ignored `.crewkite-context/` sidecar. `--client cli` writes the [workspace MCP configuration](https://antigravity.google/docs/mcp#global-and-workspace-server-configs) at `.agents/mcp_config.json`. Start the native interactive CLI yourself in that workspace and inspect `/mcp`. No plugin install command is needed. `--client app` writes `.agents/plugins/crewkite-context/` containing `plugin.json` and `mcp_config.json`. Existing workspaces and configurations are refused without changes. Nothing is installed globally, and no native client is launched. The generated configuration pins the current Node executable and this source connector, so keep both available.
 
-For the app, open the scratch workspace yourself in Antigravity. Its [workspace plugin documentation](https://antigravity.google/docs/plugins#manual-plugin-installation) describes App and IDE discovery under `.agents/plugins/`. Inspect the loaded plugin and tools in the native UI before sharing work. Both targets use a [local stdio MCP server](https://antigravity.google/docs/mcp#MCP-configuration-structure), with no URL, OAuth or account configuration. Native loading and live behavior still need qualification. Folder-only plugin discovery is not claimed for the CLI.
+For the app, open the scratch workspace yourself in Antigravity. Its [workspace plugin documentation](https://antigravity.google/docs/plugins#manual-plugin-installation) describes App and IDE discovery under `.agents/plugins/`. Inspect the loaded plugin and tools in the native UI before sharing work. Both targets use a [local stdio MCP server](https://antigravity.google/docs/mcp#MCP-configuration-structure), with no URL, OAuth or account configuration. App plugin loading remains unqualified. Folder-only plugin discovery is not claimed for the CLI.
+
+## Observed CLI behavior
+
+On 17 October 2026, native interactive CLI 1.4.0 loaded all three tools from the workspace MCP configuration. One synthetic prepared task supplied its context and an empty retained patch. Each named tool call received one-call approval, and the result tool saved 306 bytes of text labelled `UNVERIFIED` in the connector sidecar. The controller snapshot stayed unchanged, with no controller intent, controller submission or candidate created. The native process exited with code zero after 270.898 seconds, and its owned group was absent. The controller also closed normally. Source, index, refs, configuration and capability bytes stayed unchanged.
+
+This qualifies that context-only CLI exchange. The app plugin and nonempty retained-patch transfer still need connected qualification. It establishes no native Stop behavior, enforced model or effort setting, full provider route or single-interface workflow. The consumer headless profile stays restricted.
 
 ## Available tools
 
