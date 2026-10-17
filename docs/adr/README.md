@@ -27,6 +27,7 @@ Each record states one decision, the context that forced it, why I chose it and 
 | [0021](0021-explicit-route-order-and-review-floors.md) | Resolve explicit route order and minimum review methods | Proposed |
 | [0022](0022-attested-billing-for-supervised-pilots.md) | Separate observed billing facts from supervised pilot attestations | Proposed |
 | [0023](0023-qualify-provider-eligibility-before-release.md) | Qualify provider eligibility before release | Proposed |
+| [0024](0024-integrate-google-through-its-published-acp-agent.md) | Integrate Google through its published ACP agent | Proposed |
 
 ## Writing a new record
 
