@@ -8,8 +8,8 @@ import {
   NativeTargetPathSchema,
   RevisionSchema,
 } from '@crewkite/contracts';
-import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
+import { localConfiguredConnectionHash } from './connection.ts';
 
 export const CONTEXT_TOKENS = 8192;
 export const OUTPUT_TOKENS = 2048;
@@ -43,13 +43,18 @@ const legacyBinding = z.strictObject({
 });
 const observedBinding = LocalObservedModelBindingSchema.extend(attemptBinding);
 export const BindingSchema = z.union([legacyBinding, observedBinding]);
-export const StartSchema = z.strictObject({
-  binding: BindingSchema,
-  endpoint: z
-    .string()
-    .regex(/^ws:\/\/127\.0\.0\.1:([1-9][0-9]{0,4})$/)
-    .refine((value) => Number(new URL(value).port) <= 65535),
+const tokenAuthentication = {
+  authMode: z.literal('token').optional(),
   token: text(4096).refine((value) => value.trim().length > 0),
+};
+const noAuthentication = { authMode: z.literal('none') };
+const endpointSchema = z
+  .string()
+  .regex(/^ws:\/\/127\.0\.0\.1:([1-9][0-9]{0,4})$/)
+  .refine((value) => Number(new URL(value).port) <= 65535);
+const startShape = {
+  binding: BindingSchema,
+  endpoint: endpointSchema,
   original: text(MAX_CONTENT_BYTES),
   task: text(8192).refine((value) => value.trim().length > 0),
   timeoutMs: z
@@ -57,7 +62,11 @@ export const StartSchema = z.strictObject({
     .int()
     .min(CLEANUP_MS + 1)
     .max(DEADLINE_MS),
-});
+};
+export const StartSchema = z.union([
+  z.strictObject({ ...startShape, ...tokenAuthentication }),
+  z.strictObject({ ...startShape, ...noAuthentication }),
+]);
 export const DiscoveryBindingSchema = z.strictObject({
   version: z.literal(1),
   operationId: CommandIdSchema,
@@ -65,17 +74,20 @@ export const DiscoveryBindingSchema = z.strictObject({
   connectionHash: HashSchema,
   connectionRevision: RevisionSchema,
 });
-export const DiscoveryStartSchema = z.strictObject({
+const discoveryStartShape = {
   kind: z.literal('discovery'),
   binding: DiscoveryBindingSchema,
-  endpoint: StartSchema.shape.endpoint,
-  token: StartSchema.shape.token,
+  endpoint: endpointSchema,
   timeoutMs: z
     .number()
     .int()
     .min(CLEANUP_MS + 1)
     .max(20000),
-});
+};
+export const DiscoveryStartSchema = z.union([
+  z.strictObject({ ...discoveryStartShape, ...tokenAuthentication }),
+  z.strictObject({ ...discoveryStartShape, ...noAuthentication }),
+]);
 export const DiscoveryTerminalSchema = z.discriminatedUnion('kind', [
   z.strictObject({
     kind: z.literal('observed'),
@@ -94,11 +106,7 @@ export function localDiscoveryPlan(value: unknown): LocalDiscoveryStart {
   const plan = DiscoveryStartSchema.parse(value);
   if (
     plan.binding.connectionHash !==
-    hashCanonical({
-      connector: 'local-sdk-v1',
-      endpoint: plan.endpoint,
-      connectionRevision: plan.binding.connectionRevision,
-    })
+    localConfiguredConnectionHash(plan.endpoint, plan.binding.connectionRevision, plan.authMode)
   )
     throw new Error('The Local discovery connection identity does not match.');
   return Object.freeze({ ...plan, binding: Object.freeze(plan.binding) });
@@ -198,18 +206,21 @@ export type LocalBinding = z.output<typeof BindingSchema>;
 export type LocalTerminal = z.output<typeof TerminalSchema>;
 export type LocalReason = z.output<typeof ReasonSchema>;
 
-export function localPlan(value: LocalStart): LocalStart {
+export function localPlan(value: unknown): LocalStart {
   const plan = StartSchema.parse(value);
   if (createHash('sha256').update(plan.original).digest('hex') !== plan.binding.baseHash)
     throw new Error('The Local original hash does not match.');
+  if (plan.authMode === 'none' && !('version' in plan.binding))
+    throw new Error('The Local authentication mode needs an observed model binding.');
   if (
     'version' in plan.binding &&
-    plan.binding.connectionHash !==
-      hashCanonical({
-        connector: plan.binding.connectorId,
-        endpoint: plan.endpoint,
-        connectionRevision: plan.binding.connectionRevision,
-      })
+    ((plan.binding.authMode ?? 'token') !== (plan.authMode ?? 'token') ||
+      plan.binding.connectionHash !==
+        localConfiguredConnectionHash(
+          plan.endpoint,
+          plan.binding.connectionRevision,
+          plan.authMode,
+        ))
   )
     throw new Error('The Local connection identity does not match.');
   return Object.freeze({ ...plan, binding: Object.freeze(plan.binding) });

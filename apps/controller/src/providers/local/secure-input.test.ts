@@ -225,6 +225,40 @@ test('Local secret input returns one current private result after helper cleanup
     localConfiguredConnectionHash(prompt.endpoint, 2),
   );
   assert.ok(selected.connection && 'version' in selected.connection.modelBinding);
+  assert.equal(selected.connection.authMode, 'token');
+  assert(!Object.hasOwn(selected.connection.modelBinding, 'authMode'));
+  assert.equal(
+    localConfiguredConnectionHash(prompt.endpoint, 2, 'token'),
+    hashCanonical({ connector: 'local-sdk-v1', endpoint: prompt.endpoint, connectionRevision: 2 }),
+  );
+  for (const connected of [false, true]) {
+    const none = resolveLocalConnection(
+      { ...selection, authMode: 'none' },
+      { ...capability, secretConfigured: false, connected },
+    );
+    assert(none.connection && 'version' in none.connection.modelBinding);
+    assert.equal(none.facts.available, connected);
+    assert.equal(none.connection.authMode, 'none');
+    assert.equal(none.connection.modelBinding.authMode, 'none');
+    assert.equal(
+      none.connection.connectionHash,
+      localConfiguredConnectionHash(prompt.endpoint, 2, 'none'),
+    );
+    assert.notEqual(none.connection.connectionHash, selected.connection.connectionHash);
+    assert.notEqual(
+      none.connection.modelBinding.setupHash,
+      selected.connection.modelBinding.setupHash,
+    );
+  }
+  assert.equal(
+    resolveLocalConnection({ ...selection, authMode: 'none' }, capability).facts.available,
+    false,
+  );
+  assert.equal(
+    resolveLocalConnection(selection, { ...capability, secretConfigured: false, connected: true })
+      .facts.available,
+    false,
+  );
   assert(!('artifactSha256' in selected.connection.modelBinding));
   assert.equal(
     selected.connection.modelBinding.setupHash,
@@ -248,6 +282,7 @@ test('Local secret input returns one current private result after helper cleanup
     { ...selection, selectionId: digest('missing choice') },
     { ...selection, observation: { ...selection.observation, observationHash: digest('stale') } },
     { ...selection, connectionRevision: -1 },
+    { ...selection, authMode: 'automatic' },
     { ...selection, receipt },
     { ...selection, observation: { ...selection.observation, models: [] } },
   ])
@@ -281,6 +316,7 @@ test('Local secret input returns one current private result after helper cleanup
     [configuration, { ...capability, platform: 'linux' }],
     [configuration, { ...capability, arch: 'x64' }],
     [{ ...configuration, token: secret }, capability],
+    [{ ...configuration, authMode: 'none' }, capability],
     [{ ...configuration, endpoint: 'ws://localhost:1234' }, capability],
     [{ ...configuration, endpoint: 'ws://127.0.0.1:65536' }, capability],
     [{ ...configuration, receipt: { ...receipt, token: secret } }, capability],

@@ -1,5 +1,6 @@
 import {
   HashSchema,
+  LocalAuthModeSchema,
   LocalModelBindingSchema,
   LocalModelObservationSchema,
   LocalNativeProfileSchema,
@@ -40,6 +41,7 @@ const configurationSchema = z.union([
   z.strictObject({ endpoint: z.unknown(), receipt: z.unknown() }),
   z.strictObject({
     endpoint: z.unknown(),
+    authMode: LocalAuthModeSchema.optional(),
     connectionRevision: RevisionSchema,
     observation: LocalModelObservationSchema,
     selectionId: HashSchema,
@@ -48,6 +50,7 @@ const configurationSchema = z.union([
 type LocalFacts = z.output<typeof LocalNativeProfileSchema>;
 export type LocalConnection = {
   endpoint: string;
+  authMode: 'token' | 'none';
   connectionHash: string;
   modelBinding: z.output<typeof LocalModelBindingSchema>;
 };
@@ -55,13 +58,22 @@ export type LocalConnectionResolution = { facts: LocalFacts; connection: LocalCo
 
 export const localConnectionHash = (endpoint: string, setupHash: string) =>
   hashCanonical({ endpoint, setupHash });
-export const localConfiguredConnectionHash = (endpoint: string, connectionRevision: number) =>
-  hashCanonical({ connector: 'local-sdk-v1', endpoint, connectionRevision });
+export const localConfiguredConnectionHash = (
+  endpoint: string,
+  connectionRevision: number,
+  authMode: 'token' | 'none' = 'token',
+) =>
+  hashCanonical({
+    connector: 'local-sdk-v1',
+    endpoint,
+    connectionRevision,
+    ...(authMode === 'none' ? { authMode } : {}),
+  });
 
 /** Explicit setup facts never trigger discovery or establish live qualification. */
 export function resolveLocalConnection(
   input: unknown,
-  capability: { platform: string; arch: string; secretConfigured: boolean },
+  capability: { platform: string; arch: string; secretConfigured: boolean; connected?: boolean },
 ): LocalConnectionResolution {
   const unavailable = (reason: LocalFacts['reason']): LocalConnectionResolution => ({
     facts: LocalNativeProfileSchema.parse({
@@ -93,7 +105,14 @@ export function resolveLocalConnection(
   if ('observation' in configuration.data) {
     const { observation, selectionId } = configuration.data;
     const { connectionRevision } = configuration.data;
-    const connectionHash = localConfiguredConnectionHash(endpoint.data, connectionRevision);
+    const authMode = configuration.data.authMode ?? 'token';
+    const connected =
+      authMode === 'none' ? capability.connected === true : capability.secretConfigured;
+    const connectionHash = localConfiguredConnectionHash(
+      endpoint.data,
+      connectionRevision,
+      authMode,
+    );
     const { observationHash, ...observed } = observation;
     if (
       hashCanonical(observed) !== observationHash ||
@@ -130,6 +149,7 @@ export function resolveLocalConnection(
       modelSizeBytes: choice.identity.sizeBytes,
       format: choice.identity.format,
       metadataHash: choice.identity.metadataHash,
+      ...(authMode === 'none' ? { authMode } : {}),
     });
     if (!binding.success) return unavailable('model-setup-unavailable');
     return {
@@ -137,11 +157,12 @@ export function resolveLocalConnection(
         ...unavailable('connection-unavailable').facts,
         model: binding.data.modelKey,
         modelBinding: binding.data,
-        available: capability.secretConfigured,
-        reason: capability.secretConfigured ? 'qualification-pending' : 'connection-unavailable',
+        available: connected,
+        reason: connected ? 'qualification-pending' : 'connection-unavailable',
       }),
       connection: {
         endpoint: endpoint.data,
+        authMode,
         connectionHash,
         modelBinding: binding.data,
       },
@@ -165,6 +186,7 @@ export function resolveLocalConnection(
     }),
     connection: {
       endpoint: endpoint.data,
+      authMode: 'token',
       connectionHash: localConnectionHash(endpoint.data, modelBinding.setupHash),
       modelBinding,
     },

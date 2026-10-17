@@ -13,6 +13,7 @@ import {
   type LocalDiscoveryStart,
   type LocalStart,
   type LocalTerminal,
+  localDiscoveryPlan,
   localPlan,
   TerminalSchema,
 } from './profile.ts';
@@ -21,6 +22,7 @@ import {
   discoverLocalModels,
   type LoadedModel,
   type LocalDiscoveryClient,
+  localClientOptions,
   startLocalPrediction,
 } from './sdk.ts';
 
@@ -175,7 +177,7 @@ function discoveryClient(
   };
 }
 
-test('Local generation requires authenticated loopback and an exact loaded instance within context', async () => {
+test('Local generation binds its loopback authentication mode and loaded instance', async () => {
   for (const endpoint of [
     'ws://localhost:1234',
     'wss://127.0.0.1:1234',
@@ -185,6 +187,12 @@ test('Local generation requires authenticated loopback and an exact loaded insta
   ])
     assert.throws(() => localPlan({ ...plan, endpoint }), endpoint);
   for (const token of ['', ' ', '\0']) assert.throws(() => localPlan({ ...plan, token }));
+  assert.deepEqual(localPlan({ ...plan, authMode: 'token' }), { ...plan, authMode: 'token' });
+  assert.deepEqual(localPlan(plan), plan);
+  assert.equal(localClientOptions(plan).apiToken, plan.token);
+  assert.throws(() => localPlan({ ...plan, authMode: 'none' }));
+  const { token: _legacyToken, ...legacyWithoutToken } = plan;
+  assert.throws(() => localPlan({ ...legacyWithoutToken, authMode: 'none' }));
   assert.throws(() => localPlan({ ...plan, original: 'changed' }));
   const cases: Array<{
     name: string;
@@ -333,6 +341,49 @@ test('Local generation requires authenticated loopback and an exact loaded insta
       },
     });
     assert.throws(() => localPlan({ ...genericPlan, endpoint: 'ws://127.0.0.1:4321' }));
+    const none = resolveLocalConnection(
+      {
+        endpoint: plan.endpoint,
+        authMode: 'none',
+        connectionRevision: 1,
+        observation: discovery.observation,
+        selectionId: choice.selectionId,
+      },
+      { platform: 'darwin', arch: 'arm64', secretConfigured: false, connected: true },
+    );
+    assert(none.connection);
+    const { token: _token, ...withoutToken } = plan;
+    const nonePlan = localPlan({
+      ...withoutToken,
+      authMode: 'none',
+      binding: { ...genericPlan.binding, ...none.connection.modelBinding },
+    });
+    assert.throws(() => localPlan({ ...nonePlan, token: plan.token }));
+    assert.throws(() => localPlan({ ...nonePlan, authMode: 'token', token: plan.token }));
+    assert.throws(() => localPlan({ ...nonePlan, binding: genericPlan.binding }));
+    assert.equal(Object.hasOwn(localClientOptions(nonePlan, {}), 'apiToken'), false);
+    const inherited = Object.defineProperty({}, 'LM_API_TOKEN', {
+      get() {
+        throw new Error('The inherited token value must not be read.');
+      },
+    });
+    assert.throws(() => localClientOptions(nonePlan, inherited), /environment is unavailable/);
+    assert.equal(localClientOptions(plan, inherited).apiToken, plan.token);
+    const unauthenticated = fixture();
+    unauthenticated.model.getModelInfo = async () => metadata;
+    const noAuthRun = startLocalPrediction(nonePlan, {
+      createClient: (input) => {
+        assert.equal(input.authMode, 'none');
+        assert(!('token' in input));
+        return discoveryClient(unauthenticated, [metadata]);
+      },
+      schedule: unauthenticated.schedule,
+      now: () => 0,
+    });
+    await flush();
+    assert.equal(unauthenticated.submitted, 1);
+    unauthenticated.resolve({ ...terminal(), modelInfo: metadata });
+    assert.equal((await noAuthRun.result).kind, 'completed');
     const run = startLocalPrediction(genericPlan, {
       createClient: () => client,
       schedule: f.schedule,
@@ -918,7 +969,7 @@ test('Local ownership needs the same prediction terminal after cancellation or c
       });
       child.stdin.on('data', (bytes) => privateFrames.push(bytes.toString()));
       const ready = `${JSON.stringify({ type: 'ready', binding: plan.binding })}\n`;
-      const launch = () =>
+      const launch = (): ReturnType<typeof startLocalReplacement> =>
         startLocalReplacement(plan, directory, {
           now: () => clock,
           schedule: (work) => {
@@ -1060,6 +1111,7 @@ test('Local ownership needs the same prediction terminal after cancellation or c
     assert(discovery.kind === 'observed');
     for (const boundary of [
       'complete',
+      'complete-none',
       'before-failed',
       'before-async',
       'before-deadline',
@@ -1089,8 +1141,25 @@ test('Local ownership needs the same prediction terminal after cancellation or c
         stderr: new PassThrough(),
       });
       child.stdin.on('data', (bytes) => frames.push(bytes.toString()));
-      const launch = () =>
-        startLocalDiscovery(discoveryPlan, directory, {
+      const { token: _discoveryToken, ...noTokenDiscovery } = discoveryPlan;
+      const currentPlan: LocalDiscoveryStart =
+        boundary === 'complete-none'
+          ? {
+              ...noTokenDiscovery,
+              authMode: 'none',
+              binding: {
+                ...discoveryPlan.binding,
+                connectionHash: localConfiguredConnectionHash(plan.endpoint, 3, 'none'),
+              },
+            }
+          : discoveryPlan;
+      if (boundary === 'complete-none') {
+        assert.throws(() => localDiscoveryPlan({ ...currentPlan, binding: discoveryPlan.binding }));
+        assert.throws(() => localDiscoveryPlan({ ...currentPlan, token: plan.token }));
+        assert.equal(Object.hasOwn(localClientOptions(currentPlan, {}), 'apiToken'), false);
+      }
+      const launch = (): ReturnType<typeof startLocalDiscovery> =>
+        startLocalDiscovery(currentPlan, directory, {
           now: () => clock,
           schedule: (work) => {
             timers.push(work);
@@ -1105,6 +1174,7 @@ test('Local ownership needs the same prediction terminal after cancellation or c
           ) => {
             trace.push('spawn');
             assert(!JSON.stringify([args, options]).includes(plan.token));
+            assert.deepEqual(options.env, { HOME: directory, TMPDIR: directory, LANG: 'C.UTF-8' });
             return child;
           }) as unknown as typeof spawn,
           lifecycle: {
@@ -1145,6 +1215,10 @@ test('Local ownership needs the same prediction terminal after cancellation or c
       if (refused) assert(!frames.join('').includes(plan.token));
       else {
         assert.equal(JSON.parse(frames[0]).kind, 'discovery');
+        if (boundary === 'complete-none') {
+          assert.equal(JSON.parse(frames[0]).authMode, 'none');
+          assert(!Object.hasOwn(JSON.parse(frames[0]), 'token'));
+        }
         assert(!frames[0].includes('attemptId'));
         if (boundary === 'stop') run.stop();
         if (boundary === 'deadline') clock = 20000;
@@ -1153,7 +1227,7 @@ test('Local ownership needs the same prediction terminal after cancellation or c
           binding:
             boundary === 'wrong-binding'
               ? { ...discoveryPlan.binding, nonce: hash('other operation') }
-              : discoveryPlan.binding,
+              : currentPlan.binding,
         };
         const frame = `${JSON.stringify({ type: 'discovery', terminal })}\n`;
         if (boundary === 'task-ready')
@@ -1178,7 +1252,7 @@ test('Local ownership needs the same prediction terminal after cancellation or c
       const result = await run.result;
       assert.equal(
         result.terminal.kind,
-        boundary === 'complete' ? 'observed' : 'unavailable',
+        boundary === 'complete' || boundary === 'complete-none' ? 'observed' : 'unavailable',
         boundary,
       );
       assert.equal(
@@ -1193,7 +1267,7 @@ test('Local ownership needs the same prediction terminal after cancellation or c
       absent = true;
       child.emit('close');
       assert.deepEqual(trace, savedTrace);
-      if (boundary === 'complete')
+      if (boundary === 'complete' || boundary === 'complete-none')
         assert.deepEqual(trace, ['before', 'spawn', 'owned', 'quiescent']);
     }
   } finally {

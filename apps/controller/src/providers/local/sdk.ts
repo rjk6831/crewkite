@@ -16,10 +16,12 @@ import {
   CLEANUP_MS,
   CONTEXT_TOKENS,
   type ConfigurationDetail,
+  type LocalDiscoveryStart,
   type LocalReason,
   type LocalStart,
   type LocalTerminal,
   localChat,
+  localDiscoveryPlan,
   localPlan,
   MAX_STREAM_BYTES,
   OUTPUT_TOKENS,
@@ -59,13 +61,23 @@ export type LocalDiscoveryClient = LocalClient & {
   };
 };
 export const silentLogger = { debug() {}, info() {}, warn() {}, error() {} };
-export const createLocalClient = (plan: Pick<LocalStart, 'endpoint' | 'token'>) =>
-  new LMStudioClient({
+export function localClientOptions(
+  value: LocalStart | LocalDiscoveryStart,
+  environment: NodeJS.ProcessEnv = process.env,
+) {
+  const plan = 'kind' in value ? localDiscoveryPlan(value) : localPlan(value);
+  // The SDK inherits this token when apiToken is omitted. The owned child excludes it.
+  if (plan.authMode === 'none' && Object.hasOwn(environment, 'LM_API_TOKEN'))
+    throw new Error('The Local no-authentication environment is unavailable.');
+  return {
     baseUrl: plan.endpoint,
-    apiToken: plan.token,
+    ...(plan.authMode === 'none' ? {} : { apiToken: plan.token }),
     verboseErrorMessages: false,
     logger: silentLogger,
-  });
+  };
+}
+export const createLocalClient = (plan: LocalStart | LocalDiscoveryStart) =>
+  new LMStudioClient(localClientOptions(plan));
 const infoSchema = z.object({
   type: z.literal('llm'),
   modelKey: z.string(),
