@@ -141,7 +141,7 @@ const evaluationStages = {
 
 export function NativeEvaluation({
   task,
-  candidate,
+  candidate: retainedCandidate,
   snapshot,
   workspace,
 }: {
@@ -152,6 +152,21 @@ export function NativeEvaluation({
 }) {
   const run = snapshot.runs.find((value) => value.id === task.runId);
   const native = snapshot.nativeRuns.find((value) => value.runId === task.runId);
+  const combined = snapshot.combinedRuns.find(
+    (value) => value.taskId === task.id && value.runId === task.runId,
+  );
+  const combinedMember = snapshot.combinedRuns.some((value) =>
+    value.members.some((member) => member.taskId === task.id && member.runId === task.runId),
+  );
+  const selection = combined?.evaluationSelection;
+  const candidate = combined
+    ? snapshot.candidates.find(
+        (value) =>
+          value.taskId === task.id &&
+          value.id === combined.candidate?.id &&
+          value.hash === combined.candidate.hash,
+      )
+    : retainedCandidate;
   const prepared = snapshot.candidateEvaluations.find((value) => value.taskId === task.id);
   const reviewerProfiles = snapshot.nativeProfiles
     .filter((value) => value.family === 'openai')
@@ -169,9 +184,36 @@ export function NativeEvaluation({
   const [expiresAt, setExpiresAt] = useState(() => new Date(Date.now() + 3600000).toISOString());
   const [message, setMessage] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
+  const [consentIdentity, setConsentIdentity] = useState<string | null>(null);
+  const combinedIdentity = combined
+    ? JSON.stringify([
+        combined.runId,
+        combined.preparationId,
+        combined.manifestHash,
+        combined.generation,
+        combined.candidate,
+        selection,
+      ])
+    : null;
+  useEffect(() => {
+    if (consentIdentity === combinedIdentity) return;
+    setNativeTrust(false);
+    setSourceConsent(false);
+    setSavedConsent(false);
+    setExistingCredits(false);
+    setCheckPermission(false);
+    setReviewPermission(false);
+    setEditing(false);
+    setMessage(null);
+    setConsentIdentity(combinedIdentity);
+  }, [combinedIdentity, consentIdentity]);
   const profile = reviewerProfiles.find(
-    (value) => value.id === (profileId || reviewerProfiles[0]?.id),
+    (value) =>
+      value.id === (selection?.reviewer.profileId ?? (profileId || reviewerProfiles[0]?.id)),
   );
+  const selectedRecipe = selection?.recipeId ?? recipe;
+  const creditPolicy =
+    selection?.creditPolicy ?? (existingCredits ? 'existing-credits' : 'ordinary');
   const methods = run?.policy.policy.methods ?? [];
   const method = methods[0];
   const supported =
@@ -193,12 +235,35 @@ export function NativeEvaluation({
   );
   const methodName = (id: ReviewMethod['id']) =>
     methodCatalog.find((value) => value.id === id)?.name ?? 'Unavailable method';
-  const projectTests = recipe === 'project-node-tests-v1';
-  const fullVerification = recipe === 'crewkite-verify-v1';
-  const visibleRecipe = prepared && !editing ? prepared.recipe : recipe;
+  const projectTests = selectedRecipe === 'project-node-tests-v1';
+  const fullVerification = selectedRecipe === 'crewkite-verify-v1';
+  const visibleRecipe = prepared && !editing ? prepared.recipe : selectedRecipe;
   const testFiles = ProjectNodeTestFilesSchema.safeParse(
-    testFileInput.split(/\r?\n/u).filter((path) => path.length > 0),
+    selection?.testFiles ?? testFileInput.split(/\r?\n/u).filter((path) => path.length > 0),
   );
+  const preparedMatches =
+    !combined ||
+    (!!prepared &&
+      !!candidate &&
+      !!selection &&
+      prepared.runId === combined.runId &&
+      prepared.candidateId === candidate.id &&
+      prepared.candidateHash === candidate.hash &&
+      prepared.recipe === selection?.recipeId &&
+      prepared.reviewer.profileId === selection.reviewer.profileId &&
+      prepared.reviewer.methodId === selection.reviewer.methodId &&
+      prepared.reviewer.cycle === selection.reviewer.cycles &&
+      prepared.creditPolicy === selection.creditPolicy &&
+      prepared.testFiles.length === selection.testFiles.length &&
+      prepared.testFiles.every((file) => selection.testFiles.includes(file.path)));
+  const checkAvailable =
+    preparedMatches &&
+    !!prepared?.checkStart.available &&
+    (!combined || combined.evaluate.available);
+  const reviewAvailable =
+    preparedMatches &&
+    !!prepared?.reviewStart.available &&
+    (!combined || combined.review.available);
   const invalidTestFiles = projectTests && testFileInput.length > 0 && !testFiles.success;
   const testFileErrorId = `project-test-files-${task.id}`;
   function resetConsent() {
@@ -211,14 +276,15 @@ export function NativeEvaluation({
   }
   const allowed =
     connected &&
+    !combinedMember &&
     candidate &&
     task.state === 'stopped' &&
     supported &&
     profile?.available &&
-    profile.creditPolicies.some(
-      (value) => value === (existingCredits ? 'existing-credits' : 'ordinary'),
-    ) &&
-    (savedConsent || (nativeTrust && sourceConsent)) &&
+    profile.creditPolicies.some((value) => value === creditPolicy) &&
+    (!combined || consentIdentity === combinedIdentity) &&
+    (!combined || combined.evaluate.available) &&
+    ((!combined && savedConsent) || (nativeTrust && sourceConsent)) &&
     checkPermission &&
     reviewPermission &&
     (!projectTests || testFiles.success) &&
@@ -240,8 +306,8 @@ export function NativeEvaluation({
               ? { checkRecipeId: 'crewkite-verify-v1' as const }
               : { checkRecipeId: 'node-tests-v1' as const }),
           reviewer: { profileId: profile.id, methodId: method.id, cycles: 1 },
-          creditPolicy: existingCredits ? 'existing-credits' : 'ordinary',
-          consent: savedConsent ? 'saved' : 'explicit',
+          creditPolicy,
+          consent: !combined && savedConsent ? 'saved' : 'explicit',
           grants: [
             {
               action: 'run-check' as const,
@@ -272,10 +338,8 @@ export function NativeEvaluation({
     }
   }
   async function start(command: 'StartCandidateEvaluation' | 'StartCandidateReview') {
-    if (!prepared || !connected) return;
-    const readiness =
-      command === 'StartCandidateEvaluation' ? prepared.checkStart : prepared.reviewStart;
-    if (!readiness.available) return;
+    if (!prepared || !connected || combinedMember) return;
+    if (command === 'StartCandidateEvaluation' ? !checkAvailable : !reviewAvailable) return;
     try {
       const result = await workspace.command({
         command,
@@ -300,6 +364,13 @@ export function NativeEvaluation({
       ? [{ artifactId: value.artifactId, result: value.review }]
       : [],
   );
+  if (combinedMember)
+    return (
+      <section className="card view-stack" aria-label="Candidate evaluation">
+        <h2>Candidate evaluation</h2>
+        <p>Final checks, review and acceptance belong to the combined parent task.</p>
+      </section>
+    );
   return (
     <section className="card view-stack" aria-label="Candidate evaluation">
       <div className="section-heading">
@@ -307,9 +378,22 @@ export function NativeEvaluation({
         <span>{prepared ? evaluationStages[prepared.stage] : 'Separate preparation'}</span>
       </div>
       <p className="muted">
-        Prepare one local check and one additional native review. Both use the remaining original
-        run limits. The review uses a fresh process. It can use the same model as the writer.
+        {combined
+          ? 'Prepare the final local check and native review for the combined candidate. Both use the remaining shared limits.'
+          : 'Prepare one local check and one additional native review. Both use the remaining original run limits.'}{' '}
+        The review uses a fresh process. It can use the same model as a writer.
       </p>
+      {combined && !combined.evaluate.available && !prepared && (
+        <p className="notice" role="status">
+          Final evaluation is unavailable: {combined.evaluate.reason}.
+        </p>
+      )}
+      {prepared && !preparedMatches && (
+        <p className="notice" role="status">
+          The saved evaluation does not match the current combined candidate and plan. Its actions
+          are unavailable.
+        </p>
+      )}
       {visibleRecipe === 'project-node-tests-v1' && (
         <p className="muted small">
           Local code runs with your system permissions. Dependencies are not installed. Imports can
@@ -428,7 +512,7 @@ export function NativeEvaluation({
                 <button
                   type="button"
                   className="button secondary"
-                  disabled={!connected || !prepared.checkStart.available}
+                  disabled={!connected || !checkAvailable}
                   onClick={() => void start('StartCandidateEvaluation')}
                 >
                   Start local checks
@@ -438,7 +522,7 @@ export function NativeEvaluation({
                 <button
                   type="button"
                   className="button secondary"
-                  disabled={!connected || !prepared.reviewStart.available}
+                  disabled={!connected || !reviewAvailable}
                   onClick={() => void start('StartCandidateReview')}
                 >
                   Start native review
@@ -449,11 +533,13 @@ export function NativeEvaluation({
           {!prepared.check && (
             <p className="muted small" role="status">
               Checks: {evaluationReasons[prepared.checkStart.reason]}
+              {combined && !combined.evaluate.available && ` (${combined.evaluate.reason})`}
             </p>
           )}
           {!prepared.review && (
             <p className="muted small" role="status">
               Review: {evaluationReasons[prepared.reviewStart.reason]}
+              {combined && !combined.review.available && ` (${combined.review.reason})`}
             </p>
           )}
           {!prepared.check &&
@@ -463,7 +549,7 @@ export function NativeEvaluation({
               <button
                 type="button"
                 className="button secondary"
-                disabled={!connected}
+                disabled={!connected || (!!combined && !combined.evaluate.available)}
                 onClick={() => {
                   setProfileId(prepared.reviewer.profileId);
                   setExpiresAt(prepared.expiresAt);
@@ -482,72 +568,118 @@ export function NativeEvaluation({
         </>
       ) : (
         <>
-          <p>
-            File <code>{native?.target?.path ?? 'Unavailable'}</code>
-          </p>
+          {combined ? (
+            <p>The combined plan fixes the final check and reviewer.</p>
+          ) : (
+            <p>
+              File <code>{native?.target?.path ?? 'Unavailable'}</code>
+            </p>
+          )}
           <details className="technical-details">
-            <summary>File details</summary>
+            <summary>{combined ? 'Combined candidate identity' : 'File details'}</summary>
             <code>Candidate tree {candidate?.hash ?? 'Unavailable'}</code>
-            <code>Original file {native?.target?.baseHash ?? 'Unavailable'}</code>
+            {combined ? (
+              <>
+                <code>Combined plan {combined.preparationId}</code>
+                <code>Manifest {combined.manifestHash}</code>
+                <code>Generation {combined.generation}</code>
+              </>
+            ) : (
+              <code>Original file {native?.target?.baseHash ?? 'Unavailable'}</code>
+            )}
             <code>Source base {run?.source.base ?? 'Unavailable'}</code>
           </details>
           <p className="muted small">
             Preparation records the check definition and permissions. Checks and review start
             separately.
           </p>
-          <label>
-            Test setup
-            <select
-              value={recipe}
-              onChange={(event) => {
-                setRecipe(
-                  event.target.value === 'project-node-tests-v1'
-                    ? 'project-node-tests-v1'
-                    : event.target.value === 'crewkite-verify-v1'
-                      ? 'crewkite-verify-v1'
-                      : 'node-tests-v1',
-                );
-                resetConsent();
-              }}
-            >
-              <option value="node-tests-v1">Sample project tests</option>
-              <option value="project-node-tests-v1">Project Node tests</option>
-              <option value="crewkite-verify-v1">CrewKite verification</option>
-            </select>
-          </label>
-          {projectTests ? (
+          {selection ? (
+            <>
+              <div className="facts-grid">
+                <Fact label="Checks" value={evaluationRecipes[selection.recipeId]} />
+                <Fact label="Reviewer" value={profile?.displayName ?? 'Unavailable profile'} />
+                <Fact label="Role" value="Reviewer" />
+                <Fact label="Method" value={methodName(selection.reviewer.methodId)} />
+                <Fact label="Review cycles" value={selection.reviewer.cycles} />
+                <Fact
+                  label="Usage"
+                  value={
+                    selection.creditPolicy === 'ordinary'
+                      ? 'Included usage only'
+                      : 'Included usage and existing credits'
+                  }
+                />
+                <Fact label="Remaining total attempts" value={combined.remainingBudgets.attempts} />
+                <Fact label="Remaining total minutes" value={combined.remainingBudgets.minutes} />
+              </div>
+              <div>
+                <p>Committed test files</p>
+                <ul>
+                  {selection.testFiles.map((path) => (
+                    <li key={path}>
+                      <code>{path}</code>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            </>
+          ) : (
             <>
               <label>
-                Committed test files (one relative path per line)
-                <textarea
-                  rows={4}
-                  value={testFileInput}
-                  aria-invalid={invalidTestFiles}
-                  aria-describedby={invalidTestFiles ? testFileErrorId : undefined}
+                Test setup
+                <select
+                  value={recipe}
                   onChange={(event) => {
-                    setTestFileInput(event.target.value);
+                    setRecipe(
+                      event.target.value === 'project-node-tests-v1'
+                        ? 'project-node-tests-v1'
+                        : event.target.value === 'crewkite-verify-v1'
+                          ? 'crewkite-verify-v1'
+                          : 'node-tests-v1',
+                    );
                     resetConsent();
                   }}
-                />
+                >
+                  <option value="node-tests-v1">Sample project tests</option>
+                  <option value="project-node-tests-v1">Project Node tests</option>
+                  <option value="crewkite-verify-v1">CrewKite verification</option>
+                </select>
               </label>
-              {invalidTestFiles && (
-                <p className="notice" id={testFileErrorId} role="alert">
-                  Enter 1 to 32 distinct relative file paths. Patterns and paths outside the project
-                  are unavailable.
+              {projectTests ? (
+                <>
+                  <label>
+                    Committed test files (one relative path per line)
+                    <textarea
+                      rows={4}
+                      value={testFileInput}
+                      aria-invalid={invalidTestFiles}
+                      aria-describedby={invalidTestFiles ? testFileErrorId : undefined}
+                      onChange={(event) => {
+                        setTestFileInput(event.target.value);
+                        resetConsent();
+                      }}
+                    />
+                  </label>
+                  {invalidTestFiles && (
+                    <p className="notice" id={testFileErrorId} role="alert">
+                      Enter 1 to 32 distinct relative file paths. Patterns and paths outside the
+                      project are unavailable.
+                    </p>
+                  )}
+                  <p className="muted small">
+                    Choose 1 to 32 distinct committed files. Globs are unavailable.
+                  </p>
+                </>
+              ) : !fullVerification ? (
+                <p className="muted small">The built-in checks cover the sample net.mjs project.</p>
+              ) : (
+                <p className="muted small">
+                  Runs policy, lint, types, Node tests, the desktop build and the desktop journey.
+                  Staging, checks and cleanup share a five-minute limit. The original run needs six
+                  remaining minutes and two attempts, including the later review.
                 </p>
               )}
-              <p className="muted small">
-                Choose 1 to 32 distinct committed files. Globs are unavailable.
-              </p>
             </>
-          ) : !fullVerification ? (
-            <p className="muted small">The built-in checks cover the sample net.mjs project.</p>
-          ) : (
-            <p className="muted small">
-              Runs policy, lint, types, Node tests, the desktop build and the desktop journey.
-              Staging, checks and cleanup share a five-minute limit. The original run needs six
-              remaining minutes and two attempts, including the later review.
-            </p>
           )}
           {!supported && (
             <p className="notice">
@@ -555,20 +687,22 @@ export function NativeEvaluation({
               requirements stay unchanged.
             </p>
           )}
-          <label>
-            Reviewer profile
-            <select
-              value={profile?.id ?? ''}
-              onChange={(event) => setProfileId(event.target.value)}
-            >
-              {reviewerProfiles.map((value) => (
-                <option key={value.id} value={value.id}>
-                  {value.displayName}
-                  {value.available ? '' : ' (unavailable)'}
-                </option>
-              ))}
-            </select>
-          </label>
+          {!selection && (
+            <label>
+              Reviewer profile
+              <select
+                value={profile?.id ?? ''}
+                onChange={(event) => setProfileId(event.target.value)}
+              >
+                {reviewerProfiles.map((value) => (
+                  <option key={value.id} value={value.id}>
+                    {value.displayName}
+                    {value.available ? '' : ' (unavailable)'}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
           {profile && (
             <details className="technical-details">
               <summary>Reviewer details</summary>
@@ -579,15 +713,17 @@ export function NativeEvaluation({
               </code>
             </details>
           )}
-          <label className="checkbox-label">
-            <input
-              type="checkbox"
-              checked={savedConsent}
-              onChange={(event) => setSavedConsent(event.target.checked)}
-            />
-            Use saved consent for this exact evaluation
-          </label>
-          {!savedConsent && (
+          {!combined && (
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                checked={savedConsent}
+                onChange={(event) => setSavedConsent(event.target.checked)}
+              />
+              Use saved consent for this exact evaluation
+            </label>
+          )}
+          {(combined || !savedConsent) && (
             <>
               <label className="checkbox-label">
                 <input
@@ -603,7 +739,7 @@ export function NativeEvaluation({
                   checked={sourceConsent}
                   onChange={(event) => setSourceConsent(event.target.checked)}
                 />
-                {native?.repository
+                {combined || native?.repository
                   ? 'Share the committed source, candidate changes and task text with the reviewer'
                   : 'Share the original file, proposed change and task text with the reviewer'}
               </label>
@@ -616,18 +752,22 @@ export function NativeEvaluation({
               ? 'Checks use an independent candidate copy.'
               : 'The original source checkout stays unchanged.'}
           </p>
-          <label className="checkbox-label">
-            <input
-              type="checkbox"
-              checked={existingCredits}
-              disabled={!profile?.creditPolicies.some((value) => value === 'existing-credits')}
-              onChange={(event) => setExistingCredits(event.target.checked)}
-            />
-            Allow existing credits for this review after included usage
-          </label>
-          <p className="muted small">
-            This separate choice defaults off. No reset, purchase or top-up is requested.
-          </p>
+          {!selection && (
+            <>
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={existingCredits}
+                  disabled={!profile?.creditPolicies.some((value) => value === 'existing-credits')}
+                  onChange={(event) => setExistingCredits(event.target.checked)}
+                />
+                Allow existing credits for this review after included usage
+              </label>
+              <p className="muted small">
+                This separate choice defaults off. No reset, purchase or top-up is requested.
+              </p>
+            </>
+          )}
           <label>
             Permission expiry (local time)
             <input
@@ -658,6 +798,8 @@ export function NativeEvaluation({
               onChange={(event) => setReviewPermission(event.target.checked)}
             />
             Allow one {method ? methodName(method.id) : ''} review
+            {selection?.creditPolicy === 'existing-credits' &&
+              ' using included usage and existing credits'}
           </label>
           <button
             type="button"
@@ -690,6 +832,19 @@ export function NativeEvaluation({
             {!result.job.scripted && roleLabels[result.job.assignedRole]} · {result.job.cycle}{' '}
             review cycle · separate process only
           </p>
+          {'origin' in result.job && (
+            <details className="technical-details">
+              <summary>Combined review identity</summary>
+              <code>Manifest {result.job.origin.manifestHash}</code>
+              <code>Combined candidate {result.job.origin.candidateId}</code>
+              {result.job.origin.contributors.map((contributor) => (
+                <code key={contributor.taskId}>
+                  Task {contributor.taskId}, attempt {contributor.attemptId}, candidate{' '}
+                  {contributor.candidateHash}
+                </code>
+              ))}
+            </details>
+          )}
           <p>{result.summary}</p>
           <ul>
             {result.findings.map((finding) => (
