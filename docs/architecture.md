@@ -15,13 +15,17 @@ This page describes the current design. The reasoning behind each choice is in t
 
 Provider adapters stay inside the controller until a second consumer needs them. One integration owner lands changes to contracts, migrations, the lockfile and entry points, so the packages never drift apart.
 
+![Desktop conversation and CLI share durable state, authority gates and owned provider connections.](images/controller-overview.svg)
+
+A fresh normal workspace has no seeded project or fixture route catalog. Its prepared native profiles and explicit Local connection use their real provider protocols. Developer demo and preview modes remain explicit. A failed native operation retains its own refusal or uncertainty; it grants no fallback authority.
+
 ## Task conversation
 
 The task's primary conversation retains messages, queued guidance, questions, answers and proposed plans with their run and attempt bindings. A planning turn needs explicit consent, the supported primary profile and finite limits. The current selection permits Lead or Orchestrator through `openai-file-v1`, with a separate existing-credit choice. Requested model and effort remain distinct from observed effective settings. Planning consumes the task's budget; reading history, reconnecting and reopening admit no turn.
 
 Adopting a plan binds its exact proposal ID and hash to the task contract. It grants no execution authority. Execution still needs its own prepared source, policy, permissions and Start. Guidance received during active work is retained for a later explicitly admitted planning turn. Model text cannot approve an effect, raise a limit or accept a result. The renderer projects current send and adoption availability from controller reads and keeps uncertain command receipts for exact retry.
 
-Selected context is immutable input data. The controller captures committed source files or folders at the chosen base, and explicitly selected project-local logs from current disk bytes. It accepts up to four selections, 32 files, 8 KiB per file and 32 KiB for the complete encoded bundle. Links, unsupported text and excluded credential paths refuse. The artifact records the exact bytes, modes and hashes. The desktop's native picker keeps filesystem selection in main; its renderer adapter validates the retained artifact for preview. Capture retry resends the original command without reopening the picker; a committed result returns the same artifact. Conversation inputs reference those artifacts by ID and hash. Context supplies no filesystem, execution or approval authority.
+Selected context is immutable input data. The controller captures committed source files or folders at the chosen base, and explicitly selected project-local logs from current disk bytes. It accepts up to four selections, 32 files, 8 KiB per file and 32 KiB for the complete encoded bundle. Links, unsupported text and excluded credential paths refuse. The artifact records the exact bytes, modes and hashes. The desktop's native picker keeps filesystem selection in main; its renderer validates the retained artifact for a content preview before the separate send decision. Capture retry resends the original command without reopening the picker; a committed result returns the same artifact. Conversation inputs reference those artifacts by ID and hash. Context supplies no filesystem, execution or approval authority. The composer shows only profile-supported controls. A context byte measurement cannot establish a provider token count or quota balance.
 
 ## Combined runs
 
@@ -31,7 +35,7 @@ The parent reserves seven dispatches: a baseline check, two writers, two ordered
 
 The clean baseline must pass before either child can start. Assembly requires two substantive, in-scope candidates. It applies their exact deltas in order and checks each cumulative result before advancing a private integration ref with compare-and-swap. A durable operation journal owns the finite Git processes. The immutable origin binds both writers and candidates, source manifest, policy, criteria, replay definitions and results, and every old/new tree transition. Private integration changes no branch in the source repository.
 
-The sealed combined candidate still needs an explicitly prepared full check and a separate native review of the whole result. Passing replay checks cannot replace that final barrier. The supported reviewer has its own source consent, credit choice and one-use grant within the parent's remaining allowance. Same-family review establishes process independence only. Destination-specific acceptance revalidates the complete origin and evidence chain before creating one new local branch. [Continuity](continuity.md#combined-ownership-and-recovery) describes parent controls and restart limits.
+The sealed combined candidate still needs an explicitly prepared full check and a separate native review of the whole result. Passing replay checks cannot replace that final barrier. The supported reviewer has its own source consent, credit choice and one-use grant within the parent's remaining allowance. Same-family review establishes process independence only. Destination-specific acceptance revalidates the complete origin and evidence chain before creating one new local branch. [Continuity](continuity.md#combined-ownership-and-recovery) describes parent controls and restart limits. [Proposed ADR 0026](adr/0026-bind-combined-acceptance-to-checked-origins.md) records the integration tradeoff.
 
 ## Processes and transport
 
@@ -44,7 +48,7 @@ The controller runs as one headless Node process per user. The desktop app and t
 
 These measures keep other clients and workers off the control channel. They do not defend against malware running as the same user, and the docs make no such claim.
 
-Native writer preparation includes per-phase ownership hooks and a SQLite journal for preflight and task processes. The journal separates launch intent, the actual process group and proven quiescence. OpenAI task success requires its complete three-phase sequence. The Anthropic writer records authentication followed by the task process. Google records a zero-turn configuration read followed by its task process. Its prompt is in argv, so the submission marker commits before spawn. Each successful writer requires its exact provider sequence; reviewers retain the OpenAI sequence. Historical short OpenAI sequences remain readable for recovery; incomplete sequences cannot authorize a successful application or publication. Recovery checks every recorded group; ambiguous ownership stays blocked, and no native phase restarts automatically. A supervised native file proposal uses `PrepareNativeRun` to save an immutable preview without provider I/O. `StartRun` rechecks its installed profile, scoped consent and source before entering the same admission and process owner. Each prepared writer permits one submission. Anthropic and Google preparation freeze a user-sourced ordinary-subscription billing attestation separately from native observations. Missing required evidence or attestation blocks submission. Google also freezes the expected native permission mode; fresh configuration must match it and report disabled credit fallback. Configuration success establishes no account or billing identity. The writer and supported OpenAI reviewer resolve by their own saved profile IDs. Retained native work can be inspected and exported. Legacy writer resume, route switching and scripted continuation stay unavailable. Optional manual file handoff uses a frozen recipient list, fresh explicit consent and separate preparation and Start after proven quiescence. It preserves the original pin, roles and limits. This path has offline fixture coverage only; Google consumer launch remains blocked.
+Native writer preparation includes per-phase ownership hooks and a SQLite journal for preflight and task processes. The journal separates launch intent, the actual process group and proven quiescence. OpenAI task success requires its complete three-phase sequence. The Anthropic writer records authentication followed by the task process. Historical Google consumer pilots recorded a zero-turn configuration read followed by the task process, with the submission marker before spawn because the prompt was in argv. New consumer launches remain blocked. Each successful writer requires its exact provider sequence; reviewers retain the OpenAI sequence. Historical short OpenAI sequences remain readable for recovery; incomplete sequences cannot authorize a successful application or publication. Legacy cloud recovery checks recorded groups; the separate Local, ACP and metadata rules below preserve missing closure proof as unknown. No native phase restarts automatically. A supervised native file proposal uses `PrepareNativeRun` to save an immutable preview without provider I/O. `StartRun` rechecks its installed profile, scoped consent and source before entering the same admission and process owner. Each prepared writer permits one submission. Anthropic and Google preparation freeze a user-sourced ordinary-subscription billing attestation separately from native observations. Missing required evidence or attestation blocks submission. Google also freezes the expected native permission mode; fresh configuration must match it and report disabled credit fallback. Configuration success establishes no account or billing identity. The writer and supported OpenAI reviewer resolve by their own saved profile IDs. Retained native work can be inspected and exported. Legacy writer resume, route switching and scripted continuation stay unavailable. Optional manual file handoff uses a frozen recipient list, fresh explicit consent and separate preparation and Start after proven quiescence. It preserves the original pin, roles and limits. This path has offline fixture coverage only; Google consumer launch remains blocked.
 
 A separate repository profile prepares the complete committed source and explicit local-tool authority. The native client edits the independent scratch directly, using its workspace-write permission mode with approval requests and network access disabled. CrewKite trusts that client's permission system under ADR0009; it supplies no additional containment. The one-use scratch and native-tool grants are consumed together at admission, and the earlier expiry bounds execution. Native command and file-change activity is informational. It cannot establish a check result. After quiescence, the controller validates the resulting filesystem and captures its immutable candidate without reapplying a model response. A failed capture retains the scratch and reports interrupted, unverified work. Stop can retain partial changes; a completed capture receipt is required for evaluation. The existing file profiles and their application receipts keep their original behavior. This repository profile still needs connected qualification.
 
@@ -66,7 +70,7 @@ The read-only task context is captured before Start, with a shared 64 KiB limit 
 
 An ACP candidate uses the existing evaluation path with separate local-check authority. Its native reviewer still needs a supported OpenAI profile, scoped consent and grant, and remaining provider allowance within the original run limits. The Google writer's quota observations grant none of that reviewer capacity. Missing required review blocks acceptance.
 
-Local setup stores a nonsecret connection revision, model observation and explicit selection. A dedicated loopback credential stays in controller memory and requires input again after restart. Discovery lists installed variants and loaded instances without loading a model. Preparation binds the selected eligible instance and runtime metadata to the source and policy, with no cloud billing attestation or credit policy. A durable Local operation excludes input, discovery and generation from conflicting. Intent precedes launch; matching terminal proof and recorded client closure settle ownership. Uncertain ownership survives restart without replay or historical process signalling. The Local writer retains one bounded file proposal for inspection and export. Its model qualification, checks, review and acceptance remain pending.
+Local setup stores a nonsecret connection revision, model observation and explicit selection. A dedicated loopback credential stays in controller memory and requires input again after restart. Discovery lists installed variants and loaded instances without loading a model. Preparation binds the selected eligible instance and runtime metadata to the source and policy, with no cloud billing attestation or credit policy. A durable Local operation excludes input, discovery and generation from conflicting. Intent precedes launch; matching terminal proof and recorded client closure settle ownership. Uncertain ownership survives restart without replay or historical process signalling. The Local writer retains one bounded file proposal for inspection and export. Its model qualification, checks, review and acceptance remain pending. [Proposed ADR 0025](adr/0025-use-an-explicit-memory-only-local-credential.md) records the dedicated credential boundary; cloud-provider credential handling stays separate.
 
 Every mutation carries a protocol version, an idempotency key, the expected entity revision and a validated payload. The controller stores a digest of each request with its receipt.
 
@@ -80,7 +84,7 @@ Reads use snapshot plus subscription. `GetSnapshot` returns state at cursor C, a
 
 The candidate evaluation preview binds the current candidate and saved preparation to its check and review evidence. It shows the remaining original run budget and separate reasons for refusing each start action. Completed evidence stays visible after consent expires. Reading the preview creates no receipt or launch, and each start command rechecks current authority.
 
-Team routing runs scripted routes. Explicit native profiles can propose a replacement for an existing committed text file through the desktop or CLI. Its exact provider limits are in [Provider routes](providers.md). `ExportDiagnostics` returns `unsupported`. General live routing and installer recovery remain separate gates. The table describes the first-release command contract.
+Explicit native profiles can propose a replacement for an existing committed text file through the desktop or CLI. Developer fixtures separately exercise legacy team routing. Its exact provider limits are in [Provider routes](providers.md). `ExportDiagnostics` returns `unsupported`. General live routing and installer recovery remain separate gates. The table describes the first-release command contract.
 
 The command set for the first release:
 
@@ -108,9 +112,9 @@ The command set for the first release:
 | `StopGoogleAcpSetup` | Revoke the current setup operation by its exact ID and persisted revision, request owned cleanup and retain unresolved ownership |
 | `GetChanges`, `GetArtifact`, `GetUsage` | Bounded reads of immutable content and sourced usage observations |
 | `AcceptCandidate` | Eligible candidate, current authority, an unused destination ref, idempotent publication |
-| `GetHealth`, `ExportDiagnostics` | Runtime and qualification state, redacted export after preview |
+| `GetHealth`, `ExportDiagnostics` | Runtime and qualification state; diagnostic export remains unsupported |
 
-The controller exposes registered project and artifact IDs. It exposes no generic exec, raw path, URL fetch or credential command.
+The controller exposes registered project and artifact IDs. It exposes no arbitrary shell, URL fetch or unrestricted file-read command. Public command payloads accept no connection credential value.
 
 ## State
 
@@ -130,15 +134,15 @@ Current-state tables in SQLite are authoritative. An ordered event log explains 
 | Candidate | A sealed set of changes with a content hash |
 | Receipt | The durable record of a command or effect |
 
-A task moves through these visible states:
+The normal workflow keeps planning, execution and acceptance decisions separate. This diagram summarizes those boundaries; it is not a second state machine or a claim that every profile supports branch acceptance.
 
-![Task states from draft through running, waiting, handoff, stopping, recovery, checking and acceptance.](images/task-states.svg)
+![Task decisions from a project goal through owned work, retained evidence and explicit branch acceptance, with separate Stop outcomes.](images/task-states.svg)
 
 `unknown` blocks sealing, takeover, cleanup and acceptance until the controller proves no writer remains.
 
 ## Admission
 
-Admission is one short SQLite transaction that runs before any provider I/O:
+Task admission is one short SQLite transaction before task submission. A required Google quota refresh has its own earlier metadata intent and closure gate:
 
 1. Compare the task revision and the caller's authority.
 2. Reserve every hard counter and the completion allowance the policy needs.

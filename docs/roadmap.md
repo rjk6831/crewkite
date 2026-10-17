@@ -19,9 +19,13 @@ D1b is complete for one useful CrewKite repository task. A live OpenAI writer re
 
 The primary conversation now retains messages, questions, answers and proposed plans. Explicit adoption saves the task contract without starting execution. Planning uses the supported fixed profile and finite task budget; selected committed source and explicit project logs are captured as immutable context. The controller owns permissions, budgets and acceptance under [ADR 0002](adr/0002-authority-in-deterministic-code.md). This implements part of the daily workspace in [ADR 0001](adr/0001-coding-workspace-for-daily-projects.md); it establishes no autonomous coordination or planning-route qualification.
 
+Configurable supported models and effort, plus policy controls for future runs, remain unfinished D2 work. Planning still runs with its fixed supported model and low effort.
+
 The bounded combined workflow implements two scoped child writers, one shared budget, checked ordered replay and a separate full check and review of the final candidate. Immutable contributor origins and guarded private ref updates prevent passing slices from bypassing the combined barrier. Offline fixtures cover controller mechanics, parent controls and interrupted ownership. Useful connected two-slice work, provider qualification, the ten real D2 tasks and user acceptance remain open.
 
 A two-provider demo is an intermediate step on the way to D2. Google remains in the four-family target through the separate ACP proposal. The consumer headless writer stays blocked. The [bounded ACP workflow](providers.md#google-acp-writer) has import and setup controls, with production launch unavailable until its pinned review-mode and edit-tool mappings are verified. It still needs eligibility, authentication, billing and native behavior evidence before qualification. A quota read supplies no coding authority. [Proposed ADR 0023](adr/0023-qualify-provider-eligibility-before-release.md) and [Proposed ADR 0024](adr/0024-integrate-google-through-its-published-acp-agent.md) await acceptance; Accepted ADR 0012 remains unchanged.
+
+I am preparing the candidate around normal registered projects and supported provider connections. Explicit developer fixtures remain useful for controller tests, but none count as a real backlog task or live qualification. A source commit, verification receipt or package build alone does not complete D2.
 
 I will pause after D2 for real-work user acceptance and final testing. D2b holds any required corrections and their verification. I will explicitly approve the move to D3 after this gate passes.
 

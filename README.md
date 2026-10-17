@@ -7,7 +7,7 @@
 
 CrewKite is a desktop workspace and CLI for coding tasks that share one local controller. It tracks approvals, usage observations and retained work across provider routes.
 
-Status: early prototype for macOS on Apple Silicon. The supported demo uses a synthetic project and four scripted fake routes. The bounded OpenAI native path supports retained work, Stop, manual export and checked local branch acceptance. The Anthropic single-file path requires explicit subscription-login and disabled-extra-usage confirmations. Google consumer automatic launch is unavailable under its integration policy. Earlier pilots remain recorded as historical evidence in [provider routes](docs/providers.md#current-availability). General live routing remains unqualified.
+I am preparing the D2 candidate for real-project user acceptance on macOS with Apple Silicon. The normal workspace starts without a synthetic project or seeded route catalog. Native profiles connect to their supported clients; Local setup uses an explicit authenticated loopback connection. Availability is separate from qualification. Google coding remains unavailable, and the [roadmap](docs/roadmap.md) keeps the required live evidence, ten real tasks and acceptance gates open.
 
 ## Why I am building it
 
@@ -21,19 +21,18 @@ The handoff matters as much as the routing. If a provider stops, I want the next
 
 Community skills and plugins contain work I want to learn from and reuse. Finding the right ones and keeping up with changes takes attention. I want one consistent interface that explains what a tool does and the permissions it needs before I enable it. That should make reuse approachable for everyday AI users who have little interest in maintaining a collection of integrations. I intend to credit the original work and contribute useful improvements upstream where I can, with sources and licenses recorded in the [credits](docs/credits.md).
 
-The scripted prototype exercises controller behavior. The bounded native single-file path has passed a supervised desktop launch and retained export, with offline coverage of its authority and recovery rules. Local setup supports explicit connection and observed model selection; inference qualification remains pending. The skills and plugin experience remain planned. I am building in the open for my own daily use first. Finished work and less manual coordination will tell me whether this deserves a place alongside the tools I already use.
+I am building in the open for my own daily use first. Finished work and less manual coordination will tell me whether this deserves a place alongside the tools I already use. The skills and plugin experience remains later work.
 
-## Current prototype
+## Current workspace
 
-- Runs a task through one desktop window and one CLI that share the same controller, task IDs and history.
-- Keeps the primary conversation, questions and proposed plan with the task. Adopting a plan and starting execution require separate decisions.
-- Uses editable teams with optional roles and a finite fake route, model and effort catalog.
-- Shows fixture usage per route and window: remaining allowance, reset time, observation time and source. Missing data shows as unknown.
-- Prefers routes whose allowance resets soon, protects reserves you set, and never spends just to empty a gauge.
-- Records each task as durable facts and files, so a successor route continues from the work itself. A final summary from the stopped model is optional.
-- Works in scratch copies of your repository. The qualified scripted journey can accept a result as one new local branch. Native single-file work supports inspection and manual export, with separate check and review preparation for explicitly selected committed Node tests. A matching checked and reviewed native result can request local branch acceptance with its own destination permission. Your checkout, remotes and deployments stay untouched.
+- Keep the primary conversation and retained decisions with one registered project and task.
+- Preview explicitly selected committed source and project logs before sending their immutable context.
+- Review the proposed plan, then separately prepare the execution source, permissions and finite limits.
+- Run bounded native work in independent scratch. Inspect Changes and export retained work without changing the original checkout.
+- Combine two scoped child candidates through ordered checks, then require a full combined check and separate review before destination-specific branch acceptance.
+- Show observed quota and context measurements with their source and freshness. Missing values stay unknown, and unsupported controls remain unavailable.
 
-The qualified walkthrough uses the bundled synthetic project. The default sample checks require the original test file and expected completions. An explicit project Node recipe selects unchanged committed test files and requires successful tests from each file. It installs no dependencies. Package-manager checks and arbitrary commands remain unsupported. Scripted review results establish fixture behavior and candidate binding. The separate native review path supports one Keep it simple cycle with process independence only. The retained sample candidate passed two real Node tests and one live review, then became a new local branch through a separate destination approval. The same home reopened with its evidence intact. A useful change to CrewKite's completed-evaluation view has now completed the checked-branch workflow through the Mac directory package. D1b is complete for this bounded path; the [roadmap](docs/roadmap.md) records its evidence and remaining gates.
+The [provider notes](docs/providers.md) separate implemented paths from dated qualification. The bounded OpenAI workflow has historical checked-branch evidence. Local model eligibility, a Google quota read or a passing synthetic fixture supplies no live route qualification.
 
 ## Task workflow
 
@@ -41,17 +40,15 @@ Open Usage and capacity to inspect route availability and explicit provider setu
 
 Choose New goal, select a registered project and review the planning permission before sending. Conversation is the main task view. Answer the primary role's questions and inspect the proposed criteria and scope before choosing Adopt plan. Adoption saves the task contract and opens separate execution preparation. It starts no coding work.
 
-Planning settings currently select Lead or Orchestrator on the supported fixed profile, existing-credit permission and finite task limits. Requested and effective model facts remain separate. The interface offers only controls supported by that profile; it cannot switch to arbitrary models or effort levels. Planning and later execution share the task's finite budget.
+Planning settings select Lead or Orchestrator on the supported fixed OpenAI profile, existing-credit permission and finite task limits. Requested and effective model facts remain separate. The interface offers only controls supported by that profile; it cannot switch to arbitrary models or effort levels. Planning and later execution share the task's finite budget.
 
 Review the prepared source and permissions before Start. Changes shows retained work. Checks and review prepares and reports separate evidence; a matching supported result still needs destination-specific permission for local branch acceptance. Messages cannot approve actions or accept code. Uncertain commands keep their exact receipt for explicit retry, and reopening starts no work. The [conversation CLI](apps/cli/README.md#task-conversations) exposes the same controller decisions.
 
-## Workspace
+## Decisions and retained work
 
-Connected desktop running the synthetic demo with scripted fake routes.
+![Project goal, planning, explicit adoption, owned execution and separate evidence and acceptance decisions.](docs/images/task-states.svg)
 
-![Dark connected workspace](docs/images/workspace-dark.png)
-
-![Light connected workspace](docs/images/workspace-light.png)
+The diagram shows the supported decision flow. Checks, review and branch acceptance depend on the selected profile. The Local file proposal currently retains work for inspection and export.
 
 <details>
 <summary>Keyboard navigation</summary>
@@ -60,13 +57,12 @@ Press `Cmd+K` to open the command palette. Saved tasks show their project and ta
 
 Review pending approval opens the existing approval card and focuses its review region. Read the exact target and consequence, then choose Approve once or Deny as a separate action. `Escape` closes the palette and dialogs. Arrow keys move between task and launch tabs.
 
-![Command palette with scripted tasks and a pending approval](docs/images/command-palette.png)
 
 </details>
 
 ## How it fits together
 
-![Desktop and CLI connect through a shared client to one controller and scripted fake routes.](docs/images/controller-overview.svg)
+![Desktop and CLI share a controller that owns durable facts, authority gates and real provider connections.](docs/images/controller-overview.svg)
 
 The controller is a headless Node process. It owns permissions, budgets, task ownership, evidence and acceptance. Models propose plans and edits. Deterministic code decides what runs. [Architecture](docs/architecture.md) covers these boundaries. Native profiles have bounded preparation and launch paths. Their evidence and remaining qualification gates are recorded in [provider routes](docs/providers.md).
 
@@ -85,38 +81,33 @@ The controller is a headless Node process. It owns permissions, budgets, task ow
 | D0 | Desktop and CLI run the full task journey against fake providers | Local demo verified |
 | D1a | One qualified official client does useful supervised work with manual export | Bounded workflow complete |
 | D1b | Checked results: immutable candidates, independent checks and review, local branch acceptance | Bounded workflow complete |
-| D2 | Local, OpenAI, Anthropic and Google routes with handoff, honest usage and two-slice parallel work | Planned |
+| D2 | Local, OpenAI, Anthropic and Google routes with handoff, honest usage and two-slice parallel work | Implementation and qualification in progress |
 | D3 | Signed, documented distribution for a stated audience | Planned |
 
 Details live in [docs/roadmap.md](docs/roadmap.md).
 
-## Run the prototype
+## Run a local workspace
 
-The source demo requires Node 24.22.0, pnpm 12.11.2 and Git. The local desktop proof uses macOS on Apple Silicon. CI runs the full suite natively on macOS 15 with Chromium sandboxing enabled. Linux desktop startup remains unqualified. Local branch acceptance uses an existing configured Git identity; the demo does not change it.
+The [directory package](docs/distribution.md) is the normal desktop path. It carries separate Node and Electron runtimes and the fixed Local credential-input helper. It needs local Git, an existing Git identity for branch acceptance and separately installed provider clients. It downloads no provider or model. A source-only controller has no packaged Local credential-input capability.
 
-```sh
-pnpm install --frozen-lockfile
-pnpm desktop:install
-pnpm verify
-export CREWKITE_HOME="$PWD/internal/demo-home"
-export CREWKITE_PROFILE="$PWD/internal/desktop-profile"
-pnpm demo
-```
-
-In another terminal, from the same checkout, select the same home:
+For maintainer staging from a committed checkout with the pinned development dependencies already installed:
 
 ```sh
-CREWKITE_HOME="$PWD/internal/demo-home" pnpm crewkite task list --json
-CREWKITE_HOME="$PWD/internal/demo-home" pnpm crewkite task watch <task-id> --json
+internal/tools/node-v24.22.0-darwin-arm64/bin/node scripts/package.mjs --id workspace-check
+internal/packages/d0/workspace-check/bin/desktop
+internal/packages/d0/workspace-check/bin/crewkite task list --json
 ```
 
-Scripted observations intentionally become stale after five minutes. Before preparing a run after an idle period, you can explicitly choose Policy > Unknown usage > Allow selected routes within run limits. The displayed assigned routes use the shown finite limits. Stale labels, reserves and pins remain; percentage-based routing still requires fresh observations.
+The default package opens a fresh workspace. Choose a project and explicit provider setup before sending work. Existing initialized homes retain their state. A staging command or launcher does not establish a verified RC, package recovery or a released distribution. Each candidate needs its own matching verification and runtime evidence.
 
-For native work, create a project and draft task in the desktop. In Configure this run, choose Native file proposal. Select an available OpenAI or Anthropic writer and enter the committed file path. Anthropic requires your confirmation that the existing native login uses your subscription and paid extra usage is disabled. Those assertions establish no provider hard spending cap. Review the consent and supported credit choices, then prepare and inspect the saved target before Start. Unavailable profiles show their current reason. The [single-file CLI setup](apps/cli/README.md#native-single-file-runs) covers the same flow. Native trust and source consent are explicit or bound to an exact saved consent. Existing-credit spending defaults off. Inspect the retained candidate and export it manually. A saved patch can be carried to a native app you open yourself; CrewKite does not launch that app or import its work automatically. Checks and review require separate permissions and an explicit OpenAI reviewer. Matching results can request local branch acceptance with a destination-specific grant or approval. The [provider notes](docs/providers.md#current-availability) record current support and billing limits.
+For native single-file work, review the supported writer, committed target and scoped consent before preparation and Start. Existing-credit spending defaults off. Anthropic requires explicit subscription-login and disabled-extra-usage confirmations. Repository work uses a separate OpenAI profile and local-command permission. The [CLI guide](apps/cli/README.md) covers conversation, preparation, Stop, retained changes and export. Checks, review and branch acceptance keep their own permissions and profile limits.
 
-For work across committed repository files, choose Repository work. This separate OpenAI profile needs source consent and an explicit local-command permission. The native client can edit independent scratch and run multiple local commands during the bounded task. Review the frozen source and permissions before Start. The [repository CLI setup](apps/cli/README.md#native-repository-work) covers the same flow. One supervised synthetic repository run passed capture, export and same-home reopen. A separate live Stop retained interrupted work through same-home reopen. Full profile qualification remains pending.
+<details>
+<summary>Developer fixtures</summary>
 
-`pnpm verify` runs the test suite, including the real desktop and CLI recovery journey, plus policy, lint, types and the desktop build. [Testing](docs/testing.md) separates fixed synthetic evidence, native OS interaction and package checks. The [local directory package](docs/distribution.md) carries its own Node and Electron runtime; Git remains a prerequisite. Its default workspace starts without a synthetic project or scripted route catalog. To stage an explicit demo, add `--demo` to the package command. Existing initialized homes keep their data.
+`pnpm demo` explicitly selects a synthetic project and scripted providers for development. Package staging accepts `--demo` for the same purpose. These fixtures and the explicit renderer preview are separate from normal workspace startup and establish no provider qualification. [Testing](docs/testing.md) records what the synthetic collection proves. Source development requires Node 24.22.0 and pnpm 12.11.2.
+
+</details>
 
 ## Documentation
 

@@ -33,6 +33,12 @@ internal/packages/d0/local-check/bin/crewkite task list --json
 
 Use the CLI in another terminal while the desktop is open. Its launcher selects the same home; no parent-shell environment change is needed. A package carries Node and Electron, so trying the staged runtime needs no developer rebuild or runtime download. Launcher presence alone is not qualification.
 
+## Candidate identity and user acceptance
+
+I keep each candidate tied to its committed source revision, runtime manifest and exact verification receipt. I stage the normal workspace for real-project user acceptance; a demo payload cannot supply that evidence. Provider clients, account setup and any Local model remain separate prerequisites. Opening the app starts no model task or discovery operation.
+
+A compiled helper, a successful build and a launcher are separate facts from installed recovery or route qualification. I record those outcomes for the exact candidate before claiming them. D2's real-task evidence and user acceptance remain governed by the [roadmap](roadmap.md). Signing, notarization and general distribution belong to D3 after that gate and my explicit approval.
+
 ## Notices and recovery
 
 The package carries the full Node license, Electron license, Chromium component inventory and the licenses for its emitted JavaScript, icons and fonts. It also includes CrewKite's license, notice and [source credits](credits.md). The emitted file inventory is the distribution record; a source-only dependency list cannot establish that closure.

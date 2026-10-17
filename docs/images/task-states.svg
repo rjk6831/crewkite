@@ -1,66 +1,60 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="960" height="960" viewBox="0 0 960 960" role="img" aria-labelledby="title description">
-  <title id="title">Task states and transitions</title>
-  <desc id="description">A task starts in draft and enters running when admitted. Running can wait for approval, capacity or a dependency, hand off when a reserve is reached or a route is lost, or become interrupted after a controller restart. Waiting can return to running. A handoff returns to running when a successor is admitted; interruption returns after reconciliation and resume. A stop request enters stopping, followed by stopped when quiescence is proven or unknown when ownership is unproven. Running can fail or seal work as a candidate for checking. Recorded evidence advances checking to ready. Creating a new local branch advances ready to accepted.</desc>
-  <defs>
-    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#475569"/></marker>
-  </defs>
-  <style>
-    text { font-family: Arial, Helvetica, sans-serif; fill: #172033; font-size: 17px; }
-    .node { fill: #fff; stroke: #64748b; stroke-width: 1.5; }
-    .edge { fill: none; stroke: #475569; stroke-width: 1.5; marker-end: url(#arrow); }
-    .label { font-size: 15px; paint-order: stroke; stroke: #f8fafc; stroke-width: 5px; stroke-linejoin: round; }
-  </style>
-  <rect width="960" height="960" rx="12" fill="#f8fafc"/>
-  <circle cx="450" cy="25" r="6" fill="#172033"/>
-  <path class="edge" d="M450 31 V50"/>
-  <path class="edge" d="M450 110 V180"/>
-  <path class="edge" d="M365 210 H295 V280 H175 V240"/>
-  <path class="edge" d="M175 180 V135 H395 V180"/>
-  <path class="edge" d="M535 210 H600 V280 H725 V240"/>
-  <path class="edge" d="M725 180 V135 H505 V180"/>
-  <path class="edge" d="M365 220 H310 V420 H265"/>
-  <path class="edge" d="M175 450 V500 H340 V260 H390 V240"/>
-  <path class="edge" d="M535 220 H590 V420 H635"/>
-  <path class="edge" d="M705 450 V535 H650 V590"/>
-  <path class="edge" d="M745 450 V535 H855 V590"/>
-  <path class="edge" d="M450 240 V590"/>
-  <path class="edge" d="M450 650 V730"/>
-  <path class="edge" d="M450 790 V870"/>
-  <path class="edge" d="M410 240 V560 H75 V620 H90"/>
-  <text x="465" y="125" text-anchor="start" class="label"><tspan x="465" dy="0">start (admitted)</tspan></text>
-  <text x="182" y="306" text-anchor="middle" class="label"><tspan x="182" dy="0">approval, capacity</tspan><tspan x="182" dy="20">or dependency</tspan></text>
-  <text x="760" y="306" text-anchor="middle" class="label"><tspan x="760" dy="0">reserve reached</tspan><tspan x="760" dy="20">or route lost</tspan></text>
-  <text x="680" y="120" text-anchor="middle" class="label"><tspan x="680" dy="0">successor admitted</tspan></text>
-  <text x="182" y="350" text-anchor="middle" class="label"><tspan x="182" dy="0">controller restart</tspan></text>
-  <text x="172" y="528" text-anchor="middle" class="label"><tspan x="172" dy="0">reconciled and resumed</tspan></text>
-  <text x="690" y="350" text-anchor="middle" class="label"><tspan x="690" dy="0">stop requested</tspan></text>
-  <text x="650" y="570" text-anchor="middle" class="label"><tspan x="650" dy="0">quiescence proven</tspan></text>
-  <text x="855" y="570" text-anchor="middle" class="label"><tspan x="855" dy="0">ownership unproven</tspan></text>
-  <text x="466" y="490" text-anchor="start" class="label"><tspan x="466" dy="0">work sealed</tspan><tspan x="466" dy="20">as candidate</tspan></text>
-  <text x="466" y="697" text-anchor="start" class="label"><tspan x="466" dy="0">evidence recorded</tspan></text>
-  <text x="466" y="837" text-anchor="start" class="label"><tspan x="466" dy="0">new local branch created</tspan></text>
-  <rect class="node" x="365" y="50" width="170" height="60" rx="8"/>
-  <text x="450.0" y="86.0" text-anchor="middle"><tspan x="450.0" dy="0">draft</tspan></text>
-  <rect class="node" x="365" y="180" width="170" height="60" rx="8"/>
-  <text x="450.0" y="216.0" text-anchor="middle"><tspan x="450.0" dy="0">running</tspan></text>
-  <rect class="node" x="90" y="180" width="175" height="60" rx="8"/>
-  <text x="177.5" y="216.0" text-anchor="middle"><tspan x="177.5" dy="0">waiting</tspan></text>
-  <rect class="node" x="635" y="180" width="180" height="60" rx="8"/>
-  <text x="725.0" y="216.0" text-anchor="middle"><tspan x="725.0" dy="0">handing_off</tspan></text>
-  <rect class="node" x="90" y="390" width="175" height="60" rx="8"/>
-  <text x="177.5" y="426.0" text-anchor="middle"><tspan x="177.5" dy="0">interrupted</tspan></text>
-  <rect class="node" x="635" y="390" width="180" height="60" rx="8"/>
-  <text x="725.0" y="426.0" text-anchor="middle"><tspan x="725.0" dy="0">stopping</tspan></text>
-  <rect class="node" x="90" y="590" width="175" height="60" rx="8"/>
-  <text x="177.5" y="626.0" text-anchor="middle"><tspan x="177.5" dy="0">failed</tspan></text>
-  <rect class="node" x="365" y="590" width="170" height="60" rx="8"/>
-  <text x="450.0" y="626.0" text-anchor="middle"><tspan x="450.0" dy="0">checking</tspan></text>
-  <rect class="node" x="575" y="590" width="150" height="60" rx="8"/>
-  <text x="650.0" y="626.0" text-anchor="middle"><tspan x="650.0" dy="0">stopped</tspan></text>
-  <rect class="node" x="780" y="590" width="150" height="60" rx="8"/>
-  <text x="855.0" y="626.0" text-anchor="middle"><tspan x="855.0" dy="0">unknown</tspan></text>
-  <rect class="node" x="365" y="730" width="170" height="60" rx="8"/>
-  <text x="450.0" y="766.0" text-anchor="middle"><tspan x="450.0" dy="0">ready</tspan></text>
-  <rect class="node" x="365" y="870" width="170" height="60" rx="8"/>
-  <text x="450.0" y="906.0" text-anchor="middle"><tspan x="450.0" dy="0">accepted</tspan></text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1140" height="790" viewBox="0 0 1140 790" role="img" aria-labelledby="title description">
+  <title id="title">Task decisions and ownership boundaries</title>
+  <desc id="description">A project goal with selected context enters counted planning. Explicit plan adoption leads to separate execution preparation and Start. Owned work retains a candidate. Supported profiles require full checks, separate review and destination permission before a new branch is accepted. Stop requests enter stopping and settle as stopped only with the required proof; missing ownership remains unknown. The diagram summarizes decision boundaries, not every task state or provider capability.</desc>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#475569"/></marker></defs>
+  <style>text { font-family: Arial, Helvetica, sans-serif; fill: #172033; font-size: 20px; } .node { fill: #fff; stroke: #64748b; stroke-width: 1.5; } .edge { fill: none; stroke: #475569; stroke-width: 1.5; marker-end: url(#arrow); } .detail { font-size: 18px; fill: #334155; }</style>
+  <rect width="1140" height="790" rx="12" fill="#f8fafc"/>
+  <rect class="node" x="30" y="40" width="300" height="75" rx="8"/>
+  <text x="180.0" y="69" text-anchor="middle">Project goal</text>
+  <text x="180.0" y="93" text-anchor="middle" class="detail">Selected immutable context</text>
+  <rect class="node" x="420" y="40" width="300" height="75" rx="8"/>
+  <text x="570.0" y="69" text-anchor="middle">Counted planning</text>
+  <text x="570.0" y="93" text-anchor="middle" class="detail">Questions and proposed plan</text>
+  <rect class="node" x="810" y="40" width="300" height="75" rx="8"/>
+  <text x="960.0" y="69" text-anchor="middle">Explicit adoption</text>
+  <text x="960.0" y="93" text-anchor="middle" class="detail">Save the task contract</text>
+  <path class="edge" d="M330 78 H420"/>
+  <path class="edge" d="M720 78 H810"/>
+  <path class="edge" d="M960 115 V220"/>
+  <rect class="node" x="810" y="220" width="300" height="75" rx="8"/>
+  <text x="960.0" y="249" text-anchor="middle">Prepare execution</text>
+  <text x="960.0" y="273" text-anchor="middle" class="detail">Source, permissions and limits</text>
+  <rect class="node" x="420" y="220" width="300" height="75" rx="8"/>
+  <text x="570.0" y="249" text-anchor="middle">Start owned work</text>
+  <text x="570.0" y="273" text-anchor="middle" class="detail">Intent before provider input</text>
+  <rect class="node" x="30" y="220" width="300" height="75" rx="8"/>
+  <text x="180.0" y="249" text-anchor="middle">Retained candidate</text>
+  <text x="180.0" y="273" text-anchor="middle" class="detail">Exact bytes after cleanup</text>
+  <path class="edge" d="M810 258 H720"/>
+  <path class="edge" d="M420 258 H330"/>
+  <path class="edge" d="M180 295 V390"/>
+  <rect class="node" x="30" y="390" width="230" height="75" rx="8"/>
+  <text x="145.0" y="419" text-anchor="middle">Full checks</text>
+  <text x="145.0" y="443" text-anchor="middle" class="detail">Exact candidate tests</text>
+  <rect class="node" x="320" y="390" width="230" height="75" rx="8"/>
+  <text x="435.0" y="419" text-anchor="middle">Separate review</text>
+  <text x="435.0" y="443" text-anchor="middle" class="detail">Bound contributor origin</text>
+  <rect class="node" x="610" y="390" width="230" height="75" rx="8"/>
+  <text x="725.0" y="419" text-anchor="middle">Destination permission</text>
+  <text x="725.0" y="443" text-anchor="middle" class="detail">Exact destination grant</text>
+  <rect class="node" x="900" y="390" width="210" height="75" rx="8"/>
+  <text x="1005.0" y="419" text-anchor="middle">Accepted branch</text>
+  <text x="1005.0" y="443" text-anchor="middle" class="detail">New local ref only</text>
+  <path class="edge" d="M260 428 H320"/>
+  <path class="edge" d="M550 428 H610"/>
+  <path class="edge" d="M840 428 H900"/>
+  <text x="570" y="515" text-anchor="middle" class="detail">Checks, review and acceptance depend on profile support. Local proposals retain and export only.</text>
+  <text x="570" y="565" text-anchor="middle">Stop path from owned work</text>
+  <rect class="node" x="30" y="600" width="250" height="75" rx="8"/>
+  <text x="155.0" y="629" text-anchor="middle">Stopping</text>
+  <text x="155.0" y="653" text-anchor="middle" class="detail">Cancellation requested</text>
+  <rect class="node" x="420" y="600" width="300" height="75" rx="8"/>
+  <text x="570.0" y="629" text-anchor="middle">Stopped</text>
+  <text x="570.0" y="653" text-anchor="middle" class="detail">Required closure proof retained</text>
+  <rect class="node" x="810" y="600" width="300" height="75" rx="8"/>
+  <text x="960.0" y="629" text-anchor="middle">Unknown</text>
+  <text x="960.0" y="653" text-anchor="middle" class="detail">Ownership proof missing</text>
+  <path class="edge" d="M280 638 H420"/>
+  <path class="edge" d="M155 675 V715 H960 V675"/>
+  <text x="570" y="755" text-anchor="middle" class="detail">Unknown ownership blocks successors and acceptance. Reopening does not restart inference.</text>
 </svg>
