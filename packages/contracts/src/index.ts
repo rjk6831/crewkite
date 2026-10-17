@@ -907,6 +907,14 @@ export const RuntimeManifestSchema = z.strictObject({
     sha256: HashSchema,
   }),
   mode: z.literal('demo'),
+  localInput: z
+    .strictObject({
+      sha256: HashSchema,
+      sourceHash: HashSchema,
+      target: z.literal('darwin-arm64'),
+      minOS: z.literal('13.5.0'),
+    })
+    .optional(),
 });
 export type RuntimeManifest = z.infer<typeof RuntimeManifestSchema>;
 

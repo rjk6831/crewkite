@@ -960,6 +960,17 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     mode: 'demo',
   };
   assert.ok(RuntimeManifestSchema.safeParse(manifest).success);
+  assert.deepEqual(RuntimeManifestSchema.parse(manifest), manifest);
+  const localInput = {
+    sha256: 'b'.repeat(64),
+    sourceHash: 'c'.repeat(64),
+    target: 'darwin-arm64',
+    minOS: '13.5.0',
+  };
+  assert.deepEqual(RuntimeManifestSchema.parse({ ...manifest, localInput }), {
+    ...manifest,
+    localInput,
+  });
   assert.ok(
     RuntimeManifestSchema.safeParse({
       ...manifest,
@@ -970,6 +981,19 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     { ...manifest, version: 2 },
     { ...manifest, mode: 'production' },
     { ...manifest, entry: '/arbitrary/entry' },
+    { ...manifest, localInput: null },
+    { ...manifest, localInput: {} },
+    ...[
+      { sha256: 'invalid' },
+      { sourceHash: 'invalid' },
+      { target: 'darwin-x64' },
+      { minOS: '13.0.0' },
+      { path: '/arbitrary/helper' },
+      { executable: '/arbitrary/helper' },
+      { model: 'arbitrary' },
+      { secret: 'synthetic-secret' },
+      { token: 'synthetic-secret' },
+    ].map((input) => ({ ...manifest, localInput: { ...localInput, ...input } })),
     ...[
       { version: '24.21.0' },
       { platform: 'win32' },

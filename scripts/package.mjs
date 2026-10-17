@@ -554,6 +554,7 @@ export async function packageDesktop() {
     'app/runtime/bin/local-secure-input',
     'app/runtime/apps/controller/src/providers/local/sdk-child.ts',
     'app/runtime/apps/controller/src/providers/local/secure-input.ts',
+    'app/runtime/apps/controller/src/providers/google/acp/writer.ts',
     'app/runtime/apps/controller/src/providers/google/native-extension/connector.ts',
     'app/runtime/scripts/demo-controller.ts',
     'app/runtime/scripts/demo-state.ts',
