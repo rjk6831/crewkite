@@ -321,6 +321,7 @@ const contextBytes = (capture: CapturedContext) =>
   new TextEncoder().encode(canonicalJson(capture.bundle)).length;
 const sameContext = (left: ConversationContextRef[], right: ConversationContextRef[]) =>
   canonicalJson(left) === canonicalJson(right);
+type ContextRecipient = { summary: string; details?: string };
 function ContextPreview({
   captures,
   recipient,
@@ -331,7 +332,7 @@ function ContextPreview({
   recovery,
 }: {
   captures: CapturedContext[];
-  recipient?: string;
+  recipient?: ContextRecipient;
   text?: string;
   blocked?: string;
   onClose: () => void;
@@ -349,7 +350,7 @@ function ContextPreview({
           <p>
             <strong>Selected planning recipient</strong>
             <br />
-            {recipient}
+            {recipient.summary}
           </p>
         )}
         {text && <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{text}</pre>}
@@ -358,10 +359,6 @@ function ContextPreview({
             <p className="muted small">
               {capture.bundle.files.length} {capture.bundle.files.length === 1 ? 'file' : 'files'} ·{' '}
               {contextBytes(capture).toLocaleString()} bytes
-              <br />
-              Base <code>{capture.bundle.base}</code>
-              <br />
-              Capture <code>{capture.ref.hash}</code>
             </p>
             {capture.bundle.files.map((file) => (
               <section key={file.path}>
@@ -382,10 +379,22 @@ function ContextPreview({
             ))}
           </section>
         ))}
+        <details>
+          <summary>Details</summary>
+          {recipient?.details && <p className="muted small">{recipient.details}</p>}
+          {captures.map((capture, index) => (
+            <p key={capture.ref.artifactId} className="muted small">
+              Context {index + 1}
+              <br />
+              Base <code>{capture.bundle.base}</code>
+              <br />
+              Capture <code>{capture.ref.hash}</code>
+            </p>
+          ))}
+        </details>
         {onSend && (
           <p className="muted small">
-            The controller binds these captured bytes to the saved input. Execution permissions keep
-            their own review.
+            This sends the shown files with your message. It grants no extra execution permission.
           </p>
         )}
         {blocked && (
@@ -438,7 +447,7 @@ function useContextComposer({
   projectId: string;
   sourceBase?: string;
   scope: string;
-  recipient: string;
+  recipient: ContextRecipient;
   workspace: Workspace;
   afterApplied: (result: CommandResult, submitted: string) => void;
 }) {
@@ -459,7 +468,7 @@ function useContextComposer({
         kind: 'preview';
         captures: CapturedContext[];
         scope: string;
-        recipient?: string;
+        recipient?: ContextRecipient;
         command?: ContextSendCommand;
         submitted?: string;
       }
@@ -1049,8 +1058,11 @@ export function NewGoal({
       effort: profile?.effort ?? null,
     }),
     recipient: profile
-      ? `${roleLabels[planning.role]} · ${familyName(profile.family)} · Profile ${profile.id} · Requested model ${profile.model} · Requested effort ${profile.effort} · Route selected when planning is admitted`
-      : 'Planning recipient has not been selected.',
+      ? {
+          summary: `${roleLabels[planning.role]} · ${familyName(profile.family)} · Requested model ${profile.model}`,
+          details: `Profile ${profile.id} · Requested model ${profile.model} · Requested effort ${profile.effort} · Route selected when planning is admitted`,
+        }
+      : { summary: 'Planning recipient has not been selected.' },
     workspace,
     afterApplied: (result, submitted) => {
       if (result.entity && 'state' in result.entity) onCreated(result.entity.id, submitted);
@@ -1247,8 +1259,11 @@ export function ConversationView({
       recipientFamily: recipientRoute?.family ?? null,
     }),
     recipient: state?.configuration
-      ? `${roleLabels[state.configuration.selection.role]} · ${recipientRoute ? familyName(recipientRoute.family) : 'Provider not yet selected'} · Route ${state.configuration.routeId ?? 'not yet selected'} · Requested model ${state.configuration.requestedModel ?? 'unknown'} · Effective model ${state.configuration.effectiveModel ?? 'unknown'} · Requested effort ${state.configuration.requestedEffort ?? 'unknown'} · Effective effort ${state.configuration.effectiveEffort ?? 'unknown'}`
-      : 'Planning recipient has not been selected.',
+      ? {
+          summary: `${roleLabels[state.configuration.selection.role]} · ${recipientRoute ? familyName(recipientRoute.family) : 'Provider not yet selected'} · ${state.configuration.effectiveModel ? `Effective model ${state.configuration.effectiveModel}` : `Requested model ${state.configuration.requestedModel ?? 'unknown'}`}`,
+          details: `Profile ${state.configuration.selection.profileId} · Route ${state.configuration.routeId ?? 'not yet selected'} · Requested model ${state.configuration.requestedModel ?? 'unknown'} · Effective model ${state.configuration.effectiveModel ?? 'unknown'} · Requested effort ${state.configuration.requestedEffort ?? 'unknown'} · Effective effort ${state.configuration.effectiveEffort ?? 'unknown'}`,
+        }
+      : { summary: 'Planning recipient has not been selected.' },
     workspace,
     afterApplied: (_result, submitted) => onDraftSaved(submitted),
   });
