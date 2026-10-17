@@ -380,6 +380,129 @@ test('source inspection bounds file metadata without running filters or reading 
     await assert.rejects(copyInstalledDependencies(donor, candidate, expected, budget()), /EEXIST/);
   }
 
+  const { buildLocalInputHelper, inspectLocalInputArtifact } = await import(
+    new URL('../../../../scripts/package.mjs', import.meta.url).href
+  );
+  const helperArtifact = Buffer.alloc(56);
+  for (const [offset, value] of [
+    [0, 0xfeedfacf],
+    [4, 0x0100000c],
+    [12, 2],
+    [16, 1],
+    [20, 24],
+    [32, 0x32],
+    [36, 24],
+    [40, 1],
+    [44, 0x000d0500],
+    [48, 0x001a0500],
+  ])
+    helperArtifact.writeUInt32LE(value, offset);
+  assert.deepEqual(inspectLocalInputArtifact(helperArtifact), {
+    target: 'darwin-arm64',
+    minOS: '13.5.0',
+    sdk: '26.5.0',
+  });
+  for (const [offset, value] of [
+    [0, 0xcafebabe],
+    [4, 0x01000007],
+    [12, 6],
+    [16, 0],
+    [20, 25],
+    [32, 0x24],
+    [36, 16],
+    [40, 2],
+    [44, 0x000e0000],
+  ]) {
+    const invalid = Buffer.from(helperArtifact);
+    invalid.writeUInt32LE(value, offset);
+    assert.throws(() => inspectLocalInputArtifact(invalid));
+  }
+  assert.throws(() => inspectLocalInputArtifact(helperArtifact.subarray(0, 55)));
+  for (const row of [
+    'build',
+    'compiler failed',
+    'compiler missing',
+    'compiler timeout',
+    'compiler signalled',
+    'no output',
+    'changed source',
+    'wrong target',
+    'source link',
+  ] as const) {
+    const checkout = join(directory, 'native-helper', row);
+    const build = join(checkout, 'build');
+    const source = join(checkout, 'apps/controller/src/providers/local/secure-input.m');
+    mkdirSync(dirname(source), { recursive: true });
+    mkdirSync(build);
+    writeFileSync(source, 'synthetic helper source');
+    if (row === 'source link') {
+      unlinkSync(source);
+      symlinkSync(join(checkout, 'absent'), source);
+    }
+    let invoked = 0;
+    const compile = () =>
+      buildLocalInputHelper(checkout, build, {
+        read: (path: string) =>
+          path === source || path === join(build, 'local-secure-input')
+            ? readFileSync(path)
+            : Buffer.from('synthetic tool input'),
+        execute: (
+          compiler: string,
+          args: string[],
+          settings: {
+            timeout: number;
+            maxBuffer: number;
+            env: Record<string, string>;
+            stdio: string[];
+          },
+        ) => {
+          invoked++;
+          assert.equal(compiler, '/Library/Developer/CommandLineTools/usr/bin/clang');
+          assert.deepEqual(args, [
+            '-fobjc-arc',
+            '-fblocks',
+            '-arch',
+            'arm64',
+            '-mmacosx-version-min=13.5',
+            '-isysroot',
+            '/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk',
+            '-framework',
+            'AppKit',
+            '-framework',
+            'Foundation',
+            source,
+            '-o',
+            join(build, 'local-secure-input'),
+          ]);
+          assert.equal(settings.timeout, 30000);
+          assert.equal(settings.maxBuffer, 65536);
+          assert.deepEqual(settings.stdio, ['ignore', 'pipe', 'pipe']);
+          assert.deepEqual(settings.env, { LANG: 'C', PATH: '/usr/bin:/bin', TMPDIR: build });
+          if (row === 'changed source') writeFileSync(source, 'changed helper source');
+          const output = Buffer.from(helperArtifact);
+          if (row === 'wrong target') output.writeUInt32LE(0x000e0000, 44);
+          if (row !== 'no output') writeFileSync(join(build, 'local-secure-input'), output);
+          return {
+            status: row === 'compiler failed' ? 1 : row === 'compiler missing' ? null : 0,
+            signal: row === 'compiler signalled' ? 'SIGTERM' : null,
+            error: row === 'compiler timeout' ? new Error('synthetic timeout') : undefined,
+          };
+        },
+      });
+    if (row !== 'build') assert.throws(compile);
+    else {
+      const result = compile();
+      assert.deepEqual(result.identity, {
+        sha256: createHash('sha256').update(helperArtifact).digest('hex'),
+        sourceHash: createHash('sha256').update('synthetic helper source').digest('hex'),
+        target: 'darwin-arm64',
+        minOS: '13.5.0',
+      });
+      assert.throws(compile, /already exists/);
+    }
+    assert.equal(invoked, row === 'source link' ? 0 : 1);
+  }
+
   for (const name of [
     'copy',
     'exports',
