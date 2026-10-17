@@ -2992,7 +2992,8 @@ function Usage({
         {nextReadAt !== null && nextReadAt > now && (
           <p className="muted small">
             Cooldown until {new Date(nextReadAt).toLocaleTimeString()}. Refresh checks the
-            controller cooldown. Failed reads also count. No timer refreshes quota.
+            controller cooldown. Failed reads also count. Usage refreshes automatically about every
+            five minutes while connected.
           </p>
         )}
         {readerMessage && <p role="status">{readerMessage}</p>}
