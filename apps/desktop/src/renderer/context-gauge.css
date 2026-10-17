@@ -1,0 +1,206 @@
+/* Tile colors sampled from the wordmark. The wordmark keeps them in both themes, so the meter
+   does too. */
+.context-gauge {
+  --context-gauge-indigo: #4851ac;
+  --context-gauge-amber: #e5b962;
+  --context-gauge-coral: #eb7c61;
+  --context-gauge-teal: #40b1ab;
+  display: inline-flex;
+  flex: none;
+  vertical-align: middle;
+}
+/* The composer footer styles every button inside it as the send button. These resets keep the
+   meter its own size and color wherever the host mounts it. */
+.context-gauge .context-gauge-button {
+  display: inline-grid;
+  place-items: center;
+  width: auto;
+  height: auto;
+  min-inline-size: 32px;
+  min-block-size: 32px;
+  padding: 2px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  box-shadow: none;
+  filter: none;
+  color: inherit;
+  line-height: 0;
+}
+.context-gauge .context-gauge-button:hover:not(:disabled) {
+  background: var(--surface-hover);
+  filter: none;
+}
+.context-gauge .context-gauge-kite {
+  display: block;
+  overflow: visible;
+}
+.context-gauge .context-gauge-well {
+  fill: color-mix(in srgb, var(--text-dim) 12%, transparent);
+}
+.context-gauge .context-gauge-divider {
+  fill: none;
+  stroke: color-mix(in srgb, var(--text-dim) 55%, transparent);
+}
+.context-gauge .context-gauge-hatch {
+  stroke: color-mix(in srgb, var(--text-dim) 50%, transparent);
+}
+.context-gauge .context-gauge-tile.is-indigo {
+  fill: var(--context-gauge-indigo);
+}
+.context-gauge .context-gauge-tile.is-amber {
+  fill: var(--context-gauge-amber);
+}
+.context-gauge .context-gauge-tile.is-coral {
+  fill: var(--context-gauge-coral);
+}
+.context-gauge .context-gauge-tile.is-teal {
+  fill: var(--context-gauge-teal);
+}
+.context-gauge .context-gauge-outline {
+  fill: none;
+  stroke: var(--text-muted);
+  stroke-linejoin: miter;
+}
+/* Teal, coral and amber sit near 2:1 against the light well, so a line marks the level at 3:1
+   or better in both themes. */
+.context-gauge .context-gauge-level {
+  fill: none;
+  stroke: var(--text-muted);
+}
+/* An old reading keeps its level but loses color, and a clock mark sets it apart by shape. */
+.context-gauge.is-stale .context-gauge-tiles {
+  opacity: 0.85;
+  filter: saturate(0.25);
+}
+.context-gauge.is-stale .context-gauge-outline,
+.context-gauge.is-stale .context-gauge-level {
+  stroke: var(--text-dim);
+}
+.context-gauge .context-gauge-stale-mark {
+  fill: none;
+  stroke: var(--text-muted);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+/* Activity runs around the outline only. It never touches the fill, which moves only on a new
+   measurement. */
+.context-gauge .context-gauge-activity {
+  fill: none;
+  stroke: var(--accent);
+  stroke-linecap: round;
+  stroke-dasharray: 16 84;
+  animation: context-gauge-travel 3.2s linear infinite;
+}
+.context-gauge .context-gauge-halo {
+  display: none;
+  fill: none;
+  stroke: var(--accent);
+  stroke-linejoin: miter;
+}
+@keyframes context-gauge-travel {
+  to {
+    stroke-dashoffset: -100;
+  }
+}
+/* The composer sits at the bottom of the window, so the popover opens above and flips below when
+   it must. The inline insets keep it 8px clear of the window edge when it shifts to fit. */
+.context-gauge .context-gauge-popover {
+  position-area: top;
+  position-try-fallbacks: flip-block;
+  inset: auto 8px;
+  inline-size: max-content;
+  max-inline-size: min(272px, calc(100vw - 16px));
+  margin: 0 0 8px;
+  padding: 10px 12px 11px;
+  overflow: visible;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--surface-raised);
+  box-shadow: var(--shadow);
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.context-gauge .context-gauge-popover p {
+  line-height: 1.5;
+}
+.context-gauge .context-gauge-heading {
+  color: var(--text-dim);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+}
+.context-gauge .context-gauge-status {
+  margin: 2px 0 6px;
+  color: var(--text);
+  font-weight: 500;
+}
+.context-gauge .context-gauge-figures {
+  display: grid;
+  gap: 1px;
+  margin: 0 0 6px;
+}
+.context-gauge .context-gauge-figures > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+}
+.context-gauge .context-gauge-figures dd {
+  margin: 0;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.context-gauge .context-gauge-note {
+  margin-top: 8px;
+  padding-top: 7px;
+  border-top: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 11px;
+}
+/* The global reduced-motion rule uses a universal selector, so these class rules would still win. */
+@media (prefers-reduced-motion: reduce) {
+  .context-gauge .context-gauge-activity {
+    display: none;
+    animation: none;
+  }
+  .context-gauge .context-gauge-halo {
+    display: inline;
+  }
+}
+@media (forced-colors: active) {
+  .context-gauge .context-gauge-kite {
+    forced-color-adjust: none;
+  }
+  .context-gauge .context-gauge-well {
+    fill: none;
+  }
+  .context-gauge .context-gauge-divider,
+  .context-gauge .context-gauge-hatch {
+    stroke: GrayText;
+  }
+  .context-gauge .context-gauge-tiles .context-gauge-tile {
+    fill: Highlight;
+  }
+  .context-gauge.is-stale .context-gauge-tiles {
+    opacity: 1;
+    filter: none;
+  }
+  .context-gauge.is-stale .context-gauge-tiles .context-gauge-tile {
+    fill: GrayText;
+  }
+  .context-gauge .context-gauge-outline,
+  .context-gauge.is-stale .context-gauge-outline,
+  .context-gauge .context-gauge-level,
+  .context-gauge.is-stale .context-gauge-level,
+  .context-gauge .context-gauge-stale-mark {
+    stroke: CanvasText;
+  }
+  .context-gauge .context-gauge-activity,
+  .context-gauge .context-gauge-halo {
+    stroke: Highlight;
+  }
+}
