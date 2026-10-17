@@ -1012,6 +1012,10 @@ const usageBucket = z.looseObject({
 const usageOutput = z.looseObject({
   status: z.literal('SUCCESS'),
   num_turns: z.literal(0),
+  usage: z
+    .record(z.string().max(64), z.literal(0))
+    .refine((counters) => Object.keys(counters).length <= 32)
+    .optional(),
   command: z.looseObject({
     data: z.looseObject({
       groups: z.array(z.looseObject({ buckets: z.array(usageBucket).max(32) })).max(32),
@@ -1042,21 +1046,24 @@ export function projectGoogleUsage(stdout: Uint8Array): GoogleUsageBucket[] {
   const parsed = usageOutput.safeParse(value);
   if (!parsed.success) throw new GoogleWriterError('invalid-output');
   const buckets = new Map<string, GoogleUsageBucket>();
+  const fractions = new Map<string, number>();
   for (const group of parsed.data.command.data.groups)
     for (const bucket of group.buckets) {
       const next: GoogleUsageBucket = {
         windowId: bucket.id,
         kind: usageWindowKind(bucket.id),
-        remainingPercent: Math.round(bucket.remaining_fraction * 10000) / 100,
+        remainingPercent: bucket.remaining_fraction * 100,
         resetsAt: new Date(bucket.reset_time).toISOString(),
       };
       const previous = buckets.get(bucket.id);
       // The same bucket can appear under several model groups. Its values must agree.
       if (
         previous &&
-        (previous.remainingPercent !== next.remainingPercent || previous.resetsAt !== next.resetsAt)
+        (fractions.get(bucket.id) !== bucket.remaining_fraction ||
+          previous.resetsAt !== next.resetsAt)
       )
         throw new GoogleWriterError('invalid-output');
+      fractions.set(bucket.id, bucket.remaining_fraction);
       buckets.set(bucket.id, next);
     }
   if (buckets.size === 0) throw new GoogleWriterError('invalid-output');

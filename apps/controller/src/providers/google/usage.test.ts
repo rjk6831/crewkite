@@ -76,7 +76,7 @@ test('the google quota read maps zero-turn account buckets to window observation
         }),
       ),
     ),
-    [{ windowId: 'flash-model', kind: 'model', remainingPercent: 12.35, resetsAt: reset() }],
+    [{ windowId: 'flash-model', kind: 'model', remainingPercent: 12.3456, resetsAt: reset() }],
   );
   const groups = (buckets: unknown[]) => ({
     ...report,
@@ -85,11 +85,27 @@ test('the google quota read maps zero-turn account buckets to window observation
   for (const invalid of [
     { ...report, num_turns: 1 },
     { ...report, status: 'ERROR' },
+    ...[
+      'input_tokens',
+      'output_tokens',
+      'thinking_tokens',
+      'cache_read_tokens',
+      'total_tokens',
+    ].map((field) => ({ ...report, usage: { ...report.usage, [field]: 1 } })),
+    { ...report, usage: { ...report.usage, future_tokens: 1 } },
     groups([]),
     groups([{ ...weekly, remaining_fraction: 1.2 }]),
     groups([{ ...weekly, remaining_fraction: -0.1 }]),
     groups([{ ...weekly, reset_time: 'tomorrow' }]),
     groups([weekly, { ...weekly, remaining_fraction: 0.5 }]),
+    groups([
+      { ...weekly, remaining_fraction: 0.800001 },
+      { ...weekly, remaining_fraction: 0.800002 },
+    ]),
+    groups([
+      { ...weekly, remaining_fraction: 0.0013 },
+      { ...weekly, remaining_fraction: 0.0013000000000000002 },
+    ]),
     groups([{ ...weekly, id: '' }]),
     groups(Array(33).fill(weekly)),
   ])
