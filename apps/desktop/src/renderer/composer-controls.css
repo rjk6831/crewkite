@@ -1,5 +1,6 @@
-/* The toolbar mounts as its own row inside form.conversation-composer, directly above the footer.
-   It sizes itself from its own width, so the same rules hold in a wide panel and a narrow one. */
+/* The toolbar mounts inside .conversation-composer-footer, which holds the inset. The padding
+   variable keeps it usable as its own row. It sizes itself from its own width, so the same rules
+   hold in a wide panel and a narrow one. */
 .composer-controls {
   container: composer-controls / inline-size;
   position: relative;

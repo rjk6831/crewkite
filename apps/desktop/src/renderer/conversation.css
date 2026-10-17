@@ -49,9 +49,60 @@
   min-width: 0;
 }
 .conversation-primary strong {
+  color: var(--text);
   font-size: 13px;
   font-weight: 600;
   letter-spacing: -0.1px;
+}
+/* The summary keeps the avatar's height so the closed header reads as one row. */
+.conversation-primary > summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0 6px;
+  width: fit-content;
+  max-width: 100%;
+  min-height: 30px;
+  list-style: none;
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.conversation-primary > summary::-webkit-details-marker {
+  display: none;
+}
+.conversation-primary > summary::after {
+  content: "";
+  width: 5px;
+  height: 5px;
+  margin: 0 2px 3px;
+  border-right: 1.5px solid var(--text-dim);
+  border-bottom: 1.5px solid var(--text-dim);
+  transform: rotate(45deg);
+  transition: transform 150ms ease-out;
+}
+.conversation-primary[open] > summary::after {
+  margin-bottom: -2px;
+  transform: rotate(-135deg);
+}
+.conversation-primary > summary:hover {
+  color: var(--text);
+}
+.conversation-primary > summary:focus-visible {
+  border-radius: 6px;
+  outline-offset: 2px;
+}
+/* The details reuse the launch summary and notices. In the header they follow its text column. */
+.conversation-primary .launch-summary {
+  flex-wrap: wrap;
+  gap: 2px 14px;
+  padding: 4px 0 2px;
+  border: 0;
+  font-size: 11px;
+}
+.conversation-primary .notice {
+  margin-block: 6px 2px;
+  padding: 8px 10px;
 }
 .conversation-primary > span {
   color: var(--text-dim);
@@ -251,6 +302,76 @@
   color: var(--text-dim);
   opacity: 1;
 }
+/* The toolbar mounts inside the footer, which already holds the inset. */
+.conversation-composer-footer .composer-controls {
+  --composer-controls-padding: 0;
+}
+/* Context captured for the next message gets its own row under the text, so the toolbar keeps
+   its width. Two rows show; the rest scroll. */
+.conversation-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-height: 72px;
+  margin: 0;
+  padding: 4px 10px 4px 18px;
+  overflow-y: auto;
+  list-style: none;
+  scrollbar-width: thin;
+}
+.conversation-attachment,
+.conversation-message-attachment {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  max-width: 100%;
+  height: 28px;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  background: var(--surface-raised);
+  color: var(--text);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+.conversation-attachment button {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  height: 100%;
+  padding: 0 6px 0 9px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 8px 0 0 8px;
+  background: transparent;
+  white-space: nowrap;
+}
+.conversation-message-attachment > span,
+.conversation-attachment button > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.conversation-attachment .conversation-attachment-remove {
+  justify-content: center;
+  flex-shrink: 0;
+  width: 26px;
+  padding: 0;
+  border-left: 1px solid var(--border);
+  border-radius: 0 8px 8px 0;
+  color: var(--text-muted);
+}
+.conversation-attachment button:hover:not(:disabled),
+.conversation-message-attachment:hover:not(:disabled) {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+.conversation-attachment button:focus-visible {
+  outline-offset: -2px;
+}
+.conversation-attachment button:disabled {
+  color: var(--text-dim);
+  cursor: default;
+  opacity: 1;
+}
 .conversation-composer-note {
   display: flex;
   justify-content: space-between;
@@ -314,6 +435,21 @@
   line-height: 1.7;
   white-space: pre-wrap;
   text-wrap-style: pretty;
+}
+/* Context sent with a message opens its retained capture. */
+.conversation-message-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.message-user .conversation-message-attachments {
+  justify-content: flex-end;
+}
+.conversation-message-attachment {
+  padding: 0 10px;
+  color: var(--text-muted);
+  white-space: nowrap;
 }
 .message-role .conversation-message-avatar {
   border-color: color-mix(in srgb, var(--blue) 26%, var(--border));
@@ -977,6 +1113,7 @@
 /* The global reduced-motion rule uses a universal selector, so these class rules would still win. */
 @media (prefers-reduced-motion: reduce) {
   .conversation-composer,
+  .conversation-primary > summary::after,
   .conversation-stages > summary > svg,
   .conversation-plan-slices summary::before {
     transition: none;
