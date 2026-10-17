@@ -23,7 +23,7 @@ The following sections record exact pilot mechanics and adapter limits. Prior Go
 
 ## Google native workspace context
 
-The source-only [native task connector](../apps/controller/src/providers/google/native-extension/README.md) prepares a custom workspace MCP plugin for the provider's native app. An explicit local command selects one existing task and freezes its revision, run, source, candidate and bounded retained patch. Each tool rechecks that binding. The native app owns inference, model, effort, approvals and Stop. The connector launches no provider and exposes no controller mutation. One bounded result can be saved in an ignored sidecar labelled unverified; it establishes no check, review, accepted work or inference-stop evidence. Native plugin loading and live behavior remain unqualified. The consumer headless-wrapper restriction stays in force.
+The source-only [native task connector](../apps/controller/src/providers/google/native-extension/README.md) prepares workspace MCP configuration for the provider's native interactive CLI, or a workspace plugin for its app. An explicit local command selects one existing task and freezes its revision, run, source, candidate and bounded retained patch. Each tool rechecks that binding. The native client owns inference, model, effort, approvals and Stop. The connector launches no provider and exposes no controller mutation. One bounded result can be saved in an ignored sidecar labelled unverified; it establishes no check, review, accepted work or inference-stop evidence. Native loading and live behavior remain unqualified. The consumer headless-wrapper restriction stays in force.
 
 ## Anthropic writer preparation
 

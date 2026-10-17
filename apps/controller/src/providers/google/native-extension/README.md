@@ -1,6 +1,6 @@
 # Native task context
 
-This source-only connector shares one selected CrewKite task with the native Antigravity app through a workspace MCP plugin. The native app owns inference, model selection, effort, approvals and Stop. CrewKite starts no provider process. The consumer headless profile remains unavailable.
+This source-only connector shares one selected CrewKite task with the native Antigravity interactive CLI through workspace MCP configuration, or with the app through a workspace plugin. The native client owns inference, model selection, effort, approvals and Stop. CrewKite starts no provider process. The consumer headless profile remains unavailable.
 
 ## Prepare a scratch workspace
 
