@@ -147,12 +147,142 @@ export const GoogleNativeProfileSchema = AnthropicNativeProfileSchema.omit({
     z.literal('proceed-in-sandbox'),
   ]),
 });
+const acpIdentifier = label.refine(
+  (value) => value.isWellFormed() && !/\p{Cc}/u.test(value),
+  'Protocol identifiers must contain ordinary text.',
+);
+export const AcpConfigSelectionSchema = z
+  .strictObject({
+    optionId: acpIdentifier,
+    currentValue: acpIdentifier,
+    supported: z.array(acpIdentifier).min(1).max(32),
+  })
+  .refine(
+    (value) =>
+      new Set(value.supported).size === value.supported.length &&
+      value.supported.includes(value.currentValue),
+    'The current selection must be one of the distinct advertised values.',
+  );
+export const GoogleAcpConfigurationSchema = z.strictObject({
+  model: AcpConfigSelectionSchema,
+  thoughtLevel: AcpConfigSelectionSchema.nullable(),
+});
+export const GoogleAcpCapabilitiesSchema = z.strictObject({
+  protocolVersion: z.literal(1),
+  authMethods: z.array(z.literal('oauth-personal')).max(1),
+  sessionClose: z.boolean(),
+  // These describe the client posture. Native tools can still access their own resources.
+  fs: z.literal(false),
+  terminal: z.literal(false),
+});
+export const GoogleAcpReasonSchema = z.enum([
+  ...GoogleNativeProfileSchema.shape.reason.options,
+  'acp-capability-missing',
+  'auth-method-mismatch',
+  'authentication-required',
+]);
+export const GoogleAcpProfileSchema = GoogleNativeProfileSchema.omit({
+  id: true,
+  effort: true,
+  reason: true,
+  permissionModes: true,
+})
+  .extend({
+    id: z.literal('google-acp-v1'),
+    effort: acpIdentifier,
+    effortSupported: z.array(acpIdentifier).max(32),
+    configOptions: GoogleAcpConfigurationSchema.nullable(),
+    capabilities: GoogleAcpCapabilitiesSchema.nullable(),
+    permissionModes: z
+      .array(GoogleNativePermissionModeSchema)
+      .length(1)
+      .refine((modes) => modes[0] === 'request-review'),
+    reason: GoogleAcpReasonSchema,
+  })
+  .refine((profile) => {
+    const configuration = profile.configOptions;
+    const thought = configuration?.thoughtLevel;
+    return (
+      (configuration
+        ? profile.model === configuration.model.currentValue
+        : profile.model === 'unknown') &&
+      (thought
+        ? profile.effort === thought.currentValue &&
+          JSON.stringify(profile.effortSupported) === JSON.stringify(thought.supported)
+        : profile.effort === 'unknown' && profile.effortSupported.length === 0)
+    );
+  }, 'Model and effort facts must match the observed configuration.')
+  .refine(
+    (profile) =>
+      !profile.available ||
+      (!!profile.configOptions &&
+        !!profile.capabilities?.authMethods.includes('oauth-personal') &&
+        ['available', 'qualification-pending'].includes(profile.reason)),
+    'An available client needs compatible observed configuration and capabilities.',
+  )
+  .refine((profile) => profile.reason !== 'available' || profile.available);
 export const NativeProfileSchema = z.union([
-  OpenAiNativeProfileSchema.refine((profile) => profile.id !== 'openai-repository-v1'),
+  OpenAiNativeProfileSchema.refine(
+    (profile) => !['openai-repository-v1', 'google-acp-v1'].includes(profile.id),
+  ),
   AnthropicNativeProfileSchema,
   GoogleNativeProfileSchema,
   NativeRepositoryProfileSchema,
+  GoogleAcpProfileSchema,
 ]);
+export const GoogleAcpBillingAttestationSchema = NativeBillingAttestationSchema.extend({
+  quotaAccountConfirmed: z.literal(true),
+});
+export const GoogleAcpSelectionSchema = z.strictObject({
+  proofId: ArtifactIdSchema,
+  modelId: acpIdentifier,
+  thoughtLevelId: acpIdentifier.nullable(),
+});
+export const GoogleAcpSetupSchema = z
+  .strictObject({
+    profileId: z.literal('google-acp-v1'),
+    revision: RevisionSchema,
+    state: z.enum([
+      'uninitialized',
+      'initializing',
+      'authentication-required',
+      'authenticating',
+      'discovering',
+      'ready',
+      'stopping',
+      'blocked',
+      'unknown',
+    ]),
+    operationId: CommandIdSchema.nullable(),
+    proofId: ArtifactIdSchema.nullable(),
+    client: z
+      .strictObject({ version: label, sha256: HashSchema, signerTeamId: acpIdentifier })
+      .nullable(),
+    auth: z.strictObject({
+      method: z.literal('oauth-personal').nullable(),
+      status: z.enum(['unknown', 'required', 'authenticated']),
+    }),
+    reason: GoogleAcpReasonSchema.nullable(),
+  })
+  .refine(
+    (setup) =>
+      !['initializing', 'authenticating', 'discovering', 'stopping'].includes(setup.state) ||
+      !!setup.operationId,
+    'An active setup operation needs its command identity.',
+  )
+  .refine(
+    (setup) => setup.auth.status === 'unknown' || setup.auth.method === 'oauth-personal',
+    'An authentication result needs its exact method.',
+  )
+  .refine(
+    (setup) =>
+      setup.state !== 'ready' ||
+      (!setup.operationId &&
+        !!setup.client &&
+        !!setup.proofId &&
+        setup.auth.status === 'authenticated'),
+    'Ready setup needs a retained client proof and completed authentication.',
+  );
 export const NativeFileProfileIdSchema = z.enum([
   'openai-file-v1',
   'anthropic-file-v1',
@@ -228,7 +358,9 @@ export const NativeRunSchema = z
   .strictObject({
     runId: RunIdSchema,
     profileId: label,
-    billingAttestation: NativeBillingAttestationSchema.optional(),
+    billingAttestation: z
+      .union([NativeBillingAttestationSchema, GoogleAcpBillingAttestationSchema])
+      .optional(),
     permissionMode: GoogleNativePermissionModeSchema.optional(),
     stage: z.enum(['prepared', 'retain-only']),
     expiresAt: TimestampSchema.optional(),
@@ -242,7 +374,23 @@ export const NativeRunSchema = z
         bytes: RevisionSchema.max(65536),
       })
       .optional(),
+    acp: GoogleAcpSelectionSchema.optional(),
   })
+  .refine(
+    (run) =>
+      run.profileId === 'google-acp-v1'
+        ? !!run.acp &&
+          !!run.target &&
+          !!run.billingAttestation &&
+          'quotaAccountConfirmed' in run.billingAttestation &&
+          run.permissionMode === 'request-review' &&
+          !run.handoff &&
+          !run.repository &&
+          !run.execution
+        : !run.acp &&
+          !(run.billingAttestation && 'quotaAccountConfirmed' in run.billingAttestation),
+    'An ACP run needs its selected proof, target and separate account attestation.',
+  )
   .refine(
     (run) =>
       run.profileId === 'openai-repository-v1'
@@ -357,6 +505,36 @@ export const WindowSchema = z.strictObject({
   observation: ObservationSchema,
   state: WindowStateSchema,
 });
+export const UsageReaderSchema = z
+  .strictObject({
+    id: z.literal('google-usage-v1'),
+    family: z.literal('google'),
+    clientVersion: label,
+    available: z.boolean(),
+    reason: z.enum([
+      'available',
+      'unsupported-platform',
+      'native-home-unavailable',
+      'client-unavailable',
+      'client-build-mismatch',
+      'not-enabled',
+    ]),
+    enabled: z.boolean(),
+    lastObservedAt: TimestampSchema.nullable(),
+    lastAttemptAt: TimestampSchema.nullable().optional(),
+  })
+  .refine(
+    (reader) => reader.available === (reader.enabled && reader.reason === 'available'),
+    'Reader availability requires consent and a compatible client.',
+  )
+  .refine(
+    (reader) => reader.reason !== 'available' || reader.enabled,
+    'A disabled reader cannot report available.',
+  )
+  .refine(
+    (reader) => reader.reason !== 'not-enabled' || !reader.enabled,
+    'An enabled reader must report its client availability.',
+  );
 export const RoleSchema = z.strictObject({
   role: RoleNameSchema,
   routeId: RouteIdSchema,
@@ -502,6 +680,12 @@ export const TaskSchema = z
         path: ['waitingReason'],
       });
   });
+export const AcpApprovalTargetSchema = z.strictObject({
+  sessionId: acpIdentifier,
+  toolCallId: acpIdentifier,
+  optionId: acpIdentifier,
+  kind: z.literal('allow_once'),
+});
 export const ApprovalBindingSchema = z.strictObject({
   approvalId: ApprovalIdSchema,
   taskId: TaskIdSchema,
@@ -509,6 +693,7 @@ export const ApprovalBindingSchema = z.strictObject({
   generation: RevisionSchema,
   action: GrantSchema.shape.action,
   target: text,
+  acpTarget: AcpApprovalTargetSchema.optional(),
   revision: RevisionSchema,
 });
 export const ApprovalSchema = z.strictObject({
@@ -694,7 +879,7 @@ const nativePreparationFields = {
 export const NativePreparationPayloadSchema = z.union([
   z.strictObject({
     ...nativePreparationFields,
-    profileId: label.refine((id) => id !== 'openai-repository-v1'),
+    profileId: label.refine((id) => !['openai-repository-v1', 'google-acp-v1'].includes(id)),
     billingAttestation: NativeBillingAttestationSchema.optional(),
     permissionMode: GoogleNativePermissionModeSchema.optional(),
     targetPath: NativeTargetPathSchema,
@@ -703,6 +888,16 @@ export const NativePreparationPayloadSchema = z.union([
   z.strictObject({
     ...nativePreparationFields,
     profileId: z.literal('openai-repository-v1'),
+  }),
+  z.strictObject({
+    ...nativePreparationFields,
+    ...GoogleAcpSelectionSchema.shape,
+    profileId: z.literal('google-acp-v1'),
+    policy: PolicySchema.refine((policy) => policy.authority !== 'autopilot'),
+    creditPolicy: z.literal('ordinary').default('ordinary'),
+    billingAttestation: GoogleAcpBillingAttestationSchema,
+    permissionMode: z.literal('request-review'),
+    targetPath: NativeTargetPathSchema,
   }),
 ]);
 const nativeHandoffPreparationFields = {
@@ -733,6 +928,35 @@ export const NativeHandoffPreparationPayloadSchema = z.union([
 ]);
 export const CommandSchema = z.discriminatedUnion('command', [
   mutate('RegisterProject', z.strictObject({ path: text })),
+  mutate(
+    'ObserveUsage',
+    z.strictObject({ family: z.literal('google'), consent: z.boolean().optional() }),
+  ),
+  mutate(
+    'InitializeGoogleAcp',
+    z.strictObject({ profileId: z.literal('google-acp-v1'), consent: z.literal('explicit') }),
+  ),
+  mutate(
+    'AuthenticateGoogleAcp',
+    z.strictObject({
+      profileId: z.literal('google-acp-v1'),
+      proofId: ArtifactIdSchema,
+      method: z.literal('oauth-personal'),
+      consent: z.literal('explicit'),
+    }),
+  ),
+  mutate(
+    'DiscoverGoogleAcp',
+    z.strictObject({
+      profileId: z.literal('google-acp-v1'),
+      proofId: ArtifactIdSchema,
+      consent: z.literal('explicit'),
+    }),
+  ),
+  mutate(
+    'StopGoogleAcpSetup',
+    z.strictObject({ profileId: z.literal('google-acp-v1'), operationId: CommandIdSchema }),
+  ),
   read('InspectSource', z.strictObject({ projectId: ProjectIdSchema })),
   mutate(
     'CreateTask',
@@ -1029,9 +1253,11 @@ export type CandidateEvaluationPreview = z.infer<typeof CandidateEvaluationPrevi
 
 export const SnapshotSchema = z
   .strictObject({
+    usageReaders: z.array(UsageReaderSchema).max(1).default([]),
+    googleAcpSetup: GoogleAcpSetupSchema.nullable().default(null),
     nativeProfiles: z
       .array(NativeProfileSchema)
-      .max(4)
+      .max(5)
       .refine((profiles) => new Set(profiles.map((profile) => profile.id)).size === profiles.length)
       .default([]),
     nativeRuns: z.array(NativeRunSchema).max(10000).default([]),
@@ -1129,6 +1355,7 @@ const sourceInspection = z
     'Source details must match the full counts without repeated paths.',
   );
 export const ReadDataSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('google-acp-setup'), setup: GoogleAcpSetupSchema }),
   sourceInspection,
   z.strictObject({ kind: z.literal('snapshot'), snapshot: SnapshotSchema }),
   z.strictObject({
@@ -1182,21 +1409,55 @@ const event = <T extends string, S extends z.ZodType>(type: T, payload: S) =>
     type: z.literal(type),
     payload,
   });
+export const AcpActivitySchema = z
+  .strictObject({
+    sessionId: acpIdentifier,
+    sessionUpdate: z.enum([
+      'user_message_chunk',
+      'agent_message_chunk',
+      'agent_thought_chunk',
+      'tool_call',
+      'tool_call_update',
+      'plan',
+      'available_commands_update',
+      'current_mode_update',
+      'config_option_update',
+      'usage_update',
+      'session_info_update',
+    ]),
+    toolCallId: acpIdentifier.optional(),
+    status: z.enum(['pending', 'in_progress', 'completed', 'failed']).optional(),
+    locations: z
+      .array(
+        z.strictObject({ path: NativeTargetPathSchema, line: RevisionSchema.min(1).optional() }),
+      )
+      .max(100)
+      .optional(),
+    diffPaths: z.array(NativeTargetPathSchema).max(100).optional(),
+  })
+  .refine(
+    (activity) =>
+      ['tool_call', 'tool_call_update'].includes(activity.sessionUpdate)
+        ? !!activity.toolCallId
+        : !activity.toolCallId && !activity.status && !activity.locations && !activity.diffPaths,
+    'Tool activity needs its exact call identity.',
+  );
+const outputFields = {
+  attemptId: AttemptIdSchema,
+  generation: RevisionSchema,
+  text: z.string().max(65536),
+};
+export const AttemptOutputSchema = z.union([
+  z.strictObject({ ...outputFields, channel: z.enum(['stdout', 'stderr']) }),
+  z.strictObject({ ...outputFields, channel: z.literal('acp'), acp: AcpActivitySchema }),
+]);
 export const EventSchema = z.discriminatedUnion('type', [
   event('task.created', TaskSchema),
   event('task.updated', TaskSchema),
   event('run.prepared', RunSchema),
   event('run.admitted', RunSchema),
   event('attempt.launched', AttemptSchema),
-  event(
-    'attempt.output',
-    z.strictObject({
-      attemptId: AttemptIdSchema,
-      generation: RevisionSchema,
-      channel: z.enum(['stdout', 'stderr']),
-      text: z.string().max(65536),
-    }),
-  ),
+  event('attempt.output', AttemptOutputSchema),
   event('approval.requested', ApprovalSchema),
   event('approval.resolved', ApprovalSchema),
   event('usage.observed', ObservationSchema),
