@@ -411,28 +411,40 @@ export function NativeEvaluation({
             {prepared.check && <code>Check artifact {prepared.check.artifactId}</code>}
             {prepared.review && <code>Review artifact {prepared.review.artifactId}</code>}
           </details>
-          <div className="button-row">
-            <button
-              type="button"
-              className="button secondary"
-              disabled={!connected || !prepared.checkStart.available}
-              onClick={() => void start('StartCandidateEvaluation')}
-            >
-              Start local checks
-            </button>
-            <button
-              type="button"
-              className="button secondary"
-              disabled={!connected || !prepared.reviewStart.available}
-              onClick={() => void start('StartCandidateReview')}
-            >
-              Start native review
-            </button>
-          </div>
-          <p className="muted small" role="status">
-            Checks: {evaluationReasons[prepared.checkStart.reason]} Review:{' '}
-            {evaluationReasons[prepared.reviewStart.reason]}
-          </p>
+          {(!prepared.check || !prepared.review) && (
+            <div className="button-row">
+              {!prepared.check && (
+                <button
+                  type="button"
+                  className="button secondary"
+                  disabled={!connected || !prepared.checkStart.available}
+                  onClick={() => void start('StartCandidateEvaluation')}
+                >
+                  Start local checks
+                </button>
+              )}
+              {!prepared.review && (
+                <button
+                  type="button"
+                  className="button secondary"
+                  disabled={!connected || !prepared.reviewStart.available}
+                  onClick={() => void start('StartCandidateReview')}
+                >
+                  Start native review
+                </button>
+              )}
+            </div>
+          )}
+          {!prepared.check && (
+            <p className="muted small" role="status">
+              Checks: {evaluationReasons[prepared.checkStart.reason]}
+            </p>
+          )}
+          {!prepared.review && (
+            <p className="muted small" role="status">
+              Review: {evaluationReasons[prepared.reviewStart.reason]}
+            </p>
+          )}
           {!prepared.check &&
             !prepared.review &&
             task.state === 'stopped' &&
