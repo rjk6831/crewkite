@@ -979,6 +979,37 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     state: 'running',
     revision: 0,
   };
+  const contextUsage = {
+    observation: modelRequest.observation,
+    runId: conversationBinding.runId,
+    attemptId: conversationBinding.attemptId,
+    generation: 0,
+    model: 'profile-model',
+    usedTokens: 17,
+    capacityTokens: 128,
+    observedAt: '2026-10-17T00:00:00.000Z',
+  };
+  for (const usage of [contextUsage, { ...contextUsage, usedTokens: 0, capacityTokens: null }]) {
+    const measured = { ...configuredConversation, contextUsage: usage };
+    assert.deepEqual(TaskConversationStateSchema.parse(measured), measured);
+  }
+  for (const change of [
+    { usedTokens: -1 },
+    { usedTokens: Number.MAX_SAFE_INTEGER + 1 },
+    { capacityTokens: 0 },
+    { capacityTokens: -1 },
+    { capacityTokens: Number.MAX_SAFE_INTEGER + 1 },
+    { totalTokens: 100 },
+    { runId: `run_${'0'.repeat(26)}` },
+    { observedAt: 'tomorrow' },
+  ])
+    assert.equal(
+      TaskConversationStateSchema.safeParse({
+        ...configuredConversation,
+        contextUsage: { ...contextUsage, ...change },
+      }).success,
+      false,
+    );
   const executionQueue = {
     ...conversationState,
     purpose: 'execution',
@@ -988,6 +1019,21 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     send: { available: true, reason: 'queued-at-boundary', disposition: 'queue' },
   };
   assert.deepEqual(TaskConversationStateSchema.parse(executionQueue), executionQueue);
+  const retainedExecutionInput = { ...executionQueue, activeAttempt: null };
+  assert.deepEqual(
+    TaskConversationStateSchema.parse(retainedExecutionInput),
+    retainedExecutionInput,
+  );
+  for (const change of [
+    { purpose: 'conversation' },
+    { currentRunId: null },
+    { phase: 'unknown' },
+    { phase: 'stopping' },
+  ])
+    assert.equal(
+      TaskConversationStateSchema.safeParse({ ...retainedExecutionInput, ...change }).success,
+      false,
+    );
   const linkedPlanningTurn = {
     ...configuredConversation,
     purpose: 'execution',
@@ -1017,7 +1063,6 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     }).success,
   );
   for (const change of [
-    { activeAttempt: null },
     { currentRunId: null },
     { purpose: null },
     { activeAttempt: { ...conversationOwner, state: 'unknown' } },

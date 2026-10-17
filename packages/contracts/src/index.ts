@@ -1740,6 +1740,24 @@ const conversationModelEntries = z
     'Catalog model identifiers must be distinct.',
   );
 export const ConversationModelCatalogEntriesSchema = conversationModelEntries.min(1);
+export const ConversationContextMeasurementSchema = z.strictObject({
+  threadId: conversationModelText(200),
+  turnId: conversationModelText(200),
+  model: conversationModelText(200),
+  usedTokens: z.number().int().nonnegative().safe(),
+  capacityTokens: z.number().int().positive().safe().nullable(),
+});
+export const ConversationContextUsageSchema = ConversationContextMeasurementSchema.omit({
+  threadId: true,
+  turnId: true,
+}).extend({
+  observation: conversationModelObservation,
+  runId: RunIdSchema,
+  attemptId: AttemptIdSchema,
+  generation: RevisionSchema,
+  observedAt: TimestampSchema,
+});
+export type ConversationContextUsage = z.infer<typeof ConversationContextUsageSchema>;
 export const ConversationModelCatalogSchema = z
   .strictObject({
     version: z.literal(1),
@@ -1757,6 +1775,7 @@ export const ConversationModelCatalogSchema = z
     }),
     locationHash: HashSchema,
     models: ConversationModelCatalogEntriesSchema,
+    contextUsage: ConversationContextMeasurementSchema.optional(),
   })
   .refine(
     (catalog) => conversationBytes(catalog) <= 32768,
@@ -1897,6 +1916,7 @@ export const TaskConversationStateSchema = z
       })
       .nullable(),
     modelChoices: ConversationModelChoicesSchema.optional(),
+    contextUsage: ConversationContextUsageSchema.nullable().optional(),
     currentRunId: RunIdSchema.nullable(),
     activeAttempt: AttemptSchema.nullable(),
     budget: z.strictObject({ limits: LimitsSchema, remaining: RemainingBudgetsSchema }).nullable(),
@@ -1917,6 +1937,8 @@ export const TaskConversationStateSchema = z
     const fail = (message: string) => context.addIssue({ code: 'custom', message });
     if (state.activeAttempt && state.activeAttempt.runId !== state.currentRunId)
       fail('The active conversation attempt must belong to the current run.');
+    if (state.contextUsage && state.contextUsage.runId !== state.currentRunId)
+      fail('Context usage must belong to the current run.');
     if (
       new Set(state.pendingQuestions.map((question) => question.id)).size !==
       state.pendingQuestions.length
@@ -1962,10 +1984,11 @@ export const TaskConversationStateSchema = z
       state.send.disposition === 'queue' &&
       (!state.currentRunId ||
         state.purpose === null ||
-        !state.activeAttempt ||
-        !['intent', 'running', 'stopping'].includes(state.activeAttempt.state))
+        (state.activeAttempt
+          ? !['intent', 'running', 'stopping'].includes(state.activeAttempt.state)
+          : state.purpose !== 'execution' || ['unknown', 'stopping'].includes(state.phase)))
     )
-      fail('Queued input requires a known active owner for the current run.');
+      fail('Queued input requires a known current owner or a quiescent execution run.');
     if (
       state.send.available &&
       state.send.disposition === 'planning-turn' &&
