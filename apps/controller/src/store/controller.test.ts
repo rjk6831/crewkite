@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawn as spawnProcess, spawnSync } from 'node:child_process';
+import {
+  execFileSync,
+  type SpawnOptionsWithoutStdio,
+  spawn as spawnProcess,
+  spawnSync,
+} from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import {
@@ -3330,6 +3335,260 @@ function nativeCandidate(controller: Controller) {
   return candidate.promise;
 }
 
+async function localControllerFixture(t: TestContext, initialMode = 'completed') {
+  let mode = initialMode;
+  let context: Awaited<ReturnType<typeof setup>>;
+  let reopened: Controller | undefined;
+  let submissions = 0;
+  const submitted = Promise.withResolvers<void>();
+  const children: Promise<void>[] = [];
+  const runtime = { connectorId: 'local-sdk-v1', version: 'fixture-runtime', build: 1 };
+  const identity = {
+    modelKey: 'fixture-model',
+    displayName: 'Local fixture',
+    format: 'gguf',
+    sizeBytes: 1234,
+    quantization: null,
+    selectedVariant: null,
+    metadataHash: hashCanonical({ model: 'fixture-model', path: 'owned-fixture' }),
+  };
+  const choice = {
+    selectionId: hashCanonical({ runtime, metadataHash: identity.metadataHash }),
+    identity,
+    instanceReference: 'fixture-instance',
+    contextLength: 8192,
+    state: 'loaded-eligible',
+    reasons: [],
+    qualification: 'unqualified',
+  };
+  const observed = {
+    version: 1,
+    runtime,
+    models: [choice],
+    residentLlms: 1,
+    embeddingInstances: 0,
+  };
+  const observation = { ...observed, observationHash: hashCanonical(observed) };
+  const secret = 'private-controller-local-canary';
+  const inputPeer = `
+const fs=require('node:fs'); const mode=process.argv[1]; let pending=Buffer.alloc(0);
+process.stdin.on('data',part=>{pending=Buffer.concat([pending,part]);if(pending.length<4||pending.length<4+pending.readUInt32BE(0))return;
+const prompt=JSON.parse(pending.subarray(4,4+pending.readUInt32BE(0)));pending=Buffer.alloc(0);
+const body=Buffer.from(JSON.stringify({binding:prompt.binding,outcome:'submitted',secret:${JSON.stringify(secret)}}));const header=Buffer.alloc(4);header.writeUInt32BE(body.length);
+const finish=()=>{fs.writeSync(3,Buffer.concat([header,body]));process.stdin.destroy();};if(mode==='input-hold')process.stdin.once('end',finish);else finish();});`;
+  const clientPeer = `
+const {createInterface}=require('node:readline');const mode=process.argv[1];const observation=${JSON.stringify(observation)};
+let plan;const emit=value=>process.stdout.write(JSON.stringify(value)+'\\n');
+const finish=value=>{emit(value);process.stdin.destroy();};
+createInterface({input:process.stdin}).on('line',line=>{const value=JSON.parse(line);
+if(!plan){plan=value;if(plan.kind==='discovery'){finish({type:'discovery',terminal:{kind:'observed',binding:plan.binding,observation}});return;}emit({type:'ready',binding:plan.binding});return;}
+const content='export function netMinor() { return 0; }\\n';const proof={stopReason:value==='stop'?'userStopped':'eosFound',promptTokens:1,predictedTokens:1,renderedPromptTokens:1,outputBytes:Buffer.byteLength(content),contextLength:8192,maxTokens:2048,contextOverflowPolicy:'stopAtLimit',draftModel:''};
+if(value==='submit'&&mode==='hold')return;
+if(value==='submit'&&mode==='client-loss'){process.stdin.destroy();return;}
+if(value==='submit'&&mode==='unknown'){finish({type:'terminal',terminal:{kind:'unknown',binding:plan.binding,reason:'ownership'}});return;}
+if(value==='stop'){finish({type:'terminal',terminal:{kind:'stopped',binding:plan.binding,proof}});return;}
+if(value==='submit')finish({type:'terminal',terminal:{kind:'completed',binding:plan.binding,proof,proposal:{version:1,attemptId:plan.binding.attemptId,path:plan.binding.path,baseHash:plan.binding.baseHash,content}}});});`;
+  const spawnClient = ((
+    executable: string,
+    _args: readonly string[],
+    settings: SpawnOptionsWithoutStdio,
+  ) => {
+    const child = spawn(executable, ['-e', clientPeer, mode], settings);
+    children.push(new Promise<void>((done) => child.once('close', () => done())));
+    const write = child.stdin.write.bind(child.stdin);
+    child.stdin.write = ((chunk: string | Uint8Array) => {
+      for (const line of Buffer.from(chunk).toString().trim().split('\n')) {
+        if (!line) continue;
+        const value = JSON.parse(line);
+        if (value === 'submit') {
+          submissions++;
+          submitted.resolve();
+          const intent = context.controller.store.intents().at(-1);
+          assert(intent);
+          assert(context.controller.store.receipt(`native-submission:${intent.attempt_id}`));
+        } else if (typeof value === 'object') {
+          const local = context.controller.store.localControl() as {
+            operation?: { state: string };
+          };
+          if (value.kind === 'discovery') assert.equal(local.operation?.state, 'owned');
+          else
+            assert.equal(
+              context.controller.store.nativeProcesses(value.binding.attemptId)[0]?.state,
+              'owned',
+            );
+        }
+      }
+      return write(chunk);
+    }) as typeof child.stdin.write;
+    return child;
+  }) as typeof spawnProcess;
+  const options: Partial<ControllerOptions> = {
+    localInputHelper: {
+      root: resolve('internal'),
+      sha256: 'a'.repeat(64),
+      sourceHash: 'b'.repeat(64),
+      target: 'darwin-arm64',
+    },
+    localInput: {
+      platform: 'darwin',
+      arch: 'arm64',
+      verifyHelper: () => process.execPath,
+      launch: (executable, settings) => {
+        assert.equal(
+          (context.controller.store.localControl() as { operation?: { state: string } }).operation
+            ?.state,
+          'intent',
+        );
+        const child = spawn(executable, ['-e', inputPeer, mode], settings);
+        children.push(new Promise<void>((done) => child.once('close', () => done())));
+        return {
+          group: child.pid ?? 0,
+          input: child.stdin,
+          output: child.stdio[3],
+          onSpawn: (handler) => {
+            child.once('spawn', handler);
+          },
+          onError: (handler) => {
+            child.once('error', handler);
+          },
+          onClose: (handler) => {
+            child.once('close', handler);
+          },
+        };
+      },
+    },
+    localDiscovery: { spawn: spawnClient },
+    localWriter: { spawn: spawnClient },
+    afterIntent: () => {
+      if (mode === 'intent-restart') throw Error('Local intent interrupted.');
+    },
+  };
+  context = await setup(t, options, async (controller) => {
+    await reopened?.close();
+    await controller.close();
+    await Promise.all(children);
+  });
+  const { controller, command, fixtures } = context;
+  const setupState = () => controller.snapshot().localSetup;
+  const local = (name: string, payload: object = {}) =>
+    controller.execute(command(name, payload, setupState()?.revision ?? 0), 'local-owner');
+  const operationDone = async () => {
+    const operation = (controller as unknown as { localOperation?: { done: Promise<void> } })
+      .localOperation;
+    assert(operation);
+    await nativeWait('Local metadata operation', operation.done);
+  };
+  await local('ConfigureLocal', { endpoint: 'ws://127.0.0.1:12345' });
+  const connectionRevision = setupState()?.connectionRevision;
+  const begin = command(
+    'BeginLocalConnectionInput',
+    { consent: 'explicit' },
+    setupState()?.revision,
+  );
+  assert.equal((await controller.execute(begin, 'local-owner')).outcome, 'applied');
+  assert.equal(setupState()?.operation?.kind, 'input');
+  assert.equal((await controller.execute(begin, 'local-owner')).outcome, 'already-applied');
+  await operationDone();
+  assert.equal(setupState()?.secretConfigured, true);
+  await local('RefreshLocalModels', { consent: 'explicit' });
+  assert.equal(setupState()?.operation?.kind, 'discovery');
+  await operationDone();
+  assert.equal(setupState()?.connectionRevision, connectionRevision);
+  assert.equal(setupState()?.secretConfigured, true);
+  assert.equal(setupState()?.observation?.observationHash, observation.observationHash);
+  assert.equal(
+    (
+      await local('SelectLocalModel', {
+        selectionId: choice.selectionId,
+        observationHash: 'f'.repeat(64),
+      })
+    ).reason,
+    'local-selection-stale',
+  );
+  await local('SelectLocalModel', {
+    selectionId: choice.selectionId,
+    observationHash: observation.observationHash,
+  });
+  assert.equal(setupState()?.reason, 'qualification-pending');
+  assert.equal(setupState()?.connectionRevision, connectionRevision);
+  const task = TaskSchema.parse((await controller.execute(context.draft, 'local-owner')).entity);
+  const policy = {
+    ...fixtures.policy,
+    authority: 'guided',
+    quality: 'quick',
+    methods: [{ id: 'keep-it-simple', cycles: 1, reviewerRole: 'advisor' }],
+    limits: { attempts: 3, minutes: 5, concurrency: 1 },
+    reserves: [],
+    unknownUsage: { rule: 'fixed-allowance', allowance: { launches: 3, minutes: 5 } },
+    effects: fixtures.policy.effects.map((grant) => ({
+      ...grant,
+      taskId: task.id,
+      target: grant.action === 'export-patch' ? task.id : grant.target,
+    })),
+  };
+  const revision = () => controller.store.get<{ revision: number }>('task', task.id)?.revision;
+  const prepare = () =>
+    controller.execute(
+      command(
+        'PrepareNativeRun',
+        {
+          taskId: task.id,
+          profileId: 'local-file-v1',
+          targetPath: 'net.mjs',
+          policy,
+          consent: 'explicit',
+        },
+        revision(),
+      ),
+      'local-owner',
+    );
+  const prepared = await prepare();
+  assert.equal(prepared.outcome, 'applied', JSON.stringify(prepared));
+  const run = RunSchema.parse(prepared.entity);
+  const terminal = Promise.withResolvers<void>();
+  const off = controller.subscribe((event) => {
+    if (
+      event.type === 'task.updated' &&
+      event.taskId === task.id &&
+      ['stopped', 'unknown'].includes(event.payload.state)
+    )
+      terminal.resolve();
+  });
+  t.after(off);
+  const start = command('StartRun', { taskId: task.id, runId: run.id }, revision());
+  const started = () => controller.execute(start, 'local-owner');
+  const reopen = async () => {
+    await controller.close();
+    reopened = new Controller({
+      ...options,
+      home: controller.home,
+      now: context.clock.now,
+      id: context.id,
+    });
+    return reopened;
+  };
+  return {
+    ...context,
+    options,
+    local,
+    operationDone,
+    setupState,
+    task,
+    run,
+    start,
+    started,
+    terminal: terminal.promise,
+    prepare,
+    mode: (value: string) => {
+      mode = value;
+    },
+    submissions: () => submissions,
+    submitted: submitted.promise,
+    reopen,
+    secret,
+  };
+}
+
 test('an appointed native proposal is retained and applied once after every phase stops', async (t) => {
   const local = await nativeSetup(t, 'success', {
     nativeProfiles: () => [
@@ -3376,9 +3635,89 @@ test('an appointed native proposal is retained and applied once after every phas
     ),
     'local-owner',
   );
-  assert.equal(refusedLocal.outcome, 'unsupported');
+  assert.equal(refusedLocal.outcome, 'blocked');
+  assert.equal(refusedLocal.reason, 'local-model-unavailable');
   assert.deepEqual(local.controller.snapshot(), beforeLocal);
   assert.equal(local.controller.store.intents().length, 0);
+  const connectedLocal = await localControllerFixture(t);
+  assert.equal((await connectedLocal.started()).outcome, 'applied');
+  connectedLocal.clock.advance(60000);
+  await nativeWait('Local completed writer', connectedLocal.terminal);
+  assert.equal(connectedLocal.submissions(), 1);
+  assert.equal(
+    connectedLocal.controller.snapshot().tasks.find((task) => task.id === connectedLocal.task.id)
+      ?.state,
+    'stopped',
+  );
+  const localCandidate = connectedLocal.controller
+    .snapshot()
+    .candidates.find((candidate) => candidate.taskId === connectedLocal.task.id);
+  assert(localCandidate);
+  assert.equal(connectedLocal.controller.snapshot().evidence.length, 0);
+  const exportedLocal = await connectedLocal.controller.execute(
+    connectedLocal.command(
+      'ExportPatch',
+      {
+        taskId: connectedLocal.task.id,
+        candidateId: localCandidate.id,
+      },
+      connectedLocal.controller.store.get<{ revision: number }>('task', connectedLocal.task.id)
+        ?.revision,
+    ),
+    'local-owner',
+  );
+  assert.equal(exportedLocal.outcome, 'applied');
+  ArtifactSchema.parse(exportedLocal.entity);
+  assert.equal(
+    (await connectedLocal.controller.execute(connectedLocal.start, 'local-owner')).outcome,
+    'already-applied',
+  );
+  const originalLocalRun = structuredClone(
+    connectedLocal.controller.store.get('run', connectedLocal.run.id),
+  );
+  const plannedAfterLocal = await connectedLocal.controller.execute(
+    connectedLocal.command(
+      'ConfigureTaskConversation',
+      {
+        taskId: connectedLocal.task.id,
+        planning: {
+          role: 'lead',
+          profileId: 'openai-file-v1',
+          creditPolicy: 'ordinary',
+          limits: { attempts: 3, minutes: 5, concurrency: 1 },
+          consent: 'explicit',
+        },
+      },
+      connectedLocal.controller.store.get<{ revision: number }>('task', connectedLocal.task.id)
+        ?.revision,
+    ),
+    'local-owner',
+  );
+  assert.equal(plannedAfterLocal.outcome, 'applied');
+  const allowance = await connectedLocal.controller.execute(
+    connectedLocal.command('GetTaskConversationState', {
+      taskId: connectedLocal.task.id,
+    }),
+    'local-owner',
+  );
+  assert.equal(allowance.data?.kind, 'conversation-state');
+  if (allowance.data?.kind === 'conversation-state') {
+    assert.equal(allowance.data.state.budget?.remaining.attempts, 2);
+    assert.equal(allowance.data.state.budget?.remaining.minutes, 4);
+  }
+  assert.deepEqual(
+    connectedLocal.controller.store.get('run', connectedLocal.run.id),
+    originalLocalRun,
+  );
+  const retainedLocal = await connectedLocal.reopen();
+  assert.equal(retainedLocal.snapshot().localSetup?.secretConfigured, false);
+  assert.equal(retainedLocal.snapshot().localSetup?.generation, 'idle');
+  assert.equal(
+    retainedLocal.snapshot().candidates.find((candidate) => candidate.id === localCandidate.id)
+      ?.hash,
+    localCandidate.hash,
+  );
+  assert.equal(connectedLocal.submissions(), 1);
   for (const permissionMode of [
     'request-review',
     'strict',
@@ -3720,11 +4059,16 @@ test('an appointed native proposal is retained and applied once after every phas
         ),
       );
       controller.store.db.exec(
-        'INSERT INTO native_processes SELECT * FROM native_processes_saved; DROP TABLE native_processes_saved; DROP TABLE google_metadata_operations; DROP TABLE google_usage_reader; DROP TABLE native_profile_bindings; DROP TABLE google_acp_setup; PRAGMA user_version=4',
+        'INSERT INTO native_processes SELECT * FROM native_processes_saved; DROP TABLE native_processes_saved; DROP TABLE google_metadata_operations; DROP TABLE google_usage_reader; DROP TABLE native_profile_bindings; DROP TABLE google_acp_setup; DROP TABLE local_control; DROP TABLE run_purposes; DROP TABLE task_conversations; DROP TABLE conversation_entries; PRAGMA user_version=4',
       );
       controller.store.applyMigrations(new URL('../../migrations/', import.meta.url).pathname);
       assert.deepEqual(controller.store.nativeProcesses(attempt.attempt_id), previous);
-      assert.equal(controller.store.db.prepare('PRAGMA user_version').get()?.user_version, 8);
+      assert.equal(
+        controller.store.db.prepare('PRAGMA user_version').get()?.user_version,
+        readdirSync(new URL('../../migrations/', import.meta.url)).filter((name) =>
+          /^\d{3}-[a-z0-9-]+\.sql$/.test(name),
+        ).length,
+      );
       assert.equal(controller.store.googleUsageReader().enabled, 0);
       assert.deepEqual(controller.store.googleMetadataOperations(), []);
       assert.equal(controller.store.googleAcpSetup().state, 'uninitialized');
@@ -5157,6 +5501,216 @@ test('an appointed native proposal is retained and applied once after every phas
 });
 
 test('stop or restart cannot submit or apply late native work', async (t) => {
+  for (const row of [
+    'stop',
+    'disconnect',
+    'admission-stop',
+    'input-cancel',
+    'input-disconnect',
+    'input-intent-restart',
+    'unknown',
+    'client-loss',
+    'missing-terminal',
+    'missing-preparation',
+    'corrupt-terminal',
+    'intent-restart',
+  ]) {
+    const mode =
+      row === 'stop' || row === 'disconnect'
+        ? 'hold'
+        : row === 'missing-terminal' || row === 'missing-preparation' || row === 'corrupt-terminal'
+          ? 'unknown'
+          : row;
+    const context = await localControllerFixture(t, mode);
+    const { controller, command, task, run } = context;
+    if (row === 'input-intent-restart') {
+      const control = controller.store.localControl() as Record<string, unknown>;
+      const setup = context.setupState();
+      assert(setup?.connectionHash);
+      const operationId = context.id('cmd');
+      controller.store.transaction(() =>
+        controller.store.putLocalControl({
+          ...control,
+          revision: setup.revision + 1,
+          operation: {
+            kind: 'input',
+            state: 'intent',
+            group: null,
+            revoked: false,
+            clientQuiescent: false,
+            binding: {
+              version: 2,
+              operationId,
+              nonce: 'c'.repeat(64),
+              connectionHash: setup.connectionHash,
+              connectionRevision: setup.connectionRevision,
+            },
+          },
+        }),
+      );
+      const reopened = await context.reopen();
+      const retained = reopened.snapshot().localSetup;
+      assert.equal(retained?.operation?.state, 'unknown');
+      assert.equal(retained?.operation?.operationId, operationId);
+      assert.equal(retained?.secretConfigured, false);
+      assert.equal(
+        (
+          await reopened.execute(
+            command('BeginLocalConnectionInput', { consent: 'explicit' }, retained?.revision),
+            'local-owner',
+          )
+        ).reason,
+        'local-operation-unknown',
+      );
+      assert.equal(context.submissions(), 0);
+      assert.equal(reopened.store.intents().length, 0);
+      continue;
+    }
+    if (row === 'input-cancel' || row === 'input-disconnect') {
+      context.mode('input-hold');
+      const before = context.setupState();
+      await context.local('BeginLocalConnectionInput', { consent: 'explicit' });
+      const operation = context.setupState()?.operation;
+      assert(operation && operation.kind === 'input');
+      assert.equal((await context.started()).outcome, 'blocked');
+      assert.equal(controller.store.intents().length, 0);
+      if (row === 'input-cancel')
+        await context.local('CancelLocalConnectionInput', { operationId: operation.operationId });
+      else await context.local('DisconnectLocal');
+      await context.operationDone();
+      assert.equal(context.setupState()?.secretConfigured, false);
+      assert.equal(context.setupState()?.operation, null);
+      assert.equal(context.submissions(), 0);
+      assert.equal(
+        context.setupState()?.connectionRevision,
+        (before?.connectionRevision ?? 0) + (row === 'input-disconnect' ? 1 : 0),
+      );
+      continue;
+    }
+    let stoppedAtAdmission: Promise<CommandResult> | undefined;
+    if (row === 'admission-stop') {
+      const off = controller.subscribe((event) => {
+        if (event.type === 'run.admitted' && event.taskId === task.id) {
+          off();
+          stoppedAtAdmission = controller.execute(
+            command(
+              'StopRun',
+              { taskId: task.id, runId: run.id },
+              controller.store.get<{ revision: number }>('task', task.id)?.revision,
+            ),
+            'local-owner',
+          );
+        }
+      });
+      t.after(off);
+    }
+    if (row === 'intent-restart')
+      await assert.rejects(context.started(), /Local intent interrupted/);
+    else {
+      assert.equal((await context.started()).outcome, 'applied');
+      if (row === 'stop' || row === 'disconnect') {
+        await nativeWait('Local submission before Stop', context.submitted);
+        assert.equal(
+          (await context.local('RefreshLocalModels', { consent: 'explicit' })).reason,
+          'generation-active',
+        );
+        assert.equal(
+          (await context.local('ConfigureLocal', { endpoint: 'ws://127.0.0.1:23456' })).reason,
+          'generation-active',
+        );
+        if (row === 'stop')
+          await controller.execute(
+            command(
+              'StopRun',
+              { taskId: task.id, runId: run.id },
+              controller.store.get<{ revision: number }>('task', task.id)?.revision,
+            ),
+            'local-owner',
+          );
+        else await context.local('DisconnectLocal');
+      }
+      await nativeWait(`Local ${row} terminal`, context.terminal);
+      if (stoppedAtAdmission) assert.equal((await stoppedAtAdmission).outcome, 'applied');
+    }
+    const intent = controller.store.intents().find((value) => value.run_id === run.id);
+    assert(intent);
+    const uncertain = [
+      'unknown',
+      'client-loss',
+      'missing-terminal',
+      'corrupt-terminal',
+      'missing-preparation',
+      'intent-restart',
+    ].includes(row);
+    assert.equal(
+      controller.snapshot().localSetup?.generation,
+      row === 'intent-restart' ? 'active' : uncertain ? 'unknown' : 'idle',
+    );
+    assert.equal(controller.snapshot().candidates.length, 0);
+    assert.equal(
+      context.submissions(),
+      row === 'admission-stop' || row === 'intent-restart' ? 0 : 1,
+    );
+    if (row === 'missing-preparation')
+      controller.store.transaction(() =>
+        controller.store.db
+          .prepare('DELETE FROM receipts WHERE command_key=?')
+          .run(`local-prepared:${run.id}`),
+      );
+    if (row === 'missing-terminal')
+      controller.store.transaction(() =>
+        controller.store.db
+          .prepare('DELETE FROM receipts WHERE command_key=?')
+          .run(`local-terminal:${intent.attempt_id}`),
+      );
+    if (row === 'corrupt-terminal') {
+      const artifact = ArtifactSchema.parse(
+        controller.store.receipt(`local-terminal:${intent.attempt_id}`)?.result.entity,
+      );
+      writeFileSync(join(controller.home, 'artifacts', artifact.hash), '{}');
+    }
+    const before = context.submissions();
+    const reopened = await context.reopen();
+    assert.equal(reopened.snapshot().localSetup?.secretConfigured, false);
+    assert.equal(reopened.snapshot().localSetup?.generation, uncertain ? 'unknown' : 'idle');
+    const reservations = reopened.store.db
+      .prepare('SELECT COUNT(*) AS count FROM reservations WHERE attempt_id=?')
+      .get(intent.attempt_id)?.count;
+    const leases = reopened.store.db
+      .prepare('SELECT COUNT(*) AS count FROM writer_leases WHERE attempt_id=?')
+      .get(intent.attempt_id)?.count;
+    assert.equal(reservations, uncertain ? 1 : 0);
+    assert.equal(leases, uncertain ? 1 : 0);
+    if (uncertain) {
+      const setup = reopened.snapshot().localSetup;
+      assert.equal(
+        (
+          await reopened.execute(
+            command('BeginLocalConnectionInput', { consent: 'explicit' }, setup?.revision),
+            'local-owner',
+          )
+        ).reason,
+        'generation-unknown',
+      );
+      await reopened.execute(
+        command(
+          'StopRun',
+          { taskId: task.id, runId: run.id },
+          reopened.store.get<{ revision: number }>('task', task.id)?.revision,
+        ),
+        'local-owner',
+      );
+      assert.equal(reopened.snapshot().localSetup?.generation, 'unknown');
+      assert.equal(
+        reopened.store.db
+          .prepare('SELECT COUNT(*) AS count FROM reservations WHERE attempt_id=?')
+          .get(intent.attempt_id)?.count,
+        1,
+      );
+    }
+    assert.equal(context.submissions(), before);
+  }
+
   for (const scenario of ['auth-api', 'overage', 'stop-auth', 'stop-task'] as const) {
     const context = await nativeSetup(
       t,

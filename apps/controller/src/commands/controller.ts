@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
@@ -33,6 +34,7 @@ import {
   type CheckResult,
   CheckResultSchema,
   type Command,
+  CommandIdSchema,
   type CommandResult,
   CommandResultSchema,
   CommandSchema,
@@ -53,6 +55,12 @@ import {
   GrantSchema,
   HashSchema,
   LimitsSchema,
+  LocalEndpointSchema,
+  LocalModelObservationSchema,
+  LocalModelSelectionSchema,
+  LocalObservedModelBindingSchema,
+  type LocalSetup,
+  LocalSetupSchema,
   MAX_FRAME_BYTES,
   NativeBillingAttestationSchema,
   NativeHandoffPreviewSchema,
@@ -77,6 +85,7 @@ import {
   ReviewMethodSchema,
   type ReviewResult,
   ReviewResultSchema,
+  RevisionSchema,
   type Route,
   RouteIdSchema,
   type RouterDecision,
@@ -192,6 +201,22 @@ import {
   googleUsageDescriptor,
   resolveGoogleUsageClient,
 } from '../providers/google/profile.ts';
+import {
+  localConfiguredConnectionHash,
+  resolveLocalConnection,
+} from '../providers/local/connection.ts';
+import {
+  BindingSchema as LocalBindingSchema,
+  type LocalStart,
+  TerminalSchema as LocalTerminalSchema,
+  localPlan,
+} from '../providers/local/profile.ts';
+import { startLocalDiscovery, startLocalReplacement } from '../providers/local/replacement.ts';
+import {
+  type LocalInputHelper,
+  type LocalInputResult,
+  startLocalSecretInput,
+} from '../providers/local/secure-input.ts';
 import {
   type ConversationPlan,
   conversationBindingHash,
@@ -535,6 +560,80 @@ type ConversationRuntime = {
   done: Promise<void>;
 };
 
+const LocalOperationBindingSchema = z.strictObject({
+  version: z.union([z.literal(1), z.literal(2)]),
+  operationId: CommandIdSchema,
+  nonce: HashSchema,
+  connectionHash: HashSchema,
+  connectionRevision: RevisionSchema,
+});
+const LocalControlSchema = z.strictObject({
+  revision: RevisionSchema,
+  connectionRevision: RevisionSchema,
+  endpoint: LocalEndpointSchema.nullable(),
+  observation: LocalModelObservationSchema.nullable(),
+  selection: LocalModelSelectionSchema.nullable(),
+  setupHash: HashSchema.nullable(),
+  operation: z
+    .strictObject({
+      kind: z.enum(['input', 'discovery']),
+      binding: LocalOperationBindingSchema,
+      state: z.enum(['intent', 'owned', 'stopping', 'unknown']),
+      group: z.number().int().positive().safe().nullable(),
+      revoked: z.boolean(),
+      clientQuiescent: z.boolean(),
+    })
+    .refine((operation) => operation.binding.version === (operation.kind === 'input' ? 2 : 1))
+    .nullable(),
+});
+type LocalControl = z.infer<typeof LocalControlSchema>;
+type LocalOperationRuntime = {
+  operationId: string;
+  stopped: boolean;
+  handle?: { stop: () => void };
+  done: Promise<void>;
+};
+type LocalSecretCell = {
+  connectionRevision: number;
+  connectionHash: string;
+  secret: Buffer;
+};
+const LocalPreparedSchema = z.strictObject({
+  version: z.literal(1),
+  kind: z.literal('local-file'),
+  run: RunSchema,
+  attempt: AttemptSchema,
+  profile: NativeProfileSchema,
+  endpoint: LocalEndpointSchema,
+  localModel: LocalObservedModelBindingSchema,
+  target: z.strictObject({ path: z.string().min(1).max(4096), baseHash: HashSchema }),
+  manifest: z
+    .array(
+      z.strictObject({
+        path: z.string().min(1).max(4096),
+        mode: z.enum(['100644', '100755']),
+        hash: HashSchema,
+        bytes: RevisionSchema,
+      }),
+    )
+    .max(10000),
+  context: z.strictObject({
+    title: z.string().min(1).max(200),
+    outcome: z.string().min(1).max(4096),
+    criteria: z.array(z.string().min(1).max(4096)).min(1).max(100),
+  }),
+  scopeHash: HashSchema,
+  expiresAt: TimestampSchema,
+});
+type LocalPrepared = z.infer<typeof LocalPreparedSchema>;
+type LocalWriterRuntime = {
+  plan: LocalPrepared;
+  binding: LocalStart['binding'];
+  stopped: boolean;
+  handle?: ReturnType<typeof startLocalReplacement>;
+  done: Promise<void>;
+};
+
 export type ControllerOptions = {
   home: string;
   now?: () => string;
@@ -559,6 +658,10 @@ export type ControllerOptions = {
     spawn?: Parameters<typeof startGoogleAcpSetup>[0]['spawn'];
   };
   registerGoogleAcp?: boolean;
+  localInputHelper?: LocalInputHelper;
+  localInput?: Parameters<typeof startLocalSecretInput>[2];
+  localDiscovery?: Omit<Parameters<typeof startLocalDiscovery>[2], 'lifecycle'>;
+  localWriter?: Omit<Parameters<typeof startLocalReplacement>[2], 'lifecycle' | 'onSubmitted'>;
   prepareVerification?: typeof prepareToolchain;
 };
 const migrations = fileURLToPath(new URL('../../migrations/', import.meta.url));
@@ -585,6 +688,10 @@ export class Controller {
     promise: Promise<CommandResult>;
   };
   private readonly nativeReviewWorkers = new Map<string, NativeReviewRuntime>();
+  private localSecret: LocalSecretCell | null = null;
+  private localOperation?: LocalOperationRuntime;
+  private readonly pendingLocalLaunches = new Set<string>();
+  private readonly localWriters = new Map<string, LocalWriterRuntime>();
   private readonly conversationWorkers = new Map<string, ConversationRuntime>();
   private readonly pendingConversationLaunches = new Set<string>();
   private conversation!: TaskConversation;
@@ -828,7 +935,8 @@ export class Controller {
     const candidateEvaluations = this.candidateEvaluations();
     return SnapshotSchema.parse({
       protocol: 1,
-      nativeProfiles: this.profiles.map((profile) => profile.facts),
+      nativeProfiles: this.resolveProfiles().map((profile) => profile.facts),
+      localSetup: this.localSetup(),
       googleAcpSetup: this.store.googleAcpSetup(),
       usageReaders: [this.googleUsageReader()],
       nativeRuns: this.nativeRuns(),
@@ -1437,6 +1545,17 @@ export class Controller {
         runtime.worker.child.stdin.end();
       }
     }
+    this.revokeLocalSecret();
+    if (this.localOperation) {
+      this.localOperation.stopped = true;
+      this.localOperation.handle?.stop();
+      native.push(this.localOperation.done);
+    }
+    for (const runtime of this.localWriters.values()) {
+      runtime.stopped = true;
+      runtime.handle?.stop();
+      native.push(runtime.done);
+    }
     for (const runtime of this.conversationWorkers.values()) {
       runtime.stopped = true;
       runtime.handle?.stop();
@@ -1467,6 +1586,19 @@ export class Controller {
 
   private checkRevision(command: Command): CommandResult | undefined {
     if (!('expectedRevision' in command)) return;
+    if (
+      command.command === 'ConfigureLocal' ||
+      command.command === 'BeginLocalConnectionInput' ||
+      command.command === 'CancelLocalConnectionInput' ||
+      command.command === 'DisconnectLocal' ||
+      command.command === 'RefreshLocalModels' ||
+      command.command === 'SelectLocalModel'
+    ) {
+      const setup = this.localSetup();
+      if (command.expectedRevision !== setup.revision)
+        return { outcome: 'stale-revision', revision: setup.revision };
+      return;
+    }
     if (
       [
         'InitializeGoogleAcp',
@@ -1571,6 +1703,13 @@ export class Controller {
         };
     }
     switch (command.command) {
+      case 'ConfigureLocal':
+      case 'BeginLocalConnectionInput':
+      case 'CancelLocalConnectionInput':
+      case 'DisconnectLocal':
+      case 'RefreshLocalModels':
+      case 'SelectLocalModel':
+        return this.localCommand(command, effects);
       case 'GetTaskConversation':
         return {
           outcome: 'applied',
@@ -1797,6 +1936,497 @@ export class Controller {
           reason: 'command-not-implemented',
           next: 'This command has no qualified D0 implementation.',
         };
+    }
+  }
+
+  private localControl(): LocalControl {
+    return LocalControlSchema.parse(
+      this.store.localControl() ?? {
+        revision: 0,
+        connectionRevision: 0,
+        endpoint: null,
+        observation: null,
+        selection: null,
+        setupHash: null,
+        operation: null,
+      },
+    );
+  }
+
+  private saveLocal(control: LocalControl) {
+    const next = LocalControlSchema.parse({ ...control, revision: control.revision + 1 });
+    this.store.putLocalControl(next);
+    return next;
+  }
+
+  private revokeLocalSecret() {
+    this.localSecret?.secret.fill(0);
+    this.localSecret = null;
+  }
+
+  private localSecretMatches(control = this.localControl()) {
+    return (
+      !!control.endpoint &&
+      !!this.localSecret &&
+      this.localSecret.connectionRevision === control.connectionRevision &&
+      this.localSecret.connectionHash ===
+        localConfiguredConnectionHash(control.endpoint, control.connectionRevision)
+    );
+  }
+
+  private localConnection() {
+    const control = this.localControl();
+    const current =
+      control.endpoint &&
+      control.observation &&
+      control.selection &&
+      control.selection.observationHash === control.observation.observationHash;
+    return resolveLocalConnection(
+      current
+        ? {
+            endpoint: control.endpoint,
+            connectionRevision: control.connectionRevision,
+            observation: control.observation,
+            selectionId: control.selection?.selectionId,
+          }
+        : undefined,
+      {
+        platform: this.options.localInput?.platform ?? process.platform,
+        arch: this.options.localInput?.arch ?? process.arch,
+        secretConfigured: this.localSecretMatches(control),
+      },
+    );
+  }
+
+  private localSetup(): LocalSetup {
+    const control = this.localControl();
+    const generation = this.store.localGenerationBlocker();
+    const secretConfigured = this.localSecretMatches(control);
+    const choice = control.observation?.models.find(
+      (value) => value.selectionId === control.selection?.selectionId,
+    );
+    const reason: LocalSetup['reason'] =
+      generation ??
+      (control.operation
+        ? control.operation.kind === 'input'
+          ? control.operation.state === 'unknown'
+            ? 'input-unknown'
+            : 'input-active'
+          : control.operation.state === 'unknown'
+            ? 'discovery-unknown'
+            : 'discovery-active'
+        : !control.endpoint
+          ? 'unconfigured'
+          : !this.options.localInputHelper
+            ? 'capability-unavailable'
+            : !secretConfigured
+              ? 'connection-required'
+              : !control.observation
+                ? 'discovery-required'
+                : !control.selection
+                  ? 'model-selection-required'
+                  : control.selection.observationHash !== control.observation.observationHash
+                    ? 'selection-stale'
+                    : !choice
+                      ? 'setup-unavailable'
+                      : choice.state === 'installed-unloaded'
+                        ? 'model-unloaded'
+                        : choice.state !== 'loaded-eligible'
+                          ? 'model-incompatible'
+                          : 'qualification-pending');
+    return LocalSetupSchema.parse({
+      revision: control.revision,
+      connectionRevision: control.connectionRevision,
+      connectorId: 'local-sdk-v1',
+      endpoint: control.endpoint,
+      setupHash: control.setupHash,
+      connectionHash: control.endpoint
+        ? localConfiguredConnectionHash(control.endpoint, control.connectionRevision)
+        : null,
+      secretConfigured,
+      operation: control.operation
+        ? {
+            kind: control.operation.kind,
+            operationId: control.operation.binding.operationId,
+            state: control.operation.state,
+          }
+        : null,
+      generation: generation === 'generation-unknown' ? 'unknown' : generation ? 'active' : 'idle',
+      observation: control.observation,
+      selection: control.selection,
+      reason,
+    });
+  }
+
+  private localCommand(
+    command: Extract<
+      Command,
+      {
+        command:
+          | 'ConfigureLocal'
+          | 'BeginLocalConnectionInput'
+          | 'CancelLocalConnectionInput'
+          | 'DisconnectLocal'
+          | 'RefreshLocalModels'
+          | 'SelectLocalModel';
+      }
+    >,
+    effects: (() => void)[],
+  ): CommandResult {
+    let control = this.localControl();
+    const applied = (): CommandResult => {
+      const setup = this.localSetup();
+      return { outcome: 'applied', revision: setup.revision };
+    };
+    if (command.command === 'DisconnectLocal') {
+      this.revokeLocalSecret();
+      control = this.saveLocal({
+        ...control,
+        connectionRevision: control.connectionRevision + 1,
+        observation: null,
+        selection: null,
+        setupHash: null,
+        operation: control.operation
+          ? {
+              ...control.operation,
+              revoked: true,
+              state: control.operation.state === 'unknown' ? 'unknown' : 'stopping',
+            }
+          : null,
+      });
+      effects.push(() => {
+        if (this.localOperation) {
+          this.localOperation.stopped = true;
+          this.localOperation.handle?.stop();
+        }
+        for (const runtime of this.localWriters.values()) {
+          runtime.stopped = true;
+          runtime.handle?.stop();
+        }
+      });
+      return applied();
+    }
+    if (command.command === 'CancelLocalConnectionInput') {
+      if (
+        control.operation?.kind !== 'input' ||
+        control.operation.binding.operationId !== command.payload.operationId
+      )
+        return { outcome: 'blocked', reason: 'local-input-not-current' };
+      this.revokeLocalSecret();
+      this.saveLocal({
+        ...control,
+        operation: {
+          ...control.operation,
+          revoked: true,
+          state: control.operation.state === 'unknown' ? 'unknown' : 'stopping',
+        },
+      });
+      effects.push(() => {
+        if (this.localOperation?.operationId === command.payload.operationId) {
+          this.localOperation.stopped = true;
+          this.localOperation.handle?.stop();
+        }
+      });
+      return applied();
+    }
+    const blocker = this.store.localStartBlocker();
+    if (blocker) return { outcome: 'blocked', reason: blocker };
+    if (command.command === 'ConfigureLocal') {
+      if (control.endpoint === command.payload.endpoint) return applied();
+      this.revokeLocalSecret();
+      this.saveLocal({
+        ...control,
+        endpoint: command.payload.endpoint,
+        connectionRevision: control.connectionRevision + 1,
+        observation: null,
+        selection: null,
+        setupHash: null,
+        operation: null,
+      });
+      return applied();
+    }
+    if (!control.endpoint) return { outcome: 'blocked', reason: 'local-not-configured' };
+    if (command.command === 'SelectLocalModel') {
+      if (
+        !control.observation ||
+        command.payload.observationHash !== control.observation.observationHash ||
+        !control.observation.models.some(
+          (value) => value.selectionId === command.payload.selectionId,
+        )
+      )
+        return { outcome: 'blocked', reason: 'local-selection-stale' };
+      this.saveLocal({
+        ...control,
+        selection: command.payload,
+        setupHash: hashCanonical({
+          version: 2,
+          connectionHash: localConfiguredConnectionHash(
+            control.endpoint,
+            control.connectionRevision,
+          ),
+          ...command.payload,
+        }),
+      });
+      return applied();
+    }
+    if (!this.options.localInputHelper)
+      return { outcome: 'blocked', reason: 'local-input-unavailable' };
+    if (command.command === 'RefreshLocalModels' && !this.localSecretMatches(control))
+      return { outcome: 'blocked', reason: 'local-connection-required' };
+    const kind = command.command === 'BeginLocalConnectionInput' ? 'input' : 'discovery';
+    if (kind === 'input') this.revokeLocalSecret();
+    const binding = {
+      version: kind === 'input' ? (2 as const) : (1 as const),
+      operationId: command.key,
+      nonce: hashCanonical({
+        operationId: command.key,
+        connectionRevision: control.connectionRevision,
+        at: this.now(),
+      }),
+      connectionHash: localConfiguredConnectionHash(control.endpoint, control.connectionRevision),
+      connectionRevision: control.connectionRevision,
+    };
+    this.saveLocal({
+      ...control,
+      observation: null,
+      selection: null,
+      setupHash: null,
+      operation: {
+        kind,
+        binding,
+        state: 'intent',
+        group: null,
+        revoked: false,
+        clientQuiescent: false,
+      },
+    });
+    effects.push(() => this.launchLocalOperation(binding.operationId));
+    return applied();
+  }
+
+  private localOperationCurrent(operationId: string) {
+    const control = this.localControl();
+    const operation = control.operation;
+    if (
+      this.closed ||
+      !control.endpoint ||
+      !operation ||
+      operation.binding.operationId !== operationId ||
+      operation.revoked ||
+      operation.state === 'unknown' ||
+      operation.binding.connectionRevision !== control.connectionRevision ||
+      operation.binding.connectionHash !==
+        localConfiguredConnectionHash(control.endpoint, control.connectionRevision) ||
+      this.store.localGenerationBlocker()
+    )
+      throw Error('Local operation authority changed.');
+    return { control, operation };
+  }
+
+  private launchLocalOperation(operationId: string) {
+    if (this.closed) return;
+    const initial = this.localControl();
+    const operation = initial.operation;
+    if (!operation || operation.binding.operationId !== operationId) return;
+    const completion = Promise.withResolvers<void>();
+    const runtime: LocalOperationRuntime = {
+      operationId,
+      stopped: false,
+      done: completion.promise,
+    };
+    this.localOperation = runtime;
+    let requested = false;
+    const finish = (
+      value: LocalInputResult | Awaited<ReturnType<typeof startLocalDiscovery>['result']> | null,
+    ) => {
+      try {
+        this.store.transaction(() => {
+          const control = this.localControl();
+          const current = control.operation;
+          if (!current || current.binding.operationId !== operationId) {
+            if (value && 'candidate' in value) value.candidate.discard();
+            return;
+          }
+          const clientQuiescent =
+            !requested ||
+            (value !== null &&
+              ('kind' in value
+                ? value.kind === 'ready' || value.clientQuiescent
+                : value.clientQuiescent));
+          const ownershipUnknown =
+            value &&
+            ('terminal' in value
+              ? value.terminal.kind === 'unavailable' && value.terminal.reason === 'ownership'
+              : value.kind !== 'ready' && value.reason === 'ownership');
+          const known =
+            !ownershipUnknown &&
+            clientQuiescent &&
+            (!requested ||
+              (current.group !== null &&
+                current.state !== 'unknown' &&
+                (current.kind === 'input' || current.clientQuiescent)));
+          const live =
+            !this.closed &&
+            !runtime.stopped &&
+            !current.revoked &&
+            current.binding.connectionRevision === control.connectionRevision &&
+            !!control.endpoint &&
+            current.binding.connectionHash ===
+              localConfiguredConnectionHash(control.endpoint, control.connectionRevision) &&
+            !this.store.localGenerationBlocker();
+          let observation = control.observation;
+          if (known && live && value && 'kind' in value && value.kind === 'ready') {
+            const secret = value.candidate.take(current.binding);
+            if (secret)
+              this.localSecret = {
+                connectionRevision: control.connectionRevision,
+                connectionHash: current.binding.connectionHash,
+                secret: Buffer.from(secret),
+              };
+          } else if (value && 'candidate' in value) value.candidate.discard();
+          if (
+            known &&
+            live &&
+            value &&
+            'terminal' in value &&
+            value.terminal.kind === 'observed' &&
+            hashCanonical(value.terminal.binding) === hashCanonical(current.binding)
+          )
+            observation = LocalModelObservationSchema.parse(value.terminal.observation);
+          const proof = this.nativeArtifact({
+            operationId,
+            kind: current.kind,
+            binding: current.binding,
+            clientQuiescent,
+            known,
+            revoked: !live,
+            observation,
+          });
+          this.store.saveReceipt(`local-operation:${operationId}`, proof.hash, 'local-owner', {
+            outcome: known ? 'applied' : 'outcome-unknown',
+            entity: proof,
+          });
+          this.saveLocal({
+            ...control,
+            observation,
+            operation: known ? null : { ...current, state: 'unknown' },
+          });
+        });
+      } catch {
+        this.revokeLocalSecret();
+        if (value && 'candidate' in value) value.candidate.discard();
+        try {
+          this.store.transaction(() => {
+            const control = this.localControl();
+            if (control.operation?.binding.operationId === operationId)
+              this.saveLocal({ ...control, operation: { ...control.operation, state: 'unknown' } });
+          });
+        } catch {}
+      } finally {
+        if (this.localOperation === runtime) this.localOperation = undefined;
+        completion.resolve();
+      }
+    };
+    try {
+      if (this.closed || operation.revoked) return finish(null);
+      const { control } = this.localOperationCurrent(operationId);
+      const directory = join(this.home, 'local-operations', operationId);
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
+      const own = (group: number) => {
+        this.store.transaction(() => {
+          const { control, operation } = this.localOperationCurrent(operationId);
+          if (!Number.isSafeInteger(group) || group <= 0 || operation.state !== 'intent')
+            throw Error('Local operation group is invalid.');
+          this.saveLocal({ ...control, operation: { ...operation, group, state: 'owned' } });
+        });
+      };
+      if (operation.kind === 'input') {
+        runtime.handle = startLocalSecretInput(
+          { binding: operation.binding, endpoint: control.endpoint },
+          this.options.localInputHelper,
+          {
+            ...this.options.localInput,
+            schedule: this.options.schedule,
+            launch: (executable, settings) => {
+              requested = true;
+              const child =
+                this.options.localInput?.launch?.(executable, settings) ??
+                (() => {
+                  const child = spawn(executable, [], settings);
+                  return {
+                    group: child.pid ?? 0,
+                    input: child.stdin,
+                    output: child.stdio[3],
+                    onSpawn: (handler: () => void) => {
+                      child.once('spawn', handler);
+                    },
+                    onError: (handler: () => void) => {
+                      child.once('error', handler);
+                    },
+                    onClose: (
+                      handler: (code: number | null, signal: NodeJS.Signals | null) => void,
+                    ) => {
+                      child.once('close', handler);
+                    },
+                  };
+                })();
+              try {
+                own(child.group);
+                return child;
+              } catch {
+                return { ...child, input: null };
+              }
+            },
+          },
+        );
+        const handle = runtime.handle as ReturnType<typeof startLocalSecretInput>;
+        void handle.result.then(finish, () => finish(null));
+      } else {
+        if (!this.localSecretMatches(control)) throw Error('Local connection is unavailable.');
+        const token = this.localSecret?.secret.toString('utf8') as string;
+        const handle = startLocalDiscovery(
+          {
+            kind: 'discovery',
+            binding: { ...operation.binding, version: 1 },
+            endpoint: control.endpoint as string,
+            token,
+            timeoutMs: 20000,
+          },
+          directory,
+          {
+            ...this.options.localDiscovery,
+            schedule: this.options.schedule,
+            lifecycle: {
+              beforePhase: () => {
+                this.localOperationCurrent(operationId);
+                requested = true;
+              },
+              owned: (_phase, group) => {
+                own(group);
+              },
+              quiescent: (_phase, group) => {
+                this.store.transaction(() => {
+                  const current = this.localControl();
+                  if (
+                    current.operation?.binding.operationId !== operationId ||
+                    current.operation.group !== group
+                  )
+                    throw Error('Local discovery closure changed.');
+                  this.saveLocal({
+                    ...current,
+                    operation: { ...current.operation, clientQuiescent: true },
+                  });
+                });
+              },
+            },
+          },
+        );
+        runtime.handle = handle;
+        void handle.result.then(finish, () => finish(null));
+      }
+      if (runtime.stopped || this.closed) runtime.handle?.stop();
+    } catch {
+      finish(null);
     }
   }
 
@@ -2966,6 +3596,10 @@ export class Controller {
   ): CommandResult {
     const task = this.store.get<Task>('task', command.payload.taskId);
     const run = this.store.get<Run>('run', command.payload.runId);
+    if (run && this.store.receipt(`local-prepared:${run.id}`))
+      return command.command === 'StartRun'
+        ? this.startLocal(command, effects)
+        : { outcome: 'blocked', reason: 'native-pilot-retain-only' };
     if (run && this.store.runPurpose(run.id) === 'conversation') {
       if (!task || run.taskId !== task.id || task.runId !== run.id)
         return { outcome: 'blocked', reason: 'run-not-current' };
@@ -3280,6 +3914,9 @@ export class Controller {
     ];
     if (this.options.registerGoogleAcp || this.options.googleAcp)
       profiles.push(this.acpResolution());
+    const localIndex = profiles.findIndex((profile) => profile.facts.family === 'local');
+    if (localIndex >= 0) profiles.splice(localIndex, 1);
+    profiles.push({ facts: this.localConnection().facts });
     if (
       profiles.length > 6 ||
       new Set(profiles.map((profile) => profile.facts.id)).size !== profiles.length
@@ -3333,6 +3970,34 @@ export class Controller {
       const origin = this.store.receipt(this.currentNativePlanKey(run.id));
       if (!origin) return [];
       const prepared = this.store.receipt(`native-prepared:${run.id}`);
+      if (this.store.receipt(`local-prepared:${run.id}`)) {
+        try {
+          const plan = this.localPrepared(run.id);
+          return [
+            NativeRunSchema.parse({
+              runId: run.id,
+              profileId: 'local-file-v1',
+              stage:
+                prepared &&
+                this.store.get<Task>('task', run.taskId)?.runId === run.id &&
+                this.store.get<Task>('task', run.taskId)?.state === 'draft' &&
+                !this.store.intents().some((intent) => intent.run_id === run.id)
+                  ? 'prepared'
+                  : 'retain-only',
+              expiresAt: plan.expiresAt,
+              localModel: plan.localModel,
+              target: {
+                ...plan.target,
+                bytes: plan.manifest.find((file) => file.path === plan.target.path)?.bytes,
+              },
+            }),
+          ];
+        } catch {
+          return [
+            { runId: run.id, profileId: 'unavailable-native-plan', stage: 'retain-only' as const },
+          ];
+        }
+      }
       try {
         const artifact = ArtifactSchema.parse(origin.result.entity);
         if (artifact.bytes > MAX_FRAME_BYTES) throw Error('Native plan exceeds its bound.');
@@ -4369,7 +5034,495 @@ export class Controller {
     });
   }
 
+  private localPrepared(runId: string): LocalPrepared {
+    const receipt = this.store.receipt(`local-prepared:${runId}`);
+    const artifact = ArtifactSchema.parse(receipt?.result.entity);
+    if (artifact.bytes > MAX_FRAME_BYTES) throw Error('Local preparation exceeds its bound.');
+    const plan = LocalPreparedSchema.parse(
+      JSON.parse(this.artifacts.read(artifact.hash).toString('utf8')),
+    );
+    if (plan.run.id !== runId) throw Error('Local preparation lineage changed.');
+    return plan;
+  }
+
+  private prepareLocal(command: Extract<Command, { command: 'PrepareNativeRun' }>): CommandResult {
+    if (command.payload.profileId !== 'local-file-v1')
+      return { outcome: 'unsupported', reason: 'native-profile-unavailable' };
+    try {
+      const blocker = this.store.localStartBlocker();
+      if (blocker) return { outcome: 'blocked', reason: blocker };
+      const task = this.store.get<Task>('task', command.payload.taskId);
+      if (task?.state !== 'draft') return { outcome: 'blocked', reason: 'task-not-preparable' };
+      const gate = this.draftEditGate(task);
+      if (gate) return gate;
+      const connection = this.localConnection();
+      if (
+        !connection.connection ||
+        !connection.facts.available ||
+        !LocalObservedModelBindingSchema.safeParse(connection.facts.modelBinding).success
+      )
+        return { outcome: 'blocked', reason: 'local-model-unavailable' };
+      const policy = PolicySchema.parse(command.payload.policy);
+      if (
+        policy.authority !== 'guided' ||
+        policy.quality !== 'quick' ||
+        policy.reserves.length ||
+        (policy.methods?.length ?? 0) !== 1 ||
+        policy.methods?.[0].id !== 'keep-it-simple' ||
+        policy.methods[0].cycles !== 1 ||
+        policy.limits.attempts < 3 ||
+        policy.limits.concurrency !== 1 ||
+        policy.unknownUsage.rule !== 'fixed-allowance' ||
+        policy.unknownUsage.allowance.launches < 1 ||
+        policy.unknownUsage.allowance.minutes < policy.limits.minutes
+      )
+        return { outcome: 'blocked', reason: 'local-policy-unavailable' };
+      const source = inspectSource(task.projectId, this.projectPath(task.projectId) as string);
+      const files = committedFiles(this.projectPath(task.projectId) as string, source.base);
+      const targetPath = command.payload.targetPath;
+      const original = files.find((file) => file.path === targetPath);
+      if (
+        !original ||
+        original.bytes > 65536 ||
+        original.content.toString('utf8').includes('\0') ||
+        !Buffer.from(original.content.toString('utf8')).equals(original.content)
+      )
+        return { outcome: 'blocked', reason: 'native-target-unavailable' };
+      const runId = this.id('run');
+      const grant = this.grant(
+        { id: runId, taskId: task.id, policy: { policy, hash: hashCanonical(policy) } },
+        'write-scratch',
+        (this.store.get<Project>('project', task.projectId) as Project).name,
+      );
+      if (!grant) return { outcome: 'blocked', reason: 'scratch-grant-unavailable' };
+      const context = { title: task.title, outcome: task.outcome, criteria: task.criteria };
+      const manifest = files.map(({ content: _content, ...file }) => file);
+      const target = { path: original.path, baseHash: original.hash };
+      const localModel = LocalObservedModelBindingSchema.parse(connection.connection.modelBinding);
+      const scopeHash = hashCanonical({
+        profile: connection.facts,
+        endpoint: connection.connection.endpoint,
+        localModel,
+        source,
+        manifest,
+        target,
+        context,
+        policy,
+      });
+      let expiresAt = grant.expiresAt;
+      if (command.payload.consent === 'saved')
+        expiresAt = new Date(
+          Math.min(Date.parse(expiresAt), Date.parse(this.consentRecord(scopeHash).expiresAt)),
+        ).toISOString();
+      const route = RouteSchema.parse({
+        id: this.id('rte'),
+        family: 'local',
+        displayName: connection.facts.displayName,
+        model: localModel.modelKey,
+        effort: { requested: 'unknown', effective: 'unknown', supported: [] },
+        billing: 'local',
+        qualified: false,
+        fake: false,
+      });
+      const run = RunSchema.parse({
+        id: runId,
+        taskId: task.id,
+        source,
+        policy: { policy, hash: hashCanonical(policy) },
+        roles: [{ role: 'coder', routeId: route.id, pinned: true, approvedFallbacks: [] }],
+        decision: { chosen: route.id, rejected: [], rule: 'manual', inputsHash: scopeHash },
+        revision: 0,
+      });
+      const attempt = this.jobAttempt(run, route.id);
+      const plan = LocalPreparedSchema.parse({
+        version: 1,
+        kind: 'local-file',
+        run,
+        attempt,
+        profile: connection.facts,
+        endpoint: connection.connection.endpoint,
+        localModel,
+        target,
+        manifest,
+        context,
+        scopeHash,
+        expiresAt,
+      });
+      this.localStartInput(plan, original.content.toString('utf8'), 'unsubmitted', 300000);
+      const artifact = this.nativeArtifact(plan);
+      this.store.put('route', route.id, 0, route);
+      this.store.put('run', run.id, 0, run);
+      this.store.putRunPurpose(run, 'execution', task.runId);
+      for (const key of [
+        `local-prepared:${run.id}`,
+        `native-run:${run.id}`,
+        `native-prepared:${run.id}`,
+      ])
+        this.store.saveReceipt(key, artifact.hash, 'local-owner', {
+          outcome: 'applied',
+          entity: artifact,
+        });
+      if (
+        command.payload.consent === 'explicit' &&
+        !this.store.receipt(`native-consent:${scopeHash}`)
+      ) {
+        const consent = this.nativeArtifact({ scopeHash, expiresAt });
+        this.store.saveReceipt(`native-consent:${scopeHash}`, scopeHash, 'local-owner', {
+          outcome: 'applied',
+          entity: consent,
+        });
+      }
+      const updated = this.updateTask(task, {
+        runId: run.id,
+        next: 'Review the Local file preparation and start. Qualification remains pending.',
+      });
+      this.event('run.prepared', task.id, updated.revision, run);
+      return { outcome: 'applied', entity: run, revision: updated.revision };
+    } catch {
+      return { outcome: 'blocked', reason: 'local-preparation-unavailable' };
+    }
+  }
+
+  private localStartInput(
+    plan: LocalPrepared,
+    original: string,
+    token: string,
+    timeoutMs: number,
+  ): LocalStart {
+    return localPlan({
+      binding: {
+        ...plan.localModel,
+        attemptId: plan.attempt.id,
+        generation: plan.attempt.generation,
+        profileHash: hashCanonical(plan.profile),
+        sourceHash: plan.scopeHash,
+        path: plan.target.path,
+        baseHash: plan.target.baseHash,
+      },
+      endpoint: plan.endpoint,
+      token,
+      original,
+      task: JSON.stringify(plan.context),
+      timeoutMs,
+    });
+  }
+
+  private localWriterAuthority(plan: LocalPrepared, active = false) {
+    const task = this.store.get<Task>('task', plan.run.taskId);
+    const run = this.store.get<Run>('run', plan.run.id);
+    const connection = this.localConnection();
+    if (
+      this.closed ||
+      !task ||
+      task.runId !== plan.run.id ||
+      !run ||
+      hashCanonical(run.policy) !== hashCanonical(plan.run.policy) ||
+      hashCanonical(run.source) !== hashCanonical(plan.run.source) ||
+      hashCanonical(run.roles) !== hashCanonical(plan.run.roles) ||
+      hashCanonical({ title: task.title, outcome: task.outcome, criteria: task.criteria }) !==
+        hashCanonical(plan.context) ||
+      !connection.connection ||
+      !connection.facts.available ||
+      hashCanonical(connection.facts) !== hashCanonical(plan.profile) ||
+      hashCanonical(connection.connection.modelBinding) !== hashCanonical(plan.localModel) ||
+      connection.connection.endpoint !== plan.endpoint ||
+      hashCanonical(inspectSource(task.projectId, this.projectPath(task.projectId) as string)) !==
+        hashCanonical(plan.run.source)
+    )
+      throw Error('Local writer authority changed.');
+    this.consentRecord(plan.scopeHash);
+    if (Date.parse(plan.expiresAt) <= Date.parse(this.now())) throw Error('Local consent expired.');
+    if (active) {
+      const attempt = this.store.get<Attempt>('attempt', plan.attempt.id);
+      const intent = this.store.intents().find((value) => value.attempt_id === plan.attempt.id);
+      const lease = this.store.db
+        .prepare('SELECT attempt_id,generation FROM writer_leases WHERE task_id=?')
+        .get(task.id);
+      if (
+        task.state !== 'running' ||
+        !attempt ||
+        attempt.runId !== run.id ||
+        attempt.routeId !== plan.attempt.routeId ||
+        attempt.generation !== plan.attempt.generation ||
+        !['intent', 'running'].includes(attempt.state) ||
+        !intent ||
+        intent.run_id !== run.id ||
+        intent.task_id !== task.id ||
+        intent.route_id !== plan.attempt.routeId ||
+        intent.generation !== plan.attempt.generation ||
+        intent.state === 'stopped' ||
+        lease?.attempt_id !== attempt.id ||
+        lease.generation !== attempt.generation ||
+        this.jobDeadline(attempt.id, Math.min(5, plan.run.policy.policy.limits.minutes)) <= 5000
+      )
+        throw Error('Local writer ownership changed.');
+    }
+    return { task, run };
+  }
+
+  private startLocal(
+    command: Extract<Command, { command: 'StartRun' }>,
+    effects: (() => void)[],
+  ): CommandResult {
+    try {
+      const plan = this.localPrepared(command.payload.runId);
+      const { task, run } = this.localWriterAuthority(plan);
+      if (
+        task.id !== command.payload.taskId ||
+        task.state !== 'draft' ||
+        this.store.intents().some((intent) => intent.run_id === run.id)
+      )
+        return { outcome: 'blocked', reason: 'run-not-current' };
+      const blocker = this.store.localStartBlocker();
+      if (blocker) return { outcome: 'blocked', reason: blocker };
+      const remaining = this.remaining(run);
+      const timeoutMs = Math.floor(
+        Math.min(
+          300000,
+          remaining.minutes * 60000,
+          Date.parse(plan.expiresAt) - Date.parse(this.now()),
+        ),
+      );
+      if (!remaining.attempts || !remaining.concurrency || timeoutMs <= 5000)
+        return { outcome: 'blocked', reason: 'budget-exhausted' };
+      const project = this.store.get<Project>('project', task.projectId) as Project;
+      const grant = this.grant(run, 'write-scratch', project.name);
+      if (!grant) return { outcome: 'blocked', reason: 'scratch-grant-unavailable' };
+      const directory = join(this.home, 'scratch', run.id);
+      this.admitJob(run, plan.attempt, directory, Math.ceil(timeoutMs / 60000));
+      this.consumeGrant(run, grant);
+      this.store.saveReceipt(`allocation:${run.id}`, plan.scopeHash, 'local-owner', {
+        outcome: 'applied',
+        entity: run,
+      });
+      const updated = this.updateTask(task, {
+        state: 'running',
+        waitingReason: null,
+        next: 'The owned Local file turn is running.',
+      });
+      this.event('run.admitted', task.id, updated.revision, run);
+      this.pendingLocalLaunches.add(plan.attempt.id);
+      effects.push(() => {
+        this.pendingLocalLaunches.delete(plan.attempt.id);
+        if (this.closed) return;
+        const intent = this.store.intents().find((value) => value.attempt_id === plan.attempt.id);
+        if (!intent) throw Error('Local launch intent is unavailable.');
+        if (intent.state === 'stopped') return;
+        this.options.afterIntent?.(intent);
+        this.launchLocalWriter(plan, timeoutMs);
+      });
+      return { outcome: 'applied', entity: updated, revision: updated.revision };
+    } catch {
+      return { outcome: 'blocked', reason: 'local-start-unavailable' };
+    }
+  }
+
+  private launchLocalWriter(plan: LocalPrepared, maximumMs: number) {
+    const completion = Promise.withResolvers<void>();
+    const binding = {
+      ...plan.localModel,
+      attemptId: plan.attempt.id,
+      generation: plan.attempt.generation,
+      profileHash: hashCanonical(plan.profile),
+      sourceHash: plan.scopeHash,
+      path: plan.target.path,
+      baseHash: plan.target.baseHash,
+    };
+    const runtime: LocalWriterRuntime = { plan, binding, stopped: false, done: completion.promise };
+    this.localWriters.set(plan.attempt.id, runtime);
+    const current = () => {
+      if (runtime.stopped) throw Error('Local writer stopped.');
+      this.localWriterAuthority(plan, true);
+    };
+    const finish = (
+      outcome: Awaited<ReturnType<typeof startLocalReplacement>['result']> | null,
+    ) => {
+      try {
+        const phases = this.store.nativeProcesses(plan.attempt.id);
+        const terminal = outcome ? LocalTerminalSchema.parse(outcome.terminal) : null;
+        const bound = terminal && hashCanonical(terminal.binding) === hashCanonical(binding);
+        const clientQuiescent =
+          outcome?.clientQuiescent === true &&
+          phases.length > 0 &&
+          phases.every((phase) => phase.state === 'quiescent');
+        const submitted = !!this.store.receipt(`native-submission:${plan.attempt.id}`);
+        const unspawned = !runtime.handle && phases.length === 0;
+        const terminalKnown =
+          !!bound &&
+          terminal.kind !== 'unknown' &&
+          (terminal.kind === 'completed' ||
+            terminal.kind === 'stopped' ||
+            terminal.proof !== null ||
+            !submitted);
+        const known =
+          unspawned ||
+          (clientQuiescent &&
+            terminalKnown &&
+            this.store.nativePhasesComplete(plan.attempt.id, 'local'));
+        this.store.transaction(() => {
+          const proof = this.nativeArtifact({
+            attemptId: plan.attempt.id,
+            bindingHash: hashCanonical(binding),
+            terminal,
+            clientQuiescent: clientQuiescent || unspawned,
+            known,
+            unspawned,
+            at: this.now(),
+          });
+          this.store.saveReceipt(`local-terminal:${plan.attempt.id}`, proof.hash, 'local-owner', {
+            outcome: known ? 'applied' : 'outcome-unknown',
+            entity: proof,
+          });
+        });
+        let applied = false;
+        if (
+          known &&
+          bound &&
+          terminal.kind === 'completed' &&
+          submitted &&
+          !runtime.stopped &&
+          !this.closed
+        ) {
+          try {
+            current();
+            if (
+              terminal.proposal.attemptId !== plan.attempt.id ||
+              terminal.proposal.path !== plan.target.path ||
+              terminal.proposal.baseHash !== plan.target.baseHash
+            )
+              throw Error('Local replacement changed.');
+            this.store.transaction(() => {
+              current();
+              const proof = this.nativeArtifact({
+                attemptId: plan.attempt.id,
+                terminalHash: this.nativeRecord(`local-terminal:${plan.attempt.id}`).artifact.hash,
+                manifest: plan.manifest,
+              });
+              this.store.saveReceipt(
+                `native-application:${plan.attempt.id}`,
+                proof.hash,
+                'local-owner',
+                { outcome: 'outcome-unknown', entity: proof },
+              );
+            });
+            current();
+            applyReplacement(
+              join(this.home, 'scratch', plan.run.id),
+              plan.manifest,
+              terminal.proposal,
+            );
+            this.store.transaction(() => {
+              const prior = this.store.receipt(`native-application:${plan.attempt.id}`);
+              this.store.db
+                .prepare('UPDATE receipts SET result=? WHERE command_key=?')
+                .run(
+                  canonicalJson({ outcome: 'applied', entity: prior?.result.entity }),
+                  `native-application:${plan.attempt.id}`,
+                );
+            });
+            applied = true;
+          } catch {}
+        }
+        if (
+          this.settleJob(plan.attempt, known, true, () => {
+            const task = this.store.get<Task>('task', plan.run.taskId) as Task;
+            if (task.runId === plan.run.id)
+              this.updateTask(task, {
+                state: 'stopped',
+                waitingReason: null,
+                next: applied
+                  ? 'Local replacement retained. Inspect Changes or export; checks and qualification remain pending.'
+                  : 'Local work stopped without an applied replacement.',
+              });
+          })
+        ) {
+          if (applied) this.sealCandidate(plan.attempt);
+          this.localWriters.delete(plan.attempt.id);
+        }
+      } catch {
+        try {
+          this.settleJob(plan.attempt, false, true);
+        } catch {}
+      } finally {
+        completion.resolve();
+      }
+    };
+    try {
+      current();
+      const sourceFiles = committedFiles(
+        this.projectPath(plan.run.source.projectId) as string,
+        plan.run.source.base,
+      );
+      if (
+        hashCanonical(sourceFiles.map(({ content: _content, ...file }) => file)) !==
+        hashCanonical(plan.manifest)
+      )
+        throw Error('Local source manifest changed.');
+      const original = sourceFiles.find((file) => file.path === plan.target.path);
+      if (!original || original.hash !== plan.target.baseHash) throw Error('Local target changed.');
+      const directory = join(this.home, 'scratch', plan.run.id);
+      materialize(directory, sourceFiles);
+      const token = Buffer.from(this.localSecret?.secret ?? Buffer.alloc(0));
+      try {
+        const input = this.localStartInput(
+          plan,
+          original.content.toString('utf8'),
+          token.toString('utf8'),
+          Math.floor(
+            Math.min(
+              maximumMs,
+              this.jobDeadline(plan.attempt.id, Math.ceil(maximumMs / 60000)),
+              Date.parse(plan.expiresAt) - Date.parse(this.now()),
+            ),
+          ),
+        );
+        const journal = this.nativeLifecycle(plan.attempt, current);
+        const phase = { sequence: 0, kind: 'native-task' as const };
+        runtime.handle = startLocalReplacement(input, directory, {
+          ...this.options.localWriter,
+          schedule: this.options.schedule,
+          onSubmitted: () => {
+            current();
+            this.store.transaction(() => {
+              current();
+              const proof = this.nativeArtifact({
+                attemptId: plan.attempt.id,
+                bindingHash: hashCanonical(binding),
+                scopeHash: plan.scopeHash,
+              });
+              this.store.saveReceipt(
+                `native-submission:${plan.attempt.id}`,
+                proof.hash,
+                'local-owner',
+                { outcome: 'outcome-unknown', entity: proof },
+              );
+            });
+            return undefined;
+          },
+          lifecycle: {
+            beforePhase: () => {
+              journal.beforePhase(phase);
+            },
+            owned: (_kind, group) => {
+              journal.owned(phase, group);
+            },
+            quiescent: (_kind, group) => {
+              journal.quiescent(phase, group);
+            },
+          },
+        });
+      } finally {
+        token.fill(0);
+      }
+      if (runtime.stopped || this.closed) runtime.handle?.stop();
+      void runtime.handle?.result.then(finish, () => finish(null));
+    } catch {
+      finish(null);
+    }
+  }
+
   private prepareNative(command: Extract<Command, { command: 'PrepareNativeRun' }>): CommandResult {
+    if (command.payload.profileId === 'local-file-v1') return this.prepareLocal(command);
     if (command.payload.profileId === 'google-acp-v1') return this.prepareAcp(command);
     let plan: Omit<NativeBinding, 'planArtifact'>;
     let expiresAt: string;
@@ -8913,6 +10066,70 @@ export class Controller {
       return { outcome: 'applied', entity: updated, revision: updated.revision };
     }
     if (
+      this.pendingLocalLaunches.has(active.attempt_id) &&
+      active.state === 'intent' &&
+      !this.store.nativeProcesses(active.attempt_id).length
+    ) {
+      this.pendingLocalLaunches.delete(active.attempt_id);
+      const plan = this.localPrepared(active.run_id);
+      const binding = {
+        ...plan.localModel,
+        attemptId: plan.attempt.id,
+        generation: plan.attempt.generation,
+        profileHash: hashCanonical(plan.profile),
+        sourceHash: plan.scopeHash,
+        path: plan.target.path,
+        baseHash: plan.target.baseHash,
+      };
+      const stopped = {
+        ...plan.attempt,
+        state: 'stopped' as const,
+        revision: plan.attempt.revision + 1,
+      };
+      this.store.put('attempt', stopped.id, stopped.revision, stopped);
+      this.store.db
+        .prepare("UPDATE launch_intents SET state='stopped',finished_at=? WHERE attempt_id=?")
+        .run(this.now(), stopped.id);
+      this.store.db.prepare('DELETE FROM writer_leases WHERE attempt_id=?').run(stopped.id);
+      this.store.db.prepare('DELETE FROM reservations WHERE attempt_id=?').run(stopped.id);
+      const proof = this.nativeArtifact({
+        attemptId: stopped.id,
+        bindingHash: hashCanonical(binding),
+        terminal: null,
+        clientQuiescent: true,
+        known: true,
+        unspawned: true,
+        at: this.now(),
+      });
+      this.store.saveReceipt(`local-terminal:${stopped.id}`, proof.hash, 'local-owner', {
+        outcome: 'applied',
+        entity: proof,
+      });
+      const updated = this.updateTask(task, {
+        state: 'stopped',
+        waitingReason: null,
+        next: 'Local work stopped before its process launched.',
+      });
+      this.event('attempt.stopped', task.id, updated.revision, stopped);
+      return { outcome: 'applied', entity: updated, revision: updated.revision };
+    }
+    const localRuntime = this.localWriters.get(active.attempt_id);
+    if (localRuntime) {
+      if (
+        ['outcome-unknown', 'interrupted'].includes(active.state) ||
+        this.store.get<Attempt>('attempt', active.attempt_id)?.state === 'unknown'
+      )
+        return { outcome: 'blocked', reason: 'local-generation-unknown' };
+      localRuntime.stopped = true;
+      const updated = this.updateTask(task, {
+        state: 'stopping',
+        waitingReason: null,
+        next: 'Waiting for the Local runtime terminal and client closure.',
+      });
+      effects.push(() => localRuntime.handle?.stop());
+      return { outcome: 'applied', entity: updated, revision: updated.revision };
+    }
+    if (
       this.pendingConversationLaunches.has(active.attempt_id) &&
       active.state === 'intent' &&
       this.store.runPurpose(active.run_id) === 'conversation' &&
@@ -9046,8 +10263,125 @@ export class Controller {
     return { outcome: 'applied', entity: updated, revision: updated.revision };
   }
 
+  private recoverLocalWriter(
+    intent: LaunchIntent,
+    attempt: Attempt,
+    run: Run,
+    task: Task,
+  ): boolean {
+    const route = this.store.get<Route>('route', intent.route_id);
+    if (route?.family !== 'local' || route.fake) return false;
+    try {
+      // The fixed CPU evaluator catalog has its own checked process proof.
+      const cpuRoute = RouteSchema.parse(this.nativeRecord('node-check-route').value);
+      if (cpuRoute.id === route.id && hashCanonical(cpuRoute) === hashCanonical(route))
+        return false;
+    } catch {}
+    let known = false;
+    let finishedAt = this.now();
+    try {
+      const plan = this.localPrepared(run.id);
+      const expected = LocalBindingSchema.parse({
+        ...plan.localModel,
+        attemptId: attempt.id,
+        generation: attempt.generation,
+        profileHash: hashCanonical(plan.profile),
+        sourceHash: plan.scopeHash,
+        path: plan.target.path,
+        baseHash: plan.target.baseHash,
+      });
+      const receipt = this.store.receipt(`local-terminal:${attempt.id}`);
+      if (
+        receipt?.result.outcome !== 'applied' ||
+        plan.attempt.id !== attempt.id ||
+        plan.attempt.generation !== intent.generation ||
+        plan.attempt.routeId !== intent.route_id ||
+        plan.run.taskId !== task.id ||
+        plan.run.id !== run.id
+      )
+        throw Error('Local terminal lineage is unavailable.');
+      const proof = z
+        .strictObject({
+          attemptId: AttemptSchema.shape.id,
+          bindingHash: HashSchema,
+          terminal: LocalTerminalSchema.nullable(),
+          clientQuiescent: z.boolean(),
+          known: z.boolean(),
+          unspawned: z.boolean(),
+          at: TimestampSchema,
+        })
+        .parse(this.nativeRecord(`local-terminal:${attempt.id}`).value);
+      const phases = this.store.nativeProcesses(attempt.id);
+      const submitted = !!this.store.receipt(`native-submission:${attempt.id}`);
+      if (
+        proof.attemptId !== attempt.id ||
+        proof.bindingHash !== hashCanonical(expected) ||
+        !proof.known ||
+        !proof.clientQuiescent
+      )
+        throw Error('Local terminal proof changed.');
+      if (proof.unspawned) {
+        if (
+          submitted ||
+          phases.length ||
+          intent.pid !== null ||
+          intent.process_group !== null ||
+          proof.terminal !== null
+        )
+          throw Error('An unspawned Local turn has process or submission history.');
+      } else {
+        const terminal = proof.terminal;
+        if (
+          !terminal ||
+          terminal.kind === 'unknown' ||
+          hashCanonical(terminal.binding) !== hashCanonical(expected) ||
+          (terminal.kind === 'failed' && terminal.proof === null && submitted) ||
+          !this.store.nativePhasesComplete(attempt.id, 'local') ||
+          phases.some((phase) => phase.state !== 'quiescent')
+        )
+          throw Error('A Local generation has no matching runtime terminal.');
+      }
+      known = true;
+      finishedAt = proof.at;
+    } catch {}
+    const updated = {
+      ...attempt,
+      state: known ? ('stopped' as const) : ('unknown' as const),
+      revision: attempt.revision + 1,
+    };
+    this.store.put('attempt', attempt.id, updated.revision, updated);
+    this.store.db
+      .prepare('UPDATE launch_intents SET state=?,finished_at=? WHERE attempt_id=?')
+      .run(known ? 'stopped' : 'outcome-unknown', known ? finishedAt : null, attempt.id);
+    if (known) {
+      this.store.db.prepare('DELETE FROM writer_leases WHERE attempt_id=?').run(attempt.id);
+      this.store.db.prepare('DELETE FROM reservations WHERE attempt_id=?').run(attempt.id);
+    }
+    if (!known || task.runId === run.id)
+      this.updateTask(task, {
+        state: known ? 'interrupted' : 'unknown',
+        waitingReason: null,
+        next: known
+          ? 'The Local terminal is retained. Inspect existing work; nothing will replay.'
+          : 'Local generation ownership is unknown. Its lease and reservation remain held.',
+      });
+    this.event('run.interrupted', task.id, task.revision + 1, {
+      runId: run.id,
+      reason: known
+        ? 'Local runtime terminal and client closure were recorded.'
+        : 'Local generation has no recorded matching terminal.',
+    });
+    return true;
+  }
+
   private recover() {
     this.store.transaction(() => {
+      const local = this.localControl();
+      if (local.operation)
+        this.saveLocal({
+          ...local,
+          operation: { ...local.operation, state: 'unknown', revoked: true },
+        });
       for (const operation of this.store.googleMetadataOperations()) {
         const quiescent = operation.state === 'quiescent';
         if (!quiescent) this.store.unknownGoogleMetadata(operation.command_id);
@@ -9102,6 +10436,7 @@ export class Controller {
           attempt.generation !== intent.generation
         )
           throw new Error('Persisted writer lineage is invalid.');
+        if (this.recoverLocalWriter(intent, attempt, run, task)) continue;
         const phases = this.store.nativeProcesses(intent.attempt_id);
         const native = phases.length > 0;
         const known = native
@@ -9720,6 +11055,11 @@ export class Controller {
   }
 
   private admitJob(run: Run, attempt: Attempt, directory: string, maximumMinutes?: number) {
+    const localRoute = this.store.get<Route>('route', attempt.routeId);
+    if (localRoute?.family === 'local' && !localRoute.fake) {
+      const blocker = this.store.localStartBlocker();
+      if (blocker) throw Error(blocker);
+    }
     const googleBlocker = this.store.googleStartBlocker(attempt.routeId);
     if (googleBlocker) throw new Error(googleBlocker);
     const remaining = this.remaining(run);

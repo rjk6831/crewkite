@@ -101,7 +101,9 @@ export function nativePhaseSequence(
           ? [['auth-status', 'native-task']]
           : family === 'google'
             ? [['google-config', 'native-task']]
-            : [];
+            : family === 'local'
+              ? [['native-task']]
+              : [];
   return sequences.some(
     (sequence) =>
       phases.length <= sequence.length &&
@@ -206,6 +208,48 @@ export class Store {
       ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,body=excluded.body WHERE entities.kind=excluded.kind`)
       .run(id, kind, revision, canonicalJson(body));
     if (result.changes !== 1) throw new Error('Entity identity belongs to a different kind.');
+  }
+
+  localControl(): unknown {
+    const row = this.db.prepare('SELECT body FROM local_control WHERE singleton=1').get();
+    return row ? JSON.parse(row.body as string) : undefined;
+  }
+
+  putLocalControl(body: unknown) {
+    this.metadataWrite();
+    this.db
+      .prepare(
+        'INSERT INTO local_control(singleton,body) VALUES (1,?) ON CONFLICT(singleton) DO UPDATE SET body=excluded.body',
+      )
+      .run(canonicalJson(body));
+  }
+
+  localGenerationBlocker(): 'generation-active' | 'generation-unknown' | undefined {
+    const intents = this.intents().filter((intent) => {
+      const route = this.get<Route>('route', intent.route_id);
+      return intent.state !== 'stopped' && route?.family === 'local' && !route.fake;
+    });
+    if (
+      intents.some(
+        (intent) =>
+          ['outcome-unknown', 'interrupted'].includes(intent.state) ||
+          this.get<Attempt>('attempt', intent.attempt_id)?.state === 'unknown',
+      )
+    )
+      return 'generation-unknown';
+    if (intents.length) return 'generation-active';
+  }
+
+  localStartBlocker(): string | undefined {
+    this.metadataWrite();
+    const row = this.db
+      .prepare(
+        "SELECT json_extract(body,'$.operation.state') AS state FROM local_control WHERE singleton=1",
+      )
+      .get();
+    if (row?.state)
+      return row.state === 'unknown' ? 'local-operation-unknown' : 'local-operation-active';
+    return this.localGenerationBlocker();
   }
 
   conversationTask(taskId: string): unknown {
