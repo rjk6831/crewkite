@@ -22,6 +22,7 @@ export const CandidateIdSchema = id('cnd');
 export const HandoffIdSchema = id('hnd');
 export const EventIdSchema = id('evt');
 export const CommandIdSchema = id('cmd');
+export const MessageIdSchema = id('msg');
 const RelativeSourcePathSchema = text.refine(
   (path) =>
     !path.startsWith('/') &&
@@ -996,7 +997,246 @@ export const NativeHandoffPreparationPayloadSchema = z.union([
     permissionMode: GoogleNativePermissionModeSchema,
   }),
 ]);
+const conversationBytes = (value: unknown) =>
+  new TextEncoder().encode(JSON.stringify(value)).length;
+export const ConversationTextSchema = z
+  .string()
+  .min(1)
+  .max(4096)
+  .refine(
+    (value) =>
+      value.isWellFormed() &&
+      !value.includes('\0') &&
+      new TextEncoder().encode(value).length <= 4096,
+    'Conversation text needs valid Unicode without null bytes.',
+  );
+const conversationSlice = z.strictObject({
+  id: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9-]{0,79}$/),
+  title: label,
+  role: z.enum(['coder', 'reviewer', 'advisor']),
+  scope: z.array(NativeTargetPathSchema).min(1).max(100),
+  dependsOn: z.array(z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9-]{0,79}$/)).max(20),
+});
+export const ConversationPlanProposalSchema = z
+  .strictObject({
+    summary: ConversationTextSchema,
+    criteria: z.array(ConversationTextSchema).min(1).max(100),
+    slices: z.array(conversationSlice).min(1).max(20),
+    checks: z.array(label).max(20),
+  })
+  .superRefine((plan, context) => {
+    const slices = new Map(plan.slices.map((slice) => [slice.id, slice]));
+    const visiting = new Set<string>();
+    const visited = new Set<string>();
+    const visit = (id: string): boolean => {
+      if (visiting.has(id)) return false;
+      if (visited.has(id)) return true;
+      const slice = slices.get(id);
+      if (!slice) return false;
+      visiting.add(id);
+      if (!slice.dependsOn.every(visit)) return false;
+      visiting.delete(id);
+      visited.add(id);
+      return true;
+    };
+    if (slices.size !== plan.slices.length || !plan.slices.every((slice) => visit(slice.id)))
+      context.addIssue({
+        code: 'custom',
+        message: 'Plan slices need distinct IDs and acyclic known dependencies.',
+      });
+    for (const slice of plan.slices)
+      if (
+        new Set(slice.scope).size !== slice.scope.length ||
+        new Set(slice.dependsOn).size !== slice.dependsOn.length
+      )
+        context.addIssue({
+          code: 'custom',
+          message: 'Slice paths and dependencies must be distinct.',
+        });
+    if (new Set(plan.checks).size !== plan.checks.length || conversationBytes(plan) > 65536)
+      context.addIssue({
+        code: 'custom',
+        message: 'A proposal needs distinct checks and at most 65536 encoded bytes.',
+      });
+  });
+export const ConversationTurnBindingSchema = z.strictObject({
+  taskId: TaskIdSchema,
+  runId: RunIdSchema,
+  attemptId: AttemptIdSchema,
+  generation: RevisionSchema,
+  routeId: RouteIdSchema,
+  role: z.enum(['lead', 'orchestrator']),
+  taskRevision: RevisionSchema,
+  conversationRevision: RevisionSchema,
+  scopeHash: HashSchema,
+  limitMinutes: z.number().int().min(1).max(5),
+});
+export const ConversationTurnResultSchema = z
+  .strictObject({
+    version: z.literal(1),
+    bindingHash: HashSchema,
+    message: ConversationTextSchema,
+    questions: z.array(ConversationTextSchema).max(8),
+    proposal: ConversationPlanProposalSchema.nullable(),
+  })
+  .refine(
+    (value) => conversationBytes(value) <= 65536,
+    'Conversation output exceeds 65536 encoded bytes.',
+  );
+const conversationEntryFields = {
+  id: MessageIdSchema,
+  taskId: TaskIdSchema,
+  revision: RevisionSchema,
+  cursor: CursorSchema,
+  at: TimestampSchema,
+  text: ConversationTextSchema,
+};
+const conversationAgent = z.strictObject({
+  kind: z.literal('agent'),
+  role: z.enum(['lead', 'orchestrator']),
+  attemptId: AttemptIdSchema,
+  routeId: RouteIdSchema,
+});
+const conversationUser = z.strictObject({ kind: z.literal('user') });
+export const ConversationEntrySchema = z
+  .discriminatedUnion('kind', [
+    z.strictObject({
+      ...conversationEntryFields,
+      kind: z.literal('user-message'),
+      author: conversationUser,
+    }),
+    z.strictObject({
+      ...conversationEntryFields,
+      kind: z.literal('guidance'),
+      author: conversationUser,
+    }),
+    z.strictObject({
+      ...conversationEntryFields,
+      kind: z.literal('answer'),
+      author: conversationUser,
+      replyTo: MessageIdSchema,
+    }),
+    z.strictObject({
+      ...conversationEntryFields,
+      kind: z.literal('agent-message'),
+      author: conversationAgent,
+      binding: ConversationTurnBindingSchema,
+    }),
+    z.strictObject({
+      ...conversationEntryFields,
+      kind: z.literal('question'),
+      author: conversationAgent,
+      binding: ConversationTurnBindingSchema,
+    }),
+    z.strictObject({
+      ...conversationEntryFields,
+      kind: z.literal('plan-proposal'),
+      author: conversationAgent,
+      binding: ConversationTurnBindingSchema,
+      proposal: ConversationPlanProposalSchema,
+    }),
+    z.strictObject({
+      ...conversationEntryFields,
+      kind: z.literal('input-delivery'),
+      author: z.strictObject({ kind: z.literal('controller') }),
+      binding: ConversationTurnBindingSchema,
+      replyTo: MessageIdSchema,
+    }),
+  ])
+  .superRefine((entry, context) => {
+    if (
+      'binding' in entry &&
+      (entry.binding.taskId !== entry.taskId ||
+        (entry.author.kind === 'agent' &&
+          (entry.author.attemptId !== entry.binding.attemptId ||
+            entry.author.routeId !== entry.binding.routeId ||
+            entry.author.role !== entry.binding.role)))
+    )
+      context.addIssue({
+        code: 'custom',
+        message: 'Conversation output must match its admitted turn.',
+      });
+    if (conversationBytes(entry) > 73728)
+      context.addIssue({
+        code: 'custom',
+        message: 'A conversation entry exceeds its encoded byte limit.',
+      });
+  });
+export const ConversationPageSchema = z
+  .strictObject({
+    kind: z.literal('conversation'),
+    taskId: TaskIdSchema,
+    entries: z.array(ConversationEntrySchema).max(100),
+    nextBeforeCursor: CursorSchema.nullable(),
+  })
+  .superRefine((page, context) => {
+    if (
+      page.entries.some(
+        (entry, index) =>
+          entry.taskId !== page.taskId ||
+          (index > 0 && BigInt(entry.cursor) <= BigInt(page.entries[index - 1].cursor)),
+      ) ||
+      new Set(page.entries.map((entry) => entry.id)).size !== page.entries.length ||
+      (page.nextBeforeCursor !== null &&
+        (page.entries.length === 0 || page.nextBeforeCursor !== page.entries[0].cursor))
+    )
+      context.addIssue({
+        code: 'custom',
+        message: 'Conversation pages need ordered distinct entries for one task.',
+      });
+    if (conversationBytes(page) > 524288)
+      context.addIssue({
+        code: 'custom',
+        message: 'A conversation page exceeds 524288 encoded bytes.',
+      });
+  });
+export type ConversationEntry = z.infer<typeof ConversationEntrySchema>;
+export type ConversationPage = z.infer<typeof ConversationPageSchema>;
+export type ConversationPlanProposal = z.infer<typeof ConversationPlanProposalSchema>;
+export type ConversationTurnBinding = z.infer<typeof ConversationTurnBindingSchema>;
+export type ConversationTurnResult = z.infer<typeof ConversationTurnResultSchema>;
+export const ConversationPlanningSelectionSchema = z.strictObject({
+  role: z.enum(['lead', 'orchestrator']),
+  profileId: z.literal('openai-file-v1'),
+  creditPolicy: z.enum(['ordinary', 'existing-credits']),
+  limits: LimitsSchema,
+  consent: z.literal('explicit'),
+});
+export type ConversationPlanningSelection = z.infer<typeof ConversationPlanningSelectionSchema>;
 export const CommandSchema = z.discriminatedUnion('command', [
+  mutate(
+    'CreateTaskDiscussion',
+    z.strictObject({
+      projectId: ProjectIdSchema,
+      text: ConversationTextSchema,
+      planning: ConversationPlanningSelectionSchema,
+    }),
+  ),
+  mutate(
+    'ConfigureTaskConversation',
+    z.strictObject({ taskId: TaskIdSchema, planning: ConversationPlanningSelectionSchema }),
+  ),
+  mutate(
+    'AdoptTaskPlan',
+    z.strictObject({ taskId: TaskIdSchema, proposalId: MessageIdSchema, proposalHash: HashSchema }),
+  ),
+  read(
+    'GetTaskConversation',
+    z.strictObject({ taskId: TaskIdSchema, beforeCursor: CursorSchema.optional() }),
+  ),
+  mutate('SendTaskMessage', z.strictObject({ taskId: TaskIdSchema, text: ConversationTextSchema })),
+  mutate(
+    'QueueTaskGuidance',
+    z.strictObject({ taskId: TaskIdSchema, text: ConversationTextSchema }),
+  ),
+  mutate(
+    'AnswerTaskQuestion',
+    z.strictObject({
+      taskId: TaskIdSchema,
+      questionId: MessageIdSchema,
+      text: ConversationTextSchema,
+    }),
+  ),
   mutate('RegisterProject', z.strictObject({ path: text })),
   mutate(
     'ObserveUsage',
@@ -1425,6 +1665,7 @@ const sourceInspection = z
     'Source details must match the full counts without repeated paths.',
   );
 export const ReadDataSchema = z.discriminatedUnion('kind', [
+  ConversationPageSchema,
   z.strictObject({ kind: z.literal('google-acp-setup'), setup: GoogleAcpSetupSchema }),
   sourceInspection,
   z.strictObject({ kind: z.literal('snapshot'), snapshot: SnapshotSchema }),
@@ -1522,6 +1763,7 @@ export const AttemptOutputSchema = z.union([
   z.strictObject({ ...outputFields, channel: z.literal('acp'), acp: AcpActivitySchema }),
 ]);
 export const EventSchema = z.discriminatedUnion('type', [
+  event('conversation.entry', ConversationEntrySchema),
   event('task.created', TaskSchema),
   event('task.updated', TaskSchema),
   event('run.prepared', RunSchema),

@@ -10,6 +10,12 @@ import {
   CheckResultSchema,
   CommandResultSchema,
   CommandSchema,
+  ConversationEntrySchema,
+  ConversationPageSchema,
+  ConversationPlanningSelectionSchema,
+  ConversationPlanProposalSchema,
+  ConversationTurnBindingSchema,
+  ConversationTurnResultSchema,
   CursorSchema,
   canonicalJson,
   DesktopNoticeSchema,
@@ -52,6 +58,189 @@ const command = {
 };
 
 test('process boundaries reject unknown fields and invalid command identity', () => {
+  const conversationBinding = {
+    taskId: `tsk_${suffix}`,
+    runId: `run_${suffix}`,
+    attemptId: `att_${suffix}`,
+    routeId: `rte_${suffix}`,
+    generation: 0,
+    role: 'lead',
+    taskRevision: 1,
+    conversationRevision: 1,
+    scopeHash: 'a'.repeat(64),
+    limitMinutes: 1,
+  };
+  assert.deepEqual(ConversationTurnBindingSchema.parse(conversationBinding), conversationBinding);
+  const proposal = {
+    summary: 'Change the bounded module.',
+    criteria: ['Preserve the existing export.'],
+    slices: [
+      {
+        id: 'module',
+        title: 'Change the module',
+        role: 'coder',
+        scope: ['src/main.ts'],
+        dependsOn: [],
+      },
+    ],
+    checks: ['node-tests-v1'],
+  };
+  assert.deepEqual(ConversationPlanProposalSchema.parse(proposal), proposal);
+  for (const slices of [
+    [proposal.slices[0], proposal.slices[0]],
+    [{ ...proposal.slices[0], dependsOn: ['missing'] }],
+    [{ ...proposal.slices[0], dependsOn: ['module'] }],
+    [
+      { ...proposal.slices[0], dependsOn: ['review'] },
+      { ...proposal.slices[0], id: 'review', dependsOn: ['module'] },
+    ],
+    [{ ...proposal.slices[0], scope: ['../outside.ts'] }],
+    [{ ...proposal.slices[0], scope: ['src/main.ts', 'src/main.ts'] }],
+  ])
+    assert.equal(ConversationPlanProposalSchema.safeParse({ ...proposal, slices }).success, false);
+  const conversationOutput = {
+    version: 1,
+    bindingHash: hashCanonical(conversationBinding),
+    message: 'I need one scope decision.',
+    questions: ['Which export must remain?'],
+    proposal,
+  };
+  assert.deepEqual(ConversationTurnResultSchema.parse(conversationOutput), conversationOutput);
+  assert(ConversationTurnResultSchema.safeParse({ ...conversationOutput, proposal: null }).success);
+  for (const change of [
+    { proposal: undefined },
+    { commands: ['StartRun'] },
+    { grants: [] },
+    { message: '\ud800' },
+    { message: 'a\0b' },
+    { message: '界'.repeat(1366) },
+    { questions: Array(9).fill('Question') },
+    { proposal: { ...proposal, effects: [] } },
+  ])
+    assert.equal(
+      ConversationTurnResultSchema.safeParse({ ...conversationOutput, ...change }).success,
+      false,
+    );
+  const conversationEntry = {
+    id: `msg_${suffix}`,
+    taskId: conversationBinding.taskId,
+    revision: 1,
+    cursor: '1',
+    at: '2026-10-17T00:00:00.000Z',
+    kind: 'question',
+    text: conversationOutput.questions[0],
+    author: {
+      kind: 'agent',
+      role: 'lead',
+      attemptId: conversationBinding.attemptId,
+      routeId: conversationBinding.routeId,
+    },
+    binding: conversationBinding,
+  };
+  assert.deepEqual(ConversationEntrySchema.parse(conversationEntry), conversationEntry);
+  for (const change of [
+    { id: `art_${suffix}` },
+    { taskId: 'tsk_01ARZ3NDEKTSV4RRFFQ69G5FAW' },
+    { author: { ...conversationEntry.author, role: 'orchestrator' } },
+    { effects: [] },
+  ])
+    assert.equal(
+      ConversationEntrySchema.safeParse({ ...conversationEntry, ...change }).success,
+      false,
+    );
+  const conversationPage = {
+    kind: 'conversation',
+    taskId: conversationBinding.taskId,
+    entries: [conversationEntry],
+    nextBeforeCursor: null,
+  };
+  assert.deepEqual(ConversationPageSchema.parse(conversationPage), conversationPage);
+  for (const change of [
+    { entries: [conversationEntry, conversationEntry] },
+    { taskId: 'tsk_01ARZ3NDEKTSV4RRFFQ69G5FAW' },
+    { nextBeforeCursor: '2' },
+  ])
+    assert.equal(
+      ConversationPageSchema.safeParse({ ...conversationPage, ...change }).success,
+      false,
+    );
+  assert(ReadDataSchema.safeParse(conversationPage).success);
+  for (const [name, payload] of [
+    ['SendTaskMessage', { taskId: conversationBinding.taskId, text: 'Keep the export.' }],
+    ['QueueTaskGuidance', { taskId: conversationBinding.taskId, text: 'Keep the export.' }],
+    [
+      'AnswerTaskQuestion',
+      {
+        taskId: conversationBinding.taskId,
+        questionId: conversationEntry.id,
+        text: 'Keep the export.',
+      },
+    ],
+  ] as const) {
+    const request = { ...command, command: name, payload };
+    assert.deepEqual(CommandSchema.parse(request), request);
+    assert.equal(
+      CommandSchema.safeParse({ ...request, payload: { ...payload, policy: {} } }).success,
+      false,
+    );
+  }
+  const planning = {
+    role: 'lead',
+    profileId: 'openai-file-v1',
+    creditPolicy: 'ordinary',
+    limits: { attempts: 8, minutes: 30, concurrency: 4 },
+    consent: 'explicit',
+  };
+  assert.deepEqual(ConversationPlanningSelectionSchema.parse(planning), planning);
+  assert(
+    ConversationPlanningSelectionSchema.safeParse({ ...planning, role: 'orchestrator' }).success,
+  );
+  for (const change of [
+    { role: 'coder' },
+    { profileId: 'custom-provider' },
+    { consent: 'implicit' },
+    { limits: { ...planning.limits, concurrency: 17 } },
+    { effects: [] },
+    { model: 'caller-model' },
+    { executable: '/caller/process' },
+    { endpoint: 'https://invalid.example' },
+    { limits: { ...planning.limits, attempts: 0 } },
+  ])
+    assert.equal(
+      ConversationPlanningSelectionSchema.safeParse({ ...planning, ...change }).success,
+      false,
+    );
+  for (const [name, payload] of [
+    ['CreateTaskDiscussion', { projectId: `prj_${suffix}`, text: 'Change the module.', planning }],
+    ['ConfigureTaskConversation', { taskId: conversationBinding.taskId, planning }],
+    [
+      'AdoptTaskPlan',
+      {
+        taskId: conversationBinding.taskId,
+        proposalId: conversationEntry.id,
+        proposalHash: hashCanonical(proposal),
+      },
+    ],
+  ] as const) {
+    const request = { ...command, command: name, payload };
+    assert.deepEqual(CommandSchema.parse(request), request);
+    assert.equal(
+      CommandSchema.safeParse({ ...request, expectedRevision: undefined }).success,
+      false,
+    );
+    assert.equal(
+      CommandSchema.safeParse({ ...request, payload: { ...payload, effects: [] } }).success,
+      false,
+    );
+  }
+  const conversationRead = {
+    protocol: 1,
+    key: command.key,
+    actor: command.actor,
+    command: 'GetTaskConversation',
+    payload: { taskId: conversationBinding.taskId, beforeCursor: '1' },
+  };
+  assert.deepEqual(CommandSchema.parse(conversationRead), conversationRead);
   const attestation = {
     source: 'user-attested',
     subscriptionLoginConfirmed: true,
