@@ -156,33 +156,45 @@ export function projectUsagePresentation(
     const family = scope.routes[0].family;
     const id = `${family}:${scope.fixture ? 'fixture' : 'live'}:${routeIds.join(',')}`;
     const occurrences = new Map<string, number>();
-    const readings = [...scope.windows]
-      .sort(
-        (a, b) =>
-          compare(a.observation.windowId, b.observation.windowId) ||
-          compare(windowFacts(a), windowFacts(b)),
-      )
-      .map((window) => {
-        const observation = window.observation;
-        const occurrence = occurrences.get(observation.windowId) ?? 0;
-        occurrences.set(observation.windowId, occurrence + 1);
-        return {
-          id: `${id}:${observation.windowId}:${occurrence}`,
-          windowId: observation.windowId,
-          label: observation.windowId,
-          remaining: observation.remaining,
-          resetsAt: observation.resetsAt,
-          observedAt: observation.observedAt,
-          source: observation.source,
-          confidence: observation.confidence,
-          state: displayState(window, nowMs),
-          ...readingReserve(routeIds, observation, reserves),
-        };
+    const orderedWindows = [...scope.windows].sort(
+      (a, b) =>
+        compare(a.observation.windowId, b.observation.windowId) ||
+        compare(windowFacts(a), windowFacts(b)),
+    );
+    const readings = orderedWindows.map((window) => {
+      const observation = window.observation;
+      const occurrence = occurrences.get(observation.windowId) ?? 0;
+      occurrences.set(observation.windowId, occurrence + 1);
+      return {
+        id: `${id}:${observation.windowId}:${occurrence}`,
+        windowId: observation.windowId,
+        label: observation.windowId,
+        remaining: observation.remaining,
+        resetsAt: observation.resetsAt,
+        observedAt: observation.observedAt,
+        source: observation.source,
+        confidence: observation.confidence,
+        state: displayState(window, nowMs),
+        ...readingReserve(routeIds, observation, reserves),
+      };
+    });
+    const candidates = (periodSeconds: number) =>
+      readings.filter((_, index) => {
+        const semantics = orderedWindows[index].observation.semantics;
+        return semantics?.scope === 'provider' && semantics.periodSeconds === periodSeconds;
       });
+    const weekly = candidates(604800);
+    const fiveHour = candidates(18000);
+    const primary = {
+      weekly: weekly.length === 1 ? weekly[0] : null,
+      fiveHour: fiveHour.length === 1 ? fiveHour[0] : null,
+    };
     const notices = scope.fixture
       ? ['Fixture data. No account allowance is established.']
       : ['Account and shared-pool identity are unknown.'];
     if (readings.length === 0) notices.push('No usage observations.');
+    if (weekly.length > 1 || fiveHour.length > 1)
+      notices.push('Multiple provider windows match a primary period; all remain separate.');
     if (family === 'google' && !scope.fixture) {
       if (reader && !reader.enabled)
         notices.push('Quota reads are disabled; retained reports remain visible.');
@@ -198,9 +210,8 @@ export function projectUsagePresentation(
         : `${scope.fixture ? 'Fixture route' : 'Route'}: ${scope.routes[0].displayName}`,
       routeIds,
       fixture: scope.fixture,
-      // Kind alone cannot establish a provider-wide week or a five-hour duration.
-      primary: { weekly: null, fiveHour: null },
-      satellites: readings,
+      primary,
+      satellites: readings.filter((reading) => !Object.values(primary).includes(reading)),
       reader: family === 'google' && !scope.fixture ? reader : null,
       notice: notices.join(' '),
     };
