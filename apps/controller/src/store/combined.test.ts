@@ -194,14 +194,49 @@ test('combined tasks share seven real dispatches and require a separate full bar
       const rev = (taskId = parent.id) =>
         (controller.snapshot().tasks.find((task) => task.id === taskId) as Task).revision;
       const phase = () => controller.snapshot().combinedRuns[0];
-      const waitFor = async (label: string, predicate: () => boolean, milliseconds?: number) => {
+      const stagePhases = {
+        baseline: ['baseline'],
+        writers: ['writer-0', 'writer-1'],
+        assembly: ['replay-0', 'replay-1'],
+        checks: ['final-check'],
+        review: ['review'],
+      } as const;
+      const stageAllowance = (stage: keyof typeof stagePhases) => {
+        const group = controller.store.combinedGroup(phase()?.runId ?? '');
+        assert(group);
+        const dispatches = controller.store.combinedDispatches(group.run_id);
+        const minutes = stagePhases[stage].map((phase) => {
+          const slot = dispatches.find((slot) => slot.phase === phase);
+          assert(slot);
+          return slot.maximum_minutes;
+        });
+        // Writers overlap. Replays and their integration operations run in order.
+        return (
+          (stage === 'writers'
+            ? Math.max(...minutes)
+            : minutes.reduce((sum, value) => sum + value)) *
+            60_000 +
+          (stage === 'baseline' || stage === 'assembly'
+            ? Math.max(0, 60_000 - group.integration_milliseconds)
+            : 0)
+        );
+      };
+      const waitFor = async (
+        label: string,
+        predicate: () => boolean,
+        stage?: keyof typeof stagePhases,
+      ) => {
         if (predicate()) return;
         const done = Promise.withResolvers<void>();
         const off = context.observe(controller, () => {
           if (predicate()) done.resolve();
         });
         try {
-          await context.wait(`${scenario}/${label}`, done.promise, milliseconds);
+          await context.wait(
+            `${scenario}/${label}`,
+            done.promise,
+            stage === undefined ? undefined : stageAllowance(stage),
+          );
         } finally {
           off();
         }
@@ -423,11 +458,10 @@ test('combined tasks share seven real dispatches and require a separate full bar
         );
         continue;
       }
-      // Baseline readiness includes the check plus one shared minute for integration.
       await waitFor(
         'baseline',
         () => phase()?.phase === 'writers' || ['blocked', 'unknown'].includes(phase()?.phase ?? ''),
-        (input.checks.maximumMinutes + 1) * 60_000,
+        'baseline',
       );
       assert.equal(phase()?.phase, 'writers', JSON.stringify(phase()));
       let written = 0;
@@ -537,11 +571,14 @@ test('combined tasks share seven real dispatches and require a separate full bar
         assert(writerPause && activeResume);
         assert.equal((await writerPause).outcome, 'applied');
         assert.equal((await activeResume).outcome, 'blocked');
-        await waitFor('paused writers close', () =>
-          controller.store
-            .combinedDispatches(preview.runId)
-            .slice(1, 3)
-            .every((slot) => slot.state === 'passed'),
+        await waitFor(
+          'paused writers close',
+          () =>
+            controller.store
+              .combinedDispatches(preview.runId)
+              .slice(1, 3)
+              .every((slot) => slot.state === 'passed'),
+          'writers',
         );
         assert.equal(phase()?.phase, 'paused');
         assert.equal(phase()?.assemble.available, false);
@@ -563,6 +600,7 @@ test('combined tasks share seven real dispatches and require a separate full bar
         () =>
           phase()?.assemble.available === true ||
           ['blocked', 'unknown'].includes(phase()?.phase ?? ''),
+        'writers',
       );
       assert.equal(phase()?.assemble.available, true, JSON.stringify(phase()));
       if (scenario === 'recovered')
@@ -583,7 +621,7 @@ test('combined tasks share seven real dispatches and require a separate full bar
         'applied',
       );
       if (scenario === 'recovered') {
-        await waitFor('ref receipt interruption', () => phase()?.phase === 'blocked');
+        await waitFor('ref receipt interruption', () => phase()?.phase === 'blocked', 'assembly');
         const pending = controller.store
           .combinedRefIntents(preview.runId)
           .find((row) => row.operation === 'replay-0-ref');
@@ -626,6 +664,7 @@ test('combined tasks share seven real dispatches and require a separate full bar
         () =>
           phase()?.phase === 'awaiting-evaluation' ||
           ['blocked', 'unknown'].includes(phase()?.phase ?? ''),
+        'assembly',
       );
       assert.equal(phase()?.phase, 'awaiting-evaluation', JSON.stringify(phase()));
       const candidate = phase()?.candidate;
@@ -730,6 +769,7 @@ test('combined tasks share seven real dispatches and require a separate full bar
               .intents()
               .filter((intent) => intent.run_id === preview.runId)
               .every((intent) => intent.state === 'stopped'),
+          'checks',
         );
         assert(checkPause);
         assert.equal((await checkPause).outcome, 'applied');
@@ -747,8 +787,10 @@ test('combined tasks share seven real dispatches and require a separate full bar
         assert.equal(controller.store.intents().length, before);
       }
       offCheckPause();
-      await waitFor('full checks', () =>
-        ['awaiting-review', 'blocked', 'unknown'].includes(phase()?.phase ?? ''),
+      await waitFor(
+        'full checks',
+        () => ['awaiting-review', 'blocked', 'unknown'].includes(phase()?.phase ?? ''),
+        'checks',
       );
       if (scenario === 'interaction-failed') {
         assert.equal(phase()?.phase, 'blocked');
@@ -807,6 +849,7 @@ test('combined tasks share seven real dispatches and require a separate full bar
               .intents()
               .filter((intent) => intent.run_id === preview.runId)
               .every((intent) => intent.state === 'stopped'),
+          'review',
         );
         assert(reviewPause);
         assert.equal((await reviewPause).outcome, 'applied');
@@ -824,7 +867,11 @@ test('combined tasks share seven real dispatches and require a separate full bar
         assert.equal(controller.store.intents().length, before);
       }
       offReviewPause();
-      await waitFor('review', () => ['ready', 'blocked', 'unknown'].includes(phase()?.phase ?? ''));
+      await waitFor(
+        'review',
+        () => ['ready', 'blocked', 'unknown'].includes(phase()?.phase ?? ''),
+        'review',
+      );
       assert.equal(phase()?.phase, 'ready', JSON.stringify(phase()));
       const snapshot = controller.snapshot();
       assert.equal(snapshot.attempts.length, 9);
