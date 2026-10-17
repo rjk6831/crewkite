@@ -12,6 +12,7 @@ import {
 } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { checkOwner } from '../apps/controller/src/host/check-ownership.ts';
 import { configuredIdentity } from '../apps/controller/src/host/publication.ts';
 import { startController } from '../apps/controller/src/main.ts';
 import { createCommandKey } from '../packages/client/src/node.ts';
@@ -23,11 +24,13 @@ import { prepareStateDirectory, syncDirectory } from './demo-state.ts';
 export async function startDemoController(home: string) {
   const directory = resolve(home);
   const root = fileURLToPath(new URL('..', import.meta.url));
-  const internal = existsSync(join(root, 'manifest.json'))
-    ? dirname(dirname(root))
-    : existsSync(join(root, 'internal/tools'))
-      ? dirname(realpathSync(join(root, 'internal/tools')))
-      : join(root, 'internal');
+  const internal =
+    checkOwner()?.stateRoot ??
+    (existsSync(join(root, 'manifest.json'))
+      ? dirname(dirname(root))
+      : existsSync(join(root, 'internal/tools'))
+        ? dirname(realpathSync(join(root, 'internal/tools')))
+        : join(root, 'internal'));
   if (!existsSync(internal)) prepareStateDirectory(root, internal);
   prepareStateDirectory(internal, directory);
   const state = lstatSync(directory);
