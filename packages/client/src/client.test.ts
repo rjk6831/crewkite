@@ -969,6 +969,378 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
   assert.equal(refusedConversation.code, 2);
   assert.equal(JSON.parse(refusedConversation.output).result.outcome, 'blocked');
 
+  const localBinding: NonNullable<Snapshot['nativeRuns'][number]['localModel']> = {
+    version: 2,
+    identityKind: 'runtime-metadata',
+    connectorId: 'local-sdk-v1',
+    connectionRevision: 2,
+    connectionHash: '2'.repeat(64),
+    setupHash: '1'.repeat(64),
+    runtimeVersion: 'fixture',
+    runtimeBuild: 1,
+    modelKey: 'loaded-model',
+    instanceReference: 'loaded-instance',
+    modelSizeBytes: 17,
+    format: 'gguf',
+    metadataHash: '3'.repeat(64),
+  };
+  const localProfile: Snapshot['nativeProfiles'][number] = {
+    id: 'local-file-v1',
+    family: 'local',
+    displayName: 'Local file proposal',
+    sdkVersion: '2.1.0',
+    model: localBinding.modelKey,
+    modelBinding: localBinding,
+    billing: 'local',
+    contextLength: 8192,
+    maximumOutputTokens: 2048,
+    qualifiedAt: null,
+    maximumTaskMs: 300000,
+    maximumFileBytes: 65536,
+    maximumSubmissions: 1,
+    available: true,
+    reason: 'qualification-pending',
+  };
+  const localChoice = {
+    selectionId: '4'.repeat(64),
+    identity: {
+      modelKey: localBinding.modelKey,
+      displayName: 'Loaded model',
+      format: 'gguf',
+      sizeBytes: 17,
+      quantization: null,
+      selectedVariant: null,
+      metadataHash: localBinding.metadataHash,
+    },
+    instanceReference: localBinding.instanceReference,
+    contextLength: 8192,
+    state: 'loaded-eligible' as const,
+    reasons: [],
+    qualification: 'unqualified' as const,
+  };
+  let localSetup: Snapshot['localSetup'] = {
+    revision: 7,
+    connectionRevision: 2,
+    connectorId: 'local-sdk-v1',
+    endpoint: 'ws://127.0.0.1:1234',
+    setupHash: localBinding.setupHash,
+    connectionHash: localBinding.connectionHash,
+    secretConfigured: true,
+    operation: { kind: 'input', state: 'owned', operationId: `cmd_${suffix}` },
+    generation: 'idle',
+    observation: {
+      version: 1,
+      runtime: { connectorId: 'local-sdk-v1', version: 'fixture', build: 1 },
+      observationHash: '5'.repeat(64),
+      residentLlms: 1,
+      embeddingInstances: 0,
+      models: [
+        localChoice,
+        {
+          ...localChoice,
+          selectionId: '6'.repeat(64),
+          identity: {
+            ...localChoice.identity,
+            modelKey: 'installed-model',
+            displayName: 'Installed model',
+            metadataHash: '7'.repeat(64),
+          },
+          instanceReference: null,
+          contextLength: null,
+          state: 'installed-unloaded',
+        },
+        {
+          ...localChoice,
+          selectionId: '8'.repeat(64),
+          identity: {
+            ...localChoice.identity,
+            modelKey: 'unsupported-model',
+            displayName: 'Unsupported model',
+            format: 'unknown-format',
+            metadataHash: '9'.repeat(64),
+          },
+          instanceReference: null,
+          contextLength: null,
+          state: 'incompatible',
+          reasons: ['unsupported-format'],
+        },
+      ],
+    },
+    selection: { selectionId: localChoice.selectionId, observationHash: '5'.repeat(64) },
+    reason: 'qualification-pending',
+  };
+  let localNativeRun: Snapshot['nativeRuns'][number] = {
+    ...nativeRun,
+    profileId: localProfile.id,
+    localModel: localBinding,
+  };
+  let localOutcome: 'applied' | 'outcome-unknown' | 'blocked' = 'applied';
+  const localCommands: Command[] = [];
+  const localFixture = await serve((message, socket) => {
+    if (message.type === 'hello') {
+      socket.write(encodeFrame({ type: 'welcome', protocol: 1, cursor: snapshot.cursor }));
+      return;
+    }
+    if (message.type !== 'command') return;
+    localCommands.push(message.command);
+    const result =
+      message.command.command === 'GetSnapshot'
+        ? {
+            outcome: 'applied' as const,
+            data: {
+              kind: 'snapshot' as const,
+              snapshot: {
+                ...snapshot,
+                localSetup,
+                tasks: [{ ...task, runId: run.id }],
+                runs: [run],
+                nativeProfiles: [localProfile],
+                nativeRuns: [localNativeRun],
+              },
+            },
+          }
+        : {
+            outcome: localOutcome,
+            reason: 'local-result\u001b[31m\rretained',
+            next: 'Read Local status.',
+          };
+    socket.write(encodeFrame({ type: 'result', key: message.command.key, result }));
+  });
+  context.after(() => localFixture.close());
+  const localPolicyFile = join(localFixture.home, 'policy.json');
+  writeFileSync(localPolicyFile, JSON.stringify(policy));
+  const executeLocal = async (args: string[], json = true) => {
+    localCommands.length = 0;
+    const child = spawn(
+      process.execPath,
+      [
+        fileURLToPath(new URL('../../../apps/cli/src/main.ts', import.meta.url)),
+        ...args,
+        ...(json ? ['--json'] : []),
+        '--home',
+        localFixture.home,
+      ],
+      { stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    let output = '',
+      errors = '';
+    child.stdout.on('data', (bytes) => {
+      output += bytes;
+    });
+    child.stderr.on('data', (bytes) => {
+      errors += bytes;
+    });
+    const [code] = await once(child, 'close');
+    return { code, output, errors };
+  };
+  for (const row of [
+    {
+      args: ['local', 'configure', '--endpoint', 'ws://127.0.0.1:1234'],
+      command: 'ConfigureLocal',
+      payload: { endpoint: 'ws://127.0.0.1:1234' },
+    },
+    {
+      args: ['local', 'connect', '--consent'],
+      command: 'BeginLocalConnectionInput',
+      payload: { consent: 'explicit' },
+    },
+    {
+      args: ['local', 'cancel-input', `cmd_${suffix}`],
+      command: 'CancelLocalConnectionInput',
+      payload: { operationId: `cmd_${suffix}` },
+    },
+    {
+      args: ['local', 'refresh-models', '--consent'],
+      command: 'RefreshLocalModels',
+      payload: { consent: 'explicit' },
+    },
+    {
+      args: [
+        'local',
+        'select-model',
+        localChoice.selectionId,
+        '--observation-hash',
+        '5'.repeat(64),
+      ],
+      command: 'SelectLocalModel',
+      payload: { selectionId: localChoice.selectionId, observationHash: '5'.repeat(64) },
+    },
+    {
+      args: ['local', 'select-model', '6'.repeat(64), '--observation-hash', '5'.repeat(64)],
+      command: 'SelectLocalModel',
+      payload: { selectionId: '6'.repeat(64), observationHash: '5'.repeat(64) },
+    },
+    { args: ['local', 'disconnect'], command: 'DisconnectLocal', payload: {} },
+  ]) {
+    const result = await executeLocal(row.args);
+    assert.equal(result.code, 0, result.errors);
+    const receipt = JSON.parse(result.output);
+    assert.deepEqual(
+      localCommands.map((command) => command.command),
+      ['GetSnapshot', row.command],
+    );
+    assert.equal(receipt.command.expectedRevision, 7);
+    assert.deepEqual(receipt.command.payload, row.payload);
+    assert.deepEqual(receipt.command, localCommands.at(-1));
+  }
+  const localStatus = await executeLocal(['local', 'status']);
+  assert.equal(localStatus.code, 0, localStatus.errors);
+  assert.deepEqual(JSON.parse(localStatus.output), {
+    cursor: snapshot.cursor,
+    setup: localSetup,
+    profile: localProfile,
+  });
+  assert.deepEqual(
+    localCommands.map((command) => command.command),
+    ['GetSnapshot'],
+  );
+  const plainLocalStatus = await executeLocal(['local', 'status'], false);
+  for (const fact of [
+    'installed-unloaded',
+    'loaded-eligible',
+    'incompatible',
+    'unqualified',
+    '5'.repeat(64),
+  ])
+    assert(plainLocalStatus.output.includes(fact));
+  for (const args of [
+    ['local', 'connect'],
+    ['local', 'refresh-models'],
+    ['local', 'cancel-input'],
+    ['local', 'configure', '--endpoint', 'ws://localhost:1234'],
+    ['local', 'configure', '--setup-receipt', 'unused.json'],
+    ['local', 'connect', '--consent', '--token', 'synthetic-local-secret'],
+    ['local', 'connect', '--consent', '--helper-path', '/synthetic/helper'],
+    ['local', 'select-model', '/synthetic/model', '--observation-hash', '5'.repeat(64)],
+    ['local', 'disconnect', '--consent'],
+  ]) {
+    const result = await executeLocal(args);
+    assert.equal(result.code, 1, args.join(' '));
+    assert.deepEqual(localCommands, []);
+  }
+  for (const args of [
+    ['local', 'select-model', localChoice.selectionId, '--observation-hash', 'f'.repeat(64)],
+    ['local', 'select-model', 'f'.repeat(64), '--observation-hash', '5'.repeat(64)],
+    ['local', 'cancel-input', 'cmd_01ARZ3NDEKTSV4RRFFQ69G5FAW'],
+  ]) {
+    assert.equal((await executeLocal(args)).code, 1);
+    assert.deepEqual(
+      localCommands.map((command) => command.command),
+      ['GetSnapshot'],
+    );
+  }
+  const configuredLocal = localSetup;
+  localSetup = {
+    ...configuredLocal,
+    operation: { kind: 'discovery', state: 'owned', operationId: `cmd_${suffix}` },
+  };
+  assert.equal((await executeLocal(['local', 'cancel-input', `cmd_${suffix}`])).code, 1);
+  assert.deepEqual(
+    localCommands.map((command) => command.command),
+    ['GetSnapshot'],
+  );
+  localSetup = configuredLocal;
+  localOutcome = 'outcome-unknown';
+  const uncertainLocal = await executeLocal(['local', 'disconnect']);
+  assert.equal(uncertainLocal.code, 2);
+  const localReceipt = JSON.parse(uncertainLocal.output);
+  const localReceiptFile = join(localFixture.home, 'local-receipt.json');
+  writeFileSync(localReceiptFile, uncertainLocal.output);
+  localSetup = { ...configuredLocal, revision: 8 };
+  localOutcome = 'applied';
+  const localRetry = await executeLocal(['retry', localReceiptFile]);
+  assert.equal(localRetry.code, 0, localRetry.errors);
+  assert.deepEqual(localCommands, [localReceipt.command]);
+  assert.deepEqual(JSON.parse(localRetry.output).command, localReceipt.command);
+  localOutcome = 'blocked';
+  const plainLocalRefusal = await executeLocal(['local', 'disconnect'], false);
+  assert.equal(plainLocalRefusal.code, 2);
+  assert(plainLocalRefusal.output.includes('Next: Read Local status.'));
+  assert(!plainLocalRefusal.output.includes('\u001b') && !plainLocalRefusal.output.includes('\r'));
+  assert(
+    plainLocalRefusal.output.includes('\\u001b') && plainLocalRefusal.output.includes('\\u000d'),
+  );
+  localOutcome = 'applied';
+  for (const consent of ['explicit', 'saved']) {
+    const result = await executeLocal([
+      'task',
+      'prepare-native',
+      task.id,
+      localProfile.id,
+      'net.mjs',
+      '--policy',
+      localPolicyFile,
+      ...(consent === 'explicit' ? ['--native-trust', '--source-consent'] : []),
+    ]);
+    assert.equal(result.code, 0, result.errors);
+    const command = JSON.parse(result.output).command;
+    assert.deepEqual(command.payload, {
+      taskId: task.id,
+      profileId: localProfile.id,
+      targetPath: 'net.mjs',
+      policy,
+      consent,
+    });
+    assert.equal(command.expectedRevision, task.revision);
+    assert.deepEqual(
+      localCommands.map((value) => value.command),
+      ['GetSnapshot', 'PrepareNativeRun'],
+    );
+  }
+  for (const flags of [
+    ['--existing-credits'],
+    ['--confirm-subscription-only'],
+    ['--permission-mode', 'strict'],
+    ['--model-id', 'override'],
+    ['--thought-level-id', 'override'],
+    ['--confirm-quota-account'],
+    ['--handoff-target', 'anthropic-file-v1'],
+  ]) {
+    const result = await executeLocal([
+      'task',
+      'prepare-native',
+      task.id,
+      localProfile.id,
+      'net.mjs',
+      '--policy',
+      localPolicyFile,
+      '--native-trust',
+      '--source-consent',
+      ...flags,
+    ]);
+    assert.equal(result.code, 1, flags.join(' '));
+    assert.deepEqual(
+      localCommands.map((value) => value.command),
+      ['GetSnapshot'],
+    );
+  }
+  const genericLocalShow = await executeLocal(['task', 'show', task.id], false);
+  assert(genericLocalShow.output.includes('Identity runtime metadata'));
+  assert(genericLocalShow.output.includes(localBinding.metadataHash));
+  localNativeRun = {
+    ...localNativeRun,
+    localModel: {
+      setupHash: localBinding.setupHash,
+      modelKey: 'historical-model',
+      instanceReference: 'historical-instance',
+      modelSizeBytes: 17,
+      artifactSha256: 'd'.repeat(64),
+      quantization: 'Q4_K_M',
+    },
+  };
+  const historicalLocalShow = await executeLocal(['task', 'show', task.id], false);
+  assert(historicalLocalShow.output.includes('Identity retained artifact'));
+  assert(historicalLocalShow.output.includes('d'.repeat(64)));
+  localSetup = undefined;
+  const historicalLocalStatus = await executeLocal(['local', 'status']);
+  assert.equal(historicalLocalStatus.code, 0);
+  assert.equal(JSON.parse(historicalLocalStatus.output).setup, null);
+  assert.equal((await executeLocal(['local', 'disconnect'])).code, 1);
+  assert.deepEqual(
+    localCommands.map((value) => value.command),
+    ['GetSnapshot'],
+  );
+
   for (const scenario of [
     ...acpCases.map((value) => `acp-${value}`),
     ...usageCases.map((value) => `usage-${value.name}`),
