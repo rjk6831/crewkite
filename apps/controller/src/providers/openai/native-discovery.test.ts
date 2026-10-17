@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { resolve } from 'node:path';
 import test from 'node:test';
 import { spawnCheckChild as spawn } from '../../host/check-ownership.ts';
@@ -318,6 +318,144 @@ test('native discovery returns metadata only after its owned process and descend
       assert.equal(result.quiescent, true, mode);
       assert(handle.groups.every(groupAbsent), mode);
     }
+    for (const mode of ['queued-close', 'unobserved-close', 'live-at-cutoff']) {
+      const directory = resolve(root, mode);
+      mkdirSync(directory, { mode: 0o700 });
+      const schedules: Array<{ milliseconds: number; work: () => void; live: boolean }> = [];
+      const ready = Promise.withResolvers<void>();
+      let clock = 0;
+      let phase = 0;
+      let sent = false;
+      let task: ChildProcessWithoutNullStreams | undefined;
+      let closed: Promise<void> | undefined;
+      let closeSeen = false;
+      let callbackError: unknown;
+      let onExit: (() => void) | undefined;
+      const fire = (milliseconds: number) => {
+        const row = schedules.find((row) => row.live && row.milliseconds === milliseconds);
+        assert(row, `${mode}: pending ${milliseconds}ms callback`);
+        row.live = false;
+        row.work();
+      };
+      const handle = startNativeTask(
+        {
+          executable: process.execPath,
+          sha256,
+          directory,
+          repositoryRoot: root,
+          environment: sourceEnvironment,
+        },
+        {
+          timeoutMs: 300_000,
+          now: () => clock,
+          schedule: (work, milliseconds) => {
+            const row = { work, milliseconds, live: true };
+            schedules.push(row);
+            return () => {
+              row.live = false;
+            };
+          },
+          onSubmitted: () => ready.resolve(),
+          spawn: (executable, args, options) => {
+            const isTask = args.at(-1) !== 'list';
+            const child = spawn(
+              executable,
+              ['-e', fixture, 'success', isTask ? 'task' : 'features'],
+              options,
+            );
+            const completed = new Promise<void>((resolve) =>
+              child.once('close', () => {
+                if (isTask) closeSeen = true;
+                resolve();
+              }),
+            );
+            owned.push({ child, closed: completed });
+            if (isTask) {
+              task = child;
+              closed = completed;
+              child.once('exit', () => onExit?.());
+            }
+            return child;
+          },
+        },
+        () => ({
+          next: () => {
+            if (sent || phase >= 2) return null;
+            sent = true;
+            return Buffer.from(
+              `${JSON.stringify(
+                phase === 0
+                  ? {
+                      id: 1,
+                      method: 'initialize',
+                      params: {
+                        capabilities: { explicitGatewayOauth: true, experimentalApi: false },
+                      },
+                    }
+                  : { id: 2, method: 'turn/start', params: {} },
+              )}\n`,
+            );
+          },
+          push: () => {
+            phase++;
+            sent = false;
+          },
+          finish: () => ({ completed: true }),
+          get submitted() {
+            return phase === 1 && sent;
+          },
+          complete: false,
+          pendingRequest: 'turn/start',
+          lastEnvelope: null,
+          refusedEnvelope: null,
+          notifications: 0,
+        }),
+      );
+      await ready.promise;
+      assert(task);
+      assert(closed);
+      const child = task;
+      handle.stop();
+      if (mode === 'live-at-cutoff') {
+        clock = 2000;
+        assert.equal(groupAbsent(child.pid as number), false);
+        fire(2000);
+        assert.equal(
+          schedules.some((row) => row.live && row.milliseconds === 0),
+          false,
+        );
+      } else {
+        onExit = () => {
+          try {
+            clock = 2000;
+            assert.equal(closeSeen, false);
+            assert(groupAbsent(child.pid as number));
+            fire(1000);
+            fire(2000);
+            if (mode === 'unobserved-close') {
+              assert.equal(schedules.filter((row) => row.live && row.milliseconds === 0).length, 1);
+              fire(0);
+            }
+          } catch (error) {
+            callbackError = error;
+          }
+        };
+        fire(250);
+      }
+      const result = await handle.result;
+      assert.ifError(callbackError);
+      assert.equal(result.metadata, null, mode);
+      assert.equal(result.quiescent, mode === 'queued-close', mode);
+      assert.equal(result.reason, mode === 'queued-close' ? 'stopped' : 'ownership', mode);
+      if (mode === 'live-at-cutoff') child.stdin.end();
+      await closed;
+      assert(groupAbsent(child.pid as number));
+      assert.deepEqual(await handle.result, result, `${mode}: late closure cannot heal a result`);
+      assert.equal(
+        schedules.some((row) => row.live && row.milliseconds === 0),
+        false,
+      );
+    }
     const lifecycleCases = [
       { name: 'three phases', failure: '', sequence: -1 },
       ...['intent', 'owned', 'quiescent'].flatMap((failure) =>
@@ -496,6 +634,7 @@ test('native discovery returns metadata only after its owned process and descend
     assert.equal(spawned, false);
     const publicDirectory = resolve(root, 'public');
     mkdirSync(publicDirectory, { mode: 0o755 });
+    chmodSync(publicDirectory, 0o755);
     const linked = resolve(root, 'linked');
     symlinkSync(resolve(root, 'success'), linked, 'dir');
     for (const directory of [publicDirectory, linked]) {

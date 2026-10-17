@@ -307,7 +307,12 @@ function startTranscript<T>(
     );
     cancellations.push(
       schedule(
-        () => settle(closed && absent()),
+        () => {
+          // An exited group can precede delivery of its final stream-close event.
+          if (group > 0 && !closed && absent())
+            cancellations.push(schedule(() => settle(closed && absent()), 0));
+          else settle(closed && absent());
+        },
         options.task ? Math.max(0, Math.min(2000, deadline - now())) : 2000,
       ),
     );
