@@ -260,13 +260,23 @@ export function useWorkspace() {
       stopNotices?.();
     };
   }, [source, refresh]);
+  const track = useCallback(async <T>(action: () => Promise<T>): Promise<T> => {
+    setPending((value) => value + 1);
+    setError(null);
+    try {
+      return await action();
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : 'The command failed.');
+      throw failure;
+    } finally {
+      setPending((value) => value - 1);
+    }
+  }, []);
   const perform = useCallback(
-    async <T extends CommandResult | ConversationContextCapture | null>(
+    <T extends CommandResult | ConversationContextCapture | null>(
       action: () => Promise<T>,
-    ): Promise<T> => {
-      setPending((value) => value + 1);
-      setError(null);
-      try {
+    ): Promise<T> =>
+      track(async () => {
         const value = await action();
         const result =
           value === null
@@ -295,14 +305,8 @@ export function useWorkspace() {
           );
         }
         return value;
-      } catch (failure) {
-        setError(failure instanceof Error ? failure.message : 'The command failed.');
-        throw failure;
-      } finally {
-        setPending((value) => value - 1);
-      }
-    },
-    [refresh],
+      }),
+    [refresh, track],
   );
   const command = useCallback(
     (input: DesktopCommand) =>
@@ -331,10 +335,11 @@ export function useWorkspace() {
         throw new Error('Exact command retry is unavailable in this view.');
       return source.retryCommand(expected);
     });
-  const resolveContext = (ref: ConversationContextRef) => {
-    if (!source) return Promise.reject(new Error('The desktop bridge is unavailable.'));
-    return resolveConversationContext(source, ref);
-  };
+  const resolveContext = (ref: ConversationContextRef) =>
+    track(async () => {
+      if (!source) throw new Error('The desktop bridge is unavailable.');
+      return resolveConversationContext(source, ref);
+    });
   const finishCapture = async (
     scope: { projectId: string; base: string },
     capture: ConversationContextCapture,
@@ -355,28 +360,30 @@ export function useWorkspace() {
       throw new Error('The context artifact belongs to a different project or base.');
     return resolved;
   };
-  const pickConversationContext = async (input: ConversationContextRequest) => {
-    if (!source?.pickConversationContext)
-      throw new Error('Context selection is unavailable in this view.');
-    const capture = await perform(() =>
-      source.pickConversationContext
-        ? source.pickConversationContext(input)
-        : Promise.reject(new Error('Context selection is unavailable.')),
-    );
-    return capture === null ? null : finishCapture(input, capture);
-  };
-  const retryConversationContext = async (input: ConversationContextReceipt) => {
-    const receipt = contextReceipt(input);
-    if (!source?.retryConversationContext)
-      throw new Error('Context retry is unavailable in this view.');
-    const capture = await perform(() =>
-      source.retryConversationContext
-        ? source.retryConversationContext(receipt)
-        : Promise.reject(new Error('Context retry is unavailable.')),
-    );
-    if (capture.receiptId !== receipt.receiptId) throw new Error('The context receipt changed.');
-    return finishCapture(receipt, capture);
-  };
+  const pickConversationContext = (input: ConversationContextRequest) =>
+    track(async () => {
+      if (!source?.pickConversationContext)
+        throw new Error('Context selection is unavailable in this view.');
+      const capture = await perform(() =>
+        source.pickConversationContext
+          ? source.pickConversationContext(input)
+          : Promise.reject(new Error('Context selection is unavailable.')),
+      );
+      return capture === null ? null : finishCapture(input, capture);
+    });
+  const retryConversationContext = (input: ConversationContextReceipt) =>
+    track(async () => {
+      const receipt = contextReceipt(input);
+      if (!source?.retryConversationContext)
+        throw new Error('Context retry is unavailable in this view.');
+      const capture = await perform(() =>
+        source.retryConversationContext
+          ? source.retryConversationContext(receipt)
+          : Promise.reject(new Error('Context retry is unavailable.')),
+      );
+      if (capture.receiptId !== receipt.receiptId) throw new Error('The context receipt changed.');
+      return finishCapture(receipt, capture);
+    });
   const reconnect = async () => {
     setTransportError(null);
     try {
