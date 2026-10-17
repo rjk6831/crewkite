@@ -1,6 +1,6 @@
 import type { Observation, Window } from '@crewkite/contracts';
 import { CircleAlert, CircleHelp, CircleSlash, Clock, Target } from 'lucide-react';
-import { type ReactNode, useId } from 'react';
+import { type ReactNode, useEffect, useId, useState } from 'react';
 import './usage-gauges.css';
 
 export type UsageAmount = NonNullable<Observation['remaining']>;
@@ -43,7 +43,11 @@ export type UsageCard = {
   scope?: string;
   tags?: readonly string[];
   notice?: string;
+  // One or two side dials. Prominence comes from the host; nothing here ranks allowances.
   primary: readonly UsageReading[];
+  // A smaller dial raised between the side dials, for one allowance the host pins by exact window.
+  featured?: UsageReading | null;
+  // One-line meters under the dials. Each keeps its own value, reset and warning.
   auxiliary?: readonly UsageReading[];
   credits?: readonly UsageCredit[];
   resources?: readonly UsageResource[];
@@ -106,6 +110,13 @@ function arc(radius: number, from: number, to: number) {
   const [x2, y2] = point(radius, angle(to));
   const large = ((to - from) * SWEEP) / 100 > 180 ? 1 : 0;
   return `M ${x1} ${y1} A ${radius} ${radius} 0 ${large} 1 ${x2} ${y2}`;
+}
+
+// Positive amounts never print as zero. Large ones floor to compact notation; Details keep the
+// exact value.
+function amountDigits(value: number) {
+  if (value >= 10_000) return compact.format(value);
+  return value > 0 && value < 0.001 ? '<0.001' : exact.format(value);
 }
 
 function percentText(value: number) {
@@ -197,6 +208,58 @@ function describe(reading: UsageReading, nowMs: number) {
   };
 }
 
+function details(reading: UsageReading, view: ReturnType<typeof describe>) {
+  const rows: [string, ReactNode][] = [];
+  if (view.known && view.remaining && view.remaining.value >= 10_000)
+    rows.push(['Remaining', `${exact.format(view.remaining.value)} ${view.remaining.unit}`]);
+  if (reading.note) rows.push(['Note', reading.note]);
+  if (reading.windowId) rows.push(['Window', <code key="window">{reading.windowId}</code>]);
+  if (reading.source) rows.push(['Source', sourceText[reading.source]]);
+  if (reading.confidence) rows.push(['Confidence', confidenceText[reading.confidence]]);
+  if (view.observedAt !== null && !Number.isNaN(view.observedAt))
+    rows.push(['Observed', absolute(view.observedAt)]);
+  if (view.resetsAt !== null && !Number.isNaN(view.resetsAt))
+    rows.push(['Resets', absolute(view.resetsAt)]);
+  if (view.reserveText) rows.push(['Reserve', view.reserveText]);
+  return rows;
+}
+
+// A missing value names itself and explains why on hover, keyboard focus and tap. It never
+// renders as zero, empty or full.
+function Missing({ reading }: { reading: UsageReading }) {
+  const tipId = `usage-missing-${useId().replace(/[^a-zA-Z0-9]/g, '')}`;
+  const unavailable = reading.state === 'unavailable';
+  // Escape hides the explanation without moving focus or the pointer. A new hover or focus
+  // brings it back.
+  const [dismissed, setDismissed] = useState(false);
+  useEffect(() => {
+    if (dismissed) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setDismissed(true);
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [dismissed]);
+  return (
+    <span className="usage-missing" data-dismissed={dismissed ? '' : undefined}>
+      <button
+        type="button"
+        className="usage-missing-word"
+        aria-describedby={tipId}
+        onPointerEnter={() => setDismissed(false)}
+        onFocus={() => setDismissed(false)}
+      >
+        {unavailable ? 'Unavailable' : 'Unknown'}
+      </button>
+      <span role="tooltip" id={tipId} className="usage-missing-tip">
+        {unavailable
+          ? 'This source has not reported this allowance.'
+          : 'No usable report for this allowance. A missing value is never shown as zero.'}
+      </span>
+    </span>
+  );
+}
+
 function Chip({ tone, icon, children }: { tone: string; icon: ReactNode; children: ReactNode }) {
   return (
     <li className={`usage-gauges-chip chip-${tone}`}>
@@ -210,10 +273,15 @@ export function UsageGauge({
   reading,
   nowMs,
   size = 'primary',
+  cluster = false,
+  observed = true,
 }: {
   reading: UsageReading;
   nowMs: number;
-  size?: 'primary' | 'auxiliary';
+  size?: 'primary' | 'featured';
+  // In a cluster the card footer carries the details, and the observed time when all agree.
+  cluster?: boolean;
+  observed?: boolean;
 }) {
   const uid = useId().replace(/[^a-zA-Z0-9]/g, '');
   const view = describe(reading, nowMs);
@@ -225,7 +293,7 @@ export function UsageGauge({
     view.percent === null
       ? []
       : primary
-        ? Array.from({ length: 21 }, (_, index) => index * 5)
+        ? Array.from({ length: 11 }, (_, index) => index * 10)
         : [0, 25, 50, 75, 100];
   const unscaled = view.known && view.percent === null;
   const chips: ReactNode[] = [];
@@ -271,18 +339,10 @@ export function UsageGauge({
         Unavailable
       </Chip>,
     );
-  const details: [string, ReactNode][] = [];
-  if (reading.note) details.push(['Note', reading.note]);
-  if (reading.windowId) details.push(['Window', <code key="window">{reading.windowId}</code>]);
-  if (reading.source) details.push(['Source', sourceText[reading.source]]);
-  if (reading.confidence) details.push(['Confidence', confidenceText[reading.confidence]]);
-  if (view.observedAt !== null && !Number.isNaN(view.observedAt))
-    details.push(['Observed', absolute(view.observedAt)]);
-  if (view.resetsAt !== null && !Number.isNaN(view.resetsAt))
-    details.push(['Resets', absolute(view.resetsAt)]);
+  const rows = cluster ? [] : details(reading, view).filter(([term]) => term !== 'Reserve');
   return (
     <figure
-      className={`usage-gauge is-${size} tone-${view.tone} state-${reading.state}${unscaled ? ' is-unscaled' : ''}${view.unknownValue ? ' is-unknown-value' : ''}${reading.constraining ? ' is-constraining' : ''}`}
+      className={`usage-gauge is-${size} tone-${view.tone} state-${reading.state}${unscaled ? ' is-unscaled' : ''}${view.unknownValue ? ' is-unknown-value' : ''}${reading.constraining ? ' is-constraining' : ''}${cluster ? ' is-clustered' : ''}`}
       aria-labelledby={labelId}
     >
       <figcaption id={labelId} className="usage-gauge-label">
@@ -318,21 +378,6 @@ export function UsageGauge({
               />
             );
           })}
-          {primary &&
-            view.percent !== null &&
-            [0, 50, 100].map((tick) => {
-              const [x, y] = tick === 50 ? point(50, angle(tick)) : point(82, angle(tick));
-              return (
-                <text
-                  key={tick}
-                  className="usage-gauge-scale"
-                  x={x}
-                  y={tick === 50 ? y + 4 : y + 20}
-                >
-                  {tick}
-                </text>
-              );
-            })}
           <path
             className="usage-gauge-track"
             d={arc(82, 0, 100)}
@@ -365,21 +410,15 @@ export function UsageGauge({
         <p className="usage-gauge-value">
           {!view.known || remaining === null ? (
             <strong className="is-word">
-              {reading.state === 'unavailable' ? 'Unavailable' : 'Unknown'}
+              <Missing reading={reading} />
             </strong>
           ) : view.percent !== null ? (
             <strong>
               {percentText(view.percent)}
-              <span>%</span>
+              <span className="usage-gauge-unit">%</span>
             </strong>
           ) : (
-            <strong className="is-amount">
-              {remaining.value >= 10_000
-                ? compact.format(remaining.value)
-                : remaining.value > 0 && remaining.value < 0.001
-                  ? '<0.001'
-                  : exact.format(remaining.value)}
-            </strong>
+            <strong className="is-amount">{amountDigits(remaining.value)}</strong>
           )}
           <span className="usage-gauge-caption">
             {!view.known || remaining === null
@@ -398,13 +437,15 @@ export function UsageGauge({
             view.resetText
           )}
         </li>
-        <li>
-          {view.observedAt !== null && !Number.isNaN(view.observedAt) && reading.observedAt ? (
-            <time dateTime={reading.observedAt}>{view.observedText}</time>
-          ) : (
-            view.observedText
-          )}
-        </li>
+        {observed && (
+          <li>
+            {view.observedAt !== null && !Number.isNaN(view.observedAt) && reading.observedAt ? (
+              <time dateTime={reading.observedAt}>{view.observedText}</time>
+            ) : (
+              view.observedText
+            )}
+          </li>
+        )}
         {view.reserveText && <li className="usage-gauge-reserve-line">{view.reserveText}</li>}
         {unscaled && remaining && (
           <li>
@@ -414,11 +455,11 @@ export function UsageGauge({
           </li>
         )}
       </ul>
-      {details.length > 0 && (
+      {rows.length > 0 && (
         <details className="usage-gauge-details">
           <summary aria-describedby={labelId}>Details</summary>
           <dl>
-            {details.map(([term, value]) => (
+            {rows.map(([term, value]) => (
               <div key={term}>
                 <dt>{term}</dt>
                 <dd>{value}</dd>
@@ -431,10 +472,119 @@ export function UsageGauge({
   );
 }
 
+const flagText: Record<string, string> = {
+  constraining: 'Constraining',
+  exhausted: 'Exhausted',
+  low: 'At reserve',
+  stale: 'Stale',
+  'reset-pending': 'Reset pending',
+};
+
+// An auxiliary allowance on one line. It keeps its own value, reset and warning, so a low or
+// exhausted pool stands out even though it is drawn smaller than the dials.
+function UsageMeter({
+  reading,
+  nowMs,
+  observed,
+}: {
+  reading: UsageReading;
+  nowMs: number;
+  observed: boolean;
+}) {
+  const view = describe(reading, nowMs);
+  const { remaining } = view;
+  const resetsIn =
+    view.resetsAt !== null && !Number.isNaN(view.resetsAt) && view.resetsAt > nowMs
+      ? formatSpan(view.resetsAt - nowMs)
+      : null;
+  // The same facts as the dial chips, in the same order. One state never hides another.
+  const flags = [
+    reading.constraining ? 'constraining' : null,
+    view.exhausted ? 'exhausted' : null,
+    view.atReserve ? 'low' : null,
+    view.dated ? reading.state : null,
+  ].filter((flag) => flag !== null);
+  return (
+    <li
+      className={`usage-meter tone-${view.tone} state-${reading.state}${view.unknownValue ? ' is-unknown-value' : ''}${reading.constraining ? ' is-constraining' : ''}${view.known && view.percent === null ? ' is-unscaled' : ''}`}
+    >
+      <span className="usage-meter-label">{reading.label}</span>
+      <span className="usage-meter-bar" aria-hidden="true">
+        {view.percent !== null && view.percent > 0 && (
+          <span className="usage-meter-fill" style={{ width: `${view.percent}%` }} />
+        )}
+        {view.reservePercent !== null && (
+          <span className="usage-meter-reserve" style={{ left: `${view.reservePercent}%` }} />
+        )}
+      </span>
+      <span className="usage-meter-value">
+        {!view.known || remaining === null ? (
+          <Missing reading={reading} />
+        ) : view.percent !== null ? (
+          `${percentText(view.percent)}%`
+        ) : (
+          `${amountDigits(remaining.value)} ${remaining.unit}`
+        )}
+        {view.known && (
+          <span className="usage-sr-only">{view.dated ? ' left when observed' : ' remaining'}</span>
+        )}
+      </span>
+      <span className="usage-meter-reset">
+        {resetsIn ? (
+          <>
+            <span className="usage-sr-only">Resets in </span>
+            {reading.resetsAt ? <time dateTime={reading.resetsAt}>{resetsIn}</time> : resetsIn}
+          </>
+        ) : view.resetsAt === null ? (
+          <>
+            <span className="usage-sr-only">Reset time </span>Not reported
+          </>
+        ) : Number.isNaN(view.resetsAt) ? (
+          <>
+            <span className="usage-sr-only">Reset time </span>Unreadable
+          </>
+        ) : (
+          <>
+            Reset passed<span className="usage-sr-only">. Waiting for a new reading</span>
+          </>
+        )}
+      </span>
+      {flags.length > 0 && (
+        <span className="usage-meter-flags">
+          {flags.map((flag) => (
+            <span key={flag} className={`usage-meter-flag flag-${flag}`}>
+              {flagText[flag]}
+            </span>
+          ))}
+        </span>
+      )}
+      {observed && <span className="usage-meter-observed">{view.observedText}</span>}
+    </li>
+  );
+}
+
 function Card({ card, nowMs }: { card: UsageCard; nowMs: number }) {
   const titleId = `usage-card-${useId().replace(/[^a-zA-Z0-9]/g, '')}`;
   const auxiliary = card.auxiliary ?? [];
-  const empty = card.primary.length === 0 && auxiliary.length === 0;
+  const featured = card.featured ?? null;
+  const empty = card.primary.length === 0 && auxiliary.length === 0 && !featured;
+  // Two side dials and an optional center dial form the cluster. More primaries keep the grid.
+  const cluster = card.primary.length <= 2 && (card.primary.length > 0 || featured !== null);
+  const all = [...card.primary, ...(featured ? [featured] : []), ...auxiliary];
+  const views = all.map((reading) => ({ reading, view: describe(reading, nowMs) }));
+  // A card of meters alone still needs one place for the observed time and the details.
+  const withFooter = views.length > 0 && (cluster || card.primary.length === 0);
+  // One report usually stamps every window with the same time. Say it once in the footer and
+  // repeat it only on a reading that differs. Grouping by the timestamp and state keeps the
+  // choice steady as the display clock ticks.
+  const group = (reading: UsageReading) => `${reading.observedAt ?? 'never'}:${reading.state}`;
+  const counts = new Map<string, number>();
+  for (const { reading } of views)
+    counts.set(group(reading), (counts.get(group(reading)) ?? 0) + 1);
+  const common = withFooter ? ([...counts].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null) : null;
+  const shared = views.find(({ reading }) => group(reading) === common) ?? null;
+  const ownTime = (reading: UsageReading) => group(reading) !== common;
+  const [left, right] = card.primary;
   return (
     <article className="usage-gauges-card" aria-labelledby={titleId}>
       <header className="usage-gauges-card-header">
@@ -457,22 +607,85 @@ function Card({ card, nowMs }: { card: UsageCard; nowMs: number }) {
         </p>
       )}
       {empty && <p className="usage-gauges-empty">{card.emptyText ?? 'No allowance reported.'}</p>}
-      {card.primary.length > 0 && (
-        <div className="usage-gauges-primary" data-count={Math.min(card.primary.length, 3)}>
-          {card.primary.map((reading) => (
-            <UsageGauge key={reading.id} reading={reading} nowMs={nowMs} />
-          ))}
+      {cluster ? (
+        <div
+          className="usage-gauges-cluster"
+          data-count={card.primary.length}
+          data-featured={featured ? 'true' : undefined}
+        >
+          {left && <UsageGauge reading={left} nowMs={nowMs} cluster observed={ownTime(left)} />}
+          {featured && (
+            <UsageGauge
+              reading={featured}
+              nowMs={nowMs}
+              size="featured"
+              cluster
+              observed={ownTime(featured)}
+            />
+          )}
+          {right && <UsageGauge reading={right} nowMs={nowMs} cluster observed={ownTime(right)} />}
         </div>
+      ) : (
+        card.primary.length > 0 && (
+          <div className="usage-gauges-primary">
+            {[...card.primary, ...(featured ? [featured] : [])].map((reading) => (
+              <UsageGauge key={reading.id} reading={reading} nowMs={nowMs} />
+            ))}
+          </div>
+        )
       )}
       {auxiliary.length > 0 && (
         <section className="usage-gauges-auxiliary">
-          <h4>Additional allowances</h4>
-          <div>
+          <h4>More allowances</h4>
+          <ul>
             {auxiliary.map((reading) => (
-              <UsageGauge key={reading.id} reading={reading} nowMs={nowMs} size="auxiliary" />
+              <UsageMeter
+                key={reading.id}
+                reading={reading}
+                nowMs={nowMs}
+                observed={ownTime(reading)}
+              />
             ))}
-          </div>
+          </ul>
         </section>
+      )}
+      {withFooter && (
+        <footer className="usage-gauges-card-footer">
+          {shared && (
+            <span>
+              {shared.view.observedAt !== null &&
+              !Number.isNaN(shared.view.observedAt) &&
+              shared.reading.observedAt ? (
+                <time dateTime={shared.reading.observedAt}>{shared.view.observedText}</time>
+              ) : (
+                shared.view.observedText
+              )}
+            </span>
+          )}
+          <details className="usage-gauge-details usage-gauges-card-details">
+            <summary aria-describedby={titleId}>Details</summary>
+            {views.map(({ reading, view }) => {
+              const rows = details(reading, view);
+              return (
+                <section key={reading.id}>
+                  <h4>{reading.label}</h4>
+                  {rows.length > 0 ? (
+                    <dl>
+                      {rows.map(([term, value]) => (
+                        <div key={term}>
+                          <dt>{term}</dt>
+                          <dd>{value}</dd>
+                        </div>
+                      ))}
+                    </dl>
+                  ) : (
+                    <p>No further facts reported.</p>
+                  )}
+                </section>
+              );
+            })}
+          </details>
+        </footer>
       )}
       {Boolean(card.credits?.length) && (
         <section className="usage-gauges-ledger">

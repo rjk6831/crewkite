@@ -1,17 +1,19 @@
+/* Three provider cards fit side by side from about 930 px of grid width. Dials scale with
+   their card, so the cluster holds its shape from 300 px up. */
 .usage-gauges {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, 520px), 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
   align-items: start;
-  gap: 16px;
+  gap: 14px;
   color: var(--text);
   -webkit-font-smoothing: antialiased;
 }
 .usage-gauges-card {
   container: usage-card / inline-size;
   display: grid;
-  gap: 18px;
+  gap: 14px;
   min-width: 0;
-  padding: 18px 20px 20px;
+  padding: 14px 16px 12px;
   border: 1px solid var(--border);
   border-radius: 14px;
   background:
@@ -63,12 +65,12 @@
 .usage-gauges-notice {
   display: flex;
   align-items: flex-start;
-  gap: 8px;
-  padding: 8px 11px;
-  border-radius: 9px;
+  gap: 7px;
+  padding: 6px 9px;
+  border-radius: 8px;
   background: var(--surface-raised);
   color: var(--text-muted);
-  font-size: 12px;
+  font-size: 11px;
   line-height: 1.5;
   overflow-wrap: anywhere;
 }
@@ -84,11 +86,11 @@
   font-size: 12.5px;
   text-align: center;
 }
-/* Two primary allowances get equal dials; neither is averaged into the other. */
+/* Three or more primaries get equal dials in a grid; none is averaged into another. */
 .usage-gauges-primary {
   display: grid;
   align-items: start;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 110px), 1fr));
   justify-items: center;
   gap: 12px;
 }
@@ -106,12 +108,6 @@
   letter-spacing: 1.1px;
   text-transform: uppercase;
 }
-.usage-gauges-auxiliary > div {
-  display: grid;
-  align-items: start;
-  grid-template-columns: repeat(auto-fill, minmax(138px, 1fr));
-  gap: 10px;
-}
 .usage-gauge {
   --tone: var(--accent);
   display: grid;
@@ -126,17 +122,6 @@
   border: 1px solid transparent;
   border-radius: 14px;
   text-align: center;
-}
-.usage-gauge.is-auxiliary {
-  max-width: none;
-  gap: 6px;
-  padding: 10px 8px;
-  border-color: var(--border);
-  border-radius: 12px;
-  background: color-mix(in srgb, var(--background) 45%, var(--surface));
-}
-.usage-gauges-primary[data-count="1"] .usage-gauge {
-  max-width: 320px;
 }
 .usage-gauge.tone-low {
   --tone: var(--amber);
@@ -160,10 +145,6 @@
   line-height: 1.35;
   text-wrap: balance;
   overflow-wrap: anywhere;
-}
-.usage-gauge.is-auxiliary .usage-gauge-label {
-  font-size: 11.5px;
-  font-weight: 500;
 }
 .usage-gauges-chips {
   display: flex;
@@ -210,12 +191,6 @@
   max-width: 240px;
   aspect-ratio: 1;
 }
-.usage-gauges-primary[data-count="1"] .usage-gauge-face {
-  max-width: 264px;
-}
-.usage-gauge.is-auxiliary .usage-gauge-face {
-  max-width: 128px;
-}
 .usage-gauge-face > * {
   grid-area: 1 / 1;
 }
@@ -237,17 +212,6 @@
 .usage-gauge-tick.is-major {
   stroke: var(--text-dim);
   stroke-width: 2;
-}
-.usage-gauge.is-auxiliary .usage-gauge-tick {
-  stroke-width: 2.4;
-}
-.usage-gauge-scale {
-  fill: var(--text-dim);
-  font-family: Inter, sans-serif;
-  font-size: 10px;
-  font-weight: 500;
-  font-variant-numeric: tabular-nums;
-  text-anchor: middle;
 }
 .usage-gauge-track {
   fill: none;
@@ -276,10 +240,6 @@
   stroke: var(--tone);
   stroke-width: 11;
   transition: stroke-dasharray 160ms ease-out;
-}
-.usage-gauge.is-auxiliary .usage-gauge-track,
-.usage-gauge.is-auxiliary .usage-gauge-fill {
-  stroke-width: 15;
 }
 /* Amounts without a total have no scale. A hairline frame keeps the dial from reading as empty. */
 .usage-gauge.is-unscaled .usage-gauge-track {
@@ -325,7 +285,7 @@
   letter-spacing: -0.04em;
   font-variant-numeric: tabular-nums;
 }
-.usage-gauge-value strong span {
+.usage-gauge-unit {
   margin-left: 0.04em;
   color: var(--text-muted);
   font-size: 0.45em;
@@ -361,9 +321,6 @@
   line-height: 1.5;
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
-}
-.usage-gauge.is-auxiliary .usage-gauge-lines {
-  font-size: 10.5px;
 }
 .usage-gauge-lines time {
   text-decoration: none;
@@ -481,15 +438,301 @@
   height: 100%;
   background: var(--blue);
 }
-/* Auxiliary tiles are too narrow for two columns, so each term sits above its value. */
-.usage-gauge.is-auxiliary .usage-gauge-details dl > div {
+/* The instrument cluster: the host's primaries as side dials, and one smaller dial raised
+   between them. Each dial keeps its own value; nothing is averaged. */
+.usage-gauges-cluster {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  justify-items: center;
+  gap: 6px;
+}
+.usage-gauges-cluster[data-featured] {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 0.8fr) minmax(0, 1fr);
+}
+.usage-gauges-cluster[data-count="0"],
+.usage-gauges-cluster[data-count="1"]:not([data-featured]) {
   grid-template-columns: minmax(0, 1fr);
-  gap: 0;
+}
+.usage-gauges-cluster[data-count="1"][data-featured] {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 0.8fr);
+}
+.usage-gauges-cluster[data-featured] > .is-primary {
+  margin-top: 8cqi;
+}
+.usage-gauge.is-clustered {
+  gap: 4px;
+  max-width: 176px;
+  padding: 0;
+}
+.usage-gauge.is-clustered.is-constraining {
+  padding: 6px 4px;
+}
+@container usage-card (max-width: 340px) {
+  .usage-gauge.is-clustered .usage-gauges-chip svg {
+    display: none;
+  }
+  .usage-gauge.is-clustered.is-constraining {
+    padding: 6px 2px;
+  }
+}
+/* More than two primaries fall back to a grid of dials at the cluster's size. */
+.usage-gauges-primary .usage-gauge-face,
+.usage-gauge.is-clustered .usage-gauge-face {
+  max-width: min(168px, 34cqi);
+}
+.usage-gauge.is-clustered .usage-gauge-lines {
+  font-size: 11px;
+  text-wrap: balance;
+}
+.usage-gauge.is-featured .usage-gauge-face {
+  max-width: min(124px, 26cqi);
+}
+.usage-gauge.is-featured .usage-gauge-label {
+  font-size: 11.5px;
+  font-weight: 500;
+}
+.usage-gauge.is-featured .usage-gauge-tick {
+  stroke-width: 2.4;
+}
+/* The meters share one set of columns, so every bar starts and ends at the same place. */
+.usage-gauges-auxiliary > ul {
+  display: grid;
+  grid-template-columns: minmax(5.5em, 1.5fr) minmax(40px, 1fr) auto auto;
+  gap: 7px 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+/* An auxiliary allowance on one line: name, bar, value and time to reset. */
+.usage-meter {
+  --tone: var(--accent);
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  align-items: center;
+  row-gap: 3px;
+  font-size: 11.5px;
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+}
+.usage-meter.tone-low {
+  --tone: var(--amber);
+}
+.usage-meter.tone-exhausted {
+  --tone: var(--red);
+}
+.usage-meter.tone-dated {
+  --tone: var(--text-dim);
+}
+.usage-meter-label {
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+.usage-meter-bar {
+  position: relative;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--surface-hover);
+}
+.usage-meter.is-unknown-value .usage-meter-bar {
+  background: repeating-linear-gradient(-45deg, var(--text-dim) 0 1.5px, transparent 1.5px 5px);
+}
+.usage-meter.state-unavailable .usage-meter-bar {
+  outline: 1px dashed var(--border-strong);
+  outline-offset: -1px;
+  background: transparent;
+}
+.usage-meter-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: inherit;
+  background: var(--tone);
+}
+.usage-meter-reserve {
+  position: absolute;
+  top: -3px;
+  bottom: -3px;
+  width: 2px;
+  margin-left: -1px;
+  border-radius: 1px;
+  background: var(--amber);
+}
+.usage-meter-value {
+  color: var(--text);
+  font-weight: 600;
+  text-align: right;
+}
+.usage-meter.tone-dated .usage-meter-value,
+.usage-meter.is-unknown-value .usage-meter-value,
+.usage-meter.state-unavailable .usage-meter-value {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+.usage-meter-reset {
+  min-width: 52px;
+  color: var(--text-dim);
+  text-align: right;
+  text-wrap: balance;
+}
+.usage-meter-flags {
+  display: flex;
+  flex-wrap: wrap;
+  grid-column: 1 / -1;
+  gap: 4px;
+}
+/* Each flag keeps the color of what it means, the same as the dial chips. */
+.usage-meter-flag {
+  --flag: var(--text-muted);
+  padding: 0 6px;
+  border: 1px solid color-mix(in srgb, var(--flag) 45%, var(--border));
+  border-radius: 5px;
+  color: color-mix(in srgb, var(--flag) 70%, var(--text));
+  font-size: 10px;
+  font-weight: 500;
+}
+.usage-meter-flag.flag-low,
+.usage-meter-flag.flag-reset-pending {
+  --flag: var(--amber);
+}
+.usage-meter-flag.flag-exhausted {
+  --flag: var(--red);
+}
+.usage-meter-flag.flag-constraining {
+  border-color: color-mix(in srgb, var(--accent) 65%, var(--border));
+  color: var(--text);
+}
+.usage-meter-observed {
+  grid-column: 1 / -1;
+  color: var(--text-dim);
+  font-size: 10.5px;
+}
+/* A missing value explains itself on hover, keyboard focus and tap. */
+.usage-missing {
+  position: relative;
+  display: inline-flex;
+}
+.usage-missing-word {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-decoration: underline dotted;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+  cursor: help;
+}
+.usage-missing-tip {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  z-index: 2;
+  width: max-content;
+  max-width: 220px;
+  padding: 6px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: var(--surface-raised);
+  box-shadow: 0 8px 24px #0004;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.45;
+  letter-spacing: 0;
+  text-align: left;
+  white-space: normal;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateX(-50%);
+  transition: opacity 120ms ease-out;
+}
+.usage-meter .usage-missing-tip {
+  right: 0;
+  left: auto;
+  transform: none;
+}
+.usage-missing:hover .usage-missing-tip,
+.usage-missing-word:focus + .usage-missing-tip {
+  opacity: 1;
+  visibility: visible;
+}
+/* A bridge over the gap lets the pointer move onto the explanation without losing it. */
+.usage-missing-tip::after {
+  content: "";
+  position: absolute;
+  inset: 100% 0 auto;
+  height: 8px;
+}
+.usage-missing[data-dismissed] .usage-missing-tip {
+  opacity: 0;
+  visibility: hidden;
+}
+/* Side dials sit near the card edge, so their explanation opens toward the card center. */
+.usage-gauges-cluster > .usage-gauge:first-child:not(:last-child) .usage-missing-tip {
+  left: 0;
+  transform: none;
+}
+.usage-gauges-cluster > .usage-gauge:last-child:not(:first-child) .usage-missing-tip {
+  right: 0;
+  left: auto;
+  transform: none;
+}
+.usage-meter.is-unscaled .usage-meter-bar {
+  visibility: hidden;
+}
+.usage-gauges-card-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 12px;
+  padding-top: 9px;
+  border-top: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.usage-gauges-card-footer time {
+  text-decoration: none;
+}
+.usage-gauges-card-details {
+  width: auto;
+  margin-left: auto;
+}
+.usage-gauges-card-details[open] {
+  flex-basis: 100%;
+}
+.usage-gauges-card-details > summary {
+  display: flex;
+  width: fit-content;
+  margin-left: auto;
+}
+.usage-gauges-card-details section {
+  padding-top: 8px;
+}
+.usage-gauges-card-details h4 {
+  margin: 0 0 2px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.usage-gauges-card-details section > p {
+  margin: 0;
+  color: var(--text-dim);
+}
+.usage-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 @container usage-card (max-width: 420px) {
-  .usage-gauges-auxiliary > div {
-    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
-  }
   .usage-gauges-ledger dl > div {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -501,7 +744,8 @@
 /* The global reduced-motion rule uses a universal selector, so these class rules would still win. */
 @media (prefers-reduced-motion: reduce) {
   .usage-gauge-fill,
-  .usage-gauge-details summary::before {
+  .usage-gauge-details summary::before,
+  .usage-missing-tip {
     transition: none;
   }
 }
@@ -510,9 +754,6 @@
   .usage-gauge-bezel {
     fill: Canvas;
     stroke: CanvasText;
-  }
-  .usage-gauge-scale {
-    fill: CanvasText;
   }
   .usage-gauge-fill {
     stroke: Highlight;
@@ -538,7 +779,26 @@
     background: Canvas;
     outline: 1px solid CanvasText;
   }
-  .usage-gauges-meter-fill {
+  .usage-gauges-meter-fill,
+  .usage-meter-fill {
     background: Highlight;
+  }
+  .usage-meter-bar {
+    forced-color-adjust: none;
+    background: Canvas;
+    outline: 1px solid CanvasText;
+  }
+  .usage-meter-reserve {
+    forced-color-adjust: none;
+    background: CanvasText;
+  }
+  .usage-meter.is-unknown-value .usage-meter-bar {
+    background: repeating-linear-gradient(-45deg, CanvasText 0 2px, Canvas 2px 5px);
+  }
+  .usage-meter.state-unavailable .usage-meter-bar {
+    outline-color: CanvasText;
+  }
+  .usage-gauge:not(.is-constraining) {
+    border-color: Canvas;
   }
 }
