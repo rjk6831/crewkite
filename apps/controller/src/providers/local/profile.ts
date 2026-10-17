@@ -1,9 +1,12 @@
 import { createHash } from 'node:crypto';
 import {
   AttemptIdSchema,
+  CommandIdSchema,
   HashSchema,
+  LocalModelObservationSchema,
   LocalObservedModelBindingSchema,
   NativeTargetPathSchema,
+  RevisionSchema,
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
@@ -55,6 +58,51 @@ export const StartSchema = z.strictObject({
     .min(CLEANUP_MS + 1)
     .max(DEADLINE_MS),
 });
+export const DiscoveryBindingSchema = z.strictObject({
+  version: z.literal(1),
+  operationId: CommandIdSchema,
+  nonce: HashSchema,
+  connectionHash: HashSchema,
+  connectionRevision: RevisionSchema,
+});
+export const DiscoveryStartSchema = z.strictObject({
+  kind: z.literal('discovery'),
+  binding: DiscoveryBindingSchema,
+  endpoint: StartSchema.shape.endpoint,
+  token: StartSchema.shape.token,
+  timeoutMs: z
+    .number()
+    .int()
+    .min(CLEANUP_MS + 1)
+    .max(20000),
+});
+export const DiscoveryTerminalSchema = z.discriminatedUnion('kind', [
+  z.strictObject({
+    kind: z.literal('observed'),
+    binding: DiscoveryBindingSchema,
+    observation: LocalModelObservationSchema,
+  }),
+  z.strictObject({
+    kind: z.literal('unavailable'),
+    binding: DiscoveryBindingSchema,
+    reason: z.enum(['metadata', 'limit', 'deadline', 'stopped', 'transport', 'ownership']),
+  }),
+]);
+export type LocalDiscoveryStart = z.output<typeof DiscoveryStartSchema>;
+export type LocalDiscoveryTerminal = z.output<typeof DiscoveryTerminalSchema>;
+export function localDiscoveryPlan(value: unknown): LocalDiscoveryStart {
+  const plan = DiscoveryStartSchema.parse(value);
+  if (
+    plan.binding.connectionHash !==
+    hashCanonical({
+      connector: 'local-sdk-v1',
+      endpoint: plan.endpoint,
+      connectionRevision: plan.binding.connectionRevision,
+    })
+  )
+    throw new Error('The Local discovery connection identity does not match.');
+  return Object.freeze({ ...plan, binding: Object.freeze(plan.binding) });
+}
 export const ProposalSchema = z.strictObject({
   version: z.literal(1),
   attemptId: AttemptIdSchema,

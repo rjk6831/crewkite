@@ -7,8 +7,12 @@ import { groupAbsent, type Schedule } from '../../host/worker.ts';
 import {
   BindingSchema,
   CLEANUP_MS,
+  DiscoveryTerminalSchema,
+  type LocalDiscoveryStart,
+  type LocalDiscoveryTerminal,
   type LocalStart,
   type LocalTerminal,
+  localDiscoveryPlan,
   localPlan,
   MAX_STREAM_BYTES,
   TerminalSchema,
@@ -17,12 +21,22 @@ import {
 const messageSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('ready'), binding: BindingSchema }),
   z.strictObject({ type: z.literal('terminal'), terminal: TerminalSchema }),
+  z.strictObject({ type: z.literal('discovery'), terminal: DiscoveryTerminalSchema }),
 ]);
-export type LocalLifecycle = {
-  beforePhase: (phase: 'task') => void;
-  owned: (phase: 'task', group: number) => void;
-  quiescent: (phase: 'task', group: number) => void;
+export type LocalLifecycle<Phase extends 'task' | 'discovery' = 'task'> = {
+  beforePhase: (phase: Phase) => void;
+  owned: (phase: Phase, group: number) => void;
+  quiescent: (phase: Phase, group: number) => void;
 };
+type ClientOptions = {
+  now?: () => number;
+  schedule?: Schedule;
+  spawn?: typeof spawn;
+  groupAbsent?: typeof groupAbsent;
+  signal?: (group: number, signal: NodeJS.Signals) => void;
+};
+type TaskOptions = ClientOptions & { onSubmitted: () => undefined; lifecycle: LocalLifecycle };
+type DiscoveryOptions = ClientOptions & { lifecycle: LocalLifecycle<'discovery'> };
 function synchronous(work: () => unknown) {
   const marker = work();
   if (marker !== undefined) {
@@ -33,20 +47,54 @@ function synchronous(work: () => unknown) {
 const same = (left: unknown, right: unknown) => JSON.stringify(left) === JSON.stringify(right);
 
 /** This owner can close its SDK client. Only a bound runtime terminal releases generation ownership. */
-export function startLocalReplacement(
-  value: LocalStart,
+export function startLocalReplacement(value: LocalStart, directory: string, options: TaskOptions) {
+  const handle = startLocalClient({ kind: 'task', plan: localPlan(value), options }, directory);
+  return {
+    ...handle,
+    result: handle.result.then((result) => ({
+      ...result,
+      terminal: TerminalSchema.parse(result.terminal),
+    })),
+  };
+}
+export function startLocalDiscovery(
+  value: LocalDiscoveryStart,
   directory: string,
-  options: {
-    now?: () => number;
-    schedule?: Schedule;
-    spawn?: typeof spawn;
-    groupAbsent?: typeof groupAbsent;
-    onSubmitted: () => undefined;
-    lifecycle: LocalLifecycle;
-    signal?: (group: number, signal: NodeJS.Signals) => void;
-  },
+  options: DiscoveryOptions,
 ) {
-  const plan = localPlan(value);
+  const handle = startLocalClient(
+    { kind: 'discovery', plan: localDiscoveryPlan(value), options },
+    directory,
+  );
+  return {
+    ...handle,
+    result: handle.result.then((result) => ({
+      ...result,
+      terminal: DiscoveryTerminalSchema.parse(result.terminal),
+    })),
+  };
+}
+function startLocalClient(
+  operation:
+    | { kind: 'task'; plan: LocalStart; options: TaskOptions }
+    | { kind: 'discovery'; plan: LocalDiscoveryStart; options: DiscoveryOptions },
+  directory: string,
+) {
+  const { plan, options } = operation;
+  const lifecycle = {
+    before: () =>
+      operation.kind === 'task'
+        ? operation.options.lifecycle.beforePhase('task')
+        : operation.options.lifecycle.beforePhase('discovery'),
+    owned: (group: number) =>
+      operation.kind === 'task'
+        ? operation.options.lifecycle.owned('task', group)
+        : operation.options.lifecycle.owned('discovery', group),
+    quiescent: (group: number) =>
+      operation.kind === 'task'
+        ? operation.options.lifecycle.quiescent('task', group)
+        : operation.options.lifecycle.quiescent('discovery', group),
+  };
   const root = lstatSync(directory);
   if (
     process.platform === 'win32' ||
@@ -75,7 +123,7 @@ export function startLocalReplacement(
       return () => clearTimeout(timer);
     });
   if (remaining() <= CLEANUP_MS) throw new Error('The Local deadline expired.');
-  synchronous(() => options.lifecycle.beforePhase('task'));
+  synchronous(lifecycle.before);
   if (remaining() <= CLEANUP_MS) throw new Error('The Local deadline expired.');
   const child = (options.spawn ?? spawn)(
     process.execPath,
@@ -96,7 +144,8 @@ export function startLocalReplacement(
     owned = false,
     ownershipFailed = false,
     cleaning = false;
-  let terminal: LocalTerminal | null = null;
+  let terminal: LocalTerminal | LocalDiscoveryTerminal | null = null;
+  let stopReason: 'stopped' | 'ownership' | 'deadline' | null = null;
   let invalid = false,
     spawned = false,
     spawnFailed = false;
@@ -104,16 +153,18 @@ export function startLocalReplacement(
     bytes = 0,
     stderrBytes = 0;
   const timers: Array<() => void> = [];
-  let resolveResult!: (value: { terminal: LocalTerminal; clientQuiescent: boolean }) => void;
+  let resolveResult!: (value: {
+    terminal: LocalTerminal | LocalDiscoveryTerminal;
+    clientQuiescent: boolean;
+  }) => void;
   const result = new Promise<Parameters<typeof resolveResult>[0]>((resolve) => {
     resolveResult = resolve;
   });
   const absent = () => spawnFailed || (group > 0 && (options.groupAbsent ?? groupAbsent)(group));
-  const unknown = (): LocalTerminal => ({
-    kind: 'unknown',
-    binding: plan.binding,
-    reason: 'ownership',
-  });
+  const unknown = (): LocalTerminal | LocalDiscoveryTerminal =>
+    operation.kind === 'task'
+      ? { kind: 'unknown', binding: operation.plan.binding, reason: 'ownership' }
+      : { kind: 'unavailable', binding: operation.plan.binding, reason: 'ownership' };
   const settle = () => {
     if (settled) return;
     settled = true;
@@ -127,16 +178,22 @@ export function startLocalReplacement(
         (child.stdin.writableFinished || child.stdin.closed));
     if (clientQuiescent && owned) {
       try {
-        synchronous(() => options.lifecycle.quiescent('task', group));
+        synchronous(() => lifecycle.quiescent(group));
       } catch {
         ownershipFailed = true;
       }
     }
     if (!clientQuiescent || !owned || ownershipFailed || remaining() === 0) terminal = unknown();
-    const fallback: LocalTerminal =
-      !submitted && clientQuiescent
-        ? { kind: 'failed', binding: plan.binding, reason: 'ownership', proof: null }
-        : unknown();
+    const fallback: LocalTerminal | LocalDiscoveryTerminal =
+      operation.kind === 'discovery'
+        ? {
+            kind: 'unavailable',
+            binding: operation.plan.binding,
+            reason: stopReason ?? 'ownership',
+          }
+        : !submitted && clientQuiescent
+          ? { kind: 'failed', binding: operation.plan.binding, reason: 'ownership', proof: null }
+          : unknown();
     resolveResult({ terminal: terminal ?? fallback, clientQuiescent });
   };
   const signal = (name: NodeJS.Signals) => {
@@ -157,9 +214,11 @@ export function startLocalReplacement(
     timers.push(schedule(() => signal('SIGKILL'), Math.min(1000, remaining())));
     timers.push(schedule(settle, Math.min(CLEANUP_MS, remaining())));
   };
-  const stop = () => {
+  const stop = (reason: 'stopped' | 'ownership' | 'deadline' = 'stopped') => {
     if (settled || stopping) return;
     stopping = true;
+    stopReason = reason;
+    if (operation.kind === 'discovery') terminal = null;
     try {
       child.stdin.write(`${JSON.stringify('stop')}\n`);
     } catch {}
@@ -168,7 +227,7 @@ export function startLocalReplacement(
   const invalidate = () => {
     invalid = true;
     terminal = null;
-    stop();
+    stop('ownership');
   };
   child.once('spawn', () => {
     spawned = true;
@@ -188,7 +247,7 @@ export function startLocalReplacement(
   child.stdout.on('data', (chunk: Buffer) => {
     if (settled || invalid) return;
     bytes += chunk.length;
-    if (bytes > 262_144) return invalidate();
+    if (bytes > (operation.kind === 'discovery' ? 131_072 : 262_144)) return invalidate();
     pending = Buffer.concat([pending, chunk]);
     let end = pending.indexOf(10);
     while (end >= 0 && !invalid) {
@@ -200,6 +259,19 @@ export function startLocalReplacement(
         const message = messageSchema.parse(
           JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(line)),
         );
+        if (operation.kind === 'discovery') {
+          if (
+            message.type !== 'discovery' ||
+            stopping ||
+            !owned ||
+            !same(message.terminal.binding, operation.plan.binding)
+          )
+            throw new Error();
+          terminal = message.terminal;
+          cleanup();
+          continue;
+        }
+        if (message.type === 'discovery') throw new Error();
         if (message.type === 'ready') {
           if (
             !owned ||
@@ -212,7 +284,7 @@ export function startLocalReplacement(
           ready = true;
           // A journal callback must finish synchronously before generation permission is sent.
           try {
-            synchronous(options.onSubmitted);
+            synchronous(operation.options.onSubmitted);
           } catch {
             ownershipFailed = true;
             throw new Error();
@@ -234,9 +306,9 @@ export function startLocalReplacement(
             value.kind === 'completed' &&
             (value.proof.stopReason !== 'eosFound' ||
               value.proof.outputBytes > MAX_STREAM_BYTES ||
-              value.proposal.attemptId !== plan.binding.attemptId ||
-              value.proposal.path !== plan.binding.path ||
-              value.proposal.baseHash !== plan.binding.baseHash)
+              value.proposal.attemptId !== operation.plan.binding.attemptId ||
+              value.proposal.path !== operation.plan.binding.path ||
+              value.proposal.baseHash !== operation.plan.binding.baseHash)
           )
             throw new Error();
           if (value.kind === 'stopped' && (!stopping || value.proof.stopReason !== 'userStopped'))
@@ -266,7 +338,7 @@ export function startLocalReplacement(
     if (absent()) settle();
     else cleanup();
   });
-  timers.push(schedule(stop, Math.max(0, remaining() - CLEANUP_MS)));
+  timers.push(schedule(() => stop('deadline'), Math.max(0, remaining() - CLEANUP_MS)));
   timers.push(
     schedule(() => {
       cleanup();
@@ -275,7 +347,7 @@ export function startLocalReplacement(
   );
   try {
     if (group <= 0 || stopping || settled || closed || remaining() <= CLEANUP_MS) throw new Error();
-    synchronous(() => options.lifecycle.owned('task', group));
+    synchronous(() => lifecycle.owned(group));
     owned = true;
     if (stopping || invalid || settled || closed || remaining() <= CLEANUP_MS) throw new Error();
     child.stdin.write(`${JSON.stringify(plan)}\n`);
@@ -283,5 +355,5 @@ export function startLocalReplacement(
     ownershipFailed = true;
     invalidate();
   }
-  return { group, result, stop };
+  return { group, result, stop: () => stop() };
 }

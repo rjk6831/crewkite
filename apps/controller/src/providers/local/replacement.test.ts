@@ -8,9 +8,14 @@ import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { test } from 'node:test';
 import type { LLMPredictionOpts, PredictionResult } from '@lmstudio/sdk';
-import { resolveLocalConnection } from './connection.ts';
-import { type LocalStart, type LocalTerminal, localPlan } from './profile.ts';
-import { startLocalReplacement } from './replacement.ts';
+import { localConfiguredConnectionHash, resolveLocalConnection } from './connection.ts';
+import {
+  type LocalDiscoveryStart,
+  type LocalStart,
+  type LocalTerminal,
+  localPlan,
+} from './profile.ts';
+import { startLocalDiscovery, startLocalReplacement } from './replacement.ts';
 import {
   discoverLocalModels,
   type LoadedModel,
@@ -759,6 +764,159 @@ test('Local ownership needs the same prediction terminal after cancellation or c
         assert(!trace.includes('submitted'));
       if (boundary === 'complete')
         assert.deepEqual(trace, ['before', 'spawn', 'owned', 'submitted', 'quiescent']);
+    }
+    const discoveryPlan: LocalDiscoveryStart = {
+      kind: 'discovery',
+      endpoint: plan.endpoint,
+      token: plan.token,
+      timeoutMs: 20000,
+      binding: {
+        version: 1,
+        operationId: 'cmd_01J00000000000000000000001',
+        nonce: hash('discovery operation'),
+        connectionRevision: 3,
+        connectionHash: localConfiguredConnectionHash(plan.endpoint, 3),
+      },
+    };
+    const discovery = await discoverLocalModels(discoveryClient(fixture()), { now: () => 0 });
+    assert(discovery.kind === 'observed');
+    for (const boundary of [
+      'complete',
+      'before-failed',
+      'before-async',
+      'before-deadline',
+      'owned-failed',
+      'owned-async',
+      'owned-deadline',
+      'quiescent-failed',
+      'quiescent-async',
+      'missing-close',
+      'group-present',
+      'wrong-binding',
+      'task-ready',
+      'duplicate-terminal',
+      'payload-limit',
+      'stop',
+      'deadline',
+    ] as const) {
+      let clock = 0;
+      let absent = boundary !== 'group-present';
+      const trace: string[] = [];
+      const frames: string[] = [];
+      const timers: Array<() => void> = [];
+      const child = Object.assign(new EventEmitter(), {
+        pid: 12345,
+        stdin: new PassThrough(),
+        stdout: new PassThrough(),
+        stderr: new PassThrough(),
+      });
+      child.stdin.on('data', (bytes) => frames.push(bytes.toString()));
+      const launch = () =>
+        startLocalDiscovery(discoveryPlan, directory, {
+          now: () => clock,
+          schedule: (work) => {
+            timers.push(work);
+            return () => {};
+          },
+          signal: () => {},
+          groupAbsent: () => absent,
+          spawn: ((
+            _executable: string,
+            args: string[],
+            options: { env: Record<string, string> },
+          ) => {
+            trace.push('spawn');
+            assert(!JSON.stringify([args, options]).includes(plan.token));
+            return child;
+          }) as unknown as typeof spawn,
+          lifecycle: {
+            beforePhase: (phase) => {
+              assert.equal(phase, 'discovery');
+              trace.push('before');
+              if (boundary === 'before-failed') throw new Error();
+              if (boundary === 'before-async') return Promise.resolve();
+              if (boundary === 'before-deadline') clock = 15000;
+            },
+            owned: (phase, group) => {
+              assert.equal(phase, 'discovery');
+              assert.equal(group, 12345);
+              assert.equal(frames.length, 0);
+              trace.push('owned');
+              if (boundary === 'owned-failed') throw new Error();
+              if (boundary === 'owned-async') return Promise.resolve();
+              if (boundary === 'owned-deadline') clock = 15000;
+            },
+            quiescent: (phase, group) => {
+              assert.equal(phase, 'discovery');
+              assert.equal(group, 12345);
+              assert(child.stdout.readableEnded && child.stderr.readableEnded && absent);
+              trace.push('quiescent');
+              if (boundary === 'quiescent-failed') throw new Error();
+              if (boundary === 'quiescent-async') return Promise.resolve();
+            },
+          },
+        });
+      if (boundary.startsWith('before-')) {
+        assert.throws(launch);
+        assert.deepEqual(trace, ['before']);
+        assert.equal(frames.length, 0);
+        continue;
+      }
+      const run = launch();
+      const refused = boundary.startsWith('owned-');
+      if (refused) assert(!frames.join('').includes(plan.token));
+      else {
+        assert.equal(JSON.parse(frames[0]).kind, 'discovery');
+        assert(!frames[0].includes('attemptId'));
+        if (boundary === 'stop') run.stop();
+        if (boundary === 'deadline') clock = 20000;
+        const terminal = {
+          ...discovery,
+          binding:
+            boundary === 'wrong-binding'
+              ? { ...discoveryPlan.binding, nonce: hash('other operation') }
+              : discoveryPlan.binding,
+        };
+        const frame = `${JSON.stringify({ type: 'discovery', terminal })}\n`;
+        if (boundary === 'task-ready')
+          child.stdout.write(`${JSON.stringify({ type: 'ready', binding: plan.binding })}\n`);
+        else if (boundary === 'payload-limit') child.stdout.write(' '.repeat(131073));
+        else child.stdout.write(boundary === 'duplicate-terminal' ? frame + frame : frame);
+      }
+      for (const stream of [child.stdout, child.stderr]) {
+        const ended = once(stream, 'end');
+        stream.end();
+        stream.resume();
+        await ended;
+      }
+      const finished = child.stdin.writableFinished
+        ? Promise.resolve()
+        : once(child.stdin, 'finish');
+      child.stdin.end();
+      await finished;
+      if (boundary !== 'missing-close') child.emit('close', 0, null);
+      if (['missing-close', 'group-present'].includes(boundary))
+        for (const work of [...timers]) work();
+      const result = await run.result;
+      assert.equal(
+        result.terminal.kind,
+        boundary === 'complete' ? 'observed' : 'unavailable',
+        boundary,
+      );
+      assert.equal(
+        result.clientQuiescent,
+        !['missing-close', 'group-present'].includes(boundary),
+        boundary,
+      );
+      if (boundary === 'stop')
+        assert.equal(result.terminal.kind === 'unavailable' && result.terminal.reason, 'stopped');
+      assert(!frames.join('').split('\n').includes(JSON.stringify('submit')));
+      const savedTrace = [...trace];
+      absent = true;
+      child.emit('close');
+      assert.deepEqual(trace, savedTrace);
+      if (boundary === 'complete')
+        assert.deepEqual(trace, ['before', 'spawn', 'owned', 'quiescent']);
     }
   } finally {
     rmSync(directory, { recursive: true, force: true });
