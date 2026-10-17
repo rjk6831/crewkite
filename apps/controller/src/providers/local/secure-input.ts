@@ -14,7 +14,11 @@ import { Readable, type Writable } from 'node:stream';
 import { CommandIdSchema, HashSchema, RevisionSchema } from '@crewkite/contracts';
 import { z } from 'zod';
 import { groupAbsent, type Schedule } from '../../host/worker.ts';
-import { LocalEndpointSchema, localConnectionHash } from './connection.ts';
+import {
+  LocalEndpointSchema,
+  localConfiguredConnectionHash,
+  localConnectionHash,
+} from './connection.ts';
 
 const MAX_FRAME_BYTES = 32768;
 const PROMPT_MS = 60000;
@@ -26,21 +30,34 @@ const helperSchema = z.strictObject({
   target: z.literal('darwin-arm64'),
 });
 export type LocalInputHelper = z.output<typeof helperSchema>;
-export const LocalInputBindingSchema = z.strictObject({
-  version: z.literal(1),
+const operationBinding = {
   operationId: CommandIdSchema,
   nonce: HashSchema,
   connectionHash: HashSchema,
-  setupHash: HashSchema,
-  revision: RevisionSchema,
-});
+};
+export const LocalInputBindingSchema = z.discriminatedUnion('version', [
+  z.strictObject({
+    version: z.literal(1),
+    ...operationBinding,
+    setupHash: HashSchema,
+    revision: RevisionSchema,
+  }),
+  z.strictObject({
+    version: z.literal(2),
+    ...operationBinding,
+    connectionRevision: RevisionSchema,
+  }),
+]);
 export type LocalInputBinding = z.output<typeof LocalInputBindingSchema>;
 const promptSchema = z
   .strictObject({ binding: LocalInputBindingSchema, endpoint: LocalEndpointSchema })
-  .refine(
-    (value) =>
-      localConnectionHash(value.endpoint, value.binding.setupHash) === value.binding.connectionHash,
-  );
+  .refine(({ binding, endpoint }) => {
+    const expected =
+      binding.version === 1
+        ? localConnectionHash(endpoint, binding.setupHash)
+        : localConfiguredConnectionHash(endpoint, binding.connectionRevision);
+    return expected === binding.connectionHash;
+  });
 const resultSchema = z.discriminatedUnion('outcome', [
   z.strictObject({
     binding: LocalInputBindingSchema,
@@ -60,13 +77,21 @@ const resultSchema = z.discriminatedUnion('outcome', [
   z.strictObject({ binding: LocalInputBindingSchema, outcome: z.literal('cancelled') }),
   z.strictObject({ binding: LocalInputBindingSchema, outcome: z.literal('failed') }),
 ]);
-const sameBinding = (left: LocalInputBinding, right: LocalInputBinding) =>
-  left.version === right.version &&
-  left.operationId === right.operationId &&
-  left.nonce === right.nonce &&
-  left.connectionHash === right.connectionHash &&
-  left.setupHash === right.setupHash &&
-  left.revision === right.revision;
+const sameBinding = (left: LocalInputBinding, right: LocalInputBinding) => {
+  if (
+    left.operationId !== right.operationId ||
+    left.nonce !== right.nonce ||
+    left.connectionHash !== right.connectionHash
+  )
+    return false;
+  if (left.version === 1 && right.version === 1)
+    return left.setupHash === right.setupHash && left.revision === right.revision;
+  return (
+    left.version === 2 &&
+    right.version === 2 &&
+    left.connectionRevision === right.connectionRevision
+  );
+};
 
 class LocalSecretCandidate {
   #secret: Buffer | null;

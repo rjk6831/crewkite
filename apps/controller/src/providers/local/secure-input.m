@@ -108,13 +108,17 @@ int main(void) {
     id request = [NSJSONSerialization JSONObjectWithData:input options:0 error:NULL];
     if (!keysEqual(request, @[@"binding", @"endpoint", @"timeoutMs"])) return 1;
     NSDictionary *binding = request[@"binding"];
-    if (!keysEqual(binding, @[@"version", @"operationId", @"nonce", @"connectionHash", @"setupHash", @"revision"]) ||
-        !integerInRange(binding[@"version"], 1, 1) ||
-        !integerInRange(binding[@"revision"], 0, 9007199254740991.0) ||
+    BOOL legacy = keysEqual(binding, @[@"version", @"operationId", @"nonce", @"connectionHash", @"setupHash", @"revision"]) &&
+      integerInRange(binding[@"version"], 1, 1) &&
+      integerInRange(binding[@"revision"], 0, 9007199254740991.0) &&
+      matches(binding[@"setupHash"], @"^[a-f0-9]{64}$");
+    BOOL configured = keysEqual(binding, @[@"version", @"operationId", @"nonce", @"connectionHash", @"connectionRevision"]) &&
+      integerInRange(binding[@"version"], 2, 2) &&
+      integerInRange(binding[@"connectionRevision"], 0, 9007199254740991.0);
+    if ((!legacy && !configured) ||
         !matches(binding[@"operationId"], @"^cmd_[0-7][0-9A-HJKMNP-TV-Z]{25}$") ||
         !matches(binding[@"nonce"], @"^[a-f0-9]{64}$") ||
         !matches(binding[@"connectionHash"], @"^[a-f0-9]{64}$") ||
-        !matches(binding[@"setupHash"], @"^[a-f0-9]{64}$") ||
         !matches(request[@"endpoint"], @"^ws://127\\.0\\.0\\.1:([1-9][0-9]{0,4})$") ||
         !integerInRange(request[@"timeoutMs"], 1, 60000)) return 1;
     NSString *endpoint = request[@"endpoint"];
@@ -126,7 +130,7 @@ int main(void) {
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText = @"Connect Local";
     alert.informativeText = [NSString stringWithFormat:
-      @"Endpoint %@\nSetup %@\nThe connection secret stays in memory.", endpoint, binding[@"setupHash"]];
+      @"Endpoint %@\nThe connection secret stays in memory.", endpoint];
     [alert addButtonWithTitle:@"Connect"];
     [alert addButtonWithTitle:@"Cancel"];
     NSSecureTextField *field = [[NSSecureTextField alloc] initWithFrame:NSMakeRect(0, 0, 360, 24)];

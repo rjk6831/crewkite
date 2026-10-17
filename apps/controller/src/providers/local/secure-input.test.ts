@@ -23,6 +23,7 @@ import {
   resolveLocalConnection,
 } from './connection.ts';
 import {
+  LocalInputBindingSchema,
   type LocalInputChild,
   type LocalInputHelper,
   resolveLocalInputHelper,
@@ -39,6 +40,14 @@ const binding = {
   revision: 1,
 };
 const prompt = { binding, endpoint: 'ws://127.0.0.1:1234' };
+const configuredBinding = {
+  version: 2 as const,
+  operationId: binding.operationId,
+  nonce: binding.nonce,
+  connectionHash: localConfiguredConnectionHash(prompt.endpoint, 2),
+  connectionRevision: 2,
+};
+const configuredPrompt = { binding: configuredBinding, endpoint: prompt.endpoint };
 const descriptor: LocalInputHelper = {
   root: '/owned/runtime',
   sha256: digest('synthetic helper'),
@@ -355,6 +364,82 @@ test('Local secret input returns one current private result after helper cleanup
   if (ready.kind !== 'ready') throw Error('Expected a private candidate.');
   assert.equal(ready.candidate.take(binding), secret);
   assert.equal(ready.candidate.take(binding), null);
+
+  assert.deepEqual(LocalInputBindingSchema.parse(binding), binding);
+  assert.deepEqual(LocalInputBindingSchema.parse(configuredBinding), configuredBinding);
+  const configured = fixture();
+  const configuredOwner = startLocalSecretInput(configuredPrompt, descriptor, configured.options);
+  const privateRequest = JSON.parse(
+    Buffer.concat(configured.inputBytes).subarray(4).toString('utf8'),
+  );
+  assert.deepEqual(privateRequest, { ...configuredPrompt, timeoutMs: 60000 });
+  assert(!('setupHash' in privateRequest.binding));
+  assert(!JSON.stringify(privateRequest).includes(secret));
+  configured.output.write(frame({ binding: configuredBinding, outcome: 'submitted', secret }));
+  let configuredSettled = false;
+  void configuredOwner.result.then(() => {
+    configuredSettled = true;
+  });
+  await Promise.resolve();
+  assert.equal(configuredSettled, false);
+  configured.absent();
+  await configured.close();
+  const configuredReady = await configuredOwner.result;
+  assert.equal(configuredReady.kind, 'ready');
+  assert(!JSON.stringify(configuredReady).includes(secret));
+  assert(!inspect(configuredReady, { showHidden: true }).includes(secret));
+  if (configuredReady.kind !== 'ready') throw Error('Expected a private configured candidate.');
+  assert.equal(configuredReady.candidate.take(configuredBinding), secret);
+  assert.equal(configuredReady.candidate.take(configuredBinding), null);
+
+  for (const invalid of [
+    { ...configuredPrompt, endpoint: 'ws://127.0.0.1:1235' },
+    ...[
+      { version: 3 },
+      { connectionHash: binding.connectionHash },
+      { connectionRevision: 3 },
+      { connectionRevision: undefined },
+      { connectionRevision: -1 },
+      { setupHash: binding.setupHash },
+      { revision: binding.revision },
+      { model: 'synthetic-model' },
+    ].map((patch) => ({ ...configuredPrompt, binding: { ...configuredBinding, ...patch } })),
+  ]) {
+    const child = fixture();
+    assert.throws(() => startLocalSecretInput(invalid, descriptor, child.options));
+    assert.equal(child.launches.length, 0);
+  }
+  for (const returned of [
+    binding,
+    { ...configuredBinding, nonce: 'e'.repeat(64) },
+    { ...configuredBinding, operationId: 'cmd_01ARZ3NDEKTSV4RRFFQ69G5FAW' },
+    { ...configuredBinding, connectionRevision: 3 },
+    { ...configuredBinding, connectionHash: 'f'.repeat(64) },
+    { ...configuredBinding, setupHash: binding.setupHash },
+  ]) {
+    const child = fixture();
+    const current = startLocalSecretInput(configuredPrompt, descriptor, child.options);
+    child.output.write(frame({ binding: returned, outcome: 'submitted', secret }));
+    child.absent();
+    await child.close();
+    const refused = await current.result;
+    assert.equal(refused.kind, 'failed');
+    assert(!JSON.stringify(refused).includes(secret));
+  }
+  for (const expected of [
+    { ...configuredBinding, connectionRevision: 3 },
+    { ...binding, connectionHash: configuredBinding.connectionHash },
+  ]) {
+    const child = fixture();
+    const current = startLocalSecretInput(configuredPrompt, descriptor, child.options);
+    child.output.write(frame({ binding: configuredBinding, outcome: 'submitted', secret }));
+    child.absent();
+    await child.close();
+    const result = await current.result;
+    if (result.kind !== 'ready') throw Error('Expected a private configured candidate.');
+    assert.equal(result.candidate.take(expected), null);
+    assert.equal(result.candidate.take(configuredBinding), null);
+  }
 
   for (const boundary of ['late-frame', 'late-close-timer', 'late-close-delayed-timer'] as const) {
     const child = fixture();
