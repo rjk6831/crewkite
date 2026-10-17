@@ -318,6 +318,59 @@ Preparation starts no checks or native review. Verification preparation first in
 
 Task show reports the controller's evaluation stage, selected recipe and test files, exact file and hashes, saved reviewer and process-only independence, expiry, current start availability and remaining total attempts and minutes. The supplemental allowance permits one local check and one additional native review beneath those original run limits. Completed evidence remains visible after start permission expires. A failed or blocked check cannot authorize review. Task show also reports current local acceptance availability and its reason. Completed checks and review can make acceptance available. The destination still needs its own current grant or approval; inspection and export remain available.
 
+## Combined tasks
+
+Prepare a parent and two existing draft tasks from the same project. Save the complete `PrepareCombinedRun` payload in a bounded JSON file. The CLI validates the shared schema before connecting. It preserves the child revisions you supplied and uses the current parent revision. This example names two existing text targets and three committed check files:
+
+```json
+{
+  "taskId": "tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "policy": {
+    "authority": "balanced",
+    "quality": "quick",
+    "methods": [{ "id": "keep-it-simple", "cycles": 1, "reviewerRole": "reviewer" }],
+    "effects": [
+      { "taskId": "tsk_01ARZ3NDEKTSV4RRFFQ69G5FAW", "action": "write-scratch", "target": "demo-shop", "expiresAt": "2026-10-18T00:00:00.000Z", "revoked": false, "usesRemaining": 1 },
+      { "taskId": "tsk_01ARZ3NDEKTSV4RRFFQ69G5FAX", "action": "write-scratch", "target": "demo-shop", "expiresAt": "2026-10-18T00:00:00.000Z", "revoked": false, "usesRemaining": 1 }
+    ],
+    "limits": { "attempts": 7, "minutes": 20, "concurrency": 2 },
+    "reserves": [],
+    "unknownUsage": { "rule": "fixed-allowance", "allowance": { "launches": 2, "minutes": 20 } }
+  },
+  "children": [
+    { "taskId": "tsk_01ARZ3NDEKTSV4RRFFQ69G5FAW", "expectedRevision": 0, "scope": ["price.mjs"], "writer": { "profileId": "openai-file-v1", "creditPolicy": "ordinary" }, "consent": "explicit", "maximumMinutes": 2 },
+    { "taskId": "tsk_01ARZ3NDEKTSV4RRFFQ69G5FAX", "expectedRevision": 0, "scope": ["invoice.mjs"], "writer": { "profileId": "openai-file-v1", "creditPolicy": "ordinary" }, "consent": "explicit", "maximumMinutes": 2 }
+  ],
+  "checks": {
+    "recipeId": "project-node-tests-v1",
+    "testFiles": ["price.test.mjs", "invoice.test.mjs", "interaction.test.mjs"],
+    "replayTestFiles": [["price.test.mjs"], ["invoice.test.mjs"]],
+    "interactionTestFiles": ["interaction.test.mjs"],
+    "maximumMinutes": 1,
+    "baselineConsent": "explicit",
+    "replayConsents": ["explicit", "explicit"]
+  },
+  "reviewer": { "profileId": "openai-file-v1", "creditPolicy": "ordinary", "maximumMinutes": 2 }
+}
+```
+
+Replace the IDs, child revisions, project name, paths and grant expiry with current values. Both targets must be distinct existing committed text files outside the protected checks. The full test collection must contain both replay collections and the separate interaction tests. Paths are literal. The controller freezes the common source and validates every selected check. The CLI adds no grants or consent. Other finite writer selections retain their own billing attestations and observed configuration requirements; unavailable profiles remain unavailable.
+
+```sh
+pnpm crewkite combined prepare <parent-task-id> --plan combined-plan.json --json
+pnpm crewkite combined status <parent-task-id> --json
+pnpm crewkite task start <parent-task-id> --json
+```
+
+Preparation starts no work. Parent Start runs the baseline. After it passes, start each child with `task start <child-task-id>`. Status reads the current group from the snapshot: exact preparation, member runs and scopes, seven dispatch slots, candidate, shared remaining budget and controller action reasons. All work shares the parent allowance. Parent `task stop` stops the group; a child Stop does not complete it.
+
+```sh
+pnpm crewkite combined assemble <parent-task-id> --json
+pnpm crewkite combined status <parent-task-id> --json
+```
+
+Assembly binds the saved parent run and preparation. It takes no patches, candidate list, Git ref or command. The controller checks the serial replays before advancing its private integration ref. Final combined checks and independent review remain separate existing evaluation actions. Only the parent can be accepted after the complete barrier passes. Preserve uncertain prepare or assembly receipts and use `retry` with the original command. Reopening status starts nothing. These commands establish no connected provider or combined-work qualification.
+
 ## Local branch acceptance
 
 Inspect Changes and the retained evidence before requesting a branch:

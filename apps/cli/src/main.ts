@@ -31,6 +31,7 @@ import {
   MAX_FRAME_BYTES,
   NativeHandoffTargetsSchema,
   PolicySchema,
+  PrepareCombinedRunPayloadSchema,
   ProjectNodeTestFilesSchema,
   ProjectSchema,
   type Snapshot,
@@ -57,6 +58,8 @@ const help = `Usage: crewkite project add <path> [--json] [--home path]
        crewkite local cancel-input <operation-id> [--json] [--home path]
        crewkite local disconnect [--json] [--home path]
        crewkite local select-model <selection-id> --observation-hash hash [--json] [--home path]
+       crewkite combined prepare <parent-task-id> --plan file [--json] [--home path]
+       crewkite combined <status|assemble> <parent-task-id> [--json] [--home path]
        crewkite native profiles [--json] [--home path]
        crewkite native import-google --consent [--json] [--home path]
        crewkite native setup <show|initialize|authenticate|discover|stop> --family google [--consent] [--json] [--home path]
@@ -126,6 +129,7 @@ export async function runCli(
         outcome: { type: 'string' },
         criterion: { type: 'string', multiple: true },
         policy: { type: 'string' },
+        plan: { type: 'string' },
         grants: { type: 'string' },
         recipe: { type: 'string' },
         'test-file': { type: 'string', multiple: true },
@@ -160,11 +164,35 @@ export async function runCli(
             (['prepare-evaluation', 'prepare-repository', 'prepare-handoff'].includes(action) &&
               extra.length === 1))
         )) ||
-      !['project', 'task', 'conversation', 'local', 'native', 'usage', 'health', 'retry'].includes(
-        area,
-      )
+      ![
+        'project',
+        'task',
+        'conversation',
+        'combined',
+        'local',
+        'native',
+        'usage',
+        'health',
+        'retry',
+      ].includes(area)
     )
       throw new Error('Unknown command. Use --help.');
+    const combined = area === 'combined';
+    if (combined) {
+      if (!['prepare', 'status', 'assemble'].includes(action) || !id)
+        throw new Error('Use combined prepare, status or assemble with one parent task ID.');
+      const allowed = new Set(['json', 'home', ...(action === 'prepare' ? ['plan'] : [])]);
+      if (Object.keys(values).some((key) => !allowed.has(key)))
+        throw new Error('This option does not apply to the combined action. Use --help.');
+      if (action === 'prepare' && !values.plan)
+        throw new Error('Supply the explicit --plan JSON file.');
+    } else if (values.plan !== undefined) throw new Error('Plan input requires combined prepare.');
+    const combinedPlan =
+      combined && action === 'prepare'
+        ? PrepareCombinedRunPayloadSchema.parse(readJson(values.plan as string))
+        : undefined;
+    if (combinedPlan && combinedPlan.taskId !== id)
+      throw new Error('The plan must name the same parent task ID.');
     const local = area === 'local';
     if (local) {
       const takesId = action === 'cancel-input' || action === 'select-model';
@@ -710,6 +738,54 @@ export async function runCli(
       return succeeded(result) ? 0 : 2;
     }
     const snapshot = await client.snapshot();
+    if (combined) {
+      const task = requireTask(snapshot, id as string);
+      const group =
+        snapshot.combinedRuns.find(
+          (value) => value.taskId === task.id && value.runId === task.runId,
+        ) ?? null;
+      if (action === 'status') {
+        print(
+          { cursor: snapshot.cursor, combined: group },
+          group
+            ? [
+                `Combined run ${group.runId}, revision ${group.revision}, generation ${group.generation}`,
+                `Preparation ${group.preparationId}, manifest ${group.manifestHash}`,
+                `Phase ${group.phase}, blocker ${group.blocker ?? 'none'}`,
+                ...group.members.map(
+                  (member) =>
+                    `Child ${member.taskId}, run ${member.runId}, scope ${member.scope[0]}, start ${member.start.reason}`,
+                ),
+                ...group.dispatches.map(
+                  (dispatch) =>
+                    `${dispatch.phase}: ${dispatch.state}, ${dispatch.maximumMinutes} minutes, attempt ${dispatch.attemptId ?? 'none'}, check ${dispatch.checkArtifactId ?? 'none'}`,
+                ),
+                `Candidate ${group.candidate ? `${group.candidate.id} ${group.candidate.hash}` : 'none'}`,
+                `Remaining ${group.remainingBudgets.attempts} attempts, ${group.remainingBudgets.minutes} minutes, ${group.remainingBudgets.concurrency} slots`,
+                ...(['start', 'assemble', 'evaluate', 'review', 'accept'] as const).map(
+                  (name) => `${name}: ${group[name].reason}`,
+                ),
+              ].join('\n')
+            : 'No combined run is prepared for the current task.',
+        );
+        return 0;
+      }
+      if (combinedPlan)
+        return await finishAction(await request('PrepareCombinedRun', combinedPlan, task.revision));
+      if (!group?.assemble.available)
+        throw new Error(`Assembly unavailable: ${group?.assemble.reason ?? 'not-prepared'}.`);
+      return await finishAction(
+        await request(
+          'AssembleCombinedCandidate',
+          {
+            taskId: task.id,
+            runId: group.runId,
+            preparationId: group.preparationId,
+          },
+          task.revision,
+        ),
+      );
+    }
     if (area === 'usage') {
       print(
         { cursor: snapshot.cursor, usageReaders: snapshot.usageReaders, usage: snapshot.usage },

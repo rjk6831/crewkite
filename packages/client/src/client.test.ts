@@ -54,6 +54,7 @@ const snapshot: Snapshot = {
   googleAcpSetup: null,
   nativeRuns: [],
   candidateEvaluations: [],
+  combinedRuns: [],
 };
 
 function rawFrame(value: unknown): Uint8Array {
@@ -1001,6 +1002,231 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     available: true,
     reason: 'qualification-pending',
   };
+  const combinedId = (prefix: string, index = 0) =>
+    `${prefix}_${suffix.slice(0, -1)}${['V', 'W', 'X'][index]}`;
+  const combinedPlan = {
+    taskId: task.id,
+    policy: { ...policy, limits: { attempts: 7, minutes: 20, concurrency: 2 } },
+    children: [1, 2].map((index) => ({
+      taskId: combinedId('tsk', index),
+      expectedRevision: index + 6,
+      scope: [`slice-${index}.mjs`],
+      writer: { profileId: 'openai-file-v1', creditPolicy: 'ordinary' },
+      consent: 'explicit',
+      maximumMinutes: 2,
+    })),
+    checks: {
+      recipeId: 'project-node-tests-v1',
+      testFiles: ['one.test.mjs', 'two.test.mjs', 'interaction.test.mjs'],
+      replayTestFiles: [['one.test.mjs'], ['two.test.mjs']],
+      interactionTestFiles: ['interaction.test.mjs'],
+      maximumMinutes: 1,
+      baselineConsent: 'explicit',
+      replayConsents: ['explicit', 'explicit'],
+    },
+    reviewer: { profileId: 'openai-file-v1', creditPolicy: 'ordinary', maximumMinutes: 2 },
+  };
+  const available = { available: true, reason: 'available' as const };
+  const unavailable = { available: false, reason: 'checks-required' as const };
+  const combinedPreview: Snapshot['combinedRuns'][number] = {
+    taskId: task.id,
+    runId: run.id,
+    preparationId: artifact.id,
+    manifestHash: 'e'.repeat(64),
+    revision: 4,
+    generation: 0,
+    members: [1, 2].map((index) => ({
+      taskId: combinedId('tsk', index),
+      runId: combinedId('run', index),
+      scope: [`slice-${index}.mjs`],
+      start: unavailable,
+    })) as Snapshot['combinedRuns'][number]['members'],
+    phase: 'writers',
+    blocker: null,
+    dispatches: [
+      'baseline',
+      'writer-0',
+      'writer-1',
+      'replay-0',
+      'replay-1',
+      'final-check',
+      'review',
+    ].map((phase, index) => ({
+      phase,
+      maximumMinutes: 1,
+      state: index < 3 ? 'passed' : 'reserved',
+      attemptId: index < 3 ? combinedId('att', index) : null,
+      checkArtifactId: index === 0 ? artifact.id : null,
+    })) as Snapshot['combinedRuns'][number]['dispatches'],
+    candidate: null,
+    remainingBudgets: { attempts: 4, minutes: 17, concurrency: 2 },
+    start: unavailable,
+    assemble: available,
+    evaluate: unavailable,
+    review: unavailable,
+    accept: unavailable,
+  };
+  let combinedGroup: typeof combinedPreview | null = combinedPreview;
+  let combinedRevision = task.revision;
+  let combinedOutcome: 'applied' | 'blocked' | 'outcome-unknown' = 'applied';
+  const combinedCommands: Command[] = [];
+  const combinedFixture = await serve((message, socket) => {
+    if (message.type === 'hello')
+      socket.write(encodeFrame({ type: 'welcome', protocol: 1, cursor: snapshot.cursor }));
+    if (message.type !== 'command') return;
+    combinedCommands.push(message.command);
+    const refs = [0, 1, 2];
+    const result =
+      message.command.command === 'GetSnapshot'
+        ? {
+            outcome: 'applied' as const,
+            data: {
+              kind: 'snapshot' as const,
+              snapshot: {
+                ...snapshot,
+                tasks: refs.map((index) => ({
+                  ...task,
+                  id: combinedId('tsk', index),
+                  revision:
+                    index === 0
+                      ? combinedRevision
+                      : combinedPlan.children[index - 1].expectedRevision,
+                  runId: combinedId('run', index),
+                })),
+                runs: refs.map((index) => ({
+                  ...run,
+                  id: combinedId('run', index),
+                  taskId: combinedId('tsk', index),
+                })),
+                attempts: refs.map((index) => ({
+                  id: combinedId('att', index),
+                  runId: combinedId('run', index),
+                  routeId: run.roles[0].routeId,
+                  generation: 0,
+                  state: 'stopped' as const,
+                  revision: 1,
+                })),
+                artifacts: [artifact],
+                combinedRuns: combinedGroup ? [combinedGroup] : [],
+              },
+            },
+          }
+        : { outcome: combinedOutcome, reason: 'combined-result' };
+    socket.write(encodeFrame({ type: 'result', key: message.command.key, result }));
+  });
+  context.after(() => combinedFixture.close());
+  const combinedPlanFile = join(combinedFixture.home, 'combined-plan.json');
+  const executeCombined = async (args: string[], json = true) => {
+    combinedCommands.length = 0;
+    let output = '',
+      errors = '';
+    const code = await runCli(
+      [...args, ...(json ? ['--json'] : []), '--home', combinedFixture.home],
+      {
+        out: (text) => {
+          output += text;
+        },
+        err: (text) => {
+          errors += text;
+        },
+      },
+    );
+    return { code, output, errors };
+  };
+  for (const row of [
+    { action: 'prepare', command: 'PrepareCombinedRun', payload: combinedPlan },
+    {
+      action: 'assemble',
+      command: 'AssembleCombinedCandidate',
+      payload: { taskId: task.id, runId: run.id, preparationId: artifact.id },
+    },
+  ]) {
+    writeFileSync(combinedPlanFile, JSON.stringify(combinedPlan));
+    combinedOutcome = 'outcome-unknown';
+    const result = await executeCombined([
+      'combined',
+      row.action,
+      task.id,
+      ...(row.action === 'prepare' ? ['--plan', combinedPlanFile] : []),
+    ]);
+    assert.equal(result.code, 2, result.errors);
+    const saved = JSON.parse(result.output);
+    assert.deepEqual(
+      combinedCommands.map((command) => command.command),
+      ['GetSnapshot', row.command],
+    );
+    assert.equal(saved.command.expectedRevision, combinedRevision);
+    assert.deepEqual(saved.command.payload, row.payload);
+    const receiptFile = join(combinedFixture.home, `${row.action}-receipt.json`);
+    writeFileSync(receiptFile, result.output);
+    combinedRevision++;
+    combinedOutcome = 'applied';
+    const retry = await executeCombined(['retry', receiptFile]);
+    assert.equal(retry.code, 0, retry.errors);
+    assert.deepEqual(combinedCommands, [saved.command]);
+    assert.deepEqual(JSON.parse(retry.output).command, saved.command);
+  }
+  const combinedStatus = await executeCombined(['combined', 'status', task.id]);
+  assert.equal(combinedStatus.code, 0, combinedStatus.errors);
+  assert.deepEqual(JSON.parse(combinedStatus.output), {
+    cursor: snapshot.cursor,
+    combined: combinedPreview,
+  });
+  assert.deepEqual(
+    combinedCommands.map((command) => command.command),
+    ['GetSnapshot'],
+  );
+  const plainCombined = await executeCombined(['combined', 'status', task.id], false);
+  for (const fact of ['writers', 'slice-1.mjs', '4 attempts', 'assemble: available'])
+    assert(plainCombined.output.includes(fact), fact);
+  for (const invalid of [
+    { ...combinedPlan, taskId: combinedId('tsk', 1) },
+    { ...combinedPlan, children: combinedPlan.children.slice(0, 1) },
+    { ...combinedPlan, children: [combinedPlan.children[0], combinedPlan.children[0]] },
+    {
+      ...combinedPlan,
+      policy: { ...combinedPlan.policy, limits: { attempts: 6, minutes: 20, concurrency: 2 } },
+    },
+    {
+      ...combinedPlan,
+      children: combinedPlan.children.map((child) => ({
+        ...child,
+        writer: { ...child.writer, executable: '/caller/process' },
+      })),
+    },
+    { ...combinedPlan, checks: { ...combinedPlan.checks, baselineConsent: 'saved' } },
+    { ...combinedPlan, patches: ['caller patch'] },
+  ]) {
+    writeFileSync(combinedPlanFile, JSON.stringify(invalid));
+    assert.equal(
+      (await executeCombined(['combined', 'prepare', task.id, '--plan', combinedPlanFile])).code,
+      1,
+    );
+    assert.deepEqual(combinedCommands, []);
+  }
+  for (const args of [
+    ['combined', 'prepare', task.id],
+    ['combined', 'status', task.id, '--plan', combinedPlanFile],
+    ['combined', 'assemble', task.id, '--consent'],
+    ['combined', 'status', task.id, 'extra'],
+    ['combined', 'unknown', task.id],
+    ['task', 'show', task.id, '--plan', combinedPlanFile],
+  ]) {
+    assert.equal((await executeCombined(args)).code, 1, args.join(' '));
+    assert.deepEqual(combinedCommands, []);
+  }
+  combinedGroup = { ...combinedPreview, assemble: unavailable };
+  assert.equal((await executeCombined(['combined', 'assemble', task.id])).code, 1);
+  assert.deepEqual(
+    combinedCommands.map((command) => command.command),
+    ['GetSnapshot'],
+  );
+  combinedGroup = null;
+  assert.equal(
+    JSON.parse((await executeCombined(['combined', 'status', task.id])).output).combined,
+    null,
+  );
+
   const localChoice = {
     selectionId: '4'.repeat(64),
     identity: {
