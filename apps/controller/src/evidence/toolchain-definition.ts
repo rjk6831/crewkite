@@ -77,6 +77,7 @@ export const ToolchainDefinitionSchema = z.strictObject({
   platform: z.literal('darwin'),
   arch: z.literal('arm64'),
   executables: z.strictObject({ node: executable, git: executable, electron: executable }),
+  mkfifo: z.strictObject({ path: z.string().min(1).max(4096), sha256: HashSchema }),
   entrypoints: z.strictObject({
     biome: NativeTargetPathSchema,
     types: NativeTargetPathSchema,
@@ -325,6 +326,10 @@ export async function prepareToolchain(input: {
         version: electronVersion,
         sha256: await executableHash(join(root, electron), input.budget),
       },
+    },
+    mkfifo: {
+      path: await realpath('/usr/bin/mkfifo'),
+      sha256: await executableHash('/usr/bin/mkfifo', input.budget),
     },
     entrypoints: {
       biome,

@@ -45,7 +45,7 @@ export type CheckRoot = {
 function integer(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 0;
 }
-function owner(value: unknown): CheckOwner {
+export function parseCheckOwner(value: unknown): CheckOwner {
   if (!value || typeof value !== 'object' || Array.isArray(value))
     throw Error('Check ownership context is invalid.');
   const v = value as CheckOwner;
@@ -76,7 +76,7 @@ export function checkOwner(): CheckOwner | undefined {
   const text = process.env[variable];
   if (text === undefined) return;
   if (Buffer.byteLength(text) > 4096) throw Error('Check ownership context exceeds its bound.');
-  const context = owner(JSON.parse(text));
+  const context = parseCheckOwner(JSON.parse(text));
   const directory = lstatSync(context.directory);
   const stateRoot = lstatSync(context.stateRoot);
   if (
@@ -106,7 +106,7 @@ export function enrollCheckRoot(
   acknowledge: (child: ChildProcess) => void;
   failed: () => void;
 } {
-  const context = explicit ? owner(explicit) : checkOwner();
+  const context = explicit ? parseCheckOwner(explicit) : checkOwner();
   if (!context) return { environment: {}, acknowledge: () => {}, failed: () => {} };
   const id = randomUUID();
   const path = join(context.directory, `${id}.jsonl`);
@@ -197,77 +197,101 @@ export const spawnCheckChild = ((...args: Parameters<typeof spawn>) => {
   return child;
 }) as typeof spawn;
 
-export function readCheckRoots(context: CheckOwner): CheckRoot[] {
-  owner(context);
+export function inspectCheckRoots(context: CheckOwner): {
+  roots: CheckRoot[];
+  unknown: boolean;
+  unresolved: string[];
+} {
+  parseCheckOwner(context);
   const names = readdirSync(context.directory).sort();
   if (names.length > 4096) throw Error('Check ownership journal exceeds its bound.');
-  return names.map((name) => {
-    if (!/^[a-f0-9-]{36}\.jsonl$/.test(name)) throw Error('Unexpected check ownership entry.');
-    const path = join(context.directory, name);
-    const state = lstatSync(path);
-    if (!state.isFile() || state.isSymbolicLink() || state.nlink !== 1 || state.size > 16384)
-      throw Error('Invalid check ownership record.');
-    const text = readFileSync(path, 'utf8');
-    if (!text.endsWith('\n')) throw Error('Truncated check ownership record.');
-    const rows = text
-      .trimEnd()
-      .split('\n')
-      .map((row) => JSON.parse(row));
-    const first = rows[0] as Intent;
-    if (
-      first.type !== 'intent' ||
-      Object.keys(first).sort().join(',') !== 'detached,owner,role,type' ||
-      typeof first.detached !== 'boolean' ||
-      !['stage', 'fixture', 'worker', 'check', 'controller', 'electron', 'watcher'].includes(
-        first.role,
-      )
+  const roots: CheckRoot[] = [];
+  const unresolved: string[] = [];
+  for (const name of names) {
+    try {
+      roots.push(readRoot(context, name));
+    } catch {
+      unresolved.push(name);
+    }
+  }
+  return { roots, unknown: unresolved.length > 0, unresolved };
+}
+
+export function readCheckRoots(context: CheckOwner): CheckRoot[] {
+  const result = inspectCheckRoots(context);
+  if (result.unknown) throw Error('Invalid check ownership record.');
+  return result.roots;
+}
+
+function readRoot(context: CheckOwner, name: string): CheckRoot {
+  if (!/^[a-f0-9-]{36}\.jsonl$/.test(name)) throw Error('Unexpected check ownership entry.');
+  const path = join(context.directory, name);
+  const state = lstatSync(path);
+  if (!state.isFile() || state.isSymbolicLink() || state.nlink !== 1 || state.size > 16384)
+    throw Error('Invalid check ownership record.');
+  const text = readFileSync(path, 'utf8');
+  if (!text.endsWith('\n')) throw Error('Truncated check ownership record.');
+  const rows = text
+    .trimEnd()
+    .split('\n')
+    .map((row) => JSON.parse(row));
+  const first = rows[0] as Intent;
+  if (
+    first.type !== 'intent' ||
+    Object.keys(first).sort().join(',') !== 'detached,owner,role,type' ||
+    typeof first.detached !== 'boolean' ||
+    !['stage', 'fixture', 'worker', 'check', 'controller', 'electron', 'watcher'].includes(
+      first.role,
     )
-      throw Error('Invalid check ownership intent.');
-    const binding = owner(first.owner);
+  )
+    throw Error('Invalid check ownership intent.');
+  const binding = parseCheckOwner(first.owner);
+  if (
+    binding.attemptId !== context.attemptId ||
+    binding.generation !== context.generation ||
+    binding.directory !== context.directory ||
+    binding.stateRoot !== context.stateRoot ||
+    binding.electronExecutable !== context.electronExecutable
+  )
+    throw Error('Check ownership binding changed.');
+  const result: CheckRoot = { id: name, intent: first, spawnFailed: false };
+  if (rows[1]?.type === 'spawn-error') {
     if (
-      binding.attemptId !== context.attemptId ||
-      binding.generation !== context.generation ||
-      binding.directory !== context.directory ||
-      binding.stateRoot !== context.stateRoot ||
-      binding.electronExecutable !== context.electronExecutable
+      Object.keys(rows[1]).sort().join(',') !== 'noChild,type' ||
+      typeof rows[1].noChild !== 'boolean' ||
+      rows.length !== (rows[1].noChild ? 2 : 3)
     )
-      throw Error('Check ownership binding changed.');
-    const result: CheckRoot = { id: name, intent: first, spawnFailed: false };
-    if (rows[1]?.type === 'spawn-error') {
-      if (
-        Object.keys(rows[1]).sort().join(',') !== 'noChild,type' ||
-        typeof rows[1].noChild !== 'boolean' ||
-        rows.length !== (rows[1].noChild ? 2 : 3)
-      )
-        throw Error('Incomplete failed check launch.');
-      result.spawnFailed = true;
-    }
-    if (rows.length > 3) throw Error('Duplicate check ownership record.');
-    if (rows.length >= 2 && !result.spawnFailed) {
-      const ack = rows[1] as Acknowledgment;
-      if (
-        ack.type !== 'ack' ||
-        Object.keys(ack).sort().join(',') !== 'group,pid,type' ||
-        !integer(ack.pid) ||
-        ack.pid === 0 ||
-        !integer(ack.group) ||
-        ack.group === 0 ||
-        ack.group !== (first.detached ? ack.pid : binding.parentGroup)
-      )
-        throw Error('Invalid check process acknowledgment.');
-      result.acknowledgment = ack;
-    }
-    if (rows.length === 3) {
-      const terminal = rows[2] as Terminal;
-      if (
-        terminal.type !== 'close' ||
-        Object.keys(terminal).sort().join(',') !== 'code,signal,type' ||
-        !(terminal.code === null || integer(terminal.code)) ||
-        !(terminal.signal === null || /^SIG[A-Z0-9]+$/.test(terminal.signal))
-      )
-        throw Error('Invalid check process terminal record.');
-      result.terminal = terminal;
-    }
-    return result;
-  });
+      throw Error('Incomplete failed check launch.');
+    result.spawnFailed = true;
+  }
+  if (rows.length > 3) throw Error('Duplicate check ownership record.');
+  if (rows.length >= 2 && !result.spawnFailed) {
+    const ack = rows[1] as Acknowledgment;
+    if (
+      ack.type !== 'ack' ||
+      Object.keys(ack).sort().join(',') !== 'group,pid,type' ||
+      !integer(ack.pid) ||
+      ack.pid === 0 ||
+      !integer(ack.group) ||
+      ack.group === 0 ||
+      ack.group !== (first.detached ? ack.pid : binding.parentGroup)
+    )
+      throw Error('Invalid check process acknowledgment.');
+    result.acknowledgment = ack;
+  }
+  if (rows.length === 3) {
+    const terminal = rows[2] as Terminal;
+    if (
+      terminal.type !== 'close' ||
+      Object.keys(terminal).sort().join(',') !== 'code,signal,type' ||
+      !(
+        terminal.code === null ||
+        (Number.isSafeInteger(terminal.code) && (terminal.code >= 0 || result.spawnFailed))
+      ) ||
+      !(terminal.signal === null || /^SIG[A-Z0-9]+$/.test(terminal.signal))
+    )
+      throw Error('Invalid check process terminal record.');
+    result.terminal = terminal;
+  }
+  return result;
 }

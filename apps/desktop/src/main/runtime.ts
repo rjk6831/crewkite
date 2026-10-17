@@ -17,6 +17,7 @@ import { RuntimeManifestSchema } from '@crewkite/contracts';
 import { prepareStateDirectory } from '../../../../scripts/demo-state.ts';
 import {
   checkEnvironment,
+  checkOwner,
   spawnCheckChild as spawn,
 } from '../../../controller/src/host/check-ownership.ts';
 
@@ -85,6 +86,8 @@ export function resolveRuntime(appPath: string): RuntimePaths {
     if (lstatSync(internal).isSymbolicLink())
       throw new Error('The source internal directory cannot be a symlink.');
     stateRoots = [realpathSync(internal)];
+    const check = checkOwner();
+    if (check) stateRoots.push(check.stateRoot);
     if (existsSync(join(internal, 'tools')))
       stateRoots.push(dirname(realpathSync(join(internal, 'tools'))));
     if (

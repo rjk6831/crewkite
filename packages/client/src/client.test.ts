@@ -14,6 +14,7 @@ import {
   type Snapshot,
   type TransportMessage,
 } from '@crewkite/contracts';
+import { checkOwner } from '../../../apps/controller/src/host/check-ownership.ts';
 import { encodeFrame, FrameDecoder, ProtocolError } from './index.ts';
 import { connectController } from './node.ts';
 
@@ -64,11 +65,14 @@ async function serve(
   const common = execFileSync('git', ['rev-parse', '--git-common-dir'], {
     encoding: 'utf8',
   }).trim();
-  const directory = resolve(common, '..', 'internal');
+  const owner = checkOwner();
+  const directory = owner?.stateRoot ?? resolve(common, '..', 'internal');
   mkdirSync(directory, { recursive: true });
   const home = mkdtempSync(join(directory, 'client-'));
   writeFileSync(join(home, 'token'), token, { mode: 0o600 });
   const socketPath = join(home, 'control.sock');
+  if (owner && Buffer.byteLength(socketPath) > 100)
+    throw Error('The verification client socket path exceeds its bound.');
   const sockets = new Set<Socket>();
   let connection = 0;
   const server = createServer((socket) => {
