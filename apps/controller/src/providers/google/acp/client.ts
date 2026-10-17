@@ -301,6 +301,8 @@ export function startAcpProcess<T>(
   let reason: AcpReason | null = null,
     stopping = false,
     finished = false,
+    completed = false,
+    cleanupTerminated = false,
     stderrBytes = 0;
   let stopper: (() => void) | undefined;
   let code: number | null = null,
@@ -313,6 +315,7 @@ export function startAcpProcess<T>(
     if (group > 0 && !groupAbsent(group)) {
       try {
         process.kill(-group, value);
+        if (completed && reason === null && value === 'SIGTERM') cleanupTerminated = true;
       } catch {}
     }
   }
@@ -387,6 +390,7 @@ export function startAcpProcess<T>(
         }),
         failed.promise,
       ]);
+      completed = true;
     } catch (error) {
       reason ??= error instanceof AcpError ? error.reason : 'protocol';
     }
@@ -407,7 +411,11 @@ export function startAcpProcess<T>(
       finished = true;
       for (const cancel of timers) cancel();
       if (!closedInTime) kill('SIGKILL');
-      if (quiescent && reason === null && (code !== 0 || signal !== null)) reason = 'protocol';
+      // A completed response survives the SIGTERM sent for owned cleanup.
+      const expectedExit =
+        (code === 0 && signal === null) ||
+        (completed && cleanupTerminated && code === null && signal === 'SIGTERM');
+      if (quiescent && reason === null && !expectedExit) reason = 'protocol';
       if (reason === null && now() - started >= options.timeoutMs) reason = 'deadline';
       return {
         metadata,
