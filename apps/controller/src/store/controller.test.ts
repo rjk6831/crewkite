@@ -1915,6 +1915,7 @@ async function acceptsNativeCandidate(t: TestContext) {
           methodId: 'keep-it-simple',
           cycles: 1,
         },
+        creditPolicy: 'existing-credits',
         consent: 'explicit',
         grants: [
           { action: 'run-check', target: 'node --test' },
@@ -1966,6 +1967,9 @@ async function acceptsNativeCandidate(t: TestContext) {
   const reviewPhases = controller.store.nativeProcesses(job.attemptId);
   const reviewRoute = checked.routes.find((route) => route.id === job.routeId);
   assert(reviewRoute);
+  // A reviewer-family mutation must leave the frozen writer routes intact.
+  assert.notEqual(reviewRoute.id, run.roles[0].routeId);
+  assert.notEqual(reviewRoute.id, successor.route_id);
   const quiescentAt = reviewPhases[2]?.quiescent_at;
   assert(quiescentAt);
   const check = checked.evidence.find((value) => !value.review);
