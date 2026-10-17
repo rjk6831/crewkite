@@ -40,6 +40,31 @@ Task show and watch snapshots include the current task's pending approvals and n
 
 Watch retains its cursor while the controller is offline. If the bounded reconnect window ends, it prints the next action and exits with status 1. Start the controller and run watch again to reconnect explicitly.
 
+## Task conversations
+
+A discussion starts from a goal. It needs no manually written acceptance criteria. Choose a primary planning role, the supported profile and finite task limits before consenting to a counted planning turn:
+
+```sh
+pnpm crewkite conversation create <project-id> --text "Repair the checkout total" --role lead --profile openai-file-v1 --credit-policy ordinary --attempts 8 --minutes 20 --concurrency 2 --consent --json
+pnpm crewkite conversation show <task-id> --json
+pnpm crewkite conversation send <task-id> --text "Explain the failure before proposing edits" --json
+```
+
+`lead` and `orchestrator` are distinct primary roles. The profile is currently limited to `openai-file-v1`; role availability still comes from controller admission. Limits require 1 to 100 attempts, 1 to 1440 minutes and 1 to 16 concurrent attempts. They cover planning and later execution together. Every selection is explicit, including `ordinary` or `existing-credits`. Creation can launch planning under that consent. Viewing history, reconnecting and reopening start no work. An unavailable role or profile remains unavailable.
+
+| Command | Behavior |
+|---------|----------|
+| `conversation show <task-id> [--before-cursor cursor]` | Read authoritative state and one bounded history page |
+| `conversation send <task-id> --text text` | Send a message under the saved planning consent, or queue it at the next safe boundary |
+| `conversation answer <task-id> --question-id message-id --text text` | Answer one exact pending question |
+| `conversation guide <task-id> --text text` | Queue guidance without changing the task contract or authority |
+| `conversation adopt <task-id> --proposal-id message-id --proposal-hash hash` | Adopt the exact retained proposal after controller revalidation |
+| `conversation configure <task-id> --role role --profile openai-file-v1 --credit-policy policy --attempts N --minutes N --concurrency N --consent` | Explicitly amend the finite primary selection and task limits |
+
+Show returns `{ state, conversation }`. The state reports the primary selection, requested and effective model and effort, shared budget, queued input count, pending question IDs, proposal hash and current send/adopt availability. State and history are separate bounded controller reads. History entries retain their IDs, lineage and delivery records. `nextBeforeCursor` identifies the older page; pass it as `--before-cursor`. Text is limited to 4096 encoded bytes. Plain output escapes terminal controls; JSON preserves the typed values.
+
+Mutations use the current task revision and the normal action receipt. Keep an uncertain receipt and use `retry` to resend its exact command. `task stop <task-id>` uses the existing Stop action. Chat text cannot approve a tool action, grant an effect, raise a limit or accept a candidate. Proposal adoption changes the task contract and starts no execution. Execution still needs its own explicit preparation and Start.
+
 ## Google quota
 
 ```sh
@@ -286,4 +311,4 @@ pnpm crewkite retry receipt.json --json
 
 Retry validates the bounded receipt file and resends its command unchanged. It never builds a new approval or refreshes an old grant. For an applied export receipt, `retry receipt.json --output new.patch` saves the same verified artifact without creating another export command. A failed local save still prints the original action receipt. Both interfaces use the controller's policy and permission rules.
 
-Exit status is 0 for an applied action or a successful read, 2 for a controller refusal or uncertain result, and 1 for local input or connection errors. Provider output is JSON-escaped in watch mode. Plain watch output contains event identities and revisions.
+Exit status is 0 for an applied action or a successful read, 2 for a controller refusal or uncertain result, and 1 for local input or connection errors. JSON preserves typed provider output. Plain output escapes terminal controls. Plain watch output contains event identities and revisions.

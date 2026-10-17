@@ -23,6 +23,8 @@ import {
   type Command,
   type CommandResult,
   CommandSchema,
+  type ConversationEntry,
+  ConversationPlanningSelectionSchema,
   canonicalJson,
   MAX_FRAME_BYTES,
   NativeHandoffTargetsSchema,
@@ -31,6 +33,7 @@ import {
   ProjectSchema,
   type Snapshot,
   type Task,
+  type TaskConversationState,
   TaskSchema,
 } from '@crewkite/contracts';
 
@@ -41,6 +44,11 @@ const help = `Usage: crewkite project add <path> [--json] [--home path]
        crewkite task create <project-id> --title text --outcome text --criterion text [--criterion text ...] [--json] [--home path]
        crewkite task <list|show|watch|start|stop|resume|switch|approve|deny> [id] [--json] [--home path]
        crewkite task switch <task-id> <route-id> [--json] [--home path]
+       crewkite conversation <create|configure> <id> --role lead|orchestrator --profile openai-file-v1 --credit-policy ordinary|existing-credits --attempts N --minutes N --concurrency N --consent [--text goal]
+       crewkite conversation show <task-id> [--before-cursor cursor] [--json] [--home path]
+       crewkite conversation <send|guide> <task-id> --text text [--json] [--home path]
+       crewkite conversation answer <task-id> --question-id message-id --text text [--json] [--home path]
+       crewkite conversation adopt <task-id> --proposal-id message-id --proposal-hash hash [--json] [--home path]
        crewkite native profiles [--json] [--home path]
        crewkite native import-google --consent [--json] [--home path]
        crewkite native setup <show|initialize|authenticate|discover|stop> --family google [--consent] [--json] [--home path]
@@ -59,7 +67,8 @@ const help = `Usage: crewkite project add <path> [--json] [--home path]
        crewkite retry <receipt-file> [--output new-file] [--json] [--home path]
 
 Approval commands take an approval ID. Task creation takes a project ID. Other task commands take a task ID.
-Project registration and task creation start no work. Native preparation uses explicit consent or the controller's exact saved consent.
+Conversation creation takes a project ID and a goal, and can start a counted planning turn under its explicit finite consent. Other conversation commands take a task ID.
+Project registration and task create start no work. Native preparation uses explicit consent or the controller's exact saved consent.
 For an Anthropic or Google writer, --confirm-subscription-only confirms subscription login and disabled paid extra usage.
 File handoff targets are optional and permit only later explicit manual transfers within the original budget.
 Handoff preparation requires fresh consent; it starts no writer. Start is a separate command.
@@ -94,6 +103,17 @@ export async function runCli(
         json: { type: 'boolean' },
         home: { type: 'string' },
         help: { type: 'boolean', short: 'h' },
+        text: { type: 'string' },
+        role: { type: 'string' },
+        profile: { type: 'string' },
+        'credit-policy': { type: 'string' },
+        attempts: { type: 'string' },
+        minutes: { type: 'string' },
+        concurrency: { type: 'string' },
+        'before-cursor': { type: 'string' },
+        'question-id': { type: 'string' },
+        'proposal-id': { type: 'string' },
+        'proposal-hash': { type: 'string' },
         title: { type: 'string' },
         outcome: { type: 'string' },
         criterion: { type: 'string', multiple: true },
@@ -130,9 +150,72 @@ export async function runCli(
             (['prepare-evaluation', 'prepare-repository', 'prepare-handoff'].includes(action) &&
               extra.length === 1))
         )) ||
-      !['project', 'task', 'native', 'usage', 'health', 'retry'].includes(area)
+      !['project', 'task', 'conversation', 'native', 'usage', 'health', 'retry'].includes(area)
     )
       throw new Error('Unknown command. Use --help.');
+    const conversation = area === 'conversation';
+    const planning = conversation && ['create', 'configure'].includes(action);
+    const conversationOptions = [
+      'text',
+      'role',
+      'profile',
+      'credit-policy',
+      'attempts',
+      'minutes',
+      'concurrency',
+      'before-cursor',
+      'question-id',
+      'proposal-id',
+      'proposal-hash',
+    ];
+    if (conversation) {
+      if (
+        !['create', 'show', 'send', 'answer', 'guide', 'adopt', 'configure'].includes(action) ||
+        !id
+      )
+        throw new Error(
+          'Use conversation create, show, send, answer, guide, adopt or configure with one ID.',
+        );
+      const allowed = new Set([
+        'json',
+        'home',
+        ...(planning
+          ? ['role', 'profile', 'credit-policy', 'attempts', 'minutes', 'concurrency', 'consent']
+          : []),
+        ...(['create', 'send', 'answer', 'guide'].includes(action) ? ['text'] : []),
+        ...(action === 'show' ? ['before-cursor'] : []),
+        ...(action === 'answer' ? ['question-id'] : []),
+        ...(action === 'adopt' ? ['proposal-id', 'proposal-hash'] : []),
+      ]);
+      if (Object.keys(values).some((key) => !allowed.has(key)))
+        throw new Error('This option does not apply to the conversation action. Use --help.');
+      if (['create', 'send', 'answer', 'guide'].includes(action) && !values.text?.trim())
+        throw new Error('Supply nonblank --text.');
+      if (action === 'answer' && !values['question-id'])
+        throw new Error('Answer requires --question-id.');
+      if (action === 'adopt' && (!values['proposal-id'] || !values['proposal-hash']))
+        throw new Error('Adopt requires the exact --proposal-id and --proposal-hash.');
+      if (planning && !values.consent) throw new Error('Planning requires explicit --consent.');
+    } else if (conversationOptions.some((key) => values[key as keyof typeof values] !== undefined))
+      throw new Error('Conversation options require a conversation action.');
+    const planningSelection = planning
+      ? ConversationPlanningSelectionSchema.parse({
+          role: values.role,
+          profileId: values.profile,
+          creditPolicy: values['credit-policy'],
+          limits: Object.fromEntries(
+            ['attempts', 'minutes', 'concurrency'].map((key) => {
+              const value = values[key as 'attempts' | 'minutes' | 'concurrency'];
+              if (!value || !/^[1-9][0-9]*$/.test(value))
+                throw new Error(
+                  'Supply finite positive integer --attempts, --minutes and --concurrency.',
+                );
+              return [key, Number(value)];
+            }),
+          ),
+          consent: 'explicit',
+        })
+      : undefined;
     const supported = [
       'create',
       'list',
@@ -223,6 +306,7 @@ export async function runCli(
       !refreshingUsage &&
       !settingUpGoogle &&
       !importingGoogle &&
+      !planning &&
       (values.family !== undefined ||
         values.consent !== undefined ||
         values['no-consent'] !== undefined)
@@ -338,28 +422,36 @@ export async function runCli(
     }
     const actor = { id: 'terminal', kind: 'cli' as const };
     const creation =
-      addingProject || creatingTask
+      addingProject || creatingTask || (conversation && action === 'create')
         ? CommandSchema.safeParse({
             protocol: 1,
             key: createCommandKey(),
             actor,
             expectedRevision: 0,
-            command: addingProject ? 'RegisterProject' : 'CreateTask',
+            command: addingProject
+              ? 'RegisterProject'
+              : creatingTask
+                ? 'CreateTask'
+                : 'CreateTaskDiscussion',
             payload: addingProject
               ? { path: resolve(id) }
-              : {
-                  projectId: id,
-                  title: values.title,
-                  outcome: values.outcome,
-                  criteria: values.criterion,
-                },
+              : conversation
+                ? { projectId: id, text: values.text, planning: planningSelection }
+                : {
+                    projectId: id,
+                    title: values.title,
+                    outcome: values.outcome,
+                    criteria: values.criterion,
+                  },
           })
         : undefined;
     if (creation && !creation.success)
       throw new Error(
         addingProject
           ? 'Repository paths must contain 1 to 4096 characters.'
-          : 'Use a project ID, a title up to 200 characters, an outcome up to 4096 characters and 1 to 100 criteria up to 4096 characters each.',
+          : conversation
+            ? 'Use a project ID, a goal up to 4096 encoded bytes and the explicit planning selection.'
+            : 'Use a project ID, a title up to 200 characters, an outcome up to 4096 characters and 1 to 100 criteria up to 4096 characters each.',
       );
     const connected = await connectController({ ...readControllerEndpoint(home), actor });
     client = connected;
@@ -380,7 +472,7 @@ export async function runCli(
       return connected.command(sent);
     };
     const print = (data: unknown, text: string) =>
-      output.out(values.json ? `${JSON.stringify(data)}\n` : `${text}\n`);
+      output.out(values.json ? `${JSON.stringify(data)}\n` : `${terminalText(text)}\n`);
     const receipt = (
       result: CommandResult,
       command = sent,
@@ -390,7 +482,8 @@ export async function runCli(
       const created =
         succeeded(result) && command?.command === 'RegisterProject'
           ? ProjectSchema.safeParse(result.entity)
-          : succeeded(result) && command?.command === 'CreateTask'
+          : succeeded(result) &&
+              (command?.command === 'CreateTask' || command?.command === 'CreateTaskDiscussion')
             ? TaskSchema.safeParse(result.entity)
             : undefined;
       print(
@@ -687,6 +780,57 @@ export async function runCli(
     }
     if (!id) throw new Error('A task ID is required.');
     const task = requireTask(snapshot, id);
+    if (conversation) {
+      if (action === 'show') {
+        const status = await request('GetTaskConversationState', { taskId: task.id });
+        if (!succeeded(status) || status.data?.kind !== 'conversation-state') {
+          receipt(status);
+          return 2;
+        }
+        const history = await request('GetTaskConversation', {
+          taskId: task.id,
+          ...(values['before-cursor'] !== undefined
+            ? { beforeCursor: values['before-cursor'] }
+            : {}),
+        });
+        if (!succeeded(history) || history.data?.kind !== 'conversation') {
+          receipt(history);
+          return 2;
+        }
+        if (status.data.state.taskId !== task.id || history.data.taskId !== task.id)
+          throw new Error('The conversation response belongs to a different task.');
+        print(
+          { state: status.data.state, conversation: history.data },
+          [
+            conversationStateText(status.data.state),
+            ...history.data.entries.map(conversationEntryText),
+            `Older page before ${history.data.nextBeforeCursor ?? 'none'}`,
+          ].join('\n'),
+        );
+        return 0;
+      }
+      const names = {
+        configure: 'ConfigureTaskConversation',
+        send: 'SendTaskMessage',
+        answer: 'AnswerTaskQuestion',
+        guide: 'QueueTaskGuidance',
+        adopt: 'AdoptTaskPlan',
+      } as const;
+      const result = await request(
+        names[action as keyof typeof names],
+        {
+          taskId: task.id,
+          ...(planningSelection ? { planning: planningSelection } : {}),
+          ...(values.text !== undefined ? { text: values.text } : {}),
+          ...(action === 'answer' ? { questionId: values['question-id'] } : {}),
+          ...(action === 'adopt'
+            ? { proposalId: values['proposal-id'], proposalHash: values['proposal-hash'] }
+            : {}),
+        },
+        task.revision,
+      );
+      return await finishAction(result);
+    }
     if (action === 'prepare-evaluation') {
       const profile = snapshot.nativeProfiles.find((profile) => profile.id === extra[0]);
       if (profile && profile.id !== 'openai-file-v1')
@@ -1219,11 +1363,42 @@ export async function runCli(
     receipt(result);
     return succeeded(result) ? 0 : 2;
   } catch (error) {
-    output.err(`${error instanceof Error ? error.message : 'CLI command failed.'}\n`);
+    output.err(`${terminalText(error instanceof Error ? error.message : 'CLI command failed.')}\n`);
     return 1;
   } finally {
     client?.close();
   }
+}
+
+function conversationStateText(state: TaskConversationState) {
+  const configuration = state.configuration;
+  return [
+    `${state.taskId} ${state.phase}, revision ${state.revision}, contract ${state.contractStatus}`,
+    configuration
+      ? `Primary ${configuration.selection.role}, ${configuration.selection.profileId}, ${configuration.routeId ?? 'route unknown'}, credits ${configuration.selection.creditPolicy}\nRequested model ${configuration.requestedModel ?? 'unknown'}, effective model ${configuration.effectiveModel ?? 'unknown'}\nRequested effort ${configuration.requestedEffort ?? 'unknown'}, effective effort ${configuration.effectiveEffort ?? 'unknown'}`
+      : 'Primary not configured',
+    state.budget
+      ? `Task limits ${JSON.stringify(state.budget.limits)}\nRemaining ${JSON.stringify(state.budget.remaining)}`
+      : 'Task budget not configured',
+    `Send ${state.send.available ? state.send.disposition : 'unavailable'}: ${state.send.reason}`,
+    `Adopt ${state.adopt.available ? 'available' : 'unavailable'}: ${state.adopt.reason}`,
+    `Current run ${state.currentRunId ?? 'none'}`,
+    ...(state.activeAttempt
+      ? [
+          `Active attempt ${state.activeAttempt.id}, generation ${state.activeAttempt.generation}, ${state.activeAttempt.state}`,
+        ]
+      : []),
+    `Queued inputs ${state.queuedInputCount}`,
+    ...state.pendingQuestions.map((question) => `Pending question ${question.id}`),
+    ...(state.proposal ? [`Proposal ${state.proposal.id}, hash ${state.proposal.hash}`] : []),
+    ...(state.adoptedProposal
+      ? [`Adopted proposal ${state.adoptedProposal.id}, hash ${state.adoptedProposal.hash}`]
+      : []),
+  ].join('\n');
+}
+
+function conversationEntryText(entry: ConversationEntry) {
+  return `${entry.cursor} ${entry.id} ${entry.kind} ${entry.author.kind === 'agent' ? `${entry.author.role} ${entry.author.routeId}` : entry.author.kind}\n${entry.text}${'replyTo' in entry ? `\nReply to ${entry.replyTo}` : ''}${entry.kind === 'plan-proposal' ? `\n${JSON.stringify(entry.proposal, null, 2)}` : ''}`;
 }
 
 function approvalText(approvals: Snapshot['approvals']) {

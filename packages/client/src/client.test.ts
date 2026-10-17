@@ -10,9 +10,11 @@ import { fileURLToPath } from 'node:url';
 import {
   type Command,
   CommandSchema,
+  type ConversationEntry,
   type Event,
   MAX_FRAME_BYTES,
   type Snapshot,
+  type TaskConversationState,
   type TransportMessage,
 } from '@crewkite/contracts';
 import { checkOwner } from '../../../apps/controller/src/host/check-ownership.ts';
@@ -648,6 +650,310 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       invalid: true,
     },
   ];
+
+  const planningSelection = {
+    role: 'lead' as const,
+    profileId: 'openai-file-v1' as const,
+    creditPolicy: 'ordinary' as const,
+    limits: { attempts: 8, minutes: 20, concurrency: 2 },
+    consent: 'explicit' as const,
+  };
+  const conversationState: TaskConversationState = {
+    taskId: task.id,
+    revision: task.revision,
+    contractStatus: 'provisional',
+    purpose: 'conversation',
+    phase: 'planned',
+    configuration: {
+      revision: 1,
+      selection: planningSelection,
+      routeId: run.roles[0].routeId,
+      requestedModel: 'requested-model',
+      effectiveModel: null,
+      requestedEffort: 'low',
+      effectiveEffort: null,
+    },
+    currentRunId: run.id,
+    activeAttempt: null,
+    budget: {
+      limits: planningSelection.limits,
+      remaining: { attempts: 6, minutes: 18, concurrency: 2 },
+    },
+    queuedInputCount: 1,
+    pendingQuestions: [{ id: `msg_${suffix}`, cursor: '7' }],
+    proposal: {
+      id: 'msg_01ARZ3NDEKTSV4RRFFQ69G5FAW',
+      hash: 'c'.repeat(64),
+      runId: run.id,
+      revision: 2,
+    },
+    adoptedProposal: null,
+    send: { available: true, reason: 'available', disposition: 'turn' },
+    adopt: { available: true, reason: 'available' },
+  };
+  const conversationEntry: ConversationEntry = {
+    id: `msg_${suffix}`,
+    taskId: task.id,
+    revision: 1,
+    cursor: '7',
+    at: '2026-10-17T10:00:00.000Z',
+    text: 'Inspect \u001b[31mthe total\roverwrite',
+    kind: 'user-message',
+    author: { kind: 'user' },
+  };
+  const planningArgs = [
+    '--role',
+    'lead',
+    '--profile',
+    'openai-file-v1',
+    '--credit-policy',
+    'ordinary',
+    '--attempts',
+    '8',
+    '--minutes',
+    '20',
+    '--concurrency',
+    '2',
+    '--consent',
+  ];
+  const conversationRows = [
+    {
+      args: ['create', task.projectId, '--text', 'Repair the total', ...planningArgs],
+      command: 'CreateTaskDiscussion',
+      payload: { projectId: task.projectId, text: 'Repair the total', planning: planningSelection },
+    },
+    {
+      args: [
+        'configure',
+        task.id,
+        ...planningArgs.map((value) =>
+          value === 'lead' ? 'orchestrator' : value === 'ordinary' ? 'existing-credits' : value,
+        ),
+      ],
+      command: 'ConfigureTaskConversation',
+      payload: {
+        taskId: task.id,
+        planning: { ...planningSelection, role: 'orchestrator', creditPolicy: 'existing-credits' },
+      },
+    },
+    {
+      args: ['send', task.id, '--text', 'Keep this exact message'],
+      command: 'SendTaskMessage',
+      payload: { taskId: task.id, text: 'Keep this exact message' },
+    },
+    {
+      args: ['guide', task.id, '--text', 'Keep the scope bounded'],
+      command: 'QueueTaskGuidance',
+      payload: { taskId: task.id, text: 'Keep the scope bounded' },
+    },
+    {
+      args: [
+        'answer',
+        task.id,
+        '--question-id',
+        conversationEntry.id,
+        '--text',
+        'The total includes tax',
+      ],
+      command: 'AnswerTaskQuestion',
+      payload: {
+        taskId: task.id,
+        questionId: conversationEntry.id,
+        text: 'The total includes tax',
+      },
+    },
+    {
+      args: [
+        'adopt',
+        task.id,
+        '--proposal-id',
+        conversationState.proposal?.id as string,
+        '--proposal-hash',
+        'c'.repeat(64),
+      ],
+      command: 'AdoptTaskPlan',
+      payload: {
+        taskId: task.id,
+        proposalId: conversationState.proposal?.id,
+        proposalHash: 'c'.repeat(64),
+      },
+    },
+    {
+      args: ['show', task.id, '--before-cursor', '9'],
+      command: 'GetTaskConversation',
+      payload: { taskId: task.id, beforeCursor: '9' },
+    },
+    ...[
+      [
+        'create',
+        task.projectId,
+        '--text',
+        'Goal',
+        ...planningArgs.filter((value) => value !== '--consent'),
+      ],
+      [
+        'create',
+        task.projectId,
+        '--text',
+        'Goal',
+        ...planningArgs.map((value) => (value === 'lead' ? 'coder' : value)),
+      ],
+      [
+        'configure',
+        task.id,
+        ...planningArgs.map((value) => (value === 'openai-file-v1' ? '/tmp/client' : value)),
+      ],
+      ['configure', task.id, ...planningArgs.map((value) => (value === '8' ? '1e2' : value))],
+      ['configure', task.id, ...planningArgs.map((value) => (value === '20' ? '1441' : value))],
+      ['configure', task.id, ...planningArgs, '--text', 'No scope amendment'],
+      ['send', task.id, '--text', ' '],
+      ['send', task.id, '--text', 'é'.repeat(2049)],
+      ['send', task.id, '--text', 'No grants', '--grants', 'grant.json'],
+      ['send', task.id, '--text', 'No authority', '--consent'],
+      ['answer', task.id, '--text', 'Missing question'],
+      ['answer', task.id, '--question-id', 'not-an-id', '--text', 'Bad question'],
+      ['adopt', task.id, '--proposal-id', conversationEntry.id],
+      ['adopt', task.id, '--proposal-id', conversationEntry.id, '--proposal-hash', 'bad-hash'],
+      ['show', task.id, '--before-cursor', '-1'],
+      ['show', task.id, '--policy', 'policy.json'],
+      ['show', task.id, 'extra'],
+      ['unknown', task.id],
+    ].map((args) => ({ args, command: null, payload: null })),
+  ];
+  const conversationCommands: Command[] = [];
+  let conversationOutcome: 'applied' | 'outcome-unknown' | 'blocked' = 'applied';
+  const conversationFixture = await serve((message, socket) => {
+    if (message.type === 'hello')
+      socket.write(encodeFrame({ type: 'welcome', protocol: 1, cursor: snapshot.cursor }));
+    if (message.type !== 'command') return;
+    const command = message.command;
+    conversationCommands.push(command);
+    const result: import('@crewkite/contracts').CommandResult =
+      command.command === 'GetSnapshot'
+        ? {
+            outcome: 'applied',
+            data: { kind: 'snapshot', snapshot: { ...snapshot, tasks: [task] } },
+          }
+        : command.command === 'GetTaskConversationState'
+          ? { outcome: 'applied', data: { kind: 'conversation-state', state: conversationState } }
+          : command.command === 'GetTaskConversation'
+            ? {
+                outcome: 'applied',
+                data: {
+                  kind: 'conversation',
+                  taskId: task.id,
+                  entries: [conversationEntry],
+                  nextBeforeCursor: '7',
+                },
+              }
+            : {
+                outcome: conversationOutcome,
+                reason: 'queued\u001b[31m\rinput',
+                next: 'Read conversation state.',
+                entity: task,
+              };
+    socket.write(encodeFrame({ type: 'result', key: command.key, result }));
+  });
+  context.after(() => conversationFixture.close());
+  const { runCli } = await import('../../../apps/cli/src/main.ts');
+  const executeConversation = async (args: string[], json = true) => {
+    let output = '',
+      errors = '';
+    const code = await runCli(
+      [...args, ...(json ? ['--json'] : []), '--home', conversationFixture.home],
+      {
+        out: (text) => {
+          output += text;
+        },
+        err: (text) => {
+          errors += text;
+        },
+      },
+    );
+    return { code, output, errors };
+  };
+  for (const row of conversationRows) {
+    conversationCommands.length = 0;
+    const result = await executeConversation(['conversation', ...row.args]);
+    if (!row.command) {
+      assert.equal(result.code, 1, row.args.join(' '));
+      assert(
+        conversationCommands.every((command) =>
+          ['GetSnapshot', 'GetTaskConversationState'].includes(command.command),
+        ),
+      );
+      continue;
+    }
+    assert.equal(result.code, 0, result.errors);
+    const command = conversationCommands.at(-1);
+    assert.equal(command?.command, row.command);
+    assert.deepEqual(command?.payload, row.payload);
+    if (row.command === 'GetTaskConversation') {
+      assert.deepEqual(
+        conversationCommands.map((command) => command.command),
+        ['GetSnapshot', 'GetTaskConversationState', 'GetTaskConversation'],
+      );
+      assert.deepEqual(JSON.parse(result.output), {
+        state: conversationState,
+        conversation: {
+          kind: 'conversation',
+          taskId: task.id,
+          entries: [conversationEntry],
+          nextBeforeCursor: '7',
+        },
+      });
+      const plain = await executeConversation(['conversation', ...row.args], false);
+      assert(plain.output.includes('effective model unknown'));
+      assert(plain.output.includes(conversationEntry.id));
+      assert(plain.output.includes('Older page before 7'));
+      assert(!plain.output.includes('\u001b'));
+      assert(plain.output.includes('\\u001b'));
+      assert(!plain.output.includes('\r'));
+      assert(plain.output.includes('\\u000d'));
+    } else {
+      assert.equal(
+        command && 'expectedRevision' in command ? command.expectedRevision : null,
+        row.command === 'CreateTaskDiscussion' ? 0 : task.revision,
+      );
+      const receipt = JSON.parse(result.output);
+      assert.deepEqual(receipt.command, command);
+      const plain = await executeConversation(['conversation', ...row.args], false);
+      assert(!plain.output.includes('\u001b'));
+      assert(plain.output.includes('\\u001b'));
+      assert(!plain.output.includes('\r'));
+      assert(plain.output.includes('\\u000d'));
+    }
+  }
+  conversationOutcome = 'outcome-unknown';
+  const uncertainConversation = await executeConversation([
+    'conversation',
+    'send',
+    task.id,
+    '--text',
+    'Keep the original key',
+  ]);
+  assert.equal(uncertainConversation.code, 2);
+  const savedConversationReceipt = JSON.parse(uncertainConversation.output);
+  const conversationReceiptPath = join(conversationFixture.home, 'conversation-receipt.json');
+  writeFileSync(conversationReceiptPath, uncertainConversation.output);
+  conversationOutcome = 'applied';
+  const retriedConversation = await executeConversation(['retry', conversationReceiptPath]);
+  assert.equal(retriedConversation.code, 0, retriedConversation.errors);
+  assert.deepEqual(
+    JSON.parse(retriedConversation.output).command,
+    savedConversationReceipt.command,
+  );
+  assert.deepEqual(conversationCommands.at(-1), savedConversationReceipt.command);
+  conversationOutcome = 'blocked';
+  const refusedConversation = await executeConversation([
+    'conversation',
+    'guide',
+    task.id,
+    '--text',
+    'No new authority',
+  ]);
+  assert.equal(refusedConversation.code, 2);
+  assert.equal(JSON.parse(refusedConversation.output).result.outcome, 'blocked');
 
   for (const scenario of [
     ...acpCases.map((value) => `acp-${value}`),
