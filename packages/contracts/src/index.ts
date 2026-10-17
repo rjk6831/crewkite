@@ -1213,6 +1213,12 @@ const envelope = { protocol: z.literal(1), key: CommandIdSchema, actor };
 const mutation = { ...envelope, expectedRevision: RevisionSchema };
 const read = <T extends string, S extends z.ZodType>(command: T, payload: S) =>
   z.strictObject({ ...envelope, command: z.literal(command), payload });
+export const TaskActivityRequestSchema = z.strictObject({
+  taskId: TaskIdSchema,
+  beforeCursor: CursorSchema.optional(),
+  limit: z.number().int().min(1).max(100).default(100),
+});
+export type TaskActivityRequest = z.infer<typeof TaskActivityRequestSchema>;
 const mutate = <T extends string, S extends z.ZodType>(command: T, payload: S) =>
   z.strictObject({ ...mutation, command: z.literal(command), payload });
 const empty = z.strictObject({});
@@ -2199,6 +2205,7 @@ export const CommandSchema = z.discriminatedUnion('command', [
   ),
   mutate('ExportPatch', z.strictObject({ taskId: TaskIdSchema, candidateId: CandidateIdSchema })),
   read('GetSnapshot', empty),
+  read('GetTaskActivity', TaskActivityRequestSchema),
   read('Subscribe', z.strictObject({ after: CursorSchema })),
   read('GetChanges', taskRef),
   read(
@@ -2688,7 +2695,35 @@ const sourceInspection = z
         new Set(details.files.map((file) => file.path)).size === details.files.length),
     'Source details must match the full counts without repeated paths.',
   );
+export const MAX_TASK_ACTIVITY_PAGE_BYTES = 524288;
+export const TaskActivityPageSchema = z
+  .strictObject({
+    kind: z.literal('task-activity'),
+    taskId: TaskIdSchema,
+    events: z.array(z.lazy(() => EventSchema)).max(100),
+    nextBeforeCursor: CursorSchema.nullable(),
+  })
+  .superRefine((page, context) => {
+    if (
+      page.events.some(
+        (event, index) =>
+          event.taskId !== page.taskId ||
+          (index > 0 && BigInt(event.cursor) <= BigInt(page.events[index - 1].cursor)),
+      ) ||
+      new Set(page.events.map((event) => event.id)).size !== page.events.length ||
+      (page.nextBeforeCursor !== null &&
+        (page.events.length === 0 || page.nextBeforeCursor !== page.events[0].cursor))
+    )
+      context.addIssue({
+        code: 'custom',
+        message: 'Activity pages need ordered distinct whole events for one task.',
+      });
+    if (new TextEncoder().encode(JSON.stringify(page)).byteLength > MAX_TASK_ACTIVITY_PAGE_BYTES)
+      context.addIssue({ code: 'custom', message: 'An activity page exceeds its byte limit.' });
+  });
+export type TaskActivityPage = z.infer<typeof TaskActivityPageSchema>;
 export const ReadDataSchema = z.discriminatedUnion('kind', [
+  TaskActivityPageSchema,
   z.strictObject({ kind: z.literal('conversation-state'), state: TaskConversationStateSchema }),
   ConversationPageSchema,
   z.strictObject({ kind: z.literal('google-acp-setup'), setup: GoogleAcpSetupSchema }),
