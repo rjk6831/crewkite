@@ -46,7 +46,9 @@ const scopeFacts = (windows: readonly Window[]) =>
 
 function displayState(window: Window, nowMs: number): Window['state'] {
   const observation = window.observation;
-  if (Date.parse(observation.observedAt) > nowMs) return 'unknown';
+  // A snapshot may arrive after the last display tick. Larger clock differences
+  // still leave the reading unknown.
+  if (Date.parse(observation.observedAt) > nowMs + 60_000) return 'unknown';
   if (observation.resetsAt !== null && Date.parse(observation.resetsAt) <= nowMs)
     return 'reset-pending';
   if (observation.remaining === null) return 'unknown';

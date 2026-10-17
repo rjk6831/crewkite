@@ -1732,6 +1732,19 @@ export class Controller {
             });
             routes = [route];
           }
+          // A complete account report replaces its client windows. Retaining a removed
+          // bucket would leave an expired allowance blocking every Google route.
+          const reported = new Set(outcome.metadata.map((bucket) => bucket.windowId));
+          const live = new Set(routes.map((route) => route.id));
+          for (const window of this.store.list<Observation>('window'))
+            if (
+              window.source === 'client' &&
+              live.has(window.routeId) &&
+              !reported.has(window.windowId)
+            )
+              this.store.db
+                .prepare("DELETE FROM entities WHERE kind='window' AND id=?")
+                .run(`${window.routeId}/${window.windowId}`);
           for (const observation of googleUsageObservations(
             outcome.metadata,
             routes.map((route) => route.id),

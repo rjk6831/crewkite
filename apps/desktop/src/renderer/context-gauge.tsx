@@ -416,7 +416,9 @@ export function ContextGauge({
           )}
           {figures?.over && <p>Usage is above the reported capacity. The meter shows full.</p>}
           {figures === null && <p>{reason}</p>}
-          {updating && <p>Updating. The meter moves only when a new measurement arrives.</p>}
+          {updating && shown && (
+            <p>Updating. The meter moves only when a new measurement arrives.</p>
+          )}
           <p className="context-gauge-note">
             This is the model's context window, separate from subscription allowance.
           </p>

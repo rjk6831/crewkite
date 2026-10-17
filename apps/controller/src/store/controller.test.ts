@@ -37,6 +37,7 @@ import {
   canonicalJson,
   GoogleAcpProfileSchema,
   LocalNativeProfileSchema,
+  type Observation,
   RunSchema,
   TaskConversationStateSchema,
   TaskSchema,
@@ -5757,7 +5758,7 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
 
 test('google quota authority survives retries and restart while sharing one operation gate', async (t) => {
   let controller: Controller;
-  let mode: 'success' | 'invalid' = 'success';
+  let mode: 'success' | 'invalid' | 'incomplete' | 'empty' = 'success';
   let available = true;
   let launches = 0;
   const report = {
@@ -5824,12 +5825,21 @@ test('google quota authority survives retries and restart while sharing one oper
           /google-operation-active/,
         );
       });
+      const output =
+        mode === 'invalid'
+          ? {}
+          : mode === 'success'
+            ? report
+            : {
+                ...report,
+                command: {
+                  ...report.command,
+                  data: { groups: [{ buckets: mode === 'empty' ? [] : [{ id: 'incomplete' }] }] },
+                },
+              };
       const child = spawn(
         process.execPath,
-        [
-          '-e',
-          `process.stdout.write(${JSON.stringify(JSON.stringify(mode === 'invalid' ? {} : report))})`,
-        ],
+        ['-e', `process.stdout.write(${JSON.stringify(JSON.stringify(output))})`],
         spawnOptions,
       );
       return child;
@@ -5898,6 +5908,54 @@ test('google quota authority survives retries and restart while sharing one oper
         .length,
       3,
     );
+  const removed = report.command.data.groups[0].buckets.pop();
+  assert(removed);
+  const originalWindow = controller.store.get<Observation>(
+    'window',
+    `${displayRoute.id}/${removed.id}`,
+  );
+  assert(originalWindow);
+  const fixtureRoute = { ...displayRoute, id: context.id('rte'), fake: true };
+  const foreignRoute = { ...displayRoute, id: context.id('rte'), family: 'anthropic' as const };
+  const preserved = [
+    { ...originalWindow, routeId: fixtureRoute.id },
+    { ...originalWindow, routeId: foreignRoute.id },
+    { ...originalWindow, routeId: second.id, windowId: 'manual-only', source: 'manual' as const },
+  ];
+  controller.store.transaction(() => {
+    controller.store.put('route', fixtureRoute.id, 0, fixtureRoute);
+    controller.store.put('route', foreignRoute.id, 0, foreignRoute);
+    for (const observation of preserved)
+      controller.store.put(
+        'window',
+        `${observation.routeId}/${observation.windowId}`,
+        0,
+        observation,
+      );
+  });
+  context.clock.advance(300001);
+  assert.equal((await controller.execute(refresh(), 'local-owner')).outcome, 'applied');
+  for (const route of liveRoutes) {
+    const windows = controller
+      .snapshot()
+      .usage.filter(
+        ({ observation }) => observation.routeId === route.id && observation.source === 'client',
+      );
+    assert.equal(windows.length, 2);
+    assert(windows.every(({ state }) => state === 'fresh'));
+    assert(windows.every(({ observation }) => observation.windowId !== removed.id));
+  }
+  for (const observation of preserved)
+    assert.deepEqual(
+      controller.store.get<Observation>('window', `${observation.routeId}/${observation.windowId}`),
+      observation,
+    );
+  controller.store.transaction(() =>
+    controller.store.db
+      .prepare("DELETE FROM entities WHERE kind='window' AND id=?")
+      .run(`${second.id}/manual-only`),
+  );
+  report.command.data.groups[0].buckets.push(removed);
   context.clock.advance(60000);
   const beforeAutomatic = launches;
   const server = await serveController(controller);
@@ -5931,10 +5989,12 @@ test('google quota authority survives retries and restart while sharing one oper
     await server.close();
   }
   const retained = controller.snapshot().usage;
-  mode = 'invalid';
-  context.clock.advance(60000);
-  assert.equal((await controller.execute(refresh(), 'local-owner')).reason, 'usage-read-failed');
-  assert.deepEqual(controller.snapshot().usage, retained);
+  for (const failure of ['invalid', 'incomplete', 'empty'] as const) {
+    mode = failure;
+    context.clock.advance(60000);
+    assert.equal((await controller.execute(refresh(), 'local-owner')).reason, 'usage-read-failed');
+    assert.deepEqual(controller.snapshot().usage, retained);
+  }
   const attemptedAt = controller.snapshot().usageReaders[0]?.lastAttemptAt;
   await controller.close();
   controller = new Controller({
