@@ -26,4 +26,4 @@ I kept model identity in observed metadata. A hardcoded model name or machine me
 - This proposal awaits my acceptance and leaves Accepted ADR 0005 unchanged while Proposed. It grants no access to cloud-provider credential stores.
 - The initial profile permits one resident language model and one generation, with no embeddings or draft model. It neither downloads nor loads models.
 - Loaded eligibility establishes no model qualification. Memory, latency, quality, cancellation and installed recovery need separate evidence.
-- The Local file proposal retains work for inspection and export. Checks, review and acceptance remain unavailable for that profile.
+- A completed Local file candidate can use the shared fixed checks, a separately authorized OpenAI review and destination-specific branch acceptance. Its immutable Local preparation and terminal evidence remain distinct from a cloud writer's origin. Unknown ownership or changed source and candidate bytes refuse evaluation.

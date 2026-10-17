@@ -13,7 +13,7 @@ I propose a separate `google-acp-v1` profile with CrewKite as the protocol clien
 
 I pin the executable and signer through explicit import. Setup actions have separate bounded ownership; authentication stays with the native agent. Safe proof contains no credentials or OAuth URL. Preparation freezes the client, source and configuration. A fresh session must acknowledge those choices before one prompt.
 
-I limit the writer to one existing file within 64 KiB in independent scratch. Each supported permission needs a current human decision on a complete action within 4 KiB, bound to the exact session, tool call and offered `allow_once`. I bind a bounded hunk to the complete before and after file hashes and require one exact match. Unknown actions refuse. Production review-mode and edit-tool mappings remain empty; import and discovery cannot make the writer available.
+I limit the writer to one existing file within 64 KiB in independent scratch. Each supported permission needs a current human decision on a complete action within 4 KiB, bound to the exact session, tool call and offered `allow_once`. I bind a bounded hunk to the complete before and after file hashes and require one exact match. Unknown actions refuse. Production review-mode and edit-tool mappings bind the exact imported server, helper, signer and version. Import and discovery alone grant no edit authority.
 
 I require the original cancelled response, closed streams and absent owned group before claiming stopped completion. EOF alone leaves ownership unknown. Capture validates actual bytes and unchanged siblings. Checks, native review and acceptance keep separate authority. Autopilot, automatic handoff and repository-wide editing stay outside this profile.
 
@@ -29,7 +29,7 @@ I read the FAQ's headless restriction as aimed at agents that spend the subscrip
 
 I chose the published protocol because session and permission identities give the controller concrete facts to bind before an effect. An edited file or a quiet process is weaker evidence than the original terminal response plus owned cleanup. I kept those requirements through Stop and restart, even where that leaves work blocked.
 
-This costs another identity pin, explicit setup and an unavailable writer while mapping evidence is missing. I accept that cost. Guessing a tool name or review mode would let an unverified provider message decide what a human approved. Conservatively applying every observed quota bucket can also refuse a model because another pool is low; I cannot infer model entitlement from a bucket name.
+This costs another identity pin, explicit setup and review of each supported client mapping. I accept that cost. Guessing a tool name or review mode would let an unverified provider message decide what a human approved. Conservatively applying every observed quota bucket can also refuse a model because another pool is low; I cannot infer model entitlement from a bucket name.
 
 ## Consequences
 

@@ -7,7 +7,7 @@
 
 CrewKite is a desktop workspace and CLI for coding tasks that share one local controller. It tracks approvals, usage observations and retained work across provider routes.
 
-I am preparing the D2 candidate for real-project user acceptance on macOS with Apple Silicon. The normal workspace starts without a synthetic project or seeded route catalog. Native profiles connect to their supported clients; Local setup uses an explicit authenticated loopback connection. Availability is separate from qualification. Google coding remains unavailable, and the [roadmap](docs/roadmap.md) keeps the required live evidence, ten real tasks and acceptance gates open.
+I am preparing the D2 candidate for real-project user acceptance on macOS with Apple Silicon. The normal workspace starts without a synthetic project or seeded route catalog. Native profiles connect to their supported clients; Local setup uses an explicit authenticated loopback connection. Availability is separate from qualification. The separate Google ACP profile binds its supported mappings to an exact imported client bundle. The [roadmap](docs/roadmap.md) keeps the required live evidence, ten real tasks and acceptance gates open.
 
 ## Why I am building it
 
@@ -52,7 +52,7 @@ Review the prepared source and permissions before Start. Changes shows retained 
 
 ![Project goal, planning, explicit adoption, owned execution and separate evidence and acceptance decisions.](docs/images/task-states.svg)
 
-The diagram shows the supported decision flow. Checks, review and branch acceptance depend on the selected profile. The Local file proposal currently retains work for inspection and export.
+The diagram shows the supported decision flow. Checks, review and branch acceptance depend on the selected profile. A completed Local file candidate can use the shared checks, separate OpenAI review and destination-specific branch acceptance.
 
 <details>
 <summary>Keyboard navigation</summary>
