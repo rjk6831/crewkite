@@ -72,9 +72,11 @@ In cloud-first, local-finish mode, the local route takes only work it is qualifi
 
 Open Usage and capacity from the sidebar or find it in Search.
 
+Provider cards use only retained observations. A unique provider-scoped weekly or five-hour reading gets a primary gauge. Other model and pool readings stay visible as auxiliary limits; a single model-scoped reading can occupy the center gauge. Ambiguous primary matches remain separate. No provider name or guessed entitlement chooses a slot. Route and account scope remain visible, and equal values alone cannot merge separate routes.
+
 The Usage view has four regions:
 
-- Route allowance cards: one gauge or row per window with unit, model scope, reset time, observation time, source and freshness. Unknown windows render as a labelled unavailable gauge.
+- Allowance cards: reported windows with their own unit, scope, reset time, observation time, source and freshness. Missing, stale and reset-pending values stay labelled. Credits and context-token counts never become a subscription percentage.
 - Comparable activity: launches and aggregate active minutes by route, role or task. Parallel minutes can exceed wall time, and the label says so.
 - Local hardware: resident models, admitted generations, queue, memory pressure. It reads "No provider quota" for local inference and claims no cost saving.
 - Credits: existing paid credits stay off per provider. When enabled, the card shows the budget, the unit and whether the provider enforces a hard cap.

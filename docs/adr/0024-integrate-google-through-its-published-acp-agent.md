@@ -19,13 +19,15 @@ I require the original cancelled response, closed streams and absent owned group
 
 The quota read is on by default when the pinned client is present. There is no opt-in.
 
-The quota reader shares a durable gate with setup and task admission. Controller startup attempts one read. An authenticated client connection or admission can request a needed refresh. The sixty-second cooldown includes failed reads, and active or unknown Google ownership refuses another read. No timer refreshes quota. Fresh exhausted quota refuses without another read. Admission rechecks every bucket, reserve and current authority. Account matching remains user-attested; context tokens supply no account allowance.
+The quota reader shares a durable gate with setup and task admission. Controller startup attempts one read. An authenticated client connection or admission can request a needed refresh. While a client remains authenticated, the controller checks every ten seconds and permits an interval attempt at least 270 seconds after the prior attempt. Startup and connection attempts keep a sixty-second cooldown. Failed reads count toward both limits, and active or unknown Google ownership refuses another read. Fresh exhausted quota refuses an admission refresh. Admission rechecks every bucket, reserve and current authority. Account matching remains user-attested; context tokens supply no account allowance.
 
 ## Why
 
 I ruled out using pilot success to infer provider permission. Keeping that distinction meant retiring a working consumer launch path while preserving its historical evidence.
 
 I read the FAQ's headless restriction as aimed at agents that spend the subscription through the CLI. A validated `/usage` response reports `num_turns: 0`, with no generation or account switch. I treat it as a status check that spends no model allowance, so it runs without asking.
+
+I refresh connected dashboards before the five-minute freshness limit, leaving room for bounded metadata cleanup. The reads still cost client and network work. The interval floor and ownership gate limit that traffic; a failed or delayed read leaves the old timestamp visible.
 
 I chose the published protocol because session and permission identities give the controller concrete facts to bind before an effect. An edited file or a quiet process is weaker evidence than the original terminal response plus owned cleanup. I kept those requirements through Stop and restart, even where that leaves work blocked.
 
