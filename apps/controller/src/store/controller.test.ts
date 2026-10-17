@@ -7055,6 +7055,7 @@ test('planning turns keep task authority and allowance across execution', async 
   let reopened: Controller | undefined;
   let mode = 'success';
   let askQuestion = true;
+  let reportedCapacity: number | null = 4096;
   let crashAfterIntent = false;
   let modelAvailability: 'available' | 'missing-model' | 'missing-effort' = 'available';
   const held = Promise.withResolvers<void>();
@@ -7119,6 +7120,10 @@ test('planning turns keep task authority and allowance across execution', async 
       script = script.replace(
         'const edit = {version:1,attemptId:message.params.outputSchema.properties.attemptId.const,path,baseHash:message.params.outputSchema.properties.baseHash.const,content:content(path)};',
         `const edit = {version:1,bindingHash:message.params.outputSchema.properties.bindingHash.const,message:'The bounded plan is ready.',questions:${JSON.stringify(askQuestion ? ['Keep the current export?'] : [])},proposal:{summary:'Keep the export.',criteria:${JSON.stringify(mode === 'escaped-boundary' ? Array.from({ length: 12 }, (_, index) => `${index}: ${'x'.repeat(3500)}`) : ['Preserve the source sentinels.'])},slices:[{id:'net',title:'Change the module',role:'coder',scope:['net.mjs'],dependsOn:[]}],checks:['node-tests-v1']}}${mode === 'invalid' ? '; edit.effects=[]' : ''};`,
+      );
+      script = script.replace(
+        "['turn/completed',{threadId:'thread-1',turn:{...running,status:'completed'}}],",
+        `['thread/tokenUsage/updated',{threadId:'thread-1',turnId:'turn-1',tokenUsage:{total:{totalTokens:900000},last:{totalTokens:123},modelContextWindow:${JSON.stringify(reportedCapacity)}}}],\n      ['turn/completed',{threadId:'thread-1',turn:{...running,status:'completed'}}],`,
       );
       const child = spawn(
         executable,
@@ -7319,6 +7324,7 @@ test('planning turns keep task authority and allowance across execution', async 
     ).entity,
   );
   assert.equal(state(catalogTask.id).modelChoices?.status, 'not-observed');
+  assert.equal(state(catalogTask.id).contextUsage, null);
   await catalogReply;
   const observed = state(catalogTask.id).modelChoices;
   assert.equal(observed?.status, 'last-observed');
@@ -7328,6 +7334,25 @@ test('planning turns keep task authority and allowance across execution', async 
     [fixtureModel, 'fixture-secondary'],
   );
   assert(!JSON.stringify(observed).includes(process.execPath));
+  const reportedContext = state(catalogTask.id).contextUsage;
+  assert(reportedContext);
+  assert.equal(reportedContext.usedTokens, 123);
+  assert.equal(reportedContext.capacityTokens, 4096);
+  assert.equal(reportedContext.model, fixtureModel);
+  assert.equal(reportedContext.runId, current(catalogTask.id).runId);
+  assert.deepEqual(reportedContext.observation, observed.observation);
+  const retainedContext = JSON.parse(
+    new ArtifactFiles(join(controller.home, 'artifacts'))
+      .read(reportedContext.observation.hash)
+      .toString('utf8'),
+  ).contextUsage;
+  assert.deepEqual(retainedContext, {
+    threadId: 'thread-1',
+    turnId: 'turn-1',
+    model: fixtureModel,
+    usedTokens: 123,
+    capacityTokens: 4096,
+  });
   const catalogReference = observed.observation;
   const selectedPlanning = {
     ...planning,
@@ -7393,6 +7418,8 @@ test('planning turns keep task authority and allowance across execution', async 
   assert.equal(state(catalogTask.id).configuration?.requestedModel, 'fixture-secondary');
   assert.equal(state(catalogTask.id).configuration?.requestedEffort, 'medium');
   assert.equal(state(catalogTask.id).configuration?.effectiveModel, null);
+  assert.equal(state(catalogTask.id).contextUsage, null);
+  reportedCapacity = null;
   const selectedReply = nextReply();
   await send('SendTaskMessage', catalogTask.id, { text: 'Use the saved exact pair.' });
   const activeConfiguration = await send('ConfigureTaskConversation', catalogTask.id, {
@@ -7412,6 +7439,9 @@ test('planning turns keep task authority and allowance across execution', async 
   await selectedReply;
   assert.equal(state(catalogTask.id).configuration?.effectiveModel, 'fixture-secondary');
   assert.equal(state(catalogTask.id).configuration?.effectiveEffort, 'medium');
+  assert.equal(state(catalogTask.id).contextUsage?.model, 'fixture-secondary');
+  assert.equal(state(catalogTask.id).contextUsage?.usedTokens, 123);
+  assert.equal(state(catalogTask.id).contextUsage?.capacityTokens, null);
   const selectedIntent = controller.store
     .intents()
     .filter((intent) => intent.task_id === catalogTask.id)
@@ -7470,6 +7500,7 @@ test('planning turns keep task authority and allowance across execution', async 
   const originalLocation = profile.locationHash;
   profile.locationHash = '2'.repeat(64);
   assert.equal(state(catalogTask.id).modelChoices?.status, 'client-changed');
+  assert.equal(state(catalogTask.id).contextUsage, null);
   assert.equal(state(catalogTask.id).send.reason, 'profile-unavailable');
   assert.equal(
     (
@@ -7569,8 +7600,10 @@ test('planning turns keep task authority and allowance across execution', async 
     const attempts = controller.store.intents().filter((intent) => intent.task_id === raced.id);
     assert.equal(attempts.length, boundary === 'completion-send' ? 2 : 1);
     assert(attempts.every((intent) => intent.state === 'stopped'));
-    if (boundary === 'admission-stop')
+    if (boundary === 'admission-stop') {
       assert.deepEqual(controller.store.nativeProcesses(attempts[0].attempt_id), []);
+      assert.equal(state(raced.id).contextUsage, null);
+    }
     assert.equal(current(raced.id).state, boundary === 'completion-send' ? 'draft' : 'stopped');
     if (boundary !== 'completion-send')
       assert.equal(state(raced.id).send.reason, 'admissions-paused');

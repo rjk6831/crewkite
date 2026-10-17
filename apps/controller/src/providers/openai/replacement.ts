@@ -3,6 +3,7 @@ import { isAbsolute, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import {
   AttemptIdSchema,
+  ConversationContextMeasurementSchema,
   ConversationModelCatalogEntriesSchema,
   ConversationModelRequestSchema,
   HashSchema,
@@ -152,6 +153,7 @@ const fields = [
   'total',
   'last',
   'totalTokens',
+  'modelContextWindow',
   'version',
   'attemptId',
   'path',
@@ -304,6 +306,7 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
   private submission = false;
   private interrupted = false;
   private retries = 0;
+  private contextUsage: ReturnType<typeof ConversationContextMeasurementSchema.parse> | null = null;
 
   constructor(
     plan: StructuredSession,
@@ -739,12 +742,22 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
     }
     if (method === 'thread/tokenUsage/updated') {
       this.site = 'usage';
-      z.object({
-        tokenUsage: z.object({
-          total: z.object({ totalTokens: z.number().safe().nonnegative() }),
-          last: z.object({ totalTokens: z.number().safe().nonnegative() }),
-        }),
-      }).parse(params);
+      const value = z
+        .object({
+          tokenUsage: z.object({
+            total: z.object({ totalTokens: z.number().safe().nonnegative() }),
+            last: z.object({ totalTokens: z.number().safe().nonnegative() }),
+            modelContextWindow: z.number().safe().positive().nullish(),
+          }),
+        })
+        .parse(params);
+      this.contextUsage = ConversationContextMeasurementSchema.parse({
+        threadId: related.threadId,
+        turnId: related.turnId,
+        model: this.plan.model,
+        usedTokens: value.tokenUsage.last.totalTokens,
+        capacityTokens: value.tokenUsage.modelContextWindow ?? null,
+      });
       return;
     }
     this.site = 'unsupported';
@@ -779,6 +792,7 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
       requestedEffort: this.plan.effort,
       observedRetries: this.retries,
       qualified: false as const,
+      ...(this.contextUsage ? { contextUsage: this.contextUsage } : {}),
     };
   }
   protected completedModelChoices() {

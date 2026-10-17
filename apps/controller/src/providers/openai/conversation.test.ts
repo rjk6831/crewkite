@@ -118,7 +118,7 @@ function admit(
   return request;
 }
 
-function complete(reader: ConversationTranscript, value: unknown) {
+function complete(reader: ConversationTranscript, value: unknown, notifications: unknown[] = []) {
   const item = {
     id: 'message-1',
     type: 'agentMessage',
@@ -127,6 +127,7 @@ function complete(reader: ConversationTranscript, value: unknown) {
   };
   for (const message of [
     { method: 'turn/started', params: { threadId: 'thread-1', turn: running } },
+    ...notifications,
     {
       method: 'item/started',
       params: {
@@ -433,6 +434,42 @@ test('conversation replies bind frozen scope and remain finite proposals', () =>
     assert.throws(() => complete(reader, value));
     assert.throws(() => reader.finish());
   }
+  const usageNotification = (tokenUsage: object, identity = {}) => ({
+    method: 'thread/tokenUsage/updated',
+    params: { threadId: 'thread-1', turnId: 'turn-1', ...identity, tokenUsage },
+  });
+  const lastUsage = {
+    total: { totalTokens: 900_000 },
+    last: { totalTokens: 123 },
+    modelContextWindow: 4096,
+  };
+  for (const capacity of [4096, null, undefined]) {
+    const measured = new ConversationTranscript(trusted, { now: () => 1, timeoutMs: 60_000 });
+    admit(measured, trusted.directory);
+    complete(measured, valid, [
+      usageNotification(lastUsage),
+      usageNotification({ ...lastUsage, last: { totalTokens: 17 }, modelContextWindow: capacity }),
+    ]);
+    assert.deepEqual(measured.finish().contextUsage, {
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      model: trusted.model,
+      usedTokens: 17,
+      capacityTokens: capacity ?? null,
+    });
+  }
+  for (const notification of [
+    usageNotification(lastUsage, { threadId: 'other-thread' }),
+    usageNotification(lastUsage, { turnId: 'other-turn' }),
+    usageNotification({ ...lastUsage, last: { totalTokens: -1 } }),
+    usageNotification({ ...lastUsage, modelContextWindow: 0 }),
+    usageNotification({ ...lastUsage, modelContextWindow: Number.MAX_SAFE_INTEGER + 1 }),
+  ]) {
+    const refused = new ConversationTranscript(trusted, { now: () => 1, timeoutMs: 60_000 });
+    admit(refused, trusted.directory);
+    assert.throws(() => complete(refused, valid, [notification]));
+    assert.throws(() => refused.finish());
+  }
   const reader = new ConversationTranscript(trusted, { now: () => 1, timeoutMs: 60_000 });
   const request = admit(reader, trusted.directory);
   assert(Buffer.byteLength(request.params.input[0].text) <= 65_536);
@@ -440,6 +477,7 @@ test('conversation replies bind frozen scope and remain finite proposals', () =>
   complete(reader, valid);
   assert.deepEqual(reader.finish().conversation, valid);
   assert.equal(reader.finish().qualified, false);
+  assert.equal(Object.hasOwn(reader.finish(), 'contextUsage'), false);
   assert.equal(reader.next(), null);
   const launch = {
     executable: process.execPath,
@@ -520,6 +558,10 @@ test('conversation turns use one correlated submission through owned native phas
         .replace(
           "if (message.method === 'thread/start') result = thread(process.cwd());",
           `if (message.method === 'thread/start') result = {...thread(process.cwd()),model:${JSON.stringify(requested.model)},reasoningEffort:${JSON.stringify(requested.effort)}};`,
+        )
+        .replace(
+          "['turn/completed',{threadId:'thread-1',turn:{...running,status:'completed'}}],",
+          "['thread/tokenUsage/updated',{threadId:'thread-1',turnId:'turn-1',tokenUsage:{total:{totalTokens:900000},last:{totalTokens:17},modelContextWindow:4096}}],\n      ['turn/completed',{threadId:'thread-1',turn:{...running,status:'completed'}}],",
         );
       const calls: { milliseconds: number; work: () => void; active: boolean }[] = [];
       const events: string[] = [];
@@ -619,6 +661,13 @@ test('conversation turns use one correlated submission through owned native phas
             `I need a boundary for: ${trusted.history[0].text}`,
           );
           assert.equal(result.metadata?.qualified, false);
+          assert.deepEqual(result.metadata?.contextUsage, {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            model: requested.model,
+            usedTokens: 17,
+            capacityTokens: 4096,
+          });
         } else {
           assert.equal(result.metadata, null);
           assert.equal(result.reason, mode === 'unknown' ? 'ownership' : 'stopped');

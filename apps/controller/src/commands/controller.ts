@@ -49,6 +49,7 @@ import {
   CommandSchema,
   ConversationContextBundleSchema,
   type ConversationContextRefs,
+  ConversationContextUsageSchema,
   ConversationEntrySchema,
   type ConversationModelCatalog,
   ConversationModelCatalogSchema,
@@ -2885,6 +2886,7 @@ export class Controller {
     ).value as { attemptId: string; bindingHash: string };
     if (
       catalog.taskId !== taskId ||
+      (catalog.contextUsage && catalog.contextUsage.model !== input.model) ||
       hashCanonical(retained.artifact) !== hashCanonical(artifact) ||
       this.store.receipt(`conversation-model-catalog:${catalog.attemptId}`)?.hash !==
         artifact.hash ||
@@ -2999,6 +3001,35 @@ export class Controller {
         models: [],
         reason: 'catalog-unavailable',
       };
+    }
+  }
+
+  private conversationContextUsage(
+    task: Task,
+    config: ConversationConfiguration | undefined,
+  ): TaskConversationState['contextUsage'] {
+    if (!config?.modelCatalog || !task.runId) return null;
+    try {
+      const catalog = this.conversationCatalog(task.id, config.modelCatalog);
+      const route = this.store.get<Route>('route', config.routeId);
+      if (
+        !catalog.contextUsage ||
+        catalog.runId !== task.runId ||
+        catalog.contextUsage.model !== route?.model ||
+        this.conversationCatalogReason(catalog)
+      )
+        return null;
+      const { threadId: _thread, turnId: _turn, ...measurement } = catalog.contextUsage;
+      return ConversationContextUsageSchema.parse({
+        ...measurement,
+        observation: config.modelCatalog,
+        runId: catalog.runId,
+        attemptId: catalog.attemptId,
+        generation: catalog.generation,
+        observedAt: catalog.observedAt,
+      });
+    } catch {
+      return null;
     }
   }
 
@@ -3463,6 +3494,7 @@ export class Controller {
           }
         : null,
       modelChoices: this.conversationModelChoices(task.id, config),
+      contextUsage: this.conversationContextUsage(task, config),
       currentRunId: task.runId,
       activeAttempt: active,
       budget: config && allowance ? { limits: config.limits, remaining: allowance } : null,
@@ -4057,6 +4089,9 @@ export class Controller {
                   client: profile.client,
                   locationHash: config.locationHash,
                   models: outcome.metadata.modelChoices,
+                  ...(outcome.metadata.contextUsage
+                    ? { contextUsage: outcome.metadata.contextUsage }
+                    : {}),
                 });
                 const observation = this.nativeArtifact(catalog);
                 this.store.saveReceipt(
