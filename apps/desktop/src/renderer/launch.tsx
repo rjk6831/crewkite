@@ -148,7 +148,9 @@ export function NativeEvaluation({
   const run = snapshot.runs.find((value) => value.id === task.runId);
   const native = snapshot.nativeRuns.find((value) => value.runId === task.runId);
   const prepared = snapshot.candidateEvaluations.find((value) => value.taskId === task.id);
-  const reviewerProfiles = snapshot.nativeProfiles.filter((value) => value.id === 'openai-file-v1');
+  const reviewerProfiles = snapshot.nativeProfiles
+    .filter((value) => value.family === 'openai')
+    .filter((value) => value.id === 'openai-file-v1');
   const [profileId, setProfileId] = useState(reviewerProfiles[0]?.id ?? '');
   const [nativeTrust, setNativeTrust] = useState(false);
   const [sourceConsent, setSourceConsent] = useState(false);
@@ -732,9 +734,9 @@ function NativeLaunch({
 }: LaunchProps & { onBack: () => void; scope: 'file' | 'repository' }) {
   const project = snapshot.projects.find((value) => value.id === task.projectId);
   const repository = scope === 'repository';
-  const profiles = snapshot.nativeProfiles.filter(
-    (value) => (value.id === 'openai-repository-v1') === repository,
-  );
+  const profiles = snapshot.nativeProfiles
+    .filter((value) => value.family !== 'local')
+    .filter((value) => (value.id === 'openai-repository-v1') === repository);
   const current = snapshot.nativeRuns.find(
     (value) =>
       value.runId === task.runId && (value.profileId === 'openai-repository-v1') === repository,
@@ -746,7 +748,7 @@ function NativeLaunch({
       profiles[0]?.id ??
       '',
   );
-  const profile = snapshot.nativeProfiles.find((value) => value.id === profileId);
+  const profile = profiles.find((value) => value.id === profileId);
   const google = profile?.family === 'google';
   const attestedBilling = profile?.family === 'anthropic' || google;
   const [permissionMode, setPermissionMode] = useState<
@@ -1648,7 +1650,9 @@ export function NativeHandoff({ task, snapshot, workspace, onClose }: LaunchProp
   const [message, setMessage] = useState<string | null>(null);
   if (!native || !run || !handoff) return null;
   const recipient = handoff.targets.find((value) => value.profileId === recipientId);
-  const profile = snapshot.nativeProfiles.find((value) => value.id === recipient?.profileId);
+  const profile = snapshot.nativeProfiles
+    .filter((value) => value.family !== 'local')
+    .find((value) => value.id === recipient?.profileId);
   const google = profile?.family === 'google';
   const attested = profile?.family === 'anthropic' || google;
   const pending = handoff.pending;

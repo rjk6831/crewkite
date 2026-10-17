@@ -216,12 +216,71 @@ test('process boundaries reject unknown fields and invalid command identity', ()
   ])
     assert.equal(NativeProfileSchema.safeParse({ ...acpProfile, ...change }).success, false);
   assert.equal(NativeProfileSchema.safeParse({ ...modelOnly, effort: 'standard' }).success, false);
+  const localModel = {
+    setupHash: 'a'.repeat(64),
+    modelKey: 'local-fixture',
+    instanceReference: 'local-instance-1',
+    modelSizeBytes: 5_627_044_256,
+    artifactSha256: 'b'.repeat(64),
+    quantization: 'Q4_K_M',
+  };
+  const localProfile = {
+    id: 'local-file-v1',
+    family: 'local',
+    displayName: 'Local file proposal',
+    sdkVersion: '2.1.0',
+    model: 'local-fixture',
+    modelBinding: localModel,
+    billing: 'local',
+    contextLength: 8192,
+    maximumOutputTokens: 2048,
+    qualifiedAt: null,
+    maximumTaskMs: 300000,
+    maximumFileBytes: 65536,
+    maximumSubmissions: 1,
+    available: true,
+    reason: 'qualification-pending',
+  };
+  assert.deepEqual(NativeProfileSchema.parse(localProfile), localProfile);
+  assert(
+    NativeProfileSchema.safeParse({
+      ...localProfile,
+      available: false,
+      modelBinding: null,
+      reason: 'not-configured',
+    }).success,
+  );
+  for (const change of [
+    { family: 'openai' },
+    { billing: 'included' },
+    { sdkVersion: '2.2.0' },
+    { model: 'other-model' },
+    { modelBinding: null },
+    { modelBinding: { ...localModel, instanceReference: 'instance\nother' } },
+    { modelBinding: { ...localModel, modelKey: '\ud800' } },
+    { modelBinding: { ...localModel, modelSizeBytes: 0 } },
+    { modelBinding: { ...localModel, setupHash: 'invalid' } },
+    { modelBinding: { ...localModel, quantization: 'other' } },
+    { contextLength: 16384 },
+    { maximumOutputTokens: 4096 },
+    { maximumSubmissions: 2 },
+    { available: false, reason: 'available' },
+    { reason: 'unbounded-error' },
+    { creditPolicies: ['ordinary'] },
+    { accountClass: 'pro' },
+    { token: 'synthetic-secret' },
+    { endpoint: 'ws://127.0.0.1:1234' },
+  ])
+    assert.equal(NativeProfileSchema.safeParse({ ...localProfile, ...change }).success, false);
+  for (const id of ['openai-repository-v1', 'google-acp-v1', 'local-file-v1'])
+    assert.equal(NativeProfileSchema.safeParse({ ...historicalProfile, id }).success, false);
   const profiles = [
     historicalProfile,
     pendingProfile,
     googleProfile,
     repositoryProfile,
     acpProfile,
+    localProfile,
   ];
   assert.deepEqual(SnapshotSchema.shape.nativeProfiles.parse(profiles), profiles);
   assert.equal(
@@ -472,6 +531,24 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     { permissionMode: 'request-review' },
   ])
     assert.equal(NativeRunSchema.safeParse({ ...repositoryRun, ...change }).success, false);
+  const localRun = {
+    ...historicalRun,
+    profileId: localProfile.id,
+    target: { path: 'net.mjs', baseHash: 'a'.repeat(64), bytes: 1 },
+    localModel,
+  };
+  assert.deepEqual(NativeRunSchema.parse(localRun), localRun);
+  for (const change of [
+    { localModel: undefined },
+    { target: undefined },
+    { billingAttestation: attestation },
+    { permissionMode: 'request-review' },
+    { repository: repositoryRun.repository, execution },
+    { acp: selection },
+    { profileId: historicalProfile.id },
+    { token: 'synthetic-secret' },
+  ])
+    assert.equal(NativeRunSchema.safeParse({ ...localRun, ...change }).success, false);
   assert.ok(CommandSchema.safeParse(command).success);
   for (const [quality, methods] of [
     ['quick', ['keep-it-simple']],
@@ -954,6 +1031,50 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     },
   };
   assert.deepEqual(CommandSchema.parse(filePreparation), filePreparation);
+  const localPreparation = {
+    ...filePreparation,
+    payload: {
+      taskId: job.taskId,
+      profileId: localProfile.id,
+      targetPath: 'net.mjs',
+      policy: filePreparation.payload.policy,
+      consent: 'explicit',
+    },
+  };
+  for (const consent of ['explicit', 'saved']) {
+    const request = {
+      ...localPreparation,
+      payload: { ...localPreparation.payload, consent },
+    };
+    assert.deepEqual(CommandSchema.parse(request), request);
+  }
+  for (const change of [
+    { creditPolicy: 'ordinary' },
+    { billingAttestation: attestation },
+    { permissionMode: 'request-review' },
+    { handoffTargets: [{ profileId: 'openai-file-v1' }] },
+    { proofId: selection.proofId, modelId: selection.modelId, thoughtLevelId: null },
+    { localModel },
+    { targetPath: undefined },
+    { targetPath: '../source' },
+    { token: 'synthetic-secret' },
+    { endpoint: 'ws://127.0.0.1:1234' },
+    { executable: '/caller/binary' },
+  ])
+    assert.equal(
+      CommandSchema.safeParse({
+        ...localPreparation,
+        payload: { ...localPreparation.payload, ...change },
+      }).success,
+      false,
+    );
+  assert.equal(
+    CommandSchema.safeParse({
+      ...filePreparation,
+      payload: { ...filePreparation.payload, profileId: localProfile.id },
+    }).success,
+    false,
+  );
   const acpPreparation = {
     ...filePreparation,
     payload: {
@@ -1022,6 +1143,7 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     [...handoffTargets, handoffTargets[0]],
     [handoffTargets[0], handoffTargets[0]],
     [{ profileId: 'openai-repository-v1', creditPolicy: 'ordinary' }],
+    [{ profileId: 'local-file-v1', creditPolicy: 'ordinary' }],
     [{ profileId: 'anthropic-file-v1', creditPolicy: 'existing-credits' }],
     [{ ...handoffTargets[0], executable: '/caller/client' }],
   ])
@@ -1128,6 +1250,7 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     NativeRunSchema.safeParse({ ...repositoryRun, handoff: handoffPreview }).success,
     false,
   );
+  assert.equal(NativeRunSchema.safeParse({ ...localRun, handoff: handoffPreview }).success, false);
   const { targetPath: _target, ...preparationFields } = filePreparation.payload;
   const repositoryPreparation = {
     ...filePreparation,
