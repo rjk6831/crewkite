@@ -3,6 +3,7 @@ import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import {
   type Attempt,
+  CommandIdSchema,
   type CommandResult,
   CommandResultSchema,
   canonicalJson,
@@ -26,6 +27,24 @@ export type EntityKind =
   | 'artifact'
   | 'window';
 type Receipt = { request_hash: string; principal: string; result: string };
+export type GoogleMetadataKind = 'usage' | 'acp-initialize' | 'acp-authenticate' | 'acp-discover';
+export type GoogleMetadataOperation = {
+  command_id: string;
+  family: 'google';
+  kind: GoogleMetadataKind;
+  authority_revision: number;
+  state: 'intent' | 'owned' | 'quiescent' | 'unknown';
+  pid: number | null;
+  process_group: number | null;
+  started_at: string;
+  finished_at: string | null;
+};
+export type GoogleUsageReader = {
+  enabled: number;
+  authority_revision: number;
+  last_attempt_at: string | null;
+  last_observed_at: string | null;
+};
 export type LaunchIntent = {
   attempt_id: string;
   task_id: string;
@@ -234,6 +253,127 @@ export class Store {
     return this.db
       .prepare('SELECT * FROM launch_intents ORDER BY attempt_id')
       .all() as LaunchIntent[];
+  }
+
+  googleUsageReader(): GoogleUsageReader {
+    return this.db
+      .prepare('SELECT * FROM google_usage_reader WHERE family=?')
+      .get('google') as GoogleUsageReader;
+  }
+
+  private metadataWrite() {
+    if (!this.transactionEvents)
+      throw new Error('Metadata ownership writes require a transaction.');
+  }
+
+  setGoogleUsageConsent(enabled: boolean) {
+    this.metadataWrite();
+    const reader = this.googleUsageReader();
+    this.db
+      .prepare(
+        `UPDATE google_usage_reader SET enabled=?,authority_revision=? WHERE family='google'`,
+      )
+      .run(Number(enabled), reader.authority_revision + (enabled && reader.enabled ? 0 : 1));
+  }
+
+  recordGoogleUsageAttempt(at: string) {
+    this.metadataWrite();
+    this.db
+      .prepare("UPDATE google_usage_reader SET last_attempt_at=? WHERE family='google'")
+      .run(TimestampSchema.parse(at));
+  }
+
+  recordGoogleUsageObservation(at: string) {
+    this.metadataWrite();
+    this.db
+      .prepare("UPDATE google_usage_reader SET last_observed_at=? WHERE family='google'")
+      .run(TimestampSchema.parse(at));
+  }
+
+  googleMetadataOperations(): GoogleMetadataOperation[] {
+    return this.db
+      .prepare('SELECT * FROM google_metadata_operations ORDER BY started_at,command_id')
+      .all() as GoogleMetadataOperation[];
+  }
+
+  googleOperationBlocker(
+    exceptCommandId?: string,
+  ): 'google-operation-active' | 'google-ownership-unknown' | undefined {
+    this.metadataWrite();
+    const operations = this.googleMetadataOperations().filter(
+      (row) => row.command_id !== exceptCommandId && row.state !== 'quiescent',
+    );
+    const writers = this.intents().filter(
+      (intent) =>
+        intent.state !== 'stopped' &&
+        this.get<Route>('route', intent.route_id)?.family === 'google' &&
+        !this.get<Route>('route', intent.route_id)?.fake,
+    );
+    if (
+      operations.some((row) => row.state === 'unknown') ||
+      writers.some((row) => ['outcome-unknown', 'interrupted'].includes(row.state))
+    )
+      return 'google-ownership-unknown';
+    if (operations.length || writers.length) return 'google-operation-active';
+  }
+
+  googleStartBlocker(routeId: string) {
+    this.metadataWrite();
+    const route = this.get<Route>('route', routeId);
+    return route?.family === 'google' && !route.fake ? this.googleOperationBlocker() : undefined;
+  }
+
+  beginGoogleMetadata(
+    commandId: string,
+    kind: GoogleMetadataKind,
+    authorityRevision: number,
+    at: string,
+  ) {
+    this.metadataWrite();
+    const blocker = this.googleOperationBlocker();
+    if (blocker) throw new Error(blocker);
+    if (
+      !['usage', 'acp-initialize', 'acp-authenticate', 'acp-discover'].includes(kind) ||
+      !Number.isSafeInteger(authorityRevision) ||
+      authorityRevision < 0
+    )
+      throw new Error('Metadata authority is invalid.');
+    this.db
+      .prepare(
+        "INSERT INTO google_metadata_operations(command_id,kind,authority_revision,state,started_at) VALUES (?,?,?,'intent',?)",
+      )
+      .run(CommandIdSchema.parse(commandId), kind, authorityRevision, TimestampSchema.parse(at));
+  }
+
+  ownGoogleMetadata(commandId: string, group: number) {
+    this.metadataWrite();
+    if (!Number.isSafeInteger(group) || group <= 0)
+      throw new Error('Metadata process group must be a positive integer.');
+    const result = this.db
+      .prepare(
+        "UPDATE google_metadata_operations SET state='owned',pid=?,process_group=? WHERE command_id=? AND state='intent'",
+      )
+      .run(group, group, commandId);
+    if (result.changes !== 1) throw new Error('Metadata process intent is unavailable.');
+  }
+
+  finishGoogleMetadata(commandId: string, group: number | null, at: string) {
+    this.metadataWrite();
+    const result = this.db
+      .prepare(
+        `UPDATE google_metadata_operations SET state='quiescent',finished_at=? WHERE command_id=? AND ((state='intent' AND process_group IS NULL AND ? IS NULL) OR (state IN ('owned','unknown') AND process_group=?))`,
+      )
+      .run(TimestampSchema.parse(at), commandId, group, group);
+    if (result.changes !== 1) throw new Error('Metadata process closure does not match its owner.');
+  }
+
+  unknownGoogleMetadata(commandId: string) {
+    this.metadataWrite();
+    this.db
+      .prepare(
+        "UPDATE google_metadata_operations SET state='unknown' WHERE command_id=? AND state<>'quiescent'",
+      )
+      .run(commandId);
   }
 
   nativeProcesses(attemptId: string): NativeProcess[] {
