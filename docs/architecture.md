@@ -36,7 +36,9 @@ A native candidate becomes ready only after the exact checks and declared review
 
 ## Commands and events
 
-Google contracts separate quota consent from ACP setup and frozen model selections. Typed one-use permission targets and inert ACP activity preserve existing string targets and text output; their controller handlers remain unavailable.
+Google contracts separate quota consent from ACP setup and frozen model selections. `ObserveUsage` implements explicit quota opt-in, refresh under saved consent and revocation. ACP setup, typed one-use permission targets and inert activity preserve existing string targets and text output; their controller handlers remain unavailable.
+
+The quota reader uses a durable metadata-operation journal, separate from task attempts. Intent precedes spawn; ownership and closed streams bind the result to that operation. Active or unknown Google ownership blocks another read and native Google Start in that controller home. Restart never replays an operation or signals a historical PID. Disabling consent revokes in-flight authority and discards late results. Each admitted read has a sixty-second cooldown, including failure, and a twenty-second process bound. No timer refreshes quota. Failed reads preserve the prior window timestamps. Every returned bucket attaches conservatively to Google routes; the quota-only row has unknown model and effort and remains unqualified. A read cannot enable a writer. ACP setup and pre-admission refresh remain planned consumers of this gate.
 
 Every mutation carries a protocol version, an idempotency key, the expected entity revision and a validated payload. The controller stores a digest of each request with its receipt.
 
@@ -66,6 +68,7 @@ The command set for the first release:
 | `SwitchRoute` | Save an allowed coder target, stop the outgoing writer, seal retained work and recheck normal admission |
 | `PauseAdmissions`, `StopRun` | Pausing stops new dispatch. Stopping requests cancellation and waits for proven quiescence |
 | `ResolveApproval` | Binds the exact pending action, target, attempt, generation and revision |
+| `ObserveUsage` | Enable and read Google quota, refresh under saved consent or revoke without a read; preserve prior observations on failure |
 | `GetChanges`, `GetArtifact`, `GetUsage` | Bounded reads of immutable content and sourced usage observations |
 | `AcceptCandidate` | Eligible candidate, current authority, an unused destination ref, idempotent publication |
 | `GetHealth`, `ExportDiagnostics` | Runtime and qualification state, redacted export after preview |
