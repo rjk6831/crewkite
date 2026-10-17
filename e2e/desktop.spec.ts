@@ -1053,7 +1053,7 @@ async function conversationBridge(
       bump();
       state.contractStatus = 'confirmed';
       state.adoptedProposal = state.proposal;
-      state.adopt = { available: false, reason: 'proposal-not-current' };
+      state.adopt = { available: true, reason: 'available' };
       snapshot.tasks[0].criteria = ['Export only the visible filtered rows.'];
     } else if (command.command === 'ConfigureTaskConversation') {
       configureAttempts += 1;
