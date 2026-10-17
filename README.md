@@ -42,6 +42,8 @@ Choose New goal, select a registered project and review the planning permission 
 
 Planning settings keep Lead or Orchestrator on the supported OpenAI profile, with existing-credit permission and finite task limits. After a successful turn, model and effort choices come from that turn's last-observed catalog. Choose an advertised pair and explicitly Save. Saving starts no work. The next admitted turn checks the pair again before sending its prompt. Missing or stale choices keep their reason. Returning to the profile default also needs an explicit Save. Requested settings remain separate from acknowledged effective settings. Planning and later execution share the task's finite budget.
 
+Saving a material model or effort change creates a linked planning run and returns the task contract to provisional. Review and adopt a fresh valid plan before preparing execution.
+
 Future execution policy opens a separate preparation draft. Planning keeps read-only, tool-free permissions. Review the supported authority, source sharing and grants before explicit preparation. A saved or running execution keeps its frozen policy.
 
 Review the prepared source and permissions before Start. Changes shows retained work. Checks and review prepares and reports separate evidence; a matching supported result still needs destination-specific permission for local branch acceptance. Messages cannot approve actions or accept code. Uncertain commands keep their exact receipt for explicit retry, and reopening starts no work. The [conversation CLI](apps/cli/README.md#task-conversations) exposes the same controller decisions.
