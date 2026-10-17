@@ -59,10 +59,10 @@ async function start() {
       },
     });
     secureWindow(window);
-    const bridge = installBridge(window, controller);
+    await installBridge(window, controller);
+    if (closing || window.isDestroyed()) return;
     await window.loadURL(rendererURL);
     window.show();
-    await bridge;
   }
 }
 void start().catch(async (error: unknown) => {
