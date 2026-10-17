@@ -85,7 +85,9 @@ The controller captures actual scratch after owned processes are quiescent. A ma
 
 One supervised synthetic task used the normal [desktop preparation and Start path](../apps/cli/README.md#native-repository-work). It completed after 68.528 seconds with one submission, changed `net.mjs`, added `docs/calculation.md` and retained a 1,177-byte patch. The run recorded native command activity, and the desktop displayed the full diff. The CLI exported the same candidate, and the same home reopened it without another submission. Original source, index, refs and unselected files stayed unchanged. All three native phases were quiescent with groups absent, and every owned process closed with zero status.
 
-That run used explicitly enabled existing credits. It ran no CrewKite checks, review or acceptance and did not exercise active Stop. Live repository Stop and full profile qualification remain pending. The profile's qualification date remains unset; existing single-file pilot evidence keeps its separate scope.
+That run used explicitly enabled existing credits. It ran no CrewKite checks, review or acceptance and did not exercise active Stop.
+
+On 17 October 2026, a separate normal desktop task exercised Stop after a durable submission marker and a live owned repository task process were observed. It retained interrupted, unverified work without a completed repository capture or application receipt. All three native phases became quiescent and their groups were absent. Original source, index and refs stayed unchanged. Normal Quit and same-home reopen preserved the task, scratch and bound artifacts without another submission. Existing credits were explicitly enabled for this run. This establishes active Stop for this exact OpenAI repository profile. Full profile qualification remains pending, and its qualification date remains unset. Existing single-file pilot evidence keeps its separate scope.
 
 ## Applying a replacement
 
