@@ -1047,7 +1047,7 @@ const getPlanningProfile = (snapshot: Snapshot) =>
   );
 function planningComposerControls(
   snapshot: Snapshot,
-  role: PlanningFields['role'],
+  role: PlanningFields['role'] | null,
   config?: TaskConversationState['configuration'],
   controls?: {
     choices?: ConversationModelChoices;
@@ -1056,7 +1056,7 @@ function planningComposerControls(
     onSelectEffort: (effort: string) => void;
   },
 ): Pick<ComposerControlsProps, 'primary' | 'policy'> {
-  const profile = getPlanningProfile(snapshot);
+  const profile = role === null ? undefined : getPlanningProfile(snapshot);
   const requestedModel = config
     ? (config.requestedModel ?? 'unknown')
     : (profile?.model ?? 'unknown');
@@ -1078,7 +1078,7 @@ function planningComposerControls(
     unknown && value === shown ? `${value} (requested)` : value;
   return {
     primary: {
-      roleLabel: roleLabels[role],
+      roleLabel: role === null ? 'Unassigned' : roleLabels[role],
       models: advertised
         ? advertised.map((choice) => ({
             id: choice.model,
@@ -1109,12 +1109,16 @@ function planningComposerControls(
         ? `Saved for later planning turns.${reason && reason !== 'available' ? ` ${reasonText(reason)}` : ''}`
         : advertised
           ? 'Last-observed choices. Saving a change needs a newly adopted plan before execution.'
-          : 'Planning profile',
+          : role === null
+            ? 'No saved primary planning configuration.'
+            : 'Planning profile',
       frozenReason:
         controls?.disabledReason ??
         (advertised
           ? undefined
-          : `Model and effort follow the planning profile. Requested model ${requestedModel}; effective model ${config?.effectiveModel ?? 'unknown'}. Requested effort ${requestedEffort}; effective effort ${config?.effectiveEffort ?? 'unknown'}.`),
+          : role === null
+            ? 'This task has no saved primary planning configuration.'
+            : `Model and effort follow the planning profile. Requested model ${requestedModel}; effective model ${config?.effectiveModel ?? 'unknown'}. Requested effort ${requestedEffort}; effective effort ${config?.effectiveEffort ?? 'unknown'}.`),
       onSelectModel: advertised ? controls?.onSelectModel : undefined,
       onSelectEffort: advertised ? controls?.onSelectEffort : undefined,
     },
@@ -2002,7 +2006,7 @@ export function ConversationView({
             controls: visible
               ? {
                   ...context.controls,
-                  ...planningComposerControls(snapshot, config?.selection.role ?? 'lead', config, {
+                  ...planningComposerControls(snapshot, config?.selection.role ?? null, config, {
                     choices,
                     disabledReason: stageBlocked,
                     onSelectModel: stageModel,
