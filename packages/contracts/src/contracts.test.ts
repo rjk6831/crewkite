@@ -20,6 +20,10 @@ import {
   ConversationContextRefSchema,
   ConversationContextRefsSchema,
   ConversationEntrySchema,
+  ConversationModelCatalogEntriesSchema,
+  ConversationModelCatalogSchema,
+  ConversationModelChoicesSchema,
+  ConversationModelRequestSchema,
   ConversationPageSchema,
   ConversationPlanningSelectionSchema,
   ConversationPlanProposalSchema,
@@ -656,6 +660,161 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     consent: 'explicit',
   };
   assert.deepEqual(ConversationPlanningSelectionSchema.parse(planning), planning);
+  assert.equal(
+    hashCanonical(ConversationPlanningSelectionSchema.parse(planning)),
+    hashCanonical(planning),
+  );
+  const modelRequest = {
+    version: 1,
+    observation: { artifactId: `art_${suffix}`, hash: 'a'.repeat(64) },
+    model: 'model-one',
+    effort: 'high',
+  };
+  assert.deepEqual(ConversationModelRequestSchema.parse(modelRequest), modelRequest);
+  assert.deepEqual(ConversationPlanningSelectionSchema.parse({ ...planning, modelRequest }), {
+    ...planning,
+    modelRequest,
+  });
+  assert(
+    ConversationModelRequestSchema.safeParse({
+      ...modelRequest,
+      model: `${'界'.repeat(66)}ab`,
+      effort: `${'界'.repeat(10)}ab`,
+    }).success,
+  );
+  for (const change of [
+    { version: 2 },
+    { observation: { ...modelRequest.observation, hash: 'a'.repeat(63) } },
+    { observation: { ...modelRequest.observation, artifactId: `tsk_${suffix}` } },
+    { observation: { ...modelRequest.observation, executable: '/private/client' } },
+    { model: '' },
+    { model: '   ' },
+    { model: 'a'.repeat(201) },
+    { model: '界'.repeat(67) },
+    { model: 'model\nname' },
+    { model: '\ud800' },
+    { effort: '' },
+    { effort: 'a'.repeat(33) },
+    { effort: '界'.repeat(11) },
+    { effort: 'high\u0085' },
+    { effort: '\ud800' },
+    { account: 'private-account' },
+  ])
+    assert.equal(
+      ConversationModelRequestSchema.safeParse({ ...modelRequest, ...change }).success,
+      false,
+    );
+  const catalogModel = {
+    model: modelRequest.model,
+    efforts: ['low', 'high'],
+    defaultEffort: 'low',
+  };
+  const catalog = {
+    version: 1,
+    profileId: planning.profileId,
+    taskId: conversationBinding.taskId,
+    runId: conversationBinding.runId,
+    attemptId: conversationBinding.attemptId,
+    generation: 0,
+    observedAt: '2026-10-17T00:00:00Z',
+    profileHash: 'b'.repeat(64),
+    client: { executable: '/private/client', sha256: 'c'.repeat(64), version: '1.0.0' },
+    locationHash: 'd'.repeat(64),
+    models: [catalogModel],
+  };
+  assert.deepEqual(ConversationModelCatalogSchema.parse(catalog), catalog);
+  const maximumModels = Array.from({ length: 20 }, (_, index) => ({
+    model: 'm'.repeat(198) + String(index).padStart(2, '0'),
+    efforts: Array.from(
+      { length: 16 },
+      (_, effort) => 'e'.repeat(30) + String(effort).padStart(2, '0'),
+    ),
+    defaultEffort: `${'e'.repeat(30)}00`,
+  }));
+  assert(ConversationModelCatalogEntriesSchema.safeParse(maximumModels).success);
+  for (const models of [
+    [],
+    [...maximumModels, { ...catalogModel, model: 'model-extra' }],
+    [catalogModel, catalogModel],
+    [{ ...catalogModel, efforts: [] }],
+    [
+      {
+        ...catalogModel,
+        efforts: Array.from({ length: 17 }, (_, index) => `effort-${index}`),
+        defaultEffort: 'effort-0',
+      },
+    ],
+    [{ ...catalogModel, efforts: ['low', 'low'] }],
+    [{ ...catalogModel, defaultEffort: 'missing' }],
+    [{ ...catalogModel, account: 'private-account' }],
+    [{ ...catalogModel, efforts: ['low', ' '] }],
+  ])
+    assert.equal(ConversationModelCatalogEntriesSchema.safeParse(models).success, false);
+  const escapedModels = maximumModels.map((entry, index) => ({
+    model: '"'.repeat(198) + String(index).padStart(2, '0'),
+    efforts: entry.efforts.map((effort) => '"'.repeat(30) + effort.slice(-2)),
+    defaultEffort: `${'"'.repeat(30)}00`,
+  }));
+  const oversizedCatalog = {
+    ...catalog,
+    models: escapedModels,
+    client: { ...catalog.client, executable: '"'.repeat(4096) },
+  };
+  assert(Buffer.byteLength(canonicalJson(oversizedCatalog)) > 32768);
+  for (const change of [
+    { profileId: 'custom-profile' },
+    { generation: -1 },
+    { client: { ...catalog.client, executable: '界'.repeat(1366) } },
+    { client: { ...catalog.client, version: '界'.repeat(67) } },
+    { client: { ...catalog.client, account: 'private-account' } },
+    { locationHash: 'd'.repeat(63) },
+    { observedAt: 'yesterday' },
+    oversizedCatalog,
+  ])
+    assert.equal(
+      ConversationModelCatalogSchema.safeParse({ ...catalog, ...change }).success,
+      false,
+    );
+  const modelChoices = {
+    status: 'last-observed',
+    observation: modelRequest.observation,
+    observedAt: catalog.observedAt,
+    models: catalog.models,
+    reason: 'available',
+  };
+  const unobservedModels = {
+    status: 'not-observed',
+    observation: null,
+    observedAt: null,
+    models: [],
+    reason: 'not-observed',
+  };
+  for (const choices of [
+    modelChoices,
+    unobservedModels,
+    { ...modelChoices, reason: 'model-unavailable' },
+    { ...modelChoices, reason: 'effort-unavailable' },
+    { ...modelChoices, status: 'client-changed', reason: 'client-changed' },
+    { ...modelChoices, status: 'unavailable', models: [], reason: 'observation-stale' },
+    { ...unobservedModels, status: 'unavailable', reason: 'catalog-unavailable' },
+  ])
+    assert.deepEqual(ConversationModelChoicesSchema.parse(choices), choices);
+  for (const choices of [
+    { ...modelChoices, observation: null },
+    { ...modelChoices, observedAt: null },
+    { ...modelChoices, models: [] },
+    { ...modelChoices, reason: 'client-changed' },
+    { ...modelChoices, reason: 'invented-reason' },
+    { ...modelChoices, status: 'unavailable', reason: 'observation-missing' },
+    { ...unobservedModels, models: catalog.models },
+    { ...unobservedModels, reason: 'available' },
+    { ...unobservedModels, status: 'client-changed', reason: 'client-changed' },
+    { ...modelChoices, client: catalog.client },
+    { ...modelChoices, executable: catalog.client.executable },
+    { ...modelChoices, locationHash: catalog.locationHash },
+    { ...modelChoices, account: 'private-account' },
+  ])
+    assert.equal(ConversationModelChoicesSchema.safeParse(choices).success, false);
   assert(
     ConversationPlanningSelectionSchema.safeParse({ ...planning, role: 'orchestrator' }).success,
   );
@@ -688,6 +847,14 @@ test('process boundaries reject unknown fields and invalid command identity', ()
   ] as const) {
     const request = { ...command, command: name, payload };
     assert.deepEqual(CommandSchema.parse(request), request);
+    assert.equal(hashCanonical(CommandSchema.parse(request)), hashCanonical(request));
+    if ('planning' in payload) {
+      const selectedRequest = {
+        ...request,
+        payload: { ...payload, planning: { ...planning, modelRequest } },
+      };
+      assert.deepEqual(CommandSchema.parse(selectedRequest), selectedRequest);
+    }
     assert.equal(
       CommandSchema.safeParse({ ...request, expectedRevision: undefined }).success,
       false,
@@ -733,6 +900,39 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     adopt: { available: false, reason: 'proposal-missing' },
   };
   assert.deepEqual(TaskConversationStateSchema.parse(conversationState), conversationState);
+  assert.equal(
+    hashCanonical(TaskConversationStateSchema.parse(conversationState)),
+    hashCanonical(conversationState),
+  );
+  assert.deepEqual(TaskConversationStateSchema.parse({ ...conversationState, modelChoices }), {
+    ...conversationState,
+    modelChoices,
+  });
+  const oversizedModelState = {
+    ...conversationState,
+    modelChoices: { ...modelChoices, models: escapedModels },
+    pendingQuestions: Array.from({ length: 100 }, (_, index) => ({
+      id: `msg_${suffix.slice(0, -3)}${String(index).padStart(3, '0')}`,
+      cursor: String(index),
+    })),
+  };
+  assert(ConversationModelChoicesSchema.safeParse(oversizedModelState.modelChoices).success);
+  assert(Buffer.byteLength(canonicalJson(oversizedModelState)) > 32768);
+  assert.equal(TaskConversationStateSchema.safeParse(oversizedModelState).success, false);
+  for (const reason of [
+    'observation-missing',
+    'observation-stale',
+    'client-changed',
+    'catalog-unavailable',
+    'model-unavailable',
+    'effort-unavailable',
+  ])
+    assert(
+      TaskConversationStateSchema.safeParse({
+        ...conversationState,
+        send: { available: false, disposition: null, reason },
+      }).success,
+    );
   assert(
     ReadDataSchema.safeParse({ kind: 'conversation-state', state: conversationState }).success,
   );

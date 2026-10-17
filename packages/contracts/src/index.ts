@@ -1707,12 +1707,141 @@ export type ConversationPage = z.infer<typeof ConversationPageSchema>;
 export type ConversationPlanProposal = z.infer<typeof ConversationPlanProposalSchema>;
 export type ConversationTurnBinding = z.infer<typeof ConversationTurnBindingSchema>;
 export type ConversationTurnResult = z.infer<typeof ConversationTurnResultSchema>;
+const conversationModelText = (maximumBytes: number) =>
+  z
+    .string()
+    .min(1)
+    .max(maximumBytes)
+    .refine(
+      (value) =>
+        value.isWellFormed() &&
+        !/\p{Cc}/u.test(value) &&
+        value.trim().length > 0 &&
+        new TextEncoder().encode(value).byteLength <= maximumBytes,
+      'Model metadata needs bounded text without control characters.',
+    );
+const conversationModelObservation = z.strictObject({
+  artifactId: ArtifactIdSchema,
+  hash: HashSchema,
+});
+export const ConversationModelRequestSchema = z.strictObject({
+  version: z.literal(1),
+  observation: conversationModelObservation,
+  model: conversationModelText(200),
+  effort: conversationModelText(32),
+});
+export const ConversationModelCatalogEntrySchema = z
+  .strictObject({
+    model: ConversationModelRequestSchema.shape.model,
+    efforts: z.array(ConversationModelRequestSchema.shape.effort).min(1).max(16),
+    defaultEffort: ConversationModelRequestSchema.shape.effort,
+  })
+  .refine(
+    (entry) =>
+      new Set(entry.efforts).size === entry.efforts.length &&
+      entry.efforts.includes(entry.defaultEffort),
+    'Model efforts must be distinct and include their default.',
+  );
+const conversationModelEntries = z
+  .array(ConversationModelCatalogEntrySchema)
+  .max(20)
+  .refine(
+    (models) => new Set(models.map((entry) => entry.model)).size === models.length,
+    'Catalog model identifiers must be distinct.',
+  );
+export const ConversationModelCatalogEntriesSchema = conversationModelEntries.min(1);
+export const ConversationModelCatalogSchema = z
+  .strictObject({
+    version: z.literal(1),
+    profileId: z.literal('openai-file-v1'),
+    taskId: TaskIdSchema,
+    runId: RunIdSchema,
+    attemptId: AttemptIdSchema,
+    generation: RevisionSchema,
+    observedAt: TimestampSchema,
+    profileHash: HashSchema,
+    client: z.strictObject({
+      executable: conversationModelText(4096),
+      sha256: HashSchema,
+      version: conversationModelText(200),
+    }),
+    locationHash: HashSchema,
+    models: ConversationModelCatalogEntriesSchema,
+  })
+  .refine(
+    (catalog) => conversationBytes(catalog) <= 32768,
+    'A model catalog exceeds 32768 encoded bytes.',
+  );
+const conversationModelFailureReasons = [
+  'observation-missing',
+  'observation-stale',
+  'client-changed',
+  'catalog-unavailable',
+  'model-unavailable',
+  'effort-unavailable',
+] as const;
+export const ConversationModelReasonSchema = z.enum([
+  'available',
+  'not-observed',
+  ...conversationModelFailureReasons,
+]);
+export const ConversationModelChoicesSchema = z
+  .strictObject({
+    status: z.enum(['not-observed', 'last-observed', 'client-changed', 'unavailable']),
+    observation: conversationModelObservation.nullable(),
+    observedAt: TimestampSchema.nullable(),
+    models: conversationModelEntries,
+    reason: ConversationModelReasonSchema,
+  })
+  .superRefine((choices, context) => {
+    const fail = (message: string) => context.addIssue({ code: 'custom', message });
+    if ((choices.observation === null) !== (choices.observedAt === null))
+      fail('Model observation identity and time must be present together.');
+    switch (choices.status) {
+      case 'not-observed':
+        if (
+          choices.observation !== null ||
+          choices.models.length !== 0 ||
+          choices.reason !== 'not-observed'
+        )
+          fail('Unobserved model choices cannot contain a catalog.');
+        break;
+      case 'last-observed':
+      case 'client-changed':
+        if (
+          choices.observation === null ||
+          choices.models.length === 0 ||
+          !(choices.status === 'client-changed'
+            ? choices.reason === 'client-changed'
+            : ['available', 'model-unavailable', 'effort-unavailable'].includes(choices.reason))
+        )
+          fail('Observed model choices need a catalog reference and its current status.');
+        break;
+      case 'unavailable':
+        if (
+          choices.models.length !== 0 ||
+          !['observation-missing', 'observation-stale', 'catalog-unavailable'].includes(
+            choices.reason,
+          )
+        )
+          fail('Unavailable model choices need an observation failure without catalog entries.');
+        break;
+    }
+    if (conversationBytes(choices) > 32768) fail('Model choices exceed 32768 encoded bytes.');
+  });
+export type ConversationModelRequest = z.infer<typeof ConversationModelRequestSchema>;
+export type ConversationModelCatalogEntry = z.infer<typeof ConversationModelCatalogEntrySchema>;
+export type ConversationModelCatalogEntries = z.infer<typeof ConversationModelCatalogEntriesSchema>;
+export type ConversationModelCatalog = z.infer<typeof ConversationModelCatalogSchema>;
+export type ConversationModelChoices = z.infer<typeof ConversationModelChoicesSchema>;
+export type ConversationModelReason = z.infer<typeof ConversationModelReasonSchema>;
 export const ConversationPlanningSelectionSchema = z.strictObject({
   role: z.enum(['lead', 'orchestrator']),
   profileId: z.literal('openai-file-v1'),
   creditPolicy: z.enum(['ordinary', 'existing-credits']),
   limits: LimitsSchema,
   consent: z.literal('explicit'),
+  modelRequest: ConversationModelRequestSchema.optional(),
 });
 export type ConversationPlanningSelection = z.infer<typeof ConversationPlanningSelectionSchema>;
 export const ConversationActionReasonSchema = z.enum([
@@ -1741,6 +1870,7 @@ export const ConversationActionReasonSchema = z.enum([
   'execution-active',
   'task-not-discussing',
   'controller-closing',
+  ...conversationModelFailureReasons,
 ]);
 const conversationProposalReference = z.strictObject({
   id: MessageIdSchema,
@@ -1776,6 +1906,7 @@ export const TaskConversationStateSchema = z
         effectiveEffort: label.nullable(),
       })
       .nullable(),
+    modelChoices: ConversationModelChoicesSchema.optional(),
     currentRunId: RunIdSchema.nullable(),
     activeAttempt: AttemptSchema.nullable(),
     budget: z.strictObject({ limits: LimitsSchema, remaining: RemainingBudgetsSchema }).nullable(),
