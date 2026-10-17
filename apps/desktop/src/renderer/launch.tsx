@@ -6,6 +6,7 @@ import {
   NativeHandoffPreparationPayloadSchema,
   type NativeHandoffTarget,
   NativeHandoffTargetsSchema,
+  NativePreparationPayloadSchema,
   NativeTargetPathSchema,
   type Policy,
   PolicySchema,
@@ -34,7 +35,7 @@ import {
   ShieldCheck,
   Users,
 } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
 import {
   actionName,
   CurrentCheckoutChanges,
@@ -48,6 +49,7 @@ import {
   SourceFacts,
   titleCase,
 } from './components.tsx';
+import { LocalSetup, localModelStates } from './local-setup.tsx';
 import type { Workspace } from './source.ts';
 import { loadTeams, roleLabels, type SavedTeam, saveTeam } from './templates.ts';
 
@@ -709,14 +711,432 @@ export function NativeEvaluation({
 }
 
 export function Launch(props: LaunchProps) {
-  const [native, setNative] = useState<'file' | 'repository' | null>(() => {
+  const [native, setNative] = useState<'file' | 'repository' | 'local' | null>(() => {
     const current = props.snapshot.nativeRuns.find((run) => run.runId === props.task.runId);
-    return current ? (current.profileId === 'openai-repository-v1' ? 'repository' : 'file') : null;
+    return current
+      ? current.profileId === 'local-file-v1'
+        ? 'local'
+        : current.profileId === 'openai-repository-v1'
+          ? 'repository'
+          : 'file'
+      : null;
   });
-  return native ? (
+  return native === 'local' ? (
+    <LocalFileLaunch {...props} onBack={() => setNative(null)} />
+  ) : native ? (
     <NativeLaunch {...props} scope={native} onBack={() => setNative(null)} />
   ) : (
     <ScriptedLaunch {...props} onNative={setNative} />
+  );
+}
+
+function LocalFileLaunch({
+  task,
+  snapshot,
+  workspace,
+  onClose,
+  onBack,
+}: LaunchProps & { onBack: () => void }) {
+  const project = snapshot.projects.find((value) => value.id === task.projectId);
+  const profile = snapshot.nativeProfiles.find(
+    (value) => value.family === 'local' && value.id === 'local-file-v1',
+  );
+  const capability = snapshot.nativeRuns.find(
+    (value) => value.runId === task.runId && value.profileId === 'local-file-v1',
+  );
+  const saved = capability
+    ? snapshot.runs.find((value) => value.id === capability.runId)
+    : undefined;
+  const [prepared, setPrepared] = useState<Run | null>(saved ?? null);
+  const [targetPath, setTargetPath] = useState(capability?.target?.path ?? '');
+  const targetErrorId = useId();
+  const validTarget = NativeTargetPathSchema.safeParse(targetPath).success;
+  const [minutes, setMinutes] = useState('5');
+  const [grantExpiry] = useState(() => new Date(Date.now() + 86400000).toISOString());
+  const [trust, setTrust] = useState(false);
+  const [sourceConsent, setSourceConsent] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const [requested, setRequested] = useState<'prepare' | 'start' | null>(null);
+  const [uncertain, setUncertain] = useState<'prepare' | 'start' | null>(null);
+  const connected = workspace.connection === 'connected' && !workspace.preview;
+  const idle = connected && !workspace.pending && !requested && !workspace.retryAvailable;
+  const selected = snapshot.localSetup?.observation?.models.find(
+    (model) => model.selectionId === snapshot.localSetup?.selection?.selectionId,
+  );
+  const setupHash = snapshot.localSetup?.setupHash;
+  const matchingSetup = Boolean(
+    profile?.modelBinding &&
+      profile.modelBinding.setupHash === setupHash &&
+      snapshot.localSetup?.generation === 'idle' &&
+      !snapshot.localSetup.operation,
+  );
+  const policy: Policy = {
+    authority: 'guided',
+    quality: 'quick',
+    methods: [{ id: 'keep-it-simple', cycles: 1, reviewerRole: 'reviewer' }],
+    limits: { attempts: 3, minutes: Number(minutes), concurrency: 1 },
+    reserves: [],
+    unknownUsage: { rule: 'fixed-allowance', allowance: { launches: 1, minutes: Number(minutes) } },
+    effects: [
+      {
+        taskId: task.id,
+        action: 'write-scratch',
+        target: project?.name ?? task.projectId,
+        usesRemaining: 1,
+        revoked: false,
+        expiresAt: grantExpiry,
+      },
+    ],
+  };
+  const valid =
+    PolicySchema.safeParse(policy).success && Number(minutes) >= 1 && Number(minutes) <= 5;
+  const allowed =
+    idle && profile?.available && matchingSetup && trust && sourceConsent && valid && validTarget;
+  const currentPrepared = prepared?.id === task.runId && capability?.runId === prepared?.id;
+  const startable =
+    idle &&
+    profile?.available &&
+    matchingSetup &&
+    currentPrepared &&
+    capability?.stage === 'prepared' &&
+    capability.localModel?.setupHash === setupHash &&
+    Boolean(capability.expiresAt && Date.parse(capability.expiresAt) > Date.now());
+  const clearConsent = () => {
+    setTrust(false);
+    setSourceConsent(false);
+  };
+  useEffect(() => {
+    if (setupHash !== undefined) {
+      setTrust(false);
+      setSourceConsent(false);
+    }
+  }, [setupHash]);
+  function acceptPreparation(entity: unknown) {
+    const parsed = RunSchema.safeParse(entity);
+    if (parsed.success && parsed.data.taskId === task.id) {
+      setPrepared(parsed.data);
+      clearConsent();
+      return true;
+    }
+    return false;
+  }
+  async function prepare() {
+    if (!allowed) return;
+    const payload = NativePreparationPayloadSchema.safeParse({
+      taskId: task.id,
+      profileId: 'local-file-v1',
+      targetPath,
+      policy: {
+        ...policy,
+        effects: policy.effects.map((grant) => ({
+          ...grant,
+          expiresAt: new Date(Date.now() + 86400000).toISOString(),
+        })),
+      },
+      consent: 'explicit',
+    });
+    if (!payload.success) return;
+    setRequested('prepare');
+    setMessage(null);
+    setUncertain(null);
+    try {
+      const result = await workspace.command({
+        command: 'PrepareNativeRun',
+        expectedRevision: task.revision,
+        payload: payload.data,
+      });
+      if (
+        (result.outcome === 'applied' || result.outcome === 'already-applied') &&
+        acceptPreparation(result.entity)
+      )
+        setMessage(null);
+      else {
+        setMessage(
+          result.next ??
+            result.reason ??
+            'The Local preparation was not confirmed. Inspect the saved task.',
+        );
+        if (result.outcome === 'outcome-unknown') setUncertain('prepare');
+      }
+    } catch {
+      setMessage(
+        'Local preparation could not be confirmed. Use exact retry before preparing again.',
+      );
+      setUncertain('prepare');
+    } finally {
+      setRequested(null);
+    }
+  }
+  async function start() {
+    if (!startable || !prepared) return;
+    setRequested('start');
+    setMessage(null);
+    setUncertain(null);
+    try {
+      const result = await workspace.command({
+        command: 'StartRun',
+        expectedRevision: task.revision,
+        payload: { taskId: task.id, runId: prepared.id },
+      });
+      if (result.outcome === 'applied' || result.outcome === 'already-applied') onClose();
+      else {
+        setMessage(
+          result.next ??
+            result.reason ??
+            'The Local proposal did not start. Inspect the saved task.',
+        );
+        if (result.outcome === 'outcome-unknown') setUncertain('start');
+      }
+    } catch {
+      setMessage(
+        'Local Start could not be confirmed. Inspect the saved task and use exact retry if available.',
+      );
+      setUncertain('start');
+    } finally {
+      setRequested(null);
+    }
+  }
+  useEffect(() => {
+    if (uncertain === 'prepare' && saved) setPrepared(saved);
+  }, [saved, uncertain]);
+  async function retry() {
+    if (!uncertain || !workspace.retryAvailable || !connected || workspace.pending) return;
+    try {
+      const result = await workspace.retryCommand();
+      if (result && (result.outcome === 'applied' || result.outcome === 'already-applied')) {
+        setUncertain(null);
+        setMessage(
+          'The exact command is confirmed. Inspect the current saved task before continuing.',
+        );
+      } else
+        setMessage(result?.next ?? result?.reason ?? 'The exact command is still unconfirmed.');
+    } catch {
+      setMessage('Exact retry could not be confirmed. Reconnect and retry the same command.');
+    }
+  }
+  return (
+    <Dialog
+      title={prepared ? 'Review the Local proposal' : 'Local file proposal'}
+      eyebrow="ONE EXISTING COMMITTED FILE"
+      onClose={onClose}
+      wide
+    >
+      <div className="launch-content view-stack">
+        {message && (
+          <p className="notice" role="status">
+            {message}
+          </p>
+        )}
+        {workspace.retryAvailable && (
+          <div className="button-row">
+            <p className="muted small">
+              Resolve the uncertain command before changing this proposal.
+            </p>
+            {uncertain && (
+              <button
+                className="button secondary"
+                type="button"
+                disabled={!connected || workspace.pending}
+                onClick={() => void retry()}
+              >
+                Retry exact command
+              </button>
+            )}
+          </div>
+        )}
+        <section className="card view-stack">
+          <div className="section-heading">
+            <h2>{profile?.displayName ?? 'Local writer unavailable'}</h2>
+            <span>Writer only · Qualification pending</span>
+          </div>
+          <p className="muted small">
+            One replacement in independent scratch. Local lead, orchestrator and formal review
+            remain unqualified. Model loading stays in the Local app.
+          </p>
+          <div className="facts-grid">
+            <Fact
+              label="Selected model"
+              value={selected?.identity.displayName ?? profile?.model ?? 'None'}
+            />
+            <Fact
+              label="Observed state"
+              value={selected ? localModelStates[selected.state] : 'Unknown'}
+            />
+            <Fact label="Context" value={selected?.contextLength?.toLocaleString() ?? 'Unknown'} />
+            <Fact label="Writer submissions" value={profile?.maximumSubmissions ?? 'Unknown'} />
+          </div>
+          {!profile?.available && (
+            <p className="notice" role="status">
+              Local preparation unavailable. Configure the connection, refresh models and select a
+              compatible loaded model.
+            </p>
+          )}
+          <details>
+            <summary>Local connection and model setup</summary>
+            <LocalSetup snapshot={snapshot} workspace={workspace} />
+          </details>
+        </section>
+        {prepared ? (
+          <>
+            <SourceFacts source={prepared.source} />
+            <section className="card view-stack">
+              <h2>Saved Local target</h2>
+              <Fact label="Frozen model" value={capability?.localModel?.modelKey ?? 'Unknown'} />
+              <code>{capability?.target?.path ?? 'Unavailable'}</code>
+              <p>{capability?.target?.bytes ?? 'Unknown'} bytes</p>
+              <p>
+                {prepared.policy.policy.limits.attempts} total attempts ·{' '}
+                {prepared.policy.policy.limits.minutes} total minutes ·{' '}
+                {prepared.policy.policy.limits.concurrency} concurrent writer
+              </p>
+              <p>
+                Consent expires{' '}
+                {capability?.expiresAt
+                  ? new Date(capability.expiresAt).toLocaleString()
+                  : 'Unknown'}
+                .
+              </p>
+              <details className="technical-details">
+                <summary>Frozen Local identity</summary>
+                <code>Original file {capability?.target?.baseHash ?? 'Unknown'}</code>
+                <code>Model {capability?.localModel?.modelKey ?? 'Unknown'}</code>
+                <code>Setup {capability?.localModel?.setupHash ?? 'Unknown'}</code>
+                {capability?.localModel && 'connectionHash' in capability.localModel && (
+                  <>
+                    <code>Connection {capability.localModel.connectionHash}</code>
+                    <code>Metadata {capability.localModel.metadataHash}</code>
+                    <code>
+                      Runtime {capability.localModel.runtimeVersion}, build{' '}
+                      {capability.localModel.runtimeBuild}
+                    </code>
+                  </>
+                )}
+              </details>
+            </section>
+          </>
+        ) : (
+          <section className="card view-stack">
+            <label>
+              Existing committed target
+              <input
+                value={targetPath}
+                placeholder="src/example.ts"
+                aria-invalid={targetPath.length > 0 && !validTarget}
+                aria-describedby={targetPath.length > 0 && !validTarget ? targetErrorId : undefined}
+                onChange={(event) => {
+                  setTargetPath(event.target.value);
+                  clearConsent();
+                }}
+              />
+            </label>
+            {targetPath.length > 0 && !validTarget && (
+              <p className="notice" role="alert" id={targetErrorId}>
+                Use a relative path to one existing committed text file.
+              </p>
+            )}
+            <label>
+              Maximum task minutes
+              <input
+                type="number"
+                min="1"
+                max="5"
+                step="1"
+                value={minutes}
+                onChange={(event) => {
+                  setMinutes(event.target.value);
+                  clearConsent();
+                }}
+              />
+            </label>
+            <p className="muted small">
+              Guided · Quick · One coder · 3 total attempts · One writer submission. The controller
+              rechecks the task allowance and exact model before Start.
+            </p>
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                checked={trust}
+                onChange={(event) => setTrust(event.target.checked)}
+              />
+              Trust the connected Local runtime and selected model
+            </label>
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                checked={sourceConsent}
+                onChange={(event) => setSourceConsent(event.target.checked)}
+              />
+              Send this committed file and task text; allow its replacement in independent scratch
+            </label>
+          </section>
+        )}
+        <section className="card">
+          <h2>Task criteria</h2>
+          <ul>
+            {task.criteria.map((criterion) => (
+              <li key={criterion}>{criterion}</li>
+            ))}
+          </ul>
+        </section>
+        <p className="notice">
+          The original checkout stays unchanged. Inspect retained Changes after the writer stops.
+          Patch export requires its own exact permission. Checks and the required review remain
+          pending and unavailable in this Local flow. Acceptance is unavailable.
+        </p>
+        {prepared && !startable && (
+          <p className="muted small" role="status">
+            Start needs the current prepared run, matching Local setup, available profile and
+            unexpired consent. Active or unknown ownership blocks another Start.
+          </p>
+        )}
+      </div>
+      <div className="dialog-footer">
+        <button className="button secondary" type="button" onClick={onClose}>
+          Close
+        </button>
+        {!prepared && (
+          <button className="button secondary" type="button" onClick={onBack}>
+            Other writers
+          </button>
+        )}
+        {prepared ? (
+          <>
+            {capability?.stage === 'prepared' && (
+              <button
+                className="button secondary"
+                type="button"
+                disabled={!idle}
+                onClick={() => {
+                  setPrepared(null);
+                  clearConsent();
+                }}
+              >
+                Edit proposal
+              </button>
+            )}
+            <button
+              className="button primary"
+              type="button"
+              disabled={!startable}
+              onClick={() => void start()}
+            >
+              Start Local proposal
+              <ArrowRight size={14} />
+            </button>
+          </>
+        ) : (
+          <button
+            className="button primary"
+            type="button"
+            disabled={!allowed}
+            onClick={() => void prepare()}
+          >
+            Prepare Local proposal
+            <ArrowRight size={14} />
+          </button>
+        )}
+      </div>
+    </Dialog>
   );
 }
 
@@ -742,7 +1162,9 @@ function NativeLaunch({
     .filter((value) => (value.id === 'openai-repository-v1') === repository);
   const current = snapshot.nativeRuns.find(
     (value) =>
-      value.runId === task.runId && (value.profileId === 'openai-repository-v1') === repository,
+      value.runId === task.runId &&
+      value.profileId !== 'local-file-v1' &&
+      (value.profileId === 'openai-repository-v1') === repository,
   );
   const saved = current ? snapshot.runs.find((value) => value.id === task.runId) : undefined;
   const [profileId, setProfileId] = useState(
@@ -2142,7 +2564,7 @@ function ScriptedLaunch({
   onClose,
   onNative,
 }: {
-  onNative: (scope: 'file' | 'repository') => void;
+  onNative: (scope: 'file' | 'repository' | 'local') => void;
   task: Task;
   snapshot: Snapshot;
   workspace: Workspace;
@@ -2589,6 +3011,10 @@ function ScriptedLaunch({
           </button>
           <button type="button" className="button secondary" onClick={() => onNative('repository')}>
             Repository work
+            <ArrowRight size={14} />
+          </button>
+          <button type="button" className="button secondary" onClick={() => onNative('local')}>
+            Local file proposal
             <ArrowRight size={14} />
           </button>
         </div>
