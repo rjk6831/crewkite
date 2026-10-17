@@ -666,6 +666,29 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     limits: { attempts: 8, minutes: 20, concurrency: 2 },
     consent: 'explicit' as const,
   };
+  const modelRequest = {
+    version: 1,
+    observation: { artifactId: `art_${suffix}`, hash: 'd'.repeat(64) },
+    model: 'planning-model-choice',
+    effort: 'native-effort-high',
+  };
+  const modelRequestPath = join(timedFixture.home, 'planning-model-request.json');
+  writeFileSync(modelRequestPath, JSON.stringify(modelRequest));
+  const invalidModelRequests = [
+    '{',
+    '[]',
+    JSON.stringify({ ...modelRequest, version: 2 }),
+    JSON.stringify({ ...modelRequest, model: 'é'.repeat(101) }),
+    JSON.stringify({ ...modelRequest, effort: 'é'.repeat(17) }),
+    JSON.stringify({ ...modelRequest, observation: { ...modelRequest.observation, hash: 'bad' } }),
+    JSON.stringify({ ...modelRequest, provider: 'arbitrary' }),
+    JSON.stringify({ ...modelRequest, observation: { ...modelRequest.observation, path: '/tmp' } }),
+    `${JSON.stringify(modelRequest)}${' '.repeat(MAX_FRAME_BYTES)}`,
+  ].map((text, index) => {
+    const path = join(timedFixture.home, `invalid-planning-request-${index}.json`);
+    writeFileSync(path, text);
+    return path;
+  });
   const conversationState: TaskConversationState = {
     taskId: task.id,
     revision: task.revision,
@@ -698,6 +721,19 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     adoptedProposal: null,
     send: { available: true, reason: 'available', disposition: 'turn' },
     adopt: { available: true, reason: 'available' },
+    modelChoices: {
+      status: 'last-observed',
+      observation: modelRequest.observation,
+      observedAt: '2026-10-18T01:00:00.000Z',
+      models: [
+        {
+          model: modelRequest.model,
+          efforts: ['low', modelRequest.effort],
+          defaultEffort: 'low',
+        },
+      ],
+      reason: 'available',
+    },
   };
   const conversationEntry: ConversationEntry = {
     id: `msg_${suffix}`,
@@ -743,6 +779,11 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         taskId: task.id,
         planning: { ...planningSelection, role: 'orchestrator', creditPolicy: 'existing-credits' },
       },
+    },
+    {
+      args: ['configure', task.id, ...planningArgs, '--model-request', modelRequestPath],
+      command: 'ConfigureTaskConversation',
+      payload: { taskId: task.id, planning: { ...planningSelection, modelRequest } },
     },
     {
       args: ['send', task.id, '--text', 'Keep this exact message'],
@@ -814,6 +855,25 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       ['configure', task.id, ...planningArgs.map((value) => (value === '8' ? '1e2' : value))],
       ['configure', task.id, ...planningArgs.map((value) => (value === '20' ? '1441' : value))],
       ['configure', task.id, ...planningArgs, '--text', 'No scope amendment'],
+      ...invalidModelRequests.map((path) => [
+        'configure',
+        task.id,
+        ...planningArgs,
+        '--model-request',
+        path,
+      ]),
+      [
+        'create',
+        task.projectId,
+        '--text',
+        'Goal',
+        ...planningArgs,
+        '--model-request',
+        modelRequestPath,
+      ],
+      ['show', task.id, '--model-request', modelRequestPath],
+      ['send', task.id, '--text', 'No configuration change', '--model-request', modelRequestPath],
+      ['configure', task.id, ...planningArgs, '--model-request'],
       ['send', task.id, '--text', ' '],
       ['send', task.id, '--text', 'é'.repeat(2049)],
       ['send', task.id, '--text', 'No grants', '--grants', 'grant.json'],
@@ -914,6 +974,12 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       assert(plain.output.includes('effective model unknown'));
       assert(plain.output.includes(conversationEntry.id));
       assert(plain.output.includes('Older page before 7'));
+      assert(plain.output.includes(modelRequest.model));
+      assert(plain.output.includes(modelRequest.effort));
+      assert(plain.output.includes('last-observed'));
+      assert(plain.output.includes(modelRequest.observation.artifactId));
+      assert(plain.output.includes(modelRequest.observation.hash));
+      assert(plain.output.includes(conversationState.modelChoices?.observedAt as string));
       assert(!plain.output.includes('\u001b'));
       assert(plain.output.includes('\\u001b'));
       assert(!plain.output.includes('\r'));
@@ -925,6 +991,11 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       );
       const receipt = JSON.parse(result.output);
       assert.deepEqual(receipt.command, command);
+      if (row.command === 'ConfigureTaskConversation')
+        assert.deepEqual(
+          conversationCommands.map((value) => value.command),
+          ['GetSnapshot', 'ConfigureTaskConversation'],
+        );
       const plain = await executeConversation(['conversation', ...row.args], false);
       assert(!plain.output.includes('\u001b'));
       assert(plain.output.includes('\\u001b'));
@@ -952,6 +1023,27 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     savedConversationReceipt.command,
   );
   assert.deepEqual(conversationCommands.at(-1), savedConversationReceipt.command);
+  conversationOutcome = 'outcome-unknown';
+  const uncertainModelRequest = await executeConversation([
+    'conversation',
+    'configure',
+    task.id,
+    ...planningArgs,
+    '--model-request',
+    modelRequestPath,
+  ]);
+  assert.equal(uncertainModelRequest.code, 2, uncertainModelRequest.errors);
+  const savedModelRequest = JSON.parse(uncertainModelRequest.output);
+  assert.deepEqual(savedModelRequest.command.payload.planning.modelRequest, modelRequest);
+  const modelReceiptPath = join(conversationFixture.home, 'model-request-receipt.json');
+  writeFileSync(modelReceiptPath, uncertainModelRequest.output);
+  writeFileSync(modelRequestPath, '{');
+  conversationOutcome = 'applied';
+  const retriedModelRequest = await executeConversation(['retry', modelReceiptPath]);
+  assert.equal(retriedModelRequest.code, 0, retriedModelRequest.errors);
+  assert.deepEqual(JSON.parse(retriedModelRequest.output).command, savedModelRequest.command);
+  assert.deepEqual(conversationCommands.at(-1), savedModelRequest.command);
+  writeFileSync(modelRequestPath, JSON.stringify(modelRequest));
   conversationOutcome = 'blocked';
   const refusedConversation = await executeConversation([
     'conversation',
