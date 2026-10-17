@@ -409,6 +409,7 @@ function configurationField<T>(
   check: ConfigurationDetail['check'],
   schema: z.ZodType<T>,
   matches: (value: T) => boolean,
+  defaultValue?: T,
 ) {
   const parsed = fieldsSchema.safeParse(config);
   if (!parsed.success) throw new ConfigurationFailure(section, 'malformed');
@@ -416,8 +417,8 @@ function configurationField<T>(
   if (new Set(fields.map((item) => item.key)).size !== fields.length)
     throw new ConfigurationFailure(section, 'duplicate');
   const entry = fields.find((item) => item.key === key);
-  if (!entry) throw new ConfigurationFailure(check, 'missing');
-  configurationValue(entry.value, check, schema, matches);
+  if (!entry && defaultValue === undefined) throw new ConfigurationFailure(check, 'missing');
+  configurationValue(entry ? entry.value : defaultValue, check, schema, matches);
 }
 
 function sameModel(plan: LocalStart, value: unknown) {
@@ -644,6 +645,49 @@ export function startLocalPrediction(
         z.enum(['stopAtLimit', 'truncateMiddle', 'rollingWindow']),
         (value) => value === 'stopAtLimit',
       );
+      // Engine protocol removes prediction-time draft keys. Its loaded configuration owns drafting.
+      // SDK 2.1 defines absent load selectors as false and the absent draft model as empty.
+      const draftFlags = [
+        'draftMtp',
+        'draftSimple',
+        'draftDflashSidecar',
+        'draftDsparkSidecar',
+        'draftMtpSidecar',
+      ];
+      const draftFields = new Set([
+        ...draftFlags,
+        'draftModel',
+        'draftMaxTokens',
+        'draftMinTokens',
+        'draftMinContinueProbability',
+      ]);
+      const draftPrefix = 'llm.load.speculativeDecoding.';
+      if (
+        terminal.loadConfig.fields.some(
+          ({ key }) =>
+            key.startsWith(draftPrefix) && !draftFields.has(key.slice(draftPrefix.length)),
+        )
+      )
+        throw new ConfigurationFailure('load-draft-disabled', 'mismatch');
+      for (const key of draftFlags)
+        configurationField(
+          terminal.loadConfig,
+          'load-fields',
+          draftPrefix + key,
+          'load-draft-disabled',
+          z.boolean(),
+          (value) => !value,
+          false,
+        );
+      configurationField(
+        terminal.loadConfig,
+        'load-fields',
+        `${draftPrefix}draftModel`,
+        'load-draft-disabled',
+        z.string(),
+        (value) => value === '',
+        '',
+      );
       configurationField(
         terminal.predictionConfig,
         'prediction-fields',
@@ -651,6 +695,24 @@ export function startLocalPrediction(
         'draft-disabled',
         z.string(),
         (value) => value === '',
+        '',
+      );
+      const draftCount = z.number().int().nonnegative().safe().optional();
+      configurationValue(
+        terminal.stats,
+        'draft-stats',
+        z.object({
+          usedDraftModelKey: z.string().optional(),
+          totalDraftTokensCount: draftCount,
+          acceptedDraftTokensCount: draftCount,
+          rejectedDraftTokensCount: draftCount,
+          ignoredDraftTokensCount: draftCount,
+        }),
+        (value) =>
+          (value.usedDraftModelKey === undefined || value.usedDraftModelKey === '') &&
+          Object.entries(value).every(
+            ([key, count]) => key === 'usedDraftModelKey' || count === undefined || count === 0,
+          ),
       );
       configurationValue(
         terminal.roundIndex,
@@ -671,8 +733,7 @@ export function startLocalPrediction(
         !terminal.content.isWellFormed() ||
         !terminal.nonReasoningContent.isWellFormed() ||
         Buffer.byteLength(terminal.nonReasoningContent) > MAX_STREAM_BYTES ||
-        Buffer.byteLength(terminal.content) > MAX_STREAM_BYTES ||
-        terminal.stats.usedDraftModelKey
+        Buffer.byteLength(terminal.content) > MAX_STREAM_BYTES
       )
         throw new Error();
       outputBytes = Math.max(outputBytes, Buffer.byteLength(terminal.content));

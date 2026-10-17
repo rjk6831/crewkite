@@ -461,6 +461,8 @@ test('Local ownership needs the same prediction terminal after cancellation or c
   let completed!: LocalTerminal;
   for (const row of [
     'complete',
+    'omitted prediction draft with default load selectors',
+    'omitted prediction draft with explicit load selectors',
     'stop',
     'completion race',
     'transport loss',
@@ -510,10 +512,31 @@ test('Local ownership needs the same prediction terminal after cancellation or c
         containsDrafted: false,
       });
       f.resolve(terminal('userStopped'));
+    } else if (row.startsWith('omitted prediction draft')) {
+      const value = terminal();
+      value.predictionConfig.fields = value.predictionConfig.fields.filter(
+        ({ key }) => key !== 'llm.prediction.speculativeDecoding.draftModel',
+      );
+      if (row === 'omitted prediction draft with explicit load selectors') {
+        for (const key of [
+          'draftMtp',
+          'draftSimple',
+          'draftDflashSidecar',
+          'draftDsparkSidecar',
+          'draftMtpSidecar',
+        ])
+          value.loadConfig.fields.push({
+            key: `llm.load.speculativeDecoding.${key}`,
+            value: false,
+          });
+        value.loadConfig.fields.push({ key: 'llm.load.speculativeDecoding.draftModel', value: '' });
+        value.stats = { ...value.stats, ...{ usedDraftModelKey: '', totalDraftTokensCount: 0 } };
+      }
+      f.resolve(value);
     } else f.resolve(terminal(row === 'stop' ? 'userStopped' : 'eosFound'));
     const outcome = await run.result;
     const expected =
-      row === 'complete' || row === 'completion race'
+      row === 'complete' || row === 'completion race' || row.startsWith('omitted prediction draft')
         ? 'completed'
         : row === 'stop'
           ? 'stopped'
@@ -616,15 +639,6 @@ test('Local ownership needs the same prediction terminal after cancellation or c
     },
     {
       check: 'draft-disabled',
-      status: 'missing',
-      change: (value) => {
-        value.predictionConfig.fields = value.predictionConfig.fields.filter(
-          (entry) => entry.key !== 'llm.prediction.speculativeDecoding.draftModel',
-        );
-      },
-    },
-    {
-      check: 'draft-disabled',
       status: 'malformed',
       change: (value) => {
         setField(value.predictionConfig, 'llm.prediction.speculativeDecoding.draftModel', {
@@ -693,6 +707,58 @@ test('Local ownership needs the same prediction terminal after cancellation or c
       },
     },
   ];
+  for (const key of [
+    'draftMtp',
+    'draftSimple',
+    'draftDflashSidecar',
+    'draftDsparkSidecar',
+    'draftMtpSidecar',
+    'draftModel',
+    'unrecognizedDrafter',
+  ])
+    configurationCases.push({
+      check: 'load-draft-disabled',
+      status: 'mismatch',
+      change: (value) => {
+        value.loadConfig.fields.push({
+          key: `llm.load.speculativeDecoding.${key}`,
+          value: key === 'draftModel' ? canary : true,
+        });
+        value.predictionConfig.fields = value.predictionConfig.fields.filter(
+          (entry) => entry.key !== 'llm.prediction.speculativeDecoding.draftModel',
+        );
+      },
+    });
+  for (const key of ['draftMtp', 'draftModel'])
+    configurationCases.push({
+      check: 'load-draft-disabled',
+      status: 'malformed',
+      change: (value) => {
+        value.loadConfig.fields.push({ key: `llm.load.speculativeDecoding.${key}`, value: null });
+      },
+    });
+  for (const key of [
+    'usedDraftModelKey',
+    'totalDraftTokensCount',
+    'acceptedDraftTokensCount',
+    'rejectedDraftTokensCount',
+    'ignoredDraftTokensCount',
+  ])
+    configurationCases.push({
+      check: 'draft-stats',
+      status: 'mismatch',
+      change: (value) => {
+        value.stats = { ...value.stats, [key]: key === 'usedDraftModelKey' ? canary : 1 };
+      },
+    });
+  for (const value of [canary, -1, Number.MAX_SAFE_INTEGER + 1])
+    configurationCases.push({
+      check: 'draft-stats',
+      status: 'malformed',
+      change: (terminal) => {
+        terminal.stats = { ...terminal.stats, ...{ totalDraftTokensCount: value } };
+      },
+    });
   for (const row of configurationCases) {
     const f = fixture();
     const run = startLocalPrediction(plan, {
