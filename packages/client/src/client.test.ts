@@ -9,6 +9,7 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
   type Command,
+  CommandSchema,
   type Event,
   MAX_FRAME_BYTES,
   type Snapshot,
@@ -344,6 +345,12 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     { recipe: 'project-node-tests-v1', expected: 5000 },
     { recipe: null, expected: 5000 },
     { recipe: 'usage', expected: 30000 },
+    { recipe: 'InitializeGoogleAcp', expected: 15000 },
+    { recipe: 'AuthenticateGoogleAcp', expected: 130000 },
+    { recipe: 'DiscoverGoogleAcp', expected: 30000 },
+    { recipe: 'StopGoogleAcpSetup', expected: 30000 },
+    { recipe: 'AuthenticateGoogleAcp', timeoutMs: 10000, expected: 10000 },
+    { recipe: 'AuthenticateGoogleAcp', timeoutMs: 140000, expected: 140000 },
     { recipe: 'usage', timeoutMs: 10000, expected: 10000 },
     { recipe: 'usage', timeoutMs: 40000, expected: 40000 },
     { recipe: 'crewkite-verify-v1', timeoutMs: 10000, expected: 10000 },
@@ -370,30 +377,51 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
                 expectedRevision: 0,
                 payload: { family: 'google' },
               }
-            : {
-                protocol: 1,
-                key: `cmd_${suffix}`,
-                actor,
-                command: 'PrepareCandidateEvaluation',
-                expectedRevision: task.revision,
-                payload: {
-                  taskId: task.id,
-                  candidateId: candidate.id,
-                  ...(row.recipe === 'project-node-tests-v1'
-                    ? { checkRecipeId: row.recipe, testFiles: projectTestFiles }
-                    : { checkRecipeId: row.recipe }),
-                  reviewer: { profileId: profile.id, methodId: 'keep-it-simple', cycles: 1 },
-                  creditPolicy: 'ordinary',
-                  consent: 'explicit',
-                  grants: grants.map((grant) => ({
-                    ...grant,
-                    target:
-                      grant.action === 'run-check' && row.recipe === 'crewkite-verify-v1'
-                        ? 'crewkite verify'
-                        : grant.target,
-                  })),
-                },
-              };
+            : row.recipe === 'InitializeGoogleAcp' ||
+                row.recipe === 'AuthenticateGoogleAcp' ||
+                row.recipe === 'DiscoverGoogleAcp' ||
+                row.recipe === 'StopGoogleAcpSetup'
+              ? CommandSchema.parse({
+                  protocol: 1,
+                  key: `cmd_${suffix}`,
+                  actor,
+                  command: row.recipe,
+                  expectedRevision: 0,
+                  payload: {
+                    profileId: 'google-acp-v1',
+                    ...(row.recipe === 'StopGoogleAcpSetup'
+                      ? { operationId: `cmd_${suffix}` }
+                      : { consent: 'explicit' }),
+                    ...(['AuthenticateGoogleAcp', 'DiscoverGoogleAcp'].includes(row.recipe)
+                      ? { proofId: artifact.id }
+                      : {}),
+                    ...(row.recipe === 'AuthenticateGoogleAcp' ? { method: 'oauth-personal' } : {}),
+                  },
+                })
+              : {
+                  protocol: 1,
+                  key: `cmd_${suffix}`,
+                  actor,
+                  command: 'PrepareCandidateEvaluation',
+                  expectedRevision: task.revision,
+                  payload: {
+                    taskId: task.id,
+                    candidateId: candidate.id,
+                    ...(row.recipe === 'project-node-tests-v1'
+                      ? { checkRecipeId: row.recipe, testFiles: projectTestFiles }
+                      : { checkRecipeId: row.recipe }),
+                    reviewer: { profileId: profile.id, methodId: 'keep-it-simple', cycles: 1 },
+                    creditPolicy: 'ordinary',
+                    consent: 'explicit',
+                    grants: grants.map((grant) => ({
+                      ...grant,
+                      target:
+                        grant.action === 'run-check' && row.recipe === 'crewkite-verify-v1'
+                          ? 'crewkite verify'
+                          : grant.target,
+                    })),
+                  },
+                };
       let settled = false;
       const response = client.command(command).then((value) => {
         settled = true;
@@ -478,6 +506,67 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     { name: 'extra-task', args: [...createArgs, 'other'], invalid: true },
   ];
 
+  const acpProfile: Snapshot['nativeProfiles'][number] = {
+    ...googleProfile,
+    id: 'google-acp-v1',
+    effort: 'thought-low',
+    effortSupported: ['thought-low', 'thought-high'],
+    configOptions: {
+      model: {
+        optionId: 'model',
+        currentValue: 'observed-model',
+        supported: ['observed-model', 'other-model'],
+      },
+      thoughtLevel: {
+        optionId: 'thought_level',
+        currentValue: 'thought-low',
+        supported: ['thought-low', 'thought-high'],
+      },
+    },
+    capabilities: {
+      protocolVersion: 1,
+      authMethods: ['oauth-personal'],
+      sessionClose: true,
+      fs: false,
+      terminal: false,
+    },
+    model: 'observed-model',
+    permissionModes: ['request-review'],
+    reason: 'qualification-pending',
+  };
+  const acpSetup: NonNullable<Snapshot['googleAcpSetup']> = {
+    profileId: 'google-acp-v1',
+    revision: 7,
+    state: 'ready',
+    operationId: null,
+    proofId: artifact.id,
+    client: { version: '1.4.0', sha256: 'a'.repeat(64), signerTeamId: 'TESTTEAM' },
+    auth: { method: 'oauth-personal', status: 'authenticated' },
+    reason: 'qualification-pending',
+  };
+  const acpCases = [
+    'show',
+    'initialize',
+    'authenticate',
+    'discover',
+    'stop',
+    'missing-consent',
+    'missing-proof',
+    'missing-operation',
+    'wrong-family',
+    'prepare',
+    'saved',
+    'model',
+    'thought',
+    'account',
+    'credits',
+    'mode',
+    'handoff',
+    'autopilot',
+    'model-only',
+    'import-consent-missing',
+    'approval',
+  ] as const;
   const usageReader: Snapshot['usageReaders'][number] = {
     id: 'google-usage-v1',
     family: 'google',
@@ -561,6 +650,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
   ];
 
   for (const scenario of [
+    ...acpCases.map((value) => `acp-${value}`),
     ...usageCases.map((value) => `usage-${value.name}`),
     ...creationCases.map((value) => `setup-${value.name}`),
     'show',
@@ -858,6 +948,52 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
             },
           ]
         : [];
+    const acp = scenario.startsWith('acp-');
+    const selectedAcpProfile =
+      scenario === 'acp-model-only'
+        ? {
+            ...acpProfile,
+            effort: 'unknown',
+            effortSupported: [],
+            configOptions: {
+              ...acpProfile.configOptions,
+              model: {
+                optionId: 'model',
+                currentValue: 'observed-model',
+                supported: ['observed-model', 'other-model'],
+              },
+              thoughtLevel: null,
+            },
+          }
+        : acpProfile;
+    const setupState = {
+      ...acpSetup,
+      ...(scenario === 'acp-initialize'
+        ? {
+            revision: 0,
+            state: 'uninitialized' as const,
+            proofId: null,
+            client: null,
+            auth: { method: null, status: 'unknown' as const },
+          }
+        : {}),
+      ...(scenario === 'acp-stop'
+        ? { state: 'authenticating' as const, operationId: `cmd_${suffix}` }
+        : {}),
+      ...(scenario === 'acp-missing-proof'
+        ? { proofId: null, state: 'uninitialized' as const }
+        : {}),
+    };
+    const acpApproval = {
+      ...approval,
+      action: 'write-scratch' as const,
+      acpTarget: {
+        sessionId: 'session',
+        toolCallId: 'tool',
+        optionId: 'once',
+        kind: 'allow_once' as const,
+      },
+    };
     const creationCase = creationCases.find((value) => scenario === `setup-${value.name}`);
     const usageCase = usageCases.find((value) => scenario === `usage-${value.name}`);
     const fixture = await serve((message, socket) => {
@@ -894,28 +1030,33 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
             kind: 'snapshot',
             snapshot: {
               ...snapshot,
+              ...(acp ? { googleAcpSetup: setupState } : {}),
               ...(usageCase ? { usageReaders: [usageReader], usage: usageWindows } : {}),
               projects: scenario.startsWith('repository-')
                 ? [{ id: task.projectId, name: 'fixture-project', revision: 0 }]
                 : snapshot.projects,
-              tasks: pendingCommand
-                ? [pendingTask]
-                : scenario === 'native-show' ||
-                    anthropicSaved ||
-                    googleSaved ||
-                    repositorySaved ||
-                    evaluating ||
-                    needsApproval ||
-                    handing
-                  ? [
-                      {
-                        ...task,
-                        runId: nativeRun.runId,
-                        ...(evaluating ? { state: 'stopped' as const } : {}),
-                      },
-                    ]
-                  : snapshot.tasks,
+              tasks:
+                scenario === 'acp-saved'
+                  ? [{ ...task, runId: nativeRun.runId }]
+                  : pendingCommand
+                    ? [pendingTask]
+                    : scenario === 'native-show' ||
+                        anthropicSaved ||
+                        googleSaved ||
+                        repositorySaved ||
+                        evaluating ||
+                        needsApproval ||
+                        handing
+                      ? [
+                          {
+                            ...task,
+                            runId: nativeRun.runId,
+                            ...(evaluating ? { state: 'stopped' as const } : {}),
+                          },
+                        ]
+                      : snapshot.tasks,
               runs:
+                scenario === 'acp-saved' ||
                 scenario === 'native-show' ||
                 anthropicSaved ||
                 googleSaved ||
@@ -938,25 +1079,52 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
                   ]
                 : snapshot.attempts,
               nativeRuns:
-                scenario === 'native-show' ||
-                anthropicSaved ||
-                googleSaved ||
-                repositorySaved ||
-                evaluating ||
-                handing
-                  ? [selectedNativeRun]
-                  : [],
+                scenario === 'acp-saved'
+                  ? [
+                      {
+                        ...nativeRun,
+                        profileId: 'google-acp-v1',
+                        permissionMode: 'request-review',
+                        billingAttestation: {
+                          source: 'user-attested',
+                          subscriptionLoginConfirmed: true,
+                          paidExtraUsageDisabled: true,
+                          quotaAccountConfirmed: true,
+                        },
+                        acp: {
+                          proofId: artifact.id,
+                          modelId: 'observed-model',
+                          thoughtLevelId: 'thought-low',
+                        },
+                      },
+                    ]
+                  : scenario === 'native-show' ||
+                      anthropicSaved ||
+                      googleSaved ||
+                      repositorySaved ||
+                      evaluating ||
+                      handing
+                    ? [selectedNativeRun]
+                    : [],
               candidates: evaluating || needsApproval ? [candidate] : [],
               artifacts: evaluating ? [artifact] : [],
               candidateEvaluations: evaluating ? [preview] : [],
               evidence: reviewEvidence,
-              approvals: scenario.startsWith('pending-')
-                ? [
-                    approval,
-                    { ...approval, approvalId: 'apr_01ARZ3NDEKTSV4RRFFQ69G5FAW', status: 'denied' },
-                  ]
-                : approvals,
+              approvals:
+                scenario === 'acp-approval'
+                  ? [acpApproval]
+                  : scenario.startsWith('pending-')
+                    ? [
+                        approval,
+                        {
+                          ...approval,
+                          approvalId: 'apr_01ARZ3NDEKTSV4RRFFQ69G5FAW',
+                          status: 'denied',
+                        },
+                      ]
+                    : approvals,
               nativeProfiles: [
+                ...(acp ? [selectedAcpProfile] : []),
                 repositoryProfile,
                 googleProfile,
                 anthropicProfile,
@@ -981,6 +1149,15 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
               outcome: 'applied',
               data: { kind: 'usage', windows: usageCase?.consent === false ? [] : usageWindows },
             };
+      if (
+        [
+          'InitializeGoogleAcp',
+          'AuthenticateGoogleAcp',
+          'DiscoverGoogleAcp',
+          'StopGoogleAcpSetup',
+        ].includes(command.command)
+      )
+        result = { outcome: 'applied', data: { kind: 'google-acp-setup', setup: setupState } };
       if (command.command === 'GetChanges')
         result = { outcome: 'applied', data: { ...changes, truncated: scenario === 'changes' } };
       if (command.command === 'ExportPatch')
@@ -1055,7 +1232,13 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       destination = join(fixture.home, 'saved.patch');
     writeFileSync(
       policyFile,
-      JSON.stringify(scenario.startsWith('repository-') ? repositoryPolicy : policy),
+      JSON.stringify(
+        scenario === 'acp-autopilot'
+          ? { ...policy, authority: 'autopilot' }
+          : scenario.startsWith('repository-')
+            ? repositoryPolicy
+            : policy,
+      ),
     );
     const grantsFile = join(fixture.home, 'grants.json');
     writeFileSync(
@@ -1329,9 +1512,121 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         ];
       }
     }
+    if (acp) {
+      const setupActions = ['show', 'initialize', 'authenticate', 'discover', 'stop'];
+      const name = scenario.slice(4);
+      if (name === 'import-consent-missing') args = ['native', 'import-google'];
+      else if (
+        setupActions.includes(name) ||
+        ['missing-consent', 'missing-proof', 'missing-operation', 'wrong-family'].includes(name)
+      ) {
+        const action = setupActions.includes(name)
+          ? name
+          : name === 'missing-operation'
+            ? 'stop'
+            : name === 'missing-proof'
+              ? 'authenticate'
+              : 'initialize';
+        args = [
+          'native',
+          'setup',
+          action,
+          '--family',
+          name === 'wrong-family' ? 'openai' : 'google',
+          ...(['show', 'stop'].includes(action) || name === 'missing-consent' ? [] : ['--consent']),
+        ];
+      } else if (name === 'approval') args = ['task', 'approve', approval.approvalId];
+      else
+        args = [
+          'task',
+          'prepare-native',
+          task.id,
+          acpProfile.id,
+          'net.mjs',
+          '--policy',
+          policyFile,
+          ...(name === 'saved'
+            ? []
+            : [
+                '--native-trust',
+                '--source-consent',
+                '--confirm-subscription-only',
+                ...(name === 'account' ? [] : ['--confirm-quota-account']),
+                '--model-id',
+                name === 'model' ? 'invented' : 'observed-model',
+                ...(name === 'model-only'
+                  ? []
+                  : ['--thought-level-id', name === 'thought' ? 'invented' : 'thought-low']),
+              ]),
+          ...(name === 'credits' ? ['--existing-credits'] : []),
+          ...(name === 'mode' ? ['--permission-mode', 'always-proceed'] : []),
+          ...(name === 'handoff' ? ['--handoff-target', profile.id] : []),
+        ];
+    }
     if (creationCase) args = creationCase.args;
     if (usageCase) args = usageCase.args;
     const result = await execute(args, scenario !== 'changes' && !creationCase?.plain);
+    if (acp) {
+      const invalid = [
+        'missing-consent',
+        'missing-proof',
+        'missing-operation',
+        'wrong-family',
+        'model',
+        'thought',
+        'account',
+        'credits',
+        'mode',
+        'handoff',
+        'autopilot',
+        'import-consent-missing',
+      ].some((name) => scenario === `acp-${name}`);
+      assert.equal(result.code, invalid ? 1 : 0, result.errors);
+      if (invalid) {
+        assert(received.every((value) => value.command === 'GetSnapshot'));
+        continue;
+      }
+      const data = JSON.parse(result.output);
+      if (scenario === 'acp-show') {
+        assert.equal(data.setup.revision, 7);
+        assert.deepEqual(data.profile, acpProfile);
+      } else if (scenario === 'acp-approval')
+        assert.deepEqual(data.command.payload.binding.acpTarget, acpApproval.acpTarget);
+      else if (
+        scenario === 'acp-prepare' ||
+        scenario === 'acp-saved' ||
+        scenario === 'acp-model-only'
+      ) {
+        assert.equal(data.command.command, 'PrepareNativeRun');
+        assert.deepEqual(
+          {
+            proofId: data.command.payload.proofId,
+            modelId: data.command.payload.modelId,
+            thoughtLevelId: data.command.payload.thoughtLevelId,
+          },
+          {
+            proofId: artifact.id,
+            modelId: 'observed-model',
+            thoughtLevelId: scenario === 'acp-model-only' ? null : 'thought-low',
+          },
+        );
+        assert.equal(data.command.payload.billingAttestation.quotaAccountConfirmed, true);
+        assert.equal(data.command.payload.permissionMode, 'request-review');
+        assert.equal(data.command.payload.creditPolicy, 'ordinary');
+        assert.equal(data.command.payload.consent, scenario === 'acp-saved' ? 'saved' : 'explicit');
+      } else {
+        assert.equal(data.command.expectedRevision, scenario === 'acp-initialize' ? 0 : 7);
+        assert.equal(data.command.payload.profileId, 'google-acp-v1');
+        if (scenario === 'acp-stop')
+          assert.equal(data.command.payload.operationId, `cmd_${suffix}`);
+        else assert.equal(data.command.payload.consent, 'explicit');
+        if (scenario === 'acp-authenticate')
+          assert.equal(data.command.payload.method, 'oauth-personal');
+        if (['acp-authenticate', 'acp-discover'].includes(scenario))
+          assert.equal(data.command.payload.proofId, artifact.id);
+      }
+      continue;
+    }
     if (usageCase) {
       if (usageCase.invalid) {
         assert.equal(result.code, 1, scenario);

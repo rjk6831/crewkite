@@ -51,6 +51,9 @@ import {
 import type { Workspace } from './source.ts';
 import { loadTeams, roleLabels, type SavedTeam, saveTeam } from './templates.ts';
 
+export const googleAcpLabel =
+  'Google’s published ACP agent, signed in with your own Google account. Google documents this agent for editors; CrewKite is not named.';
+
 const roleNames = Object.keys(roleLabels) as Role['role'][];
 const teamNames = ['Glide', 'Formation', 'Expedition', 'Custom'] as const;
 type TeamName = (typeof teamNames)[number];
@@ -750,6 +753,15 @@ function NativeLaunch({
   );
   const profile = profiles.find((value) => value.id === profileId);
   const google = profile?.family === 'google';
+  const acpProfile = profile?.family === 'google' && 'configOptions' in profile ? profile : null;
+  const [modelId, setModelId] = useState(current?.acp?.modelId ?? '');
+  const [thoughtLevelId, setThoughtLevelId] = useState(current?.acp?.thoughtLevelId ?? '');
+  const [quotaAccount, setQuotaAccount] = useState(false);
+  const configuration = acpProfile?.configOptions;
+  const selectedModel = modelId || configuration?.model.currentValue || '';
+  const selectedThought = configuration?.thoughtLevel
+    ? thoughtLevelId || configuration.thoughtLevel.currentValue
+    : null;
   const attestedBilling = profile?.family === 'anthropic' || google;
   const [permissionMode, setPermissionMode] = useState<
     NonNullable<Snapshot['nativeRuns'][number]['permissionMode']> | ''
@@ -827,24 +839,44 @@ function NativeLaunch({
       ? current?.profileId === profile.id
         ? current.billingAttestation
         : undefined
-      : subscriptionLogin && extraUsageDisabled
+      : subscriptionLogin && extraUsageDisabled && (!acpProfile || quotaAccount)
         ? {
             source: 'user-attested' as const,
             subscriptionLoginConfirmed: true as const,
             paidExtraUsageDisabled: true as const,
+            ...(acpProfile ? { quotaAccountConfirmed: true as const } : {}),
           }
         : undefined
     : undefined;
   const validBilling = !attestedBilling || !!billingAttestation;
-  const selectedPermissionMode = google
-    ? savedConsent
-      ? current?.profileId === profile.id
-        ? current.permissionMode
-        : undefined
-      : permissionMode || undefined
-    : undefined;
+  const selectedPermissionMode = acpProfile
+    ? 'request-review'
+    : google
+      ? savedConsent
+        ? current?.profileId === profile.id
+          ? current.permissionMode
+          : undefined
+        : permissionMode || undefined
+      : undefined;
   const validPermissionMode =
     !google || profile.permissionModes.some((mode) => mode === selectedPermissionMode);
+  const validAcp =
+    !acpProfile ||
+    (snapshot.googleAcpSetup?.state === 'ready' &&
+      !!snapshot.googleAcpSetup.proofId &&
+      !!configuration?.model.supported.includes(selectedModel) &&
+      (configuration.thoughtLevel
+        ? !!selectedThought && configuration.thoughtLevel.supported.includes(selectedThought)
+        : selectedThought === null) &&
+      policy.authority !== 'autopilot' &&
+      !handoffEnabled &&
+      !existingCredits &&
+      !!billingAttestation &&
+      'quotaAccountConfirmed' in billingAttestation &&
+      (!savedConsent ||
+        (current?.acp?.proofId === snapshot.googleAcpSetup.proofId &&
+          current.acp.modelId === selectedModel &&
+          current.acp.thoughtLevelId === selectedThought)));
   function resetConsent() {
     setNativeTrust(false);
     setSourceConsent(false);
@@ -856,6 +888,9 @@ function NativeLaunch({
     setSubscriptionLogin(false);
     setExtraUsageDisabled(false);
     setPermissionMode('');
+    setModelId('');
+    setThoughtLevelId('');
+    setQuotaAccount(false);
     setNativeTools(false);
     setHandoffTargets((targets) =>
       targets.map((target) => ({ ...target, creditPolicy: 'ordinary' })),
@@ -883,6 +918,12 @@ function NativeLaunch({
             'Install the supported official client before preparing this proposal.',
           'client-build-mismatch': 'The installed client build does not match this profile.',
           'qualification-pending': 'Qualification pending.',
+          'acp-capability-missing':
+            'The discovered client has no verified review mapping. Launch remains unavailable.',
+          'auth-method-mismatch':
+            'The client does not advertise the required personal authentication method.',
+          'authentication-required':
+            'Complete explicit personal sign-in in Usage and capacity first.',
           'provider-policy-restricted':
             'Google consumer CLI access is unavailable in CrewKite under the provider integration policy. Choose another profile or use the native app directly.',
           available: '',
@@ -897,6 +938,7 @@ function NativeLaunch({
       !validBilling ||
       !validPermissionMode ||
       !validHandoff ||
+      !validAcp ||
       (!repository && !NativeTargetPathSchema.safeParse(targetPath).success) ||
       !profile
     )
@@ -950,17 +992,36 @@ function NativeLaunch({
               creditPolicy: existingCredits ? 'existing-credits' : 'ordinary',
               consent: savedConsent ? 'saved' : 'explicit',
             }
-          : {
-              taskId: task.id,
-              profileId: profile.id,
-              targetPath,
-              policy: submittedPolicy,
-              creditPolicy: existingCredits ? 'existing-credits' : 'ordinary',
-              consent: savedConsent ? 'saved' : 'explicit',
-              ...(handoffEnabled ? { handoffTargets } : {}),
-              ...(billingAttestation ? { billingAttestation } : {}),
-              ...(selectedPermissionMode ? { permissionMode: selectedPermissionMode } : {}),
-            },
+          : acpProfile
+            ? {
+                taskId: task.id,
+                profileId: 'google-acp-v1',
+                targetPath,
+                policy: submittedPolicy,
+                creditPolicy: 'ordinary',
+                consent: savedConsent ? 'saved' : 'explicit',
+                proofId: snapshot.googleAcpSetup?.proofId as string,
+                modelId: selectedModel,
+                thoughtLevelId: selectedThought,
+                billingAttestation: billingAttestation as {
+                  source: 'user-attested';
+                  subscriptionLoginConfirmed: true;
+                  paidExtraUsageDisabled: true;
+                  quotaAccountConfirmed: true;
+                },
+                permissionMode: 'request-review',
+              }
+            : {
+                taskId: task.id,
+                profileId: profile.id,
+                targetPath,
+                policy: submittedPolicy,
+                creditPolicy: existingCredits ? 'existing-credits' : 'ordinary',
+                consent: savedConsent ? 'saved' : 'explicit',
+                ...(handoffEnabled ? { handoffTargets } : {}),
+                ...(billingAttestation ? { billingAttestation } : {}),
+                ...(selectedPermissionMode ? { permissionMode: selectedPermissionMode } : {}),
+              },
       });
       const run = RunSchema.safeParse(result.entity);
       if (result.outcome === 'applied' && run.success) {
@@ -1009,6 +1070,7 @@ function NativeLaunch({
                 value={profileId}
                 onChange={(event) => {
                   setProfileId(event.target.value);
+                  setHandoffEnabled(false);
                   resetScope();
                 }}
               >
@@ -1021,6 +1083,7 @@ function NativeLaunch({
               </select>
             </label>
           )}
+          {acpProfile && <p className="muted small">{googleAcpLabel}</p>}
           {profile && (
             <div className="facts-grid">
               <span>Client {profile.clientVersion}</span>
@@ -1090,6 +1153,13 @@ function NativeLaunch({
                   </p>
                   <p>{capability?.target?.bytes ?? 'Unknown'} bytes</p>
                 </>
+              )}
+              {capability?.acp && (
+                <p className="muted small">
+                  Saved model {capability.acp.modelId}. Thought level{' '}
+                  {capability.acp.thoughtLevelId ?? 'unknown'}. Setup proof {capability.acp.proofId}
+                  . Same-account confirmation is user-attested.
+                </p>
               )}
               {capability?.handoff && (
                 <>
@@ -1177,7 +1247,7 @@ function NativeLaunch({
                 </p>
               </>
             )}
-            {!repository && (
+            {!repository && !acpProfile && (
               <>
                 <label className="checkbox-label">
                   <input
@@ -1364,7 +1434,88 @@ function NativeLaunch({
                 )}
               </>
             )}
-            {google && (
+            {acpProfile && (
+              <>
+                <p className="muted small">
+                  Every native approval needs a human decision. Start reapplies and verifies these
+                  exact choices before its prompt. Client filesystem and terminal capabilities are
+                  disabled; this does not establish operating-system containment.
+                </p>
+                <label>
+                  Google model
+                  <select
+                    value={selectedModel}
+                    onChange={(event) => {
+                      setModelId(event.target.value);
+                      setThoughtLevelId('');
+                      resetConsent();
+                    }}
+                  >
+                    {configuration?.model.supported.map((id) => (
+                      <option key={id} value={id}>
+                        {id}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {configuration?.thoughtLevel ? (
+                  <label>
+                    Google thought level
+                    <select
+                      value={selectedThought ?? ''}
+                      onChange={(event) => {
+                        setThoughtLevelId(event.target.value);
+                        resetConsent();
+                      }}
+                    >
+                      {configuration.thoughtLevel.supported.map((id) => (
+                        <option key={id} value={id}>
+                          {id}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                ) : (
+                  <p className="muted small">
+                    Thought level unknown. The client advertised no thought selector.
+                  </p>
+                )}
+                <label>
+                  Google authority
+                  <select
+                    value={policy.authority}
+                    onChange={(event) => {
+                      setPolicy({
+                        ...policy,
+                        authority: event.target.value === 'balanced' ? 'balanced' : 'guided',
+                      });
+                      resetConsent();
+                    }}
+                  >
+                    <option value="guided">Guided</option>
+                    <option value="balanced">Balanced</option>
+                  </select>
+                </label>
+                <p className="muted small">
+                  All returned quota pools must be fresh and above reserve. The quota reader and ACP
+                  login are separate sessions.
+                </p>
+                {!savedConsent && (
+                  <label className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={quotaAccount}
+                      onChange={(event) => {
+                        setQuotaAccount(event.target.checked);
+                        resetConsent();
+                      }}
+                    />
+                    I confirm quota reads and ACP sign-in use the same Google account
+                  </label>
+                )}
+              </>
+            )}
+            {google && !acpProfile && (
               <>
                 <label>
                   Expected native permission mode
@@ -1610,6 +1761,7 @@ function NativeLaunch({
               !validBilling ||
               !validPermissionMode ||
               !validHandoff ||
+              !validAcp ||
               (!repository && !NativeTargetPathSchema.safeParse(targetPath).success)
             }
             onClick={() => void prepareNative()}

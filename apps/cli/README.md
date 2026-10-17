@@ -55,6 +55,37 @@ The reader uses the Google CLI's headless `/usage` command with no model request
 
 `usage show --json` returns `{ cursor, usageReaders, usage }`. Readers include enabled state, availability reason, last attempt and last successful observation. Usage contains the controller's derived windows with their source, observation time, reset time and stale state. Refresh returns the normal `{ command, result }` action receipt. Failed reads retain prior windows, which become stale after five minutes.
 
+## Google ACP setup
+
+Google’s published ACP agent, signed in with your own Google account. Google documents this agent for editors; CrewKite is not named.
+
+Stage the official client and recorded identity as described in [provider routes](../../docs/providers.md). Import is a separate local action. It validates the managed copy and creates an immutable pin. It accepts no executable path, credential or replacement pin.
+
+```sh
+pnpm crewkite native import-google --consent --json
+pnpm crewkite native setup show --family google --json
+pnpm crewkite native setup initialize --family google --consent --json
+pnpm crewkite native setup authenticate --family google --consent --json
+pnpm crewkite native setup discover --family google --consent --json
+pnpm crewkite native setup stop --family google --json
+```
+
+Each command performs only its named action. Initialization and discovery send no model prompt. Personal authentication can open a browser, contact Google and write native authentication state. CrewKite retains result codes and safe client proofs. Setup commands use the current persisted revision; Stop names the current operation. An uncertain command keeps its exact retry key. A fresh setup action does not replay it.
+
+Setup status returns `{ cursor, setup, profile }`. Import returns `{ imported, reason, client }`, with version, digest and signer team only. Authentication and configuration do not establish entitlement or route qualification. Missing verified review mappings keep launch unavailable even when discovery exposes model choices.
+
+When setup is ready, prepare a committed file using IDs advertised by discovery:
+
+```sh
+pnpm crewkite task prepare-native <task-id> google-acp-v1 net.mjs --policy native-policy.json --native-trust --source-consent --confirm-subscription-only --confirm-quota-account --model-id <observed-model-id> --thought-level-id <observed-thought-id> --json
+```
+
+Omit the thought-level flag when no selector was advertised. The preparation freezes its proof, model and optional thought level. Start reapplies and verifies those choices in a fresh session before prompting. Changed or unavailable options refuse; no fallback is selected. Saved consent can reuse only the matching preparation and attestations.
+
+Google ACP permits guided or balanced authority, ordinary subscription billing and request-review. Each native approval requires a human decision for one exact session and tool call. Approval and denial preserve the full typed binding. Permanent permission and automatic handoff are unavailable.
+
+`--confirm-quota-account` records that the separate CLI quota login and ACP sign-in use the same Google account. Shared native home does not prove identity. Every returned quota pool must be fresh and above reserve before admission. Disabling the reader grants no unknown-usage bypass. The headless Google file profile remains blocked.
+
 ## Native single-file runs
 
 Create the project and draft task through the commands above or the desktop. List the controller's supported native profiles:
@@ -63,7 +94,7 @@ Create the project and draft task through the commands above or the desktop. Lis
 pnpm crewkite native profiles --json
 ```
 
-The snapshot reports profile availability, its reason, client version, model, effort and bounds. OpenAI and Anthropic have bounded local native paths. Google consumer automatic launch reports `provider-policy-restricted` and refuses before native discovery. The [dated provider boundaries](../../docs/providers.md#current-availability) explain these restrictions. Anthropic and Google report requested effort separately from unobserved effective effort and service tier. A missing qualification date is shown as pending. Preparation requires an available profile ID. It accepts no executable, digest or model override.
+The snapshot reports profile availability, its reason, client version, model, effort and bounds. OpenAI and Anthropic have bounded local native paths. Google consumer automatic launch reports `provider-policy-restricted` and refuses before native discovery. The [dated provider boundaries](../../docs/providers.md#current-availability) explain these restrictions. Anthropic and Google report requested effort separately from unobserved effective effort and service tier. A missing qualification date is shown as pending. Preparation requires an available profile ID. Legacy profiles accept no executable, digest or model override. The ACP profile accepts only advertised configuration choices.
 
 Save a policy JSON file using the existing policy schema. This example grants one scratch write and one export. Replace the sample task ID and project name with the registered values, and choose a future expiration before preparing the run:
 

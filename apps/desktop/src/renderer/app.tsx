@@ -59,7 +59,7 @@ import {
   short,
   titleCase,
 } from './components.tsx';
-import { Launch, NativeEvaluation, NativeHandoff } from './launch.tsx';
+import { googleAcpLabel, Launch, NativeEvaluation, NativeHandoff } from './launch.tsx';
 import { useWorkspace, type Workspace } from './source.ts';
 import { roleLabels } from './templates.ts';
 
@@ -834,6 +834,7 @@ function ApprovalCard({
       action: approval.action,
       target: approval.target,
       revision: approval.revision,
+      ...(approval.acpTarget ? { acpTarget: approval.acpTarget } : {}),
     };
     void workspace
       .command({
@@ -860,6 +861,12 @@ function ApprovalCard({
           ? 'Allow this named action once for this attempt.'
           : approval.consequence}
       </p>
+      {approval.acpTarget && (
+        <p className="muted small">
+          Allow once for session {approval.acpTarget.sessionId}, tool call{' '}
+          {approval.acpTarget.toolCallId}, option {approval.acpTarget.optionId}.
+        </p>
+      )}
       <div className="approval-target">
         <Terminal size={14} />
         <span>{effectTarget(approval, task, projectName)}</span>
@@ -1284,6 +1291,10 @@ function Roster({
                     {route.fake && <span className="fake-tag">Fake</span>}
                   </div>
                   <code className="role-model">{route.model}</code>
+                  {role === 'coder' &&
+                    snapshot.nativeRuns.some(
+                      (value) => value.runId === run?.id && value.profileId === 'google-acp-v1',
+                    ) && <p className="muted small">{googleAcpLabel}</p>}
                   <dl>
                     {role === 'coder' && assignment && (
                       <>
@@ -1822,6 +1833,169 @@ function Handoffs({ events, snapshot }: { events: Event[]; snapshot: Snapshot })
   );
 }
 
+function GoogleSetup({ snapshot, workspace }: { snapshot: Snapshot; workspace: Workspace }) {
+  const setup = snapshot.googleAcpSetup;
+  const profile = snapshot.nativeProfiles.find(
+    (value) => value.family === 'google' && 'configOptions' in value,
+  );
+  const [requested, setRequested] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const connected = workspace.connection === 'connected' && !workspace.preview;
+  const active = !!setup?.operationId;
+  async function action(kind: 'initialize' | 'authenticate' | 'discover' | 'stop') {
+    setMessage(null);
+    if (kind !== 'stop') setRequested(kind);
+    try {
+      const current = kind === 'stop' ? (await workspace.refresh()).googleAcpSetup : setup;
+      if (kind === 'stop' && !current?.operationId) {
+        setMessage('No exact setup operation is active. Refresh status before retrying.');
+        return;
+      }
+      if ((kind === 'authenticate' || kind === 'discover') && !current?.proofId) {
+        setMessage('Initialize Google ACP and inspect its retained proof first.');
+        return;
+      }
+      const result = await workspace.command(
+        kind === 'stop'
+          ? {
+              command: 'StopGoogleAcpSetup',
+              expectedRevision: current?.revision ?? 0,
+              payload: { profileId: 'google-acp-v1', operationId: current?.operationId as string },
+            }
+          : kind === 'initialize'
+            ? {
+                command: 'InitializeGoogleAcp',
+                expectedRevision: current?.revision ?? 0,
+                payload: { profileId: 'google-acp-v1', consent: 'explicit' },
+              }
+            : kind === 'authenticate'
+              ? {
+                  command: 'AuthenticateGoogleAcp',
+                  expectedRevision: current?.revision ?? 0,
+                  payload: {
+                    profileId: 'google-acp-v1',
+                    proofId: current?.proofId as string,
+                    method: 'oauth-personal',
+                    consent: 'explicit',
+                  },
+                }
+              : {
+                  command: 'DiscoverGoogleAcp',
+                  expectedRevision: current?.revision ?? 0,
+                  payload: {
+                    profileId: 'google-acp-v1',
+                    proofId: current?.proofId as string,
+                    consent: 'explicit',
+                  },
+                },
+      );
+      setMessage(
+        result.data?.kind === 'google-acp-setup'
+          ? `Setup ${result.data.setup.state}${result.data.setup.reason ? `: ${result.data.setup.reason}` : ''}.`
+          : (result.reason ?? result.outcome),
+      );
+    } catch {
+      setMessage('The setup action could not be confirmed. Refresh status before retrying.');
+    } finally {
+      if (kind !== 'stop') setRequested(null);
+    }
+  }
+  return (
+    <section className="card view-stack" aria-labelledby="google-setup-title">
+      <div className="section-heading">
+        <h2 id="google-setup-title">Google ACP setup</h2>
+        <span>{setup?.state ?? 'uninitialized'}</span>
+      </div>
+      <p className="muted small">{googleAcpLabel}</p>
+      <p className="muted small">
+        Import the official client through the explicit CLI import command first. Initialization and
+        discovery use no model prompt. Personal sign-in may open in your browser, contact Google and
+        write native authentication state. CrewKite retains result codes and safe proofs.
+      </p>
+      <div className="dialog-footer">
+        <button
+          className="button secondary"
+          type="button"
+          disabled={!connected || workspace.pending || active}
+          onClick={() => void action('initialize')}
+        >
+          Initialize Google ACP
+        </button>
+        <button
+          className="button secondary"
+          type="button"
+          disabled={!connected || workspace.pending || active || !setup?.proofId}
+          onClick={() => void action('authenticate')}
+        >
+          Sign in with Google
+        </button>
+        <button
+          className="button secondary"
+          type="button"
+          disabled={
+            !connected ||
+            workspace.pending ||
+            active ||
+            !setup?.proofId ||
+            setup.auth.status !== 'authenticated'
+          }
+          onClick={() => void action('discover')}
+        >
+          Discover Google choices
+        </button>
+        <button
+          className="button secondary"
+          type="button"
+          disabled={!connected || (!requested && !active)}
+          onClick={() => void action('stop')}
+        >
+          Stop setup
+        </button>
+        <button
+          className="button secondary"
+          type="button"
+          disabled={!connected}
+          onClick={() =>
+            void workspace.refresh().catch(() => setMessage('Setup status could not be read.'))
+          }
+        >
+          Refresh setup status
+        </button>
+      </div>
+      {requested && (
+        <p role="status">
+          {titleCase(requested)} requested. Refresh status to inspect the owned operation.
+        </p>
+      )}
+      <p className="muted small">
+        Authentication: {setup?.auth.status ?? 'unknown'}. Availability:{' '}
+        {profile?.reason ?? 'not-configured'}. Setup revision: {setup?.revision ?? 0}.
+      </p>
+      <p className="muted small">
+        Discovery choices establish configuration facts. A verified review mapping and route
+        qualification remain separate requirements.
+      </p>
+      {profile && (
+        <p className="muted small">
+          Models: {profile.configOptions?.model.supported.join(', ') ?? 'unknown'}. Thought levels:{' '}
+          {profile.configOptions?.thoughtLevel?.supported.join(', ') ?? 'unknown'}.
+        </p>
+      )}
+      {setup?.client && (
+        <details>
+          <summary>Client and proof identity</summary>
+          <p>
+            Version {setup.client.version}. Digest {setup.client.sha256}. Signer{' '}
+            {setup.client.signerTeamId}. Proof {setup.proofId ?? 'none'}. Operation{' '}
+            {setup.operationId ?? 'none'}.
+          </p>
+        </details>
+      )}
+      {message && <p role="status">{message}</p>}
+    </section>
+  );
+}
+
 function Usage({
   snapshot,
   run,
@@ -1889,6 +2063,7 @@ function Usage({
             : 'Controller observations'}
         </span>
       </div>
+      <GoogleSetup snapshot={snapshot} workspace={workspace} />
       <section className="card" aria-labelledby="google-quota-title">
         <div className="section-heading">
           <h2 id="google-quota-title">Google quota</h2>
