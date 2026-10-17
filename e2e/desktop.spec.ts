@@ -1732,6 +1732,16 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     }, destination);
     await enter(page.getByRole('button', { name: 'New task', exact: true }).first());
     await page.getByRole('button', { name: 'Create task manually', exact: true }).click();
+    const manualTask = createDemoFixtures().task;
+    await expect(page.getByLabel('Task title', { exact: true })).toHaveValue('');
+    await expect(page.getByLabel('Outcome', { exact: true })).toHaveValue('');
+    await expect(page.getByLabel(/^Acceptance criteria/)).toHaveValue('');
+    await expect(
+      page.getByRole('dialog').getByRole('button', { name: 'Create task', exact: true }),
+    ).toBeDisabled();
+    await page.getByLabel('Task title', { exact: true }).fill(manualTask.title);
+    await page.getByLabel('Outcome', { exact: true }).fill(manualTask.outcome);
+    await page.getByLabel(/^Acceptance criteria/).fill(manualTask.criteria.join('\n'));
     await enter(page.getByRole('dialog').getByRole('button', { name: 'Create task', exact: true }));
     const created = await timeline.wait((event) => event.type === 'task.created');
     assert.equal(created.type, 'task.created');
@@ -2019,6 +2029,8 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     await enter(page.getByRole('button', { name: 'New task', exact: true }).first());
     await page.getByRole('button', { name: 'Create task manually', exact: true }).click();
     await page.getByLabel('Task title', { exact: true }).fill('Retain one native file proposal');
+    await page.getByLabel('Outcome', { exact: true }).fill(manualTask.outcome);
+    await page.getByLabel(/^Acceptance criteria/).fill(manualTask.criteria.join('\n'));
     await enter(page.getByRole('dialog').getByRole('button', { name: 'Create task', exact: true }));
     await enter(
       page.getByRole('dialog').getByRole('button', { name: 'Native file proposal', exact: true }),

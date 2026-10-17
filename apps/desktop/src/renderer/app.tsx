@@ -371,7 +371,7 @@ export function App() {
             width={1024}
             height={341}
           />
-          <span className="prototype-tag">D0</span>
+          {preview && <span className="prototype-tag">D0</span>}
         </button>
         <button type="button" className="search-button" onClick={() => setPalette(true)}>
           <Search size={14} />
@@ -509,9 +509,13 @@ export function App() {
               <span />
               {preview
                 ? 'Interface preview'
-                : snapshot?.routes.every(({ fake }) => fake)
-                  ? 'Scripted providers'
-                  : 'Connected routes'}
+                : !snapshot
+                  ? 'Route state unavailable'
+                  : snapshot.routes.length === 0
+                    ? 'No routes configured'
+                    : snapshot.routes.every(({ fake }) => fake)
+                      ? 'Scripted providers'
+                      : 'Routes from controller'}
             </span>
             <button
               type="button"
@@ -900,9 +904,13 @@ export function App() {
           <span>
             <ShieldCheck size={12} />
             Local workspace<span className="footer-separator">/</span>
-            {snapshot?.routes.every(({ fake }) => fake)
-              ? 'All routes are fake'
-              : 'Route state from controller'}
+            {!snapshot
+              ? 'Route state unavailable'
+              : snapshot.routes.length === 0
+                ? 'No routes configured'
+                : snapshot.routes.every(({ fake }) => fake)
+                  ? 'All routes are fake'
+                  : 'Route state from controller'}
           </span>
           <span>
             Authority stays in the controller<kbd>⌘ K</kbd>
@@ -940,7 +948,7 @@ export function App() {
           onClose={() => setNativeHandoff(false)}
         />
       )}
-      {about && <About onClose={() => setAbout(false)} />}
+      {about && <About preview={preview} onClose={() => setAbout(false)} />}
       {palette && (
         <Dialog title="Run a command" onClose={() => setPalette(false)}>
           <div className="command-list">
@@ -2058,8 +2066,7 @@ function Checks({
               </p>
             )}
             <p className="muted small">
-              D0 inspects fixed challenge patterns in separate read-only jobs. Its results prove
-              bounded job plumbing and carry no model judgment.
+              Scripted reviews inspect fixed challenge patterns. They do not contain model judgment.
             </p>
           </section>
         </>
@@ -2625,7 +2632,7 @@ function Usage({
             <span>Configured model</span>
             <span>{local?.model ?? 'Not configured'}</span>
           </div>
-          <p className="muted small">No hardware probe is connected in this prototype.</p>
+          <p className="muted small">Hardware measurements are unavailable.</p>
         </section>
       </div>
       <section className="card credits-card">
@@ -2642,14 +2649,15 @@ function Usage({
               <span className={`provider-dot ${familyClass(route.family)}`} />
               <div>
                 <strong>{familyName(route.family)}</strong>
-                <small>No paid route qualified for this demo</small>
+                <small>No account credit balance reported</small>
               </div>
-              <span className="credit-off">Off</span>
+              <span className="credit-off">Unknown</span>
             </div>
           ))}
         </div>
         <p className="muted small">
-          A provider limit never enables paid credit use. No billing controls are connected in D0.
+          Using existing credits requires a billing selection when preparing a run. A provider limit
+          does not grant that permission.
         </p>
       </section>
     </main>
@@ -2667,10 +2675,10 @@ function CreateTask({
   onClose: () => void;
   onCreated: (id: string) => void;
 }) {
-  const template = createDemoFixtures().task;
-  const [title, setTitle] = useState(template.title);
-  const [outcome, setOutcome] = useState(template.outcome);
-  const [criteria, setCriteria] = useState(template.criteria.join('\n'));
+  const [template] = useState(() => (workspace.preview ? createDemoFixtures().task : null));
+  const [title, setTitle] = useState(template?.title ?? '');
+  const [outcome, setOutcome] = useState(template?.outcome ?? '');
+  const [criteria, setCriteria] = useState(template?.criteria.join('\n') ?? '');
   const [projectId, setProjectId] = useState(snapshot.projects[0]?.id ?? '');
   const [message, setMessage] = useState<string | null>(null);
   const payload = {
@@ -2817,7 +2825,7 @@ const credits = [
   },
 ];
 
-function About({ onClose }: { onClose: () => void }) {
+function About({ onClose, preview }: { onClose: () => void; preview: boolean }) {
   return (
     <Dialog title="About CrewKite" eyebrow="LOCAL CODING WORKSPACE" onClose={onClose}>
       <div className="about-content">
@@ -2825,10 +2833,12 @@ function About({ onClose }: { onClose: () => void }) {
           One controller owns task state, authority and result identity. The desktop and CLI are
           clients of the same workspace.
         </p>
-        <div className="about-build">
-          <span className="prototype-tag">D0</span>
-          <span>Scripted providers · no live inference qualification</span>
-        </div>
+        {preview && (
+          <div className="about-build">
+            <span className="prototype-tag">D0</span>
+            <span>Scripted providers · no live inference qualification</span>
+          </div>
+        )}
         <h3>Method acknowledgments</h3>
         <p className="muted">
           These projects shaped the review methods. Credits describe method influence. No runtime
@@ -2854,8 +2864,8 @@ function About({ onClose }: { onClose: () => void }) {
           ))}
         </div>
         <p className="muted small">
-          Method configuration and any scripted evaluation are disclosed in the launch policy. This
-          prototype does not establish that model review jobs ran.
+          Method configuration is saved in the run policy. Candidate evidence records the checks and
+          reviews that ran.
         </p>
         <div className="about-license">
           <span>Apache License 2.0</span>
