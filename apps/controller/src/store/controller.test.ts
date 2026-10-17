@@ -7017,6 +7017,7 @@ test('planning turns keep task authority and allowance across execution', async 
   let mode = 'success';
   let askQuestion = true;
   let crashAfterIntent = false;
+  let modelAvailability: 'available' | 'missing-model' | 'missing-effort' = 'available';
   const held = Promise.withResolvers<void>();
   const children: Promise<void>[] = [];
   const profile = {
@@ -7053,6 +7054,29 @@ test('planning turns keep task authority and allowance across execution', async 
         'const path = message.params.outputSchema.properties.path.const;',
         'const path = message.params.outputSchema.properties.path?.const;',
       );
+      script = script
+        .replace(
+          'const thread =',
+          `replies['model/list'].data.push(...${JSON.stringify(
+            modelAvailability === 'missing-model'
+              ? []
+              : [
+                  {
+                    id: 'fixture-secondary',
+                    model: 'fixture-secondary',
+                    supportedReasoningEfforts: (modelAvailability === 'missing-effort'
+                      ? ['low']
+                      : ['low', 'medium']
+                    ).map((reasoningEffort) => ({ reasoningEffort })),
+                    defaultReasoningEffort: 'low',
+                  },
+                ],
+          )}); const thread =`,
+        )
+        .replace(
+          "if (message.method === 'thread/start') result = thread(process.cwd());",
+          "if (message.method === 'thread/start') result = {...thread(process.cwd()),model:message.params.model,reasoningEffort:message.params.config.model_reasoning_effort};",
+        );
       script = script.replace(
         'const edit = {version:1,attemptId:message.params.outputSchema.properties.attemptId.const,path,baseHash:message.params.outputSchema.properties.baseHash.const,content:content(path)};',
         `const edit = {version:1,bindingHash:message.params.outputSchema.properties.bindingHash.const,message:'The bounded plan is ready.',questions:${JSON.stringify(askQuestion ? ['Keep the current export?'] : [])},proposal:{summary:'Keep the export.',criteria:${JSON.stringify(mode === 'escaped-boundary' ? Array.from({ length: 12 }, (_, index) => `${index}: ${'x'.repeat(3500)}`) : ['Preserve the source sentinels.'])},slices:[{id:'net',title:'Change the module',role:'coder',scope:['net.mjs'],dependsOn:[]}],checks:['node-tests-v1']}}${mode === 'invalid' ? '; edit.effects=[]' : ''};`,
@@ -7241,6 +7265,193 @@ test('planning turns keep task authority and allowance across execution', async 
       command(name, { taskId, ...payload }, current(taskId).revision),
       'local-owner',
     );
+  askQuestion = false;
+  const catalogReply = nextReply();
+  const catalogTask = TaskSchema.parse(
+    (
+      await controller.execute(
+        command(
+          'CreateTaskDiscussion',
+          { projectId, text: 'Use an observed planning model.', planning },
+          0,
+        ),
+        'local-owner',
+      )
+    ).entity,
+  );
+  assert.equal(state(catalogTask.id).modelChoices?.status, 'not-observed');
+  await catalogReply;
+  const observed = state(catalogTask.id).modelChoices;
+  assert.equal(observed?.status, 'last-observed');
+  assert(observed?.observation);
+  assert.deepEqual(
+    observed.models.map((model) => model.model),
+    [fixtureModel, 'fixture-secondary'],
+  );
+  assert(!JSON.stringify(observed).includes(process.execPath));
+  const catalogReference = observed.observation;
+  const selectedPlanning = {
+    ...planning,
+    modelRequest: {
+      version: 1,
+      observation: catalogReference,
+      model: 'fixture-secondary',
+      effort: 'medium',
+    },
+  };
+  const beforeSelection = state(catalogTask.id).budget?.remaining;
+  const beforeSelectionSpawns = children.length;
+  const beforeSelectionRun = current(catalogTask.id).runId;
+  const tasksBeforeForeignCatalog = controller.snapshot().tasks.length;
+  assert.equal(
+    (
+      await controller.execute(
+        command(
+          'CreateTaskDiscussion',
+          { projectId, text: 'Reject another task catalog.', planning: selectedPlanning },
+          0,
+        ),
+        'local-owner',
+      )
+    ).reason,
+    'observation-stale',
+  );
+  assert.equal(controller.snapshot().tasks.length, tasksBeforeForeignCatalog);
+  for (const [modelRequest, reason] of [
+    [
+      {
+        ...selectedPlanning.modelRequest,
+        observation: { ...catalogReference, hash: '0'.repeat(64) },
+      },
+      'observation-missing',
+    ],
+    [{ ...selectedPlanning.modelRequest, model: 'unobserved-model' }, 'model-unavailable'],
+    [{ ...selectedPlanning.modelRequest, effort: 'unobserved-effort' }, 'effort-unavailable'],
+  ] as const) {
+    assert.equal(
+      (
+        await send('ConfigureTaskConversation', catalogTask.id, {
+          planning: { ...planning, modelRequest },
+        })
+      ).reason,
+      reason,
+    );
+  }
+  assert.equal(current(catalogTask.id).runId, beforeSelectionRun);
+  const configureSelection = command(
+    'ConfigureTaskConversation',
+    { taskId: catalogTask.id, planning: selectedPlanning },
+    current(catalogTask.id).revision,
+  );
+  assert.equal((await controller.execute(configureSelection, 'local-owner')).outcome, 'applied');
+  assert.equal(
+    (await controller.execute(configureSelection, 'local-owner')).outcome,
+    'already-applied',
+  );
+  assert.notEqual(current(catalogTask.id).runId, beforeSelectionRun);
+  assert.equal(children.length, beforeSelectionSpawns);
+  assert.deepEqual(state(catalogTask.id).budget?.remaining, beforeSelection);
+  assert.equal(state(catalogTask.id).configuration?.requestedModel, 'fixture-secondary');
+  assert.equal(state(catalogTask.id).configuration?.requestedEffort, 'medium');
+  assert.equal(state(catalogTask.id).configuration?.effectiveModel, null);
+  const selectedReply = nextReply();
+  await send('SendTaskMessage', catalogTask.id, { text: 'Use the saved exact pair.' });
+  const activeConfiguration = await send('ConfigureTaskConversation', catalogTask.id, {
+    planning: { ...selectedPlanning, role: 'orchestrator' },
+  });
+  assert.equal(activeConfiguration.outcome, 'blocked');
+  assert(['owner-active', 'ownership-unknown'].includes(activeConfiguration.reason ?? ''));
+  assert.equal(state(catalogTask.id).configuration?.selection.role, 'lead');
+  const lowerPlanning = {
+    ...selectedPlanning,
+    limits: { ...planning.limits, attempts: 11, minutes: 29 },
+  };
+  assert.equal(
+    (await send('ConfigureTaskConversation', catalogTask.id, { planning: lowerPlanning })).outcome,
+    'applied',
+  );
+  await selectedReply;
+  assert.equal(state(catalogTask.id).configuration?.effectiveModel, 'fixture-secondary');
+  assert.equal(state(catalogTask.id).configuration?.effectiveEffort, 'medium');
+  const selectedIntent = controller.store
+    .intents()
+    .filter((intent) => intent.task_id === catalogTask.id)
+    .at(-1);
+  assert(selectedIntent);
+  const selectedInputArtifact = ArtifactSchema.parse(
+    controller.store.receipt(`conversation-turn:${selectedIntent.attempt_id}`)?.result.entity,
+  );
+  const selectedInput = JSON.parse(
+    new ArtifactFiles(join(controller.home, 'artifacts'))
+      .read(selectedInputArtifact.hash)
+      .toString('utf8'),
+  );
+  assert.equal(selectedInput.model, 'fixture-secondary');
+  assert.equal(selectedInput.effort, 'medium');
+  assert.deepEqual(selectedInput.selection.modelRequest, selectedPlanning.modelRequest);
+  assert(
+    selectedInput.selection.configurationRevision <
+      (state(catalogTask.id).configuration?.revision ?? 0),
+  );
+  assert.equal(state(catalogTask.id).budget?.remaining.attempts, 9);
+  const selectedObservation = state(catalogTask.id).modelChoices?.observation;
+  for (const unavailable of ['missing-model', 'missing-effort'] as const) {
+    modelAvailability = unavailable;
+    const failed = new Promise<void>((done) => {
+      const off = controller.subscribe((event) => {
+        if (event.type === 'attempt.stopped' && event.taskId === catalogTask.id) {
+          off();
+          done();
+        }
+      });
+    });
+    await send('SendTaskMessage', catalogTask.id, {
+      text: 'Validate the current advertised pair.',
+    });
+    await failed;
+    const failedIntent = controller.store
+      .intents()
+      .filter((intent) => intent.task_id === catalogTask.id)
+      .at(-1);
+    assert(failedIntent);
+    assert.equal(
+      controller.store.receipt(`conversation-submission:${failedIntent.attempt_id}`),
+      undefined,
+    );
+    assert.equal(state(catalogTask.id).configuration?.requestedModel, 'fixture-secondary');
+    assert.equal(state(catalogTask.id).configuration?.effectiveModel, null);
+    assert.equal(state(catalogTask.id).modelChoices?.status, 'last-observed');
+    assert.deepEqual(state(catalogTask.id).modelChoices?.observation, selectedObservation);
+    assert.equal(
+      state(catalogTask.id).modelChoices?.reason,
+      unavailable === 'missing-model' ? 'model-unavailable' : 'effort-unavailable',
+    );
+  }
+  modelAvailability = 'available';
+  const originalLocation = profile.locationHash;
+  profile.locationHash = '2'.repeat(64);
+  assert.equal(state(catalogTask.id).modelChoices?.status, 'client-changed');
+  assert.equal(state(catalogTask.id).send.reason, 'profile-unavailable');
+  assert.equal(
+    (
+      await send('ConfigureTaskConversation', catalogTask.id, {
+        planning: { ...lowerPlanning, role: 'orchestrator' },
+      })
+    ).reason,
+    'client-changed',
+  );
+  assert.equal(
+    (
+      await send('ConfigureTaskConversation', catalogTask.id, {
+        planning: { ...planning, limits: lowerPlanning.limits },
+      })
+    ).outcome,
+    'applied',
+  );
+  assert.equal(state(catalogTask.id).configuration?.selection.modelRequest, undefined);
+  assert.equal(state(catalogTask.id).configuration?.requestedModel, fixtureModel);
+  assert.equal(state(catalogTask.id).configuration?.effectiveModel, null);
+  profile.locationHash = originalLocation;
   mode = 'escaped-boundary';
   askQuestion = false;
   const boundaryReply = nextReply();
@@ -7598,6 +7809,15 @@ test('planning turns keep task authority and allowance across execution', async 
   assert.equal(afterReopen.data?.kind, 'conversation-state');
   if (afterReopen.data?.kind === 'conversation-state')
     assert.equal(afterReopen.data.state.send.reason, 'ownership-unknown');
+  const reopenedCatalog = await reopened.execute(
+    command('GetTaskConversationState', { taskId: catalogTask.id }),
+    'local-owner',
+  );
+  assert.equal(reopenedCatalog.data?.kind, 'conversation-state');
+  if (reopenedCatalog.data?.kind === 'conversation-state') {
+    assert.equal(reopenedCatalog.data.state.configuration?.selection.modelRequest, undefined);
+    assert.deepEqual(reopenedCatalog.data.state.modelChoices?.observation, selectedObservation);
+  }
   assert.equal((await reopened.execute(crash, 'local-owner')).outcome, 'already-applied');
   assert.equal(reopened.store.intents().length, count);
   const recoveredEntry = reopened.store.db

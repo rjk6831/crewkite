@@ -50,6 +50,12 @@ import {
   ConversationContextBundleSchema,
   type ConversationContextRefs,
   ConversationEntrySchema,
+  type ConversationModelCatalog,
+  ConversationModelCatalogSchema,
+  type ConversationModelChoices,
+  type ConversationModelReason,
+  type ConversationModelRequest,
+  ConversationModelRequestSchema,
   type ConversationPlanningSelection,
   ConversationPlanningSelectionSchema,
   type ConversationTurnBinding,
@@ -630,8 +636,14 @@ const ConversationConfigurationSchema = z.strictObject({
     .nullable(),
   effectiveModel: z.string().min(1).max(200).nullable(),
   effectiveEffort: z.string().min(1).max(200).nullable(),
+  modelCatalog: ConversationModelRequestSchema.shape.observation.optional(),
+  modelFailure: z.enum(['model-unavailable', 'effort-unavailable']).optional(),
 });
 type ConversationConfiguration = z.infer<typeof ConversationConfigurationSchema>;
+type ConversationModelFailureReason = Exclude<
+  ConversationModelReason,
+  'available' | 'not-observed'
+>;
 type ConversationRuntime = {
   input: ConversationPlan;
   attempt: Attempt;
@@ -2786,6 +2798,172 @@ export class Controller {
     this.store.putConversationTask(taskId, ConversationConfigurationSchema.parse(value));
   }
 
+  private conversationCatalog(
+    taskId: string,
+    reference: ConversationModelRequest['observation'],
+  ): ConversationModelCatalog {
+    const artifact = this.store.get<Artifact>('artifact', reference.artifactId);
+    if (!artifact || artifact.hash !== reference.hash) throw Error('observation-missing');
+    if (artifact.bytes > 32768) throw Error('catalog-unavailable');
+    const content = this.artifacts.read(artifact.hash);
+    if (content.length !== artifact.bytes) throw Error('catalog-unavailable');
+    const catalog = ConversationModelCatalogSchema.parse(JSON.parse(content.toString('utf8')));
+    const retained = this.nativeRecord(`conversation-model-catalog:${catalog.attemptId}`, 32768);
+    const attempt = this.store.get<Attempt>('attempt', catalog.attemptId);
+    const run = this.store.get<Run>('run', catalog.runId);
+    const route = attempt && this.store.get<Route>('route', attempt.routeId);
+    const intent = this.store.intents().find((value) => value.attempt_id === catalog.attemptId);
+    const completion = this.nativeRecord(`conversation-completion:${catalog.attemptId}`, 4096)
+      .value as {
+      attemptId: string;
+      quiescent: boolean;
+      submitted: boolean;
+      reason: string | null;
+    };
+    const saved = this.nativeRecord(`conversation-turn:${catalog.attemptId}`)
+      .value as ConversationPlan & {
+      authorityHash: string;
+    };
+    const { authorityHash, ...payload } = saved;
+    const input = conversationPlan(payload);
+    const submission = this.nativeRecord(
+      `conversation-submission:${catalog.attemptId}`,
+      4096,
+      'outcome-unknown',
+    ).value as { attemptId: string; bindingHash: string };
+    if (
+      catalog.taskId !== taskId ||
+      hashCanonical(retained.artifact) !== hashCanonical(artifact) ||
+      this.store.receipt(`conversation-model-catalog:${catalog.attemptId}`)?.hash !==
+        artifact.hash ||
+      !attempt ||
+      attempt.state !== 'stopped' ||
+      attempt.runId !== catalog.runId ||
+      attempt.generation !== catalog.generation ||
+      attempt.routeId !== input.binding.routeId ||
+      route?.model !== input.model ||
+      route.effort.requested !== input.effort ||
+      run?.taskId !== taskId ||
+      run.decision.inputsHash !== authorityHash ||
+      !run.roles.some(
+        (role) => role.role === input.binding.role && role.routeId === attempt.routeId,
+      ) ||
+      intent?.task_id !== taskId ||
+      intent.run_id !== catalog.runId ||
+      intent.route_id !== attempt.routeId ||
+      intent.generation !== catalog.generation ||
+      intent.state !== 'stopped' ||
+      intent.finished_at === null ||
+      this.store.runPurpose(catalog.runId) !== 'conversation' ||
+      !this.store.nativePhasesComplete(catalog.attemptId, 'openai') ||
+      completion.attemptId !== catalog.attemptId ||
+      completion.quiescent !== true ||
+      completion.submitted !== true ||
+      completion.reason !== null ||
+      submission.attemptId !== catalog.attemptId ||
+      submission.bindingHash !== conversationBindingHash(input) ||
+      input.binding.taskId !== taskId ||
+      input.binding.runId !== catalog.runId ||
+      input.binding.attemptId !== catalog.attemptId ||
+      input.binding.generation !== catalog.generation ||
+      !catalog.models.some(
+        (model) => model.model === input.model && model.efforts.includes(input.effort),
+      )
+    )
+      throw Error('observation-stale');
+    return catalog;
+  }
+
+  private conversationCatalogReason(
+    catalog: ConversationModelCatalog,
+  ): ConversationModelFailureReason | undefined {
+    const profile = this.profileFor(catalog.profileId);
+    if (
+      hashCanonical(profile.client) !== hashCanonical(catalog.client) ||
+      profile.locationHash !== catalog.locationHash
+    )
+      return 'client-changed';
+    if (hashCanonical(profile.facts) !== catalog.profileHash) return 'observation-stale';
+    if (!profile.facts.available) return 'catalog-unavailable';
+  }
+
+  private conversationModelReason(
+    taskId: string,
+    selection: ConversationPlanningSelection,
+  ): ConversationModelFailureReason | undefined {
+    const request = selection.modelRequest;
+    if (!request) return;
+    try {
+      const catalog = this.conversationCatalog(taskId, request.observation);
+      const changed = this.conversationCatalogReason(catalog);
+      if (changed) return changed;
+      const model = catalog.models.find((value) => value.model === request.model);
+      if (!model) return 'model-unavailable';
+      if (!model.efforts.includes(request.effort)) return 'effort-unavailable';
+    } catch (error) {
+      return error instanceof Error && error.message === 'observation-missing'
+        ? 'observation-missing'
+        : error instanceof Error && error.message === 'observation-stale'
+          ? 'observation-stale'
+          : 'catalog-unavailable';
+    }
+  }
+
+  private conversationModelChoices(
+    taskId: string,
+    config: ConversationConfiguration | undefined,
+  ): ConversationModelChoices {
+    if (!config?.modelCatalog)
+      return {
+        status: 'not-observed',
+        observation: null,
+        observedAt: null,
+        models: [],
+        reason: 'not-observed',
+      };
+    try {
+      const catalog = this.conversationCatalog(taskId, config.modelCatalog);
+      const reason = this.conversationCatalogReason(catalog);
+      if (reason && reason !== 'client-changed')
+        return {
+          status: 'unavailable',
+          observation: config.modelCatalog,
+          observedAt: catalog.observedAt,
+          models: [],
+          reason,
+        };
+      return {
+        status: reason === 'client-changed' ? 'client-changed' : 'last-observed',
+        observation: config.modelCatalog,
+        observedAt: catalog.observedAt,
+        models: catalog.models,
+        reason: reason ?? config.modelFailure ?? 'available',
+      };
+    } catch {
+      return {
+        status: 'unavailable',
+        observation: null,
+        observedAt: null,
+        models: [],
+        reason: 'catalog-unavailable',
+      };
+    }
+  }
+
+  private conversationModel(
+    selection: ConversationPlanningSelection,
+    configurationRevision: number,
+  ) {
+    const request = selection.modelRequest;
+    return {
+      model: request?.model ?? this.profileFor(selection.profileId).facts.model,
+      effort: request?.effort ?? 'low',
+      ...(request
+        ? { selection: { version: 1 as const, configurationRevision, modelRequest: request } }
+        : {}),
+    };
+  }
+
   private taskAllowance(taskId: string) {
     const config = this.conversationConfiguration(taskId);
     if (!config) return null;
@@ -2915,6 +3093,7 @@ export class Controller {
       role: config.selection.role,
       profileId: config.selection.profileId,
       creditPolicy: config.selection.creditPolicy,
+      ...(config.selection.modelRequest ? { modelRequest: config.selection.modelRequest } : {}),
       source: config.source,
       profileHash: config.profileHash,
       client: config.client,
@@ -2973,8 +3152,7 @@ export class Controller {
           scopeHash: hashCanonical(scope),
           limitMinutes: 5,
         },
-        model: profile.facts.model as ConversationPlan['model'],
-        effort: 'low',
+        ...this.conversationModel(selection, Number.MAX_SAFE_INTEGER),
         creditPolicy: selection.creditPolicy,
         directory: join(this.home, 'conversation', `run_${identity}`, `att_${identity}`),
         context: { title: task.title, outcome: task.outcome, criteria },
@@ -3041,8 +3219,7 @@ export class Controller {
           scopeHash: hashCanonical(scope),
           limitMinutes: 5,
         },
-        model: profile.facts.model as ConversationPlan['model'],
-        effort: 'low',
+        ...this.conversationModel(selection, Number.MAX_SAFE_INTEGER),
         creditPolicy: selection.creditPolicy,
         directory: join(this.home, 'conversation', `run_${identity}`, `att_${identity}`),
         context: { title: task.title, outcome: task.outcome, criteria },
@@ -3139,6 +3316,8 @@ export class Controller {
       } catch {
         send.reason = 'profile-unavailable';
       }
+      if (send.reason === 'available')
+        send.reason = this.conversationModelReason(task.id, config.selection) ?? 'available';
       if (
         send.reason === 'available' &&
         hashCanonical(inspectSource(task.projectId, this.projectPath(task.projectId) as string)) !==
@@ -3231,6 +3410,7 @@ export class Controller {
             effectiveEffort: config.effectiveEffort,
           }
         : null,
+      modelChoices: this.conversationModelChoices(task.id, config),
       currentRunId: task.runId,
       activeAttempt: active,
       budget: config && allowance ? { limits: config.limits, remaining: allowance } : null,
@@ -3253,12 +3433,17 @@ export class Controller {
     const source = inspectSource(task.projectId, this.projectPath(task.projectId) as string);
     committedFiles(this.projectPath(task.projectId) as string, source.base);
     const prior = this.conversationConfiguration(task.id);
+    const selected = this.conversationModel(selection, (prior?.revision ?? 0) + 1);
     const route = RouteSchema.parse({
       id: this.id('rte'),
       family: 'openai',
       displayName: 'Supervised planning',
-      model: profile.facts.model,
-      effort: { requested: 'low', effective: 'unknown', supported: ['low'] },
+      model: selected.model,
+      effort: {
+        requested: selected.effort,
+        effective: 'unknown',
+        supported: [selected.effort],
+      },
       billing: selection.creditPolicy === 'existing-credits' ? 'credits' : 'included',
       qualified: false,
       fake: false,
@@ -3279,6 +3464,7 @@ export class Controller {
       adoptedProposal: prior?.adoptedProposal ?? null,
       effectiveModel: null,
       effectiveEffort: null,
+      ...(prior?.modelCatalog ? { modelCatalog: prior.modelCatalog } : {}),
     });
     this.saveConversationConfiguration(task.id, config);
     const policy = PolicySchema.parse({
@@ -3350,6 +3536,8 @@ export class Controller {
         runId: null,
         next: 'Clarify the task before execution.',
       });
+      const modelReason = this.conversationModelReason(task.id, command.payload.planning);
+      if (modelReason) return { outcome: 'blocked', reason: modelReason };
       if (!this.conversationInputFits(task, command.payload.planning, []))
         return { outcome: 'blocked', reason: 'conversation-input-too-large' };
       try {
@@ -3411,6 +3599,8 @@ export class Controller {
       }
       const boundary = this.conversationBoundary(task.id);
       if (boundary) return { outcome: 'blocked', reason: boundary };
+      const modelReason = this.conversationModelReason(task.id, selection);
+      if (modelReason) return { outcome: 'blocked', reason: modelReason };
       if (!this.conversationInputFits(task, selection, task.criteria))
         return { outcome: 'blocked', reason: 'conversation-input-too-large' };
       const updated = this.configureConversation(task, selection, true);
@@ -3581,8 +3771,7 @@ export class Controller {
       try {
         input = conversationPlan({
           binding,
-          model: profile.facts.model as ConversationPlan['model'],
-          effort: 'low',
+          ...this.conversationModel(config.selection, config.revision),
           creditPolicy: config.selection.creditPolicy,
           directory,
           context: {
@@ -3637,6 +3826,11 @@ export class Controller {
         { outcome: 'applied', entity: run },
       );
     this.admitJob(run, attempt, directory, binding.limitMinutes);
+    this.saveConversationConfiguration(task.id, {
+      ...config,
+      effectiveModel: null,
+      effectiveEffort: null,
+    });
     const started = this.updateTask(this.store.get<Task>('task', task.id) as Task, {
       state: 'running',
       waitingReason: null,
@@ -3749,6 +3943,8 @@ export class Controller {
       )
         throw Error('Planning authority changed.');
       this.conversationProfile(config);
+      const modelReason = this.conversationModelReason(input.binding.taskId, config.selection);
+      if (modelReason) throw Error(modelReason);
       if (input.contextAttachments?.length)
         for (const attachment of input.contextAttachments)
           this.conversationContext([attachment], task.projectId, config.source.base);
@@ -3774,7 +3970,7 @@ export class Controller {
               attemptId: attempt.id,
               quiescent,
               submitted: !!outcome?.metadata,
-              reason: outcome?.reason ?? 'launch',
+              reason: outcome ? outcome.reason : 'launch',
             });
             this.store.saveReceipt(
               `conversation-completion:${attempt.id}`,
@@ -3786,11 +3982,6 @@ export class Controller {
               const config = this.conversationConfiguration(
                 input.binding.taskId,
               ) as ConversationConfiguration;
-              this.saveConversationConfiguration(input.binding.taskId, {
-                ...config,
-                effectiveModel: input.model,
-                effectiveEffort: input.effort,
-              });
               const result = this.conversation.recordReply(
                 {
                   binding: input.binding,
@@ -3800,6 +3991,50 @@ export class Controller {
                 outcome.metadata.conversation,
               );
               if (!result.applied) valid = false;
+              else {
+                const profile = this.conversationProfile(config);
+                const catalog = ConversationModelCatalogSchema.parse({
+                  version: 1,
+                  profileId: config.selection.profileId,
+                  taskId: input.binding.taskId,
+                  runId: input.binding.runId,
+                  attemptId: input.binding.attemptId,
+                  generation: input.binding.generation,
+                  observedAt: this.now(),
+                  profileHash: config.profileHash,
+                  client: profile.client,
+                  locationHash: config.locationHash,
+                  models: outcome.metadata.modelChoices,
+                });
+                const observation = this.nativeArtifact(catalog);
+                this.store.saveReceipt(
+                  `conversation-model-catalog:${attempt.id}`,
+                  observation.hash,
+                  'local-owner',
+                  { outcome: 'applied', entity: observation },
+                );
+                const updated = {
+                  ...config,
+                  effectiveModel: input.model,
+                  effectiveEffort: input.effort,
+                  modelCatalog: { artifactId: observation.id, hash: observation.hash },
+                };
+                delete updated.modelFailure;
+                this.saveConversationConfiguration(input.binding.taskId, updated);
+              }
+            } else if (
+              quiescent &&
+              !runtime.stopped &&
+              !this.closed &&
+              (outcome?.diagnostic?.cause === 'model-unavailable' ||
+                outcome?.diagnostic?.cause === 'effort-unavailable')
+            ) {
+              const config = this.conversationConfiguration(input.binding.taskId);
+              if (config && authorityHash === this.conversationAuthority(config))
+                this.saveConversationConfiguration(input.binding.taskId, {
+                  ...config,
+                  modelFailure: outcome.diagnostic.cause,
+                });
             }
             const task = this.store.get<Task>('task', input.binding.taskId) as Task;
             this.updateTask(task, {
@@ -3810,7 +4045,11 @@ export class Controller {
                   ? 'Planning stopped. Continue explicitly when ready.'
                   : valid
                     ? 'Review the reply and plan before execution.'
-                    : 'The planning turn has no verified reply. Inspect retained history before continuing.',
+                    : outcome?.diagnostic?.cause === 'model-unavailable'
+                      ? 'The requested model is unavailable. Save another choice or explicitly try again.'
+                      : outcome?.diagnostic?.cause === 'effort-unavailable'
+                        ? 'The requested effort is unavailable. Save another choice or explicitly try again.'
+                        : 'The planning turn has no verified reply. Inspect retained history before continuing.',
             });
           })
         )
