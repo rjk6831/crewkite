@@ -8,6 +8,7 @@ import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
+  type Command,
   type Event,
   MAX_FRAME_BYTES,
   type Snapshot,
@@ -317,15 +318,84 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     localAcceptance: { available: false, reason: 'evidence-incomplete' },
   };
   assert(evaluation.target);
-  const grants = ['run-check', 'run-review'].map((action) => ({
+  const grants = (['run-check', 'run-review'] as const).map((action) => ({
     action,
     target: action === 'run-check' ? 'node --test' : 'keep-it-simple/cycle-1',
     taskId: task.id,
     expiresAt: evaluation.expiresAt,
     revoked: false,
-    usesRemaining: 1,
+    usesRemaining: 1 as const,
   }));
   const projectTestFiles = ['test/pricing.test.mjs', 'test/税 額.test.mjs'];
+  const timedFixture = await serve((message, socket) => {
+    if (message.type === 'hello')
+      socket.write(encodeFrame({ type: 'welcome', protocol: 1, cursor: '0' }));
+  });
+  context.after(() => timedFixture.close());
+  for (const row of [
+    { recipe: 'crewkite-verify-v1', expected: 65000 },
+    { recipe: 'node-tests-v1', expected: 5000 },
+    { recipe: 'project-node-tests-v1', expected: 5000 },
+    { recipe: null, expected: 5000 },
+    { recipe: 'crewkite-verify-v1', timeoutMs: 10000, expected: 10000 },
+    { recipe: 'crewkite-verify-v1', timeoutMs: 70000, expected: 70000 },
+  ] as const) {
+    const client = await connectController({
+      ...timedFixture,
+      token,
+      actor,
+      reconnectDelaysMs: [],
+      ...('timeoutMs' in row ? { timeoutMs: row.timeoutMs } : {}),
+    });
+    try {
+      context.mock.timers.enable({ apis: ['setTimeout'] });
+      const command: Command =
+        row.recipe === null
+          ? { protocol: 1, key: `cmd_${suffix}`, actor, command: 'GetSnapshot', payload: {} }
+          : {
+              protocol: 1,
+              key: `cmd_${suffix}`,
+              actor,
+              command: 'PrepareCandidateEvaluation',
+              expectedRevision: task.revision,
+              payload: {
+                taskId: task.id,
+                candidateId: candidate.id,
+                ...(row.recipe === 'project-node-tests-v1'
+                  ? { checkRecipeId: row.recipe, testFiles: projectTestFiles }
+                  : { checkRecipeId: row.recipe }),
+                reviewer: { profileId: profile.id, methodId: 'keep-it-simple', cycles: 1 },
+                creditPolicy: 'ordinary',
+                consent: 'explicit',
+                grants: grants.map((grant) => ({
+                  ...grant,
+                  target:
+                    grant.action === 'run-check' && row.recipe === 'crewkite-verify-v1'
+                      ? 'crewkite verify'
+                      : grant.target,
+                })),
+              },
+            };
+      let settled = false;
+      const response = client.command(command).then((value) => {
+        settled = true;
+        return value;
+      });
+      context.mock.timers.tick(row.expected - 1);
+      await Promise.resolve();
+      assert.equal(settled, false, JSON.stringify(row));
+      context.mock.timers.tick(1);
+      assert.deepEqual(await response, {
+        outcome: 'outcome-unknown',
+        reason: 'response-timeout',
+        next: 'Read a fresh snapshot and retry the same command key if needed.',
+      });
+    } finally {
+      context.mock.timers.reset();
+      client.close();
+    }
+  }
+
   for (const scenario of [
     'show',
     'native-show',
@@ -382,6 +452,10 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     'evaluation-invalid-grants',
     'evaluation-project',
     'evaluation-project-show',
+    'evaluation-verification',
+    'evaluation-verification-saved',
+    'evaluation-verification-show',
+    'evaluation-verification-files',
     'evaluation-project-empty',
     'evaluation-project-limit',
     'evaluation-project-duplicate',
@@ -398,6 +472,14 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     'accept-approval-mismatch',
     'accept-approval-ambiguous',
   ]) {
+    const verification = scenario.startsWith('evaluation-verification');
+    const savedEvaluation =
+      scenario === 'evaluation-saved' || scenario === 'evaluation-verification-saved';
+    const selectedGrants = verification
+      ? grants.map((grant) =>
+          grant.action === 'run-check' ? { ...grant, target: 'crewkite verify' } : grant,
+        )
+      : grants;
     const repositorySaved = scenario === 'repository-saved' || scenario === 'repository-show';
     const repositoryPolicy = {
       ...policy,
@@ -470,8 +552,27 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         >
       | undefined;
     const received: import('@crewkite/contracts').Command[] = [];
-    const preview: Snapshot['candidateEvaluations'][number] =
-      scenario === 'evaluation-reviewed'
+    const preview: Snapshot['candidateEvaluations'][number] = verification
+      ? {
+          ...evaluation,
+          recipe: 'crewkite-verify-v1',
+          remainingBudgets: { attempts: 2, minutes: 6, concurrency: 1 },
+          verification: {
+            toolchainHash: '1'.repeat(64),
+            baselineHash: '2'.repeat(64),
+            lockHash: '3'.repeat(64),
+            platform: 'darwin',
+            arch: 'arm64',
+            executables: {
+              node: { version: '24.22.0', sha256: '4'.repeat(64) },
+              electron: { version: '44.7.2', sha256: '5'.repeat(64) },
+              git: { version: '2.50.1', sha256: '6'.repeat(64) },
+            },
+            stages: ['policy', 'lint', 'types', 'node-tests', 'build', 'desktop'],
+            maximumMinutes: 5,
+          },
+        }
+      : scenario === 'evaluation-reviewed'
         ? {
             ...evaluation,
             stage: 'reviewed',
@@ -682,7 +783,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       JSON.stringify(
         scenario === 'evaluation-invalid-grants'
           ? [{ ...grants[0], unexpected: true }, grants[1]]
-          : grants,
+          : selectedGrants,
       ),
     );
     if (scenario === 'existing') writeFileSync(destination, 'original');
@@ -729,7 +830,14 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         ...(scenario === 'saved' ? ['--existing-credits'] : []),
       ];
     if (scenario === 'changes') args = ['task', 'changes', task.id];
-    if (['evaluation-show', 'evaluation-reviewed', 'evaluation-project-show'].includes(scenario))
+    if (
+      [
+        'evaluation-show',
+        'evaluation-reviewed',
+        'evaluation-project-show',
+        'evaluation-verification-show',
+      ].includes(scenario)
+    )
       args = ['task', 'show', task.id];
     if (['start-checks', 'start-review'].includes(scenario)) args = ['task', scenario, task.id];
     if (
@@ -738,6 +846,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         'evaluation-show',
         'evaluation-reviewed',
         'evaluation-project-show',
+        'evaluation-verification-show',
         'start-checks',
         'start-review',
       ].includes(scenario)
@@ -749,8 +858,10 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         profile.id,
         '--grants',
         grantsFile,
-        ...(scenario === 'evaluation-saved'
-          ? ['--existing-credits']
+        ...(savedEvaluation
+          ? scenario === 'evaluation-saved'
+            ? ['--existing-credits']
+            : []
           : scenario === 'evaluation-partial-consent'
             ? ['--native-trust']
             : ['--native-trust', '--source-consent']),
@@ -770,6 +881,9 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         ...files.flatMap((path) => ['--test-file', path]),
       );
     }
+    if (verification && scenario !== 'evaluation-verification-show')
+      args.push('--recipe', 'crewkite-verify-v1');
+    if (scenario === 'evaluation-verification-files') args.push('--test-file', projectTestFiles[0]);
     if (scenario === 'evaluation-sample-files') args.push('--test-file', projectTestFiles[0]);
     if (scenario === 'evaluation-unknown-recipe') args.push('--recipe', 'unknown');
     if (scenario === 'evaluation-recipe-other-command')
@@ -1010,6 +1124,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         'evaluation-project-limit',
         'evaluation-project-duplicate',
         'evaluation-sample-files',
+        'evaluation-verification-files',
         'evaluation-unknown-recipe',
         'evaluation-recipe-other-command',
       ].includes(scenario)
@@ -1104,7 +1219,14 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       );
       continue;
     }
-    if (['evaluation-show', 'evaluation-reviewed', 'evaluation-project-show'].includes(scenario)) {
+    if (
+      [
+        'evaluation-show',
+        'evaluation-reviewed',
+        'evaluation-project-show',
+        'evaluation-verification-show',
+      ].includes(scenario)
+    ) {
       assert.equal(result.code, 0, result.errors);
       assert.deepEqual(JSON.parse(result.output).evaluation, preview);
       assert.deepEqual(JSON.parse(result.output).evidence, reviewEvidence);
@@ -1116,7 +1238,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         evaluation.target.path,
         evaluation.target.candidateContentHash,
         'process-only',
-        'Remaining total attempts 2, minutes 3',
+        `Remaining total attempts ${preview.remainingBudgets.attempts}, minutes ${preview.remainingBudgets.minutes}`,
         scenario === 'evaluation-reviewed' ? 'already-started' : 'checks-required',
         scenario === 'evaluation-reviewed'
           ? 'Local acceptance available, available'
@@ -1131,6 +1253,22 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
               `Test file ${file.path}, ${file.hash}, ${file.bytes} bytes, ${file.mode}`,
             ),
           );
+      }
+      if (preview.verification) {
+        for (const value of [
+          'Recipe crewkite-verify-v1',
+          'Stages policy, lint, types, node-tests, build, desktop',
+          'Maximum 5 minutes including staging and cleanup',
+          'Platform darwin, arm64',
+          preview.verification.toolchainHash,
+          preview.verification.baselineHash,
+          preview.verification.lockHash,
+          ...Object.values(preview.verification.executables).flatMap((value) => [
+            value.version,
+            value.sha256,
+          ]),
+        ])
+          assert(plain.output.includes(value), value);
       }
       if (scenario === 'evaluation-reviewed') {
         assert(plain.output.includes('Review completed.'));
@@ -1159,11 +1297,13 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
               candidateId: candidate.id,
               ...(scenario === 'evaluation-project'
                 ? { checkRecipeId: 'project-node-tests-v1', testFiles: projectTestFiles }
-                : { checkRecipeId: 'node-tests-v1' }),
+                : verification
+                  ? { checkRecipeId: 'crewkite-verify-v1' }
+                  : { checkRecipeId: 'node-tests-v1' }),
               reviewer: { profileId: profile.id, methodId: 'keep-it-simple', cycles: 1 },
               creditPolicy: scenario === 'evaluation-saved' ? 'existing-credits' : 'ordinary',
-              consent: scenario === 'evaluation-saved' ? 'saved' : 'explicit',
-              grants,
+              consent: savedEvaluation ? 'saved' : 'explicit',
+              grants: selectedGrants,
             }
           : { taskId: task.id, candidateId: candidate.id, preparationId: artifact.id },
       );
