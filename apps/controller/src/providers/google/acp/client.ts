@@ -247,6 +247,8 @@ export function acpEnvironment(source: NodeJS.ProcessEnv, directory: string): No
     LANG: 'C',
     NO_COLOR: '1',
     TMPDIR: join(directory, 'tmp'),
+    // Prefer the native URL handler before Python's AppleScript browser routes.
+    ...(process.platform === 'darwin' ? { BROWSER: '/usr/bin/open %s' } : {}),
   };
   for (const key of ['USER', 'LOGNAME', 'PATH', 'TERM'])
     if (source[key] !== undefined) result[key] = source[key];

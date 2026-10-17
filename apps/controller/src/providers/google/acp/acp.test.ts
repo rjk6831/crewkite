@@ -59,6 +59,7 @@ const environment = {
   PATH: process.env.PATH,
   USER: 'fixture',
   SECRET_TOKEN: 'must-not-escape',
+  BROWSER: 'must-not-escape',
 };
 function fixture(scenario: AcpPeerCase) {
   mkdirSync(resolve('internal'), { recursive: true });
@@ -857,6 +858,10 @@ test('acp stop settles the original prompt and retains process ownership through
     try {
       const spawn: AcpSpawn = (executable, args, options) => {
         assert.equal(options.env.SECRET_TOKEN, undefined);
+        assert.equal(
+          options.env.BROWSER,
+          process.platform === 'darwin' ? '/usr/bin/open %s' : undefined,
+        );
         const child = spawnCheckChild(executable, args, options);
         const write = child.stdin.write.bind(child.stdin);
         child.stdin.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
