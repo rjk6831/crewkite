@@ -757,6 +757,12 @@ async function conversationBridge(
   const sockets = new Set<Socket>();
   let questionId = '';
   let configureAttempts = 0;
+  let heldNativeKey: Command['key'] | null = null;
+  const modelObservation = { artifactId: id('art'), hash: 'c'.repeat(64) };
+  const modelCatalog = [
+    { model: 'fixture-model', efforts: ['low'], defaultEffort: 'low' },
+    { model: 'fixture-next', efforts: ['low', 'high'], defaultEffort: 'high' },
+  ];
   let refuseContextSend = true;
   let uncertainCapture = false;
   let holdContextRead = false;
@@ -765,7 +771,7 @@ async function conversationBridge(
     string,
     { artifact: { id: string; hash: string; bytes: number; mediaType: string }; content: Buffer }
   >();
-  const runId = id('run');
+  let runId = id('run');
   const attemptId = id('att');
   const at = '2026-10-17T12:00:00.000Z';
   const binding = () => ({
@@ -773,7 +779,7 @@ async function conversationBridge(
     runId,
     attemptId,
     generation: 0,
-    routeId: route.id,
+    routeId: state?.configuration?.routeId ?? route.id,
     role: 'lead' as const,
     taskRevision: snapshot.tasks[0].revision,
     conversationRevision: 0,
@@ -873,9 +879,21 @@ async function conversationBridge(
         command,
         received.find((prior) => prior.key === command.key),
       );
+      if (command.command === 'ConfigureTaskConversation') received.push(command);
       return receipts.get(command.key) as CommandResult;
     }
     received.push(command);
+    if (command.command === 'PrepareNativeRun') {
+      assert.equal(heldNativeKey, null);
+      assert.equal(command.expectedRevision, snapshot.tasks[0].revision);
+      assert.equal(command.payload.taskId, snapshot.tasks[0].id);
+      heldNativeKey = command.key;
+      receipts.set(command.key, {
+        outcome: 'blocked',
+        reason: 'Fixture preparation was not saved.',
+      });
+      return { outcome: 'outcome-unknown', reason: 'Fixture preparation reply is uncertain.' };
+    }
     if (command.command === 'CaptureConversationContext') {
       assert.equal(command.expectedRevision, snapshot.projects[0].revision);
       assert.equal(command.payload.projectId, snapshot.projects[0].id);
@@ -931,6 +949,7 @@ async function conversationBridge(
         concurrency: 1,
       });
       assert.equal(command.payload.planning.creditPolicy, 'ordinary');
+      assert.equal(command.payload.planning.modelRequest, undefined);
       const task = {
         ...fixtures.task,
         id: id('tsk'),
@@ -946,7 +965,7 @@ async function conversationBridge(
         kind: 'agent' as const,
         role: 'lead' as const,
         attemptId,
-        routeId: route.id,
+        routeId: state?.configuration?.routeId ?? route.id,
       };
       append({
         kind: 'user-message',
@@ -996,11 +1015,18 @@ async function conversationBridge(
         configuration: {
           revision: 0,
           selection: command.payload.planning,
-          routeId: route.id,
+          routeId: state?.configuration?.routeId ?? route.id,
           requestedModel: 'fixture-model',
           effectiveModel: 'fixture-model',
           requestedEffort: 'low',
           effectiveEffort: 'low',
+        },
+        modelChoices: {
+          status: 'last-observed',
+          observation: modelObservation,
+          observedAt: at,
+          models: modelCatalog,
+          reason: 'available',
         },
         currentRunId: runId,
         activeAttempt: null,
@@ -1054,28 +1080,40 @@ async function conversationBridge(
         return { outcome: 'blocked', reason: 'The fixture refused these settings.' };
       bump();
       assert(state.configuration);
+      const requested = command.payload.planning.modelRequest;
+      const nextRoute = {
+        ...route,
+        id: id('rte'),
+        model: requested?.model ?? profile.model,
+        effort: { requested: requested?.effort ?? 'low', effective: 'unknown', supported: [] },
+      };
+      snapshot.routes.push(nextRoute);
+      runId = id('run');
+      snapshot.tasks[0].runId = runId;
+      snapshot.tasks[0].state = 'draft';
+      state.currentRunId = runId;
+      state.contractStatus = 'provisional';
+      state.phase = 'discussion';
+      state.proposal = null;
+      state.adopt = { available: false, reason: 'proposal-missing' };
       state.configuration = {
         ...state.configuration,
         revision: state.configuration.revision + 1,
         selection: command.payload.planning,
+        routeId: nextRoute.id,
+        requestedModel: nextRoute.model,
+        requestedEffort: nextRoute.effort.requested,
+        effectiveModel: null,
+        effectiveEffort: null,
       };
-      for (const text of [
-        'Scope checked.',
-        'Limits checked.',
-        'The next planning turn uses the saved limits.',
-      ])
-        append({
-          kind: 'agent-message',
-          author: { kind: 'agent', role: 'lead', attemptId, routeId: route.id },
-          binding: binding(),
-          text,
-        });
       const result: CommandResult = { outcome: 'applied', entity: snapshot.tasks[0] };
       receipts.set(command.key, result);
-      return {
-        outcome: 'outcome-unknown',
-        reason: 'The fixture saved settings before its response was lost.',
-      };
+      return configureAttempts === 2
+        ? {
+            outcome: 'outcome-unknown',
+            reason: 'The fixture saved settings before its response was lost.',
+          }
+        : result;
     } else if (command.command === 'SendTaskMessage') {
       if (command.payload.context?.length && refuseContextSend) {
         refuseContextSend = false;
@@ -1092,7 +1130,7 @@ async function conversationBridge(
       state.activeAttempt = {
         id: attemptId,
         runId,
-        routeId: route.id,
+        routeId: state?.configuration?.routeId ?? route.id,
         generation: 0,
         state: 'running',
         revision: 0,
@@ -1317,7 +1355,7 @@ async function conversationBridge(
     state.activeAttempt = {
       id: attemptId,
       runId,
-      routeId: route.id,
+      routeId: state?.configuration?.routeId ?? route.id,
       generation: 0,
       state: 'running',
       revision: 0,
@@ -1404,10 +1442,161 @@ async function conversationBridge(
     );
     await page.getByRole('button', { name: 'Adopt plan', exact: true }).click();
     await expect(
-      page.getByRole('dialog', { name: 'Configure this run', exact: true }),
+      page.getByRole('dialog', { name: 'Choose execution provider', exact: true }),
     ).toBeVisible();
     await page.keyboard.press('Escape');
-    await page.getByRole('button', { name: 'Open session settings', exact: true }).click();
+    const beforePolicySelection = TaskConversationStateSchema.parse(state).configuration?.selection;
+    const policyControl = toolbar.getByRole('button', {
+      name: 'Future execution policy: Not prepared',
+      exact: true,
+    });
+    const choosePolicy = async (authority: 'Guided' | 'Balanced' | 'Autopilot') => {
+      await policyControl.click();
+      await page.getByRole('menuitemradio', { name: authority, exact: true }).click();
+      const chooser = page.getByRole('dialog', { name: 'Choose execution provider', exact: true });
+      await expect(chooser).toBeVisible();
+      await expect(
+        chooser.getByRole('combobox', { name: 'Future execution authority', exact: true }),
+      ).toHaveValue(authority.toLowerCase());
+      return chooser;
+    };
+    await choosePolicy('Balanced');
+    await page.keyboard.press('Escape');
+    await choosePolicy('Guided');
+    await page.keyboard.press('Escape');
+    const staleChooser = await choosePolicy('Autopilot');
+    state = TaskConversationStateSchema.parse(state);
+    assert(state.configuration);
+    state.configuration.revision += 1;
+    bump();
+    publishTask();
+    await expect(staleChooser).toHaveCount(0);
+    await expect(
+      page.getByText(
+        'The task or planning configuration changed. The execution draft was discarded. Review the current task before preparing again.',
+        { exact: true },
+      ),
+    ).toBeVisible();
+    await choosePolicy('Balanced');
+    await page.keyboard.press('Escape');
+    assert.equal(
+      received.some((command) =>
+        [
+          'PrepareRun',
+          'PrepareNativeRun',
+          'PrepareCombinedRun',
+          'StartRun',
+          'ResolveApproval',
+        ].includes(command.command),
+      ),
+      false,
+    );
+    assert.deepEqual(
+      TaskConversationStateSchema.parse(state).configuration?.selection,
+      beforePolicySelection,
+    );
+    const pendingChooser = await choosePolicy('Balanced');
+    await pendingChooser
+      .getByRole('button', { name: `Choose ${profile.displayName}`, exact: true })
+      .click();
+    const seededNative = page.getByRole('dialog', { name: 'Native file proposal', exact: true });
+    await expect(
+      seededNative.getByRole('combobox', { name: 'Execution authority', exact: true }),
+    ).toHaveValue('balanced');
+    await seededNative
+      .getByRole('textbox', { name: 'Committed file path', exact: true })
+      .fill('net.mjs');
+    await seededNative
+      .getByRole('checkbox', { name: 'Trust the existing native client and login', exact: true })
+      .check();
+    await seededNative
+      .getByRole('checkbox', {
+        name: 'Send this committed file and task text; allow its replacement in independent scratch',
+        exact: true,
+      })
+      .check();
+    await seededNative
+      .getByRole('button', { name: 'Prepare native proposal', exact: true })
+      .click();
+    await expect(
+      page.getByRole('button', { name: 'Retry exact command', exact: true }).first(),
+    ).toBeVisible();
+    assert(heldNativeKey);
+    const explicitPreparation = received.find((command) => command.key === heldNativeKey);
+    assert(explicitPreparation?.command === 'PrepareNativeRun');
+    assert.equal(explicitPreparation.payload.policy.authority, 'balanced');
+    assert.equal(explicitPreparation.payload.consent, 'explicit');
+    assert('targetPath' in explicitPreparation.payload);
+    assert.equal(explicitPreparation.payload.targetPath, 'net.mjs');
+    await seededNative.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await page.getByRole('button', { name: 'Prepare run', exact: true }).click();
+    await expect(pendingChooser).toBeVisible();
+    await expect(
+      pendingChooser.getByRole('combobox', { name: 'Future execution authority', exact: true }),
+    ).toHaveValue('balanced');
+    assert.equal(received.filter((command) => command.command === 'PrepareNativeRun').length, 1);
+    await pendingChooser.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await page.getByRole('button', { name: 'Retry exact command', exact: true }).click();
+    await expect(
+      page.getByRole('button', { name: 'Retry exact command', exact: true }),
+    ).toHaveCount(0);
+    await page.getByRole('button', { name: 'Prepare run', exact: true }).click();
+    await expect(pendingChooser).toBeVisible();
+    await expect(
+      pendingChooser.getByRole('combobox', { name: 'Future execution authority', exact: true }),
+    ).toHaveValue('guided');
+    await pendingChooser.getByRole('button', { name: 'Cancel', exact: true }).click();
+    if (await page.getByRole('button', { name: 'Dismiss error', exact: true }).count())
+      await page.getByRole('button', { name: 'Dismiss error', exact: true }).click();
+
+    const beforeModel = TaskConversationStateSchema.parse(state);
+    assert(beforeModel.configuration);
+    const originalSelection = beforeModel.configuration.selection;
+    const originalBudget = beforeModel.budget;
+    const originalTaskRevision = snapshot.tasks[0].revision;
+    // Earlier saved history appears with the settings refresh.
+    for (const text of [
+      'Scope checked.',
+      'Limits checked.',
+      'The next planning turn uses the saved limits.',
+    ])
+      append({
+        kind: 'agent-message',
+        author: {
+          kind: 'agent',
+          role: 'lead',
+          attemptId,
+          routeId: state?.configuration?.routeId ?? route.id,
+        },
+        binding: binding(),
+        text,
+      });
+    await modelControl.click();
+    await page.getByRole('menuitemradio', { name: 'fixture-next', exact: true }).click();
+    const session = page.getByRole('dialog', { name: 'Session settings', exact: true });
+    await expect(
+      session.getByRole('combobox', { name: 'Planning model', exact: true }),
+    ).toHaveValue('fixture-next');
+    await expect(
+      session.getByRole('combobox', { name: 'Planning effort', exact: true }),
+    ).toHaveValue('high');
+    await session
+      .getByRole('combobox', { name: 'Planning model', exact: true })
+      .selectOption('fixture-model');
+    await expect(
+      session.getByRole('combobox', { name: 'Planning effort', exact: true }),
+    ).toHaveValue('low');
+    await session
+      .getByRole('combobox', { name: 'Planning model', exact: true })
+      .selectOption('fixture-next');
+    await expect(
+      session.getByRole('combobox', { name: 'Planning effort', exact: true }),
+    ).toHaveValue('high');
+    await session
+      .getByRole('combobox', { name: 'Planning effort', exact: true })
+      .selectOption('low');
+    assert.equal(configureAttempts, 0);
+    assert.equal(snapshot.tasks[0].revision, originalTaskRevision);
     await page
       .getByRole('dialog')
       .getByRole('checkbox', {
@@ -1432,6 +1621,68 @@ async function conversationBridge(
     await page.getByRole('button', { name: 'Retry exact settings command', exact: true }).click();
     await expect(page.getByRole('dialog')).toHaveCount(0);
     assert.equal(configureAttempts, 2);
+    const savedCommands = received.filter(
+      (command) => command.command === 'ConfigureTaskConversation',
+    );
+    assert.equal(savedCommands.length, 3);
+    assert.deepEqual(savedCommands[2], savedCommands[1]);
+    assert.equal(savedCommands[1].expectedRevision, originalTaskRevision);
+    assert.deepEqual(savedCommands[1].payload, {
+      taskId: snapshot.tasks[0].id,
+      planning: {
+        ...originalSelection,
+        consent: 'explicit',
+        modelRequest: {
+          version: 1,
+          observation: modelObservation,
+          model: 'fixture-next',
+          effort: 'low',
+        },
+      },
+    });
+    const savedModel = TaskConversationStateSchema.parse(state);
+    assert.equal(savedModel.configuration?.requestedModel, 'fixture-next');
+    assert.equal(savedModel.configuration?.requestedEffort, 'low');
+    assert.equal(savedModel.configuration?.effectiveModel, null);
+    assert.equal(savedModel.configuration?.effectiveEffort, null);
+    assert.notEqual(savedModel.currentRunId, beforeModel.currentRunId);
+    assert.deepEqual(savedModel.modelChoices, beforeModel.modelChoices);
+    assert.deepEqual(savedModel.budget, originalBudget);
+    await toolbar.getByRole('button', { name: /^Architect effort:/ }).click();
+    await page.getByRole('menuitemradio', { name: 'high', exact: true }).click();
+    await expect(
+      session.getByRole('combobox', { name: 'Planning model', exact: true }),
+    ).toHaveValue('fixture-next');
+    await expect(
+      session.getByRole('combobox', { name: 'Planning effort', exact: true }),
+    ).toHaveValue('high');
+    await expect(
+      session.getByRole('button', { name: 'Save planning settings', exact: true }),
+    ).toBeDisabled();
+    await session
+      .getByRole('checkbox', {
+        name: 'Allow bounded planning with this profile and these limits',
+        exact: true,
+      })
+      .check();
+    await session.getByRole('button', { name: 'Save planning settings', exact: true }).click();
+    await expect(session).toHaveCount(0);
+    assert.equal(configureAttempts, 3);
+    const savedEffort = TaskConversationStateSchema.parse(state);
+    assert.deepEqual(savedEffort.configuration?.selection.modelRequest, {
+      version: 1,
+      observation: modelObservation,
+      model: 'fixture-next',
+      effort: 'high',
+    });
+    assert.equal(savedEffort.configuration?.effectiveModel, null);
+    assert.equal(savedEffort.configuration?.effectiveEffort, null);
+    assert.equal(savedEffort.contractStatus, 'provisional');
+    assert.equal(savedEffort.phase, 'discussion');
+    assert.equal(savedEffort.proposal, null);
+    assert.deepEqual(savedEffort.adopt, { available: false, reason: 'proposal-missing' });
+    await expect(policyControl).toHaveAttribute('aria-disabled', 'true');
+    await expect(page.getByRole('button', { name: 'Prepare run', exact: true })).toHaveCount(0);
     await page.getByText('Task details', { exact: true }).click();
     await expect(
       page.getByText(
@@ -1611,11 +1862,61 @@ async function conversationBridge(
     await expect(page.getByRole('button', { name: /^Remove Context/ })).toHaveCount(1);
     assert.equal(received.length, mutations);
     assert.equal(
-      received.some((command) =>
-        ['PrepareRun', 'StartRun', 'PrepareNativeRun', 'AcceptCandidate'].includes(command.command),
+      received.some(
+        (command) =>
+          ['PrepareRun', 'StartRun', 'AcceptCandidate'].includes(command.command) ||
+          (command.command === 'PrepareNativeRun' && command.key !== heldNativeKey),
       ),
       false,
     );
+    state = TaskConversationStateSchema.parse(state);
+    assert(state.configuration?.selection.modelRequest);
+    assert(state.modelChoices);
+    const beforeDefaultSelection = structuredClone(state.configuration.selection);
+    const beforeDefaultBudget = structuredClone(state.budget);
+    const beforeDefaultAttempts = snapshot.attempts.length;
+    const beforeDefaultPreparations = received.filter(
+      (command) => command.command === 'PrepareNativeRun',
+    ).length;
+    state.modelChoices.status = 'client-changed';
+    state.modelChoices.reason = 'client-changed';
+    bump();
+    publishTask();
+    await expect(modelControl).toHaveAttribute('aria-disabled', 'true');
+    await page.getByRole('button', { name: 'Open session settings', exact: true }).click();
+    await expect(session).toContainText('The installed client changed.');
+    await session.getByRole('button', { name: 'Use profile default', exact: true }).click();
+    await expect(
+      session.getByRole('checkbox', {
+        name: 'Allow bounded planning with this profile and these limits',
+        exact: true,
+      }),
+    ).not.toBeChecked();
+    await session
+      .getByRole('checkbox', {
+        name: 'Allow bounded planning with this profile and these limits',
+        exact: true,
+      })
+      .check();
+    await session.getByRole('button', { name: 'Save planning settings', exact: true }).click();
+    await expect(session).toHaveCount(0);
+    const defaultCommand = received.findLast(
+      (command) => command.command === 'ConfigureTaskConversation',
+    );
+    assert(defaultCommand?.command === 'ConfigureTaskConversation');
+    const { modelRequest: omittedRequest, ...defaultSelection } = beforeDefaultSelection;
+    assert(omittedRequest);
+    assert.deepEqual(defaultCommand.payload.planning, defaultSelection);
+    assert.equal('modelRequest' in defaultCommand.payload.planning, false);
+    assert.deepEqual(state.budget, beforeDefaultBudget);
+    await expect(composer).toHaveValue('Keep this unsent draft.');
+    await expect(page.getByRole('button', { name: /^Remove Context/ })).toHaveCount(1);
+    assert.equal(snapshot.attempts.length, beforeDefaultAttempts);
+    assert.equal(
+      received.filter((command) => command.command === 'PrepareNativeRun').length,
+      beforeDefaultPreparations,
+    );
+
     state = TaskConversationStateSchema.parse(state);
     bump();
     state.phase = 'discussion';
@@ -1623,7 +1924,12 @@ async function conversationBridge(
     const manyQuestions = Array.from({ length: 100 }, (_, index) =>
       append({
         kind: 'question',
-        author: { kind: 'agent', role: 'lead', attemptId, routeId: route.id },
+        author: {
+          kind: 'agent',
+          role: 'lead',
+          attemptId,
+          routeId: state?.configuration?.routeId ?? route.id,
+        },
         binding: binding(),
         text: `Saved question ${index + 1}`,
       }),
