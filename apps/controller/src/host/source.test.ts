@@ -11,16 +11,19 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  renameSync,
   rmSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { createRequire } from 'node:module';
+import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
 import { setImmediate } from 'node:timers';
 import { canonicalJson, ReadDataSchema } from '@crewkite/contracts';
 import { createSyntheticRepository } from '@crewkite/testkit/repository';
+import { copyRuntimePackages } from '../../../../scripts/runtime-packages.ts';
 import {
   applyReplacement,
   captureSingleFileEdit,
@@ -375,6 +378,136 @@ test('source inspection bounds file metadata without running filters or reading 
     assert.equal(tools.files, 2);
     assert.equal(tools.entries.find((entry) => entry.path === 'cli.mjs')?.kind, 'file');
     await assert.rejects(copyInstalledDependencies(donor, candidate, expected, budget()), /EEXIST/);
+  }
+
+  for (const name of [
+    'copy',
+    'exports',
+    'version',
+    'missing',
+    'extra',
+    'escape',
+    'conflicting resolution',
+    'changed donor',
+    'changed manifest',
+  ]) {
+    const root = join(directory, 'runtime', name);
+    const donor = join(root, 'donor');
+    const stage = join(root, 'stage');
+    const sdk = join(donor, 'node_modules/fixture');
+    const parser = join(sdk, 'node_modules/parser');
+    mkdirSync(parser, { recursive: true });
+    mkdirSync(stage, { recursive: true });
+    writeFileSync(join(donor, 'package.json'), '{}');
+    writeFileSync(
+      join(sdk, 'package.json'),
+      JSON.stringify({
+        name: 'fixture',
+        version: '1.0.0',
+        ...(name === 'exports' ? { exports: { '.': './index.js' } } : { main: 'index.js' }),
+        dependencies: {
+          converter: '1.0.0',
+          parser: '^3.0.0',
+          ...(name === 'extra' ? { unexpected: '*' } : {}),
+        },
+      }),
+    );
+    writeFileSync(join(sdk, 'index.js'), "module.exports = require('converter');\n");
+    writeFileSync(join(sdk, 'LICENSE'), 'exact fixture license\n');
+    writeFileSync(
+      join(parser, 'package.json'),
+      JSON.stringify({
+        name: 'parser',
+        version: name === 'version' ? '4.0.0' : '3.0.0',
+        main: 'index.js',
+      }),
+    );
+    writeFileSync(join(parser, 'index.js'), 'module.exports = 3;\n');
+    writeFileSync(join(parser, 'LICENSE'), 'exact parser license\n');
+    // Installed package stores keep dependency links beside each package, not inside its payload.
+    const payload = join(donor, 'store/fixture');
+    mkdirSync(dirname(payload), { recursive: true });
+    renameSync(sdk, payload);
+    renameSync(join(payload, 'node_modules'), join(donor, 'store/node_modules'));
+    const converter = join(donor, 'store/node_modules/converter');
+    mkdirSync(converter);
+    writeFileSync(
+      join(converter, 'package.json'),
+      '{"name":"converter","version":"1.0.0","main":"index.js","peerDependencies":{"parser":"^3"}}',
+    );
+    writeFileSync(join(converter, 'index.js'), "module.exports = require('parser');\n");
+    writeFileSync(join(converter, 'LICENSE'), 'exact converter license\n');
+    symlinkSync('../store/fixture', sdk);
+    if (name === 'missing') rmSync(join(donor, 'store/node_modules/parser'), { recursive: true });
+    if (name === 'escape') {
+      unlinkSync(sdk);
+      writeFileSync(
+        join(stage, 'package.json'),
+        '{"name":"fixture","version":"1.0.0","main":"index.js"}',
+      );
+      writeFileSync(join(stage, 'index.js'), 'module.exports = 1;\n');
+      symlinkSync(stage, sdk);
+    }
+    if (name === 'conflicting resolution') {
+      mkdirSync(join(donor, 'other/node_modules/parser'), { recursive: true });
+      for (const file of ['package.json', 'index.js', 'LICENSE'])
+        writeFileSync(
+          join(donor, 'other/node_modules/parser', file),
+          readFileSync(join(donor, 'store/node_modules/parser', file)),
+        );
+      renameSync(converter, join(donor, 'other/converter'));
+      symlinkSync('../../other/converter', converter);
+    }
+    let changed = false;
+    const limits = budget();
+    limits.maximumEntries = 200;
+    limits.now = () => {
+      if (name === 'changed manifest' && !changed) {
+        changed = true;
+        writeFileSync(join(payload, 'package.json'), '{"name":"fixture","version":"9.0.0"}');
+      }
+      if (
+        name === 'changed donor' &&
+        !changed &&
+        existsSync(join(stage, 'node_modules/.runtime/node_modules/fixture/index.js'))
+      ) {
+        changed = true;
+        writeFileSync(join(payload, 'index.js'), 'module.exports = 9;\n');
+      }
+      return 0;
+    };
+    const run = () =>
+      copyRuntimePackages({
+        source: donor,
+        from: 'package.json',
+        destination: stage,
+        root: 'fixture',
+        packages: [
+          { name: 'fixture', version: '1.0.0', edges: ['converter', 'parser'], license: 'LICENSE' },
+          { name: 'converter', version: '1.0.0', edges: ['parser'], license: 'LICENSE' },
+          { name: 'parser', version: '3.0.0', edges: [], license: 'LICENSE' },
+        ],
+        budget: limits,
+      });
+    if (!['copy', 'exports'].includes(name)) {
+      await assert.rejects(run(), Error, name);
+      if (name === 'changed donor') assert(changed);
+      continue;
+    }
+    const notices = await run();
+    assert.equal(notices.length, 3);
+    assert.equal(readFileSync(notices[0].license, 'utf8'), 'exact fixture license\n');
+    mkdirSync(join(stage, 'node_modules/parser'));
+    writeFileSync(
+      join(stage, 'node_modules/parser/package.json'),
+      '{"name":"parser","version":"4.0.0","main":"index.js"}',
+    );
+    writeFileSync(join(stage, 'node_modules/parser/index.js'), 'module.exports = 4;\n');
+    const require = createRequire(join(stage, 'package.json'));
+    assert.equal(require('fixture'), 3);
+    assert.equal(require('parser'), 4);
+    if (name === 'exports') assert.throws(() => require.resolve('fixture/package.json'));
+    await assert.rejects(run(), /EEXIST/);
   }
 });
 

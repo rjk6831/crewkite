@@ -24,6 +24,7 @@ import {
   copyInstalledDependencies,
   inspectInstalledDependencies,
 } from '../apps/controller/src/host/toolchain.ts';
+import { copyRuntimePackages } from './runtime-packages.ts';
 
 const source = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const git = (...args) => execFileSync('git', args, { cwd: source, encoding: 'utf8' }).trim();
@@ -241,7 +242,11 @@ for (const path of workspace) {
   const from = join(checkout, path);
   const manifest = json(join(from, 'package.json'));
   for (const [name, version] of Object.entries(manifest.dependencies ?? {}))
-    if (!(name.startsWith('@crewkite/') && version === 'workspace:*') && name !== 'zod')
+    if (
+      !(name.startsWith('@crewkite/') && version === 'workspace:*') &&
+      name !== 'zod' &&
+      !(path === 'apps/controller' && name === '@lmstudio/sdk' && version === '2.1.0')
+    )
       throw new Error(`Unqualified runtime dependency: ${name}.`);
   copy(join(from, 'package.json'), join(runtime, path, 'package.json'));
   cpSync(join(from, 'src'), join(runtime, path, 'src'), {
@@ -258,6 +263,43 @@ const zod = dirname(contracts.resolve('zod/package.json'));
 cpSync(zod, join(runtime, 'node_modules/zod'), {
   recursive: true,
   filter: (path) => relative(zod, path).split(sep)[0] !== 'src',
+});
+const runtimePackages = await copyRuntimePackages({
+  source: checkout,
+  from: 'apps/controller/package.json',
+  destination: runtime,
+  root: '@lmstudio/sdk',
+  packages: [
+    {
+      name: '@lmstudio/sdk',
+      version: '2.1.0',
+      edges: ['@lmstudio/lms-isomorphic', 'chalk', 'jsonschema', 'zod', 'zod-to-json-schema'],
+      license: 'LICENSE',
+    },
+    { name: '@lmstudio/lms-isomorphic', version: '0.5.0', edges: ['ws'], license: 'LICENSE' },
+    {
+      name: 'chalk',
+      version: '4.1.2',
+      edges: ['ansi-styles', 'supports-color'],
+      license: 'license',
+    },
+    { name: 'jsonschema', version: '1.5.0', edges: [], license: 'LICENSE' },
+    { name: 'zod', version: '3.25.76', edges: [], license: 'LICENSE' },
+    { name: 'zod-to-json-schema', version: '3.25.2', edges: ['zod'], license: 'LICENSE' },
+    {
+      name: 'ws',
+      version: '8.22.0',
+      edges: [],
+      optionalPeers: ['bufferutil', 'utf-8-validate'],
+      license: 'LICENSE',
+    },
+    { name: 'ansi-styles', version: '4.3.0', edges: ['color-convert'], license: 'license' },
+    { name: 'supports-color', version: '7.2.0', edges: ['has-flag'], license: 'license' },
+    { name: 'color-convert', version: '2.0.1', edges: ['color-name'], license: 'LICENSE' },
+    { name: 'has-flag', version: '4.0.0', edges: [], license: 'license' },
+    { name: 'color-name', version: '1.1.4', edges: [], license: 'LICENSE' },
+  ],
+  budget: copyBudget,
 });
 for (const entry of verificationFiles) {
   const from = join(checkout, entry.path);
@@ -292,6 +334,13 @@ function notice(name, version, from, filename) {
   copy(from, join(stage, destination));
   notices.push({ name, version, license: destination, sha256: hash(from) });
 }
+for (const item of runtimePackages)
+  notice(
+    item.name,
+    item.version,
+    item.license,
+    `${item.name.replaceAll('@', '').replaceAll('/', '-')}-${item.version}-LICENSE`,
+  );
 for (const filename of ['LICENSE', 'NOTICE'])
   notice('CrewKite', desktop.version, join(checkout, filename), filename);
 for (const filename of ['LICENSE', 'NOTICE', 'docs/credits.md'])
