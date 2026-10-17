@@ -220,10 +220,6 @@ function DecisionCard({
             <dd>{decision.approval.requester}</dd>
           </div>
           <div>
-            <dt>Action</dt>
-            <dd>{decision.approval.action}</dd>
-          </div>
-          <div>
             <dt>Target</dt>
             <dd>
               <code>{decision.approval.target}</code>
@@ -262,6 +258,12 @@ function DecisionCard({
             </dd>
           </div>
         </dl>
+      )}
+      {decision.kind === 'approval' && (
+        <details className="technical-details">
+          <summary>Action identifier</summary>
+          <code>{decision.approval.action}</code>
+        </details>
       )}
       {Boolean(decision.facts?.length) && (
         <dl className="conversation-decision-facts">
@@ -600,7 +602,7 @@ export function Conversation({
                           disabled={!onOpenAttachment}
                           onClick={() => onOpenAttachment?.(attachment.id)}
                         >
-                          {attachment.label}
+                          <span>{attachment.label}</span>
                         </button>
                       ))}
                     </div>
@@ -707,7 +709,8 @@ export function Conversation({
             onKeyDown={(event) => {
               if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
                 event.preventDefault();
-                event.currentTarget.form?.requestSubmit();
+                // Only a fresh press sends. A held Enter carried in from another control repeats.
+                if (!event.repeat) event.currentTarget.form?.requestSubmit();
               }
             }}
           />
@@ -720,14 +723,18 @@ export function Conversation({
                     disabled={composer.contextDisabled}
                     onClick={() => composer.onPreviewContext?.(attachment.id)}
                   >
-                    {attachment.label}
+                    <span>{attachment.label}</span>
                   </button>
                   <button
                     type="button"
                     className="conversation-attachment-remove"
                     aria-label={`Remove ${attachment.label}`}
                     disabled={composer.contextDisabled}
-                    onClick={() => composer.onRemoveContext?.(attachment.id)}
+                    onClick={() => {
+                      composer.onRemoveContext?.(attachment.id);
+                      // The focused button unmounts with its chip. Keep focus in the composer.
+                      textarea.current?.focus();
+                    }}
                   >
                     <X size={12} aria-hidden="true" />
                   </button>

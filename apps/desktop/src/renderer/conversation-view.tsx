@@ -27,7 +27,7 @@ import {
   useState,
   useSyncExternalStore,
 } from 'react';
-import { Dialog, familyName, titleCase } from './components.tsx';
+import { actionName, Dialog, familyName, titleCase } from './components.tsx';
 import type { ComposerControlsProps } from './composer-controls.tsx';
 import { ContextGauge } from './context-gauge.tsx';
 import { Conversation, type ConversationMessage } from './conversation.tsx';
@@ -1370,7 +1370,7 @@ export function NewGoal({
                 usedTokens={null}
                 capacityTokens={null}
                 measurement="unknown"
-                unavailableReason={`The provider has not reported context usage or capacity. ${workspace.connection === 'connected' ? 'Goal not sent.' : 'Reconnect to inspect current activity.'}`}
+                unavailableReason="Goal not sent. Context usage is unknown until a planning turn reports a measurement."
               />
             ),
           }}
@@ -1616,7 +1616,7 @@ export function ConversationView({
         decision: {
           id: approval.approvalId,
           kind: 'approval',
-          title: 'Permission request',
+          title: actionName(approval.action),
           text: 'This decision applies only to the exact request below.',
           approval,
           pending: pendingDecision === approval.approvalId,
