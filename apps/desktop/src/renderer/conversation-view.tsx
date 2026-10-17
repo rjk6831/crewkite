@@ -636,11 +636,6 @@ export function ConversationView({
   }
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0, height: '100%' }}>
-      {history.historyNotice && (
-        <p className="notice" role="status">
-          {history.historyNotice}
-        </p>
-      )}
       {history.error && (
         <button
           className="button secondary"
@@ -651,23 +646,24 @@ export function ConversationView({
           Refresh conversation
         </button>
       )}
-      {state && (
-        <div className="launch-summary">
-          <span>{titleCase(state.contractStatus)} contract</span>
-          <span>
-            {state.budget
-              ? `${state.budget.remaining.attempts}/${state.budget.limits.attempts} attempts · ${state.budget.remaining.minutes}/${state.budget.limits.minutes} minutes remaining`
-              : 'Task budget unknown'}
-          </span>
-          <span>{state.queuedInputCount} queued inputs</span>
-        </div>
-      )}
       {pendingQuestion && (
-        <div className="launch-summary">
-          <label>
+        <div
+          className="launch-summary"
+          style={{ flexShrink: 0, flexWrap: 'wrap', gap: '8px 16px', padding: '4px 24px' }}
+        >
+          <label
+            style={{
+              display: 'flex',
+              flexDirection: 'row',
+              alignItems: 'center',
+              gap: 8,
+              minWidth: 0,
+            }}
+          >
             Pending questions ({state?.pendingQuestions.length})
             <select
               aria-label="Pending question"
+              style={{ width: 'auto' }}
               value={pendingQuestion.id}
               disabled={workspace.pending || history.reading}
               onChange={(event) => setSelectedQuestion(event.target.value)}
@@ -711,6 +707,27 @@ export function ConversationView({
                   effort: `Effort ${config.effectiveEffort ?? 'unknown'} · Requested: ${config.requestedEffort ?? 'unknown'}`,
                 }
               : null
+          }
+          detailsStatus={history.historyNotice ? 'History refreshed' : undefined}
+          details={
+            <>
+              {history.historyNotice && (
+                <p className="notice" role="status">
+                  {history.historyNotice}
+                </p>
+              )}
+              {state && (
+                <div className="launch-summary">
+                  <span>{titleCase(state.contractStatus)} contract</span>
+                  <span>
+                    {state.budget
+                      ? `${state.budget.remaining.attempts}/${state.budget.limits.attempts} attempts · ${state.budget.remaining.minutes}/${state.budget.limits.minutes} minutes remaining`
+                      : 'Task budget unknown'}
+                  </span>
+                  <span>{state.queuedInputCount} queued inputs</span>
+                </div>
+              )}
+            </>
           }
           activeWorkers={
             state?.phase === 'unknown'

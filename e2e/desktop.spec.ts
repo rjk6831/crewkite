@@ -1216,12 +1216,14 @@ async function conversationBridge(
     await page.getByRole('button', { name: 'Retry exact settings command', exact: true }).click();
     await expect(page.getByRole('dialog')).toHaveCount(0);
     assert.equal(configureAttempts, 2);
+    await page.getByText('Task details', { exact: true }).click();
     await expect(
       page.getByText(
         'Newer saved messages were loaded. Load earlier messages to restore the previous history.',
         { exact: true },
       ),
     ).toBeVisible();
+    await page.getByText('Task details', { exact: true }).click();
     await page.getByRole('button', { name: 'Load earlier messages', exact: true }).click();
     await expect(page.getByText('Scope checked.', { exact: true })).toBeAttached();
     await composer.fill('Keep the execution permissions unchanged.');

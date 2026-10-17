@@ -12,7 +12,7 @@ import {
   TriangleAlert,
   Users,
 } from 'lucide-react';
-import { type FormEvent, useEffect, useId, useRef, useState } from 'react';
+import { type FormEvent, type ReactNode, useEffect, useId, useRef, useState } from 'react';
 import './conversation.css';
 
 export type ConversationStage = {
@@ -76,6 +76,8 @@ export type ConversationProps = {
   visible?: boolean;
   messages: ConversationMessage[];
   primary: { name: string; role: string; route?: string; model?: string; effort?: string } | null;
+  details?: ReactNode;
+  detailsStatus?: string;
   status: string;
   next?: string;
   activeWorkers?: number;
@@ -377,6 +379,8 @@ export function Conversation({
   onAnswerDraftChange,
   onApproval,
   onOpenSettings,
+  details,
+  detailsStatus,
 }: ConversationProps) {
   const transcript = useRef<HTMLDivElement>(null);
   const textarea = useRef<HTMLTextAreaElement>(null);
@@ -427,12 +431,20 @@ export function Conversation({
   }
   return (
     <section className="conversation" aria-label="Task conversation">
-      <div className="conversation-context">
+      <div
+        className="conversation-context"
+        style={{ flexShrink: 0, maxHeight: '25%', overflowY: 'auto', alignItems: 'flex-start' }}
+      >
         <div className="conversation-primary-avatar" aria-hidden="true">
           <MessageSquare size={17} />
         </div>
-        <div className="conversation-primary">
-          <strong>{primary?.name ?? 'Primary role unassigned'}</strong>
+        <details className="conversation-primary" style={{ flex: 1 }}>
+          <summary style={{ cursor: 'pointer' }}>
+            <strong>{primary?.name ?? 'Primary role unassigned'}</strong>
+            {' · '}
+            <span>Task details</span>
+            {detailsStatus && ` · ${detailsStatus}`}
+          </summary>
           <span>
             {primary
               ? [primary.role, primary.route, primary.model, primary.effort]
@@ -440,7 +452,8 @@ export function Conversation({
                   .join(' · ')
               : 'Choose the primary role in session settings.'}
           </span>
-        </div>
+          {details}
+        </details>
         {activeWorkers !== undefined && maximumWorkers !== undefined && (
           <span className="conversation-workers">
             <Users size={13} aria-hidden="true" />
