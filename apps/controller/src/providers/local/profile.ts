@@ -147,22 +147,50 @@ export const ReasonSchema = z.enum([
   'stopped',
   'ownership',
 ]);
-export const TerminalSchema = z.discriminatedUnion('kind', [
-  z.strictObject({
-    kind: z.literal('completed'),
-    binding: BindingSchema,
-    proof: ProofSchema,
-    proposal: ProposalSchema,
-  }),
-  z.strictObject({ kind: z.literal('stopped'), binding: BindingSchema, proof: ProofSchema }),
-  z.strictObject({
-    kind: z.literal('failed'),
-    binding: BindingSchema,
-    reason: ReasonSchema,
-    proof: ProofSchema.nullable(),
-  }),
-  z.strictObject({ kind: z.literal('unknown'), binding: BindingSchema, reason: ReasonSchema }),
-]);
+export const ConfigurationDetailSchema = z
+  .strictObject({
+    version: z.literal(1),
+    stage: z.enum(['base', 'terminal']),
+    check: z.enum([
+      'base-draft',
+      'load-fields',
+      'prediction-fields',
+      'context-length',
+      'overflow-policy',
+      'draft-disabled',
+      'round-index',
+      'max-tokens',
+    ]),
+    status: z.enum(['missing', 'malformed', 'duplicate', 'mismatch']),
+  })
+  .refine((detail) => (detail.stage === 'base') === (detail.check === 'base-draft'));
+export type ConfigurationDetail = z.output<typeof ConfigurationDetailSchema>;
+export const TerminalSchema = z
+  .discriminatedUnion('kind', [
+    z.strictObject({
+      kind: z.literal('completed'),
+      binding: BindingSchema,
+      proof: ProofSchema,
+      proposal: ProposalSchema,
+    }),
+    z.strictObject({ kind: z.literal('stopped'), binding: BindingSchema, proof: ProofSchema }),
+    z.strictObject({
+      kind: z.literal('failed'),
+      binding: BindingSchema,
+      reason: ReasonSchema,
+      proof: ProofSchema.nullable(),
+      detail: ConfigurationDetailSchema.optional(),
+    }),
+    z.strictObject({
+      kind: z.literal('unknown'),
+      binding: BindingSchema,
+      reason: ReasonSchema,
+      detail: ConfigurationDetailSchema.optional(),
+    }),
+  ])
+  .refine(
+    (terminal) => !('detail' in terminal && terminal.detail) || terminal.reason === 'configuration',
+  );
 export type LocalStart = z.output<typeof StartSchema>;
 export type LocalBinding = z.output<typeof BindingSchema>;
 export type LocalTerminal = z.output<typeof TerminalSchema>;

@@ -15,6 +15,7 @@ import type { Schedule } from '../../host/worker.ts';
 import {
   CLEANUP_MS,
   CONTEXT_TOKENS,
+  type ConfigurationDetail,
   type LocalReason,
   type LocalStart,
   type LocalTerminal,
@@ -379,13 +380,46 @@ export async function discoverLocalModels(
 const fieldsSchema = z.object({
   fields: z.array(z.object({ key: z.string().max(200), value: z.unknown() })).max(256),
 });
-function field(config: unknown, key: string) {
-  const fields = fieldsSchema.parse(config).fields;
-  if (new Set(fields.map((item) => item.key)).size !== fields.length) throw new Error();
-  const entry = fields.find((item) => item.key === key);
-  if (!entry) throw new Error();
-  return entry.value;
+// Raw SDK configuration is unstable. Failure details must not copy its values.
+class ConfigurationFailure extends Error {
+  readonly detail: ConfigurationDetail;
+  constructor(
+    check: ConfigurationDetail['check'],
+    status: ConfigurationDetail['status'],
+    stage: ConfigurationDetail['stage'] = 'terminal',
+  ) {
+    super('The Local configuration proof is unavailable.');
+    this.detail = { version: 1, stage, check, status };
+  }
 }
+function configurationValue<T>(
+  value: unknown,
+  check: ConfigurationDetail['check'],
+  schema: z.ZodType<T>,
+  matches: (value: T) => boolean,
+) {
+  const parsed = schema.safeParse(value);
+  if (!parsed.success) throw new ConfigurationFailure(check, 'malformed');
+  if (!matches(parsed.data)) throw new ConfigurationFailure(check, 'mismatch');
+}
+function configurationField<T>(
+  config: unknown,
+  section: 'load-fields' | 'prediction-fields',
+  key: string,
+  check: ConfigurationDetail['check'],
+  schema: z.ZodType<T>,
+  matches: (value: T) => boolean,
+) {
+  const parsed = fieldsSchema.safeParse(config);
+  if (!parsed.success) throw new ConfigurationFailure(section, 'malformed');
+  const fields = parsed.data.fields;
+  if (new Set(fields.map((item) => item.key)).size !== fields.length)
+    throw new ConfigurationFailure(section, 'duplicate');
+  const entry = fields.find((item) => item.key === key);
+  if (!entry) throw new ConfigurationFailure(check, 'missing');
+  configurationValue(entry.value, check, schema, matches);
+}
+
 function sameModel(plan: LocalStart, value: unknown) {
   const info = infoSchema.parse(value);
   if (
@@ -451,11 +485,17 @@ export function startLocalPrediction(
     for (const cancel of timers) cancel();
     resolveResult(terminal);
   };
-  const fail = (reason: LocalReason) =>
+  const fail = (reason: LocalReason, detail?: ConfigurationDetail) =>
     finish(
       submitted
-        ? { kind: 'unknown', binding: plan.binding, reason }
-        : { kind: 'failed', binding: plan.binding, reason, proof: null },
+        ? { kind: 'unknown', binding: plan.binding, reason, ...(detail ? { detail } : {}) }
+        : {
+            kind: 'failed',
+            binding: plan.binding,
+            reason,
+            proof: null,
+            ...(detail ? { detail } : {}),
+          },
     );
   const cancel = () => {
     if (!prediction || cancelSent || settled) return;
@@ -523,7 +563,15 @@ export function startLocalPrediction(
       stage = 'configuration';
       const base = await model.getBasePredictionConfig();
       guard();
-      if (base.draftModel !== '') throw new Error();
+      const baseConfig = z.object({ draftModel: z.string() }).safeParse(base);
+      if (!baseConfig.success)
+        throw new ConfigurationFailure(
+          'base-draft',
+          base && typeof base === 'object' && !('draftModel' in base) ? 'missing' : 'malformed',
+          'base',
+        );
+      if (baseConfig.data.draftModel !== '')
+        throw new ConfigurationFailure('base-draft', 'mismatch', 'base');
       stage = 'context';
       const rendered = await model.applyPromptTemplate(localChat(plan));
       guard();
@@ -580,16 +628,43 @@ export function startLocalPrediction(
       stage = 'identity';
       sameModel(plan, terminal.modelInfo);
       stage = 'configuration';
-      if (
-        field(terminal.loadConfig, 'llm.load.contextLength') !== CONTEXT_TOKENS ||
-        field(terminal.predictionConfig, 'llm.prediction.contextOverflowPolicy') !==
-          'stopAtLimit' ||
-        field(terminal.predictionConfig, 'llm.prediction.speculativeDecoding.draftModel') !== '' ||
-        terminal.roundIndex !== 0
-      )
-        throw new Error();
-      z.object({ checked: z.literal(true), value: z.literal(OUTPUT_TOKENS) }).parse(
-        field(terminal.predictionConfig, 'llm.prediction.maxPredictedTokens'),
+      configurationField(
+        terminal.loadConfig,
+        'load-fields',
+        'llm.load.contextLength',
+        'context-length',
+        z.number().int().positive().safe(),
+        (value) => value === CONTEXT_TOKENS,
+      );
+      configurationField(
+        terminal.predictionConfig,
+        'prediction-fields',
+        'llm.prediction.contextOverflowPolicy',
+        'overflow-policy',
+        z.enum(['stopAtLimit', 'truncateMiddle', 'rollingWindow']),
+        (value) => value === 'stopAtLimit',
+      );
+      configurationField(
+        terminal.predictionConfig,
+        'prediction-fields',
+        'llm.prediction.speculativeDecoding.draftModel',
+        'draft-disabled',
+        z.string(),
+        (value) => value === '',
+      );
+      configurationValue(
+        terminal.roundIndex,
+        'round-index',
+        z.number().int().nonnegative().safe(),
+        (value) => value === 0,
+      );
+      configurationField(
+        terminal.predictionConfig,
+        'prediction-fields',
+        'llm.prediction.maxPredictedTokens',
+        'max-tokens',
+        z.object({ checked: z.boolean(), value: z.number().int().positive().safe() }),
+        (value) => value.checked && value.value === OUTPUT_TOKENS,
       );
       stage = 'protocol';
       if (
@@ -631,8 +706,8 @@ export function startLocalPrediction(
       )
         throw new Error();
       finish({ kind: 'completed', binding: plan.binding, proof, proposal });
-    } catch {
-      fail(stage);
+    } catch (error) {
+      fail(stage, error instanceof ConfigurationFailure ? error.detail : undefined);
     }
   })();
   return { result, stop: () => stop() };

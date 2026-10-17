@@ -14,6 +14,7 @@ import {
   type LocalStart,
   type LocalTerminal,
   localPlan,
+  TerminalSchema,
 } from './profile.ts';
 import { startLocalDiscovery, startLocalReplacement } from './replacement.ts';
 import {
@@ -280,6 +281,15 @@ test('Local generation requires authenticated loopback and an exact loaded insta
     assert.equal(result.kind, 'failed', row.name);
     assert.equal('reason' in result && result.reason, row.reason, row.name);
     assert.equal(f.submitted, 0, row.name);
+    if (row.reason === 'configuration') {
+      assert(result.kind === 'failed');
+      assert.deepEqual(result.detail, {
+        version: 1,
+        stage: 'base',
+        check: 'base-draft',
+        status: row.name === 'missing draft evidence' ? 'missing' : 'mismatch',
+      });
+    }
   }
   for (const format of ['gguf', 'safetensors'] as const) {
     const f = fixture();
@@ -522,6 +532,208 @@ test('Local ownership needs the same prediction terminal after cancellation or c
       assert.equal(outcome.proof.promptTokens, null);
       assert.equal(outcome.proof.predictedTokens, null);
     }
+  }
+  const canary = 'private-config-value-must-not-escape';
+  const setField = (config: ReturnType<typeof kv>, key: string, value: unknown) => {
+    const field = config.fields.find((entry) => entry.key === key);
+    assert(field);
+    field.value = value;
+  };
+  const configurationCases: Array<{
+    check: string;
+    status: string;
+    change: (value: ReturnType<typeof terminal>) => void;
+  }> = [
+    {
+      check: 'load-fields',
+      status: 'malformed',
+      change: (value) => {
+        value.loadConfig = kv({ ['x'.repeat(201)]: canary });
+      },
+    },
+    {
+      check: 'load-fields',
+      status: 'duplicate',
+      change: (value) => {
+        value.loadConfig.fields.push(value.loadConfig.fields[0]);
+      },
+    },
+    {
+      check: 'prediction-fields',
+      status: 'malformed',
+      change: (value) => {
+        value.predictionConfig = kv({ ['x'.repeat(201)]: canary });
+      },
+    },
+    {
+      check: 'prediction-fields',
+      status: 'duplicate',
+      change: (value) => {
+        value.predictionConfig.fields.push(value.predictionConfig.fields[0]);
+      },
+    },
+    {
+      check: 'context-length',
+      status: 'missing',
+      change: (value) => {
+        value.loadConfig = kv({});
+      },
+    },
+    {
+      check: 'context-length',
+      status: 'malformed',
+      change: (value) => {
+        setField(value.loadConfig, 'llm.load.contextLength', canary);
+      },
+    },
+    {
+      check: 'context-length',
+      status: 'mismatch',
+      change: (value) => {
+        setField(value.loadConfig, 'llm.load.contextLength', 16384);
+      },
+    },
+    {
+      check: 'overflow-policy',
+      status: 'missing',
+      change: (value) => {
+        value.predictionConfig = kv({});
+      },
+    },
+    {
+      check: 'overflow-policy',
+      status: 'malformed',
+      change: (value) => {
+        setField(value.predictionConfig, 'llm.prediction.contextOverflowPolicy', canary);
+      },
+    },
+    {
+      check: 'overflow-policy',
+      status: 'mismatch',
+      change: (value) => {
+        setField(value.predictionConfig, 'llm.prediction.contextOverflowPolicy', 'truncateMiddle');
+      },
+    },
+    {
+      check: 'draft-disabled',
+      status: 'missing',
+      change: (value) => {
+        value.predictionConfig.fields = value.predictionConfig.fields.filter(
+          (entry) => entry.key !== 'llm.prediction.speculativeDecoding.draftModel',
+        );
+      },
+    },
+    {
+      check: 'draft-disabled',
+      status: 'malformed',
+      change: (value) => {
+        setField(value.predictionConfig, 'llm.prediction.speculativeDecoding.draftModel', {
+          private: canary,
+        });
+      },
+    },
+    {
+      check: 'draft-disabled',
+      status: 'mismatch',
+      change: (value) => {
+        setField(value.predictionConfig, 'llm.prediction.speculativeDecoding.draftModel', canary);
+      },
+    },
+    {
+      check: 'round-index',
+      status: 'malformed',
+      change: (value) => {
+        value.roundIndex = Number.NaN;
+      },
+    },
+    {
+      check: 'round-index',
+      status: 'mismatch',
+      change: (value) => {
+        value.roundIndex = 1;
+      },
+    },
+    {
+      check: 'max-tokens',
+      status: 'missing',
+      change: (value) => {
+        value.predictionConfig.fields = value.predictionConfig.fields.filter(
+          (entry) => entry.key !== 'llm.prediction.maxPredictedTokens',
+        );
+      },
+    },
+    {
+      check: 'max-tokens',
+      status: 'malformed',
+      change: (value) => {
+        setField(value.predictionConfig, 'llm.prediction.maxPredictedTokens', {
+          checked: canary,
+          value: 2048,
+        });
+      },
+    },
+    {
+      check: 'max-tokens',
+      status: 'mismatch',
+      change: (value) => {
+        setField(value.predictionConfig, 'llm.prediction.maxPredictedTokens', {
+          checked: false,
+          value: 2048,
+        });
+      },
+    },
+    {
+      check: 'max-tokens',
+      status: 'mismatch',
+      change: (value) => {
+        setField(value.predictionConfig, 'llm.prediction.maxPredictedTokens', {
+          checked: true,
+          value: 1024,
+        });
+      },
+    },
+  ];
+  for (const row of configurationCases) {
+    const f = fixture();
+    const run = startLocalPrediction(plan, {
+      createClient: () => f.client,
+      now: () => 0,
+      schedule: f.schedule,
+    });
+    await flush();
+    const value = terminal();
+    row.change(value);
+    f.resolve(value);
+    const outcome = await run.result;
+    assert(outcome.kind === 'unknown');
+    assert.equal(outcome.reason, 'configuration');
+    assert.deepEqual(outcome.detail, {
+      version: 1,
+      stage: 'terminal',
+      check: row.check,
+      status: row.status,
+    });
+    assert.equal(f.submitted, 1);
+    assert(!JSON.stringify(outcome).includes(canary));
+    assert.deepEqual(TerminalSchema.parse(outcome), outcome);
+    assert.equal(TerminalSchema.safeParse({ ...outcome, reason: 'transport' }).success, false);
+    assert.equal(
+      TerminalSchema.safeParse({ ...outcome, detail: { ...outcome.detail, value: canary } })
+        .success,
+      false,
+    );
+    assert.equal(
+      TerminalSchema.safeParse({ ...outcome, detail: { ...outcome.detail, check: canary } })
+        .success,
+      false,
+    );
+    assert.equal(
+      TerminalSchema.safeParse({ ...outcome, detail: { ...outcome.detail, stage: 'base' } })
+        .success,
+      false,
+    );
+    const { detail: _detail, ...legacy } = outcome;
+    assert.deepEqual(TerminalSchema.parse(legacy), legacy);
   }
   const directory = mkdtempSync(join(tmpdir(), 'crewkite-local-'));
   try {
