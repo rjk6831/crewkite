@@ -38,7 +38,7 @@ The [provider notes](docs/providers.md) separate implemented paths from dated qu
 
 Open Usage and capacity to inspect route availability and explicit provider setup. Local setup connects to a dedicated loopback runtime, refreshes its observed model list and saves one selection. It loads no model. An eligible loaded model remains unqualified; the [provider notes](docs/providers.md#local-models) describe the current limits.
 
-Choose New goal, select a registered project and review the planning permission before sending. Conversation is the main task view. Answer the primary role's questions and inspect the proposed criteria and scope before choosing Adopt plan. Adoption saves the task contract and opens separate execution preparation. It starts no coding work.
+Choose New task, select a registered project and review the planning permission before sending. Conversation is the main task view. Answer the primary role's questions and inspect the proposed criteria and scope before choosing Adopt plan. Adoption saves the task contract and opens separate execution preparation. It starts no coding work.
 
 Planning settings keep Lead or Orchestrator on the supported OpenAI profile, with existing-credit permission and finite task limits. After a successful turn, model and effort choices come from that turn's last-observed catalog. Choose an advertised pair and explicitly Save. Saving starts no work. The next admitted turn checks the pair again before sending its prompt. Missing or stale choices keep their reason. Returning to the profile default also needs an explicit Save. Requested settings remain separate from acknowledged effective settings. Planning and later execution share the task's finite budget.
 

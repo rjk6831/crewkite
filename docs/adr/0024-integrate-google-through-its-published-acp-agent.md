@@ -5,7 +5,7 @@
 
 ## Context
 
-Earlier Google consumer CLI pilots produced retained edits and process evidence. Google's published integration policy excludes wrapping that headless CLI in a third-party coding application. A working pilot could not settle that separate constraint. Google also publishes an ACP agent and documents personal-plan authentication for editors. CrewKite is not named. The [provider notes](../providers.md#google-acp-writer) retain the sources, exact label and unresolved eligibility question.
+Earlier Google consumer CLI pilots produced retained edits and process evidence. Google's published integration policy excludes wrapping that headless CLI in a third-party coding application. A working pilot could not settle that separate constraint. Google also publishes an ACP agent and documents personal-plan authentication for editors. CrewKite is not named. The [provider notes](../providers.md#google-acp-writer) retain the sources, exact label and client boundaries.
 
 ## Decision
 
@@ -13,7 +13,7 @@ I propose a separate `google-acp-v1` profile with CrewKite as the protocol clien
 
 I pin the executable and signer through explicit import. Setup actions have separate bounded ownership; authentication stays with the native agent. Safe proof contains no credentials or OAuth URL. Preparation freezes the client, source and configuration. A fresh session must acknowledge those choices before one prompt.
 
-I limit the writer to one existing file within 64 KiB in independent scratch. Each supported permission needs a current human decision on a complete action within 4 KiB, bound to the exact session, tool call and offered `allow_once`. Unknown actions refuse. Production review-mode and edit-tool mappings remain empty; import and discovery cannot make the writer available.
+I limit the writer to one existing file within 64 KiB in independent scratch. Each supported permission needs a current human decision on a complete action within 4 KiB, bound to the exact session, tool call and offered `allow_once`. I bind a bounded hunk to the complete before and after file hashes and require one exact match. Unknown actions refuse. Production review-mode and edit-tool mappings remain empty; import and discovery cannot make the writer available.
 
 I require the original cancelled response, closed streams and absent owned group before claiming stopped completion. EOF alone leaves ownership unknown. Capture validates actual bytes and unchanged siblings. Checks, native review and acceptance keep separate authority. Autopilot, automatic handoff and repository-wide editing stay outside this profile.
 
