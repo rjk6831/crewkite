@@ -23,6 +23,16 @@ Adopting a plan binds its exact proposal ID and hash to the task contract. It gr
 
 Selected context is immutable input data. The controller captures committed source files or folders at the chosen base, and explicitly selected project-local logs from current disk bytes. It accepts up to four selections, 32 files, 8 KiB per file and 32 KiB for the complete encoded bundle. Links, unsupported text and excluded credential paths refuse. The artifact records the exact bytes, modes and hashes. The desktop's native picker keeps filesystem selection in main; its renderer adapter validates the retained artifact for preview. Capture retry resends the original command without reopening the picker; a committed result returns the same artifact. Conversation inputs reference those artifacts by ID and hash. Context supplies no filesystem, execution or approval authority.
 
+## Combined runs
+
+A combined run freezes one parent and two child tasks from the same project and committed base. Each child owns one distinct existing text file and works in independent scratch. Preparation binds their task contracts, source, writer profiles, policy, selected tests and reviewer. The initial workflow uses Quick quality with one Keep it simple review under guided or balanced authority. Child work cannot be amended, transferred or accepted independently while that membership owns it.
+
+The parent reserves seven dispatches: a baseline check, two writers, two ordered replay checks, a full final check and one fresh review. It needs at least seven attempts and two concurrent slots. Its minute allowance covers both writer maxima, the reviewer maximum and five minutes for the four checks and private integration work. Dispatches charge one shared ledger; child task limits remain additional gates. Earlier planning remains charged to its task. Missing closure keeps the reserved allowance charged. No stage receives an automatic retry or a larger budget.
+
+The clean baseline must pass before either child can start. Assembly requires two substantive, in-scope candidates. It applies their exact deltas in order and checks each cumulative result before advancing a private integration ref with compare-and-swap. A durable operation journal owns the finite Git processes. The immutable origin binds both writers and candidates, source manifest, policy, criteria, replay definitions and results, and every old/new tree transition. Private integration changes no branch in the source repository.
+
+The sealed combined candidate still needs an explicitly prepared full check and a separate native review of the whole result. Passing replay checks cannot replace that final barrier. The supported reviewer has its own source consent, credit choice and one-use grant within the parent's remaining allowance. Same-family review establishes process independence only. Destination-specific acceptance revalidates the complete origin and evidence chain before creating one new local branch. [Continuity](continuity.md#combined-ownership-and-recovery) describes parent controls and restart limits.
+
 ## Processes and transport
 
 The controller runs as one headless Node process per user. The desktop app and the CLI connect to it over a private Unix domain socket using length-prefixed JSON frames with a size limit.
@@ -83,6 +93,8 @@ The command set for the first release:
 | `AdoptTaskPlan` | Bind the exact retained proposal to the task contract without starting execution |
 | `CaptureConversationContext` | Capture selected committed source or explicit project logs into a bounded immutable artifact |
 | `ConfigureLocal`, `BeginLocalConnectionInput`, `RefreshLocalModels`, `SelectLocalModel`, `DisconnectLocal` | Explicit loopback setup, private credential input and observed model selection under the persisted Local revision |
+| `PrepareCombinedRun` | Freeze a parent and two scoped children, shared dispatch allowances, checks and reviewer without starting work |
+| `AssembleCombinedCandidate` | Replay both retained child deltas through ordered checks and guarded private ref updates; seal a candidate for separate final evaluation |
 | `PrepareNativeRun` | Freeze a controller-owned file or repository profile, its committed source scope, task text, explicit or matching saved consent and policy; perform no provider I/O |
 | `PrepareNativeHandoff`, `StartNativeHandoff` | Seal retained single-file work for one previously allowed recipient with fresh consent, then consume that exact preparation once after revalidation |
 | `PrepareCandidateEvaluation`, `StartCandidateEvaluation` | Freeze supplemental authority for a stopped native candidate, then run its exact selected check recipe once; retain checks without starting review |
