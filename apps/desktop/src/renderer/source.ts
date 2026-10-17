@@ -1,10 +1,19 @@
 import {
+  ArtifactSchema,
+  CONVERSATION_CONTEXT_MEDIA_TYPE,
+  CommandIdSchema,
   type CommandResult,
   CommandResultSchema,
+  type ConversationContextBundle,
+  ConversationContextBundleSchema,
+  type ConversationContextRef,
+  ConversationContextRefSchema,
+  canonicalJson,
   type DesktopNotice,
   DesktopNoticeSchema,
   type Event,
   EventSchema,
+  ProjectIdSchema,
   type Snapshot,
   SnapshotSchema,
 } from '@crewkite/contracts';
@@ -13,12 +22,105 @@ import { createPreviewSource } from './preview.ts';
 
 export type { DesktopCommand, DesktopSource } from '@crewkite/client';
 
-import type { DesktopCommand, DesktopSource } from '@crewkite/client';
+import type {
+  ConversationContextCapture,
+  ConversationContextReceipt,
+  ConversationContextRequest,
+  DesktopCommand,
+  DesktopSource,
+} from '@crewkite/client';
 
 declare global {
   interface Window {
     crewkite?: DesktopSource;
   }
+}
+
+export class ConversationContextCaptureError extends Error {
+  readonly receipt: ConversationContextReceipt;
+  constructor(receipt: ConversationContextReceipt) {
+    super('The context capture outcome is uncertain. Retry this capture before choosing again.');
+    this.name = 'ConversationContextCaptureError';
+    this.receipt = Object.freeze({ ...receipt });
+  }
+}
+export type ResolvedConversationContext = {
+  ref: ConversationContextRef;
+  bundle: ConversationContextBundle;
+};
+function contextReceipt(input: ConversationContextReceipt): ConversationContextReceipt {
+  if (Object.keys(input).length !== 3 || !/^[a-f0-9]{40}$/.test(input.base))
+    throw new Error('The context receipt is invalid.');
+  return {
+    receiptId: CommandIdSchema.parse(input.receiptId),
+    projectId: ProjectIdSchema.parse(input.projectId),
+    base: input.base,
+  };
+}
+const digest = async (bytes: Uint8Array<ArrayBuffer>) =>
+  Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)), (byte) =>
+    byte.toString(16).padStart(2, '0'),
+  ).join('');
+export async function resolveConversationContext(
+  source: Pick<DesktopSource, 'command'>,
+  input: ConversationContextRef,
+): Promise<ResolvedConversationContext> {
+  const ref = ConversationContextRefSchema.parse(input);
+  let artifact: ReturnType<typeof ArtifactSchema.parse> | null = null;
+  const bytes = new Uint8Array(32768);
+  let offset = 0;
+  for (;;) {
+    const part = CommandResultSchema.parse(
+      await source.command({
+        command: 'GetArtifact',
+        payload: { artifactId: ref.artifactId, offset, limit: 8192 },
+      }),
+    );
+    if (
+      (part.outcome !== 'applied' && part.outcome !== 'already-applied') ||
+      part.data?.kind !== 'artifact'
+    )
+      throw new Error('The context artifact is unavailable.');
+    const data = part.data;
+    if (!artifact) artifact = ArtifactSchema.parse(data.artifact);
+    if (
+      artifact.id !== ref.artifactId ||
+      artifact.hash !== ref.hash ||
+      artifact.mediaType !== CONVERSATION_CONTEXT_MEDIA_TYPE ||
+      artifact.bytes < 1 ||
+      artifact.bytes > bytes.length ||
+      canonicalJson(data.artifact) !== canonicalJson(artifact) ||
+      data.offset !== offset ||
+      data.encoding !== 'base64' ||
+      data.content.length > 10924
+    )
+      throw new Error('The context artifact identity changed.');
+    const decoded = atob(data.content);
+    if (
+      btoa(decoded) !== data.content ||
+      decoded.length < 1 ||
+      decoded.length !== Math.min(8192, artifact.bytes - offset) ||
+      offset + decoded.length > artifact.bytes
+    )
+      throw new Error('The context artifact chunk is invalid.');
+    for (let index = 0; index < decoded.length; index++)
+      bytes[offset + index] = decoded.charCodeAt(index);
+    offset += decoded.length;
+    if (data.eof !== (offset === artifact.bytes))
+      throw new Error('The context artifact length changed.');
+    if (data.eof) break;
+  }
+  const content = bytes.slice(0, offset);
+  if ((await digest(content)) !== ref.hash)
+    throw new Error('The context artifact checksum changed.');
+  const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(content);
+  const bundle = ConversationContextBundleSchema.parse(JSON.parse(text));
+  if (canonicalJson(bundle) !== text) throw new Error('The context artifact is not canonical.');
+  for (const file of bundle.files) {
+    if ((await digest(new TextEncoder().encode(file.text))) !== file.hash)
+      throw new Error('The context file checksum changed.');
+  }
+  return { ref, bundle };
 }
 
 export function useWorkspace() {
@@ -159,12 +261,21 @@ export function useWorkspace() {
     };
   }, [source, refresh]);
   const perform = useCallback(
-    async <T extends CommandResult | null>(action: () => Promise<T>): Promise<T> => {
+    async <T extends CommandResult | ConversationContextCapture | null>(
+      action: () => Promise<T>,
+    ): Promise<T> => {
       setPending((value) => value + 1);
       setError(null);
       try {
         const value = await action();
-        const result = value === null ? null : CommandResultSchema.parse(value);
+        const result =
+          value === null
+            ? null
+            : 'receiptId' in value
+              ? value.result === null
+                ? null
+                : CommandResultSchema.parse(value.result)
+              : CommandResultSchema.parse(value);
         if (!result) return value;
         if (result.outcome !== 'applied' && result.outcome !== 'already-applied') {
           setError([result.reason ?? result.outcome, result.next].filter(Boolean).join(' '));
@@ -214,12 +325,58 @@ export function useWorkspace() {
       if (!source?.pickProject) throw new Error('Project selection is unavailable in this view.');
       return source.pickProject();
     });
-  const retryCommand = () =>
+  const retryCommand = (expected?: DesktopCommand) =>
     perform(async () => {
       if (!source?.retryCommand)
         throw new Error('Exact command retry is unavailable in this view.');
-      return source.retryCommand();
+      return source.retryCommand(expected);
     });
+  const resolveContext = (ref: ConversationContextRef) => {
+    if (!source) return Promise.reject(new Error('The desktop bridge is unavailable.'));
+    return resolveConversationContext(source, ref);
+  };
+  const finishCapture = async (
+    scope: { projectId: string; base: string },
+    capture: ConversationContextCapture,
+  ): Promise<ResolvedConversationContext> => {
+    const receipt = contextReceipt({
+      projectId: scope.projectId,
+      base: scope.base,
+      receiptId: capture.receiptId,
+    });
+    const result = capture.result === null ? null : CommandResultSchema.parse(capture.result);
+    if (!result || result.outcome === 'outcome-unknown')
+      throw new ConversationContextCaptureError(receipt);
+    if (result.outcome !== 'applied' && result.outcome !== 'already-applied')
+      throw new Error([result.reason ?? result.outcome, result.next].filter(Boolean).join(' '));
+    const artifact = ArtifactSchema.parse(result.entity);
+    const resolved = await resolveContext({ artifactId: artifact.id, hash: artifact.hash });
+    if (resolved.bundle.projectId !== scope.projectId || resolved.bundle.base !== scope.base)
+      throw new Error('The context artifact belongs to a different project or base.');
+    return resolved;
+  };
+  const pickConversationContext = async (input: ConversationContextRequest) => {
+    if (!source?.pickConversationContext)
+      throw new Error('Context selection is unavailable in this view.');
+    const capture = await perform(() =>
+      source.pickConversationContext
+        ? source.pickConversationContext(input)
+        : Promise.reject(new Error('Context selection is unavailable.')),
+    );
+    return capture === null ? null : finishCapture(input, capture);
+  };
+  const retryConversationContext = async (input: ConversationContextReceipt) => {
+    const receipt = contextReceipt(input);
+    if (!source?.retryConversationContext)
+      throw new Error('Context retry is unavailable in this view.');
+    const capture = await perform(() =>
+      source.retryConversationContext
+        ? source.retryConversationContext(receipt)
+        : Promise.reject(new Error('Context retry is unavailable.')),
+    );
+    if (capture.receiptId !== receipt.receiptId) throw new Error('The context receipt changed.');
+    return finishCapture(receipt, capture);
+  };
   const reconnect = async () => {
     setTransportError(null);
     try {
@@ -251,6 +408,10 @@ export function useWorkspace() {
     command,
     pickProject,
     canPickProject: !!source?.pickProject,
+    pickConversationContext,
+    retryConversationContext,
+    resolveConversationContext: resolveContext,
+    canPickConversationContext: !!source?.pickConversationContext,
     reconnect,
     retryCommand,
     retryAvailable,

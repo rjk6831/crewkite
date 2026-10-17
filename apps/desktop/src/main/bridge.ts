@@ -1,10 +1,16 @@
 import { createHash } from 'node:crypto';
 import { closeSync, constants, fsyncSync, openSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import type {
+  ConversationContextCapture,
+  ConversationContextReceipt,
+  ConversationContextRequest,
+} from '@crewkite/client';
 import { type ControllerClient, createCommandKey } from '@crewkite/client/node';
 import {
   ArtifactSchema,
   type Command,
+  CommandIdSchema,
   type CommandResult,
   CommandResultSchema,
   CommandSchema,
@@ -14,6 +20,7 @@ import {
   type Event,
   EventSchema,
   MAX_FRAME_BYTES,
+  ProjectIdSchema,
   SnapshotSchema,
 } from '@crewkite/contracts';
 import { type BrowserWindow, dialog, ipcMain } from 'electron';
@@ -141,7 +148,16 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
     if (exportResult) await save(result, assertCurrent);
     return result;
   }
-  const handlers = ['snapshot', 'command', 'pick-project', 'reconnect', 'retry', 'events'];
+  const handlers = [
+    'snapshot',
+    'command',
+    'pick-project',
+    'pick-context',
+    'retry-context',
+    'reconnect',
+    'retry',
+    'events',
+  ];
   for (const channel of handlers) ipcMain.removeHandler(`crewkite:${channel}`);
   ipcMain.handle('crewkite:snapshot', async (event) => {
     assertSender(event, window);
@@ -166,7 +182,8 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       'protocol' in value ||
       'key' in value ||
       'actor' in value ||
-      value.command === 'RegisterProject'
+      value.command === 'RegisterProject' ||
+      value.command === 'CaptureConversationContext'
     )
       throw new Error('The desktop command requests trusted metadata or a native-only action.');
     const command = CommandSchema.parse({
@@ -286,14 +303,149 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       busy = false;
     }
   });
-  ipcMain.handle('crewkite:retry', async (event) => {
+  function contextScope(input: unknown, retry: false): ConversationContextRequest;
+  function contextScope(input: unknown, retry: true): ConversationContextReceipt;
+  function contextScope(input: unknown, retry: boolean) {
+    if (!input || typeof input !== 'object' || Array.isArray(input))
+      throw new Error('The context selection is invalid.');
+    const keys = Object.keys(input);
+    const allowed = retry ? ['receiptId', 'projectId', 'base'] : ['projectId', 'base', 'mode'];
+    if (
+      keys.length !== allowed.length ||
+      keys.some((key) => !allowed.includes(key)) ||
+      !('projectId' in input) ||
+      !('base' in input) ||
+      typeof input.base !== 'string' ||
+      !/^[a-f0-9]{40}$/.test(input.base)
+    )
+      throw new Error('The context selection is invalid.');
+    const projectId = ProjectIdSchema.parse(input.projectId);
+    const base = input.base;
+    if (retry) {
+      if (!('receiptId' in input)) throw new Error('The context receipt is missing.');
+      return { projectId, base, receiptId: CommandIdSchema.parse(input.receiptId) };
+    }
+    if (
+      !('mode' in input) ||
+      (input.mode !== 'source-file' && input.mode !== 'source-folder' && input.mode !== 'log-file')
+    )
+      throw new Error('The context selection mode is invalid.');
+    return { projectId, base, mode: input.mode };
+  }
+  async function capture(
+    command: Extract<Command, { command: 'CaptureConversationContext' }>,
+    assertCurrent: () => void,
+  ): Promise<ConversationContextCapture> {
+    try {
+      const result = await send(command);
+      assertCurrent();
+      return { receiptId: command.key, result };
+    } catch (failure) {
+      assertCurrent();
+      if (!receipts.commands.some((item) => item.key === command.key)) throw failure;
+      return { receiptId: command.key, result: null };
+    }
+  }
+  ipcMain.handle('crewkite:pick-context', async (event, input: unknown) => {
+    assertSender(event, window);
+    const scope = contextScope(input, false);
+    if (busy || cancelling || receipts.commands.length)
+      throw new Error('Resolve the pending desktop command first.');
+    busy = true;
+    try {
+      if (!client) throw new Error('The controller is offline.');
+      const before = SnapshotSchema.parse(await client.snapshot()).projects.find(
+        (project) => project.id === scope.projectId,
+      );
+      assertSender(event, window);
+      if (!before) throw new Error('The registered project is unavailable.');
+      const choice = await dialog.showOpenDialog(window, {
+        title: scope.mode === 'log-file' ? 'Choose a project log' : 'Choose project source',
+        properties: [scope.mode === 'source-folder' ? 'openDirectory' : 'openFile'],
+      });
+      assertSender(event, window);
+      if (choice.canceled) return null;
+      if (choice.filePaths.length !== 1) throw new Error('Choose one project file or folder.');
+      const after = SnapshotSchema.parse(await client.snapshot()).projects.find(
+        (project) => project.id === scope.projectId,
+      );
+      assertSender(event, window);
+      if (!after || after.revision !== before.revision)
+        throw new Error('The project changed. Choose context again.');
+      const command = CommandSchema.parse({
+        protocol: 1,
+        key: createCommandKey(),
+        actor: desktopActor,
+        command: 'CaptureConversationContext',
+        expectedRevision: after.revision,
+        payload: {
+          projectId: scope.projectId,
+          base: scope.base,
+          selections: [{ kind: scope.mode, path: choice.filePaths[0] }],
+        },
+      });
+      if (command.command !== 'CaptureConversationContext')
+        throw new Error('The context command is invalid.');
+      activeCommand = command;
+      return await capture(command, () => assertSender(event, window));
+    } finally {
+      busy = false;
+      activeCommand = null;
+    }
+  });
+  ipcMain.handle('crewkite:retry-context', async (event, input: unknown) => {
+    assertSender(event, window);
+    const scope = contextScope(input, true);
+    if (busy || cancelling) throw new Error('Wait for the pending desktop command.');
+    const command = receipts.commands[0];
+    if (
+      receipts.commands.length !== 1 ||
+      command?.command !== 'CaptureConversationContext' ||
+      command.key !== scope.receiptId ||
+      command.payload.projectId !== scope.projectId ||
+      command.payload.base !== scope.base
+    )
+      throw new Error('The retained context receipt does not match this draft.');
+    busy = true;
+    activeCommand = command;
+    try {
+      return await capture(command, () => assertSender(event, window));
+    } finally {
+      busy = false;
+      activeCommand = null;
+    }
+  });
+  ipcMain.handle('crewkite:retry', async (event, expected: unknown) => {
     assertSender(event, window);
     if (busy || cancelling) throw new Error('Wait for the pending desktop command.');
-    if (!receipts.commands.length) return null;
+    const command = receipts.commands[0];
+    if (expected !== undefined) {
+      if (
+        !expected ||
+        typeof expected !== 'object' ||
+        Array.isArray(expected) ||
+        Buffer.byteLength(JSON.stringify(expected)) > MAX_FRAME_BYTES ||
+        'protocol' in expected ||
+        'key' in expected ||
+        'actor' in expected
+      )
+        throw new Error('The expected desktop command is invalid.');
+      const parsed = CommandSchema.parse({
+        ...expected,
+        protocol: 1,
+        key: createCommandKey(),
+        actor: desktopActor,
+      });
+      const normalize = ({ protocol: _protocol, key: _key, actor: _actor, ...value }: Command) =>
+        value;
+      if (!command || canonicalJson(normalize(parsed)) !== canonicalJson(normalize(command)))
+        throw new Error('The retained command does not match this draft.');
+    }
+    if (!command) return null;
     busy = true;
-    activeCommand = receipts.commands[0];
+    activeCommand = command;
     try {
-      const result = await execute(activeCommand, () => assertSender(event, window));
+      const result = await execute(command, () => assertSender(event, window));
       assertSender(event, window);
       return result;
     } finally {
