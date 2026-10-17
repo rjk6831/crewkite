@@ -213,6 +213,36 @@ const status = z.strictObject({
   compact_error: z.string().max(4096).optional(),
   compact_output_chars: metadataNumber.int().optional(),
 });
+const displayText = z
+  .string()
+  .max(1024)
+  .refine(
+    (value) =>
+      value.isWellFormed() &&
+      Buffer.byteLength(value, 'utf8') <= 1024 &&
+      Array.from(value).every((character) => {
+        const code = character.charCodeAt(0);
+        return code >= 32 && code !== 127;
+      }),
+  );
+const uiInvalidation = z.strictObject({
+  ...identity.shape,
+  type: z.literal('system'),
+  subtype: z.literal('ui_invalidate'),
+  event: z.literal('ui.render'),
+  uuid: z.uuid(),
+  prompts_screened: z.literal(true).optional(),
+  instances: z
+    .array(
+      z.strictObject({
+        surface: displayText,
+        component: displayText,
+        instance_id: displayText,
+      }),
+    )
+    .max(32)
+    .optional(),
+});
 const rateLimitStatus = z.enum(['allowed', 'allowed_warning', 'rejected']);
 const rateLimitInfo = z.object({
   status: rateLimitStatus,
@@ -598,6 +628,12 @@ export class ReplacementStream {
         const envelope = identity.parse(value);
         if (envelope.session_id !== this.plan.sessionId)
           this.fail('protocol', 'correlation', 'session_id');
+        if (type === 'system' && record.subtype === 'ui_invalidate') {
+          this.site = 'system';
+          // Display invalidation can precede initialization and carries no proposal authority.
+          uiInvalidation.parse(value);
+          continue;
+        }
         if (!this.initialized) {
           this.site = 'init';
           const message = init.parse(value);

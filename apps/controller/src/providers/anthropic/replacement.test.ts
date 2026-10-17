@@ -56,6 +56,13 @@ const status = {
   uuid: '46eb17cd-01e8-480d-99f4-a741f189715f',
   status: 'requesting',
 };
+const invalidation = {
+  type: 'system',
+  subtype: 'ui_invalidate',
+  session_id: input.sessionId,
+  uuid: '46eb17cd-01e8-480d-99f4-a741f189715f',
+  event: 'ui.render',
+};
 const line = (value: unknown) => Buffer.from(`${JSON.stringify(value)}\n`);
 const secret = 'private-account@example.test';
 const user = {
@@ -232,6 +239,83 @@ test('native text replacement stays bound to one proposal and owned task deadlin
     failingHook?: boolean;
   }> = [
     { name: 'valid', frames: [init, result], pass: true },
+    {
+      name: 'display invalidation before initialization is discarded',
+      frames: [invalidation, init, result],
+      pass: true,
+    },
+    {
+      name: 'display invalidation after initialization is discarded',
+      frames: [init, invalidation, result],
+      pass: true,
+    },
+    {
+      name: 'bounded display metadata is discarded without usage or authority',
+      frames: [
+        invalidation,
+        init,
+        {
+          ...invalidation,
+          prompts_screened: true,
+          instances: [{ surface: secret, component: secret, instance_id: secret }],
+        },
+        {
+          ...invalidation,
+          instances: Array(32).fill({ surface: 'é'.repeat(512), component: '', instance_id: '' }),
+        },
+        result,
+      ],
+      pass: true,
+    },
+    { name: 'display invalidation cannot initialize a session', frames: [invalidation, result] },
+    { name: 'display invalidation cannot complete a proposal', frames: [init, invalidation] },
+    {
+      name: 'display invalidation after terminal remains refused',
+      frames: [init, result, invalidation],
+    },
+    ...[[], [init]].flatMap((prefix) =>
+      [
+        { ...invalidation, event: secret },
+        { ...invalidation, uuid: secret },
+        { ...invalidation, uuid: undefined },
+        { ...invalidation, prompts_screened: false },
+        { ...invalidation, prompts_screened: null },
+        { ...invalidation, instances: {} },
+        {
+          ...invalidation,
+          instances: Array(33).fill({ surface: '', component: '', instance_id: '' }),
+        },
+        { ...invalidation, instances: [{ surface: '', component: '' }] },
+        {
+          ...invalidation,
+          instances: [{ surface: '', component: '', instance_id: '', command: secret }],
+        },
+        { ...invalidation, instances: [{ surface: 1, component: '', instance_id: '' }] },
+        { ...invalidation, instances: [{ surface: '\u0000', component: '', instance_id: '' }] },
+        { ...invalidation, instances: [{ surface: '\ud800', component: '', instance_id: '' }] },
+        {
+          ...invalidation,
+          instances: [{ surface: 'é'.repeat(513), component: '', instance_id: '' }],
+        },
+        { ...invalidation, permissionMode: 'bypassPermissions' },
+        { ...invalidation, structured_output: edit },
+      ].map((frame, index) => ({
+        name: `malformed display invalidation ${prefix.length}/${index} stays refused`,
+        frames: [...prefix, frame, result],
+        diagnostic: {
+          stage: prefix.length ? 'output' : 'before-init',
+          site: 'system',
+          subtype: 'ui_invalidate',
+        },
+      })),
+    ),
+    ...[[], [init]].flatMap((prefix) =>
+      [undefined, '46eb17cd-01e8-480d-99f4-a741f189715e'].map((session_id) => ({
+        name: `display invalidation session ${prefix.length}/${session_id ?? 'missing'} stays bound`,
+        frames: [...prefix, { ...invalidation, session_id }, result],
+        diagnostic: { site: 'identity', field: 'session_id' },
+      })),
+    ),
     { name: 'request status is progress only', frames: [init, status, result], pass: true },
     {
       name: 'bounded compaction metadata is discarded',
