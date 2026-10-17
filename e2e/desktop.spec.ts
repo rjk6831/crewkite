@@ -974,7 +974,32 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     );
     await nativeTrust.check();
     await reviewerCredits.check();
+    await recipe.selectOption('crewkite-verify-v1');
+    await expect(nativeTrust).not.toBeChecked();
+    await expect(reviewerCredits).not.toBeChecked();
+    await expect(evaluationPanel).toContainText('Local Node and Git are verified.');
+    await expect(evaluationPanel).toContainText(
+      'Staging, checks and cleanup share a five-minute limit.',
+    );
+    const verificationPermission = evaluationPanel.getByLabel(
+      'Allow one full local verification run',
+      { exact: true },
+    );
+    await expect(verificationPermission).not.toBeChecked();
+    await recipe.scrollIntoViewIfNeeded();
+    await page.screenshot({
+      path: join(internal, 'crewkite-verification-preparation-dark.png'),
+      animations: 'disabled',
+    });
+    await nativeTrust.check();
+    await reviewerCredits.check();
+    await verificationPermission.check();
     await recipe.selectOption('project-node-tests-v1');
+    await expect(
+      evaluationPanel.getByLabel('Allow one local run of the selected project tests', {
+        exact: true,
+      }),
+    ).not.toBeChecked();
     await expect(nativeTrust).not.toBeChecked();
     await expect(reviewerCredits).not.toBeChecked();
     const evaluationPermissions = [

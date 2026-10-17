@@ -10,12 +10,15 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { type TestContext, test } from 'node:test';
+import { connectController, readControllerEndpoint } from '@crewkite/client/node';
 import {
   AnthropicNativeProfileSchema,
   type Approval,
@@ -25,6 +28,7 @@ import {
   type Candidate,
   type CheckEvent,
   type CheckResult,
+  CommandSchema,
   canonicalJson,
   GoogleNativeProfileSchema,
   NativeRepositoryProfileSchema,
@@ -54,6 +58,7 @@ import {
 } from '../evidence/toolchain-definition.ts';
 import { type VerificationExecution, verificationCommand } from '../evidence/toolchain-verify.ts';
 import {
+  checkOwner,
   enrollCheckRoot,
   readCheckRoots,
   spawnCheckChild as spawn,
@@ -73,6 +78,7 @@ import {
   fixtureModel,
   repositoryFixture,
 } from '../providers/openai/replacement-fixture.ts';
+import { serve as serveController } from '../server/index.ts';
 
 const fixtureClientHash = createHash('sha256').update(readFileSync(process.execPath)).digest('hex');
 
@@ -89,7 +95,7 @@ async function setup(
   const source = createSyntheticRepository(join(directory, 'demo-shop'));
   const controller = new Controller({
     ...options,
-    home: join(directory, 'home'),
+    home: options.home ?? join(directory, 'home'),
     now: clock.now,
     id,
     routes: fixtures.snapshot.routes,
@@ -3690,6 +3696,14 @@ test('an appointed native proposal is retained and applied once after every phas
       scenario === 'anthropic-checked' ||
       scenario === 'google-checked';
     console.error(`Native fixture row: evaluation/${scenario}`);
+    const inventoryEntered = Promise.withResolvers<void>();
+    const inventoryRelease = Promise.withResolvers<void>();
+    let inventoryCalls = 0;
+    let inventorySignal: AbortSignal | undefined;
+    const socketRoot =
+      scenario === 'repository-checked'
+        ? mkdtempSync(join(realpathSync(checkOwner()?.stateRoot ?? tmpdir()), 'ck-socket-'))
+        : undefined;
     const context = await nativeSetup(
       t,
       scenario === 'anthropic-checked' ||
@@ -3701,8 +3715,37 @@ test('an appointed native proposal is retained and applied once after every phas
           : scenario === 'review-blocked'
             ? 'checked-blocked'
             : 'checked',
+      scenario === 'repository-checked'
+        ? {
+            home: join(socketRoot as string, 'home'),
+            prepareVerification: async (input) => {
+              inventoryCalls++;
+              inventorySignal = input.budget.signal;
+              inventoryEntered.resolve();
+              await inventoryRelease.promise;
+              throw Error(
+                input.budget.signal?.aborted
+                  ? 'cancelled inventory'
+                  : 'incomplete inventory fixture',
+              );
+            },
+          }
+        : {},
     );
+    if (socketRoot)
+      t.after(async () => {
+        inventoryRelease.resolve();
+        await context.controller.close();
+        rmSync(socketRoot, { recursive: true, force: true });
+      });
     let controller = context.controller;
+    if (scenario === 'repository-checked') {
+      context.appointment.policy.limits.minutes = 10;
+      assert.equal(context.appointment.policy.unknownUsage.rule, 'fixed-allowance');
+      if (context.appointment.policy.unknownUsage.rule === 'fixed-allowance')
+        context.appointment.policy.unknownUsage.allowance.minutes = 10;
+    }
+
     const { command, task, appointment, clock } = context;
     const retained = nativeCandidate(controller);
     if (passedReview) {
@@ -3837,6 +3880,84 @@ test('an appointed native proposal is retained and applied once after every phas
       ],
     };
     const revision = () => taskRevision(controller, task.id);
+    if (scenario === 'repository-checked') {
+      const policy = process.env.PROVENANCE_PATTERN;
+      process.env.PROVENANCE_PATTERN = 'private fixture identity';
+      const server = await serveController(controller);
+      const client = await connectController({
+        ...readControllerEndpoint(controller.home),
+        actor: { id: 'terminal', kind: 'cli' },
+        timeoutMs: 2000,
+      });
+      const send = (input: unknown) => client.command(CommandSchema.parse(input));
+      const fixedPayload = {
+        ...payload,
+        checkRecipeId: 'crewkite-verify-v1',
+        grants: payload.grants.map((grant) =>
+          grant.action === 'run-check' ? { ...grant, target: 'crewkite verify' } : grant,
+        ),
+      };
+      const preparing = command('PrepareCandidateEvaluation', fixedPayload, revision());
+      const artifactsBefore = controller.store.list('artifact').length;
+      const pending = send(preparing);
+      let repeat: Promise<unknown> | undefined;
+      try {
+        await context.wait('verification inventory entered', inventoryEntered.promise);
+        repeat = controller.execute(preparing, 'local-owner');
+        assert.equal(inventoryCalls, 1);
+        assert.equal(
+          (
+            await controller.execute(
+              { ...preparing, payload: { ...fixedPayload, consent: 'saved' } },
+              'local-owner',
+            )
+          ).reason,
+          'idempotency-key-reused',
+        );
+        assert.equal(
+          (
+            await controller.execute(
+              { ...preparing, command: 'StopRun', payload: { taskId: task.id, runId: run.id } },
+              'local-owner',
+            )
+          ).reason,
+          'idempotency-key-reused',
+        );
+        assert.equal(
+          (await send(command('PrepareCandidateEvaluation', fixedPayload, revision()))).reason,
+          'verification-preparation-busy',
+        );
+        const read = await send(command('GetSnapshot', {}));
+        assert.equal(read.outcome, 'applied');
+        assert(read.data?.kind === 'snapshot');
+        assert(read.data.snapshot.tasks.some((value) => value.id === task.id));
+        assert.equal(controller.store.receipt(preparing.key), undefined);
+        const stopped = await send(
+          command('StopRun', { taskId: task.id, runId: run.id }, revision()),
+        );
+        assert.equal(stopped.outcome, 'applied');
+        assert.equal(inventorySignal?.aborted, true);
+        inventoryRelease.resolve();
+        const result = await context.wait('cancelled verification preparation', pending);
+        assert.equal(result.outcome, 'stale-revision');
+        assert.deepEqual(await context.wait('joined verification preparation', repeat), result);
+        assert.equal(inventoryCalls, 1);
+        assert.equal(controller.store.receipt(`evaluation-ready:${run.id}`), undefined);
+        assert.equal(controller.store.list('artifact').length, artifactsBefore);
+        assert.equal(
+          (await send(command('PrepareCandidateEvaluation', fixedPayload, revision()))).reason,
+          'verification-preparation-unavailable',
+        );
+        assert.equal(inventoryCalls, 2);
+      } finally {
+        inventoryRelease.resolve();
+        await Promise.allSettled([pending, ...(repeat ? [repeat] : [])]);
+        client.close();
+        await server.close();
+        if (policy === undefined) delete process.env.PROVENANCE_PATTERN;
+        else process.env.PROVENANCE_PATTERN = policy;
+      }
+    }
     if (scenario === 'checked') {
       for (const change of [
         { consent: 'saved' },
