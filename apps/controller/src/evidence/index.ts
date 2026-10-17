@@ -10,6 +10,7 @@ import {
   CheckEventSchema,
   type CheckResult,
   CheckResultSchema,
+  CombinedCheckContextSchema,
   canonicalJson,
   HashSchema,
   NativeTargetPathSchema,
@@ -64,6 +65,7 @@ const syntheticNodeCheckDefinition = z.strictObject({
     count: z.number().int().min(1).max(1000),
   }),
   reporterHash: HashSchema,
+  combined: CombinedCheckContextSchema.optional(),
 });
 export const NodeCheckDefinitionSchema = z.discriminatedUnion('recipeId', [
   syntheticNodeCheckDefinition,
@@ -146,7 +148,7 @@ function definition(
   plan: Pick<
     CheckPlan,
     'argv' | 'collection' | 'criteria' | 'evaluator' | 'required' | 'reporterHash'
-  > & { guardHash?: string },
+  > & { guardHash?: string; combined?: z.infer<typeof CombinedCheckContextSchema> },
 ): string {
   return hashCanonical({
     argv: plan.argv,
@@ -156,6 +158,7 @@ function definition(
     required: plan.required,
     reporterHash: plan.reporterHash,
     ...(plan.guardHash ? { guardHash: plan.guardHash } : {}),
+    ...(plan.combined ? { combined: plan.combined } : {}),
   });
 }
 
@@ -697,6 +700,7 @@ export class CandidateEvidence {
     sourceFiles: FileContent[];
     criteria: string[];
     selection?: NodeCheckSelection;
+    combined?: z.infer<typeof CombinedCheckContextSchema>;
   }): NodeCheckDefinition {
     const { base, files } = this.read(input.candidate);
     verified(base, input.sourceFiles);
@@ -714,6 +718,7 @@ export class CandidateEvidence {
         return entry(original);
       });
       const fields = {
+        ...(input.combined ? { combined: CombinedCheckContextSchema.parse(input.combined) } : {}),
         argv: [
           `--import=${guardPath}`,
           '--test',
@@ -754,6 +759,7 @@ export class CandidateEvidence {
     const collection = files.filter((file) => isTest(file.path)).map(entry);
     if (collection.length === 0) throw new Error('No required Node tests were collected.');
     const fields = {
+      ...(input.combined ? { combined: CombinedCheckContextSchema.parse(input.combined) } : {}),
       argv: [
         '--test',
         `--test-reporter=${reporterPath}`,
@@ -788,6 +794,7 @@ export class CandidateEvidence {
   }): CheckPlan {
     const current = this.describeChecks({
       ...input,
+      ...(input.expected?.combined ? { combined: input.expected.combined } : {}),
       selection:
         input.expected?.recipeId === 'project-node-tests-v1'
           ? { recipeId: input.expected.recipeId, testFiles: input.expected.required.files }
@@ -836,6 +843,7 @@ export class CandidateEvidence {
           candidateId: candidate.id,
           candidateHash: candidate.hash,
           definitionHash: plan.definitionHash,
+          ...(plan.combined ? { combined: plan.combined } : {}),
           evaluator: plan.evaluator,
           passed,
           unchanged,

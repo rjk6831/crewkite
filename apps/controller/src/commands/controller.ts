@@ -34,6 +34,14 @@ import {
   type CheckResult,
   CheckResultSchema,
   CONVERSATION_CONTEXT_MEDIA_TYPE,
+  type CombinedCheckContextSchema,
+  CombinedDispatchPhaseSchema,
+  type CombinedNativeReviewJob,
+  CombinedNativeReviewJobSchema,
+  type CombinedOrigin,
+  CombinedOriginSchema,
+  type CombinedRunPreview,
+  CombinedRunPreviewSchema,
   type Command,
   CommandIdSchema,
   type CommandResult,
@@ -80,6 +88,7 @@ import {
   ObservationSchema,
   type Policy,
   PolicySchema,
+  PrepareCombinedRunPayloadSchema,
   type Project,
   ProjectSchema,
   RemainingBudgetsSchema,
@@ -126,6 +135,7 @@ import {
 } from '../evidence/index.ts';
 import {
   assertVerificationSource,
+  frozenVerificationPath,
   prepareToolchain,
   type ToolchainPreparation,
   verificationPreview,
@@ -133,6 +143,12 @@ import {
 } from '../evidence/toolchain-definition.ts';
 import { ToolchainVerification } from '../evidence/toolchain-verify.ts';
 import { type CheckOwner, inspectCheckRoots, parseCheckOwner } from '../host/check-ownership.ts';
+import { assembleSlices } from '../host/integration.ts';
+import {
+  createIntegrationGit,
+  type IntegrationGitOptions,
+  type IntegrationGitOutcome,
+} from '../host/integration-git.ts';
 import {
   applyPublication,
   type GitIdentity,
@@ -242,15 +258,65 @@ import { repositoryPlan, startRepository } from '../providers/openai/repository.
 import { type ReviewPlan, reviewPlan, startReview } from '../providers/openai/review.ts';
 import { chooseRoute } from '../routing/index.ts';
 import { createIds, type IdPrefix } from '../store/ids.ts';
-import { type LaunchIntent, Store } from '../store/index.ts';
+import {
+  type CombinedDispatch,
+  type CombinedGroup,
+  type CombinedMember,
+  type LaunchIntent,
+  Store,
+} from '../store/index.ts';
 import { availableAllowance, deriveWindow } from '../usage/index.ts';
-import { chargedMinutes, remainingBudgets } from './budgets.ts';
+import { chargedMinutes, remainingBudgets, remainingCombinedBudgets } from './budgets.ts';
 
 const nativeProviderRestriction: CommandResult = {
   outcome: 'blocked',
   reason: 'provider-policy-restricted',
   next: 'Choose another profile or continue manually in the provider native app. Retained evidence remains available.',
 };
+const combinedFile = z.strictObject({
+  path: ReplacementPathSchema,
+  mode: z.enum(['100644', '100755']),
+  hash: HashSchema,
+  bytes: z.number().int().nonnegative().max(67108864),
+});
+const CombinedManifestSchema = z.strictObject({
+  version: z.literal(1),
+  input: PrepareCombinedRunPayloadSchema,
+  run: RunSchema,
+  task: TaskSchema,
+  sourceFiles: z.array(combinedFile).max(10000),
+  members: z.tuple([
+    z.strictObject({ task: TaskSchema, run: RunSchema, preparation: ArtifactSchema }),
+    z.strictObject({ task: TaskSchema, run: RunSchema, preparation: ArtifactSchema }),
+  ]),
+  reviewer: z.strictObject({
+    route: RouteSchema,
+    profile: NativeProfileSchema,
+    client: z.strictObject({
+      executable: z.string().max(4096).refine(isAbsolute),
+      sha256: HashSchema,
+      version: z.string().min(1).max(200),
+    }),
+    locationHash: HashSchema,
+  }),
+  git: z.strictObject({ executable: z.string().max(4096).refine(isAbsolute), sha256: HashSchema }),
+  expiresAt: TimestampSchema,
+});
+type CombinedManifest = z.infer<typeof CombinedManifestSchema>;
+const CombinedRefJournalSchema = z.strictObject({
+  phases: z
+    .array(
+      z.strictObject({
+        sequence: z.number().int().nonnegative(),
+        kind: z.string().min(1).max(100),
+        digest: HashSchema,
+        state: z.enum(['intent', 'owned', 'quiescent']),
+        group: z.number().int().positive().nullable(),
+      }),
+    )
+    .max(10),
+  value: z.union([z.string().max(40), z.boolean(), z.null()]).optional(),
+});
 
 const NativeFileAppointmentSchema = z.strictObject({
   id: z.string().regex(/^[a-zA-Z0-9-]{1,80}$/),
@@ -452,6 +518,16 @@ const CandidateEvaluationSchema = z
         plan.verification.inventory.bytes === plan.definition.inventory.bytes
       : plan.maximumCheckMinutes === 1 && !Object.hasOwn(plan, 'verification'),
   );
+const {
+  writer: _combinedWriter,
+  verification: _combinedVerification,
+  ...combinedEvaluationShape
+} = CandidateEvaluationSchema.shape;
+const CombinedEvaluationSchema = z.strictObject({
+  ...combinedEvaluationShape,
+  origin: CombinedOriginSchema,
+  maximumCheckMinutes: z.literal(1),
+});
 type PreparedVerification = ToolchainPreparation & { lineageHash: string; sourcePath: string };
 type NativeOutcome = {
   metadata:
@@ -503,7 +579,7 @@ type NativeRuntime = {
 };
 type NativeReviewRuntime = {
   preparation: Artifact;
-  job: NativeReviewJob;
+  job: NativeReviewJob | CombinedNativeReviewJob;
   input: ReviewPlan;
   attempt: Attempt;
   stopped: boolean;
@@ -697,11 +773,21 @@ export class Controller {
   private localOperation?: LocalOperationRuntime;
   private readonly pendingLocalLaunches = new Set<string>();
   private readonly localWriters = new Map<string, LocalWriterRuntime>();
+  private readonly combinedCheckOwners = new Map<
+    string,
+    { stop: () => void; done: Promise<void> }
+  >();
+  private readonly combinedPipelines = new Map<string, Promise<void>>();
+  private readonly combinedOperations = new Map<
+    string,
+    { stop: () => void; done: Promise<unknown> }
+  >();
   private readonly conversationWorkers = new Map<string, ConversationRuntime>();
   private readonly pendingConversationLaunches = new Set<string>();
   private conversation!: TaskConversation;
   private readonly owner: DatabaseSync;
   private closed = false;
+  private projectionCache?: Map<string, unknown>;
   private readonly options: ControllerOptions;
   private profiles: NativeProfileResolution[];
   private closing?: Promise<void>;
@@ -911,30 +997,45 @@ export class Controller {
       return { outcome: 'blocked', reason: 'controller-closing' };
     const hash = hashCanonical(command);
     const effects: (() => void)[] = [];
-    const result = this.store.transaction<CommandResult>(() => {
-      const receipt = this.store.receipt(command.key);
-      if (receipt) {
-        if (receipt.hash !== hash || receipt.principal !== principal)
-          return {
-            outcome: 'denied',
-            reason: 'idempotency-key-reused',
-            next: 'Use a new key for changed command content.',
-          };
-        if (receipt.result.outcome === 'outcome-unknown' && command.command === 'AcceptCandidate')
-          effects.push(() => this.reconcilePublication(command.payload.candidateId, command.key));
-        return receipt.result.outcome === 'applied'
-          ? { ...receipt.result, outcome: 'already-applied' }
-          : receipt.result;
-      }
-      const stale = this.checkRevision(command);
-      const result = CommandResultSchema.parse(
-        stale ??
-          preflightFailure ??
-          this.apply(command, effects, verification, acpContext, contextCapture),
-      );
-      this.store.saveReceipt(command.key, hash, principal, result);
-      return result;
-    });
+    let result: CommandResult;
+    const combinedCommand =
+      command.command === 'PrepareCombinedRun' ||
+      ('taskId' in command.payload && !!this.store.combinedGroup(command.payload.taskId));
+    try {
+      result = this.store.transaction<CommandResult>(() => {
+        const receipt = this.store.receipt(command.key);
+        if (receipt) {
+          if (receipt.hash !== hash || receipt.principal !== principal)
+            return {
+              outcome: 'denied',
+              reason: 'idempotency-key-reused',
+              next: 'Use a new key for changed command content.',
+            };
+          if (receipt.result.outcome === 'outcome-unknown' && command.command === 'AcceptCandidate')
+            effects.push(() => this.reconcilePublication(command.payload.candidateId, command.key));
+          return receipt.result.outcome === 'applied'
+            ? { ...receipt.result, outcome: 'already-applied' }
+            : receipt.result;
+        }
+        const stale = this.checkRevision(command);
+        const result = CommandResultSchema.parse(
+          stale ??
+            preflightFailure ??
+            this.apply(command, effects, verification, acpContext, contextCapture),
+        );
+        this.store.saveReceipt(command.key, hash, principal, result);
+        return result;
+      });
+    } catch (error) {
+      if (!combinedCommand) throw error;
+      effects.length = 0;
+      result = {
+        outcome: 'blocked',
+        reason: 'combined-authority-unavailable',
+        next: 'Review the exact group, source, phase permissions and remaining limits.',
+      };
+      this.store.transaction(() => this.store.saveReceipt(command.key, hash, principal, result));
+    }
     for (const effect of effects) effect();
     return effects.length > 0 && result.outcome === 'outcome-unknown'
       ? (this.store.receipt(command.key)?.result ?? result)
@@ -1050,38 +1151,45 @@ export class Controller {
   }
 
   snapshot(): Snapshot {
-    const candidateEvaluations = this.candidateEvaluations();
-    return SnapshotSchema.parse({
-      protocol: 1,
-      nativeProfiles: this.resolveProfiles().map((profile) => profile.facts),
-      localSetup: this.localSetup(),
-      googleAcpSetup: this.store.googleAcpSetup(),
-      usageReaders: [this.googleUsageReader()],
-      nativeRuns: this.nativeRuns(),
-      candidateEvaluations,
-      cursor: this.store.cursor(),
-      projects: this.store.list('project'),
-      tasks: this.store.list('task'),
-      runs: this.store.list('run'),
-      attempts: this.store.list('attempt'),
-      routes: this.store.list('route'),
-      approvals: this.store.list('approval'),
-      candidates: this.store.list('candidate'),
-      artifacts: this.store.list('artifact'),
-      reviewJobs: this.store.db
-        .prepare('SELECT body FROM review_jobs')
-        .all()
-        .map((row) => JSON.parse(row.body as string)),
-      evidence: this.store.db
-        .prepare('SELECT body FROM evidence')
-        .all()
-        .map((row) => JSON.parse(row.body as string)),
-      usage: this.store
-        .list<Observation>('window')
-        .map((observation) =>
-          deriveWindow(observation, { nowMs: Date.parse(this.now()), maxAgeMs: 300000 }),
-        ),
-    });
+    const priorCache = this.projectionCache;
+    this.projectionCache ??= new Map();
+    try {
+      const candidateEvaluations = this.candidateEvaluations();
+      return SnapshotSchema.parse({
+        protocol: 1,
+        nativeProfiles: this.resolveProfiles().map((profile) => profile.facts),
+        localSetup: this.localSetup(),
+        googleAcpSetup: this.store.googleAcpSetup(),
+        usageReaders: [this.googleUsageReader()],
+        nativeRuns: this.nativeRuns(),
+        candidateEvaluations,
+        combinedRuns: this.store.combinedGroups().map((group) => this.combinedPreview(group)),
+        cursor: this.store.cursor(),
+        projects: this.store.list('project'),
+        tasks: this.store.list('task'),
+        runs: this.store.list('run'),
+        attempts: this.store.list('attempt'),
+        routes: this.store.list('route'),
+        approvals: this.store.list('approval'),
+        candidates: this.store.list('candidate'),
+        artifacts: this.store.list('artifact'),
+        reviewJobs: this.store.db
+          .prepare('SELECT body FROM review_jobs')
+          .all()
+          .map((row) => JSON.parse(row.body as string)),
+        evidence: this.store.db
+          .prepare('SELECT body FROM evidence')
+          .all()
+          .map((row) => JSON.parse(row.body as string)),
+        usage: this.store
+          .list<Observation>('window')
+          .map((observation) =>
+            deriveWindow(observation, { nowMs: Date.parse(this.now()), maxAgeMs: 300000 }),
+          ),
+      });
+    } finally {
+      this.projectionCache = priorCache;
+    }
   }
 
   private googleUsageReader() {
@@ -1684,6 +1792,29 @@ export class Controller {
       runtime.handle?.stop();
       native.push(runtime.done);
     }
+    for (const intent of this.store.intents()) {
+      if (
+        intent.state === 'intent' &&
+        this.store.receipt(`combined-check:${intent.attempt_id}`) &&
+        !this.jobs.has(intent.attempt_id)
+      ) {
+        const attempt = this.store.get<Attempt>('attempt', intent.attempt_id) as Attempt;
+        this.settleJob(attempt, true, true, () =>
+          this.store.db
+            .prepare("UPDATE combined_dispatches SET state='stopped' WHERE attempt_id=?")
+            .run(attempt.id),
+        );
+      }
+    }
+    native.push(...this.combinedPipelines.values());
+    for (const owner of this.combinedCheckOwners.values()) {
+      owner.stop();
+      native.push(owner.done);
+    }
+    for (const operation of this.combinedOperations.values()) {
+      operation.stop();
+      native.push(operation.done);
+    }
     for (const cancel of this.jobCancels.values()) cancel();
     for (const job of this.jobs.values()) {
       job.stop();
@@ -1758,8 +1889,10 @@ export class Controller {
     const taskId =
       command.command === 'ResolveApproval'
         ? command.payload.binding.taskId
-        : command.payload.taskId;
-    const task = this.store.get<Task>('task', taskId);
+        : 'taskId' in command.payload
+          ? command.payload.taskId
+          : undefined;
+    const task = taskId ? this.store.get<Task>('task', taskId) : undefined;
     if (!task)
       return { outcome: 'blocked', reason: 'task-not-found', next: 'Choose a registered task.' };
     if (task.revision !== command.expectedRevision)
@@ -1778,7 +1911,46 @@ export class Controller {
     acpContext?: CapturedContext,
     contextCapture?: ReturnType<typeof captureConversationContext>,
   ): CommandResult {
-    if (command.command === 'PrepareRun' || command.command === 'PrepareNativeRun') {
+    if ('taskId' in command.payload && typeof command.payload.taskId === 'string') {
+      const group = this.store.combinedGroup(command.payload.taskId);
+      if (
+        group &&
+        [
+          'AmendTask',
+          'PrepareRun',
+          'PrepareNativeRun',
+          'PrepareNativeHandoff',
+          'StartNativeHandoff',
+          'PrepareCandidateEvaluation',
+          'StartCandidateEvaluation',
+          'StartCandidateReview',
+          'AcceptCandidate',
+          'ConfigureTaskConversation',
+          'AdoptTaskPlan',
+          'ResumeRun',
+          'SwitchRoute',
+          'PrepareCombinedRun',
+        ].includes(command.command) &&
+        (group.task_id !== command.payload.taskId ||
+          ![
+            'PrepareCandidateEvaluation',
+            'StartCandidateEvaluation',
+            'StartCandidateReview',
+            'AcceptCandidate',
+            'ResumeRun',
+          ].includes(command.command))
+      )
+        return {
+          outcome: 'blocked',
+          reason: 'combined-member-owned',
+          next: 'Inspect the parent combined run. Child work cannot be accepted independently.',
+        };
+    }
+    if (
+      command.command === 'PrepareRun' ||
+      command.command === 'PrepareNativeRun' ||
+      command.command === 'PrepareCombinedRun'
+    ) {
       const config = this.conversationConfiguration(command.payload.taskId);
       if (
         config &&
@@ -1819,9 +1991,7 @@ export class Controller {
         this.latestCandidate(run.id)?.id !== candidate.id
       )
         return { outcome: 'blocked', reason: 'candidate-not-current' };
-      if (
-        this.evidence.hash(run.source.base, readFiles(this.writerScratch(run))) !== candidate.hash
-      )
+      if (!this.candidateCurrent(run, candidate))
         return {
           outcome: 'blocked',
           reason: 'candidate-binding-changed',
@@ -1836,6 +2006,10 @@ export class Controller {
       case 'RefreshLocalModels':
       case 'SelectLocalModel':
         return this.localCommand(command, effects);
+      case 'PrepareCombinedRun':
+        return this.prepareCombined(command);
+      case 'AssembleCombinedCandidate':
+        return this.assembleCombined(command, effects);
       case 'GetTaskConversation':
         return {
           outcome: 'applied',
@@ -2020,6 +2194,19 @@ export class Controller {
             reason: 'approval-already-pending',
             next: 'Resolve the exact pending action, or stop this run.',
           };
+        const group = this.store.combinedGroup(run.id);
+        if (group) {
+          if (group.task_id !== task.id)
+            return { outcome: 'blocked', reason: 'combined-member-owned' };
+          if (group.phase === 'paused')
+            return { outcome: 'applied', entity: task, revision: task.revision };
+          if (['stopping', 'stopped', 'unknown', 'blocked', 'accepted'].includes(group.phase))
+            return { outcome: 'blocked', reason: 'combined-pause-unavailable' };
+          this.store.db
+            .prepare('UPDATE combined_groups SET paused_phase=? WHERE run_id=? AND generation=?')
+            .run(group.phase, group.run_id, group.generation);
+          this.updateCombined(group, 'paused', 'paused');
+        }
         if (!this.store.receipt(`paused:${run.id}`))
           this.store.saveReceipt(
             `paused:${run.id}`,
@@ -2039,6 +2226,12 @@ export class Controller {
       case 'GetChanges': {
         const task = this.store.get<Task>('task', command.payload.taskId);
         const candidate = task?.runId ? this.latestCandidate(task.runId) : undefined;
+        if (
+          candidate &&
+          task?.runId &&
+          !this.candidateCurrent(this.store.get<Run>('run', task.runId) as Run, candidate)
+        )
+          return { outcome: 'blocked', reason: 'candidate-binding-changed' };
         return candidate
           ? (this.store.receipt(`changes:${candidate.id}`)?.result ?? {
               outcome: 'blocked',
@@ -2597,33 +2790,80 @@ export class Controller {
     const config = this.conversationConfiguration(taskId);
     if (!config) return null;
     const intents = this.store.intents();
-    const ledger = intents.filter((intent) => intent.task_id === taskId);
-    const minutes = ledger.reduce((sum, intent) => {
-      const run = this.store.get<Run>('run', intent.run_id);
-      let reserved = run?.policy.policy.limits.minutes ?? config.limits.minutes;
-      if (this.store.runPurpose(intent.run_id) === 'conversation') {
-        try {
-          const plan = this.nativeRecord(`conversation-turn:${intent.attempt_id}`).value as {
-            binding: ConversationTurnBinding;
-          };
-          reserved = ConversationTurnBindingSchema.parse(plan.binding).limitMinutes;
-        } catch {}
-      }
-      return sum + chargedMinutes(intent, reserved);
-    }, 0);
+    const combined = this.store.combinedGroup(taskId);
+    const memberRun = combined
+      ? this.store.combinedMembers(combined.run_id).find((member) => member.task_id === taskId)
+          ?.run_id
+      : undefined;
+    const slots = combined
+      ? this.store
+          .combinedDispatches(combined.run_id)
+          .filter(
+            (slot) =>
+              combined.task_id === taskId ||
+              this.store.get<Attempt>('attempt', slot.attempt_id ?? '')?.runId === memberRun,
+          )
+      : [];
+    const ledger = intents.filter(
+      (intent) =>
+        intent.task_id === taskId || slots.some((slot) => slot.attempt_id === intent.attempt_id),
+    );
+    const minutes = ledger.reduce(
+      (sum, intent) => {
+        const run = this.store.get<Run>('run', intent.run_id);
+        let reserved =
+          slots.find((slot) => slot.attempt_id === intent.attempt_id)?.maximum_minutes ??
+          run?.policy.policy.limits.minutes ??
+          config.limits.minutes;
+        if (this.store.runPurpose(intent.run_id) === 'conversation') {
+          try {
+            const plan = this.nativeRecord(`conversation-turn:${intent.attempt_id}`).value as {
+              binding: ConversationTurnBinding;
+            };
+            reserved = ConversationTurnBindingSchema.parse(plan.binding).limitMinutes;
+          } catch {}
+        }
+        return sum + chargedMinutes(intent, reserved);
+      },
+      combined?.task_id === taskId
+        ? combined.integration_active
+          ? 1
+          : Math.ceil(combined.integration_milliseconds / 60000)
+        : 0,
+    );
     return {
       attempts: Math.max(0, config.limits.attempts - ledger.length),
       minutes: Math.max(0, config.limits.minutes - minutes),
       concurrency: Math.max(
         0,
-        config.limits.concurrency - intents.filter((intent) => intent.state !== 'stopped').length,
+        config.limits.concurrency -
+          (combined ? ledger : intents).filter((intent) => intent.state !== 'stopped').length,
       ),
     };
   }
 
   private remaining(run: Run) {
-    const own = remainingBudgets(run, this.store.intents());
-    const task = this.taskAllowance(run.taskId);
+    const group = this.store.combinedGroup(run.id);
+    const own = group
+      ? remainingCombinedBudgets(
+          this.store.get<Run>('run', group.run_id) as Run,
+          this.store.intents(),
+          this.store.combinedDispatches(group.run_id),
+          group,
+        )
+      : remainingBudgets(run, this.store.intents());
+    let task = this.taskAllowance(group?.task_id ?? run.taskId);
+    if (group && group.task_id !== run.taskId) {
+      const child = this.taskAllowance(run.taskId);
+      if (child)
+        task = task
+          ? {
+              attempts: Math.min(task.attempts, child.attempts),
+              minutes: Math.min(task.minutes, child.minutes),
+              concurrency: Math.min(task.concurrency, child.concurrency),
+            }
+          : child;
+    }
     return task
       ? {
           attempts: Math.min(own.attempts, task.attempts),
@@ -2879,7 +3119,13 @@ export class Controller {
       send.reason = 'effects-unresolved';
     else if (unknown) send.reason = 'ownership-unknown';
     else if (config?.paused || task.state === 'stopping') send.reason = 'admissions-paused';
-    else if (active && purpose)
+    else if (this.store.combinedGroup(task.id)) {
+      const group = this.store.combinedGroup(task.id) as CombinedGroup;
+      send =
+        config && !['stopped', 'accepted', 'blocked', 'paused', 'unknown'].includes(group.phase)
+          ? { available: true, reason: 'queued-at-boundary', disposition: 'queue' }
+          : { available: false, reason: 'execution-active', disposition: null };
+    } else if (active && purpose)
       send = { available: true, reason: 'queued-at-boundary', disposition: 'queue' };
     else if (
       config &&
@@ -3627,6 +3873,1497 @@ export class Controller {
     }
   }
 
+  private combinedManifest(group: CombinedGroup): CombinedManifest {
+    const artifact = ArtifactSchema.parse(
+      this.store.get<Artifact>('artifact', group.preparation_id),
+    );
+    if (artifact.hash !== group.manifest_hash || artifact.bytes > MAX_FRAME_BYTES)
+      throw Error('The combined manifest changed.');
+    const bytes = this.artifacts.read(artifact.hash);
+    if (bytes.length !== artifact.bytes) throw Error('The combined manifest is incomplete.');
+    const manifest = CombinedManifestSchema.parse(JSON.parse(bytes.toString('utf8')));
+    if (manifest.run.id !== group.run_id || manifest.run.taskId !== group.task_id)
+      throw Error('The combined parent changed.');
+    return manifest;
+  }
+
+  private combinedCurrent(group: CombinedGroup, permitStopped = false) {
+    const key = `combined-current:${group.run_id}:${permitStopped}`;
+    const cached = this.projectionCache?.get(key) as
+      | { group: CombinedGroup; manifest: CombinedManifest; task: Task; members: CombinedMember[] }
+      | undefined;
+    if (cached) return cached;
+    const current = this.store.combinedGroup(group.run_id);
+    if (
+      !current ||
+      (this.closed && !permitStopped) ||
+      current.generation !== group.generation ||
+      (!permitStopped &&
+        ['paused', 'stopping', 'stopped', 'blocked', 'unknown', 'accepted'].includes(current.phase))
+    )
+      throw Error('Combined admission is closed.');
+    const manifest = this.combinedManifest(current);
+    const task = this.store.get<Task>('task', current.task_id);
+    if (
+      !task ||
+      task.runId !== current.run_id ||
+      hashCanonical(task.criteria) !== hashCanonical(manifest.task.criteria) ||
+      hashCanonical(this.store.get<Run>('run', current.run_id)?.policy) !==
+        hashCanonical(manifest.run.policy) ||
+      hashCanonical(this.store.get<Run>('run', current.run_id)?.source) !==
+        hashCanonical(manifest.run.source) ||
+      hashCanonical(this.store.get<Run>('run', current.run_id)?.roles) !==
+        hashCanonical(manifest.run.roles) ||
+      task.title !== manifest.task.title ||
+      task.outcome !== manifest.task.outcome ||
+      hashCanonical(inspectSource(task.projectId, this.projectPath(task.projectId) as string)) !==
+        hashCanonical(manifest.run.source)
+    )
+      throw Error('The combined source or task changed.');
+    const members = this.store.combinedMembers(group.run_id);
+    if (members.length !== 2) throw Error('The combined membership is incomplete.');
+    for (const [index, member] of members.entries()) {
+      const child = this.store.get<Task>('task', member.task_id);
+      const frozen = manifest.members[index];
+      if (
+        !child ||
+        child.runId !== member.run_id ||
+        child.projectId !== task.projectId ||
+        member.ordinal !== index ||
+        frozen.run.id !== member.run_id ||
+        hashCanonical(this.store.get<Run>('run', member.run_id)?.policy) !==
+          hashCanonical(frozen.run.policy) ||
+        member.task_id !== frozen.task.id ||
+        member.task_id !== manifest.input.children[index].taskId ||
+        member.scope_path !== manifest.input.children[index].scope[0] ||
+        hashCanonical(this.store.get<Run>('run', member.run_id)?.source) !==
+          hashCanonical(frozen.run.source) ||
+        hashCanonical(this.store.get<Run>('run', member.run_id)?.roles) !==
+          hashCanonical(frozen.run.roles) ||
+        hashCanonical(this.store.get<Artifact>('artifact', member.preparation_id)) !==
+          hashCanonical(frozen.preparation) ||
+        member.preparation_id !== frozen.preparation.id ||
+        hashCanonical({ title: child.title, outcome: child.outcome, criteria: child.criteria }) !==
+          member.task_hash ||
+        hashCanonical(frozen.run.source) !== hashCanonical(manifest.run.source) ||
+        member.scope_hash !== hashCanonical([manifest.input.children[index].scope[0]])
+      )
+        throw Error('The combined child changed.');
+    }
+    const result = { group: current, manifest, task, members };
+    this.projectionCache?.set(key, result);
+    return result;
+  }
+
+  private updateCombined(
+    group: CombinedGroup,
+    phase: CombinedGroup['phase'],
+    blocker: CombinedGroup['blocker'] = null,
+  ) {
+    const changed = this.store.db
+      .prepare(
+        "UPDATE combined_groups SET phase=?,blocker=?,revision=revision+1,paused_phase=CASE WHEN ? IN ('stopping','stopped','blocked','unknown','accepted') THEN NULL ELSE paused_phase END WHERE run_id=? AND generation=?",
+      )
+      .run(phase, blocker, phase, group.run_id, group.generation);
+    if (changed.changes !== 1) throw Error('The combined generation changed.');
+    const current = this.store.combinedGroup(group.run_id) as CombinedGroup;
+    const preview = this.combinedPreview(current);
+    this.event(
+      'combined.updated',
+      current.task_id,
+      this.store.get<Task>('task', current.task_id)?.revision ?? 0,
+      preview,
+    );
+    return current;
+  }
+
+  private combinedPreview(group: CombinedGroup): CombinedRunPreview {
+    const manifest = this.combinedManifest(group);
+    const available = { available: true, reason: 'available' as const };
+    const blocked = (reason: CombinedRunPreview['assemble']['reason']) => ({
+      available: false,
+      reason,
+    });
+    const slots = this.store.combinedDispatches(group.run_id);
+    const run = this.store.get<Run>('run', group.run_id) as Run;
+    let currentReason: CombinedRunPreview['start']['reason'] | null = null;
+    try {
+      this.combinedCurrent(group, true);
+    } catch {
+      currentReason = 'source-changed';
+    }
+    const closed =
+      !!currentReason ||
+      ['paused', 'stopping', 'stopped', 'blocked', 'unknown', 'accepted'].includes(group.phase);
+    const reason =
+      currentReason ??
+      (group.phase === 'unknown'
+        ? 'ownership-unknown'
+        : group.phase === 'paused'
+          ? 'paused'
+          : group.phase === 'accepted'
+            ? 'accepted'
+            : (group.blocker ?? 'stopped'));
+    const candidate = group.final_candidate_id
+      ? this.store.get<Candidate>('candidate', group.final_candidate_id)
+      : undefined;
+    if (candidate && !closed) {
+      try {
+        this.combinedOrigin(group, candidate);
+        if (group.phase === 'ready') this.combinedPublicationEvidence(group, candidate);
+      } catch {
+        currentReason = 'preparation-changed';
+      }
+    }
+    const ready = (
+      expected: CombinedGroup['phase'],
+      otherwise: CombinedRunPreview['assemble']['reason'],
+    ) =>
+      !closed && !currentReason && group.phase === expected
+        ? available
+        : blocked(currentReason ?? (closed ? reason : otherwise));
+    return CombinedRunPreviewSchema.parse({
+      taskId: group.task_id,
+      runId: group.run_id,
+      preparationId: group.preparation_id,
+      manifestHash: group.manifest_hash,
+      revision: group.revision,
+      generation: group.generation,
+      evaluationSelection: {
+        recipeId: 'project-node-tests-v1',
+        testFiles: manifest.input.checks.testFiles,
+        reviewer: { profileId: 'openai-file-v1', methodId: 'keep-it-simple', cycles: 1 },
+        creditPolicy: manifest.input.reviewer.creditPolicy,
+      },
+      members: this.store.combinedMembers(group.run_id).map((member) => ({
+        taskId: member.task_id,
+        runId: member.run_id,
+        scope: [member.scope_path],
+        start:
+          !closed && group.phase === 'writers' && slots[member.ordinal + 1].state === 'reserved'
+            ? available
+            : blocked(
+                closed
+                  ? reason
+                  : slots[member.ordinal + 1].state === 'reserved'
+                    ? 'baseline-required'
+                    : 'already-started',
+              ),
+      })),
+      phase: group.phase,
+      blocker: group.blocker,
+      dispatches: slots.map((slot) => ({
+        phase: slot.phase,
+        maximumMinutes: slot.maximum_minutes,
+        state: slot.state,
+        attemptId: slot.attempt_id,
+        checkArtifactId: slot.check_artifact_id,
+      })),
+      candidate: candidate ? { id: candidate.id, hash: candidate.hash } : null,
+      remainingBudgets: this.remaining(run),
+      start:
+        !closed && !currentReason && group.phase === 'baseline' && slots[0].state === 'passed'
+          ? available
+          : ready('prepared', 'already-started'),
+      assemble:
+        !closed &&
+        ['writers', 'assembling'].includes(group.phase) &&
+        !this.combinedPipelines.has(group.run_id) &&
+        slots[1].state === 'passed' &&
+        slots[2].state === 'passed'
+          ? available
+          : blocked(closed ? reason : 'writers-incomplete'),
+      evaluate: ready('awaiting-evaluation', 'checks-required'),
+      review: ready('awaiting-review', 'checks-required'),
+      accept: ready('ready', 'review-required'),
+    });
+  }
+
+  private prepareCombined(
+    command: Extract<Command, { command: 'PrepareCombinedRun' }>,
+  ): CommandResult {
+    const input = command.payload;
+    const parent = this.store.get<Task>('task', input.taskId);
+    const children = input.children.map((child) => this.store.get<Task>('task', child.taskId));
+    if (
+      parent?.state !== 'draft' ||
+      children.some(
+        (child, index) =>
+          child?.state !== 'draft' ||
+          child.projectId !== parent.projectId ||
+          child.revision !== input.children[index].expectedRevision,
+      )
+    )
+      return { outcome: 'blocked', reason: 'combined-drafts-changed' };
+    for (const task of [parent, ...children] as Task[]) {
+      if (
+        this.store.combinedGroup(task.id) ||
+        this.draftEditGate(task) ||
+        this.store
+          .list<Attempt>('attempt')
+          .some(
+            (attempt) =>
+              this.store.get<Run>('run', attempt.runId)?.taskId === task.id &&
+              this.store.runPurpose(attempt.runId) !== 'conversation',
+          ) ||
+        this.store.db.prepare('SELECT 1 FROM pending_effects WHERE task_id=? LIMIT 1').get(task.id)
+      )
+        return { outcome: 'blocked', reason: 'combined-draft-has-work' };
+    }
+    const allowance = this.taskAllowance(parent.id);
+    if (
+      allowance &&
+      (allowance.attempts < 7 ||
+        allowance.minutes <
+          5 +
+            input.children[0].maximumMinutes +
+            input.children[1].maximumMinutes +
+            input.reviewer.maximumMinutes ||
+        allowance.concurrency < 2)
+    )
+      return { outcome: 'blocked', reason: 'combined-task-budget-insufficient' };
+    for (const [index, child] of children.entries()) {
+      const allowance = this.taskAllowance((child as Task).id);
+      if (
+        allowance &&
+        (allowance.attempts < 1 ||
+          allowance.minutes < input.children[index].maximumMinutes ||
+          allowance.concurrency < 1)
+      )
+        return { outcome: 'blocked', reason: 'combined-child-budget-insufficient' };
+    }
+    const source = inspectSource(parent.projectId, this.projectPath(parent.projectId) as string);
+    const files = committedFiles(this.projectPath(parent.projectId) as string, source.base);
+    for (const child of input.children) {
+      if (frozenVerificationPath(child.scope[0]))
+        throw Error('Trusted evaluator files cannot be writer scope.');
+      const file = files.find((file) => file.path === child.scope[0]);
+      if (
+        !file ||
+        file.bytes > 65536 ||
+        new TextDecoder('utf-8', { fatal: true }).decode(file.content).includes('\0')
+      )
+        throw Error('A combined target is unavailable.');
+    }
+    const reviewer = this.profileFor(input.reviewer.profileId);
+    if (
+      !reviewer.facts.available ||
+      reviewer.facts.family !== 'openai' ||
+      !reviewer.client ||
+      !reviewer.locationHash ||
+      !reviewer.environment ||
+      !reviewer.facts.creditPolicies.includes(input.reviewer.creditPolicy)
+    )
+      return { outcome: 'blocked', reason: 'combined-reviewer-unavailable' };
+    const baseline = this.evidence.capture({
+      taskId: parent.id,
+      base: source.base,
+      files,
+      existing: [],
+    });
+    this.saveArtifacts(baseline.artifacts);
+    this.store.put('candidate', baseline.candidate.id, 0, baseline.candidate);
+    for (const testFiles of [
+      input.checks.testFiles,
+      input.checks.replayTestFiles[0],
+      [...new Set(input.checks.replayTestFiles.flat())],
+    ])
+      this.evidence.describeChecks({
+        candidate: baseline.candidate,
+        sourceFiles: files,
+        criteria: parent.criteria,
+        selection: { recipeId: 'project-node-tests-v1', testFiles },
+      });
+    const members = input.children.map((child) => {
+      const result = this.prepareNative(
+        CommandSchema.parse({
+          ...command,
+          key: this.id('cmd'),
+          command: 'PrepareNativeRun',
+          expectedRevision: child.expectedRevision,
+          payload: {
+            taskId: child.taskId,
+            ...child.writer,
+            targetPath: child.scope[0],
+            policy: input.policy,
+            consent: child.consent,
+          },
+        }) as Extract<Command, { command: 'PrepareNativeRun' }>,
+        child.maximumMinutes,
+      );
+      if (result.outcome !== 'applied')
+        throw Error(result.reason ?? 'The combined child could not be prepared.');
+      const task = this.store.get<Task>('task', child.taskId) as Task;
+      const run = this.store.get<Run>('run', task.runId as string) as Run;
+      const preparation = ArtifactSchema.parse(
+        this.store.receipt(`native-run:${run.id}`)?.result.entity,
+      );
+      if (hashCanonical(run.source) !== hashCanonical(source))
+        throw Error('Combined child source changed.');
+      return { task, run, preparation };
+    });
+    const route = RouteSchema.parse({
+      id: this.id('rte'),
+      family: 'openai',
+      displayName: reviewer.facts.displayName,
+      model: reviewer.facts.model,
+      effort: {
+        requested: reviewer.facts.effort,
+        effective: reviewer.facts.effort,
+        supported: [reviewer.facts.effort],
+      },
+      billing: input.reviewer.creditPolicy === 'ordinary' ? 'included' : 'credits',
+      qualified: false,
+      fake: false,
+    });
+    this.store.put('route', route.id, 0, route);
+    const run = RunSchema.parse({
+      id: this.id('run'),
+      taskId: parent.id,
+      source,
+      policy: { policy: input.policy, hash: hashCanonical(input.policy) },
+      roles: [{ role: 'reviewer', routeId: route.id, pinned: true, approvedFallbacks: [] }],
+      decision: {
+        chosen: null,
+        rejected: [],
+        rule: 'waiting',
+        inputsHash: hashCanonical({ source, policy: input.policy }),
+      },
+      revision: 0,
+    });
+    this.store.put('run', run.id, 0, run);
+    this.store.putRunPurpose(run, 'execution', parent.runId);
+    const task = this.updateTask(parent, {
+      runId: run.id,
+      next: 'Start the combined baseline before starting either child.',
+    });
+    const manifests = members.map((member) =>
+      NativePreparationSchema.parse(this.nativeRecord(`native-run:${member.run.id}`).value),
+    );
+    const gitPath = realpathSync('/usr/bin/git');
+    const manifest = CombinedManifestSchema.parse({
+      version: 1,
+      input,
+      run,
+      task,
+      sourceFiles: files.map(({ content: _content, ...entry }) => entry),
+      members,
+      reviewer: {
+        route,
+        profile: reviewer.facts,
+        client: reviewer.client,
+        locationHash: reviewer.locationHash,
+      },
+      git: {
+        executable: gitPath,
+        sha256: createHash('sha256').update(readFileSync(gitPath)).digest('hex'),
+      },
+      expiresAt: new Date(
+        Math.min(...manifests.map((plan) => Date.parse(plan.appointment.expiresAt))),
+      ).toISOString(),
+    });
+    if (Buffer.byteLength(canonicalJson(manifest)) > MAX_FRAME_BYTES)
+      throw Error('The combined manifest exceeds its bound.');
+    const artifact = this.nativeArtifact(manifest);
+    this.store.db
+      .prepare(
+        "INSERT INTO combined_groups(run_id,task_id,preparation_id,manifest_hash,phase,integration_ref) VALUES (?,?,?,?,'prepared',?)",
+      )
+      .run(run.id, task.id, artifact.id, artifact.hash, `refs/crewkite/integration/${run.id}`);
+    for (const [ordinal, member] of members.entries())
+      this.store.db
+        .prepare(
+          'INSERT INTO combined_members(parent_run_id,ordinal,task_id,run_id,preparation_id,scope_path,scope_hash,task_hash) VALUES (?,?,?,?,?,?,?,?)',
+        )
+        .run(
+          run.id,
+          ordinal,
+          member.task.id,
+          member.run.id,
+          member.preparation.id,
+          input.children[ordinal].scope[0],
+          hashCanonical(input.children[ordinal].scope),
+          hashCanonical({
+            title: member.task.title,
+            outcome: member.task.outcome,
+            criteria: member.task.criteria,
+          }),
+        );
+    const maxima = [
+      1,
+      input.children[0].maximumMinutes,
+      input.children[1].maximumMinutes,
+      1,
+      1,
+      1,
+      input.reviewer.maximumMinutes,
+    ];
+    for (const [index, phase] of CombinedDispatchPhaseSchema.options.entries())
+      this.store.db
+        .prepare(
+          'INSERT INTO combined_dispatches(parent_run_id,phase,maximum_minutes) VALUES (?,?,?)',
+        )
+        .run(run.id, phase, maxima[index]);
+    this.store.db
+      .prepare(
+        "UPDATE combined_dispatches SET candidate_id=? WHERE parent_run_id=? AND phase='baseline'",
+      )
+      .run(baseline.candidate.id, run.id);
+    this.event('run.prepared', task.id, task.revision, run);
+    this.updateCombined(this.store.combinedGroup(run.id) as CombinedGroup, 'prepared');
+    return { outcome: 'applied', entity: artifact, revision: task.revision };
+  }
+
+  private captureCombined(group: CombinedGroup, files: FileContent[]) {
+    const manifest = this.combinedManifest(group);
+    const captured = this.evidence.capture({
+      taskId: group.task_id,
+      base: manifest.run.source.base,
+      files,
+      existing: [],
+    });
+    this.saveArtifacts(captured.artifacts);
+    this.store.put('candidate', captured.candidate.id, 0, captured.candidate);
+    const changes = this.evidence.changes({
+      taskId: group.task_id,
+      candidateId: captured.candidate.id,
+      base: manifest.run.source.base,
+      sourceFiles: committedFiles(
+        this.projectPath(manifest.task.projectId) as string,
+        manifest.run.source.base,
+      ),
+      files,
+    });
+    this.saveArtifacts(changes.artifacts);
+    this.store.saveReceipt(
+      `changes:${captured.candidate.id}`,
+      captured.candidate.hash,
+      'local-owner',
+      { outcome: 'applied', data: changes.data },
+    );
+    return captured.candidate;
+  }
+
+  private async combinedGit<T extends string | boolean | null>(
+    group: CombinedGroup,
+    operation: string,
+    binding: { candidate?: Candidate; check?: CheckResult; old?: string | null; next?: string },
+    work: (
+      git: ReturnType<typeof createIntegrationGit>,
+      options: IntegrationGitOptions,
+    ) => { stop: () => void; result: Promise<IntegrationGitOutcome<T>> },
+  ): Promise<T> {
+    const current = this.combinedCurrent(group).group;
+    const manifest = this.combinedManifest(current);
+    if (this.closed) throw Error('Controller is closing.');
+    const prior = this.store
+      .combinedRefIntents(group.run_id)
+      .find((row) => row.generation === group.generation && row.operation === operation);
+    const journal = prior
+      ? CombinedRefJournalSchema.parse(JSON.parse(prior.body))
+      : ({ phases: [] } as z.infer<typeof CombinedRefJournalSchema>);
+    if (
+      prior &&
+      (prior.expected_old !== (binding.old ?? null) ||
+        prior.expected_new !== (binding.next ?? null) ||
+        prior.candidate_id !== (binding.candidate?.id ?? null) ||
+        prior.check_artifact_id !== (binding.check?.artifactId ?? null))
+    )
+      throw Error('Integration intent changed.');
+    if (prior?.state === 'applied' && Object.hasOwn(journal, 'value')) return journal.value as T;
+    if (
+      prior &&
+      (prior.state === 'unknown' || journal.phases.some((phase) => phase.state !== 'quiescent'))
+    )
+      throw Error('The prior integration owner is unknown.');
+    if (
+      current.integration_active ||
+      this.store.combinedRefIntents(group.run_id).some((row) => row.state === 'unknown')
+    )
+      throw Error('Integration ownership is unresolved.');
+    if (prior && operation === 'baseline-initialize' && journal.phases.length) {
+      await this.combinedGit(
+        group,
+        `${operation}-reconcile-${this.store.combinedRefIntents(group.run_id).filter((row) => row.operation.startsWith(`${operation}-reconcile-`)).length}`,
+        {},
+        (git, options) => git.readHead(options),
+      );
+      journal.value = true;
+      this.store.transaction(() =>
+        this.store.db
+          .prepare(
+            "UPDATE combined_ref_intents SET state='applied',body=?,finished_at=? WHERE parent_run_id=? AND generation=? AND operation=? AND state='prepared'",
+          )
+          .run(canonicalJson(journal), this.now(), group.run_id, group.generation, operation),
+      );
+      return true as T;
+    }
+    if (prior && binding.next && journal.phases.length) {
+      const head = await this.combinedGit(
+        group,
+        `${operation}-reconcile-${this.store.combinedRefIntents(group.run_id).filter((row) => row.operation.startsWith(`${operation}-reconcile-`)).length}`,
+        {},
+        (git, options) => git.readHead(options),
+      );
+      if (head === binding.next) {
+        journal.value = true;
+        this.store.transaction(() =>
+          this.store.db
+            .prepare(
+              "UPDATE combined_ref_intents SET state='applied',body=?,finished_at=? WHERE parent_run_id=? AND generation=? AND operation=? AND state='prepared'",
+            )
+            .run(canonicalJson(journal), this.now(), group.run_id, group.generation, operation),
+        );
+        return true as T;
+      }
+      if (head !== (binding.old ?? null)) throw Error('The prepared integration ref changed.');
+    }
+    if (binding.check && binding.candidate) {
+      const row = this.store
+        .combinedDispatches(group.run_id)
+        .find((slot) => slot.check_artifact_id === binding.check?.artifactId);
+      if (
+        row?.state !== 'passed' ||
+        row.candidate_id !== binding.candidate.id ||
+        !this.checks(binding.candidate).some(
+          (check) => hashCanonical(check) === hashCanonical(binding.check),
+        )
+      )
+        throw Error('The integration check changed.');
+    }
+    const available = 60000 - current.integration_milliseconds;
+    if (available <= 100) throw Error('The integration allowance is exhausted.');
+    const directory = join(this.home, 'integration', group.run_id);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const git = createIntegrationGit({ directory, runId: group.run_id, git: manifest.git });
+    const phaseOffset = journal.phases.length;
+    const started = performance.now();
+    this.store.transaction(() => {
+      this.combinedCurrent(group);
+      if (!prior)
+        this.store.db
+          .prepare(
+            "INSERT INTO combined_ref_intents(parent_run_id,generation,operation,expected_old,expected_new,candidate_id,check_artifact_id,state,body,intent_at) VALUES (?,?,?,?,?,?,?,'prepared',?,?)",
+          )
+          .run(
+            group.run_id,
+            group.generation,
+            operation,
+            binding.old ?? null,
+            binding.next ?? null,
+            binding.candidate?.id ?? null,
+            binding.check?.artifactId ?? null,
+            canonicalJson(journal),
+            this.now(),
+          );
+      this.store.db
+        .prepare(
+          'UPDATE combined_groups SET integration_active=1,integration_started_at=COALESCE(integration_started_at,?) WHERE run_id=?',
+        )
+        .run(this.now(), group.run_id);
+    });
+    const save = () =>
+      this.store.db
+        .prepare(
+          "UPDATE combined_ref_intents SET body=? WHERE parent_run_id=? AND generation=? AND operation=? AND state='prepared'",
+        )
+        .run(canonicalJson(journal), group.run_id, group.generation, operation);
+    const options: IntegrationGitOptions = {
+      deadline: started + available,
+      lifecycle: {
+        beforePhase: (phase) =>
+          this.store.transaction(() => {
+            this.combinedCurrent(group);
+            if (
+              phase.sequence + phaseOffset !== journal.phases.length ||
+              journal.phases.some((phase) => phase.state !== 'quiescent')
+            )
+              throw Error('Integration phases overlap.');
+            journal.phases.push({
+              ...phase,
+              sequence: phase.sequence + phaseOffset,
+              state: 'intent',
+              group: null,
+            });
+            save();
+          }),
+        owned: (phase, pid) =>
+          this.store.transaction(() => {
+            this.combinedCurrent(group);
+            const row = journal.phases[phase.sequence + phaseOffset];
+            if (!row || row.digest !== phase.digest || row.state !== 'intent')
+              throw Error('Integration phase changed.');
+            row.group = pid;
+            row.state = 'owned';
+            save();
+          }),
+        quiescent: (phase, pid) =>
+          this.store.transaction(() => {
+            const row = journal.phases[phase.sequence + phaseOffset];
+            if (!row || row.digest !== phase.digest || row.state !== 'owned' || row.group !== pid)
+              throw Error('Integration closure changed.');
+            row.state = 'quiescent';
+            save();
+          }),
+      },
+    };
+    let handle: ReturnType<typeof work>;
+    try {
+      handle = work(git, options);
+    } catch (error) {
+      this.store.transaction(() => {
+        this.store.db
+          .prepare(
+            "UPDATE combined_ref_intents SET state='unknown' WHERE parent_run_id=? AND generation=? AND operation=?",
+          )
+          .run(group.run_id, group.generation, operation);
+        this.updateCombined(group, 'unknown', 'ownership-unknown');
+      });
+      throw error;
+    }
+    this.combinedOperations.set(group.run_id, { stop: handle.stop, done: handle.result });
+    const result = await handle.result;
+    this.combinedOperations.delete(group.run_id);
+    this.store.transaction(() => {
+      const elapsed = Math.max(0, Math.ceil(performance.now() - started));
+      const state =
+        result.quiescent && journal.phases.every((phase) => phase.state === 'quiescent')
+          ? result.reason === null
+            ? 'applied'
+            : 'prepared'
+          : 'unknown';
+      if (state === 'applied') journal.value = result.value;
+      this.store.db
+        .prepare(
+          'UPDATE combined_ref_intents SET state=?,body=?,finished_at=? WHERE parent_run_id=? AND generation=? AND operation=?',
+        )
+        .run(
+          state,
+          canonicalJson(journal),
+          result.quiescent ? this.now() : null,
+          group.run_id,
+          group.generation,
+          operation,
+        );
+      this.store.db
+        .prepare(
+          'UPDATE combined_groups SET integration_milliseconds=MIN(60000,integration_milliseconds+?),integration_active=?,integration_finished_at=? WHERE run_id=?',
+        )
+        .run(elapsed, result.quiescent ? 0 : 1, result.quiescent ? this.now() : null, group.run_id);
+      if (state === 'unknown') this.updateCombined(group, 'unknown', 'ownership-unknown');
+      this.refreshCombinedStop(group);
+    });
+    if (result.reason !== null || !result.quiescent)
+      throw Error(result.reason ?? 'Integration ownership is unknown.');
+    return result.value as T;
+  }
+
+  private combinedCheck(
+    group: CombinedGroup,
+    phase: 'baseline' | 'replay-0' | 'replay-1' | 'final-check',
+    candidate: Candidate,
+    effects: (() => void)[],
+    originHash: string,
+  ): Promise<boolean> {
+    const { manifest } = this.combinedCurrent(group);
+    const slot = this.store
+      .combinedDispatches(group.run_id)
+      .find((slot) => slot.phase === phase) as CombinedDispatch;
+    if (slot.state === 'passed' && slot.candidate_id === candidate.id) {
+      this.combinedChecked(group, phase, candidate, originHash);
+      return Promise.resolve(true);
+    }
+    if (slot.state !== 'reserved') throw Error('The combined check slot was consumed.');
+    if (phase !== 'final-check' && Date.parse(manifest.expiresAt) <= Date.parse(this.now()))
+      throw Error('The combined phase consent expired.');
+    const definition = this.combinedDefinition(group, phase, candidate, originHash);
+    const plan = this.evidence.prepareChecks({
+      candidate,
+      sourceFiles: committedFiles(
+        this.projectPath(manifest.task.projectId) as string,
+        manifest.run.source.base,
+      ),
+      criteria: manifest.task.criteria,
+      expected: definition,
+    });
+    const route = this.localCheckRoute();
+    if (!route) throw Error('The trusted check route is unavailable.');
+    if (!this.store.get<Route>('route', route.id)) this.store.put('route', route.id, 0, route);
+    const attempt = this.jobAttempt(manifest.run, route.id);
+    this.admitJob(manifest.run, attempt, plan.directory, slot.maximum_minutes, phase);
+    this.store.db
+      .prepare(
+        'UPDATE combined_dispatches SET candidate_id=?,definition_hash=? WHERE parent_run_id=? AND phase=?',
+      )
+      .run(candidate.id, definition.definitionHash, group.run_id, phase);
+    const phaseArtifact = this.nativeArtifact({
+      runId: group.run_id,
+      generation: group.generation,
+      phase,
+      candidateId: candidate.id,
+      definitionHash: definition.definitionHash,
+    });
+    this.store.saveReceipt(`combined-check:${attempt.id}`, phaseArtifact.hash, 'local-owner', {
+      outcome: 'applied',
+      entity: phaseArtifact,
+    });
+    const ready = Promise.withResolvers<boolean>();
+    effects.push(() => {
+      if (this.closed || this.store.get<Attempt>('attempt', attempt.id)?.state !== 'intent') {
+        ready.resolve(false);
+        return;
+      }
+      void this.launchCombinedCheck(group, attempt, candidate, plan).then(ready.resolve, () =>
+        ready.resolve(false),
+      );
+    });
+    return ready.promise;
+  }
+
+  private async launchCombinedCheck(
+    group: CombinedGroup,
+    attempt: Attempt,
+    candidate: Candidate,
+    plan: CheckPlan,
+  ): Promise<boolean> {
+    let job: OwnedCommand;
+    const slot = this.store
+      .combinedDispatches(group.run_id)
+      .find((slot) => slot.attempt_id === attempt.id) as CombinedDispatch;
+    let timedOut = false;
+    try {
+      if (this.closed) throw Error('Controller is closing.');
+      this.combinedCurrent(group, this.store.combinedGroup(group.run_id)?.phase === 'paused');
+      if (this.closed) throw Error('Controller is closing.');
+      job = new OwnedCommand({
+        argv: plan.argv,
+        directory: plan.directory,
+        environmentHome: join(this.home, 'environment', attempt.id),
+        onSpawn: (pid) => this.acknowledgeJob(attempt, pid),
+      });
+      this.jobs.set(attempt.id, job);
+    } catch {
+      this.settleJob(attempt, false);
+      return false;
+    }
+    const completed = Promise.withResolvers<void>();
+    const interrupted = Promise.withResolvers<null>();
+    let cleanupCancel: (() => void) | undefined;
+    const stop = () => {
+      job.stop();
+      cleanupCancel ??= (this.options.schedule ?? defaultSchedule)(
+        () => interrupted.resolve(null),
+        1000,
+      );
+    };
+    this.combinedCheckOwners.set(attempt.id, { stop, done: completed.promise });
+    try {
+      const cancel = (this.options.schedule ?? defaultSchedule)(
+        () => {
+          timedOut = true;
+          stop();
+        },
+        this.jobDeadline(attempt.id, slot.maximum_minutes),
+      );
+      this.jobCancels.set(attempt.id, cancel);
+      const exit = await Promise.race([job.exited, interrupted.promise]);
+      if (!exit) {
+        this.settleJob(attempt, false, true);
+        return false;
+      }
+      const quiescent = exit.quiescent && (await closedWithin(job.closed, this.options.schedule));
+      cancel();
+      let authority = false;
+      try {
+        this.combinedCurrent(group, this.store.combinedGroup(group.run_id)?.phase === 'paused');
+        authority = !this.cancelledJobs.has(attempt.id) && !this.closed;
+      } catch {}
+      const result = this.evidence.recordCheck({
+        candidate,
+        plan,
+        passed:
+          authority &&
+          quiescent &&
+          exit.code === 0 &&
+          exit.signal === null &&
+          !job.failed &&
+          !timedOut &&
+          this.jobDeadline(attempt.id, slot.maximum_minutes) > 0,
+        output: Buffer.concat(job.stdout),
+      });
+      const passed = this.store.transaction(() => {
+        this.saveArtifacts(result.artifacts);
+        const check = result.evidence;
+        this.store.db
+          .prepare(
+            "INSERT OR REPLACE INTO evidence(candidate_id,kind,candidate_hash,definition_hash,evaluator,body) VALUES (?,'check',?,?,?,?)",
+          )
+          .run(
+            candidate.id,
+            candidate.hash,
+            check.definitionHash,
+            check.evaluator,
+            canonicalJson(check),
+          );
+        this.store.db
+          .prepare(
+            'UPDATE combined_dispatches SET state=?,check_artifact_id=? WHERE parent_run_id=? AND phase=?',
+          )
+          .run(
+            quiescent ? (check.passed ? 'passed' : 'failed') : 'unknown',
+            check.artifactId,
+            group.run_id,
+            slot.phase,
+          );
+        this.event(
+          'check.completed',
+          group.task_id,
+          this.store.get<Task>('task', group.task_id)?.revision ?? 0,
+          check,
+        );
+        if (!quiescent) this.updateCombined(group, 'unknown', 'ownership-unknown');
+        else if (
+          !check.passed &&
+          !['stopping', 'stopped', 'paused'].includes(
+            (this.store.combinedGroup(group.run_id) as CombinedGroup).phase,
+          )
+        )
+          this.updateCombined(group, 'blocked', 'checks-failed');
+        return check.passed && quiescent;
+      });
+      const settled = this.settleJob(attempt, quiescent, true);
+      return passed && settled;
+    } finally {
+      cleanupCancel?.();
+      this.combinedCheckOwners.delete(attempt.id);
+      completed.resolve();
+    }
+  }
+
+  private resumeCombined(
+    command: Extract<Command, { command: 'ResumeRun' }>,
+    group: CombinedGroup,
+  ): CommandResult {
+    if (group.task_id !== command.payload.taskId || group.phase !== 'paused' || !group.paused_phase)
+      return { outcome: 'blocked', reason: 'combined-resume-unavailable' };
+    const { manifest, task } = this.combinedCurrent(group, true);
+    const slots = this.store.combinedDispatches(group.run_id);
+    const owned = this.store
+      .intents()
+      .filter((intent) => slots.some((slot) => slot.attempt_id === intent.attempt_id));
+    const journals = this.store.combinedRefIntents(group.run_id);
+    if (
+      slots.some((slot) => slot.state === 'unknown') ||
+      journals.some(
+        (row) =>
+          row.state === 'unknown' ||
+          CombinedRefJournalSchema.parse(JSON.parse(row.body)).phases.some(
+            (phase) => phase.state !== 'quiescent',
+          ),
+      )
+    )
+      return { outcome: 'blocked', reason: 'combined-ownership-unknown' };
+    if (
+      owned.some((intent) => intent.state !== 'stopped') ||
+      group.integration_active ||
+      this.combinedOperations.has(group.run_id) ||
+      this.combinedPipelines.has(group.run_id)
+    )
+      return { outcome: 'blocked', reason: 'combined-owner-active' };
+    if (slots.some((slot) => ['failed', 'stopped'].includes(slot.state)))
+      return { outcome: 'blocked', reason: 'combined-stage-incomplete' };
+    const remaining = this.remaining(manifest.run);
+    const pending = slots.filter((slot) => slot.state === 'reserved');
+    if (
+      remaining.attempts < pending.length ||
+      remaining.minutes <
+        pending.reduce(
+          (sum, slot) => sum + slot.maximum_minutes,
+          group.integration_milliseconds === 0 ? 1 : 0,
+        ) ||
+      remaining.concurrency < 1
+    )
+      return { outcome: 'blocked', reason: 'combined-budget-exhausted' };
+    let current = group;
+    for (const operation of ['baseline-ref', 'replay-0-ref', 'replay-1-ref']) {
+      const ref = journals.find(
+        (row) =>
+          row.operation === operation &&
+          row.state === 'applied' &&
+          row.expected_old === current.current_head,
+      );
+      if (!ref?.expected_new) continue;
+      const candidate = CandidateSchema.parse(
+        this.store.get<Candidate>('candidate', ref.candidate_id as string),
+      );
+      const slot = slots.find((slot) => slot.check_artifact_id === ref.check_artifact_id);
+      if (slot?.state !== 'passed' || slot.candidate_id !== candidate.id)
+        throw Error('Paused integration proof changed.');
+      this.combinedRefCurrent(current, ref.expected_new);
+      this.store.db
+        .prepare('UPDATE combined_groups SET current_head=? WHERE run_id=? AND generation=?')
+        .run(ref.expected_new, group.run_id, group.generation);
+      current = this.store.combinedGroup(group.run_id) as CombinedGroup;
+    }
+    let phase = group.paused_phase;
+    if (phase === 'baseline' && slots[0].state === 'passed' && current.current_head)
+      phase = 'writers';
+    if (phase === 'assembling' && current.final_candidate_id) phase = 'awaiting-evaluation';
+    if (phase === 'checking' && slots[5].state === 'passed') {
+      const artifact = ArtifactSchema.parse(
+        this.store.receipt(`evaluation-started:${group.run_id}`)?.result.entity,
+      );
+      const plan = this.combinedEvaluationPlan(artifact);
+      const proof = this.combinedChecked(
+        group,
+        'final-check',
+        plan.candidate,
+        hashCanonical(plan.origin),
+      );
+      const check = ArtifactSchema.parse(
+        this.store.get<Artifact>('artifact', proof.check.artifactId),
+      );
+      this.store.saveReceipt(`evaluation-result:${artifact.id}`, artifact.hash, 'local-owner', {
+        outcome: 'applied',
+        entity: check,
+      });
+      phase = 'awaiting-review';
+    }
+    if ((phase === 'reviewing' || phase === 'ready') && slots[6].state === 'passed') {
+      this.combinedPublicationEvidence(
+        group,
+        CandidateSchema.parse(
+          this.store.get<Candidate>('candidate', current.final_candidate_id as string),
+        ),
+        true,
+      );
+      phase = 'ready';
+    }
+    this.store.db
+      .prepare('UPDATE combined_groups SET paused_phase=NULL WHERE run_id=? AND generation=?')
+      .run(group.run_id, group.generation);
+    this.store.db.prepare('DELETE FROM receipts WHERE command_key=?').run(`paused:${group.run_id}`);
+    this.updateCombined(group, phase);
+    const updated = this.updateTask(task, {
+      state:
+        phase === 'prepared'
+          ? 'draft'
+          : phase === 'ready'
+            ? 'ready'
+            : phase === 'writers'
+              ? 'running'
+              : 'stopped',
+      waitingReason: null,
+      next: 'Admissions resumed under the saved combined limits. Continue the available action.',
+    });
+    return { outcome: 'applied', entity: manifest.run, revision: updated.revision };
+  }
+
+  private startCombinedBaseline(
+    command: Extract<Command, { command: 'StartRun' | 'ResumeRun' }>,
+    group: CombinedGroup,
+    effects: (() => void)[],
+  ): CommandResult {
+    const { manifest, task } = this.combinedCurrent(group);
+    if (
+      !['prepared', 'baseline'].includes(group.phase) ||
+      this.combinedPipelines.has(group.run_id) ||
+      command.command !== 'StartRun'
+    )
+      return { outcome: 'blocked', reason: 'combined-baseline-unavailable' };
+    const candidate = CandidateSchema.parse(
+      this.store.get<Candidate>(
+        'candidate',
+        this.store.combinedDispatches(group.run_id)[0].candidate_id as string,
+      ),
+    );
+    const passed = this.combinedCheck(group, 'baseline', candidate, effects, group.manifest_hash);
+    this.updateCombined(group, 'baseline');
+    const updated = this.updateTask(task, {
+      state: 'checking',
+      waitingReason: null,
+      next: 'Checking the common baseline.',
+    });
+    effects.push(() => {
+      const pipeline = passed
+        .then(async (pass) => {
+          if (!pass) return;
+          try {
+            await this.combinedGit(group, 'baseline-initialize', {}, (git, options) =>
+              git.initialize(options),
+            );
+            const tree = await this.combinedGit(
+              group,
+              'baseline-tree',
+              { candidate },
+              (git, options) => git.importTree(this.evidence.read(candidate).files, options),
+            );
+            const check = this.checks(candidate).find((check) => check.passed) as CheckResult;
+            await this.combinedGit(
+              group,
+              'baseline-ref',
+              { candidate, check, old: null, next: tree },
+              (git, options) => git.compareAndSwap({ old: null, new: tree }, options),
+            );
+            this.store.transaction(() => {
+              this.combinedCurrent(group);
+              this.store.db
+                .prepare(
+                  'UPDATE combined_groups SET current_head=? WHERE run_id=? AND generation=?',
+                )
+                .run(tree, group.run_id, group.generation);
+              this.updateCombined(group, 'writers');
+              this.updateTask(this.store.get<Task>('task', group.task_id) as Task, {
+                state: 'running',
+                waitingReason: null,
+                next: 'Baseline passed. Start both prepared child slices.',
+              });
+            });
+          } catch {
+            if (
+              !this.closed &&
+              !['stopping', 'stopped', 'paused'].includes(
+                this.store.combinedGroup(group.run_id)?.phase ?? '',
+              )
+            )
+              this.store.transaction(() =>
+                this.updateCombined(
+                  group,
+                  this.store.combinedGroup(group.run_id)?.phase === 'unknown'
+                    ? 'unknown'
+                    : 'blocked',
+                  'ownership-unknown',
+                ),
+              );
+          }
+        })
+        .finally(() => this.combinedPipelines.delete(group.run_id));
+      this.combinedPipelines.set(group.run_id, pipeline);
+    });
+    return { outcome: 'applied', entity: manifest.run, revision: updated.revision };
+  }
+
+  private combinedDefinition(
+    group: CombinedGroup,
+    phase: 'baseline' | 'replay-0' | 'replay-1' | 'final-check',
+    candidate: Candidate,
+    originHash: string,
+  ) {
+    const manifest = this.combinedManifest(group);
+    const testFiles =
+      phase === 'replay-0'
+        ? manifest.input.checks.replayTestFiles[0]
+        : phase === 'replay-1'
+          ? [...new Set(manifest.input.checks.replayTestFiles.flat())]
+          : manifest.input.checks.testFiles;
+    return this.evidence.describeChecks({
+      candidate,
+      sourceFiles: committedFiles(
+        this.projectPath(manifest.task.projectId) as string,
+        manifest.run.source.base,
+      ),
+      criteria: manifest.task.criteria,
+      selection: { recipeId: 'project-node-tests-v1', testFiles },
+      combined: {
+        manifestHash: group.manifest_hash,
+        generation: group.generation,
+        phase,
+        originHash,
+      },
+    });
+  }
+
+  private combinedChecked(
+    group: CombinedGroup,
+    phase: 'baseline' | 'replay-0' | 'replay-1' | 'final-check',
+    candidate: Candidate,
+    originHash: string,
+  ) {
+    const slot = this.store.combinedDispatches(group.run_id).find((slot) => slot.phase === phase);
+    const definition = this.combinedDefinition(group, phase, candidate, originHash);
+    const check = this.checks(candidate).find(
+      (check) => check.artifactId === slot?.check_artifact_id,
+    );
+    const intent = this.store.intents().find((intent) => intent.attempt_id === slot?.attempt_id);
+    if (
+      slot?.state !== 'passed' ||
+      slot.candidate_id !== candidate.id ||
+      slot.definition_hash !== definition.definitionHash ||
+      intent?.state !== 'stopped' ||
+      this.store.get<Attempt>('attempt', intent.attempt_id)?.state !== 'stopped' ||
+      !check ||
+      !this.checkMatches(check, candidate, definition)
+    )
+      throw Error('The exact combined check is incomplete.');
+    return { check, definition, slot };
+  }
+
+  private combinedContributors(group: CombinedGroup) {
+    const { manifest, members } = this.combinedCurrent(group);
+    const slots = this.store.combinedDispatches(group.run_id);
+    return members.map((member, index) => {
+      const slot = slots[index + 1];
+      const candidate = slot.candidate_id
+        ? this.store.get<Candidate>('candidate', slot.candidate_id)
+        : undefined;
+      if (!candidate || slot.state !== 'passed') throw Error('Both child writers must finish.');
+      const verified = this.evaluationOrigin(member.task_id, candidate.id);
+      if (
+        verified.writer.id !== slot.attempt_id ||
+        verified.run.id !== member.run_id ||
+        hashCanonical(verified.run.policy) !== hashCanonical(manifest.run.policy)
+      )
+        throw Error('The child ownership changed.');
+      return { member, ...verified };
+    });
+  }
+
+  private combinedRefCurrent(group: CombinedGroup, preparedHead?: string | null) {
+    const directory = join(
+      this.home,
+      'integration',
+      group.run_id,
+      `integration-${group.run_id}.git`,
+    );
+    for (const suffix of ['', 'refs', 'refs/crewkite', 'refs/crewkite/integration']) {
+      const path = suffix ? join(directory, suffix) : directory;
+      const state = lstatSync(path);
+      if (
+        !state.isDirectory() ||
+        state.isSymbolicLink() ||
+        realpathSync(path) !== path ||
+        state.uid !== process.getuid?.() ||
+        (state.mode & 0o022) !== 0
+      )
+        throw Error('Private integration storage changed.');
+    }
+    const path = join(directory, group.integration_ref);
+    const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const state = fstatSync(fd);
+      if (
+        !state.isFile() ||
+        state.nlink !== 1 ||
+        state.uid !== process.getuid?.() ||
+        state.size !== 41 ||
+        (state.mode & 0o022) !== 0
+      )
+        throw Error('Private integration ref changed.');
+      const bytes = readFileSync(fd);
+      if (
+        bytes.toString() !== `${group.current_head}\n` &&
+        (!preparedHead || bytes.toString() !== `${preparedHead}\n`)
+      )
+        throw Error('Private integration head changed.');
+    } finally {
+      closeSync(fd);
+    }
+  }
+
+  private combinedOrigin(group: CombinedGroup, candidate: Candidate) {
+    const key = `combined-origin:${group.run_id}:${candidate.id}:${candidate.hash}`;
+    const cached = this.projectionCache?.get(key) as CombinedOrigin | undefined;
+    if (cached) return cached;
+    const { manifest } = this.combinedCurrent(group, true);
+    if (
+      candidate.id !== group.final_candidate_id ||
+      candidate.taskId !== group.task_id ||
+      !group.origin_artifact_id ||
+      group.integration_active ||
+      this.store.combinedDispatches(group.run_id).some((slot) => slot.state === 'unknown')
+    )
+      throw Error('The combined candidate is unavailable.');
+    const record = ArtifactSchema.parse(
+      this.store.get<Artifact>('artifact', group.origin_artifact_id),
+    );
+    if (record.bytes > MAX_FRAME_BYTES) throw Error('Combined origin exceeds its bound.');
+    const origin = CombinedOriginSchema.parse(
+      JSON.parse(this.artifacts.read(record.hash).toString('utf8')),
+    );
+    const contributors = this.combinedContributorsForOrigin(group);
+    if (
+      origin.taskId !== group.task_id ||
+      origin.runId !== group.run_id ||
+      origin.preparationId !== group.preparation_id ||
+      origin.manifestHash !== group.manifest_hash ||
+      origin.generation !== group.generation ||
+      origin.sourceBase !== manifest.run.source.base ||
+      origin.sourceManifestHash !== hashCanonical(manifest.sourceFiles) ||
+      origin.policyHash !== manifest.run.policy.hash ||
+      origin.criteriaHash !== hashCanonical(manifest.task.criteria) ||
+      origin.candidateId !== candidate.id ||
+      origin.candidateHash !== candidate.hash ||
+      hashCanonical(origin.contributors) !== hashCanonical(contributors)
+    )
+      throw Error('Combined origin changed.');
+    const baselineSlot = this.store.combinedDispatches(group.run_id)[0];
+    const baseline = CandidateSchema.parse(
+      this.store.get<Candidate>('candidate', baselineSlot.candidate_id as string),
+    );
+    const baselineProof = this.combinedChecked(group, 'baseline', baseline, group.manifest_hash);
+    const baselineRef = this.store
+      .combinedRefIntents(group.run_id)
+      .find((row) => row.operation === 'baseline-ref');
+    if (
+      baselineRef?.state !== 'applied' ||
+      baselineRef.expected_old !== null ||
+      baselineRef.expected_new !== origin.steps[0].previousTree ||
+      baselineRef.candidate_id !== baseline.id ||
+      baselineRef.check_artifact_id !== baselineProof.check.artifactId
+    )
+      throw Error('The checked baseline changed.');
+    const replay = assembleSlices({
+      base: manifest.run.source.base,
+      files: this.evidence.read(baseline).files,
+      members: [0, 1].map((index) => ({
+        base: manifest.run.source.base,
+        scope: [manifest.input.children[index].scope[0]],
+        dependencies: [],
+        files: this.evidence.read(
+          CandidateSchema.parse(
+            this.store.get<Candidate>('candidate', origin.contributors[index].candidateId),
+          ),
+        ).files,
+      })) as unknown as Parameters<typeof assembleSlices>[0]['members'],
+    });
+    if (
+      replay.some((step) => step.changes.length !== 1) ||
+      this.evidence.hash(manifest.run.source.base, replay[1].files) !== candidate.hash
+    )
+      throw Error('Combined replay inventory changed.');
+    for (const [index, step] of origin.steps.entries()) {
+      const stage = CandidateSchema.parse(this.store.get<Candidate>('candidate', step.candidateId));
+      const verified = this.combinedChecked(
+        group,
+        index === 0 ? 'replay-0' : 'replay-1',
+        stage,
+        hashCanonical({ manifestHash: group.manifest_hash, contributors, index }),
+      );
+      const cas = this.store
+        .combinedRefIntents(group.run_id)
+        .find((row) => row.operation === `replay-${index}-ref`);
+      const tree = this.store
+        .combinedRefIntents(group.run_id)
+        .find((row) => row.operation === `replay-${index}-tree`);
+      if (
+        tree?.state !== 'applied' ||
+        tree.candidate_id !== stage.id ||
+        CombinedRefJournalSchema.parse(JSON.parse(tree.body)).value !== step.nextTree ||
+        this.evidence.hash(manifest.run.source.base, replay[index].files) !== stage.hash
+      )
+        throw Error('The immutable replay tree changed.');
+      if (
+        stage.hash !== step.candidateHash ||
+        verified.definition.definitionHash !== step.definitionHash ||
+        verified.check.artifactId !== step.checkArtifactId ||
+        !cas ||
+        cas.state !== 'applied' ||
+        cas.generation !== group.generation ||
+        cas.expected_old !== step.previousTree ||
+        cas.expected_new !== step.nextTree ||
+        cas.candidate_id !== stage.id ||
+        cas.check_artifact_id !== verified.check.artifactId
+      )
+        throw Error('The checked integration chain changed.');
+    }
+    if (
+      origin.steps[1].nextTree !== group.current_head ||
+      this.evidence.read(candidate).base !== manifest.run.source.base
+    )
+      throw Error('Combined final head changed.');
+    this.combinedRefCurrent(group);
+    this.projectionCache?.set(key, origin);
+    return origin;
+  }
+
+  private combinedContributorsForOrigin(group: CombinedGroup) {
+    const current = this.store.combinedGroup(group.run_id) as CombinedGroup;
+    const savedPhase = current.phase;
+    // Completed evidence remains readable after admission closes.
+    const contributors = this.store.combinedMembers(group.run_id).map((member, index) => {
+      const slot = this.store.combinedDispatches(group.run_id)[index + 1];
+      const candidate = CandidateSchema.parse(
+        this.store.get<Candidate>('candidate', slot.candidate_id as string),
+      );
+      const verified = this.evaluationOrigin(member.task_id, candidate.id);
+      if (slot.state !== 'passed' || verified.writer.id !== slot.attempt_id)
+        throw Error('Contributor evidence changed.');
+      return {
+        taskId: member.task_id,
+        runId: member.run_id,
+        attemptId: verified.writer.id,
+        generation: verified.writer.generation,
+        routeId: verified.writer.routeId,
+        candidateId: candidate.id,
+        candidateHash: candidate.hash,
+        scopeHash: member.scope_hash,
+      };
+    });
+    if (this.store.combinedGroup(group.run_id)?.phase !== savedPhase)
+      throw Error('Combined phase changed.');
+    return contributors as CombinedOrigin['contributors'];
+  }
+
+  private assembleCombined(
+    command: Extract<Command, { command: 'AssembleCombinedCandidate' }>,
+    effects: (() => void)[],
+  ): CommandResult {
+    const group = this.store.combinedGroup(command.payload.runId);
+    if (
+      !group ||
+      group.task_id !== command.payload.taskId ||
+      group.preparation_id !== command.payload.preparationId ||
+      !['writers', 'assembling'].includes(group.phase) ||
+      this.combinedPipelines.has(group.run_id)
+    )
+      return { outcome: 'blocked', reason: 'combined-assembly-unavailable' };
+    const { manifest, task } = this.combinedCurrent(group);
+    const contributors = this.combinedContributors(group);
+    const files = committedFiles(
+      this.projectPath(task.projectId) as string,
+      manifest.run.source.base,
+    );
+    const stages = assembleSlices({
+      base: manifest.run.source.base,
+      files,
+      members: [contributors[0], contributors[1]].map((entry) => ({
+        base: entry.run.source.base,
+        scope: [entry.member.scope_path],
+        dependencies: [],
+        files: this.evidence.read(entry.candidate).files,
+      })) as unknown as Parameters<typeof assembleSlices>[0]['members'],
+    });
+    if (stages.some((stage) => stage.changes.length !== 1))
+      return { outcome: 'blocked', reason: 'combined-substantive-slices-required' };
+    const preparedCas = this.store
+      .combinedRefIntents(group.run_id)
+      .find(
+        (row) =>
+          row.state === 'prepared' &&
+          row.expected_old === group.current_head &&
+          row.expected_new &&
+          CombinedRefJournalSchema.parse(JSON.parse(row.body)).phases.every(
+            (phase) => phase.state === 'quiescent',
+          ),
+      );
+    this.combinedRefCurrent(group, preparedCas?.expected_new);
+    this.updateCombined(group, 'assembling');
+    const updated = this.updateTask(task, {
+      state: 'checking',
+      waitingReason: null,
+      next: 'Replaying the two checked slices in order.',
+    });
+    effects.push(() => {
+      const pipeline = this.assembleCombinedStages(group, stages)
+        .catch(() => {
+          if (!this.closed)
+            this.store.transaction(() => {
+              const current = this.store.combinedGroup(group.run_id) as CombinedGroup;
+              if (!['stopping', 'stopped', 'paused', 'unknown'].includes(current.phase))
+                this.updateCombined(current, 'blocked', 'checks-failed');
+            });
+        })
+        .finally(() => this.combinedPipelines.delete(group.run_id));
+      this.combinedPipelines.set(group.run_id, pipeline);
+    });
+    return { outcome: 'applied', entity: manifest.run, revision: updated.revision };
+  }
+
+  private async assembleCombinedStages(
+    group: CombinedGroup,
+    stages: ReturnType<typeof assembleSlices>,
+  ) {
+    const contributors = this.combinedContributorsForOrigin(group);
+    const steps: CombinedOrigin['steps'][number][] = [];
+    for (const [index, stage] of stages.entries()) {
+      const phase = index === 0 ? 'replay-0' : 'replay-1';
+      const current = this.combinedCurrent(group).group;
+      const slot = this.store
+        .combinedDispatches(group.run_id)
+        .find((slot) => slot.phase === phase) as CombinedDispatch;
+      const stageCandidate = slot.candidate_id
+        ? CandidateSchema.parse(this.store.get<Candidate>('candidate', slot.candidate_id))
+        : this.store.transaction(() => this.captureCombined(group, stage.files));
+      if (
+        this.evidence.hash(this.combinedManifest(group).run.source.base, stage.files) !==
+        stageCandidate.hash
+      )
+        throw Error('The assembly stage changed.');
+      const pending: (() => void)[] = [];
+      const originHash = hashCanonical({ manifestHash: group.manifest_hash, contributors, index });
+      let checked: Promise<boolean> = Promise.resolve(false);
+      this.store.transaction(() => {
+        checked = this.combinedCheck(group, phase, stageCandidate, pending, originHash);
+      });
+      for (const effect of pending) effect();
+      if (!(await checked)) throw Error('A replay check failed.');
+      const proof = this.combinedChecked(group, phase, stageCandidate, originHash);
+      const tree = await this.combinedGit(
+        group,
+        `replay-${index}-tree`,
+        { candidate: stageCandidate },
+        (git, options) => git.importTree(stage.files, options),
+      );
+      const prior = this.store
+        .combinedRefIntents(group.run_id)
+        .find((row) => row.operation === `replay-${index}-ref`);
+      const previous = prior?.expected_old ?? current.current_head;
+      if (!previous || previous === tree) throw Error('The replay has no substantive tree delta.');
+      await this.combinedGit(
+        group,
+        `replay-${index}-ref`,
+        { candidate: stageCandidate, check: proof.check, old: previous, next: tree },
+        (git, options) => git.compareAndSwap({ old: previous, new: tree }, options),
+      );
+      this.store.transaction(() => {
+        this.combinedCurrent(group);
+        this.store.db
+          .prepare('UPDATE combined_groups SET current_head=? WHERE run_id=? AND generation=?')
+          .run(tree, group.run_id, group.generation);
+      });
+      steps.push({
+        candidateId: stageCandidate.id,
+        candidateHash: stageCandidate.hash,
+        definitionHash: proof.definition.definitionHash,
+        checkArtifactId: proof.check.artifactId,
+        previousTree: previous,
+        nextTree: tree,
+      });
+    }
+    this.store.transaction(() => {
+      const { manifest } = this.combinedCurrent(group);
+      const candidate = this.captureCombined(group, stages[1].files);
+      const origin = CombinedOriginSchema.parse({
+        kind: 'combined',
+        taskId: group.task_id,
+        runId: group.run_id,
+        preparationId: group.preparation_id,
+        manifestHash: group.manifest_hash,
+        generation: group.generation,
+        sourceBase: manifest.run.source.base,
+        sourceManifestHash: hashCanonical(manifest.sourceFiles),
+        policyHash: manifest.run.policy.hash,
+        criteriaHash: hashCanonical(manifest.task.criteria),
+        contributors,
+        steps,
+        candidateId: candidate.id,
+        candidateHash: candidate.hash,
+      });
+      const artifact = this.nativeArtifact(origin);
+      this.store.db
+        .prepare(
+          'UPDATE combined_groups SET final_candidate_id=?,origin_artifact_id=? WHERE run_id=? AND generation=?',
+        )
+        .run(candidate.id, artifact.id, group.run_id, group.generation);
+      this.updateCombined(group, 'awaiting-evaluation');
+      this.updateTask(this.store.get<Task>('task', group.task_id) as Task, {
+        state: 'stopped',
+        waitingReason: null,
+        next: 'The combined candidate is sealed. Prepare its full evaluation.',
+      });
+    });
+  }
+
   private routing(
     run: Pick<Run, 'roles' | 'policy'> & Partial<Pick<Run, 'id'>>,
     roleName: Run['roles'][number]['role'] = 'coder',
@@ -3902,6 +5639,18 @@ export class Controller {
   ): CommandResult {
     const task = this.store.get<Task>('task', command.payload.taskId);
     const run = this.store.get<Run>('run', command.payload.runId);
+    const combined = run && this.store.combinedGroup(run.id);
+    if (combined?.task_id === command.payload.taskId && command.command === 'ResumeRun')
+      return this.resumeCombined(command, combined);
+    if (combined) this.combinedCurrent(combined);
+    if (combined && combined.task_id === command.payload.taskId)
+      return this.startCombinedBaseline(command, combined, effects);
+    if (
+      combined &&
+      !this.combinedPreview(combined).members.find((member) => member.runId === run?.id)?.start
+        .available
+    )
+      return { outcome: 'blocked', reason: 'combined-child-not-admissible' };
     if (run && this.store.receipt(`local-prepared:${run.id}`))
       return command.command === 'StartRun'
         ? this.startLocal(command, effects)
@@ -4045,14 +5794,14 @@ export class Controller {
     const previousCandidate = this.latestCandidate(run.id);
     const checkReserve =
       previousCandidate && this.checks(previousCandidate).some((check) => check.passed) ? 0 : 1;
-    if (spent + reviewReserve + checkReserve >= run.policy.policy.limits.attempts)
+    if (!combined && spent + reviewReserve + checkReserve >= run.policy.policy.limits.attempts)
       return {
         outcome: 'blocked',
         reason: 'attempt-budget-exhausted',
         next: 'Prepare a new bounded run with enough review headroom.',
       };
     const remaining = this.remaining(run);
-    if (remaining.attempts < reviewReserve + checkReserve + 1)
+    if (remaining.attempts < (combined ? 1 : reviewReserve + checkReserve + 1))
       return {
         outcome: 'blocked',
         reason: 'review-budget-insufficient',
@@ -4134,6 +5883,17 @@ export class Controller {
         scratchPath,
         this.now(),
       );
+    if (combined) {
+      const member = this.store
+        .combinedMembers(combined.run_id)
+        .find((member) => member.run_id === run.id);
+      if (!member) throw Error('The combined member disappeared.');
+      this.store.admitCombinedDispatch(
+        combined.run_id,
+        member.ordinal === 0 ? 'writer-0' : 'writer-1',
+        attempt.id,
+      );
+    }
     const windows = this.store
       .list<Observation>('window')
       .filter((value) => value.routeId === attempt.routeId && value.kind !== 'local');
@@ -4151,7 +5911,11 @@ export class Controller {
           attempt.routeId,
           window.windowId,
           window.remaining?.unit ?? 'minutes',
-          remaining.minutes,
+          combined
+            ? (this.store
+                .combinedDispatches(combined.run_id)
+                .find((slot) => slot.attempt_id === attempt.id)?.maximum_minutes ?? 0)
+            : remaining.minutes,
         );
     const admitted = { ...run, decision, revision: run.revision + 1 };
     this.store.put('run', run.id, admitted.revision, admitted);
@@ -4989,7 +6753,10 @@ export class Controller {
     return expected;
   }
 
-  private prepareAcp(command: Extract<Command, { command: 'PrepareNativeRun' }>): CommandResult {
+  private prepareAcp(
+    command: Extract<Command, { command: 'PrepareNativeRun' }>,
+    maximumMinutes = 5,
+  ): CommandResult {
     let writing = false;
     if (command.payload.profileId !== 'google-acp-v1' || !('proofId' in command.payload))
       return { outcome: 'unsupported', reason: 'invalid-command' };
@@ -5105,7 +6872,7 @@ export class Controller {
         },
         policy,
         expiresAt,
-        maximumTaskMs: 300000,
+        maximumTaskMs: maximumMinutes * 60000,
         maximumSubmissions: 1,
       });
       const run = RunSchema.parse({
@@ -5827,9 +7594,13 @@ export class Controller {
     }
   }
 
-  private prepareNative(command: Extract<Command, { command: 'PrepareNativeRun' }>): CommandResult {
+  private prepareNative(
+    command: Extract<Command, { command: 'PrepareNativeRun' }>,
+    maximumMinutes?: number,
+  ): CommandResult {
     if (command.payload.profileId === 'local-file-v1') return this.prepareLocal(command);
-    if (command.payload.profileId === 'google-acp-v1') return this.prepareAcp(command);
+    if (command.payload.profileId === 'google-acp-v1')
+      return this.prepareAcp(command, maximumMinutes);
     let plan: Omit<NativeBinding, 'planArtifact'>;
     let expiresAt: string;
     let manualTargets: z.infer<typeof NativeManualRosterSchema>['targets'] | undefined;
@@ -5981,7 +7752,7 @@ export class Controller {
           },
           policy,
           expiresAt,
-          maximumTaskMs: facts.maximumTaskMs,
+          maximumTaskMs: Math.min(facts.maximumTaskMs, (maximumMinutes ?? 5) * 60000),
           maximumSubmissions: facts.maximumSubmissions,
         }),
       );
@@ -6051,6 +7822,624 @@ export class Controller {
     return { outcome: 'applied', entity: binding.run, revision: updated.revision };
   }
 
+  private combinedEvaluationPlan(artifact: Artifact) {
+    const stored = this.store.get<Artifact>('artifact', artifact.id);
+    if (
+      !stored ||
+      hashCanonical(stored) !== hashCanonical(artifact) ||
+      artifact.bytes > MAX_FRAME_BYTES ||
+      this.store.receipt(`evaluation-plan:${artifact.id}`)?.hash !== artifact.hash
+    )
+      throw Error('Combined evaluation preparation changed.');
+    return CombinedEvaluationSchema.parse(
+      JSON.parse(this.artifacts.read(artifact.hash).toString('utf8')),
+    );
+  }
+
+  private combinedEvaluationAuthority(artifact: Artifact, ownedAttemptId?: string) {
+    const plan = this.combinedEvaluationPlan(artifact);
+    const group = this.store.combinedGroup(plan.run.id);
+    if (!group || group.run_id !== plan.run.id) throw Error('Combined parent missing.');
+    const { manifest, task } = this.combinedCurrent(
+      group,
+      !!ownedAttemptId &&
+        group.phase === 'paused' &&
+        this.store
+          .combinedDispatches(group.run_id)
+          .some((slot) => slot.attempt_id === ownedAttemptId && slot.state === 'running'),
+    );
+    const candidate = CandidateSchema.parse(
+      this.store.get<Candidate>('candidate', plan.candidate.id),
+    );
+    const origin = this.combinedOrigin(group, candidate);
+    const profile = this.profileFor(manifest.input.reviewer.profileId);
+    const { scopeHash: _scopeHash, expiresAt: _expiresAt, ...fields } = plan;
+    const consent = EvaluationConsentSchema.parse(
+      this.nativeRecord(`evaluation-consent:${plan.scopeHash}`, 4096).value,
+    );
+    if (
+      consent.scopeHash !== plan.scopeHash ||
+      Date.parse(consent.expiresAt) <= Date.parse(this.now())
+    )
+      throw Error('Combined evaluation consent changed.');
+    if (
+      hashCanonical(fields) !== plan.scopeHash ||
+      hashCanonical(plan.run.policy) !== hashCanonical(manifest.run.policy) ||
+      hashCanonical(plan.origin) !== hashCanonical(origin) ||
+      hashCanonical(plan.context) !==
+        hashCanonical({ title: task.title, outcome: task.outcome, criteria: task.criteria }) ||
+      hashCanonical(plan.definition) !==
+        hashCanonical(
+          this.combinedDefinition(group, 'final-check', candidate, hashCanonical(origin)),
+        ) ||
+      hashCanonical(plan.reviewer.profile) !== hashCanonical(profile.facts) ||
+      hashCanonical(plan.reviewer.client) !== hashCanonical(profile.client) ||
+      plan.reviewer.locationHash !== profile.locationHash ||
+      !profile.facts.available ||
+      !profile.environment ||
+      Date.parse(plan.expiresAt) <= Date.parse(this.now()) ||
+      this.store
+        .intents()
+        .some(
+          (intent) =>
+            [
+              group.run_id,
+              ...this.store.combinedMembers(group.run_id).map((member) => member.run_id),
+            ].includes(intent.run_id) &&
+            intent.state !== 'stopped' &&
+            intent.attempt_id !== ownedAttemptId,
+        )
+    )
+      throw Error('Combined evaluation authority changed.');
+    for (const grant of plan.grants)
+      if (
+        grant.taskId !== task.id ||
+        grant.revoked ||
+        grant.usesRemaining !== 1 ||
+        Date.parse(grant.expiresAt) <= Date.parse(this.now())
+      )
+        throw Error('Combined grants changed.');
+    return { plan, group, manifest, task, candidate, origin, environment: profile.environment };
+  }
+
+  private prepareCombinedEvaluation(
+    command: Extract<Command, { command: 'PrepareCandidateEvaluation' }>,
+    group: CombinedGroup,
+  ): CommandResult {
+    const { manifest, task } = this.combinedCurrent(group);
+    if (
+      group.phase !== 'awaiting-evaluation' ||
+      this.store.receipt(`evaluation-started:${group.run_id}`)
+    )
+      return { outcome: 'blocked', reason: 'combined-evaluation-unavailable' };
+    const candidate = CandidateSchema.parse(
+      this.store.get<Candidate>('candidate', command.payload.candidateId),
+    );
+    const origin = this.combinedOrigin(group, candidate);
+    const selected = command.payload.reviewer;
+    const frozen = manifest.input.reviewer;
+    if (
+      command.payload.checkRecipeId !== 'project-node-tests-v1' ||
+      hashCanonical(command.payload.testFiles) !== hashCanonical(manifest.input.checks.testFiles) ||
+      selected.profileId !== frozen.profileId ||
+      selected.methodId !== 'keep-it-simple' ||
+      selected.cycles !== 1 ||
+      command.payload.creditPolicy !== frozen.creditPolicy
+    )
+      return { outcome: 'blocked', reason: 'combined-frozen-evaluation-required' };
+    const grants = command.payload.grants;
+    const expected = [
+      { action: 'run-check', target: 'node --test' },
+      {
+        action: 'run-review',
+        target: formatReviewTarget({ methodId: 'keep-it-simple', cycle: 1 }),
+      },
+    ];
+    if (
+      grants.some(
+        (grant) =>
+          grant.taskId !== task.id ||
+          grant.revoked ||
+          grant.usesRemaining !== 1 ||
+          Date.parse(grant.expiresAt) <= Date.parse(this.now()) ||
+          this.store.receipt(this.grantKey(grant)),
+      ) ||
+      expected.some(
+        (value) =>
+          grants.filter((grant) => grant.action === value.action && grant.target === value.target)
+            .length !== 1,
+      )
+    )
+      return { outcome: 'blocked', reason: 'combined-exact-evaluation-grants-required' };
+    const profile = this.profileFor(frozen.profileId);
+    if (
+      !profile.facts.available ||
+      !profile.client ||
+      !profile.locationHash ||
+      !profile.environment ||
+      hashCanonical(profile.facts) !== hashCanonical(manifest.reviewer.profile) ||
+      hashCanonical(profile.client) !== hashCanonical(manifest.reviewer.client) ||
+      profile.locationHash !== manifest.reviewer.locationHash
+    )
+      return { outcome: 'blocked', reason: 'combined-reviewer-changed' };
+    const fields = {
+      run: manifest.run,
+      candidate,
+      origin,
+      context: { title: task.title, outcome: task.outcome, criteria: task.criteria },
+      definition: this.combinedDefinition(group, 'final-check', candidate, hashCanonical(origin)),
+      reviewer: {
+        ...selected,
+        role: 'reviewer' as const,
+        profile: profile.facts,
+        client: profile.client,
+        locationHash: profile.locationHash,
+      },
+      creditPolicy: frozen.creditPolicy,
+      grants,
+      remaining: this.remaining(manifest.run),
+      maximumCheckMinutes: 1 as const,
+    };
+    const scopeHash = hashCanonical(fields);
+    let expiresAt = Math.min(...grants.map((grant) => Date.parse(grant.expiresAt)));
+    const saved = this.store.receipt(`evaluation-consent:${scopeHash}`);
+    if (saved)
+      expiresAt = Math.min(
+        expiresAt,
+        Date.parse(
+          EvaluationConsentSchema.parse(
+            this.nativeRecord(`evaluation-consent:${scopeHash}`, 4096).value,
+          ).expiresAt,
+        ),
+      );
+    else if (command.payload.consent !== 'explicit')
+      return { outcome: 'blocked', reason: 'combined-consent-required' };
+    if (expiresAt <= Date.parse(this.now()))
+      return { outcome: 'blocked', reason: 'combined-consent-expired' };
+    const plan = CombinedEvaluationSchema.parse({
+      ...fields,
+      scopeHash,
+      expiresAt: new Date(expiresAt).toISOString(),
+    });
+    if (Buffer.byteLength(canonicalJson(plan)) > MAX_FRAME_BYTES)
+      throw Error('Combined evaluation exceeds its bound.');
+    const artifact = this.nativeArtifact(plan);
+    for (const key of [`evaluation-plan:${artifact.id}`, `evaluation-ready:${group.run_id}`])
+      this.store.saveReceipt(key, artifact.hash, 'local-owner', {
+        outcome: 'applied',
+        entity: artifact,
+      });
+    if (!saved) {
+      const consent = this.nativeArtifact({ scopeHash, expiresAt: plan.expiresAt });
+      this.store.saveReceipt(`evaluation-consent:${scopeHash}`, scopeHash, 'local-owner', {
+        outcome: 'applied',
+        entity: consent,
+      });
+    }
+    const updated = this.updateTask(task, {
+      next: 'Start the frozen full combined checks. Review remains a separate action.',
+    });
+    return { outcome: 'applied', entity: artifact, revision: updated.revision };
+  }
+
+  private startCombinedEvaluation(
+    command: Extract<Command, { command: 'StartCandidateEvaluation' }>,
+    effects: (() => void)[],
+    group: CombinedGroup,
+  ): CommandResult {
+    const artifact = ArtifactSchema.parse(
+      this.store.get<Artifact>('artifact', command.payload.preparationId),
+    );
+    const { plan, task, candidate } = this.combinedEvaluationAuthority(artifact);
+    if (
+      group.phase !== 'awaiting-evaluation' ||
+      plan.run.taskId !== command.payload.taskId ||
+      candidate.id !== command.payload.candidateId ||
+      this.store.receipt(`evaluation-started:${group.run_id}`) ||
+      plan.grants.some((grant) => this.store.receipt(this.grantKey(grant)))
+    )
+      return { outcome: 'blocked', reason: 'combined-evaluation-unavailable' };
+    const passed = this.combinedCheck(
+      group,
+      'final-check',
+      candidate,
+      effects,
+      hashCanonical(plan.origin),
+    );
+    const slot = this.store
+      .combinedDispatches(group.run_id)
+      .find((slot) => slot.phase === 'final-check') as CombinedDispatch;
+    this.store.saveReceipt(`evaluation-started:${group.run_id}`, artifact.hash, 'local-owner', {
+      outcome: 'applied',
+      entity: artifact,
+    });
+    this.store.saveReceipt(`evaluation-check:${slot.attempt_id}`, artifact.hash, 'local-owner', {
+      outcome: 'applied',
+      entity: artifact,
+    });
+    this.consumeGrant(plan.run, plan.grants.find((grant) => grant.action === 'run-check') as Grant);
+    this.updateCombined(group, 'checking');
+    const updated = this.updateTask(task, {
+      state: 'checking',
+      waitingReason: null,
+      next: 'Running the full combined collection and interaction checks.',
+    });
+    effects.push(() => {
+      void passed
+        .then((pass) => {
+          if (!pass || this.closed) return;
+          this.store.transaction(() => {
+            const current = this.combinedCurrent(group).group;
+            if (current.phase !== 'checking') return;
+            const verified = this.combinedChecked(
+              group,
+              'final-check',
+              candidate,
+              hashCanonical(plan.origin),
+            );
+            const check = ArtifactSchema.parse(
+              this.store.get<Artifact>('artifact', verified.check.artifactId),
+            );
+            this.store.saveReceipt(
+              `evaluation-result:${artifact.id}`,
+              artifact.hash,
+              'local-owner',
+              { outcome: 'applied', entity: check },
+            );
+            this.updateCombined(group, 'awaiting-review');
+            this.updateTask(this.store.get<Task>('task', group.task_id) as Task, {
+              state: 'stopped',
+              waitingReason: null,
+              next: 'Full checks passed. Start the independent combined review.',
+            });
+          });
+        })
+        .catch(() => {});
+    });
+    return { outcome: 'applied', entity: artifact, revision: updated.revision };
+  }
+
+  private combinedReviewAuthority(artifact: Artifact, ownedAttemptId?: string) {
+    const prepared = this.combinedEvaluationAuthority(artifact, ownedAttemptId);
+    const { plan, group } = prepared;
+    if (
+      !['awaiting-review', 'reviewing'].includes(group.phase) &&
+      !(ownedAttemptId && group.phase === 'paused' && group.paused_phase === 'reviewing')
+    )
+      throw Error('Full combined checks are required.');
+    const proof = this.combinedChecked(
+      group,
+      'final-check',
+      plan.candidate,
+      hashCanonical(plan.origin),
+    );
+    const checkArtifact = ArtifactSchema.parse(
+      this.store.get<Artifact>('artifact', proof.check.artifactId),
+    );
+    const grant = plan.grants.find((grant) => grant.action === 'run-review') as Grant;
+    const consumed = this.store.receipt(this.grantKey(grant));
+    if (
+      (!ownedAttemptId && consumed) ||
+      (ownedAttemptId && consumed?.hash !== hashCanonical(grant))
+    )
+      throw Error('The combined review grant changed.');
+    return { ...prepared, checkArtifact, grant };
+  }
+
+  private startCombinedReview(
+    command: Extract<Command, { command: 'StartCandidateReview' }>,
+    effects: (() => void)[],
+    group: CombinedGroup,
+  ): CommandResult {
+    const artifact = ArtifactSchema.parse(
+      this.store.get<Artifact>('artifact', command.payload.preparationId),
+    );
+    const prepared = this.combinedReviewAuthority(artifact);
+    const { plan, manifest, candidate, task } = prepared;
+    if (
+      group.phase !== 'awaiting-review' ||
+      plan.run.taskId !== command.payload.taskId ||
+      candidate.id !== command.payload.candidateId ||
+      this.store.receipt(`native-review-started:${group.run_id}`)
+    )
+      return { outcome: 'blocked', reason: 'combined-review-unavailable' };
+    const slot = this.store
+      .combinedDispatches(group.run_id)
+      .find((slot) => slot.phase === 'review') as CombinedDispatch;
+    const route = manifest.reviewer.route;
+    const prototype = NativeHistoricalPreparationSchema.parse(
+      this.nativeRecord(`native-run:${manifest.members[0].run.id}`).value,
+    ).appointment;
+    const decision = this.nativeDecision(
+      {
+        ...prototype,
+        route,
+        creditPolicy: plan.creditPolicy,
+        maximumTaskMs: slot.maximum_minutes * 60000,
+        expiresAt: plan.expiresAt,
+      },
+      plan.run,
+      true,
+    );
+    if (!decision.chosen || decision.chosen !== route.id)
+      return { outcome: 'blocked', reason: 'combined-review-allowance-unavailable' };
+    const attempt = this.jobAttempt(plan.run, route.id);
+    const job = CombinedNativeReviewJobSchema.parse({
+      taskId: group.task_id,
+      runId: group.run_id,
+      attemptId: attempt.id,
+      generation: attempt.generation,
+      routeId: route.id,
+      candidateId: candidate.id,
+      candidateHash: candidate.hash,
+      methodId: 'keep-it-simple',
+      cycle: 1,
+      limitMinutes: slot.maximum_minutes,
+      scripted: false,
+      preparationId: artifact.id,
+      profileId: 'openai-file-v1',
+      assignedRole: 'reviewer',
+      independence: 'process-only',
+      origin: plan.origin,
+    });
+    const source = committedFiles(this.projectPath(task.projectId) as string, plan.run.source.base);
+    const files = this.evidence.read(candidate).files;
+    const paths = [
+      ...new Set([...source.map((file) => file.path), ...files.map((file) => file.path)]),
+    ].sort();
+    const encode = (file: FileContent | undefined) =>
+      file
+        ? {
+            mode: file.mode,
+            hash: file.hash,
+            content: new TextDecoder('utf-8', { fatal: true }).decode(file.content),
+          }
+        : null;
+    const input = reviewPlan({
+      binding: { ...job, scopeHash: plan.scopeHash },
+      directory: join(this.home, 'native-review', attempt.id),
+      model: route.model as ReviewPlan['model'],
+      effort: route.effort.requested as ReviewPlan['effort'],
+      creditPolicy: plan.creditPolicy,
+      repository: {
+        version: 1,
+        sourceBase: plan.run.source.base,
+        sourceManifestHash: plan.origin.sourceManifestHash,
+        candidateManifestHash: candidate.hash,
+        changes: paths.flatMap((path) => {
+          const original = source.find((file) => file.path === path),
+            current = files.find((file) => file.path === path);
+          return original?.hash === current?.hash && original?.mode === current?.mode
+            ? []
+            : [{ path, original: encode(original), candidate: encode(current) }];
+        }),
+      },
+      context: plan.context,
+    });
+    const minutes = this.admitJob(
+      plan.run,
+      attempt,
+      input.directory,
+      slot.maximum_minutes,
+      'review',
+    );
+    const identity = this.nativeReviewIdentity(plan, job, prepared.checkArtifact);
+    const record = this.nativeArtifact({
+      preparation: artifact,
+      job,
+      input,
+      check: prepared.checkArtifact,
+      identity,
+    });
+    this.store.saveReceipt(`native-review-started:${group.run_id}`, artifact.hash, 'local-owner', {
+      outcome: 'applied',
+      entity: record,
+    });
+    this.store.saveReceipt(`native-review-input:${attempt.id}`, record.hash, 'local-owner', {
+      outcome: 'applied',
+      entity: record,
+    });
+    this.store.db
+      .prepare('INSERT INTO review_jobs(attempt_id,candidate_id,body) VALUES (?,?,?)')
+      .run(attempt.id, candidate.id, canonicalJson(job));
+    this.consumeGrant(plan.run, prepared.grant);
+    this.updateCombined(group, 'reviewing');
+    const updated = this.updateTask(task, {
+      state: 'checking',
+      waitingReason: null,
+      next: 'Reviewing the complete combined diff in a fresh process.',
+    });
+    effects.push(() =>
+      this.launchCandidateReview(
+        artifact,
+        freezeNative(job),
+        freezeNative(input),
+        attempt,
+        minutes,
+        prepared.environment,
+        identity,
+      ),
+    );
+    return { outcome: 'applied', entity: record, revision: updated.revision };
+  }
+
+  private combinedPublicationEvidence(group: CombinedGroup, candidate: Candidate, paused = false) {
+    const key = `combined-publication:${group.run_id}:${candidate.id}:${candidate.hash}`;
+    const cached = this.projectionCache?.get(key) as
+      | {
+          origin: CombinedOrigin;
+          plan: z.infer<typeof CombinedEvaluationSchema>;
+          attempt: Attempt;
+          review: CheckResult;
+        }
+      | undefined;
+    if (cached) return cached;
+    const origin = this.combinedOrigin(group, candidate);
+    const manifest = this.combinedManifest(group);
+    const artifact = ArtifactSchema.parse(
+      this.store.receipt(`evaluation-started:${group.run_id}`)?.result.entity,
+    );
+    const plan = this.combinedEvaluationPlan(artifact);
+    const proof = this.combinedChecked(group, 'final-check', candidate, hashCanonical(origin));
+    const slot = this.store
+      .combinedDispatches(group.run_id)
+      .find((slot) => slot.phase === 'review') as CombinedDispatch;
+    const attempt = AttemptSchema.parse(
+      this.store.get<Attempt>('attempt', slot.attempt_id as string),
+    );
+    const saved = z
+      .strictObject({
+        preparation: ArtifactSchema,
+        job: CombinedNativeReviewJobSchema,
+        input: z.unknown(),
+        check: ArtifactSchema,
+        identity: z.strictObject({ evaluator: z.string(), definitionHash: HashSchema }),
+      })
+      .parse(this.nativeRecord(`native-review-started:${group.run_id}`).value);
+    const job = saved.job;
+    const input = reviewPlan(saved.input as Parameters<typeof reviewPlan>[0]);
+    const identity = this.nativeReviewIdentity(plan, job, saved.check);
+    const submission = z
+      .strictObject({
+        attemptId: AttemptSchema.shape.id,
+        preparationHash: HashSchema,
+        bindingHash: HashSchema,
+      })
+      .parse(
+        this.nativeRecord(`native-review-submission:${attempt.id}`, 4096, 'outcome-unknown').value,
+      );
+    const completed = z
+      .object({ attemptId: AttemptSchema.shape.id, reason: z.null(), quiescent: z.literal(true) })
+      .parse(this.nativeRecord(`native-review-completion:${attempt.id}`, 4096).value);
+    const result = z
+      .object({
+        review: z.unknown(),
+        model: z.string(),
+        requestedEffort: z.string(),
+        qualified: z.literal(false),
+        threadId: z.string().min(1),
+        turnId: z.string().min(1),
+        observedRetries: z.number().int().nonnegative(),
+      })
+      .parse(this.nativeRecord(`native-review-result:${attempt.id}`).value);
+    const stored = this.store.db
+      .prepare('SELECT body FROM review_jobs WHERE attempt_id=?')
+      .get(attempt.id);
+    const grant = plan.grants.find((grant) => grant.action === 'run-review') as Grant;
+    const checkGrant = plan.grants.find((grant) => grant.action === 'run-check') as Grant;
+    const reviews = this.store.db
+      .prepare("SELECT body FROM evidence WHERE candidate_id=? AND kind='review'")
+      .all(candidate.id)
+      .map((row) => CheckResultSchema.parse(JSON.parse(row.body as string)));
+    const review = reviews.find(
+      (review) =>
+        review.passed &&
+        review.review?.outcome === 'passed' &&
+        hashCanonical(review.review.job) === hashCanonical(job) &&
+        review.definitionHash === identity.definitionHash &&
+        review.evaluator === identity.evaluator,
+    );
+    const { scopeHash: _scopeHash, expiresAt: _expiresAt, ...fields } = plan;
+    if (
+      hashCanonical(fields) !== plan.scopeHash ||
+      hashCanonical(plan.run) !== hashCanonical(manifest.run) ||
+      hashCanonical(plan.context) !==
+        hashCanonical({
+          title: manifest.task.title,
+          outcome: manifest.task.outcome,
+          criteria: manifest.task.criteria,
+        }) ||
+      hashCanonical(plan.definition) !== hashCanonical(proof.definition) ||
+      hashCanonical(plan.reviewer.profile) !== hashCanonical(manifest.reviewer.profile) ||
+      hashCanonical(plan.reviewer.client) !== hashCanonical(manifest.reviewer.client) ||
+      plan.reviewer.locationHash !== manifest.reviewer.locationHash ||
+      plan.creditPolicy !== manifest.input.reviewer.creditPolicy ||
+      job.preparationId !== artifact.id ||
+      job.attemptId !== attempt.id ||
+      job.routeId !== manifest.reviewer.route.id ||
+      job.limitMinutes !== slot.maximum_minutes ||
+      hashCanonical(saved.preparation) !== hashCanonical(artifact) ||
+      this.store.receipt(`native-review-started:${group.run_id}`)?.hash !== artifact.hash ||
+      this.store.receipt(`native-review-submission:${attempt.id}`)?.hash !== artifact.hash ||
+      this.store.receipt(`evaluation-result:${artifact.id}`)?.hash !== artifact.hash ||
+      hashCanonical(this.store.receipt(`evaluation-result:${artifact.id}`)?.result.entity) !==
+        hashCanonical(saved.check) ||
+      grant.action !== 'run-review' ||
+      grant.taskId !== group.task_id ||
+      grant.target !== formatReviewTarget({ methodId: 'keep-it-simple', cycle: 1 }) ||
+      checkGrant.taskId !== group.task_id ||
+      checkGrant.target !== 'node --test'
+    )
+      throw Error('Combined final preparation changed.');
+    if (
+      !review ||
+      (!['reviewing', 'ready', 'accepted'].includes(group.phase) &&
+        !(
+          paused &&
+          group.phase === 'paused' &&
+          ['reviewing', 'ready'].includes(group.paused_phase ?? '')
+        )) ||
+      this.store.receipt(this.grantKey(checkGrant))?.hash !== hashCanonical(checkGrant) ||
+      !stored ||
+      slot.state !== 'passed' ||
+      attempt.state !== 'stopped' ||
+      attempt.runId !== group.run_id ||
+      attempt.routeId !== job.routeId ||
+      attempt.generation !== job.generation ||
+      !this.store.nativePhasesComplete(attempt.id, 'openai') ||
+      this.store.intents().find((intent) => intent.attempt_id === attempt.id)?.state !==
+        'stopped' ||
+      completed.attemptId !== attempt.id ||
+      submission.attemptId !== attempt.id ||
+      submission.preparationHash !== artifact.hash ||
+      submission.bindingHash !== hashCanonical(input.binding) ||
+      saved.preparation.hash !== artifact.hash ||
+      saved.check.id !== proof.check.artifactId ||
+      hashCanonical(saved.identity) !== hashCanonical(identity) ||
+      hashCanonical(plan.origin) !== hashCanonical(origin) ||
+      hashCanonical(job.origin) !== hashCanonical(origin) ||
+      hashCanonical(JSON.parse(stored.body as string)) !== hashCanonical(job) ||
+      hashCanonical(input.binding) !== hashCanonical({ ...job, scopeHash: plan.scopeHash }) ||
+      hashCanonical(input.context) !== hashCanonical(plan.context) ||
+      input.model !== plan.reviewer.profile.model ||
+      plan.reviewer.profile.family !== 'openai' ||
+      input.effort !== plan.reviewer.profile.effort ||
+      result.model !== input.model ||
+      result.requestedEffort !== input.effort ||
+      hashCanonical(result.review) !==
+        hashCanonical({
+          version: 1,
+          bindingHash: hashCanonical(input.binding),
+          methodId: job.methodId,
+          cycle: job.cycle,
+          outcome: review.review?.outcome,
+          findings: review.review?.findings,
+          summary: review.review?.summary,
+        }) ||
+      this.store.receipt(this.grantKey(grant))?.hash !== hashCanonical(grant)
+    )
+      throw Error('Combined final evidence is incomplete.');
+    const resultArtifact = ArtifactSchema.parse(
+      this.store.get<Artifact>('artifact', review.artifactId),
+    );
+    const startedArtifact = ArtifactSchema.parse(
+      this.store.receipt(`native-review-started:${group.run_id}`)?.result.entity,
+    );
+    if (
+      review.candidateId !== candidate.id ||
+      review.candidateHash !== candidate.hash ||
+      resultArtifact.bytes > MAX_FRAME_BYTES ||
+      hashCanonical(JSON.parse(this.artifacts.read(resultArtifact.hash).toString('utf8'))) !==
+        hashCanonical(review.review) ||
+      this.store.receipt(`native-review-input:${attempt.id}`)?.hash !== startedArtifact.hash ||
+      this.store.receipt(`native-review-input:${attempt.id}`)?.result.outcome !== 'applied'
+    )
+      throw Error('Combined retained review changed.');
+    const barrier = { origin, plan, attempt, review };
+    this.projectionCache?.set(key, barrier);
+    return barrier;
+  }
+
   private evaluationOrigin(taskId: string, candidateId: string, ownedAttemptId?: string) {
     const task = this.store.get<Task>('task', taskId);
     const run = task?.runId ? this.store.get<Run>('run', task.runId) : undefined;
@@ -6109,7 +8498,7 @@ export class Controller {
           plan.public.context.outcome !== task.outcome)) ||
       hashCanonical(inspectSource(task.projectId, this.projectPath(task.projectId) as string)) !==
         hashCanonical(run.source) ||
-      this.evidence.hash(run.source.base, readFiles(this.writerScratch(run))) !== candidate.hash
+      !this.candidateCurrent(run, candidate)
     )
       throw Error('Evaluation origin or saved context changed.');
     return { task, run, writer, candidate, native: plan };
@@ -6297,6 +8686,9 @@ export class Controller {
     command: Extract<Command, { command: 'PrepareCandidateEvaluation' }>,
     verification?: PreparedVerification,
   ): CommandResult {
+    const group = this.store.combinedGroup(command.payload.taskId);
+    if (group?.task_id === command.payload.taskId)
+      return this.prepareCombinedEvaluation(command, group);
     let plan: z.infer<typeof CandidateEvaluationSchema>;
     let scopeHash: string;
     try {
@@ -6543,6 +8935,133 @@ export class Controller {
     }
   }
 
+  private combinedEvaluationPreview(
+    group: CombinedGroup,
+    artifact: Artifact,
+  ): CandidateEvaluationPreview {
+    const plan = this.combinedEvaluationPlan(artifact);
+    const manifest = this.combinedManifest(group);
+    const slots = this.store.combinedDispatches(group.run_id);
+    const check = this.checks(plan.candidate).find(
+      (check) => check.artifactId === slots[5].check_artifact_id,
+    );
+    const review = this.store.db
+      .prepare("SELECT body FROM evidence WHERE candidate_id=? AND kind='review'")
+      .all(plan.candidate.id)
+      .map((row) => CheckResultSchema.parse(JSON.parse(row.body as string)))
+      .find((review) => review.review?.job.attemptId === slots[6].attempt_id);
+    const availability = (reviewing: boolean): CandidateEvaluationPreview['checkStart'] => {
+      try {
+        if (
+          this.store.receipt(
+            `${reviewing ? 'native-review-started' : 'evaluation-started'}:${group.run_id}`,
+          )
+        )
+          return { available: false, reason: 'already-started' };
+        if (reviewing) this.combinedReviewAuthority(artifact);
+        else this.combinedEvaluationAuthority(artifact);
+        const slot = slots[reviewing ? 6 : 5];
+        if (
+          slot.state !== 'reserved' ||
+          !this.remaining(plan.run).concurrency ||
+          this.remaining(plan.run).minutes < slot.maximum_minutes
+        )
+          return { available: false, reason: 'budget-exhausted' };
+        if (!reviewing && plan.grants.some((grant) => this.store.receipt(this.grantKey(grant))))
+          return { available: false, reason: 'grant-unavailable' };
+        return { available: true, reason: 'available' };
+      } catch {
+        return {
+          available: false,
+          reason:
+            group.phase === 'unknown'
+              ? 'ownership-unknown'
+              : group.phase === 'paused'
+                ? 'paused'
+                : reviewing
+                  ? 'checks-required'
+                  : 'preparation-changed',
+        };
+      }
+    };
+    let localAcceptance: CandidateEvaluationPreview['localAcceptance'] = {
+      available: false,
+      reason: 'evidence-incomplete',
+    };
+    try {
+      this.combinedPublicationEvidence(group, plan.candidate);
+      const identity =
+        typeof this.options.identity === 'function'
+          ? this.options.identity()
+          : this.options.identity;
+      if (!identity) localAcceptance = { available: false, reason: 'git-identity-missing' };
+      else {
+        validateIdentity(identity);
+        localAcceptance = { available: true, reason: 'available' };
+      }
+      const publication = this.store.db
+        .prepare('SELECT state FROM publications WHERE candidate_id=?')
+        .get(plan.candidate.id);
+      if (publication)
+        localAcceptance = {
+          available: false,
+          reason: publication.state === 'applied' ? 'accepted' : 'publication-prepared',
+        };
+      else if (
+        this.store.db
+          .prepare("SELECT 1 FROM pending_effects WHERE task_id=? AND state='pending'")
+          .get(group.task_id)
+      )
+        localAcceptance = { available: false, reason: 'approval-pending' };
+    } catch {}
+    return CandidateEvaluationPreviewSchema.parse({
+      taskId: group.task_id,
+      runId: group.run_id,
+      candidateId: plan.candidate.id,
+      candidateHash: plan.candidate.hash,
+      preparationId: artifact.id,
+      recipe: plan.definition.recipeId,
+      testFiles:
+        plan.definition.recipeId === 'project-node-tests-v1' ? plan.definition.collection : [],
+      definitionHash: plan.definition.definitionHash,
+      repository: {
+        sourceBase: manifest.run.source.base,
+        manifestHash: plan.origin.sourceManifestHash,
+        files: manifest.sourceFiles.length,
+        bytes: manifest.sourceFiles.reduce((sum, file) => sum + file.bytes, 0),
+      },
+      reviewer: {
+        profileId: plan.reviewer.profileId,
+        assignedRole: plan.reviewer.role,
+        methodId: plan.reviewer.methodId,
+        cycle: 1,
+        independence: 'process-only',
+      },
+      creditPolicy: plan.creditPolicy,
+      expiresAt: plan.expiresAt,
+      remainingBudgets: this.remaining(plan.run),
+      allowance: { source: 'supplemental-evaluation', localChecks: 1, nativeReviews: 1 },
+      stage: review
+        ? 'reviewed'
+        : group.phase === 'checking'
+          ? 'checking'
+          : group.phase === 'reviewing'
+            ? 'reviewing'
+            : check
+              ? check.passed
+                ? 'awaiting-review'
+                : 'check-failed'
+              : group.phase === 'awaiting-evaluation'
+                ? 'prepared'
+                : 'blocked',
+      check: check ? { artifactId: check.artifactId, passed: check.passed } : null,
+      review: review ? { artifactId: review.artifactId, outcome: review.review?.outcome } : null,
+      checkStart: availability(false),
+      reviewStart: availability(true),
+      localAcceptance,
+    });
+  }
+
   private candidateEvaluations(): CandidateEvaluationPreview[] {
     return this.store.list<Task>('task').flatMap((task) => {
       if (!task.runId) return [];
@@ -6552,6 +9071,8 @@ export class Controller {
       if (!receipt) return [];
       try {
         const artifact = ArtifactSchema.parse(receipt.result.entity);
+        const group = this.store.combinedGroup(task.runId);
+        if (group?.task_id === task.id) return [this.combinedEvaluationPreview(group, artifact)];
         const plan = this.evaluationPlan(artifact);
         if (
           plan.run.taskId !== task.id ||
@@ -6599,6 +9120,7 @@ export class Controller {
               !value.review.job.scripted &&
               value.review.job.preparationId === artifact.id &&
               value.review.job.runId === plan.run.id &&
+              'writerAttemptId' in value.review.job &&
               value.review.job.writerAttemptId === plan.writer.id &&
               value.review.job.writerRouteId === plan.writer.routeId,
           );
@@ -6731,6 +9253,9 @@ export class Controller {
     command: Extract<Command, { command: 'StartCandidateEvaluation' }>,
     effects: (() => void)[],
   ): CommandResult {
+    const group = this.store.combinedGroup(command.payload.taskId);
+    if (group?.task_id === command.payload.taskId)
+      return this.startCombinedEvaluation(command, effects, group);
     let plan: z.infer<typeof CandidateEvaluationSchema>;
     let artifact: Artifact;
     let check: CheckPlan | undefined;
@@ -7793,10 +10318,7 @@ export class Controller {
         hashCanonical(run.source)
       )
         return refused('source-changed');
-      if (
-        this.evidence.hash(run.source.base, readFiles(this.writerScratch(run))) !== candidate.hash
-      )
-        return refused('candidate-changed');
+      if (!this.candidateCurrent(run, candidate)) return refused('candidate-changed');
       this.nativePublicationCurrent(run, candidate);
       const identity =
         typeof this.options.identity === 'function'
@@ -7880,8 +10402,8 @@ export class Controller {
   }
 
   private nativeReviewIdentity(
-    plan: z.infer<typeof CandidateEvaluationSchema>,
-    job: NativeReviewJob,
+    plan: Pick<z.infer<typeof CandidateEvaluationSchema>, 'reviewer' | 'scopeHash'>,
+    job: NativeReviewJob | CombinedNativeReviewJob,
     check: Artifact,
   ) {
     return {
@@ -7953,6 +10475,9 @@ export class Controller {
     command: Extract<Command, { command: 'StartCandidateReview' }>,
     effects: (() => void)[],
   ): CommandResult {
+    const group = this.store.combinedGroup(command.payload.taskId);
+    if (group?.task_id === command.payload.taskId)
+      return this.startCombinedReview(command, effects, group);
     let prepared: ReturnType<Controller['candidateReviewAuthority']>;
     let artifact: Artifact;
     let job: NativeReviewJob;
@@ -8125,7 +10650,10 @@ export class Controller {
 
   private nativeReviewCurrent(runtime: NativeReviewRuntime) {
     const { job, attempt, preparation } = runtime;
-    const prepared = this.candidateReviewAuthority(preparation, attempt.id);
+    const prepared =
+      'origin' in job
+        ? this.combinedReviewAuthority(preparation, attempt.id)
+        : this.candidateReviewAuthority(preparation, attempt.id);
     const current = this.store.get<Attempt>('attempt', attempt.id);
     const lease = this.store.db
       .prepare('SELECT attempt_id,generation FROM writer_leases WHERE task_id=?')
@@ -8152,7 +10680,7 @@ export class Controller {
 
   private launchCandidateReview(
     preparation: Artifact,
-    job: NativeReviewJob,
+    job: NativeReviewJob | CombinedNativeReviewJob,
     input: ReviewPlan,
     attempt: Attempt,
     minutes: number,
@@ -8258,14 +10786,39 @@ export class Controller {
           this.store.transaction(() => {
             const task = this.store.get<Task>('task', job.taskId) as Task;
             let ready = false;
+            if ('origin' in job) {
+              const group = this.store.combinedGroup(job.runId) as CombinedGroup;
+              this.store.db
+                .prepare('UPDATE combined_dispatches SET state=? WHERE parent_run_id=? AND phase=?')
+                .run(
+                  review?.outcome === 'passed' && !runtime.stopped ? 'passed' : 'failed',
+                  group.run_id,
+                  'review',
+                );
+            }
             if (!runtime.stopped && !this.closed && review?.outcome === 'passed') {
               try {
-                this.nativePublicationCurrent(
-                  this.store.get<Run>('run', job.runId) as Run,
-                  this.store.get<Candidate>('candidate', job.candidateId) as Candidate,
-                );
+                if ('origin' in job)
+                  this.combinedPublicationEvidence(
+                    this.store.combinedGroup(job.runId) as CombinedGroup,
+                    this.store.get<Candidate>('candidate', job.candidateId) as Candidate,
+                  );
+                else
+                  this.nativePublicationCurrent(
+                    this.store.get<Run>('run', job.runId) as Run,
+                    this.store.get<Candidate>('candidate', job.candidateId) as Candidate,
+                  );
                 ready = true;
               } catch {}
+            }
+            if ('origin' in job) {
+              const group = this.store.combinedGroup(job.runId) as CombinedGroup;
+              if (!['stopping', 'stopped', 'unknown', 'paused'].includes(group.phase))
+                this.updateCombined(
+                  group,
+                  ready ? 'ready' : 'blocked',
+                  ready ? null : 'review-required',
+                );
             }
             this.updateTask(task, {
               state: ready
@@ -9096,6 +11649,8 @@ export class Controller {
 
   private nativeCurrent(runtime: NativeRuntime) {
     const { appointment, run, attempt } = runtime.binding;
+    const group = this.store.combinedGroup(run.id);
+    if (group) this.combinedCurrent(group, group.phase === 'paused');
     if ('acp' in appointment) {
       const setup = this.store.googleAcpSetup(),
         profile = this.acpResolution();
@@ -10334,13 +12889,78 @@ export class Controller {
     return restore;
   }
 
+  private stopCombined(group: CombinedGroup, effects: (() => void)[]) {
+    this.updateCombined(group, 'stopping');
+    const runs = [
+      group.run_id,
+      ...this.store.combinedMembers(group.run_id).map((member) => member.run_id),
+    ];
+    for (const runId of runs) {
+      const run = this.store.get<Run>('run', runId) as Run;
+      const task = this.store.get<Task>('task', run.taskId) as Task;
+      this.closePendingEffects(task);
+      this.stop(
+        CommandSchema.parse({
+          protocol: 1,
+          key: this.id('cmd'),
+          actor: { id: 'controller', kind: 'controller' },
+          command: 'StopRun',
+          expectedRevision: task.revision,
+          payload: { taskId: task.id, runId },
+        }) as Extract<Command, { command: 'StopRun' }>,
+        effects,
+        true,
+      );
+    }
+    const git = this.combinedOperations.get(group.run_id);
+    if (git) effects.push(git.stop);
+    this.refreshCombinedStop(group);
+    const task = this.store.get<Task>('task', group.task_id) as Task;
+    return { outcome: 'applied' as const, entity: task, revision: task.revision };
+  }
+
+  private refreshCombinedStop(group: CombinedGroup) {
+    const current = this.store.combinedGroup(group.run_id) as CombinedGroup;
+    if (!['stopping', 'unknown'].includes(current.phase)) return;
+    const slots = this.store.combinedDispatches(group.run_id);
+    const intents = this.store
+      .intents()
+      .filter((intent) => slots.some((slot) => slot.attempt_id === intent.attempt_id));
+    const unknown =
+      slots.some((slot) => slot.state === 'unknown') ||
+      this.store.combinedRefIntents(group.run_id).some((intent) => intent.state === 'unknown');
+    const active =
+      intents.some((intent) => intent.state !== 'stopped') || current.integration_active;
+    const phase = unknown ? 'unknown' : active ? 'stopping' : 'stopped';
+    this.updateCombined(current, phase, unknown ? 'ownership-unknown' : null);
+    this.updateTask(this.store.get<Task>('task', group.task_id) as Task, {
+      state: phase,
+      waitingReason: null,
+      next:
+        phase === 'stopped'
+          ? 'All combined owners are stopped. Retained work remains available.'
+          : phase === 'unknown'
+            ? 'Combined ownership is unknown. All admissions remain closed.'
+            : 'Waiting for every combined owner to stop.',
+    });
+  }
+
   private stop(
     command: Extract<Command, { command: 'StopRun' }>,
     effects: (() => void)[],
+    memberStop = false,
   ): CommandResult {
     const task = this.store.get<Task>('task', command.payload.taskId);
     if (!task || task.runId !== command.payload.runId)
       return { outcome: 'blocked', reason: 'run-not-current' };
+    const group = this.store.combinedGroup(command.payload.runId);
+    if (group?.phase === 'accepted')
+      return { outcome: 'applied', entity: task, revision: task.revision };
+    if (group && !memberStop) {
+      if (group.task_id === task.id) return this.stopCombined(group, effects);
+      if (!['stopping', 'stopped', 'unknown', 'accepted'].includes(group.phase))
+        this.updateCombined(group, 'blocked', 'stopped');
+    }
     this.store.db
       .prepare('DELETE FROM receipts WHERE command_key=?')
       .run(`switch:${command.payload.runId}`);
@@ -10511,6 +13131,7 @@ export class Controller {
             if (this.settleJob(attempt, exit.quiescent)) this.stoppedJob(attempt);
           });
         } else if (check) {
+          this.combinedCheckOwners.get(active.attempt_id)?.stop();
           check.stop();
           if (check instanceof ToolchainVerification) return;
           const cancel = (this.options.schedule ?? defaultSchedule)(
@@ -10529,6 +13150,7 @@ export class Controller {
     }
     if (
       (this.store.receipt(`evaluation-check:${active.attempt_id}`) ||
+        this.store.receipt(`combined-check:${active.attempt_id}`) ||
         this.store.receipt(`native-review-input:${active.attempt_id}`)) &&
       active.state === 'intent'
     ) {
@@ -10723,6 +13345,39 @@ export class Controller {
             data: { kind: 'google-acp-setup', setup: next },
           });
       }
+      for (const group of this.store.combinedGroups()) {
+        const journals = this.store.combinedRefIntents(group.run_id);
+        const unresolved = journals.some((row) => {
+          const journal = CombinedRefJournalSchema.parse(JSON.parse(row.body));
+          return (
+            row.state === 'unknown' ||
+            (row.state === 'prepared' &&
+              ((!journal.phases.length && !row.finished_at) ||
+                journal.phases.some((phase) => phase.state !== 'quiescent')))
+          );
+        });
+        if (unresolved || (group.integration_active && !journals.length)) {
+          this.store.db
+            .prepare(
+              "UPDATE combined_ref_intents SET state='unknown' WHERE parent_run_id=? AND state='prepared'",
+            )
+            .run(group.run_id);
+          this.updateCombined(group, 'unknown', 'ownership-unknown');
+        } else if (group.integration_active) {
+          const pending = journals.find((row) => row.state === 'prepared');
+          const elapsed = pending ? Date.parse(this.now()) - Date.parse(pending.intent_at) : 60000;
+          this.store.db
+            .prepare(
+              'UPDATE combined_groups SET integration_active=0,integration_milliseconds=MIN(60000,integration_milliseconds+?) WHERE run_id=?',
+            )
+            .run(
+              Number.isFinite(elapsed) && elapsed >= 0 ? Math.ceil(elapsed) : 60000,
+              group.run_id,
+            );
+          if (pending?.expected_new && ['assembling', 'blocked'].includes(group.phase))
+            this.updateCombined(group, 'assembling');
+        }
+      }
       for (const intent of this.store.intents().filter((value) => value.state !== 'stopped')) {
         if (this.store.runPurpose(intent.run_id) === 'conversation') {
           const config = this.conversationConfiguration(intent.task_id);
@@ -10743,6 +13398,57 @@ export class Controller {
         )
           throw new Error('Persisted writer lineage is invalid.');
         if (this.recoverLocalWriter(intent, attempt, run, task)) continue;
+        const combined = this.store.combinedGroup(run.id);
+        if (combined) {
+          const phases = this.store.nativeProcesses(attempt.id);
+          const key = this.store.receipt(`native-completion:${attempt.id}`)
+            ? `native-completion:${attempt.id}`
+            : `native-review-completion:${attempt.id}`;
+          let quiescent = false;
+          try {
+            const value = this.nativeRecord(key, 4096).value as {
+              attemptId: string;
+              quiescent: boolean;
+            };
+            quiescent =
+              value?.attemptId === attempt.id &&
+              value.quiescent === true &&
+              phases.length > 0 &&
+              phases.every((phase) => phase.state === 'quiescent');
+          } catch {}
+          this.store.put('attempt', attempt.id, attempt.revision + 1, {
+            ...attempt,
+            state: quiescent ? 'stopped' : 'unknown',
+            revision: attempt.revision + 1,
+          });
+          this.store.db
+            .prepare('UPDATE launch_intents SET state=?,finished_at=? WHERE attempt_id=?')
+            .run(
+              quiescent ? 'stopped' : 'outcome-unknown',
+              quiescent ? this.now() : null,
+              attempt.id,
+            );
+          this.store.db
+            .prepare(
+              "UPDATE combined_dispatches SET state=? WHERE parent_run_id=? AND attempt_id=? AND state='running'",
+            )
+            .run(quiescent ? 'stopped' : 'unknown', combined.run_id, attempt.id);
+          if (quiescent) {
+            this.store.db.prepare('DELETE FROM writer_leases WHERE attempt_id=?').run(attempt.id);
+            this.store.db.prepare('DELETE FROM reservations WHERE attempt_id=?').run(attempt.id);
+          }
+          this.updateCombined(
+            combined,
+            quiescent ? 'blocked' : 'unknown',
+            quiescent ? 'stopped' : 'ownership-unknown',
+          );
+          this.updateTask(task, {
+            state: quiescent ? 'interrupted' : 'unknown',
+            waitingReason: null,
+            next: 'Combined work was interrupted. No owner will relaunch automatically.',
+          });
+          continue;
+        }
         const phases = this.store.nativeProcesses(intent.attempt_id);
         const native = phases.length > 0;
         const known = native
@@ -11004,7 +13710,7 @@ export class Controller {
         candidate.taskId !== task.id ||
         candidate.hash !== request.candidateHash ||
         this.latestCandidate(run.id)?.id !== candidate.id ||
-        this.evidence.hash(run.source.base, readFiles(this.writerScratch(run))) !== candidate.hash
+        !this.candidateCurrent(run, candidate)
       )
         return {
           outcome: 'blocked',
@@ -11184,7 +13890,27 @@ export class Controller {
     return { outcome: 'unsupported', reason: 'pending-effect-not-implemented' };
   }
 
+  private candidateCurrent(run: Run, candidate: Candidate): boolean {
+    const group = this.store.combinedGroup(run.id);
+    if (group?.run_id === run.id) {
+      try {
+        this.combinedOrigin(group, candidate);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return (
+      this.evidence.hash(run.source.base, readFiles(this.writerScratch(run))) === candidate.hash
+    );
+  }
+
   private latestCandidate(runId: string): Candidate | undefined {
+    const group = this.store.combinedGroup(runId);
+    if (group?.run_id === runId)
+      return group.final_candidate_id
+        ? this.store.get<Candidate>('candidate', group.final_candidate_id)
+        : undefined;
     for (const intent of this.store
       .intents()
       .filter((value) => value.run_id === runId)
@@ -11261,6 +13987,25 @@ export class Controller {
           entity: captured.candidate,
         });
       this.event('candidate.sealed', task.id, task.revision, captured.candidate);
+      const group = this.store.combinedGroup(run.id);
+      if (group && group.run_id !== run.id) {
+        let passed = false;
+        try {
+          passed =
+            this.evaluationOrigin(task.id, captured.candidate.id).writer.id === attempt.id &&
+            (group.phase === 'paused'
+              ? this.combinedCurrent(group, true).group.paused_phase
+              : this.combinedCurrent(group).group.phase) === 'writers';
+        } catch {}
+        this.store.db
+          .prepare(
+            "UPDATE combined_dispatches SET state=?,candidate_id=? WHERE parent_run_id=? AND attempt_id=? AND state='running'",
+          )
+          .run(passed ? 'passed' : 'failed', captured.candidate.id, group.run_id, attempt.id);
+        if (!passed && !['stopping', 'stopped', 'unknown', 'paused'].includes(group.phase))
+          this.updateCombined(group, 'blocked', 'writers-incomplete');
+        else this.updateCombined(group, group.phase, group.blocker);
+      }
     });
     return captured.candidate;
   }
@@ -11270,6 +14015,7 @@ export class Controller {
     candidate: Candidate,
     plan: Pick<CheckDefinition, 'definitionHash' | 'evaluator'> & {
       recipeId?: CheckDefinition['recipeId'];
+      combined?: z.infer<typeof CombinedCheckContextSchema>;
     },
   ): boolean {
     if (
@@ -11298,12 +14044,14 @@ export class Controller {
         tests: number;
         log: Artifact;
         verification?: { artifact: Artifact; owner: CheckOwner };
+        combined?: unknown;
       };
       if (
         metadata.candidateId !== candidate.id ||
         metadata.candidateHash !== candidate.hash ||
         metadata.definitionHash !== plan.definitionHash ||
         metadata.evaluator !== plan.evaluator ||
+        hashCanonical(metadata.combined ?? null) !== hashCanonical(plan.combined ?? null) ||
         !metadata.passed ||
         !metadata.complete ||
         !metadata.unchanged ||
@@ -11360,7 +14108,13 @@ export class Controller {
     });
   }
 
-  private admitJob(run: Run, attempt: Attempt, directory: string, maximumMinutes?: number) {
+  private admitJob(
+    run: Run,
+    attempt: Attempt,
+    directory: string,
+    maximumMinutes?: number,
+    combinedPhase?: CombinedDispatch['phase'],
+  ) {
     const localRoute = this.store.get<Route>('route', attempt.routeId);
     if (localRoute?.family === 'local' && !localRoute.fake) {
       const blocker = this.store.localStartBlocker();
@@ -11369,6 +14123,19 @@ export class Controller {
     const googleBlocker = this.store.googleStartBlocker(attempt.routeId);
     if (googleBlocker) throw new Error(googleBlocker);
     const remaining = this.remaining(run);
+    const group = this.store.combinedGroup(run.id);
+    if (group) {
+      this.combinedCurrent(group);
+      const slot = this.store
+        .combinedDispatches(group.run_id)
+        .find((slot) => slot.phase === combinedPhase);
+      if (
+        slot?.state !== 'reserved' ||
+        maximumMinutes !== slot.maximum_minutes ||
+        remaining.minutes < slot.maximum_minutes
+      )
+        throw Error('The combined job lacks its reserved allowance.');
+    }
     if (
       remaining.attempts === 0 ||
       remaining.minutes === 0 ||
@@ -11393,6 +14160,8 @@ export class Controller {
         directory,
         this.now(),
       );
+    if (group && combinedPhase)
+      this.store.admitCombinedDispatch(group.run_id, combinedPhase, attempt.id);
     this.store.db
       .prepare(
         "INSERT INTO reservations(attempt_id,route_id,window_id,unit,value,launches,minutes) VALUES (?,?,?,'minutes',0,1,?)",
@@ -11453,6 +14222,17 @@ export class Controller {
         revision: current.revision + 1,
       };
       this.store.put('attempt', attempt.id, updated.revision, updated);
+      const group = this.store.combinedGroup(run.id);
+      if (group) {
+        const stopping = ['stopping', 'stopped'].includes(group.phase);
+        if (!quiescent || stopping)
+          this.store.db
+            .prepare(
+              "UPDATE combined_dispatches SET state=? WHERE parent_run_id=? AND attempt_id=? AND state IN ('running','unknown')",
+            )
+            .run(quiescent ? 'stopped' : 'unknown', group.run_id, attempt.id);
+        if (!quiescent) this.updateCombined(group, 'unknown', 'ownership-unknown');
+      }
       if (quiescent) {
         this.jobCancels.get(attempt.id)?.();
         this.jobCancels.delete(attempt.id);
@@ -11465,6 +14245,7 @@ export class Controller {
         this.store.db.prepare('DELETE FROM reservations WHERE attempt_id=?').run(attempt.id);
         this.event('attempt.stopped', task.id, task.revision, updated);
         afterSettled?.();
+        if (group) this.refreshCombinedStop(group);
       } else {
         this.event('ownership.unknown', task.id, task.revision, updated);
         this.updateTask(task, {
@@ -11763,7 +14544,7 @@ export class Controller {
         cycle: job.cycle,
         routeId: job.routeId,
         policyHash: run.policy.hash,
-        ...(job.writerAttemptId
+        ...('writerAttemptId' in job && job.writerAttemptId
           ? { writerAttemptId: job.writerAttemptId, writerRouteId: job.writerRouteId }
           : {}),
       }),
@@ -11794,7 +14575,7 @@ export class Controller {
       ![role.routeId, ...role.approvedFallbacks].includes(job.routeId)
     )
       return false;
-    if (job.writerAttemptId) {
+    if ('writerAttemptId' in job && job.writerAttemptId) {
       const writer = this.store.get<Attempt>('attempt', job.writerAttemptId);
       if (
         !writer ||
@@ -11927,7 +14708,8 @@ export class Controller {
       job.methodId !== pending.method.id ||
       job.cycle !== pending.cycle ||
       job.candidateHash !== candidate.hash ||
-      (job.writerAttemptId !== undefined &&
+      ('writerAttemptId' in job &&
+        job.writerAttemptId !== undefined &&
         (job.writerAttemptId !== writer.id || job.writerRouteId !== writer.routeId))
     )
       throw new Error('Approved review binding changed.');
@@ -12610,6 +15392,15 @@ export class Controller {
       'candidate',
       command.payload.candidateId,
     ) as Candidate;
+    const group = this.store.combinedGroup(run.id);
+    let combined: ReturnType<Controller['combinedPublicationEvidence']> | undefined;
+    if (group?.run_id === run.id) {
+      try {
+        combined = this.combinedPublicationEvidence(group, candidate);
+      } catch {
+        return { outcome: 'blocked', reason: 'combined-final-evidence-incomplete' };
+      }
+    }
     let native: ReturnType<Controller['nativePublicationEvidence']> | undefined;
     if (this.store.receipt(`native-run:${run.id}`)) {
       try {
@@ -12620,10 +15411,7 @@ export class Controller {
     }
     if (!['ready', 'accepted', 'waiting', ...(native ? ['stopped'] : [])].includes(task.state))
       return { outcome: 'blocked', reason: 'candidate-not-ready' };
-    if (
-      this.hasUncertainWriter(task.id) ||
-      this.evidence.hash(run.source.base, readFiles(this.writerScratch(run))) !== candidate.hash
-    )
+    if (this.hasUncertainWriter(task.id) || !this.candidateCurrent(run, candidate))
       return { outcome: 'blocked', reason: 'candidate-binding-changed' };
     const path = this.projectPath(task.projectId) as string;
     if (hashCanonical(inspectSource(task.projectId, path)) !== hashCanonical(run.source))
@@ -12656,7 +15444,7 @@ export class Controller {
       } catch {
         return { outcome: 'blocked', reason: 'native-evidence-not-current' };
       }
-    } else {
+    } else if (!combined) {
       const plan = this.evidence.prepareChecks({
         candidate,
         sourceFiles: committedFiles(path, run.source.base),
@@ -12696,6 +15484,7 @@ export class Controller {
       )
       .at(-1);
     const writer =
+      combined?.attempt ??
       native?.writer ??
       (writerIntent ? this.store.get<Attempt>('attempt', writerIntent.attempt_id) : undefined);
     if (!writer) return { outcome: 'blocked', reason: 'candidate-origin-missing' };
@@ -12803,12 +15592,13 @@ export class Controller {
           hashCanonical(origin.policy) !== hashCanonical(currentRun.policy) ||
           hashCanonical(origin.source) !== hashCanonical(currentRun.source) ||
           this.latestCandidate(currentRun.id)?.id !== candidate.id ||
-          this.evidence.hash(currentRun.source.base, readFiles(this.writerScratch(currentRun))) !==
-            candidate.hash ||
+          !this.candidateCurrent(currentRun, candidate) ||
           hashCanonical(inspectSource(task.projectId, source)) !== hashCanonical(origin.source)
         )
           throw new Error('Prepared publication authority is no longer current.');
         if (native) this.nativePublicationCurrent(currentRun, candidate, native);
+        const group = this.store.combinedGroup(currentRun.id);
+        if (group?.run_id === currentRun.id) this.combinedPublicationEvidence(group, candidate);
       }
       applyPublication({
         source: this.projectPath(task.projectId) as string,
@@ -12835,6 +15625,8 @@ export class Controller {
                 next: `Accepted to ${publication.destination_ref as string}.`,
               })
             : current;
+        const group = origin ? this.store.combinedGroup(origin.id) : undefined;
+        if (belongs && group?.run_id === origin?.id) this.updateCombined(group, 'accepted');
         if (belongs && current.state !== 'accepted')
           this.event('candidate.accepted', task.id, updated.revision, {
             candidateId,
@@ -12883,6 +15675,27 @@ export class Controller {
     ) as Candidate;
     const grant = this.grant(run, 'export-patch', task.id);
     if (!grant && !approved) {
+      const group = this.store.combinedGroup(run.id);
+      if (group?.run_id === run.id) {
+        this.combinedOrigin(group, candidate);
+        const slot = [...this.store.combinedDispatches(group.run_id)]
+          .reverse()
+          .find(
+            (slot) =>
+              ['review', 'final-check', 'replay-1'].includes(slot.phase) && slot.state === 'passed',
+          );
+        const owner = slot?.attempt_id
+          ? this.store.get<Attempt>('attempt', slot.attempt_id)
+          : undefined;
+        if (!owner || owner.runId !== run.id || owner.state !== 'stopped')
+          return { outcome: 'blocked', reason: 'candidate-origin-missing' };
+        return this.requestAction(task, run, owner, 'export-patch', task.id, {
+          kind: 'export',
+          command,
+          candidateId: candidate.id,
+          candidateHash: candidate.hash,
+        });
+      }
       const writer = this.store
         .intents()
         .filter(

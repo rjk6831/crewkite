@@ -3,6 +3,8 @@ import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import {
   type Attempt,
+  CombinedDispatchPhaseSchema,
+  type CombinedRunPreview,
   CommandIdSchema,
   type CommandResult,
   CommandResultSchema,
@@ -10,7 +12,7 @@ import {
   type Event,
   EventSchema,
   GoogleAcpSetupSchema,
-  NativeReviewJobSchema,
+  ReviewJobSchema,
   type Route,
   type Run,
   type Task,
@@ -57,6 +59,58 @@ export type LaunchIntent = {
   pid: number | null;
   process_group: number | null;
   admitted_at: string | null;
+  finished_at: string | null;
+};
+export type CombinedGroup = {
+  run_id: string;
+  task_id: string;
+  preparation_id: string;
+  manifest_hash: string;
+  revision: number;
+  generation: number;
+  phase: CombinedRunPreview['phase'];
+  blocker: CombinedRunPreview['blocker'];
+  paused_phase: CombinedRunPreview['phase'] | null;
+  integration_ref: string;
+  current_head: string | null;
+  final_candidate_id: string | null;
+  origin_artifact_id: string | null;
+  integration_started_at: string | null;
+  integration_finished_at: string | null;
+  integration_milliseconds: number;
+  integration_active: number;
+};
+export type CombinedMember = {
+  parent_run_id: string;
+  ordinal: number;
+  task_id: string;
+  run_id: string;
+  preparation_id: string;
+  scope_path: string;
+  scope_hash: string;
+  task_hash: string;
+};
+export type CombinedDispatch = {
+  parent_run_id: string;
+  phase: CombinedRunPreview['dispatches'][number]['phase'];
+  maximum_minutes: number;
+  state: CombinedRunPreview['dispatches'][number]['state'];
+  attempt_id: string | null;
+  candidate_id: string | null;
+  check_artifact_id: string | null;
+  definition_hash: string | null;
+};
+export type CombinedRefIntent = {
+  parent_run_id: string;
+  generation: number;
+  operation: string;
+  expected_old: string | null;
+  expected_new: string | null;
+  candidate_id: string | null;
+  check_artifact_id: string | null;
+  state: 'prepared' | 'applied' | 'unknown';
+  body: string;
+  intent_at: string;
   finished_at: string | null;
 };
 
@@ -533,6 +587,67 @@ export class Store {
     return rows;
   }
 
+  combinedGroups(): CombinedGroup[] {
+    return this.db
+      .prepare('SELECT * FROM combined_groups ORDER BY run_id')
+      .all() as CombinedGroup[];
+  }
+
+  combinedGroup(taskOrRunId: string): CombinedGroup | undefined {
+    return this.db
+      .prepare(`SELECT g.* FROM combined_groups g WHERE g.task_id=? OR g.run_id=? OR EXISTS (
+      SELECT 1 FROM combined_members m WHERE m.parent_run_id=g.run_id AND (m.task_id=? OR m.run_id=?)
+    )`)
+      .get(taskOrRunId, taskOrRunId, taskOrRunId, taskOrRunId) as CombinedGroup | undefined;
+  }
+
+  combinedMembers(parentRunId: string): CombinedMember[] {
+    return this.db
+      .prepare('SELECT * FROM combined_members WHERE parent_run_id=? ORDER BY ordinal')
+      .all(parentRunId) as CombinedMember[];
+  }
+
+  combinedDispatches(parentRunId: string): CombinedDispatch[] {
+    const rows = this.db
+      .prepare('SELECT * FROM combined_dispatches WHERE parent_run_id=?')
+      .all(parentRunId) as CombinedDispatch[];
+    return CombinedDispatchPhaseSchema.options.map((phase) => {
+      const row = rows.find((value) => value.phase === phase);
+      if (!row) throw Error('The combined dispatch reservation is incomplete.');
+      return row;
+    });
+  }
+
+  combinedRefIntents(parentRunId: string): CombinedRefIntent[] {
+    return this.db
+      .prepare(
+        'SELECT * FROM combined_ref_intents WHERE parent_run_id=? ORDER BY generation,operation',
+      )
+      .all(parentRunId) as CombinedRefIntent[];
+  }
+
+  admitCombinedDispatch(parentRunId: string, phase: CombinedDispatch['phase'], attemptId: string) {
+    if (!this.transactionEvents) throw Error('Combined admission requires a transaction.');
+    const group = this.combinedGroup(parentRunId);
+    const attempt = this.get<Attempt>('attempt', attemptId);
+    const member = this.combinedMembers(parentRunId).find(
+      (value) => phase === `writer-${value.ordinal}`,
+    );
+    if (
+      !group ||
+      !attempt ||
+      attempt.runId !== (member?.run_id ?? group.run_id) ||
+      ['paused', 'stopping', 'stopped', 'blocked', 'unknown', 'accepted'].includes(group.phase)
+    )
+      throw Error('The combined dispatch has no current owner.');
+    const changed = this.db
+      .prepare(
+        "UPDATE combined_dispatches SET state='running',attempt_id=? WHERE parent_run_id=? AND phase=? AND state='reserved'",
+      )
+      .run(attemptId, parentRunId, phase);
+    if (changed.changes !== 1) throw Error('The combined dispatch slot was already consumed.');
+  }
+
   nativePhasesComplete(attemptId: string, expectedFamily: Route['family']): boolean {
     const attempt = this.get<Attempt>('attempt', attemptId);
     const route = attempt && this.get<Route>('route', attempt.routeId);
@@ -589,9 +704,10 @@ export class Store {
       task.state === 'checking'
         ? this.db.prepare('SELECT body FROM review_jobs WHERE attempt_id=?').get(attemptId)
         : undefined;
-    const job = review ? NativeReviewJobSchema.parse(JSON.parse(review.body as string)) : undefined;
+    const job = review ? ReviewJobSchema.parse(JSON.parse(review.body as string)) : undefined;
     const reviewing =
       job &&
+      !job.scripted &&
       job.taskId === task.id &&
       job.runId === attempt.runId &&
       job.attemptId === attempt.id &&
