@@ -254,6 +254,8 @@ import {
   conversationPlan,
   startConversation,
 } from '../providers/openai/conversation.ts';
+import { OpenAiDiscovery } from '../providers/openai/discovery.ts';
+import { startNativeSession } from '../providers/openai/native-discovery.ts';
 import {
   type NativeProfileResolution,
   unavailableNativeProfile,
@@ -733,6 +735,37 @@ type LocalPrepared = z.infer<typeof LocalPreparedSchema>;
 type EvaluationWriterPreparation =
   | LocalPrepared
   | z.infer<typeof NativeHistoricalPreparationSchema>;
+const ProviderUsageBatchSchema = z.strictObject({
+  mode: z.enum(['partial', 'complete']),
+  observedAt: TimestampSchema,
+  observations: z.array(ObservationSchema).min(1).max(32),
+});
+const ProviderUsageDraftSchema = z.object({
+  complete: z.boolean().optional(),
+  windows: z
+    .array(
+      z.union([
+        z.strictObject(ObservationSchema.shape).omit({ routeId: true, observedAt: true }),
+        z.strictObject({
+          windowId: ObservationSchema.shape.windowId,
+          kind: ObservationSchema.shape.kind,
+          semantics: ObservationSchema.shape.semantics.unwrap(),
+          remainingPercent: z.number().finite().min(0).max(100),
+          resetsAt: TimestampSchema.nullable(),
+        }),
+      ]),
+    )
+    .min(1)
+    .max(32),
+});
+const OpenAiUsageReadSchema = z.strictObject({
+  id: CommandIdSchema,
+  state: z.enum(['intent', 'owned', 'quiescent', 'unknown']),
+  attemptedAt: TimestampSchema,
+  profileHash: HashSchema,
+  groups: z.array(z.number().int().positive().safe()).max(2),
+});
+
 type LocalWriterRuntime = {
   plan: LocalPrepared;
   binding: LocalStart['binding'];
@@ -758,6 +791,8 @@ export type ControllerOptions = {
   nativeProfile?: () => NativeProfileResolution;
   nativeProfiles?: () => NativeProfileResolution[];
   nativeSpawn?: Parameters<typeof startReplacement>[2]['spawn'];
+  openAiUsageClient?: () => NativeProfileResolution;
+  openAiUsageSpawn?: Parameters<typeof startNativeSession>[1]['spawn'];
   googleUsageClient?: () => GoogleUsageClientResolution;
   googleUsageSpawn?: Parameters<typeof startGoogleUsage>[0]['spawn'];
   googleAcp?: AcpDependencies & {
@@ -818,6 +853,12 @@ export class Controller {
   private profiles: NativeProfileResolution[];
   private closing?: Promise<void>;
   private readonly workers = new Map<string, FakeRuntime | NativeRuntime>();
+  private openAiUsageRead?: {
+    id: string;
+    stopped: boolean;
+    handle?: { stop: () => void };
+    done: Promise<void>;
+  };
   private usageResolution: GoogleUsageClientResolution;
   private usageRead?: {
     key: string;
@@ -1231,13 +1272,273 @@ export class Controller {
     });
   }
 
-  refreshGoogleUsage(trigger: 'start' | 'connect'): Promise<CommandResult> | undefined {
+  refreshUsage(trigger: 'start' | 'connect' | 'interval'): Promise<void> {
+    return Promise.allSettled([
+      this.refreshGoogleUsage(trigger),
+      this.refreshOpenAiUsage(trigger),
+    ]).then(() => {});
+  }
+
+  private openAiUsageState() {
+    if (!this.store.receipt('usage-reader:openai')) return null;
+    return OpenAiUsageReadSchema.parse(this.nativeRecord('usage-reader:openai', 4096).value);
+  }
+
+  private saveOpenAiUsage(value: z.infer<typeof OpenAiUsageReadSchema>) {
+    const artifact = this.nativeArtifact(OpenAiUsageReadSchema.parse(value));
+    this.store.db.prepare('DELETE FROM receipts WHERE command_key=?').run('usage-reader:openai');
+    this.store.saveReceipt('usage-reader:openai', artifact.hash, 'local-owner', {
+      outcome: 'applied',
+      entity: artifact,
+    });
+  }
+
+  private openAiUsageBlocker(routeId: string) {
+    const route = this.store.get<Route>('route', routeId);
+    if (route?.family !== 'openai' || route.fake) return;
+    try {
+      const state = this.openAiUsageState();
+      if (state?.state === 'unknown') return 'openai-metadata-ownership-unknown';
+      if (state && state.state !== 'quiescent') return 'openai-metadata-ownership-pending';
+    } catch {
+      return 'openai-metadata-ownership-unknown';
+    }
+  }
+
+  private refreshOpenAiUsage(trigger: 'start' | 'connect' | 'interval'): Promise<void> | undefined {
+    try {
+      if (this.closed || !this.options.openAiUsageClient) return;
+      if (this.openAiUsageRead) return this.openAiUsageRead.done;
+      const profile = this.options.openAiUsageClient();
+      if (
+        !profile.facts.available ||
+        profile.facts.family !== 'openai' ||
+        !profile.client ||
+        !profile.environment ||
+        !profile.locationHash
+      )
+        return;
+      const client = profile.client;
+      const environment = profile.environment;
+      const profileHash = hashCanonical({
+        facts: profile.facts,
+        client: profile.client,
+        locationHash: profile.locationHash,
+      });
+      const attemptedAt = this.now();
+      const previous = this.openAiUsageState();
+      if (
+        previous &&
+        (previous.state !== 'quiescent' ||
+          Date.parse(attemptedAt) - Date.parse(previous.attemptedAt) <
+            (trigger === 'interval' ? 270000 : 60000))
+      )
+        return;
+      if (
+        this.store.intents().some((intent) => {
+          if (intent.state === 'stopped') return false;
+          const route = this.store.get<Route>('route', intent.route_id);
+          return !route || (route.family === 'openai' && !route.fake);
+        })
+      )
+        return;
+      const readerRoute = this.store.transaction(() => {
+        const receipt = this.store.receipt('usage-route:openai');
+        if (receipt) {
+          const route = RouteSchema.parse(this.nativeRecord('usage-route:openai', 4096).value);
+          if (
+            hashCanonical(this.store.get<Route>('route', route.id)) !== hashCanonical(route) ||
+            route.family !== 'openai' ||
+            route.fake ||
+            route.qualified
+          )
+            throw Error('usage-route-changed');
+          return route;
+        } else {
+          const route = RouteSchema.parse({
+            id: this.id('rte'),
+            family: 'openai',
+            displayName: 'OpenAI usage reader',
+            model: 'unknown',
+            effort: { requested: 'unknown', effective: 'unknown', supported: [] },
+            billing: 'included',
+            qualified: false,
+            fake: false,
+          });
+          this.store.put('route', route.id, 0, route);
+          const artifact = this.nativeArtifact(route);
+          this.store.saveReceipt('usage-route:openai', artifact.hash, 'local-owner', {
+            outcome: 'applied',
+            entity: artifact,
+          });
+          return route;
+        }
+      });
+      if (trigger === 'connect') {
+        const windows = this.store
+          .list<Observation>('window')
+          .filter((value) => value.routeId === readerRoute.id && value.source === 'client');
+        if (
+          windows.length &&
+          windows.every(
+            (value) =>
+              value.confidence === 'reported' &&
+              value.remaining !== null &&
+              deriveWindow(value, { nowMs: Date.parse(attemptedAt), maxAgeMs: 300000 }).state ===
+                'fresh',
+          )
+        )
+          return;
+      }
+      const state = OpenAiUsageReadSchema.parse({
+        id: this.id('cmd'),
+        state: 'intent',
+        attemptedAt,
+        profileHash,
+        groups: [],
+      });
+      this.store.transaction(() => this.saveOpenAiUsage(state));
+      const completion = Promise.withResolvers<void>();
+      const runtime = {
+        id: state.id,
+        stopped: false,
+        done: completion.promise,
+        handle: undefined as { stop: () => void } | undefined,
+      };
+      this.openAiUsageRead = runtime;
+      void (async () => {
+        let invoked = false;
+        const reports: { value: unknown; prior: ReadonlyMap<string, Observation> }[] = [];
+        let reportBytes = 0;
+        const current = () => {
+          const saved = this.openAiUsageState();
+          const currentProfile = this.options.openAiUsageClient?.();
+          if (
+            this.closed ||
+            runtime.stopped ||
+            this.openAiUsageRead !== runtime ||
+            saved?.id !== state.id ||
+            saved.profileHash !== state.profileHash ||
+            saved.attemptedAt !== state.attemptedAt ||
+            hashCanonical(saved.groups) !== hashCanonical(state.groups) ||
+            !['intent', 'owned'].includes(saved.state) ||
+            !currentProfile ||
+            hashCanonical({
+              facts: currentProfile.facts,
+              client: currentProfile.client,
+              locationHash: currentProfile.locationHash,
+            }) !== profileHash ||
+            hashCanonical(this.store.get<Route>('route', readerRoute.id)) !==
+              hashCanonical(readerRoute)
+          )
+            throw Error('usage-read-revoked');
+        };
+        try {
+          current();
+          const directory = mkdtempSync(join(this.home, 'openai-usage-'));
+          const onUsage = this.providerUsageAdapter(readerRoute.id, (value, prior) => {
+            current();
+            const bytes = Buffer.byteLength(canonicalJson({ value, prior: [...prior.values()] }));
+            if (reports.length >= 32 || reportBytes + bytes > 32768) return false;
+            reports.push({ value, prior: new Map(prior) });
+            reportBytes += bytes;
+            return true;
+          });
+          const options = {
+            timeoutMs: 20000,
+            schedule: this.options.schedule,
+            spawn: this.options.openAiUsageSpawn,
+            lifecycle: {
+              beforePhase: () => current(),
+              owned: (_phase: unknown, group: number) => {
+                this.store.transaction(() => {
+                  current();
+                  state.groups.push(group);
+                  state.state = 'owned';
+                  this.saveOpenAiUsage(state);
+                });
+              },
+              quiescent: () => {},
+            },
+          };
+          const deadline = performance.now() + options.timeoutMs;
+          const wallDeadline = Date.parse(this.now()) + options.timeoutMs;
+          invoked = true;
+          const handle = startNativeSession(
+            {
+              ...client,
+              directory,
+              repositoryRoot: this.home,
+              environment,
+            },
+            options,
+            (remaining) =>
+              new OpenAiDiscovery({
+                now: () => performance.now(),
+                timeoutMs: remaining,
+                readConfiguration: true,
+                configurationDirectory: directory,
+                onUsage,
+              }),
+          );
+          runtime.handle = handle;
+          if (runtime.stopped || this.closed) handle.stop();
+          const outcome = await handle.result;
+          const known = outcome.quiescent && state.groups.length > 0;
+          // Usage follows the supported account check. A later protocol refusal
+          // cannot grant authority or erase that validated read. Cancellation revokes it.
+          if (
+            known &&
+            performance.now() < deadline &&
+            Date.parse(this.now()) < wallDeadline &&
+            (outcome.reason === null || outcome.reason === 'protocol')
+          ) {
+            const publicationCurrent = () => {
+              current();
+              if (performance.now() >= deadline || Date.parse(this.now()) >= wallDeadline)
+                throw Error('usage-read-deadline');
+            };
+            for (const report of reports)
+              this.storeProviderUsage(
+                readerRoute.id,
+                report.value,
+                publicationCurrent,
+                report.prior,
+              );
+          }
+          this.store.transaction(() =>
+            this.saveOpenAiUsage({ ...state, state: known ? 'quiescent' : 'unknown' }),
+          );
+        } catch {
+          try {
+            this.store.transaction(() =>
+              this.saveOpenAiUsage({ ...state, state: invoked ? 'unknown' : 'quiescent' }),
+            );
+          } catch {}
+        } finally {
+          if (this.openAiUsageRead === runtime) this.openAiUsageRead = undefined;
+          completion.resolve();
+        }
+      })();
+      return runtime.done;
+    } catch {
+      return;
+    }
+  }
+
+  refreshGoogleUsage(
+    trigger: 'start' | 'connect' | 'interval',
+  ): Promise<CommandResult> | undefined {
     try {
       if (this.closed || this.acpStart) return;
       if (this.usageRead) return this.usageRead.promise;
       const reader = this.store.googleUsageReader();
       const nowMs = Date.parse(this.now());
-      if (reader.last_attempt_at && nowMs - Date.parse(reader.last_attempt_at) < 60000) return;
+      if (
+        reader.last_attempt_at &&
+        nowMs - Date.parse(reader.last_attempt_at) < (trigger === 'interval' ? 270000 : 60000)
+      )
+        return;
       if (trigger === 'connect') {
         const routes = this.store
           .list<Route>('route')
@@ -1827,6 +2128,11 @@ export class Controller {
       this.acpSetupRuntime.stopped = true;
       this.acpSetupRuntime.handle?.stop();
       native.push(this.acpSetupRuntime.promise);
+    }
+    if (this.openAiUsageRead) {
+      this.openAiUsageRead.stopped = true;
+      this.openAiUsageRead.handle?.stop();
+      native.push(this.openAiUsageRead.done);
     }
     if (this.usageRead) {
       this.usageRead.abort.abort();
@@ -6246,6 +6552,8 @@ export class Controller {
     if (lease) return { outcome: 'blocked', reason: 'writer-lease-held' };
     const googleBlocker = this.store.googleStartBlocker(attempt.routeId);
     if (googleBlocker) return { outcome: 'blocked', reason: googleBlocker };
+    const openAiBlocker = this.openAiUsageBlocker(attempt.routeId);
+    if (openAiBlocker) return { outcome: 'blocked', reason: openAiBlocker };
     const nativeTools =
       native && 'repository' in native.appointment
         ? this.grant(run, 'run-native-tools', project.name)
@@ -12358,6 +12666,149 @@ export class Controller {
       throw new Error('The native appointment is no longer current.');
   }
 
+  private storeProviderUsage(
+    routeId: string,
+    value: unknown,
+    current: () => void,
+    prior?: ReadonlyMap<string, Observation>,
+  ): boolean {
+    try {
+      const parsed = ProviderUsageBatchSchema.safeParse(value);
+      if (!parsed.success || Buffer.byteLength(canonicalJson(parsed.data)) > 32768) return false;
+      const report = parsed.data;
+      const ids = new Set(report.observations.map((observation) => observation.windowId));
+      if (
+        ids.size !== report.observations.length ||
+        Date.parse(report.observedAt) > Date.parse(this.now()) ||
+        report.observations.some(
+          (observation) =>
+            observation.routeId !== routeId ||
+            observation.observedAt !== report.observedAt ||
+            observation.source !== 'client' ||
+            observation.confidence !== 'reported',
+        )
+      )
+        return false;
+      return this.store.transaction(() => {
+        if (this.closed) return false;
+        current();
+        const windows = this.store
+          .list<Observation>('window')
+          .filter((window) => window.routeId === routeId);
+        const existing = new Map(windows.map((window) => [window.windowId, window]));
+        const ownedPrior = (window: Observation) =>
+          window.source === 'client' &&
+          prior?.has(window.windowId) &&
+          hashCanonical(prior.get(window.windowId)) === hashCanonical(window);
+        if (
+          (report.mode === 'complete' &&
+            windows.some(
+              (window) =>
+                window.source === 'client' &&
+                Date.parse(window.observedAt) > Date.parse(report.observedAt),
+            )) ||
+          report.observations.some((observation) => {
+            const previous = existing.get(observation.windowId);
+            return (
+              previous &&
+              Date.parse(previous.observedAt) === Date.parse(observation.observedAt) &&
+              hashCanonical(previous) !== hashCanonical(observation) &&
+              !ownedPrior(previous)
+            );
+          })
+        )
+          return false;
+        let removed = false;
+        let written = false;
+        if (report.mode === 'complete')
+          for (const window of windows)
+            if (
+              window.source === 'client' &&
+              !ids.has(window.windowId) &&
+              (Date.parse(window.observedAt) < Date.parse(report.observedAt) ||
+                (Date.parse(window.observedAt) === Date.parse(report.observedAt) &&
+                  ownedPrior(window)))
+            ) {
+              this.store.db
+                .prepare("DELETE FROM entities WHERE kind='window' AND id=?")
+                .run(`${window.routeId}/${window.windowId}`);
+              removed = true;
+            }
+        for (const observation of report.observations) {
+          const previous = existing.get(observation.windowId);
+          if (
+            previous &&
+            (Date.parse(previous.observedAt) > Date.parse(observation.observedAt) ||
+              (Date.parse(previous.observedAt) === Date.parse(observation.observedAt) &&
+                (!ownedPrior(previous) || hashCanonical(previous) === hashCanonical(observation))))
+          )
+            continue;
+          this.store.put(
+            'window',
+            `${observation.routeId}/${observation.windowId}`,
+            0,
+            observation,
+          );
+          this.event('usage.observed', null, 0, observation);
+          written = true;
+        }
+        if (removed && !written) this.event('usage.observed', null, 0, report.observations[0]);
+        return true;
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  private providerUsageAdapter(
+    routeId: string,
+    onReport: (report: unknown, prior: ReadonlyMap<string, Observation>) => boolean,
+  ) {
+    const seen = new Map<string, Observation>();
+    return (value: unknown) => {
+      try {
+        const parsed = ProviderUsageDraftSchema.safeParse(value);
+        if (!parsed.success) return;
+        const complete =
+          parsed.data.complete === true &&
+          this.store.get<Route>('route', routeId)?.family === 'openai';
+        const windows = parsed.data.windows.map((window) => {
+          if ('remainingPercent' in window)
+            return {
+              windowId: window.windowId,
+              kind: window.kind,
+              semantics: window.semantics,
+              remaining: { value: window.remainingPercent, unit: 'percent' as const },
+              resetsAt: window.resetsAt,
+              source: 'client' as const,
+              confidence: 'reported' as const,
+            };
+          return window;
+        });
+        if (
+          !complete &&
+          new Set([...seen.keys(), ...windows.map((window) => window.windowId)]).size > 32
+        )
+          return;
+        const changed = complete
+          ? windows
+          : windows.filter((window) => {
+              const previous = seen.get(window.windowId);
+              if (!previous) return true;
+              const { routeId: _route, observedAt: _time, ...reading } = previous;
+              return hashCanonical(reading) !== hashCanonical(window);
+            });
+        if (!changed.length) return;
+        const observedAt = this.now();
+        const observations = changed.map((window) => ({ ...window, routeId, observedAt }));
+        if (onReport({ mode: complete ? 'complete' : 'partial', observedAt, observations }, seen)) {
+          if (complete) seen.clear();
+          for (const observation of observations) seen.set(observation.windowId, observation);
+        }
+      } catch {}
+    };
+  }
+
   private providerUsage(
     attempt: Attempt,
     current: () => void,
@@ -12366,129 +12817,59 @@ export class Controller {
   ) {
     const route = this.store.get<Route>('route', attempt.routeId);
     const routeHash = hashCanonical(route ?? null);
-    const reportSchema = z.strictObject({
-      mode: z.enum(['partial', 'complete']),
-      observedAt: TimestampSchema,
-      observations: z.array(ObservationSchema).min(1).max(32),
-    });
+    const onReport = (value: unknown, prior?: ReadonlyMap<string, Observation>) =>
+      this.storeProviderUsage(
+        attempt.routeId,
+        value,
+        () => {
+          if (
+            this.closed ||
+            !ownsRuntime() ||
+            !route ||
+            route.fake ||
+            !['openai', 'anthropic'].includes(route.family)
+          )
+            throw Error('Provider usage ownership changed.');
+          current();
+          const saved = this.store.get<Attempt>('attempt', attempt.id);
+          const intent = this.store.intents().find((row) => row.attempt_id === attempt.id);
+          const task = intent && this.store.get<Task>('task', intent.task_id);
+          const lease =
+            intent &&
+            this.store.db
+              .prepare('SELECT attempt_id,generation FROM writer_leases WHERE task_id=?')
+              .get(intent.task_id);
+          const phase = this.store.nativeProcesses(attempt.id).at(-1);
+          if (
+            !saved ||
+            !['intent', 'running'].includes(saved.state) ||
+            saved.generation !== attempt.generation ||
+            saved.routeId !== attempt.routeId ||
+            saved.runId !== attempt.runId ||
+            !intent ||
+            intent.state !== 'acknowledged' ||
+            intent.run_id !== attempt.runId ||
+            intent.route_id !== attempt.routeId ||
+            intent.generation !== attempt.generation ||
+            task?.runId !== intent.run_id ||
+            lease?.attempt_id !== attempt.id ||
+            lease.generation !== attempt.generation ||
+            !phase ||
+            phase.state !== 'owned' ||
+            !phases.includes(phase.phase) ||
+            hashCanonical(this.store.get<Route>('route', attempt.routeId) ?? null) !== routeHash
+          )
+            throw Error('Provider usage ownership changed.');
+        },
+        prior,
+      );
     return {
       usage: {
         routeId: attempt.routeId,
         observedAt: this.now,
-        onReport: (value: unknown) => {
-          try {
-            const parsed = reportSchema.safeParse(value);
-            if (!parsed.success || Buffer.byteLength(canonicalJson(parsed.data)) > 32768) return;
-            const report = parsed.data;
-            const ids = new Set(report.observations.map((observation) => observation.windowId));
-            if (
-              ids.size !== report.observations.length ||
-              Date.parse(report.observedAt) > Date.parse(this.now()) ||
-              report.observations.some(
-                (observation) =>
-                  observation.routeId !== attempt.routeId ||
-                  observation.observedAt !== report.observedAt ||
-                  observation.source !== 'client' ||
-                  observation.confidence !== 'reported',
-              )
-            )
-              return;
-            this.store.transaction(() => {
-              if (
-                this.closed ||
-                !ownsRuntime() ||
-                !route ||
-                route.fake ||
-                !['openai', 'anthropic'].includes(route.family)
-              )
-                return;
-              current();
-              const saved = this.store.get<Attempt>('attempt', attempt.id);
-              const intent = this.store.intents().find((row) => row.attempt_id === attempt.id);
-              const task = intent && this.store.get<Task>('task', intent.task_id);
-              const lease =
-                intent &&
-                this.store.db
-                  .prepare('SELECT attempt_id,generation FROM writer_leases WHERE task_id=?')
-                  .get(intent.task_id);
-              const phase = this.store.nativeProcesses(attempt.id).at(-1);
-              if (
-                !saved ||
-                !['intent', 'running'].includes(saved.state) ||
-                saved.generation !== attempt.generation ||
-                saved.routeId !== attempt.routeId ||
-                saved.runId !== attempt.runId ||
-                !intent ||
-                intent.state !== 'acknowledged' ||
-                intent.run_id !== attempt.runId ||
-                intent.route_id !== attempt.routeId ||
-                intent.generation !== attempt.generation ||
-                task?.runId !== intent.run_id ||
-                lease?.attempt_id !== attempt.id ||
-                lease.generation !== attempt.generation ||
-                !phase ||
-                phase.state !== 'owned' ||
-                !phases.includes(phase.phase) ||
-                hashCanonical(this.store.get<Route>('route', attempt.routeId) ?? null) !== routeHash
-              )
-                return;
-              const windows = this.store
-                .list<Observation>('window')
-                .filter((window) => window.routeId === attempt.routeId);
-              const existing = new Map(windows.map((window) => [window.windowId, window]));
-              if (
-                (report.mode === 'complete' &&
-                  windows.some(
-                    (window) =>
-                      window.source === 'client' &&
-                      Date.parse(window.observedAt) > Date.parse(report.observedAt),
-                  )) ||
-                report.observations.some((observation) => {
-                  const previous = existing.get(observation.windowId);
-                  return (
-                    previous &&
-                    Date.parse(previous.observedAt) === Date.parse(observation.observedAt) &&
-                    hashCanonical(previous) !== hashCanonical(observation)
-                  );
-                })
-              )
-                return;
-              let removed = false;
-              let written = false;
-              if (report.mode === 'complete')
-                for (const window of windows)
-                  if (
-                    window.source === 'client' &&
-                    !ids.has(window.windowId) &&
-                    Date.parse(window.observedAt) < Date.parse(report.observedAt)
-                  ) {
-                    this.store.db
-                      .prepare("DELETE FROM entities WHERE kind='window' AND id=?")
-                      .run(`${window.routeId}/${window.windowId}`);
-                    removed = true;
-                  }
-              for (const observation of report.observations) {
-                const previous = existing.get(observation.windowId);
-                if (
-                  previous &&
-                  Date.parse(previous.observedAt) >= Date.parse(observation.observedAt)
-                )
-                  continue;
-                this.store.put(
-                  'window',
-                  `${observation.routeId}/${observation.windowId}`,
-                  0,
-                  observation,
-                );
-                this.event('usage.observed', null, 0, observation);
-                written = true;
-              }
-              if (removed && !written)
-                this.event('usage.observed', null, 0, report.observations[0]);
-            });
-          } catch {}
-        },
+        onReport: (value: unknown) => onReport(value),
       },
+      onUsage: this.providerUsageAdapter(attempt.routeId, onReport),
     };
   }
 
@@ -13736,6 +14117,17 @@ export class Controller {
     const group = this.store.combinedGroup(command.payload.runId);
     if (group?.phase === 'accepted')
       return { outcome: 'applied', entity: task, revision: task.revision };
+    const runForStop = this.store.get<Run>('run', command.payload.runId);
+    const stopRoute =
+      runForStop?.decision.chosen && this.store.get<Route>('route', runForStop.decision.chosen);
+    const usesOpenAi = stopRoute && stopRoute.family === 'openai' && !stopRoute.fake;
+    if (usesOpenAi && this.openAiUsageRead) {
+      const reader = this.openAiUsageRead;
+      effects.push(() => {
+        reader.stopped = true;
+        reader.handle?.stop();
+      });
+    }
     if (group && !memberStop) {
       if (group.task_id === task.id) return this.stopCombined(group, effects);
       if (!['stopping', 'stopped', 'unknown', 'accepted'].includes(group.phase))
@@ -14083,6 +14475,9 @@ export class Controller {
 
   private recover() {
     this.store.transaction(() => {
+      const usage = this.openAiUsageState();
+      if (usage && usage.state !== 'quiescent')
+        this.saveOpenAiUsage({ ...usage, state: 'unknown' });
       const local = this.localControl();
       if (local.operation)
         this.saveLocal({
@@ -14902,6 +15297,8 @@ export class Controller {
     }
     const googleBlocker = this.store.googleStartBlocker(attempt.routeId);
     if (googleBlocker) throw new Error(googleBlocker);
+    const openAiBlocker = this.openAiUsageBlocker(attempt.routeId);
+    if (openAiBlocker) throw Error(openAiBlocker);
     const remaining = this.remaining(run);
     const group = this.store.combinedGroup(run.id);
     if (group) {

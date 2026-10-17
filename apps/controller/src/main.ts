@@ -89,6 +89,8 @@ export function resolvePackagedLocalInput(root: string) {
 
 export async function startController(options: ControllerOptions) {
   const configuration = {
+    openAiUsageClient:
+      !options.nativeProfile && !options.nativeProfiles ? resolveNativeProfile : undefined,
     registerGoogleAcp: !options.nativeProfile && !options.nativeProfiles,
     nativeProfiles: options.nativeProfile
       ? undefined

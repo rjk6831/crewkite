@@ -6349,7 +6349,6 @@ test('google quota authority survives retries and restart while sharing one oper
     fresh.close();
     assert.equal(launches, beforeAutomatic + 1, 'fresh connection does not read again');
     context.clock.advance(300001);
-    assert.equal(launches, beforeAutomatic + 1, 'elapsed time admits no background read');
     const clients = await Promise.all([connect(), connect()]);
     try {
       const connected = controller.refreshGoogleUsage('connect');
@@ -6359,6 +6358,12 @@ test('google quota authority survives retries and restart while sharing one oper
     } finally {
       for (const client of clients) client.close();
     }
+    context.clock.advance(60000);
+    await controller.refreshUsage('interval');
+    assert.equal(launches, beforeAutomatic + 2, 'a timed read waits its interval');
+    context.clock.advance(210000);
+    await controller.refreshUsage('interval');
+    assert.equal(launches, beforeAutomatic + 3, 'one shared timed path refreshes Google');
   } finally {
     await server.close();
   }
@@ -6626,6 +6631,386 @@ test('google quota authority survives retries and restart while sharing one oper
     'google-ownership-unknown',
   );
   assert.equal(launches, beforeRecovery);
+  const nativeProfile = {
+    ...unavailableNativeProfile(),
+    facts: {
+      ...unavailableNativeProfile().facts,
+      available: true,
+      reason: 'available',
+      model: fixtureModel,
+      clientVersion: process.version,
+    },
+    client: { executable: process.execPath, version: process.version, sha256: fixtureClientHash },
+    environment: { ...process.env },
+    locationHash: '1'.repeat(64),
+  } satisfies NativeProfileResolution;
+  let openController: Controller;
+  let metadataLaunches = 0;
+  let metadataMode:
+    | 'success'
+    | 'invalid'
+    | 'late-protocol'
+    | 'late-publication'
+    | 'over-limit'
+    | 'api-key'
+    | 'hold' = 'success';
+  let latePublication = false;
+  let readStarted = Promise.withResolvers<void>();
+  const metadataOptions: Partial<ControllerOptions> = {
+    googleUsageClient: () => ({ available: false, reason: 'client-unavailable' }),
+    openAiUsageClient: () => {
+      if (metadataMode === 'late-publication' && latePublication) {
+        latePublication = false;
+        metadata.clock.advance(20000);
+      }
+      return nativeProfile;
+    },
+    openAiUsageSpawn: (executable, args, spawnOptions) => {
+      const phase = args.at(-1) === 'list' ? 'features' : 'prepare';
+      if (phase === 'prepare') metadataLaunches++;
+      const value =
+        metadataMode === 'invalid'
+          ? { rateLimits: { primary: { usedPercent: -1 } } }
+          : {
+              rateLimits: {},
+              rateLimitsByLimitId: {
+                ordinary: {
+                  primary: {
+                    usedPercent: ['late-protocol', 'late-publication', 'over-limit'].includes(
+                      metadataMode,
+                    )
+                      ? 101
+                      : 25,
+                    windowDurationMins: 300,
+                    resetsAt: 1792231983,
+                  },
+                },
+              },
+            };
+      const script = fixture.replace(
+        '  let result = replies[message.method];',
+        `
+        if (message.method === 'thread/start' || message.method === 'turn/start')
+          throw Error('Metadata refresh cannot submit a model turn.');
+        if (message.method === 'account/rateLimits/read' && ${JSON.stringify(metadataMode)} === 'hold') {
+          process.stderr.write('held'); return;
+        }
+        let result = message.method === 'account/rateLimits/read' ? ${JSON.stringify(value)} : replies[message.method];
+        if (message.method === 'account/read' && ${JSON.stringify(metadataMode)} === 'api-key')
+          result = {account:{type:'apiKey'},requiresOpenaiAuth:false};`,
+      );
+      const child = spawn(executable, ['-e', script, 'success', phase], spawnOptions);
+      child.stderr.once('data', () => readStarted.resolve());
+      if (phase === 'prepare' && metadataMode === 'late-protocol')
+        child.once('close', () => metadata.clock.advance(20000));
+      if (phase === 'prepare' && metadataMode === 'late-publication')
+        child.once('close', () => {
+          latePublication = true;
+        });
+      return child;
+    },
+  };
+  const metadata = await setup(t, metadataOptions, () => openController.close());
+  openController = metadata.controller;
+  const state = () => {
+    const artifact = ArtifactSchema.parse(
+      openController.store.receipt('usage-reader:openai')?.result.entity,
+    );
+    return JSON.parse(
+      new ArtifactFiles(join(metadata.directory, 'home', 'artifacts'))
+        .read(artifact.hash)
+        .toString('utf8'),
+    ) as {
+      id: string;
+      state: string;
+      attemptedAt: string;
+      profileHash: string;
+      groups: number[];
+    };
+  };
+  await openController.refreshUsage('start');
+  assert.equal(metadataLaunches, 1);
+  const reader = openController
+    .snapshot()
+    .routes.find((route) => route.displayName === 'OpenAI usage reader');
+  assert.ok(reader);
+  const readerId = reader.id;
+  const windows = () =>
+    openController.store.list<Observation>('window').filter((value) => value.routeId === readerId);
+  assert.equal(reader.qualified, false);
+  assert.equal(reader.model, 'unknown');
+  assert.equal(state().state, 'quiescent');
+  assert.equal(state().groups.length, 2);
+  assert.equal(windows().length, 1);
+  assert.equal(windows()[0].remaining?.value, 75);
+  const firstObservedAt = windows()[0].observedAt;
+  const historical = { ...windows()[0], routeId: metadata.fixtures.snapshot.routes[0].id };
+  openController.store.transaction(() =>
+    openController.store.put(
+      'window',
+      `${historical.routeId}/${historical.windowId}`,
+      0,
+      historical,
+    ),
+  );
+  metadata.clock.advance(60000);
+  await openController.refreshUsage('connect');
+  assert.equal(metadataLaunches, 1, 'fresh connect does not repeat the metadata read');
+  metadata.clock.advance(209999);
+  await openController.refreshUsage('interval');
+  assert.equal(metadataLaunches, 1);
+  metadata.clock.advance(1);
+  await openController.refreshUsage('interval');
+  assert.equal(metadataLaunches, 2);
+  assert.notEqual(
+    windows()[0].observedAt,
+    firstObservedAt,
+    'a completed account read revalidates an unchanged reading',
+  );
+  assert.deepEqual(
+    openController.store.get('window', `${historical.routeId}/${historical.windowId}`),
+    historical,
+    'the current account read cannot refresh an old task route',
+  );
+  let valid = windows();
+  metadata.clock.advance(270000);
+  metadataMode = 'invalid';
+  await openController.refreshUsage('interval');
+  assert.equal(metadataLaunches, 3);
+  assert.equal(state().state, 'quiescent');
+  assert.deepEqual(windows(), valid);
+  metadata.clock.advance(60000);
+  await openController.refreshUsage('interval');
+  assert.equal(metadataLaunches, 3, 'failed reads retain the timed cooldown');
+  metadata.clock.advance(210000);
+  metadataMode = 'late-protocol';
+  await openController.refreshUsage('interval');
+  assert.equal(metadataLaunches, 4);
+  assert.equal(state().state, 'quiescent');
+  assert.deepEqual(
+    windows(),
+    valid,
+    'protocol refusal cannot hide an expired publication deadline',
+  );
+  metadata.clock.advance(270000);
+  metadataMode = 'late-publication';
+  await openController.refreshUsage('interval');
+  assert.equal(metadataLaunches, 5);
+  assert.equal(state().state, 'quiescent');
+  assert.deepEqual(
+    windows(),
+    valid,
+    'the publication deadline is checked after current-profile validation',
+  );
+  metadata.clock.advance(270000);
+  metadataMode = 'over-limit';
+  await openController.refreshUsage('interval');
+  assert.equal(metadataLaunches, 6);
+  assert.equal(state().state, 'quiescent');
+  assert.equal(
+    windows()[0].remaining?.value,
+    0,
+    'a validated exhausted window survives a later strict admission refusal',
+  );
+  valid = windows();
+  metadata.clock.advance(270000);
+  metadataMode = 'api-key';
+  await openController.refreshUsage('interval');
+  assert.equal(metadataLaunches, 7);
+  assert.equal(state().state, 'quiescent');
+  assert.deepEqual(
+    windows(),
+    valid,
+    'a different billing path cannot publish included account readings',
+  );
+  const metadataTask = TaskSchema.parse(
+    (await openController.execute(metadata.draft, 'local-owner')).entity,
+  );
+  const taskRoute = metadata.fixtures.snapshot.routes.find((route) => route.family === 'openai');
+  assert.ok(taskRoute);
+  openController.store.transaction(() => {
+    for (const observation of openController.store
+      .list<Observation>('window')
+      .filter((value) => value.routeId === taskRoute.id))
+      openController.store.put('window', `${taskRoute.id}/${observation.windowId}`, 0, {
+        ...observation,
+        observedAt: metadata.clock.now(),
+        source: 'manual',
+      });
+  });
+  const preparedMetadataRun = await openController.execute(
+    metadata.command(
+      'PrepareRun',
+      {
+        taskId: metadataTask.id,
+        policy: {
+          ...metadata.fixtures.policy,
+          quality: 'quick',
+          methods: [],
+          effects: metadata.fixtures.policy.effects.map((grant) => ({
+            ...grant,
+            taskId: metadataTask.id,
+          })),
+        },
+        roles: [
+          { role: 'coder', routeId: taskRoute.id, pinned: true, approvedFallbacks: [] },
+          {
+            role: 'advisor',
+            routeId: metadata.fixtures.snapshot.routes[1].id,
+            pinned: false,
+            approvedFallbacks: [],
+          },
+        ],
+      },
+      metadataTask.revision,
+    ),
+    'local-owner',
+  );
+  assert.equal(preparedMetadataRun.outcome, 'applied', canonicalJson(preparedMetadataRun));
+  const metadataRun = RunSchema.parse(preparedMetadataRun.entity);
+  assert.equal(metadataRun.decision.chosen, taskRoute.id);
+  openController.store.transaction(() =>
+    openController.store.put('route', taskRoute.id, 0, { ...taskRoute, fake: false }),
+  );
+  const unresolved = {
+    id: metadata.id('att'),
+    runId: metadataRun.id,
+    routeId: taskRoute.id,
+    generation: 0,
+    state: 'unknown' as const,
+    revision: 0,
+  };
+  openController.store.transaction(() => {
+    openController.store.put('attempt', unresolved.id, 0, unresolved);
+    openController.store.db
+      .prepare(
+        "INSERT INTO launch_intents(attempt_id,task_id,run_id,route_id,generation,scratch_path,state,admitted_at) VALUES (?,?,?,?,0,?,'outcome-unknown',?)",
+      )
+      .run(
+        unresolved.id,
+        metadataTask.id,
+        metadataRun.id,
+        taskRoute.id,
+        metadata.directory,
+        metadata.clock.now(),
+      );
+  });
+  metadata.clock.advance(270000);
+  await openController.refreshUsage('interval');
+  assert.equal(metadataLaunches, 7, 'unknown native ownership blocks metadata reads');
+  openController.store.transaction(() => {
+    openController.store.db
+      .prepare('DELETE FROM launch_intents WHERE attempt_id=?')
+      .run(unresolved.id);
+    openController.store.db
+      .prepare("DELETE FROM entities WHERE kind='attempt' AND id=?")
+      .run(unresolved.id);
+  });
+  metadataMode = 'hold';
+  readStarted = Promise.withResolvers<void>();
+  const holding = openController.refreshUsage('interval');
+  await readStarted.promise;
+  assert.equal(state().state, 'owned');
+  const currentLaunches = metadataLaunches;
+  const joining = openController.refreshUsage('connect');
+  assert.equal(metadataLaunches, currentLaunches);
+  const privateApi = openController as unknown as {
+    openAiUsageBlocker: (id: string) => string | undefined;
+  };
+  assert.equal(privateApi.openAiUsageBlocker(reader.id), 'openai-metadata-ownership-pending');
+  for (const route of metadata.fixtures.snapshot.routes.filter(
+    (value) => value.family !== 'openai',
+  ))
+    assert.equal(
+      privateApi.openAiUsageBlocker(route.id),
+      undefined,
+      'other providers stay independent',
+    );
+  const jobApi = openController as unknown as {
+    admitJob: (run: typeof metadataRun, attempt: Attempt, directory: string) => unknown;
+  };
+  assert.throws(
+    () =>
+      openController.store.transaction(() =>
+        jobApi.admitJob(
+          metadataRun,
+          { ...unresolved, id: metadata.id('att'), state: 'intent' },
+          metadata.directory,
+        ),
+      ),
+    /openai-metadata-ownership-pending/,
+  );
+
+  const startDuringRead = await openController.execute(
+    metadata.command(
+      'StartRun',
+      {
+        taskId: metadataTask.id,
+        runId: metadataRun.id,
+      },
+      preparedMetadataRun.revision,
+    ),
+    'local-owner',
+  );
+  assert.equal(startDuringRead.reason, 'openai-metadata-ownership-pending');
+  assert.equal(openController.store.intents().length, 0);
+  const stoppedRead = await openController.execute(
+    metadata.command(
+      'StopRun',
+      {
+        taskId: metadataTask.id,
+        runId: metadataRun.id,
+      },
+      preparedMetadataRun.revision,
+    ),
+    'local-owner',
+  );
+  assert.equal(stoppedRead.outcome, 'applied');
+  await Promise.all([holding, joining]);
+  assert.equal(state().state, 'quiescent');
+  assert.deepEqual(windows(), valid, 'Stop cancels only the current metadata owner');
+  metadata.clock.advance(270000);
+  readStarted = Promise.withResolvers<void>();
+  const closingReadAgain = openController.refreshUsage('interval');
+  await readStarted.promise;
+  const finalLaunches = metadataLaunches;
+  const closingMetadata = openController.close();
+  await Promise.all([closingReadAgain, closingMetadata]);
+  openController = new Controller({
+    ...metadataOptions,
+    home: join(metadata.directory, 'home'),
+    now: metadata.clock.now,
+    id: metadata.id,
+  });
+  assert.equal(state().state, 'quiescent', 'close joins physical cleanup before closing the store');
+  assert.deepEqual(windows(), valid, 'a cancelled read cannot advance observed time');
+  const savedState = state();
+  const saved = openController as unknown as { saveOpenAiUsage: (value: unknown) => void };
+  openController.store.transaction(() =>
+    saved.saveOpenAiUsage({ ...savedState, state: 'owned', groups: [2147483000] }),
+  );
+  await openController.close();
+  const metadataKill = process.kill;
+  let probes = 0;
+  process.kill = ((...args: Parameters<typeof process.kill>) => {
+    probes++;
+    return metadataKill(...args);
+  }) as typeof process.kill;
+  try {
+    openController = new Controller({
+      ...metadataOptions,
+      home: join(metadata.directory, 'home'),
+      now: metadata.clock.now,
+      id: metadata.id,
+    });
+  } finally {
+    process.kill = metadataKill;
+  }
+  assert.equal(probes, 0);
+  assert.equal(state().state, 'unknown');
+  metadata.clock.advance(300000);
+  await openController.refreshUsage('interval');
+  assert.equal(metadataLaunches, finalLaunches, 'unfinished recovery never replays a reader');
 });
 
 test('an acp scratch permission binds one live action and crash recovery cannot invent completion', async (t) => {
@@ -7607,6 +7992,15 @@ test('planning turns keep task authority and allowance across execution', async 
           "if (message.method === 'thread/start') result = {...thread(process.cwd()),model:message.params.model,reasoningEffort:message.params.config.model_reasoning_effort};",
         );
       script = script.replace(
+        '  let result = replies[message.method];',
+        `
+        let result = replies[message.method];
+        if (phase === 'task' && message.method === 'account/rateLimits/read') result = {
+          ordinaryUsageAllowed:true,rateLimits:{limitId:'wire'},
+          rateLimitsByLimitId:{wire:{primary:{usedPercent:25,windowDurationMins:300,resetsAt:1792231983}}}
+        };`,
+      );
+      script = script.replace(
         'const edit = {version:1,attemptId:message.params.outputSchema.properties.attemptId.const,path,baseHash:message.params.outputSchema.properties.baseHash.const,content:content(path)};',
         `const edit = {version:1,bindingHash:message.params.outputSchema.properties.bindingHash.const,message:'The bounded plan is ready.',questions:${JSON.stringify(askQuestion ? ['Keep the current export?'] : [])},proposal:{summary:'Keep the export.',criteria:${JSON.stringify(mode === 'escaped-boundary' ? Array.from({ length: 12 }, (_, index) => `${index}: ${'x'.repeat(3500)}`) : ['Preserve the source sentinels.'])},slices:[{id:'net',title:'Change the module',role:'coder',scope:['net.mjs'],dependsOn:[]}],checks:['node-tests-v1']}}${mode === 'invalid' ? '; edit.effects=[]' : ''};`,
       );
@@ -7636,7 +8030,10 @@ test('planning turns keep task authority and allowance across execution', async 
                 current: () => void,
                 ownsRuntime: () => boolean,
                 phases: string[],
-              ) => { usage: { onReport: (value: unknown) => void } };
+              ) => {
+                usage: { onReport: (value: unknown) => void };
+                onUsage: (value: unknown) => void;
+              };
             }
           ).providerUsage(
             attempt,
@@ -7770,7 +8167,76 @@ test('planning turns keep task authority and allowance across execution', async 
           assert.deepEqual(controller.store.get('window', `${attempt.routeId}/manual`), manual);
           report([observation('observed-a', observedAt)], 'complete');
           assert.deepEqual(controller.store.get('window', `${attempt.routeId}/manual`), manual);
-          lateUsage = () => report([observation('late', observedAt)]);
+          const draftWindow = {
+            windowId: 'callback',
+            kind: 'rolling',
+            remaining: { value: 51, unit: 'percent' },
+            resetsAt: null,
+            source: 'client',
+            confidence: 'reported',
+          };
+          ingress.onUsage({
+            complete: false,
+            windows: [draftWindow],
+            credits: [{ private: true }],
+          });
+          const arrived = retained().find((value) => value.windowId === 'callback');
+          assert.equal(arrived?.observedAt, controller.now());
+          draftWindow.remaining.value = 52;
+          ingress.onUsage({ windows: [draftWindow] });
+          assert.equal(
+            retained().find((value) => value.windowId === 'callback')?.remaining?.value,
+            52,
+            'two genuine updates in one millisecond keep the later stream value',
+          );
+          assert.equal(
+            retained().find((value) => value.windowId === 'callback')?.observedAt,
+            arrived?.observedAt,
+          );
+          assert.ok(arrived);
+          const intervening = { ...arrived, remaining: { value: 49, unit: 'percent' as const } };
+          controller.store.transaction(() =>
+            controller.store.put('window', `${attempt.routeId}/callback`, 0, intervening),
+          );
+          ingress.onUsage({
+            windows: [{ ...draftWindow, remaining: { value: 53, unit: 'percent' } }],
+          });
+          assert.deepEqual(
+            retained().find((value) => value.windowId === 'callback'),
+            intervening,
+            'the stream cannot replace another equal-time writer',
+          );
+          const callbackCursor = controller.store.cursor();
+          context.clock.advance(1);
+          ingress.onUsage({ complete: false, windows: [draftWindow] });
+          assert.equal(
+            controller.store.cursor(),
+            callbackCursor,
+            'a cached sparse replay does not restamp',
+          );
+          assert.equal(
+            retained().find((value) => value.windowId === 'callback')?.observedAt,
+            arrived?.observedAt,
+          );
+          ingress.onUsage({ complete: true, windows: [draftWindow] });
+          assert.equal(
+            retained().find((value) => value.windowId === 'callback')?.observedAt,
+            controller.now(),
+          );
+          assert.equal(
+            retained().some((value) => value.windowId === 'observed-a'),
+            false,
+          );
+          const completeCallback = retained();
+          ingress.onUsage({
+            complete: true,
+            windows: [draftWindow, { ...draftWindow, remaining: { value: 101, unit: 'percent' } }],
+          });
+          assert.deepEqual(retained(), completeCallback);
+          lateUsage = () => {
+            report([observation('late', observedAt)]);
+            ingress.onUsage({ windows: [{ ...draftWindow, windowId: 'late-callback' }] });
+          };
         });
       children.push(new Promise<void>((done) => child.once('close', () => done())));
       let output = '';
@@ -7969,6 +8435,16 @@ test('planning turns keep task authority and allowance across execution', async 
   assert.equal(state(catalogTask.id).contextUsage, null);
   await catalogReply;
   assert.equal(usageChecked, true);
+  const callbackFromWire = context.controller.store
+    .list<Observation>('window')
+    .find((value) => value.windowId === 'wire:primary');
+  assert.equal(
+    callbackFromWire?.remaining?.value,
+    75,
+    'the actual planning transcript callback reaches guarded storage',
+  );
+  assert.equal(callbackFromWire?.source, 'client');
+
   const usageAfterCompletion = controller.store.list<Observation>('window');
   lateUsage?.();
   assert.deepEqual(controller.store.list<Observation>('window'), usageAfterCompletion);
