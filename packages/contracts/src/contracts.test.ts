@@ -1322,26 +1322,29 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     family: 'google',
     clientVersion: 'fixture',
     available: false,
-    enabled: false,
-    reason: 'not-enabled',
+    reason: 'client-unavailable',
     lastObservedAt: null,
   };
   for (const valid of [
     reader,
-    { ...reader, enabled: true, available: true, reason: 'available' },
+    { ...reader, available: true, reason: 'available' },
     {
       ...reader,
-      enabled: true,
       reason: 'client-build-mismatch',
       lastAttemptAt: '2026-10-17T00:00:00.000Z',
     },
     { ...reader, reason: 'unsupported-platform' },
+    { ...reader, reason: 'native-home-unavailable' },
   ])
     assert.deepEqual(UsageReaderSchema.parse(valid), valid);
   for (const change of [
     { available: true },
     { reason: 'available' },
     { enabled: true },
+    { enabled: false },
+    { consent: true },
+    { authorityRevision: 1 },
+    { reason: 'not-enabled' },
     { family: 'anthropic' },
     { reason: 'unbounded-error' },
     { lastAttemptAt: 'tomorrow' },
@@ -1733,18 +1736,21 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     SnapshotSchema.safeParse({ ...oldSnapshot, usageReaders: [reader, reader] }).success,
     false,
   );
-  for (const consent of [undefined, true, false]) {
-    const observe = {
-      ...command,
-      command: 'ObserveUsage',
-      payload: { family: 'google', ...(consent === undefined ? {} : { consent }) },
-    };
-    assert.deepEqual(CommandSchema.parse(observe), observe);
-  }
+  const observe = {
+    ...command,
+    command: 'ObserveUsage',
+    payload: { family: 'google' },
+  };
+  assert.deepEqual(CommandSchema.parse(observe), observe);
+  assert.equal(hashCanonical(CommandSchema.parse(observe)), hashCanonical(observe));
   for (const payload of [
+    { family: 'google', consent: true },
+    { family: 'google', consent: false },
     { family: 'google', consent: 'true' },
     { family: 'google', consent: null },
-    { family: 'openai', consent: true },
+    { family: 'google', enabled: true },
+    { family: 'google', authorityRevision: 1 },
+    { family: 'openai' },
     { family: 'google', token: 'synthetic-secret' },
   ])
     assert.equal(

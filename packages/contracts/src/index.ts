@@ -792,23 +792,13 @@ export const UsageReaderSchema = z
       'native-home-unavailable',
       'client-unavailable',
       'client-build-mismatch',
-      'not-enabled',
     ]),
-    enabled: z.boolean(),
     lastObservedAt: TimestampSchema.nullable(),
     lastAttemptAt: TimestampSchema.nullable().optional(),
   })
   .refine(
-    (reader) => reader.available === (reader.enabled && reader.reason === 'available'),
-    'Reader availability requires consent and a compatible client.',
-  )
-  .refine(
-    (reader) => reader.reason !== 'available' || reader.enabled,
-    'A disabled reader cannot report available.',
-  )
-  .refine(
-    (reader) => reader.reason !== 'not-enabled' || !reader.enabled,
-    'An enabled reader must report its client availability.',
+    (reader) => reader.available === (reader.reason === 'available'),
+    'Reader availability must match its client status.',
   );
 export const RoleSchema = z.strictObject({
   role: RoleNameSchema,
@@ -2071,10 +2061,7 @@ export const CommandSchema = z.discriminatedUnion('command', [
     }),
   ),
   mutate('RegisterProject', z.strictObject({ path: text })),
-  mutate(
-    'ObserveUsage',
-    z.strictObject({ family: z.literal('google'), consent: z.boolean().optional() }),
-  ),
+  mutate('ObserveUsage', z.strictObject({ family: z.literal('google') })),
   mutate(
     'InitializeGoogleAcp',
     z.strictObject({ profileId: z.literal('google-acp-v1'), consent: z.literal('explicit') }),
