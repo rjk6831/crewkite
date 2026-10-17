@@ -2,10 +2,14 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
+  closeSync,
+  constants,
   cpSync,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   realpathSync,
@@ -24,6 +28,31 @@ import {
 const source = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const git = (...args) => execFileSync('git', args, { cwd: source, encoding: 'utf8' }).trim();
 const primary = dirname(git('rev-parse', '--path-format=absolute', '--git-common-dir'));
+let provenancePattern = process.env.PROVENANCE_PATTERN?.trim() ?? '';
+const policyPath = join(primary, 'internal/provenance-pattern.txt');
+if (!provenancePattern && lstatSync(policyPath, { throwIfNoEntry: false })) {
+  const file = openSync(
+    policyPath,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
+  try {
+    const state = fstatSync(file);
+    if (!state.isFile() || state.size > 16384)
+      throw new Error('The build provenance policy must be a bounded regular file.');
+    provenancePattern = readFileSync(file, 'utf8').trim();
+    if (!provenancePattern) throw new Error('The selected build provenance policy is empty.');
+  } finally {
+    closeSync(file);
+  }
+}
+if (provenancePattern.length > 4096)
+  throw new Error('The build provenance policy exceeds the verification limit.');
+if (provenancePattern)
+  try {
+    new RegExp(provenancePattern, 'i');
+  } catch {
+    throw new Error('The build provenance policy must be a valid regular expression.');
+  }
 const { values } = parseArgs({ options: { id: { type: 'string' } } });
 if (!values.id || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(values.id))
   throw new Error('Supply --id with a new lowercase build name.');
@@ -102,6 +131,28 @@ function validateLinks(directory) {
   }
 }
 validateLinks(checkout);
+const verificationFiles = [];
+if (provenancePattern) {
+  const { frozenVerificationPath } = await import(
+    pathToFileURL(join(checkout, 'apps/controller/src/evidence/toolchain-definition.ts')).href
+  );
+  const tracked = execFileSync('git', ['ls-tree', '-r', '-z', '--name-only', revision], {
+    cwd: source,
+    encoding: 'utf8',
+  });
+  for (const path of tracked.split('\0').filter(Boolean).filter(frozenVerificationPath)) {
+    const from = join(checkout, path);
+    inside(from, checkout);
+    const state = lstatSync(from);
+    if (!state.isFile()) throw new Error(`The frozen grader must be a regular file: ${path}.`);
+    verificationFiles.push({
+      path,
+      bytes: state.size,
+      sha256: hash(from),
+      mode: state.mode & 0o7777,
+    });
+  }
+}
 const environment = {
   PATH: `${join(nodeRoot, 'bin')}:${process.env.PATH ?? ''}`,
   HOME: join(build, 'environment'),
@@ -208,6 +259,32 @@ cpSync(zod, join(runtime, 'node_modules/zod'), {
   recursive: true,
   filter: (path) => relative(zod, path).split(sep)[0] !== 'src',
 });
+for (const entry of verificationFiles) {
+  const from = join(checkout, entry.path);
+  const to = join(runtime, entry.path);
+  const matches = (path) => {
+    const state = lstatSync(path);
+    return (
+      state.isFile() &&
+      state.size === entry.bytes &&
+      (state.mode & 0o7777) === entry.mode &&
+      hash(path) === entry.sha256
+    );
+  };
+  if (!matches(from)) throw new Error(`The frozen grader changed during build: ${entry.path}.`);
+  mkdirSync(dirname(to), { recursive: true });
+  inside(dirname(to), runtime);
+  if (!existsSync(to)) copy(from, to);
+  inside(to, runtime);
+  if (!matches(to)) throw new Error(`The packaged grader differs: ${entry.path}.`);
+}
+if (provenancePattern) {
+  mkdirSync(join(runtime, 'internal'), { mode: 0o700 });
+  writeFileSync(join(runtime, 'internal/provenance-pattern.txt'), `${provenancePattern}\n`, {
+    flag: 'wx',
+    mode: 0o600,
+  });
+}
 
 const notices = [];
 function notice(name, version, from, filename) {
@@ -317,3 +394,8 @@ writeFileSync(
 console.log(`Static package staged at ${stage}`);
 console.log(`Disposable build source retained at ${checkout}`);
 console.log('Desktop, relocation and recovery journeys remain unqualified.');
+console.log(
+  provenancePattern
+    ? 'Verification policy and graders staged. Checks still need a matching source checkout with installed dependencies.'
+    : 'Verification unavailable: this build carries no trusted provenance policy.',
+);

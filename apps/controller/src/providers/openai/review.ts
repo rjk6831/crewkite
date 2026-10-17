@@ -16,6 +16,9 @@ import type { NativeLaunch } from './native-discovery.ts';
 import { StructuredTranscript, type startReplacement, startStructuredTask } from './replacement.ts';
 
 const MAX_CONTENT = 65_536;
+const MAX_FILE_INPUT = 256 * 1024;
+const MAX_REPOSITORY_CONTENT = 256 * 1024;
+const MAX_REPOSITORY_INPUT = 384 * 1024;
 const utf8 = (value: string, limit = MAX_CONTENT) =>
   value.isWellFormed() && !value.includes('\0') && Buffer.byteLength(value, 'utf8') <= limit;
 const content = z
@@ -74,8 +77,8 @@ const repositoryFile = z.strictObject({
   hash: HashSchema,
   content: z
     .string()
-    .max(262_144)
-    .refine((value) => utf8(value, 262_144)),
+    .max(MAX_REPOSITORY_CONTENT)
+    .refine((value) => utf8(value, MAX_REPOSITORY_CONTENT)),
 });
 const repositoryInput = z.strictObject({
   ...commonInput,
@@ -153,7 +156,8 @@ export function reviewPlan(value: z.input<typeof input>) {
         )
       : digest(data.original) === data.baseHash &&
         digest(data.candidate) === data.candidateContentHash;
-  if (!valid || !utf8(JSON.stringify(task(data)), 262_144))
+  const maximum = 'repository' in data ? MAX_REPOSITORY_INPUT : MAX_FILE_INPUT;
+  if (!valid || !utf8(JSON.stringify(task(data)), maximum))
     throw new Error('The native review input exceeds its bounds or differs from its hashes.');
   return Object.freeze({ ...data, directory: resolve(data.directory) });
 }
