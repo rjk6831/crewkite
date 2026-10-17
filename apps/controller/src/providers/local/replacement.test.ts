@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import type { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { EventEmitter } from 'node:events';
+import { EventEmitter, once } from 'node:events';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -364,6 +364,7 @@ test('Local ownership needs the same prediction terminal after cancellation or c
           return child;
         }) as unknown as typeof spawn,
         groupAbsent: () => true,
+        lifecycle: { beforePhase() {}, owned() {}, quiescent() {} },
         now: () => 0,
         schedule: () => () => {},
         onSubmitted: (() => {
@@ -380,19 +381,26 @@ test('Local ownership needs the same prediction terminal after cancellation or c
       if (row === 'bad then valid') child.stdout.write(`{}\n${done}`);
       if (row === 'duplicate submission') child.stdout.write(ready + done);
       if (row === 'spawn failed') child.emit('error', new Error('fixture spawn failed'));
-      else child.emit('close', row === 'complete' ? 1 : 0, null);
+      else {
+        for (const stream of [child.stdout, child.stderr]) {
+          const ended = once(stream, 'end');
+          stream.end();
+          stream.resume();
+          await ended;
+        }
+        const finished = child.stdin.writableFinished
+          ? Promise.resolve()
+          : once(child.stdin, 'finish');
+        child.stdin.end();
+        await finished;
+        child.emit('close', row === 'complete' ? 1 : 0, null);
+      }
       const result = await run.result;
-      assert.equal(result.clientQuiescent, true);
+      assert.equal(result.clientQuiescent, true, row);
       const expected =
         row === 'complete'
           ? 'completed'
-          : [
-                'client loss',
-                'terminal before submission',
-                'async marker',
-                'resolved async marker',
-                'spawn failed',
-              ].includes(row)
+          : ['client loss', 'terminal before submission'].includes(row)
             ? 'failed'
             : 'unknown';
       assert.equal(result.terminal.kind, expected, row);
@@ -404,7 +412,168 @@ test('Local ownership needs the same prediction terminal after cancellation or c
           ? 0
           : 1,
       );
-      assert.ok(privateInput.includes(plan.token));
+      assert.equal(privateInput.includes(plan.token), row !== 'spawn failed', row);
+    }
+    for (const boundary of [
+      'complete',
+      'before-failed',
+      'before-async',
+      'before-value',
+      'before-deadline',
+      'spawn-throw',
+      'owned-failed',
+      'owned-async',
+      'owned-deadline',
+      'ready-in-owned',
+      'quiescent-failed',
+      'quiescent-async',
+      'quiescent-deadline',
+      'missing-close',
+      'group-present',
+      'stdout-open',
+      'stderr-open',
+      'stop-before-ready',
+      'stop-in-submitted',
+      'close-in-submitted',
+    ] as const) {
+      let clock = 0;
+      let absent = boundary !== 'group-present';
+      const trace: string[] = [];
+      let requestStop = () => {};
+      const privateFrames: string[] = [];
+      const timers: Array<() => void> = [];
+      const child = Object.assign(new EventEmitter(), {
+        pid: 12345,
+        stdin: new PassThrough(),
+        stdout: new PassThrough(),
+        stderr: new PassThrough(),
+      });
+      child.stdin.on('data', (bytes) => privateFrames.push(bytes.toString()));
+      const ready = `${JSON.stringify({ type: 'ready', binding: plan.binding })}\n`;
+      const launch = () =>
+        startLocalReplacement(plan, directory, {
+          now: () => clock,
+          schedule: (work) => {
+            timers.push(work);
+            return () => {};
+          },
+          signal: () => {},
+          groupAbsent: () => absent,
+          spawn: (() => {
+            trace.push('spawn');
+            if (boundary === 'spawn-throw') throw Error('synthetic spawn failure');
+            return child;
+          }) as unknown as typeof spawn,
+          lifecycle: {
+            beforePhase: (phase) => {
+              assert.equal(phase, 'task');
+              trace.push('before');
+              if (boundary === 'before-failed') throw Error('synthetic intent failure');
+              if (boundary === 'before-async')
+                return Promise.reject(Error('synthetic async intent'));
+              if (boundary === 'before-value') return 1;
+              if (boundary === 'before-deadline') clock = plan.timeoutMs - 5000;
+            },
+            owned: (phase, group) => {
+              assert.equal(phase, 'task');
+              assert.equal(group, 12345);
+              assert.equal(privateFrames.length, 0);
+              trace.push('owned');
+              if (boundary === 'owned-failed') throw Error('synthetic ownership failure');
+              if (boundary === 'owned-async') return Promise.resolve();
+              if (boundary === 'owned-deadline') clock = plan.timeoutMs - 5000;
+              if (boundary === 'ready-in-owned') child.stdout.write(ready);
+            },
+            quiescent: (phase, group) => {
+              assert.equal(phase, 'task');
+              assert.equal(group, 12345);
+              assert(child.stdout.readableEnded && child.stderr.readableEnded && absent);
+              trace.push('quiescent');
+              if (boundary === 'quiescent-failed') throw Error('synthetic closure failure');
+              if (boundary === 'quiescent-async') return Promise.resolve();
+              if (boundary === 'quiescent-deadline') clock = plan.timeoutMs;
+            },
+          },
+          onSubmitted: () => {
+            trace.push('submitted');
+            if (boundary === 'stop-in-submitted') requestStop();
+            if (boundary === 'close-in-submitted') child.emit('close');
+          },
+        });
+      if (boundary.startsWith('before-') || boundary === 'spawn-throw') {
+        assert.throws(launch);
+        assert.deepEqual(trace, boundary === 'spawn-throw' ? ['before', 'spawn'] : ['before']);
+        assert.equal(privateFrames.length, 0);
+        continue;
+      }
+      const run = launch();
+      requestStop = run.stop;
+      if (boundary === 'stop-before-ready') run.stop();
+      const ownershipRefused = [
+        'owned-failed',
+        'owned-async',
+        'owned-deadline',
+        'ready-in-owned',
+      ].includes(boundary);
+      if (!ownershipRefused) {
+        assert(privateFrames.join('').includes(plan.token));
+        child.stdout.write(ready);
+        if (boundary !== 'stop-before-ready')
+          child.stdout.write(`${JSON.stringify({ type: 'terminal', terminal: completed })}\n`);
+      } else assert(!privateFrames.join('').includes(plan.token));
+      for (const [stream, open] of [
+        [child.stdout, 'stdout-open'],
+        [child.stderr, 'stderr-open'],
+      ] as const) {
+        if (boundary === open) continue;
+        const ended = once(stream, 'end');
+        stream.end();
+        stream.resume();
+        await ended;
+      }
+      const finished = child.stdin.writableFinished
+        ? Promise.resolve()
+        : once(child.stdin, 'finish');
+      child.stdin.end();
+      await finished;
+      if (boundary !== 'missing-close') child.emit('close');
+      if (['missing-close', 'group-present'].includes(boundary)) {
+        for (const work of [...timers]) work();
+      }
+      const result = await run.result;
+      const physical = ![
+        'missing-close',
+        'group-present',
+        'stdout-open',
+        'stderr-open',
+        'close-in-submitted',
+      ].includes(boundary);
+      assert.equal(result.clientQuiescent, physical, boundary);
+      assert.equal(
+        result.terminal.kind,
+        boundary === 'complete'
+          ? 'completed'
+          : ['stop-before-ready', 'stop-in-submitted'].includes(boundary)
+            ? 'failed'
+            : 'unknown',
+        boundary,
+      );
+      assert.equal(
+        trace.filter((event) => event === 'quiescent').length,
+        physical && !['owned-failed', 'owned-async'].includes(boundary) ? 1 : 0,
+        boundary,
+      );
+      const priorTrace = [...trace];
+      absent = true;
+      child.emit('close');
+      child.emit('exit');
+      assert.deepEqual(trace, priorTrace, 'late closure cannot amend a settled ownership result');
+      if (['stop-in-submitted', 'close-in-submitted'].includes(boundary))
+        assert(!privateFrames.join('').split('\n').includes(JSON.stringify('submit')));
+      if (ownershipRefused || boundary === 'stop-before-ready')
+        assert(!trace.includes('submitted'));
+      if (boundary === 'complete')
+        assert.deepEqual(trace, ['before', 'spawn', 'owned', 'submitted', 'quiescent']);
     }
   } finally {
     rmSync(directory, { recursive: true, force: true });
