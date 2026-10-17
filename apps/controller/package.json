@@ -8,6 +8,7 @@
     "@crewkite/client": "workspace:*",
     "@crewkite/contracts": "workspace:*",
     "@crewkite/testkit": "workspace:*",
+    "@lmstudio/sdk": "2.1.0",
     "zod": "4.6.7"
   }
 }
