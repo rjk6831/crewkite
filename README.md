@@ -21,11 +21,12 @@ The handoff matters as much as the routing. If a provider stops, I want the next
 
 Community skills and plugins contain work I want to learn from and reuse. Finding the right ones and keeping up with changes takes attention. I want one consistent interface that explains what a tool does and the permissions it needs before I enable it. That should make reuse approachable for everyday AI users who have little interest in maintaining a collection of integrations. I intend to credit the original work and contribute useful improvements upstream where I can, with sources and licenses recorded in the [credits](docs/credits.md).
 
-The scripted prototype exercises controller behavior. The bounded native single-file path has passed a supervised desktop launch and retained export, with offline coverage of its authority and recovery rules. Local inference and the skills and plugin experience remain planned. I am building in the open for my own daily use first. Finished work and less manual coordination will tell me whether this deserves a place alongside the tools I already use.
+The scripted prototype exercises controller behavior. The bounded native single-file path has passed a supervised desktop launch and retained export, with offline coverage of its authority and recovery rules. Local setup supports explicit connection and observed model selection; inference qualification remains pending. The skills and plugin experience remain planned. I am building in the open for my own daily use first. Finished work and less manual coordination will tell me whether this deserves a place alongside the tools I already use.
 
 ## Current prototype
 
 - Runs a task through one desktop window and one CLI that share the same controller, task IDs and history.
+- Keeps the primary conversation, questions and proposed plan with the task. Adopting a plan and starting execution require separate decisions.
 - Uses editable teams with optional roles and a finite fake route, model and effort catalog.
 - Shows fixture usage per route and window: remaining allowance, reset time, observation time and source. Missing data shows as unknown.
 - Prefers routes whose allowance resets soon, protects reserves you set, and never spends just to empty a gauge.
@@ -33,6 +34,16 @@ The scripted prototype exercises controller behavior. The bounded native single-
 - Works in scratch copies of your repository. The qualified scripted journey can accept a result as one new local branch. Native single-file work supports inspection and manual export, with separate check and review preparation for explicitly selected committed Node tests. A matching checked and reviewed native result can request local branch acceptance with its own destination permission. Your checkout, remotes and deployments stay untouched.
 
 The qualified walkthrough uses the bundled synthetic project. The default sample checks require the original test file and expected completions. An explicit project Node recipe selects unchanged committed test files and requires successful tests from each file. It installs no dependencies. Package-manager checks and arbitrary commands remain unsupported. Scripted review results establish fixture behavior and candidate binding. The separate native review path supports one Keep it simple cycle with process independence only. The retained sample candidate passed two real Node tests and one live review, then became a new local branch through a separate destination approval. The same home reopened with its evidence intact. A useful change to CrewKite's completed-evaluation view has now completed the checked-branch workflow through the Mac directory package. D1b is complete for this bounded path; the [roadmap](docs/roadmap.md) records its evidence and remaining gates.
+
+## Task workflow
+
+Open Usage and capacity to inspect route availability and explicit provider setup. Local setup connects to a dedicated loopback runtime, refreshes its observed model list and saves one selection. It loads no model. An eligible loaded model remains unqualified; the [provider notes](docs/providers.md#local-models) describe the current limits.
+
+Choose New goal, select a registered project and review the planning permission before sending. Conversation is the main task view. Answer the primary role's questions and inspect the proposed criteria and scope before choosing Adopt plan. Adoption saves the task contract and opens separate execution preparation. It starts no coding work.
+
+Planning settings currently select Lead or Orchestrator on the supported fixed profile, existing-credit permission and finite task limits. Requested and effective model facts remain separate. The interface offers only controls supported by that profile; it cannot switch to arbitrary models or effort levels. Planning and later execution share the task's finite budget.
+
+Review the prepared source and permissions before Start. Changes shows retained work. Checks and review prepares and reports separate evidence; a matching supported result still needs destination-specific permission for local branch acceptance. Messages cannot approve actions or accept code. Uncertain commands keep their exact receipt for explicit retry, and reopening starts no work. The [conversation CLI](apps/cli/README.md#task-conversations) exposes the same controller decisions.
 
 ## Workspace
 
@@ -61,7 +72,7 @@ The controller is a headless Node process. It owns permissions, budgets, task ow
 
 ## Principles
 
-- Qualify official clients on their supported subscription path. Provider credentials stay with those clients. CrewKite never falls back to paid API billing on its own.
+- Qualify official clients on their supported subscription path. Cloud-provider authentication stays with those clients. CrewKite never falls back to paid API billing on its own.
 - Report usage as observed. A gauge needs a real denominator, a source and a timestamp. Unknown is a valid state.
 - Keep authority in code. Prompts and model output cannot grant permissions, raise limits or accept results.
 - Preserve your source. Writers work in scratch copies. Results land as new local branches only.
