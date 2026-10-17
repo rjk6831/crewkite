@@ -177,6 +177,7 @@ import {
 } from '../host/source.ts';
 import type { DependencyInventory } from '../host/toolchain.ts';
 import {
+  closedBefore,
   closedWithin,
   defaultSchedule,
   groupAbsent,
@@ -5056,6 +5057,7 @@ export class Controller {
     }
     const completed = Promise.withResolvers<void>();
     const interrupted = Promise.withResolvers<null>();
+    const drained = closedBefore(job.closed, interrupted.promise);
     let cleanupCancel: (() => void) | undefined;
     const stop = () => {
       job.stop();
@@ -5066,20 +5068,24 @@ export class Controller {
     };
     this.combinedCheckOwners.set(attempt.id, { stop, done: completed.promise });
     try {
-      const cancel = (this.options.schedule ?? defaultSchedule)(
+      const cancelDeadline = (this.options.schedule ?? defaultSchedule)(
         () => {
           timedOut = true;
           stop();
         },
         this.jobDeadline(attempt.id, slot.maximum_minutes),
       );
+      const cancel = () => {
+        cancelDeadline();
+        interrupted.resolve(null);
+      };
       this.jobCancels.set(attempt.id, cancel);
       const exit = await Promise.race([job.exited, interrupted.promise]);
       if (!exit) {
         this.settleJob(attempt, false, true);
         return false;
       }
-      const quiescent = await job.quiescent(this.options.schedule);
+      const quiescent = (await drained) && (await job.quiescent(this.options.schedule));
       cancel();
       let authority = false;
       try {
@@ -15159,6 +15165,7 @@ export class Controller {
       return;
     }
     const schedule = this.options.schedule ?? defaultSchedule;
+    const boundary = Promise.withResolvers<void>();
     let timedOut = false;
     let job: OwnedCommand;
     try {
@@ -15173,17 +15180,23 @@ export class Controller {
       this.settleJob(attempt, false);
       return;
     }
-    const cancel = schedule(() => {
+    const drained = closedBefore(job.closed, boundary.promise);
+    const cancelDeadline = schedule(() => {
       timedOut = true;
       job.stop();
       schedule(() => {
+        boundary.resolve();
         this.settleJob(attempt, false);
       }, 1000);
     }, deadline());
+    const cancel = () => {
+      cancelDeadline();
+      boundary.resolve();
+    };
     this.jobCancels.set(attempt.id, cancel);
     void job.exited
       .then(async (exit) => {
-        const quiescent = await job.quiescent(this.options.schedule);
+        const quiescent = (await drained) && (await job.quiescent(this.options.schedule));
         cancel();
         if (!this.settleJob(attempt, quiescent)) return;
         if (this.cancelledJobs.has(attempt.id)) {
@@ -15197,6 +15210,7 @@ export class Controller {
             exit.code === 0 &&
             !job.failed &&
             !timedOut &&
+            deadline() > 0 &&
             (!prepared ||
               (Date.parse(prepared.expiresAt) > Date.parse(this.now()) &&
                 !!this.store.receipt(`evaluation-consent:${prepared.scopeHash}`))),

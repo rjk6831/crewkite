@@ -75,7 +75,7 @@ import {
 } from '../host/check-ownership.ts';
 import { refValue } from '../host/publication.ts';
 import { committedFiles, git, inspectSource, materialize, readFiles } from '../host/source.ts';
-import { closedWithin, groupAbsent, OwnedCommand } from '../host/worker.ts';
+import { closedBefore, closedWithin, groupAbsent, OwnedCommand } from '../host/worker.ts';
 import { type AcpSetupProof, acpClientPin } from '../providers/google/acp/profile.ts';
 import {
   type NativeProfileResolution,
@@ -627,6 +627,23 @@ test('a committed launch intent survives restart without another launch', async 
 });
 
 test('a retained descendant blocks sealing and transfer after its leader exits', async (t) => {
+  for (const first of ['close', 'deadline', 'cancel'] as const) {
+    const closed = Promise.withResolvers<void>();
+    const boundary = Promise.withResolvers<void>();
+    let observed: boolean | undefined;
+    const proof = closedBefore(closed.promise, boundary.promise).then((value) => {
+      observed = value;
+      return value;
+    });
+    await Promise.resolve();
+    assert.equal(observed, undefined, 'leader exit does not complete the stream proof');
+    if (first === 'close') closed.resolve();
+    else boundary.resolve();
+    assert.equal(await proof, first === 'close', first);
+    closed.resolve();
+    boundary.resolve();
+    assert.equal(await proof, first === 'close', 'late closure cannot rewrite the boundary');
+  }
   const { controller, command, draft, fixtures } = await setup(t, {
     scenarioForRoute: () => 'stubborn',
   });
@@ -650,6 +667,12 @@ test('a retained descendant blocks sealing and transfer after its leader exits',
     assert.equal(exit.signal, null);
     assert.equal(exit.quiescent, false);
     assert.equal(groupAbsent(job.group), false);
+    const boundary = Promise.withResolvers<void>();
+    let drained: boolean | undefined;
+    const withinBudget = closedBefore(job.closed, boundary.promise).then((value) => {
+      drained = value;
+      return value;
+    });
     if (streams === 'ignore') await nativeWait('closed command streams', job.closed);
     assert.equal(
       await job.quiescent((work, milliseconds) => {
@@ -660,6 +683,8 @@ test('a retained descendant blocks sealing and transfer after its leader exits',
       false,
       'a live descendant or retained stream cannot prove quiescence',
     );
+    if (streams === 'inherit')
+      assert.equal(drained, undefined, 'the old cleanup grace cannot spend the admitted deadline');
     process.kill(-job.group, 'SIGUSR2');
     await nativeWait('released command descendant', job.closed);
     if (streams === 'ignore') {
@@ -680,6 +705,8 @@ test('a retained descendant blocks sealing and transfer after its leader exits',
         polling = false;
       }
     }
+    assert.equal(await withinBudget, true, 'physical closure arrived before the owner boundary');
+    boundary.resolve();
     assert.equal(await job.quiescent(), true);
     assert.equal(groupAbsent(job.group), true);
     assert.equal(exit.quiescent, false, 'the leader exit snapshot remains historical');
@@ -4614,11 +4641,22 @@ test('an appointed native proposal is retained and applied once after every phas
       controller = await context.restart();
     }
     let checkLaunches = 0;
+    let expiredAtClose = false;
     let replay: Promise<unknown> | undefined;
     const finished = Promise.withResolvers<void>();
     const off = context.observe(controller, (event) => {
       if (event.type === 'attempt.launched') {
         checkLaunches++;
+        if (scenario === 'check-drain-expired')
+          queueMicrotask(() => {
+            const jobs = Reflect.get(controller, 'jobs') as Map<string, OwnedCommand>;
+            const job = jobs.get(event.payload.id);
+            assert(job instanceof OwnedCommand);
+            job.child.once('close', () => {
+              clock.advance(60001);
+              expiredAtClose = true;
+            });
+          });
         replay = controller
           .execute(command('StartCandidateEvaluation', startPayload(), revision()), 'local-owner')
           .then((result) => assert.equal(result.outcome, 'already-applied'));
@@ -4671,7 +4709,10 @@ test('an appointed native proposal is retained and applied once after every phas
     assert.equal(snapshot.reviewJobs?.length, 0);
     assert.equal(snapshot.evidence.length, scenario.endsWith('intent') ? 0 : 1);
     if (!scenario.endsWith('intent')) {
-      assert.equal(snapshot.evidence[0].passed, scenario !== 'failed');
+      assert.equal(
+        snapshot.evidence[0].passed,
+        scenario !== 'failed' && scenario !== 'check-drain-expired',
+      );
       assert.equal(snapshot.evidence[0].evaluator.startsWith('node:'), true);
       const intent = controller.store.intents().at(-1);
       assert(intent);
@@ -4679,6 +4720,23 @@ test('an appointed native proposal is retained and applied once after every phas
       assert.equal(route?.fake, false);
       assert.equal(route?.qualified, false);
       assert.equal(route?.family, 'local');
+      if (scenario === 'check-drain-expired') {
+        assert.equal(expiredAtClose, true);
+        assert.equal(intent.state, 'stopped');
+        assert.equal(snapshot.tasks[0].state, 'failed');
+        const metadata = controller.store.get<Artifact>(
+          'artifact',
+          snapshot.evidence[0].artifactId,
+        );
+        assert(metadata);
+        const proof = JSON.parse(
+          new ArtifactFiles(join(controller.home, 'artifacts'))
+            .read(metadata.hash)
+            .toString('utf8'),
+        );
+        assert.equal(proof.complete, true, 'expiry does not erase the complete Node report');
+        assert.equal(proof.unchanged, true);
+      }
     }
     assert.deepEqual(snapshot.runs.at(-1), originalRun);
     assert.notEqual(snapshot.tasks[0].state, 'ready');
@@ -4689,13 +4747,13 @@ test('an appointed native proposal is retained and applied once after every phas
       evaluationPreview.stage,
       scenario.endsWith('intent')
         ? 'blocked'
-        : scenario === 'failed'
+        : scenario === 'failed' || scenario === 'check-drain-expired'
           ? 'check-failed'
           : 'awaiting-review',
     );
     assert.equal(
       evaluationPreview.reviewStart.available,
-      !scenario.endsWith('intent') && scenario !== 'failed',
+      !scenario.endsWith('intent') && scenario !== 'failed' && scenario !== 'check-drain-expired',
     );
     const reviewPayload = startPayload();
     const shouldReview = passedReview || scenario.startsWith('review-');
@@ -5048,6 +5106,7 @@ test('an appointed native proposal is retained and applied once after every phas
       'anthropic-checked',
       'google-checked',
       'failed',
+      'check-drain-expired',
       'stop-intent',
       'expired-intent',
       'revoked-intent',

@@ -229,6 +229,20 @@ export class OwnedCommand {
   }
 }
 
+export function closedBefore(closed: Promise<void>, boundary: Promise<unknown>): Promise<boolean> {
+  // The owner keeps its admitted deadline armed while exited children drain their pipes.
+  return Promise.race([
+    closed.then(
+      () => true,
+      () => false,
+    ),
+    boundary.then(
+      () => false,
+      () => false,
+    ),
+  ]);
+}
+
 export function closedWithin(
   closed: Promise<void>,
   schedule: Schedule = defaultSchedule,
