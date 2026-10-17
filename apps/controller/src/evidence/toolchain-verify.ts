@@ -1,6 +1,6 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
 import { mkdir, realpath, symlink } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { setImmediate } from 'node:timers/promises';
 import { hashCanonical } from '@crewkite/contracts/hash';
 import {
@@ -489,6 +489,7 @@ export class ToolchainVerification {
     try {
       this.live();
       if (!validToolchainDefinition(definition)) throw Error('Verification definition changed.');
+      await mkdir(dirname(directory), { recursive: true, mode: 0o700 });
       await mkdir(directory, { mode: 0o700 });
       await mkdir(stateRoot, { mode: 0o700 });
       for (const path of ['environment', 'temporary', 'bin'])
