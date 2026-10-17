@@ -65,6 +65,9 @@ const rateLimit = {
 
 test('native text replacement stays bound to one proposal and owned task deadline', async () => {
   assert.equal(plan.timeoutMs, 300000);
+  assert.deepEqual(JSON.parse(plan.argv[plan.argv.indexOf('--settings') + 1]), {
+    disableAllHooks: true,
+  });
   for (const [flag, value] of [
     ['--tools', ''],
     ['--setting-sources', ''],

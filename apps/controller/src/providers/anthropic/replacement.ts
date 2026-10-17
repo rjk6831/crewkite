@@ -99,7 +99,7 @@ export function replacementPlan(value: z.input<typeof input>) {
     '--setting-sources',
     '',
     '--settings',
-    '{"disableAllHooks":true,"forceLoginMethod":"claudeai"}',
+    '{"disableAllHooks":true}',
     '--tools',
     '',
     '--disallowedTools',
