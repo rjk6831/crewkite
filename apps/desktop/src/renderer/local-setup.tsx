@@ -10,6 +10,8 @@ import type { DesktopCommand, Workspace } from './source.ts';
 const setupReasons: Record<NonNullable<LocalSetupState['reason']>, string> = {
   unconfigured: 'Configure a loopback endpoint first.',
   'connection-required': 'Connect through the native input window.',
+  'connection-unavailable':
+    'Local connection failed. Confirm the server authentication setting matches this connection.',
   'input-active': 'The native connection input window is open.',
   'input-unknown': 'Connection input ownership is unknown. Refresh saved status before continuing.',
   'discovery-required': 'Refresh the model list to observe the connected runtime.',
@@ -50,6 +52,8 @@ const applied = (outcome: string) => outcome === 'applied' || outcome === 'alrea
 
 export function LocalSetup({ snapshot, workspace }: { snapshot: Snapshot; workspace: Workspace }) {
   const setup = snapshot.localSetup;
+  const authMode = setup?.authMode ?? 'token';
+  const connectionReady = setup?.connected ?? setup?.secretConfigured ?? false;
   const [endpoint, setEndpoint] = useState(setup?.endpoint ?? '');
   const [endpointEdited, setEndpointEdited] = useState(false);
   const [choiceId, setChoiceId] = useState<string | null>(null);
@@ -110,13 +114,17 @@ export function LocalSetup({ snapshot, workspace }: { snapshot: Snapshot; worksp
         <span>Writer only · Qualification pending</span>
       </div>
       <p className="muted small">
-        Connect to an existing Local runtime. Connection input opens in a native window. Refresh
+        Connect to an existing Local runtime using its saved authentication mode. Dedicated token
+        opens a native input window. No authentication connects without a token to this device's
+        loopback endpoint. CrewKite does not change the runtime's authentication setting. Refresh
         reads model metadata without loading a model or starting generation. Connecting or
         refreshing models clears the saved model choice. Select a model from the new observation.
       </p>
       <p className="notice" role="status">
         {setup?.reason
-          ? setupReasons[setup.reason]
+          ? setup.reason === 'connection-required' && authMode === 'none'
+            ? 'Connect to the configured Local runtime.'
+            : setupReasons[setup.reason]
           : setup
             ? 'Inspect the saved connection and model state.'
             : 'Local setup is unavailable. Refresh saved status.'}
@@ -184,7 +192,7 @@ export function LocalSetup({ snapshot, workspace }: { snapshot: Snapshot; worksp
               void action('Endpoint configuration', {
                 command: 'ConfigureLocal',
                 expectedRevision: setup.revision,
-                payload: { endpoint: parsedEndpoint.data },
+                payload: { endpoint: parsedEndpoint.data, authMode },
               });
           }}
         >
@@ -196,7 +204,7 @@ export function LocalSetup({ snapshot, workspace }: { snapshot: Snapshot; worksp
           disabled={blocked || !setup?.endpoint}
           onClick={() => {
             if (setup?.endpoint)
-              void action('Connection input', {
+              void action(authMode === 'none' ? 'Local connection' : 'Connection input', {
                 command: 'BeginLocalConnectionInput',
                 expectedRevision: setup.revision,
                 payload: { consent: 'explicit' },
@@ -208,7 +216,7 @@ export function LocalSetup({ snapshot, workspace }: { snapshot: Snapshot; worksp
         <button
           className="button secondary"
           type="button"
-          disabled={blocked || !setup?.secretConfigured}
+          disabled={blocked || !connectionReady}
           onClick={() => {
             if (setup)
               void action('Model refresh', {
@@ -264,9 +272,10 @@ export function LocalSetup({ snapshot, workspace }: { snapshot: Snapshot; worksp
       <div className="facts-grid">
         <Fact label="Saved endpoint" value={setup?.endpoint ?? 'Unconfigured'} />
         <Fact
-          label="Connection input"
-          value={setup?.secretConfigured ? 'Configured' : 'Not configured'}
+          label="Authentication"
+          value={authMode === 'none' ? 'No authentication, this device only' : 'Dedicated token'}
         />
+        <Fact label="Connection" value={connectionReady ? 'Connected' : 'Not connected'} />
         <Fact label="Generation" value={setup?.generation ?? 'Unknown'} />
         <Fact
           label="Selected model"

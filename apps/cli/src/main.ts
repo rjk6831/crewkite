@@ -26,6 +26,7 @@ import {
   type ConversationEntry,
   ConversationPlanningSelectionSchema,
   canonicalJson,
+  LocalAuthModeSchema,
   LocalEndpointSchema,
   LocalModelSelectionSchema,
   MAX_FRAME_BYTES,
@@ -53,7 +54,7 @@ const help = `Usage: crewkite project add <path> [--json] [--home path]
        crewkite conversation answer <task-id> --question-id message-id --text text [--json] [--home path]
        crewkite conversation adopt <task-id> --proposal-id message-id --proposal-hash hash [--json] [--home path]
        crewkite local status [--json] [--home path]
-       crewkite local configure --endpoint ws://127.0.0.1:port [--json] [--home path]
+       crewkite local configure --endpoint ws://127.0.0.1:port [--authentication token|none] [--json] [--home path]
        crewkite local <connect|refresh-models> --consent [--json] [--home path]
        crewkite local cancel-input <operation-id> [--json] [--home path]
        crewkite local disconnect [--json] [--home path]
@@ -141,6 +142,7 @@ export async function runCli(
         'handoff-target': { type: 'string', multiple: true },
         output: { type: 'string' },
         endpoint: { type: 'string' },
+        authentication: { type: 'string' },
         'observation-hash': { type: 'string' },
         family: { type: 'string' },
         consent: { type: 'boolean' },
@@ -213,7 +215,7 @@ export async function runCli(
       const allowed = new Set([
         'json',
         'home',
-        ...(action === 'configure' ? ['endpoint'] : []),
+        ...(action === 'configure' ? ['endpoint', 'authentication'] : []),
         ...(['connect', 'refresh-models'].includes(action) ? ['consent'] : []),
         ...(action === 'select-model' ? ['observation-hash'] : []),
       ]);
@@ -221,14 +223,21 @@ export async function runCli(
         throw new Error('This option does not apply to the Local action. Use --help.');
       if (['connect', 'refresh-models'].includes(action) && !values.consent)
         throw new Error('This Local action requires explicit --consent.');
-      if (action === 'configure') LocalEndpointSchema.parse(values.endpoint);
+      if (action === 'configure') {
+        LocalEndpointSchema.parse(values.endpoint);
+        if (values.authentication !== undefined) LocalAuthModeSchema.parse(values.authentication);
+      }
       if (action === 'select-model')
         LocalModelSelectionSchema.parse({
           selectionId: id,
           observationHash: values['observation-hash'],
         });
-    } else if (values.endpoint !== undefined || values['observation-hash'] !== undefined)
-      throw new Error('Endpoint and observation options require a Local action.');
+    } else if (
+      values.endpoint !== undefined ||
+      values.authentication !== undefined ||
+      values['observation-hash'] !== undefined
+    )
+      throw new Error('Endpoint, authentication and observation options require a Local action.');
     const conversation = area === 'conversation';
     const planning = conversation && ['create', 'configure'].includes(action);
     const conversationOptions = [
@@ -804,7 +813,8 @@ export async function runCli(
             ? [
                 `Local revision ${setup.revision}, connection revision ${setup.connectionRevision}`,
                 `Endpoint ${setup.endpoint ?? 'not configured'}`,
-                `Connection ${setup.secretConfigured ? 'configured' : 'required'}`,
+                `Authentication ${setup.authMode === 'none' ? 'No authentication, this device only' : 'Dedicated token'}`,
+                `Connection ${(setup.connected ?? setup.secretConfigured) ? 'connected' : 'required'}`,
                 `Operation ${setup.operation ? `${setup.operation.kind} ${setup.operation.state} ${setup.operation.operationId}` : 'none'}`,
                 `Generation ${setup.generation}`,
                 `Reason ${setup.reason ?? 'none'}`,
@@ -847,7 +857,10 @@ export async function runCli(
       const result = await request(
         names[action as keyof typeof names],
         action === 'configure'
-          ? { endpoint: values.endpoint }
+          ? {
+              endpoint: values.endpoint,
+              ...(values.authentication !== undefined ? { authMode: values.authentication } : {}),
+            }
           : action === 'cancel-input'
             ? { operationId: id }
             : action === 'select-model'

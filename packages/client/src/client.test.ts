@@ -1364,6 +1364,18 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       command: 'ConfigureLocal',
       payload: { endpoint: 'ws://127.0.0.1:1234' },
     },
+    ...(['token', 'none'] as const).map((authMode) => ({
+      args: [
+        'local',
+        'configure',
+        '--endpoint',
+        'ws://127.0.0.1:1234',
+        '--authentication',
+        authMode,
+      ],
+      command: 'ConfigureLocal',
+      payload: { endpoint: 'ws://127.0.0.1:1234', authMode },
+    })),
     {
       args: ['local', 'connect', '--consent'],
       command: 'BeginLocalConnectionInput',
@@ -1428,8 +1440,28 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     '5'.repeat(64),
   ])
     assert(plainLocalStatus.output.includes(fact));
+  const tokenSetup = localSetup;
+  localSetup = {
+    ...localSetup,
+    authMode: 'none',
+    connected: true,
+    secretConfigured: false,
+    operation: null,
+  };
+  const noAuthStatus = await executeLocal(['local', 'status'], false);
+  assert.equal(noAuthStatus.code, 0, noAuthStatus.errors);
+  assert(noAuthStatus.output.includes('Authentication No authentication, this device only'));
+  assert(noAuthStatus.output.includes('Connection connected'));
+  assert.deepEqual(
+    localCommands.map((command) => command.command),
+    ['GetSnapshot'],
+  );
+  localSetup = tokenSetup;
   for (const args of [
     ['local', 'connect'],
+    ['local', 'configure', '--endpoint', 'ws://127.0.0.1:1234', '--authentication', 'automatic'],
+    ['local', 'connect', '--consent', '--authentication', 'none'],
+    ['health', '--authentication', 'none'],
     ['local', 'refresh-models'],
     ['local', 'cancel-input'],
     ['local', 'configure', '--endpoint', 'ws://localhost:1234'],

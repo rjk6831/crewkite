@@ -113,7 +113,7 @@ Google ACP permits guided or balanced authority, ordinary subscription billing a
 
 ## Local setup
 
-Local uses one configured loopback endpoint and the same controller state as the desktop. Configure the endpoint, then request the native connection prompt:
+Local uses one configured loopback endpoint and the same controller state as the desktop. Dedicated token is the default authentication mode. Configure the endpoint, then request the native connection prompt:
 
 ```sh
 pnpm crewkite local configure --endpoint ws://127.0.0.1:1234 --json
@@ -122,6 +122,15 @@ pnpm crewkite local status --json
 pnpm crewkite local refresh-models --consent --json
 pnpm crewkite local select-model <selection-id> --observation-hash <observation-hash> --json
 ```
+
+For a runtime already configured without authentication, choose that mode explicitly:
+
+```sh
+pnpm crewkite local configure --endpoint ws://127.0.0.1:1234 --authentication none --json
+pnpm crewkite local connect --consent --json
+```
+
+The desktop reports this mode as "No authentication, this device only". Connect uses the saved mode and opens no token prompt in this mode. CrewKite does not change the runtime's authentication setting. `--authentication token` restores the dedicated-token mode; omitting the option on configure also selects token mode. Status reports authentication separately from connection state. A no-auth connection has no configured secret.
 
 Enter the dedicated connection secret only in the native prompt. The CLI accepts no secret argument, stdin secret, credential environment option, setup receipt or helper path. Refresh reads the runtime's present models and loaded instances. It loads no model and starts no generation. Status reports the exact observation hash and selection IDs, with installed, loaded and incompatible states. Model identity comes from runtime metadata. It establishes no weight checksum or route qualification.
 
