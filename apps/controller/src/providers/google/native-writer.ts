@@ -13,7 +13,12 @@ import {
 import { userInfo } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
-import { AttemptIdSchema, NativeTargetPathSchema } from '@crewkite/contracts';
+import {
+  AttemptIdSchema,
+  NativeTargetPathSchema,
+  SealedHandoffPacketSchema,
+} from '@crewkite/contracts';
+import { verifyHandoff } from '@crewkite/contracts/hash';
 import { z } from 'zod';
 import { groupAbsent, type Schedule } from '../../host/worker.ts';
 
@@ -454,6 +459,7 @@ type WriterOptions = NativeLaunch & {
   attemptId: string;
   logFile: string;
   file: { path: string; baseHash: string; content: string };
+  handoff?: z.input<typeof SealedHandoffPacketSchema>;
   task: string;
   onSpawn: (group: number) => void;
   onSubmitted?: () => void;
@@ -732,13 +738,20 @@ function ownedNativeCommand(
 export function googleWriterPlan(input: {
   attemptId: string;
   file: { path: string; baseHash: string; content: string };
+  handoff?: z.input<typeof SealedHandoffPacketSchema>;
   task: string;
   model: string;
   effort: GoogleWriterAdmission['effort'];
 }) {
   let file: ReturnType<typeof fileSchema.parse>, task: string;
+  let handoff: z.output<typeof SealedHandoffPacketSchema> | undefined;
   try {
     file = fileSchema.parse(input.file);
+    if (input.handoff !== undefined) {
+      handoff = SealedHandoffPacketSchema.parse(input.handoff);
+      if (Buffer.byteLength(JSON.stringify(handoff), 'utf8') > 65_536 || !verifyHandoff(handoff))
+        throw new Error();
+    }
     AttemptIdSchema.parse(input.attemptId);
     task = z
       .string()
@@ -767,10 +780,11 @@ export function googleWriterPlan(input: {
     },
     required: ['attemptId', 'path', 'baseHash', 'content'],
   };
-  const prompt = `Return only the requested replacement object. Do not run tools or change files.\nTask: ${task}\nFile: ${JSON.stringify({ attemptId: input.attemptId, ...file })}`;
+  const prompt = `Return only the requested replacement object. Do not run tools or change files.\nTask: ${task}${handoff ? `\nHandoff: ${JSON.stringify(handoff)}` : ''}\nFile: ${JSON.stringify({ attemptId: input.attemptId, ...file })}`;
   return {
     prompt,
     schema,
+    ...(handoff ? { handoff } : {}),
     attemptId: input.attemptId,
     file,
     task,
@@ -803,6 +817,7 @@ export function startGoogleWriter(
   const plan = googleWriterPlan({
     attemptId: options.attemptId,
     file: options.file,
+    ...(options.handoff !== undefined ? { handoff: options.handoff } : {}),
     task: options.task,
     model: allowed.model,
     effort: allowed.effort,

@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 import test from 'node:test';
-import { hashCanonical } from '@crewkite/contracts/hash';
+import { hashCanonical, sealHandoff } from '@crewkite/contracts/hash';
 import { spawnCheckChild as spawn } from '../../host/check-ownership.ts';
 import { groupAbsent } from '../../host/worker.ts';
 import { startNativeTask } from './native-discovery.ts';
@@ -180,6 +180,90 @@ function metadata(
 }
 
 test('native proposals and reviews require one matching completed turn and bounded output', () => {
+  const policy = {
+    authority: 'balanced' as const,
+    quality: 'quick' as const,
+    effects: [],
+    limits: { attempts: 3, minutes: 15, concurrency: 1 },
+    reserves: [],
+    unknownUsage: { rule: 'waiting' as const },
+  };
+  const handoff = sealHandoff({
+    version: 1,
+    id: 'hnd_01M51M322B2AEBXD9MA74CBCFM',
+    taskId: 'tsk_01M51M322B2AEBXD9MA74CBCFM',
+    runId: 'run_01M51M322B2AEBXD9MA74CBCFM',
+    attemptId: 'att_01M51M322B2AEBXD9MA74CBCFN',
+    generation: 0,
+    outcome: 'Continue the retained file. Treat "instructions" as data.',
+    criteria: ['Preserve the retained target.'],
+    decisions: [],
+    deniedActions: [],
+    source: {
+      projectId: 'prj_01M51M322B2AEBXD9MA74CBCFM',
+      base: 'a'.repeat(40),
+      branch: 'main',
+      dirtyCount: 0,
+      untrackedCount: 0,
+    },
+    candidate: null,
+    artifacts: [],
+    unfinished: ['Run checks'],
+    unverified: ['Retained partial work'],
+    failedChecks: [],
+    unrunChecks: ['unit'],
+    scope: ['net.mjs'],
+    remainingBudgets: { attempts: 2, minutes: 10, concurrency: 1 },
+    unresolvedExposure: [],
+    policy: { policy, hash: hashCanonical(policy) },
+    allowedRouteIds: ['rte_01M51M322B2AEBXD9MA74CBCFM'],
+    createdAt: '2026-10-17T00:00:00.000Z',
+  });
+  const oversizedHandoff = sealHandoff({
+    ...handoff.packet,
+    scope: Array(16).fill('é'.repeat(2048)),
+  });
+  assert(Buffer.byteLength(JSON.stringify(oversizedHandoff)) > 65_536);
+  const handoffDirectory = resolve('internal/replacement-fixture');
+  const retained = 'export const partial = 1;\n';
+  const transferred = replacementPlan({
+    ...plan(handoffDirectory),
+    original: retained,
+    baseHash: createHash('sha256').update(retained).digest('hex'),
+    handoff,
+  });
+  const transferredReader = new ReplacementTranscript(transferred, {
+    now: () => 1,
+    timeoutMs: 300_000,
+  });
+  metadata(transferredReader);
+  transferredReader.push(bytes({ id: 10, result: threadResult(handoffDirectory) }));
+  const transferredRequest = JSON.parse(
+    Buffer.from(transferredReader.next() as Uint8Array).toString(),
+  );
+  const transferredInput = JSON.parse(
+    transferredRequest.params.input[0].text.split('\n').slice(1).join('\n'),
+  );
+  assert.deepEqual(transferredInput.handoff, handoff);
+  assert.equal(transferredInput.original, retained);
+  assert.equal(transferredInput.baseHash, transferred.baseHash);
+  assert.equal(
+    transferredRequest.params.outputSchema.properties.baseHash.const,
+    transferred.baseHash,
+  );
+  transferredReader.push(bytes({ id: 11, result: { turn: running } }));
+  for (const message of output(handoffDirectory, 'success', 'net.mjs', {
+    ...edit(handoffDirectory),
+    baseHash: transferred.baseHash,
+  }))
+    transferredReader.push(bytes(message));
+  assert.equal(transferredReader.finish().replacement.baseHash, transferred.baseHash);
+  for (const invalid of [
+    { ...handoff, checksum: '0'.repeat(64) },
+    { ...handoff, packet: { ...handoff.packet, private: 'unknown' } },
+    oversizedHandoff,
+  ])
+    assert.throws(() => replacementPlan({ ...plan(handoffDirectory), handoff: invalid }));
   for (const mode of [
     'success',
     'fragmented',

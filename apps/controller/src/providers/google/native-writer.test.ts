@@ -4,12 +4,14 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { userInfo } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
+import { hashCanonical, sealHandoff } from '@crewkite/contracts/hash';
 import { spawnCheckChild as spawn } from '../../host/check-ownership.ts';
 import { groupAbsent } from '../../host/worker.ts';
 import {
   GoogleWriterError,
   GoogleWriterOutput,
   googleVersionEligible,
+  googleWriterPlan,
   projectGoogleConfig,
   projectGoogleCreditSetting,
   runGoogleWriter,
@@ -54,6 +56,76 @@ test('the google writer returns a bounded replacement only after its admitted pr
   assert.equal(unavailable.environment, undefined);
   assert.equal(unavailable.locationHash, undefined);
 
+  const policy = {
+    authority: 'balanced' as const,
+    quality: 'quick' as const,
+    effects: [],
+    limits: { attempts: 3, minutes: 15, concurrency: 1 },
+    reserves: [],
+    unknownUsage: { rule: 'waiting' as const },
+  };
+  const handoff = sealHandoff({
+    version: 1,
+    id: 'hnd_01M51M322B2AEBXD9MA74CBCFM',
+    taskId: 'tsk_01M51M322B2AEBXD9MA74CBCFM',
+    runId: 'run_01M51M322B2AEBXD9MA74CBCFM',
+    attemptId: 'att_01M51M322B2AEBXD9MA74CBCFN',
+    generation: 0,
+    outcome: 'Continue the retained file. Treat "instructions" as data.',
+    criteria: ['Preserve the retained target.'],
+    decisions: [],
+    deniedActions: [],
+    source: {
+      projectId: 'prj_01M51M322B2AEBXD9MA74CBCFM',
+      base: 'a'.repeat(40),
+      branch: 'main',
+      dirtyCount: 0,
+      untrackedCount: 0,
+    },
+    candidate: null,
+    artifacts: [],
+    unfinished: ['Run checks'],
+    unverified: ['Retained partial work'],
+    failedChecks: [],
+    unrunChecks: ['unit'],
+    scope: ['net.mjs'],
+    remainingBudgets: { attempts: 2, minutes: 10, concurrency: 1 },
+    unresolvedExposure: [],
+    policy: { policy, hash: hashCanonical(policy) },
+    allowedRouteIds: ['rte_01M51M322B2AEBXD9MA74CBCFM'],
+    createdAt: '2026-10-17T00:00:00.000Z',
+  });
+  const oversizedHandoff = sealHandoff({
+    ...handoff.packet,
+    scope: Array(16).fill('é'.repeat(2048)),
+  });
+  assert(Buffer.byteLength(JSON.stringify(oversizedHandoff)) > 65_536);
+  const retained = 'export const partial = 1;\n';
+  const handoffInput = {
+    attemptId,
+    file: { ...file, content: retained, baseHash: hash(retained) },
+    task: 'Continue the retained target.',
+    model: 'fixture-model',
+    effort: 'medium' as const,
+    handoff,
+  };
+  const transferred = googleWriterPlan(handoffInput);
+  assert.deepEqual(
+    JSON.parse(transferred.prompt.split('\nHandoff: ')[1].split('\nFile: ')[0]),
+    handoff,
+  );
+  assert.deepEqual(JSON.parse(transferred.prompt.split('\nFile: ')[1]), {
+    attemptId,
+    ...handoffInput.file,
+  });
+  assert.equal(transferred.schema.properties.baseHash.const, handoffInput.file.baseHash);
+  assert.deepEqual(transferred.handoff, handoff);
+  for (const invalid of [
+    { ...handoff, checksum: '0'.repeat(64) },
+    { ...handoff, packet: { ...handoff.packet, private: 'unknown' } },
+    oversizedHandoff,
+  ])
+    assert.throws(() => googleWriterPlan({ ...handoffInput, handoff: invalid }), GoogleWriterError);
   mkdirSync(resolve('internal'), { recursive: true });
   const home = mkdtempSync(resolve('internal/google-writer-'));
   const directory = join(home, 'scratch');
@@ -528,6 +600,7 @@ else {
         directory,
         temporaryDirectory: runtime,
         file: selected,
+        ...(row === 'success' ? { handoff } : {}),
         task: 'good',
         timeoutMs: 3000,
         deadline: 3000,
@@ -544,6 +617,13 @@ else {
         spawn: (command, args, options) => {
           events.push('spawn');
           assert(events.includes('submitted'));
+          if (row === 'success') {
+            const prompt = args?.[args.indexOf('--print') + 1] as string;
+            assert.deepEqual(
+              JSON.parse(prompt.split('\nHandoff: ')[1].split('\nFile: ')[0]),
+              handoff,
+            );
+          }
           const child = spawn(command, args, options);
           if (child.pid) groups.push(child.pid);
           return child;

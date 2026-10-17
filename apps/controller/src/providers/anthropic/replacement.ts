@@ -13,7 +13,13 @@ import {
 } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
-import { AttemptIdSchema, HashSchema, NativeTargetPathSchema } from '@crewkite/contracts';
+import {
+  AttemptIdSchema,
+  HashSchema,
+  NativeTargetPathSchema,
+  SealedHandoffPacketSchema,
+} from '@crewkite/contracts';
+import { verifyHandoff } from '@crewkite/contracts/hash';
 import { z } from 'zod';
 import { groupAbsent, type Schedule } from '../../host/worker.ts';
 import {
@@ -35,6 +41,11 @@ const input = z.strictObject({
   path: NativeTargetPathSchema.optional(),
   original: z.string().max(MAX_CONTENT),
   criteria: z.array(z.string().min(1).max(4096)).min(1).max(32),
+  handoff: SealedHandoffPacketSchema.refine(
+    (packet) =>
+      Buffer.byteLength(JSON.stringify(packet), 'utf8') <= 65_536 && verifyHandoff(packet),
+    'The handoff packet must be sealed and within 64 KiB.',
+  ).optional(),
 });
 type Failure =
   | 'plan'
@@ -135,6 +146,7 @@ export function replacementPlan(value: z.input<typeof input>) {
       baseHash: data.baseHash,
       criteria: data.criteria,
       original: data.original,
+      ...(data.handoff ? { handoff: data.handoff } : {}),
     });
   return {
     input: data,
