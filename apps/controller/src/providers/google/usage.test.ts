@@ -62,6 +62,7 @@ const projected: ReturnType<typeof projectGoogleUsage> = [
   {
     windowId: 'gemini-argon-wtu-weekly',
     kind: 'weekly',
+    semantics: { scope: 'model', periodSeconds: 604800 },
     remainingPercent: 100,
     resetsAt: '2026-10-23T14:13:03.000Z',
   },

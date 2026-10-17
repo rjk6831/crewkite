@@ -12,7 +12,7 @@ type UsageReader = Snapshot['usageReaders'][number];
 
 export type UsageGaugeReading = Pick<
   Observation,
-  'windowId' | 'remaining' | 'resetsAt' | 'observedAt' | 'source' | 'confidence'
+  'windowId' | 'semantics' | 'remaining' | 'resetsAt' | 'observedAt' | 'source' | 'confidence'
 > & {
   id: string;
   label: string;
@@ -29,6 +29,7 @@ export type UsageGaugeCard = {
   routeIds: readonly string[];
   fixture: boolean;
   primary: { weekly: UsageGaugeReading | null; fiveHour: UsageGaugeReading | null };
+  featured: UsageGaugeReading | null;
   satellites: readonly UsageGaugeReading[];
   reader: UsageReader | null;
   notice: string | null;
@@ -176,21 +177,27 @@ export function projectUsagePresentation(
         observedAt: observation.observedAt,
         source: observation.source,
         confidence: observation.confidence,
+        ...(observation.semantics ? { semantics: observation.semantics } : {}),
         state: displayState(window, nowMs),
         ...readingReserve(routeIds, observation, reserves),
       };
     });
     const candidates = (periodSeconds: number) =>
-      readings.filter((_, index) => {
-        const semantics = orderedWindows[index].observation.semantics;
-        return semantics?.scope === 'provider' && semantics.periodSeconds === periodSeconds;
-      });
+      readings.filter(
+        ({ semantics }) =>
+          semantics?.scope === 'provider' && semantics.periodSeconds === periodSeconds,
+      );
     const weekly = candidates(604800);
     const fiveHour = candidates(18000);
     const primary = {
       weekly: weekly.length === 1 ? weekly[0] : null,
       fiveHour: fiveHour.length === 1 ? fiveHour[0] : null,
     };
+    // One model pool can take the center dial. Several stay in the auxiliary list; none is
+    // promoted. The featured reading stays a satellite too, so a host that does not draw the
+    // center dial still shows it.
+    const models = readings.filter(({ semantics }) => semantics?.scope === 'model');
+    const featured = models.length === 1 ? models[0] : null;
     const notices = scope.fixture
       ? ['Fixture data. No account allowance is established.']
       : ['Account and shared-pool identity are unknown.'];
@@ -213,6 +220,7 @@ export function projectUsagePresentation(
       routeIds,
       fixture: scope.fixture,
       primary,
+      featured,
       satellites: readings.filter((reading) => !Object.values(primary).includes(reading)),
       reader: family === 'google' && !scope.fixture ? reader : null,
       notice: notices.join(' '),

@@ -1039,6 +1039,7 @@ function usageWindowKind(id: string): GoogleUsageBucket['kind'] {
 function usageWindowSemantics(id: string): Observation['semantics'] {
   if (id === 'gemini-weekly') return { scope: 'provider', periodSeconds: 604800 };
   if (id === 'gemini-5h') return { scope: 'provider', periodSeconds: 18000 };
+  if (id === 'gemini-argon-wtu-weekly') return { scope: 'model', periodSeconds: 604800 };
   return undefined;
 }
 
