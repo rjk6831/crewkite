@@ -26,6 +26,8 @@ import {
   type ConversationEntry,
   ConversationPlanningSelectionSchema,
   canonicalJson,
+  LocalEndpointSchema,
+  LocalModelSelectionSchema,
   MAX_FRAME_BYTES,
   NativeHandoffTargetsSchema,
   PolicySchema,
@@ -49,6 +51,12 @@ const help = `Usage: crewkite project add <path> [--json] [--home path]
        crewkite conversation <send|guide> <task-id> --text text [--json] [--home path]
        crewkite conversation answer <task-id> --question-id message-id --text text [--json] [--home path]
        crewkite conversation adopt <task-id> --proposal-id message-id --proposal-hash hash [--json] [--home path]
+       crewkite local status [--json] [--home path]
+       crewkite local configure --endpoint ws://127.0.0.1:port [--json] [--home path]
+       crewkite local <connect|refresh-models> --consent [--json] [--home path]
+       crewkite local cancel-input <operation-id> [--json] [--home path]
+       crewkite local disconnect [--json] [--home path]
+       crewkite local select-model <selection-id> --observation-hash hash [--json] [--home path]
        crewkite native profiles [--json] [--home path]
        crewkite native import-google --consent [--json] [--home path]
        crewkite native setup <show|initialize|authenticate|discover|stop> --family google [--consent] [--json] [--home path]
@@ -128,6 +136,8 @@ export async function runCli(
         'permission-mode': { type: 'string' },
         'handoff-target': { type: 'string', multiple: true },
         output: { type: 'string' },
+        endpoint: { type: 'string' },
+        'observation-hash': { type: 'string' },
         family: { type: 'string' },
         consent: { type: 'boolean' },
         'no-consent': { type: 'boolean' },
@@ -150,9 +160,48 @@ export async function runCli(
             (['prepare-evaluation', 'prepare-repository', 'prepare-handoff'].includes(action) &&
               extra.length === 1))
         )) ||
-      !['project', 'task', 'conversation', 'native', 'usage', 'health', 'retry'].includes(area)
+      !['project', 'task', 'conversation', 'local', 'native', 'usage', 'health', 'retry'].includes(
+        area,
+      )
     )
       throw new Error('Unknown command. Use --help.');
+    const local = area === 'local';
+    if (local) {
+      const takesId = action === 'cancel-input' || action === 'select-model';
+      if (
+        ![
+          'status',
+          'configure',
+          'connect',
+          'cancel-input',
+          'disconnect',
+          'refresh-models',
+          'select-model',
+        ].includes(action) ||
+        (takesId ? !id : id !== undefined)
+      )
+        throw new Error(
+          'Use local status, configure, connect, cancel-input, disconnect, refresh-models or select-model.',
+        );
+      const allowed = new Set([
+        'json',
+        'home',
+        ...(action === 'configure' ? ['endpoint'] : []),
+        ...(['connect', 'refresh-models'].includes(action) ? ['consent'] : []),
+        ...(action === 'select-model' ? ['observation-hash'] : []),
+      ]);
+      if (Object.keys(values).some((key) => !allowed.has(key)))
+        throw new Error('This option does not apply to the Local action. Use --help.');
+      if (['connect', 'refresh-models'].includes(action) && !values.consent)
+        throw new Error('This Local action requires explicit --consent.');
+      if (action === 'configure') LocalEndpointSchema.parse(values.endpoint);
+      if (action === 'select-model')
+        LocalModelSelectionSchema.parse({
+          selectionId: id,
+          observationHash: values['observation-hash'],
+        });
+    } else if (values.endpoint !== undefined || values['observation-hash'] !== undefined)
+      throw new Error('Endpoint and observation options require a Local action.');
     const conversation = area === 'conversation';
     const planning = conversation && ['create', 'configure'].includes(action);
     const conversationOptions = [
@@ -307,6 +356,7 @@ export async function runCli(
       !settingUpGoogle &&
       !importingGoogle &&
       !planning &&
+      !local &&
       (values.family !== undefined ||
         values.consent !== undefined ||
         values['no-consent'] !== undefined)
@@ -679,6 +729,76 @@ export async function runCli(
       return 0;
     }
 
+    if (local) {
+      const setup = snapshot.localSetup;
+      if (action === 'status') {
+        const profile =
+          snapshot.nativeProfiles.find((value) => value.id === 'local-file-v1') ?? null;
+        print(
+          { cursor: snapshot.cursor, setup: setup ?? null, profile },
+          setup
+            ? [
+                `Local revision ${setup.revision}, connection revision ${setup.connectionRevision}`,
+                `Endpoint ${setup.endpoint ?? 'not configured'}`,
+                `Connection ${setup.secretConfigured ? 'configured' : 'required'}`,
+                `Operation ${setup.operation ? `${setup.operation.kind} ${setup.operation.state} ${setup.operation.operationId}` : 'none'}`,
+                `Generation ${setup.generation}`,
+                `Reason ${setup.reason ?? 'none'}`,
+                `Observation ${setup.observation?.observationHash ?? 'none'}`,
+                `Selected ${setup.selection?.selectionId ?? 'none'}`,
+                ...(setup.observation?.models.map(
+                  (choice) =>
+                    `${choice.selectionId}  ${choice.identity.displayName}  ${choice.identity.format}  ${choice.state}  ${choice.qualification}${choice.reasons.length ? `  ${choice.reasons.join(', ')}` : ''}`,
+                ) ?? []),
+              ].join('\n')
+            : 'Local controls are unavailable in this controller.',
+        );
+        return 0;
+      }
+      if (!setup) throw new Error('Local controls are unavailable in this controller.');
+      if (
+        action === 'cancel-input' &&
+        (setup.operation?.kind !== 'input' || setup.operation.operationId !== id)
+      )
+        throw new Error(
+          'The input operation changed. Read Local status and cancel its exact operation ID.',
+        );
+      if (
+        action === 'select-model' &&
+        (!setup.observation ||
+          setup.observation.observationHash !== values['observation-hash'] ||
+          !setup.observation.models.some((choice) => choice.selectionId === id))
+      )
+        throw new Error(
+          'The observed model choice changed. Read Local status before selecting it.',
+        );
+      const names = {
+        configure: 'ConfigureLocal',
+        connect: 'BeginLocalConnectionInput',
+        'cancel-input': 'CancelLocalConnectionInput',
+        disconnect: 'DisconnectLocal',
+        'refresh-models': 'RefreshLocalModels',
+        'select-model': 'SelectLocalModel',
+      } as const;
+      const result = await request(
+        names[action as keyof typeof names],
+        action === 'configure'
+          ? { endpoint: values.endpoint }
+          : action === 'cancel-input'
+            ? { operationId: id }
+            : action === 'select-model'
+              ? { selectionId: id, observationHash: values['observation-hash'] }
+              : action === 'disconnect'
+                ? {}
+                : { consent: 'explicit' },
+        setup.revision,
+      );
+      print(
+        { command: sent, result },
+        `${result.reason ?? result.outcome}${result.next ? `\nNext: ${result.next}` : ''}\nCommand key ${sent?.key}`,
+      );
+      return succeeded(result) ? 0 : 2;
+    }
     if (settingUpGoogle) {
       const setup = snapshot.googleAcpSetup;
       if (id === 'show') {
@@ -721,7 +841,7 @@ export async function runCli(
         snapshot.nativeProfiles
           .map((profile) =>
             profile.family === 'local'
-              ? `${profile.id}  ${profile.model}  local resources  native launch unavailable`
+              ? `${profile.id}  ${profile.model}  local resources  ${profile.available ? 'available' : profile.reason}  ${profile.qualifiedAt ? `qualified ${profile.qualifiedAt}` : 'qualification pending'}`
               : profile.family !== 'openai'
                 ? `${profile.id}  ${profile.model}  ${profile.effort} requested effort  effective effort unknown  account class unknown  service tier unknown  ${profile.available ? 'available' : profile.reason}  ${profile.qualifiedAt ? `qualified ${profile.qualifiedAt}` : 'qualification pending'}  billing requires user attestation${profile.family === 'google' ? `  permission modes ${profile.permissionModes.join(', ')}` : ''}`
                 : profile.id === 'openai-repository-v1'
@@ -997,7 +1117,34 @@ export async function runCli(
     }
     if (action === 'prepare-native') {
       const profile = snapshot.nativeProfiles.find((profile) => profile.id === extra[0]);
-      if (profile?.family === 'local') throw new Error('Local native launch is unavailable.');
+      if (profile?.family === 'local') {
+        if (!profile.available) throw new Error(`Native profile unavailable: ${profile.reason}.`);
+        if (
+          values['existing-credits'] ||
+          values['confirm-subscription-only'] ||
+          values['permission-mode'] !== undefined ||
+          handoffTargets ||
+          values['model-id'] !== undefined ||
+          values['thought-level-id'] !== undefined ||
+          values['confirm-quota-account']
+        )
+          throw new Error(
+            'Local preparation uses the selected observed model, with no billing, effort or handoff options.',
+          );
+        return await finishAction(
+          await request(
+            'PrepareNativeRun',
+            {
+              taskId: task.id,
+              profileId: profile.id,
+              targetPath: extra[1],
+              policy: PolicySchema.parse(readJson(values.policy as string)),
+              consent: values['native-trust'] && values['source-consent'] ? 'explicit' : 'saved',
+            },
+            task.revision,
+          ),
+        );
+      }
       if (profile?.id === 'openai-repository-v1')
         throw new Error('Use task prepare-repository for repository work.');
       if (!profile?.available)
@@ -1202,10 +1349,14 @@ export async function runCli(
       const repositoryText = nativeRun?.repository
         ? `\nRepository ${nativeRun.repository.files} files, ${nativeRun.repository.bytes} bytes\nSource base ${nativeRun.repository.sourceBase}\nManifest ${nativeRun.repository.manifestHash}\nNative sandbox ${nativeRun.execution?.sandbox}\nNative approval ${nativeRun.execution?.approvalPolicy}\nNative network ${nativeRun.execution?.networkAccess === false ? 'off' : 'unknown'}\nExpires ${nativeRun.expiresAt ?? 'unknown'}`
         : '';
+      const localModel = nativeRun?.localModel;
+      const localModelText = localModel
+        ? `\nModel ${localModel.modelKey}\nInstance ${localModel.instanceReference}\nModel bytes ${localModel.modelSizeBytes}\nSetup ${localModel.setupHash}${'identityKind' in localModel ? `\nIdentity runtime metadata, ${localModel.format}\nMetadata ${localModel.metadataHash}\nConnection ${localModel.connectionHash}, revision ${localModel.connectionRevision}` : `\nIdentity retained artifact, ${localModel.artifactSha256}\nQuantization ${localModel.quantization}`}`
+        : '';
       const preview = nativeRun?.repository
         ? `\nNative ${nativeRun.profileId}, ${nativeRun.stage}${repositoryText}`
         : nativeRun
-          ? `\nNative ${nativeRun.profileId}, ${nativeRun.stage}\nTarget ${nativeRun.target?.path ?? 'unknown'}\nBase hash ${nativeRun.target?.baseHash ?? 'unknown'}\nBytes ${nativeRun.target?.bytes ?? 'unknown'}\nExpires ${nativeRun.expiresAt ?? 'unknown'}\nSource base ${run?.source.base ?? 'unknown'}${billingText}${permissionText}`
+          ? `\nNative ${nativeRun.profileId}, ${nativeRun.stage}\nTarget ${nativeRun.target?.path ?? 'unknown'}\nBase hash ${nativeRun.target?.baseHash ?? 'unknown'}\nBytes ${nativeRun.target?.bytes ?? 'unknown'}\nExpires ${nativeRun.expiresAt ?? 'unknown'}\nSource base ${run?.source.base ?? 'unknown'}${billingText}${permissionText}${localModelText}`
           : '';
       const handoffText = nativeRun?.handoff
         ? `\nManual handoff generation ${nativeRun.handoff.generation}\nAllowed recipients ${nativeRun.handoff.targets.map((value) => `${value.profileId}:${value.creditPolicy}`).join(', ')}\nPrepare ${nativeRun.handoff.prepare.reason}\nOriginal limits ${run?.policy.policy.limits.attempts ?? 'unknown'} attempts, ${run?.policy.policy.limits.minutes ?? 'unknown'} minutes${nativeRun.handoff.pending ? `\nPending recipient ${nativeRun.handoff.pending.recipient.profileId}:${nativeRun.handoff.pending.recipient.creditPolicy}\nPreparation ${nativeRun.handoff.pending.preparationId}\nPacket ${nativeRun.handoff.pending.packetId}\nRetained unverified base ${nativeRun.handoff.pending.baseHash}, ${nativeRun.handoff.pending.bytes} bytes\nExpires ${nativeRun.handoff.pending.expiresAt}\nStart ${nativeRun.handoff.pending.start.reason}` : ''}`

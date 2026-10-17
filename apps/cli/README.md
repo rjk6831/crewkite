@@ -111,6 +111,40 @@ Google ACP permits guided or balanced authority, ordinary subscription billing a
 
 `--confirm-quota-account` records that the separate CLI quota login and ACP sign-in use the same Google account. Shared native home does not prove identity. Every returned quota pool must be fresh and above reserve before admission. Disabling the reader grants no unknown-usage bypass. The headless Google file profile remains blocked.
 
+## Local setup
+
+Local uses one configured loopback endpoint and the same controller state as the desktop. Configure the endpoint, then request the native connection prompt:
+
+```sh
+pnpm crewkite local configure --endpoint ws://127.0.0.1:1234 --json
+pnpm crewkite local connect --consent --json
+pnpm crewkite local status --json
+pnpm crewkite local refresh-models --consent --json
+pnpm crewkite local select-model <selection-id> --observation-hash <observation-hash> --json
+```
+
+Enter the dedicated connection secret only in the native prompt. The CLI accepts no secret argument, stdin secret, credential environment option, setup receipt or helper path. Refresh reads the runtime's present models and loaded instances. It loads no model and starts no generation. Status reports the exact observation hash and selection IDs, with installed, loaded and incompatible states. Model identity comes from runtime metadata. It establishes no weight checksum or route qualification.
+
+Each mutation uses the current Local revision. Selection requires the exact displayed observation hash and a choice from that observation. A stale revision or changed observation refuses. An uncertain receipt keeps its exact command key for `retry`; a fresh command does not replay it.
+
+```sh
+pnpm crewkite local cancel-input <operation-id> --json
+pnpm crewkite local disconnect --json
+```
+
+Cancel names the current input operation. Disconnect clears the controller's private connection value and revokes pending input. Unknown input, discovery or generation ownership remains blocked. Neither command resets an uncertain generation. A controller without Local controls still exposes its retained snapshot and reports the controls unavailable.
+
+After selecting an eligible loaded model, prepare one committed text target through the ordinary native path:
+
+```sh
+pnpm crewkite task prepare-native <task-id> local-file-v1 net.mjs --policy native-policy.json --native-trust --source-consent --json
+pnpm crewkite task show <task-id> --json
+pnpm crewkite task start <task-id> --json
+pnpm crewkite task stop <task-id> --json
+```
+
+Preparation freezes the current selected model, setup, source and policy. It sends no provider request. Start rechecks controller admission and ownership. Local preparation accepts no cloud billing, effort, model override or handoff option. Changes and explicit export use the ordinary task commands. Repository writing, automatic handoff and Local review remain unavailable. Available model metadata still leaves qualification pending.
+
 ## Native single-file runs
 
 Create the project and draft task through the commands above or the desktop. List the controller's supported native profiles:
