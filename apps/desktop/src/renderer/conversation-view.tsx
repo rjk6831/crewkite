@@ -1771,6 +1771,7 @@ export function ConversationView({
       state.activeAttempt?.routeId === config?.routeId &&
       ['intent', 'running'].includes(state.activeAttempt?.state ?? ''),
   );
+  const contextUsage = current ? state?.contextUsage : null;
   const contextActivity =
     workspace.connection !== 'connected'
       ? 'Reconnect to inspect current activity.'
@@ -2016,11 +2017,18 @@ export function ConversationView({
               : undefined,
             contextMeter: visible ? (
               <ContextGauge
-                usedTokens={null}
-                capacityTokens={null}
-                measurement="unknown"
+                usedTokens={contextUsage?.usedTokens ?? null}
+                capacityTokens={contextUsage?.capacityTokens ?? null}
+                measurement={contextUsage ? 'last-observed' : 'unknown'}
+                measuredAt={contextUsage?.observedAt}
                 updating={primaryActive}
-                unavailableReason={`The provider has not reported context usage or capacity. ${contextActivity}`}
+                unavailableReason={
+                  contextUsage
+                    ? contextUsage.capacityTokens === null
+                      ? `The provider reported used tokens without context capacity. ${contextActivity}`
+                      : undefined
+                    : `No retained context usage is associated with this run and model. ${contextActivity}`
+                }
               />
             ) : undefined,
             hint:
