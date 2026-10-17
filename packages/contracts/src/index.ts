@@ -983,6 +983,73 @@ export const CandidateSchema = z.strictObject({
   artifactId: ArtifactIdSchema,
   revision: RevisionSchema,
 });
+const integrationTree = z.string().regex(/^[a-f0-9]{40}$/);
+const combinedContributor = z.strictObject({
+  taskId: TaskIdSchema,
+  runId: RunIdSchema,
+  attemptId: AttemptIdSchema,
+  generation: RevisionSchema,
+  routeId: RouteIdSchema,
+  candidateId: CandidateIdSchema,
+  candidateHash: HashSchema,
+  scopeHash: HashSchema,
+});
+const combinedStep = z.strictObject({
+  candidateId: CandidateIdSchema,
+  candidateHash: HashSchema,
+  definitionHash: HashSchema,
+  checkArtifactId: ArtifactIdSchema,
+  previousTree: integrationTree,
+  nextTree: integrationTree,
+});
+export const CombinedOriginSchema = z
+  .strictObject({
+    kind: z.literal('combined'),
+    taskId: TaskIdSchema,
+    runId: RunIdSchema,
+    preparationId: ArtifactIdSchema,
+    manifestHash: HashSchema,
+    generation: RevisionSchema,
+    sourceBase: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/),
+    sourceManifestHash: HashSchema,
+    policyHash: HashSchema,
+    criteriaHash: HashSchema,
+    contributors: z.tuple([combinedContributor, combinedContributor]),
+    steps: z.tuple([combinedStep, combinedStep]),
+    candidateId: CandidateIdSchema,
+    candidateHash: HashSchema,
+  })
+  .superRefine((origin, context) => {
+    const [first, second] = origin.contributors;
+    if (
+      first.taskId === second.taskId ||
+      [first.taskId, second.taskId].includes(origin.taskId) ||
+      first.runId === second.runId ||
+      [first.runId, second.runId].includes(origin.runId) ||
+      first.attemptId === second.attemptId ||
+      new Set([
+        first.candidateId,
+        second.candidateId,
+        ...origin.steps.map((step) => step.candidateId),
+        origin.candidateId,
+      ]).size !== 5 ||
+      origin.steps[0].checkArtifactId === origin.steps[1].checkArtifactId ||
+      origin.steps[0].nextTree !== origin.steps[1].previousTree ||
+      origin.steps[1].candidateHash !== origin.candidateHash ||
+      origin.steps.some((step) => step.previousTree === step.nextTree)
+    )
+      context.addIssue({
+        code: 'custom',
+        message: 'Combined origin needs distinct contributors and checked sequential advances.',
+      });
+  });
+export type CombinedOrigin = z.infer<typeof CombinedOriginSchema>;
+export const CombinedCheckContextSchema = z.strictObject({
+  manifestHash: HashSchema,
+  generation: RevisionSchema,
+  phase: z.enum(['baseline', 'replay-0', 'replay-1', 'final-check']),
+  originHash: HashSchema,
+});
 export const ScriptedReviewJobSchema = z
   .strictObject({
     taskId: TaskIdSchema,
@@ -1016,11 +1083,31 @@ export const NativeReviewJobSchema = z.strictObject({
   cycle: z.literal(1),
   limitMinutes: z.number().int().min(1).max(5),
 });
-export const ReviewJobSchema = z.discriminatedUnion('scripted', [
+export const CombinedNativeReviewJobSchema = NativeReviewJobSchema.omit({
+  writerAttemptId: true,
+  writerRouteId: true,
+})
+  .extend({
+    origin: CombinedOriginSchema,
+    profileId: z.literal('openai-file-v1'),
+    assignedRole: z.literal('reviewer'),
+  })
+  .refine(
+    (job) =>
+      job.taskId === job.origin.taskId &&
+      job.runId === job.origin.runId &&
+      job.candidateId === job.origin.candidateId &&
+      job.candidateHash === job.origin.candidateHash &&
+      !job.origin.contributors.some((contributor) => contributor.attemptId === job.attemptId),
+    'Combined review must bind the final origin and an independent attempt.',
+  );
+export const ReviewJobSchema = z.union([
   ScriptedReviewJobSchema,
   NativeReviewJobSchema,
+  CombinedNativeReviewJobSchema,
 ]);
 export type NativeReviewJob = z.infer<typeof NativeReviewJobSchema>;
+export type CombinedNativeReviewJob = z.infer<typeof CombinedNativeReviewJobSchema>;
 export const ReviewResultSchema = z
   .strictObject({
     job: ReviewJobSchema,
@@ -1185,6 +1272,87 @@ export const NativePreparationPayloadSchema = z.union([
     consent: z.enum(['explicit', 'saved']),
   }),
 ]);
+export const CombinedWriterSelectionSchema = z.discriminatedUnion('profileId', [
+  z.strictObject({
+    profileId: z.literal('openai-file-v1'),
+    creditPolicy: z.enum(['ordinary', 'existing-credits']),
+  }),
+  z.strictObject({
+    profileId: z.literal('anthropic-file-v1'),
+    creditPolicy: z.literal('ordinary'),
+    billingAttestation: NativeBillingAttestationSchema,
+  }),
+  z.strictObject({
+    profileId: z.literal('google-acp-v1'),
+    creditPolicy: z.literal('ordinary'),
+    billingAttestation: GoogleAcpBillingAttestationSchema,
+    permissionMode: z.literal('request-review'),
+    ...GoogleAcpSelectionSchema.shape,
+  }),
+]);
+const combinedMemberPreparation = z.strictObject({
+  taskId: TaskIdSchema,
+  expectedRevision: RevisionSchema,
+  scope: z.tuple([NativeTargetPathSchema]),
+  writer: CombinedWriterSelectionSchema,
+  consent: z.literal('explicit'),
+  maximumMinutes: z.number().int().min(1).max(5),
+});
+export const PrepareCombinedRunPayloadSchema = z
+  .strictObject({
+    taskId: TaskIdSchema,
+    policy: PolicySchema,
+    children: z.tuple([combinedMemberPreparation, combinedMemberPreparation]),
+    checks: z.strictObject({
+      recipeId: z.literal('project-node-tests-v1'),
+      testFiles: ProjectNodeTestFilesSchema,
+      replayTestFiles: z.tuple([ProjectNodeTestFilesSchema, ProjectNodeTestFilesSchema]),
+      interactionTestFiles: ProjectNodeTestFilesSchema,
+      maximumMinutes: z.literal(1),
+      baselineConsent: z.literal('explicit'),
+      replayConsents: z.tuple([z.literal('explicit'), z.literal('explicit')]),
+    }),
+    reviewer: z.strictObject({
+      profileId: z.literal('openai-file-v1'),
+      creditPolicy: z.enum(['ordinary', 'existing-credits']),
+      maximumMinutes: z.number().int().min(1).max(5),
+    }),
+  })
+  .superRefine((plan, context) => {
+    const [first, second] = plan.children;
+    const paths = plan.children.flatMap((child) => child.scope);
+    const replays = plan.checks.replayTestFiles.flat();
+    const methods = plan.policy.methods;
+    const minimumMinutes =
+      5 + first.maximumMinutes + second.maximumMinutes + plan.reviewer.maximumMinutes;
+    if (
+      first.taskId === second.taskId ||
+      [first.taskId, second.taskId].includes(plan.taskId) ||
+      paths[0] === paths[1] ||
+      paths.some((path) => paths.some((other) => other !== path && other.startsWith(`${path}/`))) ||
+      [...replays, ...plan.checks.interactionTestFiles].some(
+        (path) => !plan.checks.testFiles.includes(path),
+      ) ||
+      plan.checks.interactionTestFiles.some((path) => replays.includes(path)) ||
+      plan.checks.testFiles.some((path) => paths.includes(path)) ||
+      plan.policy.quality !== 'quick' ||
+      plan.policy.authority === 'autopilot' ||
+      !methods ||
+      methods.length !== 1 ||
+      methods[0].id !== 'keep-it-simple' ||
+      methods[0].cycles !== 1 ||
+      methods[0].reviewerRole !== 'reviewer' ||
+      plan.policy.limits.attempts < 7 ||
+      plan.policy.limits.concurrency < 2 ||
+      plan.policy.limits.minutes < minimumMinutes
+    )
+      context.addIssue({
+        code: 'custom',
+        message:
+          'Combined work needs two disjoint children, protected checks and its complete reserved policy.',
+      });
+  });
+export type PrepareCombinedRunPayload = z.infer<typeof PrepareCombinedRunPayloadSchema>;
 const nativeHandoffPreparationFields = {
   taskId: TaskIdSchema,
   runId: RunIdSchema,
@@ -1670,6 +1838,15 @@ export const CommandSchema = z.discriminatedUnion('command', [
     }),
   ),
   mutate('PrepareNativeRun', NativePreparationPayloadSchema),
+  mutate('PrepareCombinedRun', PrepareCombinedRunPayloadSchema),
+  mutate(
+    'AssembleCombinedCandidate',
+    z.strictObject({
+      taskId: TaskIdSchema,
+      runId: RunIdSchema,
+      preparationId: ArtifactIdSchema,
+    }),
+  ),
   mutate('PrepareNativeHandoff', NativeHandoffPreparationPayloadSchema),
   mutate(
     'StartNativeHandoff',
@@ -1936,6 +2113,123 @@ export const CandidateEvaluationPreviewSchema = z
   });
 export type CandidateEvaluationPreview = z.infer<typeof CandidateEvaluationPreviewSchema>;
 
+export const CombinedActionReasonSchema = z.enum([
+  'available',
+  'already-started',
+  'baseline-required',
+  'writers-incomplete',
+  'checks-required',
+  'checks-failed',
+  'review-required',
+  'review-failed',
+  'budget-exhausted',
+  'paused',
+  'owner-active',
+  'ownership-unknown',
+  'source-changed',
+  'task-changed',
+  'preparation-changed',
+  'scope-changed',
+  'profile-unavailable',
+  'authority-unavailable',
+  'ref-changed',
+  'stopped',
+  'accepted',
+]);
+const combinedAvailability = z
+  .strictObject({
+    available: z.boolean(),
+    reason: CombinedActionReasonSchema,
+  })
+  .refine((value) => value.available === (value.reason === 'available'));
+export const CombinedDispatchPhaseSchema = z.enum([
+  'baseline',
+  'writer-0',
+  'writer-1',
+  'replay-0',
+  'replay-1',
+  'final-check',
+  'review',
+]);
+const combinedDispatchPreview = z
+  .strictObject({
+    phase: CombinedDispatchPhaseSchema,
+    maximumMinutes: z.number().int().min(1).max(5),
+    state: z.enum(['reserved', 'running', 'passed', 'failed', 'stopped', 'unknown']),
+    attemptId: AttemptIdSchema.nullable(),
+    checkArtifactId: ArtifactIdSchema.nullable(),
+  })
+  .refine(
+    (dispatch) => (dispatch.state === 'reserved') === (dispatch.attemptId === null),
+    'A dispatched slot needs its actual attempt.',
+  );
+const combinedMemberPreview = z.strictObject({
+  taskId: TaskIdSchema,
+  runId: RunIdSchema,
+  scope: z.tuple([NativeTargetPathSchema]),
+  start: combinedAvailability,
+});
+export const CombinedRunPreviewSchema = z
+  .strictObject({
+    taskId: TaskIdSchema,
+    runId: RunIdSchema,
+    preparationId: ArtifactIdSchema,
+    manifestHash: HashSchema,
+    revision: RevisionSchema,
+    generation: RevisionSchema,
+    members: z.tuple([combinedMemberPreview, combinedMemberPreview]),
+    phase: z.enum([
+      'prepared',
+      'baseline',
+      'writers',
+      'assembling',
+      'awaiting-evaluation',
+      'checking',
+      'awaiting-review',
+      'reviewing',
+      'ready',
+      'paused',
+      'stopping',
+      'stopped',
+      'blocked',
+      'unknown',
+      'accepted',
+    ]),
+    blocker: CombinedActionReasonSchema.nullable(),
+    dispatches: z.array(combinedDispatchPreview).length(7),
+    candidate: z.strictObject({ id: CandidateIdSchema, hash: HashSchema }).nullable(),
+    remainingBudgets: RemainingBudgetsSchema,
+    start: combinedAvailability,
+    assemble: combinedAvailability,
+    evaluate: combinedAvailability,
+    review: combinedAvailability,
+    accept: combinedAvailability,
+  })
+  .superRefine((preview, context) => {
+    if (
+      preview.dispatches.some(
+        (dispatch, index) => dispatch.phase !== CombinedDispatchPhaseSchema.options[index],
+      ) ||
+      new Set([preview.taskId, ...preview.members.map((member) => member.taskId)]).size !== 3 ||
+      new Set([preview.runId, ...preview.members.map((member) => member.runId)]).size !== 3 ||
+      preview.members[0].scope[0] === preview.members[1].scope[0] ||
+      ([
+        'awaiting-evaluation',
+        'checking',
+        'awaiting-review',
+        'reviewing',
+        'ready',
+        'accepted',
+      ].includes(preview.phase) &&
+        !preview.candidate)
+    )
+      context.addIssue({
+        code: 'custom',
+        message: 'Combined preview must preserve distinct members and its ordered dispatch ledger.',
+      });
+  });
+export type CombinedRunPreview = z.infer<typeof CombinedRunPreviewSchema>;
+
 export const SnapshotSchema = z
   .strictObject({
     usageReaders: z.array(UsageReaderSchema).max(1).default([]),
@@ -1948,6 +2242,7 @@ export const SnapshotSchema = z
       .default([]),
     nativeRuns: z.array(NativeRunSchema).max(10000).default([]),
     candidateEvaluations: z.array(CandidateEvaluationPreviewSchema).max(10000).default([]),
+    combinedRuns: z.array(CombinedRunPreviewSchema).max(1000).default([]),
     protocol: z.literal(1),
     cursor: CursorSchema,
     projects: z.array(ProjectSchema).max(1000),
@@ -1963,6 +2258,49 @@ export const SnapshotSchema = z
     reviewJobs: z.array(ReviewJobSchema).max(1000).optional(),
   })
   .superRefine((snapshot, ctx) => {
+    const combinedMembers = new Set<string>();
+    for (const combined of snapshot.combinedRuns) {
+      const references = [{ taskId: combined.taskId, runId: combined.runId }, ...combined.members];
+      const tasks = references.map((reference) =>
+        snapshot.tasks.find((task) => task.id === reference.taskId),
+      );
+      if (
+        references.some((reference, index) => {
+          const duplicate = combinedMembers.has(reference.taskId);
+          combinedMembers.add(reference.taskId);
+          return (
+            duplicate ||
+            tasks[index]?.runId !== reference.runId ||
+            !snapshot.runs.some(
+              (run) => run.id === reference.runId && run.taskId === reference.taskId,
+            )
+          );
+        }) ||
+        tasks.some((task) => !task || task.projectId !== tasks[0]?.projectId) ||
+        !snapshot.artifacts.some((artifact) => artifact.id === combined.preparationId) ||
+        (combined.candidate &&
+          !snapshot.candidates.some(
+            (candidate) =>
+              candidate.id === combined.candidate?.id &&
+              candidate.hash === combined.candidate.hash &&
+              candidate.taskId === combined.taskId,
+          )) ||
+        combined.dispatches.some(
+          (dispatch, index) =>
+            dispatch.attemptId &&
+            !snapshot.attempts.some(
+              (attempt) =>
+                attempt.id === dispatch.attemptId &&
+                attempt.runId ===
+                  (index === 1 || index === 2 ? combined.members[index - 1].runId : combined.runId),
+            ),
+        )
+      )
+        ctx.addIssue({
+          code: 'custom',
+          message: 'Combined preview must bind its saved group and actual dispatches.',
+        });
+    }
     const seen = new Set<string>();
     for (const native of snapshot.nativeRuns) {
       if (seen.has(native.runId) || !snapshot.runs.some((run) => run.id === native.runId))
@@ -2140,6 +2478,7 @@ export const AttemptOutputSchema = z.union([
   z.strictObject({ ...outputFields, channel: z.literal('acp'), acp: AcpActivitySchema }),
 ]);
 export const EventSchema = z.discriminatedUnion('type', [
+  event('combined.updated', CombinedRunPreviewSchema),
   event('conversation.entry', ConversationEntrySchema),
   event('task.created', TaskSchema),
   event('task.updated', TaskSchema),

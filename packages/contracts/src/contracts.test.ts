@@ -8,6 +8,9 @@ import {
   CandidateEvaluationPreviewSchema,
   CheckEventSchema,
   CheckResultSchema,
+  CombinedNativeReviewJobSchema,
+  CombinedOriginSchema,
+  CombinedRunPreviewSchema,
   CommandResultSchema,
   CommandSchema,
   ConversationEntrySchema,
@@ -65,6 +68,281 @@ const command = {
 };
 
 test('process boundaries reject unknown fields and invalid command identity', () => {
+  const combinedId = (prefix: string, index = 0) =>
+    `${prefix}_${suffix.slice(0, -1)}${['V', 'W', 'X', 'Y', 'Z', '0', '1', '2'][index]}`;
+  const combinedPolicy = {
+    authority: 'balanced',
+    quality: 'quick',
+    effects: [],
+    limits: { attempts: 7, minutes: 8, concurrency: 2 },
+    reserves: [],
+    unknownUsage: { rule: 'waiting' },
+    methods: [{ id: 'keep-it-simple', cycles: 1, reviewerRole: 'reviewer' }],
+  };
+  const combined = {
+    ...command,
+    command: 'PrepareCombinedRun',
+    payload: {
+      taskId: combinedId('tsk'),
+      policy: combinedPolicy,
+      children: [1, 2].map((index) => ({
+        taskId: combinedId('tsk', index),
+        expectedRevision: 0,
+        scope: [`slice-${index}.mjs`],
+        writer: { profileId: 'openai-file-v1', creditPolicy: 'ordinary' },
+        consent: 'explicit',
+        maximumMinutes: 1,
+      })),
+      checks: {
+        recipeId: 'project-node-tests-v1',
+        testFiles: ['one.test.mjs', 'two.test.mjs', 'interaction.test.mjs'],
+        replayTestFiles: [['one.test.mjs'], ['two.test.mjs']],
+        interactionTestFiles: ['interaction.test.mjs'],
+        maximumMinutes: 1,
+        baselineConsent: 'explicit',
+        replayConsents: ['explicit', 'explicit'],
+      },
+      reviewer: { profileId: 'openai-file-v1', creditPolicy: 'ordinary', maximumMinutes: 1 },
+    },
+  };
+  assert.deepEqual(CommandSchema.parse(combined), combined);
+  for (const payload of [
+    { ...combined.payload, children: combined.payload.children.slice(0, 1) },
+    { ...combined.payload, children: [combined.payload.children[0], combined.payload.children[0]] },
+    {
+      ...combined.payload,
+      children: [
+        combined.payload.children[0],
+        { ...combined.payload.children[1], scope: combined.payload.children[0].scope },
+      ],
+    },
+    {
+      ...combined.payload,
+      children: [
+        { ...combined.payload.children[0], taskId: combined.payload.taskId },
+        combined.payload.children[1],
+      ],
+    },
+    {
+      ...combined.payload,
+      children: [
+        { ...combined.payload.children[0], scope: ['one.mjs', 'two.mjs'] },
+        combined.payload.children[1],
+      ],
+    },
+    {
+      ...combined.payload,
+      children: [
+        {
+          ...combined.payload.children[0],
+          writer: { profileId: 'openai-repository-v1', creditPolicy: 'ordinary' },
+        },
+        combined.payload.children[1],
+      ],
+    },
+    {
+      ...combined.payload,
+      children: [
+        {
+          ...combined.payload.children[0],
+          writer: { ...combined.payload.children[0].writer, executable: '/caller/tool' },
+        },
+        combined.payload.children[1],
+      ],
+    },
+    {
+      ...combined.payload,
+      children: [
+        { ...combined.payload.children[0], title: 'Replacement task' },
+        combined.payload.children[1],
+      ],
+    },
+    { ...combined.payload, policy: { ...combinedPolicy, authority: 'autopilot' } },
+    { ...combined.payload, policy: { ...combinedPolicy, quality: 'standard' } },
+    { ...combined.payload, policy: { ...combinedPolicy, methods: [] } },
+    ...[{ attempts: 6 }, { minutes: 7 }, { concurrency: 1 }].map((limits) => ({
+      ...combined.payload,
+      policy: { ...combinedPolicy, limits: { ...combinedPolicy.limits, ...limits } },
+    })),
+    { ...combined.payload, checks: { ...combined.payload.checks, recipeId: 'crewkite-verify-v1' } },
+    {
+      ...combined.payload,
+      checks: { ...combined.payload.checks, testFiles: ['one.test.mjs', 'two.test.mjs'] },
+    },
+    {
+      ...combined.payload,
+      checks: { ...combined.payload.checks, interactionTestFiles: ['one.test.mjs'] },
+    },
+    {
+      ...combined.payload,
+      checks: {
+        ...combined.payload.checks,
+        testFiles: [...combined.payload.checks.testFiles, 'slice-1.mjs'],
+      },
+    },
+    { ...combined.payload, checks: { ...combined.payload.checks, baselineConsent: 'saved' } },
+  ])
+    assert.equal(CommandSchema.safeParse({ ...combined, payload }).success, false);
+  const assemble = {
+    ...command,
+    command: 'AssembleCombinedCandidate',
+    payload: {
+      taskId: combinedId('tsk'),
+      runId: combinedId('run'),
+      preparationId: combinedId('art'),
+    },
+  };
+  assert.deepEqual(CommandSchema.parse(assemble), assemble);
+  assert.equal(
+    CommandSchema.safeParse({ ...assemble, payload: { ...assemble.payload, candidates: [] } })
+      .success,
+    false,
+  );
+  const origin = {
+    kind: 'combined',
+    taskId: combinedId('tsk'),
+    runId: combinedId('run'),
+    preparationId: combinedId('art'),
+    manifestHash: 'a'.repeat(64),
+    generation: 0,
+    sourceBase: 'a'.repeat(40),
+    sourceManifestHash: 'b'.repeat(64),
+    policyHash: 'c'.repeat(64),
+    criteriaHash: 'd'.repeat(64),
+    contributors: [1, 2].map((index) => ({
+      taskId: combinedId('tsk', index),
+      runId: combinedId('run', index),
+      attemptId: combinedId('att', index),
+      generation: 0,
+      routeId: combinedId('rte', index),
+      candidateId: combinedId('cnd', index),
+      candidateHash: 'e'.repeat(64),
+      scopeHash: 'f'.repeat(64),
+    })),
+    steps: [0, 1].map((index) => ({
+      candidateId: combinedId('cnd', index + 3),
+      candidateHash: (index ? 'c' : 'b').repeat(64),
+      definitionHash: 'a'.repeat(64),
+      checkArtifactId: combinedId('art', index + 1),
+      previousTree: (index ? 'b' : 'a').repeat(40),
+      nextTree: (index ? 'c' : 'b').repeat(40),
+    })),
+    candidateId: combinedId('cnd', 5),
+    candidateHash: 'c'.repeat(64),
+  };
+  assert.deepEqual(CombinedOriginSchema.parse(origin), origin);
+  for (const amendment of [
+    { contributors: [origin.contributors[0], origin.contributors[0]] },
+    { steps: [origin.steps[0], { ...origin.steps[1], previousTree: 'd'.repeat(40) }] },
+    { steps: [{ ...origin.steps[0], nextTree: origin.steps[0].previousTree }, origin.steps[1]] },
+    { candidateId: origin.steps[1].candidateId },
+    { candidateId: origin.contributors[0].candidateId },
+    {
+      steps: [
+        { ...origin.steps[0], candidateId: origin.contributors[0].candidateId },
+        origin.steps[1],
+      ],
+    },
+    {
+      steps: [
+        origin.steps[0],
+        { ...origin.steps[1], checkArtifactId: origin.steps[0].checkArtifactId },
+      ],
+    },
+    { candidateHash: 'd'.repeat(64) },
+    { writerAttemptId: combinedId('att') },
+  ])
+    assert.equal(CombinedOriginSchema.safeParse({ ...origin, ...amendment }).success, false);
+  const combinedReview = {
+    taskId: origin.taskId,
+    runId: origin.runId,
+    attemptId: combinedId('att', 3),
+    generation: 0,
+    routeId: combinedId('rte'),
+    candidateId: origin.candidateId,
+    candidateHash: origin.candidateHash,
+    methodId: 'keep-it-simple',
+    cycle: 1,
+    limitMinutes: 1,
+    scripted: false,
+    preparationId: combinedId('art', 3),
+    profileId: 'openai-file-v1',
+    assignedRole: 'reviewer',
+    independence: 'process-only',
+    origin,
+  };
+  assert.deepEqual(CombinedNativeReviewJobSchema.parse(combinedReview), combinedReview);
+  assert.deepEqual(ReviewJobSchema.parse(combinedReview), combinedReview);
+  for (const amendment of [
+    { writerAttemptId: combinedId('att') },
+    { writerRouteId: combinedId('rte') },
+    { attemptId: origin.contributors[0].attemptId },
+    { candidateHash: 'd'.repeat(64) },
+  ])
+    assert.equal(
+      CombinedNativeReviewJobSchema.safeParse({ ...combinedReview, ...amendment }).success,
+      false,
+    );
+  const unavailable = { available: false, reason: 'baseline-required' };
+  const combinedPreview = {
+    taskId: origin.taskId,
+    runId: origin.runId,
+    preparationId: origin.preparationId,
+    manifestHash: origin.manifestHash,
+    revision: 0,
+    generation: 0,
+    members: [1, 2].map((index) => ({
+      taskId: combinedId('tsk', index),
+      runId: combinedId('run', index),
+      scope: [`slice-${index}.mjs`],
+      start: unavailable,
+    })),
+    phase: 'prepared',
+    blocker: null,
+    dispatches: [
+      'baseline',
+      'writer-0',
+      'writer-1',
+      'replay-0',
+      'replay-1',
+      'final-check',
+      'review',
+    ].map((phase) => ({
+      phase,
+      maximumMinutes: 1,
+      state: 'reserved',
+      attemptId: null,
+      checkArtifactId: null,
+    })),
+    candidate: null,
+    remainingBudgets: { attempts: 7, minutes: 8, concurrency: 2 },
+    start: { available: true, reason: 'available' },
+    assemble: unavailable,
+    evaluate: unavailable,
+    review: unavailable,
+    accept: unavailable,
+  };
+  assert.deepEqual(CombinedRunPreviewSchema.parse(combinedPreview), combinedPreview);
+  assert.equal(
+    CombinedRunPreviewSchema.safeParse({ ...combinedPreview, phase: 'ready' }).success,
+    false,
+  );
+  assert.equal(
+    CombinedRunPreviewSchema.safeParse({
+      ...combinedPreview,
+      dispatches: combinedPreview.dispatches.slice(1),
+    }).success,
+    false,
+  );
+  assert.equal(
+    CombinedRunPreviewSchema.safeParse({
+      ...combinedPreview,
+      dispatches: combinedPreview.dispatches.map((dispatch, index) =>
+        index ? dispatch : { ...dispatch, state: 'running' },
+      ),
+    }).success,
+    false,
+  );
   const conversationBinding = {
     taskId: `tsk_${suffix}`,
     runId: `run_${suffix}`,
@@ -693,6 +971,7 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     nativeProfiles: [],
     nativeRuns: [],
     candidateEvaluations: [],
+    combinedRuns: [],
     usageReaders: [],
     googleAcpSetup: null,
   });
