@@ -5,6 +5,8 @@ import {
   type ConversationContextRef,
   ConversationContextRefsSchema,
   type ConversationEntry,
+  type ConversationModelChoices,
+  type ConversationModelRequest,
   type ConversationPlanningSelection,
   ConversationPlanningSelectionSchema,
   canonicalJson,
@@ -29,6 +31,7 @@ import { Dialog, familyName, titleCase } from './components.tsx';
 import type { ComposerControlsProps } from './composer-controls.tsx';
 import { ContextGauge } from './context-gauge.tsx';
 import { Conversation, type ConversationMessage } from './conversation.tsx';
+import type { ExecutionPolicySeed } from './launch.tsx';
 import { ConversationContextCaptureError, type DesktopCommand, type Workspace } from './source.ts';
 import { roleLabels } from './templates.ts';
 
@@ -976,6 +979,7 @@ type PlanningFields = {
   concurrency: string;
   credits: boolean;
   consent: boolean;
+  modelRequest?: ConversationModelRequest;
 };
 const getPlanningProfile = (snapshot: Snapshot) =>
   snapshot.nativeProfiles.find(
@@ -986,6 +990,12 @@ function planningComposerControls(
   snapshot: Snapshot,
   role: PlanningFields['role'],
   config?: TaskConversationState['configuration'],
+  controls?: {
+    choices?: ConversationModelChoices;
+    disabledReason?: string;
+    onSelectModel: (model: string) => void;
+    onSelectEffort: (effort: string) => void;
+  },
 ): Pick<ComposerControlsProps, 'primary' | 'policy'> {
   const profile = getPlanningProfile(snapshot);
   const requestedModel = config
@@ -994,23 +1004,48 @@ function planningComposerControls(
   const requestedEffort = config
     ? (config.requestedEffort ?? 'unknown')
     : (profile?.effort ?? 'unknown');
+  const advertised =
+    controls?.choices?.status === 'last-observed' ? controls.choices.models : undefined;
   return {
     primary: {
       roleLabel: roleLabels[role],
-      models: profile
-        ? [
-            {
-              id: profile.model,
-              label: profile.model,
-              route: familyName(profile.family),
-              efforts: [{ id: profile.effort, label: profile.effort }],
-            },
-          ]
-        : [],
+      models: advertised
+        ? advertised.map((choice) => ({
+            id: choice.model,
+            label: choice.model,
+            route: 'OpenAI',
+            efforts: choice.efforts.map((effort) => ({ id: effort, label: effort })),
+          }))
+        : profile
+          ? [
+              {
+                id: profile.model,
+                label: profile.model,
+                route: familyName(profile.family),
+                efforts: [{ id: profile.effort, label: profile.effort }],
+              },
+            ]
+          : [],
       currentModelId: config?.effectiveModel ?? null,
       currentEffortId: config?.effectiveEffort ?? null,
-      scopeLabel: 'Planning profile',
-      frozenReason: `Model and effort follow the planning profile. Requested model ${requestedModel}; effective model ${config?.effectiveModel ?? 'unknown'}. Requested effort ${requestedEffort}; effective effort ${config?.effectiveEffort ?? 'unknown'}.`,
+      requestedModelId:
+        advertised && config?.selection.modelRequest && controls?.choices?.reason === 'available'
+          ? config.requestedModel
+          : undefined,
+      requestedEffortId:
+        advertised && config?.selection.modelRequest && controls?.choices?.reason === 'available'
+          ? config.requestedEffort
+          : undefined,
+      scopeLabel: advertised
+        ? 'Last-observed choices. Review and save for a later planning turn.'
+        : 'Planning profile',
+      frozenReason:
+        controls?.disabledReason ??
+        (advertised
+          ? undefined
+          : `Model and effort follow the planning profile. Requested model ${requestedModel}; effective model ${config?.effectiveModel ?? 'unknown'}. Requested effort ${requestedEffort}; effective effort ${config?.effectiveEffort ?? 'unknown'}.`),
+      onSelectModel: advertised ? controls?.onSelectModel : undefined,
+      onSelectEffort: advertised ? controls?.onSelectEffort : undefined,
     },
     policy: {
       label: 'Planning permissions',
@@ -1028,6 +1063,7 @@ const initialPlanning = (selection?: ConversationPlanningSelection): PlanningFie
   concurrency: String(selection?.limits.concurrency ?? 1),
   credits: selection?.creditPolicy === 'existing-credits',
   consent: false,
+  ...(selection?.modelRequest ? { modelRequest: selection.modelRequest } : {}),
 });
 const planningSelection = (fields: PlanningFields) =>
   ConversationPlanningSelectionSchema.safeParse({
@@ -1040,6 +1076,7 @@ const planningSelection = (fields: PlanningFields) =>
       concurrency: Number(fields.concurrency),
     },
     consent: 'explicit',
+    ...(fields.modelRequest ? { modelRequest: fields.modelRequest } : {}),
   });
 function PlanningControls({
   value,
@@ -1291,7 +1328,7 @@ export function ConversationView({
   snapshot: Snapshot;
   workspace: Workspace;
   onState: (state: TaskConversationState | null) => void;
-  onPrepare: () => void;
+  onPrepare: (seed?: ExecutionPolicySeed) => void;
 }) {
   const history = useConversation(task, workspace, visible);
   const { state, entries } = history;
@@ -1301,6 +1338,13 @@ export function ConversationView({
   const [pendingDecision, setPendingDecision] = useState<string | null>(null);
   const [settingsError, setSettingsError] = useState<string>();
   const [settingsRetry, setSettingsRetry] = useState(false);
+  const [settingsConfigurationRevision, setSettingsConfigurationRevision] = useState<number | null>(
+    null,
+  );
+  const [settingsCommand, setSettingsCommand] = useState<Extract<
+    DesktopCommand,
+    { command: 'ConfigureTaskConversation' }
+  > | null>(null);
   useEffect(() => {
     onState(state);
   }, [state, onState]);
@@ -1505,6 +1549,111 @@ export function ConversationView({
     decisionBlockedReason,
   ]);
   const config = state?.configuration;
+  const choices = state?.modelChoices;
+  const modelChoicesReason =
+    !choices || choices.status === 'not-observed'
+      ? 'Model choices appear after a successful planning turn.'
+      : choices.status === 'client-changed'
+        ? 'The installed client changed. Use the profile default for a normal planning turn to observe choices again.'
+        : choices.status === 'unavailable'
+          ? `Model choices are unavailable. ${reasonText(choices.reason)} Use the profile default to recover.`
+          : `Choices last observed at ${choices.observedAt}. Availability is checked again before the next planning turn.${choices.reason === 'available' ? '' : ` ${reasonText(choices.reason)}`}`;
+  const stageBlocked =
+    decisionBlockedReason ??
+    (state?.phase === 'unknown' || state?.phase === 'stopping'
+      ? 'Resolve current work before changing the planning request.'
+      : choices?.status !== 'last-observed' || !choices.observation
+        ? modelChoicesReason
+        : undefined);
+  function requestFor(model: string, effort: string): ConversationModelRequest | undefined {
+    if (stageBlocked || !choices?.observation) return;
+    if (!choices.models.some((choice) => choice.model === model && choice.efforts.includes(effort)))
+      return;
+    return { version: 1, observation: { ...choices.observation }, model, effort };
+  }
+  function openSettings(request?: ConversationModelRequest) {
+    if (!settingsRetry) {
+      setSettingsError(undefined);
+      setSettingsCommand(null);
+      setSettingsConfigurationRevision(config?.revision ?? null);
+      setPlanning({
+        ...initialPlanning(config?.selection),
+        ...(request ? { modelRequest: request } : {}),
+      });
+    }
+    setSettings(true);
+  }
+  function stageModel(model: string) {
+    const choice = choices?.models.find((choice) => choice.model === model);
+    if (!choice) return;
+    const request = requestFor(model, choice.defaultEffort);
+    if (request) openSettings(request);
+  }
+  function stageEffort(effort: string) {
+    const model =
+      config?.selection.modelRequest && choices?.reason === 'available'
+        ? config.requestedModel
+        : config?.effectiveModel;
+    if (!model) return;
+    const request = requestFor(model, effort);
+    if (request) openSettings(request);
+  }
+  function editPair(model: string, effort: string) {
+    const request = requestFor(model, effort);
+    if (request) setPlanning((value) => ({ ...value, modelRequest: request, consent: false }));
+  }
+  const combinedTask = snapshot.combinedRuns.some(
+    (run) => run.taskId === task.id || run.members.some((member) => member.taskId === task.id),
+  );
+  const executionRun =
+    state?.purpose === 'execution' ? snapshot.runs.find((run) => run.id === task.runId) : undefined;
+  const executionPolicyReason = combinedTask
+    ? 'Choose execution authority in Combined task preparation.'
+    : (decisionBlockedReason ??
+      (task.state !== 'draft' || executionRun
+        ? 'The saved execution policy is frozen. Review it in execution preparation.'
+        : state?.contractStatus !== 'confirmed' || !config
+          ? 'Adopt the task plan before choosing execution preparation.'
+          : state.activeAttempt || state.phase === 'unknown' || state.phase === 'stopping'
+            ? 'Resolve current work before preparing execution.'
+            : undefined));
+  const executionPolicy: ComposerControlsProps['policy'] = combinedTask
+    ? {
+        label: 'Future execution policy',
+        currentId: 'combined',
+        options: [{ id: 'combined', label: 'Combined task preparation' }],
+        scopeLabel: 'Combined task only',
+        disabledReason: executionPolicyReason,
+      }
+    : {
+        label: 'Future execution policy',
+        currentId: executionRun?.policy.policy.authority ?? 'unprepared',
+        options: [
+          {
+            id: 'unprepared',
+            label: 'Not prepared',
+            disabledReason: 'Choose an authority to open preparation.',
+          },
+          { id: 'guided', label: 'Guided' },
+          { id: 'balanced', label: 'Balanced' },
+          { id: 'autopilot', label: 'Autopilot' },
+        ],
+        scopeLabel: 'Opens a future execution draft. Planning stays read-only.',
+        disabledReason: executionPolicyReason,
+        onSelect: (authority) => {
+          if (
+            !executionPolicyReason &&
+            config &&
+            (authority === 'guided' || authority === 'balanced' || authority === 'autopilot')
+          )
+            onPrepare({
+              taskId: task.id,
+              taskRevision: task.revision,
+              planningConfigurationRevision: config.revision,
+              authority,
+            });
+        },
+      };
   const primaryActive = Boolean(
     workspace.connection === 'connected' &&
       current &&
@@ -1536,25 +1685,44 @@ export function ConversationView({
                     ? 'Waiting for a permission decision.'
                     : 'The primary role is idle.';
   const selection = planningSelection(planning);
+  const requestChanged =
+    canonicalJson(planning.modelRequest ?? null) !==
+    canonicalJson(config?.selection.modelRequest ?? null);
+  const requestCurrent =
+    !requestChanged ||
+    !planning.modelRequest ||
+    (choices?.status === 'last-observed' &&
+      choices.observation &&
+      canonicalJson(choices.observation) === canonicalJson(planning.modelRequest.observation) &&
+      choices.models.some(
+        (choice) =>
+          choice.model === planning.modelRequest?.model &&
+          choice.efforts.includes(planning.modelRequest.effort),
+      ));
+  const settingsBlocked =
+    decisionBlockedReason ??
+    ((config?.revision ?? null) !== settingsConfigurationRevision
+      ? 'The saved planning settings changed. Close and reopen this dialog to review them. Your draft has been kept.'
+      : state?.activeAttempt || state?.phase === 'unknown' || state?.phase === 'stopping'
+        ? 'This draft applies after current work stops. Save it explicitly at that boundary.'
+        : !requestCurrent
+          ? 'The observed model choices changed. Review and select the pair again before saving.'
+          : undefined);
   async function configure() {
-    if (
-      !planning.consent ||
-      !selection.success ||
-      decisionsBlocked ||
-      state?.activeAttempt ||
-      state?.phase === 'unknown' ||
-      state?.phase === 'stopping'
-    )
-      return;
+    if (!planning.consent || !selection.success || settingsBlocked) return;
     setSettingsError(undefined);
     setSettingsRetry(false);
-    const result = await mutate({
+    const command: Extract<DesktopCommand, { command: 'ConfigureTaskConversation' }> = {
       command: 'ConfigureTaskConversation',
       expectedRevision: task.revision,
       payload: { taskId: task.id, planning: selection.data },
-    });
-    if (result && applied(result.outcome)) setSettings(false);
-    else {
+    };
+    setSettingsCommand(command);
+    const result = await mutate(command);
+    if (result && applied(result.outcome)) {
+      setSettings(false);
+      setSettingsCommand(null);
+    } else {
       setSettingsRetry(!result || result.outcome === 'outcome-unknown');
       setSettingsError(
         result?.reason ?? 'The settings result is unknown. Use exact retry to resolve it.',
@@ -1714,7 +1882,13 @@ export function ConversationView({
             controls: visible
               ? {
                   ...context.controls,
-                  ...planningComposerControls(snapshot, config?.selection.role ?? 'lead', config),
+                  ...planningComposerControls(snapshot, config?.selection.role ?? 'lead', config, {
+                    choices,
+                    disabledReason: stageBlocked,
+                    onSelectModel: stageModel,
+                    onSelectEffort: stageEffort,
+                  }),
+                  policy: executionPolicy,
                   disconnectedReason:
                     workspace.connection !== 'connected'
                       ? 'Reconnect to use composer actions.'
@@ -1780,12 +1954,7 @@ export function ConversationView({
               payload: { binding, decision },
             });
           }}
-          onOpenSettings={() => {
-            setSettingsError(undefined);
-            setSettingsRetry(false);
-            setPlanning(initialPlanning(config?.selection));
-            setSettings(true);
-          }}
+          onOpenSettings={() => openSettings()}
         />
       </div>
       {context.panel}
@@ -1808,11 +1977,16 @@ export function ConversationView({
                 type="button"
                 disabled={workspace.pending || workspace.connection !== 'connected'}
                 onClick={() => {
+                  if (!settingsCommand) return;
                   void workspace
-                    .retryCommand()
+                    .retryCommand(settingsCommand)
                     .then((result) => {
-                      if (result && applied(result.outcome)) setSettings(false);
-                      else {
+                      if (result && applied(result.outcome)) {
+                        setSettings(false);
+                        setSettingsRetry(false);
+                        setSettingsCommand(null);
+                        setSettingsError(undefined);
+                      } else {
                         setSettingsError(result?.reason ?? 'The settings result is still unknown.');
                         setSettingsRetry(!result || result.outcome === 'outcome-unknown');
                       }
@@ -1827,11 +2001,113 @@ export function ConversationView({
                 Retry exact settings command
               </button>
             )}
+            {settingsRetry && !workspace.retryAvailable && !workspace.pending && (
+              <button
+                className="button secondary"
+                type="button"
+                onClick={() => {
+                  setSettingsRetry(false);
+                  setSettingsCommand(null);
+                  setSettingsError(undefined);
+                  setSettingsConfigurationRevision(config?.revision ?? null);
+                  setPlanning(initialPlanning(config?.selection));
+                }}
+              >
+                Review saved planning settings
+              </button>
+            )}
             <PlanningControls
               value={planning}
               onChange={(value) => setPlanning({ ...value, consent: false })}
               snapshot={snapshot}
             />
+            <p className="muted small">{modelChoicesReason}</p>
+            <p className="muted small" style={{ overflowWrap: 'anywhere' }}>
+              Requested model {config?.requestedModel ?? 'unknown'} · Effective model{' '}
+              {config?.effectiveModel ?? 'unknown'} · Requested effort{' '}
+              {config?.requestedEffort ?? 'unknown'} · Effective effort{' '}
+              {config?.effectiveEffort ?? 'unknown'}
+            </p>
+            {choices?.status === 'last-observed' && (
+              <>
+                <label>
+                  Planning model
+                  <select
+                    disabled={Boolean(stageBlocked || settingsRetry)}
+                    value={
+                      choices.models.some((choice) => choice.model === planning.modelRequest?.model)
+                        ? planning.modelRequest?.model
+                        : ''
+                    }
+                    onChange={(event) => {
+                      const choice = choices.models.find(
+                        (choice) => choice.model === event.target.value,
+                      );
+                      if (choice) editPair(choice.model, choice.defaultEffort);
+                    }}
+                  >
+                    <option value="" disabled>
+                      Choose a last-observed model
+                    </option>
+                    {choices.models.map((choice) => (
+                      <option key={choice.model} value={choice.model}>
+                        {choice.model}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Planning effort
+                  <select
+                    disabled={Boolean(stageBlocked || settingsRetry || !planning.modelRequest)}
+                    value={
+                      choices.models
+                        .find((choice) => choice.model === planning.modelRequest?.model)
+                        ?.efforts.includes(planning.modelRequest?.effort ?? '')
+                        ? planning.modelRequest?.effort
+                        : ''
+                    }
+                    onChange={(event) => {
+                      if (planning.modelRequest)
+                        editPair(planning.modelRequest.model, event.target.value);
+                    }}
+                  >
+                    <option value="" disabled>
+                      Choose an advertised effort
+                    </option>
+                    {choices.models
+                      .find((choice) => choice.model === planning.modelRequest?.model)
+                      ?.efforts.map((effort) => (
+                        <option key={effort} value={effort}>
+                          {effort}
+                        </option>
+                      ))}
+                  </select>
+                </label>
+              </>
+            )}
+            <p style={{ overflowWrap: 'anywhere' }}>
+              Draft request:{' '}
+              {planning.modelRequest
+                ? `${planning.modelRequest.model} · ${planning.modelRequest.effort}`
+                : 'Profile default'}
+              . Saving starts no work. The next turn checks availability again.
+            </p>
+            <button
+              className="button secondary"
+              type="button"
+              disabled={
+                !planning.modelRequest ||
+                workspace.pending ||
+                workspace.retryAvailable ||
+                settingsRetry
+              }
+              onClick={() =>
+                setPlanning((value) => ({ ...value, modelRequest: undefined, consent: false }))
+              }
+            >
+              Use profile default
+            </button>
             <label className="checkbox-label">
               <input
                 type="checkbox"
@@ -1841,9 +2117,14 @@ export function ConversationView({
               Allow bounded planning with this profile and these limits
             </label>
             <p className="muted small">
-              The controller rechecks the configuration at a safe boundary. Saved execution limits
-              and permissions keep their own review.
+              Planning remains read-only. The controller rechecks the configuration at a safe
+              boundary. Saved execution limits and permissions keep their own review.
             </p>
+            {settingsBlocked && (
+              <p className="notice" role="status">
+                {settingsBlocked}
+              </p>
+            )}
             <button
               className="button secondary"
               type="button"
@@ -1867,10 +2148,7 @@ export function ConversationView({
               className="button primary"
               type="button"
               disabled={
-                decisionsBlocked ||
-                Boolean(state?.activeAttempt) ||
-                state?.phase === 'unknown' ||
-                state?.phase === 'stopping' ||
+                Boolean(settingsBlocked) ||
                 !planning.consent ||
                 !selection.success ||
                 workspace.pending ||

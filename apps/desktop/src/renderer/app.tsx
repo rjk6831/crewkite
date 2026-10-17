@@ -74,7 +74,13 @@ import {
   titleCase,
 } from './components.tsx';
 import { ConversationView, NewGoal } from './conversation-view.tsx';
-import { googleAcpLabel, Launch, NativeEvaluation, NativeHandoff } from './launch.tsx';
+import {
+  type ExecutionPolicySeed,
+  googleAcpLabel,
+  Launch,
+  NativeEvaluation,
+  NativeHandoff,
+} from './launch.tsx';
 import { LocalSetup } from './local-setup.tsx';
 import { useWorkspace, type Workspace } from './source.ts';
 import { roleLabels } from './templates.ts';
@@ -251,7 +257,8 @@ export function App() {
   const [drafts, setDrafts] = useState(savedDrafts.tasks);
   const [answerDrafts, setAnswerDrafts] = useState(savedDrafts.answers);
   const [draftError, setDraftError] = useState(savedDrafts.error);
-  const error = workspaceError ?? draftError;
+  const [preparationError, setPreparationError] = useState<string | null>(null);
+  const error = workspaceError ?? draftError ?? preparationError;
   useEffect(() => {
     if (savedDrafts.error) return;
     try {
@@ -264,6 +271,7 @@ export function App() {
   }, [drafts, goalDraft, answerDrafts, savedDrafts.error]);
   const [conversationState, setConversationState] = useState<TaskConversationState | null>(null);
   const [launch, setLaunch] = useState(false);
+  const [executionPolicySeed, setExecutionPolicySeed] = useState<ExecutionPolicySeed | null>(null);
   const [nativeHandoff, setNativeHandoff] = useState(false);
   const [palette, setPalette] = useState(false);
   const [palettePage, setPalettePage] = useState(0);
@@ -293,6 +301,71 @@ export function App() {
     candidate?.artifactId,
   ].join(':');
   const nativeRun = snapshot?.nativeRuns.find((value) => value.runId === task?.runId);
+  useEffect(() => {
+    if (!executionPolicySeed || workspace.pending || workspace.retryAvailable) return;
+    if (task?.id === executionPolicySeed.taskId && nativeRun?.stage === 'prepared') {
+      setExecutionPolicySeed(null);
+      return;
+    }
+    if (
+      task?.id !== executionPolicySeed.taskId ||
+      task.revision !== executionPolicySeed.taskRevision ||
+      (currentConversation &&
+        currentConversation.configuration?.revision !==
+          executionPolicySeed.planningConfigurationRevision)
+    ) {
+      setExecutionPolicySeed(null);
+      setLaunch(false);
+      setPreparationError(
+        'The task or planning configuration changed. The execution draft was discarded. Review the current task before preparing again.',
+      );
+    }
+  }, [
+    executionPolicySeed,
+    workspace.pending,
+    workspace.retryAvailable,
+    task?.id,
+    task?.revision,
+    currentConversation,
+    nativeRun?.stage,
+  ]);
+  function openPreparation(seed?: ExecutionPolicySeed) {
+    if (executionPolicySeed && (workspace.pending || workspace.retryAvailable)) {
+      if (!seed && task?.id === executionPolicySeed.taskId) {
+        setLaunch(true);
+        return;
+      }
+      setPreparationError('Resolve the current preparation request before changing its policy.');
+      return;
+    }
+    if (combined) {
+      setTab('Combined task');
+      if (seed) setPreparationError('Choose execution authority in Combined task preparation.');
+      return;
+    }
+    if (
+      seed &&
+      (workspace.pending ||
+        workspace.retryAvailable ||
+        workspace.connection !== 'connected' ||
+        task?.id !== seed.taskId ||
+        task.revision !== seed.taskRevision ||
+        currentConversation?.configuration?.revision !== seed.planningConfigurationRevision ||
+        currentConversation.contractStatus !== 'confirmed' ||
+        currentConversation.activeAttempt ||
+        ['unknown', 'stopping'].includes(currentConversation.phase) ||
+        task.state !== 'draft' ||
+        nativeRun?.stage === 'prepared')
+    ) {
+      setPreparationError(
+        'The execution draft is unavailable at this task revision. Resolve current work and review preparation again.',
+      );
+      return;
+    }
+    setPreparationError(null);
+    setExecutionPolicySeed(seed ?? null);
+    setLaunch(true);
+  }
   const approval = snapshot?.approvals.find(
     (value) => value.taskId === task?.id && value.status === 'pending',
   );
@@ -586,6 +659,7 @@ export function App() {
               onClick={() => {
                 workspace.setError(null);
                 setDraftError(null);
+                setPreparationError(null);
               }}
               aria-label="Dismiss error"
             >
@@ -644,7 +718,7 @@ export function App() {
                             <button
                               type="button"
                               className="button primary"
-                              onClick={() => setLaunch(true)}
+                              onClick={() => openPreparation()}
                               disabled={workspace.pending}
                             >
                               {nativeRun?.stage === 'prepared'
@@ -813,7 +887,7 @@ export function App() {
                           )
                         }
                         onState={setConversationState}
-                        onPrepare={() => (combined ? setTab('Combined task') : setLaunch(true))}
+                        onPrepare={openPreparation}
                       />
                     </div>
                     <div
@@ -861,7 +935,7 @@ export function App() {
                         task={task}
                         run={run}
                         snapshot={snapshot}
-                        onPrepare={() => setLaunch(true)}
+                        onPrepare={() => openPreparation()}
                         conversationState={currentConversation}
                       />
                     )}
@@ -895,7 +969,7 @@ export function App() {
                 snapshot={snapshot}
                 run={run}
                 task={task}
-                onConfigure={() => (combined ? setTab('Combined task') : setLaunch(true))}
+                onConfigure={() => openPreparation()}
               />
             )}
           </div>
@@ -933,10 +1007,19 @@ export function App() {
       )}
       {launch && !combined && task && snapshot && (
         <Launch
+          key={
+            executionPolicySeed
+              ? `${executionPolicySeed.taskId}:${executionPolicySeed.taskRevision}:${executionPolicySeed.planningConfigurationRevision}:${executionPolicySeed.authority}`
+              : task.id
+          }
           task={task}
           snapshot={snapshot}
           workspace={workspace}
-          onClose={() => setLaunch(false)}
+          executionPolicySeed={executionPolicySeed ?? undefined}
+          onClose={() => {
+            setLaunch(false);
+            if (!workspace.pending && !workspace.retryAvailable) setExecutionPolicySeed(null);
+          }}
         />
       )}
       {nativeHandoff && !combined && task && snapshot && nativeRun?.handoff && (
