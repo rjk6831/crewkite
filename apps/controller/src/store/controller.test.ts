@@ -71,7 +71,7 @@ import {
 } from '../host/check-ownership.ts';
 import { refValue } from '../host/publication.ts';
 import { committedFiles, git, inspectSource, materialize, readFiles } from '../host/source.ts';
-import { closedWithin, groupAbsent } from '../host/worker.ts';
+import { closedWithin, groupAbsent, OwnedCommand } from '../host/worker.ts';
 import { type AcpSetupProof, acpClientPin } from '../providers/google/acp/profile.ts';
 import {
   type NativeProfileResolution,
@@ -626,6 +626,60 @@ test('a retained descendant blocks sealing and transfer after its leader exits',
   const { controller, command, draft, fixtures } = await setup(t, {
     scenarioForRoute: () => 'stubborn',
   });
+  for (const streams of ['inherit', 'ignore'] as const) {
+    const descendant = `process.on('SIGUSR2',()=>process.exit(0)); setInterval(()=>{},10000); process.stdout.write('ready\\n');`;
+    const leader = `const {spawn}=require('node:child_process'); const child=spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{stdio:['ignore','pipe',${JSON.stringify(streams)}]}); child.stdout.once('data',chunk=>{process.stdout.write(chunk);process.exit(0);});`;
+    const job = new OwnedCommand({
+      argv: ['-e', leader],
+      directory: controller.home,
+      environmentHome: join(controller.home, `closure-${streams}`),
+      onSpawn: () => {},
+    });
+    t.after(() => {
+      if (!groupAbsent(job.group))
+        try {
+          process.kill(-job.group, 'SIGKILL');
+        } catch {}
+    });
+    const exit = await nativeWait('retained command descendant', job.exited);
+    assert.equal(exit.code, 0);
+    assert.equal(exit.signal, null);
+    assert.equal(exit.quiescent, false);
+    assert.equal(groupAbsent(job.group), false);
+    if (streams === 'ignore') await nativeWait('closed command streams', job.closed);
+    assert.equal(
+      await job.quiescent((work, milliseconds) => {
+        assert.equal(milliseconds, 1000);
+        if (streams === 'inherit') queueMicrotask(work);
+        return () => {};
+      }),
+      false,
+      'a live descendant or retained stream cannot prove quiescence',
+    );
+    process.kill(-job.group, 'SIGUSR2');
+    await nativeWait('released command descendant', job.closed);
+    if (streams === 'ignore') {
+      let polling = true;
+      try {
+        await nativeWait(
+          'released command group',
+          new Promise<void>((resolve) => {
+            const check = () => {
+              if (groupAbsent(job.group)) resolve();
+              else if (polling) setImmediate(check);
+            };
+            check();
+          }),
+          1000,
+        );
+      } finally {
+        polling = false;
+      }
+    }
+    assert.equal(await job.quiescent(), true);
+    assert.equal(groupAbsent(job.group), true);
+    assert.equal(exit.quiescent, false, 'the leader exit snapshot remains historical');
+  }
   const task = TaskSchema.parse((await controller.execute(draft, 'local-owner')).entity);
   const policy = {
     ...fixtures.policy,

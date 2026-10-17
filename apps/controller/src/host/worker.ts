@@ -208,6 +208,11 @@ export class OwnedCommand {
     if (this.group) options.onSpawn(this.group);
     this.child.stdin.end();
   }
+  async quiescent(schedule: Schedule = defaultSchedule): Promise<boolean> {
+    if (!(await closedWithin(this.closed, schedule))) return false;
+    // A descendant can outlive the leader and finish before the streams close.
+    return this.group === 0 ? this.failed : groupAbsent(this.group);
+  }
   stop() {
     if (
       !Number.isSafeInteger(this.group) ||

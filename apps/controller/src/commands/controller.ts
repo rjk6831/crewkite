@@ -4671,7 +4671,7 @@ export class Controller {
         this.settleJob(attempt, false, true);
         return false;
       }
-      const quiescent = exit.quiescent && (await closedWithin(job.closed, this.options.schedule));
+      const quiescent = await job.quiescent(this.options.schedule);
       cancel();
       let authority = false;
       try {
@@ -13138,9 +13138,8 @@ export class Controller {
             () => this.settleJob(attempt, false),
             1000,
           );
-          void check.exited.then(async (exit) => {
-            const quiescent =
-              exit.quiescent && (await closedWithin(check.closed, this.options.schedule));
+          void check.exited.then(async () => {
+            const quiescent = await check.quiescent(this.options.schedule);
             cancel();
             if (this.settleJob(attempt, quiescent)) this.stoppedJob(attempt);
           });
@@ -14425,7 +14424,7 @@ export class Controller {
     this.jobCancels.set(attempt.id, cancel);
     void job.exited
       .then(async (exit) => {
-        const quiescent = exit.quiescent && (await closedWithin(job.closed, this.options.schedule));
+        const quiescent = await job.quiescent(this.options.schedule);
         cancel();
         if (!this.settleJob(attempt, quiescent)) return;
         if (this.cancelledJobs.has(attempt.id)) {
