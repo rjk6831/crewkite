@@ -3155,6 +3155,7 @@ test('an appointed native proposal is retained and applied once after every phas
   const originalLocalRun = structuredClone(
     connectedLocal.controller.store.get('run', connectedLocal.run.id),
   );
+  const beforeLocalPlanning = structuredClone(connectedLocal.controller.snapshot());
   const plannedAfterLocal = await connectedLocal.controller.execute(
     connectedLocal.command(
       'ConfigureTaskConversation',
@@ -3173,7 +3174,9 @@ test('an appointed native proposal is retained and applied once after every phas
     ),
     'local-owner',
   );
-  assert.equal(plannedAfterLocal.outcome, 'applied');
+  assert.equal(plannedAfterLocal.outcome, 'blocked');
+  assert.equal(plannedAfterLocal.reason, 'task-not-discussing');
+  assert.deepEqual(connectedLocal.controller.snapshot(), beforeLocalPlanning);
   const allowance = await connectedLocal.controller.execute(
     connectedLocal.command('GetTaskConversationState', {
       taskId: connectedLocal.task.id,
@@ -3182,8 +3185,8 @@ test('an appointed native proposal is retained and applied once after every phas
   );
   assert.equal(allowance.data?.kind, 'conversation-state');
   if (allowance.data?.kind === 'conversation-state') {
-    assert.equal(allowance.data.state.budget?.remaining.attempts, 2);
-    assert.equal(allowance.data.state.budget?.remaining.minutes, 4);
+    assert.equal(allowance.data.state.purpose, 'execution');
+    assert.equal(allowance.data.state.budget, null);
   }
   assert.deepEqual(
     connectedLocal.controller.store.get('run', connectedLocal.run.id),
