@@ -1173,6 +1173,123 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
   assert.equal(refusedConversation.code, 2);
   assert.equal(JSON.parse(refusedConversation.output).result.outcome, 'blocked');
 
+  let lifecycleTask: import('@crewkite/contracts').Task = { ...task };
+  let lifecycleOutcome: 'applied' | 'outcome-unknown' | 'blocked' = 'applied';
+  const lifecycleCommands: Command[] = [];
+  const lifecycleFixture = await serve((message, socket) => {
+    if (message.type === 'hello')
+      socket.write(encodeFrame({ type: 'welcome', protocol: 1, cursor: snapshot.cursor }));
+    if (message.type !== 'command') return;
+    lifecycleCommands.push(message.command);
+    const result =
+      message.command.command === 'GetSnapshot'
+        ? {
+            outcome: 'applied' as const,
+            data: {
+              kind: 'snapshot' as const,
+              snapshot: {
+                ...snapshot,
+                tasks: [lifecycleTask],
+                runs: lifecycleTask.runId ? [run] : [],
+              },
+            },
+          }
+        : { outcome: lifecycleOutcome, reason: 'task-not-amendable', entity: lifecycleTask };
+    socket.write(encodeFrame({ type: 'result', key: message.command.key, result }));
+  });
+  context.after(() => lifecycleFixture.close());
+  const executeLifecycle = async (args: string[]) => {
+    let output = '',
+      errors = '';
+    const code = await runCli([...args, '--json', '--home', lifecycleFixture.home], {
+      out: (text) => {
+        output += text;
+      },
+      err: (text) => {
+        errors += text;
+      },
+    });
+    return { code, output, errors };
+  };
+  const amendment = {
+    taskId: task.id,
+    title: 'Refine the saved task',
+    outcome: 'Keep the corrected contract on this task',
+    criteria: ['The same task ID is retained', 'Existing authority is revalidated'],
+  };
+  const amendArgs = [
+    'task',
+    'amend',
+    task.id,
+    '--title',
+    amendment.title,
+    '--outcome',
+    amendment.outcome,
+    ...amendment.criteria.flatMap((value) => ['--criterion', value]),
+  ];
+  for (const row of [
+    { args: amendArgs, command: 'AmendTask', payload: amendment, prepared: false },
+    {
+      args: ['task', 'pause', task.id],
+      command: 'PauseAdmissions',
+      payload: { taskId: task.id, runId: run.id },
+      prepared: true,
+    },
+  ]) {
+    lifecycleTask = { ...task, ...(row.prepared ? { runId: run.id } : {}) };
+    lifecycleCommands.length = 0;
+    const result = await executeLifecycle(row.args);
+    assert.equal(result.code, 0, result.errors);
+    const command = lifecycleCommands.at(-1);
+    assert.equal(command?.command, row.command);
+    assert.deepEqual(command?.payload, row.payload);
+    assert.equal(
+      command && 'expectedRevision' in command ? command.expectedRevision : null,
+      task.revision,
+    );
+    assert.deepEqual(
+      lifecycleCommands.map((value) => value.command),
+      ['GetSnapshot', row.command],
+    );
+  }
+  for (const args of [
+    ['task', 'amend', task.id, '--outcome', 'Missing title', '--criterion', 'Claim'],
+    ['task', 'amend', task.id, '--title', 'Missing outcome', '--criterion', 'Claim'],
+    ['task', 'amend', task.id, '--title', 'Missing criterion', '--outcome', 'Outcome'],
+    ['task', 'amend', task.id, '--title', 'Title', '--outcome', 'Outcome', '--criterion', ' '],
+    [...amendArgs, 'extra'],
+    [...amendArgs, '--policy', 'no-new-authority.json'],
+    ['task', 'pause', task.id, 'extra'],
+    ['task', 'pause', task.id, '--criterion', 'No contract amendment'],
+  ]) {
+    lifecycleCommands.length = 0;
+    const result = await executeLifecycle(args);
+    assert.equal(result.code, 1, args.join(' '));
+    assert(lifecycleCommands.every((command) => command.command === 'GetSnapshot'));
+  }
+  lifecycleTask = { ...task };
+  lifecycleCommands.length = 0;
+  const unpreparedPause = await executeLifecycle(['task', 'pause', task.id]);
+  assert.equal(unpreparedPause.code, 1);
+  assert(lifecycleCommands.every((command) => command.command === 'GetSnapshot'));
+  lifecycleOutcome = 'blocked';
+  const blockedAmend = await executeLifecycle(amendArgs);
+  assert.equal(blockedAmend.code, 2);
+  assert.equal(JSON.parse(blockedAmend.output).result.reason, 'task-not-amendable');
+  lifecycleTask = { ...task, runId: run.id };
+  lifecycleOutcome = 'outcome-unknown';
+  const uncertainPause = await executeLifecycle(['task', 'pause', task.id]);
+  assert.equal(uncertainPause.code, 2, uncertainPause.errors);
+  const savedPause = JSON.parse(uncertainPause.output);
+  const pauseReceiptPath = join(lifecycleFixture.home, 'pause-receipt.json');
+  writeFileSync(pauseReceiptPath, uncertainPause.output);
+  lifecycleTask = { ...lifecycleTask, revision: task.revision + 1 };
+  lifecycleOutcome = 'applied';
+  const retriedPause = await executeLifecycle(['retry', pauseReceiptPath]);
+  assert.equal(retriedPause.code, 0, retriedPause.errors);
+  assert.deepEqual(JSON.parse(retriedPause.output).command, savedPause.command);
+  assert.deepEqual(lifecycleCommands.at(-1), savedPause.command);
+
   const localBinding: NonNullable<Snapshot['nativeRuns'][number]['localModel']> = {
     version: 2,
     identityKind: 'runtime-metadata',
