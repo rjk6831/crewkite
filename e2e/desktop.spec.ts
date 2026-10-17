@@ -1746,6 +1746,11 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     const created = await timeline.wait((event) => event.type === 'task.created');
     assert.equal(created.type, 'task.created');
     const taskId = created.payload.id;
+    await enter(
+      page
+        .getByRole('dialog', { name: 'Choose execution provider', exact: true })
+        .getByRole('button', { name: 'Scripted demo', exact: true }),
+    );
     const dialog = page.getByRole('dialog');
     await expect(
       page.getByRole('dialog', { name: 'Configure this run', exact: true }),
@@ -2032,8 +2037,14 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     await page.getByLabel('Outcome', { exact: true }).fill(manualTask.outcome);
     await page.getByLabel(/^Acceptance criteria/).fill(manualTask.criteria.join('\n'));
     await enter(page.getByRole('dialog').getByRole('button', { name: 'Create task', exact: true }));
+    const nativeFileProfile = replacementProfiles.find(
+      (profile) => profile.id === 'openai-file-v1',
+    );
+    assert(nativeFileProfile);
     await enter(
-      page.getByRole('dialog').getByRole('button', { name: 'Native file proposal', exact: true }),
+      page
+        .getByRole('dialog', { name: 'Choose execution provider', exact: true })
+        .getByRole('button', { name: `Choose ${nativeFileProfile.displayName}`, exact: true }),
     );
     const nativeDialog = page.getByRole('dialog');
     await expect(nativeDialog.getByText('Requires Pro', { exact: true })).toBeVisible();
