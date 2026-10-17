@@ -16,6 +16,7 @@ import { performance } from 'node:perf_hooks';
 import {
   AttemptIdSchema,
   NativeTargetPathSchema,
+  type Observation,
   SealedHandoffPacketSchema,
 } from '@crewkite/contracts';
 import { verifyHandoff } from '@crewkite/contracts/hash';
@@ -946,7 +947,13 @@ export function projectGoogleConfig(stdout: Uint8Array) {
   };
 }
 
-export function startGoogleConfig(options: NativeLaunch) {
+// One zero-turn slash command, one owned process, one bounded projection.
+// /config and /usage share this path; both report num_turns 0 and no model request.
+function startGoogleMetadata<T>(
+  options: NativeLaunch,
+  command: '/config' | '/usage',
+  project: (stdout: Uint8Array) => T,
+) {
   const clock = nativeClock(options, 20000);
   const launch = nativeLaunch(options, '/dev/null');
   const chunks: Buffer[] = [];
@@ -958,7 +965,7 @@ export function startGoogleConfig(options: NativeLaunch) {
     'config',
     (workMs) => [
       '-p',
-      '/config',
+      command,
       '--output-format',
       'json',
       '--print-timeout',
@@ -973,11 +980,11 @@ export function startGoogleConfig(options: NativeLaunch) {
     },
   );
   const result = handle.result.then((outcome) => {
-    let metadata: ReturnType<typeof projectGoogleConfig> | null = null,
+    let metadata: T | null = null,
       reason = outcome.reason;
     if (!reason && outcome.quiescent)
       try {
-        metadata = projectGoogleConfig(Buffer.concat(chunks));
+        metadata = project(Buffer.concat(chunks));
       } catch (error) {
         reason = error instanceof GoogleWriterError ? error.reason : 'invalid-output';
       }
@@ -989,4 +996,92 @@ export function startGoogleConfig(options: NativeLaunch) {
     return { ...outcome, reason, metadata: reason ? null : metadata };
   });
   return { ...handle, result };
+}
+
+export function startGoogleConfig(options: NativeLaunch) {
+  return startGoogleMetadata(options, '/config', projectGoogleConfig);
+}
+
+// The /usage command reports account buckets, one per quota window, with zero model turns.
+// A bucket is an account fact, so the caller attaches it to every Google route it names.
+const usageBucket = z.looseObject({
+  id: text(64),
+  remaining_fraction: z.number().finite().min(0).max(1),
+  reset_time: z.iso.datetime({ offset: true }),
+});
+const usageOutput = z.looseObject({
+  status: z.literal('SUCCESS'),
+  num_turns: z.literal(0),
+  command: z.looseObject({
+    data: z.looseObject({
+      groups: z.array(z.looseObject({ buckets: z.array(usageBucket).max(32) })).max(32),
+    }),
+  }),
+});
+export type GoogleUsageBucket = Readonly<{
+  windowId: string;
+  kind: 'weekly' | 'rolling' | 'model';
+  remainingPercent: number;
+  resetsAt: string;
+}>;
+
+function usageWindowKind(id: string): GoogleUsageBucket['kind'] {
+  if (/-weekly$/.test(id)) return 'weekly';
+  if (/-\d+h$/.test(id)) return 'rolling';
+  return 'model';
+}
+
+export function projectGoogleUsage(stdout: Uint8Array): GoogleUsageBucket[] {
+  if (stdout.byteLength > 262144) throw new GoogleWriterError('invalid-output');
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder('utf8', { fatal: true }).decode(stdout));
+  } catch {
+    throw new GoogleWriterError('invalid-output');
+  }
+  const parsed = usageOutput.safeParse(value);
+  if (!parsed.success) throw new GoogleWriterError('invalid-output');
+  const buckets = new Map<string, GoogleUsageBucket>();
+  for (const group of parsed.data.command.data.groups)
+    for (const bucket of group.buckets) {
+      const next: GoogleUsageBucket = {
+        windowId: bucket.id,
+        kind: usageWindowKind(bucket.id),
+        remainingPercent: Math.round(bucket.remaining_fraction * 10000) / 100,
+        resetsAt: new Date(bucket.reset_time).toISOString(),
+      };
+      const previous = buckets.get(bucket.id);
+      // The same bucket can appear under several model groups. Its values must agree.
+      if (
+        previous &&
+        (previous.remainingPercent !== next.remainingPercent || previous.resetsAt !== next.resetsAt)
+      )
+        throw new GoogleWriterError('invalid-output');
+      buckets.set(bucket.id, next);
+    }
+  if (buckets.size === 0) throw new GoogleWriterError('invalid-output');
+  return [...buckets.values()];
+}
+
+export function googleUsageObservations(
+  buckets: readonly GoogleUsageBucket[],
+  routeIds: readonly string[],
+  observedAt: string,
+): Observation[] {
+  return routeIds.flatMap((routeId) =>
+    buckets.map((bucket) => ({
+      routeId,
+      windowId: bucket.windowId,
+      kind: bucket.kind,
+      remaining: { value: bucket.remainingPercent, unit: 'percent' as const },
+      resetsAt: bucket.resetsAt,
+      observedAt,
+      source: 'client' as const,
+      confidence: 'reported' as const,
+    })),
+  );
+}
+
+export function startGoogleUsage(options: NativeLaunch) {
+  return startGoogleMetadata(options, '/usage', projectGoogleUsage);
 }
