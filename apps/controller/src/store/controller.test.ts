@@ -38,6 +38,7 @@ import {
   GoogleAcpProfileSchema,
   LocalNativeProfileSchema,
   type Observation,
+  type Route,
   RunSchema,
   TaskConversationStateSchema,
   TaskSchema,
@@ -7170,6 +7171,8 @@ test('planning turns keep task authority and allowance across execution', async 
   let reportedCapacity: number | null = 4096;
   let crashAfterIntent = false;
   let modelAvailability: 'available' | 'missing-model' | 'missing-effort' = 'available';
+  let usageChecked = false;
+  let lateUsage: (() => void) | undefined;
   const held = Promise.withResolvers<void>();
   const children: Promise<void>[] = [];
   const profile = {
@@ -7243,6 +7246,159 @@ test('planning turns keep task authority and allowance across execution', async 
         ['-e', script, phase === 'task' && mode === 'hold' ? 'hold' : 'success', phase],
         spawnOptions,
       );
+      if (phase === 'task' && !usageChecked)
+        child.stdout.once('data', () => {
+          usageChecked = true;
+          const controller = context.controller;
+          const intent = controller.store.intents().find((row) => row.state === 'acknowledged');
+          assert.ok(intent);
+          const attempt = controller.store.get<Attempt>('attempt', intent.attempt_id);
+          assert.ok(attempt);
+          let ownsRuntime = true;
+          let current = true;
+          const ingress = (
+            controller as unknown as {
+              providerUsage: (
+                attempt: Attempt,
+                current: () => void,
+                ownsRuntime: () => boolean,
+                phases: string[],
+              ) => { usage: { onReport: (value: unknown) => void } };
+            }
+          ).providerUsage(
+            attempt,
+            () => {
+              if (!current) throw Error('Changed authority.');
+            },
+            () => ownsRuntime,
+            ['app-server-task'],
+          );
+          const observedAt = controller.now();
+          const oldTime = new Date(Date.parse(observedAt) - 1000).toISOString();
+          const observation = (windowId: string, at = oldTime): Observation => ({
+            routeId: attempt.routeId,
+            windowId,
+            kind: 'rolling',
+            remaining: { value: 80, unit: 'percent' },
+            resetsAt: null,
+            observedAt: at,
+            source: 'client',
+            confidence: 'reported',
+          });
+          const report = (values: Observation[], mode = 'partial', at = values[0].observedAt) =>
+            ingress.usage.onReport({ mode, observedAt: at, observations: values });
+          const retained = () =>
+            controller.store
+              .list<Observation>('window')
+              .filter((value) => value.routeId === attempt.routeId && value.source === 'client');
+          const originalRoute = controller.store.get<Route>('route', attempt.routeId);
+          assert.ok(originalRoute);
+          report([observation('observed-a'), observation('observed-b')]);
+          assert.equal(retained().length, 2);
+          assert.equal(retained()[0].observedAt, oldTime);
+          report([
+            observation('older-omitted', new Date(Date.parse(oldTime) - 1000).toISOString()),
+          ]);
+          const before = retained();
+          const beforeConflict = controller.store.cursor();
+          const equivalentTime = oldTime.replace('.000Z', 'Z');
+          assert.notEqual(equivalentTime, oldTime);
+          report([{ ...observation('observed-a', equivalentTime), remaining: null }], 'complete');
+          assert.deepEqual(retained(), before);
+          assert.equal(controller.store.cursor(), beforeConflict);
+          const otherRoute = context.fixtures.snapshot.routes.find(
+            (route) => route.id !== attempt.routeId,
+          );
+          assert.ok(otherRoute);
+          for (const value of [
+            { ...observation('invalid'), routeId: otherRoute.id },
+            { ...observation('invalid'), source: 'fixture' },
+            { ...observation('invalid'), confidence: 'estimated' },
+            { ...observation('invalid'), remaining: { value: 101, unit: 'percent' } },
+          ]) {
+            ingress.usage.onReport({
+              mode: 'partial',
+              observedAt: oldTime,
+              observations: [observation('would-write'), value],
+            });
+            assert.deepEqual(retained(), before);
+          }
+          report([observation('duplicate'), observation('duplicate')]);
+          report(Array.from({ length: 33 }, (_, index) => observation(`over-count-${index}`)));
+          report([observation('different-time')], 'partial', observedAt);
+          ingress.usage.onReport({
+            mode: 'partial',
+            observedAt: oldTime,
+            observations: [observation('extra-field')],
+            authority: true,
+          });
+          report([observation('future', new Date(Date.parse(observedAt) + 1000).toISOString())]);
+          report([{ ...observation('observed-a'), remaining: null }]);
+          ownsRuntime = false;
+          report([observation('unowned')]);
+          ownsRuntime = true;
+          current = false;
+          report([observation('changed-authority')]);
+          current = true;
+          controller.store.db
+            .prepare('UPDATE writer_leases SET generation=generation+1 WHERE task_id=?')
+            .run(intent.task_id);
+          report([observation('changed-lease')]);
+          controller.store.db
+            .prepare('UPDATE writer_leases SET generation=? WHERE task_id=?')
+            .run(attempt.generation, intent.task_id);
+          controller.store.transaction(() =>
+            controller.store.put('attempt', attempt.id, attempt.revision, {
+              ...attempt,
+              state: 'unknown',
+            }),
+          );
+          report([observation('unknown-attempt')]);
+          controller.store.transaction(() =>
+            controller.store.put('attempt', attempt.id, attempt.revision, attempt),
+          );
+          const process = controller.store.nativeProcesses(attempt.id).at(-1);
+          assert.ok(process);
+          controller.store.db
+            .prepare(
+              "UPDATE native_processes SET state='intent',pid=NULL,process_group=NULL WHERE attempt_id=? AND phase='app-server-task'",
+            )
+            .run(attempt.id);
+          report([observation('unowned-phase')]);
+          controller.store.db
+            .prepare(
+              "UPDATE native_processes SET state='owned',pid=?,process_group=? WHERE attempt_id=? AND phase='app-server-task'",
+            )
+            .run(process.pid, process.process_group, attempt.id);
+          controller.store.transaction(() =>
+            controller.store.put('route', attempt.routeId, 0, {
+              ...originalRoute,
+              model: 'changed-model',
+            }),
+          );
+          report([observation('changed-route')]);
+          controller.store.transaction(() =>
+            controller.store.put('route', attempt.routeId, 0, originalRoute),
+          );
+          assert.deepEqual(retained(), before);
+          assert.deepEqual(controller.store.get('route', attempt.routeId), originalRoute);
+          report([observation('observed-a', observedAt)]);
+          const cursor = controller.store.cursor();
+          report([observation('observed-a', observedAt)], 'complete');
+          assert.notEqual(controller.store.cursor(), cursor);
+          assert.deepEqual(retained(), [observation('observed-a', observedAt)]);
+          report([observation('observed-b')], 'complete');
+          assert.deepEqual(retained(), [observation('observed-a', observedAt)]);
+          const manual = { ...observation('manual', observedAt), source: 'manual' as const };
+          controller.store.transaction(() =>
+            controller.store.put('window', `${attempt.routeId}/manual`, 0, manual),
+          );
+          report([observation('manual')]);
+          assert.deepEqual(controller.store.get('window', `${attempt.routeId}/manual`), manual);
+          report([observation('observed-a', observedAt)], 'complete');
+          assert.deepEqual(controller.store.get('window', `${attempt.routeId}/manual`), manual);
+          lateUsage = () => report([observation('late', observedAt)]);
+        });
       children.push(new Promise<void>((done) => child.once('close', () => done())));
       let output = '';
       if (phase === 'task' && mode === 'hold')
@@ -7439,6 +7595,10 @@ test('planning turns keep task authority and allowance across execution', async 
   assert.equal(state(catalogTask.id).modelChoices?.status, 'not-observed');
   assert.equal(state(catalogTask.id).contextUsage, null);
   await catalogReply;
+  assert.equal(usageChecked, true);
+  const usageAfterCompletion = controller.store.list<Observation>('window');
+  lateUsage?.();
+  assert.deepEqual(controller.store.list<Observation>('window'), usageAfterCompletion);
   const observed = state(catalogTask.id).modelChoices;
   assert.equal(observed?.status, 'last-observed');
   assert(observed?.observation);

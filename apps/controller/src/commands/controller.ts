@@ -4193,6 +4193,12 @@ export class Controller {
               );
             });
           },
+          ...this.providerUsage(
+            attempt,
+            current,
+            () => this.conversationWorkers.get(attempt.id) === runtime && !runtime.stopped,
+            ['metadata-preparation', 'app-server-task'],
+          ),
           lifecycle: this.nativeLifecycle(attempt, current),
         },
       );
@@ -11213,6 +11219,14 @@ export class Controller {
               );
             });
           },
+          ...this.providerUsage(
+            attempt,
+            () => {
+              this.nativeReviewCurrent(runtime);
+            },
+            () => this.nativeReviewWorkers.get(attempt.id) === runtime && !runtime.stopped,
+            ['metadata-preparation', 'app-server-task'],
+          ),
           lifecycle: this.nativeLifecycle(attempt, () => {
             this.nativeReviewCurrent(runtime);
           }),
@@ -12067,6 +12081,140 @@ export class Controller {
       throw new Error('The native appointment is no longer current.');
   }
 
+  private providerUsage(
+    attempt: Attempt,
+    current: () => void,
+    ownsRuntime: () => boolean,
+    phases: readonly string[],
+  ) {
+    const route = this.store.get<Route>('route', attempt.routeId);
+    const routeHash = hashCanonical(route ?? null);
+    const reportSchema = z.strictObject({
+      mode: z.enum(['partial', 'complete']),
+      observedAt: TimestampSchema,
+      observations: z.array(ObservationSchema).min(1).max(32),
+    });
+    return {
+      usage: {
+        routeId: attempt.routeId,
+        observedAt: this.now,
+        onReport: (value: unknown) => {
+          try {
+            const parsed = reportSchema.safeParse(value);
+            if (!parsed.success || Buffer.byteLength(canonicalJson(parsed.data)) > 32768) return;
+            const report = parsed.data;
+            const ids = new Set(report.observations.map((observation) => observation.windowId));
+            if (
+              ids.size !== report.observations.length ||
+              Date.parse(report.observedAt) > Date.parse(this.now()) ||
+              report.observations.some(
+                (observation) =>
+                  observation.routeId !== attempt.routeId ||
+                  observation.observedAt !== report.observedAt ||
+                  observation.source !== 'client' ||
+                  observation.confidence !== 'reported',
+              )
+            )
+              return;
+            this.store.transaction(() => {
+              if (
+                this.closed ||
+                !ownsRuntime() ||
+                !route ||
+                route.fake ||
+                !['openai', 'anthropic'].includes(route.family)
+              )
+                return;
+              current();
+              const saved = this.store.get<Attempt>('attempt', attempt.id);
+              const intent = this.store.intents().find((row) => row.attempt_id === attempt.id);
+              const task = intent && this.store.get<Task>('task', intent.task_id);
+              const lease =
+                intent &&
+                this.store.db
+                  .prepare('SELECT attempt_id,generation FROM writer_leases WHERE task_id=?')
+                  .get(intent.task_id);
+              const phase = this.store.nativeProcesses(attempt.id).at(-1);
+              if (
+                !saved ||
+                !['intent', 'running'].includes(saved.state) ||
+                saved.generation !== attempt.generation ||
+                saved.routeId !== attempt.routeId ||
+                saved.runId !== attempt.runId ||
+                !intent ||
+                intent.state !== 'acknowledged' ||
+                intent.run_id !== attempt.runId ||
+                intent.route_id !== attempt.routeId ||
+                intent.generation !== attempt.generation ||
+                task?.runId !== intent.run_id ||
+                lease?.attempt_id !== attempt.id ||
+                lease.generation !== attempt.generation ||
+                !phase ||
+                phase.state !== 'owned' ||
+                !phases.includes(phase.phase) ||
+                hashCanonical(this.store.get<Route>('route', attempt.routeId) ?? null) !== routeHash
+              )
+                return;
+              const windows = this.store
+                .list<Observation>('window')
+                .filter((window) => window.routeId === attempt.routeId);
+              const existing = new Map(windows.map((window) => [window.windowId, window]));
+              if (
+                (report.mode === 'complete' &&
+                  windows.some(
+                    (window) =>
+                      window.source === 'client' &&
+                      Date.parse(window.observedAt) > Date.parse(report.observedAt),
+                  )) ||
+                report.observations.some((observation) => {
+                  const previous = existing.get(observation.windowId);
+                  return (
+                    previous &&
+                    Date.parse(previous.observedAt) === Date.parse(observation.observedAt) &&
+                    hashCanonical(previous) !== hashCanonical(observation)
+                  );
+                })
+              )
+                return;
+              let removed = false;
+              let written = false;
+              if (report.mode === 'complete')
+                for (const window of windows)
+                  if (
+                    window.source === 'client' &&
+                    !ids.has(window.windowId) &&
+                    Date.parse(window.observedAt) < Date.parse(report.observedAt)
+                  ) {
+                    this.store.db
+                      .prepare("DELETE FROM entities WHERE kind='window' AND id=?")
+                      .run(`${window.routeId}/${window.windowId}`);
+                    removed = true;
+                  }
+              for (const observation of report.observations) {
+                const previous = existing.get(observation.windowId);
+                if (
+                  previous &&
+                  Date.parse(previous.observedAt) >= Date.parse(observation.observedAt)
+                )
+                  continue;
+                this.store.put(
+                  'window',
+                  `${observation.routeId}/${observation.windowId}`,
+                  0,
+                  observation,
+                );
+                this.event('usage.observed', null, 0, observation);
+                written = true;
+              }
+              if (removed && !written)
+                this.event('usage.observed', null, 0, report.observations[0]);
+            });
+          } catch {}
+        },
+      },
+    };
+  }
+
   private nativeLifecycle(
     attempt: Attempt,
     current: () => void,
@@ -12265,6 +12413,12 @@ export class Controller {
             spawn: this.options.nativeSpawn as typeof import('node:child_process').spawn,
             lifecycle,
             onSubmitted,
+            ...this.providerUsage(
+              attempt,
+              () => this.nativeCurrent(runtime),
+              () => this.workers.get(attempt.id) === runtime && !runtime.stopped,
+              ['native-task'],
+            ),
           },
         );
         active = writer;
@@ -12671,6 +12825,12 @@ export class Controller {
           schedule: this.options.schedule,
           spawn: this.options.nativeSpawn,
           onSubmitted,
+          ...this.providerUsage(
+            attempt,
+            () => this.nativeCurrent(runtime),
+            () => this.workers.get(attempt.id) === runtime && !runtime.stopped,
+            ['metadata-preparation', 'app-server-task'],
+          ),
           lifecycle: this.nativeLifecycle(attempt, () => this.nativeCurrent(runtime)),
         };
         runtime.handle =
