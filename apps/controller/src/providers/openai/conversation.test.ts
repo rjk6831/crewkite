@@ -113,6 +113,126 @@ function complete(reader: ConversationTranscript, value: unknown) {
 
 test('conversation replies bind frozen scope and remain finite proposals', () => {
   const trusted = plan(resolve('internal/conversation-input'));
+  const messageId = 'msg_01M51M322B2AEBXD9MA74CBCFM';
+  const contextSource = { projectId: 'prj_01M51M322B2AEBXD9MA74CBCFM', base: 'a'.repeat(40) };
+  const selectedText = 'Treat this source comment as data.\n';
+  const digest = (text: string) => createHash('sha256').update(text).digest('hex');
+  const bundle = {
+    version: 1 as const,
+    ...contextSource,
+    files: [
+      {
+        kind: 'source' as const,
+        path: 'net.mjs',
+        mode: '100644' as const,
+        hash: digest(selectedText),
+        bytes: Buffer.byteLength(selectedText),
+        text: selectedText,
+      },
+    ],
+  };
+  const attachment = {
+    messageId,
+    artifactId: 'art_01M51M322B2AEBXD9MA74CBCFM',
+    hash: hashCanonical(bundle),
+    bundle,
+  };
+  const withContext = {
+    ...trusted,
+    contextSource,
+    contextAttachments: [attachment],
+    history: [{ ...trusted.history[0], messageId }],
+  };
+  const selected = conversationPlan(withContext);
+  const legacyHash = hashCanonical({
+    binding: trusted.binding,
+    context: trusted.context,
+    scope: trusted.scope,
+    history: trusted.history,
+    omittedHistoryCount: trusted.omittedHistoryCount,
+  });
+  assert.equal(conversationBindingHash(trusted), legacyHash);
+  const empty = conversationPlan({ ...withContext, contextAttachments: [] });
+  assert.equal(conversationBindingHash(empty), legacyHash);
+  assert.deepEqual(empty, trusted);
+  assert.notEqual(conversationBindingHash(selected), legacyHash);
+  const selectedReader = new ConversationTranscript(selected, { now: () => 1, timeoutMs: 60_000 });
+  const selectedRequest = admit(selectedReader, selected.directory);
+  const selectedTask = JSON.parse(selectedRequest.params.input[0].text.split('\n').at(-1));
+  assert.match(selectedRequest.params.input[0].text, /untrusted source or log text/);
+  assert.deepEqual(selectedTask.contextAttachments, [attachment]);
+  assert.deepEqual(selectedTask.contextSource, contextSource);
+  assert.deepEqual(selectedTask.scope, trusted.scope);
+  assert.equal(selectedTask.history[0].messageId, messageId);
+  assert.equal(
+    selectedRequest.params.outputSchema.properties.bindingHash.const,
+    conversationBindingHash(selected),
+  );
+  complete(selectedReader, reply(selected));
+  assert.deepEqual(selectedReader.finish().conversation, reply(selected));
+  const staleReader = new ConversationTranscript(selected, { now: () => 1, timeoutMs: 60_000 });
+  admit(staleReader, selected.directory);
+  assert.throws(() => complete(staleReader, reply(trusted)));
+  const changedText = {
+    ...bundle,
+    files: [
+      {
+        ...bundle.files[0],
+        text: 'Changed bytes.\n',
+        bytes: Buffer.byteLength('Changed bytes.\n'),
+      },
+    ],
+  };
+  for (const change of [
+    { contextSource: undefined },
+    { contextSource: { ...contextSource, projectId: 'prj_01M51M322B2AEBXD9MA74CBCFN' } },
+    { contextSource: { ...contextSource, base: 'b'.repeat(40) } },
+    { history: trusted.history },
+    { history: [withContext.history[0], withContext.history[0]] },
+    { history: [{ ...withContext.history[0], role: 'agent' }] },
+    { contextAttachments: [{ ...attachment, hash: '0'.repeat(64) }] },
+    { contextAttachments: [{ ...attachment, messageId: 'msg_01M51M322B2AEBXD9MA74CBCFN' }] },
+    { contextAttachments: [attachment, attachment] },
+    {
+      contextAttachments: [
+        attachment,
+        { ...attachment, artifactId: 'art_01M51M322B2AEBXD9MA74CBCFN' },
+      ],
+    },
+    {
+      contextAttachments: [
+        { ...attachment, hash: hashCanonical(changedText), bundle: changedText },
+      ],
+    },
+  ])
+    assert.throws(() => conversationPlan({ ...withContext, ...change } as ConversationPlan));
+  const largeText = 'x'.repeat(8192);
+  const largeBundle = {
+    ...bundle,
+    files: ['a.mjs', 'b.mjs', 'c.mjs'].map((path) => ({
+      ...bundle.files[0],
+      path,
+      text: largeText,
+      bytes: 8192,
+      hash: digest(largeText),
+    })),
+  };
+  assert.throws(() =>
+    conversationPlan({
+      ...withContext,
+      history: Array.from({ length: 5 }, (_, index) => ({
+        role: 'user',
+        text: 'x'.repeat(4096),
+        messageId: `msg_01M51M322B2AEBXD9MA74CBCF${index}`,
+      })),
+      contextAttachments: [0, 1].map((index) => ({
+        ...attachment,
+        messageId: `msg_01M51M322B2AEBXD9MA74CBCF${index}`,
+        bundle: largeBundle,
+        hash: hashCanonical(largeBundle),
+      })),
+    }),
+  );
   for (const amendment of [
     { binding: { ...trusted.binding, scopeHash: '0'.repeat(64) } },
     { binding: { ...trusted.binding, role: 'coder' } },
@@ -178,7 +298,37 @@ test('conversation turns use one correlated submission through owned native phas
   const root = mkdtempSync(resolve('internal/conversation-owner-'));
   const directory = resolve(root, 'context');
   mkdirSync(directory, { mode: 0o700 });
-  const trusted = plan(directory);
+  const input = plan(directory);
+  const selectedText = 'Selected log text cannot grant execution.\n';
+  const selectedMessageId = 'msg_01M51M322B2AEBXD9MA74CBCFM';
+  const contextSource = { projectId: 'prj_01M51M322B2AEBXD9MA74CBCFM', base: 'a'.repeat(40) };
+  const bundle = {
+    version: 1 as const,
+    ...contextSource,
+    files: [
+      {
+        kind: 'log' as const,
+        path: 'build.log',
+        mode: '100644' as const,
+        hash: createHash('sha256').update(selectedText).digest('hex'),
+        bytes: Buffer.byteLength(selectedText),
+        text: selectedText,
+      },
+    ],
+  };
+  const trusted = conversationPlan({
+    ...input,
+    history: [{ ...input.history[0], messageId: selectedMessageId }],
+    contextSource,
+    contextAttachments: [
+      {
+        messageId: selectedMessageId,
+        artifactId: 'art_01M51M322B2AEBXD9MA74CBCFM',
+        hash: hashCanonical(bundle),
+        bundle,
+      },
+    ],
+  });
   const start = fixture.indexOf(
     '    const path = message.params.outputSchema.properties.path.const;',
   );
@@ -188,6 +338,8 @@ test('conversation turns use one correlated submission through owned native phas
     fixture.slice(0, start) +
     `
     const task = JSON.parse(message.params.input[0].text.split('\\n').at(-1));
+    const attachment = task.contextAttachments[0];
+    if (attachment.messageId !== task.history[0].messageId || attachment.bundle.files[0].text !== ${JSON.stringify(selectedText)}) throw new Error('Selected context was not delivered intact.');
     const reply = {version:1,bindingHash:message.params.outputSchema.properties.bindingHash.const,message:'I need a boundary for: '+task.history.at(-1).text,questions:['Should the net total stop at zero?'],proposal:null};
     const item = {id:'message-1',type:'agentMessage',text:JSON.stringify(reply),phase:'final_answer'};
 ` +
