@@ -7,10 +7,11 @@ import {
   readFileSync,
   rmSync,
   symlinkSync,
+  truncateSync,
   writeFileSync,
 } from 'node:fs';
 import { userInfo } from 'node:os';
-import { join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import type { ApprovalBinding } from '@crewkite/contracts';
@@ -47,6 +48,7 @@ const selection = {
   thoughtLevelId: 'fixture-low',
 };
 const original = 'export const total = 0;\n';
+const harness = '#!/bin/sh\nexit 99\n';
 const target = { path: 'net.mjs', baseHash: hash(original), mode: '100644' as const };
 const environment = {
   HOME: userInfo().homedir,
@@ -66,8 +68,10 @@ function fixture(scenario: AcpPeerCase) {
     `#!${process.execPath}\nimport {runAcpPeer} from ${JSON.stringify(new URL(`file://${peer}`).href)};runAcpPeer(${JSON.stringify(scenario)});\n`,
     { mode: 0o500 },
   );
+  writeFileSync(join(home, 'localharness_external'), harness, { mode: 0o500 });
   const client = {
     executable,
+    harnessSha256: hash(harness),
     version: '1.4.0' as const,
     sha256: hash(readFileSync(executable)),
     signerTeamId: 'TESTTEAM01',
@@ -217,6 +221,41 @@ function writer(
 }
 
 test('the acp writer binds an imported client and observed configuration before one prompt', async () => {
+  const large = fixture('complete');
+  try {
+    const staged = join(large.home, 'imports/google-acp-v1');
+    mkdirSync(staged, { recursive: true, mode: 0o700 });
+    const server = join(staged, 'agy_acp_server.par');
+    writeFileSync(server, '', { mode: 0o600 });
+    const bytes = 280_980_064;
+    truncateSync(server, bytes);
+    const digest = createHash('sha256');
+    const block = Buffer.alloc(65536);
+    for (let remaining = bytes; remaining > 0; remaining -= Math.min(remaining, block.length))
+      digest.update(block.subarray(0, Math.min(remaining, block.length)));
+    const sha256 = digest.digest('hex');
+    writeFileSync(join(staged, 'localharness_external'), harness, { mode: 0o600 });
+    writeFileSync(
+      join(staged, 'identity.json'),
+      JSON.stringify({ ...acpClientPin(large.client), sha256, harnessSha256: hash(harness) }),
+      { mode: 0o600 },
+    );
+    const imported = await importGoogleAcp(
+      { home: large.home, consent: 'explicit' },
+      {
+        verifySignature: async ({ client }) => ({
+          verified: true,
+          quiescent: true,
+          signerTeamId: client.signerTeamId,
+          requirement: googleAcpDeveloperIdRequirement(client.signerTeamId),
+        }),
+      },
+    );
+    assert.equal(imported.reason, 'imported');
+    assert.equal(imported.client?.sha256, sha256);
+  } finally {
+    large.dispose();
+  }
   const f = fixture('complete');
   try {
     const staging = join(f.home, 'imports/google-acp-v1');
@@ -224,22 +263,28 @@ test('the acp writer binds an imported client and observed configuration before 
     writeFileSync(join(staging, 'agy_acp_server.par'), readFileSync(f.client.executable), {
       mode: 0o600,
     });
-    writeFileSync(join(staging, 'identity.json'), JSON.stringify(acpClientPin(f.client)), {
-      mode: 0o600,
-    });
+    writeFileSync(join(staging, 'localharness_external'), harness, { mode: 0o600 });
+    writeFileSync(
+      join(staging, 'identity.json'),
+      JSON.stringify({ ...acpClientPin(f.client), harnessSha256: f.client.harnessSha256 }),
+      {
+        mode: 0o600,
+      },
+    );
     let signatures = 0;
     const dependencies: AcpImportDependencies = {
       verifySignature: async ({ client, executable }) => {
         signatures++;
         assert.equal(
           executable,
-          join(f.home, 'providers/google-acp-v1', client.sha256, 'agy_acp_server.par'),
+          join(f.home, 'providers/google-acp-v1', f.client.sha256, basename(executable)),
         );
         const expected = readFileSync(executable);
-        writeFileSync(join(staging, 'agy_acp_server.par'), 'different staged bytes');
+        assert.equal(hash(expected), client.sha256);
+        writeFileSync(join(staging, basename(executable)), 'different staged bytes');
         await Promise.resolve();
         assert.deepEqual(readFileSync(executable), expected);
-        writeFileSync(join(staging, 'agy_acp_server.par'), expected);
+        writeFileSync(join(staging, basename(executable)), expected);
         return {
           verified: true as const,
           signerTeamId: client.signerTeamId,
@@ -254,7 +299,7 @@ test('the acp writer binds an imported client and observed configuration before 
       (await importGoogleAcp({ home: f.home, consent: 'explicit' }, dependencies)).reason,
       'already-imported',
     );
-    assert.equal(signatures, 1);
+    assert.equal(signatures, 2);
     for (const failure of [
       'team',
       'requirement',
@@ -262,6 +307,12 @@ test('the acp writer binds an imported client and observed configuration before 
       'managed-mutation',
       'parent-mutation',
       'deadline',
+      'bundle-deadline',
+      'missing-harness',
+      'harness-digest',
+      'harness-signature',
+      'harness-mutation',
+      'identity-mutation',
     ] as const) {
       const row = fixture('complete');
       try {
@@ -270,12 +321,22 @@ test('the acp writer binds an imported client and observed configuration before 
         writeFileSync(join(staged, 'agy_acp_server.par'), readFileSync(row.client.executable), {
           mode: 0o600,
         });
-        writeFileSync(join(staged, 'identity.json'), JSON.stringify(acpClientPin(row.client)), {
-          mode: 0o600,
-        });
+        if (failure !== 'missing-harness')
+          writeFileSync(
+            join(staged, 'localharness_external'),
+            failure === 'harness-digest' ? 'changed' : harness,
+            { mode: 0o600 },
+          );
+        writeFileSync(
+          join(staged, 'identity.json'),
+          JSON.stringify({ ...acpClientPin(row.client), harnessSha256: row.client.harnessSha256 }),
+          {
+            mode: 0o600,
+          },
+        );
         let clock = 0;
         const mutation: AcpImportDependencies =
-          failure === 'deadline'
+          failure === 'deadline' || failure === 'bundle-deadline'
             ? {
                 now: () => clock,
                 schedule: () => () => {},
@@ -287,7 +348,7 @@ test('the acp writer binds an imported client and observed configuration before 
                   const child = spawnCheckChild(row.client.executable, [], options);
                   if (child.pid) row.groups.push(child.pid);
                   child.once('close', () => {
-                    clock = 5000;
+                    clock = failure === 'deadline' ? 5000 : clock + 2500;
                   });
                   return child;
                 },
@@ -301,12 +362,26 @@ test('the acp writer binds an imported client and observed configuration before 
                     writeFileSync(executable, original);
                     chmodSync(executable, 0o500);
                   }
+                  if (failure === 'harness-mutation') {
+                    const helper = join(dirname(executable), 'localharness_external');
+                    chmodSync(helper, 0o700);
+                    writeFileSync(helper, 'changed');
+                    writeFileSync(helper, harness);
+                    chmodSync(helper, 0o500);
+                  }
+                  if (failure === 'identity-mutation')
+                    writeFileSync(join(staged, 'identity.json'), '{}');
                   if (failure === 'parent-mutation')
                     writeFileSync(join(executable, '..', 'unexpected'), 'changed');
                   return {
                     verified: true,
                     quiescent: failure !== 'ownership',
-                    signerTeamId: failure === 'team' ? 'WRONGTEAM1' : row.client.signerTeamId,
+                    signerTeamId:
+                      failure === 'team' ||
+                      (failure === 'harness-signature' &&
+                        basename(executable) === 'localharness_external')
+                        ? 'WRONGTEAM1'
+                        : row.client.signerTeamId,
                     requirement:
                       failure === 'requirement'
                         ? 'printed team only'
@@ -323,6 +398,19 @@ test('the acp writer binds an imported client and observed configuration before 
     }
     const managed = readGoogleAcpPin(f.home);
     assert.equal(managed.sha256, f.client.sha256);
+    assert.equal(managed.harnessSha256, f.client.harnessSha256);
+    assert.equal(
+      readFileSync(join(dirname(managed.executable), 'localharness_external'), 'utf8'),
+      harness,
+    );
+    const helperPath = join(dirname(managed.executable), 'localharness_external');
+    chmodSync(helperPath, 0o700);
+    writeFileSync(helperPath, 'changed');
+    chmodSync(helperPath, 0o500);
+    assert.throws(() => readGoogleAcpPin(f.home));
+    chmodSync(helperPath, 0o700);
+    writeFileSync(helperPath, harness);
+    chmodSync(helperPath, 0o500);
     assert.equal(
       resolveGoogleAcpProfile({ home: f.home, proof: f.proof, environment }).facts.available,
       false,

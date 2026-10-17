@@ -6234,8 +6234,11 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       `#!${process.execPath}\nimport {runAcpPeer} from ${JSON.stringify(peer)};runAcpPeer(${JSON.stringify(scenario)});\n`,
       { mode: 0o500 },
     );
+    const harness = '#!/bin/sh\nexit 99\n';
+    writeFileSync(join(fixtureHome, 'localharness_external'), harness, { mode: 0o500 });
     const client = {
       executable,
+      harnessSha256: createHash('sha256').update(harness).digest('hex'),
       version: '1.4.0' as const,
       signerTeamId: 'TESTTEAM01',
       sha256: createHash('sha256').update(readFileSync(executable)).digest('hex'),

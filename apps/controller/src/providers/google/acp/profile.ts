@@ -1,5 +1,13 @@
 import { createHash } from 'node:crypto';
-import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readdirSync,
+  readSync,
+} from 'node:fs';
 import { userInfo } from 'node:os';
 import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
 import {
@@ -22,7 +30,12 @@ export const AcpClientPinSchema = z.strictObject({
   signerTeamId: z.string().regex(/^[A-Z0-9]{10}$/),
 });
 export type AcpClientPin = z.infer<typeof AcpClientPinSchema>;
-export type AcpClientIdentity = Readonly<AcpClientPin & { executable: string }>;
+export const AcpImportIdentitySchema = AcpClientPinSchema.extend({ harnessSha256: HashSchema });
+export const AcpServerMaximumBytes = 384 * 1024 * 1024;
+export const AcpHarnessMaximumBytes = 128 * 1024 * 1024;
+export type AcpClientIdentity = Readonly<
+  z.infer<typeof AcpImportIdentitySchema> & { executable: string }
+>;
 export const AcpReviewMappingSchema = z.strictObject({
   client: AcpClientPinSchema,
   surface: z.literal('config'),
@@ -64,17 +77,19 @@ export const AcpSetupProofSchema = z
   );
 export type AcpSetupProof = z.infer<typeof AcpSetupProofSchema>;
 
+const signatureSchema = z.strictObject({
+  method: z.literal('macos-codesign'),
+  verified: z.literal(true),
+  requirement: z.string().min(1).max(1024),
+  sha256: HashSchema,
+  signerTeamId: z.string().regex(/^[A-Z0-9]{10}$/),
+});
 export const AcpImportPinSchema = z.strictObject({
-  version: z.literal(1),
+  version: z.literal(2),
   profileId: z.literal('google-acp-v1'),
   client: AcpClientPinSchema,
-  signature: z.strictObject({
-    method: z.literal('macos-codesign'),
-    verified: z.literal(true),
-    requirement: z.string().min(1).max(1024),
-    sha256: HashSchema,
-    signerTeamId: z.string().regex(/^[A-Z0-9]{10}$/),
-  }),
+  signature: signatureSchema,
+  harness: z.strictObject({ sha256: HashSchema, signature: signatureSchema }),
 });
 
 export function googleAcpDeveloperIdRequirement(signerTeamId: string): string {
@@ -92,12 +107,20 @@ export function acpClientPin(client: AcpClientIdentity | AcpClientPin): AcpClien
 
 export function validateAcpClientIdentity(client: AcpClientIdentity): AcpClientIdentity {
   const parsed = z
-    .strictObject({ ...AcpClientPinSchema.shape, executable: z.string().min(1).max(4096) })
+    .strictObject({ ...AcpImportIdentitySchema.shape, executable: z.string().min(1).max(4096) })
     .parse(client);
   if (!isAbsolute(parsed.executable) || resolve(parsed.executable) !== parsed.executable)
     throw new Error('Invalid managed executable path.');
-  if (hashAcpPrivateFile(parsed.executable, 256 * 1024 * 1024, true) !== parsed.sha256)
+  if (hashAcpPrivateFile(parsed.executable, AcpServerMaximumBytes, true) !== parsed.sha256)
     throw new Error('Managed executable changed.');
+  if (
+    hashAcpPrivateFile(
+      join(dirname(parsed.executable), 'localharness_external'),
+      AcpHarnessMaximumBytes,
+      true,
+    ) !== parsed.harnessSha256
+  )
+    throw new Error('Managed harness changed.');
   return parsed;
 }
 
@@ -226,12 +249,24 @@ export function readGoogleAcpPin(home: string): AcpClientIdentity {
   if (
     pin.signature.sha256 !== pin.client.sha256 ||
     pin.signature.signerTeamId !== pin.client.signerTeamId ||
-    pin.signature.requirement !== googleAcpDeveloperIdRequirement(pin.client.signerTeamId)
+    pin.signature.requirement !== googleAcpDeveloperIdRequirement(pin.client.signerTeamId) ||
+    pin.harness.signature.sha256 !== pin.harness.sha256 ||
+    pin.harness.signature.signerTeamId !== pin.client.signerTeamId ||
+    pin.harness.signature.requirement !== googleAcpDeveloperIdRequirement(pin.client.signerTeamId)
   )
     throw new Error('Import signature receipt does not match the pin.');
   const executable = join(root, pin.client.sha256, 'agy_acp_server.par');
   validateAcpDirectory(dirname(executable), home);
-  return validateAcpClientIdentity({ ...pin.client, executable });
+  if (
+    JSON.stringify(readdirSync(dirname(executable)).sort()) !==
+    JSON.stringify(['agy_acp_server.par', 'localharness_external'])
+  )
+    throw new Error('Managed bundle contains unexpected files.');
+  return validateAcpClientIdentity({
+    ...pin.client,
+    harnessSha256: pin.harness.sha256,
+    executable,
+  });
 }
 
 export type AcpProfileResolution = {

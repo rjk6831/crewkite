@@ -368,7 +368,10 @@ const NativeRepositoryAppointmentSchema = NativeFileAppointmentSchema.omit({
   );
 const NativeAcpAppointmentSchema = NativeFileAppointmentSchema.extend({
   profileId: z.literal('google-acp-v1'),
-  client: AcpClientPinSchema.extend({ executable: z.string().max(4096).refine(isAbsolute) }),
+  client: AcpClientPinSchema.extend({
+    executable: z.string().max(4096).refine(isAbsolute),
+    harnessSha256: HashSchema,
+  }),
   billingAttestation: GoogleAcpBillingAttestationSchema,
   permissionMode: z.literal('request-review'),
   target: NativeFileAppointmentSchema.shape.target.extend({ mode: z.enum(['100644', '100755']) }),
