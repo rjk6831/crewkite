@@ -57,9 +57,13 @@ The diagram shows the supported decision flow. Checks, review and branch accepta
 <details>
 <summary>Keyboard navigation</summary>
 
-Press `Cmd+K` to open the command palette. Saved tasks show their project and task ID suffix, with five tasks per page. Previous and Next keep the rest reachable.
+Collapse sidebar keeps Search, New task and Usage and capacity in a compact rail. Expand sidebar restores the project and task list.
 
-Review pending approval opens the existing approval card and focuses its review region. Read the exact target and consequence, then choose Approve once or Deny as a separate action. `Escape` closes the palette and dialogs. Arrow keys move between task and launch tabs.
+Press `Cmd+K` or `Ctrl+K`, or choose Search, to open tasks and commands. Search matches task titles, outcomes, criteria, task and project IDs, project names and command labels in the current snapshot. Conversation messages are not searched. Tasks show their project, state and task ID suffix, with five matches per page.
+
+Use Up and Down to select a result, then Enter to open it. Page Up and Page Down move between task pages; Previous tasks and Next tasks provide the same controls. `Escape` closes search and dialogs.
+
+Review pending approval opens the existing approval card and focuses its review region. Read the exact target and consequence, then choose Approve once or Deny as a separate action. Left and Right move between task and launch tabs.
 
 
 </details>

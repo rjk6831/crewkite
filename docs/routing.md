@@ -70,6 +70,8 @@ In cloud-first, local-finish mode, the local route takes only work it is qualifi
 
 ## Displaying usage
 
+Open Usage and capacity from the sidebar or find it in Search.
+
 The Usage view has four regions:
 
 - Route allowance cards: one gauge or row per window with unit, model scope, reset time, observation time, source and freshness. Unknown windows render as a labelled unavailable gauge.
