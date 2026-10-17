@@ -8,7 +8,7 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
-  readFileSync,
+  readSync,
   realpathSync,
 } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -42,10 +42,25 @@ function contained(root: string, path: string) {
 function readRegular(path: string, limit: number) {
   const file = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
-    const state = fstatSync(file);
-    if (!state.isFile() || state.nlink !== 1 || state.size > limit)
+    const state = fstatSync(file, { bigint: true });
+    if (!state.isFile() || state.nlink !== 1n || state.size > BigInt(limit))
       throw new Error('The runtime entry must be a bounded regular file.');
-    return readFileSync(file);
+    const bytes = Buffer.alloc(Number(state.size) + 1);
+    let count = 0;
+    while (count < bytes.length) {
+      const read = readSync(file, bytes, count, bytes.length - count, null);
+      if (read === 0) break;
+      count += read;
+    }
+    const after = fstatSync(file, { bigint: true });
+    if (
+      BigInt(count) !== state.size ||
+      (['dev', 'ino', 'size', 'mode', 'uid', 'gid', 'nlink', 'mtimeNs', 'ctimeNs'] as const).some(
+        (key) => state[key] !== after[key],
+      )
+    )
+      throw new Error('The runtime entry changed while reading.');
+    return bytes.subarray(0, count);
   } finally {
     closeSync(file);
   }

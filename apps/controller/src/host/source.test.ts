@@ -383,6 +383,91 @@ test('source inspection bounds file metadata without running filters or reading 
   const { buildLocalInputHelper, inspectLocalInputArtifact } = await import(
     new URL('../../../../scripts/package.mjs', import.meta.url).href
   );
+  const { resolvePackagedLocalInput } = await import('../main.ts');
+  for (const row of [
+    'missing manifest',
+    'missing capability',
+    'fixed capability',
+    'directory URL root',
+    'changed node',
+    'changed helper',
+    'changed source',
+    'linked helper',
+    'shared helper',
+    'special helper',
+    'writable manifest',
+    'caller path',
+  ]) {
+    const root = join(directory, 'packaged-input', row);
+    const source = join(root, 'apps/controller/src/providers/local/secure-input.m');
+    const helper = join(root, 'bin/local-secure-input');
+    mkdirSync(dirname(source), { recursive: true });
+    mkdirSync(dirname(helper));
+    writeFileSync(source, 'synthetic source');
+    writeFileSync(helper, 'synthetic helper');
+    writeFileSync(join(root, 'bin/node'), 'synthetic node');
+    const hash = (value: string) => createHash('sha256').update(value).digest('hex');
+    const localInput = {
+      sha256: hash('synthetic helper'),
+      sourceHash: hash('synthetic source'),
+      target: 'darwin-arm64',
+      minOS: '13.5.0',
+    };
+    const manifest = {
+      version: 1,
+      node: {
+        version: '24.22.0',
+        platform: 'darwin',
+        arch: 'arm64',
+        sha256: hash('synthetic node'),
+      },
+      mode: 'demo',
+      ...(row === 'missing capability' ? {} : { localInput }),
+    };
+    const manifestPath = join(root, 'manifest.json');
+    if (row !== 'missing manifest')
+      writeFileSync(
+        manifestPath,
+        JSON.stringify(
+          row === 'caller path'
+            ? { ...manifest, localInput: { ...localInput, path: helper } }
+            : manifest,
+        ),
+      );
+    if (row === 'changed node') writeFileSync(join(root, 'bin/node'), 'changed node');
+    if (row === 'changed helper') writeFileSync(helper, 'changed helper');
+    if (row === 'changed source') writeFileSync(source, 'changed source');
+    if (row === 'writable manifest') chmodSync(manifestPath, 0o666);
+    if (row === 'shared helper') linkSync(helper, join(root, 'shared-helper'));
+    if (row === 'linked helper' || row === 'special helper') {
+      unlinkSync(helper);
+      if (row === 'linked helper') symlinkSync(source, helper);
+      else execFileSync('mkfifo', [helper]);
+    }
+    if (row === 'missing manifest' || row === 'missing capability')
+      assert.equal(resolvePackagedLocalInput(root), undefined, row);
+    else if (
+      row === 'caller path' ||
+      row === 'writable manifest' ||
+      (!['fixed capability', 'directory URL root'].includes(row) &&
+        process.platform === 'darwin' &&
+        process.arch === 'arm64')
+    )
+      assert.throws(() => resolvePackagedLocalInput(root), Error, row);
+    else
+      assert.deepEqual(
+        resolvePackagedLocalInput(row === 'directory URL root' ? `${root}/` : root),
+        process.platform === 'darwin' && process.arch === 'arm64'
+          ? {
+              root,
+              sha256: localInput.sha256,
+              sourceHash: localInput.sourceHash,
+              target: localInput.target,
+            }
+          : undefined,
+        row,
+      );
+  }
   const helperArtifact = Buffer.alloc(56);
   for (const [offset, value] of [
     [0, 0xfeedfacf],

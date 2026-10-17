@@ -1,6 +1,17 @@
+import { createHash } from 'node:crypto';
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { RuntimeManifestSchema } from '@crewkite/contracts';
 import { Controller, type ControllerOptions } from './commands/controller.ts';
 import { configuredIdentity } from './host/publication.ts';
 import { resolveAnthropicNativeProfile } from './providers/anthropic/profile.ts';
@@ -8,8 +19,76 @@ import { resolveGoogleNativeProfile } from './providers/google/profile.ts';
 import { resolveNativeProfile, resolveRepositoryProfile } from './providers/openai/profile.ts';
 import { serve } from './server/index.ts';
 
+function runtimeBytes(path: string, maximum: number) {
+  if (realpathSync(path) !== path) throw Error('The packaged runtime path changed.');
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const before = fstatSync(fd, { bigint: true });
+    if (
+      !before.isFile() ||
+      before.nlink !== 1n ||
+      before.size > BigInt(maximum) ||
+      before.mode & 0o022n
+    )
+      throw Error('The packaged runtime file is unavailable.');
+    const bytes = Buffer.alloc(Number(before.size) + 1);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = readSync(fd, bytes, offset, bytes.length - offset, null);
+      if (count === 0) break;
+      offset += count;
+    }
+    const after = fstatSync(fd, { bigint: true });
+    const current = lstatSync(path, { bigint: true });
+    if (
+      BigInt(offset) !== before.size ||
+      !current.isFile() ||
+      (['dev', 'ino', 'size', 'mode', 'uid', 'gid', 'nlink', 'mtimeNs', 'ctimeNs'] as const).some(
+        (key) => before[key] !== after[key] || after[key] !== current[key],
+      )
+    )
+      throw Error('The packaged runtime file changed while reading.');
+    return bytes.subarray(0, offset);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** The helper, source and manifest must belong to the same fixed runtime. */
+export function resolvePackagedLocalInput(root: string) {
+  const runtimeRoot = realpathSync(root);
+  const manifestPath = join(runtimeRoot, 'manifest.json');
+  if (!lstatSync(manifestPath, { throwIfNoEntry: false })) return undefined;
+  const manifest = RuntimeManifestSchema.parse(
+    JSON.parse(runtimeBytes(manifestPath, 4096).toString('utf8')),
+  );
+  if (!manifest.localInput) return undefined;
+  if (
+    manifest.node.platform !== 'darwin' ||
+    manifest.node.arch !== 'arm64' ||
+    process.platform !== 'darwin' ||
+    process.arch !== 'arm64'
+  )
+    return undefined;
+  const hash = (path: string, maximum: number) =>
+    createHash('sha256').update(runtimeBytes(path, maximum)).digest('hex');
+  if (
+    hash(join(runtimeRoot, 'bin/node'), 256 * 1024 * 1024) !== manifest.node.sha256 ||
+    hash(join(runtimeRoot, 'bin/local-secure-input'), 1024 * 1024) !== manifest.localInput.sha256 ||
+    hash(join(runtimeRoot, 'apps/controller/src/providers/local/secure-input.m'), 1024 * 1024) !==
+      manifest.localInput.sourceHash
+  )
+    throw Error('The packaged Local input identity changed.');
+  return {
+    root: runtimeRoot,
+    sha256: manifest.localInput.sha256,
+    sourceHash: manifest.localInput.sourceHash,
+    target: manifest.localInput.target,
+  };
+}
+
 export async function startController(options: ControllerOptions) {
-  const controller = new Controller({
+  const configuration = {
     registerGoogleAcp: !options.nativeProfile && !options.nativeProfiles,
     nativeProfiles: options.nativeProfile
       ? undefined
@@ -19,8 +98,12 @@ export async function startController(options: ControllerOptions) {
           resolveGoogleNativeProfile(),
           resolveRepositoryProfile(),
         ],
+    localInputHelper: resolvePackagedLocalInput(
+      fileURLToPath(new URL('../../../', import.meta.url)),
+    ),
     ...options,
-  });
+  };
+  const controller = new Controller(configuration);
   try {
     const server = await serve(controller);
     let closing: Promise<void> | undefined;
