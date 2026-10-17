@@ -22,6 +22,7 @@ import {
   ArrowUpRight,
   Check,
   CheckCircle,
+  ChevronLeft,
   ChevronRight,
   Circle,
   Clock,
@@ -34,6 +35,8 @@ import {
   Info,
   ListChecks,
   Moon,
+  PanelLeftClose,
+  PanelLeftOpen,
   PanelRight,
   Pin,
   Plus,
@@ -53,6 +56,8 @@ import {
   type RefObject,
   useCallback,
   useEffect,
+  useId,
+  useLayoutEffect,
   useRef,
   useState,
 } from 'react';
@@ -242,6 +247,340 @@ function readConversationDrafts(): {
   }
 }
 
+// Local preferences only. Storage can be full or blocked, and the app keeps working with defaults.
+function readPreference(key: string) {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+function writePreference(key: string, value: string) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {}
+}
+
+type PaletteCommand = {
+  id: string;
+  label: string;
+  icon: ReactNode;
+  run: () => void;
+  disabled?: boolean;
+  // Commands with consequences are never highlighted for you, so Enter after typing cannot run them.
+  explicit?: boolean;
+};
+type TextMatch = { index: number; length: number };
+const paletteTaskPageSize = 5;
+
+function findMatch(pattern: RegExp | null, text: string): TextMatch | null {
+  const found = pattern?.exec(text);
+  return found ? { index: found.index, length: found[0].length } : null;
+}
+function Highlight({ text, match }: { text: string; match: TextMatch | null }) {
+  if (!match) return text;
+  return (
+    <>
+      {text.slice(0, match.index)}
+      <mark>{text.slice(match.index, match.index + match.length)}</mark>
+      {text.slice(match.index + match.length)}
+    </>
+  );
+}
+// Outcomes and criteria can run long. Show the words around the match and keep surrogate pairs whole.
+function excerpt(text: string, match: TextMatch, radius = 48) {
+  let start = Math.max(0, match.index - radius);
+  let end = Math.min(text.length, match.index + match.length + radius);
+  if (start > 0 && /[\udc00-\udfff]/.test(text[start] ?? '')) start -= 1;
+  if (/[\ud800-\udbff]/.test(text[end - 1] ?? '')) end += 1;
+  const lead = start > 0 ? '…' : '';
+  return {
+    text: `${lead}${text.slice(start, end)}${end < text.length ? '…' : ''}`,
+    match: { index: match.index - start + lead.length, length: match.length },
+  };
+}
+
+function CommandPalette({
+  commands,
+  tasks,
+  projects,
+  onOpenTask,
+  onClose,
+}: {
+  commands: PaletteCommand[];
+  tasks: Task[];
+  projects: { id: string; name: string }[];
+  onOpenTask: (id: string) => void;
+  onClose: () => void;
+}) {
+  const [query, setQuery] = useState('');
+  const [page, setPage] = useState(0);
+  const [active, setActive] = useState<string | null>(null);
+  const id = useId();
+  const trimmed = query.trim();
+  const pattern = trimmed
+    ? new RegExp(trimmed.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&'), 'iu')
+    : null;
+  const projectNames = new Map(projects.map((project) => [project.id, project.name]));
+  const commandResults = commands.flatMap((command) => {
+    const match = findMatch(pattern, command.label);
+    return !pattern || match ? [{ command, match }] : [];
+  });
+  // Search the whole snapshot first, then page. Title and project matches lead.
+  const taskResults = tasks
+    .flatMap((task) => {
+      if (!pattern) return [{ task, rank: 0, field: null }];
+      const project = projectNames.get(task.projectId) ?? '';
+      const fields: [number, string | null, string][] = [
+        [0, null, task.title],
+        [1, null, project],
+        [2, 'Outcome', task.outcome],
+        ...task.criteria.map((criterion): [number, string, string] => [2, 'Criterion', criterion]),
+        [3, 'Task ID', task.id],
+        [3, 'Project ID', task.projectId],
+      ];
+      for (const [rank, label, text] of fields) {
+        const match = findMatch(pattern, text);
+        if (match)
+          return [{ task, rank, field: label ? { label, ...excerpt(text, match) } : null }];
+      }
+      return [];
+    })
+    .sort((left, right) => left.rank - right.rank);
+  const pages = Math.max(1, Math.ceil(taskResults.length / paletteTaskPageSize));
+  const currentPage = Math.min(page, pages - 1);
+  const offset = currentPage * paletteTaskPageSize;
+  const shownTasks = taskResults.slice(offset, offset + paletteTaskPageSize);
+  const options = [
+    ...commandResults.map(({ command }) => ({
+      key: `command-${command.id}`,
+      disabled: Boolean(command.disabled),
+      explicit: Boolean(command.explicit),
+      run: () => {
+        onClose();
+        command.run();
+      },
+    })),
+    ...shownTasks.map(({ task }) => ({
+      key: `task-${task.id}`,
+      disabled: false,
+      explicit: false,
+      run: () => onOpenTask(task.id),
+    })),
+  ];
+  const enabled = options.filter((option) => !option.disabled);
+  const current =
+    enabled.find((option) => option.key === active) ??
+    enabled.find((option) => !option.explicit) ??
+    null;
+  const optionId = (key: string) => `${id}-${key}`;
+  const activeId = current ? optionId(current.key) : undefined;
+  useEffect(() => {
+    if (activeId) document.getElementById(activeId)?.scrollIntoView({ block: 'nearest' });
+  }, [activeId]);
+  // A new page starts on its first task, so Enter never falls back to a command off screen.
+  function turnPage(next: number) {
+    const target = Math.max(0, Math.min(pages - 1, next));
+    if (target === currentPage) return;
+    const first = taskResults[target * paletteTaskPageSize];
+    setPage(target);
+    setActive(first ? `task-${first.task.id}` : null);
+  }
+  const summary = !pattern
+    ? taskResults.length
+      ? `Tasks ${offset + 1}-${offset + shownTasks.length} of ${taskResults.length}`
+      : 'No tasks yet'
+    : options.length
+      ? `${taskResults.length} ${taskResults.length === 1 ? 'task' : 'tasks'} and ${commandResults.length} ${commandResults.length === 1 ? 'command' : 'commands'} match${taskResults.length > paletteTaskPageSize ? `. Showing ${offset + 1}-${offset + shownTasks.length}` : ''}`
+      : 'No matches';
+  function activate(key: string) {
+    const option = options.find((value) => value.key === key);
+    if (option && !option.disabled) option.run();
+  }
+  // Focus stays in the search field. Options are reached with the arrow keys or the pointer.
+  const optionProps = (key: string, disabled: boolean) => ({
+    type: 'button' as const,
+    tabIndex: -1,
+    id: optionId(key),
+    role: 'option',
+    'aria-selected': current?.key === key,
+    'aria-disabled': disabled || undefined,
+    className: `palette-option${current?.key === key ? ' is-active' : ''}`,
+    onMouseMove: () => {
+      if (!disabled && active !== key) setActive(key);
+    },
+    onClick: () => activate(key),
+  });
+  return (
+    <div className="palette">
+      <div className="palette-search">
+        <Search size={16} aria-hidden="true" />
+        <input
+          ref={(node) => node?.setAttribute('autofocus', '')}
+          type="text"
+          role="combobox"
+          aria-label="Search tasks and commands"
+          aria-expanded="true"
+          aria-controls={`${id}-results`}
+          aria-autocomplete="list"
+          aria-activedescendant={activeId}
+          aria-describedby={`${id}-scope`}
+          placeholder="Title, outcome, criteria, ID or project"
+          autoComplete="off"
+          spellCheck={false}
+          value={query}
+          onChange={(event) => {
+            setQuery(event.target.value);
+            setPage(0);
+            setActive(null);
+          }}
+          onKeyDown={(event) => {
+            if (event.nativeEvent.isComposing) return;
+            if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+              event.preventDefault();
+              if (!enabled.length) return;
+              const index = current ? enabled.indexOf(current) : -1;
+              const next =
+                event.key === 'ArrowDown'
+                  ? (index + 1) % enabled.length
+                  : index <= 0
+                    ? enabled.length - 1
+                    : index - 1;
+              setActive(enabled[next].key);
+            } else if (event.key === 'PageDown' || event.key === 'PageUp') {
+              event.preventDefault();
+              turnPage(currentPage + (event.key === 'PageDown' ? 1 : -1));
+            } else if (event.key === 'Enter') {
+              event.preventDefault();
+              if (event.repeat || !current) return;
+              // A held Enter keeps repeating after the palette closes and focus returns to the
+              // opener, which can be an Approve or Send button. Drop repeats until the key is up.
+              const drop = (repeat: KeyboardEvent) => {
+                if (repeat.key !== 'Enter' || !repeat.repeat) return;
+                repeat.preventDefault();
+                repeat.stopImmediatePropagation();
+              };
+              // Only Enter's own keyup ends the hold. Other keys can come up first while typing.
+              const release = (up: KeyboardEvent) => {
+                if (up.key !== 'Enter') return;
+                window.removeEventListener('keydown', drop, true);
+                window.removeEventListener('keyup', release, true);
+              };
+              window.addEventListener('keydown', drop, true);
+              window.addEventListener('keyup', release, true);
+              activate(current.key);
+            }
+          }}
+        />
+      </div>
+      <p className="palette-scope" id={`${id}-scope`}>
+        Tasks and commands. Searches task titles, outcomes, criteria, IDs and projects. Conversation
+        messages are not searched.
+      </p>
+      <div
+        className="palette-results"
+        id={`${id}-results`}
+        role="listbox"
+        aria-label="Tasks and commands"
+        // Keeps the scroller out of the tab order and focus in the field on any click inside.
+        tabIndex={-1}
+        onMouseDown={(event) => event.preventDefault()}
+      >
+        {commandResults.length > 0 && (
+          <fieldset className="palette-group">
+            <legend className="palette-group-label">Commands</legend>
+            {commandResults.map(({ command, match }) => {
+              const key = `command-${command.id}`;
+              return (
+                <button key={key} {...optionProps(key, Boolean(command.disabled))}>
+                  <span className="palette-option-icon" aria-hidden="true">
+                    {command.icon}
+                  </span>
+                  <span className="palette-option-text">
+                    <span className="palette-option-title">
+                      <Highlight text={command.label} match={match} />
+                    </span>
+                  </span>
+                  <ArrowRight size={14} aria-hidden="true" />
+                </button>
+              );
+            })}
+          </fieldset>
+        )}
+        {shownTasks.length > 0 && (
+          <fieldset className="palette-group">
+            <legend className="palette-group-label">Tasks</legend>
+            {shownTasks.map(({ task, rank, field }) => {
+              const key = `task-${task.id}`;
+              const project = projectNames.get(task.projectId) ?? task.projectId;
+              return (
+                <button key={key} {...optionProps(key, false)}>
+                  <span className={`status-dot state-${task.state}`} aria-hidden="true" />
+                  <span className="palette-option-text">
+                    <span className="palette-option-title">
+                      <Highlight
+                        text={task.title}
+                        match={rank === 0 ? findMatch(pattern, task.title) : null}
+                      />
+                    </span>
+                    <span className="palette-option-meta">
+                      <Highlight
+                        text={project}
+                        match={rank === 1 ? findMatch(pattern, project) : null}
+                      />
+                      {` · ${titleCase(task.state)} · ${task.id.slice(-6)}`}
+                    </span>
+                    {field && (
+                      <span className="palette-option-match">
+                        {field.label}: <Highlight text={field.text} match={field.match} />
+                      </span>
+                    )}
+                  </span>
+                  <ArrowRight size={14} aria-hidden="true" />
+                </button>
+              );
+            })}
+          </fieldset>
+        )}
+      </div>
+      {!options.length && (
+        <div className="palette-empty">
+          <strong>No tasks or commands match “{trimmed}”.</strong>
+          <span>Check the spelling, or search by task ID or project name.</span>
+        </div>
+      )}
+      <div className="palette-footer">
+        <p role="status">{summary}</p>
+        {taskResults.length > paletteTaskPageSize && (
+          <div className="palette-pages">
+            <button
+              type="button"
+              className="icon-button"
+              aria-label="Previous tasks"
+              disabled={currentPage === 0}
+              onClick={() => turnPage(currentPage - 1)}
+            >
+              <ChevronLeft size={15} aria-hidden="true" />
+            </button>
+            <span aria-hidden="true">
+              {currentPage + 1}/{pages}
+            </span>
+            <button
+              type="button"
+              className="icon-button"
+              aria-label="Next tasks"
+              disabled={currentPage >= pages - 1}
+              onClick={() => turnPage(currentPage + 1)}
+            >
+              <ChevronRight size={15} aria-hidden="true" />
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function App() {
   const workspace = useWorkspace();
   const { snapshot, connection, preview, error: workspaceError } = workspace;
@@ -249,7 +588,10 @@ export function App() {
   const [selected, setSelected] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>('Conversation');
   const [roster, setRoster] = useState(true);
-  const [theme, setTheme] = useState(() => localStorage.getItem('crewkite-theme') ?? 'dark');
+  const [theme, setTheme] = useState(() => readPreference('crewkite-theme') ?? 'dark');
+  const [collapsed, setCollapsed] = useState(
+    () => readPreference('crewkite-sidebar-collapsed-v1') === '1',
+  );
   const [create, setCreate] = useState(false);
   const [newGoal, setNewGoal] = useState(false);
   const [savedDrafts] = useState(readConversationDrafts);
@@ -274,7 +616,8 @@ export function App() {
   const [executionPolicySeed, setExecutionPolicySeed] = useState<ExecutionPolicySeed | null>(null);
   const [nativeHandoff, setNativeHandoff] = useState(false);
   const [palette, setPalette] = useState(false);
-  const [palettePage, setPalettePage] = useState(0);
+  const paletteOpener = useRef<HTMLElement | null>(null);
+  const searchButton = useRef<HTMLButtonElement>(null);
   const [approvalToReview, setApprovalToReview] = useState<string | null>(null);
   const approvalCard = useRef<HTMLElement>(null);
   const [about, setAbout] = useState(false);
@@ -370,9 +713,20 @@ export function App() {
     (value) => value.taskId === task?.id && value.status === 'pending',
   );
   const taskEvents = workspace.events.filter((event) => event.taskId === task?.id);
-  const taskCount = snapshot?.tasks.length ?? 0;
-  const taskPage = Math.min(palettePage, Math.max(0, Math.ceil(taskCount / 5) - 1));
-  const taskOffset = taskPage * 5;
+  // Runs before the dialog opens and after it is removed, so focus goes back where it came from.
+  // The approval effect below runs later and wins when the palette opened an approval.
+  useLayoutEffect(() => {
+    if (palette) {
+      paletteOpener.current =
+        document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      return;
+    }
+    const opener = paletteOpener.current;
+    paletteOpener.current = null;
+    if (!opener) return;
+    opener.focus();
+    if (document.activeElement !== opener) searchButton.current?.focus();
+  }, [palette]);
   useEffect(() => {
     if (palette || !approvalToReview) return;
     if (page === 'tasks' && tab === 'Activity' && approval?.approvalId === approvalToReview)
@@ -381,13 +735,20 @@ export function App() {
   }, [palette, page, tab, approval?.approvalId, approvalToReview]);
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
-    localStorage.setItem('crewkite-theme', theme);
+    writePreference('crewkite-theme', theme);
   }, [theme]);
+  useEffect(() => {
+    writePreference('crewkite-sidebar-collapsed-v1', collapsed ? '1' : '0');
+  }, [collapsed]);
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
         event.preventDefault();
-        setPalette((open) => !open);
+        // Palette commands change the selected task. Keep them out of other open dialogs.
+        const other = [...document.querySelectorAll('dialog[open]')].some(
+          (dialog) => !dialog.querySelector('.palette'),
+        );
+        if (!other) setPalette((open) => !open);
       }
     };
     window.addEventListener('keydown', keydown);
@@ -430,120 +791,184 @@ export function App() {
             : !['draft', 'ready', 'accepted', 'failed'].includes(task.state))));
   return (
     <div className="app-shell">
-      <aside className="navigation" aria-label="Workspace navigation">
-        <button
-          type="button"
-          className="brand"
-          onClick={() => setAbout(true)}
-          aria-label="About CrewKite"
-        >
-          <img
-            className="brand-wordmark"
-            src={theme === 'light' ? wordmark : inverseWordmark}
-            alt="CrewKite"
-            width={1024}
-            height={341}
-          />
-          {preview && <span className="prototype-tag">D0</span>}
-        </button>
-        <button type="button" className="search-button" onClick={() => setPalette(true)}>
-          <Search size={14} />
-          <span>Find or run a command</span>
-          <kbd>⌘ K</kbd>
-        </button>
-        <div className="nav-label">
-          WORKSPACE
+      <aside
+        id="workspace-navigation"
+        className={collapsed ? 'navigation is-collapsed' : 'navigation'}
+        aria-label="Workspace navigation"
+      >
+        <div className="nav-head">
           <button
             type="button"
-            className="icon-button"
+            className="brand"
+            onClick={() => setAbout(true)}
+            aria-label="About CrewKite"
+            data-tooltip="About CrewKite"
+          >
+            <img
+              className="brand-wordmark"
+              src={theme === 'light' ? wordmark : inverseWordmark}
+              alt="CrewKite"
+              width={1024}
+              height={341}
+            />
+            {preview && <span className="prototype-tag">D0</span>}
+          </button>
+          <button
+            type="button"
+            className="icon-button nav-toggle"
+            onClick={() => setCollapsed(!collapsed)}
+            aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            aria-expanded={!collapsed}
+            aria-controls="workspace-navigation"
+            data-tooltip="Expand sidebar"
+          >
+            {collapsed ? (
+              <PanelLeftOpen size={16} aria-hidden="true" />
+            ) : (
+              <PanelLeftClose size={16} aria-hidden="true" />
+            )}
+          </button>
+        </div>
+        <button
+          ref={searchButton}
+          type="button"
+          className="search-button"
+          onClick={() => setPalette(true)}
+          aria-label="Search tasks and commands"
+          aria-keyshortcuts="Meta+K Control+K"
+          data-tooltip="Search"
+        >
+          <Search size={14} aria-hidden="true" />
+          <span className="nav-text">Search</span>
+          <kbd>⌘ K</kbd>
+        </button>
+        {collapsed && (
+          <button
+            type="button"
+            className="nav-item"
             onClick={() => {
               setNewGoal(true);
               setPage('tasks');
             }}
-            aria-label="New task"
+            disabled={!snapshot}
+            data-tooltip="New task"
           >
-            <Plus size={15} />
+            <Plus size={16} aria-hidden="true" />
+            <span className="nav-text">New task</span>
           </button>
-        </div>
-        {snapshot?.projects.map((project) => (
-          <div key={project.id} className="project-group">
-            <div className="project-name">
-              <ChevronRight size={12} className="expanded" />
-              <Folder size={15} />
-              <span>{project.name}</span>
-              <span className="count">
-                {snapshot.tasks.filter((value) => value.projectId === project.id).length}
-              </span>
-            </div>
-            {snapshot.tasks
-              .filter((value) => value.projectId === project.id)
-              .map((value) => (
-                <button
-                  type="button"
-                  key={value.id}
-                  className={`task-link ${page === 'tasks' && task?.id === value.id ? 'active' : ''}`}
-                  onClick={() => {
-                    setNewGoal(false);
-                    setSelected(value.id);
-                    setTab('Conversation');
-                    setPage('tasks');
-                  }}
-                >
-                  <span className={`status-dot state-${value.state}`} />
-                  <span>{value.title}</span>
-                  {value.state === 'waiting' && <span className="notification-dot" />}
-                </button>
-              ))}
-            {!snapshot.tasks.some((value) => value.projectId === project.id) && (
-              <p className="nav-empty">No tasks yet</p>
-            )}
+        )}
+        {/* The list stays mounted while the rail shows, so it keeps its scroll position. */}
+        <div className="nav-scroll" hidden={collapsed}>
+          <div className="nav-label">
+            WORKSPACE
+            <button
+              type="button"
+              className="icon-button"
+              onClick={() => {
+                setNewGoal(true);
+                setPage('tasks');
+              }}
+              aria-label="New task"
+            >
+              <Plus size={15} />
+            </button>
           </div>
-        ))}
-        {workspace.canPickProject && (
+          {snapshot?.projects.map((project) => (
+            <div key={project.id} className="project-group">
+              <div className="project-name">
+                <ChevronRight size={12} className="expanded" />
+                <Folder size={15} />
+                <span>{project.name}</span>
+                <span className="count">
+                  {snapshot.tasks.filter((value) => value.projectId === project.id).length}
+                </span>
+              </div>
+              {snapshot.tasks
+                .filter((value) => value.projectId === project.id)
+                .map((value) => (
+                  <button
+                    type="button"
+                    key={value.id}
+                    className={`task-link ${page === 'tasks' && task?.id === value.id ? 'active' : ''}`}
+                    aria-current={page === 'tasks' && task?.id === value.id ? 'page' : undefined}
+                    onClick={() => {
+                      setNewGoal(false);
+                      setSelected(value.id);
+                      setTab('Conversation');
+                      setPage('tasks');
+                    }}
+                  >
+                    <span className={`status-dot state-${value.state}`} />
+                    <span>{value.title}</span>
+                    {value.state === 'waiting' && <span className="notification-dot" />}
+                  </button>
+                ))}
+              {!snapshot.tasks.some((value) => value.projectId === project.id) && (
+                <p className="nav-empty">No tasks yet</p>
+              )}
+            </div>
+          ))}
+          {workspace.canPickProject && (
+            <button
+              type="button"
+              className="add-task"
+              disabled={workspace.pending || connection !== 'connected'}
+              onClick={() => void workspace.pickProject().catch(() => {})}
+            >
+              <Folder size={14} />
+              Add project
+            </button>
+          )}
           <button
             type="button"
             className="add-task"
-            disabled={workspace.pending || connection !== 'connected'}
-            onClick={() => void workspace.pickProject().catch(() => {})}
+            onClick={() => {
+              setNewGoal(true);
+              setPage('tasks');
+            }}
+            disabled={!snapshot}
           >
-            <Folder size={14} />
-            Add project
+            <Plus size={14} />
+            New task
           </button>
-        )}
-        <button
-          type="button"
-          className="add-task"
-          onClick={() => {
-            setNewGoal(true);
-            setPage('tasks');
-          }}
-          disabled={!snapshot}
-        >
-          <Plus size={14} />
-          New task
-        </button>
+        </div>
         <div className="nav-bottom">
           <button
             type="button"
             className={`nav-item ${page === 'usage' ? 'active' : ''}`}
+            aria-current={page === 'usage' ? 'page' : undefined}
             onClick={() => setPage('usage')}
+            data-tooltip="Usage and capacity"
           >
-            <Gauge size={16} />
-            Usage and capacity
-            <ChevronRight size={13} />
+            <Gauge size={16} aria-hidden="true" />
+            <span className="nav-text">Usage and capacity</span>
+            <ChevronRight size={13} aria-hidden="true" />
           </button>
-          <button type="button" className="nav-item" onClick={() => setAbout(true)}>
-            <Info size={16} />
-            About and acknowledgments
-          </button>
+          {!collapsed && (
+            <button type="button" className="nav-item" onClick={() => setAbout(true)}>
+              <Info size={16} />
+              About and acknowledgments
+            </button>
+          )}
           <div className="connection-line">
-            <span className={`connection-dot ${connection}`} />
-            <span>
-              {preview
-                ? 'Preview data'
-                : connection === 'connected'
-                  ? 'Controller connected'
-                  : titleCase(connection)}
+            <span
+              className="connection-status"
+              data-tooltip={
+                preview
+                  ? 'Preview data'
+                  : connection === 'connected'
+                    ? 'Controller connected'
+                    : titleCase(connection)
+              }
+            >
+              <span className={`connection-dot ${connection}`} />
+              <span className="nav-text">
+                {preview
+                  ? 'Preview data'
+                  : connection === 'connected'
+                    ? 'Controller connected'
+                    : titleCase(connection)}
+              </span>
             </span>
             {!preview && connection !== 'connected' && (
               <button
@@ -552,6 +977,7 @@ export function App() {
                 onClick={() => void workspace.reconnect()}
                 disabled={workspace.pending || connection === 'connecting'}
                 aria-label="Reconnect controller"
+                data-tooltip="Reconnect controller"
               >
                 <RefreshCw size={15} />
               </button>
@@ -561,6 +987,7 @@ export function App() {
               className="icon-button"
               onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
               aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
+              data-tooltip={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
             >
               {theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
             </button>
@@ -1033,35 +1460,39 @@ export function App() {
       )}
       {about && <About preview={preview} onClose={() => setAbout(false)} />}
       {palette && (
-        <Dialog title="Run a command" onClose={() => setPalette(false)}>
-          <div className="command-list">
-            {[
+        <Dialog title="Search tasks and commands" onClose={() => setPalette(false)}>
+          <CommandPalette
+            commands={[
               {
+                id: 'new-task',
                 label: 'New task',
                 icon: <Plus size={17} />,
-                action: () => {
+                run: () => {
                   setNewGoal(true);
                   setPage('tasks');
                 },
               },
               {
+                id: 'usage',
                 label: 'Open usage and capacity',
                 icon: <Gauge size={17} />,
-                action: () => setPage('usage'),
+                run: () => setPage('usage'),
               },
               {
+                id: 'activity',
                 label: 'Show task activity',
                 icon: <Activity size={17} />,
-                action: () => {
+                run: () => {
                   setPage('tasks');
                   setTab('Activity');
                 },
               },
               {
+                id: 'approval',
                 label: 'Review pending approval',
                 icon: <ShieldCheck size={17} />,
                 disabled: !approval,
-                action: () => {
+                run: () => {
                   if (!approval) return;
                   setPage('tasks');
                   setTab('Activity');
@@ -1069,76 +1500,31 @@ export function App() {
                 },
               },
               {
+                id: 'stop',
                 label: 'Stop current run',
                 icon: <Square size={15} />,
-                action: stop,
+                run: stop,
                 disabled: !stopAllowed,
+                explicit: true,
               },
               {
+                id: 'about',
                 label: 'About and acknowledgments',
                 icon: <Info size={17} />,
-                action: () => setAbout(true),
+                run: () => setAbout(true),
               },
-            ].map(({ label, icon, action, disabled }) => (
-              <button
-                type="button"
-                key={label}
-                disabled={disabled}
-                onClick={() => {
-                  setPalette(false);
-                  action();
-                }}
-              >
-                {icon}
-                {label}
-                <ArrowRight size={14} />
-              </button>
-            ))}
-            {taskCount > 0 && (
-              <>
-                <p className="muted small">
-                  Tasks {taskOffset + 1}-{Math.min(taskOffset + 5, taskCount)} of {taskCount}
-                </p>
-                {snapshot?.tasks.slice(taskOffset, taskOffset + 5).map((value) => (
-                  <button
-                    type="button"
-                    key={value.id}
-                    onClick={() => {
-                      setSelected(value.id);
-                      setPage('tasks');
-                      setTab('Activity');
-                      setPalette(false);
-                    }}
-                  >
-                    <FileCode size={17} />
-                    Open task: {value.title} ·{' '}
-                    {snapshot.projects.find(({ id }) => id === value.projectId)?.name ??
-                      value.projectId}{' '}
-                    · {value.id.slice(-6)}
-                    <ArrowRight size={14} />
-                  </button>
-                ))}
-                {taskCount > 5 && (
-                  <div className="button-row">
-                    <button
-                      type="button"
-                      disabled={taskPage === 0}
-                      onClick={() => setPalettePage(taskPage - 1)}
-                    >
-                      Previous tasks
-                    </button>
-                    <button
-                      type="button"
-                      disabled={taskOffset + 5 >= taskCount}
-                      onClick={() => setPalettePage(taskPage + 1)}
-                    >
-                      Next tasks
-                    </button>
-                  </div>
-                )}
-              </>
-            )}
-          </div>
+            ]}
+            tasks={snapshot?.tasks ?? []}
+            projects={snapshot?.projects ?? []}
+            onOpenTask={(id) => {
+              setPalette(false);
+              setNewGoal(false);
+              setSelected(id);
+              setPage('tasks');
+              setTab('Conversation');
+            }}
+            onClose={() => setPalette(false)}
+          />
         </Dialog>
       )}
     </div>
