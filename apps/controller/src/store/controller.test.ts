@@ -23,6 +23,7 @@ import {
   ArtifactSchema,
   type Attempt,
   type Candidate,
+  type CheckEvent,
   type CheckResult,
   canonicalJson,
   GoogleNativeProfileSchema,
@@ -46,13 +47,20 @@ import {
   type NodeCheckDefinition,
 } from '../evidence/index.ts';
 import {
+  journeyTitle,
+  ToolchainDefinitionSchema,
+  toolchainDefinitionHash,
+  verificationStages,
+} from '../evidence/toolchain-definition.ts';
+import { type VerificationExecution, verificationCommand } from '../evidence/toolchain-verify.ts';
+import {
   enrollCheckRoot,
   readCheckRoots,
   spawnCheckChild as spawn,
 } from '../host/check-ownership.ts';
 import { refValue } from '../host/publication.ts';
 import { committedFiles, git, inspectSource, materialize, readFiles } from '../host/source.ts';
-import { groupAbsent } from '../host/worker.ts';
+import { closedWithin, groupAbsent } from '../host/worker.ts';
 import { replacementFixture as anthropicFixture } from '../providers/anthropic/replacement-fixture.ts';
 import { replacementFixture as googleFixture } from '../providers/google/replacement-fixture.ts';
 import {
@@ -803,9 +811,22 @@ test('candidate evidence requires unchanged bytes and completed checks', async (
     }
     await waitFaultClosed();
   }
+  const missingTicket = enrollCheckRoot('fixture', true, owner);
+  const missing = spawn(join(directory, 'missing-executable'), [], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  const missingClosed = new Promise<void>((done) => missing.once('close', () => done()));
+  missingTicket.acknowledge(missing);
+  assert.equal(await closedWithin(missingClosed), true);
+  const missingRecord = readCheckRoots(owner).find((row) => row.spawnFailed);
+  assert(missingRecord);
+  assert.equal(missing.pid, undefined);
+  assert.equal(missingRecord.terminal?.code, -2);
+  assert.equal(missingRecord.acknowledgment, undefined);
   const absent = enrollCheckRoot('fixture', true, owner);
   absent.failed();
-  assert.equal(readCheckRoots(owner).filter((row) => row.spawnFailed).length, 1);
+  assert.equal(readCheckRoots(owner).filter((row) => row.spawnFailed).length, 2);
   enrollCheckRoot('fixture', true, owner);
   assert.equal(
     readCheckRoots(owner).filter((row) => !row.acknowledgment && !row.spawnFailed).length,
@@ -878,9 +899,10 @@ test('candidate evidence requires unchanged bytes and completed checks', async (
   const module = join(scratch, 'net.mjs');
   writeFileSync(module, Buffer.concat([Buffer.from('process.exit(0);\n'), readFileSync(module)]));
   const metadata = new Map<string, Artifact>();
+  const artifactFiles = new ArtifactFiles(join(directory, 'negative-artifacts'));
   const evidence = new CandidateEvidence({
     home: directory,
-    artifacts: new ArtifactFiles(join(directory, 'negative-artifacts')),
+    artifacts: artifactFiles,
     id,
     getArtifact: (artifactId) => {
       const artifact = metadata.get(artifactId);
@@ -1192,6 +1214,315 @@ test('candidate evidence requires unchanged bytes and completed checks', async (
       );
     }
   }
+  const buildEntries = [
+    { path: '.', kind: 'directory' as const, mode: 0o755 },
+    ...['main', 'preload', 'renderer'].flatMap((path, index) => [
+      { path, kind: 'directory' as const, mode: 0o755 },
+      {
+        path: `${path}/${['index.js', 'index.cjs', 'index.html'][index]}`,
+        kind: 'file' as const,
+        mode: 0o644,
+        bytes: 1,
+        hash: createHash('sha256').update('x').digest('hex'),
+      },
+    ]),
+  ];
+  const buildHash = createHash('sha256');
+  for (const row of [{ version: 1, files: 3, bytes: 3 }, ...buildEntries])
+    buildHash.update(`${JSON.stringify(row)}\n`);
+  const build = {
+    version: 1 as const,
+    entries: buildEntries,
+    files: 3,
+    bytes: 3,
+    hash: buildHash.digest('hex'),
+  };
+  const inventoryHash = createHash('sha256');
+  for (const row of [{ version: 1, workspaces: [] }, { tree: build.hash }])
+    inventoryHash.update(`${JSON.stringify(row)}\n`);
+  const inventory = {
+    version: 1,
+    workspaces: [],
+    projectFiles: [],
+    buildDependencies: [],
+    tree: build,
+    hash: inventoryHash.digest('hex'),
+  };
+  const inventoryReference = artifactFiles.publish(Buffer.from(canonicalJson(inventory)));
+  const executable = {
+    path: join(directory, 'former-runtime', 'missing'),
+    version: 'fixture-v1',
+    sha256: fixtureClientHash,
+  };
+  const fields = {
+    recipeId: 'crewkite-verify-v1' as const,
+    candidateId: captured.candidate.id,
+    candidateHash: captured.candidate.hash,
+    evaluator: 'crewkite-verify-v1:fixture',
+    criteria: task.criteria,
+    baseline: definition.collection,
+    baselineHash: hashCanonical(definition.collection),
+    inventory: inventoryReference,
+    toolchainHash: inventory.hash,
+    lockHash: fixtureClientHash,
+    platform: 'darwin' as const,
+    arch: 'arm64' as const,
+    executables: { node: executable, git: executable, electron: executable },
+    mkfifo: { path: executable.path, sha256: executable.sha256 },
+    entrypoints: {
+      biome: 'node_modules/biome',
+      types: 'node_modules/types.ts',
+      build: 'node_modules/build.ts',
+      desktop: 'node_modules/desktop.ts',
+      electron: 'node_modules/electron',
+    },
+    collection: definition.collection.map((file) => ({
+      ...file,
+      tests: definition.required.tests,
+    })),
+    journey: { file: 'e2e/desktop.spec.ts', title: journeyTitle, hash: fixtureClientHash } as const,
+    stages: [...verificationStages] as [...typeof verificationStages],
+    provenancePattern: 'fixture',
+    maximumMinutes: 5 as const,
+  };
+  const verification = ToolchainDefinitionSchema.parse({
+    ...fields,
+    definitionHash: toolchainDefinitionHash(fields),
+  });
+  const frames = (file: string, names: string[]): CheckEvent[] => {
+    const counts = {
+      tests: names.length,
+      passed: names.length,
+      failed: 0,
+      cancelled: 0,
+      skipped: 0,
+      todo: 0,
+      suites: 0,
+    };
+    return [
+      { type: 'start', version: 1 },
+      ...names.map((name) => ({
+        type: 'test' as const,
+        file,
+        name,
+        kind: 'test' as const,
+        passed: true,
+        skipped: false,
+        todo: false,
+      })),
+      { type: 'summary', file, success: true, counts },
+      { type: 'summary', file: null, success: true, counts },
+      { type: 'end' },
+    ];
+  };
+  const encoded = (rows: CheckEvent[]) =>
+    Buffer.from(`${rows.map((row) => JSON.stringify(row)).join('\n')}\n`).toString('base64');
+  const verificationOwner = { ...owner, directory: join(directory, 'verification-owner') };
+  const execution: VerificationExecution = {
+    version: 1,
+    attemptId: owner.attemptId,
+    generation: owner.generation,
+    definitionHash: verification.definitionHash,
+    stages: verificationStages.map((stage) => ({
+      stage,
+      commandHash: hashCanonical(verificationCommand(verification, stage)),
+      code: 0,
+      signal: null,
+      closed: true,
+      stdout:
+        stage === 'node-tests'
+          ? encoded(frames(definition.required.path, definition.required.tests))
+          : stage === 'desktop'
+            ? encoded(frames(verification.journey.file, [journeyTitle]))
+            : '',
+      stderr: '',
+    })),
+    roots: verificationStages.map((stage, index) => ({
+      id: `00000000-0000-0000-0000-${String(index).padStart(12, '0')}.jsonl`,
+      intent: {
+        type: 'intent',
+        owner: { ...verificationOwner, stage },
+        role: 'stage',
+        detached: true,
+      },
+      acknowledgment: {
+        type: 'ack',
+        pid: faultChild.pid as number,
+        group: faultChild.pid as number,
+      },
+      terminal: { type: 'close', code: 0, signal: null },
+      spawnFailed: false,
+    })),
+    quiescent: true,
+    unchanged: true,
+    build,
+    failure: null,
+  };
+  const record = (value: VerificationExecution) => {
+    const result = evidence.recordVerification({
+      candidate: captured.candidate,
+      definition: verification,
+      execution: value,
+      owner: verificationOwner,
+    });
+    for (const artifact of result.artifacts) metadata.set(artifact.id, artifact);
+    return result;
+  };
+  const complete = record(execution);
+  assert.equal(complete.evidence.passed, true);
+  const failedSpawn = structuredClone(execution);
+  failedSpawn.roots.push({
+    ...missingRecord,
+    intent: { ...missingRecord.intent, owner: verificationOwner },
+  });
+  assert.equal(record(failedSpawn).evidence.passed, true);
+  const negativeStage = structuredClone(execution);
+  negativeStage.stages[0].code = -2;
+  assert.throws(() => record(negativeStage));
+  const mutations: { name: string; change: (value: VerificationExecution) => void }[] = [
+    { name: 'missing stage', change: (value) => void value.stages.pop() },
+    {
+      name: 'command binding',
+      change: (value) => {
+        value.stages[0].commandHash = fixtureClientHash;
+      },
+    },
+    {
+      name: 'failed stage',
+      change: (value) => {
+        value.stages[0].code = 1;
+      },
+    },
+    {
+      name: 'unclosed root',
+      change: (value) => {
+        delete value.roots[0].terminal;
+      },
+    },
+    {
+      name: 'unacknowledged root',
+      change: (value) => {
+        delete value.roots[0].acknowledgment;
+      },
+    },
+    {
+      name: 'wrong owner',
+      change: (value) => {
+        value.roots[0].intent.owner.generation += 1;
+      },
+    },
+    {
+      name: 'wrong candidate definition',
+      change: (value) => {
+        value.definitionHash = fixtureClientHash;
+      },
+    },
+    {
+      name: 'truncated Node report',
+      change: (value) => {
+        value.stages[3].stdout = encoded(
+          frames(definition.required.path, definition.required.tests).slice(0, -1),
+        );
+      },
+    },
+    {
+      name: 'wrong collected test',
+      change: (value) => {
+        value.stages[3].stdout = encoded(frames(definition.required.path, ['other']));
+      },
+    },
+    {
+      name: 'changed build inventory',
+      change: (value) => {
+        if (value.build) value.build = { ...value.build, hash: fixtureClientHash };
+      },
+    },
+    {
+      name: 'unfinished cleanup',
+      change: (value) => {
+        value.quiescent = false;
+      },
+    },
+  ];
+  for (const row of mutations) {
+    const changed = structuredClone(execution);
+    row.change(changed);
+    assert.equal(record(changed).evidence.passed, false, row.name);
+  }
+  const reporter = new URL('../evidence/desktop-reporter.ts', import.meta.url).href;
+  for (const scenario of [
+    'passed',
+    'retry',
+    'expected failure',
+    'extra case',
+    'error',
+    'missing exit',
+  ]) {
+    const output = spawnSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        `
+      import Reporter from ${JSON.stringify(reporter)};
+      const scenario = ${JSON.stringify(scenario)};
+      const reporter = new Reporter();
+      const test = { id: 'journey', title: ${JSON.stringify(journeyTitle)},
+        location: { file: ${JSON.stringify(resolve('e2e/desktop.spec.ts'))} },
+        expectedStatus: scenario === 'expected failure' ? 'failed' : 'passed' };
+      reporter.onBegin({}, { allTests: () => scenario === 'extra case' ? [test, test] : [test] });
+      reporter.onTestEnd(test, { status: 'passed', retry: scenario === 'retry' ? 1 : 0, errors: [] });
+      if (scenario === 'error') reporter.onError();
+      reporter.onEnd({ status: 'passed' });
+      if (scenario !== 'missing exit') await reporter.onExit();
+    `,
+      ],
+      {
+        env: {
+          LANG: 'C',
+          CREWKITE_CHECK_JOURNEY: JSON.stringify({
+            file: verification.journey.file,
+            title: verification.journey.title,
+          }),
+        },
+        timeout: 5000,
+        maxBuffer: 65536,
+      },
+    );
+    assert.equal(output.error, undefined, scenario);
+    assert.equal(output.status, 0, scenario);
+    const changed = structuredClone(execution);
+    changed.stages[5].stdout = output.stdout.toString('base64');
+    assert.equal(record(changed).evidence.passed, scenario === 'passed', scenario);
+  }
+  const savedArtifact = metadata.get(complete.evidence.artifactId);
+  assert(savedArtifact);
+  const savedMetadata = JSON.parse(artifactFiles.read(savedArtifact.hash).toString('utf8'));
+  const historicalInput = {
+    candidate: captured.candidate,
+    definition: verification,
+    metadata: savedMetadata,
+    owner: verificationOwner,
+  };
+  const kill = t.mock.method(process, 'kill', () => {
+    throw Error('Historical evidence probed a PID.');
+  });
+  try {
+    assert.equal(evidence.verificationMatches(historicalInput), true);
+    assert.equal(kill.mock.callCount(), 0);
+  } finally {
+    kill.mock.restore();
+  }
+  assert.equal(
+    evidence.verificationMatches({
+      ...historicalInput,
+      owner: { ...verificationOwner, generation: 1 },
+    }),
+    false,
+  );
+  const proofReference = savedMetadata.verification.artifact;
+  metadata.set(proofReference.id, { ...proofReference, hash: fixtureClientHash });
+  assert.equal(evidence.verificationMatches(historicalInput), false);
 });
 
 function binding(approval: Approval) {
