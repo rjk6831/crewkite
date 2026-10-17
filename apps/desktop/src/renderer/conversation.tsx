@@ -15,6 +15,7 @@ import {
   X,
 } from 'lucide-react';
 import { type FormEvent, type ReactNode, useEffect, useId, useRef, useState } from 'react';
+import { ComposerControls, type ComposerControlsProps } from './composer-controls.tsx';
 import './conversation.css';
 
 export type ConversationStage = {
@@ -108,6 +109,10 @@ export type ConversationProps = {
     contextDisabled?: boolean;
     addContextDisabled?: boolean;
     contextMeter?: ReactNode;
+    controls?: Omit<
+      ComposerControlsProps,
+      'contextMeter' | 'contextItems' | 'onRemoveContext' | 'microphone'
+    >;
   };
   onChoice?: (decisionId: string, choiceId: string) => void;
   onAnswer?: (questionId: string, text: string) => void;
@@ -707,7 +712,7 @@ export function Conversation({
             }}
           />
           <div className="conversation-composer-footer">
-            {composer.onAddContext && (
+            {!composer.controls && composer.onAddContext && (
               <button
                 type="button"
                 aria-label="Add context"
@@ -724,14 +729,31 @@ export function Conversation({
             )}
             <span
               id={`${composerId}-hint`}
-              className={composer.attachments?.length ? 'conversation-sr-only' : undefined}
+              className={
+                composer.controls || composer.attachments?.length
+                  ? 'conversation-sr-only'
+                  : undefined
+              }
             >
               {composer.disabledReason ??
                 composer.hint ??
                 'Messages stay within the approved task scope.'}
             </span>
+            {composer.controls && (
+              <div style={{ flex: '1 1 auto', minWidth: 0 }}>
+                <ComposerControls {...composer.controls} contextMeter={composer.contextMeter} />
+              </div>
+            )}
             {Boolean(composer.attachments?.length) && (
-              <span style={{ display: 'flex', gap: 6, overflowX: 'auto', whiteSpace: 'nowrap' }}>
+              <span
+                style={{
+                  display: 'flex',
+                  gap: 6,
+                  overflowX: 'auto',
+                  whiteSpace: 'nowrap',
+                  maxWidth: composer.controls ? '35%' : undefined,
+                }}
+              >
                 {composer.attachments?.map((attachment) => (
                   <span key={attachment.id} style={{ display: 'inline-flex', flexShrink: 0 }}>
                     <button
@@ -768,7 +790,7 @@ export function Conversation({
                 ))}
               </span>
             )}
-            {composer.contextMeter}
+            {!composer.controls && composer.contextMeter}
             <button
               type="submit"
               disabled={disabled || !composer.value.trim()}

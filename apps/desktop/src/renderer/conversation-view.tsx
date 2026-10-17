@@ -26,6 +26,7 @@ import {
   useSyncExternalStore,
 } from 'react';
 import { Dialog, familyName, titleCase } from './components.tsx';
+import type { ComposerControlsProps } from './composer-controls.tsx';
 import { ContextGauge } from './context-gauge.tsx';
 import { Conversation, type ConversationMessage } from './conversation.tsx';
 import { ConversationContextCaptureError, type DesktopCommand, type Workspace } from './source.ts';
@@ -657,6 +658,7 @@ function useContextComposer({
       busyRef.current ||
       workspace.pending ||
       draft.priorSend ||
+      (!retryReceipt && Boolean(draft.captureReceipt)) ||
       (!retryReceipt && workspace.retryAvailable)
     )
       return;
@@ -737,7 +739,10 @@ function useContextComposer({
         if (receipt?.projectId === projectId)
           writeContextDraft(draftKey, (current) => ({ ...current, captureReceipt: receipt }));
       }
-      if (latest.current.draftKey === draftKey) setError(message(failure));
+      if (latest.current.draftKey === draftKey) {
+        setPanel({ kind: 'choose' });
+        setError(message(failure));
+      }
     } finally {
       busyRef.current = false;
       setBusy(false);
@@ -819,6 +824,30 @@ function useContextComposer({
     review,
     openHistory: (ref: ConversationContextRef) => {
       void preview(ref, true);
+    },
+    controls: {
+      contextActions: (
+        [
+          { id: 'source-file', kind: 'file', label: 'Source file' },
+          { id: 'source-folder', kind: 'folder', label: 'Source folder' },
+          { id: 'log-file', kind: 'log', label: 'Project log' },
+        ] as const
+      ).map((action) => ({
+        ...action,
+        disabledReason: controlsBlocked
+          ? (uncertain ?? 'Wait for the current request or reconnect before adding context.')
+          : draft.refs.length >= 4
+            ? 'Remove a context capture before adding another.'
+            : undefined,
+      })),
+      onContextAction: (mode: string) => {
+        if (
+          !controlsBlocked &&
+          draft.refs.length < 4 &&
+          (mode === 'source-file' || mode === 'source-folder' || mode === 'log-file')
+        )
+          void add(mode);
+      },
     },
     composer: {
       attachments: draft.refs.map((ref, index) => ({
@@ -953,6 +982,45 @@ const getPlanningProfile = (snapshot: Snapshot) =>
     (profile): profile is Extract<Snapshot['nativeProfiles'][number], { family: 'openai' }> =>
       profile.family === 'openai' && profile.id === 'openai-file-v1',
   );
+function planningComposerControls(
+  snapshot: Snapshot,
+  role: PlanningFields['role'],
+  config?: TaskConversationState['configuration'],
+): Pick<ComposerControlsProps, 'primary' | 'policy'> {
+  const profile = getPlanningProfile(snapshot);
+  const requestedModel = config
+    ? (config.requestedModel ?? 'unknown')
+    : (profile?.model ?? 'unknown');
+  const requestedEffort = config
+    ? (config.requestedEffort ?? 'unknown')
+    : (profile?.effort ?? 'unknown');
+  return {
+    primary: {
+      roleLabel: roleLabels[role],
+      models: profile
+        ? [
+            {
+              id: profile.model,
+              label: profile.model,
+              route: familyName(profile.family),
+              efforts: [{ id: profile.effort, label: profile.effort }],
+            },
+          ]
+        : [],
+      currentModelId: config?.effectiveModel ?? null,
+      currentEffortId: config?.effectiveEffort ?? null,
+      scopeLabel: 'Planning profile',
+      frozenReason: `Model and effort follow the planning profile. Requested model ${requestedModel}; effective model ${config?.effectiveModel ?? 'unknown'}. Requested effort ${requestedEffort}; effective effort ${config?.effectiveEffort ?? 'unknown'}.`,
+    },
+    policy: {
+      label: 'Planning permissions',
+      options: [{ id: 'read-only', label: 'Read-only conversation' }],
+      currentId: 'read-only',
+      scopeLabel: 'Conversation only',
+      disabledReason: 'Execution permissions are set when preparing a run.',
+    },
+  };
+}
 const initialPlanning = (selection?: ConversationPlanningSelection): PlanningFields => ({
   role: selection?.role ?? 'lead',
   attempts: String(selection?.limits.attempts ?? 4),
@@ -1175,6 +1243,14 @@ export function NewGoal({
             sending: context.sending,
             disabledReason: blocked,
             ...context.composer,
+            controls: {
+              ...context.controls,
+              ...planningComposerControls(snapshot, planning.role),
+              disconnectedReason:
+                workspace.connection !== 'connected'
+                  ? 'Reconnect to use composer actions.'
+                  : undefined,
+            },
             contextMeter: (
               <ContextGauge
                 usedTokens={null}
@@ -1635,6 +1711,16 @@ export function ConversationView({
             sending: context.sending,
             disabledReason: blocked,
             ...context.composer,
+            controls: visible
+              ? {
+                  ...context.controls,
+                  ...planningComposerControls(snapshot, config?.selection.role ?? 'lead', config),
+                  disconnectedReason:
+                    workspace.connection !== 'connected'
+                      ? 'Reconnect to use composer actions.'
+                      : undefined,
+                }
+              : undefined,
             contextMeter: visible ? (
               <ContextGauge
                 usedTokens={null}

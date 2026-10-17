@@ -1209,10 +1209,7 @@ async function conversationBridge(
     ) => {
       await page.getByRole('button', { name: 'Add context', exact: true }).click();
       await nativeChoice([path]);
-      await page
-        .getByRole('dialog', { name: 'Add context', exact: true })
-        .getByRole('button', { name: kind, exact: true })
-        .click();
+      await page.getByRole('menuitem', { name: kind, exact: true }).click();
       await expect(
         page.getByRole('dialog', { name: 'Captured context', exact: true }),
       ).toBeVisible();
@@ -1221,6 +1218,26 @@ async function conversationBridge(
     };
 
     await expect(page.getByRole('heading', { name: 'New goal', exact: true })).toBeVisible();
+    const toolbar = page.getByRole('group', { name: 'Composer controls', exact: true });
+    const modelControl = toolbar.getByRole('button', { name: /^Architect model:/ });
+    await expect(modelControl).toHaveAttribute('aria-disabled', 'true');
+    await expect(modelControl).not.toHaveAttribute('aria-label', /awaiting confirmation/);
+    await modelControl.press('Enter');
+    await expect(page.getByRole('tooltip')).toContainText(
+      'Requested model fixture-model; effective model unknown.',
+    );
+    await page.keyboard.press('Escape');
+    await toolbar
+      .getByRole('button', { name: 'Planning permissions: Read-only conversation', exact: true })
+      .press('Enter');
+    await expect(page.getByRole('tooltip')).toContainText(
+      'Execution permissions are set when preparing a run.',
+    );
+    await page.keyboard.press('Escape');
+    assert.equal(
+      received.some((command) => command.command === 'ConfigureTaskConversation'),
+      false,
+    );
     const contextMeter = page.getByRole('button', { name: /^Context window, usage unknown/ });
     await expect(contextMeter).toHaveAttribute('aria-label', 'Context window, usage unknown');
     await contextMeter.focus();
@@ -1233,11 +1250,8 @@ async function conversationBridge(
     await composer.fill('Export the currently filtered invoices as CSV.');
     await page.getByRole('button', { name: 'Add context', exact: true }).click();
     await nativeChoice([]);
-    await page
-      .getByRole('dialog')
-      .getByRole('button', { name: 'Source file', exact: true })
-      .click();
-    await expect(page.getByRole('dialog', { name: 'Add context', exact: true })).toBeVisible();
+    await page.getByRole('menuitem', { name: 'Source file', exact: true }).click();
+    await expect(page.getByRole('dialog')).toHaveCount(0);
     assert.equal(
       received.filter((command) => command.command === 'CaptureConversationContext').length,
       0,
@@ -1336,10 +1350,7 @@ async function conversationBridge(
     await page.getByRole('button', { name: 'Add context', exact: true }).click();
     await nativeChoice(['/registered/project/README.md']);
     holdContextRead = true;
-    await page
-      .getByRole('dialog')
-      .getByRole('button', { name: 'Source file', exact: true })
-      .click();
+    await page.getByRole('menuitem', { name: 'Source file', exact: true }).click();
     await expect.poll(() => heldContextReads.length).toBe(1);
     await expect(page.locator('.conversation-answer button[type="submit"]')).toBeDisabled();
     holdContextRead = false;
@@ -1380,7 +1391,9 @@ async function conversationBridge(
       )
       .toBeCloseTo(anchor.top, 0);
     await expect(
-      page.getByText('Export the currently filtered invoices as CSV.', { exact: true }).last(),
+      page
+        .getByRole('region', { name: 'Task summary', exact: true })
+        .getByText('Export the currently filtered invoices as CSV.', { exact: true }),
     ).toBeVisible();
     await expect(page.getByRole('button', { name: 'Adopt plan', exact: true })).toBeEnabled();
     assert.equal(
@@ -1432,10 +1445,7 @@ async function conversationBridge(
     uncertainCapture = true;
     await page.getByRole('button', { name: 'Add context', exact: true }).click();
     await nativeChoice(['/registered/project/README.md']);
-    await page
-      .getByRole('dialog')
-      .getByRole('button', { name: 'Source file', exact: true })
-      .click();
+    await page.getByRole('menuitem', { name: 'Source file', exact: true }).click();
     await expect(page.getByRole('dialog').getByRole('alert')).toContainText(
       'capture outcome is uncertain',
     );
@@ -1493,11 +1503,8 @@ async function conversationBridge(
     );
     assert.equal(received.length, beforeWrongRetry);
     await page.reload();
-    await page.getByRole('button', { name: 'Add context', exact: true }).click();
-    await page
-      .getByRole('dialog')
-      .getByRole('button', { name: 'Retry exact context capture', exact: true })
-      .click();
+    await page.getByText('Task details', { exact: true }).click();
+    await page.getByRole('button', { name: 'Retry exact context capture', exact: true }).click();
     await expect(page.getByRole('dialog', { name: 'Captured context', exact: true })).toContainText(
       'Captured source-file text.',
     );
