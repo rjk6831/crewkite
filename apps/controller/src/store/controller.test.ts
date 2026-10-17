@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import {
@@ -8,6 +8,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -44,6 +45,11 @@ import {
   completedCheckDefinitionMatches,
   type NodeCheckDefinition,
 } from '../evidence/index.ts';
+import {
+  enrollCheckRoot,
+  readCheckRoots,
+  spawnCheckChild as spawn,
+} from '../host/check-ownership.ts';
 import { refValue } from '../host/publication.ts';
 import { committedFiles, git, inspectSource, materialize, readFiles } from '../host/source.ts';
 import { groupAbsent } from '../host/worker.ts';
@@ -719,6 +725,93 @@ test('a retained descendant blocks sealing and transfer after its leader exits',
 
 test('candidate evidence requires unchanged bytes and completed checks', async (t) => {
   const { controller, command, draft, fixtures, directory, id, source } = await setup(t);
+  const ownership = join(directory, 'ownership');
+  mkdirSync(ownership);
+  const owner = {
+    version: 1 as const,
+    directory: ownership,
+    stateRoot: directory,
+    electronExecutable: process.execPath,
+    attemptId: id('att'),
+    generation: 0,
+    stage: 'node-tests' as const,
+    parentGroup: 12345,
+  };
+  // Negative fixtures must close, but their nonzero exits are deliberate evidence.
+  for (const code of [0, 3]) {
+    const ticket = enrollCheckRoot('fixture', true, owner);
+    const child = spawn(process.execPath, ['-e', `process.exit(${code})`], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    ticket.acknowledge(child);
+    await new Promise<void>((done, reject) => {
+      child.once('error', reject);
+      child.once('close', () => done());
+    });
+    const record = readCheckRoots(owner).find((row) => row.acknowledgment?.pid === child.pid);
+    assert(record?.terminal);
+    assert.equal(record.terminal.code, code);
+    assert.equal(record.terminal.signal, null);
+    assert.equal(record.acknowledgment?.group, child.pid);
+    assert.equal(groupAbsent(child.pid ?? 0), true);
+  }
+  const attached = enrollCheckRoot('fixture', false, owner);
+  const child = spawn(process.execPath, ['-e', 'process.exit(0)'], { stdio: 'ignore' });
+  attached.acknowledge(child);
+  await new Promise<void>((done) => child.once('close', () => done()));
+  assert.equal(
+    readCheckRoots(owner).find((row) => row.acknowledgment?.pid === child.pid)?.acknowledgment
+      ?.group,
+    owner.parentGroup,
+  );
+  const faultDirectory = join(directory, 'ownership-fault');
+  mkdirSync(faultDirectory);
+  const faultOwner = { ...owner, directory: faultDirectory };
+  const faultTicket = enrollCheckRoot('fixture', true, faultOwner);
+  const faultChild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  const faultClosed = new Promise<void>((done) => faultChild.once('close', () => done()));
+  const journalPath = join(faultDirectory, readdirSync(faultDirectory)[0]);
+  rmSync(journalPath);
+  mkdirSync(journalPath);
+  const waitFaultClosed = () =>
+    new Promise<void>((done, reject) => {
+      const timer = setTimeout(
+        () => reject(Error('Fault fixture closure exceeded its bound.')),
+        2000,
+      );
+      void faultClosed.then(() => {
+        clearTimeout(timer);
+        done();
+      });
+    });
+  try {
+    assert.throws(() => faultTicket.acknowledge(faultChild), { code: 'EISDIR' });
+    await waitFaultClosed();
+    assert.equal(faultChild.exitCode, null);
+    assert.equal(faultChild.signalCode, 'SIGKILL');
+    assert.equal(groupAbsent(faultChild.pid ?? 0), true);
+    assert.throws(() => readCheckRoots(faultOwner), /ownership record/);
+  } finally {
+    if (!groupAbsent(faultChild.pid ?? 0)) {
+      try {
+        process.kill(-(faultChild.pid as number), 'SIGKILL');
+      } catch {}
+    }
+    await waitFaultClosed();
+  }
+  const absent = enrollCheckRoot('fixture', true, owner);
+  absent.failed();
+  assert.equal(readCheckRoots(owner).filter((row) => row.spawnFailed).length, 1);
+  enrollCheckRoot('fixture', true, owner);
+  assert.equal(
+    readCheckRoots(owner).filter((row) => !row.acknowledgment && !row.spawnFailed).length,
+    1,
+  );
+
   const task = TaskSchema.parse((await controller.execute(draft, 'local-owner')).entity);
   const policy = {
     ...fixtures.policy,

@@ -1,4 +1,4 @@
-import { type ChildProcess, execFileSync, spawn } from 'node:child_process';
+import { type ChildProcess, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   closeSync,
@@ -15,6 +15,10 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { ControllerClient, readControllerEndpoint } from '@crewkite/client/node';
 import { RuntimeManifestSchema } from '@crewkite/contracts';
 import { prepareStateDirectory } from '../../../../scripts/demo-state.ts';
+import {
+  checkEnvironment,
+  spawnCheckChild as spawn,
+} from '../../../controller/src/host/check-ownership.ts';
 
 export { prepareStateDirectory } from '../../../../scripts/demo-state.ts';
 
@@ -176,6 +180,7 @@ export class DesktopController {
       const child = spawn(this.paths.node, [this.paths.controller], {
         cwd: this.paths.root,
         env: {
+          ...checkEnvironment(),
           PATH: process.env.PATH,
           HOME: process.env.HOME,
           CODEX_HOME: process.env.CODEX_HOME,

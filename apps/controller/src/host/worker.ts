@@ -1,4 +1,4 @@
-import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
+import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
 import {
   type FakeWorkerEvent,
@@ -7,6 +7,7 @@ import {
   FakeWorkerInputSchema,
   MAX_FRAME_BYTES,
 } from '@crewkite/contracts';
+import { checkEnvironment, spawnCheckChild as spawn } from './check-ownership.ts';
 
 export function groupAbsent(group: number | null): boolean {
   if (group === null || !Number.isSafeInteger(group) || group <= 0) return false;
@@ -52,6 +53,7 @@ export class OwnedWorker {
       detached: true,
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
+        ...checkEnvironment(),
         PATH: process.env.PATH,
         LANG: 'C',
         HOME: options.environmentHome,
@@ -164,7 +166,12 @@ export class OwnedCommand {
       cwd: options.directory,
       detached: true,
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { PATH: process.env.PATH, LANG: 'C', HOME: options.environmentHome },
+      env: {
+        ...checkEnvironment(),
+        PATH: process.env.PATH,
+        LANG: 'C',
+        HOME: options.environmentHome,
+      },
     });
     this.group = this.child.pid ?? 0;
     this.exited = new Promise((resolve) => {

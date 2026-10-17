@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
+import { spawnCheckChild as spawn } from '../../host/check-ownership.ts';
 import { groupAbsent } from '../../host/worker.ts';
 import {
   GoogleWriterError,
