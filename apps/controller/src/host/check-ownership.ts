@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 
 const variable = 'CREWKITE_CHECK_OWNER';
 const witnessVariable = 'CREWKITE_CHECK_WORKER_EXIT';
+const stageVariable = 'CREWKITE_CHECK_STAGE_ROOT';
 const coderEntrypoint = fileURLToPath(
   new URL('../../../../packages/testkit/src/providers/worker.ts', import.meta.url),
 );
@@ -93,11 +94,36 @@ export function checkOwner(): CheckOwner | undefined {
     stateRoot.isSymbolicLink()
   )
     throw Error('Check ownership directories changed.');
+  const stageId = process.env[stageVariable];
+  if (stageId !== undefined) {
+    if (context.parentGroup !== 0 || !/^[a-f0-9-]{36}\.jsonl$/.test(stageId))
+      throw Error('Check stage marker is invalid.');
+    const root = readRoot(context, stageId);
+    if (
+      root.intent.role !== 'stage' ||
+      !root.intent.detached ||
+      root.intent.owner.stage !== context.stage ||
+      root.spawnFailed ||
+      root.terminal ||
+      !root.acknowledgment ||
+      root.acknowledgment.pid !== root.acknowledgment.group
+    )
+      throw Error('Check stage acknowledgment is unavailable.');
+    return { ...context, parentGroup: root.acknowledgment.group };
+  }
   return context.parentGroup === 0 ? { ...context, parentGroup: process.pid } : context;
 }
 
-// The stage preloader resolves its group once before Node forks test processes.
-if (process.env[variable]) process.env[variable] = JSON.stringify(checkOwner());
+// Node test files can initialize the preloader independently of their stage process.
+if (process.env[variable] || process.env[stageVariable] !== undefined) {
+  try {
+    const owner = checkOwner();
+    if (!owner) throw Error('Check stage ownership is missing.');
+    process.env[variable] = JSON.stringify(owner);
+  } finally {
+    delete process.env[stageVariable];
+  }
+}
 installWorkerExitWitness();
 
 export function qualifiedWorkerExit(root: CheckRoot): boolean {
@@ -217,6 +243,7 @@ export function enrollCheckRoot(
   return {
     environment: {
       [variable]: JSON.stringify({ ...context, parentGroup: detached ? 0 : context.parentGroup }),
+      ...(role === 'stage' && detached ? { [stageVariable]: `${id}.jsonl` } : {}),
       ...(witness
         ? { [witnessVariable]: JSON.stringify({ id: `${id}.jsonl`, entrypoint: coderEntrypoint }) }
         : {}),

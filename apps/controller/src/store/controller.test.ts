@@ -895,6 +895,75 @@ test('candidate evidence requires unchanged bytes and completed checks', async (
     assert.equal(ticket.preload, undefined);
     ticket.failed();
   }
+  const stageDirectory = join(directory, 'isolated-stage');
+  mkdirSync(stageDirectory);
+  const stageOwner = { ...owner, directory: stageDirectory, parentGroup: 0 };
+  const stageTicket = enrollCheckRoot('stage', true, stageOwner);
+  const helper = new URL('../host/check-ownership.ts', import.meta.url).href;
+  const files = [0, 1].map((index) => {
+    const path = join(directory, `stage-${index}.test.mjs`);
+    writeFileSync(
+      path,
+      `
+import assert from 'node:assert/strict';
+import { once } from 'node:events';
+import { writeFileSync } from 'node:fs';
+import { test } from 'node:test';
+import { checkOwner, spawnCheckChild } from ${JSON.stringify(helper)};
+test('attached fixture keeps the admitted stage group', async () => {
+  const owner = checkOwner();
+  assert(owner);
+  assert.equal(process.env.CREWKITE_CHECK_STAGE_ROOT, undefined);
+  writeFileSync(${JSON.stringify(join(directory, `stage-${index}.json`))}, JSON.stringify({pid:process.pid,group:owner.parentGroup}));
+  const child = spawnCheckChild(process.execPath, ['-e', 'process.exit(0)'], {stdio:'ignore'});
+  const [code,signal] = await once(child, 'close');
+  assert.equal(code,0);
+  assert.equal(signal,null);
+});
+`,
+    );
+    return path;
+  });
+  const stageChild = spawnProcess(process.execPath, [`--import=${helper}`, '--test', ...files], {
+    detached: true,
+    stdio: 'ignore',
+    env: stageTicket.environment,
+  });
+  const stageClosed = new Promise<void>((done) => stageChild.once('close', () => done()));
+  stageTicket.acknowledge(stageChild);
+  try {
+    assert.equal(await closedWithin(stageClosed), true);
+  } finally {
+    if (!groupAbsent(stageChild.pid ?? 0)) process.kill(-(stageChild.pid as number), 'SIGKILL');
+    assert.equal(await closedWithin(stageClosed), true);
+  }
+  assert.equal(stageChild.exitCode, 0);
+  const stageRoots = readCheckRoots(stageOwner);
+  assert.equal(stageRoots.length, 3);
+  for (const root of stageRoots) {
+    assert.equal(root.acknowledgment?.group, stageChild.pid);
+    assert.equal(root.terminal?.code, 0);
+  }
+  for (const index of [0, 1]) {
+    const observed = JSON.parse(readFileSync(join(directory, `stage-${index}.json`), 'utf8'));
+    assert.notEqual(observed.pid, stageChild.pid);
+    assert.equal(observed.group, stageChild.pid);
+  }
+  const unacknowledged = enrollCheckRoot('stage', true, stageOwner);
+  const noAck = spawnProcess(process.execPath, [`--import=${helper}`, '-e', 'process.exit(0)'], {
+    detached: true,
+    stdio: 'ignore',
+    env: unacknowledged.environment,
+  });
+  const noAckClosed = new Promise<void>((done) => noAck.once('close', () => done()));
+  try {
+    assert.equal(await closedWithin(noAckClosed), true);
+  } finally {
+    if (!groupAbsent(noAck.pid ?? 0)) process.kill(-(noAck.pid as number), 'SIGKILL');
+    assert.equal(await closedWithin(noAckClosed), true);
+  }
+  assert.notEqual(noAck.exitCode, 0);
+  assert.equal(readCheckRoots(stageOwner).filter((root) => !root.acknowledgment).length, 1);
   const faultDirectory = join(directory, 'ownership-fault');
   mkdirSync(faultDirectory);
   const faultOwner = { ...owner, directory: faultDirectory };
