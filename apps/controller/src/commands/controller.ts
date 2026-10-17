@@ -13,7 +13,7 @@ import {
   readFileSync,
   realpathSync,
 } from 'node:fs';
-import { basename, isAbsolute, join } from 'node:path';
+import { basename, isAbsolute, join, relative } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
@@ -33,11 +33,15 @@ import {
   CandidateSchema,
   type CheckResult,
   CheckResultSchema,
+  CONVERSATION_CONTEXT_MEDIA_TYPE,
   type Command,
   CommandIdSchema,
   type CommandResult,
   CommandResultSchema,
   CommandSchema,
+  ConversationContextBundleSchema,
+  type ConversationContextRefs,
+  ConversationEntrySchema,
   type ConversationPlanningSelection,
   ConversationPlanningSelectionSchema,
   type ConversationTurnBinding,
@@ -111,6 +115,7 @@ import { fakeReviewWorkerPath, fakeWorkerPath } from '@crewkite/testkit/worker';
 import { z } from 'zod';
 import { ArtifactFiles } from '../artifacts/index.ts';
 import { buildHandoff } from '../continuity/index.ts';
+import { captureConversationContext } from '../conversation/context.ts';
 import { type FrozenConversationTurn, TaskConversation } from '../conversation/conversation.ts';
 import {
   CandidateEvidence,
@@ -841,6 +846,8 @@ export class Controller {
     if (command.command === 'StartRun' && this.isPreparedAcp(command.payload.runId))
       return this.executeAcpStart(command, principal);
     if (command.command === 'ObserveUsage') return this.observeUsageCommand(command, principal);
+    if (command.command === 'CaptureConversationContext')
+      return this.captureConversationContextCommand(command, principal);
     const preparing = this.verificationPreparation;
     if (preparing?.key === command.key)
       return preparing.hash === hashCanonical(command) && preparing.principal === principal
@@ -898,6 +905,7 @@ export class Controller {
     preflightFailure?: CommandResult,
     verification?: PreparedVerification,
     acpContext?: CapturedContext,
+    contextCapture?: ReturnType<typeof captureConversationContext>,
   ): CommandResult {
     if (this.closed && !preflightFailure)
       return { outcome: 'blocked', reason: 'controller-closing' };
@@ -920,7 +928,9 @@ export class Controller {
       }
       const stale = this.checkRevision(command);
       const result = CommandResultSchema.parse(
-        stale ?? preflightFailure ?? this.apply(command, effects, verification, acpContext),
+        stale ??
+          preflightFailure ??
+          this.apply(command, effects, verification, acpContext, contextCapture),
       );
       this.store.saveReceipt(command.key, hash, principal, result);
       return result;
@@ -929,6 +939,114 @@ export class Controller {
     return effects.length > 0 && result.outcome === 'outcome-unknown'
       ? (this.store.receipt(command.key)?.result ?? result)
       : result;
+  }
+
+  private captureConversationContextCommand(
+    command: Extract<Command, { command: 'CaptureConversationContext' }>,
+    principal: string,
+  ): CommandResult {
+    if (this.store.receipt(command.key) || this.checkRevision(command))
+      return this.commitCommand(command, principal);
+    let capture: ReturnType<typeof captureConversationContext>;
+    try {
+      const root = this.projectPath(command.payload.projectId);
+      if (!root) throw Error('project-not-found');
+      const source = inspectSource(command.payload.projectId, root);
+      if (source.base !== command.payload.base) throw Error('conversation-context-source-changed');
+      capture = captureConversationContext({
+        projectRoot: root,
+        projectId: command.payload.projectId,
+        base: command.payload.base,
+        selections: command.payload.selections.map((selection) => {
+          const path = relative(root, selection.path);
+          if (isAbsolute(path) || path === '..' || path.startsWith('../'))
+            throw Error('conversation-context-outside-project');
+          return { ...selection, path };
+        }),
+      });
+      if (
+        this.closed ||
+        this.projectPath(command.payload.projectId) !== root ||
+        hashCanonical(inspectSource(command.payload.projectId, root)) !== hashCanonical(source)
+      )
+        throw Error('conversation-context-source-changed');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '';
+      const reason = [
+        'conversation-context-source-changed',
+        'conversation-context-outside-project',
+      ].includes(message)
+        ? message
+        : /8192|32768|32 files|four context/.test(message)
+          ? 'conversation-context-too-large'
+          : 'conversation-context-unavailable';
+      return this.commitCommand(command, principal, {
+        outcome: 'blocked',
+        reason,
+        next: 'Select bounded text in the registered project at its current commit.',
+      });
+    }
+    return this.commitCommand(command, principal, undefined, undefined, undefined, capture);
+  }
+
+  private conversationContext(
+    refs: ConversationContextRefs | undefined,
+    projectId: string,
+    base: string,
+  ) {
+    return (refs ?? []).map((ref) => {
+      const key = `conversation-context:${ref.artifactId}`;
+      const retained = this.nativeRecord(key, 4096);
+      const proof = z
+        .strictObject({
+          artifactId: ArtifactSchema.shape.id,
+          hash: HashSchema,
+          projectId: ProjectSchema.shape.id,
+          base: z.string().regex(/^[a-f0-9]{40}$/),
+          projectRevision: z.number().int().nonnegative().safe(),
+          commandKey: z.string(),
+          commandHash: HashSchema,
+        })
+        .parse(retained.value);
+      const capture = this.store.receipt(proof.commandKey);
+      const artifact = ArtifactSchema.parse(this.store.get('artifact', ref.artifactId));
+      if (
+        this.store.receipt(key)?.principal !== 'local-owner' ||
+        this.store.receipt(key)?.hash !== retained.artifact.hash ||
+        capture?.principal !== 'local-owner' ||
+        capture.hash !== proof.commandHash ||
+        capture.result.outcome !== 'applied' ||
+        hashCanonical(capture.result.entity) !== hashCanonical(artifact)
+      )
+        throw Error('conversation-context-invalid');
+      if (
+        proof.artifactId !== artifact.id ||
+        proof.hash !== ref.hash ||
+        proof.projectId !== projectId ||
+        proof.base !== base ||
+        artifact.hash !== ref.hash ||
+        artifact.bytes > 32768 ||
+        artifact.mediaType !== CONVERSATION_CONTEXT_MEDIA_TYPE
+      )
+        throw Error('conversation-context-invalid');
+      const bytes = this.artifacts.read(ref.hash);
+      const bundle = ConversationContextBundleSchema.parse(JSON.parse(bytes.toString('utf8')));
+      if (
+        bundle.projectId !== projectId ||
+        bundle.base !== base ||
+        bytes.length !== artifact.bytes ||
+        hashCanonical(bundle) !== ref.hash ||
+        bundle.files.some((file) => {
+          const text = Buffer.from(file.text);
+          return (
+            text.length !== file.bytes ||
+            createHash('sha256').update(text).digest('hex') !== file.hash
+          );
+        })
+      )
+        throw Error('conversation-context-invalid');
+      return { artifactId: artifact.id, hash: artifact.hash, bundle };
+    });
   }
 
   snapshot(): Snapshot {
@@ -1616,6 +1734,13 @@ export class Controller {
         };
       return;
     }
+    if (command.command === 'CaptureConversationContext') {
+      const project = this.store.get<Project>('project', command.payload.projectId);
+      if (!project) return { outcome: 'blocked', reason: 'project-not-found' };
+      if (project.revision !== command.expectedRevision)
+        return { outcome: 'stale-revision', entity: project, revision: project.revision };
+      return;
+    }
     if (
       command.command === 'RegisterProject' ||
       command.command === 'CreateTask' ||
@@ -1651,6 +1776,7 @@ export class Controller {
     effects: (() => void)[],
     verification?: PreparedVerification,
     acpContext?: CapturedContext,
+    contextCapture?: ReturnType<typeof captureConversationContext>,
   ): CommandResult {
     if (command.command === 'PrepareRun' || command.command === 'PrepareNativeRun') {
       const config = this.conversationConfiguration(command.payload.taskId);
@@ -1737,6 +1863,34 @@ export class Controller {
         return this.applyAcpSetup(command, effects);
       case 'ObserveUsage':
         return this.observeUsage(command, effects);
+      case 'CaptureConversationContext': {
+        if (
+          !contextCapture ||
+          contextCapture.bundle.projectId !== command.payload.projectId ||
+          contextCapture.bundle.base !== command.payload.base
+        )
+          return { outcome: 'blocked', reason: 'conversation-context-unavailable' };
+        const artifact = ArtifactSchema.parse({
+          id: this.id('art'),
+          ...this.artifacts.publish(contextCapture.content),
+          mediaType: CONVERSATION_CONTEXT_MEDIA_TYPE,
+        });
+        this.saveArtifacts([artifact]);
+        const proof = this.nativeArtifact({
+          artifactId: artifact.id,
+          hash: artifact.hash,
+          projectId: command.payload.projectId,
+          base: command.payload.base,
+          projectRevision: command.expectedRevision,
+          commandKey: command.key,
+          commandHash: hashCanonical(command),
+        });
+        this.store.saveReceipt(`conversation-context:${artifact.id}`, proof.hash, 'local-owner', {
+          outcome: 'applied',
+          entity: proof,
+        });
+        return { outcome: 'applied', entity: artifact };
+      }
       case 'RegisterProject': {
         const path = projectRoot(command.payload.path);
         const existing = this.store.db
@@ -2597,6 +2751,73 @@ export class Controller {
     }
   }
 
+  private conversationContextFits(
+    task: Pick<Task, 'id' | 'projectId' | 'runId' | 'title' | 'outcome'>,
+    selection: ConversationPlanningSelection,
+    criteria: string[],
+    text: string,
+    refs: ConversationContextRefs | undefined,
+  ): boolean {
+    const pending = this.conversation.pendingInputs(task.id);
+    if (!refs?.length && !pending.some((entry) => 'context' in entry && entry.context?.length))
+      return true;
+    const config = this.conversationConfiguration(task.id);
+    const base =
+      config?.source.base ??
+      inspectSource(task.projectId, this.projectPath(task.projectId) as string).base;
+    const entries = [
+      ...pending.map((entry) => ({
+        id: entry.id,
+        text: entry.text,
+        context: 'context' in entry ? entry.context : undefined,
+      })),
+      { id: `msg_${'0'.repeat(26)}`, text, context: refs },
+    ];
+    const profile = this.profileFor(selection.profileId);
+    if (!profile.facts.available) return true;
+    const identity = '0'.repeat(26);
+    const scope = {
+      paths: [] as string[],
+      roles: ['coder', 'reviewer', 'advisor'] as ('coder' | 'reviewer' | 'advisor')[],
+      checks: ['node-tests-v1', 'project-node-tests-v1', 'crewkite-verify-v1'],
+    };
+    try {
+      const attachments = entries.flatMap((entry) =>
+        this.conversationContext(entry.context, task.projectId, base).map((attachment) => ({
+          messageId: entry.id,
+          ...attachment,
+        })),
+      );
+      conversationPlan({
+        binding: {
+          taskId: task.id,
+          runId: task.runId ?? `run_${identity}`,
+          attemptId: `att_${identity}`,
+          generation: Number.MAX_SAFE_INTEGER,
+          routeId: `rte_${identity}`,
+          role: selection.role,
+          taskRevision: Number.MAX_SAFE_INTEGER,
+          conversationRevision: Number.MAX_SAFE_INTEGER,
+          scopeHash: hashCanonical(scope),
+          limitMinutes: 5,
+        },
+        model: profile.facts.model as ConversationPlan['model'],
+        effort: 'low',
+        creditPolicy: selection.creditPolicy,
+        directory: join(this.home, 'conversation', `run_${identity}`, `att_${identity}`),
+        context: { title: task.title, outcome: task.outcome, criteria },
+        scope,
+        contextSource: { projectId: task.projectId, base },
+        contextAttachments: attachments,
+        history: entries.map((entry) => ({ role: 'user', text: entry.text, messageId: entry.id })),
+        omittedHistoryCount: Number.MAX_SAFE_INTEGER,
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private conversationState(taskId: string): TaskConversationState {
     const task = this.store.get<Task>('task', taskId);
     if (!task) throw Error('task-not-found');
@@ -2885,10 +3106,34 @@ export class Controller {
       });
       if (!this.conversationInputFits(task, command.payload.planning, []))
         return { outcome: 'blocked', reason: 'conversation-input-too-large' };
+      try {
+        this.conversationContext(
+          command.payload.context,
+          task.projectId,
+          inspectSource(task.projectId, this.projectPath(task.projectId) as string).base,
+        );
+      } catch {
+        return { outcome: 'blocked', reason: 'conversation-context-invalid' };
+      }
+      if (
+        !this.conversationContextFits(
+          task,
+          command.payload.planning,
+          [],
+          text,
+          command.payload.context,
+        )
+      )
+        return { outcome: 'blocked', reason: 'conversation-context-too-large' };
       this.store.put('task', task.id, 0, task);
       this.event('task.created', task.id, 0, task);
       task = this.configureConversation(task, command.payload.planning, true, true);
-      const message = this.conversation.recordMessage(task.id, text);
+      const message = this.conversation.recordMessage(
+        task.id,
+        text,
+        'user-message',
+        command.payload.context,
+      );
       if (!message.applied) return { outcome: 'blocked', reason: message.reason };
       this.admitConversation(task.id, effects);
       const current = this.store.get<Task>('task', task.id) as Task;
@@ -2961,17 +3206,41 @@ export class Controller {
     if (!command.payload.text.trim()) return { outcome: 'denied', reason: 'empty-message' };
     const state = this.conversationState(task.id);
     if (!state.send.available) return { outcome: 'blocked', reason: state.send.reason };
+    try {
+      this.conversationContext(
+        command.payload.context,
+        task.projectId,
+        this.conversationConfiguration(task.id)?.source.base ??
+          inspectSource(task.projectId, this.projectPath(task.projectId) as string).base,
+      );
+    } catch {
+      return { outcome: 'blocked', reason: 'conversation-context-invalid' };
+    }
+    const config = this.conversationConfiguration(task.id);
+    if (
+      config &&
+      !this.conversationContextFits(
+        task,
+        config.selection,
+        config.contractStatus === 'provisional' ? config.contextCriteria : task.criteria,
+        command.payload.text,
+        command.payload.context,
+      )
+    )
+      return { outcome: 'blocked', reason: 'conversation-context-too-large' };
     const saved =
       command.command === 'AnswerTaskQuestion'
         ? this.conversation.answerQuestion(
             task.id,
             command.payload.questionId,
             command.payload.text,
+            command.payload.context,
           )
         : this.conversation.recordMessage(
             task.id,
             command.payload.text,
             command.command === 'QueueTaskGuidance' ? 'guidance' : 'user-message',
+            command.payload.context,
           );
     if (!saved.applied) return { outcome: 'blocked', reason: saved.reason };
     if (state.send.disposition === 'planning-turn') {
@@ -3010,12 +3279,33 @@ export class Controller {
       .get(taskId, ceiling)?.count as number;
     const historyEntries = rows
       .reverse()
-      .map(
-        (row) => JSON.parse(row.body as string) as import('@crewkite/contracts').ConversationEntry,
+      .map((row) => ConversationEntrySchema.parse(JSON.parse(row.body as string)));
+    if (pending.some((entry) => 'context' in entry && entry.context?.length)) {
+      const retained = new Set(historyEntries.map((entry) => entry.id));
+      historyEntries.push(...pending.filter((entry) => !retained.has(entry.id)));
+      historyEntries.sort((left, right) => (BigInt(left.cursor) < BigInt(right.cursor) ? -1 : 1));
+    }
+    const history = historyEntries.map((entry) => ({ role: entry.author.kind, text: entry.text }));
+    const contextInput = () => {
+      const contextAttachments = historyEntries.flatMap((entry) =>
+        'context' in entry
+          ? this.conversationContext(entry.context, task.projectId, config.source.base).map(
+              (attachment) => ({ messageId: entry.id, ...attachment }),
+            )
+          : [],
       );
-    const history = historyEntries.map((entry) => {
-      return { role: entry.author.kind, text: entry.text };
-    });
+      return contextAttachments.length
+        ? {
+            contextSource: { projectId: task.projectId, base: config.source.base },
+            contextAttachments,
+            history: historyEntries.map((entry) => ({
+              role: entry.author.kind,
+              text: entry.text,
+              ...(entry.author.kind === 'user' ? { messageId: entry.id } : {}),
+            })),
+          }
+        : { history };
+    };
     const files = committedFiles(this.projectPath(task.projectId) as string, config.source.base);
     const scope = {
       paths: files.slice(0, 1000).map((file) => file.path),
@@ -3034,6 +3324,11 @@ export class Controller {
       scopeHash: hashCanonical(scope),
       limitMinutes: Math.min(5, allowance.minutes),
     });
+    try {
+      contextInput();
+    } catch {
+      return { outcome: 'blocked', reason: 'conversation-context-invalid' };
+    }
     let input: ConversationPlan | undefined;
     let omitted = Math.max(0, total - history.length);
     while (!input) {
@@ -3051,17 +3346,25 @@ export class Controller {
               config.contractStatus === 'provisional' ? config.contextCriteria : task.criteria,
           },
           scope,
-          history,
+          ...contextInput(),
           omittedHistoryCount: omitted,
         });
       } catch {
         if (history.length > 1) {
           const retained = new Set(pending.map((entry) => entry.id));
           const old = historyEntries.findIndex((entry) => !retained.has(entry.id));
-          const index = old >= 0 ? old : history.length - 1;
-          history.splice(index, 1);
-          historyEntries.splice(index, 1);
-          omitted++;
+          const protectedContext = pending.some(
+            (entry) => 'context' in entry && entry.context?.length,
+          );
+          const index = old >= 0 ? old : protectedContext ? -1 : history.length - 1;
+          if (index >= 0) {
+            history.splice(index, 1);
+            historyEntries.splice(index, 1);
+            omitted++;
+          } else if (scope.paths.length) {
+            scope.paths.pop();
+            binding.scopeHash = hashCanonical(scope);
+          } else return { outcome: 'blocked', reason: 'conversation-context-too-large' };
         } else if (scope.paths.length) {
           scope.paths.pop();
           binding.scopeHash = hashCanonical(scope);
@@ -3200,6 +3503,9 @@ export class Controller {
       )
         throw Error('Planning authority changed.');
       this.conversationProfile(config);
+      if (input.contextAttachments?.length)
+        for (const attachment of input.contextAttachments)
+          this.conversationContext([attachment], task.projectId, config.source.base);
     };
     const finish = (outcome: Awaited<ReturnType<typeof startConversation>['result']> | null) => {
       try {

@@ -7594,6 +7594,104 @@ test('planning turns keep task authority and allowance across execution', async 
     limits: { attempts: 12, minutes: 30, concurrency: 2 },
     consent: 'explicit',
   };
+  const capturePayload = {
+    projectId,
+    base: context.source.base,
+    selections: [{ kind: 'source-file', path: join(context.source.directory, 'net.mjs') }],
+  };
+  const captureCommand = command('CaptureConversationContext', capturePayload, 0);
+  const capture = await controller.execute(captureCommand, 'local-owner');
+  const contextArtifact = ArtifactSchema.parse(capture.entity);
+  const refs = [{ artifactId: contextArtifact.id, hash: contextArtifact.hash }];
+  assert.equal(capture.outcome, 'applied');
+  assert.equal(
+    (await controller.execute(captureCommand, 'local-owner')).outcome,
+    'already-applied',
+  );
+  assert.equal(
+    (
+      await controller.execute(
+        { ...captureCommand, payload: { ...capturePayload, base: '0'.repeat(40) } },
+        'local-owner',
+      )
+    ).reason,
+    'idempotency-key-reused',
+  );
+  assert.equal(
+    (
+      await controller.execute(
+        command(
+          'CaptureConversationContext',
+          {
+            ...capturePayload,
+            selections: [{ kind: 'source-file', path: context.directory }],
+          },
+          0,
+        ),
+        'local-owner',
+      )
+    ).outcome,
+    'blocked',
+  );
+  const beforeInvalidContext = controller.snapshot().tasks.length;
+  assert.equal(
+    (
+      await controller.execute(
+        command(
+          'CreateTaskDiscussion',
+          {
+            projectId,
+            text: 'Reject a changed context digest.',
+            planning,
+            context: [{ ...refs[0], hash: '0'.repeat(64) }],
+          },
+          0,
+        ),
+        'local-owner',
+      )
+    ).reason,
+    'conversation-context-invalid',
+  );
+  assert.equal(controller.snapshot().tasks.length, beforeInvalidContext);
+  const largeRefs: { artifactId: string; hash: string }[] = [];
+  for (const [index, character] of ['"', '\\', '\t', '\n'].entries()) {
+    const path = join(context.source.directory, `selected-${index}.log`);
+    writeFileSync(path, character.repeat(8192));
+    const result = await controller.execute(
+      command(
+        'CaptureConversationContext',
+        {
+          projectId,
+          base: context.source.base,
+          selections: [{ kind: 'log-file', path }],
+        },
+        0,
+      ),
+      'local-owner',
+    );
+    const artifact = ArtifactSchema.parse(result.entity);
+    largeRefs.push({ artifactId: artifact.id, hash: artifact.hash });
+    rmSync(path);
+  }
+  assert.equal(
+    (
+      await controller.execute(
+        command(
+          'CreateTaskDiscussion',
+          {
+            projectId,
+            text: 'Keep every byte of selected context.',
+            planning,
+            context: largeRefs,
+          },
+          0,
+        ),
+        'local-owner',
+      )
+    ).reason,
+    'conversation-context-too-large',
+  );
+  assert.equal(controller.snapshot().tasks.length, beforeInvalidContext);
   const oversized = TaskSchema.parse(
     (
       await controller.execute(
@@ -7730,7 +7828,7 @@ test('planning turns keep task authority and allowance across execution', async 
   const firstReply = nextReply();
   const create = command(
     'CreateTaskDiscussion',
-    { projectId, text: 'Keep the export and change netMinor.', planning },
+    { projectId, text: 'Keep the export and change netMinor.', planning, context: refs },
     0,
   );
   const created = await controller.execute(create, 'local-owner');
@@ -7764,6 +7862,32 @@ test('planning turns keep task authority and allowance across execution', async 
     'task-not-preparable',
   );
   await firstReply;
+  const admitted = controller.store.intents().find((intent) => intent.task_id === taskId);
+  assert(admitted);
+  const savedInputReceipt = controller.store.receipt(`conversation-turn:${admitted.attempt_id}`);
+  const savedInputArtifact = ArtifactSchema.parse(savedInputReceipt?.result.entity);
+  const savedInput = JSON.parse(
+    new ArtifactFiles(join(context.directory, 'home', 'artifacts'))
+      .read(savedInputArtifact.hash)
+      .toString('utf8'),
+  );
+  assert.deepEqual(savedInput.contextSource, { projectId, base: context.source.base });
+  assert.equal(savedInput.contextAttachments.length, 1);
+  assert.equal(savedInput.contextAttachments[0].artifactId, contextArtifact.id);
+  assert.equal(savedInput.contextAttachments[0].hash, contextArtifact.hash);
+  assert.equal(
+    savedInput.history.find(
+      (entry: { messageId?: string }) =>
+        entry.messageId === savedInput.contextAttachments[0].messageId,
+    )?.role,
+    'user',
+  );
+  const retainedInput = controller.store.db
+    .prepare(
+      "SELECT body FROM conversation_entries WHERE task_id=? AND json_extract(body,'$.kind')='user-message'",
+    )
+    .get(taskId);
+  assert.deepEqual(JSON.parse(retainedInput?.body as string).context, refs);
   assert.equal(state(taskId).pendingQuestions.length, 1);
   assert.equal(state(taskId).adopt.reason, 'pending-question');
   assert.equal(state(taskId).configuration?.effectiveModel, fixtureModel);
@@ -7772,10 +7896,14 @@ test('planning turns keep task authority and allowance across execution', async 
   await send('AnswerTaskQuestion', taskId, {
     questionId: state(taskId).pendingQuestions[0].id,
     text: 'Keep it.',
+    context: refs,
   });
   await held.promise;
   const queuedRevision = current(taskId).revision;
-  await send('SendTaskMessage', taskId, { text: 'Use the existing helper in the next plan.' });
+  await send('SendTaskMessage', taskId, {
+    text: 'Use the existing helper in the next plan.',
+    context: refs,
+  });
   assert.equal(state(taskId).queuedInputCount, 1);
   assert.equal(state(taskId).send.disposition, 'queue');
   assert.equal(
@@ -7951,7 +8079,7 @@ test('planning turns keep task authority and allowance across execution', async 
   crashAfterIntent = true;
   const crash = command(
     'SendTaskMessage',
-    { taskId, text: 'Keep the next turn bounded.' },
+    { taskId, text: 'Keep the next turn bounded.', context: refs },
     current(taskId).revision,
   );
   await assert.rejects(
@@ -7971,6 +8099,12 @@ test('planning turns keep task authority and allowance across execution', async 
     assert.equal(afterReopen.data.state.send.reason, 'ownership-unknown');
   assert.equal((await reopened.execute(crash, 'local-owner')).outcome, 'already-applied');
   assert.equal(reopened.store.intents().length, count);
+  const recoveredEntry = reopened.store.db
+    .prepare(
+      "SELECT body FROM conversation_entries WHERE task_id=? AND json_extract(body,'$.text')=?",
+    )
+    .get(taskId, 'Keep the next turn bounded.');
+  assert.deepEqual(JSON.parse(recoveredEntry?.body as string).context, refs);
   assert.deepEqual(reopened.snapshot().candidates, retainedCandidates);
   assert.deepEqual(reopened.snapshot().evidence, retainedEvidence);
   for (const sentinel of context.source.sentinels) {

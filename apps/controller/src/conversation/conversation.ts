@@ -1,5 +1,7 @@
 import {
   AttemptSchema,
+  type ConversationContextRefs,
+  ConversationContextRefsSchema,
   type ConversationEntry,
   ConversationEntrySchema,
   type ConversationPage,
@@ -132,15 +134,26 @@ export class TaskConversation {
     taskId: string,
     text: string,
     kind: 'user-message' | 'guidance' = 'user-message',
+    context?: ConversationContextRefs,
   ): ConversationWrite {
     const task = this.task(taskId);
     if (!task) return { applied: false, reason: 'task-not-found' };
     return this.append(task, [
-      { kind, author: { kind: 'user' }, text: ConversationTextSchema.parse(text) },
+      {
+        kind,
+        author: { kind: 'user' },
+        text: ConversationTextSchema.parse(text),
+        ...(context === undefined ? {} : { context: ConversationContextRefsSchema.parse(context) }),
+      },
     ]);
   }
 
-  answerQuestion(taskId: string, questionId: string, text: string): ConversationWrite {
+  answerQuestion(
+    taskId: string,
+    questionId: string,
+    text: string,
+    context?: ConversationContextRefs,
+  ): ConversationWrite {
     const task = this.task(taskId);
     if (!task) return { applied: false, reason: 'task-not-found' };
     const question = this.entry(taskId, questionId);
@@ -155,6 +168,7 @@ export class TaskConversation {
         author: { kind: 'user' },
         replyTo: question.id,
         text: ConversationTextSchema.parse(text),
+        ...(context === undefined ? {} : { context: ConversationContextRefsSchema.parse(context) }),
       },
     ]);
   }
