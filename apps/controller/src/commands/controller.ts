@@ -159,6 +159,12 @@ import { type LaunchIntent, Store } from '../store/index.ts';
 import { deriveWindow } from '../usage/index.ts';
 import { chargedMinutes, remainingBudgets } from './budgets.ts';
 
+const nativeProviderRestriction: CommandResult = {
+  outcome: 'blocked',
+  reason: 'provider-policy-restricted',
+  next: 'Choose another profile or continue manually in the provider native app. Retained evidence remains available.',
+};
+
 const NativeFileAppointmentSchema = z.strictObject({
   id: z.string().regex(/^[a-zA-Z0-9-]{1,80}$/),
   taskId: TaskIdSchema,
@@ -1157,7 +1163,9 @@ export class Controller {
       try {
         native = this.preparedNativeBinding(run);
         planned = native.attempt;
-      } catch {
+      } catch (error) {
+        if (error instanceof Error && error.message === 'provider-policy-restricted')
+          return nativeProviderRestriction;
         return {
           outcome: 'blocked',
           reason: 'native-preparation-unavailable',
@@ -1492,6 +1500,7 @@ export class Controller {
     try {
       const profile = this.profileFor(command.payload.profileId);
       const facts = NativeProfileSchema.parse(profile.facts);
+      if (facts.reason === 'provider-policy-restricted') return nativeProviderRestriction;
       if (
         !facts.available ||
         !profile.client ||
@@ -3872,6 +3881,8 @@ export class Controller {
       JSON.parse(this.artifacts.read(artifact.hash).toString('utf8')),
     );
     const profile = this.profileFor(plan.public.profileId);
+    if (profile.facts.reason === 'provider-policy-restricted')
+      throw Error('provider-policy-restricted');
     if (
       !profile.facts.available ||
       profile.facts.id !== plan.public.profileId ||

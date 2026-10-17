@@ -136,6 +136,10 @@ export const GoogleNativeProfileSchema = AnthropicNativeProfileSchema.omit({
   id: z.literal('google-file-v1'),
   family: z.literal('google'),
   effort: z.literal('low'),
+  reason: z.enum([
+    ...AnthropicNativeProfileSchema.shape.reason.options,
+    'provider-policy-restricted',
+  ]),
   permissionModes: z.tuple([
     z.literal('request-review'),
     z.literal('strict'),
