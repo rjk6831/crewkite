@@ -34,6 +34,8 @@ Task commands use IDs returned by the controller:
 | `task start-checks <task-id>` | Start the saved local check once |
 | `task start-review <task-id>` | Start the saved native review after matching checks pass |
 
+Task show and watch snapshots include the current task's pending approvals and next action. Each approval carries its exact binding. Plain output lists approval and denial commands; neither runs automatically.
+
 `--json` produces one JSON object for reads and actions. Watch emits one object per line, beginning with its task snapshot. A fresh snapshot replaces that state after a history gap. Ctrl+C stops watching.
 
 Watch retains its cursor while the controller is offline. If the bounded reconnect window ends, it prints the next action and exits with status 1. Start the controller and run watch again to reconnect explicitly.

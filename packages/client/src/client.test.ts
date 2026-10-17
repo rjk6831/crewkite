@@ -564,6 +564,8 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     ...usageCases.map((value) => `usage-${value.name}`),
     ...creationCases.map((value) => `setup-${value.name}`),
     'show',
+    'pending-show',
+    'pending-watch',
     'native-show',
     'profiles',
     'handoff-targets',
@@ -948,7 +950,12 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
               artifacts: evaluating ? [artifact] : [],
               candidateEvaluations: evaluating ? [preview] : [],
               evidence: reviewEvidence,
-              approvals,
+              approvals: scenario.startsWith('pending-')
+                ? [
+                    approval,
+                    { ...approval, approvalId: 'apr_01ARZ3NDEKTSV4RRFFQ69G5FAW', status: 'denied' },
+                  ]
+                : approvals,
               nativeProfiles: [
                 repositoryProfile,
                 googleProfile,
@@ -1026,6 +1033,22 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
               ? { outcome: 'outcome-unknown', reason: 'connection-lost' }
               : { outcome: 'applied', entity: createdTask, revision: 0 };
       socket.write(encodeFrame({ type: 'result', key: command.key, result }));
+      if (scenario === 'pending-watch' && command.command === 'Subscribe')
+        socket.write(
+          encodeFrame({
+            type: 'event',
+            event: {
+              protocol: 1,
+              id: `evt_${suffix}`,
+              cursor: '5',
+              at: '2026-10-17T10:00:00.000Z',
+              taskId: task.id,
+              revision: task.revision,
+              type: 'approval.requested',
+              payload: approval,
+            },
+          }),
+        );
     });
     context.after(() => fixture.close());
     const policyFile = join(fixture.home, 'policy.json'),
@@ -1060,6 +1083,11 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         errors = '';
       child.stdout.on('data', (data) => {
         output += data;
+        if (
+          scenario === 'pending-watch' &&
+          (output.includes('"cursor":"5"') || output.includes('5 approval.requested'))
+        )
+          child.kill('SIGTERM');
       });
       child.stderr.on('data', (data) => {
         errors += data;
@@ -1070,6 +1098,8 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     let args = ['task', 'export', task.id, '--output', destination];
     if (scenario === 'show' || scenario === 'native-show') args = ['task', 'show', task.id];
     if (scenario === 'profiles') args = ['native', 'profiles'];
+    if (scenario.startsWith('pending-'))
+      args = ['task', scenario === 'pending-watch' ? 'watch' : 'show', task.id];
     if (['explicit', 'saved', 'unavailable', 'partial-consent'].includes(scenario))
       args = [
         'task',
@@ -1830,9 +1860,30 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       );
       continue;
     }
+    if (scenario.startsWith('pending-')) {
+      assert.equal(result.code, 0, result.errors);
+      const rows = result.output
+        .trim()
+        .split('\n')
+        .map((row) => JSON.parse(row));
+      assert.deepEqual(rows[0].approvals, [approval]);
+      assert.equal(rows[0].task.next, task.next);
+      if (scenario === 'pending-watch') assert.deepEqual(rows[1].payload, approval);
+      const plain = await execute(args, false);
+      assert.equal(plain.code, 0, plain.errors);
+      for (const value of [
+        approval.approvalId,
+        approval.action,
+        approval.target,
+        approval.consequence,
+        task.next,
+      ])
+        assert(plain.output.includes(value), value);
+      continue;
+    }
     if (scenario === 'show') {
       assert.equal(result.code, 0);
-      assert.deepEqual(JSON.parse(result.output), { cursor: snapshot.cursor, task });
+      assert.deepEqual(JSON.parse(result.output), { cursor: snapshot.cursor, task, approvals: [] });
       continue;
     }
     if (scenario === 'native-show') {
@@ -1840,6 +1891,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       assert.deepEqual(JSON.parse(result.output), {
         cursor: snapshot.cursor,
         task: { ...task, runId: nativeRun.runId },
+        approvals: [],
         nativeRun,
         run,
       });

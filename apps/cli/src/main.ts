@@ -843,6 +843,9 @@ export async function runCli(
       );
     }
     if (action === 'show') {
+      const approvals = snapshot.approvals.filter(
+        (value) => value.taskId === task.id && value.status === 'pending',
+      );
       const nativeRun = snapshot.nativeRuns.find((value) => value.runId === task.runId);
       const run = nativeRun
         ? snapshot.runs.find((value) => value.id === nativeRun.runId)
@@ -929,31 +932,50 @@ export async function runCli(
         {
           cursor: snapshot.cursor,
           task,
+          approvals,
           ...(nativeRun ? { nativeRun, run } : {}),
           ...(evaluation ? { evaluation, evidence } : {}),
         },
-        `${task.id}\n${task.title}\n${task.state}, revision ${task.revision}${preview}${handoffText}${evaluationText}`,
+        terminalText(
+          `${task.id}\n${task.title}\n${task.state}, revision ${task.revision}${task.next ? `\nNext: ${task.next}` : ''}${approvalText(approvals)}${preview}${handoffText}${evaluationText}`,
+        ),
       );
       return 0;
     }
     if (action === 'watch') {
+      const approvals = snapshot.approvals.filter(
+        (value) => value.taskId === task.id && value.status === 'pending',
+      );
       print(
-        { type: 'snapshot', cursor: snapshot.cursor, task },
-        `${snapshot.cursor} ${task.state}, revision ${task.revision}`,
+        { type: 'snapshot', cursor: snapshot.cursor, task, approvals },
+        terminalText(
+          `${snapshot.cursor} ${task.state}, revision ${task.revision}${task.next ? `\nNext: ${task.next}` : ''}${approvalText(approvals)}`,
+        ),
       );
       const unsubscribe = await client.subscribe(
         snapshot.cursor,
         (event) => {
           if (event.taskId === task.id)
-            print(event, `${event.cursor} ${event.type}, revision ${event.revision}`);
+            print(
+              event,
+              terminalText(
+                `${event.cursor} ${event.type}, revision ${event.revision}${event.type === 'approval.requested' ? approvalText([event.payload]) : event.type === 'task.updated' && event.payload.next ? `\nNext: ${event.payload.next}` : ''}`,
+              ),
+            );
         },
         (fresh) => {
           const current = fresh.tasks.find((item) => item.id === task.id);
-          if (current)
-            print(
-              { type: 'snapshot', cursor: fresh.cursor, task: current },
-              `${fresh.cursor} ${current.state}, revision ${current.revision}`,
+          if (current) {
+            const approvals = fresh.approvals.filter(
+              (value) => value.taskId === current.id && value.status === 'pending',
             );
+            print(
+              { type: 'snapshot', cursor: fresh.cursor, task: current, approvals },
+              terminalText(
+                `${fresh.cursor} ${current.state}, revision ${current.revision}${current.next ? `\nNext: ${current.next}` : ''}${approvalText(approvals)}`,
+              ),
+            );
+          }
         },
       );
       const stopConnection = client.onConnection((state) => {
@@ -1003,6 +1025,15 @@ export async function runCli(
   } finally {
     client?.close();
   }
+}
+
+function approvalText(approvals: Snapshot['approvals']) {
+  return approvals
+    .map(
+      (approval) =>
+        `\nApproval ${approval.approvalId}: ${approval.action} ${approval.target}\n${approval.consequence}\nApprove: crewkite task approve ${approval.approvalId}\nDeny: crewkite task deny ${approval.approvalId}`,
+    )
+    .join('');
 }
 
 function readJson(path: string): unknown {
