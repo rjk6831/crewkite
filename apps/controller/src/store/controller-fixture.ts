@@ -638,8 +638,12 @@ async function nativeSetup(
     },
     children,
     observe,
-    wait: <T>(stage: string, pending: Promise<T>) =>
-      nativeWait(`${mode}/${targetPath}/${stage}`, Promise.race([pending, failure.promise])),
+    wait: <T>(stage: string, pending: Promise<T>, milliseconds?: number) =>
+      nativeWait(
+        `${mode}/${targetPath}/${stage}`,
+        Promise.race([pending, failure.promise]),
+        milliseconds,
+      ),
     ready: ready.promise,
     submissions: () => submissions,
     onSpawn: (listener: typeof onSpawn) => {

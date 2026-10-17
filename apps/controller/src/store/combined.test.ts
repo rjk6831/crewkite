@@ -194,14 +194,14 @@ test('combined tasks share seven real dispatches and require a separate full bar
       const rev = (taskId = parent.id) =>
         (controller.snapshot().tasks.find((task) => task.id === taskId) as Task).revision;
       const phase = () => controller.snapshot().combinedRuns[0];
-      const waitFor = async (label: string, predicate: () => boolean) => {
+      const waitFor = async (label: string, predicate: () => boolean, milliseconds?: number) => {
         if (predicate()) return;
         const done = Promise.withResolvers<void>();
         const off = context.observe(controller, () => {
           if (predicate()) done.resolve();
         });
         try {
-          await context.wait(`${scenario}/${label}`, done.promise);
+          await context.wait(`${scenario}/${label}`, done.promise, milliseconds);
         } finally {
           off();
         }
@@ -423,9 +423,11 @@ test('combined tasks share seven real dispatches and require a separate full bar
         );
         continue;
       }
+      // Baseline readiness includes the check plus one shared minute for integration.
       await waitFor(
         'baseline',
         () => phase()?.phase === 'writers' || ['blocked', 'unknown'].includes(phase()?.phase ?? ''),
+        (input.checks.maximumMinutes + 1) * 60_000,
       );
       assert.equal(phase()?.phase, 'writers', JSON.stringify(phase()));
       let written = 0;
