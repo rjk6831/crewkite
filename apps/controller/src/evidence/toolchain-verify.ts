@@ -9,6 +9,7 @@ import {
   type CheckStage,
   enrollCheckRoot,
   inspectCheckRoots,
+  qualifiedWorkerExit,
 } from '../host/check-ownership.ts';
 import { type FileContent, materialize } from '../host/source.ts';
 import {
@@ -111,7 +112,7 @@ const same = (actual: unknown, expected: unknown) => {
 };
 const beneath = (path: string, root: string) => path === root || path.startsWith(`${root}/`);
 function terminal(root: CheckRoot): boolean {
-  return root.spawnFailed || !!root.terminal;
+  return root.spawnFailed || !!root.terminal || qualifiedWorkerExit(root);
 }
 
 export class ToolchainVerification {

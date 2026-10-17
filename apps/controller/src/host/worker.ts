@@ -1,4 +1,4 @@
-import type { ChildProcessWithoutNullStreams } from 'node:child_process';
+import { type ChildProcessWithoutNullStreams, spawn as spawnProcess } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
 import {
   type FakeWorkerEvent,
@@ -7,7 +7,7 @@ import {
   FakeWorkerInputSchema,
   MAX_FRAME_BYTES,
 } from '@crewkite/contracts';
-import { checkEnvironment, spawnCheckChild as spawn } from './check-ownership.ts';
+import { checkEnvironment, enrollCheckRoot, spawnCheckChild as spawn } from './check-ownership.ts';
 
 export function groupAbsent(group: number | null): boolean {
   if (group === null || !Number.isSafeInteger(group) || group <= 0) return false;
@@ -48,19 +48,30 @@ export class OwnedWorker {
     if (process.platform === 'win32')
       throw new Error('Writer ownership evidence requires a Unix process group.');
     mkdirSync(options.environmentHome, { recursive: true, mode: 0o700 });
-    this.child = spawn(process.execPath, [options.workerPath], {
-      cwd: options.start.scratchPath,
-      detached: true,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: {
-        ...checkEnvironment(),
-        PATH: process.env.PATH,
-        LANG: 'C',
-        HOME: options.environmentHome,
-        CREWKITE_FAKE_ROUTE_ID: options.routeId,
-        CREWKITE_FAKE_OBSERVED_AT: options.observedAt,
-      },
-    });
+    const ticket = enrollCheckRoot('worker', true, undefined, options.workerPath);
+    try {
+      this.child = spawnProcess(
+        process.execPath,
+        [...(ticket.preload ? [`--import=${ticket.preload}`] : []), options.workerPath],
+        {
+          cwd: options.start.scratchPath,
+          detached: true,
+          stdio: ['pipe', 'pipe', 'pipe'],
+          env: {
+            ...ticket.environment,
+            PATH: process.env.PATH,
+            LANG: 'C',
+            HOME: options.environmentHome,
+            CREWKITE_FAKE_ROUTE_ID: options.routeId,
+            CREWKITE_FAKE_OBSERVED_AT: options.observedAt,
+          },
+        },
+      );
+    } catch (error) {
+      ticket.failed();
+      throw error;
+    }
+    ticket.acknowledge(this.child);
     this.group = this.child.pid ?? 0;
     this.exited = new Promise((resolve) => {
       this.child.once('exit', (code, signal) =>

@@ -11,8 +11,13 @@ import {
   writeSync,
 } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const variable = 'CREWKITE_CHECK_OWNER';
+const witnessVariable = 'CREWKITE_CHECK_WORKER_EXIT';
+const coderEntrypoint = fileURLToPath(
+  new URL('../../../../packages/testkit/src/providers/worker.ts', import.meta.url),
+);
 const stages = ['policy', 'lint', 'types', 'node-tests', 'build', 'desktop'] as const;
 export type CheckStage = (typeof stages)[number];
 export type CheckOwner = {
@@ -31,6 +36,7 @@ type Intent = {
   owner: CheckOwner;
   role: Role;
   detached: boolean;
+  witness?: 'scripted-coder-v1';
 };
 type Acknowledgment = { type: 'ack'; pid: number; group: number };
 type Terminal = { type: 'close'; code: number | null; signal: string | null };
@@ -39,6 +45,7 @@ export type CheckRoot = {
   intent: Intent;
   acknowledgment?: Acknowledgment;
   terminal?: Terminal;
+  exitEvent?: { type: 'fixture-exit'; pid: number; code: number };
   spawnFailed: boolean;
 };
 
@@ -91,6 +98,67 @@ export function checkOwner(): CheckOwner | undefined {
 
 // The stage preloader resolves its group once before Node forks test processes.
 if (process.env[variable]) process.env[variable] = JSON.stringify(checkOwner());
+installWorkerExitWitness();
+
+export function qualifiedWorkerExit(root: CheckRoot): boolean {
+  return (
+    root.intent.witness === 'scripted-coder-v1' &&
+    root.intent.role === 'worker' &&
+    root.intent.detached &&
+    ['node-tests', 'desktop'].includes(root.intent.owner.stage) &&
+    !root.spawnFailed &&
+    !!root.acknowledgment &&
+    root.acknowledgment.pid === root.acknowledgment.group &&
+    root.exitEvent?.pid === root.acknowledgment.pid
+  );
+}
+
+function installWorkerExitWitness() {
+  const text = process.env[witnessVariable];
+  delete process.env[witnessVariable];
+  if (text === undefined) return;
+  if (Buffer.byteLength(text) > 4096) throw Error('Worker exit witness exceeds its bound.');
+  const marker = JSON.parse(text);
+  const context = checkOwner();
+  if (
+    !marker ||
+    Object.keys(marker).sort().join(',') !== 'entrypoint,id' ||
+    !/^[a-f0-9-]{36}\.jsonl$/.test(marker.id) ||
+    marker.entrypoint !== coderEntrypoint ||
+    process.argv[1] !== coderEntrypoint ||
+    !context
+  )
+    throw Error('Worker exit witness is invalid.');
+  process.once('exit', (code) => {
+    try {
+      const root = readRoot(context, marker.id);
+      if (
+        root.intent.witness !== 'scripted-coder-v1' ||
+        root.intent.role !== 'worker' ||
+        !root.intent.detached ||
+        !['node-tests', 'desktop'].includes(root.intent.owner.stage) ||
+        root.acknowledgment?.pid !== process.pid ||
+        root.acknowledgment.group !== process.pid ||
+        root.terminal ||
+        root.exitEvent ||
+        root.spawnFailed
+      )
+        return;
+      const fd = openSync(
+        join(context.directory, marker.id),
+        constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW,
+      );
+      try {
+        writeSync(fd, `${JSON.stringify({ type: 'fixture-exit', pid: process.pid, code })}\n`);
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+    } catch {
+      // An absent witness keeps crash-time ownership unknown.
+    }
+  });
+}
 
 export function checkEnvironment(): NodeJS.ProcessEnv {
   const context = checkOwner();
@@ -101,8 +169,10 @@ export function enrollCheckRoot(
   role: Role,
   detached: boolean,
   explicit?: CheckOwner,
+  scriptedEntrypoint?: string,
 ): {
   environment: NodeJS.ProcessEnv;
+  preload?: string;
   acknowledge: (child: ChildProcess) => void;
   failed: () => void;
 } {
@@ -125,13 +195,33 @@ export function enrollCheckRoot(
       closeSync(fd);
     }
   };
-  append({ type: 'intent', owner: context, role, detached } satisfies Intent, true);
+  const witness =
+    role === 'worker' &&
+    detached &&
+    ['node-tests', 'desktop'].includes(context.stage) &&
+    scriptedEntrypoint === coderEntrypoint
+      ? ('scripted-coder-v1' as const)
+      : undefined;
+  append(
+    {
+      type: 'intent',
+      owner: context,
+      role,
+      detached,
+      ...(witness ? { witness } : {}),
+    } satisfies Intent,
+    true,
+  );
   let acknowledged = false;
   let failed = false;
   return {
     environment: {
       [variable]: JSON.stringify({ ...context, parentGroup: detached ? 0 : context.parentGroup }),
+      ...(witness
+        ? { [witnessVariable]: JSON.stringify({ id: `${id}.jsonl`, entrypoint: coderEntrypoint }) }
+        : {}),
     },
+    ...(witness ? { preload: import.meta.url } : {}),
     acknowledge(child) {
       if (acknowledged || failed) throw Error('Check launch was acknowledged twice.');
       let persistenceFailed = false;
@@ -238,7 +328,15 @@ function readRoot(context: CheckOwner, name: string): CheckRoot {
   const first = rows[0] as Intent;
   if (
     first.type !== 'intent' ||
-    Object.keys(first).sort().join(',') !== 'detached,owner,role,type' ||
+    Object.keys(first).sort().join(',') !==
+      (first.witness === undefined
+        ? 'detached,owner,role,type'
+        : 'detached,owner,role,type,witness') ||
+    (first.witness !== undefined &&
+      (first.witness !== 'scripted-coder-v1' ||
+        first.role !== 'worker' ||
+        !first.detached ||
+        !['node-tests', 'desktop'].includes(first.owner?.stage))) ||
     typeof first.detached !== 'boolean' ||
     !['stage', 'fixture', 'worker', 'check', 'controller', 'electron', 'watcher'].includes(
       first.role,
@@ -264,7 +362,7 @@ function readRoot(context: CheckOwner, name: string): CheckRoot {
       throw Error('Incomplete failed check launch.');
     result.spawnFailed = true;
   }
-  if (rows.length > 3) throw Error('Duplicate check ownership record.');
+  if (rows.length > 4) throw Error('Duplicate check ownership record.');
   if (rows.length >= 2 && !result.spawnFailed) {
     const ack = rows[1] as Acknowledgment;
     if (
@@ -279,8 +377,22 @@ function readRoot(context: CheckOwner, name: string): CheckRoot {
       throw Error('Invalid check process acknowledgment.');
     result.acknowledgment = ack;
   }
-  if (rows.length === 3) {
-    const terminal = rows[2] as Terminal;
+  let terminalIndex = 2;
+  if (rows[2]?.type === 'fixture-exit') {
+    const event = rows[2] as NonNullable<CheckRoot['exitEvent']>;
+    if (
+      Object.keys(event).sort().join(',') !== 'code,pid,type' ||
+      !integer(event.code) ||
+      !integer(event.pid)
+    )
+      throw Error('Invalid worker exit event.');
+    result.exitEvent = event;
+    if (!qualifiedWorkerExit(result)) throw Error('Unbound worker exit event.');
+    terminalIndex = 3;
+  }
+  if (rows.length > terminalIndex + 1) throw Error('Duplicate check ownership record.');
+  if (rows.length > terminalIndex) {
+    const terminal = rows[terminalIndex] as Terminal;
     if (
       terminal.type !== 'close' ||
       Object.keys(terminal).sort().join(',') !== 'code,signal,type' ||

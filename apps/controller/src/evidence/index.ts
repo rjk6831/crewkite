@@ -21,7 +21,7 @@ import { hashCanonical } from '@crewkite/contracts/hash';
 import { syntheticCheckDefinition } from '@crewkite/testkit/repository';
 import { z } from 'zod';
 import type { ArtifactFiles } from '../artifacts/index.ts';
-import { type CheckOwner, parseCheckOwner } from '../host/check-ownership.ts';
+import { type CheckOwner, parseCheckOwner, qualifiedWorkerExit } from '../host/check-ownership.ts';
 import {
   type FileContent,
   type FileEntry,
@@ -295,6 +295,7 @@ const verificationRoot = z
       owner: checkOwner,
       role: z.enum(['stage', 'fixture', 'worker', 'check', 'controller', 'electron', 'watcher']),
       detached: z.boolean(),
+      witness: z.literal('scripted-coder-v1').optional(),
     }),
     acknowledgment: z
       .strictObject({ type: z.literal('ack'), pid: positiveInteger, group: positiveInteger })
@@ -306,8 +307,24 @@ const verificationRoot = z
         signal: signal.nullable(),
       })
       .optional(),
+    exitEvent: z
+      .strictObject({
+        type: z.literal('fixture-exit'),
+        pid: positiveInteger,
+        code: z.number().int().nonnegative(),
+      })
+      .optional(),
     spawnFailed: z.boolean(),
   })
+  .refine(
+    (root) =>
+      (!root.exitEvent || qualifiedWorkerExit(root)) &&
+      (!root.intent.witness ||
+        (root.intent.role === 'worker' &&
+          root.intent.detached &&
+          ['node-tests', 'desktop'].includes(root.intent.owner.stage))),
+    'Worker exit witness is not bound to its launch.',
+  )
   .refine(
     (root) => root.spawnFailed || (root.terminal?.code ?? 0) >= 0,
     'Only a failed spawn may report a negative terminal code.',
@@ -420,8 +437,8 @@ function verificationReport(
         (root.spawnFailed
           ? !!ack || root.intent.role === 'stage'
           : !ack ||
-            !root.terminal ||
-            (root.terminal.code === null && root.terminal.signal === null)) ||
+            (!root.terminal && !qualifiedWorkerExit(root)) ||
+            (!!root.terminal && root.terminal.code === null && root.terminal.signal === null)) ||
         (!!ack &&
           (ack.group !== (root.intent.detached ? ack.pid : context.parentGroup) ||
             (!root.intent.detached && !groups.has(ack.group)) ||

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn as spawnProcess, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import {
@@ -39,6 +39,7 @@ import {
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { createDemoFixtures, createTestClock, createTestIds } from '@crewkite/testkit';
 import { createSyntheticRepository, writeChallengeSolution } from '@crewkite/testkit/repository';
+import { fakeWorkerPath } from '@crewkite/testkit/worker';
 import { ArtifactFiles } from '../artifacts/index.ts';
 import {
   Controller,
@@ -60,6 +61,7 @@ import { type VerificationExecution, verificationCommand } from '../evidence/too
 import {
   checkOwner,
   enrollCheckRoot,
+  qualifiedWorkerExit,
   readCheckRoots,
   spawnCheckChild as spawn,
 } from '../host/check-ownership.ts';
@@ -779,6 +781,120 @@ test('candidate evidence requires unchanged bytes and completed checks', async (
       ?.group,
     owner.parentGroup,
   );
+  const witnessDirectory = join(directory, 'worker-exit');
+  mkdirSync(witnessDirectory);
+  const witnessOwner = { ...owner, directory: witnessDirectory };
+  const witnessTicket = enrollCheckRoot('worker', true, witnessOwner, fakeWorkerPath);
+  assert(witnessTicket.preload);
+  const witnessed = spawnProcess(
+    process.execPath,
+    [`--import=${witnessTicket.preload}`, fakeWorkerPath],
+    { detached: true, stdio: ['pipe', 'ignore', 'ignore'], env: witnessTicket.environment },
+  );
+  const witnessClosed = new Promise<void>((done) => witnessed.once('close', () => done()));
+  witnessTicket.acknowledge(witnessed);
+  witnessed.stdin.end();
+  try {
+    assert.equal(await closedWithin(witnessClosed), true);
+  } finally {
+    if (!groupAbsent(witnessed.pid ?? 0)) process.kill(-(witnessed.pid as number), 'SIGKILL');
+    assert.equal(await closedWithin(witnessClosed), true);
+  }
+  const witnessedRoot = readCheckRoots(witnessOwner)[0];
+  assert.equal(witnessedRoot.terminal?.code, 2);
+  assert.deepEqual(witnessedRoot.exitEvent, { type: 'fixture-exit', pid: witnessed.pid, code: 2 });
+  assert.equal(qualifiedWorkerExit(witnessedRoot), true);
+  assert.equal(groupAbsent(witnessed.pid ?? 0), true);
+  const witnessPath = join(witnessDirectory, witnessedRoot.id);
+  const witnessRows = readFileSync(witnessPath, 'utf8')
+    .trimEnd()
+    .split('\n')
+    .map((row) => JSON.parse(row));
+  const writeWitnessRows = (rows: unknown[]) =>
+    writeFileSync(witnessPath, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+  writeWitnessRows(witnessRows.slice(0, -1));
+  const witnessedExit = readCheckRoots(witnessOwner)[0];
+  assert.equal(witnessedExit.terminal, undefined);
+  assert.equal(qualifiedWorkerExit(witnessedExit), true);
+  for (const change of [
+    (rows: typeof witnessRows) => {
+      rows.splice(1, 1);
+    },
+    (rows: typeof witnessRows) => {
+      rows[2].pid += 1;
+    },
+    (rows: typeof witnessRows) => {
+      rows.push(rows[2]);
+    },
+    (rows: typeof witnessRows) => {
+      rows[0].role = 'fixture';
+    },
+    (rows: typeof witnessRows) => {
+      rows[0].owner.stage = 'policy';
+    },
+    (rows: typeof witnessRows) => {
+      [rows[2], rows[3]] = [rows[3], rows[2]];
+    },
+  ]) {
+    const rows = structuredClone(witnessRows);
+    change(rows);
+    writeWitnessRows(rows);
+    assert.throws(() => readCheckRoots(witnessOwner));
+  }
+  writeWitnessRows(witnessRows);
+  for (const acknowledge of [false, true]) {
+    const pendingDirectory = join(directory, `worker-exit-${acknowledge}`);
+    mkdirSync(pendingDirectory);
+    const pendingOwner = { ...owner, directory: pendingDirectory };
+    const ticket = enrollCheckRoot('worker', true, pendingOwner, fakeWorkerPath);
+    assert(ticket.preload);
+    const child = spawnProcess(process.execPath, [`--import=${ticket.preload}`, fakeWorkerPath], {
+      detached: true,
+      stdio: ['pipe', 'ignore', 'ignore'],
+      env: ticket.environment,
+    });
+    const closed = new Promise<void>((done) => child.once('close', () => done()));
+    if (acknowledge) {
+      ticket.acknowledge(child);
+      child.kill('SIGKILL');
+    } else child.stdin.end();
+    try {
+      assert.equal(await closedWithin(closed), true);
+    } finally {
+      if (!groupAbsent(child.pid ?? 0)) process.kill(-(child.pid as number), 'SIGKILL');
+      assert.equal(await closedWithin(closed), true);
+    }
+    const root = readCheckRoots(pendingOwner)[0];
+    assert.equal(root.exitEvent, undefined);
+    assert.equal(qualifiedWorkerExit(root), false);
+    assert.equal(groupAbsent(child.pid ?? 0), true);
+    if (acknowledge) {
+      assert.equal(root.terminal?.signal, 'SIGKILL');
+      const path = join(pendingDirectory, root.id);
+      writeFileSync(
+        path,
+        `${readFileSync(path, 'utf8').trimEnd().split('\n').slice(0, -1).join('\n')}\n`,
+      );
+      assert.equal(readCheckRoots(pendingOwner)[0].terminal, undefined);
+    }
+  }
+  const ineligibleDirectory = join(directory, 'worker-exit-ineligible');
+  mkdirSync(ineligibleDirectory);
+  for (const [role, detached, stage, entrypoint] of [
+    ['worker', true, 'node-tests', `${fakeWorkerPath}.custom`],
+    ['fixture', true, 'node-tests', fakeWorkerPath],
+    ['worker', false, 'node-tests', fakeWorkerPath],
+    ['worker', true, 'policy', fakeWorkerPath],
+  ] as const) {
+    const ticket = enrollCheckRoot(
+      role,
+      detached,
+      { ...owner, directory: ineligibleDirectory, stage },
+      entrypoint,
+    );
+    assert.equal(ticket.preload, undefined);
+    ticket.failed();
+  }
   const faultDirectory = join(directory, 'ownership-fault');
   mkdirSync(faultDirectory);
   const faultOwner = { ...owner, directory: faultDirectory };
@@ -1376,6 +1492,36 @@ test('candidate evidence requires unchanged bytes and completed checks', async (
   };
   const complete = record(execution);
   assert.equal(complete.evidence.passed, true);
+  const workerExit = structuredClone(execution);
+  workerExit.roots.push({
+    ...witnessedExit,
+    intent: { ...witnessedExit.intent, owner: { ...verificationOwner, stage: 'node-tests' } },
+  });
+  assert.equal(record(workerExit).evidence.passed, true);
+  for (const change of [
+    (value: VerificationExecution) => {
+      value.roots[value.roots.length - 1].intent.role = 'stage';
+    },
+    (value: VerificationExecution) => {
+      const event = value.roots[value.roots.length - 1].exitEvent;
+      assert(event);
+      event.pid += 1;
+    },
+    (value: VerificationExecution) => {
+      delete value.roots[value.roots.length - 1].acknowledgment;
+    },
+  ]) {
+    const value = structuredClone(workerExit);
+    change(value);
+    assert.throws(() => record(value));
+  }
+  const invalidClose = structuredClone(workerExit);
+  invalidClose.roots[invalidClose.roots.length - 1].terminal = {
+    type: 'close',
+    code: null,
+    signal: null,
+  };
+  assert.equal(record(invalidClose).evidence.passed, false);
   const failedSpawn = structuredClone(execution);
   failedSpawn.roots.push({
     ...missingRecord,
