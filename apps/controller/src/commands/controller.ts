@@ -1811,6 +1811,7 @@ export class Controller {
     return NativeHandoffTargetsSchema.parse(targets).map((target) => {
       const profile = this.profileFor(target.profileId);
       if (
+        profile.facts.family === 'local' ||
         !profile.facts.available ||
         !profile.client ||
         !profile.locationHash ||
@@ -2410,6 +2411,7 @@ export class Controller {
     profile: NativeProfileResolution,
     creditPolicy: NativePilotAppointment['creditPolicy'],
   ): Route | undefined {
+    if (profile.facts.family === 'local') throw Error('Local native launch is unavailable.');
     const receipt = this.store.receipt(`native-profile-route:${profile.facts.id}:${creditPolicy}`);
     if (!receipt) return;
     const artifact = ArtifactSchema.parse(receipt.result.entity);
@@ -2450,6 +2452,13 @@ export class Controller {
     try {
       const profile = this.profileFor(command.payload.profileId);
       const facts = NativeProfileSchema.parse(profile.facts);
+      if (facts.family === 'local' || !('creditPolicy' in command.payload))
+        return {
+          outcome: 'unsupported',
+          reason: 'native-profile-unavailable',
+          next: 'Local native launch is unavailable.',
+        };
+      const creditPolicy = command.payload.creditPolicy;
       if (facts.reason === 'provider-policy-restricted') return nativeProviderRestriction;
       if (
         !facts.available ||
@@ -2457,7 +2466,7 @@ export class Controller {
         !profile.environment ||
         !profile.locationHash ||
         facts.id !== command.payload.profileId ||
-        !facts.creditPolicies.some((policy) => policy === command.payload.creditPolicy)
+        !facts.creditPolicies.some((policy) => policy === creditPolicy)
       )
         return {
           outcome: 'blocked',
@@ -2558,8 +2567,7 @@ export class Controller {
           id: command.key.replaceAll('_', '-'),
           taskId: task.id,
           route: manualTargets?.find(
-            ({ target }) =>
-              target.profileId === facts.id && target.creditPolicy === command.payload.creditPolicy,
+            ({ target }) => target.profileId === facts.id && target.creditPolicy === creditPolicy,
           )?.route ??
             savedRoute ?? {
               id: this.id('rte'),
@@ -4226,6 +4234,7 @@ export class Controller {
             },
       ) ||
       input.model !== evaluation.reviewer.profile.model ||
+      evaluation.reviewer.profile.family !== 'openai' ||
       input.effort !== evaluation.reviewer.profile.effort ||
       saved.allowance.originalPolicyHash !== run.policy.hash ||
       saved.allowance.maximumTaskMs !== job.limitMinutes * 60000 ||
@@ -4884,6 +4893,7 @@ export class Controller {
       JSON.parse(this.artifacts.read(artifact.hash).toString('utf8')),
     );
     const profile = this.profileFor(plan.public.profileId);
+    if (profile.facts.family === 'local') throw Error('Local native launch is unavailable.');
     if (profile.facts.reason === 'provider-policy-restricted')
       throw Error('provider-policy-restricted');
     if (

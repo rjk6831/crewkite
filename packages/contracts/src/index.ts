@@ -147,6 +147,54 @@ export const GoogleNativeProfileSchema = AnthropicNativeProfileSchema.omit({
     z.literal('proceed-in-sandbox'),
   ]),
 });
+const localIdentifier = label.refine(
+  (value) => value.isWellFormed() && !/\p{Cc}/u.test(value),
+  'A Local model identifier cannot contain control characters.',
+);
+export const LocalModelBindingSchema = z.strictObject({
+  setupHash: HashSchema,
+  modelKey: localIdentifier,
+  instanceReference: localIdentifier,
+  modelSizeBytes: RevisionSchema.min(1),
+  artifactSha256: HashSchema,
+  quantization: z.literal('Q4_K_M'),
+});
+export const LocalNativeProfileSchema = z
+  .strictObject({
+    id: z.literal('local-file-v1'),
+    family: z.literal('local'),
+    displayName: label,
+    sdkVersion: z.literal('2.1.0'),
+    model: label,
+    modelBinding: LocalModelBindingSchema.nullable(),
+    billing: z.literal('local'),
+    contextLength: z.literal(8192),
+    maximumOutputTokens: z.literal(2048),
+    qualifiedAt: z.iso.date().nullable(),
+    maximumTaskMs: z.literal(300000),
+    maximumFileBytes: z.literal(65536),
+    maximumSubmissions: z.literal(1),
+    available: z.boolean(),
+    reason: z.enum([
+      'available',
+      'not-configured',
+      'unsupported-platform',
+      'connection-unavailable',
+      'model-setup-unavailable',
+      'qualification-pending',
+    ]),
+  })
+  .refine(
+    (profile) =>
+      profile.available
+        ? !!profile.modelBinding && ['available', 'qualification-pending'].includes(profile.reason)
+        : profile.reason !== 'available',
+    'An available Local profile needs its model binding and current availability.',
+  )
+  .refine(
+    (profile) => !profile.modelBinding || profile.model === profile.modelBinding.modelKey,
+    'A Local profile must name its bound model.',
+  );
 const acpIdentifier = label.refine(
   (value) => value.isWellFormed() && !/\p{Cc}/u.test(value),
   'Protocol identifiers must contain ordinary text.',
@@ -223,12 +271,13 @@ export const GoogleAcpProfileSchema = GoogleNativeProfileSchema.omit({
   .refine((profile) => profile.reason !== 'available' || profile.available);
 export const NativeProfileSchema = z.union([
   OpenAiNativeProfileSchema.refine(
-    (profile) => !['openai-repository-v1', 'google-acp-v1'].includes(profile.id),
+    (profile) => !['openai-repository-v1', 'google-acp-v1', 'local-file-v1'].includes(profile.id),
   ),
   AnthropicNativeProfileSchema,
   GoogleNativeProfileSchema,
   NativeRepositoryProfileSchema,
   GoogleAcpProfileSchema,
+  LocalNativeProfileSchema,
 ]);
 export const GoogleAcpBillingAttestationSchema = NativeBillingAttestationSchema.extend({
   quotaAccountConfirmed: z.literal(true),
@@ -375,6 +424,7 @@ export const NativeRunSchema = z
       })
       .optional(),
     acp: GoogleAcpSelectionSchema.optional(),
+    localModel: LocalModelBindingSchema.optional(),
   })
   .refine(
     (run) =>
@@ -403,7 +453,18 @@ export const NativeRunSchema = z
         : !run.repository && !run.execution,
     'A repository run needs its complete source scope and native execution profile.',
   )
-  .refine((run) => !run.handoff || NativeFileProfileIdSchema.safeParse(run.profileId).success);
+  .refine((run) => !run.handoff || NativeFileProfileIdSchema.safeParse(run.profileId).success)
+  .refine(
+    (run) =>
+      run.profileId === 'local-file-v1'
+        ? !!run.localModel &&
+          !!run.target &&
+          !run.billingAttestation &&
+          !run.permissionMode &&
+          !run.handoff
+        : !run.localModel,
+    'A Local file run needs its model binding and target without cloud account fields.',
+  );
 
 export const FamilySchema = z.enum(['openai', 'anthropic', 'google', 'local']);
 export const TaskStateSchema = z.enum([
@@ -879,7 +940,9 @@ const nativePreparationFields = {
 export const NativePreparationPayloadSchema = z.union([
   z.strictObject({
     ...nativePreparationFields,
-    profileId: label.refine((id) => !['openai-repository-v1', 'google-acp-v1'].includes(id)),
+    profileId: label.refine(
+      (id) => !['openai-repository-v1', 'google-acp-v1', 'local-file-v1'].includes(id),
+    ),
     billingAttestation: NativeBillingAttestationSchema.optional(),
     permissionMode: GoogleNativePermissionModeSchema.optional(),
     targetPath: NativeTargetPathSchema,
@@ -898,6 +961,13 @@ export const NativePreparationPayloadSchema = z.union([
     billingAttestation: GoogleAcpBillingAttestationSchema,
     permissionMode: z.literal('request-review'),
     targetPath: NativeTargetPathSchema,
+  }),
+  z.strictObject({
+    taskId: TaskIdSchema,
+    profileId: z.literal('local-file-v1'),
+    targetPath: NativeTargetPathSchema,
+    policy: PolicySchema,
+    consent: z.enum(['explicit', 'saved']),
   }),
 ]);
 const nativeHandoffPreparationFields = {
@@ -1257,7 +1327,7 @@ export const SnapshotSchema = z
     googleAcpSetup: GoogleAcpSetupSchema.nullable().default(null),
     nativeProfiles: z
       .array(NativeProfileSchema)
-      .max(5)
+      .max(6)
       .refine((profiles) => new Set(profiles.map((profile) => profile.id)).size === profiles.length)
       .default([]),
     nativeRuns: z.array(NativeRunSchema).max(10000).default([]),

@@ -527,11 +527,13 @@ export async function runCli(
         { profiles: snapshot.nativeProfiles },
         snapshot.nativeProfiles
           .map((profile) =>
-            profile.family !== 'openai'
-              ? `${profile.id}  ${profile.model}  ${profile.effort} requested effort  effective effort unknown  account class unknown  service tier unknown  ${profile.available ? 'available' : profile.reason}  ${profile.qualifiedAt ? `qualified ${profile.qualifiedAt}` : 'qualification pending'}  billing requires user attestation${profile.family === 'google' ? `  permission modes ${profile.permissionModes.join(', ')}` : ''}`
-              : profile.id === 'openai-repository-v1'
-                ? `${profile.id}  ${profile.model}  ${profile.effort}  ${profile.available ? 'available' : profile.reason}  ${profile.qualifiedAt ? `qualified ${profile.qualifiedAt}` : 'qualification pending'}  workspace-write  approval never  network off`
-                : `${profile.id}  ${profile.model}  ${profile.effort}  ${profile.available ? 'available' : profile.reason}`,
+            profile.family === 'local'
+              ? `${profile.id}  ${profile.model}  local resources  native launch unavailable`
+              : profile.family !== 'openai'
+                ? `${profile.id}  ${profile.model}  ${profile.effort} requested effort  effective effort unknown  account class unknown  service tier unknown  ${profile.available ? 'available' : profile.reason}  ${profile.qualifiedAt ? `qualified ${profile.qualifiedAt}` : 'qualification pending'}  billing requires user attestation${profile.family === 'google' ? `  permission modes ${profile.permissionModes.join(', ')}` : ''}`
+                : profile.id === 'openai-repository-v1'
+                  ? `${profile.id}  ${profile.model}  ${profile.effort}  ${profile.available ? 'available' : profile.reason}  ${profile.qualifiedAt ? `qualified ${profile.qualifiedAt}` : 'qualification pending'}  workspace-write  approval never  network off`
+                  : `${profile.id}  ${profile.model}  ${profile.effort}  ${profile.available ? 'available' : profile.reason}`,
           )
           .join('\n') || 'No native profiles.',
       );
@@ -739,6 +741,7 @@ export async function runCli(
     }
     if (action === 'prepare-native') {
       const profile = snapshot.nativeProfiles.find((profile) => profile.id === extra[0]);
+      if (profile?.family === 'local') throw new Error('Local native launch is unavailable.');
       if (profile?.id === 'openai-repository-v1')
         throw new Error('Use task prepare-repository for repository work.');
       if (!profile?.available)

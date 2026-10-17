@@ -32,6 +32,7 @@ import {
   CommandSchema,
   canonicalJson,
   GoogleNativeProfileSchema,
+  LocalNativeProfileSchema,
   NativeRepositoryProfileSchema,
   ProjectSchema,
   RunSchema,
@@ -2830,7 +2831,7 @@ async function nativeSetup(
   let onSpawn: ((phase: string) => void) | undefined;
   let onInput: ((message: { method?: string }, phase: string) => void) | undefined;
   let onWritten: typeof onInput;
-  const reviewerProfile: NativeProfileResolution = {
+  const reviewerProfile = {
     ...unavailableNativeProfile(),
     facts: {
       ...unavailableNativeProfile().facts,
@@ -2846,9 +2847,9 @@ async function nativeSetup(
     },
     environment: { ...process.env },
     locationHash: '1'.repeat(64),
-  };
+  } satisfies NativeProfileResolution;
   const { maximumFileBytes: _fileLimit, ...repositoryFields } = unavailableNativeProfile().facts;
-  const fixtureProfile: NativeProfileResolution = anthropic
+  const fixtureProfile = anthropic
     ? {
         ...reviewerProfile,
         facts: AnthropicNativeProfileSchema.parse({
@@ -3327,6 +3328,54 @@ function nativeCandidate(controller: Controller) {
 }
 
 test('an appointed native proposal is retained and applied once after every phase stops', async (t) => {
+  const local = await nativeSetup(t, 'success', {
+    nativeProfiles: () => [
+      {
+        facts: LocalNativeProfileSchema.parse({
+          id: 'local-file-v1',
+          family: 'local',
+          displayName: 'Local fixture',
+          sdkVersion: '2.1.0',
+          model: 'local-fixture',
+          modelBinding: {
+            setupHash: 'a'.repeat(64),
+            modelKey: 'local-fixture',
+            instanceReference: 'local-instance',
+            modelSizeBytes: 1,
+            artifactSha256: 'b'.repeat(64),
+            quantization: 'Q4_K_M',
+          },
+          billing: 'local',
+          contextLength: 8192,
+          maximumOutputTokens: 2048,
+          qualifiedAt: null,
+          maximumTaskMs: 300000,
+          maximumFileBytes: 65536,
+          maximumSubmissions: 1,
+          available: true,
+          reason: 'qualification-pending',
+        }),
+      },
+    ],
+  });
+  const beforeLocal = local.controller.snapshot();
+  const refusedLocal = await local.controller.execute(
+    local.command(
+      'PrepareNativeRun',
+      {
+        taskId: local.task.id,
+        profileId: 'local-file-v1',
+        targetPath: 'net.mjs',
+        policy: local.appointment.policy,
+        consent: 'explicit',
+      },
+      local.task.revision,
+    ),
+    'local-owner',
+  );
+  assert.equal(refusedLocal.outcome, 'unsupported');
+  assert.deepEqual(local.controller.snapshot(), beforeLocal);
+  assert.equal(local.controller.store.intents().length, 0);
   for (const permissionMode of [
     'request-review',
     'strict',

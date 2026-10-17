@@ -40,6 +40,8 @@ Google contracts separate quota consent from ACP setup and frozen model selectio
 
 The quota reader uses a durable metadata-operation journal, separate from task attempts. Intent precedes spawn; ownership and closed streams bind the result to that operation. Active or unknown Google ownership blocks another read and native Google Start in that controller home. Restart never replays an operation or signals a historical PID. Disabling consent revokes in-flight authority and discards late results. Each admitted read has a sixty-second cooldown, including failure, and a twenty-second process bound. No timer refreshes quota. Failed reads preserve the prior window timestamps. Every returned bucket attaches conservatively to Google routes; the quota-only row has unknown model and effort and remains unqualified. A read cannot enable a writer. ACP setup and pre-admission refresh remain planned consumers of this gate.
 
+Local launch contracts bind the model artifact, loaded instance and setup receipt separately from cloud account fields. Local preparation accepts no cloud billing attestation or credit policy. Its controller launch handlers remain unavailable.
+
 Every mutation carries a protocol version, an idempotency key, the expected entity revision and a validated payload. The controller stores a digest of each request with its receipt.
 
 - Retrying the same key with the same content returns the stored result.
