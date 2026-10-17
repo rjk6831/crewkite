@@ -40,11 +40,13 @@ import {
   type Observation,
   type Route,
   RunSchema,
+  type Task,
   TaskConversationStateSchema,
   TaskSchema,
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
 import type { createDemoFixtures } from '@crewkite/testkit';
+import { writeChallengeSolution } from '@crewkite/testkit/repository';
 import { fakeWorkerPath } from '@crewkite/testkit/worker';
 import { ArtifactFiles } from '../artifacts/index.ts';
 import {
@@ -2862,7 +2864,7 @@ let plan;const emit=value=>process.stdout.write(JSON.stringify(value)+'\\n');
 const finish=value=>{emit(value);process.stdin.destroy();};
 createInterface({input:process.stdin}).on('line',line=>{const value=JSON.parse(line);
 if(!plan){plan=value;if(plan.kind==='discovery'){finish({type:'discovery',terminal:{kind:'observed',binding:plan.binding,observation}});return;}emit({type:'ready',binding:plan.binding});return;}
-const content='export function netMinor() { return 0; }\\n';const proof={stopReason:value==='stop'?'userStopped':'eosFound',promptTokens:1,predictedTokens:1,renderedPromptTokens:1,outputBytes:Buffer.byteLength(content),contextLength:8192,maxTokens:2048,contextOverflowPolicy:'stopAtLimit',draftModel:''};
+const content=process.argv[2];const proof={stopReason:value==='stop'?'userStopped':'eosFound',promptTokens:1,predictedTokens:1,renderedPromptTokens:1,outputBytes:Buffer.byteLength(content),contextLength:8192,maxTokens:2048,contextOverflowPolicy:'stopAtLimit',draftModel:''};
 if(value==='submit'&&mode==='hold')return;
 if(value==='submit'&&mode==='client-loss'){process.stdin.destroy();return;}
 if(value==='submit'&&mode==='unknown'){finish({type:'terminal',terminal:{kind:'unknown',binding:plan.binding,reason:'ownership'}});return;}
@@ -2873,7 +2875,15 @@ if(value==='submit')finish({type:'terminal',terminal:{kind:'completed',binding:p
     _args: readonly string[],
     settings: SpawnOptionsWithoutStdio,
   ) => {
-    const child = spawn(executable, ['-e', clientPeer, mode], settings);
+    let content = 'export function netMinor() { return 0; }\n';
+    if (mode === 'checked') {
+      const solution = join(context.directory, 'local-solution');
+      mkdirSync(solution, { recursive: true });
+      writeFileSync(join(solution, 'net.mjs'), '');
+      writeChallengeSolution(solution);
+      content = readFileSync(join(solution, 'net.mjs'), 'utf8');
+    }
+    const child = spawn(executable, ['-e', clientPeer, mode, content], settings);
     children.push(new Promise<void>((done) => child.once('close', () => done())));
     const write = child.stdin.write.bind(child.stdin);
     child.stdin.write = ((chunk: string | Uint8Array) => {
@@ -2902,7 +2912,53 @@ if(value==='submit')finish({type:'terminal',terminal:{kind:'completed',binding:p
     }) as typeof child.stdin.write;
     return child;
   }) as typeof spawnProcess;
+  const reviewer = {
+    ...unavailableNativeProfile(),
+    facts: {
+      ...unavailableNativeProfile().facts,
+      available: true,
+      reason: 'available',
+      model: fixtureModel,
+      clientVersion: process.version,
+    },
+    client: { executable: process.execPath, sha256: fixtureClientHash, version: process.version },
+    environment: { ...process.env },
+    locationHash: '1'.repeat(64),
+  } satisfies NativeProfileResolution;
   const options: Partial<ControllerOptions> = {
+    ...(initialMode === 'checked'
+      ? ({
+          identity: { name: 'Fixture owner', email: 'owner@example.invalid' },
+          nativeProfile: () => reviewer,
+          nativeSpawn: (executable, args, settings) => {
+            const activeController = reopened ?? context.controller;
+            const phase =
+              args.at(-1) === 'list'
+                ? 'features'
+                : activeController.store
+                      .intents()
+                      .flatMap((intent) =>
+                        activeController.store.nativeProcesses(intent.attempt_id),
+                      )
+                      .filter((value) => value.state === 'intent')
+                      .at(-1)?.phase === 'metadata-preparation'
+                  ? 'prepare'
+                  : 'task';
+            const script = fixture
+              .replace(
+                'const path = message.params.outputSchema.properties.path.const;',
+                'const path = message.params.outputSchema.properties.path?.const;',
+              )
+              .replace(
+                'const edit = {version:1,attemptId:message.params.outputSchema.properties.attemptId.const,path,baseHash:message.params.outputSchema.properties.baseHash.const,content:content(path)};',
+                "const edit = {version:1,bindingHash:message.params.outputSchema.properties.bindingHash.const,methodId:message.params.outputSchema.properties.methodId.const,cycle:1,outcome:'passed',findings:[],summary:'The Local replacement meets its bounded criteria.'};",
+              );
+            const child = spawn(executable, ['-e', script, 'success', phase], settings);
+            children.push(new Promise<void>((done) => child.once('close', () => done())));
+            return child;
+          },
+        } satisfies Partial<ControllerOptions>)
+      : {}),
     localInputHelper: {
       root: resolve('internal'),
       sha256: 'a'.repeat(64),
@@ -3119,7 +3175,7 @@ test('an appointed native proposal is retained and applied once after every phas
   assert.equal(refusedLocal.reason, 'local-model-unavailable');
   assert.deepEqual(local.controller.snapshot(), beforeLocal);
   assert.equal(local.controller.store.intents().length, 0);
-  const connectedLocal = await localControllerFixture(t);
+  const connectedLocal = await localControllerFixture(t, 'checked');
   assert.equal((await connectedLocal.started()).outcome, 'applied');
   connectedLocal.clock.advance(60000);
   await nativeWait('Local completed writer', connectedLocal.terminal);
@@ -3201,6 +3257,156 @@ test('an appointed native proposal is retained and applied once after every phas
     localCandidate.hash,
   );
   assert.equal(connectedLocal.submissions(), 1);
+  const localRevision = () => taskRevision(retainedLocal, connectedLocal.task.id);
+  const localSend = (name: string, payload: object) =>
+    retainedLocal.execute(connectedLocal.command(name, payload, localRevision()), 'local-owner');
+  const localPayload = {
+    taskId: connectedLocal.task.id,
+    candidateId: localCandidate.id,
+    checkRecipeId: 'node-tests-v1',
+    reviewer: { profileId: 'openai-file-v1', methodId: 'keep-it-simple', cycles: 1 },
+    consent: 'explicit',
+    grants: [
+      { action: 'run-check', target: 'node --test' },
+      { action: 'run-review', target: 'keep-it-simple/cycle-1' },
+    ].map((grant) => ({
+      ...grant,
+      taskId: connectedLocal.task.id,
+      revoked: false,
+      usesRemaining: 1,
+      expiresAt: new Date(Date.parse(connectedLocal.clock.now()) + 86400000).toISOString(),
+    })),
+  };
+  const localIntent = retainedLocal.store
+    .intents()
+    .find((intent) => intent.run_id === connectedLocal.run.id);
+  assert(localIntent);
+  const terminalReceipt = retainedLocal.store.receipt(`local-terminal:${localIntent.attempt_id}`);
+  assert(terminalReceipt);
+  const terminalArtifact = ArtifactSchema.parse(terminalReceipt.result.entity);
+  const files = new ArtifactFiles(join(retainedLocal.home, 'artifacts'));
+  const terminalBytes = files.read(terminalArtifact.hash);
+  const terminalProof = JSON.parse(terminalBytes.toString());
+  for (const change of [
+    { known: false },
+    { terminal: { ...terminalProof.terminal, kind: 'unknown', reason: 'ownership' } },
+    { bindingHash: '0'.repeat(64) },
+    {
+      terminal: {
+        ...terminalProof.terminal,
+        binding: { ...terminalProof.terminal.binding, generation: localIntent.generation + 1 },
+      },
+    },
+  ]) {
+    const altered = {
+      id: connectedLocal.id('art'),
+      ...files.publish(Buffer.from(canonicalJson({ ...terminalProof, ...change }))),
+      mediaType: 'application/vnd.crewkite.native+json',
+    };
+    retainedLocal.store.transaction(() => {
+      retainedLocal.store.put('artifact', altered.id, 0, altered);
+      retainedLocal.store.db
+        .prepare('UPDATE receipts SET result=? WHERE command_key=?')
+        .run(
+          canonicalJson({ outcome: 'applied', entity: altered }),
+          `local-terminal:${localIntent.attempt_id}`,
+        );
+    });
+    assert.equal((await localSend('PrepareCandidateEvaluation', localPayload)).outcome, 'blocked');
+  }
+  retainedLocal.store.transaction(() =>
+    retainedLocal.store.db
+      .prepare('UPDATE receipts SET result=? WHERE command_key=?')
+      .run(canonicalJson(terminalReceipt.result), `local-terminal:${localIntent.attempt_id}`),
+  );
+  writeFileSync(join(retainedLocal.home, 'artifacts', terminalArtifact.hash), '{}');
+  assert.equal((await localSend('PrepareCandidateEvaluation', localPayload)).outcome, 'blocked');
+  writeFileSync(join(retainedLocal.home, 'artifacts', terminalArtifact.hash), terminalBytes);
+  const localScratch = join(retainedLocal.home, 'scratch', connectedLocal.run.id, 'net.mjs');
+  const retainedLocalBytes = readFileSync(localScratch);
+  appendFileSync(localScratch, '\n');
+  assert.equal((await localSend('PrepareCandidateEvaluation', localPayload)).outcome, 'blocked');
+  writeFileSync(localScratch, retainedLocalBytes);
+  const originalTask = retainedLocal.store.get<Task>('task', connectedLocal.task.id);
+  assert(originalTask);
+  const otherRun = { ...connectedLocal.run, id: connectedLocal.id('run') };
+  retainedLocal.store.transaction(() => {
+    retainedLocal.store.put('run', otherRun.id, 0, otherRun);
+    retainedLocal.store.put('task', originalTask.id, originalTask.revision, {
+      ...originalTask,
+      runId: otherRun.id,
+    });
+  });
+  assert.equal((await localSend('PrepareCandidateEvaluation', localPayload)).outcome, 'blocked');
+  retainedLocal.store.transaction(() =>
+    retainedLocal.store.put('task', originalTask.id, originalTask.revision, originalTask),
+  );
+  const localEvaluation = await localSend('PrepareCandidateEvaluation', localPayload);
+  assert.equal(localEvaluation.outcome, 'applied', JSON.stringify(localEvaluation));
+  const localPreparation = ArtifactSchema.parse(localEvaluation.entity);
+  const localStart = {
+    taskId: connectedLocal.task.id,
+    candidateId: localCandidate.id,
+    preparationId: localPreparation.id,
+  };
+  for (const action of ['StartCandidateEvaluation', 'StartCandidateReview']) {
+    const finished = Promise.withResolvers<void>();
+    const off = retainedLocal.subscribe((event) => {
+      if (
+        event.type === 'task.updated' &&
+        ['stopped', 'ready', 'failed', 'unknown'].includes(event.payload.state)
+      )
+        finished.resolve();
+    });
+    const started = await localSend(action, localStart);
+    assert.equal(started.outcome, 'applied', JSON.stringify(started));
+    await nativeWait(`Local ${action} completion`, finished.promise);
+    off();
+  }
+  assert.equal(
+    retainedLocal.snapshot().tasks.find((task) => task.id === originalTask.id)?.state,
+    'ready',
+  );
+  assert.equal(retainedLocal.snapshot().candidateEvaluations[0]?.localAcceptance.available, true);
+  assert.equal(
+    retainedLocal.store.receipt(`native-completion:${localIntent.attempt_id}`),
+    undefined,
+  );
+  assert.equal(connectedLocal.submissions(), 1);
+  const destinationRef = 'refs/heads/feat/local-checked';
+  const askedLocal = await localSend('AcceptCandidate', {
+    taskId: originalTask.id,
+    candidateId: localCandidate.id,
+    destinationRef,
+  });
+  const localApproval = retainedLocal
+    .snapshot()
+    .approvals.find((value) => value.status === 'pending');
+  assert(localApproval);
+  assert.equal(localApproval.attemptId, localIntent.attempt_id);
+  assert.equal(
+    (await localSend('ResolveApproval', { binding: binding(localApproval), decision: 'approved' }))
+      .outcome,
+    'applied',
+    JSON.stringify(askedLocal),
+  );
+  assert.equal(
+    retainedLocal.snapshot().tasks.find((task) => task.id === originalTask.id)?.state,
+    'accepted',
+  );
+  const localAccepted = git(connectedLocal.source.directory, ['rev-parse', destinationRef])
+    .toString()
+    .trim();
+  assert.equal(
+    git(connectedLocal.source.directory, ['rev-parse', `${localAccepted}^`])
+      .toString()
+      .trim(),
+    connectedLocal.run.source.base,
+  );
+  assert.equal(
+    git(connectedLocal.source.directory, ['show', `${destinationRef}:net.mjs`]).toString(),
+    readFileSync(join(retainedLocal.home, 'scratch', connectedLocal.run.id, 'net.mjs'), 'utf8'),
+  );
   const checkPermissionMode = async (permissionMode: string) => {
     const context = await nativeSetup(t, `google-${permissionMode}`);
     let controller = context.controller;

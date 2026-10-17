@@ -724,6 +724,9 @@ const LocalPreparedSchema = z.strictObject({
   expiresAt: TimestampSchema,
 });
 type LocalPrepared = z.infer<typeof LocalPreparedSchema>;
+type EvaluationWriterPreparation =
+  | LocalPrepared
+  | z.infer<typeof NativeHistoricalPreparationSchema>;
 type LocalWriterRuntime = {
   plan: LocalPrepared;
   binding: LocalStart['binding'];
@@ -7839,7 +7842,7 @@ export class Controller {
                 state: 'stopped',
                 waitingReason: null,
                 next: applied
-                  ? 'Local replacement retained. Inspect Changes or export; checks and qualification remain pending.'
+                  ? 'Local replacement retained. Prepare separate checks and review before acceptance.'
                   : 'Local work stopped without an applied replacement.',
               });
           })
@@ -8776,6 +8779,161 @@ export class Controller {
     return barrier;
   }
 
+  private evaluationPreparation(run: Run, candidate: Candidate): EvaluationWriterPreparation {
+    const origin = this.nativeRecord(this.currentNativePlanKey(run.id));
+    const local = LocalPreparedSchema.safeParse(origin.value);
+    if (local.success) {
+      this.localWriterEvidence(local.data, candidate);
+      return local.data;
+    }
+    const plan = NativeHistoricalPreparationSchema.parse(origin.value);
+    this.nativeManualHistory(plan);
+    this.anthropicWriterEvidence(plan);
+    this.googleWriterEvidence(plan);
+    this.nativeRepositoryEvidence(plan, candidate);
+    this.nativeAcpEvidence(plan, candidate);
+    return plan;
+  }
+
+  private localWriterEvidence(plan: LocalPrepared, candidate: Candidate) {
+    const same = (left: unknown, right: unknown) => hashCanonical(left) === hashCanonical(right);
+    const origin = this.nativeRecord(`local-prepared:${plan.run.id}`);
+    const retained = this.nativeRecord(`native-run:${plan.run.id}`);
+    const binding = LocalBindingSchema.parse({
+      ...plan.localModel,
+      attemptId: plan.attempt.id,
+      generation: plan.attempt.generation,
+      profileHash: hashCanonical(plan.profile),
+      sourceHash: plan.scopeHash,
+      path: plan.target.path,
+      baseHash: plan.target.baseHash,
+    });
+    const terminal = this.nativeRecord(`local-terminal:${plan.attempt.id}`);
+    const proof = z
+      .strictObject({
+        attemptId: AttemptSchema.shape.id,
+        bindingHash: HashSchema,
+        terminal: LocalTerminalSchema,
+        clientQuiescent: z.literal(true),
+        known: z.literal(true),
+        unspawned: z.literal(false),
+        at: TimestampSchema,
+      })
+      .parse(terminal.value);
+    const submission = z
+      .strictObject({
+        attemptId: AttemptSchema.shape.id,
+        bindingHash: HashSchema,
+        scopeHash: HashSchema,
+      })
+      .parse(
+        this.nativeRecord(`native-submission:${plan.attempt.id}`, 4096, 'outcome-unknown').value,
+      );
+    const application = z
+      .strictObject({
+        attemptId: AttemptSchema.shape.id,
+        terminalHash: HashSchema,
+        manifest: LocalPreparedSchema.shape.manifest,
+      })
+      .parse(this.nativeRecord(`native-application:${plan.attempt.id}`).value);
+    const route = this.store.get<Route>('route', plan.attempt.routeId);
+    const expectedScope = hashCanonical({
+      profile: plan.profile,
+      endpoint: plan.endpoint,
+      localModel: plan.localModel,
+      source: plan.run.source,
+      manifest: plan.manifest,
+      target: plan.target,
+      context: plan.context,
+      policy: plan.run.policy.policy,
+    });
+    if (
+      !same(origin.value, plan) ||
+      retained.artifact.hash !== origin.artifact.hash ||
+      this.store.receipt(`native-run:${plan.run.id}`)?.hash !== retained.artifact.hash ||
+      this.store.receipt(`local-prepared:${plan.run.id}`)?.hash !== origin.artifact.hash ||
+      plan.scopeHash !== expectedScope ||
+      plan.run.decision.inputsHash !== expectedScope ||
+      plan.run.decision.chosen !== plan.attempt.routeId ||
+      plan.attempt.runId !== plan.run.id ||
+      candidate.taskId !== plan.run.taskId ||
+      plan.profile.id !== 'local-file-v1' ||
+      plan.profile.family !== 'local' ||
+      !('modelBinding' in plan.profile) ||
+      !same(plan.profile.modelBinding, plan.localModel) ||
+      plan.localModel.connectionHash !==
+        hashCanonical({
+          connector: plan.localModel.connectorId,
+          endpoint: plan.endpoint,
+          connectionRevision: plan.localModel.connectionRevision,
+        }) ||
+      !route ||
+      route.fake ||
+      route.family !== 'local' ||
+      route.billing !== 'local' ||
+      route.model !== plan.localModel.modelKey ||
+      proof.attemptId !== plan.attempt.id ||
+      proof.bindingHash !== hashCanonical(binding) ||
+      proof.terminal.kind !== 'completed' ||
+      !same(proof.terminal.binding, binding) ||
+      proof.terminal.proof.stopReason !== 'eosFound' ||
+      proof.terminal.proposal.attemptId !== plan.attempt.id ||
+      proof.terminal.proposal.path !== plan.target.path ||
+      proof.terminal.proposal.baseHash !== plan.target.baseHash ||
+      submission.attemptId !== plan.attempt.id ||
+      submission.bindingHash !== proof.bindingHash ||
+      submission.scopeHash !== plan.scopeHash ||
+      application.attemptId !== plan.attempt.id ||
+      application.terminalHash !== terminal.artifact.hash ||
+      !same(application.manifest, plan.manifest) ||
+      !this.store.nativePhasesComplete(plan.attempt.id, 'local') ||
+      this.store.nativeProcesses(plan.attempt.id).some((phase) => phase.state !== 'quiescent') ||
+      this.store.db
+        .prepare('SELECT attempt_id FROM writer_leases WHERE attempt_id=?')
+        .get(plan.attempt.id) ||
+      this.store.db
+        .prepare('SELECT attempt_id FROM reservations WHERE attempt_id=?')
+        .get(plan.attempt.id)
+    )
+      throw Error('Local writer evidence is incomplete.');
+    const source = committedFiles(
+      this.projectPath(plan.run.source.projectId) as string,
+      plan.run.source.base,
+    );
+    if (
+      !same(
+        source.map(({ content: _content, ...file }) => file),
+        plan.manifest,
+      )
+    )
+      throw Error('Local source manifest changed.');
+    const target = this.evidence
+      .read(candidate)
+      .files.find((file) => file.path === plan.target.path);
+    if (
+      !target ||
+      target.hash !== createHash('sha256').update(proof.terminal.proposal.content).digest('hex')
+    )
+      throw Error('Local candidate does not match its completed replacement.');
+    this.nativeReviewSource(plan, candidate);
+    const grant = plan.run.policy.policy.effects.find(
+      (value) =>
+        value.action === 'write-scratch' &&
+        value.taskId === plan.run.taskId &&
+        value.target === this.store.get<Project>('project', plan.run.source.projectId)?.name &&
+        !value.revoked &&
+        value.usesRemaining === 1,
+    );
+    const consumed = grant && this.store.receipt(this.grantKey(grant));
+    if (
+      !grant ||
+      consumed?.hash !== hashCanonical(grant) ||
+      (consumed.result.entity as Run | undefined)?.id !== plan.run.id ||
+      this.store.receipt(`allocation:${plan.run.id}`)?.hash !== plan.scopeHash
+    )
+      throw Error('Local writer admission evidence changed.');
+  }
+
   private evaluationOrigin(taskId: string, candidateId: string, ownedAttemptId?: string) {
     const task = this.store.get<Task>('task', taskId);
     const run = task?.runId ? this.store.get<Run>('run', task.runId) : undefined;
@@ -8796,40 +8954,39 @@ export class Controller {
         )
     )
       throw Error('Evaluation needs the current stopped candidate.');
-    const origin = this.store.receipt(this.currentNativePlanKey(run.id));
-    const artifact = ArtifactSchema.parse(origin?.result.entity);
-    if (artifact.bytes > MAX_FRAME_BYTES) throw Error('Native origin exceeds its bound.');
-    const plan = NativeHistoricalPreparationSchema.parse(
-      JSON.parse(this.artifacts.read(artifact.hash).toString('utf8')),
-    );
-    this.nativeManualHistory(plan);
-    this.anthropicWriterEvidence(plan);
-    this.googleWriterEvidence(plan);
-    this.nativeRepositoryEvidence(plan, candidate);
-    this.nativeAcpEvidence(plan, candidate);
+    const plan = this.evaluationPreparation(run, candidate);
     const writer = this.store.get<Attempt>('attempt', plan.attempt.id);
-    const completionArtifact = ArtifactSchema.parse(
-      this.store.receipt(`native-completion:${plan.attempt.id}`)?.result.entity,
-    );
-    if (completionArtifact.bytes > 4096) throw Error('Native completion exceeds its bound.');
-    const completion = JSON.parse(this.artifacts.read(completionArtifact.hash).toString('utf8'));
+    const local = 'kind' in plan;
+    const completion = local
+      ? null
+      : this.nativeRecord(`native-completion:${plan.attempt.id}`, 4096).value;
+    const completed =
+      local ||
+      z
+        .object({ attemptId: z.string(), reason: z.null(), quiescent: z.literal(true) })
+        .parse(completion).attemptId === plan.attempt.id;
     if (
       !writer ||
       !this.attestedReviewWriter(run, candidate, writer) ||
-      completion.attemptId !== writer.id ||
-      completion.reason !== null ||
-      completion.quiescent !== true ||
-      !this.store.nativePhasesComplete(writer.id, plan.appointment.route.family) ||
+      !completed ||
+      !this.store.nativePhasesComplete(
+        writer.id,
+        local ? 'local' : plan.appointment.route.family,
+      ) ||
       this.store.receipt(
-        `${'acp' in plan.appointment ? 'native-acp-capture' : 'repository' in plan.appointment ? 'native-capture' : 'native-application'}:${writer.id}`,
+        `${!local && 'acp' in plan.appointment ? 'native-acp-capture' : !local && 'repository' in plan.appointment ? 'native-capture' : 'native-application'}:${writer.id}`,
       )?.result.outcome !== 'applied' ||
       plan.run.id !== run.id ||
       plan.run.taskId !== run.taskId ||
       hashCanonical(plan.run.policy) !== hashCanonical(run.policy) ||
       hashCanonical(plan.run.source) !== hashCanonical(run.source) ||
       hashCanonical(plan.run.roles) !== hashCanonical(run.roles) ||
-      plan.appointment.consent.criteriaHash !== hashCanonical(task.criteria) ||
-      (plan.public &&
+      (local
+        ? hashCanonical(plan.context) !==
+          hashCanonical({ title: task.title, outcome: task.outcome, criteria: task.criteria })
+        : plan.appointment.consent.criteriaHash !== hashCanonical(task.criteria)) ||
+      (!local &&
+        plan.public &&
         (plan.public.context.title !== task.title ||
           plan.public.context.outcome !== task.outcome)) ||
       hashCanonical(inspectSource(task.projectId, this.projectPath(task.projectId) as string)) !==
@@ -9218,9 +9375,8 @@ export class Controller {
     if (task?.state !== 'stopped' || active.length) return refused('not-stopped');
     if (Date.parse(plan.expiresAt) <= Date.parse(this.now())) return refused('expired');
     try {
-      const current = review
-        ? this.candidateReviewAuthority(artifact)
-        : this.evaluationAuthority(artifact);
+      if (review) this.candidateReviewAuthority(artifact);
+      else this.evaluationAuthority(artifact);
       const remaining = this.remaining(plan.run);
       const required = review ? 1 : 2;
       if (
@@ -9249,11 +9405,10 @@ export class Controller {
         );
         const decision = this.nativeDecision(
           {
-            ...current.native.appointment,
+            kind: 'candidate-review',
             route,
             maximumTaskMs: Math.min(300000, remaining.minutes * 60000),
             expiresAt: plan.expiresAt,
-            creditPolicy: plan.creditPolicy,
           },
           plan.run,
           true,
@@ -9420,10 +9575,8 @@ export class Controller {
           this.store.receipt(this.currentNativePlanKey(task.runId))?.result.entity,
         );
         if (nativeArtifact.bytes > MAX_FRAME_BYTES) return [];
-        const native = NativeHistoricalPreparationSchema.parse(
-          JSON.parse(this.artifacts.read(nativeArtifact.hash).toString('utf8')),
-        );
-        const appointment = native.appointment;
+        const native = this.evaluationPreparation(plan.run, plan.candidate);
+        const appointment = 'kind' in native ? { target: native.target } : native.appointment;
         const target =
           'target' in appointment
             ? this.evidence
@@ -9507,7 +9660,7 @@ export class Controller {
               : {
                   target: {
                     path: target?.path,
-                    baseHash: native.originalHash,
+                    baseHash: 'kind' in native ? native.target.baseHash : native.originalHash,
                     candidateContentHash: target?.hash,
                   },
                 }),
@@ -10341,16 +10494,14 @@ export class Controller {
     }
   }
 
-  private nativeReviewSource(
-    plan: z.infer<typeof NativeHistoricalPreparationSchema>,
-    candidate: Candidate,
-  ) {
+  private nativeReviewSource(plan: EvaluationWriterPreparation, candidate: Candidate) {
     const source = committedFiles(
       this.projectPath(plan.run.source.projectId) as string,
       plan.run.source.base,
     );
     const files = this.evidence.read(candidate).files;
-    const appointment = plan.appointment;
+    const local = 'kind' in plan;
+    const appointment = local ? { target: plan.target } : plan.appointment;
     if ('repository' in appointment) {
       if (
         hashCanonical(this.repositoryScope(plan.run.source.base, source)) !==
@@ -10390,19 +10541,21 @@ export class Controller {
         },
       };
     }
-    const first = plan.handoff
-      ? NativeHistoricalPreparationSchema.parse(
-          this.nativeRecord(`native-run:${plan.run.id}`).value,
-        )
-      : plan;
+    const first =
+      !local && plan.handoff
+        ? NativeHistoricalPreparationSchema.parse(
+            this.nativeRecord(`native-run:${plan.run.id}`).value,
+          )
+        : plan;
     const original = source.find((file) => file.path === appointment.target.path);
     const current = files.find((file) => file.path === appointment.target.path);
     if (
       !original ||
       !current ||
-      original.hash !== first.originalHash ||
-      !('target' in first.appointment) ||
-      original.hash !== first.appointment.target.baseHash ||
+      original.hash !== ('kind' in first ? first.target.baseHash : first.originalHash) ||
+      (!('kind' in first) &&
+        (!('target' in first.appointment) ||
+          original.hash !== first.appointment.target.baseHash)) ||
       current.mode !== original.mode ||
       hashCanonical(
         files
@@ -10423,12 +10576,8 @@ export class Controller {
   private nativePublicationEvidence(run: Run, candidate: Candidate) {
     const same = (left: unknown, right: unknown) => hashCanonical(left) === hashCanonical(right);
     const origin = this.nativeRecord(this.currentNativePlanKey(run.id));
-    const native = NativeHistoricalPreparationSchema.parse(origin.value);
-    this.nativeManualHistory(native);
-    this.anthropicWriterEvidence(native);
-    this.googleWriterEvidence(native);
-    this.nativeRepositoryEvidence(native, candidate);
-    this.nativeAcpEvidence(native, candidate);
+    const native = this.evaluationPreparation(run, candidate);
+    const local = 'kind' in native;
     const prepared = ArtifactSchema.parse(
       this.store.receipt(`evaluation-started:${run.id}`)?.result.entity,
     );
@@ -10469,11 +10618,14 @@ export class Controller {
         this.nativeRecord(`native-review-submission:${job.attemptId}`, 4096, 'outcome-unknown')
           .value,
       );
-    const submittedWriter = z
-      .strictObject({ attemptId: z.string(), plan: HashSchema })
-      .parse(
-        this.nativeRecord(`native-submission:${native.attempt.id}`, 4096, 'outcome-unknown').value,
-      );
+    const submittedWriter = local
+      ? null
+      : z
+          .strictObject({ attemptId: z.string(), plan: HashSchema })
+          .parse(
+            this.nativeRecord(`native-submission:${native.attempt.id}`, 4096, 'outcome-unknown')
+              .value,
+          );
     if (
       !writer ||
       !attempt ||
@@ -10487,13 +10639,17 @@ export class Controller {
       !same(native.run.policy, run.policy) ||
       !same(native.run.source, run.source) ||
       !same(native.run.roles, run.roles) ||
-      this.store.receipt(this.currentNativePlanKey(run.id))?.hash !==
-        hashCanonical(native.appointment) ||
+      (!local &&
+        this.store.receipt(this.currentNativePlanKey(run.id))?.hash !==
+          hashCanonical(native.appointment)) ||
       this.store.receipt(
-        `${'acp' in native.appointment ? 'native-acp-capture' : 'repository' in native.appointment ? 'native-capture' : 'native-application'}:${writer.id}`,
+        `${!local && 'acp' in native.appointment ? 'native-acp-capture' : !local && 'repository' in native.appointment ? 'native-capture' : 'native-application'}:${writer.id}`,
       )?.result.outcome !== 'applied' ||
-      native.appointment.consent.criteriaHash !== hashCanonical(evaluation.context.criteria) ||
-      (native.public &&
+      (local
+        ? !same(native.context, evaluation.context)
+        : native.appointment.consent.criteriaHash !== hashCanonical(evaluation.context.criteria)) ||
+      (!local &&
+        native.public &&
         !same(native.public.context, {
           title: evaluation.context.title,
           outcome: evaluation.context.outcome,
@@ -10502,8 +10658,9 @@ export class Controller {
       this.store.receipt(`native-review-started:${run.id}`)?.hash !== prepared.hash ||
       this.store.receipt(`native-review-input:${job.attemptId}`)?.hash !== record.artifact.hash ||
       this.store.receipt(`native-review-input:${job.attemptId}`)?.result.outcome !== 'applied' ||
-      submittedWriter.attemptId !== writer.id ||
-      submittedWriter.plan !== origin.artifact.hash ||
+      (!local &&
+        (submittedWriter?.attemptId !== writer.id ||
+          submittedWriter.plan !== origin.artifact.hash)) ||
       submission.attemptId !== job.attemptId ||
       submission.preparationHash !== prepared.hash ||
       submission.bindingHash !== hashCanonical(input.binding) ||
@@ -10561,7 +10718,9 @@ export class Controller {
     )
       throw Error('evidence-incomplete');
     for (const [owned, key, expectedFamily] of [
-      [writer, `native-completion:${writer.id}`, native.appointment.route.family],
+      ...(!local
+        ? [[writer, `native-completion:${writer.id}`, native.appointment.route.family] as const]
+        : []),
       [attempt, `native-review-completion:${attempt.id}`, 'openai'],
     ] as const) {
       const completed = z
@@ -10859,9 +11018,8 @@ export class Controller {
       // The evaluation grant permits one review within the original run budget.
       const decision = this.nativeDecision(
         {
-          ...prepared.native.appointment,
+          kind: 'candidate-review',
           route,
-          creditPolicy: plan.creditPolicy,
           maximumTaskMs: Math.min(300000, remaining.minutes * 60000),
           expiresAt: plan.expiresAt,
         },
@@ -11563,7 +11721,14 @@ export class Controller {
   }
 
   private nativeDecision(
-    appointment: NativePilotAppointment,
+    appointment:
+      | NativePilotAppointment
+      | {
+          kind: 'candidate-review';
+          route: Route;
+          maximumTaskMs: number;
+          expiresAt: string;
+        },
     run: Run,
     publicProfile = false,
   ): RouterDecision {
