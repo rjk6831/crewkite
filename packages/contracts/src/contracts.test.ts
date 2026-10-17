@@ -24,6 +24,12 @@ import {
   formatReviewTarget,
   GoogleAcpSetupSchema,
   GrantSchema,
+  LocalEndpointSchema,
+  LocalModelBindingSchema,
+  LocalModelObservationSchema,
+  LocalObservedModelBindingSchema,
+  LocalSetupReceiptSchema,
+  LocalSetupSchema,
   MinorAmountSchema,
   NativeBillingAttestationSchema,
   NativeHandoffPreviewSchema,
@@ -690,6 +696,363 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     usageReaders: [],
     googleAcpSetup: null,
   });
+  assert.equal(Object.hasOwn(SnapshotSchema.parse(oldSnapshot), 'localSetup'), false);
+  const localReceipt = {
+    version: 1,
+    runtimeVersion: 'fixture-runtime',
+    artifactSha256: 'c'.repeat(64),
+    artifactSizeBytes: 17,
+    quantization: 'fixture-quantization',
+    model: { modelKey: 'fixture-model', instanceReference: 'fixture-instance', modelSizeBytes: 17 },
+    contextLength: 8192,
+    residentLlms: 1,
+    embeddingInstances: 0,
+    draftModel: '',
+  };
+  assert.deepEqual(LocalSetupReceiptSchema.parse(localReceipt), localReceipt);
+  const localSetup = {
+    revision: 1,
+    connectionRevision: 1,
+    connectorId: 'local-sdk-v1',
+    endpoint: 'ws://127.0.0.1:1234',
+    setupHash: null,
+    connectionHash: 'b'.repeat(64),
+    secretConfigured: false,
+    operation: null,
+    observation: null,
+    selection: null,
+    generation: 'idle',
+    reason: 'connection-required',
+  };
+  assert.deepEqual(LocalSetupSchema.parse(localSetup), localSetup);
+  assert.deepEqual(SnapshotSchema.parse({ ...oldSnapshot, localSetup }).localSetup, localSetup);
+  assert.equal(SnapshotSchema.parse({ ...oldSnapshot, localSetup: null }).localSetup, null);
+  for (const kind of ['input', 'discovery'])
+    for (const state of ['intent', 'owned', 'stopping', 'unknown'])
+      assert(
+        LocalSetupSchema.safeParse({
+          ...localSetup,
+          operation: { kind, operationId: command.key, state },
+        }).success,
+      );
+  for (const state of ['idle', 'active', 'unknown'])
+    assert(LocalSetupSchema.safeParse({ ...localSetup, generation: state }).success);
+  assert(
+    LocalSetupSchema.safeParse({
+      ...localSetup,
+      endpoint: null,
+      setupHash: null,
+      connectionHash: null,
+      reason: 'unconfigured',
+    }).success,
+  );
+  for (const extra of [
+    { revision: -1 },
+    { connectionRevision: -1 },
+    { connectorId: 'arbitrary-runtime' },
+    { revision: 1.5 },
+    { endpoint: null },
+    { connectionHash: null },
+    { endpoint: null, setupHash: null, connectionHash: null, secretConfigured: true },
+    { operation: { kind: 'input', state: 'owned', operationId: null } },
+    { operation: { kind: 'input', state: 'idle', operationId: command.key } },
+    { operation: { kind: 'input', state: 'unknown', operationId: command.key, group: 123 } },
+    { generation: 'recovered' },
+    { reason: 'raw SDK diagnostic' },
+    { token: 'synthetic-secret' },
+    { tokenHash: 'a'.repeat(64) },
+    { credential: 'synthetic-secret' },
+    { helperPath: '/arbitrary/helper' },
+  ])
+    assert.equal(LocalSetupSchema.safeParse({ ...localSetup, ...extra }).success, false);
+  for (const endpoint of ['ws://127.0.0.1:1', 'ws://127.0.0.1:65535'])
+    assert(LocalEndpointSchema.safeParse(endpoint).success);
+  for (const endpoint of [
+    'ws://localhost:1234',
+    'ws://127.1:1234',
+    'ws://[::1]:1234',
+    'wss://127.0.0.1:1234',
+    'ws://127.0.0.1:0',
+    'ws://127.0.0.1:01',
+    'ws://127.0.0.1:65536',
+    'ws://127.0.0.1:1234/',
+    'ws://127.0.0.1:1234?token=x',
+    'ws://127.0.0.1:1234\n',
+  ])
+    assert.equal(LocalEndpointSchema.safeParse(endpoint).success, false, endpoint);
+  for (const extra of [
+    { artifactSizeBytes: 0 },
+    { artifactSizeBytes: Number.MAX_SAFE_INTEGER + 1 },
+    { residentLlms: -1 },
+    { embeddingInstances: 0.5 },
+    { contextLength: 0 },
+    { runtimeVersion: 'invalid\nversion' },
+    { artifactSha256: 'invalid' },
+    { model: { ...localReceipt.model, token: 'synthetic-secret' } },
+    { token: 'synthetic-secret' },
+    { tokenHash: 'a'.repeat(64) },
+    { helperPath: '/arbitrary/helper' },
+  ])
+    assert.equal(LocalSetupReceiptSchema.safeParse({ ...localReceipt, ...extra }).success, false);
+  const observedIdentity = {
+    modelKey: 'observed-model',
+    displayName: 'Observed model',
+    format: 'gguf',
+    sizeBytes: 17,
+    quantization: { name: 'observed quantization', bits: 4 },
+    selectedVariant: null,
+    metadataHash: 'c'.repeat(64),
+  };
+  const observedChoice = {
+    selectionId: 'd'.repeat(64),
+    identity: observedIdentity,
+    instanceReference: 'observed-instance',
+    contextLength: 8192,
+    state: 'loaded-eligible',
+    reasons: [],
+    qualification: 'unqualified',
+  };
+  const observation = {
+    version: 1,
+    runtime: { connectorId: 'local-sdk-v1', version: 'observed-version', build: 1 },
+    observationHash: 'e'.repeat(64),
+    models: [observedChoice],
+    residentLlms: 1,
+    embeddingInstances: 0,
+  };
+  assert.deepEqual(LocalModelObservationSchema.parse(observation), observation);
+  assert(
+    LocalSetupSchema.safeParse({
+      ...localSetup,
+      setupHash: null,
+      secretConfigured: true,
+      observation,
+    }).success,
+  );
+  for (const identity of [
+    {
+      ...observedIdentity,
+      modelKey: 'another-present-model',
+      format: 'safetensors',
+      quantization: null,
+    },
+    { ...observedIdentity, format: 'observed-unsupported-format' },
+  ])
+    assert(
+      LocalModelObservationSchema.safeParse({
+        ...observation,
+        models: [
+          { ...observedChoice, identity, state: 'incompatible', reasons: ['unsupported-format'] },
+        ],
+      }).success,
+    );
+  for (const choice of [
+    {
+      ...observedChoice,
+      state: 'installed-unloaded',
+      instanceReference: null,
+      contextLength: null,
+    },
+    {
+      ...observedChoice,
+      state: 'incompatible',
+      instanceReference: null,
+      contextLength: null,
+      reasons: ['identity-ambiguous'],
+    },
+    { ...observedChoice, state: 'incompatible', reasons: ['not-downloaded'] },
+  ])
+    assert(LocalModelObservationSchema.safeParse({ ...observation, models: [choice] }).success);
+  const unloadedChoices = Array.from({ length: 64 }, (_, index) => ({
+    ...observedChoice,
+    selectionId: index.toString(16).padStart(64, '0'),
+    instanceReference: null,
+    contextLength: null,
+    state: 'installed-unloaded',
+  }));
+  assert(
+    LocalModelObservationSchema.safeParse({
+      ...observation,
+      models: unloadedChoices,
+      residentLlms: 0,
+    }).success,
+  );
+  const eightHandles = unloadedChoices.slice(0, 8).map((choice, index) => ({
+    ...choice,
+    state: 'incompatible',
+    instanceReference: `observed-${index}`,
+    contextLength: 8192,
+    reasons: ['multiple-resident-models'],
+  }));
+  assert(
+    LocalModelObservationSchema.safeParse({ ...observation, models: eightHandles, residentLlms: 8 })
+      .success,
+  );
+  for (const change of [
+    { models: [observedChoice, observedChoice] },
+    {
+      residentLlms: 2,
+      models: Array.from({ length: 2 }, (_, index) => ({
+        ...observedChoice,
+        selectionId: index.toString(16).padStart(64, '0'),
+        state: 'incompatible',
+        reasons: ['identity-ambiguous'],
+      })),
+    },
+    {
+      models: Array.from({ length: 65 }, (_, index) => ({
+        ...observedChoice,
+        selectionId: index.toString(16).padStart(64, '0'),
+      })),
+    },
+    {
+      models: Array.from({ length: 9 }, (_, index) => ({
+        ...observedChoice,
+        selectionId: index.toString(16).padStart(64, '0'),
+      })),
+    },
+    { residentLlms: 9 },
+    { residentLlms: 0 },
+    { residentLlms: 2 },
+    { embeddingInstances: 1 },
+    { embeddingInstances: 9 },
+    { runtime: { ...observation.runtime, build: -1 } },
+    { runtime: { ...observation.runtime, executable: '/arbitrary/runtime' } },
+    { models: [{ ...observedChoice, identity: { ...observedIdentity, modelKey: 'x\ny' } }] },
+    {
+      models: [
+        { ...observedChoice, identity: { ...observedIdentity, displayName: '界'.repeat(100) } },
+      ],
+    },
+    {
+      models: [
+        { ...observedChoice, identity: { ...observedIdentity, path: 'private/model.gguf' } },
+      ],
+    },
+    { models: [{ ...observedChoice, qualification: 'qualified' }] },
+    { models: [{ ...observedChoice, reasons: ['raw diagnostic'] }] },
+    { models: [{ ...observedChoice, reasons: ['busy', 'busy'] }] },
+    { models: [{ ...observedChoice, state: 'loaded-eligible', instanceReference: null }] },
+    { models: [{ ...observedChoice, contextLength: 32768 }] },
+    { models: [{ ...observedChoice, identity: { ...observedIdentity, format: 'unsupported' } }] },
+    { models: [{ ...observedChoice, state: 'incompatible', reasons: [] }] },
+    { models: [{ ...observedChoice, state: 'installed-unloaded' }] },
+    { tokenHash: 'a'.repeat(64) },
+  ])
+    assert.equal(
+      LocalModelObservationSchema.safeParse({ ...observation, ...change }).success,
+      false,
+    );
+  const selectedSetup = {
+    ...localSetup,
+    setupHash: 'a'.repeat(64),
+    observation,
+    selection: {
+      selectionId: observedChoice.selectionId,
+      observationHash: observation.observationHash,
+    },
+  };
+  assert(LocalSetupSchema.safeParse(selectedSetup).success);
+  for (const change of [
+    { selection: null },
+    { observation: null },
+    { setupHash: null },
+    { selection: { ...selectedSetup.selection, selectionId: 'f'.repeat(64) } },
+    { selection: { ...selectedSetup.selection, observationHash: 'f'.repeat(64) } },
+  ])
+    assert.equal(LocalSetupSchema.safeParse({ ...selectedSetup, ...change }).success, false);
+  assert(
+    LocalSetupSchema.safeParse({
+      ...selectedSetup,
+      reason: 'selection-stale',
+      selection: { ...selectedSetup.selection, observationHash: 'f'.repeat(64) },
+    }).success,
+  );
+  const observedBinding = {
+    version: 2,
+    identityKind: 'runtime-metadata',
+    setupHash: 'a'.repeat(64),
+    connectionHash: localSetup.connectionHash,
+    connectionRevision: localSetup.connectionRevision,
+    connectorId: 'local-sdk-v1',
+    runtimeVersion: 'observed-version',
+    runtimeBuild: 1,
+    modelKey: observedIdentity.modelKey,
+    instanceReference: 'observed-instance',
+    modelSizeBytes: 17,
+    format: 'gguf',
+    metadataHash: observedIdentity.metadataHash,
+  };
+  assert.deepEqual(LocalModelBindingSchema.parse(localModel), localModel);
+  for (const format of ['gguf', 'safetensors'])
+    assert.deepEqual(LocalObservedModelBindingSchema.parse({ ...observedBinding, format }), {
+      ...observedBinding,
+      format,
+    });
+  assert(
+    NativeProfileSchema.safeParse({
+      ...localProfile,
+      model: observedBinding.modelKey,
+      modelBinding: observedBinding,
+    }).success,
+  );
+  for (const extra of [
+    { artifactSha256: 'f'.repeat(64) },
+    { quantization: 'invented' },
+    { identityKind: 'artifact' },
+    { connectionRevision: -1 },
+    { connectionHash: undefined },
+    { format: 'unknown' },
+    { runtimeVersion: 'observed\nversion' },
+    { token: 'synthetic-secret' },
+    { path: 'private/model' },
+  ])
+    assert.equal(
+      LocalModelBindingSchema.safeParse({ ...observedBinding, ...extra }).success,
+      false,
+    );
+  for (const [name, payload] of [
+    ['ConfigureLocal', { endpoint: localSetup.endpoint }],
+    ['RefreshLocalModels', { consent: 'explicit' }],
+    ['SelectLocalModel', { selectionId: 'c'.repeat(64), observationHash: 'd'.repeat(64) }],
+    ['BeginLocalConnectionInput', { consent: 'explicit' }],
+    ['CancelLocalConnectionInput', { operationId: command.key }],
+    ['DisconnectLocal', {}],
+  ] as const) {
+    const request = { ...command, command: name, payload };
+    assert.deepEqual(CommandSchema.parse(request), request);
+    assert.equal(hashCanonical(CommandSchema.parse(request)), hashCanonical(request));
+    for (const extra of [
+      { token: 'synthetic-secret' },
+      { tokenHash: 'a'.repeat(64) },
+      { credential: 'synthetic-secret' },
+      { helperPath: '/arbitrary/helper' },
+      { setupRevision: 1 },
+    ])
+      assert.equal(
+        CommandSchema.safeParse({ ...request, payload: { ...payload, ...extra } }).success,
+        false,
+      );
+    for (const expectedRevision of [undefined, -1, 0.5, Number.MAX_SAFE_INTEGER + 1])
+      assert.equal(CommandSchema.safeParse({ ...request, expectedRevision }).success, false);
+    assert.equal(CommandSchema.safeParse({ ...request, key: 'arbitrary-key' }).success, false);
+  }
+  for (const [name, payload] of [
+    ['ConfigureLocal', { endpoint: localSetup.endpoint, receipt: localReceipt }],
+    ['RefreshLocalModels', { consent: 'saved' }],
+    ['SelectLocalModel', { selectionId: 'not-an-id', observationHash: 'd'.repeat(64) }],
+    ['SelectLocalModel', { selectionId: 'c'.repeat(64) }],
+    [
+      'SelectLocalModel',
+      { selectionId: 'c'.repeat(64), observationHash: 'd'.repeat(64), path: 'model.gguf' },
+    ],
+    ['BeginLocalConnectionInput', { consent: 'saved' }],
+    ['BeginLocalConnectionInput', { consent: 'explicit', operationId: command.key }],
+    ['BeginLocalConnectionInput', { consent: 'explicit', nonce: 'a'.repeat(64) }],
+    ['CancelLocalConnectionInput', {}],
+    ['CancelLocalConnectionInput', { operationId: 'arbitrary-key' }],
+  ] as const)
+    assert.equal(CommandSchema.safeParse({ ...command, command: name, payload }).success, false);
   assert.equal(
     SnapshotSchema.safeParse({ ...oldSnapshot, usageReaders: [reader, reader] }).success,
     false,
@@ -877,6 +1240,10 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     localModel,
   };
   assert.deepEqual(NativeRunSchema.parse(localRun), localRun);
+  assert.deepEqual(NativeRunSchema.parse({ ...localRun, localModel: observedBinding }), {
+    ...localRun,
+    localModel: observedBinding,
+  });
   for (const change of [
     { localModel: undefined },
     { target: undefined },

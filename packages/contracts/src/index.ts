@@ -152,7 +152,102 @@ const localIdentifier = label.refine(
   (value) => value.isWellFormed() && !/\p{Cc}/u.test(value),
   'A Local model identifier cannot contain control characters.',
 );
-export const LocalModelBindingSchema = z.strictObject({
+const localText = (max: number) =>
+  z
+    .string()
+    .min(1)
+    .max(max)
+    .refine(
+      (value) =>
+        value.isWellFormed() &&
+        !/\p{Cc}/u.test(value) &&
+        new TextEncoder().encode(value).length <= max,
+      'Local metadata needs bounded ordinary text.',
+    );
+export const LocalRuntimeIdentitySchema = z.strictObject({
+  connectorId: z.literal('local-sdk-v1'),
+  version: localText(128),
+  build: RevisionSchema,
+});
+export const LocalModelIdentitySchema = z.strictObject({
+  modelKey: localText(200),
+  displayName: localText(200),
+  format: localText(64),
+  sizeBytes: RevisionSchema.min(1),
+  quantization: z
+    .strictObject({ name: localText(64), bits: RevisionSchema.min(1).max(64) })
+    .nullable(),
+  selectedVariant: localText(200).nullable(),
+  metadataHash: HashSchema,
+});
+export const LocalModelChoiceSchema = z
+  .strictObject({
+    selectionId: HashSchema,
+    identity: LocalModelIdentitySchema,
+    instanceReference: localText(200).nullable(),
+    contextLength: RevisionSchema.min(1).nullable(),
+    state: z.enum(['installed-unloaded', 'loaded-eligible', 'incompatible']),
+    reasons: z
+      .array(
+        z.enum([
+          'unsupported-format',
+          'remote-model',
+          'identity-ambiguous',
+          'multiple-resident-models',
+          'resident-embedding',
+          'busy',
+          'context',
+          'draft',
+          'not-downloaded',
+        ]),
+      )
+      .max(8)
+      .refine((values) => new Set(values).size === values.length),
+    qualification: z.literal('unqualified'),
+  })
+  .refine(
+    (choice) =>
+      choice.state === 'installed-unloaded'
+        ? choice.instanceReference === null &&
+          choice.contextLength === null &&
+          choice.reasons.length === 0
+        : choice.state === 'loaded-eligible'
+          ? choice.instanceReference !== null &&
+            choice.contextLength === 8192 &&
+            ['gguf', 'safetensors'].includes(choice.identity.format) &&
+            choice.reasons.length === 0
+          : choice.reasons.length > 0,
+    'Local model state needs its observed instance and finite compatibility reasons.',
+  );
+const localProjectionFits = (value: unknown) =>
+  new TextEncoder().encode(JSON.stringify(value)).length <= 128 * 1024;
+export const LocalModelObservationSchema = z
+  .strictObject({
+    version: z.literal(1),
+    runtime: LocalRuntimeIdentitySchema,
+    observationHash: HashSchema,
+    models: z.array(LocalModelChoiceSchema).max(64),
+    residentLlms: RevisionSchema.max(8),
+    embeddingInstances: RevisionSchema.max(8),
+  })
+  .refine((value) => {
+    const handles = value.models.flatMap((model) =>
+      model.instanceReference === null ? [] : [model.instanceReference],
+    );
+    return (
+      new Set(value.models.map((model) => model.selectionId)).size === value.models.length &&
+      new Set(handles).size === handles.length &&
+      handles.length <= value.residentLlms &&
+      (!value.models.some((model) => model.state === 'loaded-eligible') ||
+        (value.residentLlms === 1 && value.embeddingInstances === 0)) &&
+      localProjectionFits(value)
+    );
+  }, 'Local discovery needs distinct choices within its handle and byte bounds.');
+export const LocalModelSelectionSchema = z.strictObject({
+  selectionId: HashSchema,
+  observationHash: HashSchema,
+});
+const legacyLocalModelBinding = z.strictObject({
   setupHash: HashSchema,
   modelKey: localIdentifier,
   instanceReference: localIdentifier,
@@ -160,6 +255,117 @@ export const LocalModelBindingSchema = z.strictObject({
   artifactSha256: HashSchema,
   quantization: z.literal('Q4_K_M'),
 });
+export const LocalObservedModelBindingSchema = z.strictObject({
+  version: z.literal(2),
+  identityKind: z.literal('runtime-metadata'),
+  setupHash: HashSchema,
+  connectionHash: HashSchema,
+  connectionRevision: RevisionSchema,
+  connectorId: z.literal('local-sdk-v1'),
+  runtimeVersion: localText(128),
+  runtimeBuild: RevisionSchema,
+  modelKey: localText(200),
+  instanceReference: localText(200),
+  modelSizeBytes: RevisionSchema.min(1),
+  format: z.enum(['gguf', 'safetensors']),
+  metadataHash: HashSchema,
+});
+export const LocalModelBindingSchema = z.union([
+  legacyLocalModelBinding,
+  LocalObservedModelBindingSchema,
+]);
+export const LocalEndpointSchema = z
+  .string()
+  .regex(/^ws:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}$/)
+  .refine(
+    (value) => value.trim() === value && Number(value.slice(value.lastIndexOf(':') + 1)) <= 65535,
+    'A Local endpoint needs a literal loopback address and valid port.',
+  );
+export const LocalSetupReceiptSchema = z.strictObject({
+  version: z.literal(1),
+  runtimeVersion: localIdentifier,
+  artifactSha256: HashSchema,
+  artifactSizeBytes: RevisionSchema.min(1),
+  quantization: localIdentifier,
+  model: z.strictObject({
+    modelKey: localIdentifier,
+    instanceReference: localIdentifier,
+    modelSizeBytes: RevisionSchema.min(1),
+  }),
+  contextLength: RevisionSchema.min(1),
+  residentLlms: RevisionSchema,
+  embeddingInstances: RevisionSchema,
+  draftModel: z.union([z.literal(''), localIdentifier]),
+});
+const localOperationFields = {
+  operationId: CommandIdSchema,
+  state: z.enum(['intent', 'owned', 'stopping', 'unknown']),
+};
+export const LocalOperationSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ ...localOperationFields, kind: z.literal('input') }),
+  z.strictObject({ ...localOperationFields, kind: z.literal('discovery') }),
+]);
+export const LocalSetupSchema = z
+  .strictObject({
+    revision: RevisionSchema,
+    connectionRevision: RevisionSchema,
+    connectorId: z.literal('local-sdk-v1'),
+    endpoint: LocalEndpointSchema.nullable(),
+    setupHash: HashSchema.nullable(),
+    connectionHash: HashSchema.nullable(),
+    secretConfigured: z.boolean(),
+    operation: LocalOperationSchema.nullable(),
+    generation: z.enum(['idle', 'active', 'unknown']),
+    observation: LocalModelObservationSchema.nullable(),
+    selection: LocalModelSelectionSchema.nullable(),
+    reason: z
+      .enum([
+        'unconfigured',
+        'connection-required',
+        'input-active',
+        'input-unknown',
+        'discovery-required',
+        'discovery-active',
+        'discovery-unknown',
+        'model-selection-required',
+        'model-unloaded',
+        'model-incompatible',
+        'selection-stale',
+        'generation-active',
+        'generation-unknown',
+        'capability-unavailable',
+        'setup-unavailable',
+        'qualification-pending',
+      ])
+      .nullable(),
+  })
+  .refine(
+    (setup) =>
+      setup.endpoint === null
+        ? setup.setupHash === null &&
+          setup.connectionHash === null &&
+          !setup.secretConfigured &&
+          !setup.operation &&
+          !setup.observation &&
+          !setup.selection
+        : setup.connectionHash !== null,
+    'A Local configuration needs its endpoint and exact setup identity.',
+  )
+  .refine(
+    (setup) =>
+      setup.selection === null
+        ? setup.setupHash === null
+        : setup.setupHash !== null &&
+          setup.observation !== null &&
+          (setup.reason === 'selection-stale' ||
+            (setup.selection.observationHash === setup.observation.observationHash &&
+              setup.observation.models.some(
+                (model) => model.selectionId === setup.selection?.selectionId,
+              ))),
+    'A selected Local setup needs its retained observation and choice identity.',
+  )
+  .refine(localProjectionFits, 'Local setup exceeds its encoded byte bound.');
+export type LocalSetup = z.infer<typeof LocalSetupSchema>;
 export const LocalNativeProfileSchema = z
   .strictObject({
     id: z.literal('local-file-v1'),
@@ -1366,6 +1572,12 @@ export const TaskConversationStateSchema = z
   });
 export type TaskConversationState = z.infer<typeof TaskConversationStateSchema>;
 export const CommandSchema = z.discriminatedUnion('command', [
+  mutate('ConfigureLocal', z.strictObject({ endpoint: LocalEndpointSchema })),
+  mutate('RefreshLocalModels', z.strictObject({ consent: z.literal('explicit') })),
+  mutate('SelectLocalModel', LocalModelSelectionSchema),
+  mutate('BeginLocalConnectionInput', z.strictObject({ consent: z.literal('explicit') })),
+  mutate('CancelLocalConnectionInput', z.strictObject({ operationId: CommandIdSchema })),
+  mutate('DisconnectLocal', empty),
   read('GetTaskConversationState', z.strictObject({ taskId: TaskIdSchema })),
   mutate(
     'CreateTaskDiscussion',
@@ -1728,6 +1940,7 @@ export const SnapshotSchema = z
   .strictObject({
     usageReaders: z.array(UsageReaderSchema).max(1).default([]),
     googleAcpSetup: GoogleAcpSetupSchema.nullable().default(null),
+    localSetup: LocalSetupSchema.nullable().optional(),
     nativeProfiles: z
       .array(NativeProfileSchema)
       .max(6)
