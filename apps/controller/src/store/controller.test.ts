@@ -908,9 +908,9 @@ test('candidate evidence requires unchanged bytes and completed checks', async (
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { writeFileSync } from 'node:fs';
-import { test } from 'node:test';
+import { test as fixtureTest } from 'node:test';
 import { checkOwner, spawnCheckChild } from ${JSON.stringify(helper)};
-test('attached fixture keeps the admitted stage group', async () => {
+fixtureTest('attached fixture keeps the admitted stage group', async () => {
   const owner = checkOwner();
   assert(owner);
   assert.equal(process.env.CREWKITE_CHECK_STAGE_ROOT, undefined);
