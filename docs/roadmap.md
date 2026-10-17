@@ -10,6 +10,7 @@ I deliver CrewKite in milestones that each make one claim I can test. Dates foll
 | D1a Supervised native work | One qualified official client works in scratch. I can inspect activity and approvals, stop truthfully, keep an edit, reopen it and export it | A real patch from one of my projects that is worth reopening the next day |
 | D1b Checked dogfood | Immutable candidates, independent checks and review, acceptance as a new local branch | A checked result branch with its evidence receipt |
 | D2 Daily-driver release 0.1 | Local, OpenAI, Anthropic and Google routes in useful roles, durable handoff, honest usage, finite review, two coding slices with a combined check, safe self-development | Ten real tasks from my own backlog, observed end to end |
+| D2b User acceptance and corrections | Real-work UAT, final testing and required fixes before distribution | User acceptance and final testing pass, required fixes are verified, and I explicitly approve starting D3 |
 | D3 Distribution | Package provenance, install, recovery, compatibility, notices, privacy and signing for a stated audience | A clean install on a machine that never saw the source tree |
 
 D1a is complete for the bounded OpenAI single-file profile. It supports an existing committed text file. A useful documentation task produced a retained patch. Later synthetic tasks passed normal desktop and fresh package launch, CLI export and same-home reopen. Stop retained interrupted work without applying it. The original source stayed unchanged. A separate Anthropic single-file pilot has passed normal desktop launch, CLI export, active Stop and same-home reopen with explicit confirmations about subscription login and disabled paid extra usage. The completed task also reopened through the Mac directory package without another submission; task state, source, scratch and package assets stayed unchanged. A Google single-file pilot has also passed normal desktop launch, CLI export and completed-task package reopen, with explicit expected native permissions and subscription confirmations. Its active Stop retained interrupted work without application. A subsequent read-only reopen verified the same interrupted state without another submission. Native handoff remains unavailable. Local acceptance follows the separate D1b evidence and permission path. General live routing and local inference still need qualification. Strict and native sandbox permissions remain unverified for Google. [Provider routes](providers.md) records the evidence and limits. The [CLI setup](../apps/cli/README.md#native-single-file-runs) describes preparation and export.
@@ -17,6 +18,8 @@ D1a is complete for the bounded OpenAI single-file profile. It supports an exist
 D1b is complete for one useful CrewKite repository task. A live OpenAI writer removed redundant completed check and review controls from the evaluation view. The Mac directory package ran all six fixed verification stages and all 40 tests against that immutable candidate. A fresh native review passed with zero findings and same-family process independence only. A separate destination-specific approval created the exact checked result on the local `feat/evaluation-outcomes` branch. The same home reopened with its branch and evidence intact, without another submission. The original checkout and index stayed unchanged. This meets the checked-result exit above. The recipe requires a matching registered source checkout with installed development dependencies and Electron. Live repository Stop and full profile qualification remain pending. D2's ten real tasks, broader routing and handoff remain open. D3 still requires a clean install on a machine that never saw the source tree.
 
 A two-provider demo is an intermediate step on the way to D2.
+
+I will pause after D2 for real-work user acceptance and final testing. D2b holds any required corrections and their verification. I will explicitly approve the move to D3 after this gate passes.
 
 ## Work packets
 
@@ -31,7 +34,7 @@ A two-provider demo is an intermediate step on the way to D2.
 | W6 to W8 | Anthropic, Google and local routes | Per-route qualification |
 | W9 | Continuity without a summary, usage controls | Ownership and budgets preserved across a handoff |
 | W10 | Two coding slices with a combined check | A combined failure blocks acceptance |
-| W11 and W12 | My D2 release, then distribution | The gates above and an explicit publication decision |
+| W11 and W12 | My D2 release, user acceptance, then distribution | The D2 exit, D2b acceptance and explicit approval for D3 |
 
 After W4, packets W5 through W9 run alongside each other against stable interfaces. One owner lands schema, migration, lockfile and entry-point changes. There are never concurrent migrations or competing schedulers.
 
