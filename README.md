@@ -30,7 +30,7 @@ I am building in the open for my own daily use first. Finished work and less man
 - Review the proposed plan, then separately prepare the execution source, permissions and finite limits.
 - Run bounded native work in independent scratch. Inspect Changes and export retained work without changing the original checkout.
 - Combine two scoped child candidates through ordered checks, then require a full combined check and separate review before destination-specific branch acceptance.
-- Show observed quota and context measurements with their source and freshness. Missing values stay unknown, and unsupported controls remain unavailable.
+- Show observed quota with its source and freshness. The composer currently reports context token use and capacity as unknown.
 
 The [provider notes](docs/providers.md) separate implemented paths from dated qualification. The bounded OpenAI workflow has historical checked-branch evidence. Local model eligibility, a Google quota read or a passing synthetic fixture supplies no live route qualification.
 
