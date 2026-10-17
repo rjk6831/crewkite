@@ -2551,12 +2551,15 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
       animations: 'disabled',
     });
     await enter(nativeDialog.getByRole('button', { name: 'Edit proposal', exact: true }));
-    await enter(nativeDialog.getByRole('button', { name: 'Scripted run', exact: true }));
-    await expect(
-      page.getByRole('dialog', { name: 'Configure this run', exact: true }),
-    ).toBeVisible();
+    await enter(nativeDialog.getByRole('button', { name: 'Provider choices', exact: true }));
+    const repositoryProfile = replacementProfiles.find(
+      (profile) => profile.id === 'openai-repository-v1',
+    );
+    assert(repositoryProfile);
     await enter(
-      page.getByRole('dialog').getByRole('button', { name: 'Repository work', exact: true }),
+      page
+        .getByRole('dialog', { name: 'Choose execution provider', exact: true })
+        .getByRole('button', { name: `Choose ${repositoryProfile.displayName}`, exact: true }),
     );
     await expect(nativeDialog.getByLabel('Committed file path', { exact: true })).toHaveCount(0);
     await expect(
