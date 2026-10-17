@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import { hashCanonical, sealHandoff } from './hash.ts';
 import {
@@ -8,11 +9,16 @@ import {
   CandidateEvaluationPreviewSchema,
   CheckEventSchema,
   CheckResultSchema,
+  CONVERSATION_CONTEXT_MEDIA_TYPE,
   CombinedNativeReviewJobSchema,
   CombinedOriginSchema,
   CombinedRunPreviewSchema,
   CommandResultSchema,
   CommandSchema,
+  ConversationContextBundleSchema,
+  ConversationContextPickSchema,
+  ConversationContextRefSchema,
+  ConversationContextRefsSchema,
   ConversationEntrySchema,
   ConversationPageSchema,
   ConversationPlanningSelectionSchema,
@@ -343,6 +349,124 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     }).success,
     false,
   );
+  const contextText = '\uFEFFsource text 界\r\n';
+  const contextFile = {
+    kind: 'source',
+    path: 'src/main.ts',
+    mode: '100644',
+    hash: createHash('sha256').update(contextText).digest('hex'),
+    bytes: Buffer.byteLength(contextText),
+    text: contextText,
+  };
+  const contextBundle = {
+    version: 1,
+    projectId: `prj_${suffix}`,
+    base: 'a'.repeat(40),
+    files: [contextFile],
+  };
+  assert.deepEqual(ConversationContextBundleSchema.parse(contextBundle), contextBundle);
+  assert.equal(
+    CONVERSATION_CONTEXT_MEDIA_TYPE,
+    'application/vnd.crewkite.conversation-context+json',
+  );
+  for (const change of [
+    { projectId: `tsk_${suffix}` },
+    { base: 'a'.repeat(39) },
+    { version: 2 },
+    { root: '/caller' },
+    { files: [] },
+    { files: Array(33).fill(contextFile) },
+    { files: [contextFile, contextFile] },
+    { files: [contextFile, { ...contextFile, path: 'SRC/main.ts' }] },
+    { files: [{ ...contextFile, path: 'src' }, contextFile] },
+    { files: [{ ...contextFile, path: 'src/z.ts' }, contextFile] },
+    {
+      files: [
+        { ...contextFile, path: 'src/e\u0301.ts' },
+        { ...contextFile, path: 'src/é.ts' },
+      ],
+    },
+    { files: [{ ...contextFile, bytes: contextFile.bytes - 1 }] },
+    { files: [{ ...contextFile, bytes: 8193, text: 'a'.repeat(8193) }] },
+    { files: [{ ...contextFile, bytes: 8193, text: '界'.repeat(2731) }] },
+    { files: [{ ...contextFile, text: '\ud800' }] },
+    { files: [{ ...contextFile, text: 'secret\0data' }] },
+    { files: [{ ...contextFile, text: 'hidden\u0085control' }] },
+    { files: [{ ...contextFile, mode: '120000' }] },
+    { files: [{ ...contextFile, hash: 'a'.repeat(63) }] },
+    { files: [{ ...contextFile, path: '.env' }] },
+    { files: [{ ...contextFile, path: '.aws/credentials' }] },
+    { files: [{ ...contextFile, path: 'node_modules/package/index.js' }] },
+    { files: [{ ...contextFile, path: '../outside' }] },
+    { files: [{ ...contextFile, path: '/absolute' }] },
+    { files: [{ ...contextFile, path: 'src/line\nbreak.ts' }] },
+    { files: [{ ...contextFile, path: `${'a/'.repeat(16)}file.ts` }] },
+    { files: [{ ...contextFile, kind: 'log', path: '.private/log.txt' }] },
+    { files: [{ ...contextFile, grants: [] }] },
+    {
+      files: [1, 2].map((index) => ({
+        ...contextFile,
+        path: `escaped${index}.ts`,
+        text: '\\'.repeat(8192),
+        bytes: 8192,
+      })),
+    },
+  ])
+    assert.equal(
+      ConversationContextBundleSchema.safeParse({ ...contextBundle, ...change }).success,
+      false,
+    );
+  const contextRef = { artifactId: `art_${suffix}`, hash: hashCanonical(contextBundle) };
+  assert.deepEqual(ConversationContextRefSchema.parse(contextRef), contextRef);
+  assert.deepEqual(ConversationContextRefsSchema.parse([contextRef]), [contextRef]);
+  for (const refs of [
+    [contextRef, contextRef],
+    Array(5).fill(contextRef),
+    [contextRef, { ...contextRef, hash: 'b'.repeat(64) }],
+    [contextRef, { ...contextRef, artifactId: combinedId('art', 1) }],
+    [{ ...contextRef, artifactId: `msg_${suffix}` }],
+    [{ ...contextRef, grants: [] }],
+  ])
+    assert.equal(ConversationContextRefsSchema.safeParse(refs).success, false);
+  const contextPick = { kind: 'source-file', path: '/project/src/main.ts' };
+  assert.deepEqual(ConversationContextPickSchema.parse(contextPick), contextPick);
+  for (const change of [
+    { kind: 'binary' },
+    { path: '../outside' },
+    { path: '/project/../outside' },
+    { path: '/project//file' },
+    { path: '/project/line\nbreak' },
+    { path: '/project/\ud800' },
+    { path: `/${'界'.repeat(1366)}` },
+    { contents: 'caller bytes' },
+  ])
+    assert.equal(
+      ConversationContextPickSchema.safeParse({ ...contextPick, ...change }).success,
+      false,
+    );
+  const captureContext = {
+    ...command,
+    command: 'CaptureConversationContext',
+    payload: {
+      projectId: contextBundle.projectId,
+      base: contextBundle.base,
+      selections: [contextPick],
+    },
+  };
+  assert.deepEqual(CommandSchema.parse(captureContext), captureContext);
+  for (const payload of [
+    { ...captureContext.payload, root: '/caller' },
+    { ...captureContext.payload, contents: 'caller bytes' },
+    { ...captureContext.payload, grants: [] },
+    { ...captureContext.payload, selections: [] },
+    { ...captureContext.payload, selections: [contextPick, contextPick] },
+    { ...captureContext.payload, selections: Array(5).fill(contextPick) },
+  ])
+    assert.equal(CommandSchema.safeParse({ ...captureContext, payload }).success, false);
+  assert.equal(
+    CommandSchema.safeParse({ ...captureContext, expectedRevision: undefined }).success,
+    false,
+  );
   const conversationBinding = {
     taskId: `tsk_${suffix}`,
     runId: `run_${suffix}`,
@@ -423,6 +547,32 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     binding: conversationBinding,
   };
   assert.deepEqual(ConversationEntrySchema.parse(conversationEntry), conversationEntry);
+  for (const kind of ['user-message', 'guidance', 'answer'] as const) {
+    const entry = {
+      id: `msg_${suffix}`,
+      taskId: conversationBinding.taskId,
+      revision: 1,
+      cursor: '1',
+      at: conversationEntry.at,
+      kind,
+      text: 'Use selected source.',
+      author: { kind: 'user' },
+      ...(kind === 'answer' ? { replyTo: conversationEntry.id } : {}),
+    };
+    assert.deepEqual(ConversationEntrySchema.parse(entry), entry);
+    assert.equal('context' in ConversationEntrySchema.parse(entry), false);
+    assert.equal(hashCanonical(ConversationEntrySchema.parse(entry)), hashCanonical(entry));
+    const attached = { ...entry, context: [contextRef] };
+    assert.deepEqual(ConversationEntrySchema.parse(attached), attached);
+    assert.equal(
+      ConversationEntrySchema.safeParse({ ...attached, context: [contextRef, contextRef] }).success,
+      false,
+    );
+  }
+  assert.equal(
+    ConversationEntrySchema.safeParse({ ...conversationEntry, context: [contextRef] }).success,
+    false,
+  );
   for (const change of [
     { id: `art_${suffix}` },
     { taskId: 'tsk_01ARZ3NDEKTSV4RRFFQ69G5FAW' },
@@ -464,6 +614,16 @@ test('process boundaries reject unknown fields and invalid command identity', ()
   ] as const) {
     const request = { ...command, command: name, payload };
     assert.deepEqual(CommandSchema.parse(request), request);
+    assert.equal('context' in CommandSchema.parse(request).payload, false);
+    const attached = { ...request, payload: { ...payload, context: [contextRef] } };
+    assert.deepEqual(CommandSchema.parse(attached), attached);
+    assert.equal(
+      CommandSchema.safeParse({
+        ...attached,
+        payload: { ...attached.payload, context: [contextRef, contextRef] },
+      }).success,
+      false,
+    );
     assert.equal(
       CommandSchema.safeParse({ ...request, payload: { ...payload, policy: {} } }).success,
       false,
@@ -518,6 +678,24 @@ test('process boundaries reject unknown fields and invalid command identity', ()
       false,
     );
   }
+  const attachedDiscussion = {
+    ...command,
+    command: 'CreateTaskDiscussion',
+    payload: {
+      projectId: contextBundle.projectId,
+      text: 'Use selected source.',
+      planning,
+      context: [contextRef],
+    },
+  };
+  assert.deepEqual(CommandSchema.parse(attachedDiscussion), attachedDiscussion);
+  assert.equal(
+    CommandSchema.safeParse({
+      ...attachedDiscussion,
+      payload: { ...attachedDiscussion.payload, context: Array(5).fill(contextRef) },
+    }).success,
+    false,
+  );
   const conversationState = {
     taskId: conversationBinding.taskId,
     revision: 0,

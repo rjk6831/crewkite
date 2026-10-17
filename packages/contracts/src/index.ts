@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { canonicalJson } from './canonical.ts';
 
 export const PROTOCOL_VERSION = 1;
 export const MAX_FRAME_BYTES = 1024 * 1024;
@@ -1381,6 +1382,126 @@ export const NativeHandoffPreparationPayloadSchema = z.union([
 ]);
 const conversationBytes = (value: unknown) =>
   new TextEncoder().encode(JSON.stringify(value)).length;
+export const CONVERSATION_CONTEXT_MEDIA_TYPE = 'application/vnd.crewkite.conversation-context+json';
+const contextBase = z.string().regex(/^[a-f0-9]{40}$/);
+const contextPath = NativeTargetPathSchema.refine(
+  (path) =>
+    new TextEncoder().encode(path).length <= 1024 &&
+    path.split('/').length <= 16 &&
+    !path
+      .split('/')
+      .some(
+        (part) =>
+          /^(?:\.git|\.hg|\.svn|node_modules|\.pnpm|\.yarn|\.ssh|\.aws|\.azure|\.gnupg|\.config|\.kube|\.docker|\.npmrc|\.netrc|\.pypirc|\.git-credentials|\.env(?:\..*)?|credentials(?:\..*)?|secrets?(?:\..*)?|id_rsa.*|id_ed25519.*)$/i.test(
+            part,
+          ) || /\.(?:pem|key|p12|pfx|keystore|keychain(?:-db)?)$/i.test(part),
+      ),
+  'Context needs a bounded source path outside excluded locations.',
+);
+const contextText = z
+  .string()
+  .min(1)
+  .max(8192)
+  .refine(
+    (value) =>
+      value.isWellFormed() &&
+      new TextEncoder().encode(value).length <= 8192 &&
+      ![...value].some((character) => {
+        const point = character.codePointAt(0) as number;
+        return (point < 32 && ![9, 10, 13].includes(point)) || (point >= 127 && point <= 159);
+      }),
+    'Context needs bounded UTF-8 text without binary control bytes.',
+  );
+const contextFile = z
+  .strictObject({
+    kind: z.enum(['source', 'log']),
+    path: contextPath,
+    mode: z.enum(['100644', '100755']),
+    hash: HashSchema,
+    bytes: RevisionSchema.min(1).max(8192),
+    text: contextText,
+  })
+  .refine(
+    (file) =>
+      file.bytes === new TextEncoder().encode(file.text).length &&
+      (file.kind !== 'log' || !file.path.split('/').some((part) => part.startsWith('.'))),
+    'Context byte counts must match complete text and logs cannot read hidden locations.',
+  );
+export const ConversationContextBundleSchema = z
+  .strictObject({
+    version: z.literal(1),
+    projectId: ProjectIdSchema,
+    base: contextBase,
+    files: z.array(contextFile).min(1).max(32),
+  })
+  .superRefine((bundle, context) => {
+    const seen = new Set<string>(),
+      prefixes = new Map<string, string>();
+    let valid = true;
+    for (const [index, file] of bundle.files.entries()) {
+      const key = file.path.normalize('NFC').toLowerCase();
+      if (
+        seen.has(key) ||
+        prefixes.has(key) ||
+        (index > 0 && bundle.files[index - 1].path >= file.path)
+      )
+        valid = false;
+      const parts = file.path.split('/');
+      for (let end = 1; end <= parts.length; end++) {
+        const prefix = parts.slice(0, end).join('/'),
+          canonical = prefix.normalize('NFC').toLowerCase();
+        if (
+          (end < parts.length && seen.has(canonical)) ||
+          (prefixes.has(canonical) && prefixes.get(canonical) !== prefix)
+        )
+          valid = false;
+        prefixes.set(canonical, prefix);
+      }
+      seen.add(key);
+    }
+    if (!valid || new TextEncoder().encode(canonicalJson(bundle)).length > 32768)
+      context.addIssue({
+        code: 'custom',
+        message: 'Context needs ordered collision-free paths and at most 32768 canonical bytes.',
+      });
+  });
+export const ConversationContextRefSchema = z.strictObject({
+  artifactId: ArtifactIdSchema,
+  hash: HashSchema,
+});
+export const ConversationContextRefsSchema = z
+  .array(ConversationContextRefSchema)
+  .max(4)
+  .refine(
+    (refs) =>
+      new Set(refs.map((ref) => ref.artifactId)).size === refs.length &&
+      new Set(refs.map((ref) => ref.hash)).size === refs.length,
+    'Context references need distinct artifact IDs and hashes.',
+  );
+export const ConversationContextPickSchema = z.strictObject({
+  kind: z.enum(['source-file', 'source-folder', 'log-file']),
+  path: z
+    .string()
+    .min(1)
+    .max(4096)
+    .refine(
+      (path) =>
+        path.startsWith('/') &&
+        path.isWellFormed() &&
+        !path.includes('\\') &&
+        !/\p{Cc}/u.test(path) &&
+        new TextEncoder().encode(path).length <= 4096 &&
+        !path
+          .split('/')
+          .slice(1)
+          .some((part) => !part || part === '.' || part === '..'),
+      'A native context pick needs an absolute bounded path.',
+    ),
+});
+export type ConversationContextBundle = z.infer<typeof ConversationContextBundleSchema>;
+export type ConversationContextRef = z.infer<typeof ConversationContextRefSchema>;
+export type ConversationContextRefs = z.infer<typeof ConversationContextRefsSchema>;
+export type ConversationContextPick = z.infer<typeof ConversationContextPickSchema>;
 export const ConversationTextSchema = z
   .string()
   .min(1)
@@ -1486,16 +1607,19 @@ export const ConversationEntrySchema = z
       ...conversationEntryFields,
       kind: z.literal('user-message'),
       author: conversationUser,
+      context: ConversationContextRefsSchema.optional(),
     }),
     z.strictObject({
       ...conversationEntryFields,
       kind: z.literal('guidance'),
       author: conversationUser,
+      context: ConversationContextRefsSchema.optional(),
     }),
     z.strictObject({
       ...conversationEntryFields,
       kind: z.literal('answer'),
       author: conversationUser,
+      context: ConversationContextRefsSchema.optional(),
       replyTo: MessageIdSchema,
     }),
     z.strictObject({
@@ -1740,6 +1864,22 @@ export const TaskConversationStateSchema = z
   });
 export type TaskConversationState = z.infer<typeof TaskConversationStateSchema>;
 export const CommandSchema = z.discriminatedUnion('command', [
+  mutate(
+    'CaptureConversationContext',
+    z.strictObject({
+      projectId: ProjectIdSchema,
+      base: contextBase,
+      selections: z
+        .array(ConversationContextPickSchema)
+        .min(1)
+        .max(4)
+        .refine(
+          (picks) =>
+            new Set(picks.map((pick) => `${pick.kind}:${pick.path}`)).size === picks.length,
+          'Native context picks must be distinct.',
+        ),
+    }),
+  ),
   mutate('ConfigureLocal', z.strictObject({ endpoint: LocalEndpointSchema })),
   mutate('RefreshLocalModels', z.strictObject({ consent: z.literal('explicit') })),
   mutate('SelectLocalModel', LocalModelSelectionSchema),
@@ -1753,6 +1893,7 @@ export const CommandSchema = z.discriminatedUnion('command', [
       projectId: ProjectIdSchema,
       text: ConversationTextSchema,
       planning: ConversationPlanningSelectionSchema,
+      context: ConversationContextRefsSchema.optional(),
     }),
   ),
   mutate(
@@ -1767,10 +1908,21 @@ export const CommandSchema = z.discriminatedUnion('command', [
     'GetTaskConversation',
     z.strictObject({ taskId: TaskIdSchema, beforeCursor: CursorSchema.optional() }),
   ),
-  mutate('SendTaskMessage', z.strictObject({ taskId: TaskIdSchema, text: ConversationTextSchema })),
+  mutate(
+    'SendTaskMessage',
+    z.strictObject({
+      taskId: TaskIdSchema,
+      text: ConversationTextSchema,
+      context: ConversationContextRefsSchema.optional(),
+    }),
+  ),
   mutate(
     'QueueTaskGuidance',
-    z.strictObject({ taskId: TaskIdSchema, text: ConversationTextSchema }),
+    z.strictObject({
+      taskId: TaskIdSchema,
+      text: ConversationTextSchema,
+      context: ConversationContextRefsSchema.optional(),
+    }),
   ),
   mutate(
     'AnswerTaskQuestion',
@@ -1778,6 +1930,7 @@ export const CommandSchema = z.discriminatedUnion('command', [
       taskId: TaskIdSchema,
       questionId: MessageIdSchema,
       text: ConversationTextSchema,
+      context: ConversationContextRefsSchema.optional(),
     }),
   ),
   mutate('RegisterProject', z.strictObject({ path: text })),
