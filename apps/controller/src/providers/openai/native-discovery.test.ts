@@ -38,7 +38,14 @@ const replies = {
   'config/read': { config, origins: { private: 'private-native-diagnostic' } },
   'configRequirements/read': { requirements: mode === 'policy-change' ? { featureRequirements: { plugins: true } } : null },
   'account/rateLimits/read': { ordinaryUsageAllowed: true, rateLimits: {} },
-  'model/list': { data: [], nextCursor: null },
+  'model/list': {
+    data: mode === 'empty-catalog' ? [] : [{
+      id: 'native-model', model: 'native-model',
+      supportedReasoningEfforts: [{ reasoningEffort: 'native-effort' }],
+      defaultReasoningEffort: 'native-effort',
+    }],
+    nextCursor: null,
+  },
 };
 const input = createInterface({ input: process.stdin });
 input.on('line', line => {
@@ -84,6 +91,7 @@ test('native discovery returns metadata only after its owned process and descend
       'trailing-partial',
       'maximum-bound',
       'descendant',
+      'empty-catalog',
       'invalid',
       'oversized',
       'stopped',
@@ -173,6 +181,10 @@ test('native discovery returns metadata only after its owned process and descend
       }
       if (mode === 'policy-change')
         assert.equal(result.lastRequest, 'configRequirements/read', mode);
+      if (mode === 'empty-catalog') {
+        assert.equal(result.lastRequest, 'model/list', mode);
+        assert.equal(result.reason, 'protocol', mode);
+      }
       for (const group of handle.groups) if (group > 0) assert(groupAbsent(group), mode);
       assert(!JSON.stringify(result).includes('private-native-diagnostic'), mode);
       if (
