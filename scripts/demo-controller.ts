@@ -82,6 +82,7 @@ export async function startDemoController(home: string) {
     throw new Error('The demo catalog is invalid.');
   const runtime = await startController({
     home: directory,
+    googleUsageClient: () => ({ available: false, reason: 'client-unavailable' }),
     routes: catalog.routes,
     observations: catalog.usage.map(({ observation }) => observation),
     identity:
