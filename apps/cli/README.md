@@ -7,6 +7,15 @@ pnpm crewkite task list --json
 pnpm crewkite health --json
 ```
 
+Register a Git checkout and create a draft task without opening the desktop:
+
+```sh
+pnpm crewkite project add /path/to/repository --json
+pnpm crewkite task create <project-id> --title "Repair the total" --outcome "Return the correct total" --criterion "The discount cannot make the total negative" --criterion "Invalid inputs are rejected" --json
+```
+
+Use the project ID returned by registration. Repeating registration for the same checkout returns the existing project. Task creation requires a title, an outcome and at least one `--criterion`. It creates a draft with no run or provider work. Preparation and Start remain separate actions.
+
 Task commands use IDs returned by the controller:
 
 | Command | Behavior |
@@ -31,7 +40,7 @@ Watch retains its cursor while the controller is offline. If the bounded reconne
 
 ## Native single-file runs
 
-Create the project and draft task in the desktop. List the controller's supported native profiles:
+Create the project and draft task through the commands above or the desktop. List the controller's supported native profiles:
 
 ```sh
 pnpm crewkite native profiles --json
@@ -39,7 +48,7 @@ pnpm crewkite native profiles --json
 
 The snapshot reports profile availability, its reason, client version, model, effort and bounds. OpenAI and Anthropic have bounded local native paths. Google consumer automatic launch reports `provider-policy-restricted` and refuses before native discovery. The [dated provider boundaries](../../docs/providers.md#current-availability) explain these restrictions. Anthropic and Google report requested effort separately from unobserved effective effort and service tier. A missing qualification date is shown as pending. Preparation requires an available profile ID. It accepts no executable, digest or model override.
 
-Save a policy JSON file using the existing policy schema. This example grants one scratch write and one export. Replace the sample task ID and project name with the desktop values, and choose a future expiration before preparing the run:
+Save a policy JSON file using the existing policy schema. This example grants one scratch write and one export. Replace the sample task ID and project name with the registered values, and choose a future expiration before preparing the run:
 
 ```json
 {

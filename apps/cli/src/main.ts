@@ -28,12 +28,15 @@ import {
   NativeHandoffTargetsSchema,
   PolicySchema,
   ProjectNodeTestFilesSchema,
+  ProjectSchema,
   type Snapshot,
   type Task,
   TaskSchema,
 } from '@crewkite/contracts';
 
-const help = `Usage: crewkite task <list|show|watch|start|stop|resume|switch|approve|deny> [id] [--json] [--home path]
+const help = `Usage: crewkite project add <path> [--json] [--home path]
+       crewkite task create <project-id> --title text --outcome text --criterion text [--criterion text ...] [--json] [--home path]
+       crewkite task <list|show|watch|start|stop|resume|switch|approve|deny> [id] [--json] [--home path]
        crewkite task switch <task-id> <route-id> [--json] [--home path]
        crewkite native profiles [--json] [--home path]
        crewkite task prepare-native <task-id> <profile-id> <path> --policy file [--native-trust --source-consent] [--existing-credits] [--confirm-subscription-only] [--permission-mode mode] [--handoff-target profile[:existing-credits] ...]
@@ -48,8 +51,8 @@ const help = `Usage: crewkite task <list|show|watch|start|stop|resume|switch|app
        crewkite health [--json] [--home path]
        crewkite retry <receipt-file> [--output new-file] [--json] [--home path]
 
-Approval commands take an approval ID. Other task commands take a task ID.
-Create tasks in the desktop. Native preparation uses explicit consent or the controller's exact saved consent.
+Approval commands take an approval ID. Task creation takes a project ID. Other task commands take a task ID.
+Project registration and task creation start no work. Native preparation uses explicit consent or the controller's exact saved consent.
 For an Anthropic or Google writer, --confirm-subscription-only confirms subscription login and disabled paid extra usage.
 File handoff targets are optional and permit only later explicit manual transfers within the original budget.
 Handoff preparation requires fresh consent; it starts no writer. Start is a separate command.
@@ -84,6 +87,9 @@ export async function runCli(
         json: { type: 'boolean' },
         home: { type: 'string' },
         help: { type: 'boolean', short: 'h' },
+        title: { type: 'string' },
+        outcome: { type: 'string' },
+        criterion: { type: 'string', multiple: true },
         policy: { type: 'string' },
         grants: { type: 'string' },
         recipe: { type: 'string' },
@@ -111,10 +117,11 @@ export async function runCli(
             (['prepare-evaluation', 'prepare-repository', 'prepare-handoff'].includes(action) &&
               extra.length === 1))
         )) ||
-      !['task', 'native', 'health', 'retry'].includes(area)
+      !['project', 'task', 'native', 'health', 'retry'].includes(area)
     )
       throw new Error('Unknown command. Use --help.');
     const supported = [
+      'create',
       'list',
       'show',
       'watch',
@@ -146,6 +153,26 @@ export async function runCli(
         (action === 'list' ? id !== undefined : id === undefined))
     )
       throw new Error('Invalid task command. Use --help.');
+    if (area === 'project' && (action !== 'add' || id === undefined))
+      throw new Error('Use project add with one repository path.');
+    const creatingTask = area === 'task' && action === 'create';
+    const addingProject = area === 'project' && action === 'add';
+    if (
+      !creatingTask &&
+      (values.title !== undefined || values.outcome !== undefined || values.criterion !== undefined)
+    )
+      throw new Error('Title, outcome and criteria require task create.');
+    if (
+      creatingTask &&
+      (!values.title?.trim() ||
+        !values.outcome?.trim() ||
+        !values.criterion?.length ||
+        values.criterion.some((criterion) => !criterion.trim()))
+    )
+      throw new Error(
+        'Task creation requires a title, outcome and at least one nonblank criterion.',
+      );
+    if (addingProject && !id?.trim()) throw new Error('Supply a nonblank repository path.');
     if (area === 'health' && action !== undefined)
       throw new Error('Health takes no positional arguments.');
     if (area === 'retry' && (!action || id !== undefined))
@@ -227,6 +254,30 @@ export async function runCli(
       throw new Error('Export requires --output with a new file path.');
     const home = resolve(values.home ?? process.env.CREWKITE_HOME ?? join(homedir(), '.crewkite'));
     const actor = { id: 'terminal', kind: 'cli' as const };
+    const creation =
+      addingProject || creatingTask
+        ? CommandSchema.safeParse({
+            protocol: 1,
+            key: createCommandKey(),
+            actor,
+            expectedRevision: 0,
+            command: addingProject ? 'RegisterProject' : 'CreateTask',
+            payload: addingProject
+              ? { path: resolve(id) }
+              : {
+                  projectId: id,
+                  title: values.title,
+                  outcome: values.outcome,
+                  criteria: values.criterion,
+                },
+          })
+        : undefined;
+    if (creation && !creation.success)
+      throw new Error(
+        addingProject
+          ? 'Repository paths must contain 1 to 4096 characters.'
+          : 'Use a project ID, a title up to 200 characters, an outcome up to 4096 characters and 1 to 100 criteria up to 4096 characters each.',
+      );
     const connected = await connectController({ ...readControllerEndpoint(home), actor });
     client = connected;
     let sent: Command | undefined;
@@ -252,7 +303,13 @@ export async function runCli(
       command = sent,
       savedTo?: string,
       nextCommand?: string[],
-    ) =>
+    ) => {
+      const created =
+        succeeded(result) && command?.command === 'RegisterProject'
+          ? ProjectSchema.safeParse(result.entity)
+          : succeeded(result) && command?.command === 'CreateTask'
+            ? TaskSchema.safeParse(result.entity)
+            : undefined;
       print(
         {
           command,
@@ -260,8 +317,9 @@ export async function runCli(
           ...(savedTo ? { savedTo } : {}),
           ...(nextCommand ? { nextCommand } : {}),
         },
-        `${nextCommand ? (command?.command === 'AcceptCandidate' ? 'Local branch approval required.' : 'Export approval required.') : (result.reason ?? result.outcome)}\nCommand key ${command?.key}${savedTo ? `\nPatch saved to ${savedTo}` : ''}${nextCommand ? `\nNext: ${nextCommand.map((arg) => `'${arg.replaceAll("'", "'\\''")}'`).join(' ')}` : ''}`,
+        `${nextCommand ? (command?.command === 'AcceptCandidate' ? 'Local branch approval required.' : 'Export approval required.') : (result.reason ?? result.outcome)}${created?.success ? `\n${command?.command === 'RegisterProject' ? 'Project' : 'Task'} ${created.data.id}` : ''}\nCommand key ${command?.key}${savedTo ? `\nPatch saved to ${savedTo}` : ''}${nextCommand ? `\nNext: ${nextCommand.map((arg) => `'${arg.replaceAll("'", "'\\''")}'`).join(' ')}` : ''}`,
       );
+    };
     const finishAction = async (result: CommandResult) => {
       const command = sent;
       let savedTo: string | undefined;
@@ -380,6 +438,10 @@ export async function runCli(
       receipt(result, command, savedTo);
       return succeeded(result) ? 0 : 2;
     };
+    if (creation?.success) {
+      sent = creation.data;
+      return await finishAction(await connected.command(sent));
+    }
     if (area === 'retry') {
       const value = readJson(action);
       if (value === null || typeof value !== 'object' || !('command' in value))

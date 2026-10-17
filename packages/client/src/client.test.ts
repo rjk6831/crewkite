@@ -400,7 +400,72 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     }
   }
 
+  const project = { id: task.projectId, name: 'fixture-project', revision: 0 };
+  const createdTask = { ...task, revision: 0 };
+  const createArgs = [
+    'task',
+    'create',
+    project.id,
+    '--title',
+    task.title,
+    '--outcome',
+    task.outcome,
+    '--criterion',
+    task.criteria[0],
+    '--criterion',
+    'The original source stays unchanged',
+  ];
+  const creationCases = [
+    { name: 'project', args: ['project', 'add', '.'], plain: true },
+    { name: 'project-existing', args: ['project', 'add', '/fixture/project'] },
+    { name: 'task', args: createArgs },
+    { name: 'task-plain', args: createArgs, plain: true },
+    { name: 'task-blocked', args: createArgs },
+    { name: 'task-uncertain', args: createArgs },
+    { name: 'missing-path', args: ['project', 'add'], invalid: true },
+    { name: 'blank-path', args: ['project', 'add', ' '], invalid: true },
+    { name: 'extra-path', args: ['project', 'add', '.', 'other'], invalid: true },
+    {
+      name: 'missing-title',
+      args: [...createArgs.slice(0, 3), ...createArgs.slice(5)],
+      invalid: true,
+    },
+    {
+      name: 'missing-outcome',
+      args: [...createArgs.slice(0, 5), ...createArgs.slice(7)],
+      invalid: true,
+    },
+    { name: 'missing-criteria', args: createArgs.slice(0, 7), invalid: true },
+    { name: 'blank-criterion', args: [...createArgs, '--criterion', '  '], invalid: true },
+    {
+      name: 'invalid-project',
+      args: [...createArgs.slice(0, 2), 'not-an-id', ...createArgs.slice(3)],
+      invalid: true,
+    },
+    {
+      name: 'oversized-title',
+      args: [...createArgs.slice(0, 4), 'x'.repeat(201), ...createArgs.slice(5)],
+      invalid: true,
+    },
+    {
+      name: 'oversized-outcome',
+      args: [...createArgs.slice(0, 6), 'x'.repeat(4097), ...createArgs.slice(7)],
+      invalid: true,
+    },
+    {
+      name: 'too-many-criteria',
+      args: [
+        ...createArgs.slice(0, 7),
+        ...Array.from({ length: 101 }, () => ['--criterion', 'A criterion']).flat(),
+      ],
+      invalid: true,
+    },
+    { name: 'wrong-command', args: ['project', 'add', '.', '--title', task.title], invalid: true },
+    { name: 'extra-task', args: [...createArgs, 'other'], invalid: true },
+  ];
+
   for (const scenario of [
+    ...creationCases.map((value) => `setup-${value.name}`),
     'show',
     'native-show',
     'profiles',
@@ -694,6 +759,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
             },
           ]
         : [];
+    const creationCase = creationCases.find((value) => scenario === `setup-${value.name}`);
     const fixture = await serve((message, socket) => {
       if (message.type === 'hello')
         socket.write(encodeFrame({ type: 'welcome', protocol: 1, cursor: snapshot.cursor }));
@@ -836,6 +902,19 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
           },
         };
       }
+      if (command.command === 'RegisterProject')
+        result = {
+          outcome: scenario === 'setup-project-existing' ? 'already-applied' : 'applied',
+          entity: project,
+          revision: 0,
+        };
+      if (command.command === 'CreateTask')
+        result =
+          scenario === 'setup-task-blocked'
+            ? { outcome: 'blocked', reason: 'project-not-found' }
+            : scenario === 'setup-task-uncertain' && received.length === 1
+              ? { outcome: 'outcome-unknown', reason: 'connection-lost' }
+              : { outcome: 'applied', entity: createdTask, revision: 0 };
       socket.write(encodeFrame({ type: 'result', key: command.key, result }));
     });
     context.after(() => fixture.close());
@@ -1110,7 +1189,61 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         ];
       }
     }
-    const result = await execute(args, scenario !== 'changes');
+    if (creationCase) args = creationCase.args;
+    const result = await execute(args, scenario !== 'changes' && !creationCase?.plain);
+    if (creationCase) {
+      if (creationCase.invalid) {
+        assert.equal(result.code, 1, scenario);
+        assert(result.errors.length > 0, scenario);
+        assert.deepEqual(received, [], scenario);
+        continue;
+      }
+      const registering = creationCase.name.startsWith('project');
+      assert.equal(
+        result.code,
+        ['task-blocked', 'task-uncertain'].includes(creationCase.name) ? 2 : 0,
+        scenario,
+      );
+      assert.equal(received.length, 1, scenario);
+      const command = received[0];
+      assert.equal(command.command, registering ? 'RegisterProject' : 'CreateTask');
+      assert.equal(command.expectedRevision, 0);
+      assert.deepEqual(command.actor, actor);
+      assert.deepEqual(
+        command.payload,
+        registering
+          ? { path: resolve(creationCase.args[2]) }
+          : {
+              projectId: project.id,
+              title: task.title,
+              outcome: task.outcome,
+              criteria: [...task.criteria, 'The original source stays unchanged'],
+            },
+      );
+      if (creationCase.plain) {
+        assert(
+          result.output.includes(
+            `${registering ? 'Project' : 'Task'} ${registering ? project.id : createdTask.id}`,
+          ),
+        );
+        assert(result.output.includes(`Command key ${command.key}`));
+      } else {
+        const receipt = JSON.parse(result.output);
+        assert.deepEqual(receipt.command, command);
+        if (creationCase.name === 'task-blocked')
+          assert.equal(receipt.result.reason, 'project-not-found');
+        else if (creationCase.name === 'task-uncertain') {
+          assert.equal(receipt.result.outcome, 'outcome-unknown');
+          const file = join(fixture.home, 'creation-receipt.json');
+          writeFileSync(file, result.output);
+          const retried = await execute(['retry', file]);
+          assert.equal(retried.code, 0);
+          assert.deepEqual(received, [command, command]);
+          assert.deepEqual(JSON.parse(retried.output).result.entity, createdTask);
+        } else assert.deepEqual(receipt.result.entity, registering ? project : createdTask);
+      }
+      continue;
+    }
     if (handing) {
       const rejected = [
         'handoff-target-duplicate',
