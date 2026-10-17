@@ -6,7 +6,6 @@ import type {
   Snapshot,
   Task,
   TaskConversationState,
-  Window as UsageWindow,
 } from '@crewkite/contracts';
 import {
   CommandSchema,
@@ -63,7 +62,6 @@ import { CombinedTask } from './combined-task.tsx';
 import {
   actionName,
   Dialog,
-  duration,
   effectTarget,
   Fact,
   familyClass,
@@ -80,6 +78,8 @@ import { googleAcpLabel, Launch, NativeEvaluation, NativeHandoff } from './launc
 import { LocalSetup } from './local-setup.tsx';
 import { useWorkspace, type Workspace } from './source.ts';
 import { roleLabels } from './templates.ts';
+import { type UsageCard, UsageGauges, type UsageReading } from './usage-gauges.tsx';
+import { projectUsagePresentation, type UsageGaugeReading } from './usage-presentation.ts';
 
 const tabs = [
   'Conversation',
@@ -2402,6 +2402,11 @@ function GoogleSetup({ snapshot, workspace }: { snapshot: Snapshot; workspace: W
   );
 }
 
+function usageReading(value: UsageGaugeReading, label = value.label): UsageReading {
+  const { reserveNote, ...facts } = value;
+  return { ...facts, label, ...(reserveNote === null ? {} : { reserveNote }) };
+}
+
 function Usage({
   snapshot,
   run,
@@ -2455,6 +2460,20 @@ function Usage({
   );
   const now = fixture ? fixtureTime : displayTime;
   const cloud = snapshot.routes.filter(({ family }) => family !== 'local');
+  const scopes = projectUsagePresentation(snapshot, run?.policy.policy.reserves ?? null, now);
+  const cards: UsageCard[] = scopes.map((scope) => ({
+    id: scope.id,
+    title: scope.label,
+    scope: scope.scopeLabel,
+    tags: scope.fixture ? ['Fixture'] : undefined,
+    notice: scope.notice ?? undefined,
+    primary: [
+      ...(scope.primary.weekly ? [usageReading(scope.primary.weekly, 'Weekly')] : []),
+      ...(scope.primary.fiveHour ? [usageReading(scope.primary.fiveHour, 'Five-hour')] : []),
+    ],
+    auxiliary: scope.satellites.map((reading) => usageReading(reading)),
+    emptyText: 'No usage observations.',
+  }));
   const local = snapshot.routes.find(({ family }) => family === 'local');
   return (
     <main className="usage-page">
@@ -2513,50 +2532,31 @@ function Usage({
       </section>
       <section aria-labelledby="allowance-title">
         <div className="section-heading">
-          <h2 id="allowance-title">Route allowances</h2>
-          <span>Included subscriptions</span>
+          <h2 id="allowance-title">Provider allowances</h2>
+          <span>Reported observations</span>
         </div>
-        <div className="allowance-grid">
-          {cloud.map((route) => {
-            const windows = snapshot.usage.filter(
-              ({ observation }) => observation.routeId === route.id,
-            );
-            return (
-              <section className="allowance-card" key={route.id}>
-                <div className="allowance-heading">
-                  <span className={`route-symbol ${familyClass(route.family)}`}>
-                    {route.family[0].toUpperCase()}
-                  </span>
-                  <div>
-                    <h3>{familyName(route.family)}</h3>
-                    <span>{route.model}</span>
-                  </div>
-                  {route.fake && <span className="fake-tag">Fake</span>}
+        {cards.length ? (
+          <>
+            <UsageGauges cards={cards} nowMs={now} />
+            <details className="technical-details">
+              <summary>Represented routes</summary>
+              {scopes.map((scope) => (
+                <div key={scope.id}>
+                  <p>
+                    {scope.label}: {scope.scopeLabel}
+                  </p>
+                  {scope.routeIds.map((id) => (
+                    <code key={id}>{id}</code>
+                  ))}
                 </div>
-                {windows.length ? (
-                  windows.map((window) => (
-                    <AllowanceWindow
-                      key={window.observation.windowId}
-                      window={window}
-                      now={now}
-                      reserve={
-                        run?.policy.policy.reserves.find(
-                          (reserve) =>
-                            reserve.routeId === route.id &&
-                            reserve.windowId === window.observation.windowId,
-                        )?.value ?? null
-                      }
-                    />
-                  ))
-                ) : (
-                  <Empty icon={<Gauge />} title="Unknown">
-                    No usage observation has been received.
-                  </Empty>
-                )}
-              </section>
-            );
-          })}
-        </div>
+              ))}
+            </details>
+          </>
+        ) : (
+          <Empty icon={<Gauge />} title="No provider allowance scope">
+            No cloud route is configured.
+          </Empty>
+        )}
       </section>
       <div className="capacity-grid">
         <section className="card activity-capacity">
@@ -2649,120 +2649,6 @@ function Usage({
         </p>
       </section>
     </main>
-  );
-}
-
-function AllowanceWindow({
-  window,
-  now,
-  reserve,
-}: {
-  window: UsageWindow;
-  now: number;
-  reserve: number | null;
-}) {
-  const { observation } = window;
-  const state =
-    Date.parse(observation.observedAt) > now
-      ? 'unknown'
-      : observation.resetsAt !== null && Date.parse(observation.resetsAt) <= now
-        ? 'reset-pending'
-        : window.state === 'fresh' && now - Date.parse(observation.observedAt) > 300000
-          ? 'stale'
-          : window.state;
-  const percentage = observation.remaining?.unit === 'percent' ? observation.remaining.value : null;
-  const unknown = state === 'unknown' || observation.remaining === null;
-  const pending =
-    state === 'reset-pending' ||
-    (observation.resetsAt !== null && Date.parse(observation.resetsAt) <= now);
-  const remaining = unknown
-    ? 'Unknown'
-    : percentage !== null
-      ? `${percentage}%`
-      : `${observation.remaining?.value} ${observation.remaining?.unit}`;
-  const pattern = `hatch-${observation.routeId}-${observation.windowId}`;
-  return (
-    <div
-      className={`allowance-window ${unknown ? 'is-unknown' : ''} ${pending ? 'is-pending' : ''}`}
-    >
-      <div className="gauge-wrap">
-        <svg
-          viewBox="0 0 120 120"
-          role="img"
-          aria-label={`${observation.windowId} allowance: ${remaining}`}
-        >
-          <title>
-            {observation.windowId} allowance: {remaining}
-          </title>
-          <defs>
-            <pattern
-              id={pattern}
-              width="5"
-              height="5"
-              patternUnits="userSpaceOnUse"
-              patternTransform="rotate(45)"
-            >
-              <line x1="0" y1="0" x2="0" y2="5" stroke="var(--text-dim)" strokeWidth="2" />
-            </pattern>
-          </defs>
-          <circle className="gauge-track" cx="60" cy="60" r="46" fill="none" strokeWidth="9" />
-          <circle
-            className="gauge-fill"
-            cx="60"
-            cy="60"
-            r="46"
-            fill="none"
-            stroke={unknown ? `url(#${pattern})` : 'currentColor'}
-            strokeWidth="9"
-            strokeDasharray={unknown ? undefined : `${((percentage ?? 0) / 100) * 289.03} 289.03`}
-            transform="rotate(-90 60 60)"
-          />
-          {percentage !== null && reserve !== null && (
-            <line
-              x1="60"
-              y1="8"
-              x2="60"
-              y2="20"
-              transform={`rotate(${reserve * 3.6} 60 60)`}
-              stroke="var(--surface)"
-              strokeWidth="3"
-            />
-          )}
-        </svg>
-        <div className="gauge-value">
-          <strong className={unknown ? 'unknown-value' : ''}>{remaining}</strong>
-          <span>{unknown ? 'No report' : 'remaining'}</span>
-        </div>
-      </div>
-      <div className="window-name">
-        <span>{titleCase(observation.windowId)}</span>
-        {percentage !== null && (
-          <span>{reserve === null ? 'No run reserve' : `${reserve}% reserve`}</span>
-        )}
-      </div>
-      <div className="reset-line">
-        <Clock size={13} />
-        <span>
-          {pending
-            ? 'Reset pending confirmation'
-            : observation.resetsAt
-              ? `Resets in ${duration(Date.parse(observation.resetsAt) - now)}`
-              : 'Reset time unknown'}
-        </span>
-      </div>
-      <div className="observation-line">
-        <span>Observed {duration(now - Date.parse(observation.observedAt))} ago</span>
-        <span>{observation.source}</span>
-      </div>
-      {state === 'stale' && (
-        <p className="window-warning">
-          {observation.source === 'fixture'
-            ? 'Scripted usage expires after five minutes. It does not refresh automatically. Before preparing a run, choose how unknown usage is handled in Policy.'
-            : 'Stale observation. The percentage rule is unavailable until a fresh report arrives.'}
-        </p>
-      )}
-      {unknown && <p className="window-warning">Waiting for a usable observation.</p>}
-    </div>
   );
 }
 
