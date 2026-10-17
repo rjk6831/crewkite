@@ -1275,7 +1275,7 @@ export const TaskConversationStateSchema = z
     send: z.strictObject({
       available: z.boolean(),
       reason: ConversationActionReasonSchema,
-      disposition: z.enum(['turn', 'queue']).nullable(),
+      disposition: z.enum(['turn', 'planning-turn', 'queue']).nullable(),
     }),
     adopt: z.strictObject({ available: z.boolean(), reason: ConversationActionReasonSchema }),
   })
@@ -1298,7 +1298,8 @@ export const TaskConversationStateSchema = z
     if (
       state.send.available
         ? !(
-            (state.send.reason === 'available' && state.send.disposition === 'turn') ||
+            (state.send.reason === 'available' &&
+              ['turn', 'planning-turn'].includes(state.send.disposition ?? '')) ||
             (state.send.reason === 'queued-at-boundary' && state.send.disposition === 'queue')
           )
         : state.send.disposition !== null ||
@@ -1331,6 +1332,17 @@ export const TaskConversationStateSchema = z
         !['intent', 'running', 'stopping'].includes(state.activeAttempt.state))
     )
       fail('Queued input requires a known active owner for the current run.');
+    if (
+      state.send.available &&
+      state.send.disposition === 'planning-turn' &&
+      (!state.configuration?.routeId ||
+        !state.currentRunId ||
+        !state.budget ||
+        state.purpose !== 'execution' ||
+        state.activeAttempt !== null ||
+        ['unknown', 'stopping'].includes(state.phase))
+    )
+      fail('A linked planning turn requires saved authority and a quiescent execution run.');
     if (
       state.adopt.available &&
       (!state.configuration ||

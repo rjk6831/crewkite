@@ -301,6 +301,26 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     send: { available: true, reason: 'queued-at-boundary', disposition: 'queue' },
   };
   assert.deepEqual(TaskConversationStateSchema.parse(executionQueue), executionQueue);
+  const linkedPlanningTurn = {
+    ...configuredConversation,
+    purpose: 'execution',
+    send: { available: true, reason: 'available', disposition: 'planning-turn' },
+    adopt: { available: false, reason: 'proposal-not-current' },
+  };
+  assert.deepEqual(TaskConversationStateSchema.parse(linkedPlanningTurn), linkedPlanningTurn);
+  for (const change of [
+    { configuration: null },
+    { budget: null },
+    { currentRunId: null },
+    { purpose: 'conversation' },
+    { activeAttempt: conversationOwner },
+    { phase: 'unknown' },
+    { phase: 'stopping' },
+  ])
+    assert.equal(
+      TaskConversationStateSchema.safeParse({ ...linkedPlanningTurn, ...change }).success,
+      false,
+    );
   assert(
     TaskConversationStateSchema.safeParse({
       ...configuredConversation,
