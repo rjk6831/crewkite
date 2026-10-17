@@ -5,9 +5,16 @@ import type {
   Run,
   Snapshot,
   Task,
+  TaskConversationState,
   Window as UsageWindow,
 } from '@crewkite/contracts';
-import { CommandSchema, ProjectSchema, requiredReviewMethodIds } from '@crewkite/contracts';
+import {
+  CommandSchema,
+  MessageIdSchema,
+  ProjectSchema,
+  requiredReviewMethodIds,
+  TaskIdSchema,
+} from '@crewkite/contracts';
 import { createDemoFixtures } from '@crewkite/testkit';
 import {
   Activity,
@@ -59,11 +66,19 @@ import {
   short,
   titleCase,
 } from './components.tsx';
+import { ConversationView, NewGoal } from './conversation-view.tsx';
 import { googleAcpLabel, Launch, NativeEvaluation, NativeHandoff } from './launch.tsx';
 import { useWorkspace, type Workspace } from './source.ts';
 import { roleLabels } from './templates.ts';
 
-const tabs = ['Activity', 'Plan', 'Changes', 'Checks and review', 'Handoffs'] as const;
+const tabs = [
+  'Conversation',
+  'Plan',
+  'Changes',
+  'Checks and review',
+  'Handoffs',
+  'Activity',
+] as const;
 type Tab = (typeof tabs)[number];
 const roleNames: Role['role'][] = [
   'coder',
@@ -167,15 +182,76 @@ function Empty({ icon, title, children }: { icon: ReactNode; title: string; chil
   );
 }
 
+function readConversationDrafts(): {
+  goal: string;
+  tasks: Record<string, string>;
+  answers: Record<string, string>;
+  error: string | null;
+} {
+  try {
+    const stored: unknown = JSON.parse(localStorage.getItem('crewkite-task-drafts-v1') ?? '{}');
+    if (!stored || typeof stored !== 'object' || Array.isArray(stored))
+      throw new Error('Invalid saved drafts.');
+    const tasks: Record<string, string> = Object.fromEntries(
+      Object.entries(stored).flatMap(([id, text]) =>
+        TaskIdSchema.safeParse(id).success && typeof text === 'string' ? [[id, text] as const] : [],
+      ),
+    );
+    const savedAnswers: unknown = JSON.parse(
+      localStorage.getItem('crewkite-answer-drafts-v1') ?? '{}',
+    );
+    if (!savedAnswers || typeof savedAnswers !== 'object' || Array.isArray(savedAnswers))
+      throw new Error('Invalid saved answers.');
+    const answers: Record<string, string> = Object.fromEntries(
+      Object.entries(savedAnswers).flatMap(([id, text]) =>
+        MessageIdSchema.safeParse(id).success && typeof text === 'string'
+          ? [[id, text] as const]
+          : [],
+      ),
+    );
+    return {
+      goal: localStorage.getItem('crewkite-goal-draft-v1') ?? '',
+      tasks,
+      answers,
+      error: null,
+    };
+  } catch {
+    return {
+      goal: '',
+      tasks: {},
+      answers: {},
+      error: 'Saved drafts could not be read. New drafts will remain in this window.',
+    };
+  }
+}
+
 export function App() {
   const workspace = useWorkspace();
-  const { snapshot, connection, preview, error } = workspace;
+  const { snapshot, connection, preview, error: workspaceError } = workspace;
   const [page, setPage] = useState<'tasks' | 'usage'>('tasks');
   const [selected, setSelected] = useState<string | null>(null);
-  const [tab, setTab] = useState<Tab>('Activity');
+  const [tab, setTab] = useState<Tab>('Conversation');
   const [roster, setRoster] = useState(true);
   const [theme, setTheme] = useState(() => localStorage.getItem('crewkite-theme') ?? 'dark');
   const [create, setCreate] = useState(false);
+  const [newGoal, setNewGoal] = useState(false);
+  const [savedDrafts] = useState(readConversationDrafts);
+  const [goalDraft, setGoalDraft] = useState(savedDrafts.goal);
+  const [drafts, setDrafts] = useState(savedDrafts.tasks);
+  const [answerDrafts, setAnswerDrafts] = useState(savedDrafts.answers);
+  const [draftError, setDraftError] = useState(savedDrafts.error);
+  const error = workspaceError ?? draftError;
+  useEffect(() => {
+    if (savedDrafts.error) return;
+    try {
+      localStorage.setItem('crewkite-task-drafts-v1', JSON.stringify(drafts));
+      localStorage.setItem('crewkite-goal-draft-v1', goalDraft);
+      localStorage.setItem('crewkite-answer-drafts-v1', JSON.stringify(answerDrafts));
+    } catch {
+      setDraftError('The unsent draft could not be saved locally. Keep this window open.');
+    }
+  }, [drafts, goalDraft, answerDrafts, savedDrafts.error]);
+  const [conversationState, setConversationState] = useState<TaskConversationState | null>(null);
   const [launch, setLaunch] = useState(false);
   const [nativeHandoff, setNativeHandoff] = useState(false);
   const [palette, setPalette] = useState(false);
@@ -183,7 +259,14 @@ export function App() {
   const [approvalToReview, setApprovalToReview] = useState<string | null>(null);
   const approvalCard = useRef<HTMLElement>(null);
   const [about, setAbout] = useState(false);
-  const task = snapshot?.tasks.find(({ id }) => id === selected) ?? snapshot?.tasks[0];
+  const task = newGoal
+    ? undefined
+    : (snapshot?.tasks.find(({ id }) => id === selected) ?? snapshot?.tasks[0]);
+  const currentConversation =
+    task && conversationState?.taskId === task.id && conversationState.revision === task.revision
+      ? conversationState
+      : null;
+  const stopRunId = currentConversation?.currentRunId ?? task?.runId;
   const run = snapshot?.runs.find(({ id }) => id === task?.runId);
   const candidate = snapshot?.candidates.filter((value) => value.taskId === task?.id).at(-1);
   const changesKey = [
@@ -223,22 +306,27 @@ export function App() {
     return () => window.removeEventListener('keydown', keydown);
   }, []);
   function stop() {
-    if (task?.runId)
+    if (task && stopRunId)
       void workspace
         .command({
           command: 'StopRun',
           expectedRevision: task.revision,
-          payload: { taskId: task.id, runId: task.runId },
+          payload: { taskId: task.id, runId: stopRunId },
         })
         .catch(() => {});
   }
   const stopAllowed =
-    task?.runId &&
-    (nativeRun
-      ? nativeRun.stage === 'prepared' ||
-        !!nativeRun.handoff?.pending ||
-        ['running', 'checking', 'unknown'].includes(task.state)
-      : !['draft', 'ready', 'accepted', 'failed'].includes(task.state));
+    currentConversation &&
+    (currentConversation.purpose === 'conversation'
+      ? Boolean(
+          stopRunId && ['planning', 'stopping', 'unknown'].includes(currentConversation.phase),
+        )
+      : task?.runId &&
+        (nativeRun
+          ? nativeRun.stage === 'prepared' ||
+            !!nativeRun.handoff?.pending ||
+            ['running', 'checking', 'unknown'].includes(task.state)
+          : !['draft', 'ready', 'accepted', 'failed'].includes(task.state)));
   return (
     <div className="app-shell">
       <aside className="navigation" aria-label="Workspace navigation">
@@ -267,7 +355,10 @@ export function App() {
           <button
             type="button"
             className="icon-button"
-            onClick={() => setCreate(true)}
+            onClick={() => {
+              setNewGoal(true);
+              setPage('tasks');
+            }}
             aria-label="New task"
           >
             <Plus size={15} />
@@ -291,7 +382,9 @@ export function App() {
                   key={value.id}
                   className={`task-link ${page === 'tasks' && task?.id === value.id ? 'active' : ''}`}
                   onClick={() => {
+                    setNewGoal(false);
                     setSelected(value.id);
+                    setTab('Conversation');
                     setPage('tasks');
                   }}
                 >
@@ -319,7 +412,10 @@ export function App() {
         <button
           type="button"
           className="add-task"
-          onClick={() => setCreate(true)}
+          onClick={() => {
+            setNewGoal(true);
+            setPage('tasks');
+          }}
           disabled={!snapshot}
         >
           <Plus size={14} />
@@ -455,7 +551,10 @@ export function App() {
             <button
               type="button"
               className="icon-button"
-              onClick={() => workspace.setError(null)}
+              onClick={() => {
+                workspace.setError(null);
+                setDraftError(null);
+              }}
               aria-label="Dismiss error"
             >
               <X size={14} />
@@ -505,21 +604,26 @@ export function App() {
                         </span>
                       </div>
                       <div className="button-row">
-                        {task.state === 'draft' && (
-                          <button
-                            type="button"
-                            className="button primary"
-                            onClick={() => setLaunch(true)}
-                            disabled={workspace.pending}
-                          >
-                            {nativeRun?.stage === 'prepared'
-                              ? 'Review prepared proposal'
-                              : 'Prepare run'}
-                            <ArrowRight size={14} />
-                          </button>
-                        )}
+                        {task.state === 'draft' &&
+                          currentConversation?.contractStatus === 'confirmed' &&
+                          !currentConversation.activeAttempt &&
+                          !['unknown', 'stopping'].includes(currentConversation.phase) && (
+                            <button
+                              type="button"
+                              className="button primary"
+                              onClick={() => setLaunch(true)}
+                              disabled={workspace.pending}
+                            >
+                              {nativeRun?.stage === 'prepared'
+                                ? 'Review prepared proposal'
+                                : 'Prepare run'}
+                              <ArrowRight size={14} />
+                            </button>
+                          )}
                         {task.runId &&
                           !nativeRun &&
+                          currentConversation &&
+                          currentConversation.purpose !== 'conversation' &&
                           ['interrupted', 'stopped'].includes(task.state) && (
                             <button
                               type="button"
@@ -564,6 +668,7 @@ export function App() {
                       </div>
                     </div>
                     {run &&
+                      currentConversation?.purpose === 'execution' &&
                       ['running', 'waiting', 'stopped', 'interrupted'].includes(task.state) && (
                         <RouteSwitch
                           key={run.id}
@@ -578,6 +683,7 @@ export function App() {
                     className="tab-bar"
                     role="tablist"
                     aria-label="Task views"
+                    style={{ overflowX: 'auto', flexShrink: 0 }}
                     onKeyDown={moveTabFocus}
                   >
                     {tabs.map((value) => (
@@ -607,7 +713,37 @@ export function App() {
                     role="tabpanel"
                     aria-labelledby={`tab-${tab}`}
                     className="task-panel"
+                    style={tab === 'Conversation' ? { padding: 0, overflow: 'hidden' } : undefined}
                   >
+                    <div
+                      hidden={tab !== 'Conversation'}
+                      style={tab === 'Conversation' ? { height: '100%' } : { display: 'none' }}
+                    >
+                      <ConversationView
+                        visible={tab === 'Conversation'}
+                        key={task.id}
+                        task={task}
+                        snapshot={snapshot}
+                        workspace={workspace}
+                        answerDrafts={answerDrafts}
+                        onAnswerDraftChange={(id, text) =>
+                          setAnswerDrafts((current) => ({ ...current, [id]: text }))
+                        }
+                        draft={drafts[task.id] ?? ''}
+                        onDraftChange={(text) =>
+                          setDrafts((current) => ({ ...current, [task.id]: text }))
+                        }
+                        onDraftSaved={(submitted) =>
+                          setDrafts((current) =>
+                            current[task.id] === submitted
+                              ? { ...current, [task.id]: '' }
+                              : current,
+                          )
+                        }
+                        onState={setConversationState}
+                        onPrepare={() => setLaunch(true)}
+                      />
+                    </div>
                     {tab === 'Activity' && (
                       <>
                         {approval && (
@@ -630,6 +766,7 @@ export function App() {
                         run={run}
                         snapshot={snapshot}
                         onPrepare={() => setLaunch(true)}
+                        conversationState={currentConversation}
                       />
                     )}
                     {tab === 'Changes' && (
@@ -642,14 +779,19 @@ export function App() {
                   </div>
                 </>
               ) : (
-                <Empty icon={<Folder />} title="Start with one useful task">
-                  Create a bounded outcome and its acceptance criteria. Review the source and
-                  routing decision before starting.
-                  <button type="button" className="button primary" onClick={() => setCreate(true)}>
-                    <Plus size={14} />
-                    Create task
-                  </button>
-                </Empty>
+                <NewGoal
+                  snapshot={snapshot}
+                  workspace={workspace}
+                  text={goalDraft}
+                  onTextChange={setGoalDraft}
+                  onManual={() => setCreate(true)}
+                  onCreated={(id, submitted) => {
+                    setSelected(id);
+                    setNewGoal(false);
+                    setTab('Conversation');
+                    setGoalDraft((value) => (value === submitted ? '' : value));
+                  }}
+                />
               )}
             </main>
             {roster && (
@@ -682,6 +824,7 @@ export function App() {
           onClose={() => setCreate(false)}
           onCreated={(id) => {
             setSelected(id);
+            setNewGoal(false);
             setPage('tasks');
             setCreate(false);
             setLaunch(true);
@@ -710,7 +853,14 @@ export function App() {
         <Dialog title="Run a command" onClose={() => setPalette(false)}>
           <div className="command-list">
             {[
-              { label: 'New task', icon: <Plus size={17} />, action: () => setCreate(true) },
+              {
+                label: 'New task',
+                icon: <Plus size={17} />,
+                action: () => {
+                  setNewGoal(true);
+                  setPage('tasks');
+                },
+              },
               {
                 label: 'Open usage and capacity',
                 icon: <Gauge size={17} />,
@@ -912,6 +1062,7 @@ function ApprovalCard({
 
 const eventNames: Record<Event['type'], string> = {
   'task.created': 'Task created',
+  'conversation.entry': 'Conversation entry saved',
   'task.updated': 'Task state updated',
   'run.prepared': 'Run prepared',
   'run.admitted': 'Run admitted',
@@ -1076,12 +1227,62 @@ function Plan({
   run,
   snapshot,
   onPrepare,
+  conversationState,
 }: {
   task: Task;
   run?: Run;
   snapshot: Snapshot;
   onPrepare: () => void;
+  conversationState: TaskConversationState | null;
 }) {
+  if (!conversationState)
+    return (
+      <Empty icon={<RefreshCw />} title="Refreshing the task contract">
+        Open Conversation to refresh if the current state remains unavailable.
+      </Empty>
+    );
+  if (conversationState.purpose === 'conversation')
+    return (
+      <div className="view-stack">
+        <section className="card">
+          <h2>
+            {conversationState.contractStatus === 'provisional'
+              ? 'Provisional task contract'
+              : 'Confirmed task contract'}
+          </h2>
+          <p className="muted">{task.outcome}</p>
+          {conversationState.contractStatus === 'confirmed' ? (
+            <ul>
+              {task.criteria.map((criterion) => (
+                <li key={criterion}>{criterion}</li>
+              ))}
+            </ul>
+          ) : (
+            <p className="muted">
+              Criteria remain provisional until a plan is adopted in Conversation.
+            </p>
+          )}
+          <p className="muted small">
+            Conversation retains the proposal and its decisions. Execution needs a separate source,
+            team and permission review.
+          </p>
+          {conversationState.contractStatus === 'confirmed' && (
+            <button
+              className="button primary"
+              type="button"
+              disabled={
+                Boolean(conversationState.activeAttempt) ||
+                ['unknown', 'stopping'].includes(conversationState.phase)
+              }
+              onClick={onPrepare}
+            >
+              Review execution contract
+              <ArrowRight size={14} />
+            </button>
+          )}
+        </section>
+      </div>
+    );
   const native = snapshot.nativeRuns.find((value) => value.runId === run?.id);
   const profile = snapshot.nativeProfiles.find((value) => value.id === native?.profileId);
   return (

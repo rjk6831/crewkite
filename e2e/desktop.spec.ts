@@ -15,6 +15,7 @@ import {
 } from '../apps/controller/src/host/check-ownership.ts';
 import { git } from '../apps/controller/src/host/source.ts';
 import { groupAbsent } from '../apps/controller/src/host/worker.ts';
+import { unavailableNativeProfile } from '../apps/controller/src/providers/openai/profile.ts';
 import { encodeFrame, FrameDecoder } from '../packages/client/src/index.ts';
 import {
   type ControllerClient,
@@ -25,10 +26,15 @@ import {
 import {
   type Command,
   type CommandResult,
+  type ConversationEntry,
+  ConversationEntrySchema,
   type Event,
   EventSchema,
   SnapshotSchema,
+  type TaskConversationState,
+  TaskConversationStateSchema,
 } from '../packages/contracts/src/index.ts';
+import { createDemoFixtures, createTestIds } from '../packages/testkit/src/fixtures.ts';
 
 const root = resolve(import.meta.dirname, '..');
 const internal =
@@ -561,6 +567,609 @@ async function quotaRevocationBridge(
   }
 }
 
+async function conversationBridge(
+  application: Awaited<ReturnType<typeof _electron.launch>>,
+  page: Page,
+) {
+  const home = mkdtempSync(join(internal, 'chat-bridge-'));
+  const socketPath = join(home, 'control.sock');
+  const fixtures = createDemoFixtures();
+  const id = createTestIds('2026-10-17T12:00:00.000Z', 9000n);
+  const messageId = () => id('art').replace('art_', 'msg_');
+  const profile = {
+    ...unavailableNativeProfile().facts,
+    model: 'fixture-model',
+    available: true,
+    reason: 'available',
+  };
+  const route = { ...fixtures.snapshot.routes[0], model: 'fixture-model', fake: true };
+  const snapshot = SnapshotSchema.parse({
+    ...fixtures.snapshot,
+    projects: [fixtures.snapshot.projects[0]],
+    tasks: [],
+    runs: [],
+    attempts: [],
+    approvals: [],
+    routes: [route],
+    nativeProfiles: [profile],
+    nativeRuns: [],
+    candidates: [],
+    artifacts: [],
+    evidence: [],
+  });
+  let state: TaskConversationState | null = null;
+  const entries: ConversationEntry[] = [];
+  let cursor = 0n;
+  const received: Command[] = [];
+  const receipts = new Map<string, CommandResult>();
+  const sockets = new Set<Socket>();
+  let questionId = '';
+  let configureAttempts = 0;
+  const runId = id('run');
+  const attemptId = id('att');
+  const at = '2026-10-17T12:00:00.000Z';
+  const binding = () => ({
+    taskId: snapshot.tasks[0].id,
+    runId,
+    attemptId,
+    generation: 0,
+    routeId: route.id,
+    role: 'lead' as const,
+    taskRevision: snapshot.tasks[0].revision,
+    conversationRevision: 0,
+    scopeHash: 'a'.repeat(64),
+    limitMinutes: 5,
+  });
+  const append = (value: Record<string, unknown>) => {
+    cursor += 1n;
+    const entry = ConversationEntrySchema.parse({
+      id: messageId(),
+      taskId: snapshot.tasks[0].id,
+      revision: snapshot.tasks[0].revision,
+      cursor: cursor.toString(),
+      at,
+      ...value,
+    });
+    entries.push(entry);
+    snapshot.cursor = cursor.toString();
+    return entry;
+  };
+  const bump = () => {
+    snapshot.tasks[0].revision += 1;
+    if (state) state.revision = snapshot.tasks[0].revision;
+  };
+  const response = (command: Command): CommandResult => {
+    if (command.command === 'GetSnapshot')
+      return { outcome: 'applied', data: { kind: 'snapshot', snapshot } };
+    if (command.command === 'Subscribe') return { outcome: 'applied' };
+    if (command.command === 'GetTaskConversationState')
+      return {
+        outcome: 'applied',
+        data: { kind: 'conversation-state', state: TaskConversationStateSchema.parse(state) },
+      };
+    if (command.command === 'GetTaskConversation') {
+      const eligible = entries.filter(
+        (entry) =>
+          !command.payload.beforeCursor ||
+          BigInt(entry.cursor) < BigInt(command.payload.beforeCursor),
+      );
+      const page = eligible.slice(-2);
+      return {
+        outcome: 'applied',
+        data: {
+          kind: 'conversation',
+          taskId: command.payload.taskId,
+          entries: page,
+          nextBeforeCursor: eligible.length > page.length ? page[0].cursor : null,
+        },
+      };
+    }
+    if (command.command === 'InspectSource')
+      return {
+        outcome: 'applied',
+        data: {
+          kind: 'source',
+          source: {
+            projectId: fixtures.snapshot.projects[0].id,
+            base: 'a'.repeat(40),
+            branch: 'main',
+            dirtyCount: 0,
+            untrackedCount: 0,
+          },
+        },
+      };
+    if (command.command === 'GetChanges')
+      return {
+        outcome: 'applied',
+        data: {
+          kind: 'changes',
+          taskId: command.payload.taskId,
+          candidateId: null,
+          artifactId: id('art'),
+          files: [],
+          diff: '',
+          truncated: false,
+        },
+      };
+    if (receipts.has(command.key)) return receipts.get(command.key) as CommandResult;
+    received.push(command);
+    if (command.command === 'CreateTaskDiscussion') {
+      assert.equal(command.expectedRevision, 0);
+      assert.deepEqual(command.payload.planning.limits, {
+        attempts: 4,
+        minutes: 15,
+        concurrency: 1,
+      });
+      assert.equal(command.payload.planning.creditPolicy, 'ordinary');
+      const task = {
+        ...fixtures.task,
+        id: id('tsk'),
+        title: 'Filtered invoice export',
+        outcome: command.payload.text,
+        criteria: ['Provisional discussion'],
+        projectId: command.payload.projectId,
+        revision: 1,
+        runId,
+      };
+      snapshot.tasks = [task];
+      const author = {
+        kind: 'agent' as const,
+        role: 'lead' as const,
+        attemptId,
+        routeId: route.id,
+      };
+      append({ kind: 'user-message', author: { kind: 'user' }, text: command.payload.text });
+      const question = append({
+        kind: 'question',
+        author,
+        binding: binding(),
+        text: 'Should the CSV include a header row when no invoices match?',
+      });
+      questionId = question.id;
+      const proposal = append({
+        kind: 'plan-proposal',
+        author,
+        binding: binding(),
+        text: 'The proposed invoice export stays within the selected scope.',
+        proposal: {
+          summary: 'Export the filtered invoices',
+          criteria: ['Export only the visible filtered rows.'],
+          slices: [
+            {
+              id: 'csv',
+              title: 'Add the CSV action',
+              role: 'coder',
+              scope: ['src/invoices.ts'],
+              dependsOn: [],
+            },
+          ],
+          checks: ['Invoice export tests'],
+        },
+      });
+      append({
+        kind: 'agent-message',
+        author,
+        binding: binding(),
+        text: 'Answer the scope question before adopting the plan.',
+      });
+      state = TaskConversationStateSchema.parse({
+        taskId: task.id,
+        revision: task.revision,
+        contractStatus: 'provisional',
+        purpose: 'conversation',
+        phase: 'discussion',
+        configuration: {
+          revision: 0,
+          selection: command.payload.planning,
+          routeId: route.id,
+          requestedModel: 'fixture-model',
+          effectiveModel: 'fixture-model',
+          requestedEffort: 'low',
+          effectiveEffort: 'low',
+        },
+        currentRunId: runId,
+        activeAttempt: null,
+        budget: {
+          limits: command.payload.planning.limits,
+          remaining: command.payload.planning.limits,
+        },
+        queuedInputCount: 0,
+        pendingQuestions: [{ id: question.id, cursor: question.cursor }],
+        proposal: { id: proposal.id, hash: 'b'.repeat(64), runId, revision: task.revision },
+        adoptedProposal: null,
+        send: { available: false, reason: 'pending-question', disposition: null },
+        adopt: { available: false, reason: 'pending-question' },
+      });
+      return { outcome: 'applied', entity: task };
+    }
+    assert(state);
+    assert('expectedRevision' in command);
+    assert.equal(command.expectedRevision, snapshot.tasks[0].revision);
+    if (command.command === 'AnswerTaskQuestion') {
+      assert.equal(command.payload.questionId, questionId);
+      bump();
+      const answer = append({
+        kind: 'answer',
+        author: { kind: 'user' },
+        replyTo: questionId,
+        text: command.payload.text,
+      });
+      append({
+        kind: 'input-delivery',
+        author: { kind: 'controller' },
+        replyTo: answer.id,
+        binding: binding(),
+        text: 'Included in input.',
+      });
+      state.pendingQuestions = [];
+      state.phase = 'planned';
+      state.send = { available: true, reason: 'available', disposition: 'turn' };
+      state.adopt = { available: true, reason: 'available' };
+    } else if (command.command === 'AdoptTaskPlan') {
+      assert.equal(command.payload.proposalId, state.proposal?.id);
+      assert.equal(command.payload.proposalHash, state.proposal?.hash);
+      bump();
+      state.contractStatus = 'confirmed';
+      state.adoptedProposal = state.proposal;
+      state.adopt = { available: false, reason: 'proposal-not-current' };
+      snapshot.tasks[0].criteria = ['Export only the visible filtered rows.'];
+    } else if (command.command === 'ConfigureTaskConversation') {
+      configureAttempts += 1;
+      if (configureAttempts === 1)
+        return { outcome: 'blocked', reason: 'The fixture refused these settings.' };
+      bump();
+      assert(state.configuration);
+      state.configuration = {
+        ...state.configuration,
+        revision: state.configuration.revision + 1,
+        selection: command.payload.planning,
+      };
+      for (const text of [
+        'Scope checked.',
+        'Limits checked.',
+        'The next planning turn uses the saved limits.',
+      ])
+        append({
+          kind: 'agent-message',
+          author: { kind: 'agent', role: 'lead', attemptId, routeId: route.id },
+          binding: binding(),
+          text,
+        });
+      const result: CommandResult = { outcome: 'applied', entity: snapshot.tasks[0] };
+      receipts.set(command.key, result);
+      return {
+        outcome: 'outcome-unknown',
+        reason: 'The fixture saved settings before its response was lost.',
+      };
+    } else if (command.command === 'SendTaskMessage') {
+      bump();
+      append({ kind: 'user-message', author: { kind: 'user' }, text: command.payload.text });
+      state.phase = 'planning';
+      state.activeAttempt = {
+        id: attemptId,
+        runId,
+        routeId: route.id,
+        generation: 0,
+        state: 'running',
+        revision: 0,
+      };
+      state.send = { available: true, reason: 'queued-at-boundary', disposition: 'queue' };
+      snapshot.tasks[0].state = 'running';
+      const result: CommandResult = { outcome: 'applied', entity: snapshot.tasks[0] };
+      receipts.set(command.key, result);
+      return {
+        outcome: 'outcome-unknown',
+        reason: 'The fixture saved the input before its response was lost.',
+      };
+    } else if (command.command === 'QueueTaskGuidance') {
+      bump();
+      append({ kind: 'guidance', author: { kind: 'user' }, text: command.payload.text });
+      state.queuedInputCount += 1;
+    } else if (command.command === 'StopRun') {
+      assert.equal(command.payload.runId, runId);
+      bump();
+      state.phase = 'stopped';
+      state.activeAttempt = null;
+      state.send = { available: true, reason: 'available', disposition: 'turn' };
+      snapshot.tasks[0].state = 'stopped';
+    } else throw new Error(`Unexpected conversation fixture command ${command.command}`);
+    TaskConversationStateSchema.parse(state);
+    const result: CommandResult = { outcome: 'applied', entity: snapshot.tasks[0] };
+    receipts.set(command.key, result);
+    return result;
+  };
+  const server = createServer((socket) => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+    const decoder = new FrameDecoder();
+    socket.on('data', (bytes) => {
+      for (const message of decoder.push(bytes)) {
+        if (message.type === 'hello')
+          socket.write(encodeFrame({ type: 'welcome', protocol: 1, cursor: snapshot.cursor }));
+        if (message.type === 'command')
+          socket.write(
+            encodeFrame({
+              type: 'result',
+              key: message.command.key,
+              result: response(message.command),
+            }),
+          );
+      }
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(socketPath, resolve);
+  });
+  try {
+    await application.evaluate(
+      async ({ BrowserWindow }, options) => {
+        const load = process.mainModule?.require.bind(process.mainModule);
+        if (!load) throw new Error('The desktop fixture module loader is unavailable.');
+        const { installBridge } = load(
+          options.bridge,
+        ) as typeof import('../apps/desktop/src/main/bridge.ts');
+        const { connectController } = load(
+          options.client,
+        ) as typeof import('../packages/client/src/node.ts');
+        const { desktopActor } = load(
+          options.runtime,
+        ) as typeof import('../apps/desktop/src/main/runtime.ts');
+        const client = await connectController({
+          socketPath: options.socketPath,
+          token: 'a'.repeat(64),
+          actor: desktopActor,
+          reconnectDelaysMs: [],
+        });
+        const window = BrowserWindow.getAllWindows()[0];
+        window.once('closed', () => client.close());
+        await installBridge(window, {
+          paths: { home: options.home, profile: options.home },
+          connect: async () => client,
+          resetClient: () => client.close(),
+        } as never);
+      },
+      {
+        bridge: join(root, 'apps/desktop/src/main/bridge.ts'),
+        client: join(root, 'packages/client/src/node.ts'),
+        runtime: join(root, 'apps/desktop/src/main/runtime.ts'),
+        socketPath,
+        home,
+      },
+    );
+    await page.reload();
+    if ((await page.locator('html').getAttribute('data-theme')) !== 'dark')
+      await page.getByRole('button', { name: 'Switch to dark theme', exact: true }).click();
+    const composer = page.getByRole('textbox', { name: 'Message the primary role', exact: true });
+    await expect(page.getByRole('heading', { name: 'New goal', exact: true })).toBeVisible();
+    await composer.fill('Export the currently filtered invoices as CSV.');
+    await expect(page.getByRole('button', { name: 'Send message', exact: true })).toBeDisabled();
+    await page.getByRole('checkbox', { name: /^Allow bounded planning ·/ }).check();
+    await composer.press('Enter');
+    await expect(page.getByRole('tab', { name: 'Conversation', exact: true })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+    const publishTask = () => {
+      cursor += 1n;
+      snapshot.cursor = cursor.toString();
+      const event = EventSchema.parse({
+        protocol: 1,
+        id: id('evt'),
+        cursor: snapshot.cursor,
+        at,
+        taskId: snapshot.tasks[0].id,
+        revision: snapshot.tasks[0].revision,
+        type: 'task.updated',
+        payload: snapshot.tasks[0],
+      });
+      for (const socket of sockets) socket.write(encodeFrame({ type: 'event', event }));
+    };
+    await page.getByRole('tab', { name: 'Plan', exact: true }).click();
+    state = TaskConversationStateSchema.parse(state);
+    bump();
+    state.phase = 'planning';
+    state.activeAttempt = {
+      id: attemptId,
+      runId,
+      routeId: route.id,
+      generation: 0,
+      state: 'running',
+      revision: 0,
+    };
+    publishTask();
+    await expect(
+      page.getByRole('heading', { name: 'Provisional task contract', exact: true }),
+    ).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeEnabled();
+    await expect(page.getByRole('log')).toHaveCount(0);
+    await expect(page.getByRole('tab', { name: 'Plan', exact: true })).toBeFocused();
+    await page.getByRole('tab', { name: 'Changes', exact: true }).click();
+    bump();
+    state.phase = 'discussion';
+    state.activeAttempt = null;
+    publishTask();
+    await expect(
+      page.getByRole('heading', { name: 'No retained changes to show', exact: true }),
+    ).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeDisabled();
+    await expect(page.getByRole('tab', { name: 'Changes', exact: true })).toBeFocused();
+    await page.getByRole('tab', { name: 'Conversation', exact: true }).click();
+    await page.getByRole('button', { name: 'Show pending question', exact: true }).click();
+    await expect(page.locator(`#conversation-message-${questionId}`)).toBeFocused();
+    const answer = page.getByRole('textbox', { name: 'Answer for Architect', exact: true });
+    await answer.fill('Include the header row even for empty results.');
+    await page.getByRole('tab', { name: 'Plan', exact: true }).click();
+    await page.getByRole('tab', { name: 'Conversation', exact: true }).click();
+    await page.getByRole('button', { name: 'Show pending question', exact: true }).click();
+    await expect(answer).toHaveValue('Include the header row even for empty results.');
+    await page.reload();
+    await page.getByRole('button', { name: 'Show pending question', exact: true }).click();
+    await expect(page.locator(`#conversation-message-${questionId}`)).toBeFocused();
+    await expect(answer).toHaveValue('Include the header row even for empty results.');
+    await page.getByRole('button', { name: 'Send answer', exact: true }).click();
+    await expect(page.getByText('Included in input', { exact: true })).toBeVisible();
+    const loadEarlier = page.getByRole('button', { name: 'Load earlier messages', exact: true });
+    await expect(loadEarlier).toBeEnabled();
+    await loadEarlier.scrollIntoViewIfNeeded();
+    const anchor = await page.getByRole('log').evaluate((element) => {
+      const row = [...element.querySelectorAll<HTMLElement>('[data-message-id]')].find(
+        (row) => row.getBoundingClientRect().bottom > element.getBoundingClientRect().top,
+      );
+      if (!row) throw new Error('No visible history anchor.');
+      return { id: row.dataset.messageId, top: row.getBoundingClientRect().top };
+    });
+    await loadEarlier.click();
+    await expect
+      .poll(() =>
+        page
+          .locator(`[data-message-id="${anchor.id}"]`)
+          .evaluate((row) => row.getBoundingClientRect().top),
+      )
+      .toBeCloseTo(anchor.top, 0);
+    await expect(
+      page.getByText('Export the currently filtered invoices as CSV.', { exact: true }).last(),
+    ).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Adopt plan', exact: true })).toBeEnabled();
+    assert.equal(
+      received.some((command) =>
+        ['PrepareRun', 'StartRun', 'PrepareNativeRun'].includes(command.command),
+      ),
+      false,
+    );
+    await page.getByRole('button', { name: 'Adopt plan', exact: true }).click();
+    await expect(
+      page.getByRole('dialog', { name: 'Configure this run', exact: true }),
+    ).toBeVisible();
+    await page.keyboard.press('Escape');
+    await page.getByRole('button', { name: 'Open session settings', exact: true }).click();
+    await page
+      .getByRole('dialog')
+      .getByRole('checkbox', {
+        name: 'Allow bounded planning with this profile and these limits',
+        exact: true,
+      })
+      .check();
+    await page.getByRole('button', { name: 'Save planning settings', exact: true }).click();
+    await expect(page.getByRole('dialog').getByRole('alert')).toHaveText(
+      'The fixture refused these settings.',
+    );
+    await expect(
+      page.getByRole('dialog').getByRole('checkbox', {
+        name: 'Allow bounded planning with this profile and these limits',
+        exact: true,
+      }),
+    ).toBeChecked();
+    await page.getByRole('button', { name: 'Save planning settings', exact: true }).click();
+    await expect(page.getByRole('dialog').getByRole('alert')).toHaveText(
+      'The fixture saved settings before its response was lost.',
+    );
+    await page.getByRole('button', { name: 'Retry exact settings command', exact: true }).click();
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    assert.equal(configureAttempts, 2);
+    await expect(
+      page.getByText(
+        'Newer saved messages were loaded. Load earlier messages to restore the previous history.',
+        { exact: true },
+      ),
+    ).toBeVisible();
+    await page.getByRole('button', { name: 'Load earlier messages', exact: true }).click();
+    await expect(page.getByText('Scope checked.', { exact: true })).toBeAttached();
+    await composer.fill('Keep the execution permissions unchanged.');
+    await composer.press('Enter');
+    await expect(
+      page.getByRole('button', { name: 'Retry exact command', exact: true }),
+    ).toBeVisible();
+    await expect(composer).toHaveValue('Keep the execution permissions unchanged.');
+    const originalSend = received.find((command) => command.command === 'SendTaskMessage');
+    await page.getByRole('button', { name: 'Retry exact command', exact: true }).click();
+    await expect(
+      page.getByRole('button', { name: 'Retry exact command', exact: true }),
+    ).toHaveCount(0);
+    assert(originalSend && receipts.has(originalSend.key));
+    assert.equal(received.filter((command) => command.command === 'SendTaskMessage').length, 1);
+    await composer.fill('Do not add a new provider.');
+    await composer.press('Enter');
+    await expect(
+      page.getByText('Queued for the next planning turn', { exact: true }).last(),
+    ).toBeVisible();
+    await page.getByRole('button', { name: 'Stop', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Resume', exact: true })).toHaveCount(0);
+    await expect(page.getByText('Stopped', { exact: true }).last()).toBeVisible();
+    await composer.fill('Keep this unsent draft.');
+    await page.getByRole('tab', { name: 'Plan', exact: true }).click();
+    await page.getByRole('tab', { name: 'Conversation', exact: true }).click();
+    await expect(composer).toHaveValue('Keep this unsent draft.');
+    const mutations = received.length;
+    await page.reload();
+    await expect(page.getByRole('tab', { name: 'Conversation', exact: true })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+    await expect(page.getByText('Do not add a new provider.', { exact: true })).toBeVisible();
+    await expect(composer).toHaveValue('Keep this unsent draft.');
+    assert.equal(received.length, mutations);
+    assert.equal(
+      received.some((command) =>
+        ['PrepareRun', 'StartRun', 'PrepareNativeRun', 'AcceptCandidate'].includes(command.command),
+      ),
+      false,
+    );
+    state = TaskConversationStateSchema.parse(state);
+    bump();
+    state.phase = 'discussion';
+    state.send = { available: false, reason: 'pending-question', disposition: null };
+    const manyQuestions = Array.from({ length: 100 }, (_, index) =>
+      append({
+        kind: 'question',
+        author: { kind: 'agent', role: 'lead', attemptId, routeId: route.id },
+        binding: binding(),
+        text: `Saved question ${index + 1}`,
+      }),
+    );
+    state.pendingQuestions = manyQuestions.map(({ id, cursor }) => ({ id, cursor }));
+    publishTask();
+    await page.setViewportSize({ width: 1440, height: 700 });
+    const questionSelect = page.getByRole('combobox', { name: 'Pending question', exact: true });
+    await expect(questionSelect.locator('option')).toHaveCount(100);
+    await expect(questionSelect).toBeEnabled();
+    await expect(
+      page.getByRole('button', { name: 'Show pending question', exact: true }),
+    ).toHaveCount(1);
+    const questionBounds = await questionSelect.boundingBox();
+    assert(
+      questionBounds &&
+        questionBounds.height < 80 &&
+        questionBounds.y + questionBounds.height < 700,
+    );
+    assert(await page.getByRole('log').evaluate((element) => element.clientHeight > 0));
+    await questionSelect.selectOption(manyQuestions[99].id);
+    bump();
+    publishTask();
+    await expect(questionSelect).toBeEnabled();
+    await expect(questionSelect).toHaveValue(manyQuestions[99].id);
+    await page.getByRole('button', { name: 'Show pending question', exact: true }).click();
+    await expect(page.locator(`#conversation-message-${manyQuestions[99].id}`)).toBeFocused();
+    bump();
+    state.pendingQuestions = state.pendingQuestions.slice(0, 99);
+    publishTask();
+    await expect(questionSelect).toHaveValue(manyQuestions[0].id);
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.screenshot({
+      path: join(internal, 'conversation-bridge-dark.png'),
+      animations: 'disabled',
+    });
+    await page.getByRole('button', { name: 'Switch to light theme', exact: true }).click();
+    await page.screenshot({
+      path: join(internal, 'conversation-bridge-light.png'),
+      animations: 'disabled',
+    });
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
+
 test('desktop and CLI retain one checked task through handoff and restart', async () => {
   test.setTimeout(120000);
   mkdirSync(internal, { recursive: true });
@@ -621,6 +1230,7 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
       dialog.showSaveDialog = async () => ({ canceled: false, filePath: path });
     }, destination);
     await enter(page.getByRole('button', { name: 'New task', exact: true }).first());
+    await page.getByRole('button', { name: 'Create task manually', exact: true }).click();
     await enter(page.getByRole('dialog').getByRole('button', { name: 'Create task', exact: true }));
     const created = await timeline.wait((event) => event.type === 'task.created');
     assert.equal(created.type, 'task.created');
@@ -701,6 +1311,7 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     const firstApproval = await timeline.wait((event) => event.type === 'approval.requested');
     assert.equal(firstApproval.type, 'approval.requested');
     assert.equal(firstApproval.payload.action, 'run-check');
+    await page.getByRole('tab', { name: 'Activity', exact: true }).click();
     await expect(page.getByRole('region', { name: 'Pending approval' })).toContainText(
       'Run candidate checks',
     );
@@ -905,6 +1516,7 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
       .toEqual(replacementProfiles);
     await expect(page.getByText('Controller connected', { exact: true })).toBeVisible();
     await enter(page.getByRole('button', { name: 'New task', exact: true }).first());
+    await page.getByRole('button', { name: 'Create task manually', exact: true }).click();
     await page.getByLabel('Task title', { exact: true }).fill('Retain one native file proposal');
     await enter(page.getByRole('dialog').getByRole('button', { name: 'Create task', exact: true }));
     await enter(
@@ -1549,6 +2161,7 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     assert.deepEqual(sourceIdentity(source), original);
 
     await quotaRevocationBridge(application, page);
+    await conversationBridge(application, page);
     console.log(`Connected journey home: ${home}`);
   } finally {
     observer?.close();

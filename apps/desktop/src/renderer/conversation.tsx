@@ -1,4 +1,4 @@
-import type { Approval } from '@crewkite/contracts';
+import { type Approval, ConversationTextSchema } from '@crewkite/contracts';
 import {
   ArrowDown,
   ArrowUp,
@@ -35,6 +35,7 @@ type DecisionBase = {
   text: string;
   facts?: { label: string; value: string }[];
   pending?: boolean;
+  disabledReason?: string;
   resolution?: string;
 };
 
@@ -72,6 +73,7 @@ export type ConversationMessage = {
 
 export type ConversationProps = {
   conversationId: string;
+  visible?: boolean;
   messages: ConversationMessage[];
   primary: { name: string; role: string; route?: string; model?: string; effort?: string } | null;
   status: string;
@@ -80,6 +82,9 @@ export type ConversationProps = {
   maximumWorkers?: number;
   loading?: boolean;
   error?: string;
+  onLoadEarlier?: () => void;
+  loadingEarlier?: boolean;
+  historyBlocked?: boolean;
   composer: {
     value: string;
     onChange: (value: string) => void;
@@ -91,24 +96,25 @@ export type ConversationProps = {
   };
   onChoice?: (decisionId: string, choiceId: string) => void;
   onAnswer?: (questionId: string, text: string) => void;
+  answerDrafts?: Record<string, string>;
+  onAnswerDraftChange?: (questionId: string, text: string) => void;
   onApproval?: (approval: Approval, decision: 'approved' | 'denied') => void;
   onOpenSettings?: () => void;
 };
 
 const deliveryLabel = {
   pending: 'Saving',
-  queued: 'Queued for the next safe boundary',
+  queued: 'Queued for the next planning turn',
   included: 'Included in input',
   unknown: 'Delivery unknown',
   failed: 'Message was not saved',
 };
 
 function conversationTextError(text: string): string | null {
-  if (!text.isWellFormed()) return 'Use valid Unicode text before sending.';
-  if (text.includes('\0')) return 'Remove null characters before sending.';
-  if (new TextEncoder().encode(text).length > 4096)
-    return 'Keep the text within 4,096 UTF-8 bytes.';
-  return null;
+  if (!text) return null;
+  return ConversationTextSchema.safeParse(text).success
+    ? null
+    : 'Use valid Unicode without null characters, within 4,096 UTF-8 bytes.';
 }
 
 function StageIcon({ state }: { state: ConversationStage['state'] }) {
@@ -129,18 +135,25 @@ function DecisionCard({
   onAnswer,
   onApproval,
   disabled,
+  answerDraft,
+  onAnswerDraftChange,
 }: {
   decision: ConversationDecision;
   onChoice: ConversationProps['onChoice'];
   onAnswer: ConversationProps['onAnswer'];
   onApproval: ConversationProps['onApproval'];
   disabled: boolean;
+  answerDraft?: string;
+  onAnswerDraftChange?: (questionId: string, text: string) => void;
 }) {
-  const [answer, setAnswer] = useState('');
+  const [localAnswer, setLocalAnswer] = useState('');
+  const answer = answerDraft ?? localAnswer;
   const titleId = useId();
   const answerErrorId = useId();
   const answerError = conversationTextError(answer);
-  const busy = Boolean(disabled || decision.pending || decision.resolution);
+  const busy = Boolean(
+    disabled || decision.disabledReason || decision.pending || decision.resolution,
+  );
   const choices = decision.kind === 'approval' ? [] : (decision.choices ?? []);
   return (
     <section
@@ -290,7 +303,10 @@ function DecisionCard({
                   placeholder={decision.placeholder}
                   aria-invalid={Boolean(answerError)}
                   aria-describedby={answerError ? answerErrorId : undefined}
-                  onChange={(event) => setAnswer(event.target.value)}
+                  onChange={(event) => {
+                    if (onAnswerDraftChange) onAnswerDraftChange(decision.id, event.target.value);
+                    else setLocalAnswer(event.target.value);
+                  }}
                 />
               </label>
               {answerError && (
@@ -328,6 +344,9 @@ function DecisionCard({
           )}
         </>
       )}
+      {decision.disabledReason && !decision.pending && !decision.resolution && (
+        <p className="conversation-error">{decision.disabledReason}</p>
+      )}
       {decision.pending && (
         <p className="conversation-decision-pending" role="status">
           Saving the decision. Waiting for confirmation.
@@ -339,6 +358,7 @@ function DecisionCard({
 
 export function Conversation({
   conversationId,
+  visible = true,
   messages,
   primary,
   status,
@@ -347,9 +367,14 @@ export function Conversation({
   maximumWorkers,
   loading = false,
   error,
+  onLoadEarlier,
+  loadingEarlier = false,
+  historyBlocked = false,
   composer,
   onChoice,
   onAnswer,
+  answerDrafts,
+  onAnswerDraftChange,
   onApproval,
   onOpenSettings,
 }: ConversationProps) {
@@ -359,9 +384,10 @@ export function Conversation({
   const previousConversation = useRef(conversationId);
   const [newMessages, setNewMessages] = useState(false);
   const composerId = useId();
+  const historyAnchor = useRef<{ id: string; top: number } | null>(null);
   useEffect(() => {
     const element = transcript.current;
-    if (!element) return;
+    if (!element || !visible) return;
     if (previousConversation.current !== conversationId) {
       previousConversation.current = conversationId;
       follow.current = true;
@@ -370,13 +396,23 @@ export function Conversation({
       setNewMessages(false);
       return;
     }
+    if (historyAnchor.current) {
+      if (loadingEarlier) return;
+      const anchor = element.querySelector<HTMLElement>(
+        `[data-message-id="${CSS.escape(historyAnchor.current.id)}"]`,
+      );
+      if (anchor)
+        element.scrollTop += anchor.getBoundingClientRect().top - historyAnchor.current.top;
+      historyAnchor.current = null;
+      return;
+    }
     if (follow.current) {
       element.scrollTop = element.scrollHeight;
       setNewMessages(false);
     } else {
       setNewMessages(true);
     }
-  }, [conversationId, messages]);
+  }, [conversationId, messages, loadingEarlier, visible]);
   useEffect(() => {
     const element = textarea.current;
     if (!element) return;
@@ -442,6 +478,31 @@ export function Conversation({
           }}
         >
           <div className="conversation-thread">
+            {onLoadEarlier && (
+              <button
+                className="button secondary"
+                type="button"
+                disabled={loadingEarlier || historyBlocked}
+                onClick={() => {
+                  const element = transcript.current;
+                  const anchor =
+                    element &&
+                    [...element.querySelectorAll<HTMLElement>('[data-message-id]')].find(
+                      (row) =>
+                        row.getBoundingClientRect().bottom > element.getBoundingClientRect().top,
+                    );
+                  if (anchor?.dataset.messageId)
+                    historyAnchor.current = {
+                      id: anchor.dataset.messageId,
+                      top: anchor.getBoundingClientRect().top,
+                    };
+                  follow.current = false;
+                  onLoadEarlier();
+                }}
+              >
+                {loadingEarlier ? 'Loading earlier messages' : 'Load earlier messages'}
+              </button>
+            )}
             {loading && (
               <div className="conversation-empty" role="status">
                 <Clock size={25} />
@@ -460,7 +521,13 @@ export function Conversation({
               </div>
             )}
             {messages.map((message) => (
-              <article className={`conversation-message message-${message.kind}`} key={message.id}>
+              <article
+                className={`conversation-message message-${message.kind}`}
+                key={message.id}
+                id={`conversation-message-${message.id}`}
+                data-message-id={message.id}
+                tabIndex={-1}
+              >
                 <div className="conversation-message-avatar" aria-hidden="true">
                   {message.kind === 'user' ? (
                     'Y'
@@ -529,6 +596,8 @@ export function Conversation({
                     <DecisionCard
                       key={message.decision.id}
                       decision={message.decision}
+                      answerDraft={answerDrafts?.[message.decision.id]}
+                      onAnswerDraftChange={onAnswerDraftChange}
                       onChoice={onChoice}
                       onAnswer={onAnswer}
                       onApproval={onApproval}
@@ -583,12 +652,10 @@ export function Conversation({
             id={composerId}
             rows={3}
             value={composer.value}
-            disabled={Boolean(composer.disabledReason) || loading}
+            disabled={loading}
             aria-invalid={Boolean(composerError)}
             aria-describedby={`${composerId}-hint${composerError ? ` ${composerId}-error` : ''}`}
-            placeholder={
-              composer.placeholder ?? 'Describe the work, ask a question, or add guidance…'
-            }
+            placeholder={composer.placeholder ?? 'Soar to new heights with CrewKite'}
             onChange={(event) => composer.onChange(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
