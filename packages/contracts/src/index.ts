@@ -256,7 +256,9 @@ const legacyLocalModelBinding = z.strictObject({
   artifactSha256: HashSchema,
   quantization: z.literal('Q4_K_M'),
 });
+export const LocalAuthModeSchema = z.enum(['token', 'none']);
 export const LocalObservedModelBindingSchema = z.strictObject({
+  authMode: LocalAuthModeSchema.optional(),
   version: z.literal(2),
   identityKind: z.literal('runtime-metadata'),
   setupHash: HashSchema,
@@ -315,6 +317,8 @@ export const LocalSetupSchema = z
     setupHash: HashSchema.nullable(),
     connectionHash: HashSchema.nullable(),
     secretConfigured: z.boolean(),
+    authMode: LocalAuthModeSchema.optional(),
+    connected: z.boolean().optional(),
     operation: LocalOperationSchema.nullable(),
     generation: z.enum(['idle', 'active', 'unknown']),
     observation: LocalModelObservationSchema.nullable(),
@@ -323,6 +327,7 @@ export const LocalSetupSchema = z
       .enum([
         'unconfigured',
         'connection-required',
+        'connection-unavailable',
         'input-active',
         'input-unknown',
         'discovery-required',
@@ -346,6 +351,7 @@ export const LocalSetupSchema = z
         ? setup.setupHash === null &&
           setup.connectionHash === null &&
           !setup.secretConfigured &&
+          !setup.connected &&
           !setup.operation &&
           !setup.observation &&
           !setup.selection
@@ -364,6 +370,13 @@ export const LocalSetupSchema = z
                 (model) => model.selectionId === setup.selection?.selectionId,
               ))),
     'A selected Local setup needs its retained observation and choice identity.',
+  )
+  .refine(
+    (setup) =>
+      setup.authMode === 'none'
+        ? !setup.secretConfigured
+        : setup.connected === undefined || setup.connected === setup.secretConfigured,
+    'Local connection readiness must match its explicit authentication mode.',
   )
   .refine(localProjectionFits, 'Local setup exceeds its encoded byte bound.');
 export type LocalSetup = z.infer<typeof LocalSetupSchema>;
@@ -2036,7 +2049,10 @@ export const CommandSchema = z.discriminatedUnion('command', [
         ),
     }),
   ),
-  mutate('ConfigureLocal', z.strictObject({ endpoint: LocalEndpointSchema })),
+  mutate(
+    'ConfigureLocal',
+    z.strictObject({ endpoint: LocalEndpointSchema, authMode: LocalAuthModeSchema.optional() }),
+  ),
   mutate('RefreshLocalModels', z.strictObject({ consent: z.literal('explicit') })),
   mutate('SelectLocalModel', LocalModelSelectionSchema),
   mutate('BeginLocalConnectionInput', z.strictObject({ consent: z.literal('explicit') })),

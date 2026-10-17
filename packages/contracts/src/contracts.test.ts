@@ -1449,6 +1449,13 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     reason: 'connection-required',
   };
   assert.deepEqual(LocalSetupSchema.parse(localSetup), localSetup);
+  assert(LocalSetupSchema.safeParse({ ...localSetup, authMode: 'none', connected: true }).success);
+  for (const change of [
+    { authMode: 'none', secretConfigured: true },
+    { authMode: 'token', connected: true },
+    { authMode: 'automatic' },
+  ])
+    assert.equal(LocalSetupSchema.safeParse({ ...localSetup, ...change }).success, false);
   assert.deepEqual(SnapshotSchema.parse({ ...oldSnapshot, localSetup }).localSetup, localSetup);
   assert.equal(SnapshotSchema.parse({ ...oldSnapshot, localSetup: null }).localSetup, null);
   for (const kind of ['input', 'discovery'])
@@ -1737,6 +1744,8 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     );
   for (const [name, payload] of [
     ['ConfigureLocal', { endpoint: localSetup.endpoint }],
+    ['ConfigureLocal', { endpoint: localSetup.endpoint, authMode: 'token' }],
+    ['ConfigureLocal', { endpoint: localSetup.endpoint, authMode: 'none' }],
     ['RefreshLocalModels', { consent: 'explicit' }],
     ['SelectLocalModel', { selectionId: 'c'.repeat(64), observationHash: 'd'.repeat(64) }],
     ['BeginLocalConnectionInput', { consent: 'explicit' }],
@@ -1763,6 +1772,8 @@ test('process boundaries reject unknown fields and invalid command identity', ()
   }
   for (const [name, payload] of [
     ['ConfigureLocal', { endpoint: localSetup.endpoint, receipt: localReceipt }],
+    ['ConfigureLocal', { endpoint: localSetup.endpoint, authMode: 'automatic' }],
+    ['ConfigureLocal', { endpoint: 'ws://0.0.0.0:1234', authMode: 'none' }],
     ['RefreshLocalModels', { consent: 'saved' }],
     ['SelectLocalModel', { selectionId: 'not-an-id', observationHash: 'd'.repeat(64) }],
     ['SelectLocalModel', { selectionId: 'c'.repeat(64) }],
