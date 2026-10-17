@@ -17,6 +17,7 @@ import {
 } from 'node:fs';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
+import { setImmediate } from 'node:timers';
 import { ReadDataSchema } from '@crewkite/contracts';
 import { createSyntheticRepository } from '@crewkite/testkit/repository';
 import {
@@ -27,8 +28,14 @@ import {
   inspectSourceDetails,
   readFiles,
 } from './source.ts';
+import {
+  type CopyBudget,
+  copyInstalledDependencies,
+  inspectInstalledDependencies,
+  inventoryTree,
+} from './toolchain.ts';
 
-test('source inspection bounds file metadata without running filters or reading special files', (t) => {
+test('source inspection bounds file metadata without running filters or reading special files', async (t) => {
   mkdirSync(resolve('internal'), { recursive: true });
   const directory = mkdtempSync(join(resolve('internal'), 'source-test-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
@@ -79,6 +86,185 @@ test('source inspection bounds file metadata without running filters or reading 
   assert.throws(() => readFiles(special), /unsupported|regular/);
   assert.equal(existsSync(canary), false);
   assert.deepEqual(readFileSync(join(source.directory, '.git', 'index')), index);
+
+  const budget = (): CopyBudget => ({
+    deadline: 1000,
+    now: () => 0,
+    maximumEntries: 100,
+    maximumBytes: 1024 * 1024,
+  });
+  const workspace = 'apps/local';
+  const installed = 'node_modules/.pnpm/tiny@1.0.0/node_modules/tiny';
+  const executable = `${installed}/cli.mjs`;
+  const cases = [
+    'copy',
+    'nested package copy',
+    'donor bytes',
+    'donor mode',
+    'donor link',
+    'staged bytes',
+    'staged mode',
+    'staged link',
+    'lock',
+    'workspace manifest',
+    'workspace configuration',
+    'settings',
+    'installed version',
+    'escaping link',
+    'dangling link',
+    'cyclic link',
+    'special file',
+    'entries',
+    'bytes',
+    'deadline',
+    'cancel during copy',
+  ];
+  for (const name of cases) {
+    const donor = join(directory, 'closure', name, 'donor');
+    const candidate =
+      name === 'nested package copy'
+        ? join(donor, 'internal/package-source')
+        : join(directory, 'closure', name, 'candidate');
+    for (const root of [donor, candidate]) {
+      mkdirSync(join(root, workspace), { recursive: true });
+      writeFileSync(
+        join(root, 'package.json'),
+        JSON.stringify({
+          name: 'fixture',
+          packageManager: 'pnpm@12.11.2',
+          dependencies: { tiny: '1.0.0', '@tiny/local': 'workspace:*' },
+        }),
+      );
+      writeFileSync(join(root, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n');
+      writeFileSync(join(root, 'pnpm-workspace.yaml'), 'packages: [apps/*]\n');
+      writeFileSync(join(root, '.npmrc'), 'engine-strict=true\n');
+      writeFileSync(
+        join(root, workspace, 'package.json'),
+        JSON.stringify({
+          name: '@tiny/local',
+          dependencies: { tiny: '1.0.0' },
+        }),
+      );
+    }
+    mkdirSync(join(donor, installed), { recursive: true });
+    writeFileSync(
+      join(donor, installed, 'package.json'),
+      JSON.stringify({ name: 'tiny', version: '1.0.0' }),
+    );
+    writeFileSync(join(donor, executable), 'export {};\n');
+    chmodSync(join(donor, executable), 0o751);
+    mkdirSync(join(donor, 'node_modules/@tiny'));
+    symlinkSync('../../apps/local', join(donor, 'node_modules/@tiny/local'));
+    symlinkSync('.pnpm/tiny@1.0.0/node_modules/tiny', join(donor, 'node_modules/tiny'));
+    mkdirSync(join(donor, workspace, 'node_modules/.pnpm-cache'), { recursive: true });
+    writeFileSync(join(donor, workspace, 'node_modules/.pnpm-cache/keep'), 'kept');
+    symlinkSync(
+      '../../../node_modules/.pnpm/tiny@1.0.0/node_modules/tiny',
+      join(donor, workspace, 'node_modules/tiny'),
+    );
+    mkdirSync(join(donor, installed, '.pnpm-cache'));
+    writeFileSync(join(donor, installed, '.pnpm-cache/omit'), 'omitted');
+    if (name === 'installed version')
+      writeFileSync(join(donor, installed, 'package.json'), '{"name":"tiny","version":"2.0.0"}');
+    if (name === 'escaping link') symlinkSync('../../candidate', join(donor, 'node_modules/extra'));
+    if (name === 'dangling link') symlinkSync('missing', join(donor, 'node_modules/extra'));
+    if (name === 'cyclic link') symlinkSync('extra', join(donor, 'node_modules/extra'));
+    if (name === 'special file') execFileSync('mkfifo', [join(donor, 'node_modules/pipe')]);
+    if (
+      [
+        'installed version',
+        'escaping link',
+        'dangling link',
+        'cyclic link',
+        'special file',
+      ].includes(name)
+    ) {
+      await assert.rejects(inspectInstalledDependencies(donor, [workspace], budget()), Error, name);
+      continue;
+    }
+    if (name === 'cancel during copy')
+      writeFileSync(join(donor, installed, 'large'), Buffer.alloc(600000));
+    const expected = await inspectInstalledDependencies(donor, [workspace], budget());
+    assert.ok(Object.isFrozen(expected) && Object.isFrozen(expected.tree.entries));
+    assert.ok(expected.tree.entries.every(Object.isFrozen));
+    if (name === 'donor bytes') writeFileSync(join(donor, executable), 'changed');
+    if (name === 'donor mode') chmodSync(join(donor, executable), 0o644);
+    if (name === 'donor link') {
+      unlinkSync(join(donor, 'node_modules/@tiny/local'));
+      symlinkSync('../tiny', join(donor, 'node_modules/@tiny/local'));
+    }
+    const changed = (
+      {
+        lock: 'pnpm-lock.yaml',
+        'workspace manifest': `${workspace}/package.json`,
+        'workspace configuration': 'pnpm-workspace.yaml',
+        settings: '.npmrc',
+      } as Record<string, string>
+    )[name];
+    if (changed) writeFileSync(join(candidate, changed), 'changed');
+    const limits = budget();
+    if (name === 'entries') limits.maximumEntries = 1;
+    if (name === 'bytes') limits.maximumBytes = 1;
+    if (name === 'deadline') {
+      let ticks = 0;
+      limits.now = () => ++ticks;
+      limits.deadline = 10;
+    }
+    let mutated = false;
+    if (name.startsWith('staged'))
+      limits.now = () => {
+        if (!mutated && existsSync(join(candidate, 'node_modules/tiny'))) {
+          mutated = true;
+          if (name === 'staged bytes') writeFileSync(join(candidate, executable), 'changed');
+          if (name === 'staged mode') chmodSync(join(candidate, executable), 0o644);
+          if (name === 'staged link') {
+            unlinkSync(join(candidate, 'node_modules/@tiny/local'));
+            symlinkSync('../tiny', join(candidate, 'node_modules/@tiny/local'));
+          }
+        }
+        return 0;
+      };
+    if (name === 'cancel during copy') {
+      const stop = new AbortController();
+      limits.signal = stop.signal;
+      limits.now = () => {
+        if (!mutated && existsSync(join(candidate, installed, 'large'))) {
+          mutated = true;
+          setImmediate(() => stop.abort());
+        }
+        return 0;
+      };
+    }
+    if (name !== 'copy' && name !== 'nested package copy') {
+      await assert.rejects(
+        copyInstalledDependencies(donor, candidate, expected, limits),
+        Error,
+        name,
+      );
+      if (name.startsWith('staged') || name === 'cancel during copy')
+        assert.equal(mutated, true, name);
+      if (name === 'cancel during copy') assert.equal(limits.signal?.aborted, true);
+      continue;
+    }
+    assert.deepEqual(await copyInstalledDependencies(donor, candidate, expected, limits), expected);
+    assert.deepEqual(await inspectInstalledDependencies(donor, [workspace], budget()), expected);
+    assert.equal(lstatSync(join(candidate, executable)).mode & 0o777, 0o751);
+    assert.notEqual(
+      lstatSync(join(candidate, executable)).ino,
+      lstatSync(join(donor, executable)).ino,
+    );
+    assert.equal(readlinkSync(join(candidate, 'node_modules/@tiny/local')), '../../apps/local');
+    assert.ok(
+      expected.tree.entries.some(
+        (entry) => entry.path === `${workspace}/node_modules/.pnpm-cache/keep`,
+      ),
+    );
+    assert.ok(!expected.tree.entries.some((entry) => entry.path === `${installed}/.pnpm-cache`));
+    const tools = await inventoryTree(join(candidate, installed), budget());
+    assert.equal(tools.files, 2);
+    assert.equal(tools.entries.find((entry) => entry.path === 'cli.mjs')?.kind, 'file');
+    await assert.rejects(copyInstalledDependencies(donor, candidate, expected, budget()), /EEXIST/);
+  }
 });
 
 test('replacement checks the full source before writing and preserves mode with exact truncation', (t) => {
