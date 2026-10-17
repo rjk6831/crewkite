@@ -1,4 +1,4 @@
-import { ConversationModelCatalogEntriesSchema } from '@crewkite/contracts';
+import { ConversationModelCatalogEntriesSchema, type Observation } from '@crewkite/contracts';
 import { z } from 'zod';
 
 const MAX_LINE_BYTES = 65_536;
@@ -281,22 +281,23 @@ const window = z
     resetsAt: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
   })
   .nullable();
+const creditSnapshot = z
+  .object({
+    hasCredits: z.boolean(),
+    unlimited: z.boolean(),
+    balance: z
+      .string()
+      .max(128)
+      .regex(/^-?\d+(?:\.\d+)?$/)
+      .nullish(),
+  })
+  .nullish();
 const bucket = z
   .object({
     limitId: id.nullish(),
     primary: window.optional(),
     secondary: window.optional(),
-    credits: z
-      .object({
-        hasCredits: z.boolean(),
-        unlimited: z.boolean(),
-        balance: z
-          .string()
-          .max(128)
-          .regex(/^-?\d+(?:\.\d+)?$/)
-          .nullish(),
-      })
-      .nullish(),
+    credits: creditSnapshot,
     spendControlReached: z.boolean().nullish(),
     rateLimitReachedType: z
       .enum([
@@ -345,6 +346,153 @@ const limits = z
     ...limits,
     availableResetCount: rateLimitResetCredits?.availableCount ?? null,
   }));
+
+export type OpenAiUsageWindow = Omit<Observation, 'routeId' | 'observedAt'>;
+export type OpenAiCredits = Readonly<{
+  limitId: string;
+  state: 'available' | 'unlimited' | 'none';
+  balance: string | null;
+}>;
+export type OpenAiUsage = Readonly<{
+  complete: boolean;
+  windows: readonly OpenAiUsageWindow[];
+  credits: readonly OpenAiCredits[];
+}>;
+/** Runs synchronously on arrival, so the receiver's clock at call time is the receive time. */
+export type OpenAiUsageHook = (usage: OpenAiUsage) => void;
+type UsageMethod = 'account/rateLimits/read' | 'account/rateLimits/updated';
+export type UsageReporter = (method: UsageMethod, payload: unknown) => void;
+
+// The limit ID becomes part of a stored key and a visible label, so it stays short and plain.
+const usageLimitId = /^[A-Za-z0-9._-]{1,64}$/;
+// Usage reads the wire bounds. Admission keeps its own stricter window schema above.
+const usageWindowValue = z
+  .object({
+    // An i32 on the wire. Above 100 means the window is over its limit.
+    usedPercent: z.number().int().min(0).max(2_147_483_647),
+    // The contract caps a period at one year.
+    windowDurationMins: z.number().int().positive().max(525_600).nullable(),
+    // 9999-12-31T23:59:59Z. Later instants have no ISO form the contract accepts.
+    resetsAt: z.number().int().nonnegative().max(253_402_300_799).nullable(),
+  })
+  .nullish();
+const usageBucket = z.object({
+  limitId: id.nullish(),
+  primary: usageWindowValue,
+  secondary: usageWindowValue,
+  credits: creditSnapshot,
+});
+const usagePayload = {
+  'account/rateLimits/read': z.object({
+    rateLimits: usageBucket,
+    // Two windows per bucket keep a complete read within one 32-window batch.
+    rateLimitsByLimitId: z
+      .record(id, usageBucket)
+      .refine((value) => Object.keys(value).length <= 16)
+      .nullish(),
+  }),
+  'account/rateLimits/updated': z.object({ rateLimits: usageBucket }),
+};
+const compareKeys = ([left]: [string, unknown], [right]: [string, unknown]) =>
+  left < right ? -1 : left > right ? 1 : 0;
+
+function usageWindow(
+  windowId: string,
+  value: NonNullable<z.output<typeof usageWindowValue>>,
+): OpenAiUsageWindow {
+  const periodSeconds = value.windowDurationMins === null ? null : value.windowDurationMins * 60;
+  return {
+    windowId,
+    // The contract requires a kind. Only an exact seven-day duration is called weekly.
+    kind: periodSeconds === 604_800 ? 'weekly' : 'rolling',
+    ...(periodSeconds === null ? {} : { semantics: { scope: 'provider' as const, periodSeconds } }),
+    // An over-limit window has nothing left. It stays visible as exhausted.
+    remaining: { value: 100 - Math.min(value.usedPercent, 100), unit: 'percent' },
+    resetsAt: value.resetsAt === null ? null : new Date(value.resetsAt * 1000).toISOString(),
+    source: 'client',
+    confidence: 'reported',
+  };
+}
+
+/**
+ * Maps one rate-limit read or update to client windows, without routes or observation time.
+ * A window ID joins the bucket's own limit ID and the field that carried the window, as
+ * `${limitId}:primary` or `${limitId}:secondary`. usedPercent is an integer percent,
+ * windowDurationMins is minutes and resetsAt is Unix seconds. Only a read with
+ * rateLimitsByLimitId lists every bucket. The legacy rateLimits view in that read mirrors one
+ * entry and is skipped. An update is sparse by protocol, and a null window there means not
+ * reported. Credit balances stay separate.
+ */
+export function projectOpenAiUsage(method: UsageMethod, payload: unknown): OpenAiUsage {
+  const parsed = usagePayload[method].parse(payload);
+  const listed = 'rateLimitsByLimitId' in parsed ? (parsed.rateLimitsByLimitId ?? null) : null;
+  const single = parsed.rateLimits;
+  // A sparse view without a limit ID has no identity to store a window under.
+  const buckets: [string, typeof single][] = listed
+    ? Object.entries(listed)
+    : single.limitId == null
+      ? []
+      : [[single.limitId, single]];
+  let complete = listed !== null;
+  const windows: OpenAiUsageWindow[] = [];
+  const credits: OpenAiCredits[] = [];
+  for (const [limitId, value] of buckets.sort(compareKeys)) {
+    // A bucket without a usable identity is dropped, so the read no longer lists every bucket.
+    if (!usageLimitId.test(limitId) || (value.limitId != null && value.limitId !== limitId)) {
+      complete = false;
+      continue;
+    }
+    if (value.primary) windows.push(usageWindow(`${limitId}:primary`, value.primary));
+    if (value.secondary) windows.push(usageWindow(`${limitId}:secondary`, value.secondary));
+    if (value.credits)
+      credits.push({
+        limitId,
+        state: value.credits.unlimited
+          ? 'unlimited'
+          : value.credits.hasCredits
+            ? 'available'
+            : 'none',
+        balance: value.credits.balance ?? null,
+      });
+  }
+  return { complete, windows, credits };
+}
+
+/**
+ * One reporter per client process. A read hands on every window it lists. A null duration or
+ * reset in an update keeps the value reported before, as the protocol asks clients to merge. The
+ * receiver drops a repeat only after it accepted the first copy, so a refused report can return.
+ * Usage is advisory. A refused payload or a failing hook never changes the transcript.
+ */
+export function openAiUsageReporter(hook: OpenAiUsageHook | undefined): UsageReporter {
+  const reported = new Map<string, OpenAiUsageWindow>();
+  return (method, payload) => {
+    if (!hook) return;
+    try {
+      const usage = projectOpenAiUsage(method, payload);
+      if (usage.complete) reported.clear();
+      const windows = usage.windows.map((window) => {
+        const previous =
+          method === 'account/rateLimits/updated' ? reported.get(window.windowId) : undefined;
+        const merged: OpenAiUsageWindow = previous
+          ? {
+              ...window,
+              ...(window.semantics || !previous.semantics
+                ? {}
+                : { kind: previous.kind, semantics: previous.semantics }),
+              resetsAt: window.resetsAt ?? previous.resetsAt,
+            }
+          : window;
+        reported.set(window.windowId, merged);
+        return merged;
+      });
+      if (windows.length) hook({ ...usage, windows });
+    } catch {
+      // Older windows keep their own times. The next read or update can replace them.
+    }
+  };
+}
+
 const models = z
   .object({
     data: z
@@ -505,6 +653,9 @@ export class OpenAiDiscovery {
   private requirementsRequested = false;
   private requirements?: DiscoveryMetadata['requirements'];
   private readonly configurationDirectory?: string;
+  // One reporter per client process. Transcripts send their sparse updates through it too, so
+  // an update merges with this process's read.
+  readonly reportUsage: UsageReporter;
 
   constructor(options: {
     now: () => number;
@@ -512,8 +663,10 @@ export class OpenAiDiscovery {
     readConfiguration?: boolean;
     readMcpConfiguration?: boolean;
     configurationDirectory?: string;
+    onUsage?: OpenAiUsageHook;
   }) {
     this.now = options.now;
+    this.reportUsage = openAiUsageReporter(options.onUsage);
     const start = this.now();
     if (
       !Number.isFinite(start) ||
@@ -635,6 +788,8 @@ export class OpenAiDiscovery {
               this.fail('unsupported-account');
             break;
           case 2:
+            // Usage reads first, so an over-limit window still shows when admission refuses it.
+            this.reportUsage('account/rateLimits/read', value.result);
             this.limits = limits.parse(value.result);
             break;
           case 3: {
