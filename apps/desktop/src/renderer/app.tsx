@@ -2404,7 +2404,11 @@ function GoogleSetup({ snapshot, workspace }: { snapshot: Snapshot; workspace: W
 
 function usageReading(value: UsageGaugeReading, label = value.label): UsageReading {
   const { reserveNote, ...facts } = value;
-  return { ...facts, label, ...(reserveNote === null ? {} : { reserveNote }) };
+  return {
+    ...facts,
+    label,
+    ...(reserveNote === null ? {} : { reserveNote: 'See reserve details', note: reserveNote }),
+  };
 }
 
 function Usage({
