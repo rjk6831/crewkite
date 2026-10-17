@@ -245,6 +245,21 @@ async function enter(button: Locator) {
   await button.press('Enter');
 }
 
+async function desktopSnapshot(page: Page) {
+  try {
+    return SnapshotSchema.parse(await page.evaluate(() => window.crewkite?.getSnapshot()));
+  } catch (failure) {
+    if (
+      failure instanceof Error &&
+      /(?:Controller is offline\.|The controller is offline\.|Snapshot unavailable: connection-lost\.)/u.test(
+        failure.message,
+      )
+    )
+      return null;
+    throw failure;
+  }
+}
+
 async function quotaRevocationBridge(
   application: Awaited<ReturnType<typeof _electron.launch>>,
   page: Page,
@@ -764,14 +779,12 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     });
     const nativeEvents = new Timeline();
     await observer.subscribe('0', (event) => nativeEvents.append(event));
-    await enter(page.getByRole('button', { name: 'Reconnect controller', exact: true }));
+    const replacementProfiles = (await observer.snapshot()).nativeProfiles;
+    assert.equal(replacementProfiles[0]?.displayName, 'OpenAI scripted proposal fixture');
     await expect
-      .poll(
-        async () =>
-          (await page.evaluate(() => window.crewkite?.getSnapshot()))?.nativeProfiles[0]
-            ?.displayName,
-      )
-      .toBe('OpenAI scripted proposal fixture');
+      .poll(async () => (await desktopSnapshot(page))?.nativeProfiles ?? null)
+      .toEqual(replacementProfiles);
+    await expect(page.getByText('Controller connected', { exact: true })).toBeVisible();
     await enter(page.getByRole('button', { name: 'New task', exact: true }).first());
     await page.getByLabel('Task title', { exact: true }).fill('Retain one native file proposal');
     await enter(page.getByRole('dialog').getByRole('button', { name: 'Create task', exact: true }));
@@ -1401,8 +1414,9 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
       ...readControllerEndpoint(home),
       actor: { id: 'native-reopened-observer', kind: 'cli' },
     });
-    await enter(page.getByRole('button', { name: 'Reconnect controller', exact: true }));
     const reopenedNative = await observer.snapshot();
+    await expect.poll(() => desktopSnapshot(page)).toEqual(reopenedNative);
+    await expect(page.getByText('Controller connected', { exact: true })).toBeVisible();
     assert.deepEqual(reopenedNative.nativeRuns, nativeSnapshot.nativeRuns);
     assert.deepEqual(reopenedNative.candidateEvaluations, nativeSnapshot.candidateEvaluations);
     assert.equal(reopenedNative.attempts.length, nativeSnapshot.attempts.length);
