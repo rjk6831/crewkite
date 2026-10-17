@@ -345,6 +345,7 @@ test('native proposals and reviews require one matching completed turn and bound
         ...(mode === 'byte-limit' ? { content: 'é'.repeat(32768) } : {}),
       });
       assert.equal(result.qualified, false);
+      assert.equal(Object.hasOwn(result, 'modelChoices'), false);
       assert.equal(result.observedRetries, mode === 'reasoning-retry' ? 1 : 0);
       assert(!JSON.stringify(result).includes('private-data'));
       assert.equal(reader.next(), null);
@@ -762,6 +763,7 @@ test('native proposals and reviews require one matching completed turn and bound
       const result = perform();
       assert.deepEqual(result.review, response);
       assert.equal(result.qualified, false);
+      assert.equal(Object.hasOwn(result, 'modelChoices'), false);
       assert.equal(review.next(), null);
       assert.equal('replacement' in result, false);
     } else {
@@ -1102,6 +1104,17 @@ test('native proposals and reviews require one matching completed turn and bound
       criteria: ['Return the bounded net.'],
     },
   });
+  for (const change of [{ model: 'planning-fixture' }, { effort: 'medium' }]) {
+    assert.throws(() =>
+      replacementPlan({ ...plan(directory), ...change } as Parameters<typeof replacementPlan>[0]),
+    );
+    assert.throws(() =>
+      reviewPlan({ ...reviewData, ...change } as Parameters<typeof reviewPlan>[0]),
+    );
+    assert.throws(() =>
+      repositoryPlan({ ...repositoryInput, ...change } as Parameters<typeof repositoryPlan>[0]),
+    );
+  }
   assert.equal(repositoryInput.creditPolicy, 'ordinary');
   assert.equal(resolveRepositoryProfile({}).facts.id, 'openai-repository-v1');
   for (const invalid of [
@@ -1299,6 +1312,7 @@ test('native proposals and reviews require one matching completed turn and bound
       assert(!JSON.stringify(activities).includes('private-repository-canary'));
       assert.equal(result.manifestHash, repositoryInput.manifestHash);
       assert.equal(result.qualified, false);
+      assert.equal(Object.hasOwn(result, 'modelChoices'), false);
       assert.equal('replacement' in result, false);
       assert(!JSON.stringify(result).includes('private-repository-canary'));
     } else assert.throws(perform, mode);

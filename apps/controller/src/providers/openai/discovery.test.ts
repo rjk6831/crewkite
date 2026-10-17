@@ -503,6 +503,39 @@ test('provider discovery emits only correlated metadata and excludes private fie
       },
       reason: 'invalid-message',
     },
+    ...[
+      [],
+      [catalog().data[0], catalog().data[0]],
+      [{ ...catalog().data[0], supportedReasoningEfforts: [] }],
+      [
+        {
+          ...catalog().data[0],
+          supportedReasoningEfforts: Array(17).fill({ reasoningEffort: 'native-effort' }),
+        },
+      ],
+      [
+        {
+          ...catalog().data[0],
+          supportedReasoningEfforts: [
+            { reasoningEffort: 'native-effort' },
+            { reasoningEffort: 'native-effort' },
+          ],
+        },
+      ],
+      [{ ...catalog().data[0], defaultReasoningEffort: 'unadvertised' }],
+      [{ ...catalog().data[0], model: 'é'.repeat(101) }],
+      [{ ...catalog().data[0], model: 'private\nmodel' }],
+      [{ ...catalog().data[0], supportedReasoningEfforts: [{ reasoningEffort: 'é'.repeat(17) }] }],
+    ].map(
+      (data): Scenario => ({
+        name: 'model catalog remains complete, unambiguous and bounded',
+        change: (values) => {
+          values[3] = { ...catalog(), data };
+          return values;
+        },
+        reason: 'invalid-message',
+      }),
+    ),
     {
       name: 'nonfinite allowance',
       change: (values) => {

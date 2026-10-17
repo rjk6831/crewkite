@@ -3,6 +3,8 @@ import { isAbsolute, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import {
   AttemptIdSchema,
+  ConversationModelCatalogEntriesSchema,
+  ConversationModelRequestSchema,
   HashSchema,
   NativeTargetPathSchema,
   SealedHandoffPacketSchema,
@@ -10,7 +12,7 @@ import {
 import { verifyHandoff } from '@crewkite/contracts/hash';
 import { z } from 'zod';
 import { type DiscoveryMetadata, OpenAiDiscovery } from './discovery.ts';
-import { type NativeLaunch, startNativeTask } from './native-discovery.ts';
+import { type NativeLaunch, type NativeTranscript, startNativeTask } from './native-discovery.ts';
 
 const MAX_CONTENT = 65_536;
 const id = z.string().min(1).max(200);
@@ -199,7 +201,9 @@ type Cause =
   | 'limit'
   | 'deadline'
   | 'incomplete'
-  | 'admission';
+  | 'admission'
+  | 'model-unavailable'
+  | 'effort-unavailable';
 type Frame =
   | 'none'
   | 'response'
@@ -220,7 +224,12 @@ export type ReplacementDiagnostic = Readonly<{
   field: (typeof fields)[number] | 'other' | null;
 }>;
 
-const session = input.pick({ model: true, effort: true, creditPolicy: true, directory: true });
+const session = z.strictObject({
+  model: ConversationModelRequestSchema.shape.model,
+  effort: ConversationModelRequestSchema.shape.effort,
+  creditPolicy: input.shape.creditPolicy,
+  directory: input.shape.directory,
+});
 export type StructuredSession = z.output<typeof session>;
 export type StructuredCodec<T extends Record<string, unknown>> = Readonly<{
   text: string;
@@ -229,9 +238,16 @@ export type StructuredCodec<T extends Record<string, unknown>> = Readonly<{
   parse: (value: unknown) => T | null;
 }>;
 
+function choiceFailure(metadata: DiscoveryMetadata, plan: StructuredSession) {
+  const matches = metadata.models.filter((model) => model.model === plan.model);
+  if (matches.length !== 1) return 'model-unavailable' as const;
+  return matches[0].supportedReasoningEfforts.includes(plan.effort)
+    ? null
+    : ('effort-unavailable' as const);
+}
+
 /** Writer and reviewer admission use the same fresh account and allowance facts. */
 export function nativeTaskAdmitted(metadata: DiscoveryMetadata, plan: StructuredSession) {
-  const model = metadata.models.find((model) => model.model === plan.model);
   const limits = metadata.limits;
   const creditBucket = limits.rateLimitsByLimitId
     ? limits.rateLimitsByLimitId.codex
@@ -250,7 +266,7 @@ export function nativeTaskAdmitted(metadata: DiscoveryMetadata, plan: Structured
   return (
     metadata.account.plan === 'pro' &&
     (limits.ordinaryUsageAllowed === true || !!existingCreditsAllowed) &&
-    !!model?.supportedReasoningEfforts.includes(plan.effort) &&
+    choiceFailure(metadata, plan) === null &&
     !!metadata.mcpServers &&
     !Object.values(metadata.mcpServers).some((enabled) => enabled)
   );
@@ -412,6 +428,8 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
           this.discovery.push(line);
           if (this.discovery.complete) {
             this.metadata = this.discovery.finish();
+            const choice = choiceFailure(this.metadata, this.plan);
+            if (choice) this.refuse(choice);
             if (!nativeTaskAdmitted(this.metadata, this.plan)) this.refuse('admission');
             this.step = 'thread';
           }
@@ -763,6 +781,17 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
       qualified: false as const,
     };
   }
+  protected completedModelChoices() {
+    this.check();
+    if (!this.complete || !this.final || !this.metadata) this.refuse('incomplete');
+    return ConversationModelCatalogEntriesSchema.parse(
+      this.metadata.models.map((model) => ({
+        model: model.model,
+        efforts: model.supportedReasoningEfforts,
+        defaultEffort: model.defaultReasoningEffort,
+      })),
+    );
+  }
   get complete() {
     return !this.failed && this.step === 'complete' && this.pending.length === 0;
   }
@@ -834,10 +863,15 @@ export class ReplacementTranscript extends StructuredTranscript<{ replacement: R
 export function startStructuredTask<T extends Record<string, unknown>>(
   launch: NativeLaunch,
   options: Omit<Parameters<typeof startNativeTask>[1], 'now'> & { now?: () => number },
-  createReader: (options: { now: () => number; timeoutMs: number }) => StructuredTranscript<T>,
+  createReader: (options: {
+    now: () => number;
+    timeoutMs: number;
+  }) => NativeTranscript<T> & { readonly diagnostic: ReplacementDiagnostic | null },
 ) {
   const now = options.now ?? (() => performance.now());
-  let reader: StructuredTranscript<T> | undefined;
+  let reader:
+    | (NativeTranscript<T> & { readonly diagnostic: ReplacementDiagnostic | null })
+    | undefined;
   const handle = startNativeTask(
     launch,
     { ...options, now, disableMcpServers: true },

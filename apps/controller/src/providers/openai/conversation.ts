@@ -4,12 +4,14 @@ import {
   ArtifactIdSchema,
   ConversationContextBundleSchema,
   ConversationContextRefsSchema,
+  ConversationModelRequestSchema,
   ConversationTurnBindingSchema,
   ConversationTurnResultSchema,
   HashSchema,
   MessageIdSchema,
   NativeTargetPathSchema,
   ProjectIdSchema,
+  RevisionSchema,
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
@@ -28,8 +30,15 @@ const text = (limit: number) =>
 const role = z.enum(['coder', 'reviewer', 'advisor']);
 const input = z.strictObject({
   binding: ConversationTurnBindingSchema,
-  model: z.literal('gpt-6.1-sol'),
-  effort: z.literal('low'),
+  model: ConversationModelRequestSchema.shape.model,
+  effort: ConversationModelRequestSchema.shape.effort,
+  selection: z
+    .strictObject({
+      version: z.literal(1),
+      configurationRevision: RevisionSchema,
+      modelRequest: ConversationModelRequestSchema,
+    })
+    .optional(),
   creditPolicy: z.enum(['ordinary', 'existing-credits']).default('ordinary'),
   directory: z.string().min(1).max(4096).refine(isAbsolute),
   context: z.strictObject({
@@ -77,6 +86,7 @@ function task(plan: z.output<typeof input>) {
     scope: plan.scope,
     history: plan.history,
     omittedHistoryCount: plan.omittedHistoryCount,
+    ...(plan.selection ? { selection: plan.selection } : {}),
     ...(plan.contextAttachments?.length
       ? { contextSource: plan.contextSource, contextAttachments: plan.contextAttachments }
       : {}),
@@ -92,10 +102,18 @@ function prompt(plan: z.output<typeof input>) {
 
 /** The controller supplies an admitted identity and the complete permitted context. */
 export function conversationPlan(value: z.input<typeof input>) {
-  const { contextAttachments, contextSource, ...legacy } = input.parse(value);
+  const { contextAttachments, contextSource, selection, ...legacy } = input.parse(value);
+  if (
+    selection
+      ? legacy.model !== selection.modelRequest.model ||
+        legacy.effort !== selection.modelRequest.effort
+      : legacy.model !== 'gpt-6.1-sol' || legacy.effort !== 'low'
+  )
+    throw new Error('The conversation model differs from its frozen selection.');
+  const selected = { ...legacy, ...(selection ? { selection } : {}) };
   const data: z.output<typeof input> = contextAttachments?.length
-    ? { ...legacy, contextSource, contextAttachments }
-    : { ...legacy, history: legacy.history.map(({ role, text }) => ({ role, text })) };
+    ? { ...selected, contextSource, contextAttachments }
+    : { ...selected, history: legacy.history.map(({ role, text }) => ({ role, text })) };
   if (data.contextAttachments) {
     const retained = data.history.filter((entry) => entry.messageId !== undefined);
     if (
@@ -181,6 +199,9 @@ export class ConversationTranscript extends StructuredTranscript<{
           : null;
       },
     });
+  }
+  override finish() {
+    return { ...super.finish(), modelChoices: this.completedModelChoices() };
   }
 }
 

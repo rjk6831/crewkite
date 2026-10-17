@@ -1,3 +1,4 @@
+import { ConversationModelCatalogEntriesSchema } from '@crewkite/contracts';
 import { z } from 'zod';
 
 const MAX_LINE_BYTES = 65_536;
@@ -344,26 +345,39 @@ const limits = z
     ...limits,
     availableResetCount: rateLimitResetCredits?.availableCount ?? null,
   }));
-const models = z.object({
-  data: z
-    .array(
-      z
-        .object({
-          id,
-          model: id,
-          supportedReasoningEfforts: z.array(z.object({ reasoningEffort: text(32) })).max(16),
-          defaultReasoningEffort: text(32),
-        })
-        .transform(({ supportedReasoningEfforts, ...value }) => ({
-          ...value,
-          supportedReasoningEfforts: supportedReasoningEfforts.map(
-            (entry) => entry.reasoningEffort,
-          ),
+const models = z
+  .object({
+    data: z
+      .array(
+        z
+          .object({
+            id,
+            model: id,
+            supportedReasoningEfforts: z.array(z.object({ reasoningEffort: text(32) })).max(16),
+            defaultReasoningEffort: text(32),
+          })
+          .transform(({ supportedReasoningEfforts, ...value }) => ({
+            ...value,
+            supportedReasoningEfforts: supportedReasoningEfforts.map(
+              (entry) => entry.reasoningEffort,
+            ),
+          })),
+      )
+      .max(20),
+    nextCursor: text(256).nullable(),
+  })
+  .refine(
+    (catalog) =>
+      new Set(catalog.data.map((entry) => entry.id)).size === catalog.data.length &&
+      ConversationModelCatalogEntriesSchema.safeParse(
+        catalog.data.map((entry) => ({
+          model: entry.model,
+          efforts: entry.supportedReasoningEfforts,
+          defaultEffort: entry.defaultReasoningEffort,
         })),
-    )
-    .max(20),
-  nextCursor: text(256).nullable(),
-});
+      ).success,
+    'A complete model catalog needs distinct bounded identifiers and supported efforts.',
+  );
 
 const configuration = z
   .object({
