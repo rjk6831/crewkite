@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   chmodSync,
   existsSync,
@@ -22,11 +23,14 @@ import { canonicalJson, ReadDataSchema } from '@crewkite/contracts';
 import { createSyntheticRepository } from '@crewkite/testkit/repository';
 import {
   applyReplacement,
+  committedFiles,
+  type FileContent,
   type FileEntry,
   git,
   inspectSource,
   inspectSourceDetails,
   readFiles,
+  treeFromFiles,
 } from './source.ts';
 import {
   type CopyBudget,
@@ -86,6 +90,73 @@ test('source inspection bounds file metadata without running filters or reading 
   assert.throws(() => readFiles(special), /unsupported|regular/);
   assert.equal(existsSync(canary), false);
   assert.deepEqual(readFileSync(join(source.directory, '.git', 'index')), index);
+
+  const blobFiles: FileContent[] = [
+    { path: '.gitattributes', mode: '100644', content: Buffer.from('*.bin filter=canary\n') },
+    {
+      path: 'binary.bin',
+      mode: '100644',
+      content: Buffer.concat([
+        Buffer.from([0, 255, 10, 13]),
+        Buffer.from('done\ncommit refs/heads/no\n'),
+      ]),
+    },
+    { path: 'empty', mode: '100644', content: Buffer.alloc(0) },
+    { path: 'executable', mode: '100755', content: Buffer.from('same\n') },
+    { path: 'nested/é\tquote"\nfile', mode: '100644', content: Buffer.from('last line') },
+    { path: 'ordinary', mode: '100644', content: Buffer.from('same\n') },
+  ].map((file) => ({
+    ...file,
+    mode: file.mode as FileContent['mode'],
+    bytes: file.content.length,
+    hash: createHash('sha256').update(file.content).digest('hex'),
+  }));
+  for (const format of ['sha1', 'sha256']) {
+    const repository = join(directory, format);
+    mkdirSync(repository);
+    git(repository, ['init', '--quiet', `--object-format=${format}`]);
+    git(repository, ['config', 'filter.canary.clean', `touch '${canary}'`]);
+    git(repository, ['read-tree', '--empty']);
+    const entries = blobFiles.map((file) => {
+      const oid = git(repository, ['hash-object', '-w', '--stdin'], file.content).toString().trim();
+      return `${file.mode} ${oid}\t${file.path}\0`;
+    });
+    git(repository, ['update-index', '-z', '--index-info'], entries.join(''));
+    const expected = git(repository, ['write-tree']).toString().trim();
+    const references = git(repository, ['for-each-ref']);
+    assert.equal(treeFromFiles(repository, blobFiles), expected);
+    assert.deepEqual(git(repository, ['for-each-ref']), references);
+    const identity = {
+      name: 'Fixture',
+      email: 'fixture@example.invalid',
+      at: '2026-01-01T00:00:00Z',
+    };
+    const commit = (tree: string) =>
+      git(repository, ['commit-tree', tree], 'fixture\n', identity).toString().trim();
+    assert.deepEqual(committedFiles(repository, commit(expected)), blobFiles);
+    const empty = treeFromFiles(repository, []);
+    assert.deepEqual(committedFiles(repository, commit(empty)), []);
+    const missing = git(
+      repository,
+      ['mktree', '--missing', '-z'],
+      `100644 blob ${'0'.repeat(format === 'sha1' ? 40 : 64)}\tmissing\0`,
+    )
+      .toString()
+      .trim();
+    assert.throws(() => committedFiles(repository, commit(missing)), /unavailable/);
+    assert.equal(existsSync(canary), false);
+  }
+  assert.throws(
+    () => treeFromFiles(join(directory, 'too-many'), Array(10001).fill(blobFiles[0])),
+    /file limit/,
+  );
+  assert.throws(
+    () =>
+      treeFromFiles(join(directory, 'too-large'), [
+        { ...blobFiles[0], content: Buffer.alloc(64 * 1024 * 1024 + 1) },
+      ]),
+    /byte limit/,
+  );
 
   const budget = (): CopyBudget => ({
     deadline: 1000,
