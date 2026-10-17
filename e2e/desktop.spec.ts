@@ -15,6 +15,7 @@ import {
 } from '../apps/controller/src/host/check-ownership.ts';
 import { git } from '../apps/controller/src/host/source.ts';
 import { groupAbsent } from '../apps/controller/src/host/worker.ts';
+import { startController } from '../apps/controller/src/main.ts';
 import { unavailableNativeProfile } from '../apps/controller/src/providers/openai/profile.ts';
 import { encodeFrame, FrameDecoder } from '../packages/client/src/index.ts';
 import {
@@ -27,6 +28,7 @@ import {
   CONVERSATION_CONTEXT_MEDIA_TYPE,
   type Command,
   type CommandResult,
+  CommandSchema,
   ConversationContextBundleSchema,
   type ConversationEntry,
   ConversationEntrySchema,
@@ -2029,6 +2031,354 @@ async function conversationBridge(
   }
 }
 
+async function taskActivityHistory(
+  application: Awaited<ReturnType<typeof _electron.launch>>,
+  page: Page,
+) {
+  const home = mkdtempSync(join(internal, 'activity-history-'));
+  const at = '2026-10-18T00:00:00.000Z';
+  const id = createTestIds(at, 1000n);
+  const fixture = createDemoFixtures(at);
+  const task = { ...fixture.task, id: id('tsk'), title: 'Read retained task activity' };
+  const other = { ...task, id: id('tsk'), title: 'Inspect a different history' };
+  const empty = { ...task, id: id('tsk'), title: 'Inspect an empty history' };
+  const blocked = { ...task, id: id('tsk'), title: 'Inspect a blocked history' };
+  const options = {
+    home,
+    now: () => at,
+    id,
+    nativeProfiles: () => [],
+    googleUsageClient: () => ({ available: false as const, reason: 'client-unavailable' as const }),
+    registerGoogleAcp: false,
+    localInputHelper: undefined,
+  };
+  let runtime = await startController(options);
+  const requests: Array<Extract<Command, { command: 'GetTaskActivity' }>> = [];
+  let held:
+    | {
+        taskId: string;
+        older: boolean;
+        entered: ReturnType<typeof Promise.withResolvers<void>>;
+        release: ReturnType<typeof Promise.withResolvers<void>>;
+      }
+    | undefined;
+  const instrument = () => {
+    const execute = runtime.controller.execute.bind(runtime.controller);
+    runtime.controller.execute = async (input, principal) => {
+      const command = CommandSchema.parse(input);
+      const result = await execute(command, principal);
+      if (command.command === 'GetTaskActivity') {
+        requests.push(command);
+        const waiting = held;
+        if (
+          waiting &&
+          command.payload.taskId === waiting.taskId &&
+          Boolean(command.payload.beforeCursor) === waiting.older
+        ) {
+          held = undefined;
+          waiting.entered.resolve();
+          await waiting.release.promise;
+        }
+      }
+      return result;
+    };
+  };
+  instrument();
+  const append = (taskId: string | null, text: string) =>
+    runtime.controller.store.transaction(() =>
+      runtime.controller.store.append({
+        protocol: 1,
+        id: id('evt'),
+        taskId,
+        at,
+        revision: 0,
+        type: 'attempt.output',
+        payload: { attemptId: id('att'), generation: 1, channel: 'stdout', text },
+      }),
+    );
+  const marker = (index: number) => `Retained activity ${String(index).padStart(4, '0')}`;
+  const original: Event[] = [];
+  runtime.controller.store.transaction(() => {
+    const project = fixture.snapshot.projects[0];
+    runtime.controller.store.put('project', project.id, project.revision, project);
+    for (const value of [task, other, empty, blocked])
+      runtime.controller.store.put('task', value.id, value.revision, value);
+  });
+  for (let index = 0; index < 360; index++) {
+    original.push(append(task.id, marker(index)));
+    append(other.id, `Other task output ${index}`);
+    if (index % 10 === 0) append(null, `Global output ${index}`);
+  }
+  const oversized = runtime.controller.store.transaction(() =>
+    runtime.controller.store.append({
+      protocol: 1,
+      id: id('evt'),
+      taskId: blocked.id,
+      at,
+      revision: 0,
+      type: 'task.updated',
+      payload: { ...blocked, criteria: Array.from({ length: 100 }, () => 'é'.repeat(4096)) },
+    }),
+  );
+  const afterBoundary = append(blocked.id, 'Retained output above the blocked boundary.');
+  assert(afterBoundary.type === 'attempt.output');
+  const activity = page.locator('.activity-section');
+  const outputs = () => activity.locator('.worker-output').allTextContents();
+  const seen = new Set<string>();
+  const inspectWindow = async () => {
+    const text = (await outputs()).map((value) => value.trim());
+    assert(text.every((value) => !value.startsWith('Other task') && !value.startsWith('Global')));
+    assert.equal(
+      new Set(text).size,
+      text.length,
+      'Overlapping live and page rows must not repeat.',
+    );
+    const retained = text.filter((value) => value.startsWith('Retained activity '));
+    assert.deepEqual(retained, [...retained].sort(), 'Same-time events must keep cursor order.');
+    for (const value of retained) seen.add(value);
+  };
+  const older = () =>
+    activity.getByRole('button', { name: /load (?:earlier|older)(?: activity)?/i });
+  const openTask = async (title: string) => {
+    await page.getByRole('button', { name: title, exact: true }).click();
+    await page.getByRole('tab', { name: 'Activity', exact: true }).click();
+  };
+  const hold = (taskId: string, older: boolean) => {
+    assert.equal(held, undefined);
+    const waiting = {
+      taskId,
+      older,
+      entered: Promise.withResolvers<void>(),
+      release: Promise.withResolvers<void>(),
+    };
+    held = waiting;
+    return waiting;
+  };
+  let outstanding: ReturnType<typeof hold> | undefined;
+  try {
+    const prerequisite = await runtime.controller.execute(
+      CommandSchema.parse({
+        protocol: 1,
+        key: createCommandKey(),
+        actor: { id: 'activity-grader', kind: 'cli' },
+        command: 'GetTaskActivity',
+        payload: { taskId: task.id },
+      }),
+      'local-owner',
+    );
+    assert.equal(prerequisite.outcome, 'applied', 'The retained activity API must be installed.');
+    await application.evaluate(
+      async ({ BrowserWindow }, options) => {
+        const load = process.mainModule?.require.bind(process.mainModule);
+        if (!load) throw new Error('The desktop fixture module loader is unavailable.');
+        const { installBridge } = load(
+          options.bridge,
+        ) as typeof import('../apps/desktop/src/main/bridge.ts');
+        const { connectController } = load(
+          options.client,
+        ) as typeof import('../packages/client/src/node.ts');
+        const { desktopActor } = load(
+          options.runtime,
+        ) as typeof import('../apps/desktop/src/main/runtime.ts');
+        const client = await connectController({ ...options.endpoint, actor: desktopActor });
+        const state = globalThis as unknown as { activityGraderClient?: ControllerClient };
+        state.activityGraderClient = client;
+        const window = BrowserWindow.getAllWindows()[0];
+        window.once('closed', () => client.close());
+        await installBridge(window, {
+          paths: { home: options.home, profile: options.home },
+          connect: async () => client,
+          resetClient: () => client.close(),
+        } as never);
+      },
+      {
+        bridge: join(root, 'apps/desktop/src/main/bridge.ts'),
+        client: join(root, 'packages/client/src/node.ts'),
+        runtime: join(root, 'apps/desktop/src/main/runtime.ts'),
+        home,
+        endpoint: readControllerEndpoint(home),
+      },
+    );
+    await page.reload();
+    await expect(page.getByText('Controller connected', { exact: true })).toBeVisible();
+    await openTask(task.title);
+    await expect(
+      activity.getByText(marker(359), { exact: true }),
+      'Opening Activity must read retained task output, even when no live event has arrived.',
+    ).toBeVisible();
+    await inspectWindow();
+    const oldestBefore = Math.min(...[...seen].map((value) => Number(value.slice(-4))));
+    outstanding = hold(task.id, true);
+    await older().press('Enter');
+    await bounded(outstanding.entered.promise, 5000, 'Older activity read');
+    const anchor = await activity.locator('.worker-output').evaluateAll((nodes) => {
+      const row = nodes.find((node) => {
+        const bounds = node.getBoundingClientRect();
+        return bounds.top >= 0 && bounds.top < window.innerHeight;
+      });
+      if (!row) throw Error('The older-page action needs a visible existing event anchor.');
+      return { text: row.textContent ?? '', top: row.getBoundingClientRect().top };
+    });
+    outstanding.release.resolve();
+    outstanding = undefined;
+    await expect
+      .poll(async () => {
+        await inspectWindow();
+        return Math.min(...[...seen].map((value) => Number(value.slice(-4))));
+      })
+      .toBeLessThan(oldestBefore);
+    await expect
+      .poll(async () => {
+        const bounds = await activity.getByText(anchor.text, { exact: true }).boundingBox();
+        return bounds === null ? Infinity : Math.abs(bounds.y - anchor.top);
+      })
+      .toBeLessThan(3);
+    await inspectWindow();
+    for (let pageIndex = 0; pageIndex < original.length && !seen.has(marker(0)); pageIndex++) {
+      const before = seen.size;
+      await older().press('Enter');
+      await expect
+        .poll(async () => {
+          await inspectWindow();
+          return seen.size;
+        })
+        .toBeGreaterThan(before);
+    }
+    assert.deepEqual(
+      [...seen].sort(),
+      original.map((_event, index) => marker(index)),
+    );
+    await expect(
+      activity.getByText(
+        /beginning of (?:the )?(?:task )?activity|no (?:earlier|older) (?:activity|events)/i,
+      ),
+    ).toBeVisible();
+    const reading = activity.getByText(marker(50), { exact: true });
+    await reading.scrollIntoViewIfNeeded();
+    const position = await reading.boundingBox();
+    assert(position);
+    const live = append(task.id, marker(360));
+    await expect
+      .poll(
+        async () =>
+          (await activity.getByText(marker(360), { exact: true }).count()) > 0 ||
+          (await activity
+            .getByRole('status')
+            .filter({ hasText: /new (?:activity|events?)/i })
+            .count()) > 0,
+      )
+      .toBe(true);
+    const afterLive = await reading.boundingBox();
+    assert(
+      afterLive && Math.abs(afterLive.y - position.y) < 3,
+      'Live output must keep the reading anchor.',
+    );
+    await inspectWindow();
+    await activity
+      .getByRole('button', { name: /(?:jump|show|load|return).*latest|new activity/i })
+      .click();
+    await expect(activity.getByText(marker(360), { exact: true })).toBeVisible();
+    await inspectWindow();
+    outstanding = hold(other.id, false);
+    await openTask(other.title);
+    await bounded(outstanding.entered.promise, 5000, 'Other task activity read');
+    await openTask(task.title);
+    outstanding.release.resolve();
+    outstanding = undefined;
+    await desktopSnapshot(page);
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) => {
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+        }),
+    );
+    await expect(activity.getByText(marker(360), { exact: true })).toBeVisible();
+    await expect(activity.getByText(/Other task output/)).toHaveCount(0);
+    await openTask(empty.title);
+    await expect(
+      activity.getByText(/no (?:retained )?(?:activity|events)|no activity has been recorded/i),
+    ).toBeVisible();
+    await expect(older()).toHaveCount(0);
+    await openTask(blocked.title);
+    await expect(activity.getByText(afterBoundary.payload.text, { exact: true })).toBeVisible();
+    await older().press('Enter');
+    await expect(activity.getByRole('alert')).toContainText(
+      /too large|size|activity-event-too-large/i,
+    );
+    await expect(
+      activity.getByText(
+        /beginning of (?:the )?(?:task )?activity|no (?:earlier|older) (?:activity|events)/i,
+      ),
+    ).toHaveCount(0);
+    const blockedRequests = requests.filter((value) => value.payload.taskId === blocked.id);
+    assert(blockedRequests.some((value) => value.payload.beforeCursor === afterBoundary.cursor));
+    assert(
+      !blockedRequests.some((value) => value.payload.beforeCursor === oversized.cursor),
+      'An oversized row must not be skipped.',
+    );
+    await expect(activity.getByText(afterBoundary.payload.text, { exact: true })).toBeVisible();
+    const corrupt = append(other.id, 'Retained output after a repaired history.');
+    assert(corrupt.type === 'attempt.output');
+    runtime.controller.store.db
+      .prepare('UPDATE events SET body=? WHERE event_id=?')
+      .run(JSON.stringify({ ...corrupt, cursor: '0' }), corrupt.id);
+    await page.reload();
+    await expect(page.getByText('Controller connected', { exact: true })).toBeVisible();
+    await openTask(other.title);
+    await expect(activity.getByRole('alert')).toContainText(
+      /unavailable|could not|activity-history-unavailable/i,
+    );
+    runtime.controller.store.db
+      .prepare('UPDATE events SET body=? WHERE event_id=?')
+      .run(JSON.stringify(corrupt), corrupt.id);
+    await activity
+      .getByRole('button', { name: /retry.*activity|refresh.*activity|try again/i })
+      .press('Enter');
+    await expect(activity.getByText(corrupt.payload.text, { exact: true })).toBeVisible();
+    await openTask(task.title);
+    await runtime.close();
+    await expect(page.getByText('Controller offline', { exact: true })).toBeVisible();
+    runtime = await startController(options);
+    instrument();
+    runtime.controller.store.transaction(() => {
+      for (let index = 0; index < 1005; index++)
+        runtime.controller.store.append({
+          protocol: 1,
+          id: id('evt'),
+          taskId: null,
+          at,
+          revision: 0,
+          type: 'attempt.output',
+          payload: {
+            attemptId: id('att'),
+            generation: 1,
+            channel: 'stdout',
+            text: `Disconnected global output ${index}`,
+          },
+        });
+    });
+    const reconnected = append(task.id, marker(361));
+    await expect(page.getByText('Controller connected', { exact: true })).toBeVisible();
+    await expect(activity.getByText(marker(361), { exact: true })).toBeVisible();
+    await inspectWindow();
+    assert(BigInt(reconnected.cursor) > BigInt(live.cursor));
+    assert.equal(
+      runtime.controller.snapshot().attempts.length,
+      0,
+      'Activity reads must start no work.',
+    );
+  } finally {
+    held?.release.resolve();
+    outstanding?.release.resolve();
+    await application.evaluate(() => {
+      const state = globalThis as unknown as { activityGraderClient?: ControllerClient };
+      state.activityGraderClient?.close();
+      delete state.activityGraderClient;
+    });
+    await runtime.close();
+  }
+}
+
 test('desktop and CLI retain one checked task through handoff and restart', async () => {
   test.setTimeout(120000);
   mkdirSync(internal, { recursive: true });
@@ -3045,6 +3395,7 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     assert.equal(git(source, ['rev-parse', acceptedRef]).toString().trim(), acceptedCommit);
     assert.deepEqual(sourceIdentity(source), original);
 
+    await taskActivityHistory(application, page);
     await quotaReadBridge(application, page);
     await conversationBridge(application, page);
     console.log(`Connected journey home: ${home}`);
