@@ -36,6 +36,10 @@ import {
   type CommandResult,
   CommandResultSchema,
   CommandSchema,
+  type ConversationPlanningSelection,
+  ConversationPlanningSelectionSchema,
+  type ConversationTurnBinding,
+  ConversationTurnBindingSchema,
   canonicalJson,
   type Event,
   EventSchema,
@@ -48,6 +52,7 @@ import {
   type Grant,
   GrantSchema,
   HashSchema,
+  LimitsSchema,
   MAX_FRAME_BYTES,
   NativeBillingAttestationSchema,
   NativeHandoffPreviewSchema,
@@ -83,7 +88,10 @@ import {
   SealedHandoffPacketSchema,
   type Snapshot,
   SnapshotSchema,
+  SourceSchema,
   type Task,
+  type TaskConversationState,
+  TaskConversationStateSchema,
   TaskIdSchema,
   TaskSchema,
   TimestampSchema,
@@ -94,6 +102,7 @@ import { fakeReviewWorkerPath, fakeWorkerPath } from '@crewkite/testkit/worker';
 import { z } from 'zod';
 import { ArtifactFiles } from '../artifacts/index.ts';
 import { buildHandoff } from '../continuity/index.ts';
+import { type FrozenConversationTurn, TaskConversation } from '../conversation/conversation.ts';
 import {
   CandidateEvidence,
   type CheckDefinition,
@@ -183,6 +192,12 @@ import {
   googleUsageDescriptor,
   resolveGoogleUsageClient,
 } from '../providers/google/profile.ts';
+import {
+  type ConversationPlan,
+  conversationBindingHash,
+  conversationPlan,
+  startConversation,
+} from '../providers/openai/conversation.ts';
 import {
   type NativeProfileResolution,
   unavailableNativeProfile,
@@ -481,6 +496,45 @@ function freezeNative<T>(value: T): T {
   return value;
 }
 
+const ConversationConfigurationSchema = z.strictObject({
+  revision: z.number().int().nonnegative().safe(),
+  contractStatus: z.enum(['provisional', 'confirmed']),
+  contextCriteria: z.array(z.string().min(1).max(4096)).max(100),
+  selection: ConversationPlanningSelectionSchema,
+  routeId: RouteSchema.shape.id,
+  source: SourceSchema,
+  profileHash: HashSchema,
+  client: z
+    .strictObject({
+      executable: z.string().max(4096).refine(isAbsolute),
+      sha256: HashSchema,
+      version: z.string().min(1).max(200),
+    })
+    .nullable(),
+  locationHash: HashSchema.nullable(),
+  limits: LimitsSchema,
+  paused: z.boolean(),
+  adoptedProposal: z
+    .strictObject({
+      id: z.string(),
+      hash: HashSchema,
+      runId: RunSchema.shape.id,
+      revision: z.number().int().nonnegative().safe(),
+    })
+    .nullable(),
+  effectiveModel: z.string().min(1).max(200).nullable(),
+  effectiveEffort: z.string().min(1).max(200).nullable(),
+});
+type ConversationConfiguration = z.infer<typeof ConversationConfigurationSchema>;
+type ConversationRuntime = {
+  input: ConversationPlan;
+  attempt: Attempt;
+  authorityHash: string;
+  stopped: boolean;
+  handle?: ReturnType<typeof startConversation>;
+  done: Promise<void>;
+};
+
 export type ControllerOptions = {
   home: string;
   now?: () => string;
@@ -531,6 +585,9 @@ export class Controller {
     promise: Promise<CommandResult>;
   };
   private readonly nativeReviewWorkers = new Map<string, NativeReviewRuntime>();
+  private readonly conversationWorkers = new Map<string, ConversationRuntime>();
+  private readonly pendingConversationLaunches = new Set<string>();
+  private conversation!: TaskConversation;
   private readonly owner: DatabaseSync;
   private closed = false;
   private readonly options: ControllerOptions;
@@ -622,6 +679,16 @@ export class Controller {
         },
       });
       this.profiles = this.resolveProfiles();
+      this.conversation = new TaskConversation(this.store, {
+        now: this.now,
+        messageId: () => this.id('msg'),
+        publish: (entries, task) => {
+          this.event('task.updated', task.id, task.revision, task);
+          for (const entry of entries)
+            this.event('conversation.entry', task.id, task.revision, entry);
+        },
+        ownsTurn: (binding, phase) => this.ownsConversationTurn(binding, phase),
+      });
       this.recover();
       for (const row of this.store.db
         .prepare("SELECT candidate_id FROM publications WHERE state='prepared'")
@@ -1365,6 +1432,11 @@ export class Controller {
         runtime.worker.child.stdin.end();
       }
     }
+    for (const runtime of this.conversationWorkers.values()) {
+      runtime.stopped = true;
+      runtime.handle?.stop();
+      native.push(runtime.done);
+    }
     for (const runtime of this.nativeReviewWorkers.values()) {
       runtime.stopped = true;
       runtime.handle?.stop();
@@ -1410,6 +1482,7 @@ export class Controller {
     if (
       command.command === 'RegisterProject' ||
       command.command === 'CreateTask' ||
+      command.command === 'CreateTaskDiscussion' ||
       command.command === 'ObserveUsage' ||
       command.command === 'InitializeGoogleAcp' ||
       command.command === 'AuthenticateGoogleAcp' ||
@@ -1442,6 +1515,20 @@ export class Controller {
     verification?: PreparedVerification,
     acpContext?: CapturedContext,
   ): CommandResult {
+    if (command.command === 'PrepareRun' || command.command === 'PrepareNativeRun') {
+      const config = this.conversationConfiguration(command.payload.taskId);
+      if (
+        config &&
+        (['attempts', 'minutes', 'concurrency'] as const).some(
+          (axis) => command.payload.policy.limits[axis] > config.limits[axis],
+        )
+      )
+        return {
+          outcome: 'blocked',
+          reason: 'task-limit-exceeded',
+          next: 'Amend the total task limits explicitly before requesting a larger execution envelope.',
+        };
+    }
     if ('taskId' in command.payload && ['ResumeRun', 'SwitchRoute'].includes(command.command)) {
       const task = this.store.get<Task>('task', command.payload.taskId);
       if (task?.runId && this.store.receipt(`native-run:${task.runId}`))
@@ -1479,6 +1566,26 @@ export class Controller {
         };
     }
     switch (command.command) {
+      case 'GetTaskConversation':
+        return {
+          outcome: 'applied',
+          data: this.conversation.page(command.payload.taskId, command.payload.beforeCursor),
+        };
+      case 'GetTaskConversationState':
+        return {
+          outcome: 'applied',
+          data: {
+            kind: 'conversation-state',
+            state: this.conversationState(command.payload.taskId),
+          },
+        };
+      case 'CreateTaskDiscussion':
+      case 'ConfigureTaskConversation':
+      case 'SendTaskMessage':
+      case 'QueueTaskGuidance':
+      case 'AnswerTaskQuestion':
+      case 'AdoptTaskPlan':
+        return this.conversationCommand(command, effects);
       case 'InitializeGoogleAcp':
       case 'AuthenticateGoogleAcp':
       case 'DiscoverGoogleAcp':
@@ -1686,6 +1793,897 @@ export class Controller {
     }
   }
 
+  private conversationConfiguration(taskId: string): ConversationConfiguration | undefined {
+    const value = this.store.conversationTask(taskId);
+    return value === undefined ? undefined : ConversationConfigurationSchema.parse(value);
+  }
+
+  private saveConversationConfiguration(taskId: string, value: ConversationConfiguration) {
+    this.store.putConversationTask(taskId, ConversationConfigurationSchema.parse(value));
+  }
+
+  private taskAllowance(taskId: string) {
+    const config = this.conversationConfiguration(taskId);
+    if (!config) return null;
+    const intents = this.store.intents();
+    const ledger = intents.filter((intent) => intent.task_id === taskId);
+    const minutes = ledger.reduce((sum, intent) => {
+      const run = this.store.get<Run>('run', intent.run_id);
+      let reserved = run?.policy.policy.limits.minutes ?? config.limits.minutes;
+      if (this.store.runPurpose(intent.run_id) === 'conversation') {
+        try {
+          const plan = this.nativeRecord(`conversation-turn:${intent.attempt_id}`).value as {
+            binding: ConversationTurnBinding;
+          };
+          reserved = ConversationTurnBindingSchema.parse(plan.binding).limitMinutes;
+        } catch {}
+      }
+      return sum + chargedMinutes(intent, reserved);
+    }, 0);
+    return {
+      attempts: Math.max(0, config.limits.attempts - ledger.length),
+      minutes: Math.max(0, config.limits.minutes - minutes),
+      concurrency: Math.max(
+        0,
+        config.limits.concurrency - intents.filter((intent) => intent.state !== 'stopped').length,
+      ),
+    };
+  }
+
+  private remaining(run: Run) {
+    const own = remainingBudgets(run, this.store.intents());
+    const task = this.taskAllowance(run.taskId);
+    return task
+      ? {
+          attempts: Math.min(own.attempts, task.attempts),
+          minutes: Math.min(own.minutes, task.minutes),
+          concurrency: Math.min(own.concurrency, task.concurrency),
+        }
+      : own;
+  }
+
+  private conversationBoundary(
+    taskId: string,
+  ): TaskConversationState['adopt']['reason'] | undefined {
+    const active = this.store
+      .intents()
+      .filter((intent) => intent.task_id === taskId && intent.state !== 'stopped');
+    if (
+      active.some((intent) => ['outcome-unknown', 'interrupted'].includes(intent.state)) ||
+      this.hasUncertainWriter(taskId)
+    )
+      return 'ownership-unknown';
+    if (
+      active.length ||
+      this.store.db.prepare('SELECT 1 FROM writer_leases WHERE task_id=?').get(taskId)
+    )
+      return 'owner-active';
+    if (
+      this.store.db
+        .prepare(
+          "SELECT 1 FROM pending_effects WHERE task_id=? AND state IN ('pending','approved','unknown') LIMIT 1",
+        )
+        .get(taskId)
+    )
+      return 'effects-unresolved';
+    for (const intent of this.store
+      .intents()
+      .filter(
+        (value) =>
+          value.task_id === taskId && this.store.runPurpose(value.run_id) === 'conversation',
+      )) {
+      const phases = this.store.nativeProcesses(intent.attempt_id);
+      if (phases.some((phase) => phase.state !== 'quiescent')) return 'ownership-unknown';
+      if (!phases.length && !this.store.receipt(`conversation-completion:${intent.attempt_id}`))
+        return 'ownership-unknown';
+    }
+  }
+
+  private conversationAuthority(config: ConversationConfiguration) {
+    return hashCanonical({
+      role: config.selection.role,
+      profileId: config.selection.profileId,
+      creditPolicy: config.selection.creditPolicy,
+      source: config.source,
+      profileHash: config.profileHash,
+      client: config.client,
+      locationHash: config.locationHash,
+      routeId: config.routeId,
+    });
+  }
+
+  private conversationProfile(config: ConversationConfiguration) {
+    const profile = this.profileFor(config.selection.profileId);
+    if (
+      !profile.facts.available ||
+      profile.facts.family !== 'openai' ||
+      profile.facts.id !== config.selection.profileId ||
+      !profile.client ||
+      !profile.environment ||
+      !profile.locationHash ||
+      !profile.facts.creditPolicies.includes(config.selection.creditPolicy) ||
+      hashCanonical(profile.facts) !== config.profileHash ||
+      hashCanonical(profile.client) !== hashCanonical(config.client) ||
+      profile.locationHash !== config.locationHash
+    )
+      throw Error('profile-unavailable');
+    return profile as NativeProfileResolution & {
+      client: NonNullable<NativeProfileResolution['client']>;
+      environment: NodeJS.ProcessEnv;
+      locationHash: string;
+    };
+  }
+
+  private conversationInputFits(
+    task: Pick<Task, 'id' | 'runId' | 'title' | 'outcome'>,
+    selection: ConversationPlanningSelection,
+    criteria: string[],
+  ) {
+    const profile = this.profileFor(selection.profileId);
+    if (!profile.facts.available) return true;
+    const identity = '00000000000000000000000000';
+    const scope = {
+      paths: [] as string[],
+      roles: ['coder', 'reviewer', 'advisor'] as ('coder' | 'reviewer' | 'advisor')[],
+      checks: ['node-tests-v1', 'project-node-tests-v1', 'crewkite-verify-v1'],
+    };
+    try {
+      // Reserve framing space so every permitted message fits with the full task contract.
+      conversationPlan({
+        binding: {
+          taskId: task.id,
+          runId: task.runId ?? `run_${identity}`,
+          attemptId: `att_${identity}`,
+          generation: Number.MAX_SAFE_INTEGER,
+          routeId: `rte_${identity}`,
+          role: selection.role,
+          taskRevision: Number.MAX_SAFE_INTEGER,
+          conversationRevision: Number.MAX_SAFE_INTEGER,
+          scopeHash: hashCanonical(scope),
+          limitMinutes: 5,
+        },
+        model: profile.facts.model as ConversationPlan['model'],
+        effort: 'low',
+        creditPolicy: selection.creditPolicy,
+        directory: join(this.home, 'conversation', `run_${identity}`, `att_${identity}`),
+        context: { title: task.title, outcome: task.outcome, criteria },
+        scope,
+        history: [
+          { role: 'user', text: '\u0001'.repeat(4096) },
+          { role: 'controller', text: 'x'.repeat(512) },
+        ],
+        omittedHistoryCount: Number.MAX_SAFE_INTEGER,
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private conversationState(taskId: string): TaskConversationState {
+    const task = this.store.get<Task>('task', taskId);
+    if (!task) throw Error('task-not-found');
+    const config = this.conversationConfiguration(task.id);
+    const run = task.runId ? this.store.get<Run>('run', task.runId) : undefined;
+    const purpose = task.runId ? (this.store.runPurpose(task.runId) ?? null) : null;
+    const intents = this.store
+      .intents()
+      .filter((intent) => intent.task_id === task.id && intent.state !== 'stopped');
+    const active = intents[0]
+      ? (this.store.get<Attempt>('attempt', intents[0].attempt_id) ?? null)
+      : null;
+    const unknown =
+      intents.some((intent) => ['outcome-unknown', 'interrupted'].includes(intent.state)) ||
+      task.state === 'unknown';
+    const pageRows = this.store.db
+      .prepare(
+        "SELECT body FROM conversation_entries WHERE task_id=? AND json_extract(body,'$.kind')='plan-proposal' ORDER BY sequence DESC LIMIT 1",
+      )
+      .get(task.id);
+    const proposalEntry = pageRows
+      ? (JSON.parse(pageRows.body as string) as Extract<
+          import('@crewkite/contracts').ConversationEntry,
+          { kind: 'plan-proposal' }
+        >)
+      : null;
+    const proposal =
+      proposalEntry && proposalEntry.binding.runId === task.runId
+        ? {
+            id: proposalEntry.id,
+            hash: hashCanonical(proposalEntry.proposal),
+            runId: proposalEntry.binding.runId,
+            revision: proposalEntry.revision,
+          }
+        : null;
+    const pendingQuestions = this.conversation
+      .pendingQuestions(task.id)
+      .map(({ id, cursor }) => ({ id, cursor }));
+    const queuedInputCount = this.store.db
+      .prepare(`SELECT COUNT(*) AS count FROM conversation_entries input
+      WHERE input.task_id=? AND json_extract(input.body,'$.kind') IN ('user-message','guidance','answer')
+      AND NOT EXISTS (SELECT 1 FROM conversation_entries delivery WHERE delivery.task_id=input.task_id
+        AND json_extract(delivery.body,'$.kind')='input-delivery' AND json_extract(delivery.body,'$.replyTo')=input.id)`)
+      .get(task.id)?.count as number;
+    const allowance = this.taskAllowance(task.id);
+    let send: TaskConversationState['send'] = {
+      available: false,
+      reason: 'not-configured',
+      disposition: null,
+    };
+    if (this.closed) send.reason = 'controller-closing';
+    else if (
+      this.store.db
+        .prepare(
+          "SELECT 1 FROM pending_effects WHERE task_id=? AND state IN ('pending','approved','unknown') LIMIT 1",
+        )
+        .get(task.id)
+    )
+      send.reason = 'effects-unresolved';
+    else if (unknown) send.reason = 'ownership-unknown';
+    else if (config?.paused || task.state === 'stopping') send.reason = 'admissions-paused';
+    else if (active && purpose)
+      send = { available: true, reason: 'queued-at-boundary', disposition: 'queue' };
+    else if (
+      config &&
+      run &&
+      (purpose === 'conversation' || purpose === 'execution') &&
+      allowance
+    ) {
+      send.reason = 'available';
+      try {
+        this.conversationProfile(config);
+      } catch {
+        send.reason = 'profile-unavailable';
+      }
+      if (
+        send.reason === 'available' &&
+        hashCanonical(inspectSource(task.projectId, this.projectPath(task.projectId) as string)) !==
+          hashCanonical(config.source)
+      )
+        send.reason = 'source-changed';
+      const boundary = this.conversationBoundary(task.id);
+      if (send.reason === 'available' && boundary) send.reason = boundary;
+      if (
+        send.reason === 'available' &&
+        !this.conversationInputFits(
+          task,
+          config.selection,
+          config.contractStatus === 'provisional' ? config.contextCriteria : task.criteria,
+        )
+      )
+        send.reason = 'conversation-input-too-large';
+      if (send.reason === 'available' && allowance.attempts === 0)
+        send.reason = 'attempt-budget-exhausted';
+      if (send.reason === 'available' && allowance.minutes === 0)
+        send.reason = 'minute-budget-exhausted';
+      if (send.reason === 'available' && allowance.concurrency === 0)
+        send.reason = 'concurrency-exhausted';
+      if (send.reason === 'available')
+        send = {
+          available: true,
+          reason: 'available',
+          disposition: purpose === 'conversation' ? 'turn' : 'planning-turn',
+        };
+    } else if (run && purpose === 'execution') send.reason = 'task-not-discussing';
+    let adopt: TaskConversationState['adopt'] = { available: false, reason: 'proposal-missing' };
+    if (proposal && config && allowance && purpose === 'conversation') {
+      const boundary = this.conversationBoundary(task.id);
+      const newerInput = this.store.db
+        .prepare(
+          "SELECT 1 FROM conversation_entries WHERE task_id=? AND sequence>? AND json_extract(body,'$.kind') IN ('user-message','guidance','answer') LIMIT 1",
+        )
+        .get(task.id, BigInt(proposalEntry?.cursor ?? '0'));
+      adopt.reason =
+        boundary ??
+        (config.paused
+          ? 'admissions-paused'
+          : pendingQuestions.length
+            ? 'pending-question'
+            : queuedInputCount || newerInput
+              ? 'pending-input'
+              : 'available');
+      adopt.available = adopt.reason === 'available';
+      if (
+        adopt.available &&
+        hashCanonical(inspectSource(task.projectId, this.projectPath(task.projectId) as string)) !==
+          hashCanonical(config.source)
+      ) {
+        adopt = { available: false, reason: 'source-changed' };
+      }
+    }
+    const route = config ? this.store.get<Route>('route', config.routeId) : undefined;
+    return TaskConversationStateSchema.parse({
+      taskId: task.id,
+      revision: task.revision,
+      contractStatus: config?.contractStatus ?? 'confirmed',
+      purpose,
+      phase: unknown
+        ? 'unknown'
+        : task.state === 'stopping'
+          ? 'stopping'
+          : active
+            ? purpose === 'conversation'
+              ? 'planning'
+              : 'execution'
+            : task.state === 'interrupted'
+              ? 'interrupted'
+              : task.state === 'stopped'
+                ? 'stopped'
+                : purpose === 'execution'
+                  ? 'execution'
+                  : config
+                    ? config.contractStatus === 'confirmed'
+                      ? 'planned'
+                      : 'discussion'
+                    : 'idle',
+      configuration: config
+        ? {
+            revision: config.revision,
+            selection: config.selection,
+            routeId: config.routeId,
+            requestedModel: route?.model ?? null,
+            requestedEffort: route?.effort.requested ?? null,
+            effectiveModel: config.effectiveModel,
+            effectiveEffort: config.effectiveEffort,
+          }
+        : null,
+      currentRunId: task.runId,
+      activeAttempt: active,
+      budget: config && allowance ? { limits: config.limits, remaining: allowance } : null,
+      queuedInputCount,
+      pendingQuestions,
+      proposal,
+      adoptedProposal: config?.adoptedProposal ?? null,
+      send,
+      adopt,
+    });
+  }
+
+  private configureConversation(
+    task: Task,
+    selection: ConversationPlanningSelection,
+    provisional: boolean,
+    initial = false,
+  ) {
+    const profile = this.profileFor(selection.profileId);
+    const source = inspectSource(task.projectId, this.projectPath(task.projectId) as string);
+    committedFiles(this.projectPath(task.projectId) as string, source.base);
+    const prior = this.conversationConfiguration(task.id);
+    const route = RouteSchema.parse({
+      id: this.id('rte'),
+      family: 'openai',
+      displayName: 'Supervised planning',
+      model: profile.facts.model,
+      effort: { requested: 'low', effective: 'unknown', supported: ['low'] },
+      billing: selection.creditPolicy === 'existing-credits' ? 'credits' : 'included',
+      qualified: false,
+      fake: false,
+    });
+    this.store.put('route', route.id, 0, route);
+    const config = ConversationConfigurationSchema.parse({
+      revision: (prior?.revision ?? 0) + 1,
+      contractStatus: provisional ? 'provisional' : (prior?.contractStatus ?? 'confirmed'),
+      contextCriteria: initial ? [] : task.criteria,
+      selection,
+      routeId: route.id,
+      source,
+      profileHash: hashCanonical(profile.facts),
+      client: profile.client ?? null,
+      locationHash: profile.locationHash ?? null,
+      limits: selection.limits,
+      paused: false,
+      adoptedProposal: prior?.adoptedProposal ?? null,
+      effectiveModel: null,
+      effectiveEffort: null,
+    });
+    this.saveConversationConfiguration(task.id, config);
+    const policy = PolicySchema.parse({
+      authority: 'guided',
+      quality: 'quick',
+      effects: [],
+      limits: selection.limits,
+      reserves: [],
+      unknownUsage: {
+        rule: 'fixed-allowance',
+        allowance: { launches: selection.limits.attempts, minutes: selection.limits.minutes },
+      },
+    });
+    const run = RunSchema.parse({
+      id: this.id('run'),
+      taskId: task.id,
+      source,
+      policy: { policy, hash: hashCanonical(policy) },
+      roles: [{ role: selection.role, routeId: route.id, pinned: true, approvedFallbacks: [] }],
+      decision: {
+        chosen: route.id,
+        rejected: [],
+        rule: 'manual',
+        inputsHash: this.conversationAuthority(config),
+      },
+      revision: 0,
+    });
+    this.store.put('run', run.id, 0, run);
+    this.store.putRunPurpose(run, 'conversation', task.runId);
+    const updated = this.updateTask(task, {
+      runId: run.id,
+      state: 'draft',
+      waitingReason: null,
+      next: 'Describe the task or answer the pending question.',
+    });
+    this.event('run.prepared', task.id, updated.revision, run);
+    return updated;
+  }
+
+  private conversationCommand(
+    command: Extract<
+      Command,
+      {
+        command:
+          | 'CreateTaskDiscussion'
+          | 'ConfigureTaskConversation'
+          | 'SendTaskMessage'
+          | 'QueueTaskGuidance'
+          | 'AnswerTaskQuestion'
+          | 'AdoptTaskPlan';
+      }
+    >,
+    effects: (() => void)[],
+  ): CommandResult {
+    if (command.command === 'CreateTaskDiscussion') {
+      if (!this.projectPath(command.payload.projectId))
+        return { outcome: 'blocked', reason: 'project-not-found' };
+      const text = command.payload.text;
+      if (!text.trim()) return { outcome: 'denied', reason: 'empty-message' };
+      let task = TaskSchema.parse({
+        id: this.id('tsk'),
+        projectId: command.payload.projectId,
+        title: text.trim().split('\n')[0].slice(0, 200).toWellFormed(),
+        outcome: text,
+        criteria: ['Confirm acceptance criteria before execution.'],
+        state: 'draft',
+        waitingReason: null,
+        revision: 0,
+        runId: null,
+        next: 'Clarify the task before execution.',
+      });
+      if (!this.conversationInputFits(task, command.payload.planning, []))
+        return { outcome: 'blocked', reason: 'conversation-input-too-large' };
+      this.store.put('task', task.id, 0, task);
+      this.event('task.created', task.id, 0, task);
+      task = this.configureConversation(task, command.payload.planning, true, true);
+      const message = this.conversation.recordMessage(task.id, text);
+      if (!message.applied) return { outcome: 'blocked', reason: message.reason };
+      this.admitConversation(task.id, effects);
+      const current = this.store.get<Task>('task', task.id) as Task;
+      return { outcome: 'applied', entity: current, revision: current.revision };
+    }
+    const task = this.store.get<Task>('task', command.payload.taskId);
+    if (!task) return { outcome: 'blocked', reason: 'task-not-found' };
+    if (command.command === 'ConfigureTaskConversation') {
+      const prior = this.conversationConfiguration(task.id);
+      const selection = command.payload.planning;
+      const same =
+        prior &&
+        hashCanonical({ ...selection, limits: prior.selection.limits }) ===
+          hashCanonical(prior.selection);
+      const lower =
+        prior &&
+        (['attempts', 'minutes', 'concurrency'] as const).every(
+          (axis) => selection.limits[axis] <= prior.limits[axis],
+        );
+      if (same && lower) {
+        this.saveConversationConfiguration(task.id, {
+          ...prior,
+          revision: prior.revision + 1,
+          selection,
+          limits: selection.limits,
+        });
+        const updated = this.updateTask(task, {});
+        return { outcome: 'applied', entity: updated, revision: updated.revision };
+      }
+      const boundary = this.conversationBoundary(task.id);
+      if (boundary) return { outcome: 'blocked', reason: boundary };
+      if (!this.conversationInputFits(task, selection, task.criteria))
+        return { outcome: 'blocked', reason: 'conversation-input-too-large' };
+      const updated = this.configureConversation(task, selection, true);
+      return { outcome: 'applied', entity: updated, revision: updated.revision };
+    }
+    if (command.command === 'AdoptTaskPlan') {
+      const state = this.conversationState(task.id);
+      if (!state.adopt.available) return { outcome: 'blocked', reason: state.adopt.reason };
+      if (
+        state.proposal?.id !== command.payload.proposalId ||
+        state.proposal.hash !== command.payload.proposalHash
+      )
+        return { outcome: 'blocked', reason: 'proposal-hash-changed' };
+      const row = this.store.db
+        .prepare('SELECT body FROM conversation_entries WHERE id=? AND task_id=?')
+        .get(state.proposal.id, task.id);
+      const entry =
+        row &&
+        (JSON.parse(row.body as string) as Extract<
+          import('@crewkite/contracts').ConversationEntry,
+          { kind: 'plan-proposal' }
+        >);
+      if (entry?.kind !== 'plan-proposal' || hashCanonical(entry.proposal) !== state.proposal.hash)
+        return { outcome: 'blocked', reason: 'proposal-not-current' };
+      const config = this.conversationConfiguration(task.id) as ConversationConfiguration;
+      this.saveConversationConfiguration(task.id, {
+        ...config,
+        contractStatus: 'confirmed',
+        adoptedProposal: state.proposal,
+      });
+      const updated = this.updateTask(task, {
+        criteria: entry.proposal.criteria,
+        state: 'draft',
+        waitingReason: null,
+        next: 'Plan adopted. Prepare the execution contract.',
+      });
+      return { outcome: 'applied', entity: updated, revision: updated.revision };
+    }
+    if (!command.payload.text.trim()) return { outcome: 'denied', reason: 'empty-message' };
+    const state = this.conversationState(task.id);
+    if (!state.send.available) return { outcome: 'blocked', reason: state.send.reason };
+    const saved =
+      command.command === 'AnswerTaskQuestion'
+        ? this.conversation.answerQuestion(
+            task.id,
+            command.payload.questionId,
+            command.payload.text,
+          )
+        : this.conversation.recordMessage(
+            task.id,
+            command.payload.text,
+            command.command === 'QueueTaskGuidance' ? 'guidance' : 'user-message',
+          );
+    if (!saved.applied) return { outcome: 'blocked', reason: saved.reason };
+    if (state.send.disposition === 'planning-turn') {
+      const config = this.conversationConfiguration(task.id) as ConversationConfiguration;
+      this.configureConversation(saved.task, config.selection, true);
+    }
+    if (state.send.disposition === 'turn' || state.send.disposition === 'planning-turn')
+      this.admitConversation(task.id, effects);
+    const current = this.store.get<Task>('task', task.id) as Task;
+    return { outcome: 'applied', entity: current, revision: current.revision };
+  }
+
+  private admitConversation(taskId: string, effects: (() => void)[]): CommandResult {
+    const state = this.conversationState(taskId);
+    if (!state.send.available || state.send.disposition !== 'turn')
+      return { outcome: 'blocked', reason: state.send.reason };
+    const task = this.store.get<Task>('task', taskId) as Task;
+    const config = this.conversationConfiguration(taskId) as ConversationConfiguration;
+    const run = this.store.get<Run>('run', task.runId as string) as Run;
+    const pending = this.conversation.pendingInputs(taskId);
+    if (!pending.length) return { outcome: 'blocked', reason: 'pending-input' };
+    const profile = this.conversationProfile(config);
+    const allowance = this.remaining(run);
+    const attempt = this.jobAttempt(run, config.routeId);
+    const directory = join(this.home, 'conversation', run.id, attempt.id);
+    const ceiling = BigInt(pending[pending.length - 1].cursor);
+    const rows = this.store.db
+      .prepare(
+        "SELECT body FROM conversation_entries WHERE task_id=? AND sequence<=? AND json_extract(body,'$.kind')<>'input-delivery' ORDER BY sequence DESC LIMIT 100",
+      )
+      .all(taskId, ceiling);
+    const total = this.store.db
+      .prepare(
+        "SELECT COUNT(*) AS count FROM conversation_entries WHERE task_id=? AND sequence<=? AND json_extract(body,'$.kind')<>'input-delivery'",
+      )
+      .get(taskId, ceiling)?.count as number;
+    const historyEntries = rows
+      .reverse()
+      .map(
+        (row) => JSON.parse(row.body as string) as import('@crewkite/contracts').ConversationEntry,
+      );
+    const history = historyEntries.map((entry) => {
+      return { role: entry.author.kind, text: entry.text };
+    });
+    const files = committedFiles(this.projectPath(task.projectId) as string, config.source.base);
+    const scope = {
+      paths: files.slice(0, 1000).map((file) => file.path),
+      roles: ['coder', 'reviewer', 'advisor'] as ('coder' | 'reviewer' | 'advisor')[],
+      checks: ['node-tests-v1', 'project-node-tests-v1', 'crewkite-verify-v1'],
+    };
+    const binding = ConversationTurnBindingSchema.parse({
+      taskId,
+      runId: run.id,
+      attemptId: attempt.id,
+      generation: attempt.generation,
+      routeId: config.routeId,
+      role: config.selection.role,
+      taskRevision: task.revision,
+      conversationRevision: this.conversation.revision(taskId),
+      scopeHash: hashCanonical(scope),
+      limitMinutes: Math.min(5, allowance.minutes),
+    });
+    let input: ConversationPlan | undefined;
+    let omitted = Math.max(0, total - history.length);
+    while (!input) {
+      try {
+        input = conversationPlan({
+          binding,
+          model: profile.facts.model as ConversationPlan['model'],
+          effort: 'low',
+          creditPolicy: config.selection.creditPolicy,
+          directory,
+          context: {
+            title: task.title,
+            outcome: task.outcome,
+            criteria:
+              config.contractStatus === 'provisional' ? config.contextCriteria : task.criteria,
+          },
+          scope,
+          history,
+          omittedHistoryCount: omitted,
+        });
+      } catch {
+        if (history.length > 1) {
+          const retained = new Set(pending.map((entry) => entry.id));
+          const old = historyEntries.findIndex((entry) => !retained.has(entry.id));
+          const index = old >= 0 ? old : history.length - 1;
+          history.splice(index, 1);
+          historyEntries.splice(index, 1);
+          omitted++;
+        } else if (scope.paths.length) {
+          scope.paths.pop();
+          binding.scopeHash = hashCanonical(scope);
+        } else return { outcome: 'blocked', reason: 'conversation-input-too-large' };
+      }
+    }
+    input = freezeNative(input);
+    const selectedIds = new Set(historyEntries.map((entry) => entry.id));
+    const included = pending.filter((entry) => selectedIds.has(entry.id));
+    if (!included.length) return { outcome: 'blocked', reason: 'conversation-input-too-large' };
+    const artifact = this.nativeArtifact({
+      ...input,
+      authorityHash: this.conversationAuthority(config),
+    });
+    this.store.saveReceipt(`conversation-turn:${attempt.id}`, artifact.hash, 'local-owner', {
+      outcome: 'applied',
+      entity: artifact,
+    });
+    if (!this.store.receipt(`allocation:${run.id}`))
+      this.store.saveReceipt(
+        `allocation:${run.id}`,
+        this.conversationAuthority(config),
+        'local-owner',
+        { outcome: 'applied', entity: run },
+      );
+    this.admitJob(run, attempt, directory, binding.limitMinutes);
+    const started = this.updateTask(this.store.get<Task>('task', task.id) as Task, {
+      state: 'running',
+      waitingReason: null,
+      next: 'The planning turn is running.',
+    });
+    const frozen: FrozenConversationTurn = {
+      binding: input.binding,
+      scope: input.scope,
+      bindingHash: conversationBindingHash(input),
+    };
+    const delivery = this.conversation.includeInputs(
+      frozen,
+      included.map((entry) => entry.id),
+    );
+    if (!delivery.applied) throw Error(delivery.reason);
+    this.event('run.admitted', task.id, started.revision, run);
+    this.pendingConversationLaunches.add(attempt.id);
+    effects.push(() => {
+      this.pendingConversationLaunches.delete(attempt.id);
+      const intent = this.store.intents().find((value) => value.attempt_id === attempt.id);
+      if (!intent) throw Error('The planning launch intent is unavailable.');
+      if (intent.state === 'stopped') return;
+      this.options.afterIntent?.(intent);
+      this.launchConversation(
+        input as ConversationPlan,
+        attempt,
+        this.conversationAuthority(config),
+        profile.environment,
+      );
+    });
+    return {
+      outcome: 'applied',
+      entity: this.store.get<Task>('task', task.id),
+      revision: (this.store.get<Task>('task', task.id) as Task).revision,
+    };
+  }
+
+  private ownsConversationTurn(
+    binding: ConversationTurnBinding,
+    phase: 'input' | 'result',
+  ): boolean {
+    try {
+      if (this.store.runPurpose(binding.runId) !== 'conversation') return false;
+      const saved = this.nativeRecord(`conversation-turn:${binding.attemptId}`)
+        .value as ConversationPlan & { authorityHash: string };
+      const config = this.conversationConfiguration(binding.taskId);
+      if (
+        !config ||
+        saved.authorityHash !== this.conversationAuthority(config) ||
+        hashCanonical(saved.binding) !== hashCanonical(binding)
+      )
+        return false;
+      const task = this.store.get<Task>('task', binding.taskId);
+      if (
+        !task ||
+        task.runId !== binding.runId ||
+        hashCanonical({
+          title: task.title,
+          outcome: task.outcome,
+          criteria:
+            config.contractStatus === 'provisional' ? config.contextCriteria : task.criteria,
+        }) !== hashCanonical(saved.context)
+      )
+        return false;
+      const intent = this.store.intents().find((value) => value.attempt_id === binding.attemptId);
+      return phase === 'input'
+        ? !!intent && intent.state === 'intent'
+        : intent?.state === 'stopped' &&
+            this.store.nativePhasesComplete(binding.attemptId, 'openai');
+    } catch {
+      return false;
+    }
+  }
+
+  private launchConversation(
+    input: ConversationPlan,
+    attempt: Attempt,
+    authorityHash: string,
+    environment: NodeJS.ProcessEnv,
+  ) {
+    const completed = Promise.withResolvers<void>();
+    const runtime: ConversationRuntime = {
+      input,
+      attempt,
+      authorityHash,
+      stopped: false,
+      done: completed.promise,
+    };
+    this.conversationWorkers.set(attempt.id, runtime);
+    const current = () => {
+      const config = this.conversationConfiguration(input.binding.taskId);
+      const task = this.store.get<Task>('task', input.binding.taskId);
+      if (
+        this.closed ||
+        runtime.stopped ||
+        !config ||
+        config.paused ||
+        authorityHash !== this.conversationAuthority(config) ||
+        task?.runId !== input.binding.runId ||
+        task.state !== 'running' ||
+        this.jobDeadline(attempt.id, input.binding.limitMinutes) <= 0 ||
+        hashCanonical({
+          title: task.title,
+          outcome: task.outcome,
+          criteria:
+            config.contractStatus === 'provisional' ? config.contextCriteria : task.criteria,
+        }) !== hashCanonical(input.context) ||
+        hashCanonical(inspectSource(task.projectId, this.projectPath(task.projectId) as string)) !==
+          hashCanonical(config.source)
+      )
+        throw Error('Planning authority changed.');
+      this.conversationProfile(config);
+    };
+    const finish = (outcome: Awaited<ReturnType<typeof startConversation>['result']> | null) => {
+      try {
+        const phases = this.store.nativeProcesses(attempt.id);
+        const quiescent =
+          (outcome?.quiescent === true && phases.every((phase) => phase.state === 'quiescent')) ||
+          (!runtime.handle && phases.length === 0);
+        let valid = false;
+        try {
+          current();
+          valid =
+            quiescent &&
+            outcome?.reason === null &&
+            !!outcome.metadata &&
+            this.store.nativePhasesComplete(attempt.id, 'openai');
+        } catch {}
+        if (
+          !this.settleJob(attempt, quiescent, true, () => {
+            const proof = this.nativeArtifact({
+              attemptId: attempt.id,
+              quiescent,
+              submitted: !!outcome?.metadata,
+              reason: outcome?.reason ?? 'launch',
+            });
+            this.store.saveReceipt(
+              `conversation-completion:${attempt.id}`,
+              proof.hash,
+              'local-owner',
+              { outcome: 'applied', entity: proof },
+            );
+            if (valid && outcome?.metadata) {
+              const config = this.conversationConfiguration(
+                input.binding.taskId,
+              ) as ConversationConfiguration;
+              this.saveConversationConfiguration(input.binding.taskId, {
+                ...config,
+                effectiveModel: input.model,
+                effectiveEffort: input.effort,
+              });
+              const result = this.conversation.recordReply(
+                {
+                  binding: input.binding,
+                  scope: input.scope,
+                  bindingHash: conversationBindingHash(input),
+                },
+                outcome.metadata.conversation,
+              );
+              if (!result.applied) valid = false;
+            }
+            const task = this.store.get<Task>('task', input.binding.taskId) as Task;
+            this.updateTask(task, {
+              state: runtime.stopped || this.closed ? 'stopped' : valid ? 'draft' : 'interrupted',
+              waitingReason: null,
+              next:
+                runtime.stopped || this.closed
+                  ? 'Planning stopped. Continue explicitly when ready.'
+                  : valid
+                    ? 'Review the reply and plan before execution.'
+                    : 'The planning turn has no verified reply. Inspect retained history before continuing.',
+            });
+          })
+        )
+          return;
+        this.conversationWorkers.delete(attempt.id);
+        if (
+          !this.closed &&
+          !runtime.stopped &&
+          valid &&
+          this.conversation.pendingInputs(input.binding.taskId).length
+        ) {
+          const effects: (() => void)[] = [];
+          this.store.transaction(() => this.admitConversation(input.binding.taskId, effects));
+          for (const effect of effects) effect();
+        }
+      } catch {
+        try {
+          this.settleJob(attempt, false, true);
+        } catch {}
+      } finally {
+        completed.resolve();
+      }
+    };
+    try {
+      current();
+      const config = this.conversationConfiguration(
+        input.binding.taskId,
+      ) as ConversationConfiguration;
+      const profile = this.conversationProfile(config);
+      mkdirSync(input.directory, { recursive: true, mode: 0o700 });
+      runtime.handle = startConversation(
+        { ...profile.client, directory: input.directory, repositoryRoot: this.home, environment },
+        input,
+        {
+          timeoutMs: this.jobDeadline(attempt.id, input.binding.limitMinutes),
+          schedule: this.options.schedule,
+          spawn: this.options.nativeSpawn,
+          onSubmitted: () => {
+            current();
+            this.store.transaction(() => {
+              const artifact = this.nativeArtifact({
+                attemptId: attempt.id,
+                bindingHash: conversationBindingHash(input),
+              });
+              this.store.saveReceipt(
+                `conversation-submission:${attempt.id}`,
+                artifact.hash,
+                'local-owner',
+                { outcome: 'outcome-unknown', entity: artifact },
+              );
+            });
+          },
+          lifecycle: this.nativeLifecycle(attempt, current),
+        },
+      );
+      if (runtime.stopped || this.closed) runtime.handle.stop();
+      void runtime.handle.result.then(finish, () => finish(null));
+    } catch {
+      finish(null);
+    }
+  }
+
   private routing(
     run: Pick<Run, 'roles' | 'policy'> & Partial<Pick<Run, 'id'>>,
     roleName: Run['roles'][number]['role'] = 'coder',
@@ -1759,7 +2757,7 @@ export class Controller {
           reservedLaunches: reserved.length,
           reservedMinutes: reserved.length * run.policy.policy.limits.minutes,
           requestedMinutes: run.id
-            ? remainingBudgets(run as Run, this.store.intents()).minutes
+            ? this.remaining(run as Run).minutes
             : run.policy.policy.limits.minutes,
         };
       }),
@@ -1784,6 +2782,41 @@ export class Controller {
   }
 
   private draftEditGate(task: Task): CommandResult | undefined {
+    const discussion = this.conversationConfiguration(task.id);
+    if (discussion?.contractStatus === 'provisional')
+      return {
+        outcome: 'blocked',
+        reason: 'task-contract-unconfirmed',
+        next: 'Review and adopt a plan before preparing execution.',
+      };
+    if (this.store.runPurpose(task.runId ?? '') === 'conversation') {
+      const blocked = this.conversationBoundary(task.id);
+      if (blocked) return { outcome: 'blocked', reason: blocked };
+      const state = this.conversationState(task.id);
+      if (
+        !discussion?.adoptedProposal ||
+        discussion.adoptedProposal.runId !== task.runId ||
+        state.proposal?.id !== discussion.adoptedProposal.id ||
+        state.proposal.hash !== discussion.adoptedProposal.hash ||
+        !state.adopt.available
+      )
+        return {
+          outcome: 'blocked',
+          reason: 'proposal-not-current',
+          next: 'Adopt the current planning proposal before preparing execution.',
+        };
+      const row = this.store.db
+        .prepare('SELECT body FROM conversation_entries WHERE id=? AND task_id=?')
+        .get(discussion.adoptedProposal.id, task.id);
+      const proposal =
+        row && (JSON.parse(row.body as string) as { kind?: string; proposal?: unknown });
+      if (
+        proposal?.kind !== 'plan-proposal' ||
+        hashCanonical(proposal.proposal) !== discussion.adoptedProposal.hash
+      )
+        return { outcome: 'blocked', reason: 'proposal-hash-changed' };
+      return;
+    }
     if (task.state !== 'draft') return;
     const run = task.runId ? this.store.get<Run>('run', task.runId) : undefined;
     const lease = this.store.db
@@ -1904,6 +2937,7 @@ export class Controller {
       revision: 0,
     });
     this.store.put('run', run.id, run.revision, run);
+    this.store.putRunPurpose(run, 'execution', task.runId);
     const updated = this.updateTask(task, {
       runId: run.id,
       state: 'draft',
@@ -1925,6 +2959,26 @@ export class Controller {
   ): CommandResult {
     const task = this.store.get<Task>('task', command.payload.taskId);
     const run = this.store.get<Run>('run', command.payload.runId);
+    if (run && this.store.runPurpose(run.id) === 'conversation') {
+      if (!task || run.taskId !== task.id || task.runId !== run.id)
+        return { outcome: 'blocked', reason: 'run-not-current' };
+      if (command.command !== 'ResumeRun')
+        return { outcome: 'blocked', reason: 'planning-run-requires-message' };
+      const boundary = this.conversationBoundary(run.taskId);
+      if (boundary) return { outcome: 'blocked', reason: boundary };
+      const config = this.conversationConfiguration(run.taskId);
+      if (!config) return { outcome: 'blocked', reason: 'not-configured' };
+      this.saveConversationConfiguration(run.taskId, { ...config, paused: false });
+      if (!this.conversation.pendingInputs(run.taskId).length) {
+        const updated = this.updateTask(task as Task, {
+          state: 'draft',
+          waitingReason: null,
+          next: 'Send a message to continue planning.',
+        });
+        return { outcome: 'applied', entity: updated, revision: updated.revision };
+      }
+      return this.admitConversation(run.taskId, effects);
+    }
     if (this.closed) return { outcome: 'blocked', reason: 'controller-closing' };
     if (!native && run && this.store.receipt(`native-run:${run.id}`)) {
       if (
@@ -2050,8 +3104,14 @@ export class Controller {
         reason: 'attempt-budget-exhausted',
         next: 'Prepare a new bounded run with enough review headroom.',
       };
-    const remaining = remainingBudgets(run, this.store.intents());
-    if (remaining.minutes === 0 || remaining.concurrency === 0)
+    const remaining = this.remaining(run);
+    if (remaining.attempts < reviewReserve + checkReserve + 1)
+      return {
+        outcome: 'blocked',
+        reason: 'review-budget-insufficient',
+        next: 'The remaining task allowance must cover the writer, checks and selected reviews.',
+      };
+    if (remaining.attempts === 0 || remaining.minutes === 0 || remaining.concurrency === 0)
       return { outcome: 'blocked', reason: 'run-budget-exhausted' };
     const lease = this.store.db
       .prepare('SELECT attempt_id FROM writer_leases WHERE task_id=?')
@@ -2566,7 +3626,7 @@ export class Controller {
         expiresAt: preparation.authority.expiresAt,
         maximumTaskMs: Math.min(
           preparation.profile.maximumTaskMs,
-          (remainingBudgets(run, this.store.intents()).minutes - 2) * 60000,
+          (this.remaining(run).minutes - 2) * 60000,
         ),
         maximumSubmissions: 1,
       });
@@ -2654,7 +3714,7 @@ export class Controller {
       return unavailable('ownership-unknown');
     if (!this.store.receipt(`candidate:${writer.id}`))
       return unavailable('retained-work-unavailable');
-    const remaining = remainingBudgets(run, this.store.intents());
+    const remaining = this.remaining(run);
     const reviews = (run.policy.policy.methods ?? []).reduce(
       (sum, method) => sum + method.cycles,
       0,
@@ -2742,7 +3802,7 @@ export class Controller {
       this.nativeManualAllowance(
         run,
         selected.route.id,
-        Math.max(0, remainingBudgets(run, this.store.intents()).minutes - 2),
+        Math.max(0, this.remaining(run).minutes - 2),
       );
       if (
         !profile.facts.available ||
@@ -3515,7 +4575,7 @@ export class Controller {
       !profile.environment
     )
       throw Error('The reviewer profile is unavailable.');
-    const remaining = remainingBudgets(run, this.store.intents());
+    const remaining = this.remaining(run);
     if (
       remaining.attempts < 2 ||
       remaining.minutes < (command.payload.checkRecipeId === 'crewkite-verify-v1' ? 6 : 2) ||
@@ -3859,7 +4919,7 @@ export class Controller {
       const current = review
         ? this.candidateReviewAuthority(artifact)
         : this.evaluationAuthority(artifact);
-      const remaining = remainingBudgets(plan.run, this.store.intents());
+      const remaining = this.remaining(plan.run);
       const required = review ? 1 : 2;
       if (
         remaining.attempts < required ||
@@ -4028,7 +5088,7 @@ export class Controller {
             },
             creditPolicy: plan.creditPolicy,
             expiresAt: plan.expiresAt,
-            remainingBudgets: remainingBudgets(plan.run, this.store.intents()),
+            remainingBudgets: this.remaining(plan.run),
             allowance: { source: 'supplemental-evaluation', localChecks: 1, nativeReviews: 1 },
             stage: review
               ? 'reviewed'
@@ -4121,7 +5181,7 @@ export class Controller {
           : { outcome: 'blocked', reason: 'candidate-evaluation-already-started' };
       const origin = this.evaluationAuthority(artifact);
       if (origin.task.state !== 'stopped') throw Error('not-stopped');
-      const remaining = remainingBudgets(plan.run, this.store.intents());
+      const remaining = this.remaining(plan.run);
       if (
         remaining.attempts < 2 ||
         remaining.minutes < plan.maximumCheckMinutes + 1 ||
@@ -4533,7 +5593,7 @@ export class Controller {
       plan.definition.recipeId === 'crewkite-verify-v1' &&
       !this.store.receipt(`evaluation-started:${plan.run.id}`)
     ) {
-      const remaining = remainingBudgets(plan.run, this.store.intents());
+      const remaining = this.remaining(plan.run);
       if (remaining.attempts < 2 || remaining.minutes < 6 || remaining.concurrency < 1)
         throw Error('budget-exhausted');
     }
@@ -5344,7 +6404,7 @@ export class Controller {
           : { outcome: 'blocked', reason: 'candidate-review-already-started' };
       prepared = this.candidateReviewAuthority(artifact);
       if (prepared.task.state !== 'stopped') throw Error('The writer and checks must be stopped.');
-      const remaining = remainingBudgets(plan.run, this.store.intents());
+      const remaining = this.remaining(plan.run);
       const timeoutMs = Math.min(
         300000,
         remaining.minutes * 60000,
@@ -5953,6 +7013,7 @@ export class Controller {
         { outcome: 'applied', entity: planArtifact },
       );
     this.store.put('run', run.id, 0, run);
+    this.store.putRunPurpose(run, 'execution', task.runId);
     this.updateTask(task, { runId: run.id });
     this.store.saveReceipt(`native-run:${run.id}`, hashCanonical(appointment), 'local-owner', {
       outcome: 'applied',
@@ -6038,11 +7099,7 @@ export class Controller {
     const policy = run.policy.policy;
     const allowance = policy.unknownUsage;
     const active = this.store.intents().filter((intent) => intent.state !== 'stopped');
-    this.nativeManualAllowance(
-      run,
-      appointment.route.id,
-      remainingBudgets(run, this.store.intents()).minutes,
-    );
+    this.nativeManualAllowance(run, appointment.route.id, this.remaining(run).minutes);
     // Native observations cannot yet establish a reserve in the controller's usage units.
     if (
       policy.reserves.length ||
@@ -7713,6 +8770,8 @@ export class Controller {
       .intents()
       .find((intent) => intent.task_id === task.id && intent.state !== 'stopped');
     if (!active) {
+      const config = this.conversationConfiguration(task.id);
+      if (config) this.saveConversationConfiguration(task.id, { ...config, paused: true });
       const updated = this.updateTask(
         task,
         restore ?? {
@@ -7721,6 +8780,53 @@ export class Controller {
           next: task.state === 'accepted' ? task.next : 'Work is stopped.',
         },
       );
+      return { outcome: 'applied', entity: updated, revision: updated.revision };
+    }
+    if (
+      this.pendingConversationLaunches.has(active.attempt_id) &&
+      active.state === 'intent' &&
+      this.store.runPurpose(active.run_id) === 'conversation' &&
+      !this.store.nativeProcesses(active.attempt_id).length
+    ) {
+      this.pendingConversationLaunches.delete(active.attempt_id);
+      const config = this.conversationConfiguration(task.id) as ConversationConfiguration;
+      this.saveConversationConfiguration(task.id, { ...config, paused: true });
+      const attempt = this.store.get<Attempt>('attempt', active.attempt_id) as Attempt;
+      const stopped = { ...attempt, state: 'stopped' as const, revision: attempt.revision + 1 };
+      this.store.put('attempt', attempt.id, stopped.revision, stopped);
+      this.store.db
+        .prepare("UPDATE launch_intents SET state='stopped',finished_at=? WHERE attempt_id=?")
+        .run(this.now(), attempt.id);
+      this.store.db.prepare('DELETE FROM writer_leases WHERE attempt_id=?').run(attempt.id);
+      this.store.db.prepare('DELETE FROM reservations WHERE attempt_id=?').run(attempt.id);
+      const proof = this.nativeArtifact({
+        attemptId: attempt.id,
+        quiescent: true,
+        unspawned: true,
+      });
+      this.store.saveReceipt(`conversation-completion:${attempt.id}`, proof.hash, 'local-owner', {
+        outcome: 'applied',
+        entity: proof,
+      });
+      const updated = this.updateTask(task, {
+        state: 'stopped',
+        waitingReason: null,
+        next: 'Planning stopped before its process launched.',
+      });
+      this.event('attempt.stopped', task.id, updated.revision, stopped);
+      return { outcome: 'applied', entity: updated, revision: updated.revision };
+    }
+    const conversationRuntime = this.conversationWorkers.get(active.attempt_id);
+    if (conversationRuntime) {
+      const config = this.conversationConfiguration(task.id);
+      if (config) this.saveConversationConfiguration(task.id, { ...config, paused: true });
+      conversationRuntime.stopped = true;
+      const updated = this.updateTask(task, {
+        state: 'stopping',
+        waitingReason: null,
+        next: 'Waiting for the owned planning turn to stop.',
+      });
+      effects.push(() => conversationRuntime.handle?.stop());
       return { outcome: 'applied', entity: updated, revision: updated.revision };
     }
     const nativeReview = this.nativeReviewWorkers.get(active.attempt_id);
@@ -7848,6 +8954,11 @@ export class Controller {
           });
       }
       for (const intent of this.store.intents().filter((value) => value.state !== 'stopped')) {
+        if (this.store.runPurpose(intent.run_id) === 'conversation') {
+          const config = this.conversationConfiguration(intent.task_id);
+          if (config)
+            this.saveConversationConfiguration(intent.task_id, { ...config, paused: true });
+        }
         const attempt = this.store.get<Attempt>('attempt', intent.attempt_id);
         const run = this.store.get<Run>('run', intent.run_id);
         const task = this.store.get<Task>('task', intent.task_id);
@@ -8481,7 +9592,7 @@ export class Controller {
   private admitJob(run: Run, attempt: Attempt, directory: string, maximumMinutes?: number) {
     const googleBlocker = this.store.googleStartBlocker(attempt.routeId);
     if (googleBlocker) throw new Error(googleBlocker);
-    const remaining = remainingBudgets(run, this.store.intents());
+    const remaining = this.remaining(run);
     if (
       remaining.attempts === 0 ||
       remaining.minutes === 0 ||
@@ -8548,7 +9659,12 @@ export class Controller {
     );
   }
 
-  private settleJob(attempt: Attempt, quiescent: boolean, closing = false): boolean {
+  private settleJob(
+    attempt: Attempt,
+    quiescent: boolean,
+    closing = false,
+    afterSettled?: () => void,
+  ): boolean {
     if (this.closed && !closing) return false;
     const current = this.store.get<Attempt>('attempt', attempt.id) as Attempt;
     if (current.state === 'stopped' || (current.state === 'unknown' && !quiescent)) return false;
@@ -8572,6 +9688,7 @@ export class Controller {
         this.store.db.prepare('DELETE FROM writer_leases WHERE attempt_id=?').run(attempt.id);
         this.store.db.prepare('DELETE FROM reservations WHERE attempt_id=?').run(attempt.id);
         this.event('attempt.stopped', task.id, task.revision, updated);
+        afterSettled?.();
       } else {
         this.event('ownership.unknown', task.id, task.revision, updated);
         this.updateTask(task, {
@@ -9006,7 +10123,7 @@ export class Controller {
       else this.store.transaction(waiting);
       return;
     }
-    const remaining = remainingBudgets(run, this.store.intents());
+    const remaining = this.remaining(run);
     if (remaining.attempts === 0 || remaining.minutes === 0)
       throw new Error('Review budget is exhausted.');
     const attempt = planned
@@ -9402,7 +10519,7 @@ export class Controller {
           .map((check) => check.definitionHash),
         unrunChecks: checked ? [] : ['node --test'],
         scope: [task.title],
-        remainingBudgets: remainingBudgets(run, this.store.intents()),
+        remainingBudgets: this.remaining(run),
         unresolvedExposure: [],
         policy: run.policy,
         allowedRouteIds: manualNativeRouteIds

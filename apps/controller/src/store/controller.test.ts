@@ -37,6 +37,7 @@ import {
   NativeRepositoryProfileSchema,
   ProjectSchema,
   RunSchema,
+  TaskConversationStateSchema,
   TaskSchema,
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
@@ -6472,6 +6473,32 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       ).outcome,
       'denied',
     );
+    const pendingAuthority = controller.store.db
+      .prepare('SELECT * FROM pending_effects WHERE approval_id=?')
+      .get(approval.approvalId);
+    const pendingRevision = taskRevision(controller, task.id);
+    for (const name of ['SendTaskMessage', 'QueueTaskGuidance', 'AnswerTaskQuestion']) {
+      const result = await controller.execute(
+        command(
+          name,
+          {
+            taskId: task.id,
+            text: 'Keep this pending action unchanged.',
+            ...(name === 'AnswerTaskQuestion' ? { questionId: id('msg') } : {}),
+          },
+          pendingRevision,
+        ),
+        'local-owner',
+      );
+      assert.equal(result.reason, 'effects-unresolved');
+      assert.equal(taskRevision(controller, task.id), pendingRevision);
+      assert.deepEqual(
+        controller.store.db
+          .prepare('SELECT * FROM pending_effects WHERE approval_id=?')
+          .get(approval.approvalId),
+        pendingAuthority,
+      );
+    }
     const intent = controller.store.intents()[0];
     assert.equal(controller.store.nativeProfileId(intent.attempt_id), 'google-acp-v1');
     assert.deepEqual(
@@ -6590,5 +6617,475 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       'google-ownership-unknown',
     );
     await controller.close();
+  }
+});
+
+test('planning turns keep task authority and allowance across execution', async (t) => {
+  let context: Awaited<ReturnType<typeof setup>>;
+  let reopened: Controller | undefined;
+  let mode = 'success';
+  let askQuestion = true;
+  let crashAfterIntent = false;
+  const held = Promise.withResolvers<void>();
+  const children: Promise<void>[] = [];
+  const profile = {
+    ...unavailableNativeProfile(),
+    facts: {
+      ...unavailableNativeProfile().facts,
+      available: true,
+      reason: 'available',
+      model: fixtureModel,
+      clientVersion: process.version,
+    },
+    client: { executable: process.execPath, sha256: fixtureClientHash, version: process.version },
+    environment: { ...process.env },
+    locationHash: '1'.repeat(64),
+  } satisfies NativeProfileResolution;
+  const options: Partial<ControllerOptions> = {
+    nativeProfile: () => profile,
+    afterIntent: () => {
+      if (crashAfterIntent) throw Error('Interrupted after durable planning admission.');
+    },
+    scenarioForRoute: () => 'complete',
+    nativeSpawn: (executable, args, spawnOptions) => {
+      const phase =
+        args.at(-1) === 'list'
+          ? 'features'
+          : context.controller.store
+                .intents()
+                .flatMap((intent) => context.controller.store.nativeProcesses(intent.attempt_id))
+                .filter((value) => value.state === 'intent')
+                .at(-1)?.phase === 'metadata-preparation'
+            ? 'prepare'
+            : 'task';
+      let script = fixture.replace(
+        'const path = message.params.outputSchema.properties.path.const;',
+        'const path = message.params.outputSchema.properties.path?.const;',
+      );
+      script = script.replace(
+        'const edit = {version:1,attemptId:message.params.outputSchema.properties.attemptId.const,path,baseHash:message.params.outputSchema.properties.baseHash.const,content:content(path)};',
+        `const edit = {version:1,bindingHash:message.params.outputSchema.properties.bindingHash.const,message:'The bounded plan is ready.',questions:${JSON.stringify(askQuestion ? ['Keep the current export?'] : [])},proposal:{summary:'Keep the export.',criteria:${JSON.stringify(mode === 'escaped-boundary' ? Array.from({ length: 12 }, (_, index) => `${index}: ${'x'.repeat(3500)}`) : ['Preserve the source sentinels.'])},slices:[{id:'net',title:'Change the module',role:'coder',scope:['net.mjs'],dependsOn:[]}],checks:['node-tests-v1']}}${mode === 'invalid' ? '; edit.effects=[]' : ''};`,
+      );
+      const child = spawn(
+        executable,
+        ['-e', script, phase === 'task' && mode === 'hold' ? 'hold' : 'success', phase],
+        spawnOptions,
+      );
+      children.push(new Promise<void>((done) => child.once('close', () => done())));
+      let output = '';
+      if (phase === 'task' && mode === 'hold')
+        child.stdout.on('data', (bytes: Buffer) => {
+          output += bytes.toString();
+          for (;;) {
+            const end = output.indexOf('\n');
+            if (end < 0) break;
+            const line = output.slice(0, end);
+            output = output.slice(end + 1);
+            try {
+              const value = JSON.parse(line);
+              if (value.id === 11) held.resolve();
+            } catch {}
+          }
+        });
+      return child;
+    },
+  };
+  context = await setup(t, options, async (controller) => {
+    await reopened?.close();
+    await controller.close();
+    await Promise.all(children);
+  });
+  const { controller, command, fixtures, clock } = context;
+  const projectId = controller.snapshot().projects[0].id;
+  const planning = {
+    role: 'lead',
+    profileId: 'openai-file-v1',
+    creditPolicy: 'ordinary',
+    limits: { attempts: 12, minutes: 30, concurrency: 2 },
+    consent: 'explicit',
+  };
+  const oversized = TaskSchema.parse(
+    (
+      await controller.execute(
+        command(
+          'CreateTask',
+          {
+            projectId,
+            title: 'A retained contract',
+            outcome: 'Keep the full criteria.',
+            criteria: Array.from({ length: 100 }, (_, index) => `${index}: ${'x'.repeat(4000)}`),
+          },
+          0,
+        ),
+        'local-owner',
+      )
+    ).entity,
+  );
+  const oversizedResult = await controller.execute(
+    command('ConfigureTaskConversation', { taskId: oversized.id, planning }, oversized.revision),
+    'local-owner',
+  );
+  assert.equal(oversizedResult.reason, 'conversation-input-too-large');
+  assert.deepEqual(controller.store.get('task', oversized.id), oversized);
+  assert.equal(controller.store.conversationTask(oversized.id), undefined);
+  const nextReply = () =>
+    new Promise<void>((done) => {
+      const off = controller.subscribe((event) => {
+        if (event.type === 'conversation.entry' && event.payload.kind === 'agent-message') {
+          off();
+          done();
+        }
+      });
+    });
+  const state = (taskId: string) =>
+    TaskConversationStateSchema.parse(
+      (controller as unknown as { conversationState: (id: string) => unknown }).conversationState(
+        taskId,
+      ),
+    );
+  const current = (id: string) =>
+    controller.snapshot().tasks.find((task) => task.id === id) as ReturnType<
+      typeof TaskSchema.parse
+    >;
+  const send = (name: string, taskId: string, payload: object) =>
+    controller.execute(
+      command(name, { taskId, ...payload }, current(taskId).revision),
+      'local-owner',
+    );
+  mode = 'escaped-boundary';
+  askQuestion = false;
+  const boundaryReply = nextReply();
+  const boundaryTask = TaskSchema.parse(
+    (
+      await controller.execute(
+        command(
+          'CreateTaskDiscussion',
+          { projectId, text: 'Keep a large bounded contract.', planning },
+          0,
+        ),
+        'local-owner',
+      )
+    ).entity,
+  );
+  await boundaryReply;
+  const boundaryProposal = state(boundaryTask.id).proposal;
+  assert(boundaryProposal);
+  await send('AdoptTaskPlan', boundaryTask.id, {
+    proposalId: boundaryProposal.id,
+    proposalHash: boundaryProposal.hash,
+  });
+  assert.equal(state(boundaryTask.id).send.reason, 'conversation-input-too-large');
+  const entryCount = controller.store.db
+    .prepare('SELECT COUNT(*) AS count FROM conversation_entries WHERE task_id=?')
+    .get(boundaryTask.id)?.count;
+  assert.equal(
+    (await send('SendTaskMessage', boundaryTask.id, { text: '\u0001'.repeat(4096) })).reason,
+    'conversation-input-too-large',
+  );
+  assert.equal(
+    controller.store.db
+      .prepare('SELECT COUNT(*) AS count FROM conversation_entries WHERE task_id=?')
+      .get(boundaryTask.id)?.count,
+    entryCount,
+  );
+  mode = 'success';
+  askQuestion = false;
+  for (const boundary of ['admission-stop', 'completion-stop', 'completion-send']) {
+    const title = `Bounded ${boundary}`;
+    let raceTaskId: string | undefined;
+    let triggered = false;
+    let replies = 0;
+    const action = Promise.withResolvers<CommandResult>();
+    const replied = Promise.withResolvers<void>();
+    const off = controller.subscribe((event) => {
+      if (event.type === 'task.created' && event.payload.title === title)
+        raceTaskId = event.payload.id;
+      if (!raceTaskId || event.taskId !== raceTaskId) return;
+      const atBoundary =
+        boundary === 'admission-stop'
+          ? event.type === 'run.admitted'
+          : event.type === 'attempt.stopped';
+      if (!triggered && atBoundary) {
+        triggered = true;
+        const result =
+          boundary === 'completion-send'
+            ? send('SendTaskMessage', raceTaskId, { text: 'Continue from this exact boundary.' })
+            : send('StopRun', raceTaskId, { runId: current(raceTaskId).runId });
+        void result.then(action.resolve, action.reject);
+      }
+      if (event.type === 'conversation.entry' && event.payload.kind === 'agent-message') {
+        replies++;
+        if (replies === (boundary === 'completion-send' ? 2 : 1)) replied.resolve();
+      }
+    });
+    t.after(off);
+    const started = await controller.execute(
+      command('CreateTaskDiscussion', { projectId, text: title, planning }, 0),
+      'local-owner',
+    );
+    const raced = TaskSchema.parse(started.entity);
+    assert.equal((await action.promise).outcome, 'applied');
+    if (boundary !== 'admission-stop') await replied.promise;
+    off();
+    const attempts = controller.store.intents().filter((intent) => intent.task_id === raced.id);
+    assert.equal(attempts.length, boundary === 'completion-send' ? 2 : 1);
+    assert(attempts.every((intent) => intent.state === 'stopped'));
+    if (boundary === 'admission-stop')
+      assert.deepEqual(controller.store.nativeProcesses(attempts[0].attempt_id), []);
+    assert.equal(current(raced.id).state, boundary === 'completion-send' ? 'draft' : 'stopped');
+    if (boundary !== 'completion-send')
+      assert.equal(state(raced.id).send.reason, 'admissions-paused');
+  }
+  askQuestion = true;
+  const firstReply = nextReply();
+  const create = command(
+    'CreateTaskDiscussion',
+    { projectId, text: 'Keep the export and change netMinor.', planning },
+    0,
+  );
+  const created = await controller.execute(create, 'local-owner');
+  assert.equal(created.outcome, 'applied');
+  const taskId = TaskSchema.parse(created.entity).id;
+  assert.equal(state(taskId).contractStatus, 'provisional');
+  assert.equal(state(taskId).phase, 'planning');
+  assert.equal(state(taskId).budget?.remaining.attempts, 11);
+  assert.equal(state(taskId).budget?.remaining.concurrency, 1);
+  assert.equal((await controller.execute(create, 'local-owner')).outcome, 'already-applied');
+  assert.equal(controller.store.intents().filter((intent) => intent.task_id === taskId).length, 1);
+  const policy = {
+    ...fixtures.policy,
+    quality: 'quick',
+    limits: { attempts: 4, minutes: 20, concurrency: 2 },
+    methods: [],
+    effects: [
+      ...fixtures.policy.effects.map((grant) => ({ ...grant, taskId })),
+      {
+        taskId,
+        action: 'run-review',
+        target: 'keep-it-simple/cycle-1',
+        expiresAt: fixtures.policy.effects[0].expiresAt,
+        revoked: false,
+        usesRemaining: 1,
+      },
+    ],
+  };
+  assert.equal(
+    (await send('PrepareRun', taskId, { policy, roles: quickRoles(fixtures) })).reason,
+    'task-not-preparable',
+  );
+  await firstReply;
+  assert.equal(state(taskId).pendingQuestions.length, 1);
+  assert.equal(state(taskId).adopt.reason, 'pending-question');
+  assert.equal(state(taskId).configuration?.effectiveModel, fixtureModel);
+  mode = 'hold';
+  askQuestion = false;
+  await send('AnswerTaskQuestion', taskId, {
+    questionId: state(taskId).pendingQuestions[0].id,
+    text: 'Keep it.',
+  });
+  await held.promise;
+  const queuedRevision = current(taskId).revision;
+  await send('SendTaskMessage', taskId, { text: 'Use the existing helper in the next plan.' });
+  assert.equal(state(taskId).queuedInputCount, 1);
+  assert.equal(state(taskId).send.disposition, 'queue');
+  assert.equal(
+    (
+      await controller.execute(
+        command('SendTaskMessage', { taskId, text: 'Stale text.' }, queuedRevision),
+        'local-owner',
+      )
+    ).outcome,
+    'stale-revision',
+  );
+  clock.advance(60000);
+  const stopped = new Promise<void>((done) => {
+    const off = controller.subscribe((event) => {
+      if (
+        event.type === 'task.updated' &&
+        event.taskId === taskId &&
+        event.payload.state === 'stopped'
+      ) {
+        off();
+        done();
+      }
+    });
+  });
+  await send('StopRun', taskId, { runId: current(taskId).runId });
+  await stopped;
+  assert.equal(controller.store.intents().filter((intent) => intent.task_id === taskId).length, 2);
+  assert.equal(state(taskId).send.reason, 'admissions-paused');
+  assert.equal(state(taskId).budget?.remaining.minutes, 29);
+  mode = 'success';
+  const resumed = nextReply();
+  await send('ResumeRun', taskId, { runId: current(taskId).runId });
+  await resumed;
+  assert.equal(state(taskId).queuedInputCount, 0);
+  assert.equal(state(taskId).adopt.available, true);
+  mode = 'invalid';
+  const invalid = new Promise<void>((done) => {
+    const off = controller.subscribe((event) => {
+      if (
+        event.type === 'task.updated' &&
+        event.taskId === taskId &&
+        event.payload.state === 'interrupted'
+      ) {
+        off();
+        done();
+      }
+    });
+  });
+  const plansBefore = controller.store.db
+    .prepare(
+      "SELECT COUNT(*) AS count FROM conversation_entries WHERE json_extract(body,'$.kind')='plan-proposal'",
+    )
+    .get()?.count;
+  await send('SendTaskMessage', taskId, { text: 'Keep the same bounded plan.' });
+  await invalid;
+  assert.equal(
+    controller.store.db
+      .prepare(
+        "SELECT COUNT(*) AS count FROM conversation_entries WHERE json_extract(body,'$.kind')='plan-proposal'",
+      )
+      .get()?.count,
+    plansBefore,
+  );
+  assert.equal(state(taskId).adopt.available, false);
+  mode = 'success';
+  const restored = nextReply();
+  await send('SendTaskMessage', taskId, { text: 'Return the valid plan.' });
+  await restored;
+  const proposed = state(taskId).proposal;
+  assert(proposed);
+  const planningRun = controller.store.get('run', proposed.runId);
+  const effectsBefore = (planningRun as ReturnType<typeof RunSchema.parse>).policy.policy.effects;
+  assert.deepEqual(effectsBefore, []);
+  assert.equal(
+    (await send('AdoptTaskPlan', taskId, { proposalId: proposed.id, proposalHash: 'f'.repeat(64) }))
+      .reason,
+    'proposal-hash-changed',
+  );
+  await send('AdoptTaskPlan', taskId, { proposalId: proposed.id, proposalHash: proposed.hash });
+  assert.equal(state(taskId).contractStatus, 'confirmed');
+  const prepared = await send('PrepareRun', taskId, { policy, roles: quickRoles(fixtures) });
+  assert.equal(prepared.outcome, 'applied');
+  const execution = RunSchema.parse(prepared.entity);
+  assert.equal(
+    (await send('ResumeRun', taskId, { runId: proposed.runId })).reason,
+    'run-not-current',
+  );
+  assert.equal(state(taskId).budget?.remaining.attempts, 7);
+  const reviewed = new Promise<void>((done) => {
+    const off = controller.subscribe((event) => {
+      if (event.type === 'review.completed' && event.taskId === taskId) {
+        off();
+        done();
+      }
+    });
+  });
+  await send('StartRun', taskId, { runId: execution.id });
+  await send('SendTaskMessage', taskId, {
+    text: 'Discuss a later revision after this work closes.',
+  });
+  assert.equal(state(taskId).send.disposition, 'queue');
+  await reviewed;
+  const exportCandidate = controller
+    .snapshot()
+    .candidates.find((candidate) => candidate.taskId === taskId);
+  assert(exportCandidate);
+  await send('ExportPatch', taskId, { candidateId: exportCandidate.id });
+  const exportApproval = controller
+    .snapshot()
+    .approvals.find((approval) => approval.taskId === taskId && approval.status === 'pending');
+  assert(exportApproval);
+  assert.equal(state(taskId).activeAttempt, null);
+  assert.equal(state(taskId).send.reason, 'effects-unresolved');
+  const pendingExport = controller.store.db
+    .prepare('SELECT * FROM pending_effects WHERE approval_id=?')
+    .get(exportApproval.approvalId);
+  const exportRevision = current(taskId).revision;
+  for (const name of ['SendTaskMessage', 'QueueTaskGuidance']) {
+    assert.equal(
+      (await send(name, taskId, { text: 'Keep the export approval exact.' })).reason,
+      'effects-unresolved',
+    );
+    assert.equal(current(taskId).revision, exportRevision);
+    assert.deepEqual(
+      controller.store.db
+        .prepare('SELECT * FROM pending_effects WHERE approval_id=?')
+        .get(exportApproval.approvalId),
+      pendingExport,
+    );
+  }
+  assert.equal(
+    (
+      await controller.execute(
+        command(
+          'ResolveApproval',
+          {
+            binding: binding(exportApproval),
+            decision: 'approved',
+          },
+          exportRevision,
+        ),
+        'local-owner',
+      )
+    ).outcome,
+    'applied',
+  );
+  const retainedExecution = structuredClone(controller.store.get('run', execution.id));
+  const retainedCandidates = structuredClone(controller.snapshot().candidates);
+  const retainedEvidence = structuredClone(controller.snapshot().evidence);
+  assert.equal(state(taskId).queuedInputCount, 1);
+  assert.equal(state(taskId).send.disposition, 'planning-turn');
+  const revisionReply = nextReply();
+  await send('SendTaskMessage', taskId, { text: 'Plan the bounded revision now.' });
+  await revisionReply;
+  assert.equal(state(taskId).contractStatus, 'provisional');
+  assert.equal(
+    (await send('PrepareRun', taskId, { policy, roles: quickRoles(fixtures) })).reason,
+    'task-contract-unconfirmed',
+  );
+  const revisionPlan = state(taskId).proposal;
+  assert(revisionPlan);
+  await send('AdoptTaskPlan', taskId, {
+    proposalId: revisionPlan.id,
+    proposalHash: revisionPlan.hash,
+  });
+  const continuation = await send('PrepareRun', taskId, { policy, roles: quickRoles(fixtures) });
+  assert.equal(continuation.outcome, 'applied');
+  assert.equal(state(taskId).budget?.remaining.attempts, 3);
+  assert.deepEqual(controller.store.get('run', execution.id), retainedExecution);
+  assert.deepEqual(controller.store.get('run', proposed.runId), planningRun);
+  assert.deepEqual(controller.snapshot().candidates, retainedCandidates);
+  assert.deepEqual(controller.snapshot().evidence, retainedEvidence);
+  crashAfterIntent = true;
+  const crash = command(
+    'SendTaskMessage',
+    { taskId, text: 'Keep the next turn bounded.' },
+    current(taskId).revision,
+  );
+  await assert.rejects(
+    controller.execute(crash, 'local-owner'),
+    /Interrupted after durable planning admission/,
+  );
+  const count = controller.store.intents().length;
+  await controller.close();
+  crashAfterIntent = false;
+  reopened = new Controller({ ...options, home: controller.home, now: clock.now, id: context.id });
+  const afterReopen = await reopened.execute(
+    command('GetTaskConversationState', { taskId }),
+    'local-owner',
+  );
+  assert.equal(afterReopen.data?.kind, 'conversation-state');
+  if (afterReopen.data?.kind === 'conversation-state')
+    assert.equal(afterReopen.data.state.send.reason, 'ownership-unknown');
+  assert.equal((await reopened.execute(crash, 'local-owner')).outcome, 'already-applied');
+  assert.equal(reopened.store.intents().length, count);
+  assert.deepEqual(reopened.snapshot().candidates, retainedCandidates);
+  assert.deepEqual(reopened.snapshot().evidence, retainedEvidence);
+  for (const sentinel of context.source.sentinels) {
+    const path = join(context.source.directory, sentinel.path);
+    assert.equal(createHash('sha256').update(readFileSync(path)).digest('hex'), sentinel.hash);
+    assert.equal(lstatSync(path).mode & 0o777, sentinel.mode);
   }
 });

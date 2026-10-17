@@ -24,10 +24,6 @@ test('durable conversation keeps questions and queued input within the owned tur
     rmSync(directory, { recursive: true, force: true });
   });
   store.applyMigrations(fileURLToPath(new URL('../../migrations/', import.meta.url)));
-  store.db.exec(`CREATE TABLE conversation_entries (
-    sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
-    task_id TEXT NOT NULL REFERENCES entities(id), body TEXT NOT NULL CHECK(json_valid(body))
-  ) STRICT; CREATE INDEX conversation_entries_task ON conversation_entries(task_id,sequence);`);
   const clock = createTestClock();
   const id = createTestIds(clock.now(), 1000n);
   const fixtures = createDemoFixtures(clock.now());

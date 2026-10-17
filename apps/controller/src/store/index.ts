@@ -208,6 +208,32 @@ export class Store {
     if (result.changes !== 1) throw new Error('Entity identity belongs to a different kind.');
   }
 
+  conversationTask(taskId: string): unknown {
+    const row = this.db.prepare('SELECT body FROM task_conversations WHERE task_id=?').get(taskId);
+    return row ? JSON.parse(row.body as string) : undefined;
+  }
+
+  putConversationTask(taskId: string, body: unknown) {
+    if (!this.transactionEvents) throw new Error('Conversation writes require a transaction.');
+    this.db
+      .prepare(
+        'INSERT INTO task_conversations(task_id,body) VALUES (?,?) ON CONFLICT(task_id) DO UPDATE SET body=excluded.body',
+      )
+      .run(taskId, canonicalJson(body));
+  }
+
+  runPurpose(runId: string): 'conversation' | 'execution' | undefined {
+    const row = this.db.prepare('SELECT purpose FROM run_purposes WHERE run_id=?').get(runId);
+    return row?.purpose as 'conversation' | 'execution' | undefined;
+  }
+
+  putRunPurpose(run: Run, purpose: 'conversation' | 'execution', parentRunId: string | null) {
+    if (!this.transactionEvents) throw new Error('Run purpose writes require a transaction.');
+    this.db
+      .prepare('INSERT INTO run_purposes(run_id,task_id,purpose,parent_run_id) VALUES (?,?,?,?)')
+      .run(run.id, run.taskId, purpose, parentRunId);
+  }
+
   receipt(key: string): { hash: string; principal: string; result: CommandResult } | undefined {
     const row = this.db
       .prepare('SELECT request_hash,principal,result FROM receipts WHERE command_key=?')
@@ -529,6 +555,18 @@ export class Store {
       job.generation === attempt.generation;
     if (!['intent', 'running'].includes(attempt.state) || (task.state !== 'running' && !reviewing))
       throw new Error('Native phases require a current writer or native review.');
+    if (this.runPurpose(attempt.runId) === 'conversation') {
+      const run = this.get<Run>('run', attempt.runId);
+      if (
+        reviewing ||
+        !run?.roles.some(
+          (role) =>
+            ['lead', 'orchestrator'].includes(role.role) && role.routeId === attempt.routeId,
+        ) ||
+        !this.receipt(`conversation-turn:${attemptId}`)
+      )
+        throw new Error('Planning phases require their admitted conversation purpose.');
+    }
     const previous = this.nativeProcesses(attemptId);
     const route = this.get<Route>('route', attempt.routeId);
     if (
