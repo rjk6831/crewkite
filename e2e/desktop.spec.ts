@@ -16,7 +16,10 @@ import {
 import { git } from '../apps/controller/src/host/source.ts';
 import { groupAbsent } from '../apps/controller/src/host/worker.ts';
 import { startController } from '../apps/controller/src/main.ts';
-import { unavailableNativeProfile } from '../apps/controller/src/providers/openai/profile.ts';
+import {
+  unavailableNativeProfile,
+  unavailableRepositoryProfile,
+} from '../apps/controller/src/providers/openai/profile.ts';
 import { encodeFrame, FrameDecoder } from '../packages/client/src/index.ts';
 import {
   type ControllerClient,
@@ -717,6 +720,11 @@ async function conversationBridge(
     available: true,
     reason: 'available',
   };
+  const repositoryProfile = {
+    ...unavailableRepositoryProfile().facts,
+    available: true,
+    reason: 'qualification-pending',
+  };
   const route = { ...fixtures.snapshot.routes[0], model: 'fixture-model', fake: true };
   const snapshot = SnapshotSchema.parse({
     ...fixtures.snapshot,
@@ -726,7 +734,7 @@ async function conversationBridge(
     attempts: [],
     approvals: [],
     routes: [route],
-    nativeProfiles: [profile],
+    nativeProfiles: [profile, repositoryProfile],
     nativeRuns: [],
     candidates: [],
     artifacts: [],
@@ -741,6 +749,9 @@ async function conversationBridge(
   let questionId = '';
   let configureAttempts = 0;
   let heldNativeKey: Command['key'] | null = null;
+  let workerPreparationKey: Command['key'] | null = null;
+  let conversationStateReads = 0;
+  let refuseWorkerAdoption = false;
   const modelObservation = { artifactId: id('art'), hash: 'c'.repeat(64) };
   const modelCatalog = [
     { model: 'fixture-model', efforts: ['low'], defaultEffort: 'low' },
@@ -808,11 +819,16 @@ async function conversationBridge(
         },
       };
     }
-    if (command.command === 'GetTaskConversationState')
+    if (command.command === 'GetTaskConversationState') {
+      conversationStateReads += 1;
+      const observed = TaskConversationStateSchema.parse(state);
+      if (refuseWorkerAdoption && observed.proposal)
+        observed.proposal = { ...observed.proposal, id: messageId(), hash: 'd'.repeat(64) };
       return {
         outcome: 'applied',
-        data: { kind: 'conversation-state', state: TaskConversationStateSchema.parse(state) },
+        data: { kind: 'conversation-state', state: TaskConversationStateSchema.parse(observed) },
       };
+    }
     if (command.command === 'GetTaskConversation') {
       const eligible = entries.filter(
         (entry) =>
@@ -867,6 +883,19 @@ async function conversationBridge(
     }
     received.push(command);
     if (command.command === 'PrepareNativeRun') {
+      if (command.payload.profileId === 'openai-repository-v1') {
+        assert.equal(workerPreparationKey, null);
+        assert.equal(command.expectedRevision, snapshot.tasks[0].revision);
+        assert.equal(command.payload.taskId, snapshot.tasks[0].id);
+        workerPreparationKey = command.key;
+        const result: CommandResult = {
+          outcome: 'blocked',
+          reason: 'Fixture repository preparation was not saved.',
+          next: 'Fixture repository preparation was not saved.',
+        };
+        receipts.set(command.key, result);
+        return result;
+      }
       assert.equal(heldNativeKey, null);
       assert.equal(command.expectedRevision, snapshot.tasks[0].revision);
       assert.equal(command.payload.taskId, snapshot.tasks[0].id);
@@ -989,6 +1018,7 @@ async function conversationBridge(
         binding: binding(),
         text: 'Answer the scope question before adopting the plan.',
       });
+      assert(proposal.kind === 'plan-proposal');
       state = TaskConversationStateSchema.parse({
         taskId: task.id,
         revision: task.revision,
@@ -1019,7 +1049,12 @@ async function conversationBridge(
         },
         queuedInputCount: 0,
         pendingQuestions: [{ id: question.id, cursor: question.cursor }],
-        proposal: { id: proposal.id, hash: 'b'.repeat(64), runId, revision: task.revision },
+        proposal: {
+          id: proposal.id,
+          hash: createHash('sha256').update(canonicalJson(proposal.proposal)).digest('hex'),
+          runId,
+          revision: task.revision,
+        },
         adoptedProposal: null,
         send: { available: false, reason: 'pending-question', disposition: null },
         adopt: { available: false, reason: 'pending-question' },
@@ -1530,6 +1565,143 @@ async function conversationBridge(
       TaskConversationStateSchema.parse(state).configuration?.selection,
       beforePolicySelection,
     );
+    const refusedWorkerChooser = await choosePolicy('Balanced');
+    const readsBeforeRefusal = conversationStateReads;
+    refuseWorkerAdoption = true;
+    await refusedWorkerChooser
+      .getByRole('button', { name: 'Prepare adopted repository worker', exact: true })
+      .click();
+    await expect.poll(() => conversationStateReads).toBeGreaterThan(readsBeforeRefusal);
+    await expect(
+      page.getByText(
+        'The adopted plan changed. Review and adopt the current plan before preparing.',
+        { exact: true },
+      ),
+    ).toBeVisible();
+    await expect(page.getByRole('dialog', { name: 'Repository work', exact: true })).toHaveCount(0);
+    assert.equal(
+      received.some((command) => command.command === 'PrepareNativeRun'),
+      false,
+    );
+    refuseWorkerAdoption = false;
+    await page.keyboard.press('Escape');
+    const workerChooser = await choosePolicy('Balanced');
+    const adoptedState = TaskConversationStateSchema.parse(state);
+    assert.equal(adoptedState.contractStatus, 'confirmed');
+    assert(adoptedState.adoptedProposal);
+    assert.deepEqual(adoptedState.adoptedProposal, adoptedState.proposal);
+    assert.equal(adoptedState.adoptedProposal.runId, snapshot.tasks[0].runId);
+    const adoptedCriteria = [...snapshot.tasks[0].criteria];
+    const readsBeforeWorkerChoice = conversationStateReads;
+    await workerChooser
+      .getByRole('button', { name: 'Prepare adopted repository worker', exact: true })
+      .click();
+    await expect.poll(() => conversationStateReads).toBeGreaterThan(readsBeforeWorkerChoice);
+    const workerNative = page.getByRole('dialog', { name: 'Repository work', exact: true });
+    await expect(workerNative).toBeVisible();
+    await expect(workerNative).toContainText(repositoryProfile.displayName);
+    await expect(
+      workerNative.getByRole('combobox', { name: 'Execution authority', exact: true }),
+    ).toHaveValue('balanced');
+    await expect(
+      workerNative.getByRole('textbox', { name: 'Committed file path', exact: true }),
+    ).toHaveCount(0);
+    const prepareWorker = workerNative.getByRole('button', {
+      name: 'Prepare native proposal',
+      exact: true,
+    });
+    const workerTrust = workerNative.getByRole('checkbox', {
+      name: 'Trust the existing native client and login',
+      exact: true,
+    });
+    const workerSource = workerNative.getByRole('checkbox', {
+      name: 'Send this committed repository and task text; allow edits in independent scratch',
+      exact: true,
+    });
+    const workerTools = workerNative.getByRole('checkbox', {
+      name: 'Allow local commands for this run',
+      exact: true,
+    });
+    for (const consent of [workerTrust, workerSource, workerTools])
+      await expect(consent).not.toBeChecked();
+    await expect(prepareWorker).toBeDisabled();
+    await workerTrust.check();
+    await workerSource.check();
+    await expect(prepareWorker).toBeDisabled();
+    await workerTools.check();
+    await expect(workerTrust).not.toBeChecked();
+    await expect(workerSource).not.toBeChecked();
+    await expect(prepareWorker).toBeDisabled();
+    await workerTrust.check();
+    await workerSource.check();
+    await expect(prepareWorker).toBeEnabled();
+    assert.equal(
+      received.some((command) =>
+        ['PrepareRun', 'PrepareNativeRun', 'PrepareCombinedRun', 'StartRun'].includes(
+          command.command,
+        ),
+      ),
+      false,
+    );
+    const workerRevision = snapshot.tasks[0].revision;
+    await prepareWorker.click();
+    await expect(
+      workerNative.getByText('Fixture repository preparation was not saved.', { exact: true }),
+    ).toBeVisible();
+    assert(workerPreparationKey);
+    const workerPreparation = received.find((command) => command.key === workerPreparationKey);
+    assert(workerPreparation?.command === 'PrepareNativeRun');
+    assert.equal(workerPreparation.expectedRevision, workerRevision);
+    assert.equal(workerPreparation.payload.taskId, adoptedState.taskId);
+    assert.equal(workerPreparation.payload.profileId, 'openai-repository-v1');
+    assert.equal(workerPreparation.payload.policy.authority, 'balanced');
+    assert.equal(workerPreparation.payload.policy.quality, 'quick');
+    assert.deepEqual(workerPreparation.payload.policy.methods, [
+      { id: 'keep-it-simple', cycles: 1, reviewerRole: 'reviewer' },
+    ]);
+    assert.deepEqual(workerPreparation.payload.policy.limits, {
+      attempts: 3,
+      minutes: 5,
+      concurrency: 1,
+    });
+    assert.equal(workerPreparation.payload.consent, 'explicit');
+    assert.equal(workerPreparation.payload.creditPolicy, 'ordinary');
+    assert.deepEqual(Object.keys(workerPreparation.payload).sort(), [
+      'consent',
+      'creditPolicy',
+      'policy',
+      'profileId',
+      'taskId',
+    ]);
+    assert.deepEqual(
+      workerPreparation.payload.policy.effects.map(({ action, target, taskId }) => ({
+        action,
+        target,
+        taskId,
+      })),
+      [
+        { action: 'write-scratch', target: snapshot.projects[0].name, taskId: adoptedState.taskId },
+        { action: 'export-patch', target: adoptedState.taskId, taskId: adoptedState.taskId },
+        {
+          action: 'run-native-tools',
+          target: snapshot.projects[0].name,
+          taskId: adoptedState.taskId,
+        },
+      ],
+    );
+    assert.deepEqual(snapshot.tasks[0].criteria, adoptedCriteria);
+    assert.deepEqual(
+      TaskConversationStateSchema.parse(state).adoptedProposal,
+      adoptedState.adoptedProposal,
+    );
+    assert.equal(snapshot.attempts.length, 0);
+    assert.equal(
+      received.some((command) => command.command === 'StartRun'),
+      false,
+    );
+    await workerNative.getByRole('button', { name: 'Cancel', exact: true }).click();
+    if (await page.getByRole('button', { name: 'Dismiss error', exact: true }).count())
+      await page.getByRole('button', { name: 'Dismiss error', exact: true }).click();
     const pendingChooser = await choosePolicy('Balanced');
     await pendingChooser
       .getByRole('button', { name: `Choose ${profile.displayName}`, exact: true })
@@ -1569,7 +1741,8 @@ async function conversationBridge(
     await expect(
       pendingChooser.getByRole('combobox', { name: 'Future execution authority', exact: true }),
     ).toHaveValue('balanced');
-    assert.equal(received.filter((command) => command.command === 'PrepareNativeRun').length, 1);
+    assert.equal(received.filter((command) => command.key === heldNativeKey).length, 1);
+    assert.equal(received.filter((command) => command.command === 'PrepareNativeRun').length, 2);
     await pendingChooser.getByRole('button', { name: 'Cancel', exact: true }).click();
     await page.getByRole('button', { name: 'Retry exact command', exact: true }).click();
     await expect(
@@ -1919,7 +2092,9 @@ async function conversationBridge(
       received.some(
         (command) =>
           ['PrepareRun', 'StartRun', 'AcceptCandidate'].includes(command.command) ||
-          (command.command === 'PrepareNativeRun' && command.key !== heldNativeKey),
+          (command.command === 'PrepareNativeRun' &&
+            command.key !== heldNativeKey &&
+            command.key !== workerPreparationKey),
       ),
       false,
     );
