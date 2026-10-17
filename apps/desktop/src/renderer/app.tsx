@@ -48,9 +48,18 @@ import {
   Wallet,
   X,
 } from 'lucide-react';
-import { type FormEvent, type ReactNode, type RefObject, useEffect, useRef, useState } from 'react';
+import {
+  type FormEvent,
+  type ReactNode,
+  type RefObject,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from 'react';
 import wordmark from './assets/crewkite-wordmark.png';
 import inverseWordmark from './assets/crewkite-wordmark-inverse.png';
+import { CombinedTask } from './combined-task.tsx';
 import {
   actionName,
   Dialog,
@@ -74,6 +83,7 @@ import { roleLabels } from './templates.ts';
 
 const tabs = [
   'Conversation',
+  'Combined task',
   'Plan',
   'Changes',
   'Checks and review',
@@ -267,7 +277,11 @@ export function App() {
     task && conversationState?.taskId === task.id && conversationState.revision === task.revision
       ? conversationState
       : null;
-  const stopRunId = currentConversation?.currentRunId ?? task?.runId;
+  const combined = snapshot?.combinedRuns.find(
+    (value) =>
+      value.taskId === task?.id || value.members.some((member) => member.taskId === task?.id),
+  );
+  const stopRunId = combined ? task?.runId : (currentConversation?.currentRunId ?? task?.runId);
   const run = snapshot?.runs.find(({ id }) => id === task?.runId);
   const candidate = snapshot?.candidates.filter((value) => value.taskId === task?.id).at(-1);
   const changesKey = [
@@ -322,7 +336,15 @@ export function App() {
     workspace.pendingStart.runId === stopRunId;
   const stopAllowed =
     stoppingPendingStart ||
-    (currentConversation &&
+    (!!combined &&
+      combined.taskId === task?.id &&
+      combined.runId === stopRunId &&
+      !['accepted', 'stopped'].includes(combined.phase)) ||
+    (combined?.members.some((member) => member.taskId === task?.id && member.runId === stopRunId) &&
+      !!task &&
+      ['running', 'checking', 'unknown'].includes(task.state)) ||
+    (!combined &&
+      currentConversation &&
       (currentConversation.purpose === 'conversation'
         ? Boolean(
             stopRunId && ['planning', 'stopping', 'unknown'].includes(currentConversation.phase),
@@ -611,6 +633,7 @@ export function App() {
                       </div>
                       <div className="button-row">
                         {task.state === 'draft' &&
+                          !combined &&
                           currentConversation?.contractStatus === 'confirmed' &&
                           !currentConversation.activeAttempt &&
                           !['unknown', 'stopping'].includes(currentConversation.phase) && (
@@ -627,6 +650,7 @@ export function App() {
                             </button>
                           )}
                         {task.runId &&
+                          !combined &&
                           !nativeRun &&
                           currentConversation &&
                           currentConversation.purpose !== 'conversation' &&
@@ -649,7 +673,33 @@ export function App() {
                               <ArrowRight size={14} />
                             </button>
                           )}
-                        {nativeRun?.handoff && nativeRun.stage !== 'prepared' && (
+                        {combined?.taskId === task.id &&
+                          combined.runId === task.runId &&
+                          combined.phase === 'paused' && (
+                            <button
+                              type="button"
+                              className="button secondary"
+                              title="Current work must stop before admissions can resume."
+                              disabled={
+                                workspace.pending ||
+                                workspace.retryAvailable ||
+                                connection !== 'connected'
+                              }
+                              onClick={() =>
+                                void workspace
+                                  .command({
+                                    command: 'ResumeRun',
+                                    expectedRevision: task.revision,
+                                    payload: { taskId: task.id, runId: combined.runId },
+                                  })
+                                  .catch(() => {})
+                              }
+                            >
+                              Resume admissions
+                              <ArrowRight size={14} />
+                            </button>
+                          )}
+                        {!combined && nativeRun?.handoff && nativeRun.stage !== 'prepared' && (
                           <button
                             type="button"
                             className="button secondary"
@@ -679,6 +729,7 @@ export function App() {
                       </div>
                     </div>
                     {run &&
+                      !combined &&
                       currentConversation?.purpose === 'execution' &&
                       ['running', 'waiting', 'stopped', 'interrupted'].includes(task.state) && (
                         <RouteSwitch
@@ -724,7 +775,13 @@ export function App() {
                     role="tabpanel"
                     aria-labelledby={`tab-${tab}`}
                     className="task-panel"
-                    style={tab === 'Conversation' ? { padding: 0, overflow: 'hidden' } : undefined}
+                    style={
+                      tab === 'Conversation'
+                        ? { padding: 0, overflow: 'hidden' }
+                        : tab === 'Combined task'
+                          ? { padding: 16, overflow: 'hidden' }
+                          : undefined
+                    }
                   >
                     <div
                       hidden={tab !== 'Conversation'}
@@ -752,7 +809,31 @@ export function App() {
                           )
                         }
                         onState={setConversationState}
-                        onPrepare={() => setLaunch(true)}
+                        onPrepare={() => (combined ? setTab('Combined task') : setLaunch(true))}
+                      />
+                    </div>
+                    <div
+                      hidden={tab !== 'Combined task'}
+                      style={tab === 'Combined task' ? { height: '100%' } : { display: 'none' }}
+                    >
+                      <CombinedTaskPanel
+                        key={task.id}
+                        task={task}
+                        snapshot={snapshot}
+                        workspace={workspace}
+                        onInspect={(panel) =>
+                          setTab(
+                            panel === 'changes'
+                              ? 'Changes'
+                              : panel === 'evaluation'
+                                ? 'Checks and review'
+                                : 'Activity',
+                          )
+                        }
+                        onSelectTask={(id) => {
+                          setSelected(id);
+                          setTab('Combined task');
+                        }}
                       />
                     </div>
                     {tab === 'Activity' && (
@@ -810,7 +891,7 @@ export function App() {
                 snapshot={snapshot}
                 run={run}
                 task={task}
-                onConfigure={() => setLaunch(true)}
+                onConfigure={() => (combined ? setTab('Combined task') : setLaunch(true))}
               />
             )}
           </div>
@@ -842,7 +923,7 @@ export function App() {
           }}
         />
       )}
-      {launch && task && snapshot && (
+      {launch && !combined && task && snapshot && (
         <Launch
           task={task}
           snapshot={snapshot}
@@ -850,7 +931,7 @@ export function App() {
           onClose={() => setLaunch(false)}
         />
       )}
-      {nativeHandoff && task && snapshot && nativeRun?.handoff && (
+      {nativeHandoff && !combined && task && snapshot && nativeRun?.handoff && (
         <NativeHandoff
           key={`${task.runId}:${task.revision}:${nativeRun.handoff.currentAttemptId}:${nativeRun.handoff.pending?.preparationId ?? ''}`}
           task={task}
@@ -1071,9 +1152,74 @@ function ApprovalCard({
   );
 }
 
+function CombinedTaskPanel({
+  task,
+  snapshot,
+  workspace,
+  onInspect,
+  onSelectTask,
+}: {
+  task: Task;
+  snapshot: Snapshot;
+  workspace: Workspace;
+  onInspect: (panel: 'changes' | 'evaluation' | 'activity') => void;
+  onSelectTask: (id: Task['id']) => void;
+}) {
+  const [source, setSource] = useState<Run['source'] | null>(null);
+  const [sourceError, setSourceError] = useState<string | null>(null);
+  const request = useRef(0);
+  const command = workspace.command;
+  const inspect = useCallback(async () => {
+    const current = ++request.current;
+    setSource(null);
+    setSourceError(null);
+    try {
+      const result = await command({
+        command: 'InspectSource',
+        payload: { projectId: task.projectId },
+      });
+      if (current !== request.current) return;
+      if (
+        (result.outcome === 'applied' || result.outcome === 'already-applied') &&
+        result.data?.kind === 'source' &&
+        result.data.source.projectId === task.projectId
+      )
+        setSource(result.data.source);
+      else setSourceError(result.next ?? result.reason ?? 'Source inspection is unavailable.');
+    } catch (failure) {
+      if (current === request.current)
+        setSourceError(failure instanceof Error ? failure.message : 'Source inspection failed.');
+    }
+  }, [command, task.projectId]);
+  useEffect(
+    () => () => {
+      request.current += 1;
+    },
+    [],
+  );
+  const connected = workspace.connection === 'connected' && !workspace.preview;
+  return (
+    <CombinedTask
+      task={task}
+      snapshot={snapshot}
+      source={source}
+      connected={connected}
+      pending={workspace.pending}
+      retryAvailable={workspace.retryAvailable}
+      error={sourceError ?? workspace.error}
+      onCommand={workspace.command}
+      onRetry={workspace.retryCommand}
+      onRefreshSource={inspect}
+      onInspect={onInspect}
+      onSelectTask={onSelectTask}
+    />
+  );
+}
+
 const eventNames: Record<Event['type'], string> = {
   'task.created': 'Task created',
   'conversation.entry': 'Conversation entry saved',
+  'combined.updated': 'Combined progress updated',
   'task.updated': 'Task state updated',
   'run.prepared': 'Run prepared',
   'run.admitted': 'Run admitted',
@@ -1246,6 +1392,18 @@ function Plan({
   onPrepare: () => void;
   conversationState: TaskConversationState | null;
 }) {
+  const combined = snapshot.combinedRuns.find(
+    (value) =>
+      value.taskId === task.id || value.members.some((member) => member.taskId === task.id),
+  );
+  if (combined)
+    return (
+      <Empty icon={<GitBranch />} title="Combined task contract">
+        {combined.taskId === task.id
+          ? 'This parent retains the shared limits and combined candidate. Inspect Combined task for its current actions.'
+          : 'This member contributes retained work to its parent. Inspect Combined task for its scoped actions.'}
+      </Empty>
+    );
   if (!conversationState)
     return (
       <Empty icon={<RefreshCw />} title="Refreshing the task contract">
@@ -1721,10 +1879,20 @@ function Checks({
   snapshot: Snapshot;
   workspace: Workspace;
 }) {
-  const candidate = snapshot.candidates.filter(({ taskId }) => taskId === task.id).at(-1);
+  const combined = snapshot.combinedRuns.find(
+    (value) =>
+      value.taskId === task.id || value.members.some((member) => member.taskId === task.id),
+  );
+  const candidate =
+    combined?.taskId === task.id
+      ? snapshot.candidates.find(
+          (value) => value.id === combined.candidate?.id && value.hash === combined.candidate.hash,
+        )
+      : snapshot.candidates.filter(({ taskId }) => taskId === task.id).at(-1);
   const evidence = snapshot.evidence.filter(({ candidateId }) => candidateId === candidate?.id);
   const [destination, setDestination] = useState('refs/heads/feat/net-minor');
-  const native = snapshot.nativeRuns.some((value) => value.runId === task.runId);
+  const native =
+    snapshot.nativeRuns.some((value) => value.runId === task.runId) || combined?.taskId === task.id;
   const evaluation = snapshot.candidateEvaluations.find(
     (value) =>
       value.taskId === task.id &&
@@ -1733,7 +1901,7 @@ function Checks({
       value.candidateHash === candidate.hash,
   );
   const eligible = native
-    ? evaluation?.localAcceptance.available
+    ? evaluation?.localAcceptance.available && (!combined || combined.accept.available)
     : candidate && task.state === 'ready';
   const acceptanceReason = evaluation?.localAcceptance.reason ?? 'evidence-incomplete';
   const acceptanceReasons = {
@@ -1748,6 +1916,14 @@ function Checks({
     'publication-prepared': 'A local publication is prepared. Inspect its receipt before retrying.',
     accepted: 'The candidate was accepted to a local branch.',
   };
+
+  if (combined && combined.taskId !== task.id)
+    return (
+      <Empty icon={<GitBranch />} title="Member work belongs to the combined candidate">
+        Inspect Combined task for the parent. Member candidates cannot be evaluated or accepted
+        separately.
+      </Empty>
+    );
 
   return (
     <div className="view-stack">
@@ -1823,11 +1999,13 @@ function Checks({
                         </div>
                         <p>{result.summary}</p>
                         <p className="muted small">
-                          {result.job.writerRouteId === undefined
-                            ? 'Last writer route unknown for this saved review.'
-                            : result.job.writerRouteId === result.job.routeId
-                              ? 'Same route as the last writer. Separate review invocation.'
-                              : 'Different route from the last writer.'}{' '}
+                          {'origin' in result.job
+                            ? 'Combined candidate from two retained contributors. Separate review invocation.'
+                            : result.job.writerRouteId === undefined
+                              ? 'Last writer route unknown for this saved review.'
+                              : result.job.writerRouteId === result.job.routeId
+                                ? 'Same route as the last writer. Separate review invocation.'
+                                : 'Different route from the last writer.'}{' '}
                           Model diversity is not established.
                         </p>
                         <div className="review-identity">
@@ -1835,13 +2013,27 @@ function Checks({
                           <span>{route ? familyName(route.family) : 'Unavailable route'}</span>
                           <code>{short(result.job.candidateHash)}</code>
                         </div>
-                        {result.job.writerAttemptId && result.job.writerRouteId && (
+                        {'origin' in result.job ? (
+                          <details className="technical-details">
+                            <summary>Combined origin</summary>
+                            <code>Manifest {result.job.origin.manifestHash}</code>
+                            <code>Generation {result.job.origin.generation}</code>
+                            {result.job.origin.contributors.map((contributor) => (
+                              <div key={contributor.attemptId}>
+                                <code>Contributor task {contributor.taskId}</code>
+                                <code>Writer attempt {contributor.attemptId}</code>
+                                <code>Writer route {contributor.routeId}</code>
+                                <code>Candidate {contributor.candidateHash}</code>
+                              </div>
+                            ))}
+                          </details>
+                        ) : result.job.writerAttemptId && result.job.writerRouteId ? (
                           <details className="technical-details">
                             <summary>Details</summary>
                             <code>Last writer attempt {result.job.writerAttemptId}</code>
                             <code>Last writer route {result.job.writerRouteId}</code>
                           </details>
-                        )}
+                        ) : null}
                         <ul>
                           {result.findings.map((finding) => (
                             <li key={`${finding.severity}-${finding.message}`}>
@@ -1943,7 +2135,9 @@ function Checks({
         </div>
         {native ? (
           <p className="muted small" role="status">
-            {acceptanceReasons[acceptanceReason]}
+            {combined && !combined.accept.available
+              ? `Combined acceptance unavailable: ${titleCase(combined.accept.reason)}.`
+              : acceptanceReasons[acceptanceReason]}
           </p>
         ) : (
           !eligible && (
