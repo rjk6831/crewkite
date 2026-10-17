@@ -12,7 +12,6 @@ import {
   readFileSync,
   realpathSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { basename, isAbsolute, join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
@@ -2453,7 +2452,7 @@ export class Controller {
     }
     const attempt = this.jobAttempt(plan.run, route.id);
     const directory = join(this.home, 'verification', attempt.id);
-    const stateRoot = join(realpathSync(tmpdir()), `ck-${attempt.id}`);
+    const stateRoot = join(realpathSync('/tmp'), `ck-${attempt.id}`);
     if (Buffer.byteLength(join(stateRoot, 'e2e-XXXXXX', 'control.sock')) > 100)
       throw Error('Verification state path is too long.');
     const owner: CheckOwner = {
