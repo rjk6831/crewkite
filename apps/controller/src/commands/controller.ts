@@ -46,6 +46,9 @@ import {
   HashSchema,
   MAX_FRAME_BYTES,
   NativeBillingAttestationSchema,
+  NativeHandoffPreviewSchema,
+  NativeHandoffTargetSchema,
+  NativeHandoffTargetsSchema,
   NativeProfileSchema,
   NativeRepositoryExecutionSchema,
   NativeRepositoryScopeSchema,
@@ -216,6 +219,7 @@ const NativePublicScopeSchema = z.strictObject({
   profileId: z.string().min(1).max(200),
   locationHash: HashSchema,
   scopeHash: HashSchema,
+  manualTargetsHash: HashSchema.optional(),
   context: z.strictObject({
     title: z.string().min(1).max(200),
     outcome: z.string().min(1).max(4096),
@@ -239,10 +243,11 @@ const NativeHistoricalPreparationSchema = z
     originalHash: HashSchema.optional(),
     anthropicSessionId: z.uuid().optional(),
     public: NativePublicScopeSchema.optional(),
+    handoff: z.lazy(() => NativeManualLinkSchema).optional(),
   })
   .refine((plan) =>
     'repository' in plan.appointment
-      ? !plan.originalHash && !plan.anthropicSessionId
+      ? !plan.originalHash && !plan.anthropicSessionId && !plan.handoff
       : !!plan.originalHash,
   );
 const NativePreparationSchema = NativeHistoricalPreparationSchema.safeExtend({
@@ -259,7 +264,56 @@ type NativeBinding = {
   planArtifact: Artifact;
   public?: z.infer<typeof NativePublicScopeSchema>;
   environment?: NodeJS.ProcessEnv;
+  handoff?: z.infer<typeof NativeManualLinkSchema>;
 };
+const NativeManualRosterSchema = z.strictObject({
+  runId: RunSchema.shape.id,
+  targets: z
+    .array(
+      z.strictObject({
+        target: NativeHandoffTargetSchema,
+        profile: NativeProfileSchema,
+        client: NativeFileAppointmentSchema.shape.client,
+        locationHash: HashSchema,
+        route: RouteSchema,
+      }),
+    )
+    .min(1)
+    .max(3),
+});
+const NativeManualPreparationSchema = z.strictObject({
+  version: z.literal(1),
+  runId: RunSchema.shape.id,
+  fromAttemptId: AttemptSchema.shape.id,
+  attemptId: AttemptSchema.shape.id,
+  generation: AttemptSchema.shape.generation,
+  recipient: NativeHandoffTargetSchema,
+  profile: NativeProfileSchema,
+  client: NativeFileAppointmentSchema.shape.client,
+  locationHash: HashSchema,
+  route: RouteSchema,
+  billingAttestation: NativeBillingAttestationSchema.optional(),
+  permissionMode: GoogleNativePermissionModeSchema.optional(),
+  candidate: CandidateSchema,
+  packet: SealedHandoffPacketSchema,
+  target: z.strictObject({
+    path: ReplacementPathSchema,
+    baseHash: HashSchema,
+    bytes: z.number().int().nonnegative().max(65536),
+  }),
+  authority: z.strictObject({
+    action: z.literal('write-scratch'),
+    target: z.string().min(1).max(200),
+    consent: z.literal('explicit'),
+    policyHash: HashSchema,
+    criteriaHash: HashSchema,
+    expiresAt: TimestampSchema,
+  }),
+});
+const NativeManualLinkSchema = z.strictObject({
+  preparationId: ArtifactSchema.shape.id,
+  preparation: NativeManualPreparationSchema,
+});
 const EvaluationConsentSchema = z.strictObject({
   scopeHash: HashSchema,
   expiresAt: TimestampSchema,
@@ -717,8 +771,7 @@ export class Controller {
       )
         return { outcome: 'blocked', reason: 'candidate-not-current' };
       if (
-        this.evidence.hash(run.source.base, readFiles(join(this.home, 'scratch', run.id))) !==
-        candidate.hash
+        this.evidence.hash(run.source.base, readFiles(this.writerScratch(run))) !== candidate.hash
       )
         return {
           outcome: 'blocked',
@@ -804,6 +857,10 @@ export class Controller {
         return this.prepare(command);
       case 'PrepareNativeRun':
         return this.prepareNative(command);
+      case 'PrepareNativeHandoff':
+        return this.prepareNativeHandoff(command);
+      case 'StartNativeHandoff':
+        return this.startNativeHandoff(command, effects);
       case 'PrepareCandidateEvaluation':
         return this.prepareEvaluation(command, verification);
       case 'StartCandidateEvaluation':
@@ -1214,7 +1271,11 @@ export class Controller {
           ? `Selected route ${target} cannot pass the saved pin, allowance or slot gates. Resume to recheck, or stop to cancel the switch.`
           : 'Wait for usable allowance or choose an approved route.',
       };
-    if (command.command === 'StartRun' && decision.chosen !== run.decision.chosen)
+    if (
+      command.command === 'StartRun' &&
+      !native?.handoff &&
+      decision.chosen !== run.decision.chosen
+    )
       return {
         outcome: 'blocked',
         reason: 'route-preview-changed',
@@ -1241,9 +1302,9 @@ export class Controller {
         reason: 'approved-route-changed',
         next: 'Request approval for the current route.',
       };
-    const allocation = this.grant(run, 'write-scratch', project.name);
+    const allocation = native?.handoff ? undefined : this.grant(run, 'write-scratch', project.name);
     const allocated = this.store.receipt(`allocation:${run.id}`);
-    if (!allocation && !approved && !allocated) {
+    if (!allocation && !approved && !allocated && !native?.handoff) {
       this.store.put('attempt', attempt.id, attempt.revision, attempt);
       return this.requestAction(task, run, attempt, 'write-scratch', project.name, {
         kind: 'command',
@@ -1286,6 +1347,18 @@ export class Controller {
       return { outcome: 'blocked', reason: 'native-tools-grant-unavailable' };
     this.store.db.prepare('DELETE FROM receipts WHERE command_key=?').run(`paused:${run.id}`);
     this.store.put('attempt', attempt.id, attempt.revision, attempt);
+    if (native?.handoff) {
+      this.nativeManualAuthority(native, false);
+      const authority = this.nativeRecord(
+        `native-handoff-prepared:${native.handoff.preparationId}`,
+      );
+      this.store.saveReceipt(
+        `native-handoff-consumed:${attempt.id}`,
+        authority.artifact.hash,
+        'local-owner',
+        { outcome: 'applied', entity: authority.artifact },
+      );
+    }
     if (allocation) this.consumeGrant(run, allocation);
     if (nativeTools) this.consumeGrant(run, nativeTools);
     if (!allocated)
@@ -1295,7 +1368,9 @@ export class Controller {
         'local-owner',
         { outcome: 'applied', entity: run },
       );
-    const scratchPath = join(this.home, 'scratch', run.id);
+    const scratchPath = native?.handoff
+      ? join(this.home, 'scratch-handoffs', run.id, attempt.id)
+      : join(this.home, 'scratch', run.id);
     this.store.db
       .prepare('INSERT INTO writer_leases(task_id,attempt_id,generation) VALUES (?,?,?)')
       .run(task.id, attempt.id, attempt.generation);
@@ -1331,6 +1406,23 @@ export class Controller {
         );
     const admitted = { ...run, decision, revision: run.revision + 1 };
     this.store.put('run', run.id, admitted.revision, admitted);
+    if (native?.handoff) {
+      this.store.saveReceipt(
+        `native-attempt-plan:${attempt.id}`,
+        hashCanonical(native.appointment),
+        'local-owner',
+        { outcome: 'applied', entity: native.planArtifact },
+      );
+      this.store.db
+        .prepare('DELETE FROM receipts WHERE command_key=?')
+        .run(`native-current:${run.id}`);
+      this.store.saveReceipt(
+        `native-current:${run.id}`,
+        hashCanonical(native.appointment),
+        'local-owner',
+        { outcome: 'applied', entity: native.planArtifact },
+      );
+    }
     if (target)
       this.store.db
         .prepare('UPDATE receipts SET result=? WHERE command_key=?')
@@ -1382,7 +1474,7 @@ export class Controller {
 
   private nativeRuns(): z.infer<typeof NativeRunSchema>[] {
     return this.store.list<Run>('run').flatMap((run) => {
-      const origin = this.store.receipt(`native-run:${run.id}`);
+      const origin = this.store.receipt(this.currentNativePlanKey(run.id));
       if (!origin) return [];
       const prepared = this.store.receipt(`native-prepared:${run.id}`);
       try {
@@ -1391,6 +1483,7 @@ export class Controller {
         const plan = JSON.parse(this.artifacts.read(artifact.hash).toString('utf8'));
         const appointment = NativeAppointmentSchema.parse(plan.appointment);
         const publicScope = NativePublicScopeSchema.safeParse(plan.public).data;
+        const handoff = this.nativeHandoffPreview(run);
         return [
           NativeRunSchema.parse({
             runId: run.id,
@@ -1404,6 +1497,7 @@ export class Controller {
                 ? 'prepared'
                 : 'retain-only',
             expiresAt: appointment.expiresAt,
+            ...(handoff ? { handoff } : {}),
             ...(appointment.billingAttestation
               ? { billingAttestation: appointment.billingAttestation }
               : {}),
@@ -1426,6 +1520,576 @@ export class Controller {
         ];
       }
     });
+  }
+
+  private nativeManualTargets(targets: z.infer<typeof NativeHandoffTargetsSchema>) {
+    return NativeHandoffTargetsSchema.parse(targets).map((target) => {
+      const profile = this.profileFor(target.profileId);
+      if (
+        !profile.facts.available ||
+        !profile.client ||
+        !profile.locationHash ||
+        !profile.environment ||
+        !profile.facts.creditPolicies.some((policy) => policy === target.creditPolicy)
+      )
+        throw Error('The manual recipient is unavailable.');
+      const route =
+        this.nativeProfileRoute(profile, target.creditPolicy) ??
+        RouteSchema.parse({
+          id: this.id('rte'),
+          family: profile.facts.family,
+          displayName: profile.facts.displayName,
+          model: profile.facts.model,
+          effort: {
+            requested: profile.facts.effort,
+            effective: profile.facts.family === 'openai' ? profile.facts.effort : 'unknown',
+            supported: [profile.facts.effort],
+          },
+          billing: target.creditPolicy === 'ordinary' ? 'included' : 'credits',
+          qualified: false,
+          fake: false,
+        });
+      return {
+        target,
+        profile: profile.facts,
+        client: profile.client,
+        locationHash: profile.locationHash,
+        route,
+      };
+    });
+  }
+
+  private nativeManualRoster(run: Run) {
+    const origin = NativeHistoricalPreparationSchema.parse(
+      this.nativeRecord(`native-run:${run.id}`).value,
+    );
+    const roster = NativeManualRosterSchema.parse(
+      this.nativeRecord(`native-handoff-roster:${run.id}`).value,
+    );
+    if (
+      roster.runId !== run.id ||
+      !origin.public?.manualTargetsHash ||
+      hashCanonical(roster.targets) !== origin.public.manualTargetsHash ||
+      hashCanonical(origin.run.source) !== hashCanonical(run.source) ||
+      hashCanonical(origin.run.policy) !== hashCanonical(run.policy) ||
+      hashCanonical(origin.run.roles) !== hashCanonical(run.roles)
+    )
+      throw Error('authority-unavailable');
+    return roster;
+  }
+
+  private currentNativePlanKey(runId: string) {
+    return this.store.receipt(`native-current:${runId}`)
+      ? `native-current:${runId}`
+      : `native-run:${runId}`;
+  }
+
+  private writerScratch(run: Run) {
+    if (this.store.receipt(`native-current:${run.id}`)) {
+      const plan = this.nativeCurrentPlan(run);
+      const intent = this.store
+        .intents()
+        .find((value) => value.attempt_id === plan.attempt.id && value.run_id === run.id);
+      if (!intent) throw Error('The current native writer intent is unavailable.');
+      return intent.scratch_path;
+    }
+    return join(this.home, 'scratch', run.id);
+  }
+
+  private nativeManualAuthority(binding: NativeBinding, consumed: boolean) {
+    const link = NativeManualLinkSchema.parse(binding.handoff);
+    const { preparation } = link;
+    const record = this.nativeRecord(`native-handoff-prepared:${link.preparationId}`);
+    const stored = NativeManualPreparationSchema.parse(record.value);
+    const run = this.store.get<Run>('run', binding.run.id);
+    const task = run && this.store.get<Task>('task', run.taskId);
+    const project = run && this.store.get<Project>('project', run.source.projectId);
+    if (
+      !run ||
+      !task ||
+      !project ||
+      task.runId !== run.id ||
+      record.artifact.id !== link.preparationId ||
+      hashCanonical(stored) !== hashCanonical(preparation) ||
+      preparation.runId !== run.id ||
+      preparation.candidate.taskId !== task.id ||
+      preparation.attemptId !== binding.attempt.id ||
+      preparation.generation !== binding.attempt.generation ||
+      preparation.route.id !== binding.attempt.routeId ||
+      hashCanonical(preparation.route) !== hashCanonical(binding.appointment.route) ||
+      preparation.authority.policyHash !== run.policy.hash ||
+      preparation.authority.criteriaHash !== hashCanonical(task.criteria) ||
+      preparation.authority.target !== project.name ||
+      Date.parse(preparation.authority.expiresAt) <= Date.parse(this.now()) ||
+      !this.grant(run, 'write-scratch', project.name) ||
+      Buffer.byteLength(canonicalJson(preparation.packet)) > 65536 ||
+      !verifyHandoff(preparation.packet) ||
+      preparation.packet.packet.attemptId !== preparation.fromAttemptId ||
+      preparation.packet.packet.generation + 1 !== preparation.generation ||
+      hashCanonical(preparation.packet.packet.source) !== hashCanonical(run.source) ||
+      hashCanonical(preparation.packet.packet.policy) !== hashCanonical(run.policy) ||
+      hashCanonical(preparation.packet.packet.candidate) !== hashCanonical(preparation.candidate) ||
+      preparation.packet.packet.allowedRouteIds.length !== 1 ||
+      preparation.packet.packet.allowedRouteIds[0] !== preparation.route.id
+    )
+      throw Error('The exact manual handoff authority is unavailable.');
+    const roster = this.nativeManualRoster(run);
+    if (
+      !roster.targets.some(
+        (entry) =>
+          hashCanonical(entry.target) === hashCanonical(preparation.recipient) &&
+          hashCanonical(entry.route) === hashCanonical(preparation.route) &&
+          hashCanonical(entry.profile) === hashCanonical(preparation.profile) &&
+          hashCanonical(entry.client) === hashCanonical(preparation.client) &&
+          entry.locationHash === preparation.locationHash,
+      )
+    )
+      throw Error('The manual recipient is outside the initial roster.');
+    const used = this.store.receipt(`native-handoff-consumed:${binding.attempt.id}`);
+    if (
+      consumed
+        ? used?.hash !== record.artifact.hash
+        : !!used ||
+          this.store.receipt(`native-handoff-pending:${run.id}`)?.hash !== record.artifact.hash
+    )
+      throw Error('The manual handoff authority was consumed or replaced.');
+    return preparation;
+  }
+
+  private nativeManualHistory(plan: z.infer<typeof NativeHistoricalPreparationSchema>) {
+    if (!plan.handoff) return;
+    const { preparationId, preparation } = plan.handoff;
+    const record = this.nativeRecord(`native-handoff-prepared:${preparationId}`);
+    const consumed = this.store.receipt(`native-handoff-consumed:${plan.attempt.id}`);
+    const preceding = this.store.get<Attempt>('attempt', preparation.fromAttemptId);
+    const previous = NativeHistoricalPreparationSchema.parse(
+      this.nativeRecord(`native-attempt-plan:${preparation.fromAttemptId}`).value,
+    );
+    const retained = this.evidence.read(preparation.candidate);
+    const target = retained.files.find((file) => file.path === preparation.target.path);
+    if (
+      'repository' in plan.appointment ||
+      !preceding ||
+      preceding.state !== 'stopped' ||
+      previous.attempt.id !== preceding.id ||
+      preceding.generation + 1 !== plan.attempt.generation ||
+      preparation.generation !== plan.attempt.generation ||
+      preparation.attemptId !== plan.attempt.id ||
+      preparation.runId !== plan.run.id ||
+      preceding.runId !== plan.run.id ||
+      hashCanonical(previous.run.source) !== hashCanonical(plan.run.source) ||
+      hashCanonical(previous.run.policy) !== hashCanonical(plan.run.policy) ||
+      hashCanonical(previous.run.roles) !== hashCanonical(plan.run.roles) ||
+      record.artifact.id !== preparationId ||
+      consumed?.hash !== record.artifact.hash ||
+      hashCanonical(record.value) !== hashCanonical(preparation) ||
+      Buffer.byteLength(canonicalJson(preparation.packet)) > 65536 ||
+      !verifyHandoff(preparation.packet) ||
+      preparation.packet.packet.attemptId !== preceding.id ||
+      hashCanonical(preparation.packet.packet.candidate) !== hashCanonical(preparation.candidate) ||
+      hashCanonical(preparation.packet.packet.source) !== hashCanonical(plan.run.source) ||
+      hashCanonical(preparation.packet.packet.policy) !== hashCanonical(plan.run.policy) ||
+      this.store.receipt(`candidate:${preceding.id}`)?.hash !== preparation.candidate.hash ||
+      !this.store.nativeProcesses(preceding.id).length ||
+      this.store.nativeProcesses(preceding.id).some((phase) => phase.state !== 'quiescent') ||
+      !target ||
+      target.hash !== preparation.target.baseHash ||
+      target.bytes !== preparation.target.bytes ||
+      target.path !== plan.appointment.target.path ||
+      target.hash !== plan.originalHash ||
+      target.hash !== plan.appointment.target.baseHash ||
+      hashCanonical(retained.files.map(({ content: _content, ...file }) => file)) !==
+        hashCanonical(plan.manifest) ||
+      hashCanonical(preparation.route) !== hashCanonical(plan.appointment.route)
+    )
+      throw Error('Manual handoff evidence changed.');
+    const roster = this.nativeManualRoster(plan.run);
+    if (
+      !roster.targets.some(
+        (entry) =>
+          hashCanonical(entry.target) === hashCanonical(preparation.recipient) &&
+          hashCanonical(entry.route) === hashCanonical(plan.appointment.route),
+      )
+    )
+      throw Error('Manual handoff recipient changed.');
+  }
+
+  private startNativeHandoff(
+    command: Extract<Command, { command: 'StartNativeHandoff' }>,
+    effects: (() => void)[],
+  ): CommandResult {
+    let binding: Omit<NativeBinding, 'planArtifact'>;
+    try {
+      const run = this.store.get<Run>('run', command.payload.runId);
+      const task = this.store.get<Task>('task', command.payload.taskId);
+      if (!run || !task || run.taskId !== task.id || task.runId !== run.id)
+        throw Error('Run changed.');
+      const gate = this.nativeHandoffGate(run);
+      if (!gate.available) throw Error('Handoff is unavailable.');
+      const record = this.nativeRecord(`native-handoff-prepared:${command.payload.preparationId}`);
+      if (
+        record.artifact.id !== command.payload.preparationId ||
+        this.store.receipt(`native-handoff-pending:${run.id}`)?.hash !== record.artifact.hash
+      )
+        throw Error('Preparation changed.');
+      const preparation = NativeManualPreparationSchema.parse(record.value);
+      const current = this.nativeCurrentPlan(run);
+      if (
+        preparation.runId !== run.id ||
+        preparation.fromAttemptId !== current.attempt.id ||
+        preparation.generation !== current.attempt.generation + 1 ||
+        current.public?.profileId === preparation.recipient.profileId
+      )
+        throw Error('Predecessor changed.');
+      const profile = this.profileFor(preparation.recipient.profileId);
+      if (
+        !profile.facts.available ||
+        !profile.environment ||
+        hashCanonical(profile.facts) !== hashCanonical(preparation.profile) ||
+        hashCanonical(profile.client) !== hashCanonical(preparation.client) ||
+        profile.locationHash !== preparation.locationHash
+      )
+        throw Error('Recipient changed.');
+      if (
+        hashCanonical(inspectSource(task.projectId, this.projectPath(task.projectId) as string)) !==
+        hashCanonical(run.source)
+      )
+        throw Error('Source changed.');
+      const prior = this.store
+        .intents()
+        .find((value) => value.attempt_id === preparation.fromAttemptId);
+      if (
+        !prior ||
+        this.evidence.hash(run.source.base, readFiles(prior.scratch_path)) !==
+          preparation.candidate.hash
+      )
+        throw Error('Retained work changed.');
+      const files = this.evidence.read(preparation.candidate).files;
+      const original = files.find((file) => file.path === preparation.target.path);
+      if (
+        !original ||
+        original.hash !== preparation.target.baseHash ||
+        original.bytes !== preparation.target.bytes
+      )
+        throw Error('Retained target changed.');
+      const appointment = NativeFileAppointmentSchema.parse({
+        id: command.key.replaceAll('_', '-'),
+        taskId: task.id,
+        route: preparation.route,
+        client: preparation.client,
+        creditPolicy: preparation.recipient.creditPolicy,
+        ...(preparation.billingAttestation
+          ? { billingAttestation: preparation.billingAttestation }
+          : {}),
+        ...(preparation.permissionMode ? { permissionMode: preparation.permissionMode } : {}),
+        target: { path: preparation.target.path, baseHash: preparation.target.baseHash },
+        consent: {
+          nativeTrust: 'accepted',
+          source: 'explicit',
+          policyHash: run.policy.hash,
+          sourceBase: run.source.base,
+          criteriaHash: hashCanonical(task.criteria),
+        },
+        policy: run.policy.policy,
+        expiresAt: preparation.authority.expiresAt,
+        maximumTaskMs: Math.min(
+          preparation.profile.maximumTaskMs,
+          (remainingBudgets(run, this.store.intents()).minutes - 2) * 60000,
+        ),
+        maximumSubmissions: 1,
+      });
+      const attempt = AttemptSchema.parse({
+        id: preparation.attemptId,
+        runId: run.id,
+        routeId: preparation.route.id,
+        generation: preparation.generation,
+        state: 'intent',
+        revision: 0,
+      });
+      const sessionHash = hashCanonical({ attemptId: attempt.id });
+      const anthropicSessionId =
+        preparation.route.family === 'anthropic'
+          ? `${sessionHash.slice(0, 8)}-${sessionHash.slice(8, 12)}-8${sessionHash.slice(13, 16)}-a${sessionHash.slice(17, 20)}-${sessionHash.slice(20, 32)}`
+          : undefined;
+      binding = {
+        appointment,
+        run,
+        attempt,
+        original: new TextDecoder('utf-8', { fatal: true }).decode(original.content),
+        baseHash: original.hash,
+        manifest: files.map(({ content: _content, ...file }) => file),
+        ...(anthropicSessionId ? { anthropicSessionId } : {}),
+        public: {
+          profileId: preparation.recipient.profileId,
+          locationHash: preparation.locationHash,
+          scopeHash: record.artifact.hash,
+          context: { title: task.title, outcome: task.outcome },
+        },
+        handoff: { preparationId: record.artifact.id, preparation },
+        environment: { ...profile.environment },
+      };
+      this.nativeManualAuthority({ ...binding, planArtifact: record.artifact }, false);
+      this.nativeWriterPlan(binding);
+      if (Buffer.byteLength(canonicalJson(this.nativePlanPayload(binding))) > MAX_FRAME_BYTES)
+        throw Error('Native handoff plan exceeds its bound.');
+    } catch {
+      return {
+        outcome: 'blocked',
+        reason: 'native-handoff-start-unavailable',
+        next: 'Prepare an exact handoff after inspecting the retained work, recipient and original limits.',
+      };
+    }
+    const planArtifact = this.nativeArtifact(this.nativePlanPayload(binding));
+    this.store.put('route', binding.appointment.route.id, 0, binding.appointment.route);
+    const start = {
+      ...command,
+      command: 'StartRun' as const,
+      payload: { taskId: command.payload.taskId, runId: command.payload.runId },
+    };
+    return this.start(start, effects, undefined, binding.attempt, false, {
+      ...binding,
+      planArtifact,
+    });
+  }
+
+  private nativeCurrentPlan(run: Run) {
+    const key = this.currentNativePlanKey(run.id);
+    return NativeHistoricalPreparationSchema.parse(this.nativeRecord(key).value);
+  }
+
+  private nativeHandoffGate(run: Run): z.infer<typeof NativeHandoffPreviewSchema>['prepare'] {
+    const unavailable = (
+      reason: z.infer<typeof NativeHandoffPreviewSchema>['prepare']['reason'],
+    ) => ({ available: false, reason });
+    const task = this.store.get<Task>('task', run.taskId);
+    if (this.closed || this.store.receipt(`paused:${run.id}`))
+      return unavailable('admissions-paused');
+    if (!task || task.runId !== run.id) return unavailable('authority-unavailable');
+    if (this.hasUncertainWriter(task.id))
+      return unavailable(task.state === 'unknown' ? 'ownership-unknown' : 'writer-active');
+    if (!['stopped', 'interrupted'].includes(task.state))
+      return unavailable('retained-work-unavailable');
+    const plan = this.nativeCurrentPlan(run);
+    const writer = this.store.get<Attempt>('attempt', plan.attempt.id);
+    const intents = this.store.intents().filter((value) => value.run_id === run.id);
+    const phases = this.store.nativeProcesses(plan.attempt.id);
+    if (
+      writer?.state !== 'stopped' ||
+      intents.at(-1)?.attempt_id !== writer.id ||
+      !phases.length ||
+      phases.some((phase) => phase.state !== 'quiescent')
+    )
+      return unavailable('ownership-unknown');
+    if (!this.store.receipt(`candidate:${writer.id}`))
+      return unavailable('retained-work-unavailable');
+    const remaining = remainingBudgets(run, this.store.intents());
+    const reviews = (run.policy.policy.methods ?? []).reduce(
+      (sum, method) => sum + method.cycles,
+      0,
+    );
+    const allowance = run.policy.policy.unknownUsage;
+    if (
+      remaining.attempts < reviews + 2 ||
+      remaining.minutes <= 2 ||
+      remaining.concurrency < 1 ||
+      allowance.rule !== 'fixed-allowance'
+    )
+      return unavailable('budget-exhausted');
+    const project = this.store.get<Project>('project', run.source.projectId);
+    if (!project || !this.grant(run, 'write-scratch', project.name))
+      return unavailable('authority-unavailable');
+    return { available: true, reason: 'available' };
+  }
+
+  private nativeHandoffPreview(run: Run) {
+    if (!this.store.receipt(`native-handoff-roster:${run.id}`)) return;
+    const roster = this.nativeManualRoster(run);
+    const plan = this.nativeCurrentPlan(run);
+    const prepare = this.nativeHandoffGate(run);
+    const saved = this.store.receipt(`native-handoff-pending:${run.id}`);
+    const pending =
+      saved &&
+      NativeManualPreparationSchema.parse(
+        this.nativeRecord(`native-handoff-pending:${run.id}`).value,
+      );
+    const relevant = pending?.fromAttemptId === plan.attempt.id;
+    const consumed = relevant && this.store.receipt(`native-handoff-consumed:${pending.attemptId}`);
+    const start = consumed
+      ? { available: false, reason: 'already-started' as const }
+      : pending && Date.parse(pending.authority.expiresAt) <= Date.parse(this.now())
+        ? { available: false, reason: 'authority-unavailable' as const }
+        : prepare;
+    return NativeHandoffPreviewSchema.parse({
+      targets: roster.targets.map(({ target }) => target),
+      currentAttemptId: plan.attempt.id,
+      generation: plan.attempt.generation,
+      prepare,
+      ...(pending && relevant
+        ? {
+            pending: {
+              preparationId: ArtifactSchema.parse(saved?.result.entity).id,
+              packetId: pending.packet.packet.id,
+              fromAttemptId: pending.fromAttemptId,
+              generation: pending.generation,
+              recipient: pending.recipient,
+              baseHash: pending.target.baseHash,
+              bytes: pending.target.bytes,
+              expiresAt: pending.authority.expiresAt,
+              start,
+            },
+          }
+        : {}),
+    });
+  }
+
+  private prepareNativeHandoff(
+    command: Extract<Command, { command: 'PrepareNativeHandoff' }>,
+  ): CommandResult {
+    let prepared: z.infer<typeof NativeManualPreparationSchema>;
+    let task: Task;
+    try {
+      const run = this.store.get<Run>('run', command.payload.runId);
+      const currentTask = this.store.get<Task>('task', command.payload.taskId);
+      if (!run || !currentTask || run.taskId !== currentTask.id || currentTask.runId !== run.id)
+        throw Error('authority-unavailable');
+      task = currentTask;
+      const gate = this.nativeHandoffGate(run);
+      if (!gate.available) throw Error(gate.reason);
+      const plan = this.nativeCurrentPlan(run);
+      if (!('target' in plan.appointment) || plan.attempt.id !== command.payload.fromAttemptId)
+        throw Error('authority-unavailable');
+      const roster = this.nativeManualRoster(run);
+      const selected = roster.targets.find(
+        ({ target }) =>
+          target.profileId === command.payload.profileId &&
+          target.creditPolicy === command.payload.creditPolicy,
+      );
+      if (!selected || plan.public?.profileId === selected.target.profileId)
+        throw Error('recipient-unavailable');
+      const profile = this.profileFor(selected.target.profileId);
+      this.nativeManualAllowance(
+        run,
+        selected.route.id,
+        Math.max(0, remainingBudgets(run, this.store.intents()).minutes - 2),
+      );
+      if (
+        !profile.facts.available ||
+        !profile.environment ||
+        hashCanonical(profile.facts) !== hashCanonical(selected.profile) ||
+        hashCanonical(profile.client) !== hashCanonical(selected.client) ||
+        profile.locationHash !== selected.locationHash
+      )
+        throw Error('recipient-unavailable');
+      if (
+        hashCanonical(inspectSource(task.projectId, this.projectPath(task.projectId) as string)) !==
+        hashCanonical(run.source)
+      )
+        throw Error('source-changed');
+      const writer = this.store.get<Attempt>('attempt', plan.attempt.id) as Attempt;
+      const candidate = CandidateSchema.parse(
+        this.store.receipt(`candidate:${writer.id}`)?.result.entity,
+      );
+      const retained = this.evidence.read(candidate);
+      const intent = this.store.intents().find((value) => value.attempt_id === writer.id);
+      if (
+        !intent ||
+        this.evidence.hash(run.source.base, readFiles(intent.scratch_path)) !== candidate.hash
+      )
+        throw Error('retained-work-unavailable');
+      const original = committedFiles(this.projectPath(task.projectId) as string, run.source.base);
+      const targetPath = plan.appointment.target.path;
+      const target = retained.files.find((file) => file.path === targetPath);
+      const siblings = (files: typeof retained.files) =>
+        files
+          .filter((file) => file.path !== targetPath)
+          .map(({ content: _content, ...file }) => file);
+      if (
+        !target ||
+        target.bytes > 65536 ||
+        hashCanonical(siblings(original)) !== hashCanonical(siblings(retained.files))
+      )
+        throw Error('retained-work-unavailable');
+      const text = new TextDecoder('utf-8', { fatal: true }).decode(target.content);
+      if (text.includes('\0')) throw Error('retained-work-unavailable');
+      const writerPacket = this.contextPacket(writer, candidate, false, [selected.route.id]);
+      if (Buffer.byteLength(canonicalJson(writerPacket)) > 65536)
+        throw Error('retained-work-unavailable');
+      const project = this.store.get<Project>('project', task.projectId) as Project;
+      const grant = this.grant(run, 'write-scratch', project.name);
+      if (!grant) throw Error('authority-unavailable');
+      const expiry = new Date(
+        Math.min(Date.parse(grant.expiresAt), Date.parse(plan.appointment.expiresAt)),
+      ).toISOString();
+      const billingAttestation =
+        'billingAttestation' in command.payload ? command.payload.billingAttestation : undefined;
+      const permissionMode =
+        'permissionMode' in command.payload ? command.payload.permissionMode : undefined;
+      if (
+        (profile.facts.family !== 'openai') !== !!billingAttestation ||
+        (profile.facts.family === 'google') !== !!permissionMode ||
+        (profile.facts.family === 'google' &&
+          (!permissionMode || !profile.facts.permissionModes.includes(permissionMode)))
+      )
+        throw Error('recipient-unavailable');
+      prepared = NativeManualPreparationSchema.parse({
+        version: 1,
+        runId: run.id,
+        fromAttemptId: writer.id,
+        attemptId: this.id('att'),
+        generation: writer.generation + 1,
+        recipient: selected.target,
+        profile: selected.profile,
+        client: selected.client,
+        locationHash: selected.locationHash,
+        route: selected.route,
+        ...(billingAttestation ? { billingAttestation } : {}),
+        ...(permissionMode ? { permissionMode } : {}),
+        candidate,
+        packet: writerPacket,
+        target: { path: target.path, baseHash: target.hash, bytes: target.bytes },
+        authority: {
+          action: 'write-scratch',
+          target: project.name,
+          consent: 'explicit',
+          policyHash: run.policy.hash,
+          criteriaHash: hashCanonical(task.criteria),
+          expiresAt: expiry,
+        },
+      });
+    } catch {
+      return {
+        outcome: 'blocked',
+        reason: 'native-handoff-preparation-unavailable',
+        next: 'Inspect retained work, recipient consent and original run bounds.',
+      };
+    }
+    const artifact = this.nativeArtifact(prepared);
+    const consent = this.nativeArtifact({
+      scopeHash: artifact.hash,
+      expiresAt: prepared.authority.expiresAt,
+    });
+    this.store.saveReceipt(`native-consent:${artifact.hash}`, artifact.hash, 'local-owner', {
+      outcome: 'applied',
+      entity: consent,
+    });
+    this.store.saveReceipt(`native-handoff-prepared:${artifact.id}`, artifact.hash, 'local-owner', {
+      outcome: 'applied',
+      entity: artifact,
+    });
+    this.store.db
+      .prepare('DELETE FROM receipts WHERE command_key=?')
+      .run(`native-handoff-pending:${prepared.runId}`);
+    this.store.saveReceipt(
+      `native-handoff-pending:${prepared.runId}`,
+      artifact.hash,
+      'local-owner',
+      { outcome: 'applied', entity: artifact },
+    );
+    this.event('handoff.sealed', task.id, task.revision, prepared.packet);
+    const updated = this.updateTask(task, {
+      next: 'Review the manual recipient and start the prepared handoff.',
+    });
+    return { outcome: 'applied', revision: updated.revision, entity: updated };
   }
 
   private consentRecord(scopeHash: string) {
@@ -1497,6 +2161,7 @@ export class Controller {
   private prepareNative(command: Extract<Command, { command: 'PrepareNativeRun' }>): CommandResult {
     let plan: Omit<NativeBinding, 'planArtifact'>;
     let expiresAt: string;
+    let manualTargets: z.infer<typeof NativeManualRosterSchema>['targets'] | undefined;
     try {
       const profile = this.profileFor(command.payload.profileId);
       const facts = NativeProfileSchema.parse(profile.facts);
@@ -1543,6 +2208,23 @@ export class Controller {
             ),
           };
       const policy = PolicySchema.parse(command.payload.policy);
+      if (filePayload?.handoffTargets) {
+        if (command.payload.consent !== 'explicit')
+          throw Error('A new manual recipient roster needs explicit consent.');
+        manualTargets = this.nativeManualTargets(filePayload.handoffTargets);
+        if (!manualTargets.some(({ target }) => target.profileId !== facts.id))
+          throw Error('Choose a different manual recipient.');
+        const reviewCycles = (policy.methods ?? []).reduce((sum, method) => sum + method.cycles, 0);
+        if (
+          (policy.methods ?? []).length !== 1 ||
+          policy.methods?.[0].cycles !== 1 ||
+          policy.limits.attempts < reviewCycles + 3 ||
+          policy.unknownUsage.rule !== 'fixed-allowance' ||
+          policy.unknownUsage.allowance.launches < 2 ||
+          policy.unknownUsage.allowance.minutes < policy.limits.minutes
+        )
+          throw Error('The manual handoff policy lacks original allowance and review headroom.');
+      }
       const runId = this.id('run');
       const project = this.store.get<Project>('project', task.projectId) as Project;
       const writeGrant = this.grant(
@@ -1579,6 +2261,7 @@ export class Controller {
         creditPolicy: command.payload.creditPolicy,
         ...(billingAttestation ? { billingAttestation: billingAttestation } : {}),
         ...(permissionMode ? { permissionMode: permissionMode } : {}),
+        ...(manualTargets ? { manualTargets } : {}),
       });
       if (command.payload.consent === 'saved')
         expiresAt = new Date(
@@ -1589,20 +2272,24 @@ export class Controller {
         NativeAppointmentSchema.parse({
           id: command.key.replaceAll('_', '-'),
           taskId: task.id,
-          route: savedRoute ?? {
-            id: this.id('rte'),
-            family: facts.family,
-            displayName: facts.displayName,
-            model: facts.model,
-            effort: {
-              requested: facts.effort,
-              effective: facts.family === 'openai' ? facts.effort : 'unknown',
-              supported: [facts.effort],
+          route: manualTargets?.find(
+            ({ target }) =>
+              target.profileId === facts.id && target.creditPolicy === command.payload.creditPolicy,
+          )?.route ??
+            savedRoute ?? {
+              id: this.id('rte'),
+              family: facts.family,
+              displayName: facts.displayName,
+              model: facts.model,
+              effort: {
+                requested: facts.effort,
+                effective: facts.family === 'openai' ? facts.effort : 'unknown',
+                supported: [facts.effort],
+              },
+              billing: command.payload.creditPolicy === 'ordinary' ? 'included' : 'credits',
+              qualified: false,
+              fake: false,
             },
-            billing: command.payload.creditPolicy === 'ordinary' ? 'included' : 'credits',
-            qualified: false,
-            fake: false,
-          },
           client: profile.client,
           creditPolicy: command.payload.creditPolicy,
           ...(billingAttestation ? { billingAttestation: billingAttestation } : {}),
@@ -1625,6 +2312,7 @@ export class Controller {
         profileId: facts.id,
         locationHash: profile.locationHash,
         scopeHash,
+        ...(manualTargets ? { manualTargetsHash: hashCanonical(manualTargets) } : {}),
         context,
       };
       plan = this.planNativeAppointment(appointment, publicScope, runId);
@@ -1637,6 +2325,29 @@ export class Controller {
       };
     }
     const binding = this.saveNativePlan(plan);
+    if (manualTargets) {
+      this.store.saveReceipt(
+        `native-attempt-plan:${binding.attempt.id}`,
+        hashCanonical(binding.appointment),
+        'local-owner',
+        { outcome: 'applied', entity: binding.planArtifact },
+      );
+      const roster = this.nativeArtifact(
+        NativeManualRosterSchema.parse({
+          runId: binding.run.id,
+          targets: manualTargets,
+        }),
+      );
+      this.store.saveReceipt(
+        `native-handoff-roster:${binding.run.id}`,
+        roster.hash,
+        'local-owner',
+        {
+          outcome: 'applied',
+          entity: roster,
+        },
+      );
+    }
     const { scopeHash } = plan.public as z.infer<typeof NativePublicScopeSchema>;
     const task = this.store.get<Task>('task', command.payload.taskId) as Task;
     const publicScope = plan.public;
@@ -1683,12 +2394,13 @@ export class Controller {
         )
     )
       throw Error('Evaluation needs the current stopped candidate.');
-    const origin = this.store.receipt(`native-run:${run.id}`);
+    const origin = this.store.receipt(this.currentNativePlanKey(run.id));
     const artifact = ArtifactSchema.parse(origin?.result.entity);
     if (artifact.bytes > MAX_FRAME_BYTES) throw Error('Native origin exceeds its bound.');
     const plan = NativeHistoricalPreparationSchema.parse(
       JSON.parse(this.artifacts.read(artifact.hash).toString('utf8')),
     );
+    this.nativeManualHistory(plan);
     this.anthropicWriterEvidence(plan);
     this.googleWriterEvidence(plan);
     this.nativeRepositoryEvidence(plan, candidate);
@@ -1719,8 +2431,7 @@ export class Controller {
           plan.public.context.outcome !== task.outcome)) ||
       hashCanonical(inspectSource(task.projectId, this.projectPath(task.projectId) as string)) !==
         hashCanonical(run.source) ||
-      this.evidence.hash(run.source.base, readFiles(join(this.home, 'scratch', run.id))) !==
-        candidate.hash
+      this.evidence.hash(run.source.base, readFiles(this.writerScratch(run))) !== candidate.hash
     )
       throw Error('Evaluation origin or saved context changed.');
     return { task, run, writer, candidate, native: plan };
@@ -2171,7 +2882,7 @@ export class Controller {
         )
           return [];
         const nativeArtifact = ArtifactSchema.parse(
-          this.store.receipt(`native-run:${task.runId}`)?.result.entity,
+          this.store.receipt(this.currentNativePlanKey(task.runId))?.result.entity,
         );
         if (nativeArtifact.bytes > MAX_FRAME_BYTES) return [];
         const native = NativeHistoricalPreparationSchema.parse(
@@ -3074,13 +3785,19 @@ export class Controller {
         },
       };
     }
+    const first = plan.handoff
+      ? NativeHistoricalPreparationSchema.parse(
+          this.nativeRecord(`native-run:${plan.run.id}`).value,
+        )
+      : plan;
     const original = source.find((file) => file.path === appointment.target.path);
     const current = files.find((file) => file.path === appointment.target.path);
     if (
       !original ||
       !current ||
-      original.hash !== plan.originalHash ||
-      original.hash !== appointment.target.baseHash ||
+      original.hash !== first.originalHash ||
+      !('target' in first.appointment) ||
+      original.hash !== first.appointment.target.baseHash ||
       current.mode !== original.mode ||
       hashCanonical(
         files
@@ -3100,8 +3817,9 @@ export class Controller {
 
   private nativePublicationEvidence(run: Run, candidate: Candidate) {
     const same = (left: unknown, right: unknown) => hashCanonical(left) === hashCanonical(right);
-    const origin = this.nativeRecord(`native-run:${run.id}`);
+    const origin = this.nativeRecord(this.currentNativePlanKey(run.id));
     const native = NativeHistoricalPreparationSchema.parse(origin.value);
+    this.nativeManualHistory(native);
     this.anthropicWriterEvidence(native);
     this.googleWriterEvidence(native);
     this.nativeRepositoryEvidence(native, candidate);
@@ -3163,7 +3881,8 @@ export class Controller {
       !same(native.run.policy, run.policy) ||
       !same(native.run.source, run.source) ||
       !same(native.run.roles, run.roles) ||
-      this.store.receipt(`native-run:${run.id}`)?.hash !== hashCanonical(native.appointment) ||
+      this.store.receipt(this.currentNativePlanKey(run.id))?.hash !==
+        hashCanonical(native.appointment) ||
       this.store.receipt(
         `${'repository' in native.appointment ? 'native-capture' : 'native-application'}:${writer.id}`,
       )?.result.outcome !== 'applied' ||
@@ -3331,8 +4050,7 @@ export class Controller {
       )
         return refused('source-changed');
       if (
-        this.evidence.hash(run.source.base, readFiles(join(this.home, 'scratch', run.id))) !==
-        candidate.hash
+        this.evidence.hash(run.source.base, readFiles(this.writerScratch(run))) !== candidate.hash
       )
         return refused('candidate-changed');
       this.nativePublicationCurrent(run, candidate);
@@ -4075,6 +4793,7 @@ export class Controller {
       ...('repository' in appointment ? {} : { originalHash: plan.baseHash }),
       ...(plan.anthropicSessionId ? { anthropicSessionId: plan.anthropicSessionId } : {}),
       ...(plan.public ? { public: plan.public } : {}),
+      ...(plan.handoff ? { handoff: plan.handoff } : {}),
     };
   }
 
@@ -4154,6 +4873,27 @@ export class Controller {
     }
   }
 
+  private nativeManualAllowance(run: Run, routeId: string, requestedMinutes: number) {
+    if (!this.store.receipt(`native-handoff-roster:${run.id}`)) return;
+    const allowance = run.policy.policy.unknownUsage;
+    const ledger = this.store
+      .intents()
+      .filter((intent) => intent.run_id === run.id && intent.route_id === routeId);
+    const completed = ledger.filter((intent) => intent.state === 'stopped');
+    const active = ledger.filter((intent) => intent.state !== 'stopped');
+    const minutes = completed.reduce(
+      (sum, intent) => sum + chargedMinutes(intent, run.policy.policy.limits.minutes),
+      0,
+    );
+    if (
+      allowance.rule !== 'fixed-allowance' ||
+      ledger.length + 1 > allowance.allowance.launches ||
+      minutes + active.length * run.policy.policy.limits.minutes + requestedMinutes >
+        allowance.allowance.minutes
+    )
+      throw Error('The original per-route launch allowance is exhausted.');
+  }
+
   private nativeDecision(
     appointment: NativePilotAppointment,
     run: Run,
@@ -4162,6 +4902,11 @@ export class Controller {
     const policy = run.policy.policy;
     const allowance = policy.unknownUsage;
     const active = this.store.intents().filter((intent) => intent.state !== 'stopped');
+    this.nativeManualAllowance(
+      run,
+      appointment.route.id,
+      remainingBudgets(run, this.store.intents()).minutes,
+    );
     // Native observations cannot yet establish a reserve in the controller's usage units.
     if (
       policy.reserves.length ||
@@ -4193,6 +4938,7 @@ export class Controller {
 
   private nativeCurrent(runtime: NativeRuntime) {
     const { appointment, run, attempt } = runtime.binding;
+    if (runtime.binding.handoff) this.nativeManualAuthority(runtime.binding, true);
     const task = this.store.get<Task>('task', run.taskId);
     const current = this.store.get<Attempt>('attempt', attempt.id);
     const saved = this.store.get<Run>('run', run.id);
@@ -4315,6 +5061,7 @@ export class Controller {
       original: binding.original,
       baseHash: binding.baseHash,
       criteria,
+      ...(binding.handoff ? { handoff: binding.handoff.preparation.packet } : {}),
     };
     if (appointment.route.family === 'google') {
       if (
@@ -4328,6 +5075,7 @@ export class Controller {
         attemptId: attempt.id,
         file: { path: fields.path, baseHash: fields.baseHash, content: fields.original },
         task: JSON.stringify(criteria),
+        ...(binding.handoff ? { handoff: binding.handoff.preparation.packet } : {}),
         model: appointment.route.model,
         effort: 'low',
       });
@@ -4557,6 +5305,7 @@ export class Controller {
           attemptId: attempt.id,
           file: plan.file,
           task: plan.task,
+          ...(binding.handoff ? { handoff: binding.handoff.preparation.packet } : {}),
           onSubmitted,
           admission: {
             clientExecutable: appointment.client.executable,
@@ -4792,7 +5541,9 @@ export class Controller {
       if (!existsSync(intent.scratch_path))
         materialize(
           intent.scratch_path,
-          committedFiles(this.projectPath(run.source.projectId) as string, run.source.base),
+          binding.handoff
+            ? this.evidence.read(binding.handoff.preparation.candidate).files
+            : committedFiles(this.projectPath(run.source.projectId) as string, run.source.base),
         );
       const directory = join(this.home, 'native', attempt.id);
       mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -5409,6 +6160,9 @@ export class Controller {
     this.store.db
       .prepare('DELETE FROM receipts WHERE command_key=?')
       .run(`evaluation-ready:${command.payload.runId}`);
+    this.store.db
+      .prepare('DELETE FROM receipts WHERE command_key=?')
+      .run(`native-handoff-pending:${command.payload.runId}`);
     const restore = this.closePendingEffects(task);
     const active = this.store
       .intents()
@@ -5652,8 +6406,7 @@ export class Controller {
         candidate.taskId !== task.id ||
         candidate.hash !== request.candidateHash ||
         this.latestCandidate(run.id)?.id !== candidate.id ||
-        this.evidence.hash(run.source.base, readFiles(join(this.home, 'scratch', run.id))) !==
-          candidate.hash
+        this.evidence.hash(run.source.base, readFiles(this.writerScratch(run))) !== candidate.hash
       )
         return {
           outcome: 'blocked',
@@ -6359,8 +7112,7 @@ export class Controller {
     const current = this.store
       .intents()
       .filter(
-        (intent) =>
-          intent.run_id === run.id && intent.scratch_path === join(this.home, 'scratch', run.id),
+        (intent) => intent.run_id === run.id && intent.scratch_path === this.writerScratch(run),
       )
       .at(-1);
     const stored = this.store.get<Attempt>('attempt', writer.id);
@@ -6892,6 +7644,7 @@ export class Controller {
     writer: Attempt,
     candidate: Candidate,
     checked: boolean,
+    manualNativeRouteIds?: readonly string[],
   ): SealedHandoffPacket {
     const run = this.store.get<Run>('run', writer.runId) as Run;
     const task = this.store.get<Task>('task', run.taskId) as Task;
@@ -6900,6 +7653,7 @@ export class Controller {
       run,
       outgoing: writer,
       quiescent: true,
+      ...(manualNativeRouteIds ? { manualNativeRouteIds } : {}),
       packet: {
         version: 1,
         id: this.id('hnd'),
@@ -6933,9 +7687,9 @@ export class Controller {
         remainingBudgets: remainingBudgets(run, this.store.intents()),
         unresolvedExposure: [],
         policy: run.policy,
-        allowedRouteIds: [
-          ...new Set(run.roles.flatMap((role) => [role.routeId, ...role.approvedFallbacks])),
-        ],
+        allowedRouteIds: manualNativeRouteIds
+          ? [...manualNativeRouteIds]
+          : [...new Set(run.roles.flatMap((role) => [role.routeId, ...role.approvedFallbacks]))],
         createdAt: this.now(),
       },
     });
@@ -7257,8 +8011,7 @@ export class Controller {
       return { outcome: 'blocked', reason: 'candidate-not-ready' };
     if (
       this.hasUncertainWriter(task.id) ||
-      this.evidence.hash(run.source.base, readFiles(join(this.home, 'scratch', run.id))) !==
-        candidate.hash
+      this.evidence.hash(run.source.base, readFiles(this.writerScratch(run))) !== candidate.hash
     )
       return { outcome: 'blocked', reason: 'candidate-binding-changed' };
     const path = this.projectPath(task.projectId) as string;
@@ -7328,8 +8081,7 @@ export class Controller {
     const writerIntent = this.store
       .intents()
       .filter(
-        (intent) =>
-          intent.run_id === run.id && intent.scratch_path === join(this.home, 'scratch', run.id),
+        (intent) => intent.run_id === run.id && intent.scratch_path === this.writerScratch(run),
       )
       .at(-1);
     const writer =
@@ -7440,10 +8192,8 @@ export class Controller {
           hashCanonical(origin.policy) !== hashCanonical(currentRun.policy) ||
           hashCanonical(origin.source) !== hashCanonical(currentRun.source) ||
           this.latestCandidate(currentRun.id)?.id !== candidate.id ||
-          this.evidence.hash(
-            currentRun.source.base,
-            readFiles(join(this.home, 'scratch', currentRun.id)),
-          ) !== candidate.hash ||
+          this.evidence.hash(currentRun.source.base, readFiles(this.writerScratch(currentRun))) !==
+            candidate.hash ||
           hashCanonical(inspectSource(task.projectId, source)) !== hashCanonical(origin.source)
         )
           throw new Error('Prepared publication authority is no longer current.');
@@ -7525,8 +8275,7 @@ export class Controller {
       const writer = this.store
         .intents()
         .filter(
-          (intent) =>
-            intent.run_id === run.id && intent.scratch_path === join(this.home, 'scratch', run.id),
+          (intent) => intent.run_id === run.id && intent.scratch_path === this.writerScratch(run),
         )
         .at(-1);
       if (!writer) return { outcome: 'blocked', reason: 'candidate-origin-missing' };

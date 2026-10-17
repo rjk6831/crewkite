@@ -15,6 +15,7 @@ export function buildHandoff(input: {
   outgoing: Attempt;
   run: Run;
   quiescent: boolean;
+  manualNativeRouteIds?: readonly string[];
 }) {
   const packet = HandoffPacketSchema.parse(input.packet);
   const outgoing = AttemptSchema.parse(input.outgoing);
@@ -51,6 +52,10 @@ export function buildHandoff(input: {
   const allowedRoutes = new Set(
     run.roles.flatMap((role) => [role.routeId, ...role.approvedFallbacks]),
   );
+  for (const id of input.manualNativeRouteIds ?? []) {
+    const routeId = HandoffPacketSchema.shape.allowedRouteIds.element.parse(id);
+    allowedRoutes.add(routeId);
+  }
   if (packet.allowedRouteIds.some((id) => !allowedRoutes.has(id))) {
     throw new Error('Handoff cannot add a route outside the admitted roster.');
   }
