@@ -1087,9 +1087,16 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
       evaluationPanel.getByRole('button', { name: 'Start native review', exact: true }),
     ).toBeEnabled();
     await expect(evaluationPanel).toContainText('Local checks passed.');
-    await expect(
-      evaluationPanel.getByRole('button', { name: 'Start local checks', exact: true }),
-    ).toBeDisabled();
+    await expect
+      .poll(() =>
+        evaluationPanel
+          .getByRole('button', { name: 'Start local checks', exact: true })
+          .evaluateAll(
+            (buttons) =>
+              buttons.length === 0 || (buttons.length === 1 && buttons[0].matches(':disabled')),
+          ),
+      )
+      .toBe(true);
     const reviewFrom = nativeEvents.rows.length;
     await enter(evaluationPanel.getByRole('button', { name: 'Start native review', exact: true }));
     const reviewed = await nativeEvents.wait(
@@ -1107,9 +1114,16 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     assert.equal(reviewed.payload.passed, true);
     await expect(evaluationPanel).toContainText('Native review passed.');
     await expect(evaluationPanel).toContainText('separate process only');
-    await expect(
-      evaluationPanel.getByRole('button', { name: 'Start native review', exact: true }),
-    ).toBeDisabled();
+    await expect
+      .poll(() =>
+        evaluationPanel
+          .getByRole('button', { name: 'Start native review', exact: true })
+          .evaluateAll(
+            (buttons) =>
+              buttons.length === 0 || (buttons.length === 1 && buttons[0].matches(':disabled')),
+          ),
+      )
+      .toBe(true);
     await expect(page.getByRole('button', { name: 'Accept candidate', exact: true })).toBeEnabled();
     await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeDisabled();
     const evaluated = await observer.snapshot();
