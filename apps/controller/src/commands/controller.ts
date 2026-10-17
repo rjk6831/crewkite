@@ -17,6 +17,7 @@ import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import {
+  AcpApprovalTargetSchema,
   type Approval,
   ApprovalBindingSchema,
   ApprovalSchema,
@@ -40,6 +41,9 @@ import {
   EventSchema,
   type FakeWorkerEvent,
   formatReviewTarget,
+  GoogleAcpBillingAttestationSchema,
+  GoogleAcpSelectionSchema,
+  GoogleAcpSetupSchema,
   GoogleNativePermissionModeSchema,
   type Grant,
   GrantSchema,
@@ -69,6 +73,7 @@ import {
   type ReviewResult,
   ReviewResultSchema,
   type Route,
+  RouteIdSchema,
   type RouterDecision,
   RouteSchema,
   type Run,
@@ -114,7 +119,9 @@ import {
 } from '../host/publication.ts';
 import {
   applyReplacement,
+  captureSingleFileEdit,
   committedFiles,
+  type FileContent,
   inspectSource,
   inspectSourceDetails,
   materialize,
@@ -139,6 +146,29 @@ import {
   replacementPlan as anthropicReplacementPlan,
   startReplacement as startAnthropicReplacement,
 } from '../providers/anthropic/replacement.ts';
+import {
+  type AcpClientIdentity,
+  AcpClientPinSchema,
+  type AcpProfileResolution,
+  type AcpSetupProof,
+  AcpSetupProofSchema,
+  resolveGoogleAcpProfile,
+  validateAcpSetupProof,
+} from '../providers/google/acp/profile.ts';
+import {
+  type AcpDependencies,
+  AcpPermissionActionSchema,
+  type AcpPermissionProposal,
+  type AcpWriterCompletion,
+  googleAcpWriterPlan,
+  startGoogleAcpSetup,
+  startGoogleAcpWriter,
+} from '../providers/google/acp/writer.ts';
+import {
+  type CapturedContext,
+  captureContext,
+  prepareOwnedContext,
+} from '../providers/google/native-extension/connector.ts';
 import {
   type GoogleNativeLifecycle,
   GoogleWriterError,
@@ -168,7 +198,7 @@ import { type ReviewPlan, reviewPlan, startReview } from '../providers/openai/re
 import { chooseRoute } from '../routing/index.ts';
 import { createIds, type IdPrefix } from '../store/ids.ts';
 import { type LaunchIntent, Store } from '../store/index.ts';
-import { deriveWindow } from '../usage/index.ts';
+import { availableAllowance, deriveWindow } from '../usage/index.ts';
 import { chargedMinutes, remainingBudgets } from './budgets.ts';
 
 const nativeProviderRestriction: CommandResult = {
@@ -219,9 +249,20 @@ const NativeRepositoryAppointmentSchema = NativeFileAppointmentSchema.omit({
       !Object.hasOwn(appointment, 'billingAttestation') &&
       !Object.hasOwn(appointment, 'permissionMode'),
   );
+const NativeAcpAppointmentSchema = NativeFileAppointmentSchema.extend({
+  profileId: z.literal('google-acp-v1'),
+  client: AcpClientPinSchema.extend({ executable: z.string().max(4096).refine(isAbsolute) }),
+  billingAttestation: GoogleAcpBillingAttestationSchema,
+  permissionMode: z.literal('request-review'),
+  target: NativeFileAppointmentSchema.shape.target.extend({ mode: z.enum(['100644', '100755']) }),
+  acp: GoogleAcpSelectionSchema,
+  proof: AcpSetupProofSchema,
+  proofHash: HashSchema,
+});
 const NativeAppointmentSchema = z.union([
   NativeFileAppointmentSchema,
   NativeRepositoryAppointmentSchema,
+  NativeAcpAppointmentSchema,
 ]);
 export type NativePilotAppointment = z.infer<typeof NativeAppointmentSchema>;
 const NativePublicScopeSchema = z.strictObject({
@@ -274,6 +315,7 @@ type NativeBinding = {
   public?: z.infer<typeof NativePublicScopeSchema>;
   environment?: NodeJS.ProcessEnv;
   handoff?: z.infer<typeof NativeManualLinkSchema>;
+  context?: CapturedContext;
 };
 const NativeManualRosterSchema = z.strictObject({
   runId: RunSchema.shape.id,
@@ -379,6 +421,7 @@ type NativeOutcome = {
         authHash: string;
         billingAttestation: z.infer<typeof NativeBillingAttestationSchema>;
       })
+    | (AcpWriterCompletion & { family: 'google-acp' })
     | (NonNullable<Awaited<ReturnType<typeof startGoogleWriter>['result']>['metadata']> & {
         family: 'google';
         model: string;
@@ -394,6 +437,16 @@ type NativeOutcome = {
   quiescent: boolean;
   diagnostic: unknown;
 };
+type AcpSetupCommand = Extract<
+  Command,
+  {
+    command:
+      | 'InitializeGoogleAcp'
+      | 'AuthenticateGoogleAcp'
+      | 'DiscoverGoogleAcp'
+      | 'StopGoogleAcpSetup';
+  }
+>;
 type NativeRuntime = {
   kind: 'native';
   binding: NativeBinding;
@@ -401,6 +454,7 @@ type NativeRuntime = {
   handle?: { result: Promise<NativeOutcome>; stop: () => void };
   done?: Promise<void>;
   reason?: 'handoff' | 'stop' | 'switch';
+  acpHandle?: ReturnType<typeof startGoogleAcpWriter>;
 };
 type NativeReviewRuntime = {
   preparation: Artifact;
@@ -446,6 +500,11 @@ export type ControllerOptions = {
   nativeSpawn?: Parameters<typeof startReplacement>[2]['spawn'];
   googleUsageClient?: () => GoogleUsageClientResolution;
   googleUsageSpawn?: Parameters<typeof startGoogleUsage>[0]['spawn'];
+  googleAcp?: AcpDependencies & {
+    resolve?: (proof: AcpSetupProof | null) => AcpProfileResolution;
+    spawn?: Parameters<typeof startGoogleAcpSetup>[0]['spawn'];
+  };
+  registerGoogleAcp?: boolean;
   prepareVerification?: typeof prepareToolchain;
 };
 const migrations = fileURLToPath(new URL('../../migrations/', import.meta.url));
@@ -487,11 +546,29 @@ export class Controller {
     promise: Promise<CommandResult>;
     resolve: (result: CommandResult) => void;
   };
+  private acpSetupRuntime?: {
+    key: string;
+    hash: string;
+    principal: string;
+    promise: Promise<CommandResult>;
+    resolve: (result: CommandResult) => void;
+    handle?: ReturnType<typeof startGoogleAcpSetup>;
+    stopped: boolean;
+  };
+  private acpStart?: {
+    key: string;
+    hash: string;
+    principal: string;
+    taskId: string;
+    runId: string;
+    aborted: boolean;
+    promise: Promise<CommandResult>;
+  };
 
   constructor(options: ControllerOptions) {
     this.options = options;
     this.usageResolution = options.googleUsageClient?.() ?? resolveGoogleUsageClient();
-    this.profiles = this.resolveProfiles();
+    this.profiles = [];
     this.home = options.home;
     this.now = () => TimestampSchema.parse((options.now ?? (() => new Date().toISOString()))());
     this.id = options.id ?? createIds(this.now);
@@ -544,6 +621,7 @@ export class Controller {
           return artifact;
         },
       });
+      this.profiles = this.resolveProfiles();
       this.recover();
       for (const row of this.store.db
         .prepare("SELECT candidate_id FROM publications WHERE state='prepared'")
@@ -572,6 +650,17 @@ export class Controller {
         next: 'Send a valid protocol 1 command.',
       };
     const command = parsed.data;
+    if (
+      [
+        'InitializeGoogleAcp',
+        'AuthenticateGoogleAcp',
+        'DiscoverGoogleAcp',
+        'StopGoogleAcpSetup',
+      ].includes(command.command)
+    )
+      return this.executeAcpSetup(command as AcpSetupCommand, principal);
+    if (command.command === 'StartRun' && this.isPreparedAcp(command.payload.runId))
+      return this.executeAcpStart(command, principal);
     if (command.command === 'ObserveUsage') return this.observeUsageCommand(command, principal);
     const preparing = this.verificationPreparation;
     if (preparing?.key === command.key)
@@ -629,8 +718,10 @@ export class Controller {
     principal: string,
     preflightFailure?: CommandResult,
     verification?: PreparedVerification,
+    acpContext?: CapturedContext,
   ): CommandResult {
-    if (this.closed) return { outcome: 'blocked', reason: 'controller-closing' };
+    if (this.closed && !preflightFailure)
+      return { outcome: 'blocked', reason: 'controller-closing' };
     const hash = hashCanonical(command);
     const effects: (() => void)[] = [];
     const result = this.store.transaction<CommandResult>(() => {
@@ -650,7 +741,7 @@ export class Controller {
       }
       const stale = this.checkRevision(command);
       const result = CommandResultSchema.parse(
-        stale ?? preflightFailure ?? this.apply(command, effects, verification),
+        stale ?? preflightFailure ?? this.apply(command, effects, verification, acpContext),
       );
       this.store.saveReceipt(command.key, hash, principal, result);
       return result;
@@ -666,6 +757,7 @@ export class Controller {
     return SnapshotSchema.parse({
       protocol: 1,
       nativeProfiles: this.profiles.map((profile) => profile.facts),
+      googleAcpSetup: this.store.googleAcpSetup(),
       usageReaders: [this.googleUsageReader()],
       nativeRuns: this.nativeRuns(),
       candidateEvaluations,
@@ -714,6 +806,305 @@ export class Controller {
     });
   }
 
+  private executeAcpSetup(command: AcpSetupCommand, principal: string): Promise<CommandResult> {
+    const prior = this.acpSetupRuntime;
+    const hash = hashCanonical(command);
+    if (prior?.key === command.key)
+      return prior.hash === hash && prior.principal === principal
+        ? prior.promise
+        : Promise.resolve({ outcome: 'denied', reason: 'idempotency-key-reused' });
+    if (command.command === 'StopGoogleAcpSetup' || prior || this.store.receipt(command.key)) {
+      let result = this.commitCommand(command, principal);
+      if (result.reason === 'acp-setup-pending') {
+        this.store.transaction(() => {
+          const journal = this.store
+            .googleMetadataOperations()
+            .find((row) => row.command_id === command.key);
+          const known = journal?.state === 'quiescent';
+          if (!known) this.store.unknownGoogleMetadata(command.key);
+          let setup = this.store.googleAcpSetup();
+          if (setup.operationId === command.key) {
+            setup = GoogleAcpSetupSchema.parse({
+              ...setup,
+              revision: setup.revision + 1,
+              state: known ? 'blocked' : 'unknown',
+              operationId: known ? null : command.key,
+            });
+            this.store.putGoogleAcpSetup(setup);
+          }
+          result = {
+            outcome: known ? 'blocked' : 'outcome-unknown',
+            reason: known ? 'acp-setup-interrupted' : 'google-ownership-unknown',
+            data: { kind: 'google-acp-setup', setup },
+          };
+          this.finishMetadataReceipt(command.key, result);
+        });
+      }
+      return Promise.resolve(result);
+    }
+    const completion = Promise.withResolvers<CommandResult>();
+    const runtime = {
+      key: command.key,
+      hash,
+      principal,
+      promise: completion.promise,
+      resolve: completion.resolve,
+      stopped: false,
+    };
+    this.acpSetupRuntime = runtime;
+    try {
+      const result = this.commitCommand(command, principal);
+      if (result.reason !== 'acp-setup-pending') completion.resolve(result);
+    } catch (error) {
+      if (this.acpSetupRuntime === runtime) this.acpSetupRuntime = undefined;
+      throw error;
+    }
+    return runtime.promise.finally(() => {
+      if (this.acpSetupRuntime === runtime) this.acpSetupRuntime = undefined;
+    });
+  }
+
+  private applyAcpSetup(command: AcpSetupCommand, effects: (() => void)[]): CommandResult {
+    const setup = this.store.googleAcpSetup();
+    if (command.command === 'StopGoogleAcpSetup') {
+      if (
+        setup.operationId !== command.payload.operationId ||
+        !['initializing', 'authenticating', 'discovering', 'stopping'].includes(setup.state)
+      )
+        return {
+          outcome: 'blocked',
+          reason: 'acp-setup-not-current',
+          data: { kind: 'google-acp-setup', setup },
+        };
+      const runtime = this.acpSetupRuntime;
+      const live = runtime?.key === setup.operationId;
+      const next = GoogleAcpSetupSchema.parse({
+        ...setup,
+        revision: setup.revision + 1,
+        state: live ? 'stopping' : 'unknown',
+      });
+      this.store.putGoogleAcpSetup(next);
+      if (live)
+        effects.push(() => {
+          runtime.stopped = true;
+          runtime.handle?.stop();
+        });
+      return {
+        outcome: live ? 'applied' : 'outcome-unknown',
+        ...(!live ? { reason: 'google-ownership-unknown' } : {}),
+        data: { kind: 'google-acp-setup', setup: next },
+      };
+    }
+    const blocker = this.store.googleOperationBlocker();
+    if (blocker)
+      return { outcome: 'blocked', reason: blocker, data: { kind: 'google-acp-setup', setup } };
+    const resolution = this.acpResolution();
+    if (!resolution.client || !resolution.environment)
+      return {
+        outcome: 'blocked',
+        reason: resolution.facts.reason,
+        data: { kind: 'google-acp-setup', setup },
+      };
+    const operation =
+      command.command === 'InitializeGoogleAcp'
+        ? 'initialize'
+        : command.command === 'AuthenticateGoogleAcp'
+          ? 'authenticate'
+          : 'discover';
+    let proof: AcpSetupProof | null = null;
+    try {
+      if (operation !== 'initialize') {
+        if (!('proofId' in command.payload) || command.payload.proofId !== setup.proofId)
+          throw Error('ACP proof changed.');
+        proof = this.acpProof(command.payload.proofId);
+        validateAcpSetupProof(proof, resolution.client, this.options.googleAcp?.reviewMappings);
+      }
+    } catch {
+      return {
+        outcome: 'blocked',
+        reason: 'acp-proof-unavailable',
+        data: { kind: 'google-acp-setup', setup },
+      };
+    }
+    const state = {
+      initialize: 'initializing',
+      authenticate: 'authenticating',
+      discover: 'discovering',
+    }[operation];
+    const next = GoogleAcpSetupSchema.parse({
+      ...setup,
+      revision: setup.revision + 1,
+      state,
+      operationId: command.key,
+      reason: null,
+    });
+    this.store.putGoogleAcpSetup(next);
+    this.store.beginGoogleMetadata(command.key, `acp-${operation}`, next.revision, this.now());
+    effects.push(
+      () => void this.launchAcpSetup(command.key, next.revision, operation, proof, resolution),
+    );
+    return {
+      outcome: 'outcome-unknown',
+      reason: 'acp-setup-pending',
+      data: { kind: 'google-acp-setup', setup: next },
+    };
+  }
+
+  private async launchAcpSetup(
+    commandId: string,
+    revision: number,
+    operation: 'initialize' | 'authenticate' | 'discover',
+    priorProof: AcpSetupProof | null,
+    resolution: AcpProfileResolution,
+  ) {
+    const runtime = this.acpSetupRuntime;
+    if (!runtime || runtime.key !== commandId || !resolution.client || !resolution.environment)
+      return;
+    let result: CommandResult = { outcome: 'outcome-unknown', reason: 'google-ownership-unknown' };
+    let beforeSpawn = true;
+    const current = () => {
+      const setup = this.store.googleAcpSetup();
+      if (
+        this.closed ||
+        runtime.stopped ||
+        setup.operationId !== commandId ||
+        setup.revision !== revision ||
+        !['initializing', 'authenticating', 'discovering'].includes(setup.state)
+      )
+        throw Error('ACP setup authority changed.');
+    };
+    try {
+      current();
+      const directory = mkdtempSync(join(this.home, 'google-acp-setup-'));
+      runtime.handle = startGoogleAcpSetup({
+        client: resolution.client,
+        directory,
+        environment: resolution.environment,
+        operation,
+        priorProof,
+        ...this.options.googleAcp,
+        spawn: this.options.googleAcp?.spawn,
+        schedule: this.options.schedule,
+        lifecycle: {
+          beforePhase: () => {
+            current();
+            beforeSpawn = false;
+          },
+          owned: (group) => {
+            this.store.transaction(() => this.store.ownGoogleMetadata(commandId, group));
+            current();
+          },
+          quiescent: (group) =>
+            this.store.transaction(() =>
+              this.store.finishGoogleMetadata(commandId, group, this.now()),
+            ),
+        },
+      });
+      if (runtime.stopped || this.closed) runtime.handle.stop();
+      const outcome = await runtime.handle.result;
+      this.store.transaction(() => {
+        let setup = this.store.googleAcpSetup();
+        const journal = this.store
+          .googleMetadataOperations()
+          .find((row) => row.command_id === commandId);
+        const known = outcome.quiescent && journal?.state === 'quiescent';
+        if (!known) this.store.unknownGoogleMetadata(commandId);
+        const revoked =
+          this.closed ||
+          runtime.stopped ||
+          setup.operationId !== commandId ||
+          setup.revision !== revision;
+        let proofId = setup.proofId,
+          client = setup.client,
+          auth = setup.auth;
+        let ready = false;
+        if (known && !revoked && !outcome.reason && outcome.metadata) {
+          const proof = validateAcpSetupProof(
+            outcome.metadata,
+            resolution.client as AcpClientIdentity,
+            this.options.googleAcp?.reviewMappings,
+          );
+          proofId = this.nativeArtifact(proof).id;
+          client = proof.client;
+          auth = proof.auth;
+          ready =
+            !!proof.reviewMode && !!proof.configOptions && proof.auth.status === 'authenticated';
+        }
+        setup = GoogleAcpSetupSchema.parse({
+          ...setup,
+          revision: setup.revision + 1,
+          state: !known
+            ? 'unknown'
+            : ready
+              ? 'ready'
+              : !revoked && !outcome.reason && operation === 'initialize'
+                ? 'authentication-required'
+                : 'blocked',
+          operationId: known ? null : commandId,
+          proofId,
+          client,
+          auth,
+          reason: ready
+            ? null
+            : outcome.reason === 'authentication'
+              ? 'authentication-required'
+              : !revoked && operation === 'discover'
+                ? 'acp-capability-missing'
+                : null,
+        });
+        this.store.putGoogleAcpSetup(setup);
+        result = {
+          outcome: !known ? 'outcome-unknown' : revoked || outcome.reason ? 'blocked' : 'applied',
+          ...(!known || revoked || outcome.reason
+            ? {
+                reason: !known
+                  ? 'google-ownership-unknown'
+                  : revoked
+                    ? 'acp-setup-stopped'
+                    : 'acp-setup-failed',
+              }
+            : {}),
+          data: { kind: 'google-acp-setup', setup },
+        };
+        this.finishMetadataReceipt(commandId, result);
+        this.profiles = this.resolveProfiles();
+      });
+    } catch {
+      try {
+        this.store.transaction(() => {
+          const journal = this.store
+            .googleMetadataOperations()
+            .find((row) => row.command_id === commandId);
+          if (beforeSpawn && journal?.state === 'intent')
+            this.store.finishGoogleMetadata(commandId, null, this.now());
+          else if (journal?.state !== 'quiescent') this.store.unknownGoogleMetadata(commandId);
+          const known =
+            this.store.googleMetadataOperations().find((row) => row.command_id === commandId)
+              ?.state === 'quiescent';
+          const setup = this.store.googleAcpSetup();
+          const next = GoogleAcpSetupSchema.parse({
+            ...setup,
+            revision: setup.revision + 1,
+            state: known ? 'blocked' : 'unknown',
+            operationId: known ? null : commandId,
+            reason: null,
+          });
+          this.store.putGoogleAcpSetup(next);
+          result = {
+            outcome: known ? 'blocked' : 'outcome-unknown',
+            reason: known ? 'acp-setup-failed' : 'google-ownership-unknown',
+            data: { kind: 'google-acp-setup', setup: next },
+          };
+          this.finishMetadataReceipt(commandId, result);
+        });
+      } catch {
+        result = { outcome: 'outcome-unknown', reason: 'google-ownership-unknown' };
+      }
+    } finally {
+      runtime.resolve(CommandResultSchema.parse(result));
+    }
+  }
+
   private observeUsageCommand(
     command: Extract<Command, { command: 'ObserveUsage' }>,
     principal: string,
@@ -728,7 +1119,7 @@ export class Controller {
       let result = this.commitCommand(command, principal);
       if (result.outcome === 'outcome-unknown' && result.reason === 'usage-read-pending') {
         result = { outcome: 'outcome-unknown', reason: 'google-ownership-unknown' };
-        this.store.transaction(() => this.finishUsageReceipt(command.key, result));
+        this.store.transaction(() => this.finishMetadataReceipt(command.key, result));
       }
       return Promise.resolve(result);
     }
@@ -900,7 +1291,7 @@ export class Controller {
           this.store.recordGoogleUsageObservation(observedAt);
           result = { outcome: 'applied', data: { kind: 'usage', windows: this.snapshot().usage } };
         }
-        this.finishUsageReceipt(commandId, result);
+        this.finishMetadataReceipt(commandId, result);
       });
     } catch (error) {
       result = { outcome: 'outcome-unknown', reason: 'google-ownership-unknown' };
@@ -923,7 +1314,7 @@ export class Controller {
             result = { outcome: 'blocked', reason: 'usage-read-revoked' };
           else if (finished?.state === 'quiescent')
             result = { outcome: 'blocked', reason: 'usage-read-failed' };
-          this.finishUsageReceipt(commandId, result);
+          this.finishMetadataReceipt(commandId, result);
         });
       } catch {
         // A failed persistence boundary leaves the committed ownership intent in place.
@@ -934,7 +1325,7 @@ export class Controller {
     }
   }
 
-  private finishUsageReceipt(commandId: string, result: CommandResult) {
+  private finishMetadataReceipt(commandId: string, result: CommandResult) {
     this.store.db
       .prepare('UPDATE receipts SET result=? WHERE command_key=?')
       .run(canonicalJson(CommandResultSchema.parse(result)), commandId);
@@ -947,6 +1338,15 @@ export class Controller {
     if (this.closed) return this.closing;
     this.closed = true;
     const native: Promise<unknown>[] = [];
+    if (this.acpStart) {
+      this.acpStart.aborted = true;
+      native.push(this.acpStart.promise);
+    }
+    if (this.acpSetupRuntime) {
+      this.acpSetupRuntime.stopped = true;
+      this.acpSetupRuntime.handle?.stop();
+      native.push(this.acpSetupRuntime.promise);
+    }
     if (this.usageRead) {
       this.usageRead.abort.abort();
       native.push(this.usageRead.promise);
@@ -991,6 +1391,23 @@ export class Controller {
   private checkRevision(command: Command): CommandResult | undefined {
     if (!('expectedRevision' in command)) return;
     if (
+      [
+        'InitializeGoogleAcp',
+        'AuthenticateGoogleAcp',
+        'DiscoverGoogleAcp',
+        'StopGoogleAcpSetup',
+      ].includes(command.command)
+    ) {
+      const setup = this.store.googleAcpSetup();
+      if (command.expectedRevision !== setup.revision)
+        return {
+          outcome: 'stale-revision',
+          revision: setup.revision,
+          data: { kind: 'google-acp-setup', setup },
+        };
+      return;
+    }
+    if (
       command.command === 'RegisterProject' ||
       command.command === 'CreateTask' ||
       command.command === 'ObserveUsage' ||
@@ -1023,6 +1440,7 @@ export class Controller {
     command: Command,
     effects: (() => void)[],
     verification?: PreparedVerification,
+    acpContext?: CapturedContext,
   ): CommandResult {
     if ('taskId' in command.payload && ['ResumeRun', 'SwitchRoute'].includes(command.command)) {
       const task = this.store.get<Task>('task', command.payload.taskId);
@@ -1061,6 +1479,11 @@ export class Controller {
         };
     }
     switch (command.command) {
+      case 'InitializeGoogleAcp':
+      case 'AuthenticateGoogleAcp':
+      case 'DiscoverGoogleAcp':
+      case 'StopGoogleAcpSetup':
+        return this.applyAcpSetup(command, effects);
       case 'ObserveUsage':
         return this.observeUsage(command, effects);
       case 'RegisterProject': {
@@ -1152,13 +1575,22 @@ export class Controller {
         return this.startCandidateReview(command, effects);
       case 'StartRun':
       case 'ResumeRun':
-        return this.start(command, effects);
+        return this.start(command, effects, undefined, undefined, false, undefined, acpContext);
       case 'ResolveApproval':
         return this.resolve(command, effects);
       case 'SwitchRoute':
         return this.switchRoute(command, effects);
       case 'StopRun': {
         const result = this.stop(command, effects);
+        const start = this.acpStart;
+        if (
+          result.outcome === 'applied' &&
+          start?.taskId === command.payload.taskId &&
+          start.runId === command.payload.runId
+        )
+          effects.push(() => {
+            start.aborted = true;
+          });
         const pending = this.verificationPreparation;
         if (result.outcome === 'applied' && pending?.taskId === command.payload.taskId)
           effects.push(() => pending.abort.abort());
@@ -1489,6 +1921,7 @@ export class Controller {
     planned?: Attempt,
     transfer = false,
     native?: NativeBinding,
+    acpContext?: CapturedContext,
   ): CommandResult {
     const task = this.store.get<Task>('task', command.payload.taskId);
     const run = this.store.get<Run>('run', command.payload.runId);
@@ -1519,6 +1952,8 @@ export class Controller {
     }
     if (!task || !run || run.taskId !== task.id || task.runId !== run.id)
       return { outcome: 'blocked', reason: 'run-not-current' };
+    if (native && 'acp' in native.appointment && !acpContext)
+      return { outcome: 'blocked', reason: 'acp-context-unavailable' };
     if (this.hasUncertainWriter(task.id))
       return {
         outcome: 'blocked',
@@ -1675,6 +2110,8 @@ export class Controller {
     const windows = this.store
       .list<Observation>('window')
       .filter((value) => value.routeId === attempt.routeId && value.kind !== 'local');
+    if (native && 'acp' in native.appointment)
+      this.store.bindNativeProfile(attempt.id, 'google-acp-v1');
     for (const window of windows.length
       ? windows
       : [{ windowId: 'local', remaining: { unit: 'minutes' } }])
@@ -1723,7 +2160,16 @@ export class Controller {
       .find((value) => value.attempt_id === attempt.id) as LaunchIntent;
     effects.push(() => {
       if (!native) this.options.afterIntent?.(intent);
-      if (native) this.launchNative(intent, freezeNative({ ...native, run: admitted, attempt }));
+      if (native)
+        this.launchNative(
+          intent,
+          freezeNative({
+            ...native,
+            run: admitted,
+            attempt,
+            ...(acpContext ? { context: acpContext } : {}),
+          }),
+        );
       else this.launch(intent, admitted, attempt);
     });
     return { outcome: 'applied', entity: updated, revision: updated.revision };
@@ -1740,11 +2186,15 @@ export class Controller {
   }
 
   private resolveProfiles(): NativeProfileResolution[] {
-    const profiles = this.options.nativeProfiles?.() ?? [
-      this.options.nativeProfile?.() ?? unavailableNativeProfile(),
+    const profiles = [
+      ...(this.options.nativeProfiles?.() ?? [
+        this.options.nativeProfile?.() ?? unavailableNativeProfile(),
+      ]),
     ];
+    if (this.options.registerGoogleAcp || this.options.googleAcp)
+      profiles.push(this.acpResolution());
     if (
-      profiles.length > 4 ||
+      profiles.length > 6 ||
       new Set(profiles.map((profile) => profile.facts.id)).size !== profiles.length
     )
       throw Error('Native profile identities are invalid.');
@@ -1755,6 +2205,40 @@ export class Controller {
   private profileFor(id: string): NativeProfileResolution {
     this.profiles = this.resolveProfiles();
     return this.profiles.find((profile) => profile.facts.id === id) ?? unavailableNativeProfile();
+  }
+
+  private acpProof(proofId = this.store.googleAcpSetup().proofId): AcpSetupProof | null {
+    if (!proofId) return null;
+    const artifact = this.store.get<Artifact>('artifact', proofId);
+    if (!artifact || artifact.bytes > MAX_FRAME_BYTES)
+      throw Error('ACP setup proof is unavailable.');
+    const bytes = this.artifacts.read(artifact.hash);
+    if (bytes.length !== artifact.bytes) throw Error('ACP setup proof changed.');
+    return AcpSetupProofSchema.parse(
+      JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)),
+    );
+  }
+
+  private acpResolution(): NativeProfileResolution & AcpProfileResolution {
+    let proof: AcpSetupProof | null = null;
+    try {
+      proof = this.acpProof();
+    } catch {}
+    const resolved =
+      this.options.googleAcp?.resolve?.(proof) ??
+      resolveGoogleAcpProfile({ home: this.home, proof, environment: process.env });
+    return {
+      ...resolved,
+      ...(resolved.client && resolved.environment
+        ? {
+            locationHash: hashCanonical({
+              executable: resolved.client.executable,
+              client: resolved.client.sha256,
+              home: resolved.environment.HOME,
+            }),
+          }
+        : {}),
+    };
   }
 
   private nativeRuns(): z.infer<typeof NativeRunSchema>[] {
@@ -1787,11 +2271,13 @@ export class Controller {
               ? { billingAttestation: appointment.billingAttestation }
               : {}),
             ...(appointment.permissionMode ? { permissionMode: appointment.permissionMode } : {}),
+            ...('acp' in appointment ? { acp: appointment.acp } : {}),
             ...('repository' in appointment
               ? { repository: appointment.repository, execution: appointment.execution }
               : {
                   target: {
-                    ...appointment.target,
+                    path: appointment.target.path,
+                    baseHash: appointment.target.baseHash,
                     bytes: plan.manifest.find(
                       (file: { path: string }) => file.path === appointment.target.path,
                     )?.bytes,
@@ -2445,7 +2931,271 @@ export class Controller {
     return expected;
   }
 
+  private prepareAcp(command: Extract<Command, { command: 'PrepareNativeRun' }>): CommandResult {
+    let writing = false;
+    if (command.payload.profileId !== 'google-acp-v1' || !('proofId' in command.payload))
+      return { outcome: 'unsupported', reason: 'invalid-command' };
+    try {
+      const input = command.payload;
+      const setup = this.store.googleAcpSetup();
+      const profile = this.acpResolution();
+      if (
+        setup.state !== 'ready' ||
+        setup.proofId !== input.proofId ||
+        !profile.facts.available ||
+        !profile.client ||
+        !profile.environment ||
+        !profile.locationHash
+      )
+        throw Error('ACP setup is unavailable.');
+      const proof = validateAcpSetupProof(
+        this.acpProof(input.proofId),
+        profile.client,
+        this.options.googleAcp?.reviewMappings,
+      );
+      if (!proof.reviewMode || !proof.configOptions || proof.auth.status !== 'authenticated')
+        throw Error('ACP setup is incomplete.');
+      const task = this.store.get<Task>('task', input.taskId);
+      if (task?.state !== 'draft' || this.draftEditGate(task))
+        throw Error('Task is not preparable.');
+      const source = inspectSource(task.projectId, this.projectPath(task.projectId) as string);
+      const files = committedFiles(this.projectPath(task.projectId) as string, source.base);
+      const target = files.find((file) => file.path === input.targetPath);
+      if (
+        !target ||
+        target.bytes > 65536 ||
+        new TextDecoder('utf-8', { fatal: true }).decode(target.content).includes('\0')
+      )
+        throw Error('ACP target is unavailable.');
+      const policy = PolicySchema.parse(input.policy);
+      if (
+        policy.authority === 'autopilot' ||
+        policy.limits.minutes * 60000 < 300000 ||
+        !requiredReviewMethodIds(policy.quality).every((id) =>
+          (policy.methods ?? []).some((method) => method.id === id),
+        ) ||
+        policy.limits.attempts <
+          (policy.methods ?? []).reduce((n, method) => n + method.cycles, 0) + 2
+      )
+        throw Error('ACP policy is unavailable.');
+      const runId = this.id('run');
+      const grant = this.grant(
+        { id: runId, taskId: task.id, policy: { policy, hash: hashCanonical(policy) } },
+        'write-scratch',
+        (this.store.get<Project>('project', task.projectId) as Project).name,
+      );
+      if (!grant) throw Error('Scratch authority is unavailable.');
+      const acp = GoogleAcpSelectionSchema.parse({
+        proofId: input.proofId,
+        modelId: input.modelId,
+        thoughtLevelId: input.thoughtLevelId,
+      });
+      const scopeHash = hashCanonical({
+        profile: profile.facts,
+        client: profile.client,
+        proof,
+        acp,
+        task: { title: task.title, outcome: task.outcome, criteria: task.criteria },
+        source,
+        target: { path: target.path, hash: target.hash, mode: target.mode },
+        policy,
+        billingAttestation: input.billingAttestation,
+      });
+      const expiresAt =
+        input.consent === 'saved'
+          ? new Date(
+              Math.min(
+                Date.parse(grant.expiresAt),
+                Date.parse(this.consentRecord(scopeHash).expiresAt),
+              ),
+            ).toISOString()
+          : grant.expiresAt;
+      const artifact = this.store.get<Artifact>('artifact', input.proofId) as Artifact;
+      const route = RouteSchema.parse({
+        id: this.id('rte'),
+        family: 'google',
+        displayName: profile.facts.displayName,
+        model: input.modelId,
+        effort: {
+          requested: input.thoughtLevelId ?? 'unknown',
+          effective: 'unknown',
+          supported: proof.configOptions.thoughtLevel?.supported ?? [],
+        },
+        billing: 'included',
+        qualified: false,
+        fake: false,
+      });
+      const appointment = NativeAcpAppointmentSchema.parse({
+        id: command.key.replaceAll('_', '-'),
+        profileId: 'google-acp-v1',
+        taskId: task.id,
+        route,
+        client: profile.client,
+        creditPolicy: 'ordinary',
+        billingAttestation: input.billingAttestation,
+        permissionMode: 'request-review',
+        target: { path: target.path, baseHash: target.hash, mode: target.mode },
+        acp,
+        proof,
+        proofHash: artifact.hash,
+        consent: {
+          nativeTrust: 'accepted',
+          source: input.consent === 'explicit' ? 'explicit' : 'policy',
+          policyHash: hashCanonical(policy),
+          sourceBase: source.base,
+          criteriaHash: hashCanonical(task.criteria),
+        },
+        policy,
+        expiresAt,
+        maximumTaskMs: 300000,
+        maximumSubmissions: 1,
+      });
+      const run = RunSchema.parse({
+        id: runId,
+        taskId: task.id,
+        source,
+        policy: { policy, hash: hashCanonical(policy) },
+        roles: [{ role: 'coder', routeId: route.id, pinned: true, approvedFallbacks: [] }],
+        decision: {
+          chosen: route.id,
+          rejected: [],
+          rule: 'manual',
+          inputsHash: hashCanonical(appointment),
+        },
+        revision: 0,
+      });
+      const attempt = AttemptSchema.parse({
+        id: this.id('att'),
+        runId,
+        routeId: route.id,
+        generation: 0,
+        state: 'intent',
+        revision: 0,
+      });
+      const publicScope = NativePublicScopeSchema.parse({
+        profileId: 'google-acp-v1',
+        locationHash: profile.locationHash,
+        scopeHash,
+        context: { title: task.title, outcome: task.outcome },
+      });
+      const plan = {
+        appointment,
+        run,
+        attempt,
+        original: target.content.toString('utf8'),
+        baseHash: target.hash,
+        manifest: files.map(({ content: _content, ...file }) => file),
+        public: publicScope,
+        environment: profile.environment,
+      };
+      this.nativeWriterPlan(plan);
+      writing = true;
+      const binding = this.saveNativePlan(plan);
+      if (input.consent === 'explicit' && !this.store.receipt(`native-consent:${scopeHash}`)) {
+        const consent = this.nativeArtifact({ scopeHash, expiresAt });
+        this.store.saveReceipt(`native-consent:${scopeHash}`, scopeHash, 'local-owner', {
+          outcome: 'applied',
+          entity: consent,
+        });
+      }
+      this.store.saveReceipt(
+        `native-prepared:${runId}`,
+        hashCanonical(publicScope),
+        'local-owner',
+        { outcome: 'applied', entity: binding.planArtifact },
+      );
+      const updated = this.updateTask(this.store.get<Task>('task', task.id) as Task, {
+        next: 'Review the native preparation and fresh quota before Start.',
+      });
+      this.event('run.prepared', task.id, updated.revision, run);
+      return { outcome: 'applied', entity: run, revision: updated.revision };
+    } catch (error) {
+      if (writing) throw error;
+      return {
+        outcome: 'blocked',
+        reason: 'acp-preparation-unavailable',
+        next: 'Review the current setup proof, model, thought level, billing confirmations, target and policy.',
+      };
+    }
+  }
+
+  private isPreparedAcp(runId: string): boolean {
+    try {
+      return 'acp' in this.nativeCurrentPlan(this.store.get<Run>('run', runId) as Run).appointment;
+    } catch {
+      return false;
+    }
+  }
+
+  private contextClient() {
+    return {
+      snapshot: async () => this.snapshot(),
+      command: (input: Command) => {
+        if (!['GetChanges', 'GetArtifact'].includes(input.command))
+          return Promise.resolve<CommandResult>({ outcome: 'denied', reason: 'context-read-only' });
+        return this.execute(input, 'local-owner');
+      },
+    };
+  }
+
+  private executeAcpStart(
+    command: Extract<Command, { command: 'StartRun' }>,
+    principal: string,
+  ): Promise<CommandResult> {
+    const hash = hashCanonical(command),
+      prior = this.acpStart;
+    if (prior)
+      return prior.key === command.key && prior.hash === hash && prior.principal === principal
+        ? prior.promise
+        : Promise.resolve({
+            outcome: prior.key === command.key ? 'denied' : 'blocked',
+            reason: prior.key === command.key ? 'idempotency-key-reused' : 'acp-start-preparing',
+          });
+    if (this.store.receipt(command.key))
+      return Promise.resolve(this.commitCommand(command, principal));
+    const pending = {
+      key: command.key,
+      hash,
+      principal,
+      taskId: command.payload.taskId,
+      runId: command.payload.runId,
+      aborted: false,
+      promise: Promise.resolve<CommandResult>({ outcome: 'blocked' }),
+    };
+    const refuse = (result: CommandResult) => this.commitCommand(command, principal, result);
+    const promise = Promise.resolve().then(async () => {
+      try {
+        const stale = this.checkRevision(command);
+        if (stale) return refuse(stale);
+        const task = this.store.get<Task>('task', command.payload.taskId),
+          run = this.store.get<Run>('run', command.payload.runId);
+        if (!task || !run || task.runId !== run.id)
+          return refuse({ outcome: 'blocked', reason: 'run-not-current' });
+        const context = await captureContext(this.contextClient(), task.id);
+        if (this.closed || pending.aborted)
+          return refuse({ outcome: 'blocked', reason: 'acp-start-revoked' });
+        if (
+          hashCanonical(this.store.get<Task>('task', task.id)) !== hashCanonical(task) ||
+          hashCanonical(this.store.get<Run>('run', run.id)) !== hashCanonical(run) ||
+          hashCanonical(
+            inspectSource(task.projectId, this.projectPath(task.projectId) as string),
+          ) !== hashCanonical(run.source)
+        )
+          return refuse({ outcome: 'blocked', reason: 'acp-start-changed' });
+        return this.commitCommand(command, principal, undefined, undefined, context);
+      } catch {
+        return refuse({ outcome: 'blocked', reason: 'acp-context-unavailable' });
+      }
+    });
+    pending.promise = promise;
+    this.acpStart = pending;
+    return promise.finally(() => {
+      if (this.acpStart === pending) this.acpStart = undefined;
+    });
+  }
+
   private prepareNative(command: Extract<Command, { command: 'PrepareNativeRun' }>): CommandResult {
+    if (command.payload.profileId === 'google-acp-v1') return this.prepareAcp(command);
     let plan: Omit<NativeBinding, 'planArtifact'>;
     let expiresAt: string;
     let manualTargets: z.infer<typeof NativeManualRosterSchema>['targets'] | undefined;
@@ -2697,6 +3447,7 @@ export class Controller {
     this.anthropicWriterEvidence(plan);
     this.googleWriterEvidence(plan);
     this.nativeRepositoryEvidence(plan, candidate);
+    this.nativeAcpEvidence(plan, candidate);
     const writer = this.store.get<Attempt>('attempt', plan.attempt.id);
     const completionArtifact = ArtifactSchema.parse(
       this.store.receipt(`native-completion:${plan.attempt.id}`)?.result.entity,
@@ -2711,7 +3462,7 @@ export class Controller {
       completion.quiescent !== true ||
       !this.store.nativePhasesComplete(writer.id, plan.appointment.route.family) ||
       this.store.receipt(
-        `${'repository' in plan.appointment ? 'native-capture' : 'native-application'}:${writer.id}`,
+        `${'acp' in plan.appointment ? 'native-acp-capture' : 'repository' in plan.appointment ? 'native-capture' : 'native-application'}:${writer.id}`,
       )?.result.outcome !== 'applied' ||
       plan.run.id !== run.id ||
       plan.run.taskId !== run.taskId ||
@@ -3129,13 +3880,12 @@ export class Controller {
       )
         return refused('grant-unavailable');
       if (review) {
-        const route =
-          this.candidateReviewRoute(
-            this.profileFor(plan.reviewer.profileId),
-            plan.creditPolicy,
-            false,
-          ) ?? current.native.appointment.route;
-        this.nativeDecision(
+        const route = this.candidateReviewRoute(
+          this.profileFor(plan.reviewer.profileId),
+          plan.creditPolicy,
+          artifact.id,
+        );
+        const decision = this.nativeDecision(
           {
             ...current.native.appointment,
             route,
@@ -3146,6 +3896,7 @@ export class Controller {
           plan.run,
           true,
         );
+        if (!decision.chosen) return refused('preparation-changed');
       } else this.localCheckRoute(false);
       return { available: true, reason: 'available' };
     } catch (error) {
@@ -3879,7 +4630,7 @@ export class Controller {
     },
   ) {
     if ('repository' in plan.appointment) return;
-    if (plan.appointment.route.family !== 'google') return;
+    if ('acp' in plan.appointment || plan.appointment.route.family !== 'google') return;
     const config = this.nativeRecord(`native-config:${plan.attempt.id}`, 4096);
     const observed = z
       .object({
@@ -3972,6 +4723,70 @@ export class Controller {
     )
       throw Error('The repository result binding changed.');
     return result;
+  }
+
+  private nativeAcpEvidence(
+    plan: z.infer<typeof NativeHistoricalPreparationSchema>,
+    candidate: Candidate,
+  ) {
+    const appointment = plan.appointment;
+    if (!('acp' in appointment)) return;
+    const capture = z
+      .strictObject({
+        version: z.literal(1),
+        attemptId: AttemptSchema.shape.id,
+        planHash: HashSchema,
+        completionHash: HashSchema,
+        metadataHash: HashSchema,
+        candidateId: CandidateSchema.shape.id,
+        candidateHash: HashSchema,
+        target: z.strictObject({
+          path: ReplacementPathSchema,
+          baseHash: HashSchema,
+          hash: HashSchema,
+          bytes: z.number().int().nonnegative().max(65536),
+          mode: z.enum(['100644', '100755']),
+        }),
+      })
+      .parse(this.nativeRecord(`native-acp-capture:${plan.attempt.id}`).value);
+    const metadata = this.nativeRecord(`native-proposal:${plan.attempt.id}`);
+    const output = z
+      .strictObject({
+        sessionId: AcpApprovalTargetSchema.shape.sessionId,
+        stopReason: z.literal('end_turn'),
+        submitted: z.literal(true),
+        selectionHash: HashSchema,
+        reviewModeHash: HashSchema,
+      })
+      .parse(metadata.value);
+    const proof = this.store.get<Artifact>('artifact', appointment.acp.proofId);
+    const target = this.evidence
+      .read(candidate)
+      .files.find((file) => file.path === appointment.target.path);
+    if (
+      proof?.hash !== appointment.proofHash ||
+      hashCanonical(this.acpProof(appointment.acp.proofId)) !== hashCanonical(appointment.proof) ||
+      !appointment.proof.reviewMode ||
+      this.store.nativeProfileId(plan.attempt.id) !== 'google-acp-v1' ||
+      !this.store.nativePhasesComplete(plan.attempt.id, 'google') ||
+      capture.attemptId !== plan.attempt.id ||
+      capture.planHash !==
+        this.nativeRecord(this.currentNativePlanKey(plan.run.id)).artifact.hash ||
+      capture.completionHash !==
+        this.nativeRecord(`native-completion:${plan.attempt.id}`, 4096).artifact.hash ||
+      capture.metadataHash !== metadata.artifact.hash ||
+      capture.candidateId !== candidate.id ||
+      capture.candidateHash !== candidate.hash ||
+      capture.target.path !== appointment.target.path ||
+      capture.target.baseHash !== appointment.target.baseHash ||
+      capture.target.mode !== appointment.target.mode ||
+      !target ||
+      target.hash !== capture.target.hash ||
+      target.bytes !== capture.target.bytes ||
+      output.selectionHash !== hashCanonical(appointment.acp) ||
+      output.reviewModeHash !== hashCanonical(appointment.proof.reviewMode)
+    )
+      throw Error('ACP capture evidence is incomplete.');
   }
 
   private nativeRepositoryEvidence(
@@ -4116,6 +4931,7 @@ export class Controller {
     this.anthropicWriterEvidence(native);
     this.googleWriterEvidence(native);
     this.nativeRepositoryEvidence(native, candidate);
+    this.nativeAcpEvidence(native, candidate);
     const prepared = ArtifactSchema.parse(
       this.store.receipt(`evaluation-started:${run.id}`)?.result.entity,
     );
@@ -4177,7 +4993,7 @@ export class Controller {
       this.store.receipt(this.currentNativePlanKey(run.id))?.hash !==
         hashCanonical(native.appointment) ||
       this.store.receipt(
-        `${'repository' in native.appointment ? 'native-capture' : 'native-application'}:${writer.id}`,
+        `${'acp' in native.appointment ? 'native-acp-capture' : 'repository' in native.appointment ? 'native-capture' : 'native-application'}:${writer.id}`,
       )?.result.outcome !== 'applied' ||
       native.appointment.consent.criteriaHash !== hashCanonical(evaluation.context.criteria) ||
       (native.public &&
@@ -4449,7 +5265,7 @@ export class Controller {
   private candidateReviewRoute(
     profile: NativeProfileResolution,
     creditPolicy: NativePilotAppointment['creditPolicy'],
-    create = true,
+    preparationId: string,
   ) {
     if (profile.facts.family !== 'openai' || profile.facts.id !== 'openai-file-v1')
       throw Error('The reviewer profile is unavailable.');
@@ -4469,9 +5285,10 @@ export class Controller {
           })
           .parse(JSON.parse(this.artifacts.read(artifact.hash).toString('utf8')))
       : undefined;
-    if (!saved && !create) return undefined;
     const route = RouteSchema.parse({
-      id: saved?.route.id ?? this.id('rte'),
+      id:
+        saved?.route.id ??
+        RouteIdSchema.parse(ArtifactSchema.shape.id.parse(preparationId).replace(/^art_/, 'rte_')),
       family: profile.facts.family,
       displayName: profile.facts.displayName,
       model: profile.facts.model,
@@ -4484,6 +5301,9 @@ export class Controller {
       qualified: false,
       fake: false,
     });
+    const current = this.store.get<Route>('route', route.id);
+    if (current && hashCanonical(current) !== hashCanonical(route))
+      throw Error('Reviewer route collision.');
     if (
       saved &&
       (saved.profileId !== profile.facts.id ||
@@ -4535,11 +5355,12 @@ export class Controller {
       const reviewRoute = this.candidateReviewRoute(
         this.profileFor(plan.reviewer.profileId),
         plan.creditPolicy,
+        artifact.id,
       );
       if (!reviewRoute) throw Error('Reviewer route is unavailable.');
       route = reviewRoute;
       // The evaluation grant permits one review within the original run budget.
-      this.nativeDecision(
+      const decision = this.nativeDecision(
         {
           ...prepared.native.appointment,
           route,
@@ -4550,6 +5371,7 @@ export class Controller {
         plan.run,
         true,
       );
+      if (!decision.chosen) throw Error('The reviewer allowance is unavailable.');
       const attempt = this.jobAttempt(plan.run, route.id);
       job = NativeReviewJobSchema.parse({
         taskId: plan.run.taskId,
@@ -4900,8 +5722,9 @@ export class Controller {
       !profile.facts.available ||
       profile.facts.id !== plan.public.profileId ||
       !profile.facts.creditPolicies.some((policy) => policy === plan.appointment.creditPolicy) ||
-      this.nativeProfileRoute(profile, plan.appointment.creditPolicy)?.id !==
-        plan.appointment.route.id ||
+      (!('acp' in plan.appointment) &&
+        this.nativeProfileRoute(profile, plan.appointment.creditPolicy)?.id !==
+          plan.appointment.route.id) ||
       profile.locationHash !== plan.public.locationHash ||
       hashCanonical(profile.client) !== hashCanonical(plan.appointment.client) ||
       !profile.environment
@@ -4925,6 +5748,22 @@ export class Controller {
     if (hashCanonical(manifest) !== hashCanonical(plan.manifest))
       throw Error('Native manifest changed.');
     const appointment = plan.appointment;
+    if ('acp' in appointment) {
+      const setup = this.store.googleAcpSetup(),
+        artifact = this.store.get<Artifact>('artifact', appointment.acp.proofId);
+      if (
+        setup.state !== 'ready' ||
+        setup.proofId !== appointment.acp.proofId ||
+        artifact?.hash !== appointment.proofHash ||
+        hashCanonical(this.acpProof(appointment.acp.proofId)) !== hashCanonical(appointment.proof)
+      )
+        throw Error('ACP proof changed.');
+      validateAcpSetupProof(
+        appointment.proof,
+        appointment.client,
+        this.options.googleAcp?.reviewMappings,
+      );
+    }
     const original =
       'target' in appointment
         ? files.find((file) => file.path === appointment.target.path)
@@ -5194,6 +6033,8 @@ export class Controller {
     run: Run,
     publicProfile = false,
   ): RouterDecision {
+    if ('acp' in appointment && appointment.route.family === 'google')
+      return this.acpDecision(appointment, run);
     const policy = run.policy.policy;
     const allowance = policy.unknownUsage;
     const active = this.store.intents().filter((intent) => intent.state !== 'stopped');
@@ -5221,6 +6062,382 @@ export class Controller {
     };
   }
 
+  private acpDecision(
+    appointment: z.infer<typeof NativeAcpAppointmentSchema>,
+    run: Run,
+  ): RouterDecision {
+    const reader = this.store.googleUsageReader();
+    const windows = this.store
+      .list<Observation>('window')
+      .filter((value) => value.routeId === appointment.route.id && value.kind !== 'local');
+    let reason: string | undefined;
+    if (!reader.enabled || !reader.last_observed_at || !windows.length)
+      reason = 'Google quota needs an enabled reader and fresh observations.';
+    for (const window of windows) {
+      if (
+        deriveWindow(window, { nowMs: Date.parse(this.now()), maxAgeMs: 300000 }).state !==
+          'fresh' ||
+        window.remaining === null ||
+        window.source !== 'client' ||
+        window.confidence !== 'reported'
+      ) {
+        reason = 'Every Google quota bucket must be fresh.';
+        continue;
+      }
+      const reserves = run.policy.policy.reserves.filter(
+        (value) => value.routeId === window.routeId && value.windowId === window.windowId,
+      );
+      const reservations = this.store.db
+        .prepare('SELECT unit,value FROM reservations WHERE route_id=? AND window_id=?')
+        .all(window.routeId, window.windowId) as {
+        unit: NonNullable<Observation['remaining']>['unit'];
+        value: number;
+      }[];
+      if (
+        reserves.length > 1 ||
+        availableAllowance({ remaining: window.remaining, reserve: reserves[0], reservations }) <= 0
+      )
+        reason = 'A Google quota bucket has reached its reserve.';
+    }
+    if (
+      run.policy.policy.reserves.some(
+        (value) =>
+          value.routeId === appointment.route.id &&
+          !windows.some((window) => window.windowId === value.windowId),
+      )
+    )
+      reason = 'A Google reserve has no observed bucket.';
+    if (Date.parse(appointment.expiresAt) <= Date.parse(this.now()))
+      reason = 'Native consent expired.';
+    return {
+      chosen: reason ? null : appointment.route.id,
+      rejected: reason ? [{ routeId: appointment.route.id, reason }] : [],
+      rule: 'percentage',
+      inputsHash: hashCanonical({ reader, windows, policy: run.policy, reason: reason ?? null }),
+    };
+  }
+
+  private validateAcpPermission(runtime: NativeRuntime, proposal: AcpPermissionProposal) {
+    this.nativeCurrent(runtime);
+    const appointment = runtime.binding.appointment;
+    if (!('acp' in appointment)) throw Error('ACP permission has no owned attempt.');
+    const detail = AcpPermissionActionSchema.parse(proposal.detail);
+    AcpApprovalTargetSchema.parse(proposal.acpTarget);
+    if (
+      proposal.action !== 'write-scratch' ||
+      proposal.target !== appointment.target.path ||
+      detail.path !== appointment.target.path ||
+      proposal.consequence !== canonicalJson(detail) ||
+      Buffer.byteLength(proposal.consequence) > 4096 ||
+      proposal.actionHash !== hashCanonical(detail) ||
+      !HashSchema.safeParse(proposal.proposalHash).success
+    )
+      throw Error('ACP action changed.');
+    const captured = captureSingleFileEdit({
+      directory: this.writerScratch(runtime.binding.run),
+      manifest: runtime.binding.manifest,
+      target: appointment.target,
+    });
+    if (
+      captured.target.hash !== detail.baseHash ||
+      captured.target.mode !== detail.mode ||
+      captured.files.find((file) => file.path === detail.path)?.content.toString('utf8') !==
+        detail.oldText
+    )
+      throw Error('ACP action no longer matches scratch.');
+  }
+
+  private requestAcpPermission(
+    runtime: NativeRuntime,
+    proposal: AcpPermissionProposal,
+  ): z.infer<typeof ApprovalBindingSchema> {
+    this.validateAcpPermission(runtime, proposal);
+    return this.store.transaction(() => {
+      this.validateAcpPermission(runtime, proposal);
+      const { run, attempt } = runtime.binding,
+        task = this.store.get<Task>('task', run.taskId) as Task;
+      if (
+        this.store.db
+          .prepare("SELECT approval_id FROM pending_effects WHERE task_id=? AND state='pending'")
+          .get(task.id)
+      )
+        throw Error('A native permission is already pending.');
+      this.requestAction(
+        task,
+        run,
+        attempt,
+        'write-scratch',
+        proposal.target,
+        { kind: 'acp', proposal },
+        proposal,
+      );
+      const row = this.store.db
+        .prepare(
+          "SELECT approval_id FROM pending_effects WHERE task_id=? AND attempt_id=? AND state='pending'",
+        )
+        .get(task.id, attempt.id);
+      const approval = row
+        ? this.store.get<Approval>('approval', row.approval_id as string)
+        : undefined;
+      if (!approval || hashCanonical(approval.acpTarget) !== hashCanonical(proposal.acpTarget))
+        throw Error('ACP permission could not be bound.');
+      const {
+        requester: _requester,
+        consequence: _consequence,
+        status: _status,
+        ...binding
+      } = approval;
+      return ApprovalBindingSchema.parse(binding);
+    });
+  }
+
+  private launchAcpNative(intent: LaunchIntent, binding: NativeBinding) {
+    const runtime: NativeRuntime = { kind: 'native', binding, stopped: false };
+    const completion = Promise.withResolvers<void>();
+    runtime.done = completion.promise;
+    this.workers.set(binding.attempt.id, runtime);
+    const appointment = binding.appointment;
+    if (!('acp' in appointment)) throw Error('ACP appointment is unavailable.');
+    const { run, attempt } = binding;
+    const finish = (
+      outcome: Awaited<ReturnType<typeof startGoogleAcpWriter>['result']> | null,
+      unspawned = false,
+    ) => {
+      try {
+        const physical =
+          unspawned ||
+          (outcome?.quiescent === true && this.store.nativePhasesComplete(attempt.id, 'google'));
+        const metadata = outcome?.metadata;
+        const terminal =
+          !!metadata &&
+          metadata.submitted === true &&
+          metadata.selectionHash === hashCanonical(appointment.acp) &&
+          metadata.reviewModeHash === hashCanonical(appointment.proof.reviewMode) &&
+          !!this.store.receipt(`native-submission:${attempt.id}`);
+        this.store.transaction(() => {
+          const done = this.nativeArtifact({
+            attemptId: attempt.id,
+            reason: outcome ? outcome.reason : 'launch',
+            quiescent: physical,
+            diagnostic: null,
+            ...(unspawned ? { unspawned: true } : {}),
+          });
+          this.store.saveReceipt(`native-completion:${attempt.id}`, done.hash, 'local-owner', {
+            outcome: 'applied',
+            entity: done,
+          });
+          if (metadata) {
+            const proof = this.nativeArtifact(metadata);
+            this.store.saveReceipt(`native-proposal:${attempt.id}`, proof.hash, 'local-owner', {
+              outcome: 'applied',
+              entity: proof,
+            });
+          }
+          if (physical && terminal) {
+            const proof = this.nativeArtifact({
+              attemptId: attempt.id,
+              planHash: binding.planArtifact.hash,
+              completionHash: done.hash,
+              metadataHash: hashCanonical(metadata),
+            });
+            this.store.saveReceipt(`native-acp-terminal:${attempt.id}`, proof.hash, 'local-owner', {
+              outcome: 'applied',
+              entity: proof,
+            });
+          }
+        });
+        const known =
+          physical && (terminal || !this.store.receipt(`native-submission:${attempt.id}`));
+        let eligible =
+          known &&
+          !runtime.stopped &&
+          !this.closed &&
+          !outcome?.reason &&
+          metadata?.stopReason === 'end_turn';
+        if (eligible) {
+          try {
+            this.nativeCurrent(runtime);
+          } catch {
+            eligible = false;
+          }
+        }
+        if (!this.settleJob(attempt, known, true)) return;
+        let captured = false;
+        if (known) {
+          try {
+            const files = captureSingleFileEdit({
+              directory: intent.scratch_path,
+              manifest: binding.manifest,
+              target: appointment.target,
+            });
+            const candidate = this.sealCandidate(attempt, files.files);
+            if (eligible) {
+              this.store.transaction(() => {
+                const proof = this.nativeArtifact({
+                  version: 1,
+                  attemptId: attempt.id,
+                  planHash: binding.planArtifact.hash,
+                  completionHash: this.nativeRecord(`native-completion:${attempt.id}`, 4096)
+                    .artifact.hash,
+                  metadataHash: this.nativeRecord(`native-proposal:${attempt.id}`).artifact.hash,
+                  candidateId: candidate.id,
+                  candidateHash: candidate.hash,
+                  target: files.target,
+                });
+                this.store.saveReceipt(
+                  `native-acp-capture:${attempt.id}`,
+                  proof.hash,
+                  'local-owner',
+                  { outcome: 'applied', entity: proof },
+                );
+              });
+              captured = true;
+            }
+          } catch {}
+        }
+        this.store.transaction(() => {
+          const task = this.store.get<Task>('task', run.taskId) as Task;
+          this.closePendingEffects(task);
+          this.updateTask(task, {
+            state: known ? (captured ? 'stopped' : 'interrupted') : 'unknown',
+            waitingReason: null,
+            next: captured
+              ? 'Native work is retained. Checks and review remain pending.'
+              : known
+                ? 'Native work is unverified. Inspect retained changes.'
+                : 'Native turn completion is unknown. Nothing will replay automatically.',
+          });
+        });
+        if (known) this.workers.delete(attempt.id);
+      } catch {
+        try {
+          this.settleJob(attempt, false, true);
+        } catch {}
+      } finally {
+        completion.resolve();
+      }
+    };
+    void (async () => {
+      try {
+        this.nativeCurrent(runtime);
+        if (!binding.context || !binding.environment) throw Error('ACP context is unavailable.');
+        if (!existsSync(intent.scratch_path))
+          materialize(
+            intent.scratch_path,
+            committedFiles(this.projectPath(run.source.projectId) as string, run.source.base),
+          );
+        const directory = join(this.home, 'native', attempt.id);
+        mkdirSync(directory, { recursive: true, mode: 0o700 });
+        const context = await prepareOwnedContext({
+          client: this.contextClient(),
+          context: binding.context,
+          home: this.home,
+          scratch: intent.scratch_path,
+          directory: join(directory, 'context'),
+          expiresAt: appointment.expiresAt,
+          now: () => Date.parse(this.now()),
+          owner: {
+            taskId: run.taskId,
+            runId: run.id,
+            attemptId: attempt.id,
+            generation: attempt.generation,
+            routeId: attempt.routeId,
+            policyHash: run.policy.hash,
+            profileId: 'google-acp-v1',
+            selection: appointment.acp,
+          },
+        });
+        this.nativeCurrent(runtime);
+        const journal = this.nativeLifecycle(attempt, () => this.nativeCurrent(runtime));
+        const phase = { sequence: 0, kind: 'google-acp-task' as const };
+        const handle = startGoogleAcpWriter({
+          client: appointment.client,
+          directory,
+          scratch: intent.scratch_path,
+          environment: binding.environment,
+          plan: googleAcpWriterPlan({
+            attemptId: attempt.id,
+            generation: attempt.generation,
+            target: appointment.target,
+            criteria: [
+              binding.public?.context.title ?? '',
+              binding.public?.context.outcome ?? '',
+              ...(this.store.get<Task>('task', run.taskId) as Task).criteria,
+            ],
+            selection: appointment.acp,
+            proof: appointment.proof,
+            ...this.options.googleAcp,
+          }),
+          mcpServer: context.server,
+          ...this.options.googleAcp,
+          spawn: this.options.googleAcp?.spawn,
+          schedule: this.options.schedule,
+          timeoutMs: Math.min(
+            appointment.maximumTaskMs,
+            this.jobDeadline(attempt.id, appointment.maximumTaskMs / 60000),
+            Date.parse(appointment.expiresAt) - Date.parse(this.now()),
+          ),
+          lifecycle: {
+            beforePhase: () => journal.beforePhase(phase),
+            owned: (group) => journal.owned(phase, group),
+            quiescent: (group) => journal.quiescent(phase, group),
+          },
+          onSubmitted: () => {
+            this.nativeCurrent(runtime);
+            this.store.transaction(() => {
+              this.nativeCurrent(runtime);
+              const proof = this.nativeArtifact({
+                attemptId: attempt.id,
+                plan: binding.planArtifact.hash,
+              });
+              this.store.saveReceipt(
+                `native-submission:${attempt.id}`,
+                binding.planArtifact.hash,
+                'local-owner',
+                { outcome: 'outcome-unknown', entity: proof },
+              );
+            });
+          },
+          onPermission: (proposal) => this.requestAcpPermission(runtime, proposal),
+          onActivity: (activity, text) => {
+            if (
+              runtime.stopped ||
+              this.closed ||
+              this.store.get<Task>('task', run.taskId)?.state === 'stopping'
+            )
+              return;
+            this.nativeCurrent(runtime);
+            this.store.transaction(() => {
+              const task = this.store.get<Task>('task', run.taskId) as Task;
+              this.event('attempt.output', task.id, task.revision, {
+                attemptId: attempt.id,
+                generation: attempt.generation,
+                channel: 'acp',
+                acp: activity,
+                text,
+              });
+            });
+          },
+        });
+        runtime.acpHandle = handle;
+        runtime.handle = {
+          stop: () => handle.stop(),
+          result: handle.result.then((outcome) => ({
+            ...outcome,
+            metadata: outcome.metadata
+              ? { ...outcome.metadata, family: 'google-acp' as const }
+              : null,
+            diagnostic: null,
+          })),
+        };
+        if (runtime.stopped || this.closed) handle.stop();
+        finish(await handle.result);
+      } catch {
+        finish(null, this.store.nativeProcesses(attempt.id).length === 0);
+      }
+    })();
+  }
+
   private nativeArtifact(value: unknown): Artifact {
     const artifact = ArtifactSchema.parse({
       id: this.id('art'),
@@ -5233,6 +6450,21 @@ export class Controller {
 
   private nativeCurrent(runtime: NativeRuntime) {
     const { appointment, run, attempt } = runtime.binding;
+    if ('acp' in appointment) {
+      const setup = this.store.googleAcpSetup(),
+        profile = this.acpResolution();
+      const proof = this.store.get<Artifact>('artifact', appointment.acp.proofId);
+      if (
+        this.store.nativeProfileId(attempt.id) !== 'google-acp-v1' ||
+        setup.state !== 'ready' ||
+        setup.proofId !== appointment.acp.proofId ||
+        proof?.hash !== appointment.proofHash ||
+        !profile.facts.available ||
+        hashCanonical(profile.client) !== hashCanonical(appointment.client) ||
+        hashCanonical(this.acpProof(appointment.acp.proofId)) !== hashCanonical(appointment.proof)
+      )
+        throw Error('ACP runtime proof changed.');
+    }
     if (runtime.binding.handoff) this.nativeManualAuthority(runtime.binding, true);
     const task = this.store.get<Task>('task', run.taskId);
     const current = this.store.get<Attempt>('attempt', attempt.id);
@@ -5274,7 +6506,8 @@ export class Controller {
       runtime.stopped ||
       runtime.reason === 'stop' ||
       task?.runId !== run.id ||
-      task.state !== 'running' ||
+      (task.state !== 'running' &&
+        !('acp' in appointment && task.state === 'waiting' && task.waitingReason === 'approval')) ||
       !current ||
       !['intent', 'running'].includes(current.state) ||
       current.generation !== attempt.generation ||
@@ -5332,6 +6565,16 @@ export class Controller {
       ...(binding.public ? [binding.public.context.title, binding.public.context.outcome] : []),
       ...(this.store.get<Task>('task', binding.run.taskId) as Task).criteria,
     ];
+    if ('acp' in appointment)
+      return googleAcpWriterPlan({
+        attemptId: attempt.id,
+        generation: attempt.generation,
+        target: appointment.target,
+        criteria,
+        selection: appointment.acp,
+        proof: appointment.proof,
+        ...this.options.googleAcp,
+      });
     if ('repository' in appointment)
       return repositoryPlan({
         attemptId: attempt.id,
@@ -5651,6 +6894,10 @@ export class Controller {
   }
 
   private launchNative(intent: LaunchIntent, binding: NativeBinding) {
+    if ('acp' in binding.appointment) {
+      this.launchAcpNative(intent, binding);
+      return;
+    }
     if (this.closed) return;
     const runtime: NativeRuntime = { kind: 'native', binding, stopped: false };
     const completion = Promise.withResolvers<void>();
@@ -5984,6 +7231,7 @@ export class Controller {
     action: Grant['action'],
     target: string,
     request: unknown,
+    acpProposal?: AcpPermissionProposal,
   ): CommandResult {
     const existing = this.store.db
       .prepare(
@@ -5995,7 +7243,8 @@ export class Controller {
       if (
         pending?.attemptId === attempt.id &&
         pending.action === action &&
-        pending.target === target
+        pending.target === target &&
+        hashCanonical(pending.acpTarget ?? null) === hashCanonical(acpProposal?.acpTarget ?? null)
       )
         return { outcome: 'already-applied', entity: this.store.get<Task>('task', task.id) };
       return {
@@ -6015,9 +7264,10 @@ export class Controller {
       generation: attempt.generation,
       action,
       target,
+      ...(acpProposal ? { acpTarget: acpProposal.acpTarget } : {}),
       revision: 0,
       requester: 'Controller',
-      consequence: `Permit one ${action} action for this attempt.`,
+      consequence: acpProposal?.consequence ?? `Permit one ${action} action for this attempt.`,
       status: 'pending',
     });
     const updated = this.updateTask(task, {
@@ -6567,11 +7817,35 @@ export class Controller {
         if (!quiescent) this.store.unknownGoogleMetadata(operation.command_id);
         const receipt = this.store.receipt(operation.command_id);
         if (receipt?.result.reason === 'usage-read-pending') {
-          this.finishUsageReceipt(operation.command_id, {
+          this.finishMetadataReceipt(operation.command_id, {
             outcome: quiescent ? 'blocked' : 'outcome-unknown',
             reason: quiescent ? 'usage-read-interrupted' : 'google-ownership-unknown',
           });
         }
+      }
+      const setup = this.store.googleAcpSetup();
+      if (
+        setup.operationId &&
+        ['initializing', 'authenticating', 'discovering', 'stopping'].includes(setup.state)
+      ) {
+        const operation = this.store
+          .googleMetadataOperations()
+          .find((row) => row.command_id === setup.operationId);
+        const known = operation?.state === 'quiescent';
+        const next = GoogleAcpSetupSchema.parse({
+          ...setup,
+          revision: setup.revision + 1,
+          state: known ? 'blocked' : 'unknown',
+          operationId: known ? null : setup.operationId,
+          reason: null,
+        });
+        this.store.putGoogleAcpSetup(next);
+        if (this.store.receipt(setup.operationId)?.result.reason === 'acp-setup-pending')
+          this.finishMetadataReceipt(setup.operationId, {
+            outcome: known ? 'blocked' : 'outcome-unknown',
+            reason: known ? 'acp-setup-interrupted' : 'google-ownership-unknown',
+            data: { kind: 'google-acp-setup', setup: next },
+          });
       }
       for (const intent of this.store.intents().filter((value) => value.state !== 'stopped')) {
         const attempt = this.store.get<Attempt>('attempt', intent.attempt_id);
@@ -6611,7 +7885,67 @@ export class Controller {
             verificationKnown = false;
           }
         }
+        let acpKnown: boolean | undefined;
+        if (this.store.nativeProfileId(attempt.id) === 'google-acp-v1') {
+          acpKnown = false;
+          try {
+            const done = z
+              .object({
+                attemptId: AttemptSchema.shape.id,
+                quiescent: z.literal(true),
+                unspawned: z.literal(true).optional(),
+              })
+              .parse(this.nativeRecord(`native-completion:${attempt.id}`, 4096).value);
+            const noPrompt = !this.store.receipt(`native-submission:${attempt.id}`);
+            const closed =
+              (done.unspawned === true && !phases.length) ||
+              this.store.nativePhasesComplete(attempt.id, 'google');
+            let terminal = false;
+            if (!noPrompt) {
+              const plan = this.nativeCurrentPlan(run);
+              const appointment = plan.appointment;
+              if (!('acp' in appointment) || plan.attempt.id !== attempt.id)
+                throw Error('ACP plan changed.');
+              const retained = this.nativeRecord(`native-acp-terminal:${attempt.id}`, 4096);
+              const proof = z
+                .strictObject({
+                  attemptId: AttemptSchema.shape.id,
+                  planHash: HashSchema,
+                  completionHash: HashSchema,
+                  metadataHash: HashSchema,
+                })
+                .parse(retained.value);
+              const metadata = this.nativeRecord(`native-proposal:${attempt.id}`);
+              const completion = this.nativeRecord(`native-completion:${attempt.id}`, 4096);
+              const output = z
+                .strictObject({
+                  sessionId: AcpApprovalTargetSchema.shape.sessionId,
+                  stopReason: z.enum([
+                    'end_turn',
+                    'max_tokens',
+                    'max_turn_requests',
+                    'refusal',
+                    'cancelled',
+                  ]),
+                  submitted: z.literal(true),
+                  selectionHash: HashSchema,
+                  reviewModeHash: HashSchema,
+                })
+                .parse(metadata.value);
+              terminal =
+                proof.attemptId === attempt.id &&
+                proof.planHash ===
+                  this.nativeRecord(this.currentNativePlanKey(run.id)).artifact.hash &&
+                proof.completionHash === completion.artifact.hash &&
+                proof.metadataHash === hashCanonical(output) &&
+                output.selectionHash === hashCanonical(appointment.acp) &&
+                output.reviewModeHash === hashCanonical(appointment.proof.reviewMode);
+            }
+            acpKnown = done.attemptId === attempt.id && closed && (noPrompt || terminal);
+          } catch {}
+        }
         const stopped =
+          acpKnown ??
           verificationKnown ??
           (known &&
             (native
@@ -6626,7 +7960,7 @@ export class Controller {
         this.store.db
           .prepare('UPDATE launch_intents SET state=?,finished_at=? WHERE attempt_id=?')
           .run(
-            stopped ? 'stopped' : known ? 'acknowledged' : 'outcome-unknown',
+            stopped ? 'stopped' : acpKnown === false || !known ? 'outcome-unknown' : 'acknowledged',
             stopped ? this.now() : null,
             attempt.id,
           );
@@ -6650,6 +7984,23 @@ export class Controller {
             : 'An intent has no proven completed launch.',
         });
       }
+      for (const intent of this.store
+        .intents()
+        .filter(
+          (row) =>
+            row.state === 'stopped' &&
+            this.store.nativeProfileId(row.attempt_id) === 'google-acp-v1',
+        )) {
+        const task = this.store.get<Task>('task', intent.task_id);
+        if (task && ['running', 'stopping', 'waiting'].includes(task.state)) {
+          this.closePendingEffects(task);
+          this.updateTask(task, {
+            state: 'interrupted',
+            waitingReason: null,
+            next: 'Native work was interrupted after recorded closure. Inspect retained evidence.',
+          });
+        }
+      }
     });
   }
 
@@ -6668,6 +8019,7 @@ export class Controller {
       generation: approval.generation,
       action: approval.action,
       target: approval.target,
+      ...(approval.acpTarget ? { acpTarget: approval.acpTarget } : {}),
       revision: approval.revision,
     };
     if (hashCanonical(binding) !== hashCanonical(command.payload.binding))
@@ -6690,7 +8042,65 @@ export class Controller {
       identity?: GitIdentity;
       at?: string;
       previousStatus?: Pick<Task, 'state' | 'waitingReason' | 'next'>;
+      proposal?: AcpPermissionProposal;
     };
+    if (request.kind === 'acp') {
+      if (
+        hashCanonical(request) !== pending.effect_hash ||
+        !request.proposal ||
+        !approval.acpTarget ||
+        approval.action !== request.proposal.action ||
+        approval.target !== request.proposal.target ||
+        approval.consequence !== request.proposal.consequence
+      )
+        return { outcome: 'denied', reason: 'pending-effect-changed' };
+      const runtime = this.workers.get(approval.attemptId);
+      if (
+        runtime?.kind !== 'native' ||
+        !runtime.acpHandle ||
+        !('acp' in runtime.binding.appointment) ||
+        this.store.nativeProfileId(approval.attemptId) !== 'google-acp-v1' ||
+        approval.generation !== runtime.binding.attempt.generation ||
+        hashCanonical(approval.acpTarget) !== hashCanonical(request.proposal.acpTarget)
+      )
+        return { outcome: 'blocked', reason: 'acp-permission-not-current' };
+      if (command.payload.decision === 'approved') {
+        try {
+          this.validateAcpPermission(runtime, request.proposal);
+        } catch {
+          return { outcome: 'blocked', reason: 'acp-action-changed' };
+        }
+      }
+      const resolved = ApprovalSchema.parse({
+        ...approval,
+        status: command.payload.decision,
+        revision: approval.revision + 1,
+      });
+      this.store.put('approval', approval.approvalId, resolved.revision, resolved);
+      this.store.db
+        .prepare('UPDATE pending_effects SET state=? WHERE approval_id=?')
+        .run(command.payload.decision === 'approved' ? 'applied' : 'denied', approval.approvalId);
+      const next = this.updateTask(task, {
+        state: command.payload.decision === 'approved' ? 'running' : 'stopping',
+        waitingReason: null,
+        next:
+          command.payload.decision === 'approved'
+            ? 'One exact native edit was approved.'
+            : 'Stopping after the denied native edit.',
+      });
+      this.event('approval.resolved', task.id, next.revision, resolved);
+      effects.push(() => {
+        try {
+          if (command.payload.decision === 'approved')
+            this.validateAcpPermission(runtime, request.proposal as AcpPermissionProposal);
+          runtime.acpHandle?.replyPermission(command.payload.binding, command.payload.decision);
+        } catch {
+          runtime.stopped = true;
+          runtime.acpHandle?.stop();
+        }
+      });
+      return { outcome: 'applied', entity: next, revision: next.revision };
+    }
     if (
       task.runId &&
       this.store.receipt(`native-run:${task.runId}`) &&
@@ -6906,13 +8316,13 @@ export class Controller {
     for (const artifact of artifacts) this.store.put('artifact', artifact.id, 0, artifact);
   }
 
-  private sealCandidate(attempt: Attempt): Candidate {
+  private sealCandidate(attempt: Attempt, capturedFiles?: FileContent[]): Candidate {
     const run = this.store.get<Run>('run', attempt.runId) as Run;
     if (this.hasUncertainWriter(run.taskId)) throw new Error('Writer ownership is not quiescent.');
     const intent = this.store
       .intents()
       .find((value) => value.attempt_id === attempt.id) as LaunchIntent;
-    const files = readFiles(intent.scratch_path);
+    const files = capturedFiles ?? readFiles(intent.scratch_path);
     const native = !!this.store.receipt(`native-run:${run.id}`);
     const nativeCandidates = new Set(
       this.store
