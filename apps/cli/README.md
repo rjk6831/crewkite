@@ -38,6 +38,21 @@ Task commands use IDs returned by the controller:
 
 Watch retains its cursor while the controller is offline. If the bounded reconnect window ends, it prints the next action and exits with status 1. Start the controller and run watch again to reconnect explicitly.
 
+## Google quota
+
+```sh
+pnpm crewkite usage show --json
+pnpm crewkite usage refresh --family google --consent --json
+pnpm crewkite usage refresh --family google --json
+pnpm crewkite usage refresh --family google --no-consent --json
+```
+
+`--consent` enables the reader and requests one read. Omitting consent requests a read under the saved opt-in. `--no-consent` disables the reader without a read and discards any in-flight result. Reads have a 60-second cooldown after each attempt, including failures. Active or unknown Google ownership blocks a read. No timer refreshes quota.
+
+The reader uses the Google CLI's headless `/usage` command with no model request. Google's FAQ reserves headless mode for scripting and CI. Quota consent does not enable a writer. The [provider boundaries](../../docs/providers.md) describe this separate opt-in.
+
+`usage show --json` returns `{ cursor, usageReaders, usage }`. Readers include enabled state, availability reason, last attempt and last successful observation. Usage contains the controller's derived windows with their source, observation time, reset time and stale state. Refresh returns the normal `{ command, result }` action receipt. Failed reads retain prior windows, which become stale after five minutes.
+
 ## Native single-file runs
 
 Create the project and draft task through the commands above or the desktop. List the controller's supported native profiles:

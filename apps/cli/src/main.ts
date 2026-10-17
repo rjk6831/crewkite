@@ -39,6 +39,8 @@ const help = `Usage: crewkite project add <path> [--json] [--home path]
        crewkite task <list|show|watch|start|stop|resume|switch|approve|deny> [id] [--json] [--home path]
        crewkite task switch <task-id> <route-id> [--json] [--home path]
        crewkite native profiles [--json] [--home path]
+       crewkite usage show [--json] [--home path]
+       crewkite usage refresh --family google [--consent|--no-consent] [--json] [--home path]
        crewkite task prepare-native <task-id> <profile-id> <path> --policy file [--native-trust --source-consent] [--existing-credits] [--confirm-subscription-only] [--permission-mode mode] [--handoff-target profile[:existing-credits] ...]
        crewkite task prepare-handoff <task-id> <profile-id> --native-trust --source-consent [--existing-credits] [--confirm-subscription-only] [--permission-mode mode]
        crewkite task start-handoff <task-id> [--json] [--home path]
@@ -101,6 +103,9 @@ export async function runCli(
         'permission-mode': { type: 'string' },
         'handoff-target': { type: 'string', multiple: true },
         output: { type: 'string' },
+        family: { type: 'string' },
+        consent: { type: 'boolean' },
+        'no-consent': { type: 'boolean' },
       },
     });
     if (values.help || positionals.length === 0) {
@@ -117,7 +122,7 @@ export async function runCli(
             (['prepare-evaluation', 'prepare-repository', 'prepare-handoff'].includes(action) &&
               extra.length === 1))
         )) ||
-      !['project', 'task', 'native', 'health', 'retry'].includes(area)
+      !['project', 'task', 'native', 'usage', 'health', 'retry'].includes(area)
     )
       throw new Error('Unknown command. Use --help.');
     const supported = [
@@ -179,6 +184,20 @@ export async function runCli(
       throw new Error('Retry takes one receipt file.');
     if (area === 'native' && (action !== 'profiles' || id !== undefined))
       throw new Error('Use native profiles to list supported profiles.');
+    const refreshingUsage = area === 'usage' && action === 'refresh';
+    if (area === 'usage' && (!['show', 'refresh'].includes(action) || id !== undefined))
+      throw new Error('Use usage show or usage refresh --family google.');
+    if (
+      !refreshingUsage &&
+      (values.family !== undefined ||
+        values.consent !== undefined ||
+        values['no-consent'] !== undefined)
+    )
+      throw new Error('Quota family and consent options require usage refresh.');
+    if (refreshingUsage && values.family !== 'google')
+      throw new Error('Quota refresh requires --family google.');
+    if (values.consent && values['no-consent'])
+      throw new Error('Choose --consent or --no-consent.');
     const preparingFile = area === 'task' && action === 'prepare-native';
     const preparingRepository = area === 'task' && action === 'prepare-repository';
     const preparing = preparingFile || preparingRepository;
@@ -466,7 +485,43 @@ export async function runCli(
       );
       return succeeded(result) ? 0 : 2;
     }
+    if (refreshingUsage) {
+      const result = await request(
+        'ObserveUsage',
+        {
+          family: 'google',
+          ...(values.consent ? { consent: true } : values['no-consent'] ? { consent: false } : {}),
+        },
+        0,
+      );
+      print(
+        { command: sent, result },
+        terminalText(
+          `${result.reason ?? result.outcome}${result.next ? `\n${result.next}` : ''}\nCommand key ${sent?.key}`,
+        ),
+      );
+      return succeeded(result) ? 0 : 2;
+    }
     const snapshot = await client.snapshot();
+    if (area === 'usage') {
+      print(
+        { cursor: snapshot.cursor, usageReaders: snapshot.usageReaders, usage: snapshot.usage },
+        terminalText(
+          [
+            ...snapshot.usageReaders.map(
+              (reader) =>
+                `${reader.family} quota reader  ${reader.enabled ? 'enabled' : 'disabled'}  ${reader.reason}  last attempt ${reader.lastAttemptAt ?? 'none'}  last observed ${reader.lastObservedAt ?? 'none'}`,
+            ),
+            ...snapshot.usage.map(
+              ({ observation, state }) =>
+                `${observation.routeId}  ${observation.windowId}  ${observation.remaining ? `${observation.remaining.value} ${observation.remaining.unit} remaining` : 'remaining unknown'}  ${state}  source ${observation.source}  observed ${observation.observedAt}  resets ${observation.resetsAt ?? 'unknown'}`,
+            ),
+          ].join('\n') || 'No usage observations or readers.',
+        ),
+      );
+      return 0;
+    }
+
     if (area === 'native') {
       print(
         { profiles: snapshot.nativeProfiles },
