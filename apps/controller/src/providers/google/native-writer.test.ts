@@ -16,6 +16,7 @@ import {
   startGoogleConfig,
   startGoogleWriter,
 } from './native-writer.ts';
+import { resolveGoogleNativeProfile } from './profile.ts';
 
 const hash = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
 const original = 'export const total = 0;\n';
@@ -37,6 +38,22 @@ const usage = {
 };
 
 test('the google writer returns a bounded replacement only after its admitted process is quiescent', async () => {
+  const unavailable = resolveGoogleNativeProfile(
+    new Proxy(
+      {},
+      {
+        get() {
+          throw Error('Restricted profile must not inspect account or client locations.');
+        },
+      },
+    ),
+  );
+  assert.equal(unavailable.facts.available, false);
+  assert.equal(unavailable.facts.reason, 'provider-policy-restricted');
+  assert.equal(unavailable.client, undefined);
+  assert.equal(unavailable.environment, undefined);
+  assert.equal(unavailable.locationHash, undefined);
+
   mkdirSync(resolve('internal'), { recursive: true });
   const home = mkdtempSync(resolve('internal/google-writer-'));
   const directory = join(home, 'scratch');

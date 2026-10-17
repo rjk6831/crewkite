@@ -852,6 +852,8 @@ function NativeLaunch({
           'Install the supported official client before preparing this proposal.',
         'client-build-mismatch': 'The installed client build does not match this profile.',
         'qualification-pending': 'Qualification pending.',
+        'provider-policy-restricted':
+          'Google consumer CLI access is unavailable in CrewKite under the provider integration policy. Choose another profile or use the native app directly.',
         available: '',
       }[profile.reason]
     : 'The controller has no supported native profile.';

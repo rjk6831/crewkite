@@ -37,7 +37,7 @@ Create the project and draft task in the desktop. List the controller's supporte
 pnpm crewkite native profiles --json
 ```
 
-The snapshot reports profile availability, its reason, client version, model, effort and bounds. Anthropic and Google report requested effort separately from unobserved effective effort and service tier. A missing qualification date is shown as pending. The CLI accepts a listed profile ID. It accepts no executable, digest or model override.
+The snapshot reports profile availability, its reason, client version, model, effort and bounds. OpenAI and Anthropic have bounded local native paths. Google consumer automatic launch reports `provider-policy-restricted` and refuses before native discovery. The [dated provider boundaries](../../docs/providers.md#current-availability) explain these restrictions. Anthropic and Google report requested effort separately from unobserved effective effort and service tier. A missing qualification date is shown as pending. Preparation requires an available profile ID. It accepts no executable, digest or model override.
 
 Save a policy JSON file using the existing policy schema. This example grants one scratch write and one export. Replace the sample task ID and project name with the desktop values, and choose a future expiration before preparing the run:
 
@@ -78,9 +78,9 @@ pnpm crewkite task show <task-id> --json
 pnpm crewkite task start <task-id> --json
 ```
 
-For an Anthropic or Google writer, add `--confirm-subscription-only` to confirm both that the existing native login uses your subscription and that paid extra usage is disabled. This flag records your attestation. It does not change account settings or establish a provider hard spending cap. OpenAI preparation rejects this flag. Both support ordinary usage only.
+For an Anthropic writer, add `--confirm-subscription-only` to confirm both that the existing native login uses your subscription and that paid extra usage is disabled. This flag records your attestation. It does not change account settings or establish provider permission, included billing or a hard spending cap. OpenAI preparation rejects this flag. Anthropic supports ordinary usage only.
 
-For a Google writer, also pass `--permission-mode` with the current native setting: `request-review`, `strict`, `always-proceed` or `proceed-in-sandbox`. The first mode is labeled Request permission in the client. These modes cover permission approval, strict permissions, automatic permission to proceed, or native sandbox permissions respectively. CrewKite checks the expected mode and does not change it. Interactive approval and tool containment remain unqualified. Other writers and commands reject the option. Exact saved consent can reuse only the matching current run's saved mode. A new explicit preparation requires the mode again.
+Prior Google pilot preparations also recorded this attestation and an explicit `--permission-mode`. Saved Google runs remain readable; these options do not enable the unavailable consumer profile.
 
 Task show includes the matching native run and source, frozen target path, base hash, byte count, consent expiry and stage. Saved billing confirmations appear with their user-attested provenance. Google also shows its expected native permission mode. Older retained runs can report unknown target facts or expiry.
 
@@ -94,6 +94,8 @@ The native path retains a single-file candidate. Stop waits for owned cleanup. R
 pnpm crewkite task changes <task-id>
 pnpm crewkite task export <task-id> --output candidate.patch --json
 ```
+
+A saved patch can be carried to a provider's native app manually. CrewKite does not open that app or import its result automatically.
 
 Export reads bounded artifact pages and verifies identity, offsets, length and checksum before creating the destination. Existing files are never overwritten. Plain diff output escapes terminal control characters. If export needs approval, its receipt includes the next approval command. Approve that export with `task approve <approval-id> --output new.patch`, or retry the saved export approval receipt with `--output new.patch` after inspecting its result.
 

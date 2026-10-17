@@ -1,19 +1,25 @@
 # Provider routes
 
-I qualify exact routes: a specific client build, account type, model, effort setting and billing mode. A logo or a model name in a menu is not support. Team routing runs scripted fakes for all four families. A separate supervised file-proposal path supports exact OpenAI, Anthropic and Google profiles. General live routing remains unqualified.
+I qualify exact routes: a specific client build, account type, model, effort setting and billing mode. A logo or a model name in a menu is not support. Team routing runs scripted fakes for all four families. The supervised native path supports exact OpenAI and Anthropic profiles. Google consumer automatic launch is unavailable. General live routing remains unqualified.
 
-## Qualification targets
+## Current availability
 
-| Family | First route to qualify | Facts still to establish |
-|--------|------------------------|--------------------------|
-| OpenAI | Codex app-server with native login | Protocol behavior, approvals, tool boundary, billing once included usage runs out |
-| Anthropic | Claude Code structured output stream | Subscription-preserving configuration, permission modes |
-| Google | Antigravity CLI structured headless output | Subscription billing identity, native permissions, cancellation and recovery |
-| Local | An authenticated loopback runtime such as LM Studio | Locality, memory use, a useful role, cancellation |
+I checked the following primary-source guidance on 17 October 2026. Client behavior and integration permission are separate gates under [ADR 0005](adr/0005-official-clients-on-user-subscriptions.md).
 
-Each family has separate qualification gates. A fake family label does not establish a client's capabilities, authentication or billing behavior. The Local fixture loads no model.
+| Family | Current CrewKite path | Boundary |
+|--------|-----------------------|----------|
+| OpenAI | Bounded local native file and repository work | The [app-server authentication guidance](https://learn.chatgpt.com/docs/app-server#auth-endpoints) permits continued use by local or open-source applications. It recommends migration to Sign in with ChatGPT and excludes commercial or hosted services from app-server authentication. |
+| Anthropic | Bounded local native single-file work | The [native-binary policy](https://code.claude.com/docs/en/legal-and-compliance#can-customers-offer-claude-code-in-their-products) permits end users to sign in with their own subscription under its product conditions. The [7 October update](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan) preserves subscription-limit use of the Agent SDK, `claude -p` and third-party apps. |
+| Google | Consumer automatic launch unavailable | The [official FAQ](https://antigravity.google/docs/faq/#can-i-use-antigravity-cli-headless-mode-in-third-party-coding-agents-or-automate-account-switching) excludes wrapping the consumer CLI inside third-party applications. No API fallback is configured. |
+| Local | Planned authenticated loopback integration | No model is installed or loaded by the scripted Local fixture. Memory, latency, quality and cancellation still need qualification. |
 
-Google [ended consumer sign-in for Gemini CLI on June 18, 2026](https://developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals), including Google AI Pro and Ultra. That consumer subscription path is unavailable. Google's [migration guide points to Antigravity CLI](https://www.antigravity.google/docs/cli/gcli-migration).
+Running Claude Code in a product requires the publisher's agreement to Anthropic's Commercial Terms, an unmodified official binary with its authentication methods intact, and each user's own login and direct billing. Credentials and usage cannot be intermediated. CrewKite starts the user's installed native client, offers no separate login and does not collect OAuth tokens. It no longer forces a login method. Fresh authentication and billing attestations remain required by this profile. The [account guidance](https://support.claude.com/en/articles/13189465-log-in-to-your-claude-account) reserves third-party usage-credit billing, so these checks establish no provider hard spending cap or guaranteed included billing.
+
+The default Google profile refuses preparation and Start before native discovery. The interface keeps the unavailable profile and its reason visible. An installed client or user billing attestation cannot establish integration permission. Anthropic keeps its existing local native path without forcing a login method. This does not establish permission for every integration or guarantee included billing.
+
+Retained candidates remain inspectable and exportable through the existing permission path. I can save a patch and open a provider's native app myself. CrewKite does not automate that transfer, claim automatic import or reuse the native app's account through a fallback.
+
+The following sections record exact pilot mechanics and adapter limits. Prior Google evidence does not authorize new consumer launches. General live routing remains unqualified.
 
 ## Anthropic writer preparation
 
@@ -31,11 +37,11 @@ A separate synthetic task exercised public Stop after its submission marker and 
 
 The parser discards bounded, session-bound subscription metadata and top-level user-role output. A proposal requires the final successful structured result. Reported extra usage enabled or in use stops the task; missing values remain unknown.
 
-## Google writer preparation
+## Prior Google writer pilot
 
 The Google adapter reads [structured headless output](https://www.antigravity.google/docs/cli/headless) and returns a bounded file replacement tied to an attempt, relative path and original content hash. It requires an exact client identity and dated controller-owned admission evidence. It applies no file changes and registers no route. Its scripted fixture covers malformed output, session binding, refusal before launch and process cleanup.
 
-The controller preparation profile pins client 1.4.0 and its exact executable digest, with `gemini-3.8-flash-low` at requested low effort. The installed profile remains qualification-pending. Preparation requires an explicit expected permission mode and a user attestation confirming subscription login and disabled paid extra usage. The saved scope binds both to the client, native home, source, task and policy. Existing-credit use and API fallback are unsupported. Effective effort, account class, plan and request billing remain unknown.
+The prior controller preparation profile pinned client 1.4.0 and its exact executable digest, with `gemini-3.8-flash-low` at requested low effort. The default profile is unavailable with reason `provider-policy-restricted`, before client discovery. The prior pilot required an explicit expected permission mode and a user attestation confirming subscription login and disabled paid extra usage. The saved pilot scope bound both to the client, native home, source, task and policy. Existing-credit use and API fallback are unsupported. Effective effort, account class, plan and request billing remain unknown.
 
 One deadline covers the zero-turn `/config` process, proposal process and cleanup. The configuration read must succeed with exit zero, zero turns and tokens, the exact selected permission mode and credit fallback disabled. It projects no observed authentication or account identity. Both process groups must be quiescent before a replacement can reach the existing scratch application path. The task prompt is an argument, so its conservative submission marker commits before spawn. Saved configuration, task session and replacement evidence remain tied to the same attempt. Stop and restart preserve retained work without automatic resubmission. The supported reviewer still resolves independently to an OpenAI profile.
 
@@ -93,11 +99,11 @@ On 17 October 2026, a separate normal desktop task exercised Stop after a durabl
 
 The source helper separately rechecks the full saved scratch manifest and the opened target before replacing one existing regular file. It refuses links, mismatched hashes and stale file metadata. It preserves permissions, truncates to the replacement length and syncs the file. A write failure can retain unverified scratch and requires explicit recovery.
 
-The desktop and CLI prepare one existing committed text file through `PrepareNativeRun`. The OpenAI profile requires macOS on Apple silicon, the exact 0.163.0 client build, Pro account metadata, `gpt-6.1-sol` at low effort and the default tier. The Anthropic and Google profiles use the exact clients and user-attested billing premises described above. Google also freezes the expected native permission mode. Local executable resolution checks the pinned digest without reading authentication files. Unsupported builds or native configuration locations are unavailable. The native home stays unchanged through desktop and headless startup.
+The desktop and CLI prepare one existing committed text file through `PrepareNativeRun`. The OpenAI profile requires macOS on Apple silicon, the exact 0.163.0 client build, Pro account metadata, `gpt-6.1-sol` at low effort and the default tier. The Anthropic profile uses the exact client and user-attested billing premise described above. Saved Google pilots recorded their client, billing assertions and expected native permission mode; new Google consumer launches are unavailable. Local executable resolution checks the pinned digest without reading authentication files. Unsupported builds or native configuration locations are unavailable. The native home stays unchanged through desktop and headless startup.
 
 Preparation performs no provider I/O. The controller freezes source base, path, original hash and size, task title, outcome, criteria and policy. Native trust and source consent require an explicit choice or an unexpired controller receipt for that exact scope. Saved teams do not establish native consent. Existing-credit spending defaults off; opting in changes the frozen policy and does not establish a provider hard cap. Preparation expires with its required scratch-write permission. Start rechecks the saved scope, profile and client before its five-minute execution budget begins.
 
-`StartRun` uses the same admission, leases, reservations and owned processes as the retained-patch helper. Provider-specific native metadata checks run inside that deadline. Anthropic and Google subscription premises remain user-attested; Google's configuration read observes no account identity. The controller retains the proposal, waits for quiescence and rechecks authority before applying one scratch replacement. Inspection and patch export survive restart. Each native writer permits one submission. Stop cancels an unstarted preparation or waits for active native cleanup. Writer resume, route switching, scripted continuation and handoff remain unavailable. Local acceptance uses the separate checked-candidate path below. The original checkout stays unchanged. General live routing remains unqualified.
+`StartRun` uses the same admission, leases, reservations and owned processes as the retained-patch helper. Provider-specific native metadata checks run inside that deadline. The Anthropic subscription premise remains user-attested. Prior Google configuration reads established no account identity. The controller retains the proposal, waits for quiescence and rechecks authority before applying one scratch replacement. Inspection and patch export survive restart. Each native writer permits one submission. Stop cancels an unstarted preparation or waits for active native cleanup. Writer resume, route switching, scripted continuation and handoff remain unavailable. Local acceptance uses the separate checked-candidate path below. The original checkout stays unchanged. General live routing remains unqualified.
 
 ## Candidate checks and review
 
