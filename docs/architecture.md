@@ -126,6 +126,8 @@ The controller exposes registered project and artifact IDs. It exposes no arbitr
 
 Current-state tables in SQLite are authoritative. An ordered event log explains each transition. Large outputs and source snapshots are immutable files addressed by hash.
 
+I model work as projects and tasks. A project registers the root of one Git repository, tying committed source and any accepted result branch to that repository. A task keeps one objective, its conversation, scoped permissions and retained evidence together. Workspace names the local application view. It adds no separate container or permission boundary.
+
 | Entity | Meaning |
 |--------|---------|
 | Project | A registered repository with stable identity |
