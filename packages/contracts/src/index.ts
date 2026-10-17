@@ -153,6 +153,77 @@ export const NativeProfileSchema = z.union([
   GoogleNativeProfileSchema,
   NativeRepositoryProfileSchema,
 ]);
+export const NativeFileProfileIdSchema = z.enum([
+  'openai-file-v1',
+  'anthropic-file-v1',
+  'google-file-v1',
+]);
+export const NativeHandoffTargetSchema = z
+  .strictObject({
+    profileId: NativeFileProfileIdSchema,
+    creditPolicy: z.enum(['ordinary', 'existing-credits']).default('ordinary'),
+  })
+  .refine(
+    (target) => target.profileId === 'openai-file-v1' || target.creditPolicy === 'ordinary',
+    'This recipient supports ordinary subscription usage only.',
+  );
+export const NativeHandoffTargetsSchema = z
+  .array(NativeHandoffTargetSchema)
+  .min(1)
+  .max(3)
+  .refine(
+    (targets) => new Set(targets.map((target) => target.profileId)).size === targets.length,
+    'Manual handoff recipients must be distinct.',
+  );
+const nativeHandoffAvailability = z
+  .strictObject({
+    available: z.boolean(),
+    reason: z.enum([
+      'available',
+      'writer-active',
+      'ownership-unknown',
+      'source-changed',
+      'retained-work-unavailable',
+      'recipient-unavailable',
+      'authority-unavailable',
+      'budget-exhausted',
+      'admissions-paused',
+      'already-started',
+    ]),
+  })
+  .refine((value) => value.available === (value.reason === 'available'));
+export const NativeHandoffPreviewSchema = z
+  .strictObject({
+    targets: NativeHandoffTargetsSchema,
+    currentAttemptId: AttemptIdSchema,
+    generation: RevisionSchema,
+    prepare: nativeHandoffAvailability,
+    pending: z
+      .strictObject({
+        preparationId: ArtifactIdSchema,
+        packetId: HandoffIdSchema,
+        fromAttemptId: AttemptIdSchema,
+        generation: RevisionSchema,
+        recipient: NativeHandoffTargetSchema,
+        baseHash: HashSchema,
+        bytes: RevisionSchema.max(65536),
+        expiresAt: TimestampSchema,
+        start: nativeHandoffAvailability,
+      })
+      .optional(),
+  })
+  .refine(
+    ({ targets, currentAttemptId, generation, pending }) =>
+      !pending ||
+      (pending.fromAttemptId === currentAttemptId &&
+        pending.generation === generation + 1 &&
+        targets.some(
+          (target) =>
+            target.profileId === pending.recipient.profileId &&
+            target.creditPolicy === pending.recipient.creditPolicy,
+        )),
+    'The pending handoff must select a saved recipient and the next writer generation.',
+  );
 export const NativeRunSchema = z
   .strictObject({
     runId: RunIdSchema,
@@ -161,6 +232,7 @@ export const NativeRunSchema = z
     permissionMode: GoogleNativePermissionModeSchema.optional(),
     stage: z.enum(['prepared', 'retain-only']),
     expiresAt: TimestampSchema.optional(),
+    handoff: NativeHandoffPreviewSchema.optional(),
     repository: NativeRepositoryScopeSchema.optional(),
     execution: NativeRepositoryExecutionSchema.optional(),
     target: z
@@ -178,10 +250,12 @@ export const NativeRunSchema = z
           !!run.execution &&
           !run.target &&
           !run.billingAttestation &&
-          !run.permissionMode
+          !run.permissionMode &&
+          !run.handoff
         : !run.repository && !run.execution,
     'A repository run needs its complete source scope and native execution profile.',
-  );
+  )
+  .refine((run) => !run.handoff || NativeFileProfileIdSchema.safeParse(run.profileId).success);
 
 export const FamilySchema = z.enum(['openai', 'anthropic', 'google', 'local']);
 export const TaskStateSchema = z.enum([
@@ -624,10 +698,37 @@ export const NativePreparationPayloadSchema = z.union([
     billingAttestation: NativeBillingAttestationSchema.optional(),
     permissionMode: GoogleNativePermissionModeSchema.optional(),
     targetPath: NativeTargetPathSchema,
+    handoffTargets: NativeHandoffTargetsSchema.optional(),
   }),
   z.strictObject({
     ...nativePreparationFields,
     profileId: z.literal('openai-repository-v1'),
+  }),
+]);
+const nativeHandoffPreparationFields = {
+  taskId: TaskIdSchema,
+  runId: RunIdSchema,
+  fromAttemptId: AttemptIdSchema,
+  consent: z.literal('explicit'),
+};
+export const NativeHandoffPreparationPayloadSchema = z.union([
+  z.strictObject({
+    ...nativeHandoffPreparationFields,
+    profileId: z.literal('openai-file-v1'),
+    creditPolicy: z.enum(['ordinary', 'existing-credits']).default('ordinary'),
+  }),
+  z.strictObject({
+    ...nativeHandoffPreparationFields,
+    profileId: z.literal('anthropic-file-v1'),
+    creditPolicy: z.literal('ordinary').default('ordinary'),
+    billingAttestation: NativeBillingAttestationSchema,
+  }),
+  z.strictObject({
+    ...nativeHandoffPreparationFields,
+    profileId: z.literal('google-file-v1'),
+    creditPolicy: z.literal('ordinary').default('ordinary'),
+    billingAttestation: NativeBillingAttestationSchema,
+    permissionMode: GoogleNativePermissionModeSchema,
   }),
 ]);
 export const CommandSchema = z.discriminatedUnion('command', [
@@ -660,6 +761,11 @@ export const CommandSchema = z.discriminatedUnion('command', [
     }),
   ),
   mutate('PrepareNativeRun', NativePreparationPayloadSchema),
+  mutate('PrepareNativeHandoff', NativeHandoffPreparationPayloadSchema),
+  mutate(
+    'StartNativeHandoff',
+    z.strictObject({ taskId: TaskIdSchema, runId: RunIdSchema, preparationId: ArtifactIdSchema }),
+  ),
   mutate(
     'PrepareCandidateEvaluation',
     z.discriminatedUnion('checkRecipeId', [
@@ -1229,3 +1335,5 @@ export type ReviewResult = z.infer<typeof ReviewResultSchema>;
 
 export type SourceDetails = z.infer<typeof SourceDetailsSchema>;
 export type SourceFileDetail = z.infer<typeof SourceFileDetailSchema>;
+export type NativeHandoffTarget = z.infer<typeof NativeHandoffTargetSchema>;
+export type NativeHandoffPreview = z.infer<typeof NativeHandoffPreviewSchema>;
