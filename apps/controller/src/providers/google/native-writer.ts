@@ -1025,6 +1025,7 @@ const usageOutput = z.looseObject({
 export type GoogleUsageBucket = Readonly<{
   windowId: string;
   kind: 'weekly' | 'rolling' | 'model';
+  semantics?: Observation['semantics'];
   remainingPercent: number;
   resetsAt: string;
 }>;
@@ -1033,6 +1034,12 @@ function usageWindowKind(id: string): GoogleUsageBucket['kind'] {
   if (/-weekly$/.test(id)) return 'weekly';
   if (/-\d+h$/.test(id)) return 'rolling';
   return 'model';
+}
+
+function usageWindowSemantics(id: string): Observation['semantics'] {
+  if (id === 'gemini-weekly') return { scope: 'provider', periodSeconds: 604800 };
+  if (id === 'gemini-5h') return { scope: 'provider', periodSeconds: 18000 };
+  return undefined;
 }
 
 export function projectGoogleUsage(stdout: Uint8Array): GoogleUsageBucket[] {
@@ -1049,9 +1056,11 @@ export function projectGoogleUsage(stdout: Uint8Array): GoogleUsageBucket[] {
   const fractions = new Map<string, number>();
   for (const group of parsed.data.command.data.groups)
     for (const bucket of group.buckets) {
+      const semantics = usageWindowSemantics(bucket.id);
       const next: GoogleUsageBucket = {
         windowId: bucket.id,
         kind: usageWindowKind(bucket.id),
+        ...(semantics ? { semantics } : {}),
         remainingPercent: bucket.remaining_fraction * 100,
         resetsAt: new Date(bucket.reset_time).toISOString(),
       };
@@ -1080,6 +1089,7 @@ export function googleUsageObservations(
       routeId,
       windowId: bucket.windowId,
       kind: bucket.kind,
+      ...(bucket.semantics ? { semantics: bucket.semantics } : {}),
       remaining: { value: bucket.remainingPercent, unit: 'percent' as const },
       resetsAt: bucket.resetsAt,
       observedAt,

@@ -749,6 +749,12 @@ export const ObservationSchema = z
     routeId: RouteIdSchema,
     windowId: label,
     kind: z.enum(['rolling', 'weekly', 'model', 'pool', 'local']),
+    semantics: z
+      .strictObject({
+        scope: z.enum(['provider', 'model', 'pool']),
+        periodSeconds: z.number().int().positive().max(31536000).optional(),
+      })
+      .optional(),
     remaining: z
       .strictObject({
         value: z.number().finite().nonnegative(),

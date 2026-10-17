@@ -2673,17 +2673,44 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     assert.equal(MinorAmountSchema.safeParse(value).success, false);
   for (const value of ['-1', '01', '1.5', '1'.repeat(21)])
     assert.equal(CursorSchema.safeParse(value).success, false);
+  const usageObservation = {
+    routeId: `rte_${suffix}`,
+    windowId: 'weekly',
+    kind: 'weekly',
+    remaining: { value: 80, unit: 'percent' },
+    resetsAt: null,
+    observedAt: '2026-10-15T17:00:00.000Z',
+    source: 'fixture',
+    confidence: 'reported',
+  };
+  assert.deepEqual(ObservationSchema.parse(usageObservation), usageObservation);
+  for (const semantics of [
+    { scope: 'provider', periodSeconds: 604800 },
+    { scope: 'provider', periodSeconds: 18000 },
+    { scope: 'model' },
+    { scope: 'pool', periodSeconds: 1 },
+    { scope: 'pool', periodSeconds: 31536000 },
+  ])
+    assert.deepEqual(ObservationSchema.parse({ ...usageObservation, semantics }), {
+      ...usageObservation,
+      semantics,
+    });
+  for (const semantics of [
+    null,
+    {},
+    { scope: 'account' },
+    { scope: 'provider', periodSeconds: 0 },
+    { scope: 'provider', periodSeconds: -1 },
+    { scope: 'provider', periodSeconds: 0.5 },
+    { scope: 'provider', periodSeconds: 31536001 },
+    { scope: 'provider', periodSeconds: Infinity },
+    { scope: 'provider', periodSeconds: '18000' },
+    { scope: 'provider', model: 'unobserved' },
+  ])
+    assert.equal(ObservationSchema.safeParse({ ...usageObservation, semantics }).success, false);
   assert.equal(
-    ObservationSchema.safeParse({
-      routeId: `rte_${suffix}`,
-      windowId: 'weekly',
-      kind: 'weekly',
-      remaining: { value: 101, unit: 'percent' },
-      resetsAt: null,
-      observedAt: '2026-10-15T17:00:00.000Z',
-      source: 'fixture',
-      confidence: 'reported',
-    }).success,
+    ObservationSchema.safeParse({ ...usageObservation, remaining: { value: 101, unit: 'percent' } })
+      .success,
     false,
   );
 });

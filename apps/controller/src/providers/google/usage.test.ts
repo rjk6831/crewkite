@@ -48,12 +48,14 @@ const projected: ReturnType<typeof projectGoogleUsage> = [
   {
     windowId: 'gemini-weekly',
     kind: 'weekly',
+    semantics: { scope: 'provider', periodSeconds: 604800 },
     remainingPercent: 80,
     resetsAt: '2026-10-23T14:13:03.000Z',
   },
   {
     windowId: 'gemini-5h',
     kind: 'rolling',
+    semantics: { scope: 'provider', periodSeconds: 18000 },
     remainingPercent: 30,
     resetsAt: '2026-10-16T19:13:03.000Z',
   },
@@ -82,6 +84,20 @@ test('the google quota read maps zero-turn account buckets to window observation
     ...report,
     command: { data: { groups: [{ buckets }] } },
   });
+  for (const id of ['future-weekly', 'future-5h', 'gemini-weekly-pool', 'Gemini-5h']) {
+    const [projected] = projectGoogleUsage(
+      Buffer.from(JSON.stringify(groups([bucket(id, 0.5, reset())]))),
+    );
+    assert(projected);
+    assert.equal(Object.hasOwn(projected, 'semantics'), false, id);
+    const [observation] = googleUsageObservations(
+      [projected],
+      ['rte_01M51M322B2AEBXD9MA74CBCFM'],
+      reset(),
+    );
+    assert(observation);
+    assert.equal(Object.hasOwn(observation, 'semantics'), false, id);
+  }
   for (const invalid of [
     { ...report, num_turns: 1 },
     { ...report, status: 'ERROR' },
@@ -127,6 +143,7 @@ test('the google quota read maps zero-turn account buckets to window observation
     routeId: routes[0],
     windowId: 'gemini-5h',
     kind: 'rolling',
+    semantics: { scope: 'provider', periodSeconds: 18000 },
     remaining: { value: 30, unit: 'percent' },
     resetsAt: '2026-10-16T19:13:03.000Z',
     observedAt: reset(),
