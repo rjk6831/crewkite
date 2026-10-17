@@ -21,6 +21,10 @@ Retained candidates remain inspectable and exportable through the existing permi
 
 The following sections record exact pilot mechanics and adapter limits. Prior Google evidence does not authorize new consumer launches. General live routing remains unqualified.
 
+## Google native workspace context
+
+The source-only [native task connector](../apps/controller/src/providers/google/native-extension/README.md) prepares a custom workspace MCP plugin for the provider's native app. An explicit local command selects one existing task and freezes its revision, run, source, candidate and bounded retained patch. Each tool rechecks that binding. The native app owns inference, model, effort, approvals and Stop. The connector launches no provider and exposes no controller mutation. One bounded result can be saved in an ignored sidecar labelled unverified; it establishes no check, review, accepted work or inference-stop evidence. Native plugin loading and live behavior remain unqualified. The consumer headless-wrapper restriction stays in force.
+
 ## Anthropic writer preparation
 
 The provider-local helpers project bounded authentication metadata and own a structured text proposal process. The writer requires an exact executable digest, model and session. A successful result binds one attempt, a frozen relative file path and the original content hash to at most 64 KiB of NUL-free UTF-8 text. Omitting the target preserves the original `net.mjs` behavior. A caller can shorten authentication and task execution with one absolute deadline; the bounds include owned cleanup. Synchronous callbacks record each actual process phase and one conservative submission marker before prompt input. A failed callback prevents a successful result. The writer applies no files and registers no route. Desktop and CLI preparation bind this writer to the native task flow. The installed profile remains qualification-pending while its remaining pilot checks are open. Writer selection and the supported OpenAI reviewer are independent.

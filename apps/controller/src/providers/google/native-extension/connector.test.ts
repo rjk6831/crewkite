@@ -1,0 +1,396 @@
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { once } from 'node:events';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { PassThrough } from 'node:stream';
+import { test } from 'node:test';
+import { type CommandResult, type Snapshot, SnapshotSchema } from '@crewkite/contracts';
+import { createDemoFixtures } from '../../../../../../packages/testkit/src/fixtures.ts';
+import {
+  BundleSchema,
+  type ContextClient,
+  captureContext,
+  createSession,
+  MAX_MESSAGE_BYTES,
+  privateFile,
+  serve,
+  writePrivate,
+} from './connector.ts';
+
+const suffix = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
+const at = Date.parse('2026-10-17T10:00:00.000Z');
+const hash = (text: string) => createHash('sha256').update(text).digest('hex');
+const frame = (id: number, method: string, params?: object) =>
+  JSON.stringify({ jsonrpc: '2.0', id, method, ...(params ? { params } : {}) });
+type Reply = {
+  error?: { code: number };
+  result?: {
+    isError?: boolean;
+    content?: { type: string; text: string }[];
+    tools?: { name: string }[];
+    protocolVersion?: string;
+  };
+};
+
+function fixture() {
+  const demo = createDemoFixtures();
+  const task = { ...demo.task, revision: 3, state: 'stopped' as const, runId: `run_${suffix}` };
+  const patch = 'diff --git a/net.mjs b/net.mjs\n+export const total = 1;\n';
+  const artifact = {
+    id: `art_${suffix}`,
+    hash: hash(patch),
+    bytes: Buffer.byteLength(patch),
+    mediaType: 'text/x-patch',
+  };
+  const snapshot: Snapshot = SnapshotSchema.parse({
+    ...demo.snapshot,
+    tasks: [
+      task,
+      {
+        ...task,
+        id: 'tsk_01ARZ3NDEKTSV4RRFFQ69G5FAW',
+        title: 'UNRELATED PRIVATE TASK',
+        runId: null,
+      },
+    ],
+    runs: [
+      {
+        id: task.runId,
+        taskId: task.id,
+        revision: 1,
+        source: {
+          projectId: task.projectId,
+          base: 'a'.repeat(40),
+          branch: 'main',
+          dirtyCount: 0,
+          untrackedCount: 0,
+        },
+        policy: { policy: demo.policy, hash: 'b'.repeat(64) },
+        roles: demo.roles,
+        decision: {
+          chosen: demo.roles[0].routeId,
+          rejected: [],
+          rule: 'manual',
+          inputsHash: 'c'.repeat(64),
+        },
+      },
+    ],
+    candidates: [
+      {
+        id: `cnd_${suffix}`,
+        taskId: task.id,
+        hash: 'd'.repeat(64),
+        artifactId: `art_${suffix}`,
+        revision: 0,
+      },
+    ],
+    artifacts: [artifact],
+  });
+  const commands: string[] = [];
+  let corrupt = false;
+  const client: ContextClient = {
+    snapshot: async () => structuredClone(snapshot),
+    command: async (command): Promise<CommandResult> => {
+      commands.push(command.command);
+      if (command.command === 'GetChanges')
+        return {
+          outcome: 'applied',
+          data: {
+            kind: 'changes',
+            taskId: task.id,
+            candidateId: `cnd_${suffix}`,
+            artifactId: artifact.id,
+            files: [],
+            diff: patch,
+            truncated: false,
+          },
+        };
+      assert.equal(command.command, 'GetArtifact');
+      assert.equal(command.payload.artifactId, artifact.id);
+      return {
+        outcome: 'applied',
+        data: {
+          kind: 'artifact',
+          artifact,
+          offset: 0,
+          encoding: 'base64',
+          content: Buffer.from(corrupt ? `D${patch.slice(1)}` : patch).toString('base64'),
+          eof: true,
+        },
+      };
+    },
+  };
+  return {
+    task,
+    artifact,
+    commands,
+    client,
+    patch,
+    change: (update: (value: Snapshot) => void) => update(snapshot),
+    corrupt: () => {
+      corrupt = true;
+    },
+  };
+}
+
+async function prepared(f = fixture()) {
+  const data = await captureContext(f.client, f.task.id);
+  const bundle = BundleSchema.parse({
+    version: 1,
+    workspace: '/private/tmp/selected-workspace',
+    home: '/private/tmp/selected-controller',
+    expiresAt: new Date(at + 60000).toISOString(),
+    ...data,
+  });
+  return { f, bundle };
+}
+
+async function initialize(session: ReturnType<typeof createSession>) {
+  const response = (await session.receive(
+    frame(1, 'initialize', {
+      protocolVersion: '2025-06-18',
+      capabilities: {},
+      clientInfo: { name: 'fixture', version: '1' },
+    }),
+  )) as Reply;
+  assert.equal(response.result?.protocolVersion, '2025-06-18');
+  assert.equal(
+    await session.receive(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })),
+    undefined,
+  );
+}
+
+test('native context protocol discloses only the selected current bounded task', async () => {
+  const { f, bundle } = await prepared();
+  assert.deepEqual(f.commands, ['GetChanges', 'GetArtifact']);
+  const session = createSession(bundle, {
+    client: f.client,
+    now: () => at,
+    save: () => {
+      throw Error('A read cannot save a result.');
+    },
+  });
+  const input = new PassThrough(),
+    output = new PassThrough();
+  const served = serve(input, output, session);
+  async function exchange(line: string, split = 0) {
+    const received = once(output, 'data');
+    input.write(line.slice(0, split));
+    input.write(`${line.slice(split)}\n`);
+    const [bytes] = await received;
+    assert(Buffer.isBuffer(bytes));
+    assert.equal(bytes.toString('utf8').split('\n').length, 2);
+    return JSON.parse(bytes.toString('utf8')) as Reply;
+  }
+  try {
+    const initialized = await exchange(
+      frame(1, 'initialize', { protocolVersion: '2025-06-18' }),
+      12,
+    );
+    assert.equal(initialized.result?.protocolVersion, '2025-06-18');
+    input.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
+    const listed = await exchange(frame(2, 'tools/list'));
+    assert.deepEqual(
+      listed.result?.tools?.map((tool) => tool.name),
+      ['task_context', 'retained_patch', 'submit_unverified_result'],
+    );
+    const context = await exchange(frame(3, 'tools/call', { name: 'task_context', arguments: {} }));
+    const content = context.result?.content?.[0].text ?? '';
+    assert(content.includes(f.task.id));
+    assert(!content.includes('UNRELATED PRIVATE TASK'));
+    assert(!content.includes('selected-controller'));
+    const retained = await exchange(
+      frame(4, 'tools/call', { name: 'retained_patch', arguments: {} }),
+    );
+    assert.equal(JSON.parse(retained.result?.content?.[0].text ?? '{}').patch, f.patch);
+    for (const [id, method, params, code] of [
+      [5, 'tools/call', { name: 'task_context', arguments: { taskId: 'other' } }, -32602],
+      [6, 'tools/call', { name: 'GetArtifact', arguments: { artifactId: f.artifact.id } }, -32602],
+      [7, 'tasks/create', {}, -32601],
+    ] as const)
+      assert.equal((await exchange(frame(id, method, params))).error?.code, code);
+    assert.equal((await exchange(frame(7, 'ping'))).error?.code, -32600);
+    assert.equal((await exchange('{bad json')).error?.code, -32700);
+    assert.equal((await exchange('[]')).error?.code, -32600);
+  } finally {
+    input.end();
+    await served;
+    output.destroy();
+  }
+  assert.equal(((await session.receive(frame(8, 'ping'))) as Reply).error?.code, -32000);
+
+  for (const mutate of [
+    (s: Snapshot) => {
+      s.tasks[0].revision++;
+    },
+    (s: Snapshot) => {
+      s.runs[0].source.base = 'e'.repeat(40);
+    },
+    (s: Snapshot) => {
+      s.candidates[0].hash = 'f'.repeat(64);
+    },
+    (s: Snapshot) => {
+      s.artifacts[0].hash = '0'.repeat(64);
+    },
+  ]) {
+    const row = await prepared();
+    const stale = createSession(row.bundle, {
+      client: row.f.client,
+      now: () => at,
+      save: () => assert.fail('Stale context cannot write.'),
+    });
+    await initialize(stale);
+    row.f.change(mutate);
+    assert.equal(
+      ((await stale.receive(frame(2, 'tools/call', { name: 'task_context' }))) as Reply).result
+        ?.isError,
+      true,
+    );
+  }
+  const bad = fixture();
+  bad.corrupt();
+  await assert.rejects(captureContext(bad.client, bad.task.id));
+  assert.equal(BundleSchema.safeParse({ ...bundle, patch: 'tampered' }).success, false);
+  assert.equal(
+    BundleSchema.safeParse({
+      ...bundle,
+      patch: 'x'.repeat(65536),
+      binding: {
+        ...bundle.binding,
+        patch: { ...f.artifact, bytes: 65536, hash: hash('x'.repeat(65536)) },
+      },
+    }).success,
+    false,
+  );
+  assert.equal(
+    (
+      (await createSession(bundle, { client: f.client, now: () => at, save: () => {} }).receive(
+        'x'.repeat(MAX_MESSAGE_BYTES + 1),
+      )) as Reply
+    ).error?.code,
+    -32700,
+  );
+  const oversizedInput = new PassThrough(),
+    oversizedOutput = new PassThrough();
+  let disclosed = false;
+  oversizedOutput.on('data', () => {
+    disclosed = true;
+  });
+  const bounded = serve(
+    oversizedInput,
+    oversizedOutput,
+    createSession(bundle, {
+      client: f.client,
+      now: () => at,
+      save: () => assert.fail('Oversized input cannot write.'),
+    }),
+  );
+  oversizedInput.write(Buffer.alloc(MAX_MESSAGE_BYTES + 1, 120));
+  await bounded;
+  oversizedOutput.destroy();
+  assert.equal(disclosed, false);
+});
+
+test('native results stay single unverified sidecars bound to current unexpired context', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'crewkite-context-'));
+  try {
+    const { f, bundle } = await prepared();
+    const path = join(directory, 'result.unverified.json');
+    const before = await f.client.snapshot();
+    const session = createSession(bundle, {
+      client: f.client,
+      now: () => at,
+      save: (text) => writePrivate(path, text),
+    });
+    await initialize(session);
+    for (const [id, args] of [
+      [2, { text: 'x'.repeat(32769) }],
+      [3, { text: 'safe', taskId: 'wrong' }],
+    ] as const)
+      assert.equal(
+        (
+          (await session.receive(
+            frame(id, 'tools/call', { name: 'submit_unverified_result', arguments: args }),
+          )) as Reply
+        ).error?.code,
+        -32602,
+      );
+    assert.equal(
+      (
+        (await session.receive(
+          frame(6, 'tools/call', {
+            name: 'submit_unverified_result',
+            arguments: { text: '界'.repeat(11000) },
+          }),
+        )) as Reply
+      ).result?.isError,
+      true,
+    );
+    const result = (await session.receive(
+      frame(4, 'tools/call', {
+        name: 'submit_unverified_result',
+        arguments: {
+          text: 'A proposal, not check evidence.',
+          conversationId: 'untrusted-correlation',
+        },
+      }),
+    )) as Reply;
+    assert.equal(result.result?.isError, undefined);
+    const bytes = privateFile(path, MAX_MESSAGE_BYTES);
+    const saved = JSON.parse(bytes.toString('utf8'));
+    assert.equal(saved.status, 'UNVERIFIED');
+    assert.equal(saved.binding.task.id, f.task.id);
+    assert.equal(saved.conversationIdentityVerified, false);
+    assert.equal(saved.textHash, hash(saved.text));
+    assert.equal(
+      (
+        (await session.receive(
+          frame(5, 'tools/call', {
+            name: 'submit_unverified_result',
+            arguments: { text: 'second' },
+          }),
+        )) as Reply
+      ).result?.isError,
+      true,
+    );
+    assert.throws(() => writePrivate(path, 'replacement'));
+    assert.deepEqual(readFileSync(path), bytes);
+    assert.deepEqual(await f.client.snapshot(), before);
+    symlinkSync(path, join(directory, 'alias'));
+    assert.throws(() => privateFile(join(directory, 'alias'), MAX_MESSAGE_BYTES));
+    chmodSync(path, 0o644);
+    assert.throws(() => privateFile(path, MAX_MESSAGE_BYTES));
+    chmodSync(path, 0o600);
+    for (const mode of ['cancelled', 'expired', 'stale', 'closed'] as const) {
+      const row = await prepared();
+      let now = at;
+      const gate = Promise.withResolvers<Snapshot>();
+      const waiting = createSession(row.bundle, {
+        client: { ...row.f.client, snapshot: () => gate.promise },
+        now: () => now,
+        save: () => assert.fail('Invalid context cannot save.'),
+      });
+      await initialize(waiting);
+      const pending = waiting.receive(
+        frame(2, 'tools/call', {
+          name: 'submit_unverified_result',
+          arguments: { text: 'unsafe late proposal' },
+        }),
+      );
+      if (mode === 'cancelled') waiting.cancel(2);
+      if (mode === 'expired') now = at + 60000;
+      if (mode === 'stale')
+        row.f.change((s) => {
+          s.tasks[0].revision++;
+        });
+      if (mode === 'closed') waiting.close();
+      gate.resolve(await row.f.client.snapshot());
+      const reply = (await pending) as Reply;
+      assert(reply.result?.isError || reply.error);
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
