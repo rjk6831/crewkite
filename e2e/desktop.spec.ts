@@ -1,11 +1,17 @@
 import assert from 'node:assert/strict';
-import { type ChildProcess, execFileSync, spawn } from 'node:child_process';
+import { type ChildProcess, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { _electron, expect, type Locator, test } from '@playwright/test';
+import {
+  checkEnvironment,
+  checkOwner,
+  enrollCheckRoot,
+  spawnCheckChild as spawn,
+} from '../apps/controller/src/host/check-ownership.ts';
 import { git } from '../apps/controller/src/host/source.ts';
 import { groupAbsent } from '../apps/controller/src/host/worker.ts';
 import {
@@ -17,12 +23,15 @@ import {
 import { type Event, EventSchema, SnapshotSchema } from '../packages/contracts/src/index.ts';
 
 const root = resolve(import.meta.dirname, '..');
-const internal = existsSync(join(root, 'internal/tools'))
-  ? dirname(realpathSync(join(root, 'internal/tools')))
-  : join(root, 'internal');
+const internal =
+  checkOwner()?.stateRoot ??
+  (existsSync(join(root, 'internal/tools'))
+    ? dirname(realpathSync(join(root, 'internal/tools')))
+    : join(root, 'internal'));
 const node = process.execPath;
 const require = createRequire(join(root, 'apps/desktop/package.json'));
 const environment = (home: string) => ({
+  ...checkEnvironment(),
   PATH: process.env.PATH ?? '',
   LANG: 'en_US.UTF-8',
   ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
@@ -39,7 +48,7 @@ function bounded<T>(pending: Promise<T>, milliseconds: number, label: string): P
 }
 function launchController(home: string, nativeFixture = false) {
   const bootstrap = `
-    import {spawn} from 'node:child_process';
+    import {spawnCheckChild as spawn} from ${JSON.stringify(join(root, 'apps/controller/src/host/check-ownership.ts'))};
     import {createHash} from 'node:crypto';
     import {mkdirSync,readFileSync,writeFileSync} from 'node:fs';
     import {join} from 'node:path';
@@ -232,6 +241,8 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
   test.setTimeout(120000);
   mkdirSync(internal, { recursive: true });
   const home = mkdtempSync(join(internal, 'journey-'));
+  if (checkOwner() && Buffer.byteLength(join(home, 'control.sock')) > 100)
+    throw Error('The verification journey socket path exceeds its bound.');
   const profile = join(home, 'profile');
   const destination = join(home, 'candidate.patch');
   const timeline = new Timeline();
@@ -253,12 +264,14 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
       actor: { id: 'journey-observer', kind: 'cli' },
     });
     await observer.subscribe('0', (event) => timeline.append(event));
+    const electronRoot = enrollCheckRoot('electron', true);
     application = await _electron.launch({
-      executablePath: require('electron'),
+      executablePath: checkOwner()?.electronExecutable ?? require('electron'),
       chromiumSandbox: true,
       args: [join(root, 'apps/desktop')],
       env: {
         ...environment(home),
+        ...electronRoot.environment,
         ...(process.env.DISPLAY ? { DISPLAY: process.env.DISPLAY } : {}),
         ...(process.env.XAUTHORITY ? { XAUTHORITY: process.env.XAUTHORITY } : {}),
         CREWKITE_PROFILE: profile,
@@ -269,6 +282,7 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     });
     const child = application.process();
     assert(child);
+    electronRoot.acknowledge(child);
     const closed = Promise.withResolvers<void>();
     desktop = { child, closed: closed.promise, closeObserved: false };
     child.once('close', () => {
@@ -960,7 +974,32 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     );
     await nativeTrust.check();
     await reviewerCredits.check();
+    await recipe.selectOption('crewkite-verify-v1');
+    await expect(nativeTrust).not.toBeChecked();
+    await expect(reviewerCredits).not.toBeChecked();
+    await expect(evaluationPanel).toContainText('Local Node and Git are verified.');
+    await expect(evaluationPanel).toContainText(
+      'Staging, checks and cleanup share a five-minute limit.',
+    );
+    const verificationPermission = evaluationPanel.getByLabel(
+      'Allow one full local verification run',
+      { exact: true },
+    );
+    await expect(verificationPermission).not.toBeChecked();
+    await recipe.scrollIntoViewIfNeeded();
+    await page.screenshot({
+      path: join(internal, 'crewkite-verification-preparation-dark.png'),
+      animations: 'disabled',
+    });
+    await nativeTrust.check();
+    await reviewerCredits.check();
+    await verificationPermission.check();
     await recipe.selectOption('project-node-tests-v1');
+    await expect(
+      evaluationPanel.getByLabel('Allow one local run of the selected project tests', {
+        exact: true,
+      }),
+    ).not.toBeChecked();
     await expect(nativeTrust).not.toBeChecked();
     await expect(reviewerCredits).not.toBeChecked();
     const evaluationPermissions = [

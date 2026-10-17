@@ -42,6 +42,16 @@ export function git(
   input?: Buffer | string,
   identity?: { name: string; email: string; at: string },
 ): Buffer {
+  return runGit(directory, args, input, identity, MAX_SOURCE_BYTES);
+}
+
+function runGit(
+  directory: string,
+  args: string[],
+  input: Buffer | string | undefined,
+  identity: { name: string; email: string; at: string } | undefined,
+  maximumBytes: number,
+): Buffer {
   return execFileSync(
     'git',
     [
@@ -63,7 +73,7 @@ export function git(
     {
       cwd: directory,
       input,
-      maxBuffer: MAX_SOURCE_BYTES,
+      maxBuffer: maximumBytes,
       env: {
         PATH: process.env.PATH,
         LC_ALL: 'C',
@@ -319,24 +329,51 @@ export function committedFiles(path: string, base: string): FileContent[] {
   if (records.length > 10000) throw new Error('Source exceeds the file limit.');
   const seen = new Set<string>();
   const prefixes = new Map<string, string>();
-  let total = 0;
-  return records.map((record) => {
+  const selected = records.map((record) => {
     const match = /^(100644|100755) blob ([a-f0-9]{40}|[a-f0-9]{64})\t(.+)$/s.exec(record);
     if (!match) throw new Error('Source contains a symlink, submodule or unsupported mode.');
     const [, mode, oid, name] = match;
     safePath(name, seen, prefixes);
-    let bytes: Buffer;
-    try {
-      bytes = git(path, ['cat-file', 'blob', oid]);
-    } catch {
-      throw new Error(
-        'A committed blob is unavailable locally. Fetch it outside this workspace and prepare again.',
-      );
-    }
-    total += bytes.length;
-    if (total > MAX_SOURCE_BYTES) throw new Error('Source exceeds the byte limit.');
-    return content(name, mode as FileEntry['mode'], bytes);
+    return { mode: mode as FileEntry['mode'], oid, name };
   });
+  if (!selected.length) return [];
+  let batch: Buffer;
+  try {
+    batch = runGit(
+      path,
+      ['cat-file', '--batch'],
+      `${selected.map((file) => file.oid).join('\n')}\n`,
+      undefined,
+      MAX_SOURCE_BYTES + selected.length * 96,
+    );
+  } catch {
+    throw new Error(
+      'A committed blob is unavailable locally. Fetch it outside this workspace and prepare again.',
+    );
+  }
+  let offset = 0,
+    total = 0;
+  const files = selected.map(({ mode, oid, name }) => {
+    const end = batch.indexOf(10, offset);
+    if (end < offset || end - offset > 96) throw Error('Invalid committed blob response.');
+    const header = /^([a-f0-9]{40}|[a-f0-9]{64}) blob (0|[1-9][0-9]*)$/.exec(
+      batch.subarray(offset, end).toString('utf8'),
+    );
+    if (!header || header[1] !== oid)
+      throw Error('A committed blob is unavailable locally or changed identity.');
+    const size = Number(header[2]);
+    total += size;
+    if (!Number.isSafeInteger(size) || total > MAX_SOURCE_BYTES)
+      throw Error('Source exceeds the byte limit.');
+    offset = end + 1;
+    if (offset + size >= batch.length || batch[offset + size] !== 10)
+      throw Error('Incomplete committed blob response.');
+    const bytes = batch.subarray(offset, offset + size);
+    offset += size + 1;
+    return content(name, mode, bytes);
+  });
+  if (offset !== batch.length) throw Error('Unexpected committed blob response.');
+  return files;
 }
 
 export function readFiles(root: string): FileContent[] {
@@ -480,13 +517,43 @@ export function materialize(root: string, files: readonly FileContent[]) {
 }
 
 export function treeFromFiles(repository: string, files: readonly FileContent[]): string {
+  if (files.length > 10000) throw Error('Source exceeds the file limit.');
+  const seen = new Set<string>(),
+    prefixes = new Map<string, string>();
+  let total = 0;
+  for (const file of files) {
+    safePath(file.path, seen, prefixes);
+    if (!['100644', '100755'].includes(file.mode) || !Buffer.isBuffer(file.content))
+      throw Error('Source contains an unsupported file.');
+    total += file.content.length;
+    if (total > MAX_SOURCE_BYTES) throw Error('Source exceeds the byte limit.');
+  }
   mkdirSync(repository, { recursive: true, mode: 0o700 });
   git(repository, ['init', '--quiet']);
   git(repository, ['read-tree', '--empty']);
-  const entries = files.map((file) => {
-    const oid = git(repository, ['hash-object', '-w', '--stdin'], file.content).toString().trim();
-    return `${file.mode} ${oid}\t${file.path}\0`;
-  });
+  const commands = files.flatMap((file, index) => [
+    Buffer.from(`blob\nmark :${index + 1}\ndata ${file.content.length}\n`),
+    file.content,
+    Buffer.from(`\nget-mark :${index + 1}\n`),
+  ]);
+  const imported = files.length
+    ? git(
+        repository,
+        ['fast-import', '--quiet', '--done'],
+        Buffer.concat([...commands, Buffer.from('done\n')]),
+      )
+        .toString('utf8')
+        .trim()
+        .split('\n')
+    : [];
+  if (
+    imported.length !== files.length ||
+    imported.some(
+      (oid) => !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(oid) || oid.length !== imported[0].length,
+    )
+  )
+    throw Error('Invalid imported blob identities.');
+  const entries = files.map((file, index) => `${file.mode} ${imported[index]}\t${file.path}\0`);
   git(repository, ['update-index', '-z', '--index-info'], entries.join(''));
   return git(repository, ['write-tree']).toString().trim();
 }

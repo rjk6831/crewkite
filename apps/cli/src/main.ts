@@ -37,7 +37,7 @@ const help = `Usage: crewkite task <list|show|watch|start|stop|resume|switch|app
        crewkite native profiles [--json] [--home path]
        crewkite task prepare-native <task-id> <profile-id> <path> --policy file [--native-trust --source-consent] [--existing-credits] [--confirm-subscription-only] [--permission-mode mode]
        crewkite task prepare-repository <task-id> <profile-id> --policy file [--native-trust --source-consent] [--existing-credits]
-       crewkite task prepare-evaluation <task-id> <profile-id> --grants file [--recipe node-tests-v1|project-node-tests-v1] [--test-file path ...] [--native-trust --source-consent] [--existing-credits]
+       crewkite task prepare-evaluation <task-id> <profile-id> --grants file [--recipe node-tests-v1|project-node-tests-v1|crewkite-verify-v1] [--test-file path ...] [--native-trust --source-consent] [--existing-credits]
        crewkite task <start-checks|start-review> <task-id> [--json] [--home path]
        crewkite task accept <task-id> <destination-ref> [--json] [--home path]
        crewkite task changes <task-id> [--json] [--home path]
@@ -153,9 +153,9 @@ export async function runCli(
     if (!evaluating && (values.recipe !== undefined || values['test-file'] !== undefined))
       throw new Error('Check recipe options require task prepare-evaluation.');
     const recipe = values.recipe ?? 'node-tests-v1';
-    if (!['node-tests-v1', 'project-node-tests-v1'].includes(recipe))
-      throw new Error('Choose node-tests-v1 or project-node-tests-v1.');
-    if (recipe === 'node-tests-v1' && values['test-file'] !== undefined)
+    if (!['node-tests-v1', 'project-node-tests-v1', 'crewkite-verify-v1'].includes(recipe))
+      throw new Error('Choose node-tests-v1, project-node-tests-v1 or crewkite-verify-v1.');
+    if (recipe !== 'project-node-tests-v1' && values['test-file'] !== undefined)
       throw new Error('Test files require --recipe project-node-tests-v1.');
     const checkRecipe =
       recipe === 'project-node-tests-v1'
@@ -163,7 +163,9 @@ export async function runCli(
             checkRecipeId: 'project-node-tests-v1' as const,
             testFiles: ProjectNodeTestFilesSchema.parse(values['test-file'] ?? []),
           }
-        : { checkRecipeId: 'node-tests-v1' as const };
+        : recipe === 'crewkite-verify-v1'
+          ? { checkRecipeId: 'crewkite-verify-v1' as const }
+          : { checkRecipeId: 'node-tests-v1' as const };
     if (
       !preparing &&
       !evaluating &&
@@ -653,6 +655,20 @@ export async function runCli(
               (file) =>
                 `Test file ${terminalText(file.path)}, ${file.hash}, ${file.bytes} bytes, ${file.mode}`,
             ),
+            ...(evaluation.verification
+              ? [
+                  `Stages ${evaluation.verification.stages.join(', ')}`,
+                  `Maximum ${evaluation.verification.maximumMinutes} minutes including staging and cleanup`,
+                  `Platform ${evaluation.verification.platform}, ${evaluation.verification.arch}`,
+                  `Toolchain ${evaluation.verification.toolchainHash}`,
+                  `Baseline ${evaluation.verification.baselineHash}`,
+                  `Lockfile ${evaluation.verification.lockHash}`,
+                  ...Object.entries(evaluation.verification.executables).map(
+                    ([name, executable]) =>
+                      `${name} ${terminalText(executable.version)}, ${executable.sha256}`,
+                  ),
+                ]
+              : []),
             `Candidate ${evaluation.candidateHash}`,
             ...(evaluation.repository
               ? [

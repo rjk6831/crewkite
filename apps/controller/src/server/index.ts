@@ -72,6 +72,38 @@ export async function serve(
           throw error;
         }
       };
+      const respond = async (command: Command) => {
+        try {
+          const result = await controller.execute(command, 'local-owner');
+          try {
+            encodeFrame({ type: 'result', key: command.key, result });
+            send({ type: 'result', key: command.key, result });
+          } catch {
+            send({
+              type: 'result',
+              key: command.key,
+              result: {
+                outcome: 'expectedRevision' in command ? 'outcome-unknown' : 'blocked',
+                reason: 'response-too-large',
+                next:
+                  'expectedRevision' in command
+                    ? 'Read current state and retry the exact command key.'
+                    : 'Request bounded artifact chunks or reduce the retained snapshot.',
+              },
+            });
+          }
+        } catch {
+          send({
+            type: 'result',
+            key: command.key,
+            result: {
+              outcome: 'outcome-unknown',
+              reason: 'command-could-not-complete',
+              next: 'Refresh state and retry the same command key.',
+            },
+          });
+        }
+      };
       const reject = (reason: Extract<TransportMessage, { type: 'error' }>['reason']) => {
         try {
           send({
@@ -113,6 +145,7 @@ export async function serve(
             }
             queued++;
             const command = message.command;
+            let detached = false;
             pending = pending
               .then(async () => {
                 if (socket.destroyed) return;
@@ -134,42 +167,25 @@ export async function serve(
                   }
                   return;
                 }
-                try {
-                  const result = await controller.execute(command, 'local-owner');
-                  try {
-                    encodeFrame({ type: 'result', key: command.key, result });
-                    send({ type: 'result', key: command.key, result });
-                  } catch {
-                    send({
-                      type: 'result',
-                      key: command.key,
-                      result: {
-                        outcome: 'expectedRevision' in command ? 'outcome-unknown' : 'blocked',
-                        reason: 'response-too-large',
-                        next:
-                          'expectedRevision' in command
-                            ? 'Read current state and retry the exact command key.'
-                            : 'Request bounded artifact chunks or reduce the retained snapshot.',
-                      },
+                if (
+                  command.command === 'PrepareCandidateEvaluation' &&
+                  command.payload.checkRecipeId === 'crewkite-verify-v1'
+                ) {
+                  detached = true;
+                  void respond(command)
+                    .catch(() => socket.destroy())
+                    .finally(() => {
+                      queued--;
                     });
-                  }
-                } catch {
-                  send({
-                    type: 'result',
-                    key: command.key,
-                    result: {
-                      outcome: 'outcome-unknown',
-                      reason: 'command-could-not-complete',
-                      next: 'Refresh state and retry the same command key.',
-                    },
-                  });
+                  return;
                 }
+                await respond(command);
               })
               .catch(() => {
                 socket.destroy();
               })
               .finally(() => {
-                queued--;
+                if (!detached) queued--;
               });
           }
         } catch (error) {

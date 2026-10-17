@@ -13,9 +13,13 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
+import {
+  copyInstalledDependencies,
+  inspectInstalledDependencies,
+} from '../apps/controller/src/host/toolchain.ts';
 
 const source = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const git = (...args) => execFileSync('git', args, { cwd: source, encoding: 'utf8' }).trim();
@@ -68,14 +72,6 @@ for (const path of bootstrapFiles)
   if (!lstatSync(join(checkout, path)).isFile())
     throw new Error(`The committed desktop bootstrap must be a regular file: ${path}.`);
 const lockHash = hash(join(checkout, 'pnpm-lock.yaml'));
-if (hash(join(source, 'pnpm-lock.yaml')) !== lockHash)
-  throw new Error('The installed dependency source uses a different lockfile.');
-// The existing installation has already passed repository checks. No lifecycle code runs here.
-cpSync(join(source, 'node_modules'), join(checkout, 'node_modules'), {
-  recursive: true,
-  verbatimSymlinks: true,
-  filter: (path) => !['.pnpm-store', '.pnpm-cache', '.pnpm-state'].includes(basename(path)),
-});
 const workspaces = [
   'apps/controller',
   'apps/cli',
@@ -84,28 +80,20 @@ const workspaces = [
   'packages/client',
   'packages/testkit',
 ];
-const buildDependencies = [];
-for (const path of ['.', ...workspaces]) {
-  if (path !== '.') copy(join(source, path, 'node_modules'), join(checkout, path, 'node_modules'));
-  const manifestPath = join(checkout, path, 'package.json');
-  if (hash(join(source, path, 'package.json')) !== hash(manifestPath))
-    throw new Error('The installed dependency source uses a different workspace manifest.');
-  const manifest = json(manifestPath);
-  for (const [name, version] of Object.entries({
-    ...manifest.dependencies,
-    ...manifest.devDependencies,
-  })) {
-    if (version === 'workspace:*') continue;
-    const installedPath = realpathSync(
-      join(dirname(manifestPath), 'node_modules', name, 'package.json'),
-    );
-    inside(installedPath, checkout);
-    const installed = json(installedPath);
-    if (installed.name !== name || installed.version !== version)
-      throw new Error(`Installed dependency identity changed: ${name}.`);
-    buildDependencies.push({ name, version, manifest: hash(installedPath) });
-  }
-}
+const copyBudget = {
+  deadline: Date.now() + 120000,
+  now: Date.now,
+  maximumEntries: 500000,
+  maximumBytes: 8 * 1024 * 1024 * 1024,
+};
+// The existing installation has already passed repository checks. No lifecycle code runs here.
+const dependencies = await inspectInstalledDependencies(source, workspaces, copyBudget);
+const { buildDependencies } = await copyInstalledDependencies(
+  source,
+  checkout,
+  dependencies,
+  copyBudget,
+);
 function validateLinks(directory) {
   for (const name of readdirSync(directory)) {
     const path = join(directory, name);

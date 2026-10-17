@@ -10,6 +10,7 @@ import {
   mkdtempSync,
   openSync,
   readFileSync,
+  realpathSync,
 } from 'node:fs';
 import { basename, isAbsolute, join } from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -86,10 +87,20 @@ import { ArtifactFiles } from '../artifacts/index.ts';
 import { buildHandoff } from '../continuity/index.ts';
 import {
   CandidateEvidence,
+  type CheckDefinition,
+  CheckDefinitionSchema,
   type CheckPlan,
   completedCheckDefinitionMatches,
-  NodeCheckDefinitionSchema,
 } from '../evidence/index.ts';
+import {
+  assertVerificationSource,
+  prepareToolchain,
+  type ToolchainPreparation,
+  verificationPreview,
+  verificationTarget,
+} from '../evidence/toolchain-definition.ts';
+import { ToolchainVerification } from '../evidence/toolchain-verify.ts';
+import { type CheckOwner, inspectCheckRoots, parseCheckOwner } from '../host/check-ownership.ts';
 import {
   applyPublication,
   type GitIdentity,
@@ -106,6 +117,7 @@ import {
   projectRoot,
   readFiles,
 } from '../host/source.ts';
+import type { DependencyInventory } from '../host/toolchain.ts';
 import {
   closedWithin,
   defaultSchedule,
@@ -246,32 +258,45 @@ const EvaluationConsentSchema = z.strictObject({
   scopeHash: HashSchema,
   expiresAt: TimestampSchema,
 });
-const CandidateEvaluationSchema = z.strictObject({
-  run: RunSchema,
-  writer: AttemptSchema,
-  candidate: CandidateSchema,
-  context: z.strictObject({
-    title: z.string().min(1).max(200),
-    outcome: z.string().min(1).max(4096),
-    criteria: z.array(z.string().min(1).max(4096)).min(1).max(100),
-  }),
-  definition: NodeCheckDefinitionSchema,
-  reviewer: z.strictObject({
-    profileId: z.string().min(1).max(200),
-    methodId: ReviewMethodIdSchema,
-    cycles: z.literal(1),
-    role: ReviewMethodSchema.shape.reviewerRole,
-    profile: NativeProfileSchema,
-    client: NativeFileAppointmentSchema.shape.client,
-    locationHash: HashSchema,
-  }),
-  creditPolicy: z.enum(['ordinary', 'existing-credits']),
-  grants: z.array(GrantSchema).length(2),
-  remaining: RemainingBudgetsSchema,
-  maximumCheckMinutes: z.literal(1),
-  scopeHash: HashSchema,
-  expiresAt: TimestampSchema,
-});
+const CandidateEvaluationSchema = z
+  .strictObject({
+    run: RunSchema,
+    writer: AttemptSchema,
+    candidate: CandidateSchema,
+    context: z.strictObject({
+      title: z.string().min(1).max(200),
+      outcome: z.string().min(1).max(4096),
+      criteria: z.array(z.string().min(1).max(4096)).min(1).max(100),
+    }),
+    definition: CheckDefinitionSchema,
+    reviewer: z.strictObject({
+      profileId: z.string().min(1).max(200),
+      methodId: ReviewMethodIdSchema,
+      cycles: z.literal(1),
+      role: ReviewMethodSchema.shape.reviewerRole,
+      profile: NativeProfileSchema,
+      client: NativeFileAppointmentSchema.shape.client,
+      locationHash: HashSchema,
+    }),
+    creditPolicy: z.enum(['ordinary', 'existing-credits']),
+    grants: z.array(GrantSchema).length(2),
+    remaining: RemainingBudgetsSchema,
+    maximumCheckMinutes: z.union([z.literal(1), z.literal(5)]),
+    verification: z
+      .strictObject({ source: z.string().max(4096).refine(isAbsolute), inventory: ArtifactSchema })
+      .optional(),
+    scopeHash: HashSchema,
+    expiresAt: TimestampSchema,
+  })
+  .refine((plan) =>
+    plan.definition.recipeId === 'crewkite-verify-v1'
+      ? plan.maximumCheckMinutes === 5 &&
+        !!plan.verification &&
+        plan.verification.inventory.hash === plan.definition.inventory.hash &&
+        plan.verification.inventory.bytes === plan.definition.inventory.bytes
+      : plan.maximumCheckMinutes === 1 && !Object.hasOwn(plan, 'verification'),
+  );
+type PreparedVerification = ToolchainPreparation & { lineageHash: string; sourcePath: string };
 type NativeOutcome = {
   metadata:
     | Awaited<ReturnType<typeof startReplacement>['result']>['metadata']
@@ -350,8 +375,10 @@ export type ControllerOptions = {
   nativeProfile?: () => NativeProfileResolution;
   nativeProfiles?: () => NativeProfileResolution[];
   nativeSpawn?: Parameters<typeof startReplacement>[2]['spawn'];
+  prepareVerification?: typeof prepareToolchain;
 };
 const migrations = fileURLToPath(new URL('../../migrations/', import.meta.url));
+const runtimeRoot = fileURLToPath(new URL('../../../../', import.meta.url));
 
 export class Controller {
   readonly store!: Store;
@@ -364,7 +391,15 @@ export class Controller {
   private readonly cancelledJobs = new Set<string>();
   private readonly jobCancels = new Map<string, () => void>();
   private readonly reviewWorkers = new Map<string, OwnedWorker>();
-  private readonly jobs = new Map<string, OwnedCommand>();
+  private readonly jobs = new Map<string, OwnedCommand | ToolchainVerification>();
+  private verificationPreparation?: {
+    key: string;
+    hash: string;
+    principal: string;
+    taskId: string;
+    abort: AbortController;
+    promise: Promise<CommandResult>;
+  };
   private readonly nativeReviewWorkers = new Map<string, NativeReviewRuntime>();
   private readonly owner: DatabaseSync;
   private closed = false;
@@ -456,6 +491,15 @@ export class Controller {
         next: 'Send a valid protocol 1 command.',
       };
     const command = parsed.data;
+    const preparing = this.verificationPreparation;
+    if (preparing?.key === command.key)
+      return preparing.hash === hashCanonical(command) && preparing.principal === principal
+        ? preparing.promise
+        : {
+            outcome: 'denied',
+            reason: 'idempotency-key-reused',
+            next: 'Use a new key for changed command content.',
+          };
     if (
       command.command === 'ResumeRun' &&
       this.store.receipt(`native-run:${command.payload.runId}`)
@@ -488,6 +532,23 @@ export class Controller {
         };
       }
     }
+    if (
+      command.command === 'PrepareCandidateEvaluation' &&
+      command.payload.checkRecipeId === 'crewkite-verify-v1' &&
+      !this.store.receipt(command.key) &&
+      !this.checkRevision(command)
+    )
+      return this.prepareVerificationCommand(command, principal);
+    return this.commitCommand(command, principal, preflightFailure);
+  }
+
+  private commitCommand(
+    command: Command,
+    principal: string,
+    preflightFailure?: CommandResult,
+    verification?: PreparedVerification,
+  ): CommandResult {
+    if (this.closed) return { outcome: 'blocked', reason: 'controller-closing' };
     const hash = hashCanonical(command);
     const effects: (() => void)[] = [];
     const result = this.store.transaction<CommandResult>(() => {
@@ -507,7 +568,7 @@ export class Controller {
       }
       const stale = this.checkRevision(command);
       const result = CommandResultSchema.parse(
-        stale ?? preflightFailure ?? this.apply(command, effects),
+        stale ?? preflightFailure ?? this.apply(command, effects, verification),
       );
       this.store.saveReceipt(command.key, hash, principal, result);
       return result;
@@ -556,7 +617,11 @@ export class Controller {
   close(): void | Promise<void> {
     if (this.closed) return this.closing;
     this.closed = true;
-    const native: Promise<void>[] = [];
+    const native: Promise<unknown>[] = [];
+    if (this.verificationPreparation) {
+      this.verificationPreparation.abort.abort();
+      native.push(this.verificationPreparation.promise);
+    }
     for (const runtime of this.workers.values()) {
       if (runtime.kind === 'native') {
         runtime.stopped = true;
@@ -573,7 +638,10 @@ export class Controller {
       native.push(runtime.done);
     }
     for (const cancel of this.jobCancels.values()) cancel();
-    for (const job of this.jobs.values()) job.stop();
+    for (const job of this.jobs.values()) {
+      job.stop();
+      if (job instanceof ToolchainVerification) native.push(job.closed);
+    }
     for (const worker of this.reviewWorkers.values()) worker.child.stdin.end();
     const finish = () => {
       try {
@@ -610,7 +678,11 @@ export class Controller {
       };
   }
 
-  private apply(command: Command, effects: (() => void)[]): CommandResult {
+  private apply(
+    command: Command,
+    effects: (() => void)[],
+    verification?: PreparedVerification,
+  ): CommandResult {
     if ('taskId' in command.payload && ['ResumeRun', 'SwitchRoute'].includes(command.command)) {
       const task = this.store.get<Task>('task', command.payload.taskId);
       if (task?.runId && this.store.receipt(`native-run:${task.runId}`))
@@ -727,7 +799,7 @@ export class Controller {
       case 'PrepareNativeRun':
         return this.prepareNative(command);
       case 'PrepareCandidateEvaluation':
-        return this.prepareEvaluation(command);
+        return this.prepareEvaluation(command, verification);
       case 'StartCandidateEvaluation':
         return this.startEvaluation(command, effects);
       case 'StartCandidateReview':
@@ -739,8 +811,13 @@ export class Controller {
         return this.resolve(command, effects);
       case 'SwitchRoute':
         return this.switchRoute(command, effects);
-      case 'StopRun':
-        return this.stop(command, effects);
+      case 'StopRun': {
+        const result = this.stop(command, effects);
+        const pending = this.verificationPreparation;
+        if (result.outcome === 'applied' && pending?.taskId === command.payload.taskId)
+          effects.push(() => pending.abort.abort());
+        return result;
+      }
       case 'PauseAdmissions': {
         const task = this.store.get<Task>('task', command.payload.taskId);
         const run = this.store.get<Run>('run', command.payload.runId);
@@ -1640,77 +1717,226 @@ export class Controller {
     return { task, run, writer, candidate, native: plan };
   }
 
+  private evaluationInputs(command: Extract<Command, { command: 'PrepareCandidateEvaluation' }>) {
+    const { task, run, writer, candidate } = this.evaluationOrigin(
+      command.payload.taskId,
+      command.payload.candidateId,
+    );
+    if (
+      task.state !== 'stopped' ||
+      this.store.receipt(`evaluation-started:${run.id}`) ||
+      this.store.receipt(`paused:${run.id}`)
+    )
+      throw Error('Evaluation is unavailable.');
+    const methods = run.policy.policy.methods ?? [];
+    const selected = command.payload.reviewer;
+    if (
+      methods.length !== 1 ||
+      methods[0].id !== selected.methodId ||
+      methods[0].cycles !== selected.cycles ||
+      !requiredReviewMethodIds(run.policy.policy.quality).every(
+        (method) => method === selected.methodId,
+      )
+    )
+      throw Error('The selected evaluation cannot cover the saved quality floor.');
+    const profile = this.profileFor(selected.profileId);
+    if (
+      !profile.facts.available ||
+      profile.facts.family !== 'openai' ||
+      profile.facts.id !== 'openai-file-v1' ||
+      profile.facts.id !== selected.profileId ||
+      !profile.facts.creditPolicies.some((policy) => policy === command.payload.creditPolicy) ||
+      !profile.client ||
+      !profile.locationHash ||
+      !profile.environment
+    )
+      throw Error('The reviewer profile is unavailable.');
+    const remaining = remainingBudgets(run, this.store.intents());
+    if (
+      remaining.attempts < 2 ||
+      remaining.minutes < (command.payload.checkRecipeId === 'crewkite-verify-v1' ? 6 : 2) ||
+      remaining.concurrency < 1
+    )
+      throw Error('The saved budget cannot cover one check and one review.');
+    const expected = [
+      command.payload.checkRecipeId === 'crewkite-verify-v1' ? verificationTarget : 'node --test',
+      formatReviewTarget({ methodId: selected.methodId, cycle: 1 }),
+    ];
+    const grants = command.payload.grants;
+    if (
+      grants.some(
+        (grant) =>
+          grant.taskId !== task.id ||
+          grant.revoked ||
+          grant.usesRemaining !== 1 ||
+          Date.parse(grant.expiresAt) <= Date.parse(this.now()) ||
+          this.store.receipt(this.grantKey(grant)),
+      ) ||
+      grants.filter((grant) => grant.action === 'run-check' && grant.target === expected[0])
+        .length !== 1 ||
+      grants.filter((grant) => grant.action === 'run-review' && grant.target === expected[1])
+        .length !== 1
+    )
+      throw Error('Exact check and review grants are required.');
+    return {
+      task,
+      run,
+      writer,
+      candidate,
+      methods,
+      selected,
+      profile,
+      client: profile.client,
+      locationHash: profile.locationHash,
+      remaining,
+      grants,
+    };
+  }
+  private verificationLineage(input: ReturnType<Controller['evaluationInputs']>) {
+    return hashCanonical({
+      task: input.task,
+      run: input.run,
+      writer: input.writer,
+      candidate: input.candidate,
+      reviewer: {
+        profile: input.profile.facts,
+        client: input.client,
+        locationHash: input.locationHash,
+      },
+    });
+  }
+
+  private prepareVerificationCommand(
+    command: Extract<Command, { command: 'PrepareCandidateEvaluation' }>,
+    principal: string,
+  ): Promise<CommandResult> {
+    const hash = hashCanonical(command);
+    const prior = this.verificationPreparation;
+    if (prior) {
+      if (prior.key === command.key)
+        return prior.hash === hash && prior.principal === principal
+          ? prior.promise
+          : Promise.resolve({ outcome: 'denied', reason: 'idempotency-key-reused' });
+      return Promise.resolve({
+        outcome: 'blocked',
+        reason: 'verification-preparation-busy',
+        next: 'Wait for the current verification preparation to finish.',
+      });
+    }
+    const abort = new AbortController();
+    const promise = Promise.resolve().then(async () => {
+      let verification: PreparedVerification | undefined;
+      let failure: CommandResult | undefined;
+      const timer = setTimeout(() => abort.abort(), 60000);
+      try {
+        const inputs = this.evaluationInputs(command);
+        const sourcePath = this.projectPath(inputs.task.projectId) as string;
+        let provenancePattern = process.env.PROVENANCE_PATTERN?.trim();
+        if (!provenancePattern)
+          try {
+            provenancePattern = readFileSync(
+              join(runtimeRoot, 'internal/provenance-pattern.txt'),
+              'utf8',
+            ).trim();
+          } catch {}
+        if (!provenancePattern) {
+          failure = {
+            outcome: 'blocked',
+            reason: 'verification-policy-unavailable',
+            next: 'This source-configured recipe needs the installed trusted verification policy.',
+          };
+        } else {
+          new RegExp(provenancePattern, 'i');
+          const prepared = await (this.options.prepareVerification ?? prepareToolchain)({
+            root: sourcePath,
+            runtimeRoot,
+            candidateId: inputs.candidate.id,
+            candidateHash: inputs.candidate.hash,
+            source: committedFiles(sourcePath, inputs.run.source.base),
+            candidate: this.evidence.read(inputs.candidate).files,
+            criteria: inputs.task.criteria,
+            provenancePattern,
+            git: '/usr/bin/git',
+            budget: {
+              deadline: performance.now() + 60000,
+              now: () => performance.now(),
+              maximumEntries: 500000,
+              maximumBytes: 8 * 1024 * 1024 * 1024,
+              signal: abort.signal,
+            },
+          });
+          verification = { ...prepared, lineageHash: this.verificationLineage(inputs), sourcePath };
+        }
+      } catch {
+        failure = {
+          outcome: 'blocked',
+          reason: 'verification-preparation-unavailable',
+          next: 'Inspect the source-configured recipe, installed dependencies, local execution grants and remaining limits.',
+        };
+      } finally {
+        clearTimeout(timer);
+      }
+      return this.commitCommand(command, principal, failure, verification);
+    });
+    const pending = {
+      key: command.key,
+      hash,
+      principal,
+      taskId: command.payload.taskId,
+      abort,
+      promise,
+    };
+    this.verificationPreparation = pending;
+    void promise
+      .finally(() => {
+        if (this.verificationPreparation === pending) this.verificationPreparation = undefined;
+      })
+      .catch(() => {});
+    return promise;
+  }
+
   private prepareEvaluation(
     command: Extract<Command, { command: 'PrepareCandidateEvaluation' }>,
+    verification?: PreparedVerification,
   ): CommandResult {
     let plan: z.infer<typeof CandidateEvaluationSchema>;
     let scopeHash: string;
     try {
-      const { task, run, writer, candidate } = this.evaluationOrigin(
-        command.payload.taskId,
-        command.payload.candidateId,
-      );
-      if (
-        task.state !== 'stopped' ||
-        this.store.receipt(`evaluation-started:${run.id}`) ||
-        this.store.receipt(`paused:${run.id}`)
-      )
-        throw Error('Evaluation is unavailable.');
-      const methods = run.policy.policy.methods ?? [];
-      const selected = command.payload.reviewer;
-      if (
-        methods.length !== 1 ||
-        methods[0].id !== selected.methodId ||
-        methods[0].cycles !== selected.cycles ||
-        !requiredReviewMethodIds(run.policy.policy.quality).every(
-          (method) => method === selected.methodId,
+      const inputs = this.evaluationInputs(command);
+      const { task, run, writer, candidate, methods, selected, profile, remaining, grants } =
+        inputs;
+      if (command.payload.checkRecipeId === 'crewkite-verify-v1') {
+        if (
+          !verification ||
+          verification.lineageHash !== this.verificationLineage(inputs) ||
+          verification.sourcePath !== this.projectPath(task.projectId)
         )
-      )
-        throw Error('The selected evaluation cannot cover the saved quality floor.');
-      const profile = this.profileFor(selected.profileId);
-      if (
-        !profile.facts.available ||
-        profile.facts.family !== 'openai' ||
-        profile.facts.id !== 'openai-file-v1' ||
-        profile.facts.id !== selected.profileId ||
-        !profile.facts.creditPolicies.some((policy) => policy === command.payload.creditPolicy) ||
-        !profile.client ||
-        !profile.locationHash ||
-        !profile.environment
-      )
-        throw Error('The reviewer profile is unavailable.');
-      const remaining = remainingBudgets(run, this.store.intents());
-      if (remaining.attempts < 2 || remaining.minutes < 2 || remaining.concurrency < 1)
-        throw Error('The saved budget cannot cover one check and one review.');
-      const expected = [
-        'node --test',
-        formatReviewTarget({ methodId: selected.methodId, cycle: 1 }),
-      ];
-      const grants = command.payload.grants;
-      if (
-        grants.some(
-          (grant) =>
-            grant.taskId !== task.id ||
-            grant.revoked ||
-            grant.usesRemaining !== 1 ||
-            Date.parse(grant.expiresAt) <= Date.parse(this.now()) ||
-            this.store.receipt(this.grantKey(grant)),
-        ) ||
-        grants.filter((grant) => grant.action === 'run-check' && grant.target === expected[0])
-          .length !== 1 ||
-        grants.filter((grant) => grant.action === 'run-review' && grant.target === expected[1])
-          .length !== 1
-      )
-        throw Error('Exact check and review grants are required.');
-      const definition = this.evidence.describeChecks({
-        candidate,
-        sourceFiles: committedFiles(this.projectPath(task.projectId) as string, run.source.base),
-        criteria: task.criteria,
-        selection:
-          command.payload.checkRecipeId === 'project-node-tests-v1'
-            ? { recipeId: command.payload.checkRecipeId, testFiles: command.payload.testFiles }
-            : undefined,
-      });
+          throw Error('Verification preflight lineage changed.');
+        assertVerificationSource(
+          verification.definition,
+          committedFiles(verification.sourcePath, run.source.base),
+          this.evidence.read(candidate).files,
+          runtimeRoot,
+        );
+      }
+      const definition =
+        command.payload.checkRecipeId === 'crewkite-verify-v1'
+          ? (verification as PreparedVerification).definition
+          : this.evidence.describeChecks({
+              candidate,
+              sourceFiles: committedFiles(
+                this.projectPath(task.projectId) as string,
+                run.source.base,
+              ),
+              criteria: task.criteria,
+              selection:
+                command.payload.checkRecipeId === 'project-node-tests-v1'
+                  ? {
+                      recipeId: command.payload.checkRecipeId,
+                      testFiles: command.payload.testFiles,
+                    }
+                  : undefined,
+            });
       const fields = {
         run,
         writer,
@@ -1721,15 +1947,42 @@ export class Controller {
           ...selected,
           role: methods[0].reviewerRole,
           profile: profile.facts,
-          client: profile.client,
-          locationHash: profile.locationHash,
+          client: inputs.client,
+          locationHash: inputs.locationHash,
         },
         creditPolicy: command.payload.creditPolicy,
         grants,
         remaining,
-        maximumCheckMinutes: 1 as const,
+        maximumCheckMinutes:
+          command.payload.checkRecipeId === 'crewkite-verify-v1' ? (5 as const) : (1 as const),
+        ...(verification
+          ? {
+              verification: {
+                source: verification.sourcePath,
+                inventory: ArtifactSchema.parse({
+                  id: this.id('art'),
+                  hash: verification.definition.inventory.hash,
+                  bytes: verification.definition.inventory.bytes,
+                  mediaType: 'application/vnd.crewkite.toolchain+json',
+                }),
+              },
+            }
+          : {}),
       };
-      scopeHash = hashCanonical(fields);
+      scopeHash = hashCanonical(
+        verification
+          ? {
+              ...fields,
+              verification: {
+                source: verification.sourcePath,
+                inventory: {
+                  hash: verification.definition.inventory.hash,
+                  bytes: verification.definition.inventory.bytes,
+                },
+              },
+            }
+          : fields,
+      );
       let expiresAt = grants
         .map((grant) => Date.parse(grant.expiresAt))
         .reduce((a, b) => Math.min(a, b));
@@ -1761,6 +2014,15 @@ export class Controller {
         reason: 'candidate-evaluation-unavailable',
         next: 'Review the stopped candidate, trusted check recipe, reviewer consent and remaining limits.',
       };
+    }
+    if (plan.verification && verification) {
+      const content = this.artifacts.publish(verification.inventoryBytes);
+      if (
+        content.hash !== plan.verification.inventory.hash ||
+        content.bytes !== plan.verification.inventory.bytes
+      )
+        throw Error('Verification inventory changed.');
+      this.saveArtifacts([plan.verification.inventory]);
     }
     const artifact = this.nativeArtifact(plan);
     this.store.saveReceipt(`evaluation-plan:${artifact.id}`, artifact.hash, 'local-owner', {
@@ -1837,7 +2099,7 @@ export class Controller {
       const required = review ? 1 : 2;
       if (
         remaining.attempts < required ||
-        remaining.minutes < required ||
+        remaining.minutes < (review ? 1 : plan.maximumCheckMinutes + 1) ||
         remaining.concurrency < 1 ||
         (review && Date.parse(plan.expiresAt) - Date.parse(this.now()) <= 2000)
       )
@@ -1976,6 +2238,9 @@ export class Controller {
             candidateHash: plan.candidate.hash,
             preparationId: artifact.id,
             recipe: plan.definition.recipeId,
+            ...(plan.definition.recipeId === 'crewkite-verify-v1'
+              ? { verification: verificationPreview(plan.definition) }
+              : {}),
             testFiles:
               plan.definition.recipeId === 'project-node-tests-v1'
                 ? plan.definition.collection
@@ -2070,8 +2335,9 @@ export class Controller {
   ): CommandResult {
     let plan: z.infer<typeof CandidateEvaluationSchema>;
     let artifact: Artifact;
-    let check: CheckPlan;
-    let route: Route;
+    let check: CheckPlan | undefined;
+    let route: Route | undefined;
+    let verification = false;
     try {
       artifact = ArtifactSchema.parse(
         this.store.get<Artifact>('artifact', command.payload.preparationId),
@@ -2094,23 +2360,26 @@ export class Controller {
       const remaining = remainingBudgets(plan.run, this.store.intents());
       if (
         remaining.attempts < 2 ||
-        remaining.minutes < 2 ||
+        remaining.minutes < plan.maximumCheckMinutes + 1 ||
         remaining.concurrency < 1 ||
         plan.grants.some((grant) => this.store.receipt(this.grantKey(grant)))
       )
         throw Error('Evaluation authority or budget changed.');
-      check = this.evidence.prepareChecks({
-        candidate: origin.candidate,
-        sourceFiles: committedFiles(
-          this.projectPath(origin.task.projectId) as string,
-          plan.run.source.base,
-        ),
-        criteria: plan.context.criteria,
-        expected: plan.definition,
-      });
-      const localRoute = this.localCheckRoute();
-      if (!localRoute) throw Error('Local evaluator route is unavailable.');
-      route = localRoute;
+      if (plan.definition.recipeId === 'crewkite-verify-v1') verification = true;
+      else {
+        check = this.evidence.prepareChecks({
+          candidate: origin.candidate,
+          sourceFiles: committedFiles(
+            this.projectPath(origin.task.projectId) as string,
+            plan.run.source.base,
+          ),
+          criteria: plan.context.criteria,
+          expected: plan.definition,
+        });
+        const localRoute = this.localCheckRoute();
+        if (!localRoute) throw Error('Local evaluator route is unavailable.');
+        route = localRoute;
+      }
     } catch {
       return {
         outcome: 'blocked',
@@ -2118,6 +2387,8 @@ export class Controller {
         next: 'Prepare the exact candidate evaluation again before running checks.',
       };
     }
+    if (verification) return this.startVerification(artifact, plan, effects);
+    if (!check || !route) throw Error('Local checks are unavailable.');
     if (!this.store.receipt('node-check-route')) {
       const routeArtifact = this.nativeArtifact(route);
       this.store.put('route', route.id, 0, route);
@@ -2162,6 +2433,298 @@ export class Controller {
     };
   }
 
+  private startVerification(
+    artifact: Artifact,
+    plan: z.infer<typeof CandidateEvaluationSchema>,
+    effects: (() => void)[],
+  ): CommandResult {
+    if (plan.definition.recipeId !== 'crewkite-verify-v1' || !plan.verification)
+      throw Error('Verification preparation changed.');
+    const route = this.localCheckRoute();
+    if (!route) throw Error('Local evaluator route is unavailable.');
+    if (!this.store.receipt('node-check-route')) {
+      const reference = this.nativeArtifact(route);
+      this.store.put('route', route.id, 0, route);
+      this.store.saveReceipt('node-check-route', reference.hash, 'local-owner', {
+        outcome: 'applied',
+        entity: reference,
+      });
+    }
+    const attempt = this.jobAttempt(plan.run, route.id);
+    const directory = join(this.home, 'verification', attempt.id);
+    const stateRoot = join(realpathSync('/tmp'), `ck-${attempt.id}`);
+    if (Buffer.byteLength(join(stateRoot, 'e2e-XXXXXX', 'control.sock')) > 100)
+      throw Error('Verification state path is too long.');
+    const owner: CheckOwner = {
+      version: 1,
+      attemptId: attempt.id,
+      generation: attempt.generation,
+      directory: join(stateRoot, 'ownership'),
+      stateRoot,
+      electronExecutable: join(directory, plan.definition.entrypoints.electron),
+      stage: 'policy',
+      parentGroup: 0,
+    };
+    const minutes = this.admitJob(plan.run, attempt, directory, 5);
+    const launch = this.nativeArtifact({
+      version: 1,
+      runId: plan.run.id,
+      candidateId: plan.candidate.id,
+      candidateHash: plan.candidate.hash,
+      definitionHash: plan.definition.definitionHash,
+      preparation: artifact,
+      directory,
+      owner,
+    });
+    this.store.saveReceipt(`verification-launch:${attempt.id}`, launch.hash, 'local-owner', {
+      outcome: 'applied',
+      entity: launch,
+    });
+    for (const key of [`evaluation-started:${plan.run.id}`, `evaluation-check:${attempt.id}`])
+      this.store.saveReceipt(key, artifact.hash, 'local-owner', {
+        outcome: 'applied',
+        entity: artifact,
+      });
+    this.consumeGrant(plan.run, plan.grants.find((grant) => grant.action === 'run-check') as Grant);
+    const task = this.updateTask(this.store.get<Task>('task', plan.run.taskId) as Task, {
+      state: 'checking',
+      waitingReason: null,
+      next: 'Running the frozen CrewKite verification stages. Review requires a separate start.',
+    });
+    effects.push(() => this.launchVerification(attempt, artifact, minutes));
+    return { outcome: 'applied', entity: artifact, revision: task.revision };
+  }
+
+  private verificationLaunch(attemptId: string) {
+    const record = this.nativeRecord(`verification-launch:${attemptId}`);
+    const launch = z
+      .strictObject({
+        version: z.literal(1),
+        runId: RunSchema.shape.id,
+        candidateId: CandidateSchema.shape.id,
+        candidateHash: HashSchema,
+        definitionHash: HashSchema,
+        preparation: ArtifactSchema,
+        directory: z.string().min(1).max(4096),
+        owner: z.custom<CheckOwner>((value) => {
+          try {
+            parseCheckOwner(value);
+            return true;
+          } catch {
+            return false;
+          }
+        }),
+      })
+      .parse(record.value);
+    const attempt = this.store.get<Attempt>('attempt', attemptId);
+    const run = this.store.get<Run>('run', launch.runId);
+    const intent = this.store.intents().find((value) => value.attempt_id === attemptId);
+    const plan = this.evaluationPlan(launch.preparation);
+    if (
+      !attempt ||
+      !run ||
+      !intent ||
+      attempt.runId !== run.id ||
+      intent.run_id !== run.id ||
+      intent.task_id !== run.taskId ||
+      intent.route_id !== attempt.routeId ||
+      intent.generation !== attempt.generation ||
+      intent.scratch_path !== launch.directory ||
+      launch.directory !== join(this.home, 'verification', attemptId) ||
+      launch.owner.attemptId !== attemptId ||
+      launch.owner.generation !== attempt.generation ||
+      launch.owner.stage !== 'policy' ||
+      launch.owner.parentGroup !== 0 ||
+      launch.owner.directory !== join(launch.owner.stateRoot, 'ownership') ||
+      plan.definition.recipeId !== 'crewkite-verify-v1' ||
+      launch.owner.electronExecutable !==
+        join(launch.directory, plan.definition.entrypoints.electron) ||
+      plan.run.id !== run.id ||
+      plan.candidate.id !== launch.candidateId ||
+      plan.candidate.hash !== launch.candidateHash ||
+      plan.definition.definitionHash !== launch.definitionHash ||
+      this.store.receipt(`evaluation-check:${attemptId}`)?.hash !== launch.preparation.hash
+    )
+      throw Error('Verification launch binding changed.');
+    return launch;
+  }
+
+  private verificationCurrent(attempt: Attempt, artifact: Artifact): boolean {
+    try {
+      if (this.closed || this.cancelledJobs.has(attempt.id)) return false;
+      const origin = this.evaluationAuthority(artifact, attempt.id);
+      const launch = this.verificationLaunch(attempt.id);
+      const lease = this.store.db
+        .prepare('SELECT attempt_id,generation FROM writer_leases WHERE task_id=?')
+        .get(origin.task.id);
+      const current = this.store.get<Attempt>('attempt', attempt.id);
+      const grant = origin.plan.grants.find(
+        (value) => value.action === 'run-check' && value.target === verificationTarget,
+      );
+      const used = grant && this.store.receipt(this.grantKey(grant));
+      return (
+        origin.task.state === 'checking' &&
+        launch.preparation.hash === artifact.hash &&
+        !!current &&
+        ['intent', 'running'].includes(current.state) &&
+        current.runId === attempt.runId &&
+        current.generation === attempt.generation &&
+        lease?.attempt_id === attempt.id &&
+        lease.generation === attempt.generation &&
+        !!grant &&
+        !grant.revoked &&
+        Date.parse(grant.expiresAt) > Date.parse(this.now()) &&
+        used?.hash === hashCanonical(grant) &&
+        (used.result.entity as Run | undefined)?.id === origin.run.id &&
+        this.jobDeadline(attempt.id, 5) > 0
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  private launchVerification(attempt: Attempt, artifact: Artifact, minutes: number) {
+    if (this.closed || this.store.get<Attempt>('attempt', attempt.id)?.state !== 'intent') return;
+    let job: ToolchainVerification;
+    try {
+      const plan = this.evaluationPlan(artifact);
+      const launch = this.verificationLaunch(attempt.id);
+      if (
+        plan.definition.recipeId !== 'crewkite-verify-v1' ||
+        !plan.verification ||
+        !this.verificationCurrent(attempt, artifact)
+      )
+        throw Error('Verification authority changed.');
+      const definition = plan.definition;
+      const bytes = this.artifacts.read(plan.verification.inventory.hash);
+      if (bytes.length !== plan.definition.inventory.bytes)
+        throw Error('Verification inventory changed.');
+      const inventory = JSON.parse(
+        new TextDecoder('utf-8', { fatal: true }).decode(bytes),
+      ) as DependencyInventory;
+      if (inventory.hash !== plan.definition.toolchainHash)
+        throw Error('Verification inventory changed.');
+      const remaining = Math.min(
+        this.jobDeadline(attempt.id, minutes),
+        Date.parse(plan.expiresAt) - Date.parse(this.now()),
+      );
+      job = new ToolchainVerification({
+        definition: plan.definition,
+        inventory,
+        donor: plan.verification.source,
+        directory: launch.directory,
+        stateRoot: launch.owner.stateRoot,
+        owner: launch.owner,
+        files: this.evidence.read(plan.candidate).files,
+        deadline: performance.now() + remaining,
+        now: () => performance.now(),
+        current: () => this.verificationCurrent(attempt, artifact),
+        onSpawn: (pid) => this.acknowledgeJob(attempt, pid),
+      });
+      this.jobs.set(attempt.id, job);
+      void job.result
+        .then((execution) => {
+          const authorized = this.verificationCurrent(attempt, artifact);
+          if (!this.settleJob(attempt, execution.quiescent, true)) return;
+          if (this.closed) return;
+          if (this.cancelledJobs.has(attempt.id)) {
+            this.stoppedJob(attempt);
+            return;
+          }
+          if (!authorized) execution = { ...execution, failure: 'cancelled' };
+          const result = this.evidence.recordVerification({
+            candidate: plan.candidate,
+            definition,
+            execution,
+            owner: launch.owner,
+          });
+          this.store.transaction(() => {
+            this.saveArtifacts(result.artifacts);
+            const check = result.evidence;
+            this.store.db
+              .prepare(
+                "INSERT OR REPLACE INTO evidence(candidate_id,kind,candidate_hash,definition_hash,evaluator,body) VALUES (?,'check',?,?,?,?)",
+              )
+              .run(
+                plan.candidate.id,
+                plan.candidate.hash,
+                check.definitionHash,
+                check.evaluator,
+                canonicalJson(check),
+              );
+            this.store.saveReceipt(
+              `evaluation-result:${artifact.id}`,
+              artifact.hash,
+              'local-owner',
+              {
+                outcome: 'applied',
+                entity: result.artifacts.find((value) => value.id === check.artifactId),
+              },
+            );
+            const task = this.store.get<Task>('task', plan.run.taskId) as Task;
+            this.event('check.completed', task.id, task.revision, check);
+            this.updateTask(task, {
+              state: check.passed ? 'stopped' : 'failed',
+              waitingReason: null,
+              next: check.passed
+                ? 'Local verification passed. Inspect the evidence before starting the prepared review.'
+                : 'Verification failed or was incomplete. Inspect the retained evidence.',
+            });
+          });
+        })
+        .catch(() => {
+          if (!this.closed)
+            this.store.transaction(() => {
+              const task = this.store.get<Task>('task', plan.run.taskId) as Task;
+              if (task.state !== 'unknown')
+                this.updateTask(task, {
+                  state: 'failed',
+                  waitingReason: null,
+                  next: 'Verification evidence could not be verified.',
+                });
+            });
+        });
+    } catch {
+      this.settleJob(attempt, true);
+      this.stoppedJob(attempt);
+    }
+  }
+
+  private currentEvaluationDefinition(
+    plan: z.infer<typeof CandidateEvaluationSchema>,
+  ): CheckDefinition {
+    const sourceFiles = committedFiles(
+      this.projectPath(plan.run.source.projectId) as string,
+      plan.run.source.base,
+    );
+    if (plan.definition.recipeId === 'crewkite-verify-v1') {
+      if (
+        !plan.verification ||
+        plan.verification.source !== this.projectPath(plan.run.source.projectId)
+      )
+        throw Error('preparation-changed');
+      const stored = this.store.get<Artifact>('artifact', plan.verification.inventory.id);
+      if (!stored || hashCanonical(stored) !== hashCanonical(plan.verification.inventory))
+        throw Error('preparation-changed');
+      assertVerificationSource(
+        plan.definition,
+        sourceFiles,
+        this.evidence.read(plan.candidate).files,
+        runtimeRoot,
+      );
+      return plan.definition;
+    }
+    return this.evidence.describeChecks({
+      candidate: plan.candidate,
+      sourceFiles,
+      criteria: plan.context.criteria,
+      selection:
+        plan.definition.recipeId === 'project-node-tests-v1'
+          ? { recipeId: plan.definition.recipeId, testFiles: plan.definition.required.files }
+          : undefined,
+    });
+  }
+
   private evaluationAuthority(artifact: Artifact, ownedAttemptId?: string) {
     const plan = this.evaluationPlan(artifact);
     const origin = this.evaluationOrigin(plan.run.taskId, plan.candidate.id, ownedAttemptId);
@@ -2202,18 +2765,15 @@ export class Controller {
       !profile.facts.creditPolicies.some((policy) => policy === plan.creditPolicy)
     )
       throw Error('profile-unavailable');
-    const definition = this.evidence.describeChecks({
-      candidate: origin.candidate,
-      sourceFiles: committedFiles(
-        this.projectPath(origin.task.projectId) as string,
-        plan.run.source.base,
-      ),
-      criteria: plan.context.criteria,
-      selection:
-        plan.definition.recipeId === 'project-node-tests-v1'
-          ? { recipeId: plan.definition.recipeId, testFiles: plan.definition.required.files }
-          : undefined,
-    });
+    if (
+      plan.definition.recipeId === 'crewkite-verify-v1' &&
+      !this.store.receipt(`evaluation-started:${plan.run.id}`)
+    ) {
+      const remaining = remainingBudgets(plan.run, this.store.intents());
+      if (remaining.attempts < 2 || remaining.minutes < 6 || remaining.concurrency < 1)
+        throw Error('budget-exhausted');
+    }
+    const definition = this.currentEvaluationDefinition(plan);
     if (hashCanonical(definition) !== hashCanonical(plan.definition))
       throw Error('preparation-changed');
     return { ...origin, plan, definition, environment: { ...profile.environment } };
@@ -2802,21 +3362,7 @@ export class Controller {
       }) !== hashCanonical(proof.evaluation.context)
     )
       throw Error('candidate-changed');
-    const definition = this.evidence.describeChecks({
-      candidate,
-      sourceFiles: committedFiles(
-        this.projectPath(run.source.projectId) as string,
-        run.source.base,
-      ),
-      criteria: proof.evaluation.context.criteria,
-      selection:
-        proof.evaluation.definition.recipeId === 'project-node-tests-v1'
-          ? {
-              recipeId: proof.evaluation.definition.recipeId,
-              testFiles: proof.evaluation.definition.required.files,
-            }
-          : undefined,
-    });
+    const definition = this.currentEvaluationDefinition(proof.evaluation);
     if (!completedCheckDefinitionMatches(proof.evaluation.definition, definition))
       throw Error('evidence-incomplete');
     return proof;
@@ -4897,6 +5443,7 @@ export class Controller {
           });
         } else if (check) {
           check.stop();
+          if (check instanceof ToolchainVerification) return;
           const cancel = (this.options.schedule ?? defaultSchedule)(
             () => this.settleJob(attempt, false),
             1000,
@@ -4974,11 +5521,31 @@ export class Controller {
         const known = native
           ? phases.every((phase) => phase.state !== 'intent')
           : ['acknowledged', 'interrupted'].includes(intent.state);
+        let verificationKnown: boolean | undefined;
+        if (this.store.receipt(`verification-launch:${attempt.id}`)) {
+          try {
+            const launch = this.verificationLaunch(attempt.id);
+            const journal = inspectCheckRoots(launch.owner);
+            verificationKnown =
+              !journal.unknown &&
+              journal.roots.length > 0 &&
+              journal.roots.every(
+                (root) =>
+                  root.spawnFailed ||
+                  (!!root.terminal &&
+                    !!root.acknowledgment &&
+                    groupAbsent(root.acknowledgment.group)),
+              );
+          } catch {
+            verificationKnown = false;
+          }
+        }
         const stopped =
-          known &&
-          (native
-            ? phases.every((phase) => groupAbsent(phase.process_group))
-            : groupAbsent(intent.process_group));
+          verificationKnown ??
+          (known &&
+            (native
+              ? phases.every((phase) => groupAbsent(phase.process_group))
+              : groupAbsent(intent.process_group)));
         const updated = {
           ...attempt,
           state: stopped ? ('stopped' as const) : ('unknown' as const),
@@ -5339,7 +5906,9 @@ export class Controller {
   private checkMatches(
     check: CheckResult,
     candidate: Candidate,
-    plan: Pick<CheckPlan, 'definitionHash' | 'evaluator'>,
+    plan: Pick<CheckDefinition, 'definitionHash' | 'evaluator'> & {
+      recipeId?: CheckDefinition['recipeId'];
+    },
   ): boolean {
     if (
       !check.passed ||
@@ -5366,6 +5935,7 @@ export class Controller {
         unchanged: boolean;
         tests: number;
         log: Artifact;
+        verification?: { artifact: Artifact; owner: CheckOwner };
       };
       if (
         metadata.candidateId !== candidate.id ||
@@ -5379,6 +5949,22 @@ export class Controller {
         metadata.tests <= 0
       )
         return false;
+      if (plan.recipeId === 'crewkite-verify-v1') {
+        const owner = parseCheckOwner(metadata.verification?.owner);
+        const launch = this.verificationLaunch(owner.attemptId);
+        if (
+          launch.candidateId !== candidate.id ||
+          launch.definitionHash !== plan.definitionHash ||
+          hashCanonical(launch.owner) !== hashCanonical(owner) ||
+          !this.evidence.verificationMatches({
+            candidate,
+            definition: plan as CheckDefinition & { recipeId: 'crewkite-verify-v1' },
+            metadata,
+            owner,
+          })
+        )
+          return false;
+      }
       const log = ArtifactSchema.parse(metadata.log);
       const stored = this.store.get<Artifact>('artifact', log.id);
       return (

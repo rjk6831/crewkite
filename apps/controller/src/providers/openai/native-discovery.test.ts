@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
-import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
+import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { resolve } from 'node:path';
 import test from 'node:test';
+import { spawnCheckChild as spawn } from '../../host/check-ownership.ts';
 import { groupAbsent } from '../../host/worker.ts';
 import { OpenAiDiscovery } from './discovery.ts';
 import {

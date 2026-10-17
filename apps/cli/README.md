@@ -156,9 +156,19 @@ For project tests, add the recipe and repeat `--test-file` for each exact relati
 pnpm crewkite task prepare-evaluation <task-id> <profile-id> --grants evaluation-grants.json --recipe project-node-tests-v1 --test-file test/pricing.test.mjs --test-file test/tax.test.mjs --native-trust --source-consent --json
 ```
 
-Local code runs with your system permissions. Dependencies are not installed. Imports can use Node built-ins and files in the check copy. Paths are literal, with no globs or discovery; names with spaces need shell quotes. The controller freezes the committed files and refuses changed definitions before execution. Inspect `task show` before starting checks.
+For a source-configured CrewKite checkout on macOS arm64 with an installed verification policy, `crewkite-verify-v1` runs the fixed policy, lint, types, Node tests, desktop build and desktop journey stages. It copies installed dependencies and Electron, and verifies local Node and Git. Set the `run-check` grant target to `crewkite verify`, keeping the separate reviewer grant:
 
-Preparation starts no work. Omitting both consent flags requests exact saved evaluation consent. Reviewer credit spending defaults off independently of the writer. Add `--existing-credits` during evaluation preparation only when choosing that policy explicitly.
+```sh
+pnpm crewkite task prepare-evaluation <task-id> <profile-id> --grants verification-grants.json --recipe crewkite-verify-v1 --native-trust --source-consent --json
+```
+
+Before starting the source controller, set `PROVENANCE_PATTERN` in its environment to the installation's provenance regular expression used by `scripts/policy.mjs`. If that value is empty, the controller reads `internal/provenance-pattern.txt` under its source checkout. Setting the variable only for a CLI command does not configure an already running controller. A missing policy blocks preparation with `verification-policy-unavailable`. Wait for all active work and preparation to stop, then restart the source controller with the policy configured and prepare the evaluation again.
+
+This recipe takes no test-file or command options. Staging, all stages and cleanup share at most five minutes. The original run needs at least six remaining minutes and two attempts, including the later review. The controller freezes toolchain and baseline identities before Start. Task show reports the fixed stages, platform, Node, Electron and Git versions and digests, lockfile and toolchain hashes. No dependencies are installed. Local code runs with your system permissions; no added filesystem or network containment is established.
+
+Project Node tests run local code with your system permissions. Dependencies are not installed. Imports can use Node built-ins and files in the check copy. Paths are literal, with no globs or discovery; names with spaces need shell quotes. The controller freezes the committed files and refuses changed definitions before execution. Inspect `task show` before starting checks.
+
+Preparation starts no checks or native review. Verification preparation first inventories the installed files. Omitting both consent flags requests exact saved evaluation consent. Reviewer credit spending defaults off independently of the writer. Add `--existing-credits` during evaluation preparation only when choosing that policy explicitly.
 
 Task show reports the controller's evaluation stage, selected recipe and test files, exact file and hashes, saved reviewer and process-only independence, expiry, current start availability and remaining total attempts and minutes. The supplemental allowance permits one local check and one additional native review beneath those original run limits. Completed evidence remains visible after start permission expires. A failed or blocked check cannot authorize review. Task show also reports current local acceptance availability and its reason. Completed checks and review can make acceptance available. The destination still needs its own current grant or approval; inspection and export remain available.
 

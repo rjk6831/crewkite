@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { execFileSync, spawn as spawnProcess, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import {
@@ -8,13 +8,17 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { tmpdir, userInfo } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { type TestContext, test } from 'node:test';
+import { connectController, readControllerEndpoint } from '@crewkite/client/node';
 import {
   AnthropicNativeProfileSchema,
   type Approval,
@@ -22,7 +26,9 @@ import {
   ArtifactSchema,
   type Attempt,
   type Candidate,
+  type CheckEvent,
   type CheckResult,
+  CommandSchema,
   canonicalJson,
   GoogleNativeProfileSchema,
   NativeRepositoryProfileSchema,
@@ -33,6 +39,7 @@ import {
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { createDemoFixtures, createTestClock, createTestIds } from '@crewkite/testkit';
 import { createSyntheticRepository, writeChallengeSolution } from '@crewkite/testkit/repository';
+import { fakeWorkerPath } from '@crewkite/testkit/worker';
 import { ArtifactFiles } from '../artifacts/index.ts';
 import {
   Controller,
@@ -44,9 +51,23 @@ import {
   completedCheckDefinitionMatches,
   type NodeCheckDefinition,
 } from '../evidence/index.ts';
+import {
+  journeyTitle,
+  ToolchainDefinitionSchema,
+  toolchainDefinitionHash,
+  verificationStages,
+} from '../evidence/toolchain-definition.ts';
+import { type VerificationExecution, verificationCommand } from '../evidence/toolchain-verify.ts';
+import {
+  checkOwner,
+  enrollCheckRoot,
+  qualifiedWorkerExit,
+  readCheckRoots,
+  spawnCheckChild as spawn,
+} from '../host/check-ownership.ts';
 import { refValue } from '../host/publication.ts';
 import { committedFiles, git, inspectSource, materialize, readFiles } from '../host/source.ts';
-import { groupAbsent } from '../host/worker.ts';
+import { closedWithin, groupAbsent } from '../host/worker.ts';
 import { replacementFixture as anthropicFixture } from '../providers/anthropic/replacement-fixture.ts';
 import { replacementFixture as googleFixture } from '../providers/google/replacement-fixture.ts';
 import {
@@ -59,6 +80,7 @@ import {
   fixtureModel,
   repositoryFixture,
 } from '../providers/openai/replacement-fixture.ts';
+import { serve as serveController } from '../server/index.ts';
 
 const fixtureClientHash = createHash('sha256').update(readFileSync(process.execPath)).digest('hex');
 
@@ -75,7 +97,7 @@ async function setup(
   const source = createSyntheticRepository(join(directory, 'demo-shop'));
   const controller = new Controller({
     ...options,
-    home: join(directory, 'home'),
+    home: options.home ?? join(directory, 'home'),
     now: clock.now,
     id,
     routes: fixtures.snapshot.routes,
@@ -719,6 +741,289 @@ test('a retained descendant blocks sealing and transfer after its leader exits',
 
 test('candidate evidence requires unchanged bytes and completed checks', async (t) => {
   const { controller, command, draft, fixtures, directory, id, source } = await setup(t);
+  const ownership = join(directory, 'ownership');
+  mkdirSync(ownership);
+  const owner = {
+    version: 1 as const,
+    directory: ownership,
+    stateRoot: directory,
+    electronExecutable: process.execPath,
+    attemptId: id('att'),
+    generation: 0,
+    stage: 'node-tests' as const,
+    parentGroup: 12345,
+  };
+  // Negative fixtures must close, but their nonzero exits are deliberate evidence.
+  for (const code of [0, 3]) {
+    const ticket = enrollCheckRoot('fixture', true, owner);
+    const child = spawn(process.execPath, ['-e', `process.exit(${code})`], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    ticket.acknowledge(child);
+    await new Promise<void>((done, reject) => {
+      child.once('error', reject);
+      child.once('close', () => done());
+    });
+    const record = readCheckRoots(owner).find((row) => row.acknowledgment?.pid === child.pid);
+    assert(record?.terminal);
+    assert.equal(record.terminal.code, code);
+    assert.equal(record.terminal.signal, null);
+    assert.equal(record.acknowledgment?.group, child.pid);
+    assert.equal(groupAbsent(child.pid ?? 0), true);
+  }
+  const attached = enrollCheckRoot('fixture', false, owner);
+  const child = spawn(process.execPath, ['-e', 'process.exit(0)'], { stdio: 'ignore' });
+  attached.acknowledge(child);
+  await new Promise<void>((done) => child.once('close', () => done()));
+  assert.equal(
+    readCheckRoots(owner).find((row) => row.acknowledgment?.pid === child.pid)?.acknowledgment
+      ?.group,
+    owner.parentGroup,
+  );
+  const witnessDirectory = join(directory, 'worker-exit');
+  mkdirSync(witnessDirectory);
+  const witnessOwner = { ...owner, directory: witnessDirectory };
+  const witnessTicket = enrollCheckRoot('worker', true, witnessOwner, fakeWorkerPath);
+  assert(witnessTicket.preload);
+  const witnessed = spawnProcess(
+    process.execPath,
+    [`--import=${witnessTicket.preload}`, fakeWorkerPath],
+    { detached: true, stdio: ['pipe', 'ignore', 'ignore'], env: witnessTicket.environment },
+  );
+  const witnessClosed = new Promise<void>((done) => witnessed.once('close', () => done()));
+  witnessTicket.acknowledge(witnessed);
+  witnessed.stdin.end();
+  try {
+    assert.equal(await closedWithin(witnessClosed), true);
+  } finally {
+    if (!groupAbsent(witnessed.pid ?? 0)) process.kill(-(witnessed.pid as number), 'SIGKILL');
+    assert.equal(await closedWithin(witnessClosed), true);
+  }
+  const witnessedRoot = readCheckRoots(witnessOwner)[0];
+  assert.equal(witnessedRoot.terminal?.code, 2);
+  assert.deepEqual(witnessedRoot.exitEvent, { type: 'fixture-exit', pid: witnessed.pid, code: 2 });
+  assert.equal(qualifiedWorkerExit(witnessedRoot), true);
+  assert.equal(groupAbsent(witnessed.pid ?? 0), true);
+  const witnessPath = join(witnessDirectory, witnessedRoot.id);
+  const witnessRows = readFileSync(witnessPath, 'utf8')
+    .trimEnd()
+    .split('\n')
+    .map((row) => JSON.parse(row));
+  const writeWitnessRows = (rows: unknown[]) =>
+    writeFileSync(witnessPath, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+  writeWitnessRows(witnessRows.slice(0, -1));
+  const witnessedExit = readCheckRoots(witnessOwner)[0];
+  assert.equal(witnessedExit.terminal, undefined);
+  assert.equal(qualifiedWorkerExit(witnessedExit), true);
+  for (const change of [
+    (rows: typeof witnessRows) => {
+      rows.splice(1, 1);
+    },
+    (rows: typeof witnessRows) => {
+      rows[2].pid += 1;
+    },
+    (rows: typeof witnessRows) => {
+      rows.push(rows[2]);
+    },
+    (rows: typeof witnessRows) => {
+      rows[0].role = 'fixture';
+    },
+    (rows: typeof witnessRows) => {
+      rows[0].owner.stage = 'policy';
+    },
+    (rows: typeof witnessRows) => {
+      [rows[2], rows[3]] = [rows[3], rows[2]];
+    },
+  ]) {
+    const rows = structuredClone(witnessRows);
+    change(rows);
+    writeWitnessRows(rows);
+    assert.throws(() => readCheckRoots(witnessOwner));
+  }
+  writeWitnessRows(witnessRows);
+  for (const acknowledge of [false, true]) {
+    const pendingDirectory = join(directory, `worker-exit-${acknowledge}`);
+    mkdirSync(pendingDirectory);
+    const pendingOwner = { ...owner, directory: pendingDirectory };
+    const ticket = enrollCheckRoot('worker', true, pendingOwner, fakeWorkerPath);
+    assert(ticket.preload);
+    const child = spawnProcess(process.execPath, [`--import=${ticket.preload}`, fakeWorkerPath], {
+      detached: true,
+      stdio: ['pipe', 'ignore', 'ignore'],
+      env: ticket.environment,
+    });
+    const closed = new Promise<void>((done) => child.once('close', () => done()));
+    if (acknowledge) {
+      ticket.acknowledge(child);
+      child.kill('SIGKILL');
+    } else child.stdin.end();
+    try {
+      assert.equal(await closedWithin(closed), true);
+    } finally {
+      if (!groupAbsent(child.pid ?? 0)) process.kill(-(child.pid as number), 'SIGKILL');
+      assert.equal(await closedWithin(closed), true);
+    }
+    const root = readCheckRoots(pendingOwner)[0];
+    assert.equal(root.exitEvent, undefined);
+    assert.equal(qualifiedWorkerExit(root), false);
+    assert.equal(groupAbsent(child.pid ?? 0), true);
+    if (acknowledge) {
+      assert.equal(root.terminal?.signal, 'SIGKILL');
+      const path = join(pendingDirectory, root.id);
+      writeFileSync(
+        path,
+        `${readFileSync(path, 'utf8').trimEnd().split('\n').slice(0, -1).join('\n')}\n`,
+      );
+      assert.equal(readCheckRoots(pendingOwner)[0].terminal, undefined);
+    }
+  }
+  const ineligibleDirectory = join(directory, 'worker-exit-ineligible');
+  mkdirSync(ineligibleDirectory);
+  for (const [role, detached, stage, entrypoint] of [
+    ['worker', true, 'node-tests', `${fakeWorkerPath}.custom`],
+    ['fixture', true, 'node-tests', fakeWorkerPath],
+    ['worker', false, 'node-tests', fakeWorkerPath],
+    ['worker', true, 'policy', fakeWorkerPath],
+  ] as const) {
+    const ticket = enrollCheckRoot(
+      role,
+      detached,
+      { ...owner, directory: ineligibleDirectory, stage },
+      entrypoint,
+    );
+    assert.equal(ticket.preload, undefined);
+    ticket.failed();
+  }
+  const stageDirectory = join(directory, 'isolated-stage');
+  mkdirSync(stageDirectory);
+  const stageOwner = { ...owner, directory: stageDirectory, parentGroup: 0 };
+  const stageTicket = enrollCheckRoot('stage', true, stageOwner);
+  const helper = new URL('../host/check-ownership.ts', import.meta.url).href;
+  const files = [0, 1].map((index) => {
+    const path = join(directory, `stage-${index}.test.mjs`);
+    writeFileSync(
+      path,
+      `
+import assert from 'node:assert/strict';
+import { once } from 'node:events';
+import { writeFileSync } from 'node:fs';
+import { test as fixtureTest } from 'node:test';
+import { checkOwner, spawnCheckChild } from ${JSON.stringify(helper)};
+fixtureTest('attached fixture keeps the admitted stage group', async () => {
+  const owner = checkOwner();
+  assert(owner);
+  assert.equal(process.env.CREWKITE_CHECK_STAGE_ROOT, undefined);
+  writeFileSync(${JSON.stringify(join(directory, `stage-${index}.json`))}, JSON.stringify({pid:process.pid,group:owner.parentGroup}));
+  const child = spawnCheckChild(process.execPath, ['-e', 'process.exit(0)'], {stdio:'ignore'});
+  const [code,signal] = await once(child, 'close');
+  assert.equal(code,0);
+  assert.equal(signal,null);
+});
+`,
+    );
+    return path;
+  });
+  const stageChild = spawnProcess(process.execPath, [`--import=${helper}`, '--test', ...files], {
+    detached: true,
+    stdio: 'ignore',
+    env: stageTicket.environment,
+  });
+  const stageClosed = new Promise<void>((done) => stageChild.once('close', () => done()));
+  stageTicket.acknowledge(stageChild);
+  try {
+    assert.equal(await closedWithin(stageClosed), true);
+  } finally {
+    if (!groupAbsent(stageChild.pid ?? 0)) process.kill(-(stageChild.pid as number), 'SIGKILL');
+    assert.equal(await closedWithin(stageClosed), true);
+  }
+  assert.equal(stageChild.exitCode, 0);
+  const stageRoots = readCheckRoots(stageOwner);
+  assert.equal(stageRoots.length, 3);
+  for (const root of stageRoots) {
+    assert.equal(root.acknowledgment?.group, stageChild.pid);
+    assert.equal(root.terminal?.code, 0);
+  }
+  for (const index of [0, 1]) {
+    const observed = JSON.parse(readFileSync(join(directory, `stage-${index}.json`), 'utf8'));
+    assert.notEqual(observed.pid, stageChild.pid);
+    assert.equal(observed.group, stageChild.pid);
+  }
+  const unacknowledged = enrollCheckRoot('stage', true, stageOwner);
+  const noAck = spawnProcess(process.execPath, [`--import=${helper}`, '-e', 'process.exit(0)'], {
+    detached: true,
+    stdio: 'ignore',
+    env: unacknowledged.environment,
+  });
+  const noAckClosed = new Promise<void>((done) => noAck.once('close', () => done()));
+  try {
+    assert.equal(await closedWithin(noAckClosed), true);
+  } finally {
+    if (!groupAbsent(noAck.pid ?? 0)) process.kill(-(noAck.pid as number), 'SIGKILL');
+    assert.equal(await closedWithin(noAckClosed), true);
+  }
+  assert.notEqual(noAck.exitCode, 0);
+  assert.equal(readCheckRoots(stageOwner).filter((root) => !root.acknowledgment).length, 1);
+  const faultDirectory = join(directory, 'ownership-fault');
+  mkdirSync(faultDirectory);
+  const faultOwner = { ...owner, directory: faultDirectory };
+  const faultTicket = enrollCheckRoot('fixture', true, faultOwner);
+  const faultChild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  const faultClosed = new Promise<void>((done) => faultChild.once('close', () => done()));
+  const journalPath = join(faultDirectory, readdirSync(faultDirectory)[0]);
+  rmSync(journalPath);
+  mkdirSync(journalPath);
+  const waitFaultClosed = () =>
+    new Promise<void>((done, reject) => {
+      const timer = setTimeout(
+        () => reject(Error('Fault fixture closure exceeded its bound.')),
+        2000,
+      );
+      void faultClosed.then(() => {
+        clearTimeout(timer);
+        done();
+      });
+    });
+  try {
+    assert.throws(() => faultTicket.acknowledge(faultChild), { code: 'EISDIR' });
+    await waitFaultClosed();
+    assert.equal(faultChild.exitCode, null);
+    assert.equal(faultChild.signalCode, 'SIGKILL');
+    assert.equal(groupAbsent(faultChild.pid ?? 0), true);
+    assert.throws(() => readCheckRoots(faultOwner), /ownership record/);
+  } finally {
+    if (!groupAbsent(faultChild.pid ?? 0)) {
+      try {
+        process.kill(-(faultChild.pid as number), 'SIGKILL');
+      } catch {}
+    }
+    await waitFaultClosed();
+  }
+  const missingTicket = enrollCheckRoot('fixture', true, owner);
+  const missing = spawn(join(directory, 'missing-executable'), [], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  const missingClosed = new Promise<void>((done) => missing.once('close', () => done()));
+  missingTicket.acknowledge(missing);
+  assert.equal(await closedWithin(missingClosed), true);
+  const missingRecord = readCheckRoots(owner).find((row) => row.spawnFailed);
+  assert(missingRecord);
+  assert.equal(missing.pid, undefined);
+  assert.equal(missingRecord.terminal?.code, -2);
+  assert.equal(missingRecord.acknowledgment, undefined);
+  const absent = enrollCheckRoot('fixture', true, owner);
+  absent.failed();
+  assert.equal(readCheckRoots(owner).filter((row) => row.spawnFailed).length, 2);
+  enrollCheckRoot('fixture', true, owner);
+  assert.equal(
+    readCheckRoots(owner).filter((row) => !row.acknowledgment && !row.spawnFailed).length,
+    1,
+  );
+
   const task = TaskSchema.parse((await controller.execute(draft, 'local-owner')).entity);
   const policy = {
     ...fixtures.policy,
@@ -785,9 +1090,10 @@ test('candidate evidence requires unchanged bytes and completed checks', async (
   const module = join(scratch, 'net.mjs');
   writeFileSync(module, Buffer.concat([Buffer.from('process.exit(0);\n'), readFileSync(module)]));
   const metadata = new Map<string, Artifact>();
+  const artifactFiles = new ArtifactFiles(join(directory, 'negative-artifacts'));
   const evidence = new CandidateEvidence({
     home: directory,
-    artifacts: new ArtifactFiles(join(directory, 'negative-artifacts')),
+    artifacts: artifactFiles,
     id,
     getArtifact: (artifactId) => {
       const artifact = metadata.get(artifactId);
@@ -1099,6 +1405,345 @@ test('candidate evidence requires unchanged bytes and completed checks', async (
       );
     }
   }
+  const buildEntries = [
+    { path: '.', kind: 'directory' as const, mode: 0o755 },
+    ...['main', 'preload', 'renderer'].flatMap((path, index) => [
+      { path, kind: 'directory' as const, mode: 0o755 },
+      {
+        path: `${path}/${['index.js', 'index.cjs', 'index.html'][index]}`,
+        kind: 'file' as const,
+        mode: 0o644,
+        bytes: 1,
+        hash: createHash('sha256').update('x').digest('hex'),
+      },
+    ]),
+  ];
+  const buildHash = createHash('sha256');
+  for (const row of [{ version: 1, files: 3, bytes: 3 }, ...buildEntries])
+    buildHash.update(`${JSON.stringify(row)}\n`);
+  const build = {
+    version: 1 as const,
+    entries: buildEntries,
+    files: 3,
+    bytes: 3,
+    hash: buildHash.digest('hex'),
+  };
+  const inventoryHash = createHash('sha256');
+  for (const row of [{ version: 1, workspaces: [] }, { tree: build.hash }])
+    inventoryHash.update(`${JSON.stringify(row)}\n`);
+  const inventory = {
+    version: 1,
+    workspaces: [],
+    projectFiles: [],
+    buildDependencies: [],
+    tree: build,
+    hash: inventoryHash.digest('hex'),
+  };
+  const inventoryReference = artifactFiles.publish(Buffer.from(canonicalJson(inventory)));
+  const executable = {
+    path: join(directory, 'former-runtime', 'missing'),
+    version: 'fixture-v1',
+    sha256: fixtureClientHash,
+  };
+  const fields = {
+    recipeId: 'crewkite-verify-v1' as const,
+    candidateId: captured.candidate.id,
+    candidateHash: captured.candidate.hash,
+    evaluator: 'crewkite-verify-v1:fixture',
+    criteria: task.criteria,
+    baseline: definition.collection,
+    baselineHash: hashCanonical(definition.collection),
+    inventory: inventoryReference,
+    toolchainHash: inventory.hash,
+    lockHash: fixtureClientHash,
+    platform: 'darwin' as const,
+    arch: 'arm64' as const,
+    executables: { node: executable, git: executable, electron: executable },
+    mkfifo: { path: executable.path, sha256: executable.sha256 },
+    entrypoints: {
+      biome: 'node_modules/biome',
+      types: 'node_modules/types.ts',
+      build: 'node_modules/build.ts',
+      desktop: 'node_modules/desktop.ts',
+      electron: 'node_modules/electron',
+    },
+    collection: definition.collection.map((file) => ({
+      ...file,
+      tests: definition.required.tests,
+    })),
+    journey: { file: 'e2e/desktop.spec.ts', title: journeyTitle, hash: fixtureClientHash } as const,
+    stages: [...verificationStages] as [...typeof verificationStages],
+    provenancePattern: 'fixture',
+    maximumMinutes: 5 as const,
+  };
+  const verification = ToolchainDefinitionSchema.parse({
+    ...fields,
+    definitionHash: toolchainDefinitionHash(fields),
+  });
+  const frames = (file: string, names: string[]): CheckEvent[] => {
+    const counts = {
+      tests: names.length,
+      passed: names.length,
+      failed: 0,
+      cancelled: 0,
+      skipped: 0,
+      todo: 0,
+      suites: 0,
+    };
+    return [
+      { type: 'start', version: 1 },
+      ...names.map((name) => ({
+        type: 'test' as const,
+        file,
+        name,
+        kind: 'test' as const,
+        passed: true,
+        skipped: false,
+        todo: false,
+      })),
+      { type: 'summary', file, success: true, counts },
+      { type: 'summary', file: null, success: true, counts },
+      { type: 'end' },
+    ];
+  };
+  const encoded = (rows: CheckEvent[]) =>
+    Buffer.from(`${rows.map((row) => JSON.stringify(row)).join('\n')}\n`).toString('base64');
+  const verificationOwner = { ...owner, directory: join(directory, 'verification-owner') };
+  const execution: VerificationExecution = {
+    version: 1,
+    attemptId: owner.attemptId,
+    generation: owner.generation,
+    definitionHash: verification.definitionHash,
+    stages: verificationStages.map((stage) => ({
+      stage,
+      commandHash: hashCanonical(verificationCommand(verification, stage)),
+      code: 0,
+      signal: null,
+      closed: true,
+      stdout:
+        stage === 'node-tests'
+          ? encoded(frames(definition.required.path, definition.required.tests))
+          : stage === 'desktop'
+            ? encoded(frames(verification.journey.file, [journeyTitle]))
+            : '',
+      stderr: '',
+    })),
+    roots: verificationStages.map((stage, index) => ({
+      id: `00000000-0000-0000-0000-${String(index).padStart(12, '0')}.jsonl`,
+      intent: {
+        type: 'intent',
+        owner: { ...verificationOwner, stage },
+        role: 'stage',
+        detached: true,
+      },
+      acknowledgment: {
+        type: 'ack',
+        pid: faultChild.pid as number,
+        group: faultChild.pid as number,
+      },
+      terminal: { type: 'close', code: 0, signal: null },
+      spawnFailed: false,
+    })),
+    quiescent: true,
+    unchanged: true,
+    build,
+    failure: null,
+  };
+  const record = (value: VerificationExecution) => {
+    const result = evidence.recordVerification({
+      candidate: captured.candidate,
+      definition: verification,
+      execution: value,
+      owner: verificationOwner,
+    });
+    for (const artifact of result.artifacts) metadata.set(artifact.id, artifact);
+    return result;
+  };
+  const complete = record(execution);
+  assert.equal(complete.evidence.passed, true);
+  const workerExit = structuredClone(execution);
+  workerExit.roots.push({
+    ...witnessedExit,
+    intent: { ...witnessedExit.intent, owner: { ...verificationOwner, stage: 'node-tests' } },
+  });
+  assert.equal(record(workerExit).evidence.passed, true);
+  for (const change of [
+    (value: VerificationExecution) => {
+      value.roots[value.roots.length - 1].intent.role = 'stage';
+    },
+    (value: VerificationExecution) => {
+      const event = value.roots[value.roots.length - 1].exitEvent;
+      assert(event);
+      event.pid += 1;
+    },
+    (value: VerificationExecution) => {
+      delete value.roots[value.roots.length - 1].acknowledgment;
+    },
+  ]) {
+    const value = structuredClone(workerExit);
+    change(value);
+    assert.throws(() => record(value));
+  }
+  const invalidClose = structuredClone(workerExit);
+  invalidClose.roots[invalidClose.roots.length - 1].terminal = {
+    type: 'close',
+    code: null,
+    signal: null,
+  };
+  assert.equal(record(invalidClose).evidence.passed, false);
+  const failedSpawn = structuredClone(execution);
+  failedSpawn.roots.push({
+    ...missingRecord,
+    intent: { ...missingRecord.intent, owner: verificationOwner },
+  });
+  assert.equal(record(failedSpawn).evidence.passed, true);
+  const negativeStage = structuredClone(execution);
+  negativeStage.stages[0].code = -2;
+  assert.throws(() => record(negativeStage));
+  const mutations: { name: string; change: (value: VerificationExecution) => void }[] = [
+    { name: 'missing stage', change: (value) => void value.stages.pop() },
+    {
+      name: 'command binding',
+      change: (value) => {
+        value.stages[0].commandHash = fixtureClientHash;
+      },
+    },
+    {
+      name: 'failed stage',
+      change: (value) => {
+        value.stages[0].code = 1;
+      },
+    },
+    {
+      name: 'unclosed root',
+      change: (value) => {
+        delete value.roots[0].terminal;
+      },
+    },
+    {
+      name: 'unacknowledged root',
+      change: (value) => {
+        delete value.roots[0].acknowledgment;
+      },
+    },
+    {
+      name: 'wrong owner',
+      change: (value) => {
+        value.roots[0].intent.owner.generation += 1;
+      },
+    },
+    {
+      name: 'wrong candidate definition',
+      change: (value) => {
+        value.definitionHash = fixtureClientHash;
+      },
+    },
+    {
+      name: 'truncated Node report',
+      change: (value) => {
+        value.stages[3].stdout = encoded(
+          frames(definition.required.path, definition.required.tests).slice(0, -1),
+        );
+      },
+    },
+    {
+      name: 'wrong collected test',
+      change: (value) => {
+        value.stages[3].stdout = encoded(frames(definition.required.path, ['other']));
+      },
+    },
+    {
+      name: 'changed build inventory',
+      change: (value) => {
+        if (value.build) value.build = { ...value.build, hash: fixtureClientHash };
+      },
+    },
+    {
+      name: 'unfinished cleanup',
+      change: (value) => {
+        value.quiescent = false;
+      },
+    },
+  ];
+  for (const row of mutations) {
+    const changed = structuredClone(execution);
+    row.change(changed);
+    assert.equal(record(changed).evidence.passed, false, row.name);
+  }
+  const reporter = new URL('../evidence/desktop-reporter.ts', import.meta.url).href;
+  for (const scenario of [
+    'passed',
+    'retry',
+    'expected failure',
+    'extra case',
+    'error',
+    'missing exit',
+  ]) {
+    const output = spawnSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        `
+      import Reporter from ${JSON.stringify(reporter)};
+      const scenario = ${JSON.stringify(scenario)};
+      const reporter = new Reporter();
+      const test = { id: 'journey', title: ${JSON.stringify(journeyTitle)},
+        location: { file: ${JSON.stringify(resolve('e2e/desktop.spec.ts'))} },
+        expectedStatus: scenario === 'expected failure' ? 'failed' : 'passed' };
+      reporter.onBegin({}, { allTests: () => scenario === 'extra case' ? [test, test] : [test] });
+      reporter.onTestEnd(test, { status: 'passed', retry: scenario === 'retry' ? 1 : 0, errors: [] });
+      if (scenario === 'error') reporter.onError();
+      reporter.onEnd({ status: 'passed' });
+      if (scenario !== 'missing exit') await reporter.onExit();
+    `,
+      ],
+      {
+        env: {
+          LANG: 'C',
+          CREWKITE_CHECK_JOURNEY: JSON.stringify({
+            file: verification.journey.file,
+            title: verification.journey.title,
+          }),
+        },
+        timeout: 5000,
+        maxBuffer: 65536,
+      },
+    );
+    assert.equal(output.error, undefined, scenario);
+    assert.equal(output.status, 0, scenario);
+    const changed = structuredClone(execution);
+    changed.stages[5].stdout = output.stdout.toString('base64');
+    assert.equal(record(changed).evidence.passed, scenario === 'passed', scenario);
+  }
+  const savedArtifact = metadata.get(complete.evidence.artifactId);
+  assert(savedArtifact);
+  const savedMetadata = JSON.parse(artifactFiles.read(savedArtifact.hash).toString('utf8'));
+  const historicalInput = {
+    candidate: captured.candidate,
+    definition: verification,
+    metadata: savedMetadata,
+    owner: verificationOwner,
+  };
+  const kill = t.mock.method(process, 'kill', () => {
+    throw Error('Historical evidence probed a PID.');
+  });
+  try {
+    assert.equal(evidence.verificationMatches(historicalInput), true);
+    assert.equal(kill.mock.callCount(), 0);
+  } finally {
+    kill.mock.restore();
+  }
+  assert.equal(
+    evidence.verificationMatches({
+      ...historicalInput,
+      owner: { ...verificationOwner, generation: 1 },
+    }),
+    false,
+  );
+  const proofReference = savedMetadata.verification.artifact;
+  metadata.set(proofReference.id, { ...proofReference, hash: fixtureClientHash });
+  assert.equal(evidence.verificationMatches(historicalInput), false);
 });
 
 function binding(approval: Approval) {
@@ -2137,6 +2782,7 @@ async function nativeSetup(
     : google
       ? {
           ...reviewerProfile,
+          environment: { ...reviewerProfile.environment, HOME: userInfo().homedir },
           client: {
             executable: process.execPath,
             sha256: fixtureClientHash,
@@ -3266,6 +3912,14 @@ test('an appointed native proposal is retained and applied once after every phas
       scenario === 'anthropic-checked' ||
       scenario === 'google-checked';
     console.error(`Native fixture row: evaluation/${scenario}`);
+    const inventoryEntered = Promise.withResolvers<void>();
+    const inventoryRelease = Promise.withResolvers<void>();
+    let inventoryCalls = 0;
+    let inventorySignal: AbortSignal | undefined;
+    const socketRoot =
+      scenario === 'repository-checked'
+        ? mkdtempSync(join(realpathSync(checkOwner()?.stateRoot ?? tmpdir()), 'ck-socket-'))
+        : undefined;
     const context = await nativeSetup(
       t,
       scenario === 'anthropic-checked' ||
@@ -3277,8 +3931,37 @@ test('an appointed native proposal is retained and applied once after every phas
           : scenario === 'review-blocked'
             ? 'checked-blocked'
             : 'checked',
+      scenario === 'repository-checked'
+        ? {
+            home: join(socketRoot as string, 'home'),
+            prepareVerification: async (input) => {
+              inventoryCalls++;
+              inventorySignal = input.budget.signal;
+              inventoryEntered.resolve();
+              await inventoryRelease.promise;
+              throw Error(
+                input.budget.signal?.aborted
+                  ? 'cancelled inventory'
+                  : 'incomplete inventory fixture',
+              );
+            },
+          }
+        : {},
     );
+    if (socketRoot)
+      t.after(async () => {
+        inventoryRelease.resolve();
+        await context.controller.close();
+        rmSync(socketRoot, { recursive: true, force: true });
+      });
     let controller = context.controller;
+    if (scenario === 'repository-checked') {
+      context.appointment.policy.limits.minutes = 10;
+      assert.equal(context.appointment.policy.unknownUsage.rule, 'fixed-allowance');
+      if (context.appointment.policy.unknownUsage.rule === 'fixed-allowance')
+        context.appointment.policy.unknownUsage.allowance.minutes = 10;
+    }
+
     const { command, task, appointment, clock } = context;
     const retained = nativeCandidate(controller);
     if (passedReview) {
@@ -3413,6 +4096,84 @@ test('an appointed native proposal is retained and applied once after every phas
       ],
     };
     const revision = () => taskRevision(controller, task.id);
+    if (scenario === 'repository-checked') {
+      const policy = process.env.PROVENANCE_PATTERN;
+      process.env.PROVENANCE_PATTERN = 'private fixture identity';
+      const server = await serveController(controller);
+      const client = await connectController({
+        ...readControllerEndpoint(controller.home),
+        actor: { id: 'terminal', kind: 'cli' },
+        timeoutMs: 2000,
+      });
+      const send = (input: unknown) => client.command(CommandSchema.parse(input));
+      const fixedPayload = {
+        ...payload,
+        checkRecipeId: 'crewkite-verify-v1',
+        grants: payload.grants.map((grant) =>
+          grant.action === 'run-check' ? { ...grant, target: 'crewkite verify' } : grant,
+        ),
+      };
+      const preparing = command('PrepareCandidateEvaluation', fixedPayload, revision());
+      const artifactsBefore = controller.store.list('artifact').length;
+      const pending = send(preparing);
+      let repeat: Promise<unknown> | undefined;
+      try {
+        await context.wait('verification inventory entered', inventoryEntered.promise);
+        repeat = controller.execute(preparing, 'local-owner');
+        assert.equal(inventoryCalls, 1);
+        assert.equal(
+          (
+            await controller.execute(
+              { ...preparing, payload: { ...fixedPayload, consent: 'saved' } },
+              'local-owner',
+            )
+          ).reason,
+          'idempotency-key-reused',
+        );
+        assert.equal(
+          (
+            await controller.execute(
+              { ...preparing, command: 'StopRun', payload: { taskId: task.id, runId: run.id } },
+              'local-owner',
+            )
+          ).reason,
+          'idempotency-key-reused',
+        );
+        assert.equal(
+          (await send(command('PrepareCandidateEvaluation', fixedPayload, revision()))).reason,
+          'verification-preparation-busy',
+        );
+        const read = await send(command('GetSnapshot', {}));
+        assert.equal(read.outcome, 'applied');
+        assert(read.data?.kind === 'snapshot');
+        assert(read.data.snapshot.tasks.some((value) => value.id === task.id));
+        assert.equal(controller.store.receipt(preparing.key), undefined);
+        const stopped = await send(
+          command('StopRun', { taskId: task.id, runId: run.id }, revision()),
+        );
+        assert.equal(stopped.outcome, 'applied');
+        assert.equal(inventorySignal?.aborted, true);
+        inventoryRelease.resolve();
+        const result = await context.wait('cancelled verification preparation', pending);
+        assert.equal(result.outcome, 'stale-revision');
+        assert.deepEqual(await context.wait('joined verification preparation', repeat), result);
+        assert.equal(inventoryCalls, 1);
+        assert.equal(controller.store.receipt(`evaluation-ready:${run.id}`), undefined);
+        assert.equal(controller.store.list('artifact').length, artifactsBefore);
+        assert.equal(
+          (await send(command('PrepareCandidateEvaluation', fixedPayload, revision()))).reason,
+          'verification-preparation-unavailable',
+        );
+        assert.equal(inventoryCalls, 2);
+      } finally {
+        inventoryRelease.resolve();
+        await Promise.allSettled([pending, ...(repeat ? [repeat] : [])]);
+        client.close();
+        await server.close();
+        if (policy === undefined) delete process.env.PROVENANCE_PATTERN;
+        else process.env.PROVENANCE_PATTERN = policy;
+      }
+    }
     if (scenario === 'checked') {
       for (const change of [
         { consent: 'saved' },

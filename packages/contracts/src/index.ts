@@ -665,6 +665,7 @@ export const CommandSchema = z.discriminatedUnion('command', [
         checkRecipeId: z.literal('project-node-tests-v1'),
         testFiles: ProjectNodeTestFilesSchema,
       }),
+      z.strictObject({ ...evaluationFields, checkRecipeId: z.literal('crewkite-verify-v1') }),
     ]),
   ),
   mutate(
@@ -811,6 +812,29 @@ const localAcceptance = z
   })
   .refine((value) => value.available === (value.reason === 'available'))
   .default({ available: false, reason: 'evidence-incomplete' });
+const verificationExecutable = z.strictObject({ version: label, sha256: HashSchema });
+export const CrewKiteVerifyPreviewSchema = z.strictObject({
+  toolchainHash: HashSchema,
+  baselineHash: HashSchema,
+  lockHash: HashSchema,
+  platform: z.literal('darwin'),
+  arch: z.literal('arm64'),
+  executables: z.strictObject({
+    node: verificationExecutable,
+    electron: verificationExecutable,
+    git: verificationExecutable,
+  }),
+  stages: z.tuple([
+    z.literal('policy'),
+    z.literal('lint'),
+    z.literal('types'),
+    z.literal('node-tests'),
+    z.literal('build'),
+    z.literal('desktop'),
+  ]),
+  maximumMinutes: z.literal(5),
+});
+export type CrewKiteVerifyPreview = z.infer<typeof CrewKiteVerifyPreviewSchema>;
 export const CandidateEvaluationPreviewSchema = z
   .strictObject({
     taskId: TaskIdSchema,
@@ -818,7 +842,8 @@ export const CandidateEvaluationPreviewSchema = z
     candidateId: CandidateIdSchema,
     candidateHash: HashSchema,
     preparationId: ArtifactIdSchema,
-    recipe: z.enum(['node-tests-v1', 'project-node-tests-v1']),
+    recipe: z.enum(['node-tests-v1', 'project-node-tests-v1', 'crewkite-verify-v1']),
+    verification: CrewKiteVerifyPreviewSchema.optional(),
     testFiles: z
       .array(
         z.strictObject({
@@ -880,10 +905,15 @@ export const CandidateEvaluationPreviewSchema = z
     const paths = value.testFiles.map((file) => file.path);
     if (
       (value.recipe === 'project-node-tests-v1' && paths.length === 0) ||
-      (value.recipe === 'node-tests-v1' && paths.length !== 0) ||
+      (value.recipe !== 'project-node-tests-v1' && paths.length !== 0) ||
       new Set(paths).size !== paths.length
     )
       context.addIssue({ code: 'custom', message: 'Check files must match the selected recipe.' });
+    if (
+      (value.recipe === 'crewkite-verify-v1' && !value.verification) ||
+      (value.recipe !== 'crewkite-verify-v1' && Object.hasOwn(value, 'verification'))
+    )
+      context.addIssue({ code: 'custom', message: 'Verification must match the selected recipe.' });
   });
 export type CandidateEvaluationPreview = z.infer<typeof CandidateEvaluationPreviewSchema>;
 

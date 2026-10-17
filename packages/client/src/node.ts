@@ -263,14 +263,21 @@ export class ControllerClient {
     const socket = this.socket;
     const frame = encodeFrame({ type: 'command', command });
     return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(command.key);
-        resolve({
-          outcome: 'outcome-unknown',
-          reason: 'response-timeout',
-          next: 'Read a fresh snapshot and retry the same command key if needed.',
-        });
-      }, this.options.timeoutMs ?? 5000);
+      const timer = setTimeout(
+        () => {
+          this.pending.delete(command.key);
+          resolve({
+            outcome: 'outcome-unknown',
+            reason: 'response-timeout',
+            next: 'Read a fresh snapshot and retry the same command key if needed.',
+          });
+        },
+        this.options.timeoutMs ??
+          (command.command === 'PrepareCandidateEvaluation' &&
+          command.payload.checkRecipeId === 'crewkite-verify-v1'
+            ? 65000
+            : 5000),
+      );
       this.pending.set(command.key, { resolve, timer });
       socket.write(frame);
     });

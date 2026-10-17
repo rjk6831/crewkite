@@ -361,6 +361,31 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     },
   };
   assert.ok(CommandSchema.safeParse(projectChecks).success);
+  const toolchainChecks = {
+    ...evaluation,
+    payload: { ...evaluation.payload, checkRecipeId: 'crewkite-verify-v1' },
+  };
+  assert.deepEqual(CommandSchema.parse(toolchainChecks), {
+    ...toolchainChecks,
+    payload: { ...toolchainChecks.payload, creditPolicy: 'ordinary' },
+  });
+  for (const change of [
+    { argv: ['verify'] },
+    { executable: '/usr/bin/node' },
+    { donorPath: '/tmp/dependencies' },
+    { toolchainId: 'installed' },
+    { testFiles: [] },
+    { maximumMinutes: 10 },
+    { environment: { PATH: '/usr/bin' } },
+    { verification: {} },
+  ])
+    assert.equal(
+      CommandSchema.safeParse({
+        ...toolchainChecks,
+        payload: { ...toolchainChecks.payload, ...change },
+      }).success,
+      false,
+    );
   for (const testFiles of [
     [],
     ['a.test.mjs', 'a.test.mjs'],
@@ -415,6 +440,59 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     localAcceptance: { available: false, reason: 'evidence-incomplete' },
   };
   assert.deepEqual(CandidateEvaluationPreviewSchema.parse(preview), preview);
+  const { testFiles: _legacyFiles, ...legacyPreview } = preview;
+  assert.deepEqual(CandidateEvaluationPreviewSchema.parse(legacyPreview), preview);
+  const verification = {
+    toolchainHash: 'c'.repeat(64),
+    baselineHash: 'd'.repeat(64),
+    lockHash: 'e'.repeat(64),
+    platform: 'darwin',
+    arch: 'arm64',
+    executables: {
+      node: { version: '24.22.0', sha256: '1'.repeat(64) },
+      electron: { version: '44.7.2', sha256: '3'.repeat(64) },
+      git: { version: '2.50.1', sha256: '4'.repeat(64) },
+    },
+    stages: ['policy', 'lint', 'types', 'node-tests', 'build', 'desktop'],
+    maximumMinutes: 5,
+  };
+  const verificationPreview = { ...preview, recipe: 'crewkite-verify-v1', verification };
+  assert.deepEqual(
+    CandidateEvaluationPreviewSchema.parse(verificationPreview),
+    verificationPreview,
+  );
+  for (const invalid of [
+    { ...verificationPreview, verification: undefined },
+    {
+      ...verificationPreview,
+      testFiles: [{ path: 'a.test.mjs', hash: 'a'.repeat(64), bytes: 1, mode: '100644' }],
+    },
+    { ...preview, verification },
+    { ...preview, verification: undefined },
+    { ...verificationPreview, verification: { ...verification, maximumMinutes: 1 } },
+    {
+      ...verificationPreview,
+      verification: { ...verification, stages: verification.stages.slice(1) },
+    },
+    {
+      ...verificationPreview,
+      verification: { ...verification, stages: [...verification.stages].reverse() },
+    },
+    { ...verificationPreview, verification: { ...verification, platform: 'linux' } },
+    { ...verificationPreview, verification: { ...verification, donorPath: '/tmp/dependencies' } },
+    { ...verificationPreview, verification: { ...verification, toolchainHash: 'unknown' } },
+    {
+      ...verificationPreview,
+      verification: {
+        ...verification,
+        executables: {
+          ...verification.executables,
+          node: { ...verification.executables.node, path: '/usr/bin/node' },
+        },
+      },
+    },
+  ])
+    assert.equal(CandidateEvaluationPreviewSchema.safeParse(invalid).success, false);
   const { target: _previewTarget, ...previewFields } = preview;
   const repositoryPreview = { ...previewFields, repository: repositoryRun.repository };
   assert.deepEqual(CandidateEvaluationPreviewSchema.parse(repositoryPreview), repositoryPreview);

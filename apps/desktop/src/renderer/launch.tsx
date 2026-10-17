@@ -107,6 +107,19 @@ const evaluationReasons = {
   'grant-unavailable': 'The exact permission is expired, revoked or already used.',
   'budget-exhausted': 'The original run has no remaining execution slot.',
 };
+const evaluationRecipes = {
+  'node-tests-v1': 'Sample project tests',
+  'project-node-tests-v1': 'Project Node tests',
+  'crewkite-verify-v1': 'CrewKite verification',
+};
+const verificationStages = {
+  policy: 'Policy',
+  lint: 'Lint',
+  types: 'Types',
+  'node-tests': 'Node tests',
+  build: 'Desktop build',
+  desktop: 'Desktop journey',
+};
 const evaluationStages = {
   prepared: 'Prepared',
   checking: 'Running local checks',
@@ -170,6 +183,8 @@ export function NativeEvaluation({
   const methodName = (id: ReviewMethod['id']) =>
     methodCatalog.find((value) => value.id === id)?.name ?? 'Unavailable method';
   const projectTests = recipe === 'project-node-tests-v1';
+  const fullVerification = recipe === 'crewkite-verify-v1';
+  const visibleRecipe = prepared && !editing ? prepared.recipe : recipe;
   const testFiles = ProjectNodeTestFilesSchema.safeParse(
     testFileInput.split(/\r?\n/u).filter((path) => path.length > 0),
   );
@@ -210,12 +225,17 @@ export function NativeEvaluation({
           candidateId: candidate.id,
           ...(projectTests && testFiles.success
             ? { checkRecipeId: 'project-node-tests-v1' as const, testFiles: testFiles.data }
-            : { checkRecipeId: 'node-tests-v1' as const }),
+            : fullVerification
+              ? { checkRecipeId: 'crewkite-verify-v1' as const }
+              : { checkRecipeId: 'node-tests-v1' as const }),
           reviewer: { profileId: profile.id, methodId: method.id, cycles: 1 },
           creditPolicy: existingCredits ? 'existing-credits' : 'ordinary',
           consent: savedConsent ? 'saved' : 'explicit',
           grants: [
-            { action: 'run-check' as const, target: 'node --test' },
+            {
+              action: 'run-check' as const,
+              target: fullVerification ? 'crewkite verify' : 'node --test',
+            },
             {
               action: 'run-review' as const,
               target: formatReviewTarget({ methodId: method.id, cycle: 1 }),
@@ -279,10 +299,21 @@ export function NativeEvaluation({
         Prepare one local check and one additional native review. Both use the remaining original
         run limits. The review uses a fresh process. It can use the same model as the writer.
       </p>
-      {(prepared && !editing ? prepared.recipe === 'project-node-tests-v1' : projectTests) && (
+      {visibleRecipe === 'project-node-tests-v1' && (
         <p className="muted small">
           Local code runs with your system permissions. Dependencies are not installed. Imports can
           use Node built-ins and files in the check copy.
+        </p>
+      )}
+      {visibleRecipe === 'crewkite-verify-v1' && (
+        <p className="muted small">
+          Local code runs with your system permissions. Installed dependencies and Electron are
+          copied on macOS arm64. Local Node and Git are verified. Dependencies are not installed.
+        </p>
+      )}
+      {fullVerification && workspace.pending && (!prepared || editing) && (
+        <p className="muted small" role="status">
+          Preparing verification tools...
         </p>
       )}
       {message && (
@@ -301,14 +332,7 @@ export function NativeEvaluation({
             ) : (
               <Fact label="Target" value={prepared.target?.path ?? 'Unavailable'} />
             )}
-            <Fact
-              label="Checks"
-              value={
-                prepared.recipe === 'project-node-tests-v1'
-                  ? 'Project Node tests'
-                  : 'Sample project tests'
-              }
-            />
+            <Fact label="Checks" value={evaluationRecipes[prepared.recipe]} />
             <Fact label="Reviewer" value={preparedProfile?.displayName ?? 'Unavailable profile'} />
             <Fact label="Role" value={roleLabels[prepared.reviewer.assignedRole]} />
             <Fact label="Method" value={methodName(prepared.reviewer.methodId)} />
@@ -326,6 +350,13 @@ export function NativeEvaluation({
             <Fact label="Remaining total attempts" value={prepared.remainingBudgets.attempts} />
             <Fact label="Remaining total minutes" value={prepared.remainingBudgets.minutes} />
           </div>
+          {prepared.verification && (
+            <p className="muted small">
+              {prepared.verification.stages.map((stage) => verificationStages[stage]).join(', ')}.
+              Maximum {prepared.verification.maximumMinutes} minutes for staging, checks and
+              cleanup.
+            </p>
+          )}
           {prepared.testFiles.length > 0 && (
             <div>
               <p>Committed test files</p>
@@ -360,6 +391,21 @@ export function NativeEvaluation({
                 Test file {file.path}, {file.hash}, {file.bytes} bytes, {file.mode}
               </code>
             ))}
+            {prepared.verification && (
+              <>
+                <code>Toolchain {prepared.verification.toolchainHash}</code>
+                <code>Baseline {prepared.verification.baselineHash}</code>
+                <code>Lockfile {prepared.verification.lockHash}</code>
+                <code>
+                  {prepared.verification.platform} {prepared.verification.arch}
+                </code>
+                {Object.entries(prepared.verification.executables).map(([name, executable]) => (
+                  <code key={name}>
+                    {name} {executable.version}, {executable.sha256}
+                  </code>
+                ))}
+              </>
+            )}
             <code>Reviewer profile {prepared.reviewer.profileId}</code>
             <code>Review method {prepared.reviewer.methodId}, cycle 1, process-only</code>
             {prepared.check && <code>Check artifact {prepared.check.artifactId}</code>}
@@ -423,7 +469,8 @@ export function NativeEvaluation({
             <code>Source base {run?.source.base ?? 'Unavailable'}</code>
           </details>
           <p className="muted small">
-            Preparation saves the check definition and permissions. It starts no work.
+            Preparation records the check definition and permissions. Checks and review start
+            separately.
           </p>
           <label>
             Test setup
@@ -433,13 +480,16 @@ export function NativeEvaluation({
                 setRecipe(
                   event.target.value === 'project-node-tests-v1'
                     ? 'project-node-tests-v1'
-                    : 'node-tests-v1',
+                    : event.target.value === 'crewkite-verify-v1'
+                      ? 'crewkite-verify-v1'
+                      : 'node-tests-v1',
                 );
                 resetConsent();
               }}
             >
               <option value="node-tests-v1">Sample project tests</option>
               <option value="project-node-tests-v1">Project Node tests</option>
+              <option value="crewkite-verify-v1">CrewKite verification</option>
             </select>
           </label>
           {projectTests ? (
@@ -467,8 +517,14 @@ export function NativeEvaluation({
                 Choose 1 to 32 distinct committed files. Globs are unavailable.
               </p>
             </>
-          ) : (
+          ) : !fullVerification ? (
             <p className="muted small">The built-in checks cover the sample net.mjs project.</p>
+          ) : (
+            <p className="muted small">
+              Runs policy, lint, types, Node tests, the desktop build and the desktop journey.
+              Staging, checks and cleanup share a five-minute limit. The original run needs six
+              remaining minutes and two attempts, including the later review.
+            </p>
           )}
           {!supported && (
             <p className="notice">
@@ -533,7 +589,7 @@ export function NativeEvaluation({
           <p className="muted small">
             Native guidance may apply. Tool containment and a provider hard spending cap remain
             unqualified.{' '}
-            {projectTests
+            {projectTests || fullVerification
               ? 'Checks use an independent candidate copy.'
               : 'The original source checkout stays unchanged.'}
           </p>
@@ -566,9 +622,11 @@ export function NativeEvaluation({
               checked={checkPermission}
               onChange={(event) => setCheckPermission(event.target.checked)}
             />
-            {projectTests
-              ? 'Allow one local run of the selected project tests'
-              : 'Allow one local test run'}
+            {fullVerification
+              ? 'Allow one full local verification run'
+              : projectTests
+                ? 'Allow one local run of the selected project tests'
+                : 'Allow one local test run'}
           </label>
           <label className="checkbox-label">
             <input
