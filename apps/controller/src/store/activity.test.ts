@@ -13,15 +13,18 @@ import {
   type TaskActivityRequest,
   TaskActivityRequestSchema,
 } from '@crewkite/contracts';
+import { Controller } from '../commands/controller.ts';
 import { taskActivityPage } from './activity.ts';
 import { Store } from './index.ts';
 
-test('task activity pages retain every whole event across cursor and byte boundaries', (t) => {
+test('task activity pages retain every whole event across cursor and byte boundaries', async (t) => {
   const directory = mkdtempSync(join(resolve('internal'), 'activity-page-test-'));
   const path = join(directory, 'state.sqlite');
   let store = new Store(path);
-  t.after(() => {
-    store.close();
+  let controller: Controller | undefined;
+  t.after(async () => {
+    if (controller) await controller.close();
+    else store.close();
     rmSync(directory, { recursive: true, force: true });
   });
   store.applyMigrations(fileURLToPath(new URL('../../migrations/', import.meta.url)));
@@ -100,7 +103,13 @@ test('task activity pages retain every whole event across cursor and byte bounda
   assert.deepEqual(read(undefined, 100), beforeReopen);
   assert.equal(store.db.prepare('SELECT total_changes() AS count').get()?.count, changes);
   store.close();
-  store = new Store(path);
+  controller = new Controller({
+    home: directory,
+    now: () => '2026-10-18T00:00:00.000Z',
+    nativeProfiles: () => [],
+    googleUsageClient: () => ({ available: false, reason: 'client-unavailable' }),
+  });
+  store = controller.store;
   assert.deepEqual(read(undefined, 100), beforeReopen);
 
   const envelope = {
@@ -109,6 +118,25 @@ test('task activity pages retain every whole event across cursor and byte bounda
     actor: { id: 'terminal', kind: 'cli' },
     command: 'GetTaskActivity',
   };
+  const dispatch = (payload: unknown) =>
+    controller?.execute({ ...envelope, payload }, 'local-owner');
+  const stateBeforeRead = store.db.prepare('SELECT total_changes() AS count').get()?.count;
+  assert.deepEqual(await dispatch({ taskId: task.id, limit: 17 }), {
+    outcome: 'applied',
+    data: read(undefined, 17),
+  });
+  assert.deepEqual(
+    await dispatch({ taskId: task.id, beforeCursor: first.nextBeforeCursor, limit: 9 }),
+    {
+      outcome: 'applied',
+      data: read(first.nextBeforeCursor as string, 9),
+    },
+  );
+  assert.deepEqual(await dispatch({ taskId: id('tsk', 999) }), {
+    outcome: 'blocked',
+    reason: 'task-not-found',
+  });
+  assert.equal(store.db.prepare('SELECT total_changes() AS count').get()?.count, stateBeforeRead);
   assert(CommandSchema.safeParse({ ...envelope, payload: { taskId: task.id } }).success);
   assert.equal(
     CommandSchema.safeParse({ ...envelope, expectedRevision: 0, payload: { taskId: task.id } })
@@ -156,6 +184,11 @@ test('task activity pages retain every whole event across cursor and byte bounda
     }),
   );
   assert.throws(() => read(), /activity-event-too-large/);
+  assert.deepEqual(await dispatch({ taskId: task.id }), {
+    outcome: 'blocked',
+    reason: 'activity-event-too-large',
+    next: 'One retained event exceeds the page size. No history was skipped.',
+  });
   assert.deepEqual(read(tooLarge.cursor, 1).events, [highEvent]);
   const afterLarge = append(task.id, 'A small event after the oversized row.');
   const boundary = read();
@@ -168,4 +201,9 @@ test('task activity pages retain every whole event across cursor and byte bounda
     .prepare('UPDATE events SET body=? WHERE event_id=?')
     .run(JSON.stringify({ ...highEvent, cursor: '1' }), highEvent.id);
   assert.throws(() => read(), /activity-history-invalid/);
+  assert.deepEqual(await dispatch({ taskId: task.id }), {
+    outcome: 'blocked',
+    reason: 'activity-history-unavailable',
+    next: 'Retained activity could not be read. No history was skipped.',
+  });
 });

@@ -267,6 +267,7 @@ import {
 import { repositoryPlan, startRepository } from '../providers/openai/repository.ts';
 import { type ReviewPlan, reviewPlan, startReview } from '../providers/openai/review.ts';
 import { chooseRoute } from '../routing/index.ts';
+import { taskActivityPage } from '../store/activity.ts';
 import { createIds, type IdPrefix } from '../store/ids.ts';
 import {
   type CombinedDispatch,
@@ -2336,6 +2337,22 @@ export class Controller {
             eof: command.payload.offset + chunk.length >= bytes.length,
           },
         };
+      }
+      case 'GetTaskActivity': {
+        if (!this.store.get<Task>('task', command.payload.taskId))
+          return { outcome: 'blocked', reason: 'task-not-found' };
+        try {
+          return { outcome: 'applied', data: taskActivityPage(this.store.db, command.payload) };
+        } catch (error) {
+          const oversized = error instanceof Error && error.message === 'activity-event-too-large';
+          return {
+            outcome: 'blocked',
+            reason: oversized ? 'activity-event-too-large' : 'activity-history-unavailable',
+            next: oversized
+              ? 'One retained event exceeds the page size. No history was skipped.'
+              : 'Retained activity could not be read. No history was skipped.',
+          };
+        }
       }
       case 'GetSnapshot':
         return { outcome: 'applied', data: { kind: 'snapshot', snapshot: this.snapshot() } };
