@@ -699,7 +699,8 @@ test('native proposals and reviews require one matching completed turn and bound
     const expectedHash = hashCanonical(expectedBinding);
     const review = new ReviewTranscript(selected, { now: () => 1, timeoutMs: 180_000 });
     if (row.mode === 'external-mutation') {
-      selected.binding.writerRouteId = selected.binding.routeId;
+      if ('writerRouteId' in selected.binding)
+        selected.binding.writerRouteId = selected.binding.routeId;
       selected.context.criteria[0] = 'changed after construction';
     }
     const thread = metadata(review);
@@ -848,6 +849,110 @@ test('native proposals and reviews require one matching completed turn and bound
   assert.deepEqual(collectionTask.repository, repositoryData.repository);
   assert.equal(collectionTask.path, undefined);
   assert.equal(collectionTask.bindingHash, hashCanonical(repositoryData.binding));
+  const combinedId = (prefix: string, index: number) =>
+    `${prefix}_01M51M322B2AEBXD9MA74CBCF${index}`;
+  const { writerAttemptId: _attempt, writerRouteId: _route, ...reviewBinding } = reviewData.binding;
+  const combinedData = {
+    ...repositoryData,
+    binding: {
+      ...reviewBinding,
+      assignedRole: 'reviewer' as const,
+      origin: {
+        kind: 'combined' as const,
+        taskId: reviewBinding.taskId,
+        runId: reviewBinding.runId,
+        preparationId: combinedId('art', 0),
+        manifestHash: 'a'.repeat(64),
+        generation: 0,
+        sourceBase: repositoryData.repository.sourceBase,
+        sourceManifestHash: repositoryData.repository.sourceManifestHash,
+        policyHash: 'c'.repeat(64),
+        criteriaHash: hashCanonical(repositoryData.context.criteria),
+        contributors: [1, 2].map((index) => ({
+          taskId: combinedId('tsk', index),
+          runId: combinedId('run', index),
+          attemptId: combinedId('att', index),
+          generation: 0,
+          routeId: combinedId('rte', index),
+          candidateId: combinedId('cnd', index),
+          candidateHash: `${index}`.repeat(64),
+          scopeHash: 'd'.repeat(64),
+        })) as [
+          import('@crewkite/contracts').CombinedOrigin['contributors'][0],
+          import('@crewkite/contracts').CombinedOrigin['contributors'][1],
+        ],
+        steps: [0, 1].map((index) => ({
+          candidateId: combinedId('cnd', index + 3),
+          candidateHash: index === 0 ? 'e'.repeat(64) : reviewBinding.candidateHash,
+          definitionHash: 'f'.repeat(64),
+          checkArtifactId: combinedId('art', index + 1),
+          previousTree: (index === 0 ? 'a' : 'b').repeat(40),
+          nextTree: (index === 0 ? 'b' : 'c').repeat(40),
+        })) as [
+          import('@crewkite/contracts').CombinedOrigin['steps'][0],
+          import('@crewkite/contracts').CombinedOrigin['steps'][1],
+        ],
+        candidateId: reviewBinding.candidateId,
+        candidateHash: reviewBinding.candidateHash,
+      },
+    },
+  };
+  for (const mode of ['passed', 'stale-origin', 'external-mutation', 'approval'] as const) {
+    const selected = reviewPlan(combinedData);
+    const expected = structuredClone(selected.binding);
+    const reader = new ReviewTranscript(selected, { now: () => 1, timeoutMs: 180_000 });
+    if (mode === 'external-mutation' && 'origin' in selected.binding)
+      selected.binding.origin.contributors[0].scopeHash = '0'.repeat(64);
+    metadata(reader);
+    reader.push(bytes({ id: 10, result: threadResult(directory) }));
+    const request = JSON.parse(Buffer.from(reader.next() as Uint8Array).toString());
+    const task = JSON.parse(request.params.input[0].text.split('\n').slice(1).join('\n'));
+    assert.deepEqual(task.binding, expected);
+    assert.deepEqual(task.repository, repositoryData.repository);
+    assert.equal(task.binding.writerAttemptId, undefined);
+    assert.equal(task.binding.writerRouteId, undefined);
+    assert.equal(task.bindingHash, hashCanonical(expected));
+    reader.push(bytes({ id: 11, result: { turn: running } }));
+    const stale = structuredClone(expected);
+    if ('origin' in stale) stale.origin.generation++;
+    const response = {
+      version: 1,
+      bindingHash: mode === 'stale-origin' ? hashCanonical(stale) : hashCanonical(expected),
+      methodId: 'keep-it-simple',
+      cycle: 1,
+      outcome: 'passed',
+      findings: [],
+      summary: 'Both contributions meet the parent criteria.',
+    };
+    const perform = () => {
+      for (const frame of output(
+        directory,
+        mode === 'approval' ? 'approval' : 'success',
+        'net.mjs',
+        response,
+      ))
+        reader.push(bytes(frame));
+      return reader.finish();
+    };
+    if (mode === 'stale-origin' || mode === 'approval') assert.throws(perform, mode);
+    else {
+      assert.deepEqual(perform().review, response);
+      assert.equal(reader.finish().qualified, false);
+    }
+  }
+  for (const value of [
+    { ...combinedData, binding: { ...combinedData.binding, writerAttemptId: _attempt } },
+    { ...combinedData, binding: { ...combinedData.binding, writerRouteId: _route } },
+    { ...combinedData, binding: { ...combinedData.binding, candidateHash: '0'.repeat(64) } },
+    { ...combinedData, context: { ...combinedData.context, criteria: ['Other criteria.'] } },
+    { ...combinedData, repository: { ...combinedData.repository, sourceBase: '0'.repeat(40) } },
+    {
+      ...combinedData,
+      repository: { ...combinedData.repository, sourceManifestHash: '0'.repeat(64) },
+    },
+    { ...reviewData, binding: combinedData.binding },
+  ])
+    assert.throws(() => reviewPlan(value as Parameters<typeof reviewPlan>[0]));
   const reviewRequest = (value: Parameters<typeof reviewPlan>[0], escaped = false) => {
     const selected = reviewPlan(value);
     const reader = new ReviewTranscript(selected, { now: () => 1, timeoutMs: 180_000 });

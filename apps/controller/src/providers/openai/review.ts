@@ -4,6 +4,7 @@ import {
   ArtifactIdSchema,
   AttemptIdSchema,
   CandidateIdSchema,
+  CombinedNativeReviewJobSchema,
   HashSchema,
   NativeTargetPathSchema,
   RouteIdSchema,
@@ -30,7 +31,7 @@ const message = z
   .min(1)
   .max(4096)
   .refine((value) => utf8(value, 4096));
-const binding = z.strictObject({
+const legacyBinding = z.strictObject({
   preparationId: ArtifactIdSchema,
   scopeHash: HashSchema,
   taskId: TaskIdSchema,
@@ -50,6 +51,10 @@ const binding = z.strictObject({
   scripted: z.literal(false),
   independence: z.literal('process-only'),
 });
+const binding = z.union([
+  legacyBinding,
+  CombinedNativeReviewJobSchema.safeExtend({ scopeHash: HashSchema }),
+]);
 const commonInput = {
   binding,
   model: z.literal('gpt-6.1-sol'),
@@ -65,6 +70,7 @@ const commonInput = {
 const { context: taskContext, ...sessionInput } = commonInput;
 const fileInput = z.strictObject({
   ...sessionInput,
+  binding: legacyBinding,
   path: NativeTargetPathSchema,
   baseHash: HashSchema,
   original: content,
@@ -143,6 +149,10 @@ export function reviewPlan(value: z.input<typeof input>) {
   const valid =
     'repository' in data
       ? data.repository.candidateManifestHash === data.binding.candidateHash &&
+        (!('origin' in data.binding) ||
+          (data.repository.sourceBase === data.binding.origin.sourceBase &&
+            data.repository.sourceManifestHash === data.binding.origin.sourceManifestHash &&
+            hashCanonical(data.context.criteria) === data.binding.origin.criteriaHash)) &&
         data.repository.changes.every(
           (change, index, changes) =>
             (index === 0 || changes[index - 1].path < change.path) &&
