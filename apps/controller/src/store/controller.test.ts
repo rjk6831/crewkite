@@ -6257,6 +6257,8 @@ test('google quota authority survives retries and restart while sharing one oper
 test('an acp scratch permission binds one live action and crash recovery cannot invent completion', async (t) => {
   for (const row of [
     'approved',
+    'hunk-approved',
+    'hunk-after-mismatch',
     'denied',
     'stop',
     'eof',
@@ -6282,8 +6284,17 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     'reserve',
     'missing-reserve',
   ] as const) {
+    const hunk = row.startsWith('hunk-');
     const scenario =
-      row === 'eof' ? 'eof-cancel' : row === 'stop' ? 'cancel-permission' : 'permission';
+      row === 'hunk-approved'
+        ? 'hunk'
+        : row === 'hunk-after-mismatch'
+          ? row
+          : row === 'eof'
+            ? 'eof-cancel'
+            : row === 'stop'
+              ? 'cancel-permission'
+              : 'permission';
     const fixtureHome = mkdtempSync(resolve('internal/acp-controller-'));
     t.after(() => rmSync(fixtureHome, { recursive: true, force: true }));
     const executable = join(fixtureHome, 'peer');
@@ -6386,12 +6397,19 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       googleAcp: {
         reviewMappings: [mapping],
         toolMappings: [
-          {
-            client: acpClientPin(client),
-            toolName: 'fixture-replace',
-            schema: 'replace-target-v1',
-            evidenceHash: 'f'.repeat(64),
-          },
+          hunk
+            ? {
+                client: { ...acpClientPin(client), harnessSha256: client.harnessSha256 },
+                toolTitle: 'Run replace_file_content?',
+                schema: 'replace-hunk-v1',
+                evidenceHash: 'f'.repeat(64),
+              }
+            : {
+                client: acpClientPin(client),
+                toolName: 'fixture-replace',
+                schema: 'replace-target-v1',
+                evidenceHash: 'f'.repeat(64),
+              },
         ],
         spawn: (...args) => {
           acpLaunches++;
@@ -6927,8 +6945,15 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     assert.equal(approval.target, 'net.mjs');
     assert.equal(approval.acpTarget?.kind, 'allow_once');
     const action = JSON.parse(approval.consequence);
-    assert.equal(action.oldText, original);
-    assert.equal(action.newText, 'export const total = 1;\n');
+    const expectedContent = 'export const total = 1;\n';
+    assert.equal(action.type, hunk ? 'replace-hunk' : 'replace-target');
+    assert.equal(action.oldText, hunk ? '0' : original);
+    assert.equal(action.newText, hunk ? '1' : expectedContent);
+    if (hunk) {
+      assert.equal(action.baseHash, createHash('sha256').update(original).digest('hex'));
+      assert.equal(action.afterHash, createHash('sha256').update(expectedContent).digest('hex'));
+      assert.equal(action.mode, '100644');
+    }
     assert(Buffer.byteLength(approval.consequence) <= 4096);
     const {
       requester: _requester,
@@ -6998,7 +7023,7 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     writeFileSync(join(intent.scratch_path, 'net.mjs'), 'changed');
     assert.equal((await controller.execute(resolveApproval(), 'local-owner')).outcome, 'blocked');
     writeFileSync(join(intent.scratch_path, 'net.mjs'), original);
-    if (row !== 'approved') {
+    if (row !== 'approved' && !hunk) {
       const terminal = Promise.withResolvers<void>();
       const offTerminal = controller.subscribe((event) => {
         if (
@@ -7044,10 +7069,37 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     assert.equal((await controller.execute(resolveApproval(), 'local-owner')).outcome, 'applied');
     await nativeWait('acp capture', sealed);
     assert.equal(controller.store.intents().length, 1);
+    if (row === 'hunk-after-mismatch') {
+      assert.equal(controller.store.receipt(`native-acp-capture:${intent.attempt_id}`), undefined);
+      assert.equal(controller.snapshot().tasks[0].state, 'interrupted');
+      assert.equal(
+        controller.store.get<Approval>('approval', approval.approvalId)?.status,
+        'approved',
+      );
+      assert.equal(controller.store.get<Attempt>('attempt', intent.attempt_id)?.state, 'stopped');
+      assert.equal(readFileSync(join(source.directory, 'net.mjs'), 'utf8'), original);
+      assert.equal(
+        readFileSync(join(intent.scratch_path, 'net.mjs'), 'utf8'),
+        'export const total = 2;\n',
+      );
+      await controller.close();
+      controller = new Controller({
+        ...options,
+        home: context.controller.home,
+        now: clock.now,
+        id,
+      });
+      assert.equal(controller.store.receipt(`native-acp-capture:${intent.attempt_id}`), undefined);
+      assert.equal(controller.store.get<Attempt>('attempt', intent.attempt_id)?.state, 'stopped');
+      assert.equal(controller.snapshot().tasks[0].state, 'interrupted');
+      assert.equal(controller.store.intents().length, 1);
+      await controller.close();
+      continue;
+    }
     assert(controller.store.receipt(`native-acp-capture:${intent.attempt_id}`));
     assert.equal(controller.snapshot().tasks[0].state, 'stopped');
     assert.equal(readFileSync(join(source.directory, 'net.mjs'), 'utf8'), original);
-    assert.equal(readFileSync(join(intent.scratch_path, 'net.mjs'), 'utf8'), action.newText);
+    assert.equal(readFileSync(join(intent.scratch_path, 'net.mjs'), 'utf8'), expectedContent);
     assert.equal((await controller.execute(input, 'local-owner')).outcome, 'already-applied');
     await controller.close();
     controller = new Controller({ ...options, home: context.controller.home, now: clock.now, id });

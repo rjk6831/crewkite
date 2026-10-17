@@ -12,6 +12,7 @@ export const acpPeerCases = [
   'hunk-sequential',
   'hunk-control',
   'hunk-drift',
+  'hunk-after-mismatch',
   'permanent',
   'ambiguous',
   'changed-action',
@@ -332,7 +333,10 @@ export function runAcpPeer(scenario: AcpPeerCase) {
       else if (message.id === 'permission-1' || message.id === 'permission-2') {
         if (message.result?.outcome?.outcome === 'selected') {
           assert.equal(message.result.outcome.optionId, 'once');
-          writeFileSync(join(cwd, 'net.mjs'), `export const total = ${hunkStep || 1};\n`);
+          writeFileSync(
+            join(cwd, 'net.mjs'),
+            `export const total = ${scenario === 'hunk-after-mismatch' ? 2 : hunkStep || 1};\n`,
+          );
           update({
             sessionUpdate: 'tool_call_update',
             toolCallId: hunkStep ? `fixture-hunk-${hunkStep}` : 'fixture-tool',
