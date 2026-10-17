@@ -2,6 +2,9 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { hashCanonical, sealHandoff } from './hash.ts';
 import {
+  AcpApprovalTargetSchema,
+  ApprovalBindingSchema,
+  AttemptOutputSchema,
   CandidateEvaluationPreviewSchema,
   CheckEventSchema,
   CheckResultSchema,
@@ -13,6 +16,7 @@ import {
   FakeWorkerEventSchema,
   FakeWorkerInputSchema,
   formatReviewTarget,
+  GoogleAcpSetupSchema,
   GrantSchema,
   MinorAmountSchema,
   NativeBillingAttestationSchema,
@@ -34,6 +38,7 @@ import {
   SourceDetailsSchema,
   SourceSchema,
   TransportMessageSchema,
+  UsageReaderSchema,
 } from './index.ts';
 
 const suffix = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
@@ -137,7 +142,87 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     permissionModes: ['request-review', 'strict', 'always-proceed', 'proceed-in-sandbox'],
   };
   assert.deepEqual(NativeProfileSchema.parse(googleProfile), googleProfile);
-  const profiles = [historicalProfile, pendingProfile, googleProfile, repositoryProfile];
+  const selection = {
+    proofId: `art_${suffix}`,
+    modelId: 'model-selected',
+    thoughtLevelId: 'thought-selected',
+  };
+  const acpProfile = {
+    ...googleProfile,
+    id: 'google-acp-v1',
+    model: selection.modelId,
+    effort: selection.thoughtLevelId,
+    effortSupported: [selection.thoughtLevelId],
+    permissionModes: ['request-review'],
+    configOptions: {
+      model: {
+        optionId: 'model-option',
+        currentValue: selection.modelId,
+        supported: [selection.modelId],
+      },
+      thoughtLevel: {
+        optionId: 'thought-option',
+        currentValue: selection.thoughtLevelId,
+        supported: [selection.thoughtLevelId],
+      },
+    },
+    capabilities: {
+      protocolVersion: 1,
+      authMethods: ['oauth-personal'],
+      sessionClose: false,
+      fs: false,
+      terminal: false,
+    },
+  };
+  assert.deepEqual(NativeProfileSchema.parse(acpProfile), acpProfile);
+  const modelOnly = {
+    ...acpProfile,
+    effort: 'unknown',
+    effortSupported: [],
+    configOptions: { ...acpProfile.configOptions, thoughtLevel: null },
+  };
+  assert.deepEqual(NativeProfileSchema.parse(modelOnly), modelOnly);
+  assert(
+    NativeProfileSchema.safeParse({
+      ...modelOnly,
+      available: false,
+      reason: 'authentication-required',
+    }).success,
+  );
+  for (const change of [
+    { model: 'unobserved' },
+    { effort: 'standard' },
+    { effortSupported: ['unobserved'] },
+    { configOptions: null },
+    { capabilities: null },
+    { capabilities: { ...acpProfile.capabilities, protocolVersion: 2 } },
+    { capabilities: { ...acpProfile.capabilities, authMethods: ['api-key'] } },
+    { capabilities: { ...acpProfile.capabilities, fs: true } },
+    { capabilities: { ...acpProfile.capabilities, terminal: true } },
+    { permissionModes: ['always-proceed'] },
+    { reason: 'unbounded-native-error' },
+    { family: 'openai' },
+    { accountClass: 'pro' },
+    { credential: 'synthetic-secret' },
+    {
+      configOptions: {
+        ...acpProfile.configOptions,
+        model: {
+          ...acpProfile.configOptions.model,
+          supported: [selection.modelId, selection.modelId],
+        },
+      },
+    },
+  ])
+    assert.equal(NativeProfileSchema.safeParse({ ...acpProfile, ...change }).success, false);
+  assert.equal(NativeProfileSchema.safeParse({ ...modelOnly, effort: 'standard' }).success, false);
+  const profiles = [
+    historicalProfile,
+    pendingProfile,
+    googleProfile,
+    repositoryProfile,
+    acpProfile,
+  ];
   assert.deepEqual(SnapshotSchema.shape.nativeProfiles.parse(profiles), profiles);
   assert.equal(
     SnapshotSchema.shape.nativeProfiles.safeParse([
@@ -153,12 +238,224 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     { creditPolicies: ['existing-credits'] },
   ])
     assert.equal(NativeProfileSchema.safeParse({ ...googleProfile, ...change }).success, false);
+  const reader = {
+    id: 'google-usage-v1',
+    family: 'google',
+    clientVersion: 'fixture',
+    available: false,
+    enabled: false,
+    reason: 'not-enabled',
+    lastObservedAt: null,
+  };
+  for (const valid of [
+    reader,
+    { ...reader, enabled: true, available: true, reason: 'available' },
+    {
+      ...reader,
+      enabled: true,
+      reason: 'client-build-mismatch',
+      lastAttemptAt: '2026-10-17T00:00:00.000Z',
+    },
+    { ...reader, reason: 'unsupported-platform' },
+  ])
+    assert.deepEqual(UsageReaderSchema.parse(valid), valid);
+  for (const change of [
+    { available: true },
+    { reason: 'available' },
+    { enabled: true },
+    { family: 'anthropic' },
+    { reason: 'unbounded-error' },
+    { lastAttemptAt: 'tomorrow' },
+    { lastObservedAt: 'tomorrow' },
+    { token: 'synthetic-secret' },
+  ])
+    assert.equal(UsageReaderSchema.safeParse({ ...reader, ...change }).success, false);
+  const oldSnapshot = {
+    protocol: 1,
+    cursor: '0',
+    projects: [],
+    tasks: [],
+    runs: [],
+    attempts: [],
+    routes: [],
+    artifacts: [],
+    evidence: [],
+    approvals: [],
+    usage: [],
+    candidates: [],
+  };
+  assert.deepEqual(SnapshotSchema.parse(oldSnapshot), {
+    ...oldSnapshot,
+    nativeProfiles: [],
+    nativeRuns: [],
+    candidateEvaluations: [],
+    usageReaders: [],
+    googleAcpSetup: null,
+  });
+  assert.equal(
+    SnapshotSchema.safeParse({ ...oldSnapshot, usageReaders: [reader, reader] }).success,
+    false,
+  );
+  for (const consent of [undefined, true, false]) {
+    const observe = {
+      ...command,
+      command: 'ObserveUsage',
+      payload: { family: 'google', ...(consent === undefined ? {} : { consent }) },
+    };
+    assert.deepEqual(CommandSchema.parse(observe), observe);
+  }
+  for (const payload of [
+    { family: 'google', consent: 'true' },
+    { family: 'google', consent: null },
+    { family: 'openai', consent: true },
+    { family: 'google', token: 'synthetic-secret' },
+  ])
+    assert.equal(
+      CommandSchema.safeParse({ ...command, command: 'ObserveUsage', payload }).success,
+      false,
+    );
+  const setup = {
+    profileId: 'google-acp-v1',
+    revision: 1,
+    state: 'ready',
+    operationId: null,
+    proofId: selection.proofId,
+    client: { version: 'fixture', sha256: 'a'.repeat(64), signerTeamId: 'TEAM-FIXTURE' },
+    auth: { method: 'oauth-personal', status: 'authenticated' },
+    reason: 'qualification-pending',
+  };
+  assert.deepEqual(GoogleAcpSetupSchema.parse(setup), setup);
+  assert(ReadDataSchema.safeParse({ kind: 'google-acp-setup', setup }).success);
+  for (const change of [
+    { proofId: null },
+    { client: null },
+    { operationId: command.key },
+    { auth: { method: null, status: 'authenticated' } },
+    { auth: { method: 'api-key', status: 'authenticated' } },
+    { state: 'initializing', operationId: null },
+    { oauthUrl: 'https://invalid.example/' },
+    { token: 'synthetic-secret' },
+  ])
+    assert.equal(GoogleAcpSetupSchema.safeParse({ ...setup, ...change }).success, false);
+  for (const [name, payload] of [
+    ['InitializeGoogleAcp', { profileId: setup.profileId, consent: 'explicit' }],
+    [
+      'AuthenticateGoogleAcp',
+      {
+        profileId: setup.profileId,
+        proofId: setup.proofId,
+        method: 'oauth-personal',
+        consent: 'explicit',
+      },
+    ],
+    [
+      'DiscoverGoogleAcp',
+      { profileId: setup.profileId, proofId: setup.proofId, consent: 'explicit' },
+    ],
+    ['StopGoogleAcpSetup', { profileId: setup.profileId, operationId: command.key }],
+  ] as const) {
+    const request = { ...command, command: name, payload };
+    assert.deepEqual(CommandSchema.parse(request), request);
+    for (const extra of [
+      { token: 'synthetic-secret' },
+      { url: 'https://invalid.example/' },
+      { profileId: 'google-file-v1' },
+    ])
+      assert.equal(
+        CommandSchema.safeParse({ ...request, payload: { ...payload, ...extra } }).success,
+        false,
+      );
+  }
+  const permission = {
+    sessionId: 'session-fixture',
+    toolCallId: 'tool-fixture',
+    optionId: 'option-fixture',
+    kind: 'allow_once',
+  };
+  const binding = {
+    approvalId: `apr_${suffix}`,
+    taskId: `tsk_${suffix}`,
+    attemptId: `att_${suffix}`,
+    generation: 1,
+    action: 'run-native-tools',
+    target: 'Edit the selected scratch file.',
+    revision: 2,
+  };
+  assert.deepEqual(ApprovalBindingSchema.parse(binding), binding);
+  assert.deepEqual(ApprovalBindingSchema.parse({ ...binding, acpTarget: permission }), {
+    ...binding,
+    acpTarget: permission,
+  });
+  for (const change of [
+    { kind: 'allow_always' },
+    { kind: 'reject_once' },
+    { toolCallId: '' },
+    { sessionId: 'x'.repeat(201) },
+    { optionId: 'line\noption' },
+    { rpcRequestId: 1 },
+    { token: 'synthetic-secret' },
+  ])
+    assert.equal(AcpApprovalTargetSchema.safeParse({ ...permission, ...change }).success, false);
+  const output = {
+    attemptId: binding.attemptId,
+    generation: 1,
+    channel: 'stdout',
+    text: '<script>inert</script>',
+  };
+  assert.deepEqual(AttemptOutputSchema.parse(output), output);
+  const acpOutput = {
+    ...output,
+    channel: 'acp',
+    acp: {
+      sessionId: permission.sessionId,
+      sessionUpdate: 'tool_call_update',
+      toolCallId: permission.toolCallId,
+      status: 'completed',
+      locations: [{ path: 'src/net.mjs', line: 1 }],
+      diffPaths: ['src/net.mjs'],
+    },
+  };
+  assert.deepEqual(AttemptOutputSchema.parse(acpOutput), acpOutput);
+  for (const change of [
+    { toolCallId: undefined },
+    { status: 'approved' },
+    { sessionUpdate: 'future-command' },
+    { locations: [{ path: '/private/file', line: 1 }] },
+    { locations: [{ path: 'src/net.mjs', line: 0 }] },
+    { diffPaths: ['../source'] },
+    { diffPaths: Array(101).fill('net.mjs') },
+    { rawInput: { secret: 'synthetic-secret' } },
+  ])
+    assert.equal(
+      AttemptOutputSchema.safeParse({ ...acpOutput, acp: { ...acpOutput.acp, ...change } }).success,
+      false,
+    );
   const historicalRun = {
     runId: `run_${suffix}`,
     profileId: historicalProfile.id,
     stage: 'retain-only',
   };
   assert.deepEqual(NativeRunSchema.parse(historicalRun), historicalRun);
+  const acpAttestation = { ...attestation, quotaAccountConfirmed: true };
+  const acpRun = {
+    ...historicalRun,
+    profileId: acpProfile.id,
+    acp: selection,
+    billingAttestation: acpAttestation,
+    permissionMode: 'request-review',
+    target: { path: 'net.mjs', baseHash: 'a'.repeat(64), bytes: 1 },
+  };
+  assert.deepEqual(NativeRunSchema.parse(acpRun), acpRun);
+  for (const change of [
+    { acp: undefined },
+    { target: undefined },
+    { billingAttestation: attestation },
+    { billingAttestation: { ...acpAttestation, quotaAccountConfirmed: false } },
+    { permissionMode: 'always-proceed' },
+    { profileId: 'google-file-v1' },
+    { execution },
+  ])
+    assert.equal(NativeRunSchema.safeParse({ ...acpRun, ...change }).success, false);
   const repositoryRun = {
     ...historicalRun,
     profileId: repositoryProfile.id,
@@ -657,6 +954,58 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     },
   };
   assert.deepEqual(CommandSchema.parse(filePreparation), filePreparation);
+  const acpPreparation = {
+    ...filePreparation,
+    payload: {
+      ...filePreparation.payload,
+      ...selection,
+      profileId: 'google-acp-v1',
+      policy: { ...filePreparation.payload.policy, authority: 'guided' },
+      billingAttestation: acpAttestation,
+      permissionMode: 'request-review',
+    },
+  };
+  assert.deepEqual(CommandSchema.parse(acpPreparation), acpPreparation);
+  assert(
+    CommandSchema.safeParse({
+      ...acpPreparation,
+      payload: {
+        ...acpPreparation.payload,
+        thoughtLevelId: null,
+        policy: { ...acpPreparation.payload.policy, authority: 'balanced' },
+      },
+    }).success,
+  );
+  for (const change of [
+    { proofId: undefined },
+    { modelId: '' },
+    { thoughtLevelId: undefined },
+    { billingAttestation: attestation },
+    { billingAttestation: { ...acpAttestation, quotaAccountConfirmed: false } },
+    { creditPolicy: 'existing-credits' },
+    { permissionMode: 'always-proceed' },
+    { policy: { ...acpPreparation.payload.policy, authority: 'autopilot' } },
+    { handoffTargets: [{ profileId: 'openai-file-v1' }] },
+    { targetPath: '../source' },
+    { executable: '/caller/binary' },
+  ])
+    assert.equal(
+      CommandSchema.safeParse({
+        ...acpPreparation,
+        payload: { ...acpPreparation.payload, ...change },
+      }).success,
+      false,
+    );
+  assert.equal(
+    CommandSchema.safeParse({
+      ...filePreparation,
+      payload: {
+        ...filePreparation.payload,
+        profileId: 'google-acp-v1',
+      },
+    }).success,
+    false,
+  );
   const handoffTargets = [
     { profileId: 'openai-file-v1', creditPolicy: 'existing-credits' },
     { profileId: 'anthropic-file-v1', creditPolicy: 'ordinary' },

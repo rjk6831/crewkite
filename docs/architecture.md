@@ -36,6 +36,8 @@ A native candidate becomes ready only after the exact checks and declared review
 
 ## Commands and events
 
+Google contracts separate quota consent from ACP setup and frozen model selections. Typed one-use permission targets and inert ACP activity preserve existing string targets and text output; their controller handlers remain unavailable.
+
 Every mutation carries a protocol version, an idempotency key, the expected entity revision and a validated payload. The controller stores a digest of each request with its receipt.
 
 - Retrying the same key with the same content returns the stored result.

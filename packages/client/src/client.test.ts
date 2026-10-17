@@ -47,6 +47,8 @@ const snapshot: Snapshot = {
   usage: [],
   candidates: [],
   nativeProfiles: [],
+  usageReaders: [],
+  googleAcpSetup: null,
   nativeRuns: [],
   candidateEvaluations: [],
 };

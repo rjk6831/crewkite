@@ -717,7 +717,15 @@ export class Controller {
 
   private checkRevision(command: Command): CommandResult | undefined {
     if (!('expectedRevision' in command)) return;
-    if (command.command === 'RegisterProject' || command.command === 'CreateTask') {
+    if (
+      command.command === 'RegisterProject' ||
+      command.command === 'CreateTask' ||
+      command.command === 'ObserveUsage' ||
+      command.command === 'InitializeGoogleAcp' ||
+      command.command === 'AuthenticateGoogleAcp' ||
+      command.command === 'DiscoverGoogleAcp' ||
+      command.command === 'StopGoogleAcpSetup'
+    ) {
       if (command.expectedRevision !== 0)
         return { outcome: 'stale-revision', revision: 0, next: 'Create from revision zero.' };
       return;
@@ -2208,7 +2216,7 @@ export class Controller {
             ),
           };
       const policy = PolicySchema.parse(command.payload.policy);
-      if (filePayload?.handoffTargets) {
+      if (filePayload && 'handoffTargets' in filePayload && filePayload.handoffTargets) {
         if (command.payload.consent !== 'explicit')
           throw Error('A new manual recipient roster needs explicit consent.');
         manualTargets = this.nativeManualTargets(filePayload.handoffTargets);

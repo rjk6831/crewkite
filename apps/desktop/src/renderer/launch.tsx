@@ -869,21 +869,23 @@ function NativeLaunch({
     !!capability.expiresAt &&
     Date.parse(capability.expiresAt) > Date.now();
   const unavailable = profile
-    ? {
-        'not-configured': 'The controller has no supported native profile.',
-        'unsupported-platform': 'This profile requires macOS on Apple silicon.',
-        'native-home-unavailable':
-          'The existing native home is unavailable. Restart from the signed-in desktop session.',
-        'configuration-location-unsupported':
-          'This native configuration location has not been qualified.',
-        'client-unavailable':
-          'Install the supported official client before preparing this proposal.',
-        'client-build-mismatch': 'The installed client build does not match this profile.',
-        'qualification-pending': 'Qualification pending.',
-        'provider-policy-restricted':
-          'Google consumer CLI access is unavailable in CrewKite under the provider integration policy. Choose another profile or use the native app directly.',
-        available: '',
-      }[profile.reason]
+    ? ((
+        {
+          'not-configured': 'The controller has no supported native profile.',
+          'unsupported-platform': 'This profile requires macOS on Apple silicon.',
+          'native-home-unavailable':
+            'The existing native home is unavailable. Restart from the signed-in desktop session.',
+          'configuration-location-unsupported':
+            'This native configuration location has not been qualified.',
+          'client-unavailable':
+            'Install the supported official client before preparing this proposal.',
+          'client-build-mismatch': 'The installed client build does not match this profile.',
+          'qualification-pending': 'Qualification pending.',
+          'provider-policy-restricted':
+            'Google consumer CLI access is unavailable in CrewKite under the provider integration policy. Choose another profile or use the native app directly.',
+          available: '',
+        } as Partial<Record<Snapshot['nativeProfiles'][number]['reason'], string>>
+      )[profile.reason] ?? 'The controller has no supported native profile.')
     : 'The controller has no supported native profile.';
   async function prepareNative() {
     if (
