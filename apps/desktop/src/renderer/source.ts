@@ -33,6 +33,9 @@ export function useWorkspace() {
   const [error, setError] = useState<string | null>(null);
   const [transportError, setTransportError] = useState<string | null>(null);
   const [pending, setPending] = useState(0);
+  const [pendingRuns, setPendingRuns] = useState<
+    { token: symbol; input: Extract<DesktopCommand, { command: 'StartRun' | 'StopRun' }> }[]
+  >([]);
   const [retryAvailable, setRetryAvailable] = useState(false);
   const [historyGap, setHistoryGap] = useState<string | null>(null);
   const [exportNotice, setExportNotice] = useState<Extract<
@@ -194,7 +197,15 @@ export function useWorkspace() {
     (input: DesktopCommand) =>
       perform(async () => {
         if (!source) throw new Error('The desktop bridge is unavailable.');
-        return source.command(input);
+        if (input.command !== 'StartRun' && input.command !== 'StopRun')
+          return source.command(input);
+        const token = Symbol();
+        setPendingRuns((current) => [...current, { token, input }]);
+        try {
+          return await source.command(input);
+        } finally {
+          setPendingRuns((current) => current.filter((value) => value.token !== token));
+        }
       }),
     [source, perform],
   );
@@ -226,6 +237,11 @@ export function useWorkspace() {
     connection,
     preview,
     pending: pending > 0,
+    pendingStart:
+      pendingRuns.flatMap(({ input }) =>
+        input.command === 'StartRun' ? [input.payload] : [],
+      )[0] ?? null,
+    pendingStop: pendingRuns.some(({ input }) => input.command === 'StopRun'),
     error: error ?? transportError,
     setError: (value: string | null) => {
       setError(value);

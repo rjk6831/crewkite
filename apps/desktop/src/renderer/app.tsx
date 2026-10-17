@@ -315,18 +315,23 @@ export function App() {
         })
         .catch(() => {});
   }
+  const stoppingPendingStart =
+    !!workspace.pendingStart &&
+    workspace.pendingStart.taskId === task?.id &&
+    workspace.pendingStart.runId === stopRunId;
   const stopAllowed =
-    currentConversation &&
-    (currentConversation.purpose === 'conversation'
-      ? Boolean(
-          stopRunId && ['planning', 'stopping', 'unknown'].includes(currentConversation.phase),
-        )
-      : task?.runId &&
-        (nativeRun
-          ? nativeRun.stage === 'prepared' ||
-            !!nativeRun.handoff?.pending ||
-            ['running', 'checking', 'unknown'].includes(task.state)
-          : !['draft', 'ready', 'accepted', 'failed'].includes(task.state)));
+    stoppingPendingStart ||
+    (currentConversation &&
+      (currentConversation.purpose === 'conversation'
+        ? Boolean(
+            stopRunId && ['planning', 'stopping', 'unknown'].includes(currentConversation.phase),
+          )
+        : task?.runId &&
+          (nativeRun
+            ? nativeRun.stage === 'prepared' ||
+              !!nativeRun.handoff?.pending ||
+              ['running', 'checking', 'unknown'].includes(task.state)
+            : !['draft', 'ready', 'accepted', 'failed'].includes(task.state))));
   return (
     <div className="app-shell">
       <aside className="navigation" aria-label="Workspace navigation">
@@ -659,7 +664,12 @@ export function App() {
                         <button
                           type="button"
                           className="button stop"
-                          disabled={!stopAllowed || workspace.pending || task.state === 'stopping'}
+                          disabled={
+                            !stopAllowed ||
+                            (workspace.pending && !stoppingPendingStart) ||
+                            workspace.pendingStop ||
+                            task.state === 'stopping'
+                          }
                           onClick={stop}
                         >
                           <Square size={12} />

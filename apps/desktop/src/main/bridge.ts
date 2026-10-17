@@ -182,15 +182,22 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       stopSetup &&
       activeCommand?.key === command.payload.operationId &&
       setupCommands.includes(activeCommand.command);
-    const cancellation = revokeUsage || stopSetup;
+    const matchesStart =
+      command.command === 'StopRun' &&
+      activeCommand?.command === 'StartRun' &&
+      activeCommand.payload.taskId === command.payload.taskId &&
+      activeCommand.payload.runId === command.payload.runId;
+    const cancellation = revokeUsage || stopSetup || matchesStart;
     if (
       cancelling ||
       (busy &&
         !(
           (revokeUsage &&
-            activeCommand?.command === 'ObserveUsage' &&
-            activeCommand.payload.consent !== false) ||
-          matchesSetup
+            ((activeCommand?.command === 'ObserveUsage' &&
+              activeCommand.payload.consent !== false) ||
+              activeCommand?.command === 'StartRun')) ||
+          matchesSetup ||
+          matchesStart
         ))
     )
       throw new Error('Wait for the pending desktop command.');

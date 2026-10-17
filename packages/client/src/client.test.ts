@@ -347,6 +347,9 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     { recipe: 'project-node-tests-v1', expected: 5000 },
     { recipe: null, expected: 5000 },
     { recipe: 'usage', expected: 30000 },
+    { recipe: 'StartRun', expected: 40000 },
+    { recipe: 'StartRun', timeoutMs: 10000, expected: 10000 },
+    { recipe: 'StartRun', timeoutMs: 50000, expected: 50000 },
     { recipe: 'InitializeGoogleAcp', expected: 15000 },
     { recipe: 'AuthenticateGoogleAcp', expected: 130000 },
     { recipe: 'DiscoverGoogleAcp', expected: 30000 },
@@ -379,51 +382,62 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
                 expectedRevision: 0,
                 payload: { family: 'google' },
               }
-            : row.recipe === 'InitializeGoogleAcp' ||
-                row.recipe === 'AuthenticateGoogleAcp' ||
-                row.recipe === 'DiscoverGoogleAcp' ||
-                row.recipe === 'StopGoogleAcpSetup'
-              ? CommandSchema.parse({
+            : row.recipe === 'StartRun'
+              ? {
                   protocol: 1,
                   key: `cmd_${suffix}`,
                   actor,
-                  command: row.recipe,
-                  expectedRevision: 0,
-                  payload: {
-                    profileId: 'google-acp-v1',
-                    ...(row.recipe === 'StopGoogleAcpSetup'
-                      ? { operationId: `cmd_${suffix}` }
-                      : { consent: 'explicit' }),
-                    ...(['AuthenticateGoogleAcp', 'DiscoverGoogleAcp'].includes(row.recipe)
-                      ? { proofId: artifact.id }
-                      : {}),
-                    ...(row.recipe === 'AuthenticateGoogleAcp' ? { method: 'oauth-personal' } : {}),
-                  },
-                })
-              : {
-                  protocol: 1,
-                  key: `cmd_${suffix}`,
-                  actor,
-                  command: 'PrepareCandidateEvaluation',
+                  command: 'StartRun',
                   expectedRevision: task.revision,
-                  payload: {
-                    taskId: task.id,
-                    candidateId: candidate.id,
-                    ...(row.recipe === 'project-node-tests-v1'
-                      ? { checkRecipeId: row.recipe, testFiles: projectTestFiles }
-                      : { checkRecipeId: row.recipe }),
-                    reviewer: { profileId: profile.id, methodId: 'keep-it-simple', cycles: 1 },
-                    creditPolicy: 'ordinary',
-                    consent: 'explicit',
-                    grants: grants.map((grant) => ({
-                      ...grant,
-                      target:
-                        grant.action === 'run-check' && row.recipe === 'crewkite-verify-v1'
-                          ? 'crewkite verify'
-                          : grant.target,
-                    })),
-                  },
-                };
+                  payload: { taskId: task.id, runId: run.id },
+                }
+              : row.recipe === 'InitializeGoogleAcp' ||
+                  row.recipe === 'AuthenticateGoogleAcp' ||
+                  row.recipe === 'DiscoverGoogleAcp' ||
+                  row.recipe === 'StopGoogleAcpSetup'
+                ? CommandSchema.parse({
+                    protocol: 1,
+                    key: `cmd_${suffix}`,
+                    actor,
+                    command: row.recipe,
+                    expectedRevision: 0,
+                    payload: {
+                      profileId: 'google-acp-v1',
+                      ...(row.recipe === 'StopGoogleAcpSetup'
+                        ? { operationId: `cmd_${suffix}` }
+                        : { consent: 'explicit' }),
+                      ...(['AuthenticateGoogleAcp', 'DiscoverGoogleAcp'].includes(row.recipe)
+                        ? { proofId: artifact.id }
+                        : {}),
+                      ...(row.recipe === 'AuthenticateGoogleAcp'
+                        ? { method: 'oauth-personal' }
+                        : {}),
+                    },
+                  })
+                : {
+                    protocol: 1,
+                    key: `cmd_${suffix}`,
+                    actor,
+                    command: 'PrepareCandidateEvaluation',
+                    expectedRevision: task.revision,
+                    payload: {
+                      taskId: task.id,
+                      candidateId: candidate.id,
+                      ...(row.recipe === 'project-node-tests-v1'
+                        ? { checkRecipeId: row.recipe, testFiles: projectTestFiles }
+                        : { checkRecipeId: row.recipe }),
+                      reviewer: { profileId: profile.id, methodId: 'keep-it-simple', cycles: 1 },
+                      creditPolicy: 'ordinary',
+                      consent: 'explicit',
+                      grants: grants.map((grant) => ({
+                        ...grant,
+                        target:
+                          grant.action === 'run-check' && row.recipe === 'crewkite-verify-v1'
+                            ? 'crewkite verify'
+                            : grant.target,
+                      })),
+                    },
+                  };
       let settled = false;
       const response = client.command(command).then((value) => {
         settled = true;

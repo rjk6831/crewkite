@@ -298,6 +298,7 @@ async function quotaRevocationBridge(
       },
     ],
   });
+  let conversationState: TaskConversationState | null = null;
   const pending: Array<{ command: Command; socket: Socket }> = [];
   const sockets = new Set<Socket>();
   let waiting: ((value: { command: Command; socket: Socket }) => void) | null = null;
@@ -324,6 +325,26 @@ async function quotaRevocationBridge(
         if (message.command.command === 'GetSnapshot')
           reply(request, { outcome: 'applied', data: { kind: 'snapshot', snapshot } });
         else if (message.command.command === 'Subscribe') reply(request, { outcome: 'applied' });
+        else if (message.command.command === 'GetTaskConversationState')
+          reply(
+            request,
+            conversationState
+              ? {
+                  outcome: 'applied',
+                  data: { kind: 'conversation-state', state: conversationState },
+                }
+              : { outcome: 'blocked', reason: 'not-configured' },
+          );
+        else if (message.command.command === 'GetTaskConversation')
+          reply(request, {
+            outcome: 'applied',
+            data: {
+              kind: 'conversation',
+              taskId: message.command.payload.taskId,
+              entries: [],
+              nextBeforeCursor: null,
+            },
+          });
         else if (waiting) {
           const resolve = waiting;
           waiting = null;
@@ -505,6 +526,134 @@ async function quotaRevocationBridge(
       data: { kind: 'google-acp-setup', setup: snapshot.googleAcpSetup },
     });
     assert.equal((await setupRetry)?.outcome, 'applied');
+    const fixture = createDemoFixtures('2026-10-17T10:00:00.000Z');
+    const preparedTask = { ...fixture.task, revision: 3, runId: 'run_01ARZ3NDEKTSV4RRFFQ69G5FAV' };
+    const preparedRun = {
+      id: preparedTask.runId,
+      taskId: preparedTask.id,
+      source: {
+        projectId: preparedTask.projectId,
+        base: 'a'.repeat(40),
+        branch: 'main',
+        dirtyCount: 0,
+        untrackedCount: 0,
+      },
+      policy: { policy: fixture.policy, hash: 'b'.repeat(64) },
+      roles: fixture.roles,
+      decision: {
+        chosen: fixture.roles[0].routeId,
+        rejected: [],
+        rule: 'manual' as const,
+        inputsHash: 'c'.repeat(64),
+      },
+      revision: 0,
+    };
+    snapshot.projects = fixture.snapshot.projects;
+    snapshot.tasks = [preparedTask];
+    snapshot.runs = [preparedRun];
+    snapshot.routes = fixture.snapshot.routes;
+    snapshot.nativeProfiles = [
+      { ...unavailableNativeProfile().facts, available: true, reason: 'available' },
+    ];
+    snapshot.nativeRuns = [
+      {
+        runId: preparedRun.id,
+        profileId: 'openai-file-v1',
+        stage: 'prepared',
+        expiresAt: '2099-01-01T00:00:00.000Z',
+        target: { path: 'net.mjs', baseHash: 'd'.repeat(64), bytes: 42 },
+      },
+    ];
+    conversationState = TaskConversationStateSchema.parse({
+      taskId: preparedTask.id,
+      revision: preparedTask.revision,
+      contractStatus: 'confirmed',
+      purpose: 'execution',
+      phase: 'idle',
+      configuration: null,
+      currentRunId: preparedRun.id,
+      activeAttempt: null,
+      budget: null,
+      queuedInputCount: 0,
+      pendingQuestions: [],
+      proposal: null,
+      adoptedProposal: null,
+      send: { available: false, reason: 'not-configured', disposition: null },
+      adopt: { available: false, reason: 'proposal-missing' },
+    });
+    SnapshotSchema.parse(snapshot);
+    for (const cancellation of ['stop', 'revoke'] as const) {
+      snapshot.usageReaders[0].enabled = true;
+      await page.reload();
+      await page.getByRole('button', { name: 'Review prepared proposal', exact: true }).click();
+      const proposal = page.getByRole('dialog', {
+        name: 'Review the native proposal',
+        exact: true,
+      });
+      await proposal.getByRole('button', { name: 'Start native proposal', exact: true }).click();
+      const starting = await next();
+      assert.equal(starting.command.command, 'StartRun');
+      assert.deepEqual(starting.command.payload, {
+        taskId: preparedTask.id,
+        runId: preparedRun.id,
+      });
+      await proposal.getByRole('button', { name: 'Cancel', exact: true }).click();
+      const stop = {
+        command: 'StopRun',
+        expectedRevision: preparedTask.revision,
+        payload: { taskId: preparedTask.id, runId: preparedRun.id },
+      };
+      for (const payload of [
+        { ...stop.payload, runId: 'run_01ARZ3NDEKTSV4RRFFQ69G5FAW' },
+        { ...stop.payload, taskId: 'tsk_01ARZ3NDEKTSV4RRFFQ69G5FAW' },
+      ])
+        assert.match(await rejectCommand({ ...stop, payload }), /pending desktop command/u);
+      assert.match(
+        await rejectCommand({ command: 'GetHealth', payload: {} }),
+        /pending desktop command/u,
+      );
+      let cancelled: { command: Command; socket: Socket };
+      if (cancellation === 'stop') {
+        const stopButton = page.getByRole('button', { name: 'Stop', exact: true });
+        await expect(stopButton).toBeEnabled();
+        await stopButton.click();
+        cancelled = await next();
+        assert.equal(cancelled.command.command, 'StopRun');
+        assert.equal(cancelled.command.expectedRevision, preparedTask.revision);
+        assert.deepEqual(cancelled.command.payload, stop.payload);
+        await expect(stopButton).toBeDisabled();
+        assert.match(await rejectCommand(revokeCommand), /pending desktop command/u);
+        reply(cancelled, { outcome: 'outcome-unknown', reason: 'fixture-stop-unknown' });
+      } else {
+        await page.getByRole('button', { name: 'Usage and capacity', exact: true }).click();
+        const quota = page.getByRole('region', { name: 'Google quota', exact: true });
+        await quota.getByRole('checkbox', { name: 'Enable quota reads', exact: true }).uncheck();
+        cancelled = await next();
+        assert.equal(cancelled.command.command, 'ObserveUsage');
+        assert.deepEqual(cancelled.command.payload, { family: 'google', consent: false });
+        assert.match(await rejectCommand(stop), /pending desktop command/u);
+        snapshot.usageReaders[0].enabled = false;
+        reply(cancelled, { outcome: 'applied', data: { kind: 'usage', windows: [] } });
+        await expect(quota.getByRole('status')).toContainText('Quota reads disabled');
+      }
+      // Cancellation completion cannot release the original Start command's busy owner.
+      if (cancellation === 'stop')
+        await expect(page.getByRole('alert')).toContainText('fixture-stop-unknown');
+      assert.match(
+        await rejectCommand({ command: 'GetHealth', payload: {} }),
+        /pending desktop command/u,
+      );
+      reply(starting, { outcome: 'blocked', reason: `fixture-start-${cancellation}` });
+      await expect(page.getByRole('alert')).toContainText(`fixture-start-${cancellation}`);
+      if (cancellation === 'stop') {
+        assert.match(await rejectCommand(stop), /existing uncertain stop/u);
+        const retryStop = page.evaluate(() => window.crewkite?.retryCommand?.());
+        const repeatedStop = await next();
+        assert.deepEqual(repeatedStop.command, cancelled.command);
+        reply(repeatedStop, { outcome: 'applied' });
+        assert.equal((await retryStop)?.outcome, 'applied');
+      }
+    }
     const capacity = await application.evaluate(
       (_electron, options) => {
         const load = process.mainModule?.require.bind(process.mainModule);
