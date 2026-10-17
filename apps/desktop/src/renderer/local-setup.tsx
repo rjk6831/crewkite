@@ -18,7 +18,7 @@ const setupReasons: Record<NonNullable<LocalSetupState['reason']>, string> = {
     'Model discovery ownership is unknown. Refresh saved status before continuing.',
   'model-selection-required': 'Select an observed model.',
   'model-unloaded':
-    'The selected model is installed and unloaded. Load it in the Local app, then refresh models.',
+    'The selected model is installed and unloaded. Load it in the Local app, refresh models, then select it again.',
   'model-incompatible':
     'The selected model does not meet this profile. Inspect its observed reasons.',
   'selection-stale':
@@ -42,7 +42,7 @@ const modelReasons = {
   'multiple-resident-models': 'Multiple resident models',
   'resident-embedding': 'Embedding model is resident',
   busy: 'Model is busy',
-  context: 'Context does not match this profile',
+  context: 'Loaded context length is not 8192 tokens',
   draft: 'Draft model is configured',
   'not-downloaded': 'Model is not downloaded',
 };
@@ -111,7 +111,8 @@ export function LocalSetup({ snapshot, workspace }: { snapshot: Snapshot; worksp
       </div>
       <p className="muted small">
         Connect to an existing Local runtime. Connection input opens in a native window. Refresh
-        reads model metadata without loading a model or starting generation.
+        reads model metadata without loading a model or starting generation. Connecting or
+        refreshing models clears the saved model choice. Select a model from the new observation.
       </p>
       <p className="notice" role="status">
         {setup?.reason
@@ -299,6 +300,9 @@ export function LocalSetup({ snapshot, workspace }: { snapshot: Snapshot; worksp
                       disabled={model.state === 'incompatible'}
                     >
                       {model.identity.displayName} · {localModelStates[model.state]}
+                      {model.reasons.length
+                        ? ` · ${model.reasons.map((reason) => modelReasons[reason]).join(', ')}`
+                        : ''}
                     </option>
                   ))}
                 </select>

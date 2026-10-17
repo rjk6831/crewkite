@@ -32,6 +32,7 @@ test('selected conversation context retains exact bounded source and log bytes w
     writeFileSync(join(root, 'binary.bin'), Buffer.from([0xff, 0, 0x80]));
     writeFileSync(join(root, '.env'), 'DO_NOT_READ_CONTEXT_SECRET=canary\n');
     writeFileSync(join(root, 'large.txt'), 'x'.repeat(8193));
+    writeFileSync(join(root, 'empty.txt'), '');
     writeFileSync(join(root, 'escaped.txt'), '\\'.repeat(8192));
     writeFileSync(join(root, 'escaped2.txt'), '\\'.repeat(8192));
     for (let index = 0; index < 33; index++) writeFileSync(join(root, 'many', `${index}.txt`), 'x');
@@ -87,6 +88,27 @@ test('selected conversation context retains exact bounded source and log bytes w
     writeFileSync(join(root, 'logs/build.log'), 'later log bytes\n');
     assert.equal(first.bundle.files[0].text, 'explicit selected log\r\n');
     assert.notEqual(capture([{ kind: 'log-file', path: 'logs/build.log' }]).hash, first.hash);
+    writeFileSync(join(root, 'logs/empty.log'), '');
+    writeFileSync(join(root, 'logs/large.log'), 'x'.repeat(8193));
+    for (const { selection, message } of [
+      {
+        selection: { kind: 'source-file', path: 'empty.txt' },
+        message: 'A context file is empty.',
+      },
+      {
+        selection: { kind: 'log-file', path: 'logs/empty.log' },
+        message: 'A context file is empty.',
+      },
+      {
+        selection: { kind: 'source-file', path: 'large.txt' },
+        message: 'A selected source blob is unavailable or exceeds 8192 bytes.',
+      },
+      {
+        selection: { kind: 'log-file', path: 'logs/large.log' },
+        message: 'A selected log exceeds 8192 bytes.',
+      },
+    ] as const)
+      assert.throws(() => capture([selection]), { message }, selection.path);
     symlinkSync('build.log', join(root, 'logs/link.log'));
     symlinkSync('logs', join(root, 'log-parent'));
     linkSync(join(root, 'logs/build.log'), join(root, 'logs/hard.log'));

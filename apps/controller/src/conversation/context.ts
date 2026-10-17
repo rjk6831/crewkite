@@ -56,8 +56,8 @@ function validatePath(path: string) {
 }
 
 function file(kind: ContextFile['kind'], path: string, mode: ContextFile['mode'], bytes: Buffer) {
-  if (!bytes.length || bytes.length > MAX_FILE_BYTES)
-    throw Error('A context file must contain between 1 and 8192 bytes.');
+  if (!bytes.length) throw Error('A context file is empty.');
+  if (bytes.length > MAX_FILE_BYTES) throw Error('A context file exceeds 8192 bytes.');
   const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
   if (
     !text.isWellFormed() ||
@@ -101,14 +101,9 @@ function readLog(root: string, path: string): ContextFile {
   });
   const selected = join(root, path);
   const state = lstatSync(selected, { bigint: true });
-  if (
-    !state.isFile() ||
-    state.isSymbolicLink() ||
-    state.nlink !== 1n ||
-    state.mode & 0o6000n ||
-    state.size > BigInt(MAX_FILE_BYTES)
-  )
-    throw Error('A selected log must be an independent bounded regular file.');
+  if (!state.isFile() || state.isSymbolicLink() || state.nlink !== 1n || state.mode & 0o6000n)
+    throw Error('A selected log must be an independent regular file.');
+  if (state.size > BigInt(MAX_FILE_BYTES)) throw Error('A selected log exceeds 8192 bytes.');
   const fd = openSync(selected, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const opened = fstatSync(fd, { bigint: true });

@@ -342,6 +342,12 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       if (!before) throw new Error('The registered project is unavailable.');
       const choice = await dialog.showOpenDialog(window, {
         title: scope.mode === 'log-file' ? 'Choose a project log' : 'Choose project source',
+        message:
+          scope.mode === 'source-folder'
+            ? 'Committed nonempty UTF-8 files inside the project. Up to 32 files, 8 KiB each, 32 KiB encoded total.'
+            : scope.mode === 'log-file'
+              ? 'Nonempty UTF-8 log inside the project, outside hidden folders. 8 KiB at most.'
+              : 'Committed nonempty UTF-8 file inside the project. 8 KiB at most.',
         properties: [scope.mode === 'source-folder' ? 'openDirectory' : 'openFile'],
       });
       assertSender(event, window);
