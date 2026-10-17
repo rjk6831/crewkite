@@ -85,7 +85,7 @@ static BOOL validSecret(NSString *value) {
 }
 @end
 
-@interface LocalInputDelegate : NSObject <NSControlTextEditingDelegate>
+@interface LocalInputDelegate : NSObject <NSTextFieldDelegate>
 @property(nonatomic, weak) NSButton *connectButton;
 @end
 
