@@ -18,7 +18,7 @@ import {
 import { join, resolve } from 'node:path';
 import test from 'node:test';
 import { setImmediate } from 'node:timers';
-import { ReadDataSchema } from '@crewkite/contracts';
+import { canonicalJson, ReadDataSchema } from '@crewkite/contracts';
 import { createSyntheticRepository } from '@crewkite/testkit/repository';
 import {
   applyReplacement,
@@ -99,6 +99,9 @@ test('source inspection bounds file metadata without running filters or reading 
   const cases = [
     'copy',
     'nested package copy',
+    'canonical inventory',
+    'inventory hash',
+    'inventory order',
     'donor bytes',
     'donor mode',
     'donor link',
@@ -187,6 +190,14 @@ test('source inspection bounds file metadata without running filters or reading 
     const expected = await inspectInstalledDependencies(donor, [workspace], budget());
     assert.ok(Object.isFrozen(expected) && Object.isFrozen(expected.tree.entries));
     assert.ok(expected.tree.entries.every(Object.isFrozen));
+    const supplied =
+      name === 'canonical inventory' || name.startsWith('inventory ')
+        ? JSON.parse(canonicalJson(expected))
+        : expected;
+    if (name === 'canonical inventory')
+      assert.notEqual(JSON.stringify(supplied), JSON.stringify(expected));
+    if (name === 'inventory hash') supplied.hash = '0'.repeat(64);
+    if (name === 'inventory order') supplied.tree.entries.reverse();
     if (name === 'donor bytes') writeFileSync(join(donor, executable), 'changed');
     if (name === 'donor mode') chmodSync(join(donor, executable), 0o644);
     if (name === 'donor link') {
@@ -235,9 +246,9 @@ test('source inspection bounds file metadata without running filters or reading 
         return 0;
       };
     }
-    if (name !== 'copy' && name !== 'nested package copy') {
+    if (!['copy', 'nested package copy', 'canonical inventory'].includes(name)) {
       await assert.rejects(
-        copyInstalledDependencies(donor, candidate, expected, limits),
+        copyInstalledDependencies(donor, candidate, supplied, limits),
         Error,
         name,
       );
@@ -246,7 +257,7 @@ test('source inspection bounds file metadata without running filters or reading 
       if (name === 'cancel during copy') assert.equal(limits.signal?.aborted, true);
       continue;
     }
-    assert.deepEqual(await copyInstalledDependencies(donor, candidate, expected, limits), expected);
+    assert.deepEqual(await copyInstalledDependencies(donor, candidate, supplied, limits), expected);
     assert.deepEqual(await inspectInstalledDependencies(donor, [workspace], budget()), expected);
     assert.equal(lstatSync(join(candidate, executable)).mode & 0o777, 0o751);
     assert.notEqual(

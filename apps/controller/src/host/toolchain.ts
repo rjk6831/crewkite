@@ -3,6 +3,7 @@ import { constants } from 'node:fs';
 import { chmod, lstat, mkdir, open, opendir, readlink, realpath, symlink } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { setImmediate } from 'node:timers/promises';
+import { isDeepStrictEqual } from 'node:util';
 
 export type CopyBudget = {
   deadline: number;
@@ -52,8 +53,7 @@ async function digest(records: Iterable<unknown>, budget: CopyBudget) {
   return hash.digest('hex');
 }
 const same = (actual: unknown, expected: unknown) => {
-  if (JSON.stringify(actual) !== JSON.stringify(expected))
-    throw new Error('Toolchain identity changed.');
+  if (!isDeepStrictEqual(actual, expected)) throw new Error('Toolchain identity changed.');
 };
 function check(budget: CopyBudget) {
   if (
