@@ -191,6 +191,121 @@ test('native discovery returns metadata only after its owned process and descend
         assert(result.reason, mode);
       }
     }
+    for (const mode of [
+      'callback-stop',
+      'callback-cutoff',
+      'callback-deadline',
+      'callback-async',
+      'late-close',
+      'before-marker',
+    ]) {
+      const directory = resolve(root, mode);
+      mkdirSync(directory, { mode: 0o700 });
+      const schedules: { milliseconds: number; work: () => void }[] = [];
+      let clock = 0;
+      let submissions = 0;
+      let writes = 0;
+      let ready!: () => void;
+      const submitted = new Promise<void>((resolve) => {
+        ready = resolve;
+      });
+      let phase = 0;
+      let sent = false;
+      const handle = startNativeTask(
+        {
+          executable: process.execPath,
+          sha256,
+          directory,
+          repositoryRoot: root,
+          environment: sourceEnvironment,
+        },
+        {
+          timeoutMs: 300_000,
+          now: () => clock,
+          schedule: (work, milliseconds) => {
+            schedules.push({ work, milliseconds });
+            return () => {};
+          },
+          onSubmitted: () => {
+            submissions++;
+            ready();
+            if (mode === 'callback-stop') handle.stop();
+            if (mode === 'callback-cutoff') clock = 298_000;
+            if (mode === 'callback-deadline') clock = 300_000;
+            if (mode === 'callback-async') return Promise.resolve();
+          },
+          spawn: (executable, args, options) => {
+            const task = args.at(-1) !== 'list';
+            const child = spawn(
+              executable,
+              ['-e', fixture, 'success', task ? 'task' : 'features'],
+              options,
+            );
+            const write = child.stdin.write.bind(child.stdin);
+            child.stdin.write = ((data: string | Uint8Array) => {
+              for (const line of Buffer.from(data).toString().trim().split('\n'))
+                if (JSON.parse(line).method === 'turn/start') writes++;
+              return write(data);
+            }) as typeof child.stdin.write;
+            if (task && mode === 'late-close')
+              child.once('close', () => {
+                clock = 300_000;
+              });
+            owned.push({
+              child,
+              closed: new Promise((resolve) => child.once('close', () => resolve())),
+            });
+            return child;
+          },
+        },
+        () => ({
+          next: () => {
+            if (sent || phase === 2) return null;
+            sent = true;
+            if (phase === 0)
+              return Buffer.from(
+                `${JSON.stringify({ id: 1, method: 'initialize', params: { capabilities: { explicitGatewayOauth: true, experimentalApi: false } } })}\n`,
+              );
+            if (mode === 'before-marker') {
+              clock = 298_000;
+              ready();
+            }
+            return Buffer.from(`${JSON.stringify({ id: 2, method: 'turn/start', params: {} })}\n`);
+          },
+          push: () => {
+            phase++;
+            sent = false;
+          },
+          finish: () => ({ completed: true }),
+          get submitted() {
+            return phase === 1 && sent;
+          },
+          get complete() {
+            return phase === 2;
+          },
+          pendingRequest: 'turn/start',
+          lastEnvelope: null,
+          refusedEnvelope: null,
+          notifications: 0,
+        }),
+      );
+      await submitted;
+      if (mode !== 'late-close')
+        schedules
+          .find((call) => call.milliseconds === (mode === 'callback-deadline' ? 0 : 250))
+          ?.work();
+      const result = await handle.result;
+      assert.equal(submissions, mode === 'before-marker' ? 0 : 1, mode);
+      assert.equal(writes, mode === 'late-close' ? 1 : 0, mode);
+      assert.equal(
+        result.reason,
+        mode === 'callback-stop' ? 'stopped' : mode === 'callback-async' ? 'protocol' : 'deadline',
+        mode,
+      );
+      assert.equal(result.metadata, null, mode);
+      assert.equal(result.quiescent, true, mode);
+      assert(handle.groups.every(groupAbsent), mode);
+    }
     const lifecycleCases = [
       { name: 'three phases', failure: '', sequence: -1 },
       ...['intent', 'owned', 'quiescent'].flatMap((failure) =>

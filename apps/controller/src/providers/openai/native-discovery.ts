@@ -239,6 +239,8 @@ function startTranscript<T>(
   });
   const settle = (quiescent: boolean) => {
     if (finished) return;
+    const settledAt = now();
+    if (!Number.isFinite(settledAt) || settledAt >= deadline) reason ??= 'deadline';
     finished = true;
     for (const cancel of cancellations) cancel();
     if (quiescent) {
@@ -311,14 +313,26 @@ function startTranscript<T>(
     );
   };
   let submissionReported = false;
+  const canWrite = () => {
+    if (finished || stopping || closed) return false;
+    const checkedAt = now();
+    if (!Number.isFinite(checkedAt) || checkedAt >= deadline - (options.task ? 2000 : 0)) {
+      stop('deadline');
+      return false;
+    }
+    return true;
+  };
   const advance = () => {
     try {
+      if (!canWrite()) return;
       const request = reader.next();
       if (request) {
+        if (!canWrite()) return;
         if (reader.submitted && !submissionReported) {
           submissionReported = true;
-          options.onSubmitted?.();
+          synchronous(options.onSubmitted?.());
         }
+        if (!canWrite()) return;
         child.stdin.write(request);
       }
       if (reader.complete) {
