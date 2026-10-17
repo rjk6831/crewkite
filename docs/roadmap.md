@@ -9,7 +9,7 @@ I deliver CrewKite in milestones that each make one claim I can test. Dates foll
 | D0 Packaged fake journey | Desktop, CLI, transport and storage share task IDs through start, approvals, stop, restart, changes and export, with scripted fake providers | The journey runs end to end on the packaged app. Fakes prove mechanics only |
 | D1a Supervised native work | One qualified official client works in scratch. I can inspect activity and approvals, stop truthfully, keep an edit, reopen it and export it | A real patch from one of my projects that is worth reopening the next day |
 | D1b Checked dogfood | Immutable candidates, independent checks and review, acceptance as a new local branch | A checked result branch with its evidence receipt |
-| D2 Daily-driver release 0.1 | Qualified OpenAI, Anthropic and Local routes in useful roles, durable handoff, honest usage, finite review, two coding slices with a combined check, safe self-development | Ten real tasks from my own backlog, observed end to end |
+| D2 Daily-driver release 0.1 | Qualified OpenAI, Anthropic, Google and Local routes in useful roles, durable handoff, honest usage, finite review, two coding slices with a combined check, safe self-development | Ten real tasks from my own backlog, observed end to end |
 | D2b User acceptance and corrections | Real-work UAT, final testing and required fixes before distribution | User acceptance and final testing pass, required fixes are verified, and I explicitly approve starting D3 |
 | D3 Distribution | Package provenance, install, recovery, compatibility, notices, privacy and signing for a stated audience | A clean install on a machine that never saw the source tree |
 
@@ -17,7 +17,7 @@ D1a is complete for the bounded OpenAI single-file profile. It supports an exist
 
 D1b is complete for one useful CrewKite repository task. A live OpenAI writer removed redundant completed check and review controls from the evaluation view. The Mac directory package ran all six fixed verification stages and all 40 tests against that immutable candidate. A fresh native review passed with zero findings and same-family process independence only. A separate destination-specific approval created the exact checked result on the local `feat/evaluation-outcomes` branch. The same home reopened with its branch and evidence intact, without another submission. The original checkout and index stayed unchanged. This meets the checked-result exit above. The recipe requires a matching registered source checkout with installed development dependencies and Electron. A separate live OpenAI repository Stop retained interrupted work through same-home reopen. Full profile qualification remains pending. D2's ten real tasks, broader routing and handoff remain open. D3 still requires a clean install on a machine that never saw the source tree.
 
-A two-provider demo is an intermediate step on the way to D2. Google consumer CLI launch is excluded from the current D2 plan. A future Google route needs a documented permitted integration and its own qualification. [Proposed ADR 0023](adr/0023-qualify-provider-eligibility-before-release.md) records this eligibility condition; Accepted ADR 0012 remains unchanged.
+A two-provider demo is an intermediate step on the way to D2. Google remains in the four-family target through the separate ACP proposal. The consumer headless writer stays blocked. The [planned ACP route](providers.md#google-acp-writer) needs eligibility, authentication, billing and native behavior evidence before qualification. A quota read supplies no coding authority. [Proposed ADR 0023](adr/0023-qualify-provider-eligibility-before-release.md) and [Proposed ADR 0024](adr/0024-integrate-google-through-its-published-acp-agent.md) await acceptance; Accepted ADR 0012 remains unchanged.
 
 I will pause after D2 for real-work user acceptance and final testing. D2b holds any required corrections and their verification. I will explicitly approve the move to D3 after this gate passes.
 
@@ -31,7 +31,7 @@ I will pause after D2 for real-work user acceptance and final testing. D2b holds
 | W3 | Packaged desktop and CLI cockpit | The D0 fake journey |
 | W4 | Real scratch edit, retain and export | A useful D1a task |
 | W5 | Candidate, checks, review, local branch | D1b |
-| W6 to W8 | Eligible Anthropic and Local routes | Per-route qualification |
+| W6 to W8 | Eligible Anthropic, Google and Local routes | Per-route qualification |
 | W9 | Continuity without a summary, usage controls | Ownership and budgets preserved across a handoff |
 | W10 | Two coding slices with a combined check | A combined failure blocks acceptance |
 | W11 and W12 | My D2 release, user acceptance, then distribution | The D2 exit, D2b acceptance and explicit approval for D3 |

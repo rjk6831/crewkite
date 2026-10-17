@@ -3,9 +3,10 @@ import { type ChildProcess, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { createServer, type Socket } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { _electron, expect, type Locator, test } from '@playwright/test';
+import { _electron, expect, type Locator, type Page, test } from '@playwright/test';
 import {
   checkEnvironment,
   checkOwner,
@@ -14,13 +15,20 @@ import {
 } from '../apps/controller/src/host/check-ownership.ts';
 import { git } from '../apps/controller/src/host/source.ts';
 import { groupAbsent } from '../apps/controller/src/host/worker.ts';
+import { encodeFrame, FrameDecoder } from '../packages/client/src/index.ts';
 import {
   type ControllerClient,
   connectController,
   createCommandKey,
   readControllerEndpoint,
 } from '../packages/client/src/node.ts';
-import { type Event, EventSchema, SnapshotSchema } from '../packages/contracts/src/index.ts';
+import {
+  type Command,
+  type CommandResult,
+  type Event,
+  EventSchema,
+  SnapshotSchema,
+} from '../packages/contracts/src/index.ts';
 
 const root = resolve(import.meta.dirname, '..');
 const internal =
@@ -235,6 +243,203 @@ async function cleanupGroup(group: number) {
 async function enter(button: Locator) {
   await expect(button).toBeEnabled();
   await button.press('Enter');
+}
+
+async function desktopSnapshot(page: Page) {
+  try {
+    return SnapshotSchema.parse(await page.evaluate(() => window.crewkite?.getSnapshot()));
+  } catch (failure) {
+    if (
+      failure instanceof Error &&
+      /(?:Controller is offline\.|The controller is offline\.|Snapshot unavailable: connection-lost\.)/u.test(
+        failure.message,
+      )
+    )
+      return null;
+    throw failure;
+  }
+}
+
+async function quotaRevocationBridge(
+  application: Awaited<ReturnType<typeof _electron.launch>>,
+  page: Page,
+) {
+  const home = mkdtempSync(join(internal, 'quota-bridge-'));
+  const socketPath = join(home, 'control.sock');
+  const snapshot = SnapshotSchema.parse({
+    protocol: 1,
+    cursor: '0',
+    projects: [],
+    tasks: [],
+    runs: [],
+    attempts: [],
+    routes: [],
+    artifacts: [],
+    evidence: [],
+    approvals: [],
+    usage: [],
+    candidates: [],
+    usageReaders: [
+      {
+        id: 'google-usage-v1',
+        family: 'google',
+        clientVersion: '1.4.0',
+        enabled: true,
+        available: false,
+        reason: 'client-unavailable',
+        lastAttemptAt: null,
+        lastObservedAt: null,
+      },
+    ],
+  });
+  const pending: Array<{ command: Command; socket: Socket }> = [];
+  const sockets = new Set<Socket>();
+  let waiting: ((value: { command: Command; socket: Socket }) => void) | null = null;
+  const next = () => {
+    const request = pending.shift();
+    return request
+      ? Promise.resolve(request)
+      : new Promise<{ command: Command; socket: Socket }>((resolve) => {
+          waiting = resolve;
+        });
+  };
+  const reply = (request: { command: Command; socket: Socket }, result: CommandResult) =>
+    request.socket.write(encodeFrame({ type: 'result', key: request.command.key, result }));
+  const server = createServer((socket) => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+    const decoder = new FrameDecoder();
+    socket.on('data', (bytes) => {
+      for (const message of decoder.push(bytes)) {
+        if (message.type === 'hello')
+          socket.write(encodeFrame({ type: 'welcome', protocol: 1, cursor: '0' }));
+        if (message.type !== 'command') continue;
+        const request = { command: message.command, socket };
+        if (message.command.command === 'GetSnapshot')
+          reply(request, { outcome: 'applied', data: { kind: 'snapshot', snapshot } });
+        else if (message.command.command === 'Subscribe') reply(request, { outcome: 'applied' });
+        else if (waiting) {
+          const resolve = waiting;
+          waiting = null;
+          resolve(request);
+        } else pending.push(request);
+      }
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(socketPath, resolve);
+  });
+  try {
+    await application.evaluate(
+      async ({ BrowserWindow }, options) => {
+        const load = process.mainModule?.require.bind(process.mainModule);
+        if (!load) throw new Error('The desktop fixture module loader is unavailable.');
+        const { installBridge } = load(
+          options.bridge,
+        ) as typeof import('../apps/desktop/src/main/bridge.ts');
+        const { connectController } = load(
+          options.client,
+        ) as typeof import('../packages/client/src/node.ts');
+        const { desktopActor } = load(
+          options.runtime,
+        ) as typeof import('../apps/desktop/src/main/runtime.ts');
+        const client = await connectController({
+          socketPath: options.socketPath,
+          token: 'a'.repeat(64),
+          actor: desktopActor,
+          reconnectDelaysMs: [],
+        });
+        const window = BrowserWindow.getAllWindows()[0];
+        window.once('closed', () => client.close());
+        await installBridge(window, {
+          paths: { home: options.home, profile: options.home },
+          connect: async () => client,
+          resetClient: () => client.close(),
+        } as never);
+      },
+      {
+        bridge: join(root, 'apps/desktop/src/main/bridge.ts'),
+        client: join(root, 'packages/client/src/node.ts'),
+        runtime: join(root, 'apps/desktop/src/main/runtime.ts'),
+        socketPath,
+        home,
+      },
+    );
+    await page.reload();
+    await expect(page.getByText('Controller connected', { exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Usage and capacity', exact: true }).click();
+    const panel = page.getByRole('region', { name: 'Google quota', exact: true });
+    const refresh = panel.getByRole('button', { name: 'Refresh Google quota', exact: true });
+    const consent = panel.getByRole('checkbox', { name: 'Enable quota reads', exact: true });
+    await expect(refresh).toBeEnabled();
+    await refresh.click();
+    const read = await next();
+    assert.equal(read.command.command, 'ObserveUsage');
+    assert.deepEqual(read.command.payload, { family: 'google' });
+    await expect(consent).toBeEnabled();
+    await consent.uncheck();
+    const revoke = await next();
+    assert.deepEqual(revoke.command.payload, { family: 'google', consent: false });
+    const rejectCommand = (input: unknown) =>
+      page.evaluate(async (value) => {
+        try {
+          await window.crewkite?.command(value as never);
+          return '';
+        } catch (failure) {
+          return String(failure);
+        }
+      }, input);
+    const refreshCommand = {
+      command: 'ObserveUsage',
+      expectedRevision: 0,
+      payload: { family: 'google' },
+    };
+    const revokeCommand = { ...refreshCommand, payload: { family: 'google', consent: false } };
+    assert.match(await rejectCommand(revokeCommand), /pending desktop command/u);
+    assert.match(
+      await rejectCommand({ ...revokeCommand, payload: { ...revokeCommand.payload, extra: true } }),
+      /Unrecognized key/u,
+    );
+    snapshot.usageReaders[0].enabled = false;
+    snapshot.usageReaders[0].available = false;
+    reply(revoke, { outcome: 'applied', data: { kind: 'usage', windows: [] } });
+    await expect(panel.getByRole('status')).toContainText('Quota reads disabled');
+    assert.match(await rejectCommand(refreshCommand), /pending desktop command/u);
+    assert.match(
+      await rejectCommand({ command: 'GetHealth', payload: {} }),
+      /pending desktop command/u,
+    );
+    reply(read, { outcome: 'outcome-unknown', reason: 'fixture-uncertain' });
+    await expect(panel.getByRole('status')).toContainText('fixture-uncertain');
+    assert.match(await rejectCommand(refreshCommand), /exact retry/u);
+    const revokeAgain = page.evaluate(
+      (input) => window.crewkite?.command(input as never),
+      revokeCommand,
+    );
+    const uncertainRevoke = await next();
+    reply(uncertainRevoke, { outcome: 'outcome-unknown', reason: 'fixture-uncertain-revoke' });
+    assert.equal((await revokeAgain)?.outcome, 'outcome-unknown');
+    assert.match(await rejectCommand(revokeCommand), /existing uncertain quota disable/u);
+    const retryRead = page.evaluate(() => window.crewkite?.retryCommand?.());
+    const repeatedRead = await next();
+    assert.deepEqual(repeatedRead.command, read.command);
+    reply(repeatedRead, { outcome: 'applied', data: { kind: 'usage', windows: [] } });
+    assert.equal((await retryRead)?.outcome, 'applied');
+    const retryRevoke = page.evaluate(() => window.crewkite?.retryCommand?.());
+    const repeatedRevoke = await next();
+    assert.deepEqual(repeatedRevoke.command, uncertainRevoke.command);
+    reply(repeatedRevoke, { outcome: 'applied', data: { kind: 'usage', windows: [] } });
+    assert.equal((await retryRevoke)?.outcome, 'applied');
+    assert.equal(pending.length, 0);
+    await page.screenshot({
+      path: join(internal, 'google-quota-controls.png'),
+      animations: 'disabled',
+    });
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 }
 
 test('desktop and CLI retain one checked task through handoff and restart', async () => {
@@ -574,14 +779,12 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     });
     const nativeEvents = new Timeline();
     await observer.subscribe('0', (event) => nativeEvents.append(event));
-    await enter(page.getByRole('button', { name: 'Reconnect controller', exact: true }));
+    const replacementProfiles = (await observer.snapshot()).nativeProfiles;
+    assert.equal(replacementProfiles[0]?.displayName, 'OpenAI scripted proposal fixture');
     await expect
-      .poll(
-        async () =>
-          (await page.evaluate(() => window.crewkite?.getSnapshot()))?.nativeProfiles[0]
-            ?.displayName,
-      )
-      .toBe('OpenAI scripted proposal fixture');
+      .poll(async () => (await desktopSnapshot(page))?.nativeProfiles ?? null)
+      .toEqual(replacementProfiles);
+    await expect(page.getByText('Controller connected', { exact: true })).toBeVisible();
     await enter(page.getByRole('button', { name: 'New task', exact: true }).first());
     await page.getByLabel('Task title', { exact: true }).fill('Retain one native file proposal');
     await enter(page.getByRole('dialog').getByRole('button', { name: 'Create task', exact: true }));
@@ -1211,8 +1414,9 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
       ...readControllerEndpoint(home),
       actor: { id: 'native-reopened-observer', kind: 'cli' },
     });
-    await enter(page.getByRole('button', { name: 'Reconnect controller', exact: true }));
     const reopenedNative = await observer.snapshot();
+    await expect.poll(() => desktopSnapshot(page)).toEqual(reopenedNative);
+    await expect(page.getByText('Controller connected', { exact: true })).toBeVisible();
     assert.deepEqual(reopenedNative.nativeRuns, nativeSnapshot.nativeRuns);
     assert.deepEqual(reopenedNative.candidateEvaluations, nativeSnapshot.candidateEvaluations);
     assert.equal(reopenedNative.attempts.length, nativeSnapshot.attempts.length);
@@ -1225,6 +1429,7 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     assert.equal(git(source, ['rev-parse', acceptedRef]).toString().trim(), acceptedCommit);
     assert.deepEqual(sourceIdentity(source), original);
 
+    await quotaRevocationBridge(application, page);
     console.log(`Connected journey home: ${home}`);
   } finally {
     observer?.close();

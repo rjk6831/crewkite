@@ -82,6 +82,7 @@ import {
   TaskIdSchema,
   TaskSchema,
   TimestampSchema,
+  UsageReaderSchema,
 } from '@crewkite/contracts';
 import { hashCanonical, verifyHandoff } from '@crewkite/contracts/hash';
 import { fakeReviewWorkerPath, fakeWorkerPath } from '@crewkite/testkit/worker';
@@ -140,10 +141,18 @@ import {
 } from '../providers/anthropic/replacement.ts';
 import {
   type GoogleNativeLifecycle,
+  GoogleWriterError,
+  googleUsageObservations,
   googleWriterPlan,
   startGoogleConfig,
+  startGoogleUsage,
   startGoogleWriter,
 } from '../providers/google/native-writer.ts';
+import {
+  type GoogleUsageClientResolution,
+  googleUsageDescriptor,
+  resolveGoogleUsageClient,
+} from '../providers/google/profile.ts';
 import {
   type NativeProfileResolution,
   unavailableNativeProfile,
@@ -435,6 +444,8 @@ export type ControllerOptions = {
   nativeProfile?: () => NativeProfileResolution;
   nativeProfiles?: () => NativeProfileResolution[];
   nativeSpawn?: Parameters<typeof startReplacement>[2]['spawn'];
+  googleUsageClient?: () => GoogleUsageClientResolution;
+  googleUsageSpawn?: Parameters<typeof startGoogleUsage>[0]['spawn'];
   prepareVerification?: typeof prepareToolchain;
 };
 const migrations = fileURLToPath(new URL('../../migrations/', import.meta.url));
@@ -467,9 +478,19 @@ export class Controller {
   private profiles: NativeProfileResolution[];
   private closing?: Promise<void>;
   private readonly workers = new Map<string, FakeRuntime | NativeRuntime>();
+  private usageResolution: GoogleUsageClientResolution;
+  private usageRead?: {
+    key: string;
+    hash: string;
+    principal: string;
+    abort: AbortController;
+    promise: Promise<CommandResult>;
+    resolve: (result: CommandResult) => void;
+  };
 
   constructor(options: ControllerOptions) {
     this.options = options;
+    this.usageResolution = options.googleUsageClient?.() ?? resolveGoogleUsageClient();
     this.profiles = this.resolveProfiles();
     this.home = options.home;
     this.now = () => TimestampSchema.parse((options.now ?? (() => new Date().toISOString()))());
@@ -551,6 +572,7 @@ export class Controller {
         next: 'Send a valid protocol 1 command.',
       };
     const command = parsed.data;
+    if (command.command === 'ObserveUsage') return this.observeUsageCommand(command, principal);
     const preparing = this.verificationPreparation;
     if (preparing?.key === command.key)
       return preparing.hash === hashCanonical(command) && preparing.principal === principal
@@ -644,6 +666,7 @@ export class Controller {
     return SnapshotSchema.parse({
       protocol: 1,
       nativeProfiles: this.profiles.map((profile) => profile.facts),
+      usageReaders: [this.googleUsageReader()],
       nativeRuns: this.nativeRuns(),
       candidateEvaluations,
       cursor: this.store.cursor(),
@@ -671,6 +694,252 @@ export class Controller {
     });
   }
 
+  private googleUsageReader() {
+    const reader = this.store.googleUsageReader();
+    const enabled = reader.enabled === 1;
+    const reason = this.usageResolution.available
+      ? enabled
+        ? 'available'
+        : 'not-enabled'
+      : this.usageResolution.reason;
+    return UsageReaderSchema.parse({
+      id: googleUsageDescriptor.id,
+      family: 'google',
+      clientVersion: googleUsageDescriptor.clientVersion,
+      available: enabled && this.usageResolution.available,
+      reason,
+      enabled,
+      lastObservedAt: reader.last_observed_at,
+      lastAttemptAt: reader.last_attempt_at,
+    });
+  }
+
+  private observeUsageCommand(
+    command: Extract<Command, { command: 'ObserveUsage' }>,
+    principal: string,
+  ): Promise<CommandResult> {
+    const prior = this.usageRead;
+    const hash = hashCanonical(command);
+    if (prior?.key === command.key)
+      return prior.hash === hash && prior.principal === principal
+        ? prior.promise
+        : Promise.resolve({ outcome: 'denied', reason: 'idempotency-key-reused' });
+    if (command.payload.consent === false || prior || this.store.receipt(command.key)) {
+      let result = this.commitCommand(command, principal);
+      if (result.outcome === 'outcome-unknown' && result.reason === 'usage-read-pending') {
+        result = { outcome: 'outcome-unknown', reason: 'google-ownership-unknown' };
+        this.store.transaction(() => this.finishUsageReceipt(command.key, result));
+      }
+      return Promise.resolve(result);
+    }
+    const completion = Promise.withResolvers<CommandResult>();
+    const pending = {
+      key: command.key,
+      hash,
+      principal,
+      abort: new AbortController(),
+      promise: completion.promise,
+      resolve: completion.resolve,
+    };
+    this.usageRead = pending;
+    try {
+      const result = this.commitCommand(command, principal);
+      if (result.outcome !== 'outcome-unknown' || result.reason !== 'usage-read-pending')
+        completion.resolve(result);
+    } catch (error) {
+      if (this.usageRead === pending) this.usageRead = undefined;
+      throw error;
+    }
+    return pending.promise.finally(() => {
+      if (this.usageRead === pending) this.usageRead = undefined;
+    });
+  }
+
+  private observeUsage(
+    command: Extract<Command, { command: 'ObserveUsage' }>,
+    effects: (() => void)[],
+  ): CommandResult {
+    if (command.payload.consent !== undefined)
+      this.store.setGoogleUsageConsent(command.payload.consent);
+    if (command.payload.consent === false) {
+      effects.push(() => this.usageRead?.abort.abort());
+      return { outcome: 'applied', data: { kind: 'usage', windows: this.snapshot().usage } };
+    }
+    const reader = this.store.googleUsageReader();
+    if (!reader.enabled) return { outcome: 'blocked', reason: 'usage-reader-not-enabled' };
+    const now = this.now();
+    if (reader.last_attempt_at && Date.parse(now) - Date.parse(reader.last_attempt_at) < 60000)
+      return {
+        outcome: 'blocked',
+        reason: 'usage-reader-cooldown',
+        next: `Refresh after ${new Date(Date.parse(reader.last_attempt_at) + 60000).toISOString()}.`,
+      };
+    const blocker = this.store.googleOperationBlocker();
+    if (blocker) return { outcome: 'blocked', reason: blocker };
+    this.store.recordGoogleUsageAttempt(now);
+    try {
+      this.usageResolution = this.options.googleUsageClient?.() ?? resolveGoogleUsageClient();
+    } catch {
+      this.usageResolution = { available: false, reason: 'client-unavailable' };
+    }
+    if (!this.usageResolution.available)
+      return { outcome: 'blocked', reason: this.usageResolution.reason };
+    this.store.beginGoogleMetadata(command.key, 'usage', reader.authority_revision, now);
+    const resolution = this.usageResolution;
+    effects.push(
+      () => void this.launchGoogleUsage(command.key, reader.authority_revision, resolution),
+    );
+    return { outcome: 'outcome-unknown', reason: 'usage-read-pending' };
+  }
+
+  private async launchGoogleUsage(
+    commandId: string,
+    authorityRevision: number,
+    resolution: Extract<GoogleUsageClientResolution, { available: true }>,
+  ) {
+    const runtime = this.usageRead;
+    if (!runtime || runtime.key !== commandId) return;
+    let result: CommandResult = { outcome: 'blocked', reason: 'usage-read-failed' };
+    let beforeSpawn = true;
+    const current = () => {
+      const reader = this.store.googleUsageReader();
+      if (
+        this.closed ||
+        runtime.abort.signal.aborted ||
+        !reader.enabled ||
+        reader.authority_revision !== authorityRevision
+      )
+        throw new Error('usage-read-revoked');
+      const operation = this.store
+        .googleMetadataOperations()
+        .find((row) => row.command_id === commandId);
+      if (!operation || !['intent', 'owned'].includes(operation.state))
+        throw new Error('google-ownership-unknown');
+    };
+    try {
+      current();
+      const directory = mkdtempSync(join(this.home, 'google-usage-'));
+      const temporaryDirectory = mkdtempSync(join(this.home, 'google-usage-tmp-'));
+      const handle = startGoogleUsage({
+        client: resolution.client,
+        repositoryRoot: this.home,
+        directory,
+        temporaryDirectory,
+        environment: resolution.environment,
+        timeoutMs: googleUsageDescriptor.maximumReadMs,
+        signal: runtime.abort.signal,
+        spawn: this.options.googleUsageSpawn,
+        schedule: this.options.schedule,
+        lifecycle: {
+          beforePhase: () => {
+            current();
+            beforeSpawn = false;
+          },
+          owned: (_, group) => {
+            this.store.transaction(() => this.store.ownGoogleMetadata(commandId, group));
+            current();
+          },
+          quiescent: (_, group) =>
+            this.store.transaction(() =>
+              this.store.finishGoogleMetadata(commandId, group, this.now()),
+            ),
+        },
+      });
+      const outcome = await handle.result;
+      this.store.transaction(() => {
+        if (!outcome.quiescent) this.store.unknownGoogleMetadata(commandId);
+        const reader = this.store.googleUsageReader();
+        const operation = this.store
+          .googleMetadataOperations()
+          .find((row) => row.command_id === commandId);
+        if (operation?.state !== 'quiescent') this.store.unknownGoogleMetadata(commandId);
+        if (
+          this.closed ||
+          runtime.abort.signal.aborted ||
+          !reader.enabled ||
+          reader.authority_revision !== authorityRevision
+        )
+          result = { outcome: 'blocked', reason: 'usage-read-revoked' };
+        else if (!outcome.quiescent || operation?.state !== 'quiescent')
+          result = { outcome: 'outcome-unknown', reason: 'google-ownership-unknown' };
+        else if (!outcome.reason && outcome.metadata) {
+          const observedAt = this.now();
+          let routes = this.store
+            .list<Route>('route')
+            .filter((route) => route.family === 'google' && !route.fake);
+          if (!routes.length) {
+            const route = RouteSchema.parse({
+              id: this.id('rte'),
+              family: 'google',
+              displayName: 'Google',
+              model: 'unknown',
+              effort: { requested: 'unknown', effective: 'unknown', supported: [] },
+              billing: 'included',
+              qualified: false,
+              fake: false,
+            });
+            this.store.put('route', route.id, 0, route);
+            this.store.saveReceipt('usage-route:google', hashCanonical(route), 'local-owner', {
+              outcome: 'applied',
+            });
+            routes = [route];
+          }
+          for (const observation of googleUsageObservations(
+            outcome.metadata,
+            routes.map((route) => route.id),
+            observedAt,
+          )) {
+            this.store.put(
+              'window',
+              `${observation.routeId}/${observation.windowId}`,
+              0,
+              ObservationSchema.parse(observation),
+            );
+            this.event('usage.observed', null, 0, observation);
+          }
+          this.store.recordGoogleUsageObservation(observedAt);
+          result = { outcome: 'applied', data: { kind: 'usage', windows: this.snapshot().usage } };
+        }
+        this.finishUsageReceipt(commandId, result);
+      });
+    } catch (error) {
+      result = { outcome: 'outcome-unknown', reason: 'google-ownership-unknown' };
+      try {
+        this.store.transaction(() => {
+          const operation = this.store
+            .googleMetadataOperations()
+            .find((row) => row.command_id === commandId);
+          if (
+            operation?.state === 'intent' &&
+            (beforeSpawn || (error instanceof GoogleWriterError && error.reason === 'start'))
+          )
+            this.store.finishGoogleMetadata(commandId, null, this.now());
+          else if (operation?.state !== 'quiescent') this.store.unknownGoogleMetadata(commandId);
+          const reader = this.store.googleUsageReader();
+          const finished = this.store
+            .googleMetadataOperations()
+            .find((row) => row.command_id === commandId);
+          if (!reader.enabled || reader.authority_revision !== authorityRevision || this.closed)
+            result = { outcome: 'blocked', reason: 'usage-read-revoked' };
+          else if (finished?.state === 'quiescent')
+            result = { outcome: 'blocked', reason: 'usage-read-failed' };
+          this.finishUsageReceipt(commandId, result);
+        });
+      } catch {
+        // A failed persistence boundary leaves the committed ownership intent in place.
+        result = { outcome: 'outcome-unknown', reason: 'google-ownership-unknown' };
+      }
+    } finally {
+      runtime.resolve(CommandResultSchema.parse(result));
+    }
+  }
+
+  private finishUsageReceipt(commandId: string, result: CommandResult) {
+    this.store.db
+      .prepare('UPDATE receipts SET result=? WHERE command_key=?')
+      .run(canonicalJson(CommandResultSchema.parse(result)), commandId);
+  }
+
   subscribe(listener: (event: Event) => void): () => void {
     return this.store.subscribe(listener);
   }
@@ -678,6 +947,10 @@ export class Controller {
     if (this.closed) return this.closing;
     this.closed = true;
     const native: Promise<unknown>[] = [];
+    if (this.usageRead) {
+      this.usageRead.abort.abort();
+      native.push(this.usageRead.promise);
+    }
     if (this.verificationPreparation) {
       this.verificationPreparation.abort.abort();
       native.push(this.verificationPreparation.promise);
@@ -788,6 +1061,8 @@ export class Controller {
         };
     }
     switch (command.command) {
+      case 'ObserveUsage':
+        return this.observeUsage(command, effects);
       case 'RegisterProject': {
         const path = projectRoot(command.payload.path);
         const existing = this.store.db
@@ -1347,6 +1622,8 @@ export class Controller {
       .prepare('SELECT attempt_id FROM writer_leases WHERE task_id=?')
       .get(task.id);
     if (lease) return { outcome: 'blocked', reason: 'writer-lease-held' };
+    const googleBlocker = this.store.googleStartBlocker(attempt.routeId);
+    if (googleBlocker) return { outcome: 'blocked', reason: googleBlocker };
     const nativeTools =
       native && 'repository' in native.appointment
         ? this.grant(run, 'run-native-tools', project.name)
@@ -6275,6 +6552,17 @@ export class Controller {
 
   private recover() {
     this.store.transaction(() => {
+      for (const operation of this.store.googleMetadataOperations()) {
+        const quiescent = operation.state === 'quiescent';
+        if (!quiescent) this.store.unknownGoogleMetadata(operation.command_id);
+        const receipt = this.store.receipt(operation.command_id);
+        if (receipt?.result.reason === 'usage-read-pending') {
+          this.finishUsageReceipt(operation.command_id, {
+            outcome: quiescent ? 'blocked' : 'outcome-unknown',
+            reason: quiescent ? 'usage-read-interrupted' : 'google-ownership-unknown',
+          });
+        }
+      }
       for (const intent of this.store.intents().filter((value) => value.state !== 'stopped')) {
         const attempt = this.store.get<Attempt>('attempt', intent.attempt_id);
         const run = this.store.get<Run>('run', intent.run_id);
@@ -6771,6 +7059,8 @@ export class Controller {
   }
 
   private admitJob(run: Run, attempt: Attempt, directory: string, maximumMinutes?: number) {
+    const googleBlocker = this.store.googleStartBlocker(attempt.routeId);
+    if (googleBlocker) throw new Error(googleBlocker);
     const remaining = remainingBudgets(run, this.store.intents());
     if (
       remaining.attempts === 0 ||
@@ -8315,7 +8605,12 @@ export class Controller {
       ?.path as string | undefined;
   }
 
-  private event(type: Event['type'], taskId: string, revision: number, payload: Event['payload']) {
+  private event(
+    type: Event['type'],
+    taskId: string | null,
+    revision: number,
+    payload: Event['payload'],
+  ) {
     this.store.append({
       protocol: 1,
       id: this.id('evt'),

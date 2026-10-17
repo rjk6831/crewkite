@@ -273,10 +273,12 @@ export class ControllerClient {
           });
         },
         this.options.timeoutMs ??
-          (command.command === 'PrepareCandidateEvaluation' &&
-          command.payload.checkRecipeId === 'crewkite-verify-v1'
-            ? 65000
-            : 5000),
+          (command.command === 'ObserveUsage'
+            ? 30000
+            : command.command === 'PrepareCandidateEvaluation' &&
+                command.payload.checkRecipeId === 'crewkite-verify-v1'
+              ? 65000
+              : 5000),
       );
       this.pending.set(command.key, { resolve, timer });
       socket.write(frame);

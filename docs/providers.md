@@ -1,6 +1,6 @@
 # Provider routes
 
-I qualify exact routes: a specific client build, account type, model, effort setting and billing mode. A logo or a model name in a menu is not support. Team routing runs scripted fakes for all four families. The supervised native path supports exact OpenAI and Anthropic profiles. Google consumer automatic launch is unavailable. General live routing remains unqualified.
+I qualify exact routes: a specific client build, account type, model, effort setting and billing mode. A logo or a model name in a menu is not support. Team routing runs scripted fakes for all four families. The supervised native path supports exact OpenAI and Anthropic profiles. Google consumer headless-wrapper launch is unavailable. Its separate quota reader has explicit consent and refresh controls; the ACP writer remains planned. Neither path has live qualification. General live routing remains unqualified.
 
 ## Current availability
 
@@ -10,16 +10,46 @@ I checked the following primary-source guidance on 17 October 2026. Client behav
 |--------|-----------------------|----------|
 | OpenAI | Bounded local native file and repository work | The [app-server authentication guidance](https://learn.chatgpt.com/docs/app-server#auth-endpoints) permits continued use by local or open-source applications. It recommends migration to Sign in with ChatGPT and excludes commercial or hosted services from app-server authentication. |
 | Anthropic | Bounded local native single-file work | The [native-binary policy](https://code.claude.com/docs/en/legal-and-compliance#can-customers-offer-claude-code-in-their-products) permits end users to sign in with their own subscription under its product conditions. The [7 October update](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan) preserves subscription-limit use of the Agent SDK, `claude -p` and third-party apps. |
-| Google | Consumer automatic launch unavailable | The [official FAQ](https://antigravity.google/docs/faq/#can-i-use-antigravity-cli-headless-mode-in-third-party-coding-agents-or-automate-account-switching) excludes wrapping the consumer CLI inside third-party applications. No API fallback is configured. |
+| Google | Opt-in quota reader; consumer headless writer unavailable; separate ACP writer planned | The [official FAQ](https://antigravity.google/docs/faq/#can-i-use-antigravity-cli-headless-mode-in-third-party-coding-agents-or-automate-account-switching) excludes wrapping the consumer CLI inside third-party applications. Google documents its separate ACP agent for editors. CrewKite is not named. No ACP route is qualified and no API fallback is configured. |
 | Local | Planned authenticated loopback integration | No model is installed or loaded by the scripted Local fixture. Memory, latency, quality and cancellation still need qualification. |
 
 Running Claude Code in a product requires the publisher's agreement to Anthropic's Commercial Terms, an unmodified official binary with its authentication methods intact, and each user's own login and direct billing. Credentials and usage cannot be intermediated. CrewKite starts the user's installed native client, offers no separate login and does not collect OAuth tokens. It no longer forces a login method. Fresh authentication and billing attestations remain required by this profile. The [account guidance](https://support.claude.com/en/articles/13189465-log-in-to-your-claude-account) reserves third-party usage-credit billing, so these checks establish no provider hard spending cap or guaranteed included billing.
 
-The default Google profile refuses preparation and Start before native discovery. The interface keeps the unavailable profile and its reason visible. An installed client or user billing attestation cannot establish integration permission. Anthropic keeps its existing local native path without forcing a login method. This does not establish permission for every integration or guarantee included billing.
+The existing `google-file-v1` profile refuses preparation and Start before native discovery. The interface keeps the unavailable profile and its reason visible. An installed client or user billing attestation cannot establish integration permission. The proposed `google-acp-v1` profile is separate. Anthropic keeps its existing local native path without forcing a login method. This does not establish permission for every integration or guarantee included billing.
 
 Retained candidates remain inspectable and exportable through the existing permission path. I can save a patch and open a provider's native app myself. CrewKite does not automate that transfer, claim automatic import or reuse the native app's account through a fallback.
 
 The following sections record exact pilot mechanics and adapter limits. Prior Google evidence does not authorize new consumer launches. General live routing remains unqualified.
+
+## Google ACP writer
+
+I propose a controller-owned ACP writer under [Proposed ADR 0024](adr/0024-integrate-google-through-its-published-acp-agent.md). The [published registry](https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json) lists Google LLC's Antigravity server 1.4.0 for `darwin-aarch64` with a Google-hosted download. The macOS executable is `agy_acp_server.par`, separate from the CLI. No published checksum accompanies that entry. Qualification would pin the first observed SHA-256 digest and Developer ID team before use. Google's [Zed guide](https://www.antigravity.google/docs/ide/extensions/zed/) documents personal-plan `oauth-personal` authentication. Google documents this agent for editors; that precedent does not settle CrewKite's eligibility as an orchestrator.
+
+The proposed launch card, roster and provider notice use this label:
+
+> Google’s published ACP agent, signed in with your own Google account. Google documents this agent for editors; CrewKite is not named.
+
+The first path would use guided or balanced authority with a human decision for every approval request. Preparation would freeze the observed model, thought level, client identity and setup proof. A fresh session would have to acknowledge those choices before the controller sends one prompt. Native authentication would remain inside Google's agent, initiated explicitly from CrewKite's setup UI. CrewKite would retain a result code and safe capability facts, with no credentials or OAuth URL. A successful login or listed model would establish no account entitlement or request charge.
+
+The writer would edit one selected file in independent scratch. After Stop or completion, the controller would require closed streams and an absent owned group before capture. The target would have to remain a regular UTF-8 file within 64 KiB, with every sibling and source mode unchanged. Candidate bytes would come from scratch. ACP diff text and connector results would remain activity. Checks, review and local acceptance would keep their existing separate authority.
+
+Only an offered `allow_once` option could answer an exact pending approval bound to the session, tool call, attempt and generation. Permanent options, stale replies and automatic approvals would refuse. Stop would cancel pending approvals, send `session/cancel`, await the original prompt's cancelled response and prove process cleanup. Lost transport would preserve uncertainty. Disabling ACP filesystem and terminal services would not disable native tools or establish containment under [ADR 0009](adr/0009-native-client-trust-profile.md).
+
+These are planned capabilities. No ACP executable, sign-in, model selection, permission behavior, Stop or installed recovery is qualified. Offline protocol fixtures must precede separately authorized native observations. Autopilot and automatic Google handoff remain outside this proposal. The existing headless writer stays blocked, and the native workspace connector keeps its separate context-only evidence below.
+
+## Google quota read
+
+The `google-usage-v1` reader is separate from coding authority. Explicit opt-in permits the pinned CLI's `agy -p /usage --output-format json` metadata command. Google's [FAQ](https://antigravity.google/docs/faq/#can-i-use-antigravity-cli-headless-mode-in-third-party-coding-agents-or-automate-account-switching) reserves consumer headless use for scripting and CI. The Usage page keeps that boundary visible; a quota query establishes no permission for a headless coding wrapper. The [CLI usage documentation](https://www.antigravity.google/docs/cli/commands/usage/) describes a backend quota refresh.
+
+A historical metadata observation reported zero turns and account buckets. The parser rejects contradictory nonzero usage counters, conflicting duplicate buckets and invalid output. A successful owned read retains reported percentages, reset times and observation time. A refusal preserves older observations with their original timestamps. Controller and interface support establish no current live read, account identity or writer qualification.
+
+The Usage page can enable reads and read once, refresh under saved consent or disable reads. The [CLI usage commands](../apps/cli/README.md) expose the same controller state. `ObserveUsage` with consent true records opt-in and requests a read. Omitted consent requires the stored opt-in. Consent false disables without a read, cancels in-flight authority and rejects late results. No timer refreshes quota. Each admitted attempt has a durable sixty-second cooldown, including failures.
+
+A separate metadata-operation journal records intent, process ownership and closure without creating a task or attempt. Reads refuse while Google ownership is active or unknown in that controller home. Restart preserves uncertainty and never replays a metadata command or signals a historical PID. The shared gate also protects native Google Start; ACP setup will use it when implemented. A read has a twenty-second bound, private working and temporary directories and a restricted environment. Existing observations remain visible after failure or disabled consent and become stale after five minutes.
+
+All returned buckets attach conservatively to Google routes, without inferred model-group entitlement. A quota-only display row remains unqualified with unknown model and effort; included billing describes intended mode. A read never makes that row selectable for coding. Applying every bucket can refuse a model because another pool is low; I accept that cost.
+
+ACP preparation would require a separate user assertion that CLI quota and ACP login use the same Google account. This would remain user-attested, with no verified identity claim. Every returned bucket would have to be fresh and above reserve before ACP admission. Disabled reads, stale data and missing windows would block ACP Start. The ACP admission refresh is still planned. ACP context tokens would never substitute for account allowance.
 
 ## Google native workspace context
 

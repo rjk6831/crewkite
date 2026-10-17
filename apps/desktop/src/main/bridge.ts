@@ -27,6 +27,8 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
   let client: ControllerClient | null = null;
   let listening = false;
   let busy = false;
+  let activeCommand: Command | null = null;
+  let revokingUsage = false;
   const receipts = new CommandReceipts(controller.paths.home, controller.paths.profile);
   let connection: DesktopNotice = {
     kind: 'connection',
@@ -150,7 +152,6 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
   });
   ipcMain.handle('crewkite:command', async (event, input: unknown) => {
     assertSender(event, window);
-    if (busy) throw new Error('Wait for the pending desktop command.');
     const bytes = JSON.stringify(input);
     if (
       !bytes ||
@@ -174,7 +175,23 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       key: createCommandKey(),
       actor: desktopActor,
     });
-    if (receipts.commands.length && 'expectedRevision' in command && command.command !== 'StopRun')
+    const revokeUsage = command.command === 'ObserveUsage' && command.payload.consent === false;
+    if (
+      revokingUsage ||
+      (busy &&
+        !(
+          revokeUsage &&
+          activeCommand?.command === 'ObserveUsage' &&
+          activeCommand.payload.consent !== false
+        ))
+    )
+      throw new Error('Wait for the pending desktop command.');
+    if (
+      receipts.commands.length &&
+      'expectedRevision' in command &&
+      command.command !== 'StopRun' &&
+      !revokeUsage
+    )
       throw new Error('Resolve the uncertain command with exact retry before another change.');
     if (
       command.command === 'StopRun' &&
@@ -183,18 +200,33 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       )
     )
       throw new Error('Retry the existing uncertain stop with its exact command key.');
-    busy = true;
+    if (
+      revokeUsage &&
+      receipts.commands.some(
+        (item) => item.command === 'ObserveUsage' && item.payload.consent === false,
+      )
+    )
+      throw new Error('Retry the existing uncertain quota disable with its exact command key.');
+    if (revokeUsage) revokingUsage = true;
+    else {
+      busy = true;
+      activeCommand = command;
+    }
     try {
       const result = await execute(command, () => assertSender(event, window));
       assertSender(event, window);
       return result;
     } finally {
-      busy = false;
+      if (revokeUsage) revokingUsage = false;
+      else {
+        busy = false;
+        activeCommand = null;
+      }
     }
   });
   ipcMain.handle('crewkite:pick-project', async (event) => {
     assertSender(event, window);
-    if (busy || receipts.commands.length)
+    if (busy || revokingUsage || receipts.commands.length)
       throw new Error('Resolve the pending desktop command first.');
     busy = true;
     try {
@@ -222,15 +254,17 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
   });
   ipcMain.handle('crewkite:retry', async (event) => {
     assertSender(event, window);
-    if (busy) throw new Error('Wait for the pending desktop command.');
+    if (busy || revokingUsage) throw new Error('Wait for the pending desktop command.');
     if (!receipts.commands.length) return null;
     busy = true;
+    activeCommand = receipts.commands[0];
     try {
-      const result = await execute(receipts.commands[0], () => assertSender(event, window));
+      const result = await execute(activeCommand, () => assertSender(event, window));
       assertSender(event, window);
       return result;
     } finally {
       busy = false;
+      activeCommand = null;
     }
   });
   ipcMain.handle('crewkite:events', (event) => {

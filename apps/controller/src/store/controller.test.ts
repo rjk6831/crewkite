@@ -28,6 +28,7 @@ import {
   type Candidate,
   type CheckEvent,
   type CheckResult,
+  type CommandResult,
   CommandSchema,
   canonicalJson,
   GoogleNativeProfileSchema,
@@ -3667,11 +3668,13 @@ test('an appointed native proposal is retained and applied once after every phas
         ),
       );
       controller.store.db.exec(
-        'INSERT INTO native_processes SELECT * FROM native_processes_saved; DROP TABLE native_processes_saved; PRAGMA user_version=4',
+        'INSERT INTO native_processes SELECT * FROM native_processes_saved; DROP TABLE native_processes_saved; DROP TABLE google_metadata_operations; DROP TABLE google_usage_reader; PRAGMA user_version=4',
       );
       controller.store.applyMigrations(new URL('../../migrations/', import.meta.url).pathname);
       assert.deepEqual(controller.store.nativeProcesses(attempt.attempt_id), previous);
-      assert.equal(controller.store.db.prepare('PRAGMA user_version').get()?.user_version, 6);
+      assert.equal(controller.store.db.prepare('PRAGMA user_version').get()?.user_version, 7);
+      assert.equal(controller.store.googleUsageReader().enabled, 0);
+      assert.deepEqual(controller.store.googleMetadataOperations(), []);
     }
 
     assert(
@@ -5619,4 +5622,428 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
       );
     }
   }
+});
+
+test('google quota authority survives retries and restart while sharing one operation gate', async (t) => {
+  let controller: Controller;
+  let mode: 'success' | 'invalid' | 'revoke' = 'success';
+  let available = true;
+  let launches = 0;
+  let revoke: Promise<CommandResult> | undefined;
+  const report = {
+    status: 'SUCCESS',
+    num_turns: 0,
+    command: {
+      name: 'usage',
+      data: {
+        groups: [
+          {
+            buckets: [
+              { id: 'gemini-weekly', remaining_fraction: 0.8, reset_time: '2026-10-23T14:13:03Z' },
+              { id: 'gemini-5h', remaining_fraction: 0.3, reset_time: '2026-10-16T19:13:03Z' },
+              {
+                id: 'gemini-argon-wtu-weekly',
+                remaining_fraction: 1,
+                reset_time: '2026-10-23T14:13:03Z',
+              },
+            ],
+          },
+        ],
+      },
+    },
+  };
+  const options: Partial<ControllerOptions> = {
+    googleUsageClient: () =>
+      available
+        ? {
+            available: true,
+            reason: 'available',
+            client: { executable: process.execPath, version: '1.4.0', sha256: fixtureClientHash },
+            environment: { HOME: userInfo().homedir },
+          }
+        : { available: false, reason: 'client-unavailable' },
+    googleUsageSpawn: (_, args, spawnOptions) => {
+      launches++;
+      assert.equal(args[1], '/usage');
+      assert.deepEqual(Object.keys(spawnOptions.env).sort(), [
+        'HOME',
+        'LANG',
+        'LOGNAME',
+        'NO_COLOR',
+        'PATH',
+        'TERM',
+        'TMPDIR',
+        'USER',
+      ]);
+      const operation = controller.store.googleMetadataOperations().at(-1);
+      assert.equal(operation?.state, 'intent', 'metadata ownership commits before spawn');
+      controller.store.transaction(() => {
+        assert.equal(controller.store.googleOperationBlocker(), 'google-operation-active');
+        assert.throws(
+          () =>
+            controller.store.beginGoogleMetadata(
+              context.id('cmd'),
+              'acp-initialize',
+              0,
+              context.clock.now(),
+            ),
+          /google-operation-active/,
+        );
+      });
+      const child = spawn(
+        process.execPath,
+        [
+          '-e',
+          `process.stdout.write(${JSON.stringify(JSON.stringify(mode === 'invalid' ? {} : report))})`,
+        ],
+        spawnOptions,
+      );
+      if (mode === 'revoke')
+        child.once('close', () => {
+          revoke = controller.execute(
+            context.command('ObserveUsage', { family: 'google', consent: false }, 0),
+            'local-owner',
+          );
+        });
+      return child;
+    },
+  };
+  const context = await setup(t, options, () => controller.close());
+  controller = context.controller;
+  const refresh = (consent?: boolean) =>
+    context.command(
+      'ObserveUsage',
+      { family: 'google', ...(consent === undefined ? {} : { consent }) },
+      0,
+    );
+  assert.equal(
+    (await controller.execute(refresh(), 'local-owner')).reason,
+    'usage-reader-not-enabled',
+  );
+  assert.equal(launches, 0);
+  const first = refresh(true);
+  const pending = controller.execute(first, 'local-owner');
+  const retry = controller.execute(first, 'local-owner');
+  assert.equal(
+    (
+      await controller.execute(
+        { ...first, payload: { family: 'google', consent: false } },
+        'local-owner',
+      )
+    ).reason,
+    'idempotency-key-reused',
+  );
+  assert.equal((await pending).outcome, 'applied');
+  assert.equal((await retry).outcome, 'applied');
+  assert.equal((await controller.execute(first, 'local-owner')).outcome, 'already-applied');
+  assert.equal(launches, 1);
+  const displayRoute = controller
+    .snapshot()
+    .routes.find((route) => route.family === 'google' && !route.fake);
+  assert(displayRoute);
+  assert.equal(displayRoute.model, 'unknown');
+  assert.deepEqual(displayRoute.effort, {
+    requested: 'unknown',
+    effective: 'unknown',
+    supported: [],
+  });
+  assert.equal(displayRoute.qualified, false);
+  assert.equal(
+    controller.snapshot().usage.filter(({ observation }) => observation.routeId === displayRoute.id)
+      .length,
+    3,
+  );
+  assert.equal(controller.snapshot().usageReaders[0]?.lastObservedAt, context.clock.now());
+  assert(
+    controller.store
+      .eventsAfter('0')
+      .filter((event) => event.type === 'usage.observed')
+      .every((event) => event.taskId === null),
+  );
+  assert.equal(
+    (await controller.execute(refresh(), 'local-owner')).reason,
+    'usage-reader-cooldown',
+  );
+  const second = { ...displayRoute, id: context.id('rte') };
+  controller.store.transaction(() => controller.store.put('route', second.id, 0, second));
+  context.clock.advance(60000);
+  assert.equal((await controller.execute(refresh(), 'local-owner')).outcome, 'applied');
+  const liveRoutes = controller
+    .snapshot()
+    .routes.filter((route) => route.family === 'google' && !route.fake);
+  for (const route of liveRoutes)
+    assert.equal(
+      controller.snapshot().usage.filter(({ observation }) => observation.routeId === route.id)
+        .length,
+      3,
+    );
+  const retained = controller.snapshot().usage;
+  mode = 'invalid';
+  context.clock.advance(60000);
+  assert.equal((await controller.execute(refresh(), 'local-owner')).reason, 'usage-read-failed');
+  assert.deepEqual(controller.snapshot().usage, retained);
+  const attemptedAt = controller.snapshot().usageReaders[0]?.lastAttemptAt;
+  await controller.close();
+  controller = new Controller({
+    ...options,
+    home: join(context.directory, 'home'),
+    now: context.clock.now,
+    id: context.id,
+  });
+  assert.equal(controller.snapshot().usageReaders[0]?.enabled, true);
+  assert.equal(controller.snapshot().usageReaders[0]?.lastAttemptAt, attemptedAt);
+  assert.equal(
+    (await controller.execute(refresh(), 'local-owner')).reason,
+    'usage-reader-cooldown',
+  );
+  context.clock.advance(60000);
+  available = false;
+  assert.equal((await controller.execute(refresh(), 'local-owner')).reason, 'client-unavailable');
+  assert.equal(
+    (await controller.execute(refresh(), 'local-owner')).reason,
+    'usage-reader-cooldown',
+  );
+  available = true;
+  mode = 'revoke';
+  context.clock.advance(60000);
+  const beforeRevoke = controller.snapshot().usage;
+  assert.equal((await controller.execute(refresh(), 'local-owner')).reason, 'usage-read-revoked');
+  assert.equal((await revoke)?.outcome, 'applied');
+  assert.equal(controller.snapshot().usageReaders[0]?.enabled, false);
+  assert.deepEqual(controller.snapshot().usage, beforeRevoke);
+  assert.equal(controller.store.googleMetadataOperations().at(-1)?.state, 'quiescent');
+  mode = 'success';
+  context.clock.advance(60000);
+  const googleRoute = context.fixtures.snapshot.routes.find((route) => route.family === 'google');
+  assert(googleRoute);
+  controller.store.transaction(() => {
+    controller.store.db
+      .prepare("DELETE FROM entities WHERE kind='window' AND id=?")
+      .run(`${googleRoute.id}/weekly`);
+    for (const { observation } of controller
+      .snapshot()
+      .usage.filter(({ observation }) => observation.routeId === displayRoute.id)) {
+      const mapped = { ...observation, routeId: googleRoute.id };
+      controller.store.put('window', `${googleRoute.id}/${mapped.windowId}`, 0, mapped);
+    }
+  });
+  const task = TaskSchema.parse((await controller.execute(context.draft, 'local-owner')).entity);
+  const prepared = await controller.execute(
+    context.command(
+      'PrepareRun',
+      {
+        taskId: task.id,
+        policy: {
+          ...context.fixtures.policy,
+          quality: 'quick',
+          methods: [],
+          effects: context.fixtures.policy.effects.map((grant) => ({ ...grant, taskId: task.id })),
+        },
+        roles: [
+          { role: 'coder', routeId: googleRoute.id, pinned: false, approvedFallbacks: [] },
+          {
+            role: 'advisor',
+            routeId: context.fixtures.snapshot.routes[0].id,
+            pinned: false,
+            approvedFallbacks: [],
+          },
+        ],
+      },
+      task.revision,
+    ),
+    'local-owner',
+  );
+  assert.equal(prepared.outcome, 'applied', canonicalJson(prepared));
+  const run = RunSchema.parse(prepared.entity);
+  controller.store.transaction(() =>
+    controller.store.put('route', googleRoute.id, 0, { ...googleRoute, fake: false }),
+  );
+  const setupId = context.id('cmd');
+  controller.store.transaction(() =>
+    controller.store.beginGoogleMetadata(setupId, 'acp-discover', 7, context.clock.now()),
+  );
+  assert.equal(
+    (await controller.execute(refresh(true), 'local-owner')).reason,
+    'google-operation-active',
+  );
+  controller.store.transaction(() => {
+    assert.equal(controller.store.googleStartBlocker(googleRoute.id), 'google-operation-active');
+  });
+  const startCommand = context.command(
+    'StartRun',
+    { taskId: task.id, runId: run.id },
+    prepared.revision,
+  );
+  assert.equal(
+    (await controller.execute(startCommand, 'local-owner')).reason,
+    'google-operation-active',
+  );
+  assert.equal(controller.store.intents().length, 0);
+  controller.store.transaction(() =>
+    controller.store.finishGoogleMetadata(setupId, null, context.clock.now()),
+  );
+  const writer = {
+    id: context.id('att'),
+    runId: run.id,
+    routeId: googleRoute.id,
+    generation: 0,
+    state: 'intent' as const,
+    revision: 0,
+  };
+  controller.store.transaction(() => {
+    controller.store.put('attempt', writer.id, 0, writer);
+    controller.store.db
+      .prepare(
+        "INSERT INTO launch_intents(attempt_id,task_id,run_id,route_id,generation,scratch_path,state,admitted_at) VALUES (?,?,?,?,0,?,'intent',?)",
+      )
+      .run(writer.id, task.id, run.id, displayRoute.id, context.directory, context.clock.now());
+    assert.throws(
+      () =>
+        controller.store.beginGoogleMetadata(
+          context.id('cmd'),
+          'acp-initialize',
+          0,
+          context.clock.now(),
+        ),
+      /google-operation-active/,
+    );
+  });
+  assert.equal(
+    (await controller.execute(refresh(), 'local-owner')).reason,
+    'google-operation-active',
+  );
+  controller.store.transaction(() =>
+    controller.store.db
+      .prepare("UPDATE launch_intents SET state='outcome-unknown' WHERE attempt_id=?")
+      .run(writer.id),
+  );
+  assert.equal(
+    (await controller.execute(refresh(), 'local-owner')).reason,
+    'google-ownership-unknown',
+  );
+  controller.store.transaction(() =>
+    controller.store.db.prepare('DELETE FROM launch_intents WHERE attempt_id=?').run(writer.id),
+  );
+  assert.equal((await controller.execute(refresh(), 'local-owner')).outcome, 'applied');
+  context.clock.advance(60000);
+  const priorObservations = controller.snapshot().usage;
+  const closingRead = controller.execute(refresh(), 'local-owner');
+  const closing = controller.close();
+  assert.equal((await closingRead).reason, 'usage-read-revoked');
+  await closing;
+  controller = new Controller({
+    ...options,
+    home: join(context.directory, 'home'),
+    now: context.clock.now,
+    id: context.id,
+  });
+  assert.deepEqual(controller.snapshot().usage, priorObservations);
+  assert.equal(controller.store.googleMetadataOperations().at(-1)?.state, 'quiescent');
+  context.clock.advance(60000);
+  const absentGroup = controller.store
+    .googleMetadataOperations()
+    .find((row) => row.process_group)?.process_group;
+  assert(absentGroup && groupAbsent(absentGroup));
+  const closedCommand = refresh();
+  controller.store.transaction(() => {
+    controller.store.beginGoogleMetadata(
+      closedCommand.key as string,
+      'usage',
+      controller.store.googleUsageReader().authority_revision,
+      context.clock.now(),
+    );
+    controller.store.ownGoogleMetadata(closedCommand.key as string, absentGroup);
+    controller.store.saveReceipt(
+      closedCommand.key as string,
+      hashCanonical(closedCommand),
+      'local-owner',
+      { outcome: 'outcome-unknown', reason: 'usage-read-pending' },
+    );
+  });
+  await controller.close();
+  const recoveryLaunches = launches;
+  const originalKill = process.kill;
+  let historicalProbes = 0;
+  process.kill = (pid, signal) => {
+    if (pid === -absentGroup) {
+      historicalProbes++;
+      throw new Error('A historical metadata group cannot establish stream closure.');
+    }
+    return originalKill(pid, signal);
+  };
+  try {
+    controller = new Controller({
+      ...options,
+      home: join(context.directory, 'home'),
+      now: context.clock.now,
+      id: context.id,
+    });
+  } finally {
+    process.kill = originalKill;
+  }
+  assert.equal(historicalProbes, 0);
+  assert.equal(
+    controller.store.googleMetadataOperations().find((row) => row.command_id === closedCommand.key)
+      ?.state,
+    'unknown',
+  );
+  assert.equal(
+    (await controller.execute(closedCommand, 'local-owner')).reason,
+    'google-ownership-unknown',
+  );
+  assert.equal(
+    (await controller.execute(refresh(), 'local-owner')).reason,
+    'google-ownership-unknown',
+  );
+  assert.equal(launches, recoveryLaunches);
+  await controller.close();
+  const unknownHome = join(context.directory, 'unknown-home');
+  controller = new Controller({
+    ...options,
+    home: unknownHome,
+    now: context.clock.now,
+    id: context.id,
+  });
+  controller.store.transaction(() => controller.store.setGoogleUsageConsent(true));
+  const interrupted = refresh();
+  controller.store.transaction(() => {
+    controller.store.beginGoogleMetadata(
+      interrupted.key as string,
+      'usage',
+      controller.store.googleUsageReader().authority_revision,
+      context.clock.now(),
+    );
+    controller.store.saveReceipt(
+      interrupted.key as string,
+      hashCanonical(interrupted),
+      'local-owner',
+      { outcome: 'outcome-unknown', reason: 'usage-read-pending' },
+    );
+  });
+  assert.equal(
+    (await controller.execute(interrupted, 'local-owner')).reason,
+    'google-ownership-unknown',
+  );
+  assert.equal(
+    controller.store.receipt(interrupted.key as string)?.result.reason,
+    'google-ownership-unknown',
+  );
+  await controller.close();
+  const beforeRecovery = launches;
+  controller = new Controller({
+    ...options,
+    home: unknownHome,
+    now: context.clock.now,
+    id: context.id,
+  });
+  assert.equal(
+    controller.store.googleMetadataOperations().find((row) => row.command_id === interrupted.key)
+      ?.state,
+    'unknown',
+  );
+  assert.equal(
+    (await controller.execute(refresh(), 'local-owner')).reason,
+    'google-ownership-unknown',
+  );
+  assert.equal(launches, beforeRecovery);
 });

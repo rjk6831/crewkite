@@ -343,6 +343,9 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     { recipe: 'node-tests-v1', expected: 5000 },
     { recipe: 'project-node-tests-v1', expected: 5000 },
     { recipe: null, expected: 5000 },
+    { recipe: 'usage', expected: 30000 },
+    { recipe: 'usage', timeoutMs: 10000, expected: 10000 },
+    { recipe: 'usage', timeoutMs: 40000, expected: 40000 },
     { recipe: 'crewkite-verify-v1', timeoutMs: 10000, expected: 10000 },
     { recipe: 'crewkite-verify-v1', timeoutMs: 70000, expected: 70000 },
   ] as const) {
@@ -358,30 +361,39 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       const command: Command =
         row.recipe === null
           ? { protocol: 1, key: `cmd_${suffix}`, actor, command: 'GetSnapshot', payload: {} }
-          : {
-              protocol: 1,
-              key: `cmd_${suffix}`,
-              actor,
-              command: 'PrepareCandidateEvaluation',
-              expectedRevision: task.revision,
-              payload: {
-                taskId: task.id,
-                candidateId: candidate.id,
-                ...(row.recipe === 'project-node-tests-v1'
-                  ? { checkRecipeId: row.recipe, testFiles: projectTestFiles }
-                  : { checkRecipeId: row.recipe }),
-                reviewer: { profileId: profile.id, methodId: 'keep-it-simple', cycles: 1 },
-                creditPolicy: 'ordinary',
-                consent: 'explicit',
-                grants: grants.map((grant) => ({
-                  ...grant,
-                  target:
-                    grant.action === 'run-check' && row.recipe === 'crewkite-verify-v1'
-                      ? 'crewkite verify'
-                      : grant.target,
-                })),
-              },
-            };
+          : row.recipe === 'usage'
+            ? {
+                protocol: 1,
+                key: `cmd_${suffix}`,
+                actor,
+                command: 'ObserveUsage',
+                expectedRevision: 0,
+                payload: { family: 'google' },
+              }
+            : {
+                protocol: 1,
+                key: `cmd_${suffix}`,
+                actor,
+                command: 'PrepareCandidateEvaluation',
+                expectedRevision: task.revision,
+                payload: {
+                  taskId: task.id,
+                  candidateId: candidate.id,
+                  ...(row.recipe === 'project-node-tests-v1'
+                    ? { checkRecipeId: row.recipe, testFiles: projectTestFiles }
+                    : { checkRecipeId: row.recipe }),
+                  reviewer: { profileId: profile.id, methodId: 'keep-it-simple', cycles: 1 },
+                  creditPolicy: 'ordinary',
+                  consent: 'explicit',
+                  grants: grants.map((grant) => ({
+                    ...grant,
+                    target:
+                      grant.action === 'run-check' && row.recipe === 'crewkite-verify-v1'
+                        ? 'crewkite verify'
+                        : grant.target,
+                  })),
+                },
+              };
       let settled = false;
       const response = client.command(command).then((value) => {
         settled = true;
@@ -466,7 +478,90 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     { name: 'extra-task', args: [...createArgs, 'other'], invalid: true },
   ];
 
+  const usageReader: Snapshot['usageReaders'][number] = {
+    id: 'google-usage-v1',
+    family: 'google',
+    clientVersion: '1.4.0',
+    enabled: true,
+    available: true,
+    reason: 'available',
+    lastAttemptAt: '2026-10-17T10:00:00.000Z',
+    lastObservedAt: '2026-10-17T10:00:00.000Z',
+  };
+  const usageWindows: Snapshot['usage'] = [
+    {
+      observation: {
+        routeId: `rte_${suffix}`,
+        windowId: 'weekly',
+        kind: 'weekly',
+        remaining: { value: 42.25, unit: 'percent' },
+        resetsAt: '2026-10-18T10:00:00.000Z',
+        observedAt: '2026-10-17T10:00:00.000Z',
+        source: 'client',
+        confidence: 'reported',
+      },
+      state: 'stale',
+    },
+  ];
+  const usageCases: Array<{
+    name: string;
+    args: string[];
+    consent?: boolean;
+    invalid?: boolean;
+    reason?: string;
+  }> = [
+    { name: 'show', args: ['usage', 'show'] },
+    {
+      name: 'enable',
+      args: ['usage', 'refresh', '--family', 'google', '--consent'],
+      consent: true,
+    },
+    { name: 'refresh', args: ['usage', 'refresh', '--family', 'google'] },
+    {
+      name: 'disable',
+      args: ['usage', 'refresh', '--family', 'google', '--no-consent'],
+      consent: false,
+    },
+    {
+      name: 'cooldown',
+      args: ['usage', 'refresh', '--family', 'google'],
+      reason: 'usage-reader-cooldown',
+    },
+    {
+      name: 'off',
+      args: ['usage', 'refresh', '--family', 'google'],
+      reason: 'usage-reader-not-enabled',
+    },
+    {
+      name: 'active',
+      args: ['usage', 'refresh', '--family', 'google'],
+      reason: 'google-operation-active',
+    },
+    {
+      name: 'unknown',
+      args: ['usage', 'refresh', '--family', 'google'],
+      reason: 'google-ownership-unknown',
+    },
+    {
+      name: 'unavailable',
+      args: ['usage', 'refresh', '--family', 'google'],
+      reason: 'client-unavailable',
+    },
+    { name: 'missing-family', args: ['usage', 'refresh'], invalid: true },
+    { name: 'wrong-family', args: ['usage', 'refresh', '--family', 'openai'], invalid: true },
+    { name: 'show-family', args: ['usage', 'show', '--family', 'google'], invalid: true },
+    { name: 'wrong-command', args: ['health', '--consent'], invalid: true },
+    { name: 'extra', args: ['usage', 'show', 'other'], invalid: true },
+    { name: 'unknown-action', args: ['usage', 'enable'], invalid: true },
+    {
+      name: 'conflicting-consent',
+      args: ['usage', 'refresh', '--family', 'google', '--consent', '--no-consent'],
+      invalid: true,
+    },
+  ];
+
   for (const scenario of [
+    ...usageCases.map((value) => `usage-${value.name}`),
     ...creationCases.map((value) => `setup-${value.name}`),
     'show',
     'native-show',
@@ -762,6 +857,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
           ]
         : [];
     const creationCase = creationCases.find((value) => scenario === `setup-${value.name}`);
+    const usageCase = usageCases.find((value) => scenario === `usage-${value.name}`);
     const fixture = await serve((message, socket) => {
       if (message.type === 'hello')
         socket.write(encodeFrame({ type: 'welcome', protocol: 1, cursor: snapshot.cursor }));
@@ -796,6 +892,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
             kind: 'snapshot',
             snapshot: {
               ...snapshot,
+              ...(usageCase ? { usageReaders: [usageReader], usage: usageWindows } : {}),
               projects: scenario.startsWith('repository-')
                 ? [{ id: task.projectId, name: 'fixture-project', revision: 0 }]
                 : snapshot.projects,
@@ -866,6 +963,17 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
             },
           },
         };
+      if (command.command === 'ObserveUsage')
+        result = usageCase?.reason
+          ? {
+              outcome: 'blocked',
+              reason: usageCase.reason,
+              next: 'Inspect reader status and retry after 2026-10-17T10:01:00.000Z.',
+            }
+          : {
+              outcome: 'applied',
+              data: { kind: 'usage', windows: usageCase?.consent === false ? [] : usageWindows },
+            };
       if (command.command === 'GetChanges')
         result = { outcome: 'applied', data: { ...changes, truncated: scenario === 'changes' } };
       if (command.command === 'ExportPatch')
@@ -1192,7 +1300,56 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       }
     }
     if (creationCase) args = creationCase.args;
+    if (usageCase) args = usageCase.args;
     const result = await execute(args, scenario !== 'changes' && !creationCase?.plain);
+    if (usageCase) {
+      if (usageCase.invalid) {
+        assert.equal(result.code, 1, scenario);
+        assert(result.errors.length > 0, scenario);
+        assert.deepEqual(received, [], scenario);
+      } else if (usageCase.name === 'show') {
+        assert.equal(result.code, 0, result.errors);
+        assert.deepEqual(JSON.parse(result.output), {
+          cursor: snapshot.cursor,
+          usageReaders: [usageReader],
+          usage: usageWindows,
+        });
+        assert.deepEqual(
+          received.map((value) => value.command),
+          ['GetSnapshot'],
+        );
+        const plain = await execute(usageCase.args, false);
+        assert.match(
+          plain.output,
+          /42.25 percent remaining.*stale.*source client.*observed 2026-10-17T10:00:00.000Z/u,
+        );
+        assert.match(plain.output, /last attempt 2026-10-17T10:00:00.000Z/u);
+      } else {
+        assert.equal(result.code, usageCase.reason ? 2 : 0, result.errors);
+        assert.deepEqual(
+          received.map((value) => value.command),
+          ['ObserveUsage'],
+        );
+        const receipt = JSON.parse(result.output);
+        assert.deepEqual(receipt.command, received[0]);
+        assert.equal(receipt.command.expectedRevision, 0);
+        assert.deepEqual(receipt.command.payload, {
+          family: 'google',
+          ...(usageCase.consent === undefined ? {} : { consent: usageCase.consent }),
+        });
+        if (usageCase.reason) {
+          assert.equal(receipt.result.reason, usageCase.reason);
+          const plain = await execute(usageCase.args, false);
+          assert.match(plain.output, new RegExp(usageCase.reason, 'u'));
+          assert.match(plain.output, /retry after 2026-10-17T10:01:00.000Z/u);
+        } else
+          assert.deepEqual(receipt.result.data, {
+            kind: 'usage',
+            windows: usageCase.consent === false ? [] : usageWindows,
+          });
+      }
+      continue;
+    }
     if (creationCase) {
       if (creationCase.invalid) {
         assert.equal(result.code, 1, scenario);

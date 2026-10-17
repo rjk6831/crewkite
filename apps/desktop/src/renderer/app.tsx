@@ -471,7 +471,7 @@ export function App() {
             </button>
           </div>
         ) : page === 'usage' ? (
-          <Usage snapshot={snapshot} run={run} />
+          <Usage snapshot={snapshot} run={run} workspace={workspace} />
         ) : (
           <div className={`task-layout ${roster ? '' : 'roster-hidden'}`}>
             <main className="task-main">
@@ -1794,7 +1794,44 @@ function Handoffs({ events, snapshot }: { events: Event[]; snapshot: Snapshot })
   );
 }
 
-function Usage({ snapshot, run }: { snapshot: Snapshot; run?: Run }) {
+function Usage({
+  snapshot,
+  run,
+  workspace,
+}: {
+  snapshot: Snapshot;
+  run?: Run;
+  workspace: Workspace;
+}) {
+  const [readerMessage, setReaderMessage] = useState<string | null>(null);
+  const [readerChoice, setReaderChoice] = useState<boolean | null>(null);
+  const reader = snapshot.usageReaders.find((value) => value.family === 'google');
+  const readerEnabled = readerChoice ?? reader?.enabled ?? false;
+  useEffect(() => {
+    if (!workspace.pending) setReaderChoice(null);
+  }, [workspace.pending]);
+  const connected = workspace.connection === 'connected' && !workspace.preview;
+  const nextReadAt = reader?.lastAttemptAt ? Date.parse(reader.lastAttemptAt) + 60000 : null;
+  async function observeUsage(consent?: boolean) {
+    if (consent !== undefined) setReaderChoice(consent);
+    setReaderMessage(null);
+    try {
+      const result = await workspace.command({
+        command: 'ObserveUsage',
+        expectedRevision: 0,
+        payload: { family: 'google', ...(consent === undefined ? {} : { consent }) },
+      });
+      setReaderMessage(
+        result.outcome === 'applied' || result.outcome === 'already-applied'
+          ? consent === false
+            ? 'Quota reads disabled. Prior windows retain their observation times.'
+            : 'Quota read completed.'
+          : [result.reason ?? result.outcome, result.next].filter(Boolean).join('. '),
+      );
+    } catch (failure) {
+      setReaderMessage(failure instanceof Error ? failure.message : 'The quota command failed.');
+    }
+  }
   const fixtureTime = Math.max(
     0,
     ...snapshot.usage.map(({ observation }) => Date.parse(observation.observedAt)),
@@ -1815,6 +1852,46 @@ function Usage({ snapshot, run }: { snapshot: Snapshot; run?: Run }) {
             : 'Controller observations'}
         </span>
       </div>
+      <section className="card" aria-labelledby="google-quota-title">
+        <div className="section-heading">
+          <h2 id="google-quota-title">Google quota</h2>
+          <span>{reader?.enabled ? 'Reads enabled' : 'Reads disabled'}</span>
+        </div>
+        <p className="muted small">
+          Reads Google quota through the CLI's headless /usage command with no model request.
+          Google's FAQ reserves headless mode for scripting and CI. Enabling requests one read.
+          Quota consent does not enable a writer.
+        </p>
+        <label className="checkbox-label">
+          <input
+            type="checkbox"
+            checked={readerEnabled}
+            disabled={!reader || !connected || (workspace.pending && !readerEnabled)}
+            onChange={(event) => void observeUsage(event.target.checked)}
+          />{' '}
+          Enable quota reads
+        </label>
+        <button
+          type="button"
+          className="button secondary"
+          disabled={!connected || workspace.pending || !reader?.enabled}
+          onClick={() => void observeUsage()}
+        >
+          <RefreshCw size={14} />
+          Refresh Google quota
+        </button>
+        <p className="muted small">
+          Reader status: {reader?.reason ?? 'Reader unavailable'}. Last attempt:{' '}
+          {reader?.lastAttemptAt ?? 'None'}. Last observation: {reader?.lastObservedAt ?? 'None'}.
+        </p>
+        {nextReadAt !== null && nextReadAt > now && (
+          <p className="muted small">
+            Cooldown until {new Date(nextReadAt).toLocaleTimeString()}. Refresh checks the
+            controller cooldown. Failed reads also count. No timer refreshes quota.
+          </p>
+        )}
+        {readerMessage && <p role="status">{readerMessage}</p>}
+      </section>
       <section aria-labelledby="allowance-title">
         <div className="section-heading">
           <h2 id="allowance-title">Route allowances</h2>
