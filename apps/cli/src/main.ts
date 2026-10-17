@@ -1514,61 +1514,75 @@ export async function runCli(
       return 0;
     }
     if (action === 'watch') {
-      const approvals = snapshot.approvals.filter(
-        (value) => value.taskId === task.id && value.status === 'pending',
-      );
-      print(
-        { type: 'snapshot', cursor: snapshot.cursor, task, approvals },
-        terminalText(
-          `${snapshot.cursor} ${task.state}, revision ${task.revision}${task.next ? `\nNext: ${task.next}` : ''}${approvalText(approvals)}`,
-        ),
-      );
-      const unsubscribe = await client.subscribe(
-        snapshot.cursor,
-        (event) => {
-          if (event.taskId === task.id)
-            print(
-              event,
-              terminalText(
-                `${event.cursor} ${event.type}, revision ${event.revision}${event.type === 'approval.requested' ? approvalText([event.payload]) : event.type === 'task.updated' && event.payload.next ? `\nNext: ${event.payload.next}` : ''}`,
-              ),
-            );
-        },
-        (fresh) => {
-          const current = fresh.tasks.find((item) => item.id === task.id);
-          if (current) {
-            const approvals = fresh.approvals.filter(
-              (value) => value.taskId === current.id && value.status === 'pending',
-            );
-            print(
-              { type: 'snapshot', cursor: fresh.cursor, task: current, approvals },
-              terminalText(
-                `${fresh.cursor} ${current.state}, revision ${current.revision}${current.next ? `\nNext: ${current.next}` : ''}${approvalText(approvals)}`,
-              ),
-            );
-          }
-        },
-      );
-      const stopConnection = client.onConnection((state) => {
-        if (state === 'offline')
-          output.err('Controller offline. The last event cursor is retained.\n');
-      });
       const waiting = Promise.withResolvers<number>();
-      const stop = () => waiting.resolve(0);
-      const stopExhausted = client.onReconnectExhausted(() => {
-        output.err('Reconnect attempts ended. Start the controller, then run task watch again.\n');
-        waiting.resolve(1);
-      });
+      let stopped = false;
+      const stop = () => {
+        stopped = true;
+        waiting.resolve(0);
+        // Closing the client also settles a subscription still being initialized.
+        client?.close();
+      };
+      let unsubscribe: (() => void) | undefined;
+      let stopConnection: (() => void) | undefined;
+      let stopExhausted: (() => void) | undefined;
       process.once('SIGINT', stop);
       process.once('SIGTERM', stop);
       try {
+        const approvals = snapshot.approvals.filter(
+          (value) => value.taskId === task.id && value.status === 'pending',
+        );
+        print(
+          { type: 'snapshot', cursor: snapshot.cursor, task, approvals },
+          terminalText(
+            `${snapshot.cursor} ${task.state}, revision ${task.revision}${task.next ? `\nNext: ${task.next}` : ''}${approvalText(approvals)}`,
+          ),
+        );
+        unsubscribe = await client.subscribe(
+          snapshot.cursor,
+          (event) => {
+            if (event.taskId === task.id)
+              print(
+                event,
+                terminalText(
+                  `${event.cursor} ${event.type}, revision ${event.revision}${event.type === 'approval.requested' ? approvalText([event.payload]) : event.type === 'task.updated' && event.payload.next ? `\nNext: ${event.payload.next}` : ''}`,
+                ),
+              );
+          },
+          (fresh) => {
+            const current = fresh.tasks.find((item) => item.id === task.id);
+            if (current) {
+              const approvals = fresh.approvals.filter(
+                (value) => value.taskId === current.id && value.status === 'pending',
+              );
+              print(
+                { type: 'snapshot', cursor: fresh.cursor, task: current, approvals },
+                terminalText(
+                  `${fresh.cursor} ${current.state}, revision ${current.revision}${current.next ? `\nNext: ${current.next}` : ''}${approvalText(approvals)}`,
+                ),
+              );
+            }
+          },
+        );
+        stopConnection = client.onConnection((state) => {
+          if (state === 'offline' && !stopped)
+            output.err('Controller offline. The last event cursor is retained.\n');
+        });
+        stopExhausted = client.onReconnectExhausted(() => {
+          output.err(
+            'Reconnect attempts ended. Start the controller, then run task watch again.\n',
+          );
+          waiting.resolve(1);
+        });
         return await waiting.promise;
+      } catch (error) {
+        if (stopped) return 0;
+        throw error;
       } finally {
         process.off('SIGINT', stop);
         process.off('SIGTERM', stop);
-        stopExhausted();
-        unsubscribe();
-        stopConnection();
+        stopExhausted?.();
+        unsubscribe?.();
+        stopConnection?.();
       }
     }
     if (!task.runId)
