@@ -43,7 +43,6 @@ export type GoogleMetadataOperation = {
   finished_at: string | null;
 };
 export type GoogleUsageReader = {
-  enabled: number;
   authority_revision: number;
   last_attempt_at: string | null;
   last_observed_at: string | null;
@@ -388,7 +387,9 @@ export class Store {
 
   googleUsageReader(): GoogleUsageReader {
     return this.db
-      .prepare('SELECT * FROM google_usage_reader WHERE family=?')
+      .prepare(
+        'SELECT authority_revision,last_attempt_at,last_observed_at FROM google_usage_reader WHERE family=?',
+      )
       .get('google') as GoogleUsageReader;
   }
 
@@ -446,16 +447,6 @@ export class Store {
   private metadataWrite() {
     if (!this.transactionEvents)
       throw new Error('Metadata ownership writes require a transaction.');
-  }
-
-  setGoogleUsageConsent(enabled: boolean) {
-    this.metadataWrite();
-    const reader = this.googleUsageReader();
-    this.db
-      .prepare(
-        `UPDATE google_usage_reader SET enabled=?,authority_revision=? WHERE family='google'`,
-      )
-      .run(Number(enabled), reader.authority_revision + (enabled && reader.enabled ? 0 : 1));
   }
 
   recordGoogleUsageAttempt(at: string) {

@@ -1206,22 +1206,67 @@ export class Controller {
 
   private googleUsageReader() {
     const reader = this.store.googleUsageReader();
-    const enabled = reader.enabled === 1;
-    const reason = this.usageResolution.available
-      ? enabled
-        ? 'available'
-        : 'not-enabled'
-      : this.usageResolution.reason;
     return UsageReaderSchema.parse({
       id: googleUsageDescriptor.id,
       family: 'google',
       clientVersion: googleUsageDescriptor.clientVersion,
-      available: enabled && this.usageResolution.available,
-      reason,
-      enabled,
+      available: this.usageResolution.available,
+      reason: this.usageResolution.reason,
       lastObservedAt: reader.last_observed_at,
       lastAttemptAt: reader.last_attempt_at,
     });
+  }
+
+  refreshGoogleUsage(trigger: 'start' | 'connect'): Promise<CommandResult> | undefined {
+    try {
+      if (this.closed || this.acpStart) return;
+      if (this.usageRead) return this.usageRead.promise;
+      const reader = this.store.googleUsageReader();
+      const nowMs = Date.parse(this.now());
+      if (reader.last_attempt_at && nowMs - Date.parse(reader.last_attempt_at) < 60000) return;
+      if (trigger === 'connect') {
+        const routes = this.store
+          .list<Route>('route')
+          .filter((route) => route.family === 'google' && !route.fake);
+        const windows = this.store.list<Observation>('window');
+        if (
+          reader.last_observed_at &&
+          routes.length &&
+          routes.every((route) => {
+            const observations = windows.filter((window) => window.routeId === route.id);
+            return (
+              observations.length &&
+              observations.every(
+                (window) =>
+                  deriveWindow(window, { nowMs, maxAgeMs: 300000 }).state === 'fresh' &&
+                  window.remaining !== null &&
+                  window.source === 'client' &&
+                  window.confidence === 'reported',
+              )
+            );
+          })
+        )
+          return;
+      }
+      if (this.store.transaction(() => this.store.googleOperationBlocker())) return;
+      try {
+        this.usageResolution = this.options.googleUsageClient?.() ?? resolveGoogleUsageClient();
+      } catch {
+        this.usageResolution = { available: false, reason: 'client-unavailable' };
+      }
+      if (!this.usageResolution.available) return;
+      const command = CommandSchema.parse({
+        protocol: 1,
+        key: this.id('cmd'),
+        actor: { id: 'controller', kind: 'controller' },
+        command: 'ObserveUsage',
+        expectedRevision: 0,
+        payload: { family: 'google' },
+      }) as Extract<Command, { command: 'ObserveUsage' }>;
+      return this.observeUsageCommand(command, 'local-owner');
+    } catch {
+      return;
+    }
   }
 
   private executeAcpSetup(command: AcpSetupCommand, principal: string): Promise<CommandResult> {
@@ -1533,7 +1578,7 @@ export class Controller {
       return prior.hash === hash && prior.principal === principal
         ? prior.promise
         : Promise.resolve({ outcome: 'denied', reason: 'idempotency-key-reused' });
-    if (command.payload.consent === false || prior || this.store.receipt(command.key)) {
+    if (prior || this.store.receipt(command.key)) {
       let result = this.commitCommand(command, principal);
       if (result.outcome === 'outcome-unknown' && result.reason === 'usage-read-pending') {
         result = { outcome: 'outcome-unknown', reason: 'google-ownership-unknown' };
@@ -1568,14 +1613,7 @@ export class Controller {
     command: Extract<Command, { command: 'ObserveUsage' }>,
     effects: (() => void)[],
   ): CommandResult {
-    if (command.payload.consent !== undefined)
-      this.store.setGoogleUsageConsent(command.payload.consent);
-    if (command.payload.consent === false) {
-      effects.push(() => this.usageRead?.abort.abort());
-      return { outcome: 'applied', data: { kind: 'usage', windows: this.snapshot().usage } };
-    }
     const reader = this.store.googleUsageReader();
-    if (!reader.enabled) return { outcome: 'blocked', reason: 'usage-reader-not-enabled' };
     const now = this.now();
     if (reader.last_attempt_at && Date.parse(now) - Date.parse(reader.last_attempt_at) < 60000)
       return {
@@ -1615,7 +1653,6 @@ export class Controller {
       if (
         this.closed ||
         runtime.abort.signal.aborted ||
-        !reader.enabled ||
         reader.authority_revision !== authorityRevision
       )
         throw new Error('usage-read-revoked');
@@ -1665,7 +1702,6 @@ export class Controller {
         if (
           this.closed ||
           runtime.abort.signal.aborted ||
-          !reader.enabled ||
           reader.authority_revision !== authorityRevision
         )
           result = { outcome: 'blocked', reason: 'usage-read-revoked' };
@@ -1728,7 +1764,7 @@ export class Controller {
           const finished = this.store
             .googleMetadataOperations()
             .find((row) => row.command_id === commandId);
-          if (!reader.enabled || reader.authority_revision !== authorityRevision || this.closed)
+          if (reader.authority_revision !== authorityRevision || this.closed)
             result = { outcome: 'blocked', reason: 'usage-read-revoked' };
           else if (finished?.state === 'quiescent')
             result = { outcome: 'blocked', reason: 'usage-read-failed' };
@@ -6077,7 +6113,7 @@ export class Controller {
       )
         return { outcome: 'blocked', reason: 'acp-start-deadline' };
       const reader = this.store.googleUsageReader();
-      if (!reader.enabled || reader.authority_revision !== preparing.authorityRevision)
+      if (reader.authority_revision !== preparing.authorityRevision)
         return { outcome: 'blocked', reason: 'usage-read-revoked' };
     }
     this.store.db.prepare('DELETE FROM receipts WHERE command_key=?').run(`paused:${run.id}`);
@@ -7274,8 +7310,6 @@ export class Controller {
           blocker: this.store.googleOperationBlocker(),
         }));
         pending.authorityRevision = quota.reader.authority_revision;
-        if (!quota.reader.enabled)
-          return refuse({ outcome: 'blocked', reason: 'usage-reader-not-enabled' });
         if (quota.blocker) return refuse({ outcome: 'blocked', reason: quota.blocker });
         if (quota.reserveReason)
           return refuse({
@@ -7309,7 +7343,7 @@ export class Controller {
           const revoked = cancelled();
           if (revoked) return revoked;
           const reader = this.store.googleUsageReader();
-          if (!reader.enabled || reader.authority_revision !== quota.reader.authority_revision)
+          if (reader.authority_revision !== quota.reader.authority_revision)
             return { outcome: 'blocked', reason: 'usage-read-revoked' };
           if (
             hashCanonical(this.store.googleAcpSetup()) !== hashCanonical(setup) ||
@@ -11543,8 +11577,7 @@ export class Controller {
       run,
     );
     let reason = reserveReason;
-    if (!reader.enabled || needsRefresh)
-      reason ??= 'Every Google quota bucket needs an enabled reader and fresh observations.';
+    if (needsRefresh) reason ??= 'Every Google quota bucket needs fresh observations.';
     if (Date.parse(appointment.expiresAt) <= Date.parse(this.now()))
       reason = 'Native consent expired.';
     return {

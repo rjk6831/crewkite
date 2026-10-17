@@ -3547,7 +3547,7 @@ test('an appointed native proposal is retained and applied once after every phas
           /^\d{3}-[a-z0-9-]+\.sql$/.test(name),
         ).length,
       );
-      assert.equal(controller.store.googleUsageReader().enabled, 0);
+      assert.equal('enabled' in controller.store.googleUsageReader(), false);
       assert.deepEqual(controller.store.googleMetadataOperations(), []);
       assert.equal(controller.store.googleAcpSetup().state, 'uninitialized');
     }
@@ -3902,6 +3902,7 @@ test('an appointed native proposal is retained and applied once after every phas
       scenario === 'repository-checked'
         ? {
             home: join(socketRoot as string, 'home'),
+            googleUsageClient: () => ({ available: false, reason: 'client-unavailable' }),
             prepareVerification: async (input) => {
               inventoryCalls++;
               inventorySignal = input.budget.signal;
@@ -5756,10 +5757,9 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
 
 test('google quota authority survives retries and restart while sharing one operation gate', async (t) => {
   let controller: Controller;
-  let mode: 'success' | 'invalid' | 'revoke' = 'success';
+  let mode: 'success' | 'invalid' = 'success';
   let available = true;
   let launches = 0;
-  let revoke: Promise<CommandResult> | undefined;
   const report = {
     status: 'SUCCESS',
     num_turns: 0,
@@ -5782,7 +5782,11 @@ test('google quota authority survives retries and restart while sharing one oper
       },
     },
   };
+  const socketRoot = mkdtempSync(
+    join(realpathSync(checkOwner()?.stateRoot ?? tmpdir()), 'ck-quota-'),
+  );
   const options: Partial<ControllerOptions> = {
+    home: join(socketRoot, 'home'),
     googleUsageClient: () =>
       available
         ? {
@@ -5828,36 +5832,23 @@ test('google quota authority survives retries and restart while sharing one oper
         ],
         spawnOptions,
       );
-      if (mode === 'revoke')
-        child.once('close', () => {
-          revoke = controller.execute(
-            context.command('ObserveUsage', { family: 'google', consent: false }, 0),
-            'local-owner',
-          );
-        });
       return child;
     },
   };
   const context = await setup(t, options, () => controller.close());
   controller = context.controller;
-  const refresh = (consent?: boolean) =>
-    context.command(
-      'ObserveUsage',
-      { family: 'google', ...(consent === undefined ? {} : { consent }) },
-      0,
-    );
-  assert.equal(
-    (await controller.execute(refresh(), 'local-owner')).reason,
-    'usage-reader-not-enabled',
-  );
+  t.after(() => rmSync(socketRoot, { recursive: true, force: true }));
+  const refresh = () => context.command('ObserveUsage', { family: 'google' }, 0);
+  assert.equal(controller.snapshot().usageReaders[0]?.available, true);
+  assert.equal('enabled' in controller.snapshot().usageReaders[0], false);
   assert.equal(launches, 0);
-  const first = refresh(true);
+  const first = refresh();
   const pending = controller.execute(first, 'local-owner');
   const retry = controller.execute(first, 'local-owner');
   assert.equal(
     (
       await controller.execute(
-        { ...first, payload: { family: 'google', consent: false } },
+        { ...first, actor: { id: 'changed-client', kind: 'cli' } },
         'local-owner',
       )
     ).reason,
@@ -5907,6 +5898,38 @@ test('google quota authority survives retries and restart while sharing one oper
         .length,
       3,
     );
+  context.clock.advance(60000);
+  const beforeAutomatic = launches;
+  const server = await serveController(controller);
+  try {
+    const startup = controller.refreshGoogleUsage('start');
+    assert(startup);
+    assert.equal((await startup).outcome, 'applied');
+    assert.equal(launches, beforeAutomatic + 1);
+    const connect = () =>
+      connectController({
+        ...readControllerEndpoint(controller.home),
+        actor: { id: 'quota-fixture', kind: 'cli' },
+        reconnectDelaysMs: [],
+      });
+    context.clock.advance(60000);
+    const fresh = await connect();
+    fresh.close();
+    assert.equal(launches, beforeAutomatic + 1, 'fresh connection does not read again');
+    context.clock.advance(300001);
+    assert.equal(launches, beforeAutomatic + 1, 'elapsed time admits no background read');
+    const clients = await Promise.all([connect(), connect()]);
+    try {
+      const connected = controller.refreshGoogleUsage('connect');
+      assert(connected);
+      assert.equal((await connected).outcome, 'applied');
+      assert.equal(launches, beforeAutomatic + 2, 'stale connections share one read');
+    } finally {
+      for (const client of clients) client.close();
+    }
+  } finally {
+    await server.close();
+  }
   const retained = controller.snapshot().usage;
   mode = 'invalid';
   context.clock.advance(60000);
@@ -5916,11 +5939,11 @@ test('google quota authority survives retries and restart while sharing one oper
   await controller.close();
   controller = new Controller({
     ...options,
-    home: join(context.directory, 'home'),
+    home: options.home as string,
     now: context.clock.now,
     id: context.id,
   });
-  assert.equal(controller.snapshot().usageReaders[0]?.enabled, true);
+  assert.equal(controller.snapshot().usageReaders[0]?.available, true);
   assert.equal(controller.snapshot().usageReaders[0]?.lastAttemptAt, attemptedAt);
   assert.equal(
     (await controller.execute(refresh(), 'local-owner')).reason,
@@ -5934,14 +5957,6 @@ test('google quota authority survives retries and restart while sharing one oper
     'usage-reader-cooldown',
   );
   available = true;
-  mode = 'revoke';
-  context.clock.advance(60000);
-  const beforeRevoke = controller.snapshot().usage;
-  assert.equal((await controller.execute(refresh(), 'local-owner')).reason, 'usage-read-revoked');
-  assert.equal((await revoke)?.outcome, 'applied');
-  assert.equal(controller.snapshot().usageReaders[0]?.enabled, false);
-  assert.deepEqual(controller.snapshot().usage, beforeRevoke);
-  assert.equal(controller.store.googleMetadataOperations().at(-1)?.state, 'quiescent');
   mode = 'success';
   context.clock.advance(60000);
   const googleRoute = context.fixtures.snapshot.routes.find((route) => route.family === 'google');
@@ -5992,8 +6007,9 @@ test('google quota authority survives retries and restart while sharing one oper
   controller.store.transaction(() =>
     controller.store.beginGoogleMetadata(setupId, 'acp-discover', 7, context.clock.now()),
   );
+  assert.equal(controller.refreshGoogleUsage('start'), undefined);
   assert.equal(
-    (await controller.execute(refresh(true), 'local-owner')).reason,
+    (await controller.execute(refresh(), 'local-owner')).reason,
     'google-operation-active',
   );
   controller.store.transaction(() => {
@@ -6038,6 +6054,7 @@ test('google quota authority survives retries and restart while sharing one oper
       /google-operation-active/,
     );
   });
+  assert.equal(controller.refreshGoogleUsage('start'), undefined);
   assert.equal(
     (await controller.execute(refresh(), 'local-owner')).reason,
     'google-operation-active',
@@ -6063,7 +6080,7 @@ test('google quota authority survives retries and restart while sharing one oper
   await closing;
   controller = new Controller({
     ...options,
-    home: join(context.directory, 'home'),
+    home: options.home as string,
     now: context.clock.now,
     id: context.id,
   });
@@ -6104,7 +6121,7 @@ test('google quota authority survives retries and restart while sharing one oper
   try {
     controller = new Controller({
       ...options,
-      home: join(context.directory, 'home'),
+      home: options.home as string,
       now: context.clock.now,
       id: context.id,
     });
@@ -6134,7 +6151,6 @@ test('google quota authority survives retries and restart while sharing one oper
     now: context.clock.now,
     id: context.id,
   });
-  controller.store.transaction(() => controller.store.setGoogleUsageConsent(true));
   const interrupted = refresh();
   controller.store.transaction(() => {
     controller.store.beginGoogleMetadata(
@@ -6196,8 +6212,6 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     'unavailable',
     'active-owner',
     'unknown-owner',
-    'revoke-read',
-    'reenable-read',
     'stop-read',
     'close-read',
     'deadline-read',
@@ -6478,8 +6492,6 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     const run = RunSchema.parse(prepared.entity);
     const start = () =>
       command('StartRun', { taskId: task.id, runId: run.id }, taskRevision(controller, task.id));
-    assert.equal((await controller.execute(start(), 'local-owner')).outcome, 'blocked');
-    assert.equal(controller.store.intents().length, 0);
     quotaReset = new Date(Date.parse(clock.now()) + 3600000).toISOString();
     const autoRefresh = ![
       'approved',
@@ -6491,7 +6503,6 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       'reserve',
     ].includes(row);
     controller.store.transaction(() => {
-      controller.store.setGoogleUsageConsent(true);
       controller.store.recordGoogleUsageObservation(clock.now());
       const observation = {
         routeId: run.roles[0].routeId,
@@ -6534,8 +6545,6 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     let cancellation: Promise<unknown> | undefined;
     if (
       [
-        'revoke-read',
-        'reenable-read',
         'stop-read',
         'close-read',
         'deadline-read',
@@ -6545,17 +6554,6 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       ].includes(row)
     )
       quotaAction = () => {
-        if (row === 'revoke-read' || row === 'reenable-read') {
-          cancellation = controller.execute(
-            command('ObserveUsage', { family: 'google', consent: false }, 0),
-            'local-owner',
-          );
-          if (row === 'reenable-read')
-            void controller.execute(
-              command('ObserveUsage', { family: 'google', consent: true }, 0),
-              'local-owner',
-            );
-        }
         if (row === 'stop-read')
           cancellation = controller.execute(
             command(
@@ -6610,8 +6608,6 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       'unavailable',
       'active-owner',
       'unknown-owner',
-      'revoke-read',
-      'reenable-read',
       'stop-read',
       'close-read',
       'deadline-read',
@@ -6656,28 +6652,9 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
           : 1,
         row,
       );
-      if (
-        [
-          'invalid-read',
-          'unavailable',
-          'cooldown',
-          'revoke-read',
-          'reenable-read',
-          'stop-read',
-          'close-read',
-        ].includes(row)
-      )
+      if (['invalid-read', 'unavailable', 'cooldown', 'stop-read', 'close-read'].includes(row))
         assert.deepEqual(controller.snapshot().usage, before, row);
-      if (
-        [
-          'invalid-read',
-          'unavailable',
-          'revoke-read',
-          'reenable-read',
-          'stop-read',
-          'close-read',
-        ].includes(row)
-      )
+      if (['invalid-read', 'unavailable', 'stop-read', 'close-read'].includes(row))
         assert.equal(controller.store.googleUsageReader().last_attempt_at, context.clock.now());
       if (row === 'invalid-read' || row === 'unavailable') {
         const beforeRetry = quotaReads;
@@ -6706,7 +6683,6 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       if (row === 'unknown-owner') assert.equal(refused.reason, 'google-ownership-unknown');
       if (row === 'active-owner') assert.equal(refused.reason, 'google-operation-active');
       if (row === 'deadline-read') assert.equal(refused.reason, 'acp-start-deadline');
-      if (row === 'reenable-read') assert.equal(controller.store.googleUsageReader().enabled, 1);
       await controller.close();
       continue;
     }

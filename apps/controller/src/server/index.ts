@@ -130,6 +130,7 @@ export async function serve(
               actor = message.actor;
               socket.setTimeout(0);
               send({ type: 'welcome', protocol: 1, cursor: controller.store.cursor() });
+              void controller.refreshGoogleUsage('connect')?.catch(() => {});
               continue;
             }
             if (
@@ -214,6 +215,7 @@ export async function serve(
     });
     ownsSocket = true;
     chmodSync(socketPath, 0o600);
+    void controller.refreshGoogleUsage('start')?.catch(() => {});
     return {
       socketPath,
       close: async () => {
