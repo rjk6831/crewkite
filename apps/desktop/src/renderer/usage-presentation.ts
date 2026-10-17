@@ -196,8 +196,8 @@ export function projectUsagePresentation(
     if (weekly.length > 1 || fiveHour.length > 1)
       notices.push('Multiple provider windows match a primary period; all remain separate.');
     if (family === 'google' && !scope.fixture) {
-      if (reader && !reader.enabled)
-        notices.push('Quota reads are disabled; retained reports remain visible.');
+      if (reader && !reader.available)
+        notices.push('Quota reader is unavailable; retained reports remain visible.');
       if (googleReports.size > 1)
         notices.push('Google route reports differ; scopes are shown separately.');
     }

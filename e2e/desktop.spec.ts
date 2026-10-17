@@ -90,7 +90,7 @@ function launchController(home: string, nativeFixture = false) {
     const anthropicProfile={...profile,facts:AnthropicNativeProfileSchema.parse({...profile.facts,id:'anthropic-file-v1',family:'anthropic',displayName:'Anthropic scripted proposal fixture',effort:'medium',effectiveEffort:'unknown',accountClass:'unknown',serviceTier:'unknown',billingBasis:'requires-user-attestation',qualifiedAt:null,creditPolicies:['ordinary'],reason:'qualification-pending'}),locationHash:'2'.repeat(64)};
     const googleProfile={...profile,client:{...profile.client,version:'1.4.0'},facts:GoogleNativeProfileSchema.parse({...anthropicProfile.facts,clientVersion:'1.4.0',id:'google-file-v1',family:'google',displayName:'Google scripted proposal fixture',effort:'low',permissionModes:['request-review','strict','always-proceed','proceed-in-sandbox']}),locationHash:'3'.repeat(64)};
     const repositoryProfile={...profile,facts:{...unavailableRepositoryProfile().facts,model:fixtureModel,clientVersion:process.version,available:true,reason:'qualification-pending'},locationHash:'4'.repeat(64)};
-    const runtime=await startController({home:process.env.CREWKITE_HOME,identity:{name:'CrewKite fixture',email:'fixture@example.invalid'},nativeProfiles:()=>[profile,anthropicProfile,googleProfile,repositoryProfile],nativeSpawn:(executable,args,options)=>{
+    const runtime=await startController({home:process.env.CREWKITE_HOME,identity:{name:'CrewKite fixture',email:'fixture@example.invalid'},nativeProfiles:()=>[profile,anthropicProfile,googleProfile,repositoryProfile],googleUsageClient:()=>({available:false,reason:'client-unavailable'}),nativeSpawn:(executable,args,options)=>{
       const store=runtime.controller.store;
       const intent=store.intents().findLast(intent=>store.nativeProcesses(intent.attempt_id).some(row=>row.state==='intent'));
       const family=intent?store.get('route',intent.route_id)?.family:undefined;
@@ -269,7 +269,7 @@ async function desktopSnapshot(page: Page) {
   }
 }
 
-async function quotaRevocationBridge(
+async function quotaReadBridge(
   application: Awaited<ReturnType<typeof _electron.launch>>,
   page: Page,
 ) {
@@ -293,7 +293,6 @@ async function quotaRevocationBridge(
         id: 'google-usage-v1',
         family: 'google',
         clientVersion: '1.4.0',
-        enabled: true,
         available: false,
         reason: 'client-unavailable',
         lastAttemptAt: null,
@@ -401,16 +400,22 @@ async function quotaRevocationBridge(
     await page.getByRole('button', { name: 'Usage and capacity', exact: true }).click();
     const panel = page.getByRole('region', { name: 'Google quota', exact: true });
     const refresh = panel.getByRole('button', { name: 'Refresh Google quota', exact: true });
-    const consent = panel.getByRole('checkbox', { name: 'Enable quota reads', exact: true });
+    await expect(panel.getByRole('checkbox')).toHaveCount(0);
+    await expect(refresh).toBeDisabled();
+    await expect(panel).toContainText('client-unavailable');
+    assert.equal(pending.length, 0);
+    snapshot.usageReaders[0].available = true;
+    snapshot.usageReaders[0].reason = 'available';
+    await page.reload();
+    await page.getByRole('button', { name: 'Usage and capacity', exact: true }).click();
     await expect(refresh).toBeEnabled();
+    assert.equal(pending.length, 0);
     await refresh.click();
     const read = await next();
     assert.equal(read.command.command, 'ObserveUsage');
     assert.deepEqual(read.command.payload, { family: 'google' });
-    await expect(consent).toBeEnabled();
-    await consent.uncheck();
-    const revoke = await next();
-    assert.deepEqual(revoke.command.payload, { family: 'google', consent: false });
+    await expect(refresh).toBeDisabled();
+    await expect(panel.getByRole('status')).toContainText('Quota read in progress');
     const rejectCommand = (input: unknown) =>
       page.evaluate(async (value) => {
         try {
@@ -425,17 +430,12 @@ async function quotaRevocationBridge(
       expectedRevision: 0,
       payload: { family: 'google' },
     };
-    const revokeCommand = { ...refreshCommand, payload: { family: 'google', consent: false } };
-    assert.match(await rejectCommand(revokeCommand), /pending desktop command/u);
-    assert.match(
-      await rejectCommand({ ...revokeCommand, payload: { ...revokeCommand.payload, extra: true } }),
-      /Unrecognized key/u,
-    );
-    snapshot.usageReaders[0].enabled = false;
-    snapshot.usageReaders[0].available = false;
-    reply(revoke, { outcome: 'applied', data: { kind: 'usage', windows: [] } });
-    await expect(panel.getByRole('status')).toContainText('Quota reads disabled');
     assert.match(await rejectCommand(refreshCommand), /pending desktop command/u);
+    for (const consent of [true, false])
+      assert.match(
+        await rejectCommand({ ...refreshCommand, payload: { family: 'google', consent } }),
+        /Unrecognized key/u,
+      );
     assert.match(
       await rejectCommand({ command: 'GetHealth', payload: {} }),
       /pending desktop command/u,
@@ -443,24 +443,23 @@ async function quotaRevocationBridge(
     reply(read, { outcome: 'outcome-unknown', reason: 'fixture-uncertain' });
     await expect(panel.getByRole('status')).toContainText('fixture-uncertain');
     assert.match(await rejectCommand(refreshCommand), /exact retry/u);
-    const revokeAgain = page.evaluate(
-      (input) => window.crewkite?.command(input as never),
-      revokeCommand,
-    );
-    const uncertainRevoke = await next();
-    reply(uncertainRevoke, { outcome: 'outcome-unknown', reason: 'fixture-uncertain-revoke' });
-    assert.equal((await revokeAgain)?.outcome, 'outcome-unknown');
-    assert.match(await rejectCommand(revokeCommand), /existing uncertain quota disable/u);
     const retryRead = page.evaluate(() => window.crewkite?.retryCommand?.());
     const repeatedRead = await next();
     assert.deepEqual(repeatedRead.command, read.command);
+    snapshot.usageReaders[0].lastAttemptAt = new Date().toISOString();
     reply(repeatedRead, { outcome: 'applied', data: { kind: 'usage', windows: [] } });
     assert.equal((await retryRead)?.outcome, 'applied');
-    const retryRevoke = page.evaluate(() => window.crewkite?.retryCommand?.());
-    const repeatedRevoke = await next();
-    assert.deepEqual(repeatedRevoke.command, uncertainRevoke.command);
-    reply(repeatedRevoke, { outcome: 'applied', data: { kind: 'usage', windows: [] } });
-    assert.equal((await retryRevoke)?.outcome, 'applied');
+    await page.reload();
+    await page.getByRole('button', { name: 'Usage and capacity', exact: true }).click();
+    await expect(panel).toContainText('Cooldown until');
+    await refresh.click();
+    const cooldown = await next();
+    reply(cooldown, {
+      outcome: 'blocked',
+      reason: 'usage-reader-cooldown',
+      next: 'Wait until the next read is allowed.',
+    });
+    await expect(panel.getByRole('status')).toContainText('usage-reader-cooldown');
     await page.getByRole('button', { name: 'Initialize Google ACP', exact: true }).click();
     const setupRead = await next();
     assert.equal(setupRead.command.command, 'InitializeGoogleAcp');
@@ -585,8 +584,7 @@ async function quotaRevocationBridge(
       adopt: { available: false, reason: 'proposal-missing' },
     });
     SnapshotSchema.parse(snapshot);
-    for (const cancellation of ['stop', 'revoke'] as const) {
-      snapshot.usageReaders[0].enabled = true;
+    {
       await page.reload();
       await page.getByRole('button', { name: 'Review prepared proposal', exact: true }).click();
       const proposal = page.getByRole('dialog', {
@@ -615,47 +613,30 @@ async function quotaRevocationBridge(
         await rejectCommand({ command: 'GetHealth', payload: {} }),
         /pending desktop command/u,
       );
-      let cancelled: { command: Command; socket: Socket };
-      if (cancellation === 'stop') {
-        const stopButton = page.getByRole('button', { name: 'Stop', exact: true });
-        await expect(stopButton).toBeEnabled();
-        await stopButton.click();
-        cancelled = await next();
-        assert.equal(cancelled.command.command, 'StopRun');
-        assert.equal(cancelled.command.expectedRevision, preparedTask.revision);
-        assert.deepEqual(cancelled.command.payload, stop.payload);
-        await expect(stopButton).toBeDisabled();
-        assert.match(await rejectCommand(revokeCommand), /pending desktop command/u);
-        reply(cancelled, { outcome: 'outcome-unknown', reason: 'fixture-stop-unknown' });
-      } else {
-        await page.getByRole('button', { name: 'Usage and capacity', exact: true }).click();
-        const quota = page.getByRole('region', { name: 'Google quota', exact: true });
-        await quota.getByRole('checkbox', { name: 'Enable quota reads', exact: true }).uncheck();
-        cancelled = await next();
-        assert.equal(cancelled.command.command, 'ObserveUsage');
-        assert.deepEqual(cancelled.command.payload, { family: 'google', consent: false });
-        assert.match(await rejectCommand(stop), /pending desktop command/u);
-        snapshot.usageReaders[0].enabled = false;
-        reply(cancelled, { outcome: 'applied', data: { kind: 'usage', windows: [] } });
-        await expect(quota.getByRole('status')).toContainText('Quota reads disabled');
-      }
+      const stopButton = page.getByRole('button', { name: 'Stop', exact: true });
+      await expect(stopButton).toBeEnabled();
+      await stopButton.click();
+      const cancelled = await next();
+      assert.equal(cancelled.command.command, 'StopRun');
+      assert.equal(cancelled.command.expectedRevision, preparedTask.revision);
+      assert.deepEqual(cancelled.command.payload, stop.payload);
+      await expect(stopButton).toBeDisabled();
+      assert.match(await rejectCommand(refreshCommand), /pending desktop command/u);
+      reply(cancelled, { outcome: 'outcome-unknown', reason: 'fixture-stop-unknown' });
       // Cancellation completion cannot release the original Start command's busy owner.
-      if (cancellation === 'stop')
-        await expect(page.getByRole('alert')).toContainText('fixture-stop-unknown');
+      await expect(page.getByRole('alert')).toContainText('fixture-stop-unknown');
       assert.match(
         await rejectCommand({ command: 'GetHealth', payload: {} }),
         /pending desktop command/u,
       );
-      reply(starting, { outcome: 'blocked', reason: `fixture-start-${cancellation}` });
-      await expect(page.getByRole('alert')).toContainText(`fixture-start-${cancellation}`);
-      if (cancellation === 'stop') {
-        assert.match(await rejectCommand(stop), /existing uncertain stop/u);
-        const retryStop = page.evaluate(() => window.crewkite?.retryCommand?.());
-        const repeatedStop = await next();
-        assert.deepEqual(repeatedStop.command, cancelled.command);
-        reply(repeatedStop, { outcome: 'applied' });
-        assert.equal((await retryStop)?.outcome, 'applied');
-      }
+      reply(starting, { outcome: 'blocked', reason: 'fixture-start-stop' });
+      await expect(page.getByRole('alert')).toContainText('fixture-start-stop');
+      assert.match(await rejectCommand(stop), /existing uncertain stop/u);
+      const retryStop = page.evaluate(() => window.crewkite?.retryCommand?.());
+      const repeatedStop = await next();
+      assert.deepEqual(repeatedStop.command, cancelled.command);
+      reply(repeatedStop, { outcome: 'applied' });
+      assert.equal((await retryStop)?.outcome, 'applied');
     }
     const capacity = await application.evaluate(
       (_electron, options) => {
@@ -2990,7 +2971,7 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     assert.equal(git(source, ['rev-parse', acceptedRef]).toString().trim(), acceptedCommit);
     assert.deepEqual(sourceIdentity(source), original);
 
-    await quotaRevocationBridge(application, page);
+    await quotaReadBridge(application, page);
     await conversationBridge(application, page);
     console.log(`Connected journey home: ${home}`);
   } finally {

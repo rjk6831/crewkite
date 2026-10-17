@@ -588,7 +588,6 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     id: 'google-usage-v1',
     family: 'google',
     clientVersion: '1.4.0',
-    enabled: true,
     available: true,
     reason: 'available',
     lastAttemptAt: '2026-10-17T10:00:00.000Z',
@@ -612,31 +611,25 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
   const usageCases: Array<{
     name: string;
     args: string[];
-    consent?: boolean;
     invalid?: boolean;
     reason?: string;
   }> = [
     { name: 'show', args: ['usage', 'show'] },
     {
-      name: 'enable',
+      name: 'consent-rejected',
       args: ['usage', 'refresh', '--family', 'google', '--consent'],
-      consent: true,
+      invalid: true,
     },
     { name: 'refresh', args: ['usage', 'refresh', '--family', 'google'] },
     {
-      name: 'disable',
+      name: 'no-consent-rejected',
       args: ['usage', 'refresh', '--family', 'google', '--no-consent'],
-      consent: false,
+      invalid: true,
     },
     {
       name: 'cooldown',
       args: ['usage', 'refresh', '--family', 'google'],
       reason: 'usage-reader-cooldown',
-    },
-    {
-      name: 'off',
-      args: ['usage', 'refresh', '--family', 'google'],
-      reason: 'usage-reader-not-enabled',
     },
     {
       name: 'active',
@@ -2071,7 +2064,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
             }
           : {
               outcome: 'applied',
-              data: { kind: 'usage', windows: usageCase?.consent === false ? [] : usageWindows },
+              data: { kind: 'usage', windows: usageWindows },
             };
       if (
         [
@@ -2572,6 +2565,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
           plain.output,
           /42.25 percent remaining.*stale.*source client.*observed 2026-10-17T10:00:00.000Z/u,
         );
+        assert.match(plain.output, /google quota reader {2}available {2}last attempt/u);
         assert.match(plain.output, /last attempt 2026-10-17T10:00:00.000Z/u);
       } else {
         assert.equal(result.code, usageCase.reason ? 2 : 0, result.errors);
@@ -2584,7 +2578,6 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         assert.equal(receipt.command.expectedRevision, 0);
         assert.deepEqual(receipt.command.payload, {
           family: 'google',
-          ...(usageCase.consent === undefined ? {} : { consent: usageCase.consent }),
         });
         if (usageCase.reason) {
           assert.equal(receipt.result.reason, usageCase.reason);
@@ -2594,7 +2587,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         } else
           assert.deepEqual(receipt.result.data, {
             kind: 'usage',
-            windows: usageCase.consent === false ? [] : usageWindows,
+            windows: usageWindows,
           });
       }
       continue;

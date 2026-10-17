@@ -64,7 +64,7 @@ const help = `Usage: crewkite project add <path> [--json] [--home path]
        crewkite native import-google --consent [--json] [--home path]
        crewkite native setup <show|initialize|authenticate|discover|stop> --family google [--consent] [--json] [--home path]
        crewkite usage show [--json] [--home path]
-       crewkite usage refresh --family google [--consent|--no-consent] [--json] [--home path]
+       crewkite usage refresh --family google [--json] [--home path]
        crewkite task prepare-native <task-id> <profile-id> <path> --policy file [--native-trust --source-consent] [--existing-credits] [--confirm-subscription-only] [--permission-mode mode] [--handoff-target profile[:existing-credits] ...]
        crewkite task prepare-handoff <task-id> <profile-id> --native-trust --source-consent [--existing-credits] [--confirm-subscription-only] [--permission-mode mode]
        crewkite task start-handoff <task-id> [--json] [--home path]
@@ -144,7 +144,6 @@ export async function runCli(
         'observation-hash': { type: 'string' },
         family: { type: 'string' },
         consent: { type: 'boolean' },
-        'no-consent': { type: 'boolean' },
         'model-id': { type: 'string' },
         'thought-level-id': { type: 'string' },
         'confirm-quota-account': { type: 'boolean' },
@@ -364,9 +363,7 @@ export async function runCli(
       throw new Error('Use native profiles, import-google or setup.');
     if (
       settingUpGoogle &&
-      (values.family !== 'google' ||
-        values['no-consent'] ||
-        (['show', 'stop'].includes(id ?? '') && values.consent))
+      (values.family !== 'google' || (['show', 'stop'].includes(id ?? '') && values.consent))
     )
       throw new Error(
         'Use native setup with --family google. Consent applies only to initialize, authenticate or discover.',
@@ -385,17 +382,15 @@ export async function runCli(
       !importingGoogle &&
       !planning &&
       !local &&
-      (values.family !== undefined ||
-        values.consent !== undefined ||
-        values['no-consent'] !== undefined)
+      (values.family !== undefined || values.consent !== undefined)
     )
-      throw new Error('Quota family and consent options require usage refresh.');
+      throw new Error('Family and consent options do not apply to this command.');
     if (refreshingUsage && values.family !== 'google')
       throw new Error('Quota refresh requires --family google.');
-    if (importingGoogle && (values.family !== undefined || values['no-consent']))
+    if (refreshingUsage && values.consent !== undefined)
+      throw new Error('Quota refresh does not take consent.');
+    if (importingGoogle && values.family !== undefined)
       throw new Error('Use native import-google --consent.');
-    if (values.consent && values['no-consent'])
-      throw new Error('Choose --consent or --no-consent.');
     const preparingFile = area === 'task' && action === 'prepare-native';
     const preparingRepository = area === 'task' && action === 'prepare-repository';
     const preparing = preparingFile || preparingRepository;
@@ -721,14 +716,7 @@ export async function runCli(
       return succeeded(result) ? 0 : 2;
     }
     if (refreshingUsage) {
-      const result = await request(
-        'ObserveUsage',
-        {
-          family: 'google',
-          ...(values.consent ? { consent: true } : values['no-consent'] ? { consent: false } : {}),
-        },
-        0,
-      );
+      const result = await request('ObserveUsage', { family: 'google' }, 0);
       print(
         { command: sent, result },
         terminalText(
@@ -793,7 +781,7 @@ export async function runCli(
           [
             ...snapshot.usageReaders.map(
               (reader) =>
-                `${reader.family} quota reader  ${reader.enabled ? 'enabled' : 'disabled'}  ${reader.reason}  last attempt ${reader.lastAttemptAt ?? 'none'}  last observed ${reader.lastObservedAt ?? 'none'}`,
+                `${reader.family} quota reader  ${reader.reason}  last attempt ${reader.lastAttemptAt ?? 'none'}  last observed ${reader.lastObservedAt ?? 'none'}`,
             ),
             ...snapshot.usage.map(
               ({ observation, state }) =>

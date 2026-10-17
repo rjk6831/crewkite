@@ -192,7 +192,6 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       key: createCommandKey(),
       actor: desktopActor,
     });
-    const revokeUsage = command.command === 'ObserveUsage' && command.payload.consent === false;
     const stopSetup = command.command === 'StopGoogleAcpSetup';
     const setupCommands = ['InitializeGoogleAcp', 'AuthenticateGoogleAcp', 'DiscoverGoogleAcp'];
     const matchesSetup =
@@ -204,19 +203,8 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       activeCommand?.command === 'StartRun' &&
       activeCommand.payload.taskId === command.payload.taskId &&
       activeCommand.payload.runId === command.payload.runId;
-    const cancellation = revokeUsage || stopSetup || matchesStart;
-    if (
-      cancelling ||
-      (busy &&
-        !(
-          (revokeUsage &&
-            ((activeCommand?.command === 'ObserveUsage' &&
-              activeCommand.payload.consent !== false) ||
-              activeCommand?.command === 'StartRun')) ||
-          matchesSetup ||
-          matchesStart
-        ))
-    )
+    const cancellation = stopSetup || matchesStart;
+    if (cancelling || (busy && !(matchesSetup || matchesStart)))
       throw new Error('Wait for the pending desktop command.');
     if (
       receipts.commands.length &&
@@ -232,13 +220,6 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       )
     )
       throw new Error('Retry the existing uncertain stop with its exact command key.');
-    if (
-      revokeUsage &&
-      receipts.commands.some(
-        (item) => item.command === 'ObserveUsage' && item.payload.consent === false,
-      )
-    )
-      throw new Error('Retry the existing uncertain quota disable with its exact command key.');
     if (
       stopSetup &&
       receipts.commands.some(

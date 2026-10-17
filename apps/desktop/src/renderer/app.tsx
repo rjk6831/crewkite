@@ -2511,7 +2511,6 @@ function Usage({
   workspace: Workspace;
 }) {
   const [readerMessage, setReaderMessage] = useState<string | null>(null);
-  const [readerChoice, setReaderChoice] = useState<boolean | null>(null);
   const [displayTime, setDisplayTime] = useState(Date.now);
   const fixture =
     workspace.preview || (snapshot.routes.length > 0 && snapshot.routes.every(({ fake }) => fake));
@@ -2522,26 +2521,19 @@ function Usage({
     return () => window.clearInterval(timer);
   }, [fixture]);
   const reader = snapshot.usageReaders.find((value) => value.family === 'google');
-  const readerEnabled = readerChoice ?? reader?.enabled ?? false;
-  useEffect(() => {
-    if (!workspace.pending) setReaderChoice(null);
-  }, [workspace.pending]);
   const connected = workspace.connection === 'connected' && !workspace.preview;
   const nextReadAt = reader?.lastAttemptAt ? Date.parse(reader.lastAttemptAt) + 60000 : null;
-  async function observeUsage(consent?: boolean) {
-    if (consent !== undefined) setReaderChoice(consent);
-    setReaderMessage(null);
+  async function observeUsage() {
+    setReaderMessage('Quota read in progress.');
     try {
       const result = await workspace.command({
         command: 'ObserveUsage',
         expectedRevision: 0,
-        payload: { family: 'google', ...(consent === undefined ? {} : { consent }) },
+        payload: { family: 'google' },
       });
       setReaderMessage(
         result.outcome === 'applied' || result.outcome === 'already-applied'
-          ? consent === false
-            ? 'Quota reads disabled. Prior windows retain their observation times.'
-            : 'Quota read completed.'
+          ? 'Quota read completed.'
           : [result.reason ?? result.outcome, result.next].filter(Boolean).join('. '),
       );
     } catch (failure) {
@@ -2587,26 +2579,16 @@ function Usage({
       <section className="card" aria-labelledby="google-quota-title">
         <div className="section-heading">
           <h2 id="google-quota-title">Google quota</h2>
-          <span>{reader?.enabled ? 'Reads enabled' : 'Reads disabled'}</span>
+          <span>{reader?.available ? 'Available' : 'Unavailable'}</span>
         </div>
         <p className="muted small">
-          Reads Google quota through the CLI's headless /usage command with no model request.
-          Google's FAQ reserves headless mode for scripting and CI. Enabling requests one read.
-          Quota consent does not enable a writer.
+          Reads Google quota through the CLI's /usage command. No model request. Reads are on by
+          default when the pinned client is available.
         </p>
-        <label className="checkbox-label">
-          <input
-            type="checkbox"
-            checked={readerEnabled}
-            disabled={!reader || !connected || (workspace.pending && !readerEnabled)}
-            onChange={(event) => void observeUsage(event.target.checked)}
-          />{' '}
-          Enable quota reads
-        </label>
         <button
           type="button"
           className="button secondary"
-          disabled={!connected || workspace.pending || !reader?.enabled}
+          disabled={!connected || workspace.pending || !reader?.available}
           onClick={() => void observeUsage()}
         >
           <RefreshCw size={14} />
