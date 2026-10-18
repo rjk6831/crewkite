@@ -36,6 +36,7 @@ import {
   git,
   inspectSource,
   inspectSourceDetails,
+  readCandidateFiles,
   readFiles,
   treeFromFiles,
 } from './source.ts';
@@ -97,6 +98,83 @@ test('source inspection bounds file metadata without running filters or reading 
   assert.throws(() => readFiles(special), /unsupported|regular/);
   assert.equal(existsSync(canary), false);
   assert.deepEqual(readFileSync(join(source.directory, '.git', 'index')), index);
+
+  const ignoreRepository = join(directory, 'ignore-repository');
+  const ignoreScratch = join(directory, 'ignore-scratch');
+  const originalFiles = [
+    ['.gitignore', 'node_modules/\n*.log\n'],
+    ['nested/.gitignore', 'generated/*\n!generated/keep.txt\n'],
+    ['node_modules/tracked.txt', 'original\n'],
+    ['deleted.log', 'remove me\n'],
+    ['tracked.log', 'original\n'],
+    ['ordinary.txt', 'original\n'],
+  ].map(([path, text]) => {
+    const content = Buffer.from(text);
+    return {
+      path,
+      mode: '100644' as const,
+      hash: createHash('sha256').update(content).digest('hex'),
+      bytes: content.length,
+      content,
+    };
+  });
+  const ignoreTree = treeFromFiles(ignoreRepository, originalFiles);
+  const ignoreBase = git(ignoreRepository, ['commit-tree', ignoreTree, '-m', 'base'], undefined, {
+    name: 'Source test',
+    email: 'source@example.test',
+    at: '2026-01-01T00:00:00.000Z',
+  })
+    .toString()
+    .trim();
+  for (const file of originalFiles) {
+    mkdirSync(dirname(join(ignoreScratch, file.path)), { recursive: true });
+    writeFileSync(join(ignoreScratch, file.path), file.content);
+  }
+  writeFileSync(join(ignoreScratch, 'tracked.log'), 'changed\n');
+  chmodSync(join(ignoreScratch, 'tracked.log'), 0o755);
+  writeFileSync(join(ignoreScratch, 'node_modules/tracked.txt'), 'changed tracked dependency\n');
+  unlinkSync(join(ignoreScratch, 'deleted.log'));
+  writeFileSync(join(ignoreScratch, 'ordinary.txt'), 'changed ordinary\n');
+  writeFileSync(join(ignoreScratch, 'new-source.txt'), 'new source\n');
+  // New ignore rules cannot conceal source edits from the frozen source policy.
+  writeFileSync(join(ignoreScratch, '.gitignore'), '*\n');
+  mkdirSync(join(ignoreScratch, 'node_modules/.pnpm-store'), { recursive: true });
+  writeFileSync(join(ignoreScratch, 'node_modules/.pnpm-store/index.db'), 'generated cache');
+  mkdirSync(join(ignoreScratch, 'nested/generated'), { recursive: true });
+  writeFileSync(join(ignoreScratch, 'nested/generated/drop.txt'), 'generated');
+  writeFileSync(join(ignoreScratch, 'nested/generated/keep.txt'), 'retained');
+  assert.ok(
+    readFiles(ignoreScratch).some((file) => file.path === 'node_modules/.pnpm-store/index.db'),
+  );
+  const selected = readCandidateFiles(ignoreScratch, ignoreRepository, ignoreBase);
+  assert.deepEqual(
+    selected.map((file) => file.path),
+    [
+      '.gitignore',
+      'nested/.gitignore',
+      'nested/generated/keep.txt',
+      'new-source.txt',
+      'node_modules/tracked.txt',
+      'ordinary.txt',
+      'tracked.log',
+    ],
+  );
+  assert.equal(selected.find((file) => file.path === 'tracked.log')?.mode, '100755');
+  assert.equal(
+    selected.find((file) => file.path === 'node_modules/tracked.txt')?.content.toString(),
+    'changed tracked dependency\n',
+  );
+  assert.equal(
+    selected.find((file) => file.path === 'ordinary.txt')?.content.toString(),
+    'changed ordinary\n',
+  );
+  // Ignored generated special files are skipped before any content is opened.
+  execFileSync('mkfifo', [join(ignoreScratch, 'node_modules/cache.pipe')]);
+  assert.deepEqual(readCandidateFiles(ignoreScratch, ignoreRepository, ignoreBase), selected);
+  execFileSync('mkfifo', [join(ignoreScratch, 'selected.pipe')]);
+  assert.throws(() => readCandidateFiles(ignoreScratch, ignoreRepository, ignoreBase), /special/);
+  unlinkSync(join(ignoreScratch, 'selected.pipe'));
+  assert.deepEqual(git(ignoreRepository, ['for-each-ref']).toString(), '');
 
   const blobFiles: FileContent[] = [
     { path: '.gitattributes', mode: '100644', content: Buffer.from('*.bin filter=canary\n') },

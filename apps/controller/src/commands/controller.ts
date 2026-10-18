@@ -174,6 +174,7 @@ import {
   inspectSourceDetails,
   materialize,
   projectRoot,
+  readCandidateFiles,
   readFiles,
 } from '../host/source.ts';
 import type { DependencyInventory } from '../host/toolchain.ts';
@@ -13804,7 +13805,10 @@ export class Controller {
         const candidate = context.packet.candidate;
         const files = this.evidence.read(candidate).files;
         if (!existsSync(intent.scratch_path)) materialize(intent.scratch_path, files);
-        if (this.evidence.hash(run.source.base, readFiles(intent.scratch_path)) !== candidate.hash)
+        if (
+          this.evidence.hash(run.source.base, this.candidateFiles(run, intent.scratch_path)) !==
+          candidate.hash
+        )
           throw new Error('Retained bytes changed after context sealing.');
       } else if (!existsSync(intent.scratch_path))
         materialize(
@@ -15250,7 +15254,8 @@ export class Controller {
       }
     }
     return (
-      this.evidence.hash(run.source.base, readFiles(this.writerScratch(run))) === candidate.hash
+      this.evidence.hash(run.source.base, this.candidateFiles(run, this.writerScratch(run))) ===
+      candidate.hash
     );
   }
 
@@ -15273,13 +15278,27 @@ export class Controller {
     for (const artifact of artifacts) this.store.put('artifact', artifact.id, 0, artifact);
   }
 
+  private candidateFiles(run: Run, directory: string): FileContent[] {
+    if (this.store.receipt(`local-prepared:${run.id}`)) return readFiles(directory);
+    if (
+      this.store.receipt(`native-run:${run.id}`) &&
+      !('repository' in this.nativeCurrentPlan(run).appointment)
+    )
+      return readFiles(directory);
+    return readCandidateFiles(
+      directory,
+      this.projectPath(run.source.projectId) as string,
+      run.source.base,
+    );
+  }
+
   private sealCandidate(attempt: Attempt, capturedFiles?: FileContent[]): Candidate {
     const run = this.store.get<Run>('run', attempt.runId) as Run;
     if (this.hasUncertainWriter(run.taskId)) throw new Error('Writer ownership is not quiescent.');
     const intent = this.store
       .intents()
       .find((value) => value.attempt_id === attempt.id) as LaunchIntent;
-    const files = capturedFiles ?? readFiles(intent.scratch_path);
+    const files = capturedFiles ?? this.candidateFiles(run, intent.scratch_path);
     const native = !!this.store.receipt(`native-run:${run.id}`);
     const nativeCandidates = new Set(
       this.store
