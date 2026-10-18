@@ -5996,7 +5996,7 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
     assert.equal(context.submissions(), before);
   }
 
-  for (const scenario of ['auth-api', 'overage', 'stop-auth', 'stop-task'] as const) {
+  for (const scenario of ['auth-api', 'overage', 'quota', 'stop-auth', 'stop-task'] as const) {
     const context = await nativeSetup(
       t,
       scenario === 'stop-task' ? 'anthropic-hold' : `anthropic-${scenario}`,
@@ -6079,7 +6079,10 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
     );
     await context.wait(`${scenario} retained`, retained);
     if (stopping) await context.wait(`${scenario} Stop`, stopping);
-    assert.equal(context.submissions(), scenario === 'overage' || scenario === 'stop-task' ? 1 : 0);
+    assert.equal(
+      context.submissions(),
+      scenario === 'overage' || scenario === 'quota' || scenario === 'stop-task' ? 1 : 0,
+    );
     const attempt = controller.snapshot().attempts[0];
     const phases = controller.store.nativeProcesses(attempt.id);
     assert.deepEqual(
@@ -6098,10 +6101,18 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
         controller.snapshot().tasks[0].next,
         'Native output was refused by protocol checks at rate-limit.isUsingOverage (unsupported). Inspect retained ownership and artifacts.',
       );
+    if (scenario === 'quota')
+      assert.equal(
+        controller.snapshot().tasks[0].next,
+        'Provider usage limit reached. The provider reports that it resets at 2026-10-14T17:46:40.000Z. Retry after the reset or choose another available provider.',
+      );
     assert.deepEqual(inspectSource(task.projectId, context.source.directory), run.source);
     controller = await context.restart();
     assert.equal(controller.snapshot().attempts.length, 1);
-    assert.equal(context.submissions(), scenario === 'overage' || scenario === 'stop-task' ? 1 : 0);
+    assert.equal(
+      context.submissions(),
+      scenario === 'overage' || scenario === 'quota' || scenario === 'stop-task' ? 1 : 0,
+    );
   }
   for (const scenario of [
     'config-error',

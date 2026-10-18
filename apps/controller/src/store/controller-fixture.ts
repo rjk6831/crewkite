@@ -365,9 +365,11 @@ async function nativeSetup(
               ? 'hold'
               : mode === 'anthropic-overage'
                 ? 'overage'
-                : mode === 'anthropic-auth-api'
-                  ? 'auth-api'
-                  : 'success',
+                : mode === 'anthropic-quota'
+                  ? 'quota'
+                  : mode === 'anthropic-auth-api'
+                    ? 'auth-api'
+                    : 'success',
         });
       }
       if (googleChild) {

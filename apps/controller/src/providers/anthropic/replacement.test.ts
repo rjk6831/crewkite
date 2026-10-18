@@ -290,6 +290,7 @@ test('native text replacement stays bound to one proposal and owned task deadlin
     toolsEmpty?: boolean;
     pluginsEmpty?: boolean;
     retries?: number;
+    reason?: string;
     diagnostic?: Record<string, unknown>;
     ignored?: Record<string, number>;
     usage?: unknown[];
@@ -947,7 +948,72 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       name: 'missing structured output',
       frames: [init, { ...result, structured_output: undefined }],
     },
-    { name: 'error result', frames: [init, { ...result, is_error: true }] },
+    {
+      name: 'generic provider error stays distinct from a usage limit',
+      frames: [
+        init,
+        {
+          ...result,
+          is_error: true,
+          api_error_status: 429,
+          api_error: 'rate_limit',
+          result: secret,
+        },
+      ],
+      reason: 'provider',
+      diagnostic: {
+        stage: 'output',
+        site: 'result',
+        cause: 'provider-error',
+        envelope: 'result',
+        subtype: 'success',
+        field: 'is_error',
+      },
+    },
+    {
+      name: 'typed usage limit keeps only its kind and validated reset',
+      frames: [
+        init,
+        {
+          type: 'assistant',
+          session_id: input.sessionId,
+          message: { role: 'assistant', content: [] },
+          is_api_error_message: true,
+          api_error: 'usage_limit_reached',
+          api_error_params: {
+            rate_limit_info: {
+              status: 'rejected',
+              rateLimitType: 'five_hour',
+              resetsAt: fiveHourReset,
+              private: secret,
+            },
+          },
+          error_details: secret,
+        },
+        {
+          ...result,
+          is_error: true,
+          api_error_status: 429,
+          api_error: 'usage_limit_reached',
+          api_error_origin: 'first_party',
+          result: secret,
+        },
+      ],
+      reason: 'provider',
+      diagnostic: {
+        stage: 'output',
+        site: 'result',
+        cause: 'provider-error',
+        envelope: 'result',
+        subtype: 'success',
+        field: 'is_error',
+        providerFailure: {
+          kind: 'usage-limit',
+          rateLimitType: 'five_hour',
+          resetsAt: '2026-10-14T17:46:40.000Z',
+        },
+      },
+    },
     {
       name: 'denial result',
       frames: [init, { ...result, permission_denials: [{ tool_name: secret }] }],
@@ -1044,9 +1110,10 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       assert(diagnostic, row.name);
       assert(Object.isFrozen(diagnostic), row.name);
       assert.equal(error.diagnostic, diagnostic, row.name);
+      if ('reason' in row) assert.equal(error.reason, row.reason, row.name);
       assert(!JSON.stringify(diagnostic).includes(secret), row.name);
       for (const [key, value] of Object.entries(row.diagnostic ?? {}))
-        assert.equal(diagnostic[key as keyof typeof diagnostic], value, row.name);
+        assert.deepEqual(diagnostic[key as keyof typeof diagnostic], value, row.name);
       assert.throws(
         () => reader.finish(),
         (later: unknown) => later instanceof ReplacementError && later.diagnostic === diagnostic,

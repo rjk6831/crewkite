@@ -594,6 +594,33 @@ type NativeOutcome = {
 };
 
 const nativeFailureNext = (outcome: NativeOutcome | null) => {
+  if (outcome?.reason === 'provider') {
+    const diagnostic =
+      outcome.diagnostic && typeof outcome.diagnostic === 'object'
+        ? (outcome.diagnostic as Record<string, unknown>)
+        : null;
+    const failure = z
+      .strictObject({
+        kind: z.literal('usage-limit'),
+        rateLimitType: z
+          .enum([
+            'five_hour',
+            'seven_day',
+            'seven_day_opus',
+            'seven_day_sonnet',
+            'seven_day_overage_included',
+          ])
+          .nullable(),
+        resetsAt: z.iso.datetime().nullable(),
+      })
+      .safeParse(diagnostic?.providerFailure);
+    if (failure.success) {
+      if (!failure.data.resetsAt)
+        return 'Provider usage limit reached. Retry later or choose another available provider.';
+      return `Provider usage limit reached. The provider reports that it resets at ${failure.data.resetsAt}. Retry after the reset or choose another available provider.`;
+    }
+    return 'The provider ended this work with an error. Inspect the retained task details before retrying or choose another available provider.';
+  }
   if (
     outcome?.reason !== 'protocol' ||
     !outcome.diagnostic ||

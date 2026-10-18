@@ -55,6 +55,7 @@ type Failure =
   | 'storage'
   | 'environment'
   | 'launch'
+  | 'provider'
   | 'protocol'
   | 'limit'
   | 'deadline'
@@ -184,6 +185,9 @@ const result = identity.extend({
 const assistant = identity.extend({
   type: z.literal('assistant'),
   message: z.object({ role: z.literal('assistant'), content: z.array(z.unknown()).max(128) }),
+  is_api_error_message: z.unknown().optional(),
+  api_error: z.unknown().optional(),
+  api_error_params: z.unknown().optional(),
 });
 const user = identity.extend({
   type: z.literal('user'),
@@ -280,6 +284,31 @@ const unixTime = (seconds: number | undefined) => {
   const parsed = epochSeconds.safeParse(seconds);
   return parsed.success ? new Date(parsed.data * 1000).toISOString() : null;
 };
+type UsageLimitFailure = Readonly<{
+  kind: 'usage-limit';
+  rateLimitType: keyof typeof usageWindows | null;
+  resetsAt: string | null;
+}>;
+const usageLimitFailure = (value: unknown): UsageLimitFailure | null => {
+  const parsed = rateLimitInfo.safeParse(value);
+  if (!parsed.success || parsed.data.status !== 'rejected') return null;
+  const rateLimitType = isWindow(parsed.data.rateLimitType) ? parsed.data.rateLimitType : null;
+  if (!rateLimitType) return null;
+  return {
+    kind: 'usage-limit',
+    rateLimitType,
+    resetsAt: unixTime(parsed.data.resetsAt),
+  };
+};
+const typedUsageLimit = (message: Record<string, unknown>): UsageLimitFailure | null => {
+  if (message.api_error !== 'usage_limit_reached') return null;
+  if (!message.api_error_params || typeof message.api_error_params !== 'object')
+    return { kind: 'usage-limit', rateLimitType: null, resetsAt: null };
+  const info = (message.api_error_params as Record<string, unknown>).rate_limit_info;
+  return usageLimitFailure(info) ?? { kind: 'usage-limit', rateLimitType: null, resetsAt: null };
+};
+const assistantUsageLimit = (message: z.output<typeof assistant>): UsageLimitFailure | null =>
+  message.is_api_error_message === true ? typedUsageLimit(message) : null;
 
 /** Map one rate_limit_event to the windows it reports. A window it omits stays unreported. */
 export function projectAnthropicUsage(event: unknown): AnthropicUsage {
@@ -432,11 +461,19 @@ export type ReplacementDiagnostic = Readonly<{
     | 'result'
     | 'replacement'
     | 'finish';
-  cause: 'validation' | 'correlation' | 'invalid-json' | 'unsupported' | 'limit' | 'incomplete';
+  cause:
+    | 'validation'
+    | 'correlation'
+    | 'invalid-json'
+    | 'unsupported'
+    | 'limit'
+    | 'incomplete'
+    | 'provider-error';
   // The client's own frame name, or 'other' when the name is not a plain identifier.
   envelope: string;
   subtype: string | null;
   field: (typeof fields)[number] | 'other' | null;
+  providerFailure?: UsageLimitFailure;
 }>;
 
 /** Assistant output is never a host command, permission response or replacement authority. */
@@ -454,6 +491,7 @@ export class ReplacementStream {
   private envelope: ReplacementDiagnostic['envelope'] = 'none';
   private subtype: ReplacementDiagnostic['subtype'] = null;
   private failure: ReplacementDiagnostic | null = null;
+  private usageLimitFailure: UsageLimitFailure | null = null;
   private readonly usage = new Map<string, string>();
   private readonly plan: WriterPlan;
   private readonly onUsage: AnthropicUsageHook | undefined;
@@ -492,6 +530,7 @@ export class ReplacementStream {
     reason: Failure,
     cause: ReplacementDiagnostic['cause'] = 'validation',
     field: ReplacementDiagnostic['field'] = null,
+    providerFailure?: UsageLimitFailure,
   ): never {
     this.failed ??= reason;
     this.failure ??= Object.freeze({
@@ -501,6 +540,7 @@ export class ReplacementStream {
       envelope: this.envelope,
       subtype: this.subtype,
       field,
+      ...(providerFailure ? { providerFailure } : {}),
     });
     this.terminal = null;
     throw new ReplacementError(this.failed, this.failure);
@@ -561,6 +601,7 @@ export class ReplacementStream {
           // Subscription metadata grants no permission, billing or replacement authority.
           const info = rateLimit.parse(value).rate_limit_info;
           this.observeUsage(value);
+          this.usageLimitFailure = usageLimitFailure(info) ?? this.usageLimitFailure;
           // Extra-usage configuration does not report use. Served overflow still refuses.
           if (info.isUsingOverage === true) this.fail('protocol', 'unsupported', 'isUsingOverage');
           if (info.overageInUse === true) this.fail('protocol', 'unsupported', 'overageInUse');
@@ -578,7 +619,8 @@ export class ReplacementStream {
           this.fail('protocol', 'unsupported');
         } else if (type === 'assistant') {
           this.site = 'assistant';
-          assistant.parse(value);
+          const message = assistant.parse(value);
+          this.usageLimitFailure = assistantUsageLimit(message) ?? this.usageLimitFailure;
         } else if (type === 'user') {
           this.site = 'user';
           // Native user-role output is discarded. Only the terminal result can supply a proposal.
@@ -595,6 +637,16 @@ export class ReplacementStream {
           this.fail('protocol', 'unsupported', 'type');
         } else {
           this.site = 'result';
+          if (record.is_error === true) {
+            if (typeof record.subtype !== 'string' || !PROTOCOL_NAME.test(record.subtype))
+              this.fail('protocol', 'validation', 'subtype');
+            this.fail(
+              'provider',
+              'provider-error',
+              'is_error',
+              this.usageLimitFailure ?? typedUsageLimit(record) ?? undefined,
+            );
+          }
           const message = result.parse(value);
           this.site = 'replacement';
           const edit = message.structured_output;
