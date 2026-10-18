@@ -566,6 +566,7 @@ function nativeLaunch(options: NativeLaunch, logFile: string) {
         LANG: 'en_US.UTF-8',
         TERM: 'dumb',
         NO_COLOR: '1',
+        AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
         TMPDIR: temporary,
       },
     };

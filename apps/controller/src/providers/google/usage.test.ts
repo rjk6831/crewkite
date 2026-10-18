@@ -190,10 +190,15 @@ test('the google quota read maps zero-turn account buckets to window observation
         directory,
         temporaryDirectory: runtime,
         timeoutMs: 3000,
-        environment: { ...environment, GOOGLE_API_KEY: 'private-canary' },
+        environment: {
+          ...environment,
+          GOOGLE_API_KEY: 'private-canary',
+          AGY_CLI_DISABLE_AUTO_UPDATE: 'false',
+        },
         spawn: (_, args, options) => {
           assert.deepEqual(args.slice(0, 4), ['-p', '/usage', '--output-format', 'json']);
           assert(!('GOOGLE_API_KEY' in (options?.env ?? {})));
+          assert.equal(options?.env?.AGY_CLI_DISABLE_AUTO_UPDATE, 'true');
           events.push('spawn');
           const child = spawn(process.execPath, ['-e', script], options);
           if (child.pid) groupsSeen.push(child.pid);

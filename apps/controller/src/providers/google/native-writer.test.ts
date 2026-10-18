@@ -147,8 +147,9 @@ const file=JSON.parse(prompt.split('\nFile: ')[1]);
 assert(args.includes('--sandbox')&&args.includes('--disable-slash-commands'));
 assert(!args.includes('--dangerously-skip-permissions'));
 assert(process.env.HOME&&process.env.USER&&process.env.LOGNAME);
+assert.equal(process.env.AGY_CLI_DISABLE_AUTO_UPDATE,'true');
 const owner=checkOwner();
-assert(Object.keys(process.env).every(key=>['HOME','USER','LOGNAME','PATH','LANG','TERM','NO_COLOR','TMPDIR','__CF_USER_TEXT_ENCODING'].includes(key)||(owner&&key==='CREWKITE_CHECK_OWNER')),JSON.stringify(Object.keys(process.env)));
+assert(Object.keys(process.env).every(key=>['HOME','USER','LOGNAME','PATH','LANG','TERM','NO_COLOR','AGY_CLI_DISABLE_AUTO_UPDATE','TMPDIR','__CF_USER_TEXT_ENCODING'].includes(key)||(owner&&key==='CREWKITE_CHECK_OWNER')),JSON.stringify(Object.keys(process.env)));
 const permissionMode=['strict','always-proceed','proceed-in-sandbox'].includes(mode)?mode:'request-review';
 const start={event:'init',conversation_id:'session',init:{cwd:process.cwd(),tools:['view_file'],permission_mode:permissionMode,model:value('--model')}};
 const result={event:'result',result:{conversation_id:mode==='wrong-session'?'other':'session',status:mode==='failed'?'ERROR':'SUCCESS',response:'discarded',duration_seconds:0,num_turns:1,usage:${JSON.stringify(usage)},structured_output:{...file,content:'export const total = 1;\n'}}};
@@ -534,6 +535,7 @@ else {
           ...environment,
           GOOGLE_API_KEY: 'private-canary',
           GOOGLE_APPLICATION_CREDENTIALS: 'private-canary',
+          AGY_CLI_DISABLE_AUTO_UPDATE: 'false',
         },
         spawn: (_, args, options) => {
           assert.deepEqual(args.slice(0, 4), ['-p', '/config', '--output-format', 'json']);
@@ -541,6 +543,7 @@ else {
           const child = spawn(process.execPath, ['-e', script], options);
           if (child.pid) groups.push(child.pid);
           assert(!('GOOGLE_API_KEY' in (options?.env ?? {})));
+          assert.equal(options?.env?.AGY_CLI_DISABLE_AUTO_UPDATE, 'true');
           return child;
         },
         lifecycle: {
