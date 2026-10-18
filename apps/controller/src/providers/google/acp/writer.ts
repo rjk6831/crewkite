@@ -514,9 +514,11 @@ function outsideScratch(root: string, locations: Tool['locations']) {
   );
 }
 // The server tells the model to keep planning notes under its own data directory, using
-// the file creation tool. The task needs only the replacement tool, so creation stays off.
-// The server strips a disabled tool from the model's context.
-const sessionMeta = { antigravity: { disabledTools: ['create_file', 'edit_file'] } };
+// the file creation tool. The prompt already carries task context. Keep those tools and the
+// broad native editor out so the model uses the scoped replacement tool.
+const sessionMeta = {
+  antigravity: { disabledTools: ['create_file', 'edit_file', 'task_context'] },
+};
 const toolKinds = [
   'read',
   'edit',
@@ -608,48 +610,9 @@ export function decodeAcpPermissionAction(options: {
   scratch: string;
   target: AcpWriterPlan['target'];
   toolMappings: readonly AcpToolMapping[];
-  mcpServerName?: string;
   readTarget?: () => AcpTargetSnapshot;
 }): AcpPermissionAction {
-  const received = toolUpdate.parse(options.tool);
-  const hunkInput = z.strictObject({
-    TargetFile: text(4096),
-    TargetContent: text(65536).min(1),
-    ReplacementContent: text(65536),
-  });
-  const wrappedMeta = options.mcpServerName
-    ? z
-        .strictObject({
-          mcp: z.strictObject({
-            server: z.literal(options.mcpServerName),
-            tool: z.literal('replace_file_content'),
-          }),
-          is_mcp_tool_call: z.literal(true),
-          prompt: text(4096).optional(),
-        })
-        .safeParse(received._meta)
-    : null;
-  const wrappedInput = hunkInput.extend({ arguments: hunkInput }).safeParse(received.rawInput);
-  const wrapped =
-    wrappedMeta?.success &&
-    wrappedInput.success &&
-    hashCanonical(
-      hunkInput.parse({
-        TargetFile: wrappedInput.data.TargetFile,
-        TargetContent: wrappedInput.data.TargetContent,
-        ReplacementContent: wrappedInput.data.ReplacementContent,
-      }),
-    ) === hashCanonical(wrappedInput.data.arguments);
-  if (
-    options.mcpServerName &&
-    received.name == null &&
-    received.title === 'Run replace_file_content?' &&
-    !wrapped
-  )
-    throw new AcpError('permission');
-  const tool = wrapped
-    ? { ...received, _meta: undefined, rawInput: wrappedInput.data.arguments }
-    : received;
+  const tool = toolUpdate.parse(options.tool);
   const mappings = options.toolMappings
     .map((entry) => AcpToolMappingSchema.parse(entry))
     .filter(
@@ -884,7 +847,6 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
             scratch: options.scratch,
             target: plan.target,
             toolMappings: options.toolMappings ?? GoogleAcpToolMappings,
-            mcpServerName: options.mcpServer.name,
             readTarget: options.readTarget,
           });
           if (detail.baseHash !== expectedTargetHash) return reject(id, diagnostic);

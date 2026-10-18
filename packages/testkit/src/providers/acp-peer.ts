@@ -133,15 +133,10 @@ export function runAcpPeer(scenario: AcpPeerCase) {
       title: 'Run replace_file_content?',
       kind: 'edit',
       status: 'pending',
-      _meta: {
-        mcp: { server: 'crewkite-context', tool: 'replace_file_content' },
-        is_mcp_tool_call: true,
-      },
       rawInput: {
         TargetFile: path,
         TargetContent: oldText,
         ReplacementContent: newText,
-        arguments: { TargetFile: path, TargetContent: oldText, ReplacementContent: newText },
         ...(scenario === 'hunk-control' ? { AllowMultiple: true } : {}),
       },
       content: [{ type: 'diff', path, oldText, newText, _meta: { kind: 'modify' } }],
@@ -233,7 +228,7 @@ export function runAcpPeer(scenario: AcpPeerCase) {
         assert.deepEqual(
           message.params._meta,
           message.params.mcpServers.length
-            ? { antigravity: { disabledTools: ['create_file', 'edit_file'] } }
+            ? { antigravity: { disabledTools: ['create_file', 'edit_file', 'task_context'] } }
             : undefined,
         );
         for (const server of message.params.mcpServers) {
