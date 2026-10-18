@@ -1253,7 +1253,12 @@ test('native proposals and reviews require one matching completed turn and bound
     'unknown-request',
     'notice-request',
     'busy-command',
+    'large-output',
+    'long-turn',
     'overrun',
+    'item-overrun',
+    'retry-overrun',
+    'line-overrun',
     'late-progress',
     'late-completion',
     'late-error',
@@ -1374,12 +1379,32 @@ test('native proposals and reviews require one matching completed turn and bound
       assert.equal(native.complete, false);
       continue;
     }
-    if (mode === 'overrun') {
+    const reasoning = (index: number) => ({ id: `reasoning-${index}`, type: 'reasoning' });
+    const retry = { method: 'error', params: { ...identity, willRetry: true, error: {} } };
+    const sized = (length: number) => {
+      const frame = {
+        method: 'item/commandExecution/outputDelta',
+        params: { ...identity, delta: '' },
+      };
+      frame.params.delta = 'x'.repeat(length - JSON.stringify(frame).length);
+      return frame;
+    };
+    // Each bound admits its last frame and refuses the next. turn/started is one checked notice.
+    const overruns: Record<string, [number, (index: number) => unknown]> = {
+      overrun: [16_383, () => ({ method: 'thread/queue/changed', params: identity })],
+      'item-overrun': [
+        4096,
+        (index) => ({ method: 'item/started', params: { ...identity, item: reasoning(index) } }),
+      ],
+      'retry-overrun': [32, () => retry],
+      'line-overrun': [1, (index) => sized(1024 * 1024 + index)],
+    };
+    if (mode in overruns) {
+      const [allowed, frame] = overruns[mode];
       native.push(bytes(frames[0]));
-      const queued = bytes({ method: 'thread/queue/changed', params: identity });
-      for (let count = 1; count < 4096; count++) native.push(queued);
-      assert.throws(() => native.push(queued));
-      assert.equal(native.diagnostic?.cause, 'limit');
+      for (let index = 0; index < allowed; index++) native.push(bytes(frame(index)));
+      assert.throws(() => native.push(bytes(frame(allowed))), mode);
+      assert.equal(native.diagnostic?.cause, 'limit', mode);
       continue;
     }
     if (mode === 'duplicate-item') frames.push(frames[1]);
@@ -1401,7 +1426,14 @@ test('native proposals and reviews require one matching completed turn and bound
         params: {
           ...identity,
           turnId: mode === 'wrong-turn' ? 'other' : identity.turnId,
-          item: { ...command, status: mode === 'failed-command' ? 'failed' : 'completed' },
+          item: {
+            ...command,
+            status: mode === 'failed-command' ? 'failed' : 'completed',
+            // A completed command item repeats all of its output.
+            ...(mode === 'large-output'
+              ? { aggregatedOutput: 'private-repository-canary'.repeat(24_576) }
+              : {}),
+          },
           completedAtMs: 2,
         },
       });
@@ -1429,6 +1461,14 @@ test('native proposals and reviews require one matching completed turn and bound
         params: { ...identity, item: { ...fileItem, status: 'completed' }, completedAtMs: 4 },
       },
     );
+    // A long turn passes the earlier 128-item and three-retry bounds.
+    if (mode === 'long-turn')
+      for (let index = 0; index < 200; index++)
+        frames.push(
+          { method: 'item/started', params: { ...identity, item: reasoning(index) } },
+          { method: 'item/completed', params: { ...identity, item: reasoning(index) } },
+          ...(index % 50 === 0 ? [retry] : []),
+        );
     frames.push({
       method: 'turn/completed',
       params: {
@@ -1450,7 +1490,15 @@ test('native proposals and reviews require one matching completed turn and bound
       return native.finish();
     };
     if (
-      ['success', 'fragmented', 'failed-command', 'busy-command', 'late-progress'].includes(mode)
+      [
+        'success',
+        'fragmented',
+        'failed-command',
+        'busy-command',
+        'large-output',
+        'long-turn',
+        'late-progress',
+      ].includes(mode)
     ) {
       const result = perform();
       assert.deepEqual(activities, [
@@ -1465,6 +1513,7 @@ test('native proposals and reviews require one matching completed turn and bound
       assert.equal(Object.hasOwn(result, 'modelChoices'), false);
       assert.equal('replacement' in result, false);
       assert(!JSON.stringify(result).includes('private-repository-canary'));
+      assert.equal(result.observedRetries, mode === 'long-turn' ? 4 : 0);
       if (mode === 'busy-command')
         assert.deepEqual(native.ignoredNotifications, {
           [methodHash(delta.method)]: 5000,

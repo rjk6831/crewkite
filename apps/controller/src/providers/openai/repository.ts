@@ -59,13 +59,28 @@ export function repositoryPlan(value: z.input<typeof input>) {
 }
 export type RepositoryPlan = ReturnType<typeof repositoryPlan>;
 const encode = (value: unknown) => Buffer.from(`${JSON.stringify(value)}\n`);
-// Command output streams through this transcript. Eight MiB is sixteen full 512 KiB frames.
-const MAX_OUTPUT = 8 * 1024 * 1024;
+// A completed command item repeats the command's whole output, and writers run checks that print
+// a lot. One frame may reach 1 MiB, and the total holds eight of them.
+const MAX_LINE = 1024 * 1024;
+const MAX_OUTPUT = 8 * MAX_LINE;
+// A live turn started 8 commands in about 73 seconds. With a reasoning item and a message around
+// each, that is near 0.35 items a second, or about 200 items in ten minutes. This cap is twenty
+// times that and still covers five items a second for ten minutes. An item costs at most about
+// 0.5 KiB here: an ID of up to 200 characters, its type and two collection entries. The cap
+// holds about 2 MiB.
+const MAX_ITEMS = 4096;
+// Each item starts and completes. The other half covers thread status, warnings and a
+// rate-limit update for each model request.
+const MAX_NOTICES = 4 * MAX_ITEMS;
+// That pace is about 70 model requests in ten minutes, and the client retries each one a few
+// times on its own. This rides out a connection that drops every minute or so and still ends a
+// turn that keeps failing.
+const MAX_RETRIES = 32;
 const turn = z.object({
   id,
   status: z.enum(['inProgress', 'completed', 'interrupted', 'failed']),
   error: z.unknown().nullable(),
-  items: z.array(z.unknown()).max(128),
+  items: z.array(z.unknown()).max(MAX_ITEMS),
 });
 const itemKinds = [
   'agentMessage',
@@ -323,10 +338,10 @@ export class RepositoryTranscript {
     for (;;) {
       const end = this.pending.indexOf(10);
       if (end < 0) {
-        if (this.pending.length > 524288) this.refuse('limit');
+        if (this.pending.length > MAX_LINE) this.refuse('limit');
         return;
       }
-      if (end > 524288) this.refuse('limit');
+      if (end > MAX_LINE) this.refuse('limit');
       const line = this.pending.subarray(0, end + 1);
       this.pending = this.pending.subarray(end + 1);
       if (this.step === 'metadata') {
@@ -442,7 +457,7 @@ export class RepositoryTranscript {
     if (!this.method || authorityNotice(this.method)) this.refuse('unsupported');
     if (!methods.includes(this.method as (typeof methods)[number]))
       return this.census.add(this.method);
-    if (++this.count > 4096) this.refuse('limit');
+    if (++this.count > MAX_NOTICES) this.refuse('limit');
     this.notification(this.method, value.params);
   }
   private notification(method: string, raw: unknown) {
@@ -563,13 +578,13 @@ export class RepositoryTranscript {
       this.refuse();
     if (method === 'error') {
       const retry = z.object({ willRetry: z.literal(true) }).parse(raw);
-      if (!retry.willRetry || ++this.retries > 3) this.refuse('limit');
+      if (!retry.willRetry || ++this.retries > MAX_RETRIES) this.refuse('limit');
       return;
     }
     if (method === 'item/started' || method === 'item/completed') {
       const item = z.object({ item: z.object({ id, type: z.enum(itemKinds) }) }).parse(raw).item;
       if (method === 'item/started') {
-        if (this.items.has(item.id) || this.items.size >= 128) this.refuse('limit');
+        if (this.items.has(item.id) || this.items.size >= MAX_ITEMS) this.refuse('limit');
         this.items.set(item.id, item.type);
         this.activity(item.type, 'started', z.object({ item: z.unknown() }).parse(raw).item);
       } else {
