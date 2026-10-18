@@ -8184,6 +8184,14 @@ export class Controller {
           (clientQuiescent &&
             terminalKnown &&
             this.store.nativePhasesComplete(plan.attempt.id, 'local'));
+        const missingFinalAnswer =
+          known &&
+          clientQuiescent &&
+          bound &&
+          terminal.kind === 'failed' &&
+          terminal.reason === 'protocol' &&
+          (terminal.proof?.structured?.reasoningBytes ?? 0) > 0 &&
+          terminal.proof?.structured?.nonReasoningBytes === 0;
         this.store.transaction(() => {
           const proof = this.nativeArtifact({
             attemptId: plan.attempt.id,
@@ -8263,7 +8271,9 @@ export class Controller {
                     ? 'Local replacement retained. Prepare separate checks and review before acceptance.'
                     : configurationFailed
                       ? 'Local settings could not be verified. No replacement was applied.'
-                      : 'Local work stopped without an applied replacement.',
+                      : missingFinalAnswer
+                        ? 'Local returned no final answer. No replacement was applied. Check the model settings.'
+                        : 'Local work stopped without an applied replacement.',
                 });
             },
             configurationFailed
