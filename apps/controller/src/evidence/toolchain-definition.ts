@@ -121,6 +121,12 @@ const compare = (a: { path: string }, b: { path: string }) =>
 export const nodeTestFile = (path: string) =>
   /^(?:apps|packages|scripts)\/.*\.test\.(?:ts|mjs)$/.test(path);
 
+export function nodeTestNames(content: string): string[] {
+  return [...content.matchAll(/(?:^|\n)\s*(?:await\s+)?(?:test|t\.test)\(\s*'([^'\n]+)'/g)].map(
+    (match) => match[1],
+  );
+}
+
 // The first recipe freezes the code which grades the candidate and enrolls child processes.
 const frozenDirectories = [
   'e2e/',
@@ -322,9 +328,7 @@ export async function prepareToolchain(input: {
     .filter((entry) => nodeTestFile(entry.path))
     .map((entry) => ({
       ...metadata(entry),
-      tests: [...entry.content.toString('utf8').matchAll(/^test\('([^'\n]+)'/gm)].map(
-        (match) => match[1],
-      ),
+      tests: nodeTestNames(entry.content.toString('utf8')),
     }));
   const journey = source.find((entry) => entry.path === 'e2e/desktop.spec.ts');
   const lock = source.find((entry) => entry.path === 'pnpm-lock.yaml');
