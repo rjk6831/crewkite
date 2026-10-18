@@ -5,8 +5,10 @@ import {
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
 import {
+  type ChatLike,
   type LLM,
   type LLMPredictionOpts,
+  type LLMRespondOpts,
   LMStudioClient,
   type PredictionResult,
 } from '@lmstudio/sdk';
@@ -44,6 +46,13 @@ export type LoadedModel = Pick<
   complete(
     prompt: string,
     options: LLMPredictionOpts,
+  ): {
+    cancel(): Promise<void>;
+    result(): Promise<PredictionResult>;
+  };
+  respond(
+    chat: ChatLike,
+    options: LLMRespondOpts,
   ): {
     cancel(): Promise<void>;
     result(): Promise<PredictionResult>;
@@ -534,7 +543,7 @@ export function startLocalPrediction(
     settled = false,
     cancelSent = false;
   let refusal: LocalReason | null = null;
-  let prediction: ReturnType<LoadedModel['complete']> | null = null;
+  let prediction: ReturnType<LoadedModel['respond']> | null = null;
   let outputBytes = 0,
     promptTokens = 0;
   const timers: Array<() => void> = [];
@@ -640,7 +649,9 @@ export function startLocalPrediction(
       // go without them, and the token proof covers the prompt that is actually sent.
       let rendered = '';
       let tokens: number[] = [];
+      let selectedTests = plan.tests;
       for (const tests of plan.tests.length ? [plan.tests, []] : [plan.tests]) {
+        selectedTests = tests;
         rendered = await model.applyPromptTemplate(localChat({ ...plan, tests }));
         guard();
         if (!rendered.isWellFormed() || Buffer.byteLength(rendered) > MAX_STREAM_BYTES)
@@ -678,8 +689,11 @@ export function startLocalPrediction(
       submitted = true;
       stage = 'transport';
       const structured = localStructuredOutput(plan.binding);
-      prediction = model.complete(rendered, {
+      const responseOptions: LLMRespondOpts = {
         maxTokens: outputTokens,
+        reasoningBudget: 1024,
+        temperature: 0.1,
+        enableThinking: true,
         contextOverflowPolicy: 'stopAtLimit',
         draftModel: '',
         stopStrings: [],
@@ -689,7 +703,8 @@ export function startLocalPrediction(
           outputBytes += Buffer.byteLength(content);
           if (!content.isWellFormed() || outputBytes > MAX_STREAM_BYTES) stop('limit');
         },
-      });
+      };
+      prediction = model.respond(localChat({ ...plan, tests: selectedTests }), responseOptions);
       if (stopping) cancel();
       const terminal = await prediction.result();
       if (settled) return;
@@ -712,6 +727,30 @@ export function startLocalPrediction(
         'overflow-policy',
         z.enum(['stopAtLimit', 'truncateMiddle', 'rollingWindow']),
         (value) => value === 'stopAtLimit',
+      );
+      configurationField(
+        terminal.predictionConfig,
+        'prediction-fields',
+        'llm.prediction.temperature',
+        'temperature',
+        z.number(),
+        (value) => value === 0.1,
+      );
+      configurationField(
+        terminal.predictionConfig,
+        'prediction-fields',
+        'llm.prediction.reasoning.enableThinking',
+        'reasoning-enabled',
+        z.boolean(),
+        (value) => value,
+      );
+      configurationField(
+        terminal.predictionConfig,
+        'prediction-fields',
+        'llm.prediction.reasoning.budgetTokens',
+        'reasoning-budget',
+        z.object({ checked: z.boolean(), value: z.number().int().positive().safe() }),
+        (value) => value.checked && value.value === 1024,
       );
       // Engine protocol removes prediction-time draft keys. Its loaded configuration owns drafting.
       // SDK 2.1 defines absent load selectors as false and the absent draft model as empty.
@@ -832,7 +871,8 @@ export function startLocalPrediction(
         draftModel: '',
       });
       if (
-        (proof.promptTokens !== null && proof.promptTokens !== promptTokens) ||
+        proof.promptTokens === null ||
+        proof.promptTokens + outputTokens > CONTEXT_TOKENS ||
         (proof.predictedTokens !== null && proof.predictedTokens > outputTokens)
       )
         throw new Error();

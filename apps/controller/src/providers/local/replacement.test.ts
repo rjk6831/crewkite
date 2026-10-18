@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { test } from 'node:test';
 import { canonicalJson } from '@crewkite/contracts';
-import type { LLMPredictionOpts, PredictionResult } from '@lmstudio/sdk';
+import type { PredictionResult } from '@lmstudio/sdk';
 import { localConfiguredConnectionHash, resolveLocalConnection } from './connection.ts';
 import {
   type LocalDiscoveryStart,
@@ -97,13 +97,16 @@ function terminal(
     content,
     reasoningContent: '',
     nonReasoningContent: content,
-    stats: { stopReason },
+    stats: { stopReason, promptTokensCount: 3 },
     modelInfo: info,
     roundIndex: 0,
     loadConfig: kv({ 'llm.load.contextLength': 8192 }),
     predictionConfig: kv({
       'llm.prediction.maxPredictedTokens': { checked: true, value: maximumOutputTokens },
       'llm.prediction.contextOverflowPolicy': 'stopAtLimit',
+      'llm.prediction.temperature': 0.1,
+      'llm.prediction.reasoning.enableThinking': true,
+      'llm.prediction.reasoning.budgetTokens': { checked: true, value: 1024 },
       'llm.prediction.speculativeDecoding.draftModel': '',
       'llm.prediction.structured': localStructuredOutput(input.binding).format,
     }),
@@ -119,7 +122,9 @@ function fixture(input: LocalStart = plan) {
     cancelled = 0,
     renders = 0,
     prompt = '',
-    options: LLMPredictionOpts | undefined;
+    renderedChat: ReturnType<typeof localChat> | undefined,
+    responseChat: ReturnType<typeof localChat> | undefined,
+    options: Parameters<LoadedModel['respond']>[1];
   const model: LoadedModel = {
     modelKey: plan.binding.modelKey,
     instanceReference: plan.binding.instanceReference,
@@ -128,6 +133,7 @@ function fixture(input: LocalStart = plan) {
     getBasePredictionConfig: async () => ({ draftModel: '' }),
     getInstanceProcessingState: async () => ({ status: 'idle', queued: 0 }),
     applyPromptTemplate: async (chat) => {
+      renderedChat = chat as ReturnType<typeof localChat>;
       // The task reads once as plain text and the file arrives byte for byte inside attempt fences.
       const [message, ...rest] = chat as ReturnType<typeof localChat>;
       assert.equal(rest.length, 0);
@@ -162,19 +168,23 @@ function fixture(input: LocalStart = plan) {
             `\n${fence('BEGIN', kind, path)}\n${content}${content.endsWith('\n') ? '' : '\n'}${fence('END', kind, path)}\n`,
           ),
         );
-      return tested ? 'rendered chat' : 'rendered chat without tests';
+      prompt = tested ? 'rendered chat' : 'rendered chat without tests';
+      return prompt;
     },
     tokenize: async () => [1, 2, 3],
     complete: (value, config) => {
+      throw new Error(`Raw completion is unavailable: ${value.length}:${config.maxTokens}`);
+    },
+    respond: (chat, config) => {
       submitted++;
-      prompt = value;
+      responseChat = chat as ReturnType<typeof localChat>;
       options = config;
       return {
         result: () => result,
         cancel: async () => {
           cancelled++;
         },
-      };
+      } as ReturnType<LoadedModel['respond']>;
     },
   };
   const timers: Array<{ work: () => void; delay: number; active: boolean }> = [];
@@ -209,6 +219,12 @@ function fixture(input: LocalStart = plan) {
     },
     get options() {
       return options;
+    },
+    get responseChat() {
+      return responseChat;
+    },
+    get renderedChat() {
+      return renderedChat;
     },
   };
 }
@@ -890,7 +906,7 @@ test('Local ownership needs the same prediction terminal after cancellation or c
       'malformed content',
       'invalid token count',
       'excess tokens',
-      'prompt mismatch',
+      'prompt exceeds budget',
     ]) {
       const f = fixture();
       const run = startLocalPrediction(
@@ -923,7 +939,11 @@ test('Local ownership needs the same prediction terminal after cancellation or c
         value.stats = { ...value.stats, ...{ predictedTokensCount: 1.5 } };
       if (row === 'excess tokens')
         value.stats = { ...value.stats, ...{ predictedTokensCount: maximumOutputTokens + 1 } };
-      if (row === 'prompt mismatch') value.stats = { ...value.stats, ...{ promptTokensCount: 4 } };
+      if (row === 'prompt exceeds budget')
+        value.stats = {
+          ...value.stats,
+          ...{ promptTokensCount: 8192 - maximumOutputTokens + 1 },
+        };
       value.content = value.nonReasoningContent;
       f.resolve(value);
       const outcome = await run.result;
@@ -931,7 +951,7 @@ test('Local ownership needs the same prediction terminal after cancellation or c
         'malformed content',
         'invalid token count',
         'excess tokens',
-        'prompt mismatch',
+        'prompt exceeds budget',
       ].includes(row);
       assert.equal(outcome.kind, unproven ? 'unknown' : 'failed', row);
       assert(outcome.kind === 'unknown' || outcome.kind === 'failed');
@@ -1041,8 +1061,12 @@ test('Local ownership needs the same prediction terminal after cancellation or c
     assert.equal(markers, 1, row);
     assert.equal(f.prompt, 'rendered chat');
     assert.equal(f.options?.maxTokens, 2048);
+    assert.equal(f.options?.reasoningBudget, 1024);
+    assert.equal(f.options?.temperature, 0.1);
+    assert.equal(f.options?.enableThinking, true);
     assert.equal(f.options?.contextOverflowPolicy, 'stopAtLimit');
     assert.equal(f.options?.draftModel, '');
+    assert.deepEqual(f.responseChat, f.renderedChat);
     if (row === 'stop' || row === 'completion race' || row === 'cancel timeout') {
       run.stop();
       run.stop();
@@ -1111,7 +1135,7 @@ test('Local ownership needs the same prediction terminal after cancellation or c
     if (outcome.kind === 'completed') {
       if (input === plan) completed = outcome;
       assert.equal(outcome.proposal.content, ending?.[2] ?? 'export const n = 2;\n', row);
-      assert.equal(outcome.proof.promptTokens, null);
+      assert.equal(outcome.proof.promptTokens, 3);
       assert.equal(outcome.proof.predictedTokens, null);
     }
   }
@@ -1126,6 +1150,30 @@ test('Local ownership needs the same prediction terminal after cancellation or c
     status: string;
     change: (value: ReturnType<typeof terminal>) => void;
   }> = [
+    {
+      check: 'temperature',
+      status: 'mismatch',
+      change: (value) => {
+        setField(value.predictionConfig, 'llm.prediction.temperature', 0.8);
+      },
+    },
+    {
+      check: 'reasoning-enabled',
+      status: 'mismatch',
+      change: (value) => {
+        setField(value.predictionConfig, 'llm.prediction.reasoning.enableThinking', false);
+      },
+    },
+    {
+      check: 'reasoning-budget',
+      status: 'mismatch',
+      change: (value) => {
+        setField(value.predictionConfig, 'llm.prediction.reasoning.budgetTokens', {
+          checked: true,
+          value: 2048,
+        });
+      },
+    },
     {
       check: 'structured-output',
       status: 'missing',
