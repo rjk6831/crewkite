@@ -1408,8 +1408,8 @@ export class Controller {
     });
   }
 
-  private openAiUsageBlocker(routeId: string) {
-    const route = this.store.get<Route>('route', routeId);
+  private openAiUsageBlocker(routeId: string | Route) {
+    const route = typeof routeId === 'string' ? this.store.get<Route>('route', routeId) : routeId;
     if (route?.family !== 'openai' || route.fake) return;
     try {
       const state = this.openAiUsageState();
@@ -12215,6 +12215,8 @@ export class Controller {
       };
     }
     const { plan } = prepared;
+    const openAiBlocker = this.openAiUsageBlocker(route);
+    if (openAiBlocker) return { outcome: 'blocked', reason: openAiBlocker };
     if (!this.store.get<Route>('route', route.id)) {
       const routeArtifact = this.nativeArtifact({
         profileId: plan.reviewer.profileId,

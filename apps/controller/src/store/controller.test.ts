@@ -4662,13 +4662,16 @@ test('an appointed native proposal is retained and applied once after every phas
 
   const evaluate = async (scenario: string) => {
     const repositoryScenario = scenario.startsWith('repository-');
+    const anthropicScenario =
+      scenario === 'anthropic-checked' || scenario === 'anthropic-review-metadata-owned';
+    const googleScenario = scenario === 'google-checked';
     const passedReview =
       scenario === 'checked' ||
       scenario === 'project-checked' ||
       scenario === 'repository-checked' ||
       scenario === 'repository-recovered' ||
-      scenario === 'anthropic-checked' ||
-      scenario === 'google-checked';
+      anthropicScenario ||
+      googleScenario;
     console.error(`Native fixture row: evaluation/${scenario}`);
     const inventoryEntered = Promise.withResolvers<void>();
     const inventoryRelease = Promise.withResolvers<void>();
@@ -4679,8 +4682,10 @@ test('an appointed native proposal is retained and applied once after every phas
       : undefined;
     const context = await nativeSetup(
       t,
-      scenario === 'anthropic-checked' || scenario === 'google-checked'
-        ? scenario
+      anthropicScenario || googleScenario
+        ? anthropicScenario
+          ? 'anthropic-checked'
+          : 'google-checked'
         : repositoryScenario
           ? 'repository-checked'
           : scenario === 'failed'
@@ -4781,7 +4786,7 @@ test('an appointed native proposal is retained and applied once after every phas
           {
             taskId: task.id,
             profileId: context.fixtureProfile.facts.id,
-            ...(scenario === 'anthropic-checked' || scenario === 'google-checked'
+            ...(anthropicScenario || googleScenario
               ? {
                   billingAttestation: {
                     source: 'user-attested',
@@ -4790,7 +4795,7 @@ test('an appointed native proposal is retained and applied once after every phas
                   },
                 }
               : {}),
-            ...(scenario === 'google-checked' ? { permissionMode: 'request-review' } : {}),
+            ...(googleScenario ? { permissionMode: 'request-review' } : {}),
             ...(repositoryScenario ? {} : { targetPath: 'net.mjs' }),
             policy: appointment.policy,
             consent: 'explicit',
@@ -5017,12 +5022,12 @@ test('an appointed native proposal is retained and applied once after every phas
         assert.deepEqual(controller.snapshot(), before);
       }
     }
-    if (scenario === 'anthropic-checked' || scenario === 'google-checked') {
+    if (anthropicScenario || googleScenario) {
       assert.deepEqual(
         controller.store
           .nativeProcesses(controller.snapshot().attempts[0].id)
           .map((phase) => phase.phase),
-        [scenario === 'google-checked' ? 'google-config' : 'auth-status', 'native-task'],
+        [googleScenario ? 'google-config' : 'auth-status', 'native-task'],
       );
       assert.equal(
         (
@@ -5232,10 +5237,7 @@ test('an appointed native proposal is retained and applied once after every phas
     const snapshot = controller.snapshot();
     assert.equal(snapshot.attempts.length, 2);
     assert.equal(context.submissions(), 1);
-    assert.equal(
-      context.children.length,
-      scenario === 'anthropic-checked' || scenario === 'google-checked' ? 2 : 3,
-    );
+    assert.equal(context.children.length, anthropicScenario || googleScenario ? 2 : 3);
     assert.equal(snapshot.reviewJobs?.length, 0);
     assert.equal(snapshot.evidence.length, scenario.endsWith('intent') ? 0 : 1);
     if (!scenario.endsWith('intent')) {
@@ -5445,6 +5447,40 @@ test('an appointed native proposal is retained and applied once after every phas
         if (scenario === 'review-close') closing = Promise.resolve(controller.close());
       });
       const reviewStart = command('StartCandidateReview', reviewPayload, revision());
+      if (scenario === 'anthropic-review-metadata-owned') {
+        const privateApi = controller as unknown as {
+          saveOpenAiUsage: (value: {
+            id: string;
+            state: 'owned';
+            attemptedAt: string;
+            profileHash: string;
+            groups: number[];
+          }) => void;
+        };
+        controller.store.transaction(() =>
+          privateApi.saveOpenAiUsage({
+            id: context.id('cmd'),
+            state: 'owned',
+            attemptedAt: clock.now(),
+            profileHash: '0'.repeat(64),
+            groups: [123],
+          }),
+        );
+        const routeReceipt = 'native-review-profile-route:openai-file-v1:existing-credits';
+        assert.equal(controller.store.receipt(routeReceipt), undefined);
+        const before = controller.snapshot();
+        const intents = controller.store.intents().length;
+        const refused = await controller.execute(reviewStart, 'local-owner');
+        assert.equal(refused.outcome, 'blocked');
+        assert.equal(refused.reason, 'openai-metadata-ownership-pending');
+        assert(controller.store.receipt(reviewStart.key), 'the expected refusal is durable');
+        assert.deepEqual(controller.snapshot(), before);
+        assert.equal(controller.store.intents().length, intents);
+        assert.equal(controller.snapshot().reviewJobs?.length, 0);
+        assert.equal(controller.store.receipt(routeReceipt), undefined);
+        offReview();
+        return;
+      }
       assert.equal((await controller.execute(reviewStart, 'local-owner')).outcome, 'applied');
       await context.wait(`${scenario} review completion`, reviewed.promise);
       if (reviewReplay) await context.wait(`${scenario} review replay`, reviewReplay);
@@ -5513,10 +5549,7 @@ test('an appointed native proposal is retained and applied once after every phas
       assert.equal(job.preparationId, artifact.id);
       assert.equal(job.independence, 'process-only');
       assert.equal(context.submissions(), 2, scenario);
-      assert.equal(
-        context.children.length,
-        scenario === 'anthropic-checked' || scenario === 'google-checked' ? 5 : 6,
-      );
+      assert.equal(context.children.length, anthropicScenario || googleScenario ? 5 : 6);
       assert.equal(result.attempts.length, 3);
       assert.equal(result.candidates.length, 1);
       assert.deepEqual(result.runs.at(-1), originalRun);
@@ -5642,6 +5675,7 @@ test('an appointed native proposal is retained and applied once after every phas
       'expired-intent',
       'revoked-intent',
       'review-blocked',
+      'anthropic-review-metadata-owned',
       'review-stop',
       'review-close',
       'review-journal-read',
