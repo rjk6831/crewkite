@@ -23,6 +23,7 @@ import {
 const MAX_FRAME_BYTES = 32768;
 const PROMPT_MS = 60000;
 const CLEANUP_MS = 5000;
+const KILL_MS = 2500;
 const helperSchema = z.strictObject({
   root: z.string().min(1).max(4096).refine(isAbsolute),
   sha256: HashSchema,
@@ -314,6 +315,23 @@ export function startLocalSecretInput(
       (options.signal ?? ((group, name) => process.kill(-group, name)))(child.group, name);
     } catch {}
   };
+  let killedAt: number | undefined;
+  const settleAtCutoff = () => {
+    if (child && !closed && absent()) timers.push(schedule(() => settle(null, null), 0));
+    else settle(null, null);
+  };
+  const cutoff = () => {
+    if (settled) return;
+    if (absent()) return settleAtCutoff();
+    setImmediate(() => {
+      if (settled) return;
+      if (absent()) return settleAtCutoff();
+      const late = killedAt === undefined ? 0 : killedAt + CLEANUP_MS - KILL_MS - now();
+      const wait = Math.min(late, remaining());
+      if (wait > 0) timers.push(schedule(settleAtCutoff, wait));
+      else settle(null, null);
+    });
+  };
   const cleanup = () => {
     if (cleaning || settled) return;
     cleaning = true;
@@ -321,8 +339,16 @@ export function startLocalSecretInput(
       child?.input?.end();
     } catch {}
     timers.push(schedule(() => signal('SIGTERM'), Math.min(1000, remaining())));
-    timers.push(schedule(() => signal('SIGKILL'), Math.min(2500, remaining())));
-    timers.push(schedule(() => settle(null, null), Math.min(CLEANUP_MS, remaining())));
+    timers.push(
+      schedule(
+        () => {
+          killedAt = now();
+          signal('SIGKILL');
+        },
+        Math.min(KILL_MS, remaining()),
+      ),
+    );
+    timers.push(schedule(cutoff, Math.min(CLEANUP_MS, remaining())));
   };
   const refuse = (reason: NonNullable<typeof failure>) => {
     failure ??= reason;

@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { join, resolve } from 'node:path';
+import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import { hashCanonical, sealHandoff } from '@crewkite/contracts/hash';
 import { spawnCheckChild as spawn } from '../../host/check-ownership.ts';
@@ -690,6 +692,68 @@ else {
           assert(!JSON.stringify(outcome).includes('private'));
         }
       }
+    }
+    {
+      let tick = 0,
+        absent = false;
+      const timers: Array<{ delay: number; work: () => void; active: boolean }> = [];
+      const signals: NodeJS.Signals[] = [];
+      const child = new EventEmitter() as ReturnType<typeof spawn>;
+      Object.assign(child, {
+        pid: 12345,
+        stdout: new PassThrough(),
+        stderr: new PassThrough(),
+        unref: () => child,
+      });
+      const handle = startGoogleWriter({
+        client,
+        environment,
+        admission,
+        attemptId,
+        repositoryRoot: resolve('.'),
+        directory,
+        temporaryDirectory: runtime,
+        file,
+        task: 'late shutdown',
+        timeoutMs: 3000,
+        deadline: 3000,
+        now: () => tick,
+        onSubmitted: () => {},
+        spawn: () => child,
+        groupAbsent: () => absent,
+        signalGroup: (_, signal) => {
+          signals.push(signal);
+          if (signal === 'SIGKILL') absent = true;
+        },
+        schedule: (work, delay) => {
+          const timer = { delay, work, active: true };
+          timers.push(timer);
+          return () => {
+            timer.active = false;
+          };
+        },
+      });
+      handle.stop();
+      tick = 2000;
+      const fire = (delay: number) => {
+        const timer = timers.find((value) => value.active && value.delay === delay);
+        assert(timer, `pending ${delay}ms timer`);
+        timer.active = false;
+        timer.work();
+      };
+      fire(1500);
+      fire(250);
+      await new Promise((resolve) => setImmediate(resolve));
+      child.emit('close', null, 'SIGKILL');
+      assert.deepEqual(await handle.result, {
+        reason: 'cancelled',
+        quiescent: true,
+        exitCode: null,
+        signal: 'SIGKILL',
+        metadata: null,
+        diagnostic: null,
+      });
+      assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
     }
     for (const content of ['text\0tail', '\ud800'])
       await assert.rejects(

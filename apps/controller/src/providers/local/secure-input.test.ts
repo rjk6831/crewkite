@@ -62,7 +62,7 @@ function frame(value: unknown) {
   header.writeUInt32BE(bytes.length);
   return Buffer.concat([header, bytes]);
 }
-function fixture() {
+function fixture(reapOnKill = false) {
   const input = new PassThrough();
   const output = new PassThrough();
   const inputBytes: Buffer[] = [];
@@ -115,6 +115,7 @@ function fixture() {
     signal: (group: number, value: NodeJS.Signals) => {
       assert.equal(group, 12345);
       signals.push(value);
+      if (reapOnKill && value === 'SIGKILL') absent = true;
     },
   };
   return {
@@ -141,6 +142,12 @@ function fixture() {
     },
     jump: (milliseconds: number) => {
       clock += milliseconds;
+    },
+    fire: (delay: number) => {
+      const timer = timers.find((value) => value.active && value.at === delay);
+      assert(timer, `pending ${delay}ms timer`);
+      timer.active = false;
+      timer.work();
     },
     advance: (milliseconds: number) => {
       clock += milliseconds;
@@ -571,7 +578,11 @@ test('Local secret input returns one current private result after helper cleanup
         boundary === 'signal' ? 'SIGTERM' : null,
         boundary !== 'streams-open',
       );
-    if (boundary === 'group-present') child.advance(5000);
+    if (boundary === 'group-present') {
+      child.advance(5000);
+      await new Promise((resolve) => setImmediate(resolve));
+      child.advance(2500);
+    }
     assert.equal((await current.result).kind, 'failed');
   }
   for (const boundary of ['wrong-binding', 'revoke-ready'] as const) {
@@ -594,6 +605,19 @@ test('Local secret input returns one current private result after helper cleanup
   missing.advance(65000);
   assert.equal((await waiting.result).kind, 'failed');
   assert(missing.signals.includes('SIGKILL'));
+  const lateKill = fixture(true);
+  const late = startLocalSecretInput(prompt, descriptor, lateKill.options);
+  lateKill.output.write(frame(submitted));
+  await lateKill.close();
+  lateKill.jump(5000);
+  lateKill.fire(5000);
+  lateKill.fire(2500);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(await late.result, {
+    kind: 'failed',
+    reason: 'ownership',
+    clientQuiescent: true,
+  });
   const failedSpawn = fixture();
   failedSpawn.child.group = 0;
   const launching = startLocalSecretInput(prompt, descriptor, failedSpawn.options);

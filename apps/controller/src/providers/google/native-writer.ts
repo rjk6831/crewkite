@@ -434,6 +434,8 @@ type NativeControls = {
   now?: () => number;
   deadline?: number;
   schedule?: Schedule;
+  groupAbsent?: typeof groupAbsent;
+  signalGroup?: (group: number, signal: NodeJS.Signals) => void;
   spawn?: (
     executable: string,
     args: string[],
@@ -508,7 +510,7 @@ function nativeClock(options: NativeLaunch, maximum: number) {
     if (remaining() <= CLEANUP_MS) throw new GoogleWriterError('deadline');
   };
   check();
-  return { remaining, check };
+  return { remaining, check, now };
 }
 
 function nativeLaunch(options: NativeLaunch, logFile: string) {
@@ -634,11 +636,11 @@ function ownedNativeCommand(
     stderrTail = '';
   const timers: Array<() => void> = [];
   const complete = Promise.withResolvers<NativeExit>();
-  const absent = () => group > 0 && groupAbsent(group);
+  const absent = () => group > 0 && (options.groupAbsent ?? groupAbsent)(group);
   const send = (value: NodeJS.Signals) => {
     if (group > 0 && !absent())
       try {
-        process.kill(-group, value);
+        (options.signalGroup ?? ((group, signal) => process.kill(-group, signal)))(group, value);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ESRCH') reason ??= 'not-quiescent';
       }
@@ -669,14 +671,33 @@ function ownedNativeCommand(
   };
   const later = (work: () => void, delay: number) =>
     timers.push(schedule(work, Math.max(0, Math.min(delay, clock.remaining()))));
+  let killedAt: number | undefined;
+  const finishAtCutoff = () => {
+    if (!closed && absent()) later(finish, 0);
+    else finish();
+  };
+  const cutoff = () => {
+    if (finished) return;
+    if (absent()) return finishAtCutoff();
+    setImmediate(() => {
+      if (finished) return;
+      if (absent()) return finishAtCutoff();
+      const late = killedAt === undefined ? 0 : killedAt + CLEANUP_MS - 250 - clock.now();
+      if (late > 0) later(finishAtCutoff, late);
+      else finish();
+    });
+  };
   const stop = (failure: Reason | null) => {
     reason ??= failure;
     if (stopping) return;
     stopping = true;
     if (closed && absent()) return finish();
     send('SIGTERM');
-    later(() => send('SIGKILL'), 250);
-    later(finish, Math.min(CLEANUP_MS, clock.remaining()));
+    later(() => {
+      killedAt = clock.now();
+      send('SIGKILL');
+    }, 250);
+    later(cutoff, Math.min(CLEANUP_MS, clock.remaining()));
   };
   const abort = () => stop('cancelled');
   child.stdout?.on('data', (chunk: Buffer) => {

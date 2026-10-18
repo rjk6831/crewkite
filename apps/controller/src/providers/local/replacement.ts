@@ -48,6 +48,7 @@ function synchronous(work: () => unknown) {
 }
 const same = (left: unknown, right: unknown) => JSON.stringify(left) === JSON.stringify(right);
 const KILL_MS = 1000;
+const CUTOFF_MS = CLEANUP_MS;
 
 /** This owner can close its SDK client. Only a bound runtime terminal releases generation ownership. */
 export function startLocalReplacement(value: LocalStart, directory: string, options: TaskOptions) {
@@ -223,7 +224,7 @@ function startLocalClient(
     setImmediate(() => {
       if (settled) return;
       if (absent()) return settleAtCutoff();
-      const late = killedAt === undefined ? 0 : killedAt + CLEANUP_MS - KILL_MS - now();
+      const late = killedAt === undefined ? 0 : killedAt + CUTOFF_MS - KILL_MS - now();
       const wait = Math.min(late, remaining());
       if (wait > 0) timers.push(schedule(settleAtCutoff, wait));
       else settle();
@@ -247,7 +248,7 @@ function startLocalClient(
         Math.min(KILL_MS, remaining()),
       ),
     );
-    timers.push(schedule(cutoff, Math.min(CLEANUP_MS, remaining())));
+    timers.push(schedule(cutoff, Math.min(CUTOFF_MS, remaining())));
   };
   const stop = (reason: 'stopped' | 'ownership' | 'deadline' = 'stopped') => {
     if (settled || stopping) return;
