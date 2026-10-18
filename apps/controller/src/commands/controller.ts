@@ -7054,6 +7054,19 @@ export class Controller {
     return binding;
   }
 
+  private quotaRetryPreview(run: Run): z.infer<typeof NativeRunSchema>['quotaRetry'] {
+    try {
+      const { reset } = this.quotaRetryEvidence(run, false);
+      return {
+        available: reset <= Date.parse(this.now()),
+        mode: run.policy.policy.authority === 'guided' ? 'manual' : 'automatic',
+        resetsAt: new Date(reset).toISOString(),
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
   private armQuotaRetries() {
     const runIds = new Set(this.store.intents().map((intent) => intent.run_id));
     for (const runId of runIds) {
@@ -7227,6 +7240,7 @@ export class Controller {
         const appointment = NativeAppointmentSchema.parse(plan.appointment);
         const publicScope = NativePublicScopeSchema.safeParse(plan.public).data;
         const handoff = this.nativeHandoffPreview(run);
+        const quotaRetry = this.quotaRetryPreview(run);
         return [
           NativeRunSchema.parse({
             runId: run.id,
@@ -7241,6 +7255,7 @@ export class Controller {
                 : 'retain-only',
             expiresAt: appointment.expiresAt,
             maximumTaskMs: appointment.maximumTaskMs,
+            ...(quotaRetry ? { quotaRetry } : {}),
             ...(handoff ? { handoff } : {}),
             ...(appointment.billingAttestation
               ? { billingAttestation: appointment.billingAttestation }

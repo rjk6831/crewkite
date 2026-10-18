@@ -658,6 +658,16 @@ export function App() {
     candidate?.artifactId,
   ].join(':');
   const nativeRun = snapshot?.nativeRuns.find((value) => value.runId === task?.runId);
+  const quotaRetry = nativeRun?.quotaRetry;
+  const [quotaClock, setQuotaClock] = useState(Date.now);
+  useEffect(() => {
+    if (quotaRetry?.mode !== 'manual' || quotaRetry.available) return;
+    setQuotaClock(Date.now());
+    const timer = window.setInterval(() => setQuotaClock(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [quotaRetry]);
+  const quotaRetryReady =
+    !!quotaRetry && (quotaRetry.available || Date.parse(quotaRetry.resetsAt) <= quotaClock);
   useEffect(() => {
     if (!executionPolicySeed || workspace.pending || workspace.retryAvailable) return;
     if (task?.id === executionPolicySeed.taskId && nativeRun?.stage === 'prepared') {
@@ -802,7 +812,7 @@ export function App() {
           (nativeRun
             ? nativeRun.stage === 'prepared' ||
               !!nativeRun.handoff?.pending ||
-              ['running', 'checking', 'unknown'].includes(task.state)
+              ['running', 'checking', 'unknown', 'interrupted'].includes(task.state)
             : !['draft', 'ready', 'accepted', 'failed'].includes(task.state))));
   return (
     <div className="app-shell">
@@ -1177,14 +1187,22 @@ export function App() {
                           )}
                         {task.runId &&
                           !combined &&
-                          !nativeRun &&
+                          (!nativeRun || nativeRun.quotaRetry?.mode === 'manual') &&
                           currentConversation &&
                           currentConversation.purpose !== 'conversation' &&
                           ['interrupted', 'stopped'].includes(task.state) && (
                             <button
                               type="button"
                               className="button primary"
-                              disabled={workspace.pending}
+                              disabled={
+                                workspace.pending ||
+                                (nativeRun?.quotaRetry?.mode === 'manual' && !quotaRetryReady)
+                              }
+                              title={
+                                nativeRun?.quotaRetry?.mode === 'manual' && !quotaRetryReady
+                                  ? `Resume after ${new Date(nativeRun.quotaRetry.resetsAt).toLocaleString()}`
+                                  : undefined
+                              }
                               onClick={() =>
                                 void workspace
                                   .command({

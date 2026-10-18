@@ -6629,6 +6629,13 @@ test('confirmed provider resets resume under the saved authority mode', async (t
       'applied',
     );
     await context.wait(`${authority} quota denial retained`, first);
+    const retry = controller
+      .snapshot()
+      .nativeRuns.find((value) => value.runId === run.id)?.quotaRetry;
+    assert.equal(retry?.available, true);
+    assert.equal(retry?.mode, authority === 'guided' ? 'manual' : 'automatic');
+    assert.equal(new Date(retry?.resetsAt as string).toISOString(), retry?.resetsAt);
+    assert(Date.parse(retry?.resetsAt as string) <= Date.parse(context.clock.now()));
     if (automatic) await context.wait('automatic quota retry retained', automatic);
     assert.equal(context.submissions(), authority === 'guided' ? 1 : 2);
     controller = await context.restart();
@@ -6702,6 +6709,14 @@ test('future provider resets rearm after restart and obey Stop', async (t) => {
     'applied',
   );
   await context.wait('future quota denial', denied.promise);
+  assert.deepEqual(
+    controller.snapshot().nativeRuns.find((value) => value.runId === run.id)?.quotaRetry,
+    {
+      available: false,
+      mode: 'automatic',
+      resetsAt: new Date(Date.parse(context.clock.now()) + 10_800_000).toISOString(),
+    },
+  );
   assert.equal(context.submissions(), 1);
   assert.equal(scheduled.at(-1)?.milliseconds, 10_800_000);
   context.clock.advance(7_200_000);

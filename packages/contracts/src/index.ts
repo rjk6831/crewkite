@@ -637,6 +637,13 @@ export const NativeRunSchema = z
     stage: z.enum(['prepared', 'retain-only']),
     expiresAt: TimestampSchema.optional(),
     maximumTaskMs: z.number().int().min(2001).max(600000).optional(),
+    quotaRetry: z
+      .strictObject({
+        available: z.boolean(),
+        mode: z.enum(['manual', 'automatic']),
+        resetsAt: TimestampSchema,
+      })
+      .optional(),
     handoff: NativeHandoffPreviewSchema.optional(),
     repository: NativeRepositoryScopeSchema.optional(),
     execution: NativeRepositoryExecutionSchema.optional(),
@@ -688,6 +695,14 @@ export const NativeRunSchema = z
           !run.handoff
         : !run.localModel,
     'A Local file run needs its model binding and target without cloud account fields.',
+  )
+  .refine(
+    (run) =>
+      !run.quotaRetry ||
+      (['anthropic-file-v1', 'anthropic-file-compact-v1'].includes(run.profileId) &&
+        run.stage === 'retain-only' &&
+        !!run.target),
+    'Quota retry is available only for retained Anthropic file work.',
   );
 
 export const FamilySchema = z.enum(['openai', 'anthropic', 'google', 'local']);

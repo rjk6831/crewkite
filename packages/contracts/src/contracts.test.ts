@@ -1967,6 +1967,17 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     stage: 'retain-only',
   };
   assert.deepEqual(NativeRunSchema.parse(historicalRun), historicalRun);
+  assert.equal(
+    NativeRunSchema.safeParse({
+      ...historicalRun,
+      quotaRetry: {
+        available: false,
+        mode: 'manual',
+        resetsAt: '2026-10-19T01:00:00.000Z',
+      },
+    }).success,
+    false,
+  );
   const acpAttestation = { ...attestation, quotaAccountConfirmed: true };
   const acpRun = {
     ...historicalRun,
