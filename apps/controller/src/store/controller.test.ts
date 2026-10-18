@@ -6509,14 +6509,14 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
     }
     let startCommand: ReturnType<typeof command> | undefined;
     if (publicRun) {
-      // Sixteen run minutes keep six for evaluation and give a repository writer ten.
+      // Twenty-one run minutes keep eleven for evaluation and give a repository writer ten.
       const policy = repository
         ? {
             ...appointment.policy,
-            limits: { ...appointment.policy.limits, minutes: 16 },
+            limits: { ...appointment.policy.limits, minutes: 21 },
             unknownUsage: {
               rule: 'fixed-allowance' as const,
-              allowance: { launches: 1, minutes: 16 },
+              allowance: { launches: 1, minutes: 21 },
             },
           }
         : appointment.policy;
