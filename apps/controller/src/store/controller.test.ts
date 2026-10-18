@@ -46,7 +46,7 @@ import {
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
 import type { createDemoFixtures } from '@crewkite/testkit';
-import { writeChallengeSolution } from '@crewkite/testkit/repository';
+import { syntheticCheckDefinition, writeChallengeSolution } from '@crewkite/testkit/repository';
 import { fakeWorkerPath } from '@crewkite/testkit/worker';
 import { ArtifactFiles } from '../artifacts/index.ts';
 import {
@@ -2964,6 +2964,14 @@ if(value==='submit')finish({type:'terminal',terminal:{kind:'completed',binding:p
             assert.equal(
               context.controller.store.nativeProcesses(value.binding.attemptId)[0]?.state,
               'owned',
+            );
+            // The writer reads the committed check that imports its target, and nothing else.
+            assert.deepEqual(
+              value.tests.map((file: { path: string; content: string }) => [
+                file.path,
+                createHash('sha256').update(file.content).digest('hex'),
+              ]),
+              [[syntheticCheckDefinition.path, syntheticCheckDefinition.hash]],
             );
             input = `${JSON.stringify({
               ...value,

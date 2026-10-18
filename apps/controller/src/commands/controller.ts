@@ -243,6 +243,7 @@ import {
   type LocalStart,
   TerminalSchema as LocalTerminalSchema,
   localPlan,
+  localTests,
 } from '../providers/local/profile.ts';
 import { startLocalDiscovery, startLocalReplacement } from '../providers/local/replacement.ts';
 import {
@@ -8050,6 +8051,7 @@ export class Controller {
       this.localStartInput(
         plan,
         original.content.toString('utf8'),
+        files,
         plan.localModel.authMode === 'none' ? { authMode: 'none' } : { token: 'unsubmitted' },
         300000,
       );
@@ -8090,6 +8092,7 @@ export class Controller {
   private localStartInput(
     plan: LocalPrepared,
     original: string,
+    files: readonly FileContent[],
     credentials: { token: string } | { authMode: 'none' },
     timeoutMs: number,
   ): LocalStart {
@@ -8107,6 +8110,7 @@ export class Controller {
       ...credentials,
       original,
       task: plan.context,
+      tests: localTests(plan.target.path, files),
       maximumOutputTokens: plan.profile.maximumOutputTokens,
       timeoutMs,
     });
@@ -8402,6 +8406,7 @@ export class Controller {
         const input = this.localStartInput(
           plan,
           original.content.toString('utf8'),
+          sourceFiles,
           token === null ? { authMode: 'none' } : { token: token.toString('utf8') },
           Math.floor(
             Math.min(

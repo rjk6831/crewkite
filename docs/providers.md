@@ -233,6 +233,8 @@ File proposals request a closed JSON schema bound to the attempt, target path an
 
 This setting does not establish that thinking is disabled or that a model will finish within its allowance. The additional diagnostics contain SDK-classified reasoning and nonreasoning byte counts, with no reasoning text or token-split estimate. Older receipts remain readable.
 
+The Local writer also reads, read-only, up to two committed test files in the target's directory that import the target, sorted by path and within 12 KiB. They count toward the prompt's token check, and the proposal still replaces only the target.
+
 A completed Local file candidate can enter the shared fixed-check workflow. The controller validates its immutable Local preparation, matching completed terminal and model/connection binding, submission receipt, applied replacement, unchanged source and proven closure. Unknown ownership, changed sibling files or a candidate that differs from the completed replacement refuse evaluation. The Local origin creates no cloud writer appointment.
 
 The existing fixed recipes and check permissions remain unchanged. Passing checks permit a separately authorized bounded OpenAI review within the original task's remaining budget. Matching check and review evidence still needs current destination-specific approval before one new local branch is created. Completed evidence can be validated after restart without a current Local credential or connection, and receipt replay never resubmits the writer. The offline controller fixture covers this path through acceptance and tamper refusal; it supplies no live Local model or check-to-acceptance qualification.

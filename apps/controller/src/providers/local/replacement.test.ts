@@ -18,6 +18,7 @@ import {
   localDiscoveryPlan,
   localPlan,
   localStructuredOutput,
+  localTests,
   TerminalSchema,
 } from './profile.ts';
 import { startLocalDiscovery, startLocalReplacement } from './replacement.ts';
@@ -52,6 +53,9 @@ const plan: LocalStart = {
     outcome: 'Change n to 2.',
     criteria: ['Keep the export named n.'],
   },
+  tests: [
+    { path: 'net.test.mjs', content: "import { n } from './net.mjs';\nif (n !== 2) throw 1;\n" },
+  ],
   timeoutMs: 30_000,
 };
 const info = {
@@ -131,9 +135,17 @@ function fixture() {
           `\nTitle: ${title}\nOutcome: ${outcome}\nRequirements:\n1. ${criteria[0]}\n`,
         ),
       );
-      const fence = (edge: string) =>
-        `----- ${edge} FILE ${plan.binding.path} ${plan.binding.attemptId} -----`;
-      assert.ok(message.content.includes(`\n${fence('BEGIN')}\n${plan.original}${fence('END')}\n`));
+      const fence = (edge: string, kind: string, path: string) =>
+        `----- ${edge} ${kind} ${path} ${plan.binding.attemptId} -----`;
+      for (const [kind, path, content] of [
+        ['FILE', plan.binding.path, plan.original],
+        ...plan.tests.map((test) => ['READ-ONLY TEST', test.path, test.content]),
+      ])
+        assert.ok(
+          message.content.includes(
+            `\n${fence('BEGIN', kind, path)}\n${content}${fence('END', kind, path)}\n`,
+          ),
+        );
       return 'rendered chat';
     },
     tokenize: async () => [1, 2, 3],
@@ -231,6 +243,30 @@ test('Local generation binds its loopback authentication mode and loaded instanc
     { ...plan.task, criteria: ['x'.repeat(4096), 'x'.repeat(4096)] },
   ])
     assert.throws(() => localPlan({ ...plan, task }));
+  for (const tests of [
+    [...plan.tests, ...plan.tests, ...plan.tests],
+    [
+      { path: 'a.test.mjs', content: 'x'.repeat(6144) },
+      { path: 'b.test.mjs', content: 'x'.repeat(6145) },
+    ],
+  ])
+    assert.throws(() => localPlan({ ...plan, tests }));
+  const sibling = (path: string, content: string) => ({ path, content: Buffer.from(content) });
+  const imports = "import { run } from './run.ts';\n";
+  assert.deepEqual(
+    localTests('src/run.ts', [
+      sibling('src/z.test.ts', imports),
+      sibling('src/y.test.mjs', imports.replaceAll("'", '"')),
+      sibling('src/b.test.ts', imports),
+      sibling('src/a.test.ts', imports.padEnd(12_289)),
+      sibling('src/other.test.ts', "import { run } from './runner.ts';\n"),
+      sibling('src/run.ts', imports),
+      sibling('src/helper.ts', imports),
+      sibling('src/nested/run.test.ts', "import { run } from '../run.ts';\n"),
+      sibling('run.test.ts', "import { run } from './src/run.ts';\n"),
+    ]).map((test) => test.path),
+    ['src/b.test.ts', 'src/y.test.mjs'],
+  );
   const cases: Array<{
     name: string;
     change: (value: ReturnType<typeof fixture>) => void;

@@ -16,6 +16,8 @@ import { localConfiguredConnectionHash } from './connection.ts';
 export const CONTEXT_TOKENS = 8192;
 const LEGACY_OUTPUT_TOKENS = 2048;
 export const MAX_CONTENT_BYTES = 65_536;
+const MAX_TESTS = 2;
+const MAX_TEST_BYTES = 12_288;
 export const MAX_STREAM_BYTES = 131_072;
 export const DEADLINE_MS = 300_000;
 export const CLEANUP_MS = 5000;
@@ -70,6 +72,13 @@ const startShape = {
   original: text(MAX_CONTENT_BYTES),
   maximumOutputTokens: LocalNativeProfileSchema.shape.maximumOutputTokens.optional(),
   task: TaskSchema,
+  tests: z
+    .array(z.strictObject({ path: NativeTargetPathSchema, content: text(MAX_TEST_BYTES) }))
+    .max(MAX_TESTS)
+    .refine(
+      (tests) =>
+        tests.reduce((bytes, test) => bytes + Buffer.byteLength(test.content), 0) <= MAX_TEST_BYTES,
+    ),
   timeoutMs: z
     .number()
     .int()
@@ -274,6 +283,36 @@ export function localOutputTokens(plan: LocalStart) {
   return plan.maximumOutputTokens ?? LEGACY_OUTPUT_TOKENS;
 }
 
+// Committed tests beside the target that import it define the contract a candidate must pass.
+// Two files and 12 KiB keep the prompt inside its token budget next to a whole-file answer.
+export function localTests(target: string, files: readonly { path: string; content: Buffer }[]) {
+  const directory = target.slice(0, target.lastIndexOf('/') + 1);
+  const specifier = `./${target.slice(directory.length)}`;
+  const tests: { path: string; content: string }[] = [];
+  let bytes = 0;
+  for (const file of [...files].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))) {
+    if (tests.length === MAX_TESTS) break;
+    const name = file.path.slice(directory.length);
+    if (
+      !file.path.startsWith(directory) ||
+      name.includes('/') ||
+      !/\.test\.[cm]?[jt]s$/.test(name) ||
+      bytes + file.content.length > MAX_TEST_BYTES
+    )
+      continue;
+    const content = file.content.toString('utf8');
+    if (
+      Buffer.from(content).equals(file.content) &&
+      !content.includes('\0') &&
+      (content.includes(`'${specifier}'`) || content.includes(`"${specifier}"`))
+    ) {
+      tests.push({ path: file.path, content });
+      bytes += file.content.length;
+    }
+  }
+  return tests;
+}
+
 export function localChat(plan: LocalStart) {
   const { attemptId, path, baseHash } = plan.binding;
   // The attempt ID is minted after the source commit, so no source file can contain a fence line.
@@ -292,6 +331,15 @@ export function localChat(plan: LocalStart) {
         'Requirements:',
         ...plan.task.criteria.map((criterion, index) => `${index + 1}. ${criterion}`),
         '',
+        ...(plan.tests.length
+          ? [
+              'The new file must pass these committed tests. They are read-only. Do not return them.',
+              ...plan.tests.flatMap((test) => [
+                ...fenced('READ-ONLY TEST', test.path, test.content),
+                '',
+              ]),
+            ]
+          : []),
         'The original file is between the BEGIN FILE and END FILE lines.',
         ...fenced('FILE', path, plan.original),
         '',
