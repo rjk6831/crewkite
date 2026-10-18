@@ -271,6 +271,7 @@ export type ReplacementDiagnostic = Readonly<{
   envelope: Frame;
   method: (typeof methods)[number] | 'other' | null;
   methodHash: string | null;
+  itemTypeHash?: string | null;
   rpcCode: number | null;
   rpcField: (typeof rpcFields)[number] | null;
   field: (typeof fields)[number] | 'other' | null;

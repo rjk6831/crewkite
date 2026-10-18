@@ -150,6 +150,8 @@ export class RepositoryTranscript {
   private approvals = new Set<string>();
   private frame: ReplacementDiagnostic['envelope'] = 'none';
   private method: string | null = null;
+  private site: ReplacementDiagnostic['site'] = 'frame';
+  private itemTypeHash: string | null = null;
   private retries = 0;
   private readonly census = new NoticeCensus();
   private readonly onActivity: ActivityHook | undefined;
@@ -190,7 +192,7 @@ export class RepositoryTranscript {
   private refuse(cause: ReplacementDiagnostic['cause'] = 'correlation'): never {
     this.failure ??= Object.freeze({
       stage: this.step,
-      site: 'frame',
+      site: this.site,
       cause,
       envelope: this.frame,
       method: 'other',
@@ -198,6 +200,7 @@ export class RepositoryTranscript {
         this.method && this.method.length <= 200
           ? createHash('sha256').update(this.method).digest('hex')
           : null,
+      itemTypeHash: this.itemTypeHash,
       rpcCode: null,
       rpcField: null,
       field: null,
@@ -334,6 +337,10 @@ export class RepositoryTranscript {
   }
   push(bytes: Uint8Array) {
     this.check();
+    this.site = 'frame';
+    this.itemTypeHash = null;
+    this.method = null;
+    this.frame = 'none';
     this.received += bytes.length;
     if (this.received > MAX_OUTPUT) this.refuse('limit');
     this.pending = Buffer.concat([this.pending, bytes]);
@@ -354,6 +361,10 @@ export class RepositoryTranscript {
         }
         continue;
       }
+      this.site = 'frame';
+      this.itemTypeHash = null;
+      this.method = null;
+      this.frame = 'none';
       let decoded: unknown;
       try {
         decoded = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(line));
@@ -490,6 +501,7 @@ export class RepositoryTranscript {
       this.threadId = thread.id;
       return;
     }
+    this.site = 'identity';
     const identity = z.object({ threadId: id }).parse(raw);
     if (!this.threadId || identity.threadId !== this.threadId) this.refuse();
     if (method === 'thread/settings/updated') {
@@ -580,6 +592,14 @@ export class RepositoryTranscript {
       return;
     }
     if (method === 'item/started' || method === 'item/completed') {
+      this.site = 'item-event';
+      const rawType = z.object({ item: z.object({ type: z.unknown() }) }).safeParse(raw);
+      this.itemTypeHash =
+        rawType.success &&
+        typeof rawType.data.item.type === 'string' &&
+        rawType.data.item.type.length <= 200
+          ? createHash('sha256').update(rawType.data.item.type).digest('hex')
+          : null;
       const item = z.object({ item: z.object({ id, type: z.enum(itemKinds) }) }).parse(raw).item;
       if (method === 'item/started') {
         if (this.items.has(item.id) || this.items.size >= MAX_ITEMS) this.refuse('limit');

@@ -1730,6 +1730,80 @@ test('both task transcripts refuse every notice that carries authority', () => {
     }
 });
 
+test('repository item refusals identify the failing schema without retaining the item type', () => {
+  const directory = resolve('internal/replacement-fixture');
+  const scratch = resolve(directory, 'scratch');
+  const open = () => {
+    const reader = new RepositoryTranscript(repositoryTask(directory), {
+      now: () => 1,
+      timeoutMs: 300_000,
+      directory,
+    });
+    metadata(reader);
+    reader.push(
+      bytes({
+        id: 10,
+        result: {
+          ...threadResult(scratch),
+          approvalPolicy: 'never',
+          sandbox: { type: 'workspaceWrite', writableRoots: [scratch], networkAccess: false },
+        },
+      }),
+    );
+    reader.next();
+    reader.push(bytes({ id: 11, result: { turn: running } }));
+    reader.push(bytes({ method: 'turn/started', params: { threadId: 'thread-1', turn: running } }));
+    return reader;
+  };
+  const unknownType = 'private-item-type-canary';
+  const item = open();
+  assert.throws(() =>
+    item.push(
+      bytes({
+        method: 'item/started',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: { id: 'item-1', type: unknownType },
+          startedAtMs: 1,
+        },
+      }),
+    ),
+  );
+  assert.equal(item.diagnostic?.site, 'item-event');
+  assert.equal(item.diagnostic?.itemTypeHash, methodHash(unknownType));
+  assert(!JSON.stringify(item.diagnostic).includes(unknownType));
+
+  const identity = open();
+  assert.throws(() =>
+    identity.push(
+      bytes({
+        method: 'item/started',
+        params: { threadId: 1, turnId: 'turn-1', item: { id: 'item-1', type: 'reasoning' } },
+      }),
+    ),
+  );
+  assert.equal(identity.diagnostic?.site, 'identity');
+  assert.equal(identity.diagnostic?.itemTypeHash, null);
+
+  const nextFrame = open();
+  nextFrame.push(
+    bytes({
+      method: 'item/started',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { id: 'item-1', type: 'reasoning' },
+        startedAtMs: 1,
+      },
+    }),
+  );
+  assert.throws(() => nextFrame.push(Buffer.from('{invalid\n')));
+  assert.equal(nextFrame.diagnostic?.site, 'frame');
+  assert.equal(nextFrame.diagnostic?.methodHash, null);
+  assert.equal(nextFrame.diagnostic?.itemTypeHash, null);
+});
+
 test('transcripts pass rate-limit reads and updates to the usage hook without changing their outcome', () => {
   const directory = resolve('internal/replacement-fixture');
   const scratchPath = resolve(directory, 'scratch');
