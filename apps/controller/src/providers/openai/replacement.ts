@@ -13,15 +13,13 @@ import {
 import { verifyHandoff } from '@crewkite/contracts/hash';
 import { z } from 'zod';
 import { type DiscoveryMetadata, OpenAiDiscovery, type OpenAiUsageHook } from './discovery.ts';
-import {
-  MAX_TASK_LINE,
-  MAX_TASK_OUTPUT,
-  type NativeLaunch,
-  type NativeTranscript,
-  startNativeTask,
-} from './native-discovery.ts';
+import { type NativeLaunch, type NativeTranscript, startNativeTask } from './native-discovery.ts';
 
 const MAX_CONTENT = 65_536;
+// The client repeats submitted text when its user item starts and completes, and JSON escaping
+// can double each copy. A structured transcript holds two full echo lines and 1 MiB besides.
+const MAX_TASK_LINE = 1024 * 1024;
+const MAX_TASK_OUTPUT = 3 * MAX_TASK_LINE;
 const id = z.string().min(1).max(200);
 const utf8 = (value: string) =>
   value.isWellFormed() && !value.includes('\0') && Buffer.byteLength(value, 'utf8') <= MAX_CONTENT;
@@ -295,6 +293,7 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
   private metadata: DiscoveryMetadata | null = null;
   private pending: number[] = [];
   private bytes = 0;
+  readonly outputLimit = MAX_TASK_OUTPUT;
   private failed = false;
   private step: Stage = 'metadata';
   private site: Site = 'metadata';
