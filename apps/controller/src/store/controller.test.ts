@@ -6093,6 +6093,11 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
     );
     assert.equal(controller.store.receipt(`native-application:${attempt.id}`), undefined);
     assert.equal(controller.snapshot().tasks[0].state, 'interrupted');
+    if (scenario === 'overage')
+      assert.equal(
+        controller.snapshot().tasks[0].next,
+        'Native output was refused by protocol checks at rate-limit.isUsingOverage (unsupported). Inspect retained ownership and artifacts.',
+      );
     assert.deepEqual(inspectSource(task.projectId, context.source.directory), run.source);
     controller = await context.restart();
     assert.equal(controller.snapshot().attempts.length, 1);

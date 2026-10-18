@@ -592,6 +592,24 @@ type NativeOutcome = {
   diagnostic: unknown;
   ignoredNotifications?: Readonly<Record<string, number>>;
 };
+
+const nativeFailureNext = (outcome: NativeOutcome | null) => {
+  if (
+    outcome?.reason !== 'protocol' ||
+    !outcome.diagnostic ||
+    typeof outcome.diagnostic !== 'object'
+  )
+    return 'Native work is unverified. Inspect retained ownership and artifacts.';
+  const diagnostic = outcome.diagnostic as Record<string, unknown>;
+  const safe = (value: unknown) =>
+    typeof value === 'string' && /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(value) ? value : null;
+  const cause = safe(diagnostic.cause);
+  const site = safe(diagnostic.site);
+  const field = safe(diagnostic.field);
+  if (!cause || !site)
+    return 'Native work is unverified. Inspect retained ownership and artifacts.';
+  return `Native output was refused by protocol checks at ${site}${field ? `.${field}` : ''} (${cause}). Inspect retained ownership and artifacts.`;
+};
 type AcpSetupCommand = Extract<
   Command,
   {
@@ -13667,7 +13685,7 @@ export class Controller {
                   waitingReason: null,
                   next: applied
                     ? 'Native work is retained. Checks and review remain pending.'
-                    : 'Native work is unverified. Inspect retained ownership and artifacts.',
+                    : nativeFailureNext(outcome),
                 });
               });
               this.sealCandidate(attempt);
