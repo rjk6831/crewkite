@@ -967,11 +967,8 @@ test('the acp protocol consumes one complete live permission and never treats co
         // Read and search tools left open at a clean end let the turn finish.
         assert.equal(outcome.reason, null, JSON.stringify(outcome.diagnostic));
         assert.equal(outcome.metadata?.stopReason, 'end_turn');
-        assert.deepEqual(outcome.openTools, [
-          'fixture-open-read',
-          'fixture-open-search',
-          'fixture-open-execute',
-        ]);
+        assert.equal(outcome.openToolCount, 3);
+        assert.deepEqual(outcome.openToolKinds, ['read', 'search', 'execute']);
       } else if (scenario === 'pending-end') {
         // A permission still pending at the terminal response refuses the turn.
         assert.equal(outcome.reason, 'protocol');

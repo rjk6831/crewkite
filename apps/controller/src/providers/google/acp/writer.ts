@@ -504,6 +504,20 @@ function activityLocations(root: string, locations: Tool['locations']) {
       : [];
   });
 }
+const toolKinds = [
+  'read',
+  'edit',
+  'delete',
+  'move',
+  'search',
+  'execute',
+  'think',
+  'fetch',
+  'switch_mode',
+  'other',
+] as const;
+const toolKind = (kind: string | null | undefined) =>
+  toolKinds.find((known) => known === kind) ?? 'other';
 const fileChangingKinds = new Set(['edit', 'delete', 'move']);
 const trailingKinds = new Set<AcpDiagnostic['sessionUpdate']>([
   'usage_update',
@@ -653,7 +667,8 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
   let settled = false;
   let refusal: 'permission' | null = null;
   let trailingUpdates = 0;
-  let openTools: string[] = [];
+  let openToolCount = 0;
+  let openToolKinds: (typeof toolKinds)[number][] = [];
   const handle = startAcpProcess(
     { ...options, timeoutMs: options.timeoutMs ?? 300000 },
     async (connection, onStop, settle): Promise<AcpWriterCompletion> => {
@@ -985,8 +1000,9 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
           method: 'session/prompt',
           pendingToolCount: new Set([...pending.keys(), ...editing.map((v) => v.toolCallId)]).size,
         });
-      // The completion record has a 4 KiB bound, so it keeps at most eight IDs.
-      openTools = open.slice(0, 8).map((v) => v.toolCallId);
+      // Tool IDs are provider text. The completion record keeps a count and fixed kind names.
+      openToolCount = open.length;
+      openToolKinds = toolKinds.filter((kind) => open.some((v) => toolKind(v.kind) === kind));
       if (
         (cancelled && terminal.stopReason !== 'cancelled') ||
         (!cancelled && terminal.stopReason === 'cancelled')
@@ -1021,7 +1037,8 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
         refusal ??
         (outcome.metadata?.stopReason === 'cancelled' ? ('stopped' as const) : null),
       trailingUpdates,
-      openTools,
+      openToolCount,
+      openToolKinds,
     })),
     stop: () => {
       if (!settled) handle.stop();
