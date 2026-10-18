@@ -73,6 +73,7 @@ export function verificationCommand(
         argv: [
           preload,
           '--test',
+          '--test-concurrency=3',
           '--test-reporter=./apps/controller/src/evidence/reporter.ts',
           '--',
           ...definition.collection.map((file) => `./${file.path}`),
