@@ -2944,14 +2944,24 @@ function ScriptedLaunch({
       target: grant.action === 'export-patch' ? task.id : grant.target,
       usesRemaining: 0,
     })),
-    reserves: snapshot.routes
-      .filter(({ family }) => ['openai', 'anthropic'].includes(family))
-      .map((route) => ({
-        routeId: route.id,
-        windowId: 'weekly',
-        value: route.family === 'openai' ? 40 : 5,
-        unit: 'percent' as const,
-      })),
+    reserves: snapshot.routes.flatMap((route) => {
+      const weekly = snapshot.usage.find(
+        ({ observation }) =>
+          observation.routeId === route.id &&
+          observation.windowId === 'weekly' &&
+          observation.remaining?.unit === 'percent',
+      );
+      return ['openai', 'anthropic'].includes(route.family) && weekly
+        ? [
+            {
+              routeId: route.id,
+              windowId: 'weekly',
+              value: route.family === 'openai' ? 40 : 5,
+              unit: 'percent' as const,
+            },
+          ]
+        : [];
+    }),
   }));
   const [methods, setMethods] = useState<Method[]>(
     requiredReviewMethodIds('standard').map((id) => ({ id, cycles: 1, reviewerRole: 'reviewer' })),

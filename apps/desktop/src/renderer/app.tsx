@@ -2258,31 +2258,44 @@ function Changes({ task, workspace }: { task: Task; workspace: Workspace }) {
   const [readError, setReadError] = useState<string | null>(null);
   useEffect(() => {
     let active = true;
+    let retry: ReturnType<typeof setTimeout> | undefined;
     setLoading(true);
     setChanges(null);
     setSelected(null);
     setReadError(null);
-    void workspace
-      .command({ command: 'GetChanges', payload: { taskId: task.id } })
-      .then((result) => {
-        if (!active) return;
-        if (result.data?.kind === 'changes' && result.data.taskId === task.id) {
-          setChanges(result.data);
-          setSelected(result.data.files[0]?.path ?? null);
-        } else
-          setReadError(result.next ?? result.reason ?? 'The retained changes are unavailable.');
-      })
-      .catch((failure: unknown) => {
-        if (active)
+    const read = () => {
+      retry = undefined;
+      void workspace
+        .command({ command: 'GetChanges', payload: { taskId: task.id } })
+        .then((result) => {
+          if (!active) return;
+          if (result.data?.kind === 'changes' && result.data.taskId === task.id) {
+            setChanges(result.data);
+            setSelected(result.data.files[0]?.path ?? null);
+          } else
+            setReadError(result.next ?? result.reason ?? 'The retained changes are unavailable.');
+        })
+        .catch((failure: unknown) => {
+          if (!active) return;
+          if (
+            failure instanceof Error &&
+            failure.message === 'Wait for the pending desktop command.'
+          ) {
+            retry = setTimeout(read, 50);
+            return;
+          }
           setReadError(
             failure instanceof Error ? failure.message : 'The retained changes could not be read.',
           );
-      })
-      .finally(() => {
-        if (active) setLoading(false);
-      });
+        })
+        .finally(() => {
+          if (active && retry === undefined) setLoading(false);
+        });
+    };
+    read();
     return () => {
       active = false;
+      clearTimeout(retry);
     };
   }, [task.id, workspace.command]);
   if (loading)
