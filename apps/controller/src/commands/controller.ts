@@ -293,7 +293,7 @@ import { availableAllowance, deriveWindow } from '../usage/index.ts';
 import { chargedMinutes, remainingBudgets, remainingCombinedBudgets } from './budgets.ts';
 
 // A repository writer leaves this long for the verify check and review that follow it.
-const evaluationFloorMinutes = 6;
+const evaluationFloorMinutes = 11;
 // Owned cleanup escalates to SIGKILL within a second. A minute covers a slow host and matches the
 // whole-minute granularity of the minute ledger.
 const cleanupReserveMs = 60_000;
@@ -536,7 +536,7 @@ const CandidateEvaluationSchema = z
     creditPolicy: z.enum(['ordinary', 'existing-credits']),
     grants: z.array(GrantSchema).length(2),
     remaining: RemainingBudgetsSchema,
-    maximumCheckMinutes: z.union([z.literal(1), z.literal(5)]),
+    maximumCheckMinutes: z.union([z.literal(1), z.literal(10)]),
     verification: z
       .strictObject({ source: z.string().max(4096).refine(isAbsolute), inventory: ArtifactSchema })
       .optional(),
@@ -545,7 +545,7 @@ const CandidateEvaluationSchema = z
   })
   .refine((plan) =>
     plan.definition.recipeId === 'crewkite-verify-v1'
-      ? plan.maximumCheckMinutes === 5 &&
+      ? plan.maximumCheckMinutes === 10 &&
         !!plan.verification &&
         plan.verification.inventory.hash === plan.definition.inventory.hash &&
         plan.verification.inventory.bytes === plan.definition.inventory.bytes
@@ -8678,8 +8678,8 @@ export class Controller {
           },
           policy,
           expiresAt,
-          // A repository writer leaves the six minutes a verify check and review need, and
-          // never drops below five. Start requires those six minutes behind a writer longer than
+          // A repository writer leaves the eleven minutes a verify check and review need, and
+          // never drops below five. Start requires those eleven minutes behind a writer longer than
           // five minutes and lets a five-minute writer start with its own five. File profiles
           // stop at five minutes.
           maximumTaskMs: Math.min(
@@ -9634,7 +9634,7 @@ export class Controller {
     const remaining = this.remaining(run);
     if (
       remaining.attempts < 2 ||
-      remaining.minutes < (command.payload.checkRecipeId === 'crewkite-verify-v1' ? 6 : 2) ||
+      remaining.minutes < (command.payload.checkRecipeId === 'crewkite-verify-v1' ? 11 : 2) ||
       remaining.concurrency < 1
     )
       throw Error('The saved budget cannot cover one check and one review.');
@@ -9837,7 +9837,7 @@ export class Controller {
         grants,
         remaining,
         maximumCheckMinutes:
-          command.payload.checkRecipeId === 'crewkite-verify-v1' ? (5 as const) : (1 as const),
+          command.payload.checkRecipeId === 'crewkite-verify-v1' ? (10 as const) : (1 as const),
         ...(verification
           ? {
               verification: {

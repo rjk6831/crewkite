@@ -683,8 +683,8 @@ export function NativeEvaluation({
               ) : (
                 <p className="muted small">
                   Runs policy, lint, types, Node tests, the desktop build and the desktop journey.
-                  Staging, checks and cleanup share a five-minute limit. The original run needs six
-                  remaining minutes and two attempts, including the later review.
+                  Staging, checks and cleanup share a ten-minute limit. The original run needs
+                  eleven remaining minutes and two attempts, including the later review.
                 </p>
               )}
             </>
@@ -2185,7 +2185,7 @@ function NativeLaunch({
                     <p className="muted small">
                       Every writer spends the same original run budget. The overall attempt cap is
                       separate from each route's launch allowance. Two reserved minutes cover a
-                      standard check and review; full verification needs six remaining minutes.
+                      standard check and review; full verification needs eleven remaining minutes.
                     </p>
                     {!validHandoff && (
                       <p className="notice" role="status">
@@ -2632,7 +2632,7 @@ export function NativeHandoff({ task, snapshot, workspace, onClose }: LaunchProp
             Original limits: {run.policy.policy.limits.attempts} overall attempts and{' '}
             {run.policy.policy.limits.minutes} minutes. Every writer spends this same budget. This
             view cannot replenish it. The controller rechecks the remaining allowance; full
-            verification needs six remaining minutes.
+            verification needs eleven remaining minutes.
           </p>
           <p className="notice" role="status">
             {handoffReasons[pending?.start.reason ?? handoff.prepare.reason]}

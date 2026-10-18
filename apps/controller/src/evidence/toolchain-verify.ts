@@ -151,9 +151,9 @@ export class ToolchainVerification {
     if (
       !Number.isFinite(options.deadline) ||
       options.deadline <= options.now() ||
-      options.deadline - options.now() > 300000
+      options.deadline - options.now() > 600000
     )
-      throw Error('Verification needs one bounded five-minute deadline.');
+      throw Error('Verification needs one bounded ten-minute deadline.');
     this.options = options;
     this.result = Promise.resolve().then(() => this.run());
     this.exited = this.result.then((result) => ({

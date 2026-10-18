@@ -1611,7 +1611,7 @@ fixtureTest('attached fixture keeps the admitted stage group', async () => {
     journey: { file: 'e2e/desktop.spec.ts', title: journeyTitle, hash: fixtureClientHash } as const,
     stages: [...verificationStages] as [...typeof verificationStages],
     provenancePattern: 'fixture',
-    maximumMinutes: 5 as const,
+    maximumMinutes: 10 as const,
   };
   const verification = ToolchainDefinitionSchema.parse({
     ...fields,
@@ -4572,10 +4572,10 @@ test('an appointed native proposal is retained and applied once after every phas
       });
     let controller = context.controller;
     if (scenario === 'repository-checked') {
-      context.appointment.policy.limits.minutes = 10;
+      context.appointment.policy.limits.minutes = 16;
       assert.equal(context.appointment.policy.unknownUsage.rule, 'fixed-allowance');
       if (context.appointment.policy.unknownUsage.rule === 'fixed-allowance')
-        context.appointment.policy.unknownUsage.allowance.minutes = 10;
+        context.appointment.policy.unknownUsage.allowance.minutes = 16;
     }
 
     const { command, task, appointment, clock } = context;
@@ -4657,7 +4657,7 @@ test('an appointed native proposal is retained and applied once after every phas
       );
       assert.equal(prepared.outcome, 'applied');
       const nativeRun = RunSchema.parse(prepared.entity);
-      // A ten-minute repository run keeps six minutes for evaluation, so the floor applies.
+      // A sixteen-minute repository run keeps eleven minutes for evaluation, so the floor applies.
       assert.equal(
         controller.snapshot().nativeRuns.find((value) => value.runId === nativeRun.id)
           ?.maximumTaskMs,
@@ -9752,8 +9752,8 @@ test('planning turns keep task authority and allowance across execution', async 
   assert.deepEqual(adoptedScope(), []);
   assert.equal((await amend(adoptedCriteria)).outcome, 'applied');
   assert.deepEqual(adoptedScope(), ['net.mjs']);
-  // A repository writer leaves six run minutes for its check and review. Twelve run minutes
-  // freeze six, sixteen freeze ten and ten freeze the five-minute floor.
+  // A repository writer leaves eleven run minutes for its check and review. Twelve run minutes
+  // freeze five, twenty-one freeze ten and ten freeze the five-minute floor.
   const write = nativePreparation.policy.effects.find((grant) => grant.action === 'write-scratch');
   assert(write);
   const prepareRepository = async (minutes: number) => {
@@ -9780,21 +9780,21 @@ test('planning turns keep task authority and allowance across execution', async 
         ?.maximumTaskMs,
     };
   };
-  assert.equal((await prepareRepository(12)).frozen, 360_000);
-  const sixteen = await prepareRepository(16);
-  assert.equal(sixteen.frozen, 600_000);
-  // Lowering the task total to 13 minutes with one spent leaves 12. That covers the ten-minute
-  // limit alone and falls short of the six minutes behind it.
+  assert.equal((await prepareRepository(12)).frozen, 300_000);
+  const twentyOne = await prepareRepository(21);
+  assert.equal(twentyOne.frozen, 600_000);
+  // Lowering the task total to 21 minutes with one spent leaves 20. That covers the ten-minute
+  // limit alone and falls short of the eleven minutes behind it.
   const lowerTotal = async (minutes: number) =>
     (
       await send('ConfigureTaskConversation', taskId, {
         planning: { ...planning, limits: { ...planning.limits, minutes } },
       })
     ).outcome;
-  assert.equal(await lowerTotal(13), 'applied');
-  assert.equal(state(taskId).budget?.remaining.minutes, 12);
+  assert.equal(await lowerTotal(21), 'applied');
+  assert.equal(state(taskId).budget?.remaining.minutes, 20);
   const intentsBeforeRepository = controller.store.intents().length;
-  const repositoryStart = await send('StartRun', taskId, { runId: sixteen.run.id });
+  const repositoryStart = await send('StartRun', taskId, { runId: twentyOne.run.id });
   assert.equal(repositoryStart.reason, 'run-budget-exhausted');
   assert.equal(
     repositoryStart.next,

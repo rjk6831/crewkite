@@ -2307,7 +2307,7 @@ test('process boundaries reject unknown fields and invalid command identity', ()
       git: { version: '2.50.1', sha256: '4'.repeat(64) },
     },
     stages: ['policy', 'lint', 'types', 'node-tests', 'build', 'desktop'],
-    maximumMinutes: 5,
+    maximumMinutes: 10,
   };
   const verificationPreview = { ...preview, recipe: 'crewkite-verify-v1', verification };
   assert.deepEqual(
@@ -2322,6 +2322,7 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     },
     { ...preview, verification },
     { ...preview, verification: undefined },
+    { ...verificationPreview, verification: { ...verification, maximumMinutes: 5 } },
     { ...verificationPreview, verification: { ...verification, maximumMinutes: 1 } },
     {
       ...verificationPreview,

@@ -2238,7 +2238,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       ? {
           ...evaluation,
           recipe: 'crewkite-verify-v1',
-          remainingBudgets: { attempts: 2, minutes: 6, concurrency: 1 },
+          remainingBudgets: { attempts: 2, minutes: 11, concurrency: 1 },
           verification: {
             toolchainHash: '1'.repeat(64),
             baselineHash: '2'.repeat(64),
@@ -2251,7 +2251,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
               git: { version: '2.50.1', sha256: '6'.repeat(64) },
             },
             stages: ['policy', 'lint', 'types', 'node-tests', 'build', 'desktop'],
-            maximumMinutes: 5,
+            maximumMinutes: 10,
           },
         }
       : scenario === 'evaluation-reviewed'
@@ -3457,7 +3457,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         for (const value of [
           'Recipe crewkite-verify-v1',
           'Stages policy, lint, types, node-tests, build, desktop',
-          'Maximum 5 minutes including staging and cleanup',
+          'Maximum 10 minutes including staging and cleanup',
           'Platform darwin, arm64',
           preview.verification.toolchainHash,
           preview.verification.baselineHash,

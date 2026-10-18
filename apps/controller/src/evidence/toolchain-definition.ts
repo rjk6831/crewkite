@@ -106,7 +106,7 @@ export const ToolchainDefinitionSchema = z.strictObject({
     ],
   ),
   provenancePattern: z.string().min(1).max(4096),
-  maximumMinutes: z.literal(5),
+  maximumMinutes: z.literal(10),
 });
 export type ToolchainDefinition = z.infer<typeof ToolchainDefinitionSchema>;
 export type ToolchainPreparation = {
@@ -237,7 +237,7 @@ export function verificationPreview(definition: ToolchainDefinition) {
     arch: definition.arch,
     executables: { node, electron, git },
     stages: definition.stages,
-    maximumMinutes: 5,
+    maximumMinutes: 10,
   });
 }
 
@@ -370,7 +370,7 @@ export async function prepareToolchain(input: {
     journey: { file: 'e2e/desktop.spec.ts' as const, title: journeyTitle, hash: journey.hash },
     stages: [...verificationStages] as [...typeof verificationStages],
     provenancePattern: input.provenancePattern,
-    maximumMinutes: 5 as const,
+    maximumMinutes: 10 as const,
   };
   const definition = ToolchainDefinitionSchema.parse({
     ...fields,

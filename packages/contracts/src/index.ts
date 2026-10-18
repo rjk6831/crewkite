@@ -2353,7 +2353,7 @@ export const CrewKiteVerifyPreviewSchema = z.strictObject({
     z.literal('build'),
     z.literal('desktop'),
   ]),
-  maximumMinutes: z.literal(5),
+  maximumMinutes: z.literal(10),
 });
 export type CrewKiteVerifyPreview = z.infer<typeof CrewKiteVerifyPreviewSchema>;
 export const CandidateEvaluationPreviewSchema = z
