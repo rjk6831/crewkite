@@ -973,6 +973,6 @@ test('combined tasks share seven real dispatches and require a separate full bar
       assert.equal(refValue(context.source.directory, 'refs/heads/combined'), acceptedHead);
     }
   };
-  const results = await Promise.allSettled([run(), run()]);
+  const results = await Promise.allSettled(Array.from({ length: 3 }, run));
   for (const result of results) if (result.status === 'rejected') throw result.reason;
 });
