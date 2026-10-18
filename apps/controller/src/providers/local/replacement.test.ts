@@ -83,13 +83,15 @@ const kv = (values: Record<string, unknown>) => ({
 function terminal(
   stopReason: PredictionResult['stats']['stopReason'] = 'eosFound',
   maximumOutputTokens = 2048,
+  input: LocalStart = plan,
+  proposed = 'export const n = 2;\n',
 ) {
   const content = JSON.stringify({
     version: 1,
-    attemptId: plan.binding.attemptId,
-    path: plan.binding.path,
-    baseHash: plan.binding.baseHash,
-    content: 'export const n = 2;\n',
+    attemptId: input.binding.attemptId,
+    path: input.binding.path,
+    baseHash: input.binding.baseHash,
+    content: proposed,
   });
   return {
     content,
@@ -103,11 +105,11 @@ function terminal(
       'llm.prediction.maxPredictedTokens': { checked: true, value: maximumOutputTokens },
       'llm.prediction.contextOverflowPolicy': 'stopAtLimit',
       'llm.prediction.speculativeDecoding.draftModel': '',
-      'llm.prediction.structured': localStructuredOutput(plan.binding).format,
+      'llm.prediction.structured': localStructuredOutput(input.binding).format,
     }),
   } satisfies PredictionResult;
 }
-function fixture() {
+function fixture(input: LocalStart = plan) {
   let resolve!: (value: PredictionResult) => void, reject!: (error: Error) => void;
   const result = new Promise<PredictionResult>((yes, no) => {
     resolve = yes;
@@ -128,7 +130,7 @@ function fixture() {
       // The task reads once as plain text and the file arrives byte for byte inside attempt fences.
       const [message, ...rest] = chat as ReturnType<typeof localChat>;
       assert.equal(rest.length, 0);
-      const { title, outcome, criteria } = plan.task;
+      const { title, outcome, criteria } = input.task;
       assert.equal(message.content.split(title).length, 2);
       assert.ok(
         message.content.includes(
@@ -136,14 +138,14 @@ function fixture() {
         ),
       );
       const fence = (edge: string, kind: string, path: string) =>
-        `----- ${edge} ${kind} ${path} ${plan.binding.attemptId} -----`;
+        `----- ${edge} ${kind} ${path} ${input.binding.attemptId} -----`;
       for (const [kind, path, content] of [
-        ['FILE', plan.binding.path, plan.original],
-        ...plan.tests.map((test) => ['READ-ONLY TEST', test.path, test.content]),
+        ['FILE', input.binding.path, input.original],
+        ...input.tests.map((test) => ['READ-ONLY TEST', test.path, test.content]),
       ])
         assert.ok(
           message.content.includes(
-            `\n${fence('BEGIN', kind, path)}\n${content}${fence('END', kind, path)}\n`,
+            `\n${fence('BEGIN', kind, path)}\n${content}${content.endsWith('\n') ? '' : '\n'}${fence('END', kind, path)}\n`,
           ),
         );
       return 'rendered chat';
@@ -930,9 +932,28 @@ test('Local ownership needs the same prediction terminal after cancellation or c
     assert.equal(f.submitted, 1);
   }
   let completed!: LocalTerminal;
+  const endings: Record<string, readonly [string, string, string] | undefined> = {
+    'missing final newline': [
+      'export const n = 1;\n',
+      'export const n = 2;',
+      'export const n = 2;\n',
+    ],
+    'missing final CRLF': [
+      'export const n = 1;\r\n',
+      'export const n = 2;',
+      'export const n = 2;\r\n',
+    ],
+    'original without final newline': [
+      'export const n = 1;',
+      'export const n = 2;',
+      'export const n = 2;',
+    ],
+  };
   for (const row of [
     'complete',
     'missing final newline',
+    'missing final CRLF',
+    'original without final newline',
     'omitted prediction draft with default load selectors',
     'omitted prediction draft with explicit load selectors',
     'stop',
@@ -944,9 +965,13 @@ test('Local ownership needs the same prediction terminal after cancellation or c
     'duplicate raw config',
     'reasoning limit',
   ] as const) {
-    const f = fixture();
+    const ending = endings[row];
+    const input: LocalStart = ending
+      ? { ...plan, original: ending[0], binding: { ...plan.binding, baseHash: hash(ending[0]) } }
+      : plan;
+    const f = fixture(input);
     let markers = 0;
-    const run = startLocalPrediction(plan, {
+    const run = startLocalPrediction(input, {
       createClient: () => f.client,
       schedule: f.schedule,
       now: () => 0,
@@ -1005,19 +1030,12 @@ test('Local ownership needs the same prediction terminal after cancellation or c
         value.stats = { ...value.stats, ...{ usedDraftModelKey: '', totalDraftTokensCount: 0 } };
       }
       f.resolve(value);
-    } else if (row === 'missing final newline') {
-      const value = terminal();
-      value.nonReasoningContent = JSON.stringify({
-        ...JSON.parse(value.nonReasoningContent),
-        content: 'export const n = 2;',
-      });
-      value.content = value.nonReasoningContent;
-      f.resolve(value);
-    } else f.resolve(terminal(row === 'stop' ? 'userStopped' : 'eosFound'));
+    } else if (ending) f.resolve(terminal('eosFound', 2048, input, ending[1]));
+    else f.resolve(terminal(row === 'stop' ? 'userStopped' : 'eosFound'));
     const outcome = await run.result;
     const expected =
       row === 'complete' ||
-      row === 'missing final newline' ||
+      ending ||
       row === 'completion race' ||
       row.startsWith('omitted prediction draft')
         ? 'completed'
@@ -1034,8 +1052,8 @@ test('Local ownership needs the same prediction terminal after cancellation or c
       row,
     );
     if (outcome.kind === 'completed') {
-      completed = outcome;
-      assert.equal(outcome.proposal.content, 'export const n = 2;\n', row);
+      if (input === plan) completed = outcome;
+      assert.equal(outcome.proposal.content, ending?.[2] ?? 'export const n = 2;\n', row);
       assert.equal(outcome.proof.promptTokens, null);
       assert.equal(outcome.proof.predictedTokens, null);
     }

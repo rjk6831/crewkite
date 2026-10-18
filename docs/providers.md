@@ -233,6 +233,8 @@ File proposals request a closed JSON schema bound to the attempt, target path an
 
 This setting does not establish that thinking is disabled or that a model will finish within its allowance. The additional diagnostics contain SDK-classified reasoning and nonreasoning byte counts, with no reasoning text or token-split estimate. Older receipts remain readable.
 
+When the original ends with a line ending and the returned content does not, CrewKite restores that ending. The retained proposal can therefore differ from the model's response by one line ending.
+
 The Local writer also reads, read-only, up to two committed test files in the target's directory that import the target, sorted by path and within 12 KiB. They count toward the prompt's token check, and the proposal still replaces only the target.
 
 A completed Local file candidate can enter the shared fixed-check workflow. The controller validates its immutable Local preparation, matching completed terminal and model/connection binding, submission receipt, applied replacement, unchanged source and proven closure. Unknown ownership, changed sibling files or a candidate that differs from the completed replacement refuse evaluation. The Local origin creates no cloud writer appointment.
