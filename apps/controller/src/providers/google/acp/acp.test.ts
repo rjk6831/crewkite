@@ -343,6 +343,7 @@ test('the acp writer binds an imported client and observed configuration before 
       // The signature phase runs only where codesign does.
       if (held && (process.platform !== 'darwin' || process.arch !== 'arm64')) continue;
       const row = fixture('complete');
+      const exits: Array<Promise<unknown>> = [];
       try {
         const staged = join(row.home, 'imports/google-acp-v1');
         mkdirSync(staged, { recursive: true, mode: 0o700 });
@@ -404,10 +405,17 @@ test('the acp writer binds an imported client and observed configuration before 
                       )
                     : spawnCheckChild(row.client.executable, [], options);
                   if (child.pid) row.groups.push(child.pid);
+                  exits.push(new Promise((resolve) => child.once('close', resolve)));
                   if (held) {
                     child.stdout.once('data', () => ready.resolve());
                     child.once('exit', () => onExit?.());
-                    child.once('close', () => closed.resolve());
+                    child.once('error', ready.reject);
+                    child.once('close', () => {
+                      ready.reject(
+                        new Error(`${failure}: the held child closed before it was ready`),
+                      );
+                      closed.resolve();
+                    });
                   } else
                     child.once('close', () => {
                       clock = failure === 'deadline' ? 5000 : clock + 2500;
@@ -453,7 +461,9 @@ test('the acp writer binds an imported client and observed configuration before 
               };
         const pending = importGoogleAcp({ home: row.home, consent: 'explicit' }, mutation);
         if (held) {
-          await ready.promise;
+          // A child that fails to start or exits early rejects here, and an import that settles
+          // first fails the timer lookup below.
+          await Promise.race([ready.promise, pending]);
           fire(4000);
           if (failure === 'queued-close') {
             // The group is gone when the cutoff runs, but its close event is still queued.
@@ -498,6 +508,13 @@ test('the acp writer binds an imported client and observed configuration before 
           );
         }
       } finally {
+        // A row that fails midway reports its own assertion and leaves no child or directory.
+        for (const group of row.groups) {
+          try {
+            process.kill(-group, 'SIGKILL');
+          } catch {}
+        }
+        await Promise.all(exits);
         row.dispose();
       }
     }
