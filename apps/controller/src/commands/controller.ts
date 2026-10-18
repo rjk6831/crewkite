@@ -14449,11 +14449,15 @@ export class Controller {
     }
     const runtime = this.workers.get(active.attempt_id);
     if (!runtime)
-      return {
-        outcome: 'blocked',
-        reason: 'writer-ownership-unknown',
-        next: 'Prove the prior process group is gone before continuing.',
-      };
+      return (
+        (!memberStop && command.actor.kind !== 'controller'
+          ? this.stopUnknownAcpWriter(task, active)
+          : undefined) ?? {
+          outcome: 'blocked',
+          reason: 'writer-ownership-unknown',
+          next: 'Prove the prior process group is gone before continuing.',
+        }
+      );
     if (task.state === 'unknown') return { outcome: 'blocked', reason: 'writer-ownership-unknown' };
     runtime.reason = 'stop';
     const updated = this.updateTask(task, {
@@ -14469,6 +14473,63 @@ export class Controller {
         void runtime.worker
           .stop({ schedule: this.options.schedule })
           .then((exit) => this.finishAttempt(active.attempt_id, exit.quiescent));
+    });
+    return { outcome: 'applied', entity: updated, revision: updated.revision };
+  }
+
+  // An ACP turn without its terminal response stays unknown across restart, and that writer
+  // closes every Google operation in the home. Only an explicit Stop in a controller that holds
+  // no runtime for the attempt can close it, and only after every recorded group is absent.
+  // The attempt keeps its unknown outcome, and every submission, completion and proposal
+  // receipt and every phase row stays. Nothing is captured, and the preparation receipt that
+  // Stop already deleted prevents another submission from this run.
+  private stopUnknownAcpWriter(task: Task, intent: LaunchIntent): CommandResult | undefined {
+    const attempt = this.store.get<Attempt>('attempt', intent.attempt_id);
+    if (
+      attempt?.state !== 'unknown' ||
+      this.store.nativeProfileId(attempt.id) !== 'google-acp-v1' ||
+      this.store.combinedGroup(intent.run_id)
+    )
+      return undefined;
+    const phases = this.store.nativeProcesses(intent.attempt_id);
+    const groups = [
+      ...new Set([intent.process_group, ...phases.map((phase) => phase.process_group)]),
+    ].filter((group) => group !== null);
+    if (
+      !phases.length ||
+      phases.some((phase) => phase.state === 'intent') ||
+      !groups.every((group) => groupAbsent(group))
+    )
+      return undefined;
+    const at = this.now();
+    const retained = (key: string) =>
+      (this.store.receipt(key)?.result.entity as Artifact | undefined)?.hash ?? null;
+    const proof = this.nativeArtifact({
+      attemptId: attempt.id,
+      outcome: 'unknown',
+      submissionHash: retained(`native-submission:${attempt.id}`),
+      completionHash: retained(`native-completion:${attempt.id}`),
+      groups,
+      absentAt: at,
+    });
+    this.store.saveReceipt(`native-acp-unknown-stop:${attempt.id}`, proof.hash, 'local-owner', {
+      outcome: 'applied',
+      entity: proof,
+    });
+    this.store.db
+      .prepare("UPDATE launch_intents SET state='stopped',finished_at=? WHERE attempt_id=?")
+      .run(at, attempt.id);
+    this.store.db.prepare('DELETE FROM writer_leases WHERE attempt_id=?').run(attempt.id);
+    this.store.db.prepare('DELETE FROM reservations WHERE attempt_id=?').run(attempt.id);
+    const updated = this.updateTask(task, {
+      state: 'interrupted',
+      waitingReason: null,
+      next: 'Stopped after every recorded process group exited. The turn has an unknown outcome, and retained work is unverified. Prepare a new run to continue.',
+    });
+    this.event('run.interrupted', task.id, updated.revision, {
+      runId: intent.run_id,
+      reason:
+        'An explicit Stop closed a turn with an unknown outcome after its process groups exited.',
     });
     return { outcome: 'applied', entity: updated, revision: updated.revision };
   }

@@ -7870,6 +7870,12 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       const attemptId = controller.store.intents()[0].attempt_id;
       assert.equal(controller.store.get<Attempt>('attempt', attemptId)?.state, 'unknown');
       assert.equal(controller.store.receipt(`native-acp-terminal:${attemptId}`), undefined);
+      const stopUnknown = () =>
+        controller.execute(
+          command('StopRun', { taskId: task.id, runId: run.id }, taskRevision(controller, task.id)),
+          'local-owner',
+        );
+      assert.equal((await stopUnknown()).reason, 'writer-ownership-unknown');
       await controller.close();
       controller = new Controller({
         ...options,
@@ -7877,12 +7883,49 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
         now: clock.now,
         id,
       });
-      assert.equal(controller.store.get<Attempt>('attempt', attemptId)?.state, 'unknown');
-      assert.equal(
+      const gate = () =>
         controller.store.transaction(() =>
           controller.store.googleStartBlocker(run.roles[0].routeId),
-        ),
-        'google-ownership-unknown',
+        );
+      assert.equal(controller.store.get<Attempt>('attempt', attemptId)?.state, 'unknown');
+      assert.equal(gate(), 'google-ownership-unknown');
+      const recorded = controller.store.nativeProcesses(attemptId);
+      const held = (table: string) =>
+        controller.store.db
+          .prepare(`SELECT count(*) AS n FROM ${table} WHERE attempt_id=?`)
+          .get(attemptId)?.n;
+      for (const table of ['writer_leases', 'reservations']) assert(Number(held(table)) > 0, table);
+      const holder = spawnProcess(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], {
+        detached: true,
+        stdio: 'ignore',
+      });
+      const exited = once(holder, 'exit');
+      t.after(() => holder.kill('SIGKILL'));
+      const phaseGroup = controller.store.db.prepare(
+        'UPDATE native_processes SET pid=?,process_group=? WHERE attempt_id=? AND sequence=0',
+      );
+      phaseGroup.run(holder.pid as number, holder.pid as number, attemptId);
+      assert.equal((await stopUnknown()).reason, 'writer-ownership-unknown');
+      assert.equal(gate(), 'google-ownership-unknown');
+      holder.kill('SIGKILL');
+      await exited;
+      phaseGroup.run(recorded[0].pid, recorded[0].process_group, attemptId);
+      assert.equal((await stopUnknown()).outcome, 'applied');
+      assert.equal(controller.store.get<Attempt>('attempt', attemptId)?.state, 'unknown');
+      assert.equal(
+        controller.store.intents().find((intent) => intent.attempt_id === attemptId)?.finished_at,
+        clock.now(),
+      );
+      for (const table of ['writer_leases', 'reservations']) assert.equal(held(table), 0, table);
+      assert.deepEqual(controller.store.nativeProcesses(attemptId), recorded);
+      for (const key of ['native-submission', 'native-completion', 'native-acp-unknown-stop'])
+        assert(controller.store.receipt(`${key}:${attemptId}`), key);
+      assert.equal(controller.store.receipt(`native-acp-terminal:${attemptId}`), undefined);
+      assert(!controller.snapshot().candidates.some((value) => value.taskId === task.id));
+      assert.equal(gate(), undefined);
+      assert.equal(
+        (await controller.execute(start(), 'local-owner')).reason,
+        'native-preparation-unavailable',
       );
       await controller.close();
       continue;

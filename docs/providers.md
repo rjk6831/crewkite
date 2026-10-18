@@ -57,7 +57,7 @@ Candidate capture validates actual scratch bytes after owned cleanup. The target
 
 Evaluation needs separately prepared local-check authority. Native review uses a separately supported OpenAI profile, its own source-sharing consent and review grant, and remaining attempt, time and provider allowance. Google quota observations establish no reviewer allowance. A retained candidate cannot pass required review when that route or allowance is unavailable.
 
-Stop cancels pending permissions, sends `session/cancel` and waits for the original prompt's `cancelled` response. It closes the session when supported and requires closed streams and an absent owned process group. EOF before the terminal response remains unknown. Stop retains partial work as unverified and blocks a late completed-capture receipt. Restart never resubmits or infers completion from quiet scratch. Autopilot, automatic Google handoff and repository-wide ACP editing remain unavailable.
+Stop cancels pending permissions, sends `session/cancel` and waits for the original prompt's `cancelled` response. It closes the session when supported and requires closed streams and an absent owned process group. EOF before the terminal response remains unknown. After a restart, an explicit Stop can record that unknown outcome once every recorded process group is absent. It keeps the submission and completion evidence, captures nothing and reopens the home for later Google work. Stop retains partial work as unverified and blocks a late completed-capture receipt. Restart never resubmits or infers completion from quiet scratch. Autopilot, automatic Google handoff and repository-wide ACP editing remain unavailable.
 
 ## Google quota read
 
