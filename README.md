@@ -31,6 +31,7 @@ I am building in the open for my own daily use first. Finished work and less man
 - Run bounded native work in independent scratch. Inspect Changes and export retained work without changing the original checkout.
 - Combine two scoped child candidates through ordered checks, then require a full combined check and separate review before destination-specific branch acceptance.
 - Show reported weekly, five-hour and model or pool windows with their source and freshness. Connected clients permit bounded idle metadata refresh for supported readers. After a successful OpenAI planning turn closes, the composer can show its last observed context token use and reported capacity. Missing capacity keeps the percentage unknown.
+- Keep a first-party usage-limit refusal distinct from other provider failures. When the provider supplies a valid reset time, the task shows that time and a local countdown without treating it as fresh usage evidence.
 
 The [provider notes](docs/providers.md) separate implemented paths from dated qualification. The bounded OpenAI workflow has historical checked-branch evidence. Local model eligibility, a Google quota read or a passing synthetic fixture supplies no live route qualification.
 
@@ -48,9 +49,11 @@ Future execution policy opens a separate preparation draft. Planning keeps read-
 
 Review the prepared source and permissions before Start. Changes shows retained work. Checks and review prepares and reports separate evidence; a matching supported result still needs destination-specific permission for local branch acceptance. Messages cannot approve actions or accept code. Uncertain commands keep their exact receipt for explicit retry, and reopening starts no work. The [conversation CLI](apps/cli/README.md#task-conversations) exposes the same controller decisions.
 
-Repository writers receive the frozen check recipe and finite turn limits with the task. Provider progress notices remain display data. They cannot complete a turn or create a candidate. Before sealing, the controller runs the frozen formatter outside its event loop and hashes the resulting bytes. A skipped or failed formatter keeps the writer bytes with its reason. Checks and review bind to the final sealed candidate.
+Repository writers receive the frozen check recipe and finite turn limits with the task. Provider progress notices remain display data. They cannot complete a turn or create a candidate. Before sealing, the controller excludes generated files covered by the committed base's ignore rules, then runs the frozen formatter outside its event loop and hashes the resulting bytes. Tracked files stay eligible even when an ignore rule matches them, and a changed ignore file cannot conceal edits. A skipped or failed formatter keeps the writer bytes with its reason. Checks and review bind to the final sealed candidate.
 
 If a submitted writer exits without a terminal result, its outcome stays unknown. Once every recorded process group is proven absent, the controller releases its lease and reservations, records bounded usage through the shutdown evidence and marks the task interrupted. It captures no candidate and starts no replacement. Reopening keeps that record and still starts no work.
+
+A confirmed, quiescent Anthropic quota denial is the narrow retry case. Guided authority waits for explicit Resume after the reported reset. Balanced schedules one retry, and Autopilot does the same for supported standalone work. A combined run can reopen its denied native child when the sibling has passed with exact candidate provenance, is stopped on its own confirmed denial, or is entering or running the immediately next generation backed by that denial. Two same-reset wakes still honor the run's concurrency limit. Combined preparation does not support Autopilot. Restart restores one pending wait per denial. Admission rechecks current authority, ownership, source, route and remaining budget, and any drift blocks the retry. The confirmed denial consumes no attempt or minute allowance. Generic errors and unknown outcomes keep normal accounting.
 
 ## Decisions and retained work
 
