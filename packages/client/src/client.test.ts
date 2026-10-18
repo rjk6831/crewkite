@@ -262,7 +262,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     runId: `run_${suffix}`,
     profileId: profile.id,
     stage: 'prepared' as const,
-    expiresAt: '2026-10-18T00:00:00.000Z',
+    expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
     target: { path: 'docs/providers.md', baseHash: 'b'.repeat(64), bytes: 42 },
   };
   const run: Snapshot['runs'][number] = {
@@ -317,7 +317,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       independence: 'process-only',
     },
     creditPolicy: 'ordinary',
-    expiresAt: '2026-10-18T00:00:00.000Z',
+    expiresAt: nativeRun.expiresAt,
     remainingBudgets: { attempts: 2, minutes: 3, concurrency: 1 },
     allowance: { source: 'supplemental-evaluation', localChecks: 1, nativeReviews: 1 },
     stage: 'prepared',
@@ -996,7 +996,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     reason: 'qualification-pending',
   };
   const combinedId = (prefix: string, index = 0) =>
-    `${prefix}_${suffix.slice(0, -1)}${['V', 'W', 'X'][index]}`;
+    `${prefix}_${suffix.slice(0, -1)}${['V', 'W', 'X', 'Y'][index]}`;
   const combinedPlan = {
     taskId: task.id,
     policy: { ...policy, limits: { attempts: 7, minutes: 20, concurrency: 2 } },
@@ -1067,6 +1067,8 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
   };
   let combinedGroup: typeof combinedPreview | null = combinedPreview;
   let combinedRevision = task.revision;
+  let combinedState: Snapshot['tasks'][number]['state'] = task.state;
+  let combinedCandidates: Snapshot['candidates'] = [];
   let combinedOutcome: 'applied' | 'blocked' | 'outcome-unknown' = 'applied';
   const combinedCommands: Command[] = [];
   const combinedFixture = await serve((message, socket) => {
@@ -1091,6 +1093,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
                       ? combinedRevision
                       : combinedPlan.children[index - 1].expectedRevision,
                   runId: combinedId('run', index),
+                  state: index === 0 ? combinedState : task.state,
                 })),
                 runs: refs.map((index) => ({
                   ...run,
@@ -1106,6 +1109,8 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
                   revision: 1,
                 })),
                 artifacts: [artifact],
+                candidates: combinedCandidates,
+                nativeProfiles: [{ ...profile, creditPolicies: [...profile.creditPolicies] }],
                 combinedRuns: combinedGroup ? [combinedGroup] : [],
               },
             },
@@ -1178,6 +1183,90 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
   const plainCombined = await executeCombined(['combined', 'status', task.id], false);
   for (const fact of ['writers', 'slice-1.mjs', '4 attempts', 'assemble: available'])
     assert(plainCombined.output.includes(fact), fact);
+  const completedCombined: typeof combinedPreview = {
+    ...combinedPreview,
+    phase: 'awaiting-evaluation',
+    candidate: { id: candidate.id, hash: candidate.hash },
+    evaluate: available,
+  };
+  const combinedGrantsFile = join(combinedFixture.home, 'grants.json');
+  writeFileSync(combinedGrantsFile, JSON.stringify(grants));
+  const combinedEvaluationArgs = [
+    'task',
+    'prepare-evaluation',
+    task.id,
+    profile.id,
+    '--grants',
+    combinedGrantsFile,
+    '--recipe',
+    'project-node-tests-v1',
+    ...combinedPlan.checks.testFiles.flatMap((path) => ['--test-file', path]),
+    '--native-trust',
+    '--source-consent',
+  ];
+  combinedGroup = completedCombined;
+  combinedState = 'stopped';
+  combinedCandidates = [candidate];
+  const combinedEvaluation = await executeCombined(combinedEvaluationArgs);
+  assert.equal(combinedEvaluation.code, 0, combinedEvaluation.errors);
+  assert.deepEqual(
+    combinedCommands.map((command) => command.command),
+    ['GetSnapshot', 'PrepareCandidateEvaluation'],
+  );
+  const combinedEvaluationCommand = JSON.parse(combinedEvaluation.output).command;
+  assert.equal(combinedEvaluationCommand.expectedRevision, combinedRevision);
+  assert.deepEqual(combinedEvaluationCommand.payload, {
+    taskId: task.id,
+    candidateId: candidate.id,
+    checkRecipeId: 'project-node-tests-v1',
+    testFiles: combinedPlan.checks.testFiles,
+    reviewer: completedCombined.evaluationSelection.reviewer,
+    creditPolicy: 'ordinary',
+    consent: 'explicit',
+    grants,
+  });
+  for (const row of [
+    { group: null },
+    { group: { ...completedCombined, phase: 'writers' as const } },
+    { group: { ...completedCombined, evaluate: unavailable } },
+    { candidates: [candidate, { ...candidate, id: combinedId('cnd', 3) }] },
+    { state: 'running' as const },
+    { group: null, candidates: [] },
+    {
+      args: combinedEvaluationArgs.map((value) =>
+        value === task.id ? combinedId('tsk', 1) : value,
+      ),
+    },
+    { args: [...combinedEvaluationArgs, '--existing-credits'] },
+    {
+      args: [
+        ...combinedEvaluationArgs.slice(0, 6),
+        '--recipe',
+        'node-tests-v1',
+        '--native-trust',
+        '--source-consent',
+      ],
+    },
+    {
+      args: [
+        ...combinedEvaluationArgs.slice(0, 8),
+        ...combinedPlan.checks.testFiles.toReversed().flatMap((path) => ['--test-file', path]),
+      ],
+    },
+  ]) {
+    combinedGroup = 'group' in row ? (row.group ?? null) : completedCombined;
+    combinedState = row.state ?? 'stopped';
+    combinedCandidates = row.candidates ?? [candidate];
+    const result = await executeCombined(row.args ?? combinedEvaluationArgs);
+    assert.equal(result.code, 1, JSON.stringify(row));
+    assert.deepEqual(
+      combinedCommands.map((command) => command.command),
+      ['GetSnapshot'],
+    );
+  }
+  combinedGroup = combinedPreview;
+  combinedState = task.state;
+  combinedCandidates = [];
   for (const invalid of [
     { ...combinedPlan, taskId: combinedId('tsk', 1) },
     { ...combinedPlan, children: combinedPlan.children.slice(0, 1) },

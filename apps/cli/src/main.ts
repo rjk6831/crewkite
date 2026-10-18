@@ -1035,14 +1035,25 @@ export async function runCli(
       const run = snapshot.runs.find((run) => run.id === task.runId);
       const candidate = snapshot.candidates.filter((value) => value.taskId === task.id).at(-1);
       const methods = run?.policy.policy.methods ?? [];
+      const combined = snapshot.combinedRuns.find(
+        (value) => value.taskId === task.id && value.runId === run?.id,
+      );
       if (
         !profile?.available ||
         !run ||
         !candidate ||
         task.state !== 'stopped' ||
-        !snapshot.nativeRuns.some((value) => value.runId === run.id)
+        (combined
+          ? run.taskId !== task.id ||
+            combined.phase !== 'awaiting-evaluation' ||
+            !combined.evaluate.available ||
+            combined.candidate?.id !== candidate.id ||
+            combined.candidate.hash !== candidate.hash
+          : !snapshot.nativeRuns.some((value) => value.runId === run.id))
       )
-        throw new Error('A stopped native candidate and available reviewer profile are required.');
+        throw new Error(
+          'A stopped native or current combined candidate and available reviewer profile are required.',
+        );
       if (methods.length !== 1 || methods[0].id !== 'keep-it-simple' || methods[0].cycles !== 1)
         throw new Error(
           'Evaluation requires the saved single keep-it-simple method and one cycle.',
@@ -1050,6 +1061,16 @@ export async function runCli(
       const creditPolicy = values['existing-credits'] ? 'existing-credits' : 'ordinary';
       if (!profile.creditPolicies.some((value) => value === creditPolicy))
         throw new Error('This reviewer profile does not support the selected credit policy.');
+      if (
+        combined &&
+        canonicalJson({
+          recipeId: checkRecipe.checkRecipeId,
+          testFiles: 'testFiles' in checkRecipe ? checkRecipe.testFiles : [],
+          reviewer: { profileId: profile.id, methodId: methods[0].id, cycles: 1 },
+          creditPolicy,
+        }) !== canonicalJson(combined.evaluationSelection)
+      )
+        throw new Error('Use the combined run’s saved recipe, test files and reviewer selection.');
       return await finishAction(
         await request(
           'PrepareCandidateEvaluation',
