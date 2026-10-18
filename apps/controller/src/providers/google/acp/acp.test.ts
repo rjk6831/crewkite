@@ -1415,6 +1415,47 @@ setInterval(() => {}, 1000);
       f.dispose();
     }
   }
+  for (const [name, stderrBytes] of [
+    ['ordinary-stderr', 32768],
+    ['bounded-stderr', 1048577],
+  ] as const) {
+    const f = fixture('complete');
+    try {
+      chmodSync(f.client.executable, 0o700);
+      writeFileSync(
+        f.client.executable,
+        `#!${process.execPath}
+process.stderr.write('x'.repeat(${stderrBytes}));
+process.stdin.on('data', bytes => {
+  const request = JSON.parse(bytes.toString());
+  process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:1,agentInfo:{version:'1.4.0'},authMethods:[{id:'oauth-personal',name:'Personal'}]}})+'\\n');
+});
+setInterval(() => {}, 1000);
+`,
+      );
+      chmodSync(f.client.executable, 0o500);
+      f.client.sha256 = hash(readFileSync(f.client.executable));
+      const outcome = await startGoogleAcpSetup({
+        client: f.client,
+        directory: f.directory(),
+        environment,
+        operation: 'initialize',
+        priorProof: null,
+        lifecycle: f.lifecycle,
+        spawn: spawnCheckChild as AcpSpawn,
+      }).result;
+      assert(outcome.quiescent, name);
+      assert.equal(outcome.stderrBytes, stderrBytes, name);
+      assert.equal(outcome.reason, name === 'ordinary-stderr' ? null : 'output-limit', name);
+      assert.deepEqual(
+        outcome.diagnostic,
+        name === 'ordinary-stderr' ? null : { site: 'stderr-output' },
+        name,
+      );
+    } finally {
+      f.dispose();
+    }
+  }
   const late = fixture('complete');
   let lateClock = 0;
   try {

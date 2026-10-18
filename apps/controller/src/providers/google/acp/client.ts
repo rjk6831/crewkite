@@ -37,6 +37,7 @@ export const AcpDiagnosticSchema = z.strictObject({
     'eof-pending',
     'stdout-stream',
     'stderr-stream',
+    'stderr-output',
     'stdin-stream',
     'launch',
     'work',
@@ -212,6 +213,8 @@ export type AcpProcessOptions = {
   schedule?: Schedule;
   spawn?: AcpSpawn;
 };
+
+const stderrLimit = 1048576;
 
 function boundedJson(value: unknown) {
   const pending: { value: unknown; depth: number }[] = [{ value, depth: 0 }];
@@ -519,7 +522,8 @@ export function startAcpProcess<T>(
   );
   child.stderr.on('data', (bytes: Buffer) => {
     stderrBytes += bytes.length;
-    if (stderrBytes > 16384) connection.fail(new AcpError('output-limit'));
+    if (stderrBytes > stderrLimit)
+      connection.fail(new AcpError('output-limit', { site: 'stderr-output' }));
   });
   child.stdin.on('error', () =>
     connection.fail(new AcpError('protocol', { site: 'stdin-stream' })),
