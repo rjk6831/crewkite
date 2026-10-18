@@ -877,6 +877,9 @@ test('the acp protocol consumes one complete live permission and never treats co
     'late-permission',
     'open-tools',
     'pending-end',
+    'late-message',
+    'open-edits',
+    'hunk-open',
   ] as const) {
     const f = fixture(scenario);
     let permissions = 0,
@@ -969,6 +972,28 @@ test('the acp protocol consumes one complete live permission and never treats co
         assert.equal(outcome.metadata?.stopReason, 'end_turn');
         assert.equal(outcome.openToolCount, 3);
         assert.deepEqual(outcome.openToolKinds, ['read', 'search', 'execute']);
+      } else if (scenario === 'late-message') {
+        // Agent text while close is pending fails the turn but keeps its terminal outcome.
+        assert.equal(outcome.reason, 'protocol');
+        assert.equal(outcome.metadata?.stopReason, 'end_turn');
+        assert.equal(outcome.trailingUpdates, 0);
+        assert.deepEqual(outcome.diagnostic, {
+          site: 'notification-after-terminal',
+          method: 'session/update',
+          sessionUpdate: 'agent_message_chunk',
+        });
+        assert(!JSON.stringify(outcome).includes('private-'));
+      } else if (scenario === 'open-edits' || scenario === 'hunk-open') {
+        // Open edit, delete and move tools, and an approved edit still open under another
+        // kind, each leave the target undecided.
+        assert.equal(outcome.reason, 'protocol');
+        assert.equal(outcome.metadata, null);
+        assert.equal(permissions, scenario === 'hunk-open' ? 1 : 0);
+        assert.deepEqual(outcome.diagnostic, {
+          site: 'incomplete-tool-terminal',
+          method: 'session/prompt',
+          pendingToolCount: scenario === 'hunk-open' ? 1 : 3,
+        });
       } else if (scenario === 'pending-end') {
         // A permission still pending at the terminal response refuses the turn.
         assert.equal(outcome.reason, 'protocol');

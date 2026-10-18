@@ -42,6 +42,9 @@ export const acpPeerCases = [
   'late-permission',
   'open-tools',
   'pending-end',
+  'late-message',
+  'open-edits',
+  'hunk-open',
 ] as const;
 export type AcpPeerCase = (typeof acpPeerCases)[number];
 
@@ -325,9 +328,11 @@ export function runAcpPeer(scenario: AcpPeerCase) {
             update({ sessionUpdate: 'tool_call_update', toolCallId, status: 'completed' });
           }
           terminal('end_turn');
-        } else if (scenario === 'open-tools') {
-          // Read, search and background exec tools stay open across the turn end.
-          for (const kind of ['read', 'search', 'execute'])
+        } else if (scenario === 'open-tools' || scenario === 'open-edits') {
+          // Tools that stay open across the turn end.
+          for (const kind of scenario === 'open-tools'
+            ? ['read', 'search', 'execute']
+            : ['edit', 'delete', 'move'])
             update({
               sessionUpdate: 'tool_call',
               toolCallId: `fixture-open-${kind}`,
@@ -375,6 +380,11 @@ export function runAcpPeer(scenario: AcpPeerCase) {
           });
           return;
         }
+        if (scenario === 'late-message')
+          update({
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'private-late-text' },
+          });
         if (scenario === 'late-permission')
           emit({
             jsonrpc: '2.0',
@@ -396,10 +406,13 @@ export function runAcpPeer(scenario: AcpPeerCase) {
             join(cwd, 'net.mjs'),
             `export const total = ${scenario === 'hunk-after-mismatch' ? 2 : hunkStep || 1};\n`,
           );
+          // The approved edit can stay open and report a different kind.
           update({
             sessionUpdate: 'tool_call_update',
             toolCallId: hunkStep ? `fixture-hunk-${hunkStep}` : 'fixture-tool',
-            status: 'completed',
+            ...(scenario === 'hunk-open'
+              ? { status: 'in_progress', kind: 'other' }
+              : { status: 'completed' }),
           });
           if (hunkStep === 1 && ['hunk-sequential', 'hunk-drift'].includes(scenario)) {
             if (scenario === 'hunk-drift')
