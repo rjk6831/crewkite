@@ -21,6 +21,7 @@ import {
   type AcpProcessOptions,
   acpIdentifier,
   acpMethod,
+  acpSessionUpdate,
   acpValidate,
   startAcpProcess,
 } from './client.ts';
@@ -502,6 +503,15 @@ function activityLocations(root: string, locations: Tool['locations']) {
       : [];
   });
 }
+const editArgumentNames = AcpDiagnosticSchema.shape.editArguments.unwrap().element.options;
+const knownEditArguments = new Set<string>(editArgumentNames.filter((name) => name !== 'other'));
+function editArguments(input: unknown): AcpDiagnostic['editArguments'] {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return undefined;
+  const names = Object.keys(input);
+  return editArgumentNames.filter((name) =>
+    name === 'other' ? names.some((key) => !knownEditArguments.has(key)) : names.includes(name),
+  );
+}
 function mergeTool(previous: Tool | undefined, patch: Tool): Tool {
   const next = { ...previous, toolCallId: patch.toolCallId } as Tool;
   for (const [key, value] of Object.entries(patch))
@@ -690,7 +700,14 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
             return reject(id, diagnostic);
           diagnostic = { site: 'permission-request', method: 'session/request_permission' };
           const request = permission.parse(params);
-          diagnostic = { site: 'permission-options', method: 'session/request_permission' };
+          const tool = mergeTool(tools.get(request.toolCall.toolCallId), request.toolCall);
+          const carried = editArguments(tool.rawInput);
+          const at = (site: AcpDiagnostic['site']): AcpDiagnostic => ({
+            site,
+            method: 'session/request_permission',
+            ...(carried ? { editArguments: carried } : {}),
+          });
+          diagnostic = at('permission-options');
           if (
             request.sessionId !== sessionId ||
             seenTools.has(request.toolCall.toolCallId) ||
@@ -700,8 +717,7 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
             return reject(id, diagnostic);
           const choices = request.options.filter((v) => v.kind === 'allow_once');
           if (choices.length !== 1) return reject(id, diagnostic);
-          const tool = mergeTool(tools.get(request.toolCall.toolCallId), request.toolCall);
-          diagnostic = { site: 'permission-action', method: 'session/request_permission' };
+          diagnostic = at('permission-action');
           const detail = decodeAcpPermissionAction({
             tool,
             client: options.client,
@@ -729,7 +745,7 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
           Object.freeze(proposal.detail);
           Object.freeze(proposal.acpTarget);
           Object.freeze(proposal);
-          diagnostic = { site: 'permission-binding', method: 'session/request_permission' };
+          diagnostic = at('permission-binding');
           const binding = ApprovalBindingSchema.parse(options.onPermission(proposal));
           if (cancelled || !armed || settled) {
             connection.respond(id, { outcome: { outcome: 'cancelled' } });
@@ -797,8 +813,7 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
           z.object({ sessionUpdate: z.string() }).passthrough().parse(params.update),
         );
         const kind = update.sessionUpdate;
-        const sessionUpdate =
-          AcpDiagnosticSchema.shape.sessionUpdate.unwrap().safeParse(kind).data ?? 'other';
+        const sessionUpdate = acpSessionUpdate(update);
         const diagnostic = (site: AcpDiagnostic['site']): AcpDiagnostic => ({
           site,
           method: 'session/update',
@@ -852,7 +867,9 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
             );
             if (content.type === 'text') output = content.text ?? '';
           }
-          options.onActivity(supported.data, output);
+          acpValidate(diagnostic('activity-sink'), () =>
+            options.onActivity(supported.data, output),
+          );
         }
       };
       replay();

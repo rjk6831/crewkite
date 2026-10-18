@@ -52,6 +52,7 @@ export const AcpDiagnosticSchema = z.strictObject({
     'tool-duplicate',
     'permission-drift',
     'message-content',
+    'activity-sink',
     'request-method',
     'permission-request',
     'permission-options',
@@ -92,10 +93,33 @@ export const AcpDiagnosticSchema = z.strictObject({
     .optional(),
   rpcCode: z.number().int().safe().optional(),
   pendingToolCount: z.number().int().min(0).max(256).optional(),
+  // A refused edit keeps the names of the arguments it carried, never their values.
+  editArguments: z
+    .array(
+      z.enum([
+        'TargetFile',
+        'TargetContent',
+        'ReplacementContent',
+        'AllowMultiple',
+        'StartLine',
+        'EndLine',
+        'other',
+      ]),
+    )
+    .max(7)
+    .refine((names) => new Set(names).size === names.length)
+    .optional(),
 });
 export type AcpDiagnostic = z.infer<typeof AcpDiagnosticSchema>;
 export function acpMethod(method: string): NonNullable<AcpDiagnostic['method']> {
   return AcpDiagnosticSchema.shape.method.unwrap().safeParse(method).data ?? 'other';
+}
+export function acpSessionUpdate(update: unknown): NonNullable<AcpDiagnostic['sessionUpdate']> {
+  const kind =
+    update && typeof update === 'object'
+      ? (update as { sessionUpdate?: unknown }).sessionUpdate
+      : undefined;
+  return AcpDiagnosticSchema.shape.sessionUpdate.unwrap().safeParse(kind).data ?? 'other';
 }
 export function acpErrorAt(error: unknown, diagnostic: AcpDiagnostic): AcpError {
   return new AcpError(
@@ -314,7 +338,13 @@ export class AcpConnection {
         if (value.method !== undefined) {
           if (hasResult || value.error) throw new AcpError('protocol');
           if (value.id === undefined) {
-            diagnostic = { site: 'notification', method: acpMethod(value.method) };
+            diagnostic = {
+              site: 'notification',
+              method: acpMethod(value.method),
+              ...(value.method === 'session/update'
+                ? { sessionUpdate: acpSessionUpdate(value.params?.update) }
+                : {}),
+            };
             this.onNotification(value.method, value.params ?? {});
           } else {
             if (this.seen.has(value.id) || this.seen.size >= 128 || this.incoming.size >= 16)

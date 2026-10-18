@@ -929,7 +929,13 @@ test('the acp protocol consumes one complete live permission and never treats co
           locations: [{ path: target.path }],
         });
       if (scenario === 'ambiguous') assert.equal(outcome.diagnostic?.site, 'permission-options');
-      if (scenario === 'hunk-control') assert.equal(outcome.diagnostic?.site, 'permission-action');
+      // The refused edit names its argument classes and carries none of their values.
+      if (scenario === 'hunk-control')
+        assert.deepEqual(outcome.diagnostic, {
+          site: 'permission-action',
+          method: 'session/request_permission',
+          editArguments: ['TargetFile', 'TargetContent', 'ReplacementContent', 'AllowMultiple'],
+        });
       if (scenario === 'duplicate') assert.equal(outcome.diagnostic?.site, 'correlation');
       assert.equal(usages, 1, scenario);
       assert(!Object.hasOwn(outcome, 'observations'));
@@ -1121,6 +1127,24 @@ setInterval(() => {}, 1000);
   } finally {
     late.dispose();
   }
+  const sink = fixture('complete');
+  try {
+    const outcome = await writer(sink, {
+      onActivity: () => {
+        throw Error('private-sink-failure');
+      },
+    }).result;
+    assert.equal(outcome.reason, 'protocol');
+    assert.deepEqual(outcome.diagnostic, {
+      site: 'activity-sink',
+      method: 'session/update',
+      sessionUpdate: 'usage_update',
+    });
+    assert.equal(outcome.metadata, null);
+    assert(outcome.quiescent);
+  } finally {
+    sink.dispose();
+  }
   const timed = fixture('cancel');
   try {
     const timers: { work: () => void; ms: number }[] = [];
@@ -1167,6 +1191,13 @@ setInterval(() => {}, 1000);
       { site: 'rpc-result', method: 'session/prompt' },
     ],
     ['eof', Buffer.alloc(0), { site: 'eof-pending' }],
+    [
+      'notification',
+      Buffer.from(
+        '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"private-tool"}}}\n',
+      ),
+      { site: 'notification', method: 'session/update', sessionUpdate: 'tool_call' },
+    ],
   ] as const) {
     const stream = new (await import('node:stream')).PassThrough();
     const connection = new AcpConnection(stream, () => {});
