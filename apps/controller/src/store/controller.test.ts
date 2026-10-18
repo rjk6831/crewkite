@@ -151,6 +151,10 @@ test('a stale task revision leaves the current task and event cursor intact', as
     .get()?.count;
   await controller.execute(command('GetSnapshot', {}), 'local-owner');
   await controller.execute(command('GetUsage', {}), 'local-owner');
+  assert.deepEqual(await controller.execute(command('GetHealth', {}), 'local-owner'), {
+    outcome: 'applied',
+    data: { kind: 'health', status: 'ready', version: '0.0.0', blockers: [] },
+  });
   assert.equal(
     controller.store.db.prepare('SELECT COUNT(*) AS count FROM receipts').get()?.count,
     receipts,
@@ -159,6 +163,16 @@ test('a stale task revision leaves the current task and event cursor intact', as
     (await controller.execute(command('GetSnapshot', {}), 'untrusted')).outcome,
     'denied',
   );
+  assert.deepEqual(await controller.execute(command('GetHealth', {}), 'untrusted'), {
+    outcome: 'denied',
+    reason: 'unauthenticated-actor',
+    next: 'Connect through the private authenticated socket.',
+  });
+  await controller.close();
+  assert.deepEqual(await controller.execute(command('GetHealth', {}), 'local-owner'), {
+    outcome: 'blocked',
+    reason: 'controller-closing',
+  });
 });
 
 test('a prepared draft is editable only before it has pending work', async (t) => {

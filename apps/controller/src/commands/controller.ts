@@ -2670,9 +2670,9 @@ export class Controller {
           outcome: 'applied',
           data: {
             kind: 'health',
-            status: 'degraded',
+            status: 'ready',
             version: '0.0.0',
-            blockers: ['Only scripted routes are qualified in D0.'],
+            blockers: [],
           },
         };
       default:

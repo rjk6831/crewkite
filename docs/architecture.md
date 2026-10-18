@@ -123,7 +123,7 @@ The command set for the first release:
 | `GetChanges`, `GetArtifact`, `GetUsage` | Bounded reads of immutable content and sourced usage observations |
 | `GetTaskActivity` | Bounded pages of retained task events using an exclusive cursor, with no mutation authority |
 | `AcceptCandidate` | Eligible candidate, current authority, an unused destination ref, idempotent publication |
-| `GetHealth`, `ExportDiagnostics` | Runtime and qualification state; diagnostic export remains unsupported |
+| `GetHealth`, `ExportDiagnostics` | Controller availability; provider qualification remains profile-specific and diagnostic export remains unsupported |
 
 The controller exposes registered project and artifact IDs. It exposes no arbitrary shell, URL fetch or unrestricted file-read command. Public command payloads accept no connection credential value.
 
