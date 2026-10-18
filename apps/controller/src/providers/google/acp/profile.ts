@@ -132,19 +132,24 @@ export function acpReviewMappingMatchesClient(
   );
 }
 
-export function validateAcpClientIdentity(client: AcpClientIdentity): AcpClientIdentity {
+/** Spawn keeps the default full hash. Only profile resolution reuses a matching digest. */
+export function validateAcpClientIdentity(
+  client: AcpClientIdentity,
+  reuse = false,
+): AcpClientIdentity {
   const parsed = z
     .strictObject({ ...AcpImportIdentitySchema.shape, executable: z.string().min(1).max(4096) })
     .parse(client);
   if (!isAbsolute(parsed.executable) || resolve(parsed.executable) !== parsed.executable)
     throw new Error('Invalid managed executable path.');
-  if (hashAcpPrivateFile(parsed.executable, AcpServerMaximumBytes, true) !== parsed.sha256)
+  if (hashAcpPrivateFile(parsed.executable, AcpServerMaximumBytes, true, reuse) !== parsed.sha256)
     throw new Error('Managed executable changed.');
   if (
     hashAcpPrivateFile(
       join(dirname(parsed.executable), 'localharness_external'),
       AcpHarnessMaximumBytes,
       true,
+      reuse,
     ) !== parsed.harnessSha256
   )
     throw new Error('Managed harness changed.');
@@ -260,13 +265,45 @@ export function readAcpPrivateFile(path: string, maximum: number, executable = f
   }
 }
 
-export function hashAcpPrivateFile(path: string, maximum: number, executable = false): string {
-  return createHash('sha256')
-    .update(readAcpPrivateFile(path, maximum, executable))
-    .digest('hex');
+// Profile resolution runs for every ACP notification and snapshot, and the
+// managed bundle is about 400 MB. Hashing it each time stalls the event loop.
+// A write, chmod, link or replacement changes the inode or ctime, so matching
+// metadata reuses the last full digest.
+// shortcut: a filesystem with coarse timestamps could hide a same-size rewrite
+// inside one tick. Upgrade: skip reuse while ctime is within two seconds of the hash.
+const digests = new Map<string, { key: string; sha256: string }>();
+function digestKey(path: string, maximum: number, executable: boolean) {
+  const state = lstatSync(path, { bigint: true });
+  return [
+    maximum,
+    executable,
+    state.dev,
+    state.ino,
+    state.size,
+    state.mtimeNs,
+    state.ctimeNs,
+    state.mode,
+  ].join(':');
 }
 
-export function readGoogleAcpPin(home: string): AcpClientIdentity {
+export function hashAcpPrivateFile(
+  path: string,
+  maximum: number,
+  executable = false,
+  reuse = false,
+): string {
+  validateAcpDirectory(dirname(path));
+  const key = digestKey(path, maximum, executable);
+  const known = digests.get(path);
+  if (reuse && known?.key === key) return known.sha256;
+  const sha256 = createHash('sha256')
+    .update(readAcpPrivateFile(path, maximum, executable))
+    .digest('hex');
+  if (digestKey(path, maximum, executable) === key) digests.set(path, { key, sha256 });
+  return sha256;
+}
+
+export function readGoogleAcpPin(home: string, reuse = false): AcpClientIdentity {
   validateAcpDirectory(home);
   const root = join(home, 'providers/google-acp-v1');
   validateAcpDirectory(root, home);
@@ -289,11 +326,14 @@ export function readGoogleAcpPin(home: string): AcpClientIdentity {
     JSON.stringify(['agy_acp_server.par', 'localharness_external'])
   )
     throw new Error('Managed bundle contains unexpected files.');
-  return validateAcpClientIdentity({
-    ...pin.client,
-    harnessSha256: pin.harness.sha256,
-    executable,
-  });
+  return validateAcpClientIdentity(
+    {
+      ...pin.client,
+      harnessSha256: pin.harness.sha256,
+      executable,
+    },
+    reuse,
+  );
 }
 
 export type AcpProfileResolution = {
@@ -328,7 +368,7 @@ export function resolveGoogleAcpProfile(
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
-    client = readGoogleAcpPin(options.home);
+    client = readGoogleAcpPin(options.home, true);
     reason = 'acp-capability-missing';
     if (options.environment.HOME !== userInfo().homedir) reason = 'native-home-unavailable';
     else {

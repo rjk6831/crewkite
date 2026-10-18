@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import {
+import fs, {
   chmodSync,
   mkdirSync,
   mkdtempSync,
@@ -10,9 +10,10 @@ import {
   truncateSync,
   writeFileSync,
 } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { userInfo } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
-import { test } from 'node:test';
+import { mock, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import type { ApprovalBinding } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
@@ -435,13 +436,35 @@ test('the acp writer binds an imported client and observed configuration before 
       resolveGoogleAcpProfile({ home: f.home, proof: f.proof, environment }).facts.available,
       false,
     );
-    assert.equal(
+    const resolved = () =>
       resolveGoogleAcpProfile(
         { home: f.home, proof: f.proof, environment },
         { reviewMappings: [f.mapping] },
-      ).facts.available,
-      true,
-    );
+      ).facts.available;
+    assert.equal(resolved(), true);
+    // Resolution repeats on every notification. An unchanged client is not
+    // read again, and a same-size rewrite in place is still detected.
+    const rewritten = readFileSync(managed.executable);
+    rewritten[0] ^= 1;
+    const opens = mock.method(fs, 'openSync');
+    syncBuiltinESMExports();
+    try {
+      const openedManaged = () =>
+        opens.mock.calls.filter((call) =>
+          [managed.executable, helperPath].includes(String(call.arguments[0])),
+        ).length;
+      assert.equal(resolved(), true);
+      assert.equal(openedManaged(), 0);
+      chmodSync(managed.executable, 0o700);
+      writeFileSync(managed.executable, rewritten);
+      chmodSync(managed.executable, 0o500);
+      opens.mock.resetCalls();
+      assert.equal(resolved(), false);
+      assert.equal(openedManaged(), 1);
+    } finally {
+      opens.mock.restore();
+      syncBuiltinESMExports();
+    }
     chmodSync(managed.executable, 0o700);
     writeFileSync(managed.executable, 'changed');
     chmodSync(managed.executable, 0o500);
