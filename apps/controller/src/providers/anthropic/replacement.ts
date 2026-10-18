@@ -24,6 +24,7 @@ import { verifyHandoff } from '@crewkite/contracts/hash';
 import { z } from 'zod';
 import { groupAbsent, type Schedule } from '../../host/worker.ts';
 import {
+  armOwnedCleanup,
   type NativeLifecycle,
   nativeAuthEnvironment,
   nativeSynchronousHook,
@@ -841,10 +842,19 @@ export function startReplacement(
     }
     if (closed && absent()) return settle();
     signal('SIGTERM');
-    const cleanup = Math.min(CLEANUP_MS, remaining());
-    timers.push(
-      schedule(() => signal('SIGKILL'), Math.min(1000, cleanup)),
-      schedule(settle, cleanup),
+    armOwnedCleanup(
+      {
+        schedule,
+        now,
+        remaining,
+        timers,
+        signal,
+        absent,
+        closed: () => closed,
+        finished: () => finished,
+        settle,
+      },
+      Math.min(CLEANUP_MS, remaining()),
     );
   };
   child.on('error', () => stop('launch'));

@@ -1052,11 +1052,12 @@ test('native text replacement stays bound to one proposal and owned task deadlin
 const {spawn}=require('node:child_process');const {MessageChannel}=require('node:worker_threads');
 const mode=process.argv[1],frames=${frames};const hold=()=>{const channel=new MessageChannel();channel.port1.on('message',()=>{});};
 process.stdin.resume();process.stdin.once('end',()=>{
+if(mode.startsWith('late-kill'))process.on('SIGTERM',()=>{});
 if(mode==='refusal')return process.stdout.write(JSON.stringify({type:'system',subtype:'model_refusal_no_fallback',session_id:frames[0].session_id,reason:${JSON.stringify(secret)}})+'\\n');
 if(mode==='limit')return process.stdout.write(Buffer.alloc(1048577,32));
 if(mode==='stderr')return process.stderr.write(Buffer.alloc(16385,32));
 if(mode==='descendant'){const child=spawn(process.execPath,['-e',"const{MessageChannel}=require('node:worker_threads');process.on('SIGTERM',()=>{});const c=new MessageChannel();c.port1.on('message',()=>{});process.send('ready');"],{stdio:['inherit','inherit','inherit','ipc']});child.once('message',()=>process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>process.exit(0)));return;}
-process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(mode==='deadline'||mode==='stop')hold();else if(mode==='trailing')process.stdout.write('{',()=>process.exit(0));else process.exit(mode==='exit' ? 1 : 0);});});`;
+process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(mode==='deadline'||mode==='stop'||mode==='queued-close'||mode.startsWith('late-kill'))hold();else if(mode==='trailing')process.stdout.write('{',()=>process.exit(0));else process.exit(mode==='exit' ? 1 : 0);});});`;
   try {
     for (const mode of [
       'success',
@@ -1079,13 +1080,31 @@ process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(
       'quiescent-promise',
       'quiescent-deadline',
       'write-failure',
+      'queued-close',
+      'late-kill',
+      'late-kill-reversed',
+      'late-kill-near-deadline',
     ]) {
       const directory = join(root, mode);
       mkdirSync(directory, { mode: 0o700 });
       let deadline: (() => void) | undefined;
       let time = 0;
       const trace: string[] = [];
-      const shortened = mode.includes('deadline') && mode !== 'deadline';
+      // These rows drive the stop timers by hand, so no real timer can run ahead of them.
+      const manual = mode === 'queued-close' || mode.startsWith('late-kill');
+      const shortened =
+        mode.includes('deadline') && mode !== 'deadline' && !mode.startsWith('late');
+      const timers: Array<{ delay: number; work: () => void; live: boolean }> = [];
+      let callbackError: unknown;
+      // Every due callback is found before the first one runs, so the order stays the test's.
+      const fire = (order: number[]) => {
+        const due = order.map((delay) => {
+          const row = timers.find((timer) => timer.live && timer.delay === delay);
+          assert(row, `${mode}: pending ${delay}ms callback`);
+          return row;
+        });
+        for (const row of due) row.work();
+      };
       let received!: () => void;
       const output = new Promise<void>((resolve) => {
         received = resolve;
@@ -1146,6 +1165,13 @@ process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(
                 deadline = undefined;
               };
             }
+            if (manual) {
+              const row = { delay, work, live: true };
+              timers.push(row);
+              return () => {
+                row.live = false;
+              };
+            }
             const timer = setTimeout(work, delay);
             return () => clearTimeout(timer);
           },
@@ -1164,6 +1190,17 @@ process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(
             );
             child.stdout.once('data', () => received());
             owned.push({ child, closed: new Promise((resolve) => child.once('close', resolve)) });
+            // This listener runs before the process handler's own. The cutoff then meets an
+            // exited group whose stream-close event is still queued.
+            if (mode === 'queued-close')
+              child.once('exit', () => {
+                try {
+                  time = 2000;
+                  fire([1000, 2000]);
+                } catch (error) {
+                  callbackError = error;
+                }
+              });
             const end = child.stdin.end;
             child.stdin.end = function (...args: unknown[]) {
               if (typeof args[0] === 'string') {
@@ -1176,14 +1213,33 @@ process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(
           }) as typeof spawn,
         },
       );
-      if (mode === 'deadline' || mode === 'stop') {
+      if (mode === 'deadline' || mode === 'stop' || manual) {
         await output;
         if (mode === 'deadline') {
           assert(deadline);
           deadline();
         } else handle.stop();
       }
+      if (mode.startsWith('late-kill')) {
+        // A blocked loop runs the stop timers in one pass. Node runs one duration list at a
+        // time, so an older 2000 ms list can reach the verdict before the kill.
+        time = mode === 'late-kill-near-deadline' ? 299_500 : 2000;
+        fire(mode === 'late-kill-reversed' ? [2000, 1000] : [1000, 2000]);
+      }
       const outcome = await handle.result;
+      assert.ifError(callbackError);
+      if (manual) {
+        if (mode === 'late-kill-near-deadline')
+          assert(
+            timers.some((timer) => timer.delay === 500),
+            `${mode}: the late kill waits only until the deadline`,
+          );
+        assert.equal(
+          timers.some((timer) => timer.live),
+          false,
+          `${mode}: settlement cancels every timer`,
+        );
+      }
       assert(outcome.quiescent, mode);
       assert(groupAbsent(handle.group), mode);
       assert(!JSON.stringify(outcome).includes(secret), mode);
@@ -1221,6 +1277,10 @@ process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(
             {
               deadline: 'deadline',
               stop: 'stopped',
+              'queued-close': 'stopped',
+              'late-kill': 'stopped',
+              'late-kill-reversed': 'stopped',
+              'late-kill-near-deadline': 'stopped',
               limit: 'limit',
               stderr: 'limit',
               trailing: 'protocol',
@@ -1299,8 +1359,15 @@ process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(
       assert.equal(launched, false, mode);
     }
   } finally {
-    for (const { child } of owned)
-      if (child.pid && !groupAbsent(child.pid)) process.kill(-child.pid, 'SIGKILL');
+    for (const { child } of owned) {
+      if (child.pid && !groupAbsent(child.pid)) {
+        try {
+          process.kill(-child.pid, 'SIGKILL');
+        } catch {
+          // An unreaped leader can refuse the signal. The closure check below still decides.
+        }
+      }
+    }
     let timer: ReturnType<typeof setTimeout> | undefined;
     const closed = await Promise.race([
       Promise.all(owned.map((value) => value.closed)).then(() => true),

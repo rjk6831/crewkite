@@ -50,6 +50,57 @@ export function nativeSynchronousHook(work: () => unknown) {
   }
 }
 
+type CleanupOwner = {
+  schedule: Schedule;
+  now: () => number;
+  remaining: () => number;
+  timers: Array<() => void>;
+  signal: (value: NodeJS.Signals) => void;
+  absent: () => boolean;
+  closed: () => boolean;
+  finished: () => boolean;
+  settle: () => void;
+};
+
+/**
+ * Arms the kill at one second and the ownership verdict at the cutoff, after SIGTERM went out.
+ * Timers run before the poll phase that reaps children. When synchronous work holds the loop
+ * past the cutoff, the kill and the verdict run in one pass, microseconds apart, and the
+ * verdict finds the group present. Node also runs one timer list per duration at a time, so an
+ * older cutoff timer can reach the verdict before the kill. The verdict therefore waits one
+ * poll phase, which lets the kill go out and the child be reaped. A group that is still present
+ * gets a full second from its kill, capped by the deadline.
+ */
+export function armOwnedCleanup(owner: CleanupOwner, cutoff: number) {
+  let killedAt: number | undefined;
+  const settleAtCutoff = () => {
+    // An exited group can precede delivery of its final stream-close event.
+    if (!owner.closed() && owner.absent()) owner.timers.push(owner.schedule(owner.settle, 0));
+    else owner.settle();
+  };
+  owner.timers.push(
+    owner.schedule(
+      () => {
+        killedAt = owner.now();
+        owner.signal('SIGKILL');
+      },
+      Math.min(1000, cutoff),
+    ),
+    owner.schedule(() => {
+      if (owner.finished()) return;
+      if (owner.absent()) return settleAtCutoff();
+      setImmediate(() => {
+        if (owner.finished()) return;
+        if (owner.absent()) return settleAtCutoff();
+        const late = killedAt === undefined ? 0 : killedAt + 1000 - owner.now();
+        const wait = Math.min(late, owner.remaining());
+        if (wait > 0) owner.timers.push(owner.schedule(settleAtCutoff, wait));
+        else owner.settle();
+      });
+    }, cutoff),
+  );
+}
+
 type Spawn = (
   executable: string,
   args: string[],
@@ -290,9 +341,20 @@ export function startNativeAuthStatus(
     }
     if (closed && absent()) return settle();
     signal('SIGTERM');
-    const cleanup = Math.min(2000, remaining());
-    cancellations.push(schedule(() => signal('SIGKILL'), Math.min(1000, cleanup)));
-    cancellations.push(schedule(settle, cleanup));
+    armOwnedCleanup(
+      {
+        schedule,
+        now,
+        remaining,
+        timers: cancellations,
+        signal,
+        absent,
+        closed: () => closed,
+        finished: () => finished,
+        settle,
+      },
+      Math.min(2000, remaining()),
+    );
   };
   child.stdin.on('error', () => stop('launch'));
   child.on('error', () => stop('launch'));

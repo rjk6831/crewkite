@@ -225,6 +225,91 @@ test('authentication metadata waits for bounded owned child and descendant clean
       }
     }
     for (const mode of [
+      'queued-close',
+      'late-kill',
+      'late-kill-reversed',
+      'late-kill-near-deadline',
+    ]) {
+      const directory = join(root, mode);
+      mkdirSync(directory, { mode: 0o700 });
+      let time = 0;
+      let ready!: () => void;
+      const output = new Promise<void>((resolve) => {
+        ready = resolve;
+      });
+      let callbackError: unknown;
+      const timers: Array<{ milliseconds: number; work: () => void; live: boolean }> = [];
+      // Every due callback is found before the first one runs, so the order stays the test's.
+      const fire = (order: number[]) => {
+        const due = order.map((milliseconds) => {
+          const row = timers.find((timer) => timer.live && timer.milliseconds === milliseconds);
+          assert(row, `${mode}: pending ${milliseconds}ms callback`);
+          return row;
+        });
+        for (const row of due) row.work();
+      };
+      const handle = startNativeAuthStatus(
+        { executable: process.execPath, sha256, directory, repositoryRoot: root, environment },
+        {
+          now: () => time,
+          schedule: (work, milliseconds) => {
+            const row = { milliseconds, work, live: true };
+            timers.push(row);
+            return () => {
+              row.live = false;
+            };
+          },
+          spawn: (_executable, _argv, options) => {
+            const child = spawn(
+              process.execPath,
+              ['-e', fixture, mode === 'queued-close' ? 'stopped' : 'stubborn'],
+              options,
+            );
+            child.stdout.once('data', () => ready());
+            owned.push({
+              child,
+              closed: new Promise((resolve) => child.once('close', () => resolve())),
+            });
+            // This listener runs before the process handler's own. The cutoff then meets an
+            // exited group whose stream-close event is still queued.
+            if (mode === 'queued-close')
+              child.once('exit', () => {
+                try {
+                  time = 2000;
+                  fire([1000, 2000]);
+                } catch (error) {
+                  callbackError = error;
+                }
+              });
+            return child;
+          },
+        },
+      );
+      await output;
+      handle.stop();
+      if (mode !== 'queued-close') {
+        // A blocked loop runs the stop timers in one pass. Node runs one duration list at a
+        // time, so an older 2000 ms list can reach the verdict before the kill.
+        time = mode === 'late-kill-near-deadline' ? 29_500 : 2000;
+        fire(mode === 'late-kill-reversed' ? [2000, 1000] : [1000, 2000]);
+      }
+      const result = await handle.result;
+      assert.ifError(callbackError);
+      assert.equal(result.quiescent, true, mode);
+      assert.equal(result.reason, 'stopped', mode);
+      assert(groupAbsent(handle.group), mode);
+      if (mode === 'late-kill-near-deadline')
+        assert(
+          timers.some((timer) => timer.milliseconds === 500),
+          `${mode}: the late kill waits only until the deadline`,
+        );
+      assert.equal(
+        timers.some((timer) => timer.live),
+        false,
+        `${mode}: settlement cancels every timer`,
+      );
+    }
+    for (const mode of [
       'expired',
       'validation-time',
       'before-time',
