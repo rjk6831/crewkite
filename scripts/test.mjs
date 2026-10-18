@@ -1,5 +1,7 @@
-import { spawnSync } from 'node:child_process';
 import { globSync } from 'node:fs';
+import { finished } from 'node:stream/promises';
+import { run } from 'node:test';
+import { spec } from 'node:test/reporters';
 
 const priority = new Map([
   ['apps/controller/src/store/combined.test.ts', 0],
@@ -18,8 +20,10 @@ const files = [
     left.localeCompare(right),
 );
 if (files.length === 0) throw new Error('No repository tests were found.');
-const result = spawnSync(process.execPath, ['--test', '--test-concurrency=3', ...files], {
-  stdio: 'inherit',
+const tests = run({ files, concurrency: 3 });
+tests.on('test:summary', ({ success }) => {
+  if (!success) process.exitCode = 1;
 });
-if (result.error) throw result.error;
-process.exitCode = result.status ?? 1;
+const report = tests.compose(spec);
+report.pipe(process.stdout);
+await finished(report);
