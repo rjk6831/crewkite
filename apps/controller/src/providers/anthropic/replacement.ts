@@ -361,93 +361,6 @@ export function anthropicUsageObservations(
     confidence: 'reported' as const,
   }));
 }
-const envelopes = [
-  'system',
-  'assistant',
-  'result',
-  'control_request',
-  'user',
-  'stream_event',
-  'tool_progress',
-  'auth_status',
-  'tool_use_summary',
-  'rate_limit_event',
-  'prompt_suggestion',
-  'conversation_reset',
-] as const;
-
-const subtypes = [
-  'init',
-  'api_retry',
-  'status',
-  'agents_killed',
-  'away_summary',
-  'compact_boundary',
-  'control_request_progress',
-  'instruction_size_warning',
-  'local_command',
-  'memory_saved',
-  'mirror_error',
-  'model_refusal_fallback',
-  'permission_retry',
-  'post_turn_summary',
-  'session_metadata',
-  'stop_hook_summary',
-  'task_notification',
-  'task_started',
-  'task_summary',
-  'thinking',
-  'hook_started',
-  'hook_progress',
-  'hook_response',
-  'plugin_install',
-  'informational',
-  'permission_denied',
-  'success',
-  'error_during_execution',
-  'error_max_turns',
-  'error_max_budget_usd',
-  'error_max_structured_output_retries',
-  'model_refusal_no_fallback',
-  'model_fallback',
-  'model_consent_fallback',
-  'file_snapshot',
-  'scheduled_task_fire',
-  'peer_message_hold',
-  'turn_duration',
-  'api_error',
-  'local_command_output',
-  'files_persisted',
-  'task_updated',
-  'background_tasks_changed',
-  'feedback_draft_queued',
-  'session_state_changed',
-  'session_title_changed',
-  'worker_shutting_down',
-  'turn_handoff_available',
-  'ui_invalidate',
-  'ui_log',
-  'ui_toast',
-  'ui_status',
-  'ui_panes',
-  'ui_scroll',
-  'ui_focus',
-  'commands_changed',
-  'notification',
-  'task_progress',
-  'thinking_tokens',
-  'memory_recall',
-  'elicitation_complete',
-  'permission_check_status',
-  'code_change_published',
-  'vcs_state_changed',
-  'dev_intent',
-  'turn_preempted',
-  'per_turn_effort_changed',
-  'file_attachments_missing',
-  'cloud_session_delta',
-  'upgrade_relay_marker',
-] as const;
 const fields = [
   'session_id',
   'type',
@@ -504,6 +417,11 @@ const authoritySubtypes = new Set([
   'model_refusal_no_fallback',
 ]);
 
+// A diagnostic names the frame and never quotes it. Only a plain identifier of at most 64
+// characters counts as a name, so no frame content can ride along in a type or subtype.
+const protocolName = (value: unknown) =>
+  typeof value === 'string' && PROTOCOL_NAME.test(value) ? value : 'other';
+
 /** The census name of a frame the decoder drops, or null when the frame needs a handler. */
 function progressFrame(record: Record<string, unknown>) {
   const { type, subtype } = record;
@@ -531,8 +449,9 @@ export type ReplacementDiagnostic = Readonly<{
     | 'replacement'
     | 'finish';
   cause: 'validation' | 'correlation' | 'invalid-json' | 'unsupported' | 'limit' | 'incomplete';
-  envelope: (typeof envelopes)[number] | 'none' | 'other' | 'invalid-json';
-  subtype: (typeof subtypes)[number] | 'other' | null;
+  // The client's own frame name, or 'other' when the name is not a plain identifier.
+  envelope: string;
+  subtype: string | null;
   field: (typeof fields)[number] | 'other' | null;
 }>;
 
@@ -624,11 +543,8 @@ export class ReplacementStream {
         this.pending = [];
         const record = value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
         const type = record.type;
-        this.envelope = envelopes.find((envelope) => envelope === type) ?? 'other';
-        this.subtype =
-          record.subtype === undefined
-            ? null
-            : (subtypes.find((subtype) => subtype === record.subtype) ?? 'other');
+        this.envelope = protocolName(type);
+        this.subtype = record.subtype === undefined ? null : protocolName(record.subtype);
         if (this.terminal) this.fail('protocol', 'unsupported');
         this.site = 'identity';
         const envelope = identity.parse(value);

@@ -873,6 +873,37 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       frames: [init, { ...frame, session_id: input.sessionId }, result],
       diagnostic: { stage: 'output', envelope: frame.type === 'system' ? 'system' : 'other' },
     })),
+    {
+      name: 'an unlisted result subtype is reported by its protocol name',
+      frames: [
+        init,
+        {
+          type: 'result',
+          subtype: 'error_future_limit',
+          is_error: true,
+          session_id: input.sessionId,
+        },
+      ],
+      diagnostic: { site: 'result', envelope: 'result', subtype: 'error_future_limit' },
+    },
+    ...[
+      { label: 'plain identifier', name: 'future_frame', reported: 'future_frame' },
+      { label: 'identifier of 64 characters', name: 'a'.repeat(64), reported: 'a'.repeat(64) },
+      { label: 'identifier of 65 characters', name: 'a'.repeat(65), reported: 'other' },
+      { label: 'upper case letter', name: 'Future_frame', reported: 'other' },
+      { label: 'hyphen', name: 'future-frame', reported: 'other' },
+      { label: 'leading digit', name: '1_future_frame', reported: 'other' },
+      { label: 'empty string', name: '', reported: 'other' },
+      { label: 'account text', name: secret, reported: 'other' },
+    ].map(({ label, name, reported }) => ({
+      name: `frame name with ${label} reports ${reported === 'other' ? 'other' : 'itself'}`,
+      frames: [
+        init,
+        { type: name, subtype: name, session_id: '46eb17cd-01e8-480d-99f4-a741f189715e' },
+        result,
+      ],
+      diagnostic: { site: 'identity', cause: 'correlation', envelope: reported, subtype: reported },
+    })),
     { name: 'missing result', frames: [init] },
   ];
   for (const row of cases) {
