@@ -9,6 +9,7 @@ import {
   NativeTargetPathSchema,
   RevisionSchema,
 } from '@crewkite/contracts';
+import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
 import { localConfiguredConnectionHash } from './connection.ts';
 
@@ -141,12 +142,24 @@ export const ProofSchema = z
       .positive()
       .max(CONTEXT_TOKENS - LEGACY_OUTPUT_TOKENS),
     outputBytes: z.number().int().nonnegative().safe(),
+    structured: z
+      .strictObject({
+        schemaHash: HashSchema,
+        reasoningBytes: z.number().int().nonnegative().max(MAX_STREAM_BYTES),
+        nonReasoningBytes: z.number().int().nonnegative().max(MAX_STREAM_BYTES),
+      })
+      .optional(),
     contextLength: z.literal(CONTEXT_TOKENS),
     maxTokens: LocalNativeProfileSchema.shape.maximumOutputTokens,
     contextOverflowPolicy: z.literal('stopAtLimit'),
     draftModel: z.literal(''),
   })
-  .refine((proof) => proof.renderedPromptTokens + proof.maxTokens <= proof.contextLength);
+  .refine((proof) => proof.renderedPromptTokens + proof.maxTokens <= proof.contextLength)
+  .refine(
+    (proof) =>
+      !proof.structured ||
+      proof.structured.reasoningBytes + proof.structured.nonReasoningBytes <= proof.outputBytes,
+  );
 export const ReasonSchema = z.enum([
   'input',
   'identity',
@@ -174,6 +187,7 @@ export const ConfigurationDetailSchema = z
       'draft-stats',
       'round-index',
       'max-tokens',
+      'structured-output',
     ]),
     status: z.enum(['missing', 'malformed', 'duplicate', 'mismatch']),
   })
@@ -209,6 +223,22 @@ export type LocalStart = z.output<typeof StartSchema>;
 export type LocalBinding = z.output<typeof BindingSchema>;
 export type LocalTerminal = z.output<typeof TerminalSchema>;
 export type LocalReason = z.output<typeof ReasonSchema>;
+
+export function localStructuredOutput(binding: LocalBinding) {
+  const jsonSchema = {
+    type: 'object',
+    properties: {
+      version: { const: 1 },
+      attemptId: { const: binding.attemptId },
+      path: { const: binding.path },
+      baseHash: { const: binding.baseHash },
+      content: { type: 'string', maxLength: MAX_CONTENT_BYTES },
+    },
+    required: ['version', 'attemptId', 'path', 'baseHash', 'content'],
+    additionalProperties: false,
+  };
+  return { format: { type: 'json' as const, jsonSchema }, schemaHash: hashCanonical(jsonSchema) };
+}
 
 export function localPlan(value: unknown): LocalStart {
   const plan = StartSchema.parse(value);

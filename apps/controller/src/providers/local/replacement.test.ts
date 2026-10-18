@@ -16,6 +16,7 @@ import {
   type LocalTerminal,
   localDiscoveryPlan,
   localPlan,
+  localStructuredOutput,
   TerminalSchema,
 } from './profile.ts';
 import { startLocalDiscovery, startLocalReplacement } from './replacement.ts';
@@ -93,6 +94,7 @@ function terminal(
       'llm.prediction.maxPredictedTokens': { checked: true, value: maximumOutputTokens },
       'llm.prediction.contextOverflowPolicy': 'stopAtLimit',
       'llm.prediction.speculativeDecoding.draftModel': '',
+      'llm.prediction.structured': localStructuredOutput(plan.binding).format,
     }),
   } satisfies PredictionResult;
 }
@@ -704,6 +706,21 @@ test('Local ownership needs the same prediction terminal after cancellation or c
     assert.equal(markers, fits ? 1 : 0, label);
     if (fits) {
       assert.equal(f.options?.maxTokens, cap, label);
+      assert.deepEqual(f.options?.structured, {
+        type: 'json',
+        jsonSchema: {
+          type: 'object',
+          properties: {
+            version: { const: 1 },
+            attemptId: { const: plan.binding.attemptId },
+            path: { const: plan.binding.path },
+            baseHash: { const: plan.binding.baseHash },
+            content: { type: 'string', maxLength: 65536 },
+          },
+          required: ['version', 'attemptId', 'path', 'baseHash', 'content'],
+          additionalProperties: false,
+        },
+      });
       const value = terminal(row.stop, 'terminalCap' in row ? row.terminalCap : cap);
       if (row.stop === 'maxPredictedTokensReached') {
         value.nonReasoningContent = '{"version":';
@@ -728,6 +745,10 @@ test('Local ownership needs the same prediction terminal after cancellation or c
       assert('proof' in outcome && outcome.proof !== null, label);
       assert.equal(outcome.proof.maxTokens, cap, label);
       assert.equal(outcome.proof.renderedPromptTokens, row.prompt, label);
+      assert.equal(
+        outcome.proof.structured?.schemaHash,
+        localStructuredOutput(plan.binding).schemaHash,
+      );
       assert.deepEqual(TerminalSchema.parse(outcome), outcome);
       assert.equal(
         TerminalSchema.safeParse({
@@ -784,6 +805,7 @@ test('Local ownership needs the same prediction terminal after cancellation or c
       if (row === 'excess tokens')
         value.stats = { ...value.stats, ...{ predictedTokensCount: maximumOutputTokens + 1 } };
       if (row === 'prompt mismatch') value.stats = { ...value.stats, ...{ promptTokensCount: 4 } };
+      value.content = value.nonReasoningContent;
       f.resolve(value);
       const outcome = await run.result;
       const unproven = [
@@ -803,6 +825,49 @@ test('Local ownership needs the same prediction terminal after cancellation or c
       assert.equal(f.submitted, 1);
       assert.equal(f.cancelled, 0);
     }
+  }
+  for (const row of ['classified bytes', 'malformed reasoning', 'unsupported engine'] as const) {
+    const f = fixture();
+    const run = startLocalPrediction(plan, {
+      createClient: () => f.client,
+      schedule: f.schedule,
+      now: () => 0,
+    });
+    await flush();
+    const value = terminal();
+    if (row === 'unsupported engine') f.reject(new Error('private engine refusal'));
+    else {
+      value.reasoningContent = row === 'malformed reasoning' ? '\ud800' : 'คิด';
+      value.content = `<think>${value.reasoningContent}</think>${value.nonReasoningContent}`;
+      f.resolve(value);
+    }
+    const outcome = await run.result;
+    if (row === 'classified bytes') {
+      assert(outcome.kind === 'completed');
+      assert.deepEqual(outcome.proof.structured, {
+        schemaHash: localStructuredOutput(plan.binding).schemaHash,
+        reasoningBytes: Buffer.byteLength(value.reasoningContent),
+        nonReasoningBytes: Buffer.byteLength(value.nonReasoningContent),
+      });
+      const { structured: _structured, ...oldProof } = outcome.proof;
+      const historical = { ...outcome, proof: oldProof };
+      assert.deepEqual(TerminalSchema.parse(historical), historical);
+      for (const structured of [
+        { ...outcome.proof.structured, reasoningBytes: -1 },
+        { ...outcome.proof.structured, nonReasoningBytes: outcome.proof.outputBytes + 1 },
+        { ...outcome.proof.structured, content: value.reasoningContent },
+      ])
+        assert.equal(
+          TerminalSchema.safeParse({ ...outcome, proof: { ...outcome.proof, structured } }).success,
+          false,
+        );
+      assert(!JSON.stringify(outcome.proof).includes(value.reasoningContent));
+    } else {
+      assert(outcome.kind === 'unknown');
+      assert.equal(outcome.reason, row === 'unsupported engine' ? 'transport' : 'protocol');
+      assert(!JSON.stringify(outcome).includes('private engine refusal'));
+    }
+    assert.equal(f.submitted, 1);
   }
   let completed!: LocalTerminal;
   for (const row of [
@@ -913,6 +978,32 @@ test('Local ownership needs the same prediction terminal after cancellation or c
     status: string;
     change: (value: ReturnType<typeof terminal>) => void;
   }> = [
+    {
+      check: 'structured-output',
+      status: 'missing',
+      change: (value) => {
+        value.predictionConfig.fields = value.predictionConfig.fields.filter(
+          ({ key }) => key !== 'llm.prediction.structured',
+        );
+      },
+    },
+    {
+      check: 'structured-output',
+      status: 'malformed',
+      change: (value) => {
+        setField(value.predictionConfig, 'llm.prediction.structured', { type: 'json' });
+      },
+    },
+    {
+      check: 'prediction-fields',
+      status: 'duplicate',
+      change: (value) => {
+        value.predictionConfig.fields.push({
+          key: 'llm.prediction.structured',
+          value: localStructuredOutput(plan.binding).format,
+        });
+      },
+    },
     {
       check: 'load-fields',
       status: 'malformed',
@@ -1053,6 +1144,17 @@ test('Local ownership needs the same prediction terminal after cancellation or c
       },
     },
   ];
+  for (const field of ['attemptId', 'path', 'baseHash', 'additionalProperties'])
+    configurationCases.push({
+      check: 'structured-output',
+      status: 'mismatch',
+      change: (value) => {
+        const structured = localStructuredOutput(plan.binding).format;
+        if (field === 'additionalProperties') structured.jsonSchema.additionalProperties = true;
+        else Object.assign(structured.jsonSchema.properties, { [field]: { const: canary } });
+        setField(value.predictionConfig, 'llm.prediction.structured', structured);
+      },
+    });
   for (const key of [
     'draftMtp',
     'draftSimple',
@@ -1155,6 +1257,8 @@ test('Local ownership needs the same prediction terminal after cancellation or c
       'complete',
       'terminal before submission',
       'wrong output limit',
+      'missing structured proof',
+      'wrong structured proof',
       'bad then valid',
       'duplicate submission',
       'async marker',
@@ -1199,6 +1303,25 @@ test('Local ownership needs the same prediction terminal after cancellation or c
           `${JSON.stringify({
             type: 'terminal',
             terminal: { ...completed, proof: { ...completed.proof, maxTokens: 4096 } },
+          })}\n`,
+        );
+      }
+      if (row === 'missing structured proof' || row === 'wrong structured proof') {
+        assert(completed.kind === 'completed');
+        const { structured, ...proof } = completed.proof;
+        child.stdout.write(
+          `${JSON.stringify({
+            type: 'terminal',
+            terminal: {
+              ...completed,
+              proof:
+                row === 'missing structured proof'
+                  ? proof
+                  : {
+                      ...proof,
+                      structured: { ...structured, schemaHash: hash('different schema') },
+                    },
+            },
           })}\n`,
         );
       }

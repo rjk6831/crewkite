@@ -15,6 +15,7 @@ import {
   localDiscoveryPlan,
   localOutputTokens,
   localPlan,
+  localStructuredOutput,
   MAX_STREAM_BYTES,
   TerminalSchema,
 } from './profile.ts';
@@ -301,7 +302,9 @@ function startLocalClient(
             !same(value.binding, plan.binding) ||
             ('proof' in value &&
               value.proof !== null &&
-              value.proof.maxTokens !== localOutputTokens(operation.plan)) ||
+              (value.proof.maxTokens !== localOutputTokens(operation.plan) ||
+                value.proof.structured?.schemaHash !==
+                  localStructuredOutput(operation.plan.binding).schemaHash)) ||
             (submitted && value.kind === 'failed' && value.proof === null) ||
             (!submitted && value.kind !== 'failed')
           )

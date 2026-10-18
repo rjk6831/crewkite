@@ -24,6 +24,7 @@ import {
   localDiscoveryPlan,
   localOutputTokens,
   localPlan,
+  localStructuredOutput,
   MAX_STREAM_BYTES,
   ProofSchema,
   ProposalSchema,
@@ -672,11 +673,13 @@ export function startLocalPrediction(
       // Mark uncertainty before the SDK can open its prediction channel.
       submitted = true;
       stage = 'transport';
+      const structured = localStructuredOutput(plan.binding);
       prediction = model.complete(rendered, {
         maxTokens: outputTokens,
         contextOverflowPolicy: 'stopAtLimit',
         draftModel: '',
         stopStrings: [],
+        structured: structured.format,
         onPredictionFragment: ({ content }) => {
           if (settled) return;
           outputBytes += Buffer.byteLength(content);
@@ -789,10 +792,20 @@ export function startLocalPrediction(
         z.object({ checked: z.boolean(), value: z.number().int().positive().safe() }),
         (value) => value.checked && value.value === outputTokens,
       );
+      configurationField(
+        terminal.predictionConfig,
+        'prediction-fields',
+        'llm.prediction.structured',
+        'structured-output',
+        z.strictObject({ type: z.literal('json'), jsonSchema: z.record(z.string(), z.unknown()) }),
+        (value) => hashCanonical(value.jsonSchema) === structured.schemaHash,
+      );
       stage = 'protocol';
       if (
         !terminal.content.isWellFormed() ||
+        !terminal.reasoningContent.isWellFormed() ||
         !terminal.nonReasoningContent.isWellFormed() ||
+        Buffer.byteLength(terminal.reasoningContent) > MAX_STREAM_BYTES ||
         Buffer.byteLength(terminal.nonReasoningContent) > MAX_STREAM_BYTES ||
         Buffer.byteLength(terminal.content) > MAX_STREAM_BYTES
       )
@@ -804,6 +817,11 @@ export function startLocalPrediction(
         predictedTokens: terminal.stats.predictedTokensCount ?? null,
         renderedPromptTokens: promptTokens,
         outputBytes,
+        structured: {
+          schemaHash: structured.schemaHash,
+          reasoningBytes: Buffer.byteLength(terminal.reasoningContent),
+          nonReasoningBytes: Buffer.byteLength(terminal.nonReasoningContent),
+        },
         contextLength: CONTEXT_TOKENS,
         maxTokens: outputTokens,
         contextOverflowPolicy: 'stopAtLimit',

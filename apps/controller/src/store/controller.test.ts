@@ -77,6 +77,7 @@ import { refValue } from '../host/publication.ts';
 import { committedFiles, git, inspectSource, materialize, readFiles } from '../host/source.ts';
 import { closedBefore, closedWithin, groupAbsent, OwnedCommand } from '../host/worker.ts';
 import { type AcpSetupProof, acpClientPin } from '../providers/google/acp/profile.ts';
+import { localStructuredOutput } from '../providers/local/profile.ts';
 import {
   type NativeProfileResolution,
   unavailableNativeProfile,
@@ -2913,7 +2914,7 @@ let plan;const emit=value=>process.stdout.write(JSON.stringify(value)+'\\n');
 const finish=value=>{emit(value);process.stdin.destroy();};
 createInterface({input:process.stdin}).on('line',line=>{const value=JSON.parse(line);
 if(!plan){plan=value;if(plan.kind==='discovery'){finish({type:'discovery',terminal:mode==='discovery-failed'?{kind:'unavailable',binding:plan.binding,reason:'transport'}:{kind:'observed',binding:plan.binding,observation}});return;}emit({type:'ready',binding:plan.binding});return;}
-const content=process.argv[2];const proof={stopReason:value==='stop'?'userStopped':'eosFound',promptTokens:1,predictedTokens:1,renderedPromptTokens:1,outputBytes:Buffer.byteLength(content),contextLength:8192,maxTokens:plan.maximumOutputTokens??2048,contextOverflowPolicy:'stopAtLimit',draftModel:''};
+const content=process.argv[2];const proof={stopReason:value==='stop'?'userStopped':'eosFound',promptTokens:1,predictedTokens:1,renderedPromptTokens:1,outputBytes:Buffer.byteLength(content),contextLength:8192,maxTokens:plan.maximumOutputTokens??2048,contextOverflowPolicy:'stopAtLimit',draftModel:'',structured:{schemaHash:plan.fixtureSchemaHash,reasoningBytes:0,nonReasoningBytes:Buffer.byteLength(content)}};
 if(mode==='wrong-output-limit')proof.maxTokens=2048;
 if(value==='submit'&&mode==='output-limit'){proof.stopReason='maxPredictedTokensReached';proof.predictedTokens=plan.maximumOutputTokens;finish({type:'terminal',terminal:{kind:'failed',binding:plan.binding,reason:'limit',proof}});return;}
 if(value==='submit'&&mode==='hold')return;
@@ -2940,6 +2941,7 @@ if(value==='submit')finish({type:'terminal',terminal:{kind:'completed',binding:p
     children.push(new Promise<void>((done) => child.once('close', () => done())));
     const write = child.stdin.write.bind(child.stdin);
     child.stdin.write = ((chunk: string | Uint8Array) => {
+      let input = chunk;
       for (const line of Buffer.from(chunk).toString().trim().split('\n')) {
         if (!line) continue;
         const value = JSON.parse(line);
@@ -2958,14 +2960,19 @@ if(value==='submit')finish({type:'terminal',terminal:{kind:'completed',binding:p
             operation?: { state: string };
           };
           if (value.kind === 'discovery') assert.equal(local.operation?.state, 'owned');
-          else
+          else {
             assert.equal(
               context.controller.store.nativeProcesses(value.binding.attemptId)[0]?.state,
               'owned',
             );
+            input = `${JSON.stringify({
+              ...value,
+              fixtureSchemaHash: localStructuredOutput(value.binding).schemaHash,
+            })}\n`;
+          }
         }
       }
-      return write(chunk);
+      return write(input);
     }) as typeof child.stdin.write;
     return child;
   }) as typeof spawnProcess;
