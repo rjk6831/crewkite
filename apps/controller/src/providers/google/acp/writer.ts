@@ -504,6 +504,19 @@ function activityLocations(root: string, locations: Tool['locations']) {
       : [];
   });
 }
+// A path the scratch cannot name: outside it, its root or a reserved name. A relative
+// path stays out of this check, because the permission decoder refuses it on its own.
+function outsideScratch(root: string, locations: Tool['locations']) {
+  return (locations ?? []).some(
+    (location) =>
+      isAbsolute(location.path) &&
+      !NativeTargetPathSchema.safeParse(relative(root, location.path)).success,
+  );
+}
+// The server tells the model to keep planning notes under its own data directory, using
+// the file creation tool. The task needs only the replacement tool, so creation stays off.
+// The server strips a disabled tool from the model's context.
+const sessionMeta = { antigravity: { disabledTools: ['create_file'] } };
 const toolKinds = [
   'read',
   'edit',
@@ -667,6 +680,7 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
   let settled = false;
   let refusal: 'permission' | null = null;
   let trailingUpdates = 0;
+  let rejectedOutsideWrites = 0;
   let openToolCount = 0;
   let openToolKinds: (typeof toolKinds)[number][] = [];
   const handle = startAcpProcess(
@@ -680,6 +694,7 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
         await connection.request('session/new', {
           cwd: options.scratch,
           mcpServers: [options.mcpServer],
+          _meta: sessionMeta,
         }),
       );
       const sessionId = session.sessionId;
@@ -690,6 +705,8 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
         finalAcknowledged = false;
       const tools = new Map<string, Tool>();
       const seenTools = new Set<string>();
+      // Tools that named a path the activity feed had to drop.
+      const droppedLocations = new Set<string>();
       let expectedTargetHash = plan.target.baseHash;
       const pending = new Map<
         string,
@@ -740,6 +757,20 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
             new Set(request.options.map((v) => v.optionId)).size !== request.options.length
           )
             return reject(id, diagnostic);
+          if (tool.kind === 'edit' && outsideScratch(options.scratch, tool.locations)) {
+            // Nothing outside scratch is ever approved. A reject reply keeps the tool from
+            // running and lets the model go back to the real target. The tool table caps a
+            // turn at 128 calls, so the count stays finite.
+            const denials = request.options.filter((v) => v.kind === 'reject_once');
+            if (denials.length !== 1) return reject(id, diagnostic);
+            rejectedOutsideWrites++;
+            seenTools.add(tool.toolCallId);
+            tools.set(tool.toolCallId, tool);
+            connection.respond(id, {
+              outcome: { outcome: 'selected', optionId: denials[0].optionId },
+            });
+            return;
+          }
           const choices = request.options.filter((v) => v.kind === 'allow_once');
           if (choices.length !== 1) return reject(id, diagnostic);
           diagnostic = at('permission-action');
@@ -883,13 +914,16 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
           ? acpValidate(diagnostic('tool-update'), () => toolUpdate.parse(update))
           : null;
         const locations = call ? activityLocations(options.scratch, call.locations) : [];
+        if (call && locations.length < (call.locations?.length ?? 0))
+          droppedLocations.add(call.toolCallId);
         if (
-          call &&
-          locations.length < (call.locations?.length ?? 0) &&
+          call?.status === 'completed' &&
+          droppedLocations.has(call.toolCallId) &&
           fileChangingKinds.has(tools.get(call.toolCallId)?.kind ?? '')
         ) {
-          // A tool that changes files named a path outside the scratch. The turn may
-          // finish, but its result stays unverified and cannot be captured.
+          // A tool that changes files finished on a path outside the scratch. The turn may
+          // end cleanly, but its result stays unverified and cannot be captured. An
+          // announcement or a rejected tool changes nothing and does not block capture.
           connection.noteDiagnostic(diagnostic('edit-location'));
           refusal = 'permission';
         }
@@ -1048,6 +1082,7 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
         refusal ??
         (outcome.metadata?.stopReason === 'cancelled' ? ('stopped' as const) : null),
       trailingUpdates,
+      rejectedOutsideWrites,
       openToolCount,
       openToolKinds,
     })),

@@ -965,6 +965,8 @@ test('the acp protocol consumes one complete live permission and never treats co
     'open-edits',
     'hunk-open',
     'outside-edit',
+    'outside-completed',
+    'hunk-brain-write',
   ] as const) {
     const f = fixture(scenario);
     let permissions = 0,
@@ -1009,14 +1011,17 @@ test('the acp protocol consumes one complete live permission and never treats co
       });
       const outcome = await handle.result;
       assert(outcome.quiescent, scenario);
-      if (['permission', 'hunk', 'hunk-sequential'].includes(scenario)) {
-        assert.equal(outcome.reason, null);
+      if (['permission', 'hunk', 'hunk-sequential', 'hunk-brain-write'].includes(scenario)) {
+        // A note write outside scratch gets a reject reply and never reaches the approval
+        // callback. The turn then edits the target under the usual approval and ends clean.
+        assert.equal(outcome.reason, null, JSON.stringify(outcome.diagnostic));
         assert.equal(permissions, scenario === 'hunk-sequential' ? 2 : 1);
         assert.equal(outcome.metadata?.stopReason, 'end_turn');
         assert.equal(
           outcome.metadata?.targetHash,
           hash(`export const total = ${scenario === 'hunk-sequential' ? 2 : 1};\n`),
         );
+        assert.equal(outcome.rejectedOutsideWrites, scenario === 'hunk-brain-write' ? 1 : 0);
       } else if (scenario === 'usage-refusal') {
         assert.equal(outcome.reason, null);
         assert.equal(outcome.metadata?.stopReason, 'refusal');
@@ -1079,14 +1084,18 @@ test('the acp protocol consumes one complete live permission and never treats co
           method: 'session/prompt',
           pendingToolCount: scenario === 'hunk-open' ? 1 : 3,
         });
-      } else if (scenario === 'outside-edit') {
-        // A delete outside the scratch lets the turn finish, but it cannot be captured.
+      } else if (scenario === 'outside-edit' || scenario === 'outside-completed') {
+        // A file change that completes outside the scratch without approval lets the turn
+        // finish, but it cannot be captured. The completion can arrive on the announcement
+        // or on a later update that no longer names the path.
         assert.equal(outcome.reason, 'permission');
         assert.equal(outcome.metadata?.stopReason, 'end_turn');
+        assert.equal(permissions, 0);
+        assert.equal(outcome.rejectedOutsideWrites, 0);
         assert.deepEqual(outcome.diagnostic, {
           site: 'edit-location',
           method: 'session/update',
-          sessionUpdate: 'tool_call',
+          sessionUpdate: scenario === 'outside-edit' ? 'tool_call' : 'tool_call_update',
         });
       } else if (scenario === 'pending-end') {
         // A permission still pending at the terminal response refuses the turn.

@@ -46,6 +46,8 @@ export const acpPeerCases = [
   'open-edits',
   'hunk-open',
   'outside-edit',
+  'outside-completed',
+  'hunk-brain-write',
 ] as const;
 export type AcpPeerCase = (typeof acpPeerCases)[number];
 
@@ -147,6 +149,32 @@ export function runAcpPeer(scenario: AcpPeerCase) {
       },
     });
   }
+  // The server announces a note write into its own data directory, then asks permission.
+  function requestBrainWrite() {
+    const path = join(cwd, '..', 'brain', 'conversation', 'task.md');
+    const tool = {
+      toolCallId: 'fixture-brain-write',
+      title: 'Run write_to_file?',
+      kind: 'edit',
+      status: 'pending',
+      rawInput: { TargetFile: path, CodeContent: '# Tasks\n' },
+      locations: [{ path }],
+    };
+    update({ sessionUpdate: 'tool_call', ...tool });
+    emit({
+      jsonrpc: '2.0',
+      id: 'permission-brain',
+      method: 'session/request_permission',
+      params: {
+        sessionId: 'fixture-session',
+        toolCall: tool,
+        options: [
+          { optionId: 'once', name: 'Once', kind: 'allow_once' },
+          { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
+        ],
+      },
+    });
+  }
   const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
   input.on('line', (line) => {
     try {
@@ -172,6 +200,13 @@ export function runAcpPeer(scenario: AcpPeerCase) {
       } else if (message.method === 'session/new') {
         cwd = message.params.cwd;
         assert(Array.isArray(message.params.mcpServers));
+        // Task sessions switch off file creation. Setup sessions carry no server and no filter.
+        assert.deepEqual(
+          message.params._meta,
+          message.params.mcpServers.length
+            ? { antigravity: { disabledTools: ['create_file'] } }
+            : undefined,
+        );
         for (const server of message.params.mcpServers) {
           assert.deepEqual(server.env, []);
           assert(!Object.hasOwn(server, 'cwd'));
@@ -248,7 +283,9 @@ export function runAcpPeer(scenario: AcpPeerCase) {
           sessionUpdate: 'agent_thought_chunk',
           content: { type: 'text', text: 'private thought fixture' },
         });
-        if (scenario.startsWith('hunk')) {
+        if (scenario === 'hunk-brain-write') {
+          requestBrainWrite();
+        } else if (scenario.startsWith('hunk')) {
           requestHunk();
         } else if (scenario === 'drift') {
           config[0].currentValue = 'fixture-other';
@@ -339,6 +376,23 @@ export function runAcpPeer(scenario: AcpPeerCase) {
             locations: [{ path: join(cwd, '..', 'outside.md') }],
           });
           terminal('end_turn');
+        } else if (scenario === 'outside-completed') {
+          // The edit is never offered for permission and later reports completion
+          // without naming its path again.
+          update({
+            sessionUpdate: 'tool_call',
+            toolCallId: 'fixture-outside-edit',
+            title: 'edit',
+            kind: 'edit',
+            status: 'in_progress',
+            locations: [{ path: join(cwd, '..', 'outside.md') }],
+          });
+          update({
+            sessionUpdate: 'tool_call_update',
+            toolCallId: 'fixture-outside-edit',
+            status: 'completed',
+          });
+          terminal('end_turn');
         } else if (scenario === 'open-tools' || scenario === 'open-edits') {
           // Tools that stay open across the turn end.
           for (const kind of scenario === 'open-tools'
@@ -410,7 +464,17 @@ export function runAcpPeer(scenario: AcpPeerCase) {
         result(message.id, {});
       } else if (message.id === 'permission-late')
         assert.equal(message.result?.outcome?.outcome, 'cancelled');
-      else if (message.id === 'permission-1' || message.id === 'permission-2') {
+      else if (message.id === 'permission-brain') {
+        // The reply must pick the reject option. The tool then fails and the turn goes on.
+        assert.deepEqual(message.result, { outcome: { outcome: 'selected', optionId: 'deny' } });
+        update({
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'fixture-brain-write',
+          status: 'failed',
+          rawOutput: 'Rejected by user',
+        });
+        requestHunk();
+      } else if (message.id === 'permission-1' || message.id === 'permission-2') {
         if (message.result?.outcome?.outcome === 'selected') {
           assert.equal(message.result.outcome.optionId, 'once');
           writeFileSync(

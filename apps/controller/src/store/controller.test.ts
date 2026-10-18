@@ -7096,8 +7096,10 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     'approved',
     'hunk-approved',
     'hunk-after-mismatch',
+    'hunk-brain-write',
     'no-change',
     'unapproved-write',
+    'outside-completed',
     'denied',
     'stop',
     'eof',
@@ -7127,7 +7129,7 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     const scenario =
       row === 'hunk-approved'
         ? 'hunk'
-        : row === 'hunk-after-mismatch'
+        : row === 'hunk-after-mismatch' || row === 'hunk-brain-write' || row === 'outside-completed'
           ? row
           : row === 'no-change'
             ? 'activity-locations'
@@ -7903,19 +7905,21 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       );
       assert.equal(controller.store.intents().length, 1);
     }
-    if (row === 'no-change' || row === 'unapproved-write') {
+    if (row === 'no-change' || row === 'unapproved-write' || row === 'outside-completed') {
       // A clean end_turn without an approved change closes known. Untouched scratch has
-      // nothing to review; an unapproved write stays retained and unverified.
+      // nothing to review; an unapproved write stays retained and unverified. A file
+      // change reported complete outside scratch leaves the turn unverified the same way.
       assert.equal(await nativeWait('acp turn without change', ended.promise), 'interrupted');
       const attemptId = controller.store.intents()[0].attempt_id;
       assert(controller.store.receipt(`native-acp-terminal:${attemptId}`));
       assert.equal(controller.store.receipt(`native-acp-capture:${attemptId}`), undefined);
       assert.equal(controller.store.get<Attempt>('attempt', attemptId)?.state, 'stopped');
       const snapshot = controller.snapshot();
-      assert.equal(
-        snapshot.candidates.some((value) => value.taskId === task.id),
-        row === 'unapproved-write',
-      );
+      if (row !== 'outside-completed')
+        assert.equal(
+          snapshot.candidates.some((value) => value.taskId === task.id),
+          row === 'unapproved-write',
+        );
       assert.equal(
         snapshot.tasks.find((value) => value.id === task.id)?.next,
         row === 'no-change'
@@ -8186,6 +8190,10 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     assert(completion.stdoutBytes > 0);
     assert.equal(completion.stderrBytes, 0);
     assert.equal(completion.trailingUpdates, 0);
+    // The rejected note write is counted in the record and never became an approval.
+    assert.equal(completion.rejectedOutsideWrites, row === 'hunk-brain-write' ? 1 : 0);
+    if (row === 'hunk-brain-write')
+      assert.equal(controller.store.list<Approval>('approval').length, 1);
     assert.equal(completion.openToolCount, 0);
     assert.deepEqual(completion.openToolKinds, []);
     assert(controller.store.receipt(`native-acp-capture:${intent.attempt_id}`));

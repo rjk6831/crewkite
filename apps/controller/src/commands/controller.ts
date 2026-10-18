@@ -12492,6 +12492,7 @@ export class Controller {
             stdoutBytes: outcome?.stdoutBytes ?? 0,
             stderrBytes: outcome?.stderrBytes ?? 0,
             trailingUpdates: outcome?.trailingUpdates ?? 0,
+            rejectedOutsideWrites: outcome?.rejectedOutsideWrites ?? 0,
             openToolCount: outcome?.openToolCount ?? 0,
             openToolKinds: outcome?.openToolKinds ?? [],
             ...(unspawned ? { unspawned: true } : {}),
