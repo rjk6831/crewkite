@@ -32,6 +32,14 @@ test('combined tasks share seven real dispatches and require a separate full bar
     'quota-stop',
   ] as const;
   let next = 0;
+  let fullBarrier = Promise.resolve();
+  const enterFullBarrier = async () => {
+    const prior = fullBarrier;
+    const release = Promise.withResolvers<void>();
+    fullBarrier = release.promise;
+    await prior;
+    return release.resolve;
+  };
   const run = async () => {
     while (next < scenarios.length) {
       const scenario = scenarios[next++];
@@ -934,124 +942,133 @@ test('combined tasks share seven real dispatches and require a separate full bar
             'local-owner',
           );
       });
-      assert.equal(
-        (await controller.execute(command('StartCandidateEvaluation', start, rev()), 'local-owner'))
-          .outcome,
-        'applied',
-      );
-      if (scenario === 'paused') {
-        await waitFor(
-          'paused final check',
-          () =>
-            phase()?.phase === 'paused' &&
-            controller.store.combinedDispatches(preview.runId)[5].state === 'passed' &&
-            controller.store
-              .intents()
-              .filter((intent) => intent.run_id === preview.runId)
-              .every((intent) => intent.state === 'stopped'),
-          'checks',
-        );
-        assert(checkPause);
-        assert.equal((await checkPause).outcome, 'applied');
-        assert.equal(phase()?.review.available, false);
-        const before = controller.store.intents().length;
+      const leaveFullBarrier = await enterFullBarrier();
+      try {
         assert.equal(
           (
             await controller.execute(
-              command('ResumeRun', { taskId: parent.id, runId: preview.runId }, rev()),
+              command('StartCandidateEvaluation', start, rev()),
               'local-owner',
             )
           ).outcome,
           'applied',
         );
-        assert.equal(controller.store.intents().length, before);
-      }
-      offCheckPause();
-      await waitFor(
-        'full checks',
-        () => ['awaiting-review', 'blocked', 'unknown'].includes(phase()?.phase ?? ''),
-        'checks',
-      );
-      if (scenario === 'interaction-failed') {
-        assert.equal(phase()?.phase, 'blocked');
-        assert.equal(controller.store.combinedDispatches(preview.runId)[5].state, 'failed');
+        if (scenario === 'paused') {
+          await waitFor(
+            'paused final check',
+            () =>
+              phase()?.phase === 'paused' &&
+              controller.store.combinedDispatches(preview.runId)[5].state === 'passed' &&
+              controller.store
+                .intents()
+                .filter((intent) => intent.run_id === preview.runId)
+                .every((intent) => intent.state === 'stopped'),
+            'checks',
+          );
+          assert(checkPause);
+          assert.equal((await checkPause).outcome, 'applied');
+          assert.equal(phase()?.review.available, false);
+          const before = controller.store.intents().length;
+          assert.equal(
+            (
+              await controller.execute(
+                command('ResumeRun', { taskId: parent.id, runId: preview.runId }, rev()),
+                'local-owner',
+              )
+            ).outcome,
+            'applied',
+          );
+          assert.equal(controller.store.intents().length, before);
+        }
+        offCheckPause();
+        await waitFor(
+          'full checks',
+          () => ['awaiting-review', 'blocked', 'unknown'].includes(phase()?.phase ?? ''),
+          'checks',
+        );
+        if (scenario === 'interaction-failed') {
+          assert.equal(phase()?.phase, 'blocked');
+          assert.equal(controller.store.combinedDispatches(preview.runId)[5].state, 'failed');
+          assert.equal(
+            (await controller.execute(command('StartCandidateReview', start, rev()), 'local-owner'))
+              .outcome,
+            'blocked',
+          );
+          assert.equal(
+            (
+              await controller.execute(
+                command(
+                  'AcceptCandidate',
+                  {
+                    taskId: parent.id,
+                    candidateId: candidate.id,
+                    destinationRef: 'refs/heads/combined',
+                  },
+                  rev(),
+                ),
+                'local-owner',
+              )
+            ).outcome,
+            'blocked',
+          );
+          assert.equal(refValue(context.source.directory, 'refs/heads/combined'), null);
+          continue;
+        }
+        assert.equal(phase()?.phase, 'awaiting-review', JSON.stringify(phase()));
+        let reviewPause: Promise<CommandResult> | undefined;
+        const offReviewPause = context.observe(controller, (event) => {
+          if (
+            scenario === 'paused' &&
+            event.type === 'review.completed' &&
+            event.payload.candidateId === candidate.id &&
+            event.payload.passed
+          )
+            reviewPause = controller.execute(
+              command('PauseAdmissions', { taskId: parent.id, runId: preview.runId }, rev()),
+              'local-owner',
+            );
+        });
         assert.equal(
           (await controller.execute(command('StartCandidateReview', start, rev()), 'local-owner'))
             .outcome,
-          'blocked',
-        );
-        assert.equal(
-          (
-            await controller.execute(
-              command(
-                'AcceptCandidate',
-                {
-                  taskId: parent.id,
-                  candidateId: candidate.id,
-                  destinationRef: 'refs/heads/combined',
-                },
-                rev(),
-              ),
-              'local-owner',
-            )
-          ).outcome,
-          'blocked',
-        );
-        assert.equal(refValue(context.source.directory, 'refs/heads/combined'), null);
-        continue;
-      }
-      assert.equal(phase()?.phase, 'awaiting-review', JSON.stringify(phase()));
-      let reviewPause: Promise<CommandResult> | undefined;
-      const offReviewPause = context.observe(controller, (event) => {
-        if (
-          scenario === 'paused' &&
-          event.type === 'review.completed' &&
-          event.payload.candidateId === candidate.id &&
-          event.payload.passed
-        )
-          reviewPause = controller.execute(
-            command('PauseAdmissions', { taskId: parent.id, runId: preview.runId }, rev()),
-            'local-owner',
-          );
-      });
-      assert.equal(
-        (await controller.execute(command('StartCandidateReview', start, rev()), 'local-owner'))
-          .outcome,
-        'applied',
-      );
-      if (scenario === 'paused') {
-        await waitFor(
-          'paused completed review',
-          () =>
-            phase()?.phase === 'paused' &&
-            controller.store.combinedDispatches(preview.runId)[6].state === 'passed' &&
-            controller.store
-              .intents()
-              .filter((intent) => intent.run_id === preview.runId)
-              .every((intent) => intent.state === 'stopped'),
-          'review',
-        );
-        assert(reviewPause);
-        assert.equal((await reviewPause).outcome, 'applied');
-        assert.equal(phase()?.accept.available, false);
-        const before = controller.store.intents().length;
-        assert.equal(
-          (
-            await controller.execute(
-              command('ResumeRun', { taskId: parent.id, runId: preview.runId }, rev()),
-              'local-owner',
-            )
-          ).outcome,
           'applied',
         );
-        assert.equal(controller.store.intents().length, before);
+        if (scenario === 'paused') {
+          await waitFor(
+            'paused completed review',
+            () =>
+              phase()?.phase === 'paused' &&
+              controller.store.combinedDispatches(preview.runId)[6].state === 'passed' &&
+              controller.store
+                .intents()
+                .filter((intent) => intent.run_id === preview.runId)
+                .every((intent) => intent.state === 'stopped'),
+            'review',
+          );
+          assert(reviewPause);
+          assert.equal((await reviewPause).outcome, 'applied');
+          assert.equal(phase()?.accept.available, false);
+          const before = controller.store.intents().length;
+          assert.equal(
+            (
+              await controller.execute(
+                command('ResumeRun', { taskId: parent.id, runId: preview.runId }, rev()),
+                'local-owner',
+              )
+            ).outcome,
+            'applied',
+          );
+          assert.equal(controller.store.intents().length, before);
+        }
+        offReviewPause();
+        await waitFor(
+          'review',
+          () => ['ready', 'blocked', 'unknown'].includes(phase()?.phase ?? ''),
+          'review',
+        );
+      } finally {
+        leaveFullBarrier();
       }
-      offReviewPause();
-      await waitFor(
-        'review',
-        () => ['ready', 'blocked', 'unknown'].includes(phase()?.phase ?? ''),
-        'review',
-      );
       assert.equal(phase()?.phase, 'ready', JSON.stringify(phase()));
       const snapshot = controller.snapshot();
       assert.equal(snapshot.attempts.length, scenario === 'quota' ? 10 : 9);
