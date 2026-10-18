@@ -13,7 +13,13 @@ import {
 import { verifyHandoff } from '@crewkite/contracts/hash';
 import { z } from 'zod';
 import { type DiscoveryMetadata, OpenAiDiscovery, type OpenAiUsageHook } from './discovery.ts';
-import { type NativeLaunch, type NativeTranscript, startNativeTask } from './native-discovery.ts';
+import {
+  MAX_TASK_LINE,
+  MAX_TASK_OUTPUT,
+  type NativeLaunch,
+  type NativeTranscript,
+  startNativeTask,
+} from './native-discovery.ts';
 
 const MAX_CONTENT = 65_536;
 const id = z.string().min(1).max(200);
@@ -416,12 +422,12 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
   push(bytes: Uint8Array) {
     this.check();
     this.bytes += bytes.length;
-    if (this.bytes > 1_048_576) this.refuse('limit');
+    if (this.bytes > MAX_TASK_OUTPUT) this.refuse('limit');
     for (const byte of bytes) {
       if (this.pending.length === 0)
         this.frameRequest = this.awaiting ? (this.step === 'thread' ? 10 : 11) : null;
       if (byte !== 10) {
-        if (this.pending.length >= 524_288) this.refuse('limit');
+        if (this.pending.length >= MAX_TASK_LINE) this.refuse('limit');
         this.pending.push(byte);
         continue;
       }

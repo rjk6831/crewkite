@@ -28,6 +28,10 @@ export type NativeLifecycle = {
   owned: (phase: NativePhase, group: number) => void;
   quiescent: (phase: NativePhase, group: number) => void;
 };
+// The client repeats submitted text when its user item starts and completes. JSON escaping
+// can double each copy, so a task keeps two full echo lines plus the earlier 1 MiB.
+export const MAX_TASK_LINE = 1024 * 1024;
+export const MAX_TASK_OUTPUT = 3 * MAX_TASK_LINE;
 function synchronous(result: unknown) {
   if (result instanceof Promise) {
     void result.catch(() => {});
@@ -226,6 +230,7 @@ function startTranscript<T>(
   let closed = false;
   let finished = false;
   let received = 0;
+  const maximumOutput = options.task ? MAX_TASK_OUTPUT : 1_048_576;
   let stdoutBytes = 0;
   let stderrBytes = 0;
   let stopping = false;
@@ -374,7 +379,7 @@ function startTranscript<T>(
   child.stdout.on('data', (bytes: Buffer) => {
     stdoutBytes += bytes.length;
     received += bytes.length;
-    if (received > 1_048_576) return stop('output-limit');
+    if (received > maximumOutput) return stop('output-limit');
     if (finished || (stopping && reason !== null)) return;
     try {
       reader.push(bytes);
@@ -386,7 +391,7 @@ function startTranscript<T>(
   child.stderr.on('data', (bytes: Buffer) => {
     stderrBytes += bytes.length;
     received += bytes.length;
-    if (received > 1_048_576) stop('output-limit');
+    if (received > maximumOutput) stop('output-limit');
   });
   child.stdout.once('end', () => {
     // A completed response can still be followed by an incomplete frame before EOF.

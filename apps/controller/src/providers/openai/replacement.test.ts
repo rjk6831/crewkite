@@ -986,6 +986,31 @@ test('native proposals and reviews require one matching completed turn and bound
     const request = JSON.parse(frame.toString());
     const packet = request.params.input[0].text.split('\n').slice(1).join('\n');
     assert(frame.length < 1024 * 1024);
+    // The client reports the submitted text back twice before the review answer.
+    const threadId = escaped ? '\x01'.repeat(200) : 'thread-1';
+    const review = {
+      version: 1,
+      bindingHash: request.params.outputSchema.properties.bindingHash.const,
+      methodId: 'keep-it-simple',
+      cycle: 1,
+      outcome: 'passed',
+      findings: [],
+      summary: 'One bounded review.',
+    };
+    const echo = { type: 'userMessage', id: 'user-1', content: request.params.input };
+    const frames: unknown[] = output(selected.directory, 'success', 'net.mjs', review).map(
+      (value) =>
+        JSON.parse(JSON.stringify(value).replaceAll('"thread-1"', JSON.stringify(threadId))),
+    );
+    frames.splice(
+      1,
+      0,
+      { method: 'item/started', params: { threadId, turnId: 'turn-1', item: echo } },
+      { method: 'item/completed', params: { threadId, turnId: 'turn-1', item: echo } },
+    );
+    reader.push(bytes({ id: 11, result: { turn: running } }));
+    for (const value of frames) reader.push(bytes(value));
+    assert.deepEqual(reader.finish().review, review);
     return { frame, packet };
   };
   const repositorySides = (original: string, candidate: string) => ({
@@ -1001,18 +1026,19 @@ test('native proposals and reviews require one matching completed turn and bound
       ],
     },
   });
-  const nearRepositoryLimit = repositorySides('x'.repeat(200_000), 'y'.repeat(190_000));
+  const repositoryLimit = 448 * 1024;
+  const nearRepositoryLimit = repositorySides('x'.repeat(200_000), 'y'.repeat(250_000));
   const repositoryPadding =
-    384 * 1024 - Buffer.byteLength(reviewRequest(nearRepositoryLimit).packet);
+    repositoryLimit - Buffer.byteLength(reviewRequest(nearRepositoryLimit).packet);
   assert(repositoryPadding > 0);
   const atRepositoryLimit = repositorySides(
     'x'.repeat(200_000),
-    'y'.repeat(190_000 + repositoryPadding),
+    'y'.repeat(250_000 + repositoryPadding),
   );
   const escapedOriginal = '"\\'.repeat(45_000);
   const escapedCandidate = '\\"'.repeat(45_000);
   const escapedPadding =
-    384 * 1024 -
+    repositoryLimit -
     Buffer.byteLength(reviewRequest(repositorySides(escapedOriginal, escapedCandidate)).packet);
   assert(escapedPadding > 0);
   const escapedRepository = {
@@ -1033,13 +1059,13 @@ test('native proposals and reviews require one matching completed turn and bound
   ] as const) {
     const { packet } = reviewRequest(value, escaped);
     const size = Buffer.byteLength(packet);
-    assert(size > 256 * 1024 && size <= 384 * 1024, name);
+    assert(size > 256 * 1024 && size <= repositoryLimit, name);
     if (name === 'exact repository aggregate' || name === 'escaping')
-      assert.equal(size, 384 * 1024);
+      assert.equal(size, repositoryLimit);
     assert.deepEqual(JSON.parse(packet).repository, value.repository, name);
   }
   assert.throws(() =>
-    reviewPlan(repositorySides('x'.repeat(200_000), 'y'.repeat(190_001 + repositoryPadding))),
+    reviewPlan(repositorySides('x'.repeat(200_000), 'y'.repeat(250_001 + repositoryPadding))),
   );
   const legacySides = {
     ...reviewData,
