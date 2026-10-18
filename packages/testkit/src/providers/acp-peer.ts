@@ -61,7 +61,7 @@ export const acpPeerCases = [
 export type AcpPeerCase = (typeof acpPeerCases)[number];
 
 /** Each transition follows a received message; the peer uses no clock or network. */
-export function runAcpPeer(scenario: AcpPeerCase) {
+export function runAcpPeer(scenario: AcpPeerCase, fresh = false) {
   assert(acpPeerCases.includes(scenario));
   let cwd = '',
     promptId: string | number | undefined,
@@ -227,7 +227,10 @@ export function runAcpPeer(scenario: AcpPeerCase) {
         assert(Array.isArray(message.params.mcpServers));
         // Task sessions switch off broad file tools. Fresh tasks do not need an MCP server.
         if (message.params._meta)
-          assert.equal(message.params.mcpServers.length, scenario === 'fresh-no-mcp' ? 0 : 1);
+          assert.equal(
+            message.params.mcpServers.length,
+            fresh || scenario === 'fresh-no-mcp' ? 0 : 1,
+          );
         if (message.params._meta)
           assert.deepEqual(message.params._meta, {
             antigravity: { disabledTools: ['create_file', 'edit_file', 'task_context'] },

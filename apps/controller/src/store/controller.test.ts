@@ -8028,8 +8028,9 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     'missing-reserve',
   ] as const) {
     const hunk = row.startsWith('hunk-');
+    const hunkAction = hunk || ['approved', 'denied', 'stop'].includes(row);
     const scenario =
-      row === 'hunk-approved'
+      row === 'approved' || row === 'denied' || row === 'stop' || row === 'hunk-approved'
         ? 'hunk'
         : row === 'hunk-after-mismatch' || row === 'hunk-brain-write' || row === 'outside-completed'
           ? row
@@ -8039,9 +8040,7 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
               ? 'complete'
               : row === 'eof' || row === 'eof-restart'
                 ? 'eof-cancel'
-                : row === 'stop'
-                  ? 'cancel-permission'
-                  : 'permission';
+                : 'permission';
     const fixtureHome = mkdtempSync(resolve('internal/acp-controller-'));
     t.after(() => rmSync(fixtureHome, { recursive: true, force: true }));
     const executable = join(fixtureHome, 'peer');
@@ -8049,7 +8048,7 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       .href;
     writeFileSync(
       executable,
-      `#!${process.execPath}\nimport {runAcpPeer} from ${JSON.stringify(peer)};runAcpPeer(${JSON.stringify(scenario)});\n`,
+      `#!${process.execPath}\nimport {runAcpPeer} from ${JSON.stringify(peer)};runAcpPeer(${JSON.stringify(scenario)},true);\n`,
       { mode: 0o500 },
     );
     const harness = '#!/bin/sh\nexit 99\n';
@@ -8153,7 +8152,7 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       googleAcp: {
         reviewMappings: [mapping],
         toolMappings: [
-          hunk
+          hunkAction
             ? {
                 client: { ...acpClientPin(client), harnessSha256: client.harnessSha256 },
                 toolTitle: 'Run replace_file_content?',
@@ -8985,16 +8984,24 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       await controller.close();
       continue;
     }
-    const approval = await nativeWait('acp permission', permission.promise);
+    const approval = await nativeWait(
+      `acp permission/${row}`,
+      Promise.race([
+        permission.promise,
+        ended.promise.then((state) => {
+          throw new Error(`ACP fixture ended ${state} before requesting permission for ${row}.`);
+        }),
+      ]),
+    );
     assert.equal(approval.action, 'write-scratch');
     assert.equal(approval.target, 'net.mjs');
     assert.equal(approval.acpTarget?.kind, 'allow_once');
     const action = JSON.parse(approval.consequence);
     const expectedContent = 'export const total = 1;\n';
-    assert.equal(action.type, hunk ? 'replace-hunk' : 'replace-target');
-    assert.equal(action.oldText, hunk ? '0' : original);
-    assert.equal(action.newText, hunk ? '1' : expectedContent);
-    if (hunk) {
+    assert.equal(action.type, hunkAction ? 'replace-hunk' : 'replace-target');
+    assert.equal(action.oldText, hunkAction ? '0' : original);
+    assert.equal(action.newText, hunkAction ? '1' : expectedContent);
+    if (hunkAction) {
       assert.equal(action.baseHash, createHash('sha256').update(original).digest('hex'));
       assert.equal(action.afterHash, createHash('sha256').update(expectedContent).digest('hex'));
       assert.equal(action.mode, '100644');
