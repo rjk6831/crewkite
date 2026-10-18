@@ -119,6 +119,7 @@ For native single-file work, review the supported writer, committed target and s
 
 ## Documentation
 
+- [Trying the preview](docs/preview.md#trying-the-preview): a short participant guide through the normal project and task workflow and recovery controls.
 - [Architecture](docs/architecture.md)
 - [Usage and routing](docs/routing.md)
 - [Continuity and recovery](docs/continuity.md)
