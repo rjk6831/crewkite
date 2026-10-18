@@ -4196,17 +4196,8 @@ export class Controller {
         state.proposal.hash !== command.payload.proposalHash
       )
         return { outcome: 'blocked', reason: 'proposal-hash-changed' };
-      const row = this.store.db
-        .prepare('SELECT body FROM conversation_entries WHERE id=? AND task_id=?')
-        .get(state.proposal.id, task.id);
-      const entry =
-        row &&
-        (JSON.parse(row.body as string) as Extract<
-          import('@crewkite/contracts').ConversationEntry,
-          { kind: 'plan-proposal' }
-        >);
-      if (entry?.kind !== 'plan-proposal' || hashCanonical(entry.proposal) !== state.proposal.hash)
-        return { outcome: 'blocked', reason: 'proposal-not-current' };
+      const entry = this.planProposal(task.id, state.proposal);
+      if (!entry) return { outcome: 'blocked', reason: 'proposal-not-current' };
       const config = this.conversationConfiguration(task.id) as ConversationConfiguration;
       this.saveConversationConfiguration(task.id, {
         ...config,
@@ -6317,15 +6308,7 @@ export class Controller {
           reason: 'proposal-not-current',
           next: 'Adopt the current planning proposal before preparing execution.',
         };
-      const row = this.store.db
-        .prepare('SELECT body FROM conversation_entries WHERE id=? AND task_id=?')
-        .get(discussion.adoptedProposal.id, task.id);
-      const proposal =
-        row && (JSON.parse(row.body as string) as { kind?: string; proposal?: unknown });
-      if (
-        proposal?.kind !== 'plan-proposal' ||
-        hashCanonical(proposal.proposal) !== discussion.adoptedProposal.hash
-      )
+      if (!this.planProposal(task.id, discussion.adoptedProposal))
         return { outcome: 'blocked', reason: 'proposal-hash-changed' };
       return;
     }
@@ -13055,21 +13038,30 @@ export class Controller {
     };
   }
 
-  // An adopted plan names the paths its coder slices may change. Other tasks name none.
-  private adoptedCoderScope(taskId: string): string[] {
-    const adopted = this.conversationConfiguration(taskId)?.adoptedProposal;
-    if (!adopted) return [];
+  // A stored plan proposal counts only while its body still matches the referenced hash.
+  private planProposal(taskId: string, reference: { id: string; hash: string }) {
     const row = this.store.db
       .prepare('SELECT body FROM conversation_entries WHERE id=? AND task_id=?')
-      .get(adopted.id, taskId);
+      .get(reference.id, taskId);
     const entry =
       row &&
       (JSON.parse(row.body as string) as Extract<
         import('@crewkite/contracts').ConversationEntry,
         { kind: 'plan-proposal' }
       >);
-    if (entry?.kind !== 'plan-proposal' || hashCanonical(entry.proposal) !== adopted.hash)
-      throw Error('The adopted plan changed.');
+    return entry?.kind === 'plan-proposal' && hashCanonical(entry.proposal) === reference.hash
+      ? entry
+      : undefined;
+  }
+
+  // An adopted plan names the paths its coder slices may change while the task keeps the
+  // plan's criteria. Other tasks name none.
+  private adoptedCoderScope(taskId: string): string[] {
+    const task = this.store.get<Task>('task', taskId) as Task;
+    const adopted = this.conversationConfiguration(taskId)?.adoptedProposal;
+    const entry = adopted && this.planProposal(taskId, adopted);
+    if (!entry || hashCanonical(entry.proposal.criteria) !== hashCanonical(task.criteria))
+      return [];
     const coder = entry.proposal.slices.filter((slice) => slice.role === 'coder');
     return [...new Set(coder.flatMap((slice) => slice.scope))].sort();
   }
