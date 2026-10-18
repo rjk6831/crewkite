@@ -233,7 +233,9 @@ export function runAcpPeer(scenario: AcpPeerCase, fresh = false) {
           );
         if (message.params._meta)
           assert.deepEqual(message.params._meta, {
-            antigravity: { disabledTools: ['create_file', 'edit_file', 'task_context'] },
+            antigravity: {
+              disabledTools: ['create_file', 'edit_file', 'invoke_subagent', 'task_context'],
+            },
           });
         else assert.equal(message.params.mcpServers.length, 0);
         for (const server of message.params.mcpServers) {

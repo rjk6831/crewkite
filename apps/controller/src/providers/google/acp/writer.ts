@@ -515,9 +515,11 @@ function outsideScratch(root: string, locations: Tool['locations']) {
 }
 // The server tells the model to keep planning notes under its own data directory, using
 // the file creation tool. The prompt already carries task context. Keep those tools and the
-// broad native editor out so the model uses the scoped replacement tool.
+// broad native editor and delegation tool out so the model uses the scoped replacement tool.
 const sessionMeta = {
-  antigravity: { disabledTools: ['create_file', 'edit_file', 'task_context'] },
+  antigravity: {
+    disabledTools: ['create_file', 'edit_file', 'invoke_subagent', 'task_context'],
+  },
 };
 const toolKinds = [
   'read',
