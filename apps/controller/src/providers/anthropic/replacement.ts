@@ -395,6 +395,10 @@ const authoritySubtypes = new Set([
   'model_consent_fallback',
   'model_refusal_fallback',
   'model_refusal_no_fallback',
+  // A hook runs a command during the turn, so its frames are never progress.
+  'hook_started',
+  'hook_progress',
+  'hook_response',
 ]);
 
 // A diagnostic names the frame and never quotes it. Only a plain identifier of at most 64

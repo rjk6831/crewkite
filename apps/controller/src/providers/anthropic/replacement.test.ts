@@ -255,7 +255,7 @@ test('native text replacement stays bound to one proposal and owned task deadlin
   };
   const { frames: earlyFrames, names: earlyNames } = named([
     ['system', 'ui_invalidate'],
-    ['system', 'hook_started'],
+    ['system', 'plugin_install'],
     ['tool_progress'],
   ]);
   const { frames: laterFrames, names: laterNames } = named([
@@ -267,7 +267,7 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       'api_error',
       'task_started',
       'task_notification',
-      'hook_response',
+      'task_progress',
       'session_state_changed',
       'permission_retry',
       'ui_invalidate',
@@ -460,6 +460,30 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       frames: [init, { ...status, session_id: '46eb17cd-01e8-480d-99f4-a741f189715e' }, result],
       diagnostic: { site: 'identity', cause: 'correlation', field: 'session_id' },
     },
+    ...['hook_started', 'hook_progress', 'hook_response'].flatMap((subtype) =>
+      [[], [init]].map((prefix) => ({
+        name: `hook ${subtype} ${prefix.length ? 'after' : 'before'} init stays refused`,
+        frames: [
+          ...prefix,
+          {
+            type: 'system',
+            subtype,
+            session_id: input.sessionId,
+            hook_name: secret,
+            stdout: secret,
+          },
+          result,
+        ],
+        diagnostic: {
+          stage: prefix.length ? 'output' : 'before-init',
+          site: prefix.length ? 'system' : 'init',
+          cause: prefix.length ? 'unsupported' : 'validation',
+          envelope: 'system',
+          subtype,
+          field: 'subtype',
+        },
+      })),
+    ),
     ...[
       'model_fallback',
       'model_consent_fallback',
