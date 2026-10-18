@@ -235,6 +235,54 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       }),
     ReplacementError,
   );
+  // Progress and display frames carry content and a proposal-shaped field that must not surface.
+  const progress = (type: string, subtype?: string) => ({
+    type,
+    ...(subtype ? { subtype } : {}),
+    session_id: input.sessionId,
+    uuid: status.uuid,
+    content: secret,
+    structured_output: { ...edit, content: secret },
+  });
+  const named = (names: Array<[string, string?]>) => ({
+    frames: names.map(([type, subtype]) => progress(type, subtype)),
+    names: names.map(([type, subtype]) => (subtype ? `${type}/${subtype}` : type)),
+  });
+  const tally = (names: string[]) => {
+    const counts: Record<string, number> = {};
+    for (const name of names) counts[name] = (counts[name] ?? 0) + 1;
+    return counts;
+  };
+  const { frames: earlyFrames, names: earlyNames } = named([
+    ['system', 'ui_invalidate'],
+    ['system', 'hook_started'],
+    ['tool_progress'],
+  ]);
+  const { frames: laterFrames, names: laterNames } = named([
+    ...[
+      'status',
+      'thinking_tokens',
+      'notification',
+      'compact_boundary',
+      'api_error',
+      'task_started',
+      'task_notification',
+      'hook_response',
+      'session_state_changed',
+      'permission_retry',
+      'ui_invalidate',
+      'unrecognized_subtype',
+    ].map((subtype): [string, string] => ['system', subtype]),
+    ...[
+      'stream_event',
+      'tool_progress',
+      'auth_status',
+      'tool_use_summary',
+      'prompt_suggestion',
+      'conversation_reset',
+      'future_frame',
+    ].map((type): [string] => [type]),
+  ]);
   const cases: Array<{
     name: string;
     frames: unknown[];
@@ -243,38 +291,32 @@ test('native text replacement stays bound to one proposal and owned task deadlin
     pluginsEmpty?: boolean;
     retries?: number;
     diagnostic?: Record<string, unknown>;
+    ignored?: Record<string, number>;
     usage?: unknown[];
     usageAccepted?: boolean[];
     failingHook?: boolean;
   }> = [
     { name: 'valid', frames: [init, result], pass: true },
     {
-      name: 'display invalidation before initialization is discarded',
-      frames: [invalidation, init, result],
+      name: 'progress frames the pinned client defines leave a correlated proposal intact',
+      frames: [...earlyFrames, init, ...laterFrames, result],
       pass: true,
+      ignored: tally([...earlyNames, ...laterNames]),
     },
     {
-      name: 'display invalidation after initialization is discarded',
-      frames: [init, invalidation, result],
-      pass: true,
-    },
-    {
-      name: 'bounded display metadata is discarded without usage or authority',
+      name: 'ignored frame names are counted within a fixed ceiling',
       frames: [
-        invalidation,
         init,
-        {
-          ...invalidation,
-          prompts_screened: true,
-          instances: [{ surface: secret, component: secret, instance_id: secret }],
-        },
-        {
-          ...invalidation,
-          instances: Array(32).fill({ surface: 'é'.repeat(512), component: '', instance_id: '' }),
-        },
+        ...Array.from({ length: 40 }, (_, index) => progress(`future_frame_${index}`)),
+        progress('future_frame_0'),
         result,
       ],
       pass: true,
+      ignored: {
+        ...tally(Array.from({ length: 32 }, (_, index) => `future_frame_${index}`)),
+        future_frame_0: 2,
+        other: 8,
+      },
     },
     { name: 'display invalidation cannot initialize a session', frames: [invalidation, result] },
     { name: 'display invalidation cannot complete a proposal', frames: [init, invalidation] },
@@ -283,51 +325,48 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       frames: [init, result, invalidation],
     },
     ...[[], [init]].flatMap((prefix) =>
-      [
-        { ...invalidation, event: secret },
-        { ...invalidation, uuid: secret },
-        { ...invalidation, uuid: undefined },
-        { ...invalidation, prompts_screened: false },
-        { ...invalidation, prompts_screened: null },
-        { ...invalidation, instances: {} },
-        {
-          ...invalidation,
-          instances: Array(33).fill({ surface: '', component: '', instance_id: '' }),
-        },
-        { ...invalidation, instances: [{ surface: '', component: '' }] },
-        {
-          ...invalidation,
-          instances: [{ surface: '', component: '', instance_id: '', command: secret }],
-        },
-        { ...invalidation, instances: [{ surface: 1, component: '', instance_id: '' }] },
-        { ...invalidation, instances: [{ surface: '\u0000', component: '', instance_id: '' }] },
-        { ...invalidation, instances: [{ surface: '\ud800', component: '', instance_id: '' }] },
-        {
-          ...invalidation,
-          instances: [{ surface: 'é'.repeat(513), component: '', instance_id: '' }],
-        },
-        { ...invalidation, permissionMode: 'bypassPermissions' },
-        { ...invalidation, structured_output: edit },
-      ].map((frame, index) => ({
-        name: `malformed display invalidation ${prefix.length}/${index} stays refused`,
-        frames: [...prefix, frame, result],
-        diagnostic: {
-          stage: prefix.length ? 'output' : 'before-init',
-          site: 'system',
-          subtype: 'ui_invalidate',
-        },
-      })),
-    ),
-    ...[[], [init]].flatMap((prefix) =>
       [undefined, '46eb17cd-01e8-480d-99f4-a741f189715e'].map((session_id) => ({
         name: `display invalidation session ${prefix.length}/${session_id ?? 'missing'} stays bound`,
         frames: [...prefix, { ...invalidation, session_id }, result],
         diagnostic: { site: 'identity', field: 'session_id' },
       })),
     ),
-    { name: 'request status is progress only', frames: [init, status, result], pass: true },
     {
-      name: 'bounded compaction metadata is discarded',
+      name: 'a host request after init stays refused',
+      frames: [
+        init,
+        {
+          type: 'control_request',
+          request_id: 'request-1',
+          session_id: input.sessionId,
+          request: { subtype: 'can_use_tool', tool_name: secret },
+        },
+        result,
+      ],
+      diagnostic: { stage: 'output', envelope: 'control_request', field: 'type' },
+    },
+    ...[
+      'error_during_execution',
+      'error_max_turns',
+      'error_max_budget_usd',
+      'error_max_structured_output_retries',
+    ].map((subtype) => ({
+      name: `failed result ${subtype} stays refused after progress`,
+      frames: [
+        init,
+        status,
+        { type: 'result', subtype, is_error: true, session_id: input.sessionId, errors: [secret] },
+      ],
+      diagnostic: { site: 'result', envelope: 'result', subtype },
+    })),
+    {
+      name: 'request status is progress only',
+      frames: [init, status, result],
+      pass: true,
+      ignored: { 'system/status': 1 },
+    },
+    {
+      name: 'compaction metadata is discarded without validation',
       frames: [
         init,
         {
@@ -338,32 +377,21 @@ test('native text replacement stays bound to one proposal and owned task deadlin
           compact_error: secret,
         },
         { ...status, status: null, permissionMode: 'default' },
+        { ...status, status: secret, uuid: secret, compact_output_chars: -1, command: secret },
         result,
       ],
       pass: true,
+      ignored: { 'system/status': 3 },
     },
-    ...[
-      { ...status, status: secret },
-      { ...status, permissionMode: 'bypassPermissions' },
-      { ...status, permissionMode: 'acceptEdits' },
-      { ...status, compact_result: secret },
-      { ...status, compact_error: 'x'.repeat(4097) },
-      { ...status, compact_output_chars: -1 },
-      { ...status, compact_output_chars: 0.5 },
-      { ...status, compact_output_chars: Number.MAX_SAFE_INTEGER + 1 },
-      { ...status, uuid: secret },
-      { ...status, uuid: undefined },
-      { ...status, command: secret },
-      { ...status, structured_output: edit },
-    ].map((frame, index) => ({
-      name: `malformed or authoritative status ${index} is refused`,
-      frames: [init, frame, result],
-      diagnostic: { site: 'status', subtype: 'status' },
+    ...['bypassPermissions', 'acceptEdits'].map((permissionMode) => ({
+      name: `status reporting ${permissionMode} cannot change the permission mode`,
+      frames: [init, { ...status, permissionMode }, result],
+      diagnostic: { stage: 'output', site: 'status', subtype: 'status', field: 'permissionMode' },
     })),
     {
       name: 'status cannot initialize a session',
       frames: [status, result],
-      diagnostic: { stage: 'before-init', site: 'init', subtype: 'status' },
+      diagnostic: { stage: 'before-init', site: 'init', envelope: 'result' },
     },
     { name: 'status cannot complete a proposal', frames: [init, status] },
     { name: 'status after terminal remains refused', frames: [init, result, status] },
@@ -379,14 +407,11 @@ test('native text replacement stays bound to one proposal and owned task deadlin
           estimated_tokens: Number.MAX_SAFE_INTEGER,
           estimated_tokens_delta: Number.MIN_SAFE_INTEGER,
         },
+        { ...thinking, estimated_tokens: secret, uuid: secret, estimated_tokens_delta: 0.5 },
         result,
       ],
       pass: true,
-    },
-    {
-      name: 'thinking estimates cannot initialize a session',
-      frames: [thinking, init, result],
-      diagnostic: { stage: 'before-init', site: 'init', subtype: 'thinking_tokens' },
+      ignored: { 'system/thinking_tokens': 5 },
     },
     { name: 'thinking estimates cannot complete a proposal', frames: [init, thinking] },
     {
@@ -394,30 +419,6 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       frames: [init, result, thinking],
       diagnostic: { stage: 'complete', subtype: 'thinking_tokens' },
     },
-    ...[
-      { ...thinking, estimated_tokens: secret },
-      { ...thinking, estimated_tokens: undefined },
-      { ...thinking, estimated_tokens: null },
-      { ...thinking, estimated_tokens: 0.5 },
-      { ...thinking, estimated_tokens: Number.MAX_SAFE_INTEGER + 1 },
-      { ...thinking, estimated_tokens_delta: undefined },
-      { ...thinking, estimated_tokens_delta: 0.5 },
-      { ...thinking, estimated_tokens_delta: Number.MIN_SAFE_INTEGER - 1 },
-      { ...thinking, uuid: secret },
-      { ...thinking, uuid: undefined },
-      { ...thinking, user_message_uuid: null },
-      { ...thinking, user_message_uuid: 1 },
-      { ...thinking, user_message_uuid: '\0' },
-      { ...thinking, user_message_uuid: '\ud800' },
-      { ...thinking, user_message_uuid: 'x'.repeat(1025) },
-      { ...thinking, command: secret },
-      { ...thinking, permissionMode: 'bypassPermissions' },
-      { ...thinking, structured_output: edit },
-    ].map((frame, index) => ({
-      name: `malformed or authoritative thinking estimate ${index} is refused`,
-      frames: [init, frame, result],
-      diagnostic: { stage: 'output', site: 'system', subtype: 'thinking_tokens' },
-    })),
     ...[undefined, '46eb17cd-01e8-480d-99f4-a741f189715e'].map((session_id) => ({
       name: `thinking estimate session ${session_id ?? 'missing'} remains bound`,
       frames: [init, { ...thinking, session_id }, result],
@@ -429,20 +430,17 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       diagnostic: { site: 'identity', cause: 'correlation', field: 'session_id' },
     },
     ...[
-      'compact_boundary',
-      'task_started',
-      'task_notification',
+      'model_fallback',
+      'model_consent_fallback',
       'model_refusal_fallback',
-      'api_error',
-      'session_state_changed',
-      'per_turn_effort_changed',
-      'notification',
       'model_refusal_no_fallback',
-      'session_metadata',
-      'permission_retry',
     ].map((subtype) => ({
-      name: `known system ${subtype} stays refused and identifiable`,
-      frames: [init, { type: 'system', subtype, session_id: input.sessionId, content: secret }],
+      name: `model change ${subtype} stays refused and identifiable`,
+      frames: [
+        init,
+        { type: 'system', subtype, session_id: input.sessionId, content: secret },
+        result,
+      ],
       diagnostic: {
         stage: 'output',
         site: 'system',
@@ -721,16 +719,7 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       name: `rate limit ${field} remains bounded`,
       frames: [init, { ...rateLimit, rate_limit_info: { status: 'allowed', [field]: -1 } }, result],
     })),
-    ...[
-      'user',
-      'stream_event',
-      'tool_progress',
-      'auth_status',
-      'tool_use_summary',
-      'rate_limit_event',
-      'prompt_suggestion',
-      'conversation_reset',
-    ].map((type) => ({
+    ...['user', 'rate_limit_event'].map((type) => ({
       name: `known ${type} refusal stays finite`,
       frames: [init, { type, session_id: input.sessionId, content: secret }],
       diagnostic: { envelope: type },
@@ -775,16 +764,21 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       pass: true,
     },
     {
-      name: 'startup hook remains refused with finite diagnostics',
+      name: 'model refusal before init stays refused with finite diagnostics',
       frames: [
-        { type: 'system', subtype: 'hook_started', session_id: input.sessionId, hook_name: secret },
+        {
+          type: 'system',
+          subtype: 'model_refusal_no_fallback',
+          session_id: input.sessionId,
+          reason: secret,
+        },
       ],
       diagnostic: {
         stage: 'before-init',
         site: 'init',
         cause: 'validation',
         envelope: 'system',
-        subtype: 'hook_started',
+        subtype: 'model_refusal_no_fallback',
         field: 'subtype',
       },
     },
@@ -796,25 +790,6 @@ test('native text replacement stays bound to one proposal and owned task deadlin
         site: 'init',
         cause: 'validation',
         envelope: 'system',
-        subtype: 'other',
-        field: 'subtype',
-      },
-    },
-    {
-      name: 'unrecognized public-looking subtype remains private and refused',
-      frames: [
-        init,
-        {
-          type: 'system',
-          subtype: 'unrecognized_subtype',
-          session_id: input.sessionId,
-          error: secret,
-        },
-      ],
-      diagnostic: {
-        stage: 'output',
-        site: 'system',
-        cause: 'unsupported',
         subtype: 'other',
         field: 'subtype',
       },
@@ -888,6 +863,16 @@ test('native text replacement stays bound to one proposal and owned task deadlin
         field: 'session_id',
       },
     },
+    ...[
+      { type: secret },
+      { type: 'FutureFrame' },
+      { type: 'system' },
+      { type: 'system', subtype: secret },
+    ].map((frame, index) => ({
+      name: `frame without a protocol name ${index} stays refused and private`,
+      frames: [init, { ...frame, session_id: input.sessionId }, result],
+      diagnostic: { stage: 'output', envelope: frame.type === 'system' ? 'system' : 'other' },
+    })),
     { name: 'missing result', frames: [init] },
   ];
   for (const row of cases) {
@@ -910,6 +895,7 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       assert.equal(output.nativePluginsReportedEmpty, row.pluginsEmpty ?? true, row.name);
       assert.equal(output.qualified, false, row.name);
       assert.equal(output.observedRetries, row.retries ?? 0, row.name);
+      assert.deepEqual(output.ignoredFrames, row.ignored ?? {}, row.name);
       assert(!JSON.stringify(output).includes(secret), row.name);
     } catch (error) {
       if (!(error instanceof ReplacementError)) throw error;
@@ -951,7 +937,7 @@ test('native text replacement stays bound to one proposal and owned task deadlin
 const {spawn}=require('node:child_process');const {MessageChannel}=require('node:worker_threads');
 const mode=process.argv[1],frames=${frames};const hold=()=>{const channel=new MessageChannel();channel.port1.on('message',()=>{});};
 process.stdin.resume();process.stdin.once('end',()=>{
-if(mode==='refusal')return process.stdout.write(JSON.stringify({type:'system',subtype:'hook_started',session_id:frames[0].session_id,hook_name:${JSON.stringify(secret)},stdout:${JSON.stringify(secret)}})+'\\n');
+if(mode==='refusal')return process.stdout.write(JSON.stringify({type:'system',subtype:'model_refusal_no_fallback',session_id:frames[0].session_id,reason:${JSON.stringify(secret)}})+'\\n');
 if(mode==='limit')return process.stdout.write(Buffer.alloc(1048577,32));
 if(mode==='stderr')return process.stderr.write(Buffer.alloc(16385,32));
 if(mode==='descendant'){const child=spawn(process.execPath,['-e',"const{MessageChannel}=require('node:worker_threads');process.on('SIGTERM',()=>{});const c=new MessageChannel();c.port1.on('message',()=>{});process.send('ready');"],{stdio:['inherit','inherit','inherit','ipc']});child.once('message',()=>process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>process.exit(0)));return;}
@@ -1106,7 +1092,7 @@ process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(
           site: 'init',
           cause: 'validation',
           envelope: 'system',
-          subtype: 'hook_started',
+          subtype: 'model_refusal_no_fallback',
           field: 'subtype',
         });
       if (mode === 'success' || mode === 'descendant') {

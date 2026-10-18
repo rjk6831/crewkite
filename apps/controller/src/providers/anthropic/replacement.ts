@@ -202,57 +202,6 @@ const retry = identity.extend({
 });
 
 const metadataNumber = z.number().finite().nonnegative().max(Number.MAX_SAFE_INTEGER);
-const status = z.strictObject({
-  ...identity.shape,
-  type: z.literal('system'),
-  subtype: z.literal('status'),
-  uuid: z.uuid(),
-  status: z.enum(['compacting', 'requesting']).nullable(),
-  permissionMode: z.literal('default').optional(),
-  compact_result: z.enum(['success', 'failed']).optional(),
-  compact_error: z.string().max(4096).optional(),
-  compact_output_chars: metadataNumber.int().optional(),
-});
-const displayText = z
-  .string()
-  .max(1024)
-  .refine(
-    (value) =>
-      value.isWellFormed() &&
-      Buffer.byteLength(value, 'utf8') <= 1024 &&
-      Array.from(value).every((character) => {
-        const code = character.charCodeAt(0);
-        return code >= 32 && code !== 127;
-      }),
-  );
-const uiInvalidation = z.strictObject({
-  ...identity.shape,
-  type: z.literal('system'),
-  subtype: z.literal('ui_invalidate'),
-  event: z.literal('ui.render'),
-  uuid: z.uuid(),
-  prompts_screened: z.literal(true).optional(),
-  instances: z
-    .array(
-      z.strictObject({
-        surface: displayText,
-        component: displayText,
-        instance_id: displayText,
-      }),
-    )
-    .max(32)
-    .optional(),
-});
-const progressInteger = z.number().int().min(Number.MIN_SAFE_INTEGER).max(Number.MAX_SAFE_INTEGER);
-const thinkingTokens = z.strictObject({
-  ...identity.shape,
-  type: z.literal('system'),
-  subtype: z.literal('thinking_tokens'),
-  uuid: z.uuid(),
-  estimated_tokens: progressInteger,
-  estimated_tokens_delta: progressInteger,
-  user_message_uuid: displayText.optional(),
-});
 const rateLimitStatus = z.enum(['allowed', 'allowed_warning', 'rejected']);
 const rateLimitInfo = z.object({
   status: rateLimitStatus,
@@ -531,10 +480,41 @@ const fields = [
   'isReplay',
   'status',
   'permissionMode',
-  'compact_result',
-  'compact_error',
-  'compact_output_chars',
 ] as const;
+
+// The client reports progress and display state in many frames, and each release adds more. Few
+// of them carry authority here: init pins the model and tool set, a retry or a model change
+// alters what ran, and the terminal result is the only proposal. The decoder counts every other
+// frame by name and drops it, so a frame it has never seen cannot stop a finished task.
+const PROTOCOL_NAME = /^[a-z][a-z0-9_]{0,63}$/;
+const MAX_CENSUS_NAMES = 32;
+const handledFrames = new Set([
+  'assistant',
+  'user',
+  'rate_limit_event',
+  'result',
+  'control_request',
+]);
+const authoritySubtypes = new Set([
+  'init',
+  'api_retry',
+  'model_fallback',
+  'model_consent_fallback',
+  'model_refusal_fallback',
+  'model_refusal_no_fallback',
+]);
+
+/** The census name of a frame the decoder drops, or null when the frame needs a handler. */
+function progressFrame(record: Record<string, unknown>) {
+  const { type, subtype } = record;
+  if (typeof type !== 'string' || !PROTOCOL_NAME.test(type)) return null;
+  if (type !== 'system') return handledFrames.has(type) ? null : type;
+  return typeof subtype === 'string' &&
+    PROTOCOL_NAME.test(subtype) &&
+    !authoritySubtypes.has(subtype)
+    ? `system/${subtype}`
+    : null;
+}
 export type ReplacementDiagnostic = Readonly<{
   stage: 'before-init' | 'output' | 'complete';
   site:
@@ -566,6 +546,7 @@ export class ReplacementStream {
   private toolsEmpty: boolean | null = null;
   private pluginsEmpty: boolean | null = null;
   private retries = 0;
+  private readonly ignored = new Map<string, number>();
   private site: ReplacementDiagnostic['site'] = 'frame';
   private envelope: ReplacementDiagnostic['envelope'] = 'none';
   private subtype: ReplacementDiagnostic['subtype'] = null;
@@ -598,6 +579,11 @@ export class ReplacementStream {
     } catch {
       // Usage is advisory. A malformed reading or a failed sink leaves the task as it was.
     }
+  }
+  private ignore(name: string) {
+    // The ceiling keeps the completion record small whatever the client sends.
+    const key = this.ignored.has(name) || this.ignored.size < MAX_CENSUS_NAMES ? name : 'other';
+    this.ignored.set(key, (this.ignored.get(key) ?? 0) + 1);
   }
   private fail(
     reason: Failure,
@@ -648,10 +634,19 @@ export class ReplacementStream {
         const envelope = identity.parse(value);
         if (envelope.session_id !== this.plan.sessionId)
           this.fail('protocol', 'correlation', 'session_id');
-        if (type === 'system' && record.subtype === 'ui_invalidate') {
-          this.site = 'system';
-          // Display invalidation can precede initialization and carries no proposal authority.
-          uiInvalidation.parse(value);
+        const progress = progressFrame(record);
+        if (progress) {
+          // Progress and display frames carry no proposal authority, before or after init. A
+          // status frame still cannot change the permission mode the launch fixed.
+          if (
+            progress === 'system/status' &&
+            record.permissionMode !== undefined &&
+            record.permissionMode !== 'default'
+          ) {
+            this.site = 'status';
+            this.fail('protocol', 'unsupported', 'permissionMode');
+          }
+          this.ignore(progress);
           continue;
         }
         if (!this.initialized) {
@@ -684,20 +679,16 @@ export class ReplacementStream {
           this.site = 'user';
           // Native user-role output is discarded. Only the terminal result can supply a proposal.
           user.parse(value);
-        } else if (type === 'system' && record.subtype === 'status') {
-          this.site = 'status';
-          // Progress cannot change the fixed permission mode or supply replacement authority.
-          status.parse(value);
-        } else if (type === 'system' && record.subtype === 'thinking_tokens') {
-          this.site = 'system';
-          // Thinking estimates describe progress and supply no billing or proposal authority.
-          thinkingTokens.parse(value);
         } else if (type === 'system') {
           this.site = 'system';
           if (record.subtype !== 'api_retry') this.fail('protocol', 'unsupported', 'subtype');
           this.site = 'retry';
           retry.parse(value);
           this.retries++;
+        } else if (type !== 'result') {
+          // A host request or a frame without a protocol name cannot be answered or ignored.
+          this.site = 'frame';
+          this.fail('protocol', 'unsupported', 'type');
         } else {
           this.site = 'result';
           const message = result.parse(value);
@@ -736,6 +727,7 @@ export class ReplacementStream {
       nativeToolsReportedEmpty: this.toolsEmpty,
       nativePluginsReportedEmpty: this.pluginsEmpty,
       observedRetries: this.retries,
+      ignoredFrames: Object.fromEntries(this.ignored),
       qualified: false as const,
     };
   }
