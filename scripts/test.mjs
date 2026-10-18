@@ -10,6 +10,8 @@ const files = [
   ),
 ].sort();
 if (files.length === 0) throw new Error('No repository tests were found.');
-const result = spawnSync(process.execPath, ['--test', ...files], { stdio: 'inherit' });
+const result = spawnSync(process.execPath, ['--test', '--test-concurrency=2', ...files], {
+  stdio: 'inherit',
+});
 if (result.error) throw result.error;
 process.exitCode = result.status ?? 1;
