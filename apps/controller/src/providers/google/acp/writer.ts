@@ -504,6 +504,7 @@ function activityLocations(root: string, locations: Tool['locations']) {
       : [];
   });
 }
+const fileChangingKinds = new Set(['edit', 'delete', 'move']);
 const trailingKinds = new Set<AcpDiagnostic['sessionUpdate']>([
   'usage_update',
   'available_commands_update',
@@ -652,6 +653,7 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
   let settled = false;
   let refusal: 'permission' | null = null;
   let trailingUpdates = 0;
+  let openTools: string[] = [];
   const handle = startAcpProcess(
     { ...options, timeoutMs: options.timeoutMs ?? 300000 },
     async (connection, onStop, settle): Promise<AcpWriterCompletion> => {
@@ -969,21 +971,22 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
       );
       settled = true;
       armed = false;
-      if (
-        pending.size ||
-        (!cancelled &&
-          [...tools.values()].some((v) => v.status === 'pending' || v.status === 'in_progress'))
-      )
+      const open = [...tools.values()].filter(
+        (v) => v.status === 'pending' || v.status === 'in_progress',
+      );
+      // The agent can keep a background exec or a host tool open across the turn
+      // end. Only a pending permission or an open file edit leaves the target undecided.
+      const editing = open.filter(
+        (v) => seenTools.has(v.toolCallId) || fileChangingKinds.has(v.kind ?? ''),
+      );
+      if (pending.size || (!cancelled && editing.length))
         throw new AcpError('protocol', {
           site: 'incomplete-tool-terminal',
           method: 'session/prompt',
-          pendingToolCount: new Set([
-            ...pending.keys(),
-            ...[...tools.values()]
-              .filter((v) => v.status === 'pending' || v.status === 'in_progress')
-              .map((v) => v.toolCallId),
-          ]).size,
+          pendingToolCount: new Set([...pending.keys(), ...editing.map((v) => v.toolCallId)]).size,
         });
+      // The completion record has a 4 KiB bound, so it keeps at most eight IDs.
+      openTools = open.slice(0, 8).map((v) => v.toolCallId);
       if (
         (cancelled && terminal.stopReason !== 'cancelled') ||
         (!cancelled && terminal.stopReason === 'cancelled')
@@ -1018,6 +1021,7 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
         refusal ??
         (outcome.metadata?.stopReason === 'cancelled' ? ('stopped' as const) : null),
       trailingUpdates,
+      openTools,
     })),
     stop: () => {
       if (!settled) handle.stop();

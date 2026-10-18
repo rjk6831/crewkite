@@ -40,6 +40,8 @@ export const acpPeerCases = [
   'activity-locations',
   'after-terminal',
   'late-permission',
+  'open-tools',
+  'pending-end',
 ] as const;
 export type AcpPeerCase = (typeof acpPeerCases)[number];
 
@@ -256,6 +258,7 @@ export function runAcpPeer(scenario: AcpPeerCase) {
             'bad-action',
             'large-action',
             'cancel-permission',
+            'pending-end',
           ].includes(scenario)
         ) {
           const rawInput = {
@@ -298,6 +301,7 @@ export function runAcpPeer(scenario: AcpPeerCase) {
               toolCallId: 'fixture-tool',
               rawInput: { ...rawInput, newText: 'changed' },
             });
+          if (scenario === 'pending-end') terminal('end_turn');
         } else if (['cancel', 'cancel-late', 'eof-cancel'].includes(scenario)) {
           update({
             sessionUpdate: 'agent_message_chunk',
@@ -320,6 +324,17 @@ export function runAcpPeer(scenario: AcpPeerCase) {
             });
             update({ sessionUpdate: 'tool_call_update', toolCallId, status: 'completed' });
           }
+          terminal('end_turn');
+        } else if (scenario === 'open-tools') {
+          // Read, search and background exec tools stay open across the turn end.
+          for (const kind of ['read', 'search', 'execute'])
+            update({
+              sessionUpdate: 'tool_call',
+              toolCallId: `fixture-open-${kind}`,
+              title: kind,
+              kind,
+              status: 'in_progress',
+            });
           terminal('end_turn');
         } else {
           writeFileSync(join(cwd, 'net.mjs'), 'export const total = 1;\n');

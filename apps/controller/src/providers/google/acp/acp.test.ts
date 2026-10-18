@@ -875,6 +875,8 @@ test('the acp protocol consumes one complete live permission and never treats co
     'activity-locations',
     'after-terminal',
     'late-permission',
+    'open-tools',
+    'pending-end',
   ] as const) {
     const f = fixture(scenario);
     let permissions = 0,
@@ -960,6 +962,25 @@ test('the acp protocol consumes one complete live permission and never treats co
         assert.deepEqual(outcome.diagnostic, {
           site: 'request-method',
           method: 'session/request_permission',
+        });
+      } else if (scenario === 'open-tools') {
+        // Read and search tools left open at a clean end let the turn finish.
+        assert.equal(outcome.reason, null, JSON.stringify(outcome.diagnostic));
+        assert.equal(outcome.metadata?.stopReason, 'end_turn');
+        assert.deepEqual(outcome.openTools, [
+          'fixture-open-read',
+          'fixture-open-search',
+          'fixture-open-execute',
+        ]);
+      } else if (scenario === 'pending-end') {
+        // A permission still pending at the terminal response refuses the turn.
+        assert.equal(outcome.reason, 'protocol');
+        assert.equal(outcome.metadata, null);
+        assert.equal(permissions, 1);
+        assert.deepEqual(outcome.diagnostic, {
+          site: 'incomplete-tool-terminal',
+          method: 'session/prompt',
+          pendingToolCount: 1,
         });
       } else {
         assert(outcome.reason, scenario);
@@ -1076,7 +1097,7 @@ process.stdout.write = function(chunk) {
     const line = pending.slice(0, at); pending = pending.slice(at + 1);
     const value = JSON.parse(line);
     if (value.result?.stopReason) {
-      if (diagnosticCase === 'tool-update' || diagnosticCase === 'incomplete-tool-terminal') emit(JSON.stringify({jsonrpc:'2.0',method:'session/update',params:{sessionId:'fixture-session',update:{sessionUpdate:'tool_call',toolCallId:'fixture-diagnostic',status:diagnosticCase === 'tool-update' ? 'private-bad-status' : 'in_progress'}}})+'\\n');
+      if (diagnosticCase === 'tool-update' || diagnosticCase === 'incomplete-tool-terminal') emit(JSON.stringify({jsonrpc:'2.0',method:'session/update',params:{sessionId:'fixture-session',update:{sessionUpdate:'tool_call',toolCallId:'fixture-diagnostic',kind:'edit',status:diagnosticCase === 'tool-update' ? 'private-bad-status' : 'in_progress'}}})+'\\n');
       if (diagnosticCase === 'prompt-result') value.result.stopReason = 'private-bad-terminal';
       if (diagnosticCase === 'prompt-terminal-state') value.result.stopReason = 'cancelled';
     }
