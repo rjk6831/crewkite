@@ -2279,7 +2279,9 @@ function Changes({ task, workspace }: { task: Task; workspace: Workspace }) {
           if (!active) return;
           if (
             failure instanceof Error &&
-            failure.message === 'Wait for the pending desktop command.'
+            (failure.message === 'Wait for the pending desktop command.' ||
+              failure.message ===
+                "Error invoking remote method 'crewkite:command': Error: Wait for the pending desktop command.")
           ) {
             retry = setTimeout(read, 50);
             return;
