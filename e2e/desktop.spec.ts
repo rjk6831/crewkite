@@ -2344,7 +2344,9 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     assert(cliChangedState, 'A CLI approval must produce the review result observed in the GUI.');
     const final = await observer.snapshot();
     assert.equal(final.evidence.filter((evidence) => evidence.passed).length, 3);
-    await enter(page.getByRole('button', { name: 'Accept candidate', exact: true }));
+    const accept = page.getByRole('button', { name: 'Accept candidate', exact: true });
+    await expect(accept).toBeEnabled();
+    await accept.click();
     await page.getByRole('tab', { name: 'Activity', exact: true }).click();
     await enter(page.getByRole('button', { name: 'Approve once', exact: true }));
     await resumed.wait((event) => event.type === 'candidate.accepted');
