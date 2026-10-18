@@ -40,6 +40,32 @@ export type DependencyInventory = Readonly<{
   hash: string;
 }>;
 
+export function treeInventoryRecords(
+  inventory: Pick<TreeInventory, 'entries' | 'files' | 'bytes'>,
+): unknown[] {
+  return [
+    { version: 1, files: inventory.files, bytes: inventory.bytes },
+    ...inventory.entries.map((entry) => {
+      if (entry.kind === 'file')
+        return {
+          path: entry.path,
+          kind: entry.kind,
+          mode: entry.mode,
+          bytes: entry.bytes,
+          hash: entry.hash,
+        };
+      if (entry.kind === 'directory')
+        return { path: entry.path, kind: entry.kind, mode: entry.mode };
+      return {
+        path: entry.path,
+        kind: entry.kind,
+        target: entry.target,
+        resolved: entry.resolved,
+      };
+    }),
+  ];
+}
+
 const chunkBytes = 256 * 1024;
 const excluded = new Set(['.pnpm-store', '.pnpm-cache', '.pnpm-state']);
 async function digest(records: Iterable<unknown>, budget: CopyBudget) {
@@ -191,7 +217,7 @@ async function scan(
   check(budget);
   return Object.freeze({
     ...result,
-    hash: await digest([{ version: 1, files, bytes }, ...entries], budget),
+    hash: await digest(treeInventoryRecords(result), budget),
   });
 }
 

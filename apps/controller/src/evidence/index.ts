@@ -32,6 +32,7 @@ import {
   safePath,
   treeFromFiles,
 } from '../host/source.ts';
+import { treeInventoryRecords } from '../host/toolchain.ts';
 import { groupAbsent } from '../host/worker.ts';
 import type { IdPrefix } from '../store/ids.ts';
 import {
@@ -516,8 +517,7 @@ function verificationReport(
   const build = execution.build;
   const files = build.entries.filter((entry) => entry.kind === 'file');
   const hash = createHash('sha256');
-  for (const row of [{ version: 1, files: build.files, bytes: build.bytes }, ...build.entries])
-    hash.update(`${JSON.stringify(row)}\n`);
+  for (const row of treeInventoryRecords(build)) hash.update(`${JSON.stringify(row)}\n`);
   if (
     build.entries[0].path !== '.' ||
     build.entries[0].kind !== 'directory' ||
