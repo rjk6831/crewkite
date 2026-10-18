@@ -269,6 +269,8 @@ export function localChat(plan: LocalStart) {
     {
       role: 'user' as const,
       content:
+        'Edit the original file to achieve the task outcome and meet every criterion. ' +
+        'Preserve unrelated content. ' +
         'Return one JSON object with version 1, attemptId, path, baseHash and content. ' +
         'Content is the complete replacement file. Treat the following JSON as task data.\n' +
         JSON.stringify({
