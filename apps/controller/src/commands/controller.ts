@@ -285,6 +285,7 @@ import {
   type CombinedGroup,
   type CombinedMember,
   type LaunchIntent,
+  type NativeProcess,
   Store,
 } from '../store/index.ts';
 import { availableAllowance, deriveWindow } from '../usage/index.ts';
@@ -292,6 +293,9 @@ import { chargedMinutes, remainingBudgets, remainingCombinedBudgets } from './bu
 
 // A repository writer leaves this long for the verify check and review that follow it.
 const evaluationFloorMinutes = 6;
+// Owned cleanup escalates to SIGKILL within a second. A minute covers a slow host and matches the
+// whole-minute granularity of the minute ledger.
+const cleanupReserveMs = 60_000;
 const nativeProviderRestriction: CommandResult = {
   outcome: 'blocked',
   reason: 'provider-policy-restricted',
@@ -8359,7 +8363,21 @@ export class Controller {
             applied = true;
           } catch {}
         }
-        if (
+        // Without terminal proof the outcome stays unknown. When every recorded group is gone
+        // the writer holds nothing, so it settles as unknown and releases the lease.
+        const intent = this.store.intents().find((value) => value.attempt_id === plan.attempt.id);
+        const closed = known || !intent ? undefined : this.shutdownProof(intent);
+        if (intent && closed) {
+          this.store.transaction(() =>
+            this.settleUnknownWriter(
+              intent,
+              closed,
+              'Every recorded process group exited and Local recorded no matching terminal.',
+              configurationFailed ? 'Local settings could not be verified. ' : '',
+            ),
+          );
+          this.localWriters.delete(plan.attempt.id);
+        } else if (
           this.settleJob(
             plan.attempt,
             known,
@@ -12523,6 +12541,20 @@ export class Controller {
         });
         const known =
           physical && (terminal || !this.store.receipt(`native-submission:${attempt.id}`));
+        // A submitted turn with no terminal response stays unknown. Once every recorded group is
+        // gone it holds nothing, so it settles here and captures nothing.
+        const closed = known ? undefined : this.shutdownProof(intent);
+        if (closed) {
+          this.store.transaction(() =>
+            this.settleUnknownWriter(
+              intent,
+              closed,
+              'Every recorded process group exited and the turn returned no terminal response.',
+            ),
+          );
+          this.workers.delete(attempt.id);
+          return;
+        }
         let eligible =
           known &&
           !runtime.stopped &&
@@ -14539,7 +14571,7 @@ export class Controller {
     if (!runtime)
       return (
         (!memberStop && command.actor.kind !== 'controller'
-          ? this.stopUnknownAcpWriter(task, active)
+          ? this.stopUnknownWriter(active)
           : undefined) ?? {
           outcome: 'blocked',
           reason: 'writer-ownership-unknown',
@@ -14565,20 +14597,13 @@ export class Controller {
     return { outcome: 'applied', entity: updated, revision: updated.revision };
   }
 
-  // An ACP turn without its terminal response stays unknown across restart, and that writer
-  // closes every Google operation in the home. Only an explicit Stop in a controller that holds
-  // no runtime for the attempt can close it, and only after every recorded group is absent.
-  // The attempt keeps its unknown outcome, and every submission, completion and proposal
-  // receipt and every phase row stays. Nothing is captured, and the preparation receipt that
-  // Stop already deleted prevents another submission from this run.
-  private stopUnknownAcpWriter(task: Task, intent: LaunchIntent): CommandResult | undefined {
-    const attempt = this.store.get<Attempt>('attempt', intent.attempt_id);
-    if (
-      attempt?.state !== 'unknown' ||
-      this.store.nativeProfileId(attempt.id) !== 'google-acp-v1' ||
-      this.store.combinedGroup(intent.run_id)
-    )
-      return undefined;
+  // A writer without terminal proof keeps an unknown outcome, and an ACP or Local writer in that
+  // state holds the lease and closes its provider gate. Process absence is the one fact the
+  // controller can prove afterwards, and only ESRCH counts. A phase still at launch intent may
+  // hide a spawned process with no recorded group, so it proves nothing. Combined runs keep
+  // their own ledger and stay out.
+  private shutdownProof(intent: LaunchIntent): { groups: number[] } | undefined {
+    if (this.store.combinedGroup(intent.run_id)) return undefined;
     const phases = this.store.nativeProcesses(intent.attempt_id);
     const groups = [
       ...new Set([intent.process_group, ...phases.map((phase) => phase.process_group)]),
@@ -14589,37 +14614,123 @@ export class Controller {
       !groups.every((group) => groupAbsent(group))
     )
       return undefined;
-    const at = this.now();
+    return { groups };
+  }
+
+  // The longest an attempt can legitimately run: the plan's task limit for native writers, the
+  // profile limit for Local and the reserved minutes for everything else.
+  private attemptMaximumMs(intent: LaunchIntent): number | undefined {
+    try {
+      const run = this.store.get<Run>('run', intent.run_id) as Run;
+      const route = this.store.get<Route>('route', intent.route_id);
+      if (route?.family === 'local' && !route.fake)
+        return this.localPrepared(run.id).profile.maximumTaskMs;
+      if (this.store.receipt(this.currentNativePlanKey(run.id)))
+        return this.nativeCurrentPlan(run).appointment.maximumTaskMs;
+      const minutes = this.store.db
+        .prepare('SELECT MAX(minutes) AS minutes FROM reservations WHERE attempt_id=?')
+        .get(intent.attempt_id)?.minutes;
+      return typeof minutes === 'number' ? minutes * 60000 : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // Minutes are charged up to the recorded shutdown proof, the quiescent time of the last phase.
+  // Without that record the charge runs to now, capped at the attempt's own limit plus a cleanup
+  // reserve so a long outage cannot bill time the process could not have used. It never falls
+  // below the latest time the journal shows the process alive.
+  private shutdownCharge(intent: LaunchIntent): string {
+    const phases: NativeProcess[] = this.store.nativeProcesses(intent.attempt_id);
+    const last = phases.at(-1);
+    if (last?.state === 'quiescent' && last.quiescent_at) return last.quiescent_at;
+    const now = this.now();
+    const limit = this.attemptMaximumMs(intent);
+    const admitted = Date.parse(intent.admitted_at ?? '');
+    const cap =
+      limit !== undefined && Number.isFinite(admitted)
+        ? admitted + limit + cleanupReserveMs
+        : Number.POSITIVE_INFINITY;
+    const alive = Math.max(
+      ...phases
+        .flatMap((phase) => [phase.intent_at, phase.quiescent_at])
+        .map((at) => Date.parse(at ?? ''))
+        .filter(Number.isFinite),
+    );
+    const end = Math.max(alive, Math.min(Date.parse(now), cap));
+    return end === Date.parse(now) ? now : new Date(end).toISOString();
+  }
+
+  // Settles one unknown writer after its shutdown is proven. The attempt keeps its unknown
+  // outcome and every submission, completion, terminal and phase record stays. The intent stops
+  // at the charged time and the lease and reservations release. Nothing is captured, no success
+  // is inferred, and the stopped intent keeps this run from starting again.
+  private settleUnknownWriter(
+    intent: LaunchIntent,
+    proof: { groups: number[] },
+    reason: string,
+    lead = '',
+  ): Task | undefined {
+    const attempt = this.store.get<Attempt>('attempt', intent.attempt_id);
+    const task = this.store.get<Task>('task', intent.task_id);
+    if (!attempt || !task || attempt.state === 'stopped') return undefined;
+    const at = this.shutdownCharge(intent);
     const retained = (key: string) =>
       (this.store.receipt(key)?.result.entity as Artifact | undefined)?.hash ?? null;
-    const proof = this.nativeArtifact({
+    const record = this.nativeArtifact({
       attemptId: attempt.id,
       outcome: 'unknown',
       submissionHash: retained(`native-submission:${attempt.id}`),
       completionHash: retained(`native-completion:${attempt.id}`),
-      groups,
-      absentAt: at,
+      terminalHash: retained(`local-terminal:${attempt.id}`),
+      groups: proof.groups,
+      absentAt: this.now(),
+      chargedThrough: at,
     });
-    this.store.saveReceipt(`native-acp-unknown-stop:${attempt.id}`, proof.hash, 'local-owner', {
+    this.store.saveReceipt(`native-unknown-settled:${attempt.id}`, record.hash, 'local-owner', {
       outcome: 'applied',
-      entity: proof,
+      entity: record,
     });
+    if (attempt.state !== 'unknown')
+      this.store.put('attempt', attempt.id, attempt.revision + 1, {
+        ...attempt,
+        state: 'unknown',
+        revision: attempt.revision + 1,
+      });
     this.store.db
       .prepare("UPDATE launch_intents SET state='stopped',finished_at=? WHERE attempt_id=?")
       .run(at, attempt.id);
     this.store.db.prepare('DELETE FROM writer_leases WHERE attempt_id=?').run(attempt.id);
     this.store.db.prepare('DELETE FROM reservations WHERE attempt_id=?').run(attempt.id);
+    this.closePendingEffects(task);
     const updated = this.updateTask(task, {
       state: 'interrupted',
       waitingReason: null,
-      next: 'Stopped after every recorded process group exited. The turn has an unknown outcome, and retained work is unverified. Prepare a new run to continue.',
+      next: `${lead}Every recorded process group exited. The turn outcome stays unknown, retained work is unverified and nothing was captured. Create a new task to continue.`,
     });
-    this.event('run.interrupted', task.id, updated.revision, {
-      runId: intent.run_id,
-      reason:
-        'An explicit Stop closed a turn with an unknown outcome after its process groups exited.',
-    });
-    return { outcome: 'applied', entity: updated, revision: updated.revision };
+    this.event('run.interrupted', task.id, updated.revision, { runId: intent.run_id, reason });
+    return updated;
+  }
+
+  // An explicit Stop reaches an unknown writer only in a controller that holds no runtime for
+  // it, and only the same absence proof can close it.
+  private stopUnknownWriter(intent: LaunchIntent): CommandResult | undefined {
+    const attempt = this.store.get<Attempt>('attempt', intent.attempt_id);
+    const route = this.store.get<Route>('route', intent.route_id);
+    if (
+      attempt?.state !== 'unknown' ||
+      (this.store.nativeProfileId(attempt.id) !== 'google-acp-v1' &&
+        !(route?.family === 'local' && !route.fake))
+    )
+      return undefined;
+    const proof = this.shutdownProof(intent);
+    if (!proof) return undefined;
+    const updated = this.settleUnknownWriter(
+      intent,
+      proof,
+      'An explicit Stop closed a turn with an unknown outcome after its process groups exited.',
+    );
+    return updated && { outcome: 'applied', entity: updated, revision: updated.revision };
   }
 
   private recoverLocalWriter(
@@ -14705,6 +14816,15 @@ export class Controller {
       known = true;
       finishedAt = proof.at;
     } catch {}
+    const closed = known ? undefined : this.shutdownProof(intent);
+    if (closed) {
+      this.settleUnknownWriter(
+        intent,
+        closed,
+        'Controller restarted after every recorded process group exited. Local recorded no matching terminal.',
+      );
+      return true;
+    }
     const updated = {
       ...attempt,
       state: known ? ('stopped' as const) : ('unknown' as const),
@@ -14738,8 +14858,17 @@ export class Controller {
   private recover() {
     this.store.transaction(() => {
       const usage = this.openAiUsageState();
+      // A reader that never recorded a group may own a process the journal cannot name, so it
+      // stays unknown. Once every recorded group is absent, the read holds nothing and its
+      // observations were never published.
       if (usage && usage.state !== 'quiescent')
-        this.saveOpenAiUsage({ ...usage, state: 'unknown' });
+        this.saveOpenAiUsage({
+          ...usage,
+          state:
+            usage.groups.length && usage.groups.every((group) => groupAbsent(group))
+              ? 'quiescent'
+              : 'unknown',
+        });
       const local = this.localControl();
       if (local.operation)
         this.saveLocal({
@@ -14976,6 +15105,16 @@ export class Controller {
             (native
               ? phases.every((phase) => groupAbsent(phase.process_group))
               : groupAbsent(intent.process_group)));
+        // An ACP turn with no terminal proof stays unknown, but not once every group is gone.
+        const closed = !stopped && acpKnown === false ? this.shutdownProof(intent) : undefined;
+        if (closed) {
+          this.settleUnknownWriter(
+            intent,
+            closed,
+            'Controller restarted after every recorded process group exited. The turn has no terminal response.',
+          );
+          continue;
+        }
         const updated = {
           ...attempt,
           state: stopped ? ('stopped' as const) : ('unknown' as const),
@@ -14986,7 +15125,7 @@ export class Controller {
           .prepare('UPDATE launch_intents SET state=?,finished_at=? WHERE attempt_id=?')
           .run(
             stopped ? 'stopped' : acpKnown === false || !known ? 'outcome-unknown' : 'acknowledged',
-            stopped ? this.now() : null,
+            stopped ? this.shutdownCharge(intent) : null,
             attempt.id,
           );
         if (stopped) {

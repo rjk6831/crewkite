@@ -40,3 +40,9 @@ I keep provider-policy assessment and technical client qualification in release 
 - This proposal awaits my acceptance. Accepted ADRs 0005, 0009 and 0012 remain unchanged.
 - Offline protocol and controller fixtures establish mechanics only.
 - A changed client or account invalidates affected evidence. Earlier CLI pilots and context-only exchanges grant no automatic launch authority.
+
+## Amendment, 2026-10-18
+
+I no longer wait for an explicit Stop once shutdown is proven. When the controller finds every recorded process group absent, by `ESRCH` alone, and no terminal response exists, it settles the attempt as the turn finishes or as it recovers after a restart. The outcome stays unknown. The intent stops, the lease and reservations release, and the task becomes interrupted with a next step. Nothing is captured, nothing is inferred and the run cannot submit again. Minutes are charged up to the recorded closure time. A group that is still present keeps the hold, and an explicit Stop still settles an attempt a restart left unknown once its groups are gone.
+
+I made this change because a lease and a closed Google gate protect nothing after the process is gone. They only keep the whole home waiting on a person. The same proof now releases a Local turn and an unfinished OpenAI usage read.

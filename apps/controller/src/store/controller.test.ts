@@ -94,6 +94,42 @@ import {
   setup,
 } from './controller-fixture.ts';
 
+// A crash before settlement leaves the intent open, the lease and reservation held, the attempt
+// running and no settlement record. The rows below rebuild exactly that from a settled attempt.
+function crashBeforeSettlement(controller: Controller, attemptId: string) {
+  const { store } = controller;
+  const intent = store.intents().find((value) => value.attempt_id === attemptId);
+  const attempt = store.get<Attempt>('attempt', attemptId);
+  const task = store.get<Task>('task', intent?.task_id ?? '');
+  assert(intent && attempt && task);
+  store.transaction(() => {
+    store.put('attempt', attempt.id, attempt.revision + 1, {
+      ...attempt,
+      state: 'running',
+      revision: attempt.revision + 1,
+    });
+    store.put('task', task.id, task.revision + 1, {
+      ...task,
+      state: 'running',
+      revision: task.revision + 1,
+    });
+    store.db
+      .prepare("UPDATE launch_intents SET state='acknowledged',finished_at=NULL WHERE attempt_id=?")
+      .run(attemptId);
+    store.db
+      .prepare('INSERT INTO writer_leases(task_id,attempt_id,generation) VALUES (?,?,?)')
+      .run(task.id, attemptId, intent.generation);
+    store.db
+      .prepare(
+        "INSERT INTO reservations(attempt_id,route_id,window_id,unit,value,launches,minutes) VALUES (?,?,'held','minutes',0,1,5)",
+      )
+      .run(attemptId, intent.route_id);
+    store.db
+      .prepare('DELETE FROM receipts WHERE command_key=?')
+      .run(`native-unknown-settled:${attemptId}`);
+  });
+}
+
 function quickRoles(fixtures: ReturnType<typeof createDemoFixtures>) {
   return [
     ...fixtures.roles,
@@ -610,6 +646,8 @@ test('a committed launch intent survives restart without another launch', async 
       });
     }
     fixture.controller.close();
+    // The controller stays down for two hours before it recovers.
+    fixture.clock.advance(7200000);
     const recovered = new Controller({
       home: join(fixture.directory, 'home'),
       now: fixture.clock.now,
@@ -635,6 +673,20 @@ test('a committed launch intent survives restart without another launch', async 
         entry.unknown ? 1 : 0,
       );
       assert.equal(submissions, 1, 'restart cannot resubmit or advance a native phase');
+      // The charge stops at the recorded closure. Without one it stops at the attempt limit
+      // plus the cleanup reserve, and an unresolved intent stays open and charged in full.
+      const charged = recovered.store.intents()[0].finished_at;
+      if (entry.unknown) assert.equal(charged, null);
+      else if (entry.state === 'quiescent')
+        assert.equal(
+          charged,
+          recovered.store.nativeProcesses(intent.attempt_id).at(-1)?.quiescent_at,
+        );
+      else
+        assert.equal(
+          charged,
+          new Date(Date.parse(intent.admitted_at as string) + 30 * 60000 + 60000).toISOString(),
+        );
     } finally {
       recovered.close();
       for (const process of processes) process.child.stdin?.end();
@@ -3168,7 +3220,7 @@ if(value==='submit')finish({type:'terminal',terminal:{kind:'completed',binding:p
     if (
       event.type === 'task.updated' &&
       event.taskId === task.id &&
-      ['stopped', 'unknown'].includes(event.payload.state)
+      ['stopped', 'interrupted', 'unknown'].includes(event.payload.state)
     )
       terminal.resolve();
   });
@@ -5556,7 +5608,9 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
     }
     const intent = controller.store.intents().find((value) => value.run_id === run.id);
     assert(intent);
-    const uncertain = [
+    // These rows end with no terminal proof. Their client group is gone, so each one settles as
+    // unknown and holds nothing. Only a launch that never recorded a process keeps its lease.
+    const unproven = [
       'configuration-unknown',
       'wrong-output-limit',
       'unknown',
@@ -5564,20 +5618,35 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
       'missing-terminal',
       'corrupt-terminal',
       'missing-preparation',
-      'intent-restart',
     ].includes(row);
+    const count = (store: Controller['store'], table: string) =>
+      store.db
+        .prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE attempt_id=?`)
+        .get(intent.attempt_id)?.count;
+    const settledAs = (store: Controller['store']) => {
+      assert.equal(store.get<Attempt>('attempt', intent.attempt_id)?.state, 'unknown');
+      assert.equal(
+        store.intents().find((value) => value.attempt_id === intent.attempt_id)?.state,
+        'stopped',
+      );
+      assert.equal(count(store, 'writer_leases'), 0);
+      assert.equal(count(store, 'reservations'), 0);
+      assert(store.receipt(`native-unknown-settled:${intent.attempt_id}`));
+      assert.equal(store.get<Task>('task', task.id)?.state, 'interrupted');
+    };
     assert.equal(
       controller.snapshot().localSetup?.generation,
-      row === 'intent-restart' ? 'active' : uncertain ? 'unknown' : 'idle',
+      row === 'intent-restart' ? 'active' : 'idle',
     );
     assert.equal(controller.snapshot().candidates.length, 0);
+    if (unproven) settledAs(controller.store);
     if (row === 'configuration-unknown' || row === 'configuration-failed') {
       const failedTask = controller.snapshot().tasks.find((value) => value.id === task.id);
-      assert.equal(failedTask?.state, row === 'configuration-unknown' ? 'unknown' : 'stopped');
+      assert.equal(failedTask?.state, row === 'configuration-unknown' ? 'interrupted' : 'stopped');
       assert.equal(
         failedTask?.next,
         row === 'configuration-unknown'
-          ? 'Local settings could not be verified. Execution ownership is unknown. Checks and publication are blocked.'
+          ? 'Local settings could not be verified. Every recorded process group exited. The turn outcome stays unknown, retained work is unverified and nothing was captured. Create a new task to continue.'
           : 'Local settings could not be verified. No replacement was applied.',
       );
       assert(!failedTask?.next?.includes(context.secret));
@@ -5586,37 +5655,80 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
       context.submissions(),
       row === 'admission-stop' || row === 'intent-restart' ? 0 : 1,
     );
-    if (row === 'missing-preparation')
-      controller.store.transaction(() =>
+    // The next three rows rebuild a crash before the settlement above ran, with the retained
+    // proof damaged. Recovery then has to decide from the process groups alone.
+    const phase = controller.store.nativeProcesses(intent.attempt_id).at(0);
+    const phaseGroup = (store: Controller['store'], pid: number | null, group: number | null) =>
+      store.db
+        .prepare(
+          'UPDATE native_processes SET pid=?,process_group=? WHERE attempt_id=? AND sequence=0',
+        )
+        .run(pid, group, intent.attempt_id);
+    let holder: ReturnType<typeof spawnProcess> | undefined;
+    let quiescentAt: string | null | undefined;
+    if (row === 'missing-preparation' || row === 'missing-terminal' || row === 'corrupt-terminal') {
+      quiescentAt = phase?.quiescent_at;
+      assert(quiescentAt);
+      if (row === 'missing-preparation')
+        controller.store.transaction(() =>
+          controller.store.db
+            .prepare('DELETE FROM receipts WHERE command_key=?')
+            .run(`local-prepared:${run.id}`),
+        );
+      if (row === 'missing-terminal')
+        controller.store.transaction(() =>
+          controller.store.db
+            .prepare('DELETE FROM receipts WHERE command_key=?')
+            .run(`local-terminal:${intent.attempt_id}`),
+        );
+      if (row === 'corrupt-terminal') {
+        const artifact = ArtifactSchema.parse(
+          controller.store.receipt(`local-terminal:${intent.attempt_id}`)?.result.entity,
+        );
+        writeFileSync(join(controller.home, 'artifacts', artifact.hash), '{}');
+      }
+      crashBeforeSettlement(controller, intent.attempt_id);
+      if (row === 'missing-terminal')
+        // No recorded closure, so recovery charges through the limit and the cleanup reserve.
         controller.store.db
-          .prepare('DELETE FROM receipts WHERE command_key=?')
-          .run(`local-prepared:${run.id}`),
-      );
-    if (row === 'missing-terminal')
-      controller.store.transaction(() =>
-        controller.store.db
-          .prepare('DELETE FROM receipts WHERE command_key=?')
-          .run(`local-terminal:${intent.attempt_id}`),
-      );
-    if (row === 'corrupt-terminal') {
-      const artifact = ArtifactSchema.parse(
-        controller.store.receipt(`local-terminal:${intent.attempt_id}`)?.result.entity,
-      );
-      writeFileSync(join(controller.home, 'artifacts', artifact.hash), '{}');
+          .prepare(
+            "UPDATE native_processes SET state='owned',quiescent_at=NULL WHERE attempt_id=? AND sequence=0",
+          )
+          .run(intent.attempt_id);
+      if (row === 'corrupt-terminal') {
+        holder = spawnProcess(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], {
+          detached: true,
+          stdio: 'ignore',
+        });
+        t.after(() => holder?.kill('SIGKILL'));
+        phaseGroup(controller.store, holder.pid as number, holder.pid as number);
+      }
+      context.clock.advance(3600000);
     }
     const before = context.submissions();
     const reopened = await context.reopen();
     assert.equal(reopened.snapshot().localSetup?.secretConfigured, false);
-    assert.equal(reopened.snapshot().localSetup?.generation, uncertain ? 'unknown' : 'idle');
-    const reservations = reopened.store.db
-      .prepare('SELECT COUNT(*) AS count FROM reservations WHERE attempt_id=?')
-      .get(intent.attempt_id)?.count;
-    const leases = reopened.store.db
-      .prepare('SELECT COUNT(*) AS count FROM writer_leases WHERE attempt_id=?')
-      .get(intent.attempt_id)?.count;
-    assert.equal(reservations, uncertain ? 1 : 0);
-    assert.equal(leases, uncertain ? 1 : 0);
-    if (uncertain) {
+    const holding = row === 'intent-restart' || row === 'corrupt-terminal';
+    assert.equal(reopened.snapshot().localSetup?.generation, holding ? 'unknown' : 'idle');
+    assert.equal(count(reopened.store, 'reservations'), holding ? 1 : 0);
+    assert.equal(count(reopened.store, 'writer_leases'), holding ? 1 : 0);
+    if (unproven && !holding) settledAs(reopened.store);
+    const finishedAt = () =>
+      reopened.store.intents().find((value) => value.attempt_id === intent.attempt_id)?.finished_at;
+    if (row === 'missing-preparation') assert.equal(finishedAt(), quiescentAt);
+    if (row === 'missing-terminal')
+      assert.equal(
+        finishedAt(),
+        new Date(
+          Date.parse(
+            reopened.store.intents().find((value) => value.attempt_id === intent.attempt_id)
+              ?.admitted_at as string,
+          ) +
+            300000 +
+            60000,
+        ).toISOString(),
+      );
+    if (holding) {
       const setup = reopened.snapshot().localSetup;
       assert.equal(
         (
@@ -5627,21 +5739,31 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
         ).reason,
         'generation-unknown',
       );
-      await reopened.execute(
-        command(
-          'StopRun',
-          { taskId: task.id, runId: run.id },
-          reopened.store.get<{ revision: number }>('task', task.id)?.revision,
-        ),
-        'local-owner',
-      );
+      const stop = () =>
+        reopened.execute(
+          command(
+            'StopRun',
+            { taskId: task.id, runId: run.id },
+            reopened.store.get<{ revision: number }>('task', task.id)?.revision,
+          ),
+          'local-owner',
+        );
+      await stop();
       assert.equal(reopened.snapshot().localSetup?.generation, 'unknown');
-      assert.equal(
-        reopened.store.db
-          .prepare('SELECT COUNT(*) AS count FROM reservations WHERE attempt_id=?')
-          .get(intent.attempt_id)?.count,
-        1,
-      );
+      assert.equal(count(reopened.store, 'reservations'), 1);
+      assert.equal(reopened.store.get<Attempt>('attempt', intent.attempt_id)?.state, 'unknown');
+      if (holder) {
+        // Once the group is gone and the recorded closure is back, an explicit Stop settles
+        // the turn at that closure and not at the later Stop.
+        const exited = once(holder, 'exit');
+        holder.kill('SIGKILL');
+        await exited;
+        phaseGroup(reopened.store, phase?.pid ?? null, phase?.process_group ?? null);
+        assert.equal((await stop()).outcome, 'applied');
+        settledAs(reopened.store);
+        assert.notEqual(context.clock.now(), quiescentAt);
+        assert.equal(finishedAt(), quiescentAt);
+      }
     }
     assert.equal(context.submissions(), before);
   }
@@ -7064,31 +7186,55 @@ test('google quota authority survives retries and restart while sharing one oper
   assert.deepEqual(windows(), valid, 'a cancelled read cannot advance observed time');
   const savedState = state();
   const saved = openController as unknown as { saveOpenAiUsage: (value: unknown) => void };
+  const holder = spawnProcess(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  const holderExit = once(holder, 'exit');
+  t.after(() => holder.kill('SIGKILL'));
+  const group = holder.pid as number;
   openController.store.transaction(() =>
-    saved.saveOpenAiUsage({ ...savedState, state: 'owned', groups: [2147483000] }),
+    saved.saveOpenAiUsage({ ...savedState, state: 'owned', groups: [group] }),
   );
   await openController.close();
-  const metadataKill = process.kill;
-  let probes = 0;
-  process.kill = ((...args: Parameters<typeof process.kill>) => {
-    probes++;
-    return metadataKill(...args);
-  }) as typeof process.kill;
-  try {
-    openController = new Controller({
+  const reopenReader = () =>
+    new Controller({
       ...metadataOptions,
       home: join(metadata.directory, 'home'),
       now: metadata.clock.now,
       id: metadata.id,
     });
-  } finally {
-    process.kill = metadataKill;
-  }
-  assert.equal(probes, 0);
-  assert.equal(state().state, 'unknown');
+  const readerBlocker = () =>
+    (
+      openController as unknown as { openAiUsageBlocker: (id: string) => string | undefined }
+    ).openAiUsageBlocker(reader.id);
+  openController = reopenReader();
+  assert.equal(state().state, 'unknown', 'a group that still exists keeps the read unknown');
+  assert.equal(readerBlocker(), 'openai-metadata-ownership-unknown');
   metadata.clock.advance(300000);
   await openController.refreshUsage('interval');
   assert.equal(metadataLaunches, finalLaunches, 'unfinished recovery never replays a reader');
+  await openController.close();
+  holder.kill('SIGKILL');
+  await holderExit;
+  // Only ESRCH on every recorded group releases the read. The probe sends no signal.
+  const metadataKill = process.kill;
+  const probes: Parameters<typeof process.kill>[] = [];
+  process.kill = ((...args: Parameters<typeof process.kill>) => {
+    probes.push(args);
+    return metadataKill(...args);
+  }) as typeof process.kill;
+  try {
+    openController = reopenReader();
+  } finally {
+    process.kill = metadataKill;
+  }
+  assert.deepEqual(probes, [[-group, 0]]);
+  assert.equal(state().state, 'quiescent', 'an absent group releases the read');
+  assert.equal(state().id, savedState.id, 'the released read keeps its identity');
+  assert.deepEqual(state().groups, [group]);
+  assert.equal(readerBlocker(), undefined);
+  assert.equal(metadataLaunches, finalLaunches, 'releasing a read never replays it');
 });
 
 test('an acp scratch permission binds one live action and crash recovery cannot invent completion', async (t) => {
@@ -7103,6 +7249,7 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     'denied',
     'stop',
     'eof',
+    'eof-restart',
     'preflight',
     'refresh-missing',
     'refresh-stale',
@@ -7135,7 +7282,7 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
             ? 'activity-locations'
             : row === 'unapproved-write'
               ? 'complete'
-              : row === 'eof'
+              : row === 'eof' || row === 'eof-restart'
                 ? 'eof-cancel'
                 : row === 'stop'
                   ? 'cancel-permission'
@@ -7639,6 +7786,7 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       'denied',
       'stop',
       'eof',
+      'eof-restart',
       'preflight',
       'fresh-zero',
       'reserve',
@@ -7935,13 +8083,14 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       await controller.close();
       continue;
     }
-    if (row === 'eof') {
+    if (row === 'eof' || row === 'eof-restart') {
       await nativeWait('acp cancellation readiness', readyToCancel.promise);
-      const terminal = Promise.withResolvers<void>();
-      const offUnknown = controller.subscribe((event) => {
-        if (event.type === 'task.updated' && event.payload.state === 'unknown') terminal.resolve();
+      const settled = Promise.withResolvers<void>();
+      const offSettled = controller.subscribe((event) => {
+        if (event.type === 'task.updated' && event.payload.state === 'interrupted')
+          settled.resolve();
       });
-      t.after(offUnknown);
+      t.after(offSettled);
       assert.equal(
         (
           await controller.execute(
@@ -7955,67 +8104,129 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
         ).outcome,
         'applied',
       );
-      await nativeWait('acp eof ownership', terminal.promise);
+      await nativeWait('acp eof settlement', settled.promise);
       const attemptId = controller.store.intents()[0].attempt_id;
-      assert.equal(controller.store.get<Attempt>('attempt', attemptId)?.state, 'unknown');
-      assert.equal(controller.store.receipt(`native-acp-terminal:${attemptId}`), undefined);
-      const stopUnknown = () =>
-        controller.execute(
-          command('StopRun', { taskId: task.id, runId: run.id }, taskRevision(controller, task.id)),
-          'local-owner',
-        );
-      assert.equal((await stopUnknown()).reason, 'writer-ownership-unknown');
-      await controller.close();
-      controller = new Controller({
-        ...options,
-        home: context.controller.home,
-        now: clock.now,
-        id,
-      });
       const gate = () =>
         controller.store.transaction(() =>
           controller.store.googleStartBlocker(run.roles[0].routeId),
         );
-      assert.equal(controller.store.get<Attempt>('attempt', attemptId)?.state, 'unknown');
-      assert.equal(gate(), 'google-ownership-unknown');
-      const recorded = controller.store.nativeProcesses(attemptId);
       const held = (table: string) =>
         controller.store.db
           .prepare(`SELECT count(*) AS n FROM ${table} WHERE attempt_id=?`)
           .get(attemptId)?.n;
-      for (const table of ['writer_leases', 'reservations']) assert(Number(held(table)) > 0, table);
+      const intentRow = () =>
+        controller.store.intents().find((value) => value.attempt_id === attemptId);
+      const recorded = controller.store.nativeProcesses(attemptId);
+      const quiescentAt = recorded.at(-1)?.quiescent_at;
+      assert(quiescentAt);
+      // The writer exited before any terminal response and its group is absent. The turn
+      // settles in the same controller with no restart or Stop, keeps its unknown outcome and
+      // holds nothing.
+      assert.equal(controller.store.get<Attempt>('attempt', attemptId)?.state, 'unknown');
+      assert.equal(controller.store.receipt(`native-acp-terminal:${attemptId}`), undefined);
+      assert.equal(controller.store.receipt(`native-acp-capture:${attemptId}`), undefined);
+      assert.equal(intentRow()?.state, 'stopped');
+      assert.equal(intentRow()?.finished_at, quiescentAt);
+      for (const table of ['writer_leases', 'reservations']) assert.equal(held(table), 0, table);
+      for (const key of ['native-submission', 'native-completion', 'native-unknown-settled'])
+        assert(controller.store.receipt(`${key}:${attemptId}`), key);
+      assert.deepEqual(controller.store.nativeProcesses(attemptId), recorded);
+      assert(!controller.snapshot().candidates.some((value) => value.taskId === task.id));
+      assert.equal(
+        controller.snapshot().tasks.find((value) => value.id === task.id)?.state,
+        'interrupted',
+      );
+      assert.equal(gate(), undefined);
+      const launches = acpLaunches;
+      const restart = async () => {
+        await controller.close();
+        controller = new Controller({
+          ...options,
+          home: context.controller.home,
+          now: clock.now,
+          id,
+        });
+      };
+      const refusedStart = async () => {
+        assert.notEqual((await controller.execute(start(), 'local-owner')).outcome, 'applied');
+        assert.equal(acpLaunches, launches, 'a settled turn cannot submit again');
+      };
+      if (row === 'eof') {
+        await refusedStart();
+        await restart();
+        assert.equal(controller.store.get<Attempt>('attempt', attemptId)?.state, 'unknown');
+        assert.equal(gate(), undefined);
+        await controller.close();
+        continue;
+      }
+      // A crash before settlement leaves the intent open with the lease and reservations
+      // held. Recovery first meets a group that is still present.
+      crashBeforeSettlement(controller, attemptId);
       const holder = spawnProcess(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], {
         detached: true,
         stdio: 'ignore',
       });
       const exited = once(holder, 'exit');
       t.after(() => holder.kill('SIGKILL'));
-      const phaseGroup = controller.store.db.prepare(
-        'UPDATE native_processes SET pid=?,process_group=? WHERE attempt_id=? AND sequence=0',
-      );
-      phaseGroup.run(holder.pid as number, holder.pid as number, attemptId);
+      const phaseGroup = (pid: number, group: number) =>
+        controller.store.db
+          .prepare(
+            'UPDATE native_processes SET pid=?,process_group=? WHERE attempt_id=? AND sequence=0',
+          )
+          .run(pid, group, attemptId);
+      phaseGroup(holder.pid as number, holder.pid as number);
+      clock.advance(3600000);
+      await restart();
+      const stopUnknown = () =>
+        controller.execute(
+          command('StopRun', { taskId: task.id, runId: run.id }, taskRevision(controller, task.id)),
+          'local-owner',
+        );
+      assert.equal(controller.store.get<Attempt>('attempt', attemptId)?.state, 'unknown');
+      assert.equal(intentRow()?.state, 'outcome-unknown');
+      assert.equal(gate(), 'google-ownership-unknown');
+      for (const table of ['writer_leases', 'reservations']) assert(Number(held(table)) > 0, table);
       assert.equal((await stopUnknown()).reason, 'writer-ownership-unknown');
       assert.equal(gate(), 'google-ownership-unknown');
+      assert.equal(controller.store.receipt(`native-unknown-settled:${attemptId}`), undefined);
       holder.kill('SIGKILL');
       await exited;
-      phaseGroup.run(recorded[0].pid, recorded[0].process_group, attemptId);
+      phaseGroup(recorded[0].pid as number, recorded[0].process_group as number);
+      // Shutdown proof is on record, so the charge stops there and not at the later Stop.
       assert.equal((await stopUnknown()).outcome, 'applied');
+      assert.notEqual(clock.now(), quiescentAt);
       assert.equal(controller.store.get<Attempt>('attempt', attemptId)?.state, 'unknown');
-      assert.equal(
-        controller.store.intents().find((intent) => intent.attempt_id === attemptId)?.finished_at,
-        clock.now(),
-      );
+      assert.equal(intentRow()?.finished_at, quiescentAt);
       for (const table of ['writer_leases', 'reservations']) assert.equal(held(table), 0, table);
       assert.deepEqual(controller.store.nativeProcesses(attemptId), recorded);
-      for (const key of ['native-submission', 'native-completion', 'native-acp-unknown-stop'])
-        assert(controller.store.receipt(`${key}:${attemptId}`), key);
       assert.equal(controller.store.receipt(`native-acp-terminal:${attemptId}`), undefined);
-      assert(!controller.snapshot().candidates.some((value) => value.taskId === task.id));
       assert.equal(gate(), undefined);
+      await refusedStart();
+      // Recovery without a recorded closure charges through the attempt limit and the cleanup
+      // reserve, not through the hour the controller was down.
+      crashBeforeSettlement(controller, attemptId);
+      controller.store.db
+        .prepare(
+          "UPDATE native_processes SET state='owned',quiescent_at=NULL WHERE attempt_id=? AND sequence=0",
+        )
+        .run(attemptId);
+      clock.advance(3600000);
+      await restart();
+      assert.equal(controller.store.get<Attempt>('attempt', attemptId)?.state, 'unknown');
+      assert.equal(intentRow()?.state, 'stopped');
+      const admittedAt = Date.parse(intentRow()?.admitted_at as string);
+      assert.equal(intentRow()?.finished_at, new Date(admittedAt + 300000 + 60000).toISOString());
+      for (const table of ['writer_leases', 'reservations']) assert.equal(held(table), 0, table);
+      assert(controller.store.receipt(`native-unknown-settled:${attemptId}`));
+      assert.equal(controller.store.receipt(`native-acp-terminal:${attemptId}`), undefined);
+      assert.equal(controller.store.receipt(`native-acp-capture:${attemptId}`), undefined);
+      assert(!controller.snapshot().candidates.some((value) => value.taskId === task.id));
       assert.equal(
-        (await controller.execute(start(), 'local-owner')).reason,
-        'native-preparation-unavailable',
+        controller.snapshot().tasks.find((value) => value.id === task.id)?.state,
+        'interrupted',
       );
+      assert.equal(gate(), undefined);
+      await refusedStart();
       await controller.close();
       continue;
     }
@@ -8253,11 +8464,17 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     });
     await controller.close();
     controller = new Controller({ ...options, home: context.controller.home, now: clock.now, id });
+    // Every recorded group is absent, so recovery settles the turn without inventing a
+    // terminal response. The outcome stays unknown and the writer no longer holds the intent.
+    // The orphan setup operation above still blocks the gate on its own.
     assert.equal(controller.store.get<Attempt>('attempt', intent.attempt_id)?.state, 'unknown');
+    assert.equal(controller.store.receipt(`native-acp-terminal:${intent.attempt_id}`), undefined);
+    assert(controller.store.receipt(`native-unknown-settled:${intent.attempt_id}`));
     assert.equal(
-      controller.store.transaction(() => controller.store.googleStartBlocker(run.roles[0].routeId)),
-      'google-ownership-unknown',
+      controller.store.intents().find((value) => value.attempt_id === intent.attempt_id)?.state,
+      'stopped',
     );
+    assert.equal(controller.store.intents().filter((value) => value.state !== 'stopped').length, 0);
     await controller.close();
   }
 });
