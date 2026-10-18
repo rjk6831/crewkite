@@ -47,6 +47,7 @@ function synchronous(work: () => unknown) {
   }
 }
 const same = (left: unknown, right: unknown) => JSON.stringify(left) === JSON.stringify(right);
+const KILL_MS = 1000;
 
 /** This owner can close its SDK client. Only a bound runtime terminal releases generation ownership. */
 export function startLocalReplacement(value: LocalStart, directory: string, options: TaskOptions) {
@@ -146,6 +147,7 @@ function startLocalClient(
     owned = false,
     ownershipFailed = false,
     cleaning = false;
+  let killedAt: number | undefined;
   let terminal: LocalTerminal | LocalDiscoveryTerminal | null = null;
   let stopReason: 'stopped' | 'ownership' | 'deadline' | null = null;
   let invalid = false,
@@ -204,6 +206,29 @@ function startLocalClient(
         (options.signal ?? ((group, name) => process.kill(-group, name)))(group, name);
       } catch {}
   };
+  const settleAtCutoff = () => {
+    // An exited group can precede delivery of its final stream-close event.
+    if (group > 0 && !closed && absent()) timers.push(schedule(settle, 0));
+    else settle();
+  };
+  const cutoff = () => {
+    if (settled) return;
+    if (absent()) return settleAtCutoff();
+    // Timers run before the poll phase that reaps children. When synchronous work holds the
+    // loop past the cutoff, KILL and this check run in one pass, microseconds apart. Node runs
+    // one timer list per duration at a time, so an older cutoff list can even run before the
+    // KILL. Deciding after one poll phase lets the kill go out and the child be reaped. A group
+    // still present then gets the usual gap between KILL and cutoff, counted from the kill and
+    // capped by the deadline.
+    setImmediate(() => {
+      if (settled) return;
+      if (absent()) return settleAtCutoff();
+      const late = killedAt === undefined ? 0 : killedAt + CLEANUP_MS - KILL_MS - now();
+      const wait = Math.min(late, remaining());
+      if (wait > 0) timers.push(schedule(settleAtCutoff, wait));
+      else settle();
+    });
+  };
   const cleanup = () => {
     if (settled) return;
     try {
@@ -213,8 +238,16 @@ function startLocalClient(
     if (cleaning) return;
     cleaning = true;
     signal('SIGTERM');
-    timers.push(schedule(() => signal('SIGKILL'), Math.min(1000, remaining())));
-    timers.push(schedule(settle, Math.min(CLEANUP_MS, remaining())));
+    timers.push(
+      schedule(
+        () => {
+          killedAt = now();
+          signal('SIGKILL');
+        },
+        Math.min(KILL_MS, remaining()),
+      ),
+    );
+    timers.push(schedule(cutoff, Math.min(CLEANUP_MS, remaining())));
   };
   const stop = (reason: 'stopped' | 'ownership' | 'deadline' = 'stopped') => {
     if (settled || stopping) return;

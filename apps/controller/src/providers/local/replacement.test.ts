@@ -1523,13 +1523,18 @@ test('Local ownership needs the same prediction terminal after cancellation or c
       'stop-before-ready',
       'stop-in-submitted',
       'close-in-submitted',
+      'late-kill',
+      'late-kill-reversed',
+      'late-kill-near-deadline',
     ] as const) {
+      const late = boundary.startsWith('late-kill');
       let clock = 0;
-      let absent = boundary !== 'group-present';
+      let absent = boundary !== 'group-present' && !late;
+      let killed = false;
       const trace: string[] = [];
       let requestStop = () => {};
       const privateFrames: string[] = [];
-      const timers: Array<() => void> = [];
+      const timers: Array<{ work: () => void; delay: number; live: boolean }> = [];
       const child = Object.assign(new EventEmitter(), {
         pid: 12345,
         stdin: new PassThrough(),
@@ -1541,11 +1546,16 @@ test('Local ownership needs the same prediction terminal after cancellation or c
       const launch = (): ReturnType<typeof startLocalReplacement> =>
         startLocalReplacement(plan, directory, {
           now: () => clock,
-          schedule: (work) => {
-            timers.push(work);
-            return () => {};
+          schedule: (work, delay) => {
+            const row = { work, delay, live: true };
+            timers.push(row);
+            return () => {
+              row.live = false;
+            };
           },
-          signal: () => {},
+          signal: (_group, name) => {
+            if (name === 'SIGKILL') killed = true;
+          },
           groupAbsent: () => absent,
           spawn: (() => {
             trace.push('spawn');
@@ -1624,9 +1634,39 @@ test('Local ownership needs the same prediction terminal after cancellation or c
         : once(child.stdin, 'finish');
       child.stdin.end();
       await finished;
-      if (boundary !== 'missing-close') child.emit('close');
+      if (boundary !== 'missing-close' && !late) child.emit('close');
       if (['missing-close', 'group-present'].includes(boundary)) {
-        for (const work of [...timers]) work();
+        for (const row of [...timers]) row.work();
+      }
+      if (late) {
+        const fire = (delay: number) => {
+          const row = timers.find((row) => row.live && row.delay === delay);
+          assert(row, `${boundary}: pending ${delay}ms timer`);
+          row.live = false;
+          row.work();
+        };
+        // Only the kill ends this child. It ignores the earlier TERM.
+        const reap = () => {
+          if (!killed) return;
+          absent = true;
+          child.emit('exit');
+        };
+        // Synchronous work holds the loop past both cleanup timers, so the kill and the cutoff run
+        // in one pass. Node runs one duration list at a time, so the cutoff can even run first.
+        // The poll phase that reaps the child comes before the check phase that follows the pass.
+        clock = boundary === 'late-kill-near-deadline' ? plan.timeoutMs - 500 : 5000;
+        if (boundary !== 'late-kill-near-deadline') setImmediate(reap);
+        for (const delay of boundary === 'late-kill-reversed' ? [5000, 1000] : [1000, 5000])
+          fire(delay);
+        await new Promise((resolve) => setImmediate(resolve));
+        if (boundary === 'late-kill-near-deadline') {
+          assert(
+            timers.some((row) => row.delay === 500),
+            `${boundary}: the late kill waits only until the deadline`,
+          );
+          reap();
+        }
+        child.emit('close');
       }
       const result = await run.result;
       const physical = ![
@@ -1637,9 +1677,15 @@ test('Local ownership needs the same prediction terminal after cancellation or c
         'close-in-submitted',
       ].includes(boundary);
       assert.equal(result.clientQuiescent, physical, boundary);
+      if (late)
+        assert.equal(
+          timers.some((row) => row.live),
+          false,
+          `${boundary}: settlement cancels every timer`,
+        );
       assert.equal(
         result.terminal.kind,
-        boundary === 'complete'
+        boundary === 'complete' || late
           ? 'completed'
           : ['stop-before-ready', 'stop-in-submitted'].includes(boundary)
             ? 'failed'
