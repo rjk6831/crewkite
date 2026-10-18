@@ -6206,6 +6206,7 @@ test('google quota authority survives retries and restart while sharing one oper
       launches++;
       assert.equal(args[1], '/usage');
       assert.deepEqual(Object.keys(spawnOptions.env).sort(), [
+        'AGY_CLI_DISABLE_AUTO_UPDATE',
         'HOME',
         'LANG',
         'LOGNAME',
@@ -6215,6 +6216,7 @@ test('google quota authority survives retries and restart while sharing one oper
         'TMPDIR',
         'USER',
       ]);
+      assert.equal(spawnOptions.env?.AGY_CLI_DISABLE_AUTO_UPDATE, 'true');
       const operation = controller.store.googleMetadataOperations().at(-1);
       assert.equal(operation?.state, 'intent', 'metadata ownership commits before spawn');
       controller.store.transaction(() => {
@@ -6269,7 +6271,7 @@ test('google quota authority survives retries and restart while sharing one oper
     ).reason,
     'idempotency-key-reused',
   );
-  assert.equal((await pending).outcome, 'applied');
+  assert.equal((await pending).outcome, 'applied', canonicalJson(await pending));
   assert.equal((await retry).outcome, 'applied');
   assert.equal((await controller.execute(first, 'local-owner')).outcome, 'already-applied');
   assert.equal(launches, 1);
@@ -7121,6 +7123,10 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     let profileAvailable = true;
     let quotaAction: (() => void) | undefined;
     let quotaReset = '2026-10-24T17:00:00.000Z';
+    let quotaClientChanged = false;
+    let quotaHome = userInfo().homedir;
+    let quotaInvalid = false;
+    let quotaZero = false;
     const planningProfile = {
       ...unavailableNativeProfile(),
       facts: {
@@ -7142,8 +7148,12 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
           : {
               available: true,
               reason: 'available',
-              client: { executable: process.execPath, version: '1.4.0', sha256: fixtureClientHash },
-              environment: { HOME: userInfo().homedir },
+              client: {
+                executable: process.execPath,
+                version: '1.4.0',
+                sha256: quotaClientChanged ? '0'.repeat(64) : fixtureClientHash,
+              },
+              environment: { HOME: quotaHome },
             },
       googleUsageSpawn: (_executable, args, spawnOptions) => {
         quotaReads++;
@@ -7165,7 +7175,7 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
                     },
                     {
                       id: 'satellite',
-                      remaining_fraction: row === 'refresh-zero' ? 0 : 0.7,
+                      remaining_fraction: row === 'refresh-zero' || quotaZero ? 0 : 0.7,
                       reset_time: quotaReset,
                     },
                   ],
@@ -7178,7 +7188,7 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
           process.execPath,
           [
             '-e',
-            `process.stdout.write(${JSON.stringify(JSON.stringify(row === 'invalid-read' ? {} : report))})`,
+            `process.stdout.write(${JSON.stringify(JSON.stringify(row === 'invalid-read' || quotaInvalid ? {} : report))})`,
           ],
           spawnOptions,
         );
@@ -7418,7 +7428,153 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       assert.equal(unconfirmed.next, 'Review and adopt a plan before preparing execution.');
       assert.equal(controller.store.intents().length, 0);
       assert.equal(acpLaunches, setupLaunches);
+      for (const change of [
+        'same',
+        'client',
+        'home',
+        'setup',
+        'reader',
+        'attempt',
+        'authority',
+        'active',
+        'unknown',
+        'stale',
+        'reset',
+        'zero',
+        'failed',
+        'restart',
+      ]) {
+        clock.advance(60001);
+        quotaZero = change === 'zero';
+        quotaReset = new Date(
+          Date.parse(clock.now()) + (change === 'reset' ? 0 : 3600000),
+        ).toISOString();
+        const read = controller.refreshGoogleUsage('start');
+        assert(read);
+        assert.equal((await read).outcome, 'applied', change);
+        const reader = controller.store.googleUsageReader();
+        const setup = controller.store.googleAcpSetup();
+        const originalReport = controller.store
+          .list<Observation>('window')
+          .filter((window) => window.observedAt === reader.last_observed_at);
+        const originalRoute = originalReport[0]?.routeId;
+        const buckets = originalReport.filter((window) => window.routeId === originalRoute);
+        assert.equal(buckets.length, 2);
+        const blocker = id('cmd');
+        if (change === 'client') quotaClientChanged = true;
+        if (change === 'home') quotaHome = join(userInfo().homedir, 'changed');
+        if (change === 'stale') clock.advance(300001);
+        if (change === 'failed') {
+          clock.advance(60001);
+          quotaInvalid = true;
+          assert.equal((await controller.refreshGoogleUsage('start'))?.reason, 'usage-read-failed');
+          quotaInvalid = false;
+        }
+        controller.store.transaction(() => {
+          if (change === 'setup')
+            controller.store.putGoogleAcpSetup({ ...setup, revision: setup.revision + 1 });
+          if (change === 'reader')
+            controller.store.recordGoogleUsageObservation(
+              new Date(Date.parse(clock.now()) + 1).toISOString(),
+            );
+          if (change === 'attempt')
+            controller.store.recordGoogleUsageAttempt(
+              new Date(Date.parse(clock.now()) - 1).toISOString(),
+            );
+          if (change === 'authority')
+            controller.store.db
+              .prepare('UPDATE google_usage_reader SET authority_revision=authority_revision+1')
+              .run();
+          if (change === 'active' || change === 'unknown') {
+            controller.store.beginGoogleMetadata(
+              blocker,
+              'usage',
+              reader.authority_revision,
+              clock.now(),
+            );
+            if (change === 'unknown') controller.store.unknownGoogleMetadata(blocker);
+          }
+        });
+        if (change === 'restart') {
+          await controller.close();
+          controller = new Controller({ ...options, home: controller.home, now: clock.now, id });
+          liveController = controller;
+        }
+        const target = TaskSchema.parse(
+          (
+            await controller.execute(
+              command(
+                'CreateTask',
+                {
+                  projectId: task.projectId,
+                  title: `Quota attachment ${change}`,
+                  outcome: task.outcome,
+                  criteria: task.criteria,
+                },
+                0,
+              ),
+              'local-owner',
+            )
+          ).entity,
+        );
+        const before = controller.store.googleUsageReader();
+        const reads = quotaReads;
+        const result = await controller.execute(prepareAcpTask(target), 'local-owner');
+        assert.equal(result.outcome, 'applied', canonicalJson(result));
+        const prepared = RunSchema.parse(result.entity);
+        const attached = controller.store
+          .list<Observation>('window')
+          .filter((window) => window.routeId === prepared.roles[0].routeId);
+        assert.deepEqual(
+          attached,
+          ['same', 'zero'].includes(change)
+            ? buckets.map((window) => ({ ...window, routeId: prepared.roles[0].routeId }))
+            : [],
+          change,
+        );
+        assert.deepEqual(controller.store.googleUsageReader(), before, change);
+        assert.equal(quotaReads, reads, change);
+        if (change === 'zero') {
+          assert.equal(
+            (
+              await controller.execute(
+                command(
+                  'StartRun',
+                  {
+                    taskId: target.id,
+                    runId: prepared.id,
+                  },
+                  taskRevision(controller, target.id),
+                ),
+                'local-owner',
+              )
+            ).reason,
+            'capacity-unavailable',
+          );
+          assert.equal(quotaReads, reads);
+          assert.equal(controller.store.intents().length, 0);
+        }
+        quotaClientChanged = false;
+        quotaHome = userInfo().homedir;
+        quotaZero = false;
+        controller.store.transaction(() => {
+          if (change === 'setup') controller.store.putGoogleAcpSetup(setup);
+          if (change === 'authority')
+            controller.store.db
+              .prepare('UPDATE google_usage_reader SET authority_revision=?')
+              .run(reader.authority_revision);
+          // Remove only the injected blocker after proving attachment refused it.
+          if (change === 'active' || change === 'unknown')
+            controller.store.db
+              .prepare('DELETE FROM google_metadata_operations WHERE command_id=?')
+              .run(blocker);
+        });
+      }
+      clock.advance(60001);
+      quotaReset = new Date(Date.parse(clock.now()) + 3600000).toISOString();
+      assert.equal((await controller.refreshGoogleUsage('start'))?.outcome, 'applied');
     }
+    const preparationQuotaReads = quotaReads;
     const prepared = await controller.execute(prepareAcpTask(task), 'local-owner');
     assert.equal(prepared.outcome, 'applied', canonicalJson(prepared));
     const run = RunSchema.parse(prepared.entity);
@@ -7678,7 +7834,7 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     assert.equal((await controller.execute(start(), 'local-owner')).reason, 'acp-start-preparing');
     assert.deepEqual(await first, await retry);
     assert.equal((await first).outcome, 'applied', canonicalJson(await first));
-    assert.equal(quotaReads, autoRefresh ? 1 : 0, row);
+    assert.equal(quotaReads - preparationQuotaReads, autoRefresh ? 1 : 0, row);
     if (autoRefresh) {
       assert.equal(controller.store.googleMetadataOperations().at(-1)?.kind, 'usage');
       assert.equal(controller.store.googleMetadataOperations().at(-1)?.state, 'quiescent');

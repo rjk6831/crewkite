@@ -861,6 +861,15 @@ export class Controller {
     done: Promise<void>;
   };
   private usageResolution: GoogleUsageClientResolution;
+  private googleUsageReport?: {
+    commandId: string;
+    authorityRevision: number;
+    attemptedAt: string | null;
+    observedAt: string;
+    bindingHash: string;
+    home: string | undefined;
+    buckets: Parameters<typeof googleUsageObservations>[0];
+  };
   private usageRead?: {
     key: string;
     hash: string;
@@ -1962,6 +1971,7 @@ export class Controller {
   ) {
     const runtime = this.usageRead;
     if (!runtime || runtime.key !== commandId) return;
+    this.googleUsageReport = undefined;
     let result: CommandResult = { outcome: 'blocked', reason: 'usage-read-failed' };
     let beforeSpawn = true;
     const current = () => {
@@ -2008,6 +2018,7 @@ export class Controller {
         },
       });
       const outcome = await handle.result;
+      let published: Controller['googleUsageReport'];
       this.store.transaction(() => {
         if (!outcome.quiescent) this.store.unknownGoogleMetadata(commandId);
         const reader = this.store.googleUsageReader();
@@ -2072,10 +2083,22 @@ export class Controller {
             this.event('usage.observed', null, 0, observation);
           }
           this.store.recordGoogleUsageObservation(observedAt);
+          const bindingHash = this.googleUsageBinding(resolution);
+          if (bindingHash)
+            published = {
+              commandId,
+              authorityRevision,
+              attemptedAt: reader.last_attempt_at,
+              observedAt,
+              bindingHash,
+              home: resolution.environment.HOME,
+              buckets: structuredClone(outcome.metadata),
+            };
           result = { outcome: 'applied', data: { kind: 'usage', windows: this.snapshot().usage } };
         }
         this.finishMetadataReceipt(commandId, result);
       });
+      this.googleUsageReport = published;
     } catch (error) {
       result = { outcome: 'outcome-unknown', reason: 'google-ownership-unknown' };
       try {
@@ -2105,6 +2128,68 @@ export class Controller {
       }
     } finally {
       runtime.resolve(CommandResultSchema.parse(result));
+    }
+  }
+
+  private googleUsageBinding(
+    resolution: Extract<GoogleUsageClientResolution, { available: true }>,
+  ) {
+    try {
+      const setup = this.store.googleAcpSetup();
+      if (setup.state !== 'ready' || !setup.proofId) return;
+      const proof = this.store.get<Artifact>('artifact', setup.proofId);
+      if (!proof) return;
+      return hashCanonical({
+        client: resolution.client,
+        environment: resolution.environment,
+        setup,
+        proofHash: proof.hash,
+      });
+    } catch {
+      return;
+    }
+  }
+
+  private attachGoogleUsage(routeId: string, environment: NodeJS.ProcessEnv) {
+    const report = this.googleUsageReport;
+    if (!report || this.store.googleOperationBlocker()) return;
+    let observations: Observation[];
+    try {
+      const resolution = this.options.googleUsageClient?.() ?? resolveGoogleUsageClient();
+      const reader = this.store.googleUsageReader();
+      const operation = this.store
+        .googleMetadataOperations()
+        .find((row) => row.command_id === report.commandId);
+      if (
+        !resolution.available ||
+        !report.home ||
+        environment.HOME !== report.home ||
+        this.googleUsageBinding(resolution) !== report.bindingHash ||
+        reader.authority_revision !== report.authorityRevision ||
+        reader.last_attempt_at !== report.attemptedAt ||
+        reader.last_observed_at !== report.observedAt ||
+        operation?.kind !== 'usage' ||
+        operation.state !== 'quiescent' ||
+        operation.authority_revision !== report.authorityRevision
+      )
+        return;
+      observations = googleUsageObservations(report.buckets, [routeId], report.observedAt);
+      if (
+        !observations.every(
+          (window) =>
+            deriveWindow(window, { nowMs: Date.parse(this.now()), maxAgeMs: 300000 }).state ===
+            'fresh',
+        )
+      )
+        return;
+    } catch {
+      return;
+    }
+    // A new preparation can follow the startup read inside its cooldown.
+    // Keep that complete report's original time and account assertion binding.
+    for (const observation of observations) {
+      this.store.put('window', `${routeId}/${observation.windowId}`, 0, observation);
+      this.event('usage.observed', null, 0, observation);
     }
   }
 
@@ -7657,6 +7742,7 @@ export class Controller {
       this.nativeWriterPlan(plan);
       writing = true;
       const binding = this.saveNativePlan(plan);
+      this.attachGoogleUsage(route.id, profile.environment);
       if (input.consent === 'explicit' && !this.store.receipt(`native-consent:${scopeHash}`)) {
         const consent = this.nativeArtifact({ scopeHash, expiresAt });
         this.store.saveReceipt(`native-consent:${scopeHash}`, scopeHash, 'local-owner', {
