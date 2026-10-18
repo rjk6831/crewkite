@@ -163,7 +163,8 @@ export function runAcpPeer(scenario: AcpPeerCase) {
     const path = join(cwd, '..', 'brain', 'conversation', 'task.md');
     const tool = {
       toolCallId: 'fixture-brain-write',
-      title: 'Run write_to_file?',
+      ...(scenario === 'outside-execute' ? { name: 'private prose' } : {}),
+      title: scenario === 'outside-execute' ? 'private prose' : 'Run write_to_file?',
       kind: scenario === 'outside-execute' ? 'execute' : 'edit',
       status: scenario === 'outside-permission-completed' ? 'completed' : 'pending',
       rawInput: { TargetFile: path, CodeContent: '# Tasks\n' },

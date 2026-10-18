@@ -547,6 +547,28 @@ function editArguments(input: unknown): AcpDiagnostic['editArguments'] {
     name === 'other' ? names.some((key) => !knownEditArguments.has(key)) : names.includes(name),
   );
 }
+function permissionMachineIdentity(
+  tool: Tool,
+): Pick<AcpDiagnostic, 'toolIdentityHash' | 'rawInputKeyHashes'> {
+  const wrapped = tool.title?.match(/^Run ([a-z][a-z0-9_]*)\?$/)?.[1];
+  const direct = tool.name?.match(/^[a-z][a-z0-9_]*$/)?.[0];
+  const identifier = direct ?? wrapped;
+  const keys =
+    tool.rawInput && typeof tool.rawInput === 'object' && !Array.isArray(tool.rawInput)
+      ? Object.keys(tool.rawInput)
+      : [];
+  const rawInputKeyHashes = [
+    ...new Set(keys.map((key) => createHash('sha256').update(key).digest('hex'))),
+  ]
+    .sort()
+    .slice(0, 32);
+  return {
+    ...(identifier
+      ? { toolIdentityHash: createHash('sha256').update(identifier).digest('hex') }
+      : {}),
+    ...(rawInputKeyHashes.length > 0 ? { rawInputKeyHashes } : {}),
+  };
+}
 function mergeTool(previous: Tool | undefined, patch: Tool): Tool {
   const next = { ...previous, toolCallId: patch.toolCallId } as Tool;
   for (const [key, value] of Object.entries(patch))
@@ -760,6 +782,7 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
           const at = (site: AcpDiagnostic['site']): AcpDiagnostic => ({
             site,
             method: 'session/request_permission',
+            ...permissionMachineIdentity(tool),
             ...(carried ? { editArguments: carried } : {}),
           });
           if (completedTools.has(tool.toolCallId) && outsideEdit(tool.toolCallId)) {

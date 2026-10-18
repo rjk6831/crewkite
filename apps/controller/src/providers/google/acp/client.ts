@@ -95,6 +95,16 @@ export const AcpDiagnosticSchema = z.strictObject({
     .optional(),
   rpcCode: z.number().int().safe().optional(),
   pendingToolCount: z.number().int().min(0).max(256).optional(),
+  // Keep only digests of machine identifiers. Provider text and argument values stay out.
+  toolIdentityHash: z
+    .string()
+    .regex(/^[0-9a-f]{64}$/)
+    .optional(),
+  rawInputKeyHashes: z
+    .array(z.string().regex(/^[0-9a-f]{64}$/))
+    .max(32)
+    .refine((hashes) => new Set(hashes).size === hashes.length)
+    .optional(),
   // A refused edit keeps the names of the arguments it carried, never their values.
   editArguments: z
     .array(

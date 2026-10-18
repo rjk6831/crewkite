@@ -1162,6 +1162,10 @@ test('the acp protocol consumes one complete live permission and never treats co
             ? {
                 site: 'edit-location',
                 method: 'session/request_permission',
+                toolIdentityHash: createHash('sha256').update('write_to_file').digest('hex'),
+                rawInputKeyHashes: ['TargetFile', 'CodeContent']
+                  .map((key) => createHash('sha256').update(key).digest('hex'))
+                  .sort(),
                 editArguments: ['TargetFile', 'other'],
               }
             : {
@@ -1184,6 +1188,8 @@ test('the acp protocol consumes one complete live permission and never treats co
           scenario === 'outside-execute' ? 'permission-action' : 'permission-options',
         );
         assert.equal(outcome.diagnostic?.method, 'session/request_permission');
+        if (scenario === 'outside-execute')
+          assert.equal(outcome.diagnostic?.toolIdentityHash, undefined);
       } else if (scenario === 'pending-end') {
         // A permission still pending at the terminal response refuses the turn.
         assert.equal(outcome.reason, 'protocol');
@@ -1211,6 +1217,10 @@ test('the acp protocol consumes one complete live permission and never treats co
         assert.deepEqual(outcome.diagnostic, {
           site: 'permission-action',
           method: 'session/request_permission',
+          toolIdentityHash: createHash('sha256').update('replace_file_content').digest('hex'),
+          rawInputKeyHashes: ['TargetFile', 'TargetContent', 'ReplacementContent', 'AllowMultiple']
+            .map((key) => createHash('sha256').update(key).digest('hex'))
+            .sort(),
           editArguments: ['TargetFile', 'TargetContent', 'ReplacementContent', 'AllowMultiple'],
         });
       if (scenario === 'duplicate') assert.equal(outcome.diagnostic?.site, 'correlation');
@@ -1511,6 +1521,11 @@ setInterval(() => {}, 1000);
   );
   assert.equal(
     AcpDiagnosticSchema.safeParse({ site: 'tool-update', sessionUpdate: 'private-update' }).success,
+    false,
+  );
+  assert.equal(
+    AcpDiagnosticSchema.safeParse({ site: 'permission-action', toolIdentityHash: 'task_boundary' })
+      .success,
     false,
   );
   const output = new (await import('node:stream')).PassThrough();
