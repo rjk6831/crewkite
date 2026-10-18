@@ -147,7 +147,7 @@ export class RepositoryTranscript {
       !Number.isFinite(started) ||
       !Number.isSafeInteger(privateOptions.timeoutMs) ||
       privateOptions.timeoutMs < 1 ||
-      privateOptions.timeoutMs > 300000
+      privateOptions.timeoutMs > 600000
     )
       throw new Error('Repository task deadline is invalid.');
     this.deadline = started + privateOptions.timeoutMs;
@@ -697,7 +697,7 @@ export function startRepository(
   const now = options.now ?? (() => performance.now());
   const handle = startNativeTask(
     launch,
-    { ...options, now, disableMcpServers: true },
+    { ...options, now, disableMcpServers: true, maximumTaskMs: 600_000 },
     (remaining) => {
       reader = new RepositoryTranscript(trusted, {
         now,

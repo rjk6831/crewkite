@@ -367,6 +367,7 @@ const NativeRepositoryAppointmentSchema = NativeFileAppointmentSchema.omit({
   .extend({
     repository: NativeRepositoryScopeSchema,
     execution: NativeRepositoryExecutionSchema,
+    maximumTaskMs: z.number().int().min(2001).max(600_000),
     billingAttestation: z.never().optional(),
     permissionMode: z.never().optional(),
   })
@@ -6915,6 +6916,7 @@ export class Controller {
                 ? 'prepared'
                 : 'retain-only',
             expiresAt: appointment.expiresAt,
+            maximumTaskMs: appointment.maximumTaskMs,
             ...(handoff ? { handoff } : {}),
             ...(appointment.billingAttestation
               ? { billingAttestation: appointment.billingAttestation }
@@ -8620,7 +8622,12 @@ export class Controller {
           },
           policy,
           expiresAt,
-          maximumTaskMs: Math.min(facts.maximumTaskMs, (maximumMinutes ?? 5) * 60000),
+          // Repository writers get up to their ten-minute profile limit, capped by the run's
+          // minutes. The five-minute floor keeps file appointments and short runs as before.
+          maximumTaskMs: Math.min(
+            facts.maximumTaskMs,
+            (maximumMinutes ?? Math.max(5, policy.limits.minutes)) * 60000,
+          ),
           maximumSubmissions: facts.maximumSubmissions,
         }),
       );

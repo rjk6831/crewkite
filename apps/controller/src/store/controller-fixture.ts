@@ -29,6 +29,7 @@ import { replacementFixture as googleFixture } from '../providers/google/replace
 import {
   type NativeProfileResolution,
   unavailableNativeProfile,
+  unavailableRepositoryProfile,
 } from '../providers/openai/profile.ts';
 import {
   fixture,
@@ -176,7 +177,7 @@ async function nativeSetup(
     environment: { ...process.env },
     locationHash: '1'.repeat(64),
   } satisfies NativeProfileResolution;
-  const { maximumFileBytes: _fileLimit, ...repositoryFields } = unavailableNativeProfile().facts;
+  const repositoryFields = unavailableRepositoryProfile().facts;
   const fixtureProfile = anthropic
     ? {
         ...reviewerProfile,

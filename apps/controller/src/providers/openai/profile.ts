@@ -104,6 +104,7 @@ function repositoryResolution(resolved: NativeProfileResolution): NativeProfileR
       id: 'openai-repository-v1',
       displayName: 'OpenAI repository work',
       qualifiedAt: null,
+      maximumTaskMs: 600000,
       maximumSourceFiles: 10000,
       maximumSourceBytes: 67108864,
       execution: { sandbox: 'workspace-write', approvalPolicy: 'never', networkAccess: false },

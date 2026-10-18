@@ -95,6 +95,7 @@ export const NativeRepositoryProfileSchema = OpenAiNativeProfileSchema.omit({
 }).extend({
   id: z.literal('openai-repository-v1'),
   qualifiedAt: z.iso.date().nullable(),
+  maximumTaskMs: z.literal(600000),
   maximumSourceFiles: z.literal(10000),
   maximumSourceBytes: z.literal(67108864),
   execution: NativeRepositoryExecutionSchema,
@@ -634,6 +635,7 @@ export const NativeRunSchema = z
     permissionMode: GoogleNativePermissionModeSchema.optional(),
     stage: z.enum(['prepared', 'retain-only']),
     expiresAt: TimestampSchema.optional(),
+    maximumTaskMs: z.number().int().min(2001).max(600000).optional(),
     handoff: NativeHandoffPreviewSchema.optional(),
     repository: NativeRepositoryScopeSchema.optional(),
     execution: NativeRepositoryExecutionSchema.optional(),

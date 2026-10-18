@@ -1164,6 +1164,7 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     id: 'openai-repository-v1',
     qualifiedAt: null,
     reason: 'qualification-pending',
+    maximumTaskMs: 600000,
     maximumSourceFiles: 10000,
     maximumSourceBytes: 67108864,
     execution,
@@ -1171,6 +1172,7 @@ test('process boundaries reject unknown fields and invalid command identity', ()
   assert.deepEqual(NativeProfileSchema.parse(repositoryProfile), repositoryProfile);
   for (const change of [
     { maximumFileBytes: 65536 },
+    { maximumTaskMs: 300000 },
     { maximumSourceFiles: 2 },
     { maximumSourceBytes: 67108865 },
     { execution: { ...execution, sandbox: 'danger-full-access' } },

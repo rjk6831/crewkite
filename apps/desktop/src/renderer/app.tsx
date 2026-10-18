@@ -2008,7 +2008,7 @@ function Plan({
                 />
                 <Fact
                   label={native.handoff ? 'Writer time limit' : 'Time limit'}
-                  value={`${(profile?.maximumTaskMs ?? 300000) / 60000} min`}
+                  value={`${(native.maximumTaskMs ?? profile?.maximumTaskMs ?? 300000) / 60000} min`}
                 />
               </div>
               {native.handoff && (

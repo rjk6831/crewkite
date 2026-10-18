@@ -161,7 +161,7 @@ Idle publication requires a validated supported-account reading and physical clo
 
 ### Repository work
 
-The separate `openai-repository-v1` profile uses the exact 0.163.0 client build, Pro metadata, `gpt-6.1-sol` at low effort and the default tier. It freezes the committed source base and manifest, bounded to 10,000 files and 64 MiB. Preparation requires scratch-write and `run-native-tools` grants for that task and project. The tools grant is consumed once at launch and permits multiple local commands during the bounded task. File consent cannot authorize it. Existing credits default off.
+The separate `openai-repository-v1` profile uses the exact 0.163.0 client build, Pro metadata, `gpt-6.1-sol` at low effort and the default tier. It freezes the committed source base and manifest, bounded to 10,000 files and 64 MiB. Preparation requires scratch-write and `run-native-tools` grants for that task and project. The tools grant is consumed once at launch and permits multiple local commands during the bounded task. File consent cannot authorize it. Existing credits default off. The writer deadline is ten minutes or the run's minute limit, whichever is shorter, including preparation and owned cleanup. Writers prepared earlier keep their saved five-minute limit. Reviews keep five minutes.
 
 The native settings are fixed: `workspace-write`, approval `never` and network access off. The requested policy retains the native `TMPDIR` and `/tmp` write exceptions. Requests needing native approval are cancelled and the turn is interrupted. These controls add no CrewKite filesystem, process or network containment. [ADR 0009](adr/0009-native-client-trust-profile.md) records the native trust boundary.
 

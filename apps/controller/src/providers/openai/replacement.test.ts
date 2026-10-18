@@ -1156,6 +1156,11 @@ test('native proposals and reviews require one matching completed turn and bound
   }
   assert.equal(repositoryInput.creditPolicy, 'ordinary');
   assert.equal(resolveRepositoryProfile({}).facts.id, 'openai-repository-v1');
+  assert.equal(resolveRepositoryProfile({}).facts.maximumTaskMs, 600_000);
+  assert.throws(
+    () =>
+      new RepositoryTranscript(repositoryInput, { now: () => 1, timeoutMs: 600_001, directory }),
+  );
   for (const invalid of [
     { ...repositoryInput, scratchPath: 'relative' },
     { ...repositoryInput, execution: { ...repositoryInput.execution, networkAccess: true } },
@@ -1192,7 +1197,7 @@ test('native proposals and reviews require one matching completed turn and bound
     const activities: RepositoryActivity[] = [];
     const native = new RepositoryTranscript(repositoryInput, {
       now: () => clock,
-      timeoutMs: 300_000,
+      timeoutMs: 600_000,
       directory,
       onActivity: (activity) => {
         activities.push(activity);
@@ -1228,7 +1233,7 @@ test('native proposals and reviews require one matching completed turn and bound
     }
     native.push(bytes({ id: 10, result: thread }));
     if (mode === 'deadline') {
-      clock = 300_001;
+      clock = 600_001;
       assert.throws(() => native.next());
       assert.equal(native.submitted, false);
       continue;
@@ -1383,6 +1388,19 @@ test('native proposals and reviews require one matching completed turn and bound
       },
       selectedReview,
       { timeoutMs: 181_000, onSubmitted: () => assert.fail('over-budget review cannot submit') },
+    ),
+  );
+  assert.throws(() =>
+    startReplacement(
+      {
+        executable: process.execPath,
+        sha256: '0'.repeat(64),
+        directory,
+        repositoryRoot: directory,
+        environment: {},
+      },
+      plan(directory),
+      { timeoutMs: 300_001, onSubmitted: () => assert.fail('a file writer keeps five minutes') },
     ),
   );
   const reader = new ReplacementTranscript(plan(directory), { now: () => 1, timeoutMs: 300_000 });
@@ -1752,7 +1770,7 @@ test('native task submission and interruption share one deadline through owned c
         context: { title: 'Bound net', outcome: 'Return the net.', criteria: ['Keep the bound.'] },
       }),
       {
-        timeoutMs: 300_000,
+        timeoutMs: 600_000,
         onSubmitted: () => {
           repositorySubmissions++;
         },

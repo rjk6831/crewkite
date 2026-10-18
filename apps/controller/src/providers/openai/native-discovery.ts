@@ -476,6 +476,7 @@ function nativeSession<T>(
     schedule?: Schedule;
     spawn?: Spawn;
     task?: boolean;
+    maximumTaskMs?: 300_000 | 600_000;
     onSubmitted?: () => void;
     disableMcpServers?: boolean;
     lifecycle?: NativeLifecycle;
@@ -488,7 +489,7 @@ function nativeSession<T>(
     !Number.isFinite(started) ||
     !Number.isSafeInteger(options.timeoutMs) ||
     options.timeoutMs < (options.task ? 2001 : 1) ||
-    options.timeoutMs > (options.task ? 300_000 : 60_000)
+    options.timeoutMs > (options.task ? (options.maximumTaskMs ?? 300_000) : 60_000)
   )
     throw new Error('Discovery deadline is invalid.');
   const deadline = started + options.timeoutMs;
@@ -613,6 +614,7 @@ export function startNativeTask<T>(
     now?: () => number;
     schedule?: Schedule;
     spawn?: Spawn;
+    maximumTaskMs?: 300_000 | 600_000;
     onSubmitted: () => void;
     disableMcpServers?: boolean;
     lifecycle?: NativeLifecycle;

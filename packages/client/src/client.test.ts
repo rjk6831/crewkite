@@ -220,7 +220,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     serviceTier: 'default',
     qualifiedAt: null,
     creditPolicies: ['ordinary', 'existing-credits'],
-    maximumTaskMs: 300000,
+    maximumTaskMs: 600000,
     maximumSourceFiles: 10000,
     maximumSourceBytes: 67108864,
     maximumSubmissions: 1,
