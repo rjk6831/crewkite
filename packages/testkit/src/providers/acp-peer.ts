@@ -163,11 +163,16 @@ export function runAcpPeer(scenario: AcpPeerCase) {
     const path = join(cwd, '..', 'brain', 'conversation', 'task.md');
     const tool = {
       toolCallId: 'fixture-brain-write',
-      ...(scenario === 'outside-execute' ? { name: 'private prose' } : {}),
+      ...(scenario === 'outside-execute'
+        ? { name: 'private prose', _meta: { mcp: { tool: 'catalog_tool' } } }
+        : {}),
       title: scenario === 'outside-execute' ? 'private prose' : 'Run write_to_file?',
       kind: scenario === 'outside-execute' ? 'execute' : 'edit',
       status: scenario === 'outside-permission-completed' ? 'completed' : 'pending',
-      rawInput: { TargetFile: path, CodeContent: '# Tasks\n' },
+      rawInput:
+        scenario === 'outside-execute'
+          ? { arguments: JSON.stringify({ task_status: 'done' }) }
+          : { TargetFile: path, CodeContent: '# Tasks\n' },
       locations: [{ path }],
     };
     // Here the path first appears in the permission request.

@@ -552,13 +552,38 @@ function permissionMachineIdentity(
 ): Pick<AcpDiagnostic, 'toolIdentityHash' | 'rawInputKeyHashes'> {
   const wrapped = tool.title?.match(/^Run ([a-z][a-z0-9_]*)\?$/)?.[1];
   const direct = tool.name?.match(/^[a-z][a-z0-9_]*$/)?.[0];
-  const identifier = direct ?? wrapped;
-  const keys =
-    tool.rawInput && typeof tool.rawInput === 'object' && !Array.isArray(tool.rawInput)
-      ? Object.keys(tool.rawInput)
-      : [];
+  const meta =
+    tool._meta && typeof tool._meta === 'object' && !Array.isArray(tool._meta)
+      ? tool._meta
+      : undefined;
+  const mcp =
+    meta && 'mcp' in meta && meta.mcp && typeof meta.mcp === 'object' && !Array.isArray(meta.mcp)
+      ? meta.mcp
+      : undefined;
+  const mcpTool =
+    mcp && 'tool' in mcp && typeof mcp.tool === 'string'
+      ? mcp.tool.match(/^[a-z][a-z0-9_]*$/)?.[0]
+      : undefined;
+  const identifier = direct ?? wrapped ?? mcpTool;
+  const keys = new Set<string>();
+  const collectKeys = (value: unknown, depth: number) => {
+    if (depth > 4 || keys.size >= 32) return;
+    if (typeof value === 'string' && value.length <= 65_536 && value.trimStart().startsWith('{')) {
+      try {
+        collectKeys(JSON.parse(value), depth + 1);
+      } catch {}
+      return;
+    }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+    for (const [key, nested] of Object.entries(value)) {
+      keys.add(key);
+      collectKeys(nested, depth + 1);
+      if (keys.size >= 32) return;
+    }
+  };
+  collectKeys(tool.rawInput, 0);
   const rawInputKeyHashes = [
-    ...new Set(keys.map((key) => createHash('sha256').update(key).digest('hex'))),
+    ...new Set([...keys].map((key) => createHash('sha256').update(key).digest('hex'))),
   ]
     .sort()
     .slice(0, 32);

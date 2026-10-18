@@ -1188,8 +1188,18 @@ test('the acp protocol consumes one complete live permission and never treats co
           scenario === 'outside-execute' ? 'permission-action' : 'permission-options',
         );
         assert.equal(outcome.diagnostic?.method, 'session/request_permission');
-        if (scenario === 'outside-execute')
-          assert.equal(outcome.diagnostic?.toolIdentityHash, undefined);
+        if (scenario === 'outside-execute') {
+          assert.equal(
+            outcome.diagnostic?.toolIdentityHash,
+            createHash('sha256').update('catalog_tool').digest('hex'),
+          );
+          assert.deepEqual(
+            outcome.diagnostic?.rawInputKeyHashes,
+            ['arguments', 'task_status']
+              .map((key) => createHash('sha256').update(key).digest('hex'))
+              .sort(),
+          );
+        }
       } else if (scenario === 'pending-end') {
         // A permission still pending at the terminal response refuses the turn.
         assert.equal(outcome.reason, 'protocol');
