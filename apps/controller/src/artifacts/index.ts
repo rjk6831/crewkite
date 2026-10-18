@@ -33,12 +33,31 @@ export class ArtifactFiles {
       constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
       0o600,
     );
+
     try {
       writeFileSync(file, content);
       fsyncSync(file);
-    } finally {
-      closeSync(file);
+    } catch (error) {
+      // Cleanup attempt 1: Close the file descriptor.
+      try {
+        closeSync(file);
+      } catch (_cleanupError) {
+        // Discard cleanup error to preserve original failure context.
+      }
+
+      // Cleanup attempt 2: Remove the temporary incoming file.
+      try {
+        unlinkSync(temporary);
+      } catch (_unlinkError) {
+        // Discard cleanup error to preserve original failure context.
+      }
+
+      throw error;
     }
+
+    // Success path: Close the file descriptor before publication logic.
+    closeSync(file);
+
     try {
       try {
         linkSync(temporary, destination);
@@ -56,6 +75,7 @@ export class ArtifactFiles {
     } finally {
       unlinkSync(temporary);
     }
+
     return { hash, bytes: content.length };
   }
 
