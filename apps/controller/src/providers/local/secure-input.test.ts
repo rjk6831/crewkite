@@ -174,14 +174,11 @@ test('Local secret input returns one current private result after helper cleanup
     draftModel: '',
   };
   const capability = { platform: 'darwin', arch: 'arm64', secretConfigured: true };
-  const configuration = { endpoint: prompt.endpoint, receipt };
-  const resolved = resolveLocalConnection(configuration, capability);
-  assert.equal(resolved.facts.available, true);
-  assert.equal(resolved.facts.qualifiedAt, null);
-  assert.equal(resolved.facts.reason, 'qualification-pending');
-  assert.equal(resolved.facts.family, 'local');
-  assert.equal(resolved.facts.billing, 'local');
-  assert(!('creditPolicies' in resolved.facts));
+  const legacyConfiguration = { endpoint: prompt.endpoint, receipt };
+  assert.equal(
+    resolveLocalConnection(legacyConfiguration, capability).facts.reason,
+    'model-setup-unavailable',
+  );
   const runtime = { connectorId: 'local-sdk-v1', version: '0.5.0', build: 9 };
   const identity = {
     modelKey: 'fixture/new-model',
@@ -217,6 +214,10 @@ test('Local secret input returns one current private result after helper cleanup
     observation: { ...observed, observationHash: hashCanonical(observed) },
   };
   const selected = resolveLocalConnection(selection, capability);
+  assert.equal(selected.facts.available, true);
+  assert.equal(selected.facts.family, 'local');
+  assert.equal(selected.facts.billing, 'local');
+  assert(!('creditPolicies' in selected.facts));
   assert.equal(selected.facts.reason, 'qualification-pending');
   assert.equal(selected.facts.qualifiedAt, null);
   assert.equal(selected.connection?.modelBinding.modelKey, identity.modelKey);
@@ -307,31 +308,33 @@ test('Local secret input returns one current private result after helper cleanup
     null,
   );
   assert.equal(
-    resolveLocalConnection(configuration, { ...capability, secretConfigured: false }).facts
-      .available,
+    resolveLocalConnection(selection, { ...capability, secretConfigured: false }).facts.available,
     false,
   );
   for (const [input, platform] of [
     [null, capability],
-    [configuration, { ...capability, platform: 'linux' }],
-    [configuration, { ...capability, arch: 'x64' }],
-    [{ ...configuration, token: secret }, capability],
-    [{ ...configuration, authMode: 'none' }, capability],
-    [{ ...configuration, endpoint: 'ws://localhost:1234' }, capability],
-    [{ ...configuration, endpoint: 'ws://127.0.0.1:65536' }, capability],
-    [{ ...configuration, receipt: { ...receipt, token: secret } }, capability],
-    [{ ...configuration, receipt: { ...receipt, residentLlms: 2 } }, capability],
-    [{ ...configuration, receipt: { ...receipt, embeddingInstances: 1 } }, capability],
-    [{ ...configuration, receipt: { ...receipt, contextLength: 16384 } }, capability],
-    [{ ...configuration, receipt: { ...receipt, draftModel: 'other' } }, capability],
-    [{ ...configuration, receipt: { ...receipt, artifactSha256: 'e'.repeat(64) } }, capability],
-    [
-      {
-        ...configuration,
-        receipt: { ...receipt, model: { ...receipt.model, instanceReference: 'bad\ninstance' } },
-      },
-      capability,
-    ],
+    [legacyConfiguration, capability],
+    [{ ...legacyConfiguration, authMode: 'none' }, capability],
+    [selection, { ...capability, platform: 'linux' }],
+    [selection, { ...capability, arch: 'x64' }],
+    [{ ...selection, token: secret }, capability],
+    [{ ...selection, endpoint: 'ws://localhost:1234' }, capability],
+    [{ ...selection, endpoint: 'ws://127.0.0.1:65536' }, capability],
+    ...[
+      { ...observed, residentLlms: 2 },
+      { ...observed, embeddingInstances: 1 },
+      { ...observed, models: [{ ...observed.models[0], contextLength: 16384 }] },
+      { ...observed, models: [{ ...observed.models[0], instanceReference: 'bad\ninstance' }] },
+    ].map(
+      (observation) =>
+        [
+          {
+            ...selection,
+            observation: { ...observation, observationHash: hashCanonical(observation) },
+          },
+          capability,
+        ] as const,
+    ),
   ] as const) {
     const refused = resolveLocalConnection(input, platform);
     assert.equal(refused.facts.available, false);

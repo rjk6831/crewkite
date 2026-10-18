@@ -13,40 +13,13 @@ export const LocalEndpointSchema = z
   .string()
   .regex(/^ws:\/\/127\.0\.0\.1:([1-9][0-9]{0,4})$/)
   .refine((value) => Number(value.slice(value.lastIndexOf(':') + 1)) <= 65535);
-const identifier = z
-  .string()
-  .min(1)
-  .max(200)
-  .refine(
-    (value) => value.isWellFormed() && !/\p{Cc}/u.test(value) && Buffer.byteLength(value) <= 200,
-  );
-const modelIdentity = z.strictObject({
-  modelKey: identifier,
-  instanceReference: identifier,
-  modelSizeBytes: z.number().int().positive().safe(),
+const configurationSchema = z.strictObject({
+  endpoint: z.unknown(),
+  authMode: LocalAuthModeSchema.optional(),
+  connectionRevision: RevisionSchema,
+  observation: LocalModelObservationSchema,
+  selectionId: HashSchema,
 });
-export const LocalSetupReceiptSchema = z.strictObject({
-  version: z.literal(1),
-  runtimeVersion: z.literal('0.4.26+4'),
-  artifactSha256: z.literal('cd76ec205963b3b33350093e6904d9de16c4e666fd104e1f632d25c7f15f2a13'),
-  artifactSizeBytes: z.literal(5627044256),
-  quantization: z.literal('Q4_K_M'),
-  model: modelIdentity.extend({ modelSizeBytes: z.literal(5627044256) }),
-  contextLength: z.literal(8192),
-  residentLlms: z.literal(1),
-  embeddingInstances: z.literal(0),
-  draftModel: z.literal(''),
-});
-const configurationSchema = z.union([
-  z.strictObject({ endpoint: z.unknown(), receipt: z.unknown() }),
-  z.strictObject({
-    endpoint: z.unknown(),
-    authMode: LocalAuthModeSchema.optional(),
-    connectionRevision: RevisionSchema,
-    observation: LocalModelObservationSchema,
-    selectionId: HashSchema,
-  }),
-]);
 type LocalFacts = z.output<typeof LocalNativeProfileSchema>;
 export type LocalConnection = {
   endpoint: string;
@@ -102,93 +75,64 @@ export function resolveLocalConnection(
   if (!configuration.success) return unavailable('model-setup-unavailable');
   const endpoint = LocalEndpointSchema.safeParse(configuration.data.endpoint);
   if (!endpoint.success) return unavailable('connection-unavailable');
-  if ('observation' in configuration.data) {
-    const { observation, selectionId } = configuration.data;
-    const { connectionRevision } = configuration.data;
-    const authMode = configuration.data.authMode ?? 'token';
-    const connected =
-      authMode === 'none' ? capability.connected === true : capability.secretConfigured;
-    const connectionHash = localConfiguredConnectionHash(
-      endpoint.data,
-      connectionRevision,
-      authMode,
-    );
-    const { observationHash, ...observed } = observation;
-    if (
-      hashCanonical(observed) !== observationHash ||
-      observation.models.some(
-        (choice) =>
-          choice.selectionId !==
-          hashCanonical({
-            runtime: observation.runtime,
-            metadataHash: choice.identity.metadataHash,
-          }),
-      )
+  const { observation, selectionId } = configuration.data;
+  const { connectionRevision } = configuration.data;
+  const authMode = configuration.data.authMode ?? 'token';
+  const connected =
+    authMode === 'none' ? capability.connected === true : capability.secretConfigured;
+  const connectionHash = localConfiguredConnectionHash(endpoint.data, connectionRevision, authMode);
+  const { observationHash, ...observed } = observation;
+  if (
+    hashCanonical(observed) !== observationHash ||
+    observation.models.some(
+      (choice) =>
+        choice.selectionId !==
+        hashCanonical({
+          runtime: observation.runtime,
+          metadataHash: choice.identity.metadataHash,
+        }),
     )
-      return unavailable('model-setup-unavailable');
-    const choice = observation.models.find((model) => model.selectionId === selectionId);
-    if (
-      choice?.state !== 'loaded-eligible' ||
-      !choice.instanceReference ||
-      choice.contextLength !== 8192 ||
-      observation.residentLlms !== 1 ||
-      observation.embeddingInstances !== 0
-    )
-      return unavailable('model-setup-unavailable');
-    const binding = LocalModelBindingSchema.safeParse({
-      version: 2,
-      identityKind: 'runtime-metadata',
-      setupHash: hashCanonical({ version: 2, connectionHash, observationHash, selectionId }),
-      connectionHash,
-      connectionRevision,
-      connectorId: observation.runtime.connectorId,
-      runtimeVersion: observation.runtime.version,
-      runtimeBuild: observation.runtime.build,
-      modelKey: choice.identity.modelKey,
-      instanceReference: choice.instanceReference,
-      modelSizeBytes: choice.identity.sizeBytes,
-      format: choice.identity.format,
-      metadataHash: choice.identity.metadataHash,
-      ...(authMode === 'none' ? { authMode } : {}),
-    });
-    if (!binding.success) return unavailable('model-setup-unavailable');
-    return {
-      facts: LocalNativeProfileSchema.parse({
-        ...unavailable('connection-unavailable').facts,
-        model: binding.data.modelKey,
-        modelBinding: binding.data,
-        available: connected,
-        reason: connected ? 'qualification-pending' : 'connection-unavailable',
-      }),
-      connection: {
-        endpoint: endpoint.data,
-        authMode,
-        connectionHash,
-        modelBinding: binding.data,
-      },
-    };
-  }
-  const receipt = LocalSetupReceiptSchema.safeParse(configuration.data.receipt);
-  if (!receipt.success) return unavailable('model-setup-unavailable');
-  const modelBinding = LocalModelBindingSchema.parse({
-    ...receipt.data.model,
-    setupHash: hashCanonical(receipt.data),
-    artifactSha256: receipt.data.artifactSha256,
-    quantization: receipt.data.quantization,
+  )
+    return unavailable('model-setup-unavailable');
+  const choice = observation.models.find((model) => model.selectionId === selectionId);
+  if (
+    choice?.state !== 'loaded-eligible' ||
+    !choice.instanceReference ||
+    choice.contextLength !== 8192 ||
+    observation.residentLlms !== 1 ||
+    observation.embeddingInstances !== 0
+  )
+    return unavailable('model-setup-unavailable');
+  const binding = LocalModelBindingSchema.safeParse({
+    version: 2,
+    identityKind: 'runtime-metadata',
+    setupHash: hashCanonical({ version: 2, connectionHash, observationHash, selectionId }),
+    connectionHash,
+    connectionRevision,
+    connectorId: observation.runtime.connectorId,
+    runtimeVersion: observation.runtime.version,
+    runtimeBuild: observation.runtime.build,
+    modelKey: choice.identity.modelKey,
+    instanceReference: choice.instanceReference,
+    modelSizeBytes: choice.identity.sizeBytes,
+    format: choice.identity.format,
+    metadataHash: choice.identity.metadataHash,
+    ...(authMode === 'none' ? { authMode } : {}),
   });
+  if (!binding.success) return unavailable('model-setup-unavailable');
   return {
     facts: LocalNativeProfileSchema.parse({
       ...unavailable('connection-unavailable').facts,
-      model: modelBinding.modelKey,
-      modelBinding,
-      available: capability.secretConfigured,
-      reason: capability.secretConfigured ? 'qualification-pending' : 'connection-unavailable',
+      model: binding.data.modelKey,
+      modelBinding: binding.data,
+      available: connected,
+      reason: connected ? 'qualification-pending' : 'connection-unavailable',
     }),
     connection: {
       endpoint: endpoint.data,
-      authMode: 'token',
-      connectionHash: localConnectionHash(endpoint.data, modelBinding.setupHash),
-      modelBinding,
+      authMode,
+      connectionHash,
+      modelBinding: binding.data,
     },
   };
 }
