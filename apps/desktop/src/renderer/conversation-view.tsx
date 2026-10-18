@@ -1425,7 +1425,7 @@ export function NewGoal({
         <details>
           <summary>
             Planning settings · {planning.attempts} attempts · {planning.minutes} minutes ·{' '}
-            {planning.concurrency} active model {planning.concurrency === 1 ? 'agent' : 'agents'}
+            {planning.concurrency} active model {planning.concurrency === '1' ? 'agent' : 'agents'}
           </summary>
           <div className="form-stack">
             <PlanningControls
