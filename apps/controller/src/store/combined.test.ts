@@ -219,7 +219,9 @@ test('combined tasks share seven real dispatches and require a separate full bar
             60_000 +
           (stage === 'baseline' || stage === 'assembly'
             ? Math.max(0, 60_000 - group.integration_milliseconds)
-            : 0)
+            : 0) +
+          // The three-file runner can pause this process while sibling fixtures own the host.
+          60_000
         );
       };
       const waitFor = async (
