@@ -816,6 +816,19 @@ test('the acp protocol consumes one complete live permission and never treats co
         toolMappings: [hunkFixture.hunkMapping],
         readTarget,
       });
+    assert.throws(
+      () =>
+        decodeAcpPermissionAction({
+          tool,
+          client: hunkFixture.client,
+          scratch: hunkFixture.scratch,
+          target,
+          toolMappings: [hunkFixture.hunkMapping],
+          mcpServerName: 'crewkite-context',
+          readTarget: targetState,
+        }),
+      AcpError,
+    );
     const productionTool = GoogleAcpToolMappings[0];
     assert.equal(GoogleAcpToolMappings.length, 1);
     assert.equal(GoogleAcpReviewMappings.length, 1);
@@ -1228,10 +1241,22 @@ test('the acp protocol consumes one complete live permission and never treats co
           site: 'permission-action',
           method: 'session/request_permission',
           toolIdentityHash: createHash('sha256').update('replace_file_content').digest('hex'),
-          rawInputKeyHashes: ['TargetFile', 'TargetContent', 'ReplacementContent', 'AllowMultiple']
+          rawInputKeyHashes: [
+            'TargetFile',
+            'TargetContent',
+            'ReplacementContent',
+            'AllowMultiple',
+            'arguments',
+          ]
             .map((key) => createHash('sha256').update(key).digest('hex'))
             .sort(),
-          editArguments: ['TargetFile', 'TargetContent', 'ReplacementContent', 'AllowMultiple'],
+          editArguments: [
+            'TargetFile',
+            'TargetContent',
+            'ReplacementContent',
+            'AllowMultiple',
+            'other',
+          ],
         });
       if (scenario === 'duplicate') assert.equal(outcome.diagnostic?.site, 'correlation');
       assert.equal(usages, 1, scenario);
