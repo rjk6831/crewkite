@@ -28,8 +28,8 @@ export type NativeLifecycle = {
   owned: (phase: NativePhase, group: number) => void;
   quiescent: (phase: NativePhase, group: number) => void;
 };
-// The client repeats submitted text when its user item starts and completes. JSON escaping
-// can double each copy, so a task keeps two full echo lines plus the earlier 1 MiB.
+// The client repeats submitted text when its user item starts and completes, and JSON escaping
+// can double each copy. Task output holds two full echo lines and 1 MiB for everything else.
 export const MAX_TASK_LINE = 1024 * 1024;
 export const MAX_TASK_OUTPUT = 3 * MAX_TASK_LINE;
 function synchronous(result: unknown) {

@@ -6641,6 +6641,9 @@ export class Controller {
       };
     if (remaining.attempts === 0 || remaining.minutes === 0 || remaining.concurrency === 0)
       return { outcome: 'blocked', reason: 'run-budget-exhausted' };
+    // A spent task allowance can leave less than the limit frozen at preparation.
+    if (native && remaining.minutes * 60_000 < native.appointment.maximumTaskMs)
+      return { outcome: 'blocked', reason: 'run-budget-exhausted' };
     const lease = this.store.db
       .prepare('SELECT attempt_id FROM writer_leases WHERE task_id=?')
       .get(task.id);
@@ -8628,11 +8631,11 @@ export class Controller {
           },
           policy,
           expiresAt,
-          // Repository writers get up to their ten-minute profile limit, capped by the run's
-          // minutes. The five-minute floor keeps file appointments and short runs as before.
+          // A repository writer leaves the six minutes a verify check and review need, and
+          // never drops below five. File profiles stop at five minutes either way.
           maximumTaskMs: Math.min(
             facts.maximumTaskMs,
-            (maximumMinutes ?? Math.max(5, policy.limits.minutes)) * 60000,
+            (maximumMinutes ?? Math.max(5, policy.limits.minutes - 6)) * 60000,
           ),
           maximumSubmissions: facts.maximumSubmissions,
         }),

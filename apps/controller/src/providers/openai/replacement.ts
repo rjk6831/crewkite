@@ -885,7 +885,7 @@ export class ReplacementTranscript extends StructuredTranscript<{ replacement: R
 
 export function startStructuredTask<T extends Record<string, unknown>>(
   launch: NativeLaunch,
-  options: Omit<Parameters<typeof startNativeTask>[1], 'now'> & {
+  options: Omit<Parameters<typeof startNativeTask>[1], 'now' | 'maximumTaskMs'> & {
     now?: () => number;
     onUsage?: OpenAiUsageHook;
   },

@@ -4375,6 +4375,12 @@ test('an appointed native proposal is retained and applied once after every phas
       );
       assert.equal(prepared.outcome, 'applied');
       const nativeRun = RunSchema.parse(prepared.entity);
+      // A ten-minute repository run keeps six minutes for evaluation, so the floor applies.
+      assert.equal(
+        controller.snapshot().nativeRuns.find((value) => value.runId === nativeRun.id)
+          ?.maximumTaskMs,
+        300000,
+      );
       if (scenario === 'repository-checked') {
         const tools = appointment.policy.effects.find(
           (grant) => grant.action === 'run-native-tools',
@@ -5977,6 +5983,17 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
     }
     let startCommand: ReturnType<typeof command> | undefined;
     if (publicRun) {
+      // Sixteen run minutes keep six for evaluation and give a repository writer ten.
+      const policy = repository
+        ? {
+            ...appointment.policy,
+            limits: { ...appointment.policy.limits, minutes: 16 },
+            unknownUsage: {
+              rule: 'fixed-allowance' as const,
+              allowance: { launches: 1, minutes: 16 },
+            },
+          }
+        : appointment.policy;
       const prepared = await controller.execute(
         command(
           'PrepareNativeRun',
@@ -5984,7 +6001,7 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
             taskId: task.id,
             profileId: context.fixtureProfile.facts.id,
             ...(repository ? {} : { targetPath: appointment.target.path }),
-            policy: appointment.policy,
+            policy,
             consent: 'explicit',
           },
           task.revision,
@@ -5992,6 +6009,13 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
         'local-owner',
       );
       assert.equal(prepared.outcome, 'applied');
+      assert.equal(
+        controller
+          .snapshot()
+          .nativeRuns.find((value) => value.runId === RunSchema.parse(prepared.entity).id)
+          ?.maximumTaskMs,
+        repository ? 600000 : 300000,
+      );
       startCommand = command(
         'StartRun',
         { taskId: task.id, runId: RunSchema.parse(prepared.entity).id },
@@ -9228,7 +9252,33 @@ test('planning turns keep task authority and allowance across execution', async 
     'Adopt the current planning proposal before preparing execution.',
   );
   rmSync(changedSource);
-  const prepared = await send('PrepareRun', taskId, { policy, roles: quickRoles(fixtures) });
+  // One planning minute is spent, so a five-minute allowance leaves four. A native writer frozen
+  // at five minutes refuses Start before any intent. The scripted run below fits in four.
+  const tightPlanning = { ...planning, limits: { ...planning.limits, minutes: 5 } };
+  assert.equal(
+    (await send('ConfigureTaskConversation', taskId, { planning: tightPlanning })).outcome,
+    'applied',
+  );
+  const tightRun = await send('PrepareNativeRun', taskId, {
+    ...nativePreparation,
+    policy: {
+      ...nativePreparation.policy,
+      limits: { ...nativePreparation.policy.limits, minutes: 5 },
+      reserves: [],
+      unknownUsage: { rule: 'fixed-allowance', allowance: { launches: 1, minutes: 5 } },
+    },
+  });
+  assert.equal(tightRun.outcome, 'applied', JSON.stringify(tightRun));
+  const intentsBeforeStart = controller.store.intents().length;
+  assert.equal(
+    (await send('StartRun', taskId, { runId: RunSchema.parse(tightRun.entity).id })).reason,
+    'run-budget-exhausted',
+  );
+  assert.equal(controller.store.intents().length, intentsBeforeStart);
+  const prepared = await send('PrepareRun', taskId, {
+    policy: { ...policy, limits: { ...policy.limits, minutes: 5 } },
+    roles: quickRoles(fixtures),
+  });
   assert.equal(prepared.outcome, 'applied');
   const execution = RunSchema.parse(prepared.entity);
   assert.equal(
@@ -9275,7 +9325,7 @@ test('planning turns keep task authority and allowance across execution', async 
   assert.equal(
     (
       await send('ConfigureTaskConversation', taskId, {
-        planning: { ...planning, limits: { ...planning.limits, attempts: 11 } },
+        planning: { ...tightPlanning, limits: { ...tightPlanning.limits, attempts: 11 } },
       })
     ).outcome,
     'applied',

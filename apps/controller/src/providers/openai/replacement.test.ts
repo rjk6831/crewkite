@@ -1170,10 +1170,10 @@ test('native proposals and reviews require one matching completed turn and bound
   }
   assert.equal(repositoryInput.creditPolicy, 'ordinary');
   assert.equal(resolveRepositoryProfile({}).facts.id, 'openai-repository-v1');
-  assert.equal(resolveRepositoryProfile({}).facts.maximumTaskMs, 600_000);
   assert.throws(
     () =>
       new RepositoryTranscript(repositoryInput, { now: () => 1, timeoutMs: 600_001, directory }),
+    /Repository task deadline is invalid/,
   );
   for (const invalid of [
     { ...repositoryInput, scratchPath: 'relative' },
@@ -1397,31 +1397,35 @@ test('native proposals and reviews require one matching completed turn and bound
   }
   const selectedReview = reviewPlan(reviewData);
   assert.equal(selectedReview.creditPolicy, 'ordinary');
-  assert.throws(() =>
-    startReview(
-      {
-        executable: process.execPath,
-        sha256: '0'.repeat(64),
-        directory,
-        repositoryRoot: directory,
-        environment: {},
-      },
-      selectedReview,
-      { timeoutMs: 181_000, onSubmitted: () => assert.fail('over-budget review cannot submit') },
-    ),
+  assert.throws(
+    () =>
+      startReview(
+        {
+          executable: process.execPath,
+          sha256: '0'.repeat(64),
+          directory,
+          repositoryRoot: directory,
+          environment: {},
+        },
+        selectedReview,
+        { timeoutMs: 181_000, onSubmitted: () => assert.fail('over-budget review cannot submit') },
+      ),
+    /differs from its directory or remaining budget/,
   );
-  assert.throws(() =>
-    startReplacement(
-      {
-        executable: process.execPath,
-        sha256: '0'.repeat(64),
-        directory,
-        repositoryRoot: directory,
-        environment: {},
-      },
-      plan(directory),
-      { timeoutMs: 300_001, onSubmitted: () => assert.fail('a file writer keeps five minutes') },
-    ),
+  assert.throws(
+    () =>
+      startReplacement(
+        {
+          executable: process.execPath,
+          sha256: '0'.repeat(64),
+          directory,
+          repositoryRoot: directory,
+          environment: {},
+        },
+        plan(directory),
+        { timeoutMs: 300_001, onSubmitted: () => assert.fail('a file writer keeps five minutes') },
+      ),
+    /Discovery deadline is invalid/,
   );
   const reader = new ReplacementTranscript(plan(directory), { now: () => 1, timeoutMs: 300_000 });
   metadata(reader);
