@@ -48,6 +48,10 @@ Future execution policy opens a separate preparation draft. Planning keeps read-
 
 Review the prepared source and permissions before Start. Changes shows retained work. Checks and review prepares and reports separate evidence; a matching supported result still needs destination-specific permission for local branch acceptance. Messages cannot approve actions or accept code. Uncertain commands keep their exact receipt for explicit retry, and reopening starts no work. The [conversation CLI](apps/cli/README.md#task-conversations) exposes the same controller decisions.
 
+Repository writers receive the frozen check recipe and finite turn limits with the task. Provider progress notices remain display data. They cannot complete a turn or create a candidate. Before sealing, the controller runs the frozen formatter outside its event loop and hashes the resulting bytes. A skipped or failed formatter keeps the writer bytes with its reason. Checks and review bind to the final sealed candidate.
+
+If a submitted writer exits without a terminal result, its outcome stays unknown. Once every recorded process group is proven absent, the controller releases its lease and reservations, records bounded usage through the shutdown evidence and marks the task interrupted. It captures no candidate and starts no replacement. Reopening keeps that record and still starts no work.
+
 ## Decisions and retained work
 
 ![Project goal, planning, explicit adoption, owned execution and separate evidence and acceptance decisions.](docs/images/task-states.svg)

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1140" height="790" viewBox="0 0 1140 790" role="img" aria-labelledby="title description">
   <title id="title">Task decisions and ownership boundaries</title>
-  <desc id="description">A project goal with selected context enters counted planning. Explicit plan adoption leads to separate execution preparation and Start. Owned work retains a candidate. Supported profiles require full checks, separate review and destination permission before a new branch is accepted. Stop requests enter stopping and settle as stopped only with the required proof; missing ownership remains unknown. The diagram summarizes decision boundaries, not every task state or provider capability.</desc>
+  <desc id="description">A project goal with selected context enters counted planning. Explicit plan adoption leads to separate execution preparation and Start. Owned work retains a sealed candidate. Supported profiles require full checks, separate review and destination permission before a new branch is accepted. Stop requests enter stopping and settle as stopped only with the required proof. A missing terminal result stays unknown; proven process absence releases ownership without creating a candidate. The diagram summarizes decision boundaries, not every task state or provider capability.</desc>
   <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#475569"/></marker></defs>
   <style>text { font-family: Arial, Helvetica, sans-serif; fill: #172033; font-size: 20px; } .node { fill: #fff; stroke: #64748b; stroke-width: 1.5; } .edge { fill: none; stroke: #475569; stroke-width: 1.5; marker-end: url(#arrow); } .detail { font-size: 18px; fill: #334155; }</style>
   <rect width="1140" height="790" rx="12" fill="#f8fafc"/>
@@ -24,7 +24,7 @@
   <text x="570.0" y="273" text-anchor="middle" class="detail">Intent before provider input</text>
   <rect class="node" x="30" y="220" width="300" height="75" rx="8"/>
   <text x="180.0" y="249" text-anchor="middle">Retained candidate</text>
-  <text x="180.0" y="273" text-anchor="middle" class="detail">Exact bytes after cleanup</text>
+  <text x="180.0" y="273" text-anchor="middle" class="detail">Sealed bytes after cleanup</text>
   <path class="edge" d="M810 258 H720"/>
   <path class="edge" d="M420 258 H330"/>
   <path class="edge" d="M180 295 V390"/>
@@ -53,8 +53,8 @@
   <text x="570.0" y="653" text-anchor="middle" class="detail">Required closure proof retained</text>
   <rect class="node" x="810" y="600" width="300" height="75" rx="8"/>
   <text x="960.0" y="629" text-anchor="middle">Unknown</text>
-  <text x="960.0" y="653" text-anchor="middle" class="detail">Ownership proof missing</text>
+  <text x="960.0" y="653" text-anchor="middle" class="detail">Terminal result missing</text>
   <path class="edge" d="M280 638 H420"/>
   <path class="edge" d="M155 675 V715 H960 V675"/>
-  <text x="570" y="755" text-anchor="middle" class="detail">Unknown ownership blocks successors and acceptance. Reopening does not restart inference.</text>
+  <text x="570" y="755" text-anchor="middle" class="detail">Proven absence releases ownership. The outcome stays unknown and reopening starts no work.</text>
 </svg>
