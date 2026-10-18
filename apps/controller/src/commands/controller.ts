@@ -12508,12 +12508,11 @@ export class Controller {
           !this.closed &&
           !outcome?.reason &&
           metadata?.stopReason === 'end_turn';
-        // An agent can end its turn cleanly after a failed or skipped edit. Without an
-        // approved change there is nothing to check or review, so close with no candidate.
-        const unchanged =
+        // An agent can end its turn cleanly after a failed or skipped edit.
+        const unapproved =
           eligible &&
           (!metadata?.targetHash || metadata.targetHash === appointment.target.baseHash);
-        if (unchanged) eligible = false;
+        if (unapproved) eligible = false;
         if (eligible) {
           try {
             this.nativeCurrent(runtime);
@@ -12523,17 +12522,21 @@ export class Controller {
         }
         if (!this.settleJob(attempt, known, true)) return;
         let captured = false;
-        if (known && !unchanged) {
+        let unchanged = false;
+        if (known) {
           try {
             const files = captureSingleFileEdit({
               directory: intent.scratch_path,
               manifest: binding.manifest,
               target: appointment.target,
             });
-            const candidate = this.sealCandidate(attempt, files.files);
+            // With no approved change and scratch still at the admitted source, there is
+            // nothing to check or review. Any unapproved write keeps the unverified path.
+            unchanged = unapproved && files.target.hash === appointment.target.baseHash;
+            const candidate = unchanged ? null : this.sealCandidate(attempt, files.files);
             if (metadata?.targetHash !== undefined && files.target.hash !== metadata.targetHash)
               eligible = false;
-            if (eligible) {
+            if (eligible && candidate) {
               this.store.transaction(() => {
                 const proof = this.nativeArtifact({
                   version: 1,

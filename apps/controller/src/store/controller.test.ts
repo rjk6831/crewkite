@@ -7060,6 +7060,7 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     'hunk-approved',
     'hunk-after-mismatch',
     'no-change',
+    'unapproved-write',
     'denied',
     'stop',
     'eof',
@@ -7093,11 +7094,13 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
           ? row
           : row === 'no-change'
             ? 'activity-locations'
-            : row === 'eof'
-              ? 'eof-cancel'
-              : row === 'stop'
-                ? 'cancel-permission'
-                : 'permission';
+            : row === 'unapproved-write'
+              ? 'complete'
+              : row === 'eof'
+                ? 'eof-cancel'
+                : row === 'stop'
+                  ? 'cancel-permission'
+                  : 'permission';
     const fixtureHome = mkdtempSync(resolve('internal/acp-controller-'));
     t.after(() => rmSync(fixtureHome, { recursive: true, force: true }));
     const executable = join(fixtureHome, 'peer');
@@ -7863,14 +7866,25 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       );
       assert.equal(controller.store.intents().length, 1);
     }
-    if (row === 'no-change') {
-      // A clean end_turn without an approved change closes known, with nothing to review.
+    if (row === 'no-change' || row === 'unapproved-write') {
+      // A clean end_turn without an approved change closes known. Untouched scratch has
+      // nothing to review; an unapproved write stays retained and unverified.
       assert.equal(await nativeWait('acp turn without change', ended.promise), 'interrupted');
       const attemptId = controller.store.intents()[0].attempt_id;
       assert(controller.store.receipt(`native-acp-terminal:${attemptId}`));
       assert.equal(controller.store.receipt(`native-acp-capture:${attemptId}`), undefined);
       assert.equal(controller.store.get<Attempt>('attempt', attemptId)?.state, 'stopped');
-      assert(!controller.snapshot().candidates.some((value) => value.taskId === task.id));
+      const snapshot = controller.snapshot();
+      assert.equal(
+        snapshot.candidates.some((value) => value.taskId === task.id),
+        row === 'unapproved-write',
+      );
+      assert.equal(
+        snapshot.tasks.find((value) => value.id === task.id)?.next,
+        row === 'no-change'
+          ? 'Native turn ended without an approved change. Nothing was captured.'
+          : 'Native work is unverified. Inspect retained changes.',
+      );
       assert.equal(
         controller.store.transaction(() =>
           controller.store.googleStartBlocker(run.roles[0].routeId),
