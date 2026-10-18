@@ -101,6 +101,22 @@ const ignoredNotices = (identity: { threadId: string; turnId: string }) => [
   { method: 'model/safetyBuffering/updated', params: identity },
   { method: 'private-notice-canary', params: { text: 'private-notice-canary' } },
 ];
+const repositoryTask = (directory: string) =>
+  repositoryPlan({
+    attemptId: plan(directory).attemptId,
+    model: 'gpt-6.1-sol',
+    effort: 'low',
+    scratchPath: resolve(directory, 'scratch'),
+    sourceBase: 'a'.repeat(40),
+    manifestHash: 'b'.repeat(64),
+    execution: { sandbox: 'workspace-write', approvalPolicy: 'never', networkAccess: false },
+    context: {
+      title: 'Fix arithmetic',
+      outcome: 'Preserve the bounds.',
+      criteria: ['Return the bounded net.'],
+    },
+    limits: repositoryLimits,
+  });
 const edit = (directory: string, path = 'net.mjs') => ({
   version: 1,
   attemptId: plan(directory).attemptId,
@@ -192,6 +208,11 @@ const output = (directory: string, mode = 'success', path = 'net.mjs', structure
       ignoredNotices(identity)[0],
     );
   if (mode === 'late-completion') messages.push(messages.at(-1));
+  if (mode === 'late-item')
+    messages.push({
+      method: 'item/started',
+      params: { ...identity, item: { id: 'reasoning-1', type: 'reasoning' } },
+    });
   if (mode === 'late-error')
     messages.push({
       method: 'error',
@@ -330,6 +351,7 @@ test('native proposals and reviews require one matching completed turn and bound
     'unicode-path',
     'byte-limit',
     'late-completion',
+    'late-item',
     'late-error',
     'different-path',
     'nul-content',
@@ -1253,12 +1275,12 @@ test('native proposals and reviews require one matching completed turn and bound
     'unknown-request',
     'notice-request',
     'busy-command',
-    'large-output',
+    'escaped-output',
     'long-turn',
     'overrun',
     'item-overrun',
     'retry-overrun',
-    'line-overrun',
+    'output-overrun',
     'late-progress',
     'late-completion',
     'late-error',
@@ -1390,6 +1412,7 @@ test('native proposals and reviews require one matching completed turn and bound
       return frame;
     };
     // Each bound admits its last frame and refuses the next. turn/started is one checked notice.
+    // Fifteen 1 MiB frames and the setup replies fit in 16 MiB. The sixteenth frame does not.
     const overruns: Record<string, [number, (index: number) => unknown]> = {
       overrun: [16_383, () => ({ method: 'thread/queue/changed', params: identity })],
       'item-overrun': [
@@ -1397,7 +1420,7 @@ test('native proposals and reviews require one matching completed turn and bound
         (index) => ({ method: 'item/started', params: { ...identity, item: reasoning(index) } }),
       ],
       'retry-overrun': [32, () => retry],
-      'line-overrun': [1, (index) => sized(1024 * 1024 + index)],
+      'output-overrun': [15, () => sized(1024 * 1024)],
     };
     if (mode in overruns) {
       const [allowed, frame] = overruns[mode];
@@ -1409,7 +1432,8 @@ test('native proposals and reviews require one matching completed turn and bound
     }
     if (mode === 'duplicate-item') frames.push(frames[1]);
     if (mode === 'reroute') frames.push({ method: 'model/rerouted', params: identity });
-    // A busy command streams more than 1024 output frames and more than 1 MiB.
+    // A busy command streams 5000 output frames and over 1 MiB. They count by hash and stay out of
+    // the checked-notice cap.
     const delta = {
       method: 'item/commandExecution/outputDelta',
       params: {
@@ -1429,9 +1453,11 @@ test('native proposals and reviews require one matching completed turn and bound
           item: {
             ...command,
             status: mode === 'failed-command' ? 'failed' : 'completed',
-            // A completed command item repeats all of its output.
-            ...(mode === 'large-output'
-              ? { aggregatedOutput: 'private-repository-canary'.repeat(24_576) }
+            // The client retains 1 MiB of output. JSON writes each control byte as six, so this line
+            // is over 6 MiB. Only the turn total bounds it. The canary prefix must stay out of
+            // activities, the result and every diagnostic.
+            ...(mode === 'escaped-output'
+              ? { aggregatedOutput: `private-repository-canary${'\u0001'.repeat(1024 * 1024)}` }
               : {}),
           },
           completedAtMs: 2,
@@ -1454,6 +1480,8 @@ test('native proposals and reviews require one matching completed turn and bound
         },
       ],
     };
+    if (mode === 'escaped-output')
+      assert(frames.some((frame) => bytes(frame).length > 6 * 1024 * 1024));
     frames.push(
       { method: 'item/started', params: { ...identity, item: fileItem, startedAtMs: 3 } },
       {
@@ -1461,7 +1489,7 @@ test('native proposals and reviews require one matching completed turn and bound
         params: { ...identity, item: { ...fileItem, status: 'completed' }, completedAtMs: 4 },
       },
     );
-    // A long turn passes the earlier 128-item and three-retry bounds.
+    // A ten-minute turn reaches about 200 items and a few retried requests, and it completes.
     if (mode === 'long-turn')
       for (let index = 0; index < 200; index++)
         frames.push(
@@ -1495,7 +1523,7 @@ test('native proposals and reviews require one matching completed turn and bound
         'fragmented',
         'failed-command',
         'busy-command',
-        'large-output',
+        'escaped-output',
         'long-turn',
         'late-progress',
       ].includes(mode)
@@ -1627,6 +1655,79 @@ test('native proposals and reviews require one matching completed turn and bound
   assert.equal(unsolicited.next(), null);
   assert.throws(() => unsolicited.push(Buffer.from('"result":{}}\n')));
   assert.equal(unsolicited.submitted, false);
+});
+
+test('both task transcripts refuse every notice that carries authority', () => {
+  const directory = resolve('internal/replacement-fixture');
+  const scratch = resolve(directory, 'scratch');
+  const open = {
+    structured: () => {
+      const reader = new ReplacementTranscript(plan(directory), {
+        now: () => 1,
+        timeoutMs: 300_000,
+      });
+      metadata(reader);
+      reader.push(bytes({ id: 10, result: threadResult(directory) }));
+      reader.next();
+      reader.push(bytes({ id: 11, result: { turn: running } }));
+      return reader;
+    },
+    repository: () => {
+      const reader = new RepositoryTranscript(repositoryTask(directory), {
+        now: () => 1,
+        timeoutMs: 300_000,
+        directory,
+      });
+      metadata(reader);
+      reader.push(
+        bytes({
+          id: 10,
+          result: {
+            ...threadResult(scratch),
+            approvalPolicy: 'never',
+            sandbox: { type: 'workspaceWrite', writableRoots: [scratch], networkAccess: false },
+          },
+        }),
+      );
+      reader.next();
+      reader.push(bytes({ id: 11, result: { turn: running } }));
+      return reader;
+    },
+  };
+  // Every exact name that refuses a task, then one example under each refused prefix. The list is
+  // written out here so that dropping a name from the set fails this test.
+  for (const method of [
+    'thread/archived',
+    'thread/unarchived',
+    'thread/deleted',
+    'thread/closed',
+    'thread/reverted',
+    'thread/environment/connected',
+    'thread/environment/disconnected',
+    'remoteControl/status/changed',
+    'model/rerouted',
+    'hook/started',
+    'hook/completed',
+    'account/updated',
+    'account/login/completed',
+    'account/gatewayOAuth/changed',
+    'item/autoApprovalReview/started',
+    'item/autoApprovalReview/completed',
+    'autoApprovalReview/strictReviewRequired',
+    'guardianWarning',
+    'thread/realtime/started',
+    'mcpServer/startupStatus/updated',
+  ])
+    for (const [kind, start] of Object.entries(open)) {
+      const reader = start();
+      const label = `${kind} ${method}`;
+      assert.throws(
+        () => reader.push(bytes({ method, params: { threadId: 'thread-1', turnId: 'turn-1' } })),
+        label,
+      );
+      assert.equal(reader.diagnostic?.cause, 'unsupported', label);
+      assert.equal(reader.complete, false, label);
+    }
 });
 
 test('transcripts pass rate-limit reads and updates to the usage hook without changing their outcome', () => {

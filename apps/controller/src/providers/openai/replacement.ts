@@ -168,6 +168,7 @@ const fields = [
 // remote control, or touches approvals.
 const authorityNotices: ReadonlySet<string> = new Set([
   'thread/archived',
+  'thread/unarchived',
   'thread/deleted',
   'thread/closed',
   'thread/reverted',

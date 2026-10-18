@@ -58,6 +58,11 @@ input.on('line', line => {
     return;
   }
   if (mode === 'oversized') return process.stderr.write(Buffer.alloc(1048577));
+  if (mode.startsWith('flood:')) {
+    const [stdout, stderr] = mode.split(':').slice(1).map(Number);
+    return process.stderr.write(Buffer.alloc(stderr, 32), () =>
+      process.stdout.write(Buffer.alloc(stdout, 32), () => process.exit(0)));
+  }
   if (mode === 'truncated') return process.stdout.write('{"id":1');
   if (message.method === 'model/list' && mode === 'descendant')
     spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'inherit' });
@@ -551,6 +556,75 @@ test('native discovery returns metadata only after its owned process and descend
       assert.deepEqual(result.metadata, reason ? null : { completed: true }, mode);
       assert.equal(result.quiescent, true, mode);
       assert(handle.groups.every(groupAbsent), mode);
+    }
+    // A task transcript sets the byte bound for stdout and stderr together.
+    const limit = 4096;
+    for (const row of [
+      { name: 'stdout over', stdout: limit + 1, stderr: 0, reason: 'output-limit' },
+      { name: 'stderr over', stdout: 0, stderr: limit + 1, reason: 'output-limit' },
+      { name: 'split over', stdout: limit / 2 + 1, stderr: limit / 2, reason: 'output-limit' },
+      { name: 'split at limit', stdout: limit / 2, stderr: limit / 2, reason: null },
+    ]) {
+      const directory = resolve(root, `flood-${row.name.replace(' ', '-')}`);
+      mkdirSync(directory, { mode: 0o700 });
+      let sent = false;
+      let pushed = false;
+      const handle = startNativeTask(
+        {
+          executable: process.execPath,
+          sha256,
+          directory,
+          repositoryRoot: root,
+          environment: sourceEnvironment,
+        },
+        {
+          timeoutMs: 10_000,
+          onSubmitted: () => {},
+          spawn: (executable, args, options) => {
+            const child = spawn(
+              executable,
+              [
+                '-e',
+                fixture,
+                `flood:${row.stdout}:${row.stderr}`,
+                args.at(-1) === 'list' ? 'features' : 'task',
+              ],
+              options,
+            );
+            owned.push({
+              child,
+              closed: new Promise((resolve) => child.once('close', () => resolve())),
+            });
+            return child;
+          },
+        },
+        () => ({
+          outputLimit: limit,
+          next: () => {
+            if (sent) return null;
+            sent = true;
+            return Buffer.from(
+              `${JSON.stringify({ id: 1, method: 'initialize', params: { capabilities: { explicitGatewayOauth: true, experimentalApi: false } } })}\n`,
+            );
+          },
+          push: () => {
+            pushed = true;
+          },
+          finish: () => ({ completed: true }),
+          get complete() {
+            return pushed;
+          },
+          pendingRequest: 'turn/start',
+          lastEnvelope: null,
+          refusedEnvelope: null,
+          notifications: 0,
+        }),
+      );
+      const result = await handle.result;
+      assert.equal(result.reason, row.reason, row.name);
+      assert.equal(result.quiescent, true, row.name);
+      assert.deepEqual(result.metadata, row.reason ? null : { completed: true }, row.name);
+      assert(handle.groups.every(groupAbsent), row.name);
     }
     const lifecycleCases = [
       { name: 'three phases', failure: '', sequence: -1 },

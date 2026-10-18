@@ -59,10 +59,12 @@ export function repositoryPlan(value: z.input<typeof input>) {
 }
 export type RepositoryPlan = ReturnType<typeof repositoryPlan>;
 const encode = (value: unknown) => Buffer.from(`${JSON.stringify(value)}\n`);
-// A completed command item repeats the command's whole output, and writers run checks that print
-// a lot. One frame may reach 1 MiB, and the total holds eight of them.
-const MAX_LINE = 1024 * 1024;
-const MAX_OUTPUT = 8 * MAX_LINE;
+// The pinned client retains at most 1 MiB of a command's output and sends it twice, as deltas and
+// again in the completed item. JSON escaping can turn each byte into six, so one command may cost
+// about 12 MiB on the wire. The client caps the delta stream by chunk count and sets no byte cap,
+// so a command that prints more than about 15 MiB still ends the turn with limit. This total
+// bounds the whole turn, and no single line can pass it.
+const MAX_OUTPUT = 16 * 1024 * 1024;
 // A live turn started 8 commands in about 73 seconds. With a reasoning item and a message around
 // each, that is near 0.35 items a second, or about 200 items in ten minutes. This cap is twenty
 // times that and still covers five items a second for ten minutes. An item costs at most about
@@ -92,8 +94,8 @@ const itemKinds = [
   'contextCompaction',
 ] as const;
 const terminal = z.enum(['completed', 'failed', 'declined']);
-// Output, message and reasoning deltas, diffs, plans and token counts only report progress.
-// A busy command can stream thousands of them, so they join the ignored notices.
+// The checked notices. Output, message and reasoning deltas, diffs, plans and token counts only
+// report progress, and a busy command streams thousands of them, so this list leaves them out.
 const methods = [
   'thread/started',
   'thread/settings/updated',
@@ -337,11 +339,7 @@ export class RepositoryTranscript {
     this.pending = Buffer.concat([this.pending, bytes]);
     for (;;) {
       const end = this.pending.indexOf(10);
-      if (end < 0) {
-        if (this.pending.length > MAX_LINE) this.refuse('limit');
-        return;
-      }
-      if (end > MAX_LINE) this.refuse('limit');
+      if (end < 0) return;
       const line = this.pending.subarray(0, end + 1);
       this.pending = this.pending.subarray(end + 1);
       if (this.step === 'metadata') {
