@@ -12505,6 +12505,12 @@ export class Controller {
           !this.closed &&
           !outcome?.reason &&
           metadata?.stopReason === 'end_turn';
+        // An agent can end its turn cleanly after a failed or skipped edit. Without an
+        // approved change there is nothing to check or review, so close with no candidate.
+        const unchanged =
+          eligible &&
+          (!metadata?.targetHash || metadata.targetHash === appointment.target.baseHash);
+        if (unchanged) eligible = false;
         if (eligible) {
           try {
             this.nativeCurrent(runtime);
@@ -12514,7 +12520,7 @@ export class Controller {
         }
         if (!this.settleJob(attempt, known, true)) return;
         let captured = false;
-        if (known) {
+        if (known && !unchanged) {
           try {
             const files = captureSingleFileEdit({
               directory: intent.scratch_path,
@@ -12556,9 +12562,11 @@ export class Controller {
             waitingReason: null,
             next: captured
               ? 'Native work is retained. Checks and review remain pending.'
-              : known
-                ? 'Native work is unverified. Inspect retained changes.'
-                : 'Native turn completion is unknown. Nothing will replay automatically.',
+              : unchanged
+                ? 'Native turn ended without an approved change. Nothing was captured.'
+                : known
+                  ? 'Native work is unverified. Inspect retained changes.'
+                  : 'Native turn completion is unknown. Nothing will replay automatically.',
           });
         });
         if (known) this.workers.delete(attempt.id);

@@ -7059,6 +7059,7 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     'approved',
     'hunk-approved',
     'hunk-after-mismatch',
+    'no-change',
     'denied',
     'stop',
     'eof',
@@ -7090,11 +7091,13 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
         ? 'hunk'
         : row === 'hunk-after-mismatch'
           ? row
-          : row === 'eof'
-            ? 'eof-cancel'
-            : row === 'stop'
-              ? 'cancel-permission'
-              : 'permission';
+          : row === 'no-change'
+            ? 'activity-locations'
+            : row === 'eof'
+              ? 'eof-cancel'
+              : row === 'stop'
+                ? 'cancel-permission'
+                : 'permission';
     const fixtureHome = mkdtempSync(resolve('internal/acp-controller-'));
     t.after(() => rmSync(fixtureHome, { recursive: true, force: true }));
     const executable = join(fixtureHome, 'peer');
@@ -7817,10 +7820,16 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     }
     const permission = Promise.withResolvers<Approval>();
     const readyToCancel = Promise.withResolvers<void>();
+    const ended = Promise.withResolvers<string>();
     const off = controller.subscribe((event) => {
       if (event.type === 'approval.requested') permission.resolve(event.payload);
       if (event.type === 'attempt.output' && event.payload.text === 'fixture-ready-to-cancel')
         readyToCancel.resolve();
+      if (
+        event.type === 'task.updated' &&
+        ['stopped', 'interrupted', 'unknown'].includes(event.payload.state)
+      )
+        ended.resolve(event.payload.state);
     });
     t.after(off);
     const input = start();
@@ -7853,6 +7862,23 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
         2,
       );
       assert.equal(controller.store.intents().length, 1);
+    }
+    if (row === 'no-change') {
+      // A clean end_turn without an approved change closes known, with nothing to review.
+      assert.equal(await nativeWait('acp turn without change', ended.promise), 'interrupted');
+      const attemptId = controller.store.intents()[0].attempt_id;
+      assert(controller.store.receipt(`native-acp-terminal:${attemptId}`));
+      assert.equal(controller.store.receipt(`native-acp-capture:${attemptId}`), undefined);
+      assert.equal(controller.store.get<Attempt>('attempt', attemptId)?.state, 'stopped');
+      assert(!controller.snapshot().candidates.some((value) => value.taskId === task.id));
+      assert.equal(
+        controller.store.transaction(() =>
+          controller.store.googleStartBlocker(run.roles[0].routeId),
+        ),
+        undefined,
+      );
+      await controller.close();
+      continue;
     }
     if (row === 'eof') {
       await nativeWait('acp cancellation readiness', readyToCancel.promise);
