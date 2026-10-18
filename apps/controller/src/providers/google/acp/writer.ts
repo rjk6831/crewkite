@@ -705,8 +705,9 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
         finalAcknowledged = false;
       const tools = new Map<string, Tool>();
       const seenTools = new Set<string>();
-      // Tools that named a path the activity feed had to drop.
-      const droppedLocations = new Set<string>();
+      // File-changing tools that named a path outside the scratch. One that completes
+      // cannot be captured, whatever kind its last update reports.
+      const outsideEdits = new Set<string>();
       let expectedTargetHash = plan.target.baseHash;
       const pending = new Map<
         string,
@@ -759,11 +760,12 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
             return reject(id, diagnostic);
           if (tool.kind === 'edit' && outsideScratch(options.scratch, tool.locations)) {
             // Nothing outside scratch is ever approved. A reject reply keeps the tool from
-            // running and lets the model go back to the real target. The tool table caps a
-            // turn at 128 calls, so the count stays finite.
+            // running and lets the model go back to the real target. The connection takes at
+            // most 128 incoming requests, so the count stays finite.
             const denials = request.options.filter((v) => v.kind === 'reject_once');
             if (denials.length !== 1) return reject(id, diagnostic);
             rejectedOutsideWrites++;
+            outsideEdits.add(tool.toolCallId);
             seenTools.add(tool.toolCallId);
             tools.set(tool.toolCallId, tool);
             connection.respond(id, {
@@ -914,13 +916,13 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
           ? acpValidate(diagnostic('tool-update'), () => toolUpdate.parse(update))
           : null;
         const locations = call ? activityLocations(options.scratch, call.locations) : [];
-        if (call && locations.length < (call.locations?.length ?? 0))
-          droppedLocations.add(call.toolCallId);
         if (
-          call?.status === 'completed' &&
-          droppedLocations.has(call.toolCallId) &&
+          call &&
+          locations.length < (call.locations?.length ?? 0) &&
           fileChangingKinds.has(tools.get(call.toolCallId)?.kind ?? '')
-        ) {
+        )
+          outsideEdits.add(call.toolCallId);
+        if (call?.status === 'completed' && outsideEdits.has(call.toolCallId)) {
           // A tool that changes files finished on a path outside the scratch. The turn may
           // end cleanly, but its result stays unverified and cannot be captured. An
           // announcement or a rejected tool changes nothing and does not block capture.

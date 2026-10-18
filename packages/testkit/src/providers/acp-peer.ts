@@ -47,6 +47,11 @@ export const acpPeerCases = [
   'hunk-open',
   'outside-edit',
   'outside-completed',
+  'outside-kind-flip',
+  'outside-permission-completed',
+  'outside-no-reject',
+  'outside-two-rejects',
+  'outside-execute',
   'hunk-brain-write',
 ] as const;
 export type AcpPeerCase = (typeof acpPeerCases)[number];
@@ -150,17 +155,25 @@ export function runAcpPeer(scenario: AcpPeerCase) {
     });
   }
   // The server announces a note write into its own data directory, then asks permission.
+  // The variants change what the request offers or which tool asks.
   function requestBrainWrite() {
     const path = join(cwd, '..', 'brain', 'conversation', 'task.md');
     const tool = {
       toolCallId: 'fixture-brain-write',
       title: 'Run write_to_file?',
-      kind: 'edit',
+      kind: scenario === 'outside-execute' ? 'execute' : 'edit',
       status: 'pending',
       rawInput: { TargetFile: path, CodeContent: '# Tasks\n' },
       locations: [{ path }],
     };
-    update({ sessionUpdate: 'tool_call', ...tool });
+    // Here the path first appears in the permission request.
+    update({
+      sessionUpdate: 'tool_call',
+      ...tool,
+      ...(scenario === 'outside-permission-completed' ? { locations: undefined } : {}),
+    });
+    const allow = { optionId: 'once', name: 'Once', kind: 'allow_once' };
+    const deny = { optionId: 'deny', name: 'Deny', kind: 'reject_once' };
     emit({
       jsonrpc: '2.0',
       id: 'permission-brain',
@@ -168,10 +181,12 @@ export function runAcpPeer(scenario: AcpPeerCase) {
       params: {
         sessionId: 'fixture-session',
         toolCall: tool,
-        options: [
-          { optionId: 'once', name: 'Once', kind: 'allow_once' },
-          { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
-        ],
+        options:
+          scenario === 'outside-no-reject'
+            ? [allow]
+            : scenario === 'outside-two-rejects'
+              ? [allow, deny, { optionId: 'deny-too', name: 'Deny too', kind: 'reject_once' }]
+              : [allow, deny],
       },
     });
   }
@@ -283,7 +298,15 @@ export function runAcpPeer(scenario: AcpPeerCase) {
           sessionUpdate: 'agent_thought_chunk',
           content: { type: 'text', text: 'private thought fixture' },
         });
-        if (scenario === 'hunk-brain-write') {
+        if (
+          [
+            'hunk-brain-write',
+            'outside-permission-completed',
+            'outside-no-reject',
+            'outside-two-rejects',
+            'outside-execute',
+          ].includes(scenario)
+        ) {
           requestBrainWrite();
         } else if (scenario.startsWith('hunk')) {
           requestHunk();
@@ -376,9 +399,9 @@ export function runAcpPeer(scenario: AcpPeerCase) {
             locations: [{ path: join(cwd, '..', 'outside.md') }],
           });
           terminal('end_turn');
-        } else if (scenario === 'outside-completed') {
+        } else if (scenario === 'outside-completed' || scenario === 'outside-kind-flip') {
           // The edit is never offered for permission and later reports completion
-          // without naming its path again.
+          // without naming its path again. One variant also changes the reported kind.
           update({
             sessionUpdate: 'tool_call',
             toolCallId: 'fixture-outside-edit',
@@ -391,6 +414,7 @@ export function runAcpPeer(scenario: AcpPeerCase) {
             sessionUpdate: 'tool_call_update',
             toolCallId: 'fixture-outside-edit',
             status: 'completed',
+            ...(scenario === 'outside-kind-flip' ? { kind: 'other' } : {}),
           });
           terminal('end_turn');
         } else if (scenario === 'open-tools' || scenario === 'open-edits') {
@@ -465,15 +489,31 @@ export function runAcpPeer(scenario: AcpPeerCase) {
       } else if (message.id === 'permission-late')
         assert.equal(message.result?.outcome?.outcome, 'cancelled');
       else if (message.id === 'permission-brain') {
-        // The reply must pick the reject option. The tool then fails and the turn goes on.
-        assert.deepEqual(message.result, { outcome: { outcome: 'selected', optionId: 'deny' } });
-        update({
-          sessionUpdate: 'tool_call_update',
-          toolCallId: 'fixture-brain-write',
-          status: 'failed',
-          rawOutput: 'Rejected by user',
-        });
-        requestHunk();
+        if (['outside-no-reject', 'outside-two-rejects', 'outside-execute'].includes(scenario))
+          // Without exactly one reject option, or from a tool that is no edit, the turn cancels.
+          assert.equal(message.result?.outcome?.outcome, 'cancelled');
+        else {
+          // The reply must pick the reject option.
+          assert.deepEqual(message.result, { outcome: { outcome: 'selected', optionId: 'deny' } });
+          if (scenario === 'outside-permission-completed') {
+            // A server that runs the tool anyway reports it complete without a path.
+            update({
+              sessionUpdate: 'tool_call_update',
+              toolCallId: 'fixture-brain-write',
+              status: 'completed',
+            });
+            terminal('end_turn');
+          } else {
+            // The tool fails and the turn goes on.
+            update({
+              sessionUpdate: 'tool_call_update',
+              toolCallId: 'fixture-brain-write',
+              status: 'failed',
+              rawOutput: 'Rejected by user',
+            });
+            requestHunk();
+          }
+        }
       } else if (message.id === 'permission-1' || message.id === 'permission-2') {
         if (message.result?.outcome?.outcome === 'selected') {
           assert.equal(message.result.outcome.optionId, 'once');

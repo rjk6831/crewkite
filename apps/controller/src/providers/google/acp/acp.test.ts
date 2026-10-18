@@ -966,6 +966,11 @@ test('the acp protocol consumes one complete live permission and never treats co
     'hunk-open',
     'outside-edit',
     'outside-completed',
+    'outside-kind-flip',
+    'outside-permission-completed',
+    'outside-no-reject',
+    'outside-two-rejects',
+    'outside-execute',
     'hunk-brain-write',
   ] as const) {
     const f = fixture(scenario);
@@ -1084,19 +1089,45 @@ test('the acp protocol consumes one complete live permission and never treats co
           method: 'session/prompt',
           pendingToolCount: scenario === 'hunk-open' ? 1 : 3,
         });
-      } else if (scenario === 'outside-edit' || scenario === 'outside-completed') {
-        // A file change that completes outside the scratch without approval lets the turn
-        // finish, but it cannot be captured. The completion can arrive on the announcement
-        // or on a later update that no longer names the path.
+      } else if (
+        [
+          'outside-edit',
+          'outside-completed',
+          'outside-kind-flip',
+          'outside-permission-completed',
+        ].includes(scenario)
+      ) {
+        // A file change that completes outside the scratch lets the turn finish, but it
+        // cannot be captured. The completion can arrive on the announcement or on a later
+        // update that no longer names the path or reports another kind. The path can also
+        // first appear in a permission request, which gets the reject reply and still
+        // blocks capture when the server then reports the tool complete.
         assert.equal(outcome.reason, 'permission');
         assert.equal(outcome.metadata?.stopReason, 'end_turn');
         assert.equal(permissions, 0);
-        assert.equal(outcome.rejectedOutsideWrites, 0);
+        assert.equal(
+          outcome.rejectedOutsideWrites,
+          scenario === 'outside-permission-completed' ? 1 : 0,
+        );
         assert.deepEqual(outcome.diagnostic, {
           site: 'edit-location',
           method: 'session/update',
           sessionUpdate: scenario === 'outside-edit' ? 'tool_call' : 'tool_call_update',
         });
+      } else if (
+        ['outside-no-reject', 'outside-two-rejects', 'outside-execute'].includes(scenario)
+      ) {
+        // A reject reply needs one reject option on an edit tool. Without that the request
+        // gets the cancelled reply and the turn cancels, with nothing counted as rejected.
+        assert.equal(outcome.reason, 'permission');
+        assert.equal(outcome.metadata?.stopReason, 'cancelled');
+        assert.equal(permissions, 0);
+        assert.equal(outcome.rejectedOutsideWrites, 0);
+        assert.equal(
+          outcome.diagnostic?.site,
+          scenario === 'outside-execute' ? 'permission-action' : 'permission-options',
+        );
+        assert.equal(outcome.diagnostic?.method, 'session/request_permission');
       } else if (scenario === 'pending-end') {
         // A permission still pending at the terminal response refuses the turn.
         assert.equal(outcome.reason, 'protocol');
