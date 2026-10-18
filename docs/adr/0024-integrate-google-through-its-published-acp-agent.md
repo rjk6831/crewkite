@@ -29,7 +29,7 @@ I read the FAQ's headless restriction as aimed at agents that spend the subscrip
 
 I refresh connected dashboards before the five-minute freshness limit, leaving room for bounded metadata cleanup. The reads still cost client and network work. The interval floor and ownership gate limit that traffic; a failed or delayed read leaves the old timestamp visible.
 
-I chose the published protocol because session and permission identities give the controller concrete facts to bind before an effect. An edited file or a quiet process is weaker evidence than the original terminal response plus owned cleanup. I kept those requirements through Stop and restart, even where that leaves work blocked.
+I chose the published protocol because session and permission identities give the controller concrete facts to bind before an effect. An edited file or a quiet process is weaker evidence than the original terminal response plus owned cleanup. I keep missing terminal proof unknown through restart. After a restart, I allow an explicit Stop to release the home's Google gate when the controller holds no runtime for the attempt, no phase remains at launch intent and every recorded process group is absent. The attempt keeps its unknown outcome and retained evidence. Nothing is captured, and the run cannot submit again.
 
 This costs another identity pin, explicit setup and review of each supported client mapping. I accept that cost. Guessing a tool name or review mode would let an unverified provider message decide what a human approved. Conservatively applying every observed quota bucket can also refuse a model because another pool is low; I cannot infer model entitlement from a bucket name.
 
