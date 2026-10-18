@@ -133,6 +133,13 @@ function fixture(input: LocalStart = plan) {
       assert.equal(rest.length, 0);
       const { title, outcome, criteria } = input.task;
       assert.equal(message.content.split(title).length, 2);
+      const taskStart = message.content.indexOf(`Title: ${title}`);
+      const sourceEnd = message.content.indexOf(
+        `----- END FILE ${input.binding.path} ${input.binding.attemptId} -----`,
+      );
+      const outputContract = message.content.indexOf('Return one JSON object with version 1');
+      assert.ok(sourceEnd < taskStart);
+      assert.ok(taskStart < outputContract);
       assert.ok(
         message.content.includes(
           `\nTitle: ${title}\nOutcome: ${outcome}\nRequirements:\n1. ${criteria[0]}\n`,
