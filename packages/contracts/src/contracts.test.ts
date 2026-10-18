@@ -1194,6 +1194,10 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     reason: 'qualification-pending',
   };
   assert.deepEqual(NativeProfileSchema.parse(pendingProfile), pendingProfile);
+  assert.deepEqual(
+    NativeProfileSchema.parse({ ...pendingProfile, id: 'anthropic-file-compact-v1' }),
+    { ...pendingProfile, id: 'anthropic-file-compact-v1' },
+  );
   for (const change of [
     { effectiveEffort: 'medium' },
     { accountClass: 'pro' },
@@ -1347,6 +1351,7 @@ test('process boundaries reject unknown fields and invalid command identity', ()
   const profiles = [
     historicalProfile,
     pendingProfile,
+    { ...pendingProfile, id: 'anthropic-file-compact-v1' },
     googleProfile,
     repositoryProfile,
     acpProfile,

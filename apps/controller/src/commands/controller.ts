@@ -6857,7 +6857,7 @@ export class Controller {
     if (localIndex >= 0) profiles.splice(localIndex, 1);
     profiles.push({ facts: this.localConnection().facts });
     if (
-      profiles.length > 6 ||
+      profiles.length > 7 ||
       new Set(profiles.map((profile) => profile.facts.id)).size !== profiles.length
     )
       throw Error('Native profile identities are invalid.');

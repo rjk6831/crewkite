@@ -14,7 +14,10 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { RuntimeManifestSchema } from '@crewkite/contracts';
 import { Controller, type ControllerOptions } from './commands/controller.ts';
 import { configuredIdentity } from './host/publication.ts';
-import { resolveAnthropicNativeProfile } from './providers/anthropic/profile.ts';
+import {
+  resolveAnthropicCompactNativeProfile,
+  resolveAnthropicNativeProfile,
+} from './providers/anthropic/profile.ts';
 import { resolveGoogleNativeProfile } from './providers/google/profile.ts';
 import { resolveNativeProfile, resolveRepositoryProfile } from './providers/openai/profile.ts';
 import { serve } from './server/index.ts';
@@ -97,6 +100,7 @@ export async function startController(options: ControllerOptions) {
       : () => [
           resolveNativeProfile(),
           resolveAnthropicNativeProfile(),
+          resolveAnthropicCompactNativeProfile(),
           resolveGoogleNativeProfile(),
           resolveRepositoryProfile(),
         ],

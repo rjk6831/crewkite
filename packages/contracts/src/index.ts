@@ -107,7 +107,7 @@ export const NativeBillingAttestationSchema = z.strictObject({
   paidExtraUsageDisabled: z.literal(true),
 });
 export const AnthropicNativeProfileSchema = z.strictObject({
-  id: z.literal('anthropic-file-v1'),
+  id: z.enum(['anthropic-file-v1', 'anthropic-file-compact-v1']),
   family: z.literal('anthropic'),
   displayName: label,
   clientVersion: label,
@@ -557,6 +557,7 @@ export const GoogleAcpSetupSchema = z
 export const NativeFileProfileIdSchema = z.enum([
   'openai-file-v1',
   'anthropic-file-v1',
+  'anthropic-file-compact-v1',
   'google-file-v1',
 ]);
 export const NativeHandoffTargetSchema = z
@@ -1385,7 +1386,7 @@ export const NativeHandoffPreparationPayloadSchema = z.union([
   }),
   z.strictObject({
     ...nativeHandoffPreparationFields,
-    profileId: z.literal('anthropic-file-v1'),
+    profileId: z.enum(['anthropic-file-v1', 'anthropic-file-compact-v1']),
     creditPolicy: z.literal('ordinary').default('ordinary'),
     billingAttestation: NativeBillingAttestationSchema,
   }),
@@ -2572,7 +2573,7 @@ export const SnapshotSchema = z
     localSetup: LocalSetupSchema.nullable().optional(),
     nativeProfiles: z
       .array(NativeProfileSchema)
-      .max(6)
+      .max(7)
       .refine((profiles) => new Set(profiles.map((profile) => profile.id)).size === profiles.length)
       .default([]),
     nativeRuns: z.array(NativeRunSchema).max(10000).default([]),
