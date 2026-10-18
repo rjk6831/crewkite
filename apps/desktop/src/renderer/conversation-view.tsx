@@ -593,6 +593,17 @@ function useContextComposer({
   >(null);
   const latest = useRef({ draftKey, projectId, scope, workspace, afterApplied });
   latest.current = { draftKey, projectId, scope, workspace, afterApplied };
+  function captureProjectReason() {
+    const current = latest.current;
+    if (
+      !current.projectId ||
+      !current.workspace.snapshot?.projects.some((project) => project.id === current.projectId)
+    )
+      return 'Choose a project before adding context.';
+    if (current.workspace.preview) return 'Context capture is unavailable in preview.';
+    if (current.draftKey !== draftKey || current.projectId !== projectId || current.scope !== scope)
+      return 'The draft changed. Choose context again.';
+  }
   const refSignature = canonicalJson(draft.refs);
   const panelScope = `${scope}:${refSignature}`;
   const currentPanelScope = useRef(panelScope);
@@ -780,6 +791,7 @@ function useContextComposer({
     mode: 'source-file' | 'source-folder' | 'log-file',
     retryReceipt?: ContextCaptureReceipt,
   ) {
+    if (!retryReceipt && captureProjectReason()) return;
     if (
       busyRef.current ||
       workspace.pending ||
@@ -818,6 +830,7 @@ function useContextComposer({
         }
         if (!/^[a-f0-9]{40}$/.test(base))
           throw new Error('Context capture needs a supported committed source base.');
+        if (captureProjectReason()) return;
         capture = await workspace.pickConversationContext({ projectId, base, mode });
       }
       if (!capture) return;
@@ -888,6 +901,7 @@ function useContextComposer({
     workspace.connection !== 'connected' ||
     draft.priorSend ||
     Boolean(draft.captureReceipt);
+  const projectBlockedReason = captureProjectReason();
   const frozen = panel?.kind === 'preview' && Boolean(panel.command);
   const changed = frozen && panel.scope !== currentPanelScope.current;
   const previewBlocked = changed
@@ -995,14 +1009,17 @@ function useContextComposer({
         ] as const
       ).map((action) => ({
         ...action,
-        disabledReason: controlsBlocked
-          ? (uncertain ?? 'Wait for the current request or reconnect before adding context.')
-          : draft.refs.length >= 4
-            ? 'Remove a context capture before adding another.'
-            : undefined,
+        disabledReason:
+          projectBlockedReason ??
+          (controlsBlocked
+            ? (uncertain ?? 'Wait for the current request or reconnect before adding context.')
+            : draft.refs.length >= 4
+              ? 'Remove a context capture before adding another.'
+              : undefined),
       })),
       onContextAction: (mode: string) => {
         if (
+          !projectBlockedReason &&
           !controlsBlocked &&
           draft.refs.length < 4 &&
           (mode === 'source-file' || mode === 'source-folder' || mode === 'log-file')
@@ -1018,6 +1035,7 @@ function useContextComposer({
           : `Context ${index + 1} · ${ref.hash.slice(0, 8)}`,
       })),
       onAddContext: () => {
+        if (captureProjectReason()) return;
         setError(undefined);
         setPanel({ kind: 'choose' });
       },
@@ -1033,7 +1051,11 @@ function useContextComposer({
           }));
       },
       contextDisabled: controlsBlocked,
-      addContextDisabled: busy || workspace.pending || workspace.connection !== 'connected',
+      addContextDisabled:
+        Boolean(projectBlockedReason) ||
+        busy ||
+        workspace.pending ||
+        workspace.connection !== 'connected',
     },
     panel:
       panel &&
@@ -1075,7 +1097,10 @@ function useContextComposer({
                     type="button"
                     key={mode}
                     disabled={
-                      controlsBlocked || Boolean(draft.captureReceipt) || draft.refs.length >= 4
+                      Boolean(projectBlockedReason) ||
+                      controlsBlocked ||
+                      Boolean(draft.captureReceipt) ||
+                      draft.refs.length >= 4
                     }
                     onClick={() => void add(mode)}
                   >
