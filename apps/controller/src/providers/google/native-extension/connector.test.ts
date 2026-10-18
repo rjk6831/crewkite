@@ -415,6 +415,26 @@ test('native context protocol discloses only the selected current bounded task',
       ).error?.code,
       -32601,
     );
+    const withoutPatch = OwnedBundleSchema.parse({
+      ...owned.bundle,
+      context: {
+        ...owned.bundle.context,
+        binding: { ...owned.bundle.context.binding, candidate: null, patch: null },
+        patch: '',
+      },
+    });
+    const noRetainedPatch = createSession(withoutPatch, {
+      client: owned.f.client,
+      now: () => at,
+      save: () => assert.fail('A read cannot save.'),
+    });
+    await initialize(noRetainedPatch);
+    assert.deepEqual(
+      ((await noRetainedPatch.receive(frame(2, 'tools/list'))) as Reply).result?.tools?.map(
+        (tool) => tool.name,
+      ),
+      ['submit_unverified_result'],
+    );
     const before = await owned.f.client.snapshot();
     for (const [name, change, allowed] of [
       [

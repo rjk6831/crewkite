@@ -432,7 +432,13 @@ export function createSession(
 ) {
   const context = 'context' in bundle ? bundle.context : bundle;
   const availableTools =
-    'context' in bundle ? tools.filter((tool) => tool.name !== 'task_context') : tools;
+    'context' in bundle
+      ? tools.filter(
+          (tool) =>
+            tool.name !== 'task_context' &&
+            (tool.name !== 'retained_patch' || context.binding.patch !== null),
+        )
+      : tools;
   let initialized = false,
     ready = false,
     closed = false,
