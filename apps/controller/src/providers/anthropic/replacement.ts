@@ -545,7 +545,6 @@ export class ReplacementStream {
         const type = record.type;
         this.envelope = protocolName(type);
         this.subtype = record.subtype === undefined ? null : protocolName(record.subtype);
-        if (this.terminal) this.fail('protocol', 'unsupported');
         this.site = 'identity';
         const envelope = identity.parse(value);
         if (envelope.session_id !== this.plan.sessionId)
@@ -588,6 +587,11 @@ export class ReplacementStream {
             (info.overageStatus === 'allowed' || info.overageStatus === 'allowed_warning')
           )
             this.fail('protocol', 'unsupported', 'rateLimitGraceActive');
+        } else if (this.terminal) {
+          // Progress and rate-limit metadata can follow the result. Anything else could change
+          // what ran or replace the proposal.
+          this.site = 'frame';
+          this.fail('protocol', 'unsupported');
         } else if (type === 'assistant') {
           this.site = 'assistant';
           assistant.parse(value);

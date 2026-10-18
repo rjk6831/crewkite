@@ -318,12 +318,49 @@ test('native text replacement stays bound to one proposal and owned task deadlin
         other: 8,
       },
     },
+    {
+      name: 'progress frames after the result leave the proposal intact',
+      frames: [init, result, ...laterFrames],
+      pass: true,
+      ignored: tally(laterNames),
+    },
+    {
+      name: 'progress after the result stays session bound',
+      frames: [init, result, { ...status, session_id: '46eb17cd-01e8-480d-99f4-a741f189715e' }],
+      diagnostic: {
+        stage: 'complete',
+        site: 'identity',
+        cause: 'correlation',
+        field: 'session_id',
+      },
+    },
+    {
+      name: 'a second result after progress stays refused',
+      frames: [init, result, status, result],
+      diagnostic: { stage: 'complete' },
+    },
+    ...[
+      {
+        type: 'assistant',
+        session_id: input.sessionId,
+        message: { role: 'assistant', content: [] },
+      },
+      {
+        type: 'system',
+        subtype: 'api_retry',
+        session_id: input.sessionId,
+        attempt: 1,
+        max_retries: 10,
+        retry_delay_ms: 1000,
+      },
+      { type: 'system', subtype: 'model_fallback', session_id: input.sessionId },
+    ].map((frame) => ({
+      name: `${frame.subtype ?? frame.type} after the result stays refused`,
+      frames: [init, result, frame],
+      diagnostic: { stage: 'complete', cause: 'unsupported' },
+    })),
     { name: 'display invalidation cannot initialize a session', frames: [invalidation, result] },
     { name: 'display invalidation cannot complete a proposal', frames: [init, invalidation] },
-    {
-      name: 'display invalidation after terminal remains refused',
-      frames: [init, result, invalidation],
-    },
     ...[[], [init]].flatMap((prefix) =>
       [undefined, '46eb17cd-01e8-480d-99f4-a741f189715e'].map((session_id) => ({
         name: `display invalidation session ${prefix.length}/${session_id ?? 'missing'} stays bound`,
@@ -394,7 +431,6 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       diagnostic: { stage: 'before-init', site: 'init', envelope: 'result' },
     },
     { name: 'status cannot complete a proposal', frames: [init, status] },
-    { name: 'status after terminal remains refused', frames: [init, result, status] },
     {
       name: 'thinking estimates are discarded without usage or proposal authority',
       frames: [
@@ -414,11 +450,6 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       ignored: { 'system/thinking_tokens': 5 },
     },
     { name: 'thinking estimates cannot complete a proposal', frames: [init, thinking] },
-    {
-      name: 'thinking estimates after terminal remain refused',
-      frames: [init, result, thinking],
-      diagnostic: { stage: 'complete', subtype: 'thinking_tokens' },
-    },
     ...[undefined, '46eb17cd-01e8-480d-99f4-a741f189715e'].map((session_id) => ({
       name: `thinking estimate session ${session_id ?? 'missing'} remains bound`,
       frames: [init, { ...thinking, session_id }, result],
@@ -590,9 +621,30 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       frames: [init, usageEvent({ overageEnabled: true })],
     },
     {
-      name: 'extra usage configuration after terminal remains refused',
+      name: 'extra usage configuration after the result leaves the proposal intact',
       frames: [init, result, usageEvent({ overageEnabled: true })],
+      pass: true,
     },
+    {
+      name: 'a window reading after the result still reaches the usage hook',
+      frames: [
+        init,
+        result,
+        usageEvent({ unifiedWindows: { five_hour: reading(0.25, fiveHourReset) } }),
+      ],
+      pass: true,
+      usage: [{ windows: [fiveHour(75)], paid: null }],
+    },
+    ...[
+      { isUsingOverage: true },
+      { overageInUse: true },
+      { rateLimitType: 'overage' },
+      { rateLimitGraceActive: true, overageStatus: 'allowed' },
+    ].map((info) => ({
+      name: `reported paid use ${Object.keys(info)[0]} after the result refuses the proposal`,
+      frames: [init, result, usageEvent(info)],
+      diagnostic: { stage: 'complete', site: 'rate-limit', cause: 'unsupported' },
+    })),
     ...['isUsingOverage', 'overageInUse'].map((field) => ({
       name: `reported ${field} stops included-only task`,
       frames: [
