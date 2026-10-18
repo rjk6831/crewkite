@@ -15,17 +15,18 @@ import { groupAbsent } from '../host/worker.ts';
 import { binding, nativeSetup } from './controller-fixture.ts';
 
 test('combined tasks share seven real dispatches and require a separate full barrier', async (t) => {
+  // Start longer scenarios first so both workers stay occupied through the claim.
   const scenarios = [
-    'closed-before-check',
-    'empty-journal',
     'passed',
-    'interaction-failed',
-    'stopped',
     'recovered',
-    'child-budget',
-    'unknown',
-    'stopped-before-check',
     'paused',
+    'stopped',
+    'interaction-failed',
+    'stopped-before-check',
+    'unknown',
+    'closed-before-check',
+    'child-budget',
+    'empty-journal',
   ] as const;
   let next = 0;
   const run = async () => {
