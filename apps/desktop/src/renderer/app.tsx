@@ -78,7 +78,13 @@ import {
   short,
   titleCase,
 } from './components.tsx';
-import { adoptedPlanCurrent, ConversationView, NewGoal } from './conversation-view.tsx';
+import {
+  adoptedPlanCurrent,
+  ConversationView,
+  NewGoal,
+  pendingGoalProject,
+  type RegisterComposerRetry,
+} from './conversation-view.tsx';
 import {
   type ExecutionPolicySeed,
   googleAcpLabel,
@@ -593,9 +599,16 @@ export function App() {
     () => readPreference('crewkite-sidebar-collapsed-v1') === '1',
   );
   const [create, setCreate] = useState(false);
-  const [newGoal, setNewGoal] = useState(false);
+  const [newGoal, setNewGoal] = useState(() => Boolean(pendingGoalProject()));
   const [savedDrafts] = useState(readConversationDrafts);
   const [goalDraft, setGoalDraft] = useState(savedDrafts.goal);
+  const composerRetry = useRef<(() => Promise<void>) | null>(null);
+  const registerComposerRetry = useCallback<RegisterComposerRetry>((retry) => {
+    composerRetry.current = retry;
+    return () => {
+      if (composerRetry.current === retry) composerRetry.current = null;
+    };
+  }, []);
   const [drafts, setDrafts] = useState(savedDrafts.tasks);
   const [answerDrafts, setAnswerDrafts] = useState(savedDrafts.answers);
   const [draftError, setDraftError] = useState(savedDrafts.error);
@@ -1045,7 +1058,10 @@ export function App() {
               type="button"
               className="button secondary"
               disabled={workspace.pending || connection !== 'connected'}
-              onClick={() => void workspace.retryCommand().catch(() => {})}
+              onClick={() => {
+                const retry = composerRetry.current;
+                void (retry ? retry() : workspace.retryCommand()).catch(() => {});
+              }}
             >
               Retry exact command
             </button>
@@ -1300,6 +1316,7 @@ export function App() {
                         task={task}
                         snapshot={snapshot}
                         workspace={workspace}
+                        registerRetry={registerComposerRetry}
                         answerDrafts={answerDrafts}
                         onAnswerDraftChange={(id, text) =>
                           setAnswerDrafts((current) => ({ ...current, [id]: text }))
@@ -1381,10 +1398,12 @@ export function App() {
                 <NewGoal
                   snapshot={snapshot}
                   workspace={workspace}
+                  registerRetry={registerComposerRetry}
                   text={goalDraft}
                   onTextChange={setGoalDraft}
                   onManual={() => setCreate(true)}
                   onCreated={(id, submitted) => {
+                    setPage('tasks');
                     setSelected(id);
                     setNewGoal(false);
                     setTab('Conversation');

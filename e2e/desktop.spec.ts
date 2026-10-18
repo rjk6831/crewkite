@@ -1022,7 +1022,8 @@ async function conversationBridge(
         send: { available: false, reason: 'pending-question', disposition: null },
         adopt: { available: false, reason: 'pending-question' },
       });
-      return { outcome: 'applied', entity: task };
+      receipts.set(command.key, { outcome: 'applied', entity: task });
+      return { outcome: 'outcome-unknown' };
     }
     assert(state);
     assert('expectedRevision' in command);
@@ -1309,6 +1310,52 @@ async function conversationBridge(
     assert.equal(createdWithContext.payload.context?.length, 2);
     for (const ref of createdWithContext.payload.context ?? [])
       assert.equal(captured.get(ref.artifactId)?.artifact.hash, ref.hash);
+
+    await expect(
+      page.getByRole('button', { name: 'Retry exact command', exact: true }),
+    ).toBeVisible();
+    const pendingGoalDrafts = await page.evaluate(() =>
+      localStorage.getItem('crewkite-context-drafts-v1'),
+    );
+    assert(pendingGoalDrafts);
+    await page.evaluate((stored) => {
+      const drafts = JSON.parse(stored);
+      for (const draft of Object.values(drafts) as {
+        sendReceipt?: { command: { payload: { text: string } } };
+      }[])
+        if (draft.sendReceipt) draft.sendReceipt.command.payload.text = 'A different goal.';
+      localStorage.setItem('crewkite-context-drafts-v1', JSON.stringify(drafts));
+    }, pendingGoalDrafts);
+    await page.reload();
+    await expect(page.getByRole('heading', { name: 'New goal', exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Retry exact command', exact: true }).click();
+    await expect(
+      page.getByRole('alert').filter({ hasText: 'does not match this draft' }).first(),
+    ).toBeVisible();
+    await expect(composer).toHaveValue('Export the currently filtered invoices as CSV.');
+    assert.equal(
+      received.filter((command) => command.command === 'CreateTaskDiscussion').length,
+      1,
+    );
+    await page.evaluate(
+      (stored) => localStorage.setItem('crewkite-context-drafts-v1', stored),
+      pendingGoalDrafts,
+    );
+    await page.reload();
+    await expect(page.getByRole('heading', { name: 'New goal', exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Retry exact command', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'New goal', exact: true })).toHaveCount(0);
+    assert.equal(
+      received.filter((command) => command.command === 'CreateTaskDiscussion').length,
+      1,
+    );
+    assert.equal(await page.evaluate(() => localStorage.getItem('crewkite-goal-draft-v1')), '');
+    const completedGoalDrafts = await page.evaluate(() =>
+      localStorage.getItem('crewkite-context-drafts-v1'),
+    );
+    assert(
+      !completedGoalDrafts || !JSON.parse(completedGoalDrafts)[`goal:${snapshot.projects[0].id}`],
+    );
 
     await expect(page.getByRole('tab', { name: 'Conversation', exact: true })).toHaveAttribute(
       'aria-selected',
@@ -1740,12 +1787,29 @@ async function conversationBridge(
     assert.equal(received.length, beforeWrongRetry);
     await page.reload();
     await page.getByText('Task details', { exact: true }).click();
-    await page.getByRole('button', { name: 'Retry exact context capture', exact: true }).click();
+    await page.getByRole('button', { name: 'Retry exact command', exact: true }).click();
     await expect(page.getByRole('dialog', { name: 'Captured context', exact: true })).toContainText(
       'Captured source-file text.',
     );
     await page.keyboard.press('Escape');
     assert.equal(received.filter((command) => command.key === pendingCapture.key).length, 1);
+    uncertainCapture = true;
+    await page.getByRole('button', { name: 'Add context', exact: true }).click();
+    await nativeChoice(['/registered/project/README.md']);
+    await page.getByRole('menuitem', { name: 'Source file', exact: true }).click();
+    await expect(page.getByRole('dialog').getByRole('alert')).toContainText(
+      'capture outcome is uncertain',
+    );
+    await page.evaluate(async () => {
+      await window.crewkite?.retryCommand?.();
+    });
+    await page.reload();
+    await page.getByText('Task details', { exact: true }).click();
+    await page.getByRole('button', { name: 'Choose context again', exact: true }).click();
+    await expect(
+      page.getByRole('button', { name: 'Retry exact context capture', exact: true }),
+    ).toHaveCount(0);
+    await expect(page.getByRole('button', { name: /^Remove Context/ })).toHaveCount(1);
     await composer.fill('Keep the execution permissions unchanged.');
     await composer.press('Enter');
     bump();
@@ -1782,10 +1846,8 @@ async function conversationBridge(
     const originalSend = received.find(
       (command) => command.command === 'SendTaskMessage' && receipts.has(command.key),
     );
-    await page
-      .getByRole('dialog')
-      .getByRole('button', { name: 'Retry exact message', exact: true })
-      .click();
+    await page.keyboard.press('Escape');
+    await page.getByRole('button', { name: 'Retry exact command', exact: true }).click();
     await expect(page.getByRole('dialog')).toHaveCount(0);
     await expect(composer).toHaveValue('');
     await expect(page.getByRole('button', { name: /^Remove Context/ })).toHaveCount(0);

@@ -1,6 +1,7 @@
 import {
   CommandIdSchema,
   type CommandResult,
+  CommandSchema,
   type ConversationContextBundle,
   type ConversationContextRef,
   ConversationContextRefsSchema,
@@ -34,6 +35,8 @@ import { Conversation, type ConversationMessage } from './conversation.tsx';
 import type { ExecutionPolicySeed } from './launch.tsx';
 import { ConversationContextCaptureError, type DesktopCommand, type Workspace } from './source.ts';
 import { roleLabels } from './templates.ts';
+
+export type RegisterComposerRetry = (retry: () => Promise<void>) => () => void;
 
 const applied = (outcome: string) => outcome === 'applied' || outcome === 'already-applied';
 const reasonText = (reason: string) =>
@@ -233,15 +236,49 @@ type ContextDraft = {
   facts?: Record<string, ContextFact>;
   priorSend: boolean;
   captureReceipt?: ContextCaptureReceipt;
+  sendReceipt?: { command: ContextSendCommand; submitted: string };
 };
 type ContextSendCommand = Extract<
   DesktopCommand,
   { command: 'CreateTaskDiscussion' | 'SendTaskMessage' | 'QueueTaskGuidance' }
 >;
-const contextSendReceipts = new Map<
-  string,
-  { command: ContextSendCommand; submitted: string; refs: ConversationContextRef[] }
->();
+const contextSendSchemas = CommandSchema.options
+  .filter(
+    (
+      schema,
+    ): schema is Extract<
+      (typeof CommandSchema.options)[number],
+      { shape: { command: { value: ContextSendCommand['command'] } } }
+    > =>
+      ['CreateTaskDiscussion', 'SendTaskMessage', 'QueueTaskGuidance'].includes(
+        schema.shape.command.value,
+      ),
+  )
+  .map((schema) => schema.omit({ protocol: true, key: true, actor: true }));
+function sendReceipt(value: unknown, draftKey: string): ContextDraft['sendReceipt'] {
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    Object.keys(value).length !== 2 ||
+    !('command' in value) ||
+    !('submitted' in value) ||
+    typeof value.submitted !== 'string' ||
+    new TextEncoder().encode(JSON.stringify(value)).length > 32768
+  )
+    return;
+  for (const schema of contextSendSchemas) {
+    const parsed = schema.safeParse(value.command);
+    if (!parsed.success) continue;
+    const command = parsed.data;
+    if (
+      (command.command === 'CreateTaskDiscussion' &&
+        draftKey === `goal:${command.payload.projectId}`) ||
+      ((command.command === 'SendTaskMessage' || command.command === 'QueueTaskGuidance') &&
+        draftKey === `task:${command.payload.taskId}`)
+    )
+      return { command, submitted: value.submitted };
+  }
+}
 function captureReceipt(value: unknown): ContextCaptureReceipt | undefined {
   if (!value || typeof value !== 'object') return;
   const receiptId = 'receiptId' in value ? CommandIdSchema.safeParse(value.receiptId) : undefined;
@@ -299,6 +336,7 @@ function readContextDrafts() {
         refs: refs.data,
         facts,
         priorSend: 'priorSend' in value && value.priorSend === true,
+        sendReceipt: 'sendReceipt' in value ? sendReceipt(value.sendReceipt, key) : undefined,
         captureReceipt:
           'captureReceipt' in value ? captureReceipt(value.captureReceipt) : undefined,
       };
@@ -311,6 +349,11 @@ function readContextDrafts() {
     };
   }
   return contextDraftStore;
+}
+export function pendingGoalProject() {
+  return Object.entries(readContextDrafts().drafts)
+    .find(([key, draft]) => key.startsWith('goal:') && draft.priorSend)?.[0]
+    .slice(5);
 }
 function writeContextDraft(key: string, update: (draft: ContextDraft) => ContextDraft) {
   const current = readContextDrafts();
@@ -505,6 +548,7 @@ function useContextComposer({
   recipient,
   workspace,
   afterApplied,
+  registerRetry,
 }: {
   draftKey: string;
   projectId: string;
@@ -513,6 +557,7 @@ function useContextComposer({
   recipient: ContextRecipient;
   workspace: Workspace;
   afterApplied: (result: CommandResult, submitted: string) => void;
+  registerRetry?: RegisterComposerRetry;
 }) {
   const saved = useSyncExternalStore(subscribeContextDrafts, readContextDrafts);
   const draft = saved.drafts[draftKey] ?? emptyContextDraft;
@@ -522,6 +567,15 @@ function useContextComposer({
   const reads = useRef(new Map<string, Promise<CapturedContext>>());
   const [busy, setBusy] = useState(false);
   const [sending, setSending] = useState(false);
+  const releaseRetry = useRef<(() => void) | null>(null);
+  function clearRetry() {
+    releaseRetry.current?.();
+    releaseRetry.current = null;
+  }
+  function retainRetry(retry: () => Promise<void>) {
+    clearRetry();
+    releaseRetry.current = registerRetry?.(retry) ?? null;
+  }
   const busyRef = useRef(false);
   const [error, setError] = useState<string>();
   const [panel, setPanel] = useState<
@@ -598,11 +652,12 @@ function useContextComposer({
     [projectId],
   );
   function finish(result: CommandResult, submitted: string, refs: ConversationContextRef[]) {
-    contextSendReceipts.delete(draftKey);
+    clearRetry();
     writeContextDraft(draftKey, (current) => ({
       ...current,
       refs: sameContext(current.refs, refs) ? [] : current.refs,
       priorSend: false,
+      sendReceipt: undefined,
     }));
     afterApplied(result, submitted);
   }
@@ -613,10 +668,14 @@ function useContextComposer({
     setSending(true);
     setError(undefined);
     const refs = 'context' in command.payload ? (command.payload.context ?? []) : [];
-    const receipt = { command, submitted, refs };
-    contextSendReceipts.set(draftKey, receipt);
     try {
-      writeContextDraft(draftKey, (current) => ({ ...current, priorSend: true }));
+      const receipt = sendReceipt({ command, submitted }, draftKey);
+      if (!receipt) throw new Error('The exact send could not be kept in this draft.');
+      writeContextDraft(draftKey, (current) => ({
+        ...current,
+        priorSend: true,
+        sendReceipt: receipt,
+      }));
       const result = retry
         ? await workspace.retryCommand(command)
         : await workspace.command(command);
@@ -624,10 +683,15 @@ function useContextComposer({
         finish(result, submitted, refs);
         if (latest.current.draftKey === draftKey) setPanel(null);
       } else if (!result || result.outcome === 'outcome-unknown') {
+        retainRetry(() => dispatch(command, submitted, true));
         setError('The send outcome is unknown. Retry this exact send before changing the message.');
       } else {
-        contextSendReceipts.delete(draftKey);
-        writeContextDraft(draftKey, (current) => ({ ...current, priorSend: false }));
+        clearRetry();
+        writeContextDraft(draftKey, (current) => ({
+          ...current,
+          priorSend: false,
+          sendReceipt: undefined,
+        }));
         setError(
           result.reason === 'conversation-context-too-large'
             ? 'The message and its context exceed the planning input limit. Remove a capture and review again.'
@@ -636,6 +700,7 @@ function useContextComposer({
         );
       }
     } catch (failure) {
+      retainRetry(() => dispatch(command, submitted, true));
       setError(
         `${message(failure)} The draft and context have been kept. A prior send may have been saved.`,
       );
@@ -777,14 +842,17 @@ function useContextComposer({
           facts: { ...current.facts, [capture.ref.artifactId]: contextFact(capture) },
         };
       });
+      clearRetry();
       setCache((current) => ({ ...current, [capture.ref.artifactId]: capture }));
       if (latest.current.draftKey === draftKey)
         setPanel({ kind: 'preview', captures: [capture], scope: panelScope, recipient });
     } catch (failure) {
       if (failure instanceof ConversationContextCaptureError) {
         const receipt = captureReceipt(failure.receipt);
-        if (receipt?.projectId === projectId)
+        if (receipt?.projectId === projectId) {
           writeContextDraft(draftKey, (current) => ({ ...current, captureReceipt: receipt }));
+          retainRetry(() => add('source-file', receipt));
+        }
       }
       if (latest.current.draftKey === draftKey) {
         setPanel({ kind: 'choose' });
@@ -795,6 +863,19 @@ function useContextComposer({
       setBusy(false);
     }
   }
+  useEffect(() => {
+    if (!workspace.retryAvailable) {
+      clearRetry();
+      return;
+    }
+    const receipt = draft.sendReceipt;
+    if (draft.priorSend && receipt)
+      retainRetry(() => dispatch(receipt.command, receipt.submitted, true));
+    else if (draft.captureReceipt) {
+      const capture = draft.captureReceipt;
+      retainRetry(() => add('source-file', capture));
+    }
+  });
   const uncertain = draft.priorSend
     ? 'A prior send may have been saved. Resolve its exact retry, then check the saved conversation. The draft has been kept.'
     : draft.captureReceipt
@@ -821,13 +902,13 @@ function useContextComposer({
           {uncertain}
         </p>
       )}
-      {draft.priorSend && workspace.retryAvailable && contextSendReceipts.has(draftKey) && (
+      {draft.priorSend && workspace.retryAvailable && draft.sendReceipt && (
         <button
           className="button secondary"
           type="button"
           disabled={busy || workspace.pending || workspace.connection !== 'connected'}
           onClick={() => {
-            const receipt = contextSendReceipts.get(draftKey);
+            const receipt = draft.sendReceipt;
             if (receipt) void dispatch(receipt.command, receipt.submitted, true);
           }}
         >
@@ -839,12 +920,30 @@ function useContextComposer({
           className="button secondary"
           type="button"
           onClick={() => {
-            contextSendReceipts.delete(draftKey);
-            writeContextDraft(draftKey, (current) => ({ ...current, priorSend: false }));
+            clearRetry();
+            writeContextDraft(draftKey, (current) => ({
+              ...current,
+              priorSend: false,
+              sendReceipt: undefined,
+            }));
             setError(undefined);
           }}
         >
           Keep as a new draft after reviewing history
+        </button>
+      )}
+      {draft.captureReceipt && !workspace.retryAvailable && !workspace.pending && (
+        <button
+          className="button secondary"
+          type="button"
+          disabled={busy}
+          onClick={() => {
+            clearRetry();
+            writeContextDraft(draftKey, (current) => ({ ...current, captureReceipt: undefined }));
+            setError(undefined);
+          }}
+        >
+          Choose context again
         </button>
       )}
       {draft.captureReceipt && (
@@ -1001,22 +1100,6 @@ function useContextComposer({
               <p className="notice" role="status">
                 Close this dialog and use Retry exact command before adding context.
               </p>
-            )}
-            {draft.captureReceipt && !workspace.retryAvailable && !workspace.pending && (
-              <button
-                className="button secondary"
-                type="button"
-                disabled={busy}
-                onClick={() => {
-                  writeContextDraft(draftKey, (current) => ({
-                    ...current,
-                    captureReceipt: undefined,
-                  }));
-                  setError(undefined);
-                }}
-              >
-                Choose context again
-              </button>
             )}
             {recovery}
             {error && (
@@ -1213,6 +1296,7 @@ function PlanningControls({
 export function NewGoal({
   snapshot,
   workspace,
+  registerRetry,
   onCreated,
   onManual,
   text,
@@ -1222,10 +1306,13 @@ export function NewGoal({
   onTextChange: (text: string) => void;
   snapshot: Snapshot;
   workspace: Workspace;
+  registerRetry?: RegisterComposerRetry;
   onCreated: (id: string, submitted: string) => void;
   onManual: () => void;
 }) {
-  const [chosenProject, setProjectId] = useState(snapshot.projects[0]?.id ?? '');
+  const [chosenProject, setProjectId] = useState(
+    pendingGoalProject() ?? snapshot.projects[0]?.id ?? '',
+  );
   const projectId = snapshot.projects.some((project) => project.id === chosenProject)
     ? chosenProject
     : (snapshot.projects[0]?.id ?? '');
@@ -1251,6 +1338,7 @@ export function NewGoal({
         }
       : { summary: 'Planning recipient has not been selected.' },
     workspace,
+    registerRetry,
     afterApplied: (result, submitted) => {
       if (result.entity && 'state' in result.entity) onCreated(result.entity.id, submitted);
     },
@@ -1391,6 +1479,7 @@ export function ConversationView({
   visible,
   snapshot,
   workspace,
+  registerRetry,
   onState,
   onPrepare,
   draft,
@@ -1408,6 +1497,7 @@ export function ConversationView({
   task: Task;
   snapshot: Snapshot;
   workspace: Workspace;
+  registerRetry?: RegisterComposerRetry;
   onState: (state: TaskConversationState | null) => void;
   onPrepare: (seed?: ExecutionPolicySeed) => void;
 }) {
@@ -1475,6 +1565,7 @@ export function ConversationView({
         }
       : { summary: 'Planning recipient has not been selected.' },
     workspace,
+    registerRetry,
     afterApplied: (_result, submitted) => onDraftSaved(submitted),
   });
   const blocked =
