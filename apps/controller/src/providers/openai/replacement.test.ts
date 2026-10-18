@@ -1730,6 +1730,57 @@ test('both task transcripts refuse every notice that carries authority', () => {
     }
 });
 
+test('both task transcripts ignore an unrelated advisory thread status', () => {
+  const directory = resolve('internal/replacement-fixture');
+  const scratch = resolve(directory, 'scratch');
+  const structured = new ReplacementTranscript(plan(directory), {
+    now: () => 1,
+    timeoutMs: 300_000,
+  });
+  metadata(structured);
+  structured.push(bytes({ id: 10, result: threadResult(directory) }));
+  structured.next();
+  structured.push(bytes({ id: 11, result: { turn: running } }));
+
+  const repository = new RepositoryTranscript(repositoryTask(directory), {
+    now: () => 1,
+    timeoutMs: 300_000,
+    directory,
+  });
+  metadata(repository);
+  repository.push(
+    bytes({
+      id: 10,
+      result: {
+        ...threadResult(scratch),
+        approvalPolicy: 'never',
+        sandbox: { type: 'workspaceWrite', writableRoots: [scratch], networkAccess: false },
+      },
+    }),
+  );
+  repository.next();
+  repository.push(bytes({ id: 11, result: { turn: running } }));
+
+  const unrelated = {
+    method: 'thread/status/changed',
+    params: { threadId: 'unrelated-thread', status: { type: 'idle' } },
+  };
+  structured.push(bytes(unrelated));
+  repository.push(bytes(unrelated));
+  assert.equal(structured.diagnostic, null);
+  assert.equal(repository.diagnostic, null);
+
+  for (const transcript of [structured, repository])
+    assert.throws(() =>
+      transcript.push(
+        bytes({
+          method: 'thread/status/changed',
+          params: { threadId: 'thread-1', status: { type: 'unknown' } },
+        }),
+      ),
+    );
+});
+
 test('repository item handling accepts passive subagent activity and identifies refused schemas', () => {
   const directory = resolve('internal/replacement-fixture');
   const scratch = resolve(directory, 'scratch');

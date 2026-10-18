@@ -21,6 +21,17 @@ const MAX_CONTENT = 65_536;
 const MAX_TASK_LINE = 1024 * 1024;
 const MAX_TASK_OUTPUT = 3 * MAX_TASK_LINE;
 const id = z.string().min(1).max(200);
+const advisoryThreadStatus = z.object({
+  threadId: id,
+  status: z.union([
+    z.object({ type: z.literal('idle') }),
+    z.object({
+      type: z.literal('active'),
+      activeFlags: z.array(z.enum(['waitingOnApproval', 'waitingOnUserInput'])).max(2),
+    }),
+  ]),
+});
+export const parseAdvisoryThreadStatus = (value: unknown) => advisoryThreadStatus.parse(value);
 const utf8 = (value: string) =>
   value.isWellFormed() && !value.includes('\0') && Buffer.byteLength(value, 'utf8') <= MAX_CONTENT;
 export const ReplacementPathSchema = NativeTargetPathSchema;
@@ -601,16 +612,10 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
     }
     if (method === 'thread/status/changed') {
       this.site = 'status';
-      const value = z
-        .object({
-          threadId: id,
-          status: z.union([
-            z.object({ type: z.literal('idle') }),
-            z.object({ type: z.literal('active'), activeFlags: z.array(z.never()) }),
-          ]),
-        })
-        .parse(params);
-      if (!this.threadId || value.threadId !== this.threadId) this.refuse();
+      const value = parseAdvisoryThreadStatus(params);
+      if (this.threadId && value.threadId !== this.threadId) return;
+      if (!this.threadId) this.refuse();
+      if (value.status.type === 'active' && value.status.activeFlags.length) this.refuse();
       return;
     }
     // Thread metadata can arrive before turn/start returns a turn identity.

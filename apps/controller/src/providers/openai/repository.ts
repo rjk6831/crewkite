@@ -13,6 +13,7 @@ import {
   authorityNotice,
   NoticeCensus,
   nativeTaskAdmitted,
+  parseAdvisoryThreadStatus,
   type ReplacementDiagnostic,
 } from './replacement.ts';
 
@@ -501,6 +502,10 @@ export class RepositoryTranscript {
         this.refuse();
       this.threadId = thread.id;
       return;
+    }
+    if (method === 'thread/status/changed') {
+      const status = parseAdvisoryThreadStatus(raw);
+      if (this.threadId && status.threadId !== this.threadId) return;
     }
     this.site = 'identity';
     const identity = z.object({ threadId: id }).parse(raw);
