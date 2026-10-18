@@ -117,6 +117,7 @@ function fixture(input: LocalStart = plan) {
   });
   let submitted = 0,
     cancelled = 0,
+    renders = 0,
     prompt = '',
     options: LLMPredictionOpts | undefined;
   const model: LoadedModel = {
@@ -139,16 +140,22 @@ function fixture(input: LocalStart = plan) {
       );
       const fence = (edge: string, kind: string, path: string) =>
         `----- ${edge} ${kind} ${path} ${input.binding.attemptId} -----`;
+      // Only a prompt that does not fit is rendered again, and then without the tests.
+      const tested = renders++ === 0;
+      assert.equal(
+        message.content.includes('----- BEGIN READ-ONLY TEST'),
+        tested && !!input.tests.length,
+      );
       for (const [kind, path, content] of [
         ['FILE', input.binding.path, input.original],
-        ...input.tests.map((test) => ['READ-ONLY TEST', test.path, test.content]),
+        ...(tested ? input.tests : []).map((test) => ['READ-ONLY TEST', test.path, test.content]),
       ])
         assert.ok(
           message.content.includes(
             `\n${fence('BEGIN', kind, path)}\n${content}${content.endsWith('\n') ? '' : '\n'}${fence('END', kind, path)}\n`,
           ),
         );
-      return 'rendered chat';
+      return tested ? 'rendered chat' : 'rendered chat without tests';
     },
     tokenize: async () => [1, 2, 3],
     complete: (value, config) => {
@@ -186,6 +193,9 @@ function fixture(input: LocalStart = plan) {
     },
     get cancelled() {
       return cancelled;
+    },
+    get renders() {
+      return renders;
     },
     get prompt() {
       return prompt;
@@ -253,22 +263,53 @@ test('Local generation binds its loopback authentication mode and loaded instanc
     ],
   ])
     assert.throws(() => localPlan({ ...plan, tests }));
-  const sibling = (path: string, content: string) => ({ path, content: Buffer.from(content) });
+  const file = (path: string, content: string | Buffer) => ({
+    path,
+    content: typeof content === 'string' ? Buffer.from(content) : content,
+  });
   const imports = "import { run } from './run.ts';\n";
-  assert.deepEqual(
-    localTests('src/run.ts', [
-      sibling('src/z.test.ts', imports),
-      sibling('src/y.test.mjs', imports.replaceAll("'", '"')),
-      sibling('src/b.test.ts', imports),
-      sibling('src/a.test.ts', imports.padEnd(12_289)),
-      sibling('src/other.test.ts', "import { run } from './runner.ts';\n"),
-      sibling('src/run.ts', imports),
-      sibling('src/helper.ts', imports),
-      sibling('src/nested/run.test.ts', "import { run } from '../run.ts';\n"),
-      sibling('run.test.ts', "import { run } from './src/run.ts';\n"),
-    ]).map((test) => test.path),
-    ['src/b.test.ts', 'src/y.test.mjs'],
-  );
+  for (const [target, files, expected] of [
+    [
+      'src/run.ts',
+      [
+        file('src/z.test.ts', imports),
+        file('src/y.test.mjs', imports.replaceAll("'", '"')),
+        file('src/b.test.ts', imports),
+        file('src/other.test.ts', "import { run } from './runner.ts';\n"),
+        file('src/helper.ts', imports),
+      ],
+      ['src/b.test.ts', 'src/y.test.mjs'],
+    ],
+    [
+      'src/run.ts',
+      [
+        file('lib/run.test.ts', imports),
+        file('src/nested/run.test.ts', imports),
+        file('src/run.test.ts', imports),
+      ],
+      ['src/run.test.ts'],
+    ],
+    [
+      'src/run.ts',
+      [file('src/a.test.ts', imports.padEnd(7000)), file('src/b.test.ts', imports.padEnd(7000))],
+      ['src/a.test.ts'],
+    ],
+    [
+      'src/run.ts',
+      [
+        file('src/a.test.ts', Buffer.concat([Buffer.from(imports), Buffer.from([0xff])])),
+        file('src/b.test.ts', `${imports}\0`),
+        file('src/c.test.ts', imports),
+      ],
+      ['src/c.test.ts'],
+    ],
+    ['src/run.test.ts', [file('src/run.test.ts', "import './run.test.ts';\n")], []],
+  ] as const)
+    assert.deepEqual(
+      localTests(target, files).map((test) => test.path),
+      expected,
+      `${target} ${files.map((test) => test.path)}`,
+    );
   const cases: Array<{
     name: string;
     change: (value: ReturnType<typeof fixture>) => void;
@@ -743,6 +784,7 @@ test('Local ownership needs the same prediction terminal after cancellation or c
     { cap: 4096, prompt: 4096, stop: 'eosFound' },
     { cap: undefined, prompt: 6145, stop: 'eosFound' },
     { cap: 4096, prompt: 4097, stop: 'eosFound' },
+    { cap: 4096, prompt: 4096, stop: 'eosFound', tested: 4097 },
     { cap: undefined, prompt: 3, stop: 'maxPredictedTokensReached' },
     { cap: 4096, prompt: 1070, stop: 'maxPredictedTokensReached' },
     { cap: 4096, prompt: 3, stop: 'eosFound', terminalCap: 2048 },
@@ -750,7 +792,9 @@ test('Local ownership needs the same prediction terminal after cancellation or c
   ] as const) {
     const label = JSON.stringify(row);
     const f = fixture();
-    f.model.tokenize = async () => Array.from({ length: row.prompt }, () => 1);
+    const first = row.tested ?? row.prompt;
+    f.model.tokenize = async () =>
+      Array.from({ length: f.renders === 1 ? first : row.prompt }, () => 1);
     const input = { ...plan, ...(row.cap === undefined ? {} : { maximumOutputTokens: row.cap }) };
     let markers = 0;
     const run = startLocalPrediction(input, {
@@ -766,7 +810,13 @@ test('Local ownership needs the same prediction terminal after cancellation or c
     const fits = row.prompt + cap <= 8192;
     assert.equal(f.submitted, fits ? 1 : 0, label);
     assert.equal(markers, fits ? 1 : 0, label);
+    assert.equal(f.renders, first + cap <= 8192 ? 1 : 2, label);
     if (fits) {
+      assert.equal(
+        f.prompt,
+        first + cap <= 8192 ? 'rendered chat' : 'rendered chat without tests',
+        label,
+      );
       assert.equal(f.options?.maxTokens, cap, label);
       assert.deepEqual(f.options?.structured, {
         type: 'json',

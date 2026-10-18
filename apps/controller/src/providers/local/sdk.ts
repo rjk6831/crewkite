@@ -636,18 +636,22 @@ export function startLocalPrediction(
       if (baseConfig.data.draftModel !== '')
         throw new ConfigurationFailure('base-draft', 'mismatch', 'base');
       stage = 'context';
-      const rendered = await model.applyPromptTemplate(localChat(plan));
-      guard();
-      if (!rendered.isWellFormed() || Buffer.byteLength(rendered) > MAX_STREAM_BYTES)
-        throw new Error();
-      const tokens = await model.tokenize(rendered);
-      guard();
-      if (
-        !tokens.length ||
-        tokens.some((token) => !Number.isSafeInteger(token) || token < 0) ||
-        tokens.length + outputTokens > CONTEXT_TOKENS
-      )
-        throw new Error();
+      // Tests are optional context. When they push the prompt past its budget, the task and file
+      // go without them, and the token proof covers the prompt that is actually sent.
+      let rendered = '';
+      let tokens: number[] = [];
+      for (const tests of plan.tests.length ? [plan.tests, []] : [plan.tests]) {
+        rendered = await model.applyPromptTemplate(localChat({ ...plan, tests }));
+        guard();
+        if (!rendered.isWellFormed() || Buffer.byteLength(rendered) > MAX_STREAM_BYTES)
+          throw new Error();
+        tokens = await model.tokenize(rendered);
+        guard();
+        if (!tokens.length || tokens.some((token) => !Number.isSafeInteger(token) || token < 0))
+          throw new Error();
+        if (tokens.length + outputTokens <= CONTEXT_TOKENS) break;
+      }
+      if (tokens.length + outputTokens > CONTEXT_TOKENS) throw new Error();
       promptTokens = tokens.length;
       sameModel(plan, await model.getModelInfo());
       guard();

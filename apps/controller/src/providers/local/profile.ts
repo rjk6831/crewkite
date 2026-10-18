@@ -284,7 +284,7 @@ export function localOutputTokens(plan: LocalStart) {
 }
 
 // Committed tests beside the target that import it define the contract a candidate must pass.
-// Two files and 12 KiB keep the prompt inside its token budget next to a whole-file answer.
+// The bounds keep the start plan small. A prompt that does not fit with them goes without them.
 export function localTests(target: string, files: readonly { path: string; content: Buffer }[]) {
   const directory = target.slice(0, target.lastIndexOf('/') + 1);
   const specifier = `./${target.slice(directory.length)}`;
@@ -294,6 +294,7 @@ export function localTests(target: string, files: readonly { path: string; conte
     if (tests.length === MAX_TESTS) break;
     const name = file.path.slice(directory.length);
     if (
+      file.path === target ||
       !file.path.startsWith(directory) ||
       name.includes('/') ||
       !/\.test\.[cm]?[jt]s$/.test(name) ||

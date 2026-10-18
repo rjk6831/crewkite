@@ -235,7 +235,7 @@ This setting does not establish that thinking is disabled or that a model will f
 
 When the original ends with a line ending and the returned content does not, CrewKite restores that ending. The retained proposal can therefore differ from the model's response by one line ending.
 
-The Local writer also reads, read-only, up to two committed test files in the target's directory that import the target, sorted by path and within 12 KiB. They count toward the prompt's token check, and the proposal still replaces only the target.
+The Local writer prompt also includes up to two committed `.test` files with a JavaScript or TypeScript extension from the target's directory, sorted by path and at most 12 KiB in total. A test is selected when its text contains the quoted `./<file name>` of the target. The tests are read-only context, and the proposal still replaces only the target. When the prompt with the tests does not fit the token check, the writer sends the task and file without them.
 
 A completed Local file candidate can enter the shared fixed-check workflow. The controller validates its immutable Local preparation, matching completed terminal and model/connection binding, submission receipt, applied replacement, unchanged source and proven closure. Unknown ownership, changed sibling files or a candidate that differs from the completed replacement refuse evaluation. The Local origin creates no cloud writer appointment.
 
