@@ -15,9 +15,13 @@ import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
 import {
   type AcpConnection,
+  type AcpDiagnostic,
+  AcpDiagnosticSchema,
   AcpError,
   type AcpProcessOptions,
   acpIdentifier,
+  acpMethod,
+  acpValidate,
   startAcpProcess,
 } from './client.ts';
 import {
@@ -206,8 +210,12 @@ function bufferSessionUpdates(connection: AcpConnection) {
   };
 }
 async function closeSession(connection: AcpConnection, proof: AcpSetupProof, sessionId: string) {
-  if (proof.capabilities.sessionClose)
-    z.object({}).parse(await connection.request('session/close', { sessionId }));
+  if (proof.capabilities.sessionClose) {
+    const result = await connection.request('session/close', { sessionId });
+    acpValidate({ site: 'session-close', method: 'session/close' }, () =>
+      z.object({}).parse(result),
+    );
+  }
 }
 export type AcpSetupOptions = Omit<AcpProcessOptions, 'timeoutMs'> & {
   operation: 'initialize' | 'authenticate' | 'discover';
@@ -656,25 +664,31 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
         if (promptStarted) connection.notify('session/cancel', { sessionId });
       }
       onStop(cancel);
-      function reject(id: string | number) {
+      function reject(id: string | number, diagnostic: AcpDiagnostic) {
+        connection.noteDiagnostic(diagnostic);
         refusal = 'permission';
         connection.respond(id, { outcome: { outcome: 'cancelled' } });
         cancel();
       }
       connection.onRequest = (id, method, params) => {
+        let diagnostic: AcpDiagnostic = { site: 'request-method', method: acpMethod(method) };
         try {
-          if (method !== 'session/request_permission' || !armed || cancelled) return reject(id);
+          if (method !== 'session/request_permission' || !armed || cancelled)
+            return reject(id, diagnostic);
+          diagnostic = { site: 'permission-request', method: 'session/request_permission' };
           const request = permission.parse(params);
+          diagnostic = { site: 'permission-options', method: 'session/request_permission' };
           if (
             request.sessionId !== sessionId ||
             seenTools.has(request.toolCall.toolCallId) ||
             pending.size > 0 ||
             new Set(request.options.map((v) => v.optionId)).size !== request.options.length
           )
-            return reject(id);
+            return reject(id, diagnostic);
           const choices = request.options.filter((v) => v.kind === 'allow_once');
-          if (choices.length !== 1) return reject(id);
+          if (choices.length !== 1) return reject(id, diagnostic);
           const tool = mergeTool(tools.get(request.toolCall.toolCallId), request.toolCall);
+          diagnostic = { site: 'permission-action', method: 'session/request_permission' };
           const detail = decodeAcpPermissionAction({
             tool,
             client: options.client,
@@ -683,7 +697,7 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
             toolMappings: options.toolMappings ?? GoogleAcpToolMappings,
             readTarget: options.readTarget,
           });
-          if (detail.baseHash !== expectedTargetHash) return reject(id);
+          if (detail.baseHash !== expectedTargetHash) return reject(id, diagnostic);
           const path = detail.path;
           const proposal: AcpPermissionProposal = {
             acpTarget: {
@@ -702,6 +716,7 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
           Object.freeze(proposal.detail);
           Object.freeze(proposal.acpTarget);
           Object.freeze(proposal);
+          diagnostic = { site: 'permission-binding', method: 'session/request_permission' };
           const binding = ApprovalBindingSchema.parse(options.onPermission(proposal));
           if (cancelled || !armed || settled) {
             connection.respond(id, { outcome: { outcome: 'cancelled' } });
@@ -714,12 +729,12 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
             binding.target !== path ||
             hashCanonical(binding.acpTarget) !== hashCanonical(proposal.acpTarget)
           )
-            return reject(id);
+            return reject(id, diagnostic);
           seenTools.add(tool.toolCallId);
           tools.set(tool.toolCallId, tool);
           pending.set(tool.toolCallId, { id, binding, proposal });
         } catch {
-          reject(id);
+          reject(id, diagnostic);
         }
       };
       reply = (binding, decision) => {
@@ -755,36 +770,55 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
         }
       };
       connection.onNotification = (method, params) => {
-        if (settled) throw new AcpError('protocol');
+        if (settled)
+          throw new AcpError('protocol', {
+            site: 'notification-after-terminal',
+            method: acpMethod(method),
+          });
         if (method !== 'session/update' || params.sessionId !== sessionId)
-          throw new AcpError('protocol');
-        const update = z.object({ sessionUpdate: z.string() }).passthrough().parse(params.update);
+          throw new AcpError('protocol', {
+            site: 'notification-session',
+            method: acpMethod(method),
+          });
+        const update = acpValidate({ site: 'notification-update', method: 'session/update' }, () =>
+          z.object({ sessionUpdate: z.string() }).passthrough().parse(params.update),
+        );
         const kind = update.sessionUpdate;
+        const sessionUpdate =
+          AcpDiagnosticSchema.shape.sessionUpdate.unwrap().safeParse(kind).data ?? 'other';
+        const diagnostic = (site: AcpDiagnostic['site']): AcpDiagnostic => ({
+          site,
+          method: 'session/update',
+          sessionUpdate,
+        });
         if (kind === 'config_option_update') {
-          config = decodeAcpConfiguration(update.configOptions);
+          config = acpValidate(diagnostic('configuration-update'), () =>
+            decodeAcpConfiguration(update.configOptions),
+          );
           if ((armed || finalAcknowledged) && !matchesSelection()) {
             cancel();
-            throw new AcpError('configuration');
+            throw new AcpError('configuration', diagnostic('configuration-update'));
           }
         }
         if (kind === 'current_mode_update' && update.currentModeId !== mode.valueId) {
           cancel();
-          throw new AcpError('configuration');
+          throw new AcpError('configuration', diagnostic('configuration-update'));
         }
         if (kind === 'tool_call' || kind === 'tool_call_update') {
-          const patch = toolUpdate.parse(update);
+          const patch = acpValidate(diagnostic('tool-update'), () => toolUpdate.parse(update));
           const previous = tools.get(patch.toolCallId);
-          if (kind === 'tool_call' && previous) throw new AcpError('protocol');
+          if (kind === 'tool_call' && previous)
+            throw new AcpError('protocol', diagnostic('tool-duplicate'));
           if (tools.size >= 128 && !previous) throw new AcpError('output-limit');
           const next = mergeTool(previous, patch);
           if (pending.has(next.toolCallId) && hashCanonical(previous) !== hashCanonical(next)) {
             cancel();
-            throw new AcpError('permission');
+            throw new AcpError('permission', diagnostic('permission-drift'));
           }
           tools.set(next.toolCallId, next);
         }
         const call = ['tool_call', 'tool_call_update'].includes(kind)
-          ? toolUpdate.parse(update)
+          ? acpValidate(diagnostic('tool-update'), () => toolUpdate.parse(update))
           : null;
         const supported = AcpActivitySchema.safeParse({
           sessionId,
@@ -803,9 +837,9 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
         if (supported.success) {
           let output = '';
           if (['agent_message_chunk', 'user_message_chunk'].includes(kind)) {
-            const content = z
-              .object({ type: z.string(), text: text(65536).optional() })
-              .parse(update.content);
+            const content = acpValidate(diagnostic('message-content'), () =>
+              z.object({ type: z.string(), text: text(65536).optional() }).parse(update.content),
+            );
             if (content.type === 'text') output = content.text ?? '';
           }
           options.onActivity(supported.data, output);
@@ -872,32 +906,45 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
       connection.assertActive();
       armed = true;
       promptStarted = true;
-      const terminal = z
-        .object({
-          stopReason: z.enum([
-            'end_turn',
-            'max_tokens',
-            'max_turn_requests',
-            'refusal',
-            'cancelled',
-          ]),
-        })
-        .parse(
-          await connection.request('session/prompt', {
-            sessionId,
-            prompt: [{ type: 'text', text: plan.prompt }],
-          }),
-        );
+      const response = await connection.request('session/prompt', {
+        sessionId,
+        prompt: [{ type: 'text', text: plan.prompt }],
+      });
+      const terminal = acpValidate({ site: 'prompt-result', method: 'session/prompt' }, () =>
+        z
+          .object({
+            stopReason: z.enum([
+              'end_turn',
+              'max_tokens',
+              'max_turn_requests',
+              'refusal',
+              'cancelled',
+            ]),
+          })
+          .parse(response),
+      );
       settled = true;
       armed = false;
       if (
         pending.size ||
         (!cancelled &&
-          [...tools.values()].some((v) => v.status === 'pending' || v.status === 'in_progress')) ||
+          [...tools.values()].some((v) => v.status === 'pending' || v.status === 'in_progress'))
+      )
+        throw new AcpError('protocol', {
+          site: 'incomplete-tool-terminal',
+          method: 'session/prompt',
+          pendingToolCount: new Set([
+            ...pending.keys(),
+            ...[...tools.values()]
+              .filter((v) => v.status === 'pending' || v.status === 'in_progress')
+              .map((v) => v.toolCallId),
+          ]).size,
+        });
+      if (
         (cancelled && terminal.stopReason !== 'cancelled') ||
         (!cancelled && terminal.stopReason === 'cancelled')
       )
-        throw new AcpError('protocol');
+        throw new AcpError('protocol', { site: 'prompt-terminal-state', method: 'session/prompt' });
       await closeSession(connection, proof, sessionId);
       return {
         sessionId,

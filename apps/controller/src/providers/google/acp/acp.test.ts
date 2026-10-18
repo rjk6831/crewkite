@@ -19,7 +19,13 @@ import { hashCanonical } from '@crewkite/contracts/hash';
 import type { AcpPeerCase } from '../../../../../../packages/testkit/src/providers/acp-peer.ts';
 import { spawnCheckChild } from '../../../host/check-ownership.ts';
 import { groupAbsent } from '../../../host/worker.ts';
-import { AcpConnection, AcpError, type AcpLifecycle, type AcpSpawn } from './client.ts';
+import {
+  AcpConnection,
+  AcpDiagnosticSchema,
+  AcpError,
+  type AcpLifecycle,
+  type AcpSpawn,
+} from './client.ts';
 import { type AcpImportDependencies, importGoogleAcp } from './import.ts';
 import {
   type AcpReviewMapping,
@@ -899,6 +905,9 @@ test('the acp protocol consumes one complete live permission and never treats co
         if (scenario === 'hunk-drift') assert.equal(permissions, 1, scenario);
         else if (scenario !== 'changed-action') assert.equal(permissions, 0, scenario);
       }
+      if (scenario === 'ambiguous') assert.equal(outcome.diagnostic?.site, 'permission-options');
+      if (scenario === 'hunk-control') assert.equal(outcome.diagnostic?.site, 'permission-action');
+      if (scenario === 'duplicate') assert.equal(outcome.diagnostic?.site, 'correlation');
       assert.equal(usages, 1, scenario);
       assert(!Object.hasOwn(outcome, 'observations'));
     } finally {
@@ -972,6 +981,57 @@ test('acp stop settles the original prompt and retains process ownership through
       f.dispose();
     }
   }
+  for (const [scenario, expected] of [
+    ['tool-update', { site: 'tool-update', method: 'session/update', sessionUpdate: 'tool_call' }],
+    ['prompt-result', { site: 'prompt-result', method: 'session/prompt' }],
+    [
+      'incomplete-tool-terminal',
+      { site: 'incomplete-tool-terminal', method: 'session/prompt', pendingToolCount: 1 },
+    ],
+    ['prompt-terminal-state', { site: 'prompt-terminal-state', method: 'session/prompt' }],
+  ] as const) {
+    const f = fixture('complete');
+    try {
+      const peer = readFileSync(f.client.executable, 'utf8');
+      const rewrite = `
+const diagnosticCase = ${JSON.stringify(scenario)};
+const emit = process.stdout.write.bind(process.stdout); let pending = '';
+process.stdout.write = function(chunk) {
+  pending += String(chunk);
+  for (;;) {
+    const at = pending.indexOf('\\n'); if (at < 0) break;
+    const line = pending.slice(0, at); pending = pending.slice(at + 1);
+    const value = JSON.parse(line);
+    if (value.result?.stopReason) {
+      if (diagnosticCase === 'tool-update' || diagnosticCase === 'incomplete-tool-terminal') emit(JSON.stringify({jsonrpc:'2.0',method:'session/update',params:{sessionId:'fixture-session',update:{sessionUpdate:'tool_call',toolCallId:'fixture-diagnostic',status:diagnosticCase === 'tool-update' ? 'private-bad-status' : 'in_progress'}}})+'\\n');
+      if (diagnosticCase === 'prompt-result') value.result.stopReason = 'private-bad-terminal';
+      if (diagnosticCase === 'prompt-terminal-state') value.result.stopReason = 'cancelled';
+    }
+    emit(JSON.stringify(value)+'\\n');
+  }
+  return true;
+};
+`;
+      chmodSync(f.client.executable, 0o700);
+      writeFileSync(
+        f.client.executable,
+        peer.replace('runAcpPeer("complete");', `${rewrite}runAcpPeer("complete");`),
+      );
+      chmodSync(f.client.executable, 0o500);
+      f.client.sha256 = hash(readFileSync(f.client.executable));
+      f.proof.client.sha256 = f.client.sha256;
+      f.mapping.client.sha256 = f.client.sha256;
+      f.toolMapping.client.sha256 = f.client.sha256;
+      const outcome = await writer(f).result;
+      assert.equal(outcome.reason, 'protocol', scenario);
+      assert.deepEqual(outcome.diagnostic, expected, scenario);
+      assert.equal(outcome.metadata, null);
+      assert(outcome.quiescent);
+      assert(!JSON.stringify(outcome).includes('private-'));
+    } finally {
+      f.dispose();
+    }
+  }
   for (const cleanup of ['owned-term', 'unexpected-term', 'hard-kill', 'nonzero'] as const) {
     const f = fixture('complete');
     try {
@@ -1006,6 +1066,9 @@ setInterval(() => {}, 1000);
       assert(outcome.metadata, cleanup);
       assert(outcome.quiescent, cleanup);
       assert.equal(outcome.reason, cleanup === 'owned-term' ? null : 'protocol', cleanup);
+      assert.deepEqual(outcome.diagnostic, cleanup === 'owned-term' ? null : { site: 'exit' });
+      assert(outcome.stdoutBytes > 0);
+      assert.equal(outcome.stderrBytes, 0);
       assert.equal(
         outcome.signal,
         cleanup === 'hard-kill' ? 'SIGKILL' : cleanup === 'nonzero' ? null : 'SIGTERM',
@@ -1055,6 +1118,70 @@ setInterval(() => {}, 1000);
   } finally {
     timed.dispose();
   }
+  for (const [name, bytes, expected] of [
+    ['utf8', Buffer.from([255, 10]), { site: 'utf8' }],
+    ['json', Buffer.from('private-not-json\n'), { site: 'json' }],
+    [
+      'envelope',
+      Buffer.from('{"jsonrpc":"private-version","id":1,"result":{}}\n'),
+      { site: 'envelope' },
+    ],
+    [
+      'correlation',
+      Buffer.from('{"jsonrpc":"2.0","id":99,"result":{}}\n'),
+      { site: 'correlation' },
+    ],
+    [
+      'rpc',
+      Buffer.from(
+        '{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"private-provider-message","data":"private-provider-data"}}\n',
+      ),
+      { site: 'rpc-error', method: 'session/prompt', rpcCode: -32603 },
+    ],
+    [
+      'result',
+      Buffer.from('{"jsonrpc":"2.0","id":1,"result":"private-provider-result"}\n'),
+      { site: 'rpc-result', method: 'session/prompt' },
+    ],
+    ['eof', Buffer.alloc(0), { site: 'eof-pending' }],
+  ] as const) {
+    const stream = new (await import('node:stream')).PassThrough();
+    const connection = new AcpConnection(stream, () => {});
+    const pending = connection.request(
+      'session/prompt',
+      {},
+      name === 'result'
+        ? () => {
+            throw Error('private-validator-details');
+          }
+        : undefined,
+    );
+    if (name === 'eof') connection.end();
+    else connection.push(bytes);
+    await assert.rejects(
+      pending,
+      (error: unknown) =>
+        error instanceof AcpError && JSON.stringify(error.diagnostic) === JSON.stringify(expected),
+    );
+    assert.deepEqual(connection.diagnostic, expected, name);
+    connection.fail(new AcpError('protocol', { site: 'stdout-stream' }));
+    assert.deepEqual(
+      connection.diagnostic,
+      expected,
+      'The first failure survives later cleanup errors.',
+    );
+    assert(!JSON.stringify(connection.diagnostic).includes('private-'));
+    stream.destroy();
+  }
+  assert.equal(AcpDiagnosticSchema.safeParse({ site: 'json', message: 'private' }).success, false);
+  assert.equal(
+    AcpDiagnosticSchema.safeParse({ site: 'json', method: 'private-method' }).success,
+    false,
+  );
+  assert.equal(
+    AcpDiagnosticSchema.safeParse({ site: 'tool-update', sessionUpdate: 'private-update' }).success,
+    false,
+  );
   const output = new (await import('node:stream')).PassThrough();
   let reason = '';
   const connection = new AcpConnection(output, (error) => {

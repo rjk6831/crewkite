@@ -8043,6 +8043,20 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       await controller.close();
       continue;
     }
+    const completionArtifact = controller.store.receipt(`native-completion:${intent.attempt_id}`)
+      ?.result.entity as Artifact;
+    const completion = JSON.parse(
+      new ArtifactFiles(join(controller.home, 'artifacts'))
+        .read(completionArtifact.hash)
+        .toString(),
+    );
+    assert.equal(completion.reason, null);
+    assert.equal(completion.quiescent, true);
+    assert.equal(completion.diagnostic, null);
+    assert.equal(completion.exitCode, 0);
+    assert.equal(completion.signal, null);
+    assert(completion.stdoutBytes > 0);
+    assert.equal(completion.stderrBytes, 0);
     assert(controller.store.receipt(`native-acp-capture:${intent.attempt_id}`));
     assert.equal(controller.snapshot().tasks[0].state, 'stopped');
     assert.equal(readFileSync(join(source.directory, 'net.mjs'), 'utf8'), original);

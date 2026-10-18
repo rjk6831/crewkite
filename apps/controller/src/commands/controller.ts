@@ -12460,7 +12460,11 @@ export class Controller {
             attemptId: attempt.id,
             reason: outcome ? outcome.reason : 'launch',
             quiescent: physical,
-            diagnostic: null,
+            diagnostic: outcome?.diagnostic ?? null,
+            exitCode: outcome?.exitCode ?? null,
+            signal: outcome?.signal ?? null,
+            stdoutBytes: outcome?.stdoutBytes ?? 0,
+            stderrBytes: outcome?.stderrBytes ?? 0,
             ...(unspawned ? { unspawned: true } : {}),
           });
           this.store.saveReceipt(`native-completion:${attempt.id}`, done.hash, 'local-owner', {

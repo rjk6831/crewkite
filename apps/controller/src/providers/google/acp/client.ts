@@ -22,11 +22,101 @@ export type AcpReason =
   | 'stopped'
   | 'deadline'
   | 'ownership';
+export const AcpDiagnosticSchema = z.strictObject({
+  site: z.enum([
+    'utf8',
+    'json',
+    'json-bound',
+    'envelope',
+    'correlation',
+    'rpc-error',
+    'rpc-result',
+    'notification',
+    'request',
+    'write',
+    'eof-pending',
+    'stdout-stream',
+    'stderr-stream',
+    'stdin-stream',
+    'launch',
+    'work',
+    'exit',
+    'stop',
+    'deadline',
+    'ownership',
+    'notification-after-terminal',
+    'notification-session',
+    'notification-update',
+    'configuration-update',
+    'tool-update',
+    'tool-duplicate',
+    'permission-drift',
+    'message-content',
+    'request-method',
+    'permission-request',
+    'permission-options',
+    'permission-action',
+    'permission-binding',
+    'prompt-result',
+    'prompt-terminal-state',
+    'incomplete-tool-terminal',
+    'session-close',
+  ]),
+  method: z
+    .enum([
+      'initialize',
+      'authenticate',
+      'session/new',
+      'session/set_config_option',
+      'session/prompt',
+      'session/cancel',
+      'session/close',
+      'session/update',
+      'session/request_permission',
+      'other',
+    ])
+    .optional(),
+  sessionUpdate: z
+    .enum([
+      'tool_call',
+      'tool_call_update',
+      'agent_message_chunk',
+      'user_message_chunk',
+      'agent_thought_chunk',
+      'config_option_update',
+      'current_mode_update',
+      'usage_update',
+      'available_commands_update',
+      'other',
+    ])
+    .optional(),
+  rpcCode: z.number().int().safe().optional(),
+  pendingToolCount: z.number().int().min(0).max(256).optional(),
+});
+export type AcpDiagnostic = z.infer<typeof AcpDiagnosticSchema>;
+export function acpMethod(method: string): NonNullable<AcpDiagnostic['method']> {
+  return AcpDiagnosticSchema.shape.method.unwrap().safeParse(method).data ?? 'other';
+}
+export function acpErrorAt(error: unknown, diagnostic: AcpDiagnostic): AcpError {
+  return new AcpError(
+    error instanceof AcpError ? error.reason : 'protocol',
+    error instanceof AcpError && error.diagnostic ? error.diagnostic : diagnostic,
+  );
+}
+export function acpValidate<T>(diagnostic: AcpDiagnostic, work: () => T): T {
+  try {
+    return work();
+  } catch (error) {
+    throw acpErrorAt(error, diagnostic);
+  }
+}
 export class AcpError extends Error {
   readonly reason: AcpReason;
-  constructor(reason: AcpReason) {
+  readonly diagnostic: AcpDiagnostic | null;
+  constructor(reason: AcpReason, diagnostic: AcpDiagnostic | null = null) {
     super(`Google ACP refused: ${reason}.`);
     this.reason = reason;
+    this.diagnostic = diagnostic ? AcpDiagnosticSchema.parse(diagnostic) : null;
   }
 }
 export const acpIdentifier = z
@@ -64,6 +154,7 @@ export type AcpProcessOutcome<T> = {
   signal: NodeJS.Signals | null;
   stdoutBytes: number;
   stderrBytes: number;
+  diagnostic: AcpDiagnostic | null;
 };
 export type AcpSpawn = (
   executable: string,
@@ -112,6 +203,7 @@ export class AcpConnection {
       resolve(value: unknown): void;
       reject(error: unknown): void;
       accept?: (value: unknown) => void;
+      method: NonNullable<AcpDiagnostic['method']>;
     }
   >();
   private seen = new Set<RpcId>();
@@ -121,6 +213,14 @@ export class AcpConnection {
   private received = 0;
   private frames = 0;
   private failure: AcpError | null = null;
+  private firstDiagnostic: AcpDiagnostic | null = null;
+  get diagnostic() {
+    return this.firstDiagnostic;
+  }
+  noteDiagnostic(diagnostic: AcpDiagnostic | null) {
+    if (diagnostic && !this.firstDiagnostic)
+      this.firstDiagnostic = AcpDiagnosticSchema.parse(diagnostic);
+  }
   onNotification: (method: string, params: Record<string, unknown>) => void = () => {
     throw new AcpError('protocol');
   };
@@ -147,7 +247,7 @@ export class AcpConnection {
   }
   private write(value: unknown) {
     if (this.failure || this.output.destroyed || !this.output.writable)
-      throw this.failure ?? new AcpError('protocol');
+      throw this.failure ?? new AcpError('protocol', { site: 'write' });
     const line = `${JSON.stringify(value)}\n`;
     this.sent += Buffer.byteLength(line);
     if (Buffer.byteLength(line) > 1048576 || this.sent > 4194304)
@@ -159,7 +259,7 @@ export class AcpConnection {
       return Promise.reject(new AcpError('output-limit'));
     const id = ++this.nextId;
     const result = Promise.withResolvers<unknown>();
-    this.requests.set(id, { ...result, accept });
+    this.requests.set(id, { ...result, accept, method: acpMethod(method) });
     try {
       this.write({ jsonrpc: '2.0', id, method, params });
     } catch (error) {
@@ -172,44 +272,56 @@ export class AcpConnection {
     this.write({ jsonrpc: '2.0', method, params });
   }
   respond(id: RpcId, result: object) {
-    if (!this.incoming.delete(id)) throw new AcpError('protocol');
+    if (!this.incoming.delete(id)) throw new AcpError('protocol', { site: 'correlation' });
     this.write({ jsonrpc: '2.0', id, result });
   }
   fail(error: AcpError) {
     if (this.failure) return;
     this.failure = error;
+    this.noteDiagnostic(error.diagnostic);
     for (const pending of this.requests.values()) pending.reject(error);
     this.requests.clear();
     this.failOwner(error);
   }
   end() {
     if (this.pending.length || this.requests.size || this.incoming.size)
-      this.fail(new AcpError('protocol'));
+      this.fail(new AcpError('protocol', { site: 'eof-pending' }));
   }
   push(chunk: Uint8Array) {
     if (this.failure) return;
+    let diagnostic: AcpDiagnostic = { site: 'json-bound' };
     try {
       this.received += chunk.byteLength;
       if (this.received > 4194304) throw new AcpError('output-limit');
       this.pending = Buffer.concat([this.pending, chunk]);
       for (;;) {
+        diagnostic = { site: 'json-bound' };
         const end = this.pending.indexOf(10);
         if (end < 0) break;
         if (end > 1048576 || ++this.frames > 4096) throw new AcpError('output-limit');
         const bytes = this.pending.subarray(0, end);
         this.pending = this.pending.subarray(end + 1);
-        const raw: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+        diagnostic = { site: 'utf8' };
+        const line = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+        diagnostic = { site: 'json' };
+        const raw: unknown = JSON.parse(line);
+        diagnostic = { site: 'json-bound' };
         boundedJson(raw);
+        diagnostic = { site: 'envelope' };
         const value = envelope.parse(raw);
+        diagnostic = { site: 'correlation' };
         const hasResult = Object.hasOwn(raw as object, 'result');
         if (value.method !== undefined) {
           if (hasResult || value.error) throw new AcpError('protocol');
-          if (value.id === undefined) this.onNotification(value.method, value.params ?? {});
-          else {
+          if (value.id === undefined) {
+            diagnostic = { site: 'notification', method: acpMethod(value.method) };
+            this.onNotification(value.method, value.params ?? {});
+          } else {
             if (this.seen.has(value.id) || this.seen.size >= 128 || this.incoming.size >= 16)
               throw new AcpError('protocol');
             this.seen.add(value.id);
             this.incoming.add(value.id);
+            diagnostic = { site: 'request', method: acpMethod(value.method) };
             this.onRequest(value.id, value.method, value.params ?? {});
           }
         } else {
@@ -218,24 +330,33 @@ export class AcpConnection {
           const pending = this.requests.get(value.id);
           if (!pending) throw new AcpError('protocol');
           this.requests.delete(value.id);
-          if (value.error)
-            pending.reject(
-              new AcpError(value.error.code === -32000 ? 'authentication' : 'protocol'),
+          if (value.error) {
+            const error = new AcpError(
+              value.error.code === -32000 ? 'authentication' : 'protocol',
+              {
+                site: 'rpc-error',
+                method: pending.method,
+                ...(Number.isSafeInteger(value.error.code) ? { rpcCode: value.error.code } : {}),
+              },
             );
-          else {
+            this.noteDiagnostic(error.diagnostic);
+            pending.reject(error);
+          } else {
+            diagnostic = { site: 'rpc-result', method: pending.method };
             try {
               pending.accept?.(value.result);
               pending.resolve(value.result);
             } catch (error) {
-              pending.reject(error);
-              throw error;
+              const failure = acpErrorAt(error, diagnostic);
+              pending.reject(failure);
+              throw failure;
             }
           }
         }
       }
       if (this.pending.length > 1048576) throw new AcpError('output-limit');
     } catch (error) {
-      this.fail(error instanceof AcpError ? error : new AcpError('protocol'));
+      this.fail(acpErrorAt(error, diagnostic));
     }
   }
 }
@@ -329,6 +450,7 @@ export function startAcpProcess<T>(
   const connection = new AcpConnection(
     child.stdin,
     (error) => {
+      connection.noteDiagnostic(error.diagnostic);
       reason ??= error.reason;
       failed.reject(error);
       shutdown();
@@ -340,14 +462,21 @@ export function startAcpProcess<T>(
   );
   child.stdout.on('data', (bytes: Buffer) => connection.push(bytes));
   child.stdout.once('end', () => connection.end());
-  child.stdout.on('error', () => connection.fail(new AcpError('protocol')));
-  child.stderr.on('error', () => connection.fail(new AcpError('protocol')));
+  child.stdout.on('error', () =>
+    connection.fail(new AcpError('protocol', { site: 'stdout-stream' })),
+  );
+  child.stderr.on('error', () =>
+    connection.fail(new AcpError('protocol', { site: 'stderr-stream' })),
+  );
   child.stderr.on('data', (bytes: Buffer) => {
     stderrBytes += bytes.length;
     if (stderrBytes > 16384) connection.fail(new AcpError('output-limit'));
   });
-  child.stdin.on('error', () => connection.fail(new AcpError('protocol')));
+  child.stdin.on('error', () =>
+    connection.fail(new AcpError('protocol', { site: 'stdin-stream' })),
+  );
   child.once('error', () => {
+    connection.noteDiagnostic({ site: 'launch' });
     reason ??= 'launch';
     failed.reject(new AcpError('launch'));
   });
@@ -359,6 +488,7 @@ export function startAcpProcess<T>(
   function stop(cause: 'stopped' | 'deadline' = 'stopped') {
     if (finished || stopping) return;
     stopping = true;
+    connection.noteDiagnostic({ site: cause === 'deadline' ? 'deadline' : 'stop' });
     reason ??= cause;
     try {
       if (stopper) stopper();
@@ -394,6 +524,7 @@ export function startAcpProcess<T>(
       ]);
       completed = true;
     } catch (error) {
+      connection.noteDiagnostic(acpErrorAt(error, { site: 'work' }).diagnostic);
       reason ??= error instanceof AcpError ? error.reason : 'protocol';
     }
     {
@@ -407,9 +538,13 @@ export function startAcpProcess<T>(
         try {
           sync(() => options.lifecycle.quiescent(group));
         } catch {
+          connection.noteDiagnostic({ site: 'ownership' });
           reason = 'ownership';
         }
-      } else reason = 'ownership';
+      } else {
+        connection.noteDiagnostic({ site: 'ownership' });
+        reason = 'ownership';
+      }
       finished = true;
       for (const cancel of timers) cancel();
       if (!closedInTime) kill('SIGKILL');
@@ -417,8 +552,14 @@ export function startAcpProcess<T>(
       const expectedExit =
         (code === 0 && signal === null) ||
         (completed && cleanupTerminated && code === null && signal === 'SIGTERM');
-      if (quiescent && reason === null && !expectedExit) reason = 'protocol';
-      if (reason === null && now() - started >= options.timeoutMs) reason = 'deadline';
+      if (quiescent && reason === null && !expectedExit) {
+        connection.noteDiagnostic({ site: 'exit' });
+        reason = 'protocol';
+      }
+      if (reason === null && now() - started >= options.timeoutMs) {
+        connection.noteDiagnostic({ site: 'deadline' });
+        reason = 'deadline';
+      }
       return {
         metadata,
         reason,
@@ -427,6 +568,7 @@ export function startAcpProcess<T>(
         signal,
         stdoutBytes: connection.stdoutBytes,
         stderrBytes,
+        diagnostic: connection.diagnostic,
       };
     }
   })();
