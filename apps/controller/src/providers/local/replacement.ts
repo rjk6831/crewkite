@@ -13,6 +13,7 @@ import {
   type LocalStart,
   type LocalTerminal,
   localDiscoveryPlan,
+  localOutputTokens,
   localPlan,
   MAX_STREAM_BYTES,
   TerminalSchema,
@@ -298,6 +299,9 @@ function startLocalClient(
           const value = message.terminal;
           if (
             !same(value.binding, plan.binding) ||
+            ('proof' in value &&
+              value.proof !== null &&
+              value.proof.maxTokens !== localOutputTokens(operation.plan)) ||
             (submitted && value.kind === 'failed' && value.proof === null) ||
             (!submitted && value.kind !== 'failed')
           )

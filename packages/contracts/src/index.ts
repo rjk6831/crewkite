@@ -390,7 +390,7 @@ export const LocalNativeProfileSchema = z
     modelBinding: LocalModelBindingSchema.nullable(),
     billing: z.literal('local'),
     contextLength: z.literal(8192),
-    maximumOutputTokens: z.literal(2048),
+    maximumOutputTokens: z.union([z.literal(2048), z.literal(4096)]),
     qualifiedAt: z.iso.date().nullable(),
     maximumTaskMs: z.literal(300000),
     maximumFileBytes: z.literal(65536),

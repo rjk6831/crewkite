@@ -78,6 +78,7 @@ import {
   LocalEndpointSchema,
   LocalModelObservationSchema,
   LocalModelSelectionSchema,
+  LocalNativeProfileSchema,
   LocalObservedModelBindingSchema,
   type LocalSetup,
   LocalSetupSchema,
@@ -709,7 +710,7 @@ const LocalPreparedSchema = z.strictObject({
   kind: z.literal('local-file'),
   run: RunSchema,
   attempt: AttemptSchema,
-  profile: NativeProfileSchema,
+  profile: LocalNativeProfileSchema,
   endpoint: LocalEndpointSchema,
   localModel: LocalObservedModelBindingSchema,
   target: z.strictObject({ path: z.string().min(1).max(4096), baseHash: HashSchema }),
@@ -8019,6 +8020,7 @@ export class Controller {
       ...credentials,
       original,
       task: JSON.stringify(plan.context),
+      maximumOutputTokens: plan.profile.maximumOutputTokens,
       timeoutMs,
     });
   }
@@ -8156,7 +8158,12 @@ export class Controller {
       try {
         const phases = this.store.nativeProcesses(plan.attempt.id);
         const terminal = outcome ? LocalTerminalSchema.parse(outcome.terminal) : null;
-        const bound = terminal && hashCanonical(terminal.binding) === hashCanonical(binding);
+        const bound =
+          terminal &&
+          hashCanonical(terminal.binding) === hashCanonical(binding) &&
+          (!('proof' in terminal) ||
+            terminal.proof === null ||
+            terminal.proof.maxTokens === plan.profile.maximumOutputTokens);
         const configurationFailed =
           bound && terminal && 'reason' in terminal && terminal.reason === 'configuration';
         const clientQuiescent =
@@ -9297,6 +9304,7 @@ export class Controller {
       proof.terminal.kind !== 'completed' ||
       !same(proof.terminal.binding, binding) ||
       proof.terminal.proof.stopReason !== 'eosFound' ||
+      proof.terminal.proof.maxTokens !== plan.profile.maximumOutputTokens ||
       proof.terminal.proposal.attemptId !== plan.attempt.id ||
       proof.terminal.proposal.path !== plan.target.path ||
       proof.terminal.proposal.baseHash !== plan.target.baseHash ||
@@ -14436,6 +14444,8 @@ export class Controller {
           terminal.kind === 'unknown' ||
           hashCanonical(terminal.binding) !== hashCanonical(expected) ||
           (terminal.kind === 'failed' && terminal.proof === null && submitted) ||
+          (terminal.proof !== null &&
+            terminal.proof.maxTokens !== plan.profile.maximumOutputTokens) ||
           !this.store.nativePhasesComplete(attempt.id, 'local') ||
           phases.some((phase) => phase.state !== 'quiescent')
         )

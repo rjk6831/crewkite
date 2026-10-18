@@ -22,9 +22,9 @@ import {
   type LocalTerminal,
   localChat,
   localDiscoveryPlan,
+  localOutputTokens,
   localPlan,
   MAX_STREAM_BYTES,
-  OUTPUT_TOKENS,
   ProofSchema,
   ProposalSchema,
 } from './profile.ts';
@@ -462,6 +462,7 @@ export function startLocalPrediction(
   } = {},
 ) {
   const plan = localPlan(value);
+  const outputTokens = localOutputTokens(plan);
   const now = options.now ?? (() => performance.now());
   const began = now();
   if (!Number.isFinite(began)) throw new Error('The Local clock is invalid.');
@@ -595,7 +596,7 @@ export function startLocalPrediction(
       if (
         !tokens.length ||
         tokens.some((token) => !Number.isSafeInteger(token) || token < 0) ||
-        tokens.length + OUTPUT_TOKENS > CONTEXT_TOKENS
+        tokens.length + outputTokens > CONTEXT_TOKENS
       )
         throw new Error();
       promptTokens = tokens.length;
@@ -624,7 +625,7 @@ export function startLocalPrediction(
       submitted = true;
       stage = 'transport';
       prediction = model.complete(rendered, {
-        maxTokens: OUTPUT_TOKENS,
+        maxTokens: outputTokens,
         contextOverflowPolicy: 'stopAtLimit',
         draftModel: '',
         stopStrings: [],
@@ -738,7 +739,7 @@ export function startLocalPrediction(
         'llm.prediction.maxPredictedTokens',
         'max-tokens',
         z.object({ checked: z.boolean(), value: z.number().int().positive().safe() }),
-        (value) => value.checked && value.value === OUTPUT_TOKENS,
+        (value) => value.checked && value.value === outputTokens,
       );
       stage = 'protocol';
       if (
@@ -756,28 +757,35 @@ export function startLocalPrediction(
         renderedPromptTokens: promptTokens,
         outputBytes,
         contextLength: CONTEXT_TOKENS,
-        maxTokens: OUTPUT_TOKENS,
+        maxTokens: outputTokens,
         contextOverflowPolicy: 'stopAtLimit',
         draftModel: '',
       });
       if (
         (proof.promptTokens !== null && proof.promptTokens !== promptTokens) ||
-        (proof.predictedTokens !== null && proof.predictedTokens > OUTPUT_TOKENS)
+        (proof.predictedTokens !== null && proof.predictedTokens > outputTokens)
       )
         throw new Error();
       if (proof.stopReason === 'userStopped' && stopping && refusal === 'stopped')
         return finish({ kind: 'stopped', binding: plan.binding, proof });
       if (refusal && refusal !== 'stopped')
         return finish({ kind: 'failed', binding: plan.binding, reason: refusal, proof });
+      if (proof.stopReason === 'maxPredictedTokensReached')
+        return finish({ kind: 'failed', binding: plan.binding, reason: 'limit', proof });
       if (proof.stopReason !== 'eosFound')
         return finish({ kind: 'failed', binding: plan.binding, reason: 'protocol', proof });
-      const proposal = ProposalSchema.parse(JSON.parse(terminal.nonReasoningContent));
-      if (
-        proposal.attemptId !== plan.binding.attemptId ||
-        proposal.path !== plan.binding.path ||
-        proposal.baseHash !== plan.binding.baseHash
-      )
-        throw new Error();
+      let proposal: z.output<typeof ProposalSchema>;
+      try {
+        proposal = ProposalSchema.parse(JSON.parse(terminal.nonReasoningContent));
+        if (
+          proposal.attemptId !== plan.binding.attemptId ||
+          proposal.path !== plan.binding.path ||
+          proposal.baseHash !== plan.binding.baseHash
+        )
+          throw new Error();
+      } catch {
+        return finish({ kind: 'failed', binding: plan.binding, reason: 'protocol', proof });
+      }
       finish({ kind: 'completed', binding: plan.binding, proof, proposal });
     } catch (error) {
       fail(stage, error instanceof ConfigurationFailure ? error.detail : undefined);

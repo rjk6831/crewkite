@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { test } from 'node:test';
+import { canonicalJson } from '@crewkite/contracts';
 import type { LLMPredictionOpts, PredictionResult } from '@lmstudio/sdk';
 import { localConfiguredConnectionHash, resolveLocalConnection } from './connection.ts';
 import {
@@ -69,7 +70,10 @@ const info = {
 const kv = (values: Record<string, unknown>) => ({
   fields: Object.entries(values).map(([key, value]) => ({ key, value })),
 });
-function terminal(stopReason: 'eosFound' | 'userStopped' = 'eosFound') {
+function terminal(
+  stopReason: PredictionResult['stats']['stopReason'] = 'eosFound',
+  maximumOutputTokens = 2048,
+) {
   const content = JSON.stringify({
     version: 1,
     attemptId: plan.binding.attemptId,
@@ -86,7 +90,7 @@ function terminal(stopReason: 'eosFound' | 'userStopped' = 'eosFound') {
     roundIndex: 0,
     loadConfig: kv({ 'llm.load.contextLength': 8192 }),
     predictionConfig: kv({
-      'llm.prediction.maxPredictedTokens': { checked: true, value: 2048 },
+      'llm.prediction.maxPredictedTokens': { checked: true, value: maximumOutputTokens },
       'llm.prediction.contextOverflowPolicy': 'stopAtLimit',
       'llm.prediction.speculativeDecoding.draftModel': '',
     }),
@@ -189,6 +193,13 @@ test('Local generation binds its loopback authentication mode and loaded instanc
   for (const token of ['', ' ', '\0']) assert.throws(() => localPlan({ ...plan, token }));
   assert.deepEqual(localPlan({ ...plan, authMode: 'token' }), { ...plan, authMode: 'token' });
   assert.deepEqual(localPlan(plan), plan);
+  assert.equal(canonicalJson(localPlan(plan)), canonicalJson(plan));
+  for (const maximumOutputTokens of [2048, 4096] as const) {
+    const explicit: LocalStart = { ...plan, maximumOutputTokens };
+    assert.deepEqual(localPlan(explicit), explicit);
+  }
+  for (const maximumOutputTokens of [0, 2049, 8192, false])
+    assert.throws(() => localPlan({ ...plan, maximumOutputTokens }));
   assert.equal(localClientOptions(plan).apiToken, plan.token);
   assert.throws(() => localPlan({ ...plan, authMode: 'none' }));
   const { token: _legacyToken, ...legacyWithoutToken } = plan;
@@ -509,6 +520,137 @@ test('Local generation binds its loopback authentication mode and loaded instanc
 });
 
 test('Local ownership needs the same prediction terminal after cancellation or client loss', async () => {
+  for (const row of [
+    { cap: undefined, prompt: 6144, stop: 'eosFound' },
+    { cap: 2048, prompt: 3, stop: 'eosFound' },
+    { cap: 4096, prompt: 4096, stop: 'eosFound' },
+    { cap: undefined, prompt: 6145, stop: 'eosFound' },
+    { cap: 4096, prompt: 4097, stop: 'eosFound' },
+    { cap: undefined, prompt: 3, stop: 'maxPredictedTokensReached' },
+    { cap: 4096, prompt: 1070, stop: 'maxPredictedTokensReached' },
+    { cap: 4096, prompt: 3, stop: 'eosFound', terminalCap: 2048 },
+    { cap: undefined, prompt: 3, stop: 'eosFound', terminalCap: 4096 },
+  ] as const) {
+    const label = JSON.stringify(row);
+    const f = fixture();
+    f.model.tokenize = async () => Array.from({ length: row.prompt }, () => 1);
+    const input = { ...plan, ...(row.cap === undefined ? {} : { maximumOutputTokens: row.cap }) };
+    let markers = 0;
+    const run = startLocalPrediction(input, {
+      createClient: () => f.client,
+      schedule: f.schedule,
+      now: () => 0,
+      onSubmitted: () => {
+        markers++;
+      },
+    });
+    await flush();
+    const cap = row.cap ?? 2048;
+    const fits = row.prompt + cap <= 8192;
+    assert.equal(f.submitted, fits ? 1 : 0, label);
+    assert.equal(markers, fits ? 1 : 0, label);
+    if (fits) {
+      assert.equal(f.options?.maxTokens, cap, label);
+      const value = terminal(row.stop, 'terminalCap' in row ? row.terminalCap : cap);
+      if (row.stop === 'maxPredictedTokensReached') {
+        value.nonReasoningContent = '{"version":';
+        value.stats = {
+          ...value.stats,
+          ...{ promptTokensCount: row.prompt, predictedTokensCount: cap },
+        };
+      }
+      f.resolve(value);
+    }
+    const outcome = await run.result;
+    if (!fits) {
+      assert(
+        outcome.kind === 'failed' && outcome.reason === 'context' && outcome.proof === null,
+        label,
+      );
+    } else if ('terminalCap' in row) {
+      assert(outcome.kind === 'unknown' && outcome.reason === 'configuration', label);
+      assert.equal(outcome.detail?.check, 'max-tokens', label);
+    } else {
+      assert(outcome.kind === (row.stop === 'eosFound' ? 'completed' : 'failed'), label);
+      assert('proof' in outcome && outcome.proof !== null, label);
+      assert.equal(outcome.proof.maxTokens, cap, label);
+      assert.equal(outcome.proof.renderedPromptTokens, row.prompt, label);
+      assert.deepEqual(TerminalSchema.parse(outcome), outcome);
+      assert.equal(
+        TerminalSchema.safeParse({
+          ...outcome,
+          proof: { ...outcome.proof, renderedPromptTokens: 8193 - cap },
+        }).success,
+        false,
+      );
+      if (outcome.kind === 'failed') assert.equal(outcome.reason, 'limit', label);
+    }
+  }
+  for (const maximumOutputTokens of [2048, 4096] as const) {
+    for (const row of [
+      'invalid JSON',
+      'fenced JSON',
+      'unknown field',
+      'wrong attempt',
+      'wrong path',
+      'wrong base',
+      'malformed content',
+      'invalid token count',
+      'excess tokens',
+      'prompt mismatch',
+    ]) {
+      const f = fixture();
+      const run = startLocalPrediction(
+        { ...plan, maximumOutputTokens },
+        {
+          createClient: () => f.client,
+          schedule: f.schedule,
+          now: () => 0,
+        },
+      );
+      await flush();
+      const value = terminal('eosFound', maximumOutputTokens);
+      const proposal = JSON.parse(value.nonReasoningContent);
+      if (row === 'invalid JSON') value.nonReasoningContent = '{"version":';
+      if (row === 'fenced JSON')
+        value.nonReasoningContent = `\x60\x60\x60json\n${value.nonReasoningContent}\n\x60\x60\x60`;
+      if (row === 'unknown field')
+        value.nonReasoningContent = JSON.stringify({ ...proposal, extra: true });
+      if (row === 'wrong attempt')
+        value.nonReasoningContent = JSON.stringify({
+          ...proposal,
+          attemptId: 'att_01J00000000000000000000002',
+        });
+      if (row === 'wrong path')
+        value.nonReasoningContent = JSON.stringify({ ...proposal, path: 'other.mjs' });
+      if (row === 'wrong base')
+        value.nonReasoningContent = JSON.stringify({ ...proposal, baseHash: hash('other') });
+      if (row === 'malformed content') value.nonReasoningContent = '\ud800';
+      if (row === 'invalid token count')
+        value.stats = { ...value.stats, ...{ predictedTokensCount: 1.5 } };
+      if (row === 'excess tokens')
+        value.stats = { ...value.stats, ...{ predictedTokensCount: maximumOutputTokens + 1 } };
+      if (row === 'prompt mismatch') value.stats = { ...value.stats, ...{ promptTokensCount: 4 } };
+      f.resolve(value);
+      const outcome = await run.result;
+      const unproven = [
+        'malformed content',
+        'invalid token count',
+        'excess tokens',
+        'prompt mismatch',
+      ].includes(row);
+      assert.equal(outcome.kind, unproven ? 'unknown' : 'failed', row);
+      assert(outcome.kind === 'unknown' || outcome.kind === 'failed');
+      assert.equal(outcome.reason, 'protocol', row);
+      if (outcome.kind === 'failed') {
+        assert(outcome.proof);
+        assert.equal(outcome.proof.stopReason, 'eosFound');
+        assert.equal(outcome.proof.maxTokens, maximumOutputTokens);
+      } else assert.equal('proof' in outcome, false);
+      assert.equal(f.submitted, 1);
+      assert.equal(f.cancelled, 0);
+    }
+  }
   let completed!: LocalTerminal;
   for (const row of [
     'complete',
@@ -859,6 +1001,7 @@ test('Local ownership needs the same prediction terminal after cancellation or c
       'submitted client loss',
       'complete',
       'terminal before submission',
+      'wrong output limit',
       'bad then valid',
       'duplicate submission',
       'async marker',
@@ -897,6 +1040,15 @@ test('Local ownership needs the same prediction terminal after cancellation or c
       if (row !== 'client loss' && row !== 'terminal before submission' && row !== 'spawn failed')
         child.stdout.write(ready);
       if (row === 'complete' || row === 'terminal before submission') child.stdout.write(done);
+      if (row === 'wrong output limit') {
+        assert(completed.kind === 'completed');
+        child.stdout.write(
+          `${JSON.stringify({
+            type: 'terminal',
+            terminal: { ...completed, proof: { ...completed.proof, maxTokens: 4096 } },
+          })}\n`,
+        );
+      }
       if (row === 'bad then valid') child.stdout.write(`{}\n${done}`);
       if (row === 'duplicate submission') child.stdout.write(ready + done);
       if (row === 'spawn failed') child.emit('error', new Error('fixture spawn failed'));

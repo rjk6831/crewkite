@@ -4,6 +4,7 @@ import {
   CommandIdSchema,
   HashSchema,
   LocalModelObservationSchema,
+  LocalNativeProfileSchema,
   LocalObservedModelBindingSchema,
   NativeTargetPathSchema,
   RevisionSchema,
@@ -12,7 +13,7 @@ import { z } from 'zod';
 import { localConfiguredConnectionHash } from './connection.ts';
 
 export const CONTEXT_TOKENS = 8192;
-export const OUTPUT_TOKENS = 2048;
+const LEGACY_OUTPUT_TOKENS = 2048;
 export const MAX_CONTENT_BYTES = 65_536;
 export const MAX_STREAM_BYTES = 131_072;
 export const DEADLINE_MS = 300_000;
@@ -56,6 +57,7 @@ const startShape = {
   binding: BindingSchema,
   endpoint: endpointSchema,
   original: text(MAX_CONTENT_BYTES),
+  maximumOutputTokens: LocalNativeProfileSchema.shape.maximumOutputTokens.optional(),
   task: text(8192).refine((value) => value.trim().length > 0),
   timeoutMs: z
     .number()
@@ -119,30 +121,32 @@ export const ProposalSchema = z.strictObject({
   content: text(MAX_CONTENT_BYTES),
 });
 const count = z.number().int().nonnegative().safe().nullable();
-export const ProofSchema = z.strictObject({
-  stopReason: z.enum([
-    'userStopped',
-    'modelUnloaded',
-    'failed',
-    'eosFound',
-    'stopStringFound',
-    'maxPredictedTokensReached',
-    'contextLengthReached',
-    'toolCalls',
-  ]),
-  promptTokens: count,
-  predictedTokens: count,
-  renderedPromptTokens: z
-    .number()
-    .int()
-    .positive()
-    .max(CONTEXT_TOKENS - OUTPUT_TOKENS),
-  outputBytes: z.number().int().nonnegative().safe(),
-  contextLength: z.literal(CONTEXT_TOKENS),
-  maxTokens: z.literal(OUTPUT_TOKENS),
-  contextOverflowPolicy: z.literal('stopAtLimit'),
-  draftModel: z.literal(''),
-});
+export const ProofSchema = z
+  .strictObject({
+    stopReason: z.enum([
+      'userStopped',
+      'modelUnloaded',
+      'failed',
+      'eosFound',
+      'stopStringFound',
+      'maxPredictedTokensReached',
+      'contextLengthReached',
+      'toolCalls',
+    ]),
+    promptTokens: count,
+    predictedTokens: count,
+    renderedPromptTokens: z
+      .number()
+      .int()
+      .positive()
+      .max(CONTEXT_TOKENS - LEGACY_OUTPUT_TOKENS),
+    outputBytes: z.number().int().nonnegative().safe(),
+    contextLength: z.literal(CONTEXT_TOKENS),
+    maxTokens: LocalNativeProfileSchema.shape.maximumOutputTokens,
+    contextOverflowPolicy: z.literal('stopAtLimit'),
+    draftModel: z.literal(''),
+  })
+  .refine((proof) => proof.renderedPromptTokens + proof.maxTokens <= proof.contextLength);
 export const ReasonSchema = z.enum([
   'input',
   'identity',
@@ -224,6 +228,10 @@ export function localPlan(value: unknown): LocalStart {
   )
     throw new Error('The Local connection identity does not match.');
   return Object.freeze({ ...plan, binding: Object.freeze(plan.binding) });
+}
+
+export function localOutputTokens(plan: LocalStart) {
+  return plan.maximumOutputTokens ?? LEGACY_OUTPUT_TOKENS;
 }
 
 export function localChat(plan: LocalStart) {

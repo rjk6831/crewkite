@@ -1307,6 +1307,8 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     reason: 'qualification-pending',
   };
   assert.deepEqual(NativeProfileSchema.parse(localProfile), localProfile);
+  const currentLocalProfile = { ...localProfile, maximumOutputTokens: 4096 };
+  assert.deepEqual(NativeProfileSchema.parse(currentLocalProfile), currentLocalProfile);
   assert(
     NativeProfileSchema.safeParse({
       ...localProfile,
@@ -1327,7 +1329,8 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     { modelBinding: { ...localModel, setupHash: 'invalid' } },
     { modelBinding: { ...localModel, quantization: 'other' } },
     { contextLength: 16384 },
-    { maximumOutputTokens: 4096 },
+    { maximumOutputTokens: 2049 },
+    { maximumOutputTokens: 8192 },
     { maximumSubmissions: 2 },
     { available: false, reason: 'available' },
     { reason: 'unbounded-error' },

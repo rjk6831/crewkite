@@ -2899,7 +2899,9 @@ let plan;const emit=value=>process.stdout.write(JSON.stringify(value)+'\\n');
 const finish=value=>{emit(value);process.stdin.destroy();};
 createInterface({input:process.stdin}).on('line',line=>{const value=JSON.parse(line);
 if(!plan){plan=value;if(plan.kind==='discovery'){finish({type:'discovery',terminal:mode==='discovery-failed'?{kind:'unavailable',binding:plan.binding,reason:'transport'}:{kind:'observed',binding:plan.binding,observation}});return;}emit({type:'ready',binding:plan.binding});return;}
-const content=process.argv[2];const proof={stopReason:value==='stop'?'userStopped':'eosFound',promptTokens:1,predictedTokens:1,renderedPromptTokens:1,outputBytes:Buffer.byteLength(content),contextLength:8192,maxTokens:2048,contextOverflowPolicy:'stopAtLimit',draftModel:''};
+const content=process.argv[2];const proof={stopReason:value==='stop'?'userStopped':'eosFound',promptTokens:1,predictedTokens:1,renderedPromptTokens:1,outputBytes:Buffer.byteLength(content),contextLength:8192,maxTokens:plan.maximumOutputTokens??2048,contextOverflowPolicy:'stopAtLimit',draftModel:''};
+if(mode==='wrong-output-limit')proof.maxTokens=2048;
+if(value==='submit'&&mode==='output-limit'){proof.stopReason='maxPredictedTokensReached';proof.predictedTokens=plan.maximumOutputTokens;finish({type:'terminal',terminal:{kind:'failed',binding:plan.binding,reason:'limit',proof}});return;}
 if(value==='submit'&&mode==='hold')return;
 if(value==='submit'&&mode==='client-loss'){process.stdin.destroy();return;}
 if(value==='submit'&&mode==='unknown'){finish({type:'terminal',terminal:{kind:'unknown',binding:plan.binding,reason:'ownership'}});return;}
@@ -3294,6 +3296,11 @@ test('an appointed native proposal is retained and applied once after every phas
   assert.notEqual(noneReopened.snapshot().localSetup?.connectionHash, noneHash);
   assert.equal(noneReopened.snapshot().localSetup?.selection, null);
   const connectedLocal = await localControllerFixture(t, 'checked');
+  const currentProfile = connectedLocal.controller
+    .snapshot()
+    .nativeProfiles.find((value) => value.id === 'local-file-v1');
+  assert(currentProfile && 'maximumOutputTokens' in currentProfile);
+  assert.equal(currentProfile.maximumOutputTokens, 4096);
   assert.equal((await connectedLocal.started()).outcome, 'applied');
   connectedLocal.clock.advance(60000);
   await nativeWait('Local completed writer', connectedLocal.terminal);
@@ -5373,6 +5380,8 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
     'input-intent-restart',
     'configuration-unknown',
     'configuration-failed',
+    'output-limit',
+    'wrong-output-limit',
     'unknown',
     'client-loss',
     'missing-terminal',
@@ -5501,6 +5510,7 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
     assert(intent);
     const uncertain = [
       'configuration-unknown',
+      'wrong-output-limit',
       'unknown',
       'client-loss',
       'missing-terminal',

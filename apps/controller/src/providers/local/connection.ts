@@ -58,7 +58,7 @@ export function resolveLocalConnection(
       modelBinding: null,
       billing: 'local',
       contextLength: 8192,
-      maximumOutputTokens: 2048,
+      maximumOutputTokens: 4096,
       qualifiedAt: null,
       maximumTaskMs: 300000,
       maximumFileBytes: 65536,
