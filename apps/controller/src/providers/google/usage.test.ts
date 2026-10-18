@@ -176,7 +176,7 @@ test('the google quota read maps zero-turn account buckets to window observation
   mkdirSync(runtime, { mode: 0o700 });
   const executable = join(runtime, 'fixture');
   writeFileSync(executable, `#!${process.execPath}\n`, { mode: 0o700 });
-  const client = { executable, version: '1.4.1', sha256: hash(readFileSync(executable)) };
+  const client = { executable, version: '1.4.2', sha256: hash(readFileSync(executable)) };
   const environment = { ...process.env, HOME: userInfo().homedir };
   const groupsSeen: number[] = [];
   try {
@@ -234,7 +234,7 @@ test('the google quota read maps zero-turn account buckets to window observation
     }
 
     // Client discovery never executes the client or reads account files.
-    assert.equal(googleUsageDescriptor.clientVersion, '1.4.1');
+    assert.equal(googleUsageDescriptor.clientVersion, '1.4.2');
     if (process.platform !== 'darwin' || process.arch !== 'arm64') {
       assert.deepEqual(resolveGoogleUsageClient(environment), {
         available: false,
