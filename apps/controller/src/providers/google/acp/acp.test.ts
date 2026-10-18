@@ -335,11 +335,15 @@ test('the acp writer binds an imported client and observed configuration before 
       'harness-mutation',
       'identity-mutation',
       'queued-close',
+      'live-at-cutoff',
       'late-kill',
       'late-kill-reversed',
       'late-kill-near-deadline',
     ] as const) {
-      const held = failure === 'queued-close' || failure.startsWith('late-kill');
+      const held =
+        failure === 'queued-close' ||
+        failure === 'live-at-cutoff' ||
+        failure.startsWith('late-kill');
       // The signature phase runs only where codesign does.
       if (held && (process.platform !== 'darwin' || process.arch !== 'arm64')) continue;
       const row = fixture('complete');
@@ -476,6 +480,10 @@ test('the acp writer binds an imported client and observed configuration before 
               }
             };
             fire(250);
+          } else if (failure === 'live-at-cutoff') {
+            // No kill has gone out, so the group is still present when the cutoff decides.
+            clock = 2000;
+            fire(1000);
           } else {
             // A blocked loop runs the stop timers in one pass. Node runs one duration list at a
             // time, so the 1000 ms cutoff list can reach the cutoff before the 250 ms kill.
@@ -485,12 +493,18 @@ test('the acp writer binds an imported client and observed configuration before 
           }
         }
         const result = await pending;
+        if (failure === 'live-at-cutoff')
+          for (const group of row.groups) process.kill(-group, 'SIGKILL');
         if (held) await closed.promise;
         assert.ifError(callbackError);
         assert.equal(result.imported, false, failure);
         assert.throws(() => readGoogleAcpPin(row.home));
         if (held) {
-          assert.equal(result.reason, 'signature-refused', failure);
+          assert.equal(
+            result.reason,
+            failure === 'live-at-cutoff' ? 'ownership' : 'signature-refused',
+            failure,
+          );
           if (failure === 'queued-close')
             assert(
               timers.some((timer) => timer.delay === 0),
