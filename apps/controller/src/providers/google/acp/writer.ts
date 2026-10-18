@@ -705,9 +705,20 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
         finalAcknowledged = false;
       const tools = new Map<string, Tool>();
       const seenTools = new Set<string>();
-      // File-changing tools that named a path outside the scratch. One that completes
-      // cannot be captured, whatever kind its last update reports.
-      const outsideEdits = new Set<string>();
+      // Tools that named a path outside the scratch under any kind, and tools that
+      // reported a file-changing kind in any update. A tool in both changed files outside
+      // the scratch, in whatever order the path and the kind showed up and whatever kind
+      // its last update reports.
+      const outsidePaths = new Set<string>();
+      const changingKinds = new Set<string>();
+      const completedTools = new Set<string>();
+      const outsideEdit = (toolCallId: string) =>
+        outsidePaths.has(toolCallId) && changingKinds.has(toolCallId);
+      const observeTool = (tool: Tool, outside: boolean) => {
+        if (outside) outsidePaths.add(tool.toolCallId);
+        if (fileChangingKinds.has(tool.kind ?? '')) changingKinds.add(tool.toolCallId);
+        if (tool.status === 'completed') completedTools.add(tool.toolCallId);
+      };
       let expectedTargetHash = plan.target.baseHash;
       const pending = new Map<
         string,
@@ -744,12 +755,17 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
           diagnostic = { site: 'permission-request', method: 'session/request_permission' };
           const request = permission.parse(params);
           const tool = mergeTool(tools.get(request.toolCall.toolCallId), request.toolCall);
+          observeTool(tool, outsideScratch(options.scratch, tool.locations));
           const carried = editArguments(tool.rawInput);
           const at = (site: AcpDiagnostic['site']): AcpDiagnostic => ({
             site,
             method: 'session/request_permission',
             ...(carried ? { editArguments: carried } : {}),
           });
+          if (completedTools.has(tool.toolCallId) && outsideEdit(tool.toolCallId)) {
+            connection.noteDiagnostic(at('edit-location'));
+            refusal = 'permission';
+          }
           diagnostic = at('permission-options');
           if (
             request.sessionId !== sessionId ||
@@ -765,7 +781,6 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
             const denials = request.options.filter((v) => v.kind === 'reject_once');
             if (denials.length !== 1) return reject(id, diagnostic);
             rejectedOutsideWrites++;
-            outsideEdits.add(tool.toolCallId);
             seenTools.add(tool.toolCallId);
             tools.set(tool.toolCallId, tool);
             connection.respond(id, {
@@ -916,13 +931,12 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
           ? acpValidate(diagnostic('tool-update'), () => toolUpdate.parse(update))
           : null;
         const locations = call ? activityLocations(options.scratch, call.locations) : [];
-        if (
-          call &&
-          locations.length < (call.locations?.length ?? 0) &&
-          fileChangingKinds.has(tools.get(call.toolCallId)?.kind ?? '')
-        )
-          outsideEdits.add(call.toolCallId);
-        if (call?.status === 'completed' && outsideEdits.has(call.toolCallId)) {
+        if (call)
+          observeTool(
+            tools.get(call.toolCallId) ?? call,
+            locations.length < (call.locations?.length ?? 0),
+          );
+        if (call && completedTools.has(call.toolCallId) && outsideEdit(call.toolCallId)) {
           // A tool that changes files finished on a path outside the scratch. The turn may
           // end cleanly, but its result stays unverified and cannot be captured. An
           // announcement or a rejected tool changes nothing and does not block capture.
@@ -1039,7 +1053,10 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
       // The agent can keep a background exec or a host tool open across the turn
       // end. Only a pending permission or an open file edit leaves the target undecided.
       const editing = open.filter(
-        (v) => seenTools.has(v.toolCallId) || fileChangingKinds.has(v.kind ?? ''),
+        (v) =>
+          seenTools.has(v.toolCallId) ||
+          fileChangingKinds.has(v.kind ?? '') ||
+          outsideEdit(v.toolCallId),
       );
       if (pending.size || (!cancelled && editing.length))
         throw new AcpError('protocol', {

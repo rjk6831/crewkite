@@ -967,6 +967,9 @@ test('the acp protocol consumes one complete live permission and never treats co
     'outside-edit',
     'outside-completed',
     'outside-kind-flip',
+    'outside-reverse-flip',
+    'outside-open-flip',
+    'permission-outside-completed',
     'outside-permission-completed',
     'outside-no-reject',
     'outside-two-rejects',
@@ -1002,7 +1005,11 @@ test('the acp protocol consumes one complete live permission and never treats co
           assert(Buffer.byteLength(proposal.consequence) <= 4096);
           assert.equal(proposal.actionHash, hashCanonical(proposal.detail));
           const bound = binding(proposal);
-          if (scenario === 'permission' || scenario.startsWith('hunk'))
+          if (
+            scenario === 'permission' ||
+            scenario === 'permission-outside-completed' ||
+            scenario.startsWith('hunk')
+          )
             queueMicrotask(() => {
               assert.throws(
                 () => handle.replyPermission({ ...bound, generation: 1 }, 'approved'),
@@ -1078,42 +1085,60 @@ test('the acp protocol consumes one complete live permission and never treats co
           sessionUpdate: 'agent_message_chunk',
         });
         assert(!JSON.stringify(outcome).includes('private-'));
-      } else if (scenario === 'open-edits' || scenario === 'hunk-open') {
-        // Open edit, delete and move tools, and an approved edit still open under another
-        // kind, each leave the target undecided.
+      } else if (
+        scenario === 'open-edits' ||
+        scenario === 'hunk-open' ||
+        scenario === 'outside-open-flip'
+      ) {
+        // Open edit, delete and move tools, an approved edit still open under another
+        // kind, and an outside edit that flipped kind and stayed open each leave the
+        // target undecided.
         assert.equal(outcome.reason, 'protocol');
         assert.equal(outcome.metadata, null);
         assert.equal(permissions, scenario === 'hunk-open' ? 1 : 0);
         assert.deepEqual(outcome.diagnostic, {
           site: 'incomplete-tool-terminal',
           method: 'session/prompt',
-          pendingToolCount: scenario === 'hunk-open' ? 1 : 3,
+          pendingToolCount: scenario === 'open-edits' ? 3 : 1,
         });
       } else if (
         [
           'outside-edit',
           'outside-completed',
           'outside-kind-flip',
+          'outside-reverse-flip',
+          'permission-outside-completed',
           'outside-permission-completed',
         ].includes(scenario)
       ) {
         // A file change that completes outside the scratch lets the turn finish, but it
         // cannot be captured. The completion can arrive on the announcement or on a later
-        // update that no longer names the path or reports another kind. The path can also
-        // first appear in a permission request, which gets the reject reply and still
-        // blocks capture when the server then reports the tool complete.
+        // update that no longer names the path. The kind can change in either direction,
+        // including after the tool first reports completion and later changes status. The
+        // path and the edit kind can also first appear in a permission request, which gets
+        // the reject reply and still blocks capture when the server then reports the tool
+        // complete under another kind.
         assert.equal(outcome.reason, 'permission');
         assert.equal(outcome.metadata?.stopReason, 'end_turn');
-        assert.equal(permissions, 0);
+        assert.equal(permissions, scenario === 'permission-outside-completed' ? 1 : 0);
         assert.equal(
           outcome.rejectedOutsideWrites,
           scenario === 'outside-permission-completed' ? 1 : 0,
         );
-        assert.deepEqual(outcome.diagnostic, {
-          site: 'edit-location',
-          method: 'session/update',
-          sessionUpdate: scenario === 'outside-edit' ? 'tool_call' : 'tool_call_update',
-        });
+        assert.deepEqual(
+          outcome.diagnostic,
+          scenario === 'outside-permission-completed'
+            ? {
+                site: 'edit-location',
+                method: 'session/request_permission',
+                editArguments: ['TargetFile', 'other'],
+              }
+            : {
+                site: 'edit-location',
+                method: 'session/update',
+                sessionUpdate: scenario === 'outside-edit' ? 'tool_call' : 'tool_call_update',
+              },
+        );
       } else if (
         ['outside-no-reject', 'outside-two-rejects', 'outside-execute'].includes(scenario)
       ) {

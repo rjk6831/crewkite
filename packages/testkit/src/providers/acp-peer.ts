@@ -48,6 +48,9 @@ export const acpPeerCases = [
   'outside-edit',
   'outside-completed',
   'outside-kind-flip',
+  'outside-reverse-flip',
+  'outside-open-flip',
+  'permission-outside-completed',
   'outside-permission-completed',
   'outside-no-reject',
   'outside-two-rejects',
@@ -162,7 +165,7 @@ export function runAcpPeer(scenario: AcpPeerCase) {
       toolCallId: 'fixture-brain-write',
       title: 'Run write_to_file?',
       kind: scenario === 'outside-execute' ? 'execute' : 'edit',
-      status: 'pending',
+      status: scenario === 'outside-permission-completed' ? 'completed' : 'pending',
       rawInput: { TargetFile: path, CodeContent: '# Tasks\n' },
       locations: [{ path }],
     };
@@ -321,6 +324,7 @@ export function runAcpPeer(scenario: AcpPeerCase) {
             'changed-action',
             'bad-action',
             'large-action',
+            'permission-outside-completed',
             'cancel-permission',
             'pending-end',
           ].includes(scenario)
@@ -331,21 +335,25 @@ export function runAcpPeer(scenario: AcpPeerCase) {
             newText: scenario === 'large-action' ? 'x'.repeat(4096) : 'export const total = 1;\n',
             ...(scenario === 'bad-action' ? { command: 'hidden effect' } : {}),
           };
-          update({
-            sessionUpdate: 'tool_call',
+          const toolCall = {
             toolCallId: 'fixture-tool',
             name: 'fixture-replace',
             kind: 'edit',
             status: 'pending',
             rawInput,
-          });
+          };
+          if (scenario !== 'permission-outside-completed')
+            update({ sessionUpdate: 'tool_call', ...toolCall });
           emit({
             jsonrpc: '2.0',
             id: 'permission-1',
             method: 'session/request_permission',
             params: {
               sessionId: 'fixture-session',
-              toolCall: { toolCallId: 'fixture-tool' },
+              toolCall:
+                scenario === 'permission-outside-completed'
+                  ? toolCall
+                  : { toolCallId: 'fixture-tool' },
               options: [
                 {
                   optionId: 'once',
@@ -399,22 +407,46 @@ export function runAcpPeer(scenario: AcpPeerCase) {
             locations: [{ path: join(cwd, '..', 'outside.md') }],
           });
           terminal('end_turn');
-        } else if (scenario === 'outside-completed' || scenario === 'outside-kind-flip') {
-          // The edit is never offered for permission and later reports completion
-          // without naming its path again. One variant also changes the reported kind.
+        } else if (
+          [
+            'outside-completed',
+            'outside-kind-flip',
+            'outside-reverse-flip',
+            'outside-open-flip',
+          ].includes(scenario)
+        ) {
+          // The edit is never offered for permission and its next update does not name the
+          // path again. The variants change the kind between the two updates, in either
+          // direction. The reverse case reports completion before the edit kind, then
+          // changes the status. One other case leaves the tool open at the end of the turn.
+          const kindChanges: Record<
+            | 'outside-completed'
+            | 'outside-kind-flip'
+            | 'outside-reverse-flip'
+            | 'outside-open-flip',
+            readonly [string, string | undefined]
+          > = {
+            'outside-completed': ['edit', undefined],
+            'outside-kind-flip': ['edit', 'other'],
+            'outside-reverse-flip': ['other', 'edit'],
+            'outside-open-flip': ['edit', 'other'],
+          };
+          const [announced, reported] = kindChanges[scenario as keyof typeof kindChanges];
           update({
             sessionUpdate: 'tool_call',
             toolCallId: 'fixture-outside-edit',
             title: 'edit',
-            kind: 'edit',
-            status: 'in_progress',
+            kind: announced,
+            status: scenario === 'outside-reverse-flip' ? 'completed' : 'in_progress',
             locations: [{ path: join(cwd, '..', 'outside.md') }],
           });
           update({
             sessionUpdate: 'tool_call_update',
             toolCallId: 'fixture-outside-edit',
-            status: 'completed',
-            ...(scenario === 'outside-kind-flip' ? { kind: 'other' } : {}),
+            ...(scenario === 'outside-open-flip'
+              ? {}
+              : { status: scenario === 'outside-reverse-flip' ? 'failed' : 'completed' }),
+            ...(reported ? { kind: reported } : {}),
           });
           terminal('end_turn');
         } else if (scenario === 'open-tools' || scenario === 'open-edits') {
@@ -496,11 +528,13 @@ export function runAcpPeer(scenario: AcpPeerCase) {
           // The reply must pick the reject option.
           assert.deepEqual(message.result, { outcome: { outcome: 'selected', optionId: 'deny' } });
           if (scenario === 'outside-permission-completed') {
-            // A server that runs the tool anyway reports it complete without a path.
+            // The completed request remains decisive after a later failed update under
+            // another kind.
             update({
               sessionUpdate: 'tool_call_update',
               toolCallId: 'fixture-brain-write',
-              status: 'completed',
+              status: 'failed',
+              kind: 'other',
             });
             terminal('end_turn');
           } else {
@@ -525,9 +559,15 @@ export function runAcpPeer(scenario: AcpPeerCase) {
           update({
             sessionUpdate: 'tool_call_update',
             toolCallId: hunkStep ? `fixture-hunk-${hunkStep}` : 'fixture-tool',
-            ...(scenario === 'hunk-open'
-              ? { status: 'in_progress', kind: 'other' }
-              : { status: 'completed' }),
+            ...(scenario === 'permission-outside-completed'
+              ? {
+                  status: 'completed',
+                  kind: 'other',
+                  locations: [{ path: join(cwd, '..', 'outside.md') }],
+                }
+              : scenario === 'hunk-open'
+                ? { status: 'in_progress', kind: 'other' }
+                : { status: 'completed' }),
           });
           if (hunkStep === 1 && ['hunk-sequential', 'hunk-drift'].includes(scenario)) {
             if (scenario === 'hunk-drift')
