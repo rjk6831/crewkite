@@ -489,6 +489,19 @@ function scratchPath(root: string, path: string) {
   const result = relative(root, path);
   return NativeTargetPathSchema.parse(result);
 }
+// Read-only tools can report the scratch root or files outside it. Activity
+// locations are display data, so drop any path an action could not name.
+// Permission actions keep the strict check in scratchPath().
+function activityLocations(root: string, locations: Tool['locations']) {
+  return (locations ?? []).flatMap((location) => {
+    const path = isAbsolute(location.path)
+      ? NativeTargetPathSchema.safeParse(relative(root, location.path))
+      : null;
+    return path?.success
+      ? [{ path: path.data, ...(location.line ? { line: location.line } : {}) }]
+      : [];
+  });
+}
 function mergeTool(previous: Tool | undefined, patch: Tool): Tool {
   const next = { ...previous, toolCallId: patch.toolCallId } as Tool;
   for (const [key, value] of Object.entries(patch))
@@ -827,10 +840,7 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
             ? {
                 toolCallId: call.toolCallId,
                 ...(call.status ? { status: call.status } : {}),
-                locations: (call.locations ?? []).map((v) => ({
-                  path: scratchPath(options.scratch, v.path),
-                  ...(v.line ? { line: v.line } : {}),
-                })),
+                locations: activityLocations(options.scratch, call.locations),
               }
             : {}),
         });

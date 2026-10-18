@@ -37,6 +37,7 @@ export const acpPeerCases = [
   'descendant',
   'no-close',
   'usage-refusal',
+  'activity-locations',
 ] as const;
 export type AcpPeerCase = (typeof acpPeerCases)[number];
 
@@ -301,7 +302,24 @@ export function runAcpPeer(scenario: AcpPeerCase) {
             content: { type: 'text', text: 'fixture-ready-to-cancel' },
           });
         } else if (scenario === 'usage-refusal') terminal('refusal');
-        else {
+        else if (scenario === 'activity-locations') {
+          // Read-only tools report the scratch root and paths outside it.
+          for (const [toolCallId, kind, path] of [
+            ['fixture-search', 'search', cwd],
+            ['fixture-read', 'read', join(cwd, '..', 'outside.md')],
+          ]) {
+            update({
+              sessionUpdate: 'tool_call',
+              toolCallId,
+              title: kind,
+              kind,
+              status: 'in_progress',
+              locations: [{ path }],
+            });
+            update({ sessionUpdate: 'tool_call_update', toolCallId, status: 'completed' });
+          }
+          terminal('end_turn');
+        } else {
           writeFileSync(join(cwd, 'net.mjs'), 'export const total = 1;\n');
           terminal('end_turn');
           if (scenario === 'duplicate') terminal('end_turn');

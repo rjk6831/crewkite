@@ -849,10 +849,12 @@ test('the acp protocol consumes one complete live permission and never treats co
     'drift',
     'duplicate',
     'usage-refusal',
+    'activity-locations',
   ] as const) {
     const f = fixture(scenario);
     let permissions = 0,
       usages = 0;
+    const toolActivity: { toolCallId?: string; status?: string; locations?: unknown[] }[] = [];
     let handle: ReturnType<typeof writer>;
     try {
       handle = writer(f, {
@@ -868,6 +870,10 @@ test('the acp protocol consumes one complete live permission and never treats co
         onActivity: (activity, text) => {
           if (activity.sessionUpdate === 'agent_thought_chunk') assert.equal(text, '');
           if (activity.sessionUpdate === 'usage_update') usages++;
+          if (activity.toolCallId) {
+            const { toolCallId, status, locations } = activity;
+            toolActivity.push({ toolCallId, status, locations });
+          }
         },
         onPermission: (proposal) => {
           permissions++;
@@ -900,11 +906,28 @@ test('the acp protocol consumes one complete live permission and never treats co
         assert.equal(outcome.reason, null);
         assert.equal(outcome.metadata?.stopReason, 'refusal');
         assert.equal(permissions, 0);
+      } else if (scenario === 'activity-locations') {
+        assert.equal(outcome.reason, null, JSON.stringify(outcome.diagnostic));
+        assert.equal(outcome.metadata?.stopReason, 'end_turn');
+        assert.equal(permissions, 0);
+        assert.deepEqual(
+          toolActivity,
+          ['fixture-search', 'fixture-read'].flatMap((toolCallId) => [
+            { toolCallId, status: 'in_progress', locations: [] },
+            { toolCallId, status: 'completed', locations: [] },
+          ]),
+        );
       } else {
         assert(outcome.reason, scenario);
         if (scenario === 'hunk-drift') assert.equal(permissions, 1, scenario);
         else if (scenario !== 'changed-action') assert.equal(permissions, 0, scenario);
       }
+      if (scenario === 'hunk')
+        assert.deepEqual(toolActivity[0], {
+          toolCallId: 'fixture-hunk-1',
+          status: 'pending',
+          locations: [{ path: target.path }],
+        });
       if (scenario === 'ambiguous') assert.equal(outcome.diagnostic?.site, 'permission-options');
       if (scenario === 'hunk-control') assert.equal(outcome.diagnostic?.site, 'permission-action');
       if (scenario === 'duplicate') assert.equal(outcome.diagnostic?.site, 'correlation');
