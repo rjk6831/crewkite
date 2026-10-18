@@ -77,6 +77,6 @@ Provider cards use only retained observations. A unique provider-scoped weekly o
 The Usage view has four regions:
 
 - Allowance cards: reported windows with their own unit, scope, reset time, observation time, source and freshness. Missing, stale and reset-pending values stay labelled. Credits and context-token counts never become a subscription percentage.
-- Comparable activity: launches and aggregate active minutes by route, role or task. Parallel minutes can exceed wall time, and the label says so.
-- Local hardware: resident models, admitted generations, queue, memory pressure. It reads "No provider quota" for local inference and claims no cost saving.
-- Credits: existing paid credits stay off per provider. When enabled, the card shows the budget, the unit and whether the provider enforces a hard cap.
+- Controller activity: recorded attempts by route in this workspace. Active minutes are not measured; these counts do not describe account-wide usage.
+- Local hardware: the configured route model and "No provider quota". Hardware measurements remain unavailable. Local setup separately lists observed model state.
+- Credits: the dashboard reports unknown account credit balances. Using existing credits requires an explicit billing selection in preparation; a provider allowance grants no spending permission.
