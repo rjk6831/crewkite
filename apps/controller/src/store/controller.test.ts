@@ -4612,10 +4612,12 @@ test('an appointed native proposal is retained and applied once after every phas
   );
 
   const evaluate = async (scenario: string) => {
+    const repositoryScenario = scenario.startsWith('repository-');
     const passedReview =
       scenario === 'checked' ||
       scenario === 'project-checked' ||
       scenario === 'repository-checked' ||
+      scenario === 'repository-recovered' ||
       scenario === 'anthropic-checked' ||
       scenario === 'google-checked';
     console.error(`Native fixture row: evaluation/${scenario}`);
@@ -4623,21 +4625,20 @@ test('an appointed native proposal is retained and applied once after every phas
     const inventoryRelease = Promise.withResolvers<void>();
     let inventoryCalls = 0;
     let inventorySignal: AbortSignal | undefined;
-    const socketRoot =
-      scenario === 'repository-checked'
-        ? mkdtempSync(join(realpathSync(checkOwner()?.stateRoot ?? tmpdir()), 'ck-socket-'))
-        : undefined;
+    const socketRoot = repositoryScenario
+      ? mkdtempSync(join(realpathSync(checkOwner()?.stateRoot ?? tmpdir()), 'ck-socket-'))
+      : undefined;
     const context = await nativeSetup(
       t,
-      scenario === 'anthropic-checked' ||
-        scenario === 'google-checked' ||
-        scenario === 'repository-checked'
+      scenario === 'anthropic-checked' || scenario === 'google-checked'
         ? scenario
-        : scenario === 'failed'
-          ? 'success'
-          : scenario === 'review-blocked'
-            ? 'checked-blocked'
-            : 'checked',
+        : repositoryScenario
+          ? 'repository-checked'
+          : scenario === 'failed'
+            ? 'success'
+            : scenario === 'review-blocked'
+              ? 'checked-blocked'
+              : 'checked',
       scenario === 'repository-checked'
         ? {
             home: join(socketRoot as string, 'home'),
@@ -4654,7 +4655,9 @@ test('an appointed native proposal is retained and applied once after every phas
               );
             },
           }
-        : {},
+        : scenario === 'repository-recovered'
+          ? { home: join(socketRoot as string, 'home') }
+          : {},
     );
     if (socketRoot)
       t.after(async () => {
@@ -4663,7 +4666,7 @@ test('an appointed native proposal is retained and applied once after every phas
         rmSync(socketRoot, { recursive: true, force: true });
       });
     let controller = context.controller;
-    if (scenario === 'repository-checked') {
+    if (repositoryScenario) {
       context.appointment.policy.limits.minutes = 16;
       assert.equal(context.appointment.policy.unknownUsage.rule, 'fixed-allowance');
       if (context.appointment.policy.unknownUsage.rule === 'fixed-allowance')
@@ -4673,7 +4676,7 @@ test('an appointed native proposal is retained and applied once after every phas
     const { command, task, appointment, clock } = context;
     const retained = nativeCandidate(controller);
     if (passedReview) {
-      if (scenario === 'repository-checked') {
+      if (repositoryScenario) {
         const payload = {
           taskId: task.id,
           profileId: context.fixtureProfile.facts.id,
@@ -4739,7 +4742,7 @@ test('an appointed native proposal is retained and applied once after every phas
                 }
               : {}),
             ...(scenario === 'google-checked' ? { permissionMode: 'request-review' } : {}),
-            ...(scenario === 'repository-checked' ? {} : { targetPath: 'net.mjs' }),
+            ...(repositoryScenario ? {} : { targetPath: 'net.mjs' }),
             policy: appointment.policy,
             consent: 'explicit',
           },
@@ -4778,6 +4781,56 @@ test('an appointed native proposal is retained and applied once after every phas
     const run = controller.snapshot().runs.at(-1);
     const candidate = controller.snapshot().candidates.at(-1);
     assert(run && candidate);
+    const revision = () => taskRevision(controller, task.id);
+    if (scenario === 'repository-recovered') {
+      const intent = controller.store.intents()[0];
+      assert(intent);
+      const completionKey = `native-completion:${intent.attempt_id}`;
+      const oldCompletion = ArtifactSchema.parse(
+        controller.store.receipt(completionKey)?.result.entity,
+      );
+      const artifactFiles = new ArtifactFiles(join(controller.home, 'artifacts'));
+      const completionBody = JSON.parse(artifactFiles.read(oldCompletion.hash).toString('utf8'));
+      const published = artifactFiles.publish(
+        Buffer.from(canonicalJson({ ...completionBody, reason: 'protocol' })),
+      );
+      const completion = ArtifactSchema.parse({ ...oldCompletion, ...published });
+      controller.store.transaction(() => {
+        controller.store.put('artifact', completion.id, 1, completion);
+        controller.store.db
+          .prepare('UPDATE receipts SET request_hash=?,result=? WHERE command_key=?')
+          .run(
+            completion.hash,
+            canonicalJson({ outcome: 'applied', entity: completion }),
+            completionKey,
+          );
+        controller.store.db
+          .prepare('DELETE FROM receipts WHERE command_key IN (?,?)')
+          .run(`native-capture:${intent.attempt_id}`, `native-proposal:${intent.attempt_id}`);
+        const current = controller.store.get<Task>('task', task.id) as Task;
+        controller.store.put('task', current.id, current.revision + 1, {
+          ...current,
+          state: 'running',
+          revision: current.revision + 1,
+          next: 'Native work is running.',
+        });
+      });
+      controller = await context.restart();
+      assert.equal(
+        (
+          await controller.execute(
+            command('StopRun', { taskId: task.id, runId: run.id }, revision()),
+            'local-owner',
+          )
+        ).outcome,
+        'applied',
+      );
+      assert.equal(controller.store.receipt(`native-prepared:${run.id}`), undefined);
+      assert.equal(
+        controller.store.receipt(`native-recovery:${intent.attempt_id}`)?.result.outcome,
+        'applied',
+      );
+    }
     const originalRun = structuredClone(run);
     const payload = {
       taskId: task.id,
@@ -4809,7 +4862,6 @@ test('an appointed native proposal is retained and applied once after every phas
         },
       ],
     };
-    const revision = () => taskRevision(controller, task.id);
     if (scenario === 'repository-checked') {
       const policy = process.env.PROVENANCE_PATTERN;
       process.env.PROVENANCE_PATTERN = 'private fixture identity';
@@ -4940,7 +4992,7 @@ test('an appointed native proposal is retained and applied once after every phas
         'blocked',
       );
     }
-    if (scenario === 'repository-checked') {
+    if (repositoryScenario) {
       const before = controller.snapshot();
       assert.equal(
         (
@@ -4980,7 +5032,7 @@ test('an appointed native proposal is retained and applied once after every phas
     assert.deepEqual(preview.reviewStart, { available: false, reason: 'checks-required' });
     assert.equal(preview.creditPolicy, 'ordinary');
     assert.equal(preview.reviewer.independence, 'process-only');
-    if (scenario === 'repository-checked') {
+    if (repositoryScenario) {
       assert(preview.repository);
       assert.equal(preview.target, undefined);
       assert.deepEqual(preview.repository, controller.snapshot().nativeRuns[0].repository);
@@ -4988,9 +5040,11 @@ test('an appointed native proposal is retained and applied once after every phas
         controller.store.receipt(`native-application:${controller.store.intents()[0].attempt_id}`),
         undefined,
       );
+      const writerAttemptId = controller.store.intents()[0].attempt_id;
       assert.equal(
-        controller.store.receipt(`native-capture:${controller.store.intents()[0].attempt_id}`)
-          ?.result.outcome,
+        controller.store.receipt(
+          `${scenario === 'repository-recovered' ? 'native-recovery' : 'native-capture'}:${writerAttemptId}`,
+        )?.result.outcome,
         'applied',
       );
       // The completion record counts the command output the writer saw and ignored.
@@ -5528,6 +5582,7 @@ test('an appointed native proposal is retained and applied once after every phas
   await nativeRows(['checked', 'project-checked'], evaluate);
   // This row changes process-wide policy. Both row pools stay outside its lifetime.
   await evaluate('repository-checked');
+  await evaluate('repository-recovered');
   await nativeRows(
     [
       'anthropic-checked',

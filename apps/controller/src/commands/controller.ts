@@ -9855,13 +9855,21 @@ export class Controller {
     const plan = this.evaluationPreparation(run, candidate);
     const writer = this.store.get<Attempt>('attempt', plan.attempt.id);
     const local = 'kind' in plan;
+    const repositoryRecovery =
+      !local &&
+      'repository' in plan.appointment &&
+      !!this.store.receipt(`native-recovery:${plan.attempt.id}`);
     const completion = local
       ? null
       : this.nativeRecord(`native-completion:${plan.attempt.id}`, 4096).value;
     const completed =
       local ||
       z
-        .object({ attemptId: z.string(), reason: z.null(), quiescent: z.literal(true) })
+        .object({
+          attemptId: z.string(),
+          reason: repositoryRecovery ? z.string().min(1) : z.null(),
+          quiescent: z.literal(true),
+        })
         .parse(completion).attemptId === plan.attempt.id;
     if (
       !writer ||
@@ -9872,7 +9880,7 @@ export class Controller {
         local ? 'local' : plan.appointment.route.family,
       ) ||
       this.store.receipt(
-        `${!local && 'acp' in plan.appointment ? 'native-acp-capture' : !local && 'repository' in plan.appointment ? 'native-capture' : 'native-application'}:${writer.id}`,
+        `${!local && 'acp' in plan.appointment ? 'native-acp-capture' : !local && 'repository' in plan.appointment && repositoryRecovery ? 'native-recovery' : !local && 'repository' in plan.appointment ? 'native-capture' : 'native-application'}:${writer.id}`,
       )?.result.outcome !== 'applied' ||
       plan.run.id !== run.id ||
       plan.run.taskId !== run.taskId ||
@@ -11348,6 +11356,13 @@ export class Controller {
   ) {
     const appointment = plan.appointment;
     if (!('repository' in appointment)) return;
+    if (!this.store.receipt(`native-capture:${plan.attempt.id}`)) {
+      const proof = this.repositoryRecoveryProof(plan, candidate);
+      const retained = this.nativeRecord(`native-recovery:${plan.attempt.id}`);
+      if (hashCanonical(retained.value) !== hashCanonical(proof))
+        throw Error('Repository recovery evidence changed.');
+      return;
+    }
     const capture = z
       .strictObject({
         version: z.literal(1),
@@ -11395,6 +11410,118 @@ export class Controller {
       )
         throw Error('The repository grant was not consumed for this run.');
     }
+  }
+
+  private repositoryRecoveryProof(
+    plan: z.infer<typeof NativeHistoricalPreparationSchema>,
+    candidate: Candidate,
+  ) {
+    if (!('repository' in plan.appointment))
+      throw Error('Repository recovery needs a repository run.');
+    const attempt = this.store.get<Attempt>('attempt', plan.attempt.id);
+    const intent = this.store
+      .intents()
+      .find((value) => value.run_id === plan.run.id && value.attempt_id === plan.attempt.id);
+    const submission = this.nativeRecord(
+      `native-submission:${plan.attempt.id}`,
+      4096,
+      'outcome-unknown',
+    );
+    const submitted = z
+      .strictObject({ attemptId: AttemptSchema.shape.id, plan: HashSchema })
+      .parse(submission.value);
+    const completion = this.nativeRecord(`native-completion:${plan.attempt.id}`, 4096);
+    const completed = z
+      .object({
+        attemptId: AttemptSchema.shape.id,
+        reason: z.string().min(1),
+        quiescent: z.literal(true),
+      })
+      .parse(completion.value);
+    const receipt = this.store.receipt(`candidate:${plan.attempt.id}`);
+    const sealed = CandidateSchema.parse(receipt?.result.entity);
+    const phases = this.store.nativeProcesses(plan.attempt.id);
+    if (
+      attempt?.state !== 'stopped' ||
+      attempt.runId !== plan.run.id ||
+      attempt.routeId !== plan.attempt.routeId ||
+      attempt.generation !== plan.attempt.generation ||
+      intent?.attempt_id !== plan.attempt.id ||
+      intent.state !== 'stopped' ||
+      submitted.attemptId !== plan.attempt.id ||
+      submitted.plan !== this.nativeRecord(`native-run:${plan.run.id}`).artifact.hash ||
+      completed.attemptId !== plan.attempt.id ||
+      !phases.length ||
+      phases.some((phase) => phase.state !== 'quiescent') ||
+      !this.store.nativePhasesComplete(plan.attempt.id, plan.appointment.route.family) ||
+      this.store.db
+        .prepare('SELECT attempt_id FROM writer_leases WHERE attempt_id=?')
+        .get(plan.attempt.id) ||
+      this.store.db
+        .prepare('SELECT attempt_id FROM reservations WHERE attempt_id=?')
+        .get(plan.attempt.id) ||
+      receipt?.hash !== candidate.hash ||
+      receipt.result.outcome !== 'applied' ||
+      hashCanonical(sealed) !== hashCanonical(candidate) ||
+      candidate.taskId !== plan.run.taskId ||
+      !this.candidateCurrent(plan.run, candidate) ||
+      hashCanonical(this.repositoryScope(plan.run.source.base, plan.manifest)) !==
+        hashCanonical(plan.appointment.repository)
+    )
+      throw Error('Repository recovery evidence is incomplete.');
+    const project = this.store.get<Project>('project', plan.run.source.projectId);
+    for (const action of ['write-scratch', 'run-native-tools'] as const) {
+      const grant = plan.run.policy.policy.effects.find(
+        (value) =>
+          value.taskId === plan.run.taskId &&
+          value.action === action &&
+          value.target === project?.name &&
+          !value.revoked &&
+          value.usesRemaining === 1,
+      );
+      const consumed = grant && this.store.receipt(this.grantKey(grant));
+      if (
+        !grant ||
+        consumed?.hash !== hashCanonical(grant) ||
+        (consumed.result.entity as Run | undefined)?.id !== plan.run.id
+      )
+        throw Error('Repository recovery grant evidence changed.');
+    }
+    return {
+      version: 1,
+      attemptId: plan.attempt.id,
+      planHash: this.nativeRecord(`native-run:${plan.run.id}`).artifact.hash,
+      submissionHash: submission.artifact.hash,
+      completionHash: completion.artifact.hash,
+      completionReason: completed.reason,
+      candidateId: candidate.id,
+      candidateHash: candidate.hash,
+      sourceBase: plan.run.source.base,
+      repository: plan.appointment.repository,
+      execution: plan.appointment.execution,
+      consent: plan.appointment.consent,
+    };
+  }
+
+  private retainRepositoryRecovery(task: Task) {
+    if (!task.runId) return;
+    const run = this.store.get<Run>('run', task.runId);
+    const candidate = run && this.latestCandidate(run.id);
+    if (!run || !candidate) return;
+    const plan = NativeHistoricalPreparationSchema.parse(
+      this.nativeRecord(`native-run:${run.id}`).value,
+    );
+    if (
+      !('repository' in plan.appointment) ||
+      this.store.receipt(`native-capture:${plan.attempt.id}`) ||
+      this.store.receipt(`native-recovery:${plan.attempt.id}`)
+    )
+      return;
+    const artifact = this.nativeArtifact(this.repositoryRecoveryProof(plan, candidate));
+    this.store.saveReceipt(`native-recovery:${plan.attempt.id}`, artifact.hash, 'local-owner', {
+      outcome: 'applied',
+      entity: artifact,
+    });
   }
 
   private nativeReviewSource(plan: EvaluationWriterPreparation, candidate: Candidate) {
@@ -11546,7 +11673,7 @@ export class Controller {
         this.store.receipt(this.currentNativePlanKey(run.id))?.hash !==
           hashCanonical(native.appointment)) ||
       this.store.receipt(
-        `${!local && 'acp' in native.appointment ? 'native-acp-capture' : !local && 'repository' in native.appointment ? 'native-capture' : 'native-application'}:${writer.id}`,
+        `${!local && 'acp' in native.appointment ? 'native-acp-capture' : !local && 'repository' in native.appointment && this.store.receipt(`native-recovery:${writer.id}`) ? 'native-recovery' : !local && 'repository' in native.appointment ? 'native-capture' : 'native-application'}:${writer.id}`,
       )?.result.outcome !== 'applied' ||
       (local
         ? !same(native.context, evaluation.context)
@@ -11626,8 +11753,14 @@ export class Controller {
         : []),
       [attempt, `native-review-completion:${attempt.id}`, 'openai'],
     ] as const) {
+      const recoveredWriter =
+        owned.id === writer.id && !!this.store.receipt(`native-recovery:${writer.id}`);
       const completed = z
-        .object({ attemptId: z.string(), reason: z.null(), quiescent: z.literal(true) })
+        .object({
+          attemptId: z.string(),
+          reason: recoveredWriter ? z.string().min(1) : z.null(),
+          quiescent: z.literal(true),
+        })
         .parse(this.nativeRecord(key, 4096).value);
       const intent = this.store.intents().find((value) => value.attempt_id === owned.id);
       const phases = this.store.nativeProcesses(owned.id);
@@ -14743,6 +14876,11 @@ export class Controller {
       .intents()
       .find((intent) => intent.task_id === task.id && intent.state !== 'stopped');
     if (!active) {
+      try {
+        this.retainRepositoryRecovery(task);
+      } catch {
+        // Stop still closes launch authority when retained evidence cannot support evaluation.
+      }
       const config = this.conversationConfiguration(task.id);
       if (config) this.saveConversationConfiguration(task.id, { ...config, paused: true });
       const updated = this.updateTask(
