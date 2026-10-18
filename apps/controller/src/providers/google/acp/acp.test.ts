@@ -334,7 +334,14 @@ test('the acp writer binds an imported client and observed configuration before 
       'harness-signature',
       'harness-mutation',
       'identity-mutation',
+      'queued-close',
+      'late-kill',
+      'late-kill-reversed',
+      'late-kill-near-deadline',
     ] as const) {
+      const held = failure === 'queued-close' || failure.startsWith('late-kill');
+      // The signature phase runs only where codesign does.
+      if (held && (process.platform !== 'darwin' || process.arch !== 'arm64')) continue;
       const row = fixture('complete');
       try {
         const staged = join(row.home, 'imports/google-acp-v1');
@@ -356,21 +363,55 @@ test('the acp writer binds an imported client and observed configuration before 
           },
         );
         let clock = 0;
+        const timers: Array<{ delay: number; work: () => void; live: boolean }> = [];
+        const ready = Promise.withResolvers<void>();
+        const closed = Promise.withResolvers<void>();
+        let onExit: (() => void) | undefined;
+        let callbackError: unknown;
+        const fire = (delay: number) => {
+          const timer = timers.find((timer) => timer.live && timer.delay === delay);
+          assert(timer, `${failure}: pending ${delay}ms timer`);
+          timer.live = false;
+          timer.work();
+        };
         const mutation: AcpImportDependencies =
-          failure === 'deadline' || failure === 'bundle-deadline'
+          failure === 'deadline' || failure === 'bundle-deadline' || held
             ? {
                 now: () => clock,
-                schedule: () => () => {},
+                schedule: held
+                  ? (work, delay) => {
+                      const timer = { delay, work, live: true };
+                      timers.push(timer);
+                      return () => {
+                        timer.live = false;
+                      };
+                    }
+                  : () => () => {},
                 spawn: (program, args, options) => {
                   assert.equal(program, '/usr/bin/codesign');
                   assert(
                     args.includes(`=${googleAcpDeveloperIdRequirement(row.client.signerTeamId)}`),
                   );
-                  const child = spawnCheckChild(row.client.executable, [], options);
+                  // A held child ignores TERM and leaves only on the kill.
+                  const child = held
+                    ? spawnCheckChild(
+                        process.execPath,
+                        [
+                          '-e',
+                          "process.on('SIGTERM', () => {}); setTimeout(() => process.exit(1), 10000); process.stdout.write('ready\\n');",
+                        ],
+                        options,
+                      )
+                    : spawnCheckChild(row.client.executable, [], options);
                   if (child.pid) row.groups.push(child.pid);
-                  child.once('close', () => {
-                    clock = failure === 'deadline' ? 5000 : clock + 2500;
-                  });
+                  if (held) {
+                    child.stdout.once('data', () => ready.resolve());
+                    child.once('exit', () => onExit?.());
+                    child.once('close', () => closed.resolve());
+                  } else
+                    child.once('close', () => {
+                      clock = failure === 'deadline' ? 5000 : clock + 2500;
+                    });
                   return child;
                 },
               }
@@ -410,9 +451,52 @@ test('the acp writer binds an imported client and observed configuration before 
                   } as never;
                 },
               };
-        const result = await importGoogleAcp({ home: row.home, consent: 'explicit' }, mutation);
+        const pending = importGoogleAcp({ home: row.home, consent: 'explicit' }, mutation);
+        if (held) {
+          await ready.promise;
+          fire(4000);
+          if (failure === 'queued-close') {
+            // The group is gone when the cutoff runs, but its close event is still queued.
+            clock = 2000;
+            onExit = () => {
+              try {
+                fire(1000);
+              } catch (error) {
+                callbackError = error;
+              }
+            };
+            fire(250);
+          } else {
+            // A blocked loop runs the stop timers in one pass. Node runs one duration list at a
+            // time, so the 1000 ms cutoff list can reach the cutoff before the 250 ms kill.
+            clock = failure === 'late-kill-near-deadline' ? 4500 : 2000;
+            for (const delay of failure === 'late-kill-reversed' ? [1000, 250] : [250, 1000])
+              fire(delay);
+          }
+        }
+        const result = await pending;
+        if (held) await closed.promise;
+        assert.ifError(callbackError);
         assert.equal(result.imported, false, failure);
         assert.throws(() => readGoogleAcpPin(row.home));
+        if (held) {
+          assert.equal(result.reason, 'signature-refused', failure);
+          if (failure === 'queued-close')
+            assert(
+              timers.some((timer) => timer.delay === 0),
+              `${failure}: the cutoff waits one tick for the close event`,
+            );
+          if (failure === 'late-kill-near-deadline')
+            assert(
+              timers.some((timer) => timer.delay === 500),
+              `${failure}: the late kill waits only until the deadline`,
+            );
+          assert.equal(
+            timers.some((timer) => timer.live),
+            false,
+            `${failure}: settlement cancels every timer`,
+          );
+        }
       } finally {
         row.dispose();
       }

@@ -65,6 +65,9 @@ export type AcpImportResult = {
   client: AcpClientIdentity | null;
 };
 
+const KILL_MS = 250;
+const CUTOFF_MS = 1000;
+
 function synchronous(callback: (() => unknown) | undefined) {
   const result = callback?.();
   if (result instanceof Promise) {
@@ -101,6 +104,7 @@ function signaturePhase(
     let finished = false;
     let failed = false;
     let stopping = false;
+    let killedAt: number | undefined;
     let code: number | null = null;
     let size = 0;
     const output: Buffer[] = [];
@@ -131,14 +135,43 @@ function signaturePhase(
         reject(new Error('signature-refused'));
       }
     };
+    const settleAtCutoff = () => {
+      // An exited group can precede delivery of its final stream-close event.
+      if (!closed && absent()) cancellations.push(schedule(settle, 0));
+      else settle();
+    };
+    const cutoff = () => {
+      if (finished) return;
+      if (absent()) return settleAtCutoff();
+      // Timers run before the poll phase that reaps children. When synchronous work holds the
+      // loop past the cutoff, KILL and this check run in one pass, microseconds apart. Node runs
+      // one timer list per duration at a time, so an older cutoff list can even run before the
+      // KILL. Deciding after one poll phase lets the kill go out and the child be reaped. A group
+      // still present then gets the usual gap between KILL and cutoff, counted from the kill and
+      // capped by the deadline.
+      setImmediate(() => {
+        if (finished) return;
+        if (absent()) return settleAtCutoff();
+        const late = killedAt === undefined ? 0 : killedAt + CUTOFF_MS - KILL_MS - now();
+        const wait = Math.min(late, deadline - now());
+        if (wait > 0) cancellations.push(schedule(settleAtCutoff, wait));
+        else settle();
+      });
+    };
     const stop = () => {
       if (finished || stopping) return;
       stopping = true;
       signal('SIGTERM');
       cancellations.push(
-        schedule(() => signal('SIGKILL'), Math.max(0, Math.min(250, deadline - now()))),
+        schedule(
+          () => {
+            killedAt = now();
+            signal('SIGKILL');
+          },
+          Math.max(0, Math.min(KILL_MS, deadline - now())),
+        ),
       );
-      cancellations.push(schedule(settle, Math.max(0, Math.min(1000, deadline - now()))));
+      cancellations.push(schedule(cutoff, Math.max(0, Math.min(CUTOFF_MS, deadline - now()))));
     };
     const receive = (bytes: Buffer) => {
       if (finished) return;
