@@ -849,6 +849,10 @@ export function startLocalPrediction(
           proposal.baseHash !== plan.binding.baseHash
         )
           throw new Error();
+        // Small models often drop the final newline. Restore the original's so the candidate
+        // differs only where the edit does. Parsing again keeps the content bound.
+        if (plan.original.endsWith('\n') && !proposal.content.endsWith('\n'))
+          proposal = ProposalSchema.parse({ ...proposal, content: `${proposal.content}\n` });
       } catch {
         return finish({ kind: 'failed', binding: plan.binding, reason: 'protocol', proof });
       }

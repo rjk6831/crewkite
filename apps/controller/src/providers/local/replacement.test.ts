@@ -872,6 +872,7 @@ test('Local ownership needs the same prediction terminal after cancellation or c
   let completed!: LocalTerminal;
   for (const row of [
     'complete',
+    'missing final newline',
     'omitted prediction draft with default load selectors',
     'omitted prediction draft with explicit load selectors',
     'stop',
@@ -944,10 +945,21 @@ test('Local ownership needs the same prediction terminal after cancellation or c
         value.stats = { ...value.stats, ...{ usedDraftModelKey: '', totalDraftTokensCount: 0 } };
       }
       f.resolve(value);
+    } else if (row === 'missing final newline') {
+      const value = terminal();
+      value.nonReasoningContent = JSON.stringify({
+        ...JSON.parse(value.nonReasoningContent),
+        content: 'export const n = 2;',
+      });
+      value.content = value.nonReasoningContent;
+      f.resolve(value);
     } else f.resolve(terminal(row === 'stop' ? 'userStopped' : 'eosFound'));
     const outcome = await run.result;
     const expected =
-      row === 'complete' || row === 'completion race' || row.startsWith('omitted prediction draft')
+      row === 'complete' ||
+      row === 'missing final newline' ||
+      row === 'completion race' ||
+      row.startsWith('omitted prediction draft')
         ? 'completed'
         : row === 'stop'
           ? 'stopped'
@@ -963,6 +975,7 @@ test('Local ownership needs the same prediction terminal after cancellation or c
     );
     if (outcome.kind === 'completed') {
       completed = outcome;
+      assert.equal(outcome.proposal.content, 'export const n = 2;\n', row);
       assert.equal(outcome.proof.promptTokens, null);
       assert.equal(outcome.proof.predictedTokens, null);
     }
