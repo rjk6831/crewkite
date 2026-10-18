@@ -19,6 +19,7 @@ import {
   AcpDiagnosticSchema,
   AcpError,
   type AcpProcessOptions,
+  acpErrorAt,
   acpIdentifier,
   acpMethod,
   acpSessionUpdate,
@@ -503,6 +504,12 @@ function activityLocations(root: string, locations: Tool['locations']) {
       : [];
   });
 }
+const trailingKinds = new Set<AcpDiagnostic['sessionUpdate']>([
+  'usage_update',
+  'available_commands_update',
+  'session_info_update',
+  'tool_call_update',
+]);
 const editArgumentNames = AcpDiagnosticSchema.shape.editArguments.unwrap().element.options;
 const knownEditArguments = new Set<string>(editArgumentNames.filter((name) => name !== 'other'));
 function editArguments(input: unknown): AcpDiagnostic['editArguments'] {
@@ -644,9 +651,10 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
   let reply: ((binding: ApprovalBinding, decision: 'approved' | 'denied') => void) | undefined;
   let settled = false;
   let refusal: 'permission' | null = null;
+  let trailingUpdates = 0;
   const handle = startAcpProcess(
     { ...options, timeoutMs: options.timeoutMs ?? 300000 },
-    async (connection, onStop): Promise<AcpWriterCompletion> => {
+    async (connection, onStop, settle): Promise<AcpWriterCompletion> => {
       const proof = await initialize(connection, options.client);
       if (hashCanonical(proof.capabilities) !== hashCanonical(plan.proof.capabilities))
         throw new AcpError('configuration');
@@ -799,11 +807,20 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
         }
       };
       connection.onNotification = (method, params) => {
-        if (settled)
+        if (settled) {
+          const late = method === 'session/update' ? acpSessionUpdate(params.update) : undefined;
+          // Usage and progress updates can trail the terminal response and change
+          // nothing, so count them. Anything else after that response still fails.
+          if (params.sessionId === sessionId && late && trailingKinds.has(late)) {
+            trailingUpdates++;
+            return;
+          }
           throw new AcpError('protocol', {
             site: 'notification-after-terminal',
             method: acpMethod(method),
+            ...(late ? { sessionUpdate: late } : {}),
           });
+        }
         if (method !== 'session/update' || params.sessionId !== sessionId)
           throw new AcpError('protocol', {
             site: 'notification-session',
@@ -972,8 +989,7 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
         (!cancelled && terminal.stopReason === 'cancelled')
       )
         throw new AcpError('protocol', { site: 'prompt-terminal-state', method: 'session/prompt' });
-      await closeSession(connection, proof, sessionId);
-      return {
+      const completion: AcpWriterCompletion = {
         sessionId,
         stopReason: terminal.stopReason,
         submitted: true,
@@ -981,6 +997,16 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
         reviewModeHash: hashCanonical(mode),
         targetHash: expectedTargetHash,
       };
+      settle(completion);
+      try {
+        await closeSession(connection, proof, sessionId);
+      } catch (error) {
+        // Closing is cleanup. The terminal response already decided the turn.
+        connection.noteDiagnostic(
+          acpErrorAt(error, { site: 'session-close', method: 'session/close' }).diagnostic,
+        );
+      }
+      return completion;
     },
   );
   return {
@@ -991,6 +1017,7 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
         outcome.reason ??
         refusal ??
         (outcome.metadata?.stopReason === 'cancelled' ? ('stopped' as const) : null),
+      trailingUpdates,
     })),
     stop: () => {
       if (!settled) handle.stop();

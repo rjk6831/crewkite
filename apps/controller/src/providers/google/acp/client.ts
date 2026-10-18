@@ -88,6 +88,7 @@ export const AcpDiagnosticSchema = z.strictObject({
       'current_mode_update',
       'usage_update',
       'available_commands_update',
+      'session_info_update',
       'other',
     ])
     .optional(),
@@ -269,6 +270,9 @@ export class AcpConnection {
   get stdoutBytes() {
     return this.received;
   }
+  get failed() {
+    return this.failure !== null;
+  }
   private write(value: unknown) {
     if (this.failure || this.output.destroyed || !this.output.writable)
       throw this.failure ?? new AcpError('protocol', { site: 'write' });
@@ -416,7 +420,11 @@ function sync(callback: () => unknown) {
 /** A protocol result cannot release ownership before all streams and the group end. */
 export function startAcpProcess<T>(
   options: AcpProcessOptions,
-  work: (connection: AcpConnection, onStop: (stop: () => void) => void) => Promise<T>,
+  work: (
+    connection: AcpConnection,
+    onStop: (stop: () => void) => void,
+    settle: (metadata: T) => void,
+  ) => Promise<T>,
 ) {
   const now = options.now ?? (() => performance.now());
   const started = now();
@@ -542,14 +550,22 @@ export function startAcpProcess<T>(
   );
   const result = (async (): Promise<AcpProcessOutcome<T>> => {
     let metadata: T | null = null;
+    let working = true;
     try {
       if (!group) throw new AcpError('launch');
       sync(() => options.lifecycle.owned(group));
       metadata = await Promise.race([
-        work(connection, (callback) => {
-          stopper = callback;
-          if (stopping) callback();
-        }),
+        work(
+          connection,
+          (callback) => {
+            stopper = callback;
+            if (stopping) callback();
+          },
+          (value) => {
+            // A terminal outcome recorded before any failure survives a later cleanup error.
+            if (working && !connection.failed) metadata = value;
+          },
+        ),
         failed.promise,
       ]);
       completed = true;
@@ -557,6 +573,7 @@ export function startAcpProcess<T>(
       connection.noteDiagnostic(acpErrorAt(error, { site: 'work' }).diagnostic);
       reason ??= error instanceof AcpError ? error.reason : 'protocol';
     }
+    working = false;
     {
       shutdown();
       const closedInTime = await Promise.race([

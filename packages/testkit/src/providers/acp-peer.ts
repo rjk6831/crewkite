@@ -38,6 +38,8 @@ export const acpPeerCases = [
   'no-close',
   'usage-refusal',
   'activity-locations',
+  'after-terminal',
+  'late-permission',
 ] as const;
 export type AcpPeerCase = (typeof acpPeerCases)[number];
 
@@ -347,7 +349,31 @@ export function runAcpPeer(scenario: AcpPeerCase) {
             content: { type: 'text', text: 'late inert output' },
           });
         terminal('cancelled');
-      } else if (message.method === 'session/close') result(message.id, {});
+      } else if (message.method === 'session/close') {
+        // Close follows the terminal response, so these messages trail the finished turn.
+        if (scenario === 'after-terminal') {
+          update({ sessionUpdate: 'usage_update', used: 24, size: 1024 });
+          emit({
+            jsonrpc: '2.0',
+            id: message.id,
+            error: { code: -32603, message: 'private-close-failure' },
+          });
+          return;
+        }
+        if (scenario === 'late-permission')
+          emit({
+            jsonrpc: '2.0',
+            id: 'permission-late',
+            method: 'session/request_permission',
+            params: {
+              sessionId: 'fixture-session',
+              toolCall: { toolCallId: 'fixture-late' },
+              options: [{ optionId: 'once', name: 'Once', kind: 'allow_once' }],
+            },
+          });
+        result(message.id, {});
+      } else if (message.id === 'permission-late')
+        assert.equal(message.result?.outcome?.outcome, 'cancelled');
       else if (message.id === 'permission-1' || message.id === 'permission-2') {
         if (message.result?.outcome?.outcome === 'selected') {
           assert.equal(message.result.outcome.optionId, 'once');

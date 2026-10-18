@@ -873,6 +873,8 @@ test('the acp protocol consumes one complete live permission and never treats co
     'duplicate',
     'usage-refusal',
     'activity-locations',
+    'after-terminal',
+    'late-permission',
   ] as const) {
     const f = fixture(scenario);
     let permissions = 0,
@@ -940,6 +942,25 @@ test('the acp protocol consumes one complete live permission and never treats co
             { toolCallId, status: 'completed', locations: [] },
           ]),
         );
+      } else if (scenario === 'after-terminal') {
+        // A trailing usage update and a failed close leave the finished turn intact.
+        assert.equal(outcome.reason, null);
+        assert.equal(outcome.metadata?.stopReason, 'end_turn');
+        assert.equal(outcome.trailingUpdates, 1);
+        assert.deepEqual(outcome.diagnostic, {
+          site: 'rpc-error',
+          method: 'session/close',
+          rpcCode: -32603,
+        });
+      } else if (scenario === 'late-permission') {
+        // A permission request after the terminal response still refuses.
+        assert.equal(outcome.reason, 'permission');
+        assert.equal(outcome.metadata?.stopReason, 'end_turn');
+        assert.equal(permissions, 0);
+        assert.deepEqual(outcome.diagnostic, {
+          site: 'request-method',
+          method: 'session/request_permission',
+        });
       } else {
         assert(outcome.reason, scenario);
         if (scenario === 'hunk-drift') assert.equal(permissions, 1, scenario);

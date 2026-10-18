@@ -12471,6 +12471,7 @@ export class Controller {
             signal: outcome?.signal ?? null,
             stdoutBytes: outcome?.stdoutBytes ?? 0,
             stderrBytes: outcome?.stderrBytes ?? 0,
+            trailingUpdates: outcome?.trailingUpdates ?? 0,
             ...(unspawned ? { unspawned: true } : {}),
           });
           this.store.saveReceipt(`native-completion:${attempt.id}`, done.hash, 'local-owner', {

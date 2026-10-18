@@ -8134,6 +8134,7 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     assert.equal(completion.signal, null);
     assert(completion.stdoutBytes > 0);
     assert.equal(completion.stderrBytes, 0);
+    assert.equal(completion.trailingUpdates, 0);
     assert(controller.store.receipt(`native-acp-capture:${intent.attempt_id}`));
     assert.equal(controller.snapshot().tasks[0].state, 'stopped');
     assert.equal(readFileSync(join(source.directory, 'net.mjs'), 'utf8'), original);
