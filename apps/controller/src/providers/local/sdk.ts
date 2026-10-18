@@ -691,7 +691,7 @@ export function startLocalPrediction(
       const structured = localStructuredOutput(plan.binding);
       const responseOptions: LLMRespondOpts = {
         maxTokens: outputTokens,
-        reasoningBudget: 1024,
+        reasoningBudget: 1536,
         temperature: 0.1,
         enableThinking: true,
         contextOverflowPolicy: 'stopAtLimit',
@@ -750,7 +750,7 @@ export function startLocalPrediction(
         'llm.prediction.reasoning.budgetTokens',
         'reasoning-budget',
         z.object({ checked: z.boolean(), value: z.number().int().positive().safe() }),
-        (value) => value.checked && value.value === 1024,
+        (value) => value.checked && value.value === 1536,
       );
       // Engine protocol removes prediction-time draft keys. Its loaded configuration owns drafting.
       // SDK 2.1 defines absent load selectors as false and the absent draft model as empty.

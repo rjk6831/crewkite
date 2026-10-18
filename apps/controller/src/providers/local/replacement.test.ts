@@ -106,7 +106,7 @@ function terminal(
       'llm.prediction.contextOverflowPolicy': 'stopAtLimit',
       'llm.prediction.temperature': 0.1,
       'llm.prediction.reasoning.enableThinking': true,
-      'llm.prediction.reasoning.budgetTokens': { checked: true, value: 1024 },
+      'llm.prediction.reasoning.budgetTokens': { checked: true, value: 1536 },
       'llm.prediction.speculativeDecoding.draftModel': '',
       'llm.prediction.structured': localStructuredOutput(input.binding).format,
     }),
@@ -1061,7 +1061,7 @@ test('Local ownership needs the same prediction terminal after cancellation or c
     assert.equal(markers, 1, row);
     assert.equal(f.prompt, 'rendered chat');
     assert.equal(f.options?.maxTokens, 2048);
-    assert.equal(f.options?.reasoningBudget, 1024);
+    assert.equal(f.options?.reasoningBudget, 1536);
     assert.equal(f.options?.temperature, 0.1);
     assert.equal(f.options?.enableThinking, true);
     assert.equal(f.options?.contextOverflowPolicy, 'stopAtLimit');
