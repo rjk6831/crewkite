@@ -600,7 +600,7 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       frames: [init, usageEvent({ rateLimitGraceActive: true, overageStatus }), result],
       diagnostic: { site: 'rate-limit', cause: 'unsupported', field: 'rateLimitGraceActive' },
     })),
-    ...[undefined, 'rejected'].map((overageStatus) => ({
+    ...[undefined, 'rejected', 'future_status'].map((overageStatus) => ({
       name: `grace metadata with ${overageStatus ?? 'unreported'} paid status supplies no paid-use proof`,
       frames: [init, usageEvent({ rateLimitGraceActive: true, overageStatus }), result],
       pass: true,
@@ -764,9 +764,41 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       frames: [init, { ...rateLimit, session_id: '46eb17cd-01e8-480d-99f4-a741f189715e' }, result],
     },
     {
-      name: 'unknown rate limit status',
-      frames: [init, { ...rateLimit, rate_limit_info: { status: secret } }, result],
+      name: 'rate limit labels from a newer client stay advisory',
+      frames: [
+        init,
+        usageEvent({
+          status: secret,
+          rateLimitType: secret,
+          overageStatus: secret,
+          overageDisabledReason: secret,
+          limitScope: secret,
+          errorCode: secret,
+          utilization: 0.5,
+          resetsAt: fiveHourReset,
+        }),
+        usageEvent({
+          rateLimitType: 'future_window',
+          utilization: 0.9,
+          unifiedWindows: { five_hour: reading(0.25, fiveHourReset) },
+        }),
+        result,
+      ],
+      pass: true,
+      usage: [{ windows: [fiveHour(75)], paid: null }],
     },
+    ...[
+      'status',
+      'rateLimitType',
+      'overageStatus',
+      'overageDisabledReason',
+      'limitScope',
+      'errorCode',
+    ].map((label) => ({
+      name: `rate limit ${label} label remains bounded`,
+      frames: [init, usageEvent({ [label]: 'x'.repeat(129) }), result],
+      diagnostic: { site: 'rate-limit', cause: 'validation' },
+    })),
     ...['resetsAt', 'utilization', 'overageResetsAt', 'surpassedThreshold'].map((field) => ({
       name: `rate limit ${field} remains bounded`,
       frames: [init, { ...rateLimit, rate_limit_info: { status: 'allowed', [field]: -1 } }, result],

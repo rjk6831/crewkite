@@ -202,47 +202,24 @@ const retry = identity.extend({
 });
 
 const metadataNumber = z.number().finite().nonnegative().max(Number.MAX_SAFE_INTEGER);
-const rateLimitStatus = z.enum(['allowed', 'allowed_warning', 'rejected']);
+// Labels describe account state and grant nothing, so a value a newer client adds stays readable.
+// The use flags report served paid use and stay strict.
+const rateLimitLabel = z.string().max(128);
 const rateLimitInfo = z.object({
-  status: rateLimitStatus,
+  status: rateLimitLabel,
   resetsAt: metadataNumber.optional(),
-  rateLimitType: z
-    .enum([
-      'five_hour',
-      'seven_day',
-      'seven_day_opus',
-      'seven_day_sonnet',
-      'seven_day_overage_included',
-      'overage',
-    ])
-    .optional(),
+  rateLimitType: rateLimitLabel.optional(),
   utilization: metadataNumber.optional(),
-  overageStatus: rateLimitStatus.optional(),
+  overageStatus: rateLimitLabel.optional(),
   overageResetsAt: metadataNumber.optional(),
-  overageDisabledReason: z
-    .enum([
-      'overage_not_provisioned',
-      'org_level_disabled',
-      'org_level_disabled_until',
-      'out_of_credits',
-      'seat_tier_level_disabled',
-      'member_level_disabled',
-      'seat_tier_zero_credit_limit',
-      'group_zero_credit_limit',
-      'member_zero_credit_limit',
-      'org_service_level_disabled',
-      'no_limits_configured',
-      'fetch_error',
-      'unknown',
-    ])
-    .optional(),
+  overageDisabledReason: rateLimitLabel.optional(),
   isUsingOverage: z.boolean().optional(),
   overageInUse: z.boolean().optional(),
   overageEnabled: z.boolean().optional(),
   rateLimitGraceActive: z.boolean().optional(),
   surpassedThreshold: metadataNumber.optional(),
-  limitScope: z.enum(['service', 'channel', 'group_pool']).optional(),
-  errorCode: z.literal('credits_required').optional(),
+  limitScope: rateLimitLabel.optional(),
+  errorCode: rateLimitLabel.optional(),
   canUserPurchaseCredits: z.boolean().optional(),
   hasChargeableSavedPaymentMethod: z.boolean().optional(),
 });
@@ -263,6 +240,8 @@ const usageWindows = {
   seven_day_sonnet: { kind: 'model', semantics: { scope: 'model' } },
   seven_day_overage_included: { kind: 'model', semantics: { scope: 'model' } },
 } as const satisfies Record<string, Pick<Observation, 'kind' | 'semantics'>>;
+const isWindow = (name: string | undefined): name is keyof typeof usageWindows =>
+  name !== undefined && Object.hasOwn(usageWindows, name);
 // The last Unix second that still prints as a four-digit-year ISO timestamp.
 const epochSeconds = z.number().int().nonnegative().max(253_402_300_799);
 // Usage can run past the cap, but a reading above twice the cap is not plausible from this
@@ -313,7 +292,7 @@ export function projectAnthropicUsage(event: unknown): AnthropicUsage {
       const reading = info.unifiedWindows[windowId];
       if (reading) readings.set(windowId, reading);
     }
-  } else if (type && type !== 'overage' && info.utilization !== undefined) {
+  } else if (isWindow(type) && info.utilization !== undefined) {
     // The top-level fields name the window closest to its limit and can repeat a reading held
     // since an earlier response. They count only when the event has no per-response readings.
     if (info.resetsAt !== undefined && unixTime(info.resetsAt) === null)
