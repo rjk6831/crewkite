@@ -52,6 +52,7 @@ export const AcpDiagnosticSchema = z.strictObject({
     'tool-duplicate',
     'permission-drift',
     'message-content',
+    'edit-location',
     'activity-sink',
     'request-method',
     'permission-request',

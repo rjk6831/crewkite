@@ -882,6 +882,17 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
         const call = ['tool_call', 'tool_call_update'].includes(kind)
           ? acpValidate(diagnostic('tool-update'), () => toolUpdate.parse(update))
           : null;
+        const locations = call ? activityLocations(options.scratch, call.locations) : [];
+        if (
+          call &&
+          locations.length < (call.locations?.length ?? 0) &&
+          fileChangingKinds.has(tools.get(call.toolCallId)?.kind ?? '')
+        ) {
+          // A tool that changes files named a path outside the scratch. The turn may
+          // finish, but its result stays unverified and cannot be captured.
+          connection.noteDiagnostic(diagnostic('edit-location'));
+          refusal = 'permission';
+        }
         const supported = AcpActivitySchema.safeParse({
           sessionId,
           sessionUpdate: kind,
@@ -889,7 +900,7 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
             ? {
                 toolCallId: call.toolCallId,
                 ...(call.status ? { status: call.status } : {}),
-                locations: activityLocations(options.scratch, call.locations),
+                locations,
               }
             : {}),
         });

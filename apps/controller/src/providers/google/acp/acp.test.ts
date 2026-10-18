@@ -880,6 +880,7 @@ test('the acp protocol consumes one complete live permission and never treats co
     'late-message',
     'open-edits',
     'hunk-open',
+    'outside-edit',
   ] as const) {
     const f = fixture(scenario);
     let permissions = 0,
@@ -993,6 +994,15 @@ test('the acp protocol consumes one complete live permission and never treats co
           site: 'incomplete-tool-terminal',
           method: 'session/prompt',
           pendingToolCount: scenario === 'hunk-open' ? 1 : 3,
+        });
+      } else if (scenario === 'outside-edit') {
+        // A delete outside the scratch lets the turn finish, but it cannot be captured.
+        assert.equal(outcome.reason, 'permission');
+        assert.equal(outcome.metadata?.stopReason, 'end_turn');
+        assert.deepEqual(outcome.diagnostic, {
+          site: 'edit-location',
+          method: 'session/update',
+          sessionUpdate: 'tool_call',
         });
       } else if (scenario === 'pending-end') {
         // A permission still pending at the terminal response refuses the turn.

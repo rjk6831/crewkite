@@ -45,6 +45,7 @@ export const acpPeerCases = [
   'late-message',
   'open-edits',
   'hunk-open',
+  'outside-edit',
 ] as const;
 export type AcpPeerCase = (typeof acpPeerCases)[number];
 
@@ -327,6 +328,16 @@ export function runAcpPeer(scenario: AcpPeerCase) {
             });
             update({ sessionUpdate: 'tool_call_update', toolCallId, status: 'completed' });
           }
+          terminal('end_turn');
+        } else if (scenario === 'outside-edit') {
+          update({
+            sessionUpdate: 'tool_call',
+            toolCallId: 'fixture-outside-delete',
+            title: 'delete',
+            kind: 'delete',
+            status: 'completed',
+            locations: [{ path: join(cwd, '..', 'outside.md') }],
+          });
           terminal('end_turn');
         } else if (scenario === 'open-tools' || scenario === 'open-edits') {
           // Tools that stay open across the turn end.
