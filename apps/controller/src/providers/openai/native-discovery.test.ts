@@ -318,7 +318,14 @@ test('native discovery returns metadata only after its owned process and descend
       assert.equal(result.quiescent, true, mode);
       assert(handle.groups.every(groupAbsent), mode);
     }
-    for (const mode of ['queued-close', 'unobserved-close', 'live-at-cutoff']) {
+    for (const mode of [
+      'queued-close',
+      'unobserved-close',
+      'live-at-cutoff',
+      'late-kill',
+      'late-kill-reversed',
+      'late-kill-near-deadline',
+    ]) {
       const directory = resolve(root, mode);
       mkdirSync(directory, { mode: 0o700 });
       const schedules: Array<{ milliseconds: number; work: () => void; live: boolean }> = [];
@@ -424,6 +431,14 @@ test('native discovery returns metadata only after its owned process and descend
           schedules.some((row) => row.live && row.milliseconds === 0),
           false,
         );
+      } else if (mode.startsWith('late-kill')) {
+        // A blocked loop runs an owned task's stop timers in one pass. Node runs one duration
+        // list at a time, so an older 2000 ms list can reach the cutoff before the kill.
+        clock = mode === 'late-kill-near-deadline' ? 299_500 : 2000;
+        for (const milliseconds of mode === 'late-kill-reversed'
+          ? [250, 2000, 1000]
+          : [250, 1000, 2000])
+          fire(milliseconds);
       } else {
         onExit = () => {
           try {
@@ -445,15 +460,22 @@ test('native discovery returns metadata only after its owned process and descend
       const result = await handle.result;
       assert.ifError(callbackError);
       assert.equal(result.metadata, null, mode);
-      assert.equal(result.quiescent, mode === 'queued-close', mode);
-      assert.equal(result.reason, mode === 'queued-close' ? 'stopped' : 'ownership', mode);
+      const quiet = mode === 'queued-close' || mode.startsWith('late-kill');
+      assert.equal(result.quiescent, quiet, mode);
+      assert.equal(result.reason, quiet ? 'stopped' : 'ownership', mode);
+      if (mode === 'late-kill-near-deadline')
+        assert(
+          schedules.some((row) => row.milliseconds === 500),
+          `${mode}: the late kill waits only until the deadline`,
+        );
       if (mode === 'live-at-cutoff') child.stdin.end();
       await closed;
       assert(groupAbsent(child.pid as number));
       assert.deepEqual(await handle.result, result, `${mode}: late closure cannot heal a result`);
       assert.equal(
-        schedules.some((row) => row.live && row.milliseconds === 0),
+        schedules.some((row) => row.live),
         false,
+        `${mode}: settlement cancels every timer`,
       );
     }
     const lifecycleCases = [

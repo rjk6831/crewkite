@@ -230,6 +230,7 @@ function startTranscript<T>(
   let stderrBytes = 0;
   let stopping = false;
   let owned = false;
+  let killedAt: number | undefined;
   let exitCode: number | null = null;
   let exitSignal: NodeJS.Signals | null = null;
   const cancellations: Array<() => void> = [];
@@ -273,6 +274,30 @@ function startTranscript<T>(
       // Only an observed absent group proves that a failed signal needs no further action.
     }
   };
+  const settleAtCutoff = () => {
+    // An exited group can precede delivery of its final stream-close event.
+    if (group > 0 && !closed && absent())
+      cancellations.push(schedule(() => settle(closed && absent()), 0));
+    else settle(closed && absent());
+  };
+  const cutoff = () => {
+    if (finished) return;
+    if (absent()) return settleAtCutoff();
+    // Timers run before the poll phase that reaps children. When synchronous work holds the
+    // loop past the cutoff, KILL and this check run in one pass, microseconds apart, and an
+    // owned task's deferred TERM runs with them. Node runs one timer list per duration at a
+    // time, so an older 2000 ms list can even reach this check before the 1000 ms kill.
+    // Deciding after one poll phase lets that kill go out and the child be reaped. A group
+    // still present then gets a full second from its kill, still inside a task's deadline.
+    setImmediate(() => {
+      if (finished) return;
+      if (absent()) return settleAtCutoff();
+      const late = killedAt === undefined ? 0 : killedAt + 1000 - now();
+      const wait = options.task ? Math.min(late, deadline - now()) : late;
+      if (wait > 0) cancellations.push(schedule(settleAtCutoff, wait));
+      else settle(false);
+    });
+  };
   const stop = (failure: Outcome['reason']) => {
     if (finished) return;
     reason ??= failure;
@@ -301,20 +326,15 @@ function startTranscript<T>(
     if (!options.task || !owned) signal('SIGTERM');
     cancellations.push(
       schedule(
-        () => signal('SIGKILL'),
+        () => {
+          killedAt = now();
+          signal('SIGKILL');
+        },
         options.task ? Math.max(0, Math.min(1000, deadline - now())) : 1000,
       ),
     );
     cancellations.push(
-      schedule(
-        () => {
-          // An exited group can precede delivery of its final stream-close event.
-          if (group > 0 && !closed && absent())
-            cancellations.push(schedule(() => settle(closed && absent()), 0));
-          else settle(closed && absent());
-        },
-        options.task ? Math.max(0, Math.min(2000, deadline - now())) : 2000,
-      ),
+      schedule(cutoff, options.task ? Math.max(0, Math.min(2000, deadline - now())) : 2000),
     );
   };
   let submissionReported = false;
