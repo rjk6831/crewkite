@@ -365,12 +365,14 @@ async function nativeSetup(
               ? 'hold'
               : mode === 'anthropic-overage'
                 ? 'overage'
-                : mode === 'anthropic-quota'
+                : mode === 'anthropic-quota' || mode === 'anthropic-quota-future'
                   ? 'quota'
                   : mode === 'anthropic-auth-api'
                     ? 'auth-api'
                     : 'success',
         });
+        if (mode === 'anthropic-quota-future')
+          transcript = transcript.replace('resetsAt:1792000000', 'resetsAt:1792094400');
       }
       if (googleChild) {
         transcript = googleFixture(args, {

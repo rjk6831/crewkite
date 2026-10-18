@@ -637,6 +637,33 @@ const nativeFailureNext = (outcome: NativeOutcome | null) => {
     return 'Native work is unverified. Inspect retained ownership and artifacts.';
   return `Native output was refused by protocol checks at ${site}${field ? `.${field}` : ''} (${cause}). Inspect retained ownership and artifacts.`;
 };
+
+const NativeQuotaFailureSchema = z.strictObject({
+  kind: z.literal('usage-limit'),
+  rateLimitType: z.enum([
+    'five_hour',
+    'seven_day',
+    'seven_day_opus',
+    'seven_day_sonnet',
+    'seven_day_overage_included',
+  ]),
+  resetsAt: z.iso.datetime(),
+});
+const NativeQuotaCompletionSchema = z.strictObject({
+  attemptId: AttemptSchema.shape.id,
+  reason: z.literal('provider'),
+  quiescent: z.literal(true),
+  diagnostic: z.strictObject({
+    stage: z.literal('output'),
+    site: z.literal('result'),
+    cause: z.literal('provider-error'),
+    envelope: z.string(),
+    subtype: z.string().nullable(),
+    field: z.literal('is_error'),
+    providerFailure: NativeQuotaFailureSchema,
+  }),
+  ignoredNotifications: z.record(z.string(), z.number()).optional(),
+});
 type AcpSetupCommand = Extract<
   Command,
   {
@@ -920,6 +947,7 @@ export class Controller {
   private profiles: NativeProfileResolution[];
   private closing?: Promise<void>;
   private readonly workers = new Map<string, FakeRuntime | NativeRuntime>();
+  private readonly quotaRetries = new Map<string, () => void>();
   private openAiUsageRead?: {
     id: string;
     stopped: boolean;
@@ -1036,6 +1064,7 @@ export class Controller {
         ownsTurn: (binding, phase) => this.ownsConversationTurn(binding, phase),
       });
       this.recover();
+      this.armQuotaRetries();
       for (const row of this.store.db
         .prepare("SELECT candidate_id FROM publications WHERE state='prepared'")
         .all())
@@ -1088,9 +1117,17 @@ export class Controller {
           };
     if (
       command.command === 'ResumeRun' &&
+      !this.store.receipt(command.key) &&
       this.store.receipt(`native-run:${command.payload.runId}`)
-    )
-      return { outcome: 'blocked', reason: 'native-pilot-retain-only' };
+    ) {
+      try {
+        const run = this.store.get<Run>('run', command.payload.runId);
+        if (!run) throw Error('Native run is unavailable.');
+        this.quotaRetryEvidence(run, true);
+      } catch {
+        return { outcome: 'blocked', reason: 'native-pilot-retain-only' };
+      }
+    }
     if (!('expectedRevision' in command)) {
       try {
         return CommandResultSchema.parse(this.apply(command, []));
@@ -1105,6 +1142,7 @@ export class Controller {
     let preflightFailure: CommandResult | undefined;
     if (
       command.command === 'ResumeRun' &&
+      !this.store.receipt(`native-run:${command.payload.runId}`) &&
       !this.store.receipt(command.key) &&
       !this.checkRevision(command)
     ) {
@@ -2271,6 +2309,8 @@ export class Controller {
   close(): void | Promise<void> {
     if (this.closed) return this.closing;
     this.closed = true;
+    for (const cancel of this.quotaRetries.values()) cancel();
+    this.quotaRetries.clear();
     const native: Promise<unknown>[] = [];
     if (this.acpStart) {
       this.acpStart.aborted = true;
@@ -2503,8 +2543,16 @@ export class Controller {
     }
     if ('taskId' in command.payload && ['ResumeRun', 'SwitchRoute'].includes(command.command)) {
       const task = this.store.get<Task>('task', command.payload.taskId);
-      if (task?.runId && this.store.receipt(`native-run:${task.runId}`))
-        return { outcome: 'blocked', reason: 'native-pilot-retain-only' };
+      if (task?.runId && this.store.receipt(`native-run:${task.runId}`)) {
+        try {
+          if (command.command !== 'ResumeRun') throw Error('Native switch is unavailable.');
+          const run = this.store.get<Run>('run', task.runId);
+          if (!run) throw Error('Native run is unavailable.');
+          this.quotaRetryEvidence(run, true);
+        } catch {
+          return { outcome: 'blocked', reason: 'native-pilot-retain-only' };
+        }
+      }
     }
     if (
       'taskId' in command.payload &&
@@ -3603,7 +3651,7 @@ export class Controller {
   private taskAllowance(taskId: string) {
     const config = this.conversationConfiguration(taskId);
     if (!config) return null;
-    const intents = this.store.intents();
+    const intents = this.chargeableIntents();
     const combined = this.store.combinedGroup(taskId);
     const memberRun = combined
       ? this.store.combinedMembers(combined.run_id).find((member) => member.task_id === taskId)
@@ -3657,15 +3705,16 @@ export class Controller {
   }
 
   private remaining(run: Run) {
+    const intents = this.chargeableIntents();
     const group = this.store.combinedGroup(run.id);
     const own = group
       ? remainingCombinedBudgets(
           this.store.get<Run>('run', group.run_id) as Run,
-          this.store.intents(),
+          intents,
           this.store.combinedDispatches(group.run_id),
           group,
         )
-      : remainingBudgets(run, this.store.intents());
+      : remainingBudgets(run, intents);
     let task = this.taskAllowance(group?.task_id ?? run.taskId);
     if (group && group.task_id !== run.taskId) {
       const child = this.taskAllowance(run.taskId);
@@ -3685,6 +3734,26 @@ export class Controller {
           concurrency: Math.min(own.concurrency, task.concurrency),
         }
       : own;
+  }
+
+  private confirmedQuotaDenial(intent: LaunchIntent) {
+    try {
+      if (this.store.combinedGroup(intent.run_id)) return false;
+      const completion = NativeQuotaCompletionSchema.parse(
+        this.nativeRecord(`native-completion:${intent.attempt_id}`, 4096).value,
+      );
+      return (
+        completion.attemptId === intent.attempt_id &&
+        this.store.nativeProcesses(intent.attempt_id).length > 0 &&
+        this.store.nativeProcesses(intent.attempt_id).every((phase) => phase.state === 'quiescent')
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  private chargeableIntents() {
+    return this.store.intents().filter((intent) => !this.confirmedQuotaDenial(intent));
   }
 
   private conversationBoundary(
@@ -6553,6 +6622,19 @@ export class Controller {
       return this.admitConversation(run.taskId, effects);
     }
     if (this.closed) return { outcome: 'blocked', reason: 'controller-closing' };
+    if (
+      !native &&
+      run &&
+      command.command === 'ResumeRun' &&
+      this.store.receipt(`native-run:${run.id}`)
+    ) {
+      try {
+        native = this.quotaRetryBinding(run);
+        planned = native.attempt;
+      } catch {
+        return { outcome: 'blocked', reason: 'native-pilot-retain-only' };
+      }
+    }
     if (!native && run && this.store.receipt(`native-run:${run.id}`)) {
       if (
         command.command !== 'StartRun' ||
@@ -6663,7 +6745,7 @@ export class Controller {
           : {}),
       });
     }
-    const spent = this.store.intents().filter((intent) => intent.run_id === run.id).length;
+    const spent = this.chargeableIntents().filter((intent) => intent.run_id === run.id).length;
     const reviewReserve = (run.policy.policy.methods ?? []).reduce(
       (sum, method) => sum + method.cycles,
       0,
@@ -6751,7 +6833,7 @@ export class Controller {
         { outcome: 'applied', entity: authority.artifact },
       );
     }
-    if (allocation) this.consumeGrant(run, allocation);
+    if (allocation && !allocated) this.consumeGrant(run, allocation);
     if (nativeTools) this.consumeGrant(run, nativeTools);
     if (!allocated)
       this.store.saveReceipt(
@@ -6860,6 +6942,180 @@ export class Controller {
       else this.launch(intent, admitted, attempt);
     });
     return { outcome: 'applied', entity: updated, revision: updated.revision };
+  }
+
+  private quotaRetryEvidence(run: Run, resetElapsed: boolean) {
+    if (this.store.combinedGroup(run.id)) throw Error('Combined quota retry is unavailable.');
+    const task = this.store.get<Task>('task', run.taskId);
+    const origin = NativePreparationSchema.parse(this.nativeRecord(`native-run:${run.id}`).value);
+    const intents = this.store.intents().filter((value) => value.run_id === run.id);
+    const generations = new Map<number, LaunchIntent>();
+    for (const value of intents) {
+      if (generations.has(value.generation)) throw Error('Quota retry generation is ambiguous.');
+      generations.set(value.generation, value);
+    }
+    const intent = intents.reduce<LaunchIntent | undefined>(
+      (latest, value) => (!latest || value.generation > latest.generation ? value : latest),
+      undefined,
+    );
+    if (!task || !intent) throw Error('Quota retry is unavailable.');
+    const attempt = this.store.get<Attempt>('attempt', intent.attempt_id);
+    const completion = NativeQuotaCompletionSchema.parse(
+      this.nativeRecord(`native-completion:${intent.attempt_id}`, 4096).value,
+    );
+    const reset = Date.parse(completion.diagnostic.providerFailure.resetsAt);
+    const phases = this.store.nativeProcesses(intent.attempt_id);
+    if (
+      task.runId !== run.id ||
+      task.state !== 'interrupted' ||
+      this.store.receipt(`paused:${run.id}`) ||
+      this.hasUncertainWriter(task.id) ||
+      !attempt ||
+      attempt.state !== 'stopped' ||
+      attempt.id !== completion.attemptId ||
+      intent.task_id !== task.id ||
+      intent.route_id !== attempt.routeId ||
+      intent.generation !== attempt.generation ||
+      !phases.length ||
+      phases.some((phase) => phase.state !== 'quiescent') ||
+      origin.appointment.route.family !== 'anthropic' ||
+      'repository' in origin.appointment ||
+      !('target' in origin.appointment) ||
+      origin.run.id !== run.id ||
+      hashCanonical(origin.run.source) !== hashCanonical(run.source) ||
+      hashCanonical(origin.run.policy) !== hashCanonical(run.policy) ||
+      hashCanonical(origin.run.roles) !== hashCanonical(run.roles) ||
+      origin.appointment.consent.criteriaHash !== hashCanonical(task.criteria) ||
+      Date.parse(origin.appointment.expiresAt) <= Date.parse(this.now()) ||
+      !this.store.receipt(`allocation:${run.id}`) ||
+      !run.policy.policy.effects.some(
+        (grant) =>
+          grant.action === 'write-scratch' &&
+          grant.taskId === task.id &&
+          !grant.revoked &&
+          Date.parse(grant.expiresAt) > Date.parse(this.now()),
+      ) ||
+      (resetElapsed && reset > Date.parse(this.now()))
+    )
+      throw Error('Quota retry is unavailable.');
+    return { task, origin, attempt, reset, completion };
+  }
+
+  private quotaRetryBinding(run: Run): NativeBinding {
+    const { task, origin, attempt } = this.quotaRetryEvidence(run, true);
+    const appointment = origin.appointment;
+    if (!('target' in appointment)) throw Error('Quota retry target changed.');
+    const profile = this.profileFor(origin.public.profileId);
+    if (
+      !profile.facts.available ||
+      profile.facts.family !== 'anthropic' ||
+      profile.facts.id !== origin.public.profileId ||
+      profile.locationHash !== origin.public.locationHash ||
+      hashCanonical(profile.client) !== hashCanonical(origin.appointment.client) ||
+      this.nativeProfileRoute(profile, appointment.creditPolicy)?.id !== appointment.route.id ||
+      !profile.environment
+    )
+      throw Error('Quota retry profile changed.');
+    const files = committedFiles(this.projectPath(task.projectId) as string, run.source.base);
+    const manifest = files.map(({ content: _content, ...file }) => file);
+    const original = files.find((file) => file.path === appointment.target.path);
+    if (
+      hashCanonical(inspectSource(task.projectId, this.projectPath(task.projectId) as string)) !==
+        hashCanonical(run.source) ||
+      hashCanonical(manifest) !== hashCanonical(origin.manifest) ||
+      !original ||
+      original.hash !== origin.originalHash ||
+      original.hash !== appointment.target.baseHash
+    )
+      throw Error('Quota retry source changed.');
+    const retried = AttemptSchema.parse({
+      id: this.id('att'),
+      runId: run.id,
+      routeId: attempt.routeId,
+      generation: attempt.generation + 1,
+      state: 'intent',
+      revision: 0,
+    });
+    const sessionHash = hashCanonical({ attemptId: retried.id });
+    const binding = freezeNative({
+      appointment,
+      run,
+      attempt: retried,
+      original: original.content.toString('utf8'),
+      baseHash: original.hash,
+      anthropicSessionId: `${sessionHash.slice(0, 8)}-${sessionHash.slice(8, 12)}-8${sessionHash.slice(13, 16)}-a${sessionHash.slice(17, 20)}-${sessionHash.slice(20, 32)}`,
+      manifest,
+      planArtifact: this.nativeRecord(`native-run:${run.id}`).artifact,
+      public: origin.public,
+      environment: { ...profile.environment },
+    });
+    if (!this.nativeConsentCurrent(binding)) throw Error('Quota retry consent changed.');
+    this.nativeWriterPlan(binding);
+    return binding;
+  }
+
+  private armQuotaRetries() {
+    const runIds = new Set(this.store.intents().map((intent) => intent.run_id));
+    for (const runId of runIds) {
+      const run = this.store.get<Run>('run', runId);
+      if (!run || run.policy.policy.authority === 'guided') continue;
+      let reset = 0;
+      let key = '';
+      try {
+        const evidence = this.quotaRetryEvidence(run, false);
+        reset = evidence.reset;
+        key = `quota-retry:${run.id}:${hashCanonical(evidence.completion.diagnostic.providerFailure)}`;
+      } catch {
+        continue;
+      }
+      if (this.store.receipt(key) || this.quotaRetries.has(key)) continue;
+      const cancel = (this.options.schedule ?? defaultSchedule)(
+        () => this.runQuotaRetry(runId, key),
+        Math.max(0, reset - Date.parse(this.now())),
+      );
+      this.quotaRetries.set(key, cancel);
+    }
+  }
+
+  private runQuotaRetry(runId: string, key: string) {
+    this.quotaRetries.delete(key);
+    if (this.closed) return;
+    const effects: (() => void)[] = [];
+    try {
+      this.store.transaction(() => {
+        if (this.store.receipt(key)) return;
+        const run = this.store.get<Run>('run', runId);
+        const task = run && this.store.get<Task>('task', run.taskId);
+        let result: CommandResult = { outcome: 'blocked', reason: 'quota-retry-unavailable' };
+        if (run && task && run.policy.policy.authority !== 'guided') {
+          const command = CommandSchema.parse({
+            protocol: 1,
+            key: this.id('cmd'),
+            actor: { id: 'controller', kind: 'controller' },
+            command: 'ResumeRun',
+            expectedRevision: task.revision,
+            payload: { taskId: task.id, runId: run.id },
+          });
+          result = this.start(command as Extract<Command, { command: 'ResumeRun' }>, effects);
+        }
+        this.store.saveReceipt(key, hashCanonical({ runId, key }), 'local-owner', result);
+      });
+    } catch {
+      effects.length = 0;
+      try {
+        this.store.transaction(() => {
+          if (!this.store.receipt(key))
+            this.store.saveReceipt(key, hashCanonical({ runId, key }), 'local-owner', {
+              outcome: 'blocked',
+              reason: 'quota-retry-unavailable',
+            });
+        });
+      } catch {}
+    }
+    for (const effect of effects)
+      try {
+        effect();
+      } catch {}
   }
 
   private repositoryScope(sourceBase: string, files: NativeBinding['manifest']) {
@@ -13729,6 +13985,7 @@ export class Controller {
           this.settleJob(attempt, false, true);
         } catch {}
       } finally {
+        this.armQuotaRetries();
         completion.resolve();
       }
     };

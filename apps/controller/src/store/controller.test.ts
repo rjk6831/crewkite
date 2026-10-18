@@ -6572,6 +6572,272 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
   }
 });
 
+test('confirmed provider resets resume under the saved authority mode', async (t) => {
+  for (const authority of ['guided', 'balanced', 'autopilot'] as const) {
+    const context = await nativeSetup(t, 'anthropic-quota');
+    let controller = context.controller;
+    const { command, task, appointment } = context;
+    const prepared = await controller.execute(
+      command(
+        'PrepareNativeRun',
+        {
+          taskId: task.id,
+          profileId: context.fixtureProfile.facts.id,
+          targetPath: 'net.mjs',
+          policy: { ...appointment.policy, authority },
+          consent: 'explicit',
+          billingAttestation: {
+            source: 'user-attested',
+            subscriptionLoginConfirmed: true,
+            paidExtraUsageDisabled: true,
+          },
+        },
+        task.revision,
+      ),
+      'local-owner',
+    );
+    assert.equal(prepared.outcome, 'applied');
+    const run = RunSchema.parse(prepared.entity);
+    const interrupted = (attempts: number) =>
+      new Promise<void>((resolve) => {
+        const off = controller.subscribe((event) => {
+          if (
+            event.type === 'task.updated' &&
+            event.taskId === task.id &&
+            event.payload.state === 'interrupted' &&
+            controller.snapshot().attempts.length === attempts
+          ) {
+            off();
+            resolve();
+          }
+        });
+        t.after(off);
+      });
+    const first = interrupted(1);
+    const automatic = authority === 'guided' ? undefined : interrupted(2);
+    assert.equal(
+      (
+        await controller.execute(
+          command(
+            'StartRun',
+            { taskId: task.id, runId: run.id },
+            taskRevision(controller, task.id),
+          ),
+          'local-owner',
+        )
+      ).outcome,
+      'applied',
+    );
+    await context.wait(`${authority} quota denial retained`, first);
+    if (automatic) await context.wait('automatic quota retry retained', automatic);
+    assert.equal(context.submissions(), authority === 'guided' ? 1 : 2);
+    controller = await context.restart();
+    assert.equal(controller.snapshot().attempts.length, authority === 'guided' ? 1 : 2);
+    if (authority === 'guided') {
+      const manual = interrupted(2);
+      const resume = command(
+        'ResumeRun',
+        { taskId: task.id, runId: run.id },
+        taskRevision(controller, task.id),
+      );
+      const resumed = await controller.execute(resume, 'local-owner');
+      assert.equal(resumed.outcome, 'applied', JSON.stringify(resumed));
+      await context.wait('manual quota retry retained', manual);
+      assert.equal((await controller.execute(resume, 'local-owner')).outcome, 'already-applied');
+      assert.equal(context.submissions(), 2);
+    }
+    controller = await context.restart();
+    assert.equal(context.submissions(), 2);
+    assert.equal(controller.snapshot().attempts.length, 2);
+  }
+});
+
+test('future provider resets rearm after restart and obey Stop', async (t) => {
+  const scheduled: { work: () => void; milliseconds: number; cancelled: boolean }[] = [];
+  const schedule: NonNullable<ControllerOptions['schedule']> = (work, milliseconds) => {
+    if (milliseconds === 10_800_000 || milliseconds === 3_600_000) {
+      const entry = { work, milliseconds, cancelled: false };
+      scheduled.push(entry);
+      return () => {
+        entry.cancelled = true;
+      };
+    }
+    const timer = setTimeout(work, milliseconds);
+    return () => clearTimeout(timer);
+  };
+  const context = await nativeSetup(t, 'anthropic-quota-future', { schedule });
+  let controller = context.controller;
+  const { command, task, appointment } = context;
+  const prepared = await controller.execute(
+    command(
+      'PrepareNativeRun',
+      {
+        taskId: task.id,
+        profileId: context.fixtureProfile.facts.id,
+        targetPath: 'net.mjs',
+        policy: { ...appointment.policy, authority: 'balanced' },
+        consent: 'explicit',
+        billingAttestation: {
+          source: 'user-attested',
+          subscriptionLoginConfirmed: true,
+          paidExtraUsageDisabled: true,
+        },
+      },
+      task.revision,
+    ),
+    'local-owner',
+  );
+  const run = RunSchema.parse(prepared.entity);
+  const denied = Promise.withResolvers<void>();
+  context.observe(controller, (event) => {
+    if (event.type === 'task.updated' && event.payload.state === 'interrupted') denied.resolve();
+  });
+  assert.equal(
+    (
+      await controller.execute(
+        command('StartRun', { taskId: task.id, runId: run.id }, taskRevision(controller, task.id)),
+        'local-owner',
+      )
+    ).outcome,
+    'applied',
+  );
+  await context.wait('future quota denial', denied.promise);
+  assert.equal(context.submissions(), 1);
+  assert.equal(scheduled.at(-1)?.milliseconds, 10_800_000);
+  context.clock.advance(7_200_000);
+  controller = await context.restart();
+  assert.equal(scheduled.at(-2)?.cancelled, true);
+  assert.equal(scheduled.at(-1)?.milliseconds, 3_600_000);
+  assert.equal(
+    (
+      await controller.execute(
+        command('StopRun', { taskId: task.id, runId: run.id }, taskRevision(controller, task.id)),
+        'local-owner',
+      )
+    ).outcome,
+    'applied',
+  );
+  context.clock.advance(3_600_000);
+  scheduled.at(-1)?.work();
+  assert.equal(context.submissions(), 1);
+  assert.equal(controller.snapshot().attempts.length, 1);
+});
+
+test('an elapsed provider reset resumes through normal admission', async (t) => {
+  let retry: (() => void) | undefined;
+  const schedule: NonNullable<ControllerOptions['schedule']> = (work, milliseconds) => {
+    if (milliseconds === 10_800_000 || milliseconds === 0) {
+      retry = work;
+      return () => {
+        retry = undefined;
+      };
+    }
+    const timer = setTimeout(work, milliseconds);
+    return () => clearTimeout(timer);
+  };
+  const context = await nativeSetup(t, 'anthropic-quota-future', { schedule });
+  const { controller, command, task, appointment } = context;
+  const prepared = await controller.execute(
+    command(
+      'PrepareNativeRun',
+      {
+        taskId: task.id,
+        profileId: context.fixtureProfile.facts.id,
+        targetPath: 'net.mjs',
+        policy: { ...appointment.policy, authority: 'autopilot' },
+        consent: 'explicit',
+        billingAttestation: {
+          source: 'user-attested',
+          subscriptionLoginConfirmed: true,
+          paidExtraUsageDisabled: true,
+        },
+      },
+      task.revision,
+    ),
+    'local-owner',
+  );
+  const run = RunSchema.parse(prepared.entity);
+  const interrupted = (attempts: number) =>
+    new Promise<void>((resolve) => {
+      context.observe(controller, (event) => {
+        if (
+          event.type === 'task.updated' &&
+          event.payload.state === 'interrupted' &&
+          controller.snapshot().attempts.length === attempts
+        )
+          resolve();
+      });
+    });
+  const first = interrupted(1);
+  assert.equal(
+    (
+      await controller.execute(
+        command('StartRun', { taskId: task.id, runId: run.id }, taskRevision(controller, task.id)),
+        'local-owner',
+      )
+    ).outcome,
+    'applied',
+  );
+  await context.wait('future quota denial before elapsed retry', first);
+  assert(retry);
+  context.clock.advance(10_800_000);
+  const second = interrupted(2);
+  retry();
+  await context.wait('elapsed quota retry retained', second);
+  assert.equal(context.submissions(), 2);
+  assert.equal(controller.snapshot().attempts.at(-1)?.generation, 1);
+});
+
+test('generic provider failures cannot enter quota recovery', async (t) => {
+  const context = await nativeSetup(t, 'anthropic-overage');
+  const { controller, command, task, appointment } = context;
+  const prepared = await controller.execute(
+    command(
+      'PrepareNativeRun',
+      {
+        taskId: task.id,
+        profileId: context.fixtureProfile.facts.id,
+        targetPath: 'net.mjs',
+        policy: { ...appointment.policy, authority: 'balanced' },
+        consent: 'explicit',
+        billingAttestation: {
+          source: 'user-attested',
+          subscriptionLoginConfirmed: true,
+          paidExtraUsageDisabled: true,
+        },
+      },
+      task.revision,
+    ),
+    'local-owner',
+  );
+  const run = RunSchema.parse(prepared.entity);
+  const interrupted = Promise.withResolvers<void>();
+  context.observe(controller, (event) => {
+    if (event.type === 'task.updated' && event.payload.state === 'interrupted')
+      interrupted.resolve();
+  });
+  assert.equal(
+    (
+      await controller.execute(
+        command('StartRun', { taskId: task.id, runId: run.id }, taskRevision(controller, task.id)),
+        'local-owner',
+      )
+    ).outcome,
+    'applied',
+  );
+  await context.wait('generic provider failure', interrupted.promise);
+  assert.equal(
+    (
+      await controller.execute(
+        command('ResumeRun', { taskId: task.id, runId: run.id }, taskRevision(controller, task.id)),
+        'local-owner',
+      )
+    ).reason,
+    'native-pilot-retain-only',
+  );
+  assert.equal(context.submissions(), 1);
+});
+
 test('google quota authority survives retries and restart while sharing one operation gate', async (t) => {
   let controller: Controller;
   let mode: 'success' | 'invalid' | 'incomplete' | 'empty' = 'success';
