@@ -13276,7 +13276,7 @@ export class Controller {
             client: appointment.client,
             ...this.options.googleAcp,
           }),
-          mcpServer: context.server,
+          ...(binding.context.binding.patch ? { mcpServer: context.server } : {}),
           ...this.options.googleAcp,
           spawn: this.options.googleAcp?.spawn,
           schedule: this.options.schedule,

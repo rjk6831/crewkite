@@ -6,6 +6,7 @@ import { createInterface } from 'node:readline';
 
 export const acpPeerCases = [
   'complete',
+  'fresh-no-mcp',
   'session-update',
   'permission',
   'hunk',
@@ -224,13 +225,14 @@ export function runAcpPeer(scenario: AcpPeerCase) {
       } else if (message.method === 'session/new') {
         cwd = message.params.cwd;
         assert(Array.isArray(message.params.mcpServers));
-        // Task sessions switch off file creation. Setup sessions carry no server and no filter.
-        assert.deepEqual(
-          message.params._meta,
-          message.params.mcpServers.length
-            ? { antigravity: { disabledTools: ['create_file', 'edit_file', 'task_context'] } }
-            : undefined,
-        );
+        // Task sessions switch off broad file tools. Fresh tasks do not need an MCP server.
+        if (message.params._meta)
+          assert.equal(message.params.mcpServers.length, scenario === 'fresh-no-mcp' ? 0 : 1);
+        if (message.params._meta)
+          assert.deepEqual(message.params._meta, {
+            antigravity: { disabledTools: ['create_file', 'edit_file', 'task_context'] },
+          });
+        else assert.equal(message.params.mcpServers.length, 0);
         for (const server of message.params.mcpServers) {
           assert.deepEqual(server.env, []);
           assert(!Object.hasOwn(server, 'cwd'));

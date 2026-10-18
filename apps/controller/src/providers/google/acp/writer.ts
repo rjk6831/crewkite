@@ -438,7 +438,7 @@ export type AcpWriterOptions = Omit<AcpProcessOptions, 'timeoutMs'> &
     scratch: string;
     timeoutMs?: number;
     plan: AcpWriterPlan;
-    mcpServer: AcpMcpServer;
+    mcpServer?: AcpMcpServer;
     onSubmitted(): void;
     onPermission(proposal: AcpPermissionProposal): ApprovalBinding;
     readTarget?(): AcpTargetSnapshot;
@@ -719,12 +719,13 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
   validateAcpSetupProof(plan.proof, options.client, mappings);
   if (!plan.proof.reviewMode || !plan.proof.configOptions || !isAbsolute(options.scratch))
     throw new AcpError('configuration');
-  z.strictObject({
-    name: acpIdentifier,
-    command: text(4096).refine(isAbsolute),
-    args: z.array(text(4096)).max(16),
-    env: z.array(z.never()).length(0),
-  }).parse(options.mcpServer);
+  if (options.mcpServer)
+    z.strictObject({
+      name: acpIdentifier,
+      command: text(4096).refine(isAbsolute),
+      args: z.array(text(4096)).max(16),
+      env: z.array(z.never()).length(0),
+    }).parse(options.mcpServer);
   let reply: ((binding: ApprovalBinding, decision: 'approved' | 'denied') => void) | undefined;
   let settled = false;
   let refusal: 'permission' | null = null;
@@ -742,7 +743,7 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
       const session = sessionSchema.parse(
         await connection.request('session/new', {
           cwd: options.scratch,
-          mcpServers: [options.mcpServer],
+          mcpServers: options.mcpServer ? [options.mcpServer] : [],
           _meta: sessionMeta,
         }),
       );

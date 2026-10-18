@@ -780,6 +780,17 @@ test('the acp writer binds an imported client and observed configuration before 
   }
 });
 
+test('fresh acp writers keep broad editors disabled without an mcp server', async () => {
+  const f = fixture('fresh-no-mcp');
+  try {
+    const completion = await writer(f, { mcpServer: undefined }).result;
+    assert.equal(completion.reason, null);
+    assert.equal(completion.metadata?.stopReason, 'end_turn');
+  } finally {
+    f.dispose();
+  }
+});
+
 test('the acp protocol consumes one complete live permission and never treats context usage as allowance', async () => {
   const hunkFixture = fixture('hunk');
   try {
