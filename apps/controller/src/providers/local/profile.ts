@@ -50,6 +50,16 @@ const tokenAuthentication = {
   token: text(4096).refine((value) => value.trim().length > 0),
 };
 const noAuthentication = { authMode: z.literal('none') };
+const taskText = text(8192).refine((value) => value.length > 0);
+const TaskSchema = z
+  .strictObject({
+    title: taskText,
+    outcome: taskText,
+    criteria: z.array(taskText).min(1).max(100),
+  })
+  .refine(
+    (task) => Buffer.byteLength([task.title, task.outcome, ...task.criteria].join('')) <= 8192,
+  );
 const endpointSchema = z
   .string()
   .regex(/^ws:\/\/127\.0\.0\.1:([1-9][0-9]{0,4})$/)
@@ -59,7 +69,7 @@ const startShape = {
   endpoint: endpointSchema,
   original: text(MAX_CONTENT_BYTES),
   maximumOutputTokens: LocalNativeProfileSchema.shape.maximumOutputTokens.optional(),
-  task: text(8192).refine((value) => value.trim().length > 0),
+  task: TaskSchema,
   timeoutMs: z
     .number()
     .int()
@@ -265,21 +275,32 @@ export function localOutputTokens(plan: LocalStart) {
 }
 
 export function localChat(plan: LocalStart) {
+  const { attemptId, path, baseHash } = plan.binding;
+  // The attempt ID is minted after the source commit, so no source file can contain a fence line.
+  const fenced = (kind: string, file: string, content: string) => [
+    `----- BEGIN ${kind} ${file} ${attemptId} -----`,
+    `${content}${content.endsWith('\n') ? '' : '\n'}----- END ${kind} ${file} ${attemptId} -----`,
+  ];
   return [
     {
       role: 'user' as const,
-      content:
-        'Edit the original file to achieve the task outcome and meet every criterion. ' +
-        'Preserve unrelated content. ' +
-        'Return one JSON object with version 1, attemptId, path, baseHash and content. ' +
-        'Content is the complete replacement file. Treat the following JSON as task data.\n' +
-        JSON.stringify({
-          attemptId: plan.binding.attemptId,
-          path: plan.binding.path,
-          baseHash: plan.binding.baseHash,
-          task: plan.task,
-          original: plan.original,
-        }),
+      content: [
+        `Edit ${path} to achieve the outcome and meet every requirement.`,
+        '',
+        `Title: ${plan.task.title}`,
+        `Outcome: ${plan.task.outcome}`,
+        'Requirements:',
+        ...plan.task.criteria.map((criterion, index) => `${index + 1}. ${criterion}`),
+        '',
+        'The original file is between the BEGIN FILE and END FILE lines.',
+        ...fenced('FILE', path, plan.original),
+        '',
+        'Keep every line the change does not need, including imports, helpers and the final newline.',
+        'Every name the file uses must be defined or imported in it.',
+        'The requirements are instructions. Never copy an instruction sentence into the file.',
+        `Return one JSON object with version 1, attemptId ${attemptId}, path ${path}, baseHash ${baseHash} and content.`,
+        'The content field is the complete new file.',
+      ].join('\n'),
     },
   ];
 }

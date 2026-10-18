@@ -14,6 +14,7 @@ import {
   type LocalDiscoveryStart,
   type LocalStart,
   type LocalTerminal,
+  type localChat,
   localDiscoveryPlan,
   localPlan,
   localStructuredOutput,
@@ -46,7 +47,11 @@ const plan: LocalStart = {
   endpoint: 'ws://127.0.0.1:1234',
   token: 'private-fixture-token',
   original: 'export const n = 1;\n',
-  task: 'Change n to 2.',
+  task: {
+    title: 'Raise the fixture constant',
+    outcome: 'Change n to 2.',
+    criteria: ['Keep the export named n.'],
+  },
   timeoutMs: 30_000,
 };
 const info = {
@@ -116,7 +121,19 @@ function fixture() {
     getBasePredictionConfig: async () => ({ draftModel: '' }),
     getInstanceProcessingState: async () => ({ status: 'idle', queued: 0 }),
     applyPromptTemplate: async (chat) => {
-      assert.ok(JSON.stringify(chat).includes(plan.original.trim()));
+      // The task reads once as plain text and the file arrives byte for byte inside attempt fences.
+      const [message, ...rest] = chat as ReturnType<typeof localChat>;
+      assert.equal(rest.length, 0);
+      const { title, outcome, criteria } = plan.task;
+      assert.equal(message.content.split(title).length, 2);
+      assert.ok(
+        message.content.includes(
+          `\nTitle: ${title}\nOutcome: ${outcome}\nRequirements:\n1. ${criteria[0]}\n`,
+        ),
+      );
+      const fence = (edge: string) =>
+        `----- ${edge} FILE ${plan.binding.path} ${plan.binding.attemptId} -----`;
+      assert.ok(message.content.includes(`\n${fence('BEGIN')}\n${plan.original}${fence('END')}\n`));
       return 'rendered chat';
     },
     tokenize: async () => [1, 2, 3],
@@ -207,6 +224,13 @@ test('Local generation binds its loopback authentication mode and loaded instanc
   const { token: _legacyToken, ...legacyWithoutToken } = plan;
   assert.throws(() => localPlan({ ...legacyWithoutToken, authMode: 'none' }));
   assert.throws(() => localPlan({ ...plan, original: 'changed' }));
+  for (const task of [
+    JSON.stringify(plan.task),
+    { ...plan.task, extra: true },
+    { ...plan.task, criteria: [] },
+    { ...plan.task, criteria: ['x'.repeat(4096), 'x'.repeat(4096)] },
+  ])
+    assert.throws(() => localPlan({ ...plan, task }));
   const cases: Array<{
     name: string;
     change: (value: ReturnType<typeof fixture>) => void;

@@ -8106,7 +8106,7 @@ export class Controller {
       endpoint: plan.endpoint,
       ...credentials,
       original,
-      task: JSON.stringify(plan.context),
+      task: plan.context,
       maximumOutputTokens: plan.profile.maximumOutputTokens,
       timeoutMs,
     });
