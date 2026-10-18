@@ -516,8 +516,13 @@ export function Conversation({
         {activeWorkers !== undefined && maximumWorkers !== undefined && (
           <span className="conversation-workers">
             <Users size={13} aria-hidden="true" />
-            {activeWorkers}/{maximumWorkers}
-            <span className="conversation-sr-only"> active model agents</span>
+            <span aria-hidden="true">
+              {activeWorkers}/{maximumWorkers}
+            </span>
+            <span className="conversation-sr-only">
+              {activeWorkers} active model {activeWorkers === 1 ? 'agent' : 'agents'} out of a
+              maximum of {maximumWorkers}
+            </span>
           </span>
         )}
         {onOpenSettings && (
