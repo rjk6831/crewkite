@@ -14,7 +14,15 @@ import {
   Users,
   X,
 } from 'lucide-react';
-import { type FormEvent, type ReactNode, useEffect, useId, useRef, useState } from 'react';
+import {
+  type FormEvent,
+  type ReactNode,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from 'react';
 import { ComposerControls, type ComposerControlsProps } from './composer-controls.tsx';
 import './conversation.css';
 
@@ -408,28 +416,58 @@ export function Conversation({
   const follow = useRef(true);
   const previousConversation = useRef(conversationId);
   const [newMessages, setNewMessages] = useState(false);
+  const [historyTail, setHistoryTail] = useState(0);
+  const previousHistory = useRef<{ lastId?: string; height: number } | null>(null);
+  const restoredScrollTop = useRef<number | null>(null);
   const composerId = useId();
   const historyAnchor = useRef<{ id: string; top: number } | null>(null);
-  useEffect(() => {
+  useLayoutEffect(() => {
     const element = transcript.current;
     if (!element || !visible) return;
+    const previous = previousHistory.current;
+    const height = element.firstElementChild?.getBoundingClientRect().height ?? 0;
+    const lastId = messages.at(-1)?.id;
+    previousHistory.current = { lastId, height };
     if (previousConversation.current !== conversationId) {
       previousConversation.current = conversationId;
       follow.current = true;
+      historyAnchor.current = null;
+      restoredScrollTop.current = null;
+      setHistoryTail(0);
     }
     if (messages.length === 0) {
       setNewMessages(false);
+      setHistoryTail(0);
       return;
     }
     if (historyAnchor.current) {
-      if (loadingEarlier) return;
+      if (loadingEarlier || historyBlocked) return;
       const anchor = element.querySelector<HTMLElement>(
         `[data-message-id="${CSS.escape(historyAnchor.current.id)}"]`,
       );
-      if (anchor)
-        element.scrollTop += anchor.getBoundingClientRect().top - historyAnchor.current.top;
+      if (anchor) {
+        const target =
+          element.scrollTop + anchor.getBoundingClientRect().top - historyAnchor.current.top;
+        const missing = target - (element.scrollHeight - element.clientHeight);
+        // A short thread leaves blank space below its last row. Keep that space while prepending.
+        const tail = Math.min(element.clientHeight, historyTail + Math.max(0, missing));
+        if (tail > historyTail + 0.5) {
+          setHistoryTail(tail);
+          return;
+        }
+        element.scrollTop = target;
+        restoredScrollTop.current = element.scrollTop;
+      }
       historyAnchor.current = null;
       return;
+    }
+    if (historyTail > 0 && previous && previous.lastId !== lastId) {
+      const retained = messages.some((message) => message.id === previous.lastId);
+      setHistoryTail(
+        follow.current || !retained
+          ? 0
+          : Math.max(0, historyTail - Math.max(0, height - previous.height)),
+      );
     }
     if (follow.current) {
       element.scrollTop = element.scrollHeight;
@@ -437,7 +475,7 @@ export function Conversation({
     } else {
       setNewMessages(true);
     }
-  }, [conversationId, messages, loadingEarlier, visible]);
+  }, [conversationId, messages, loadingEarlier, historyBlocked, historyTail, visible]);
   useEffect(() => {
     const element = textarea.current;
     if (!element) return;
@@ -507,8 +545,16 @@ export function Conversation({
           onScroll={() => {
             const element = transcript.current;
             if (!element) return;
+            if (restoredScrollTop.current !== null) {
+              const restored = Math.abs(element.scrollTop - restoredScrollTop.current) < 1;
+              restoredScrollTop.current = null;
+              if (restored) return;
+            }
             follow.current = element.scrollHeight - element.scrollTop - element.clientHeight < 64;
-            if (follow.current) setNewMessages(false);
+            if (follow.current) {
+              setNewMessages(false);
+              setHistoryTail(0);
+            }
           }}
         >
           <div className="conversation-thread">
@@ -657,6 +703,9 @@ export function Conversation({
               </article>
             ))}
           </div>
+          {historyTail > 0 && (
+            <div aria-hidden="true" style={{ height: historyTail, overflowAnchor: 'none' }} />
+          )}
         </div>
         {newMessages && (
           <button
@@ -667,6 +716,7 @@ export function Conversation({
                 transcript.current.scrollTop = transcript.current.scrollHeight;
               follow.current = true;
               setNewMessages(false);
+              setHistoryTail(0);
             }}
           >
             <ArrowDown size={13} />

@@ -1449,6 +1449,11 @@ async function conversationBridge(
       return { id: row.dataset.messageId, top: row.getBoundingClientRect().top };
     });
     await loadEarlier.click();
+    await expect(
+      page.getByText('The proposed invoice export stays within the selected scope.', {
+        exact: true,
+      }),
+    ).toHaveCount(1);
     await expect
       .poll(() =>
         page
