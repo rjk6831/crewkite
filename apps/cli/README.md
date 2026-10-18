@@ -22,9 +22,11 @@ Task commands use IDs returned by the controller:
 |---------|----------|
 | `task show <task-id>` | Show the current task and snapshot cursor |
 | `task watch <task-id>` | Stream events after a snapshot, with replay after reconnect |
+| `task amend <task-id> --title text --outcome text --criterion text [--criterion text ...]` | Replace the full contract using the current task revision, preserving the task ID |
+| `task pause <task-id>` | Close admissions for the exact current run; owned work may finish |
 | `task start <task-id>` | Start the prepared run |
 | `task stop <task-id>` | Request stop using the current task revision |
-| `task resume <task-id>` | Resume an interrupted run through controller admission |
+| `task resume <task-id>` | Explicitly request Resume through controller admission; native restart is unavailable |
 | `task approve <approval-id>` | Approve the exact pending binding from the snapshot |
 | `task deny <approval-id>` | Deny that binding |
 | `task accept <task-id> <destination-ref>` | Request the checked candidate as a new local branch |
@@ -105,6 +107,16 @@ To reuse retained context, add `--context-refs context-refs.json` to conversatio
 The bounded JSON file accepts at most four references with distinct artifact IDs and hashes. Unknown fields, source paths and malformed references are rejected before mutation. Omitting the option preserves the absent context field. Supplying `[]` sends an explicit empty array. The CLI sends the exact refs and captures no filesystem content. It grants no extra permission and uploads no arbitrary files. The controller checks capture provenance, project, base and actual retained bytes, and can refuse stale or foreign captures. An unknown-outcome receipt retains the exact refs; retry resends them even if the input file changes.
 
 Mutations use the current task revision and the normal action receipt. Keep an uncertain receipt and use `retry` to resend its exact command. `task stop <task-id>` uses the existing Stop action. Chat text cannot approve a tool action, grant an effect, raise a limit or accept a candidate. Proposal adoption changes the task contract and starts no execution. Execution still needs its own explicit preparation and Start.
+
+## Saved task lifecycle
+
+Amend requires the complete explicit title, outcome and criteria on every call. Omitted fields are rejected. The controller permits amendment only in `draft`, `stopped`, `interrupted` or `failed`, with proven quiescence and no conflicting ownership or combined membership. It keeps the task ID, advances its revision and clears the current run binding. Inspect the result, then prepare explicitly when ready. Amendment starts no work and grants no authority.
+
+Pause sends `PauseAdmissions` with the current task revision and exact current run ID. An unprepared task has no run to pause. Pause closes new admissions; an already owned process may finish. Stop requests cancellation of owned work. Neither command creates a grant or submits new work. Resume remains an explicit controller request. It does not provide a general native restart path, and reopening a task never relaunches work.
+
+A combined parent Pause records its current phase. Child Pause and Resume refuse while the parent owns the membership, and a child cannot amend its contract independently. Parent Resume requires settled owners, valid proofs and enough remaining budget. Unknown ownership or failed or stopped stages block it. Combined Resume dispatches nothing and cannot restart a child writer. Parent Stop requests cancellation across the group. See [combined ownership and recovery](../../docs/continuity.md#combined-ownership-and-recovery).
+
+Blocked and unknown outcomes remain visible in the action receipt. Save JSON output when a result is uncertain and use `retry <receipt-file>` only for that exact receipt. Retry retains the original command key, payload and expected revision, including the full amendment contract or exact paused run binding. It does not refresh the revision or reread contract flags. No automatic retry, preparation or follow-up action runs after amend or pause.
 
 ## Google quota
 

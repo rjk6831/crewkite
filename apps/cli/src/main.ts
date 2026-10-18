@@ -48,7 +48,8 @@ const googleAcpLabel =
 
 const help = `Usage: crewkite project add <path> [--json] [--home path]
        crewkite task create <project-id> --title text --outcome text --criterion text [--criterion text ...] [--json] [--home path]
-       crewkite task <list|show|watch|start|stop|resume|switch|approve|deny> [id] [--json] [--home path]
+       crewkite task <list|show|watch|start|pause|stop|resume|switch|approve|deny> [id] [--json] [--home path]
+       crewkite task amend <task-id> --title text --outcome text --criterion text [--criterion text ...] [--json] [--home path]
        crewkite task switch <task-id> <route-id> [--json] [--home path]
        crewkite conversation <create|configure> <id> --role lead|orchestrator --profile openai-file-v1 --credit-policy ordinary|existing-credits --attempts N --minutes N --concurrency N --consent [--text goal]
        crewkite conversation create <project-id> --text goal --role lead|orchestrator --profile openai-file-v1 --credit-policy ordinary|existing-credits --attempts N --minutes N --concurrency N --consent [--context-refs file]
@@ -323,6 +324,8 @@ export async function runCli(
       : undefined;
     const supported = [
       'create',
+      'amend',
+      'pause',
       'list',
       'show',
       'watch',
@@ -357,21 +360,32 @@ export async function runCli(
     if (area === 'project' && (action !== 'add' || id === undefined))
       throw new Error('Use project add with one repository path.');
     const creatingTask = area === 'task' && action === 'create';
+    const amendingTask = area === 'task' && action === 'amend';
+    if (amendingTask || (area === 'task' && action === 'pause')) {
+      const allowed = new Set([
+        'json',
+        'home',
+        ...(amendingTask ? ['title', 'outcome', 'criterion'] : []),
+      ]);
+      if (Object.keys(values).some((key) => !allowed.has(key)))
+        throw new Error('This option does not apply to the task action. Use --help.');
+    }
     const addingProject = area === 'project' && action === 'add';
     if (
       !creatingTask &&
+      !amendingTask &&
       (values.title !== undefined || values.outcome !== undefined || values.criterion !== undefined)
     )
-      throw new Error('Title, outcome and criteria require task create.');
+      throw new Error('Title, outcome and criteria require task create or amend.');
     if (
-      creatingTask &&
+      (creatingTask || amendingTask) &&
       (!values.title?.trim() ||
         !values.outcome?.trim() ||
         !values.criterion?.length ||
         values.criterion.some((criterion) => !criterion.trim()))
     )
       throw new Error(
-        'Task creation requires a title, outcome and at least one nonblank criterion.',
+        'Task create and amend require a title, outcome and at least one nonblank criterion.',
       );
     if (addingProject && !id?.trim()) throw new Error('Supply a nonblank repository path.');
     if (area === 'health' && action !== undefined)
@@ -1002,6 +1016,20 @@ export async function runCli(
     }
     if (!id) throw new Error('A task ID is required.');
     const task = requireTask(snapshot, id);
+    if (amendingTask) {
+      const result = await request(
+        'AmendTask',
+        {
+          taskId: task.id,
+          title: values.title,
+          outcome: values.outcome,
+          criteria: values.criterion,
+        },
+        task.revision,
+      );
+      receipt(result);
+      return succeeded(result) ? 0 : 2;
+    }
     if (conversation) {
       if (action === 'show') {
         const status = await request('GetTaskConversationState', { taskId: task.id });
@@ -1643,7 +1671,12 @@ export async function runCli(
       receipt(result);
       return succeeded(result) ? 0 : 2;
     }
-    const names = { start: 'StartRun', stop: 'StopRun', resume: 'ResumeRun' } as const;
+    const names = {
+      start: 'StartRun',
+      pause: 'PauseAdmissions',
+      stop: 'StopRun',
+      resume: 'ResumeRun',
+    } as const;
     const result = await request(
       names[action as keyof typeof names],
       { taskId: task.id, runId: task.runId },
