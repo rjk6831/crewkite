@@ -2798,7 +2798,7 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     await expect(reviewerCredits).not.toBeChecked();
     await expect(evaluationPanel).toContainText('Local Node and Git are verified.');
     await expect(evaluationPanel).toContainText(
-      'Staging, checks and cleanup share a five-minute limit.',
+      'Staging, checks and cleanup share a ten-minute limit.',
     );
     const verificationPermission = evaluationPanel.getByLabel(
       'Allow one full local verification run',
