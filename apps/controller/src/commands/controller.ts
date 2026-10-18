@@ -147,6 +147,7 @@ import {
   frozenVerificationPath,
   prepareToolchain,
   type ToolchainPreparation,
+  verificationGuidance,
   verificationPreview,
   verificationTarget,
 } from '../evidence/toolchain-definition.ts';
@@ -270,7 +271,12 @@ import {
   type WriterPlan,
 } from '../providers/openai/replacement.ts';
 import { repositoryPlan, startRepository } from '../providers/openai/repository.ts';
-import { type ReviewPlan, reviewPlan, startReview } from '../providers/openai/review.ts';
+import {
+  type ReviewPlan,
+  repositoryReviewBudget,
+  reviewPlan,
+  startReview,
+} from '../providers/openai/review.ts';
 import { chooseRoute } from '../routing/index.ts';
 import { taskActivityPage } from '../store/activity.ts';
 import { createIds, type IdPrefix } from '../store/ids.ts';
@@ -13046,6 +13052,25 @@ export class Controller {
     };
   }
 
+  // An adopted plan names the paths its coder slices may change. Other tasks name none.
+  private adoptedCoderScope(taskId: string): string[] {
+    const adopted = this.conversationConfiguration(taskId)?.adoptedProposal;
+    if (!adopted) return [];
+    const row = this.store.db
+      .prepare('SELECT body FROM conversation_entries WHERE id=? AND task_id=?')
+      .get(adopted.id, taskId);
+    const entry =
+      row &&
+      (JSON.parse(row.body as string) as Extract<
+        import('@crewkite/contracts').ConversationEntry,
+        { kind: 'plan-proposal' }
+      >);
+    if (entry?.kind !== 'plan-proposal' || hashCanonical(entry.proposal) !== adopted.hash)
+      throw Error('The adopted plan changed.');
+    const coder = entry.proposal.slices.filter((slice) => slice.role === 'coder');
+    return [...new Set(coder.flatMap((slice) => slice.scope))].sort();
+  }
+
   private nativeWriterPlan(binding: Omit<NativeBinding, 'planArtifact'>) {
     const { appointment, attempt } = binding;
     const criteria = [
@@ -13063,7 +13088,8 @@ export class Controller {
         proof: appointment.proof,
         ...this.options.googleAcp,
       });
-    if ('repository' in appointment)
+    if ('repository' in appointment) {
+      const committed = (path: string) => binding.manifest.some((file) => file.path === path);
       return repositoryPlan({
         attemptId: attempt.id,
         model: appointment.route.model as WriterPlan['model'],
@@ -13078,7 +13104,17 @@ export class Controller {
           outcome: binding.public?.context.outcome ?? '',
           criteria: (this.store.get<Task>('task', binding.run.taskId) as Task).criteria,
         },
+        limits: {
+          deadlineMs: appointment.maximumTaskMs,
+          paths: this.adoptedCoderScope(binding.run.taskId),
+          // Verification preparation needs this journey and lockfile in the source.
+          ...(committed('e2e/desktop.spec.ts') && committed('pnpm-lock.yaml')
+            ? verificationGuidance
+            : { checks: [], frozen: [] }),
+          review: repositoryReviewBudget,
+        },
       });
+    }
     if (typeof binding.original !== 'string' || !binding.baseHash)
       throw Error('The file input is unavailable.');
     const fields = {

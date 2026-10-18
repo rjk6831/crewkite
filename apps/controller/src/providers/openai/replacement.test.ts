@@ -5,6 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 import test from 'node:test';
 import { hashCanonical, sealHandoff } from '@crewkite/contracts/hash';
+import { verificationGuidance } from '../../evidence/toolchain-definition.ts';
 import { spawnCheckChild as spawn } from '../../host/check-ownership.ts';
 import { groupAbsent } from '../../host/worker.ts';
 import type { OpenAiUsage } from './discovery.ts';
@@ -25,7 +26,15 @@ import {
   repositoryPlan,
   startRepository,
 } from './repository.ts';
-import { ReviewTranscript, reviewPlan, startReview } from './review.ts';
+import { ReviewTranscript, repositoryReviewBudget, reviewPlan, startReview } from './review.ts';
+
+const repositoryLimits = {
+  deadlineMs: 600_000,
+  paths: [] as string[],
+  checks: [] as string[],
+  frozen: [] as string[],
+  review: repositoryReviewBudget,
+};
 
 const original = 'export function netMinor() { throw new Error(); }\n';
 const plan = (directory: string, path = 'net.mjs') =>
@@ -1142,6 +1151,11 @@ test('native proposals and reviews require one matching completed turn and bound
       outcome: 'Preserve the bounds.',
       criteria: ['Return the bounded net.'],
     },
+    limits: {
+      ...repositoryLimits,
+      paths: ['docs/calculation.md', 'net.mjs'],
+      ...verificationGuidance,
+    },
   });
   for (const change of [{ model: 'planning-fixture' }, { effort: 'medium' }]) {
     assert.throws(() =>
@@ -1240,6 +1254,12 @@ test('native proposals and reviews require one matching completed turn and bound
     }
     const request = JSON.parse(Buffer.from(native.next() as Uint8Array).toString());
     assert.equal(request.params.outputSchema, undefined);
+    const [instructions, data] = request.params.input[0].text.split('\n');
+    assert.match(instructions, /do not run pnpm, npm or npx/);
+    const limits = JSON.parse(data).limits;
+    assert.deepEqual(limits.paths, ['docs/calculation.md', 'net.mjs']);
+    assert.equal(limits.checks[1], 'lint: biome check . (formatting differences fail)');
+    assert.deepEqual(limits.review, { fileBytes: 256 * 1024, totalBytes: 448 * 1024 });
     assert.equal(request.params.cwd, repositoryInput.scratchPath);
     assert.deepEqual(request.params.sandboxPolicy.writableRoots, [repositoryInput.scratchPath]);
     native.push(bytes({ id: 11, result: { turn: running } }));
@@ -1487,6 +1507,7 @@ test('transcripts pass rate-limit reads and updates to the usage hook without ch
     manifestHash: 'b'.repeat(64),
     execution: { sandbox: 'workspace-write', approvalPolicy: 'never', networkAccess: false },
     context: { title: 'Bound net', outcome: 'Return the net.', criteria: ['Keep the bound.'] },
+    limits: repositoryLimits,
   });
   // Each transcript delivers its complete read, then the merged update and its repeat.
   const delivered = [
@@ -1768,6 +1789,7 @@ test('native task submission and interruption share one deadline through owned c
         manifestHash: 'b'.repeat(64),
         execution: { sandbox: 'workspace-write', approvalPolicy: 'never', networkAccess: false },
         context: { title: 'Bound net', outcome: 'Return the net.', criteria: ['Keep the bound.'] },
+        limits: repositoryLimits,
       }),
       {
         timeoutMs: 600_000,

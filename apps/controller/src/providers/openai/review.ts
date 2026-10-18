@@ -27,6 +27,10 @@ const MAX_REPOSITORY_CONTENT = 256 * 1024;
 // Both full sides of a 188 KB file need 382 KiB before any edit. The client echoes the
 // review text twice, so MAX_TASK_LINE and MAX_TASK_OUTPUT must cover this bound.
 const MAX_REPOSITORY_INPUT = 448 * 1024;
+export const repositoryReviewBudget = {
+  fileBytes: MAX_REPOSITORY_CONTENT,
+  totalBytes: MAX_REPOSITORY_INPUT,
+} as const;
 const utf8 = (value: string, limit = MAX_CONTENT) =>
   value.isWellFormed() && !value.includes('\0') && Buffer.byteLength(value, 'utf8') <= limit;
 const content = z

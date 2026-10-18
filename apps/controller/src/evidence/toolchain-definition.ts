@@ -120,6 +120,28 @@ const compare = (a: { path: string }, b: { path: string }) =>
 export const nodeTestFile = (path: string) =>
   /^(?:apps|packages|scripts)\/.*\.test\.(?:ts|mjs)$/.test(path);
 
+// A repository writer reads this before any check runs. Keep it in step with
+// verificationCommand and frozenVerificationPath.
+export const verificationGuidance = {
+  checks: [
+    'policy: node scripts/policy.mjs all',
+    'lint: biome check . (formatting differences fail)',
+    'types: tsc --noEmit',
+    'node-tests: every committed *.test.ts and *.test.mjs under apps, packages and scripts',
+    'build: electron-vite build in apps/desktop',
+    'desktop: playwright test e2e/desktop.spec.ts',
+  ],
+  frozen: [
+    '*.test.ts and *.test.mjs under apps, packages and scripts',
+    'e2e/ and scripts/',
+    'apps/controller/src/{host,evidence,providers,store,commands}/ and apps/controller/src/main.ts',
+    'apps/desktop/src/{main,preload}/ and apps/desktop/electron.vite.config.ts',
+    'packages/{testkit,contracts}/ and packages/client/src/node.ts',
+    'every package.json',
+    'root files other than *.md',
+  ],
+};
+
 // The first recipe freezes the code which grades the candidate and enrolls child processes.
 export function frozenVerificationPath(path: string): boolean {
   return (
