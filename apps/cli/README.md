@@ -59,9 +59,37 @@ pnpm crewkite conversation send <task-id> --text "Explain the failure before pro
 | `conversation answer <task-id> --question-id message-id --text text` | Answer one exact pending question |
 | `conversation guide <task-id> --text text` | Queue guidance without changing the task contract or authority |
 | `conversation adopt <task-id> --proposal-id message-id --proposal-hash hash` | Adopt the exact retained proposal after controller revalidation |
-| `conversation configure <task-id> --role role --profile openai-file-v1 --credit-policy policy --attempts N --minutes N --concurrency N --consent` | Explicitly amend the finite primary selection and task limits |
+| `conversation configure <task-id> --role role --profile openai-file-v1 --credit-policy policy --attempts N --minutes N --concurrency N --consent [--model-request file]` | Explicitly amend the finite primary selection and task limits |
 
 Show returns `{ state, conversation }`. The state reports the primary selection, requested and effective model and effort, shared budget, queued input count, pending question IDs, proposal hash and current send/adopt availability. State and history are separate bounded controller reads. History entries retain their IDs, lineage and delivery records. `nextBeforeCursor` identifies the older page; pass it as `--before-cursor`. Text is limited to 4096 encoded bytes. Plain output escapes terminal controls; JSON preserves the typed values.
+
+Plain show also reports the bounded last-observed model choices, status, reason, observation time and exact artifact ID and hash. Older state without choices reports `not-observed`. These choices come from a successful retained planning turn. Reading them starts no discovery or model turn.
+
+To request a pair for a later planning turn, inspect `conversation show <task-id>` first. Copy the observation reference from `state.modelChoices.observation` and a model with one of its advertised efforts from `state.modelChoices.models`. The following strict JSON template contains placeholders, not catalog choices. Replace every angle-bracket value with the exact value from actual show output before saving it as `model-request.json`:
+
+```json
+{
+  "version": 1,
+  "observation": {
+    "artifactId": "<copy observation.artifactId>",
+    "hash": "<copy observation.hash>"
+  },
+  "model": "<copy models entry.model>",
+  "effort": "<copy an effort from that entry.efforts>"
+}
+```
+
+Save the request with the complete explicit selection and limits:
+
+```sh
+pnpm crewkite conversation configure <task-id> --role lead --profile openai-file-v1 --credit-policy ordinary --attempts 8 --minutes 20 --concurrency 2 --consent --model-request model-request.json --json
+```
+
+Use the intended role, credit policy and existing task limits explicitly. Only configure accepts `--model-request`. The bounded file must match the strict versioned schema; unknown fields and malformed references are rejected before mutation. The controller checks that the observation belongs to this task and that the pair and current client capability remain valid. A refusal selects no fallback.
+
+Configure is Save. It starts no planning or execution turn, discovers no models and grants no new planning permissions. Requested settings record the saved choice; effective settings report what a completed turn actually used. A material model or effort Save returns the contract to provisional. Execution requires a later valid proposal and fresh explicit adoption, followed by the existing execution preparation and Start.
+
+To recover the explicit profile-default behavior, run configure with the complete selection and consent while omitting `--model-request`. Omission sends no model request field and does not preserve a previous explicit pair. Inspect show after Save. If Save returns an unknown outcome, keep its receipt and retry that exact receipt. Retry reuses the saved command, including its original model request, even if the input file changes.
 
 Mutations use the current task revision and the normal action receipt. Keep an uncertain receipt and use `retry` to resend its exact command. `task stop <task-id>` uses the existing Stop action. Chat text cannot approve a tool action, grant an effect, raise a limit or accept a candidate. Proposal adoption changes the task contract and starts no execution. Execution still needs its own explicit preparation and Start.
 

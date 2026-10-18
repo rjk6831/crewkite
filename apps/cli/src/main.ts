@@ -24,6 +24,7 @@ import {
   type CommandResult,
   CommandSchema,
   type ConversationEntry,
+  ConversationModelRequestSchema,
   ConversationPlanningSelectionSchema,
   canonicalJson,
   LocalAuthModeSchema,
@@ -49,6 +50,7 @@ const help = `Usage: crewkite project add <path> [--json] [--home path]
        crewkite task <list|show|watch|start|stop|resume|switch|approve|deny> [id] [--json] [--home path]
        crewkite task switch <task-id> <route-id> [--json] [--home path]
        crewkite conversation <create|configure> <id> --role lead|orchestrator --profile openai-file-v1 --credit-policy ordinary|existing-credits --attempts N --minutes N --concurrency N --consent [--text goal]
+       crewkite conversation configure <task-id> --role lead|orchestrator --profile openai-file-v1 --credit-policy ordinary|existing-credits --attempts N --minutes N --concurrency N --consent [--model-request file]
        crewkite conversation show <task-id> [--before-cursor cursor] [--json] [--home path]
        crewkite conversation <send|guide> <task-id> --text text [--json] [--home path]
        crewkite conversation answer <task-id> --question-id message-id --text text [--json] [--home path]
@@ -119,6 +121,7 @@ export async function runCli(
         role: { type: 'string' },
         profile: { type: 'string' },
         'credit-policy': { type: 'string' },
+        'model-request': { type: 'string' },
         attempts: { type: 'string' },
         minutes: { type: 'string' },
         concurrency: { type: 'string' },
@@ -245,6 +248,7 @@ export async function runCli(
       'role',
       'profile',
       'credit-policy',
+      'model-request',
       'attempts',
       'minutes',
       'concurrency',
@@ -268,6 +272,7 @@ export async function runCli(
           ? ['role', 'profile', 'credit-policy', 'attempts', 'minutes', 'concurrency', 'consent']
           : []),
         ...(['create', 'send', 'answer', 'guide'].includes(action) ? ['text'] : []),
+        ...(action === 'configure' ? ['model-request'] : []),
         ...(action === 'show' ? ['before-cursor'] : []),
         ...(action === 'answer' ? ['question-id'] : []),
         ...(action === 'adopt' ? ['proposal-id', 'proposal-hash'] : []),
@@ -299,6 +304,13 @@ export async function runCli(
             }),
           ),
           consent: 'explicit',
+          ...(values['model-request'] !== undefined
+            ? {
+                modelRequest: ConversationModelRequestSchema.parse(
+                  readJson(values['model-request']),
+                ),
+              }
+            : {}),
         })
       : undefined;
     const supported = [
@@ -1635,11 +1647,21 @@ export async function runCli(
 
 function conversationStateText(state: TaskConversationState) {
   const configuration = state.configuration;
+  const choices = state.modelChoices;
   return [
     `${state.taskId} ${state.phase}, revision ${state.revision}, contract ${state.contractStatus}`,
     configuration
       ? `Primary ${configuration.selection.role}, ${configuration.selection.profileId}, ${configuration.routeId ?? 'route unknown'}, credits ${configuration.selection.creditPolicy}\nRequested model ${configuration.requestedModel ?? 'unknown'}, effective model ${configuration.effectiveModel ?? 'unknown'}\nRequested effort ${configuration.requestedEffort ?? 'unknown'}, effective effort ${configuration.effectiveEffort ?? 'unknown'}`
       : 'Primary not configured',
+    `Model choices ${choices?.status ?? 'not-observed'}: ${choices?.reason ?? 'not-observed'}`,
+    `Choices observed at ${choices?.observedAt ?? 'none'}`,
+    choices?.observation
+      ? `Observation artifact ${choices.observation.artifactId}, hash ${choices.observation.hash}`
+      : 'Observation none',
+    ...(choices?.models.map(
+      (choice) =>
+        `Observed model ${choice.model}, efforts ${JSON.stringify(choice.efforts)}, default effort ${choice.defaultEffort}`,
+    ) ?? []),
     state.budget
       ? `Task limits ${JSON.stringify(state.budget.limits)}\nRemaining ${JSON.stringify(state.budget.remaining)}`
       : 'Task budget not configured',
