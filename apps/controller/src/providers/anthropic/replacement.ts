@@ -290,6 +290,7 @@ const rateLimitInfo = z.object({
   isUsingOverage: z.boolean().optional(),
   overageInUse: z.boolean().optional(),
   overageEnabled: z.boolean().optional(),
+  rateLimitGraceActive: z.boolean().optional(),
   surpassedThreshold: metadataNumber.optional(),
   limitScope: z.enum(['service', 'channel', 'group_pool']).optional(),
   errorCode: z.literal('credits_required').optional(),
@@ -521,6 +522,11 @@ const fields = [
   'baseHash',
   'uuid',
   'rate_limit_info',
+  'isUsingOverage',
+  'overageInUse',
+  'overageEnabled',
+  'rateLimitType',
+  'rateLimitGraceActive',
   'parent_tool_use_id',
   'isReplay',
   'status',
@@ -661,13 +667,16 @@ export class ReplacementStream {
           // Subscription metadata grants no permission, billing or replacement authority.
           const info = rateLimit.parse(value).rate_limit_info;
           this.observeUsage(value);
+          // Extra-usage configuration does not report use. Served overflow still refuses.
+          if (info.isUsingOverage === true) this.fail('protocol', 'unsupported', 'isUsingOverage');
+          if (info.overageInUse === true) this.fail('protocol', 'unsupported', 'overageInUse');
+          if (info.rateLimitType === 'overage')
+            this.fail('protocol', 'unsupported', 'rateLimitType');
           if (
-            info.isUsingOverage === true ||
-            info.overageInUse === true ||
-            info.overageEnabled === true ||
-            info.rateLimitType === 'overage'
+            info.rateLimitGraceActive === true &&
+            (info.overageStatus === 'allowed' || info.overageStatus === 'allowed_warning')
           )
-            this.fail('protocol', 'unsupported', 'rate_limit_info');
+            this.fail('protocol', 'unsupported', 'rateLimitGraceActive');
         } else if (type === 'assistant') {
           this.site = 'assistant';
           assistant.parse(value);
@@ -705,7 +714,12 @@ export class ReplacementStream {
         if (error instanceof ReplacementError) throw error;
         let field: ReplacementDiagnostic['field'] = null;
         if (error instanceof z.ZodError) {
-          const label = error.issues[0]?.path.find((part) => typeof part === 'string');
+          const path = error.issues[0]?.path;
+          const rateField =
+            this.site === 'rate-limit' && path?.[0] === 'rate_limit_info'
+              ? fields.find((field) => field === path[1])
+              : undefined;
+          const label = rateField ?? path?.find((part) => typeof part === 'string');
           field = fields.find((field) => field === label) ?? 'other';
         }
         this.fail('protocol', decoded ? 'validation' : 'invalid-json', field);

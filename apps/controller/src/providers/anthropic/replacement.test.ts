@@ -544,23 +544,80 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       ],
       pass: true,
     },
-    ...['isUsingOverage', 'overageInUse', 'overageEnabled'].map((field) => ({
+    {
+      name: 'extra usage configuration does not report served paid usage',
+      frames: [
+        init,
+        usageEvent({
+          status: 'allowed_warning',
+          rateLimitType: 'five_hour',
+          overageEnabled: true,
+          isUsingOverage: false,
+          overageInUse: false,
+          unifiedWindows: { five_hour: reading(0.75, fiveHourReset) },
+        }),
+        result,
+      ],
+      pass: true,
+      usage: [{ windows: [fiveHour(25)], paid: null }],
+    },
+    {
+      name: 'extra usage configuration supplies no usage reading',
+      frames: [init, usageEvent({ overageEnabled: true }), result],
+      pass: true,
+    },
+    ...['allowed', 'allowed_warning'].map((overageStatus) => ({
+      name: `served grace overflow with ${overageStatus} paid usage stops included-only task`,
+      frames: [init, usageEvent({ rateLimitGraceActive: true, overageStatus }), result],
+      diagnostic: { site: 'rate-limit', cause: 'unsupported', field: 'rateLimitGraceActive' },
+    })),
+    ...[undefined, 'rejected'].map((overageStatus) => ({
+      name: `grace metadata with ${overageStatus ?? 'unreported'} paid status supplies no paid-use proof`,
+      frames: [init, usageEvent({ rateLimitGraceActive: true, overageStatus }), result],
+      pass: true,
+    })),
+    ...['isUsingOverage', 'overageInUse', 'overageEnabled', 'rateLimitGraceActive'].map(
+      (field) => ({
+        name: `rate limit ${field} rejects malformed flags`,
+        frames: [init, usageEvent({ [field]: secret }), result],
+        diagnostic: { site: 'rate-limit', cause: 'validation', field },
+      }),
+    ),
+    {
+      name: 'extra usage configuration cannot initialize or complete a task',
+      frames: [usageEvent({ overageEnabled: true }), result],
+    },
+    {
+      name: 'extra usage configuration still needs terminal result',
+      frames: [init, usageEvent({ overageEnabled: true })],
+    },
+    {
+      name: 'extra usage configuration after terminal remains refused',
+      frames: [init, result, usageEvent({ overageEnabled: true })],
+    },
+    ...['isUsingOverage', 'overageInUse'].map((field) => ({
       name: `reported ${field} stops included-only task`,
       frames: [
         init,
-        { ...rateLimit, rate_limit_info: { status: 'allowed', [field]: true } },
+        {
+          ...rateLimit,
+          rate_limit_info: { status: 'allowed', overageEnabled: true, [field]: true },
+        },
         result,
       ],
-      diagnostic: { site: 'rate-limit', cause: 'unsupported', field: 'rate_limit_info' },
+      diagnostic: { site: 'rate-limit', cause: 'unsupported', field },
     })),
     {
       name: 'usage credit window stops included-only task',
       frames: [
         init,
-        { ...rateLimit, rate_limit_info: { status: 'allowed', rateLimitType: 'overage' } },
+        {
+          ...rateLimit,
+          rate_limit_info: { status: 'allowed', rateLimitType: 'overage', overageEnabled: true },
+        },
         result,
       ],
-      diagnostic: { site: 'rate-limit', cause: 'unsupported', field: 'rate_limit_info' },
+      diagnostic: { site: 'rate-limit', cause: 'unsupported', field: 'rateLimitType' },
     },
     {
       name: 'a window reading reaches the usage hook once per process',
@@ -647,7 +704,7 @@ test('native text replacement stays bound to one proposal and owned task deadlin
         }),
         result,
       ],
-      diagnostic: { site: 'rate-limit', cause: 'unsupported', field: 'rate_limit_info' },
+      diagnostic: { site: 'rate-limit', cause: 'unsupported', field: 'isUsingOverage' },
       usage: [{ windows: [fiveHour(0)], paid: { inUse: true, usedPercent: null, resetsAt: null } }],
     },
     { name: 'rate limit metadata needs terminal result', frames: [init, rateLimit] },
