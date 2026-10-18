@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -16,6 +16,7 @@ import { Store } from '../store/index.ts';
 import { type FrozenConversationTurn, TaskConversation } from './conversation.ts';
 
 test('durable conversation keeps questions and queued input within the owned turn', (t) => {
+  mkdirSync(resolve('internal'), { recursive: true });
   const directory = mkdtempSync(join(resolve('internal'), 'conversation-test-'));
   const path = join(directory, 'state.sqlite');
   let store = new Store(path);
