@@ -131,7 +131,7 @@ async function nativeSetup(
   options: Partial<ControllerOptions> = {},
   targetPath = 'net.mjs',
 ) {
-  const anthropic = mode.startsWith('anthropic-');
+  const anthropic = mode.startsWith('anthropic-') || mode === 'combined-quota';
   const google = mode.startsWith('google-');
   const repository = mode.startsWith('repository-');
   let repositoryCli = '';
@@ -263,16 +263,18 @@ async function nativeSetup(
         .flatMap((intent) => context.controller.store.nativeProcesses(intent.attempt_id))
         .filter((row) => row.state === 'intent')
         .at(-1);
-      const googleChild =
-        !!pending &&
-        context.controller.store.get<{ family: string }>(
-          'route',
-          context.controller.store
-            .intents()
-            .find((intent) => intent.attempt_id === pending.attempt_id)?.route_id ?? '',
-        )?.family === 'google';
+      const pendingFamily = pending
+        ? context.controller.store.get<{ family: string }>(
+            'route',
+            context.controller.store
+              .intents()
+              .find((intent) => intent.attempt_id === pending.attempt_id)?.route_id ?? '',
+          )?.family
+        : undefined;
+      const googleChild = pendingFamily === 'google';
       const anthropicChild =
-        !googleChild && (pending?.phase === 'auth-status' || pending?.phase === 'native-task');
+        pendingFamily === 'anthropic' &&
+        (pending?.phase === 'auth-status' || pending?.phase === 'native-task');
       const phase =
         pending?.phase === 'google-config'
           ? 'config'
@@ -321,7 +323,9 @@ async function nativeSetup(
         );
         transcript = transcript.replace(
           '\n  }\n});',
-          '\n    }; if (message.params.outputSchema.properties.bindingHash) complete(); else globalThis.release=complete;\n  }\n});',
+          mode === 'combined-quota'
+            ? '\n    }; complete();\n  }\n});'
+            : '\n    }; if (message.params.outputSchema.properties.bindingHash) complete(); else globalThis.release=complete;\n  }\n});',
         );
       }
       const replacement =
@@ -355,9 +359,14 @@ async function nativeSetup(
           { path: 'index.html', content: null },
         ]);
       if (anthropicChild) {
+        const pendingIntent = context.controller.store
+          .intents()
+          .find((value) => value.attempt_id === pending?.attempt_id);
         const content = mode.includes('checked')
           ? readFileSync(join(context.directory, 'checked-proposal/net.mjs'), 'utf8')
-          : fixtureContent(targetPath);
+          : mode === 'combined-quota'
+            ? 'export const value = 1;\n'
+            : fixtureContent(targetPath);
         transcript = anthropicFixture(args, {
           content,
           mode:
@@ -365,7 +374,9 @@ async function nativeSetup(
               ? 'hold'
               : mode === 'anthropic-overage'
                 ? 'overage'
-                : mode === 'anthropic-quota' || mode === 'anthropic-quota-future'
+                : mode === 'anthropic-quota' ||
+                    mode === 'anthropic-quota-future' ||
+                    (mode === 'combined-quota' && pendingIntent?.generation === 0)
                   ? 'quota'
                   : mode === 'anthropic-auth-api'
                     ? 'auth-api'
@@ -373,6 +384,8 @@ async function nativeSetup(
         });
         if (mode === 'anthropic-quota-future')
           transcript = transcript.replace('resetsAt:1792000000', 'resetsAt:1792094400');
+        if (mode === 'combined-quota')
+          transcript = transcript.replace('resetsAt:1792000000', 'resetsAt:1792083660');
       }
       if (googleChild) {
         transcript = googleFixture(args, {

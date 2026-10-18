@@ -3707,12 +3707,19 @@ export class Controller {
   private remaining(run: Run) {
     const intents = this.chargeableIntents();
     const group = this.store.combinedGroup(run.id);
+    const ignored = new Set(
+      this.store
+        .intents()
+        .filter((intent) => this.confirmedQuotaDenial(intent))
+        .map((intent) => intent.attempt_id),
+    );
     const own = group
       ? remainingCombinedBudgets(
           this.store.get<Run>('run', group.run_id) as Run,
           intents,
           this.store.combinedDispatches(group.run_id),
           group,
+          ignored,
         )
       : remainingBudgets(run, intents);
     let task = this.taskAllowance(group?.task_id ?? run.taskId);
@@ -3738,7 +3745,6 @@ export class Controller {
 
   private confirmedQuotaDenial(intent: LaunchIntent) {
     try {
-      if (this.store.combinedGroup(intent.run_id)) return false;
       const completion = NativeQuotaCompletionSchema.parse(
         this.nativeRecord(`native-completion:${intent.attempt_id}`, 4096).value,
       );
@@ -6586,13 +6592,26 @@ export class Controller {
     const task = this.store.get<Task>('task', command.payload.taskId);
     const run = this.store.get<Run>('run', command.payload.runId);
     const combined = run && this.store.combinedGroup(run.id);
+    let quotaRetry = false;
+    let combinedQuota: ReturnType<Controller['quotaRetryEvidence']> | undefined;
+    if (
+      combined &&
+      run &&
+      command.command === 'ResumeRun' &&
+      this.store.receipt(`native-run:${run.id}`)
+    ) {
+      try {
+        combinedQuota = this.quotaRetryEvidence(run, true);
+      } catch {}
+    }
     if (combined?.task_id === command.payload.taskId && command.command === 'ResumeRun')
       return this.resumeCombined(command, combined);
-    if (combined) this.combinedCurrent(combined);
+    if (combined && !combinedQuota) this.combinedCurrent(combined);
     if (combined && combined.task_id === command.payload.taskId)
       return this.startCombinedBaseline(command, combined, effects);
     if (
       combined &&
+      !combinedQuota &&
       !this.combinedPreview(combined).members.find((member) => member.runId === run?.id)?.start
         .available
     )
@@ -6631,6 +6650,7 @@ export class Controller {
       try {
         native = this.quotaRetryBinding(run);
         planned = native.attempt;
+        quotaRetry = true;
       } catch {
         return { outcome: 'blocked', reason: 'native-pilot-retain-only' };
       }
@@ -6866,11 +6886,16 @@ export class Controller {
         .combinedMembers(combined.run_id)
         .find((member) => member.run_id === run.id);
       if (!member) throw Error('The combined member disappeared.');
-      this.store.admitCombinedDispatch(
-        combined.run_id,
-        member.ordinal === 0 ? 'writer-0' : 'writer-1',
-        attempt.id,
-      );
+      const phase = member.ordinal === 0 ? 'writer-0' : 'writer-1';
+      if (combinedQuota)
+        this.store.retryCombinedDispatch(
+          combined.run_id,
+          phase,
+          attempt.id,
+          combinedQuota.attempt.id,
+        );
+      else this.store.admitCombinedDispatch(combined.run_id, phase, attempt.id);
+      if (combinedQuota) this.updateCombined(combined, 'writers');
     }
     const windows = this.store
       .list<Observation>('window')
@@ -6897,7 +6922,7 @@ export class Controller {
         );
     const admitted = { ...run, decision, revision: run.revision + 1 };
     this.store.put('run', run.id, admitted.revision, admitted);
-    if (native?.handoff) {
+    if (native && (native.handoff || quotaRetry)) {
       this.store.saveReceipt(
         `native-attempt-plan:${attempt.id}`,
         hashCanonical(native.appointment),
@@ -6945,7 +6970,6 @@ export class Controller {
   }
 
   private quotaRetryEvidence(run: Run, resetElapsed: boolean) {
-    if (this.store.combinedGroup(run.id)) throw Error('Combined quota retry is unavailable.');
     const task = this.store.get<Task>('task', run.taskId);
     const origin = NativePreparationSchema.parse(this.nativeRecord(`native-run:${run.id}`).value);
     const intents = this.store.intents().filter((value) => value.run_id === run.id);
@@ -6965,6 +6989,78 @@ export class Controller {
     );
     const reset = Date.parse(completion.diagnostic.providerFailure.resetsAt);
     const phases = this.store.nativeProcesses(intent.attempt_id);
+    const group = this.store.combinedGroup(run.id);
+    const member = group
+      ? this.store.combinedMembers(group.run_id).find((value) => value.run_id === run.id)
+      : undefined;
+    const slot =
+      group && member
+        ? this.store
+            .combinedDispatches(group.run_id)
+            .find((value) => value.phase === `writer-${member.ordinal}`)
+        : undefined;
+    const sibling = group
+      ? this.store
+          .combinedDispatches(group.run_id)
+          .find((value) => value.phase.startsWith('writer-') && value.phase !== slot?.phase)
+      : undefined;
+    const siblingMember =
+      group && sibling
+        ? this.store
+            .combinedMembers(group.run_id)
+            .find((value) => sibling.phase === `writer-${value.ordinal}`)
+        : undefined;
+    const siblingCandidate = sibling?.candidate_id
+      ? this.store.get<Candidate>('candidate', sibling.candidate_id)
+      : undefined;
+    let siblingProven = !group;
+    let siblingRetryRunning = false;
+    if (group && sibling && siblingMember && siblingCandidate) {
+      try {
+        siblingProven =
+          sibling.state === 'passed' &&
+          this.evaluationOrigin(siblingMember.task_id, siblingCandidate.id).writer.id ===
+            sibling.attempt_id;
+      } catch {}
+    }
+    if (group && sibling && siblingMember && !siblingProven) {
+      const siblingAttempt = sibling.attempt_id
+        ? this.store.get<Attempt>('attempt', sibling.attempt_id)
+        : undefined;
+      const siblingIntent = sibling.attempt_id
+        ? this.store.intents().find((value) => value.attempt_id === sibling.attempt_id)
+        : undefined;
+      if (
+        siblingAttempt &&
+        siblingIntent &&
+        siblingAttempt.runId === siblingMember.run_id &&
+        siblingIntent.run_id === siblingMember.run_id
+      ) {
+        if (sibling.state === 'stopped') {
+          const siblingPhases = this.store.nativeProcesses(siblingAttempt.id);
+          siblingProven =
+            siblingAttempt.state === 'stopped' &&
+            this.confirmedQuotaDenial(siblingIntent) &&
+            siblingPhases.length > 0 &&
+            siblingPhases.every((phase) => phase.state === 'quiescent');
+        } else if (sibling.state === 'running') {
+          const priorSibling = this.store
+            .intents()
+            .filter(
+              (value) =>
+                value.run_id === siblingMember.run_id &&
+                value.generation < siblingAttempt.generation,
+            )
+            .sort((left, right) => right.generation - left.generation)[0];
+          siblingRetryRunning =
+            ['intent', 'running'].includes(siblingAttempt.state) &&
+            priorSibling?.generation === siblingAttempt.generation - 1 &&
+            this.confirmedQuotaDenial(priorSibling);
+          siblingProven = siblingRetryRunning;
+        }
+      }
+    }
+    if (group) this.combinedCurrent(group, true);
     if (
       task.runId !== run.id ||
       task.state !== 'interrupted' ||
@@ -6978,6 +7074,19 @@ export class Controller {
       intent.generation !== attempt.generation ||
       !phases.length ||
       phases.some((phase) => phase.state !== 'quiescent') ||
+      (group &&
+        (group.run_id === run.id ||
+          !member ||
+          !slot ||
+          !sibling ||
+          !siblingProven ||
+          slot.attempt_id !== attempt.id ||
+          slot.state !== 'stopped' ||
+          group.integration_active ||
+          !(
+            (group.phase === 'blocked' && group.blocker === 'writers-incomplete') ||
+            (group.phase === 'writers' && siblingRetryRunning && group.blocker === null)
+          ))) ||
       origin.appointment.route.family !== 'anthropic' ||
       'repository' in origin.appointment ||
       !('target' in origin.appointment) ||
@@ -6998,7 +7107,7 @@ export class Controller {
       (resetElapsed && reset > Date.parse(this.now()))
     )
       throw Error('Quota retry is unavailable.');
-    return { task, origin, attempt, reset, completion };
+    return { task, origin, attempt, reset, completion, group, member, slot };
   }
 
   private quotaRetryBinding(run: Run): NativeBinding {
@@ -7037,7 +7146,7 @@ export class Controller {
       revision: 0,
     });
     const sessionHash = hashCanonical({ attemptId: retried.id });
-    const binding = freezeNative({
+    const retryPlan = {
       appointment,
       run,
       attempt: retried,
@@ -7045,9 +7154,12 @@ export class Controller {
       baseHash: original.hash,
       anthropicSessionId: `${sessionHash.slice(0, 8)}-${sessionHash.slice(8, 12)}-8${sessionHash.slice(13, 16)}-a${sessionHash.slice(17, 20)}-${sessionHash.slice(20, 32)}`,
       manifest,
-      planArtifact: this.nativeRecord(`native-run:${run.id}`).artifact,
       public: origin.public,
       environment: { ...profile.environment },
+    };
+    const binding = freezeNative({
+      ...retryPlan,
+      planArtifact: this.nativeArtifact(this.nativePlanPayload(retryPlan)),
     });
     if (!this.nativeConsentCurrent(binding)) throw Error('Quota retry consent changed.');
     this.nativeWriterPlan(binding);
@@ -14112,6 +14224,8 @@ export class Controller {
                 });
               });
             } else {
+              const combined = this.store.combinedGroup(run.id);
+              const quotaDenied = !!combined && this.confirmedQuotaDenial(intent);
               this.store.transaction(() => {
                 const task = this.store.get<Task>('task', run.taskId) as Task;
                 this.closePendingEffects(task);
@@ -14122,8 +14236,22 @@ export class Controller {
                     ? 'Native work is retained. Checks and review remain pending.'
                     : nativeFailureNext(outcome),
                 });
+                if (quotaDenied) {
+                  const changed = this.store.db
+                    .prepare(
+                      "UPDATE combined_dispatches SET state='stopped' WHERE parent_run_id=? AND attempt_id=? AND state='running'",
+                    )
+                    .run(combined.run_id, attempt.id);
+                  if (changed.changes !== 1) throw Error('The combined quota slot changed.');
+                  const writers = this.store
+                    .combinedDispatches(combined.run_id)
+                    .filter((slot) => slot.phase.startsWith('writer-'));
+                  if (writers.every((slot) => ['passed', 'stopped'].includes(slot.state)))
+                    this.updateCombined(combined, 'blocked', 'writers-incomplete');
+                  else this.updateCombined(combined, 'writers');
+                }
               });
-              this.sealCandidate(attempt);
+              if (!quotaDenied) this.sealCandidate(attempt);
             }
           }
         } catch {
@@ -16190,11 +16318,24 @@ export class Controller {
             "UPDATE combined_dispatches SET state=?,candidate_id=? WHERE parent_run_id=? AND attempt_id=? AND state='running'",
           )
           .run(passed ? 'passed' : 'failed', captured.candidate.id, group.run_id, attempt.id);
-        if (!passed && !['stopping', 'stopped', 'unknown', 'paused'].includes(group.phase))
+        const current = this.store.combinedGroup(group.run_id) as CombinedGroup;
+        const stoppedSibling = this.store
+          .combinedDispatches(group.run_id)
+          .some(
+            (slot) =>
+              slot.phase.startsWith('writer-') &&
+              slot.attempt_id !== attempt.id &&
+              slot.state === 'stopped',
+          );
+        if (
+          (!passed || stoppedSibling) &&
+          !['stopping', 'stopped', 'unknown', 'paused'].includes(current.phase)
+        )
           this.updateCombined(group, 'blocked', 'writers-incomplete');
-        else this.updateCombined(group, group.phase, group.blocker);
+        else this.updateCombined(group, current.phase, current.blocker);
       }
     });
+    this.armQuotaRetries();
     return captured.candidate;
   }
 

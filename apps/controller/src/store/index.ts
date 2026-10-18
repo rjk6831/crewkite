@@ -639,6 +639,34 @@ export class Store {
     if (changed.changes !== 1) throw Error('The combined dispatch slot was already consumed.');
   }
 
+  retryCombinedDispatch(
+    parentRunId: string,
+    phase: CombinedDispatch['phase'],
+    attemptId: string,
+    priorAttemptId: string,
+  ) {
+    if (!this.transactionEvents) throw Error('Combined retry requires a transaction.');
+    const group = this.combinedGroup(parentRunId);
+    const attempt = this.get<Attempt>('attempt', attemptId);
+    const member = this.combinedMembers(parentRunId).find(
+      (value) => phase === `writer-${value.ordinal}`,
+    );
+    if (
+      !group ||
+      !attempt ||
+      attempt.runId !== member?.run_id ||
+      group.integration_active ||
+      !['writers', 'blocked'].includes(group.phase)
+    )
+      throw Error('The combined retry has no current owner.');
+    const changed = this.db
+      .prepare(
+        "UPDATE combined_dispatches SET state='running',attempt_id=?,candidate_id=NULL,check_artifact_id=NULL,definition_hash=NULL WHERE parent_run_id=? AND phase=? AND attempt_id=? AND state IN ('failed','stopped')",
+      )
+      .run(attemptId, parentRunId, phase, priorAttemptId);
+    if (changed.changes !== 1) throw Error('The combined retry slot changed.');
+  }
+
   nativePhasesComplete(attemptId: string, expectedFamily: Route['family']): boolean {
     const attempt = this.get<Attempt>('attempt', attemptId);
     const route = attempt && this.get<Route>('route', attempt.routeId);

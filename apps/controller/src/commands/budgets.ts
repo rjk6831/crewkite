@@ -42,10 +42,14 @@ export function remainingCombinedBudgets(
   intents: LaunchIntent[],
   dispatches: CombinedDispatch[],
   group: Pick<CombinedGroup, 'integration_milliseconds' | 'integration_active'>,
+  ignoredAttemptIds: ReadonlySet<string> = new Set(),
 ) {
-  const ids = dispatches.flatMap((slot) => (slot.attempt_id ? [slot.attempt_id] : []));
+  const allIds = dispatches.flatMap((slot) => (slot.attempt_id ? [slot.attempt_id] : []));
+  const ids = dispatches.flatMap((slot) =>
+    slot.attempt_id && !ignoredAttemptIds.has(slot.attempt_id) ? [slot.attempt_id] : [],
+  );
   if (
-    new Set(ids).size !== ids.length ||
+    new Set(allIds).size !== allIds.length ||
     ids.some((id) => !intents.some((intent) => intent.attempt_id === id))
   )
     throw Error('The combined budget has an incomplete dispatch ledger.');

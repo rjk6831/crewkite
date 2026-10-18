@@ -27,14 +27,38 @@ test('combined tasks share seven real dispatches and require a separate full bar
     'closed-before-check',
     'child-budget',
     'empty-journal',
+    'quota',
+    'quota-both',
+    'quota-stop',
   ] as const;
   let next = 0;
   const run = async () => {
     while (next < scenarios.length) {
       const scenario = scenarios[next++];
-      const context = await nativeSetup(t, `combined-${scenario}`, {
-        identity: { name: 'Fixture owner', email: 'owner@example.invalid' },
-      });
+      const quotaScenario = scenario.startsWith('quota');
+      const scheduled: { callback: () => void; delay: number; cancelled: boolean }[] = [];
+      const context = await nativeSetup(
+        t,
+        quotaScenario ? 'combined-quota' : `combined-${scenario}`,
+        {
+          identity: { name: 'Fixture owner', email: 'owner@example.invalid' },
+          ...(quotaScenario
+            ? {
+                schedule: (callback: () => void, delay: number) => {
+                  if (delay !== 60_000) {
+                    const timer = setTimeout(callback, delay);
+                    return () => clearTimeout(timer);
+                  }
+                  const pending = { callback, delay, cancelled: false };
+                  scheduled.push(pending);
+                  return () => {
+                    pending.cancelled = true;
+                  };
+                },
+              }
+            : {}),
+        },
+      );
       let controller = context.controller;
       const { command, task: parent } = context;
       const seeded: Record<string, string> = {
@@ -158,7 +182,7 @@ test('combined tasks share seven real dispatches and require a separate full bar
       const expiresAt = new Date(Date.parse(context.clock.now()) + 300000).toISOString();
       const policy = {
         ...context.appointment.policy,
-        authority: 'guided',
+        authority: quotaScenario ? 'balanced' : 'guided',
         limits: { attempts: 7, minutes: 20, concurrency: 2 },
         unknownUsage: { rule: 'fixed-allowance', allowance: { launches: 7, minutes: 20 } },
         effects: children.map((child) => ({
@@ -177,7 +201,22 @@ test('combined tasks share seven real dispatches and require a separate full bar
           taskId: child.id,
           expectedRevision: child.revision,
           scope: [index ? 'src/b.mjs' : 'src/a.mjs'],
-          writer: { profileId: 'openai-file-v1', creditPolicy: 'ordinary' },
+          writer: {
+            profileId:
+              quotaScenario && (index === 0 || scenario === 'quota-both')
+                ? 'anthropic-file-v1'
+                : 'openai-file-v1',
+            creditPolicy: 'ordinary',
+            ...(quotaScenario && (index === 0 || scenario === 'quota-both')
+              ? {
+                  billingAttestation: {
+                    source: 'user-attested' as const,
+                    subscriptionLoginConfirmed: true,
+                    paidExtraUsageDisabled: true,
+                  },
+                }
+              : {}),
+          },
           consent: 'explicit',
           maximumMinutes: 5,
         })),
@@ -471,6 +510,7 @@ test('combined tasks share seven real dispatches and require a separate full bar
       let writerPause: Promise<CommandResult> | undefined;
       let activeResume: Promise<CommandResult> | undefined;
       context.onWritten((message, nativePhase) => {
+        if (quotaScenario) return;
         if (nativePhase !== 'task' || message.method !== 'turn/start') return;
         written++;
         if (written !== 2) return;
@@ -511,7 +551,11 @@ test('combined tasks share seven real dispatches and require a separate full bar
             child.stdin?.write(`${JSON.stringify({ method: 'fixture/release' })}\n`);
           }
       });
-      for (const [index, member] of preview.members.entries()) {
+      const members =
+        quotaScenario && scenario !== 'quota-both'
+          ? [...preview.members].reverse()
+          : preview.members;
+      for (const [index, member] of members.entries()) {
         if (scenario === 'unknown' && index === 1) break;
         assert.equal(
           (
@@ -526,6 +570,139 @@ test('combined tasks share seven real dispatches and require a separate full bar
           ).outcome,
           'applied',
         );
+        if (quotaScenario && scenario !== 'quota-both' && index === 0)
+          await waitFor(
+            'quota sibling passes',
+            () =>
+              controller.store
+                .combinedDispatches(preview.runId)
+                .find((slot) => slot.phase === 'writer-1')?.state === 'passed',
+            'writers',
+          );
+      }
+      if (scenario === 'quota-both') {
+        await waitFor(
+          'both quota children wait for reset',
+          () =>
+            controller.store
+              .combinedDispatches(preview.runId)
+              .filter((slot) => slot.phase.startsWith('writer-'))
+              .every((slot) => slot.state === 'stopped'),
+          'writers',
+        );
+        assert.equal(phase()?.phase, 'blocked');
+        controller = await context.restart();
+        const pending = scheduled.filter((entry) => entry.delay === 60_000 && !entry.cancelled);
+        assert.equal(pending.length, 2);
+        context.clock.advance(60_000);
+        pending[0]?.callback();
+        pending[1]?.callback();
+        await waitFor(
+          'both quota children retry',
+          () =>
+            controller.store
+              .combinedDispatches(preview.runId)
+              .filter((slot) => slot.phase.startsWith('writer-'))
+              .every((slot) => slot.state === 'passed') && phase()?.assemble.available === true,
+          'writers',
+        );
+        for (const member of preview.members)
+          assert.equal(
+            controller.store.intents().filter((intent) => intent.run_id === member.runId).length,
+            2,
+          );
+        continue;
+      }
+      if (scenario === 'quota' || scenario === 'quota-stop') {
+        await waitFor(
+          'quota child waits for reset',
+          () => {
+            const slots = controller.store.combinedDispatches(preview.runId);
+            return (
+              slots.find((slot) => slot.phase === 'writer-0')?.state === 'stopped' &&
+              slots.find((slot) => slot.phase === 'writer-1')?.state === 'passed'
+            );
+          },
+          'writers',
+        );
+        assert.equal(phase()?.phase, 'blocked');
+        assert.equal(phase()?.blocker, 'writers-incomplete');
+        const quotaSchedules = () => scheduled.filter((pending) => pending.delay === 60_000);
+        const pendingReset = quotaSchedules().find((pending) => !pending.cancelled);
+        assert(pendingReset);
+        const before = controller.store.combinedDispatches(preview.runId);
+        const deniedAttempt = before.find((slot) => slot.phase === 'writer-0')?.attempt_id;
+        const sibling = before.find((slot) => slot.phase === 'writer-1');
+        assert(deniedAttempt && sibling?.candidate_id);
+        const denial = controller.store.receipt(`native-completion:${deniedAttempt}`);
+        assert(denial);
+        assert.equal(
+          controller.store.intents().filter((intent) => intent.run_id === preview.members[1].runId)
+            .length,
+          1,
+        );
+        assert.equal(
+          controller.store.intents().filter((intent) => intent.run_id === preview.members[0].runId)
+            .length,
+          1,
+        );
+        if (scenario === 'quota-stop') {
+          const stopped = await controller.execute(
+            command(
+              'StopRun',
+              { taskId: preview.members[1].taskId, runId: preview.members[1].runId },
+              rev(preview.members[1].taskId),
+            ),
+            'local-owner',
+          );
+          assert.equal(stopped.outcome, 'applied');
+          context.clock.advance(60_000);
+          pendingReset.callback();
+          assert.equal(
+            controller.store
+              .intents()
+              .filter((intent) => intent.run_id === preview.members[0].runId).length,
+            1,
+          );
+          assert.equal(phase()?.phase, 'blocked');
+          assert.equal(phase()?.blocker, 'stopped');
+          continue;
+        }
+        controller = await context.restart();
+        assert.equal(phase()?.phase, 'blocked');
+        assert.equal(pendingReset.cancelled, true);
+        const rearmed = quotaSchedules().filter((pending) => !pending.cancelled);
+        assert.equal(rearmed.length, 1);
+        context.clock.advance(60_000);
+        rearmed[0]?.callback();
+        await waitFor(
+          'quota child retry',
+          () =>
+            controller.store.combinedDispatches(preview.runId)[1]?.state === 'passed' &&
+            phase()?.assemble.available === true,
+          'writers',
+        );
+        assert.equal(
+          controller.store.intents().filter((intent) => intent.run_id === preview.members[0].runId)
+            .length,
+          2,
+        );
+        rearmed[0]?.callback();
+        assert.equal(
+          controller.store.intents().filter((intent) => intent.run_id === preview.members[0].runId)
+            .length,
+          2,
+        );
+        const after = controller.store.combinedDispatches(preview.runId);
+        assert.equal(
+          after.find((slot) => slot.phase === 'writer-1')?.attempt_id,
+          sibling.attempt_id,
+        );
+        assert.equal(
+          after.find((slot) => slot.phase === 'writer-1')?.candidate_id,
+          sibling.candidate_id,
+        );
+        assert.deepEqual(controller.store.receipt(`native-completion:${deniedAttempt}`), denial);
       }
       if (scenario === 'unknown') {
         await waitFor('unknown owner', () => phase()?.phase === 'unknown');
@@ -877,12 +1054,12 @@ test('combined tasks share seven real dispatches and require a separate full bar
       );
       assert.equal(phase()?.phase, 'ready', JSON.stringify(phase()));
       const snapshot = controller.snapshot();
-      assert.equal(snapshot.attempts.length, 9);
+      assert.equal(snapshot.attempts.length, scenario === 'quota' ? 10 : 9);
       assert.equal(
         controller.store
           .intents()
           .filter((intent) => controller.store.runPurpose(intent.run_id) !== 'conversation').length,
-        7,
+        scenario === 'quota' ? 8 : 7,
       );
       assert(
         snapshot.reviewJobs?.every(
