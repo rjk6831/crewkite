@@ -9,7 +9,12 @@ import {
 import { z } from 'zod';
 import { type DiscoveryMetadata, OpenAiDiscovery, type OpenAiUsageHook } from './discovery.ts';
 import { type NativeLaunch, startNativeTask } from './native-discovery.ts';
-import { nativeTaskAdmitted, type ReplacementDiagnostic } from './replacement.ts';
+import {
+  authorityNotice,
+  NoticeCensus,
+  nativeTaskAdmitted,
+  type ReplacementDiagnostic,
+} from './replacement.ts';
 
 const text = (limit: number) =>
   z
@@ -54,6 +59,8 @@ export function repositoryPlan(value: z.input<typeof input>) {
 }
 export type RepositoryPlan = ReturnType<typeof repositoryPlan>;
 const encode = (value: unknown) => Buffer.from(`${JSON.stringify(value)}\n`);
+// Command output streams through this transcript. Eight MiB is sixteen full 512 KiB frames.
+const MAX_OUTPUT = 8 * 1024 * 1024;
 const turn = z.object({
   id,
   status: z.enum(['inProgress', 'completed', 'interrupted', 'failed']),
@@ -70,6 +77,8 @@ const itemKinds = [
   'contextCompaction',
 ] as const;
 const terminal = z.enum(['completed', 'failed', 'declined']);
+// Output, message and reasoning deltas, diffs, plans and token counts only report progress.
+// A busy command can stream thousands of them, so they join the ignored notices.
 const methods = [
   'thread/started',
   'thread/settings/updated',
@@ -83,20 +92,8 @@ const methods = [
   'configWarning',
   'turn/started',
   'turn/completed',
-  'turn/diff/updated',
-  'turn/plan/updated',
   'item/started',
   'item/completed',
-  'item/agentMessage/delta',
-  'item/plan/delta',
-  'item/reasoning/summaryTextDelta',
-  'item/reasoning/summaryPartAdded',
-  'item/reasoning/textDelta',
-  'item/commandExecution/outputDelta',
-  'item/commandExecution/terminalInteraction',
-  'item/fileChange/outputDelta',
-  'item/fileChange/patchUpdated',
-  'thread/tokenUsage/updated',
   'error',
   'serverRequest/resolved',
 ] as const;
@@ -137,7 +134,9 @@ export class RepositoryTranscript {
   private frame: ReplacementDiagnostic['envelope'] = 'none';
   private method: string | null = null;
   private retries = 0;
+  private readonly census = new NoticeCensus();
   private readonly onActivity: ActivityHook | undefined;
+  readonly outputLimit = MAX_OUTPUT;
 
   constructor(
     plan: RepositoryPlan,
@@ -319,7 +318,7 @@ export class RepositoryTranscript {
   push(bytes: Uint8Array) {
     this.check();
     this.received += bytes.length;
-    if (this.received > 1048576) this.refuse('limit');
+    if (this.received > MAX_OUTPUT) this.refuse('limit');
     this.pending = Buffer.concat([this.pending, bytes]);
     for (;;) {
       const end = this.pending.indexOf(10);
@@ -440,12 +439,10 @@ export class RepositoryTranscript {
       this.waiting = false;
       return;
     }
-    if (
-      ++this.count > 1024 ||
-      !this.method ||
-      !methods.includes(this.method as (typeof methods)[number])
-    )
-      this.refuse('unsupported');
+    if (!this.method || authorityNotice(this.method)) this.refuse('unsupported');
+    if (!methods.includes(this.method as (typeof methods)[number]))
+      return this.census.add(this.method);
+    if (++this.count > 4096) this.refuse('limit');
     this.notification(this.method, value.params);
   }
   private notification(method: string, raw: unknown) {
@@ -569,29 +566,6 @@ export class RepositoryTranscript {
       if (!retry.willRetry || ++this.retries > 3) this.refuse('limit');
       return;
     }
-    if (method === 'thread/tokenUsage/updated') {
-      z.object({
-        tokenUsage: z.object({
-          total: z.object({ totalTokens: z.number().safe().nonnegative() }),
-          last: z.object({ totalTokens: z.number().safe().nonnegative() }),
-        }),
-      }).parse(raw);
-      return;
-    }
-    if (method === 'turn/diff/updated') {
-      z.object({ diff: text(524288) }).parse(raw);
-      return;
-    }
-    if (method === 'turn/plan/updated') {
-      z.object({
-        plan: z
-          .array(
-            z.object({ step: text(4096), status: z.enum(['pending', 'inProgress', 'completed']) }),
-          )
-          .max(128),
-      }).parse(raw);
-      return;
-    }
     if (method === 'item/started' || method === 'item/completed') {
       const item = z.object({ item: z.object({ id, type: z.enum(itemKinds) }) }).parse(raw).item;
       if (method === 'item/started') {
@@ -609,29 +583,7 @@ export class RepositoryTranscript {
       }
       return;
     }
-    const item = z.object({ itemId: id }).parse(raw);
-    if (!this.items.has(item.itemId) || this.completed.has(item.itemId)) this.refuse();
-    const expected = method.startsWith('item/commandExecution/')
-      ? 'commandExecution'
-      : method.startsWith('item/fileChange/')
-        ? 'fileChange'
-        : method.startsWith('item/reasoning/')
-          ? 'reasoning'
-          : method === 'item/plan/delta'
-            ? 'plan'
-            : 'agentMessage';
-    if (this.items.get(item.itemId) !== expected) this.refuse();
-    if (method === 'item/fileChange/patchUpdated')
-      z.object({
-        changes: z
-          .array(z.object({ path: text(4096), kind: z.unknown(), diff: text(524288) }))
-          .max(10000),
-      }).parse(raw);
-    else if (method === 'item/commandExecution/terminalInteraction')
-      z.object({ processId: id, stdin: text(524288) }).parse(raw);
-    else if (method.endsWith('PartAdded'))
-      z.object({ summaryIndex: z.number().safe().nonnegative() }).parse(raw);
-    else z.object({ delta: text(524288) }).parse(raw);
+    this.refuse('unsupported');
   }
   interrupt() {
     if (this.interrupted || !this.threadId || !this.turnId || this.step === 'complete') return null;
@@ -687,10 +639,13 @@ export class RepositoryTranscript {
     return this.step === 'metadata' ? this.discovery.refusedEnvelope : null;
   }
   get notifications() {
-    return this.discovery.notifications + this.count;
+    return this.discovery.notifications + this.count + this.census.total;
   }
   get diagnostic() {
     return this.failure;
+  }
+  get ignoredNotifications() {
+    return this.census.value;
   }
 }
 
@@ -730,6 +685,7 @@ export function startRepository(
     result: handle.result.then((outcome) => ({
       ...outcome,
       diagnostic: reader?.diagnostic ?? null,
+      ignoredNotifications: reader?.ignoredNotifications ?? {},
     })),
   };
 }

@@ -163,6 +163,51 @@ const fields = [
   'path',
   'baseHash',
 ] as const;
+// A transcript ignores a notice it does not consume, unless the notice ends or moves the thread,
+// opens a realtime session, reroutes the model, starts a hook or MCP server, changes the account or
+// remote control, or touches approvals.
+const authorityNotices: ReadonlySet<string> = new Set([
+  'thread/archived',
+  'thread/deleted',
+  'thread/closed',
+  'thread/reverted',
+  'thread/environment/connected',
+  'thread/environment/disconnected',
+  'remoteControl/status/changed',
+  'model/rerouted',
+  'hook/started',
+  'hook/completed',
+  'account/updated',
+  'account/login/completed',
+  'account/gatewayOAuth/changed',
+  'item/autoApprovalReview/started',
+  'item/autoApprovalReview/completed',
+  'autoApprovalReview/strictReviewRequired',
+  'guardianWarning',
+]);
+export const authorityNotice = (method: string) =>
+  authorityNotices.has(method) ||
+  method.startsWith('thread/realtime/') ||
+  method.startsWith('mcpServer/');
+
+/** Ignored notices are counted by method hash so a completion record shows what arrived. */
+export class NoticeCensus {
+  private readonly counts = new Map<string, number>();
+  private count = 0;
+  add(method: string) {
+    const hash = createHash('sha256').update(method).digest('hex');
+    // Sixteen hashes keep a completion record well inside its 4 KiB read bound.
+    const key = this.counts.has(hash) || this.counts.size < 16 ? hash : 'other';
+    this.counts.set(key, (this.counts.get(key) ?? 0) + 1);
+    this.count++;
+  }
+  get total() {
+    return this.count;
+  }
+  get value(): Readonly<Record<string, number>> {
+    return Object.freeze(Object.fromEntries(this.counts));
+  }
+}
 const rpcFields = [
   'outputSchema',
   'sandboxPolicy',
@@ -313,6 +358,7 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
   private readonly startedItems = new Map<string, string>();
   private readonly completedItems = new Set<string>();
   private notificationCount = 0;
+  private readonly census = new NoticeCensus();
   private submission = false;
   private interrupted = false;
   private retries = 0;
@@ -530,7 +576,6 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
           this.awaiting = false;
           continue;
         }
-        if (++this.notificationCount > 4096) this.refuse('limit');
         this.notification(value.method, value.params);
       } catch (error) {
         this.refuse('validation', error);
@@ -538,6 +583,12 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
     }
   }
   private notification(method: string, params: unknown) {
+    if (authorityNotice(method)) {
+      this.site = 'unsupported';
+      this.refuse('unsupported');
+    }
+    if (!methods.some((known) => known === method)) return this.census.add(method);
+    if (++this.notificationCount > 4096) this.refuse('limit');
     if (method === 'thread/started') {
       this.site = 'thread-event';
       const value = z.object({ thread: z.object({ id }) }).parse(params);
@@ -641,10 +692,6 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
       }).parse(params);
       return;
     }
-    if (!methods.some((known) => known === method)) {
-      this.site = 'unsupported';
-      this.refuse('unsupported');
-    }
     this.site = 'identity';
     const identity = z.object({ threadId: id, turnId: id });
     if (method === 'turn/started' || method === 'turn/completed') {
@@ -674,13 +721,15 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
       return;
     }
     const related = identity.parse(params);
-    if (
-      !this.submission ||
-      related.threadId !== this.threadId ||
-      related.turnId !== this.turnId ||
-      this.step === 'complete'
-    )
+    if (!this.submission || related.threadId !== this.threadId || related.turnId !== this.turnId)
       this.refuse();
+    // Progress can trail turn/completed. Only new items or an error put the result in doubt.
+    // A late token count still updates the reported context use.
+    if (this.step === 'complete') {
+      if (method === 'item/started' || method === 'item/completed' || method === 'error')
+        this.refuse();
+      if (method !== 'thread/tokenUsage/updated') return;
+    }
     if (method === 'item/started' || method === 'item/completed') {
       this.site = 'item-event';
       const value = z.object({ item }).parse(params).item;
@@ -848,7 +897,10 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
     return this.step === 'metadata' ? this.discovery.refusedEnvelope : null;
   }
   get notifications() {
-    return this.discovery.notifications + this.notificationCount;
+    return this.discovery.notifications + this.notificationCount + this.census.total;
+  }
+  get ignoredNotifications() {
+    return this.census.value;
   }
 }
 
@@ -882,20 +934,21 @@ export class ReplacementTranscript extends StructuredTranscript<{ replacement: R
   }
 }
 
+type StructuredReader<T> = NativeTranscript<T> & {
+  readonly diagnostic: ReplacementDiagnostic | null;
+  readonly ignoredNotifications: Readonly<Record<string, number>>;
+};
+
 export function startStructuredTask<T extends Record<string, unknown>>(
   launch: NativeLaunch,
   options: Omit<Parameters<typeof startNativeTask>[1], 'now' | 'maximumTaskMs'> & {
     now?: () => number;
     onUsage?: OpenAiUsageHook;
   },
-  createReader: (
-    options: TranscriptOptions,
-  ) => NativeTranscript<T> & { readonly diagnostic: ReplacementDiagnostic | null },
+  createReader: (options: TranscriptOptions) => StructuredReader<T>,
 ) {
   const now = options.now ?? (() => performance.now());
-  let reader:
-    | (NativeTranscript<T> & { readonly diagnostic: ReplacementDiagnostic | null })
-    | undefined;
+  let reader: StructuredReader<T> | undefined;
   const handle = startNativeTask(
     launch,
     { ...options, now, disableMcpServers: true },
@@ -915,6 +968,7 @@ export function startStructuredTask<T extends Record<string, unknown>>(
     result: handle.result.then((outcome) => ({
       ...outcome,
       diagnostic: reader?.diagnostic ?? null,
+      ignoredNotifications: reader?.ignoredNotifications ?? {},
     })),
   };
 }

@@ -4621,6 +4621,17 @@ test('an appointed native proposal is retained and applied once after every phas
           ?.result.outcome,
         'applied',
       );
+      // The completion record counts the command output the writer saw and ignored.
+      const completion = ArtifactSchema.parse(
+        controller.store.receipt(`native-completion:${controller.store.intents()[0].attempt_id}`)
+          ?.result.entity,
+      );
+      assert.deepEqual(
+        JSON.parse(
+          new ArtifactFiles(join(controller.home, 'artifacts')).read(completion.hash).toString(),
+        ).ignoredNotifications,
+        { [createHash('sha256').update('item/commandExecution/outputDelta').digest('hex')]: 3 },
+      );
     } else {
       assert(preview.target);
       assert.equal(preview.target.baseHash, appointment.target.baseHash);

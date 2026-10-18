@@ -585,6 +585,7 @@ type NativeOutcome = {
   reason: string | null;
   quiescent: boolean;
   diagnostic: unknown;
+  ignoredNotifications?: Readonly<Record<string, number>>;
 };
 type AcpSetupCommand = Extract<
   Command,
@@ -4543,6 +4544,7 @@ export class Controller {
               quiescent,
               submitted: !!outcome?.metadata,
               reason: outcome ? outcome.reason : 'launch',
+              ignoredNotifications: outcome?.ignoredNotifications ?? {},
             });
             this.store.saveReceipt(
               `conversation-completion:${attempt.id}`,
@@ -11772,6 +11774,7 @@ export class Controller {
             reason: outcome ? outcome.reason : 'launch',
             quiescent,
             diagnostic: outcome?.diagnostic ?? null,
+            ignoredNotifications: outcome?.ignoredNotifications ?? {},
           });
           this.store.saveReceipt(
             `native-review-completion:${attempt.id}`,
@@ -13465,6 +13468,9 @@ export class Controller {
               reason: outcome ? outcome.reason : 'launch',
               quiescent,
               diagnostic: outcome?.diagnostic ?? null,
+              ...(outcome?.ignoredNotifications
+                ? { ignoredNotifications: outcome.ignoredNotifications }
+                : {}),
             });
             this.store.saveReceipt(
               `native-completion:${attempt.id}`,

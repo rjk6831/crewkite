@@ -86,6 +86,21 @@ const threadNotices = (directory: string) => [
     },
   },
 ];
+const methodHash = (value: string) => createHash('sha256').update(value).digest('hex');
+// Progress and display notices nothing consumes. The census keeps only their method hashes.
+const ignoredNotices = (identity: { threadId: string; turnId: string }) => [
+  {
+    method: 'item/commandExecution/outputDelta',
+    params: { ...identity, itemId: 'command-1', delta: 'private-notice-canary' },
+  },
+  { method: 'modelProvider/authRecoveryStarted', params: identity },
+  {
+    method: 'turn/moderationMetadata',
+    params: { ...identity, metadata: { note: 'private-notice-canary' } },
+  },
+  { method: 'model/safetyBuffering/updated', params: identity },
+  { method: 'private-notice-canary', params: { text: 'private-notice-canary' } },
+];
 const edit = (directory: string, path = 'net.mjs') => ({
   version: 1,
   attemptId: plan(directory).attemptId,
@@ -164,6 +179,24 @@ const output = (directory: string, mode = 'success', path = 'net.mjs', structure
       { method: 'item/completed', params: { ...identity, item: reasoning, completedAtMs: 2 } },
     );
   }
+  if (mode === 'ignored-notices') messages.splice(2, 0, ...ignoredNotices(identity));
+  if (mode === 'late-progress')
+    messages.push(
+      {
+        method: 'thread/tokenUsage/updated',
+        params: {
+          ...identity,
+          tokenUsage: { total: { totalTokens: 9 }, last: { totalTokens: 9 } },
+        },
+      },
+      ignoredNotices(identity)[0],
+    );
+  if (mode === 'late-completion') messages.push(messages.at(-1));
+  if (mode === 'late-error')
+    messages.push({
+      method: 'error',
+      params: { ...identity, willRetry: true, error: { message: 'private retry detail' } },
+    });
   if (mode === 'duplicate') messages.splice(4, 0, messages[3]);
   if (mode === 'summary') item.text = 'The change is done.';
   if (mode === 'extra-field') item.text = JSON.stringify({ ...value, command: 'touch elsewhere' });
@@ -291,9 +324,13 @@ test('native proposals and reviews require one matching completed turn and bound
     'fragmented',
     'reasoning-retry',
     'thread-notices',
+    'ignored-notices',
+    'late-progress',
     'nested-path',
     'unicode-path',
     'byte-limit',
+    'late-completion',
+    'late-error',
     'different-path',
     'nul-content',
     'wrong-attempt',
@@ -357,6 +394,8 @@ test('native proposals and reviews require one matching completed turn and bound
       mode === 'fragmented' ||
       mode === 'reasoning-retry' ||
       mode === 'thread-notices' ||
+      mode === 'ignored-notices' ||
+      mode === 'late-progress' ||
       mode === 'nested-path' ||
       mode === 'unicode-path' ||
       mode === 'byte-limit'
@@ -371,6 +410,16 @@ test('native proposals and reviews require one matching completed turn and bound
       assert.equal(result.observedRetries, mode === 'reasoning-retry' ? 1 : 0);
       assert(!JSON.stringify(result).includes('private-data'));
       assert.equal(reader.next(), null);
+      if (mode === 'late-progress') assert.equal(result.contextUsage?.usedTokens, 9);
+      if (mode === 'ignored-notices' || mode === 'late-progress')
+        assert.deepEqual(
+          reader.ignoredNotifications,
+          Object.fromEntries(
+            ignoredNotices({ threadId: 'thread-1', turnId: 'turn-1' })
+              .slice(0, mode === 'late-progress' ? 1 : undefined)
+              .map(({ method }) => [methodHash(method), 1]),
+          ),
+        );
     } else assert.throws(perform, mode);
   }
   const directory = resolve('internal/replacement-fixture');
@@ -392,6 +441,7 @@ test('native proposals and reviews require one matching completed turn and bound
       method: 'mcpServer/startupStatus/updated',
       params: { threadId: 'thread-1', name: 'private server', status: 'starting' },
     },
+    { method: 'account/updated', params: { authMode: 'apikey', planType: null } },
     {
       method: 'thread/settings/updated',
       params: { threadId: 'foreign', threadSettings: threadSettings(directory) },
@@ -432,9 +482,7 @@ test('native proposals and reviews require one matching completed turn and bound
     assert.equal(rejected.complete, false);
     assert.equal(
       rejected.diagnostic?.method,
-      notice.method.startsWith('thread/environment/') || notice.method.startsWith('mcpServer/')
-        ? 'other'
-        : notice.method,
+      /^(thread\/environment|mcpServer|account)\//.test(notice.method) ? 'other' : notice.method,
     );
   }
   const canary = 'private-diagnostic-canary';
@@ -468,7 +516,7 @@ test('native proposals and reviews require one matching completed turn and bound
     },
     {
       frame: {
-        method: canary,
+        method: 'thread/closed',
         params: {
           threadId: 'thread-1',
           turnId: canary,
@@ -1203,6 +1251,12 @@ test('native proposals and reviews require one matching completed turn and bound
     'wrong-approval',
     'malformed-approval',
     'unknown-request',
+    'notice-request',
+    'busy-command',
+    'overrun',
+    'late-progress',
+    'late-completion',
+    'late-error',
     'network',
     'cwd',
     'incomplete-item',
@@ -1280,14 +1334,16 @@ test('native proposals and reviews require one matching completed turn and bound
       { method: 'turn/started', params: { threadId: identity.threadId, turn: running } },
       { method: 'item/started', params: { ...identity, item: command, startedAtMs: 1 } },
     ];
-    if (mode.includes('approval') || mode === 'unknown-request') {
+    if (mode.includes('approval') || mode.endsWith('-request')) {
       for (const frame of frames) native.push(bytes(frame));
       const approval = {
         id: 'approval-1',
         method:
           mode === 'unknown-request'
             ? 'item/tool/request'
-            : 'item/commandExecution/requestApproval',
+            : mode === 'notice-request'
+              ? 'item/commandExecution/outputDelta'
+              : 'item/commandExecution/requestApproval',
         params: {
           ...identity,
           turnId: mode === 'wrong-approval' ? 'other' : identity.turnId,
@@ -1318,22 +1374,33 @@ test('native proposals and reviews require one matching completed turn and bound
       assert.equal(native.complete, false);
       continue;
     }
+    if (mode === 'overrun') {
+      native.push(bytes(frames[0]));
+      const queued = bytes({ method: 'thread/queue/changed', params: identity });
+      for (let count = 1; count < 4096; count++) native.push(queued);
+      assert.throws(() => native.push(queued));
+      assert.equal(native.diagnostic?.cause, 'limit');
+      continue;
+    }
     if (mode === 'duplicate-item') frames.push(frames[1]);
     if (mode === 'reroute') frames.push({ method: 'model/rerouted', params: identity });
-    frames.push({
+    // A busy command streams more than 1024 output frames and more than 1 MiB.
+    const delta = {
       method: 'item/commandExecution/outputDelta',
       params: {
         ...identity,
-        turnId: mode === 'wrong-turn' ? 'other' : identity.turnId,
         itemId: command.id,
-        delta: 'private-repository-canary',
+        delta: 'private-repository-canary'.repeat(mode === 'busy-command' ? 8 : 1),
       },
-    });
+    };
+    frames.push(...Array(mode === 'busy-command' ? 5000 : 1).fill(delta));
+    if (mode === 'busy-command') frames.push(...ignoredNotices(identity).slice(1));
     if (mode !== 'incomplete-item')
       frames.push({
         method: 'item/completed',
         params: {
           ...identity,
+          turnId: mode === 'wrong-turn' ? 'other' : identity.turnId,
           item: { ...command, status: mode === 'failed-command' ? 'failed' : 'completed' },
           completedAtMs: 2,
         },
@@ -1369,6 +1436,11 @@ test('native proposals and reviews require one matching completed turn and bound
         turn: { ...running, status: mode === 'failed-turn' ? 'failed' : 'completed' },
       },
     });
+    if (mode === 'late-progress')
+      frames.push(delta, { method: 'turn/diff/updated', params: { ...identity, diff: '' } });
+    if (mode === 'late-completion') frames.push(frames.at(-1));
+    if (mode === 'late-error')
+      frames.push({ method: 'error', params: { ...identity, willRetry: true, error: {} } });
     const perform = () => {
       for (const frame of frames) {
         const buffer = bytes(frame);
@@ -1377,7 +1449,9 @@ test('native proposals and reviews require one matching completed turn and bound
       }
       return native.finish();
     };
-    if (['success', 'fragmented', 'failed-command'].includes(mode)) {
+    if (
+      ['success', 'fragmented', 'failed-command', 'busy-command', 'late-progress'].includes(mode)
+    ) {
       const result = perform();
       assert.deepEqual(activities, [
         { kind: 'command', state: 'started' },
@@ -1391,6 +1465,15 @@ test('native proposals and reviews require one matching completed turn and bound
       assert.equal(Object.hasOwn(result, 'modelChoices'), false);
       assert.equal('replacement' in result, false);
       assert(!JSON.stringify(result).includes('private-repository-canary'));
+      if (mode === 'busy-command')
+        assert.deepEqual(native.ignoredNotifications, {
+          [methodHash(delta.method)]: 5000,
+          ...Object.fromEntries(
+            ignoredNotices(identity)
+              .slice(1)
+              .map(({ method }) => [methodHash(method), 1]),
+          ),
+        });
     } else assert.throws(perform, mode);
     assert(
       !JSON.stringify({
@@ -1840,6 +1923,9 @@ test('native task submission and interruption share one deadline through owned c
     const captured = await repository.result;
     assert.equal(captured.reason, null, JSON.stringify(captured));
     assert.equal(captured.quiescent, true);
+    assert.deepEqual(captured.ignoredNotifications, {
+      [methodHash('item/commandExecution/outputDelta')]: 3,
+    });
     assert.equal(repositorySubmissions, 1);
     assert.deepEqual(repositoryUsages, delivered);
     assert.deepEqual(
