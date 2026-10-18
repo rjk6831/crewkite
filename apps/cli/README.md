@@ -91,6 +91,19 @@ Configure is Save. It starts no planning or execution turn, discovers no models 
 
 To recover the explicit profile-default behavior, run configure with the complete selection and consent while omitting `--model-request`. Omission sends no model request field and does not preserve a previous explicit pair. Inspect show after Save. If Save returns an unknown outcome, keep its receipt and retry that exact receipt. Retry reuses the saved command, including its original model request, even if the input file changes.
 
+To reuse retained context, add `--context-refs context-refs.json` to conversation create, send, guide or answer. Use actual retained context artifact IDs and hashes from this controller home, such as references in the task's conversation history from `conversation show <task-id> --json`. Copy only each reference's `artifactId` and `hash` into the array. This template needs actual retained values before use:
+
+```json
+[
+  {
+    "artifactId": "<copy retained context artifactId>",
+    "hash": "<copy retained context hash>"
+  }
+]
+```
+
+The bounded JSON file accepts at most four references with distinct artifact IDs and hashes. Unknown fields, source paths and malformed references are rejected before mutation. Omitting the option preserves the absent context field. Supplying `[]` sends an explicit empty array. The CLI sends the exact refs and captures no filesystem content. It grants no extra permission and uploads no arbitrary files. The controller checks capture provenance, project, base and actual retained bytes, and can refuse stale or foreign captures. An unknown-outcome receipt retains the exact refs; retry resends them even if the input file changes.
+
 Mutations use the current task revision and the normal action receipt. Keep an uncertain receipt and use `retry` to resend its exact command. `task stop <task-id>` uses the existing Stop action. Chat text cannot approve a tool action, grant an effect, raise a limit or accept a candidate. Proposal adoption changes the task contract and starts no execution. Execution still needs its own explicit preparation and Start.
 
 ## Google quota

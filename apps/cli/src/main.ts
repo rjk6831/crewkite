@@ -23,6 +23,7 @@ import {
   type Command,
   type CommandResult,
   CommandSchema,
+  ConversationContextRefsSchema,
   type ConversationEntry,
   ConversationModelRequestSchema,
   ConversationPlanningSelectionSchema,
@@ -50,10 +51,11 @@ const help = `Usage: crewkite project add <path> [--json] [--home path]
        crewkite task <list|show|watch|start|stop|resume|switch|approve|deny> [id] [--json] [--home path]
        crewkite task switch <task-id> <route-id> [--json] [--home path]
        crewkite conversation <create|configure> <id> --role lead|orchestrator --profile openai-file-v1 --credit-policy ordinary|existing-credits --attempts N --minutes N --concurrency N --consent [--text goal]
+       crewkite conversation create <project-id> --text goal --role lead|orchestrator --profile openai-file-v1 --credit-policy ordinary|existing-credits --attempts N --minutes N --concurrency N --consent [--context-refs file]
        crewkite conversation configure <task-id> --role lead|orchestrator --profile openai-file-v1 --credit-policy ordinary|existing-credits --attempts N --minutes N --concurrency N --consent [--model-request file]
        crewkite conversation show <task-id> [--before-cursor cursor] [--json] [--home path]
-       crewkite conversation <send|guide> <task-id> --text text [--json] [--home path]
-       crewkite conversation answer <task-id> --question-id message-id --text text [--json] [--home path]
+       crewkite conversation <send|guide> <task-id> --text text [--context-refs file] [--json] [--home path]
+       crewkite conversation answer <task-id> --question-id message-id --text text [--context-refs file] [--json] [--home path]
        crewkite conversation adopt <task-id> --proposal-id message-id --proposal-hash hash [--json] [--home path]
        crewkite local status [--json] [--home path]
        crewkite local configure --endpoint ws://127.0.0.1:port [--authentication token|none] [--json] [--home path]
@@ -122,6 +124,7 @@ export async function runCli(
         profile: { type: 'string' },
         'credit-policy': { type: 'string' },
         'model-request': { type: 'string' },
+        'context-refs': { type: 'string' },
         attempts: { type: 'string' },
         minutes: { type: 'string' },
         concurrency: { type: 'string' },
@@ -249,6 +252,7 @@ export async function runCli(
       'profile',
       'credit-policy',
       'model-request',
+      'context-refs',
       'attempts',
       'minutes',
       'concurrency',
@@ -271,7 +275,7 @@ export async function runCli(
         ...(planning
           ? ['role', 'profile', 'credit-policy', 'attempts', 'minutes', 'concurrency', 'consent']
           : []),
-        ...(['create', 'send', 'answer', 'guide'].includes(action) ? ['text'] : []),
+        ...(['create', 'send', 'answer', 'guide'].includes(action) ? ['text', 'context-refs'] : []),
         ...(action === 'configure' ? ['model-request'] : []),
         ...(action === 'show' ? ['before-cursor'] : []),
         ...(action === 'answer' ? ['question-id'] : []),
@@ -288,6 +292,10 @@ export async function runCli(
       if (planning && !values.consent) throw new Error('Planning requires explicit --consent.');
     } else if (conversationOptions.some((key) => values[key as keyof typeof values] !== undefined))
       throw new Error('Conversation options require a conversation action.');
+    const contextRefs =
+      values['context-refs'] !== undefined
+        ? ConversationContextRefsSchema.parse(readJson(values['context-refs']))
+        : undefined;
     const planningSelection = planning
       ? ConversationPlanningSelectionSchema.parse({
           role: values.role,
@@ -530,7 +538,12 @@ export async function runCli(
             payload: addingProject
               ? { path: resolve(id) }
               : conversation
-                ? { projectId: id, text: values.text, planning: planningSelection }
+                ? {
+                    projectId: id,
+                    text: values.text,
+                    planning: planningSelection,
+                    ...(contextRefs !== undefined ? { context: contextRefs } : {}),
+                  }
                 : {
                     projectId: id,
                     title: values.title,
@@ -1031,6 +1044,7 @@ export async function runCli(
           taskId: task.id,
           ...(planningSelection ? { planning: planningSelection } : {}),
           ...(values.text !== undefined ? { text: values.text } : {}),
+          ...(contextRefs !== undefined ? { context: contextRefs } : {}),
           ...(action === 'answer' ? { questionId: values['question-id'] } : {}),
           ...(action === 'adopt'
             ? { proposalId: values['proposal-id'], proposalHash: values['proposal-hash'] }
