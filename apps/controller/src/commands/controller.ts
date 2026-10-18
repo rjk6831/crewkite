@@ -15561,9 +15561,8 @@ export class Controller {
 
   // Formatting runs once per attempt, after the writer is quiescent and before the attempt settles
   // and its candidate seals, so the hash covers the formatted bytes and observers never see a
-  // stopped task without its candidate. The receipt lands before scratch changes, so a crash
-  // between the two leaves bytes the receipt still explains. The child runs without holding the
-  // event loop, and concurrent callers for one attempt share one run.
+  // stopped task without its candidate. The receipt records only writes observed in scratch. The
+  // child runs without holding the event loop, and concurrent callers for one attempt share one run.
   private formatAttempt(attempt: Attempt): Promise<void> {
     const running = this.formatting.get(attempt.id);
     if (running) return running.promise;
@@ -15602,14 +15601,31 @@ export class Controller {
       plan = noFormatting('failed', 'Formatting could not start.');
     }
     if (settled() || signal.aborted) return;
+    const applied = plan.outputs.length
+      ? applyFormatting(intent.scratch_path, files, plan.outputs)
+      : [];
+    const appliedByPath = new Map(applied.map((file) => [file.path, file]));
+    const expectedByPath = new Map(plan.outputs.map((file) => [file.path, file]));
+    const allApplied = applied.every((file) => expectedByPath.get(file.path)?.hash === file.hash);
+    const receipt = plan.outputs.length
+      ? {
+          ...plan.receipt,
+          status: allApplied ? plan.receipt.status : ('failed' as const),
+          reason: allApplied
+            ? plan.receipt.reason
+            : 'The scratch file changed before formatting was applied.',
+          files: plan.receipt.files.filter(
+            (file) => appliedByPath.get(file.path)?.hash === file.after,
+          ),
+        }
+      : plan.receipt;
     this.store.transaction(() => {
-      const artifact = this.nativeArtifact(plan.receipt);
+      const artifact = this.nativeArtifact(receipt);
       this.store.saveReceipt(key, artifact.hash, 'local-owner', {
         outcome: 'applied',
         entity: artifact,
       });
     });
-    if (plan.outputs.length) applyFormatting(intent.scratch_path, files, plan.outputs);
   }
 
   // Formatting rewrites the writer's bytes once. Its receipt links the writer's hash to the sealed one.

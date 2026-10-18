@@ -75,6 +75,7 @@ import {
   readCheckRoots,
   spawnCheckChild as spawn,
 } from '../host/check-ownership.ts';
+import { planFormatting } from '../host/format.ts';
 import { refValue } from '../host/publication.ts';
 import { committedFiles, git, inspectSource, materialize, readFiles } from '../host/source.ts';
 import { closedBefore, closedWithin, groupAbsent, OwnedCommand } from '../host/worker.ts';
@@ -1943,6 +1944,7 @@ fixtureTest('attached fixture keeps the admitted stage group', async () => {
     return {
       snapshot: owner.snapshot(),
       base: formattingRun.source.base,
+      source: formatting.source.directory,
       scratch: join(owner.home, 'scratch', formattingRun.id),
       receipt:
         artifact && 'hash' in artifact
@@ -2009,6 +2011,35 @@ fixtureTest('attached fixture keeps the admitted stage group', async () => {
       },
     ]);
   });
+  await t.test(
+    'a candidate configuration cannot replace the committed formatter policy',
+    async () => {
+      const candidateConfiguration = Buffer.from(
+        '{"formatter":{"indentStyle":"space"},"linter":{"enabled":false}}\n',
+      );
+      const files = committedFiles(layout.source, layout.base).map((file) =>
+        file.path === 'biome.json'
+          ? {
+              ...file,
+              content: candidateConfiguration,
+              bytes: candidateConfiguration.length,
+              hash: createHash('sha256').update(candidateConfiguration).digest('hex'),
+            }
+          : file,
+      );
+      const planned = await planFormatting({
+        runtime: resolve('.'),
+        project: layout.source,
+        base: layout.base,
+        files,
+        work: mkdtempSync(join(directory, 'format-policy-')),
+        maximumBytes: 1024 * 1024,
+      });
+      assert.equal(planned.receipt.status, 'skipped');
+      assert.equal(planned.receipt.reason, 'The candidate changes the formatting configuration.');
+      assert.deepEqual(planned.outputs, []);
+    },
+  );
 });
 
 test('acceptance creates one checked branch and preserves the original source', async (t) => {
@@ -3536,6 +3567,9 @@ test('an appointed native proposal is retained and applied once after every phas
             .toString('utf8'),
         ).status,
         'formatted',
+        new ArtifactFiles(join(formattedLocal.controller.home, 'artifacts'))
+          .read(formattedReceipt.result.entity.hash)
+          .toString('utf8'),
       );
       const formattedEvaluation = await evaluateLocal(formattedLocal, formattedCandidate);
       assert.equal(formattedEvaluation.outcome, 'applied', JSON.stringify(formattedEvaluation));

@@ -414,6 +414,27 @@ export async function packageDesktop() {
     recursive: true,
     filter: (path) => relative(zod, path).split(sep)[0] !== 'src',
   });
+  const rootPackages = createRequire(join(checkout, 'package.json'));
+  const biome = dirname(rootPackages.resolve('@biomejs/biome/package.json'));
+  const biomeManifest = json(join(biome, 'package.json'));
+  const biomeBinary = dirname(
+    createRequire(join(biome, 'package.json')).resolve('@biomejs/cli-darwin-arm64/package.json'),
+  );
+  const biomeBinaryManifest = json(join(biomeBinary, 'package.json'));
+  if (
+    biomeManifest.version !==
+      json(join(checkout, 'package.json')).devDependencies['@biomejs/biome'] ||
+    biomeBinaryManifest.version !== biomeManifest.version
+  )
+    throw new Error('The installed Biome payload differs from the frozen root manifest.');
+  mkdirSync(join(runtime, 'node_modules/@biomejs'), { recursive: true });
+  cpSync(biome, join(runtime, 'node_modules/@biomejs/biome'), {
+    recursive: true,
+    filter: (path) => relative(biome, path).split(sep)[0] !== 'node_modules',
+  });
+  cpSync(biomeBinary, join(runtime, 'node_modules/@biomejs/cli-darwin-arm64'), {
+    recursive: true,
+  });
   const runtimePackages = await copyRuntimePackages({
     source: checkout,
     from: 'apps/controller/package.json',
@@ -497,6 +518,13 @@ export async function packageDesktop() {
     copy(join(checkout, filename), join(stage, filename));
   notice('CrewKite source credits', revision, join(checkout, 'docs/credits.md'), 'credits.md');
   notice('Node', nodeVersion, join(nodeRoot, 'LICENSE'), 'node-LICENSE');
+  notice(
+    '@biomejs/biome',
+    biomeManifest.version,
+    join(biome, 'LICENSE-APACHE'),
+    'biome-LICENSE-APACHE',
+  );
+  notice('@biomejs/biome', biomeManifest.version, join(biome, 'LICENSE-MIT'), 'biome-LICENSE-MIT');
   notice('Electron', electronVersion, join(electron, 'dist/LICENSE'), 'electron-LICENSE');
   notice(
     'Chromium and Electron components',

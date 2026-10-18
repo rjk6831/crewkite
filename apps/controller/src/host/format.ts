@@ -1,9 +1,10 @@
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   closeSync,
   constants,
   createReadStream,
+  fchmodSync,
   fstatSync,
   fsyncSync,
   ftruncateSync,
@@ -12,7 +13,9 @@ import {
   mkdtempSync,
   openSync,
   readFileSync,
+  renameSync,
   rmSync,
+  unlinkSync,
   writeFileSync,
   writeSync,
 } from 'node:fs';
@@ -122,6 +125,12 @@ export async function planFormatting(input: {
   const changed = input.files.filter(
     (file) => SUPPORTED.has(extname(file.path)) && original.get(file.path)?.hash !== file.hash,
   );
+  if (changed.some((file) => file.path === config.path))
+    return noFormatting(
+      'skipped',
+      'The candidate changes the formatting configuration.',
+      undefined,
+    );
   if (!changed.length)
     return noFormatting('skipped', 'No changed file is one the formatter supports.');
   if (changed.length > MAX_FILES || changed.some((file) => file.bytes > input.maximumBytes))
@@ -247,29 +256,44 @@ function readExact(path: string): Buffer {
 }
 
 function overwrite(path: string, original: FileContent, bytes: Buffer) {
-  const fd = openSync(path, constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  const mode = Number.parseInt(original.mode, 8) & 0o777;
+  const source = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
-    const state = fstatSync(fd);
-    if (
-      !state.isFile() ||
-      state.nlink !== 1 ||
-      state.mode & 0o6000 ||
-      state.size !== original.bytes
-    )
+    const state = fstatSync(source);
+    if (!state.isFile() || state.mode & 0o6000 || state.size !== original.bytes)
       throw new Error('Formatting target metadata changed.');
-    const current = readFileSync(fd);
+    const current = readFileSync(source);
     if (createHash('sha256').update(current).digest('hex') !== original.hash)
       throw new Error('Formatting target bytes changed.');
-    let written = 0;
-    while (written < bytes.length) {
-      const count = writeSync(fd, bytes, written, bytes.length - written, written);
-      if (count === 0) throw new Error('Formatting write made no progress.');
-      written += count;
-    }
-    ftruncateSync(fd, bytes.length);
-    fsyncSync(fd);
   } finally {
-    closeSync(fd);
+    closeSync(source);
+  }
+  const temporary = join(dirname(path), `.crewkite-format-${randomUUID()}`);
+  const target = openSync(
+    temporary,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+    mode,
+  );
+  try {
+    try {
+      let written = 0;
+      while (written < bytes.length) {
+        const count = writeSync(target, bytes, written, bytes.length - written, written);
+        if (count === 0) throw new Error('Formatting write made no progress.');
+        written += count;
+      }
+      ftruncateSync(target, bytes.length);
+      fchmodSync(target, mode);
+      fsyncSync(target);
+    } finally {
+      closeSync(target);
+    }
+    renameSync(temporary, path);
+  } catch (error) {
+    try {
+      unlinkSync(temporary);
+    } catch {}
+    throw error;
   }
 }
 
