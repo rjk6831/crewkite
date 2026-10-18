@@ -63,6 +63,14 @@ const invalidation = {
   uuid: '46eb17cd-01e8-480d-99f4-a741f189715f',
   event: 'ui.render',
 };
+const thinking = {
+  type: 'system',
+  subtype: 'thinking_tokens',
+  session_id: input.sessionId,
+  uuid: '46eb17cd-01e8-480d-99f4-a741f189715f',
+  estimated_tokens: 12,
+  estimated_tokens_delta: 3,
+};
 const line = (value: unknown) => Buffer.from(`${JSON.stringify(value)}\n`);
 const secret = 'private-account@example.test';
 const user = {
@@ -360,6 +368,62 @@ test('native text replacement stays bound to one proposal and owned task deadlin
     { name: 'status cannot complete a proposal', frames: [init, status] },
     { name: 'status after terminal remains refused', frames: [init, result, status] },
     {
+      name: 'thinking estimates are discarded without usage or proposal authority',
+      frames: [
+        init,
+        thinking,
+        { ...thinking, user_message_uuid: secret },
+        { ...thinking, estimated_tokens: 0, estimated_tokens_delta: 0 },
+        {
+          ...thinking,
+          estimated_tokens: Number.MAX_SAFE_INTEGER,
+          estimated_tokens_delta: Number.MIN_SAFE_INTEGER,
+        },
+        result,
+      ],
+      pass: true,
+    },
+    {
+      name: 'thinking estimates cannot initialize a session',
+      frames: [thinking, init, result],
+      diagnostic: { stage: 'before-init', site: 'init', subtype: 'thinking_tokens' },
+    },
+    { name: 'thinking estimates cannot complete a proposal', frames: [init, thinking] },
+    {
+      name: 'thinking estimates after terminal remain refused',
+      frames: [init, result, thinking],
+      diagnostic: { stage: 'complete', subtype: 'thinking_tokens' },
+    },
+    ...[
+      { ...thinking, estimated_tokens: secret },
+      { ...thinking, estimated_tokens: undefined },
+      { ...thinking, estimated_tokens: null },
+      { ...thinking, estimated_tokens: 0.5 },
+      { ...thinking, estimated_tokens: Number.MAX_SAFE_INTEGER + 1 },
+      { ...thinking, estimated_tokens_delta: undefined },
+      { ...thinking, estimated_tokens_delta: 0.5 },
+      { ...thinking, estimated_tokens_delta: Number.MIN_SAFE_INTEGER - 1 },
+      { ...thinking, uuid: secret },
+      { ...thinking, uuid: undefined },
+      { ...thinking, user_message_uuid: null },
+      { ...thinking, user_message_uuid: 1 },
+      { ...thinking, user_message_uuid: '\0' },
+      { ...thinking, user_message_uuid: '\ud800' },
+      { ...thinking, user_message_uuid: 'x'.repeat(1025) },
+      { ...thinking, command: secret },
+      { ...thinking, permissionMode: 'bypassPermissions' },
+      { ...thinking, structured_output: edit },
+    ].map((frame, index) => ({
+      name: `malformed or authoritative thinking estimate ${index} is refused`,
+      frames: [init, frame, result],
+      diagnostic: { stage: 'output', site: 'system', subtype: 'thinking_tokens' },
+    })),
+    ...[undefined, '46eb17cd-01e8-480d-99f4-a741f189715e'].map((session_id) => ({
+      name: `thinking estimate session ${session_id ?? 'missing'} remains bound`,
+      frames: [init, { ...thinking, session_id }, result],
+      diagnostic: { site: 'identity', field: 'session_id' },
+    })),
+    {
       name: 'status remains session bound',
       frames: [init, { ...status, session_id: '46eb17cd-01e8-480d-99f4-a741f189715e' }, result],
       diagnostic: { site: 'identity', cause: 'correlation', field: 'session_id' },
@@ -370,7 +434,6 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       'task_notification',
       'model_refusal_fallback',
       'api_error',
-      'thinking_tokens',
       'session_state_changed',
       'per_turn_effort_changed',
       'notification',

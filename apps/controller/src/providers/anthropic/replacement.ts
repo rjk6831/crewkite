@@ -243,6 +243,16 @@ const uiInvalidation = z.strictObject({
     .max(32)
     .optional(),
 });
+const progressInteger = z.number().int().min(Number.MIN_SAFE_INTEGER).max(Number.MAX_SAFE_INTEGER);
+const thinkingTokens = z.strictObject({
+  ...identity.shape,
+  type: z.literal('system'),
+  subtype: z.literal('thinking_tokens'),
+  uuid: z.uuid(),
+  estimated_tokens: progressInteger,
+  estimated_tokens_delta: progressInteger,
+  user_message_uuid: displayText.optional(),
+});
 const rateLimitStatus = z.enum(['allowed', 'allowed_warning', 'rejected']);
 const rateLimitInfo = z.object({
   status: rateLimitStatus,
@@ -669,6 +679,10 @@ export class ReplacementStream {
           this.site = 'status';
           // Progress cannot change the fixed permission mode or supply replacement authority.
           status.parse(value);
+        } else if (type === 'system' && record.subtype === 'thinking_tokens') {
+          this.site = 'system';
+          // Thinking estimates describe progress and supply no billing or proposal authority.
+          thinkingTokens.parse(value);
         } else if (type === 'system') {
           this.site = 'system';
           if (record.subtype !== 'api_retry') this.fail('protocol', 'unsupported', 'subtype');
