@@ -15601,6 +15601,15 @@ export class Controller {
       plan = noFormatting('failed', 'Formatting could not start.');
     }
     if (settled() || signal.aborted) return;
+    if (plan.outputs.length && !this.store.receipt(`formatting-plan:${attempt.id}`)) {
+      this.store.transaction(() => {
+        const artifact = this.nativeArtifact(plan.receipt);
+        this.store.saveReceipt(`formatting-plan:${attempt.id}`, artifact.hash, 'local-owner', {
+          outcome: 'applied',
+          entity: artifact,
+        });
+      });
+    }
     const applied = plan.outputs.length
       ? applyFormatting(intent.scratch_path, files, plan.outputs)
       : [];
@@ -15631,15 +15640,17 @@ export class Controller {
   // Formatting rewrites the writer's bytes once. Its receipt links the writer's hash to the sealed one.
   private writerBytes(attemptId: string, path: string, writerHash: string, sealedHash: string) {
     if (sealedHash === writerHash) return true;
-    try {
-      return FormattingSchema.parse(
-        this.nativeRecord(`formatting:${attemptId}`, 65536).value,
-      ).files.some(
-        (file) => file.path === path && file.before === writerHash && file.after === sealedHash,
-      );
-    } catch {
-      return false;
+    for (const key of [`formatting:${attemptId}`, `formatting-plan:${attemptId}`]) {
+      try {
+        if (
+          FormattingSchema.parse(this.nativeRecord(key, 65536).value).files.some(
+            (file) => file.path === path && file.before === writerHash && file.after === sealedHash,
+          )
+        )
+          return true;
+      } catch {}
     }
+    return false;
   }
 
   private sealCandidate(attempt: Attempt, capturedFiles?: FileContent[]): Candidate {
