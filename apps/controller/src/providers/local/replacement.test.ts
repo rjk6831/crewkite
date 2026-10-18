@@ -310,20 +310,59 @@ test('Local generation binds its loopback authentication mode and loaded instanc
       });
     }
   }
-  for (const format of ['gguf', 'safetensors'] as const) {
+  for (const [format, catalog] of [
+    ['gguf', 'exact'],
+    ['safetensors', 'exact'],
+    ['gguf', 'variant'],
+    ['safetensors', 'variant'],
+    ['gguf', 'expanded-variant'],
+    ['safetensors', 'expanded-variant'],
+  ] as const) {
     const f = fixture();
     const metadata = {
       ...info,
       format,
       selectedVariant: 'selected-variant',
       quantization: { name: 'arbitrary-quantization', bits: 6 },
+      ...(catalog === 'expanded-variant' ? { variants: ['selected-variant'] } : {}),
     };
     f.model.getModelInfo = async () => metadata;
-    const client = discoveryClient(f, [metadata]);
+    const installed = {
+      ...metadata,
+      modelKey: metadata.selectedVariant,
+      selectedVariant: undefined,
+      variants: undefined,
+    };
+    const client = discoveryClient(f, [catalog === 'variant' ? installed : metadata]);
+    let variantReads = 0;
+    client.system.listDownloadedModelVariants = async (key) => {
+      assert.equal(catalog, 'expanded-variant');
+      assert.equal(key, metadata.modelKey);
+      variantReads++;
+      return [installed];
+    };
     const discovery = await discoverLocalModels(client, { now: () => 0 });
     assert.equal(discovery.kind, 'observed');
     assert(discovery.kind === 'observed');
+    assert.equal(variantReads, catalog === 'expanded-variant' ? 1 : 0);
+    assert.equal(discovery.observation.models.length, 1);
     const choice = discovery.observation.models[0];
+    assert.equal(choice.identity.modelKey, metadata.modelKey);
+    assert.equal(choice.identity.selectedVariant, metadata.selectedVariant);
+    assert.equal(
+      choice.identity.metadataHash,
+      hash(
+        canonicalJson({
+          modelKey: metadata.modelKey,
+          path: metadata.path,
+          format: metadata.format,
+          sizeBytes: metadata.sizeBytes,
+          deviceIdentifier: metadata.deviceIdentifier,
+          quantization: metadata.quantization,
+          selectedVariant: metadata.selectedVariant,
+        }),
+      ),
+    );
     assert.equal(choice.state, 'loaded-eligible');
     assert.equal(choice.qualification, 'unqualified');
     assert.equal(f.submitted, 0);
@@ -339,6 +378,8 @@ test('Local generation binds its loopback authentication mode and loaded instanc
       { platform: 'darwin', arch: 'arm64', secretConfigured: true },
     );
     assert(selected.connection);
+    assert.equal(selected.connection.modelBinding.modelKey, metadata.modelKey);
+    assert.equal(selected.connection.modelBinding.instanceReference, metadata.instanceReference);
     const genericPlan = localPlan({
       ...plan,
       binding: {
@@ -404,7 +445,7 @@ test('Local generation binds its loopback authentication mode and loaded instanc
     assert.equal(f.submitted, 1);
     f.resolve({ ...terminal(), modelInfo: metadata });
     assert.equal((await run.result).kind, 'completed');
-    for (const drift of ['runtime', 'model-path', 'extra-resident'] as const) {
+    for (const drift of ['runtime', 'model-path', 'model-variant', 'extra-resident'] as const) {
       const next = fixture();
       next.model.getModelInfo = async () => metadata;
       const changed = discoveryClient(next, [metadata]);
@@ -417,6 +458,8 @@ test('Local generation binds its loopback authentication mode and loaded instanc
             changed.system.getLMStudioVersion = async () => ({ version: '0.5.0', build: 10 });
           if (drift === 'model-path')
             next.model.getModelInfo = async () => ({ ...metadata, path: 'different-model' });
+          if (drift === 'model-variant')
+            next.model.getModelInfo = async () => ({ ...metadata, selectedVariant: 'other' });
           if (drift === 'extra-resident')
             changed.llm.listLoaded = async () => [next.model, next.model];
         },
@@ -426,6 +469,116 @@ test('Local generation binds its loopback authentication mode and loaded instanc
       assert.equal('reason' in outcome && outcome.reason, 'identity', drift);
       assert.equal(next.submitted, 0, drift);
     }
+  }
+  for (const row of [
+    'path',
+    'size',
+    'format',
+    'device',
+    'quantization-name',
+    'quantization-bits',
+    'quantization-missing',
+    'selected-conflict',
+    'duplicate-key',
+    'conflicting-key',
+    'parent-conflict',
+    'loaded-membership',
+    'duplicate-membership',
+    'expanded-unlisted',
+    'expanded-missing',
+    'missing-variant',
+    'no-selector',
+    'unsupported-variant',
+    'remote-variant',
+    'multiple-instances',
+  ] as const) {
+    const f = fixture();
+    const metadata = {
+      ...info,
+      format: 'safetensors' as const,
+      selectedVariant: 'fixture/variant',
+      quantization: { name: 'fixture-quantization', bits: 4 },
+    };
+    const installed = {
+      ...metadata,
+      modelKey: metadata.selectedVariant,
+      selectedVariant: undefined as string | undefined,
+      quantization: metadata.quantization as typeof metadata.quantization | undefined,
+    };
+    const downloaded: unknown[] = [installed];
+    if (row === 'path') installed.path = 'other/model';
+    if (row === 'size') installed.sizeBytes++;
+    if (row === 'format') Object.assign(installed, { format: 'gguf' });
+    if (row === 'device') Object.assign(installed, { deviceIdentifier: 'remote-runtime' });
+    if (row === 'quantization-name') installed.quantization = { name: 'other', bits: 4 };
+    if (row === 'quantization-bits')
+      installed.quantization = { name: 'fixture-quantization', bits: 5 };
+    if (row === 'quantization-missing') installed.quantization = undefined;
+    if (row === 'selected-conflict') installed.selectedVariant = 'another-variant';
+    if (row === 'duplicate-key') downloaded.push(installed);
+    if (row === 'conflicting-key') downloaded.push({ ...installed, path: 'other/model' });
+    if (row === 'parent-conflict') downloaded.push(metadata);
+    if (row === 'loaded-membership') Object.assign(metadata, { variants: ['other'] });
+    if (row === 'duplicate-membership')
+      Object.assign(metadata, { variants: [metadata.selectedVariant, metadata.selectedVariant] });
+    if (row === 'missing-variant') installed.modelKey += '-different';
+    if (row === 'no-selector') Object.assign(metadata, { selectedVariant: undefined });
+    if (row === 'unsupported-variant') {
+      Object.assign(installed, { format: 'unsupported' });
+      Object.assign(metadata, { format: 'unsupported' });
+    }
+    if (row === 'remote-variant') {
+      Object.assign(installed, { deviceIdentifier: 'remote-runtime' });
+      Object.assign(metadata, { deviceIdentifier: 'remote-runtime' });
+    }
+    f.model.getModelInfo = async () => metadata;
+    const client = discoveryClient(f, downloaded);
+    if (row === 'expanded-unlisted' || row === 'expanded-missing') {
+      client.system.listDownloadedModels = async () => [
+        { ...metadata, variants: [metadata.selectedVariant, 'other'] },
+      ];
+      client.system.listDownloadedModelVariants = async () =>
+        row === 'expanded-unlisted'
+          ? [installed, { ...installed, modelKey: 'unlisted' }]
+          : [installed];
+    }
+    if (row === 'multiple-instances')
+      client.llm.listLoaded = async () => [
+        f.model,
+        {
+          ...f.model,
+          instanceReference: 'instance-2',
+          getModelInfo: async () => ({ ...metadata, instanceReference: 'instance-2' }),
+        },
+      ];
+    const outcome = await discoverLocalModels(client, { now: () => 0 });
+    const observed = [
+      'missing-variant',
+      'no-selector',
+      'unsupported-variant',
+      'remote-variant',
+      'multiple-instances',
+    ].includes(row);
+    assert.equal(outcome.kind, observed ? 'observed' : 'unavailable', row);
+    if (outcome.kind === 'observed') {
+      assert(
+        outcome.observation.models.every((choice) => choice.state !== 'loaded-eligible'),
+        row,
+      );
+      const reason =
+        row === 'unsupported-variant'
+          ? 'unsupported-format'
+          : row === 'remote-variant'
+            ? 'remote-model'
+            : row === 'multiple-instances'
+              ? 'identity-ambiguous'
+              : 'not-downloaded';
+      assert(
+        outcome.observation.models.some((choice) => choice.reasons.includes(reason)),
+        row,
+      );
+    } else assert.equal(outcome.reason, 'metadata', row);
+    assert.equal(f.submitted, 0, row);
   }
   for (const row of [
     'downloaded-limit',

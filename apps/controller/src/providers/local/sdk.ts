@@ -113,13 +113,23 @@ const metadataSchema = z.object({
     .object({ name: identifier(64), bits: z.number().int().min(1).max(64) })
     .optional(),
   selectedVariant: identifier(200).optional(),
-  variants: z.array(identifier(200)).max(64).optional(),
+  variants: z
+    .array(identifier(200))
+    .max(64)
+    .refine((values) => new Set(values).size === values.length)
+    .optional(),
 });
 const loadedMetadataSchema = metadataSchema.extend({
   instanceReference: identifier(200),
   contextLength: z.number().int().positive().safe(),
 });
 function metadataIdentity(value: z.output<typeof metadataSchema>) {
+  if (
+    value.selectedVariant !== undefined &&
+    value.variants !== undefined &&
+    !value.variants.includes(value.selectedVariant)
+  )
+    throw new Error();
   const metadata = {
     modelKey: value.modelKey,
     path: value.path,
@@ -195,6 +205,7 @@ export async function discoverLocalModels(
       for (const raw of bounded(downloaded, 64)) {
         reason = 'metadata';
         const parent = metadataSchema.parse(raw);
+        metadataIdentity(parent);
         let variants = [raw];
         if (parent.variants?.length) {
           reason = 'transport';
@@ -208,11 +219,17 @@ export async function discoverLocalModels(
         for (const rawVariant of bounded(variants, 64)) {
           reason = 'metadata';
           const variant = metadataSchema.parse(rawVariant);
+          if (parent.variants?.length && !parent.variants.includes(variant.modelKey))
+            throw new Error();
           inventory.push(variant);
           if (inventory.length > 64) {
             reason = 'limit';
             throw new Error();
           }
+        }
+        if (parent.variants?.length && variants.length !== parent.variants.length) {
+          reason = 'metadata';
+          throw new Error();
         }
       }
       reason = 'transport';
@@ -224,10 +241,12 @@ export async function discoverLocalModels(
       bounded(embeddings, 8);
       type Choice = z.output<typeof LocalModelChoiceSchema>;
       const choices = new Map<string, Choice>();
+      const catalogKeys = new Set<string>();
       for (const value of inventory) {
-        const identity = metadataIdentity(value);
         reason = 'metadata';
-        if (choices.has(identity.metadataHash)) throw new Error();
+        const identity = metadataIdentity(value);
+        if (catalogKeys.has(value.modelKey)) throw new Error();
+        catalogKeys.add(value.modelKey);
         const reasons: Choice['reasons'] = [];
         if (!['gguf', 'safetensors'].includes(value.format)) reasons.push('unsupported-format');
         if (value.deviceIdentifier !== null) reasons.push('remote-model');
@@ -259,6 +278,35 @@ export async function discoverLocalModels(
         instances.add(info.instanceReference);
         const identity = metadataIdentity(info);
         let choice = choices.get(identity.metadataHash);
+        const variant = inventory.find((value) => value.modelKey === info.selectedVariant);
+        if (variant && !matched.has(identity.metadataHash)) {
+          const variantIdentity = metadataIdentity(variant);
+          if (variantIdentity.metadataHash !== identity.metadataHash) {
+            // A selected variant proves presence only when its file metadata agrees.
+            if (
+              choice ||
+              (info.modelKey !== variant.modelKey && catalogKeys.has(info.modelKey)) ||
+              (variant.selectedVariant !== undefined &&
+                variant.selectedVariant !== info.selectedVariant) ||
+              variant.path !== info.path ||
+              variant.format !== info.format ||
+              variant.sizeBytes !== info.sizeBytes ||
+              variant.deviceIdentifier !== info.deviceIdentifier ||
+              variant.quantization?.name !== info.quantization?.name ||
+              variant.quantization?.bits !== info.quantization?.bits
+            )
+              throw new Error();
+            const installed = choices.get(variantIdentity.metadataHash);
+            if (!installed || installed.instanceReference !== null) throw new Error();
+            choice = {
+              ...installed,
+              selectionId: hashCanonical({ runtime, metadataHash: identity.metadataHash }),
+              identity,
+            };
+            choices.delete(variantIdentity.metadataHash);
+            choices.set(identity.metadataHash, choice);
+          }
+        }
         if (!choice) {
           choice = {
             selectionId: hashCanonical({ runtime, metadataHash: identity.metadataHash }),
