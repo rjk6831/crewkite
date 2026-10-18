@@ -37,6 +37,7 @@ import {
   canonicalJson,
   GoogleAcpProfileSchema,
   LocalNativeProfileSchema,
+  NativeRepositoryProfileSchema,
   type Observation,
   type Route,
   RunSchema,
@@ -81,6 +82,7 @@ import { localStructuredOutput } from '../providers/local/profile.ts';
 import {
   type NativeProfileResolution,
   unavailableNativeProfile,
+  unavailableRepositoryProfile,
 } from '../providers/openai/profile.ts';
 import { fixture, fixtureContent, fixtureModel } from '../providers/openai/replacement-fixture.ts';
 import { serve as serveController } from '../server/index.ts';
@@ -8266,9 +8268,20 @@ test('planning turns keep task authority and allowance across execution', async 
     environment: { ...process.env },
     locationHash: '1'.repeat(64),
   } satisfies NativeProfileResolution;
+  const repositoryProfile = {
+    ...profile,
+    facts: NativeRepositoryProfileSchema.parse({
+      ...unavailableRepositoryProfile().facts,
+      model: fixtureModel,
+      clientVersion: process.version,
+      available: true,
+      reason: 'qualification-pending',
+    }),
+    locationHash: '4'.repeat(64),
+  } satisfies NativeProfileResolution;
   const options: Partial<ControllerOptions> = {
     identity: { name: 'Fixture owner', email: 'owner@example.invalid' },
-    nativeProfile: () => profile,
+    nativeProfiles: () => [profile, repositoryProfile],
     afterIntent: () => {
       if (crashAfterIntent) throw Error('Interrupted after durable planning admission.');
     },
@@ -9252,6 +9265,86 @@ test('planning turns keep task authority and allowance across execution', async 
     'Adopt the current planning proposal before preparing execution.',
   );
   rmSync(changedSource);
+  // The adopted plan's coder paths reach a repository writer only while the task still carries
+  // the plan's criteria.
+  const adoptedScope = () =>
+    (
+      controller as unknown as { adoptedCoderScope: (taskId: string) => string[] }
+    ).adoptedCoderScope(taskId);
+  const adoptedCriteria = current(taskId).criteria;
+  const amend = (criteria: string[]) =>
+    send('AmendTask', taskId, {
+      title: current(taskId).title,
+      outcome: current(taskId).outcome,
+      criteria,
+    });
+  assert.deepEqual(adoptedScope(), ['net.mjs']);
+  assert.equal((await amend(['Changed after adoption.'])).outcome, 'applied');
+  assert.deepEqual(adoptedScope(), []);
+  assert.equal((await amend(adoptedCriteria)).outcome, 'applied');
+  assert.deepEqual(adoptedScope(), ['net.mjs']);
+  // A repository writer leaves six run minutes for its check and review. Twelve run minutes
+  // freeze six, sixteen freeze ten and ten freeze the five-minute floor.
+  const write = nativePreparation.policy.effects.find((grant) => grant.action === 'write-scratch');
+  assert(write);
+  const prepareRepository = async (minutes: number) => {
+    const { targetPath: _file, ...repositoryPreparation } = nativePreparation;
+    const prepared = await send('PrepareNativeRun', taskId, {
+      ...repositoryPreparation,
+      profileId: 'openai-repository-v1',
+      policy: {
+        ...repositoryPreparation.policy,
+        limits: { ...repositoryPreparation.policy.limits, minutes },
+        reserves: [],
+        unknownUsage: { rule: 'fixed-allowance', allowance: { launches: 1, minutes } },
+        effects: [
+          ...repositoryPreparation.policy.effects,
+          { ...write, action: 'run-native-tools' },
+        ],
+      },
+    });
+    assert.equal(prepared.outcome, 'applied', JSON.stringify(prepared));
+    const run = RunSchema.parse(prepared.entity);
+    return {
+      run,
+      frozen: controller.snapshot().nativeRuns.find((value) => value.runId === run.id)
+        ?.maximumTaskMs,
+    };
+  };
+  assert.equal((await prepareRepository(12)).frozen, 360_000);
+  const sixteen = await prepareRepository(16);
+  assert.equal(sixteen.frozen, 600_000);
+  // Lowering the task total to 13 minutes with one spent leaves 12. That covers the ten-minute
+  // limit alone and falls short of the six minutes behind it.
+  const lowerTotal = async (minutes: number) =>
+    (
+      await send('ConfigureTaskConversation', taskId, {
+        planning: { ...planning, limits: { ...planning.limits, minutes } },
+      })
+    ).outcome;
+  assert.equal(await lowerTotal(13), 'applied');
+  assert.equal(state(taskId).budget?.remaining.minutes, 12);
+  const intentsBeforeRepository = controller.store.intents().length;
+  const repositoryStart = await send('StartRun', taskId, { runId: sixteen.run.id });
+  assert.equal(repositoryStart.reason, 'run-budget-exhausted');
+  assert.equal(
+    repositoryStart.next,
+    'The task has fewer minutes than the writer limit plus its check. Prepare a run that fits.',
+  );
+  assert.equal(controller.store.intents().length, intentsBeforeRepository);
+  // A five-minute writer needs only its own five minutes. A total of 6 with one spent leaves
+  // exactly five. The writer lease check follows the budget gate, so a held lease shows that
+  // Start passed the gate without launching a process.
+  const ten = await prepareRepository(10);
+  assert.equal(ten.frozen, 300_000);
+  assert.equal(await lowerTotal(6), 'applied');
+  assert.equal(state(taskId).budget?.remaining.minutes, 5);
+  controller.store.db
+    .prepare('INSERT INTO writer_leases(task_id,attempt_id,generation) VALUES (?,?,0)')
+    .run(taskId, ten.run.id);
+  assert.equal((await send('StartRun', taskId, { runId: ten.run.id })).reason, 'writer-lease-held');
+  controller.store.db.prepare('DELETE FROM writer_leases WHERE task_id=?').run(taskId);
+  assert.equal(controller.store.intents().length, intentsBeforeRepository);
   // One planning minute is spent, so a five-minute allowance leaves four. A native writer frozen
   // at five minutes refuses Start before any intent. The scripted run below fits in four.
   const tightPlanning = { ...planning, limits: { ...planning.limits, minutes: 5 } };

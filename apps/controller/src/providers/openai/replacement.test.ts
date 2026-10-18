@@ -697,6 +697,11 @@ test('native proposals and reviews require one matching completed turn and bound
     },
   };
   const { attemptId: _writerAttempt, criteria: _writerCriteria, ...reviewData } = reviewInput;
+  // The client echoes the review text twice, so the runner must allow two full lines and 1 MiB.
+  assert.equal(
+    new ReviewTranscript(reviewPlan(reviewData), { now: () => 1, timeoutMs: 180_000 }).outputLimit,
+    3 * 1024 * 1024,
+  );
   for (const row of [
     { mode: 'passed', allowed: true },
     { mode: 'failed', allowed: true },

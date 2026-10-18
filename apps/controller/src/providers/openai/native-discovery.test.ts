@@ -71,6 +71,13 @@ input.on('close', () => { if (mode !== 'stubborn' && mode !== 'trailing-partial'
 if (mode === 'trailing-partial') process.stdin.on('end', () => { process.stdout.write('{', () => process.exit(0)); });
 `;
 
+// One stdout write of the requested size, ending in a newline, then wait for input to close.
+const writer = `
+process.stdout.write('x'.repeat(Number(process.argv[1]) - 1) + '\\n');
+process.stdin.on('end', () => process.exit(0));
+process.stdin.resume();
+`;
+
 test('native discovery returns metadata only after its owned process and descendants stop', async () => {
   mkdirSync(resolve('internal'), { recursive: true });
   const root = mkdtempSync(resolve('internal/native-discovery-'));
@@ -202,6 +209,8 @@ test('native discovery returns metadata only after its owned process and descend
         assert.equal(result.metadata, null, mode);
         assert(result.reason, mode);
       }
+      // A reader that names no bound keeps the one MiB default.
+      if (mode === 'oversized') assert.equal(result.reason, 'output-limit', mode);
     }
     for (const mode of [
       'callback-stop',
@@ -477,6 +486,71 @@ test('native discovery returns metadata only after its owned process and descend
         false,
         `${mode}: settlement cancels every timer`,
       );
+    }
+    // A task reader names its own bound, here above the one MiB default. The process may write
+    // exactly that many bytes and is stopped by the next one.
+    const bound = 1_572_864;
+    for (const [mode, written, reason] of [
+      ['output-at-bound', bound, null],
+      ['output-past-bound', bound + 1, 'output-limit'],
+    ] as const) {
+      const directory = resolve(root, mode);
+      mkdirSync(directory, { mode: 0o700 });
+      let complete = false;
+      const handle = startNativeTask(
+        {
+          executable: process.execPath,
+          sha256,
+          directory,
+          repositoryRoot: root,
+          environment: sourceEnvironment,
+        },
+        {
+          timeoutMs: 300_000,
+          // A stop gives the native interrupt 250 ms before it ends input. Run that step at once.
+          // After a complete response the same delay only confirms the stop, so it stays pending.
+          schedule: (work, milliseconds) => {
+            if (milliseconds === 250 && !complete) queueMicrotask(work);
+            return () => {};
+          },
+          onSubmitted: () => assert.fail('Output rows submit no native turn.'),
+          spawn: (executable, args, options) => {
+            const child = spawn(
+              executable,
+              args.at(-1) === 'list'
+                ? ['-e', fixture, 'success', 'features']
+                : ['-e', writer, String(written)],
+              options,
+            );
+            owned.push({
+              child,
+              closed: new Promise((resolve) => child.once('close', () => resolve())),
+            });
+            return child;
+          },
+        },
+        () => ({
+          next: () => null,
+          push: (bytes) => {
+            complete = bytes.at(-1) === 10;
+          },
+          finish: () => ({ completed: true }),
+          get complete() {
+            return complete;
+          },
+          pendingRequest: 'turn/start',
+          lastEnvelope: null,
+          refusedEnvelope: null,
+          notifications: 0,
+          outputLimit: bound,
+        }),
+      );
+      const result = await handle.result;
+      assert.equal(result.reason, reason, mode);
+      assert.equal(result.stdoutBytes, written, mode);
+      assert.deepEqual(result.metadata, reason ? null : { completed: true }, mode);
+      assert.equal(result.quiescent, true, mode);
+      assert(handle.groups.every(groupAbsent), mode);
     }
     const lifecycleCases = [
       { name: 'three phases', failure: '', sequence: -1 },

@@ -290,6 +290,8 @@ import {
 import { availableAllowance, deriveWindow } from '../usage/index.ts';
 import { chargedMinutes, remainingBudgets, remainingCombinedBudgets } from './budgets.ts';
 
+// A repository writer leaves this long for the verify check and review that follow it.
+const evaluationFloorMinutes = 6;
 const nativeProviderRestriction: CommandResult = {
   outcome: 'blocked',
   reason: 'provider-policy-restricted',
@@ -6624,9 +6626,23 @@ export class Controller {
       };
     if (remaining.attempts === 0 || remaining.minutes === 0 || remaining.concurrency === 0)
       return { outcome: 'blocked', reason: 'run-budget-exhausted' };
-    // A spent task allowance can leave less than the limit frozen at preparation.
-    if (native && remaining.minutes * 60_000 < native.appointment.maximumTaskMs)
-      return { outcome: 'blocked', reason: 'run-budget-exhausted' };
+    // A spent task allowance can leave less than the limit frozen at preparation. A repository
+    // writer longer than five minutes also needs the evaluation floor behind that limit. A
+    // five-minute writer starts with its own five.
+    if (native) {
+      const limit = native.appointment.maximumTaskMs;
+      const floored = 'repository' in native.appointment && limit > 5 * 60_000;
+      if (remaining.minutes * 60_000 < limit + (floored ? evaluationFloorMinutes * 60_000 : 0))
+        return {
+          outcome: 'blocked',
+          reason: 'run-budget-exhausted',
+          ...(floored
+            ? {
+                next: 'The task has fewer minutes than the writer limit plus its check. Prepare a run that fits.',
+              }
+            : {}),
+        };
+    }
     const lease = this.store.db
       .prepare('SELECT attempt_id FROM writer_leases WHERE task_id=?')
       .get(task.id);
@@ -8615,10 +8631,12 @@ export class Controller {
           policy,
           expiresAt,
           // A repository writer leaves the six minutes a verify check and review need, and
-          // never drops below five. File profiles stop at five minutes either way.
+          // never drops below five. Start requires those six minutes behind a writer longer than
+          // five minutes and lets a five-minute writer start with its own five. File profiles
+          // stop at five minutes.
           maximumTaskMs: Math.min(
             facts.maximumTaskMs,
-            (maximumMinutes ?? Math.max(5, policy.limits.minutes - 6)) * 60000,
+            (maximumMinutes ?? Math.max(5, policy.limits.minutes - evaluationFloorMinutes)) * 60000,
           ),
           maximumSubmissions: facts.maximumSubmissions,
         }),
@@ -13055,13 +13073,15 @@ export class Controller {
   }
 
   // An adopted plan names the paths its coder slices may change while the task keeps the
-  // plan's criteria. Other tasks name none.
+  // plan's criteria. Other tasks name none. A stored proposal that no longer matches its
+  // adopted hash throws.
   private adoptedCoderScope(taskId: string): string[] {
-    const task = this.store.get<Task>('task', taskId) as Task;
     const adopted = this.conversationConfiguration(taskId)?.adoptedProposal;
-    const entry = adopted && this.planProposal(taskId, adopted);
-    if (!entry || hashCanonical(entry.proposal.criteria) !== hashCanonical(task.criteria))
-      return [];
+    if (!adopted) return [];
+    const entry = this.planProposal(taskId, adopted);
+    if (!entry) throw Error('The adopted plan changed.');
+    const task = this.store.get<Task>('task', taskId) as Task;
+    if (hashCanonical(entry.proposal.criteria) !== hashCanonical(task.criteria)) return [];
     const coder = entry.proposal.slices.filter((slice) => slice.role === 'coder');
     return [...new Set(coder.flatMap((slice) => slice.scope))].sort();
   }
