@@ -12917,6 +12917,7 @@ export class Controller {
     ];
     if ('acp' in appointment)
       return googleAcpWriterPlan({
+        client: appointment.client,
         attemptId: attempt.id,
         generation: attempt.generation,
         target: appointment.target,

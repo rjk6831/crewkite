@@ -7075,6 +7075,7 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     };
     const mapping = {
       client: acpClientPin(client),
+      harnessSha256: client.harnessSha256,
       surface: 'config' as const,
       configId: 'mode-slot',
       valueId: 'fixture-review',
