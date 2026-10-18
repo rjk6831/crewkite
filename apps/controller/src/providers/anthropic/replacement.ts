@@ -333,6 +333,9 @@ export type AnthropicUsage = Readonly<{
   // Usage credits are billed money. They never become an included subscription window.
   paid: Readonly<{ inUse: boolean; usedPercent: number | null; resetsAt: string | null }> | null;
 }>;
+export type AnthropicUsageHook =
+  | ((usage: AnthropicUsage) => boolean)
+  | ((usage: AnthropicUsage) => void);
 const unixTime = (seconds: number | undefined) => {
   const parsed = epochSeconds.safeParse(seconds);
   return parsed.success ? new Date(parsed.data * 1000).toISOString() : null;
@@ -553,8 +556,8 @@ export class ReplacementStream {
   private failure: ReplacementDiagnostic | null = null;
   private readonly usage = new Map<string, string>();
   private readonly plan: WriterPlan;
-  private readonly onUsage: ((usage: AnthropicUsage) => void) | undefined;
-  constructor(plan: WriterPlan, onUsage?: (usage: AnthropicUsage) => void) {
+  private readonly onUsage: AnthropicUsageHook | undefined;
+  constructor(plan: WriterPlan, onUsage?: AnthropicUsageHook) {
     this.plan = replacementPlan(plan.input);
     this.onUsage = onUsage;
   }
@@ -573,7 +576,8 @@ export class ReplacementStream {
         (window) => this.usage.get(window.windowId) !== key(window),
       );
       if (!windows.length) return;
-      this.onUsage({ windows, paid: usage.paid });
+      // A refused sink must see the next replay before this process can suppress it.
+      if (this.onUsage({ windows, paid: usage.paid }) === false) return;
       for (const window of windows) this.usage.set(window.windowId, key(window));
     } catch {
       // Usage is advisory. A malformed reading or a failed sink leaves the task as it was.
@@ -730,7 +734,7 @@ export function startReplacement(
     spawn?: Spawn;
     lifecycle?: NativeLifecycle;
     onSubmitted?: () => void;
-    onUsage?: (usage: AnthropicUsage) => void;
+    onUsage?: AnthropicUsageHook;
   } = {},
 ) {
   const now = options.now ?? (() => performance.now());

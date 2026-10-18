@@ -12776,7 +12776,7 @@ export class Controller {
     return (value: unknown) => {
       try {
         const parsed = ProviderUsageDraftSchema.safeParse(value);
-        if (!parsed.success) return;
+        if (!parsed.success) return false;
         const complete =
           parsed.data.complete === true &&
           this.store.get<Route>('route', routeId)?.family === 'openai';
@@ -12797,7 +12797,7 @@ export class Controller {
           !complete &&
           new Set([...seen.keys(), ...windows.map((window) => window.windowId)]).size > 32
         )
-          return;
+          return false;
         const changed = complete
           ? windows
           : windows.filter((window) => {
@@ -12806,14 +12806,16 @@ export class Controller {
               const { routeId: _route, observedAt: _time, ...reading } = previous;
               return hashCanonical(reading) !== hashCanonical(window);
             });
-        if (!changed.length) return;
+        if (!changed.length) return true;
         const observedAt = this.now();
         const observations = changed.map((window) => ({ ...window, routeId, observedAt }));
         if (onReport({ mode: complete ? 'complete' : 'partial', observedAt, observations }, seen)) {
           if (complete) seen.clear();
           for (const observation of observations) seen.set(observation.windowId, observation);
+          return true;
         }
       } catch {}
+      return false;
     };
   }
 

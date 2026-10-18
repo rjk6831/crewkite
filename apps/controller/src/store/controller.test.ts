@@ -8043,7 +8043,7 @@ test('planning turns keep task authority and allowance across execution', async 
                 phases: string[],
               ) => {
                 usage: { onReport: (value: unknown) => void };
-                onUsage: (value: unknown) => void;
+                onUsage: (value: unknown) => boolean;
               };
             }
           ).providerUsage(
@@ -8186,11 +8186,14 @@ test('planning turns keep task authority and allowance across execution', async 
             source: 'client',
             confidence: 'reported',
           };
-          ingress.onUsage({
-            complete: false,
-            windows: [draftWindow],
-            credits: [{ private: true }],
-          });
+          assert.equal(
+            ingress.onUsage({
+              complete: false,
+              windows: [draftWindow],
+              credits: [{ private: true }],
+            }),
+            true,
+          );
           const arrived = retained().find((value) => value.windowId === 'callback');
           assert.equal(arrived?.observedAt, controller.now());
           draftWindow.remaining.value = 52;
@@ -8209,9 +8212,11 @@ test('planning turns keep task authority and allowance across execution', async 
           controller.store.transaction(() =>
             controller.store.put('window', `${attempt.routeId}/callback`, 0, intervening),
           );
-          ingress.onUsage({
-            windows: [{ ...draftWindow, remaining: { value: 53, unit: 'percent' } }],
-          });
+          const refusedWindow = {
+            ...draftWindow,
+            remaining: { value: 53, unit: 'percent' },
+          };
+          assert.equal(ingress.onUsage({ windows: [refusedWindow] }), false);
           assert.deepEqual(
             retained().find((value) => value.windowId === 'callback'),
             intervening,
@@ -8228,6 +8233,21 @@ test('planning turns keep task authority and allowance across execution', async 
           assert.equal(
             retained().find((value) => value.windowId === 'callback')?.observedAt,
             arrived?.observedAt,
+          );
+          assert.equal(ingress.onUsage({ windows: [refusedWindow] }), true);
+          const acceptedAt = controller.now();
+          assert.equal(
+            retained().find((value) => value.windowId === 'callback')?.remaining?.value,
+            53,
+          );
+          const acceptedCursor = controller.store.cursor();
+          context.clock.advance(1);
+          assert.equal(ingress.onUsage({ windows: [refusedWindow] }), true);
+          assert.equal(controller.store.cursor(), acceptedCursor);
+          assert.equal(
+            retained().find((value) => value.windowId === 'callback')?.observedAt,
+            acceptedAt,
+            'an accepted replay keeps its original observation time',
           );
           ingress.onUsage({ complete: true, windows: [draftWindow] });
           assert.equal(

@@ -236,6 +236,7 @@ test('native text replacement stays bound to one proposal and owned task deadlin
     retries?: number;
     diagnostic?: Record<string, unknown>;
     usage?: unknown[];
+    usageAccepted?: boolean[];
     failingHook?: boolean;
   }> = [
     { name: 'valid', frames: [init, result], pass: true },
@@ -542,6 +543,22 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       ],
     },
     {
+      name: 'a refused usage reading returns until its replay is accepted',
+      frames: [
+        init,
+        usageEvent({ unifiedWindows: { five_hour: reading(0.25, fiveHourReset) } }),
+        usageEvent({ unifiedWindows: { five_hour: reading(0.25, fiveHourReset) } }),
+        usageEvent({ unifiedWindows: { five_hour: reading(0.25, fiveHourReset) } }),
+        result,
+      ],
+      pass: true,
+      usageAccepted: [false, true],
+      usage: [
+        { windows: [fiveHour(75)], paid: null },
+        { windows: [fiveHour(75)], paid: null },
+      ],
+    },
+    {
       name: 'a malformed usage reading adds nothing and the task continues',
       frames: [init, usageEvent({ unifiedWindows: { five_hour: reading(0.25, 1.5) } }), result],
       pass: true,
@@ -758,6 +775,7 @@ test('native text replacement stays bound to one proposal and owned task deadlin
     const reader = new ReplacementStream(plan, (usage) => {
       reported.push(usage);
       if (row.failingHook) throw new Error(secret);
+      return row.usageAccepted?.[reported.length - 1];
     });
     try {
       for (const frame of row.frames) {
