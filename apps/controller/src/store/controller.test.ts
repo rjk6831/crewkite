@@ -30,6 +30,7 @@ import {
   type Artifact,
   ArtifactSchema,
   type Attempt,
+  AttemptSchema,
   type Candidate,
   type CheckEvent,
   type CheckResult,
@@ -41,6 +42,7 @@ import {
   NativeRepositoryProfileSchema,
   type Observation,
   type Route,
+  type Run,
   RunSchema,
   type Task,
   TaskConversationStateSchema,
@@ -197,6 +199,96 @@ test('reusing a command key with changed content cannot change its result', asyn
   };
   assert.equal((await controller.execute(changed, 'local-owner')).reason, 'idempotency-key-reused');
   assert.deepEqual(controller.snapshot().tasks, [first.entity]);
+});
+
+test('repository verification launches with its sealed ten-minute check window', async (t) => {
+  const { controller, command, draft, fixtures, directory, id } = await setup(t);
+  const task = TaskSchema.parse((await controller.execute(draft, 'local-owner')).entity);
+  const policy = {
+    ...fixtures.policy,
+    quality: 'quick' as const,
+    methods: [],
+    limits: { ...fixtures.policy.limits, minutes: 12 },
+    effects: fixtures.policy.effects.map((grant) => ({ ...grant, taskId: task.id })),
+  };
+  const prepared = await controller.execute(
+    command('PrepareRun', { taskId: task.id, policy, roles: quickRoles(fixtures) }, 0),
+    'local-owner',
+  );
+  assert.equal(prepared.outcome, 'applied', JSON.stringify(prepared));
+  const run = RunSchema.parse(prepared.entity);
+  const attempt = AttemptSchema.parse({
+    id: id('att'),
+    runId: run.id,
+    routeId: fixtures.snapshot.routes[0].id,
+    generation: 0,
+    state: 'intent',
+    revision: 0,
+  });
+  const admit = Reflect.get(controller, 'admitJob') as (
+    value: Run,
+    admitted: Attempt,
+    path: string,
+    maximumMinutes: number,
+  ) => number;
+  const calls: unknown[][] = [];
+  const sentinel = Error('verification admission observed');
+  Reflect.set(controller, 'admitJob', (...input: unknown[]) => {
+    calls.push(input);
+    throw sentinel;
+  });
+  const startVerification = Reflect.get(controller, 'startVerification') as (
+    artifact: Artifact,
+    plan: unknown,
+    effects: (() => void)[],
+  ) => CommandResult;
+  const preparation = ArtifactSchema.parse({
+    id: id('art'),
+    hash: 'a'.repeat(64),
+    bytes: 1,
+    mediaType: 'application/vnd.crewkite.evaluation+json',
+  });
+  const plan = {
+    run,
+    candidate: { id: id('cnd'), hash: 'b'.repeat(64) },
+    definition: {
+      recipeId: 'crewkite-verify-v1',
+      definitionHash: 'c'.repeat(64),
+      entrypoints: { electron: 'node_modules/electron/index.js' },
+    },
+    verification: {},
+    maximumCheckMinutes: 10,
+  };
+  assert.throws(
+    () =>
+      controller.store.transaction(() =>
+        Reflect.apply(startVerification, controller, [preparation, plan, []]),
+      ),
+    sentinel,
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], run);
+  assert.equal((calls[0][1] as Attempt).runId, run.id);
+  assert.equal(calls[0][2], join(controller.home, 'verification', (calls[0][1] as Attempt).id));
+  assert.equal(calls[0][3], plan.maximumCheckMinutes);
+  Reflect.set(controller, 'admitJob', admit);
+  const minutes = controller.store.transaction(() =>
+    Reflect.apply(admit, controller, [run, attempt, join(directory, 'verification-fixture'), 10]),
+  );
+  assert.equal(minutes, 10);
+  assert.equal(
+    controller.store.db
+      .prepare(
+        "SELECT minutes FROM reservations WHERE attempt_id=? AND window_id='local-execution'",
+      )
+      .get(attempt.id)?.minutes,
+    10,
+  );
+  const deadline = Reflect.get(controller, 'jobDeadline') as (
+    attemptId: string,
+    maximumMinutes: number,
+  ) => number;
+  assert.equal(Reflect.apply(deadline, controller, [attempt.id, minutes]), 600_000);
 });
 
 test('a stale task revision leaves the current task and event cursor intact', async (t) => {

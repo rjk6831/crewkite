@@ -10775,7 +10775,7 @@ export class Controller {
       stage: 'policy',
       parentGroup: 0,
     };
-    const minutes = this.admitJob(plan.run, attempt, directory, 5);
+    const minutes = this.admitJob(plan.run, attempt, directory, plan.maximumCheckMinutes);
     const launch = this.nativeArtifact({
       version: 1,
       runId: plan.run.id,
@@ -10886,7 +10886,7 @@ export class Controller {
         Date.parse(grant.expiresAt) > Date.parse(this.now()) &&
         used?.hash === hashCanonical(grant) &&
         (used.result.entity as Run | undefined)?.id === origin.run.id &&
-        this.jobDeadline(attempt.id, 5) > 0
+        this.jobDeadline(attempt.id, origin.plan.maximumCheckMinutes) > 0
       );
     } catch {
       return false;
@@ -11080,7 +11080,11 @@ export class Controller {
       !this.store.receipt(`evaluation-started:${plan.run.id}`)
     ) {
       const remaining = this.remaining(plan.run);
-      if (remaining.attempts < 2 || remaining.minutes < 6 || remaining.concurrency < 1)
+      if (
+        remaining.attempts < 2 ||
+        remaining.minutes < plan.maximumCheckMinutes + 1 ||
+        remaining.concurrency < 1
+      )
         throw Error('budget-exhausted');
     }
     const definition = this.currentEvaluationDefinition(plan);
