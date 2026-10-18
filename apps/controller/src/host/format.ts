@@ -1,8 +1,9 @@
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   closeSync,
   constants,
+  createReadStream,
   fstatSync,
   fsyncSync,
   ftruncateSync,
@@ -67,6 +68,12 @@ export const noFormatting = (
   outputs: [],
 });
 
+async function fileHash(path: string): Promise<string> {
+  const hash = createHash('sha256');
+  for await (const chunk of createReadStream(path)) hash.update(chunk);
+  return hash.digest('hex');
+}
+
 function content(path: string, mode: FileContent['mode'], bytes: Buffer): FileContent {
   return {
     path,
@@ -81,7 +88,7 @@ function content(path: string, mode: FileContent['mode'], bytes: Buffer): FileCo
 // Nothing from the project tree runs, and the candidate cannot change the configuration it is
 // formatted with. Formatting changes layout only, so the frozen check and the review still judge
 // the formatted bytes. Any refusal here keeps the writer's bytes and says why.
-export function planFormatting(input: {
+export async function planFormatting(input: {
   runtime: string;
   project: string;
   base: string;
@@ -89,7 +96,8 @@ export function planFormatting(input: {
   work: string;
   maximumBytes: number;
   timeoutMs?: number;
-}): FormattingPlan {
+  signal?: AbortSignal;
+}): Promise<FormattingPlan> {
   if (process.platform !== 'darwin' || process.arch !== 'arm64')
     return noFormatting('skipped', 'The trusted Biome build needs macOS arm64.');
   let biome: ReturnType<typeof trustedBiome>;
@@ -126,10 +134,11 @@ export function planFormatting(input: {
   const formatter = {
     name: 'biome' as const,
     version: biome.version,
-    sha256: createHash('sha256').update(readFileSync(binary)).digest('hex'),
+    sha256: await fileHash(binary),
     configHash: config.hash,
   };
   const timeout = input.timeoutMs ?? 10_000;
+  let limit = false;
   mkdirSync(input.work, { recursive: true, mode: 0o700 });
   const root = mkdtempSync(join(input.work, 'run-'));
   try {
@@ -141,44 +150,56 @@ export function planFormatting(input: {
       mkdirSync(dirname(join(tree, file.path)), { recursive: true });
       writeFileSync(join(tree, file.path), file.content);
     }
-    // shortcut: spawnSync holds the controller for at most the limit. Upgrade: an owned async child.
-    const run = spawnSync(
-      '/usr/bin/sandbox-exec',
-      [
-        '-p',
-        NO_NETWORK,
-        binary,
-        'format',
-        '--write',
-        '--no-errors-on-unmatched',
-        '--files-ignore-unknown=true',
-        '--',
-        ...changed.map((file) => file.path),
-      ],
-      {
-        cwd: tree,
-        env: {
-          PATH: '/usr/bin:/bin',
-          HOME: join(root, 'home'),
-          TMPDIR: join(root, 'tmp'),
-          LANG: 'C',
-          LC_ALL: 'C',
-          NO_COLOR: '1',
-        },
-        stdio: ['ignore', 'pipe', 'pipe'],
-        timeout,
-        killSignal: 'SIGKILL',
-        maxBuffer: 1024 * 1024,
+    const run = await new Promise<{ status: number | null; signal: string | null; error?: Error }>(
+      (resolve) => {
+        const child = spawn(
+          '/usr/bin/sandbox-exec',
+          [
+            '-p',
+            NO_NETWORK,
+            binary,
+            'format',
+            '--write',
+            '--no-errors-on-unmatched',
+            '--files-ignore-unknown=true',
+            '--',
+            ...changed.map((file) => file.path),
+          ],
+          {
+            cwd: tree,
+            env: {
+              PATH: '/usr/bin:/bin',
+              HOME: join(root, 'home'),
+              TMPDIR: join(root, 'tmp'),
+              LANG: 'C',
+              LC_ALL: 'C',
+              NO_COLOR: '1',
+            },
+            stdio: 'ignore',
+          },
+        );
+        // The kill is the limit. Waiting for close keeps the work directory alive until Biome is gone.
+        const timer = setTimeout(() => {
+          limit = true;
+          child.kill('SIGKILL');
+        }, timeout);
+        const stop = () => child.kill('SIGKILL');
+        input.signal?.addEventListener('abort', stop, { once: true });
+        if (input.signal?.aborted) stop();
+        const done = (value: { status: number | null; signal: string | null; error?: Error }) => {
+          clearTimeout(timer);
+          input.signal?.removeEventListener('abort', stop);
+          resolve(value);
+        };
+        child.once('error', (error) => done({ status: null, signal: null, error }));
+        child.once('close', (status, signal) => done({ status, signal }));
       },
     );
-    if (run.error)
-      return noFormatting(
-        'failed',
-        (run.error as NodeJS.ErrnoException).code === 'ETIMEDOUT'
-          ? `Formatting passed its ${timeout} ms limit.`
-          : 'The formatter could not run.',
-        formatter,
-      );
+    if (run.error) return noFormatting('failed', 'The formatter could not run.', formatter);
+    if (limit)
+      return noFormatting('failed', `Formatting passed its ${timeout} ms limit.`, formatter);
+    if (input.signal?.aborted)
+      return noFormatting('failed', 'Formatting was cancelled.', formatter);
     if (run.status !== 0)
       return noFormatting(
         'failed',

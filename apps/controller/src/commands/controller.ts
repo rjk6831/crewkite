@@ -835,6 +835,10 @@ export class Controller {
 
   private artifacts!: ArtifactFiles;
   private evidence!: CandidateEvidence;
+  private readonly formatting = new Map<
+    string,
+    { promise: Promise<void>; abort: AbortController }
+  >();
   private readonly cancelledJobs = new Set<string>();
   private readonly jobCancels = new Map<string, () => void>();
   private readonly reviewWorkers = new Map<string, OwnedWorker>();
@@ -2244,6 +2248,10 @@ export class Controller {
     if (this.verificationPreparation) {
       this.verificationPreparation.abort.abort();
       native.push(this.verificationPreparation.promise);
+    }
+    for (const run of this.formatting.values()) {
+      run.abort.abort();
+      native.push(run.promise);
     }
     for (const runtime of this.workers.values()) {
       if (runtime.kind === 'native') {
@@ -8260,7 +8268,7 @@ export class Controller {
       if (runtime.stopped) throw Error('Local writer stopped.');
       this.localWriterAuthority(plan, true);
     };
-    const finish = (
+    const finish = async (
       outcome: Awaited<ReturnType<typeof startLocalReplacement>['result']> | null,
     ) => {
       try {
@@ -8364,6 +8372,7 @@ export class Controller {
             applied = true;
           } catch {}
         }
+        if (applied) await this.formatAttempt(plan.attempt);
         // Without terminal proof the outcome stays unknown. When every recorded group is gone
         // the writer holds nothing, so it settles as unknown and releases the lease.
         const intent = this.store.intents().find((value) => value.attempt_id === plan.attempt.id);
@@ -8488,7 +8497,7 @@ export class Controller {
       if (runtime.stopped || this.closed) runtime.handle?.stop();
       void runtime.handle?.result.then(finish, () => finish(null));
     } catch {
-      finish(null);
+      void finish(null);
     }
   }
 
@@ -12491,7 +12500,7 @@ export class Controller {
     const appointment = binding.appointment;
     if (!('acp' in appointment)) throw Error('ACP appointment is unavailable.');
     const { run, attempt } = binding;
-    const finish = (
+    const finish = async (
       outcome: Awaited<ReturnType<typeof startGoogleAcpWriter>['result']> | null,
       unspawned = false,
     ) => {
@@ -12548,6 +12557,7 @@ export class Controller {
         });
         const known =
           physical && (terminal || !this.store.receipt(`native-submission:${attempt.id}`));
+        if (known) await this.formatAttempt(attempt);
         // A submitted turn with no terminal response stays unknown. Once every recorded group is
         // gone it holds nothing, so it settles here and captures nothing.
         const closed = known ? undefined : this.shutdownProof(intent);
@@ -12594,14 +12604,17 @@ export class Controller {
             // nothing to check or review. Any unapproved write keeps the unverified path.
             unchanged = unapproved && files.target.hash === appointment.target.baseHash;
             const candidate = unchanged ? null : this.sealCandidate(attempt, files.files);
-            if (metadata?.targetHash !== undefined && files.target.hash !== metadata.targetHash)
+            if (
+              metadata?.targetHash !== undefined &&
+              !this.writerBytes(
+                attempt.id,
+                files.target.path,
+                metadata.targetHash,
+                files.target.hash,
+              )
+            )
               eligible = false;
             if (eligible && candidate) {
-              // The proof describes the sealed target, which formatting may have rewritten.
-              const sealed = this.evidence
-                .read(candidate)
-                .files.find((file) => file.path === files.target.path);
-              if (!sealed) throw Error('The sealed target is unavailable.');
               this.store.transaction(() => {
                 const proof = this.nativeArtifact({
                   version: 1,
@@ -12612,7 +12625,7 @@ export class Controller {
                   metadataHash: this.nativeRecord(`native-proposal:${attempt.id}`).artifact.hash,
                   candidateId: candidate.id,
                   candidateHash: candidate.hash,
-                  target: { ...files.target, hash: sealed.hash, bytes: sealed.bytes },
+                  target: files.target,
                 });
                 this.store.saveReceipt(
                   `native-acp-capture:${attempt.id}`,
@@ -12765,9 +12778,9 @@ export class Controller {
           })),
         };
         if (runtime.stopped || this.closed) handle.stop();
-        finish(await handle.result);
+        await finish(await handle.result);
       } catch {
-        finish(null, this.store.nativeProcesses(attempt.id).length === 0);
+        await finish(null, this.store.nativeProcesses(attempt.id).length === 0);
       }
     })();
   }
@@ -13497,7 +13510,7 @@ export class Controller {
     runtime.done = completion.promise;
     this.workers.set(binding.attempt.id, runtime);
     const { appointment, run, attempt } = binding;
-    const finish = (outcome: NativeOutcome | null) => {
+    const finish = async (outcome: NativeOutcome | null) => {
       try {
         let applied = false;
         let repositoryCompleted = false;
@@ -13583,6 +13596,7 @@ export class Controller {
         } catch {
           // A committed intent can outlive an interrupted write. Recovery never reapplies it.
         }
+        if (quiescent) await this.formatAttempt(attempt);
         try {
           if (this.settleJob(attempt, quiescent, true)) {
             if ('repository' in appointment) {
@@ -13785,7 +13799,7 @@ export class Controller {
       if (runtime.stopped || this.closed) handle.stop();
       void handle.result.then(finish, () => finish(null));
     } catch {
-      finish(null);
+      void finish(null);
     }
   }
 
@@ -13990,7 +14004,7 @@ export class Controller {
         .then(async (exit) => {
           const quiescent =
             exit.quiescent && (await closedWithin(worker.closed, this.options.schedule));
-          this.finishAttempt(attempt.id, quiescent);
+          await this.finishAttempt(attempt.id, quiescent);
         })
         .catch(() => this.workerFailure(attempt.id, 'Worker completion could not be recorded.'));
     } catch (error) {
@@ -14166,7 +14180,21 @@ export class Controller {
     runtime.worker.child.stdin.end();
   }
 
-  private finishAttempt(attemptId: string, quiescent: boolean) {
+  private async finishAttempt(attemptId: string, quiescent: boolean) {
+    if (this.closed) return;
+    const writer = this.store.get<Attempt>('attempt', attemptId);
+    if (
+      quiescent &&
+      writer &&
+      writer.state !== 'stopped' &&
+      writer.state !== 'failed' &&
+      this.workers.get(attemptId)?.kind === 'fake'
+    )
+      await this.formatAttempt(writer);
+    this.settleFinishedAttempt(attemptId, quiescent);
+  }
+
+  private settleFinishedAttempt(attemptId: string, quiescent: boolean) {
     if (this.closed) return;
     const runtime = this.workers.get(attemptId);
     const attempt = this.store.get<Attempt>('attempt', attemptId);
@@ -15531,32 +15559,49 @@ export class Controller {
     );
   }
 
-  // Formatting runs once per attempt, before the candidate hash exists. The receipt lands before
-  // scratch changes, so a crash between the two leaves bytes the receipt still explains.
-  private formatCandidate(
-    attempt: Attempt,
-    run: Run,
-    scratch: string,
-    files: FileContent[],
-  ): FileContent[] {
+  // Formatting runs once per attempt, after the writer is quiescent and before the attempt settles
+  // and its candidate seals, so the hash covers the formatted bytes and observers never see a
+  // stopped task without its candidate. The receipt lands before scratch changes, so a crash
+  // between the two leaves bytes the receipt still explains. The child runs without holding the
+  // event loop, and concurrent callers for one attempt share one run.
+  private formatAttempt(attempt: Attempt): Promise<void> {
+    const running = this.formatting.get(attempt.id);
+    if (running) return running.promise;
+    const abort = new AbortController();
+    const promise = this.formatScratch(attempt, abort.signal)
+      .catch(() => {})
+      .finally(() => this.formatting.delete(attempt.id));
+    this.formatting.set(attempt.id, { promise, abort });
+    return promise;
+  }
+
+  private async formatScratch(attempt: Attempt, signal: AbortSignal) {
     const key = `formatting:${attempt.id}`;
     // A sealed attempt keeps its bytes. Re-sealing retained scratch never reformats them.
-    if (this.store.receipt(key) || this.store.receipt(`candidate:${attempt.id}`)) return files;
-    let plan: ReturnType<typeof planFormatting>;
+    const settled = () =>
+      this.closed || this.store.receipt(key) || this.store.receipt(`candidate:${attempt.id}`);
+    const run = this.store.get<Run>('run', attempt.runId) as Run;
+    const intent = this.store.intents().find((value) => value.attempt_id === attempt.id);
+    if (!intent || settled()) return;
+    let files: FileContent[] = [];
+    let plan: Awaited<ReturnType<typeof planFormatting>>;
     try {
+      files = this.candidateFiles(run, intent.scratch_path);
       plan = this.store.combinedGroup(run.id)
         ? noFormatting('skipped', 'Combined runs check with a recipe that has no formatter.')
-        : planFormatting({
+        : await planFormatting({
             runtime: runtimeRoot,
             project: this.projectPath(run.source.projectId) as string,
             base: run.source.base,
             files,
             work: join(this.home, 'format'),
             maximumBytes: this.singleFileWriter(run) ? 65_536 : 1024 * 1024,
+            signal,
           });
     } catch {
       plan = noFormatting('failed', 'Formatting could not start.');
     }
+    if (settled() || signal.aborted) return;
     this.store.transaction(() => {
       const artifact = this.nativeArtifact(plan.receipt);
       this.store.saveReceipt(key, artifact.hash, 'local-owner', {
@@ -15564,11 +15609,7 @@ export class Controller {
         entity: artifact,
       });
     });
-    if (!plan.outputs.length) return files;
-    const formatted = new Map(
-      applyFormatting(scratch, files, plan.outputs).map((file) => [file.path, file]),
-    );
-    return files.map((file) => formatted.get(file.path) ?? file);
+    if (plan.outputs.length) applyFormatting(intent.scratch_path, files, plan.outputs);
   }
 
   // Formatting rewrites the writer's bytes once. Its receipt links the writer's hash to the sealed one.
@@ -15591,12 +15632,7 @@ export class Controller {
     const intent = this.store
       .intents()
       .find((value) => value.attempt_id === attempt.id) as LaunchIntent;
-    const files = this.formatCandidate(
-      attempt,
-      run,
-      intent.scratch_path,
-      capturedFiles ?? this.candidateFiles(run, intent.scratch_path),
-    );
+    const files = capturedFiles ?? this.candidateFiles(run, intent.scratch_path);
     const native = !!this.store.receipt(`native-run:${run.id}`);
     const nativeCandidates = new Set(
       this.store
