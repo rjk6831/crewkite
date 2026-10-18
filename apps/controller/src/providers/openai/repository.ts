@@ -92,6 +92,7 @@ const itemKinds = [
   'commandExecution',
   'fileChange',
   'contextCompaction',
+  'subAgentActivity',
 ] as const;
 const terminal = z.enum(['completed', 'failed', 'declined']);
 // The checked notices. Output, message and reasoning deltas, diffs, plans and token counts only

@@ -1730,7 +1730,7 @@ test('both task transcripts refuse every notice that carries authority', () => {
     }
 });
 
-test('repository item refusals identify the failing schema without retaining the item type', () => {
+test('repository item handling accepts passive subagent activity and identifies refused schemas', () => {
   const directory = resolve('internal/replacement-fixture');
   const scratch = resolve(directory, 'scratch');
   const open = () => {
@@ -1755,6 +1755,51 @@ test('repository item refusals identify the failing schema without retaining the
     reader.push(bytes({ method: 'turn/started', params: { threadId: 'thread-1', turn: running } }));
     return reader;
   };
+  const activity = open();
+  const subagent = {
+    id: 'item-1',
+    type: 'subAgentActivity',
+    kind: 'started',
+    agentThreadId: 'thread-2',
+    agentPath: '/root/worker',
+  };
+  activity.push(
+    bytes({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: subagent, startedAtMs: 1 },
+    }),
+  );
+  activity.push(
+    bytes({
+      method: 'item/completed',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: subagent, completedAtMs: 2 },
+    }),
+  );
+  activity.push(
+    bytes({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { ...running, status: 'completed' } },
+    }),
+  );
+  assert.equal(activity.complete, true);
+
+  const authorityType = 'collabAgentToolCall';
+  const authority = open();
+  assert.throws(() =>
+    authority.push(
+      bytes({
+        method: 'item/started',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: { id: 'item-1', type: authorityType },
+          startedAtMs: 1,
+        },
+      }),
+    ),
+  );
+  assert.equal(authority.diagnostic?.itemTypeHash, methodHash(authorityType));
+
   const unknownType = 'private-item-type-canary';
   const item = open();
   assert.throws(() =>
