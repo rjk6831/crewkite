@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
-import { constants } from 'node:fs';
+import { constants, readFileSync, realpathSync } from 'node:fs';
 import { chmod, lstat, mkdir, open, opendir, readlink, realpath, symlink } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { setImmediate } from 'node:timers/promises';
 import { isDeepStrictEqual } from 'node:util';
@@ -192,6 +193,19 @@ async function scan(
     ...result,
     hash: await digest([{ version: 1, files, bytes }, ...entries], budget),
   });
+}
+
+// The verify recipe pins this binary. Capture formatting resolves it the same way from the runtime.
+export function trustedBiome(root: string): { entrypoint: string; version: string } {
+  const real = realpathSync(root);
+  const manifest = createRequire(join(real, 'package.json')).resolve('@biomejs/biome/package.json');
+  const binary = createRequire(manifest).resolve('@biomejs/cli-darwin-arm64/package.json');
+  const version = JSON.parse(readFileSync(manifest, 'utf8')).version;
+  if (typeof version !== 'string' || JSON.parse(readFileSync(binary, 'utf8')).version !== version)
+    throw new Error('Installed Biome packages disagree.');
+  const entrypoint = inside(real, realpathSync(join(dirname(binary), 'biome')));
+  if (entrypoint === '.') throw new Error('Toolchain path escapes its root.');
+  return { entrypoint: entrypoint.split(sep).join('/'), version };
 }
 
 export async function inventoryTree(root: string, budget: CopyBudget): Promise<TreeInventory> {

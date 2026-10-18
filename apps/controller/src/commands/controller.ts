@@ -153,6 +153,7 @@ import {
 } from '../evidence/toolchain-definition.ts';
 import { ToolchainVerification } from '../evidence/toolchain-verify.ts';
 import { type CheckOwner, inspectCheckRoots, parseCheckOwner } from '../host/check-ownership.ts';
+import { applyFormatting, FormattingSchema, noFormatting, planFormatting } from '../host/format.ts';
 import { assembleSlices } from '../host/integration.ts';
 import {
   createIntegrationGit,
@@ -9479,7 +9480,12 @@ export class Controller {
       .files.find((file) => file.path === plan.target.path);
     if (
       !target ||
-      target.hash !== createHash('sha256').update(proof.terminal.proposal.content).digest('hex')
+      !this.writerBytes(
+        plan.attempt.id,
+        target.path,
+        createHash('sha256').update(proof.terminal.proposal.content).digest('hex'),
+        target.hash,
+      )
     )
       throw Error('Local candidate does not match its completed replacement.');
     this.nativeReviewSource(plan, candidate);
@@ -10999,7 +11005,8 @@ export class Controller {
       !target ||
       target.hash !== capture.target.hash ||
       target.bytes !== capture.target.bytes ||
-      (output.targetHash !== undefined && target.hash !== output.targetHash) ||
+      (output.targetHash !== undefined &&
+        !this.writerBytes(plan.attempt.id, target.path, output.targetHash, target.hash)) ||
       output.selectionHash !== hashCanonical(appointment.acp) ||
       output.reviewModeHash !== hashCanonical(appointment.proof.reviewMode)
     )
@@ -12590,6 +12597,11 @@ export class Controller {
             if (metadata?.targetHash !== undefined && files.target.hash !== metadata.targetHash)
               eligible = false;
             if (eligible && candidate) {
+              // The proof describes the sealed target, which formatting may have rewritten.
+              const sealed = this.evidence
+                .read(candidate)
+                .files.find((file) => file.path === files.target.path);
+              if (!sealed) throw Error('The sealed target is unavailable.');
               this.store.transaction(() => {
                 const proof = this.nativeArtifact({
                   version: 1,
@@ -12600,7 +12612,7 @@ export class Controller {
                   metadataHash: this.nativeRecord(`native-proposal:${attempt.id}`).artifact.hash,
                   candidateId: candidate.id,
                   candidateHash: candidate.hash,
-                  target: files.target,
+                  target: { ...files.target, hash: sealed.hash, bytes: sealed.bytes },
                 });
                 this.store.saveReceipt(
                   `native-acp-capture:${attempt.id}`,
@@ -15501,18 +15513,76 @@ export class Controller {
     for (const artifact of artifacts) this.store.put('artifact', artifact.id, 0, artifact);
   }
 
+  // Local and native file writers edit one bounded target in a full copy of the source.
+  private singleFileWriter(run: Run): boolean {
+    return (
+      !!this.store.receipt(`local-prepared:${run.id}`) ||
+      (!!this.store.receipt(`native-run:${run.id}`) &&
+        !('repository' in this.nativeCurrentPlan(run).appointment))
+    );
+  }
+
   private candidateFiles(run: Run, directory: string): FileContent[] {
-    if (this.store.receipt(`local-prepared:${run.id}`)) return readFiles(directory);
-    if (
-      this.store.receipt(`native-run:${run.id}`) &&
-      !('repository' in this.nativeCurrentPlan(run).appointment)
-    )
-      return readFiles(directory);
+    if (this.singleFileWriter(run)) return readFiles(directory);
     return readCandidateFiles(
       directory,
       this.projectPath(run.source.projectId) as string,
       run.source.base,
     );
+  }
+
+  // Formatting runs once per attempt, before the candidate hash exists. The receipt lands before
+  // scratch changes, so a crash between the two leaves bytes the receipt still explains.
+  private formatCandidate(
+    attempt: Attempt,
+    run: Run,
+    scratch: string,
+    files: FileContent[],
+  ): FileContent[] {
+    const key = `formatting:${attempt.id}`;
+    // A sealed attempt keeps its bytes. Re-sealing retained scratch never reformats them.
+    if (this.store.receipt(key) || this.store.receipt(`candidate:${attempt.id}`)) return files;
+    let plan: ReturnType<typeof planFormatting>;
+    try {
+      plan = this.store.combinedGroup(run.id)
+        ? noFormatting('skipped', 'Combined runs check with a recipe that has no formatter.')
+        : planFormatting({
+            runtime: runtimeRoot,
+            project: this.projectPath(run.source.projectId) as string,
+            base: run.source.base,
+            files,
+            work: join(this.home, 'format'),
+            maximumBytes: this.singleFileWriter(run) ? 65_536 : 1024 * 1024,
+          });
+    } catch {
+      plan = noFormatting('failed', 'Formatting could not start.');
+    }
+    this.store.transaction(() => {
+      const artifact = this.nativeArtifact(plan.receipt);
+      this.store.saveReceipt(key, artifact.hash, 'local-owner', {
+        outcome: 'applied',
+        entity: artifact,
+      });
+    });
+    if (!plan.outputs.length) return files;
+    const formatted = new Map(
+      applyFormatting(scratch, files, plan.outputs).map((file) => [file.path, file]),
+    );
+    return files.map((file) => formatted.get(file.path) ?? file);
+  }
+
+  // Formatting rewrites the writer's bytes once. Its receipt links the writer's hash to the sealed one.
+  private writerBytes(attemptId: string, path: string, writerHash: string, sealedHash: string) {
+    if (sealedHash === writerHash) return true;
+    try {
+      return FormattingSchema.parse(
+        this.nativeRecord(`formatting:${attemptId}`, 65536).value,
+      ).files.some(
+        (file) => file.path === path && file.before === writerHash && file.after === sealedHash,
+      );
+    } catch {
+      return false;
+    }
   }
 
   private sealCandidate(attempt: Attempt, capturedFiles?: FileContent[]): Candidate {
@@ -15521,7 +15591,12 @@ export class Controller {
     const intent = this.store
       .intents()
       .find((value) => value.attempt_id === attempt.id) as LaunchIntent;
-    const files = capturedFiles ?? this.candidateFiles(run, intent.scratch_path);
+    const files = this.formatCandidate(
+      attempt,
+      run,
+      intent.scratch_path,
+      capturedFiles ?? this.candidateFiles(run, intent.scratch_path),
+    );
     const native = !!this.store.receipt(`native-run:${run.id}`);
     const nativeCandidates = new Set(
       this.store

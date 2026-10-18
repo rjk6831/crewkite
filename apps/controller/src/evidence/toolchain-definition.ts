@@ -20,6 +20,7 @@ import {
   type CopyBudget,
   type DependencyInventory,
   inspectInstalledDependencies,
+  trustedBiome,
 } from '../host/toolchain.ts';
 
 export const toolchainWorkspaces = [
@@ -301,13 +302,7 @@ export async function prepareToolchain(input: {
   )
     throw Error('Installed desktop payload is missing or changed.');
   const electron = inside(root, await realpath(join(electronRoot, 'dist', electronRelative)));
-  const biomeRequire = createRequire(require.resolve('@biomejs/biome/package.json'));
-  const biome = inside(
-    root,
-    realpathSync(
-      join(dirname(biomeRequire.resolve('@biomejs/cli-darwin-arm64/package.json')), 'biome'),
-    ),
-  );
+  const biome = trustedBiome(root).entrypoint;
   const inventory = await inspectInstalledDependencies(root, toolchainWorkspaces, input.budget);
   const inventoryBytes = Buffer.from(canonicalJson(inventory));
   if (inventoryBytes.length > 64 * 1024 * 1024)

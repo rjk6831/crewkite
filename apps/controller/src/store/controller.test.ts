@@ -19,8 +19,9 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir, userInfo } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { type TestContext, test } from 'node:test';
 import { connectController, readControllerEndpoint } from '@crewkite/client/node';
@@ -128,6 +129,36 @@ function crashBeforeSettlement(controller: Controller, attemptId: string) {
       .prepare('DELETE FROM receipts WHERE command_key=?')
       .run(`native-unknown-settled:${attemptId}`);
   });
+}
+
+function installedBiome() {
+  const manifest = createRequire(resolve('package.json')).resolve('@biomejs/biome/package.json');
+  return {
+    version: JSON.parse(readFileSync(manifest, 'utf8')).version as string,
+    binary: join(
+      dirname(createRequire(manifest).resolve('@biomejs/cli-darwin-arm64/package.json')),
+      'biome',
+    ),
+  };
+}
+
+// Tabs differ from the layout the fixture writers produce, so their bytes carry a layout defect.
+const tabConfiguration =
+  '{"formatter":{"indentStyle":"tab"},"linter":{"enabled":false},"assist":{"enabled":false}}\n';
+
+function commitFormatting(root: string, configuration: string) {
+  writeFileSync(join(root, 'biome.json'), configuration);
+  writeFileSync(
+    join(root, 'package.json'),
+    JSON.stringify({ devDependencies: { '@biomejs/biome': installedBiome().version } }),
+  );
+  git(root, ['add', '--', 'biome.json', 'package.json']);
+  git(
+    root,
+    ['commit', '--quiet', '-m', 'test: configure formatting', '--', 'biome.json', 'package.json'],
+    undefined,
+    { name: 'CrewKite fixture', email: 'fixture@example.invalid', at: '2026-10-15T17:00:00Z' },
+  );
 }
 
 function quickRoles(fixtures: ReturnType<typeof createDemoFixtures>) {
@@ -1849,6 +1880,135 @@ fixtureTest('attached fixture keeps the admitted stage group', async () => {
   const proofReference = savedMetadata.verification.artifact;
   metadata.set(proofReference.id, { ...proofReference, hash: fixtureClientHash });
   assert.equal(evidence.verificationMatches(historicalInput), false);
+
+  // Capture formats changed files with the committed configuration before the hash exists.
+  const biome = installedBiome();
+  const authored = mkdtempSync(join(directory, 'authored-'));
+  writeFileSync(join(authored, 'net.mjs'), '');
+  writeChallengeSolution(authored);
+  const authoredBytes = readFileSync(join(authored, 'net.mjs'));
+  const formatRun = async (configuration: string) => {
+    const formatting = await setup(t);
+    commitFormatting(formatting.source.directory, configuration);
+    const drafted = TaskSchema.parse(
+      (await formatting.controller.execute(formatting.draft, 'local-owner')).entity,
+    );
+    const formattingPolicy = {
+      ...formatting.fixtures.policy,
+      quality: 'quick',
+      methods: [],
+      effects: [
+        ...formatting.fixtures.policy.effects.map((grant) => ({ ...grant, taskId: drafted.id })),
+        {
+          taskId: drafted.id,
+          action: 'run-review',
+          target: 'keep-it-simple/cycle-1',
+          expiresAt: formatting.fixtures.policy.effects[0].expiresAt,
+          revoked: false,
+          usesRemaining: 1,
+        },
+      ],
+    };
+    const scheduled = await formatting.controller.execute(
+      formatting.command(
+        'PrepareRun',
+        { taskId: drafted.id, policy: formattingPolicy, roles: quickRoles(formatting.fixtures) },
+        0,
+      ),
+      'local-owner',
+    );
+    const formattingRun = RunSchema.parse(scheduled.entity);
+    const finished = new Promise<void>((resolve) => {
+      const off = formatting.controller.subscribe((event) => {
+        if (event.type === 'task.updated' && event.payload.state === 'ready') {
+          off();
+          resolve();
+        }
+      });
+    });
+    await formatting.controller.execute(
+      formatting.command(
+        'StartRun',
+        { taskId: drafted.id, runId: formattingRun.id },
+        scheduled.revision,
+      ),
+      'local-owner',
+    );
+    await finished;
+    const { controller: owner } = formatting;
+    const attemptId = owner.store
+      .intents()
+      .find((intent) => intent.run_id === formattingRun.id)?.attempt_id;
+    const artifact = owner.store.receipt(`formatting:${attemptId}`)?.result.entity;
+    return {
+      snapshot: owner.snapshot(),
+      base: formattingRun.source.base,
+      scratch: join(owner.home, 'scratch', formattingRun.id),
+      receipt:
+        artifact && 'hash' in artifact
+          ? JSON.parse(
+              new ArtifactFiles(join(owner.home, 'artifacts')).read(artifact.hash).toString('utf8'),
+            )
+          : undefined,
+    };
+  };
+  const hashOf = (base: string, files: ReturnType<typeof readFiles>) =>
+    new CandidateEvidence({
+      home: directory,
+      artifacts: artifactFiles,
+      id,
+      getArtifact: () => {
+        throw Error('The hash needs no artifacts.');
+      },
+    }).hash(base, files);
+  const layout = await formatRun(tabConfiguration);
+  const failure = await formatRun('{');
+  await t.test('a candidate whose only defect is layout passes biome check after capture', () => {
+    const check = spawnSync(biome.binary, ['check', 'net.mjs'], {
+      cwd: layout.scratch,
+      encoding: 'utf8',
+    });
+    assert.equal(check.status, 0, check.stdout + check.stderr);
+    assert.equal(layout.receipt?.status, 'formatted');
+    assert.equal(layout.receipt.formatter.version, biome.version);
+    assert.equal(
+      layout.receipt.formatter.sha256,
+      createHash('sha256').update(readFileSync(biome.binary)).digest('hex'),
+    );
+    assert.deepEqual(
+      layout.receipt.files.map((file: { path: string }) => file.path),
+      ['net.mjs'],
+    );
+  });
+  await t.test('a formatter failure leaves the bytes unchanged and is recorded', () => {
+    assert.deepEqual(readFileSync(join(failure.scratch, 'net.mjs')), authoredBytes);
+    assert.equal(failure.receipt?.status, 'failed');
+    assert.match(failure.receipt.reason, /exited/);
+    assert.deepEqual(failure.receipt.files, []);
+    assert.equal(
+      failure.snapshot.candidates[0].hash,
+      hashOf(failure.base, readFiles(failure.scratch)),
+    );
+  });
+  await t.test('the candidate hash equals the formatted bytes', () => {
+    const formatted = spawnSync(biome.binary, ['format', '--stdin-file-path=net.mjs'], {
+      cwd: layout.scratch,
+      input: authoredBytes,
+    });
+    assert.equal(formatted.status, 0);
+    assert.notDeepEqual(formatted.stdout, authoredBytes);
+    const sealed = readFiles(layout.scratch);
+    assert.deepEqual(sealed.find((file) => file.path === 'net.mjs')?.content, formatted.stdout);
+    assert.equal(layout.snapshot.candidates[0].hash, hashOf(layout.base, sealed));
+    assert.equal(layout.snapshot.evidence[0].candidateHash, layout.snapshot.candidates[0].hash);
+    assert.deepEqual(layout.receipt?.files, [
+      {
+        path: 'net.mjs',
+        before: createHash('sha256').update(authoredBytes).digest('hex'),
+        after: createHash('sha256').update(formatted.stdout).digest('hex'),
+      },
+    ]);
+  });
 });
 
 test('acceptance creates one checked branch and preserves the original source', async (t) => {
@@ -2921,6 +3081,7 @@ async function localControllerFixture(
   t: TestContext,
   initialMode = 'completed',
   authMode: 'token' | 'none' = 'token',
+  formatting?: string,
 ) {
   let mode = initialMode;
   let context: Awaited<ReturnType<typeof setup>>;
@@ -3135,6 +3296,7 @@ if(value==='submit')finish({type:'terminal',terminal:{kind:'completed',binding:p
     await Promise.all(children);
   });
   const { controller, command, fixtures } = context;
+  if (formatting) commitFormatting(context.source.directory, formatting);
   const setupState = () => controller.snapshot().localSetup;
   const local = (name: string, payload: object = {}) =>
     controller.execute(command(name, payload, setupState()?.revision ?? 0), 'local-owner');
@@ -3322,31 +3484,63 @@ test('an appointed native proposal is retained and applied once after every phas
     .snapshot()
     .candidates.find((value) => value.taskId === withoutToken.task.id);
   assert(noneCandidate);
-  const noneEvaluation = await withoutToken.controller.execute(
-    withoutToken.command(
-      'PrepareCandidateEvaluation',
-      {
-        taskId: withoutToken.task.id,
-        candidateId: noneCandidate.id,
-        checkRecipeId: 'node-tests-v1',
-        reviewer: { profileId: 'openai-file-v1', methodId: 'keep-it-simple', cycles: 1 },
-        consent: 'explicit',
-        grants: [
-          { action: 'run-check', target: 'node --test' },
-          { action: 'run-review', target: 'keep-it-simple/cycle-1' },
-        ].map((grant) => ({
-          ...grant,
-          taskId: withoutToken.task.id,
-          revoked: false,
-          usesRemaining: 1,
-          expiresAt: new Date(Date.parse(withoutToken.clock.now()) + 86400000).toISOString(),
-        })),
-      },
-      taskRevision(withoutToken.controller, withoutToken.task.id),
-    ),
-    'local-owner',
-  );
+  const evaluateLocal = (
+    fixture: Awaited<ReturnType<typeof localControllerFixture>>,
+    candidate: Candidate,
+  ) =>
+    fixture.controller.execute(
+      fixture.command(
+        'PrepareCandidateEvaluation',
+        {
+          taskId: fixture.task.id,
+          candidateId: candidate.id,
+          checkRecipeId: 'node-tests-v1',
+          reviewer: { profileId: 'openai-file-v1', methodId: 'keep-it-simple', cycles: 1 },
+          consent: 'explicit',
+          grants: [
+            { action: 'run-check', target: 'node --test' },
+            { action: 'run-review', target: 'keep-it-simple/cycle-1' },
+          ].map((grant) => ({
+            ...grant,
+            taskId: fixture.task.id,
+            revoked: false,
+            usesRemaining: 1,
+            expiresAt: new Date(Date.parse(fixture.clock.now()) + 86400000).toISOString(),
+          })),
+        },
+        taskRevision(fixture.controller, fixture.task.id),
+      ),
+      'local-owner',
+    );
+  const noneEvaluation = await evaluateLocal(withoutToken, noneCandidate);
   assert.equal(noneEvaluation.outcome, 'applied', JSON.stringify(noneEvaluation));
+  const formattedLocal = await localControllerFixture(t, 'checked', 'none', tabConfiguration);
+  assert.equal((await formattedLocal.started()).outcome, 'applied');
+  await nativeWait('Local formatted writer', formattedLocal.terminal);
+  await t.test(
+    'a formatted Local candidate still traces to its completed replacement',
+    async () => {
+      const formattedCandidate = formattedLocal.controller
+        .snapshot()
+        .candidates.find((value) => value.taskId === formattedLocal.task.id);
+      assert(formattedCandidate);
+      const formattedAttempt = formattedLocal.controller.store.intents().at(-1);
+      const formattedReceipt = formattedLocal.controller.store.receipt(
+        `formatting:${formattedAttempt?.attempt_id}`,
+      );
+      assert(formattedReceipt?.result.entity && 'hash' in formattedReceipt.result.entity);
+      assert.equal(
+        JSON.parse(
+          new ArtifactFiles(join(formattedLocal.controller.home, 'artifacts'))
+            .read(formattedReceipt.result.entity.hash)
+            .toString('utf8'),
+        ).status,
+        'formatted',
+      );
+      const formattedEvaluation = await evaluateLocal(formattedLocal, formattedCandidate);
+      assert.equal(formattedEvaluation.outcome, 'applied', JSON.stringify(formattedEvaluation));
+    },
+  );
   withoutToken.mode('discovery-failed');
   await withoutToken.local('RefreshLocalModels', { consent: 'explicit' });
   await withoutToken.operationDone();
