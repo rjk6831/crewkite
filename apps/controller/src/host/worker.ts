@@ -7,7 +7,12 @@ import {
   FakeWorkerInputSchema,
   MAX_FRAME_BYTES,
 } from '@crewkite/contracts';
-import { checkEnvironment, enrollCheckRoot, spawnCheckChild as spawn } from './check-ownership.ts';
+import {
+  type CheckRoot,
+  checkEnvironment,
+  enrollCheckRoot,
+  spawnCheckChild as spawn,
+} from './check-ownership.ts';
 
 export function groupAbsent(group: number | null): boolean {
   if (group === null || !Number.isSafeInteger(group) || group <= 0) return false;
@@ -17,6 +22,10 @@ export function groupAbsent(group: number | null): boolean {
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === 'ESRCH';
   }
+}
+
+export function checkRootQuiescent(root: CheckRoot): boolean {
+  return root.spawnFailed || (!!root.acknowledgment && groupAbsent(root.acknowledgment.group));
 }
 
 export type Schedule = (work: () => void, milliseconds: number) => () => void;

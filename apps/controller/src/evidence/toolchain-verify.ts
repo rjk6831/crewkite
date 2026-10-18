@@ -9,7 +9,6 @@ import {
   type CheckStage,
   enrollCheckRoot,
   inspectCheckRoots,
-  qualifiedWorkerExit,
 } from '../host/check-ownership.ts';
 import { type FileContent, materialize } from '../host/source.ts';
 import {
@@ -20,7 +19,7 @@ import {
   type TreeEntry,
   type TreeInventory,
 } from '../host/toolchain.ts';
-import { groupAbsent } from '../host/worker.ts';
+import { checkRootQuiescent } from '../host/worker.ts';
 import {
   executableHash,
   type ToolchainDefinition,
@@ -112,10 +111,6 @@ const same = (actual: unknown, expected: unknown) => {
     throw Error('Verification identity changed.');
 };
 const beneath = (path: string, root: string) => path === root || path.startsWith(`${root}/`);
-function terminal(root: CheckRoot): boolean {
-  return root.spawnFailed || !!root.terminal || qualifiedWorkerExit(root);
-}
-
 export class ToolchainVerification {
   readonly result: Promise<VerificationExecution>;
   readonly exited: Promise<{
@@ -374,7 +369,7 @@ export class ToolchainVerification {
     const signal = (roots: CheckRoot[], value: NodeJS.Signals) => {
       for (const root of roots) {
         const ack = root.acknowledgment;
-        if (!ack || (terminal(root) && (!root.intent.detached || groupAbsent(ack.group)))) continue;
+        if (!ack || checkRootQuiescent(root)) continue;
         try {
           process.kill(root.intent.detached ? -ack.group : ack.pid, value);
         } catch {}
@@ -382,7 +377,7 @@ export class ToolchainVerification {
     };
     const waits = async (filter: (root: CheckRoot) => boolean, until: number) => {
       while (this.options.now() < Math.min(end, until)) {
-        if (refresh().filter(filter).every(terminal)) return;
+        if (refresh().filter(filter).every(checkRootQuiescent)) return;
         await setImmediate();
       }
     };
@@ -407,14 +402,7 @@ export class ToolchainVerification {
         } catch {}
     while (this.options.now() < end) {
       const roots = refresh();
-      if (
-        this.children.size === 0 &&
-        roots.every(
-          (root) =>
-            terminal(root) &&
-            (root.spawnFailed || (!!root.acknowledgment && groupAbsent(root.acknowledgment.group))),
-        )
-      )
+      if (this.children.size === 0 && roots.every(checkRootQuiescent))
         return !inspectionFailed && unresolved.size === 0;
       await setImmediate();
     }

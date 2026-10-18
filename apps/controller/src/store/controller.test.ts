@@ -80,7 +80,13 @@ import {
 import { planFormatting } from '../host/format.ts';
 import { refValue } from '../host/publication.ts';
 import { committedFiles, git, inspectSource, materialize, readFiles } from '../host/source.ts';
-import { closedBefore, closedWithin, groupAbsent, OwnedCommand } from '../host/worker.ts';
+import {
+  checkRootQuiescent,
+  closedBefore,
+  closedWithin,
+  groupAbsent,
+  OwnedCommand,
+} from '../host/worker.ts';
 import { type AcpSetupProof, acpClientPin } from '../providers/google/acp/profile.ts';
 import { localStructuredOutput } from '../providers/local/profile.ts';
 import {
@@ -1143,7 +1149,9 @@ test('candidate evidence requires unchanged bytes and completed checks', async (
         path,
         `${readFileSync(path, 'utf8').trimEnd().split('\n').slice(0, -1).join('\n')}\n`,
       );
-      assert.equal(readCheckRoots(pendingOwner)[0].terminal, undefined);
+      const absentWithoutClose = readCheckRoots(pendingOwner)[0];
+      assert.equal(absentWithoutClose.terminal, undefined);
+      assert.equal(checkRootQuiescent(absentWithoutClose), true);
     }
   }
   const ineligibleDirectory = join(directory, 'worker-exit-ineligible');
@@ -1231,7 +1239,9 @@ fixtureTest('attached fixture keeps the admitted stage group', async () => {
     assert.equal(await closedWithin(noAckClosed), true);
   }
   assert.notEqual(noAck.exitCode, 0);
-  assert.equal(readCheckRoots(stageOwner).filter((root) => !root.acknowledgment).length, 1);
+  const unacknowledgedRoot = readCheckRoots(stageOwner).find((root) => !root.acknowledgment);
+  assert(unacknowledgedRoot);
+  assert.equal(checkRootQuiescent(unacknowledgedRoot), false);
   const faultDirectory = join(directory, 'ownership-fault');
   mkdirSync(faultDirectory);
   const faultOwner = { ...owner, directory: faultDirectory };

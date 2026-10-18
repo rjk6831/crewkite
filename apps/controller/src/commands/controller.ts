@@ -181,6 +181,7 @@ import {
 } from '../host/source.ts';
 import type { DependencyInventory } from '../host/toolchain.ts';
 import {
+  checkRootQuiescent,
   closedBefore,
   closedWithin,
   defaultSchedule,
@@ -15651,13 +15652,7 @@ export class Controller {
             verificationKnown =
               !journal.unknown &&
               journal.roots.length > 0 &&
-              journal.roots.every(
-                (root) =>
-                  root.spawnFailed ||
-                  (!!root.terminal &&
-                    !!root.acknowledgment &&
-                    groupAbsent(root.acknowledgment.group)),
-              );
+              journal.roots.every(checkRootQuiescent);
           } catch {
             verificationKnown = false;
           }
