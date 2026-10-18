@@ -870,6 +870,8 @@ function useContextComposer({
       if (latest.current.draftKey === draftKey) {
         setPanel({ kind: 'choose' });
         setError(message(failure));
+        if (failure instanceof Error && contextRefusals.has(failure.message.split(' ')[0]))
+          workspace.dismissError(failure.message);
       }
     } finally {
       busyRef.current = false;
@@ -1028,12 +1030,16 @@ function useContextComposer({
       },
     },
     composer: {
-      attachments: draft.refs.map((ref, index) => ({
-        id: ref.artifactId,
-        label: draft.facts?.[ref.artifactId]
-          ? `Context ${index + 1} · ${draft.facts[ref.artifactId].files} ${draft.facts[ref.artifactId].files === 1 ? 'file' : 'files'} · ${draft.facts[ref.artifactId].bytes.toLocaleString()} bytes${draft.facts[ref.artifactId].name ? ` · ${draft.facts[ref.artifactId].name}` : ''}`
-          : `Context ${index + 1} · ${ref.hash.slice(0, 8)}`,
-      })),
+      attachments: draft.refs.map((ref, index) => {
+        const fact = draft.facts?.[ref.artifactId];
+        return {
+          id: ref.artifactId,
+          label: fact
+            ? `Context ${index + 1} · ${fact.files} ${fact.files === 1 ? 'file' : 'files'} · ${fact.bytes.toLocaleString()} bytes${fact.name ? ` · ${fact.name}` : ''}`
+            : `Context ${index + 1} · ${ref.hash.slice(0, 8)}`,
+          status: fact ? 'Captured' : 'Details unavailable',
+        };
+      }),
       onAddContext: () => {
         if (captureProjectReason()) return;
         setError(undefined);

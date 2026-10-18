@@ -67,7 +67,7 @@ export type ConversationDecision = DecisionBase &
     | { kind: 'approval'; approval: Approval }
   );
 
-export type ConversationAttachment = { id: string; label: string };
+export type ConversationAttachment = { id: string; label: string; status?: string };
 
 export type ConversationMessage = {
   id: string;
@@ -779,6 +779,11 @@ export function Conversation({
                     onClick={() => composer.onPreviewContext?.(attachment.id)}
                   >
                     <span>{attachment.label}</span>
+                    {attachment.status && (
+                      <small className="cc-status conversation-attachment-status">
+                        {attachment.status}
+                      </small>
+                    )}
                   </button>
                   <button
                     type="button"

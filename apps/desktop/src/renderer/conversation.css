@@ -336,6 +336,7 @@
 .conversation-attachment button {
   display: inline-flex;
   align-items: center;
+  gap: 8px;
   min-width: 0;
   height: 100%;
   padding: 0 6px 0 9px;
@@ -349,6 +350,11 @@
 .conversation-attachment button > span {
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.conversation-attachment-status {
+  flex-shrink: 0;
+  color: var(--text-dim);
+  font-size: 10px;
 }
 .conversation-attachment .conversation-attachment-remove {
   justify-content: center;

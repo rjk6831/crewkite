@@ -746,7 +746,7 @@ kbd {
   flex-shrink: 0;
 }
 .task-summary {
-  max-height: 18dvh;
+  max-height: max(152px, 18dvh);
   overflow: auto;
 }
 .task-meta {

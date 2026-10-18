@@ -411,6 +411,8 @@ export function useWorkspace() {
       setError(value);
       if (value === null) setTransportError(null);
     },
+    dismissError: (expected: string) =>
+      setError((current) => (current === expected ? null : current)),
     refresh,
     command,
     pickProject,
