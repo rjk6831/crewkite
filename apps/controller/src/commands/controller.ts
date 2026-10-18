@@ -10598,7 +10598,7 @@ export class Controller {
         const target =
           'target' in appointment
             ? this.evidence
-                .read(plan.candidate)
+                .describe(plan.candidate)
                 .files.find((file) => file.path === appointment.target.path)
             : undefined;
         if ('target' in appointment && !target) return [];
@@ -11958,10 +11958,7 @@ export class Controller {
     if (!task || task.runId !== run.id || this.latestCandidate(run.id)?.id !== candidate.id)
       return refused('candidate-changed');
     try {
-      if (
-        hashCanonical(inspectSource(task.projectId, this.projectPath(task.projectId) as string)) !==
-        hashCanonical(run.source)
-      )
+      if (hashCanonical(this.projectSource(task.projectId)) !== hashCanonical(run.source))
         return refused('source-changed');
       if (!this.candidateCurrent(run, candidate)) return refused('candidate-changed');
       this.nativePublicationCurrent(run, candidate);
@@ -18064,6 +18061,17 @@ export class Controller {
         .run(approved);
     this.event('export.created', task.id, task.revision, artifact);
     return { outcome: 'applied', entity: artifact };
+  }
+
+  private projectSource(projectId: string) {
+    const key = `project-source:${projectId}`;
+    const cached = this.projectionCache?.get(key) as ReturnType<typeof inspectSource> | undefined;
+    if (cached) return cached;
+    const path = this.projectPath(projectId);
+    if (!path) throw Error('Project path is unavailable.');
+    const source = inspectSource(projectId, path);
+    this.projectionCache?.set(key, source);
+    return source;
   }
 
   private projectPath(projectId: string): string | undefined {

@@ -595,7 +595,7 @@ export class CandidateEvidence {
     return { candidate, artifacts };
   }
 
-  read(candidate: Candidate): { base: string; files: FileContent[] } {
+  describe(candidate: Candidate) {
     CandidateSchema.parse(candidate);
     const artifact = ArtifactSchema.parse(this.getArtifact(candidate.artifactId));
     if (
@@ -615,6 +615,11 @@ export class CandidateEvidence {
     const sealed = manifest(raw.base, raw.files);
     if (hashCanonical(sealed) !== candidate.hash)
       throw new Error('Candidate manifest identity changed.');
+    return sealed;
+  }
+
+  read(candidate: Candidate): { base: string; files: FileContent[] } {
+    const sealed = this.describe(candidate);
     const files = sealed.files.map((file) => {
       const content = this.artifacts.read(file.hash);
       if (content.length !== file.bytes) throw new Error('Candidate content size changed.');

@@ -49,7 +49,7 @@ import {
   TaskSchema,
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
-import type { createDemoFixtures } from '@crewkite/testkit';
+import { type createDemoFixtures, createTestClock, createTestIds } from '@crewkite/testkit';
 import { syntheticCheckDefinition, writeChallengeSolution } from '@crewkite/testkit/repository';
 import { fakeWorkerPath } from '@crewkite/testkit/worker';
 import { ArtifactFiles } from '../artifacts/index.ts';
@@ -966,6 +966,45 @@ test('a retained descendant blocks sealing and transfer after its leader exits',
     ).reason,
     'writer-ownership-unknown',
   );
+});
+
+test('candidate manifests expose sealed metadata without materializing file content', (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'crewkite-manifest-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const artifacts = new ArtifactFiles(join(directory, 'artifacts'));
+  const metadata = new Map<string, Artifact>();
+  const clock = createTestClock();
+  const evidence = new CandidateEvidence({
+    home: directory,
+    artifacts,
+    id: createTestIds(clock.now(), 1n),
+    getArtifact: (id) => {
+      const artifact = metadata.get(id);
+      if (!artifact) throw Error('Missing fixture artifact.');
+      return artifact;
+    },
+  });
+  const content = Buffer.from('export const a = 1;\n');
+  const file = {
+    path: 'src/a.mjs',
+    mode: '100644' as const,
+    hash: createHash('sha256').update(content).digest('hex'),
+    bytes: content.length,
+    content,
+  };
+  const captured = evidence.capture({
+    taskId: createTestIds(clock.now(), 100n)('tsk'),
+    base: '1'.repeat(40),
+    files: [file],
+    existing: [],
+  });
+  for (const artifact of captured.artifacts) metadata.set(artifact.id, artifact);
+  rmSync(join(artifacts.directory, file.hash));
+  assert.deepEqual(evidence.describe(captured.candidate), {
+    base: '1'.repeat(40),
+    files: [{ path: file.path, mode: file.mode, hash: file.hash, bytes: file.bytes }],
+  });
+  assert.throws(() => evidence.read(captured.candidate));
 });
 
 test('candidate evidence requires unchanged bytes and completed checks', async (t) => {
