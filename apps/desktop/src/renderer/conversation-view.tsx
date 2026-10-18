@@ -28,7 +28,7 @@ import {
   useState,
   useSyncExternalStore,
 } from 'react';
-import { actionName, Dialog, familyName, titleCase } from './components.tsx';
+import { actionName, Dialog, familyName, TaskNext, titleCase } from './components.tsx';
 import type { ComposerControlsProps } from './composer-controls.tsx';
 import { ContextGauge } from './context-gauge.tsx';
 import { Conversation, type ConversationMessage } from './conversation.tsx';
@@ -2103,9 +2103,11 @@ export function ConversationView({
           maximumWorkers={state?.budget?.limits.concurrency}
           status={state ? titleCase(state.phase) : 'Conversation state unavailable'}
           next={
-            state?.purpose === 'conversation'
-              ? 'Planning route unqualified. Execution needs a separate decision.'
-              : (task.next ?? undefined)
+            state?.purpose === 'conversation' ? (
+              'Planning route unqualified. Execution needs a separate decision.'
+            ) : task.next ? (
+              <TaskNext text={task.next} />
+            ) : undefined
           }
           loading={!state && history.reading}
           error={context.error ?? history.error}

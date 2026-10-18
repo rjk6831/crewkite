@@ -76,6 +76,7 @@ import {
   RouterCard,
   SourceFacts,
   short,
+  TaskNext,
   titleCase,
 } from './components.tsx';
 import {
@@ -1150,7 +1151,9 @@ export function App() {
                         <span className={`status-dot state-${task.state}`} />
                         <span>
                           {approval ? 'Needs you' : 'Next step'}
-                          <strong>{task.next ?? 'Inspect the retained task state.'}</strong>
+                          <strong>
+                            <TaskNext text={task.next ?? 'Inspect the retained task state.'} />
+                          </strong>
                         </span>
                       </div>
                       <div className="button-row">

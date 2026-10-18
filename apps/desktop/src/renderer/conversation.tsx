@@ -93,7 +93,7 @@ export type ConversationProps = {
   details?: ReactNode;
   detailsStatus?: string;
   status: string;
-  next?: string;
+  next?: ReactNode;
   activeWorkers?: number;
   maximumWorkers?: number;
   loading?: boolean;
