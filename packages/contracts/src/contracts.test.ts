@@ -116,6 +116,28 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     },
   };
   assert.deepEqual(CommandSchema.parse(combined), combined);
+  const compactWriter = {
+    ...combined,
+    payload: {
+      ...combined.payload,
+      children: [
+        {
+          ...combined.payload.children[0],
+          writer: {
+            profileId: 'anthropic-file-compact-v1',
+            creditPolicy: 'ordinary',
+            billingAttestation: {
+              source: 'user-attested',
+              subscriptionLoginConfirmed: true,
+              paidExtraUsageDisabled: true,
+            },
+          },
+        },
+        combined.payload.children[1],
+      ],
+    },
+  };
+  assert.deepEqual(CommandSchema.parse(compactWriter), compactWriter);
   for (const payload of [
     { ...combined.payload, children: combined.payload.children.slice(0, 1) },
     { ...combined.payload, children: [combined.payload.children[0], combined.payload.children[0]] },

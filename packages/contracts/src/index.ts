@@ -1302,6 +1302,11 @@ export const CombinedWriterSelectionSchema = z.discriminatedUnion('profileId', [
     billingAttestation: NativeBillingAttestationSchema,
   }),
   z.strictObject({
+    profileId: z.literal('anthropic-file-compact-v1'),
+    creditPolicy: z.literal('ordinary'),
+    billingAttestation: NativeBillingAttestationSchema,
+  }),
+  z.strictObject({
     profileId: z.literal('google-acp-v1'),
     creditPolicy: z.literal('ordinary'),
     billingAttestation: GoogleAcpBillingAttestationSchema,
