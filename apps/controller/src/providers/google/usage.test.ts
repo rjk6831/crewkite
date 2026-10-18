@@ -16,8 +16,8 @@ import {
 import { googleUsageDescriptor, resolveGoogleUsageClient } from './profile.ts';
 
 const hash = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
-// The shape the pinned client printed on 16 October 2026 for /usage: zero turns, three model
-// groups, one weekly and one five-hour bucket shared by two of them.
+// Synthetic values retain the five window IDs observed from the pinned client on
+// 18 October 2026. Shared buckets must deduplicate without model-group inference.
 const bucket = (id: string, remaining: number, reset: string) => ({
   id,
   name: 'private-name',
@@ -27,6 +27,8 @@ const bucket = (id: string, remaining: number, reset: string) => ({
 });
 const weekly = bucket('gemini-weekly', 0.8, '2026-10-23T14:13:03Z');
 const rolling = bucket('gemini-5h', 0.3, '2026-10-16T19:13:03Z');
+const thirdPartyWeekly = bucket('3p-weekly', 0.7, '2026-10-23T14:13:03Z');
+const thirdPartyRolling = bucket('3p-5h', 0.6, '2026-10-16T19:13:03Z');
 const argon = bucket('gemini-argon-wtu-weekly', 1, '2026-10-23T14:13:03Z');
 const report = {
   status: 'SUCCESS',
@@ -39,6 +41,7 @@ const report = {
       groups: [
         { name: 'private-group', buckets: [weekly, rolling] },
         { name: 'private-group', buckets: [weekly, rolling] },
+        { name: 'private-group', buckets: [thirdPartyWeekly, thirdPartyRolling] },
         { name: 'private-group', buckets: [argon] },
       ],
     },
@@ -57,6 +60,18 @@ const projected: ReturnType<typeof projectGoogleUsage> = [
     kind: 'rolling',
     semantics: { scope: 'provider', periodSeconds: 18000 },
     remainingPercent: 30,
+    resetsAt: '2026-10-16T19:13:03.000Z',
+  },
+  {
+    windowId: '3p-weekly',
+    kind: 'weekly',
+    remainingPercent: 70,
+    resetsAt: '2026-10-23T14:13:03.000Z',
+  },
+  {
+    windowId: '3p-5h',
+    kind: 'rolling',
+    remainingPercent: 60,
     resetsAt: '2026-10-16T19:13:03.000Z',
   },
   {
@@ -138,7 +153,7 @@ test('the google quota read maps zero-turn account buckets to window observation
 
   const routes = ['rte_01M51M322B2AEBXD9MA74CBCFM', 'rte_01M51M322B2AEBXD9MA74CBCFN'];
   const observations = googleUsageObservations(projected, routes, reset());
-  assert.equal(observations.length, 6);
+  assert.equal(observations.length, 10);
   for (const observation of observations) ObservationSchema.parse(observation);
   assert.deepEqual(observations[1], {
     routeId: routes[0],
@@ -161,7 +176,7 @@ test('the google quota read maps zero-turn account buckets to window observation
   mkdirSync(runtime, { mode: 0o700 });
   const executable = join(runtime, 'fixture');
   writeFileSync(executable, `#!${process.execPath}\n`, { mode: 0o700 });
-  const client = { executable, version: '1.4.0', sha256: hash(readFileSync(executable)) };
+  const client = { executable, version: '1.4.1', sha256: hash(readFileSync(executable)) };
   const environment = { ...process.env, HOME: userInfo().homedir };
   const groupsSeen: number[] = [];
   try {
@@ -214,7 +229,7 @@ test('the google quota read maps zero-turn account buckets to window observation
     }
 
     // Client discovery never executes the client or reads account files.
-    assert.equal(googleUsageDescriptor.clientVersion, '1.4.0');
+    assert.equal(googleUsageDescriptor.clientVersion, '1.4.1');
     if (process.platform !== 'darwin' || process.arch !== 'arm64') {
       assert.deepEqual(resolveGoogleUsageClient(environment), {
         available: false,

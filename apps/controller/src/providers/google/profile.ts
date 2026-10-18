@@ -41,8 +41,8 @@ export const googleUsageDescriptor = {
   id: 'google-usage-v1',
   family: 'google',
   displayName: 'Google quota read',
-  clientVersion: '1.4.0',
-  clientSha256: 'a4502aaf310b2fd6eb657fcfec2fcc31a690fbbd0c2d14c8eefbb556409024ce',
+  clientVersion: '1.4.1',
+  clientSha256: 'da7e0766b076e411343542db4c09380bf4656df24da47168c0fa0f7986813e11',
   command: '/usage',
   maximumReadMs: 20000,
 } as const;
