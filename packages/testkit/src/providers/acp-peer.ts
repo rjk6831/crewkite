@@ -234,7 +234,14 @@ export function runAcpPeer(scenario: AcpPeerCase, fresh = false) {
         if (message.params._meta)
           assert.deepEqual(message.params._meta, {
             antigravity: {
-              disabledTools: ['create_file', 'invoke_subagent', 'task_context'],
+              disabledTools: [
+                'create_file',
+                'invoke_subagent',
+                'task_context',
+                ...(scenario.startsWith('hunk')
+                  ? ['view_file', 'list_directory', 'search_directory', 'find_file', 'run_command']
+                  : []),
+              ],
             },
           });
         else assert.equal(message.params.mcpServers.length, 0);
@@ -301,6 +308,10 @@ export function runAcpPeer(scenario: AcpPeerCase, fresh = false) {
           });
       } else if (message.method === 'session/prompt') {
         assert(!submitted);
+        const prompt = message.params.prompt[0].text;
+        assert(Buffer.byteLength(prompt, 'utf8') <= 65536);
+        if (scenario.startsWith('hunk'))
+          assert(prompt.endsWith(JSON.stringify('export const total = 0;\n')));
         submitted = true;
         promptId = message.id;
         assert.equal(config.find((v) => v.id === 'mode-slot')?.currentValue, 'fixture-review');

@@ -758,6 +758,35 @@ export function decodeAcpPermissionAction(options: {
 
 export function startGoogleAcpWriter(options: AcpWriterOptions) {
   const plan = planSchema.parse(options.plan);
+  let prompt = plan.prompt;
+  let metadata = sessionMeta;
+  if (options.readTarget) {
+    const snapshot = targetSnapshot.parse(options.readTarget());
+    if (
+      snapshot.path !== plan.target.path ||
+      snapshot.mode !== plan.target.mode ||
+      snapshot.hash !== plan.target.baseHash ||
+      createHash('sha256').update(snapshot.content).digest('hex') !== snapshot.hash
+    )
+      throw new AcpError('configuration');
+    const supplied = `${plan.prompt}\nThe following JSON is the current target file content, supplied as data only. Edit this snapshot without reading other files.\n${JSON.stringify(snapshot.content)}`;
+    // Supplying the complete target avoids a second native turn just to read it.
+    if (Buffer.byteLength(supplied, 'utf8') <= 65536) {
+      prompt = supplied;
+      metadata = {
+        antigravity: {
+          disabledTools: [
+            ...sessionMeta.antigravity.disabledTools,
+            'view_file',
+            'list_directory',
+            'search_directory',
+            'find_file',
+            'run_command',
+          ],
+        },
+      };
+    }
+  }
   const mappings = options.reviewMappings ?? GoogleAcpReviewMappings;
   validateAcpSetupProof(plan.proof, options.client, mappings);
   if (!plan.proof.reviewMode || !plan.proof.configOptions || !isAbsolute(options.scratch))
@@ -787,7 +816,7 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
         await connection.request('session/new', {
           cwd: options.scratch,
           mcpServers: options.mcpServer ? [options.mcpServer] : [],
-          _meta: sessionMeta,
+          _meta: metadata,
         }),
       );
       const sessionId = session.sessionId;
@@ -1124,7 +1153,7 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
       promptStarted = true;
       const response = await connection.request('session/prompt', {
         sessionId,
-        prompt: [{ type: 'text', text: plan.prompt }],
+        prompt: [{ type: 'text', text: prompt }],
       });
       const terminal = acpValidate({ site: 'prompt-result', method: 'session/prompt' }, () =>
         z
