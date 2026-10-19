@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 
@@ -66,6 +66,7 @@ export function runAcpPeer(scenario: AcpPeerCase, fresh = false) {
   let cwd = '',
     promptId: string | number | undefined,
     submitted = false,
+    suppliedSnapshot = false,
     hunkStep = 0;
   const config = [
     {
@@ -231,6 +232,8 @@ export function runAcpPeer(scenario: AcpPeerCase, fresh = false) {
             message.params.mcpServers.length,
             fresh || scenario === 'fresh-no-mcp' ? 0 : 1,
           );
+        suppliedSnapshot =
+          message.params._meta?.antigravity?.disabledTools?.includes('view_file') === true;
         if (message.params._meta)
           assert.deepEqual(message.params._meta, {
             antigravity: {
@@ -238,7 +241,7 @@ export function runAcpPeer(scenario: AcpPeerCase, fresh = false) {
                 'create_file',
                 'invoke_subagent',
                 'task_context',
-                ...(scenario.startsWith('hunk')
+                ...(suppliedSnapshot
                   ? ['view_file', 'list_directory', 'search_directory', 'find_file', 'run_command']
                   : []),
               ],
@@ -310,8 +313,9 @@ export function runAcpPeer(scenario: AcpPeerCase, fresh = false) {
         assert(!submitted);
         const prompt = message.params.prompt[0].text;
         assert(Buffer.byteLength(prompt, 'utf8') <= 65536);
-        if (scenario.startsWith('hunk'))
-          assert(prompt.endsWith(JSON.stringify('export const total = 0;\n')));
+        if (scenario.startsWith('hunk')) assert(suppliedSnapshot);
+        if (suppliedSnapshot)
+          assert(prompt.endsWith(JSON.stringify(readFileSync(join(cwd, 'net.mjs'), 'utf8'))));
         submitted = true;
         promptId = message.id;
         assert.equal(config.find((v) => v.id === 'mode-slot')?.currentValue, 'fixture-review');
