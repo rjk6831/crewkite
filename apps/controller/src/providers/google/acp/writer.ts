@@ -347,7 +347,7 @@ export function googleAcpWriterPlan(
     target: options.target,
     selection: options.selection,
     proof,
-    prompt: `Edit only the existing scratch file ${options.target.path}. Preserve its mode and every other path. Do not run checks or change session settings. Request human permission for edits.\nTask criteria: ${canonicalJson(criteria)}`,
+    prompt: `Read and edit only the existing scratch file ${options.target.path}. Preserve its mode and every other path. Do not read or search any other path; the task criteria are complete. Keep each replacement hunk under 1500 bytes. Do not run checks or change session settings. Request human permission for edits.\nTask criteria: ${canonicalJson(criteria)}`,
   });
 }
 const actionFields = {
@@ -514,11 +514,11 @@ function outsideScratch(root: string, locations: Tool['locations']) {
   );
 }
 // The server tells the model to keep planning notes under its own data directory, using
-// the file creation tool. The prompt already carries task context. Keep those tools and the
-// broad native editor and delegation tool out so the model uses the scoped replacement tool.
+// the file creation tool. The prompt already carries task context. Keep those tools and
+// the delegation tool out so the model uses the scoped replacement tool.
 const sessionMeta = {
   antigravity: {
-    disabledTools: ['create_file', 'edit_file', 'invoke_subagent', 'task_context'],
+    disabledTools: ['create_file', 'invoke_subagent', 'task_context'],
   },
 };
 const toolKinds = [
@@ -623,7 +623,7 @@ export function decodeAcpPermissionAction(options: {
         (entry.schema === 'replace-target-v1'
           ? entry.toolName === tool.name
           : entry.client.harnessSha256 === options.client.harnessSha256 &&
-            entry.toolTitle === tool.title &&
+            (entry.toolTitle === tool.title || tool.title === 'Run edit_file?') &&
             tool.name == null),
     );
   if (
@@ -637,29 +637,64 @@ export function decodeAcpPermissionAction(options: {
   const mapping = mappings[0];
   const input =
     mapping.schema === 'replace-target-v1'
-      ? z
-          .strictObject({ path: text(4096), oldText: text(65536), newText: text(65536) })
-          .parse(tool.rawInput)
-      : (() => {
-          const raw = z
-            .strictObject({
-              TargetFile: text(4096),
-              TargetContent: text(65536).min(1),
-              ReplacementContent: text(65536),
-            })
-            .parse(tool.rawInput);
-          return {
-            path: raw.TargetFile,
-            oldText: raw.TargetContent,
-            newText: raw.ReplacementContent,
-          };
-        })();
+      ? {
+          ...z
+            .strictObject({ path: text(4096), oldText: text(65536), newText: text(65536) })
+            .parse(tool.rawInput),
+          startLine: undefined,
+          endLine: undefined,
+        }
+      : tool.title === 'Run edit_file?'
+        ? (() => {
+            const raw = z
+              .strictObject({
+                TargetFile: text(4096),
+                TargetContent: text(65536).min(1),
+                ReplacementContent: text(65536),
+                AllowMultiple: z.literal(false).optional(),
+                StartLine: z.number().int().positive().optional(),
+                EndLine: z.number().int().positive().optional(),
+                Instruction: text(4096).optional(),
+                Description: text(4096).optional(),
+                TargetLintErrorIds: z.array(text(200)).max(32).optional(),
+                toolSummary: text(4096).optional(),
+                toolAction: text(4096).optional(),
+              })
+              .refine((v) => (v.StartLine ?? 1) <= (v.EndLine ?? Number.MAX_SAFE_INTEGER))
+              .parse(tool.rawInput);
+            return {
+              path: raw.TargetFile,
+              oldText: raw.TargetContent,
+              newText: raw.ReplacementContent,
+              startLine: raw.StartLine,
+              endLine: raw.EndLine,
+            };
+          })()
+        : (() => {
+            const raw = z
+              .strictObject({
+                TargetFile: text(4096),
+                TargetContent: text(65536).min(1),
+                ReplacementContent: text(65536),
+              })
+              .parse(tool.rawInput);
+            return {
+              path: raw.TargetFile,
+              oldText: raw.TargetContent,
+              newText: raw.ReplacementContent,
+              startLine: undefined,
+              endLine: undefined,
+            };
+          })();
   const path = scratchPath(options.scratch, input.path);
   if (path !== options.target.path) throw new AcpError('permission');
   for (const location of tool.locations ?? [])
     if (
       scratchPath(options.scratch, location.path) !== path ||
-      (mapping.schema === 'replace-hunk-v1' && location.line != null)
+      (mapping.schema === 'replace-hunk-v1' &&
+        (tool.title === 'Run edit_file?'
+          ? location.line != null && location.line !== input.startLine
+          : location.line != null))
     )
       throw new AcpError('permission');
   for (const content of tool.content ?? []) {
@@ -690,12 +725,18 @@ export function decodeAcpPermissionAction(options: {
     });
   if (!options.readTarget) throw new AcpError('permission');
   const target = targetSnapshot.parse(options.readTarget());
+  const lines = target.content.split('\n');
+  const ranged =
+    input.startLine != null || input.endLine != null
+      ? lines.slice((input.startLine ?? 1) - 1, input.endLine ?? lines.length).join('\n')
+      : target.content;
   const offset = target.content.indexOf(input.oldText);
   if (
     target.path !== path ||
     target.mode !== options.target.mode ||
     offset < 0 ||
-    target.content.lastIndexOf(input.oldText) !== offset
+    target.content.lastIndexOf(input.oldText) !== offset ||
+    !ranged.includes(input.oldText)
   )
     throw new AcpError('permission');
   const merged =

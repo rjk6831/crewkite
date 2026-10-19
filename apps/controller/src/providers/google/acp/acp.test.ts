@@ -904,6 +904,27 @@ test('the acp protocol consumes one complete live permission and never treats co
     assert.equal(action.baseHash, hash(original));
     assert.notEqual(action.baseHash, hash(input.TargetContent));
     assert.equal(acpPermissionAfterHash(action, targetState()), hash(original.replace('0', '1')));
+    const editFileTool = {
+      ...tool,
+      title: 'Run edit_file?',
+      rawInput: {
+        ...input,
+        AllowMultiple: false,
+        StartLine: 1,
+        EndLine: 1,
+        Instruction: 'Set net value to 1',
+        Description: 'Update net value',
+      },
+      locations: [{ path: absolutePath, line: 1 }],
+    };
+    assert.deepEqual(decode(editFileTool), action);
+    for (const invalidEditFile of [
+      { rawInput: { ...editFileTool.rawInput, AllowMultiple: true } },
+      { rawInput: { ...editFileTool.rawInput, StartLine: 2, EndLine: 2 } },
+      { rawInput: { ...editFileTool.rawInput, StartLine: 2, EndLine: 1 } },
+      { locations: [{ path: absolutePath, line: 2 }] },
+    ])
+      assert.throws(() => decode({ ...editFileTool, ...invalidEditFile }));
     for (const newText of ['界'.repeat(1400), '"'.repeat(2000)])
       assert.throws(() =>
         decode({
