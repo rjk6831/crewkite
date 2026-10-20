@@ -30,6 +30,8 @@ Each record states one decision, the context that forced it, why I chose it and 
 | [0024](0024-integrate-google-through-its-published-acp-agent.md) | Integrate Google through its published ACP agent | Proposed |
 | [0025](0025-use-an-explicit-memory-only-local-credential.md) | Use an explicit memory-only Local connection credential | Proposed |
 | [0026](0026-bind-combined-acceptance-to-checked-origins.md) | Bind combined acceptance to checked contributor origins | Proposed |
+| [0027](0027-page-large-data-without-project-size-ceilings.md) | Page large data without aggregate project-size ceilings | Proposed |
+| [0028](0028-journal-project-commands-and-remote-effects.md) | Journal project commands and remote effects | Proposed |
 
 ## Writing a new record
 
