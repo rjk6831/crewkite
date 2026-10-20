@@ -591,6 +591,13 @@ function CommandPalette({
 export function App() {
   const workspace = useWorkspace();
   const { snapshot, connection, preview, error: workspaceError } = workspace;
+  const connectionLabel = preview
+    ? 'Preview data'
+    : connection === 'connected'
+      ? 'Controller connected'
+      : connection === 'offline'
+        ? 'Controller offline'
+        : titleCase(connection);
   const [page, setPage] = useState<'tasks' | 'usage'>('tasks');
   const [selected, setSelected] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>('Conversation');
@@ -976,24 +983,9 @@ export function App() {
             </button>
           )}
           <div className="connection-line">
-            <span
-              className="connection-status"
-              data-tooltip={
-                preview
-                  ? 'Preview data'
-                  : connection === 'connected'
-                    ? 'Controller connected'
-                    : titleCase(connection)
-              }
-            >
+            <span className="connection-status" data-tooltip={connectionLabel}>
               <span className={`connection-dot ${connection}`} />
-              <span className="nav-text">
-                {preview
-                  ? 'Preview data'
-                  : connection === 'connected'
-                    ? 'Controller connected'
-                    : titleCase(connection)}
-              </span>
+              <span className="nav-text">{connectionLabel}</span>
             </span>
             {!preview && connection !== 'connected' && (
               <button
