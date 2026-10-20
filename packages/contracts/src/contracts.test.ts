@@ -1512,6 +1512,8 @@ test('process boundaries reject unknown fields and invalid command identity', ()
   };
   assert.deepEqual(SnapshotSchema.parse(oldSnapshot), {
     ...oldSnapshot,
+    nativeConnections: [],
+    googleAcpInstall: null,
     nativeProfiles: [],
     nativeRuns: [],
     candidateEvaluations: [],
