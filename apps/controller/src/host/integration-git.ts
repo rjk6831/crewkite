@@ -541,6 +541,9 @@ export function createIntegrationGit(
             }
             return;
           }
+          // A delayed deadline callback can run after its final timer is already due.
+          // Kill any remaining owned group before cancelling its pending escalation.
+          if (!quiescent) sendSignal('SIGKILL');
           settled = true;
           for (const cancel of cancellations) cancel();
           stopCurrent = undefined;

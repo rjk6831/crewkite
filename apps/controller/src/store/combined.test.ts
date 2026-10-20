@@ -863,7 +863,32 @@ test('combined tasks share seven real dispatches and require a separate full bar
           ['blocked', 'unknown'].includes(phase()?.phase ?? ''),
         'assembly',
       );
-      assert.equal(phase()?.phase, 'awaiting-evaluation', JSON.stringify(phase()));
+      assert.equal(
+        phase()?.phase,
+        'awaiting-evaluation',
+        JSON.stringify({
+          capturedAt: new Date().toISOString(),
+          integration: {
+            milliseconds: controller.store.combinedGroup(preview.runId)?.integration_milliseconds,
+            journals: controller.store.combinedRefIntents(preview.runId).map((row) => ({
+              operation: row.operation,
+              state: row.state,
+              phases: (
+                JSON.parse(row.body).phases as {
+                  kind: string;
+                  state: string;
+                  group: number | null;
+                }[]
+              ).map((phase) => ({
+                kind: phase.kind,
+                state: phase.state,
+                group: phase.group,
+              })),
+            })),
+          },
+          preview: phase(),
+        }),
+      );
       const candidate = phase()?.candidate;
       assert(candidate);
       const slots = controller.store.combinedDispatches(preview.runId);

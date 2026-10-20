@@ -206,6 +206,7 @@ test('integration effects require durable ownership and quiescence', async (t) =
     'deadline before spawn',
     'stop',
     'deadline',
+    'delayed deadline',
     'late close',
     'late final',
     'output',
@@ -265,6 +266,7 @@ test('integration effects require durable ownership and quiescence', async (t) =
         signal(group, signal) {
           assert.equal(group, 12345);
           signals.push(signal);
+          if (name === 'delayed deadline' && signal === 'SIGTERM') return;
           if (!['missing close', 'missing EOF', 'remaining group'].includes(name)) close(1);
         },
         spawn(_executable, argv, options) {
@@ -295,7 +297,7 @@ test('integration effects require durable ownership and quiescence', async (t) =
                   child.stdout.emit('error', Error('untrusted output'));
                 else if (name === 'stderr error')
                   child.stderr.emit('error', Error('untrusted output'));
-                else if (!['stop', 'deadline'].includes(name)) {
+                else if (!['stop', 'deadline', 'delayed deadline'].includes(name)) {
                   if (name === 'late close') current = 1000;
                   close(name === 'nonzero' ? 1 : 0);
                 }
@@ -335,12 +337,13 @@ test('integration effects require durable ownership and quiescence', async (t) =
       assert.equal(closures, 0);
       assert.deepEqual(signals, []);
     }
+    if (name === 'delayed deadline') current = 1000;
     while (scheduled.length) {
       scheduled.sort((a, b) => a.at - b.at);
       const timer = scheduled.shift();
       assert(timer);
       if (timer.cancelled) continue;
-      current = timer.at;
+      current = Math.max(current, timer.at);
       timer.work();
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
@@ -355,6 +358,7 @@ test('integration effects require durable ownership and quiescence', async (t) =
       assert.equal(closures, 1);
       assert.deepEqual(signals, []);
     }
+    if (name === 'delayed deadline') assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
     if (['deadline', 'late close', 'late final'].includes(name))
       assert.equal(outcome.reason, 'deadline', name);
     if (['output', 'stdout error', 'stderr error'].includes(name))
@@ -382,6 +386,7 @@ test('integration effects require durable ownership and quiescence', async (t) =
         'missing close',
         'missing EOF',
         'remaining group',
+        'delayed deadline',
         'owner refused',
         'closure refused',
         'async owner',
