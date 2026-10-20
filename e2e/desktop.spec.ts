@@ -919,12 +919,19 @@ async function quotaReadBridge(
     snapshot.googleAcpSetup = {
       ...snapshot.googleAcpSetup,
       revision: 4,
+      state: 'discovery-required',
       auth: { method: 'oauth-personal', status: 'authenticated' },
     };
     reply(authenticate, {
       outcome: 'applied',
       data: { kind: 'google-acp-setup', setup: snapshot.googleAcpSetup },
     });
+    await expect(
+      setupPanel.getByText('Signed in, discover choices', { exact: true }),
+    ).toBeVisible();
+    await expect(setupPanel.getByRole('status').last()).toContainText(
+      'Signed in. Discover Google choices to finish setup.',
+    );
     await setupPanel.getByRole('button', { name: 'Discover Google choices', exact: true }).click();
     const discovery = await next();
     assert.equal(discovery.command.command, 'DiscoverGoogleAcp');
@@ -938,7 +945,7 @@ async function quotaReadBridge(
       outcome: 'applied',
       data: { kind: 'google-acp-setup', setup: snapshot.googleAcpSetup },
     });
-    await expect(setupPanel.getByRole('status').last()).toContainText('Setup ready');
+    await expect(setupPanel.getByRole('status').last()).toContainText('Ready');
     await expect(
       page.getByRole('button', { name: 'Retry exact command', exact: true }),
     ).toHaveCount(0);

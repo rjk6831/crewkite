@@ -3,6 +3,19 @@ import { useState } from 'react';
 import { googleAcpLabel } from './launch.tsx';
 import type { Workspace } from './source.ts';
 
+const setupLabels: Record<string, string> = {
+  uninitialized: 'Not initialized',
+  initializing: 'Initializing',
+  'authentication-required': 'Sign-in required',
+  'discovery-required': 'Signed in, discover choices',
+  authenticating: 'Signing in',
+  discovering: 'Discovering choices',
+  ready: 'Ready',
+  stopping: 'Stopping',
+  blocked: 'Setup blocked',
+  unknown: 'Setup status unknown',
+};
+
 export function GoogleSetup({
   snapshot,
   workspace,
@@ -96,13 +109,22 @@ export function GoogleSetup({
                       },
                     },
       );
+      const signedIn =
+        kind === 'authenticate' &&
+        (result.outcome === 'applied' || result.outcome === 'already-applied') &&
+        result.data?.kind === 'google-acp-setup' &&
+        result.data.setup.auth.status === 'authenticated';
       setMessage(
-        [result.reason, result.next].filter(Boolean).join(' ') ||
-          (result.data?.kind === 'google-acp-install'
-            ? `Installation ${result.data.install.state}. ${result.data.install.next}`
-            : result.data?.kind === 'google-acp-setup'
-              ? `Setup ${result.data.setup.state}${result.data.setup.reason ? `: ${result.data.setup.reason}` : ''}.`
-              : result.outcome),
+        result.reason
+          ? [result.reason, result.next].filter(Boolean).join(' ')
+          : signedIn
+            ? 'Signed in. Discover Google choices to finish setup.'
+            : result.next ||
+              (result.data?.kind === 'google-acp-install'
+                ? `Installation ${result.data.install.state}. ${result.data.install.next}`
+                : result.data?.kind === 'google-acp-setup'
+                  ? `${setupLabels[result.data.setup.state] ?? result.data.setup.state}${result.data.setup.reason ? `: ${result.data.setup.reason}` : ''}.`
+                  : result.outcome),
       );
     } catch {
       setMessage('The setup action could not be confirmed. Refresh status before retrying.');
@@ -114,7 +136,7 @@ export function GoogleSetup({
     <section className="card view-stack" aria-labelledby="google-setup-title">
       <div className="section-heading">
         <h2 id="google-setup-title">Google ACP setup</h2>
-        <span>{setup?.state ?? 'uninitialized'}</span>
+        <span>{setupLabels[setup?.state ?? 'uninitialized'] ?? setup?.state}</span>
       </div>
       <p className="muted small">{googleAcpLabel}</p>
       <p className="muted small">
