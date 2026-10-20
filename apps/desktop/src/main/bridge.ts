@@ -6,9 +6,10 @@ import type {
   ConversationContextReceipt,
   ConversationContextRequest,
 } from '@crewkite/client';
-import { type ControllerClient, createCommandKey } from '@crewkite/client/node';
+import { type ControllerClient, createCommandKey, transferArtifact } from '@crewkite/client/node';
 import {
   ArtifactSchema,
+  ArtifactVerificationSchema,
   type Command,
   CommandIdSchema,
   type CommandResult,
@@ -29,9 +30,14 @@ import { CommandReceipts, syncDirectory } from './receipts.ts';
 import { type DesktopController, desktopActor } from './runtime.ts';
 import { assertSender } from './security.ts';
 
+const verifications = new WeakMap<BrowserWindow, { requestId: string; abort: AbortController }>();
+const validVerificationId = (value: unknown): value is string =>
+  typeof value === 'string' &&
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
 const applied = (result: CommandResult) =>
   result.outcome === 'applied' || result.outcome === 'already-applied';
 export async function installBridge(window: BrowserWindow, controller: DesktopController) {
+  verifications.get(window)?.abort.abort();
   let client: ControllerClient | null = null;
   let listening = false;
   let busy = false;
@@ -158,8 +164,47 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
     'reconnect',
     'retry',
     'events',
+    'verify-artifact',
+    'cancel-artifact-verification',
   ];
   for (const channel of handlers) ipcMain.removeHandler(`crewkite:${channel}`);
+  ipcMain.handle('crewkite:verify-artifact', async (event, input: unknown) => {
+    assertSender(event, window);
+    if (
+      !input ||
+      typeof input !== 'object' ||
+      Array.isArray(input) ||
+      Object.keys(input).length !== 2 ||
+      !('requestId' in input) ||
+      !('artifact' in input) ||
+      !validVerificationId(input.requestId)
+    )
+      throw Error('Output verification request is invalid.');
+    const artifact = ArtifactSchema.parse(input.artifact);
+    if (!client) throw Error('The controller is offline.');
+    if (verifications.has(window)) throw Error('Another output verification is still finishing.');
+    const reader = client;
+    const operation = { requestId: input.requestId, abort: new AbortController() };
+    verifications.set(window, operation);
+    try {
+      const proof = await transferArtifact(
+        artifact,
+        (request) => reader.artifactRange(request),
+        () => {},
+        { signal: operation.abort.signal },
+      );
+      assertSender(event, window);
+      return ArtifactVerificationSchema.parse(proof);
+    } finally {
+      if (verifications.get(window) === operation) verifications.delete(window);
+    }
+  });
+  ipcMain.handle('crewkite:cancel-artifact-verification', (event, requestId: unknown) => {
+    assertSender(event, window);
+    if (!validVerificationId(requestId)) throw Error('Output verification identity is invalid.');
+    const operation = verifications.get(window);
+    if (operation?.requestId === requestId) operation.abort.abort();
+  });
   ipcMain.handle('crewkite:snapshot', async (event, scope: unknown) => {
     assertSender(event, window);
     if (!client) throw new Error('The controller is offline.');
@@ -200,6 +245,8 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
         'GetWorkspaceState',
         'GetProjectPage',
         'GetTaskPage',
+        'GetTaskActivityPage',
+        'GetArtifactRange',
         'ObserveUsage',
         'CheckNativeConnection',
         'InstallGoogleAcp',
@@ -483,6 +530,7 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
     listening = false;
   });
   window.once('closed', () => {
+    verifications.get(window)?.abort.abort();
     for (const channel of handlers) ipcMain.removeHandler(`crewkite:${channel}`);
   });
   async function connect() {
