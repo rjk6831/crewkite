@@ -225,20 +225,20 @@ export function assertInactive(target, execute = run) {
   const profile = join(target, 'state/profile');
   if (readdirSync(profile).some((name) => name.startsWith('Singleton')))
     fail('Quit the app first. A desktop profile lock remains; no lock was deleted.');
-  const result = execute('/usr/sbin/lsof', ['-nP', '-F', 'p', '+D', target]);
+  const result = execute('/usr/sbin/lsof', ['-nP', '-t', '+D', target]);
   if (
     result.error ||
     result.signal ||
     ![0, 1].includes(result.status) ||
     result.stderr ||
-    (result.stdout && !/^(p[0-9]+\n)+$/.test(result.stdout))
+    (result.stdout && !/^([0-9]+\n)+$/.test(result.stdout))
   )
     fail('App activity could not be established. Keep the app closed and try again.');
   const pids = (result.stdout ?? '')
     .trim()
     .split('\n')
     .filter(Boolean)
-    .map((row) => Number(row.slice(1)));
+    .map((row) => Number(row));
   if (pids.some((pid) => pid !== process.pid && pid !== result.pid))
     fail('The selected package is still in use. Quit its app and controller first.');
 }
@@ -315,7 +315,9 @@ export async function upgradePackage({ source, target, confirm }, dependencies =
   const move = dependencies.rename ?? renameSync;
   try {
     try {
-      owner.exec('PRAGMA busy_timeout=0; BEGIN EXCLUSIVE;');
+      // This advisory database receives no writes. Keep its journal in memory so closing
+      // the lease after a rename cannot clean up a different file at the old pathname.
+      owner.exec('PRAGMA journal_mode=MEMORY; PRAGMA busy_timeout=0; BEGIN EXCLUSIVE;');
     } catch {
       fail(
         'The controller is active or its ownership lease is unavailable. Quit it before upgrading.',
