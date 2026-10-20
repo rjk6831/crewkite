@@ -2205,6 +2205,14 @@ export const CommandSchema = z.discriminatedUnion('command', [
     'CheckNativeConnection',
     z.strictObject({ family: z.literal('anthropic'), consent: z.literal('explicit') }),
   ),
+  mutate(
+    'InstallGoogleAcp',
+    z.strictObject({ profileId: z.literal('google-acp-v1'), consent: z.literal('explicit') }),
+  ),
+  mutate(
+    'StopGoogleAcpInstall',
+    z.strictObject({ profileId: z.literal('google-acp-v1'), operationId: CommandIdSchema }),
+  ),
   mutate('ObserveUsage', z.strictObject({ family: z.enum(['google', 'openai']) })),
   mutate(
     'InitializeGoogleAcp',
@@ -2679,7 +2687,7 @@ export const NativeConnectionStatusSchema = z
       'unknown',
     ]),
     authMethod: z
-      .enum(['none', 'claude.ai', 'oauth_token', 'api_key', 'api_key_helper', 'third_party'])
+      .enum(['none', 'subscription', 'oauth_token', 'api_key', 'api_key_helper', 'third_party'])
       .nullable(),
     observedAt: TimestampSchema.nullable(),
     reason: z.string().min(1).max(200).nullable(),
@@ -2691,7 +2699,7 @@ export const NativeConnectionStatusSchema = z
   .refine(
     (status) =>
       status.state !== 'signed-in' ||
-      (status.authMethod === 'claude.ai' && status.observedAt !== null),
+      (status.authMethod === 'subscription' && status.observedAt !== null),
     'Signed-in status requires observed native subscription authentication.',
   )
   .refine(
@@ -2701,8 +2709,19 @@ export const NativeConnectionStatusSchema = z
   );
 export type NativeConnectionStatus = z.infer<typeof NativeConnectionStatusSchema>;
 
+export const GoogleAcpInstallStatusSchema = z.strictObject({
+  profileId: z.literal('google-acp-v1'),
+  state: z.enum(['idle', 'installing', 'stopping', 'installed', 'blocked', 'unknown']),
+  operationId: CommandIdSchema.nullable(),
+  observedAt: TimestampSchema.nullable(),
+  reason: z.string().min(1).max(200).nullable(),
+  next: z.string().min(1).max(500),
+});
+export type GoogleAcpInstallStatus = z.infer<typeof GoogleAcpInstallStatusSchema>;
+
 export const SnapshotSchema = z
   .strictObject({
+    googleAcpInstall: GoogleAcpInstallStatusSchema.nullable().default(null),
     nativeConnections: z.array(NativeConnectionStatusSchema).max(1).default([]),
     usageReaders: z
       .array(UsageReaderSchema)
@@ -2895,6 +2914,7 @@ export const WorkspaceStateSchema = z
     usageReaders: SnapshotSchema.shape.usageReaders,
     googleAcpSetup: SnapshotSchema.shape.googleAcpSetup,
     localSetup: SnapshotSchema.shape.localSetup,
+    googleAcpInstall: SnapshotSchema.shape.googleAcpInstall,
     nativeConnections: SnapshotSchema.shape.nativeConnections,
     nativeProfiles: SnapshotSchema.shape.nativeProfiles,
     routes: SnapshotSchema.shape.routes,
@@ -3007,6 +3027,7 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('conversation-state'), state: TaskConversationStateSchema }),
   ConversationPageSchema,
   z.strictObject({ kind: z.literal('google-acp-setup'), setup: GoogleAcpSetupSchema }),
+  z.strictObject({ kind: z.literal('google-acp-install'), install: GoogleAcpInstallStatusSchema }),
   sourceInspection,
   z.strictObject({ kind: z.literal('snapshot'), snapshot: SnapshotSchema }),
   z.strictObject({

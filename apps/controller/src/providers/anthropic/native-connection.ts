@@ -244,7 +244,8 @@ export class NativeConnectionChecks {
                 : metadata?.status === 'signed-out'
                   ? 'signed-out'
                   : 'unsupported',
-          authMethod: metadata?.authMethod ?? null,
+          authMethod:
+            metadata?.authMethod === 'claude.ai' ? 'subscription' : (metadata?.authMethod ?? null),
           observedAt: this.options.now(),
           reason: observed.reason,
           next: !observed.quiescent

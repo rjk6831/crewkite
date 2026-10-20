@@ -89,6 +89,7 @@ import {
   groupAbsent,
   OwnedCommand,
 } from '../host/worker.ts';
+import { replacementFixture as nativeSubscriptionFixture } from '../providers/anthropic/replacement-fixture.ts';
 import { type AcpSetupProof, acpClientPin } from '../providers/google/acp/profile.ts';
 import { GoogleFlashQuotaModelId } from '../providers/google/native-writer.ts';
 import { localStructuredOutput } from '../providers/local/profile.ts';
@@ -11226,7 +11227,6 @@ test('planning turns keep task authority and allowance across execution', async 
 test('native connection checks retain ownership without blocking unrelated tasks', async (t) => {
   const { AnthropicNativeProfileSchema } = await import('@crewkite/contracts');
   let launches = 0;
-  const method = 'claude.ai';
   let child: import('node:child_process').ChildProcessWithoutNullStreams | undefined;
   const ready = Promise.withResolvers<void>();
   const base = unavailableNativeProfile();
@@ -11263,7 +11263,8 @@ test('native connection checks retain ownership without blocking unrelated tasks
         const {MessageChannel}=require('node:worker_threads');
         const channel=new MessageChannel();channel.port1.on('message',()=>{});
         process.on('SIGUSR1', () => {
-          process.stdout.write(JSON.stringify({authMethod:${JSON.stringify(method)},email:'discard@example.invalid',token:'discard'}), () => process.exit(0));
+          ${nativeSubscriptionFixture(args, { content: '' })}
+          setImmediate(()=>process.exit(0));
         });
         process.stderr.write('ready');
         process.stdin.resume();
@@ -11376,4 +11377,99 @@ test('native connection checks retain ownership without blocking unrelated tasks
     ).outcome,
     'applied',
   );
+});
+
+test('official installation can stop and recover without blocking project work', async (t) => {
+  let started = Promise.withResolvers<void>();
+  let downloads = 0;
+  const options: Partial<ControllerOptions> = {
+    googleUsageClient: () => ({ available: false, reason: 'client-unavailable' }),
+    googleAcpInstall: {
+      fetch: (async (_url: unknown, init?: RequestInit) => {
+        downloads++;
+        assert.ok(init?.signal);
+        started.resolve();
+        await new Promise<void>((_resolve, reject) => {
+          if (init.signal?.aborted) reject(Error('cancelled'));
+          else
+            init.signal?.addEventListener('abort', () => reject(Error('cancelled')), {
+              once: true,
+            });
+        });
+        throw Error('No download result was expected.');
+      }) as typeof fetch,
+    },
+  };
+  let controller: Controller;
+  const context = await setup(t, options, () => controller.close());
+  controller = context.controller;
+  const input = context.command(
+    'InstallGoogleAcp',
+    { profileId: 'google-acp-v1', consent: 'explicit' },
+    0,
+  );
+  const pending = controller.execute(input, 'local-owner');
+  await started.promise;
+  assert.equal(controller.snapshot().googleAcpInstall?.state, 'installing');
+  assert.equal((await controller.execute(context.draft, 'local-owner')).outcome, 'applied');
+  assert.equal(
+    (await controller.execute({ ...context.draft, key: input.key }, 'local-owner')).outcome,
+    'denied',
+  );
+  assert.equal(
+    (
+      await controller.execute(
+        context.command(
+          'InitializeGoogleAcp',
+          { profileId: 'google-acp-v1', consent: 'explicit' },
+          0,
+        ),
+        'local-owner',
+      )
+    ).reason,
+    'google-install-active',
+  );
+  const stop = context.command(
+    'StopGoogleAcpInstall',
+    { profileId: 'google-acp-v1', operationId: input.key },
+    0,
+  );
+  const result = await controller.execute(stop, 'local-owner');
+  assert.equal(result.data?.kind, 'google-acp-install');
+  assert.equal(result.reason, 'cancelled');
+  await pending;
+  assert.equal(controller.snapshot().googleAcpInstall?.state, 'blocked');
+  assert.equal((await controller.execute(input, 'local-owner')).reason, 'cancelled');
+  assert.equal(downloads, 1);
+  controller.store.db
+    .prepare('DELETE FROM receipts WHERE command_key=? OR (command_key LIKE ? AND command_key<>?)')
+    .run(input.key, `google-acp-install:${input.key}:%`, `google-acp-install:${input.key}:0`);
+  await controller.close();
+  const reopen = () =>
+    new Controller({
+      ...options,
+      home: join(context.directory, 'home'),
+      now: context.clock.now,
+      id: context.id,
+    });
+  controller = reopen();
+  const snapshot = await controller.execute(context.command('GetSnapshot', {}), 'local-owner');
+  if (snapshot.data?.kind !== 'snapshot') throw Error('Expected installation snapshot.');
+  assert.equal(snapshot.data.snapshot.googleAcpInstall?.reason, 'google-install-interrupted');
+  assert.equal(
+    (await controller.execute(input, 'local-owner')).reason,
+    'google-install-interrupted',
+  );
+  assert.equal(downloads, 1);
+  started = Promise.withResolvers<void>();
+  const fresh = controller.execute(
+    context.command('InstallGoogleAcp', input.payload, 0),
+    'local-owner',
+  );
+  await started.promise;
+  await controller.close();
+  assert.equal((await fresh).reason, 'cancelled');
+  controller = reopen();
+  assert.equal(controller.snapshot().googleAcpInstall?.state, 'blocked');
+  assert.equal(downloads, 2);
 });

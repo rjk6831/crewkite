@@ -208,6 +208,11 @@ import {
   startReplacement as startAnthropicReplacement,
 } from '../providers/anthropic/replacement.ts';
 import { AcpDiagnosticSchema } from '../providers/google/acp/client.ts';
+import type { AcpInstallDependencies } from '../providers/google/acp/install.ts';
+import {
+  GoogleAcpInstallation,
+  InstallRecordSchema,
+} from '../providers/google/acp/install-operation.ts';
 import {
   type AcpClientIdentity,
   AcpClientPinSchema,
@@ -914,6 +919,7 @@ export type ControllerOptions = {
     resolve?: (proof: AcpSetupProof | null) => AcpProfileResolution;
     spawn?: Parameters<typeof startGoogleAcpSetup>[0]['spawn'];
   };
+  googleAcpInstall?: AcpInstallDependencies;
   registerGoogleAcp?: boolean;
   localInputHelper?: LocalInputHelper;
   localInput?: Parameters<typeof startLocalSecretInput>[2];
@@ -1090,6 +1096,7 @@ export class Controller {
       });
       this.recover();
       this.nativeConnections().recover();
+      this.googleInstallation().recover();
       this.armQuotaRetries();
       for (const row of this.store.db
         .prepare("SELECT candidate_id FROM publications WHERE state='prepared'")
@@ -1129,6 +1136,8 @@ export class Controller {
       return this.executeAcpSetup(command as AcpSetupCommand, principal);
     if (command.command === 'StartRun' && this.isPreparedAcp(command.payload.runId))
       return this.executeAcpStart(command, principal);
+    if (command.command === 'InstallGoogleAcp' || command.command === 'StopGoogleAcpInstall')
+      return this.executeGoogleInstall(command, principal);
     if (command.command === 'CheckNativeConnection')
       return this.checkNativeConnection(command, principal);
     if (command.command === 'ObserveUsage') return this.observeUsageCommand(command, principal);
@@ -1368,6 +1377,7 @@ export class Controller {
       protocol: 1,
       stamp: this.store.workspaceStamp(),
       cursor: this.store.cursor(),
+      googleAcpInstall: this.googleInstallation().status(),
       nativeConnections: [this.nativeConnections().status()],
       nativeProfiles: this.resolveProfiles().map((profile) => profile.facts),
       localSetup: this.localSetup(),
@@ -1424,6 +1434,7 @@ export class Controller {
     try {
       const snapshot = {
         protocol: 1,
+        googleAcpInstall: header.googleAcpInstall,
         nativeConnections: header.nativeConnections,
         nativeProfiles: header.nativeProfiles,
         localSetup: header.localSetup,
@@ -1951,6 +1962,8 @@ export class Controller {
         data: { kind: 'google-acp-setup', setup: next },
       };
     }
+    const installBlocker = this.googleInstallationBlocker();
+    if (installBlocker) return installBlocker;
     const blocker = this.store.googleOperationBlocker();
     if (blocker)
       return { outcome: 'blocked', reason: blocker, data: { kind: 'google-acp-setup', setup } };
@@ -2159,6 +2172,129 @@ export class Controller {
     } finally {
       runtime.resolve(CommandResultSchema.parse(result));
     }
+  }
+
+  private googleInstallOperation?: GoogleAcpInstallation;
+
+  private googleInstallation(): GoogleAcpInstallation {
+    if (this.googleInstallOperation) return this.googleInstallOperation;
+    const read = (key?: string) => {
+      const row = this.store.db
+        .prepare(
+          'SELECT command_key FROM receipts WHERE command_key LIKE ? ORDER BY rowid DESC LIMIT 1',
+        )
+        .get(key ? `google-acp-install:${key}:%` : 'google-acp-install:%') as
+        | { command_key: string }
+        | undefined;
+      return row ? InstallRecordSchema.parse(this.nativeRecord(row.command_key, 4096).value) : null;
+    };
+    this.googleInstallOperation = new GoogleAcpInstallation({
+      now: this.now,
+      latest: () => read(),
+      forKey: (key) => read(key),
+      append: (record) =>
+        this.store.transaction(() => {
+          const value = InstallRecordSchema.parse(record);
+          const artifact = this.nativeArtifact(value);
+          if (value.phase === 'intent')
+            this.store.saveReceipt(value.key, value.requestHash, 'local-owner', {
+              outcome: 'blocked',
+              reason: 'google-install-pending',
+              data: { kind: 'google-acp-install', install: value.status },
+            });
+          this.store.saveReceipt(
+            `google-acp-install:${value.key}:${value.step}`,
+            artifact.hash,
+            'local-owner',
+            { outcome: 'applied', entity: artifact },
+          );
+        }),
+    });
+    return this.googleInstallOperation;
+  }
+
+  private googleInstallationBlocker(): CommandResult | undefined {
+    const status = this.googleInstallation().status();
+    if (['installing', 'stopping', 'unknown'].includes(status.state))
+      return {
+        outcome: 'blocked',
+        reason:
+          status.state === 'unknown' ? 'google-install-ownership-unknown' : 'google-install-active',
+        next: status.next,
+        data: { kind: 'google-acp-install', install: status },
+      };
+  }
+
+  private async executeGoogleInstall(
+    command: Extract<Command, { command: 'InstallGoogleAcp' | 'StopGoogleAcpInstall' }>,
+    principal: string,
+  ): Promise<CommandResult> {
+    const hash = hashCanonical(command),
+      receipt = this.store.receipt(command.key);
+    if (receipt && (receipt.hash !== hash || receipt.principal !== principal))
+      return { outcome: 'denied', reason: 'idempotency-key-reused' };
+    if (
+      receipt &&
+      !['google-install-pending', 'google-install-stop-pending'].includes(
+        receipt.result.reason ?? '',
+      )
+    )
+      return {
+        ...receipt.result,
+        ...(receipt.result.outcome === 'applied' ? { outcome: 'already-applied' as const } : {}),
+      };
+    if (command.expectedRevision !== 0) return { outcome: 'stale-revision', revision: 0 };
+    const operation = this.googleInstallation();
+    let result: CommandResult;
+    if (command.command === 'StopGoogleAcpInstall') {
+      if (!receipt)
+        this.store.transaction(() =>
+          this.store.saveReceipt(command.key, hash, principal, {
+            outcome: 'blocked',
+            reason: 'google-install-stop-pending',
+            data: { kind: 'google-acp-install', install: operation.status() },
+          }),
+        );
+      result = await operation.stop(command.payload.operationId);
+    } else {
+      const blocker = receipt
+        ? undefined
+        : this.store.transaction(() => this.store.googleOperationBlocker());
+      result = blocker
+        ? {
+            outcome: 'blocked',
+            reason: blocker,
+            data: { kind: 'google-acp-install', install: operation.status() },
+          }
+        : !receipt && (this.acpSetupRuntime || this.acpStart)
+          ? {
+              outcome: 'blocked',
+              reason: 'google-operation-active',
+              data: { kind: 'google-acp-install', install: operation.status() },
+            }
+          : await operation.install(
+              { key: command.key, requestHash: hash, home: this.home },
+              this.options.googleAcpInstall,
+            );
+    }
+    if (result.outcome === 'denied') return result;
+    try {
+      this.store.transaction(() => {
+        const current = this.store.receipt(command.key);
+        if (current && current.hash !== hash) throw Error('Command binding changed.');
+        if (
+          current &&
+          ['google-install-pending', 'google-install-stop-pending'].includes(
+            current.result.reason ?? '',
+          )
+        )
+          this.finishMetadataReceipt(command.key, result);
+        else if (!current) this.store.saveReceipt(command.key, hash, principal, result);
+      });
+    } catch {
+      return { outcome: 'blocked', reason: 'google-install-storage-failed' };
+    }
+    return result;
   }
 
   private connectionChecks?: NativeConnectionChecks;
@@ -2643,6 +2779,7 @@ export class Controller {
     this.quotaRetries.clear();
     const native: Promise<unknown>[] = [];
     if (this.connectionChecks) native.push(this.connectionChecks.close());
+    if (this.googleInstallOperation) native.push(this.googleInstallOperation.close());
     if (this.acpStart) {
       this.acpStart.aborted = true;
       native.push(this.acpStart.promise);
@@ -8682,6 +8819,8 @@ export class Controller {
           });
     if (this.store.receipt(command.key))
       return Promise.resolve(this.commitCommand(command, principal));
+    const installBlocker = this.googleInstallationBlocker();
+    if (installBlocker) return Promise.resolve(installBlocker);
     const deadline = performance.now() + 30000;
     const wallDeadline = Date.parse(this.now()) + 30000;
     const pending = {

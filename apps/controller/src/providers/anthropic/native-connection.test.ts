@@ -123,6 +123,7 @@ test('connection metadata retains closure and idempotence without task authority
         status.state,
         method === 'claude.ai' ? 'signed-in' : method === 'none' ? 'signed-out' : 'unsupported',
       );
+      assert.equal(status.authMethod, method === 'claude.ai' ? 'subscription' : method);
       assert.equal(status.billing, 'unknown');
       assert.equal(status.quota, 'unknown');
       assert.equal(status.qualified, false);
