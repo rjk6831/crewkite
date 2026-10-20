@@ -293,9 +293,11 @@ export class NativeConnectionChecks {
     return pending.promise;
   }
 
-  async close() {
+  close(): void | Promise<void> {
     this.closed = true;
-    this.active?.stop?.();
-    await this.active?.promise;
+    const active = this.active;
+    if (!active) return;
+    active.stop?.();
+    return active.promise.then(() => {});
   }
 }

@@ -2795,8 +2795,10 @@ export class Controller {
     for (const cancel of this.quotaRetries.values()) cancel();
     this.quotaRetries.clear();
     const native: Promise<unknown>[] = [];
-    if (this.connectionChecks) native.push(this.connectionChecks.close());
-    if (this.googleInstallOperation) native.push(this.googleInstallOperation.close());
+    const connectionClosing = this.connectionChecks?.close();
+    if (connectionClosing) native.push(connectionClosing);
+    const installClosing = this.googleInstallOperation?.close();
+    if (installClosing) native.push(installClosing);
     if (this.acpStart) {
       this.acpStart.aborted = true;
       native.push(this.acpStart.promise);

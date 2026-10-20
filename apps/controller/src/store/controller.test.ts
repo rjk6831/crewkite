@@ -953,7 +953,7 @@ test('a committed launch intent survives restart without another launch', async 
   assert.equal(controller.store.intents()[0].pid, null);
   assert.equal((await controller.execute(start, 'local-owner')).outcome, 'already-applied');
   assert.equal(launches, 1);
-  controller.close();
+  assert.equal(controller.close(), undefined);
   const recovered = new Controller({
     home: join(directory, 'home'),
     now: clock.now,

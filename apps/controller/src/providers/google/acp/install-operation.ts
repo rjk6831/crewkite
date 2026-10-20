@@ -342,8 +342,8 @@ export class GoogleAcpInstallation {
     return active.promise;
   }
 
-  async close() {
+  close(): void | Promise<void> {
     this.closed = true;
-    if (this.active) await this.stop(this.active.key);
+    if (this.active) return this.stop(this.active.key).then(() => {});
   }
 }

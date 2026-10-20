@@ -77,12 +77,21 @@ test('installation Stop waits for owned signature closure and recovery never rep
       settled = true;
       return result;
     });
+    const closing = operation.close();
+    assert.ok(closing instanceof Promise);
+    let closeSettled = false;
+    void closing.then(() => {
+      closeSettled = true;
+    });
     await Promise.resolve();
+    assert.equal(closeSettled, false);
     assert.equal(settled, false);
     assert.equal(operation.status().state, 'stopping');
     release.resolve();
     await closed.promise;
     const stopped = await stopping;
+    await closing;
+    assert.equal(closeSettled, true);
     assert.equal(stopped.outcome, 'blocked');
     assert.equal(stopped.reason, 'cancelled');
     assert.equal(operation.status().state, 'blocked');
@@ -92,7 +101,14 @@ test('installation Stop waits for owned signature closure and recovery never rep
         ?.signatures.filter((phase) => phase.state === 'closed').length,
       2,
     );
-    assert.equal((await operation.install(input)).reason, 'cancelled');
+    const retryOperation = new GoogleAcpInstallation({
+      ...journal,
+      install: async () => {
+        assert.fail('A completed install cannot replay.');
+      },
+    });
+    assert.equal((await retryOperation.install(input)).reason, 'cancelled');
+    assert.equal(retryOperation.close(), undefined);
     assert.equal(launches, 1);
     const previous = records().at(-1);
     assert.ok(previous);
