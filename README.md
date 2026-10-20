@@ -37,7 +37,7 @@ The [provider notes](docs/providers.md) separate implemented paths from dated qu
 
 ## Task workflow
 
-Open Usage and capacity to inspect route availability and explicit provider setup. Local setup connects to a dedicated loopback runtime, refreshes its observed model list and saves one selection. Dedicated token is the default. An explicit CLI configuration can select no authentication, this device only; the desktop reports that saved mode without a selector or silent fallback. That mode needs no token input after restart. Setup loads no model. An eligible loaded model remains unqualified; the [provider notes](docs/providers.md#local-models) describe the current limits.
+Choose Connect providers before adding a project or task. The same setup controls appear in Usage and capacity, with installed client, sign-in and allowance observations kept separate. Local setup connects to a dedicated loopback runtime, refreshes its observed model list and saves one selection. Dedicated token is the default. An explicit CLI configuration can select no authentication, this device only; the desktop reports that saved mode without a selector or silent fallback. That mode needs no token input after restart. Setup loads no model. An eligible loaded model remains unqualified; the [provider notes](docs/providers.md#local-models) describe the current limits.
 
 Choose New task, select a registered project and review the planning permission before sending. Conversation is the main task view. Answer the primary role's questions and inspect the proposed criteria and scope before choosing Adopt plan. Adoption saves the task contract and opens separate execution preparation. It starts no coding work.
 

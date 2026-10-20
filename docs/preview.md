@@ -18,7 +18,7 @@ Extract the archive after the checksum passes. Keep its folder together. If macO
 
 The preview has an ad-hoc resource seal. It has no verified Developer ID identity and is not notarized by Apple. Check the release receipt for the exact candidate's first-launch evidence.
 
-Keep the extracted candidate folder together and double-click `CrewKite.command`. It opens the workspace through the adjacent `bin/desktop` launcher. The folder can move before its first launch. After setup, reopen the same folder to retain its projects, tasks and settings.
+Keep the extracted candidate folder together and double-click `CrewKite.command`. It opens the workspace through the adjacent `bin/desktop` launcher. The folder can move before its first launch. After setup, reopen the same folder to retain its projects, tasks and settings. To replace an initialized candidate, use the fresh package's `Upgrade Existing.command` and follow the [state-preserving upgrade procedure](distribution.md#upgrade-an-existing-directory-package). Keep the old app closed. The helper preserves the exact installed path and retains the original folder as a backup; moving its initialized state into another candidate folder is unsupported.
 
 macOS can require separate approval for `CrewKite.command` and `Electron.app`. After each blocked attempt, use System Settings > Privacy & Security > Open Anyway for that exact item. Opening `Electron.app` directly can show its runtime welcome screen. Quit it with Command-Q, then launch `CrewKite.command` again.
 
@@ -36,9 +36,9 @@ I record the exact source revision, verification and provider qualification in t
 ## Start a task
 
 1. Open the normal candidate. Packaging details are in the [distribution notes](distribution.md).
-2. Choose Add project and select the exact Git repository root.
-3. Choose New task, select that project, and read the planning permission before sending anything.
-4. Review the explicit provider setup in Usage and capacity. Details are in the [provider routes](providers.md).
+2. Choose Connect providers and check the clients you plan to use. This needs no project or task.
+3. Choose Add project and select the exact Git repository root. A refused folder reports its reason and permits another selection after its saved command settles.
+4. Choose New task, select that project, and read the planning permission before sending anything.
 
 ## Plan before coding
 
@@ -57,6 +57,12 @@ Open Changes to inspect the retained work. Checks and review are separate action
 Use Stop to end active work. Reopening the same home launches nothing. An uncertain command keeps its original receipt, so you can retry that exact command. Unresolved ownership is shown as such and gives no permission to relaunch the work or treat it as complete.
 
 ## Providers
+
+Open Connect providers from the workspace sidebar. The same controls appear in Usage and capacity.
+
+- Refresh OpenAI quota reads the supported installed client's existing subscription session. It submits no model prompt. Readiness failures show the retained reason and next action.
+- Check Anthropic sign-in observes the supported installed native client. A signed-out client needs its own native sign-in, described in the [provider instructions](providers.md#anthropic-writer-preparation). The idle allowance remains unknown because this integration has no standalone reader.
+- Install official Google client downloads and verifies the reviewed ACP bundle. Then Initialize Google ACP, choose Sign in with Google and Discover Google choices. Personal sign-in may open a browser. The separate Google quota gauge does not establish an ACP connection.
 
 Local uses a dedicated token by default. The packaged app asks for it and keeps it in controller memory, so it is requested again after a restart. An explicit CLI configuration can instead select no authentication, limited to this device's loopback address. The main interface has no selector and never switches modes automatically. See the [provider notes](providers.md#local-models) and the [CLI guide](../apps/cli/README.md). Model eligibility is not qualification. An eligible model stays unmeasured until separate evidence covers it.
 
