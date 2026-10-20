@@ -7,7 +7,7 @@
 
 CrewKite is a desktop workspace and CLI for coding tasks that share one local controller. It tracks approvals, usage observations and retained work across provider routes.
 
-I am preparing the D2 candidate for real-project user acceptance on macOS with Apple Silicon. The normal workspace starts without a synthetic project or seeded route catalog. Native profiles connect to their supported clients; Local setup uses an explicitly configured loopback connection. Availability is separate from qualification. The separate Google ACP profile binds its supported mappings to an exact imported client bundle. The [roadmap](docs/roadmap.md) keeps the required live evidence, ten real tasks and acceptance gates open.
+I completed ten real D2 backlog outcomes through the normal checked workflow. I am preparing their composed candidate for real-project user acceptance on macOS with Apple Silicon. The normal workspace starts without a synthetic project or seeded route catalog. Native profiles connect to their supported clients; Local setup uses an explicitly configured loopback connection. Availability is separate from qualification. The separate Google ACP profile binds its supported mappings to an exact imported client bundle. The [roadmap](docs/roadmap.md) records that task evidence and the separate D2b user-acceptance and D3 gates. The release receipt carries the exact candidate verification and package status.
 
 ## Why I am building it
 
@@ -96,7 +96,7 @@ The controller is a headless Node process. It owns permissions, budgets, task ow
 | D0 | Desktop and CLI run the full task journey against fake providers | Local demo verified |
 | D1a | One qualified official client does useful supervised work with manual export | Bounded workflow complete |
 | D1b | Checked results: immutable candidates, independent checks and review, local branch acceptance | Bounded workflow complete |
-| D2 | Local, OpenAI, Anthropic and Google routes with handoff, honest usage and two-slice parallel work | Implementation and qualification in progress |
+| D2 | Local, OpenAI, Anthropic and Google routes with handoff, honest usage and two-slice parallel work | Ten real tasks accepted; exact route and candidate evidence in the release receipt |
 | D3 | Signed, documented distribution for a stated audience | Planned |
 
 Details live in [docs/roadmap.md](docs/roadmap.md).

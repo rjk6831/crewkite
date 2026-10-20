@@ -122,16 +122,16 @@ Blocked and unknown outcomes remain visible in the action receipt. Save JSON out
 
 ```sh
 pnpm crewkite usage show --json
-pnpm crewkite usage refresh --family google --consent --json
 pnpm crewkite usage refresh --family google --json
-pnpm crewkite usage refresh --family google --no-consent --json
 ```
 
-`--consent` enables the reader and requests one read. Omitting consent requests a read under the saved opt-in. `--no-consent` disables the reader without a read and discards any in-flight result. Reads have a 60-second cooldown after each attempt, including failures. Active or unknown Google ownership blocks a read. No timer refreshes quota.
+The quota reader runs by default when the pinned client is available. Controller startup attempts one read. Authenticated connections can refresh missing, stale or unknown observations, and Google admission can make one needed bounded read. Reads have a 60-second cooldown after each attempt, including failures. Active or unknown Google ownership blocks a read. A fresh reported zero remains fresh and does not cause another read just for being zero.
 
-The reader uses the Google CLI's headless `/usage` command with no model request. Google's FAQ reserves headless mode for scripting and CI. Quota consent does not enable a writer. The [provider boundaries](../../docs/providers.md) describe this separate opt-in.
+The reader calls the pinned Google CLI's headless `/usage` metadata command without a model request. A quota read supplies no coding authority, account identity, provider entitlement or billing hard cap. The [provider boundaries](../../docs/providers.md) describe this status check and its limits.
 
-`usage show --json` returns `{ cursor, usageReaders, usage }`. Readers include enabled state, availability reason, last attempt and last successful observation. Usage contains the controller's derived windows with their source, observation time, reset time and stale state. Refresh returns the normal `{ command, result }` action receipt. Failed reads retain prior windows, which become stale after five minutes.
+`usage show --json` returns `{ cursor, usageReaders, usage }`. Readers report availability and its reason, the last attempt and the last successful observation. Derived usage windows retain their source, observation and reset times, and stale state. Refresh returns the normal `{ command, result }` action receipt. Failed reads retain prior observations and their original timestamps; they become stale after five minutes. Keep an uncertain refresh receipt and use `retry <receipt-file>` for that exact saved command key.
+
+Admission rechecks every bucket applicable to the frozen selected model and every configured reserve. A known separate model pool does not consume that selection's allowance. Required selected-model windows must be present; third-party and unknown buckets retain conservative checks. Missing client or invalid output cannot become known allowance. The provider-boundaries link above records the exact mapping.
 
 ## Google ACP setup
 
@@ -162,7 +162,7 @@ Omit the thought-level flag when no selector was advertised. The preparation fre
 
 Google ACP permits guided or balanced authority, ordinary subscription billing and request-review. Each native approval requires a human decision for one exact session and tool call. Approval and denial preserve the full typed binding. Permanent permission and automatic handoff are unavailable.
 
-`--confirm-quota-account` records that the separate CLI quota login and ACP sign-in use the same Google account. Shared native home does not prove identity. Every returned quota pool must be fresh and above reserve before admission. Disabling the reader grants no unknown-usage bypass. The headless Google file profile remains blocked.
+`--confirm-quota-account` records that the separate CLI quota login and ACP sign-in use the same Google account. Shared native home does not prove identity. Admission rechecks every applicable quota pool and configured reserve for the frozen selected model; required windows must be present, and unknown pools remain conservative. Missing, stale or unknown quota must be resolved before admission. The headless Google file profile remains blocked.
 
 ## Local setup
 
