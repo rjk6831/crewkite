@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
@@ -124,14 +125,24 @@ test('package upgrade preserves fixed-path state and refuses unsafe swaps', asyn
     }
     if (scenario === 'external-link') symlinkSync(root, join(state, 'external'));
     let renames = 0;
-    const execute = (path) =>
-      path === '/usr/sbin/lsof'
-        ? {
-            status: scenario === 'active' ? 0 : 1,
-            stdout: scenario === 'active' ? 'p999999\n' : '',
-            stderr: '',
-          }
-        : { status: 0, stdout: '', stderr: '' };
+    const execute = (path, args) => {
+      if (path !== '/usr/sbin/lsof') return { status: 0, stdout: '', stderr: '' };
+      assert.deepEqual(args, ['-nP', '-t', '+D', args.at(-1)]);
+      if (scenario === 'installed')
+        return spawnSync(path, args, {
+          cwd: root,
+          env: { LANG: 'C', PATH: '/usr/bin:/bin' },
+          encoding: 'utf8',
+          timeout: 30000,
+          maxBuffer: 65536,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+      return {
+        status: scenario === 'active' ? 0 : 1,
+        stdout: scenario === 'active' ? '999999\n' : '',
+        stderr: '',
+      };
+    };
     let plan;
     try {
       const pending = upgradePackage(
