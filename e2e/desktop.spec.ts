@@ -259,6 +259,21 @@ async function enter(button: Locator) {
   await button.click();
 }
 
+async function pauseRenderer(
+  application: Awaited<ReturnType<typeof _electron.launch>>,
+  page: Page,
+) {
+  const url = page.url();
+  // Unload the prior fixture before replacing its window's IPC handlers.
+  await application.evaluate(async ({ BrowserWindow }) => {
+    await BrowserWindow.getAllWindows()[0].loadURL('about:blank');
+  });
+  return () =>
+    application.evaluate(async ({ BrowserWindow }, url) => {
+      await BrowserWindow.getAllWindows()[0].loadURL(url);
+    }, url);
+}
+
 async function desktopSnapshot(page: Page) {
   try {
     return SnapshotSchema.parse(await page.evaluate(() => window.crewkite?.getSnapshot()));
@@ -365,6 +380,7 @@ async function quotaReadBridge(
     server.listen(socketPath, resolve);
   });
   try {
+    const restoreRenderer = await pauseRenderer(application, page);
     await application.evaluate(
       async ({ BrowserWindow }, options) => {
         const load = process.mainModule?.require.bind(process.mainModule);
@@ -400,7 +416,7 @@ async function quotaReadBridge(
         home,
       },
     );
-    await page.reload();
+    await restoreRenderer();
     await expect(page.getByText('Controller connected', { exact: true })).toBeVisible();
     await page.getByRole('button', { name: 'Usage and capacity', exact: true }).click();
     const panel = page.getByRole('region', { name: 'Google quota', exact: true });
@@ -408,7 +424,7 @@ async function quotaReadBridge(
     await expect(panel.getByRole('checkbox')).toHaveCount(0);
     await expect(refresh).toBeDisabled();
     await expect(panel).toContainText('client-unavailable');
-    assert.equal(pending.length, 0);
+    assert.equal(pending.length, 0, pending.map(({ command }) => command.command).join(','));
     snapshot.usageReaders[0].available = true;
     snapshot.usageReaders[0].reason = 'available';
     await page.reload();
@@ -1213,6 +1229,7 @@ async function conversationBridge(
     server.listen(socketPath, resolve);
   });
   try {
+    const restoreRenderer = await pauseRenderer(application, page);
     await application.evaluate(
       async ({ BrowserWindow }, options) => {
         const load = process.mainModule?.require.bind(process.mainModule);
@@ -1248,7 +1265,7 @@ async function conversationBridge(
         home,
       },
     );
-    await page.reload();
+    await restoreRenderer();
     if ((await page.locator('html').getAttribute('data-theme')) !== 'dark')
       await page.getByRole('button', { name: 'Switch to dark theme', exact: true }).click();
     const composer = page.getByRole('textbox', { name: 'Message the primary role', exact: true });
@@ -2001,8 +2018,10 @@ async function conversationBridge(
       'The recipient, draft context or task changed.',
     );
     await page.keyboard.press('Escape');
+    await expect(page.getByRole('dialog')).toHaveCount(0);
     await expect(composer).toHaveValue('Keep the execution permissions unchanged.');
     await expect(page.getByRole('button', { name: /^Remove Context/ })).toHaveCount(1);
+    await expect(page.getByRole('button', { name: 'Send message', exact: true })).toBeEnabled();
     await composer.press('Enter');
     await page
       .getByRole('dialog')
