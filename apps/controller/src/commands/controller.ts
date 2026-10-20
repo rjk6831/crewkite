@@ -2767,7 +2767,22 @@ export class Controller {
         return { outcome: 'applied', entity: artifact };
       }
       case 'RegisterProject': {
-        const path = projectRoot(command.payload.path);
+        let path: string;
+        try {
+          path = projectRoot(command.payload.path);
+        } catch {
+          return {
+            outcome: 'blocked',
+            reason: 'project-folder-unavailable',
+            next: 'Choose a readable Git repository root. No new project was registered.',
+          };
+        }
+        if (!ProjectSchema.shape.name.safeParse(basename(path)).success)
+          return {
+            outcome: 'blocked',
+            reason: 'project-folder-name-invalid',
+            next: 'Choose a repository root with a folder name of 1 to 200 characters.',
+          };
         const existing = this.store.db
           .prepare('SELECT project_id FROM project_paths WHERE path=?')
           .get(path);

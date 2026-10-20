@@ -199,6 +199,45 @@ test('an idempotent retry returns the receipt without creating another task', as
   );
 });
 
+test('project validation refusals settle their exact receipt and allow another folder', async (t) => {
+  const { controller, command, directory, source } = await setup(t);
+  const plain = join(directory, 'plain-folder');
+  const longName = join(directory, 'p'.repeat(201));
+  const valid = join(directory, 'another-project');
+  const nested = join(source.directory, 'nested-folder');
+  for (const path of [plain, longName, valid, nested]) mkdirSync(path);
+  for (const path of [longName, valid]) git(path, ['init', '--quiet']);
+  const before = controller.snapshot();
+  for (const [path, reason] of [
+    [join(directory, 'missing'), 'project-folder-unavailable'],
+    [plain, 'project-folder-unavailable'],
+    [nested, 'project-folder-unavailable'],
+    [longName, 'project-folder-name-invalid'],
+  ]) {
+    const request = command('RegisterProject', { path }, 0);
+    const result = await controller.execute(request, 'local-owner');
+    assert.equal(result.outcome, 'blocked');
+    assert.equal(result.reason, reason);
+    assert(result.next);
+    assert.deepEqual(controller.store.receipt(request.key)?.result, result);
+    assert.deepEqual(await controller.execute(request, 'local-owner'), result);
+    const changed = { ...request, payload: { path: valid } };
+    assert.equal(
+      (await controller.execute(changed, 'local-owner')).reason,
+      'idempotency-key-reused',
+    );
+    assert.equal(controller.snapshot().projects.length, before.projects.length);
+    assert.equal(controller.store.cursor(), before.cursor);
+  }
+  const validRequest = command('RegisterProject', { path: valid }, 0);
+  const result = await controller.execute(validRequest, 'local-owner');
+  assert.equal(result.outcome, 'applied');
+  const committedRetry = await controller.execute(validRequest, 'local-owner');
+  assert.equal(committedRetry.outcome, 'already-applied');
+  assert.deepEqual(committedRetry.entity, result.entity);
+  assert.equal(controller.snapshot().projects.length, before.projects.length + 1);
+});
+
 test('task snapshots retain related evidence within the unchanged frame bound', async (t) => {
   const socketRoot = mkdtempSync(
     join(realpathSync(checkOwner()?.stateRoot ?? tmpdir()), 'ck-snap-'),

@@ -20,6 +20,7 @@ import {
   unavailableNativeProfile,
   unavailableRepositoryProfile,
 } from '../apps/controller/src/providers/openai/profile.ts';
+import { CommandReceipts } from '../apps/desktop/src/main/receipts.ts';
 import { encodeFrame, FrameDecoder } from '../packages/client/src/index.ts';
 import {
   type ControllerClient,
@@ -2395,6 +2396,23 @@ async function taskActivityHistory(
   const at = '2026-10-18T00:00:00.000Z';
   const id = createTestIds(at, 1000n);
   const fixture = createDemoFixtures(at);
+  const invalidProject = join(home, 'invalid-project-choice');
+  const validProject = join(home, 'recovery-project');
+  mkdirSync(invalidProject);
+  mkdirSync(validProject);
+  git(validProject, ['init', '--quiet']);
+  const legacyRegistration = CommandSchema.parse({
+    protocol: 1,
+    key: createCommandKey(),
+    actor: { id: 'desktop', kind: 'desktop' },
+    command: 'RegisterProject',
+    expectedRevision: 0,
+    payload: { path: invalidProject },
+  });
+  const retainedRegistration = new CommandReceipts(home, home);
+  retainedRegistration.retain(legacyRegistration, true);
+  const registrationRequests: Command[] = [];
+
   const task = { ...fixture.task, id: id('tsk'), title: 'Read retained task activity' };
   const other = { ...task, id: id('tsk'), title: 'Inspect a different history' };
   const empty = { ...task, id: id('tsk'), title: 'Inspect an empty history' };
@@ -2436,6 +2454,7 @@ async function taskActivityHistory(
     const execute = runtime.controller.execute.bind(runtime.controller);
     runtime.controller.execute = async (input, principal) => {
       const command = CommandSchema.parse(input);
+      if (command.command === 'RegisterProject') registrationRequests.push(command);
       if (command.command === 'GetSnapshot')
         assert(
           'taskId' in command.payload,
@@ -2459,6 +2478,7 @@ async function taskActivityHistory(
     };
   };
   instrument();
+  const controllerReceipt = () => runtime.controller.store.receipt(legacyRegistration.key);
   const append = (taskId: string | null, text: string) =>
     runtime.controller.store.transaction(() =>
       runtime.controller.store.append({
@@ -2631,6 +2651,28 @@ async function taskActivityHistory(
     );
     await page.reload();
     await expect(page.getByText('Controller connected', { exact: true })).toBeVisible();
+    const retryRegistration = page.getByRole('button', {
+      name: 'Retry exact command',
+      exact: true,
+    });
+    await expect(retryRegistration).toBeVisible();
+    await page.reload();
+    await expect(retryRegistration).toBeVisible();
+    assert.equal(controllerReceipt(), undefined);
+    await page.getByRole('button', { name: 'Add project', exact: true }).click();
+    await expect(page.getByRole('alert')).toContainText(
+      'Resolve the pending desktop command first.',
+    );
+    await page.getByRole('button', { name: 'Dismiss error', exact: true }).click();
+    await retryRegistration.click();
+    await expect(page.getByRole('alert')).toContainText('Choose a readable Git repository root.');
+    await expect(retryRegistration).toHaveCount(0);
+    assert.deepEqual(registrationRequests, [legacyRegistration]);
+    assert.equal(controllerReceipt()?.result.outcome, 'blocked');
+    retainedRegistration.load();
+    assert.deepEqual(retainedRegistration.commands, []);
+    await page.getByRole('button', { name: 'Dismiss error', exact: true }).click();
+
     await expect(page.getByRole('button', { name: task.title, exact: true })).toBeVisible();
     await expect(page.getByRole('heading', { name: task.title, exact: true })).toBeVisible();
     await expect(page.locator('.project-group .count')).toHaveText(String(retainedTasks.length));
@@ -2650,6 +2692,31 @@ async function taskActivityHistory(
     console.log(
       `Retained workspace: ${retainedTasks.length} tasks, legacy snapshot ${legacyBytes} bytes; desktop last-task selection and CLI pages complete.`,
     );
+    const pickProjectFolder = async (path: string) => {
+      await application.evaluate(({ dialog }, filePath) => {
+        const original = dialog.showOpenDialog;
+        dialog.showOpenDialog = async () => {
+          dialog.showOpenDialog = original;
+          return { canceled: false, filePaths: [filePath] };
+        };
+      }, path);
+      await page.getByRole('button', { name: 'Add project', exact: true }).click();
+    };
+    await pickProjectFolder(invalidProject);
+    await expect(page.getByRole('alert')).toContainText('Choose a readable Git repository root.');
+    await expect(
+      page.getByRole('button', { name: 'Retry exact command', exact: true }),
+    ).toHaveCount(0);
+    await page.getByRole('button', { name: 'Dismiss error', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Add project', exact: true })).toBeEnabled();
+    await pickProjectFolder(validProject);
+    await expect(
+      page.locator('.project-name').filter({ hasText: 'recovery-project' }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole('button', { name: 'Retry exact command', exact: true }),
+    ).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Add project', exact: true })).toBeEnabled();
     await openTask(task.title);
     await expect(
       activity.getByText(marker(359), { exact: true }),
