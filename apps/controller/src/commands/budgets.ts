@@ -36,12 +36,32 @@ export function remainingBudgets(run: Run, intents: LaunchIntent[]) {
   };
 }
 
+export function chargedIntegrationMinutes(
+  group: Pick<
+    CombinedGroup,
+    'integration_milliseconds' | 'integration_active' | 'integration_maximum_minutes' | 'phase'
+  >,
+) {
+  return group.integration_active || group.phase === 'unknown'
+    ? group.integration_maximum_minutes
+    : Math.ceil(group.integration_milliseconds / 60000);
+}
+
+export function unspentIntegrationMinutes(
+  group: Pick<CombinedGroup, 'integration_milliseconds' | 'integration_maximum_minutes'>,
+) {
+  return Math.max(
+    0,
+    group.integration_maximum_minutes - Math.ceil(group.integration_milliseconds / 60000),
+  );
+}
+
 /** Reserved stages share one ledger, even while two child writers are active. */
 export function remainingCombinedBudgets(
   owner: Run,
   intents: LaunchIntent[],
   dispatches: CombinedDispatch[],
-  group: Pick<CombinedGroup, 'integration_milliseconds' | 'integration_active'>,
+  group: Parameters<typeof chargedIntegrationMinutes>[0],
   ignoredAttemptIds: ReadonlySet<string> = new Set(),
 ) {
   const allIds = dispatches.flatMap((slot) => (slot.attempt_id ? [slot.attempt_id] : []));
@@ -54,14 +74,11 @@ export function remainingCombinedBudgets(
   )
     throw Error('The combined budget has an incomplete dispatch ledger.');
   const ledger = intents.filter((intent) => ids.includes(intent.attempt_id));
-  const minutes = ledger.reduce(
-    (sum, intent) => {
-      const slot = dispatches.find((value) => value.attempt_id === intent.attempt_id);
-      if (!slot) throw Error('The combined dispatch has no reserved allowance.');
-      return sum + chargedMinutes(intent, slot.maximum_minutes);
-    },
-    group.integration_active ? 1 : Math.ceil(group.integration_milliseconds / 60000),
-  );
+  const minutes = ledger.reduce((sum, intent) => {
+    const slot = dispatches.find((value) => value.attempt_id === intent.attempt_id);
+    if (!slot) throw Error('The combined dispatch has no reserved allowance.');
+    return sum + chargedMinutes(intent, slot.maximum_minutes);
+  }, chargedIntegrationMinutes(group));
   return {
     attempts: Math.max(0, owner.policy.policy.limits.attempts - ledger.length),
     minutes: Math.max(0, owner.policy.policy.limits.minutes - minutes),

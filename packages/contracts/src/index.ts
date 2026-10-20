@@ -1356,6 +1356,7 @@ export const PrepareCombinedRunPayloadSchema = z
     taskId: TaskIdSchema,
     policy: PolicySchema,
     children: z.tuple([combinedMemberPreparation, combinedMemberPreparation]),
+    integration: z.strictObject({ maximumMinutes: LimitsSchema.shape.minutes }).optional(),
     checks: z.strictObject({
       recipeId: z.literal('project-node-tests-v1'),
       testFiles: ProjectNodeTestFilesSchema,
@@ -1377,7 +1378,11 @@ export const PrepareCombinedRunPayloadSchema = z
     const replays = plan.checks.replayTestFiles.flat();
     const methods = plan.policy.methods;
     const minimumMinutes =
-      5 + first.maximumMinutes + second.maximumMinutes + plan.reviewer.maximumMinutes;
+      4 +
+      (plan.integration?.maximumMinutes ?? 1) +
+      first.maximumMinutes +
+      second.maximumMinutes +
+      plan.reviewer.maximumMinutes;
     if (
       first.taskId === second.taskId ||
       [first.taskId, second.taskId].includes(plan.taskId) ||

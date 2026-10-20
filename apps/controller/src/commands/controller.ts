@@ -297,7 +297,13 @@ import {
   Store,
 } from '../store/index.ts';
 import { availableAllowance, deriveWindow } from '../usage/index.ts';
-import { chargedMinutes, remainingBudgets, remainingCombinedBudgets } from './budgets.ts';
+import {
+  chargedIntegrationMinutes,
+  chargedMinutes,
+  remainingBudgets,
+  remainingCombinedBudgets,
+  unspentIntegrationMinutes,
+} from './budgets.ts';
 
 // A repository writer leaves this long for the verify check and review that follow it.
 const evaluationFloorMinutes = 11;
@@ -3757,11 +3763,7 @@ export class Controller {
         }
         return sum + chargedMinutes(intent, reserved);
       },
-      combined?.task_id === taskId
-        ? combined.integration_active
-          ? 1
-          : Math.ceil(combined.integration_milliseconds / 60000)
-        : 0,
+      combined?.task_id === taskId ? chargedIntegrationMinutes(combined) : 0,
     );
     return {
       attempts: Math.max(0, config.limits.attempts - ledger.length),
@@ -4928,6 +4930,8 @@ export class Controller {
     )
       throw Error('Combined admission is closed.');
     const manifest = this.combinedManifest(current);
+    if (current.integration_maximum_minutes !== (manifest.input.integration?.maximumMinutes ?? 1))
+      throw Error('The combined integration allowance changed.');
     const task = this.store.get<Task>('task', current.task_id);
     if (
       !task ||
@@ -5140,7 +5144,8 @@ export class Controller {
       allowance &&
       (allowance.attempts < 7 ||
         allowance.minutes <
-          5 +
+          4 +
+            (input.integration?.maximumMinutes ?? 1) +
             input.children[0].maximumMinutes +
             input.children[1].maximumMinutes +
             input.reviewer.maximumMinutes ||
@@ -5292,9 +5297,16 @@ export class Controller {
     const artifact = this.nativeArtifact(manifest);
     this.store.db
       .prepare(
-        "INSERT INTO combined_groups(run_id,task_id,preparation_id,manifest_hash,phase,integration_ref) VALUES (?,?,?,?,'prepared',?)",
+        "INSERT INTO combined_groups(run_id,task_id,preparation_id,manifest_hash,phase,integration_ref,integration_maximum_minutes) VALUES (?,?,?,?,'prepared',?,?)",
       )
-      .run(run.id, task.id, artifact.id, artifact.hash, `refs/crewkite/integration/${run.id}`);
+      .run(
+        run.id,
+        task.id,
+        artifact.id,
+        artifact.hash,
+        `refs/crewkite/integration/${run.id}`,
+        input.integration?.maximumMinutes ?? 1,
+      );
     for (const [ordinal, member] of members.entries())
       this.store.db
         .prepare(
@@ -5456,7 +5468,10 @@ export class Controller {
       )
         throw Error('The integration check changed.');
     }
-    const available = 60000 - current.integration_milliseconds;
+    const available = Math.min(
+      60000,
+      current.integration_maximum_minutes * 60000 - current.integration_milliseconds,
+    );
     if (available <= 100) throw Error('The integration allowance is exhausted.');
     const directory = join(this.home, 'integration', group.run_id);
     mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -5572,7 +5587,7 @@ export class Controller {
         );
       this.store.db
         .prepare(
-          'UPDATE combined_groups SET integration_milliseconds=MIN(60000,integration_milliseconds+?),integration_active=?,integration_finished_at=? WHERE run_id=?',
+          'UPDATE combined_groups SET integration_milliseconds=MIN(integration_maximum_minutes*60000,integration_milliseconds+?),integration_active=?,integration_finished_at=? WHERE run_id=?',
         )
         .run(elapsed, result.quiescent ? 0 : 1, result.quiescent ? this.now() : null, group.run_id);
       if (state === 'unknown') this.updateCombined(group, 'unknown', 'ownership-unknown');
@@ -5809,7 +5824,7 @@ export class Controller {
       remaining.minutes <
         pending.reduce(
           (sum, slot) => sum + slot.maximum_minutes,
-          group.integration_milliseconds === 0 ? 1 : 0,
+          unspentIntegrationMinutes(group),
         ) ||
       remaining.concurrency < 1
     )
@@ -15647,6 +15662,9 @@ export class Controller {
           });
       }
       for (const group of this.store.combinedGroups()) {
+        const manifest = this.combinedManifest(group);
+        if (group.integration_maximum_minutes !== (manifest.input.integration?.maximumMinutes ?? 1))
+          throw Error('The saved combined integration allowance changed.');
         const journals = this.store.combinedRefIntents(group.run_id);
         const unresolved = journals.some((row) => {
           const journal = CombinedRefJournalSchema.parse(JSON.parse(row.body));
@@ -15666,13 +15684,17 @@ export class Controller {
           this.updateCombined(group, 'unknown', 'ownership-unknown');
         } else if (group.integration_active) {
           const pending = journals.find((row) => row.state === 'prepared');
-          const elapsed = pending ? Date.parse(this.now()) - Date.parse(pending.intent_at) : 60000;
+          const elapsed = pending
+            ? Date.parse(this.now()) - Date.parse(pending.intent_at)
+            : group.integration_maximum_minutes * 60000;
           this.store.db
             .prepare(
-              'UPDATE combined_groups SET integration_active=0,integration_milliseconds=MIN(60000,integration_milliseconds+?) WHERE run_id=?',
+              'UPDATE combined_groups SET integration_active=0,integration_milliseconds=MIN(integration_maximum_minutes*60000,integration_milliseconds+?) WHERE run_id=?',
             )
             .run(
-              Number.isFinite(elapsed) && elapsed >= 0 ? Math.ceil(elapsed) : 60000,
+              Number.isFinite(elapsed) && elapsed >= 0
+                ? Math.ceil(elapsed)
+                : group.integration_maximum_minutes * 60000,
               group.run_id,
             );
           if (pending?.expected_new && ['assembling', 'blocked'].includes(group.phase))

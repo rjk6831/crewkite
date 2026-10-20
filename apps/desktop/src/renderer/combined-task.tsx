@@ -336,6 +336,7 @@ export function CombinedTask({
   const [authority, setAuthority] = useState<'guided' | 'balanced'>('guided');
   const [attempts, setAttempts] = useState('7');
   const [minutes, setMinutes] = useState('20');
+  const [integrationMinutes, setIntegrationMinutes] = useState('1');
   const [concurrency, setConcurrency] = useState('2');
   const [reviewerId, setReviewerId] = useState('');
   const [reviewerMinutes, setReviewerMinutes] = useState('5');
@@ -388,6 +389,7 @@ export function CombinedTask({
     authority,
     attempts,
     minutes,
+    integrationMinutes,
     concurrency,
     reviewerId,
     reviewerMinutes,
@@ -443,6 +445,7 @@ export function CombinedTask({
       consent: 'explicit',
       maximumMinutes: Number(child.maximumMinutes),
     })),
+    integration: { maximumMinutes: Number(integrationMinutes) },
     checks: {
       recipeId: 'project-node-tests-v1',
       testFiles: paths(fullTests),
@@ -973,7 +976,8 @@ export function CombinedTask({
                   <input
                     type="number"
                     min={
-                      5 +
+                      4 +
+                      Number(integrationMinutes) +
                       Number(children[0].maximumMinutes) +
                       Number(children[1].maximumMinutes) +
                       Number(reviewerMinutes)
@@ -983,6 +987,18 @@ export function CombinedTask({
                     disabled={busy}
                     value={minutes}
                     onChange={(event) => setMinutes(event.target.value)}
+                  />
+                </label>
+                <label>
+                  Integration minutes
+                  <input
+                    type="number"
+                    min="1"
+                    max="1440"
+                    step="1"
+                    disabled={busy}
+                    value={integrationMinutes}
+                    onChange={(event) => setIntegrationMinutes(event.target.value)}
                   />
                 </label>
                 <label>

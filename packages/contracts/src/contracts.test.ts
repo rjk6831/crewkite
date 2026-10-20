@@ -116,6 +116,41 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     },
   };
   assert.deepEqual(CommandSchema.parse(combined), combined);
+  for (const maximumMinutes of [1, 3, 6, 1433]) {
+    const explicit = {
+      ...combined,
+      payload: {
+        ...combined.payload,
+        integration: { maximumMinutes },
+        policy: {
+          ...combinedPolicy,
+          limits: { ...combinedPolicy.limits, minutes: 7 + maximumMinutes },
+        },
+      },
+    };
+    assert.deepEqual(CommandSchema.parse(explicit), explicit);
+    assert.equal(
+      CommandSchema.safeParse({
+        ...explicit,
+        payload: {
+          ...explicit.payload,
+          policy: {
+            ...explicit.payload.policy,
+            limits: { ...explicit.payload.policy.limits, minutes: 6 + maximumMinutes },
+          },
+        },
+      }).success,
+      false,
+    );
+  }
+  for (const maximumMinutes of [0, 1.5, 1441])
+    assert.equal(
+      CommandSchema.safeParse({
+        ...combined,
+        payload: { ...combined.payload, integration: { maximumMinutes } },
+      }).success,
+      false,
+    );
   const compactWriter = {
     ...combined,
     payload: {

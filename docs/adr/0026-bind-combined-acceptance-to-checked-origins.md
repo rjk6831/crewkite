@@ -9,7 +9,7 @@ Two edits can pass their own tests and fail when combined. Identical candidate b
 
 ## Decision
 
-I propose one frozen parent with exactly two child tasks from the same committed base. Each child owns one distinct existing text file in independent scratch. The parent reserves seven dispatches for the baseline, two writers, two replay checks, full final check and one review, plus finite private integration time. Earlier planning remains charged, and child task limits stay additional gates.
+I propose one frozen parent with exactly two child tasks from the same committed base. Each child owns one distinct existing text file in independent scratch. The parent reserves seven dispatches for the baseline, two writers, two replay checks, full final check and one review, plus an explicit private integration minute allowance within the parent limit. Omitting the allowance keeps the original one minute; existing preparations retain their frozen value. Earlier planning remains charged, and child task limits stay additional gates.
 
 I replay the exact substantive deltas in order. Each cumulative candidate must pass its declared checks before a compare-and-swap advances a private integration ref. The origin binds source, policy, criteria, both writer attempts and candidates, check definitions and results, and the exact old/new tree chain. Intermediate integration touches no source branch.
 

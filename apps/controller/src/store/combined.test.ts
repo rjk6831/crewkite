@@ -1,18 +1,26 @@
 import assert from 'node:assert/strict';
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import {
   ArtifactSchema,
   type CommandResult,
+  type Run,
   type Task,
   TaskConversationStateSchema,
   TaskSchema,
 } from '@crewkite/contracts';
+import {
+  chargedIntegrationMinutes,
+  remainingCombinedBudgets,
+  unspentIntegrationMinutes,
+} from '../commands/budgets.ts';
 import { refValue } from '../host/publication.ts';
 import { git } from '../host/source.ts';
 import { groupAbsent } from '../host/worker.ts';
 import { binding, nativeSetup } from './controller-fixture.ts';
+import { type CombinedGroup, Store } from './index.ts';
 
 test('combined tasks share seven real dispatches and require a separate full barrier', async (t) => {
   const scenarioQueues = [
@@ -186,8 +194,8 @@ test('combined tasks share seven real dispatches and require a separate full bar
       const policy = {
         ...context.appointment.policy,
         authority: quotaScenario ? 'balanced' : 'guided',
-        limits: { attempts: 7, minutes: 20, concurrency: 2 },
-        unknownUsage: { rule: 'fixed-allowance', allowance: { launches: 7, minutes: 20 } },
+        limits: { attempts: 7, minutes: 22, concurrency: 2 },
+        unknownUsage: { rule: 'fixed-allowance', allowance: { launches: 7, minutes: 22 } },
         effects: children.map((child) => ({
           taskId: child.id,
           action: 'write-scratch',
@@ -223,6 +231,7 @@ test('combined tasks share seven real dispatches and require a separate full bar
           consent: 'explicit',
           maximumMinutes: 5,
         })),
+        ...(scenario === 'empty-journal' ? {} : { integration: { maximumMinutes: 3 } }),
         checks: {
           recipeId: 'project-node-tests-v1',
           testFiles: ['a.test.mjs', 'b.test.mjs', 'interaction.test.mjs'],
@@ -260,7 +269,10 @@ test('combined tasks share seven real dispatches and require a separate full bar
             : minutes.reduce((sum, value) => sum + value)) *
             60_000 +
           (stage === 'baseline' || stage === 'assembly'
-            ? Math.max(0, 60_000 - group.integration_milliseconds)
+            ? Math.max(
+                0,
+                group.integration_maximum_minutes * 60_000 - group.integration_milliseconds,
+              )
             : 0) +
           // The three-file runner can pause this process while sibling fixtures own the host.
           60_000
@@ -332,6 +344,125 @@ test('combined tasks share seven real dispatches and require a separate full bar
       assert.equal(prepared.outcome, 'applied', JSON.stringify(prepared));
       const preview = phase();
       assert(preview);
+      const group = controller.store.combinedGroup(preview.runId);
+      assert(group);
+      assert.equal(group.integration_maximum_minutes, input.integration?.maximumMinutes ?? 1);
+      if (scenario === 'passed') {
+        const owner = controller.store.get<Run>('run', preview.runId);
+        assert(owner);
+        for (const [maximum, elapsed, active, unknown, charged, unspent] of [
+          [1, 0, 0, false, 0, 1],
+          [1, 1, 1, false, 1, 0],
+          [3, 0, 0, false, 0, 3],
+          [3, 1, 0, false, 1, 2],
+          [3, 60001, 0, false, 2, 1],
+          [3, 180000, 0, false, 3, 0],
+          [3, 60001, 1, false, 3, 1],
+          [3, 1, 0, true, 3, 2],
+        ] as const) {
+          const sample: CombinedGroup = {
+            ...group,
+            integration_maximum_minutes: maximum,
+            integration_milliseconds: elapsed,
+            integration_active: active,
+            phase: unknown ? ('unknown' as const) : group.phase,
+          };
+          assert.equal(chargedIntegrationMinutes(sample), charged);
+          assert.equal(unspentIntegrationMinutes(sample), unspent);
+          assert.equal(
+            remainingCombinedBudgets(owner, [], [], sample).minutes,
+            owner.policy.policy.limits.minutes - charged,
+          );
+        }
+      }
+      if (scenario === 'empty-journal') {
+        const migrations = new URL('../../migrations/', import.meta.url);
+        const oldMigrations = join(context.directory, 'legacy-migrations');
+        mkdirSync(oldMigrations);
+        for (const file of readdirSync(migrations).filter((file) => file < '013'))
+          writeFileSync(join(oldMigrations, file), readFileSync(new URL(file, migrations)));
+        const legacy = new Store(join(context.directory, 'legacy.sqlite'));
+        try {
+          legacy.applyMigrations(oldMigrations);
+          const tables = [
+            'entities',
+            'combined_groups',
+            'combined_members',
+            'combined_dispatches',
+            'combined_ref_intents',
+          ];
+          for (const table of tables)
+            for (const row of controller.store.db.prepare(`SELECT * FROM ${table}`).all()) {
+              if (table === 'combined_groups') delete row.integration_maximum_minutes;
+              const columns = Object.keys(row);
+              legacy.db
+                .prepare(
+                  `INSERT INTO ${table} (${columns.join(',')}) VALUES (${columns.map(() => '?').join(',')})`,
+                )
+                .run(...Object.values(row));
+            }
+          legacy.db
+            .prepare(
+              'UPDATE combined_groups SET integration_milliseconds=42000,integration_active=1',
+            )
+            .run();
+          legacy.db
+            .prepare(
+              "INSERT INTO combined_ref_intents(parent_run_id,generation,operation,state,body,intent_at,finished_at) VALUES (?,0,'legacy-checkpoint','applied',?,?,?)",
+            )
+            .run(
+              preview.runId,
+              JSON.stringify({ phases: [] }),
+              context.clock.now(),
+              context.clock.now(),
+            );
+          assert.equal(legacy.db.prepare('SELECT COUNT(*) AS n FROM combined_members').get()?.n, 2);
+          assert.equal(
+            legacy.db.prepare('SELECT COUNT(*) AS n FROM combined_dispatches').get()?.n,
+            7,
+          );
+          assert.equal(
+            legacy.db.prepare('SELECT COUNT(*) AS n FROM combined_ref_intents').get()?.n,
+            1,
+          );
+          const before = tables.map((table) => legacy.db.prepare(`SELECT * FROM ${table}`).all());
+          const foreignKeys = tables.map((table) =>
+            legacy.db.prepare(`PRAGMA foreign_key_list(${table})`).all(),
+          );
+          legacy.applyMigrations(fileURLToPath(migrations));
+          for (const [index, table] of tables.entries()) {
+            assert.deepEqual(
+              legacy.db.prepare(`SELECT * FROM ${table}`).all(),
+              table === 'combined_groups'
+                ? before[index].map((row) =>
+                    Object.assign(Object.create(Object.getPrototypeOf(row)), row, {
+                      integration_maximum_minutes: 1,
+                    }),
+                  )
+                : before[index],
+            );
+            assert.deepEqual(
+              legacy.db.prepare(`PRAGMA foreign_key_list(${table})`).all(),
+              foreignKeys[index],
+            );
+          }
+          assert.equal(legacy.db.prepare('PRAGMA user_version').get()?.user_version, 13);
+          assert.deepEqual(legacy.db.prepare('PRAGMA foreign_key_check').all(), []);
+          assert.throws(() =>
+            legacy.db.prepare('UPDATE combined_groups SET integration_milliseconds=60001').run(),
+          );
+          legacy.db
+            .prepare(
+              'UPDATE combined_groups SET integration_maximum_minutes=3,integration_milliseconds=60001',
+            )
+            .run();
+          assert.throws(() =>
+            legacy.db.prepare('UPDATE combined_groups SET integration_maximum_minutes=1').run(),
+          );
+        } finally {
+          legacy.close();
+        }
+      }
       for (const task of [parent, ...children]) {
         const scoped = controller.snapshot({ taskId: task.id });
         assert.deepEqual(
@@ -839,7 +970,13 @@ test('combined tasks share seven real dispatches and require a separate full bar
         );
         controller.store.db.exec('DROP TRIGGER interrupt_combined_receipt');
         const attempts = controller.store.intents().length;
+        context.clock.advance(61000);
         controller = await context.restart();
+        const recovered = controller.store.combinedGroup(preview.runId);
+        assert(recovered);
+        assert.equal(recovered.integration_maximum_minutes, 3);
+        assert(recovered.integration_milliseconds >= 61000);
+        assert(recovered.integration_milliseconds < 180000);
         assert.equal(phase()?.phase, 'assembling');
         assert.equal(controller.store.intents().length, attempts);
         assert.equal(
@@ -869,6 +1006,8 @@ test('combined tasks share seven real dispatches and require a separate full bar
         JSON.stringify({
           capturedAt: new Date().toISOString(),
           integration: {
+            maximumMinutes: controller.store.combinedGroup(preview.runId)
+              ?.integration_maximum_minutes,
             milliseconds: controller.store.combinedGroup(preview.runId)?.integration_milliseconds,
             journals: controller.store.combinedRefIntents(preview.runId).map((row) => ({
               operation: row.operation,

@@ -78,6 +78,7 @@ export type CombinedGroup = {
   integration_finished_at: string | null;
   integration_milliseconds: number;
   integration_active: number;
+  integration_maximum_minutes: number;
 };
 export type CombinedMember = {
   parent_run_id: string;

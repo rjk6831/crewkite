@@ -403,6 +403,7 @@ Prepare a parent and two existing draft tasks from the same project. Save the co
     { "taskId": "tsk_01ARZ3NDEKTSV4RRFFQ69G5FAW", "expectedRevision": 0, "scope": ["price.mjs"], "writer": { "profileId": "openai-file-v1", "creditPolicy": "ordinary" }, "consent": "explicit", "maximumMinutes": 2 },
     { "taskId": "tsk_01ARZ3NDEKTSV4RRFFQ69G5FAX", "expectedRevision": 0, "scope": ["invoice.mjs"], "writer": { "profileId": "openai-file-v1", "creditPolicy": "ordinary" }, "consent": "explicit", "maximumMinutes": 2 }
   ],
+  "integration": { "maximumMinutes": 3 },
   "checks": {
     "recipeId": "project-node-tests-v1",
     "testFiles": ["price.test.mjs", "invoice.test.mjs", "interaction.test.mjs"],
@@ -416,7 +417,7 @@ Prepare a parent and two existing draft tasks from the same project. Save the co
 }
 ```
 
-Replace the IDs, child revisions, project name, paths and grant expiry with current values. Both targets must be distinct existing committed text files outside the protected checks. The full test collection must contain both replay collections and the separate interaction tests. Paths are literal. The controller freezes the common source and validates every selected check. The CLI adds no grants or consent. Other finite writer selections retain their own billing attestations and observed configuration requirements; unavailable profiles remain unavailable.
+Replace the IDs, child revisions, project name, paths and grant expiry with current values. Both targets must be distinct existing committed text files outside the protected checks. The full test collection must contain both replay collections and the separate interaction tests. Paths are literal. The controller freezes the common source and validates every selected check. The optional `integration.maximumMinutes` reserves private Git time within the total policy minutes; omitting it retains one minute. The total must cover both writer maxima, the reviewer maximum, four one-minute checks and integration. Each Git operation stays within sixty seconds and the remaining integration allowance. The CLI adds no grants or consent. Other finite writer selections retain their own billing attestations and observed configuration requirements; unavailable profiles remain unavailable.
 
 ```sh
 pnpm crewkite combined prepare <parent-task-id> --plan combined-plan.json --json
