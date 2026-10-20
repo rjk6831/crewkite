@@ -50,6 +50,10 @@ type Exit = { code: number | null; signal: NodeJS.Signals | null; quiescent: boo
 const maximumCommandChunkBytes = 64 * 1024;
 const commandEnvironmentNames = new Set([
   'CI',
+  'GH_CONFIG_DIR',
+  'GH_HOST',
+  'GH_PAGER',
+  'GH_PROMPT_DISABLED',
   'HOME',
   'LANG',
   'LC_ALL',
@@ -57,6 +61,7 @@ const commandEnvironmentNames = new Set([
   'PATH',
   'TMPDIR',
   'TZ',
+  'XDG_CONFIG_HOME',
 ]);
 const commandShellNames = new Set([
   'bash',
@@ -73,6 +78,7 @@ const commandShellNames = new Set([
 export type OwnedCommandLaunch = Readonly<{
   operationId: string;
   executable: string;
+  executableIdentity: 'verified-prelaunch-sha256';
   executableSha256: string;
   argv: readonly string[];
   cwd: string;
@@ -130,6 +136,8 @@ export function verifyOwnedCommandExecutable(executable: string, sha256: string)
       if (count === 0) break;
       hash.update(buffer.subarray(0, count));
       bytes += BigInt(count);
+      if (bytes > before.size || bytes > 256n * 1024n * 1024n)
+        throw Error('Command executable identity changed.');
     }
     const after = fstatSync(descriptor, { bigint: true });
     if (
@@ -148,6 +156,7 @@ export function verifyOwnedCommandExecutable(executable: string, sha256: string)
 function validateCommandLaunch(launch: OwnedCommandLaunch) {
   if (
     !/^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,199}$/.test(launch.operationId) ||
+    launch.executableIdentity !== 'verified-prelaunch-sha256' ||
     launch.shell !== false ||
     !Array.isArray(launch.argv) ||
     launch.argv.length > 128
@@ -210,12 +219,12 @@ export type StreamingCommandOptions = Readonly<{
   streaming: true;
   operationId: string;
   executable: string;
+  executableIdentity: 'verified-prelaunch-sha256';
   executableSha256: string;
   argv: readonly string[];
   directory: string;
   environment: Readonly<Record<string, string>>;
   lifecycle: OwnedCommandLifecycle;
-  onSpawn?: (pid: number) => void;
 }>;
 export class OwnedWorker {
   readonly child: ChildProcessWithoutNullStreams;
@@ -356,19 +365,26 @@ export class OwnedCommand {
   readonly stderrStream?: AsyncIterable<Uint8Array>;
   readonly group: number;
   failed = false;
+  ownershipUnknown = false;
   private bytes = 0;
-  private quiescenceError?: unknown;
+  private closedObserved = false;
   private quiescenceRecorded = false;
   private readonly lifecycle?: OwnedCommandLifecycle;
+  private ownsGroup = false;
+  private readonly streaming: boolean;
+  private stopEscalation?: () => void;
+  private stopRequested = false;
   constructor(options: BufferedCommandOptions | StreamingCommandOptions) {
     if (process.platform === 'win32')
       throw new Error('Process ownership evidence requires a Unix process group.');
     const streaming = options.streaming === true;
+    this.streaming = streaming;
     let launch: OwnedCommandLaunch | undefined;
     if (streaming) {
       launch = Object.freeze({
         operationId: options.operationId,
         executable: options.executable,
+        executableIdentity: options.executableIdentity,
         executableSha256: options.executableSha256,
         argv: Object.freeze([...options.argv]),
         cwd: options.directory,
@@ -377,6 +393,8 @@ export class OwnedCommand {
       });
       validateCommandLaunch(launch);
       synchronous(() => options.lifecycle.intent(launch as OwnedCommandLaunch));
+      // This is an observable prelaunch pin, matching the existing toolchain boundary.
+      // A same-user adversary that swaps the path around exec is outside this claim.
       commandDirectory(launch.cwd);
       verifyOwnedCommandExecutable(launch.executable, launch.executableSha256);
       this.lifecycle = options.lifecycle;
@@ -405,6 +423,7 @@ export class OwnedCommand {
       });
     }
     this.group = this.child.pid ?? 0;
+    this.ownsGroup = streaming && this.group > 0;
     this.exited = new Promise((resolve) => {
       this.child.once('exit', (code, signal) =>
         resolve({ code, signal, quiescent: this.group > 0 && groupAbsent(this.group) }),
@@ -414,7 +433,12 @@ export class OwnedCommand {
         resolve({ code: null, signal: null, quiescent: this.group === 0 });
       });
     });
-    this.closed = new Promise((resolve) => this.child.once('close', () => resolve()));
+    this.closed = new Promise((resolve) =>
+      this.child.once('close', () => {
+        this.closedObserved = true;
+        resolve();
+      }),
+    );
     if (streaming) {
       this.stdoutStream = streamChunks(this.child.stdout, () => {
         this.failed = true;
@@ -434,37 +458,58 @@ export class OwnedCommand {
           this[channel].push(chunk);
         });
     }
-    if (this.group)
-      try {
-        if (streaming) synchronous(() => options.lifecycle.owned(this.group));
-        if (streaming) synchronous(() => options.onSpawn?.(this.group));
-        else options.onSpawn(this.group);
-      } catch (error) {
+    if (this.group) {
+      if (streaming)
         try {
-          process.kill(-this.group, 'SIGKILL');
-        } catch {}
-        throw error;
-      }
+          // Persist the fresh group before any post-spawn validation can block or fail.
+          synchronous(() => options.lifecycle.owned(this.group));
+          // Revalidation detects ordinary path or working-directory drift around spawn.
+          // It does not claim exact executed-image proof against an atomic swap-and-restore.
+          if (!launch) throw Error('Command launch is unavailable.');
+          commandDirectory(launch.cwd);
+          verifyOwnedCommandExecutable(launch.executable, launch.executableSha256);
+        } catch {
+          // Keep the only fresh child handle so output, close and group absence remain observable.
+          this.failed = true;
+          this.ownershipUnknown = true;
+          this.signalOwnedGroup('SIGKILL');
+        }
+      else options.onSpawn(this.group);
+    }
     this.child.stdin.end();
   }
   async quiescent(schedule: Schedule = defaultSchedule): Promise<boolean> {
-    if (this.quiescenceError) throw this.quiescenceError;
     if (!(await closedWithin(this.closed, schedule))) return false;
     // A descendant can outlive the leader and finish before the streams close.
     const quiescent = this.group === 0 ? this.failed : groupAbsent(this.group);
-    if (quiescent && this.group > 0 && this.lifecycle && !this.quiescenceRecorded) {
-      this.quiescenceRecorded = true;
-      try {
-        synchronous(() => this.lifecycle?.quiescent(this.group));
-      } catch (error) {
-        this.failed = true;
-        this.quiescenceError = error;
-        throw error;
-      }
+    if (quiescent && this.streaming) {
+      this.ownsGroup = false;
+      this.stopEscalation?.();
+      this.stopEscalation = undefined;
     }
+    const lifecycle = this.lifecycle;
+    if (quiescent && this.group > 0 && lifecycle && !this.quiescenceRecorded)
+      try {
+        synchronous(() => lifecycle.quiescent(this.group));
+        this.quiescenceRecorded = true;
+      } catch {
+        this.failed = true;
+        this.ownershipUnknown = true;
+        return false;
+      }
     return quiescent;
   }
   stop() {
+    if (this.streaming) {
+      if (this.stopRequested) return;
+      this.stopRequested = true;
+      if (!this.signalOwnedGroup('SIGTERM')) return;
+      this.stopEscalation = defaultSchedule(() => {
+        this.stopEscalation = undefined;
+        this.signalOwnedGroup('SIGKILL');
+      }, 1000);
+      return;
+    }
     if (
       !Number.isSafeInteger(this.group) ||
       this.group <= 0 ||
@@ -476,6 +521,29 @@ export class OwnedCommand {
       process.kill(-this.group, 'SIGTERM');
     } catch {
       this.failed = true;
+    }
+  }
+  private signalOwnedGroup(signal: NodeJS.Signals): boolean {
+    if (!this.ownsGroup || !Number.isSafeInteger(this.group) || this.group <= 0) return false;
+    if (groupAbsent(this.group)) {
+      this.ownsGroup = false;
+      this.stopEscalation?.();
+      this.stopEscalation = undefined;
+      return false;
+    }
+    // Open child pipes keep the fresh in-memory ownership current after leader exit.
+    // Once close is observed, a numeric group alone is historical and is never signaled.
+    if (this.closedObserved) return false;
+    try {
+      process.kill(-this.group, signal);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ESRCH') {
+        this.ownsGroup = false;
+        this.stopEscalation?.();
+        this.stopEscalation = undefined;
+      } else this.failed = true;
+      return false;
     }
   }
 }

@@ -50,6 +50,7 @@ test('owned commands stream bounded output and keep cancellation owned through c
     streaming: true,
     operationId: 'cmd_stream_success',
     executable,
+    executableIdentity: 'verified-prelaunch-sha256',
     executableSha256,
     argv: [
       '-e',
@@ -77,31 +78,71 @@ test('owned commands stream bounded output and keep cancellation owned through c
 
   const cancelledEvents: string[] = [];
   const ready = Promise.withResolvers<void>();
+  const stubborn = "process.on('SIGTERM',()=>{});process.send('ready');setInterval(()=>{},1000);";
+  const descendant = `const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e',${JSON.stringify(stubborn)}],{stdio:['ignore','inherit','inherit','ipc']});child.once('message',()=>process.stdout.write('ready',()=>process.exit(0)));`;
   const cancelled = new OwnedCommand({
     streaming: true,
     operationId: 'cmd_stream_cancel',
     executable,
+    executableIdentity: 'verified-prelaunch-sha256',
     executableSha256,
-    argv: ['-e', "process.stdout.write('ready');setInterval(()=>{},1000);"],
+    argv: ['-e', descendant],
     directory,
     environment: { HOME: directory, LANG: 'C' },
     lifecycle: ownership(cancelledEvents),
   });
+  let readyText = '';
   const cancelledOutput = Promise.all([
-    collect(cancelled.stdoutStream, () => ready.resolve()),
+    collect(cancelled.stdoutStream, (chunk) => {
+      readyText += Buffer.from(chunk).toString('utf8');
+      if (readyText.includes('ready')) ready.resolve();
+    }),
     collect(cancelled.stderrStream),
   ]);
   await ready.promise;
+  const leaderExit = await cancelled.exited;
+  assert.equal(leaderExit.code, 0);
+  assert.equal(leaderExit.signal, null);
   cancelled.stop();
-  const cancelledExit = await cancelled.exited;
   const [beforeStop, cancelledError] = await cancelledOutput;
   await cancelled.closed;
-  assert.equal(cancelledExit.code, null);
-  assert.equal(cancelledExit.signal, 'SIGTERM');
   assert.equal(beforeStop.toString('utf8'), 'ready');
   assert.equal(cancelledError.byteLength, 0);
   assert.equal(await cancelled.quiescent(), true);
   assert.deepEqual(cancelledEvents, ['intent', 'owned', 'quiescent']);
+
+  const unknownEvents: string[] = [];
+  const ownershipFailure = new OwnedCommand({
+    streaming: true,
+    operationId: 'cmd_stream_owned_failure',
+    executable,
+    executableIdentity: 'verified-prelaunch-sha256',
+    executableSha256,
+    argv: ['-e', 'setInterval(()=>{},1000);'],
+    directory,
+    environment: { HOME: directory, LANG: 'C' },
+    lifecycle: {
+      intent() {
+        unknownEvents.push('intent');
+      },
+      owned() {
+        unknownEvents.push('owned');
+        throw Error('journal unavailable');
+      },
+      quiescent() {
+        unknownEvents.push('quiescent');
+      },
+    },
+  });
+  await Promise.all([
+    collect(ownershipFailure.stdoutStream),
+    collect(ownershipFailure.stderrStream),
+    ownershipFailure.exited,
+    ownershipFailure.closed,
+  ]);
+  assert.equal(await ownershipFailure.quiescent(), true);
+  assert.equal(ownershipFailure.ownershipUnknown, true);
+  assert.deepEqual(unknownEvents, ['intent', 'owned', 'quiescent']);
 
   assert.throws(
     () =>
@@ -109,6 +150,7 @@ test('owned commands stream bounded output and keep cancellation owned through c
         streaming: true,
         operationId: 'cmd_stream_changed_identity',
         executable,
+        executableIdentity: 'verified-prelaunch-sha256',
         executableSha256: '0'.repeat(64),
         argv: ['--version'],
         directory,

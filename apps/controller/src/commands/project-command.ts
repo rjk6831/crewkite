@@ -50,6 +50,7 @@ export type ProjectCommandDefinition = Readonly<{
   scratchRoot: string;
   cwd: string;
   executable: string;
+  executableIdentity: 'verified-prelaunch-sha256';
   executableSha256: string;
   argv: readonly string[];
   environment: Readonly<Record<string, string>>;
@@ -67,6 +68,7 @@ export type OwnedProjectCommandRequest = Readonly<{
   argv: readonly string[];
   cwd: string;
   environment: Readonly<Record<string, string>>;
+  executableIdentity: 'verified-prelaunch-sha256';
   shell: false;
 }>;
 export type OwnedProjectCommandTerminal = Readonly<{
@@ -171,6 +173,8 @@ function hashExecutable(path: string): string {
       if (count === 0) break;
       hash.update(buffer.subarray(0, count));
       bytes += BigInt(count);
+      if (bytes > before.size || bytes > 256n * 1024n * 1024n)
+        throw Error('Project command executable changed while reading.');
     }
     const after = fstatSync(descriptor, { bigint: true });
     if (
@@ -199,6 +203,7 @@ export function validateProjectCommandDefinition(value: unknown): ProjectCommand
       'scratchRoot',
       'cwd',
       'executable',
+      'executableIdentity',
       'executableSha256',
       'argv',
       'environment',
@@ -230,6 +235,8 @@ export function validateProjectCommandDefinition(value: unknown): ProjectCommand
     throw Error('Project command working directory must stay inside scratch.');
 
   boundedText(command.executable, 'Project command executable', 4096);
+  if (command.executableIdentity !== 'verified-prelaunch-sha256')
+    throw Error('Project command executable identity policy is invalid.');
   if (!isAbsolute(command.executable) || resolve(command.executable) !== command.executable)
     throw Error('Project command executable must be absolute.');
   const executable = lstatSync(command.executable);
@@ -316,6 +323,7 @@ export function startProjectCommand(
   const request: OwnedProjectCommandRequest = {
     operationId: command.operationId,
     executable: command.executable,
+    executableIdentity: command.executableIdentity,
     executableSha256: command.executableSha256,
     argv: [...command.argv],
     cwd: command.cwd,

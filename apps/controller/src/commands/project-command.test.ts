@@ -49,6 +49,7 @@ function fixture(t: test.TestContext) {
     scratchRoot,
     cwd,
     executable,
+    executableIdentity: 'verified-prelaunch-sha256',
     executableSha256,
     argv: ['--run', 'tests/unit.test.ts'],
     environment: { HOME: join(root, 'home'), LANG: 'C', PATH: join(root, 'bin') },
@@ -213,6 +214,7 @@ test('project commands retain streamed output and classify success, failure and 
     );
     assert.equal(stops, row.stop ? 1 : 0, row.name);
     assert.equal(request?.shell, false);
+    assert.equal(request?.executableIdentity, 'verified-prelaunch-sha256');
     assert.equal(request?.executableSha256, definition.executableSha256);
   }
 
