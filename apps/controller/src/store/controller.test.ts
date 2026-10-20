@@ -414,6 +414,14 @@ test('task snapshots retain related evidence within the unchanged frame bound', 
   });
   try {
     const workspace = await client.workspaceState();
+    assert.deepEqual(workspace.nativeConnections, header.nativeConnections);
+    assert.equal(workspace.nativeConnections[0]?.state, 'unchecked');
+    assert.deepEqual(workspace.googleAcpInstall, header.googleAcpInstall);
+    assert.equal(workspace.googleAcpInstall?.state, 'idle');
+    assert.deepEqual(
+      workspace.usageReaders.map((reader) => reader.id),
+      ['google-usage-v1', 'openai-usage-v1'],
+    );
     const projectStatus = await client.projectPage({
       stamp: workspace.stamp,
       projectId: selected.projectId,
@@ -441,6 +449,9 @@ test('task snapshots retain related evidence within the unchanged frame bound', 
         new Set(snapshot.artifacts.map((artifact) => artifact.id)),
         new Set([records[0].artifact.id, records[0].log.id]),
       );
+      assert.deepEqual(snapshot.nativeConnections, workspace.nativeConnections);
+      assert.deepEqual(snapshot.googleAcpInstall, workspace.googleAcpInstall);
+      assert.deepEqual(snapshot.usageReaders, workspace.usageReaders);
       assert.deepEqual(snapshot.routes, before.routes);
       assert.deepEqual(snapshot.usage, before.usage);
       const message = {

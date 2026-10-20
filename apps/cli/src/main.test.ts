@@ -23,6 +23,8 @@ test('CLI lists traverse empty pages and preserve incomplete output', async (con
     usageReaders: [],
     nativeProfiles: [],
     googleAcpSetup: null,
+    googleAcpInstall: null,
+    nativeConnections: [],
   };
   const task = {
     id: 'tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV',
