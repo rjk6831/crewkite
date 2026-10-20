@@ -2974,6 +2974,32 @@ function Usage({
   workspace: Workspace;
 }) {
   const [readerMessage, setReaderMessage] = useState<string | null>(null);
+  const [metadataBusy, setMetadataBusy] = useState<Record<string, boolean>>({});
+  const anthropicConnection = snapshot.nativeConnections.find(
+    (value) => value.family === 'anthropic',
+  );
+  async function checkAnthropic() {
+    setMetadataBusy((current) => ({ ...current, anthropic: true }));
+    setReaderMessage('Checking Anthropic sign-in.');
+    try {
+      const result = await workspace.metadataCommand({
+        command: 'CheckNativeConnection',
+        expectedRevision: 0,
+        payload: { family: 'anthropic', consent: 'explicit' },
+      });
+      setReaderMessage(
+        result.outcome === 'applied' || result.outcome === 'already-applied'
+          ? 'Anthropic sign-in check completed.'
+          : [result.reason ?? result.outcome, result.next].filter(Boolean).join('. '),
+      );
+    } catch (failure) {
+      setReaderMessage(
+        failure instanceof Error ? failure.message : 'Anthropic sign-in could not be checked.',
+      );
+    } finally {
+      setMetadataBusy((current) => ({ ...current, anthropic: false }));
+    }
+  }
   const [displayTime, setDisplayTime] = useState(Date.now);
   const fixture = workspace.preview;
   useEffect(() => {
@@ -2985,20 +3011,23 @@ function Usage({
   const clients = nativeUsageClients(snapshot);
   const connected = workspace.connection === 'connected' && !workspace.preview;
   async function observeUsage(family: 'google' | 'openai') {
+    setMetadataBusy((current) => ({ ...current, [family]: true }));
     setReaderMessage('Quota read in progress.');
     try {
-      const result = await workspace.command({
+      const result = await workspace.metadataCommand({
         command: 'ObserveUsage',
         expectedRevision: 0,
         payload: { family },
       });
       setReaderMessage(
         result.outcome === 'applied' || result.outcome === 'already-applied'
-          ? 'Quota read completed.'
+          ? 'Quota read successful.'
           : [result.reason ?? result.outcome, result.next].filter(Boolean).join('. '),
       );
     } catch (failure) {
       setReaderMessage(failure instanceof Error ? failure.message : 'The quota command failed.');
+    } finally {
+      setMetadataBusy((current) => ({ ...current, [family]: false }));
     }
   }
   const fixtureTime = Math.max(
@@ -3071,10 +3100,47 @@ function Usage({
                   <p className="muted small">No native profile is registered.</p>
                 )}
                 {family === 'anthropic' ? (
-                  <p className="muted small">
-                    Standalone quota refresh is unavailable. Usage stays unknown until an explicitly
-                    started task reports it. No prompt is sent to obtain quota.
-                  </p>
+                  <>
+                    <p role="status">
+                      {anthropicConnection?.state === 'signed-in'
+                        ? 'Signed in with Claude account'
+                        : anthropicConnection?.state === 'signed-out'
+                          ? 'Signed out'
+                          : `Sign-in ${anthropicConnection?.state ?? 'unchecked'}`}
+                    </p>
+                    <button
+                      type="button"
+                      className="button secondary"
+                      disabled={
+                        !connected ||
+                        !profiles.some((profile) => profile.available) ||
+                        metadataBusy.anthropic ||
+                        anthropicConnection?.state === 'checking'
+                      }
+                      onClick={() => void checkAnthropic()}
+                    >
+                      Check Anthropic sign-in
+                    </button>
+                    <p className="muted small">
+                      {anthropicConnection?.next ??
+                        'Check the existing native client sign-in. No model prompt is sent.'}
+                    </p>
+                    {anthropicConnection?.state === 'signed-out' && (
+                      <p className="muted small">
+                        Run claude auth login in the native terminal, then check again.
+                      </p>
+                    )}
+                    {anthropicConnection?.observedAt && (
+                      <p className="muted small">
+                        Last checked: {anthropicConnection.observedAt}. Billing and task
+                        qualification remain unknown.
+                      </p>
+                    )}
+                    <p className="muted small">
+                      Standalone quota refresh is unavailable. Usage stays unknown until an
+                      explicitly started task reports it. No prompt is sent to obtain quota.
+                    </p>
+                  </>
                 ) : family === 'local' ? (
                   <p className="muted small">
                     Local resource capacity has no subscription quota reader.
@@ -3089,7 +3155,7 @@ function Usage({
                       className="button secondary"
                       disabled={
                         !connected ||
-                        workspace.pending ||
+                        metadataBusy[family] ||
                         !reader?.available ||
                         reader.readState === 'intent' ||
                         reader.readState === 'owned'
@@ -3098,6 +3164,11 @@ function Usage({
                     >
                       <RefreshCw size={14} /> Refresh {label} quota
                     </button>
+                    {family === 'openai' &&
+                      reader?.readState === 'quiescent' &&
+                      reader.readReason === 'observed' && (
+                        <p role="status">Latest quota read successful.</p>
+                      )}
                     <p className="muted small">
                       Reader status: {reader?.reason ?? 'unavailable'}. Last attempt:{' '}
                       {reader?.lastAttemptAt ?? 'None'}. Last observation:{' '}

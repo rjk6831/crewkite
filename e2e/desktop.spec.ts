@@ -29,6 +29,7 @@ import {
   readControllerEndpoint,
 } from '../packages/client/src/node.ts';
 import {
+  AnthropicNativeProfileSchema,
   CONVERSATION_CONTEXT_MEDIA_TYPE,
   type Command,
   type CommandResult,
@@ -61,7 +62,7 @@ const environment = (home: string) => ({
   ...checkEnvironment(),
   PATH: process.env.PATH ?? '',
   LANG: 'en_US.UTF-8',
-  ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
+  HOME: home,
   ...(process.env.CODEX_HOME ? { CODEX_HOME: process.env.CODEX_HOME } : {}),
   CREWKITE_HOME: home,
   CREWKITE_FIXTURE_IDENTITY: '1',
@@ -443,6 +444,7 @@ async function quotaReadBridge(
       },
     ],
   });
+  let failNextSnapshot = false;
   let conversationState: TaskConversationState | null = null;
   const pending: Array<{ command: Command; socket: Socket }> = [];
   const sockets = new Set<Socket>();
@@ -468,7 +470,14 @@ async function quotaReadBridge(
         if (message.type !== 'command') continue;
         const request = { command: message.command, socket };
         const workspace = workspaceRead(snapshot, message.command);
-        if (workspace) reply(request, workspace);
+        if (
+          failNextSnapshot &&
+          (message.command.command === 'GetWorkspaceState' ||
+            message.command.command === 'GetSnapshot')
+        ) {
+          failNextSnapshot = false;
+          reply(request, { outcome: 'blocked', reason: 'fixture-refresh-failed' });
+        } else if (workspace) reply(request, workspace);
         else if (message.command.command === 'GetSnapshot')
           reply(request, { outcome: 'applied', data: { kind: 'snapshot', snapshot } });
         else if (message.command.command === 'Subscribe') reply(request, { outcome: 'applied' });
@@ -544,7 +553,7 @@ async function quotaReadBridge(
     await restoreRenderer();
     await expect(page.getByText('Controller connected', { exact: true })).toBeVisible();
     await page.getByRole('button', { name: 'Usage and capacity', exact: true }).click();
-    const panel = page.getByRole('region', { name: 'Google quota', exact: true });
+    const panel = page.getByRole('region', { name: 'Google client status', exact: true });
     const refresh = panel.getByRole('button', { name: 'Refresh Google quota', exact: true });
     await expect(panel.getByRole('checkbox')).toHaveCount(0);
     await expect(refresh).toBeDisabled();
@@ -561,7 +570,9 @@ async function quotaReadBridge(
     assert.equal(read.command.command, 'ObserveUsage');
     assert.deepEqual(read.command.payload, { family: 'google' });
     await expect(refresh).toBeDisabled();
-    await expect(panel.getByRole('status')).toContainText('Quota read in progress');
+    await expect(
+      page.getByRole('status').filter({ hasText: /Quota|fixture-uncertain|usage-reader-cooldown/ }),
+    ).toContainText('Quota read in progress');
     const rejectCommand = (input: unknown) =>
       page.evaluate(async (value) => {
         try {
@@ -576,25 +587,43 @@ async function quotaReadBridge(
       expectedRevision: 0,
       payload: { family: 'google' },
     };
-    assert.match(await rejectCommand(refreshCommand), /pending desktop command/u);
     for (const consent of [true, false])
       assert.match(
         await rejectCommand({ ...refreshCommand, payload: { family: 'google', consent } }),
         /Unrecognized key/u,
       );
-    assert.match(
-      await rejectCommand({ command: 'GetHealth', payload: {} }),
-      /pending desktop command/u,
+    const health = page.evaluate(() =>
+      window.crewkite?.command({ command: 'GetHealth', payload: {} }),
     );
+    const healthRequest = await next();
+    assert.equal(healthRequest.command.command, 'GetHealth');
+    reply(healthRequest, { outcome: 'applied' });
+    await health;
+    await application.evaluate(({ dialog }) => {
+      dialog.showOpenDialog = async () => ({ canceled: true, filePaths: [] });
+    });
+    await page.getByRole('button', { name: 'Add project', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Add project', exact: true })).toBeEnabled();
     reply(read, { outcome: 'outcome-unknown', reason: 'fixture-uncertain' });
-    await expect(panel.getByRole('status')).toContainText('fixture-uncertain');
-    assert.match(await rejectCommand(refreshCommand), /exact retry/u);
-    const retryRead = page.evaluate(() => window.crewkite?.retryCommand?.());
+    await expect(page.getByRole('status').filter({ hasText: 'fixture-uncertain' })).toBeVisible();
+    await expect(
+      page.getByRole('button', { name: 'Retry exact command', exact: true }),
+    ).toHaveCount(0);
+    await expect(refresh).toBeEnabled();
+    await refresh.click();
     const repeatedRead = await next();
-    assert.deepEqual(repeatedRead.command, read.command);
+    assert.notEqual(repeatedRead.command.key, read.command.key);
     snapshot.usageReaders[0].lastAttemptAt = new Date().toISOString();
+    failNextSnapshot = true;
     reply(repeatedRead, { outcome: 'applied', data: { kind: 'usage', windows: [] } });
-    assert.equal((await retryRead)?.outcome, 'applied');
+    await expect(
+      page.getByRole('status').filter({ hasText: 'Quota read successful' }),
+    ).toBeVisible();
+    await expect(page.getByText(/Workspace refresh failed:/u)).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Add project', exact: true })).toBeEnabled();
+    await expect(
+      page.getByRole('button', { name: 'Retry exact command', exact: true }),
+    ).toHaveCount(0);
     await page.reload();
     await page.getByRole('button', { name: 'Usage and capacity', exact: true }).click();
     await expect(panel).toContainText('Cooldown until');
@@ -605,7 +634,59 @@ async function quotaReadBridge(
       reason: 'usage-reader-cooldown',
       next: 'Wait until the next read is allowed.',
     });
-    await expect(panel.getByRole('status')).toContainText('usage-reader-cooldown');
+    await expect(
+      page.getByRole('status').filter({ hasText: /Quota|fixture-uncertain|usage-reader-cooldown/ }),
+    ).toContainText('usage-reader-cooldown');
+    snapshot.nativeProfiles.push(
+      AnthropicNativeProfileSchema.parse({
+        ...unavailableNativeProfile().facts,
+        id: 'anthropic-file-v1',
+        family: 'anthropic',
+        model: 'claude-sonnet-5-5',
+        effort: 'medium',
+        effectiveEffort: 'unknown',
+        accountClass: 'unknown',
+        serviceTier: 'unknown',
+        billingBasis: 'requires-user-attestation',
+        qualifiedAt: null,
+        creditPolicies: ['ordinary'],
+        available: true,
+        reason: 'qualification-pending',
+      }),
+    );
+    await page.reload();
+    await page.getByRole('button', { name: 'Usage and capacity', exact: true }).click();
+    const anthropicPanel = page.getByRole('region', {
+      name: 'Anthropic client status',
+      exact: true,
+    });
+    await anthropicPanel
+      .getByRole('button', { name: 'Check Anthropic sign-in', exact: true })
+      .click();
+    const authCheck = await next();
+    assert.equal(authCheck.command.command, 'CheckNativeConnection');
+    assert.deepEqual(authCheck.command.payload, { family: 'anthropic', consent: 'explicit' });
+    await expect(page.getByRole('button', { name: 'Add project', exact: true })).toBeEnabled();
+    snapshot.nativeConnections = [
+      {
+        family: 'anthropic',
+        profileId: 'anthropic-file-v1',
+        state: 'signed-in',
+        authMethod: 'claude.ai',
+        observedAt: new Date().toISOString(),
+        reason: null,
+        next: 'Sign-in observed. Billing and task qualification remain unknown.',
+        billing: 'unknown',
+        qualified: false,
+        quota: 'unknown',
+      },
+    ];
+    reply(authCheck, { outcome: 'applied' });
+    await expect(anthropicPanel).toContainText('Signed in with Claude account');
+    await expect(anthropicPanel).toContainText('Billing and task qualification remain unknown');
+    await expect(
+      page.getByRole('button', { name: 'Retry exact command', exact: true }),
+    ).toHaveCount(0);
     await page.getByRole('button', { name: 'Initialize Google ACP', exact: true }).click();
     const setupRead = await next();
     assert.equal(setupRead.command.command, 'InitializeGoogleAcp');
@@ -732,6 +813,11 @@ async function quotaReadBridge(
     SnapshotSchema.parse(snapshot);
     {
       await page.reload();
+      await page.getByRole('button', { name: 'Usage and capacity', exact: true }).click();
+      await refresh.click();
+      const heldMetadata = await next();
+      assert.equal(heldMetadata.command.command, 'ObserveUsage');
+      await page.getByRole('button', { name: preparedTask.title, exact: true }).click();
       await page.getByRole('button', { name: 'Review prepared proposal', exact: true }).click();
       const proposal = page.getByRole('dialog', {
         name: 'Review the native proposal',
@@ -767,7 +853,14 @@ async function quotaReadBridge(
       assert.equal(cancelled.command.expectedRevision, preparedTask.revision);
       assert.deepEqual(cancelled.command.payload, stop.payload);
       await expect(stopButton).toBeDisabled();
-      assert.match(await rejectCommand(refreshCommand), /pending desktop command/u);
+      const independentMetadata = page.evaluate(
+        (value) => window.crewkite?.command(value),
+        refreshCommand as never,
+      );
+      const duringStop = await next();
+      assert.equal(duringStop.command.command, 'ObserveUsage');
+      reply(duringStop, { outcome: 'blocked', reason: 'usage-reader-cooldown' });
+      assert.equal((await independentMetadata)?.outcome, 'blocked');
       reply(cancelled, { outcome: 'outcome-unknown', reason: 'fixture-stop-unknown' });
       // Cancellation completion cannot release the original Start command's busy owner.
       await expect(page.getByRole('alert')).toContainText('fixture-stop-unknown');
@@ -783,6 +876,10 @@ async function quotaReadBridge(
       assert.deepEqual(repeatedStop.command, cancelled.command);
       reply(repeatedStop, { outcome: 'applied' });
       assert.equal((await retryStop)?.outcome, 'applied');
+      reply(heldMetadata, { outcome: 'blocked', reason: 'fixture-metadata-failed' });
+      await expect(
+        page.getByRole('button', { name: 'Retry exact command', exact: true }),
+      ).toHaveCount(0);
     }
     const capacity = await application.evaluate(
       (_electron, options) => {
@@ -3942,6 +4039,18 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     await taskActivityHistory(application, page);
     await quotaReadBridge(application, page);
     await conversationBridge(application, page);
+    const isolatedUsage = new DatabaseSync(join(home, 'state.sqlite'), { readOnly: true });
+    try {
+      assert.equal(
+        isolatedUsage
+          .prepare("SELECT COUNT(*) AS n FROM receipts WHERE command_key='usage-reader:openai'")
+          .get()?.n,
+        0,
+        'Scripted desktop checks must not start the real native account metadata reader.',
+      );
+    } finally {
+      isolatedUsage.close();
+    }
     console.log(`Connected journey home: ${home}`);
   } finally {
     observer?.close();

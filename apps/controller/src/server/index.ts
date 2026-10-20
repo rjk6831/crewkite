@@ -172,8 +172,10 @@ export async function serve(
                   return;
                 }
                 if (
-                  command.command === 'PrepareCandidateEvaluation' &&
-                  command.payload.checkRecipeId === 'crewkite-verify-v1'
+                  command.command === 'ObserveUsage' ||
+                  command.command === 'CheckNativeConnection' ||
+                  (command.command === 'PrepareCandidateEvaluation' &&
+                    command.payload.checkRecipeId === 'crewkite-verify-v1')
                 ) {
                   detached = true;
                   void respond(command)

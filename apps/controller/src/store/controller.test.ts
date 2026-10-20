@@ -487,6 +487,84 @@ test('task snapshots retain related evidence within the unchanged frame bound', 
   }
 });
 
+test('held metadata leaves stop replies reachable on the same authenticated socket', async (t) => {
+  const socketRoot = mkdtempSync(
+    join(realpathSync(checkOwner()?.stateRoot ?? tmpdir()), 'ck-meta-'),
+  );
+  const { controller, command, draft, fixtures } = await setup(t, {
+    home: join(socketRoot, 'home'),
+  });
+  t.after(() => rmSync(socketRoot, { recursive: true, force: true }));
+  for (const [kind, payload] of [
+    ['ObserveUsage', { family: 'google' }],
+    ['CheckNativeConnection', { family: 'anthropic', consent: 'explicit' }],
+  ] as const) {
+    const task = TaskSchema.parse(
+      (await controller.execute(command('CreateTask', draft.payload, 0), 'local-owner')).entity,
+    );
+    const run = RunSchema.parse(
+      (
+        await controller.execute(
+          command(
+            'PrepareRun',
+            {
+              taskId: task.id,
+              policy: { ...fixtures.policy, quality: 'quick', methods: [], effects: [] },
+              roles: quickRoles(fixtures),
+            },
+            task.revision,
+          ),
+          'local-owner',
+        )
+      ).entity,
+    );
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const execute = controller.execute.bind(controller);
+    controller.execute = async (input, principal) => {
+      const parsed = CommandSchema.parse(input);
+      if (parsed.command === kind) {
+        entered.resolve();
+        await release.promise;
+        return { outcome: 'blocked', reason: 'fixture-metadata-unavailable' };
+      }
+      return execute(input, principal);
+    };
+    const server = await serveController(controller);
+    const client = await connectController({
+      ...readControllerEndpoint(controller.home),
+      actor: { id: 'terminal', kind: 'cli' },
+    });
+    try {
+      const metadata = client.command(CommandSchema.parse(command(kind, payload, 0)));
+      await entered.promise;
+      const current = controller.store.get<Task>('task', task.id);
+      assert(current);
+      const stopped = await Promise.race([
+        client.command(
+          CommandSchema.parse(
+            command('StopRun', { taskId: task.id, runId: run.id }, current.revision),
+          ),
+        ),
+        new Promise<never>((_resolve, reject) => {
+          const timer = setTimeout(() => reject(Error('Stop waited for metadata release.')), 2000);
+          timer.unref();
+          t.after(() => clearTimeout(timer));
+        }),
+      ]);
+      assert.equal(stopped.outcome, 'applied');
+      assert.equal(controller.store.get<Task>('task', task.id)?.state, 'stopped');
+      release.resolve();
+      assert.equal((await metadata).reason, 'fixture-metadata-unavailable');
+    } finally {
+      release.resolve();
+      client.close();
+      await server.close();
+      controller.execute = execute;
+    }
+  }
+});
+
 test('reusing a command key with changed content cannot change its result', async (t) => {
   const { controller, draft } = await setup(t);
   const first = await controller.execute(draft, 'local-owner');

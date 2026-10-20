@@ -590,9 +590,28 @@ export function useWorkspace() {
       }),
     [refresh, track],
   );
+  const metadataCommand = useCallback(
+    async (
+      input: Extract<DesktopCommand, { command: 'ObserveUsage' | 'CheckNativeConnection' }>,
+    ) => {
+      if (!source) throw new Error('The desktop bridge is unavailable.');
+      const result = CommandResultSchema.parse(await source.command(input));
+      try {
+        await refresh();
+      } catch (failure) {
+        setTransportError(
+          `Workspace refresh failed: ${failure instanceof Error ? failure.message : 'reconnect to recover current state.'}`,
+        );
+      }
+      return result;
+    },
+    [source, refresh],
+  );
   const command = useCallback(
-    (input: DesktopCommand) =>
-      perform(async () => {
+    (input: DesktopCommand) => {
+      if (input.command === 'ObserveUsage' || input.command === 'CheckNativeConnection')
+        return metadataCommand(input);
+      return perform(async () => {
         if (!source) throw new Error('The desktop bridge is unavailable.');
         if (
           input.command === 'GetTaskConversationState' ||
@@ -617,8 +636,9 @@ export function useWorkspace() {
         } finally {
           setPendingRuns((current) => current.filter((value) => value.token !== token));
         }
-      }),
-    [source, perform],
+      });
+    },
+    [source, perform, metadataCommand],
   );
   const pickProject = () =>
     perform(async () => {
@@ -724,6 +744,7 @@ export function useWorkspace() {
       setError((current) => (current === expected ? null : current)),
     refresh,
     command,
+    metadataCommand,
     pickProject,
     canPickProject: !!source?.pickProject,
     pickConversationContext,

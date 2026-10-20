@@ -198,7 +198,9 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
     if (
       command.command === 'GetWorkspaceState' ||
       command.command === 'GetProjectPage' ||
-      command.command === 'GetTaskPage'
+      command.command === 'GetTaskPage' ||
+      command.command === 'ObserveUsage' ||
+      command.command === 'CheckNativeConnection'
     ) {
       if (!client) throw new Error('The controller is offline.');
       const result = CommandResultSchema.parse(await client.command(command));
