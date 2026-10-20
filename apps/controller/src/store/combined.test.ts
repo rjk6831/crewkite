@@ -332,6 +332,15 @@ test('combined tasks share seven real dispatches and require a separate full bar
       assert.equal(prepared.outcome, 'applied', JSON.stringify(prepared));
       const preview = phase();
       assert(preview);
+      for (const task of [parent, ...children]) {
+        const scoped = controller.snapshot({ taskId: task.id });
+        assert.deepEqual(
+          new Set(scoped.tasks.map((value) => value.id)),
+          new Set([parent.id, ...children.map((child) => child.id)]),
+        );
+        assert.deepEqual(scoped.combinedRuns, [preview]);
+        assert(scoped.artifacts.some((artifact) => artifact.id === preview.preparationId));
+      }
       assert.equal(controller.snapshot().attempts.length, 2);
       assert.deepEqual(
         preview.dispatches.map((dispatch) => dispatch.state),

@@ -120,6 +120,8 @@ import {
   SealedHandoffPacketSchema,
   type Snapshot,
   SnapshotSchema,
+  type SnapshotScope,
+  SnapshotScopeSchema,
   SourceSchema,
   type Task,
   type TaskConversationState,
@@ -1338,43 +1340,101 @@ export class Controller {
     });
   }
 
-  snapshot(): Snapshot {
+  snapshot(scope?: SnapshotScope): Snapshot {
+    const selection = SnapshotScopeSchema.parse(scope ?? {});
+    const scoped = 'taskId' in selection || 'approvalId' in selection;
+    const requestedTask =
+      'taskId' in selection
+        ? selection.taskId
+        : 'approvalId' in selection
+          ? this.store.get<Approval>('approval', selection.approvalId)?.taskId
+          : undefined;
+    const allTasks = this.store.list<Task>('task');
+    const taskIds = scoped
+      ? new Set(allTasks.filter((task) => task.id === requestedTask).map((task) => task.id))
+      : null;
+    const groups = this.store.combinedGroups();
+    if (taskIds) {
+      const memberships = groups.map((group) => [
+        group.task_id,
+        ...this.store.combinedMembers(group.run_id).map((member) => member.task_id),
+      ]);
+      let previousSize: number;
+      do {
+        previousSize = taskIds.size;
+        for (const members of memberships)
+          if (members.some((id) => taskIds.has(id))) for (const id of members) taskIds.add(id);
+      } while (taskIds.size !== previousSize);
+    }
+    const tasks = allTasks.filter((task) => !taskIds || taskIds.has(task.id));
+    const projectIds = new Set(tasks.map((task) => task.projectId));
+    const runs = this.store.list<Run>('run').filter((run) => !taskIds || taskIds.has(run.taskId));
+    const runIds = new Set(runs.map((run) => run.id));
+    const candidates = this.store
+      .list<Candidate>('candidate')
+      .filter((candidate) => !taskIds || taskIds.has(candidate.taskId));
+    const candidateIds = new Set(candidates.map((candidate) => candidate.id));
     const priorCache = this.projectionCache;
     this.projectionCache ??= new Map();
     try {
-      const candidateEvaluations = this.candidateEvaluations();
-      return SnapshotSchema.parse({
+      const snapshot = {
         protocol: 1,
         nativeProfiles: this.resolveProfiles().map((profile) => profile.facts),
         localSetup: this.localSetup(),
         googleAcpSetup: this.store.googleAcpSetup(),
         usageReaders: [this.googleUsageReader()],
-        nativeRuns: this.nativeRuns(),
-        candidateEvaluations,
-        combinedRuns: this.store.combinedGroups().map((group) => this.combinedPreview(group)),
+        nativeRuns: this.nativeRuns(taskIds ? runIds : undefined),
+        candidateEvaluations: this.candidateEvaluations(taskIds ?? undefined),
+        combinedRuns: groups
+          .filter((group) => !taskIds || taskIds.has(group.task_id))
+          .map((group) => this.combinedPreview(group)),
         cursor: this.store.cursor(),
-        projects: this.store.list('project'),
-        tasks: this.store.list('task'),
-        runs: this.store.list('run'),
-        attempts: this.store.list('attempt'),
+        projects: this.store
+          .list<Project>('project')
+          .filter((project) => !taskIds || projectIds.has(project.id)),
+        tasks,
+        runs,
+        attempts: this.store
+          .list<Attempt>('attempt')
+          .filter((attempt) => !taskIds || runIds.has(attempt.runId)),
         routes: this.store.list('route'),
-        approvals: this.store.list('approval'),
-        candidates: this.store.list('candidate'),
-        artifacts: this.store.list('artifact'),
+        approvals: this.store
+          .list<Approval>('approval')
+          .filter((approval) => !taskIds || taskIds.has(approval.taskId)),
+        candidates,
+        artifacts: this.store.list<Artifact>('artifact'),
         reviewJobs: this.store.db
           .prepare('SELECT body FROM review_jobs')
           .all()
-          .map((row) => JSON.parse(row.body as string)),
+          .map((row) => JSON.parse(row.body as string) as ReviewJob)
+          .filter((job) => !taskIds || taskIds.has(job.taskId)),
         evidence: this.store.db
           .prepare('SELECT body FROM evidence')
           .all()
-          .map((row) => JSON.parse(row.body as string)),
+          .map((row) => JSON.parse(row.body as string) as CheckResult)
+          .filter((check) => !taskIds || candidateIds.has(check.candidateId)),
         usage: this.store
           .list<Observation>('window')
           .map((observation) =>
             deriveWindow(observation, { nowMs: Date.parse(this.now()), maxAgeMs: 300000 }),
           ),
-      });
+      };
+      if (taskIds) {
+        const referenced = new Set<string>();
+        const collect = (value: unknown, key = '') => {
+          if (typeof value === 'string') {
+            if (['artifactId', 'preparationId', 'proofId', 'checkArtifactId'].includes(key))
+              referenced.add(value);
+          } else if (Array.isArray(value)) {
+            for (const item of value) collect(item);
+          } else if (value && typeof value === 'object') {
+            for (const [name, item] of Object.entries(value)) collect(item, name);
+          }
+        };
+        collect({ ...snapshot, artifacts: [] });
+        snapshot.artifacts = snapshot.artifacts.filter((artifact) => referenced.has(artifact.id));
+      }
+      return SnapshotSchema.parse(snapshot);
     } finally {
       this.projectionCache = priorCache;
     }
@@ -2872,7 +2932,10 @@ export class Controller {
         }
       }
       case 'GetSnapshot':
-        return { outcome: 'applied', data: { kind: 'snapshot', snapshot: this.snapshot() } };
+        return {
+          outcome: 'applied',
+          data: { kind: 'snapshot', snapshot: this.snapshot(command.payload) },
+        };
       case 'GetUsage':
         return { outcome: 'applied', data: { kind: 'usage', windows: this.snapshot().usage } };
       case 'GetHealth':
@@ -7319,8 +7382,9 @@ export class Controller {
     };
   }
 
-  private nativeRuns(): z.infer<typeof NativeRunSchema>[] {
+  private nativeRuns(runIds?: ReadonlySet<string>): z.infer<typeof NativeRunSchema>[] {
     return this.store.list<Run>('run').flatMap((run) => {
+      if (runIds && !runIds.has(run.id)) return [];
       const origin = this.store.receipt(this.currentNativePlanKey(run.id));
       if (!origin) return [];
       const prepared = this.store.receipt(`native-prepared:${run.id}`);
@@ -10600,8 +10664,9 @@ export class Controller {
     });
   }
 
-  private candidateEvaluations(): CandidateEvaluationPreview[] {
+  private candidateEvaluations(taskIds?: ReadonlySet<string>): CandidateEvaluationPreview[] {
     return this.store.list<Task>('task').flatMap((task) => {
+      if (taskIds && !taskIds.has(task.id)) return [];
       if (!task.runId) return [];
       const receipt =
         this.store.receipt(`evaluation-started:${task.runId}`) ??

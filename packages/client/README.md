@@ -19,6 +19,8 @@ const snapshot = await client.snapshot();
 const unsubscribe = await client.subscribe(snapshot.cursor, applyEvent, replaceSnapshot);
 ```
 
+`snapshot({ taskId })` reads one task and its combined parent and members, with their runs, candidates, approvals and evidence. `snapshot({ approvalId })` resolves the approval's task through the same read. The selectors are mutually exclusive. Missing IDs return an empty task projection. Global route, profile, setup and usage context remains available; artifact metadata includes only references from the projection. These reads change no authority or history, and every response keeps the 1 MiB frame limit. Calling `snapshot()` preserves the full workspace read.
+
 The endpoint uses `control.sock` and `token` under the selected home. The directory must belong to the current user with mode 0700. The token must be an independent regular file with mode 0600. The client reads no provider account state.
 
 ## Commands and connection loss

@@ -9,6 +9,7 @@ import {
   CursorSchema,
   type Event,
   type Snapshot,
+  type SnapshotScope,
   type TransportMessage,
 } from '@crewkite/contracts';
 import { type ConnectionState, encodeFrame, FrameDecoder } from './index.ts';
@@ -308,8 +309,8 @@ export class ControllerClient {
     );
   }
 
-  async snapshot(): Promise<Snapshot> {
-    const result = await this.read('GetSnapshot', {});
+  async snapshot(scope?: SnapshotScope): Promise<Snapshot> {
+    const result = await this.read('GetSnapshot', scope ?? {});
     if (
       (result.outcome !== 'applied' && result.outcome !== 'already-applied') ||
       result.data?.kind !== 'snapshot'

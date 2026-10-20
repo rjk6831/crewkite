@@ -1260,6 +1260,12 @@ const mutate = <T extends string, S extends z.ZodType>(command: T, payload: S) =
   z.strictObject({ ...mutation, command: z.literal(command), payload });
 const empty = z.strictObject({});
 const taskRef = z.strictObject({ taskId: TaskIdSchema });
+export const SnapshotScopeSchema = z.union([
+  empty,
+  taskRef,
+  z.strictObject({ approvalId: ApprovalIdSchema }),
+]);
+export type SnapshotScope = z.infer<typeof SnapshotScopeSchema>;
 const runRef = z.strictObject({ taskId: TaskIdSchema, runId: RunIdSchema });
 const evaluationFields = {
   taskId: TaskIdSchema,
@@ -2251,7 +2257,7 @@ export const CommandSchema = z.discriminatedUnion('command', [
     }),
   ),
   mutate('ExportPatch', z.strictObject({ taskId: TaskIdSchema, candidateId: CandidateIdSchema })),
-  read('GetSnapshot', empty),
+  read('GetSnapshot', SnapshotScopeSchema),
   read('GetTaskActivity', TaskActivityRequestSchema),
   read('Subscribe', z.strictObject({ after: CursorSchema })),
   read('GetChanges', taskRef),

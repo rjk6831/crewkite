@@ -637,7 +637,7 @@ export async function runCli(
           pending.data.state === 'waiting' &&
           pending.data.waitingReason === 'approval'
         ) {
-          const fresh = await connected.snapshot();
+          const fresh = await connected.snapshot({ taskId: command.payload.taskId });
           const task = fresh.tasks.find((value) => value.id === command.payload.taskId);
           const candidate = fresh.candidates.filter((value) => value.taskId === task?.id).at(-1);
           const action =
@@ -780,7 +780,13 @@ export async function runCli(
       );
       return succeeded(result) ? 0 : 2;
     }
-    const snapshot = await client.snapshot();
+    const snapshot = await client.snapshot(
+      (area === 'task' || conversation || combined) && id
+        ? action === 'approve' || action === 'deny'
+          ? { approvalId: id }
+          : { taskId: id }
+        : undefined,
+    );
     if (combined) {
       const task = requireTask(snapshot, id as string);
       const group =

@@ -1046,6 +1046,8 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
   for (const row of conversationRows) {
     conversationCommands.length = 0;
     const result = await executeConversation(['conversation', ...row.args]);
+    for (const read of conversationCommands.filter((command) => command.command === 'GetSnapshot'))
+      assert.deepEqual(read.payload, { taskId: task.id });
     if (!row.command) {
       assert.equal(result.code, 1, row.args.join(' '));
       assert(
@@ -2959,6 +2961,25 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     if (creationCase) args = creationCase.args;
     if (usageCase) args = usageCase.args;
     const result = await execute(args, scenario !== 'changes' && !creationCase?.plain);
+    for (const read of received.filter((command) => command.command === 'GetSnapshot')) {
+      const pendingAction = received
+        .slice(0, received.indexOf(read))
+        .findLast(
+          (command) => command.command === 'AcceptCandidate' || command.command === 'ExportPatch',
+        );
+      assert.deepEqual(
+        read.payload,
+        pendingAction &&
+          (pendingAction.command === 'AcceptCandidate' || pendingAction.command === 'ExportPatch')
+          ? { taskId: pendingAction.payload.taskId }
+          : args[0] === 'task' && args[2]
+            ? ['approve', 'deny'].includes(args[1])
+              ? { approvalId: args[2] }
+              : { taskId: args[2] }
+            : {},
+        scenario,
+      );
+    }
     if (acp) {
       const invalid = [
         'missing-consent',

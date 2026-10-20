@@ -24,6 +24,7 @@ import { tmpdir, userInfo } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { type TestContext, test } from 'node:test';
+import { encodeFrame, FrameDecoder, ProtocolError } from '@crewkite/client';
 import { connectController, readControllerEndpoint } from '@crewkite/client/node';
 import {
   type Approval,
@@ -39,6 +40,7 @@ import {
   canonicalJson,
   GoogleAcpProfileSchema,
   LocalNativeProfileSchema,
+  MAX_FRAME_BYTES,
   NativeRepositoryProfileSchema,
   type Observation,
   type Route,
@@ -195,6 +197,228 @@ test('an idempotent retry returns the receipt without creating another task', as
     controller.store.eventsAfter('0').filter((event) => event.type === 'task.created').length,
     1,
   );
+});
+
+test('task snapshots retain related evidence within the unchanged frame bound', async (t) => {
+  const { controller, command, draft, fixtures, id } = await setup(t, {
+    googleUsageClient: () => ({ available: false, reason: 'client-unavailable' }),
+    openAiUsageClient: () => unavailableNativeProfile(),
+  });
+  const unrelatedArtifactId = id('art');
+  const selected = TaskSchema.parse(
+    (
+      await controller.execute(
+        {
+          ...draft,
+          payload: {
+            ...(draft.payload as object),
+            criteria: [...fixtures.task.criteria, unrelatedArtifactId],
+          },
+        },
+        'local-owner',
+      )
+    ).entity,
+  );
+  const unrelated = TaskSchema.parse(
+    (
+      await controller.execute(
+        command(
+          'CreateTask',
+          {
+            projectId: selected.projectId,
+            title: 'Unrelated task',
+            outcome: 'Keep history',
+            criteria: ['Retain history'],
+          },
+          0,
+        ),
+        'local-owner',
+      )
+    ).entity,
+  );
+  const records = [];
+  for (const task of [selected, unrelated]) {
+    const run = RunSchema.parse(
+      (
+        await controller.execute(
+          command(
+            'PrepareRun',
+            {
+              taskId: task.id,
+              policy: { ...fixtures.policy, quality: 'quick', methods: [], effects: [] },
+              roles: quickRoles(fixtures),
+            },
+            task.revision,
+          ),
+          'local-owner',
+        )
+      ).entity,
+    );
+    const attempt: Attempt = {
+      id: id('att'),
+      runId: run.id,
+      routeId: run.roles[0].routeId,
+      generation: 0,
+      state: 'stopped',
+      revision: 0,
+    };
+    const artifact: Artifact = {
+      id: id('art'),
+      hash: 'a'.repeat(64),
+      bytes: 0,
+      mediaType: 'application/json',
+    };
+    const log: Artifact = { ...artifact, id: id('art'), hash: 'b'.repeat(64) };
+    const candidate: Candidate = {
+      id: id('cnd'),
+      taskId: task.id,
+      hash: 'c'.repeat(64),
+      artifactId: artifact.id,
+      revision: 0,
+    };
+    const check: CheckResult = {
+      candidateId: candidate.id,
+      candidateHash: candidate.hash,
+      definitionHash: 'd'.repeat(64),
+      evaluator: 'fixture',
+      passed: true,
+      artifactId: log.id,
+    };
+    const approval: Approval = {
+      approvalId: id('apr'),
+      taskId: task.id,
+      attemptId: attempt.id,
+      generation: 0,
+      action: 'accept-candidate',
+      target: 'refs/heads/feat/checked',
+      revision: 0,
+      requester: 'controller',
+      consequence: 'Accept the checked candidate.',
+      status: 'pending',
+    };
+    const job = {
+      taskId: task.id,
+      runId: run.id,
+      attemptId: attempt.id,
+      generation: 0,
+      routeId: attempt.routeId,
+      candidateId: candidate.id,
+      candidateHash: candidate.hash,
+      methodId: 'keep-it-simple',
+      cycle: 1,
+      limitMinutes: 1,
+      scripted: true,
+    };
+    controller.store.transaction(() => {
+      controller.store.put('attempt', attempt.id, 0, attempt);
+      controller.store.put('artifact', artifact.id, 0, artifact);
+      controller.store.put('artifact', log.id, 0, log);
+      controller.store.put('candidate', candidate.id, 0, candidate);
+      controller.store.put('approval', approval.approvalId, 0, approval);
+      controller.store.db
+        .prepare('INSERT INTO evidence VALUES (?,?,?,?,?,?)')
+        .run(
+          candidate.id,
+          'check',
+          candidate.hash,
+          check.definitionHash,
+          check.evaluator,
+          canonicalJson(check),
+        );
+      controller.store.db
+        .prepare('INSERT INTO review_jobs VALUES (?,?,?)')
+        .run(attempt.id, candidate.id, canonicalJson(job));
+    });
+    records.push({ task, run, attempt, candidate, check, approval, job, artifact, log });
+  }
+  controller.store.transaction(() => {
+    for (let index = 0; index < 5000; index++) {
+      const artifact: Artifact = {
+        id: index === 0 ? unrelatedArtifactId : id('art'),
+        hash: 'a'.repeat(64),
+        bytes: 0,
+        mediaType: 'x'.repeat(180),
+      };
+      controller.store.put('artifact', artifact.id, 0, artifact);
+    }
+  });
+  const before = controller.snapshot();
+  assert.equal(MAX_FRAME_BYTES, 1048576);
+  const globalMessage = {
+    type: 'result' as const,
+    key: id('cmd'),
+    result: { outcome: 'applied' as const, data: { kind: 'snapshot' as const, snapshot: before } },
+  };
+  assert(Buffer.byteLength(JSON.stringify(globalMessage)) > MAX_FRAME_BYTES);
+  assert.throws(() => encodeFrame(globalMessage), ProtocolError);
+  const cursor = controller.store.cursor();
+  const receipts = controller.store.db.prepare('SELECT COUNT(*) AS n FROM receipts').get()?.n;
+  const server = await serveController(controller);
+  const client = await connectController({
+    ...readControllerEndpoint(controller.home),
+    actor: { id: 'scoped-read', kind: 'cli' },
+  });
+  try {
+    for (const scope of [{ taskId: selected.id }, { approvalId: records[0].approval.approvalId }]) {
+      const snapshot = await client.snapshot(scope);
+      assert.deepEqual(
+        snapshot.tasks.map((task) => task.id),
+        [selected.id],
+      );
+      assert.deepEqual(snapshot.runs, [records[0].run]);
+      assert.deepEqual(snapshot.attempts, [records[0].attempt]);
+      assert.deepEqual(snapshot.candidates, [records[0].candidate]);
+      assert.deepEqual(snapshot.evidence, [records[0].check]);
+      assert.deepEqual(snapshot.approvals, [records[0].approval]);
+      assert.deepEqual(snapshot.reviewJobs, [records[0].job]);
+      assert.deepEqual(
+        new Set(snapshot.artifacts.map((artifact) => artifact.id)),
+        new Set([records[0].artifact.id, records[0].log.id]),
+      );
+      assert.deepEqual(snapshot.routes, before.routes);
+      assert.deepEqual(snapshot.usage, before.usage);
+      const message = {
+        ...globalMessage,
+        result: { ...globalMessage.result, data: { kind: 'snapshot' as const, snapshot } },
+      };
+      const frame = encodeFrame(message);
+      assert(frame.byteLength <= MAX_FRAME_BYTES + 4);
+      assert.deepEqual(new FrameDecoder().push(frame), [message]);
+    }
+    for (const scope of [{ taskId: id('tsk') }, { approvalId: id('apr') }]) {
+      const snapshot = await client.snapshot(scope);
+      for (const values of [
+        snapshot.tasks,
+        snapshot.runs,
+        snapshot.attempts,
+        snapshot.candidates,
+        snapshot.approvals,
+        snapshot.artifacts,
+        snapshot.evidence,
+        snapshot.reviewJobs,
+      ])
+        assert.equal(values?.length, 0);
+    }
+    assert.equal(
+      CommandSchema.safeParse(
+        command('GetSnapshot', { taskId: selected.id, approvalId: records[0].approval.approvalId }),
+      ).success,
+      false,
+    );
+    assert.equal(
+      CommandSchema.safeParse(command('GetSnapshot', { taskId: selected.id, extra: true })).success,
+      false,
+    );
+    assert.deepEqual(controller.snapshot(), before);
+    assert.equal(controller.store.cursor(), cursor);
+    assert.equal(
+      controller.store.db.prepare('SELECT COUNT(*) AS n FROM receipts').get()?.n,
+      receipts,
+    );
+  } finally {
+    client.close();
+    await server.close();
+  }
 });
 
 test('reusing a command key with changed content cannot change its result', async (t) => {
