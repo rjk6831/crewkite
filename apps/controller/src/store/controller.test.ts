@@ -8817,6 +8817,10 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       const retry = controller.execute(input, 'local-owner');
       assert.deepEqual(await first, await retry);
       assert.equal((await first).outcome, 'applied', canonicalJson(await first));
+      if (name === 'AuthenticateGoogleAcp') {
+        assert.equal(controller.store.googleAcpSetup().state, 'discovery-required');
+        assert.equal(controller.store.googleAcpSetup().auth.status, 'authenticated');
+      }
       assert.equal((await controller.execute(input, 'local-owner')).outcome, 'already-applied');
     }
     assert.equal(controller.store.googleAcpSetup().state, 'ready');

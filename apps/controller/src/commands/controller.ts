@@ -2108,7 +2108,12 @@ export class Controller {
               ? 'ready'
               : !revoked && !outcome.reason && operation === 'initialize'
                 ? 'authentication-required'
-                : 'blocked',
+                : !revoked &&
+                    !outcome.reason &&
+                    operation === 'authenticate' &&
+                    auth.status === 'authenticated'
+                  ? 'discovery-required'
+                  : 'blocked',
           operationId: known ? null : commandId,
           proofId,
           client,

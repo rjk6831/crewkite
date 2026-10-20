@@ -523,6 +523,7 @@ export const GoogleAcpSetupSchema = z
       'initializing',
       'authentication-required',
       'authenticating',
+      'discovery-required',
       'discovering',
       'ready',
       'stopping',
