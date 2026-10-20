@@ -50,7 +50,7 @@ const plan: LocalStart = {
   original: 'export const n = 1;\n',
   task: {
     title: 'Raise the fixture constant',
-    outcome: 'Change n to 2.',
+    outcome: 'Change n to 2. Read-only older baseline:\nexport const n = 0;\n',
     criteria: ['Keep the export named n.'],
   },
   tests: [
@@ -140,17 +140,21 @@ function fixture(input: LocalStart = plan) {
       const { title, outcome, criteria } = input.task;
       assert.equal(message.content.split(title).length, 2);
       const taskStart = message.content.indexOf(`Title: ${title}`);
+      const sourceStart = message.content.indexOf(
+        `----- BEGIN FILE ${input.binding.path} ${input.binding.attemptId} -----`,
+      );
       const sourceEnd = message.content.indexOf(
         `----- END FILE ${input.binding.path} ${input.binding.attemptId} -----`,
       );
+      const requirements = message.content.indexOf('Requirements:', sourceEnd);
       const outputContract = message.content.indexOf('Return one JSON object with version 1');
-      assert.ok(sourceEnd < taskStart);
-      assert.ok(taskStart < outputContract);
-      assert.ok(
-        message.content.includes(
-          `\nTitle: ${title}\nOutcome: ${outcome}\nRequirements:\n1. ${criteria[0]}\n`,
-        ),
-      );
+      assert.ok(taskStart < sourceStart);
+      assert.ok(sourceStart < sourceEnd);
+      assert.ok(sourceEnd < requirements);
+      assert.ok(requirements < outputContract);
+      assert.ok(message.content.includes(`\nTitle: ${title}\nOutcome: ${outcome}\n`));
+      assert.ok(message.content.includes(`\nRequirements:\n1. ${criteria[0]}\n`));
+      assert.ok(message.content.includes('The CURRENT target file to edit'));
       const fence = (edge: string, kind: string, path: string) =>
         `----- ${edge} ${kind} ${path} ${input.binding.attemptId} -----`;
       // Only a prompt that does not fit is rendered again, and then without the tests.

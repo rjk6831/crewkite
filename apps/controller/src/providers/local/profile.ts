@@ -340,7 +340,10 @@ export function localChat(plan: LocalStart) {
               ]),
             ]
           : []),
-        'The original file is between the BEGIN FILE and END FILE lines.',
+        `Title: ${plan.task.title}`,
+        `Outcome: ${plan.task.outcome}`,
+        '',
+        'The CURRENT target file to edit is between the BEGIN FILE and END FILE lines.',
         ...fenced('FILE', path, plan.original),
         '',
         plan.original.endsWith('\n')
@@ -349,8 +352,6 @@ export function localChat(plan: LocalStart) {
         'Every name the file uses must be defined or imported in it.',
         'The requirements are instructions. Never copy an instruction sentence into the file.',
         '',
-        `Title: ${plan.task.title}`,
-        `Outcome: ${plan.task.outcome}`,
         'Requirements:',
         ...plan.task.criteria.map((criterion, index) => `${index + 1}. ${criterion}`),
         '',
