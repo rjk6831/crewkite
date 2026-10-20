@@ -19,6 +19,7 @@ import {
   type Snapshot,
   type SourceDetails,
   type Task,
+  type TaskConversationState,
 } from '@crewkite/contracts';
 import { createDemoFixtures } from '@crewkite/testkit';
 import {
@@ -35,7 +36,7 @@ import {
   ShieldCheck,
   Users,
 } from 'lucide-react';
-import { useEffect, useId, useState } from 'react';
+import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import {
   actionName,
   CurrentCheckoutChanges,
@@ -873,8 +874,54 @@ export function NativeEvaluation({
   );
 }
 
+type AdoptedWorkerIdentity = {
+  taskId: Task['id'];
+  revision: Task['revision'];
+  runId: Task['runId'];
+  proposalId: NonNullable<TaskConversationState['adoptedProposal']>['id'];
+  proposalHash: string;
+};
+
+function adoptedWorkerIdentity(task: Task, state: TaskConversationState) {
+  const adopted = state.adoptedProposal;
+  if (
+    state.taskId !== task.id ||
+    state.revision !== task.revision ||
+    state.currentRunId !== task.runId ||
+    state.contractStatus !== 'confirmed' ||
+    !adopted ||
+    adopted.runId !== task.runId ||
+    state.proposal?.runId !== task.runId ||
+    state.proposal?.id !== adopted.id ||
+    state.proposal.hash !== adopted.hash ||
+    !state.adopt.available
+  )
+    return null;
+  return {
+    taskId: task.id,
+    revision: task.revision,
+    runId: task.runId,
+    proposalId: adopted.id,
+    proposalHash: adopted.hash,
+  } satisfies AdoptedWorkerIdentity;
+}
+
+const changedAdoption =
+  'The adopted plan changed. Review and adopt the current plan before preparing.';
+
+// Adoption changes advance the task revision. Remount to discard pending reads and consent.
 export function Launch(props: LaunchProps) {
-  return <ExecutionLaunch {...props} key={JSON.stringify(props.executionPolicySeed) ?? 'legacy'} />;
+  return (
+    <ExecutionLaunch
+      {...props}
+      key={JSON.stringify([
+        props.task.id,
+        props.task.revision,
+        props.task.runId,
+        props.executionPolicySeed,
+      ])}
+    />
+  );
 }
 
 function ExecutionLaunch(props: LaunchProps) {
@@ -894,7 +941,13 @@ function ExecutionLaunch(props: LaunchProps) {
   const demoAvailable =
     scriptedRun || props.snapshot.routes.some((route) => route.fake && route.qualified);
   const [choice, setChoice] = useState<
-    { scope: 'file' | 'repository' | 'local'; profileId: string } | 'demo' | null
+    | {
+        scope: 'file' | 'repository' | 'local';
+        profileId: string;
+        adoptedWorker?: AdoptedWorkerIdentity;
+      }
+    | 'demo'
+    | null
   >(() => {
     const current = props.snapshot.nativeRuns.find((run) => run.runId === props.task.runId);
     return current
@@ -911,6 +964,55 @@ function ExecutionLaunch(props: LaunchProps) {
         ? 'demo'
         : null;
   });
+  const [readingWorker, setReadingWorker] = useState(false);
+  const [workerMessage, setWorkerMessage] = useState<string | null>(null);
+  const active = useRef(false);
+  useLayoutEffect(() => {
+    active.current = true;
+    return () => {
+      active.current = false;
+    };
+  }, []);
+  async function chooseAdoptedWorker() {
+    if (
+      readingWorker ||
+      props.workspace.pending ||
+      props.workspace.retryAvailable ||
+      props.workspace.connection !== 'connected' ||
+      props.workspace.preview ||
+      !props.snapshot.nativeProfiles.some(
+        (profile) => profile.id === 'openai-repository-v1' && profile.available,
+      )
+    )
+      return;
+    setReadingWorker(true);
+    setWorkerMessage(null);
+    try {
+      const result = await props.workspace.command({
+        command: 'GetTaskConversationState',
+        payload: { taskId: props.task.id },
+      });
+      if (!active.current) return;
+      const identity =
+        (result.outcome === 'applied' || result.outcome === 'already-applied') &&
+        result.data?.kind === 'conversation-state'
+          ? adoptedWorkerIdentity(props.task, result.data.state)
+          : null;
+      if (!identity) {
+        setWorkerMessage(changedAdoption);
+        return;
+      }
+      setChoice({
+        scope: 'repository',
+        profileId: 'openai-repository-v1',
+        adoptedWorker: identity,
+      });
+    } catch {
+      if (active.current) setWorkerMessage(changedAdoption);
+    } finally {
+      if (active.current) setReadingWorker(false);
+    }
+  }
   if (
     seed &&
     !savedNative &&
@@ -940,10 +1042,11 @@ function ExecutionLaunch(props: LaunchProps) {
         initialAuthority={authority}
         scope={choice.scope}
         initialProfileId={choice.profileId}
+        adoptedWorker={choice.adoptedWorker}
         onBack={() => setChoice(null)}
       />
     );
-  const blocked = props.workspace.pending || props.workspace.retryAvailable;
+  const blocked = props.workspace.pending || props.workspace.retryAvailable || readingWorker;
   return (
     <Dialog title="Choose execution provider" onClose={props.onClose} wide>
       <div className="launch-content view-stack">
@@ -975,6 +1078,22 @@ function ExecutionLaunch(props: LaunchProps) {
             The provider catalog is unavailable. Refresh the saved workspace before preparing.
           </p>
         )}
+        {workerMessage && <p role="status">{workerMessage}</p>}
+        <button
+          type="button"
+          className="button secondary"
+          disabled={
+            blocked ||
+            props.workspace.connection !== 'connected' ||
+            props.workspace.preview ||
+            !props.snapshot.nativeProfiles.some(
+              (profile) => profile.id === 'openai-repository-v1' && profile.available,
+            )
+          }
+          onClick={() => void chooseAdoptedWorker()}
+        >
+          Prepare adopted repository worker
+        </button>
         {props.snapshot.nativeProfiles.map((profile) => {
           const scope =
             profile.family === 'local'
@@ -1457,14 +1576,25 @@ function NativeLaunch({
   scope,
   initialProfileId,
   initialAuthority,
+  adoptedWorker,
 }: LaunchProps & {
   onBack: () => void;
   scope: 'file' | 'repository';
   initialProfileId?: string;
   initialAuthority?: Policy['authority'];
+  adoptedWorker?: AdoptedWorkerIdentity;
 }) {
   const project = snapshot.projects.find((value) => value.id === task.projectId);
   const repository = scope === 'repository';
+  const active = useRef(false);
+  const [checkingWorker, setCheckingWorker] = useState(false);
+  const [workerInvalid, setWorkerInvalid] = useState(false);
+  useLayoutEffect(() => {
+    active.current = true;
+    return () => {
+      active.current = false;
+    };
+  }, []);
   const profiles = snapshot.nativeProfiles
     .filter((value) => value.family !== 'local')
     .filter((value) => (value.id === 'openai-repository-v1') === repository);
@@ -1562,7 +1692,8 @@ function NativeLaunch({
       policy.unknownUsage.allowance.minutes >= policy.limits.minutes);
   const capability = snapshot.nativeRuns.find((value) => value.runId === prepared?.id);
   const connected = workspace.connection === 'connected' && !workspace.preview;
-  const allowed = connected && profile?.available && !workspace.pending;
+  const allowed =
+    connected && profile?.available && !workspace.pending && !checkingWorker && !workerInvalid;
   const supportedAuthority = !google || policy.authority !== 'autopilot';
   const validConsent = savedConsent || (nativeTrust && sourceConsent);
   const validTools = !repository || savedConsent || nativeTools;
@@ -1662,6 +1793,10 @@ function NativeLaunch({
         } as Partial<Record<Snapshot['nativeProfiles'][number]['reason'], string>>
       )[profile.reason] ?? 'The controller has no supported native profile.')
     : 'The controller has no supported native profile.';
+  function leavePreparation(next: () => void) {
+    active.current = false;
+    next();
+  }
   async function prepareNative() {
     if (
       !supportedAuthority ||
@@ -1677,6 +1812,24 @@ function NativeLaunch({
     )
       return;
     try {
+      if (adoptedWorker) {
+        setCheckingWorker(true);
+        const result = await workspace.command({
+          command: 'GetTaskConversationState',
+          payload: { taskId: task.id },
+        });
+        if (!active.current) return;
+        const identity =
+          (result.outcome === 'applied' || result.outcome === 'already-applied') &&
+          result.data?.kind === 'conversation-state'
+            ? adoptedWorkerIdentity(task, result.data.state)
+            : null;
+        if (!identity || JSON.stringify(identity) !== JSON.stringify(adoptedWorker)) {
+          setWorkerInvalid(true);
+          setMessage(changedAdoption);
+          return;
+        }
+      }
       const expiresAt = new Date(Date.now() + 86400000).toISOString();
       const writeIndex = policy.effects.findIndex(
         (grant) =>
@@ -1767,9 +1920,12 @@ function NativeLaunch({
             'The target, native consent or saved policy is unavailable. Review the proposal again.',
         );
     } catch {
+      if (adoptedWorker) setWorkerInvalid(true);
       setMessage(
         'Preparation could not be confirmed. Check the connection and retained task before retrying.',
       );
+    } finally {
+      if (active.current) setCheckingWorker(false);
     }
   }
   return (
@@ -1782,10 +1938,10 @@ function NativeLaunch({
             : 'Native file proposal'
       }
       eyebrow={repository ? 'COMMITTED REPOSITORY' : 'ONE EXISTING COMMITTED FILE'}
-      onClose={onClose}
+      onClose={() => leavePreparation(onClose)}
       wide
     >
-      <div className="launch-content view-stack">
+      <fieldset className="launch-content view-stack" disabled={checkingWorker}>
         {message && (
           <p className="notice" role="status">
             {message}
@@ -2441,13 +2597,21 @@ function NativeLaunch({
             The saved consent expired. Edit the proposal and review its permissions.
           </p>
         )}
-      </div>
+      </fieldset>
       <div className="dialog-footer">
-        <button type="button" className="button secondary" onClick={onClose}>
+        <button
+          type="button"
+          className="button secondary"
+          onClick={() => leavePreparation(onClose)}
+        >
           Cancel
         </button>
         {!prepared && (
-          <button type="button" className="button secondary" onClick={onBack}>
+          <button
+            type="button"
+            className="button secondary"
+            onClick={() => leavePreparation(onBack)}
+          >
             Provider choices
           </button>
         )}
