@@ -188,7 +188,15 @@ export function buildLocalInputHelper(checkout, build, dependencies = {}) {
   return {
     path: output,
     identity: { sha256: digest(bytes), sourceHash, target, minOS },
-    compiler: { sha256: compilerHash, sdkSettingsHash, sdk, args },
+    compiler: {
+      sha256: compilerHash,
+      sdkSettingsHash,
+      sdk,
+      pathsRelativeTo: 'build-source',
+      args: args.map((value) =>
+        value === source || value === output ? relative(checkout, value) : value,
+      ),
+    },
   };
 }
 
@@ -415,6 +423,11 @@ export async function packageDesktop() {
     `${launcherRoot}test -f "$root/app/runtime/${controllerEntry}" || { echo 'The packaged controller entry is unavailable.' >&2; exit 1; }\nexport CREWKITE_HOME="$root/state/home"\nexport CREWKITE_PROFILE="$root/state/profile"\nexec "$root/Electron.app/Contents/MacOS/Electron" "$root/app"\n`,
     { mode: 0o755 },
   );
+  writeFileSync(
+    join(stage, 'CrewKite.command'),
+    '#!/bin/sh\nset -eu\nroot=$(CDPATH= cd "$(dirname "$0")" && pwd -P)\nexec "$root/bin/desktop"\n',
+    { mode: 0o755 },
+  );
   const workspace = [
     'apps/controller',
     'apps/cli',
@@ -606,6 +619,7 @@ export async function packageDesktop() {
     }
   }
   for (const entry of [
+    'CrewKite.command',
     'Electron.app/Contents/MacOS/Electron',
     `app/${desktop.main}`,
     'app/out/preload/index.cjs',

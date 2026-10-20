@@ -20,6 +20,8 @@ Runtime TypeScript lives outside `node_modules`. Relative workspace links point 
 
 The build compiles the committed Local input helper with the installed Command Line Tools compiler and macOS 26.5 SDK, targeting arm64 and macOS 13.5. Missing tools block staging. The compiler has a thirty-second limit and bounded diagnostic output. Packaging never runs the helper. Each package builds the helper from its committed source. The fixed `runtime/bin/local-secure-input` artifact carries its source and executable hashes in the runtime manifest; the package record also retains the compiler hash and SDK settings hash. End users need no compiler.
 
+The package records compiler source and output arguments relative to the build source. Compiler and SDK identities remain hash-pinned. The public manifest contains no absolute build-checkout path.
+
 The controller resolves Local credential input from that fixed runtime manifest. It verifies the packaged Node, helper and native source hashes before supplying the capability. Linked, shared or changed files refuse. A source-only launch without the manifest has no Local credential-input capability. Native prompt behavior and its package launch remain separate checks; the manifest establishes no model qualification.
 
 The first directory layout resolves its trusted runtime from `app.getAppPath()/runtime`. A later branded app needs an explicit resource layout. Runtime selection never comes from page content or a fallback to an arbitrary Node on PATH.

@@ -2,6 +2,19 @@
 
 This guide gives one practical sequence for trying the candidate on a real project. You need a local Git repository and any provider client you plan to use.
 
+## Open the candidate
+
+Keep the extracted candidate folder together and double-click `CrewKite.command`. It opens the workspace through the adjacent `bin/desktop` launcher. The folder can move before its first launch. After setup, reopen the same folder to retain its projects, tasks and settings.
+
+From Terminal, change into that candidate folder and use:
+
+```sh
+./bin/desktop
+./bin/crewkite task list --json
+```
+
+I record the exact source revision, verification and provider qualification in the candidate's release receipt. A working launcher does not establish a qualified provider route. The [distribution notes](distribution.md) describe the directory package and remaining install checks.
+
 ## Start a task
 
 1. Open the normal candidate. Packaging details are in the [distribution notes](distribution.md).

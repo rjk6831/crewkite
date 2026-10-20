@@ -717,6 +717,13 @@ test('source inspection bounds file metadata without running filters or reading 
         target: 'darwin-arm64',
         minOS: '13.5.0',
       });
+      assert.equal(result.compiler.pathsRelativeTo, 'build-source');
+      assert.equal(
+        result.compiler.args.at(-3),
+        'apps/controller/src/providers/local/secure-input.m',
+      );
+      assert.equal(result.compiler.args.at(-1), 'build/local-secure-input');
+      assert.equal(JSON.stringify(result.compiler).includes(checkout), false);
       assert.throws(compile, /already exists/);
     }
     assert.equal(invoked, row === 'source link' ? 0 : 1);
