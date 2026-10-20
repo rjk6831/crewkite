@@ -152,6 +152,7 @@ export function chooseRoute(input: RoutingInput): RouterDecision {
         (value) => value.routeId === route.id && value.windowId === windowId,
       );
       if (reserve.length > 1) throw new TypeError('A window has more than one reserve.');
+      if (window.state !== 'fresh') continue;
       const requested = requestedReservations.filter(matching);
       try {
         const available = availableAllowance({

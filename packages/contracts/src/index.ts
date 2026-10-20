@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { canonicalJson } from './canonical.ts';
 
 export const PROTOCOL_VERSION = 1;
 export const MAX_FRAME_BYTES = 1024 * 1024;
@@ -22,6 +23,7 @@ export const CandidateIdSchema = id('cnd');
 export const HandoffIdSchema = id('hnd');
 export const EventIdSchema = id('evt');
 export const CommandIdSchema = id('cmd');
+export const MessageIdSchema = id('msg');
 const RelativeSourcePathSchema = text.refine(
   (path) =>
     !path.startsWith('/') &&
@@ -37,6 +39,9 @@ export const NativeTargetPathSchema = RelativeSourcePathSchema.refine(
   (value) => value.isWellFormed() && !/\p{Cc}/u.test(value),
   'A replacement needs a relative path without control characters.',
 );
+export const NativeTargetContextLinesSchema = z
+  .strictObject({ start: RevisionSchema.min(1), end: RevisionSchema.min(1) })
+  .refine(({ start, end }) => end >= start, 'Context lines need an inclusive ordered range.');
 export const ProjectNodeTestPathSchema = NativeTargetPathSchema.refine(
   (path) => !path.startsWith('-') && !/[?*[\]{}]/.test(path),
   'Node tests need exact relative file paths without options or globs.',
@@ -93,6 +98,7 @@ export const NativeRepositoryProfileSchema = OpenAiNativeProfileSchema.omit({
 }).extend({
   id: z.literal('openai-repository-v1'),
   qualifiedAt: z.iso.date().nullable(),
+  maximumTaskMs: z.literal(600000),
   maximumSourceFiles: z.literal(10000),
   maximumSourceBytes: z.literal(67108864),
   execution: NativeRepositoryExecutionSchema,
@@ -104,7 +110,7 @@ export const NativeBillingAttestationSchema = z.strictObject({
   paidExtraUsageDisabled: z.literal(true),
 });
 export const AnthropicNativeProfileSchema = z.strictObject({
-  id: z.literal('anthropic-file-v1'),
+  id: z.enum(['anthropic-file-v1', 'anthropic-file-compact-v1']),
   family: z.literal('anthropic'),
   displayName: label,
   clientVersion: label,
@@ -151,7 +157,102 @@ const localIdentifier = label.refine(
   (value) => value.isWellFormed() && !/\p{Cc}/u.test(value),
   'A Local model identifier cannot contain control characters.',
 );
-export const LocalModelBindingSchema = z.strictObject({
+const localText = (max: number) =>
+  z
+    .string()
+    .min(1)
+    .max(max)
+    .refine(
+      (value) =>
+        value.isWellFormed() &&
+        !/\p{Cc}/u.test(value) &&
+        new TextEncoder().encode(value).length <= max,
+      'Local metadata needs bounded ordinary text.',
+    );
+export const LocalRuntimeIdentitySchema = z.strictObject({
+  connectorId: z.literal('local-sdk-v1'),
+  version: localText(128),
+  build: RevisionSchema,
+});
+export const LocalModelIdentitySchema = z.strictObject({
+  modelKey: localText(200),
+  displayName: localText(200),
+  format: localText(64),
+  sizeBytes: RevisionSchema.min(1),
+  quantization: z
+    .strictObject({ name: localText(64), bits: RevisionSchema.min(1).max(64) })
+    .nullable(),
+  selectedVariant: localText(200).nullable(),
+  metadataHash: HashSchema,
+});
+export const LocalModelChoiceSchema = z
+  .strictObject({
+    selectionId: HashSchema,
+    identity: LocalModelIdentitySchema,
+    instanceReference: localText(200).nullable(),
+    contextLength: RevisionSchema.min(1).nullable(),
+    state: z.enum(['installed-unloaded', 'loaded-eligible', 'incompatible']),
+    reasons: z
+      .array(
+        z.enum([
+          'unsupported-format',
+          'remote-model',
+          'identity-ambiguous',
+          'multiple-resident-models',
+          'resident-embedding',
+          'busy',
+          'context',
+          'draft',
+          'not-downloaded',
+        ]),
+      )
+      .max(8)
+      .refine((values) => new Set(values).size === values.length),
+    qualification: z.literal('unqualified'),
+  })
+  .refine(
+    (choice) =>
+      choice.state === 'installed-unloaded'
+        ? choice.instanceReference === null &&
+          choice.contextLength === null &&
+          choice.reasons.length === 0
+        : choice.state === 'loaded-eligible'
+          ? choice.instanceReference !== null &&
+            choice.contextLength === 8192 &&
+            ['gguf', 'safetensors'].includes(choice.identity.format) &&
+            choice.reasons.length === 0
+          : choice.reasons.length > 0,
+    'Local model state needs its observed instance and finite compatibility reasons.',
+  );
+const localProjectionFits = (value: unknown) =>
+  new TextEncoder().encode(JSON.stringify(value)).length <= 128 * 1024;
+export const LocalModelObservationSchema = z
+  .strictObject({
+    version: z.literal(1),
+    runtime: LocalRuntimeIdentitySchema,
+    observationHash: HashSchema,
+    models: z.array(LocalModelChoiceSchema).max(64),
+    residentLlms: RevisionSchema.max(8),
+    embeddingInstances: RevisionSchema.max(8),
+  })
+  .refine((value) => {
+    const handles = value.models.flatMap((model) =>
+      model.instanceReference === null ? [] : [model.instanceReference],
+    );
+    return (
+      new Set(value.models.map((model) => model.selectionId)).size === value.models.length &&
+      new Set(handles).size === handles.length &&
+      handles.length <= value.residentLlms &&
+      (!value.models.some((model) => model.state === 'loaded-eligible') ||
+        (value.residentLlms === 1 && value.embeddingInstances === 0)) &&
+      localProjectionFits(value)
+    );
+  }, 'Local discovery needs distinct choices within its handle and byte bounds.');
+export const LocalModelSelectionSchema = z.strictObject({
+  selectionId: HashSchema,
+  observationHash: HashSchema,
+});
+const legacyLocalModelBinding = z.strictObject({
   setupHash: HashSchema,
   modelKey: localIdentifier,
   instanceReference: localIdentifier,
@@ -159,6 +260,130 @@ export const LocalModelBindingSchema = z.strictObject({
   artifactSha256: HashSchema,
   quantization: z.literal('Q4_K_M'),
 });
+export const LocalAuthModeSchema = z.enum(['token', 'none']);
+export const LocalObservedModelBindingSchema = z.strictObject({
+  authMode: LocalAuthModeSchema.optional(),
+  version: z.literal(2),
+  identityKind: z.literal('runtime-metadata'),
+  setupHash: HashSchema,
+  connectionHash: HashSchema,
+  connectionRevision: RevisionSchema,
+  connectorId: z.literal('local-sdk-v1'),
+  runtimeVersion: localText(128),
+  runtimeBuild: RevisionSchema,
+  modelKey: localText(200),
+  instanceReference: localText(200),
+  modelSizeBytes: RevisionSchema.min(1),
+  format: z.enum(['gguf', 'safetensors']),
+  metadataHash: HashSchema,
+});
+export const LocalModelBindingSchema = z.union([
+  legacyLocalModelBinding,
+  LocalObservedModelBindingSchema,
+]);
+export const LocalEndpointSchema = z
+  .string()
+  .regex(/^ws:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}$/)
+  .refine(
+    (value) => value.trim() === value && Number(value.slice(value.lastIndexOf(':') + 1)) <= 65535,
+    'A Local endpoint needs a literal loopback address and valid port.',
+  );
+export const LocalSetupReceiptSchema = z.strictObject({
+  version: z.literal(1),
+  runtimeVersion: localIdentifier,
+  artifactSha256: HashSchema,
+  artifactSizeBytes: RevisionSchema.min(1),
+  quantization: localIdentifier,
+  model: z.strictObject({
+    modelKey: localIdentifier,
+    instanceReference: localIdentifier,
+    modelSizeBytes: RevisionSchema.min(1),
+  }),
+  contextLength: RevisionSchema.min(1),
+  residentLlms: RevisionSchema,
+  embeddingInstances: RevisionSchema,
+  draftModel: z.union([z.literal(''), localIdentifier]),
+});
+const localOperationFields = {
+  operationId: CommandIdSchema,
+  state: z.enum(['intent', 'owned', 'stopping', 'unknown']),
+};
+export const LocalOperationSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ ...localOperationFields, kind: z.literal('input') }),
+  z.strictObject({ ...localOperationFields, kind: z.literal('discovery') }),
+]);
+export const LocalSetupSchema = z
+  .strictObject({
+    revision: RevisionSchema,
+    connectionRevision: RevisionSchema,
+    connectorId: z.literal('local-sdk-v1'),
+    endpoint: LocalEndpointSchema.nullable(),
+    setupHash: HashSchema.nullable(),
+    connectionHash: HashSchema.nullable(),
+    secretConfigured: z.boolean(),
+    authMode: LocalAuthModeSchema.optional(),
+    connected: z.boolean().optional(),
+    operation: LocalOperationSchema.nullable(),
+    generation: z.enum(['idle', 'active', 'unknown']),
+    observation: LocalModelObservationSchema.nullable(),
+    selection: LocalModelSelectionSchema.nullable(),
+    reason: z
+      .enum([
+        'unconfigured',
+        'connection-required',
+        'connection-unavailable',
+        'input-active',
+        'input-unknown',
+        'discovery-required',
+        'discovery-active',
+        'discovery-unknown',
+        'model-selection-required',
+        'model-unloaded',
+        'model-incompatible',
+        'selection-stale',
+        'generation-active',
+        'generation-unknown',
+        'capability-unavailable',
+        'setup-unavailable',
+        'qualification-pending',
+      ])
+      .nullable(),
+  })
+  .refine(
+    (setup) =>
+      setup.endpoint === null
+        ? setup.setupHash === null &&
+          setup.connectionHash === null &&
+          !setup.secretConfigured &&
+          !setup.connected &&
+          !setup.operation &&
+          !setup.observation &&
+          !setup.selection
+        : setup.connectionHash !== null,
+    'A Local configuration needs its endpoint and exact setup identity.',
+  )
+  .refine(
+    (setup) =>
+      setup.selection === null
+        ? setup.setupHash === null
+        : setup.setupHash !== null &&
+          setup.observation !== null &&
+          (setup.reason === 'selection-stale' ||
+            (setup.selection.observationHash === setup.observation.observationHash &&
+              setup.observation.models.some(
+                (model) => model.selectionId === setup.selection?.selectionId,
+              ))),
+    'A selected Local setup needs its retained observation and choice identity.',
+  )
+  .refine(
+    (setup) =>
+      setup.authMode === 'none'
+        ? !setup.secretConfigured
+        : setup.connected === undefined || setup.connected === setup.secretConfigured,
+    'Local connection readiness must match its explicit authentication mode.',
+  )
+  .refine(localProjectionFits, 'Local setup exceeds its encoded byte bound.');
+export type LocalSetup = z.infer<typeof LocalSetupSchema>;
 export const LocalNativeProfileSchema = z
   .strictObject({
     id: z.literal('local-file-v1'),
@@ -169,7 +394,7 @@ export const LocalNativeProfileSchema = z
     modelBinding: LocalModelBindingSchema.nullable(),
     billing: z.literal('local'),
     contextLength: z.literal(8192),
-    maximumOutputTokens: z.literal(2048),
+    maximumOutputTokens: z.union([z.literal(2048), z.literal(4096)]),
     qualifiedAt: z.iso.date().nullable(),
     maximumTaskMs: z.literal(300000),
     maximumFileBytes: z.literal(65536),
@@ -237,6 +462,7 @@ export const GoogleAcpProfileSchema = GoogleNativeProfileSchema.omit({
 })
   .extend({
     id: z.literal('google-acp-v1'),
+    maximumTaskMs: z.union([z.literal(300000), z.literal(600000)]),
     effort: acpIdentifier,
     effortSupported: z.array(acpIdentifier).max(32),
     configOptions: GoogleAcpConfigurationSchema.nullable(),
@@ -335,6 +561,7 @@ export const GoogleAcpSetupSchema = z
 export const NativeFileProfileIdSchema = z.enum([
   'openai-file-v1',
   'anthropic-file-v1',
+  'anthropic-file-compact-v1',
   'google-file-v1',
 ]);
 export const NativeHandoffTargetSchema = z
@@ -413,6 +640,14 @@ export const NativeRunSchema = z
     permissionMode: GoogleNativePermissionModeSchema.optional(),
     stage: z.enum(['prepared', 'retain-only']),
     expiresAt: TimestampSchema.optional(),
+    maximumTaskMs: z.number().int().min(2001).max(600000).optional(),
+    quotaRetry: z
+      .strictObject({
+        available: z.boolean(),
+        mode: z.enum(['manual', 'automatic']),
+        resetsAt: TimestampSchema,
+      })
+      .optional(),
     handoff: NativeHandoffPreviewSchema.optional(),
     repository: NativeRepositoryScopeSchema.optional(),
     execution: NativeRepositoryExecutionSchema.optional(),
@@ -424,6 +659,7 @@ export const NativeRunSchema = z
       })
       .optional(),
     acp: GoogleAcpSelectionSchema.optional(),
+    contextLines: NativeTargetContextLinesSchema.optional(),
     localModel: LocalModelBindingSchema.optional(),
   })
   .refine(
@@ -438,6 +674,7 @@ export const NativeRunSchema = z
           !run.repository &&
           !run.execution
         : !run.acp &&
+          !run.contextLines &&
           !(run.billingAttestation && 'quotaAccountConfirmed' in run.billingAttestation),
     'An ACP run needs its selected proof, target and separate account attestation.',
   )
@@ -464,6 +701,14 @@ export const NativeRunSchema = z
           !run.handoff
         : !run.localModel,
     'A Local file run needs its model binding and target without cloud account fields.',
+  )
+  .refine(
+    (run) =>
+      !run.quotaRetry ||
+      (['anthropic-file-v1', 'anthropic-file-compact-v1'].includes(run.profileId) &&
+        run.stage === 'retain-only' &&
+        !!run.target),
+    'Quota retry is available only for retained Anthropic file work.',
   );
 
 export const FamilySchema = z.enum(['openai', 'anthropic', 'google', 'local']);
@@ -541,6 +786,12 @@ export const ObservationSchema = z
     routeId: RouteIdSchema,
     windowId: label,
     kind: z.enum(['rolling', 'weekly', 'model', 'pool', 'local']),
+    semantics: z
+      .strictObject({
+        scope: z.enum(['provider', 'model', 'pool']),
+        periodSeconds: z.number().int().positive().max(31536000).optional(),
+      })
+      .optional(),
     remaining: z
       .strictObject({
         value: z.number().finite().nonnegative(),
@@ -578,23 +829,13 @@ export const UsageReaderSchema = z
       'native-home-unavailable',
       'client-unavailable',
       'client-build-mismatch',
-      'not-enabled',
     ]),
-    enabled: z.boolean(),
     lastObservedAt: TimestampSchema.nullable(),
     lastAttemptAt: TimestampSchema.nullable().optional(),
   })
   .refine(
-    (reader) => reader.available === (reader.enabled && reader.reason === 'available'),
-    'Reader availability requires consent and a compatible client.',
-  )
-  .refine(
-    (reader) => reader.reason !== 'available' || reader.enabled,
-    'A disabled reader cannot report available.',
-  )
-  .refine(
-    (reader) => reader.reason !== 'not-enabled' || !reader.enabled,
-    'An enabled reader must report its client availability.',
+    (reader) => reader.available === (reader.reason === 'available'),
+    'Reader availability must match its client status.',
   );
 export const RoleSchema = z.strictObject({
   role: RoleNameSchema,
@@ -776,6 +1017,73 @@ export const CandidateSchema = z.strictObject({
   artifactId: ArtifactIdSchema,
   revision: RevisionSchema,
 });
+const integrationTree = z.string().regex(/^[a-f0-9]{40}$/);
+const combinedContributor = z.strictObject({
+  taskId: TaskIdSchema,
+  runId: RunIdSchema,
+  attemptId: AttemptIdSchema,
+  generation: RevisionSchema,
+  routeId: RouteIdSchema,
+  candidateId: CandidateIdSchema,
+  candidateHash: HashSchema,
+  scopeHash: HashSchema,
+});
+const combinedStep = z.strictObject({
+  candidateId: CandidateIdSchema,
+  candidateHash: HashSchema,
+  definitionHash: HashSchema,
+  checkArtifactId: ArtifactIdSchema,
+  previousTree: integrationTree,
+  nextTree: integrationTree,
+});
+export const CombinedOriginSchema = z
+  .strictObject({
+    kind: z.literal('combined'),
+    taskId: TaskIdSchema,
+    runId: RunIdSchema,
+    preparationId: ArtifactIdSchema,
+    manifestHash: HashSchema,
+    generation: RevisionSchema,
+    sourceBase: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/),
+    sourceManifestHash: HashSchema,
+    policyHash: HashSchema,
+    criteriaHash: HashSchema,
+    contributors: z.tuple([combinedContributor, combinedContributor]),
+    steps: z.tuple([combinedStep, combinedStep]),
+    candidateId: CandidateIdSchema,
+    candidateHash: HashSchema,
+  })
+  .superRefine((origin, context) => {
+    const [first, second] = origin.contributors;
+    if (
+      first.taskId === second.taskId ||
+      [first.taskId, second.taskId].includes(origin.taskId) ||
+      first.runId === second.runId ||
+      [first.runId, second.runId].includes(origin.runId) ||
+      first.attemptId === second.attemptId ||
+      new Set([
+        first.candidateId,
+        second.candidateId,
+        ...origin.steps.map((step) => step.candidateId),
+        origin.candidateId,
+      ]).size !== 5 ||
+      origin.steps[0].checkArtifactId === origin.steps[1].checkArtifactId ||
+      origin.steps[0].nextTree !== origin.steps[1].previousTree ||
+      origin.steps[1].candidateHash !== origin.candidateHash ||
+      origin.steps.some((step) => step.previousTree === step.nextTree)
+    )
+      context.addIssue({
+        code: 'custom',
+        message: 'Combined origin needs distinct contributors and checked sequential advances.',
+      });
+  });
+export type CombinedOrigin = z.infer<typeof CombinedOriginSchema>;
+export const CombinedCheckContextSchema = z.strictObject({
+  manifestHash: HashSchema,
+  generation: RevisionSchema,
+  phase: z.enum(['baseline', 'replay-0', 'replay-1', 'final-check']),
+  originHash: HashSchema,
+});
 export const ScriptedReviewJobSchema = z
   .strictObject({
     taskId: TaskIdSchema,
@@ -809,11 +1117,31 @@ export const NativeReviewJobSchema = z.strictObject({
   cycle: z.literal(1),
   limitMinutes: z.number().int().min(1).max(5),
 });
-export const ReviewJobSchema = z.discriminatedUnion('scripted', [
+export const CombinedNativeReviewJobSchema = NativeReviewJobSchema.omit({
+  writerAttemptId: true,
+  writerRouteId: true,
+})
+  .extend({
+    origin: CombinedOriginSchema,
+    profileId: z.literal('openai-file-v1'),
+    assignedRole: z.literal('reviewer'),
+  })
+  .refine(
+    (job) =>
+      job.taskId === job.origin.taskId &&
+      job.runId === job.origin.runId &&
+      job.candidateId === job.origin.candidateId &&
+      job.candidateHash === job.origin.candidateHash &&
+      !job.origin.contributors.some((contributor) => contributor.attemptId === job.attemptId),
+    'Combined review must bind the final origin and an independent attempt.',
+  );
+export const ReviewJobSchema = z.union([
   ScriptedReviewJobSchema,
   NativeReviewJobSchema,
+  CombinedNativeReviewJobSchema,
 ]);
 export type NativeReviewJob = z.infer<typeof NativeReviewJobSchema>;
+export type CombinedNativeReviewJob = z.infer<typeof CombinedNativeReviewJobSchema>;
 export const ReviewResultSchema = z
   .strictObject({
     job: ReviewJobSchema,
@@ -905,7 +1233,15 @@ export const RuntimeManifestSchema = z.strictObject({
     arch: z.enum(['arm64', 'x64']),
     sha256: HashSchema,
   }),
-  mode: z.literal('demo'),
+  mode: z.enum(['workspace', 'demo']),
+  localInput: z
+    .strictObject({
+      sha256: HashSchema,
+      sourceHash: HashSchema,
+      target: z.literal('darwin-arm64'),
+      minOS: z.literal('13.5.0'),
+    })
+    .optional(),
 });
 export type RuntimeManifest = z.infer<typeof RuntimeManifestSchema>;
 
@@ -914,10 +1250,22 @@ const envelope = { protocol: z.literal(1), key: CommandIdSchema, actor };
 const mutation = { ...envelope, expectedRevision: RevisionSchema };
 const read = <T extends string, S extends z.ZodType>(command: T, payload: S) =>
   z.strictObject({ ...envelope, command: z.literal(command), payload });
+export const TaskActivityRequestSchema = z.strictObject({
+  taskId: TaskIdSchema,
+  beforeCursor: CursorSchema.optional(),
+  limit: z.number().int().min(1).max(100).default(100),
+});
+export type TaskActivityRequest = z.infer<typeof TaskActivityRequestSchema>;
 const mutate = <T extends string, S extends z.ZodType>(command: T, payload: S) =>
   z.strictObject({ ...mutation, command: z.literal(command), payload });
 const empty = z.strictObject({});
 const taskRef = z.strictObject({ taskId: TaskIdSchema });
+export const SnapshotScopeSchema = z.union([
+  empty,
+  taskRef,
+  z.strictObject({ approvalId: ApprovalIdSchema }),
+]);
+export type SnapshotScope = z.infer<typeof SnapshotScopeSchema>;
 const runRef = z.strictObject({ taskId: TaskIdSchema, runId: RunIdSchema });
 const evaluationFields = {
   taskId: TaskIdSchema,
@@ -960,6 +1308,8 @@ export const NativePreparationPayloadSchema = z.union([
     creditPolicy: z.literal('ordinary').default('ordinary'),
     billingAttestation: GoogleAcpBillingAttestationSchema,
     permissionMode: z.literal('request-review'),
+    maximumTaskMs: z.union([z.literal(300000), z.literal(600000)]).optional(),
+    contextLines: NativeTargetContextLinesSchema.optional(),
     targetPath: NativeTargetPathSchema,
   }),
   z.strictObject({
@@ -970,6 +1320,97 @@ export const NativePreparationPayloadSchema = z.union([
     consent: z.enum(['explicit', 'saved']),
   }),
 ]);
+export const CombinedWriterSelectionSchema = z.discriminatedUnion('profileId', [
+  z.strictObject({
+    profileId: z.literal('openai-file-v1'),
+    creditPolicy: z.enum(['ordinary', 'existing-credits']),
+  }),
+  z.strictObject({
+    profileId: z.literal('anthropic-file-v1'),
+    creditPolicy: z.literal('ordinary'),
+    billingAttestation: NativeBillingAttestationSchema,
+  }),
+  z.strictObject({
+    profileId: z.literal('anthropic-file-compact-v1'),
+    creditPolicy: z.literal('ordinary'),
+    billingAttestation: NativeBillingAttestationSchema,
+  }),
+  z.strictObject({
+    profileId: z.literal('google-acp-v1'),
+    creditPolicy: z.literal('ordinary'),
+    billingAttestation: GoogleAcpBillingAttestationSchema,
+    permissionMode: z.literal('request-review'),
+    ...GoogleAcpSelectionSchema.shape,
+  }),
+]);
+const combinedMemberPreparation = z.strictObject({
+  taskId: TaskIdSchema,
+  expectedRevision: RevisionSchema,
+  scope: z.tuple([NativeTargetPathSchema]),
+  writer: CombinedWriterSelectionSchema,
+  consent: z.literal('explicit'),
+  maximumMinutes: z.number().int().min(1).max(5),
+});
+export const PrepareCombinedRunPayloadSchema = z
+  .strictObject({
+    taskId: TaskIdSchema,
+    policy: PolicySchema,
+    children: z.tuple([combinedMemberPreparation, combinedMemberPreparation]),
+    integration: z.strictObject({ maximumMinutes: LimitsSchema.shape.minutes }).optional(),
+    checks: z.strictObject({
+      recipeId: z.literal('project-node-tests-v1'),
+      testFiles: ProjectNodeTestFilesSchema,
+      replayTestFiles: z.tuple([ProjectNodeTestFilesSchema, ProjectNodeTestFilesSchema]),
+      interactionTestFiles: ProjectNodeTestFilesSchema,
+      maximumMinutes: z.literal(1),
+      baselineConsent: z.literal('explicit'),
+      replayConsents: z.tuple([z.literal('explicit'), z.literal('explicit')]),
+    }),
+    reviewer: z.strictObject({
+      profileId: z.literal('openai-file-v1'),
+      creditPolicy: z.enum(['ordinary', 'existing-credits']),
+      maximumMinutes: z.number().int().min(1).max(5),
+    }),
+  })
+  .superRefine((plan, context) => {
+    const [first, second] = plan.children;
+    const paths = plan.children.flatMap((child) => child.scope);
+    const replays = plan.checks.replayTestFiles.flat();
+    const methods = plan.policy.methods;
+    const minimumMinutes =
+      4 +
+      (plan.integration?.maximumMinutes ?? 1) +
+      first.maximumMinutes +
+      second.maximumMinutes +
+      plan.reviewer.maximumMinutes;
+    if (
+      first.taskId === second.taskId ||
+      [first.taskId, second.taskId].includes(plan.taskId) ||
+      paths[0] === paths[1] ||
+      paths.some((path) => paths.some((other) => other !== path && other.startsWith(`${path}/`))) ||
+      [...replays, ...plan.checks.interactionTestFiles].some(
+        (path) => !plan.checks.testFiles.includes(path),
+      ) ||
+      plan.checks.interactionTestFiles.some((path) => replays.includes(path)) ||
+      plan.checks.testFiles.some((path) => paths.includes(path)) ||
+      plan.policy.quality !== 'quick' ||
+      plan.policy.authority === 'autopilot' ||
+      !methods ||
+      methods.length !== 1 ||
+      methods[0].id !== 'keep-it-simple' ||
+      methods[0].cycles !== 1 ||
+      methods[0].reviewerRole !== 'reviewer' ||
+      plan.policy.limits.attempts < 7 ||
+      plan.policy.limits.concurrency < 2 ||
+      plan.policy.limits.minutes < minimumMinutes
+    )
+      context.addIssue({
+        code: 'custom',
+        message:
+          'Combined work needs two disjoint children, protected checks and its complete reserved policy.',
+      });
+  });
+export type PrepareCombinedRunPayload = z.infer<typeof PrepareCombinedRunPayloadSchema>;
 const nativeHandoffPreparationFields = {
   taskId: TaskIdSchema,
   runId: RunIdSchema,
@@ -984,7 +1425,7 @@ export const NativeHandoffPreparationPayloadSchema = z.union([
   }),
   z.strictObject({
     ...nativeHandoffPreparationFields,
-    profileId: z.literal('anthropic-file-v1'),
+    profileId: z.enum(['anthropic-file-v1', 'anthropic-file-compact-v1']),
     creditPolicy: z.literal('ordinary').default('ordinary'),
     billingAttestation: NativeBillingAttestationSchema,
   }),
@@ -996,12 +1437,718 @@ export const NativeHandoffPreparationPayloadSchema = z.union([
     permissionMode: GoogleNativePermissionModeSchema,
   }),
 ]);
+const conversationBytes = (value: unknown) =>
+  new TextEncoder().encode(JSON.stringify(value)).length;
+export const CONVERSATION_CONTEXT_MEDIA_TYPE = 'application/vnd.crewkite.conversation-context+json';
+const contextBase = z.string().regex(/^[a-f0-9]{40}$/);
+const contextPath = NativeTargetPathSchema.refine(
+  (path) =>
+    new TextEncoder().encode(path).length <= 1024 &&
+    path.split('/').length <= 16 &&
+    !path
+      .split('/')
+      .some(
+        (part) =>
+          /^(?:\.git|\.hg|\.svn|node_modules|\.pnpm|\.yarn|\.ssh|\.aws|\.azure|\.gnupg|\.config|\.kube|\.docker|\.npmrc|\.netrc|\.pypirc|\.git-credentials|\.env(?:\..*)?|credentials(?:\..*)?|secrets?(?:\..*)?|id_rsa.*|id_ed25519.*)$/i.test(
+            part,
+          ) || /\.(?:pem|key|p12|pfx|keystore|keychain(?:-db)?)$/i.test(part),
+      ),
+  'Context needs a bounded source path outside excluded locations.',
+);
+const contextText = z
+  .string()
+  .min(1)
+  .max(8192)
+  .refine(
+    (value) =>
+      value.isWellFormed() &&
+      new TextEncoder().encode(value).length <= 8192 &&
+      ![...value].some((character) => {
+        const point = character.codePointAt(0) as number;
+        return (point < 32 && ![9, 10, 13].includes(point)) || (point >= 127 && point <= 159);
+      }),
+    'Context needs bounded UTF-8 text without binary control bytes.',
+  );
+const contextFile = z
+  .strictObject({
+    kind: z.enum(['source', 'log']),
+    path: contextPath,
+    mode: z.enum(['100644', '100755']),
+    hash: HashSchema,
+    bytes: RevisionSchema.min(1).max(8192),
+    text: contextText,
+  })
+  .refine(
+    (file) =>
+      file.bytes === new TextEncoder().encode(file.text).length &&
+      (file.kind !== 'log' || !file.path.split('/').some((part) => part.startsWith('.'))),
+    'Context byte counts must match complete text and logs cannot read hidden locations.',
+  );
+export const ConversationContextBundleSchema = z
+  .strictObject({
+    version: z.literal(1),
+    projectId: ProjectIdSchema,
+    base: contextBase,
+    files: z.array(contextFile).min(1).max(32),
+  })
+  .superRefine((bundle, context) => {
+    const seen = new Set<string>(),
+      prefixes = new Map<string, string>();
+    let valid = true;
+    for (const [index, file] of bundle.files.entries()) {
+      const key = file.path.normalize('NFC').toLowerCase();
+      if (
+        seen.has(key) ||
+        prefixes.has(key) ||
+        (index > 0 && bundle.files[index - 1].path >= file.path)
+      )
+        valid = false;
+      const parts = file.path.split('/');
+      for (let end = 1; end <= parts.length; end++) {
+        const prefix = parts.slice(0, end).join('/'),
+          canonical = prefix.normalize('NFC').toLowerCase();
+        if (
+          (end < parts.length && seen.has(canonical)) ||
+          (prefixes.has(canonical) && prefixes.get(canonical) !== prefix)
+        )
+          valid = false;
+        prefixes.set(canonical, prefix);
+      }
+      seen.add(key);
+    }
+    if (!valid || new TextEncoder().encode(canonicalJson(bundle)).length > 32768)
+      context.addIssue({
+        code: 'custom',
+        message: 'Context needs ordered collision-free paths and at most 32768 canonical bytes.',
+      });
+  });
+export const ConversationContextRefSchema = z.strictObject({
+  artifactId: ArtifactIdSchema,
+  hash: HashSchema,
+});
+export const ConversationContextRefsSchema = z
+  .array(ConversationContextRefSchema)
+  .max(4)
+  .refine(
+    (refs) =>
+      new Set(refs.map((ref) => ref.artifactId)).size === refs.length &&
+      new Set(refs.map((ref) => ref.hash)).size === refs.length,
+    'Context references need distinct artifact IDs and hashes.',
+  );
+export const ConversationContextPickSchema = z.strictObject({
+  kind: z.enum(['source-file', 'source-folder', 'log-file']),
+  path: z
+    .string()
+    .min(1)
+    .max(4096)
+    .refine(
+      (path) =>
+        path.startsWith('/') &&
+        path.isWellFormed() &&
+        !path.includes('\\') &&
+        !/\p{Cc}/u.test(path) &&
+        new TextEncoder().encode(path).length <= 4096 &&
+        !path
+          .split('/')
+          .slice(1)
+          .some((part) => !part || part === '.' || part === '..'),
+      'A native context pick needs an absolute bounded path.',
+    ),
+});
+export type ConversationContextBundle = z.infer<typeof ConversationContextBundleSchema>;
+export type ConversationContextRef = z.infer<typeof ConversationContextRefSchema>;
+export type ConversationContextRefs = z.infer<typeof ConversationContextRefsSchema>;
+export type ConversationContextPick = z.infer<typeof ConversationContextPickSchema>;
+export const ConversationTextSchema = z
+  .string()
+  .min(1)
+  .max(4096)
+  .refine(
+    (value) =>
+      value.isWellFormed() &&
+      !value.includes('\0') &&
+      new TextEncoder().encode(value).length <= 4096,
+    'Conversation text needs valid Unicode without null bytes.',
+  );
+const conversationSlice = z.strictObject({
+  id: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9-]{0,79}$/),
+  title: label,
+  role: z.enum(['coder', 'reviewer', 'advisor']),
+  scope: z.array(NativeTargetPathSchema).min(1).max(100),
+  dependsOn: z.array(z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9-]{0,79}$/)).max(20),
+});
+export const ConversationPlanProposalSchema = z
+  .strictObject({
+    summary: ConversationTextSchema,
+    criteria: z.array(ConversationTextSchema).min(1).max(100),
+    slices: z.array(conversationSlice).min(1).max(20),
+    checks: z.array(label).max(20),
+  })
+  .superRefine((plan, context) => {
+    const slices = new Map(plan.slices.map((slice) => [slice.id, slice]));
+    const visiting = new Set<string>();
+    const visited = new Set<string>();
+    const visit = (id: string): boolean => {
+      if (visiting.has(id)) return false;
+      if (visited.has(id)) return true;
+      const slice = slices.get(id);
+      if (!slice) return false;
+      visiting.add(id);
+      if (!slice.dependsOn.every(visit)) return false;
+      visiting.delete(id);
+      visited.add(id);
+      return true;
+    };
+    if (slices.size !== plan.slices.length || !plan.slices.every((slice) => visit(slice.id)))
+      context.addIssue({
+        code: 'custom',
+        message: 'Plan slices need distinct IDs and acyclic known dependencies.',
+      });
+    for (const slice of plan.slices)
+      if (
+        new Set(slice.scope).size !== slice.scope.length ||
+        new Set(slice.dependsOn).size !== slice.dependsOn.length
+      )
+        context.addIssue({
+          code: 'custom',
+          message: 'Slice paths and dependencies must be distinct.',
+        });
+    if (new Set(plan.checks).size !== plan.checks.length || conversationBytes(plan) > 65536)
+      context.addIssue({
+        code: 'custom',
+        message: 'A proposal needs distinct checks and at most 65536 encoded bytes.',
+      });
+  });
+export const ConversationTurnBindingSchema = z.strictObject({
+  taskId: TaskIdSchema,
+  runId: RunIdSchema,
+  attemptId: AttemptIdSchema,
+  generation: RevisionSchema,
+  routeId: RouteIdSchema,
+  role: z.enum(['lead', 'orchestrator']),
+  taskRevision: RevisionSchema,
+  conversationRevision: RevisionSchema,
+  scopeHash: HashSchema,
+  limitMinutes: z.number().int().min(1).max(5),
+});
+export const ConversationTurnResultSchema = z
+  .strictObject({
+    version: z.literal(1),
+    bindingHash: HashSchema,
+    message: ConversationTextSchema,
+    questions: z.array(ConversationTextSchema).max(8),
+    proposal: ConversationPlanProposalSchema.nullable(),
+  })
+  .refine(
+    (value) => conversationBytes(value) <= 65536,
+    'Conversation output exceeds 65536 encoded bytes.',
+  );
+const conversationEntryFields = {
+  id: MessageIdSchema,
+  taskId: TaskIdSchema,
+  revision: RevisionSchema,
+  cursor: CursorSchema,
+  at: TimestampSchema,
+  text: ConversationTextSchema,
+};
+const conversationAgent = z.strictObject({
+  kind: z.literal('agent'),
+  role: z.enum(['lead', 'orchestrator']),
+  attemptId: AttemptIdSchema,
+  routeId: RouteIdSchema,
+});
+const conversationUser = z.strictObject({ kind: z.literal('user') });
+export const ConversationEntrySchema = z
+  .discriminatedUnion('kind', [
+    z.strictObject({
+      ...conversationEntryFields,
+      kind: z.literal('user-message'),
+      author: conversationUser,
+      context: ConversationContextRefsSchema.optional(),
+    }),
+    z.strictObject({
+      ...conversationEntryFields,
+      kind: z.literal('guidance'),
+      author: conversationUser,
+      context: ConversationContextRefsSchema.optional(),
+    }),
+    z.strictObject({
+      ...conversationEntryFields,
+      kind: z.literal('answer'),
+      author: conversationUser,
+      context: ConversationContextRefsSchema.optional(),
+      replyTo: MessageIdSchema,
+    }),
+    z.strictObject({
+      ...conversationEntryFields,
+      kind: z.literal('agent-message'),
+      author: conversationAgent,
+      binding: ConversationTurnBindingSchema,
+    }),
+    z.strictObject({
+      ...conversationEntryFields,
+      kind: z.literal('question'),
+      author: conversationAgent,
+      binding: ConversationTurnBindingSchema,
+    }),
+    z.strictObject({
+      ...conversationEntryFields,
+      kind: z.literal('plan-proposal'),
+      author: conversationAgent,
+      binding: ConversationTurnBindingSchema,
+      proposal: ConversationPlanProposalSchema,
+    }),
+    z.strictObject({
+      ...conversationEntryFields,
+      kind: z.literal('input-delivery'),
+      author: z.strictObject({ kind: z.literal('controller') }),
+      binding: ConversationTurnBindingSchema,
+      replyTo: MessageIdSchema,
+    }),
+  ])
+  .superRefine((entry, context) => {
+    if (
+      'binding' in entry &&
+      (entry.binding.taskId !== entry.taskId ||
+        (entry.author.kind === 'agent' &&
+          (entry.author.attemptId !== entry.binding.attemptId ||
+            entry.author.routeId !== entry.binding.routeId ||
+            entry.author.role !== entry.binding.role)))
+    )
+      context.addIssue({
+        code: 'custom',
+        message: 'Conversation output must match its admitted turn.',
+      });
+    if (conversationBytes(entry) > 73728)
+      context.addIssue({
+        code: 'custom',
+        message: 'A conversation entry exceeds its encoded byte limit.',
+      });
+  });
+export const ConversationPageSchema = z
+  .strictObject({
+    kind: z.literal('conversation'),
+    taskId: TaskIdSchema,
+    entries: z.array(ConversationEntrySchema).max(100),
+    nextBeforeCursor: CursorSchema.nullable(),
+  })
+  .superRefine((page, context) => {
+    if (
+      page.entries.some(
+        (entry, index) =>
+          entry.taskId !== page.taskId ||
+          (index > 0 && BigInt(entry.cursor) <= BigInt(page.entries[index - 1].cursor)),
+      ) ||
+      new Set(page.entries.map((entry) => entry.id)).size !== page.entries.length ||
+      (page.nextBeforeCursor !== null &&
+        (page.entries.length === 0 || page.nextBeforeCursor !== page.entries[0].cursor))
+    )
+      context.addIssue({
+        code: 'custom',
+        message: 'Conversation pages need ordered distinct entries for one task.',
+      });
+    if (conversationBytes(page) > 524288)
+      context.addIssue({
+        code: 'custom',
+        message: 'A conversation page exceeds 524288 encoded bytes.',
+      });
+  });
+export type ConversationEntry = z.infer<typeof ConversationEntrySchema>;
+export type ConversationPage = z.infer<typeof ConversationPageSchema>;
+export type ConversationPlanProposal = z.infer<typeof ConversationPlanProposalSchema>;
+export type ConversationTurnBinding = z.infer<typeof ConversationTurnBindingSchema>;
+export type ConversationTurnResult = z.infer<typeof ConversationTurnResultSchema>;
+const conversationModelText = (maximumBytes: number) =>
+  z
+    .string()
+    .min(1)
+    .max(maximumBytes)
+    .refine(
+      (value) =>
+        value.isWellFormed() &&
+        !/\p{Cc}/u.test(value) &&
+        value.trim().length > 0 &&
+        new TextEncoder().encode(value).byteLength <= maximumBytes,
+      'Model metadata needs bounded text without control characters.',
+    );
+const conversationModelObservation = z.strictObject({
+  artifactId: ArtifactIdSchema,
+  hash: HashSchema,
+});
+export const ConversationModelRequestSchema = z.strictObject({
+  version: z.literal(1),
+  observation: conversationModelObservation,
+  model: conversationModelText(200),
+  effort: conversationModelText(32),
+});
+export const ConversationModelCatalogEntrySchema = z
+  .strictObject({
+    model: ConversationModelRequestSchema.shape.model,
+    efforts: z.array(ConversationModelRequestSchema.shape.effort).min(1).max(16),
+    defaultEffort: ConversationModelRequestSchema.shape.effort,
+  })
+  .refine(
+    (entry) =>
+      new Set(entry.efforts).size === entry.efforts.length &&
+      entry.efforts.includes(entry.defaultEffort),
+    'Model efforts must be distinct and include their default.',
+  );
+const conversationModelEntries = z
+  .array(ConversationModelCatalogEntrySchema)
+  .max(20)
+  .refine(
+    (models) => new Set(models.map((entry) => entry.model)).size === models.length,
+    'Catalog model identifiers must be distinct.',
+  );
+export const ConversationModelCatalogEntriesSchema = conversationModelEntries.min(1);
+export const ConversationContextMeasurementSchema = z.strictObject({
+  threadId: conversationModelText(200),
+  turnId: conversationModelText(200),
+  model: conversationModelText(200),
+  usedTokens: z.number().int().nonnegative().safe(),
+  capacityTokens: z.number().int().positive().safe().nullable(),
+});
+export const ConversationContextUsageSchema = ConversationContextMeasurementSchema.omit({
+  threadId: true,
+  turnId: true,
+}).extend({
+  observation: conversationModelObservation,
+  runId: RunIdSchema,
+  attemptId: AttemptIdSchema,
+  generation: RevisionSchema,
+  observedAt: TimestampSchema,
+});
+export type ConversationContextUsage = z.infer<typeof ConversationContextUsageSchema>;
+export const ConversationModelCatalogSchema = z
+  .strictObject({
+    version: z.literal(1),
+    profileId: z.literal('openai-file-v1'),
+    taskId: TaskIdSchema,
+    runId: RunIdSchema,
+    attemptId: AttemptIdSchema,
+    generation: RevisionSchema,
+    observedAt: TimestampSchema,
+    profileHash: HashSchema,
+    client: z.strictObject({
+      executable: conversationModelText(4096),
+      sha256: HashSchema,
+      version: conversationModelText(200),
+    }),
+    locationHash: HashSchema,
+    models: ConversationModelCatalogEntriesSchema,
+    contextUsage: ConversationContextMeasurementSchema.optional(),
+  })
+  .refine(
+    (catalog) => conversationBytes(catalog) <= 32768,
+    'A model catalog exceeds 32768 encoded bytes.',
+  );
+const conversationModelFailureReasons = [
+  'observation-missing',
+  'observation-stale',
+  'client-changed',
+  'catalog-unavailable',
+  'model-unavailable',
+  'effort-unavailable',
+] as const;
+export const ConversationModelReasonSchema = z.enum([
+  'available',
+  'not-observed',
+  ...conversationModelFailureReasons,
+]);
+export const ConversationModelChoicesSchema = z
+  .strictObject({
+    status: z.enum(['not-observed', 'last-observed', 'client-changed', 'unavailable']),
+    observation: conversationModelObservation.nullable(),
+    observedAt: TimestampSchema.nullable(),
+    models: conversationModelEntries,
+    reason: ConversationModelReasonSchema,
+  })
+  .superRefine((choices, context) => {
+    const fail = (message: string) => context.addIssue({ code: 'custom', message });
+    if ((choices.observation === null) !== (choices.observedAt === null))
+      fail('Model observation identity and time must be present together.');
+    switch (choices.status) {
+      case 'not-observed':
+        if (
+          choices.observation !== null ||
+          choices.models.length !== 0 ||
+          choices.reason !== 'not-observed'
+        )
+          fail('Unobserved model choices cannot contain a catalog.');
+        break;
+      case 'last-observed':
+      case 'client-changed':
+        if (
+          choices.observation === null ||
+          choices.models.length === 0 ||
+          !(choices.status === 'client-changed'
+            ? choices.reason === 'client-changed'
+            : ['available', 'model-unavailable', 'effort-unavailable'].includes(choices.reason))
+        )
+          fail('Observed model choices need a catalog reference and its current status.');
+        break;
+      case 'unavailable':
+        if (
+          choices.models.length !== 0 ||
+          !['observation-missing', 'observation-stale', 'catalog-unavailable'].includes(
+            choices.reason,
+          )
+        )
+          fail('Unavailable model choices need an observation failure without catalog entries.');
+        break;
+    }
+    if (conversationBytes(choices) > 32768) fail('Model choices exceed 32768 encoded bytes.');
+  });
+export type ConversationModelRequest = z.infer<typeof ConversationModelRequestSchema>;
+export type ConversationModelCatalogEntry = z.infer<typeof ConversationModelCatalogEntrySchema>;
+export type ConversationModelCatalogEntries = z.infer<typeof ConversationModelCatalogEntriesSchema>;
+export type ConversationModelCatalog = z.infer<typeof ConversationModelCatalogSchema>;
+export type ConversationModelChoices = z.infer<typeof ConversationModelChoicesSchema>;
+export type ConversationModelReason = z.infer<typeof ConversationModelReasonSchema>;
+export const ConversationPlanningSelectionSchema = z.strictObject({
+  role: z.enum(['lead', 'orchestrator']),
+  profileId: z.literal('openai-file-v1'),
+  creditPolicy: z.enum(['ordinary', 'existing-credits']),
+  limits: LimitsSchema,
+  consent: z.literal('explicit'),
+  modelRequest: ConversationModelRequestSchema.optional(),
+});
+export type ConversationPlanningSelection = z.infer<typeof ConversationPlanningSelectionSchema>;
+export const ConversationActionReasonSchema = z.enum([
+  'available',
+  'queued-at-boundary',
+  'not-configured',
+  'profile-unavailable',
+  'planning-role-unavailable',
+  'planning-consent-required',
+  'source-changed',
+  'task-contract-changed',
+  'conversation-input-too-large',
+  'owner-active',
+  'ownership-unknown',
+  'admissions-paused',
+  'attempt-budget-exhausted',
+  'minute-budget-exhausted',
+  'concurrency-exhausted',
+  'provider-capacity-unavailable',
+  'proposal-missing',
+  'proposal-not-current',
+  'proposal-hash-changed',
+  'pending-question',
+  'pending-input',
+  'effects-unresolved',
+  'execution-active',
+  'task-not-discussing',
+  'controller-closing',
+  ...conversationModelFailureReasons,
+]);
+const conversationProposalReference = z.strictObject({
+  id: MessageIdSchema,
+  hash: HashSchema,
+  runId: RunIdSchema,
+  revision: RevisionSchema,
+});
+export const TaskConversationStateSchema = z
+  .strictObject({
+    taskId: TaskIdSchema,
+    revision: RevisionSchema,
+    contractStatus: z.enum(['provisional', 'confirmed']),
+    purpose: z.enum(['conversation', 'execution']).nullable(),
+    phase: z.enum([
+      'idle',
+      'discussion',
+      'planning',
+      'planned',
+      'execution',
+      'stopping',
+      'stopped',
+      'interrupted',
+      'unknown',
+    ]),
+    configuration: z
+      .strictObject({
+        revision: RevisionSchema,
+        selection: ConversationPlanningSelectionSchema,
+        routeId: RouteIdSchema.nullable(),
+        requestedModel: label.nullable(),
+        effectiveModel: label.nullable(),
+        requestedEffort: label.nullable(),
+        effectiveEffort: label.nullable(),
+      })
+      .nullable(),
+    modelChoices: ConversationModelChoicesSchema.optional(),
+    contextUsage: ConversationContextUsageSchema.nullable().optional(),
+    currentRunId: RunIdSchema.nullable(),
+    activeAttempt: AttemptSchema.nullable(),
+    budget: z.strictObject({ limits: LimitsSchema, remaining: RemainingBudgetsSchema }).nullable(),
+    queuedInputCount: RevisionSchema,
+    pendingQuestions: z
+      .array(z.strictObject({ id: MessageIdSchema, cursor: CursorSchema }))
+      .max(100),
+    proposal: conversationProposalReference.nullable(),
+    adoptedProposal: conversationProposalReference.nullable(),
+    send: z.strictObject({
+      available: z.boolean(),
+      reason: ConversationActionReasonSchema,
+      disposition: z.enum(['turn', 'planning-turn', 'queue']).nullable(),
+    }),
+    adopt: z.strictObject({ available: z.boolean(), reason: ConversationActionReasonSchema }),
+  })
+  .superRefine((state, context) => {
+    const fail = (message: string) => context.addIssue({ code: 'custom', message });
+    if (state.activeAttempt && state.activeAttempt.runId !== state.currentRunId)
+      fail('The active conversation attempt must belong to the current run.');
+    if (state.contextUsage && state.contextUsage.runId !== state.currentRunId)
+      fail('Context usage must belong to the current run.');
+    if (
+      new Set(state.pendingQuestions.map((question) => question.id)).size !==
+      state.pendingQuestions.length
+    )
+      fail('Pending questions must be distinct.');
+    if (
+      state.budget &&
+      (['attempts', 'minutes', 'concurrency'] as const).some(
+        (axis) => state.budget !== null && state.budget.remaining[axis] > state.budget.limits[axis],
+      )
+    )
+      fail('Remaining task allowance cannot exceed its configured limits.');
+    if (
+      state.send.available
+        ? !(
+            (state.send.reason === 'available' &&
+              ['turn', 'planning-turn'].includes(state.send.disposition ?? '')) ||
+            (state.send.reason === 'queued-at-boundary' && state.send.disposition === 'queue')
+          )
+        : state.send.disposition !== null ||
+          ['available', 'queued-at-boundary'].includes(state.send.reason)
+    )
+      fail('Send availability must state whether a turn can start or input will queue.');
+    if (
+      state.adopt.available
+        ? state.adopt.reason !== 'available' || state.proposal === null
+        : ['available', 'queued-at-boundary'].includes(state.adopt.reason)
+    )
+      fail('Plan adoption availability requires a current proposal.');
+    if (
+      state.send.available &&
+      state.send.disposition === 'turn' &&
+      (!state.configuration?.routeId ||
+        !state.currentRunId ||
+        !state.budget ||
+        state.purpose !== 'conversation' ||
+        state.activeAttempt !== null ||
+        ['unknown', 'stopping'].includes(state.phase))
+    )
+      fail('A fresh planning turn requires configured authority and no active owner.');
+    if (
+      state.send.available &&
+      state.send.disposition === 'queue' &&
+      (!state.currentRunId ||
+        state.purpose === null ||
+        (state.activeAttempt
+          ? !['intent', 'running', 'stopping'].includes(state.activeAttempt.state)
+          : state.purpose !== 'execution' || ['unknown', 'stopping'].includes(state.phase)))
+    )
+      fail('Queued input requires a known current owner or a quiescent execution run.');
+    if (
+      state.send.available &&
+      state.send.disposition === 'planning-turn' &&
+      (!state.configuration?.routeId ||
+        !state.currentRunId ||
+        !state.budget ||
+        state.purpose !== 'execution' ||
+        state.activeAttempt !== null ||
+        ['unknown', 'stopping'].includes(state.phase))
+    )
+      fail('A linked planning turn requires saved authority and a quiescent execution run.');
+    if (
+      state.adopt.available &&
+      (!state.configuration ||
+        !state.budget ||
+        state.purpose !== 'conversation' ||
+        !state.currentRunId ||
+        state.proposal?.runId !== state.currentRunId ||
+        state.activeAttempt !== null)
+    )
+      fail('Plan adoption requires the current planning lineage without an active owner.');
+    if (conversationBytes(state) > 32768) fail('Conversation state exceeds 32768 encoded bytes.');
+  });
+export type TaskConversationState = z.infer<typeof TaskConversationStateSchema>;
 export const CommandSchema = z.discriminatedUnion('command', [
-  mutate('RegisterProject', z.strictObject({ path: text })),
   mutate(
-    'ObserveUsage',
-    z.strictObject({ family: z.literal('google'), consent: z.boolean().optional() }),
+    'CaptureConversationContext',
+    z.strictObject({
+      projectId: ProjectIdSchema,
+      base: contextBase,
+      selections: z
+        .array(ConversationContextPickSchema)
+        .min(1)
+        .max(4)
+        .refine(
+          (picks) =>
+            new Set(picks.map((pick) => `${pick.kind}:${pick.path}`)).size === picks.length,
+          'Native context picks must be distinct.',
+        ),
+    }),
   ),
+  mutate(
+    'ConfigureLocal',
+    z.strictObject({ endpoint: LocalEndpointSchema, authMode: LocalAuthModeSchema.optional() }),
+  ),
+  mutate('RefreshLocalModels', z.strictObject({ consent: z.literal('explicit') })),
+  mutate('SelectLocalModel', LocalModelSelectionSchema),
+  mutate('BeginLocalConnectionInput', z.strictObject({ consent: z.literal('explicit') })),
+  mutate('CancelLocalConnectionInput', z.strictObject({ operationId: CommandIdSchema })),
+  mutate('DisconnectLocal', empty),
+  read('GetTaskConversationState', z.strictObject({ taskId: TaskIdSchema })),
+  mutate(
+    'CreateTaskDiscussion',
+    z.strictObject({
+      projectId: ProjectIdSchema,
+      text: ConversationTextSchema,
+      planning: ConversationPlanningSelectionSchema,
+      context: ConversationContextRefsSchema.optional(),
+    }),
+  ),
+  mutate(
+    'ConfigureTaskConversation',
+    z.strictObject({ taskId: TaskIdSchema, planning: ConversationPlanningSelectionSchema }),
+  ),
+  mutate(
+    'AdoptTaskPlan',
+    z.strictObject({ taskId: TaskIdSchema, proposalId: MessageIdSchema, proposalHash: HashSchema }),
+  ),
+  read(
+    'GetTaskConversation',
+    z.strictObject({ taskId: TaskIdSchema, beforeCursor: CursorSchema.optional() }),
+  ),
+  mutate(
+    'SendTaskMessage',
+    z.strictObject({
+      taskId: TaskIdSchema,
+      text: ConversationTextSchema,
+      context: ConversationContextRefsSchema.optional(),
+    }),
+  ),
+  mutate(
+    'QueueTaskGuidance',
+    z.strictObject({
+      taskId: TaskIdSchema,
+      text: ConversationTextSchema,
+      context: ConversationContextRefsSchema.optional(),
+    }),
+  ),
+  mutate(
+    'AnswerTaskQuestion',
+    z.strictObject({
+      taskId: TaskIdSchema,
+      questionId: MessageIdSchema,
+      text: ConversationTextSchema,
+      context: ConversationContextRefsSchema.optional(),
+    }),
+  ),
+  mutate('RegisterProject', z.strictObject({ path: text })),
+  mutate('ObserveUsage', z.strictObject({ family: z.literal('google') })),
   mutate(
     'InitializeGoogleAcp',
     z.strictObject({ profileId: z.literal('google-acp-v1'), consent: z.literal('explicit') }),
@@ -1055,6 +2202,15 @@ export const CommandSchema = z.discriminatedUnion('command', [
     }),
   ),
   mutate('PrepareNativeRun', NativePreparationPayloadSchema),
+  mutate('PrepareCombinedRun', PrepareCombinedRunPayloadSchema),
+  mutate(
+    'AssembleCombinedCandidate',
+    z.strictObject({
+      taskId: TaskIdSchema,
+      runId: RunIdSchema,
+      preparationId: ArtifactIdSchema,
+    }),
+  ),
   mutate('PrepareNativeHandoff', NativeHandoffPreparationPayloadSchema),
   mutate(
     'StartNativeHandoff',
@@ -1106,7 +2262,8 @@ export const CommandSchema = z.discriminatedUnion('command', [
     }),
   ),
   mutate('ExportPatch', z.strictObject({ taskId: TaskIdSchema, candidateId: CandidateIdSchema })),
-  read('GetSnapshot', empty),
+  read('GetSnapshot', SnapshotScopeSchema),
+  read('GetTaskActivity', TaskActivityRequestSchema),
   read('Subscribe', z.strictObject({ after: CursorSchema })),
   read('GetChanges', taskRef),
   read(
@@ -1236,7 +2393,7 @@ export const CrewKiteVerifyPreviewSchema = z.strictObject({
     z.literal('build'),
     z.literal('desktop'),
   ]),
-  maximumMinutes: z.literal(5),
+  maximumMinutes: z.literal(10),
 });
 export type CrewKiteVerifyPreview = z.infer<typeof CrewKiteVerifyPreviewSchema>;
 export const CandidateEvaluationPreviewSchema = z
@@ -1321,17 +2478,146 @@ export const CandidateEvaluationPreviewSchema = z
   });
 export type CandidateEvaluationPreview = z.infer<typeof CandidateEvaluationPreviewSchema>;
 
+export const CombinedActionReasonSchema = z.enum([
+  'available',
+  'already-started',
+  'baseline-required',
+  'writers-incomplete',
+  'checks-required',
+  'checks-failed',
+  'review-required',
+  'review-failed',
+  'budget-exhausted',
+  'paused',
+  'owner-active',
+  'ownership-unknown',
+  'source-changed',
+  'task-changed',
+  'preparation-changed',
+  'scope-changed',
+  'profile-unavailable',
+  'authority-unavailable',
+  'ref-changed',
+  'stopped',
+  'accepted',
+]);
+const combinedAvailability = z
+  .strictObject({
+    available: z.boolean(),
+    reason: CombinedActionReasonSchema,
+  })
+  .refine((value) => value.available === (value.reason === 'available'));
+export const CombinedDispatchPhaseSchema = z.enum([
+  'baseline',
+  'writer-0',
+  'writer-1',
+  'replay-0',
+  'replay-1',
+  'final-check',
+  'review',
+]);
+const combinedDispatchPreview = z
+  .strictObject({
+    phase: CombinedDispatchPhaseSchema,
+    maximumMinutes: z.number().int().min(1).max(5),
+    state: z.enum(['reserved', 'running', 'passed', 'failed', 'stopped', 'unknown']),
+    attemptId: AttemptIdSchema.nullable(),
+    checkArtifactId: ArtifactIdSchema.nullable(),
+  })
+  .refine(
+    (dispatch) => (dispatch.state === 'reserved') === (dispatch.attemptId === null),
+    'A dispatched slot needs its actual attempt.',
+  );
+const combinedMemberPreview = z.strictObject({
+  taskId: TaskIdSchema,
+  runId: RunIdSchema,
+  scope: z.tuple([NativeTargetPathSchema]),
+  start: combinedAvailability,
+});
+export const CombinedRunPreviewSchema = z
+  .strictObject({
+    taskId: TaskIdSchema,
+    runId: RunIdSchema,
+    preparationId: ArtifactIdSchema,
+    manifestHash: HashSchema,
+    revision: RevisionSchema,
+    generation: RevisionSchema,
+    evaluationSelection: z.strictObject({
+      recipeId: z.literal('project-node-tests-v1'),
+      testFiles: ProjectNodeTestFilesSchema,
+      reviewer: z.strictObject({
+        profileId: z.literal('openai-file-v1'),
+        methodId: z.literal('keep-it-simple'),
+        cycles: z.literal(1),
+      }),
+      creditPolicy: z.enum(['ordinary', 'existing-credits']),
+    }),
+    members: z.tuple([combinedMemberPreview, combinedMemberPreview]),
+    phase: z.enum([
+      'prepared',
+      'baseline',
+      'writers',
+      'assembling',
+      'awaiting-evaluation',
+      'checking',
+      'awaiting-review',
+      'reviewing',
+      'ready',
+      'paused',
+      'stopping',
+      'stopped',
+      'blocked',
+      'unknown',
+      'accepted',
+    ]),
+    blocker: CombinedActionReasonSchema.nullable(),
+    dispatches: z.array(combinedDispatchPreview).length(7),
+    candidate: z.strictObject({ id: CandidateIdSchema, hash: HashSchema }).nullable(),
+    remainingBudgets: RemainingBudgetsSchema,
+    start: combinedAvailability,
+    assemble: combinedAvailability,
+    evaluate: combinedAvailability,
+    review: combinedAvailability,
+    accept: combinedAvailability,
+  })
+  .superRefine((preview, context) => {
+    if (
+      preview.dispatches.some(
+        (dispatch, index) => dispatch.phase !== CombinedDispatchPhaseSchema.options[index],
+      ) ||
+      new Set([preview.taskId, ...preview.members.map((member) => member.taskId)]).size !== 3 ||
+      new Set([preview.runId, ...preview.members.map((member) => member.runId)]).size !== 3 ||
+      preview.members[0].scope[0] === preview.members[1].scope[0] ||
+      ([
+        'awaiting-evaluation',
+        'checking',
+        'awaiting-review',
+        'reviewing',
+        'ready',
+        'accepted',
+      ].includes(preview.phase) &&
+        !preview.candidate)
+    )
+      context.addIssue({
+        code: 'custom',
+        message: 'Combined preview must preserve distinct members and its ordered dispatch ledger.',
+      });
+  });
+export type CombinedRunPreview = z.infer<typeof CombinedRunPreviewSchema>;
+
 export const SnapshotSchema = z
   .strictObject({
     usageReaders: z.array(UsageReaderSchema).max(1).default([]),
     googleAcpSetup: GoogleAcpSetupSchema.nullable().default(null),
+    localSetup: LocalSetupSchema.nullable().optional(),
     nativeProfiles: z
       .array(NativeProfileSchema)
-      .max(6)
+      .max(7)
       .refine((profiles) => new Set(profiles.map((profile) => profile.id)).size === profiles.length)
       .default([]),
     nativeRuns: z.array(NativeRunSchema).max(10000).default([]),
     candidateEvaluations: z.array(CandidateEvaluationPreviewSchema).max(10000).default([]),
+    combinedRuns: z.array(CombinedRunPreviewSchema).max(1000).default([]),
     protocol: z.literal(1),
     cursor: CursorSchema,
     projects: z.array(ProjectSchema).max(1000),
@@ -1347,6 +2633,49 @@ export const SnapshotSchema = z
     reviewJobs: z.array(ReviewJobSchema).max(1000).optional(),
   })
   .superRefine((snapshot, ctx) => {
+    const combinedMembers = new Set<string>();
+    for (const combined of snapshot.combinedRuns) {
+      const references = [{ taskId: combined.taskId, runId: combined.runId }, ...combined.members];
+      const tasks = references.map((reference) =>
+        snapshot.tasks.find((task) => task.id === reference.taskId),
+      );
+      if (
+        references.some((reference, index) => {
+          const duplicate = combinedMembers.has(reference.taskId);
+          combinedMembers.add(reference.taskId);
+          return (
+            duplicate ||
+            tasks[index]?.runId !== reference.runId ||
+            !snapshot.runs.some(
+              (run) => run.id === reference.runId && run.taskId === reference.taskId,
+            )
+          );
+        }) ||
+        tasks.some((task) => !task || task.projectId !== tasks[0]?.projectId) ||
+        !snapshot.artifacts.some((artifact) => artifact.id === combined.preparationId) ||
+        (combined.candidate &&
+          !snapshot.candidates.some(
+            (candidate) =>
+              candidate.id === combined.candidate?.id &&
+              candidate.hash === combined.candidate.hash &&
+              candidate.taskId === combined.taskId,
+          )) ||
+        combined.dispatches.some(
+          (dispatch, index) =>
+            dispatch.attemptId &&
+            !snapshot.attempts.some(
+              (attempt) =>
+                attempt.id === dispatch.attemptId &&
+                attempt.runId ===
+                  (index === 1 || index === 2 ? combined.members[index - 1].runId : combined.runId),
+            ),
+        )
+      )
+        ctx.addIssue({
+          code: 'custom',
+          message: 'Combined preview must bind its saved group and actual dispatches.',
+        });
+    }
     const seen = new Set<string>();
     for (const native of snapshot.nativeRuns) {
       if (seen.has(native.runId) || !snapshot.runs.some((run) => run.id === native.runId))
@@ -1424,7 +2753,37 @@ const sourceInspection = z
         new Set(details.files.map((file) => file.path)).size === details.files.length),
     'Source details must match the full counts without repeated paths.',
   );
+export const MAX_TASK_ACTIVITY_PAGE_BYTES = 524288;
+export const TaskActivityPageSchema = z
+  .strictObject({
+    kind: z.literal('task-activity'),
+    taskId: TaskIdSchema,
+    events: z.array(z.lazy(() => EventSchema)).max(100),
+    nextBeforeCursor: CursorSchema.nullable(),
+  })
+  .superRefine((page, context) => {
+    if (
+      page.events.some(
+        (event, index) =>
+          event.taskId !== page.taskId ||
+          (index > 0 && BigInt(event.cursor) <= BigInt(page.events[index - 1].cursor)),
+      ) ||
+      new Set(page.events.map((event) => event.id)).size !== page.events.length ||
+      (page.nextBeforeCursor !== null &&
+        (page.events.length === 0 || page.nextBeforeCursor !== page.events[0].cursor))
+    )
+      context.addIssue({
+        code: 'custom',
+        message: 'Activity pages need ordered distinct whole events for one task.',
+      });
+    if (new TextEncoder().encode(JSON.stringify(page)).byteLength > MAX_TASK_ACTIVITY_PAGE_BYTES)
+      context.addIssue({ code: 'custom', message: 'An activity page exceeds its byte limit.' });
+  });
+export type TaskActivityPage = z.infer<typeof TaskActivityPageSchema>;
 export const ReadDataSchema = z.discriminatedUnion('kind', [
+  TaskActivityPageSchema,
+  z.strictObject({ kind: z.literal('conversation-state'), state: TaskConversationStateSchema }),
+  ConversationPageSchema,
   z.strictObject({ kind: z.literal('google-acp-setup'), setup: GoogleAcpSetupSchema }),
   sourceInspection,
   z.strictObject({ kind: z.literal('snapshot'), snapshot: SnapshotSchema }),
@@ -1522,6 +2881,8 @@ export const AttemptOutputSchema = z.union([
   z.strictObject({ ...outputFields, channel: z.literal('acp'), acp: AcpActivitySchema }),
 ]);
 export const EventSchema = z.discriminatedUnion('type', [
+  event('combined.updated', CombinedRunPreviewSchema),
+  event('conversation.entry', ConversationEntrySchema),
   event('task.created', TaskSchema),
   event('task.updated', TaskSchema),
   event('run.prepared', RunSchema),

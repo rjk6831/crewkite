@@ -8,12 +8,12 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
-  readFileSync,
+  readSync,
   realpathSync,
 } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { ControllerClient, readControllerEndpoint } from '@crewkite/client/node';
-import { RuntimeManifestSchema } from '@crewkite/contracts';
+import { type RuntimeManifest, RuntimeManifestSchema } from '@crewkite/contracts';
 import { prepareStateDirectory } from '../../../../scripts/demo-state.ts';
 import {
   checkEnvironment,
@@ -25,6 +25,7 @@ export { prepareStateDirectory } from '../../../../scripts/demo-state.ts';
 
 export const desktopActor = { id: 'desktop', kind: 'desktop' as const };
 export type RuntimePaths = {
+  mode: RuntimeManifest['mode'];
   root: string;
   node: string;
   controller: string;
@@ -42,18 +43,36 @@ function contained(root: string, path: string) {
 function readRegular(path: string, limit: number) {
   const file = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
-    const state = fstatSync(file);
-    if (!state.isFile() || state.nlink !== 1 || state.size > limit)
+    const state = fstatSync(file, { bigint: true });
+    if (!state.isFile() || state.nlink !== 1n || state.size > BigInt(limit))
       throw new Error('The runtime entry must be a bounded regular file.');
-    return readFileSync(file);
+    const bytes = Buffer.alloc(Number(state.size) + 1);
+    let count = 0;
+    while (count < bytes.length) {
+      const read = readSync(file, bytes, count, bytes.length - count, null);
+      if (read === 0) break;
+      count += read;
+    }
+    const after = fstatSync(file, { bigint: true });
+    if (
+      BigInt(count) !== state.size ||
+      (['dev', 'ino', 'size', 'mode', 'uid', 'gid', 'nlink', 'mtimeNs', 'ctimeNs'] as const).some(
+        (key) => state[key] !== after[key],
+      )
+    )
+      throw new Error('The runtime entry changed while reading.');
+    return bytes.subarray(0, count);
   } finally {
     closeSync(file);
   }
 }
-export function resolveRuntime(appPath: string): RuntimePaths {
+export function resolveRuntime(
+  appPath: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): RuntimePaths {
   const appRoot = realpathSync(appPath);
-  const home = process.env.CREWKITE_HOME;
-  const profile = process.env.CREWKITE_PROFILE;
+  const home = environment.CREWKITE_HOME;
+  const profile = environment.CREWKITE_PROFILE;
   if (
     !home ||
     !profile ||
@@ -62,7 +81,8 @@ export function resolveRuntime(appPath: string): RuntimePaths {
     home === profile ||
     Buffer.byteLength(join(home, 'control.sock')) > 100
   )
-    throw new Error('Choose separate absolute demo home and desktop profile paths.');
+    throw new Error('Choose separate absolute controller home and desktop profile paths.');
+  let mode: RuntimeManifest['mode'] = 'demo';
   let stateRoots: string[];
   let root: string;
   let node: string;
@@ -75,6 +95,7 @@ export function resolveRuntime(appPath: string): RuntimePaths {
     const manifest = RuntimeManifestSchema.parse(
       JSON.parse(readRegular(contained(root, join(root, 'manifest.json')), 4096).toString('utf8')),
     );
+    mode = manifest.mode;
     node = contained(root, join(root, 'bin/node'));
     expectedHash = manifest.node.sha256;
     platform = manifest.node.platform;
@@ -92,12 +113,12 @@ export function resolveRuntime(appPath: string): RuntimePaths {
       stateRoots.push(dirname(realpathSync(join(internal, 'tools'))));
     if (
       appRoot !== join(root, 'apps/desktop') ||
-      !process.env.CREWKITE_SOURCE_NODE ||
-      !/^[a-f0-9]{64}$/.test(process.env.CREWKITE_SOURCE_NODE_HASH ?? '')
+      !environment.CREWKITE_SOURCE_NODE ||
+      !/^[a-f0-9]{64}$/.test(environment.CREWKITE_SOURCE_NODE_HASH ?? '')
     )
       throw new Error('The source demo needs its explicit trusted launcher.');
-    node = realpathSync(process.env.CREWKITE_SOURCE_NODE);
-    expectedHash = process.env.CREWKITE_SOURCE_NODE_HASH ?? '';
+    node = realpathSync(environment.CREWKITE_SOURCE_NODE);
+    expectedHash = environment.CREWKITE_SOURCE_NODE_HASH ?? '';
     platform = process.platform;
     arch = process.arch;
   }
@@ -126,15 +147,19 @@ export function resolveRuntime(appPath: string): RuntimePaths {
     throw new Error('The standalone Node identity does not match.');
   const prepare = (path: string) => {
     const base = stateRoots.find((root) => path.startsWith(`${root}${sep}`));
-    if (!base) throw new Error('Choose a state path under the repository demo directory.');
+    if (!base) throw new Error('Choose a state path inside its selected runtime directory.');
     return prepareStateDirectory(base, path);
   };
   return {
+    mode,
     root,
     node,
     home: prepare(resolve(home)),
     profile: prepare(resolve(profile)),
-    controller: contained(root, join(root, 'scripts/demo-controller.ts')),
+    controller: contained(
+      root,
+      join(root, mode === 'demo' ? 'scripts/demo-controller.ts' : 'apps/controller/src/main.ts'),
+    ),
   };
 }
 
@@ -191,12 +216,18 @@ export class DesktopController {
           LANG: 'en_US.UTF-8',
           CREWKITE_HOME: this.paths.home,
           CREWKITE_FIXTURE_IDENTITY:
-            process.env.CREWKITE_FIXTURE_IDENTITY === '1' ? '1' : undefined,
+            this.paths.mode === 'demo' && process.env.CREWKITE_FIXTURE_IDENTITY === '1'
+              ? '1'
+              : undefined,
         },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       this.child = child;
       console.log(`Controller PID: ${child.pid ?? 'starting'}`);
+      const readyLine =
+        this.paths.mode === 'demo'
+          ? 'CREWKITE_CONTROLLER_READY'
+          : `Controller ready at ${join(this.paths.home, 'control.sock')}`;
       let output = '';
       let finished = false;
       const finish = (error?: Error) => {
@@ -215,7 +246,7 @@ export class DesktopController {
         output += bytes.toString('utf8');
         if (output.length > 4096)
           finish(new Error('The controller startup output exceeded its bound.'));
-        else if (output.split('\n').includes('CREWKITE_CONTROLLER_READY')) finish();
+        else if (output.split('\n').includes(readyLine)) finish();
       });
       child.stderr?.on('data', () => {});
       child.once('error', () => finish(new Error('The standalone controller could not start.')));

@@ -44,7 +44,19 @@ export function createTestIds(start = DEMO_TIME, seed = 0n) {
   }
   const timestamp = encode(BigInt(milliseconds), 10);
   return (
-    prefix: 'prj' | 'tsk' | 'run' | 'att' | 'rte' | 'apr' | 'art' | 'cnd' | 'hnd' | 'evt' | 'cmd',
+    prefix:
+      | 'prj'
+      | 'tsk'
+      | 'run'
+      | 'att'
+      | 'rte'
+      | 'apr'
+      | 'art'
+      | 'cnd'
+      | 'hnd'
+      | 'evt'
+      | 'cmd'
+      | 'msg',
   ) => {
     const suffix = encode(counter, 16);
     counter++;

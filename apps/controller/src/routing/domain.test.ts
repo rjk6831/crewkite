@@ -186,6 +186,42 @@ test('stale and missing windows use only the selected finite fallback policy', (
     chooseRoute({ ...base, unknownUsage: { rule: 'manual', approvedRouteIds: [b] } }).chosen,
     b,
   );
+  for (const reading of [
+    { ...observation(b, 0, 2 * hour), observedAt: stamp(-2 * hour) },
+    { ...observation(b, 5, 2 * hour), observedAt: stamp(-2 * hour) },
+    observation(b, 0, 0),
+    { ...observation(b, 0, 2 * hour), observedAt: stamp(1) },
+    {
+      ...observation(b, 0, 2 * hour),
+      observedAt: stamp(-2 * hour),
+      remaining: { value: 0, unit: 'requests' as const },
+    },
+  ]) {
+    const unknown = { ...base, observations: [reading] };
+    for (const entry of cases)
+      assert.equal(
+        chooseRoute({
+          ...unknown,
+          unknownUsage: entry.policy,
+          fixedUsage: entry.usage,
+        }).chosen,
+        entry.chosen,
+      );
+    assert.throws(
+      () => chooseRoute({ ...unknown, reserves: [...unknown.reserves, unknown.reserves[1]] }),
+      /more than one reserve/,
+    );
+    const constrained = {
+      ...unknown,
+      candidates: [{ ...unknown.candidates[0], windowIds: ['weekly', 'short'] }],
+      observations: [
+        reading,
+        { ...observation(b, 0, hour), windowId: 'short', kind: 'rolling' as const },
+      ],
+      unknownUsage: { rule: 'manual' as const, approvedRouteIds: [b] },
+    };
+    assert.equal(chooseRoute(constrained).chosen, null);
+  }
   base.observations = [observation(b, 30, 2 * hour)];
   base.candidates = [{ ...base.candidates[0], windowIds: ['weekly', 'missing'] }];
   assert.equal(chooseRoute(base).chosen, null);

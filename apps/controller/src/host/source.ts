@@ -9,14 +9,16 @@ import {
   ftruncateSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
   readdirSync,
   readFileSync,
   realpathSync,
+  rmSync,
   writeFileSync,
   writeSync,
 } from 'node:fs';
-import { devNull } from 'node:os';
+import { devNull, tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import {
   type SourceDetails,
@@ -376,7 +378,61 @@ export function committedFiles(path: string, base: string): FileContent[] {
   return files;
 }
 
+export function readCandidateFiles(root: string, repository: string, base: string): FileContent[] {
+  const original = committedFiles(repository, base);
+  const rules = original.filter((file) => file.path.split('/').at(-1) === '.gitignore');
+  if (!rules.length) return readFiles(root);
+  const tracked = new Set<string>();
+  for (const file of original) {
+    const parts = file.path.split('/');
+    for (let end = 1; end <= parts.length; end++) tracked.add(parts.slice(0, end).join('/'));
+  }
+  const context = mkdtempSync(join(tmpdir(), 'crewkite-ignore-'));
+  try {
+    git(context, ['init', '--quiet', '--template=']);
+    for (const rule of rules) {
+      mkdirSync(dirname(join(context, rule.path)), { recursive: true });
+      writeFileSync(join(context, rule.path), rule.content);
+    }
+    // Frozen rules exclude generated files without letting new ignore rules conceal edits.
+    return readScratchFiles(root, (paths) => {
+      const requested = new Map<string, string>();
+      for (const path of paths) {
+        const name = path.replace(/\/$/, '');
+        safePath(name, new Set(), new Map());
+        if (path.endsWith('/')) mkdirSync(join(context, name), { recursive: true });
+        if (!tracked.has(name)) requested.set(name, path);
+      }
+      if (!requested.size) return new Set();
+      let output: Buffer;
+      try {
+        output = git(
+          context,
+          ['check-ignore', '--no-index', '-z', '--stdin'],
+          `${[...requested.keys()].join('\0')}\0`,
+        );
+      } catch (error) {
+        if ((error as { status?: number }).status === 1) return new Set();
+        throw error;
+      }
+      const ignored = output.toString('utf8').split('\0').filter(Boolean);
+      if (
+        !Buffer.from(output.toString('utf8')).equals(output) ||
+        ignored.some((path) => !requested.has(path))
+      )
+        throw new Error('Invalid ignored source paths.');
+      return new Set(ignored.map((path) => requested.get(path) as string));
+    });
+  } finally {
+    rmSync(context, { recursive: true, force: true });
+  }
+}
+
 export function readFiles(root: string): FileContent[] {
+  return readScratchFiles(root);
+}
+
+function readScratchFiles(root: string, ignored?: (paths: string[]) => Set<string>): FileContent[] {
   const rootState = lstatSync(root);
   if (!rootState.isDirectory() || rootState.isSymbolicLink())
     throw new Error('Scratch root is not an independent directory.');
@@ -385,13 +441,21 @@ export function readFiles(root: string): FileContent[] {
   const prefixes = new Map<string, string>();
   let total = 0;
   function visit(directory: string) {
-    for (const name of readdirSync(directory).sort()) {
-      const file = join(directory, name);
-      const path = relative(root, file).split('\\').join('/');
-      const state = lstatSync(file);
+    const entries = readdirSync(directory)
+      .sort()
+      .map((name) => {
+        if (name.toLowerCase() === '.git') throw new Error('Scratch Git metadata is unsupported.');
+        const file = join(directory, name);
+        const path = relative(root, file).split('\\').join('/');
+        return { file, path, state: lstatSync(file) };
+      });
+    const excluded = ignored?.(
+      entries.map(({ path, state }) => path + (state.isDirectory() ? '/' : '')),
+    );
+    for (const { file, path, state } of entries) {
+      if (excluded?.has(path + (state.isDirectory() ? '/' : ''))) continue;
       if (state.isSymbolicLink()) throw new Error('Scratch contains an unsupported symlink.');
       if (state.isDirectory()) {
-        if (name.toLowerCase() === '.git') throw new Error('Scratch Git metadata is unsupported.');
         visit(file);
         continue;
       }

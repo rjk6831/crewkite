@@ -1,0 +1,588 @@
+/* The toolbar mounts inside .conversation-composer-footer, which holds the inset. The padding
+   variable keeps it usable as its own row. It sizes itself from its own width, so the same rules
+   hold in a wide panel and a narrow one. */
+.composer-controls {
+  container: composer-controls / inline-size;
+  position: relative;
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: var(--composer-controls-padding, 2px 10px 2px 16px);
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.4;
+  --cc-amber: var(--amber);
+  --cc-red: var(--red);
+}
+/* Light amber and red fall just under 4.5:1 on the hover surface. A little text color keeps the
+   small status text readable there. */
+:root[data-theme="light"] .composer-controls {
+  --cc-amber: color-mix(in srgb, var(--amber) 85%, var(--text));
+  --cc-red: color-mix(in srgb, var(--red) 85%, var(--text));
+}
+
+/* conversation.css styles every button in the composer footer as the send button. These resets
+   outrank those rules, so the toolbar also holds up if it is mounted inside the footer. */
+.composer-controls :is(.cc-button, .cc-item, .cc-status, .cc-remove) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  justify-items: stretch;
+  gap: 6px;
+  flex-shrink: 0;
+  width: auto;
+  height: auto;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  box-shadow: none;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  filter: none;
+  opacity: 1;
+}
+/* The footer adds a hover filter at (0,3,1). Matching its :not(:disabled) keeps this rule above
+   it, and no control here uses the disabled attribute, so it covers aria-disabled controls too. */
+.composer-controls :is(.cc-button, .cc-item, .cc-status, .cc-remove):hover:not(:disabled) {
+  filter: none;
+}
+.composer-controls [aria-disabled="true"] {
+  cursor: default;
+}
+
+.composer-controls .cc-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.composer-controls .cc-primary {
+  display: flex;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+.composer-controls .cc-meter {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  margin-left: 2px;
+}
+.composer-controls .cc-divider {
+  flex-shrink: 0;
+  width: 1px;
+  height: 16px;
+  margin-inline: 4px;
+  background: var(--border-strong);
+}
+.composer-controls .cc-row > .cc-divider:first-child {
+  display: none;
+}
+
+.composer-controls .cc-button {
+  height: 30px;
+  padding: 0 8px;
+  border-radius: 9px;
+  color: var(--text-muted);
+  font-weight: 500;
+  white-space: nowrap;
+}
+.composer-controls .cc-button:hover:not([aria-disabled="true"]),
+.composer-controls .cc-button[aria-expanded="true"] {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+.composer-controls .cc-button[aria-disabled="true"] {
+  color: var(--text-dim);
+}
+.composer-controls .cc-icon {
+  justify-content: center;
+  width: 30px;
+  padding: 0;
+}
+.composer-controls .cc-add {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+.composer-controls .cc-add[aria-disabled="true"] {
+  border-color: var(--border);
+  color: var(--text-dim);
+}
+/* The policy starts from zero and grows into the space left over, so its label gives way first.
+   The model label shortens next. The effort label is short and holds until the narrow step. */
+.composer-controls .cc-model {
+  flex: 0 1 auto;
+  min-width: 72px;
+  max-width: 280px;
+}
+.composer-controls .cc-effort {
+  flex: 0 0 auto;
+  max-width: 150px;
+}
+.composer-controls .cc-policy {
+  flex: 1 1 0;
+  min-width: 52px;
+  max-width: max-content;
+}
+/* A long role label shortens before it can push the model name out of the trigger. */
+.composer-controls .cc-role {
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 10em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-dim);
+}
+.composer-controls .cc-value {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.composer-controls .cc-policy .cc-value {
+  max-width: 200px;
+}
+.composer-controls .cc-button:not([aria-disabled="true"]) .cc-value {
+  color: var(--text);
+}
+.composer-controls .cc-caret {
+  margin-left: -2px;
+  color: var(--text-dim);
+}
+.composer-controls .cc-pending {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 3px;
+  color: var(--cc-amber);
+  font-size: 11px;
+}
+.composer-controls .cc-mic {
+  margin-left: auto;
+}
+.composer-controls .cc-mic[aria-pressed="true"] {
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--border-strong));
+  background: color-mix(in srgb, var(--accent) 14%, var(--surface));
+  color: var(--accent);
+}
+.composer-controls .cc-mic[data-state="processing"]:not([aria-disabled="true"]) {
+  color: var(--text);
+}
+.composer-controls .cc-spin {
+  animation: composer-controls-spin 900ms linear infinite;
+}
+@keyframes composer-controls-spin {
+  to {
+    rotate: 360deg;
+  }
+}
+
+/* A disconnected controller blocks everything, so the reason gets a full line where it can wrap. */
+.composer-controls .cc-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin: 0;
+  padding: 6px 10px;
+  border: 1px solid color-mix(in srgb, var(--amber) 34%, var(--border));
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--amber) 7%, var(--surface));
+  color: var(--text);
+  font-size: 11.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.composer-controls .cc-notice svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--cc-amber);
+}
+
+/* Two rows of chips at most. More scroll inside the list, so the controls row never moves down. */
+.composer-controls .cc-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-height: 72px;
+  margin: -4px;
+  padding: 4px;
+  overflow-y: auto;
+  list-style: none;
+  scrollbar-width: thin;
+}
+.composer-controls .cc-chips :focus-visible {
+  outline-offset: 1px;
+}
+.composer-controls .cc-chip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  height: 28px;
+  padding: 0 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  background: var(--surface-raised);
+  color: var(--text);
+  font-size: 11.5px;
+}
+.composer-controls .cc-chip[data-status="pending"] {
+  border-style: dashed;
+}
+.composer-controls .cc-chip[data-status="failed"] {
+  border-color: color-mix(in srgb, var(--red) 55%, var(--border-strong));
+}
+.composer-controls .cc-chip[data-status="uncertain"] {
+  border-color: color-mix(in srgb, var(--amber) 55%, var(--border-strong));
+}
+.composer-controls .cc-chip-kind {
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+.composer-controls .cc-chip-name {
+  min-width: 0;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer-controls .cc-chip-size {
+  flex-shrink: 0;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.composer-controls .cc-status {
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+/* A status without a detail is plain text. Only the explained ones are buttons. */
+.composer-controls span.cc-status {
+  border: 0;
+}
+.composer-controls button.cc-status {
+  height: 20px;
+  margin-inline: -4px;
+  padding: 0 4px;
+  border-radius: 6px;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+.composer-controls button.cc-status:hover {
+  background: var(--surface-hover);
+}
+.composer-controls [data-status="pending"] .cc-status {
+  color: var(--blue);
+}
+.composer-controls [data-status="failed"] .cc-status {
+  color: var(--cc-red);
+}
+.composer-controls [data-status="uncertain"] .cc-status {
+  color: var(--cc-amber);
+}
+.composer-controls .cc-remove {
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-right: -5px;
+  border-radius: 6px;
+  color: var(--text-muted);
+}
+.composer-controls .cc-remove:hover:not([aria-disabled="true"]) {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+.composer-controls .cc-remove[aria-disabled="true"] {
+  color: var(--text-dim);
+}
+
+/* Menus open upward because the composer sits at the bottom of the window. They flip when the
+   space runs out. The popover lives in the top layer, so the composer never clips it. */
+.composer-controls .cc-menu {
+  position: fixed;
+  inset: auto;
+  position-area: block-start span-inline-end;
+  position-try-fallbacks:
+    flip-inline,
+    flip-block,
+    flip-block flip-inline;
+  width: max-content;
+  min-width: 236px;
+  max-width: min(340px, calc(100vw - 16px));
+  max-height: min(440px, calc(100dvh - 16px));
+  margin: 6px 0;
+  padding: 5px;
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: 0 18px 48px -18px #000c;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.4;
+}
+:root[data-theme="light"] .composer-controls .cc-menu {
+  box-shadow: 0 18px 44px -20px #22302455;
+}
+.composer-controls .cc-menu:popover-open {
+  display: flex;
+  flex-direction: column;
+  opacity: 1;
+  translate: 0 0;
+  transition:
+    opacity 140ms ease-out,
+    translate 140ms ease-out;
+}
+@starting-style {
+  .composer-controls .cc-menu:popover-open {
+    opacity: 0;
+    translate: 0 4px;
+  }
+}
+.composer-controls .cc-menu-head {
+  display: grid;
+  gap: 1px;
+  padding: 7px 9px 6px;
+}
+.composer-controls .cc-menu-head strong {
+  font-size: 12px;
+  font-weight: 600;
+}
+.composer-controls .cc-menu-head span {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.composer-controls .cc-menu-notice {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 2px 4px 5px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--amber) 10%, var(--surface));
+  font-size: 11px;
+  line-height: 1.45;
+}
+.composer-controls .cc-menu-notice svg {
+  flex-shrink: 0;
+  color: var(--cc-amber);
+}
+.composer-controls .cc-menu-list {
+  display: grid;
+  gap: 1px;
+  min-height: 0;
+  padding: 1px;
+  overflow-y: auto;
+}
+/* An empty menu holds focus itself but has no height, so its focus ring moves to the message. */
+.composer-controls .cc-menu-list:empty {
+  padding: 0;
+  outline: 0;
+}
+.composer-controls .cc-menu-list:empty:focus-visible + .cc-menu-empty {
+  border-radius: 8px;
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.composer-controls .cc-item {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  align-items: start;
+  column-gap: 8px;
+  width: 100%;
+  padding: 7px 9px;
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.35;
+  white-space: normal;
+}
+.composer-controls .cc-item:focus-visible {
+  outline-offset: -2px;
+}
+.composer-controls .cc-item:is(:hover, :focus):not([aria-disabled="true"]) {
+  background: var(--surface-hover);
+}
+.composer-controls .cc-item[aria-disabled="true"] {
+  color: var(--text-muted);
+}
+.composer-controls .cc-item[aria-disabled="true"]:focus {
+  background: var(--surface-raised);
+}
+.composer-controls .cc-item-mark {
+  display: flex;
+  align-items: center;
+  height: 17px;
+  color: var(--text-muted);
+}
+.composer-controls .cc-item[role="menuitemradio"] .cc-item-mark {
+  color: var(--accent);
+}
+.composer-controls .cc-item-text {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.composer-controls :is(.cc-item-detail, .cc-item-reason) {
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.composer-controls .cc-item-reason {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+}
+.composer-controls .cc-item-reason svg {
+  flex-shrink: 0;
+  translate: 0 1px;
+}
+.composer-controls .cc-item-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding-top: 2px;
+  color: var(--text-dim);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.composer-controls .cc-item-tag[data-requested] {
+  color: var(--cc-amber);
+}
+.composer-controls :is(.cc-menu-empty, .cc-menu-note) {
+  margin: 0;
+  padding: 8px 9px 5px;
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.composer-controls .cc-menu-note {
+  margin-top: 5px;
+  border-top: 1px solid var(--border);
+}
+
+/* Tips explain blocked controls and failed context. A hint popover closes on Escape on its own. */
+.composer-controls .cc-tip {
+  position: fixed;
+  inset: auto;
+  position-area: block-start span-inline-end;
+  position-try-fallbacks:
+    flip-inline,
+    flip-block,
+    flip-block flip-inline;
+  width: max-content;
+  max-width: min(280px, calc(100vw - 16px));
+  margin: 6px 0;
+  padding: 7px 10px;
+  overflow: visible;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  background: var(--surface-raised);
+  box-shadow: 0 12px 30px -14px #000c;
+  color: var(--text);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+/* The margin above leaves a gap. This keeps the pointer inside the tip while it crosses it. */
+.composer-controls .cc-tip::before {
+  position: absolute;
+  inset: -7px 0;
+  content: "";
+}
+
+.composer-controls .cc-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Full names stay in accessible names and in the menus. Only the visible trigger text shortens.
+   The pending word goes first, then the role and policy labels, then the chevrons. */
+@container composer-controls (max-width: 640px) {
+  .composer-controls .cc-pending-text {
+    display: none;
+  }
+}
+@container composer-controls (max-width: 520px) {
+  .composer-controls .cc-role,
+  .composer-controls .cc-policy .cc-value {
+    display: none;
+  }
+  .composer-controls .cc-button {
+    padding-inline: 7px;
+  }
+  .composer-controls .cc-icon {
+    padding: 0;
+  }
+  .composer-controls .cc-effort {
+    flex-shrink: 1;
+    max-width: 120px;
+  }
+  .composer-controls .cc-policy {
+    min-width: max-content;
+  }
+}
+@container composer-controls (max-width: 360px) {
+  .composer-controls .cc-row {
+    gap: 2px;
+  }
+  .composer-controls .cc-divider {
+    margin-inline: 2px;
+  }
+  .composer-controls .cc-caret {
+    display: none;
+  }
+  .composer-controls .cc-effort {
+    max-width: 96px;
+  }
+  .composer-controls .cc-chip-name {
+    max-width: 150px;
+  }
+}
+
+/* The global reduced-motion rule uses a universal selector, so these class rules would win. */
+@media (prefers-reduced-motion: reduce) {
+  .composer-controls .cc-menu:popover-open {
+    transition: none;
+  }
+  .composer-controls .cc-spin {
+    animation: none;
+  }
+}
+
+/* Forced colors drop fills, so borders mark the controls and the focused item uses Highlight. */
+@media (forced-colors: active) {
+  .composer-controls :is(.cc-button, .cc-chip, .cc-menu, .cc-tip, .cc-notice) {
+    border-color: CanvasText;
+  }
+  .composer-controls .cc-item {
+    border-color: Canvas;
+  }
+  .composer-controls [aria-disabled="true"],
+  .composer-controls [aria-disabled="true"] * {
+    color: GrayText;
+  }
+  .composer-controls .cc-item:is(:hover, :focus):not([aria-disabled="true"]),
+  .composer-controls .cc-item:is(:hover, :focus):not([aria-disabled="true"]) * {
+    background: Highlight;
+    color: HighlightText;
+  }
+  .composer-controls .cc-menu-note {
+    border-color: CanvasText;
+  }
+}

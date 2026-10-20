@@ -60,6 +60,8 @@ export type NativeTranscript<T> = {
   readonly lastEnvelope: NativeEnvelope;
   readonly refusedEnvelope: RefusedEnvelope | null;
   readonly notifications: number;
+  /** Stdout and stderr bytes the process may write. One MiB when absent. */
+  readonly outputLimit?: number;
 };
 type Spawn = (
   executable: string,
@@ -230,6 +232,7 @@ function startTranscript<T>(
   let stderrBytes = 0;
   let stopping = false;
   let owned = false;
+  let killedAt: number | undefined;
   let exitCode: number | null = null;
   let exitSignal: NodeJS.Signals | null = null;
   const cancellations: Array<() => void> = [];
@@ -273,6 +276,30 @@ function startTranscript<T>(
       // Only an observed absent group proves that a failed signal needs no further action.
     }
   };
+  const settleAtCutoff = () => {
+    // An exited group can precede delivery of its final stream-close event.
+    if (group > 0 && !closed && absent())
+      cancellations.push(schedule(() => settle(closed && absent()), 0));
+    else settle(closed && absent());
+  };
+  const cutoff = () => {
+    if (finished) return;
+    if (absent()) return settleAtCutoff();
+    // Timers run before the poll phase that reaps children. When synchronous work holds the
+    // loop past the cutoff, KILL and this check run in one pass, microseconds apart, and an
+    // owned task's deferred TERM runs with them. Node runs one timer list per duration at a
+    // time, so an older 2000 ms list can even reach this check before the 1000 ms kill.
+    // Deciding after one poll phase lets that kill go out and the child be reaped. A group
+    // still present then gets a full second from its kill, still inside a task's deadline.
+    setImmediate(() => {
+      if (finished) return;
+      if (absent()) return settleAtCutoff();
+      const late = killedAt === undefined ? 0 : killedAt + 1000 - now();
+      const wait = options.task ? Math.min(late, deadline - now()) : late;
+      if (wait > 0) cancellations.push(schedule(settleAtCutoff, wait));
+      else settle(false);
+    });
+  };
   const stop = (failure: Outcome['reason']) => {
     if (finished) return;
     reason ??= failure;
@@ -301,15 +328,15 @@ function startTranscript<T>(
     if (!options.task || !owned) signal('SIGTERM');
     cancellations.push(
       schedule(
-        () => signal('SIGKILL'),
+        () => {
+          killedAt = now();
+          signal('SIGKILL');
+        },
         options.task ? Math.max(0, Math.min(1000, deadline - now())) : 1000,
       ),
     );
     cancellations.push(
-      schedule(
-        () => settle(closed && absent()),
-        options.task ? Math.max(0, Math.min(2000, deadline - now())) : 2000,
-      ),
+      schedule(cutoff, options.task ? Math.max(0, Math.min(2000, deadline - now())) : 2000),
     );
   };
   let submissionReported = false;
@@ -349,7 +376,7 @@ function startTranscript<T>(
   child.stdout.on('data', (bytes: Buffer) => {
     stdoutBytes += bytes.length;
     received += bytes.length;
-    if (received > 1_048_576) return stop('output-limit');
+    if (received > (reader.outputLimit ?? 1_048_576)) return stop('output-limit');
     if (finished || (stopping && reason !== null)) return;
     try {
       reader.push(bytes);
@@ -361,7 +388,7 @@ function startTranscript<T>(
   child.stderr.on('data', (bytes: Buffer) => {
     stderrBytes += bytes.length;
     received += bytes.length;
-    if (received > 1_048_576) stop('output-limit');
+    if (received > (reader.outputLimit ?? 1_048_576)) stop('output-limit');
   });
   child.stdout.once('end', () => {
     // A completed response can still be followed by an incomplete frame before EOF.
@@ -446,6 +473,7 @@ function nativeSession<T>(
     schedule?: Schedule;
     spawn?: Spawn;
     task?: boolean;
+    maximumTaskMs?: 300_000 | 600_000;
     onSubmitted?: () => void;
     disableMcpServers?: boolean;
     lifecycle?: NativeLifecycle;
@@ -458,7 +486,7 @@ function nativeSession<T>(
     !Number.isFinite(started) ||
     !Number.isSafeInteger(options.timeoutMs) ||
     options.timeoutMs < (options.task ? 2001 : 1) ||
-    options.timeoutMs > (options.task ? 300_000 : 60_000)
+    options.timeoutMs > (options.task ? (options.maximumTaskMs ?? 300_000) : 60_000)
   )
     throw new Error('Discovery deadline is invalid.');
   const deadline = started + options.timeoutMs;
@@ -583,6 +611,7 @@ export function startNativeTask<T>(
     now?: () => number;
     schedule?: Schedule;
     spawn?: Spawn;
+    maximumTaskMs?: 300_000 | 600_000;
     onSubmitted: () => void;
     disableMcpServers?: boolean;
     lifecycle?: NativeLifecycle;

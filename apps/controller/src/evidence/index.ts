@@ -10,6 +10,7 @@ import {
   CheckEventSchema,
   type CheckResult,
   CheckResultSchema,
+  CombinedCheckContextSchema,
   canonicalJson,
   HashSchema,
   NativeTargetPathSchema,
@@ -31,6 +32,7 @@ import {
   safePath,
   treeFromFiles,
 } from '../host/source.ts';
+import { treeInventoryRecords } from '../host/toolchain.ts';
 import { groupAbsent } from '../host/worker.ts';
 import type { IdPrefix } from '../store/ids.ts';
 import {
@@ -64,6 +66,7 @@ const syntheticNodeCheckDefinition = z.strictObject({
     count: z.number().int().min(1).max(1000),
   }),
   reporterHash: HashSchema,
+  combined: CombinedCheckContextSchema.optional(),
 });
 export const NodeCheckDefinitionSchema = z.discriminatedUnion('recipeId', [
   syntheticNodeCheckDefinition,
@@ -146,7 +149,7 @@ function definition(
   plan: Pick<
     CheckPlan,
     'argv' | 'collection' | 'criteria' | 'evaluator' | 'required' | 'reporterHash'
-  > & { guardHash?: string },
+  > & { guardHash?: string; combined?: z.infer<typeof CombinedCheckContextSchema> },
 ): string {
   return hashCanonical({
     argv: plan.argv,
@@ -156,6 +159,7 @@ function definition(
     required: plan.required,
     reporterHash: plan.reporterHash,
     ...(plan.guardHash ? { guardHash: plan.guardHash } : {}),
+    ...(plan.combined ? { combined: plan.combined } : {}),
   });
 }
 
@@ -513,8 +517,7 @@ function verificationReport(
   const build = execution.build;
   const files = build.entries.filter((entry) => entry.kind === 'file');
   const hash = createHash('sha256');
-  for (const row of [{ version: 1, files: build.files, bytes: build.bytes }, ...build.entries])
-    hash.update(`${JSON.stringify(row)}\n`);
+  for (const row of treeInventoryRecords(build)) hash.update(`${JSON.stringify(row)}\n`);
   if (
     build.entries[0].path !== '.' ||
     build.entries[0].kind !== 'directory' ||
@@ -592,7 +595,7 @@ export class CandidateEvidence {
     return { candidate, artifacts };
   }
 
-  read(candidate: Candidate): { base: string; files: FileContent[] } {
+  describe(candidate: Candidate) {
     CandidateSchema.parse(candidate);
     const artifact = ArtifactSchema.parse(this.getArtifact(candidate.artifactId));
     if (
@@ -612,6 +615,11 @@ export class CandidateEvidence {
     const sealed = manifest(raw.base, raw.files);
     if (hashCanonical(sealed) !== candidate.hash)
       throw new Error('Candidate manifest identity changed.');
+    return sealed;
+  }
+
+  read(candidate: Candidate): { base: string; files: FileContent[] } {
+    const sealed = this.describe(candidate);
     const files = sealed.files.map((file) => {
       const content = this.artifacts.read(file.hash);
       if (content.length !== file.bytes) throw new Error('Candidate content size changed.');
@@ -697,6 +705,7 @@ export class CandidateEvidence {
     sourceFiles: FileContent[];
     criteria: string[];
     selection?: NodeCheckSelection;
+    combined?: z.infer<typeof CombinedCheckContextSchema>;
   }): NodeCheckDefinition {
     const { base, files } = this.read(input.candidate);
     verified(base, input.sourceFiles);
@@ -714,6 +723,7 @@ export class CandidateEvidence {
         return entry(original);
       });
       const fields = {
+        ...(input.combined ? { combined: CombinedCheckContextSchema.parse(input.combined) } : {}),
         argv: [
           `--import=${guardPath}`,
           '--test',
@@ -754,6 +764,7 @@ export class CandidateEvidence {
     const collection = files.filter((file) => isTest(file.path)).map(entry);
     if (collection.length === 0) throw new Error('No required Node tests were collected.');
     const fields = {
+      ...(input.combined ? { combined: CombinedCheckContextSchema.parse(input.combined) } : {}),
       argv: [
         '--test',
         `--test-reporter=${reporterPath}`,
@@ -788,6 +799,7 @@ export class CandidateEvidence {
   }): CheckPlan {
     const current = this.describeChecks({
       ...input,
+      ...(input.expected?.combined ? { combined: input.expected.combined } : {}),
       selection:
         input.expected?.recipeId === 'project-node-tests-v1'
           ? { recipeId: input.expected.recipeId, testFiles: input.expected.required.files }
@@ -836,6 +848,7 @@ export class CandidateEvidence {
           candidateId: candidate.id,
           candidateHash: candidate.hash,
           definitionHash: plan.definitionHash,
+          ...(plan.combined ? { combined: plan.combined } : {}),
           evaluator: plan.evaluator,
           passed,
           unchanged,

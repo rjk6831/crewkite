@@ -5,8 +5,10 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 import test from 'node:test';
 import { hashCanonical, sealHandoff } from '@crewkite/contracts/hash';
+import { verificationGuidance } from '../../evidence/toolchain-definition.ts';
 import { spawnCheckChild as spawn } from '../../host/check-ownership.ts';
 import { groupAbsent } from '../../host/worker.ts';
+import type { OpenAiUsage } from './discovery.ts';
 import { startNativeTask } from './native-discovery.ts';
 import { resolveRepositoryProfile } from './profile.ts';
 import { ReplacementTranscript, replacementPlan, startReplacement } from './replacement.ts';
@@ -24,7 +26,15 @@ import {
   repositoryPlan,
   startRepository,
 } from './repository.ts';
-import { ReviewTranscript, reviewPlan, startReview } from './review.ts';
+import { ReviewTranscript, repositoryReviewBudget, reviewPlan, startReview } from './review.ts';
+
+const repositoryLimits = {
+  deadlineMs: 600_000,
+  paths: [] as string[],
+  checks: [] as string[],
+  frozen: [] as string[],
+  review: repositoryReviewBudget,
+};
 
 const original = 'export function netMinor() { throw new Error(); }\n';
 const plan = (directory: string, path = 'net.mjs') =>
@@ -76,6 +86,37 @@ const threadNotices = (directory: string) => [
     },
   },
 ];
+const methodHash = (value: string) => createHash('sha256').update(value).digest('hex');
+// Progress and display notices nothing consumes. The census keeps only their method hashes.
+const ignoredNotices = (identity: { threadId: string; turnId: string }) => [
+  {
+    method: 'item/commandExecution/outputDelta',
+    params: { ...identity, itemId: 'command-1', delta: 'private-notice-canary' },
+  },
+  { method: 'modelProvider/authRecoveryStarted', params: identity },
+  {
+    method: 'turn/moderationMetadata',
+    params: { ...identity, metadata: { note: 'private-notice-canary' } },
+  },
+  { method: 'model/safetyBuffering/updated', params: identity },
+  { method: 'private-notice-canary', params: { text: 'private-notice-canary' } },
+];
+const repositoryTask = (directory: string) =>
+  repositoryPlan({
+    attemptId: plan(directory).attemptId,
+    model: 'gpt-6.1-sol',
+    effort: 'low',
+    scratchPath: resolve(directory, 'scratch'),
+    sourceBase: 'a'.repeat(40),
+    manifestHash: 'b'.repeat(64),
+    execution: { sandbox: 'workspace-write', approvalPolicy: 'never', networkAccess: false },
+    context: {
+      title: 'Fix arithmetic',
+      outcome: 'Preserve the bounds.',
+      criteria: ['Return the bounded net.'],
+    },
+    limits: repositoryLimits,
+  });
 const edit = (directory: string, path = 'net.mjs') => ({
   version: 1,
   attemptId: plan(directory).attemptId,
@@ -154,6 +195,29 @@ const output = (directory: string, mode = 'success', path = 'net.mjs', structure
       { method: 'item/completed', params: { ...identity, item: reasoning, completedAtMs: 2 } },
     );
   }
+  if (mode === 'ignored-notices') messages.splice(2, 0, ...ignoredNotices(identity));
+  if (mode === 'late-progress')
+    messages.push(
+      {
+        method: 'thread/tokenUsage/updated',
+        params: {
+          ...identity,
+          tokenUsage: { total: { totalTokens: 9 }, last: { totalTokens: 9 } },
+        },
+      },
+      ignoredNotices(identity)[0],
+    );
+  if (mode === 'late-completion') messages.push(messages.at(-1));
+  if (mode === 'late-item')
+    messages.push({
+      method: 'item/started',
+      params: { ...identity, item: { id: 'reasoning-1', type: 'reasoning' } },
+    });
+  if (mode === 'late-error')
+    messages.push({
+      method: 'error',
+      params: { ...identity, willRetry: true, error: { message: 'private retry detail' } },
+    });
   if (mode === 'duplicate') messages.splice(4, 0, messages[3]);
   if (mode === 'summary') item.text = 'The change is done.';
   if (mode === 'extra-field') item.text = JSON.stringify({ ...value, command: 'touch elsewhere' });
@@ -161,6 +225,18 @@ const output = (directory: string, mode = 'success', path = 'net.mjs', structure
   return messages;
 };
 const bytes = (message: unknown) => Buffer.from(`${JSON.stringify(message)}\n`);
+const weekly = { usedPercent: 34, windowDurationMins: 10080, resetsAt: 1792679628 };
+const codex = { limitId: 'codex', primary: weekly, secondary: null, credits: null };
+const usageRead = { ordinaryUsageAllowed: true, rateLimits: codex, rateLimitsByLimitId: { codex } };
+const weeklyWindow = {
+  windowId: 'codex:primary',
+  kind: 'weekly',
+  semantics: { scope: 'provider', periodSeconds: 604800 },
+  remaining: { value: 66, unit: 'percent' },
+  resetsAt: '2026-10-22T14:33:48.000Z',
+  source: 'client',
+  confidence: 'reported',
+};
 function metadata(
   reader: Pick<ReplacementTranscript, 'next' | 'push'>,
   overrides: Record<string, unknown> = {},
@@ -269,9 +345,14 @@ test('native proposals and reviews require one matching completed turn and bound
     'fragmented',
     'reasoning-retry',
     'thread-notices',
+    'ignored-notices',
+    'late-progress',
     'nested-path',
     'unicode-path',
     'byte-limit',
+    'late-completion',
+    'late-item',
+    'late-error',
     'different-path',
     'nul-content',
     'wrong-attempt',
@@ -335,6 +416,8 @@ test('native proposals and reviews require one matching completed turn and bound
       mode === 'fragmented' ||
       mode === 'reasoning-retry' ||
       mode === 'thread-notices' ||
+      mode === 'ignored-notices' ||
+      mode === 'late-progress' ||
       mode === 'nested-path' ||
       mode === 'unicode-path' ||
       mode === 'byte-limit'
@@ -345,9 +428,20 @@ test('native proposals and reviews require one matching completed turn and bound
         ...(mode === 'byte-limit' ? { content: 'é'.repeat(32768) } : {}),
       });
       assert.equal(result.qualified, false);
+      assert.equal(Object.hasOwn(result, 'modelChoices'), false);
       assert.equal(result.observedRetries, mode === 'reasoning-retry' ? 1 : 0);
       assert(!JSON.stringify(result).includes('private-data'));
       assert.equal(reader.next(), null);
+      if (mode === 'late-progress') assert.equal(result.contextUsage?.usedTokens, 9);
+      if (mode === 'ignored-notices' || mode === 'late-progress')
+        assert.deepEqual(
+          reader.ignoredNotifications,
+          Object.fromEntries(
+            ignoredNotices({ threadId: 'thread-1', turnId: 'turn-1' })
+              .slice(0, mode === 'late-progress' ? 1 : undefined)
+              .map(({ method }) => [methodHash(method), 1]),
+          ),
+        );
     } else assert.throws(perform, mode);
   }
   const directory = resolve('internal/replacement-fixture');
@@ -369,6 +463,7 @@ test('native proposals and reviews require one matching completed turn and bound
       method: 'mcpServer/startupStatus/updated',
       params: { threadId: 'thread-1', name: 'private server', status: 'starting' },
     },
+    { method: 'account/updated', params: { authMode: 'apikey', planType: null } },
     {
       method: 'thread/settings/updated',
       params: { threadId: 'foreign', threadSettings: threadSettings(directory) },
@@ -409,9 +504,7 @@ test('native proposals and reviews require one matching completed turn and bound
     assert.equal(rejected.complete, false);
     assert.equal(
       rejected.diagnostic?.method,
-      notice.method.startsWith('thread/environment/') || notice.method.startsWith('mcpServer/')
-        ? 'other'
-        : notice.method,
+      /^(thread\/environment|mcpServer|account)\//.test(notice.method) ? 'other' : notice.method,
     );
   }
   const canary = 'private-diagnostic-canary';
@@ -445,7 +538,7 @@ test('native proposals and reviews require one matching completed turn and bound
     },
     {
       frame: {
-        method: canary,
+        method: 'thread/closed',
         params: {
           threadId: 'thread-1',
           turnId: canary,
@@ -674,6 +767,11 @@ test('native proposals and reviews require one matching completed turn and bound
     },
   };
   const { attemptId: _writerAttempt, criteria: _writerCriteria, ...reviewData } = reviewInput;
+  // The client echoes the review text twice, so the runner must allow two full lines and 1 MiB.
+  assert.equal(
+    new ReviewTranscript(reviewPlan(reviewData), { now: () => 1, timeoutMs: 180_000 }).outputLimit,
+    3 * 1024 * 1024,
+  );
   for (const row of [
     { mode: 'passed', allowed: true },
     { mode: 'failed', allowed: true },
@@ -699,7 +797,8 @@ test('native proposals and reviews require one matching completed turn and bound
     const expectedHash = hashCanonical(expectedBinding);
     const review = new ReviewTranscript(selected, { now: () => 1, timeoutMs: 180_000 });
     if (row.mode === 'external-mutation') {
-      selected.binding.writerRouteId = selected.binding.routeId;
+      if ('writerRouteId' in selected.binding)
+        selected.binding.writerRouteId = selected.binding.routeId;
       selected.context.criteria[0] = 'changed after construction';
     }
     const thread = metadata(review);
@@ -761,6 +860,7 @@ test('native proposals and reviews require one matching completed turn and bound
       const result = perform();
       assert.deepEqual(result.review, response);
       assert.equal(result.qualified, false);
+      assert.equal(Object.hasOwn(result, 'modelChoices'), false);
       assert.equal(review.next(), null);
       assert.equal('replacement' in result, false);
     } else {
@@ -848,6 +948,110 @@ test('native proposals and reviews require one matching completed turn and bound
   assert.deepEqual(collectionTask.repository, repositoryData.repository);
   assert.equal(collectionTask.path, undefined);
   assert.equal(collectionTask.bindingHash, hashCanonical(repositoryData.binding));
+  const combinedId = (prefix: string, index: number) =>
+    `${prefix}_01M51M322B2AEBXD9MA74CBCF${index}`;
+  const { writerAttemptId: _attempt, writerRouteId: _route, ...reviewBinding } = reviewData.binding;
+  const combinedData = {
+    ...repositoryData,
+    binding: {
+      ...reviewBinding,
+      assignedRole: 'reviewer' as const,
+      origin: {
+        kind: 'combined' as const,
+        taskId: reviewBinding.taskId,
+        runId: reviewBinding.runId,
+        preparationId: combinedId('art', 0),
+        manifestHash: 'a'.repeat(64),
+        generation: 0,
+        sourceBase: repositoryData.repository.sourceBase,
+        sourceManifestHash: repositoryData.repository.sourceManifestHash,
+        policyHash: 'c'.repeat(64),
+        criteriaHash: hashCanonical(repositoryData.context.criteria),
+        contributors: [1, 2].map((index) => ({
+          taskId: combinedId('tsk', index),
+          runId: combinedId('run', index),
+          attemptId: combinedId('att', index),
+          generation: 0,
+          routeId: combinedId('rte', index),
+          candidateId: combinedId('cnd', index),
+          candidateHash: `${index}`.repeat(64),
+          scopeHash: 'd'.repeat(64),
+        })) as [
+          import('@crewkite/contracts').CombinedOrigin['contributors'][0],
+          import('@crewkite/contracts').CombinedOrigin['contributors'][1],
+        ],
+        steps: [0, 1].map((index) => ({
+          candidateId: combinedId('cnd', index + 3),
+          candidateHash: index === 0 ? 'e'.repeat(64) : reviewBinding.candidateHash,
+          definitionHash: 'f'.repeat(64),
+          checkArtifactId: combinedId('art', index + 1),
+          previousTree: (index === 0 ? 'a' : 'b').repeat(40),
+          nextTree: (index === 0 ? 'b' : 'c').repeat(40),
+        })) as [
+          import('@crewkite/contracts').CombinedOrigin['steps'][0],
+          import('@crewkite/contracts').CombinedOrigin['steps'][1],
+        ],
+        candidateId: reviewBinding.candidateId,
+        candidateHash: reviewBinding.candidateHash,
+      },
+    },
+  };
+  for (const mode of ['passed', 'stale-origin', 'external-mutation', 'approval'] as const) {
+    const selected = reviewPlan(combinedData);
+    const expected = structuredClone(selected.binding);
+    const reader = new ReviewTranscript(selected, { now: () => 1, timeoutMs: 180_000 });
+    if (mode === 'external-mutation' && 'origin' in selected.binding)
+      selected.binding.origin.contributors[0].scopeHash = '0'.repeat(64);
+    metadata(reader);
+    reader.push(bytes({ id: 10, result: threadResult(directory) }));
+    const request = JSON.parse(Buffer.from(reader.next() as Uint8Array).toString());
+    const task = JSON.parse(request.params.input[0].text.split('\n').slice(1).join('\n'));
+    assert.deepEqual(task.binding, expected);
+    assert.deepEqual(task.repository, repositoryData.repository);
+    assert.equal(task.binding.writerAttemptId, undefined);
+    assert.equal(task.binding.writerRouteId, undefined);
+    assert.equal(task.bindingHash, hashCanonical(expected));
+    reader.push(bytes({ id: 11, result: { turn: running } }));
+    const stale = structuredClone(expected);
+    if ('origin' in stale) stale.origin.generation++;
+    const response = {
+      version: 1,
+      bindingHash: mode === 'stale-origin' ? hashCanonical(stale) : hashCanonical(expected),
+      methodId: 'keep-it-simple',
+      cycle: 1,
+      outcome: 'passed',
+      findings: [],
+      summary: 'Both contributions meet the parent criteria.',
+    };
+    const perform = () => {
+      for (const frame of output(
+        directory,
+        mode === 'approval' ? 'approval' : 'success',
+        'net.mjs',
+        response,
+      ))
+        reader.push(bytes(frame));
+      return reader.finish();
+    };
+    if (mode === 'stale-origin' || mode === 'approval') assert.throws(perform, mode);
+    else {
+      assert.deepEqual(perform().review, response);
+      assert.equal(reader.finish().qualified, false);
+    }
+  }
+  for (const value of [
+    { ...combinedData, binding: { ...combinedData.binding, writerAttemptId: _attempt } },
+    { ...combinedData, binding: { ...combinedData.binding, writerRouteId: _route } },
+    { ...combinedData, binding: { ...combinedData.binding, candidateHash: '0'.repeat(64) } },
+    { ...combinedData, context: { ...combinedData.context, criteria: ['Other criteria.'] } },
+    { ...combinedData, repository: { ...combinedData.repository, sourceBase: '0'.repeat(40) } },
+    {
+      ...combinedData,
+      repository: { ...combinedData.repository, sourceManifestHash: '0'.repeat(64) },
+    },
+    { ...reviewData, binding: combinedData.binding },
+  ])
+    assert.throws(() => reviewPlan(value as Parameters<typeof reviewPlan>[0]));
   const reviewRequest = (value: Parameters<typeof reviewPlan>[0], escaped = false) => {
     const selected = reviewPlan(value);
     const reader = new ReviewTranscript(selected, { now: () => 1, timeoutMs: 180_000 });
@@ -866,6 +1070,31 @@ test('native proposals and reviews require one matching completed turn and bound
     const request = JSON.parse(frame.toString());
     const packet = request.params.input[0].text.split('\n').slice(1).join('\n');
     assert(frame.length < 1024 * 1024);
+    // The client reports the submitted text back twice before the review answer.
+    const threadId = escaped ? '\x01'.repeat(200) : 'thread-1';
+    const review = {
+      version: 1,
+      bindingHash: request.params.outputSchema.properties.bindingHash.const,
+      methodId: 'keep-it-simple',
+      cycle: 1,
+      outcome: 'passed',
+      findings: [],
+      summary: 'One bounded review.',
+    };
+    const echo = { type: 'userMessage', id: 'user-1', content: request.params.input };
+    const frames: unknown[] = output(selected.directory, 'success', 'net.mjs', review).map(
+      (value) =>
+        JSON.parse(JSON.stringify(value).replaceAll('"thread-1"', JSON.stringify(threadId))),
+    );
+    frames.splice(
+      1,
+      0,
+      { method: 'item/started', params: { threadId, turnId: 'turn-1', item: echo } },
+      { method: 'item/completed', params: { threadId, turnId: 'turn-1', item: echo } },
+    );
+    reader.push(bytes({ id: 11, result: { turn: running } }));
+    for (const value of frames) reader.push(bytes(value));
+    assert.deepEqual(reader.finish().review, review);
     return { frame, packet };
   };
   const repositorySides = (original: string, candidate: string) => ({
@@ -881,18 +1110,19 @@ test('native proposals and reviews require one matching completed turn and bound
       ],
     },
   });
-  const nearRepositoryLimit = repositorySides('x'.repeat(200_000), 'y'.repeat(190_000));
+  const repositoryLimit = 448 * 1024;
+  const nearRepositoryLimit = repositorySides('x'.repeat(200_000), 'y'.repeat(250_000));
   const repositoryPadding =
-    384 * 1024 - Buffer.byteLength(reviewRequest(nearRepositoryLimit).packet);
+    repositoryLimit - Buffer.byteLength(reviewRequest(nearRepositoryLimit).packet);
   assert(repositoryPadding > 0);
   const atRepositoryLimit = repositorySides(
     'x'.repeat(200_000),
-    'y'.repeat(190_000 + repositoryPadding),
+    'y'.repeat(250_000 + repositoryPadding),
   );
   const escapedOriginal = '"\\'.repeat(45_000);
   const escapedCandidate = '\\"'.repeat(45_000);
   const escapedPadding =
-    384 * 1024 -
+    repositoryLimit -
     Buffer.byteLength(reviewRequest(repositorySides(escapedOriginal, escapedCandidate)).packet);
   assert(escapedPadding > 0);
   const escapedRepository = {
@@ -913,13 +1143,13 @@ test('native proposals and reviews require one matching completed turn and bound
   ] as const) {
     const { packet } = reviewRequest(value, escaped);
     const size = Buffer.byteLength(packet);
-    assert(size > 256 * 1024 && size <= 384 * 1024, name);
+    assert(size > 256 * 1024 && size <= repositoryLimit, name);
     if (name === 'exact repository aggregate' || name === 'escaping')
-      assert.equal(size, 384 * 1024);
+      assert.equal(size, repositoryLimit);
     assert.deepEqual(JSON.parse(packet).repository, value.repository, name);
   }
   assert.throws(() =>
-    reviewPlan(repositorySides('x'.repeat(200_000), 'y'.repeat(190_001 + repositoryPadding))),
+    reviewPlan(repositorySides('x'.repeat(200_000), 'y'.repeat(250_001 + repositoryPadding))),
   );
   const legacySides = {
     ...reviewData,
@@ -996,9 +1226,30 @@ test('native proposals and reviews require one matching completed turn and bound
       outcome: 'Preserve the bounds.',
       criteria: ['Return the bounded net.'],
     },
+    limits: {
+      ...repositoryLimits,
+      paths: ['docs/calculation.md', 'net.mjs'],
+      ...verificationGuidance,
+    },
   });
+  for (const change of [{ model: 'planning-fixture' }, { effort: 'medium' }]) {
+    assert.throws(() =>
+      replacementPlan({ ...plan(directory), ...change } as Parameters<typeof replacementPlan>[0]),
+    );
+    assert.throws(() =>
+      reviewPlan({ ...reviewData, ...change } as Parameters<typeof reviewPlan>[0]),
+    );
+    assert.throws(() =>
+      repositoryPlan({ ...repositoryInput, ...change } as Parameters<typeof repositoryPlan>[0]),
+    );
+  }
   assert.equal(repositoryInput.creditPolicy, 'ordinary');
   assert.equal(resolveRepositoryProfile({}).facts.id, 'openai-repository-v1');
+  assert.throws(
+    () =>
+      new RepositoryTranscript(repositoryInput, { now: () => 1, timeoutMs: 600_001, directory }),
+    /Repository task deadline is invalid/,
+  );
   for (const invalid of [
     { ...repositoryInput, scratchPath: 'relative' },
     { ...repositoryInput, execution: { ...repositoryInput.execution, networkAccess: true } },
@@ -1022,6 +1273,17 @@ test('native proposals and reviews require one matching completed turn and bound
     'wrong-approval',
     'malformed-approval',
     'unknown-request',
+    'notice-request',
+    'busy-command',
+    'escaped-output',
+    'long-turn',
+    'overrun',
+    'item-overrun',
+    'retry-overrun',
+    'output-overrun',
+    'late-progress',
+    'late-completion',
+    'late-error',
     'network',
     'cwd',
     'incomplete-item',
@@ -1035,7 +1297,7 @@ test('native proposals and reviews require one matching completed turn and bound
     const activities: RepositoryActivity[] = [];
     const native = new RepositoryTranscript(repositoryInput, {
       now: () => clock,
-      timeoutMs: 300_000,
+      timeoutMs: 600_000,
       directory,
       onActivity: (activity) => {
         activities.push(activity);
@@ -1048,6 +1310,13 @@ test('native proposals and reviews require one matching completed turn and bound
     assert.equal(threadRequest.params.cwd, repositoryInput.scratchPath);
     assert.equal(threadRequest.params.sandbox, 'workspace-write');
     assert.equal(threadRequest.params.approvalPolicy, 'never');
+    assert.deepEqual(threadRequest.params.config.shell_environment_policy, {
+      set: {
+        PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN: 'error',
+        PNPM_CONFIG_OFFLINE: 'true',
+        COREPACK_ENABLE_NETWORK: '0',
+      },
+    });
     const thread = {
       ...threadResult(repositoryInput.scratchPath),
       approvalPolicy: 'never',
@@ -1064,13 +1333,19 @@ test('native proposals and reviews require one matching completed turn and bound
     }
     native.push(bytes({ id: 10, result: thread }));
     if (mode === 'deadline') {
-      clock = 300_001;
+      clock = 600_001;
       assert.throws(() => native.next());
       assert.equal(native.submitted, false);
       continue;
     }
     const request = JSON.parse(Buffer.from(native.next() as Uint8Array).toString());
     assert.equal(request.params.outputSchema, undefined);
+    const [instructions, data] = request.params.input[0].text.split('\n');
+    assert.match(instructions, /do not run pnpm, npm or npx/);
+    const limits = JSON.parse(data).limits;
+    assert.deepEqual(limits.paths, ['docs/calculation.md', 'net.mjs']);
+    assert.equal(limits.checks[1], 'lint: biome check . (formatting differences fail)');
+    assert.deepEqual(limits.review, { fileBytes: 256 * 1024, totalBytes: 448 * 1024 });
     assert.equal(request.params.cwd, repositoryInput.scratchPath);
     assert.deepEqual(request.params.sandboxPolicy.writableRoots, [repositoryInput.scratchPath]);
     native.push(bytes({ id: 11, result: { turn: running } }));
@@ -1086,14 +1361,16 @@ test('native proposals and reviews require one matching completed turn and bound
       { method: 'turn/started', params: { threadId: identity.threadId, turn: running } },
       { method: 'item/started', params: { ...identity, item: command, startedAtMs: 1 } },
     ];
-    if (mode.includes('approval') || mode === 'unknown-request') {
+    if (mode.includes('approval') || mode.endsWith('-request')) {
       for (const frame of frames) native.push(bytes(frame));
       const approval = {
         id: 'approval-1',
         method:
           mode === 'unknown-request'
             ? 'item/tool/request'
-            : 'item/commandExecution/requestApproval',
+            : mode === 'notice-request'
+              ? 'item/commandExecution/outputDelta'
+              : 'item/commandExecution/requestApproval',
         params: {
           ...identity,
           turnId: mode === 'wrong-approval' ? 'other' : identity.turnId,
@@ -1124,23 +1401,65 @@ test('native proposals and reviews require one matching completed turn and bound
       assert.equal(native.complete, false);
       continue;
     }
+    const reasoning = (index: number) => ({ id: `reasoning-${index}`, type: 'reasoning' });
+    const retry = { method: 'error', params: { ...identity, willRetry: true, error: {} } };
+    const sized = (length: number) => {
+      const frame = {
+        method: 'item/commandExecution/outputDelta',
+        params: { ...identity, delta: '' },
+      };
+      frame.params.delta = 'x'.repeat(length - JSON.stringify(frame).length);
+      return frame;
+    };
+    // Each bound admits its last frame and refuses the next. turn/started is one checked notice.
+    // Fifteen 1 MiB frames and the setup replies fit in 16 MiB. The sixteenth frame does not.
+    const overruns: Record<string, [number, (index: number) => unknown]> = {
+      overrun: [16_383, () => ({ method: 'thread/queue/changed', params: identity })],
+      'item-overrun': [
+        4096,
+        (index) => ({ method: 'item/started', params: { ...identity, item: reasoning(index) } }),
+      ],
+      'retry-overrun': [32, () => retry],
+      'output-overrun': [15, () => sized(1024 * 1024)],
+    };
+    if (mode in overruns) {
+      const [allowed, frame] = overruns[mode];
+      native.push(bytes(frames[0]));
+      for (let index = 0; index < allowed; index++) native.push(bytes(frame(index)));
+      assert.throws(() => native.push(bytes(frame(allowed))), mode);
+      assert.equal(native.diagnostic?.cause, 'limit', mode);
+      continue;
+    }
     if (mode === 'duplicate-item') frames.push(frames[1]);
     if (mode === 'reroute') frames.push({ method: 'model/rerouted', params: identity });
-    frames.push({
+    // A busy command streams 5000 output frames and over 1 MiB. They count by hash and stay out of
+    // the checked-notice cap.
+    const delta = {
       method: 'item/commandExecution/outputDelta',
       params: {
         ...identity,
-        turnId: mode === 'wrong-turn' ? 'other' : identity.turnId,
         itemId: command.id,
-        delta: 'private-repository-canary',
+        delta: 'private-repository-canary'.repeat(mode === 'busy-command' ? 8 : 1),
       },
-    });
+    };
+    frames.push(...Array(mode === 'busy-command' ? 5000 : 1).fill(delta));
+    if (mode === 'busy-command') frames.push(...ignoredNotices(identity).slice(1));
     if (mode !== 'incomplete-item')
       frames.push({
         method: 'item/completed',
         params: {
           ...identity,
-          item: { ...command, status: mode === 'failed-command' ? 'failed' : 'completed' },
+          turnId: mode === 'wrong-turn' ? 'other' : identity.turnId,
+          item: {
+            ...command,
+            status: mode === 'failed-command' ? 'failed' : 'completed',
+            // The client retains 1 MiB of output. JSON writes each control byte as six, so this line
+            // is over 6 MiB. Only the turn total bounds it. The canary prefix must stay out of
+            // activities, the result and every diagnostic.
+            ...(mode === 'escaped-output'
+              ? { aggregatedOutput: `private-repository-canary${'\u0001'.repeat(1024 * 1024)}` }
+              : {}),
+          },
           completedAtMs: 2,
         },
       });
@@ -1161,6 +1480,8 @@ test('native proposals and reviews require one matching completed turn and bound
         },
       ],
     };
+    if (mode === 'escaped-output')
+      assert(frames.some((frame) => bytes(frame).length > 6 * 1024 * 1024));
     frames.push(
       { method: 'item/started', params: { ...identity, item: fileItem, startedAtMs: 3 } },
       {
@@ -1168,6 +1489,14 @@ test('native proposals and reviews require one matching completed turn and bound
         params: { ...identity, item: { ...fileItem, status: 'completed' }, completedAtMs: 4 },
       },
     );
+    // A ten-minute turn reaches about 200 items and a few retried requests, and it completes.
+    if (mode === 'long-turn')
+      for (let index = 0; index < 200; index++)
+        frames.push(
+          { method: 'item/started', params: { ...identity, item: reasoning(index) } },
+          { method: 'item/completed', params: { ...identity, item: reasoning(index) } },
+          ...(index % 50 === 0 ? [retry] : []),
+        );
     frames.push({
       method: 'turn/completed',
       params: {
@@ -1175,6 +1504,11 @@ test('native proposals and reviews require one matching completed turn and bound
         turn: { ...running, status: mode === 'failed-turn' ? 'failed' : 'completed' },
       },
     });
+    if (mode === 'late-progress')
+      frames.push(delta, { method: 'turn/diff/updated', params: { ...identity, diff: '' } });
+    if (mode === 'late-completion') frames.push(frames.at(-1));
+    if (mode === 'late-error')
+      frames.push({ method: 'error', params: { ...identity, willRetry: true, error: {} } });
     const perform = () => {
       for (const frame of frames) {
         const buffer = bytes(frame);
@@ -1183,7 +1517,17 @@ test('native proposals and reviews require one matching completed turn and bound
       }
       return native.finish();
     };
-    if (['success', 'fragmented', 'failed-command'].includes(mode)) {
+    if (
+      [
+        'success',
+        'fragmented',
+        'failed-command',
+        'busy-command',
+        'escaped-output',
+        'long-turn',
+        'late-progress',
+      ].includes(mode)
+    ) {
       const result = perform();
       assert.deepEqual(activities, [
         { kind: 'command', state: 'started' },
@@ -1194,8 +1538,19 @@ test('native proposals and reviews require one matching completed turn and bound
       assert(!JSON.stringify(activities).includes('private-repository-canary'));
       assert.equal(result.manifestHash, repositoryInput.manifestHash);
       assert.equal(result.qualified, false);
+      assert.equal(Object.hasOwn(result, 'modelChoices'), false);
       assert.equal('replacement' in result, false);
       assert(!JSON.stringify(result).includes('private-repository-canary'));
+      assert.equal(result.observedRetries, mode === 'long-turn' ? 4 : 0);
+      if (mode === 'busy-command')
+        assert.deepEqual(native.ignoredNotifications, {
+          [methodHash(delta.method)]: 5000,
+          ...Object.fromEntries(
+            ignoredNotices(identity)
+              .slice(1)
+              .map(({ method }) => [methodHash(method), 1]),
+          ),
+        });
     } else assert.throws(perform, mode);
     assert(
       !JSON.stringify({
@@ -1207,18 +1562,35 @@ test('native proposals and reviews require one matching completed turn and bound
   }
   const selectedReview = reviewPlan(reviewData);
   assert.equal(selectedReview.creditPolicy, 'ordinary');
-  assert.throws(() =>
-    startReview(
-      {
-        executable: process.execPath,
-        sha256: '0'.repeat(64),
-        directory,
-        repositoryRoot: directory,
-        environment: {},
-      },
-      selectedReview,
-      { timeoutMs: 181_000, onSubmitted: () => assert.fail('over-budget review cannot submit') },
-    ),
+  assert.throws(
+    () =>
+      startReview(
+        {
+          executable: process.execPath,
+          sha256: '0'.repeat(64),
+          directory,
+          repositoryRoot: directory,
+          environment: {},
+        },
+        selectedReview,
+        { timeoutMs: 181_000, onSubmitted: () => assert.fail('over-budget review cannot submit') },
+      ),
+    /differs from its directory or remaining budget/,
+  );
+  assert.throws(
+    () =>
+      startReplacement(
+        {
+          executable: process.execPath,
+          sha256: '0'.repeat(64),
+          directory,
+          repositoryRoot: directory,
+          environment: {},
+        },
+        plan(directory),
+        { timeoutMs: 300_001, onSubmitted: () => assert.fail('a file writer keeps five minutes') },
+      ),
+    /Discovery deadline is invalid/,
   );
   const reader = new ReplacementTranscript(plan(directory), { now: () => 1, timeoutMs: 300_000 });
   metadata(reader);
@@ -1285,11 +1657,368 @@ test('native proposals and reviews require one matching completed turn and bound
   assert.equal(unsolicited.submitted, false);
 });
 
+test('both task transcripts refuse every notice that carries authority', () => {
+  const directory = resolve('internal/replacement-fixture');
+  const scratch = resolve(directory, 'scratch');
+  const open = {
+    structured: () => {
+      const reader = new ReplacementTranscript(plan(directory), {
+        now: () => 1,
+        timeoutMs: 300_000,
+      });
+      metadata(reader);
+      reader.push(bytes({ id: 10, result: threadResult(directory) }));
+      reader.next();
+      reader.push(bytes({ id: 11, result: { turn: running } }));
+      return reader;
+    },
+    repository: () => {
+      const reader = new RepositoryTranscript(repositoryTask(directory), {
+        now: () => 1,
+        timeoutMs: 300_000,
+        directory,
+      });
+      metadata(reader);
+      reader.push(
+        bytes({
+          id: 10,
+          result: {
+            ...threadResult(scratch),
+            approvalPolicy: 'never',
+            sandbox: { type: 'workspaceWrite', writableRoots: [scratch], networkAccess: false },
+          },
+        }),
+      );
+      reader.next();
+      reader.push(bytes({ id: 11, result: { turn: running } }));
+      return reader;
+    },
+  };
+  // Every exact name that refuses a task, then one example under each refused prefix. The list is
+  // written out here so that dropping a name from the set fails this test.
+  for (const method of [
+    'thread/archived',
+    'thread/unarchived',
+    'thread/deleted',
+    'thread/closed',
+    'thread/reverted',
+    'thread/environment/connected',
+    'thread/environment/disconnected',
+    'remoteControl/status/changed',
+    'model/rerouted',
+    'hook/started',
+    'hook/completed',
+    'account/updated',
+    'account/login/completed',
+    'account/gatewayOAuth/changed',
+    'item/autoApprovalReview/started',
+    'item/autoApprovalReview/completed',
+    'autoApprovalReview/strictReviewRequired',
+    'guardianWarning',
+    'thread/realtime/started',
+    'mcpServer/startupStatus/updated',
+  ])
+    for (const [kind, start] of Object.entries(open)) {
+      const reader = start();
+      const label = `${kind} ${method}`;
+      assert.throws(
+        () => reader.push(bytes({ method, params: { threadId: 'thread-1', turnId: 'turn-1' } })),
+        label,
+      );
+      assert.equal(reader.diagnostic?.cause, 'unsupported', label);
+      assert.equal(reader.complete, false, label);
+    }
+});
+
+test('both task transcripts ignore an unrelated advisory thread status', () => {
+  const directory = resolve('internal/replacement-fixture');
+  const scratch = resolve(directory, 'scratch');
+  const structured = new ReplacementTranscript(plan(directory), {
+    now: () => 1,
+    timeoutMs: 300_000,
+  });
+  metadata(structured);
+  structured.push(bytes({ id: 10, result: threadResult(directory) }));
+  structured.next();
+  structured.push(bytes({ id: 11, result: { turn: running } }));
+
+  const repository = new RepositoryTranscript(repositoryTask(directory), {
+    now: () => 1,
+    timeoutMs: 300_000,
+    directory,
+  });
+  metadata(repository);
+  repository.push(
+    bytes({
+      id: 10,
+      result: {
+        ...threadResult(scratch),
+        approvalPolicy: 'never',
+        sandbox: { type: 'workspaceWrite', writableRoots: [scratch], networkAccess: false },
+      },
+    }),
+  );
+  repository.next();
+  repository.push(bytes({ id: 11, result: { turn: running } }));
+
+  const unrelated = {
+    method: 'thread/status/changed',
+    params: { threadId: 'unrelated-thread', status: { type: 'idle' } },
+  };
+  structured.push(bytes(unrelated));
+  repository.push(bytes(unrelated));
+  assert.equal(structured.diagnostic, null);
+  assert.equal(repository.diagnostic, null);
+
+  for (const transcript of [structured, repository])
+    assert.throws(() =>
+      transcript.push(
+        bytes({
+          method: 'thread/status/changed',
+          params: { threadId: 'thread-1', status: { type: 'unknown' } },
+        }),
+      ),
+    );
+});
+
+test('repository item handling accepts passive subagent activity and identifies refused schemas', () => {
+  const directory = resolve('internal/replacement-fixture');
+  const scratch = resolve(directory, 'scratch');
+  const open = () => {
+    const reader = new RepositoryTranscript(repositoryTask(directory), {
+      now: () => 1,
+      timeoutMs: 300_000,
+      directory,
+    });
+    metadata(reader);
+    reader.push(
+      bytes({
+        id: 10,
+        result: {
+          ...threadResult(scratch),
+          approvalPolicy: 'never',
+          sandbox: { type: 'workspaceWrite', writableRoots: [scratch], networkAccess: false },
+        },
+      }),
+    );
+    reader.next();
+    reader.push(bytes({ id: 11, result: { turn: running } }));
+    reader.push(bytes({ method: 'turn/started', params: { threadId: 'thread-1', turn: running } }));
+    return reader;
+  };
+  const activity = open();
+  const subagent = {
+    id: 'item-1',
+    type: 'subAgentActivity',
+    kind: 'started',
+    agentThreadId: 'thread-2',
+    agentPath: '/root/worker',
+  };
+  activity.push(
+    bytes({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: subagent, startedAtMs: 1 },
+    }),
+  );
+  activity.push(
+    bytes({
+      method: 'item/completed',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: subagent, completedAtMs: 2 },
+    }),
+  );
+  activity.push(
+    bytes({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { ...running, status: 'completed' } },
+    }),
+  );
+  assert.equal(activity.complete, true);
+
+  const authorityType = 'collabAgentToolCall';
+  const authority = open();
+  assert.throws(() =>
+    authority.push(
+      bytes({
+        method: 'item/started',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: { id: 'item-1', type: authorityType },
+          startedAtMs: 1,
+        },
+      }),
+    ),
+  );
+  assert.equal(authority.diagnostic?.itemTypeHash, methodHash(authorityType));
+
+  const unknownType = 'private-item-type-canary';
+  const item = open();
+  assert.throws(() =>
+    item.push(
+      bytes({
+        method: 'item/started',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: { id: 'item-1', type: unknownType },
+          startedAtMs: 1,
+        },
+      }),
+    ),
+  );
+  assert.equal(item.diagnostic?.site, 'item-event');
+  assert.equal(item.diagnostic?.itemTypeHash, methodHash(unknownType));
+  assert(!JSON.stringify(item.diagnostic).includes(unknownType));
+
+  const identity = open();
+  assert.throws(() =>
+    identity.push(
+      bytes({
+        method: 'item/started',
+        params: { threadId: 1, turnId: 'turn-1', item: { id: 'item-1', type: 'reasoning' } },
+      }),
+    ),
+  );
+  assert.equal(identity.diagnostic?.site, 'identity');
+  assert.equal(identity.diagnostic?.itemTypeHash, null);
+
+  const nextFrame = open();
+  nextFrame.push(
+    bytes({
+      method: 'item/started',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { id: 'item-1', type: 'reasoning' },
+        startedAtMs: 1,
+      },
+    }),
+  );
+  assert.throws(() => nextFrame.push(Buffer.from('{invalid\n')));
+  assert.equal(nextFrame.diagnostic?.site, 'frame');
+  assert.equal(nextFrame.diagnostic?.methodHash, null);
+  assert.equal(nextFrame.diagnostic?.itemTypeHash, null);
+});
+
+test('transcripts pass rate-limit reads and updates to the usage hook without changing their outcome', () => {
+  const directory = resolve('internal/replacement-fixture');
+  const scratchPath = resolve(directory, 'scratch');
+  // The update merges with the session's read. The receiver drops its repeat. The malformed one
+  // reaches no hook and leaves the turn running.
+  const sparse = { usedPercent: 35, windowDurationMins: null, resetsAt: null };
+  const updates = [sparse, sparse, { ...weekly, usedPercent: -1 }].map((primary) => ({
+    method: 'account/rateLimits/updated',
+    params: { rateLimits: { ...codex, primary } },
+  }));
+  const repositoryInput = repositoryPlan({
+    attemptId: plan(directory).attemptId,
+    model: 'gpt-6.1-sol',
+    effort: 'low',
+    scratchPath,
+    sourceBase: 'a'.repeat(40),
+    manifestHash: 'b'.repeat(64),
+    execution: { sandbox: 'workspace-write', approvalPolicy: 'never', networkAccess: false },
+    context: { title: 'Bound net', outcome: 'Return the net.', criteria: ['Keep the bound.'] },
+    limits: repositoryLimits,
+  });
+  // Each transcript delivers its complete read, then the merged update and its repeat.
+  const delivered = [
+    [true, [[66, 604800]]],
+    [false, [[65, 604800]]],
+    [false, [[65, 604800]]],
+  ];
+  const outcomes = new Map<string, unknown>();
+  for (const hook of ['absent', 'records', 'throws'] as const) {
+    const reports: OpenAiUsage[] = [];
+    const onUsage =
+      hook === 'absent'
+        ? undefined
+        : (usage: OpenAiUsage) => {
+            reports.push(usage);
+            if (hook === 'throws') throw new Error('private-usage-canary');
+          };
+    const writer = new ReplacementTranscript(plan(directory), {
+      now: () => 1,
+      timeoutMs: 300_000,
+      onUsage,
+    });
+    metadata(writer, { 'account/rateLimits/read': usageRead });
+    writer.push(bytes({ id: 10, result: threadResult(directory) }));
+    writer.next();
+    writer.push(bytes({ id: 11, result: { turn: running } }));
+    const messages = output(directory);
+    messages.splice(1, 0, ...updates);
+    for (const message of messages) writer.push(bytes(message));
+    const native = new RepositoryTranscript(repositoryInput, {
+      now: () => 1,
+      timeoutMs: 300_000,
+      directory,
+      onUsage,
+    });
+    metadata(native, { 'account/rateLimits/read': usageRead });
+    native.push(
+      bytes({
+        id: 10,
+        result: {
+          ...threadResult(scratchPath),
+          approvalPolicy: 'never',
+          sandbox: { type: 'workspaceWrite', writableRoots: [scratchPath], networkAccess: false },
+        },
+      }),
+    );
+    native.next();
+    native.push(bytes({ id: 11, result: { turn: running } }));
+    for (const message of [
+      { method: 'turn/started', params: { threadId: 'thread-1', turn: running } },
+      ...updates,
+      {
+        method: 'turn/completed',
+        params: { threadId: 'thread-1', turn: { ...running, status: 'completed' } },
+      },
+    ])
+      native.push(bytes(message));
+    outcomes.set(hook, { writer: writer.finish(), repository: native.finish() });
+    assert.deepEqual(outcomes.get(hook), outcomes.get('absent'), hook);
+    assert.deepEqual(
+      reports.map((usage) => [
+        usage.complete,
+        usage.windows.map((value) => [value.remaining?.value, value.semantics?.periodSeconds]),
+      ]),
+      hook === 'absent' ? [] : [...delivered, ...delivered],
+      hook,
+    );
+  }
+  // Admission still refuses an over-limit read. Usage reads it first and shows it exhausted.
+  const exhausted: OpenAiUsage[] = [];
+  const refused = new ReplacementTranscript(plan(directory), {
+    now: () => 1,
+    timeoutMs: 300_000,
+    onUsage: (usage) => exhausted.push(usage),
+  });
+  const over = { ...codex, primary: { ...weekly, usedPercent: 101 } };
+  assert.throws(() =>
+    metadata(refused, {
+      'account/rateLimits/read': { ...usageRead, rateLimitsByLimitId: { codex: over } },
+    }),
+  );
+  assert.deepEqual(
+    exhausted.map((usage) => usage.windows.map((value) => value.remaining)),
+    [[{ value: 0, unit: 'percent' }]],
+  );
+});
+
 test('native task submission and interruption share one deadline through owned cleanup', async () => {
   mkdirSync(resolve('internal'), { recursive: true });
   const root = mkdtempSync(resolve('internal/replacement-owner-'));
   const digest = createHash('sha256').update(readFileSync(process.execPath)).digest('hex');
   const owned: Array<{ child: ChildProcessWithoutNullStreams; closed: Promise<void> }> = [];
+  // Both phases read one weekly window. Only the task phase reports it.
+  const withUsage = (script: string) =>
+    script.replace(
+      JSON.stringify(replies),
+      JSON.stringify({ ...replies, 'account/rateLimits/read': usageRead }),
+    );
+  const delivered = [{ complete: true, windows: [weeklyWindow], credits: [] }];
   try {
     for (const mode of [
       'success',
@@ -1308,6 +2037,7 @@ test('native task submission and interruption share one deadline through owned c
       let submission = 0;
       let now = 100;
       let appServers = 0;
+      const usages: OpenAiUsage[] = [];
       const runGroups: number[] = [];
       let requestStop: (() => void) | undefined;
       let stopReady!: () => void;
@@ -1329,6 +2059,9 @@ test('native task submission and interruption share one deadline through owned c
           onSubmitted: () => {
             submission++;
           },
+          onUsage: (usage) => {
+            usages.push(usage);
+          },
           schedule: (work, milliseconds) => {
             const call = { work, milliseconds, active: true };
             calls.push(call);
@@ -1345,7 +2078,7 @@ test('native task submission and interruption share one deadline through owned c
             );
             if (phase === 'task') assert(args.includes('mcp_servers.fixture_server.enabled=false'));
             else assert(!args.some((arg) => arg.startsWith('mcp_servers.')));
-            const child = spawn(executable, ['-e', fixture, mode, phase], options);
+            const child = spawn(executable, ['-e', withUsage(fixture), mode, phase], options);
             if (child.pid) runGroups.push(child.pid);
             if (phase === 'prepare' && mode === 'prepare-deadline')
               child.once('close', () => {
@@ -1417,6 +2150,7 @@ test('native task submission and interruption share one deadline through owned c
       if (mode === 'success') {
         assert.equal(result.reason, null);
         assert.equal(result.metadata?.replacement.path, 'net.mjs');
+        assert.deepEqual(usages, delivered);
       } else {
         assert.equal(result.metadata, null, mode);
         assert.equal(
@@ -1449,6 +2183,7 @@ test('native task submission and interruption share one deadline through owned c
     let repositoryPhases = 0;
     let repositorySubmissions = 0;
     const ownedActivities: RepositoryActivity[] = [];
+    const repositoryUsages: OpenAiUsage[] = [];
     const repository = startRepository(
       {
         executable: process.execPath,
@@ -1466,14 +2201,18 @@ test('native task submission and interruption share one deadline through owned c
         manifestHash: 'b'.repeat(64),
         execution: { sandbox: 'workspace-write', approvalPolicy: 'never', networkAccess: false },
         context: { title: 'Bound net', outcome: 'Return the net.', criteria: ['Keep the bound.'] },
+        limits: repositoryLimits,
       }),
       {
-        timeoutMs: 300_000,
+        timeoutMs: 600_000,
         onSubmitted: () => {
           repositorySubmissions++;
         },
         onActivity: (activity) => {
           ownedActivities.push(activity);
+        },
+        onUsage: (usage) => {
+          repositoryUsages.push(usage);
         },
         spawn: (executable, args, options) => {
           const phase =
@@ -1482,10 +2221,12 @@ test('native task submission and interruption share one deadline through owned c
             executable,
             [
               '-e',
-              repositoryFixture([
-                { path: 'net.mjs', content: 'export const net = 0;\n' },
-                { path: 'docs/note.md', content: '# Bounds\n' },
-              ]),
+              withUsage(
+                repositoryFixture([
+                  { path: 'net.mjs', content: 'export const net = 0;\n' },
+                  { path: 'docs/note.md', content: '# Bounds\n' },
+                ]),
+              ),
               'success',
               phase,
             ],
@@ -1502,7 +2243,11 @@ test('native task submission and interruption share one deadline through owned c
     const captured = await repository.result;
     assert.equal(captured.reason, null, JSON.stringify(captured));
     assert.equal(captured.quiescent, true);
+    assert.deepEqual(captured.ignoredNotifications, {
+      [methodHash('item/commandExecution/outputDelta')]: 3,
+    });
     assert.equal(repositorySubmissions, 1);
+    assert.deepEqual(repositoryUsages, delivered);
     assert.deepEqual(
       ownedActivities.map(({ kind, state }) => [kind, state]),
       [

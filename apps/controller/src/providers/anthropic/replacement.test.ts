@@ -49,6 +49,28 @@ const result = {
   structured_output: edit,
   permission_denials: [],
 };
+const status = {
+  type: 'system',
+  subtype: 'status',
+  session_id: input.sessionId,
+  uuid: '46eb17cd-01e8-480d-99f4-a741f189715f',
+  status: 'requesting',
+};
+const invalidation = {
+  type: 'system',
+  subtype: 'ui_invalidate',
+  session_id: input.sessionId,
+  uuid: '46eb17cd-01e8-480d-99f4-a741f189715f',
+  event: 'ui.render',
+};
+const thinking = {
+  type: 'system',
+  subtype: 'thinking_tokens',
+  session_id: input.sessionId,
+  uuid: '46eb17cd-01e8-480d-99f4-a741f189715f',
+  estimated_tokens: 12,
+  estimated_tokens_delta: 3,
+};
 const line = (value: unknown) => Buffer.from(`${JSON.stringify(value)}\n`);
 const secret = 'private-account@example.test';
 const user = {
@@ -63,6 +85,27 @@ const rateLimit = {
   uuid: '46eb17cd-01e8-480d-99f4-a741f189715f',
   rate_limit_info: { status: 'allowed', resetsAt: 123, utilization: 0.5 },
 };
+const usageEvent = (info: Record<string, unknown>) => ({
+  ...rateLimit,
+  rate_limit_info: { status: 'allowed', ...info },
+});
+const reading = (utilization: number, resetsAt: number) => ({ utilization, resetsAt });
+const fiveHourReset = 1_792_000_000;
+const weeklyReset = 1_792_500_000;
+const fiveHour = (remainingPercent: number) => ({
+  windowId: 'five_hour',
+  kind: 'rolling',
+  semantics: { scope: 'provider', periodSeconds: 18_000 },
+  remainingPercent,
+  resetsAt: '2026-10-14T17:46:40.000Z',
+});
+const sevenDay = (remainingPercent: number) => ({
+  windowId: 'seven_day',
+  kind: 'weekly',
+  semantics: { scope: 'provider', periodSeconds: 604_800 },
+  remainingPercent,
+  resetsAt: '2026-10-20T12:40:00.000Z',
+});
 
 test('native text replacement stays bound to one proposal and owned task deadline', async () => {
   const policy = {
@@ -192,15 +235,277 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       }),
     ReplacementError,
   );
+  // Progress and display frames carry content and a proposal-shaped field that must not surface.
+  const progress = (type: string, subtype?: string) => ({
+    type,
+    ...(subtype ? { subtype } : {}),
+    session_id: input.sessionId,
+    uuid: status.uuid,
+    content: secret,
+    structured_output: { ...edit, content: secret },
+  });
+  const named = (names: Array<[string, string?]>) => ({
+    frames: names.map(([type, subtype]) => progress(type, subtype)),
+    names: names.map(([type, subtype]) => (subtype ? `${type}/${subtype}` : type)),
+  });
+  const tally = (names: string[]) => {
+    const counts: Record<string, number> = {};
+    for (const name of names) counts[name] = (counts[name] ?? 0) + 1;
+    return counts;
+  };
+  const { frames: earlyFrames, names: earlyNames } = named([
+    ['system', 'ui_invalidate'],
+    ['system', 'plugin_install'],
+    ['tool_progress'],
+  ]);
+  const { frames: laterFrames, names: laterNames } = named([
+    ...[
+      'status',
+      'thinking_tokens',
+      'notification',
+      'compact_boundary',
+      'api_error',
+      'task_started',
+      'task_notification',
+      'task_progress',
+      'session_state_changed',
+      'permission_retry',
+      'ui_invalidate',
+      'unrecognized_subtype',
+    ].map((subtype): [string, string] => ['system', subtype]),
+    ...[
+      'stream_event',
+      'tool_progress',
+      'auth_status',
+      'tool_use_summary',
+      'prompt_suggestion',
+      'conversation_reset',
+      'future_frame',
+    ].map((type): [string] => [type]),
+  ]);
   const cases: Array<{
     name: string;
     frames: unknown[];
     pass?: boolean;
     toolsEmpty?: boolean;
     pluginsEmpty?: boolean;
+    retries?: number;
+    reason?: string;
     diagnostic?: Record<string, unknown>;
+    ignored?: Record<string, number>;
+    usage?: unknown[];
+    usageAccepted?: boolean[];
+    failingHook?: boolean;
   }> = [
     { name: 'valid', frames: [init, result], pass: true },
+    {
+      name: 'progress frames the pinned client defines leave a correlated proposal intact',
+      frames: [...earlyFrames, init, ...laterFrames, result],
+      pass: true,
+      ignored: tally([...earlyNames, ...laterNames]),
+    },
+    {
+      name: 'ignored frame names are counted within a fixed ceiling',
+      frames: [
+        init,
+        ...Array.from({ length: 40 }, (_, index) => progress(`future_frame_${index}`)),
+        progress('future_frame_0'),
+        result,
+      ],
+      pass: true,
+      ignored: {
+        ...tally(Array.from({ length: 32 }, (_, index) => `future_frame_${index}`)),
+        future_frame_0: 2,
+        other: 8,
+      },
+    },
+    {
+      name: 'progress frames after the result leave the proposal intact',
+      frames: [init, result, ...laterFrames],
+      pass: true,
+      ignored: tally(laterNames),
+    },
+    {
+      name: 'progress after the result stays session bound',
+      frames: [init, result, { ...status, session_id: '46eb17cd-01e8-480d-99f4-a741f189715e' }],
+      diagnostic: {
+        stage: 'complete',
+        site: 'identity',
+        cause: 'correlation',
+        field: 'session_id',
+      },
+    },
+    {
+      name: 'a second result after progress stays refused',
+      frames: [init, result, status, result],
+      diagnostic: { stage: 'complete' },
+    },
+    ...[
+      {
+        type: 'assistant',
+        session_id: input.sessionId,
+        message: { role: 'assistant', content: [] },
+      },
+      {
+        type: 'system',
+        subtype: 'api_retry',
+        session_id: input.sessionId,
+        attempt: 1,
+        max_retries: 10,
+        retry_delay_ms: 1000,
+      },
+      { type: 'system', subtype: 'model_fallback', session_id: input.sessionId },
+    ].map((frame) => ({
+      name: `${frame.subtype ?? frame.type} after the result stays refused`,
+      frames: [init, result, frame],
+      diagnostic: { stage: 'complete', cause: 'unsupported' },
+    })),
+    { name: 'display invalidation cannot initialize a session', frames: [invalidation, result] },
+    { name: 'display invalidation cannot complete a proposal', frames: [init, invalidation] },
+    ...[[], [init]].flatMap((prefix) =>
+      [undefined, '46eb17cd-01e8-480d-99f4-a741f189715e'].map((session_id) => ({
+        name: `display invalidation session ${prefix.length}/${session_id ?? 'missing'} stays bound`,
+        frames: [...prefix, { ...invalidation, session_id }, result],
+        diagnostic: { site: 'identity', field: 'session_id' },
+      })),
+    ),
+    {
+      name: 'a host request after init stays refused',
+      frames: [
+        init,
+        {
+          type: 'control_request',
+          request_id: 'request-1',
+          session_id: input.sessionId,
+          request: { subtype: 'can_use_tool', tool_name: secret },
+        },
+        result,
+      ],
+      diagnostic: { stage: 'output', envelope: 'control_request', field: 'type' },
+    },
+    ...[
+      'error_during_execution',
+      'error_max_turns',
+      'error_max_budget_usd',
+      'error_max_structured_output_retries',
+    ].map((subtype) => ({
+      name: `failed result ${subtype} stays refused after progress`,
+      frames: [
+        init,
+        status,
+        { type: 'result', subtype, is_error: true, session_id: input.sessionId, errors: [secret] },
+      ],
+      diagnostic: { site: 'result', envelope: 'result', subtype },
+    })),
+    {
+      name: 'request status is progress only',
+      frames: [init, status, result],
+      pass: true,
+      ignored: { 'system/status': 1 },
+    },
+    {
+      name: 'compaction metadata is discarded without validation',
+      frames: [
+        init,
+        {
+          ...status,
+          status: 'compacting',
+          compact_output_chars: 123,
+          compact_result: 'failed',
+          compact_error: secret,
+        },
+        { ...status, status: null, permissionMode: 'default' },
+        { ...status, status: secret, uuid: secret, compact_output_chars: -1, command: secret },
+        result,
+      ],
+      pass: true,
+      ignored: { 'system/status': 3 },
+    },
+    ...['bypassPermissions', 'acceptEdits'].map((permissionMode) => ({
+      name: `status reporting ${permissionMode} cannot change the permission mode`,
+      frames: [init, { ...status, permissionMode }, result],
+      diagnostic: { stage: 'output', site: 'status', subtype: 'status', field: 'permissionMode' },
+    })),
+    {
+      name: 'status cannot initialize a session',
+      frames: [status, result],
+      diagnostic: { stage: 'before-init', site: 'init', envelope: 'result' },
+    },
+    { name: 'status cannot complete a proposal', frames: [init, status] },
+    {
+      name: 'thinking estimates are discarded without usage or proposal authority',
+      frames: [
+        init,
+        thinking,
+        { ...thinking, user_message_uuid: secret },
+        { ...thinking, estimated_tokens: 0, estimated_tokens_delta: 0 },
+        {
+          ...thinking,
+          estimated_tokens: Number.MAX_SAFE_INTEGER,
+          estimated_tokens_delta: Number.MIN_SAFE_INTEGER,
+        },
+        { ...thinking, estimated_tokens: secret, uuid: secret, estimated_tokens_delta: 0.5 },
+        result,
+      ],
+      pass: true,
+      ignored: { 'system/thinking_tokens': 5 },
+    },
+    { name: 'thinking estimates cannot complete a proposal', frames: [init, thinking] },
+    ...[undefined, '46eb17cd-01e8-480d-99f4-a741f189715e'].map((session_id) => ({
+      name: `thinking estimate session ${session_id ?? 'missing'} remains bound`,
+      frames: [init, { ...thinking, session_id }, result],
+      diagnostic: { site: 'identity', field: 'session_id' },
+    })),
+    {
+      name: 'status remains session bound',
+      frames: [init, { ...status, session_id: '46eb17cd-01e8-480d-99f4-a741f189715e' }, result],
+      diagnostic: { site: 'identity', cause: 'correlation', field: 'session_id' },
+    },
+    ...['hook_started', 'hook_progress', 'hook_response'].flatMap((subtype) =>
+      [[], [init]].map((prefix) => ({
+        name: `hook ${subtype} ${prefix.length ? 'after' : 'before'} init stays refused`,
+        frames: [
+          ...prefix,
+          {
+            type: 'system',
+            subtype,
+            session_id: input.sessionId,
+            hook_name: secret,
+            stdout: secret,
+          },
+          result,
+        ],
+        diagnostic: {
+          stage: prefix.length ? 'output' : 'before-init',
+          site: prefix.length ? 'system' : 'init',
+          cause: prefix.length ? 'unsupported' : 'validation',
+          envelope: 'system',
+          subtype,
+          field: 'subtype',
+        },
+      })),
+    ),
+    ...[
+      'model_fallback',
+      'model_consent_fallback',
+      'model_refusal_fallback',
+      'model_refusal_no_fallback',
+    ].map((subtype) => ({
+      name: `model change ${subtype} stays refused and identifiable`,
+      frames: [
+        init,
+        { type: 'system', subtype, session_id: input.sessionId, content: secret },
+        result,
+      ],
+      diagnostic: {
+        stage: 'output',
+        site: 'system',
+        cause: 'unsupported',
+        subtype,
+        field: 'subtype',
+      },
+    })),
+
     {
       name: 'different regular path',
       frames: [init, { ...result, structured_output: { ...edit, path: 'other.mjs' } }],
@@ -293,23 +598,189 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       ],
       pass: true,
     },
-    ...['isUsingOverage', 'overageInUse', 'overageEnabled'].map((field) => ({
+    {
+      name: 'extra usage configuration does not report served paid usage',
+      frames: [
+        init,
+        usageEvent({
+          status: 'allowed_warning',
+          rateLimitType: 'five_hour',
+          overageEnabled: true,
+          isUsingOverage: false,
+          overageInUse: false,
+          unifiedWindows: { five_hour: reading(0.75, fiveHourReset) },
+        }),
+        result,
+      ],
+      pass: true,
+      usage: [{ windows: [fiveHour(25)], paid: null }],
+    },
+    {
+      name: 'extra usage configuration supplies no usage reading',
+      frames: [init, usageEvent({ overageEnabled: true }), result],
+      pass: true,
+    },
+    ...['allowed', 'allowed_warning'].map((overageStatus) => ({
+      name: `served grace overflow with ${overageStatus} paid usage stops included-only task`,
+      frames: [init, usageEvent({ rateLimitGraceActive: true, overageStatus }), result],
+      diagnostic: { site: 'rate-limit', cause: 'unsupported', field: 'rateLimitGraceActive' },
+    })),
+    ...[undefined, 'rejected', 'future_status'].map((overageStatus) => ({
+      name: `grace metadata with ${overageStatus ?? 'unreported'} paid status supplies no paid-use proof`,
+      frames: [init, usageEvent({ rateLimitGraceActive: true, overageStatus }), result],
+      pass: true,
+    })),
+    ...['isUsingOverage', 'overageInUse', 'overageEnabled', 'rateLimitGraceActive'].map(
+      (field) => ({
+        name: `rate limit ${field} rejects malformed flags`,
+        frames: [init, usageEvent({ [field]: secret }), result],
+        diagnostic: { site: 'rate-limit', cause: 'validation', field },
+      }),
+    ),
+    {
+      name: 'extra usage configuration cannot initialize or complete a task',
+      frames: [usageEvent({ overageEnabled: true }), result],
+    },
+    {
+      name: 'extra usage configuration still needs terminal result',
+      frames: [init, usageEvent({ overageEnabled: true })],
+    },
+    {
+      name: 'extra usage configuration after the result leaves the proposal intact',
+      frames: [init, result, usageEvent({ overageEnabled: true })],
+      pass: true,
+    },
+    {
+      name: 'a window reading after the result still reaches the usage hook',
+      frames: [
+        init,
+        result,
+        usageEvent({ unifiedWindows: { five_hour: reading(0.25, fiveHourReset) } }),
+      ],
+      pass: true,
+      usage: [{ windows: [fiveHour(75)], paid: null }],
+    },
+    ...[
+      { isUsingOverage: true },
+      { overageInUse: true },
+      { rateLimitType: 'overage' },
+      { rateLimitGraceActive: true, overageStatus: 'allowed' },
+    ].map((info) => ({
+      name: `reported paid use ${Object.keys(info)[0]} after the result refuses the proposal`,
+      frames: [init, result, usageEvent(info)],
+      diagnostic: { stage: 'complete', site: 'rate-limit', cause: 'unsupported' },
+    })),
+    ...['isUsingOverage', 'overageInUse'].map((field) => ({
       name: `reported ${field} stops included-only task`,
       frames: [
         init,
-        { ...rateLimit, rate_limit_info: { status: 'allowed', [field]: true } },
+        {
+          ...rateLimit,
+          rate_limit_info: { status: 'allowed', overageEnabled: true, [field]: true },
+        },
         result,
       ],
-      diagnostic: { site: 'rate-limit', cause: 'unsupported', field: 'rate_limit_info' },
+      diagnostic: { site: 'rate-limit', cause: 'unsupported', field },
     })),
     {
       name: 'usage credit window stops included-only task',
       frames: [
         init,
-        { ...rateLimit, rate_limit_info: { status: 'allowed', rateLimitType: 'overage' } },
+        {
+          ...rateLimit,
+          rate_limit_info: { status: 'allowed', rateLimitType: 'overage', overageEnabled: true },
+        },
         result,
       ],
-      diagnostic: { site: 'rate-limit', cause: 'unsupported', field: 'rate_limit_info' },
+      diagnostic: { site: 'rate-limit', cause: 'unsupported', field: 'rateLimitType' },
+    },
+    {
+      name: 'a window reading reaches the usage hook once per process',
+      frames: [
+        init,
+        usageEvent({
+          unifiedWindows: {
+            five_hour: reading(0.25, fiveHourReset),
+            seven_day: reading(0.5, weeklyReset),
+          },
+        }),
+        // A status change sends both readings again, unchanged.
+        usageEvent({
+          status: 'allowed_warning',
+          rateLimitType: 'seven_day',
+          utilization: 0.5,
+          resetsAt: weeklyReset,
+          unifiedWindows: {
+            five_hour: reading(0.25, fiveHourReset),
+            seven_day: reading(0.5, weeklyReset),
+          },
+        }),
+        // The weekly reading rides along within the same whole percent.
+        usageEvent({
+          unifiedWindows: {
+            five_hour: reading(0.5, fiveHourReset),
+            seven_day: reading(0.5004, weeklyReset),
+          },
+        }),
+        // A top-level reading held since an earlier response.
+        usageEvent({
+          status: 'allowed_warning',
+          rateLimitType: 'five_hour',
+          utilization: 0.5004,
+          resetsAt: fiveHourReset,
+        }),
+        result,
+      ],
+      pass: true,
+      usage: [
+        { windows: [fiveHour(75), sevenDay(50)], paid: null },
+        { windows: [fiveHour(50)], paid: null },
+      ],
+    },
+    {
+      name: 'a refused usage reading returns until its replay is accepted',
+      frames: [
+        init,
+        usageEvent({ unifiedWindows: { five_hour: reading(0.25, fiveHourReset) } }),
+        usageEvent({ unifiedWindows: { five_hour: reading(0.25, fiveHourReset) } }),
+        usageEvent({ unifiedWindows: { five_hour: reading(0.25, fiveHourReset) } }),
+        result,
+      ],
+      pass: true,
+      usageAccepted: [false, true],
+      usage: [
+        { windows: [fiveHour(75)], paid: null },
+        { windows: [fiveHour(75)], paid: null },
+      ],
+    },
+    {
+      name: 'a malformed usage reading adds nothing and the task continues',
+      frames: [init, usageEvent({ unifiedWindows: { five_hour: reading(0.25, 1.5) } }), result],
+      pass: true,
+    },
+    {
+      name: 'a failing usage hook leaves the task unchanged',
+      frames: [
+        init,
+        usageEvent({ unifiedWindows: { five_hour: reading(0.25, fiveHourReset) } }),
+        result,
+      ],
+      pass: true,
+      failingHook: true,
+      usage: [{ windows: [fiveHour(75)], paid: null }],
+    },
+    {
+      name: 'included readings beside paid credits reach the hook and the refusal stands',
+      frames: [
+        init,
+        usageEvent({
+          isUsingOverage: true,
+          unifiedWindows: { five_hour: reading(1, fiveHourReset) },
+        }),
+        result,
+      ],
+      diagnostic: { site: 'rate-limit', cause: 'unsupported', field: 'isUsingOverage' },
+      usage: [{ windows: [fiveHour(0)], paid: { inUse: true, usedPercent: null, resetsAt: null } }],
     },
     { name: 'rate limit metadata needs terminal result', frames: [init, rateLimit] },
     { name: 'rate limit metadata needs init', frames: [rateLimit, result] },
@@ -318,23 +789,46 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       frames: [init, { ...rateLimit, session_id: '46eb17cd-01e8-480d-99f4-a741f189715e' }, result],
     },
     {
-      name: 'unknown rate limit status',
-      frames: [init, { ...rateLimit, rate_limit_info: { status: secret } }, result],
+      name: 'rate limit labels from a newer client stay advisory',
+      frames: [
+        init,
+        usageEvent({
+          status: secret,
+          rateLimitType: secret,
+          overageStatus: secret,
+          overageDisabledReason: secret,
+          limitScope: secret,
+          errorCode: secret,
+          utilization: 0.5,
+          resetsAt: fiveHourReset,
+        }),
+        usageEvent({
+          rateLimitType: 'future_window',
+          utilization: 0.9,
+          unifiedWindows: { five_hour: reading(0.25, fiveHourReset) },
+        }),
+        result,
+      ],
+      pass: true,
+      usage: [{ windows: [fiveHour(75)], paid: null }],
     },
+    ...[
+      'status',
+      'rateLimitType',
+      'overageStatus',
+      'overageDisabledReason',
+      'limitScope',
+      'errorCode',
+    ].map((label) => ({
+      name: `rate limit ${label} label remains bounded`,
+      frames: [init, usageEvent({ [label]: 'x'.repeat(129) }), result],
+      diagnostic: { site: 'rate-limit', cause: 'validation' },
+    })),
     ...['resetsAt', 'utilization', 'overageResetsAt', 'surpassedThreshold'].map((field) => ({
       name: `rate limit ${field} remains bounded`,
       frames: [init, { ...rateLimit, rate_limit_info: { status: 'allowed', [field]: -1 } }, result],
     })),
-    ...[
-      'user',
-      'stream_event',
-      'tool_progress',
-      'auth_status',
-      'tool_use_summary',
-      'rate_limit_event',
-      'prompt_suggestion',
-      'conversation_reset',
-    ].map((type) => ({
+    ...['user', 'rate_limit_event'].map((type) => ({
       name: `known ${type} refusal stays finite`,
       frames: [init, { type, session_id: input.sessionId, content: secret }],
       diagnostic: { envelope: type },
@@ -363,6 +857,7 @@ test('native text replacement stays bound to one proposal and owned task deadlin
     },
     {
       name: 'ordinary retry remains one task',
+      retries: 1,
       frames: [
         init,
         {
@@ -378,16 +873,21 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       pass: true,
     },
     {
-      name: 'startup hook remains refused with finite diagnostics',
+      name: 'model refusal before init stays refused with finite diagnostics',
       frames: [
-        { type: 'system', subtype: 'hook_started', session_id: input.sessionId, hook_name: secret },
+        {
+          type: 'system',
+          subtype: 'model_refusal_no_fallback',
+          session_id: input.sessionId,
+          reason: secret,
+        },
       ],
       diagnostic: {
         stage: 'before-init',
         site: 'init',
         cause: 'validation',
         envelope: 'system',
-        subtype: 'hook_started',
+        subtype: 'model_refusal_no_fallback',
         field: 'subtype',
       },
     },
@@ -448,7 +948,72 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       name: 'missing structured output',
       frames: [init, { ...result, structured_output: undefined }],
     },
-    { name: 'error result', frames: [init, { ...result, is_error: true }] },
+    {
+      name: 'generic provider error stays distinct from a usage limit',
+      frames: [
+        init,
+        {
+          ...result,
+          is_error: true,
+          api_error_status: 429,
+          api_error: 'rate_limit',
+          result: secret,
+        },
+      ],
+      reason: 'provider',
+      diagnostic: {
+        stage: 'output',
+        site: 'result',
+        cause: 'provider-error',
+        envelope: 'result',
+        subtype: 'success',
+        field: 'is_error',
+      },
+    },
+    {
+      name: 'typed usage limit keeps only its kind and validated reset',
+      frames: [
+        init,
+        {
+          type: 'assistant',
+          session_id: input.sessionId,
+          message: { role: 'assistant', content: [] },
+          is_api_error_message: true,
+          api_error: 'usage_limit_reached',
+          api_error_params: {
+            rate_limit_info: {
+              status: 'rejected',
+              rateLimitType: 'five_hour',
+              resetsAt: fiveHourReset,
+              private: secret,
+            },
+          },
+          error_details: secret,
+        },
+        {
+          ...result,
+          is_error: true,
+          api_error_status: 429,
+          api_error: 'usage_limit_reached',
+          api_error_origin: 'first_party',
+          result: secret,
+        },
+      ],
+      reason: 'provider',
+      diagnostic: {
+        stage: 'output',
+        site: 'result',
+        cause: 'provider-error',
+        envelope: 'result',
+        subtype: 'success',
+        field: 'is_error',
+        providerFailure: {
+          kind: 'usage-limit',
+          rateLimitType: 'five_hour',
+          resetsAt: '2026-10-14T17:46:40.000Z',
+        },
+      },
+    },
     {
       name: 'denial result',
       frames: [init, { ...result, permission_denials: [{ tool_name: secret }] }],
@@ -472,10 +1037,56 @@ test('native text replacement stays bound to one proposal and owned task deadlin
         field: 'session_id',
       },
     },
+    ...[
+      { type: secret },
+      { type: 'FutureFrame' },
+      { type: 'system' },
+      { type: 'system', subtype: secret },
+    ].map((frame, index) => ({
+      name: `frame without a protocol name ${index} stays refused and private`,
+      frames: [init, { ...frame, session_id: input.sessionId }, result],
+      diagnostic: { stage: 'output', envelope: frame.type === 'system' ? 'system' : 'other' },
+    })),
+    {
+      name: 'an unlisted result subtype is reported by its protocol name',
+      frames: [
+        init,
+        {
+          type: 'result',
+          subtype: 'error_future_limit',
+          is_error: true,
+          session_id: input.sessionId,
+        },
+      ],
+      diagnostic: { site: 'result', envelope: 'result', subtype: 'error_future_limit' },
+    },
+    ...[
+      { label: 'plain identifier', name: 'future_frame', reported: 'future_frame' },
+      { label: 'identifier of 64 characters', name: 'a'.repeat(64), reported: 'a'.repeat(64) },
+      { label: 'identifier of 65 characters', name: 'a'.repeat(65), reported: 'other' },
+      { label: 'upper case letter', name: 'Future_frame', reported: 'other' },
+      { label: 'hyphen', name: 'future-frame', reported: 'other' },
+      { label: 'leading digit', name: '1_future_frame', reported: 'other' },
+      { label: 'empty string', name: '', reported: 'other' },
+      { label: 'account text', name: secret, reported: 'other' },
+    ].map(({ label, name, reported }) => ({
+      name: `frame name with ${label} reports ${reported === 'other' ? 'other' : 'itself'}`,
+      frames: [
+        init,
+        { type: name, subtype: name, session_id: '46eb17cd-01e8-480d-99f4-a741f189715e' },
+        result,
+      ],
+      diagnostic: { site: 'identity', cause: 'correlation', envelope: reported, subtype: reported },
+    })),
     { name: 'missing result', frames: [init] },
   ];
   for (const row of cases) {
-    const reader = new ReplacementStream(plan);
+    const reported: unknown[] = [];
+    const reader = new ReplacementStream(plan, (usage) => {
+      reported.push(usage);
+      if (row.failingHook) throw new Error(secret);
+      return row.usageAccepted?.[reported.length - 1];
+    });
     try {
       for (const frame of row.frames) {
         const bytes = line(frame);
@@ -488,6 +1099,8 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       assert.equal(output.nativeToolsReportedEmpty, row.toolsEmpty ?? true, row.name);
       assert.equal(output.nativePluginsReportedEmpty, row.pluginsEmpty ?? true, row.name);
       assert.equal(output.qualified, false, row.name);
+      assert.equal(output.observedRetries, row.retries ?? 0, row.name);
+      assert.deepEqual(output.ignoredFrames, row.ignored ?? {}, row.name);
       assert(!JSON.stringify(output).includes(secret), row.name);
     } catch (error) {
       if (!(error instanceof ReplacementError)) throw error;
@@ -497,9 +1110,10 @@ test('native text replacement stays bound to one proposal and owned task deadlin
       assert(diagnostic, row.name);
       assert(Object.isFrozen(diagnostic), row.name);
       assert.equal(error.diagnostic, diagnostic, row.name);
+      if ('reason' in row) assert.equal(error.reason, row.reason, row.name);
       assert(!JSON.stringify(diagnostic).includes(secret), row.name);
       for (const [key, value] of Object.entries(row.diagnostic ?? {}))
-        assert.equal(diagnostic[key as keyof typeof diagnostic], value, row.name);
+        assert.deepEqual(diagnostic[key as keyof typeof diagnostic], value, row.name);
       assert.throws(
         () => reader.finish(),
         (later: unknown) => later instanceof ReplacementError && later.diagnostic === diagnostic,
@@ -511,6 +1125,7 @@ test('native text replacement stays bound to one proposal and owned task deadlin
         row.name,
       );
     }
+    assert.deepEqual(reported, row.usage ?? [], row.name);
   }
   for (const bytes of [Buffer.from('{'), Buffer.from([0xff, 10]), Buffer.alloc(1048577, 32)]) {
     const reader = new ReplacementStream(plan);
@@ -528,11 +1143,12 @@ test('native text replacement stays bound to one proposal and owned task deadlin
 const {spawn}=require('node:child_process');const {MessageChannel}=require('node:worker_threads');
 const mode=process.argv[1],frames=${frames};const hold=()=>{const channel=new MessageChannel();channel.port1.on('message',()=>{});};
 process.stdin.resume();process.stdin.once('end',()=>{
-if(mode==='refusal')return process.stdout.write(JSON.stringify({type:'system',subtype:'hook_started',session_id:frames[0].session_id,hook_name:${JSON.stringify(secret)},stdout:${JSON.stringify(secret)}})+'\\n');
+if(mode.startsWith('late-kill'))process.on('SIGTERM',()=>{});
+if(mode==='refusal')return process.stdout.write(JSON.stringify({type:'system',subtype:'model_refusal_no_fallback',session_id:frames[0].session_id,reason:${JSON.stringify(secret)}})+'\\n');
 if(mode==='limit')return process.stdout.write(Buffer.alloc(1048577,32));
 if(mode==='stderr')return process.stderr.write(Buffer.alloc(16385,32));
 if(mode==='descendant'){const child=spawn(process.execPath,['-e',"const{MessageChannel}=require('node:worker_threads');process.on('SIGTERM',()=>{});const c=new MessageChannel();c.port1.on('message',()=>{});process.send('ready');"],{stdio:['inherit','inherit','inherit','ipc']});child.once('message',()=>process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>process.exit(0)));return;}
-process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(mode==='deadline'||mode==='stop')hold();else if(mode==='trailing')process.stdout.write('{',()=>process.exit(0));else process.exit(mode==='exit' ? 1 : 0);});});`;
+process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(mode==='deadline'||mode==='stop'||mode==='queued-close'||mode.startsWith('late-kill'))hold();else if(mode==='trailing')process.stdout.write('{',()=>process.exit(0));else process.exit(mode==='exit' ? 1 : 0);});});`;
   try {
     for (const mode of [
       'success',
@@ -555,13 +1171,36 @@ process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(
       'quiescent-promise',
       'quiescent-deadline',
       'write-failure',
+      'queued-close',
+      'late-kill',
+      'late-kill-reversed',
+      'late-kill-near-deadline',
     ]) {
       const directory = join(root, mode);
       mkdirSync(directory, { mode: 0o700 });
       let deadline: (() => void) | undefined;
       let time = 0;
       const trace: string[] = [];
-      const shortened = mode.includes('deadline') && mode !== 'deadline';
+      // These rows drive the stop timers by hand, so no real timer can run ahead of them.
+      const manual = mode === 'queued-close' || mode.startsWith('late-kill');
+      let capture = true;
+      const shortened =
+        mode.includes('deadline') && mode !== 'deadline' && !mode.startsWith('late');
+      const timers: Array<{ delay: number; work: () => void; live: boolean }> = [];
+      let callbackError: unknown;
+      // Every due callback is found before the first one runs, so the order stays the test's.
+      const fire = (order: number[]) => {
+        const due = order.map((delay) => {
+          const row = timers.find((timer) => timer.live && timer.delay === delay);
+          assert(row, `${mode}: pending ${delay}ms callback`);
+          return row;
+        });
+        capture = false;
+        for (const row of due) {
+          row.live = false;
+          row.work();
+        }
+      };
       let received!: () => void;
       const output = new Promise<void>((resolve) => {
         received = resolve;
@@ -622,6 +1261,23 @@ process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(
                 deadline = undefined;
               };
             }
+            if (manual) {
+              const row = { delay, work, live: true };
+              timers.push(row);
+              let timer: ReturnType<typeof setTimeout> | undefined;
+              if (!capture) {
+                const at = time + delay;
+                timer = setTimeout(() => {
+                  row.live = false;
+                  time = Math.max(time, at);
+                  work();
+                }, delay);
+              }
+              return () => {
+                row.live = false;
+                clearTimeout(timer);
+              };
+            }
             const timer = setTimeout(work, delay);
             return () => clearTimeout(timer);
           },
@@ -640,6 +1296,17 @@ process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(
             );
             child.stdout.once('data', () => received());
             owned.push({ child, closed: new Promise((resolve) => child.once('close', resolve)) });
+            // This listener runs before the process handler's own. The cutoff then meets an
+            // exited group whose stream-close event is still queued.
+            if (mode === 'queued-close')
+              child.once('exit', () => {
+                try {
+                  time = 2000;
+                  fire([1000, 2000]);
+                } catch (error) {
+                  callbackError = error;
+                }
+              });
             const end = child.stdin.end;
             child.stdin.end = function (...args: unknown[]) {
               if (typeof args[0] === 'string') {
@@ -652,14 +1319,33 @@ process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(
           }) as typeof spawn,
         },
       );
-      if (mode === 'deadline' || mode === 'stop') {
+      if (mode === 'deadline' || mode === 'stop' || manual) {
         await output;
         if (mode === 'deadline') {
           assert(deadline);
           deadline();
         } else handle.stop();
       }
+      if (mode.startsWith('late-kill')) {
+        // A blocked loop runs the stop timers in one pass. Node runs one duration list at a
+        // time, so an older 2000 ms list can reach the verdict before the kill.
+        time = mode === 'late-kill-near-deadline' ? 299_500 : 2000;
+        fire(mode === 'late-kill-reversed' ? [2000, 1000] : [1000, 2000]);
+      }
       const outcome = await handle.result;
+      assert.ifError(callbackError);
+      if (manual) {
+        if (mode === 'late-kill-near-deadline')
+          assert(
+            timers.some((timer) => timer.delay === 500),
+            `${mode}: the late kill waits only until the deadline`,
+          );
+        assert.equal(
+          timers.some((timer) => timer.live),
+          false,
+          `${mode}: settlement cancels every timer`,
+        );
+      }
       assert(outcome.quiescent, mode);
       assert(groupAbsent(handle.group), mode);
       assert(!JSON.stringify(outcome).includes(secret), mode);
@@ -683,7 +1369,7 @@ process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(
           site: 'init',
           cause: 'validation',
           envelope: 'system',
-          subtype: 'hook_started',
+          subtype: 'model_refusal_no_fallback',
           field: 'subtype',
         });
       if (mode === 'success' || mode === 'descendant') {
@@ -697,6 +1383,10 @@ process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(
             {
               deadline: 'deadline',
               stop: 'stopped',
+              'queued-close': 'stopped',
+              'late-kill': 'stopped',
+              'late-kill-reversed': 'stopped',
+              'late-kill-near-deadline': 'stopped',
               limit: 'limit',
               stderr: 'limit',
               trailing: 'protocol',
@@ -775,8 +1465,15 @@ process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(
       assert.equal(launched, false, mode);
     }
   } finally {
-    for (const { child } of owned)
-      if (child.pid && !groupAbsent(child.pid)) process.kill(-child.pid, 'SIGKILL');
+    for (const { child } of owned) {
+      if (child.pid && !groupAbsent(child.pid)) {
+        try {
+          process.kill(-child.pid, 'SIGKILL');
+        } catch {
+          // An unreaped leader can refuse the signal. The closure check below still decides.
+        }
+      }
+    }
     let timer: ReturnType<typeof setTimeout> | undefined;
     const closed = await Promise.race([
       Promise.all(owned.map((value) => value.closed)).then(() => true),

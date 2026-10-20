@@ -9,6 +9,7 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   writeFileSync,
 } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
@@ -17,8 +18,10 @@ import { groupAbsent, type Schedule } from '../../../host/worker.ts';
 import {
   type AcpClientIdentity,
   type AcpClientPin,
-  AcpClientPinSchema,
+  AcpHarnessMaximumBytes,
+  AcpImportIdentitySchema,
   AcpImportPinSchema,
+  AcpServerMaximumBytes,
   acpClientPin,
   googleAcpDeveloperIdRequirement,
   readAcpPrivateFile,
@@ -62,6 +65,9 @@ export type AcpImportResult = {
   client: AcpClientIdentity | null;
 };
 
+const KILL_MS = 250;
+const CUTOFF_MS = 1000;
+
 function synchronous(callback: (() => unknown) | undefined) {
   const result = callback?.();
   if (result instanceof Promise) {
@@ -98,6 +104,7 @@ function signaturePhase(
     let finished = false;
     let failed = false;
     let stopping = false;
+    let killedAt: number | undefined;
     let code: number | null = null;
     let size = 0;
     const output: Buffer[] = [];
@@ -128,14 +135,43 @@ function signaturePhase(
         reject(new Error('signature-refused'));
       }
     };
+    const settleAtCutoff = () => {
+      // An exited group can precede delivery of its final stream-close event.
+      if (!closed && absent()) cancellations.push(schedule(settle, 0));
+      else settle();
+    };
+    const cutoff = () => {
+      if (finished) return;
+      if (absent()) return settleAtCutoff();
+      // Timers run before the poll phase that reaps children. When synchronous work holds the
+      // loop past the cutoff, KILL and this check run in one pass, microseconds apart. Node runs
+      // one timer list per duration at a time, so an older cutoff list can even run before the
+      // KILL. Deciding after one poll phase lets the kill go out and the child be reaped. A group
+      // still present then gets the usual gap between KILL and cutoff, counted from the kill and
+      // capped by the deadline.
+      setImmediate(() => {
+        if (finished) return;
+        if (absent()) return settleAtCutoff();
+        const late = killedAt === undefined ? 0 : killedAt + CUTOFF_MS - KILL_MS - now();
+        const wait = Math.min(late, deadline - now());
+        if (wait > 0) cancellations.push(schedule(settleAtCutoff, wait));
+        else settle();
+      });
+    };
     const stop = () => {
       if (finished || stopping) return;
       stopping = true;
       signal('SIGTERM');
       cancellations.push(
-        schedule(() => signal('SIGKILL'), Math.max(0, Math.min(250, deadline - now()))),
+        schedule(
+          () => {
+            killedAt = now();
+            signal('SIGKILL');
+          },
+          Math.max(0, Math.min(KILL_MS, deadline - now())),
+        ),
       );
-      cancellations.push(schedule(settle, Math.max(0, Math.min(1000, deadline - now()))));
+      cancellations.push(schedule(cutoff, Math.max(0, Math.min(CUTOFF_MS, deadline - now()))));
     };
     const receive = (bytes: Buffer) => {
       if (finished) return;
@@ -194,10 +230,10 @@ function signaturePhase(
 async function verifyOsSignature(
   input: SignatureInput,
   dependencies: AcpImportDependencies,
+  deadline: number,
 ): Promise<SignatureReceipt> {
   if (process.platform !== 'darwin' || process.arch !== 'arm64')
     throw new Error('signature-refused');
-  const deadline = (dependencies.now ?? (() => performance.now()))() + 5000;
   const requirement = googleAcpDeveloperIdRequirement(input.client.signerTeamId);
   await signaturePhase(
     input.executable,
@@ -249,7 +285,7 @@ function managedSnapshot(home: string, executable: string): string {
     current = join(current, part);
     paths.push(current);
   }
-  paths.push(executable);
+  paths.push(executable, join(dirname(executable), 'localharness_external'));
   return JSON.stringify(
     paths.map((path) => {
       const state = lstatSync(path, { bigint: true });
@@ -283,18 +319,32 @@ export async function importGoogleAcp(
     const staging = join(options.home, 'imports/google-acp-v1');
     validateAcpDirectory(staging, options.home);
     const identityBytes = readAcpPrivateFile(join(staging, 'identity.json'), 4096);
-    const client = AcpClientPinSchema.parse(
+    const identity = AcpImportIdentitySchema.parse(
       JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(identityBytes)),
     );
-    const source = join(staging, 'agy_acp_server.par');
-    const bytes = readAcpPrivateFile(source, 256 * 1024 * 1024);
-    if (createHash('sha256').update(bytes).digest('hex') !== client.sha256)
+    const client = acpClientPin(identity);
+    const files = [
+      { name: 'agy_acp_server.par', sha256: client.sha256, maximum: AcpServerMaximumBytes },
+      {
+        name: 'localharness_external',
+        sha256: identity.harnessSha256,
+        maximum: AcpHarnessMaximumBytes,
+      },
+    ].map((file) => ({
+      ...file,
+      source: join(staging, file.name),
+      bytes: readAcpPrivateFile(join(staging, file.name), file.maximum),
+    }));
+    if (files.some((file) => createHash('sha256').update(file.bytes).digest('hex') !== file.sha256))
       return refused('invalid-import');
     const root = join(options.home, 'providers/google-acp-v1');
     const pinPath = join(root, 'pin.json');
+    const matchesIdentity = (current: AcpClientIdentity) =>
+      JSON.stringify(acpClientPin(current)) === JSON.stringify(client) &&
+      current.harnessSha256 === identity.harnessSha256;
     if (existsSync(pinPath)) {
       const current = readGoogleAcpPin(options.home);
-      return JSON.stringify(acpClientPin(current)) === JSON.stringify(client)
+      return matchesIdentity(current)
         ? { imported: true, reason: 'already-imported', client: current }
         : refused('pin-conflict');
     }
@@ -302,47 +352,65 @@ export async function importGoogleAcp(
     privateDirectory(root, options.home);
     const managed = join(root, client.sha256);
     privateDirectory(managed, options.home);
-    const executable = join(managed, 'agy_acp_server.par');
-    if (!existsSync(executable)) writePrivate(executable, bytes, 0o500);
-    if (!readAcpPrivateFile(executable, 256 * 1024 * 1024, true).equals(bytes))
+    for (const file of files) {
+      const destination = join(managed, file.name);
+      if (!existsSync(destination)) writePrivate(destination, file.bytes, 0o500);
+      if (!readAcpPrivateFile(destination, file.maximum, true).equals(file.bytes))
+        return refused('invalid-import');
+    }
+    if (
+      JSON.stringify(readdirSync(managed).sort()) !== JSON.stringify(files.map((file) => file.name))
+    )
       return refused('invalid-import');
+    const executable = join(managed, 'agy_acp_server.par');
     const snapshot = managedSnapshot(options.home, executable);
-    let receipt: SignatureReceipt;
+    const receipts: SignatureReceipt[] = [];
+    const signatureDeadline = (dependencies.now ?? (() => performance.now()))() + 5000;
     try {
-      receipt = await (
-        dependencies.verifySignature ?? ((input) => verifyOsSignature(input, dependencies))
-      )({ executable, client });
-      if (
-        receipt.verified !== true ||
-        receipt.quiescent !== true ||
-        receipt.signerTeamId !== client.signerTeamId ||
-        receipt.requirement !== googleAcpDeveloperIdRequirement(client.signerTeamId)
-      )
-        return refused('signature-refused');
+      for (const file of files) {
+        const receipt = await (
+          dependencies.verifySignature ??
+          ((input) => verifyOsSignature(input, dependencies, signatureDeadline))
+        )({ executable: join(managed, file.name), client: { ...client, sha256: file.sha256 } });
+        if (
+          receipt.verified !== true ||
+          receipt.quiescent !== true ||
+          receipt.signerTeamId !== client.signerTeamId ||
+          receipt.requirement !== googleAcpDeveloperIdRequirement(client.signerTeamId)
+        )
+          return refused('signature-refused');
+        receipts.push(receipt);
+        if (
+          managedSnapshot(options.home, executable) !== snapshot ||
+          !files.every(
+            (entry) =>
+              readAcpPrivateFile(join(managed, entry.name), entry.maximum, true).equals(
+                entry.bytes,
+              ) && readAcpPrivateFile(entry.source, entry.maximum).equals(entry.bytes),
+          ) ||
+          !readAcpPrivateFile(join(staging, 'identity.json'), 4096).equals(identityBytes) ||
+          managedSnapshot(options.home, executable) !== snapshot
+        )
+          return refused('invalid-import');
+      }
     } catch (error) {
       return refused(
         error instanceof Error && error.message === 'ownership' ? 'ownership' : 'signature-refused',
       );
     }
-    if (
-      managedSnapshot(options.home, executable) !== snapshot ||
-      !readAcpPrivateFile(executable, 256 * 1024 * 1024, true).equals(bytes) ||
-      !readAcpPrivateFile(source, 256 * 1024 * 1024).equals(bytes) ||
-      !readAcpPrivateFile(join(staging, 'identity.json'), 4096).equals(identityBytes) ||
-      managedSnapshot(options.home, executable) !== snapshot
-    )
-      return refused('invalid-import');
+    const signature = (index: number) => ({
+      method: 'macos-codesign' as const,
+      verified: true as const,
+      requirement: receipts[index].requirement,
+      sha256: files[index].sha256,
+      signerTeamId: receipts[index].signerTeamId,
+    });
     const pin = AcpImportPinSchema.parse({
-      version: 1,
+      version: 2,
       profileId: 'google-acp-v1',
       client,
-      signature: {
-        method: 'macos-codesign',
-        verified: true,
-        requirement: receipt.requirement,
-        sha256: client.sha256,
-        signerTeamId: receipt.signerTeamId,
-      },
+      signature: signature(0),
+      harness: { sha256: identity.harnessSha256, signature: signature(1) },
     });
     try {
       writePrivate(pinPath, Buffer.from(JSON.stringify(pin)), 0o400);
@@ -350,8 +418,7 @@ export async function importGoogleAcp(
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     }
     const current = readGoogleAcpPin(options.home);
-    if (JSON.stringify(acpClientPin(current)) !== JSON.stringify(client))
-      return refused('pin-conflict');
+    if (!matchesIdentity(current)) return refused('pin-conflict');
     return { imported: true, reason: 'imported', client: current };
   } catch {
     return refused('invalid-import');

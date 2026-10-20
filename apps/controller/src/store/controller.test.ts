@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawn as spawnProcess, spawnSync } from 'node:child_process';
+import {
+  execFileSync,
+  type SpawnOptionsWithoutStdio,
+  spawn as spawnProcess,
+  spawnSync,
+} from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import {
@@ -14,17 +19,19 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir, userInfo } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { type TestContext, test } from 'node:test';
+import { encodeFrame, FrameDecoder, ProtocolError } from '@crewkite/client';
 import { connectController, readControllerEndpoint } from '@crewkite/client/node';
 import {
-  AnthropicNativeProfileSchema,
   type Approval,
   type Artifact,
   ArtifactSchema,
   type Attempt,
+  AttemptSchema,
   type Candidate,
   type CheckEvent,
   type CheckResult,
@@ -32,16 +39,20 @@ import {
   CommandSchema,
   canonicalJson,
   GoogleAcpProfileSchema,
-  GoogleNativeProfileSchema,
   LocalNativeProfileSchema,
+  MAX_FRAME_BYTES,
   NativeRepositoryProfileSchema,
-  ProjectSchema,
+  type Observation,
+  type Route,
+  type Run,
   RunSchema,
+  type Task,
+  TaskConversationStateSchema,
   TaskSchema,
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
-import { createDemoFixtures, createTestClock, createTestIds } from '@crewkite/testkit';
-import { createSyntheticRepository, writeChallengeSolution } from '@crewkite/testkit/repository';
+import { type createDemoFixtures, createTestClock, createTestIds } from '@crewkite/testkit';
+import { syntheticCheckDefinition, writeChallengeSolution } from '@crewkite/testkit/repository';
 import { fakeWorkerPath } from '@crewkite/testkit/worker';
 import { ArtifactFiles } from '../artifacts/index.ts';
 import {
@@ -68,76 +79,98 @@ import {
   readCheckRoots,
   spawnCheckChild as spawn,
 } from '../host/check-ownership.ts';
+import { planFormatting } from '../host/format.ts';
 import { refValue } from '../host/publication.ts';
 import { committedFiles, git, inspectSource, materialize, readFiles } from '../host/source.ts';
-import { closedWithin, groupAbsent } from '../host/worker.ts';
-import { replacementFixture as anthropicFixture } from '../providers/anthropic/replacement-fixture.ts';
+import {
+  checkRootQuiescent,
+  closedBefore,
+  closedWithin,
+  groupAbsent,
+  OwnedCommand,
+} from '../host/worker.ts';
 import { type AcpSetupProof, acpClientPin } from '../providers/google/acp/profile.ts';
-import { replacementFixture as googleFixture } from '../providers/google/replacement-fixture.ts';
+import { GoogleFlashQuotaModelId } from '../providers/google/native-writer.ts';
+import { localStructuredOutput } from '../providers/local/profile.ts';
 import {
   type NativeProfileResolution,
   unavailableNativeProfile,
+  unavailableRepositoryProfile,
 } from '../providers/openai/profile.ts';
-import {
-  fixture,
-  fixtureContent,
-  fixtureModel,
-  repositoryFixture,
-} from '../providers/openai/replacement-fixture.ts';
+import { fixture, fixtureContent, fixtureModel } from '../providers/openai/replacement-fixture.ts';
 import { serve as serveController } from '../server/index.ts';
+import {
+  binding,
+  fixtureClientHash,
+  nativeSetup,
+  nativeWait,
+  setup,
+} from './controller-fixture.ts';
 
-const fixtureClientHash = createHash('sha256').update(readFileSync(process.execPath)).digest('hex');
-
-async function setup(
-  t: TestContext,
-  options: Partial<ControllerOptions> = {},
-  close: (controller: Controller) => void | Promise<void> = (controller) => controller.close(),
-) {
-  mkdirSync(resolve('internal'), { recursive: true });
-  const directory = mkdtempSync(join(resolve('internal'), 'controller-test-'));
-  const clock = createTestClock();
-  const id = createTestIds(clock.now(), 1000n);
-  const fixtures = createDemoFixtures(clock.now());
-  const source = createSyntheticRepository(join(directory, 'demo-shop'));
-  const controller = new Controller({
-    ...options,
-    home: options.home ?? join(directory, 'home'),
-    now: clock.now,
-    id,
-    routes: fixtures.snapshot.routes,
-    observations: fixtures.snapshot.usage.map((window) => window.observation),
-  });
-  t.after(async () => {
-    await close(controller);
-    rmSync(directory, { recursive: true, force: true });
-  });
-  const command = (name: string, payload: unknown, revision?: number) => ({
-    protocol: 1,
-    key: id('cmd'),
-    actor: { id: 'terminal', kind: 'cli' },
-    command: name,
-    payload,
-    ...(revision === undefined ? {} : { expectedRevision: revision }),
-  });
-  const project = ProjectSchema.parse(
-    (
-      await controller.execute(
-        command('RegisterProject', { path: source.directory }, 0),
-        'local-owner',
+// A crash before settlement leaves the intent open, the lease and reservation held, the attempt
+// running and no settlement record. The rows below rebuild exactly that from a settled attempt.
+function crashBeforeSettlement(controller: Controller, attemptId: string) {
+  const { store } = controller;
+  const intent = store.intents().find((value) => value.attempt_id === attemptId);
+  const attempt = store.get<Attempt>('attempt', attemptId);
+  const task = store.get<Task>('task', intent?.task_id ?? '');
+  assert(intent && attempt && task);
+  store.transaction(() => {
+    store.put('attempt', attempt.id, attempt.revision + 1, {
+      ...attempt,
+      state: 'running',
+      revision: attempt.revision + 1,
+    });
+    store.put('task', task.id, task.revision + 1, {
+      ...task,
+      state: 'running',
+      revision: task.revision + 1,
+    });
+    store.db
+      .prepare("UPDATE launch_intents SET state='acknowledged',finished_at=NULL WHERE attempt_id=?")
+      .run(attemptId);
+    store.db
+      .prepare('INSERT INTO writer_leases(task_id,attempt_id,generation) VALUES (?,?,?)')
+      .run(task.id, attemptId, intent.generation);
+    store.db
+      .prepare(
+        "INSERT INTO reservations(attempt_id,route_id,window_id,unit,value,launches,minutes) VALUES (?,?,'held','minutes',0,1,5)",
       )
-    ).entity,
+      .run(attemptId, intent.route_id);
+    store.db
+      .prepare('DELETE FROM receipts WHERE command_key=?')
+      .run(`native-unknown-settled:${attemptId}`);
+  });
+}
+
+function installedBiome() {
+  const manifest = createRequire(resolve('package.json')).resolve('@biomejs/biome/package.json');
+  return {
+    version: JSON.parse(readFileSync(manifest, 'utf8')).version as string,
+    binary: join(
+      dirname(createRequire(manifest).resolve('@biomejs/cli-darwin-arm64/package.json')),
+      'biome',
+    ),
+  };
+}
+
+// Tabs differ from the layout the fixture writers produce, so their bytes carry a layout defect.
+const tabConfiguration =
+  '{"formatter":{"indentStyle":"tab"},"linter":{"enabled":false},"assist":{"enabled":false}}\n';
+
+function commitFormatting(root: string, configuration: string) {
+  writeFileSync(join(root, 'biome.json'), configuration);
+  writeFileSync(
+    join(root, 'package.json'),
+    JSON.stringify({ devDependencies: { '@biomejs/biome': installedBiome().version } }),
   );
-  const draft = command(
-    'CreateTask',
-    {
-      projectId: project.id,
-      title: fixtures.task.title,
-      outcome: fixtures.task.outcome,
-      criteria: fixtures.task.criteria,
-    },
-    0,
+  git(root, ['add', '--', 'biome.json', 'package.json']);
+  git(
+    root,
+    ['commit', '--quiet', '-m', 'test: configure formatting', '--', 'biome.json', 'package.json'],
+    undefined,
+    { name: 'CrewKite fixture', email: 'fixture@example.invalid', at: '2026-10-15T17:00:00Z' },
   );
-  return { controller, command, draft, fixtures, source, directory, clock, id };
 }
 
 function quickRoles(fixtures: ReturnType<typeof createDemoFixtures>) {
@@ -166,6 +199,233 @@ test('an idempotent retry returns the receipt without creating another task', as
   );
 });
 
+test('task snapshots retain related evidence within the unchanged frame bound', async (t) => {
+  const socketRoot = mkdtempSync(
+    join(realpathSync(checkOwner()?.stateRoot ?? tmpdir()), 'ck-snap-'),
+  );
+  const { controller, command, draft, fixtures, id } = await setup(t, {
+    home: join(socketRoot, 'home'),
+    googleUsageClient: () => ({ available: false, reason: 'client-unavailable' }),
+    openAiUsageClient: () => unavailableNativeProfile(),
+  });
+  t.after(() => rmSync(socketRoot, { recursive: true, force: true }));
+  const unrelatedArtifactId = id('art');
+  const selected = TaskSchema.parse(
+    (
+      await controller.execute(
+        {
+          ...draft,
+          payload: {
+            ...(draft.payload as object),
+            criteria: [...fixtures.task.criteria, unrelatedArtifactId],
+          },
+        },
+        'local-owner',
+      )
+    ).entity,
+  );
+  const unrelated = TaskSchema.parse(
+    (
+      await controller.execute(
+        command(
+          'CreateTask',
+          {
+            projectId: selected.projectId,
+            title: 'Unrelated task',
+            outcome: 'Keep history',
+            criteria: ['Retain history'],
+          },
+          0,
+        ),
+        'local-owner',
+      )
+    ).entity,
+  );
+  const records = [];
+  for (const task of [selected, unrelated]) {
+    const run = RunSchema.parse(
+      (
+        await controller.execute(
+          command(
+            'PrepareRun',
+            {
+              taskId: task.id,
+              policy: { ...fixtures.policy, quality: 'quick', methods: [], effects: [] },
+              roles: quickRoles(fixtures),
+            },
+            task.revision,
+          ),
+          'local-owner',
+        )
+      ).entity,
+    );
+    const attempt: Attempt = {
+      id: id('att'),
+      runId: run.id,
+      routeId: run.roles[0].routeId,
+      generation: 0,
+      state: 'stopped',
+      revision: 0,
+    };
+    const artifact: Artifact = {
+      id: id('art'),
+      hash: 'a'.repeat(64),
+      bytes: 0,
+      mediaType: 'application/json',
+    };
+    const log: Artifact = { ...artifact, id: id('art'), hash: 'b'.repeat(64) };
+    const candidate: Candidate = {
+      id: id('cnd'),
+      taskId: task.id,
+      hash: 'c'.repeat(64),
+      artifactId: artifact.id,
+      revision: 0,
+    };
+    const check: CheckResult = {
+      candidateId: candidate.id,
+      candidateHash: candidate.hash,
+      definitionHash: 'd'.repeat(64),
+      evaluator: 'fixture',
+      passed: true,
+      artifactId: log.id,
+    };
+    const approval: Approval = {
+      approvalId: id('apr'),
+      taskId: task.id,
+      attemptId: attempt.id,
+      generation: 0,
+      action: 'accept-candidate',
+      target: 'refs/heads/feat/checked',
+      revision: 0,
+      requester: 'controller',
+      consequence: 'Accept the checked candidate.',
+      status: 'pending',
+    };
+    const job = {
+      taskId: task.id,
+      runId: run.id,
+      attemptId: attempt.id,
+      generation: 0,
+      routeId: attempt.routeId,
+      candidateId: candidate.id,
+      candidateHash: candidate.hash,
+      methodId: 'keep-it-simple',
+      cycle: 1,
+      limitMinutes: 1,
+      scripted: true,
+    };
+    controller.store.transaction(() => {
+      controller.store.put('attempt', attempt.id, 0, attempt);
+      controller.store.put('artifact', artifact.id, 0, artifact);
+      controller.store.put('artifact', log.id, 0, log);
+      controller.store.put('candidate', candidate.id, 0, candidate);
+      controller.store.put('approval', approval.approvalId, 0, approval);
+      controller.store.db
+        .prepare('INSERT INTO evidence VALUES (?,?,?,?,?,?)')
+        .run(
+          candidate.id,
+          'check',
+          candidate.hash,
+          check.definitionHash,
+          check.evaluator,
+          canonicalJson(check),
+        );
+      controller.store.db
+        .prepare('INSERT INTO review_jobs VALUES (?,?,?)')
+        .run(attempt.id, candidate.id, canonicalJson(job));
+    });
+    records.push({ task, run, attempt, candidate, check, approval, job, artifact, log });
+  }
+  controller.store.transaction(() => {
+    for (let index = 0; index < 5000; index++) {
+      const artifact: Artifact = {
+        id: index === 0 ? unrelatedArtifactId : id('art'),
+        hash: 'a'.repeat(64),
+        bytes: 0,
+        mediaType: 'x'.repeat(180),
+      };
+      controller.store.put('artifact', artifact.id, 0, artifact);
+    }
+  });
+  const before = controller.snapshot();
+  assert.equal(MAX_FRAME_BYTES, 1048576);
+  const globalMessage = {
+    type: 'result' as const,
+    key: id('cmd'),
+    result: { outcome: 'applied' as const, data: { kind: 'snapshot' as const, snapshot: before } },
+  };
+  assert(Buffer.byteLength(JSON.stringify(globalMessage)) > MAX_FRAME_BYTES);
+  assert.throws(() => encodeFrame(globalMessage), ProtocolError);
+  const cursor = controller.store.cursor();
+  const receipts = controller.store.db.prepare('SELECT COUNT(*) AS n FROM receipts').get()?.n;
+  const server = await serveController(controller);
+  const client = await connectController({
+    ...readControllerEndpoint(controller.home),
+    actor: { id: 'scoped-read', kind: 'cli' },
+  });
+  try {
+    for (const scope of [{ taskId: selected.id }, { approvalId: records[0].approval.approvalId }]) {
+      const snapshot = await client.snapshot(scope);
+      assert.deepEqual(
+        snapshot.tasks.map((task) => task.id),
+        [selected.id],
+      );
+      assert.deepEqual(snapshot.runs, [records[0].run]);
+      assert.deepEqual(snapshot.attempts, [records[0].attempt]);
+      assert.deepEqual(snapshot.candidates, [records[0].candidate]);
+      assert.deepEqual(snapshot.evidence, [records[0].check]);
+      assert.deepEqual(snapshot.approvals, [records[0].approval]);
+      assert.deepEqual(snapshot.reviewJobs, [records[0].job]);
+      assert.deepEqual(
+        new Set(snapshot.artifacts.map((artifact) => artifact.id)),
+        new Set([records[0].artifact.id, records[0].log.id]),
+      );
+      assert.deepEqual(snapshot.routes, before.routes);
+      assert.deepEqual(snapshot.usage, before.usage);
+      const message = {
+        ...globalMessage,
+        result: { ...globalMessage.result, data: { kind: 'snapshot' as const, snapshot } },
+      };
+      const frame = encodeFrame(message);
+      assert(frame.byteLength <= MAX_FRAME_BYTES + 4);
+      assert.deepEqual(new FrameDecoder().push(frame), [message]);
+    }
+    for (const scope of [{ taskId: id('tsk') }, { approvalId: id('apr') }]) {
+      const snapshot = await client.snapshot(scope);
+      for (const values of [
+        snapshot.tasks,
+        snapshot.runs,
+        snapshot.attempts,
+        snapshot.candidates,
+        snapshot.approvals,
+        snapshot.artifacts,
+        snapshot.evidence,
+        snapshot.reviewJobs,
+      ])
+        assert.equal(values?.length, 0);
+    }
+    assert.equal(
+      CommandSchema.safeParse(
+        command('GetSnapshot', { taskId: selected.id, approvalId: records[0].approval.approvalId }),
+      ).success,
+      false,
+    );
+    assert.equal(
+      CommandSchema.safeParse(command('GetSnapshot', { taskId: selected.id, extra: true })).success,
+      false,
+    );
+    assert.deepEqual(controller.snapshot(), before);
+    assert.equal(controller.store.cursor(), cursor);
+    assert.equal(
+      controller.store.db.prepare('SELECT COUNT(*) AS n FROM receipts').get()?.n,
+      receipts,
+    );
+  } finally {
+    client.close();
+    await server.close();
+  }
+});
+
 test('reusing a command key with changed content cannot change its result', async (t) => {
   const { controller, draft } = await setup(t);
   const first = await controller.execute(draft, 'local-owner');
@@ -175,6 +435,96 @@ test('reusing a command key with changed content cannot change its result', asyn
   };
   assert.equal((await controller.execute(changed, 'local-owner')).reason, 'idempotency-key-reused');
   assert.deepEqual(controller.snapshot().tasks, [first.entity]);
+});
+
+test('repository verification launches with its sealed ten-minute check window', async (t) => {
+  const { controller, command, draft, fixtures, directory, id } = await setup(t);
+  const task = TaskSchema.parse((await controller.execute(draft, 'local-owner')).entity);
+  const policy = {
+    ...fixtures.policy,
+    quality: 'quick' as const,
+    methods: [],
+    limits: { ...fixtures.policy.limits, minutes: 12 },
+    effects: fixtures.policy.effects.map((grant) => ({ ...grant, taskId: task.id })),
+  };
+  const prepared = await controller.execute(
+    command('PrepareRun', { taskId: task.id, policy, roles: quickRoles(fixtures) }, 0),
+    'local-owner',
+  );
+  assert.equal(prepared.outcome, 'applied', JSON.stringify(prepared));
+  const run = RunSchema.parse(prepared.entity);
+  const attempt = AttemptSchema.parse({
+    id: id('att'),
+    runId: run.id,
+    routeId: fixtures.snapshot.routes[0].id,
+    generation: 0,
+    state: 'intent',
+    revision: 0,
+  });
+  const admit = Reflect.get(controller, 'admitJob') as (
+    value: Run,
+    admitted: Attempt,
+    path: string,
+    maximumMinutes: number,
+  ) => number;
+  const calls: unknown[][] = [];
+  const sentinel = Error('verification admission observed');
+  Reflect.set(controller, 'admitJob', (...input: unknown[]) => {
+    calls.push(input);
+    throw sentinel;
+  });
+  const startVerification = Reflect.get(controller, 'startVerification') as (
+    artifact: Artifact,
+    plan: unknown,
+    effects: (() => void)[],
+  ) => CommandResult;
+  const preparation = ArtifactSchema.parse({
+    id: id('art'),
+    hash: 'a'.repeat(64),
+    bytes: 1,
+    mediaType: 'application/vnd.crewkite.evaluation+json',
+  });
+  const plan = {
+    run,
+    candidate: { id: id('cnd'), hash: 'b'.repeat(64) },
+    definition: {
+      recipeId: 'crewkite-verify-v1',
+      definitionHash: 'c'.repeat(64),
+      entrypoints: { electron: 'node_modules/electron/index.js' },
+    },
+    verification: {},
+    maximumCheckMinutes: 10,
+  };
+  assert.throws(
+    () =>
+      controller.store.transaction(() =>
+        Reflect.apply(startVerification, controller, [preparation, plan, []]),
+      ),
+    sentinel,
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], run);
+  assert.equal((calls[0][1] as Attempt).runId, run.id);
+  assert.equal(calls[0][2], join(controller.home, 'verification', (calls[0][1] as Attempt).id));
+  assert.equal(calls[0][3], plan.maximumCheckMinutes);
+  Reflect.set(controller, 'admitJob', admit);
+  const minutes = controller.store.transaction(() =>
+    Reflect.apply(admit, controller, [run, attempt, join(directory, 'verification-fixture'), 10]),
+  );
+  assert.equal(minutes, 10);
+  assert.equal(
+    controller.store.db
+      .prepare(
+        "SELECT minutes FROM reservations WHERE attempt_id=? AND window_id='local-execution'",
+      )
+      .get(attempt.id)?.minutes,
+    10,
+  );
+  const deadline = Reflect.get(controller, 'jobDeadline') as (
+    attemptId: string,
+    maximumMinutes: number,
+  ) => number;
+  assert.equal(Reflect.apply(deadline, controller, [attempt.id, minutes]), 600_000);
 });
 
 test('a stale task revision leaves the current task and event cursor intact', async (t) => {
@@ -200,6 +550,10 @@ test('a stale task revision leaves the current task and event cursor intact', as
     .get()?.count;
   await controller.execute(command('GetSnapshot', {}), 'local-owner');
   await controller.execute(command('GetUsage', {}), 'local-owner');
+  assert.deepEqual(await controller.execute(command('GetHealth', {}), 'local-owner'), {
+    outcome: 'applied',
+    data: { kind: 'health', status: 'ready', version: '0.0.0', blockers: [] },
+  });
   assert.equal(
     controller.store.db.prepare('SELECT COUNT(*) AS count FROM receipts').get()?.count,
     receipts,
@@ -208,6 +562,16 @@ test('a stale task revision leaves the current task and event cursor intact', as
     (await controller.execute(command('GetSnapshot', {}), 'untrusted')).outcome,
     'denied',
   );
+  assert.deepEqual(await controller.execute(command('GetHealth', {}), 'untrusted'), {
+    outcome: 'denied',
+    reason: 'unauthenticated-actor',
+    next: 'Connect through the private authenticated socket.',
+  });
+  await controller.close();
+  assert.deepEqual(await controller.execute(command('GetHealth', {}), 'local-owner'), {
+    outcome: 'blocked',
+    reason: 'controller-closing',
+  });
 });
 
 test('a prepared draft is editable only before it has pending work', async (t) => {
@@ -642,6 +1006,8 @@ test('a committed launch intent survives restart without another launch', async 
       });
     }
     fixture.controller.close();
+    // The controller stays down for two hours before it recovers.
+    fixture.clock.advance(7200000);
     const recovered = new Controller({
       home: join(fixture.directory, 'home'),
       now: fixture.clock.now,
@@ -667,6 +1033,20 @@ test('a committed launch intent survives restart without another launch', async 
         entry.unknown ? 1 : 0,
       );
       assert.equal(submissions, 1, 'restart cannot resubmit or advance a native phase');
+      // The charge stops at the recorded closure. Without one it stops at the attempt limit
+      // plus the cleanup reserve, and an unresolved intent stays open and charged in full.
+      const charged = recovered.store.intents()[0].finished_at;
+      if (entry.unknown) assert.equal(charged, null);
+      else if (entry.state === 'quiescent')
+        assert.equal(
+          charged,
+          recovered.store.nativeProcesses(intent.attempt_id).at(-1)?.quiescent_at,
+        );
+      else
+        assert.equal(
+          charged,
+          new Date(Date.parse(intent.admitted_at as string) + 30 * 60000 + 60000).toISOString(),
+        );
     } finally {
       recovered.close();
       for (const process of processes) process.child.stdin?.end();
@@ -676,9 +1056,90 @@ test('a committed launch intent survives restart without another launch', async 
 });
 
 test('a retained descendant blocks sealing and transfer after its leader exits', async (t) => {
+  for (const first of ['close', 'deadline', 'cancel'] as const) {
+    const closed = Promise.withResolvers<void>();
+    const boundary = Promise.withResolvers<void>();
+    let observed: boolean | undefined;
+    const proof = closedBefore(closed.promise, boundary.promise).then((value) => {
+      observed = value;
+      return value;
+    });
+    await Promise.resolve();
+    assert.equal(observed, undefined, 'leader exit does not complete the stream proof');
+    if (first === 'close') closed.resolve();
+    else boundary.resolve();
+    assert.equal(await proof, first === 'close', first);
+    closed.resolve();
+    boundary.resolve();
+    assert.equal(await proof, first === 'close', 'late closure cannot rewrite the boundary');
+  }
   const { controller, command, draft, fixtures } = await setup(t, {
     scenarioForRoute: () => 'stubborn',
   });
+  for (const streams of ['inherit', 'ignore'] as const) {
+    const descendant = `process.on('SIGUSR2',()=>process.exit(0)); setInterval(()=>{},10000); process.stdout.write('ready\\n');`;
+    const leader = `const {spawn}=require('node:child_process'); const child=spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{stdio:['ignore','pipe',${JSON.stringify(streams)}]}); child.stdout.once('data',chunk=>{process.stdout.write(chunk);process.exit(0);});`;
+    const job = new OwnedCommand({
+      argv: ['-e', leader],
+      directory: controller.home,
+      environmentHome: join(controller.home, `closure-${streams}`),
+      onSpawn: () => {},
+    });
+    t.after(() => {
+      if (!groupAbsent(job.group))
+        try {
+          process.kill(-job.group, 'SIGKILL');
+        } catch {}
+    });
+    const exit = await nativeWait('retained command descendant', job.exited);
+    assert.equal(exit.code, 0);
+    assert.equal(exit.signal, null);
+    assert.equal(exit.quiescent, false);
+    assert.equal(groupAbsent(job.group), false);
+    const boundary = Promise.withResolvers<void>();
+    let drained: boolean | undefined;
+    const withinBudget = closedBefore(job.closed, boundary.promise).then((value) => {
+      drained = value;
+      return value;
+    });
+    if (streams === 'ignore') await nativeWait('closed command streams', job.closed);
+    assert.equal(
+      await job.quiescent((work, milliseconds) => {
+        assert.equal(milliseconds, 1000);
+        if (streams === 'inherit') queueMicrotask(work);
+        return () => {};
+      }),
+      false,
+      'a live descendant or retained stream cannot prove quiescence',
+    );
+    if (streams === 'inherit')
+      assert.equal(drained, undefined, 'the old cleanup grace cannot spend the admitted deadline');
+    process.kill(-job.group, 'SIGUSR2');
+    await nativeWait('released command descendant', job.closed);
+    if (streams === 'ignore') {
+      let polling = true;
+      try {
+        await nativeWait(
+          'released command group',
+          new Promise<void>((resolve) => {
+            const check = () => {
+              if (groupAbsent(job.group)) resolve();
+              else if (polling) setImmediate(check);
+            };
+            check();
+          }),
+          1000,
+        );
+      } finally {
+        polling = false;
+      }
+    }
+    assert.equal(await withinBudget, true, 'physical closure arrived before the owner boundary');
+    boundary.resolve();
+    assert.equal(await job.quiescent(), true);
+    assert.equal(groupAbsent(job.group), true);
+    assert.equal(exit.quiescent, false, 'the leader exit snapshot remains historical');
+  }
   const task = TaskSchema.parse((await controller.execute(draft, 'local-owner')).entity);
   const policy = {
     ...fixtures.policy,
@@ -741,6 +1202,45 @@ test('a retained descendant blocks sealing and transfer after its leader exits',
     ).reason,
     'writer-ownership-unknown',
   );
+});
+
+test('candidate manifests expose sealed metadata without materializing file content', (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'crewkite-manifest-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const artifacts = new ArtifactFiles(join(directory, 'artifacts'));
+  const metadata = new Map<string, Artifact>();
+  const clock = createTestClock();
+  const evidence = new CandidateEvidence({
+    home: directory,
+    artifacts,
+    id: createTestIds(clock.now(), 1n),
+    getArtifact: (id) => {
+      const artifact = metadata.get(id);
+      if (!artifact) throw Error('Missing fixture artifact.');
+      return artifact;
+    },
+  });
+  const content = Buffer.from('export const a = 1;\n');
+  const file = {
+    path: 'src/a.mjs',
+    mode: '100644' as const,
+    hash: createHash('sha256').update(content).digest('hex'),
+    bytes: content.length,
+    content,
+  };
+  const captured = evidence.capture({
+    taskId: createTestIds(clock.now(), 100n)('tsk'),
+    base: '1'.repeat(40),
+    files: [file],
+    existing: [],
+  });
+  for (const artifact of captured.artifacts) metadata.set(artifact.id, artifact);
+  rmSync(join(artifacts.directory, file.hash));
+  assert.deepEqual(evidence.describe(captured.candidate), {
+    base: '1'.repeat(40),
+    files: [{ path: file.path, mode: file.mode, hash: file.hash, bytes: file.bytes }],
+  });
+  assert.throws(() => evidence.read(captured.candidate));
 });
 
 test('candidate evidence requires unchanged bytes and completed checks', async (t) => {
@@ -879,7 +1379,9 @@ test('candidate evidence requires unchanged bytes and completed checks', async (
         path,
         `${readFileSync(path, 'utf8').trimEnd().split('\n').slice(0, -1).join('\n')}\n`,
       );
-      assert.equal(readCheckRoots(pendingOwner)[0].terminal, undefined);
+      const absentWithoutClose = readCheckRoots(pendingOwner)[0];
+      assert.equal(absentWithoutClose.terminal, undefined);
+      assert.equal(checkRootQuiescent(absentWithoutClose), true);
     }
   }
   const ineligibleDirectory = join(directory, 'worker-exit-ineligible');
@@ -967,7 +1469,9 @@ fixtureTest('attached fixture keeps the admitted stage group', async () => {
     assert.equal(await closedWithin(noAckClosed), true);
   }
   assert.notEqual(noAck.exitCode, 0);
-  assert.equal(readCheckRoots(stageOwner).filter((root) => !root.acknowledgment).length, 1);
+  const unacknowledgedRoot = readCheckRoots(stageOwner).find((root) => !root.acknowledgment);
+  assert(unacknowledgedRoot);
+  assert.equal(checkRootQuiescent(unacknowledgedRoot), false);
   const faultDirectory = join(directory, 'ownership-fault');
   mkdirSync(faultDirectory);
   const faultOwner = { ...owner, directory: faultDirectory };
@@ -1478,7 +1982,7 @@ fixtureTest('attached fixture keeps the admitted stage group', async () => {
     journey: { file: 'e2e/desktop.spec.ts', title: journeyTitle, hash: fixtureClientHash } as const,
     stages: [...verificationStages] as [...typeof verificationStages],
     provenancePattern: 'fixture',
-    maximumMinutes: 5 as const,
+    maximumMinutes: 10 as const,
   };
   const verification = ToolchainDefinitionSchema.parse({
     ...fields,
@@ -1748,19 +2252,166 @@ fixtureTest('attached fixture keeps the admitted stage group', async () => {
   const proofReference = savedMetadata.verification.artifact;
   metadata.set(proofReference.id, { ...proofReference, hash: fixtureClientHash });
   assert.equal(evidence.verificationMatches(historicalInput), false);
-});
 
-function binding(approval: Approval) {
-  return {
-    approvalId: approval.approvalId,
-    taskId: approval.taskId,
-    attemptId: approval.attemptId,
-    generation: approval.generation,
-    action: approval.action,
-    target: approval.target,
-    revision: approval.revision,
+  // Capture formats changed files with the committed configuration before the hash exists.
+  const biome = installedBiome();
+  const authored = mkdtempSync(join(directory, 'authored-'));
+  writeFileSync(join(authored, 'net.mjs'), '');
+  writeChallengeSolution(authored);
+  const authoredBytes = readFileSync(join(authored, 'net.mjs'));
+  const formatRun = async (configuration: string) => {
+    const formatting = await setup(t);
+    commitFormatting(formatting.source.directory, configuration);
+    const drafted = TaskSchema.parse(
+      (await formatting.controller.execute(formatting.draft, 'local-owner')).entity,
+    );
+    const formattingPolicy = {
+      ...formatting.fixtures.policy,
+      quality: 'quick',
+      methods: [],
+      effects: [
+        ...formatting.fixtures.policy.effects.map((grant) => ({ ...grant, taskId: drafted.id })),
+        {
+          taskId: drafted.id,
+          action: 'run-review',
+          target: 'keep-it-simple/cycle-1',
+          expiresAt: formatting.fixtures.policy.effects[0].expiresAt,
+          revoked: false,
+          usesRemaining: 1,
+        },
+      ],
+    };
+    const scheduled = await formatting.controller.execute(
+      formatting.command(
+        'PrepareRun',
+        { taskId: drafted.id, policy: formattingPolicy, roles: quickRoles(formatting.fixtures) },
+        0,
+      ),
+      'local-owner',
+    );
+    const formattingRun = RunSchema.parse(scheduled.entity);
+    const finished = new Promise<void>((resolve) => {
+      const off = formatting.controller.subscribe((event) => {
+        if (event.type === 'task.updated' && event.payload.state === 'ready') {
+          off();
+          resolve();
+        }
+      });
+    });
+    await formatting.controller.execute(
+      formatting.command(
+        'StartRun',
+        { taskId: drafted.id, runId: formattingRun.id },
+        scheduled.revision,
+      ),
+      'local-owner',
+    );
+    await finished;
+    const { controller: owner } = formatting;
+    const attemptId = owner.store
+      .intents()
+      .find((intent) => intent.run_id === formattingRun.id)?.attempt_id;
+    const artifact = owner.store.receipt(`formatting:${attemptId}`)?.result.entity;
+    return {
+      snapshot: owner.snapshot(),
+      base: formattingRun.source.base,
+      source: formatting.source.directory,
+      scratch: join(owner.home, 'scratch', formattingRun.id),
+      receipt:
+        artifact && 'hash' in artifact
+          ? JSON.parse(
+              new ArtifactFiles(join(owner.home, 'artifacts')).read(artifact.hash).toString('utf8'),
+            )
+          : undefined,
+    };
   };
-}
+  const hashOf = (base: string, files: ReturnType<typeof readFiles>) =>
+    new CandidateEvidence({
+      home: directory,
+      artifacts: artifactFiles,
+      id,
+      getArtifact: () => {
+        throw Error('The hash needs no artifacts.');
+      },
+    }).hash(base, files);
+  const layout = await formatRun(tabConfiguration);
+  const failure = await formatRun('{');
+  await t.test('a candidate whose only defect is layout passes biome check after capture', () => {
+    const check = spawnSync(biome.binary, ['check', 'net.mjs'], {
+      cwd: layout.scratch,
+      encoding: 'utf8',
+    });
+    assert.equal(check.status, 0, check.stdout + check.stderr);
+    assert.equal(layout.receipt?.status, 'formatted');
+    assert.equal(layout.receipt.formatter.version, biome.version);
+    assert.equal(
+      layout.receipt.formatter.sha256,
+      createHash('sha256').update(readFileSync(biome.binary)).digest('hex'),
+    );
+    assert.deepEqual(
+      layout.receipt.files.map((file: { path: string }) => file.path),
+      ['net.mjs'],
+    );
+  });
+  await t.test('a formatter failure leaves the bytes unchanged and is recorded', () => {
+    assert.deepEqual(readFileSync(join(failure.scratch, 'net.mjs')), authoredBytes);
+    assert.equal(failure.receipt?.status, 'failed');
+    assert.match(failure.receipt.reason, /exited/);
+    assert.deepEqual(failure.receipt.files, []);
+    assert.equal(
+      failure.snapshot.candidates[0].hash,
+      hashOf(failure.base, readFiles(failure.scratch)),
+    );
+  });
+  await t.test('the candidate hash equals the formatted bytes', () => {
+    const formatted = spawnSync(biome.binary, ['format', '--stdin-file-path=net.mjs'], {
+      cwd: layout.scratch,
+      input: authoredBytes,
+    });
+    assert.equal(formatted.status, 0);
+    assert.notDeepEqual(formatted.stdout, authoredBytes);
+    const sealed = readFiles(layout.scratch);
+    assert.deepEqual(sealed.find((file) => file.path === 'net.mjs')?.content, formatted.stdout);
+    assert.equal(layout.snapshot.candidates[0].hash, hashOf(layout.base, sealed));
+    assert.equal(layout.snapshot.evidence[0].candidateHash, layout.snapshot.candidates[0].hash);
+    assert.deepEqual(layout.receipt?.files, [
+      {
+        path: 'net.mjs',
+        before: createHash('sha256').update(authoredBytes).digest('hex'),
+        after: createHash('sha256').update(formatted.stdout).digest('hex'),
+      },
+    ]);
+  });
+  await t.test(
+    'a candidate configuration cannot replace the committed formatter policy',
+    async () => {
+      const candidateConfiguration = Buffer.from(
+        '{"formatter":{"indentStyle":"space"},"linter":{"enabled":false}}\n',
+      );
+      const files = committedFiles(layout.source, layout.base).map((file) =>
+        file.path === 'biome.json'
+          ? {
+              ...file,
+              content: candidateConfiguration,
+              bytes: candidateConfiguration.length,
+              hash: createHash('sha256').update(candidateConfiguration).digest('hex'),
+            }
+          : file,
+      );
+      const planned = await planFormatting({
+        runtime: resolve('.'),
+        project: layout.source,
+        base: layout.base,
+        files,
+        work: mkdtempSync(join(directory, 'format-policy-')),
+        maximumBytes: 1024 * 1024,
+      });
+      assert.equal(planned.receipt.status, 'skipped');
+      assert.equal(planned.receipt.reason, 'The candidate changes the formatting configuration.');
+      assert.deepEqual(planned.outputs, []);
+    },
+  );
+});
 
 test('acceptance creates one checked branch and preserves the original source', async (t) => {
   for (const transfer of ['reserve', 'manual'] as const)
@@ -1922,6 +2573,7 @@ async function acceptsNativeCandidate(t: TestContext) {
           methodId: 'keep-it-simple',
           cycles: 1,
         },
+        creditPolicy: 'existing-credits',
         consent: 'explicit',
         grants: [
           { action: 'run-check', target: 'node --test' },
@@ -1973,6 +2625,9 @@ async function acceptsNativeCandidate(t: TestContext) {
   const reviewPhases = controller.store.nativeProcesses(job.attemptId);
   const reviewRoute = checked.routes.find((route) => route.id === job.routeId);
   assert(reviewRoute);
+  // A reviewer-family mutation must leave the frozen writer routes intact.
+  assert.notEqual(reviewRoute.id, run.roles[0].routeId);
+  assert.notEqual(reviewRoute.id, successor.route_id);
   const quiescentAt = reviewPhases[2]?.quiescent_at;
   assert(quiescentAt);
   const check = checked.evidence.find((value) => !value.review);
@@ -2551,8 +3206,9 @@ async function acceptsTransferredCandidate(t: TestContext, transfer: 'reserve' |
     .at(-1);
   assert.ok(writer);
   for (const check of snapshot.evidence.filter((check) => check.review)) {
-    assert.equal(check.review?.job.writerAttemptId, writer.attempt_id);
-    assert.equal(check.review?.job.writerRouteId, writer.route_id);
+    assert(check.review && 'writerAttemptId' in check.review.job);
+    assert.equal(check.review.job.writerAttemptId, writer.attempt_id);
+    assert.equal(check.review.job.writerRouteId, writer.route_id);
   }
   if (transfer === 'reserve') {
     const check = snapshot.evidence.find((check) => check.review) as CheckResult;
@@ -2601,6 +3257,7 @@ async function acceptsTransferredCandidate(t: TestContext, transfer: 'reserve' |
         controller.store.put('attempt', writer.attempt_id, 0, original),
       );
     }
+    assert('writerAttemptId' in check.review.job);
     const {
       writerAttemptId: _writerAttemptId,
       writerRouteId: _writerRouteId,
@@ -2777,529 +3434,22 @@ function taskRevision(controller: Controller, taskId: string): number {
   return TaskSchema.parse(controller.store.get('task', taskId)).revision;
 }
 
-async function nativeWait<T>(
-  stage: string,
-  pending: Promise<T>,
-  milliseconds = 30_000,
-): Promise<T> {
-  console.error(`Native fixture stage: ${stage}`);
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      pending,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => {
-          reject(new Error(`Native fixture ${stage} timed out.`));
-        }, milliseconds);
-      }),
-    ]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function nativeSetup(
-  t: TestContext,
-  mode = 'success',
-  options: Partial<ControllerOptions> = {},
-  targetPath = 'net.mjs',
-) {
-  const anthropic = mode.startsWith('anthropic-');
-  const google = mode.startsWith('google-');
-  const repository = mode.startsWith('repository-');
-  let repositoryCli = '';
-  let submissions = 0;
-  const ready = Promise.withResolvers<void>();
-  const failure = Promise.withResolvers<never>();
-  let callbackError: unknown;
-  const fail = (error: unknown) => {
-    callbackError ??= error;
-    failure.reject(error);
-  };
-  void failure.promise.catch(() => {});
-  t.after(() => {
-    if (callbackError) throw callbackError;
-  });
-  const observe = (controller: Controller, listener: Parameters<Controller['subscribe']>[0]) =>
-    controller.subscribe((event) => {
-      try {
-        listener(event);
-      } catch (error) {
-        fail(error);
-      }
-    });
-  const childrenClosed: Promise<void>[] = [];
-  const children: ReturnType<typeof spawn>[] = [];
-  let onSpawn: ((phase: string) => void) | undefined;
-  let onInput: ((message: { method?: string }, phase: string) => void) | undefined;
-  let onWritten: typeof onInput;
-  const reviewerProfile = {
-    ...unavailableNativeProfile(),
-    facts: {
-      ...unavailableNativeProfile().facts,
-      available: true,
-      reason: 'available',
-      model: fixtureModel,
-      clientVersion: process.version,
-    },
-    client: {
-      executable: process.execPath,
-      sha256: fixtureClientHash,
-      version: process.version,
-    },
-    environment: { ...process.env },
-    locationHash: '1'.repeat(64),
-  } satisfies NativeProfileResolution;
-  const { maximumFileBytes: _fileLimit, ...repositoryFields } = unavailableNativeProfile().facts;
-  const fixtureProfile = anthropic
-    ? {
-        ...reviewerProfile,
-        facts: AnthropicNativeProfileSchema.parse({
-          id: 'anthropic-file-v1',
-          family: 'anthropic',
-          displayName: 'Anthropic fixture',
-          clientVersion: process.version,
-          model: fixtureModel,
-          effort: 'medium',
-          effectiveEffort: 'unknown',
-          accountClass: 'unknown',
-          serviceTier: 'unknown',
-          billingBasis: 'requires-user-attestation',
-          qualifiedAt: null,
-          creditPolicies: ['ordinary'],
-          maximumTaskMs: 300000,
-          maximumFileBytes: 65536,
-          maximumSubmissions: 1,
-          available: true,
-          reason: 'qualification-pending',
-        }),
-        locationHash: '2'.repeat(64),
-      }
-    : google
-      ? {
-          ...reviewerProfile,
-          environment: { ...reviewerProfile.environment, HOME: userInfo().homedir },
-          client: {
-            executable: process.execPath,
-            sha256: fixtureClientHash,
-            version: '1.4.0',
-          },
-          facts: GoogleNativeProfileSchema.parse({
-            ...reviewerProfile.facts,
-            id: 'google-file-v1',
-            family: 'google',
-            displayName: 'Google fixture',
-            clientVersion: '1.4.0',
-            effort: 'low',
-            effectiveEffort: 'unknown',
-            accountClass: 'unknown',
-            serviceTier: 'unknown',
-            billingBasis: 'requires-user-attestation',
-            qualifiedAt: null,
-            creditPolicies: ['ordinary'],
-            reason: 'qualification-pending',
-            permissionModes: ['request-review', 'strict', 'always-proceed', 'proceed-in-sandbox'],
-          }),
-          locationHash: '3'.repeat(64),
-        }
-      : repository
-        ? {
-            ...reviewerProfile,
-            facts: NativeRepositoryProfileSchema.parse({
-              ...repositoryFields,
-              id: 'openai-repository-v1',
-              model: fixtureModel,
-              clientVersion: process.version,
-              displayName: 'Repository fixture',
-              available: true,
-              reason: 'qualification-pending',
-              qualifiedAt: null,
-              maximumSourceFiles: 10000,
-              maximumSourceBytes: 67108864,
-              execution: {
-                sandbox: 'workspace-write',
-                approvalPolicy: 'never',
-                networkAccess: false,
-              },
-            }),
-            locationHash: '4'.repeat(64),
-          }
-        : reviewerProfile;
-  const nativeOptions: Partial<ControllerOptions> = {
-    ...(anthropic || google || repository
-      ? { nativeProfiles: () => [reviewerProfile, fixtureProfile] }
-      : { nativeProfile: () => fixtureProfile }),
-    ...options,
-    nativeSpawn: (executable, args, spawnOptions) => {
-      const pending = context.controller.store
-        .intents()
-        .flatMap((intent) => context.controller.store.nativeProcesses(intent.attempt_id))
-        .filter((row) => row.state === 'intent')
-        .at(-1);
-      const googleChild =
-        !!pending &&
-        context.controller.store.get<{ family: string }>(
-          'route',
-          context.controller.store
-            .intents()
-            .find((intent) => intent.attempt_id === pending.attempt_id)?.route_id ?? '',
-        )?.family === 'google';
-      const anthropicChild =
-        !googleChild && (pending?.phase === 'auth-status' || pending?.phase === 'native-task');
-      const phase =
-        pending?.phase === 'google-config'
-          ? 'config'
-          : pending?.phase === 'auth-status'
-            ? 'auth'
-            : args.at(-1) === 'list'
-              ? 'features'
-              : pending?.phase === 'metadata-preparation'
-                ? 'prepare'
-                : 'task';
-      let transcript = fixture;
-      if (mode.includes('checked')) {
-        const proposal = join(context.directory, 'checked-proposal');
-        mkdirSync(proposal, { recursive: true });
-        writeFileSync(join(proposal, 'net.mjs'), '');
-        writeChallengeSolution(proposal);
-        transcript = fixture.replace(
-          `const content = ${fixtureContent.toString()};`,
-          `const content = () => ${JSON.stringify(readFileSync(join(proposal, 'net.mjs'), 'utf8'))};`,
-        );
-      }
-      transcript = transcript.replace(
-        'const path = message.params.outputSchema.properties.path.const;',
-        'const path = message.params.outputSchema.properties.path?.const;',
-      );
-      const replacement =
-        'const edit = {version:1,attemptId:message.params.outputSchema.properties.attemptId.const,path,baseHash:message.params.outputSchema.properties.baseHash.const,content:content(path)};';
-      transcript = transcript.replace(
-        replacement,
-        `const edit = message.params.outputSchema.properties.bindingHash ? {version:1,bindingHash:message.params.outputSchema.properties.bindingHash.const,methodId:message.params.outputSchema.properties.methodId.const,cycle:1,outcome:${JSON.stringify(mode === 'checked-blocked' ? 'blocked' : 'passed')},findings:[],summary:'The bounded review completed.'} : ${replacement.slice('const edit = '.length)}`,
-      );
-      const repositoryWriter =
-        repository &&
-        pending &&
-        !context.controller.store.db
-          .prepare('SELECT attempt_id FROM review_jobs WHERE attempt_id=?')
-          .get(pending.attempt_id);
-      if (repositoryWriter)
-        transcript = repositoryFixture([
-          {
-            path: 'net.mjs',
-            content: mode.includes('checked')
-              ? readFileSync(join(context.directory, 'checked-proposal/net.mjs'), 'utf8')
-              : fixtureContent(targetPath),
-          },
-          {
-            path: 'cli.mjs',
-            content: `${repositoryCli}// The command keeps the same interface.\n`,
-          },
-          {
-            path: 'docs/日本語.md',
-            content: '# Calculation notes\nThe discount clamps at zero.\n',
-          },
-          { path: 'index.html', content: null },
-        ]);
-      if (anthropicChild) {
-        const content = mode.includes('checked')
-          ? readFileSync(join(context.directory, 'checked-proposal/net.mjs'), 'utf8')
-          : fixtureContent(targetPath);
-        transcript = anthropicFixture(args, {
-          content,
-          mode:
-            mode === 'anthropic-hold'
-              ? 'hold'
-              : mode === 'anthropic-overage'
-                ? 'overage'
-                : mode === 'anthropic-auth-api'
-                  ? 'auth-api'
-                  : 'success',
-        });
-      }
-      if (googleChild) {
-        transcript = googleFixture(args, {
-          content: mode.includes('checked')
-            ? readFileSync(join(context.directory, 'checked-proposal/net.mjs'), 'utf8')
-            : fixtureContent(targetPath),
-          permissionMode:
-            mode === 'google-strict'
-              ? 'strict'
-              : mode === 'google-always-proceed'
-                ? 'always-proceed'
-                : mode === 'google-proceed-in-sandbox'
-                  ? 'proceed-in-sandbox'
-                  : 'request-review',
-          mode:
-            mode === 'google-hold'
-              ? 'hold'
-              : mode === 'google-credits'
-                ? 'credits'
-                : mode === 'google-mode-mismatch'
-                  ? 'mode-mismatch'
-                  : mode === 'google-config-error'
-                    ? 'config-error'
-                    : 'success',
-        });
-        if (phase === 'task') {
-          assert(pending);
-          assert.equal(pending.state, 'intent');
-          assert(
-            context.controller.store.receipt(`native-submission:${pending.attempt_id}`),
-            'the argv prompt marker commits before spawn',
-          );
-          submissions++;
-          onInput?.({ method: 'prompt' }, phase);
-        }
-      }
-      const child = spawn(
-        executable,
-        [
-          '-e',
-          transcript,
-          mode.includes('checked') || anthropic || repository
-            ? mode === 'repository-hold'
-              ? 'hold'
-              : 'success'
-            : mode,
-          phase,
-        ],
-        spawnOptions,
-      );
-      children.push(child);
-      childrenClosed.push(new Promise((resolve) => child.once('close', () => resolve())));
-      const write = child.stdin?.write.bind(child.stdin);
-      if (!anthropicChild && !googleChild)
-        child.stdin.write = ((data: Uint8Array) => {
-          try {
-            const messages = Buffer.from(data)
-              .toString()
-              .trim()
-              .split('\n')
-              .map((line) => JSON.parse(line) as { method?: string });
-            const attempt = context.controller.store
-              .intents()
-              .find((intent) => intent.attempt_id === pending?.attempt_id);
-            assert(attempt, 'the controller commits admission before native input');
-            assert.equal(
-              context.controller.store.nativeProcesses(attempt.attempt_id).at(-1)?.state,
-              'owned',
-            );
-            for (const message of messages) {
-              if (message.method === 'turn/start') {
-                submissions++;
-                const review = context.controller.store.db
-                  .prepare('SELECT body FROM review_jobs WHERE attempt_id=?')
-                  .get(attempt.attempt_id);
-                assert(
-                  context.controller.store.receipt(
-                    `${review ? 'native-review-submission' : 'native-submission'}:${attempt.attempt_id}`,
-                  ),
-                );
-              }
-              onInput?.(message, phase);
-            }
-            if (!write) throw Error('Missing fixture input.');
-            const result = write(data);
-            for (const message of messages) onWritten?.(message, phase);
-            if (messages.some((message) => message.method === 'turn/start')) ready.resolve();
-            return result;
-          } catch (error) {
-            fail(error);
-            throw error;
-          }
-        }) as typeof child.stdin.write;
-      if (anthropicChild && phase === 'task') {
-        const end = child.stdin.end.bind(child.stdin);
-        child.stdin.end = ((data: string) => {
-          if (data === undefined) return end();
-          try {
-            assert(pending);
-            assert.equal(
-              context.controller.store.nativeProcesses(pending.attempt_id).at(-1)?.state,
-              'owned',
-            );
-            assert(context.controller.store.receipt(`native-submission:${pending.attempt_id}`));
-            submissions++;
-            onInput?.({ method: 'prompt' }, phase);
-            const result = end(data);
-            onWritten?.({ method: 'prompt' }, phase);
-            ready.resolve();
-            return result;
-          } catch (error) {
-            fail(error);
-            throw error;
-          }
-        }) as typeof child.stdin.end;
-      }
-      if (googleChild && phase === 'task') {
-        onWritten?.({ method: 'prompt' }, phase);
-        ready.resolve();
-      }
-      try {
-        onSpawn?.(phase);
-      } catch (error) {
-        fail(error);
-        throw error;
-      }
-      return child;
-    },
-  };
-  const close = async (controller: Controller) => {
+async function nativeRows<T>(rows: readonly T[], run: (row: T) => Promise<void>) {
+  let next = 0;
+  let failed = false;
+  let failure: unknown;
+  const work = async () => {
     try {
-      await nativeWait(
-        'cleanup',
-        Promise.resolve().then(() => controller.close()),
-        10_000,
-      );
-      if (callbackError) throw callbackError;
+      while (!failed && next < rows.length) await run(rows[next++]);
     } catch (error) {
-      for (const child of children) {
-        if (child.pid && !groupAbsent(child.pid)) {
-          try {
-            process.kill(-child.pid, 'SIGKILL');
-          } catch {}
-        }
+      if (!failed) {
+        failed = true;
+        failure = error;
       }
-      await nativeWait('forced fixture cleanup', Promise.all(childrenClosed), 2000);
-      assert(children.every((child) => !child.pid || groupAbsent(child.pid)));
-      throw error;
     }
   };
-  const context = await nativeWait(
-    `${mode}/${targetPath}/setup`,
-    Promise.resolve().then(() => setup(t, nativeOptions, close)),
-  );
-  if (targetPath !== 'net.mjs') {
-    const files = [
-      { path: targetPath, content: Buffer.from('# Provider notes\nOriginal café notes.\n') },
-      { path: 'docs/nul.txt', content: Buffer.from('text\0tail') },
-      { path: 'docs/invalid.txt', content: Buffer.from([0xc3, 0x28]) },
-      { path: 'docs/large.txt', content: Buffer.alloc(65_537, 97) },
-    ];
-    for (const file of files) {
-      mkdirSync(dirname(join(context.source.directory, file.path)), { recursive: true });
-      writeFileSync(join(context.source.directory, file.path), file.content);
-    }
-    const paths = files.map((file) => file.path);
-    git(context.source.directory, ['add', '--', ...paths]);
-    git(
-      context.source.directory,
-      ['commit', '-s', '--only', '-m', 'test: seed bounded text targets', '--', ...paths],
-      undefined,
-      {
-        name: 'CrewKite fixture',
-        email: 'fixture@example.invalid',
-        at: '2026-10-15T17:00:00Z',
-      },
-    );
-  }
-  const task = TaskSchema.parse(
-    (await context.controller.execute(context.draft, 'local-owner')).entity,
-  );
-  const source = inspectSource(task.projectId, context.source.directory);
-  const sourceFiles = committedFiles(context.source.directory, source.base);
-  if (repository) {
-    const cli = sourceFiles.find((file) => file.path === 'cli.mjs');
-    assert(cli);
-    repositoryCli = cli.content.toString('utf8');
-  }
-  const policy: NativePilotAppointment['policy'] = {
-    ...context.fixtures.policy,
-    quality: 'quick',
-    methods: [{ id: 'keep-it-simple', cycles: 1, reviewerRole: 'reviewer' }],
-    reserves: [],
-    limits: { attempts: 4, minutes: 5, concurrency: 1 },
-    unknownUsage: { rule: 'fixed-allowance', allowance: { launches: 1, minutes: 5 } },
-    effects: context.fixtures.policy.effects.map((grant) => ({
-      ...grant,
-      taskId: task.id,
-      ...(grant.action === 'export-patch' ? { target: task.id } : {}),
-    })),
-  };
-  if (repository) {
-    const write = policy.effects.find((grant) => grant.action === 'write-scratch');
-    assert(write);
-    policy.effects.push({
-      ...write,
-      action: 'run-native-tools',
-      expiresAt: new Date(Date.parse(context.clock.now()) + 180000).toISOString(),
-    });
-  }
-  const appointment: NativePilotAppointment = {
-    id: 'controller-native-fixture',
-    taskId: task.id,
-    route: {
-      ...context.fixtures.snapshot.routes[0],
-      id: context.id('rte'),
-      family: 'openai',
-      model: fixtureModel,
-      effort: { requested: 'low', effective: 'low', supported: ['low'] },
-      billing: 'included',
-      qualified: false,
-      fake: false,
-    },
-    client: {
-      executable: process.execPath,
-      sha256: fixtureClientHash,
-      version: process.version,
-    },
-    creditPolicy: 'ordinary',
-    target: {
-      path: targetPath,
-      baseHash: sourceFiles.find((file) => file.path === targetPath)?.hash as string,
-    },
-    consent: {
-      nativeTrust: 'accepted',
-      source: 'explicit',
-      policyHash: hashCanonical(policy),
-      sourceBase: source.base,
-      criteriaHash: hashCanonical(task.criteria),
-    },
-    policy,
-    expiresAt: new Date(Date.parse(context.clock.now()) + 300_000).toISOString(),
-    maximumTaskMs: 300_000,
-    maximumSubmissions: 1,
-  };
-  return {
-    ...context,
-    task,
-    appointment,
-    fixtureProfile,
-    reviewerProfile,
-    restart: async () => {
-      await close(context.controller);
-      context.controller = await nativeWait(
-        `${mode}/${targetPath}/restart`,
-        Promise.resolve().then(
-          () =>
-            new Controller({
-              ...nativeOptions,
-              home: context.controller.home,
-              now: context.clock.now,
-              id: context.id,
-            }),
-        ),
-      );
-      t.after(() => close(context.controller));
-      return context.controller;
-    },
-    children,
-    observe,
-    wait: <T>(stage: string, pending: Promise<T>) =>
-      nativeWait(`${mode}/${targetPath}/${stage}`, Promise.race([pending, failure.promise])),
-    ready: ready.promise,
-    submissions: () => submissions,
-    onSpawn: (listener: typeof onSpawn) => {
-      onSpawn = listener;
-    },
-    onInput: (listener: typeof onInput) => {
-      onInput = listener;
-    },
-    onWritten: (listener: typeof onWritten) => {
-      onWritten = listener;
-    },
-  };
+  await Promise.allSettled([work(), work()]);
+  if (failed) throw failure;
 }
 
 function nativeCandidate(controller: Controller) {
@@ -3327,6 +3477,350 @@ function nativeCandidate(controller: Controller) {
     }
   });
   return candidate.promise;
+}
+
+async function localControllerFixture(
+  t: TestContext,
+  initialMode = 'completed',
+  authMode: 'token' | 'none' = 'token',
+  formatting?: string,
+) {
+  let mode = initialMode;
+  let context: Awaited<ReturnType<typeof setup>>;
+  let reopened: Controller | undefined;
+  let submissions = 0;
+  const submitted = Promise.withResolvers<void>();
+  const children: Promise<void>[] = [];
+  const runtime = { connectorId: 'local-sdk-v1', version: 'fixture-runtime', build: 1 };
+  const identity = {
+    modelKey: 'fixture-model',
+    displayName: 'Local fixture',
+    format: 'gguf',
+    sizeBytes: 1234,
+    quantization: null,
+    selectedVariant: null,
+    metadataHash: hashCanonical({ model: 'fixture-model', path: 'owned-fixture' }),
+  };
+  const choice = {
+    selectionId: hashCanonical({ runtime, metadataHash: identity.metadataHash }),
+    identity,
+    instanceReference: 'fixture-instance',
+    contextLength: 8192,
+    state: 'loaded-eligible',
+    reasons: [],
+    qualification: 'unqualified',
+  };
+  const observed = {
+    version: 1,
+    runtime,
+    models: [choice],
+    residentLlms: 1,
+    embeddingInstances: 0,
+  };
+  const observation = { ...observed, observationHash: hashCanonical(observed) };
+  const secret = 'private-controller-local-canary';
+  const inputPeer = `
+const fs=require('node:fs'); const mode=process.argv[1]; let pending=Buffer.alloc(0);
+process.stdin.on('data',part=>{pending=Buffer.concat([pending,part]);if(pending.length<4||pending.length<4+pending.readUInt32BE(0))return;
+const prompt=JSON.parse(pending.subarray(4,4+pending.readUInt32BE(0)));pending=Buffer.alloc(0);
+const body=Buffer.from(JSON.stringify({binding:prompt.binding,outcome:'submitted',secret:${JSON.stringify(secret)}}));const header=Buffer.alloc(4);header.writeUInt32BE(body.length);
+const finish=()=>{fs.writeSync(3,Buffer.concat([header,body]));process.stdin.destroy();};if(mode==='input-hold')process.stdin.once('end',finish);else finish();});`;
+  const clientPeer = `
+const {createInterface}=require('node:readline');const mode=process.argv[1];const observation=${JSON.stringify(observation)};
+let plan;const emit=value=>process.stdout.write(JSON.stringify(value)+'\\n');
+const finish=value=>{emit(value);process.stdin.destroy();};
+createInterface({input:process.stdin}).on('line',line=>{const value=JSON.parse(line);
+if(!plan){plan=value;if(plan.kind==='discovery'){finish({type:'discovery',terminal:mode==='discovery-failed'?{kind:'unavailable',binding:plan.binding,reason:'transport'}:{kind:'observed',binding:plan.binding,observation}});return;}emit({type:'ready',binding:plan.binding});return;}
+const content=process.argv[2];const proof={stopReason:value==='stop'?'userStopped':'eosFound',promptTokens:1,predictedTokens:1,renderedPromptTokens:1,outputBytes:Buffer.byteLength(content),contextLength:8192,maxTokens:plan.maximumOutputTokens??2048,contextOverflowPolicy:'stopAtLimit',draftModel:'',structured:{schemaHash:plan.fixtureSchemaHash,reasoningBytes:0,nonReasoningBytes:Buffer.byteLength(content)}};
+if(mode==='wrong-output-limit')proof.maxTokens=2048;
+if(value==='submit'&&mode==='output-limit'){proof.stopReason='maxPredictedTokensReached';proof.predictedTokens=plan.maximumOutputTokens;finish({type:'terminal',terminal:{kind:'failed',binding:plan.binding,reason:'limit',proof}});return;}
+if(value==='submit'&&mode==='hold')return;
+if(value==='submit'&&mode==='client-loss'){process.stdin.destroy();return;}
+if(value==='submit'&&mode==='unknown'){finish({type:'terminal',terminal:{kind:'unknown',binding:plan.binding,reason:'ownership'}});return;}
+if(value==='submit'&&mode==='configuration-unknown'){finish({type:'terminal',terminal:{kind:'unknown',binding:plan.binding,reason:'configuration',detail:{version:1,stage:'terminal',check:'draft-disabled',status:'missing'}}});return;}
+if(value==='submit'&&mode==='configuration-failed'){finish({type:'terminal',terminal:{kind:'failed',binding:plan.binding,reason:'configuration',proof,detail:{version:1,stage:'terminal',check:'draft-disabled',status:'missing'}}});return;}
+if(value==='stop'){finish({type:'terminal',terminal:{kind:'stopped',binding:plan.binding,proof}});return;}
+if(value==='submit')finish({type:'terminal',terminal:{kind:'completed',binding:plan.binding,proof,proposal:{version:1,attemptId:plan.binding.attemptId,path:plan.binding.path,baseHash:plan.binding.baseHash,content}}});});`;
+  const spawnClient = ((
+    executable: string,
+    _args: readonly string[],
+    settings: SpawnOptionsWithoutStdio,
+  ) => {
+    let content = 'export function netMinor() { return 0; }\n';
+    if (mode === 'checked') {
+      const solution = join(context.directory, 'local-solution');
+      mkdirSync(solution, { recursive: true });
+      writeFileSync(join(solution, 'net.mjs'), '');
+      writeChallengeSolution(solution);
+      content = readFileSync(join(solution, 'net.mjs'), 'utf8');
+    }
+    const child = spawn(executable, ['-e', clientPeer, mode, content], settings);
+    children.push(new Promise<void>((done) => child.once('close', () => done())));
+    const write = child.stdin.write.bind(child.stdin);
+    child.stdin.write = ((chunk: string | Uint8Array) => {
+      let input = chunk;
+      for (const line of Buffer.from(chunk).toString().trim().split('\n')) {
+        if (!line) continue;
+        const value = JSON.parse(line);
+        if (value === 'submit') {
+          submissions++;
+          submitted.resolve();
+          const intent = context.controller.store.intents().at(-1);
+          assert(intent);
+          assert(context.controller.store.receipt(`native-submission:${intent.attempt_id}`));
+        } else if (typeof value === 'object') {
+          if (authMode === 'none') {
+            assert.equal(value.authMode, 'none');
+            assert.equal('token' in value, false);
+          }
+          const local = context.controller.store.localControl() as {
+            operation?: { state: string };
+          };
+          if (value.kind === 'discovery') assert.equal(local.operation?.state, 'owned');
+          else {
+            assert.equal(
+              context.controller.store.nativeProcesses(value.binding.attemptId)[0]?.state,
+              'owned',
+            );
+            // The writer reads the committed check that imports its target, and nothing else.
+            assert.deepEqual(
+              value.tests.map((file: { path: string; content: string }) => [
+                file.path,
+                createHash('sha256').update(file.content).digest('hex'),
+              ]),
+              [[syntheticCheckDefinition.path, syntheticCheckDefinition.hash]],
+            );
+            input = `${JSON.stringify({
+              ...value,
+              fixtureSchemaHash: localStructuredOutput(value.binding).schemaHash,
+            })}\n`;
+          }
+        }
+      }
+      return write(input);
+    }) as typeof child.stdin.write;
+    return child;
+  }) as typeof spawnProcess;
+  const reviewer = {
+    ...unavailableNativeProfile(),
+    facts: {
+      ...unavailableNativeProfile().facts,
+      available: true,
+      reason: 'available',
+      model: fixtureModel,
+      clientVersion: process.version,
+    },
+    client: { executable: process.execPath, sha256: fixtureClientHash, version: process.version },
+    environment: { ...process.env },
+    locationHash: '1'.repeat(64),
+  } satisfies NativeProfileResolution;
+  const options: Partial<ControllerOptions> = {
+    ...(initialMode === 'checked'
+      ? ({
+          identity: { name: 'Fixture owner', email: 'owner@example.invalid' },
+          nativeProfile: () => reviewer,
+          nativeSpawn: (executable, args, settings) => {
+            const activeController = reopened ?? context.controller;
+            const phase =
+              args.at(-1) === 'list'
+                ? 'features'
+                : activeController.store
+                      .intents()
+                      .flatMap((intent) =>
+                        activeController.store.nativeProcesses(intent.attempt_id),
+                      )
+                      .filter((value) => value.state === 'intent')
+                      .at(-1)?.phase === 'metadata-preparation'
+                  ? 'prepare'
+                  : 'task';
+            const script = fixture
+              .replace(
+                'const path = message.params.outputSchema.properties.path.const;',
+                'const path = message.params.outputSchema.properties.path?.const;',
+              )
+              .replace(
+                'const edit = {version:1,attemptId:message.params.outputSchema.properties.attemptId.const,path,baseHash:message.params.outputSchema.properties.baseHash.const,content:content(path)};',
+                "const edit = {version:1,bindingHash:message.params.outputSchema.properties.bindingHash.const,methodId:message.params.outputSchema.properties.methodId.const,cycle:1,outcome:'passed',findings:[],summary:'The Local replacement meets its bounded criteria.'};",
+              );
+            const child = spawn(executable, ['-e', script, 'success', phase], settings);
+            children.push(new Promise<void>((done) => child.once('close', () => done())));
+            return child;
+          },
+        } satisfies Partial<ControllerOptions>)
+      : {}),
+    localInputHelper:
+      authMode === 'none'
+        ? undefined
+        : {
+            root: resolve('internal'),
+            sha256: 'a'.repeat(64),
+            sourceHash: 'b'.repeat(64),
+            target: 'darwin-arm64',
+          },
+    localInput: {
+      platform: 'darwin',
+      arch: 'arm64',
+      verifyHelper: () => process.execPath,
+      launch: (executable, settings) => {
+        assert.equal(authMode, 'token', 'No-authentication mode must not open secure input.');
+        assert.equal(
+          (context.controller.store.localControl() as { operation?: { state: string } }).operation
+            ?.state,
+          'intent',
+        );
+        const child = spawn(executable, ['-e', inputPeer, mode], settings);
+        children.push(new Promise<void>((done) => child.once('close', () => done())));
+        return {
+          group: child.pid ?? 0,
+          input: child.stdin,
+          output: child.stdio[3],
+          onSpawn: (handler) => {
+            child.once('spawn', handler);
+          },
+          onError: (handler) => {
+            child.once('error', handler);
+          },
+          onClose: (handler) => {
+            child.once('close', handler);
+          },
+        };
+      },
+    },
+    localDiscovery: { spawn: spawnClient },
+    localWriter: { spawn: spawnClient },
+    afterIntent: () => {
+      if (mode === 'intent-restart') throw Error('Local intent interrupted.');
+    },
+  };
+  context = await setup(t, options, async (controller) => {
+    await reopened?.close();
+    await controller.close();
+    await Promise.all(children);
+  });
+  const { controller, command, fixtures } = context;
+  if (formatting) commitFormatting(context.source.directory, formatting);
+  const setupState = () => controller.snapshot().localSetup;
+  const local = (name: string, payload: object = {}) =>
+    controller.execute(command(name, payload, setupState()?.revision ?? 0), 'local-owner');
+  const operationDone = async () => {
+    const operation = (controller as unknown as { localOperation?: { done: Promise<void> } })
+      .localOperation;
+    assert(operation);
+    await nativeWait('Local metadata operation', operation.done);
+  };
+  await local('ConfigureLocal', {
+    endpoint: 'ws://127.0.0.1:12345',
+    ...(authMode === 'none' ? { authMode } : {}),
+  });
+  const connectionRevision = setupState()?.connectionRevision;
+  const begin = command(
+    'BeginLocalConnectionInput',
+    { consent: 'explicit' },
+    setupState()?.revision,
+  );
+  assert.equal((await controller.execute(begin, 'local-owner')).outcome, 'applied');
+  assert.equal(setupState()?.operation?.kind, authMode === 'token' ? 'input' : undefined);
+  assert.equal((await controller.execute(begin, 'local-owner')).outcome, 'already-applied');
+  if (authMode === 'token') await operationDone();
+  assert.equal(setupState()?.secretConfigured, authMode === 'token');
+  assert.equal(setupState()?.connected, true);
+  await local('RefreshLocalModels', { consent: 'explicit' });
+  assert.equal(setupState()?.operation?.kind, 'discovery');
+  await operationDone();
+  assert.equal(setupState()?.connectionRevision, connectionRevision);
+  assert.equal(setupState()?.secretConfigured, authMode === 'token');
+  assert.equal(setupState()?.observation?.observationHash, observation.observationHash);
+  assert.equal(
+    (
+      await local('SelectLocalModel', {
+        selectionId: choice.selectionId,
+        observationHash: 'f'.repeat(64),
+      })
+    ).reason,
+    'local-selection-stale',
+  );
+  await local('SelectLocalModel', {
+    selectionId: choice.selectionId,
+    observationHash: observation.observationHash,
+  });
+  assert.equal(setupState()?.reason, 'qualification-pending');
+  assert.equal(setupState()?.connectionRevision, connectionRevision);
+  const task = TaskSchema.parse((await controller.execute(context.draft, 'local-owner')).entity);
+  const policy = {
+    ...fixtures.policy,
+    authority: 'guided',
+    quality: 'quick',
+    methods: [{ id: 'keep-it-simple', cycles: 1, reviewerRole: 'advisor' }],
+    limits: { attempts: 3, minutes: 5, concurrency: 1 },
+    reserves: [],
+    unknownUsage: { rule: 'fixed-allowance', allowance: { launches: 3, minutes: 5 } },
+    effects: fixtures.policy.effects.map((grant) => ({
+      ...grant,
+      taskId: task.id,
+      target: grant.action === 'export-patch' ? task.id : grant.target,
+    })),
+  };
+  const revision = () => controller.store.get<{ revision: number }>('task', task.id)?.revision;
+  const prepare = () =>
+    controller.execute(
+      command(
+        'PrepareNativeRun',
+        {
+          taskId: task.id,
+          profileId: 'local-file-v1',
+          targetPath: 'net.mjs',
+          policy,
+          consent: 'explicit',
+        },
+        revision(),
+      ),
+      'local-owner',
+    );
+  const prepared = await prepare();
+  assert.equal(prepared.outcome, 'applied', JSON.stringify(prepared));
+  const run = RunSchema.parse(prepared.entity);
+  const terminal = Promise.withResolvers<void>();
+  const off = controller.subscribe((event) => {
+    if (
+      event.type === 'task.updated' &&
+      event.taskId === task.id &&
+      ['stopped', 'interrupted', 'unknown'].includes(event.payload.state)
+    )
+      terminal.resolve();
+  });
+  t.after(off);
+  const start = command('StartRun', { taskId: task.id, runId: run.id }, revision());
+  const started = () => controller.execute(start, 'local-owner');
+  const reopen = async () => {
+    await controller.close();
+    reopened = new Controller({
+      ...options,
+      home: controller.home,
+      now: context.clock.now,
+      id: context.id,
+    });
+    return reopened;
+  };
+  return {
+    ...context,
+    options,
+    local,
+    operationDone,
+    setupState,
+    task,
+    run,
+    start,
+    started,
+    terminal: terminal.promise,
+    prepare,
+    mode: (value: string) => {
+      mode = value;
+    },
+    submissions: () => submissions,
+    submitted: submitted.promise,
+    reopen,
+    secret,
+  };
 }
 
 test('an appointed native proposal is retained and applied once after every phase stops', async (t) => {
@@ -3375,15 +3869,352 @@ test('an appointed native proposal is retained and applied once after every phas
     ),
     'local-owner',
   );
-  assert.equal(refusedLocal.outcome, 'unsupported');
+  assert.equal(refusedLocal.outcome, 'blocked');
+  assert.equal(refusedLocal.reason, 'local-model-unavailable');
   assert.deepEqual(local.controller.snapshot(), beforeLocal);
   assert.equal(local.controller.store.intents().length, 0);
-  for (const permissionMode of [
-    'request-review',
-    'strict',
-    'always-proceed',
-    'proceed-in-sandbox',
-  ] as const) {
+  const withoutToken = await localControllerFixture(t, 'checked', 'none');
+  assert.equal((await withoutToken.started()).outcome, 'applied');
+  await nativeWait('Local no-authentication completed writer', withoutToken.terminal);
+  assert.equal(withoutToken.submissions(), 1);
+  assert.equal(
+    withoutToken.controller.snapshot().tasks.find((value) => value.id === withoutToken.task.id)
+      ?.state,
+    'stopped',
+  );
+  const noneCandidate = withoutToken.controller
+    .snapshot()
+    .candidates.find((value) => value.taskId === withoutToken.task.id);
+  assert(noneCandidate);
+  const evaluateLocal = (
+    fixture: Awaited<ReturnType<typeof localControllerFixture>>,
+    candidate: Candidate,
+  ) =>
+    fixture.controller.execute(
+      fixture.command(
+        'PrepareCandidateEvaluation',
+        {
+          taskId: fixture.task.id,
+          candidateId: candidate.id,
+          checkRecipeId: 'node-tests-v1',
+          reviewer: { profileId: 'openai-file-v1', methodId: 'keep-it-simple', cycles: 1 },
+          consent: 'explicit',
+          grants: [
+            { action: 'run-check', target: 'node --test' },
+            { action: 'run-review', target: 'keep-it-simple/cycle-1' },
+          ].map((grant) => ({
+            ...grant,
+            taskId: fixture.task.id,
+            revoked: false,
+            usesRemaining: 1,
+            expiresAt: new Date(Date.parse(fixture.clock.now()) + 86400000).toISOString(),
+          })),
+        },
+        taskRevision(fixture.controller, fixture.task.id),
+      ),
+      'local-owner',
+    );
+  const noneEvaluation = await evaluateLocal(withoutToken, noneCandidate);
+  assert.equal(noneEvaluation.outcome, 'applied', JSON.stringify(noneEvaluation));
+  const formattedLocal = await localControllerFixture(t, 'checked', 'none', tabConfiguration);
+  assert.equal((await formattedLocal.started()).outcome, 'applied');
+  await nativeWait('Local formatted writer', formattedLocal.terminal);
+  await t.test(
+    'a formatted Local candidate still traces to its completed replacement',
+    async () => {
+      const formattedCandidate = formattedLocal.controller
+        .snapshot()
+        .candidates.find((value) => value.taskId === formattedLocal.task.id);
+      assert(formattedCandidate);
+      const formattedAttempt = formattedLocal.controller.store.intents().at(-1);
+      const formattedReceipt = formattedLocal.controller.store.receipt(
+        `formatting:${formattedAttempt?.attempt_id}`,
+      );
+      assert(formattedReceipt?.result.entity && 'hash' in formattedReceipt.result.entity);
+      assert.equal(
+        JSON.parse(
+          new ArtifactFiles(join(formattedLocal.controller.home, 'artifacts'))
+            .read(formattedReceipt.result.entity.hash)
+            .toString('utf8'),
+        ).status,
+        'formatted',
+        new ArtifactFiles(join(formattedLocal.controller.home, 'artifacts'))
+          .read(formattedReceipt.result.entity.hash)
+          .toString('utf8'),
+      );
+      const formattedEvaluation = await evaluateLocal(formattedLocal, formattedCandidate);
+      assert.equal(formattedEvaluation.outcome, 'applied', JSON.stringify(formattedEvaluation));
+    },
+  );
+  withoutToken.mode('discovery-failed');
+  await withoutToken.local('RefreshLocalModels', { consent: 'explicit' });
+  await withoutToken.operationDone();
+  assert.equal(withoutToken.setupState()?.connected, false);
+  assert.equal(withoutToken.setupState()?.reason, 'connection-unavailable');
+  assert.equal(withoutToken.setupState()?.secretConfigured, false);
+  await withoutToken.local('BeginLocalConnectionInput', { consent: 'explicit' });
+  assert.equal(withoutToken.setupState()?.connected, true);
+  assert.equal(withoutToken.setupState()?.operation, null);
+  const noneReopened = await withoutToken.reopen();
+  assert.equal(noneReopened.snapshot().localSetup?.connected, true);
+  assert.equal(noneReopened.snapshot().localSetup?.secretConfigured, false);
+  const noneRevision = noneReopened.snapshot().localSetup?.connectionRevision;
+  const noneHash = noneReopened.snapshot().localSetup?.connectionHash;
+  const changedMode = await noneReopened.execute(
+    withoutToken.command(
+      'ConfigureLocal',
+      { endpoint: 'ws://127.0.0.1:12345', authMode: 'token' },
+      noneReopened.snapshot().localSetup?.revision,
+    ),
+    'local-owner',
+  );
+  assert.equal(changedMode.outcome, 'applied');
+  assert.equal(noneReopened.snapshot().localSetup?.connected, false);
+  assert.equal(noneReopened.snapshot().localSetup?.authMode, 'token');
+  assert.equal(
+    noneReopened.snapshot().localSetup?.connectionRevision,
+    (noneRevision as number) + 1,
+  );
+  assert.notEqual(noneReopened.snapshot().localSetup?.connectionHash, noneHash);
+  assert.equal(noneReopened.snapshot().localSetup?.selection, null);
+  const connectedLocal = await localControllerFixture(t, 'checked');
+  const currentProfile = connectedLocal.controller
+    .snapshot()
+    .nativeProfiles.find((value) => value.id === 'local-file-v1');
+  assert(currentProfile && 'maximumOutputTokens' in currentProfile);
+  assert.equal(currentProfile.maximumOutputTokens, 4096);
+  assert.equal((await connectedLocal.started()).outcome, 'applied');
+  connectedLocal.clock.advance(60000);
+  await nativeWait('Local completed writer', connectedLocal.terminal);
+  assert.equal(connectedLocal.submissions(), 1);
+  assert.equal(
+    connectedLocal.controller.snapshot().tasks.find((task) => task.id === connectedLocal.task.id)
+      ?.state,
+    'stopped',
+  );
+  const localCandidate = connectedLocal.controller
+    .snapshot()
+    .candidates.find((candidate) => candidate.taskId === connectedLocal.task.id);
+  assert(localCandidate);
+  assert.equal(connectedLocal.controller.snapshot().evidence.length, 0);
+  const exportedLocal = await connectedLocal.controller.execute(
+    connectedLocal.command(
+      'ExportPatch',
+      {
+        taskId: connectedLocal.task.id,
+        candidateId: localCandidate.id,
+      },
+      connectedLocal.controller.store.get<{ revision: number }>('task', connectedLocal.task.id)
+        ?.revision,
+    ),
+    'local-owner',
+  );
+  assert.equal(exportedLocal.outcome, 'applied');
+  ArtifactSchema.parse(exportedLocal.entity);
+  assert.equal(
+    (await connectedLocal.controller.execute(connectedLocal.start, 'local-owner')).outcome,
+    'already-applied',
+  );
+  const originalLocalRun = structuredClone(
+    connectedLocal.controller.store.get('run', connectedLocal.run.id),
+  );
+  const beforeLocalPlanning = structuredClone(connectedLocal.controller.snapshot());
+  const plannedAfterLocal = await connectedLocal.controller.execute(
+    connectedLocal.command(
+      'ConfigureTaskConversation',
+      {
+        taskId: connectedLocal.task.id,
+        planning: {
+          role: 'lead',
+          profileId: 'openai-file-v1',
+          creditPolicy: 'ordinary',
+          limits: { attempts: 3, minutes: 5, concurrency: 1 },
+          consent: 'explicit',
+        },
+      },
+      connectedLocal.controller.store.get<{ revision: number }>('task', connectedLocal.task.id)
+        ?.revision,
+    ),
+    'local-owner',
+  );
+  assert.equal(plannedAfterLocal.outcome, 'blocked');
+  assert.equal(plannedAfterLocal.reason, 'task-not-discussing');
+  assert.deepEqual(connectedLocal.controller.snapshot(), beforeLocalPlanning);
+  const allowance = await connectedLocal.controller.execute(
+    connectedLocal.command('GetTaskConversationState', {
+      taskId: connectedLocal.task.id,
+    }),
+    'local-owner',
+  );
+  assert.equal(allowance.data?.kind, 'conversation-state');
+  if (allowance.data?.kind === 'conversation-state') {
+    assert.equal(allowance.data.state.purpose, 'execution');
+    assert.equal(allowance.data.state.budget, null);
+  }
+  assert.deepEqual(
+    connectedLocal.controller.store.get('run', connectedLocal.run.id),
+    originalLocalRun,
+  );
+  const retainedLocal = await connectedLocal.reopen();
+  assert.equal(retainedLocal.snapshot().localSetup?.secretConfigured, false);
+  assert.equal(retainedLocal.snapshot().localSetup?.generation, 'idle');
+  assert.equal(
+    retainedLocal.snapshot().candidates.find((candidate) => candidate.id === localCandidate.id)
+      ?.hash,
+    localCandidate.hash,
+  );
+  assert.equal(connectedLocal.submissions(), 1);
+  const localRevision = () => taskRevision(retainedLocal, connectedLocal.task.id);
+  const localSend = (name: string, payload: object) =>
+    retainedLocal.execute(connectedLocal.command(name, payload, localRevision()), 'local-owner');
+  const localPayload = {
+    taskId: connectedLocal.task.id,
+    candidateId: localCandidate.id,
+    checkRecipeId: 'node-tests-v1',
+    reviewer: { profileId: 'openai-file-v1', methodId: 'keep-it-simple', cycles: 1 },
+    consent: 'explicit',
+    grants: [
+      { action: 'run-check', target: 'node --test' },
+      { action: 'run-review', target: 'keep-it-simple/cycle-1' },
+    ].map((grant) => ({
+      ...grant,
+      taskId: connectedLocal.task.id,
+      revoked: false,
+      usesRemaining: 1,
+      expiresAt: new Date(Date.parse(connectedLocal.clock.now()) + 86400000).toISOString(),
+    })),
+  };
+  const localIntent = retainedLocal.store
+    .intents()
+    .find((intent) => intent.run_id === connectedLocal.run.id);
+  assert(localIntent);
+  const terminalReceipt = retainedLocal.store.receipt(`local-terminal:${localIntent.attempt_id}`);
+  assert(terminalReceipt);
+  const terminalArtifact = ArtifactSchema.parse(terminalReceipt.result.entity);
+  const files = new ArtifactFiles(join(retainedLocal.home, 'artifacts'));
+  const terminalBytes = files.read(terminalArtifact.hash);
+  const terminalProof = JSON.parse(terminalBytes.toString());
+  for (const change of [
+    { known: false },
+    { terminal: { ...terminalProof.terminal, kind: 'unknown', reason: 'ownership' } },
+    { bindingHash: '0'.repeat(64) },
+    {
+      terminal: {
+        ...terminalProof.terminal,
+        binding: { ...terminalProof.terminal.binding, generation: localIntent.generation + 1 },
+      },
+    },
+  ]) {
+    const altered = {
+      id: connectedLocal.id('art'),
+      ...files.publish(Buffer.from(canonicalJson({ ...terminalProof, ...change }))),
+      mediaType: 'application/vnd.crewkite.native+json',
+    };
+    retainedLocal.store.transaction(() => {
+      retainedLocal.store.put('artifact', altered.id, 0, altered);
+      retainedLocal.store.db
+        .prepare('UPDATE receipts SET result=? WHERE command_key=?')
+        .run(
+          canonicalJson({ outcome: 'applied', entity: altered }),
+          `local-terminal:${localIntent.attempt_id}`,
+        );
+    });
+    assert.equal((await localSend('PrepareCandidateEvaluation', localPayload)).outcome, 'blocked');
+  }
+  retainedLocal.store.transaction(() =>
+    retainedLocal.store.db
+      .prepare('UPDATE receipts SET result=? WHERE command_key=?')
+      .run(canonicalJson(terminalReceipt.result), `local-terminal:${localIntent.attempt_id}`),
+  );
+  writeFileSync(join(retainedLocal.home, 'artifacts', terminalArtifact.hash), '{}');
+  assert.equal((await localSend('PrepareCandidateEvaluation', localPayload)).outcome, 'blocked');
+  writeFileSync(join(retainedLocal.home, 'artifacts', terminalArtifact.hash), terminalBytes);
+  const localScratch = join(retainedLocal.home, 'scratch', connectedLocal.run.id, 'net.mjs');
+  const retainedLocalBytes = readFileSync(localScratch);
+  appendFileSync(localScratch, '\n');
+  assert.equal((await localSend('PrepareCandidateEvaluation', localPayload)).outcome, 'blocked');
+  writeFileSync(localScratch, retainedLocalBytes);
+  const originalTask = retainedLocal.store.get<Task>('task', connectedLocal.task.id);
+  assert(originalTask);
+  const otherRun = { ...connectedLocal.run, id: connectedLocal.id('run') };
+  retainedLocal.store.transaction(() => {
+    retainedLocal.store.put('run', otherRun.id, 0, otherRun);
+    retainedLocal.store.put('task', originalTask.id, originalTask.revision, {
+      ...originalTask,
+      runId: otherRun.id,
+    });
+  });
+  assert.equal((await localSend('PrepareCandidateEvaluation', localPayload)).outcome, 'blocked');
+  retainedLocal.store.transaction(() =>
+    retainedLocal.store.put('task', originalTask.id, originalTask.revision, originalTask),
+  );
+  const localEvaluation = await localSend('PrepareCandidateEvaluation', localPayload);
+  assert.equal(localEvaluation.outcome, 'applied', JSON.stringify(localEvaluation));
+  const localPreparation = ArtifactSchema.parse(localEvaluation.entity);
+  const localStart = {
+    taskId: connectedLocal.task.id,
+    candidateId: localCandidate.id,
+    preparationId: localPreparation.id,
+  };
+  for (const action of ['StartCandidateEvaluation', 'StartCandidateReview']) {
+    const finished = Promise.withResolvers<void>();
+    const off = retainedLocal.subscribe((event) => {
+      if (
+        event.type === 'task.updated' &&
+        ['stopped', 'ready', 'failed', 'unknown'].includes(event.payload.state)
+      )
+        finished.resolve();
+    });
+    const started = await localSend(action, localStart);
+    assert.equal(started.outcome, 'applied', JSON.stringify(started));
+    await nativeWait(`Local ${action} completion`, finished.promise);
+    off();
+  }
+  assert.equal(
+    retainedLocal.snapshot().tasks.find((task) => task.id === originalTask.id)?.state,
+    'ready',
+  );
+  assert.equal(retainedLocal.snapshot().candidateEvaluations[0]?.localAcceptance.available, true);
+  assert.equal(
+    retainedLocal.store.receipt(`native-completion:${localIntent.attempt_id}`),
+    undefined,
+  );
+  assert.equal(connectedLocal.submissions(), 1);
+  const destinationRef = 'refs/heads/feat/local-checked';
+  const askedLocal = await localSend('AcceptCandidate', {
+    taskId: originalTask.id,
+    candidateId: localCandidate.id,
+    destinationRef,
+  });
+  const localApproval = retainedLocal
+    .snapshot()
+    .approvals.find((value) => value.status === 'pending');
+  assert(localApproval);
+  assert.equal(localApproval.attemptId, localIntent.attempt_id);
+  assert.equal(
+    (await localSend('ResolveApproval', { binding: binding(localApproval), decision: 'approved' }))
+      .outcome,
+    'applied',
+    JSON.stringify(askedLocal),
+  );
+  assert.equal(
+    retainedLocal.snapshot().tasks.find((task) => task.id === originalTask.id)?.state,
+    'accepted',
+  );
+  const localAccepted = git(connectedLocal.source.directory, ['rev-parse', destinationRef])
+    .toString()
+    .trim();
+  assert.equal(
+    git(connectedLocal.source.directory, ['rev-parse', `${localAccepted}^`])
+      .toString()
+      .trim(),
+    connectedLocal.run.source.base,
+  );
+  assert.equal(
+    git(connectedLocal.source.directory, ['show', `${destinationRef}:net.mjs`]).toString(),
+    readFileSync(join(retainedLocal.home, 'scratch', connectedLocal.run.id, 'net.mjs'), 'utf8'),
+  );
+  const checkPermissionMode = async (permissionMode: string) => {
     const context = await nativeSetup(t, `google-${permissionMode}`);
     let controller = context.controller;
     const { task, command, appointment } = context;
@@ -3473,16 +4304,21 @@ test('an appointed native proposal is retained and applied once after every phas
     controller = await context.restart();
     assert.equal(context.submissions(), 1);
     assert.equal(controller.snapshot().attempts.length, 1);
-  }
+  };
+  await nativeRows(
+    ['request-review', 'strict', 'always-proceed', 'proceed-in-sandbox'],
+    checkPermissionMode,
+  );
 
-  for (const { consent, path, publicRun } of [
-    { consent: 'explicit', path: 'net.mjs', publicRun: false },
-    { consent: 'policy', path: 'net.mjs', publicRun: false },
-    { consent: 'explicit', path: 'docs/providers.md', publicRun: false },
-    { consent: 'policy', path: 'docs/案内.md', publicRun: false },
-    { consent: 'explicit', path: 'docs/providers.md', publicRun: true },
-    { consent: 'policy', path: 'docs/案内.md', publicRun: true },
-  ] as const) {
+  const retain = async ({
+    consent,
+    path,
+    publicRun,
+  }: {
+    consent: 'explicit' | 'policy';
+    path: string;
+    publicRun: boolean;
+  }) => {
     console.error(
       `Native fixture row: retained/${consent}/${path}/${publicRun ? 'public' : 'private'}`,
     );
@@ -3719,12 +4555,17 @@ test('an appointed native proposal is retained and applied once after every phas
         ),
       );
       controller.store.db.exec(
-        'INSERT INTO native_processes SELECT * FROM native_processes_saved; DROP TABLE native_processes_saved; DROP TABLE google_metadata_operations; DROP TABLE google_usage_reader; DROP TABLE native_profile_bindings; DROP TABLE google_acp_setup; PRAGMA user_version=4',
+        'INSERT INTO native_processes SELECT * FROM native_processes_saved; DROP TABLE native_processes_saved; DROP TABLE combined_ref_intents; DROP TABLE combined_dispatches; DROP TABLE combined_members; DROP TABLE combined_groups; DROP TABLE conversation_entries; DROP TABLE task_conversations; DROP TABLE run_purposes; DROP TABLE local_control; DROP TABLE google_metadata_operations; DROP TABLE google_usage_reader; DROP TABLE native_profile_bindings; DROP TABLE google_acp_setup; DROP INDEX events_task_cursor; PRAGMA user_version=4',
       );
       controller.store.applyMigrations(new URL('../../migrations/', import.meta.url).pathname);
       assert.deepEqual(controller.store.nativeProcesses(attempt.attempt_id), previous);
-      assert.equal(controller.store.db.prepare('PRAGMA user_version').get()?.user_version, 8);
-      assert.equal(controller.store.googleUsageReader().enabled, 0);
+      assert.equal(
+        controller.store.db.prepare('PRAGMA user_version').get()?.user_version,
+        readdirSync(new URL('../../migrations/', import.meta.url)).filter((name) =>
+          /^\d{3}-[a-z0-9-]+\.sql$/.test(name),
+        ).length,
+      );
+      assert.equal('enabled' in controller.store.googleUsageReader(), false);
       assert.deepEqual(controller.store.googleMetadataOperations(), []);
       assert.equal(controller.store.googleAcpSetup().state, 'uninitialized');
     }
@@ -4036,51 +4877,56 @@ test('an appointed native proposal is retained and applied once after every phas
         10_000,
       );
     }
-  }
-  for (const scenario of [
-    'checked',
-    'project-checked',
-    'repository-checked',
-    'anthropic-checked',
-    'google-checked',
-    'failed',
-    'stop-intent',
-    'expired-intent',
-    'revoked-intent',
-    'review-blocked',
-    'review-stop',
-    'review-close',
-    'review-journal-read',
-  ]) {
+  };
+  await nativeRows(
+    [
+      { consent: 'explicit', path: 'net.mjs', publicRun: false },
+      { consent: 'policy', path: 'net.mjs', publicRun: false },
+      { consent: 'explicit', path: 'docs/providers.md', publicRun: false },
+      { consent: 'policy', path: 'docs/案内.md', publicRun: false },
+      { consent: 'explicit', path: 'docs/providers.md', publicRun: true },
+      { consent: 'policy', path: 'docs/案内.md', publicRun: true },
+    ] as const,
+    retain,
+  );
+
+  const evaluate = async (scenario: string) => {
+    const repositoryScenario = scenario.startsWith('repository-');
+    const anthropicScenario =
+      scenario === 'anthropic-checked' || scenario === 'anthropic-review-metadata-owned';
+    const googleScenario = scenario === 'google-checked';
     const passedReview =
       scenario === 'checked' ||
       scenario === 'project-checked' ||
       scenario === 'repository-checked' ||
-      scenario === 'anthropic-checked' ||
-      scenario === 'google-checked';
+      scenario === 'repository-recovered' ||
+      anthropicScenario ||
+      googleScenario;
     console.error(`Native fixture row: evaluation/${scenario}`);
     const inventoryEntered = Promise.withResolvers<void>();
     const inventoryRelease = Promise.withResolvers<void>();
     let inventoryCalls = 0;
     let inventorySignal: AbortSignal | undefined;
-    const socketRoot =
-      scenario === 'repository-checked'
-        ? mkdtempSync(join(realpathSync(checkOwner()?.stateRoot ?? tmpdir()), 'ck-socket-'))
-        : undefined;
+    const socketRoot = repositoryScenario
+      ? mkdtempSync(join(realpathSync(checkOwner()?.stateRoot ?? tmpdir()), 'ck-socket-'))
+      : undefined;
     const context = await nativeSetup(
       t,
-      scenario === 'anthropic-checked' ||
-        scenario === 'google-checked' ||
-        scenario === 'repository-checked'
-        ? scenario
-        : scenario === 'failed'
-          ? 'success'
-          : scenario === 'review-blocked'
-            ? 'checked-blocked'
-            : 'checked',
+      anthropicScenario || googleScenario
+        ? anthropicScenario
+          ? 'anthropic-checked'
+          : 'google-checked'
+        : repositoryScenario
+          ? 'repository-checked'
+          : scenario === 'failed'
+            ? 'success'
+            : scenario === 'review-blocked'
+              ? 'checked-blocked'
+              : 'checked',
       scenario === 'repository-checked'
         ? {
             home: join(socketRoot as string, 'home'),
+            googleUsageClient: () => ({ available: false, reason: 'client-unavailable' }),
             prepareVerification: async (input) => {
               inventoryCalls++;
               inventorySignal = input.budget.signal;
@@ -4093,7 +4939,9 @@ test('an appointed native proposal is retained and applied once after every phas
               );
             },
           }
-        : {},
+        : scenario === 'repository-recovered'
+          ? { home: join(socketRoot as string, 'home') }
+          : {},
     );
     if (socketRoot)
       t.after(async () => {
@@ -4102,17 +4950,17 @@ test('an appointed native proposal is retained and applied once after every phas
         rmSync(socketRoot, { recursive: true, force: true });
       });
     let controller = context.controller;
-    if (scenario === 'repository-checked') {
-      context.appointment.policy.limits.minutes = 10;
+    if (repositoryScenario) {
+      context.appointment.policy.limits.minutes = 16;
       assert.equal(context.appointment.policy.unknownUsage.rule, 'fixed-allowance');
       if (context.appointment.policy.unknownUsage.rule === 'fixed-allowance')
-        context.appointment.policy.unknownUsage.allowance.minutes = 10;
+        context.appointment.policy.unknownUsage.allowance.minutes = 16;
     }
 
     const { command, task, appointment, clock } = context;
     const retained = nativeCandidate(controller);
     if (passedReview) {
-      if (scenario === 'repository-checked') {
+      if (repositoryScenario) {
         const payload = {
           taskId: task.id,
           profileId: context.fixtureProfile.facts.id,
@@ -4168,7 +5016,7 @@ test('an appointed native proposal is retained and applied once after every phas
           {
             taskId: task.id,
             profileId: context.fixtureProfile.facts.id,
-            ...(scenario === 'anthropic-checked' || scenario === 'google-checked'
+            ...(anthropicScenario || googleScenario
               ? {
                   billingAttestation: {
                     source: 'user-attested',
@@ -4177,8 +5025,8 @@ test('an appointed native proposal is retained and applied once after every phas
                   },
                 }
               : {}),
-            ...(scenario === 'google-checked' ? { permissionMode: 'request-review' } : {}),
-            ...(scenario === 'repository-checked' ? {} : { targetPath: 'net.mjs' }),
+            ...(googleScenario ? { permissionMode: 'request-review' } : {}),
+            ...(repositoryScenario ? {} : { targetPath: 'net.mjs' }),
             policy: appointment.policy,
             consent: 'explicit',
           },
@@ -4188,6 +5036,12 @@ test('an appointed native proposal is retained and applied once after every phas
       );
       assert.equal(prepared.outcome, 'applied');
       const nativeRun = RunSchema.parse(prepared.entity);
+      // A sixteen-minute repository run keeps eleven minutes for evaluation, so the floor applies.
+      assert.equal(
+        controller.snapshot().nativeRuns.find((value) => value.runId === nativeRun.id)
+          ?.maximumTaskMs,
+        300000,
+      );
       if (scenario === 'repository-checked') {
         const tools = appointment.policy.effects.find(
           (grant) => grant.action === 'run-native-tools',
@@ -4211,6 +5065,56 @@ test('an appointed native proposal is retained and applied once after every phas
     const run = controller.snapshot().runs.at(-1);
     const candidate = controller.snapshot().candidates.at(-1);
     assert(run && candidate);
+    const revision = () => taskRevision(controller, task.id);
+    if (scenario === 'repository-recovered') {
+      const intent = controller.store.intents()[0];
+      assert(intent);
+      const completionKey = `native-completion:${intent.attempt_id}`;
+      const oldCompletion = ArtifactSchema.parse(
+        controller.store.receipt(completionKey)?.result.entity,
+      );
+      const artifactFiles = new ArtifactFiles(join(controller.home, 'artifacts'));
+      const completionBody = JSON.parse(artifactFiles.read(oldCompletion.hash).toString('utf8'));
+      const published = artifactFiles.publish(
+        Buffer.from(canonicalJson({ ...completionBody, reason: 'protocol' })),
+      );
+      const completion = ArtifactSchema.parse({ ...oldCompletion, ...published });
+      controller.store.transaction(() => {
+        controller.store.put('artifact', completion.id, 1, completion);
+        controller.store.db
+          .prepare('UPDATE receipts SET request_hash=?,result=? WHERE command_key=?')
+          .run(
+            completion.hash,
+            canonicalJson({ outcome: 'applied', entity: completion }),
+            completionKey,
+          );
+        controller.store.db
+          .prepare('DELETE FROM receipts WHERE command_key IN (?,?)')
+          .run(`native-capture:${intent.attempt_id}`, `native-proposal:${intent.attempt_id}`);
+        const current = controller.store.get<Task>('task', task.id) as Task;
+        controller.store.put('task', current.id, current.revision + 1, {
+          ...current,
+          state: 'running',
+          revision: current.revision + 1,
+          next: 'Native work is running.',
+        });
+      });
+      controller = await context.restart();
+      assert.equal(
+        (
+          await controller.execute(
+            command('StopRun', { taskId: task.id, runId: run.id }, revision()),
+            'local-owner',
+          )
+        ).outcome,
+        'applied',
+      );
+      assert.equal(controller.store.receipt(`native-prepared:${run.id}`), undefined);
+      assert.equal(
+        controller.store.receipt(`native-recovery:${intent.attempt_id}`)?.result.outcome,
+        'applied',
+      );
+    }
     const originalRun = structuredClone(run);
     const payload = {
       taskId: task.id,
@@ -4242,7 +5146,6 @@ test('an appointed native proposal is retained and applied once after every phas
         },
       ],
     };
-    const revision = () => taskRevision(controller, task.id);
     if (scenario === 'repository-checked') {
       const policy = process.env.PROVENANCE_PATTERN;
       process.env.PROVENANCE_PATTERN = 'private fixture identity';
@@ -4349,12 +5252,12 @@ test('an appointed native proposal is retained and applied once after every phas
         assert.deepEqual(controller.snapshot(), before);
       }
     }
-    if (scenario === 'anthropic-checked' || scenario === 'google-checked') {
+    if (anthropicScenario || googleScenario) {
       assert.deepEqual(
         controller.store
           .nativeProcesses(controller.snapshot().attempts[0].id)
           .map((phase) => phase.phase),
-        [scenario === 'google-checked' ? 'google-config' : 'auth-status', 'native-task'],
+        [googleScenario ? 'google-config' : 'auth-status', 'native-task'],
       );
       assert.equal(
         (
@@ -4373,7 +5276,7 @@ test('an appointed native proposal is retained and applied once after every phas
         'blocked',
       );
     }
-    if (scenario === 'repository-checked') {
+    if (repositoryScenario) {
       const before = controller.snapshot();
       assert.equal(
         (
@@ -4413,7 +5316,7 @@ test('an appointed native proposal is retained and applied once after every phas
     assert.deepEqual(preview.reviewStart, { available: false, reason: 'checks-required' });
     assert.equal(preview.creditPolicy, 'ordinary');
     assert.equal(preview.reviewer.independence, 'process-only');
-    if (scenario === 'repository-checked') {
+    if (repositoryScenario) {
       assert(preview.repository);
       assert.equal(preview.target, undefined);
       assert.deepEqual(preview.repository, controller.snapshot().nativeRuns[0].repository);
@@ -4421,10 +5324,23 @@ test('an appointed native proposal is retained and applied once after every phas
         controller.store.receipt(`native-application:${controller.store.intents()[0].attempt_id}`),
         undefined,
       );
+      const writerAttemptId = controller.store.intents()[0].attempt_id;
       assert.equal(
-        controller.store.receipt(`native-capture:${controller.store.intents()[0].attempt_id}`)
-          ?.result.outcome,
+        controller.store.receipt(
+          `${scenario === 'repository-recovered' ? 'native-recovery' : 'native-capture'}:${writerAttemptId}`,
+        )?.result.outcome,
         'applied',
+      );
+      // The completion record counts the command output the writer saw and ignored.
+      const completion = ArtifactSchema.parse(
+        controller.store.receipt(`native-completion:${controller.store.intents()[0].attempt_id}`)
+          ?.result.entity,
+      );
+      assert.deepEqual(
+        JSON.parse(
+          new ArtifactFiles(join(controller.home, 'artifacts')).read(completion.hash).toString(),
+        ).ignoredNotifications,
+        { [createHash('sha256').update('item/commandExecution/outputDelta').digest('hex')]: 3 },
       );
     } else {
       assert(preview.target);
@@ -4490,11 +5406,22 @@ test('an appointed native proposal is retained and applied once after every phas
       controller = await context.restart();
     }
     let checkLaunches = 0;
+    let expiredAtClose = false;
     let replay: Promise<unknown> | undefined;
     const finished = Promise.withResolvers<void>();
     const off = context.observe(controller, (event) => {
       if (event.type === 'attempt.launched') {
         checkLaunches++;
+        if (scenario === 'check-drain-expired')
+          queueMicrotask(() => {
+            const jobs = Reflect.get(controller, 'jobs') as Map<string, OwnedCommand>;
+            const job = jobs.get(event.payload.id);
+            assert(job instanceof OwnedCommand);
+            job.child.once('close', () => {
+              clock.advance(60001);
+              expiredAtClose = true;
+            });
+          });
         replay = controller
           .execute(command('StartCandidateEvaluation', startPayload(), revision()), 'local-owner')
           .then((result) => assert.equal(result.outcome, 'already-applied'));
@@ -4540,14 +5467,14 @@ test('an appointed native proposal is retained and applied once after every phas
     const snapshot = controller.snapshot();
     assert.equal(snapshot.attempts.length, 2);
     assert.equal(context.submissions(), 1);
-    assert.equal(
-      context.children.length,
-      scenario === 'anthropic-checked' || scenario === 'google-checked' ? 2 : 3,
-    );
+    assert.equal(context.children.length, anthropicScenario || googleScenario ? 2 : 3);
     assert.equal(snapshot.reviewJobs?.length, 0);
     assert.equal(snapshot.evidence.length, scenario.endsWith('intent') ? 0 : 1);
     if (!scenario.endsWith('intent')) {
-      assert.equal(snapshot.evidence[0].passed, scenario !== 'failed');
+      assert.equal(
+        snapshot.evidence[0].passed,
+        scenario !== 'failed' && scenario !== 'check-drain-expired',
+      );
       assert.equal(snapshot.evidence[0].evaluator.startsWith('node:'), true);
       const intent = controller.store.intents().at(-1);
       assert(intent);
@@ -4555,6 +5482,23 @@ test('an appointed native proposal is retained and applied once after every phas
       assert.equal(route?.fake, false);
       assert.equal(route?.qualified, false);
       assert.equal(route?.family, 'local');
+      if (scenario === 'check-drain-expired') {
+        assert.equal(expiredAtClose, true);
+        assert.equal(intent.state, 'stopped');
+        assert.equal(snapshot.tasks[0].state, 'failed');
+        const metadata = controller.store.get<Artifact>(
+          'artifact',
+          snapshot.evidence[0].artifactId,
+        );
+        assert(metadata);
+        const proof = JSON.parse(
+          new ArtifactFiles(join(controller.home, 'artifacts'))
+            .read(metadata.hash)
+            .toString('utf8'),
+        );
+        assert.equal(proof.complete, true, 'expiry does not erase the complete Node report');
+        assert.equal(proof.unchanged, true);
+      }
     }
     assert.deepEqual(snapshot.runs.at(-1), originalRun);
     assert.notEqual(snapshot.tasks[0].state, 'ready');
@@ -4565,13 +5509,13 @@ test('an appointed native proposal is retained and applied once after every phas
       evaluationPreview.stage,
       scenario.endsWith('intent')
         ? 'blocked'
-        : scenario === 'failed'
+        : scenario === 'failed' || scenario === 'check-drain-expired'
           ? 'check-failed'
           : 'awaiting-review',
     );
     assert.equal(
       evaluationPreview.reviewStart.available,
-      !scenario.endsWith('intent') && scenario !== 'failed',
+      !scenario.endsWith('intent') && scenario !== 'failed' && scenario !== 'check-drain-expired',
     );
     const reviewPayload = startPayload();
     const shouldReview = passedReview || scenario.startsWith('review-');
@@ -4733,6 +5677,40 @@ test('an appointed native proposal is retained and applied once after every phas
         if (scenario === 'review-close') closing = Promise.resolve(controller.close());
       });
       const reviewStart = command('StartCandidateReview', reviewPayload, revision());
+      if (scenario === 'anthropic-review-metadata-owned') {
+        const privateApi = controller as unknown as {
+          saveOpenAiUsage: (value: {
+            id: string;
+            state: 'owned';
+            attemptedAt: string;
+            profileHash: string;
+            groups: number[];
+          }) => void;
+        };
+        controller.store.transaction(() =>
+          privateApi.saveOpenAiUsage({
+            id: context.id('cmd'),
+            state: 'owned',
+            attemptedAt: clock.now(),
+            profileHash: '0'.repeat(64),
+            groups: [123],
+          }),
+        );
+        const routeReceipt = 'native-review-profile-route:openai-file-v1:existing-credits';
+        assert.equal(controller.store.receipt(routeReceipt), undefined);
+        const before = controller.snapshot();
+        const intents = controller.store.intents().length;
+        const refused = await controller.execute(reviewStart, 'local-owner');
+        assert.equal(refused.outcome, 'blocked');
+        assert.equal(refused.reason, 'openai-metadata-ownership-pending');
+        assert(controller.store.receipt(reviewStart.key), 'the expected refusal is durable');
+        assert.deepEqual(controller.snapshot(), before);
+        assert.equal(controller.store.intents().length, intents);
+        assert.equal(controller.snapshot().reviewJobs?.length, 0);
+        assert.equal(controller.store.receipt(routeReceipt), undefined);
+        offReview();
+        return;
+      }
       assert.equal((await controller.execute(reviewStart, 'local-owner')).outcome, 'applied');
       await context.wait(`${scenario} review completion`, reviewed.promise);
       if (reviewReplay) await context.wait(`${scenario} review replay`, reviewReplay);
@@ -4795,15 +5773,13 @@ test('an appointed native proposal is retained and applied once after every phas
         );
       }
 
+      assert('writerAttemptId' in job);
       assert.equal(job.writerAttemptId, result.attempts[0].id);
       assert.equal(job.candidateId, candidate.id);
       assert.equal(job.preparationId, artifact.id);
       assert.equal(job.independence, 'process-only');
       assert.equal(context.submissions(), 2, scenario);
-      assert.equal(
-        context.children.length,
-        scenario === 'anthropic-checked' || scenario === 'google-checked' ? 5 : 6,
-      );
+      assert.equal(context.children.length, anthropicScenario || googleScenario ? 5 : 6);
       assert.equal(result.attempts.length, 3);
       assert.equal(result.candidates.length, 1);
       assert.deepEqual(result.runs.at(-1), originalRun);
@@ -4914,19 +5890,30 @@ test('an appointed native proposal is retained and applied once after every phas
     );
     assert.equal(controller.store.intents().length, intents);
     assert.equal(context.submissions(), shouldReview ? 2 : 1);
-  }
-  for (const boundary of [
-    'stop-prepared',
-    'client-changed',
-    'model-changed',
-    'credit-withdrawn',
-    'consent-revoked',
-    'expired',
-    'context-changed',
-    'unrelated-expired-grant',
-    'oversized-plan',
-    'credit-unavailable',
-  ]) {
+  };
+  await nativeRows(['checked', 'project-checked'], evaluate);
+  // This row changes process-wide policy. Both row pools stay outside its lifetime.
+  await evaluate('repository-checked');
+  await evaluate('repository-recovered');
+  await nativeRows(
+    [
+      'anthropic-checked',
+      'google-checked',
+      'failed',
+      'check-drain-expired',
+      'stop-intent',
+      'expired-intent',
+      'revoked-intent',
+      'review-blocked',
+      'anthropic-review-metadata-owned',
+      'review-stop',
+      'review-close',
+      'review-journal-read',
+    ],
+    evaluate,
+  );
+
+  const prepareBoundary = async (boundary: string) => {
     console.error(`Native fixture row: preparation/${boundary}`);
     const context = await nativeSetup(t);
     const { controller, appointment, task, command, clock } = context;
@@ -4967,12 +5954,12 @@ test('an appointed native proposal is retained and applied once after every phas
       assert.equal(prepared.outcome, 'blocked');
       assert.deepEqual(controller.snapshot(), before);
       assert.equal(controller.store.intents().length, 0);
-      continue;
+      return;
     }
     assert.equal(prepared.outcome, 'applied', JSON.stringify(prepared));
     assert.equal(context.children.length, 0);
     const run = RunSchema.parse(prepared.entity);
-    if (boundary === 'unrelated-expired-grant') continue;
+    if (boundary === 'unrelated-expired-grant') return;
     if (boundary === 'stop-prepared') {
       assert.equal(
         (
@@ -5055,7 +6042,23 @@ test('an appointed native proposal is retained and applied once after every phas
     );
     assert.equal(context.children.length, 0);
     assert.equal(controller.store.intents().length, 0);
-  }
+  };
+  await nativeRows(
+    [
+      'stop-prepared',
+      'client-changed',
+      'model-changed',
+      'credit-withdrawn',
+      'consent-revoked',
+      'expired',
+      'context-changed',
+      'unrelated-expired-grant',
+      'oversized-plan',
+      'credit-unavailable',
+    ],
+    prepareBoundary,
+  );
+
   {
     console.error('Native fixture row: parallel tasks');
     const context = await nativeSetup(t, 'hold');
@@ -5156,7 +6159,304 @@ test('an appointed native proposal is retained and applied once after every phas
 });
 
 test('stop or restart cannot submit or apply late native work', async (t) => {
-  for (const scenario of ['auth-api', 'overage', 'stop-auth', 'stop-task'] as const) {
+  for (const row of [
+    'stop',
+    'disconnect',
+    'admission-stop',
+    'input-cancel',
+    'input-disconnect',
+    'input-intent-restart',
+    'configuration-unknown',
+    'configuration-failed',
+    'output-limit',
+    'wrong-output-limit',
+    'unknown',
+    'client-loss',
+    'missing-terminal',
+    'missing-preparation',
+    'corrupt-terminal',
+    'intent-restart',
+  ]) {
+    const mode =
+      row === 'stop' || row === 'disconnect'
+        ? 'hold'
+        : row === 'missing-terminal' || row === 'missing-preparation' || row === 'corrupt-terminal'
+          ? 'unknown'
+          : row;
+    const context = await localControllerFixture(t, mode);
+    const { controller, command, task, run } = context;
+    if (row === 'input-intent-restart') {
+      const control = controller.store.localControl() as Record<string, unknown>;
+      const setup = context.setupState();
+      assert(setup?.connectionHash);
+      const operationId = context.id('cmd');
+      controller.store.transaction(() =>
+        controller.store.putLocalControl({
+          ...control,
+          revision: setup.revision + 1,
+          operation: {
+            kind: 'input',
+            state: 'intent',
+            group: null,
+            revoked: false,
+            clientQuiescent: false,
+            binding: {
+              version: 2,
+              operationId,
+              nonce: 'c'.repeat(64),
+              connectionHash: setup.connectionHash,
+              connectionRevision: setup.connectionRevision,
+            },
+          },
+        }),
+      );
+      const reopened = await context.reopen();
+      const retained = reopened.snapshot().localSetup;
+      assert.equal(retained?.operation?.state, 'unknown');
+      assert.equal(retained?.operation?.operationId, operationId);
+      assert.equal(retained?.secretConfigured, false);
+      assert.equal(
+        (
+          await reopened.execute(
+            command('BeginLocalConnectionInput', { consent: 'explicit' }, retained?.revision),
+            'local-owner',
+          )
+        ).reason,
+        'local-operation-unknown',
+      );
+      assert.equal(context.submissions(), 0);
+      assert.equal(reopened.store.intents().length, 0);
+      continue;
+    }
+    if (row === 'input-cancel' || row === 'input-disconnect') {
+      context.mode('input-hold');
+      const before = context.setupState();
+      await context.local('BeginLocalConnectionInput', { consent: 'explicit' });
+      const operation = context.setupState()?.operation;
+      assert(operation && operation.kind === 'input');
+      assert.equal((await context.started()).outcome, 'blocked');
+      assert.equal(controller.store.intents().length, 0);
+      if (row === 'input-cancel')
+        await context.local('CancelLocalConnectionInput', { operationId: operation.operationId });
+      else await context.local('DisconnectLocal');
+      await context.operationDone();
+      assert.equal(context.setupState()?.secretConfigured, false);
+      assert.equal(context.setupState()?.operation, null);
+      assert.equal(context.submissions(), 0);
+      assert.equal(
+        context.setupState()?.connectionRevision,
+        (before?.connectionRevision ?? 0) + (row === 'input-disconnect' ? 1 : 0),
+      );
+      continue;
+    }
+    let stoppedAtAdmission: Promise<CommandResult> | undefined;
+    if (row === 'admission-stop') {
+      const off = controller.subscribe((event) => {
+        if (event.type === 'run.admitted' && event.taskId === task.id) {
+          off();
+          stoppedAtAdmission = controller.execute(
+            command(
+              'StopRun',
+              { taskId: task.id, runId: run.id },
+              controller.store.get<{ revision: number }>('task', task.id)?.revision,
+            ),
+            'local-owner',
+          );
+        }
+      });
+      t.after(off);
+    }
+    if (row === 'intent-restart')
+      await assert.rejects(context.started(), /Local intent interrupted/);
+    else {
+      assert.equal((await context.started()).outcome, 'applied');
+      if (row === 'stop' || row === 'disconnect') {
+        await nativeWait('Local submission before Stop', context.submitted);
+        assert.equal(
+          (await context.local('RefreshLocalModels', { consent: 'explicit' })).reason,
+          'generation-active',
+        );
+        assert.equal(
+          (await context.local('ConfigureLocal', { endpoint: 'ws://127.0.0.1:23456' })).reason,
+          'generation-active',
+        );
+        if (row === 'stop')
+          await controller.execute(
+            command(
+              'StopRun',
+              { taskId: task.id, runId: run.id },
+              controller.store.get<{ revision: number }>('task', task.id)?.revision,
+            ),
+            'local-owner',
+          );
+        else await context.local('DisconnectLocal');
+      }
+      await nativeWait(`Local ${row} terminal`, context.terminal);
+      if (stoppedAtAdmission) assert.equal((await stoppedAtAdmission).outcome, 'applied');
+    }
+    const intent = controller.store.intents().find((value) => value.run_id === run.id);
+    assert(intent);
+    // These rows end with no terminal proof. Their client group is gone, so each one settles as
+    // unknown and holds nothing. Only a launch that never recorded a process keeps its lease.
+    const unproven = [
+      'configuration-unknown',
+      'wrong-output-limit',
+      'unknown',
+      'client-loss',
+      'missing-terminal',
+      'corrupt-terminal',
+      'missing-preparation',
+    ].includes(row);
+    const count = (store: Controller['store'], table: string) =>
+      store.db
+        .prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE attempt_id=?`)
+        .get(intent.attempt_id)?.count;
+    const settledAs = (store: Controller['store']) => {
+      assert.equal(store.get<Attempt>('attempt', intent.attempt_id)?.state, 'unknown');
+      assert.equal(
+        store.intents().find((value) => value.attempt_id === intent.attempt_id)?.state,
+        'stopped',
+      );
+      assert.equal(count(store, 'writer_leases'), 0);
+      assert.equal(count(store, 'reservations'), 0);
+      assert(store.receipt(`native-unknown-settled:${intent.attempt_id}`));
+      assert.equal(store.get<Task>('task', task.id)?.state, 'interrupted');
+    };
+    assert.equal(
+      controller.snapshot().localSetup?.generation,
+      row === 'intent-restart' ? 'active' : 'idle',
+    );
+    assert.equal(controller.snapshot().candidates.length, 0);
+    if (unproven) settledAs(controller.store);
+    if (row === 'configuration-unknown' || row === 'configuration-failed') {
+      const failedTask = controller.snapshot().tasks.find((value) => value.id === task.id);
+      assert.equal(failedTask?.state, row === 'configuration-unknown' ? 'interrupted' : 'stopped');
+      assert.equal(
+        failedTask?.next,
+        row === 'configuration-unknown'
+          ? 'Local settings could not be verified. Every recorded process group exited. The turn outcome stays unknown, retained work is unverified and nothing was captured. Create a new task to continue.'
+          : 'Local settings could not be verified. No replacement was applied.',
+      );
+      assert(!failedTask?.next?.includes(context.secret));
+    }
+    assert.equal(
+      context.submissions(),
+      row === 'admission-stop' || row === 'intent-restart' ? 0 : 1,
+    );
+    // The next three rows rebuild a crash before the settlement above ran, with the retained
+    // proof damaged. Recovery then has to decide from the process groups alone.
+    const phase = controller.store.nativeProcesses(intent.attempt_id).at(0);
+    const phaseGroup = (store: Controller['store'], pid: number | null, group: number | null) =>
+      store.db
+        .prepare(
+          'UPDATE native_processes SET pid=?,process_group=? WHERE attempt_id=? AND sequence=0',
+        )
+        .run(pid, group, intent.attempt_id);
+    let holder: ReturnType<typeof spawnProcess> | undefined;
+    let quiescentAt: string | null | undefined;
+    if (row === 'missing-preparation' || row === 'missing-terminal' || row === 'corrupt-terminal') {
+      quiescentAt = phase?.quiescent_at;
+      assert(quiescentAt);
+      if (row === 'missing-preparation')
+        controller.store.transaction(() =>
+          controller.store.db
+            .prepare('DELETE FROM receipts WHERE command_key=?')
+            .run(`local-prepared:${run.id}`),
+        );
+      if (row === 'missing-terminal')
+        controller.store.transaction(() =>
+          controller.store.db
+            .prepare('DELETE FROM receipts WHERE command_key=?')
+            .run(`local-terminal:${intent.attempt_id}`),
+        );
+      if (row === 'corrupt-terminal') {
+        const artifact = ArtifactSchema.parse(
+          controller.store.receipt(`local-terminal:${intent.attempt_id}`)?.result.entity,
+        );
+        writeFileSync(join(controller.home, 'artifacts', artifact.hash), '{}');
+      }
+      crashBeforeSettlement(controller, intent.attempt_id);
+      if (row === 'missing-terminal')
+        // No recorded closure, so recovery charges through the limit and the cleanup reserve.
+        controller.store.db
+          .prepare(
+            "UPDATE native_processes SET state='owned',quiescent_at=NULL WHERE attempt_id=? AND sequence=0",
+          )
+          .run(intent.attempt_id);
+      if (row === 'corrupt-terminal') {
+        holder = spawnProcess(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], {
+          detached: true,
+          stdio: 'ignore',
+        });
+        t.after(() => holder?.kill('SIGKILL'));
+        phaseGroup(controller.store, holder.pid as number, holder.pid as number);
+      }
+      context.clock.advance(3600000);
+    }
+    const before = context.submissions();
+    const reopened = await context.reopen();
+    assert.equal(reopened.snapshot().localSetup?.secretConfigured, false);
+    const holding = row === 'intent-restart' || row === 'corrupt-terminal';
+    assert.equal(reopened.snapshot().localSetup?.generation, holding ? 'unknown' : 'idle');
+    assert.equal(count(reopened.store, 'reservations'), holding ? 1 : 0);
+    assert.equal(count(reopened.store, 'writer_leases'), holding ? 1 : 0);
+    if (unproven && !holding) settledAs(reopened.store);
+    const finishedAt = () =>
+      reopened.store.intents().find((value) => value.attempt_id === intent.attempt_id)?.finished_at;
+    if (row === 'missing-preparation') assert.equal(finishedAt(), quiescentAt);
+    if (row === 'missing-terminal')
+      assert.equal(
+        finishedAt(),
+        new Date(
+          Date.parse(
+            reopened.store.intents().find((value) => value.attempt_id === intent.attempt_id)
+              ?.admitted_at as string,
+          ) +
+            300000 +
+            60000,
+        ).toISOString(),
+      );
+    if (holding) {
+      const setup = reopened.snapshot().localSetup;
+      assert.equal(
+        (
+          await reopened.execute(
+            command('BeginLocalConnectionInput', { consent: 'explicit' }, setup?.revision),
+            'local-owner',
+          )
+        ).reason,
+        'generation-unknown',
+      );
+      const stop = () =>
+        reopened.execute(
+          command(
+            'StopRun',
+            { taskId: task.id, runId: run.id },
+            reopened.store.get<{ revision: number }>('task', task.id)?.revision,
+          ),
+          'local-owner',
+        );
+      await stop();
+      assert.equal(reopened.snapshot().localSetup?.generation, 'unknown');
+      assert.equal(count(reopened.store, 'reservations'), 1);
+      assert.equal(reopened.store.get<Attempt>('attempt', intent.attempt_id)?.state, 'unknown');
+      if (holder) {
+        // Once the group is gone and the recorded closure is back, an explicit Stop settles
+        // the turn at that closure and not at the later Stop.
+        const exited = once(holder, 'exit');
+        holder.kill('SIGKILL');
+        await exited;
+        phaseGroup(reopened.store, phase?.pid ?? null, phase?.process_group ?? null);
+        assert.equal((await stop()).outcome, 'applied');
+        settledAs(reopened.store);
+        assert.notEqual(context.clock.now(), quiescentAt);
+        assert.equal(finishedAt(), quiescentAt);
+      }
+    }
+    assert.equal(context.submissions(), before);
+  }
+
+  for (const scenario of ['auth-api', 'overage', 'quota', 'stop-auth', 'stop-task'] as const) {
     const context = await nativeSetup(
       t,
       scenario === 'stop-task' ? 'anthropic-hold' : `anthropic-${scenario}`,
@@ -5239,7 +6539,10 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
     );
     await context.wait(`${scenario} retained`, retained);
     if (stopping) await context.wait(`${scenario} Stop`, stopping);
-    assert.equal(context.submissions(), scenario === 'overage' || scenario === 'stop-task' ? 1 : 0);
+    assert.equal(
+      context.submissions(),
+      scenario === 'overage' || scenario === 'quota' || scenario === 'stop-task' ? 1 : 0,
+    );
     const attempt = controller.snapshot().attempts[0];
     const phases = controller.store.nativeProcesses(attempt.id);
     assert.deepEqual(
@@ -5253,10 +6556,23 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
     );
     assert.equal(controller.store.receipt(`native-application:${attempt.id}`), undefined);
     assert.equal(controller.snapshot().tasks[0].state, 'interrupted');
+    if (scenario === 'overage')
+      assert.equal(
+        controller.snapshot().tasks[0].next,
+        'Native output was refused by protocol checks at rate-limit.isUsingOverage (unsupported). Inspect retained ownership and artifacts.',
+      );
+    if (scenario === 'quota')
+      assert.equal(
+        controller.snapshot().tasks[0].next,
+        'Provider usage limit reached. The provider reports that it resets at 2026-10-14T17:46:40.000Z. Retry after the reset or choose another available provider.',
+      );
     assert.deepEqual(inspectSource(task.projectId, context.source.directory), run.source);
     controller = await context.restart();
     assert.equal(controller.snapshot().attempts.length, 1);
-    assert.equal(context.submissions(), scenario === 'overage' || scenario === 'stop-task' ? 1 : 0);
+    assert.equal(
+      context.submissions(),
+      scenario === 'overage' || scenario === 'quota' || scenario === 'stop-task' ? 1 : 0,
+    );
   }
   for (const scenario of [
     'config-error',
@@ -5506,6 +6822,17 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
     }
     let startCommand: ReturnType<typeof command> | undefined;
     if (publicRun) {
+      // Twenty-one run minutes keep eleven for evaluation and give a repository writer ten.
+      const policy = repository
+        ? {
+            ...appointment.policy,
+            limits: { ...appointment.policy.limits, minutes: 21 },
+            unknownUsage: {
+              rule: 'fixed-allowance' as const,
+              allowance: { launches: 1, minutes: 21 },
+            },
+          }
+        : appointment.policy;
       const prepared = await controller.execute(
         command(
           'PrepareNativeRun',
@@ -5513,7 +6840,7 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
             taskId: task.id,
             profileId: context.fixtureProfile.facts.id,
             ...(repository ? {} : { targetPath: appointment.target.path }),
-            policy: appointment.policy,
+            policy,
             consent: 'explicit',
           },
           task.revision,
@@ -5521,6 +6848,13 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
         'local-owner',
       );
       assert.equal(prepared.outcome, 'applied');
+      assert.equal(
+        controller
+          .snapshot()
+          .nativeRuns.find((value) => value.runId === RunSchema.parse(prepared.entity).id)
+          ?.maximumTaskMs,
+        repository ? 600000 : 300000,
+      );
       startCommand = command(
         'StartRun',
         { taskId: task.id, runId: RunSchema.parse(prepared.entity).id },
@@ -5698,12 +7032,292 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
   }
 });
 
+test('confirmed provider resets resume under the saved authority mode', async (t) => {
+  for (const authority of ['guided', 'balanced', 'autopilot'] as const) {
+    const context = await nativeSetup(t, 'anthropic-quota');
+    let controller = context.controller;
+    const { command, task, appointment } = context;
+    const prepared = await controller.execute(
+      command(
+        'PrepareNativeRun',
+        {
+          taskId: task.id,
+          profileId: context.fixtureProfile.facts.id,
+          targetPath: 'net.mjs',
+          policy: { ...appointment.policy, authority },
+          consent: 'explicit',
+          billingAttestation: {
+            source: 'user-attested',
+            subscriptionLoginConfirmed: true,
+            paidExtraUsageDisabled: true,
+          },
+        },
+        task.revision,
+      ),
+      'local-owner',
+    );
+    assert.equal(prepared.outcome, 'applied');
+    const run = RunSchema.parse(prepared.entity);
+    const interrupted = (attempts: number) =>
+      new Promise<void>((resolve) => {
+        const off = controller.subscribe((event) => {
+          if (
+            event.type === 'task.updated' &&
+            event.taskId === task.id &&
+            event.payload.state === 'interrupted' &&
+            controller.snapshot().attempts.length === attempts
+          ) {
+            off();
+            resolve();
+          }
+        });
+        t.after(off);
+      });
+    const first = interrupted(1);
+    const automatic = authority === 'guided' ? undefined : interrupted(2);
+    assert.equal(
+      (
+        await controller.execute(
+          command(
+            'StartRun',
+            { taskId: task.id, runId: run.id },
+            taskRevision(controller, task.id),
+          ),
+          'local-owner',
+        )
+      ).outcome,
+      'applied',
+    );
+    await context.wait(`${authority} quota denial retained`, first);
+    const retry = controller
+      .snapshot()
+      .nativeRuns.find((value) => value.runId === run.id)?.quotaRetry;
+    assert.equal(retry?.available, true);
+    assert.equal(retry?.mode, authority === 'guided' ? 'manual' : 'automatic');
+    assert.equal(new Date(retry?.resetsAt as string).toISOString(), retry?.resetsAt);
+    assert(Date.parse(retry?.resetsAt as string) <= Date.parse(context.clock.now()));
+    if (automatic) await context.wait('automatic quota retry retained', automatic);
+    assert.equal(context.submissions(), authority === 'guided' ? 1 : 2);
+    controller = await context.restart();
+    assert.equal(controller.snapshot().attempts.length, authority === 'guided' ? 1 : 2);
+    if (authority === 'guided') {
+      const manual = interrupted(2);
+      const resume = command(
+        'ResumeRun',
+        { taskId: task.id, runId: run.id },
+        taskRevision(controller, task.id),
+      );
+      const resumed = await controller.execute(resume, 'local-owner');
+      assert.equal(resumed.outcome, 'applied', JSON.stringify(resumed));
+      await context.wait('manual quota retry retained', manual);
+      assert.equal((await controller.execute(resume, 'local-owner')).outcome, 'already-applied');
+      assert.equal(context.submissions(), 2);
+    }
+    controller = await context.restart();
+    assert.equal(context.submissions(), 2);
+    assert.equal(controller.snapshot().attempts.length, 2);
+  }
+});
+
+test('future provider resets rearm after restart and obey Stop', async (t) => {
+  const scheduled: { work: () => void; milliseconds: number; cancelled: boolean }[] = [];
+  const schedule: NonNullable<ControllerOptions['schedule']> = (work, milliseconds) => {
+    if (milliseconds === 10_800_000 || milliseconds === 3_600_000) {
+      const entry = { work, milliseconds, cancelled: false };
+      scheduled.push(entry);
+      return () => {
+        entry.cancelled = true;
+      };
+    }
+    const timer = setTimeout(work, milliseconds);
+    return () => clearTimeout(timer);
+  };
+  const context = await nativeSetup(t, 'anthropic-quota-future', { schedule });
+  let controller = context.controller;
+  const { command, task, appointment } = context;
+  const prepared = await controller.execute(
+    command(
+      'PrepareNativeRun',
+      {
+        taskId: task.id,
+        profileId: context.fixtureProfile.facts.id,
+        targetPath: 'net.mjs',
+        policy: { ...appointment.policy, authority: 'balanced' },
+        consent: 'explicit',
+        billingAttestation: {
+          source: 'user-attested',
+          subscriptionLoginConfirmed: true,
+          paidExtraUsageDisabled: true,
+        },
+      },
+      task.revision,
+    ),
+    'local-owner',
+  );
+  const run = RunSchema.parse(prepared.entity);
+  const denied = Promise.withResolvers<void>();
+  context.observe(controller, (event) => {
+    if (event.type === 'task.updated' && event.payload.state === 'interrupted') denied.resolve();
+  });
+  assert.equal(
+    (
+      await controller.execute(
+        command('StartRun', { taskId: task.id, runId: run.id }, taskRevision(controller, task.id)),
+        'local-owner',
+      )
+    ).outcome,
+    'applied',
+  );
+  await context.wait('future quota denial', denied.promise);
+  assert.deepEqual(
+    controller.snapshot().nativeRuns.find((value) => value.runId === run.id)?.quotaRetry,
+    {
+      available: false,
+      mode: 'automatic',
+      resetsAt: new Date(Date.parse(context.clock.now()) + 10_800_000).toISOString(),
+    },
+  );
+  assert.equal(context.submissions(), 1);
+  assert.equal(scheduled.at(-1)?.milliseconds, 10_800_000);
+  context.clock.advance(7_200_000);
+  controller = await context.restart();
+  assert.equal(scheduled.at(-2)?.cancelled, true);
+  assert.equal(scheduled.at(-1)?.milliseconds, 3_600_000);
+  assert.equal(
+    (
+      await controller.execute(
+        command('StopRun', { taskId: task.id, runId: run.id }, taskRevision(controller, task.id)),
+        'local-owner',
+      )
+    ).outcome,
+    'applied',
+  );
+  context.clock.advance(3_600_000);
+  scheduled.at(-1)?.work();
+  assert.equal(context.submissions(), 1);
+  assert.equal(controller.snapshot().attempts.length, 1);
+});
+
+test('an elapsed provider reset resumes through normal admission', async (t) => {
+  let retry: (() => void) | undefined;
+  const schedule: NonNullable<ControllerOptions['schedule']> = (work, milliseconds) => {
+    if (milliseconds === 10_800_000 || milliseconds === 0) {
+      retry = work;
+      return () => {
+        retry = undefined;
+      };
+    }
+    const timer = setTimeout(work, milliseconds);
+    return () => clearTimeout(timer);
+  };
+  const context = await nativeSetup(t, 'anthropic-quota-future', { schedule });
+  const { controller, command, task, appointment } = context;
+  const prepared = await controller.execute(
+    command(
+      'PrepareNativeRun',
+      {
+        taskId: task.id,
+        profileId: context.fixtureProfile.facts.id,
+        targetPath: 'net.mjs',
+        policy: { ...appointment.policy, authority: 'autopilot' },
+        consent: 'explicit',
+        billingAttestation: {
+          source: 'user-attested',
+          subscriptionLoginConfirmed: true,
+          paidExtraUsageDisabled: true,
+        },
+      },
+      task.revision,
+    ),
+    'local-owner',
+  );
+  const run = RunSchema.parse(prepared.entity);
+  const interrupted = (attempts: number) =>
+    new Promise<void>((resolve) => {
+      context.observe(controller, (event) => {
+        if (
+          event.type === 'task.updated' &&
+          event.payload.state === 'interrupted' &&
+          controller.snapshot().attempts.length === attempts
+        )
+          resolve();
+      });
+    });
+  const first = interrupted(1);
+  assert.equal(
+    (
+      await controller.execute(
+        command('StartRun', { taskId: task.id, runId: run.id }, taskRevision(controller, task.id)),
+        'local-owner',
+      )
+    ).outcome,
+    'applied',
+  );
+  await context.wait('future quota denial before elapsed retry', first);
+  assert(retry);
+  context.clock.advance(10_800_000);
+  const second = interrupted(2);
+  retry();
+  await context.wait('elapsed quota retry retained', second);
+  assert.equal(context.submissions(), 2);
+  assert.equal(controller.snapshot().attempts.at(-1)?.generation, 1);
+});
+
+test('generic provider failures cannot enter quota recovery', async (t) => {
+  const context = await nativeSetup(t, 'anthropic-overage');
+  const { controller, command, task, appointment } = context;
+  const prepared = await controller.execute(
+    command(
+      'PrepareNativeRun',
+      {
+        taskId: task.id,
+        profileId: context.fixtureProfile.facts.id,
+        targetPath: 'net.mjs',
+        policy: { ...appointment.policy, authority: 'balanced' },
+        consent: 'explicit',
+        billingAttestation: {
+          source: 'user-attested',
+          subscriptionLoginConfirmed: true,
+          paidExtraUsageDisabled: true,
+        },
+      },
+      task.revision,
+    ),
+    'local-owner',
+  );
+  const run = RunSchema.parse(prepared.entity);
+  const interrupted = Promise.withResolvers<void>();
+  context.observe(controller, (event) => {
+    if (event.type === 'task.updated' && event.payload.state === 'interrupted')
+      interrupted.resolve();
+  });
+  assert.equal(
+    (
+      await controller.execute(
+        command('StartRun', { taskId: task.id, runId: run.id }, taskRevision(controller, task.id)),
+        'local-owner',
+      )
+    ).outcome,
+    'applied',
+  );
+  await context.wait('generic provider failure', interrupted.promise);
+  assert.equal(
+    (
+      await controller.execute(
+        command('ResumeRun', { taskId: task.id, runId: run.id }, taskRevision(controller, task.id)),
+        'local-owner',
+      )
+    ).reason,
+    'native-pilot-retain-only',
+  );
+  assert.equal(context.submissions(), 1);
+});
+
 test('google quota authority survives retries and restart while sharing one operation gate', async (t) => {
   let controller: Controller;
-  let mode: 'success' | 'invalid' | 'revoke' = 'success';
+  let mode: 'success' | 'invalid' | 'incomplete' | 'empty' = 'success';
   let available = true;
   let launches = 0;
-  let revoke: Promise<CommandResult> | undefined;
   const report = {
     status: 'SUCCESS',
     num_turns: 0,
@@ -5726,7 +7340,11 @@ test('google quota authority survives retries and restart while sharing one oper
       },
     },
   };
+  const socketRoot = mkdtempSync(
+    join(realpathSync(checkOwner()?.stateRoot ?? tmpdir()), 'ck-quota-'),
+  );
   const options: Partial<ControllerOptions> = {
+    home: join(socketRoot, 'home'),
     googleUsageClient: () =>
       available
         ? {
@@ -5740,6 +7358,7 @@ test('google quota authority survives retries and restart while sharing one oper
       launches++;
       assert.equal(args[1], '/usage');
       assert.deepEqual(Object.keys(spawnOptions.env).sort(), [
+        'AGY_CLI_DISABLE_AUTO_UPDATE',
         'HOME',
         'LANG',
         'LOGNAME',
@@ -5749,6 +7368,7 @@ test('google quota authority survives retries and restart while sharing one oper
         'TMPDIR',
         'USER',
       ]);
+      assert.equal(spawnOptions.env?.AGY_CLI_DISABLE_AUTO_UPDATE, 'true');
       const operation = controller.store.googleMetadataOperations().at(-1);
       assert.equal(operation?.state, 'intent', 'metadata ownership commits before spawn');
       controller.store.transaction(() => {
@@ -5764,50 +7384,46 @@ test('google quota authority survives retries and restart while sharing one oper
           /google-operation-active/,
         );
       });
+      const output =
+        mode === 'invalid'
+          ? {}
+          : mode === 'success'
+            ? report
+            : {
+                ...report,
+                command: {
+                  ...report.command,
+                  data: { groups: [{ buckets: mode === 'empty' ? [] : [{ id: 'incomplete' }] }] },
+                },
+              };
       const child = spawn(
         process.execPath,
-        [
-          '-e',
-          `process.stdout.write(${JSON.stringify(JSON.stringify(mode === 'invalid' ? {} : report))})`,
-        ],
+        ['-e', `process.stdout.write(${JSON.stringify(JSON.stringify(output))})`],
         spawnOptions,
       );
-      if (mode === 'revoke')
-        child.once('close', () => {
-          revoke = controller.execute(
-            context.command('ObserveUsage', { family: 'google', consent: false }, 0),
-            'local-owner',
-          );
-        });
       return child;
     },
   };
   const context = await setup(t, options, () => controller.close());
   controller = context.controller;
-  const refresh = (consent?: boolean) =>
-    context.command(
-      'ObserveUsage',
-      { family: 'google', ...(consent === undefined ? {} : { consent }) },
-      0,
-    );
-  assert.equal(
-    (await controller.execute(refresh(), 'local-owner')).reason,
-    'usage-reader-not-enabled',
-  );
+  t.after(() => rmSync(socketRoot, { recursive: true, force: true }));
+  const refresh = () => context.command('ObserveUsage', { family: 'google' }, 0);
+  assert.equal(controller.snapshot().usageReaders[0]?.available, true);
+  assert.equal('enabled' in controller.snapshot().usageReaders[0], false);
   assert.equal(launches, 0);
-  const first = refresh(true);
+  const first = refresh();
   const pending = controller.execute(first, 'local-owner');
   const retry = controller.execute(first, 'local-owner');
   assert.equal(
     (
       await controller.execute(
-        { ...first, payload: { family: 'google', consent: false } },
+        { ...first, actor: { id: 'changed-client', kind: 'cli' } },
         'local-owner',
       )
     ).reason,
     'idempotency-key-reused',
   );
-  assert.equal((await pending).outcome, 'applied');
+  assert.equal((await pending).outcome, 'applied', canonicalJson(await pending));
   assert.equal((await retry).outcome, 'applied');
   assert.equal((await controller.execute(first, 'local-owner')).outcome, 'already-applied');
   assert.equal(launches, 1);
@@ -5828,6 +7444,99 @@ test('google quota authority survives retries and restart while sharing one oper
     3,
   );
   assert.equal(controller.snapshot().usageReaders[0]?.lastObservedAt, context.clock.now());
+  const quotaApi = controller as unknown as {
+    acpQuotaState: (
+      routeId: string,
+      modelId: string,
+      run: { policy: { policy: { reserves: Run['policy']['policy']['reserves'] } } },
+    ) => { windows: Observation[]; needsRefresh: boolean; reserveReason?: string };
+  };
+  const accountWindows = controller.store
+    .list<Observation>('window')
+    .filter((window) => window.routeId === displayRoute.id);
+  const setWindows = (windows: Observation[]) =>
+    controller.store.transaction(() => {
+      for (const window of controller.store
+        .list<Observation>('window')
+        .filter((value) => value.routeId === displayRoute.id))
+        controller.store.db
+          .prepare("DELETE FROM entities WHERE kind='window' AND id=?")
+          .run(`${window.routeId}/${window.windowId}`);
+      for (const window of windows)
+        controller.store.put('window', `${window.routeId}/${window.windowId}`, 0, window);
+    });
+  for (const scenario of [
+    'argon-zero',
+    'relevant-zero',
+    'unknown-zero',
+    'third-party-zero',
+    'stale',
+    'null',
+    'missing',
+    'reserve',
+  ]) {
+    let windows = accountWindows.map((window) => ({
+      ...window,
+      remaining: { unit: 'percent' as const, value: window.windowId.includes('argon') ? 0 : 96 },
+    }));
+    if (scenario === 'missing')
+      windows = windows.filter((window) => window.windowId !== 'gemini-5h');
+    if (scenario === 'unknown-zero' || scenario === 'third-party-zero')
+      windows.push({
+        ...windows[0],
+        windowId: scenario === 'unknown-zero' ? 'future-weekly' : '3p-weekly',
+        remaining: { unit: 'percent', value: 0 },
+      });
+    const observations: Observation[] = windows.map((window) =>
+      window.windowId !== 'gemini-weekly'
+        ? window
+        : {
+            ...window,
+            remaining:
+              scenario === 'null'
+                ? null
+                : { unit: 'percent', value: scenario === 'relevant-zero' ? 0 : 96 },
+            observedAt:
+              scenario === 'stale'
+                ? new Date(Date.parse(context.clock.now()) - 300001).toISOString()
+                : window.observedAt,
+          },
+    );
+    setWindows(observations);
+    const state = quotaApi.acpQuotaState(displayRoute.id, GoogleFlashQuotaModelId, {
+      policy: {
+        policy: {
+          reserves:
+            scenario === 'reserve'
+              ? [
+                  {
+                    routeId: displayRoute.id,
+                    windowId: 'gemini-weekly',
+                    unit: 'percent',
+                    value: 96,
+                  },
+                ]
+              : [],
+        },
+      },
+    });
+    assert.equal(state.needsRefresh, ['stale', 'null', 'missing'].includes(scenario), scenario);
+    assert.equal(
+      !!state.reserveReason,
+      ['relevant-zero', 'unknown-zero', 'third-party-zero', 'reserve'].includes(scenario),
+      scenario,
+    );
+    assert(!state.windows.some((window) => window.windowId.includes('argon')), scenario);
+    assert.equal(
+      controller.store
+        .list<Observation>('window')
+        .filter((window) => window.routeId === displayRoute.id).length,
+      observations.length,
+      'admission preserves the complete account display',
+    );
+  }
+  setWindows(accountWindows);
+
   assert(
     controller.store
       .eventsAfter('0')
@@ -5851,20 +7560,107 @@ test('google quota authority survives retries and restart while sharing one oper
         .length,
       3,
     );
-  const retained = controller.snapshot().usage;
-  mode = 'invalid';
+  const removed = report.command.data.groups[0].buckets.pop();
+  assert(removed);
+  const originalWindow = controller.store.get<Observation>(
+    'window',
+    `${displayRoute.id}/${removed.id}`,
+  );
+  assert(originalWindow);
+  const fixtureRoute = { ...displayRoute, id: context.id('rte'), fake: true };
+  const foreignRoute = { ...displayRoute, id: context.id('rte'), family: 'anthropic' as const };
+  const preserved = [
+    { ...originalWindow, routeId: fixtureRoute.id },
+    { ...originalWindow, routeId: foreignRoute.id },
+    { ...originalWindow, routeId: second.id, windowId: 'manual-only', source: 'manual' as const },
+  ];
+  controller.store.transaction(() => {
+    controller.store.put('route', fixtureRoute.id, 0, fixtureRoute);
+    controller.store.put('route', foreignRoute.id, 0, foreignRoute);
+    for (const observation of preserved)
+      controller.store.put(
+        'window',
+        `${observation.routeId}/${observation.windowId}`,
+        0,
+        observation,
+      );
+  });
+  context.clock.advance(300001);
+  assert.equal((await controller.execute(refresh(), 'local-owner')).outcome, 'applied');
+  for (const route of liveRoutes) {
+    const windows = controller
+      .snapshot()
+      .usage.filter(
+        ({ observation }) => observation.routeId === route.id && observation.source === 'client',
+      );
+    assert.equal(windows.length, 2);
+    assert(windows.every(({ state }) => state === 'fresh'));
+    assert(windows.every(({ observation }) => observation.windowId !== removed.id));
+  }
+  for (const observation of preserved)
+    assert.deepEqual(
+      controller.store.get<Observation>('window', `${observation.routeId}/${observation.windowId}`),
+      observation,
+    );
+  controller.store.transaction(() =>
+    controller.store.db
+      .prepare("DELETE FROM entities WHERE kind='window' AND id=?")
+      .run(`${second.id}/manual-only`),
+  );
+  report.command.data.groups[0].buckets.push(removed);
   context.clock.advance(60000);
-  assert.equal((await controller.execute(refresh(), 'local-owner')).reason, 'usage-read-failed');
-  assert.deepEqual(controller.snapshot().usage, retained);
+  const beforeAutomatic = launches;
+  const server = await serveController(controller);
+  try {
+    const startup = controller.refreshGoogleUsage('start');
+    assert(startup);
+    assert.equal((await startup).outcome, 'applied');
+    assert.equal(launches, beforeAutomatic + 1);
+    const connect = () =>
+      connectController({
+        ...readControllerEndpoint(controller.home),
+        actor: { id: 'quota-fixture', kind: 'cli' },
+        reconnectDelaysMs: [],
+      });
+    context.clock.advance(60000);
+    const fresh = await connect();
+    fresh.close();
+    assert.equal(launches, beforeAutomatic + 1, 'fresh connection does not read again');
+    context.clock.advance(300001);
+    const clients = await Promise.all([connect(), connect()]);
+    try {
+      const connected = controller.refreshGoogleUsage('connect');
+      assert(connected);
+      assert.equal((await connected).outcome, 'applied');
+      assert.equal(launches, beforeAutomatic + 2, 'stale connections share one read');
+    } finally {
+      for (const client of clients) client.close();
+    }
+    context.clock.advance(60000);
+    await controller.refreshUsage('interval');
+    assert.equal(launches, beforeAutomatic + 2, 'a timed read waits its interval');
+    context.clock.advance(210000);
+    await controller.refreshUsage('interval');
+    assert.equal(launches, beforeAutomatic + 3, 'one shared timed path refreshes Google');
+  } finally {
+    await server.close();
+  }
+  const retained = controller.snapshot().usage;
+  for (const failure of ['invalid', 'incomplete', 'empty'] as const) {
+    mode = failure;
+    context.clock.advance(60000);
+    assert.equal((await controller.execute(refresh(), 'local-owner')).reason, 'usage-read-failed');
+    assert.deepEqual(controller.snapshot().usage, retained);
+  }
   const attemptedAt = controller.snapshot().usageReaders[0]?.lastAttemptAt;
   await controller.close();
   controller = new Controller({
     ...options,
-    home: join(context.directory, 'home'),
+    home: options.home as string,
     now: context.clock.now,
     id: context.id,
   });
-  assert.equal(controller.snapshot().usageReaders[0]?.enabled, true);
+  assert.equal(controller.snapshot().usageReaders[0]?.available, true);
   assert.equal(controller.snapshot().usageReaders[0]?.lastAttemptAt, attemptedAt);
   assert.equal(
     (await controller.execute(refresh(), 'local-owner')).reason,
@@ -5878,14 +7674,6 @@ test('google quota authority survives retries and restart while sharing one oper
     'usage-reader-cooldown',
   );
   available = true;
-  mode = 'revoke';
-  context.clock.advance(60000);
-  const beforeRevoke = controller.snapshot().usage;
-  assert.equal((await controller.execute(refresh(), 'local-owner')).reason, 'usage-read-revoked');
-  assert.equal((await revoke)?.outcome, 'applied');
-  assert.equal(controller.snapshot().usageReaders[0]?.enabled, false);
-  assert.deepEqual(controller.snapshot().usage, beforeRevoke);
-  assert.equal(controller.store.googleMetadataOperations().at(-1)?.state, 'quiescent');
   mode = 'success';
   context.clock.advance(60000);
   const googleRoute = context.fixtures.snapshot.routes.find((route) => route.family === 'google');
@@ -5936,8 +7724,9 @@ test('google quota authority survives retries and restart while sharing one oper
   controller.store.transaction(() =>
     controller.store.beginGoogleMetadata(setupId, 'acp-discover', 7, context.clock.now()),
   );
+  assert.equal(controller.refreshGoogleUsage('start'), undefined);
   assert.equal(
-    (await controller.execute(refresh(true), 'local-owner')).reason,
+    (await controller.execute(refresh(), 'local-owner')).reason,
     'google-operation-active',
   );
   controller.store.transaction(() => {
@@ -5982,6 +7771,7 @@ test('google quota authority survives retries and restart while sharing one oper
       /google-operation-active/,
     );
   });
+  assert.equal(controller.refreshGoogleUsage('start'), undefined);
   assert.equal(
     (await controller.execute(refresh(), 'local-owner')).reason,
     'google-operation-active',
@@ -6007,7 +7797,7 @@ test('google quota authority survives retries and restart while sharing one oper
   await closing;
   controller = new Controller({
     ...options,
-    home: join(context.directory, 'home'),
+    home: options.home as string,
     now: context.clock.now,
     id: context.id,
   });
@@ -6048,7 +7838,7 @@ test('google quota authority survives retries and restart while sharing one oper
   try {
     controller = new Controller({
       ...options,
-      home: join(context.directory, 'home'),
+      home: options.home as string,
       now: context.clock.now,
       id: context.id,
     });
@@ -6078,7 +7868,6 @@ test('google quota authority survives retries and restart while sharing one oper
     now: context.clock.now,
     id: context.id,
   });
-  controller.store.transaction(() => controller.store.setGoogleUsageConsent(true));
   const interrupted = refresh();
   controller.store.transaction(() => {
     controller.store.beginGoogleMetadata(
@@ -6120,12 +7909,461 @@ test('google quota authority survives retries and restart while sharing one oper
     'google-ownership-unknown',
   );
   assert.equal(launches, beforeRecovery);
+  const nativeProfile = {
+    ...unavailableNativeProfile(),
+    facts: {
+      ...unavailableNativeProfile().facts,
+      available: true,
+      reason: 'available',
+      model: fixtureModel,
+      clientVersion: process.version,
+    },
+    client: { executable: process.execPath, version: process.version, sha256: fixtureClientHash },
+    environment: { ...process.env },
+    locationHash: '1'.repeat(64),
+  } satisfies NativeProfileResolution;
+  let openController: Controller;
+  let metadataLaunches = 0;
+  let metadataMode:
+    | 'success'
+    | 'invalid'
+    | 'late-protocol'
+    | 'late-publication'
+    | 'over-limit'
+    | 'api-key'
+    | 'hold' = 'success';
+  let latePublication = false;
+  let readStarted = Promise.withResolvers<void>();
+  const metadataOptions: Partial<ControllerOptions> = {
+    googleUsageClient: () => ({ available: false, reason: 'client-unavailable' }),
+    openAiUsageClient: () => {
+      if (metadataMode === 'late-publication' && latePublication) {
+        latePublication = false;
+        metadata.clock.advance(20000);
+      }
+      return nativeProfile;
+    },
+    openAiUsageSpawn: (executable, args, spawnOptions) => {
+      const phase = args.at(-1) === 'list' ? 'features' : 'prepare';
+      if (phase === 'prepare') metadataLaunches++;
+      const value =
+        metadataMode === 'invalid'
+          ? { rateLimits: { primary: { usedPercent: -1 } } }
+          : {
+              rateLimits: {},
+              rateLimitsByLimitId: {
+                ordinary: {
+                  primary: {
+                    usedPercent: ['late-protocol', 'late-publication', 'over-limit'].includes(
+                      metadataMode,
+                    )
+                      ? 101
+                      : 25,
+                    windowDurationMins: 300,
+                    resetsAt: 1792231983,
+                  },
+                },
+              },
+            };
+      const script = fixture.replace(
+        '  let result = replies[message.method];',
+        `
+        if (message.method === 'thread/start' || message.method === 'turn/start')
+          throw Error('Metadata refresh cannot submit a model turn.');
+        if (message.method === 'account/rateLimits/read' && ${JSON.stringify(metadataMode)} === 'hold') {
+          process.stderr.write('held'); return;
+        }
+        let result = message.method === 'account/rateLimits/read' ? ${JSON.stringify(value)} : replies[message.method];
+        if (message.method === 'account/read' && ${JSON.stringify(metadataMode)} === 'api-key')
+          result = {account:{type:'apiKey'},requiresOpenaiAuth:false};`,
+      );
+      const child = spawn(executable, ['-e', script, 'success', phase], spawnOptions);
+      child.stderr.once('data', () => readStarted.resolve());
+      if (phase === 'prepare' && metadataMode === 'late-protocol')
+        child.once('close', () => metadata.clock.advance(20000));
+      if (phase === 'prepare' && metadataMode === 'late-publication')
+        child.once('close', () => {
+          latePublication = true;
+        });
+      return child;
+    },
+  };
+  const metadata = await setup(t, metadataOptions, () => openController.close());
+  openController = metadata.controller;
+  const state = () => {
+    const artifact = ArtifactSchema.parse(
+      openController.store.receipt('usage-reader:openai')?.result.entity,
+    );
+    return JSON.parse(
+      new ArtifactFiles(join(metadata.directory, 'home', 'artifacts'))
+        .read(artifact.hash)
+        .toString('utf8'),
+    ) as {
+      id: string;
+      state: string;
+      attemptedAt: string;
+      profileHash: string;
+      groups: number[];
+    };
+  };
+  await openController.refreshUsage('start');
+  assert.equal(metadataLaunches, 1);
+  const reader = openController
+    .snapshot()
+    .routes.find((route) => route.displayName === 'OpenAI usage reader');
+  assert.ok(reader);
+  const readerId = reader.id;
+  const windows = () =>
+    openController.store.list<Observation>('window').filter((value) => value.routeId === readerId);
+  assert.equal(reader.qualified, false);
+  assert.equal(reader.model, 'unknown');
+  assert.equal(state().state, 'quiescent');
+  assert.equal(state().groups.length, 2);
+  assert.equal(windows().length, 1);
+  assert.equal(windows()[0].remaining?.value, 75);
+  const firstObservedAt = windows()[0].observedAt;
+  const historical = { ...windows()[0], routeId: metadata.fixtures.snapshot.routes[0].id };
+  openController.store.transaction(() =>
+    openController.store.put(
+      'window',
+      `${historical.routeId}/${historical.windowId}`,
+      0,
+      historical,
+    ),
+  );
+  metadata.clock.advance(60000);
+  await openController.refreshUsage('connect');
+  assert.equal(metadataLaunches, 1, 'fresh connect does not repeat the metadata read');
+  metadata.clock.advance(209999);
+  await openController.refreshUsage('interval');
+  assert.equal(metadataLaunches, 1);
+  metadata.clock.advance(1);
+  await openController.refreshUsage('interval');
+  assert.equal(metadataLaunches, 2);
+  assert.notEqual(
+    windows()[0].observedAt,
+    firstObservedAt,
+    'a completed account read revalidates an unchanged reading',
+  );
+  assert.deepEqual(
+    openController.store.get('window', `${historical.routeId}/${historical.windowId}`),
+    historical,
+    'the current account read cannot refresh an old task route',
+  );
+  let valid = windows();
+  metadata.clock.advance(270000);
+  metadataMode = 'invalid';
+  await openController.refreshUsage('interval');
+  assert.equal(metadataLaunches, 3);
+  assert.equal(state().state, 'quiescent');
+  assert.deepEqual(windows(), valid);
+  metadata.clock.advance(60000);
+  await openController.refreshUsage('interval');
+  assert.equal(metadataLaunches, 3, 'failed reads retain the timed cooldown');
+  metadata.clock.advance(210000);
+  metadataMode = 'late-protocol';
+  await openController.refreshUsage('interval');
+  assert.equal(metadataLaunches, 4);
+  assert.equal(state().state, 'quiescent');
+  assert.deepEqual(
+    windows(),
+    valid,
+    'protocol refusal cannot hide an expired publication deadline',
+  );
+  metadata.clock.advance(270000);
+  metadataMode = 'late-publication';
+  await openController.refreshUsage('interval');
+  assert.equal(metadataLaunches, 5);
+  assert.equal(state().state, 'quiescent');
+  assert.deepEqual(
+    windows(),
+    valid,
+    'the publication deadline is checked after current-profile validation',
+  );
+  metadata.clock.advance(270000);
+  metadataMode = 'over-limit';
+  await openController.refreshUsage('interval');
+  assert.equal(metadataLaunches, 6);
+  assert.equal(state().state, 'quiescent');
+  assert.equal(
+    windows()[0].remaining?.value,
+    0,
+    'a validated exhausted window survives a later strict admission refusal',
+  );
+  valid = windows();
+  metadata.clock.advance(270000);
+  metadataMode = 'api-key';
+  await openController.refreshUsage('interval');
+  assert.equal(metadataLaunches, 7);
+  assert.equal(state().state, 'quiescent');
+  assert.deepEqual(
+    windows(),
+    valid,
+    'a different billing path cannot publish included account readings',
+  );
+  const metadataTask = TaskSchema.parse(
+    (await openController.execute(metadata.draft, 'local-owner')).entity,
+  );
+  const taskRoute = metadata.fixtures.snapshot.routes.find((route) => route.family === 'openai');
+  assert.ok(taskRoute);
+  openController.store.transaction(() => {
+    for (const observation of openController.store
+      .list<Observation>('window')
+      .filter((value) => value.routeId === taskRoute.id))
+      openController.store.put('window', `${taskRoute.id}/${observation.windowId}`, 0, {
+        ...observation,
+        observedAt: metadata.clock.now(),
+        source: 'manual',
+      });
+  });
+  const preparedMetadataRun = await openController.execute(
+    metadata.command(
+      'PrepareRun',
+      {
+        taskId: metadataTask.id,
+        policy: {
+          ...metadata.fixtures.policy,
+          quality: 'quick',
+          methods: [],
+          effects: metadata.fixtures.policy.effects.map((grant) => ({
+            ...grant,
+            taskId: metadataTask.id,
+          })),
+        },
+        roles: [
+          { role: 'coder', routeId: taskRoute.id, pinned: true, approvedFallbacks: [] },
+          {
+            role: 'advisor',
+            routeId: metadata.fixtures.snapshot.routes[1].id,
+            pinned: false,
+            approvedFallbacks: [],
+          },
+        ],
+      },
+      metadataTask.revision,
+    ),
+    'local-owner',
+  );
+  assert.equal(preparedMetadataRun.outcome, 'applied', canonicalJson(preparedMetadataRun));
+  const metadataRun = RunSchema.parse(preparedMetadataRun.entity);
+  assert.equal(metadataRun.decision.chosen, taskRoute.id);
+  openController.store.transaction(() =>
+    openController.store.put('route', taskRoute.id, 0, { ...taskRoute, fake: false }),
+  );
+  const unresolved = {
+    id: metadata.id('att'),
+    runId: metadataRun.id,
+    routeId: taskRoute.id,
+    generation: 0,
+    state: 'unknown' as const,
+    revision: 0,
+  };
+  openController.store.transaction(() => {
+    openController.store.put('attempt', unresolved.id, 0, unresolved);
+    openController.store.db
+      .prepare(
+        "INSERT INTO launch_intents(attempt_id,task_id,run_id,route_id,generation,scratch_path,state,admitted_at) VALUES (?,?,?,?,0,?,'outcome-unknown',?)",
+      )
+      .run(
+        unresolved.id,
+        metadataTask.id,
+        metadataRun.id,
+        taskRoute.id,
+        metadata.directory,
+        metadata.clock.now(),
+      );
+  });
+  metadata.clock.advance(270000);
+  await openController.refreshUsage('interval');
+  assert.equal(metadataLaunches, 7, 'unknown native ownership blocks metadata reads');
+  openController.store.transaction(() => {
+    openController.store.db
+      .prepare('DELETE FROM launch_intents WHERE attempt_id=?')
+      .run(unresolved.id);
+    openController.store.db
+      .prepare("DELETE FROM entities WHERE kind='attempt' AND id=?")
+      .run(unresolved.id);
+  });
+  metadataMode = 'hold';
+  readStarted = Promise.withResolvers<void>();
+  const holding = openController.refreshUsage('interval');
+  await readStarted.promise;
+  assert.equal(state().state, 'owned');
+  const currentLaunches = metadataLaunches;
+  const joining = openController.refreshUsage('connect');
+  assert.equal(metadataLaunches, currentLaunches);
+  const privateApi = openController as unknown as {
+    openAiUsageBlocker: (id: string) => string | undefined;
+  };
+  assert.equal(privateApi.openAiUsageBlocker(reader.id), 'openai-metadata-ownership-pending');
+  for (const route of metadata.fixtures.snapshot.routes.filter(
+    (value) => value.family !== 'openai',
+  ))
+    assert.equal(
+      privateApi.openAiUsageBlocker(route.id),
+      undefined,
+      'other providers stay independent',
+    );
+  const jobApi = openController as unknown as {
+    admitJob: (run: typeof metadataRun, attempt: Attempt, directory: string) => unknown;
+  };
+  assert.throws(
+    () =>
+      openController.store.transaction(() =>
+        jobApi.admitJob(
+          metadataRun,
+          { ...unresolved, id: metadata.id('att'), state: 'intent' },
+          metadata.directory,
+        ),
+      ),
+    /openai-metadata-ownership-pending/,
+  );
+
+  const startDuringRead = await openController.execute(
+    metadata.command(
+      'StartRun',
+      {
+        taskId: metadataTask.id,
+        runId: metadataRun.id,
+      },
+      preparedMetadataRun.revision,
+    ),
+    'local-owner',
+  );
+  assert.equal(startDuringRead.reason, 'openai-metadata-ownership-pending');
+  assert.equal(openController.store.intents().length, 0);
+  const stoppedRead = await openController.execute(
+    metadata.command(
+      'StopRun',
+      {
+        taskId: metadataTask.id,
+        runId: metadataRun.id,
+      },
+      preparedMetadataRun.revision,
+    ),
+    'local-owner',
+  );
+  assert.equal(stoppedRead.outcome, 'applied');
+  await Promise.all([holding, joining]);
+  assert.equal(state().state, 'quiescent');
+  assert.deepEqual(windows(), valid, 'Stop cancels only the current metadata owner');
+  metadata.clock.advance(270000);
+  readStarted = Promise.withResolvers<void>();
+  const closingReadAgain = openController.refreshUsage('interval');
+  await readStarted.promise;
+  const finalLaunches = metadataLaunches;
+  const closingMetadata = openController.close();
+  await Promise.all([closingReadAgain, closingMetadata]);
+  openController = new Controller({
+    ...metadataOptions,
+    home: join(metadata.directory, 'home'),
+    now: metadata.clock.now,
+    id: metadata.id,
+  });
+  assert.equal(state().state, 'quiescent', 'close joins physical cleanup before closing the store');
+  assert.deepEqual(windows(), valid, 'a cancelled read cannot advance observed time');
+  const savedState = state();
+  const saved = openController as unknown as { saveOpenAiUsage: (value: unknown) => void };
+  const holder = spawnProcess(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  const holderExit = once(holder, 'exit');
+  t.after(() => holder.kill('SIGKILL'));
+  const group = holder.pid as number;
+  openController.store.transaction(() =>
+    saved.saveOpenAiUsage({ ...savedState, state: 'owned', groups: [group] }),
+  );
+  await openController.close();
+  const reopenReader = () =>
+    new Controller({
+      ...metadataOptions,
+      home: join(metadata.directory, 'home'),
+      now: metadata.clock.now,
+      id: metadata.id,
+    });
+  const readerBlocker = () =>
+    (
+      openController as unknown as { openAiUsageBlocker: (id: string) => string | undefined }
+    ).openAiUsageBlocker(reader.id);
+  openController = reopenReader();
+  assert.equal(state().state, 'unknown', 'a group that still exists keeps the read unknown');
+  assert.equal(readerBlocker(), 'openai-metadata-ownership-unknown');
+  metadata.clock.advance(300000);
+  await openController.refreshUsage('interval');
+  assert.equal(metadataLaunches, finalLaunches, 'unfinished recovery never replays a reader');
+  await openController.close();
+  holder.kill('SIGKILL');
+  await holderExit;
+  // Only ESRCH on every recorded group releases the read. The probe sends no signal.
+  const metadataKill = process.kill;
+  const probes: Parameters<typeof process.kill>[] = [];
+  process.kill = ((...args: Parameters<typeof process.kill>) => {
+    probes.push(args);
+    return metadataKill(...args);
+  }) as typeof process.kill;
+  try {
+    openController = reopenReader();
+  } finally {
+    process.kill = metadataKill;
+  }
+  assert.deepEqual(probes, [[-group, 0]]);
+  assert.equal(state().state, 'quiescent', 'an absent group releases the read');
+  assert.equal(state().id, savedState.id, 'the released read keeps its identity');
+  assert.deepEqual(state().groups, [group]);
+  assert.equal(readerBlocker(), undefined);
+  assert.equal(metadataLaunches, finalLaunches, 'releasing a read never replays it');
 });
 
 test('an acp scratch permission binds one live action and crash recovery cannot invent completion', async (t) => {
-  for (const row of ['approved', 'denied', 'stop', 'eof', 'preflight'] as const) {
+  for (const row of [
+    'approved',
+    'hunk-approved',
+    'hunk-after-mismatch',
+    'hunk-brain-write',
+    'no-change',
+    'unapproved-write',
+    'outside-completed',
+    'denied',
+    'stop',
+    'eof',
+    'eof-restart',
+    'preflight',
+    'refresh-missing',
+    'refresh-stale',
+    'refresh-unknown',
+    'refresh-reset',
+    'fresh-zero',
+    'refresh-zero',
+    'cooldown',
+    'invalid-read',
+    'unavailable',
+    'active-owner',
+    'unknown-owner',
+    'stop-read',
+    'close-read',
+    'deadline-read',
+    'source-read',
+    'proof-read',
+    'profile-read',
+    'unrelated-read',
+    'reserve',
+    'missing-reserve',
+  ] as const) {
+    const hunk = row.startsWith('hunk-');
+    const hunkAction = hunk || ['approved', 'denied', 'stop'].includes(row);
     const scenario =
-      row === 'eof' ? 'eof-cancel' : row === 'stop' ? 'cancel-permission' : 'permission';
+      row === 'approved' || row === 'denied' || row === 'stop' || row === 'hunk-approved'
+        ? 'hunk'
+        : row === 'hunk-after-mismatch' || row === 'hunk-brain-write' || row === 'outside-completed'
+          ? row
+          : row === 'no-change'
+            ? 'activity-locations'
+            : row === 'unapproved-write'
+              ? 'complete'
+              : row === 'eof' || row === 'eof-restart'
+                ? 'eof-cancel'
+                : 'permission';
     const fixtureHome = mkdtempSync(resolve('internal/acp-controller-'));
     t.after(() => rmSync(fixtureHome, { recursive: true, force: true }));
     const executable = join(fixtureHome, 'peer');
@@ -6133,17 +8371,21 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       .href;
     writeFileSync(
       executable,
-      `#!${process.execPath}\nimport {runAcpPeer} from ${JSON.stringify(peer)};runAcpPeer(${JSON.stringify(scenario)});\n`,
+      `#!${process.execPath}\nimport {runAcpPeer} from ${JSON.stringify(peer)};runAcpPeer(${JSON.stringify(scenario)},true);\n`,
       { mode: 0o500 },
     );
+    const harness = '#!/bin/sh\nexit 99\n';
+    writeFileSync(join(fixtureHome, 'localharness_external'), harness, { mode: 0o500 });
     const client = {
       executable,
+      harnessSha256: createHash('sha256').update(harness).digest('hex'),
       version: '1.4.0' as const,
       signerTeamId: 'TESTTEAM01',
       sha256: createHash('sha256').update(readFileSync(executable)).digest('hex'),
     };
     const mapping = {
       client: acpClientPin(client),
+      harnessSha256: client.harnessSha256,
       surface: 'config' as const,
       configId: 'mode-slot',
       valueId: 'fixture-review',
@@ -6153,19 +8395,102 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     let liveController: Controller | undefined;
     let interruptSetup = false;
     let setupStop: Promise<CommandResult> | undefined;
+    let quotaReads = 0;
+    let acpLaunches = 0;
+    let profileAvailable = true;
+    let quotaAction: (() => void) | undefined;
+    let quotaReset = '2026-10-24T17:00:00.000Z';
+    let quotaClientChanged = false;
+    let quotaHome = userInfo().homedir;
+    let quotaInvalid = false;
+    let quotaZero = false;
+    const planningProfile = {
+      ...unavailableNativeProfile(),
+      facts: {
+        ...unavailableNativeProfile().facts,
+        available: true,
+        reason: 'available',
+        model: fixtureModel,
+        clientVersion: process.version,
+      },
+      client: { executable: process.execPath, sha256: fixtureClientHash, version: process.version },
+      environment: { ...process.env },
+      locationHash: '1'.repeat(64),
+    } satisfies NativeProfileResolution;
     const options: Partial<ControllerOptions> = {
-      nativeProfiles: () => [],
+      nativeProfiles: () => (row === 'approved' ? [planningProfile] : []),
+      googleUsageClient: () =>
+        row === 'unavailable'
+          ? { available: false, reason: 'client-unavailable' }
+          : {
+              available: true,
+              reason: 'available',
+              client: {
+                executable: process.execPath,
+                version: '1.4.0',
+                sha256: quotaClientChanged ? '0'.repeat(64) : fixtureClientHash,
+              },
+              environment: { HOME: quotaHome },
+            },
+      googleUsageSpawn: (_executable, args, spawnOptions) => {
+        quotaReads++;
+        assert.equal(args[1], '/usage');
+        assert.equal(liveController?.store.intents().length, 0);
+        assert.equal(liveController?.store.googleMetadataOperations().at(-1)?.state, 'intent');
+        const report = {
+          status: 'SUCCESS',
+          num_turns: 0,
+          command: {
+            data: {
+              groups: [
+                {
+                  buckets: [
+                    {
+                      id: 'quota',
+                      remaining_fraction: 0.8,
+                      reset_time: quotaReset,
+                    },
+                    {
+                      id: 'satellite',
+                      remaining_fraction: row === 'refresh-zero' || quotaZero ? 0 : 0.7,
+                      reset_time: quotaReset,
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+        };
+        const child = spawn(
+          process.execPath,
+          [
+            '-e',
+            `process.stdout.write(${JSON.stringify(JSON.stringify(row === 'invalid-read' || quotaInvalid ? {} : report))})`,
+          ],
+          spawnOptions,
+        );
+        if (quotaAction) queueMicrotask(quotaAction);
+        return child;
+      },
       googleAcp: {
         reviewMappings: [mapping],
         toolMappings: [
-          {
-            client: acpClientPin(client),
-            toolName: 'fixture-replace',
-            schema: 'replace-target-v1',
-            evidenceHash: 'f'.repeat(64),
-          },
+          hunkAction
+            ? {
+                client: { ...acpClientPin(client), harnessSha256: client.harnessSha256 },
+                toolTitle: 'Run replace_file_content?',
+                schema: 'replace-hunk-v1',
+                evidenceHash: 'f'.repeat(64),
+              }
+            : {
+                client: acpClientPin(client),
+                toolName: 'fixture-replace',
+                schema: 'replace-target-v1',
+                evidenceHash: 'f'.repeat(64),
+              },
         ],
         spawn: (...args) => {
+          acpLaunches++;
           const child = spawn(...args);
           if (interruptSetup) {
             interruptSetup = false;
@@ -6189,7 +8514,8 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
         },
         resolve: (proof: AcpSetupProof | null) => {
           const config = proof?.configOptions ?? null;
-          const available = !!proof?.reviewMode && proof.auth.status === 'authenticated';
+          const available =
+            profileAvailable && !!proof?.reviewMode && proof.auth.status === 'authenticated';
           return {
             client,
             environment: { HOME: userInfo().homedir, PATH: process.env.PATH },
@@ -6208,7 +8534,7 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
               qualifiedAt: null,
               creditPolicies: ['ordinary'],
               permissionModes: ['request-review'],
-              maximumTaskMs: 300000,
+              maximumTaskMs: 600000,
               maximumFileBytes: 65536,
               maximumSubmissions: 1,
               available,
@@ -6276,21 +8602,53 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     assert.equal(controller.store.googleAcpSetup().state, 'ready');
     assert.equal(controller.store.googleMetadataOperations().length, row === 'stop' ? 4 : 3);
     assert(controller.store.googleMetadataOperations().every((row) => row.state === 'quiescent'));
+    const setupLaunches = acpLaunches;
+    let appointedRouteId: string | undefined;
+    if (row === 'reserve' || row === 'missing-reserve') {
+      appointedRouteId = id('rte');
+      await controller.close();
+      controller = new Controller({
+        ...options,
+        home: context.controller.home,
+        now: clock.now,
+        id: (prefix) => (prefix === 'rte' ? (appointedRouteId as string) : id(prefix)),
+      });
+      liveController = controller;
+    }
     const task = TaskSchema.parse((await controller.execute(context.draft, 'local-owner')).entity);
     const policy = {
       ...fixtures.policy,
       quality: 'quick',
+      ...(row === 'fresh-zero'
+        ? { unknownUsage: { rule: 'fixed-allowance', allowance: { launches: 10, minutes: 5 } } }
+        : {}),
       methods: [{ id: 'keep-it-simple', cycles: 1, reviewerRole: 'reviewer' }],
-      reserves: [],
+      reserves: appointedRouteId
+        ? [
+            {
+              routeId: appointedRouteId,
+              windowId: row === 'missing-reserve' ? 'missing' : 'quota',
+              value: 25,
+              unit: 'percent',
+            },
+          ]
+        : [],
       limits: { attempts: 4, minutes: 5, concurrency: 1 },
       effects: fixtures.policy.effects.map((grant) => ({ ...grant, taskId: task.id })),
     };
-    const prepared = await controller.execute(
+    const prepareAcpTask = (
+      target: ReturnType<typeof TaskSchema.parse>,
+      maximumTaskMs?: 300000 | 600000,
+      minutes = 5,
+      contextLines?: { start: number; end: number },
+    ) =>
       command(
         'PrepareNativeRun',
         {
-          taskId: task.id,
+          taskId: target.id,
           profileId: 'google-acp-v1',
+          ...(maximumTaskMs === undefined ? {} : { maximumTaskMs }),
+          ...(contextLines === undefined ? {} : { contextLines }),
           proofId: controller.store.googleAcpSetup().proofId,
           modelId: 'fixture-model',
           thoughtLevelId: 'fixture-low',
@@ -6303,33 +8661,522 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
             paidExtraUsageDisabled: true,
             quotaAccountConfirmed: true,
           },
-          policy,
+          policy: {
+            ...policy,
+            limits: { ...policy.limits, minutes },
+            effects: policy.effects.map((grant) => ({ ...grant, taskId: target.id })),
+          },
         },
-        task.revision,
-      ),
-      'local-owner',
-    );
+        target.revision,
+      );
+    if (row === 'approved') {
+      const frozen: { runId: string; maximumTaskMs: number }[] = [];
+      for (const maximumTaskMs of [undefined, 300000, 600000] as const) {
+        const deadlineTask = TaskSchema.parse(
+          (
+            await controller.execute(
+              command(
+                'CreateTask',
+                {
+                  projectId: task.projectId,
+                  title: `Saved deadline ${maximumTaskMs ?? 'default'}`,
+                  outcome: task.outcome,
+                  criteria: task.criteria,
+                },
+                0,
+              ),
+              'local-owner',
+            )
+          ).entity,
+        );
+        if (maximumTaskMs === 600000) {
+          const before = controller.snapshot();
+          assert.equal(
+            (await controller.execute(prepareAcpTask(deadlineTask, maximumTaskMs), 'local-owner'))
+              .outcome,
+            'blocked',
+          );
+          assert.deepEqual(controller.snapshot(), before);
+        }
+        const result = await controller.execute(
+          prepareAcpTask(deadlineTask, maximumTaskMs, 10),
+          'local-owner',
+        );
+        assert.equal(result.outcome, 'applied');
+        const run = RunSchema.parse(result.entity);
+        frozen.push({ runId: run.id, maximumTaskMs: maximumTaskMs ?? 300000 });
+        for (const saved of frozen)
+          assert.equal(
+            controller.snapshot().nativeRuns.find((value) => value.runId === saved.runId)
+              ?.maximumTaskMs,
+            saved.maximumTaskMs,
+          );
+      }
+      const contextTask = TaskSchema.parse(
+        (
+          await controller.execute(
+            command(
+              'CreateTask',
+              {
+                projectId: task.projectId,
+                title: 'Bind an initial target context window',
+                outcome: task.outcome,
+                criteria: task.criteria,
+              },
+              0,
+            ),
+            'local-owner',
+          )
+        ).entity,
+      );
+      const beforeContext = controller.snapshot();
+      assert.equal(
+        (
+          await controller.execute(
+            prepareAcpTask(contextTask, undefined, 5, { start: 1, end: 99999 }),
+            'local-owner',
+          )
+        ).outcome,
+        'blocked',
+      );
+      assert.deepEqual(controller.snapshot(), beforeContext);
+      const windowCommand = prepareAcpTask(contextTask, undefined, 5, { start: 1, end: 1 });
+      const noConsent = command(
+        'PrepareNativeRun',
+        {
+          ...(windowCommand.payload as Record<string, unknown>),
+          consent: 'saved',
+        },
+        contextTask.revision,
+      );
+      assert.equal((await controller.execute(noConsent, 'local-owner')).outcome, 'blocked');
+      assert.deepEqual(controller.snapshot(), beforeContext);
+      const contextResult = await controller.execute(windowCommand, 'local-owner');
+      assert.equal(contextResult.outcome, 'applied');
+      const contextRun = RunSchema.parse(contextResult.entity);
+      assert.deepEqual(
+        controller.snapshot().nativeRuns.find((value) => value.runId === contextRun.id)
+          ?.contextLines,
+        { start: 1, end: 1 },
+      );
+      const currentContextTask = controller
+        .snapshot()
+        .tasks.find((value) => value.id === contextTask.id) as typeof contextTask;
+      const beforeChangedContext = controller.snapshot();
+      const changedWindow = prepareAcpTask(currentContextTask, undefined, 5);
+      assert.equal(
+        (
+          await controller.execute(
+            {
+              ...changedWindow,
+              payload: { ...(changedWindow.payload as Record<string, unknown>), consent: 'saved' },
+            },
+            'local-owner',
+          )
+        ).outcome,
+        'blocked',
+      );
+      assert.deepEqual(controller.snapshot(), beforeChangedContext);
+      for (const saved of frozen)
+        assert.equal(
+          Object.hasOwn(
+            controller.snapshot().nativeRuns.find((value) => value.runId === saved.runId) ?? {},
+            'contextLines',
+          ),
+          false,
+        );
+      assert.equal(controller.store.intents().length, 0);
+      assert.equal(acpLaunches, setupLaunches);
+      const planningTask = TaskSchema.parse(
+        (
+          await controller.execute(
+            command(
+              'CreateTask',
+              {
+                projectId: task.projectId,
+                title: 'Confirm the plan before native preparation',
+                outcome: task.outcome,
+                criteria: task.criteria,
+              },
+              0,
+            ),
+            'local-owner',
+          )
+        ).entity,
+      );
+      const configured = await controller.execute(
+        command(
+          'ConfigureTaskConversation',
+          {
+            taskId: planningTask.id,
+            planning: {
+              role: 'lead',
+              profileId: 'openai-file-v1',
+              creditPolicy: 'ordinary',
+              limits: policy.limits,
+              consent: 'explicit',
+            },
+          },
+          planningTask.revision,
+        ),
+        'local-owner',
+      );
+      assert.equal(configured.outcome, 'applied');
+      const unconfirmed = await controller.execute(
+        prepareAcpTask(TaskSchema.parse(configured.entity)),
+        'local-owner',
+      );
+      assert.equal(unconfirmed.reason, 'task-contract-unconfirmed');
+      assert.equal(unconfirmed.next, 'Review and adopt a plan before preparing execution.');
+      assert.equal(controller.store.intents().length, 0);
+      assert.equal(acpLaunches, setupLaunches);
+      for (const change of [
+        'same',
+        'client',
+        'home',
+        'setup',
+        'reader',
+        'attempt',
+        'authority',
+        'active',
+        'unknown',
+        'stale',
+        'reset',
+        'zero',
+        'failed',
+        'restart',
+      ]) {
+        clock.advance(60001);
+        quotaZero = change === 'zero';
+        quotaReset = new Date(
+          Date.parse(clock.now()) + (change === 'reset' ? 0 : 3600000),
+        ).toISOString();
+        const read = controller.refreshGoogleUsage('start');
+        assert(read);
+        assert.equal((await read).outcome, 'applied', change);
+        const reader = controller.store.googleUsageReader();
+        const setup = controller.store.googleAcpSetup();
+        const originalReport = controller.store
+          .list<Observation>('window')
+          .filter((window) => window.observedAt === reader.last_observed_at);
+        const originalRoute = originalReport[0]?.routeId;
+        const buckets = originalReport.filter((window) => window.routeId === originalRoute);
+        assert.equal(buckets.length, 2);
+        const blocker = id('cmd');
+        if (change === 'client') quotaClientChanged = true;
+        if (change === 'home') quotaHome = join(userInfo().homedir, 'changed');
+        if (change === 'stale') clock.advance(300001);
+        if (change === 'failed') {
+          clock.advance(60001);
+          quotaInvalid = true;
+          assert.equal((await controller.refreshGoogleUsage('start'))?.reason, 'usage-read-failed');
+          quotaInvalid = false;
+        }
+        controller.store.transaction(() => {
+          if (change === 'setup')
+            controller.store.putGoogleAcpSetup({ ...setup, revision: setup.revision + 1 });
+          if (change === 'reader')
+            controller.store.recordGoogleUsageObservation(
+              new Date(Date.parse(clock.now()) + 1).toISOString(),
+            );
+          if (change === 'attempt')
+            controller.store.recordGoogleUsageAttempt(
+              new Date(Date.parse(clock.now()) - 1).toISOString(),
+            );
+          if (change === 'authority')
+            controller.store.db
+              .prepare('UPDATE google_usage_reader SET authority_revision=authority_revision+1')
+              .run();
+          if (change === 'active' || change === 'unknown') {
+            controller.store.beginGoogleMetadata(
+              blocker,
+              'usage',
+              reader.authority_revision,
+              clock.now(),
+            );
+            if (change === 'unknown') controller.store.unknownGoogleMetadata(blocker);
+          }
+        });
+        if (change === 'restart') {
+          await controller.close();
+          controller = new Controller({ ...options, home: controller.home, now: clock.now, id });
+          liveController = controller;
+        }
+        const target = TaskSchema.parse(
+          (
+            await controller.execute(
+              command(
+                'CreateTask',
+                {
+                  projectId: task.projectId,
+                  title: `Quota attachment ${change}`,
+                  outcome: task.outcome,
+                  criteria: task.criteria,
+                },
+                0,
+              ),
+              'local-owner',
+            )
+          ).entity,
+        );
+        const before = controller.store.googleUsageReader();
+        const reads = quotaReads;
+        const result = await controller.execute(prepareAcpTask(target), 'local-owner');
+        assert.equal(result.outcome, 'applied', canonicalJson(result));
+        const prepared = RunSchema.parse(result.entity);
+        const attached = controller.store
+          .list<Observation>('window')
+          .filter((window) => window.routeId === prepared.roles[0].routeId);
+        assert.deepEqual(
+          attached,
+          ['same', 'zero'].includes(change)
+            ? buckets.map((window) => ({ ...window, routeId: prepared.roles[0].routeId }))
+            : [],
+          change,
+        );
+        assert.deepEqual(controller.store.googleUsageReader(), before, change);
+        assert.equal(quotaReads, reads, change);
+        if (change === 'zero') {
+          assert.equal(
+            (
+              await controller.execute(
+                command(
+                  'StartRun',
+                  {
+                    taskId: target.id,
+                    runId: prepared.id,
+                  },
+                  taskRevision(controller, target.id),
+                ),
+                'local-owner',
+              )
+            ).reason,
+            'capacity-unavailable',
+          );
+          assert.equal(quotaReads, reads);
+          assert.equal(controller.store.intents().length, 0);
+        }
+        quotaClientChanged = false;
+        quotaHome = userInfo().homedir;
+        quotaZero = false;
+        controller.store.transaction(() => {
+          if (change === 'setup') controller.store.putGoogleAcpSetup(setup);
+          if (change === 'authority')
+            controller.store.db
+              .prepare('UPDATE google_usage_reader SET authority_revision=?')
+              .run(reader.authority_revision);
+          // Remove only the injected blocker after proving attachment refused it.
+          if (change === 'active' || change === 'unknown')
+            controller.store.db
+              .prepare('DELETE FROM google_metadata_operations WHERE command_id=?')
+              .run(blocker);
+        });
+      }
+      clock.advance(60001);
+      quotaReset = new Date(Date.parse(clock.now()) + 3600000).toISOString();
+      assert.equal((await controller.refreshGoogleUsage('start'))?.outcome, 'applied');
+    }
+    const preparationQuotaReads = quotaReads;
+    const prepared = await controller.execute(prepareAcpTask(task), 'local-owner');
     assert.equal(prepared.outcome, 'applied', canonicalJson(prepared));
     const run = RunSchema.parse(prepared.entity);
     const start = () =>
       command('StartRun', { taskId: task.id, runId: run.id }, taskRevision(controller, task.id));
-    assert.equal((await controller.execute(start(), 'local-owner')).outcome, 'blocked');
-    assert.equal(controller.store.intents().length, 0);
+    quotaReset = new Date(Date.parse(clock.now()) + 3600000).toISOString();
+    const autoRefresh = ![
+      'approved',
+      'denied',
+      'stop',
+      'eof',
+      'eof-restart',
+      'preflight',
+      'fresh-zero',
+      'reserve',
+    ].includes(row);
     controller.store.transaction(() => {
-      controller.store.setGoogleUsageConsent(true);
       controller.store.recordGoogleUsageObservation(clock.now());
       const observation = {
         routeId: run.roles[0].routeId,
         windowId: 'quota',
         kind: 'weekly',
-        remaining: { value: 80, unit: 'percent' },
-        resetsAt: new Date(Date.parse(clock.now()) + 3600000).toISOString(),
-        observedAt: clock.now(),
+        remaining:
+          row === 'refresh-unknown'
+            ? null
+            : { value: row === 'fresh-zero' ? 0 : row === 'reserve' ? 20 : 80, unit: 'percent' },
+        resetsAt: row === 'refresh-reset' ? clock.now() : quotaReset,
+        observedAt:
+          autoRefresh && row !== 'refresh-unknown' && row !== 'refresh-reset'
+            ? new Date(Date.parse(clock.now()) - 300001).toISOString()
+            : clock.now(),
         source: 'client',
         confidence: 'reported',
       };
-      controller.store.put('window', `${run.roles[0].routeId}/quota`, 0, observation);
+      if (row !== 'refresh-missing' && row !== 'refresh-zero')
+        controller.store.put('window', `${run.roles[0].routeId}/quota`, 0, observation);
+      if (row === 'fresh-zero')
+        controller.store.put('window', `${run.roles[0].routeId}/old`, 0, {
+          ...observation,
+          windowId: 'old',
+          remaining: null,
+        });
+      if (row === 'cooldown' || row === 'approved')
+        controller.store.recordGoogleUsageAttempt(clock.now());
+      if (row === 'active-owner' || row === 'unknown-owner') {
+        const key = id('cmd');
+        controller.store.beginGoogleMetadata(
+          key,
+          'usage',
+          controller.store.googleUsageReader().authority_revision,
+          clock.now(),
+        );
+        if (row === 'unknown-owner') controller.store.unknownGoogleMetadata(key);
+      }
     });
+    let closeDuringRead: Promise<void> | undefined;
+    let cancellation: Promise<unknown> | undefined;
+    if (
+      [
+        'stop-read',
+        'close-read',
+        'deadline-read',
+        'source-read',
+        'proof-read',
+        'profile-read',
+      ].includes(row)
+    )
+      quotaAction = () => {
+        if (row === 'stop-read')
+          cancellation = controller.execute(
+            command(
+              'StopRun',
+              { taskId: task.id, runId: run.id },
+              taskRevision(controller, task.id),
+            ),
+            'local-owner',
+          );
+        if (row === 'close-read') closeDuringRead = Promise.resolve(controller.close());
+        if (row === 'deadline-read') clock.advance(30001);
+        if (row === 'profile-read') profileAvailable = false;
+        if (row === 'source-read')
+          writeFileSync(join(source.directory, 'net.mjs'), 'source changed');
+        if (row === 'proof-read')
+          controller.store.transaction(() => {
+            const setup = controller.store.googleAcpSetup();
+            controller.store.putGoogleAcpSetup({ ...setup, revision: setup.revision + 1 });
+          });
+      };
+    if (row === 'unrelated-read') {
+      let pendingStart: Promise<CommandResult> | undefined;
+      let pendingStop: Promise<CommandResult> | undefined;
+      quotaAction = () => {
+        pendingStart = controller.execute(start(), 'local-owner');
+        pendingStop = controller.execute(
+          command('StopRun', { taskId: task.id, runId: run.id }, taskRevision(controller, task.id)),
+          'local-owner',
+        );
+      };
+      const manual = await controller.execute(
+        command('ObserveUsage', { family: 'google' }, 0),
+        'local-owner',
+      );
+      assert.equal(manual.outcome, 'applied');
+      assert.equal((await pendingStop)?.outcome, 'applied');
+      assert.notEqual((await pendingStart)?.outcome, 'applied');
+      assert.equal(controller.store.intents().length, 0);
+      assert.equal(controller.store.googleMetadataOperations().at(-1)?.state, 'quiescent');
+      assert.equal(quotaReads, 1);
+      assert.equal(acpLaunches, setupLaunches);
+      await controller.close();
+      continue;
+    }
+    const blockedRows = [
+      'fresh-zero',
+      'reserve',
+      'refresh-zero',
+      'missing-reserve',
+      'cooldown',
+      'invalid-read',
+      'unavailable',
+      'active-owner',
+      'unknown-owner',
+      'stop-read',
+      'close-read',
+      'deadline-read',
+      'source-read',
+      'proof-read',
+      'profile-read',
+    ];
+    if (blockedRows.includes(row)) {
+      const before = controller.snapshot().usage;
+      const input = start();
+      const first = controller.execute(input, 'local-owner');
+      const repeated = controller.execute(input, 'local-owner');
+      const refused = await first;
+      assert.deepEqual(await repeated, refused);
+      assert.notEqual(refused.outcome, 'applied', row);
+      if (cancellation) await cancellation;
+      if (closeDuringRead) {
+        await closeDuringRead;
+        controller = new Controller({
+          ...options,
+          home: context.controller.home,
+          now: clock.now,
+          id,
+        });
+        liveController = controller;
+      }
+      assert.equal(controller.store.intents().length, 0, row);
+      assert.equal(acpLaunches, setupLaunches, row);
+      assert.equal(controller.store.receipt(input.key)?.hash, hashCanonical(input));
+      assert.deepEqual(await controller.execute(input, 'local-owner'), refused);
+      assert.equal(
+        quotaReads,
+        [
+          'fresh-zero',
+          'reserve',
+          'cooldown',
+          'unavailable',
+          'active-owner',
+          'unknown-owner',
+        ].includes(row)
+          ? 0
+          : 1,
+        row,
+      );
+      if (['invalid-read', 'unavailable', 'cooldown', 'stop-read', 'close-read'].includes(row))
+        assert.deepEqual(controller.snapshot().usage, before, row);
+      if (['invalid-read', 'unavailable', 'stop-read', 'close-read'].includes(row))
+        assert.equal(controller.store.googleUsageReader().last_attempt_at, context.clock.now());
+      if (row === 'invalid-read' || row === 'unavailable') {
+        const beforeRetry = quotaReads;
+        assert.equal(
+          (await controller.execute(start(), 'local-owner')).reason,
+          'usage-reader-cooldown',
+        );
+        assert.equal(quotaReads, beforeRetry);
+      }
+      if (row === 'unknown-owner') {
+        await controller.close();
+        controller = new Controller({
+          ...options,
+          home: context.controller.home,
+          now: clock.now,
+          id,
+        });
+        liveController = controller;
+        assert.equal(
+          (await controller.execute(start(), 'local-owner')).reason,
+          'google-ownership-unknown',
+        );
+        assert.equal(quotaReads, 0);
+      }
+      if (row === 'cooldown') assert.equal(refused.reason, 'usage-reader-cooldown');
+      if (row === 'unknown-owner') assert.equal(refused.reason, 'google-ownership-unknown');
+      if (row === 'active-owner') assert.equal(refused.reason, 'google-operation-active');
+      if (row === 'deadline-read') assert.equal(refused.reason, 'acp-start-deadline');
+      await controller.close();
+      continue;
+    }
     if (row === 'preflight') {
       const input = start();
       const pending = controller.execute(input, 'local-owner');
@@ -6365,10 +9212,16 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     }
     const permission = Promise.withResolvers<Approval>();
     const readyToCancel = Promise.withResolvers<void>();
+    const ended = Promise.withResolvers<string>();
     const off = controller.subscribe((event) => {
       if (event.type === 'approval.requested') permission.resolve(event.payload);
       if (event.type === 'attempt.output' && event.payload.text === 'fixture-ready-to-cancel')
         readyToCancel.resolve();
+      if (
+        event.type === 'task.updated' &&
+        ['stopped', 'interrupted', 'unknown'].includes(event.payload.state)
+      )
+        ended.resolve(event.payload.state);
     });
     t.after(off);
     const input = start();
@@ -6390,13 +9243,56 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     assert.equal((await controller.execute(start(), 'local-owner')).reason, 'acp-start-preparing');
     assert.deepEqual(await first, await retry);
     assert.equal((await first).outcome, 'applied', canonicalJson(await first));
-    if (row === 'eof') {
+    assert.equal(quotaReads - preparationQuotaReads, autoRefresh ? 1 : 0, row);
+    if (autoRefresh) {
+      assert.equal(controller.store.googleMetadataOperations().at(-1)?.kind, 'usage');
+      assert.equal(controller.store.googleMetadataOperations().at(-1)?.state, 'quiescent');
+      assert.equal(
+        controller
+          .snapshot()
+          .usage.filter(({ observation }) => observation.routeId === run.roles[0].routeId).length,
+        2,
+      );
+      assert.equal(controller.store.intents().length, 1);
+    }
+    if (row === 'no-change' || row === 'unapproved-write' || row === 'outside-completed') {
+      // A clean end_turn without an approved change closes known. Untouched scratch has
+      // nothing to review; an unapproved write stays retained and unverified. A file
+      // change reported complete outside scratch leaves the turn unverified the same way.
+      assert.equal(await nativeWait('acp turn without change', ended.promise), 'interrupted');
+      const attemptId = controller.store.intents()[0].attempt_id;
+      assert(controller.store.receipt(`native-acp-terminal:${attemptId}`));
+      assert.equal(controller.store.receipt(`native-acp-capture:${attemptId}`), undefined);
+      assert.equal(controller.store.get<Attempt>('attempt', attemptId)?.state, 'stopped');
+      const snapshot = controller.snapshot();
+      if (row !== 'outside-completed')
+        assert.equal(
+          snapshot.candidates.some((value) => value.taskId === task.id),
+          row === 'unapproved-write',
+        );
+      assert.equal(
+        snapshot.tasks.find((value) => value.id === task.id)?.next,
+        row === 'no-change'
+          ? 'Native turn ended without an approved change. Nothing was captured.'
+          : 'Native work is unverified. Inspect retained changes.',
+      );
+      assert.equal(
+        controller.store.transaction(() =>
+          controller.store.googleStartBlocker(run.roles[0].routeId),
+        ),
+        undefined,
+      );
+      await controller.close();
+      continue;
+    }
+    if (row === 'eof' || row === 'eof-restart') {
       await nativeWait('acp cancellation readiness', readyToCancel.promise);
-      const terminal = Promise.withResolvers<void>();
-      const offUnknown = controller.subscribe((event) => {
-        if (event.type === 'task.updated' && event.payload.state === 'unknown') terminal.resolve();
+      const settled = Promise.withResolvers<void>();
+      const offSettled = controller.subscribe((event) => {
+        if (event.type === 'task.updated' && event.payload.state === 'interrupted')
+          settled.resolve();
       });
-      t.after(offUnknown);
+      t.after(offSettled);
       assert.equal(
         (
           await controller.execute(
@@ -6410,34 +9306,154 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
         ).outcome,
         'applied',
       );
-      await nativeWait('acp eof ownership', terminal.promise);
+      await nativeWait('acp eof settlement', settled.promise);
       const attemptId = controller.store.intents()[0].attempt_id;
-      assert.equal(controller.store.get<Attempt>('attempt', attemptId)?.state, 'unknown');
-      assert.equal(controller.store.receipt(`native-acp-terminal:${attemptId}`), undefined);
-      await controller.close();
-      controller = new Controller({
-        ...options,
-        home: context.controller.home,
-        now: clock.now,
-        id,
-      });
-      assert.equal(controller.store.get<Attempt>('attempt', attemptId)?.state, 'unknown');
-      assert.equal(
+      const gate = () =>
         controller.store.transaction(() =>
           controller.store.googleStartBlocker(run.roles[0].routeId),
-        ),
-        'google-ownership-unknown',
+        );
+      const held = (table: string) =>
+        controller.store.db
+          .prepare(`SELECT count(*) AS n FROM ${table} WHERE attempt_id=?`)
+          .get(attemptId)?.n;
+      const intentRow = () =>
+        controller.store.intents().find((value) => value.attempt_id === attemptId);
+      const recorded = controller.store.nativeProcesses(attemptId);
+      const quiescentAt = recorded.at(-1)?.quiescent_at;
+      assert(quiescentAt);
+      // The writer exited before any terminal response and its group is absent. The turn
+      // settles in the same controller with no restart or Stop, keeps its unknown outcome and
+      // holds nothing.
+      assert.equal(controller.store.get<Attempt>('attempt', attemptId)?.state, 'unknown');
+      assert.equal(controller.store.receipt(`native-acp-terminal:${attemptId}`), undefined);
+      assert.equal(controller.store.receipt(`native-acp-capture:${attemptId}`), undefined);
+      assert.equal(intentRow()?.state, 'stopped');
+      assert.equal(intentRow()?.finished_at, quiescentAt);
+      for (const table of ['writer_leases', 'reservations']) assert.equal(held(table), 0, table);
+      for (const key of ['native-submission', 'native-completion', 'native-unknown-settled'])
+        assert(controller.store.receipt(`${key}:${attemptId}`), key);
+      assert.deepEqual(controller.store.nativeProcesses(attemptId), recorded);
+      assert(!controller.snapshot().candidates.some((value) => value.taskId === task.id));
+      assert.equal(
+        controller.snapshot().tasks.find((value) => value.id === task.id)?.state,
+        'interrupted',
       );
+      assert.equal(gate(), undefined);
+      const launches = acpLaunches;
+      const restart = async () => {
+        await controller.close();
+        controller = new Controller({
+          ...options,
+          home: context.controller.home,
+          now: clock.now,
+          id,
+        });
+      };
+      const refusedStart = async () => {
+        assert.notEqual((await controller.execute(start(), 'local-owner')).outcome, 'applied');
+        assert.equal(acpLaunches, launches, 'a settled turn cannot submit again');
+      };
+      if (row === 'eof') {
+        await refusedStart();
+        await restart();
+        assert.equal(controller.store.get<Attempt>('attempt', attemptId)?.state, 'unknown');
+        assert.equal(gate(), undefined);
+        await controller.close();
+        continue;
+      }
+      // A crash before settlement leaves the intent open with the lease and reservations
+      // held. Recovery first meets a group that is still present.
+      crashBeforeSettlement(controller, attemptId);
+      const holder = spawnProcess(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], {
+        detached: true,
+        stdio: 'ignore',
+      });
+      const exited = once(holder, 'exit');
+      t.after(() => holder.kill('SIGKILL'));
+      const phaseGroup = (pid: number, group: number) =>
+        controller.store.db
+          .prepare(
+            'UPDATE native_processes SET pid=?,process_group=? WHERE attempt_id=? AND sequence=0',
+          )
+          .run(pid, group, attemptId);
+      phaseGroup(holder.pid as number, holder.pid as number);
+      clock.advance(3600000);
+      await restart();
+      const stopUnknown = () =>
+        controller.execute(
+          command('StopRun', { taskId: task.id, runId: run.id }, taskRevision(controller, task.id)),
+          'local-owner',
+        );
+      assert.equal(controller.store.get<Attempt>('attempt', attemptId)?.state, 'unknown');
+      assert.equal(intentRow()?.state, 'outcome-unknown');
+      assert.equal(gate(), 'google-ownership-unknown');
+      for (const table of ['writer_leases', 'reservations']) assert(Number(held(table)) > 0, table);
+      assert.equal((await stopUnknown()).reason, 'writer-ownership-unknown');
+      assert.equal(gate(), 'google-ownership-unknown');
+      assert.equal(controller.store.receipt(`native-unknown-settled:${attemptId}`), undefined);
+      holder.kill('SIGKILL');
+      await exited;
+      phaseGroup(recorded[0].pid as number, recorded[0].process_group as number);
+      // Shutdown proof is on record, so the charge stops there and not at the later Stop.
+      assert.equal((await stopUnknown()).outcome, 'applied');
+      assert.notEqual(clock.now(), quiescentAt);
+      assert.equal(controller.store.get<Attempt>('attempt', attemptId)?.state, 'unknown');
+      assert.equal(intentRow()?.finished_at, quiescentAt);
+      for (const table of ['writer_leases', 'reservations']) assert.equal(held(table), 0, table);
+      assert.deepEqual(controller.store.nativeProcesses(attemptId), recorded);
+      assert.equal(controller.store.receipt(`native-acp-terminal:${attemptId}`), undefined);
+      assert.equal(gate(), undefined);
+      await refusedStart();
+      // Recovery without a recorded closure charges through the attempt limit and the cleanup
+      // reserve, not through the hour the controller was down.
+      crashBeforeSettlement(controller, attemptId);
+      controller.store.db
+        .prepare(
+          "UPDATE native_processes SET state='owned',quiescent_at=NULL WHERE attempt_id=? AND sequence=0",
+        )
+        .run(attemptId);
+      clock.advance(3600000);
+      await restart();
+      assert.equal(controller.store.get<Attempt>('attempt', attemptId)?.state, 'unknown');
+      assert.equal(intentRow()?.state, 'stopped');
+      const admittedAt = Date.parse(intentRow()?.admitted_at as string);
+      assert.equal(intentRow()?.finished_at, new Date(admittedAt + 300000 + 60000).toISOString());
+      for (const table of ['writer_leases', 'reservations']) assert.equal(held(table), 0, table);
+      assert(controller.store.receipt(`native-unknown-settled:${attemptId}`));
+      assert.equal(controller.store.receipt(`native-acp-terminal:${attemptId}`), undefined);
+      assert.equal(controller.store.receipt(`native-acp-capture:${attemptId}`), undefined);
+      assert(!controller.snapshot().candidates.some((value) => value.taskId === task.id));
+      assert.equal(
+        controller.snapshot().tasks.find((value) => value.id === task.id)?.state,
+        'interrupted',
+      );
+      assert.equal(gate(), undefined);
+      await refusedStart();
       await controller.close();
       continue;
     }
-    const approval = await nativeWait('acp permission', permission.promise);
+    const approval = await nativeWait(
+      `acp permission/${row}`,
+      Promise.race([
+        permission.promise,
+        ended.promise.then((state) => {
+          throw new Error(`ACP fixture ended ${state} before requesting permission for ${row}.`);
+        }),
+      ]),
+    );
     assert.equal(approval.action, 'write-scratch');
     assert.equal(approval.target, 'net.mjs');
     assert.equal(approval.acpTarget?.kind, 'allow_once');
     const action = JSON.parse(approval.consequence);
-    assert.equal(action.oldText, original);
-    assert.equal(action.newText, 'export const total = 1;\n');
+    const expectedContent = 'export const total = 1;\n';
+    assert.equal(action.type, hunkAction ? 'replace-hunk' : 'replace-target');
+    assert.equal(action.oldText, hunkAction ? '0' : original);
+    assert.equal(action.newText, hunkAction ? '1' : expectedContent);
+    if (hunkAction) {
+      assert.equal(action.baseHash, createHash('sha256').update(original).digest('hex'));
+      assert.equal(action.afterHash, createHash('sha256').update(expectedContent).digest('hex'));
+      assert.equal(action.mode, '100644');
+    }
     assert(Buffer.byteLength(approval.consequence) <= 4096);
     const {
       requester: _requester,
@@ -6472,6 +9488,32 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       ).outcome,
       'denied',
     );
+    const pendingAuthority = controller.store.db
+      .prepare('SELECT * FROM pending_effects WHERE approval_id=?')
+      .get(approval.approvalId);
+    const pendingRevision = taskRevision(controller, task.id);
+    for (const name of ['SendTaskMessage', 'QueueTaskGuidance', 'AnswerTaskQuestion']) {
+      const result = await controller.execute(
+        command(
+          name,
+          {
+            taskId: task.id,
+            text: 'Keep this pending action unchanged.',
+            ...(name === 'AnswerTaskQuestion' ? { questionId: id('msg') } : {}),
+          },
+          pendingRevision,
+        ),
+        'local-owner',
+      );
+      assert.equal(result.reason, 'effects-unresolved');
+      assert.equal(taskRevision(controller, task.id), pendingRevision);
+      assert.deepEqual(
+        controller.store.db
+          .prepare('SELECT * FROM pending_effects WHERE approval_id=?')
+          .get(approval.approvalId),
+        pendingAuthority,
+      );
+    }
     const intent = controller.store.intents()[0];
     assert.equal(controller.store.nativeProfileId(intent.attempt_id), 'google-acp-v1');
     assert.deepEqual(
@@ -6481,7 +9523,7 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     writeFileSync(join(intent.scratch_path, 'net.mjs'), 'changed');
     assert.equal((await controller.execute(resolveApproval(), 'local-owner')).outcome, 'blocked');
     writeFileSync(join(intent.scratch_path, 'net.mjs'), original);
-    if (row !== 'approved') {
+    if (row !== 'approved' && !hunk) {
       const terminal = Promise.withResolvers<void>();
       const offTerminal = controller.subscribe((event) => {
         if (
@@ -6527,10 +9569,58 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     assert.equal((await controller.execute(resolveApproval(), 'local-owner')).outcome, 'applied');
     await nativeWait('acp capture', sealed);
     assert.equal(controller.store.intents().length, 1);
+    if (row === 'hunk-after-mismatch') {
+      assert.equal(controller.store.receipt(`native-acp-capture:${intent.attempt_id}`), undefined);
+      assert.equal(controller.snapshot().tasks[0].state, 'interrupted');
+      assert.equal(
+        controller.store.get<Approval>('approval', approval.approvalId)?.status,
+        'approved',
+      );
+      assert.equal(controller.store.get<Attempt>('attempt', intent.attempt_id)?.state, 'stopped');
+      assert.equal(readFileSync(join(source.directory, 'net.mjs'), 'utf8'), original);
+      assert.equal(
+        readFileSync(join(intent.scratch_path, 'net.mjs'), 'utf8'),
+        'export const total = 2;\n',
+      );
+      await controller.close();
+      controller = new Controller({
+        ...options,
+        home: context.controller.home,
+        now: clock.now,
+        id,
+      });
+      assert.equal(controller.store.receipt(`native-acp-capture:${intent.attempt_id}`), undefined);
+      assert.equal(controller.store.get<Attempt>('attempt', intent.attempt_id)?.state, 'stopped');
+      assert.equal(controller.snapshot().tasks[0].state, 'interrupted');
+      assert.equal(controller.store.intents().length, 1);
+      await controller.close();
+      continue;
+    }
+    const completionArtifact = controller.store.receipt(`native-completion:${intent.attempt_id}`)
+      ?.result.entity as Artifact;
+    const completion = JSON.parse(
+      new ArtifactFiles(join(controller.home, 'artifacts'))
+        .read(completionArtifact.hash)
+        .toString(),
+    );
+    assert.equal(completion.reason, null);
+    assert.equal(completion.quiescent, true);
+    assert.equal(completion.diagnostic, null);
+    assert.equal(completion.exitCode, 0);
+    assert.equal(completion.signal, null);
+    assert(completion.stdoutBytes > 0);
+    assert.equal(completion.stderrBytes, 0);
+    assert.equal(completion.trailingUpdates, 0);
+    // The rejected note write is counted in the record and never became an approval.
+    assert.equal(completion.rejectedOutsideWrites, row === 'hunk-brain-write' ? 1 : 0);
+    if (row === 'hunk-brain-write')
+      assert.equal(controller.store.list<Approval>('approval').length, 1);
+    assert.equal(completion.openToolCount, 0);
+    assert.deepEqual(completion.openToolKinds, []);
     assert(controller.store.receipt(`native-acp-capture:${intent.attempt_id}`));
     assert.equal(controller.snapshot().tasks[0].state, 'stopped');
     assert.equal(readFileSync(join(source.directory, 'net.mjs'), 'utf8'), original);
-    assert.equal(readFileSync(join(intent.scratch_path, 'net.mjs'), 'utf8'), action.newText);
+    assert.equal(readFileSync(join(intent.scratch_path, 'net.mjs'), 'utf8'), expectedContent);
     assert.equal((await controller.execute(input, 'local-owner')).outcome, 'already-applied');
     await controller.close();
     controller = new Controller({ ...options, home: context.controller.home, now: clock.now, id });
@@ -6584,11 +9674,1364 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     });
     await controller.close();
     controller = new Controller({ ...options, home: context.controller.home, now: clock.now, id });
+    // Every recorded group is absent, so recovery settles the turn without inventing a
+    // terminal response. The outcome stays unknown and the writer no longer holds the intent.
+    // The orphan setup operation above still blocks the gate on its own.
     assert.equal(controller.store.get<Attempt>('attempt', intent.attempt_id)?.state, 'unknown');
+    assert.equal(controller.store.receipt(`native-acp-terminal:${intent.attempt_id}`), undefined);
+    assert(controller.store.receipt(`native-unknown-settled:${intent.attempt_id}`));
     assert.equal(
-      controller.store.transaction(() => controller.store.googleStartBlocker(run.roles[0].routeId)),
-      'google-ownership-unknown',
+      controller.store.intents().find((value) => value.attempt_id === intent.attempt_id)?.state,
+      'stopped',
     );
+    assert.equal(controller.store.intents().filter((value) => value.state !== 'stopped').length, 0);
     await controller.close();
+  }
+});
+
+test('planning turns keep task authority and allowance across execution', async (t) => {
+  let context: Awaited<ReturnType<typeof setup>>;
+  let reopened: Controller | undefined;
+  let mode = 'success';
+  let askQuestion = true;
+  let reportedCapacity: number | null = 4096;
+  let crashAfterIntent = false;
+  let modelAvailability: 'available' | 'missing-model' | 'missing-effort' = 'available';
+  let usageChecked = false;
+  let lateUsage: (() => void) | undefined;
+  const held = Promise.withResolvers<void>();
+  const children: Promise<void>[] = [];
+  const profile = {
+    ...unavailableNativeProfile(),
+    facts: {
+      ...unavailableNativeProfile().facts,
+      available: true,
+      reason: 'available',
+      model: fixtureModel,
+      clientVersion: process.version,
+    },
+    client: { executable: process.execPath, sha256: fixtureClientHash, version: process.version },
+    environment: { ...process.env },
+    locationHash: '1'.repeat(64),
+  } satisfies NativeProfileResolution;
+  const repositoryProfile = {
+    ...profile,
+    facts: NativeRepositoryProfileSchema.parse({
+      ...unavailableRepositoryProfile().facts,
+      model: fixtureModel,
+      clientVersion: process.version,
+      available: true,
+      reason: 'qualification-pending',
+    }),
+    locationHash: '4'.repeat(64),
+  } satisfies NativeProfileResolution;
+  const options: Partial<ControllerOptions> = {
+    identity: { name: 'Fixture owner', email: 'owner@example.invalid' },
+    nativeProfiles: () => [profile, repositoryProfile],
+    afterIntent: () => {
+      if (crashAfterIntent) throw Error('Interrupted after durable planning admission.');
+    },
+    scenarioForRoute: () => 'complete',
+    nativeSpawn: (executable, args, spawnOptions) => {
+      const phase =
+        args.at(-1) === 'list'
+          ? 'features'
+          : context.controller.store
+                .intents()
+                .flatMap((intent) => context.controller.store.nativeProcesses(intent.attempt_id))
+                .filter((value) => value.state === 'intent')
+                .at(-1)?.phase === 'metadata-preparation'
+            ? 'prepare'
+            : 'task';
+      let script = fixture.replace(
+        'const path = message.params.outputSchema.properties.path.const;',
+        'const path = message.params.outputSchema.properties.path?.const;',
+      );
+      script = script
+        .replace(
+          'const thread =',
+          `replies['model/list'].data.push(...${JSON.stringify(
+            modelAvailability === 'missing-model'
+              ? []
+              : [
+                  {
+                    id: 'fixture-secondary',
+                    model: 'fixture-secondary',
+                    supportedReasoningEfforts: (modelAvailability === 'missing-effort'
+                      ? ['low']
+                      : ['low', 'medium']
+                    ).map((reasoningEffort) => ({ reasoningEffort })),
+                    defaultReasoningEffort: 'low',
+                  },
+                ],
+          )}); const thread =`,
+        )
+        .replace(
+          "if (message.method === 'thread/start') result = thread(process.cwd());",
+          "if (message.method === 'thread/start') result = {...thread(process.cwd()),model:message.params.model,reasoningEffort:message.params.config.model_reasoning_effort};",
+        );
+      script = script.replace(
+        '  let result = replies[message.method];',
+        `
+        let result = replies[message.method];
+        if (phase === 'task' && message.method === 'account/rateLimits/read') result = {
+          ordinaryUsageAllowed:true,rateLimits:{limitId:'wire'},
+          rateLimitsByLimitId:{wire:{primary:{usedPercent:25,windowDurationMins:300,resetsAt:1792231983}}}
+        };`,
+      );
+      script = script.replace(
+        'const edit = {version:1,attemptId:message.params.outputSchema.properties.attemptId.const,path,baseHash:message.params.outputSchema.properties.baseHash.const,content:content(path)};',
+        `const edit = {version:1,bindingHash:message.params.outputSchema.properties.bindingHash.const,message:'The bounded plan is ready.',questions:${JSON.stringify(askQuestion ? ['Keep the current export?'] : [])},proposal:{summary:'Keep the export.',criteria:${JSON.stringify(mode === 'escaped-boundary' ? Array.from({ length: 12 }, (_, index) => `${index}: ${'x'.repeat(3500)}`) : ['Preserve the source sentinels.'])},slices:[{id:'net',title:'Change the module',role:'coder',scope:['net.mjs'],dependsOn:[]}],checks:['node-tests-v1']}}${mode === 'invalid' ? '; edit.effects=[]' : ''};`,
+      );
+      script = script.replace(
+        "['turn/completed',{threadId:'thread-1',turn:{...running,status:'completed'}}],",
+        `['thread/tokenUsage/updated',{threadId:'thread-1',turnId:'turn-1',tokenUsage:{total:{totalTokens:900000},last:{totalTokens:123},modelContextWindow:${JSON.stringify(reportedCapacity)}}}],\n      ['turn/completed',{threadId:'thread-1',turn:{...running,status:'completed'}}],`,
+      );
+      const child = spawn(
+        executable,
+        ['-e', script, phase === 'task' && mode === 'hold' ? 'hold' : 'success', phase],
+        spawnOptions,
+      );
+      if (phase === 'task' && !usageChecked)
+        child.stdout.once('data', () => {
+          usageChecked = true;
+          const controller = context.controller;
+          const intent = controller.store.intents().find((row) => row.state === 'acknowledged');
+          assert.ok(intent);
+          const attempt = controller.store.get<Attempt>('attempt', intent.attempt_id);
+          assert.ok(attempt);
+          let ownsRuntime = true;
+          let current = true;
+          const ingress = (
+            controller as unknown as {
+              providerUsage: (
+                attempt: Attempt,
+                current: () => void,
+                ownsRuntime: () => boolean,
+                phases: string[],
+              ) => {
+                usage: { onReport: (value: unknown) => void };
+                onUsage: (value: unknown) => boolean;
+              };
+            }
+          ).providerUsage(
+            attempt,
+            () => {
+              if (!current) throw Error('Changed authority.');
+            },
+            () => ownsRuntime,
+            ['app-server-task'],
+          );
+          const observedAt = controller.now();
+          const oldTime = new Date(Date.parse(observedAt) - 1000).toISOString();
+          const observation = (windowId: string, at = oldTime): Observation => ({
+            routeId: attempt.routeId,
+            windowId,
+            kind: 'rolling',
+            remaining: { value: 80, unit: 'percent' },
+            resetsAt: null,
+            observedAt: at,
+            source: 'client',
+            confidence: 'reported',
+          });
+          const report = (values: Observation[], mode = 'partial', at = values[0].observedAt) =>
+            ingress.usage.onReport({ mode, observedAt: at, observations: values });
+          const retained = () =>
+            controller.store
+              .list<Observation>('window')
+              .filter((value) => value.routeId === attempt.routeId && value.source === 'client');
+          const originalRoute = controller.store.get<Route>('route', attempt.routeId);
+          assert.ok(originalRoute);
+          report([observation('observed-a'), observation('observed-b')]);
+          assert.equal(retained().length, 2);
+          assert.equal(retained()[0].observedAt, oldTime);
+          report([
+            observation('older-omitted', new Date(Date.parse(oldTime) - 1000).toISOString()),
+          ]);
+          const before = retained();
+          const beforeConflict = controller.store.cursor();
+          const equivalentTime = oldTime.replace('.000Z', 'Z');
+          assert.notEqual(equivalentTime, oldTime);
+          report([{ ...observation('observed-a', equivalentTime), remaining: null }], 'complete');
+          assert.deepEqual(retained(), before);
+          assert.equal(controller.store.cursor(), beforeConflict);
+          const otherRoute = context.fixtures.snapshot.routes.find(
+            (route) => route.id !== attempt.routeId,
+          );
+          assert.ok(otherRoute);
+          for (const value of [
+            { ...observation('invalid'), routeId: otherRoute.id },
+            { ...observation('invalid'), source: 'fixture' },
+            { ...observation('invalid'), confidence: 'estimated' },
+            { ...observation('invalid'), remaining: { value: 101, unit: 'percent' } },
+          ]) {
+            ingress.usage.onReport({
+              mode: 'partial',
+              observedAt: oldTime,
+              observations: [observation('would-write'), value],
+            });
+            assert.deepEqual(retained(), before);
+          }
+          report([observation('duplicate'), observation('duplicate')]);
+          report(Array.from({ length: 33 }, (_, index) => observation(`over-count-${index}`)));
+          report([observation('different-time')], 'partial', observedAt);
+          ingress.usage.onReport({
+            mode: 'partial',
+            observedAt: oldTime,
+            observations: [observation('extra-field')],
+            authority: true,
+          });
+          report([observation('future', new Date(Date.parse(observedAt) + 1000).toISOString())]);
+          report([{ ...observation('observed-a'), remaining: null }]);
+          ownsRuntime = false;
+          report([observation('unowned')]);
+          ownsRuntime = true;
+          current = false;
+          report([observation('changed-authority')]);
+          current = true;
+          controller.store.db
+            .prepare('UPDATE writer_leases SET generation=generation+1 WHERE task_id=?')
+            .run(intent.task_id);
+          report([observation('changed-lease')]);
+          controller.store.db
+            .prepare('UPDATE writer_leases SET generation=? WHERE task_id=?')
+            .run(attempt.generation, intent.task_id);
+          controller.store.transaction(() =>
+            controller.store.put('attempt', attempt.id, attempt.revision, {
+              ...attempt,
+              state: 'unknown',
+            }),
+          );
+          report([observation('unknown-attempt')]);
+          controller.store.transaction(() =>
+            controller.store.put('attempt', attempt.id, attempt.revision, attempt),
+          );
+          const process = controller.store.nativeProcesses(attempt.id).at(-1);
+          assert.ok(process);
+          controller.store.db
+            .prepare(
+              "UPDATE native_processes SET state='intent',pid=NULL,process_group=NULL WHERE attempt_id=? AND phase='app-server-task'",
+            )
+            .run(attempt.id);
+          report([observation('unowned-phase')]);
+          controller.store.db
+            .prepare(
+              "UPDATE native_processes SET state='owned',pid=?,process_group=? WHERE attempt_id=? AND phase='app-server-task'",
+            )
+            .run(process.pid, process.process_group, attempt.id);
+          controller.store.transaction(() =>
+            controller.store.put('route', attempt.routeId, 0, {
+              ...originalRoute,
+              model: 'changed-model',
+            }),
+          );
+          report([observation('changed-route')]);
+          controller.store.transaction(() =>
+            controller.store.put('route', attempt.routeId, 0, originalRoute),
+          );
+          assert.deepEqual(retained(), before);
+          assert.deepEqual(controller.store.get('route', attempt.routeId), originalRoute);
+          report([observation('observed-a', observedAt)]);
+          const cursor = controller.store.cursor();
+          report([observation('observed-a', observedAt)], 'complete');
+          assert.notEqual(controller.store.cursor(), cursor);
+          assert.deepEqual(retained(), [observation('observed-a', observedAt)]);
+          report([observation('observed-b')], 'complete');
+          assert.deepEqual(retained(), [observation('observed-a', observedAt)]);
+          const manual = { ...observation('manual', observedAt), source: 'manual' as const };
+          controller.store.transaction(() =>
+            controller.store.put('window', `${attempt.routeId}/manual`, 0, manual),
+          );
+          report([observation('manual')]);
+          assert.deepEqual(controller.store.get('window', `${attempt.routeId}/manual`), manual);
+          report([observation('observed-a', observedAt)], 'complete');
+          assert.deepEqual(controller.store.get('window', `${attempt.routeId}/manual`), manual);
+          const draftWindow = {
+            windowId: 'callback',
+            kind: 'rolling',
+            remaining: { value: 51, unit: 'percent' },
+            resetsAt: null,
+            source: 'client',
+            confidence: 'reported',
+          };
+          assert.equal(
+            ingress.onUsage({
+              complete: false,
+              windows: [draftWindow],
+              credits: [{ private: true }],
+            }),
+            true,
+          );
+          const arrived = retained().find((value) => value.windowId === 'callback');
+          assert.equal(arrived?.observedAt, controller.now());
+          draftWindow.remaining.value = 52;
+          ingress.onUsage({ windows: [draftWindow] });
+          assert.equal(
+            retained().find((value) => value.windowId === 'callback')?.remaining?.value,
+            52,
+            'two genuine updates in one millisecond keep the later stream value',
+          );
+          assert.equal(
+            retained().find((value) => value.windowId === 'callback')?.observedAt,
+            arrived?.observedAt,
+          );
+          assert.ok(arrived);
+          const intervening = { ...arrived, remaining: { value: 49, unit: 'percent' as const } };
+          controller.store.transaction(() =>
+            controller.store.put('window', `${attempt.routeId}/callback`, 0, intervening),
+          );
+          const refusedWindow = {
+            ...draftWindow,
+            remaining: { value: 53, unit: 'percent' },
+          };
+          assert.equal(ingress.onUsage({ windows: [refusedWindow] }), false);
+          assert.deepEqual(
+            retained().find((value) => value.windowId === 'callback'),
+            intervening,
+            'the stream cannot replace another equal-time writer',
+          );
+          const callbackCursor = controller.store.cursor();
+          context.clock.advance(1);
+          ingress.onUsage({ complete: false, windows: [draftWindow] });
+          assert.equal(
+            controller.store.cursor(),
+            callbackCursor,
+            'a cached sparse replay does not restamp',
+          );
+          assert.equal(
+            retained().find((value) => value.windowId === 'callback')?.observedAt,
+            arrived?.observedAt,
+          );
+          assert.equal(ingress.onUsage({ windows: [refusedWindow] }), true);
+          const acceptedAt = controller.now();
+          assert.equal(
+            retained().find((value) => value.windowId === 'callback')?.remaining?.value,
+            53,
+          );
+          const acceptedCursor = controller.store.cursor();
+          context.clock.advance(1);
+          assert.equal(ingress.onUsage({ windows: [refusedWindow] }), true);
+          assert.equal(controller.store.cursor(), acceptedCursor);
+          assert.equal(
+            retained().find((value) => value.windowId === 'callback')?.observedAt,
+            acceptedAt,
+            'an accepted replay keeps its original observation time',
+          );
+          ingress.onUsage({ complete: true, windows: [draftWindow] });
+          assert.equal(
+            retained().find((value) => value.windowId === 'callback')?.observedAt,
+            controller.now(),
+          );
+          assert.equal(
+            retained().some((value) => value.windowId === 'observed-a'),
+            false,
+          );
+          const completeCallback = retained();
+          ingress.onUsage({
+            complete: true,
+            windows: [draftWindow, { ...draftWindow, remaining: { value: 101, unit: 'percent' } }],
+          });
+          assert.deepEqual(retained(), completeCallback);
+          lateUsage = () => {
+            report([observation('late', observedAt)]);
+            ingress.onUsage({ windows: [{ ...draftWindow, windowId: 'late-callback' }] });
+          };
+        });
+      children.push(new Promise<void>((done) => child.once('close', () => done())));
+      let output = '';
+      if (phase === 'task' && mode === 'hold')
+        child.stdout.on('data', (bytes: Buffer) => {
+          output += bytes.toString();
+          for (;;) {
+            const end = output.indexOf('\n');
+            if (end < 0) break;
+            const line = output.slice(0, end);
+            output = output.slice(end + 1);
+            try {
+              const value = JSON.parse(line);
+              if (value.id === 11) held.resolve();
+            } catch {}
+          }
+        });
+      return child;
+    },
+  };
+  context = await setup(t, options, async (controller) => {
+    await reopened?.close();
+    await controller.close();
+    await Promise.all(children);
+  });
+  const { controller, command, fixtures, clock } = context;
+  const projectId = controller.snapshot().projects[0].id;
+  const planning = {
+    role: 'lead',
+    profileId: 'openai-file-v1',
+    creditPolicy: 'ordinary',
+    limits: { attempts: 12, minutes: 30, concurrency: 2 },
+    consent: 'explicit',
+  };
+  const capturePayload = {
+    projectId,
+    base: context.source.base,
+    selections: [{ kind: 'source-file', path: join(context.source.directory, 'net.mjs') }],
+  };
+  const captureCommand = command('CaptureConversationContext', capturePayload, 0);
+  const capture = await controller.execute(captureCommand, 'local-owner');
+  const contextArtifact = ArtifactSchema.parse(capture.entity);
+  const refs = [{ artifactId: contextArtifact.id, hash: contextArtifact.hash }];
+  assert.equal(capture.outcome, 'applied');
+  assert.equal(
+    (await controller.execute(captureCommand, 'local-owner')).outcome,
+    'already-applied',
+  );
+  assert.equal(
+    (
+      await controller.execute(
+        { ...captureCommand, payload: { ...capturePayload, base: '0'.repeat(40) } },
+        'local-owner',
+      )
+    ).reason,
+    'idempotency-key-reused',
+  );
+  assert.equal(
+    (
+      await controller.execute(
+        command(
+          'CaptureConversationContext',
+          {
+            ...capturePayload,
+            selections: [{ kind: 'source-file', path: context.directory }],
+          },
+          0,
+        ),
+        'local-owner',
+      )
+    ).outcome,
+    'blocked',
+  );
+  const beforeInvalidContext = controller.snapshot().tasks.length;
+  assert.equal(
+    (
+      await controller.execute(
+        command(
+          'CreateTaskDiscussion',
+          {
+            projectId,
+            text: 'Reject a changed context digest.',
+            planning,
+            context: [{ ...refs[0], hash: '0'.repeat(64) }],
+          },
+          0,
+        ),
+        'local-owner',
+      )
+    ).reason,
+    'conversation-context-invalid',
+  );
+  assert.equal(controller.snapshot().tasks.length, beforeInvalidContext);
+  const largeRefs: { artifactId: string; hash: string }[] = [];
+  for (const [index, character] of ['"', '\\', '\t', '\n'].entries()) {
+    const path = join(context.source.directory, `selected-${index}.log`);
+    writeFileSync(path, character.repeat(8192));
+    const result = await controller.execute(
+      command(
+        'CaptureConversationContext',
+        {
+          projectId,
+          base: context.source.base,
+          selections: [{ kind: 'log-file', path }],
+        },
+        0,
+      ),
+      'local-owner',
+    );
+    const artifact = ArtifactSchema.parse(result.entity);
+    largeRefs.push({ artifactId: artifact.id, hash: artifact.hash });
+    rmSync(path);
+  }
+  assert.equal(
+    (
+      await controller.execute(
+        command(
+          'CreateTaskDiscussion',
+          {
+            projectId,
+            text: 'Keep every byte of selected context.',
+            planning,
+            context: largeRefs,
+          },
+          0,
+        ),
+        'local-owner',
+      )
+    ).reason,
+    'conversation-context-too-large',
+  );
+  assert.equal(controller.snapshot().tasks.length, beforeInvalidContext);
+  const oversized = TaskSchema.parse(
+    (
+      await controller.execute(
+        command(
+          'CreateTask',
+          {
+            projectId,
+            title: 'A retained contract',
+            outcome: 'Keep the full criteria.',
+            criteria: Array.from({ length: 100 }, (_, index) => `${index}: ${'x'.repeat(4000)}`),
+          },
+          0,
+        ),
+        'local-owner',
+      )
+    ).entity,
+  );
+  const oversizedResult = await controller.execute(
+    command('ConfigureTaskConversation', { taskId: oversized.id, planning }, oversized.revision),
+    'local-owner',
+  );
+  assert.equal(oversizedResult.reason, 'conversation-input-too-large');
+  assert.deepEqual(controller.store.get('task', oversized.id), oversized);
+  assert.equal(controller.store.conversationTask(oversized.id), undefined);
+  const nextReply = () =>
+    new Promise<void>((done) => {
+      const off = controller.subscribe((event) => {
+        if (event.type === 'conversation.entry' && event.payload.kind === 'agent-message') {
+          off();
+          done();
+        }
+      });
+    });
+  const state = (taskId: string) =>
+    TaskConversationStateSchema.parse(
+      (controller as unknown as { conversationState: (id: string) => unknown }).conversationState(
+        taskId,
+      ),
+    );
+  const current = (id: string) =>
+    controller.snapshot().tasks.find((task) => task.id === id) as ReturnType<
+      typeof TaskSchema.parse
+    >;
+  const send = (name: string, taskId: string, payload: object) =>
+    controller.execute(
+      command(name, { taskId, ...payload }, current(taskId).revision),
+      'local-owner',
+    );
+  askQuestion = false;
+  const catalogReply = nextReply();
+  const catalogTask = TaskSchema.parse(
+    (
+      await controller.execute(
+        command(
+          'CreateTaskDiscussion',
+          { projectId, text: 'Use an observed planning model.', planning },
+          0,
+        ),
+        'local-owner',
+      )
+    ).entity,
+  );
+  assert.equal(state(catalogTask.id).modelChoices?.status, 'not-observed');
+  assert.equal(state(catalogTask.id).contextUsage, null);
+  await catalogReply;
+  assert.equal(usageChecked, true);
+  const callbackFromWire = context.controller.store
+    .list<Observation>('window')
+    .find((value) => value.windowId === 'wire:primary');
+  assert.equal(
+    callbackFromWire?.remaining?.value,
+    75,
+    'the actual planning transcript callback reaches guarded storage',
+  );
+  assert.equal(callbackFromWire?.source, 'client');
+
+  const usageAfterCompletion = controller.store.list<Observation>('window');
+  lateUsage?.();
+  assert.deepEqual(controller.store.list<Observation>('window'), usageAfterCompletion);
+  const observed = state(catalogTask.id).modelChoices;
+  assert.equal(observed?.status, 'last-observed');
+  assert(observed?.observation);
+  assert.deepEqual(
+    observed.models.map((model) => model.model),
+    [fixtureModel, 'fixture-secondary'],
+  );
+  assert(!JSON.stringify(observed).includes(process.execPath));
+  const reportedContext = state(catalogTask.id).contextUsage;
+  assert(reportedContext);
+  assert.equal(reportedContext.usedTokens, 123);
+  assert.equal(reportedContext.capacityTokens, 4096);
+  assert.equal(reportedContext.model, fixtureModel);
+  assert.equal(reportedContext.runId, current(catalogTask.id).runId);
+  assert.deepEqual(reportedContext.observation, observed.observation);
+  const retainedContext = JSON.parse(
+    new ArtifactFiles(join(controller.home, 'artifacts'))
+      .read(reportedContext.observation.hash)
+      .toString('utf8'),
+  ).contextUsage;
+  assert.deepEqual(retainedContext, {
+    threadId: 'thread-1',
+    turnId: 'turn-1',
+    model: fixtureModel,
+    usedTokens: 123,
+    capacityTokens: 4096,
+  });
+  const catalogReference = observed.observation;
+  const selectedPlanning = {
+    ...planning,
+    modelRequest: {
+      version: 1,
+      observation: catalogReference,
+      model: 'fixture-secondary',
+      effort: 'medium',
+    },
+  };
+  const beforeSelection = state(catalogTask.id).budget?.remaining;
+  const beforeSelectionSpawns = children.length;
+  const beforeSelectionRun = current(catalogTask.id).runId;
+  const tasksBeforeForeignCatalog = controller.snapshot().tasks.length;
+  assert.equal(
+    (
+      await controller.execute(
+        command(
+          'CreateTaskDiscussion',
+          { projectId, text: 'Reject another task catalog.', planning: selectedPlanning },
+          0,
+        ),
+        'local-owner',
+      )
+    ).reason,
+    'observation-stale',
+  );
+  assert.equal(controller.snapshot().tasks.length, tasksBeforeForeignCatalog);
+  for (const [modelRequest, reason] of [
+    [
+      {
+        ...selectedPlanning.modelRequest,
+        observation: { ...catalogReference, hash: '0'.repeat(64) },
+      },
+      'observation-missing',
+    ],
+    [{ ...selectedPlanning.modelRequest, model: 'unobserved-model' }, 'model-unavailable'],
+    [{ ...selectedPlanning.modelRequest, effort: 'unobserved-effort' }, 'effort-unavailable'],
+  ] as const) {
+    assert.equal(
+      (
+        await send('ConfigureTaskConversation', catalogTask.id, {
+          planning: { ...planning, modelRequest },
+        })
+      ).reason,
+      reason,
+    );
+  }
+  assert.equal(current(catalogTask.id).runId, beforeSelectionRun);
+  const configureSelection = command(
+    'ConfigureTaskConversation',
+    { taskId: catalogTask.id, planning: selectedPlanning },
+    current(catalogTask.id).revision,
+  );
+  assert.equal((await controller.execute(configureSelection, 'local-owner')).outcome, 'applied');
+  assert.equal(
+    (await controller.execute(configureSelection, 'local-owner')).outcome,
+    'already-applied',
+  );
+  assert.notEqual(current(catalogTask.id).runId, beforeSelectionRun);
+  assert.equal(children.length, beforeSelectionSpawns);
+  assert.deepEqual(state(catalogTask.id).budget?.remaining, beforeSelection);
+  assert.equal(state(catalogTask.id).configuration?.requestedModel, 'fixture-secondary');
+  assert.equal(state(catalogTask.id).configuration?.requestedEffort, 'medium');
+  assert.equal(state(catalogTask.id).configuration?.effectiveModel, null);
+  assert.equal(state(catalogTask.id).contextUsage, null);
+  reportedCapacity = null;
+  const selectedReply = nextReply();
+  await send('SendTaskMessage', catalogTask.id, { text: 'Use the saved exact pair.' });
+  const activeConfiguration = await send('ConfigureTaskConversation', catalogTask.id, {
+    planning: { ...selectedPlanning, role: 'orchestrator' },
+  });
+  assert.equal(activeConfiguration.outcome, 'blocked');
+  assert(['owner-active', 'ownership-unknown'].includes(activeConfiguration.reason ?? ''));
+  assert.equal(state(catalogTask.id).configuration?.selection.role, 'lead');
+  const lowerPlanning = {
+    ...selectedPlanning,
+    limits: { ...planning.limits, attempts: 11, minutes: 29 },
+  };
+  assert.equal(
+    (await send('ConfigureTaskConversation', catalogTask.id, { planning: lowerPlanning })).outcome,
+    'applied',
+  );
+  await selectedReply;
+  assert.equal(state(catalogTask.id).configuration?.effectiveModel, 'fixture-secondary');
+  assert.equal(state(catalogTask.id).configuration?.effectiveEffort, 'medium');
+  assert.equal(state(catalogTask.id).contextUsage?.model, 'fixture-secondary');
+  assert.equal(state(catalogTask.id).contextUsage?.usedTokens, 123);
+  assert.equal(state(catalogTask.id).contextUsage?.capacityTokens, null);
+  const selectedIntent = controller.store
+    .intents()
+    .filter((intent) => intent.task_id === catalogTask.id)
+    .at(-1);
+  assert(selectedIntent);
+  const selectedInputArtifact = ArtifactSchema.parse(
+    controller.store.receipt(`conversation-turn:${selectedIntent.attempt_id}`)?.result.entity,
+  );
+  const selectedInput = JSON.parse(
+    new ArtifactFiles(join(controller.home, 'artifacts'))
+      .read(selectedInputArtifact.hash)
+      .toString('utf8'),
+  );
+  assert.equal(selectedInput.model, 'fixture-secondary');
+  assert.equal(selectedInput.effort, 'medium');
+  assert.deepEqual(selectedInput.selection.modelRequest, selectedPlanning.modelRequest);
+  assert(
+    selectedInput.selection.configurationRevision <
+      (state(catalogTask.id).configuration?.revision ?? 0),
+  );
+  assert.equal(state(catalogTask.id).budget?.remaining.attempts, 9);
+  const selectedObservation = state(catalogTask.id).modelChoices?.observation;
+  for (const unavailable of ['missing-model', 'missing-effort'] as const) {
+    modelAvailability = unavailable;
+    const failed = new Promise<void>((done) => {
+      const off = controller.subscribe((event) => {
+        if (event.type === 'attempt.stopped' && event.taskId === catalogTask.id) {
+          off();
+          done();
+        }
+      });
+    });
+    await send('SendTaskMessage', catalogTask.id, {
+      text: 'Validate the current advertised pair.',
+    });
+    await failed;
+    const failedIntent = controller.store
+      .intents()
+      .filter((intent) => intent.task_id === catalogTask.id)
+      .at(-1);
+    assert(failedIntent);
+    assert.equal(
+      controller.store.receipt(`conversation-submission:${failedIntent.attempt_id}`),
+      undefined,
+    );
+    assert.equal(state(catalogTask.id).configuration?.requestedModel, 'fixture-secondary');
+    assert.equal(state(catalogTask.id).configuration?.effectiveModel, null);
+    assert.equal(state(catalogTask.id).modelChoices?.status, 'last-observed');
+    assert.deepEqual(state(catalogTask.id).modelChoices?.observation, selectedObservation);
+    assert.equal(
+      state(catalogTask.id).modelChoices?.reason,
+      unavailable === 'missing-model' ? 'model-unavailable' : 'effort-unavailable',
+    );
+  }
+  modelAvailability = 'available';
+  const originalLocation = profile.locationHash;
+  profile.locationHash = '2'.repeat(64);
+  assert.equal(state(catalogTask.id).modelChoices?.status, 'client-changed');
+  assert.equal(state(catalogTask.id).contextUsage, null);
+  assert.equal(state(catalogTask.id).send.reason, 'profile-unavailable');
+  assert.equal(
+    (
+      await send('ConfigureTaskConversation', catalogTask.id, {
+        planning: { ...lowerPlanning, role: 'orchestrator' },
+      })
+    ).reason,
+    'client-changed',
+  );
+  assert.equal(
+    (
+      await send('ConfigureTaskConversation', catalogTask.id, {
+        planning: { ...planning, limits: lowerPlanning.limits },
+      })
+    ).outcome,
+    'applied',
+  );
+  assert.equal(state(catalogTask.id).configuration?.selection.modelRequest, undefined);
+  assert.equal(state(catalogTask.id).configuration?.requestedModel, fixtureModel);
+  assert.equal(state(catalogTask.id).configuration?.effectiveModel, null);
+  profile.locationHash = originalLocation;
+  mode = 'escaped-boundary';
+  askQuestion = false;
+  const boundaryReply = nextReply();
+  const boundaryTask = TaskSchema.parse(
+    (
+      await controller.execute(
+        command(
+          'CreateTaskDiscussion',
+          { projectId, text: 'Keep a large bounded contract.', planning },
+          0,
+        ),
+        'local-owner',
+      )
+    ).entity,
+  );
+  await boundaryReply;
+  const boundaryProposal = state(boundaryTask.id).proposal;
+  assert(boundaryProposal);
+  await send('AdoptTaskPlan', boundaryTask.id, {
+    proposalId: boundaryProposal.id,
+    proposalHash: boundaryProposal.hash,
+  });
+  assert.equal(state(boundaryTask.id).send.reason, 'conversation-input-too-large');
+  const entryCount = controller.store.db
+    .prepare('SELECT COUNT(*) AS count FROM conversation_entries WHERE task_id=?')
+    .get(boundaryTask.id)?.count;
+  assert.equal(
+    (await send('SendTaskMessage', boundaryTask.id, { text: '\u0001'.repeat(4096) })).reason,
+    'conversation-input-too-large',
+  );
+  assert.equal(
+    controller.store.db
+      .prepare('SELECT COUNT(*) AS count FROM conversation_entries WHERE task_id=?')
+      .get(boundaryTask.id)?.count,
+    entryCount,
+  );
+  mode = 'success';
+  askQuestion = false;
+  for (const boundary of ['admission-stop', 'completion-stop', 'completion-send']) {
+    const title = `Bounded ${boundary}`;
+    let raceTaskId: string | undefined;
+    let triggered = false;
+    let replies = 0;
+    const action = Promise.withResolvers<CommandResult>();
+    const replied = Promise.withResolvers<void>();
+    const off = controller.subscribe((event) => {
+      if (event.type === 'task.created' && event.payload.title === title)
+        raceTaskId = event.payload.id;
+      if (!raceTaskId || event.taskId !== raceTaskId) return;
+      const atBoundary =
+        boundary === 'admission-stop'
+          ? event.type === 'run.admitted'
+          : event.type === 'attempt.stopped';
+      if (!triggered && atBoundary) {
+        triggered = true;
+        const result =
+          boundary === 'completion-send'
+            ? send('SendTaskMessage', raceTaskId, { text: 'Continue from this exact boundary.' })
+            : send('StopRun', raceTaskId, { runId: current(raceTaskId).runId });
+        void result.then(action.resolve, action.reject);
+      }
+      if (event.type === 'conversation.entry' && event.payload.kind === 'agent-message') {
+        replies++;
+        if (replies === (boundary === 'completion-send' ? 2 : 1)) replied.resolve();
+      }
+    });
+    t.after(off);
+    const started = await controller.execute(
+      command('CreateTaskDiscussion', { projectId, text: title, planning }, 0),
+      'local-owner',
+    );
+    const raced = TaskSchema.parse(started.entity);
+    assert.equal((await action.promise).outcome, 'applied');
+    if (boundary !== 'admission-stop') await replied.promise;
+    off();
+    const attempts = controller.store.intents().filter((intent) => intent.task_id === raced.id);
+    assert.equal(attempts.length, boundary === 'completion-send' ? 2 : 1);
+    assert(attempts.every((intent) => intent.state === 'stopped'));
+    if (boundary === 'admission-stop') {
+      assert.deepEqual(controller.store.nativeProcesses(attempts[0].attempt_id), []);
+      assert.equal(state(raced.id).contextUsage, null);
+    }
+    assert.equal(current(raced.id).state, boundary === 'completion-send' ? 'draft' : 'stopped');
+    if (boundary !== 'completion-send')
+      assert.equal(state(raced.id).send.reason, 'admissions-paused');
+  }
+  askQuestion = true;
+  const firstReply = nextReply();
+  const create = command(
+    'CreateTaskDiscussion',
+    { projectId, text: 'Keep the export and change netMinor.', planning, context: refs },
+    0,
+  );
+  const created = await controller.execute(create, 'local-owner');
+  assert.equal(created.outcome, 'applied');
+  const taskId = TaskSchema.parse(created.entity).id;
+  assert.equal(state(taskId).contractStatus, 'provisional');
+  assert.equal(state(taskId).phase, 'planning');
+  assert.equal(state(taskId).budget?.remaining.attempts, 11);
+  assert.equal(state(taskId).budget?.remaining.concurrency, 1);
+  assert.equal((await controller.execute(create, 'local-owner')).outcome, 'already-applied');
+  assert.equal(controller.store.intents().filter((intent) => intent.task_id === taskId).length, 1);
+  const policy = {
+    ...fixtures.policy,
+    quality: 'quick',
+    limits: { attempts: 4, minutes: 20, concurrency: 2 },
+    methods: [],
+    effects: [
+      ...fixtures.policy.effects.map((grant) => ({ ...grant, taskId })),
+      {
+        taskId,
+        action: 'run-review',
+        target: 'keep-it-simple/cycle-1',
+        expiresAt: fixtures.policy.effects[0].expiresAt,
+        revoked: false,
+        usesRemaining: 1,
+      },
+    ],
+  };
+  assert.equal(
+    (await send('PrepareRun', taskId, { policy, roles: quickRoles(fixtures) })).reason,
+    'task-not-preparable',
+  );
+  await firstReply;
+  const nativePreparation = {
+    profileId: 'openai-file-v1',
+    targetPath: 'net.mjs',
+    policy: {
+      ...policy,
+      methods: [{ id: 'keep-it-simple', cycles: 1, reviewerRole: 'reviewer' }],
+    },
+    creditPolicy: 'ordinary',
+    consent: 'explicit',
+  };
+  const provisionalPreparation = await send('PrepareNativeRun', taskId, nativePreparation);
+  assert.equal(provisionalPreparation.reason, 'task-contract-unconfirmed');
+  assert.equal(provisionalPreparation.next, 'Review and adopt a plan before preparing execution.');
+  const admitted = controller.store.intents().find((intent) => intent.task_id === taskId);
+  assert(admitted);
+  const savedInputReceipt = controller.store.receipt(`conversation-turn:${admitted.attempt_id}`);
+  const savedInputArtifact = ArtifactSchema.parse(savedInputReceipt?.result.entity);
+  const savedInput = JSON.parse(
+    new ArtifactFiles(join(context.directory, 'home', 'artifacts'))
+      .read(savedInputArtifact.hash)
+      .toString('utf8'),
+  );
+  assert.deepEqual(savedInput.contextSource, { projectId, base: context.source.base });
+  assert.equal(savedInput.contextAttachments.length, 1);
+  assert.equal(savedInput.contextAttachments[0].artifactId, contextArtifact.id);
+  assert.equal(savedInput.contextAttachments[0].hash, contextArtifact.hash);
+  assert.equal(
+    savedInput.history.find(
+      (entry: { messageId?: string }) =>
+        entry.messageId === savedInput.contextAttachments[0].messageId,
+    )?.role,
+    'user',
+  );
+  const retainedInput = controller.store.db
+    .prepare(
+      "SELECT body FROM conversation_entries WHERE task_id=? AND json_extract(body,'$.kind')='user-message'",
+    )
+    .get(taskId);
+  assert.deepEqual(JSON.parse(retainedInput?.body as string).context, refs);
+  assert.equal(state(taskId).pendingQuestions.length, 1);
+  assert.equal(state(taskId).adopt.reason, 'pending-question');
+  assert.equal(state(taskId).configuration?.effectiveModel, fixtureModel);
+  mode = 'hold';
+  askQuestion = false;
+  await send('AnswerTaskQuestion', taskId, {
+    questionId: state(taskId).pendingQuestions[0].id,
+    text: 'Keep it.',
+    context: refs,
+  });
+  await held.promise;
+  const queuedRevision = current(taskId).revision;
+  await send('SendTaskMessage', taskId, {
+    text: 'Use the existing helper in the next plan.',
+    context: refs,
+  });
+  assert.equal(state(taskId).queuedInputCount, 1);
+  assert.equal(state(taskId).send.disposition, 'queue');
+  assert.equal(
+    (
+      await controller.execute(
+        command('SendTaskMessage', { taskId, text: 'Stale text.' }, queuedRevision),
+        'local-owner',
+      )
+    ).outcome,
+    'stale-revision',
+  );
+  clock.advance(60000);
+  const stopped = new Promise<void>((done) => {
+    const off = controller.subscribe((event) => {
+      if (
+        event.type === 'task.updated' &&
+        event.taskId === taskId &&
+        event.payload.state === 'stopped'
+      ) {
+        off();
+        done();
+      }
+    });
+  });
+  await send('StopRun', taskId, { runId: current(taskId).runId });
+  await stopped;
+  assert.equal(controller.store.intents().filter((intent) => intent.task_id === taskId).length, 2);
+  assert.equal(state(taskId).send.reason, 'admissions-paused');
+  assert.equal(state(taskId).budget?.remaining.minutes, 29);
+  mode = 'success';
+  const resumed = nextReply();
+  await send('ResumeRun', taskId, { runId: current(taskId).runId });
+  await resumed;
+  assert.equal(state(taskId).queuedInputCount, 0);
+  assert.equal(state(taskId).adopt.available, true);
+  mode = 'invalid';
+  const invalid = new Promise<void>((done) => {
+    const off = controller.subscribe((event) => {
+      if (
+        event.type === 'task.updated' &&
+        event.taskId === taskId &&
+        event.payload.state === 'interrupted'
+      ) {
+        off();
+        done();
+      }
+    });
+  });
+  const plansBefore = controller.store.db
+    .prepare(
+      "SELECT COUNT(*) AS count FROM conversation_entries WHERE json_extract(body,'$.kind')='plan-proposal'",
+    )
+    .get()?.count;
+  await send('SendTaskMessage', taskId, { text: 'Keep the same bounded plan.' });
+  await invalid;
+  assert.equal(
+    controller.store.db
+      .prepare(
+        "SELECT COUNT(*) AS count FROM conversation_entries WHERE json_extract(body,'$.kind')='plan-proposal'",
+      )
+      .get()?.count,
+    plansBefore,
+  );
+  assert.equal(state(taskId).adopt.available, false);
+  mode = 'success';
+  const restored = nextReply();
+  await send('SendTaskMessage', taskId, { text: 'Return the valid plan.' });
+  await restored;
+  const proposed = state(taskId).proposal;
+  assert(proposed);
+  const planningRun = controller.store.get('run', proposed.runId);
+  const effectsBefore = (planningRun as ReturnType<typeof RunSchema.parse>).policy.policy.effects;
+  assert.deepEqual(effectsBefore, []);
+  assert.equal(
+    (await send('AdoptTaskPlan', taskId, { proposalId: proposed.id, proposalHash: 'f'.repeat(64) }))
+      .reason,
+    'proposal-hash-changed',
+  );
+  await send('AdoptTaskPlan', taskId, { proposalId: proposed.id, proposalHash: proposed.hash });
+  assert.equal(state(taskId).contractStatus, 'confirmed');
+  const changedSource = join(context.source.directory, 'planning-note.txt');
+  writeFileSync(changedSource, 'Source changed after adoption.\n');
+  const stalePreparation = await send('PrepareNativeRun', taskId, nativePreparation);
+  assert.equal(stalePreparation.reason, 'proposal-not-current');
+  assert.equal(
+    stalePreparation.next,
+    'Adopt the current planning proposal before preparing execution.',
+  );
+  rmSync(changedSource);
+  // The adopted plan's coder paths reach a repository writer only while the task still carries
+  // the plan's criteria.
+  const adoptedScope = () =>
+    (
+      controller as unknown as { adoptedCoderScope: (taskId: string) => string[] }
+    ).adoptedCoderScope(taskId);
+  const adoptedCriteria = current(taskId).criteria;
+  const amend = (criteria: string[]) =>
+    send('AmendTask', taskId, {
+      title: current(taskId).title,
+      outcome: current(taskId).outcome,
+      criteria,
+    });
+  assert.deepEqual(adoptedScope(), ['net.mjs']);
+  assert.equal((await amend(['Changed after adoption.'])).outcome, 'applied');
+  assert.deepEqual(adoptedScope(), []);
+  assert.equal((await amend(adoptedCriteria)).outcome, 'applied');
+  assert.deepEqual(adoptedScope(), ['net.mjs']);
+  // A repository writer leaves eleven run minutes for its check and review. Twelve run minutes
+  // freeze five, twenty-one freeze ten and ten freeze the five-minute floor.
+  const write = nativePreparation.policy.effects.find((grant) => grant.action === 'write-scratch');
+  assert(write);
+  const prepareRepository = async (minutes: number) => {
+    const { targetPath: _file, ...repositoryPreparation } = nativePreparation;
+    const prepared = await send('PrepareNativeRun', taskId, {
+      ...repositoryPreparation,
+      profileId: 'openai-repository-v1',
+      policy: {
+        ...repositoryPreparation.policy,
+        limits: { ...repositoryPreparation.policy.limits, minutes },
+        reserves: [],
+        unknownUsage: { rule: 'fixed-allowance', allowance: { launches: 1, minutes } },
+        effects: [
+          ...repositoryPreparation.policy.effects,
+          { ...write, action: 'run-native-tools' },
+        ],
+      },
+    });
+    assert.equal(prepared.outcome, 'applied', JSON.stringify(prepared));
+    const run = RunSchema.parse(prepared.entity);
+    return {
+      run,
+      frozen: controller.snapshot().nativeRuns.find((value) => value.runId === run.id)
+        ?.maximumTaskMs,
+    };
+  };
+  assert.equal((await prepareRepository(12)).frozen, 300_000);
+  const twentyOne = await prepareRepository(21);
+  assert.equal(twentyOne.frozen, 600_000);
+  // Lowering the task total to 21 minutes with one spent leaves 20. That covers the ten-minute
+  // limit alone and falls short of the eleven minutes behind it.
+  const lowerTotal = async (minutes: number) =>
+    (
+      await send('ConfigureTaskConversation', taskId, {
+        planning: { ...planning, limits: { ...planning.limits, minutes } },
+      })
+    ).outcome;
+  assert.equal(await lowerTotal(21), 'applied');
+  assert.equal(state(taskId).budget?.remaining.minutes, 20);
+  const intentsBeforeRepository = controller.store.intents().length;
+  const repositoryStart = await send('StartRun', taskId, { runId: twentyOne.run.id });
+  assert.equal(repositoryStart.reason, 'run-budget-exhausted');
+  assert.equal(
+    repositoryStart.next,
+    'The task has fewer minutes than the writer limit plus its check. Prepare a run that fits.',
+  );
+  assert.equal(controller.store.intents().length, intentsBeforeRepository);
+  // A five-minute writer needs only its own five minutes. A total of 6 with one spent leaves
+  // exactly five. The writer lease check follows the budget gate, so a held lease shows that
+  // Start passed the gate without launching a process.
+  const ten = await prepareRepository(10);
+  assert.equal(ten.frozen, 300_000);
+  assert.equal(await lowerTotal(6), 'applied');
+  assert.equal(state(taskId).budget?.remaining.minutes, 5);
+  controller.store.db
+    .prepare('INSERT INTO writer_leases(task_id,attempt_id,generation) VALUES (?,?,0)')
+    .run(taskId, ten.run.id);
+  assert.equal((await send('StartRun', taskId, { runId: ten.run.id })).reason, 'writer-lease-held');
+  controller.store.db.prepare('DELETE FROM writer_leases WHERE task_id=?').run(taskId);
+  assert.equal(controller.store.intents().length, intentsBeforeRepository);
+  // One planning minute is spent, so a five-minute allowance leaves four. A native writer frozen
+  // at five minutes refuses Start before any intent. The scripted run below fits in four.
+  const tightPlanning = { ...planning, limits: { ...planning.limits, minutes: 5 } };
+  assert.equal(
+    (await send('ConfigureTaskConversation', taskId, { planning: tightPlanning })).outcome,
+    'applied',
+  );
+  const tightRun = await send('PrepareNativeRun', taskId, {
+    ...nativePreparation,
+    policy: {
+      ...nativePreparation.policy,
+      limits: { ...nativePreparation.policy.limits, minutes: 5 },
+      reserves: [],
+      unknownUsage: { rule: 'fixed-allowance', allowance: { launches: 1, minutes: 5 } },
+    },
+  });
+  assert.equal(tightRun.outcome, 'applied', JSON.stringify(tightRun));
+  const intentsBeforeStart = controller.store.intents().length;
+  assert.equal(
+    (await send('StartRun', taskId, { runId: RunSchema.parse(tightRun.entity).id })).reason,
+    'run-budget-exhausted',
+  );
+  assert.equal(controller.store.intents().length, intentsBeforeStart);
+  const prepared = await send('PrepareRun', taskId, {
+    policy: { ...policy, limits: { ...policy.limits, minutes: 5 } },
+    roles: quickRoles(fixtures),
+  });
+  assert.equal(prepared.outcome, 'applied');
+  const execution = RunSchema.parse(prepared.entity);
+  assert.equal(
+    (await send('ResumeRun', taskId, { runId: proposed.runId })).reason,
+    'run-not-current',
+  );
+  assert.equal(state(taskId).budget?.remaining.attempts, 7);
+  const retainGuidance = async (text: string) => {
+    const before = structuredClone(current(taskId));
+    const snapshot = controller.snapshot();
+    const runs = structuredClone(snapshot.runs);
+    const candidates = structuredClone(snapshot.candidates);
+    const evidence = structuredClone(snapshot.evidence);
+    const allowance = state(taskId).budget;
+    const attempts = controller.store.intents().length;
+    const spawns = children.length;
+    const result = await send('SendTaskMessage', taskId, { text, context: refs });
+    assert.equal(result.outcome, 'applied', JSON.stringify(result));
+    assert.deepEqual({ ...current(taskId), revision: before.revision }, before);
+    assert.deepEqual(controller.snapshot().runs, runs);
+    assert.deepEqual(controller.snapshot().candidates, candidates);
+    assert.deepEqual(controller.snapshot().evidence, evidence);
+    assert.deepEqual(state(taskId).budget, allowance);
+    assert.equal(controller.store.intents().length, attempts);
+    assert.equal(children.length, spawns);
+    assert.equal(state(taskId).send.disposition, 'queue');
+    const entry = controller.store.db
+      .prepare(
+        'SELECT body FROM conversation_entries WHERE task_id=? ORDER BY sequence DESC LIMIT 1',
+      )
+      .get(taskId);
+    const guidance = JSON.parse(entry?.body as string);
+    assert.equal(guidance.kind, 'guidance');
+    assert.equal(guidance.text, text);
+    assert.deepEqual(guidance.context, refs);
+  };
+  await retainGuidance('Keep this prepared run while retaining the question.');
+  const preparedRunId = current(taskId).runId;
+  const reconfigure = await send('ConfigureTaskConversation', taskId, {
+    planning: { ...planning, role: 'orchestrator' },
+  });
+  assert.equal(reconfigure.reason, 'task-not-discussing');
+  assert.equal(current(taskId).runId, preparedRunId);
+  assert.equal(
+    (
+      await send('ConfigureTaskConversation', taskId, {
+        planning: { ...tightPlanning, limits: { ...tightPlanning.limits, attempts: 11 } },
+      })
+    ).outcome,
+    'applied',
+  );
+  assert.equal(current(taskId).runId, preparedRunId);
+  const reviewed = new Promise<void>((done) => {
+    const off = controller.subscribe((event) => {
+      if (event.type === 'review.completed' && event.taskId === taskId) {
+        off();
+        done();
+      }
+    });
+  });
+  await send('StartRun', taskId, { runId: execution.id });
+  await send('SendTaskMessage', taskId, {
+    text: 'Discuss a later revision after this work closes.',
+  });
+  assert.equal(state(taskId).send.disposition, 'queue');
+  await reviewed;
+  const exportCandidate = controller
+    .snapshot()
+    .candidates.find((candidate) => candidate.taskId === taskId);
+  assert(exportCandidate);
+  await send('ExportPatch', taskId, { candidateId: exportCandidate.id });
+  const exportApproval = controller
+    .snapshot()
+    .approvals.find((approval) => approval.taskId === taskId && approval.status === 'pending');
+  assert(exportApproval);
+  assert.equal(state(taskId).activeAttempt, null);
+  assert.equal(state(taskId).send.reason, 'effects-unresolved');
+  const pendingExport = controller.store.db
+    .prepare('SELECT * FROM pending_effects WHERE approval_id=?')
+    .get(exportApproval.approvalId);
+  const exportRevision = current(taskId).revision;
+  for (const name of ['SendTaskMessage', 'QueueTaskGuidance']) {
+    assert.equal(
+      (await send(name, taskId, { text: 'Keep the export approval exact.' })).reason,
+      'effects-unresolved',
+    );
+    assert.equal(current(taskId).revision, exportRevision);
+    assert.deepEqual(
+      controller.store.db
+        .prepare('SELECT * FROM pending_effects WHERE approval_id=?')
+        .get(exportApproval.approvalId),
+      pendingExport,
+    );
+  }
+  assert.equal(
+    (
+      await controller.execute(
+        command(
+          'ResolveApproval',
+          {
+            binding: binding(exportApproval),
+            decision: 'approved',
+          },
+          exportRevision,
+        ),
+        'local-owner',
+      )
+    ).outcome,
+    'applied',
+  );
+  const retainedExecution = structuredClone(controller.store.get('run', execution.id));
+  const retainedCandidates = structuredClone(controller.snapshot().candidates);
+  const retainedEvidence = structuredClone(controller.snapshot().evidence);
+  assert.equal(state(taskId).queuedInputCount, 2);
+  await retainGuidance('Thanks. Keep the checked candidate current.');
+  assert.equal(current(taskId).runId, execution.id);
+  assert.deepEqual(controller.store.get('run', execution.id), retainedExecution);
+  assert.deepEqual(controller.store.get('run', proposed.runId), planningRun);
+  const acceptance = await send('AcceptCandidate', taskId, {
+    candidateId: exportCandidate.id,
+    destinationRef: 'refs/heads/retained-conversation',
+  });
+  assert.equal(acceptance.outcome, 'applied', JSON.stringify(acceptance));
+  const acceptApproval = controller
+    .snapshot()
+    .approvals.find(
+      (approval) =>
+        approval.taskId === taskId &&
+        approval.action === 'accept-candidate' &&
+        approval.status === 'pending',
+    );
+  assert(acceptApproval);
+  assert.equal(
+    (
+      await controller.execute(
+        command(
+          'ResolveApproval',
+          { binding: binding(acceptApproval), decision: 'approved' },
+          current(taskId).revision,
+        ),
+        'local-owner',
+      )
+    ).outcome,
+    'applied',
+  );
+  assert.equal(current(taskId).state, 'accepted');
+  const acceptedHead = refValue(context.source.directory, 'refs/heads/retained-conversation');
+  assert(acceptedHead);
+  await retainGuidance('Keep the accepted result and this follow-up.');
+  assert.equal(current(taskId).state, 'accepted');
+  assert.equal(current(taskId).runId, execution.id);
+  assert.equal(
+    refValue(context.source.directory, 'refs/heads/retained-conversation'),
+    acceptedHead,
+  );
+  assert.equal(
+    (
+      await send('ConfigureTaskConversation', taskId, {
+        planning: { ...planning, role: 'orchestrator' },
+      })
+    ).reason,
+    'task-not-discussing',
+  );
+  assert.equal(
+    (
+      await send('ConfigureTaskConversation', catalogTask.id, {
+        planning: { ...planning, role: 'orchestrator', limits: lowerPlanning.limits },
+      })
+    ).outcome,
+    'applied',
+  );
+  crashAfterIntent = true;
+  const crash = command(
+    'SendTaskMessage',
+    { taskId: catalogTask.id, text: 'Keep the next turn bounded.', context: refs },
+    current(catalogTask.id).revision,
+  );
+  await assert.rejects(
+    controller.execute(crash, 'local-owner'),
+    /Interrupted after durable planning admission/,
+  );
+  const count = controller.store.intents().length;
+  await controller.close();
+  crashAfterIntent = false;
+  reopened = new Controller({ ...options, home: controller.home, now: clock.now, id: context.id });
+  const afterReopen = await reopened.execute(
+    command('GetTaskConversationState', { taskId: catalogTask.id }),
+    'local-owner',
+  );
+  assert.equal(afterReopen.data?.kind, 'conversation-state');
+  if (afterReopen.data?.kind === 'conversation-state')
+    assert.equal(afterReopen.data.state.send.reason, 'ownership-unknown');
+  const reopenedCatalog = await reopened.execute(
+    command('GetTaskConversationState', { taskId: catalogTask.id }),
+    'local-owner',
+  );
+  assert.equal(reopenedCatalog.data?.kind, 'conversation-state');
+  if (reopenedCatalog.data?.kind === 'conversation-state') {
+    assert.equal(reopenedCatalog.data.state.configuration?.selection.modelRequest, undefined);
+    assert.deepEqual(reopenedCatalog.data.state.modelChoices?.observation, selectedObservation);
+  }
+  assert.equal((await reopened.execute(crash, 'local-owner')).outcome, 'already-applied');
+  assert.equal(reopened.store.intents().length, count);
+  const recoveredEntry = reopened.store.db
+    .prepare(
+      "SELECT body FROM conversation_entries WHERE task_id=? AND json_extract(body,'$.text')=?",
+    )
+    .get(catalogTask.id, 'Keep the next turn bounded.');
+  assert.deepEqual(JSON.parse(recoveredEntry?.body as string).context, refs);
+  assert.deepEqual(reopened.snapshot().candidates, retainedCandidates);
+  assert.deepEqual(reopened.snapshot().evidence, retainedEvidence);
+  for (const sentinel of context.source.sentinels) {
+    const path = join(context.source.directory, sentinel.path);
+    assert.equal(createHash('sha256').update(readFileSync(path)).digest('hex'), sentinel.hash);
+    assert.equal(lstatSync(path).mode & 0o777, sentinel.mode);
   }
 });

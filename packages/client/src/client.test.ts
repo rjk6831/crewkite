@@ -10,9 +10,11 @@ import { fileURLToPath } from 'node:url';
 import {
   type Command,
   CommandSchema,
+  type ConversationEntry,
   type Event,
   MAX_FRAME_BYTES,
   type Snapshot,
+  type TaskConversationState,
   type TransportMessage,
 } from '@crewkite/contracts';
 import { checkOwner } from '../../../apps/controller/src/host/check-ownership.ts';
@@ -52,6 +54,7 @@ const snapshot: Snapshot = {
   googleAcpSetup: null,
   nativeRuns: [],
   candidateEvaluations: [],
+  combinedRuns: [],
 };
 
 function rawFrame(value: unknown): Uint8Array {
@@ -217,7 +220,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     serviceTier: 'default',
     qualifiedAt: null,
     creditPolicies: ['ordinary', 'existing-credits'],
-    maximumTaskMs: 300000,
+    maximumTaskMs: 600000,
     maximumSourceFiles: 10000,
     maximumSourceBytes: 67108864,
     maximumSubmissions: 1,
@@ -259,7 +262,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     runId: `run_${suffix}`,
     profileId: profile.id,
     stage: 'prepared' as const,
-    expiresAt: '2026-10-18T00:00:00.000Z',
+    expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
     target: { path: 'docs/providers.md', baseHash: 'b'.repeat(64), bytes: 42 },
   };
   const run: Snapshot['runs'][number] = {
@@ -314,7 +317,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       independence: 'process-only',
     },
     creditPolicy: 'ordinary',
-    expiresAt: '2026-10-18T00:00:00.000Z',
+    expiresAt: nativeRun.expiresAt,
     remainingBudgets: { attempts: 2, minutes: 3, concurrency: 1 },
     allowance: { source: 'supplemental-evaluation', localChecks: 1, nativeReviews: 1 },
     stage: 'prepared',
@@ -345,6 +348,9 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     { recipe: 'project-node-tests-v1', expected: 5000 },
     { recipe: null, expected: 5000 },
     { recipe: 'usage', expected: 30000 },
+    { recipe: 'StartRun', expected: 40000 },
+    { recipe: 'StartRun', timeoutMs: 10000, expected: 10000 },
+    { recipe: 'StartRun', timeoutMs: 50000, expected: 50000 },
     { recipe: 'InitializeGoogleAcp', expected: 15000 },
     { recipe: 'AuthenticateGoogleAcp', expected: 130000 },
     { recipe: 'DiscoverGoogleAcp', expected: 30000 },
@@ -377,51 +383,62 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
                 expectedRevision: 0,
                 payload: { family: 'google' },
               }
-            : row.recipe === 'InitializeGoogleAcp' ||
-                row.recipe === 'AuthenticateGoogleAcp' ||
-                row.recipe === 'DiscoverGoogleAcp' ||
-                row.recipe === 'StopGoogleAcpSetup'
-              ? CommandSchema.parse({
+            : row.recipe === 'StartRun'
+              ? {
                   protocol: 1,
                   key: `cmd_${suffix}`,
                   actor,
-                  command: row.recipe,
-                  expectedRevision: 0,
-                  payload: {
-                    profileId: 'google-acp-v1',
-                    ...(row.recipe === 'StopGoogleAcpSetup'
-                      ? { operationId: `cmd_${suffix}` }
-                      : { consent: 'explicit' }),
-                    ...(['AuthenticateGoogleAcp', 'DiscoverGoogleAcp'].includes(row.recipe)
-                      ? { proofId: artifact.id }
-                      : {}),
-                    ...(row.recipe === 'AuthenticateGoogleAcp' ? { method: 'oauth-personal' } : {}),
-                  },
-                })
-              : {
-                  protocol: 1,
-                  key: `cmd_${suffix}`,
-                  actor,
-                  command: 'PrepareCandidateEvaluation',
+                  command: 'StartRun',
                   expectedRevision: task.revision,
-                  payload: {
-                    taskId: task.id,
-                    candidateId: candidate.id,
-                    ...(row.recipe === 'project-node-tests-v1'
-                      ? { checkRecipeId: row.recipe, testFiles: projectTestFiles }
-                      : { checkRecipeId: row.recipe }),
-                    reviewer: { profileId: profile.id, methodId: 'keep-it-simple', cycles: 1 },
-                    creditPolicy: 'ordinary',
-                    consent: 'explicit',
-                    grants: grants.map((grant) => ({
-                      ...grant,
-                      target:
-                        grant.action === 'run-check' && row.recipe === 'crewkite-verify-v1'
-                          ? 'crewkite verify'
-                          : grant.target,
-                    })),
-                  },
-                };
+                  payload: { taskId: task.id, runId: run.id },
+                }
+              : row.recipe === 'InitializeGoogleAcp' ||
+                  row.recipe === 'AuthenticateGoogleAcp' ||
+                  row.recipe === 'DiscoverGoogleAcp' ||
+                  row.recipe === 'StopGoogleAcpSetup'
+                ? CommandSchema.parse({
+                    protocol: 1,
+                    key: `cmd_${suffix}`,
+                    actor,
+                    command: row.recipe,
+                    expectedRevision: 0,
+                    payload: {
+                      profileId: 'google-acp-v1',
+                      ...(row.recipe === 'StopGoogleAcpSetup'
+                        ? { operationId: `cmd_${suffix}` }
+                        : { consent: 'explicit' }),
+                      ...(['AuthenticateGoogleAcp', 'DiscoverGoogleAcp'].includes(row.recipe)
+                        ? { proofId: artifact.id }
+                        : {}),
+                      ...(row.recipe === 'AuthenticateGoogleAcp'
+                        ? { method: 'oauth-personal' }
+                        : {}),
+                    },
+                  })
+                : {
+                    protocol: 1,
+                    key: `cmd_${suffix}`,
+                    actor,
+                    command: 'PrepareCandidateEvaluation',
+                    expectedRevision: task.revision,
+                    payload: {
+                      taskId: task.id,
+                      candidateId: candidate.id,
+                      ...(row.recipe === 'project-node-tests-v1'
+                        ? { checkRecipeId: row.recipe, testFiles: projectTestFiles }
+                        : { checkRecipeId: row.recipe }),
+                      reviewer: { profileId: profile.id, methodId: 'keep-it-simple', cycles: 1 },
+                      creditPolicy: 'ordinary',
+                      consent: 'explicit',
+                      grants: grants.map((grant) => ({
+                        ...grant,
+                        target:
+                          grant.action === 'run-check' && row.recipe === 'crewkite-verify-v1'
+                            ? 'crewkite verify'
+                            : grant.target,
+                      })),
+                    },
+                  };
       let settled = false;
       const response = client.command(command).then((value) => {
         settled = true;
@@ -555,6 +572,13 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     'missing-operation',
     'wrong-family',
     'prepare',
+    'deadline-five',
+    'deadline-ten',
+    'context-lines',
+    'context-reversed',
+    'context-unsafe',
+    'context-duplicate',
+    'deadline-invalid',
     'saved',
     'model',
     'thought',
@@ -571,7 +595,6 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     id: 'google-usage-v1',
     family: 'google',
     clientVersion: '1.4.0',
-    enabled: true,
     available: true,
     reason: 'available',
     lastAttemptAt: '2026-10-17T10:00:00.000Z',
@@ -595,31 +618,25 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
   const usageCases: Array<{
     name: string;
     args: string[];
-    consent?: boolean;
     invalid?: boolean;
     reason?: string;
   }> = [
     { name: 'show', args: ['usage', 'show'] },
     {
-      name: 'enable',
+      name: 'consent-rejected',
       args: ['usage', 'refresh', '--family', 'google', '--consent'],
-      consent: true,
+      invalid: true,
     },
     { name: 'refresh', args: ['usage', 'refresh', '--family', 'google'] },
     {
-      name: 'disable',
+      name: 'no-consent-rejected',
       args: ['usage', 'refresh', '--family', 'google', '--no-consent'],
-      consent: false,
+      invalid: true,
     },
     {
       name: 'cooldown',
       args: ['usage', 'refresh', '--family', 'google'],
       reason: 'usage-reader-cooldown',
-    },
-    {
-      name: 'off',
-      args: ['usage', 'refresh', '--family', 'google'],
-      reason: 'usage-reader-not-enabled',
     },
     {
       name: 'active',
@@ -648,6 +665,1365 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       invalid: true,
     },
   ];
+
+  const planningSelection = {
+    role: 'lead' as const,
+    profileId: 'openai-file-v1' as const,
+    creditPolicy: 'ordinary' as const,
+    limits: { attempts: 8, minutes: 20, concurrency: 2 },
+    consent: 'explicit' as const,
+  };
+  const modelRequest = {
+    version: 1,
+    observation: { artifactId: `art_${suffix}`, hash: 'd'.repeat(64) },
+    model: 'planning-model-choice',
+    effort: 'native-effort-high',
+  };
+  const modelRequestPath = join(timedFixture.home, 'planning-model-request.json');
+  writeFileSync(modelRequestPath, JSON.stringify(modelRequest));
+  const contextRefs = ['V', 'W', 'X', 'Y'].map((ending, index) => ({
+    artifactId: `art_01ARZ3NDEKTSV4RRFFQ69G5FA${ending}`,
+    hash: (index + 1).toString(16).repeat(64),
+  }));
+  const contextRefsPath = join(timedFixture.home, 'conversation-context-refs.json');
+  writeFileSync(contextRefsPath, JSON.stringify(contextRefs.slice(0, 2)));
+  const emptyContextRefsPath = join(timedFixture.home, 'empty-context-refs.json');
+  writeFileSync(emptyContextRefsPath, '[]');
+  const maximumContextRefsPath = join(timedFixture.home, 'maximum-context-refs.json');
+  writeFileSync(maximumContextRefsPath, JSON.stringify(contextRefs));
+  const invalidContextRefs = [
+    '{',
+    '{}',
+    JSON.stringify([{ artifactId: 'not-an-artifact', hash: '1'.repeat(64) }]),
+    JSON.stringify([{ ...contextRefs[0], hash: 'bad' }]),
+    JSON.stringify([{ ...contextRefs[0], path: '/tmp/source' }]),
+    JSON.stringify([contextRefs[0], { ...contextRefs[1], artifactId: contextRefs[0].artifactId }]),
+    JSON.stringify([contextRefs[0], { ...contextRefs[1], hash: contextRefs[0].hash }]),
+    JSON.stringify([
+      ...contextRefs,
+      { artifactId: 'art_01ARZ3NDEKTSV4RRFFQ69G5FAZ', hash: '5'.repeat(64) },
+    ]),
+    `${JSON.stringify(contextRefs)}${' '.repeat(MAX_FRAME_BYTES)}`,
+  ].map((text, index) => {
+    const path = join(timedFixture.home, `invalid-context-refs-${index}.json`);
+    writeFileSync(path, text);
+    return path;
+  });
+  const invalidModelRequests = [
+    '{',
+    '[]',
+    JSON.stringify({ ...modelRequest, version: 2 }),
+    JSON.stringify({ ...modelRequest, model: 'é'.repeat(101) }),
+    JSON.stringify({ ...modelRequest, effort: 'é'.repeat(17) }),
+    JSON.stringify({ ...modelRequest, observation: { ...modelRequest.observation, hash: 'bad' } }),
+    JSON.stringify({ ...modelRequest, provider: 'arbitrary' }),
+    JSON.stringify({ ...modelRequest, observation: { ...modelRequest.observation, path: '/tmp' } }),
+    `${JSON.stringify(modelRequest)}${' '.repeat(MAX_FRAME_BYTES)}`,
+  ].map((text, index) => {
+    const path = join(timedFixture.home, `invalid-planning-request-${index}.json`);
+    writeFileSync(path, text);
+    return path;
+  });
+  const conversationState: TaskConversationState = {
+    taskId: task.id,
+    revision: task.revision,
+    contractStatus: 'provisional',
+    purpose: 'conversation',
+    phase: 'planned',
+    configuration: {
+      revision: 1,
+      selection: planningSelection,
+      routeId: run.roles[0].routeId,
+      requestedModel: 'requested-model',
+      effectiveModel: null,
+      requestedEffort: 'low',
+      effectiveEffort: null,
+    },
+    currentRunId: run.id,
+    activeAttempt: null,
+    budget: {
+      limits: planningSelection.limits,
+      remaining: { attempts: 6, minutes: 18, concurrency: 2 },
+    },
+    queuedInputCount: 1,
+    pendingQuestions: [{ id: `msg_${suffix}`, cursor: '7' }],
+    proposal: {
+      id: 'msg_01ARZ3NDEKTSV4RRFFQ69G5FAW',
+      hash: 'c'.repeat(64),
+      runId: run.id,
+      revision: 2,
+    },
+    adoptedProposal: null,
+    send: { available: true, reason: 'available', disposition: 'turn' },
+    adopt: { available: true, reason: 'available' },
+    modelChoices: {
+      status: 'last-observed',
+      observation: modelRequest.observation,
+      observedAt: '2026-10-18T01:00:00.000Z',
+      models: [
+        {
+          model: modelRequest.model,
+          efforts: ['low', modelRequest.effort],
+          defaultEffort: 'low',
+        },
+      ],
+      reason: 'available',
+    },
+  };
+  const conversationEntry: ConversationEntry = {
+    id: `msg_${suffix}`,
+    taskId: task.id,
+    revision: 1,
+    cursor: '7',
+    at: '2026-10-17T10:00:00.000Z',
+    text: 'Inspect \u001b[31mthe total\roverwrite',
+    kind: 'user-message',
+    author: { kind: 'user' },
+  };
+  const planningArgs = [
+    '--role',
+    'lead',
+    '--profile',
+    'openai-file-v1',
+    '--credit-policy',
+    'ordinary',
+    '--attempts',
+    '8',
+    '--minutes',
+    '20',
+    '--concurrency',
+    '2',
+    '--consent',
+  ];
+  const conversationRows = [
+    {
+      args: ['create', task.projectId, '--text', 'Repair the total', ...planningArgs],
+      command: 'CreateTaskDiscussion',
+      payload: { projectId: task.projectId, text: 'Repair the total', planning: planningSelection },
+    },
+    {
+      args: [
+        'configure',
+        task.id,
+        ...planningArgs.map((value) =>
+          value === 'lead' ? 'orchestrator' : value === 'ordinary' ? 'existing-credits' : value,
+        ),
+      ],
+      command: 'ConfigureTaskConversation',
+      payload: {
+        taskId: task.id,
+        planning: { ...planningSelection, role: 'orchestrator', creditPolicy: 'existing-credits' },
+      },
+    },
+    {
+      args: ['configure', task.id, ...planningArgs, '--model-request', modelRequestPath],
+      command: 'ConfigureTaskConversation',
+      payload: { taskId: task.id, planning: { ...planningSelection, modelRequest } },
+    },
+    {
+      args: ['send', task.id, '--text', 'Keep this exact message'],
+      command: 'SendTaskMessage',
+      payload: { taskId: task.id, text: 'Keep this exact message' },
+    },
+    {
+      args: [
+        'create',
+        task.projectId,
+        '--text',
+        'Inspect the captured source',
+        ...planningArgs,
+        '--context-refs',
+        contextRefsPath,
+      ],
+      command: 'CreateTaskDiscussion',
+      payload: {
+        projectId: task.projectId,
+        text: 'Inspect the captured source',
+        planning: planningSelection,
+        context: contextRefs.slice(0, 2),
+      },
+    },
+    ...[
+      { action: 'send', command: 'SendTaskMessage' },
+      { action: 'guide', command: 'QueueTaskGuidance' },
+      { action: 'answer', command: 'AnswerTaskQuestion' },
+    ].map(({ action, command }) => ({
+      args: [
+        action,
+        task.id,
+        '--text',
+        'Keep the exact captured refs',
+        ...(action === 'answer' ? ['--question-id', conversationEntry.id] : []),
+        '--context-refs',
+        contextRefsPath,
+      ],
+      command,
+      payload: {
+        taskId: task.id,
+        text: 'Keep the exact captured refs',
+        ...(action === 'answer' ? { questionId: conversationEntry.id } : {}),
+        context: contextRefs.slice(0, 2),
+      },
+    })),
+    ...[
+      { path: emptyContextRefsPath, context: [] },
+      { path: maximumContextRefsPath, context: contextRefs },
+    ].map(({ path, context }) => ({
+      args: ['send', task.id, '--text', 'Preserve explicit refs', '--context-refs', path],
+      command: 'SendTaskMessage',
+      payload: { taskId: task.id, text: 'Preserve explicit refs', context },
+    })),
+    {
+      args: ['guide', task.id, '--text', 'Keep the scope bounded'],
+      command: 'QueueTaskGuidance',
+      payload: { taskId: task.id, text: 'Keep the scope bounded' },
+    },
+    {
+      args: [
+        'answer',
+        task.id,
+        '--question-id',
+        conversationEntry.id,
+        '--text',
+        'The total includes tax',
+      ],
+      command: 'AnswerTaskQuestion',
+      payload: {
+        taskId: task.id,
+        questionId: conversationEntry.id,
+        text: 'The total includes tax',
+      },
+    },
+    {
+      args: [
+        'adopt',
+        task.id,
+        '--proposal-id',
+        conversationState.proposal?.id as string,
+        '--proposal-hash',
+        'c'.repeat(64),
+      ],
+      command: 'AdoptTaskPlan',
+      payload: {
+        taskId: task.id,
+        proposalId: conversationState.proposal?.id,
+        proposalHash: 'c'.repeat(64),
+      },
+    },
+    {
+      args: ['show', task.id, '--before-cursor', '9'],
+      command: 'GetTaskConversation',
+      payload: { taskId: task.id, beforeCursor: '9' },
+    },
+    ...[
+      [
+        'create',
+        task.projectId,
+        '--text',
+        'Goal',
+        ...planningArgs.filter((value) => value !== '--consent'),
+      ],
+      [
+        'create',
+        task.projectId,
+        '--text',
+        'Goal',
+        ...planningArgs.map((value) => (value === 'lead' ? 'coder' : value)),
+      ],
+      [
+        'configure',
+        task.id,
+        ...planningArgs.map((value) => (value === 'openai-file-v1' ? '/tmp/client' : value)),
+      ],
+      ['configure', task.id, ...planningArgs.map((value) => (value === '8' ? '1e2' : value))],
+      ['configure', task.id, ...planningArgs.map((value) => (value === '20' ? '1441' : value))],
+      ['configure', task.id, ...planningArgs, '--text', 'No scope amendment'],
+      ...invalidModelRequests.map((path) => [
+        'configure',
+        task.id,
+        ...planningArgs,
+        '--model-request',
+        path,
+      ]),
+      [
+        'create',
+        task.projectId,
+        '--text',
+        'Goal',
+        ...planningArgs,
+        '--model-request',
+        modelRequestPath,
+      ],
+      ['show', task.id, '--model-request', modelRequestPath],
+      ['send', task.id, '--text', 'No configuration change', '--model-request', modelRequestPath],
+      ['configure', task.id, ...planningArgs, '--model-request'],
+      ['send', task.id, '--text', ' '],
+      ['send', task.id, '--text', 'é'.repeat(2049)],
+      ['send', task.id, '--text', 'No grants', '--grants', 'grant.json'],
+      ...invalidContextRefs.map((path) => [
+        'send',
+        task.id,
+        '--text',
+        'Reject invalid refs',
+        '--context-refs',
+        path,
+      ]),
+      ['show', task.id, '--context-refs', contextRefsPath],
+      ['configure', task.id, ...planningArgs, '--context-refs', contextRefsPath],
+      ['send', task.id, '--text', 'No missing refs file', '--context-refs'],
+      ['send', task.id, '--text', 'No authority', '--consent'],
+      ['answer', task.id, '--text', 'Missing question'],
+      ['answer', task.id, '--question-id', 'not-an-id', '--text', 'Bad question'],
+      ['adopt', task.id, '--proposal-id', conversationEntry.id],
+      ['adopt', task.id, '--proposal-id', conversationEntry.id, '--proposal-hash', 'bad-hash'],
+      ['show', task.id, '--before-cursor', '-1'],
+      ['show', task.id, '--policy', 'policy.json'],
+      ['show', task.id, 'extra'],
+      ['unknown', task.id],
+    ].map((args) => ({ args, command: null, payload: null })),
+  ];
+  const conversationCommands: Command[] = [];
+  let conversationOutcome: 'applied' | 'outcome-unknown' | 'blocked' = 'applied';
+  const conversationFixture = await serve((message, socket) => {
+    if (message.type === 'hello')
+      socket.write(encodeFrame({ type: 'welcome', protocol: 1, cursor: snapshot.cursor }));
+    if (message.type !== 'command') return;
+    const command = message.command;
+    conversationCommands.push(command);
+    const result: import('@crewkite/contracts').CommandResult =
+      command.command === 'GetSnapshot'
+        ? {
+            outcome: 'applied',
+            data: { kind: 'snapshot', snapshot: { ...snapshot, tasks: [task] } },
+          }
+        : command.command === 'GetTaskConversationState'
+          ? { outcome: 'applied', data: { kind: 'conversation-state', state: conversationState } }
+          : command.command === 'GetTaskConversation'
+            ? {
+                outcome: 'applied',
+                data: {
+                  kind: 'conversation',
+                  taskId: task.id,
+                  entries: [conversationEntry],
+                  nextBeforeCursor: '7',
+                },
+              }
+            : {
+                outcome: conversationOutcome,
+                reason: 'queued\u001b[31m\rinput',
+                next: 'Read conversation state.',
+                entity: task,
+              };
+    socket.write(encodeFrame({ type: 'result', key: command.key, result }));
+  });
+  context.after(() => conversationFixture.close());
+  const { runCli } = await import('../../../apps/cli/src/main.ts');
+  const executeConversation = async (args: string[], json = true) => {
+    let output = '',
+      errors = '';
+    const code = await runCli(
+      [...args, ...(json ? ['--json'] : []), '--home', conversationFixture.home],
+      {
+        out: (text) => {
+          output += text;
+        },
+        err: (text) => {
+          errors += text;
+        },
+      },
+    );
+    return { code, output, errors };
+  };
+  for (const args of [
+    ['task', 'show', task.id, '--context-refs', contextRefsPath],
+    ['usage', 'show', '--context-refs', contextRefsPath],
+  ]) {
+    conversationCommands.length = 0;
+    const refused = await executeConversation(args);
+    assert.equal(refused.code, 1, args.join(' '));
+    assert(conversationCommands.every((command) => command.command === 'GetSnapshot'));
+  }
+  for (const row of conversationRows) {
+    conversationCommands.length = 0;
+    const result = await executeConversation(['conversation', ...row.args]);
+    for (const read of conversationCommands.filter((command) => command.command === 'GetSnapshot'))
+      assert.deepEqual(read.payload, { taskId: task.id });
+    if (!row.command) {
+      assert.equal(result.code, 1, row.args.join(' '));
+      assert(
+        conversationCommands.every((command) =>
+          ['GetSnapshot', 'GetTaskConversationState'].includes(command.command),
+        ),
+      );
+      continue;
+    }
+    assert.equal(result.code, 0, result.errors);
+    const command = conversationCommands.at(-1);
+    assert.equal(command?.command, row.command);
+    assert.deepEqual(command?.payload, row.payload);
+    if (row.command === 'GetTaskConversation') {
+      assert.deepEqual(
+        conversationCommands.map((command) => command.command),
+        ['GetSnapshot', 'GetTaskConversationState', 'GetTaskConversation'],
+      );
+      assert.deepEqual(JSON.parse(result.output), {
+        state: conversationState,
+        conversation: {
+          kind: 'conversation',
+          taskId: task.id,
+          entries: [conversationEntry],
+          nextBeforeCursor: '7',
+        },
+      });
+      const plain = await executeConversation(['conversation', ...row.args], false);
+      assert(plain.output.includes('effective model unknown'));
+      assert(plain.output.includes(conversationEntry.id));
+      assert(plain.output.includes('Older page before 7'));
+      assert(plain.output.includes(modelRequest.model));
+      assert(plain.output.includes(modelRequest.effort));
+      assert(plain.output.includes('last-observed'));
+      assert(plain.output.includes(modelRequest.observation.artifactId));
+      assert(plain.output.includes(modelRequest.observation.hash));
+      assert(plain.output.includes(conversationState.modelChoices?.observedAt as string));
+      assert(!plain.output.includes('\u001b'));
+      assert(plain.output.includes('\\u001b'));
+      assert(!plain.output.includes('\r'));
+      assert(plain.output.includes('\\u000d'));
+    } else {
+      assert.equal(
+        command && 'expectedRevision' in command ? command.expectedRevision : null,
+        row.command === 'CreateTaskDiscussion' ? 0 : task.revision,
+      );
+      const receipt = JSON.parse(result.output);
+      assert.deepEqual(receipt.command, command);
+      if (row.command === 'ConfigureTaskConversation')
+        assert.deepEqual(
+          conversationCommands.map((value) => value.command),
+          ['GetSnapshot', 'ConfigureTaskConversation'],
+        );
+      const plain = await executeConversation(['conversation', ...row.args], false);
+      assert(!plain.output.includes('\u001b'));
+      assert(plain.output.includes('\\u001b'));
+      assert(!plain.output.includes('\r'));
+      assert(plain.output.includes('\\u000d'));
+    }
+  }
+  conversationOutcome = 'outcome-unknown';
+  const uncertainConversation = await executeConversation([
+    'conversation',
+    'send',
+    task.id,
+    '--text',
+    'Keep the original key',
+  ]);
+  assert.equal(uncertainConversation.code, 2);
+  const savedConversationReceipt = JSON.parse(uncertainConversation.output);
+  const conversationReceiptPath = join(conversationFixture.home, 'conversation-receipt.json');
+  writeFileSync(conversationReceiptPath, uncertainConversation.output);
+  conversationOutcome = 'applied';
+  const retriedConversation = await executeConversation(['retry', conversationReceiptPath]);
+  assert.equal(retriedConversation.code, 0, retriedConversation.errors);
+  assert.deepEqual(
+    JSON.parse(retriedConversation.output).command,
+    savedConversationReceipt.command,
+  );
+  assert.deepEqual(conversationCommands.at(-1), savedConversationReceipt.command);
+  conversationOutcome = 'outcome-unknown';
+  const uncertainModelRequest = await executeConversation([
+    'conversation',
+    'configure',
+    task.id,
+    ...planningArgs,
+    '--model-request',
+    modelRequestPath,
+  ]);
+  assert.equal(uncertainModelRequest.code, 2, uncertainModelRequest.errors);
+  const savedModelRequest = JSON.parse(uncertainModelRequest.output);
+  assert.deepEqual(savedModelRequest.command.payload.planning.modelRequest, modelRequest);
+  const modelReceiptPath = join(conversationFixture.home, 'model-request-receipt.json');
+  writeFileSync(modelReceiptPath, uncertainModelRequest.output);
+  writeFileSync(modelRequestPath, '{');
+  conversationOutcome = 'applied';
+  const retriedModelRequest = await executeConversation(['retry', modelReceiptPath]);
+  assert.equal(retriedModelRequest.code, 0, retriedModelRequest.errors);
+  assert.deepEqual(JSON.parse(retriedModelRequest.output).command, savedModelRequest.command);
+  assert.deepEqual(conversationCommands.at(-1), savedModelRequest.command);
+  writeFileSync(modelRequestPath, JSON.stringify(modelRequest));
+  conversationOutcome = 'outcome-unknown';
+  const uncertainContext = await executeConversation([
+    'conversation',
+    'send',
+    task.id,
+    '--text',
+    'Keep refs on exact retry',
+    '--context-refs',
+    contextRefsPath,
+  ]);
+  assert.equal(uncertainContext.code, 2, uncertainContext.errors);
+  const savedContextReceipt = JSON.parse(uncertainContext.output);
+  assert.deepEqual(savedContextReceipt.command.payload.context, contextRefs.slice(0, 2));
+  const contextReceiptPath = join(conversationFixture.home, 'context-refs-receipt.json');
+  writeFileSync(contextReceiptPath, uncertainContext.output);
+  writeFileSync(contextRefsPath, '[]');
+  conversationOutcome = 'applied';
+  const retriedContext = await executeConversation(['retry', contextReceiptPath]);
+  assert.equal(retriedContext.code, 0, retriedContext.errors);
+  assert.deepEqual(JSON.parse(retriedContext.output).command, savedContextReceipt.command);
+  assert.deepEqual(conversationCommands.at(-1), savedContextReceipt.command);
+  writeFileSync(contextRefsPath, JSON.stringify(contextRefs.slice(0, 2)));
+  conversationOutcome = 'blocked';
+  const refusedConversation = await executeConversation([
+    'conversation',
+    'guide',
+    task.id,
+    '--text',
+    'No new authority',
+  ]);
+  assert.equal(refusedConversation.code, 2);
+  assert.equal(JSON.parse(refusedConversation.output).result.outcome, 'blocked');
+
+  let lifecycleTask: import('@crewkite/contracts').Task = { ...task };
+  let lifecycleOutcome: 'applied' | 'outcome-unknown' | 'blocked' = 'applied';
+  const lifecycleCommands: Command[] = [];
+  const lifecycleFixture = await serve((message, socket) => {
+    if (message.type === 'hello')
+      socket.write(encodeFrame({ type: 'welcome', protocol: 1, cursor: snapshot.cursor }));
+    if (message.type !== 'command') return;
+    lifecycleCommands.push(message.command);
+    const result =
+      message.command.command === 'GetSnapshot'
+        ? {
+            outcome: 'applied' as const,
+            data: {
+              kind: 'snapshot' as const,
+              snapshot: {
+                ...snapshot,
+                tasks: [lifecycleTask],
+                runs: lifecycleTask.runId ? [run] : [],
+              },
+            },
+          }
+        : { outcome: lifecycleOutcome, reason: 'task-not-amendable', entity: lifecycleTask };
+    socket.write(encodeFrame({ type: 'result', key: message.command.key, result }));
+  });
+  context.after(() => lifecycleFixture.close());
+  const executeLifecycle = async (args: string[]) => {
+    let output = '',
+      errors = '';
+    const code = await runCli([...args, '--json', '--home', lifecycleFixture.home], {
+      out: (text) => {
+        output += text;
+      },
+      err: (text) => {
+        errors += text;
+      },
+    });
+    return { code, output, errors };
+  };
+  const amendment = {
+    taskId: task.id,
+    title: 'Refine the saved task',
+    outcome: 'Keep the corrected contract on this task',
+    criteria: ['The same task ID is retained', 'Existing authority is revalidated'],
+  };
+  const amendArgs = [
+    'task',
+    'amend',
+    task.id,
+    '--title',
+    amendment.title,
+    '--outcome',
+    amendment.outcome,
+    ...amendment.criteria.flatMap((value) => ['--criterion', value]),
+  ];
+  for (const row of [
+    { args: amendArgs, command: 'AmendTask', payload: amendment, prepared: false },
+    {
+      args: ['task', 'pause', task.id],
+      command: 'PauseAdmissions',
+      payload: { taskId: task.id, runId: run.id },
+      prepared: true,
+    },
+  ]) {
+    lifecycleTask = { ...task, ...(row.prepared ? { runId: run.id } : {}) };
+    lifecycleCommands.length = 0;
+    const result = await executeLifecycle(row.args);
+    assert.equal(result.code, 0, result.errors);
+    const command = lifecycleCommands.at(-1);
+    assert.equal(command?.command, row.command);
+    assert.deepEqual(command?.payload, row.payload);
+    assert.equal(
+      command && 'expectedRevision' in command ? command.expectedRevision : null,
+      task.revision,
+    );
+    assert.deepEqual(
+      lifecycleCommands.map((value) => value.command),
+      ['GetSnapshot', row.command],
+    );
+  }
+  for (const args of [
+    ['task', 'amend', task.id, '--outcome', 'Missing title', '--criterion', 'Claim'],
+    ['task', 'amend', task.id, '--title', 'Missing outcome', '--criterion', 'Claim'],
+    ['task', 'amend', task.id, '--title', 'Missing criterion', '--outcome', 'Outcome'],
+    ['task', 'amend', task.id, '--title', 'Title', '--outcome', 'Outcome', '--criterion', ' '],
+    [...amendArgs, 'extra'],
+    [...amendArgs, '--policy', 'no-new-authority.json'],
+    ['task', 'pause', task.id, 'extra'],
+    ['task', 'pause', task.id, '--criterion', 'No contract amendment'],
+  ]) {
+    lifecycleCommands.length = 0;
+    const result = await executeLifecycle(args);
+    assert.equal(result.code, 1, args.join(' '));
+    assert(lifecycleCommands.every((command) => command.command === 'GetSnapshot'));
+  }
+  lifecycleTask = { ...task };
+  lifecycleCommands.length = 0;
+  const unpreparedPause = await executeLifecycle(['task', 'pause', task.id]);
+  assert.equal(unpreparedPause.code, 1);
+  assert(lifecycleCommands.every((command) => command.command === 'GetSnapshot'));
+  lifecycleOutcome = 'blocked';
+  const blockedAmend = await executeLifecycle(amendArgs);
+  assert.equal(blockedAmend.code, 2);
+  assert.equal(JSON.parse(blockedAmend.output).result.reason, 'task-not-amendable');
+  lifecycleTask = { ...task, runId: run.id };
+  lifecycleOutcome = 'outcome-unknown';
+  const uncertainPause = await executeLifecycle(['task', 'pause', task.id]);
+  assert.equal(uncertainPause.code, 2, uncertainPause.errors);
+  const savedPause = JSON.parse(uncertainPause.output);
+  const pauseReceiptPath = join(lifecycleFixture.home, 'pause-receipt.json');
+  writeFileSync(pauseReceiptPath, uncertainPause.output);
+  lifecycleTask = { ...lifecycleTask, revision: task.revision + 1 };
+  lifecycleOutcome = 'applied';
+  const retriedPause = await executeLifecycle(['retry', pauseReceiptPath]);
+  assert.equal(retriedPause.code, 0, retriedPause.errors);
+  assert.deepEqual(JSON.parse(retriedPause.output).command, savedPause.command);
+  assert.deepEqual(lifecycleCommands.at(-1), savedPause.command);
+
+  const localBinding: NonNullable<Snapshot['nativeRuns'][number]['localModel']> = {
+    version: 2,
+    identityKind: 'runtime-metadata',
+    connectorId: 'local-sdk-v1',
+    connectionRevision: 2,
+    connectionHash: '2'.repeat(64),
+    setupHash: '1'.repeat(64),
+    runtimeVersion: 'fixture',
+    runtimeBuild: 1,
+    modelKey: 'loaded-model',
+    instanceReference: 'loaded-instance',
+    modelSizeBytes: 17,
+    format: 'gguf',
+    metadataHash: '3'.repeat(64),
+  };
+  const localProfile: Snapshot['nativeProfiles'][number] = {
+    id: 'local-file-v1',
+    family: 'local',
+    displayName: 'Local file proposal',
+    sdkVersion: '2.1.0',
+    model: localBinding.modelKey,
+    modelBinding: localBinding,
+    billing: 'local',
+    contextLength: 8192,
+    maximumOutputTokens: 2048,
+    qualifiedAt: null,
+    maximumTaskMs: 300000,
+    maximumFileBytes: 65536,
+    maximumSubmissions: 1,
+    available: true,
+    reason: 'qualification-pending',
+  };
+  const combinedId = (prefix: string, index = 0) =>
+    `${prefix}_${suffix.slice(0, -1)}${['V', 'W', 'X', 'Y'][index]}`;
+  const combinedPlan = {
+    taskId: task.id,
+    policy: { ...policy, limits: { attempts: 7, minutes: 20, concurrency: 2 } },
+    children: [1, 2].map((index) => ({
+      taskId: combinedId('tsk', index),
+      expectedRevision: index + 6,
+      scope: [`slice-${index}.mjs`],
+      writer: { profileId: 'openai-file-v1', creditPolicy: 'ordinary' },
+      consent: 'explicit',
+      maximumMinutes: 2,
+    })),
+    checks: {
+      recipeId: 'project-node-tests-v1',
+      testFiles: ['one.test.mjs', 'two.test.mjs', 'interaction.test.mjs'],
+      replayTestFiles: [['one.test.mjs'], ['two.test.mjs']],
+      interactionTestFiles: ['interaction.test.mjs'],
+      maximumMinutes: 1,
+      baselineConsent: 'explicit',
+      replayConsents: ['explicit', 'explicit'],
+    },
+    reviewer: { profileId: 'openai-file-v1', creditPolicy: 'ordinary', maximumMinutes: 2 },
+  };
+  const available = { available: true, reason: 'available' as const };
+  const unavailable = { available: false, reason: 'checks-required' as const };
+  const combinedPreview: Snapshot['combinedRuns'][number] = {
+    taskId: task.id,
+    runId: run.id,
+    preparationId: artifact.id,
+    manifestHash: 'e'.repeat(64),
+    revision: 4,
+    generation: 0,
+    evaluationSelection: {
+      recipeId: 'project-node-tests-v1',
+      testFiles: combinedPlan.checks.testFiles,
+      reviewer: { profileId: 'openai-file-v1', methodId: 'keep-it-simple', cycles: 1 },
+      creditPolicy: 'ordinary',
+    },
+    members: [1, 2].map((index) => ({
+      taskId: combinedId('tsk', index),
+      runId: combinedId('run', index),
+      scope: [`slice-${index}.mjs`],
+      start: unavailable,
+    })) as Snapshot['combinedRuns'][number]['members'],
+    phase: 'writers',
+    blocker: null,
+    dispatches: [
+      'baseline',
+      'writer-0',
+      'writer-1',
+      'replay-0',
+      'replay-1',
+      'final-check',
+      'review',
+    ].map((phase, index) => ({
+      phase,
+      maximumMinutes: 1,
+      state: index < 3 ? 'passed' : 'reserved',
+      attemptId: index < 3 ? combinedId('att', index) : null,
+      checkArtifactId: index === 0 ? artifact.id : null,
+    })) as Snapshot['combinedRuns'][number]['dispatches'],
+    candidate: null,
+    remainingBudgets: { attempts: 4, minutes: 17, concurrency: 2 },
+    start: unavailable,
+    assemble: available,
+    evaluate: unavailable,
+    review: unavailable,
+    accept: unavailable,
+  };
+  let combinedGroup: typeof combinedPreview | null = combinedPreview;
+  let combinedRevision = task.revision;
+  let combinedState: Snapshot['tasks'][number]['state'] = task.state;
+  let combinedCandidates: Snapshot['candidates'] = [];
+  let combinedOutcome: 'applied' | 'blocked' | 'outcome-unknown' = 'applied';
+  const combinedCommands: Command[] = [];
+  const combinedFixture = await serve((message, socket) => {
+    if (message.type === 'hello')
+      socket.write(encodeFrame({ type: 'welcome', protocol: 1, cursor: snapshot.cursor }));
+    if (message.type !== 'command') return;
+    combinedCommands.push(message.command);
+    const refs = [0, 1, 2];
+    const result =
+      message.command.command === 'GetSnapshot'
+        ? {
+            outcome: 'applied' as const,
+            data: {
+              kind: 'snapshot' as const,
+              snapshot: {
+                ...snapshot,
+                tasks: refs.map((index) => ({
+                  ...task,
+                  id: combinedId('tsk', index),
+                  revision:
+                    index === 0
+                      ? combinedRevision
+                      : combinedPlan.children[index - 1].expectedRevision,
+                  runId: combinedId('run', index),
+                  state: index === 0 ? combinedState : task.state,
+                })),
+                runs: refs.map((index) => ({
+                  ...run,
+                  id: combinedId('run', index),
+                  taskId: combinedId('tsk', index),
+                })),
+                attempts: refs.map((index) => ({
+                  id: combinedId('att', index),
+                  runId: combinedId('run', index),
+                  routeId: run.roles[0].routeId,
+                  generation: 0,
+                  state: 'stopped' as const,
+                  revision: 1,
+                })),
+                artifacts: [artifact],
+                candidates: combinedCandidates,
+                nativeProfiles: [{ ...profile, creditPolicies: [...profile.creditPolicies] }],
+                combinedRuns: combinedGroup ? [combinedGroup] : [],
+              },
+            },
+          }
+        : { outcome: combinedOutcome, reason: 'combined-result' };
+    socket.write(encodeFrame({ type: 'result', key: message.command.key, result }));
+  });
+  context.after(() => combinedFixture.close());
+  const combinedPlanFile = join(combinedFixture.home, 'combined-plan.json');
+  const executeCombined = async (args: string[], json = true) => {
+    combinedCommands.length = 0;
+    let output = '',
+      errors = '';
+    const code = await runCli(
+      [...args, ...(json ? ['--json'] : []), '--home', combinedFixture.home],
+      {
+        out: (text) => {
+          output += text;
+        },
+        err: (text) => {
+          errors += text;
+        },
+      },
+    );
+    return { code, output, errors };
+  };
+  for (const row of [
+    { action: 'prepare', command: 'PrepareCombinedRun', payload: combinedPlan },
+    {
+      action: 'assemble',
+      command: 'AssembleCombinedCandidate',
+      payload: { taskId: task.id, runId: run.id, preparationId: artifact.id },
+    },
+  ]) {
+    writeFileSync(combinedPlanFile, JSON.stringify(combinedPlan));
+    combinedOutcome = 'outcome-unknown';
+    const result = await executeCombined([
+      'combined',
+      row.action,
+      task.id,
+      ...(row.action === 'prepare' ? ['--plan', combinedPlanFile] : []),
+    ]);
+    assert.equal(result.code, 2, result.errors);
+    const saved = JSON.parse(result.output);
+    assert.deepEqual(
+      combinedCommands.map((command) => command.command),
+      ['GetSnapshot', row.command],
+    );
+    assert.equal(saved.command.expectedRevision, combinedRevision);
+    assert.deepEqual(saved.command.payload, row.payload);
+    const receiptFile = join(combinedFixture.home, `${row.action}-receipt.json`);
+    writeFileSync(receiptFile, result.output);
+    combinedRevision++;
+    combinedOutcome = 'applied';
+    const retry = await executeCombined(['retry', receiptFile]);
+    assert.equal(retry.code, 0, retry.errors);
+    assert.deepEqual(combinedCommands, [saved.command]);
+    assert.deepEqual(JSON.parse(retry.output).command, saved.command);
+  }
+  const combinedStatus = await executeCombined(['combined', 'status', task.id]);
+  assert.equal(combinedStatus.code, 0, combinedStatus.errors);
+  assert.deepEqual(JSON.parse(combinedStatus.output), {
+    cursor: snapshot.cursor,
+    combined: combinedPreview,
+  });
+  assert.deepEqual(
+    combinedCommands.map((command) => command.command),
+    ['GetSnapshot'],
+  );
+  const plainCombined = await executeCombined(['combined', 'status', task.id], false);
+  for (const fact of ['writers', 'slice-1.mjs', '4 attempts', 'assemble: available'])
+    assert(plainCombined.output.includes(fact), fact);
+  const completedCombined: typeof combinedPreview = {
+    ...combinedPreview,
+    phase: 'awaiting-evaluation',
+    candidate: { id: candidate.id, hash: candidate.hash },
+    evaluate: available,
+  };
+  const combinedGrantsFile = join(combinedFixture.home, 'grants.json');
+  writeFileSync(combinedGrantsFile, JSON.stringify(grants));
+  const combinedEvaluationArgs = [
+    'task',
+    'prepare-evaluation',
+    task.id,
+    profile.id,
+    '--grants',
+    combinedGrantsFile,
+    '--recipe',
+    'project-node-tests-v1',
+    ...combinedPlan.checks.testFiles.flatMap((path) => ['--test-file', path]),
+    '--native-trust',
+    '--source-consent',
+  ];
+  combinedGroup = completedCombined;
+  combinedState = 'stopped';
+  combinedCandidates = [candidate];
+  const combinedEvaluation = await executeCombined(combinedEvaluationArgs);
+  assert.equal(combinedEvaluation.code, 0, combinedEvaluation.errors);
+  assert.deepEqual(
+    combinedCommands.map((command) => command.command),
+    ['GetSnapshot', 'PrepareCandidateEvaluation'],
+  );
+  const combinedEvaluationCommand = JSON.parse(combinedEvaluation.output).command;
+  assert.equal(combinedEvaluationCommand.expectedRevision, combinedRevision);
+  assert.deepEqual(combinedEvaluationCommand.payload, {
+    taskId: task.id,
+    candidateId: candidate.id,
+    checkRecipeId: 'project-node-tests-v1',
+    testFiles: combinedPlan.checks.testFiles,
+    reviewer: completedCombined.evaluationSelection.reviewer,
+    creditPolicy: 'ordinary',
+    consent: 'explicit',
+    grants,
+  });
+  for (const row of [
+    { group: null },
+    { group: { ...completedCombined, phase: 'writers' as const } },
+    { group: { ...completedCombined, evaluate: unavailable } },
+    { candidates: [candidate, { ...candidate, id: combinedId('cnd', 3) }] },
+    { state: 'running' as const },
+    { group: null, candidates: [] },
+    {
+      args: combinedEvaluationArgs.map((value) =>
+        value === task.id ? combinedId('tsk', 1) : value,
+      ),
+    },
+    { args: [...combinedEvaluationArgs, '--existing-credits'] },
+    {
+      args: [
+        ...combinedEvaluationArgs.slice(0, 6),
+        '--recipe',
+        'node-tests-v1',
+        '--native-trust',
+        '--source-consent',
+      ],
+    },
+    {
+      args: [
+        ...combinedEvaluationArgs.slice(0, 8),
+        ...combinedPlan.checks.testFiles.toReversed().flatMap((path) => ['--test-file', path]),
+      ],
+    },
+  ]) {
+    combinedGroup = 'group' in row ? (row.group ?? null) : completedCombined;
+    combinedState = row.state ?? 'stopped';
+    combinedCandidates = row.candidates ?? [candidate];
+    const result = await executeCombined(row.args ?? combinedEvaluationArgs);
+    assert.equal(result.code, 1, JSON.stringify(row));
+    assert.deepEqual(
+      combinedCommands.map((command) => command.command),
+      ['GetSnapshot'],
+    );
+  }
+  combinedGroup = combinedPreview;
+  combinedState = task.state;
+  combinedCandidates = [];
+  for (const invalid of [
+    { ...combinedPlan, taskId: combinedId('tsk', 1) },
+    { ...combinedPlan, children: combinedPlan.children.slice(0, 1) },
+    { ...combinedPlan, children: [combinedPlan.children[0], combinedPlan.children[0]] },
+    {
+      ...combinedPlan,
+      policy: { ...combinedPlan.policy, limits: { attempts: 6, minutes: 20, concurrency: 2 } },
+    },
+    {
+      ...combinedPlan,
+      children: combinedPlan.children.map((child) => ({
+        ...child,
+        writer: { ...child.writer, executable: '/caller/process' },
+      })),
+    },
+    { ...combinedPlan, checks: { ...combinedPlan.checks, baselineConsent: 'saved' } },
+    { ...combinedPlan, patches: ['caller patch'] },
+  ]) {
+    writeFileSync(combinedPlanFile, JSON.stringify(invalid));
+    assert.equal(
+      (await executeCombined(['combined', 'prepare', task.id, '--plan', combinedPlanFile])).code,
+      1,
+    );
+    assert.deepEqual(combinedCommands, []);
+  }
+  for (const args of [
+    ['combined', 'prepare', task.id],
+    ['combined', 'status', task.id, '--plan', combinedPlanFile],
+    ['combined', 'assemble', task.id, '--consent'],
+    ['combined', 'status', task.id, 'extra'],
+    ['combined', 'unknown', task.id],
+    ['task', 'show', task.id, '--plan', combinedPlanFile],
+  ]) {
+    assert.equal((await executeCombined(args)).code, 1, args.join(' '));
+    assert.deepEqual(combinedCommands, []);
+  }
+  combinedGroup = { ...combinedPreview, assemble: unavailable };
+  assert.equal((await executeCombined(['combined', 'assemble', task.id])).code, 1);
+  assert.deepEqual(
+    combinedCommands.map((command) => command.command),
+    ['GetSnapshot'],
+  );
+  combinedGroup = null;
+  assert.equal(
+    JSON.parse((await executeCombined(['combined', 'status', task.id])).output).combined,
+    null,
+  );
+
+  const localChoice = {
+    selectionId: '4'.repeat(64),
+    identity: {
+      modelKey: localBinding.modelKey,
+      displayName: 'Loaded model',
+      format: 'gguf',
+      sizeBytes: 17,
+      quantization: null,
+      selectedVariant: null,
+      metadataHash: localBinding.metadataHash,
+    },
+    instanceReference: localBinding.instanceReference,
+    contextLength: 8192,
+    state: 'loaded-eligible' as const,
+    reasons: [],
+    qualification: 'unqualified' as const,
+  };
+  let localSetup: Snapshot['localSetup'] = {
+    revision: 7,
+    connectionRevision: 2,
+    connectorId: 'local-sdk-v1',
+    endpoint: 'ws://127.0.0.1:1234',
+    setupHash: localBinding.setupHash,
+    connectionHash: localBinding.connectionHash,
+    secretConfigured: true,
+    operation: { kind: 'input', state: 'owned', operationId: `cmd_${suffix}` },
+    generation: 'idle',
+    observation: {
+      version: 1,
+      runtime: { connectorId: 'local-sdk-v1', version: 'fixture', build: 1 },
+      observationHash: '5'.repeat(64),
+      residentLlms: 1,
+      embeddingInstances: 0,
+      models: [
+        localChoice,
+        {
+          ...localChoice,
+          selectionId: '6'.repeat(64),
+          identity: {
+            ...localChoice.identity,
+            modelKey: 'installed-model',
+            displayName: 'Installed model',
+            metadataHash: '7'.repeat(64),
+          },
+          instanceReference: null,
+          contextLength: null,
+          state: 'installed-unloaded',
+        },
+        {
+          ...localChoice,
+          selectionId: '8'.repeat(64),
+          identity: {
+            ...localChoice.identity,
+            modelKey: 'unsupported-model',
+            displayName: 'Unsupported model',
+            format: 'unknown-format',
+            metadataHash: '9'.repeat(64),
+          },
+          instanceReference: null,
+          contextLength: null,
+          state: 'incompatible',
+          reasons: ['unsupported-format'],
+        },
+      ],
+    },
+    selection: { selectionId: localChoice.selectionId, observationHash: '5'.repeat(64) },
+    reason: 'qualification-pending',
+  };
+  let localNativeRun: Snapshot['nativeRuns'][number] = {
+    ...nativeRun,
+    profileId: localProfile.id,
+    localModel: localBinding,
+  };
+  let localOutcome: 'applied' | 'outcome-unknown' | 'blocked' = 'applied';
+  const localCommands: Command[] = [];
+  const localFixture = await serve((message, socket) => {
+    if (message.type === 'hello') {
+      socket.write(encodeFrame({ type: 'welcome', protocol: 1, cursor: snapshot.cursor }));
+      return;
+    }
+    if (message.type !== 'command') return;
+    localCommands.push(message.command);
+    const result =
+      message.command.command === 'GetSnapshot'
+        ? {
+            outcome: 'applied' as const,
+            data: {
+              kind: 'snapshot' as const,
+              snapshot: {
+                ...snapshot,
+                localSetup,
+                tasks: [{ ...task, runId: run.id }],
+                runs: [run],
+                nativeProfiles: [localProfile],
+                nativeRuns: [localNativeRun],
+              },
+            },
+          }
+        : {
+            outcome: localOutcome,
+            reason: 'local-result\u001b[31m\rretained',
+            next: 'Read Local status.',
+          };
+    socket.write(encodeFrame({ type: 'result', key: message.command.key, result }));
+  });
+  context.after(() => localFixture.close());
+  const localPolicyFile = join(localFixture.home, 'policy.json');
+  writeFileSync(localPolicyFile, JSON.stringify(policy));
+  const executeLocal = async (args: string[], json = true) => {
+    localCommands.length = 0;
+    const child = spawn(
+      process.execPath,
+      [
+        fileURLToPath(new URL('../../../apps/cli/src/main.ts', import.meta.url)),
+        ...args,
+        ...(json ? ['--json'] : []),
+        '--home',
+        localFixture.home,
+      ],
+      { stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    let output = '',
+      errors = '';
+    child.stdout.on('data', (bytes) => {
+      output += bytes;
+    });
+    child.stderr.on('data', (bytes) => {
+      errors += bytes;
+    });
+    const [code] = await once(child, 'close');
+    return { code, output, errors };
+  };
+  for (const row of [
+    {
+      args: ['local', 'configure', '--endpoint', 'ws://127.0.0.1:1234'],
+      command: 'ConfigureLocal',
+      payload: { endpoint: 'ws://127.0.0.1:1234' },
+    },
+    ...(['token', 'none'] as const).map((authMode) => ({
+      args: [
+        'local',
+        'configure',
+        '--endpoint',
+        'ws://127.0.0.1:1234',
+        '--authentication',
+        authMode,
+      ],
+      command: 'ConfigureLocal',
+      payload: { endpoint: 'ws://127.0.0.1:1234', authMode },
+    })),
+    {
+      args: ['local', 'connect', '--consent'],
+      command: 'BeginLocalConnectionInput',
+      payload: { consent: 'explicit' },
+    },
+    {
+      args: ['local', 'cancel-input', `cmd_${suffix}`],
+      command: 'CancelLocalConnectionInput',
+      payload: { operationId: `cmd_${suffix}` },
+    },
+    {
+      args: ['local', 'refresh-models', '--consent'],
+      command: 'RefreshLocalModels',
+      payload: { consent: 'explicit' },
+    },
+    {
+      args: [
+        'local',
+        'select-model',
+        localChoice.selectionId,
+        '--observation-hash',
+        '5'.repeat(64),
+      ],
+      command: 'SelectLocalModel',
+      payload: { selectionId: localChoice.selectionId, observationHash: '5'.repeat(64) },
+    },
+    {
+      args: ['local', 'select-model', '6'.repeat(64), '--observation-hash', '5'.repeat(64)],
+      command: 'SelectLocalModel',
+      payload: { selectionId: '6'.repeat(64), observationHash: '5'.repeat(64) },
+    },
+    { args: ['local', 'disconnect'], command: 'DisconnectLocal', payload: {} },
+  ]) {
+    const result = await executeLocal(row.args);
+    assert.equal(result.code, 0, result.errors);
+    const receipt = JSON.parse(result.output);
+    assert.deepEqual(
+      localCommands.map((command) => command.command),
+      ['GetSnapshot', row.command],
+    );
+    assert.equal(receipt.command.expectedRevision, 7);
+    assert.deepEqual(receipt.command.payload, row.payload);
+    assert.deepEqual(receipt.command, localCommands.at(-1));
+  }
+  const localStatus = await executeLocal(['local', 'status']);
+  assert.equal(localStatus.code, 0, localStatus.errors);
+  assert.deepEqual(JSON.parse(localStatus.output), {
+    cursor: snapshot.cursor,
+    setup: localSetup,
+    profile: localProfile,
+  });
+  assert.deepEqual(
+    localCommands.map((command) => command.command),
+    ['GetSnapshot'],
+  );
+  const plainLocalStatus = await executeLocal(['local', 'status'], false);
+  for (const fact of [
+    'installed-unloaded',
+    'loaded-eligible',
+    'incompatible',
+    'unqualified',
+    '5'.repeat(64),
+  ])
+    assert(plainLocalStatus.output.includes(fact));
+  const tokenSetup = localSetup;
+  localSetup = {
+    ...localSetup,
+    authMode: 'none',
+    connected: true,
+    secretConfigured: false,
+    operation: null,
+  };
+  const noAuthStatus = await executeLocal(['local', 'status'], false);
+  assert.equal(noAuthStatus.code, 0, noAuthStatus.errors);
+  assert(noAuthStatus.output.includes('Authentication No authentication, this device only'));
+  assert(noAuthStatus.output.includes('Connection connected'));
+  assert.deepEqual(
+    localCommands.map((command) => command.command),
+    ['GetSnapshot'],
+  );
+  localSetup = tokenSetup;
+  for (const args of [
+    ['local', 'connect'],
+    ['local', 'configure', '--endpoint', 'ws://127.0.0.1:1234', '--authentication', 'automatic'],
+    ['local', 'connect', '--consent', '--authentication', 'none'],
+    ['health', '--authentication', 'none'],
+    ['local', 'refresh-models'],
+    ['local', 'cancel-input'],
+    ['local', 'configure', '--endpoint', 'ws://localhost:1234'],
+    ['local', 'configure', '--setup-receipt', 'unused.json'],
+    ['local', 'connect', '--consent', '--token', 'synthetic-local-secret'],
+    ['local', 'connect', '--consent', '--helper-path', '/synthetic/helper'],
+    ['local', 'select-model', '/synthetic/model', '--observation-hash', '5'.repeat(64)],
+    ['local', 'disconnect', '--consent'],
+  ]) {
+    const result = await executeLocal(args);
+    assert.equal(result.code, 1, args.join(' '));
+    assert.deepEqual(localCommands, []);
+  }
+  for (const args of [
+    ['local', 'select-model', localChoice.selectionId, '--observation-hash', 'f'.repeat(64)],
+    ['local', 'select-model', 'f'.repeat(64), '--observation-hash', '5'.repeat(64)],
+    ['local', 'cancel-input', 'cmd_01ARZ3NDEKTSV4RRFFQ69G5FAW'],
+  ]) {
+    assert.equal((await executeLocal(args)).code, 1);
+    assert.deepEqual(
+      localCommands.map((command) => command.command),
+      ['GetSnapshot'],
+    );
+  }
+  const configuredLocal = localSetup;
+  localSetup = {
+    ...configuredLocal,
+    operation: { kind: 'discovery', state: 'owned', operationId: `cmd_${suffix}` },
+  };
+  assert.equal((await executeLocal(['local', 'cancel-input', `cmd_${suffix}`])).code, 1);
+  assert.deepEqual(
+    localCommands.map((command) => command.command),
+    ['GetSnapshot'],
+  );
+  localSetup = configuredLocal;
+  localOutcome = 'outcome-unknown';
+  const uncertainLocal = await executeLocal(['local', 'disconnect']);
+  assert.equal(uncertainLocal.code, 2);
+  const localReceipt = JSON.parse(uncertainLocal.output);
+  const localReceiptFile = join(localFixture.home, 'local-receipt.json');
+  writeFileSync(localReceiptFile, uncertainLocal.output);
+  localSetup = { ...configuredLocal, revision: 8 };
+  localOutcome = 'applied';
+  const localRetry = await executeLocal(['retry', localReceiptFile]);
+  assert.equal(localRetry.code, 0, localRetry.errors);
+  assert.deepEqual(localCommands, [localReceipt.command]);
+  assert.deepEqual(JSON.parse(localRetry.output).command, localReceipt.command);
+  localOutcome = 'blocked';
+  const plainLocalRefusal = await executeLocal(['local', 'disconnect'], false);
+  assert.equal(plainLocalRefusal.code, 2);
+  assert(plainLocalRefusal.output.includes('Next: Read Local status.'));
+  assert(!plainLocalRefusal.output.includes('\u001b') && !plainLocalRefusal.output.includes('\r'));
+  assert(
+    plainLocalRefusal.output.includes('\\u001b') && plainLocalRefusal.output.includes('\\u000d'),
+  );
+  localOutcome = 'applied';
+  for (const consent of ['explicit', 'saved']) {
+    const result = await executeLocal([
+      'task',
+      'prepare-native',
+      task.id,
+      localProfile.id,
+      'net.mjs',
+      '--policy',
+      localPolicyFile,
+      ...(consent === 'explicit' ? ['--native-trust', '--source-consent'] : []),
+    ]);
+    assert.equal(result.code, 0, result.errors);
+    const command = JSON.parse(result.output).command;
+    assert.deepEqual(command.payload, {
+      taskId: task.id,
+      profileId: localProfile.id,
+      targetPath: 'net.mjs',
+      policy,
+      consent,
+    });
+    assert.equal(command.expectedRevision, task.revision);
+    assert.deepEqual(
+      localCommands.map((value) => value.command),
+      ['GetSnapshot', 'PrepareNativeRun'],
+    );
+  }
+  for (const flags of [
+    ['--existing-credits'],
+    ['--confirm-subscription-only'],
+    ['--permission-mode', 'strict'],
+    ['--maximum-task-ms', '600000'],
+    ['--context-lines', '1:1'],
+    ['--model-id', 'override'],
+    ['--thought-level-id', 'override'],
+    ['--confirm-quota-account'],
+    ['--handoff-target', 'anthropic-file-v1'],
+  ]) {
+    const result = await executeLocal([
+      'task',
+      'prepare-native',
+      task.id,
+      localProfile.id,
+      'net.mjs',
+      '--policy',
+      localPolicyFile,
+      '--native-trust',
+      '--source-consent',
+      ...flags,
+    ]);
+    assert.equal(result.code, 1, flags.join(' '));
+    assert.deepEqual(
+      localCommands.map((value) => value.command),
+      ['GetSnapshot'],
+    );
+  }
+  const genericLocalShow = await executeLocal(['task', 'show', task.id], false);
+  assert(genericLocalShow.output.includes('Identity runtime metadata'));
+  assert(genericLocalShow.output.includes(localBinding.metadataHash));
+  localNativeRun = {
+    ...localNativeRun,
+    localModel: {
+      setupHash: localBinding.setupHash,
+      modelKey: 'historical-model',
+      instanceReference: 'historical-instance',
+      modelSizeBytes: 17,
+      artifactSha256: 'd'.repeat(64),
+      quantization: 'Q4_K_M',
+    },
+  };
+  const historicalLocalShow = await executeLocal(['task', 'show', task.id], false);
+  assert(historicalLocalShow.output.includes('Identity retained artifact'));
+  assert(historicalLocalShow.output.includes('d'.repeat(64)));
+  localSetup = undefined;
+  const historicalLocalStatus = await executeLocal(['local', 'status']);
+  assert.equal(historicalLocalStatus.code, 0);
+  assert.equal(JSON.parse(historicalLocalStatus.output).setup, null);
+  assert.equal((await executeLocal(['local', 'disconnect'])).code, 1);
+  assert.deepEqual(
+    localCommands.map((value) => value.command),
+    ['GetSnapshot'],
+  );
 
   for (const scenario of [
     ...acpCases.map((value) => `acp-${value}`),
@@ -873,7 +2249,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       ? {
           ...evaluation,
           recipe: 'crewkite-verify-v1',
-          remainingBudgets: { attempts: 2, minutes: 6, concurrency: 1 },
+          remainingBudgets: { attempts: 2, minutes: 11, concurrency: 1 },
           verification: {
             toolchainHash: '1'.repeat(64),
             baselineHash: '2'.repeat(64),
@@ -886,7 +2262,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
               git: { version: '2.50.1', sha256: '6'.repeat(64) },
             },
             stages: ['policy', 'lint', 'types', 'node-tests', 'build', 'desktop'],
-            maximumMinutes: 5,
+            maximumMinutes: 10,
           },
         }
       : scenario === 'evaluation-reviewed'
@@ -1147,7 +2523,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
             }
           : {
               outcome: 'applied',
-              data: { kind: 'usage', windows: usageCase?.consent === false ? [] : usageWindows },
+              data: { kind: 'usage', windows: usageWindows },
             };
       if (
         [
@@ -1558,6 +2934,25 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
                   ? []
                   : ['--thought-level-id', name === 'thought' ? 'invented' : 'thought-low']),
               ]),
+          ...(name.startsWith('deadline-')
+            ? [
+                '--maximum-task-ms',
+                name === 'deadline-five' ? '300000' : name === 'deadline-ten' ? '600000' : '600001',
+              ]
+            : []),
+          ...(name.startsWith('context-')
+            ? [
+                '--context-lines',
+                name === 'context-lines'
+                  ? '1:2'
+                  : name === 'context-reversed'
+                    ? '2:1'
+                    : name === 'context-unsafe'
+                      ? '1:9007199254740992'
+                      : '1:2',
+                ...(name === 'context-duplicate' ? ['--context-lines', '1:2'] : []),
+              ]
+            : []),
           ...(name === 'credits' ? ['--existing-credits'] : []),
           ...(name === 'mode' ? ['--permission-mode', 'always-proceed'] : []),
           ...(name === 'handoff' ? ['--handoff-target', profile.id] : []),
@@ -1566,6 +2961,25 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     if (creationCase) args = creationCase.args;
     if (usageCase) args = usageCase.args;
     const result = await execute(args, scenario !== 'changes' && !creationCase?.plain);
+    for (const read of received.filter((command) => command.command === 'GetSnapshot')) {
+      const pendingAction = received
+        .slice(0, received.indexOf(read))
+        .findLast(
+          (command) => command.command === 'AcceptCandidate' || command.command === 'ExportPatch',
+        );
+      assert.deepEqual(
+        read.payload,
+        pendingAction &&
+          (pendingAction.command === 'AcceptCandidate' || pendingAction.command === 'ExportPatch')
+          ? { taskId: pendingAction.payload.taskId }
+          : args[0] === 'task' && args[2]
+            ? ['approve', 'deny'].includes(args[1])
+              ? { approvalId: args[2] }
+              : { taskId: args[2] }
+            : {},
+        scenario,
+      );
+    }
     if (acp) {
       const invalid = [
         'missing-consent',
@@ -1580,6 +2994,10 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         'handoff',
         'autopilot',
         'import-consent-missing',
+        'deadline-invalid',
+        'context-reversed',
+        'context-unsafe',
+        'context-duplicate',
       ].some((name) => scenario === `acp-${name}`);
       assert.equal(result.code, invalid ? 1 : 0, result.errors);
       if (invalid) {
@@ -1594,6 +3012,9 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         assert.deepEqual(data.command.payload.binding.acpTarget, acpApproval.acpTarget);
       else if (
         scenario === 'acp-prepare' ||
+        scenario === 'acp-deadline-five' ||
+        scenario === 'acp-deadline-ten' ||
+        scenario === 'acp-context-lines' ||
         scenario === 'acp-saved' ||
         scenario === 'acp-model-only'
       ) {
@@ -1613,6 +3034,15 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         assert.equal(data.command.payload.billingAttestation.quotaAccountConfirmed, true);
         assert.equal(data.command.payload.permissionMode, 'request-review');
         assert.equal(data.command.payload.creditPolicy, 'ordinary');
+        if (scenario === 'acp-deadline-five' || scenario === 'acp-deadline-ten')
+          assert.equal(
+            data.command.payload.maximumTaskMs,
+            scenario === 'acp-deadline-five' ? 300000 : 600000,
+          );
+        else assert.equal(Object.hasOwn(data.command.payload, 'maximumTaskMs'), false);
+        if (scenario === 'acp-context-lines')
+          assert.deepEqual(data.command.payload.contextLines, { start: 1, end: 2 });
+        else assert.equal(Object.hasOwn(data.command.payload, 'contextLines'), false);
         assert.equal(data.command.payload.consent, scenario === 'acp-saved' ? 'saved' : 'explicit');
       } else {
         assert.equal(data.command.expectedRevision, scenario === 'acp-initialize' ? 0 : 7);
@@ -1648,6 +3078,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
           plain.output,
           /42.25 percent remaining.*stale.*source client.*observed 2026-10-17T10:00:00.000Z/u,
         );
+        assert.match(plain.output, /google quota reader {2}available {2}last attempt/u);
         assert.match(plain.output, /last attempt 2026-10-17T10:00:00.000Z/u);
       } else {
         assert.equal(result.code, usageCase.reason ? 2 : 0, result.errors);
@@ -1660,7 +3091,6 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         assert.equal(receipt.command.expectedRevision, 0);
         assert.deepEqual(receipt.command.payload, {
           family: 'google',
-          ...(usageCase.consent === undefined ? {} : { consent: usageCase.consent }),
         });
         if (usageCase.reason) {
           assert.equal(receipt.result.reason, usageCase.reason);
@@ -1670,7 +3100,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         } else
           assert.deepEqual(receipt.result.data, {
             kind: 'usage',
-            windows: usageCase.consent === false ? [] : usageWindows,
+            windows: usageWindows,
           });
       }
       continue;
@@ -2092,7 +3522,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         for (const value of [
           'Recipe crewkite-verify-v1',
           'Stages policy, lint, types, node-tests, build, desktop',
-          'Maximum 5 minutes including staging and cleanup',
+          'Maximum 10 minutes including staging and cleanup',
           'Platform darwin, arm64',
           preview.verification.toolchainHash,
           preview.verification.baselineHash,

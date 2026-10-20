@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   linkSync,
   lstatSync,
@@ -11,16 +12,21 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  renameSync,
   rmSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { createRequire } from 'node:module';
+import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
 import { setImmediate } from 'node:timers';
 import { canonicalJson, ReadDataSchema } from '@crewkite/contracts';
 import { createSyntheticRepository } from '@crewkite/testkit/repository';
+import { copyRuntimePackages } from '../../../../scripts/runtime-packages.ts';
+import { resolveRuntime } from '../../../desktop/src/main/runtime.ts';
+import { checkOwner } from './check-ownership.ts';
 import {
   applyReplacement,
   captureSingleFileEdit,
@@ -30,6 +36,7 @@ import {
   git,
   inspectSource,
   inspectSourceDetails,
+  readCandidateFiles,
   readFiles,
   treeFromFiles,
 } from './source.ts';
@@ -91,6 +98,83 @@ test('source inspection bounds file metadata without running filters or reading 
   assert.throws(() => readFiles(special), /unsupported|regular/);
   assert.equal(existsSync(canary), false);
   assert.deepEqual(readFileSync(join(source.directory, '.git', 'index')), index);
+
+  const ignoreRepository = join(directory, 'ignore-repository');
+  const ignoreScratch = join(directory, 'ignore-scratch');
+  const originalFiles = [
+    ['.gitignore', 'node_modules/\n*.log\n'],
+    ['nested/.gitignore', 'generated/*\n!generated/keep.txt\n'],
+    ['node_modules/tracked.txt', 'original\n'],
+    ['deleted.log', 'remove me\n'],
+    ['tracked.log', 'original\n'],
+    ['ordinary.txt', 'original\n'],
+  ].map(([path, text]) => {
+    const content = Buffer.from(text);
+    return {
+      path,
+      mode: '100644' as const,
+      hash: createHash('sha256').update(content).digest('hex'),
+      bytes: content.length,
+      content,
+    };
+  });
+  const ignoreTree = treeFromFiles(ignoreRepository, originalFiles);
+  const ignoreBase = git(ignoreRepository, ['commit-tree', ignoreTree, '-m', 'base'], undefined, {
+    name: 'Source test',
+    email: 'source@example.test',
+    at: '2026-01-01T00:00:00.000Z',
+  })
+    .toString()
+    .trim();
+  for (const file of originalFiles) {
+    mkdirSync(dirname(join(ignoreScratch, file.path)), { recursive: true });
+    writeFileSync(join(ignoreScratch, file.path), file.content);
+  }
+  writeFileSync(join(ignoreScratch, 'tracked.log'), 'changed\n');
+  chmodSync(join(ignoreScratch, 'tracked.log'), 0o755);
+  writeFileSync(join(ignoreScratch, 'node_modules/tracked.txt'), 'changed tracked dependency\n');
+  unlinkSync(join(ignoreScratch, 'deleted.log'));
+  writeFileSync(join(ignoreScratch, 'ordinary.txt'), 'changed ordinary\n');
+  writeFileSync(join(ignoreScratch, 'new-source.txt'), 'new source\n');
+  // New ignore rules cannot conceal source edits from the frozen source policy.
+  writeFileSync(join(ignoreScratch, '.gitignore'), '*\n');
+  mkdirSync(join(ignoreScratch, 'node_modules/.pnpm-store'), { recursive: true });
+  writeFileSync(join(ignoreScratch, 'node_modules/.pnpm-store/index.db'), 'generated cache');
+  mkdirSync(join(ignoreScratch, 'nested/generated'), { recursive: true });
+  writeFileSync(join(ignoreScratch, 'nested/generated/drop.txt'), 'generated');
+  writeFileSync(join(ignoreScratch, 'nested/generated/keep.txt'), 'retained');
+  assert.ok(
+    readFiles(ignoreScratch).some((file) => file.path === 'node_modules/.pnpm-store/index.db'),
+  );
+  const selected = readCandidateFiles(ignoreScratch, ignoreRepository, ignoreBase);
+  assert.deepEqual(
+    selected.map((file) => file.path),
+    [
+      '.gitignore',
+      'nested/.gitignore',
+      'nested/generated/keep.txt',
+      'new-source.txt',
+      'node_modules/tracked.txt',
+      'ordinary.txt',
+      'tracked.log',
+    ],
+  );
+  assert.equal(selected.find((file) => file.path === 'tracked.log')?.mode, '100755');
+  assert.equal(
+    selected.find((file) => file.path === 'node_modules/tracked.txt')?.content.toString(),
+    'changed tracked dependency\n',
+  );
+  assert.equal(
+    selected.find((file) => file.path === 'ordinary.txt')?.content.toString(),
+    'changed ordinary\n',
+  );
+  // Ignored generated special files are skipped before any content is opened.
+  execFileSync('mkfifo', [join(ignoreScratch, 'node_modules/cache.pipe')]);
+  assert.deepEqual(readCandidateFiles(ignoreScratch, ignoreRepository, ignoreBase), selected);
+  execFileSync('mkfifo', [join(ignoreScratch, 'selected.pipe')]);
+  assert.throws(() => readCandidateFiles(ignoreScratch, ignoreRepository, ignoreBase), /special/);
+  unlinkSync(join(ignoreScratch, 'selected.pipe'));
+  assert.deepEqual(git(ignoreRepository, ['for-each-ref']).toString(), '');
 
   const blobFiles: FileContent[] = [
     { path: '.gitattributes', mode: '100644', content: Buffer.from('*.bin filter=canary\n') },
@@ -375,6 +459,404 @@ test('source inspection bounds file metadata without running filters or reading 
     assert.equal(tools.files, 2);
     assert.equal(tools.entries.find((entry) => entry.path === 'cli.mjs')?.kind, 'file');
     await assert.rejects(copyInstalledDependencies(donor, candidate, expected, budget()), /EEXIST/);
+  }
+
+  const primary = dirname(
+    git(resolve('.'), ['rev-parse', '--path-format=absolute', '--git-common-dir'])
+      .toString()
+      .trim(),
+  );
+  const runtimeRootDirectory = checkOwner()?.stateRoot ?? join(primary, 'internal');
+  const runtimeDirectory = mkdtempSync(join(runtimeRootDirectory, 'rt-'));
+  t.after(() => rmSync(runtimeDirectory, { recursive: true, force: true }));
+  const app = join(runtimeDirectory, 'app');
+  const runtimeRoot = join(app, 'runtime');
+  const workspaceEntry = join(runtimeRoot, 'apps/controller/src/main.ts');
+  const demoEntry = join(runtimeRoot, 'scripts/demo-controller.ts');
+  for (const path of [dirname(workspaceEntry), dirname(demoEntry), join(runtimeRoot, 'bin')])
+    mkdirSync(path, { recursive: true });
+  writeFileSync(workspaceEntry, 'export {};\n');
+  writeFileSync(demoEntry, 'export {};\n');
+  const bundledNode = join(runtimeRoot, 'bin/node');
+  copyFileSync(process.execPath, bundledNode);
+  chmodSync(bundledNode, 0o700);
+  const environment = {
+    CREWKITE_HOME: join(runtimeDirectory, 'home'),
+    CREWKITE_PROFILE: join(runtimeDirectory, 'profile'),
+  };
+  mkdirSync(environment.CREWKITE_HOME, { mode: 0o700 });
+  const retained = new Map([
+    ['demo-catalog.json', 'historical catalog'],
+    ['state.sqlite', 'historical database'],
+  ]);
+  for (const [name, bytes] of retained)
+    writeFileSync(join(environment.CREWKITE_HOME, name), bytes, { mode: 0o600 });
+  for (const mode of ['workspace', 'demo'] as const) {
+    writeFileSync(
+      join(runtimeRoot, 'manifest.json'),
+      JSON.stringify({
+        version: 1,
+        node: {
+          version: '24.22.0',
+          platform: process.platform,
+          arch: process.arch,
+          sha256: createHash('sha256').update(readFileSync(bundledNode)).digest('hex'),
+        },
+        mode,
+      }),
+    );
+    const paths = resolveRuntime(app, environment);
+    assert.equal(paths.mode, mode);
+    assert.equal(paths.controller, mode === 'workspace' ? workspaceEntry : demoEntry);
+    assert.equal(paths.home, environment.CREWKITE_HOME);
+    for (const [name, bytes] of retained)
+      assert.equal(readFileSync(join(paths.home, name), 'utf8'), bytes);
+    assert.equal(existsSync(join(paths.home, 'demo-shop')), false);
+  }
+
+  const { buildLocalInputHelper, inspectLocalInputArtifact } = await import(
+    new URL('../../../../scripts/package.mjs', import.meta.url).href
+  );
+  const { resolvePackagedLocalInput } = await import('../main.ts');
+  for (const row of [
+    'missing manifest',
+    'missing capability',
+    'fixed capability',
+    'directory URL root',
+    'changed node',
+    'changed helper',
+    'changed source',
+    'linked helper',
+    'shared helper',
+    'special helper',
+    'writable manifest',
+    'caller path',
+  ]) {
+    const root = join(directory, 'packaged-input', row);
+    const source = join(root, 'apps/controller/src/providers/local/secure-input.m');
+    const helper = join(root, 'bin/local-secure-input');
+    mkdirSync(dirname(source), { recursive: true });
+    mkdirSync(dirname(helper));
+    writeFileSync(source, 'synthetic source');
+    writeFileSync(helper, 'synthetic helper');
+    writeFileSync(join(root, 'bin/node'), 'synthetic node');
+    const hash = (value: string) => createHash('sha256').update(value).digest('hex');
+    const localInput = {
+      sha256: hash('synthetic helper'),
+      sourceHash: hash('synthetic source'),
+      target: 'darwin-arm64',
+      minOS: '13.5.0',
+    };
+    const manifest = {
+      version: 1,
+      node: {
+        version: '24.22.0',
+        platform: 'darwin',
+        arch: 'arm64',
+        sha256: hash('synthetic node'),
+      },
+      mode: 'demo',
+      ...(row === 'missing capability' ? {} : { localInput }),
+    };
+    const manifestPath = join(root, 'manifest.json');
+    if (row !== 'missing manifest')
+      writeFileSync(
+        manifestPath,
+        JSON.stringify(
+          row === 'caller path'
+            ? { ...manifest, localInput: { ...localInput, path: helper } }
+            : manifest,
+        ),
+      );
+    if (row === 'changed node') writeFileSync(join(root, 'bin/node'), 'changed node');
+    if (row === 'changed helper') writeFileSync(helper, 'changed helper');
+    if (row === 'changed source') writeFileSync(source, 'changed source');
+    if (row === 'writable manifest') chmodSync(manifestPath, 0o666);
+    if (row === 'shared helper') linkSync(helper, join(root, 'shared-helper'));
+    if (row === 'linked helper' || row === 'special helper') {
+      unlinkSync(helper);
+      if (row === 'linked helper') symlinkSync(source, helper);
+      else execFileSync('mkfifo', [helper]);
+    }
+    if (row === 'missing manifest' || row === 'missing capability')
+      assert.equal(resolvePackagedLocalInput(root), undefined, row);
+    else if (
+      row === 'caller path' ||
+      row === 'writable manifest' ||
+      (!['fixed capability', 'directory URL root'].includes(row) &&
+        process.platform === 'darwin' &&
+        process.arch === 'arm64')
+    )
+      assert.throws(() => resolvePackagedLocalInput(root), Error, row);
+    else
+      assert.deepEqual(
+        resolvePackagedLocalInput(row === 'directory URL root' ? `${root}/` : root),
+        process.platform === 'darwin' && process.arch === 'arm64'
+          ? {
+              root,
+              sha256: localInput.sha256,
+              sourceHash: localInput.sourceHash,
+              target: localInput.target,
+            }
+          : undefined,
+        row,
+      );
+  }
+  const helperArtifact = Buffer.alloc(56);
+  for (const [offset, value] of [
+    [0, 0xfeedfacf],
+    [4, 0x0100000c],
+    [12, 2],
+    [16, 1],
+    [20, 24],
+    [32, 0x32],
+    [36, 24],
+    [40, 1],
+    [44, 0x000d0500],
+    [48, 0x001a0500],
+  ])
+    helperArtifact.writeUInt32LE(value, offset);
+  assert.deepEqual(inspectLocalInputArtifact(helperArtifact), {
+    target: 'darwin-arm64',
+    minOS: '13.5.0',
+    sdk: '26.5.0',
+  });
+  for (const [offset, value] of [
+    [0, 0xcafebabe],
+    [4, 0x01000007],
+    [12, 6],
+    [16, 0],
+    [20, 25],
+    [32, 0x24],
+    [36, 16],
+    [40, 2],
+    [44, 0x000e0000],
+  ]) {
+    const invalid = Buffer.from(helperArtifact);
+    invalid.writeUInt32LE(value, offset);
+    assert.throws(() => inspectLocalInputArtifact(invalid));
+  }
+  assert.throws(() => inspectLocalInputArtifact(helperArtifact.subarray(0, 55)));
+  for (const row of [
+    'build',
+    'compiler failed',
+    'compiler missing',
+    'compiler timeout',
+    'compiler signalled',
+    'no output',
+    'changed source',
+    'wrong target',
+    'source link',
+  ] as const) {
+    const checkout = join(directory, 'native-helper', row);
+    const build = join(checkout, 'build');
+    const source = join(checkout, 'apps/controller/src/providers/local/secure-input.m');
+    mkdirSync(dirname(source), { recursive: true });
+    mkdirSync(build);
+    writeFileSync(source, 'synthetic helper source');
+    if (row === 'source link') {
+      unlinkSync(source);
+      symlinkSync(join(checkout, 'absent'), source);
+    }
+    let invoked = 0;
+    const compile = () =>
+      buildLocalInputHelper(checkout, build, {
+        read: (path: string) =>
+          path === source || path === join(build, 'local-secure-input')
+            ? readFileSync(path)
+            : Buffer.from('synthetic tool input'),
+        execute: (
+          compiler: string,
+          args: string[],
+          settings: {
+            timeout: number;
+            maxBuffer: number;
+            env: Record<string, string>;
+            stdio: string[];
+          },
+        ) => {
+          invoked++;
+          assert.equal(compiler, '/Library/Developer/CommandLineTools/usr/bin/clang');
+          assert.deepEqual(args, [
+            '-fobjc-arc',
+            '-fblocks',
+            '-arch',
+            'arm64',
+            '-mmacosx-version-min=13.5',
+            '-isysroot',
+            '/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk',
+            '-framework',
+            'AppKit',
+            '-framework',
+            'Foundation',
+            source,
+            '-o',
+            join(build, 'local-secure-input'),
+          ]);
+          assert.equal(settings.timeout, 30000);
+          assert.equal(settings.maxBuffer, 65536);
+          assert.deepEqual(settings.stdio, ['ignore', 'pipe', 'pipe']);
+          assert.deepEqual(settings.env, { LANG: 'C', PATH: '/usr/bin:/bin', TMPDIR: build });
+          if (row === 'changed source') writeFileSync(source, 'changed helper source');
+          const output = Buffer.from(helperArtifact);
+          if (row === 'wrong target') output.writeUInt32LE(0x000e0000, 44);
+          if (row !== 'no output') writeFileSync(join(build, 'local-secure-input'), output);
+          return {
+            status: row === 'compiler failed' ? 1 : row === 'compiler missing' ? null : 0,
+            signal: row === 'compiler signalled' ? 'SIGTERM' : null,
+            error: row === 'compiler timeout' ? new Error('synthetic timeout') : undefined,
+          };
+        },
+      });
+    if (row !== 'build') assert.throws(compile);
+    else {
+      const result = compile();
+      assert.deepEqual(result.identity, {
+        sha256: createHash('sha256').update(helperArtifact).digest('hex'),
+        sourceHash: createHash('sha256').update('synthetic helper source').digest('hex'),
+        target: 'darwin-arm64',
+        minOS: '13.5.0',
+      });
+      assert.equal(result.compiler.pathsRelativeTo, 'build-source');
+      assert.equal(
+        result.compiler.args.at(-3),
+        'apps/controller/src/providers/local/secure-input.m',
+      );
+      assert.equal(result.compiler.args.at(-1), 'build/local-secure-input');
+      assert.equal(JSON.stringify(result.compiler).includes(checkout), false);
+      assert.throws(compile, /already exists/);
+    }
+    assert.equal(invoked, row === 'source link' ? 0 : 1);
+  }
+
+  for (const name of [
+    'copy',
+    'exports',
+    'version',
+    'missing',
+    'extra',
+    'escape',
+    'conflicting resolution',
+    'changed donor',
+    'changed manifest',
+  ]) {
+    const root = join(directory, 'runtime', name);
+    const donor = join(root, 'donor');
+    const stage = join(root, 'stage');
+    const sdk = join(donor, 'node_modules/fixture');
+    const parser = join(sdk, 'node_modules/parser');
+    mkdirSync(parser, { recursive: true });
+    mkdirSync(stage, { recursive: true });
+    writeFileSync(join(donor, 'package.json'), '{}');
+    writeFileSync(
+      join(sdk, 'package.json'),
+      JSON.stringify({
+        name: 'fixture',
+        version: '1.0.0',
+        ...(name === 'exports' ? { exports: { '.': './index.js' } } : { main: 'index.js' }),
+        dependencies: {
+          converter: '1.0.0',
+          parser: '^3.0.0',
+          ...(name === 'extra' ? { unexpected: '*' } : {}),
+        },
+      }),
+    );
+    writeFileSync(join(sdk, 'index.js'), "module.exports = require('converter');\n");
+    writeFileSync(join(sdk, 'LICENSE'), 'exact fixture license\n');
+    writeFileSync(
+      join(parser, 'package.json'),
+      JSON.stringify({
+        name: 'parser',
+        version: name === 'version' ? '4.0.0' : '3.0.0',
+        main: 'index.js',
+      }),
+    );
+    writeFileSync(join(parser, 'index.js'), 'module.exports = 3;\n');
+    writeFileSync(join(parser, 'LICENSE'), 'exact parser license\n');
+    // Installed package stores keep dependency links beside each package, not inside its payload.
+    const payload = join(donor, 'store/fixture');
+    mkdirSync(dirname(payload), { recursive: true });
+    renameSync(sdk, payload);
+    renameSync(join(payload, 'node_modules'), join(donor, 'store/node_modules'));
+    const converter = join(donor, 'store/node_modules/converter');
+    mkdirSync(converter);
+    writeFileSync(
+      join(converter, 'package.json'),
+      '{"name":"converter","version":"1.0.0","main":"index.js","peerDependencies":{"parser":"^3"}}',
+    );
+    writeFileSync(join(converter, 'index.js'), "module.exports = require('parser');\n");
+    writeFileSync(join(converter, 'LICENSE'), 'exact converter license\n');
+    symlinkSync('../store/fixture', sdk);
+    if (name === 'missing') rmSync(join(donor, 'store/node_modules/parser'), { recursive: true });
+    if (name === 'escape') {
+      unlinkSync(sdk);
+      writeFileSync(
+        join(stage, 'package.json'),
+        '{"name":"fixture","version":"1.0.0","main":"index.js"}',
+      );
+      writeFileSync(join(stage, 'index.js'), 'module.exports = 1;\n');
+      symlinkSync(stage, sdk);
+    }
+    if (name === 'conflicting resolution') {
+      mkdirSync(join(donor, 'other/node_modules/parser'), { recursive: true });
+      for (const file of ['package.json', 'index.js', 'LICENSE'])
+        writeFileSync(
+          join(donor, 'other/node_modules/parser', file),
+          readFileSync(join(donor, 'store/node_modules/parser', file)),
+        );
+      renameSync(converter, join(donor, 'other/converter'));
+      symlinkSync('../../other/converter', converter);
+    }
+    let changed = false;
+    const limits = budget();
+    limits.maximumEntries = 200;
+    limits.now = () => {
+      if (name === 'changed manifest' && !changed) {
+        changed = true;
+        writeFileSync(join(payload, 'package.json'), '{"name":"fixture","version":"9.0.0"}');
+      }
+      if (
+        name === 'changed donor' &&
+        !changed &&
+        existsSync(join(stage, 'node_modules/.runtime/node_modules/fixture/index.js'))
+      ) {
+        changed = true;
+        writeFileSync(join(payload, 'index.js'), 'module.exports = 9;\n');
+      }
+      return 0;
+    };
+    const run = () =>
+      copyRuntimePackages({
+        source: donor,
+        from: 'package.json',
+        destination: stage,
+        root: 'fixture',
+        packages: [
+          { name: 'fixture', version: '1.0.0', edges: ['converter', 'parser'], license: 'LICENSE' },
+          { name: 'converter', version: '1.0.0', edges: ['parser'], license: 'LICENSE' },
+          { name: 'parser', version: '3.0.0', edges: [], license: 'LICENSE' },
+        ],
+        budget: limits,
+      });
+    if (!['copy', 'exports'].includes(name)) {
+      await assert.rejects(run(), Error, name);
+      if (name === 'changed donor') assert(changed);
+      continue;
+    }
+    const notices = await run();
+    assert.equal(notices.length, 3);
+    assert.equal(readFileSync(notices[0].license, 'utf8'), 'exact fixture license\n');
+    mkdirSync(join(stage, 'node_modules/parser'));
+    writeFileSync(
+      join(stage, 'node_modules/parser/package.json'),
+      '{"name":"parser","version":"4.0.0","main":"index.js"}',
+    );
+    writeFileSync(join(stage, 'node_modules/parser/index.js'), 'module.exports = 4;\n');
+    const require = createRequire(join(stage, 'package.json'));
+    assert.equal(require('fixture'), 3);
+    assert.equal(require('parser'), 4);
+    if (name === 'exports') assert.throws(() => require.resolve('fixture/package.json'));
+    await assert.rejects(run(), /EEXIST/);
   }
 });
 

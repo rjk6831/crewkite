@@ -1,7 +1,8 @@
 import type { Effect, Route, Run, Snapshot, SourceDetails, Task } from '@crewkite/contracts';
 import { parseReviewTarget } from '@crewkite/contracts';
 import { Check, GitBranch, Info, X } from 'lucide-react';
-import { type KeyboardEvent, type ReactNode, useEffect, useId, useRef } from 'react';
+import { type KeyboardEvent, type ReactNode, useEffect, useId, useRef, useState } from 'react';
+import { formatSpan } from './usage-gauges.tsx';
 
 export const familyName = (family: string) =>
   ({ openai: 'OpenAI', anthropic: 'Anthropic', google: 'Google', local: 'Local' })[family] ??
@@ -15,6 +16,40 @@ export function duration(milliseconds: number) {
   if (minutes >= 1440) return `${Math.round(minutes / 1440)} days`;
   if (minutes >= 60) return `${Math.round(minutes / 60)} hours`;
   return `${minutes} min`;
+}
+
+const usageLimitReset =
+  /^Provider usage limit reached\. The provider reports that it resets at (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\. Retry after the reset or choose another available provider\.$/;
+
+export function TaskNext({ text }: { text: string }) {
+  const match = usageLimitReset.exec(text);
+  const resetAt = match ? Date.parse(match[1]) : Number.NaN;
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!Number.isFinite(resetAt)) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, [resetAt]);
+  if (!match || !Number.isFinite(resetAt) || new Date(resetAt).toISOString() !== match[1])
+    return text;
+  const future = resetAt > now;
+  return (
+    <>
+      Provider usage limit reached. The provider reports a reset at{' '}
+      <time dateTime={match[1]}>
+        {new Date(resetAt).toLocaleString([], {
+          month: 'short',
+          day: 'numeric',
+          hour: 'numeric',
+          minute: '2-digit',
+          timeZoneName: 'short',
+        })}
+      </time>
+      . {future ? `Resets in ${formatSpan(resetAt - now)}.` : 'The reported reset time has passed.'}{' '}
+      {future ? 'Retry after the reset' : 'Retry now'} or choose another available provider.
+    </>
+  );
 }
 
 export const methodName = (id: string) =>

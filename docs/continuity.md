@@ -56,6 +56,16 @@ New native file runs can opt into a finite recipient list during initial prepara
 
 The retained file and packet each have a 64 KiB bound. Original committed source and retained target bytes keep separate identities. Changed work needs new checks and review. A pending transfer survives reopening without submission; Stop cancels it. Legacy and repository runs do not gain this capability. The path has offline fixture coverage only, with no connected-transfer qualification. Google consumer launch remains unavailable. The [CLI guide](../apps/cli/README.md#manual-native-file-transfers) records the explicit commands and consent.
 
+## Combined ownership and recovery
+
+One frozen parent owns two child memberships and their shared dispatch ledger. A child cannot independently change its task contract, route or acceptance path. Retained candidates keep both contributors' run, attempt, scope and source identities. Identical final bytes do not erase that lineage. Ordered replay checks and guarded private ref transitions remain part of the final origin; acceptance also needs the full combined check and separate review.
+
+Parent Pause closes new admissions and records the current phase. An already owned process may finish. Resume is explicit and restores an available phase only after every owner has stopped, recorded proofs remain valid and the remaining budget covers reserved work. Unknown ownership or a failed or stopped stage blocks it. Resume dispatches nothing and cannot restart a child writer. Child Pause and Resume refuse while the parent owns that membership.
+
+Stopping one child closes further combined admission. Parent Stop requests cancellation for both children, checks, review and private integration work, and closes their pending approvals. The parent remains stopping until all owners settle; unresolved ownership remains unknown. Retained work stays inspectable. Stop on an already accepted group preserves its accepted result.
+
+Restart never resubmits a writer, reruns a check or automatically replays a private Git operation. Missing terminal proof or unproven process closure in a ref journal keeps the group unknown without probing or signalling historical process groups. A saved ref value alone cannot prove process closure. Exact command retry can return a committed result; it grants no new execution. Reconciliation and publication still validate the saved generation, immutable origin and exact ref state. The saved integration allowance survives restart and bounds reconciliation. Legacy preparations retain one minute. Resume reserves the unspent integration minutes with the remaining dispatches; it cannot enlarge that allowance. Offline fixtures cover these rules; connected recovery remains unqualified.
+
 ## Restart
 
 On startup the controller reconciles attempts and effects before it dispatches anything.

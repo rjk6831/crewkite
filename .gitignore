@@ -25,6 +25,7 @@ playwright-report/
 !/docs/distribution.md
 !/docs/history.md
 !/docs/providers.md
+!/docs/preview.md
 !/docs/roadmap.md
 !/docs/routing.md
 !/docs/testing.md

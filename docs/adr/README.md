@@ -28,6 +28,8 @@ Each record states one decision, the context that forced it, why I chose it and 
 | [0022](0022-attested-billing-for-supervised-pilots.md) | Separate observed billing facts from supervised pilot attestations | Proposed |
 | [0023](0023-qualify-provider-eligibility-before-release.md) | Qualify provider eligibility before release | Proposed |
 | [0024](0024-integrate-google-through-its-published-acp-agent.md) | Integrate Google through its published ACP agent | Proposed |
+| [0025](0025-use-an-explicit-memory-only-local-credential.md) | Use an explicit memory-only Local connection credential | Proposed |
+| [0026](0026-bind-combined-acceptance-to-checked-origins.md) | Bind combined acceptance to checked contributor origins | Proposed |
 
 ## Writing a new record
 

@@ -3,17 +3,35 @@ import { isAbsolute, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import {
   AttemptIdSchema,
+  ConversationContextMeasurementSchema,
+  ConversationModelCatalogEntriesSchema,
+  ConversationModelRequestSchema,
   HashSchema,
   NativeTargetPathSchema,
   SealedHandoffPacketSchema,
 } from '@crewkite/contracts';
 import { verifyHandoff } from '@crewkite/contracts/hash';
 import { z } from 'zod';
-import { type DiscoveryMetadata, OpenAiDiscovery } from './discovery.ts';
-import { type NativeLaunch, startNativeTask } from './native-discovery.ts';
+import { type DiscoveryMetadata, OpenAiDiscovery, type OpenAiUsageHook } from './discovery.ts';
+import { type NativeLaunch, type NativeTranscript, startNativeTask } from './native-discovery.ts';
 
 const MAX_CONTENT = 65_536;
+// The client repeats submitted text when its user item starts and completes, and JSON escaping
+// can double each copy. A structured transcript holds two full echo lines and 1 MiB besides.
+const MAX_TASK_LINE = 1024 * 1024;
+const MAX_TASK_OUTPUT = 3 * MAX_TASK_LINE;
 const id = z.string().min(1).max(200);
+const advisoryThreadStatus = z.object({
+  threadId: id,
+  status: z.union([
+    z.object({ type: z.literal('idle') }),
+    z.object({
+      type: z.literal('active'),
+      activeFlags: z.array(z.enum(['waitingOnApproval', 'waitingOnUserInput'])).max(2),
+    }),
+  ]),
+});
+export const parseAdvisoryThreadStatus = (value: unknown) => advisoryThreadStatus.parse(value);
 const utf8 = (value: string) =>
   value.isWellFormed() && !value.includes('\0') && Buffer.byteLength(value, 'utf8') <= MAX_CONTENT;
 export const ReplacementPathSchema = NativeTargetPathSchema;
@@ -150,11 +168,58 @@ const fields = [
   'total',
   'last',
   'totalTokens',
+  'modelContextWindow',
   'version',
   'attemptId',
   'path',
   'baseHash',
 ] as const;
+// A transcript ignores a notice it does not consume, unless the notice ends or moves the thread,
+// opens a realtime session, reroutes the model, starts a hook or MCP server, changes the account or
+// remote control, or touches approvals.
+const authorityNotices: ReadonlySet<string> = new Set([
+  'thread/archived',
+  'thread/unarchived',
+  'thread/deleted',
+  'thread/closed',
+  'thread/reverted',
+  'thread/environment/connected',
+  'thread/environment/disconnected',
+  'remoteControl/status/changed',
+  'model/rerouted',
+  'hook/started',
+  'hook/completed',
+  'account/updated',
+  'account/login/completed',
+  'account/gatewayOAuth/changed',
+  'item/autoApprovalReview/started',
+  'item/autoApprovalReview/completed',
+  'autoApprovalReview/strictReviewRequired',
+  'guardianWarning',
+]);
+export const authorityNotice = (method: string) =>
+  authorityNotices.has(method) ||
+  method.startsWith('thread/realtime/') ||
+  method.startsWith('mcpServer/');
+
+/** Ignored notices are counted by method hash so a completion record shows what arrived. */
+export class NoticeCensus {
+  private readonly counts = new Map<string, number>();
+  private count = 0;
+  add(method: string) {
+    const hash = createHash('sha256').update(method).digest('hex');
+    // Sixteen hashes keep a completion record well inside its 4 KiB read bound.
+    const key = this.counts.has(hash) || this.counts.size < 16 ? hash : 'other';
+    this.counts.set(key, (this.counts.get(key) ?? 0) + 1);
+    this.count++;
+  }
+  get total() {
+    return this.count;
+  }
+  get value(): Readonly<Record<string, number>> {
+    return Object.freeze(Object.fromEntries(this.counts));
+  }
+}
 const rpcFields = [
   'outputSchema',
   'sandboxPolicy',
@@ -199,7 +264,9 @@ type Cause =
   | 'limit'
   | 'deadline'
   | 'incomplete'
-  | 'admission';
+  | 'admission'
+  | 'model-unavailable'
+  | 'effort-unavailable';
 type Frame =
   | 'none'
   | 'response'
@@ -215,13 +282,24 @@ export type ReplacementDiagnostic = Readonly<{
   envelope: Frame;
   method: (typeof methods)[number] | 'other' | null;
   methodHash: string | null;
+  itemTypeHash?: string | null;
   rpcCode: number | null;
   rpcField: (typeof rpcFields)[number] | null;
   field: (typeof fields)[number] | 'other' | null;
 }>;
 
-const session = input.pick({ model: true, effort: true, creditPolicy: true, directory: true });
+const session = z.strictObject({
+  model: ConversationModelRequestSchema.shape.model,
+  effort: ConversationModelRequestSchema.shape.effort,
+  creditPolicy: input.shape.creditPolicy,
+  directory: input.shape.directory,
+});
 export type StructuredSession = z.output<typeof session>;
+export type TranscriptOptions = {
+  now: () => number;
+  timeoutMs: number;
+  onUsage?: OpenAiUsageHook;
+};
 export type StructuredCodec<T extends Record<string, unknown>> = Readonly<{
   text: string;
   outputSchema: Record<string, unknown>;
@@ -229,9 +307,16 @@ export type StructuredCodec<T extends Record<string, unknown>> = Readonly<{
   parse: (value: unknown) => T | null;
 }>;
 
+function choiceFailure(metadata: DiscoveryMetadata, plan: StructuredSession) {
+  const matches = metadata.models.filter((model) => model.model === plan.model);
+  if (matches.length !== 1) return 'model-unavailable' as const;
+  return matches[0].supportedReasoningEfforts.includes(plan.effort)
+    ? null
+    : ('effort-unavailable' as const);
+}
+
 /** Writer and reviewer admission use the same fresh account and allowance facts. */
 export function nativeTaskAdmitted(metadata: DiscoveryMetadata, plan: StructuredSession) {
-  const model = metadata.models.find((model) => model.model === plan.model);
   const limits = metadata.limits;
   const creditBucket = limits.rateLimitsByLimitId
     ? limits.rateLimitsByLimitId.codex
@@ -250,7 +335,7 @@ export function nativeTaskAdmitted(metadata: DiscoveryMetadata, plan: Structured
   return (
     metadata.account.plan === 'pro' &&
     (limits.ordinaryUsageAllowed === true || !!existingCreditsAllowed) &&
-    !!model?.supportedReasoningEfforts.includes(plan.effort) &&
+    choiceFailure(metadata, plan) === null &&
     !!metadata.mcpServers &&
     !Object.values(metadata.mcpServers).some((enabled) => enabled)
   );
@@ -266,6 +351,7 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
   private metadata: DiscoveryMetadata | null = null;
   private pending: number[] = [];
   private bytes = 0;
+  readonly outputLimit = MAX_TASK_OUTPUT;
   private failed = false;
   private step: Stage = 'metadata';
   private site: Site = 'metadata';
@@ -285,15 +371,13 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
   private readonly startedItems = new Map<string, string>();
   private readonly completedItems = new Set<string>();
   private notificationCount = 0;
+  private readonly census = new NoticeCensus();
   private submission = false;
   private interrupted = false;
   private retries = 0;
+  private contextUsage: ReturnType<typeof ConversationContextMeasurementSchema.parse> | null = null;
 
-  constructor(
-    plan: StructuredSession,
-    options: { now: () => number; timeoutMs: number },
-    codec: StructuredCodec<T>,
-  ) {
+  constructor(plan: StructuredSession, options: TranscriptOptions, codec: StructuredCodec<T>) {
     this.plan = session.parse({
       model: plan.model,
       effort: plan.effort,
@@ -317,6 +401,7 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
       readConfiguration: true,
       readMcpConfiguration: true,
       configurationDirectory: this.plan.directory,
+      onUsage: options.onUsage,
     });
   }
   private refuse(cause: Cause = 'correlation', error?: unknown): never {
@@ -395,12 +480,12 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
   push(bytes: Uint8Array) {
     this.check();
     this.bytes += bytes.length;
-    if (this.bytes > 1_048_576) this.refuse('limit');
+    if (this.bytes > MAX_TASK_OUTPUT) this.refuse('limit');
     for (const byte of bytes) {
       if (this.pending.length === 0)
         this.frameRequest = this.awaiting ? (this.step === 'thread' ? 10 : 11) : null;
       if (byte !== 10) {
-        if (this.pending.length >= 524_288) this.refuse('limit');
+        if (this.pending.length >= MAX_TASK_LINE) this.refuse('limit');
         this.pending.push(byte);
         continue;
       }
@@ -412,6 +497,8 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
           this.discovery.push(line);
           if (this.discovery.complete) {
             this.metadata = this.discovery.finish();
+            const choice = choiceFailure(this.metadata, this.plan);
+            if (choice) this.refuse(choice);
             if (!nativeTaskAdmitted(this.metadata, this.plan)) this.refuse('admission');
             this.step = 'thread';
           }
@@ -502,7 +589,6 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
           this.awaiting = false;
           continue;
         }
-        if (++this.notificationCount > 4096) this.refuse('limit');
         this.notification(value.method, value.params);
       } catch (error) {
         this.refuse('validation', error);
@@ -510,6 +596,12 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
     }
   }
   private notification(method: string, params: unknown) {
+    if (authorityNotice(method)) {
+      this.site = 'unsupported';
+      this.refuse('unsupported');
+    }
+    if (!methods.some((known) => known === method)) return this.census.add(method);
+    if (++this.notificationCount > 4096) this.refuse('limit');
     if (method === 'thread/started') {
       this.site = 'thread-event';
       const value = z.object({ thread: z.object({ id }) }).parse(params);
@@ -520,16 +612,10 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
     }
     if (method === 'thread/status/changed') {
       this.site = 'status';
-      const value = z
-        .object({
-          threadId: id,
-          status: z.union([
-            z.object({ type: z.literal('idle') }),
-            z.object({ type: z.literal('active'), activeFlags: z.array(z.never()) }),
-          ]),
-        })
-        .parse(params);
-      if (!this.threadId || value.threadId !== this.threadId) this.refuse();
+      const value = parseAdvisoryThreadStatus(params);
+      if (this.threadId && value.threadId !== this.threadId) return;
+      if (!this.threadId) this.refuse();
+      if (value.status.type === 'active' && value.status.activeFlags.length) this.refuse();
       return;
     }
     // Thread metadata can arrive before turn/start returns a turn identity.
@@ -583,6 +669,7 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
     if (method === 'account/rateLimits/updated') {
       this.site = 'allowance';
       z.object({ rateLimits: z.record(z.string(), z.unknown()) }).parse(params);
+      this.discovery.reportUsage(method, params);
       return;
     }
     if (method === 'warning') {
@@ -611,10 +698,6 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
           : {}),
       }).parse(params);
       return;
-    }
-    if (!methods.some((known) => known === method)) {
-      this.site = 'unsupported';
-      this.refuse('unsupported');
     }
     this.site = 'identity';
     const identity = z.object({ threadId: id, turnId: id });
@@ -645,13 +728,15 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
       return;
     }
     const related = identity.parse(params);
-    if (
-      !this.submission ||
-      related.threadId !== this.threadId ||
-      related.turnId !== this.turnId ||
-      this.step === 'complete'
-    )
+    if (!this.submission || related.threadId !== this.threadId || related.turnId !== this.turnId)
       this.refuse();
+    // Progress can trail turn/completed. Only new items or an error put the result in doubt.
+    // A late token count still updates the reported context use.
+    if (this.step === 'complete') {
+      if (method === 'item/started' || method === 'item/completed' || method === 'error')
+        this.refuse();
+      if (method !== 'thread/tokenUsage/updated') return;
+    }
     if (method === 'item/started' || method === 'item/completed') {
       this.site = 'item-event';
       const value = z.object({ item }).parse(params).item;
@@ -721,12 +806,22 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
     }
     if (method === 'thread/tokenUsage/updated') {
       this.site = 'usage';
-      z.object({
-        tokenUsage: z.object({
-          total: z.object({ totalTokens: z.number().safe().nonnegative() }),
-          last: z.object({ totalTokens: z.number().safe().nonnegative() }),
-        }),
-      }).parse(params);
+      const value = z
+        .object({
+          tokenUsage: z.object({
+            total: z.object({ totalTokens: z.number().safe().nonnegative() }),
+            last: z.object({ totalTokens: z.number().safe().nonnegative() }),
+            modelContextWindow: z.number().safe().positive().nullish(),
+          }),
+        })
+        .parse(params);
+      this.contextUsage = ConversationContextMeasurementSchema.parse({
+        threadId: related.threadId,
+        turnId: related.turnId,
+        model: this.plan.model,
+        usedTokens: value.tokenUsage.last.totalTokens,
+        capacityTokens: value.tokenUsage.modelContextWindow ?? null,
+      });
       return;
     }
     this.site = 'unsupported';
@@ -761,7 +856,19 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
       requestedEffort: this.plan.effort,
       observedRetries: this.retries,
       qualified: false as const,
+      ...(this.contextUsage ? { contextUsage: this.contextUsage } : {}),
     };
+  }
+  protected completedModelChoices() {
+    this.check();
+    if (!this.complete || !this.final || !this.metadata) this.refuse('incomplete');
+    return ConversationModelCatalogEntriesSchema.parse(
+      this.metadata.models.map((model) => ({
+        model: model.model,
+        efforts: model.supportedReasoningEfforts,
+        defaultEffort: model.defaultReasoningEffort,
+      })),
+    );
   }
   get complete() {
     return !this.failed && this.step === 'complete' && this.pending.length === 0;
@@ -797,12 +904,15 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
     return this.step === 'metadata' ? this.discovery.refusedEnvelope : null;
   }
   get notifications() {
-    return this.discovery.notifications + this.notificationCount;
+    return this.discovery.notifications + this.notificationCount + this.census.total;
+  }
+  get ignoredNotifications() {
+    return this.census.value;
   }
 }
 
 export class ReplacementTranscript extends StructuredTranscript<{ replacement: Replacement }> {
-  constructor(plan: WriterPlan, options: { now: () => number; timeoutMs: number }) {
+  constructor(plan: WriterPlan, options: TranscriptOptions) {
     const trusted = replacementPlan(plan);
     super(trusted, options, {
       site: 'replacement',
@@ -831,18 +941,26 @@ export class ReplacementTranscript extends StructuredTranscript<{ replacement: R
   }
 }
 
+type StructuredReader<T> = NativeTranscript<T> & {
+  readonly diagnostic: ReplacementDiagnostic | null;
+  readonly ignoredNotifications: Readonly<Record<string, number>>;
+};
+
 export function startStructuredTask<T extends Record<string, unknown>>(
   launch: NativeLaunch,
-  options: Omit<Parameters<typeof startNativeTask>[1], 'now'> & { now?: () => number },
-  createReader: (options: { now: () => number; timeoutMs: number }) => StructuredTranscript<T>,
+  options: Omit<Parameters<typeof startNativeTask>[1], 'now' | 'maximumTaskMs'> & {
+    now?: () => number;
+    onUsage?: OpenAiUsageHook;
+  },
+  createReader: (options: TranscriptOptions) => StructuredReader<T>,
 ) {
   const now = options.now ?? (() => performance.now());
-  let reader: StructuredTranscript<T> | undefined;
+  let reader: StructuredReader<T> | undefined;
   const handle = startNativeTask(
     launch,
     { ...options, now, disableMcpServers: true },
     (remaining) => {
-      reader = createReader({ now, timeoutMs: remaining });
+      reader = createReader({ now, timeoutMs: remaining, onUsage: options.onUsage });
       return reader;
     },
   );
@@ -857,6 +975,7 @@ export function startStructuredTask<T extends Record<string, unknown>>(
     result: handle.result.then((outcome) => ({
       ...outcome,
       diagnostic: reader?.diagnostic ?? null,
+      ignoredNotifications: reader?.ignoredNotifications ?? {},
     })),
   };
 }
@@ -864,7 +983,7 @@ export function startStructuredTask<T extends Record<string, unknown>>(
 export function startReplacement(
   launch: NativeLaunch,
   plan: WriterPlan,
-  options: Omit<Parameters<typeof startNativeTask>[1], 'now'> & { now?: () => number },
+  options: Parameters<typeof startStructuredTask>[1],
 ) {
   const trusted = replacementPlan(plan);
   if (trusted.directory !== resolve(launch.directory))

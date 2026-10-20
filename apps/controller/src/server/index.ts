@@ -26,6 +26,8 @@ export async function serve(
 ): Promise<{ close: () => Promise<void>; socketPath: string }> {
   const socketPath = join(controller.home, 'control.sock');
   const sockets = new Set<Socket>();
+  const authenticated = new Set<Socket>();
+  let usageTimer: ReturnType<typeof setInterval> | undefined;
   let ownsSocket = false;
   try {
     try {
@@ -130,6 +132,8 @@ export async function serve(
               actor = message.actor;
               socket.setTimeout(0);
               send({ type: 'welcome', protocol: 1, cursor: controller.store.cursor() });
+              authenticated.add(socket);
+              void controller.refreshUsage('connect');
               continue;
             }
             if (
@@ -203,6 +207,7 @@ export async function serve(
       socket.once('close', () => {
         unsubscribe?.();
         sockets.delete(socket);
+        authenticated.delete(socket);
       });
     });
     await new Promise<void>((resolve, reject) => {
@@ -214,9 +219,15 @@ export async function serve(
     });
     ownsSocket = true;
     chmodSync(socketPath, 0o600);
+    void controller.refreshUsage('start');
+    usageTimer = setInterval(() => {
+      if (authenticated.size) void controller.refreshUsage('interval');
+    }, 10000);
+    usageTimer.unref();
     return {
       socketPath,
       close: async () => {
+        clearInterval(usageTimer);
         for (const socket of sockets) socket.destroy();
         await new Promise<void>((resolve, reject) =>
           server.close((error) => (error ? reject(error) : resolve())),
@@ -232,6 +243,7 @@ export async function serve(
       },
     };
   } catch (error) {
+    clearInterval(usageTimer);
     if (ownsSocket) unlinkSync(socketPath);
 
     throw error;

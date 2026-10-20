@@ -91,7 +91,10 @@ input.on('close',()=>process.exit(0));
 
 export const fixtureModel = 'gpt-6.1-sol' as const;
 
-/** The child edits only its admitted scratch cwd; transport storage stays separate. */
+/**
+ * The child edits only its admitted scratch cwd; transport storage stays separate. Its command
+ * streams three output frames of 480,000 bytes, past the 1 MiB bound of other native phases.
+ */
 export function repositoryFixture(
   files: readonly { path: string; content: string | null }[] = [
     { path: 'net.mjs', content: fixtureContent('net.mjs') },
@@ -126,6 +129,7 @@ export function repositoryFixture(
     for (const [method,params] of [
       ['turn/started',{threadId:'thread-1',turn:running}],
       ['item/started',{...identity,item:command,startedAtMs:1}],
+      ...Array.from({length:3},()=>['item/commandExecution/outputDelta',{...identity,itemId:command.id,delta:'fixture output '.repeat(32000)}]),
       ['item/completed',{...identity,item:{...command,status:'completed',exitCode:0},completedAtMs:2}],
       ['item/started',{...identity,item:change,startedAtMs:3}],
       ['item/completed',{...identity,item:{...change,status:'completed'},completedAtMs:4}],

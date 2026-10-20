@@ -5,9 +5,15 @@ import type {
   Run,
   Snapshot,
   Task,
-  Window as UsageWindow,
+  TaskConversationState,
 } from '@crewkite/contracts';
-import { CommandSchema, ProjectSchema, requiredReviewMethodIds } from '@crewkite/contracts';
+import {
+  CommandSchema,
+  MessageIdSchema,
+  ProjectSchema,
+  requiredReviewMethodIds,
+  TaskIdSchema,
+} from '@crewkite/contracts';
 import { createDemoFixtures } from '@crewkite/testkit';
 import {
   Activity,
@@ -16,6 +22,7 @@ import {
   ArrowUpRight,
   Check,
   CheckCircle,
+  ChevronLeft,
   ChevronRight,
   Circle,
   Clock,
@@ -28,6 +35,8 @@ import {
   Info,
   ListChecks,
   Moon,
+  PanelLeftClose,
+  PanelLeftOpen,
   PanelRight,
   Pin,
   Plus,
@@ -41,13 +50,24 @@ import {
   Wallet,
   X,
 } from 'lucide-react';
-import { type FormEvent, type ReactNode, type RefObject, useEffect, useRef, useState } from 'react';
+import {
+  type FormEvent,
+  type ReactNode,
+  type RefObject,
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from 'react';
+import { ActivityView } from './activity.tsx';
 import wordmark from './assets/crewkite-wordmark.png';
 import inverseWordmark from './assets/crewkite-wordmark-inverse.png';
+import { CombinedTask } from './combined-task.tsx';
 import {
   actionName,
   Dialog,
-  duration,
   effectTarget,
   Fact,
   familyClass,
@@ -57,13 +77,38 @@ import {
   RouterCard,
   SourceFacts,
   short,
+  TaskNext,
   titleCase,
 } from './components.tsx';
-import { googleAcpLabel, Launch, NativeEvaluation, NativeHandoff } from './launch.tsx';
+import {
+  adoptedPlanCurrent,
+  ConversationView,
+  NewGoal,
+  pendingGoalProject,
+  type RegisterComposerRetry,
+} from './conversation-view.tsx';
+import {
+  type ExecutionPolicySeed,
+  googleAcpLabel,
+  Launch,
+  NativeEvaluation,
+  NativeHandoff,
+} from './launch.tsx';
+import { LocalSetup } from './local-setup.tsx';
 import { useWorkspace, type Workspace } from './source.ts';
 import { roleLabels } from './templates.ts';
+import { type UsageCard, UsageGauges, type UsageReading } from './usage-gauges.tsx';
+import { projectUsagePresentation, type UsageGaugeReading } from './usage-presentation.ts';
 
-const tabs = ['Activity', 'Plan', 'Changes', 'Checks and review', 'Handoffs'] as const;
+const tabs = [
+  'Conversation',
+  'Combined task',
+  'Plan',
+  'Changes',
+  'Checks and review',
+  'Handoffs',
+  'Activity',
+] as const;
 type Tab = (typeof tabs)[number];
 const roleNames: Role['role'][] = [
   'coder',
@@ -167,23 +212,449 @@ function Empty({ icon, title, children }: { icon: ReactNode; title: string; chil
   );
 }
 
+function readConversationDrafts(): {
+  goal: string;
+  tasks: Record<string, string>;
+  answers: Record<string, string>;
+  error: string | null;
+} {
+  try {
+    const stored: unknown = JSON.parse(localStorage.getItem('crewkite-task-drafts-v1') ?? '{}');
+    if (!stored || typeof stored !== 'object' || Array.isArray(stored))
+      throw new Error('Invalid saved drafts.');
+    const tasks: Record<string, string> = Object.fromEntries(
+      Object.entries(stored).flatMap(([id, text]) =>
+        TaskIdSchema.safeParse(id).success && typeof text === 'string' ? [[id, text] as const] : [],
+      ),
+    );
+    const savedAnswers: unknown = JSON.parse(
+      localStorage.getItem('crewkite-answer-drafts-v1') ?? '{}',
+    );
+    if (!savedAnswers || typeof savedAnswers !== 'object' || Array.isArray(savedAnswers))
+      throw new Error('Invalid saved answers.');
+    const answers: Record<string, string> = Object.fromEntries(
+      Object.entries(savedAnswers).flatMap(([id, text]) =>
+        MessageIdSchema.safeParse(id).success && typeof text === 'string'
+          ? [[id, text] as const]
+          : [],
+      ),
+    );
+    return {
+      goal: localStorage.getItem('crewkite-goal-draft-v1') ?? '',
+      tasks,
+      answers,
+      error: null,
+    };
+  } catch {
+    return {
+      goal: '',
+      tasks: {},
+      answers: {},
+      error: 'Saved drafts could not be read. New drafts will remain in this window.',
+    };
+  }
+}
+
+// Local preferences only. Storage can be full or blocked, and the app keeps working with defaults.
+function readPreference(key: string) {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+function writePreference(key: string, value: string) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {}
+}
+
+type PaletteCommand = {
+  id: string;
+  label: string;
+  icon: ReactNode;
+  run: () => void;
+  disabled?: boolean;
+  // Commands with consequences are never highlighted for you, so Enter after typing cannot run them.
+  explicit?: boolean;
+};
+type TextMatch = { index: number; length: number };
+const paletteTaskPageSize = 5;
+
+function findMatch(pattern: RegExp | null, text: string): TextMatch | null {
+  const found = pattern?.exec(text);
+  return found ? { index: found.index, length: found[0].length } : null;
+}
+function Highlight({ text, match }: { text: string; match: TextMatch | null }) {
+  if (!match) return text;
+  return (
+    <>
+      {text.slice(0, match.index)}
+      <mark>{text.slice(match.index, match.index + match.length)}</mark>
+      {text.slice(match.index + match.length)}
+    </>
+  );
+}
+// Outcomes and criteria can run long. Show the words around the match and keep surrogate pairs whole.
+function excerpt(text: string, match: TextMatch, radius = 48) {
+  let start = Math.max(0, match.index - radius);
+  let end = Math.min(text.length, match.index + match.length + radius);
+  if (start > 0 && /[\udc00-\udfff]/.test(text[start] ?? '')) start -= 1;
+  if (/[\ud800-\udbff]/.test(text[end - 1] ?? '')) end += 1;
+  const lead = start > 0 ? '…' : '';
+  return {
+    text: `${lead}${text.slice(start, end)}${end < text.length ? '…' : ''}`,
+    match: { index: match.index - start + lead.length, length: match.length },
+  };
+}
+
+function CommandPalette({
+  commands,
+  tasks,
+  projects,
+  onOpenTask,
+  onClose,
+}: {
+  commands: PaletteCommand[];
+  tasks: Task[];
+  projects: { id: string; name: string }[];
+  onOpenTask: (id: string) => void;
+  onClose: () => void;
+}) {
+  const [query, setQuery] = useState('');
+  const [page, setPage] = useState(0);
+  const [active, setActive] = useState<string | null>(null);
+  const id = useId();
+  const trimmed = query.trim();
+  const pattern = trimmed
+    ? new RegExp(trimmed.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&'), 'iu')
+    : null;
+  const projectNames = new Map(projects.map((project) => [project.id, project.name]));
+  const commandResults = commands.flatMap((command) => {
+    const match = findMatch(pattern, command.label);
+    return !pattern || match ? [{ command, match }] : [];
+  });
+  // Search the whole snapshot first, then page. Title and project matches lead.
+  const taskResults = tasks
+    .flatMap((task) => {
+      if (!pattern) return [{ task, rank: 0, field: null }];
+      const project = projectNames.get(task.projectId) ?? '';
+      const fields: [number, string | null, string][] = [
+        [0, null, task.title],
+        [1, null, project],
+        [2, 'Outcome', task.outcome],
+        ...task.criteria.map((criterion): [number, string, string] => [2, 'Criterion', criterion]),
+        [3, 'Task ID', task.id],
+        [3, 'Project ID', task.projectId],
+      ];
+      for (const [rank, label, text] of fields) {
+        const match = findMatch(pattern, text);
+        if (match)
+          return [{ task, rank, field: label ? { label, ...excerpt(text, match) } : null }];
+      }
+      return [];
+    })
+    .sort((left, right) => left.rank - right.rank);
+  const pages = Math.max(1, Math.ceil(taskResults.length / paletteTaskPageSize));
+  const currentPage = Math.min(page, pages - 1);
+  const offset = currentPage * paletteTaskPageSize;
+  const shownTasks = taskResults.slice(offset, offset + paletteTaskPageSize);
+  const options = [
+    ...commandResults.map(({ command }) => ({
+      key: `command-${command.id}`,
+      disabled: Boolean(command.disabled),
+      explicit: Boolean(command.explicit),
+      run: () => {
+        onClose();
+        command.run();
+      },
+    })),
+    ...shownTasks.map(({ task }) => ({
+      key: `task-${task.id}`,
+      disabled: false,
+      explicit: false,
+      run: () => onOpenTask(task.id),
+    })),
+  ];
+  const enabled = options.filter((option) => !option.disabled);
+  const current =
+    enabled.find((option) => option.key === active) ??
+    enabled.find((option) => !option.explicit) ??
+    null;
+  const optionId = (key: string) => `${id}-${key}`;
+  const activeId = current ? optionId(current.key) : undefined;
+  useEffect(() => {
+    if (activeId) document.getElementById(activeId)?.scrollIntoView({ block: 'nearest' });
+  }, [activeId]);
+  // A new page starts on its first task, so Enter never falls back to a command off screen.
+  function turnPage(next: number) {
+    const target = Math.max(0, Math.min(pages - 1, next));
+    if (target === currentPage) return;
+    const first = taskResults[target * paletteTaskPageSize];
+    setPage(target);
+    setActive(first ? `task-${first.task.id}` : null);
+  }
+  const summary = !pattern
+    ? taskResults.length
+      ? `Tasks ${offset + 1}-${offset + shownTasks.length} of ${taskResults.length}`
+      : 'No tasks yet'
+    : options.length
+      ? `${taskResults.length} ${taskResults.length === 1 ? 'task' : 'tasks'} and ${commandResults.length} ${commandResults.length === 1 ? 'command' : 'commands'} match${taskResults.length > paletteTaskPageSize ? `. Showing ${offset + 1}-${offset + shownTasks.length}` : ''}`
+      : 'No matches';
+  function activate(key: string) {
+    const option = options.find((value) => value.key === key);
+    if (option && !option.disabled) option.run();
+  }
+  // Focus stays in the search field. Options are reached with the arrow keys or the pointer.
+  const optionProps = (key: string, disabled: boolean) => ({
+    type: 'button' as const,
+    tabIndex: -1,
+    id: optionId(key),
+    role: 'option',
+    'aria-selected': current?.key === key,
+    'aria-disabled': disabled || undefined,
+    className: `palette-option${current?.key === key ? ' is-active' : ''}`,
+    onMouseMove: () => {
+      if (!disabled && active !== key) setActive(key);
+    },
+    onClick: () => activate(key),
+  });
+  return (
+    <div className="palette">
+      <div className="palette-search">
+        <Search size={16} aria-hidden="true" />
+        <input
+          ref={(node) => node?.setAttribute('autofocus', '')}
+          type="text"
+          role="combobox"
+          aria-label="Search tasks and commands"
+          aria-expanded="true"
+          aria-controls={`${id}-results`}
+          aria-autocomplete="list"
+          aria-activedescendant={activeId}
+          aria-describedby={`${id}-scope`}
+          placeholder="Title, outcome, criteria, ID or project"
+          autoComplete="off"
+          spellCheck={false}
+          value={query}
+          onChange={(event) => {
+            setQuery(event.target.value);
+            setPage(0);
+            setActive(null);
+          }}
+          onKeyDown={(event) => {
+            if (event.nativeEvent.isComposing) return;
+            if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+              event.preventDefault();
+              if (!enabled.length) return;
+              const index = current ? enabled.indexOf(current) : -1;
+              const next =
+                event.key === 'ArrowDown'
+                  ? (index + 1) % enabled.length
+                  : index <= 0
+                    ? enabled.length - 1
+                    : index - 1;
+              setActive(enabled[next].key);
+            } else if (event.key === 'PageDown' || event.key === 'PageUp') {
+              event.preventDefault();
+              turnPage(currentPage + (event.key === 'PageDown' ? 1 : -1));
+            } else if (event.key === 'Enter') {
+              event.preventDefault();
+              if (event.repeat || !current) return;
+              // A held Enter keeps repeating after the palette closes and focus returns to the
+              // opener, which can be an Approve or Send button. Drop repeats until the key is up.
+              const drop = (repeat: KeyboardEvent) => {
+                if (repeat.key !== 'Enter' || !repeat.repeat) return;
+                repeat.preventDefault();
+                repeat.stopImmediatePropagation();
+              };
+              // Only Enter's own keyup ends the hold. Other keys can come up first while typing.
+              const release = (up: KeyboardEvent) => {
+                if (up.key !== 'Enter') return;
+                window.removeEventListener('keydown', drop, true);
+                window.removeEventListener('keyup', release, true);
+              };
+              window.addEventListener('keydown', drop, true);
+              window.addEventListener('keyup', release, true);
+              activate(current.key);
+            }
+          }}
+        />
+      </div>
+      <p className="palette-scope" id={`${id}-scope`}>
+        Tasks and commands. Searches task titles, outcomes, criteria, IDs and projects. Conversation
+        messages are not searched.
+      </p>
+      <div
+        className="palette-results"
+        id={`${id}-results`}
+        role="listbox"
+        aria-label="Tasks and commands"
+        // Keeps the scroller out of the tab order and focus in the field on any click inside.
+        tabIndex={-1}
+        onMouseDown={(event) => event.preventDefault()}
+      >
+        {commandResults.length > 0 && (
+          <fieldset className="palette-group">
+            <legend className="palette-group-label">Commands</legend>
+            {commandResults.map(({ command, match }) => {
+              const key = `command-${command.id}`;
+              return (
+                <button key={key} {...optionProps(key, Boolean(command.disabled))}>
+                  <span className="palette-option-icon" aria-hidden="true">
+                    {command.icon}
+                  </span>
+                  <span className="palette-option-text">
+                    <span className="palette-option-title">
+                      <Highlight text={command.label} match={match} />
+                    </span>
+                  </span>
+                  <ArrowRight size={14} aria-hidden="true" />
+                </button>
+              );
+            })}
+          </fieldset>
+        )}
+        {shownTasks.length > 0 && (
+          <fieldset className="palette-group">
+            <legend className="palette-group-label">Tasks</legend>
+            {shownTasks.map(({ task, rank, field }) => {
+              const key = `task-${task.id}`;
+              const project = projectNames.get(task.projectId) ?? task.projectId;
+              return (
+                <button key={key} {...optionProps(key, false)}>
+                  <span className={`status-dot state-${task.state}`} aria-hidden="true" />
+                  <span className="palette-option-text">
+                    <span className="palette-option-title">
+                      <Highlight
+                        text={task.title}
+                        match={rank === 0 ? findMatch(pattern, task.title) : null}
+                      />
+                    </span>
+                    <span className="palette-option-meta">
+                      <Highlight
+                        text={project}
+                        match={rank === 1 ? findMatch(pattern, project) : null}
+                      />
+                      {` · ${titleCase(task.state)} · ${task.id.slice(-6)}`}
+                    </span>
+                    {field && (
+                      <span className="palette-option-match">
+                        {field.label}: <Highlight text={field.text} match={field.match} />
+                      </span>
+                    )}
+                  </span>
+                  <ArrowRight size={14} aria-hidden="true" />
+                </button>
+              );
+            })}
+          </fieldset>
+        )}
+      </div>
+      {!options.length && (
+        <div className="palette-empty">
+          <strong>No tasks or commands match “{trimmed}”.</strong>
+          <span>Check the spelling, or search by task ID or project name.</span>
+        </div>
+      )}
+      <div className="palette-footer">
+        <p role="status">{summary}</p>
+        {taskResults.length > paletteTaskPageSize && (
+          <div className="palette-pages">
+            <button
+              type="button"
+              className="icon-button"
+              aria-label="Previous tasks"
+              disabled={currentPage === 0}
+              onClick={() => turnPage(currentPage - 1)}
+            >
+              <ChevronLeft size={15} aria-hidden="true" />
+            </button>
+            <span aria-hidden="true">
+              {currentPage + 1}/{pages}
+            </span>
+            <button
+              type="button"
+              className="icon-button"
+              aria-label="Next tasks"
+              disabled={currentPage >= pages - 1}
+              onClick={() => turnPage(currentPage + 1)}
+            >
+              <ChevronRight size={15} aria-hidden="true" />
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function App() {
   const workspace = useWorkspace();
-  const { snapshot, connection, preview, error } = workspace;
+  const { snapshot, connection, preview, error: workspaceError } = workspace;
+  const connectionLabel = preview
+    ? 'Preview data'
+    : connection === 'connected'
+      ? 'Controller connected'
+      : connection === 'offline'
+        ? 'Controller offline'
+        : titleCase(connection);
   const [page, setPage] = useState<'tasks' | 'usage'>('tasks');
   const [selected, setSelected] = useState<string | null>(null);
-  const [tab, setTab] = useState<Tab>('Activity');
+  const [tab, setTab] = useState<Tab>('Conversation');
   const [roster, setRoster] = useState(true);
-  const [theme, setTheme] = useState(() => localStorage.getItem('crewkite-theme') ?? 'dark');
+  const [theme, setTheme] = useState(() => readPreference('crewkite-theme') ?? 'dark');
+  const [collapsed, setCollapsed] = useState(
+    () => readPreference('crewkite-sidebar-collapsed-v1') === '1',
+  );
   const [create, setCreate] = useState(false);
+  const [newGoal, setNewGoal] = useState(() => Boolean(pendingGoalProject()));
+  const [savedDrafts] = useState(readConversationDrafts);
+  const [goalDraft, setGoalDraft] = useState(savedDrafts.goal);
+  const composerRetry = useRef<(() => Promise<void>) | null>(null);
+  const registerComposerRetry = useCallback<RegisterComposerRetry>((retry) => {
+    composerRetry.current = retry;
+    return () => {
+      if (composerRetry.current === retry) composerRetry.current = null;
+    };
+  }, []);
+  const [drafts, setDrafts] = useState(savedDrafts.tasks);
+  const [answerDrafts, setAnswerDrafts] = useState(savedDrafts.answers);
+  const [draftError, setDraftError] = useState(savedDrafts.error);
+  const [preparationError, setPreparationError] = useState<string | null>(null);
+  const error = workspaceError ?? draftError ?? preparationError;
+  useEffect(() => {
+    if (savedDrafts.error) return;
+    try {
+      localStorage.setItem('crewkite-task-drafts-v1', JSON.stringify(drafts));
+      localStorage.setItem('crewkite-goal-draft-v1', goalDraft);
+      localStorage.setItem('crewkite-answer-drafts-v1', JSON.stringify(answerDrafts));
+    } catch {
+      setDraftError('The unsent draft could not be saved locally. Keep this window open.');
+    }
+  }, [drafts, goalDraft, answerDrafts, savedDrafts.error]);
+  const [conversationState, setConversationState] = useState<TaskConversationState | null>(null);
   const [launch, setLaunch] = useState(false);
+  const [executionPolicySeed, setExecutionPolicySeed] = useState<ExecutionPolicySeed | null>(null);
   const [nativeHandoff, setNativeHandoff] = useState(false);
   const [palette, setPalette] = useState(false);
-  const [palettePage, setPalettePage] = useState(0);
+  const paletteOpener = useRef<HTMLElement | null>(null);
+  const searchButton = useRef<HTMLButtonElement>(null);
   const [approvalToReview, setApprovalToReview] = useState<string | null>(null);
   const approvalCard = useRef<HTMLElement>(null);
   const [about, setAbout] = useState(false);
-  const task = snapshot?.tasks.find(({ id }) => id === selected) ?? snapshot?.tasks[0];
+  const task = newGoal
+    ? undefined
+    : (snapshot?.tasks.find(({ id }) => id === selected) ?? snapshot?.tasks[0]);
+  const currentConversation =
+    task && conversationState?.taskId === task.id && conversationState.revision === task.revision
+      ? conversationState
+      : null;
+  const combined = snapshot?.combinedRuns.find(
+    (value) =>
+      value.taskId === task?.id || value.members.some((member) => member.taskId === task?.id),
+  );
+  const stopRunId = combined ? task?.runId : (currentConversation?.currentRunId ?? task?.runId);
   const run = snapshot?.runs.find(({ id }) => id === task?.runId);
   const candidate = snapshot?.candidates.filter((value) => value.taskId === task?.id).at(-1);
   const changesKey = [
@@ -195,13 +666,100 @@ export function App() {
     candidate?.artifactId,
   ].join(':');
   const nativeRun = snapshot?.nativeRuns.find((value) => value.runId === task?.runId);
+  const quotaRetry = nativeRun?.quotaRetry;
+  const [quotaClock, setQuotaClock] = useState(Date.now);
+  useEffect(() => {
+    if (quotaRetry?.mode !== 'manual' || quotaRetry.available) return;
+    setQuotaClock(Date.now());
+    const timer = window.setInterval(() => setQuotaClock(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [quotaRetry]);
+  const quotaRetryReady =
+    !!quotaRetry && (quotaRetry.available || Date.parse(quotaRetry.resetsAt) <= quotaClock);
+  useEffect(() => {
+    if (!executionPolicySeed || workspace.pending || workspace.retryAvailable) return;
+    if (task?.id === executionPolicySeed.taskId && nativeRun?.stage === 'prepared') {
+      setExecutionPolicySeed(null);
+      return;
+    }
+    if (
+      task?.id !== executionPolicySeed.taskId ||
+      task.revision !== executionPolicySeed.taskRevision ||
+      (currentConversation &&
+        currentConversation.configuration?.revision !==
+          executionPolicySeed.planningConfigurationRevision)
+    ) {
+      setExecutionPolicySeed(null);
+      setLaunch(false);
+      setPreparationError(
+        'The task or planning configuration changed. The execution draft was discarded. Review the current task before preparing again.',
+      );
+    }
+  }, [
+    executionPolicySeed,
+    workspace.pending,
+    workspace.retryAvailable,
+    task?.id,
+    task?.revision,
+    currentConversation,
+    nativeRun?.stage,
+  ]);
+  function openPreparation(seed?: ExecutionPolicySeed) {
+    if (executionPolicySeed && (workspace.pending || workspace.retryAvailable)) {
+      if (!seed && task?.id === executionPolicySeed.taskId) {
+        setLaunch(true);
+        return;
+      }
+      setPreparationError('Resolve the current preparation request before changing its policy.');
+      return;
+    }
+    if (combined) {
+      setTab('Combined task');
+      if (seed) setPreparationError('Choose execution authority in Combined task preparation.');
+      return;
+    }
+    if (
+      seed &&
+      (workspace.pending ||
+        workspace.retryAvailable ||
+        workspace.connection !== 'connected' ||
+        task?.id !== seed.taskId ||
+        task.revision !== seed.taskRevision ||
+        currentConversation?.configuration?.revision !== seed.planningConfigurationRevision ||
+        currentConversation.contractStatus !== 'confirmed' ||
+        !adoptedPlanCurrent(currentConversation) ||
+        currentConversation.activeAttempt ||
+        ['unknown', 'stopping'].includes(currentConversation.phase) ||
+        task.state !== 'draft' ||
+        nativeRun?.stage === 'prepared')
+    ) {
+      setPreparationError(
+        'The execution draft is unavailable at this task revision. Resolve current work and review preparation again.',
+      );
+      return;
+    }
+    setPreparationError(null);
+    setExecutionPolicySeed(seed ?? null);
+    setLaunch(true);
+  }
   const approval = snapshot?.approvals.find(
     (value) => value.taskId === task?.id && value.status === 'pending',
   );
   const taskEvents = workspace.events.filter((event) => event.taskId === task?.id);
-  const taskCount = snapshot?.tasks.length ?? 0;
-  const taskPage = Math.min(palettePage, Math.max(0, Math.ceil(taskCount / 5) - 1));
-  const taskOffset = taskPage * 5;
+  // Runs before the dialog opens and after it is removed, so focus goes back where it came from.
+  // The approval effect below runs later and wins when the palette opened an approval.
+  useLayoutEffect(() => {
+    if (palette) {
+      paletteOpener.current =
+        document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      return;
+    }
+    const opener = paletteOpener.current;
+    paletteOpener.current = null;
+    if (!opener) return;
+    opener.focus();
+    if (document.activeElement !== opener) searchButton.current?.focus();
+  }, [palette]);
   useEffect(() => {
     if (palette || !approvalToReview) return;
     if (page === 'tasks' && tab === 'Activity' && approval?.approvalId === approvalToReview)
@@ -210,143 +768,225 @@ export function App() {
   }, [palette, page, tab, approval?.approvalId, approvalToReview]);
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
-    localStorage.setItem('crewkite-theme', theme);
+    writePreference('crewkite-theme', theme);
   }, [theme]);
+  useEffect(() => {
+    writePreference('crewkite-sidebar-collapsed-v1', collapsed ? '1' : '0');
+  }, [collapsed]);
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
         event.preventDefault();
-        setPalette((open) => !open);
+        // Palette commands change the selected task. Keep them out of other open dialogs.
+        const other = [...document.querySelectorAll('dialog[open]')].some(
+          (dialog) => !dialog.querySelector('.palette'),
+        );
+        if (!other) setPalette((open) => !open);
       }
     };
     window.addEventListener('keydown', keydown);
     return () => window.removeEventListener('keydown', keydown);
   }, []);
   function stop() {
-    if (task?.runId)
+    if (task && stopRunId)
       void workspace
         .command({
           command: 'StopRun',
           expectedRevision: task.revision,
-          payload: { taskId: task.id, runId: task.runId },
+          payload: { taskId: task.id, runId: stopRunId },
         })
         .catch(() => {});
   }
+  const stoppingPendingStart =
+    !!workspace.pendingStart &&
+    workspace.pendingStart.taskId === task?.id &&
+    workspace.pendingStart.runId === stopRunId;
   const stopAllowed =
-    task?.runId &&
-    (nativeRun
-      ? nativeRun.stage === 'prepared' ||
-        !!nativeRun.handoff?.pending ||
-        ['running', 'checking', 'unknown'].includes(task.state)
-      : !['draft', 'ready', 'accepted', 'failed'].includes(task.state));
+    stoppingPendingStart ||
+    (!!combined &&
+      combined.taskId === task?.id &&
+      combined.runId === stopRunId &&
+      !['accepted', 'stopped'].includes(combined.phase)) ||
+    (combined?.members.some((member) => member.taskId === task?.id && member.runId === stopRunId) &&
+      !!task &&
+      ['running', 'checking', 'unknown'].includes(task.state)) ||
+    (!combined &&
+      currentConversation &&
+      (currentConversation.purpose === 'conversation'
+        ? Boolean(
+            stopRunId && ['planning', 'stopping', 'unknown'].includes(currentConversation.phase),
+          )
+        : task?.runId &&
+          (nativeRun
+            ? nativeRun.stage === 'prepared' ||
+              !!nativeRun.handoff?.pending ||
+              ['running', 'checking', 'unknown', 'interrupted'].includes(task.state)
+            : !['draft', 'ready', 'accepted', 'failed'].includes(task.state))));
   return (
     <div className="app-shell">
-      <aside className="navigation" aria-label="Workspace navigation">
-        <button
-          type="button"
-          className="brand"
-          onClick={() => setAbout(true)}
-          aria-label="About CrewKite"
-        >
-          <img
-            className="brand-wordmark"
-            src={theme === 'light' ? wordmark : inverseWordmark}
-            alt="CrewKite"
-            width={1024}
-            height={341}
-          />
-          <span className="prototype-tag">D0</span>
-        </button>
-        <button type="button" className="search-button" onClick={() => setPalette(true)}>
-          <Search size={14} />
-          <span>Find or run a command</span>
-          <kbd>⌘ K</kbd>
-        </button>
-        <div className="nav-label">
-          WORKSPACE
+      <aside
+        id="workspace-navigation"
+        className={collapsed ? 'navigation is-collapsed' : 'navigation'}
+        aria-label="Workspace navigation"
+      >
+        <div className="nav-head">
           <button
             type="button"
-            className="icon-button"
-            onClick={() => setCreate(true)}
-            aria-label="New task"
+            className="brand"
+            onClick={() => setAbout(true)}
+            aria-label="About CrewKite"
+            data-tooltip="About CrewKite"
           >
-            <Plus size={15} />
+            <img
+              className="brand-wordmark"
+              src={theme === 'light' ? wordmark : inverseWordmark}
+              alt="CrewKite"
+              width={1024}
+              height={341}
+            />
+            {preview && <span className="prototype-tag">D0</span>}
+          </button>
+          <button
+            type="button"
+            className="icon-button nav-toggle"
+            onClick={() => setCollapsed(!collapsed)}
+            aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            aria-expanded={!collapsed}
+            aria-controls="workspace-navigation"
+            data-tooltip="Expand sidebar"
+          >
+            {collapsed ? (
+              <PanelLeftOpen size={16} aria-hidden="true" />
+            ) : (
+              <PanelLeftClose size={16} aria-hidden="true" />
+            )}
           </button>
         </div>
-        {snapshot?.projects.map((project) => (
-          <div key={project.id} className="project-group">
-            <div className="project-name">
-              <ChevronRight size={12} className="expanded" />
-              <Folder size={15} />
-              <span>{project.name}</span>
-              <span className="count">
-                {snapshot.tasks.filter((value) => value.projectId === project.id).length}
-              </span>
-            </div>
-            {snapshot.tasks
-              .filter((value) => value.projectId === project.id)
-              .map((value) => (
-                <button
-                  type="button"
-                  key={value.id}
-                  className={`task-link ${page === 'tasks' && task?.id === value.id ? 'active' : ''}`}
-                  onClick={() => {
-                    setSelected(value.id);
-                    setPage('tasks');
-                  }}
-                >
-                  <span className={`status-dot state-${value.state}`} />
-                  <span>{value.title}</span>
-                  {value.state === 'waiting' && <span className="notification-dot" />}
-                </button>
-              ))}
-            {!snapshot.tasks.some((value) => value.projectId === project.id) && (
-              <p className="nav-empty">No tasks yet</p>
-            )}
+        <button
+          ref={searchButton}
+          type="button"
+          className="search-button"
+          onClick={() => setPalette(true)}
+          aria-label="Search tasks and commands"
+          aria-keyshortcuts="Meta+K Control+K"
+          data-tooltip="Search"
+        >
+          <Search size={14} aria-hidden="true" />
+          <span className="nav-text">Search</span>
+          <kbd>⌘ K</kbd>
+        </button>
+        {collapsed && (
+          <button
+            type="button"
+            className="nav-item"
+            onClick={() => {
+              setNewGoal(true);
+              setPage('tasks');
+            }}
+            disabled={!snapshot}
+            data-tooltip="New task"
+          >
+            <Plus size={16} aria-hidden="true" />
+            <span className="nav-text">New task</span>
+          </button>
+        )}
+        {/* The list stays mounted while the rail shows, so it keeps its scroll position. */}
+        <div className="nav-scroll" hidden={collapsed}>
+          <div className="nav-label">
+            WORKSPACE
+            <button
+              type="button"
+              className="icon-button"
+              onClick={() => {
+                setNewGoal(true);
+                setPage('tasks');
+              }}
+              aria-label="New task"
+            >
+              <Plus size={15} />
+            </button>
           </div>
-        ))}
-        {workspace.canPickProject && (
+          {snapshot?.projects.map((project) => (
+            <div key={project.id} className="project-group">
+              <div className="project-name">
+                <ChevronRight size={12} className="expanded" />
+                <Folder size={15} />
+                <span>{project.name}</span>
+                <span className="count">
+                  {snapshot.tasks.filter((value) => value.projectId === project.id).length}
+                </span>
+              </div>
+              {snapshot.tasks
+                .filter((value) => value.projectId === project.id)
+                .map((value) => (
+                  <button
+                    type="button"
+                    key={value.id}
+                    className={`task-link ${page === 'tasks' && task?.id === value.id ? 'active' : ''}`}
+                    aria-current={page === 'tasks' && task?.id === value.id ? 'page' : undefined}
+                    onClick={() => {
+                      setNewGoal(false);
+                      setSelected(value.id);
+                      setTab('Conversation');
+                      setPage('tasks');
+                    }}
+                  >
+                    <span className={`status-dot state-${value.state}`} />
+                    <span>{value.title}</span>
+                    {value.state === 'waiting' && <span className="notification-dot" />}
+                  </button>
+                ))}
+              {!snapshot.tasks.some((value) => value.projectId === project.id) && (
+                <p className="nav-empty">No tasks yet</p>
+              )}
+            </div>
+          ))}
+          {workspace.canPickProject && (
+            <button
+              type="button"
+              className="add-task"
+              disabled={workspace.pending || connection !== 'connected'}
+              onClick={() => void workspace.pickProject().catch(() => {})}
+            >
+              <Folder size={14} />
+              Add project
+            </button>
+          )}
           <button
             type="button"
             className="add-task"
-            disabled={workspace.pending || connection !== 'connected'}
-            onClick={() => void workspace.pickProject().catch(() => {})}
+            onClick={() => {
+              setNewGoal(true);
+              setPage('tasks');
+            }}
+            disabled={!snapshot}
           >
-            <Folder size={14} />
-            Add project
+            <Plus size={14} />
+            New task
           </button>
-        )}
-        <button
-          type="button"
-          className="add-task"
-          onClick={() => setCreate(true)}
-          disabled={!snapshot}
-        >
-          <Plus size={14} />
-          New task
-        </button>
+        </div>
         <div className="nav-bottom">
           <button
             type="button"
             className={`nav-item ${page === 'usage' ? 'active' : ''}`}
+            aria-current={page === 'usage' ? 'page' : undefined}
             onClick={() => setPage('usage')}
+            data-tooltip="Usage and capacity"
           >
-            <Gauge size={16} />
-            Usage and capacity
-            <ChevronRight size={13} />
+            <Gauge size={16} aria-hidden="true" />
+            <span className="nav-text">Usage and capacity</span>
+            <ChevronRight size={13} aria-hidden="true" />
           </button>
-          <button type="button" className="nav-item" onClick={() => setAbout(true)}>
-            <Info size={16} />
-            About and acknowledgments
-          </button>
+          {!collapsed && (
+            <button type="button" className="nav-item" onClick={() => setAbout(true)}>
+              <Info size={16} />
+              About and acknowledgments
+            </button>
+          )}
           <div className="connection-line">
-            <span className={`connection-dot ${connection}`} />
-            <span>
-              {preview
-                ? 'Preview data'
-                : connection === 'connected'
-                  ? 'Controller connected'
-                  : titleCase(connection)}
+            <span className="connection-status" data-tooltip={connectionLabel}>
+              <span className={`connection-dot ${connection}`} />
+              <span className="nav-text">{connectionLabel}</span>
             </span>
             {!preview && connection !== 'connected' && (
               <button
@@ -355,6 +995,7 @@ export function App() {
                 onClick={() => void workspace.reconnect()}
                 disabled={workspace.pending || connection === 'connecting'}
                 aria-label="Reconnect controller"
+                data-tooltip="Reconnect controller"
               >
                 <RefreshCw size={15} />
               </button>
@@ -364,6 +1005,7 @@ export function App() {
               className="icon-button"
               onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
               aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
+              data-tooltip={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
             >
               {theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
             </button>
@@ -385,9 +1027,13 @@ export function App() {
               <span />
               {preview
                 ? 'Interface preview'
-                : snapshot?.routes.every(({ fake }) => fake)
-                  ? 'Scripted providers'
-                  : 'Connected routes'}
+                : !snapshot
+                  ? 'Route state unavailable'
+                  : snapshot.routes.length === 0
+                    ? 'No routes configured'
+                    : snapshot.routes.every(({ fake }) => fake)
+                      ? 'Scripted providers'
+                      : 'Routes from controller'}
             </span>
             <button
               type="button"
@@ -416,7 +1062,10 @@ export function App() {
               type="button"
               className="button secondary"
               disabled={workspace.pending || connection !== 'connected'}
-              onClick={() => void workspace.retryCommand().catch(() => {})}
+              onClick={() => {
+                const retry = composerRetry.current;
+                void (retry ? retry() : workspace.retryCommand()).catch(() => {});
+              }}
             >
               Retry exact command
             </button>
@@ -455,7 +1104,11 @@ export function App() {
             <button
               type="button"
               className="icon-button"
-              onClick={() => workspace.setError(null)}
+              onClick={() => {
+                workspace.setError(null);
+                setDraftError(null);
+                setPreparationError(null);
+              }}
               aria-label="Dismiss error"
             >
               <X size={14} />
@@ -501,30 +1154,48 @@ export function App() {
                         <span className={`status-dot state-${task.state}`} />
                         <span>
                           {approval ? 'Needs you' : 'Next step'}
-                          <strong>{task.next ?? 'Inspect the retained task state.'}</strong>
+                          <strong>
+                            <TaskNext text={task.next ?? 'Inspect the retained task state.'} />
+                          </strong>
                         </span>
                       </div>
                       <div className="button-row">
-                        {task.state === 'draft' && (
-                          <button
-                            type="button"
-                            className="button primary"
-                            onClick={() => setLaunch(true)}
-                            disabled={workspace.pending}
-                          >
-                            {nativeRun?.stage === 'prepared'
-                              ? 'Review prepared proposal'
-                              : 'Prepare run'}
-                            <ArrowRight size={14} />
-                          </button>
-                        )}
+                        {task.state === 'draft' &&
+                          !combined &&
+                          currentConversation?.contractStatus === 'confirmed' &&
+                          adoptedPlanCurrent(currentConversation) &&
+                          !currentConversation.activeAttempt &&
+                          !['unknown', 'stopping'].includes(currentConversation.phase) && (
+                            <button
+                              type="button"
+                              className="button primary"
+                              onClick={() => openPreparation()}
+                              disabled={workspace.pending}
+                            >
+                              {nativeRun?.stage === 'prepared'
+                                ? 'Review prepared proposal'
+                                : 'Prepare run'}
+                              <ArrowRight size={14} />
+                            </button>
+                          )}
                         {task.runId &&
-                          !nativeRun &&
+                          !combined &&
+                          (!nativeRun || nativeRun.quotaRetry?.mode === 'manual') &&
+                          currentConversation &&
+                          currentConversation.purpose !== 'conversation' &&
                           ['interrupted', 'stopped'].includes(task.state) && (
                             <button
                               type="button"
                               className="button primary"
-                              disabled={workspace.pending}
+                              disabled={
+                                workspace.pending ||
+                                (nativeRun?.quotaRetry?.mode === 'manual' && !quotaRetryReady)
+                              }
+                              title={
+                                nativeRun?.quotaRetry?.mode === 'manual' && !quotaRetryReady
+                                  ? `Resume after ${new Date(nativeRun.quotaRetry.resetsAt).toLocaleString()}`
+                                  : undefined
+                              }
                               onClick={() =>
                                 void workspace
                                   .command({
@@ -539,7 +1210,33 @@ export function App() {
                               <ArrowRight size={14} />
                             </button>
                           )}
-                        {nativeRun?.handoff && nativeRun.stage !== 'prepared' && (
+                        {combined?.taskId === task.id &&
+                          combined.runId === task.runId &&
+                          combined.phase === 'paused' && (
+                            <button
+                              type="button"
+                              className="button secondary"
+                              title="Current work must stop before admissions can resume."
+                              disabled={
+                                workspace.pending ||
+                                workspace.retryAvailable ||
+                                connection !== 'connected'
+                              }
+                              onClick={() =>
+                                void workspace
+                                  .command({
+                                    command: 'ResumeRun',
+                                    expectedRevision: task.revision,
+                                    payload: { taskId: task.id, runId: combined.runId },
+                                  })
+                                  .catch(() => {})
+                              }
+                            >
+                              Resume admissions
+                              <ArrowRight size={14} />
+                            </button>
+                          )}
+                        {!combined && nativeRun?.handoff && nativeRun.stage !== 'prepared' && (
                           <button
                             type="button"
                             className="button secondary"
@@ -555,7 +1252,12 @@ export function App() {
                         <button
                           type="button"
                           className="button stop"
-                          disabled={!stopAllowed || workspace.pending || task.state === 'stopping'}
+                          disabled={
+                            !stopAllowed ||
+                            (workspace.pending && !stoppingPendingStart) ||
+                            workspace.pendingStop ||
+                            task.state === 'stopping'
+                          }
                           onClick={stop}
                         >
                           <Square size={12} />
@@ -564,6 +1266,8 @@ export function App() {
                       </div>
                     </div>
                     {run &&
+                      !combined &&
+                      currentConversation?.purpose === 'execution' &&
                       ['running', 'waiting', 'stopped', 'interrupted'].includes(task.state) && (
                         <RouteSwitch
                           key={run.id}
@@ -578,6 +1282,7 @@ export function App() {
                     className="tab-bar"
                     role="tablist"
                     aria-label="Task views"
+                    style={{ overflowX: 'auto', flexShrink: 0 }}
                     onKeyDown={moveTabFocus}
                   >
                     {tabs.map((value) => (
@@ -607,7 +1312,68 @@ export function App() {
                     role="tabpanel"
                     aria-labelledby={`tab-${tab}`}
                     className="task-panel"
+                    style={
+                      tab === 'Conversation'
+                        ? { padding: 0, overflow: 'hidden' }
+                        : tab === 'Combined task'
+                          ? { padding: 16, overflow: 'hidden' }
+                          : undefined
+                    }
                   >
+                    <div
+                      hidden={tab !== 'Conversation'}
+                      style={tab === 'Conversation' ? { height: '100%' } : { display: 'none' }}
+                    >
+                      <ConversationView
+                        visible={tab === 'Conversation'}
+                        key={task.id}
+                        task={task}
+                        snapshot={snapshot}
+                        workspace={workspace}
+                        registerRetry={registerComposerRetry}
+                        answerDrafts={answerDrafts}
+                        onAnswerDraftChange={(id, text) =>
+                          setAnswerDrafts((current) => ({ ...current, [id]: text }))
+                        }
+                        draft={drafts[task.id] ?? ''}
+                        onDraftChange={(text) =>
+                          setDrafts((current) => ({ ...current, [task.id]: text }))
+                        }
+                        onDraftSaved={(submitted) =>
+                          setDrafts((current) =>
+                            current[task.id] === submitted
+                              ? { ...current, [task.id]: '' }
+                              : current,
+                          )
+                        }
+                        onState={setConversationState}
+                        onPrepare={openPreparation}
+                      />
+                    </div>
+                    <div
+                      hidden={tab !== 'Combined task'}
+                      style={tab === 'Combined task' ? { height: '100%' } : { display: 'none' }}
+                    >
+                      <CombinedTaskPanel
+                        key={task.id}
+                        task={task}
+                        snapshot={snapshot}
+                        workspace={workspace}
+                        onInspect={(panel) =>
+                          setTab(
+                            panel === 'changes'
+                              ? 'Changes'
+                              : panel === 'evaluation'
+                                ? 'Checks and review'
+                                : 'Activity',
+                          )
+                        }
+                        onSelectTask={(id) => {
+                          setSelected(id);
+                          setTab('Combined task');
+                        }}
+                      />
+                    </div>
                     {tab === 'Activity' && (
                       <>
                         {approval && (
@@ -621,7 +1387,12 @@ export function App() {
                             focusRef={approvalCard}
                           />
                         )}
-                        <ActivityView events={taskEvents} task={task} snapshot={snapshot} />
+                        <ActivityView
+                          key={task.id}
+                          task={task}
+                          snapshot={snapshot}
+                          workspace={workspace}
+                        />
                       </>
                     )}
                     {tab === 'Plan' && (
@@ -629,7 +1400,8 @@ export function App() {
                         task={task}
                         run={run}
                         snapshot={snapshot}
-                        onPrepare={() => setLaunch(true)}
+                        onPrepare={() => openPreparation()}
+                        conversationState={currentConversation}
                       />
                     )}
                     {tab === 'Changes' && (
@@ -642,14 +1414,21 @@ export function App() {
                   </div>
                 </>
               ) : (
-                <Empty icon={<Folder />} title="Start with one useful task">
-                  Create a bounded outcome and its acceptance criteria. Review the source and
-                  routing decision before starting.
-                  <button type="button" className="button primary" onClick={() => setCreate(true)}>
-                    <Plus size={14} />
-                    Create task
-                  </button>
-                </Empty>
+                <NewGoal
+                  snapshot={snapshot}
+                  workspace={workspace}
+                  registerRetry={registerComposerRetry}
+                  text={goalDraft}
+                  onTextChange={setGoalDraft}
+                  onManual={() => setCreate(true)}
+                  onCreated={(id, submitted) => {
+                    setPage('tasks');
+                    setSelected(id);
+                    setNewGoal(false);
+                    setTab('Conversation');
+                    setGoalDraft((value) => (value === submitted ? '' : value));
+                  }}
+                />
               )}
             </main>
             {roster && (
@@ -657,7 +1436,7 @@ export function App() {
                 snapshot={snapshot}
                 run={run}
                 task={task}
-                onConfigure={() => setLaunch(true)}
+                onConfigure={() => openPreparation()}
               />
             )}
           </div>
@@ -666,9 +1445,13 @@ export function App() {
           <span>
             <ShieldCheck size={12} />
             Local workspace<span className="footer-separator">/</span>
-            {snapshot?.routes.every(({ fake }) => fake)
-              ? 'All routes are fake'
-              : 'Route state from controller'}
+            {!snapshot
+              ? 'Route state unavailable'
+              : snapshot.routes.length === 0
+                ? 'No routes configured'
+                : snapshot.routes.every(({ fake }) => fake)
+                  ? 'All routes are fake'
+                  : 'Route state from controller'}
           </span>
           <span>
             Authority stays in the controller<kbd>⌘ K</kbd>
@@ -682,21 +1465,31 @@ export function App() {
           onClose={() => setCreate(false)}
           onCreated={(id) => {
             setSelected(id);
+            setNewGoal(false);
             setPage('tasks');
             setCreate(false);
             setLaunch(true);
           }}
         />
       )}
-      {launch && task && snapshot && (
+      {launch && !combined && task && snapshot && (
         <Launch
+          key={
+            executionPolicySeed
+              ? `${executionPolicySeed.taskId}:${executionPolicySeed.taskRevision}:${executionPolicySeed.planningConfigurationRevision}:${executionPolicySeed.authority}`
+              : task.id
+          }
           task={task}
           snapshot={snapshot}
           workspace={workspace}
-          onClose={() => setLaunch(false)}
+          executionPolicySeed={executionPolicySeed ?? undefined}
+          onClose={() => {
+            setLaunch(false);
+            if (!workspace.pending && !workspace.retryAvailable) setExecutionPolicySeed(null);
+          }}
         />
       )}
-      {nativeHandoff && task && snapshot && nativeRun?.handoff && (
+      {nativeHandoff && !combined && task && snapshot && nativeRun?.handoff && (
         <NativeHandoff
           key={`${task.runId}:${task.revision}:${nativeRun.handoff.currentAttemptId}:${nativeRun.handoff.pending?.preparationId ?? ''}`}
           task={task}
@@ -705,30 +1498,41 @@ export function App() {
           onClose={() => setNativeHandoff(false)}
         />
       )}
-      {about && <About onClose={() => setAbout(false)} />}
+      {about && <About preview={preview} onClose={() => setAbout(false)} />}
       {palette && (
-        <Dialog title="Run a command" onClose={() => setPalette(false)}>
-          <div className="command-list">
-            {[
-              { label: 'New task', icon: <Plus size={17} />, action: () => setCreate(true) },
+        <Dialog title="Search tasks and commands" onClose={() => setPalette(false)}>
+          <CommandPalette
+            commands={[
               {
-                label: 'Open usage and capacity',
-                icon: <Gauge size={17} />,
-                action: () => setPage('usage'),
+                id: 'new-task',
+                label: 'New task',
+                icon: <Plus size={17} />,
+                run: () => {
+                  setNewGoal(true);
+                  setPage('tasks');
+                },
               },
               {
+                id: 'usage',
+                label: 'Open usage and capacity',
+                icon: <Gauge size={17} />,
+                run: () => setPage('usage'),
+              },
+              {
+                id: 'activity',
                 label: 'Show task activity',
                 icon: <Activity size={17} />,
-                action: () => {
+                run: () => {
                   setPage('tasks');
                   setTab('Activity');
                 },
               },
               {
+                id: 'approval',
                 label: 'Review pending approval',
                 icon: <ShieldCheck size={17} />,
                 disabled: !approval,
-                action: () => {
+                run: () => {
                   if (!approval) return;
                   setPage('tasks');
                   setTab('Activity');
@@ -736,76 +1540,31 @@ export function App() {
                 },
               },
               {
+                id: 'stop',
                 label: 'Stop current run',
                 icon: <Square size={15} />,
-                action: stop,
+                run: stop,
                 disabled: !stopAllowed,
+                explicit: true,
               },
               {
+                id: 'about',
                 label: 'About and acknowledgments',
                 icon: <Info size={17} />,
-                action: () => setAbout(true),
+                run: () => setAbout(true),
               },
-            ].map(({ label, icon, action, disabled }) => (
-              <button
-                type="button"
-                key={label}
-                disabled={disabled}
-                onClick={() => {
-                  setPalette(false);
-                  action();
-                }}
-              >
-                {icon}
-                {label}
-                <ArrowRight size={14} />
-              </button>
-            ))}
-            {taskCount > 0 && (
-              <>
-                <p className="muted small">
-                  Tasks {taskOffset + 1}-{Math.min(taskOffset + 5, taskCount)} of {taskCount}
-                </p>
-                {snapshot?.tasks.slice(taskOffset, taskOffset + 5).map((value) => (
-                  <button
-                    type="button"
-                    key={value.id}
-                    onClick={() => {
-                      setSelected(value.id);
-                      setPage('tasks');
-                      setTab('Activity');
-                      setPalette(false);
-                    }}
-                  >
-                    <FileCode size={17} />
-                    Open task: {value.title} ·{' '}
-                    {snapshot.projects.find(({ id }) => id === value.projectId)?.name ??
-                      value.projectId}{' '}
-                    · {value.id.slice(-6)}
-                    <ArrowRight size={14} />
-                  </button>
-                ))}
-                {taskCount > 5 && (
-                  <div className="button-row">
-                    <button
-                      type="button"
-                      disabled={taskPage === 0}
-                      onClick={() => setPalettePage(taskPage - 1)}
-                    >
-                      Previous tasks
-                    </button>
-                    <button
-                      type="button"
-                      disabled={taskOffset + 5 >= taskCount}
-                      onClick={() => setPalettePage(taskPage + 1)}
-                    >
-                      Next tasks
-                    </button>
-                  </div>
-                )}
-              </>
-            )}
-          </div>
+            ]}
+            tasks={snapshot?.tasks ?? []}
+            projects={snapshot?.projects ?? []}
+            onOpenTask={(id) => {
+              setPalette(false);
+              setNewGoal(false);
+              setSelected(id);
+              setPage('tasks');
+              setTab('Conversation');
+            }}
+            onClose={() => setPalette(false)}
+          />
         </Dialog>
       )}
     </div>
@@ -910,164 +1669,67 @@ function ApprovalCard({
   );
 }
 
-const eventNames: Record<Event['type'], string> = {
-  'task.created': 'Task created',
-  'task.updated': 'Task state updated',
-  'run.prepared': 'Run prepared',
-  'run.admitted': 'Run admitted',
-  'attempt.launched': 'Worker started',
-  'attempt.output': 'Worker output',
-  'approval.requested': 'Approval requested',
-  'approval.resolved': 'Approval resolved',
-  'usage.observed': 'Usage observation received',
-  'route.reserve_reached': 'Reserve reached',
-  'admissions.paused': 'New admissions paused',
-  'handoff.sealed': 'Handoff packet sealed',
-  'attempt.stopping': 'Worker stopping',
-  'attempt.stopped': 'Worker stopped',
-  'ownership.unknown': 'Writer ownership unknown',
-  'run.interrupted': 'Run interrupted',
-  'candidate.sealed': 'Candidate sealed',
-  'check.completed': 'Check completed',
-  'review.completed': 'Review recorded',
-  'candidate.accepted': 'Candidate accepted',
-  'export.created': 'Export created',
-  'run.failed': 'Run failed',
-};
-
-function ActivityView({
-  events,
+function CombinedTaskPanel({
   task,
   snapshot,
+  workspace,
+  onInspect,
+  onSelectTask,
 }: {
-  events: Event[];
   task: Task;
   snapshot: Snapshot;
+  workspace: Workspace;
+  onInspect: (panel: 'changes' | 'evaluation' | 'activity') => void;
+  onSelectTask: (id: Task['id']) => void;
 }) {
-  const tail = useRef<HTMLDivElement>(null);
-  const visible = events.filter(({ type }) => type !== 'task.updated');
+  const [source, setSource] = useState<Run['source'] | null>(null);
+  const [sourceError, setSourceError] = useState<string | null>(null);
+  const request = useRef(0);
+  const command = workspace.command;
+  const inspect = useCallback(async () => {
+    const current = ++request.current;
+    setSource(null);
+    setSourceError(null);
+    try {
+      const result = await command({
+        command: 'InspectSource',
+        payload: { projectId: task.projectId },
+      });
+      if (current !== request.current) return;
+      if (
+        (result.outcome === 'applied' || result.outcome === 'already-applied') &&
+        result.data?.kind === 'source' &&
+        result.data.source.projectId === task.projectId
+      )
+        setSource(result.data.source);
+      else setSourceError(result.next ?? result.reason ?? 'Source inspection is unavailable.');
+    } catch (failure) {
+      if (current === request.current)
+        setSourceError(failure instanceof Error ? failure.message : 'Source inspection failed.');
+    }
+  }, [command, task.projectId]);
+  useEffect(
+    () => () => {
+      request.current += 1;
+    },
+    [],
+  );
+  const connected = workspace.connection === 'connected' && !workspace.preview;
   return (
-    <section className="activity-section">
-      <div className="section-heading">
-        <h2>
-          <Activity size={15} />
-          Activity
-        </h2>
-        <span>{visible.length} events received</span>
-      </div>
-      {visible.length === 0 ? (
-        <Empty
-          icon={<Terminal size={24} />}
-          title={task.state === 'draft' ? 'Ready when you are' : 'Retained task state is available'}
-        >
-          {task.state === 'draft'
-            ? 'Prepare a run to inspect the source, team and routing decision. Worker events will appear here.'
-            : 'New events appear while this client is connected. Inspect the other views for retained state.'}
-        </Empty>
-      ) : (
-        <div className="timeline">
-          {visible.map((event) => {
-            const routeId = 'routeId' in event.payload ? event.payload.routeId : null;
-            const provider = snapshot.routes.find(({ id }) => id === routeId);
-            const output = event.type === 'attempt.output' ? event.payload.text : null;
-            const reason =
-              'reason' in event.payload && typeof event.payload.reason === 'string'
-                ? event.payload.reason
-                : null;
-            const outcome =
-              event.type === 'check.completed' || event.type === 'review.completed'
-                ? (event.payload.review?.outcome ??
-                  (event.payload.passed ? 'passed' : 'not passed'))
-                : null;
-            const tone =
-              outcome === 'passed' || event.type === 'candidate.accepted'
-                ? 'success'
-                : outcome === 'failed' || outcome === 'not passed' || event.type === 'run.failed'
-                  ? 'failure'
-                  : outcome === 'blocked' ||
-                      event.type === 'approval.requested' ||
-                      event.type === 'ownership.unknown' ||
-                      event.type === 'run.interrupted' ||
-                      event.type === 'route.reserve_reached' ||
-                      event.type === 'admissions.paused'
-                    ? 'warning'
-                    : 'neutral';
-            return (
-              <article
-                className={`timeline-row timeline-${tone} event-${event.type.replaceAll('.', '-')}`}
-                key={event.id}
-              >
-                <div className="timeline-marker" aria-hidden="true">
-                  {event.type === 'handoff.sealed' ? (
-                    <GitBranch size={13} />
-                  ) : event.type === 'approval.requested' ? (
-                    <ShieldCheck size={13} />
-                  ) : event.type === 'attempt.output' ? (
-                    <Terminal size={12} />
-                  ) : (
-                    <Circle size={8} />
-                  )}
-                </div>
-                <div className="timeline-content">
-                  <div className="timeline-title">
-                    <strong>
-                      {eventNames[event.type]}
-                      {outcome && ` · ${titleCase(outcome)}`}
-                    </strong>
-                    {provider && (
-                      <span className={`provider-label ${familyClass(provider.family)}`}>
-                        {provider.family}
-                      </span>
-                    )}
-                    <time>
-                      {new Date(event.at).toLocaleTimeString([], {
-                        hour: '2-digit',
-                        minute: '2-digit',
-                        hour12: false,
-                      })}
-                    </time>
-                  </div>
-                  {reason && <p>{reason}</p>}
-                  {output && <pre className="worker-output">{output}</pre>}
-                  {event.type === 'handoff.sealed' && (
-                    <div className="inline-packet">
-                      <GitBranch size={15} />
-                      <span>
-                        Version {event.payload.packet.version} ·{' '}
-                        {event.payload.packet.unfinished.length} unfinished item(s)
-                        <small>Checksum {short(event.payload.checksum)}</small>
-                      </span>
-                      <ShieldCheck size={15} />
-                    </div>
-                  )}
-                  {event.type === 'approval.resolved' && (
-                    <p>
-                      {titleCase(event.payload.status)}:{' '}
-                      {effectTarget(
-                        event.payload,
-                        task,
-                        snapshot.projects.find(({ id }) => id === task.projectId)?.name,
-                      )}
-                    </p>
-                  )}
-                </div>
-              </article>
-            );
-          })}
-          <div ref={tail} />
-        </div>
-      )}
-      {visible.length > 6 && (
-        <button
-          type="button"
-          className="text-button jump-latest"
-          onClick={() => tail.current?.scrollIntoView({ block: 'end' })}
-        >
-          Jump to latest
-          <ArrowRight size={13} />
-        </button>
-      )}
-    </section>
+    <CombinedTask
+      task={task}
+      snapshot={snapshot}
+      source={source}
+      connected={connected}
+      pending={workspace.pending}
+      retryAvailable={workspace.retryAvailable}
+      error={sourceError ?? workspace.error}
+      onCommand={workspace.command}
+      onRetry={workspace.retryCommand}
+      onRefreshSource={inspect}
+      onInspect={onInspect}
+      onSelectTask={onSelectTask}
+    />
   );
 }
 
@@ -1076,12 +1738,75 @@ function Plan({
   run,
   snapshot,
   onPrepare,
+  conversationState,
 }: {
   task: Task;
   run?: Run;
   snapshot: Snapshot;
   onPrepare: () => void;
+  conversationState: TaskConversationState | null;
 }) {
+  const combined = snapshot.combinedRuns.find(
+    (value) =>
+      value.taskId === task.id || value.members.some((member) => member.taskId === task.id),
+  );
+  if (combined)
+    return (
+      <Empty icon={<GitBranch />} title="Combined task contract">
+        {combined.taskId === task.id
+          ? 'This parent retains the shared limits and combined candidate. Inspect Combined task for its current actions.'
+          : 'This member contributes retained work to its parent. Inspect Combined task for its scoped actions.'}
+      </Empty>
+    );
+  if (!conversationState)
+    return (
+      <Empty icon={<RefreshCw />} title="Refreshing the task contract">
+        Open Conversation to refresh if the current state remains unavailable.
+      </Empty>
+    );
+  if (conversationState.purpose === 'conversation')
+    return (
+      <div className="view-stack">
+        <section className="card">
+          <h2>
+            {conversationState.contractStatus === 'provisional'
+              ? 'Provisional task contract'
+              : 'Confirmed task contract'}
+          </h2>
+          <p className="muted">{task.outcome}</p>
+          {conversationState.contractStatus === 'confirmed' ? (
+            <ul>
+              {task.criteria.map((criterion) => (
+                <li key={criterion}>{criterion}</li>
+              ))}
+            </ul>
+          ) : (
+            <p className="muted">
+              Criteria remain provisional until a plan is adopted in Conversation.
+            </p>
+          )}
+          <p className="muted small">
+            Conversation retains the proposal and its decisions. Execution needs a separate source,
+            team and permission review.
+          </p>
+          {conversationState.contractStatus === 'confirmed' &&
+            adoptedPlanCurrent(conversationState) && (
+              <button
+                className="button primary"
+                type="button"
+                disabled={
+                  Boolean(conversationState.activeAttempt) ||
+                  ['unknown', 'stopping'].includes(conversationState.phase)
+                }
+                onClick={onPrepare}
+              >
+                Review execution contract
+                <ArrowRight size={14} />
+              </button>
+            )}
+        </section>
+      </div>
+    );
   const native = snapshot.nativeRuns.find((value) => value.runId === run?.id);
   const profile = snapshot.nativeProfiles.find((value) => value.id === native?.profileId);
   return (
@@ -1139,7 +1864,7 @@ function Plan({
                 />
                 <Fact
                   label={native.handoff ? 'Writer time limit' : 'Time limit'}
-                  value={`${(profile?.maximumTaskMs ?? 300000) / 60000} min`}
+                  value={`${(native.maximumTaskMs ?? profile?.maximumTaskMs ?? 300000) / 60000} min`}
                 />
               </div>
               {native.handoff && (
@@ -1368,31 +2093,46 @@ function Changes({ task, workspace }: { task: Task; workspace: Workspace }) {
   const [readError, setReadError] = useState<string | null>(null);
   useEffect(() => {
     let active = true;
+    let retry: ReturnType<typeof setTimeout> | undefined;
     setLoading(true);
     setChanges(null);
     setSelected(null);
     setReadError(null);
-    void workspace
-      .command({ command: 'GetChanges', payload: { taskId: task.id } })
-      .then((result) => {
-        if (!active) return;
-        if (result.data?.kind === 'changes' && result.data.taskId === task.id) {
-          setChanges(result.data);
-          setSelected(result.data.files[0]?.path ?? null);
-        } else
-          setReadError(result.next ?? result.reason ?? 'The retained changes are unavailable.');
-      })
-      .catch((failure: unknown) => {
-        if (active)
+    const read = () => {
+      retry = undefined;
+      void workspace
+        .command({ command: 'GetChanges', payload: { taskId: task.id } })
+        .then((result) => {
+          if (!active) return;
+          if (result.data?.kind === 'changes' && result.data.taskId === task.id) {
+            setChanges(result.data);
+            setSelected(result.data.files[0]?.path ?? null);
+          } else
+            setReadError(result.next ?? result.reason ?? 'The retained changes are unavailable.');
+        })
+        .catch((failure: unknown) => {
+          if (!active) return;
+          if (
+            failure instanceof Error &&
+            (failure.message === 'Wait for the pending desktop command.' ||
+              failure.message ===
+                "Error invoking remote method 'crewkite:command': Error: Wait for the pending desktop command.")
+          ) {
+            retry = setTimeout(read, 50);
+            return;
+          }
           setReadError(
             failure instanceof Error ? failure.message : 'The retained changes could not be read.',
           );
-      })
-      .finally(() => {
-        if (active) setLoading(false);
-      });
+        })
+        .finally(() => {
+          if (active && retry === undefined) setLoading(false);
+        });
+    };
+    read();
     return () => {
       active = false;
+      clearTimeout(retry);
     };
   }, [task.id, workspace.command]);
   if (loading)
@@ -1509,10 +2249,20 @@ function Checks({
   snapshot: Snapshot;
   workspace: Workspace;
 }) {
-  const candidate = snapshot.candidates.filter(({ taskId }) => taskId === task.id).at(-1);
+  const combined = snapshot.combinedRuns.find(
+    (value) =>
+      value.taskId === task.id || value.members.some((member) => member.taskId === task.id),
+  );
+  const candidate =
+    combined?.taskId === task.id
+      ? snapshot.candidates.find(
+          (value) => value.id === combined.candidate?.id && value.hash === combined.candidate.hash,
+        )
+      : snapshot.candidates.filter(({ taskId }) => taskId === task.id).at(-1);
   const evidence = snapshot.evidence.filter(({ candidateId }) => candidateId === candidate?.id);
   const [destination, setDestination] = useState('refs/heads/feat/net-minor');
-  const native = snapshot.nativeRuns.some((value) => value.runId === task.runId);
+  const native =
+    snapshot.nativeRuns.some((value) => value.runId === task.runId) || combined?.taskId === task.id;
   const evaluation = snapshot.candidateEvaluations.find(
     (value) =>
       value.taskId === task.id &&
@@ -1521,7 +2271,7 @@ function Checks({
       value.candidateHash === candidate.hash,
   );
   const eligible = native
-    ? evaluation?.localAcceptance.available
+    ? evaluation?.localAcceptance.available && (!combined || combined.accept.available)
     : candidate && task.state === 'ready';
   const acceptanceReason = evaluation?.localAcceptance.reason ?? 'evidence-incomplete';
   const acceptanceReasons = {
@@ -1536,6 +2286,14 @@ function Checks({
     'publication-prepared': 'A local publication is prepared. Inspect its receipt before retrying.',
     accepted: 'The candidate was accepted to a local branch.',
   };
+
+  if (combined && combined.taskId !== task.id)
+    return (
+      <Empty icon={<GitBranch />} title="Member work belongs to the combined candidate">
+        Inspect Combined task for the parent. Member candidates cannot be evaluated or accepted
+        separately.
+      </Empty>
+    );
 
   return (
     <div className="view-stack">
@@ -1611,11 +2369,13 @@ function Checks({
                         </div>
                         <p>{result.summary}</p>
                         <p className="muted small">
-                          {result.job.writerRouteId === undefined
-                            ? 'Last writer route unknown for this saved review.'
-                            : result.job.writerRouteId === result.job.routeId
-                              ? 'Same route as the last writer. Separate review invocation.'
-                              : 'Different route from the last writer.'}{' '}
+                          {'origin' in result.job
+                            ? 'Combined candidate from two retained contributors. Separate review invocation.'
+                            : result.job.writerRouteId === undefined
+                              ? 'Last writer route unknown for this saved review.'
+                              : result.job.writerRouteId === result.job.routeId
+                                ? 'Same route as the last writer. Separate review invocation.'
+                                : 'Different route from the last writer.'}{' '}
                           Model diversity is not established.
                         </p>
                         <div className="review-identity">
@@ -1623,13 +2383,27 @@ function Checks({
                           <span>{route ? familyName(route.family) : 'Unavailable route'}</span>
                           <code>{short(result.job.candidateHash)}</code>
                         </div>
-                        {result.job.writerAttemptId && result.job.writerRouteId && (
+                        {'origin' in result.job ? (
+                          <details className="technical-details">
+                            <summary>Combined origin</summary>
+                            <code>Manifest {result.job.origin.manifestHash}</code>
+                            <code>Generation {result.job.origin.generation}</code>
+                            {result.job.origin.contributors.map((contributor) => (
+                              <div key={contributor.attemptId}>
+                                <code>Contributor task {contributor.taskId}</code>
+                                <code>Writer attempt {contributor.attemptId}</code>
+                                <code>Writer route {contributor.routeId}</code>
+                                <code>Candidate {contributor.candidateHash}</code>
+                              </div>
+                            ))}
+                          </details>
+                        ) : result.job.writerAttemptId && result.job.writerRouteId ? (
                           <details className="technical-details">
                             <summary>Details</summary>
                             <code>Last writer attempt {result.job.writerAttemptId}</code>
                             <code>Last writer route {result.job.writerRouteId}</code>
                           </details>
-                        )}
+                        ) : null}
                         <ul>
                           {result.findings.map((finding) => (
                             <li key={`${finding.severity}-${finding.message}`}>
@@ -1654,8 +2428,7 @@ function Checks({
               </p>
             )}
             <p className="muted small">
-              D0 inspects fixed challenge patterns in separate read-only jobs. Its results prove
-              bounded job plumbing and carry no model judgment.
+              Scripted reviews inspect fixed challenge patterns. They do not contain model judgment.
             </p>
           </section>
         </>
@@ -1731,7 +2504,9 @@ function Checks({
         </div>
         {native ? (
           <p className="muted small" role="status">
-            {acceptanceReasons[acceptanceReason]}
+            {combined && !combined.accept.available
+              ? `Combined acceptance unavailable: ${titleCase(combined.accept.reason)}.`
+              : acceptanceReasons[acceptanceReason]}
           </p>
         ) : (
           !eligible && (
@@ -1996,6 +2771,15 @@ function GoogleSetup({ snapshot, workspace }: { snapshot: Snapshot; workspace: W
   );
 }
 
+function usageReading(value: UsageGaugeReading, label = value.label): UsageReading {
+  const { reserveNote, ...facts } = value;
+  return {
+    ...facts,
+    label,
+    ...(reserveNote === null ? {} : { reserveNote: 'See reserve details', note: reserveNote }),
+  };
+}
+
 function Usage({
   snapshot,
   run,
@@ -2006,10 +2790,8 @@ function Usage({
   workspace: Workspace;
 }) {
   const [readerMessage, setReaderMessage] = useState<string | null>(null);
-  const [readerChoice, setReaderChoice] = useState<boolean | null>(null);
   const [displayTime, setDisplayTime] = useState(Date.now);
-  const fixture =
-    workspace.preview || (snapshot.routes.length > 0 && snapshot.routes.every(({ fake }) => fake));
+  const fixture = workspace.preview;
   useEffect(() => {
     if (fixture) return;
     setDisplayTime(Date.now());
@@ -2017,26 +2799,19 @@ function Usage({
     return () => window.clearInterval(timer);
   }, [fixture]);
   const reader = snapshot.usageReaders.find((value) => value.family === 'google');
-  const readerEnabled = readerChoice ?? reader?.enabled ?? false;
-  useEffect(() => {
-    if (!workspace.pending) setReaderChoice(null);
-  }, [workspace.pending]);
   const connected = workspace.connection === 'connected' && !workspace.preview;
   const nextReadAt = reader?.lastAttemptAt ? Date.parse(reader.lastAttemptAt) + 60000 : null;
-  async function observeUsage(consent?: boolean) {
-    if (consent !== undefined) setReaderChoice(consent);
-    setReaderMessage(null);
+  async function observeUsage() {
+    setReaderMessage('Quota read in progress.');
     try {
       const result = await workspace.command({
         command: 'ObserveUsage',
         expectedRevision: 0,
-        payload: { family: 'google', ...(consent === undefined ? {} : { consent }) },
+        payload: { family: 'google' },
       });
       setReaderMessage(
         result.outcome === 'applied' || result.outcome === 'already-applied'
-          ? consent === false
-            ? 'Quota reads disabled. Prior windows retain their observation times.'
-            : 'Quota read completed.'
+          ? 'Quota read completed.'
           : [result.reason ?? result.outcome, result.next].filter(Boolean).join('. '),
       );
     } catch (failure) {
@@ -2049,6 +2824,23 @@ function Usage({
   );
   const now = fixture ? fixtureTime : displayTime;
   const cloud = snapshot.routes.filter(({ family }) => family !== 'local');
+  const scopes = projectUsagePresentation(snapshot, run?.policy.policy.reserves ?? null, now);
+  const cards: UsageCard[] = scopes.map((scope) => ({
+    id: scope.id,
+    title: scope.label,
+    scope: scope.scopeLabel,
+    tags: scope.fixture ? ['Fixture'] : undefined,
+    notice: scope.notice ?? undefined,
+    primary: [
+      ...(scope.primary.weekly ? [usageReading(scope.primary.weekly, 'Weekly')] : []),
+      ...(scope.primary.fiveHour ? [usageReading(scope.primary.fiveHour, 'Five-hour')] : []),
+    ],
+    featured: scope.featured ? usageReading(scope.featured) : null,
+    auxiliary: scope.satellites
+      .filter((reading) => reading !== scope.featured)
+      .map((reading) => usageReading(reading)),
+    emptyText: 'No usage observations.',
+  }));
   const local = snapshot.routes.find(({ family }) => family === 'local');
   return (
     <main className="usage-page">
@@ -2063,30 +2855,21 @@ function Usage({
             : 'Controller observations'}
         </span>
       </div>
+      <LocalSetup snapshot={snapshot} workspace={workspace} />
       <GoogleSetup snapshot={snapshot} workspace={workspace} />
       <section className="card" aria-labelledby="google-quota-title">
         <div className="section-heading">
           <h2 id="google-quota-title">Google quota</h2>
-          <span>{reader?.enabled ? 'Reads enabled' : 'Reads disabled'}</span>
+          <span>{reader?.available ? 'Available' : 'Unavailable'}</span>
         </div>
         <p className="muted small">
-          Reads Google quota through the CLI's headless /usage command with no model request.
-          Google's FAQ reserves headless mode for scripting and CI. Enabling requests one read.
-          Quota consent does not enable a writer.
+          Reads Google quota through the CLI's /usage command. No model request. Reads are on by
+          default when the pinned client is available.
         </p>
-        <label className="checkbox-label">
-          <input
-            type="checkbox"
-            checked={readerEnabled}
-            disabled={!reader || !connected || (workspace.pending && !readerEnabled)}
-            onChange={(event) => void observeUsage(event.target.checked)}
-          />{' '}
-          Enable quota reads
-        </label>
         <button
           type="button"
           className="button secondary"
-          disabled={!connected || workspace.pending || !reader?.enabled}
+          disabled={!connected || workspace.pending || !reader?.available}
           onClick={() => void observeUsage()}
         >
           <RefreshCw size={14} />
@@ -2099,57 +2882,41 @@ function Usage({
         {nextReadAt !== null && nextReadAt > now && (
           <p className="muted small">
             Cooldown until {new Date(nextReadAt).toLocaleTimeString()}. Refresh checks the
-            controller cooldown. Failed reads also count. No timer refreshes quota.
+            controller cooldown. Failed reads also count. Usage refreshes automatically about every
+            five minutes while connected.
           </p>
         )}
         {readerMessage && <p role="status">{readerMessage}</p>}
       </section>
       <section aria-labelledby="allowance-title">
         <div className="section-heading">
-          <h2 id="allowance-title">Route allowances</h2>
-          <span>Included subscriptions</span>
+          <h2 id="allowance-title">Provider allowances</h2>
+          <span>
+            {run ? 'Reserve markers follow the selected task run' : 'Reported observations'}
+          </span>
         </div>
-        <div className="allowance-grid">
-          {cloud.map((route) => {
-            const windows = snapshot.usage.filter(
-              ({ observation }) => observation.routeId === route.id,
-            );
-            return (
-              <section className="allowance-card" key={route.id}>
-                <div className="allowance-heading">
-                  <span className={`route-symbol ${familyClass(route.family)}`}>
-                    {route.family[0].toUpperCase()}
-                  </span>
-                  <div>
-                    <h3>{familyName(route.family)}</h3>
-                    <span>{route.model}</span>
-                  </div>
-                  {route.fake && <span className="fake-tag">Fake</span>}
+        {cards.length ? (
+          <>
+            <UsageGauges cards={cards} nowMs={now} />
+            <details className="technical-details">
+              <summary>Represented routes</summary>
+              {scopes.map((scope) => (
+                <div key={scope.id}>
+                  <p>
+                    {scope.label}: {scope.scopeLabel}
+                  </p>
+                  {scope.routeIds.map((id) => (
+                    <code key={id}>{id}</code>
+                  ))}
                 </div>
-                {windows.length ? (
-                  windows.map((window) => (
-                    <AllowanceWindow
-                      key={window.observation.windowId}
-                      window={window}
-                      now={now}
-                      reserve={
-                        run?.policy.policy.reserves.find(
-                          (reserve) =>
-                            reserve.routeId === route.id &&
-                            reserve.windowId === window.observation.windowId,
-                        )?.value ?? null
-                      }
-                    />
-                  ))
-                ) : (
-                  <Empty icon={<Gauge />} title="Unknown">
-                    No usage observation has been received.
-                  </Empty>
-                )}
-              </section>
-            );
-          })}
-        </div>
+              ))}
+            </details>
+          </>
+        ) : (
+          <Empty icon={<Gauge />} title="No provider allowance scope">
+            No cloud route is configured.
+          </Empty>
+        )}
       </section>
       <div className="capacity-grid">
         <section className="card activity-capacity">
@@ -2214,7 +2981,7 @@ function Usage({
             <span>Configured model</span>
             <span>{local?.model ?? 'Not configured'}</span>
           </div>
-          <p className="muted small">No hardware probe is connected in this prototype.</p>
+          <p className="muted small">Hardware measurements are unavailable.</p>
         </section>
       </div>
       <section className="card credits-card">
@@ -2231,131 +2998,18 @@ function Usage({
               <span className={`provider-dot ${familyClass(route.family)}`} />
               <div>
                 <strong>{familyName(route.family)}</strong>
-                <small>No paid route qualified for this demo</small>
+                <small>No account credit balance reported</small>
               </div>
-              <span className="credit-off">Off</span>
+              <span className="credit-off">Unknown</span>
             </div>
           ))}
         </div>
         <p className="muted small">
-          A provider limit never enables paid credit use. No billing controls are connected in D0.
+          Using existing credits requires a billing selection when preparing a run. A provider limit
+          does not grant that permission.
         </p>
       </section>
     </main>
-  );
-}
-
-function AllowanceWindow({
-  window,
-  now,
-  reserve,
-}: {
-  window: UsageWindow;
-  now: number;
-  reserve: number | null;
-}) {
-  const { observation } = window;
-  const state =
-    Date.parse(observation.observedAt) > now
-      ? 'unknown'
-      : observation.resetsAt !== null && Date.parse(observation.resetsAt) <= now
-        ? 'reset-pending'
-        : window.state === 'fresh' && now - Date.parse(observation.observedAt) > 300000
-          ? 'stale'
-          : window.state;
-  const percentage = observation.remaining?.unit === 'percent' ? observation.remaining.value : null;
-  const unknown = state === 'unknown' || observation.remaining === null;
-  const pending =
-    state === 'reset-pending' ||
-    (observation.resetsAt !== null && Date.parse(observation.resetsAt) <= now);
-  const remaining = unknown
-    ? 'Unknown'
-    : percentage !== null
-      ? `${percentage}%`
-      : `${observation.remaining?.value} ${observation.remaining?.unit}`;
-  const pattern = `hatch-${observation.routeId}-${observation.windowId}`;
-  return (
-    <div
-      className={`allowance-window ${unknown ? 'is-unknown' : ''} ${pending ? 'is-pending' : ''}`}
-    >
-      <div className="gauge-wrap">
-        <svg
-          viewBox="0 0 120 120"
-          role="img"
-          aria-label={`${observation.windowId} allowance: ${remaining}`}
-        >
-          <title>
-            {observation.windowId} allowance: {remaining}
-          </title>
-          <defs>
-            <pattern
-              id={pattern}
-              width="5"
-              height="5"
-              patternUnits="userSpaceOnUse"
-              patternTransform="rotate(45)"
-            >
-              <line x1="0" y1="0" x2="0" y2="5" stroke="var(--text-dim)" strokeWidth="2" />
-            </pattern>
-          </defs>
-          <circle className="gauge-track" cx="60" cy="60" r="46" fill="none" strokeWidth="9" />
-          <circle
-            className="gauge-fill"
-            cx="60"
-            cy="60"
-            r="46"
-            fill="none"
-            stroke={unknown ? `url(#${pattern})` : 'currentColor'}
-            strokeWidth="9"
-            strokeDasharray={unknown ? undefined : `${((percentage ?? 0) / 100) * 289.03} 289.03`}
-            transform="rotate(-90 60 60)"
-          />
-          {percentage !== null && reserve !== null && (
-            <line
-              x1="60"
-              y1="8"
-              x2="60"
-              y2="20"
-              transform={`rotate(${reserve * 3.6} 60 60)`}
-              stroke="var(--surface)"
-              strokeWidth="3"
-            />
-          )}
-        </svg>
-        <div className="gauge-value">
-          <strong className={unknown ? 'unknown-value' : ''}>{remaining}</strong>
-          <span>{unknown ? 'No report' : 'remaining'}</span>
-        </div>
-      </div>
-      <div className="window-name">
-        <span>{titleCase(observation.windowId)}</span>
-        {percentage !== null && (
-          <span>{reserve === null ? 'No run reserve' : `${reserve}% reserve`}</span>
-        )}
-      </div>
-      <div className="reset-line">
-        <Clock size={13} />
-        <span>
-          {pending
-            ? 'Reset pending confirmation'
-            : observation.resetsAt
-              ? `Resets in ${duration(Date.parse(observation.resetsAt) - now)}`
-              : 'Reset time unknown'}
-        </span>
-      </div>
-      <div className="observation-line">
-        <span>Observed {duration(now - Date.parse(observation.observedAt))} ago</span>
-        <span>{observation.source}</span>
-      </div>
-      {state === 'stale' && (
-        <p className="window-warning">
-          {observation.source === 'fixture'
-            ? 'Scripted usage expires after five minutes. It does not refresh automatically. Before preparing a run, choose how unknown usage is handled in Policy.'
-            : 'Stale observation. The percentage rule is unavailable until a fresh report arrives.'}
-        </p>
-      )}
-      {unknown && <p className="window-warning">Waiting for a usable observation.</p>}
-    </div>
   );
 }
 
@@ -2370,10 +3024,10 @@ function CreateTask({
   onClose: () => void;
   onCreated: (id: string) => void;
 }) {
-  const template = createDemoFixtures().task;
-  const [title, setTitle] = useState(template.title);
-  const [outcome, setOutcome] = useState(template.outcome);
-  const [criteria, setCriteria] = useState(template.criteria.join('\n'));
+  const [template] = useState(() => (workspace.preview ? createDemoFixtures().task : null));
+  const [title, setTitle] = useState(template?.title ?? '');
+  const [outcome, setOutcome] = useState(template?.outcome ?? '');
+  const [criteria, setCriteria] = useState(template?.criteria.join('\n') ?? '');
   const [projectId, setProjectId] = useState(snapshot.projects[0]?.id ?? '');
   const [message, setMessage] = useState<string | null>(null);
   const payload = {
@@ -2520,7 +3174,7 @@ const credits = [
   },
 ];
 
-function About({ onClose }: { onClose: () => void }) {
+function About({ onClose, preview }: { onClose: () => void; preview: boolean }) {
   return (
     <Dialog title="About CrewKite" eyebrow="LOCAL CODING WORKSPACE" onClose={onClose}>
       <div className="about-content">
@@ -2528,10 +3182,12 @@ function About({ onClose }: { onClose: () => void }) {
           One controller owns task state, authority and result identity. The desktop and CLI are
           clients of the same workspace.
         </p>
-        <div className="about-build">
-          <span className="prototype-tag">D0</span>
-          <span>Scripted providers · no live inference qualification</span>
-        </div>
+        {preview && (
+          <div className="about-build">
+            <span className="prototype-tag">D0</span>
+            <span>Scripted providers · no live inference qualification</span>
+          </div>
+        )}
         <h3>Method acknowledgments</h3>
         <p className="muted">
           These projects shaped the review methods. Credits describe method influence. No runtime
@@ -2557,8 +3213,8 @@ function About({ onClose }: { onClose: () => void }) {
           ))}
         </div>
         <p className="muted small">
-          Method configuration and any scripted evaluation are disclosed in the launch policy. This
-          prototype does not establish that model review jobs ran.
+          Method configuration is saved in the run policy. Candidate evidence records the checks and
+          reviews that ran.
         </p>
         <div className="about-license">
           <span>Apache License 2.0</span>

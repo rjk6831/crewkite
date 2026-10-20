@@ -434,6 +434,8 @@ type NativeControls = {
   now?: () => number;
   deadline?: number;
   schedule?: Schedule;
+  groupAbsent?: typeof groupAbsent;
+  signalGroup?: (group: number, signal: NodeJS.Signals) => void;
   spawn?: (
     executable: string,
     args: string[],
@@ -508,7 +510,7 @@ function nativeClock(options: NativeLaunch, maximum: number) {
     if (remaining() <= CLEANUP_MS) throw new GoogleWriterError('deadline');
   };
   check();
-  return { remaining, check };
+  return { remaining, check, now };
 }
 
 function nativeLaunch(options: NativeLaunch, logFile: string) {
@@ -566,6 +568,7 @@ function nativeLaunch(options: NativeLaunch, logFile: string) {
         LANG: 'en_US.UTF-8',
         TERM: 'dumb',
         NO_COLOR: '1',
+        AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
         TMPDIR: temporary,
       },
     };
@@ -633,11 +636,11 @@ function ownedNativeCommand(
     stderrTail = '';
   const timers: Array<() => void> = [];
   const complete = Promise.withResolvers<NativeExit>();
-  const absent = () => group > 0 && groupAbsent(group);
+  const absent = () => group > 0 && (options.groupAbsent ?? groupAbsent)(group);
   const send = (value: NodeJS.Signals) => {
     if (group > 0 && !absent())
       try {
-        process.kill(-group, value);
+        (options.signalGroup ?? ((group, signal) => process.kill(-group, signal)))(group, value);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ESRCH') reason ??= 'not-quiescent';
       }
@@ -668,14 +671,33 @@ function ownedNativeCommand(
   };
   const later = (work: () => void, delay: number) =>
     timers.push(schedule(work, Math.max(0, Math.min(delay, clock.remaining()))));
+  let killedAt: number | undefined;
+  const finishAtCutoff = () => {
+    if (!closed && absent()) later(finish, 0);
+    else finish();
+  };
+  const cutoff = () => {
+    if (finished) return;
+    if (absent()) return finishAtCutoff();
+    setImmediate(() => {
+      if (finished) return;
+      if (absent()) return finishAtCutoff();
+      const late = killedAt === undefined ? 0 : killedAt + CLEANUP_MS - 250 - clock.now();
+      if (late > 0) later(finishAtCutoff, late);
+      else finish();
+    });
+  };
   const stop = (failure: Reason | null) => {
     reason ??= failure;
     if (stopping) return;
     stopping = true;
     if (closed && absent()) return finish();
     send('SIGTERM');
-    later(() => send('SIGKILL'), 250);
-    later(finish, Math.min(CLEANUP_MS, clock.remaining()));
+    later(() => {
+      killedAt = clock.now();
+      send('SIGKILL');
+    }, 250);
+    later(cutoff, Math.min(CLEANUP_MS, clock.remaining()));
   };
   const abort = () => stop('cancelled');
   child.stdout?.on('data', (chunk: Buffer) => {
@@ -1003,7 +1025,7 @@ export function startGoogleConfig(options: NativeLaunch) {
 }
 
 // The /usage command reports account buckets, one per quota window, with zero model turns.
-// A bucket is an account fact, so the caller attaches it to every Google route it names.
+// Account observations remain complete; admission selects the applicable model pools.
 const usageBucket = z.looseObject({
   id: text(64),
   remaining_fraction: z.number().finite().min(0).max(1),
@@ -1025,6 +1047,7 @@ const usageOutput = z.looseObject({
 export type GoogleUsageBucket = Readonly<{
   windowId: string;
   kind: 'weekly' | 'rolling' | 'model';
+  semantics?: Observation['semantics'];
   remainingPercent: number;
   resetsAt: string;
 }>;
@@ -1033,6 +1056,13 @@ function usageWindowKind(id: string): GoogleUsageBucket['kind'] {
   if (/-weekly$/.test(id)) return 'weekly';
   if (/-\d+h$/.test(id)) return 'rolling';
   return 'model';
+}
+
+function usageWindowSemantics(id: string): Observation['semantics'] {
+  if (id === 'gemini-weekly') return { scope: 'provider', periodSeconds: 604800 };
+  if (id === 'gemini-5h') return { scope: 'provider', periodSeconds: 18000 };
+  if (id === 'gemini-argon-wtu-weekly') return { scope: 'model', periodSeconds: 604800 };
+  return undefined;
 }
 
 export function projectGoogleUsage(stdout: Uint8Array): GoogleUsageBucket[] {
@@ -1049,9 +1079,11 @@ export function projectGoogleUsage(stdout: Uint8Array): GoogleUsageBucket[] {
   const fractions = new Map<string, number>();
   for (const group of parsed.data.command.data.groups)
     for (const bucket of group.buckets) {
+      const semantics = usageWindowSemantics(bucket.id);
       const next: GoogleUsageBucket = {
         windowId: bucket.id,
         kind: usageWindowKind(bucket.id),
+        ...(semantics ? { semantics } : {}),
         remainingPercent: bucket.remaining_fraction * 100,
         resetsAt: new Date(bucket.reset_time).toISOString(),
       };
@@ -1080,6 +1112,7 @@ export function googleUsageObservations(
       routeId,
       windowId: bucket.windowId,
       kind: bucket.kind,
+      ...(bucket.semantics ? { semantics: bucket.semantics } : {}),
       remaining: { value: bucket.remainingPercent, unit: 'percent' as const },
       resetsAt: bucket.resetsAt,
       observedAt,
@@ -1087,6 +1120,24 @@ export function googleUsageObservations(
       confidence: 'reported' as const,
     })),
   );
+}
+
+export const GoogleFlashQuotaModelId = 'gemini-3.8-flash';
+
+export function googleQuotaWindows<T extends { windowId: string }>(
+  modelId: string,
+  observations: readonly T[],
+): { windows: T[]; missingRequired: boolean } {
+  if (modelId !== GoogleFlashQuotaModelId)
+    return { windows: [...observations], missingRequired: false };
+  // This exact model has a separate pool from the independently reported Argon bucket.
+  const windows = observations.filter((window) => window.windowId !== 'gemini-argon-wtu-weekly');
+  return {
+    windows,
+    missingRequired: ['gemini-weekly', 'gemini-5h'].some(
+      (id) => !windows.some((window) => window.windowId === id),
+    ),
+  };
 }
 
 export function startGoogleUsage(options: NativeLaunch) {

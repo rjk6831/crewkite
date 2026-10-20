@@ -1,0 +1,640 @@
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { once } from 'node:events';
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  truncateSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { PassThrough } from 'node:stream';
+import { test } from 'node:test';
+import { inspect } from 'node:util';
+import { hashCanonical } from '@crewkite/contracts/hash';
+import {
+  localConfiguredConnectionHash,
+  localConnectionHash,
+  resolveLocalConnection,
+} from './connection.ts';
+import {
+  LocalInputBindingSchema,
+  type LocalInputChild,
+  type LocalInputHelper,
+  resolveLocalInputHelper,
+  startLocalSecretInput,
+} from './secure-input.ts';
+
+const digest = (bytes: string) => createHash('sha256').update(bytes).digest('hex');
+const binding = {
+  version: 1 as const,
+  operationId: 'cmd_01ARZ3NDEKTSV4RRFFQ69G5FAV',
+  nonce: 'a'.repeat(64),
+  setupHash: 'b'.repeat(64),
+  connectionHash: localConnectionHash('ws://127.0.0.1:1234', 'b'.repeat(64)),
+  revision: 1,
+};
+const prompt = { binding, endpoint: 'ws://127.0.0.1:1234' };
+const configuredBinding = {
+  version: 2 as const,
+  operationId: binding.operationId,
+  nonce: binding.nonce,
+  connectionHash: localConfiguredConnectionHash(prompt.endpoint, 2),
+  connectionRevision: 2,
+};
+const configuredPrompt = { binding: configuredBinding, endpoint: prompt.endpoint };
+const descriptor: LocalInputHelper = {
+  root: '/owned/runtime',
+  sha256: digest('synthetic helper'),
+  sourceHash: digest('synthetic helper source'),
+  target: 'darwin-arm64',
+};
+const secret = ' synthetic-connection-secret ';
+const submitted = { binding, outcome: 'submitted', secret };
+function frame(value: unknown) {
+  const bytes = Buffer.from(JSON.stringify(value));
+  const header = Buffer.alloc(4);
+  header.writeUInt32BE(bytes.length);
+  return Buffer.concat([header, bytes]);
+}
+function fixture(reapOnKill = false) {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const inputBytes: Buffer[] = [];
+  input.on('data', (bytes: Buffer) => inputBytes.push(bytes));
+  let onSpawn: (() => void) | undefined;
+  let onError: (() => void) | undefined;
+  let onClose: ((code: number | null, signal: NodeJS.Signals | null) => void) | undefined;
+  let clock = 0,
+    absent = false;
+  const timers: Array<{ at: number; work: () => void; active: boolean }> = [];
+  const launches: Array<{ executable: string; settings: unknown }> = [];
+  const signals: NodeJS.Signals[] = [];
+  const child: LocalInputChild = {
+    group: 12345,
+    input,
+    output,
+    onSpawn: (handler) => {
+      onSpawn = handler;
+    },
+    onError: (handler) => {
+      onError = handler;
+    },
+    onClose: (handler) => {
+      onClose = handler;
+    },
+  };
+  const options = {
+    platform: 'darwin',
+    arch: 'arm64',
+    now: () => clock,
+    schedule: (work: () => void, delay: number) => {
+      const timer = { at: clock + delay, work, active: true };
+      timers.push(timer);
+      return () => {
+        timer.active = false;
+      };
+    },
+    verifyHelper: (value: LocalInputHelper) => {
+      assert.deepEqual(value, descriptor);
+      return '/owned/runtime/bin/local-secure-input';
+    },
+    launch: (executable: string, settings: unknown) => {
+      launches.push({ executable, settings });
+      return child;
+    },
+    groupAbsent: (group: number) => {
+      assert.equal(group, 12345);
+      return absent;
+    },
+    signal: (group: number, value: NodeJS.Signals) => {
+      assert.equal(group, 12345);
+      signals.push(value);
+      if (reapOnKill && value === 'SIGKILL') absent = true;
+    },
+  };
+  return {
+    options,
+    child,
+    input,
+    output,
+    launches,
+    inputBytes,
+    signals,
+    spawn: () => onSpawn?.(),
+    error: () => onError?.(),
+    absent: () => {
+      absent = true;
+    },
+    close: async (code: number | null = 0, signal: NodeJS.Signals | null = null, ended = true) => {
+      if (ended) {
+        const end = once(output, 'end');
+        output.end();
+        output.resume();
+        await end;
+      }
+      onClose?.(code, signal);
+    },
+    jump: (milliseconds: number) => {
+      clock += milliseconds;
+    },
+    fire: (delay: number) => {
+      const timer = timers.find((value) => value.active && value.at === delay);
+      assert(timer, `pending ${delay}ms timer`);
+      timer.active = false;
+      timer.work();
+    },
+    advance: (milliseconds: number) => {
+      clock += milliseconds;
+      for (;;) {
+        const next = timers
+          .filter((value) => value.active && value.at <= clock)
+          .sort((a, b) => a.at - b.at)[0];
+        if (!next) break;
+        next.active = false;
+        next.work();
+      }
+    },
+  };
+}
+
+test('Local secret input returns one current private result after helper cleanup', async () => {
+  const receipt = {
+    version: 1,
+    runtimeVersion: '0.4.26+4',
+    artifactSha256: 'cd76ec205963b3b33350093e6904d9de16c4e666fd104e1f632d25c7f15f2a13',
+    artifactSizeBytes: 5627044256,
+    quantization: 'Q4_K_M',
+    model: {
+      modelKey: 'local-fixture',
+      instanceReference: 'instance-1',
+      modelSizeBytes: 5627044256,
+    },
+    contextLength: 8192,
+    residentLlms: 1,
+    embeddingInstances: 0,
+    draftModel: '',
+  };
+  const capability = { platform: 'darwin', arch: 'arm64', secretConfigured: true };
+  const legacyConfiguration = { endpoint: prompt.endpoint, receipt };
+  assert.equal(
+    resolveLocalConnection(legacyConfiguration, capability).facts.reason,
+    'model-setup-unavailable',
+  );
+  const runtime = { connectorId: 'local-sdk-v1', version: '0.5.0', build: 9 };
+  const identity = {
+    modelKey: 'fixture/new-model',
+    displayName: 'Installed fixture',
+    format: 'safetensors',
+    sizeBytes: 1234567,
+    quantization: { name: 'fixture-quant', bits: 6 },
+    selectedVariant: 'fixture-variant',
+    metadataHash: digest('runtime metadata'),
+  };
+  const selectionId = hashCanonical({ runtime, metadataHash: identity.metadataHash });
+  const observed = {
+    version: 1,
+    runtime,
+    residentLlms: 1,
+    embeddingInstances: 0,
+    models: [
+      {
+        selectionId,
+        identity,
+        instanceReference: 'new-instance',
+        contextLength: 8192,
+        state: 'loaded-eligible',
+        reasons: [],
+        qualification: 'unqualified',
+      },
+    ],
+  };
+  const selection = {
+    endpoint: prompt.endpoint,
+    connectionRevision: 2,
+    selectionId,
+    observation: { ...observed, observationHash: hashCanonical(observed) },
+  };
+  const selected = resolveLocalConnection(selection, capability);
+  assert.equal(selected.facts.available, true);
+  assert.equal(selected.facts.family, 'local');
+  assert.equal(selected.facts.billing, 'local');
+  assert(!('creditPolicies' in selected.facts));
+  assert.equal(selected.facts.reason, 'qualification-pending');
+  assert.equal(selected.facts.qualifiedAt, null);
+  assert.equal(selected.connection?.modelBinding.modelKey, identity.modelKey);
+  assert.equal(
+    selected.connection?.connectionHash,
+    localConfiguredConnectionHash(prompt.endpoint, 2),
+  );
+  assert.ok(selected.connection && 'version' in selected.connection.modelBinding);
+  assert.equal(selected.connection.authMode, 'token');
+  assert(!Object.hasOwn(selected.connection.modelBinding, 'authMode'));
+  assert.equal(
+    localConfiguredConnectionHash(prompt.endpoint, 2, 'token'),
+    hashCanonical({ connector: 'local-sdk-v1', endpoint: prompt.endpoint, connectionRevision: 2 }),
+  );
+  for (const connected of [false, true]) {
+    const none = resolveLocalConnection(
+      { ...selection, authMode: 'none' },
+      { ...capability, secretConfigured: false, connected },
+    );
+    assert(none.connection && 'version' in none.connection.modelBinding);
+    assert.equal(none.facts.available, connected);
+    assert.equal(none.connection.authMode, 'none');
+    assert.equal(none.connection.modelBinding.authMode, 'none');
+    assert.equal(
+      none.connection.connectionHash,
+      localConfiguredConnectionHash(prompt.endpoint, 2, 'none'),
+    );
+    assert.notEqual(none.connection.connectionHash, selected.connection.connectionHash);
+    assert.notEqual(
+      none.connection.modelBinding.setupHash,
+      selected.connection.modelBinding.setupHash,
+    );
+  }
+  assert.equal(
+    resolveLocalConnection({ ...selection, authMode: 'none' }, capability).facts.available,
+    false,
+  );
+  assert.equal(
+    resolveLocalConnection(selection, { ...capability, secretConfigured: false, connected: true })
+      .facts.available,
+    false,
+  );
+  assert(!('artifactSha256' in selected.connection.modelBinding));
+  assert.equal(
+    selected.connection.modelBinding.setupHash,
+    hashCanonical({
+      version: 2,
+      connectionHash: selected.connection.connectionHash,
+      observationHash: selection.observation.observationHash,
+      selectionId,
+    }),
+  );
+  const changedConnection = resolveLocalConnection(
+    { ...selection, connectionRevision: 3 },
+    capability,
+  );
+  assert.notEqual(changedConnection.connection?.connectionHash, selected.connection.connectionHash);
+  assert.notEqual(
+    changedConnection.connection?.modelBinding.setupHash,
+    selected.connection.modelBinding.setupHash,
+  );
+  for (const invalid of [
+    { ...selection, selectionId: digest('missing choice') },
+    { ...selection, observation: { ...selection.observation, observationHash: digest('stale') } },
+    { ...selection, connectionRevision: -1 },
+    { ...selection, authMode: 'automatic' },
+    { ...selection, receipt },
+    { ...selection, observation: { ...selection.observation, models: [] } },
+  ])
+    assert.equal(resolveLocalConnection(invalid, capability).connection, null);
+  const unloaded = {
+    ...observed,
+    residentLlms: 0,
+    models: [
+      {
+        ...observed.models[0],
+        instanceReference: null,
+        contextLength: null,
+        state: 'installed-unloaded',
+      },
+    ],
+  };
+  assert.equal(
+    resolveLocalConnection(
+      { ...selection, observation: { ...unloaded, observationHash: hashCanonical(unloaded) } },
+      capability,
+    ).connection,
+    null,
+  );
+  assert.equal(
+    resolveLocalConnection(selection, { ...capability, secretConfigured: false }).facts.available,
+    false,
+  );
+  for (const [input, platform] of [
+    [null, capability],
+    [legacyConfiguration, capability],
+    [{ ...legacyConfiguration, authMode: 'none' }, capability],
+    [selection, { ...capability, platform: 'linux' }],
+    [selection, { ...capability, arch: 'x64' }],
+    [{ ...selection, token: secret }, capability],
+    [{ ...selection, endpoint: 'ws://localhost:1234' }, capability],
+    [{ ...selection, endpoint: 'ws://127.0.0.1:65536' }, capability],
+    ...[
+      { ...observed, residentLlms: 2 },
+      { ...observed, embeddingInstances: 1 },
+      { ...observed, models: [{ ...observed.models[0], contextLength: 16384 }] },
+      { ...observed, models: [{ ...observed.models[0], instanceReference: 'bad\ninstance' }] },
+    ].map(
+      (observation) =>
+        [
+          {
+            ...selection,
+            observation: { ...observation, observationHash: hashCanonical(observation) },
+          },
+          capability,
+        ] as const,
+    ),
+  ] as const) {
+    const refused = resolveLocalConnection(input, platform);
+    assert.equal(refused.facts.available, false);
+    assert.equal(refused.connection, null);
+    assert(!JSON.stringify(refused).includes(secret));
+  }
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), 'local-input-')));
+  try {
+    mkdirSync(join(directory, 'bin'));
+    const executable = join(directory, 'bin/local-secure-input');
+    writeFileSync(executable, 'synthetic helper', { mode: 0o500 });
+    const helper = { ...descriptor, root: directory };
+    assert.equal(resolveLocalInputHelper(helper), executable);
+    assert.throws(() => resolveLocalInputHelper({ ...helper, sha256: 'f'.repeat(64) }));
+    assert.throws(() => resolveLocalInputHelper({ ...helper, token: secret }));
+    chmodSync(executable, 0o520);
+    assert.throws(() => resolveLocalInputHelper(helper));
+    chmodSync(executable, 0o500);
+    chmodSync(executable, 0o700);
+    for (const size of [0, 1024 * 1024 + 1]) {
+      truncateSync(executable, size);
+      assert.throws(() => resolveLocalInputHelper(helper));
+    }
+    rmSync(executable);
+    symlinkSync('/dev/null', executable);
+    assert.throws(() => resolveLocalInputHelper(helper));
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+
+  const valid = fixture();
+  const owner = startLocalSecretInput(prompt, descriptor, valid.options);
+  valid.spawn();
+  assert.deepEqual(valid.launches, [
+    {
+      executable: '/owned/runtime/bin/local-secure-input',
+      settings: {
+        cwd: descriptor.root,
+        detached: true,
+        stdio: ['pipe', 'ignore', 'ignore', 'pipe'],
+        env: { LANG: 'C.UTF-8' },
+      },
+    },
+  ]);
+  assert(!Buffer.concat(valid.inputBytes).includes(Buffer.from(secret)));
+  const resultBytes = frame(submitted);
+  for (const bytes of [
+    resultBytes.subarray(0, 2),
+    resultBytes.subarray(2, 11),
+    resultBytes.subarray(11),
+  ])
+    valid.output.write(bytes);
+  let settled = false;
+  void owner.result.then(() => {
+    settled = true;
+  });
+  await Promise.resolve();
+  assert.equal(settled, false);
+  valid.absent();
+  await valid.close();
+  const ready = await owner.result;
+  assert.equal(ready.kind, 'ready');
+  if (ready.kind === 'ready') assert(Object.isFrozen(ready.binding));
+  assert(!JSON.stringify(ready).includes(secret));
+  assert(!inspect(ready, { showHidden: true }).includes(secret));
+  if (ready.kind !== 'ready') throw Error('Expected a private candidate.');
+  assert.equal(ready.candidate.take(binding), secret);
+  assert.equal(ready.candidate.take(binding), null);
+
+  assert.deepEqual(LocalInputBindingSchema.parse(binding), binding);
+  assert.deepEqual(LocalInputBindingSchema.parse(configuredBinding), configuredBinding);
+  const configured = fixture();
+  const configuredOwner = startLocalSecretInput(configuredPrompt, descriptor, configured.options);
+  const privateRequest = JSON.parse(
+    Buffer.concat(configured.inputBytes).subarray(4).toString('utf8'),
+  );
+  assert.deepEqual(privateRequest, { ...configuredPrompt, timeoutMs: 60000 });
+  assert(!('setupHash' in privateRequest.binding));
+  assert(!JSON.stringify(privateRequest).includes(secret));
+  configured.output.write(frame({ binding: configuredBinding, outcome: 'submitted', secret }));
+  let configuredSettled = false;
+  void configuredOwner.result.then(() => {
+    configuredSettled = true;
+  });
+  await Promise.resolve();
+  assert.equal(configuredSettled, false);
+  configured.absent();
+  await configured.close();
+  const configuredReady = await configuredOwner.result;
+  assert.equal(configuredReady.kind, 'ready');
+  assert(!JSON.stringify(configuredReady).includes(secret));
+  assert(!inspect(configuredReady, { showHidden: true }).includes(secret));
+  if (configuredReady.kind !== 'ready') throw Error('Expected a private configured candidate.');
+  assert.equal(configuredReady.candidate.take(configuredBinding), secret);
+  assert.equal(configuredReady.candidate.take(configuredBinding), null);
+
+  for (const invalid of [
+    { ...configuredPrompt, endpoint: 'ws://127.0.0.1:1235' },
+    ...[
+      { version: 3 },
+      { connectionHash: binding.connectionHash },
+      { connectionRevision: 3 },
+      { connectionRevision: undefined },
+      { connectionRevision: -1 },
+      { setupHash: binding.setupHash },
+      { revision: binding.revision },
+      { model: 'synthetic-model' },
+    ].map((patch) => ({ ...configuredPrompt, binding: { ...configuredBinding, ...patch } })),
+  ]) {
+    const child = fixture();
+    assert.throws(() => startLocalSecretInput(invalid, descriptor, child.options));
+    assert.equal(child.launches.length, 0);
+  }
+  for (const returned of [
+    binding,
+    { ...configuredBinding, nonce: 'e'.repeat(64) },
+    { ...configuredBinding, operationId: 'cmd_01ARZ3NDEKTSV4RRFFQ69G5FAW' },
+    { ...configuredBinding, connectionRevision: 3 },
+    { ...configuredBinding, connectionHash: 'f'.repeat(64) },
+    { ...configuredBinding, setupHash: binding.setupHash },
+  ]) {
+    const child = fixture();
+    const current = startLocalSecretInput(configuredPrompt, descriptor, child.options);
+    child.output.write(frame({ binding: returned, outcome: 'submitted', secret }));
+    child.absent();
+    await child.close();
+    const refused = await current.result;
+    assert.equal(refused.kind, 'failed');
+    assert(!JSON.stringify(refused).includes(secret));
+  }
+  for (const expected of [
+    { ...configuredBinding, connectionRevision: 3 },
+    { ...binding, connectionHash: configuredBinding.connectionHash },
+  ]) {
+    const child = fixture();
+    const current = startLocalSecretInput(configuredPrompt, descriptor, child.options);
+    child.output.write(frame({ binding: configuredBinding, outcome: 'submitted', secret }));
+    child.absent();
+    await child.close();
+    const result = await current.result;
+    if (result.kind !== 'ready') throw Error('Expected a private configured candidate.');
+    assert.equal(result.candidate.take(expected), null);
+    assert.equal(result.candidate.take(configuredBinding), null);
+  }
+
+  for (const boundary of ['late-frame', 'late-close-timer', 'late-close-delayed-timer'] as const) {
+    const child = fixture();
+    const current = startLocalSecretInput(prompt, descriptor, child.options);
+    if (boundary === 'late-frame') child.jump(62000);
+    else child.jump(59000);
+    child.output.write(frame(submitted));
+    if (boundary === 'late-close-timer') child.advance(3000);
+    if (boundary === 'late-close-delayed-timer') child.jump(3000);
+    child.absent();
+    await child.close();
+    const result = await current.result;
+    assert.equal(result.kind, boundary === 'late-frame' ? 'failed' : 'ready');
+    if (result.kind === 'ready') result.candidate.discard();
+  }
+  const lateVerification = fixture();
+  const verifying = startLocalSecretInput(prompt, descriptor, {
+    ...lateVerification.options,
+    verifyHelper: (helper) => {
+      lateVerification.jump(60000);
+      return lateVerification.options.verifyHelper(helper);
+    },
+  });
+  assert.equal(lateVerification.launches.length, 0);
+  assert.deepEqual(await verifying.result, {
+    kind: 'failed',
+    reason: 'deadline',
+    clientQuiescent: true,
+  });
+
+  for (const payload of [
+    { ...submitted, binding: { ...binding, nonce: 'e'.repeat(64) } },
+    { ...submitted, binding: { ...binding, revision: 2 } },
+    { ...submitted, secret: '' },
+    { ...submitted, secret: ' ' },
+    { ...submitted, secret: 'a'.repeat(4097) },
+    { ...submitted, secret: 'x\ny' },
+    { ...submitted, secret: 'x\u2028y' },
+    { ...submitted, secret: '\ud800' },
+    { ...submitted, extra: true },
+  ]) {
+    const child = fixture();
+    const current = startLocalSecretInput(prompt, descriptor, child.options);
+    child.output.write(frame(payload));
+    child.absent();
+    await child.close();
+    const result = await current.result;
+    assert.equal(result.kind, 'failed');
+    assert(!JSON.stringify(result).includes(secret));
+  }
+  for (const bytes of [
+    Buffer.concat([frame(submitted), frame(submitted)]),
+    Buffer.concat([frame(submitted), Buffer.from([0])]),
+    Buffer.from([0, 0, 0, 1, 0xff]),
+    Buffer.from([0, 0, 128, 1]),
+    frame(submitted).subarray(0, 20),
+  ]) {
+    const child = fixture();
+    const current = startLocalSecretInput(prompt, descriptor, child.options);
+    child.output.write(bytes);
+    child.absent();
+    await child.close();
+    assert.equal((await current.result).kind, 'failed');
+  }
+  for (const outcome of ['cancelled', 'failed'] as const) {
+    const child = fixture();
+    const current = startLocalSecretInput(prompt, descriptor, child.options);
+    child.output.write(frame({ binding, outcome }));
+    child.absent();
+    await child.close();
+    assert.equal((await current.result).kind, outcome === 'cancelled' ? 'cancelled' : 'failed');
+  }
+  for (const boundary of [
+    'group-present',
+    'exit-failed',
+    'signal',
+    'streams-open',
+    'stop',
+    'deadline',
+  ] as const) {
+    const child = fixture();
+    const current = startLocalSecretInput(prompt, descriptor, child.options);
+    child.output.write(frame(submitted));
+    if (boundary !== 'group-present') child.absent();
+    if (boundary === 'stop') current.stop();
+    if (boundary === 'deadline') child.advance(65000);
+    else
+      await child.close(
+        boundary === 'exit-failed' ? 1 : 0,
+        boundary === 'signal' ? 'SIGTERM' : null,
+        boundary !== 'streams-open',
+      );
+    if (boundary === 'group-present') {
+      child.advance(5000);
+      await new Promise((resolve) => setImmediate(resolve));
+      child.advance(2500);
+    }
+    assert.equal((await current.result).kind, 'failed');
+  }
+  for (const boundary of ['wrong-binding', 'revoke-ready'] as const) {
+    const child = fixture();
+    const current = startLocalSecretInput(prompt, descriptor, child.options);
+    child.output.write(frame(submitted));
+    child.absent();
+    await child.close();
+    const result = await current.result;
+    if (result.kind !== 'ready') throw Error('Expected a private candidate.');
+    if (boundary === 'revoke-ready') current.stop();
+    assert.equal(
+      result.candidate.take(boundary === 'wrong-binding' ? { ...binding, revision: 2 } : binding),
+      null,
+    );
+    assert.equal(result.candidate.take(binding), null);
+  }
+  const missing = fixture();
+  const waiting = startLocalSecretInput(prompt, descriptor, missing.options);
+  missing.advance(65000);
+  assert.equal((await waiting.result).kind, 'failed');
+  assert(missing.signals.includes('SIGKILL'));
+  const lateKill = fixture(true);
+  const late = startLocalSecretInput(prompt, descriptor, lateKill.options);
+  lateKill.output.write(frame(submitted));
+  await lateKill.close();
+  lateKill.jump(5000);
+  lateKill.fire(5000);
+  lateKill.fire(2500);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(await late.result, {
+    kind: 'failed',
+    reason: 'ownership',
+    clientQuiescent: true,
+  });
+  const failedSpawn = fixture();
+  failedSpawn.child.group = 0;
+  const launching = startLocalSecretInput(prompt, descriptor, failedSpawn.options);
+  failedSpawn.error();
+  await failedSpawn.close(1);
+  assert.deepEqual(await launching.result, {
+    kind: 'failed',
+    reason: 'helper',
+    clientQuiescent: true,
+  });
+  for (const invalid of [
+    { ...prompt, token: secret },
+    { ...prompt, endpoint: 'ws://localhost:1234' },
+    { ...prompt, binding: { ...binding, connectionHash: 'f'.repeat(64) } },
+  ])
+    assert.throws(
+      () => startLocalSecretInput(invalid, descriptor, fixture().options),
+      /Local input configuration is unavailable/,
+    );
+});

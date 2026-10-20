@@ -45,7 +45,7 @@ Some things never get the short version: input validation at trust boundaries, e
 
 ## Tests
 
-Read [docs/testing.md](docs/testing.md) before adding tests. Each test names the claim it protects and runs at the lowest layer that can observe it. `pnpm verify` runs the whole suite and must stay under five minutes.
+Read [docs/testing.md](docs/testing.md) before adding tests. Each test names the claim it protects and runs at the lowest layer that can observe it. Keep the D0 `pnpm verify` benchmark under five minutes. The full D2 collection has a ten-minute CI allowance.
 
 ## Documentation
 

@@ -22,9 +22,11 @@ Task commands use IDs returned by the controller:
 |---------|----------|
 | `task show <task-id>` | Show the current task and snapshot cursor |
 | `task watch <task-id>` | Stream events after a snapshot, with replay after reconnect |
+| `task amend <task-id> --title text --outcome text --criterion text [--criterion text ...]` | Replace the full contract using the current task revision, preserving the task ID |
+| `task pause <task-id>` | Close admissions for the exact current run; owned work may finish |
 | `task start <task-id>` | Start the prepared run |
 | `task stop <task-id>` | Request stop using the current task revision |
-| `task resume <task-id>` | Resume an interrupted run through controller admission |
+| `task resume <task-id>` | Explicitly request Resume through controller admission; native restart is unavailable |
 | `task approve <approval-id>` | Approve the exact pending binding from the snapshot |
 | `task deny <approval-id>` | Deny that binding |
 | `task accept <task-id> <destination-ref>` | Request the checked candidate as a new local branch |
@@ -40,20 +42,96 @@ Task show and watch snapshots include the current task's pending approvals and n
 
 Watch retains its cursor while the controller is offline. If the bounded reconnect window ends, it prints the next action and exits with status 1. Start the controller and run watch again to reconnect explicitly.
 
+## Task conversations
+
+A discussion starts from a goal. It needs no manually written acceptance criteria. Choose a primary planning role, the supported profile and finite task limits before consenting to a counted planning turn:
+
+```sh
+pnpm crewkite conversation create <project-id> --text "Repair the checkout total" --role lead --profile openai-file-v1 --credit-policy ordinary --attempts 8 --minutes 20 --concurrency 2 --consent --json
+pnpm crewkite conversation show <task-id> --json
+pnpm crewkite conversation send <task-id> --text "Explain the failure before proposing edits" --json
+```
+
+`lead` and `orchestrator` are distinct primary roles. The profile is currently limited to `openai-file-v1`; role availability still comes from controller admission. Limits require 1 to 100 attempts, 1 to 1440 minutes and 1 to 16 concurrent attempts. They cover planning and later execution together. Every selection is explicit, including `ordinary` or `existing-credits`. Creation can launch planning under that consent. Viewing history, reconnecting and reopening start no work. An unavailable role or profile remains unavailable.
+
+| Command | Behavior |
+|---------|----------|
+| `conversation show <task-id> [--before-cursor cursor]` | Read authoritative state and one bounded history page |
+| `conversation send <task-id> --text text` | Send a message under the saved planning consent, or queue it at the next safe boundary |
+| `conversation answer <task-id> --question-id message-id --text text` | Answer one exact pending question |
+| `conversation guide <task-id> --text text` | Queue guidance without changing the task contract or authority |
+| `conversation adopt <task-id> --proposal-id message-id --proposal-hash hash` | Adopt the exact retained proposal after controller revalidation |
+| `conversation configure <task-id> --role role --profile openai-file-v1 --credit-policy policy --attempts N --minutes N --concurrency N --consent [--model-request file]` | Explicitly amend the finite primary selection and task limits |
+
+Show returns `{ state, conversation }`. The state reports the primary selection, requested and effective model and effort, shared budget, queued input count, pending question IDs, proposal hash and current send/adopt availability. State and history are separate bounded controller reads. History entries retain their IDs, lineage and delivery records. `nextBeforeCursor` identifies the older page; pass it as `--before-cursor`. Text is limited to 4096 encoded bytes. Plain output escapes terminal controls; JSON preserves the typed values.
+
+Plain show also reports the bounded last-observed model choices, status, reason, observation time and exact artifact ID and hash. Older state without choices reports `not-observed`. These choices come from a successful retained planning turn. Reading them starts no discovery or model turn.
+
+To request a pair for a later planning turn, inspect `conversation show <task-id>` first. Copy the observation reference from `state.modelChoices.observation` and a model with one of its advertised efforts from `state.modelChoices.models`. The following strict JSON template contains placeholders, not catalog choices. Replace every angle-bracket value with the exact value from actual show output before saving it as `model-request.json`:
+
+```json
+{
+  "version": 1,
+  "observation": {
+    "artifactId": "<copy observation.artifactId>",
+    "hash": "<copy observation.hash>"
+  },
+  "model": "<copy models entry.model>",
+  "effort": "<copy an effort from that entry.efforts>"
+}
+```
+
+Save the request with the complete explicit selection and limits:
+
+```sh
+pnpm crewkite conversation configure <task-id> --role lead --profile openai-file-v1 --credit-policy ordinary --attempts 8 --minutes 20 --concurrency 2 --consent --model-request model-request.json --json
+```
+
+Use the intended role, credit policy and existing task limits explicitly. Only configure accepts `--model-request`. The bounded file must match the strict versioned schema; unknown fields and malformed references are rejected before mutation. The controller checks that the observation belongs to this task and that the pair and current client capability remain valid. A refusal selects no fallback.
+
+Configure is Save. It starts no planning or execution turn, discovers no models and grants no new planning permissions. Requested settings record the saved choice; effective settings report what a completed turn actually used. A material model or effort Save returns the contract to provisional. Execution requires a later valid proposal and fresh explicit adoption, followed by the existing execution preparation and Start.
+
+To recover the explicit profile-default behavior, run configure with the complete selection and consent while omitting `--model-request`. Omission sends no model request field and does not preserve a previous explicit pair. Inspect show after Save. If Save returns an unknown outcome, keep its receipt and retry that exact receipt. Retry reuses the saved command, including its original model request, even if the input file changes.
+
+To reuse retained context, add `--context-refs context-refs.json` to conversation create, send, guide or answer. Use actual retained context artifact IDs and hashes from this controller home, such as references in the task's conversation history from `conversation show <task-id> --json`. Copy only each reference's `artifactId` and `hash` into the array. This template needs actual retained values before use:
+
+```json
+[
+  {
+    "artifactId": "<copy retained context artifactId>",
+    "hash": "<copy retained context hash>"
+  }
+]
+```
+
+The bounded JSON file accepts at most four references with distinct artifact IDs and hashes. Unknown fields, source paths and malformed references are rejected before mutation. Omitting the option preserves the absent context field. Supplying `[]` sends an explicit empty array. The CLI sends the exact refs and captures no filesystem content. It grants no extra permission and uploads no arbitrary files. The controller checks capture provenance, project, base and actual retained bytes, and can refuse stale or foreign captures. An unknown-outcome receipt retains the exact refs; retry resends them even if the input file changes.
+
+Mutations use the current task revision and the normal action receipt. Keep an uncertain receipt and use `retry` to resend its exact command. `task stop <task-id>` uses the existing Stop action. Chat text cannot approve a tool action, grant an effect, raise a limit or accept a candidate. Proposal adoption changes the task contract and starts no execution. Execution still needs its own explicit preparation and Start.
+
+## Saved task lifecycle
+
+Amend requires the complete explicit title, outcome and criteria on every call. Omitted fields are rejected. The controller permits amendment only in `draft`, `stopped`, `interrupted` or `failed`, with proven quiescence and no conflicting ownership or combined membership. It keeps the task ID, advances its revision and clears the current run binding. Inspect the result, then prepare explicitly when ready. Amendment starts no work and grants no authority.
+
+Pause sends `PauseAdmissions` with the current task revision and exact current run ID. An unprepared task has no run to pause. Pause closes new admissions; an already owned process may finish. Stop requests cancellation of owned work. Neither command creates a grant or submits new work. Resume remains an explicit controller request. It does not provide a general native restart path, and reopening a task never relaunches work.
+
+A combined parent Pause records its current phase. Child Pause and Resume refuse while the parent owns the membership, and a child cannot amend its contract independently. Parent Resume requires settled owners, valid proofs and enough remaining budget. Unknown ownership or failed or stopped stages block it. Combined Resume dispatches nothing and cannot restart a child writer. Parent Stop requests cancellation across the group. See [combined ownership and recovery](../../docs/continuity.md#combined-ownership-and-recovery).
+
+Blocked and unknown outcomes remain visible in the action receipt. Save JSON output when a result is uncertain and use `retry <receipt-file>` only for that exact receipt. Retry retains the original command key, payload and expected revision, including the full amendment contract or exact paused run binding. It does not refresh the revision or reread contract flags. No automatic retry, preparation or follow-up action runs after amend or pause.
+
 ## Google quota
 
 ```sh
 pnpm crewkite usage show --json
-pnpm crewkite usage refresh --family google --consent --json
 pnpm crewkite usage refresh --family google --json
-pnpm crewkite usage refresh --family google --no-consent --json
 ```
 
-`--consent` enables the reader and requests one read. Omitting consent requests a read under the saved opt-in. `--no-consent` disables the reader without a read and discards any in-flight result. Reads have a 60-second cooldown after each attempt, including failures. Active or unknown Google ownership blocks a read. No timer refreshes quota.
+The quota reader runs by default when the pinned client is available. Controller startup attempts one read. Authenticated connections can refresh missing, stale or unknown observations, and Google admission can make one needed bounded read. Reads have a 60-second cooldown after each attempt, including failures. Active or unknown Google ownership blocks a read. A fresh reported zero remains fresh and does not cause another read just for being zero.
 
-The reader uses the Google CLI's headless `/usage` command with no model request. Google's FAQ reserves headless mode for scripting and CI. Quota consent does not enable a writer. The [provider boundaries](../../docs/providers.md) describe this separate opt-in.
+The reader calls the pinned Google CLI's headless `/usage` metadata command without a model request. A quota read supplies no coding authority, account identity, provider entitlement or billing hard cap. The [provider boundaries](../../docs/providers.md) describe this status check and its limits.
 
-`usage show --json` returns `{ cursor, usageReaders, usage }`. Readers include enabled state, availability reason, last attempt and last successful observation. Usage contains the controller's derived windows with their source, observation time, reset time and stale state. Refresh returns the normal `{ command, result }` action receipt. Failed reads retain prior windows, which become stale after five minutes.
+`usage show --json` returns `{ cursor, usageReaders, usage }`. Readers report availability and its reason, the last attempt and the last successful observation. Derived usage windows retain their source, observation and reset times, and stale state. Refresh returns the normal `{ command, result }` action receipt. Failed reads retain prior observations and their original timestamps; they become stale after five minutes. Keep an uncertain refresh receipt and use `retry <receipt-file>` for that exact saved command key.
+
+Admission rechecks every bucket applicable to the frozen selected model and every configured reserve. A known separate model pool does not consume that selection's allowance. Required selected-model windows must be present; third-party and unknown buckets retain conservative checks. Missing client or invalid output cannot become known allowance. The provider-boundaries link above records the exact mapping.
 
 ## Google ACP setup
 
@@ -84,7 +162,50 @@ Omit the thought-level flag when no selector was advertised. The preparation fre
 
 Google ACP permits guided or balanced authority, ordinary subscription billing and request-review. Each native approval requires a human decision for one exact session and tool call. Approval and denial preserve the full typed binding. Permanent permission and automatic handoff are unavailable.
 
-`--confirm-quota-account` records that the separate CLI quota login and ACP sign-in use the same Google account. Shared native home does not prove identity. Every returned quota pool must be fresh and above reserve before admission. Disabling the reader grants no unknown-usage bypass. The headless Google file profile remains blocked.
+`--confirm-quota-account` records that the separate CLI quota login and ACP sign-in use the same Google account. Shared native home does not prove identity. Admission rechecks every applicable quota pool and configured reserve for the frozen selected model; required windows must be present, and unknown pools remain conservative. Missing, stale or unknown quota must be resolved before admission. The headless Google file profile remains blocked.
+
+## Local setup
+
+Local uses one configured loopback endpoint and the same controller state as the desktop. Dedicated token is the default authentication mode. Configure the endpoint, then request the native connection prompt:
+
+```sh
+pnpm crewkite local configure --endpoint ws://127.0.0.1:1234 --json
+pnpm crewkite local connect --consent --json
+pnpm crewkite local status --json
+pnpm crewkite local refresh-models --consent --json
+pnpm crewkite local select-model <selection-id> --observation-hash <observation-hash> --json
+```
+
+For a runtime already configured without authentication, choose that mode explicitly:
+
+```sh
+pnpm crewkite local configure --endpoint ws://127.0.0.1:1234 --authentication none --json
+pnpm crewkite local connect --consent --json
+```
+
+The desktop reports this mode as "No authentication, this device only". Connect uses the saved mode and opens no token prompt in this mode. CrewKite does not change the runtime's authentication setting. `--authentication token` restores the dedicated-token mode; omitting the option on configure also selects token mode. Status reports authentication separately from connection state. A no-auth connection has no configured secret.
+
+Enter the dedicated connection secret only in the native prompt. The CLI accepts no secret argument, stdin secret, credential environment option, setup receipt or helper path. Refresh reads the runtime's present models and loaded instances. It loads no model and starts no generation. Status reports the exact observation hash and selection IDs, with installed, loaded and incompatible states. Model identity comes from runtime metadata. It establishes no weight checksum or route qualification.
+
+Each mutation uses the current Local revision. Selection requires the exact displayed observation hash and a choice from that observation. A stale revision or changed observation refuses. An uncertain receipt keeps its exact command key for `retry`; a fresh command does not replay it.
+
+```sh
+pnpm crewkite local cancel-input <operation-id> --json
+pnpm crewkite local disconnect --json
+```
+
+Cancel names the current input operation. Disconnect clears the controller's private connection value and revokes pending input. Unknown input, discovery or generation ownership remains blocked. Neither command resets an uncertain generation. A controller without Local controls still exposes its retained snapshot and reports the controls unavailable.
+
+After selecting an eligible loaded model, prepare one committed text target through the ordinary native path:
+
+```sh
+pnpm crewkite task prepare-native <task-id> local-file-v1 net.mjs --policy native-policy.json --native-trust --source-consent --json
+pnpm crewkite task show <task-id> --json
+pnpm crewkite task start <task-id> --json
+pnpm crewkite task stop <task-id> --json
+```
+
+Preparation freezes the current selected model, setup, source and policy. It sends no provider request. Start rechecks controller admission and ownership. Local preparation accepts no cloud billing, effort, model override or handoff option. Changes and explicit export use the ordinary task commands. Repository writing, automatic handoff and Local review remain unavailable. Available model metadata still leaves qualification pending.
 
 ## Native single-file runs
 
@@ -166,7 +287,7 @@ New file runs can opt into a finite recipient list. Add `--handoff-target` for e
 pnpm crewkite task prepare-native <task-id> openai-file-v1 net.mjs --policy native-policy.json --native-trust --source-consent --handoff-target anthropic-file-v1 --handoff-target openai-file-v1 --json
 ```
 
-Choose the original limits before preparing. A Quick run with two writers, one check and one review needs at least four overall attempts and two launches per route. Launch allowance is per route; the overall attempt limit still applies. Every writer spends the same original minutes. The desktop offers an explicit two-writer choice of four attempts, twelve minutes and two launches per route. It starts nothing. Two reserved minutes cover the standard check/review path; full verification requires six remaining minutes. Later transfer cannot raise or replenish limits.
+Choose the original limits before preparing. A Quick run with two writers, one check and one review needs at least four overall attempts and two launches per route. Launch allowance is per route; the overall attempt limit still applies. Every writer spends the same original minutes. The desktop offers an explicit two-writer choice of four attempts, twelve minutes and two launches per route. It starts nothing. Two reserved minutes cover the standard check/review path; full verification requires eleven remaining minutes. Later transfer cannot raise or replenish limits.
 
 After normal Stop and confirmed process cleanup, inspect retained Changes. Prepare one previously allowed recipient with fresh trust and source-sharing consent:
 
@@ -251,13 +372,67 @@ Before starting the source controller, set `PROVENANCE_PATTERN` in its environme
 
 The Mac directory-package builder selects `PROVENANCE_PATTERN` from its build environment or `internal/provenance-pattern.txt` under the primary checkout. A selected policy must be a nonempty valid expression within the recipe's limit. It carries that policy and exact frozen graders into the installed runtime. A build without either policy source remains available for ordinary use and cannot prepare this recipe. Packaged checks still require a registered matching CrewKite checkout with its development dependencies and Electron already installed. The package supplies Node; system Git and mkfifo remain required. The builder installs no dependencies and changes no account settings. The [roadmap](../../docs/roadmap.md) records the first useful packaged checked result and remaining qualification gates.
 
-This recipe takes no test-file or command options. Staging, all stages and cleanup share at most five minutes. The original run needs at least six remaining minutes and two attempts, including the later review. The controller freezes toolchain and baseline identities before Start. Task show reports the fixed stages, platform, Node, Electron and Git versions and digests, lockfile and toolchain hashes. No dependencies are installed. Local code runs with your system permissions; no added filesystem or network containment is established.
+This recipe takes no test-file or command options. Staging, all stages and cleanup share at most ten minutes. The original run needs at least eleven remaining minutes and two attempts, including the later review. The controller freezes toolchain and baseline identities before Start. Task show reports the fixed stages, platform, Node, Electron and Git versions and digests, lockfile and toolchain hashes. No dependencies are installed. Local code runs with your system permissions; no added filesystem or network containment is established.
 
 Project Node tests run local code with your system permissions. Dependencies are not installed. Imports can use Node built-ins and files in the check copy. Paths are literal, with no globs or discovery; names with spaces need shell quotes. The controller freezes the committed files and refuses changed definitions before execution. Inspect `task show` before starting checks.
 
 Preparation starts no checks or native review. Verification preparation first inventories the installed files. Omitting both consent flags requests exact saved evaluation consent. Reviewer credit spending defaults off independently of the writer. Add `--existing-credits` during evaluation preparation only when choosing that policy explicitly.
 
 Task show reports the controller's evaluation stage, selected recipe and test files, exact file and hashes, saved reviewer and process-only independence, expiry, current start availability and remaining total attempts and minutes. The supplemental allowance permits one local check and one additional native review beneath those original run limits. Completed evidence remains visible after start permission expires. A failed or blocked check cannot authorize review. Task show also reports current local acceptance availability and its reason. Completed checks and review can make acceptance available. The destination still needs its own current grant or approval; inspection and export remain available.
+
+## Combined tasks
+
+Prepare a parent and two existing draft tasks from the same project. Save the complete `PrepareCombinedRun` payload in a bounded JSON file. The CLI validates the shared schema before connecting. It preserves the child revisions you supplied and uses the current parent revision. This example names two existing text targets and three committed check files:
+
+```json
+{
+  "taskId": "tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "policy": {
+    "authority": "balanced",
+    "quality": "quick",
+    "methods": [{ "id": "keep-it-simple", "cycles": 1, "reviewerRole": "reviewer" }],
+    "effects": [
+      { "taskId": "tsk_01ARZ3NDEKTSV4RRFFQ69G5FAW", "action": "write-scratch", "target": "demo-shop", "expiresAt": "2026-10-18T00:00:00.000Z", "revoked": false, "usesRemaining": 1 },
+      { "taskId": "tsk_01ARZ3NDEKTSV4RRFFQ69G5FAX", "action": "write-scratch", "target": "demo-shop", "expiresAt": "2026-10-18T00:00:00.000Z", "revoked": false, "usesRemaining": 1 }
+    ],
+    "limits": { "attempts": 7, "minutes": 20, "concurrency": 2 },
+    "reserves": [],
+    "unknownUsage": { "rule": "fixed-allowance", "allowance": { "launches": 2, "minutes": 20 } }
+  },
+  "children": [
+    { "taskId": "tsk_01ARZ3NDEKTSV4RRFFQ69G5FAW", "expectedRevision": 0, "scope": ["price.mjs"], "writer": { "profileId": "openai-file-v1", "creditPolicy": "ordinary" }, "consent": "explicit", "maximumMinutes": 2 },
+    { "taskId": "tsk_01ARZ3NDEKTSV4RRFFQ69G5FAX", "expectedRevision": 0, "scope": ["invoice.mjs"], "writer": { "profileId": "openai-file-v1", "creditPolicy": "ordinary" }, "consent": "explicit", "maximumMinutes": 2 }
+  ],
+  "integration": { "maximumMinutes": 3 },
+  "checks": {
+    "recipeId": "project-node-tests-v1",
+    "testFiles": ["price.test.mjs", "invoice.test.mjs", "interaction.test.mjs"],
+    "replayTestFiles": [["price.test.mjs"], ["invoice.test.mjs"]],
+    "interactionTestFiles": ["interaction.test.mjs"],
+    "maximumMinutes": 1,
+    "baselineConsent": "explicit",
+    "replayConsents": ["explicit", "explicit"]
+  },
+  "reviewer": { "profileId": "openai-file-v1", "creditPolicy": "ordinary", "maximumMinutes": 2 }
+}
+```
+
+Replace the IDs, child revisions, project name, paths and grant expiry with current values. Both targets must be distinct existing committed text files outside the protected checks. The full test collection must contain both replay collections and the separate interaction tests. Paths are literal. The controller freezes the common source and validates every selected check. The optional `integration.maximumMinutes` reserves private Git time within the total policy minutes; omitting it retains one minute. The total must cover both writer maxima, the reviewer maximum, four one-minute checks and integration. Each Git operation stays within sixty seconds and the remaining integration allowance. The CLI adds no grants or consent. Other finite writer selections retain their own billing attestations and observed configuration requirements; unavailable profiles remain unavailable.
+
+```sh
+pnpm crewkite combined prepare <parent-task-id> --plan combined-plan.json --json
+pnpm crewkite combined status <parent-task-id> --json
+pnpm crewkite task start <parent-task-id> --json
+```
+
+Preparation starts no work. Parent Start runs the baseline. After it passes, start each child with `task start <child-task-id>`. Status reads the current group from the snapshot: exact preparation, member runs and scopes, seven dispatch slots, candidate, shared remaining budget and controller action reasons. All work shares the parent allowance. Parent `task stop` stops the group; a child Stop does not complete it.
+
+```sh
+pnpm crewkite combined assemble <parent-task-id> --json
+pnpm crewkite combined status <parent-task-id> --json
+```
+
+Assembly binds the saved parent run and preparation. It takes no patches, candidate list, Git ref or command. The controller checks the serial replays before advancing its private integration ref. Final combined checks and independent review remain separate existing evaluation actions. Only the parent can be accepted after the complete barrier passes. Preserve uncertain prepare or assembly receipts and use `retry` with the original command. Reopening status starts nothing. These commands establish no connected provider or combined-work qualification.
 
 ## Local branch acceptance
 
@@ -286,4 +461,4 @@ pnpm crewkite retry receipt.json --json
 
 Retry validates the bounded receipt file and resends its command unchanged. It never builds a new approval or refreshes an old grant. For an applied export receipt, `retry receipt.json --output new.patch` saves the same verified artifact without creating another export command. A failed local save still prints the original action receipt. Both interfaces use the controller's policy and permission rules.
 
-Exit status is 0 for an applied action or a successful read, 2 for a controller refusal or uncertain result, and 1 for local input or connection errors. Provider output is JSON-escaped in watch mode. Plain watch output contains event identities and revisions.
+Exit status is 0 for an applied action or a successful read, 2 for a controller refusal or uncertain result, and 1 for local input or connection errors. JSON preserves typed provider output. Plain output escapes terminal controls. Plain watch output contains event identities and revisions.

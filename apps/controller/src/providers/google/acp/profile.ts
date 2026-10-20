@@ -1,5 +1,13 @@
 import { createHash } from 'node:crypto';
-import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readdirSync,
+  readSync,
+} from 'node:fs';
 import { userInfo } from 'node:os';
 import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
 import {
@@ -22,9 +30,15 @@ export const AcpClientPinSchema = z.strictObject({
   signerTeamId: z.string().regex(/^[A-Z0-9]{10}$/),
 });
 export type AcpClientPin = z.infer<typeof AcpClientPinSchema>;
-export type AcpClientIdentity = Readonly<AcpClientPin & { executable: string }>;
+export const AcpImportIdentitySchema = AcpClientPinSchema.extend({ harnessSha256: HashSchema });
+export const AcpServerMaximumBytes = 384 * 1024 * 1024;
+export const AcpHarnessMaximumBytes = 128 * 1024 * 1024;
+export type AcpClientIdentity = Readonly<
+  z.infer<typeof AcpImportIdentitySchema> & { executable: string }
+>;
 export const AcpReviewMappingSchema = z.strictObject({
   client: AcpClientPinSchema,
+  harnessSha256: HashSchema.optional(),
   surface: z.literal('config'),
   configId: identifier,
   valueId: identifier,
@@ -32,7 +46,21 @@ export const AcpReviewMappingSchema = z.strictObject({
   evidenceHash: HashSchema,
 });
 export type AcpReviewMapping = z.infer<typeof AcpReviewMappingSchema>;
-export const GoogleAcpReviewMappings: readonly AcpReviewMapping[] = Object.freeze([]);
+export const GoogleAcpReviewMappings: readonly AcpReviewMapping[] = Object.freeze([
+  {
+    client: {
+      version: '1.4.0',
+      sha256: '34e0cd2fe6fcafc4b280a81d38026c55689e54c0619c6729a781f1ebfefa1d88',
+      signerTeamId: 'EQHXZ8M8AV',
+    },
+    harnessSha256: 'e7d236a0761ef904cee649e6f42e56861ca953457f8f62bcd0cdf649640d0ff5',
+    surface: 'config',
+    configId: 'mode',
+    valueId: 'default',
+    semantics: 'request-review',
+    evidenceHash: 'abe9f3af6f37ec81399df78fe1672964f07fe9daf0258398803dd39bc5c2080a',
+  },
+]);
 export const AcpSetupProofSchema = z
   .strictObject({
     version: z.literal(1),
@@ -64,17 +92,19 @@ export const AcpSetupProofSchema = z
   );
 export type AcpSetupProof = z.infer<typeof AcpSetupProofSchema>;
 
+const signatureSchema = z.strictObject({
+  method: z.literal('macos-codesign'),
+  verified: z.literal(true),
+  requirement: z.string().min(1).max(1024),
+  sha256: HashSchema,
+  signerTeamId: z.string().regex(/^[A-Z0-9]{10}$/),
+});
 export const AcpImportPinSchema = z.strictObject({
-  version: z.literal(1),
+  version: z.literal(2),
   profileId: z.literal('google-acp-v1'),
   client: AcpClientPinSchema,
-  signature: z.strictObject({
-    method: z.literal('macos-codesign'),
-    verified: z.literal(true),
-    requirement: z.string().min(1).max(1024),
-    sha256: HashSchema,
-    signerTeamId: z.string().regex(/^[A-Z0-9]{10}$/),
-  }),
+  signature: signatureSchema,
+  harness: z.strictObject({ sha256: HashSchema, signature: signatureSchema }),
 });
 
 export function googleAcpDeveloperIdRequirement(signerTeamId: string): string {
@@ -90,14 +120,39 @@ export function acpClientPin(client: AcpClientIdentity | AcpClientPin): AcpClien
   });
 }
 
-export function validateAcpClientIdentity(client: AcpClientIdentity): AcpClientIdentity {
+export function acpReviewMappingMatchesClient(
+  value: AcpReviewMapping,
+  client: AcpClientIdentity | AcpClientPin,
+): boolean {
+  const mapping = AcpReviewMappingSchema.parse(value);
+  return (
+    hashCanonical(mapping.client) === hashCanonical(acpClientPin(client)) &&
+    (mapping.harnessSha256 === undefined ||
+      ('harnessSha256' in client && mapping.harnessSha256 === client.harnessSha256))
+  );
+}
+
+/** Spawn keeps the default full hash. Only profile resolution reuses a matching digest. */
+export function validateAcpClientIdentity(
+  client: AcpClientIdentity,
+  reuse = false,
+): AcpClientIdentity {
   const parsed = z
-    .strictObject({ ...AcpClientPinSchema.shape, executable: z.string().min(1).max(4096) })
+    .strictObject({ ...AcpImportIdentitySchema.shape, executable: z.string().min(1).max(4096) })
     .parse(client);
   if (!isAbsolute(parsed.executable) || resolve(parsed.executable) !== parsed.executable)
     throw new Error('Invalid managed executable path.');
-  if (hashAcpPrivateFile(parsed.executable, 256 * 1024 * 1024, true) !== parsed.sha256)
+  if (hashAcpPrivateFile(parsed.executable, AcpServerMaximumBytes, true, reuse) !== parsed.sha256)
     throw new Error('Managed executable changed.');
+  if (
+    hashAcpPrivateFile(
+      join(dirname(parsed.executable), 'localharness_external'),
+      AcpHarnessMaximumBytes,
+      true,
+      reuse,
+    ) !== parsed.harnessSha256
+  )
+    throw new Error('Managed harness changed.');
   return parsed;
 }
 
@@ -115,7 +170,7 @@ export function validateAcpSetupProof(
       .map((entry) => AcpReviewMappingSchema.parse(entry))
       .filter(
         (entry) =>
-          hashCanonical(entry.client) === hashCanonical(proof.client) &&
+          acpReviewMappingMatchesClient(entry, client) &&
           entry.surface === mode.surface &&
           entry.configId === mode.configId &&
           entry.valueId === mode.valueId &&
@@ -210,13 +265,45 @@ export function readAcpPrivateFile(path: string, maximum: number, executable = f
   }
 }
 
-export function hashAcpPrivateFile(path: string, maximum: number, executable = false): string {
-  return createHash('sha256')
-    .update(readAcpPrivateFile(path, maximum, executable))
-    .digest('hex');
+// Profile resolution runs for every ACP notification and snapshot, and the
+// managed bundle is about 400 MB. Hashing it each time stalls the event loop.
+// A write, chmod, link or replacement changes the inode or ctime, so matching
+// metadata reuses the last full digest.
+// shortcut: a filesystem with coarse timestamps could hide a same-size rewrite
+// inside one tick. Upgrade: skip reuse while ctime is within two seconds of the hash.
+const digests = new Map<string, { key: string; sha256: string }>();
+function digestKey(path: string, maximum: number, executable: boolean) {
+  const state = lstatSync(path, { bigint: true });
+  return [
+    maximum,
+    executable,
+    state.dev,
+    state.ino,
+    state.size,
+    state.mtimeNs,
+    state.ctimeNs,
+    state.mode,
+  ].join(':');
 }
 
-export function readGoogleAcpPin(home: string): AcpClientIdentity {
+export function hashAcpPrivateFile(
+  path: string,
+  maximum: number,
+  executable = false,
+  reuse = false,
+): string {
+  validateAcpDirectory(dirname(path));
+  const key = digestKey(path, maximum, executable);
+  const known = digests.get(path);
+  if (reuse && known?.key === key) return known.sha256;
+  const sha256 = createHash('sha256')
+    .update(readAcpPrivateFile(path, maximum, executable))
+    .digest('hex');
+  if (digestKey(path, maximum, executable) === key) digests.set(path, { key, sha256 });
+  return sha256;
+}
+
+export function readGoogleAcpPin(home: string, reuse = false): AcpClientIdentity {
   validateAcpDirectory(home);
   const root = join(home, 'providers/google-acp-v1');
   validateAcpDirectory(root, home);
@@ -226,12 +313,27 @@ export function readGoogleAcpPin(home: string): AcpClientIdentity {
   if (
     pin.signature.sha256 !== pin.client.sha256 ||
     pin.signature.signerTeamId !== pin.client.signerTeamId ||
-    pin.signature.requirement !== googleAcpDeveloperIdRequirement(pin.client.signerTeamId)
+    pin.signature.requirement !== googleAcpDeveloperIdRequirement(pin.client.signerTeamId) ||
+    pin.harness.signature.sha256 !== pin.harness.sha256 ||
+    pin.harness.signature.signerTeamId !== pin.client.signerTeamId ||
+    pin.harness.signature.requirement !== googleAcpDeveloperIdRequirement(pin.client.signerTeamId)
   )
     throw new Error('Import signature receipt does not match the pin.');
   const executable = join(root, pin.client.sha256, 'agy_acp_server.par');
   validateAcpDirectory(dirname(executable), home);
-  return validateAcpClientIdentity({ ...pin.client, executable });
+  if (
+    JSON.stringify(readdirSync(dirname(executable)).sort()) !==
+    JSON.stringify(['agy_acp_server.par', 'localharness_external'])
+  )
+    throw new Error('Managed bundle contains unexpected files.');
+  return validateAcpClientIdentity(
+    {
+      ...pin.client,
+      harnessSha256: pin.harness.sha256,
+      executable,
+    },
+    reuse,
+  );
 }
 
 export type AcpProfileResolution = {
@@ -266,7 +368,7 @@ export function resolveGoogleAcpProfile(
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
-    client = readGoogleAcpPin(options.home);
+    client = readGoogleAcpPin(options.home, true);
     reason = 'acp-capability-missing';
     if (options.environment.HOME !== userInfo().homedir) reason = 'native-home-unavailable';
     else {
@@ -300,7 +402,7 @@ export function resolveGoogleAcpProfile(
       qualifiedAt: null,
       creditPolicies: ['ordinary'],
       permissionModes: ['request-review'],
-      maximumTaskMs: 300000,
+      maximumTaskMs: 600000,
       maximumFileBytes: 65536,
       maximumSubmissions: 1,
       available: reason === 'qualification-pending',

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import { hashCanonical, sealHandoff } from './hash.ts';
 import {
@@ -8,8 +9,26 @@ import {
   CandidateEvaluationPreviewSchema,
   CheckEventSchema,
   CheckResultSchema,
+  CONVERSATION_CONTEXT_MEDIA_TYPE,
+  CombinedNativeReviewJobSchema,
+  CombinedOriginSchema,
+  CombinedRunPreviewSchema,
   CommandResultSchema,
   CommandSchema,
+  ConversationContextBundleSchema,
+  ConversationContextPickSchema,
+  ConversationContextRefSchema,
+  ConversationContextRefsSchema,
+  ConversationEntrySchema,
+  ConversationModelCatalogEntriesSchema,
+  ConversationModelCatalogSchema,
+  ConversationModelChoicesSchema,
+  ConversationModelRequestSchema,
+  ConversationPageSchema,
+  ConversationPlanningSelectionSchema,
+  ConversationPlanProposalSchema,
+  ConversationTurnBindingSchema,
+  ConversationTurnResultSchema,
   CursorSchema,
   canonicalJson,
   DesktopNoticeSchema,
@@ -18,6 +37,12 @@ import {
   formatReviewTarget,
   GoogleAcpSetupSchema,
   GrantSchema,
+  LocalEndpointSchema,
+  LocalModelBindingSchema,
+  LocalModelObservationSchema,
+  LocalObservedModelBindingSchema,
+  LocalSetupReceiptSchema,
+  LocalSetupSchema,
   MinorAmountSchema,
   NativeBillingAttestationSchema,
   NativeHandoffPreviewSchema,
@@ -37,6 +62,7 @@ import {
   SnapshotSchema,
   SourceDetailsSchema,
   SourceSchema,
+  TaskConversationStateSchema,
   TransportMessageSchema,
   UsageReaderSchema,
 } from './index.ts';
@@ -52,6 +78,1106 @@ const command = {
 };
 
 test('process boundaries reject unknown fields and invalid command identity', () => {
+  const combinedId = (prefix: string, index = 0) =>
+    `${prefix}_${suffix.slice(0, -1)}${['V', 'W', 'X', 'Y', 'Z', '0', '1', '2'][index]}`;
+  const combinedPolicy = {
+    authority: 'balanced',
+    quality: 'quick',
+    effects: [],
+    limits: { attempts: 7, minutes: 8, concurrency: 2 },
+    reserves: [],
+    unknownUsage: { rule: 'waiting' },
+    methods: [{ id: 'keep-it-simple', cycles: 1, reviewerRole: 'reviewer' }],
+  };
+  const combined = {
+    ...command,
+    command: 'PrepareCombinedRun',
+    payload: {
+      taskId: combinedId('tsk'),
+      policy: combinedPolicy,
+      children: [1, 2].map((index) => ({
+        taskId: combinedId('tsk', index),
+        expectedRevision: 0,
+        scope: [`slice-${index}.mjs`],
+        writer: { profileId: 'openai-file-v1', creditPolicy: 'ordinary' },
+        consent: 'explicit',
+        maximumMinutes: 1,
+      })),
+      checks: {
+        recipeId: 'project-node-tests-v1',
+        testFiles: ['one.test.mjs', 'two.test.mjs', 'interaction.test.mjs'],
+        replayTestFiles: [['one.test.mjs'], ['two.test.mjs']],
+        interactionTestFiles: ['interaction.test.mjs'],
+        maximumMinutes: 1,
+        baselineConsent: 'explicit',
+        replayConsents: ['explicit', 'explicit'],
+      },
+      reviewer: { profileId: 'openai-file-v1', creditPolicy: 'ordinary', maximumMinutes: 1 },
+    },
+  };
+  assert.deepEqual(CommandSchema.parse(combined), combined);
+  for (const maximumMinutes of [1, 3, 6, 1433]) {
+    const explicit = {
+      ...combined,
+      payload: {
+        ...combined.payload,
+        integration: { maximumMinutes },
+        policy: {
+          ...combinedPolicy,
+          limits: { ...combinedPolicy.limits, minutes: 7 + maximumMinutes },
+        },
+      },
+    };
+    assert.deepEqual(CommandSchema.parse(explicit), explicit);
+    assert.equal(
+      CommandSchema.safeParse({
+        ...explicit,
+        payload: {
+          ...explicit.payload,
+          policy: {
+            ...explicit.payload.policy,
+            limits: { ...explicit.payload.policy.limits, minutes: 6 + maximumMinutes },
+          },
+        },
+      }).success,
+      false,
+    );
+  }
+  for (const maximumMinutes of [0, 1.5, 1441])
+    assert.equal(
+      CommandSchema.safeParse({
+        ...combined,
+        payload: { ...combined.payload, integration: { maximumMinutes } },
+      }).success,
+      false,
+    );
+  const compactWriter = {
+    ...combined,
+    payload: {
+      ...combined.payload,
+      children: [
+        {
+          ...combined.payload.children[0],
+          writer: {
+            profileId: 'anthropic-file-compact-v1',
+            creditPolicy: 'ordinary',
+            billingAttestation: {
+              source: 'user-attested',
+              subscriptionLoginConfirmed: true,
+              paidExtraUsageDisabled: true,
+            },
+          },
+        },
+        combined.payload.children[1],
+      ],
+    },
+  };
+  assert.deepEqual(CommandSchema.parse(compactWriter), compactWriter);
+  for (const payload of [
+    { ...combined.payload, children: combined.payload.children.slice(0, 1) },
+    {
+      ...combined.payload,
+      children: combined.payload.children.map((child) => ({ ...child, maximumMinutes: 10 })),
+    },
+    { ...combined.payload, children: [combined.payload.children[0], combined.payload.children[0]] },
+    {
+      ...combined.payload,
+      children: [
+        combined.payload.children[0],
+        { ...combined.payload.children[1], scope: combined.payload.children[0].scope },
+      ],
+    },
+    {
+      ...combined.payload,
+      children: [
+        { ...combined.payload.children[0], taskId: combined.payload.taskId },
+        combined.payload.children[1],
+      ],
+    },
+    {
+      ...combined.payload,
+      children: [
+        { ...combined.payload.children[0], scope: ['one.mjs', 'two.mjs'] },
+        combined.payload.children[1],
+      ],
+    },
+    {
+      ...combined.payload,
+      children: [
+        {
+          ...combined.payload.children[0],
+          writer: { profileId: 'openai-repository-v1', creditPolicy: 'ordinary' },
+        },
+        combined.payload.children[1],
+      ],
+    },
+    {
+      ...combined.payload,
+      children: [
+        {
+          ...combined.payload.children[0],
+          writer: { ...combined.payload.children[0].writer, executable: '/caller/tool' },
+        },
+        combined.payload.children[1],
+      ],
+    },
+    {
+      ...combined.payload,
+      children: [
+        { ...combined.payload.children[0], title: 'Replacement task' },
+        combined.payload.children[1],
+      ],
+    },
+    { ...combined.payload, policy: { ...combinedPolicy, authority: 'autopilot' } },
+    { ...combined.payload, policy: { ...combinedPolicy, quality: 'standard' } },
+    { ...combined.payload, policy: { ...combinedPolicy, methods: [] } },
+    ...[{ attempts: 6 }, { minutes: 7 }, { concurrency: 1 }].map((limits) => ({
+      ...combined.payload,
+      policy: { ...combinedPolicy, limits: { ...combinedPolicy.limits, ...limits } },
+    })),
+    { ...combined.payload, checks: { ...combined.payload.checks, recipeId: 'crewkite-verify-v1' } },
+    {
+      ...combined.payload,
+      checks: { ...combined.payload.checks, testFiles: ['one.test.mjs', 'two.test.mjs'] },
+    },
+    {
+      ...combined.payload,
+      checks: { ...combined.payload.checks, interactionTestFiles: ['one.test.mjs'] },
+    },
+    {
+      ...combined.payload,
+      checks: {
+        ...combined.payload.checks,
+        testFiles: [...combined.payload.checks.testFiles, 'slice-1.mjs'],
+      },
+    },
+    { ...combined.payload, checks: { ...combined.payload.checks, baselineConsent: 'saved' } },
+  ])
+    assert.equal(CommandSchema.safeParse({ ...combined, payload }).success, false);
+  const assemble = {
+    ...command,
+    command: 'AssembleCombinedCandidate',
+    payload: {
+      taskId: combinedId('tsk'),
+      runId: combinedId('run'),
+      preparationId: combinedId('art'),
+    },
+  };
+  assert.deepEqual(CommandSchema.parse(assemble), assemble);
+  assert.equal(
+    CommandSchema.safeParse({ ...assemble, payload: { ...assemble.payload, candidates: [] } })
+      .success,
+    false,
+  );
+  const origin = {
+    kind: 'combined',
+    taskId: combinedId('tsk'),
+    runId: combinedId('run'),
+    preparationId: combinedId('art'),
+    manifestHash: 'a'.repeat(64),
+    generation: 0,
+    sourceBase: 'a'.repeat(40),
+    sourceManifestHash: 'b'.repeat(64),
+    policyHash: 'c'.repeat(64),
+    criteriaHash: 'd'.repeat(64),
+    contributors: [1, 2].map((index) => ({
+      taskId: combinedId('tsk', index),
+      runId: combinedId('run', index),
+      attemptId: combinedId('att', index),
+      generation: 0,
+      routeId: combinedId('rte', index),
+      candidateId: combinedId('cnd', index),
+      candidateHash: 'e'.repeat(64),
+      scopeHash: 'f'.repeat(64),
+    })),
+    steps: [0, 1].map((index) => ({
+      candidateId: combinedId('cnd', index + 3),
+      candidateHash: (index ? 'c' : 'b').repeat(64),
+      definitionHash: 'a'.repeat(64),
+      checkArtifactId: combinedId('art', index + 1),
+      previousTree: (index ? 'b' : 'a').repeat(40),
+      nextTree: (index ? 'c' : 'b').repeat(40),
+    })),
+    candidateId: combinedId('cnd', 5),
+    candidateHash: 'c'.repeat(64),
+  };
+  assert.deepEqual(CombinedOriginSchema.parse(origin), origin);
+  for (const amendment of [
+    { contributors: [origin.contributors[0], origin.contributors[0]] },
+    { steps: [origin.steps[0], { ...origin.steps[1], previousTree: 'd'.repeat(40) }] },
+    { steps: [{ ...origin.steps[0], nextTree: origin.steps[0].previousTree }, origin.steps[1]] },
+    { candidateId: origin.steps[1].candidateId },
+    { candidateId: origin.contributors[0].candidateId },
+    {
+      steps: [
+        { ...origin.steps[0], candidateId: origin.contributors[0].candidateId },
+        origin.steps[1],
+      ],
+    },
+    {
+      steps: [
+        origin.steps[0],
+        { ...origin.steps[1], checkArtifactId: origin.steps[0].checkArtifactId },
+      ],
+    },
+    { candidateHash: 'd'.repeat(64) },
+    { writerAttemptId: combinedId('att') },
+  ])
+    assert.equal(CombinedOriginSchema.safeParse({ ...origin, ...amendment }).success, false);
+  const combinedReview = {
+    taskId: origin.taskId,
+    runId: origin.runId,
+    attemptId: combinedId('att', 3),
+    generation: 0,
+    routeId: combinedId('rte'),
+    candidateId: origin.candidateId,
+    candidateHash: origin.candidateHash,
+    methodId: 'keep-it-simple',
+    cycle: 1,
+    limitMinutes: 1,
+    scripted: false,
+    preparationId: combinedId('art', 3),
+    profileId: 'openai-file-v1',
+    assignedRole: 'reviewer',
+    independence: 'process-only',
+    origin,
+  };
+  assert.deepEqual(CombinedNativeReviewJobSchema.parse(combinedReview), combinedReview);
+  assert.deepEqual(ReviewJobSchema.parse(combinedReview), combinedReview);
+  for (const amendment of [
+    { writerAttemptId: combinedId('att') },
+    { writerRouteId: combinedId('rte') },
+    { attemptId: origin.contributors[0].attemptId },
+    { candidateHash: 'd'.repeat(64) },
+  ])
+    assert.equal(
+      CombinedNativeReviewJobSchema.safeParse({ ...combinedReview, ...amendment }).success,
+      false,
+    );
+  const unavailable = { available: false, reason: 'baseline-required' };
+  const combinedPreview = {
+    taskId: origin.taskId,
+    runId: origin.runId,
+    preparationId: origin.preparationId,
+    manifestHash: origin.manifestHash,
+    revision: 0,
+    generation: 0,
+    evaluationSelection: {
+      recipeId: 'project-node-tests-v1',
+      testFiles: combined.payload.checks.testFiles,
+      reviewer: { profileId: 'openai-file-v1', methodId: 'keep-it-simple', cycles: 1 },
+      creditPolicy: 'ordinary',
+    },
+    members: [1, 2].map((index) => ({
+      taskId: combinedId('tsk', index),
+      runId: combinedId('run', index),
+      scope: [`slice-${index}.mjs`],
+      start: unavailable,
+    })),
+    phase: 'prepared',
+    blocker: null,
+    dispatches: [
+      'baseline',
+      'writer-0',
+      'writer-1',
+      'replay-0',
+      'replay-1',
+      'final-check',
+      'review',
+    ].map((phase) => ({
+      phase,
+      maximumMinutes: 1,
+      state: 'reserved',
+      attemptId: null,
+      checkArtifactId: null,
+    })),
+    candidate: null,
+    remainingBudgets: { attempts: 7, minutes: 8, concurrency: 2 },
+    start: { available: true, reason: 'available' },
+    assemble: unavailable,
+    evaluate: unavailable,
+    review: unavailable,
+    accept: unavailable,
+  };
+  assert.deepEqual(CombinedRunPreviewSchema.parse(combinedPreview), combinedPreview);
+  for (const evaluationSelection of [
+    { ...combinedPreview.evaluationSelection, recipeId: 'caller-command' },
+    { ...combinedPreview.evaluationSelection, testFiles: ['../outside.test.mjs'] },
+    {
+      ...combinedPreview.evaluationSelection,
+      reviewer: { ...combinedPreview.evaluationSelection.reviewer, profileId: 'local-file-v1' },
+    },
+    { ...combinedPreview.evaluationSelection, command: 'node caller.mjs' },
+  ])
+    assert.equal(
+      CombinedRunPreviewSchema.safeParse({ ...combinedPreview, evaluationSelection }).success,
+      false,
+    );
+  assert.equal(
+    CombinedRunPreviewSchema.safeParse({ ...combinedPreview, phase: 'ready' }).success,
+    false,
+  );
+  assert.equal(
+    CombinedRunPreviewSchema.safeParse({
+      ...combinedPreview,
+      dispatches: combinedPreview.dispatches.slice(1),
+    }).success,
+    false,
+  );
+  assert.equal(
+    CombinedRunPreviewSchema.safeParse({
+      ...combinedPreview,
+      dispatches: combinedPreview.dispatches.map((dispatch, index) =>
+        index ? dispatch : { ...dispatch, state: 'running' },
+      ),
+    }).success,
+    false,
+  );
+  const contextText = '\uFEFFsource text 界\r\n';
+  const contextFile = {
+    kind: 'source',
+    path: 'src/main.ts',
+    mode: '100644',
+    hash: createHash('sha256').update(contextText).digest('hex'),
+    bytes: Buffer.byteLength(contextText),
+    text: contextText,
+  };
+  const contextBundle = {
+    version: 1,
+    projectId: `prj_${suffix}`,
+    base: 'a'.repeat(40),
+    files: [contextFile],
+  };
+  assert.deepEqual(ConversationContextBundleSchema.parse(contextBundle), contextBundle);
+  assert.equal(
+    CONVERSATION_CONTEXT_MEDIA_TYPE,
+    'application/vnd.crewkite.conversation-context+json',
+  );
+  for (const change of [
+    { projectId: `tsk_${suffix}` },
+    { base: 'a'.repeat(39) },
+    { version: 2 },
+    { root: '/caller' },
+    { files: [] },
+    { files: Array(33).fill(contextFile) },
+    { files: [contextFile, contextFile] },
+    { files: [contextFile, { ...contextFile, path: 'SRC/main.ts' }] },
+    { files: [{ ...contextFile, path: 'src' }, contextFile] },
+    { files: [{ ...contextFile, path: 'src/z.ts' }, contextFile] },
+    {
+      files: [
+        { ...contextFile, path: 'src/e\u0301.ts' },
+        { ...contextFile, path: 'src/é.ts' },
+      ],
+    },
+    { files: [{ ...contextFile, bytes: contextFile.bytes - 1 }] },
+    { files: [{ ...contextFile, bytes: 8193, text: 'a'.repeat(8193) }] },
+    { files: [{ ...contextFile, bytes: 8193, text: '界'.repeat(2731) }] },
+    { files: [{ ...contextFile, text: '\ud800' }] },
+    { files: [{ ...contextFile, text: 'secret\0data' }] },
+    { files: [{ ...contextFile, text: 'hidden\u0085control' }] },
+    { files: [{ ...contextFile, mode: '120000' }] },
+    { files: [{ ...contextFile, hash: 'a'.repeat(63) }] },
+    { files: [{ ...contextFile, path: '.env' }] },
+    { files: [{ ...contextFile, path: '.aws/credentials' }] },
+    { files: [{ ...contextFile, path: 'node_modules/package/index.js' }] },
+    { files: [{ ...contextFile, path: '../outside' }] },
+    { files: [{ ...contextFile, path: '/absolute' }] },
+    { files: [{ ...contextFile, path: 'src/line\nbreak.ts' }] },
+    { files: [{ ...contextFile, path: `${'a/'.repeat(16)}file.ts` }] },
+    { files: [{ ...contextFile, kind: 'log', path: '.private/log.txt' }] },
+    { files: [{ ...contextFile, grants: [] }] },
+    {
+      files: [1, 2].map((index) => ({
+        ...contextFile,
+        path: `escaped${index}.ts`,
+        text: '\\'.repeat(8192),
+        bytes: 8192,
+      })),
+    },
+  ])
+    assert.equal(
+      ConversationContextBundleSchema.safeParse({ ...contextBundle, ...change }).success,
+      false,
+    );
+  const contextRef = { artifactId: `art_${suffix}`, hash: hashCanonical(contextBundle) };
+  assert.deepEqual(ConversationContextRefSchema.parse(contextRef), contextRef);
+  assert.deepEqual(ConversationContextRefsSchema.parse([contextRef]), [contextRef]);
+  for (const refs of [
+    [contextRef, contextRef],
+    Array(5).fill(contextRef),
+    [contextRef, { ...contextRef, hash: 'b'.repeat(64) }],
+    [contextRef, { ...contextRef, artifactId: combinedId('art', 1) }],
+    [{ ...contextRef, artifactId: `msg_${suffix}` }],
+    [{ ...contextRef, grants: [] }],
+  ])
+    assert.equal(ConversationContextRefsSchema.safeParse(refs).success, false);
+  const contextPick = { kind: 'source-file', path: '/project/src/main.ts' };
+  assert.deepEqual(ConversationContextPickSchema.parse(contextPick), contextPick);
+  for (const change of [
+    { kind: 'binary' },
+    { path: '../outside' },
+    { path: '/project/../outside' },
+    { path: '/project//file' },
+    { path: '/project/line\nbreak' },
+    { path: '/project/\ud800' },
+    { path: `/${'界'.repeat(1366)}` },
+    { contents: 'caller bytes' },
+  ])
+    assert.equal(
+      ConversationContextPickSchema.safeParse({ ...contextPick, ...change }).success,
+      false,
+    );
+  const captureContext = {
+    ...command,
+    command: 'CaptureConversationContext',
+    payload: {
+      projectId: contextBundle.projectId,
+      base: contextBundle.base,
+      selections: [contextPick],
+    },
+  };
+  assert.deepEqual(CommandSchema.parse(captureContext), captureContext);
+  for (const payload of [
+    { ...captureContext.payload, root: '/caller' },
+    { ...captureContext.payload, contents: 'caller bytes' },
+    { ...captureContext.payload, grants: [] },
+    { ...captureContext.payload, selections: [] },
+    { ...captureContext.payload, selections: [contextPick, contextPick] },
+    { ...captureContext.payload, selections: Array(5).fill(contextPick) },
+  ])
+    assert.equal(CommandSchema.safeParse({ ...captureContext, payload }).success, false);
+  assert.equal(
+    CommandSchema.safeParse({ ...captureContext, expectedRevision: undefined }).success,
+    false,
+  );
+  const conversationBinding = {
+    taskId: `tsk_${suffix}`,
+    runId: `run_${suffix}`,
+    attemptId: `att_${suffix}`,
+    routeId: `rte_${suffix}`,
+    generation: 0,
+    role: 'lead',
+    taskRevision: 1,
+    conversationRevision: 1,
+    scopeHash: 'a'.repeat(64),
+    limitMinutes: 1,
+  };
+  assert.deepEqual(ConversationTurnBindingSchema.parse(conversationBinding), conversationBinding);
+  const proposal = {
+    summary: 'Change the bounded module.',
+    criteria: ['Preserve the existing export.'],
+    slices: [
+      {
+        id: 'module',
+        title: 'Change the module',
+        role: 'coder',
+        scope: ['src/main.ts'],
+        dependsOn: [],
+      },
+    ],
+    checks: ['node-tests-v1'],
+  };
+  assert.deepEqual(ConversationPlanProposalSchema.parse(proposal), proposal);
+  for (const slices of [
+    [proposal.slices[0], proposal.slices[0]],
+    [{ ...proposal.slices[0], dependsOn: ['missing'] }],
+    [{ ...proposal.slices[0], dependsOn: ['module'] }],
+    [
+      { ...proposal.slices[0], dependsOn: ['review'] },
+      { ...proposal.slices[0], id: 'review', dependsOn: ['module'] },
+    ],
+    [{ ...proposal.slices[0], scope: ['../outside.ts'] }],
+    [{ ...proposal.slices[0], scope: ['src/main.ts', 'src/main.ts'] }],
+  ])
+    assert.equal(ConversationPlanProposalSchema.safeParse({ ...proposal, slices }).success, false);
+  const conversationOutput = {
+    version: 1,
+    bindingHash: hashCanonical(conversationBinding),
+    message: 'I need one scope decision.',
+    questions: ['Which export must remain?'],
+    proposal,
+  };
+  assert.deepEqual(ConversationTurnResultSchema.parse(conversationOutput), conversationOutput);
+  assert(ConversationTurnResultSchema.safeParse({ ...conversationOutput, proposal: null }).success);
+  for (const change of [
+    { proposal: undefined },
+    { commands: ['StartRun'] },
+    { grants: [] },
+    { message: '\ud800' },
+    { message: 'a\0b' },
+    { message: '界'.repeat(1366) },
+    { questions: Array(9).fill('Question') },
+    { proposal: { ...proposal, effects: [] } },
+  ])
+    assert.equal(
+      ConversationTurnResultSchema.safeParse({ ...conversationOutput, ...change }).success,
+      false,
+    );
+  const conversationEntry = {
+    id: `msg_${suffix}`,
+    taskId: conversationBinding.taskId,
+    revision: 1,
+    cursor: '1',
+    at: '2026-10-17T00:00:00.000Z',
+    kind: 'question',
+    text: conversationOutput.questions[0],
+    author: {
+      kind: 'agent',
+      role: 'lead',
+      attemptId: conversationBinding.attemptId,
+      routeId: conversationBinding.routeId,
+    },
+    binding: conversationBinding,
+  };
+  assert.deepEqual(ConversationEntrySchema.parse(conversationEntry), conversationEntry);
+  for (const kind of ['user-message', 'guidance', 'answer'] as const) {
+    const entry = {
+      id: `msg_${suffix}`,
+      taskId: conversationBinding.taskId,
+      revision: 1,
+      cursor: '1',
+      at: conversationEntry.at,
+      kind,
+      text: 'Use selected source.',
+      author: { kind: 'user' },
+      ...(kind === 'answer' ? { replyTo: conversationEntry.id } : {}),
+    };
+    assert.deepEqual(ConversationEntrySchema.parse(entry), entry);
+    assert.equal('context' in ConversationEntrySchema.parse(entry), false);
+    assert.equal(hashCanonical(ConversationEntrySchema.parse(entry)), hashCanonical(entry));
+    const attached = { ...entry, context: [contextRef] };
+    assert.deepEqual(ConversationEntrySchema.parse(attached), attached);
+    assert.equal(
+      ConversationEntrySchema.safeParse({ ...attached, context: [contextRef, contextRef] }).success,
+      false,
+    );
+  }
+  assert.equal(
+    ConversationEntrySchema.safeParse({ ...conversationEntry, context: [contextRef] }).success,
+    false,
+  );
+  for (const change of [
+    { id: `art_${suffix}` },
+    { taskId: 'tsk_01ARZ3NDEKTSV4RRFFQ69G5FAW' },
+    { author: { ...conversationEntry.author, role: 'orchestrator' } },
+    { effects: [] },
+  ])
+    assert.equal(
+      ConversationEntrySchema.safeParse({ ...conversationEntry, ...change }).success,
+      false,
+    );
+  const conversationPage = {
+    kind: 'conversation',
+    taskId: conversationBinding.taskId,
+    entries: [conversationEntry],
+    nextBeforeCursor: null,
+  };
+  assert.deepEqual(ConversationPageSchema.parse(conversationPage), conversationPage);
+  for (const change of [
+    { entries: [conversationEntry, conversationEntry] },
+    { taskId: 'tsk_01ARZ3NDEKTSV4RRFFQ69G5FAW' },
+    { nextBeforeCursor: '2' },
+  ])
+    assert.equal(
+      ConversationPageSchema.safeParse({ ...conversationPage, ...change }).success,
+      false,
+    );
+  assert(ReadDataSchema.safeParse(conversationPage).success);
+  for (const [name, payload] of [
+    ['SendTaskMessage', { taskId: conversationBinding.taskId, text: 'Keep the export.' }],
+    ['QueueTaskGuidance', { taskId: conversationBinding.taskId, text: 'Keep the export.' }],
+    [
+      'AnswerTaskQuestion',
+      {
+        taskId: conversationBinding.taskId,
+        questionId: conversationEntry.id,
+        text: 'Keep the export.',
+      },
+    ],
+  ] as const) {
+    const request = { ...command, command: name, payload };
+    assert.deepEqual(CommandSchema.parse(request), request);
+    assert.equal('context' in CommandSchema.parse(request).payload, false);
+    const attached = { ...request, payload: { ...payload, context: [contextRef] } };
+    assert.deepEqual(CommandSchema.parse(attached), attached);
+    assert.equal(
+      CommandSchema.safeParse({
+        ...attached,
+        payload: { ...attached.payload, context: [contextRef, contextRef] },
+      }).success,
+      false,
+    );
+    assert.equal(
+      CommandSchema.safeParse({ ...request, payload: { ...payload, policy: {} } }).success,
+      false,
+    );
+  }
+  const planning = {
+    role: 'lead',
+    profileId: 'openai-file-v1',
+    creditPolicy: 'ordinary',
+    limits: { attempts: 8, minutes: 30, concurrency: 4 },
+    consent: 'explicit',
+  };
+  assert.deepEqual(ConversationPlanningSelectionSchema.parse(planning), planning);
+  assert.equal(
+    hashCanonical(ConversationPlanningSelectionSchema.parse(planning)),
+    hashCanonical(planning),
+  );
+  const modelRequest = {
+    version: 1,
+    observation: { artifactId: `art_${suffix}`, hash: 'a'.repeat(64) },
+    model: 'model-one',
+    effort: 'high',
+  };
+  assert.deepEqual(ConversationModelRequestSchema.parse(modelRequest), modelRequest);
+  assert.deepEqual(ConversationPlanningSelectionSchema.parse({ ...planning, modelRequest }), {
+    ...planning,
+    modelRequest,
+  });
+  assert(
+    ConversationModelRequestSchema.safeParse({
+      ...modelRequest,
+      model: `${'界'.repeat(66)}ab`,
+      effort: `${'界'.repeat(10)}ab`,
+    }).success,
+  );
+  for (const change of [
+    { version: 2 },
+    { observation: { ...modelRequest.observation, hash: 'a'.repeat(63) } },
+    { observation: { ...modelRequest.observation, artifactId: `tsk_${suffix}` } },
+    { observation: { ...modelRequest.observation, executable: '/private/client' } },
+    { model: '' },
+    { model: '   ' },
+    { model: 'a'.repeat(201) },
+    { model: '界'.repeat(67) },
+    { model: 'model\nname' },
+    { model: '\ud800' },
+    { effort: '' },
+    { effort: 'a'.repeat(33) },
+    { effort: '界'.repeat(11) },
+    { effort: 'high\u0085' },
+    { effort: '\ud800' },
+    { account: 'private-account' },
+  ])
+    assert.equal(
+      ConversationModelRequestSchema.safeParse({ ...modelRequest, ...change }).success,
+      false,
+    );
+  const catalogModel = {
+    model: modelRequest.model,
+    efforts: ['low', 'high'],
+    defaultEffort: 'low',
+  };
+  const catalog = {
+    version: 1,
+    profileId: planning.profileId,
+    taskId: conversationBinding.taskId,
+    runId: conversationBinding.runId,
+    attemptId: conversationBinding.attemptId,
+    generation: 0,
+    observedAt: '2026-10-17T00:00:00Z',
+    profileHash: 'b'.repeat(64),
+    client: { executable: '/private/client', sha256: 'c'.repeat(64), version: '1.0.0' },
+    locationHash: 'd'.repeat(64),
+    models: [catalogModel],
+  };
+  assert.deepEqual(ConversationModelCatalogSchema.parse(catalog), catalog);
+  const maximumModels = Array.from({ length: 20 }, (_, index) => ({
+    model: 'm'.repeat(198) + String(index).padStart(2, '0'),
+    efforts: Array.from(
+      { length: 16 },
+      (_, effort) => 'e'.repeat(30) + String(effort).padStart(2, '0'),
+    ),
+    defaultEffort: `${'e'.repeat(30)}00`,
+  }));
+  assert(ConversationModelCatalogEntriesSchema.safeParse(maximumModels).success);
+  for (const models of [
+    [],
+    [...maximumModels, { ...catalogModel, model: 'model-extra' }],
+    [catalogModel, catalogModel],
+    [{ ...catalogModel, efforts: [] }],
+    [
+      {
+        ...catalogModel,
+        efforts: Array.from({ length: 17 }, (_, index) => `effort-${index}`),
+        defaultEffort: 'effort-0',
+      },
+    ],
+    [{ ...catalogModel, efforts: ['low', 'low'] }],
+    [{ ...catalogModel, defaultEffort: 'missing' }],
+    [{ ...catalogModel, account: 'private-account' }],
+    [{ ...catalogModel, efforts: ['low', ' '] }],
+  ])
+    assert.equal(ConversationModelCatalogEntriesSchema.safeParse(models).success, false);
+  const escapedModels = maximumModels.map((entry, index) => ({
+    model: '"'.repeat(198) + String(index).padStart(2, '0'),
+    efforts: entry.efforts.map((effort) => '"'.repeat(30) + effort.slice(-2)),
+    defaultEffort: `${'"'.repeat(30)}00`,
+  }));
+  const oversizedCatalog = {
+    ...catalog,
+    models: escapedModels,
+    client: { ...catalog.client, executable: '"'.repeat(4096) },
+  };
+  assert(Buffer.byteLength(canonicalJson(oversizedCatalog)) > 32768);
+  for (const change of [
+    { profileId: 'custom-profile' },
+    { generation: -1 },
+    { client: { ...catalog.client, executable: '界'.repeat(1366) } },
+    { client: { ...catalog.client, version: '界'.repeat(67) } },
+    { client: { ...catalog.client, account: 'private-account' } },
+    { locationHash: 'd'.repeat(63) },
+    { observedAt: 'yesterday' },
+    oversizedCatalog,
+  ])
+    assert.equal(
+      ConversationModelCatalogSchema.safeParse({ ...catalog, ...change }).success,
+      false,
+    );
+  const modelChoices = {
+    status: 'last-observed',
+    observation: modelRequest.observation,
+    observedAt: catalog.observedAt,
+    models: catalog.models,
+    reason: 'available',
+  };
+  const unobservedModels = {
+    status: 'not-observed',
+    observation: null,
+    observedAt: null,
+    models: [],
+    reason: 'not-observed',
+  };
+  for (const choices of [
+    modelChoices,
+    unobservedModels,
+    { ...modelChoices, reason: 'model-unavailable' },
+    { ...modelChoices, reason: 'effort-unavailable' },
+    { ...modelChoices, status: 'client-changed', reason: 'client-changed' },
+    { ...modelChoices, status: 'unavailable', models: [], reason: 'observation-stale' },
+    { ...unobservedModels, status: 'unavailable', reason: 'catalog-unavailable' },
+  ])
+    assert.deepEqual(ConversationModelChoicesSchema.parse(choices), choices);
+  for (const choices of [
+    { ...modelChoices, observation: null },
+    { ...modelChoices, observedAt: null },
+    { ...modelChoices, models: [] },
+    { ...modelChoices, reason: 'client-changed' },
+    { ...modelChoices, reason: 'invented-reason' },
+    { ...modelChoices, status: 'unavailable', reason: 'observation-missing' },
+    { ...unobservedModels, models: catalog.models },
+    { ...unobservedModels, reason: 'available' },
+    { ...unobservedModels, status: 'client-changed', reason: 'client-changed' },
+    { ...modelChoices, client: catalog.client },
+    { ...modelChoices, executable: catalog.client.executable },
+    { ...modelChoices, locationHash: catalog.locationHash },
+    { ...modelChoices, account: 'private-account' },
+  ])
+    assert.equal(ConversationModelChoicesSchema.safeParse(choices).success, false);
+  assert(
+    ConversationPlanningSelectionSchema.safeParse({ ...planning, role: 'orchestrator' }).success,
+  );
+  for (const change of [
+    { role: 'coder' },
+    { profileId: 'custom-provider' },
+    { consent: 'implicit' },
+    { limits: { ...planning.limits, concurrency: 17 } },
+    { effects: [] },
+    { model: 'caller-model' },
+    { executable: '/caller/process' },
+    { endpoint: 'https://invalid.example' },
+    { limits: { ...planning.limits, attempts: 0 } },
+  ])
+    assert.equal(
+      ConversationPlanningSelectionSchema.safeParse({ ...planning, ...change }).success,
+      false,
+    );
+  for (const [name, payload] of [
+    ['CreateTaskDiscussion', { projectId: `prj_${suffix}`, text: 'Change the module.', planning }],
+    ['ConfigureTaskConversation', { taskId: conversationBinding.taskId, planning }],
+    [
+      'AdoptTaskPlan',
+      {
+        taskId: conversationBinding.taskId,
+        proposalId: conversationEntry.id,
+        proposalHash: hashCanonical(proposal),
+      },
+    ],
+  ] as const) {
+    const request = { ...command, command: name, payload };
+    assert.deepEqual(CommandSchema.parse(request), request);
+    assert.equal(hashCanonical(CommandSchema.parse(request)), hashCanonical(request));
+    if ('planning' in payload) {
+      const selectedRequest = {
+        ...request,
+        payload: { ...payload, planning: { ...planning, modelRequest } },
+      };
+      assert.deepEqual(CommandSchema.parse(selectedRequest), selectedRequest);
+    }
+    assert.equal(
+      CommandSchema.safeParse({ ...request, expectedRevision: undefined }).success,
+      false,
+    );
+    assert.equal(
+      CommandSchema.safeParse({ ...request, payload: { ...payload, effects: [] } }).success,
+      false,
+    );
+  }
+  const attachedDiscussion = {
+    ...command,
+    command: 'CreateTaskDiscussion',
+    payload: {
+      projectId: contextBundle.projectId,
+      text: 'Use selected source.',
+      planning,
+      context: [contextRef],
+    },
+  };
+  assert.deepEqual(CommandSchema.parse(attachedDiscussion), attachedDiscussion);
+  assert.equal(
+    CommandSchema.safeParse({
+      ...attachedDiscussion,
+      payload: { ...attachedDiscussion.payload, context: Array(5).fill(contextRef) },
+    }).success,
+    false,
+  );
+  const conversationState = {
+    taskId: conversationBinding.taskId,
+    revision: 0,
+    contractStatus: 'confirmed',
+    purpose: null,
+    phase: 'idle',
+    configuration: null,
+    currentRunId: null,
+    activeAttempt: null,
+    budget: null,
+    queuedInputCount: 0,
+    pendingQuestions: [],
+    proposal: null,
+    adoptedProposal: null,
+    send: { available: false, reason: 'not-configured', disposition: null },
+    adopt: { available: false, reason: 'proposal-missing' },
+  };
+  assert.deepEqual(TaskConversationStateSchema.parse(conversationState), conversationState);
+  assert.equal(
+    hashCanonical(TaskConversationStateSchema.parse(conversationState)),
+    hashCanonical(conversationState),
+  );
+  assert.deepEqual(TaskConversationStateSchema.parse({ ...conversationState, modelChoices }), {
+    ...conversationState,
+    modelChoices,
+  });
+  const oversizedModelState = {
+    ...conversationState,
+    modelChoices: { ...modelChoices, models: escapedModels },
+    pendingQuestions: Array.from({ length: 100 }, (_, index) => ({
+      id: `msg_${suffix.slice(0, -3)}${String(index).padStart(3, '0')}`,
+      cursor: String(index),
+    })),
+  };
+  assert(ConversationModelChoicesSchema.safeParse(oversizedModelState.modelChoices).success);
+  assert(Buffer.byteLength(canonicalJson(oversizedModelState)) > 32768);
+  assert.equal(TaskConversationStateSchema.safeParse(oversizedModelState).success, false);
+  for (const reason of [
+    'observation-missing',
+    'observation-stale',
+    'client-changed',
+    'catalog-unavailable',
+    'model-unavailable',
+    'effort-unavailable',
+  ])
+    assert(
+      TaskConversationStateSchema.safeParse({
+        ...conversationState,
+        send: { available: false, disposition: null, reason },
+      }).success,
+    );
+  assert(
+    ReadDataSchema.safeParse({ kind: 'conversation-state', state: conversationState }).success,
+  );
+  const configuredConversation = {
+    ...conversationState,
+    contractStatus: 'provisional',
+    purpose: 'conversation',
+    phase: 'discussion',
+    currentRunId: conversationBinding.runId,
+    configuration: {
+      revision: 1,
+      selection: planning,
+      routeId: conversationBinding.routeId,
+      requestedModel: 'profile-model',
+      effectiveModel: null,
+      requestedEffort: 'low',
+      effectiveEffort: null,
+    },
+    budget: { limits: planning.limits, remaining: { attempts: 7, minutes: 29, concurrency: 4 } },
+    proposal: {
+      id: conversationEntry.id,
+      hash: hashCanonical(proposal),
+      runId: conversationBinding.runId,
+      revision: 1,
+    },
+    send: { available: true, reason: 'available', disposition: 'turn' },
+    adopt: { available: true, reason: 'available' },
+  };
+  assert.deepEqual(
+    TaskConversationStateSchema.parse(configuredConversation),
+    configuredConversation,
+  );
+  assert(
+    TaskConversationStateSchema.safeParse({
+      ...configuredConversation,
+      send: { available: false, reason: 'conversation-input-too-large', disposition: null },
+    }).success,
+  );
+  const conversationOwner = {
+    id: conversationBinding.attemptId,
+    runId: conversationBinding.runId,
+    routeId: conversationBinding.routeId,
+    generation: 0,
+    state: 'running',
+    revision: 0,
+  };
+  const contextUsage = {
+    observation: modelRequest.observation,
+    runId: conversationBinding.runId,
+    attemptId: conversationBinding.attemptId,
+    generation: 0,
+    model: 'profile-model',
+    usedTokens: 17,
+    capacityTokens: 128,
+    observedAt: '2026-10-17T00:00:00.000Z',
+  };
+  for (const usage of [contextUsage, { ...contextUsage, usedTokens: 0, capacityTokens: null }]) {
+    const measured = { ...configuredConversation, contextUsage: usage };
+    assert.deepEqual(TaskConversationStateSchema.parse(measured), measured);
+  }
+  for (const change of [
+    { usedTokens: -1 },
+    { usedTokens: Number.MAX_SAFE_INTEGER + 1 },
+    { capacityTokens: 0 },
+    { capacityTokens: -1 },
+    { capacityTokens: Number.MAX_SAFE_INTEGER + 1 },
+    { totalTokens: 100 },
+    { runId: `run_${'0'.repeat(26)}` },
+    { observedAt: 'tomorrow' },
+  ])
+    assert.equal(
+      TaskConversationStateSchema.safeParse({
+        ...configuredConversation,
+        contextUsage: { ...contextUsage, ...change },
+      }).success,
+      false,
+    );
+  const executionQueue = {
+    ...conversationState,
+    purpose: 'execution',
+    phase: 'execution',
+    currentRunId: conversationBinding.runId,
+    activeAttempt: conversationOwner,
+    send: { available: true, reason: 'queued-at-boundary', disposition: 'queue' },
+  };
+  assert.deepEqual(TaskConversationStateSchema.parse(executionQueue), executionQueue);
+  const retainedExecutionInput = { ...executionQueue, activeAttempt: null };
+  assert.deepEqual(
+    TaskConversationStateSchema.parse(retainedExecutionInput),
+    retainedExecutionInput,
+  );
+  for (const change of [
+    { purpose: 'conversation' },
+    { currentRunId: null },
+    { phase: 'unknown' },
+    { phase: 'stopping' },
+  ])
+    assert.equal(
+      TaskConversationStateSchema.safeParse({ ...retainedExecutionInput, ...change }).success,
+      false,
+    );
+  const linkedPlanningTurn = {
+    ...configuredConversation,
+    purpose: 'execution',
+    send: { available: true, reason: 'available', disposition: 'planning-turn' },
+    adopt: { available: false, reason: 'proposal-not-current' },
+  };
+  assert.deepEqual(TaskConversationStateSchema.parse(linkedPlanningTurn), linkedPlanningTurn);
+  for (const change of [
+    { configuration: null },
+    { budget: null },
+    { currentRunId: null },
+    { purpose: 'conversation' },
+    { activeAttempt: conversationOwner },
+    { phase: 'unknown' },
+    { phase: 'stopping' },
+  ])
+    assert.equal(
+      TaskConversationStateSchema.safeParse({ ...linkedPlanningTurn, ...change }).success,
+      false,
+    );
+  assert(
+    TaskConversationStateSchema.safeParse({
+      ...configuredConversation,
+      activeAttempt: conversationOwner,
+      send: executionQueue.send,
+      adopt: { available: false, reason: 'owner-active' },
+    }).success,
+  );
+  for (const change of [
+    { currentRunId: null },
+    { purpose: null },
+    { activeAttempt: { ...conversationOwner, state: 'unknown' } },
+  ])
+    assert.equal(
+      TaskConversationStateSchema.safeParse({ ...executionQueue, ...change }).success,
+      false,
+    );
+  for (const change of [
+    { send: { available: true, reason: 'ownership-unknown', disposition: 'turn' } },
+    { configuration: null },
+    { configuration: { ...configuredConversation.configuration, routeId: null } },
+    { budget: null },
+    { currentRunId: null },
+    { purpose: 'execution' },
+    { phase: 'unknown' },
+    { activeAttempt: conversationOwner },
+    { proposal: { ...configuredConversation.proposal, runId: 'run_01ARZ3NDEKTSV4RRFFQ69G5FAW' } },
+    { send: { available: false, reason: 'available', disposition: null } },
+    { send: { available: true, reason: 'available', disposition: 'queue' } },
+    { send: { available: false, reason: 'invented-reason', disposition: null } },
+    { adopt: { available: true, reason: 'proposal-missing' } },
+    { proposal: null },
+    {
+      budget: { limits: planning.limits, remaining: { attempts: 9, minutes: 29, concurrency: 4 } },
+    },
+    { configuration: { ...configuredConversation.configuration, executable: '/caller/process' } },
+    {
+      pendingQuestions: [
+        { id: conversationEntry.id, cursor: '1' },
+        { id: conversationEntry.id, cursor: '1' },
+      ],
+    },
+  ])
+    assert.equal(
+      TaskConversationStateSchema.safeParse({ ...configuredConversation, ...change }).success,
+      false,
+    );
+  const conversationStateRead = {
+    protocol: 1,
+    key: command.key,
+    actor: command.actor,
+    command: 'GetTaskConversationState',
+    payload: { taskId: conversationBinding.taskId },
+  };
+  assert.deepEqual(CommandSchema.parse(conversationStateRead), conversationStateRead);
+  const conversationRead = {
+    protocol: 1,
+    key: command.key,
+    actor: command.actor,
+    command: 'GetTaskConversation',
+    payload: { taskId: conversationBinding.taskId, beforeCursor: '1' },
+  };
+  assert.deepEqual(CommandSchema.parse(conversationRead), conversationRead);
   const attestation = {
     source: 'user-attested',
     subscriptionLoginConfirmed: true,
@@ -99,6 +1225,7 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     id: 'openai-repository-v1',
     qualifiedAt: null,
     reason: 'qualification-pending',
+    maximumTaskMs: 600000,
     maximumSourceFiles: 10000,
     maximumSourceBytes: 67108864,
     execution,
@@ -106,6 +1233,7 @@ test('process boundaries reject unknown fields and invalid command identity', ()
   assert.deepEqual(NativeProfileSchema.parse(repositoryProfile), repositoryProfile);
   for (const change of [
     { maximumFileBytes: 65536 },
+    { maximumTaskMs: 300000 },
     { maximumSourceFiles: 2 },
     { maximumSourceBytes: 67108865 },
     { execution: { ...execution, sandbox: 'danger-full-access' } },
@@ -127,6 +1255,10 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     reason: 'qualification-pending',
   };
   assert.deepEqual(NativeProfileSchema.parse(pendingProfile), pendingProfile);
+  assert.deepEqual(
+    NativeProfileSchema.parse({ ...pendingProfile, id: 'anthropic-file-compact-v1' }),
+    { ...pendingProfile, id: 'anthropic-file-compact-v1' },
+  );
   for (const change of [
     { effectiveEffort: 'medium' },
     { accountClass: 'pro' },
@@ -175,6 +1307,12 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     },
   };
   assert.deepEqual(NativeProfileSchema.parse(acpProfile), acpProfile);
+  assert.deepEqual(NativeProfileSchema.parse({ ...acpProfile, maximumTaskMs: 600000 }), {
+    ...acpProfile,
+    maximumTaskMs: 600000,
+  });
+  for (const maximumTaskMs of [300001, 600001])
+    assert.equal(NativeProfileSchema.safeParse({ ...acpProfile, maximumTaskMs }).success, false);
   const modelOnly = {
     ...acpProfile,
     effort: 'unknown',
@@ -242,6 +1380,8 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     reason: 'qualification-pending',
   };
   assert.deepEqual(NativeProfileSchema.parse(localProfile), localProfile);
+  const currentLocalProfile = { ...localProfile, maximumOutputTokens: 4096 };
+  assert.deepEqual(NativeProfileSchema.parse(currentLocalProfile), currentLocalProfile);
   assert(
     NativeProfileSchema.safeParse({
       ...localProfile,
@@ -262,7 +1402,8 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     { modelBinding: { ...localModel, setupHash: 'invalid' } },
     { modelBinding: { ...localModel, quantization: 'other' } },
     { contextLength: 16384 },
-    { maximumOutputTokens: 4096 },
+    { maximumOutputTokens: 2049 },
+    { maximumOutputTokens: 8192 },
     { maximumSubmissions: 2 },
     { available: false, reason: 'available' },
     { reason: 'unbounded-error' },
@@ -277,6 +1418,7 @@ test('process boundaries reject unknown fields and invalid command identity', ()
   const profiles = [
     historicalProfile,
     pendingProfile,
+    { ...pendingProfile, id: 'anthropic-file-compact-v1' },
     googleProfile,
     repositoryProfile,
     acpProfile,
@@ -302,26 +1444,29 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     family: 'google',
     clientVersion: 'fixture',
     available: false,
-    enabled: false,
-    reason: 'not-enabled',
+    reason: 'client-unavailable',
     lastObservedAt: null,
   };
   for (const valid of [
     reader,
-    { ...reader, enabled: true, available: true, reason: 'available' },
+    { ...reader, available: true, reason: 'available' },
     {
       ...reader,
-      enabled: true,
       reason: 'client-build-mismatch',
       lastAttemptAt: '2026-10-17T00:00:00.000Z',
     },
     { ...reader, reason: 'unsupported-platform' },
+    { ...reader, reason: 'native-home-unavailable' },
   ])
     assert.deepEqual(UsageReaderSchema.parse(valid), valid);
   for (const change of [
     { available: true },
     { reason: 'available' },
     { enabled: true },
+    { enabled: false },
+    { consent: true },
+    { authorityRevision: 1 },
+    { reason: 'not-enabled' },
     { family: 'anthropic' },
     { reason: 'unbounded-error' },
     { lastAttemptAt: 'tomorrow' },
@@ -348,25 +1493,397 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     nativeProfiles: [],
     nativeRuns: [],
     candidateEvaluations: [],
+    combinedRuns: [],
     usageReaders: [],
     googleAcpSetup: null,
   });
+  assert.equal(Object.hasOwn(SnapshotSchema.parse(oldSnapshot), 'localSetup'), false);
+  const localReceipt = {
+    version: 1,
+    runtimeVersion: 'fixture-runtime',
+    artifactSha256: 'c'.repeat(64),
+    artifactSizeBytes: 17,
+    quantization: 'fixture-quantization',
+    model: { modelKey: 'fixture-model', instanceReference: 'fixture-instance', modelSizeBytes: 17 },
+    contextLength: 8192,
+    residentLlms: 1,
+    embeddingInstances: 0,
+    draftModel: '',
+  };
+  assert.deepEqual(LocalSetupReceiptSchema.parse(localReceipt), localReceipt);
+  const localSetup = {
+    revision: 1,
+    connectionRevision: 1,
+    connectorId: 'local-sdk-v1',
+    endpoint: 'ws://127.0.0.1:1234',
+    setupHash: null,
+    connectionHash: 'b'.repeat(64),
+    secretConfigured: false,
+    operation: null,
+    observation: null,
+    selection: null,
+    generation: 'idle',
+    reason: 'connection-required',
+  };
+  assert.deepEqual(LocalSetupSchema.parse(localSetup), localSetup);
+  assert(LocalSetupSchema.safeParse({ ...localSetup, authMode: 'none', connected: true }).success);
+  for (const change of [
+    { authMode: 'none', secretConfigured: true },
+    { authMode: 'token', connected: true },
+    { authMode: 'automatic' },
+  ])
+    assert.equal(LocalSetupSchema.safeParse({ ...localSetup, ...change }).success, false);
+  assert.deepEqual(SnapshotSchema.parse({ ...oldSnapshot, localSetup }).localSetup, localSetup);
+  assert.equal(SnapshotSchema.parse({ ...oldSnapshot, localSetup: null }).localSetup, null);
+  for (const kind of ['input', 'discovery'])
+    for (const state of ['intent', 'owned', 'stopping', 'unknown'])
+      assert(
+        LocalSetupSchema.safeParse({
+          ...localSetup,
+          operation: { kind, operationId: command.key, state },
+        }).success,
+      );
+  for (const state of ['idle', 'active', 'unknown'])
+    assert(LocalSetupSchema.safeParse({ ...localSetup, generation: state }).success);
+  assert(
+    LocalSetupSchema.safeParse({
+      ...localSetup,
+      endpoint: null,
+      setupHash: null,
+      connectionHash: null,
+      reason: 'unconfigured',
+    }).success,
+  );
+  for (const extra of [
+    { revision: -1 },
+    { connectionRevision: -1 },
+    { connectorId: 'arbitrary-runtime' },
+    { revision: 1.5 },
+    { endpoint: null },
+    { connectionHash: null },
+    { endpoint: null, setupHash: null, connectionHash: null, secretConfigured: true },
+    { operation: { kind: 'input', state: 'owned', operationId: null } },
+    { operation: { kind: 'input', state: 'idle', operationId: command.key } },
+    { operation: { kind: 'input', state: 'unknown', operationId: command.key, group: 123 } },
+    { generation: 'recovered' },
+    { reason: 'raw SDK diagnostic' },
+    { token: 'synthetic-secret' },
+    { tokenHash: 'a'.repeat(64) },
+    { credential: 'synthetic-secret' },
+    { helperPath: '/arbitrary/helper' },
+  ])
+    assert.equal(LocalSetupSchema.safeParse({ ...localSetup, ...extra }).success, false);
+  for (const endpoint of ['ws://127.0.0.1:1', 'ws://127.0.0.1:65535'])
+    assert(LocalEndpointSchema.safeParse(endpoint).success);
+  for (const endpoint of [
+    'ws://localhost:1234',
+    'ws://127.1:1234',
+    'ws://[::1]:1234',
+    'wss://127.0.0.1:1234',
+    'ws://127.0.0.1:0',
+    'ws://127.0.0.1:01',
+    'ws://127.0.0.1:65536',
+    'ws://127.0.0.1:1234/',
+    'ws://127.0.0.1:1234?token=x',
+    'ws://127.0.0.1:1234\n',
+  ])
+    assert.equal(LocalEndpointSchema.safeParse(endpoint).success, false, endpoint);
+  for (const extra of [
+    { artifactSizeBytes: 0 },
+    { artifactSizeBytes: Number.MAX_SAFE_INTEGER + 1 },
+    { residentLlms: -1 },
+    { embeddingInstances: 0.5 },
+    { contextLength: 0 },
+    { runtimeVersion: 'invalid\nversion' },
+    { artifactSha256: 'invalid' },
+    { model: { ...localReceipt.model, token: 'synthetic-secret' } },
+    { token: 'synthetic-secret' },
+    { tokenHash: 'a'.repeat(64) },
+    { helperPath: '/arbitrary/helper' },
+  ])
+    assert.equal(LocalSetupReceiptSchema.safeParse({ ...localReceipt, ...extra }).success, false);
+  const observedIdentity = {
+    modelKey: 'observed-model',
+    displayName: 'Observed model',
+    format: 'gguf',
+    sizeBytes: 17,
+    quantization: { name: 'observed quantization', bits: 4 },
+    selectedVariant: null,
+    metadataHash: 'c'.repeat(64),
+  };
+  const observedChoice = {
+    selectionId: 'd'.repeat(64),
+    identity: observedIdentity,
+    instanceReference: 'observed-instance',
+    contextLength: 8192,
+    state: 'loaded-eligible',
+    reasons: [],
+    qualification: 'unqualified',
+  };
+  const observation = {
+    version: 1,
+    runtime: { connectorId: 'local-sdk-v1', version: 'observed-version', build: 1 },
+    observationHash: 'e'.repeat(64),
+    models: [observedChoice],
+    residentLlms: 1,
+    embeddingInstances: 0,
+  };
+  assert.deepEqual(LocalModelObservationSchema.parse(observation), observation);
+  assert(
+    LocalSetupSchema.safeParse({
+      ...localSetup,
+      setupHash: null,
+      secretConfigured: true,
+      observation,
+    }).success,
+  );
+  for (const identity of [
+    {
+      ...observedIdentity,
+      modelKey: 'another-present-model',
+      format: 'safetensors',
+      quantization: null,
+    },
+    { ...observedIdentity, format: 'observed-unsupported-format' },
+  ])
+    assert(
+      LocalModelObservationSchema.safeParse({
+        ...observation,
+        models: [
+          { ...observedChoice, identity, state: 'incompatible', reasons: ['unsupported-format'] },
+        ],
+      }).success,
+    );
+  for (const choice of [
+    {
+      ...observedChoice,
+      state: 'installed-unloaded',
+      instanceReference: null,
+      contextLength: null,
+    },
+    {
+      ...observedChoice,
+      state: 'incompatible',
+      instanceReference: null,
+      contextLength: null,
+      reasons: ['identity-ambiguous'],
+    },
+    { ...observedChoice, state: 'incompatible', reasons: ['not-downloaded'] },
+  ])
+    assert(LocalModelObservationSchema.safeParse({ ...observation, models: [choice] }).success);
+  const unloadedChoices = Array.from({ length: 64 }, (_, index) => ({
+    ...observedChoice,
+    selectionId: index.toString(16).padStart(64, '0'),
+    instanceReference: null,
+    contextLength: null,
+    state: 'installed-unloaded',
+  }));
+  assert(
+    LocalModelObservationSchema.safeParse({
+      ...observation,
+      models: unloadedChoices,
+      residentLlms: 0,
+    }).success,
+  );
+  const eightHandles = unloadedChoices.slice(0, 8).map((choice, index) => ({
+    ...choice,
+    state: 'incompatible',
+    instanceReference: `observed-${index}`,
+    contextLength: 8192,
+    reasons: ['multiple-resident-models'],
+  }));
+  assert(
+    LocalModelObservationSchema.safeParse({ ...observation, models: eightHandles, residentLlms: 8 })
+      .success,
+  );
+  for (const change of [
+    { models: [observedChoice, observedChoice] },
+    {
+      residentLlms: 2,
+      models: Array.from({ length: 2 }, (_, index) => ({
+        ...observedChoice,
+        selectionId: index.toString(16).padStart(64, '0'),
+        state: 'incompatible',
+        reasons: ['identity-ambiguous'],
+      })),
+    },
+    {
+      models: Array.from({ length: 65 }, (_, index) => ({
+        ...observedChoice,
+        selectionId: index.toString(16).padStart(64, '0'),
+      })),
+    },
+    {
+      models: Array.from({ length: 9 }, (_, index) => ({
+        ...observedChoice,
+        selectionId: index.toString(16).padStart(64, '0'),
+      })),
+    },
+    { residentLlms: 9 },
+    { residentLlms: 0 },
+    { residentLlms: 2 },
+    { embeddingInstances: 1 },
+    { embeddingInstances: 9 },
+    { runtime: { ...observation.runtime, build: -1 } },
+    { runtime: { ...observation.runtime, executable: '/arbitrary/runtime' } },
+    { models: [{ ...observedChoice, identity: { ...observedIdentity, modelKey: 'x\ny' } }] },
+    {
+      models: [
+        { ...observedChoice, identity: { ...observedIdentity, displayName: '界'.repeat(100) } },
+      ],
+    },
+    {
+      models: [
+        { ...observedChoice, identity: { ...observedIdentity, path: 'private/model.gguf' } },
+      ],
+    },
+    { models: [{ ...observedChoice, qualification: 'qualified' }] },
+    { models: [{ ...observedChoice, reasons: ['raw diagnostic'] }] },
+    { models: [{ ...observedChoice, reasons: ['busy', 'busy'] }] },
+    { models: [{ ...observedChoice, state: 'loaded-eligible', instanceReference: null }] },
+    { models: [{ ...observedChoice, contextLength: 32768 }] },
+    { models: [{ ...observedChoice, identity: { ...observedIdentity, format: 'unsupported' } }] },
+    { models: [{ ...observedChoice, state: 'incompatible', reasons: [] }] },
+    { models: [{ ...observedChoice, state: 'installed-unloaded' }] },
+    { tokenHash: 'a'.repeat(64) },
+  ])
+    assert.equal(
+      LocalModelObservationSchema.safeParse({ ...observation, ...change }).success,
+      false,
+    );
+  const selectedSetup = {
+    ...localSetup,
+    setupHash: 'a'.repeat(64),
+    observation,
+    selection: {
+      selectionId: observedChoice.selectionId,
+      observationHash: observation.observationHash,
+    },
+  };
+  assert(LocalSetupSchema.safeParse(selectedSetup).success);
+  for (const change of [
+    { selection: null },
+    { observation: null },
+    { setupHash: null },
+    { selection: { ...selectedSetup.selection, selectionId: 'f'.repeat(64) } },
+    { selection: { ...selectedSetup.selection, observationHash: 'f'.repeat(64) } },
+  ])
+    assert.equal(LocalSetupSchema.safeParse({ ...selectedSetup, ...change }).success, false);
+  assert(
+    LocalSetupSchema.safeParse({
+      ...selectedSetup,
+      reason: 'selection-stale',
+      selection: { ...selectedSetup.selection, observationHash: 'f'.repeat(64) },
+    }).success,
+  );
+  const observedBinding = {
+    version: 2,
+    identityKind: 'runtime-metadata',
+    setupHash: 'a'.repeat(64),
+    connectionHash: localSetup.connectionHash,
+    connectionRevision: localSetup.connectionRevision,
+    connectorId: 'local-sdk-v1',
+    runtimeVersion: 'observed-version',
+    runtimeBuild: 1,
+    modelKey: observedIdentity.modelKey,
+    instanceReference: 'observed-instance',
+    modelSizeBytes: 17,
+    format: 'gguf',
+    metadataHash: observedIdentity.metadataHash,
+  };
+  assert.deepEqual(LocalModelBindingSchema.parse(localModel), localModel);
+  for (const format of ['gguf', 'safetensors'])
+    assert.deepEqual(LocalObservedModelBindingSchema.parse({ ...observedBinding, format }), {
+      ...observedBinding,
+      format,
+    });
+  assert(
+    NativeProfileSchema.safeParse({
+      ...localProfile,
+      model: observedBinding.modelKey,
+      modelBinding: observedBinding,
+    }).success,
+  );
+  for (const extra of [
+    { artifactSha256: 'f'.repeat(64) },
+    { quantization: 'invented' },
+    { identityKind: 'artifact' },
+    { connectionRevision: -1 },
+    { connectionHash: undefined },
+    { format: 'unknown' },
+    { runtimeVersion: 'observed\nversion' },
+    { token: 'synthetic-secret' },
+    { path: 'private/model' },
+  ])
+    assert.equal(
+      LocalModelBindingSchema.safeParse({ ...observedBinding, ...extra }).success,
+      false,
+    );
+  for (const [name, payload] of [
+    ['ConfigureLocal', { endpoint: localSetup.endpoint }],
+    ['ConfigureLocal', { endpoint: localSetup.endpoint, authMode: 'token' }],
+    ['ConfigureLocal', { endpoint: localSetup.endpoint, authMode: 'none' }],
+    ['RefreshLocalModels', { consent: 'explicit' }],
+    ['SelectLocalModel', { selectionId: 'c'.repeat(64), observationHash: 'd'.repeat(64) }],
+    ['BeginLocalConnectionInput', { consent: 'explicit' }],
+    ['CancelLocalConnectionInput', { operationId: command.key }],
+    ['DisconnectLocal', {}],
+  ] as const) {
+    const request = { ...command, command: name, payload };
+    assert.deepEqual(CommandSchema.parse(request), request);
+    assert.equal(hashCanonical(CommandSchema.parse(request)), hashCanonical(request));
+    for (const extra of [
+      { token: 'synthetic-secret' },
+      { tokenHash: 'a'.repeat(64) },
+      { credential: 'synthetic-secret' },
+      { helperPath: '/arbitrary/helper' },
+      { setupRevision: 1 },
+    ])
+      assert.equal(
+        CommandSchema.safeParse({ ...request, payload: { ...payload, ...extra } }).success,
+        false,
+      );
+    for (const expectedRevision of [undefined, -1, 0.5, Number.MAX_SAFE_INTEGER + 1])
+      assert.equal(CommandSchema.safeParse({ ...request, expectedRevision }).success, false);
+    assert.equal(CommandSchema.safeParse({ ...request, key: 'arbitrary-key' }).success, false);
+  }
+  for (const [name, payload] of [
+    ['ConfigureLocal', { endpoint: localSetup.endpoint, receipt: localReceipt }],
+    ['ConfigureLocal', { endpoint: localSetup.endpoint, authMode: 'automatic' }],
+    ['ConfigureLocal', { endpoint: 'ws://0.0.0.0:1234', authMode: 'none' }],
+    ['RefreshLocalModels', { consent: 'saved' }],
+    ['SelectLocalModel', { selectionId: 'not-an-id', observationHash: 'd'.repeat(64) }],
+    ['SelectLocalModel', { selectionId: 'c'.repeat(64) }],
+    [
+      'SelectLocalModel',
+      { selectionId: 'c'.repeat(64), observationHash: 'd'.repeat(64), path: 'model.gguf' },
+    ],
+    ['BeginLocalConnectionInput', { consent: 'saved' }],
+    ['BeginLocalConnectionInput', { consent: 'explicit', operationId: command.key }],
+    ['BeginLocalConnectionInput', { consent: 'explicit', nonce: 'a'.repeat(64) }],
+    ['CancelLocalConnectionInput', {}],
+    ['CancelLocalConnectionInput', { operationId: 'arbitrary-key' }],
+  ] as const)
+    assert.equal(CommandSchema.safeParse({ ...command, command: name, payload }).success, false);
   assert.equal(
     SnapshotSchema.safeParse({ ...oldSnapshot, usageReaders: [reader, reader] }).success,
     false,
   );
-  for (const consent of [undefined, true, false]) {
-    const observe = {
-      ...command,
-      command: 'ObserveUsage',
-      payload: { family: 'google', ...(consent === undefined ? {} : { consent }) },
-    };
-    assert.deepEqual(CommandSchema.parse(observe), observe);
-  }
+  const observe = {
+    ...command,
+    command: 'ObserveUsage',
+    payload: { family: 'google' },
+  };
+  assert.deepEqual(CommandSchema.parse(observe), observe);
+  assert.equal(hashCanonical(CommandSchema.parse(observe)), hashCanonical(observe));
   for (const payload of [
+    { family: 'google', consent: true },
+    { family: 'google', consent: false },
     { family: 'google', consent: 'true' },
     { family: 'google', consent: null },
-    { family: 'openai', consent: true },
+    { family: 'google', enabled: true },
+    { family: 'google', authorityRevision: 1 },
+    { family: 'openai' },
     { family: 'google', token: 'synthetic-secret' },
   ])
     assert.equal(
@@ -495,6 +2012,17 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     stage: 'retain-only',
   };
   assert.deepEqual(NativeRunSchema.parse(historicalRun), historicalRun);
+  assert.equal(
+    NativeRunSchema.safeParse({
+      ...historicalRun,
+      quotaRetry: {
+        available: false,
+        mode: 'manual',
+        resetsAt: '2026-10-19T01:00:00.000Z',
+      },
+    }).success,
+    false,
+  );
   const acpAttestation = { ...attestation, quotaAccountConfirmed: true };
   const acpRun = {
     ...historicalRun,
@@ -538,6 +2066,10 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     localModel,
   };
   assert.deepEqual(NativeRunSchema.parse(localRun), localRun);
+  assert.deepEqual(NativeRunSchema.parse({ ...localRun, localModel: observedBinding }), {
+    ...localRun,
+    localModel: observedBinding,
+  });
   for (const change of [
     { localModel: undefined },
     { target: undefined },
@@ -621,6 +2153,21 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     mode: 'demo',
   };
   assert.ok(RuntimeManifestSchema.safeParse(manifest).success);
+  assert.deepEqual(RuntimeManifestSchema.parse(manifest), manifest);
+  assert.deepEqual(RuntimeManifestSchema.parse({ ...manifest, mode: 'workspace' }), {
+    ...manifest,
+    mode: 'workspace',
+  });
+  const localInput = {
+    sha256: 'b'.repeat(64),
+    sourceHash: 'c'.repeat(64),
+    target: 'darwin-arm64',
+    minOS: '13.5.0',
+  };
+  assert.deepEqual(RuntimeManifestSchema.parse({ ...manifest, localInput }), {
+    ...manifest,
+    localInput,
+  });
   assert.ok(
     RuntimeManifestSchema.safeParse({
       ...manifest,
@@ -631,6 +2178,19 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     { ...manifest, version: 2 },
     { ...manifest, mode: 'production' },
     { ...manifest, entry: '/arbitrary/entry' },
+    { ...manifest, localInput: null },
+    { ...manifest, localInput: {} },
+    ...[
+      { sha256: 'invalid' },
+      { sourceHash: 'invalid' },
+      { target: 'darwin-x64' },
+      { minOS: '13.0.0' },
+      { path: '/arbitrary/helper' },
+      { executable: '/arbitrary/helper' },
+      { model: 'arbitrary' },
+      { secret: 'synthetic-secret' },
+      { token: 'synthetic-secret' },
+    ].map((input) => ({ ...manifest, localInput: { ...localInput, ...input } })),
     ...[
       { version: '24.21.0' },
       { platform: 'win32' },
@@ -830,7 +2390,7 @@ test('process boundaries reject unknown fields and invalid command identity', ()
       git: { version: '2.50.1', sha256: '4'.repeat(64) },
     },
     stages: ['policy', 'lint', 'types', 'node-tests', 'build', 'desktop'],
-    maximumMinutes: 5,
+    maximumMinutes: 10,
   };
   const verificationPreview = { ...preview, recipe: 'crewkite-verify-v1', verification };
   assert.deepEqual(
@@ -845,6 +2405,7 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     },
     { ...preview, verification },
     { ...preview, verification: undefined },
+    { ...verificationPreview, verification: { ...verification, maximumMinutes: 5 } },
     { ...verificationPreview, verification: { ...verification, maximumMinutes: 1 } },
     {
       ...verificationPreview,
@@ -1087,6 +2648,57 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     },
   };
   assert.deepEqual(CommandSchema.parse(acpPreparation), acpPreparation);
+  assert.equal(Object.hasOwn(CommandSchema.parse(acpPreparation).payload, 'maximumTaskMs'), false);
+  assert.equal(Object.hasOwn(CommandSchema.parse(acpPreparation).payload, 'contextLines'), false);
+  for (const contextLines of [
+    { start: 1, end: 1 },
+    { start: 2, end: 20 },
+  ]) {
+    const request = { ...acpPreparation, payload: { ...acpPreparation.payload, contextLines } };
+    assert.deepEqual(CommandSchema.parse(request), request);
+  }
+  for (const contextLines of [
+    { start: 0, end: 1 },
+    { start: 2, end: 1 },
+    { start: 1.5, end: 2 },
+    { start: 1, end: Number.MAX_SAFE_INTEGER + 1 },
+    { start: 1, end: 2, extra: true },
+  ])
+    assert.equal(
+      CommandSchema.safeParse({
+        ...acpPreparation,
+        payload: { ...acpPreparation.payload, contextLines },
+      }).success,
+      false,
+    );
+  for (const request of [filePreparation, localPreparation])
+    assert.equal(
+      CommandSchema.safeParse({
+        ...request,
+        payload: { ...request.payload, contextLines: { start: 1, end: 1 } },
+      }).success,
+      false,
+    );
+
+  for (const maximumTaskMs of [300000, 600000]) {
+    const request = { ...acpPreparation, payload: { ...acpPreparation.payload, maximumTaskMs } };
+    assert.deepEqual(CommandSchema.parse(request), request);
+  }
+  for (const maximumTaskMs of [300001, 600001])
+    assert.equal(
+      CommandSchema.safeParse({
+        ...acpPreparation,
+        payload: { ...acpPreparation.payload, maximumTaskMs },
+      }).success,
+      false,
+    );
+  assert.equal(
+    CommandSchema.safeParse({
+      ...filePreparation,
+      payload: { ...filePreparation.payload, maximumTaskMs: 600000 },
+    }).success,
+    false,
+  );
   assert(
     CommandSchema.safeParse({
       ...acpPreparation,
@@ -1486,17 +3098,44 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     assert.equal(MinorAmountSchema.safeParse(value).success, false);
   for (const value of ['-1', '01', '1.5', '1'.repeat(21)])
     assert.equal(CursorSchema.safeParse(value).success, false);
+  const usageObservation = {
+    routeId: `rte_${suffix}`,
+    windowId: 'weekly',
+    kind: 'weekly',
+    remaining: { value: 80, unit: 'percent' },
+    resetsAt: null,
+    observedAt: '2026-10-15T17:00:00.000Z',
+    source: 'fixture',
+    confidence: 'reported',
+  };
+  assert.deepEqual(ObservationSchema.parse(usageObservation), usageObservation);
+  for (const semantics of [
+    { scope: 'provider', periodSeconds: 604800 },
+    { scope: 'provider', periodSeconds: 18000 },
+    { scope: 'model' },
+    { scope: 'pool', periodSeconds: 1 },
+    { scope: 'pool', periodSeconds: 31536000 },
+  ])
+    assert.deepEqual(ObservationSchema.parse({ ...usageObservation, semantics }), {
+      ...usageObservation,
+      semantics,
+    });
+  for (const semantics of [
+    null,
+    {},
+    { scope: 'account' },
+    { scope: 'provider', periodSeconds: 0 },
+    { scope: 'provider', periodSeconds: -1 },
+    { scope: 'provider', periodSeconds: 0.5 },
+    { scope: 'provider', periodSeconds: 31536001 },
+    { scope: 'provider', periodSeconds: Infinity },
+    { scope: 'provider', periodSeconds: '18000' },
+    { scope: 'provider', model: 'unobserved' },
+  ])
+    assert.equal(ObservationSchema.safeParse({ ...usageObservation, semantics }).success, false);
   assert.equal(
-    ObservationSchema.safeParse({
-      routeId: `rte_${suffix}`,
-      windowId: 'weekly',
-      kind: 'weekly',
-      remaining: { value: 101, unit: 'percent' },
-      resetsAt: null,
-      observedAt: '2026-10-15T17:00:00.000Z',
-      source: 'fixture',
-      confidence: 'reported',
-    }).success,
+    ObservationSchema.safeParse({ ...usageObservation, remaining: { value: 101, unit: 'percent' } })
+      .success,
     false,
   );
 });

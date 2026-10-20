@@ -9,7 +9,7 @@ ADR 0012 names Local, OpenAI, Anthropic and Google in D2. ADR 0005 requires supp
 
 ## Decision
 
-I propose to retain all four D2 families and qualify each integration's eligibility, authentication and billing path. [Proposed ADR 0024](0024-integrate-google-through-its-published-acp-agent.md) describes the separate ACP route for Google with explicit human approvals and its own quota read. The consumer headless writer stays blocked. The editor precedent leaves CrewKite's orchestrator eligibility unresolved. Installing an official client or recording a user attestation does not satisfy those gates by itself.
+I propose to retain all four D2 families and qualify each integration's eligibility, authentication and billing path. [Proposed ADR 0024](0024-integrate-google-through-its-published-acp-agent.md) describes the separate ACP route for Google with explicit human approvals and its own quota read. The consumer headless writer stays blocked. Installing an official client or recording a user attestation does not satisfy those gates by itself.
 
 D2 still requires ten real tasks from my backlog, durable handoff, honest usage, finite review, two coding slices with a combined check and safe self-development. Provider eligibility does not lower those exits. Real-work user acceptance and final testing follow in D2b. Required corrections must pass verification, and I must explicitly approve starting D3.
 

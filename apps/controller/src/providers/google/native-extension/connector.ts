@@ -431,6 +431,14 @@ export function createSession(
   options: { client: ContextClient; now: () => number; save: (text: string) => void },
 ) {
   const context = 'context' in bundle ? bundle.context : bundle;
+  const availableTools =
+    'context' in bundle
+      ? tools.filter(
+          (tool) =>
+            tool.name !== 'task_context' &&
+            (tool.name !== 'retained_patch' || context.binding.patch !== null),
+        )
+      : tools;
   let initialized = false,
     ready = false,
     closed = false,
@@ -510,7 +518,8 @@ export function createSession(
         }
         if (!ready) return error(-32002, 'Complete initialization first.');
         if (message.method === 'ping') return { jsonrpc: '2.0', id, result: {} };
-        if (message.method === 'tools/list') return { jsonrpc: '2.0', id, result: { tools } };
+        if (message.method === 'tools/list')
+          return { jsonrpc: '2.0', id, result: { tools: availableTools } };
         if (message.method !== 'tools/call') return error(-32601, 'Method is unavailable.');
         const call = z
           .strictObject({
@@ -521,6 +530,8 @@ export function createSession(
           .safeParse(message.params);
         if (!call.success) return error(-32602, 'Unknown tool or invalid parameters.');
         const { name, arguments: args } = call.data;
+        if ('context' in bundle && name === 'task_context')
+          return error(-32601, 'Method is unavailable.');
         const result =
           name === 'submit_unverified_result'
             ? ResultSchema.safeParse(args)

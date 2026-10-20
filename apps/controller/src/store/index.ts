@@ -3,6 +3,8 @@ import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import {
   type Attempt,
+  CombinedDispatchPhaseSchema,
+  type CombinedRunPreview,
   CommandIdSchema,
   type CommandResult,
   CommandResultSchema,
@@ -10,7 +12,7 @@ import {
   type Event,
   EventSchema,
   GoogleAcpSetupSchema,
-  NativeReviewJobSchema,
+  ReviewJobSchema,
   type Route,
   type Run,
   type Task,
@@ -41,7 +43,6 @@ export type GoogleMetadataOperation = {
   finished_at: string | null;
 };
 export type GoogleUsageReader = {
-  enabled: number;
   authority_revision: number;
   last_attempt_at: string | null;
   last_observed_at: string | null;
@@ -57,6 +58,59 @@ export type LaunchIntent = {
   pid: number | null;
   process_group: number | null;
   admitted_at: string | null;
+  finished_at: string | null;
+};
+export type CombinedGroup = {
+  run_id: string;
+  task_id: string;
+  preparation_id: string;
+  manifest_hash: string;
+  revision: number;
+  generation: number;
+  phase: CombinedRunPreview['phase'];
+  blocker: CombinedRunPreview['blocker'];
+  paused_phase: CombinedRunPreview['phase'] | null;
+  integration_ref: string;
+  current_head: string | null;
+  final_candidate_id: string | null;
+  origin_artifact_id: string | null;
+  integration_started_at: string | null;
+  integration_finished_at: string | null;
+  integration_milliseconds: number;
+  integration_active: number;
+  integration_maximum_minutes: number;
+};
+export type CombinedMember = {
+  parent_run_id: string;
+  ordinal: number;
+  task_id: string;
+  run_id: string;
+  preparation_id: string;
+  scope_path: string;
+  scope_hash: string;
+  task_hash: string;
+};
+export type CombinedDispatch = {
+  parent_run_id: string;
+  phase: CombinedRunPreview['dispatches'][number]['phase'];
+  maximum_minutes: number;
+  state: CombinedRunPreview['dispatches'][number]['state'];
+  attempt_id: string | null;
+  candidate_id: string | null;
+  check_artifact_id: string | null;
+  definition_hash: string | null;
+};
+export type CombinedRefIntent = {
+  parent_run_id: string;
+  generation: number;
+  operation: string;
+  expected_old: string | null;
+  expected_new: string | null;
+  candidate_id: string | null;
+  check_artifact_id: string | null;
+  state: 'prepared' | 'applied' | 'unknown';
+  body: string;
+  intent_at: string;
   finished_at: string | null;
 };
 
@@ -101,7 +155,9 @@ export function nativePhaseSequence(
           ? [['auth-status', 'native-task']]
           : family === 'google'
             ? [['google-config', 'native-task']]
-            : [];
+            : family === 'local'
+              ? [['native-task']]
+              : [];
   return sequences.some(
     (sequence) =>
       phases.length <= sequence.length &&
@@ -208,6 +264,74 @@ export class Store {
     if (result.changes !== 1) throw new Error('Entity identity belongs to a different kind.');
   }
 
+  localControl(): unknown {
+    const row = this.db.prepare('SELECT body FROM local_control WHERE singleton=1').get();
+    return row ? JSON.parse(row.body as string) : undefined;
+  }
+
+  putLocalControl(body: unknown) {
+    this.metadataWrite();
+    this.db
+      .prepare(
+        'INSERT INTO local_control(singleton,body) VALUES (1,?) ON CONFLICT(singleton) DO UPDATE SET body=excluded.body',
+      )
+      .run(canonicalJson(body));
+  }
+
+  localGenerationBlocker(): 'generation-active' | 'generation-unknown' | undefined {
+    const intents = this.intents().filter((intent) => {
+      const route = this.get<Route>('route', intent.route_id);
+      return intent.state !== 'stopped' && route?.family === 'local' && !route.fake;
+    });
+    if (
+      intents.some(
+        (intent) =>
+          ['outcome-unknown', 'interrupted'].includes(intent.state) ||
+          this.get<Attempt>('attempt', intent.attempt_id)?.state === 'unknown',
+      )
+    )
+      return 'generation-unknown';
+    if (intents.length) return 'generation-active';
+  }
+
+  localStartBlocker(): string | undefined {
+    this.metadataWrite();
+    const row = this.db
+      .prepare(
+        "SELECT json_extract(body,'$.operation.state') AS state FROM local_control WHERE singleton=1",
+      )
+      .get();
+    if (row?.state)
+      return row.state === 'unknown' ? 'local-operation-unknown' : 'local-operation-active';
+    return this.localGenerationBlocker();
+  }
+
+  conversationTask(taskId: string): unknown {
+    const row = this.db.prepare('SELECT body FROM task_conversations WHERE task_id=?').get(taskId);
+    return row ? JSON.parse(row.body as string) : undefined;
+  }
+
+  putConversationTask(taskId: string, body: unknown) {
+    if (!this.transactionEvents) throw new Error('Conversation writes require a transaction.');
+    this.db
+      .prepare(
+        'INSERT INTO task_conversations(task_id,body) VALUES (?,?) ON CONFLICT(task_id) DO UPDATE SET body=excluded.body',
+      )
+      .run(taskId, canonicalJson(body));
+  }
+
+  runPurpose(runId: string): 'conversation' | 'execution' | undefined {
+    const row = this.db.prepare('SELECT purpose FROM run_purposes WHERE run_id=?').get(runId);
+    return row?.purpose as 'conversation' | 'execution' | undefined;
+  }
+
+  putRunPurpose(run: Run, purpose: 'conversation' | 'execution', parentRunId: string | null) {
+    if (!this.transactionEvents) throw new Error('Run purpose writes require a transaction.');
+    this.db
+      .prepare('INSERT INTO run_purposes(run_id,task_id,purpose,parent_run_id) VALUES (?,?,?,?)')
+      .run(run.id, run.taskId, purpose, parentRunId);
+  }
+
   receipt(key: string): { hash: string; principal: string; result: CommandResult } | undefined {
     const row = this.db
       .prepare('SELECT request_hash,principal,result FROM receipts WHERE command_key=?')
@@ -264,7 +388,9 @@ export class Store {
 
   googleUsageReader(): GoogleUsageReader {
     return this.db
-      .prepare('SELECT * FROM google_usage_reader WHERE family=?')
+      .prepare(
+        'SELECT authority_revision,last_attempt_at,last_observed_at FROM google_usage_reader WHERE family=?',
+      )
       .get('google') as GoogleUsageReader;
   }
 
@@ -322,16 +448,6 @@ export class Store {
   private metadataWrite() {
     if (!this.transactionEvents)
       throw new Error('Metadata ownership writes require a transaction.');
-  }
-
-  setGoogleUsageConsent(enabled: boolean) {
-    this.metadataWrite();
-    const reader = this.googleUsageReader();
-    this.db
-      .prepare(
-        `UPDATE google_usage_reader SET enabled=?,authority_revision=? WHERE family='google'`,
-      )
-      .run(Number(enabled), reader.authority_revision + (enabled && reader.enabled ? 0 : 1));
   }
 
   recordGoogleUsageAttempt(at: string) {
@@ -463,6 +579,95 @@ export class Store {
     return rows;
   }
 
+  combinedGroups(): CombinedGroup[] {
+    return this.db
+      .prepare('SELECT * FROM combined_groups ORDER BY run_id')
+      .all() as CombinedGroup[];
+  }
+
+  combinedGroup(taskOrRunId: string): CombinedGroup | undefined {
+    return this.db
+      .prepare(`SELECT g.* FROM combined_groups g WHERE g.task_id=? OR g.run_id=? OR EXISTS (
+      SELECT 1 FROM combined_members m WHERE m.parent_run_id=g.run_id AND (m.task_id=? OR m.run_id=?)
+    )`)
+      .get(taskOrRunId, taskOrRunId, taskOrRunId, taskOrRunId) as CombinedGroup | undefined;
+  }
+
+  combinedMembers(parentRunId: string): CombinedMember[] {
+    return this.db
+      .prepare('SELECT * FROM combined_members WHERE parent_run_id=? ORDER BY ordinal')
+      .all(parentRunId) as CombinedMember[];
+  }
+
+  combinedDispatches(parentRunId: string): CombinedDispatch[] {
+    const rows = this.db
+      .prepare('SELECT * FROM combined_dispatches WHERE parent_run_id=?')
+      .all(parentRunId) as CombinedDispatch[];
+    return CombinedDispatchPhaseSchema.options.map((phase) => {
+      const row = rows.find((value) => value.phase === phase);
+      if (!row) throw Error('The combined dispatch reservation is incomplete.');
+      return row;
+    });
+  }
+
+  combinedRefIntents(parentRunId: string): CombinedRefIntent[] {
+    return this.db
+      .prepare(
+        'SELECT * FROM combined_ref_intents WHERE parent_run_id=? ORDER BY generation,operation',
+      )
+      .all(parentRunId) as CombinedRefIntent[];
+  }
+
+  admitCombinedDispatch(parentRunId: string, phase: CombinedDispatch['phase'], attemptId: string) {
+    if (!this.transactionEvents) throw Error('Combined admission requires a transaction.');
+    const group = this.combinedGroup(parentRunId);
+    const attempt = this.get<Attempt>('attempt', attemptId);
+    const member = this.combinedMembers(parentRunId).find(
+      (value) => phase === `writer-${value.ordinal}`,
+    );
+    if (
+      !group ||
+      !attempt ||
+      attempt.runId !== (member?.run_id ?? group.run_id) ||
+      ['paused', 'stopping', 'stopped', 'blocked', 'unknown', 'accepted'].includes(group.phase)
+    )
+      throw Error('The combined dispatch has no current owner.');
+    const changed = this.db
+      .prepare(
+        "UPDATE combined_dispatches SET state='running',attempt_id=? WHERE parent_run_id=? AND phase=? AND state='reserved'",
+      )
+      .run(attemptId, parentRunId, phase);
+    if (changed.changes !== 1) throw Error('The combined dispatch slot was already consumed.');
+  }
+
+  retryCombinedDispatch(
+    parentRunId: string,
+    phase: CombinedDispatch['phase'],
+    attemptId: string,
+    priorAttemptId: string,
+  ) {
+    if (!this.transactionEvents) throw Error('Combined retry requires a transaction.');
+    const group = this.combinedGroup(parentRunId);
+    const attempt = this.get<Attempt>('attempt', attemptId);
+    const member = this.combinedMembers(parentRunId).find(
+      (value) => phase === `writer-${value.ordinal}`,
+    );
+    if (
+      !group ||
+      !attempt ||
+      attempt.runId !== member?.run_id ||
+      group.integration_active ||
+      !['writers', 'blocked'].includes(group.phase)
+    )
+      throw Error('The combined retry has no current owner.');
+    const changed = this.db
+      .prepare(
+        "UPDATE combined_dispatches SET state='running',attempt_id=?,candidate_id=NULL,check_artifact_id=NULL,definition_hash=NULL WHERE parent_run_id=? AND phase=? AND attempt_id=? AND state IN ('failed','stopped')",
+      )
+      .run(attemptId, parentRunId, phase, priorAttemptId);
+    if (changed.changes !== 1) throw Error('The combined retry slot changed.');
+  }
+
   nativePhasesComplete(attemptId: string, expectedFamily: Route['family']): boolean {
     const attempt = this.get<Attempt>('attempt', attemptId);
     const route = attempt && this.get<Route>('route', attempt.routeId);
@@ -519,9 +724,10 @@ export class Store {
       task.state === 'checking'
         ? this.db.prepare('SELECT body FROM review_jobs WHERE attempt_id=?').get(attemptId)
         : undefined;
-    const job = review ? NativeReviewJobSchema.parse(JSON.parse(review.body as string)) : undefined;
+    const job = review ? ReviewJobSchema.parse(JSON.parse(review.body as string)) : undefined;
     const reviewing =
       job &&
+      !job.scripted &&
       job.taskId === task.id &&
       job.runId === attempt.runId &&
       job.attemptId === attempt.id &&
@@ -529,6 +735,18 @@ export class Store {
       job.generation === attempt.generation;
     if (!['intent', 'running'].includes(attempt.state) || (task.state !== 'running' && !reviewing))
       throw new Error('Native phases require a current writer or native review.');
+    if (this.runPurpose(attempt.runId) === 'conversation') {
+      const run = this.get<Run>('run', attempt.runId);
+      if (
+        reviewing ||
+        !run?.roles.some(
+          (role) =>
+            ['lead', 'orchestrator'].includes(role.role) && role.routeId === attempt.routeId,
+        ) ||
+        !this.receipt(`conversation-turn:${attemptId}`)
+      )
+        throw new Error('Planning phases require their admitted conversation purpose.');
+    }
     const previous = this.nativeProcesses(attemptId);
     const route = this.get<Route>('route', attempt.routeId);
     if (

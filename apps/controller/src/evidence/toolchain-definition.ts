@@ -20,6 +20,7 @@ import {
   type CopyBudget,
   type DependencyInventory,
   inspectInstalledDependencies,
+  trustedBiome,
 } from '../host/toolchain.ts';
 
 export const toolchainWorkspaces = [
@@ -105,7 +106,7 @@ export const ToolchainDefinitionSchema = z.strictObject({
     ],
   ),
   provenancePattern: z.string().min(1).max(4096),
-  maximumMinutes: z.literal(5),
+  maximumMinutes: z.literal(10),
 });
 export type ToolchainDefinition = z.infer<typeof ToolchainDefinitionSchema>;
 export type ToolchainPreparation = {
@@ -120,21 +121,60 @@ const compare = (a: { path: string }, b: { path: string }) =>
 export const nodeTestFile = (path: string) =>
   /^(?:apps|packages|scripts)\/.*\.test\.(?:ts|mjs)$/.test(path);
 
+export function nodeTestNames(content: string): string[] {
+  return [...content.matchAll(/(?:^|\n)\s*(?:await\s+)?(?:test|t\.test)\(\s*'([^'\n]+)'/g)].map(
+    (match) => match[1],
+  );
+}
+
 // The first recipe freezes the code which grades the candidate and enrolls child processes.
+const frozenDirectories = [
+  'e2e/',
+  'scripts/',
+  'apps/controller/src/host/',
+  'apps/controller/src/evidence/',
+  'apps/controller/src/providers/',
+  'apps/controller/src/store/',
+  'apps/controller/src/commands/',
+  'apps/desktop/src/main/',
+  'apps/desktop/src/preload/',
+  'packages/testkit/',
+  'packages/contracts/',
+];
+const frozenFiles = [
+  'apps/controller/src/main.ts',
+  'apps/desktop/electron.vite.config.ts',
+  'packages/client/src/node.ts',
+];
 export function frozenVerificationPath(path: string): boolean {
   return (
     nodeTestFile(path) ||
-    path.startsWith('e2e/') ||
-    path.startsWith('scripts/') ||
-    /^(?:apps\/controller\/src\/(?:host|evidence|providers|store|commands)\/|apps\/controller\/src\/main\.ts$|apps\/desktop\/src\/(?:main|preload)\/|packages\/(?:testkit|contracts)\/)/.test(
-      path,
-    ) ||
-    path === 'apps/desktop/electron.vite.config.ts' ||
-    path === 'packages/client/src/node.ts' ||
+    frozenDirectories.some((directory) => path.startsWith(directory)) ||
+    frozenFiles.includes(path) ||
     /(?:^|\/)package\.json$/.test(path) ||
     (!path.includes('/') && !/\.md$/.test(path))
   );
 }
+
+// A repository writer reads this before any check runs. Keep it in step with verificationCommand.
+const stageGuidance: Record<(typeof verificationStages)[number], string> = {
+  policy: 'node scripts/policy.mjs all',
+  lint: 'biome check . (formatting differences fail)',
+  types: 'tsc --noEmit',
+  'node-tests': 'every committed *.test.ts and *.test.mjs under apps, packages and scripts',
+  build: 'electron-vite build in apps/desktop',
+  desktop: 'playwright test e2e/desktop.spec.ts',
+};
+export const verificationGuidance = {
+  checks: verificationStages.map((stage) => `${stage}: ${stageGuidance[stage]}`),
+  frozen: [
+    '*.test.ts and *.test.mjs under apps, packages and scripts',
+    ...frozenDirectories,
+    ...frozenFiles,
+    'every package.json',
+    'root files other than *.md',
+  ],
+};
 
 function inside(root: string, path: string): string {
   const result = relative(root, path);
@@ -203,7 +243,7 @@ export function verificationPreview(definition: ToolchainDefinition) {
     arch: definition.arch,
     executables: { node, electron, git },
     stages: definition.stages,
-    maximumMinutes: 5,
+    maximumMinutes: 10,
   });
 }
 
@@ -268,13 +308,7 @@ export async function prepareToolchain(input: {
   )
     throw Error('Installed desktop payload is missing or changed.');
   const electron = inside(root, await realpath(join(electronRoot, 'dist', electronRelative)));
-  const biomeRequire = createRequire(require.resolve('@biomejs/biome/package.json'));
-  const biome = inside(
-    root,
-    realpathSync(
-      join(dirname(biomeRequire.resolve('@biomejs/cli-darwin-arm64/package.json')), 'biome'),
-    ),
-  );
+  const biome = trustedBiome(root).entrypoint;
   const inventory = await inspectInstalledDependencies(root, toolchainWorkspaces, input.budget);
   const inventoryBytes = Buffer.from(canonicalJson(inventory));
   if (inventoryBytes.length > 64 * 1024 * 1024)
@@ -294,9 +328,7 @@ export async function prepareToolchain(input: {
     .filter((entry) => nodeTestFile(entry.path))
     .map((entry) => ({
       ...metadata(entry),
-      tests: [...entry.content.toString('utf8').matchAll(/^test\('([^'\n]+)'/gm)].map(
-        (match) => match[1],
-      ),
+      tests: nodeTestNames(entry.content.toString('utf8')),
     }));
   const journey = source.find((entry) => entry.path === 'e2e/desktop.spec.ts');
   const lock = source.find((entry) => entry.path === 'pnpm-lock.yaml');
@@ -342,7 +374,7 @@ export async function prepareToolchain(input: {
     journey: { file: 'e2e/desktop.spec.ts' as const, title: journeyTitle, hash: journey.hash },
     stages: [...verificationStages] as [...typeof verificationStages],
     provenancePattern: input.provenancePattern,
-    maximumMinutes: 5 as const,
+    maximumMinutes: 10 as const,
   };
   const definition = ToolchainDefinitionSchema.parse({
     ...fields,

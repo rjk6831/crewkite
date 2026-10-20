@@ -7,7 +7,12 @@ import {
   FakeWorkerInputSchema,
   MAX_FRAME_BYTES,
 } from '@crewkite/contracts';
-import { checkEnvironment, enrollCheckRoot, spawnCheckChild as spawn } from './check-ownership.ts';
+import {
+  type CheckRoot,
+  checkEnvironment,
+  enrollCheckRoot,
+  spawnCheckChild as spawn,
+} from './check-ownership.ts';
 
 export function groupAbsent(group: number | null): boolean {
   if (group === null || !Number.isSafeInteger(group) || group <= 0) return false;
@@ -17,6 +22,10 @@ export function groupAbsent(group: number | null): boolean {
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === 'ESRCH';
   }
+}
+
+export function checkRootQuiescent(root: CheckRoot): boolean {
+  return root.spawnFailed || (!!root.acknowledgment && groupAbsent(root.acknowledgment.group));
 }
 
 export type Schedule = (work: () => void, milliseconds: number) => () => void;
@@ -208,6 +217,11 @@ export class OwnedCommand {
     if (this.group) options.onSpawn(this.group);
     this.child.stdin.end();
   }
+  async quiescent(schedule: Schedule = defaultSchedule): Promise<boolean> {
+    if (!(await closedWithin(this.closed, schedule))) return false;
+    // A descendant can outlive the leader and finish before the streams close.
+    return this.group === 0 ? this.failed : groupAbsent(this.group);
+  }
   stop() {
     if (
       !Number.isSafeInteger(this.group) ||
@@ -222,6 +236,20 @@ export class OwnedCommand {
       this.failed = true;
     }
   }
+}
+
+export function closedBefore(closed: Promise<void>, boundary: Promise<unknown>): Promise<boolean> {
+  // The owner keeps its admitted deadline armed while exited children drain their pipes.
+  return Promise.race([
+    closed.then(
+      () => true,
+      () => false,
+    ),
+    boundary.then(
+      () => false,
+      () => false,
+    ),
+  ]);
 }
 
 export function closedWithin(

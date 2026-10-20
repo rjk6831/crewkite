@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { resolve } from 'node:path';
 import test from 'node:test';
 import { spawnCheckChild as spawn } from '../../host/check-ownership.ts';
@@ -38,7 +38,14 @@ const replies = {
   'config/read': { config, origins: { private: 'private-native-diagnostic' } },
   'configRequirements/read': { requirements: mode === 'policy-change' ? { featureRequirements: { plugins: true } } : null },
   'account/rateLimits/read': { ordinaryUsageAllowed: true, rateLimits: {} },
-  'model/list': { data: [], nextCursor: null },
+  'model/list': {
+    data: mode === 'empty-catalog' ? [] : [{
+      id: 'native-model', model: 'native-model',
+      supportedReasoningEfforts: [{ reasoningEffort: 'native-effort' }],
+      defaultReasoningEffort: 'native-effort',
+    }],
+    nextCursor: null,
+  },
 };
 const input = createInterface({ input: process.stdin });
 input.on('line', line => {
@@ -51,6 +58,11 @@ input.on('line', line => {
     return;
   }
   if (mode === 'oversized') return process.stderr.write(Buffer.alloc(1048577));
+  if (mode.startsWith('flood:')) {
+    const [stdout, stderr] = mode.split(':').slice(1).map(Number);
+    return process.stderr.write(Buffer.alloc(stderr, 32), () =>
+      process.stdout.write(Buffer.alloc(stdout, 32), () => process.exit(0)));
+  }
   if (mode === 'truncated') return process.stdout.write('{"id":1');
   if (message.method === 'model/list' && mode === 'descendant')
     spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'inherit' });
@@ -62,6 +74,13 @@ input.on('line', line => {
 });
 input.on('close', () => { if (mode !== 'stubborn' && mode !== 'trailing-partial') process.exit(mode === 'bad-exit' ? 1 : 0); });
 if (mode === 'trailing-partial') process.stdin.on('end', () => { process.stdout.write('{', () => process.exit(0)); });
+`;
+
+// One stdout write of the requested size, ending in a newline, then wait for input to close.
+const writer = `
+process.stdout.write('x'.repeat(Number(process.argv[1]) - 1) + '\\n');
+process.stdin.on('end', () => process.exit(0));
+process.stdin.resume();
 `;
 
 test('native discovery returns metadata only after its owned process and descendants stop', async () => {
@@ -84,6 +103,7 @@ test('native discovery returns metadata only after its owned process and descend
       'trailing-partial',
       'maximum-bound',
       'descendant',
+      'empty-catalog',
       'invalid',
       'oversized',
       'stopped',
@@ -173,6 +193,10 @@ test('native discovery returns metadata only after its owned process and descend
       }
       if (mode === 'policy-change')
         assert.equal(result.lastRequest, 'configRequirements/read', mode);
+      if (mode === 'empty-catalog') {
+        assert.equal(result.lastRequest, 'model/list', mode);
+        assert.equal(result.reason, 'protocol', mode);
+      }
       for (const group of handle.groups) if (group > 0) assert(groupAbsent(group), mode);
       assert(!JSON.stringify(result).includes('private-native-diagnostic'), mode);
       if (
@@ -190,6 +214,8 @@ test('native discovery returns metadata only after its owned process and descend
         assert.equal(result.metadata, null, mode);
         assert(result.reason, mode);
       }
+      // A reader that names no bound keeps the one MiB default.
+      if (mode === 'oversized') assert.equal(result.reason, 'output-limit', mode);
     }
     for (const mode of [
       'callback-stop',
@@ -305,6 +331,313 @@ test('native discovery returns metadata only after its owned process and descend
       assert.equal(result.metadata, null, mode);
       assert.equal(result.quiescent, true, mode);
       assert(handle.groups.every(groupAbsent), mode);
+    }
+    for (const mode of [
+      'queued-close',
+      'unobserved-close',
+      'live-at-cutoff',
+      'late-kill',
+      'late-kill-reversed',
+      'late-kill-near-deadline',
+    ]) {
+      const directory = resolve(root, mode);
+      mkdirSync(directory, { mode: 0o700 });
+      const schedules: Array<{ milliseconds: number; work: () => void; live: boolean }> = [];
+      let capture = true;
+      const ready = Promise.withResolvers<void>();
+      let clock = 0;
+      let phase = 0;
+      let sent = false;
+      let task: ChildProcessWithoutNullStreams | undefined;
+      let closed: Promise<void> | undefined;
+      let closeSeen = false;
+      let callbackError: unknown;
+      let onExit: (() => void) | undefined;
+      const fire = (milliseconds: number) => {
+        const row = schedules.find((row) => row.live && row.milliseconds === milliseconds);
+        assert(row, `${mode}: pending ${milliseconds}ms callback`);
+        row.live = false;
+        row.work();
+      };
+      const handle = startNativeTask(
+        {
+          executable: process.execPath,
+          sha256,
+          directory,
+          repositoryRoot: root,
+          environment: sourceEnvironment,
+        },
+        {
+          timeoutMs: 300_000,
+          now: () => clock,
+          schedule: (work, milliseconds) => {
+            const row = { work, milliseconds, live: true };
+            schedules.push(row);
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            if (!capture) {
+              const at = clock + milliseconds;
+              timer = setTimeout(() => {
+                row.live = false;
+                clock = Math.max(clock, at);
+                work();
+              }, milliseconds);
+            }
+            return () => {
+              row.live = false;
+              clearTimeout(timer);
+            };
+          },
+          onSubmitted: () => ready.resolve(),
+          spawn: (executable, args, options) => {
+            const isTask = args.at(-1) !== 'list';
+            const child = spawn(
+              executable,
+              ['-e', fixture, 'success', isTask ? 'task' : 'features'],
+              options,
+            );
+            const completed = new Promise<void>((resolve) =>
+              child.once('close', () => {
+                if (isTask) closeSeen = true;
+                resolve();
+              }),
+            );
+            owned.push({ child, closed: completed });
+            if (isTask) {
+              task = child;
+              closed = completed;
+              child.once('exit', () => onExit?.());
+            }
+            return child;
+          },
+        },
+        () => ({
+          next: () => {
+            if (sent || phase >= 2) return null;
+            sent = true;
+            return Buffer.from(
+              `${JSON.stringify(
+                phase === 0
+                  ? {
+                      id: 1,
+                      method: 'initialize',
+                      params: {
+                        capabilities: { explicitGatewayOauth: true, experimentalApi: false },
+                      },
+                    }
+                  : { id: 2, method: 'turn/start', params: {} },
+              )}\n`,
+            );
+          },
+          push: () => {
+            phase++;
+            sent = false;
+          },
+          finish: () => ({ completed: true }),
+          get submitted() {
+            return phase === 1 && sent;
+          },
+          complete: false,
+          pendingRequest: 'turn/start',
+          lastEnvelope: null,
+          refusedEnvelope: null,
+          notifications: 0,
+        }),
+      );
+      await ready.promise;
+      assert(task);
+      assert(closed);
+      const child = task;
+      handle.stop();
+      if (mode === 'live-at-cutoff') {
+        clock = 2000;
+        assert.equal(groupAbsent(child.pid as number), false);
+        fire(2000);
+        assert.equal(
+          schedules.some((row) => row.live && row.milliseconds === 0),
+          false,
+        );
+      } else if (mode.startsWith('late-kill')) {
+        // A blocked loop runs an owned task's stop timers in one pass. Node runs one duration
+        // list at a time, so an older 2000 ms list can reach the cutoff before the kill.
+        clock = mode === 'late-kill-near-deadline' ? 299_500 : 2000;
+        capture = false;
+        for (const milliseconds of mode === 'late-kill-reversed'
+          ? [250, 2000, 1000]
+          : [250, 1000, 2000])
+          fire(milliseconds);
+      } else {
+        onExit = () => {
+          try {
+            clock = 2000;
+            assert.equal(closeSeen, false);
+            assert(groupAbsent(child.pid as number));
+            if (mode === 'queued-close') capture = false;
+            fire(1000);
+            fire(2000);
+            if (mode === 'unobserved-close') {
+              assert.equal(schedules.filter((row) => row.live && row.milliseconds === 0).length, 1);
+              fire(0);
+            }
+          } catch (error) {
+            callbackError = error;
+          }
+        };
+        fire(250);
+      }
+      const result = await handle.result;
+      assert.ifError(callbackError);
+      assert.equal(result.metadata, null, mode);
+      const quiet = mode === 'queued-close' || mode.startsWith('late-kill');
+      assert.equal(result.quiescent, quiet, mode);
+      assert.equal(result.reason, quiet ? 'stopped' : 'ownership', mode);
+      if (mode === 'late-kill-near-deadline')
+        assert(
+          schedules.some((row) => row.milliseconds === 500),
+          `${mode}: the late kill waits only until the deadline`,
+        );
+      if (mode === 'live-at-cutoff') child.stdin.end();
+      await closed;
+      assert(groupAbsent(child.pid as number));
+      assert.deepEqual(await handle.result, result, `${mode}: late closure cannot heal a result`);
+      assert.equal(
+        schedules.some((row) => row.live),
+        false,
+        `${mode}: settlement cancels every timer`,
+      );
+    }
+    // A task reader names its own bound, here above the one MiB default. The process may write
+    // exactly that many bytes and is stopped by the next one.
+    const bound = 1_572_864;
+    for (const [mode, written, reason] of [
+      ['output-at-bound', bound, null],
+      ['output-past-bound', bound + 1, 'output-limit'],
+    ] as const) {
+      const directory = resolve(root, mode);
+      mkdirSync(directory, { mode: 0o700 });
+      let complete = false;
+      const handle = startNativeTask(
+        {
+          executable: process.execPath,
+          sha256,
+          directory,
+          repositoryRoot: root,
+          environment: sourceEnvironment,
+        },
+        {
+          timeoutMs: 300_000,
+          // A stop gives the native interrupt 250 ms before it ends input. Run that step at once.
+          // After a complete response the same delay only confirms the stop, so it stays pending.
+          schedule: (work, milliseconds) => {
+            if (milliseconds === 250 && !complete) queueMicrotask(work);
+            return () => {};
+          },
+          onSubmitted: () => assert.fail('Output rows submit no native turn.'),
+          spawn: (executable, args, options) => {
+            const child = spawn(
+              executable,
+              args.at(-1) === 'list'
+                ? ['-e', fixture, 'success', 'features']
+                : ['-e', writer, String(written)],
+              options,
+            );
+            owned.push({
+              child,
+              closed: new Promise((resolve) => child.once('close', () => resolve())),
+            });
+            return child;
+          },
+        },
+        () => ({
+          next: () => null,
+          push: (bytes) => {
+            complete = bytes.at(-1) === 10;
+          },
+          finish: () => ({ completed: true }),
+          get complete() {
+            return complete;
+          },
+          pendingRequest: 'turn/start',
+          lastEnvelope: null,
+          refusedEnvelope: null,
+          notifications: 0,
+          outputLimit: bound,
+        }),
+      );
+      const result = await handle.result;
+      assert.equal(result.reason, reason, mode);
+      assert.equal(result.stdoutBytes, written, mode);
+      assert.deepEqual(result.metadata, reason ? null : { completed: true }, mode);
+      assert.equal(result.quiescent, true, mode);
+      assert(handle.groups.every(groupAbsent), mode);
+    }
+    // A task transcript sets the byte bound for stdout and stderr together.
+    const limit = 4096;
+    for (const row of [
+      { name: 'stdout over', stdout: limit + 1, stderr: 0, reason: 'output-limit' },
+      { name: 'stderr over', stdout: 0, stderr: limit + 1, reason: 'output-limit' },
+      { name: 'split over', stdout: limit / 2 + 1, stderr: limit / 2, reason: 'output-limit' },
+      { name: 'split at limit', stdout: limit / 2, stderr: limit / 2, reason: null },
+    ]) {
+      const directory = resolve(root, `flood-${row.name.replace(' ', '-')}`);
+      mkdirSync(directory, { mode: 0o700 });
+      let sent = false;
+      let pushed = false;
+      const handle = startNativeTask(
+        {
+          executable: process.execPath,
+          sha256,
+          directory,
+          repositoryRoot: root,
+          environment: sourceEnvironment,
+        },
+        {
+          timeoutMs: 10_000,
+          onSubmitted: () => {},
+          spawn: (executable, args, options) => {
+            const child = spawn(
+              executable,
+              [
+                '-e',
+                fixture,
+                `flood:${row.stdout}:${row.stderr}`,
+                args.at(-1) === 'list' ? 'features' : 'task',
+              ],
+              options,
+            );
+            owned.push({
+              child,
+              closed: new Promise((resolve) => child.once('close', () => resolve())),
+            });
+            return child;
+          },
+        },
+        () => ({
+          outputLimit: limit,
+          next: () => {
+            if (sent) return null;
+            sent = true;
+            return Buffer.from(
+              `${JSON.stringify({ id: 1, method: 'initialize', params: { capabilities: { explicitGatewayOauth: true, experimentalApi: false } } })}\n`,
+            );
+          },
+          push: () => {
+            pushed = true;
+          },
+          finish: () => ({ completed: true }),
+          get complete() {
+            return pushed;
+          },
+          pendingRequest: 'turn/start',
+          lastEnvelope: null,
+          refusedEnvelope: null,
+          notifications: 0,
+        }),
+      );
+      const result = await handle.result;
+      assert.equal(result.reason, row.reason, row.name);
+      assert.equal(result.quiescent, true, row.name);
+      assert.deepEqual(result.metadata, row.reason ? null : { completed: true }, row.name);
+      assert(handle.groups.every(groupAbsent), row.name);
     }
     const lifecycleCases = [
       { name: 'three phases', failure: '', sequence: -1 },
@@ -484,6 +817,7 @@ test('native discovery returns metadata only after its owned process and descend
     assert.equal(spawned, false);
     const publicDirectory = resolve(root, 'public');
     mkdirSync(publicDirectory, { mode: 0o755 });
+    chmodSync(publicDirectory, 0o755);
     const linked = resolve(root, 'linked');
     symlinkSync(resolve(root, 'success'), linked, 'dir');
     for (const directory of [publicDirectory, linked]) {

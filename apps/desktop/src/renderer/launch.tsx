@@ -6,6 +6,7 @@ import {
   NativeHandoffPreparationPayloadSchema,
   type NativeHandoffTarget,
   NativeHandoffTargetsSchema,
+  NativePreparationPayloadSchema,
   NativeTargetPathSchema,
   type Policy,
   PolicySchema,
@@ -18,6 +19,7 @@ import {
   type Snapshot,
   type SourceDetails,
   type Task,
+  type TaskConversationState,
 } from '@crewkite/contracts';
 import { createDemoFixtures } from '@crewkite/testkit';
 import {
@@ -34,7 +36,7 @@ import {
   ShieldCheck,
   Users,
 } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import {
   actionName,
   CurrentCheckoutChanges,
@@ -48,6 +50,7 @@ import {
   SourceFacts,
   titleCase,
 } from './components.tsx';
+import { LocalSetup, localModelStates } from './local-setup.tsx';
 import type { Workspace } from './source.ts';
 import { loadTeams, roleLabels, type SavedTeam, saveTeam } from './templates.ts';
 
@@ -92,11 +95,19 @@ const principles = [
   'Allow only the specific action approved for this task.',
 ];
 
+export type ExecutionPolicySeed = {
+  taskId: Task['id'];
+  taskRevision: Task['revision'];
+  planningConfigurationRevision: number;
+  authority: Policy['authority'];
+};
+
 type LaunchProps = {
   task: Task;
   snapshot: Snapshot;
   workspace: Workspace;
   onClose: () => void;
+  executionPolicySeed?: ExecutionPolicySeed;
 };
 
 const evaluationReasons = {
@@ -139,7 +150,7 @@ const evaluationStages = {
 
 export function NativeEvaluation({
   task,
-  candidate,
+  candidate: retainedCandidate,
   snapshot,
   workspace,
 }: {
@@ -150,6 +161,21 @@ export function NativeEvaluation({
 }) {
   const run = snapshot.runs.find((value) => value.id === task.runId);
   const native = snapshot.nativeRuns.find((value) => value.runId === task.runId);
+  const combined = snapshot.combinedRuns.find(
+    (value) => value.taskId === task.id && value.runId === task.runId,
+  );
+  const combinedMember = snapshot.combinedRuns.some((value) =>
+    value.members.some((member) => member.taskId === task.id && member.runId === task.runId),
+  );
+  const selection = combined?.evaluationSelection;
+  const candidate = combined
+    ? snapshot.candidates.find(
+        (value) =>
+          value.taskId === task.id &&
+          value.id === combined.candidate?.id &&
+          value.hash === combined.candidate.hash,
+      )
+    : retainedCandidate;
   const prepared = snapshot.candidateEvaluations.find((value) => value.taskId === task.id);
   const reviewerProfiles = snapshot.nativeProfiles
     .filter((value) => value.family === 'openai')
@@ -167,9 +193,36 @@ export function NativeEvaluation({
   const [expiresAt, setExpiresAt] = useState(() => new Date(Date.now() + 3600000).toISOString());
   const [message, setMessage] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
+  const [consentIdentity, setConsentIdentity] = useState<string | null>(null);
+  const combinedIdentity = combined
+    ? JSON.stringify([
+        combined.runId,
+        combined.preparationId,
+        combined.manifestHash,
+        combined.generation,
+        combined.candidate,
+        selection,
+      ])
+    : null;
+  useEffect(() => {
+    if (consentIdentity === combinedIdentity) return;
+    setNativeTrust(false);
+    setSourceConsent(false);
+    setSavedConsent(false);
+    setExistingCredits(false);
+    setCheckPermission(false);
+    setReviewPermission(false);
+    setEditing(false);
+    setMessage(null);
+    setConsentIdentity(combinedIdentity);
+  }, [combinedIdentity, consentIdentity]);
   const profile = reviewerProfiles.find(
-    (value) => value.id === (profileId || reviewerProfiles[0]?.id),
+    (value) =>
+      value.id === (selection?.reviewer.profileId ?? (profileId || reviewerProfiles[0]?.id)),
   );
+  const selectedRecipe = selection?.recipeId ?? recipe;
+  const creditPolicy =
+    selection?.creditPolicy ?? (existingCredits ? 'existing-credits' : 'ordinary');
   const methods = run?.policy.policy.methods ?? [];
   const method = methods[0];
   const supported =
@@ -191,12 +244,35 @@ export function NativeEvaluation({
   );
   const methodName = (id: ReviewMethod['id']) =>
     methodCatalog.find((value) => value.id === id)?.name ?? 'Unavailable method';
-  const projectTests = recipe === 'project-node-tests-v1';
-  const fullVerification = recipe === 'crewkite-verify-v1';
-  const visibleRecipe = prepared && !editing ? prepared.recipe : recipe;
+  const projectTests = selectedRecipe === 'project-node-tests-v1';
+  const fullVerification = selectedRecipe === 'crewkite-verify-v1';
+  const visibleRecipe = prepared && !editing ? prepared.recipe : selectedRecipe;
   const testFiles = ProjectNodeTestFilesSchema.safeParse(
-    testFileInput.split(/\r?\n/u).filter((path) => path.length > 0),
+    selection?.testFiles ?? testFileInput.split(/\r?\n/u).filter((path) => path.length > 0),
   );
+  const preparedMatches =
+    !combined ||
+    (!!prepared &&
+      !!candidate &&
+      !!selection &&
+      prepared.runId === combined.runId &&
+      prepared.candidateId === candidate.id &&
+      prepared.candidateHash === candidate.hash &&
+      prepared.recipe === selection?.recipeId &&
+      prepared.reviewer.profileId === selection.reviewer.profileId &&
+      prepared.reviewer.methodId === selection.reviewer.methodId &&
+      prepared.reviewer.cycle === selection.reviewer.cycles &&
+      prepared.creditPolicy === selection.creditPolicy &&
+      prepared.testFiles.length === selection.testFiles.length &&
+      prepared.testFiles.every((file) => selection.testFiles.includes(file.path)));
+  const checkAvailable =
+    preparedMatches &&
+    !!prepared?.checkStart.available &&
+    (!combined || combined.evaluate.available);
+  const reviewAvailable =
+    preparedMatches &&
+    !!prepared?.reviewStart.available &&
+    (!combined || combined.review.available);
   const invalidTestFiles = projectTests && testFileInput.length > 0 && !testFiles.success;
   const testFileErrorId = `project-test-files-${task.id}`;
   function resetConsent() {
@@ -209,14 +285,15 @@ export function NativeEvaluation({
   }
   const allowed =
     connected &&
+    !combinedMember &&
     candidate &&
     task.state === 'stopped' &&
     supported &&
     profile?.available &&
-    profile.creditPolicies.some(
-      (value) => value === (existingCredits ? 'existing-credits' : 'ordinary'),
-    ) &&
-    (savedConsent || (nativeTrust && sourceConsent)) &&
+    profile.creditPolicies.some((value) => value === creditPolicy) &&
+    (!combined || consentIdentity === combinedIdentity) &&
+    (!combined || combined.evaluate.available) &&
+    ((!combined && savedConsent) || (nativeTrust && sourceConsent)) &&
     checkPermission &&
     reviewPermission &&
     (!projectTests || testFiles.success) &&
@@ -238,8 +315,8 @@ export function NativeEvaluation({
               ? { checkRecipeId: 'crewkite-verify-v1' as const }
               : { checkRecipeId: 'node-tests-v1' as const }),
           reviewer: { profileId: profile.id, methodId: method.id, cycles: 1 },
-          creditPolicy: existingCredits ? 'existing-credits' : 'ordinary',
-          consent: savedConsent ? 'saved' : 'explicit',
+          creditPolicy,
+          consent: !combined && savedConsent ? 'saved' : 'explicit',
           grants: [
             {
               action: 'run-check' as const,
@@ -270,10 +347,8 @@ export function NativeEvaluation({
     }
   }
   async function start(command: 'StartCandidateEvaluation' | 'StartCandidateReview') {
-    if (!prepared || !connected) return;
-    const readiness =
-      command === 'StartCandidateEvaluation' ? prepared.checkStart : prepared.reviewStart;
-    if (!readiness.available) return;
+    if (!prepared || !connected || combinedMember) return;
+    if (command === 'StartCandidateEvaluation' ? !checkAvailable : !reviewAvailable) return;
     try {
       const result = await workspace.command({
         command,
@@ -298,6 +373,13 @@ export function NativeEvaluation({
       ? [{ artifactId: value.artifactId, result: value.review }]
       : [],
   );
+  if (combinedMember)
+    return (
+      <section className="card view-stack" aria-label="Candidate evaluation">
+        <h2>Candidate evaluation</h2>
+        <p>Final checks, review and acceptance belong to the combined parent task.</p>
+      </section>
+    );
   return (
     <section className="card view-stack" aria-label="Candidate evaluation">
       <div className="section-heading">
@@ -305,9 +387,22 @@ export function NativeEvaluation({
         <span>{prepared ? evaluationStages[prepared.stage] : 'Separate preparation'}</span>
       </div>
       <p className="muted">
-        Prepare one local check and one additional native review. Both use the remaining original
-        run limits. The review uses a fresh process. It can use the same model as the writer.
+        {combined
+          ? 'Prepare the final local check and native review for the combined candidate. Both use the remaining shared limits.'
+          : 'Prepare one local check and one additional native review. Both use the remaining original run limits.'}{' '}
+        The review uses a fresh process. It can use the same model as a writer.
       </p>
+      {combined && !combined.evaluate.available && !prepared && (
+        <p className="notice" role="status">
+          Final evaluation is unavailable: {combined.evaluate.reason}.
+        </p>
+      )}
+      {prepared && !preparedMatches && (
+        <p className="notice" role="status">
+          The saved evaluation does not match the current combined candidate and plan. Its actions
+          are unavailable.
+        </p>
+      )}
       {visibleRecipe === 'project-node-tests-v1' && (
         <p className="muted small">
           Local code runs with your system permissions. Dependencies are not installed. Imports can
@@ -426,7 +521,7 @@ export function NativeEvaluation({
                 <button
                   type="button"
                   className="button secondary"
-                  disabled={!connected || !prepared.checkStart.available}
+                  disabled={!connected || !checkAvailable}
                   onClick={() => void start('StartCandidateEvaluation')}
                 >
                   Start local checks
@@ -436,7 +531,7 @@ export function NativeEvaluation({
                 <button
                   type="button"
                   className="button secondary"
-                  disabled={!connected || !prepared.reviewStart.available}
+                  disabled={!connected || !reviewAvailable}
                   onClick={() => void start('StartCandidateReview')}
                 >
                   Start native review
@@ -447,11 +542,13 @@ export function NativeEvaluation({
           {!prepared.check && (
             <p className="muted small" role="status">
               Checks: {evaluationReasons[prepared.checkStart.reason]}
+              {combined && !combined.evaluate.available && ` (${combined.evaluate.reason})`}
             </p>
           )}
           {!prepared.review && (
             <p className="muted small" role="status">
               Review: {evaluationReasons[prepared.reviewStart.reason]}
+              {combined && !combined.review.available && ` (${combined.review.reason})`}
             </p>
           )}
           {!prepared.check &&
@@ -461,7 +558,7 @@ export function NativeEvaluation({
               <button
                 type="button"
                 className="button secondary"
-                disabled={!connected}
+                disabled={!connected || (!!combined && !combined.evaluate.available)}
                 onClick={() => {
                   setProfileId(prepared.reviewer.profileId);
                   setExpiresAt(prepared.expiresAt);
@@ -480,72 +577,118 @@ export function NativeEvaluation({
         </>
       ) : (
         <>
-          <p>
-            File <code>{native?.target?.path ?? 'Unavailable'}</code>
-          </p>
+          {combined ? (
+            <p>The combined plan fixes the final check and reviewer.</p>
+          ) : (
+            <p>
+              File <code>{native?.target?.path ?? 'Unavailable'}</code>
+            </p>
+          )}
           <details className="technical-details">
-            <summary>File details</summary>
+            <summary>{combined ? 'Combined candidate identity' : 'File details'}</summary>
             <code>Candidate tree {candidate?.hash ?? 'Unavailable'}</code>
-            <code>Original file {native?.target?.baseHash ?? 'Unavailable'}</code>
+            {combined ? (
+              <>
+                <code>Combined plan {combined.preparationId}</code>
+                <code>Manifest {combined.manifestHash}</code>
+                <code>Generation {combined.generation}</code>
+              </>
+            ) : (
+              <code>Original file {native?.target?.baseHash ?? 'Unavailable'}</code>
+            )}
             <code>Source base {run?.source.base ?? 'Unavailable'}</code>
           </details>
           <p className="muted small">
             Preparation records the check definition and permissions. Checks and review start
             separately.
           </p>
-          <label>
-            Test setup
-            <select
-              value={recipe}
-              onChange={(event) => {
-                setRecipe(
-                  event.target.value === 'project-node-tests-v1'
-                    ? 'project-node-tests-v1'
-                    : event.target.value === 'crewkite-verify-v1'
-                      ? 'crewkite-verify-v1'
-                      : 'node-tests-v1',
-                );
-                resetConsent();
-              }}
-            >
-              <option value="node-tests-v1">Sample project tests</option>
-              <option value="project-node-tests-v1">Project Node tests</option>
-              <option value="crewkite-verify-v1">CrewKite verification</option>
-            </select>
-          </label>
-          {projectTests ? (
+          {selection ? (
+            <>
+              <div className="facts-grid">
+                <Fact label="Checks" value={evaluationRecipes[selection.recipeId]} />
+                <Fact label="Reviewer" value={profile?.displayName ?? 'Unavailable profile'} />
+                <Fact label="Role" value="Reviewer" />
+                <Fact label="Method" value={methodName(selection.reviewer.methodId)} />
+                <Fact label="Review cycles" value={selection.reviewer.cycles} />
+                <Fact
+                  label="Usage"
+                  value={
+                    selection.creditPolicy === 'ordinary'
+                      ? 'Included usage only'
+                      : 'Included usage and existing credits'
+                  }
+                />
+                <Fact label="Remaining total attempts" value={combined.remainingBudgets.attempts} />
+                <Fact label="Remaining total minutes" value={combined.remainingBudgets.minutes} />
+              </div>
+              <div>
+                <p>Committed test files</p>
+                <ul>
+                  {selection.testFiles.map((path) => (
+                    <li key={path}>
+                      <code>{path}</code>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            </>
+          ) : (
             <>
               <label>
-                Committed test files (one relative path per line)
-                <textarea
-                  rows={4}
-                  value={testFileInput}
-                  aria-invalid={invalidTestFiles}
-                  aria-describedby={invalidTestFiles ? testFileErrorId : undefined}
+                Test setup
+                <select
+                  value={recipe}
                   onChange={(event) => {
-                    setTestFileInput(event.target.value);
+                    setRecipe(
+                      event.target.value === 'project-node-tests-v1'
+                        ? 'project-node-tests-v1'
+                        : event.target.value === 'crewkite-verify-v1'
+                          ? 'crewkite-verify-v1'
+                          : 'node-tests-v1',
+                    );
                     resetConsent();
                   }}
-                />
+                >
+                  <option value="node-tests-v1">Sample project tests</option>
+                  <option value="project-node-tests-v1">Project Node tests</option>
+                  <option value="crewkite-verify-v1">CrewKite verification</option>
+                </select>
               </label>
-              {invalidTestFiles && (
-                <p className="notice" id={testFileErrorId} role="alert">
-                  Enter 1 to 32 distinct relative file paths. Patterns and paths outside the project
-                  are unavailable.
+              {projectTests ? (
+                <>
+                  <label>
+                    Committed test files (one relative path per line)
+                    <textarea
+                      rows={4}
+                      value={testFileInput}
+                      aria-invalid={invalidTestFiles}
+                      aria-describedby={invalidTestFiles ? testFileErrorId : undefined}
+                      onChange={(event) => {
+                        setTestFileInput(event.target.value);
+                        resetConsent();
+                      }}
+                    />
+                  </label>
+                  {invalidTestFiles && (
+                    <p className="notice" id={testFileErrorId} role="alert">
+                      Enter 1 to 32 distinct relative file paths. Patterns and paths outside the
+                      project are unavailable.
+                    </p>
+                  )}
+                  <p className="muted small">
+                    Choose 1 to 32 distinct committed files. Globs are unavailable.
+                  </p>
+                </>
+              ) : !fullVerification ? (
+                <p className="muted small">The built-in checks cover the sample net.mjs project.</p>
+              ) : (
+                <p className="muted small">
+                  Runs policy, lint, types, Node tests, the desktop build and the desktop journey.
+                  Staging, checks and cleanup share a ten-minute limit. The original run needs
+                  eleven remaining minutes and two attempts, including the later review.
                 </p>
               )}
-              <p className="muted small">
-                Choose 1 to 32 distinct committed files. Globs are unavailable.
-              </p>
             </>
-          ) : !fullVerification ? (
-            <p className="muted small">The built-in checks cover the sample net.mjs project.</p>
-          ) : (
-            <p className="muted small">
-              Runs policy, lint, types, Node tests, the desktop build and the desktop journey.
-              Staging, checks and cleanup share a five-minute limit. The original run needs six
-              remaining minutes and two attempts, including the later review.
-            </p>
           )}
           {!supported && (
             <p className="notice">
@@ -553,20 +696,22 @@ export function NativeEvaluation({
               requirements stay unchanged.
             </p>
           )}
-          <label>
-            Reviewer profile
-            <select
-              value={profile?.id ?? ''}
-              onChange={(event) => setProfileId(event.target.value)}
-            >
-              {reviewerProfiles.map((value) => (
-                <option key={value.id} value={value.id}>
-                  {value.displayName}
-                  {value.available ? '' : ' (unavailable)'}
-                </option>
-              ))}
-            </select>
-          </label>
+          {!selection && (
+            <label>
+              Reviewer profile
+              <select
+                value={profile?.id ?? ''}
+                onChange={(event) => setProfileId(event.target.value)}
+              >
+                {reviewerProfiles.map((value) => (
+                  <option key={value.id} value={value.id}>
+                    {value.displayName}
+                    {value.available ? '' : ' (unavailable)'}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
           {profile && (
             <details className="technical-details">
               <summary>Reviewer details</summary>
@@ -577,15 +722,17 @@ export function NativeEvaluation({
               </code>
             </details>
           )}
-          <label className="checkbox-label">
-            <input
-              type="checkbox"
-              checked={savedConsent}
-              onChange={(event) => setSavedConsent(event.target.checked)}
-            />
-            Use saved consent for this exact evaluation
-          </label>
-          {!savedConsent && (
+          {!combined && (
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                checked={savedConsent}
+                onChange={(event) => setSavedConsent(event.target.checked)}
+              />
+              Use saved consent for this exact evaluation
+            </label>
+          )}
+          {(combined || !savedConsent) && (
             <>
               <label className="checkbox-label">
                 <input
@@ -601,7 +748,7 @@ export function NativeEvaluation({
                   checked={sourceConsent}
                   onChange={(event) => setSourceConsent(event.target.checked)}
                 />
-                {native?.repository
+                {combined || native?.repository
                   ? 'Share the committed source, candidate changes and task text with the reviewer'
                   : 'Share the original file, proposed change and task text with the reviewer'}
               </label>
@@ -614,18 +761,22 @@ export function NativeEvaluation({
               ? 'Checks use an independent candidate copy.'
               : 'The original source checkout stays unchanged.'}
           </p>
-          <label className="checkbox-label">
-            <input
-              type="checkbox"
-              checked={existingCredits}
-              disabled={!profile?.creditPolicies.some((value) => value === 'existing-credits')}
-              onChange={(event) => setExistingCredits(event.target.checked)}
-            />
-            Allow existing credits for this review after included usage
-          </label>
-          <p className="muted small">
-            This separate choice defaults off. No reset, purchase or top-up is requested.
-          </p>
+          {!selection && (
+            <>
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={existingCredits}
+                  disabled={!profile?.creditPolicies.some((value) => value === 'existing-credits')}
+                  onChange={(event) => setExistingCredits(event.target.checked)}
+                />
+                Allow existing credits for this review after included usage
+              </label>
+              <p className="muted small">
+                This separate choice defaults off. No reset, purchase or top-up is requested.
+              </p>
+            </>
+          )}
           <label>
             Permission expiry (local time)
             <input
@@ -656,6 +807,8 @@ export function NativeEvaluation({
               onChange={(event) => setReviewPermission(event.target.checked)}
             />
             Allow one {method ? methodName(method.id) : ''} review
+            {selection?.creditPolicy === 'existing-credits' &&
+              ' using included usage and existing credits'}
           </label>
           <button
             type="button"
@@ -688,6 +841,19 @@ export function NativeEvaluation({
             {!result.job.scripted && roleLabels[result.job.assignedRole]} · {result.job.cycle}{' '}
             review cycle · separate process only
           </p>
+          {'origin' in result.job && (
+            <details className="technical-details">
+              <summary>Combined review identity</summary>
+              <code>Manifest {result.job.origin.manifestHash}</code>
+              <code>Combined candidate {result.job.origin.candidateId}</code>
+              {result.job.origin.contributors.map((contributor) => (
+                <code key={contributor.taskId}>
+                  Task {contributor.taskId}, attempt {contributor.attemptId}, candidate{' '}
+                  {contributor.candidateHash}
+                </code>
+              ))}
+            </details>
+          )}
           <p>{result.summary}</p>
           <ul>
             {result.findings.map((finding) => (
@@ -708,15 +874,689 @@ export function NativeEvaluation({
   );
 }
 
+type AdoptedWorkerIdentity = {
+  taskId: Task['id'];
+  revision: Task['revision'];
+  runId: Task['runId'];
+  proposalId: NonNullable<TaskConversationState['adoptedProposal']>['id'];
+  proposalHash: string;
+};
+
+function adoptedWorkerIdentity(task: Task, state: TaskConversationState) {
+  const adopted = state.adoptedProposal;
+  if (
+    state.taskId !== task.id ||
+    state.revision !== task.revision ||
+    state.currentRunId !== task.runId ||
+    state.contractStatus !== 'confirmed' ||
+    !adopted ||
+    adopted.runId !== task.runId ||
+    state.proposal?.runId !== task.runId ||
+    state.proposal?.id !== adopted.id ||
+    state.proposal.hash !== adopted.hash ||
+    !state.adopt.available
+  )
+    return null;
+  return {
+    taskId: task.id,
+    revision: task.revision,
+    runId: task.runId,
+    proposalId: adopted.id,
+    proposalHash: adopted.hash,
+  } satisfies AdoptedWorkerIdentity;
+}
+
+const changedAdoption =
+  'The adopted plan changed. Review and adopt the current plan before preparing.';
+
+// Adoption changes advance the task revision. Remount to discard pending reads and consent.
 export function Launch(props: LaunchProps) {
-  const [native, setNative] = useState<'file' | 'repository' | null>(() => {
+  return (
+    <ExecutionLaunch
+      {...props}
+      key={JSON.stringify([
+        props.task.id,
+        props.task.revision,
+        props.task.runId,
+        props.executionPolicySeed,
+      ])}
+    />
+  );
+}
+
+function ExecutionLaunch(props: LaunchProps) {
+  const seed = props.executionPolicySeed;
+  const saved = props.snapshot.runs.find((run) => run.id === props.task.runId);
+  const savedNative = props.snapshot.nativeRuns.find((run) => run.runId === props.task.runId);
+  const [authority, setAuthority] = useState<Policy['authority']>(
+    savedNative ? (saved?.policy.policy.authority ?? 'guided') : (seed?.authority ?? 'guided'),
+  );
+  const scriptedRun =
+    !!saved &&
+    saved.roles.every((role) =>
+      [role.routeId, ...role.approvedFallbacks].every((id) =>
+        props.snapshot.routes.some((route) => route.id === id && route.fake),
+      ),
+    );
+  const demoAvailable =
+    scriptedRun || props.snapshot.routes.some((route) => route.fake && route.qualified);
+  const [choice, setChoice] = useState<
+    | {
+        scope: 'file' | 'repository' | 'local';
+        profileId: string;
+        adoptedWorker?: AdoptedWorkerIdentity;
+      }
+    | 'demo'
+    | null
+  >(() => {
     const current = props.snapshot.nativeRuns.find((run) => run.runId === props.task.runId);
-    return current ? (current.profileId === 'openai-repository-v1' ? 'repository' : 'file') : null;
+    return current
+      ? {
+          scope:
+            current.profileId === 'local-file-v1'
+              ? 'local'
+              : current.profileId === 'openai-repository-v1'
+                ? 'repository'
+                : 'file',
+          profileId: current.profileId,
+        }
+      : scriptedRun
+        ? 'demo'
+        : null;
   });
-  return native ? (
-    <NativeLaunch {...props} scope={native} onBack={() => setNative(null)} />
-  ) : (
-    <ScriptedLaunch {...props} onNative={setNative} />
+  const [readingWorker, setReadingWorker] = useState(false);
+  const [workerMessage, setWorkerMessage] = useState<string | null>(null);
+  const active = useRef(false);
+  useLayoutEffect(() => {
+    active.current = true;
+    return () => {
+      active.current = false;
+    };
+  }, []);
+  async function chooseAdoptedWorker() {
+    if (
+      readingWorker ||
+      props.workspace.pending ||
+      props.workspace.retryAvailable ||
+      props.workspace.connection !== 'connected' ||
+      props.workspace.preview ||
+      !props.snapshot.nativeProfiles.some(
+        (profile) => profile.id === 'openai-repository-v1' && profile.available,
+      )
+    )
+      return;
+    setReadingWorker(true);
+    setWorkerMessage(null);
+    try {
+      const result = await props.workspace.command({
+        command: 'GetTaskConversationState',
+        payload: { taskId: props.task.id },
+      });
+      if (!active.current) return;
+      const identity =
+        (result.outcome === 'applied' || result.outcome === 'already-applied') &&
+        result.data?.kind === 'conversation-state'
+          ? adoptedWorkerIdentity(props.task, result.data.state)
+          : null;
+      if (!identity) {
+        setWorkerMessage(changedAdoption);
+        return;
+      }
+      setChoice({
+        scope: 'repository',
+        profileId: 'openai-repository-v1',
+        adoptedWorker: identity,
+      });
+    } catch {
+      if (active.current) setWorkerMessage(changedAdoption);
+    } finally {
+      if (active.current) setReadingWorker(false);
+    }
+  }
+  if (
+    seed &&
+    !savedNative &&
+    (seed.taskId !== props.task.id || seed.taskRevision !== props.task.revision)
+  )
+    return (
+      <Dialog title="Future execution draft unavailable" onClose={props.onClose}>
+        <p role="status">
+          The task changed. Close this draft and choose its future execution policy again.
+        </p>
+      </Dialog>
+    );
+  if (choice === 'demo' && demoAvailable)
+    return <ScriptedLaunch {...props} onBack={() => setChoice(null)} />;
+  if (
+    choice &&
+    choice !== 'demo' &&
+    (choice.scope !== 'local' ||
+      authority === 'guided' ||
+      savedNative?.profileId === 'local-file-v1')
+  )
+    return choice.scope === 'local' ? (
+      <LocalFileLaunch {...props} onBack={() => setChoice(null)} />
+    ) : (
+      <NativeLaunch
+        {...props}
+        initialAuthority={authority}
+        scope={choice.scope}
+        initialProfileId={choice.profileId}
+        adoptedWorker={choice.adoptedWorker}
+        onBack={() => setChoice(null)}
+      />
+    );
+  const blocked = props.workspace.pending || props.workspace.retryAvailable || readingWorker;
+  return (
+    <Dialog title="Choose execution provider" onClose={props.onClose} wide>
+      <div className="launch-content view-stack">
+        <p>
+          Choose a provider and scope. Review its source sharing and permissions before preparing.
+        </p>
+        <label>
+          Future execution authority
+          <select
+            value={authority}
+            disabled={blocked}
+            onChange={(event) => {
+              setAuthority(event.target.value as Policy['authority']);
+              setChoice(null);
+            }}
+          >
+            <option value="guided">Guided</option>
+            <option value="balanced">Balanced</option>
+            <option value="autopilot">Autopilot</option>
+          </select>
+        </label>
+        {blocked && (
+          <p className="notice" role="status">
+            Resolve the pending command before choosing another provider.
+          </p>
+        )}
+        {!props.snapshot.nativeProfiles.length && (
+          <p className="notice" role="status">
+            The provider catalog is unavailable. Refresh the saved workspace before preparing.
+          </p>
+        )}
+        {workerMessage && <p role="status">{workerMessage}</p>}
+        <button
+          type="button"
+          className="button secondary"
+          disabled={
+            blocked ||
+            props.workspace.connection !== 'connected' ||
+            props.workspace.preview ||
+            !props.snapshot.nativeProfiles.some(
+              (profile) => profile.id === 'openai-repository-v1' && profile.available,
+            )
+          }
+          onClick={() => void chooseAdoptedWorker()}
+        >
+          Prepare adopted repository worker
+        </button>
+        {props.snapshot.nativeProfiles.map((profile) => {
+          const scope =
+            profile.family === 'local'
+              ? 'local'
+              : profile.id === 'openai-repository-v1'
+                ? 'repository'
+                : 'file';
+          return (
+            <section key={profile.id} className="view-stack">
+              <h3>{profile.displayName}</h3>
+              <p className="muted small">
+                {familyName(profile.family)} · {scope === 'repository' ? 'Repository' : 'One file'}
+                {' · '}Requested model {profile.model}
+              </p>
+              <p className="muted small" role="status">
+                {profile.available ? 'Preparation available' : 'Preparation unavailable'} ·{' '}
+                {titleCase(profile.reason.replaceAll('-', ' '))}
+              </p>
+              {profile.family === 'local' && authority !== 'guided' && (
+                <p className="notice" role="status">
+                  Local preparation supports Guided authority only. Choose Guided to prepare with
+                  Local.
+                </p>
+              )}
+              <button
+                type="button"
+                className="button secondary"
+                disabled={blocked || (profile.family === 'local' && authority !== 'guided')}
+                onClick={() => setChoice({ scope, profileId: profile.id })}
+              >
+                {profile.available ? 'Choose' : 'Inspect'} {profile.displayName}
+                <ArrowRight size={14} />
+              </button>
+            </section>
+          );
+        })}
+        {demoAvailable && (
+          <button
+            type="button"
+            className="button secondary"
+            disabled={blocked}
+            onClick={() => setChoice('demo')}
+          >
+            Scripted demo
+          </button>
+        )}
+      </div>
+      <div className="dialog-footer">
+        <button type="button" className="button secondary" onClick={props.onClose}>
+          Cancel
+        </button>
+      </div>
+    </Dialog>
+  );
+}
+
+function LocalFileLaunch({
+  task,
+  snapshot,
+  workspace,
+  onClose,
+  onBack,
+}: LaunchProps & { onBack: () => void }) {
+  const project = snapshot.projects.find((value) => value.id === task.projectId);
+  const profile = snapshot.nativeProfiles.find(
+    (value) => value.family === 'local' && value.id === 'local-file-v1',
+  );
+  const capability = snapshot.nativeRuns.find(
+    (value) => value.runId === task.runId && value.profileId === 'local-file-v1',
+  );
+  const saved = capability
+    ? snapshot.runs.find((value) => value.id === capability.runId)
+    : undefined;
+  const [prepared, setPrepared] = useState<Run | null>(saved ?? null);
+  const [targetPath, setTargetPath] = useState(capability?.target?.path ?? '');
+  const targetErrorId = useId();
+  const validTarget = NativeTargetPathSchema.safeParse(targetPath).success;
+  const [minutes, setMinutes] = useState('5');
+  const [grantExpiry] = useState(() => new Date(Date.now() + 86400000).toISOString());
+  const [trust, setTrust] = useState(false);
+  const [sourceConsent, setSourceConsent] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const [requested, setRequested] = useState<'prepare' | 'start' | null>(null);
+  const [uncertain, setUncertain] = useState<'prepare' | 'start' | null>(null);
+  const connected = workspace.connection === 'connected' && !workspace.preview;
+  const idle = connected && !workspace.pending && !requested && !workspace.retryAvailable;
+  const selected = snapshot.localSetup?.observation?.models.find(
+    (model) => model.selectionId === snapshot.localSetup?.selection?.selectionId,
+  );
+  const setupHash = snapshot.localSetup?.setupHash;
+  const matchingSetup = Boolean(
+    profile?.modelBinding &&
+      profile.modelBinding.setupHash === setupHash &&
+      snapshot.localSetup?.generation === 'idle' &&
+      !snapshot.localSetup.operation,
+  );
+  const policy: Policy = {
+    authority: 'guided',
+    quality: 'quick',
+    methods: [{ id: 'keep-it-simple', cycles: 1, reviewerRole: 'reviewer' }],
+    limits: { attempts: 3, minutes: Number(minutes), concurrency: 1 },
+    reserves: [],
+    unknownUsage: { rule: 'fixed-allowance', allowance: { launches: 1, minutes: Number(minutes) } },
+    effects: [
+      {
+        taskId: task.id,
+        action: 'write-scratch',
+        target: project?.name ?? task.projectId,
+        usesRemaining: 1,
+        revoked: false,
+        expiresAt: grantExpiry,
+      },
+    ],
+  };
+  const valid =
+    PolicySchema.safeParse(policy).success && Number(minutes) >= 1 && Number(minutes) <= 5;
+  const allowed =
+    idle && profile?.available && matchingSetup && trust && sourceConsent && valid && validTarget;
+  const currentPrepared = prepared?.id === task.runId && capability?.runId === prepared?.id;
+  const startable =
+    idle &&
+    profile?.available &&
+    matchingSetup &&
+    currentPrepared &&
+    capability?.stage === 'prepared' &&
+    capability.localModel?.setupHash === setupHash &&
+    Boolean(capability.expiresAt && Date.parse(capability.expiresAt) > Date.now());
+  const clearConsent = () => {
+    setTrust(false);
+    setSourceConsent(false);
+  };
+  useEffect(() => {
+    if (setupHash !== undefined) {
+      setTrust(false);
+      setSourceConsent(false);
+    }
+  }, [setupHash]);
+  function acceptPreparation(entity: unknown) {
+    const parsed = RunSchema.safeParse(entity);
+    if (parsed.success && parsed.data.taskId === task.id) {
+      setPrepared(parsed.data);
+      clearConsent();
+      return true;
+    }
+    return false;
+  }
+  async function prepare() {
+    if (!allowed) return;
+    const payload = NativePreparationPayloadSchema.safeParse({
+      taskId: task.id,
+      profileId: 'local-file-v1',
+      targetPath,
+      policy: {
+        ...policy,
+        effects: policy.effects.map((grant) => ({
+          ...grant,
+          expiresAt: new Date(Date.now() + 86400000).toISOString(),
+        })),
+      },
+      consent: 'explicit',
+    });
+    if (!payload.success) return;
+    setRequested('prepare');
+    setMessage(null);
+    setUncertain(null);
+    try {
+      const result = await workspace.command({
+        command: 'PrepareNativeRun',
+        expectedRevision: task.revision,
+        payload: payload.data,
+      });
+      if (
+        (result.outcome === 'applied' || result.outcome === 'already-applied') &&
+        acceptPreparation(result.entity)
+      )
+        setMessage(null);
+      else {
+        setMessage(
+          result.next ??
+            result.reason ??
+            'The Local preparation was not confirmed. Inspect the saved task.',
+        );
+        if (result.outcome === 'outcome-unknown') setUncertain('prepare');
+      }
+    } catch {
+      setMessage(
+        'Local preparation could not be confirmed. Use exact retry before preparing again.',
+      );
+      setUncertain('prepare');
+    } finally {
+      setRequested(null);
+    }
+  }
+  async function start() {
+    if (!startable || !prepared) return;
+    setRequested('start');
+    setMessage(null);
+    setUncertain(null);
+    try {
+      const result = await workspace.command({
+        command: 'StartRun',
+        expectedRevision: task.revision,
+        payload: { taskId: task.id, runId: prepared.id },
+      });
+      if (result.outcome === 'applied' || result.outcome === 'already-applied') onClose();
+      else {
+        setMessage(
+          result.next ??
+            result.reason ??
+            'The Local proposal did not start. Inspect the saved task.',
+        );
+        if (result.outcome === 'outcome-unknown') setUncertain('start');
+      }
+    } catch {
+      setMessage(
+        'Local Start could not be confirmed. Inspect the saved task and use exact retry if available.',
+      );
+      setUncertain('start');
+    } finally {
+      setRequested(null);
+    }
+  }
+  useEffect(() => {
+    if (uncertain === 'prepare' && saved) setPrepared(saved);
+  }, [saved, uncertain]);
+  async function retry() {
+    if (!uncertain || !workspace.retryAvailable || !connected || workspace.pending) return;
+    try {
+      const result = await workspace.retryCommand();
+      if (result && (result.outcome === 'applied' || result.outcome === 'already-applied')) {
+        setUncertain(null);
+        setMessage(
+          'The exact command is confirmed. Inspect the current saved task before continuing.',
+        );
+      } else
+        setMessage(result?.next ?? result?.reason ?? 'The exact command is still unconfirmed.');
+    } catch {
+      setMessage('Exact retry could not be confirmed. Reconnect and retry the same command.');
+    }
+  }
+  return (
+    <Dialog
+      title={prepared ? 'Review the Local proposal' : 'Local file proposal'}
+      eyebrow="ONE EXISTING COMMITTED FILE"
+      onClose={onClose}
+      wide
+    >
+      <div className="launch-content view-stack">
+        {message && (
+          <p className="notice" role="status">
+            {message}
+          </p>
+        )}
+        {workspace.retryAvailable && (
+          <div className="button-row">
+            <p className="muted small">
+              Resolve the uncertain command before changing this proposal.
+            </p>
+            {uncertain && (
+              <button
+                className="button secondary"
+                type="button"
+                disabled={!connected || workspace.pending}
+                onClick={() => void retry()}
+              >
+                Retry exact command
+              </button>
+            )}
+          </div>
+        )}
+        <section className="card view-stack">
+          <div className="section-heading">
+            <h2>{profile?.displayName ?? 'Local writer unavailable'}</h2>
+            <span>Writer only · Qualification pending</span>
+          </div>
+          <p className="muted small">
+            One replacement in independent scratch. Local lead, orchestrator and formal review
+            remain unqualified. Model loading stays in the Local app.
+          </p>
+          <div className="facts-grid">
+            <Fact
+              label="Selected model"
+              value={selected?.identity.displayName ?? profile?.model ?? 'None'}
+            />
+            <Fact
+              label="Observed state"
+              value={selected ? localModelStates[selected.state] : 'Unknown'}
+            />
+            <Fact label="Context" value={selected?.contextLength?.toLocaleString() ?? 'Unknown'} />
+            <Fact label="Writer submissions" value={profile?.maximumSubmissions ?? 'Unknown'} />
+          </div>
+          {!profile?.available && (
+            <p className="notice" role="status">
+              Local preparation unavailable. Configure the connection, refresh models and select a
+              compatible loaded model.
+            </p>
+          )}
+          <details>
+            <summary>Local connection and model setup</summary>
+            <LocalSetup snapshot={snapshot} workspace={workspace} />
+          </details>
+        </section>
+        {prepared ? (
+          <>
+            <SourceFacts source={prepared.source} />
+            <section className="card view-stack">
+              <h2>Saved Local target</h2>
+              <Fact label="Frozen model" value={capability?.localModel?.modelKey ?? 'Unknown'} />
+              <code>{capability?.target?.path ?? 'Unavailable'}</code>
+              <p>{capability?.target?.bytes ?? 'Unknown'} bytes</p>
+              <p>
+                {prepared.policy.policy.limits.attempts} total attempts ·{' '}
+                {prepared.policy.policy.limits.minutes} total minutes ·{' '}
+                {prepared.policy.policy.limits.concurrency} concurrent writer
+              </p>
+              <p>
+                Consent expires{' '}
+                {capability?.expiresAt
+                  ? new Date(capability.expiresAt).toLocaleString()
+                  : 'Unknown'}
+                .
+              </p>
+              <details className="technical-details">
+                <summary>Frozen Local identity</summary>
+                <code>Original file {capability?.target?.baseHash ?? 'Unknown'}</code>
+                <code>Model {capability?.localModel?.modelKey ?? 'Unknown'}</code>
+                <code>Setup {capability?.localModel?.setupHash ?? 'Unknown'}</code>
+                {capability?.localModel && 'connectionHash' in capability.localModel && (
+                  <>
+                    <code>Connection {capability.localModel.connectionHash}</code>
+                    <code>Metadata {capability.localModel.metadataHash}</code>
+                    <code>
+                      Runtime {capability.localModel.runtimeVersion}, build{' '}
+                      {capability.localModel.runtimeBuild}
+                    </code>
+                  </>
+                )}
+              </details>
+            </section>
+          </>
+        ) : (
+          <section className="card view-stack">
+            <label>
+              Existing committed target
+              <input
+                value={targetPath}
+                placeholder="src/example.ts"
+                aria-invalid={targetPath.length > 0 && !validTarget}
+                aria-describedby={targetPath.length > 0 && !validTarget ? targetErrorId : undefined}
+                onChange={(event) => {
+                  setTargetPath(event.target.value);
+                  clearConsent();
+                }}
+              />
+            </label>
+            {targetPath.length > 0 && !validTarget && (
+              <p className="notice" role="alert" id={targetErrorId}>
+                Use a relative path to one existing committed text file.
+              </p>
+            )}
+            <label>
+              Maximum task minutes
+              <input
+                type="number"
+                min="1"
+                max="5"
+                step="1"
+                value={minutes}
+                onChange={(event) => {
+                  setMinutes(event.target.value);
+                  clearConsent();
+                }}
+              />
+            </label>
+            <p className="muted small">
+              Guided · Quick · One coder · 3 total attempts · One writer submission. The controller
+              rechecks the task allowance and exact model before Start.
+            </p>
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                checked={trust}
+                onChange={(event) => setTrust(event.target.checked)}
+              />
+              Trust the connected Local runtime and selected model
+            </label>
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                checked={sourceConsent}
+                onChange={(event) => setSourceConsent(event.target.checked)}
+              />
+              Send this committed file and task text; allow its replacement in independent scratch
+            </label>
+          </section>
+        )}
+        <section className="card">
+          <h2>Task criteria</h2>
+          <ul>
+            {task.criteria.map((criterion) => (
+              <li key={criterion}>{criterion}</li>
+            ))}
+          </ul>
+        </section>
+        <p className="notice">
+          The original checkout stays unchanged. Inspect retained Changes after the writer stops.
+          Patch export requires its own exact permission. Checks and the required review remain
+          pending and unavailable in this Local flow. Acceptance is unavailable.
+        </p>
+        {prepared && !startable && (
+          <p className="muted small" role="status">
+            Start needs the current prepared run, matching Local setup, available profile and
+            unexpired consent. Active or unknown ownership blocks another Start.
+          </p>
+        )}
+      </div>
+      <div className="dialog-footer">
+        <button className="button secondary" type="button" onClick={onClose}>
+          Close
+        </button>
+        {!prepared && (
+          <button className="button secondary" type="button" onClick={onBack}>
+            Other writers
+          </button>
+        )}
+        {prepared ? (
+          <>
+            {capability?.stage === 'prepared' && (
+              <button
+                className="button secondary"
+                type="button"
+                disabled={!idle}
+                onClick={() => {
+                  setPrepared(null);
+                  clearConsent();
+                }}
+              >
+                Edit proposal
+              </button>
+            )}
+            <button
+              className="button primary"
+              type="button"
+              disabled={!startable}
+              onClick={() => void start()}
+            >
+              Start Local proposal
+              <ArrowRight size={14} />
+            </button>
+          </>
+        ) : (
+          <button
+            className="button primary"
+            type="button"
+            disabled={!allowed}
+            onClick={() => void prepare()}
+          >
+            Prepare Local proposal
+            <ArrowRight size={14} />
+          </button>
+        )}
+      </div>
+    </Dialog>
   );
 }
 
@@ -734,19 +1574,40 @@ function NativeLaunch({
   onClose,
   onBack,
   scope,
-}: LaunchProps & { onBack: () => void; scope: 'file' | 'repository' }) {
+  initialProfileId,
+  initialAuthority,
+  adoptedWorker,
+}: LaunchProps & {
+  onBack: () => void;
+  scope: 'file' | 'repository';
+  initialProfileId?: string;
+  initialAuthority?: Policy['authority'];
+  adoptedWorker?: AdoptedWorkerIdentity;
+}) {
   const project = snapshot.projects.find((value) => value.id === task.projectId);
   const repository = scope === 'repository';
+  const active = useRef(false);
+  const [checkingWorker, setCheckingWorker] = useState(false);
+  const [workerInvalid, setWorkerInvalid] = useState(false);
+  useLayoutEffect(() => {
+    active.current = true;
+    return () => {
+      active.current = false;
+    };
+  }, []);
   const profiles = snapshot.nativeProfiles
     .filter((value) => value.family !== 'local')
     .filter((value) => (value.id === 'openai-repository-v1') === repository);
   const current = snapshot.nativeRuns.find(
     (value) =>
-      value.runId === task.runId && (value.profileId === 'openai-repository-v1') === repository,
+      value.runId === task.runId &&
+      value.profileId !== 'local-file-v1' &&
+      (value.profileId === 'openai-repository-v1') === repository,
   );
   const saved = current ? snapshot.runs.find((value) => value.id === task.runId) : undefined;
   const [profileId, setProfileId] = useState(
     current?.profileId ??
+      initialProfileId ??
       profiles.find((value) => value.id === 'openai-file-v1')?.id ??
       profiles[0]?.id ??
       '',
@@ -786,7 +1647,7 @@ function NativeLaunch({
   const [policy, setPolicy] = useState<Policy>(
     () =>
       saved?.policy.policy ?? {
-        authority: 'guided',
+        authority: initialAuthority ?? 'guided',
         quality: 'quick',
         methods: [{ id: 'keep-it-simple', cycles: 1, reviewerRole: 'reviewer' }],
         limits: { attempts: 3, minutes: 5, concurrency: 1 },
@@ -831,7 +1692,9 @@ function NativeLaunch({
       policy.unknownUsage.allowance.minutes >= policy.limits.minutes);
   const capability = snapshot.nativeRuns.find((value) => value.runId === prepared?.id);
   const connected = workspace.connection === 'connected' && !workspace.preview;
-  const allowed = connected && profile?.available && !workspace.pending;
+  const allowed =
+    connected && profile?.available && !workspace.pending && !checkingWorker && !workerInvalid;
+  const supportedAuthority = !google || policy.authority !== 'autopilot';
   const validConsent = savedConsent || (nativeTrust && sourceConsent);
   const validTools = !repository || savedConsent || nativeTools;
   const billingAttestation = attestedBilling
@@ -930,8 +1793,13 @@ function NativeLaunch({
         } as Partial<Record<Snapshot['nativeProfiles'][number]['reason'], string>>
       )[profile.reason] ?? 'The controller has no supported native profile.')
     : 'The controller has no supported native profile.';
+  function leavePreparation(next: () => void) {
+    active.current = false;
+    next();
+  }
   async function prepareNative() {
     if (
+      !supportedAuthority ||
       !allowed ||
       !validConsent ||
       !validTools ||
@@ -944,6 +1812,24 @@ function NativeLaunch({
     )
       return;
     try {
+      if (adoptedWorker) {
+        setCheckingWorker(true);
+        const result = await workspace.command({
+          command: 'GetTaskConversationState',
+          payload: { taskId: task.id },
+        });
+        if (!active.current) return;
+        const identity =
+          (result.outcome === 'applied' || result.outcome === 'already-applied') &&
+          result.data?.kind === 'conversation-state'
+            ? adoptedWorkerIdentity(task, result.data.state)
+            : null;
+        if (!identity || JSON.stringify(identity) !== JSON.stringify(adoptedWorker)) {
+          setWorkerInvalid(true);
+          setMessage(changedAdoption);
+          return;
+        }
+      }
       const expiresAt = new Date(Date.now() + 86400000).toISOString();
       const writeIndex = policy.effects.findIndex(
         (grant) =>
@@ -1034,9 +1920,12 @@ function NativeLaunch({
             'The target, native consent or saved policy is unavailable. Review the proposal again.',
         );
     } catch {
+      if (adoptedWorker) setWorkerInvalid(true);
       setMessage(
         'Preparation could not be confirmed. Check the connection and retained task before retrying.',
       );
+    } finally {
+      if (active.current) setCheckingWorker(false);
     }
   }
   return (
@@ -1049,10 +1938,10 @@ function NativeLaunch({
             : 'Native file proposal'
       }
       eyebrow={repository ? 'COMMITTED REPOSITORY' : 'ONE EXISTING COMMITTED FILE'}
-      onClose={onClose}
+      onClose={() => leavePreparation(onClose)}
       wide
     >
-      <div className="launch-content view-stack">
+      <fieldset className="launch-content view-stack" disabled={checkingWorker}>
         {message && (
           <p className="notice" role="status">
             {message}
@@ -1118,6 +2007,10 @@ function NativeLaunch({
         </section>
         {prepared ? (
           <>
+            <p className="notice">
+              Saved execution authority: {titleCase(prepared.policy.policy.authority)}. This
+              prepared policy is frozen.
+            </p>
             <SourceFacts source={prepared.source} />
             <section className="card" aria-label="Prepared native target">
               <h2>{repository ? 'Saved repository' : 'Saved target'}</h2>
@@ -1213,6 +2106,33 @@ function NativeLaunch({
           </>
         ) : (
           <section className="card">
+            <label>
+              Execution authority
+              <select
+                value={policy.authority}
+                disabled={workspace.pending || workspace.retryAvailable}
+                onChange={(event) => {
+                  setPolicy({ ...policy, authority: event.target.value as Policy['authority'] });
+                  resetScope();
+                }}
+              >
+                <option value="guided">Guided</option>
+                <option value="balanced">Balanced</option>
+                <option value="autopilot" disabled={google}>
+                  Autopilot
+                </option>
+              </select>
+            </label>
+            {!supportedAuthority && (
+              <p className="notice" role="status">
+                Google preparation supports Guided or Balanced authority. Choose a supported
+                authority before preparing.
+              </p>
+            )}
+            <p className="muted small">
+              This draft grants nothing until explicit preparation. Source sharing and tool
+              permissions need fresh confirmation after an authority change.
+            </p>
             {repository ? (
               <>
                 <h2>Committed repository</h2>
@@ -1421,7 +2341,7 @@ function NativeLaunch({
                     <p className="muted small">
                       Every writer spends the same original run budget. The overall attempt cap is
                       separate from each route's launch allowance. Two reserved minutes cover a
-                      standard check and review; full verification needs six remaining minutes.
+                      standard check and review; full verification needs eleven remaining minutes.
                     </p>
                     {!validHandoff && (
                       <p className="notice" role="status">
@@ -1480,22 +2400,6 @@ function NativeLaunch({
                     Thought level unknown. The client advertised no thought selector.
                   </p>
                 )}
-                <label>
-                  Google authority
-                  <select
-                    value={policy.authority}
-                    onChange={(event) => {
-                      setPolicy({
-                        ...policy,
-                        authority: event.target.value === 'balanced' ? 'balanced' : 'guided',
-                      });
-                      resetConsent();
-                    }}
-                  >
-                    <option value="guided">Guided</option>
-                    <option value="balanced">Balanced</option>
-                  </select>
-                </label>
                 <p className="muted small">
                   All returned quota pools must be fresh and above reserve. The quota reader and ACP
                   login are separate sessions.
@@ -1596,6 +2500,7 @@ function NativeLaunch({
               <input
                 type="checkbox"
                 checked={savedConsent}
+                disabled={!saved || JSON.stringify(policy) !== JSON.stringify(saved.policy.policy)}
                 onChange={(event) => setSavedConsent(event.target.checked)}
               />
               Use saved consent for this exact {repository ? 'repository' : 'file'} and policy
@@ -1692,14 +2597,22 @@ function NativeLaunch({
             The saved consent expired. Edit the proposal and review its permissions.
           </p>
         )}
-      </div>
+      </fieldset>
       <div className="dialog-footer">
-        <button type="button" className="button secondary" onClick={onClose}>
+        <button
+          type="button"
+          className="button secondary"
+          onClick={() => leavePreparation(onClose)}
+        >
           Cancel
         </button>
         {!prepared && (
-          <button type="button" className="button secondary" onClick={onBack}>
-            Scripted run
+          <button
+            type="button"
+            className="button secondary"
+            onClick={() => leavePreparation(onBack)}
+          >
+            Provider choices
           </button>
         )}
         <span className="muted small">
@@ -1755,6 +2668,7 @@ function NativeLaunch({
             type="button"
             className="button primary"
             disabled={
+              !supportedAuthority ||
               !allowed ||
               !validConsent ||
               !validTools ||
@@ -1882,7 +2796,7 @@ export function NativeHandoff({ task, snapshot, workspace, onClose }: LaunchProp
             Original limits: {run.policy.policy.limits.attempts} overall attempts and{' '}
             {run.policy.policy.limits.minutes} minutes. Every writer spends this same budget. This
             view cannot replenish it. The controller rechecks the remaining allowance; full
-            verification needs six remaining minutes.
+            verification needs eleven remaining minutes.
           </p>
           <p className="notice" role="status">
             {handoffReasons[pending?.start.reason ?? handoff.prepare.reason]}
@@ -2140,9 +3054,9 @@ function ScriptedLaunch({
   snapshot,
   workspace,
   onClose,
-  onNative,
+  onBack,
 }: {
-  onNative: (scope: 'file' | 'repository') => void;
+  onBack: () => void;
   task: Task;
   snapshot: Snapshot;
   workspace: Workspace;
@@ -2194,14 +3108,24 @@ function ScriptedLaunch({
       target: grant.action === 'export-patch' ? task.id : grant.target,
       usesRemaining: 0,
     })),
-    reserves: snapshot.routes
-      .filter(({ family }) => ['openai', 'anthropic'].includes(family))
-      .map((route) => ({
-        routeId: route.id,
-        windowId: 'weekly',
-        value: route.family === 'openai' ? 40 : 5,
-        unit: 'percent' as const,
-      })),
+    reserves: snapshot.routes.flatMap((route) => {
+      const weekly = snapshot.usage.find(
+        ({ observation }) =>
+          observation.routeId === route.id &&
+          observation.windowId === 'weekly' &&
+          observation.remaining?.unit === 'percent',
+      );
+      return ['openai', 'anthropic'].includes(route.family) && weekly
+        ? [
+            {
+              routeId: route.id,
+              windowId: 'weekly',
+              value: route.family === 'openai' ? 40 : 5,
+              unit: 'percent' as const,
+            },
+          ]
+        : [];
+    }),
   }));
   const [methods, setMethods] = useState<Method[]>(
     requiredReviewMethodIds('standard').map((id) => ({ id, cycles: 1, reviewerRole: 'reviewer' })),
@@ -2583,12 +3507,8 @@ function ScriptedLaunch({
     >
       {!prepared && (
         <div className="button-row">
-          <button type="button" className="button secondary" onClick={() => onNative('file')}>
-            Native file proposal
-            <ArrowRight size={14} />
-          </button>
-          <button type="button" className="button secondary" onClick={() => onNative('repository')}>
-            Repository work
+          <button type="button" className="button secondary" onClick={onBack}>
+            Provider choices
             <ArrowRight size={14} />
           </button>
         </div>

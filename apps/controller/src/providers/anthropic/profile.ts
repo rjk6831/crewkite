@@ -24,6 +24,12 @@ const descriptor = {
   maximumFileBytes: 65536,
   maximumSubmissions: 1,
 } as const;
+const compactDescriptor = {
+  ...descriptor,
+  id: 'anthropic-file-compact-v1',
+  displayName: 'Anthropic compact single-file proposal',
+  model: 'claude-haiku-5-5',
+} as const;
 const clientHash = '5262ce9de86243fed0d21edc39b271555d56780d0112e2b194439fe1c6662d37';
 
 const subscriptionMetadata = z.strictObject({
@@ -37,11 +43,14 @@ export function subscriptionAuth(metadata: unknown): boolean {
 }
 
 /** Resolve a known build without executing it or reading authentication files. */
-export function resolveAnthropicNativeProfile(environment = process.env): NativeProfileResolution {
+function resolve(
+  selected: typeof descriptor | typeof compactDescriptor,
+  environment: NodeJS.ProcessEnv,
+): NativeProfileResolution {
   const unavailable = (
     reason: ReturnType<typeof AnthropicNativeProfileSchema.parse>['reason'],
   ) => ({
-    facts: AnthropicNativeProfileSchema.parse({ ...descriptor, available: false, reason }),
+    facts: AnthropicNativeProfileSchema.parse({ ...selected, available: false, reason }),
   });
   if (process.platform !== 'darwin' || process.arch !== 'arm64')
     return unavailable('unsupported-platform');
@@ -67,11 +76,11 @@ export function resolveAnthropicNativeProfile(environment = process.env): Native
         continue;
       return {
         facts: AnthropicNativeProfileSchema.parse({
-          ...descriptor,
+          ...selected,
           available: true,
           reason: 'qualification-pending',
         }),
-        client: { executable, sha256: clientHash, version: descriptor.clientVersion },
+        client: { executable, sha256: clientHash, version: selected.clientVersion },
         environment: nativeAuthEnvironment(environment, '/tmp'),
         locationHash: createHash('sha256')
           .update(JSON.stringify({ home: environment.HOME, configurationHome: null }))
@@ -80,4 +89,14 @@ export function resolveAnthropicNativeProfile(environment = process.env): Native
     } catch {}
   }
   return unavailable(found ? 'client-build-mismatch' : 'client-unavailable');
+}
+
+export function resolveAnthropicNativeProfile(environment = process.env): NativeProfileResolution {
+  return resolve(descriptor, environment);
+}
+
+export function resolveAnthropicCompactNativeProfile(
+  environment = process.env,
+): NativeProfileResolution {
+  return resolve(compactDescriptor, environment);
 }

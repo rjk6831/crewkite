@@ -23,14 +23,24 @@ import {
   type Command,
   type CommandResult,
   CommandSchema,
+  ConversationContextRefsSchema,
+  type ConversationEntry,
+  ConversationModelRequestSchema,
+  ConversationPlanningSelectionSchema,
   canonicalJson,
+  LocalAuthModeSchema,
+  LocalEndpointSchema,
+  LocalModelSelectionSchema,
   MAX_FRAME_BYTES,
   NativeHandoffTargetsSchema,
+  NativeTargetContextLinesSchema,
   PolicySchema,
+  PrepareCombinedRunPayloadSchema,
   ProjectNodeTestFilesSchema,
   ProjectSchema,
   type Snapshot,
   type Task,
+  type TaskConversationState,
   TaskSchema,
 } from '@crewkite/contracts';
 
@@ -39,14 +49,30 @@ const googleAcpLabel =
 
 const help = `Usage: crewkite project add <path> [--json] [--home path]
        crewkite task create <project-id> --title text --outcome text --criterion text [--criterion text ...] [--json] [--home path]
-       crewkite task <list|show|watch|start|stop|resume|switch|approve|deny> [id] [--json] [--home path]
+       crewkite task <list|show|watch|start|pause|stop|resume|switch|approve|deny> [id] [--json] [--home path]
+       crewkite task amend <task-id> --title text --outcome text --criterion text [--criterion text ...] [--json] [--home path]
        crewkite task switch <task-id> <route-id> [--json] [--home path]
+       crewkite conversation <create|configure> <id> --role lead|orchestrator --profile openai-file-v1 --credit-policy ordinary|existing-credits --attempts N --minutes N --concurrency N --consent [--text goal]
+       crewkite conversation create <project-id> --text goal --role lead|orchestrator --profile openai-file-v1 --credit-policy ordinary|existing-credits --attempts N --minutes N --concurrency N --consent [--context-refs file]
+       crewkite conversation configure <task-id> --role lead|orchestrator --profile openai-file-v1 --credit-policy ordinary|existing-credits --attempts N --minutes N --concurrency N --consent [--model-request file]
+       crewkite conversation show <task-id> [--before-cursor cursor] [--json] [--home path]
+       crewkite conversation <send|guide> <task-id> --text text [--context-refs file] [--json] [--home path]
+       crewkite conversation answer <task-id> --question-id message-id --text text [--context-refs file] [--json] [--home path]
+       crewkite conversation adopt <task-id> --proposal-id message-id --proposal-hash hash [--json] [--home path]
+       crewkite local status [--json] [--home path]
+       crewkite local configure --endpoint ws://127.0.0.1:port [--authentication token|none] [--json] [--home path]
+       crewkite local <connect|refresh-models> --consent [--json] [--home path]
+       crewkite local cancel-input <operation-id> [--json] [--home path]
+       crewkite local disconnect [--json] [--home path]
+       crewkite local select-model <selection-id> --observation-hash hash [--json] [--home path]
+       crewkite combined prepare <parent-task-id> --plan file [--json] [--home path]
+       crewkite combined <status|assemble> <parent-task-id> [--json] [--home path]
        crewkite native profiles [--json] [--home path]
        crewkite native import-google --consent [--json] [--home path]
        crewkite native setup <show|initialize|authenticate|discover|stop> --family google [--consent] [--json] [--home path]
        crewkite usage show [--json] [--home path]
-       crewkite usage refresh --family google [--consent|--no-consent] [--json] [--home path]
-       crewkite task prepare-native <task-id> <profile-id> <path> --policy file [--native-trust --source-consent] [--existing-credits] [--confirm-subscription-only] [--permission-mode mode] [--handoff-target profile[:existing-credits] ...]
+       crewkite usage refresh --family google [--json] [--home path]
+       crewkite task prepare-native <task-id> <profile-id> <path> --policy file [--native-trust --source-consent] [--existing-credits] [--confirm-subscription-only] [--maximum-task-ms 300000|600000] [--context-lines START:END] [--permission-mode mode] [--handoff-target profile[:existing-credits] ...]
        crewkite task prepare-handoff <task-id> <profile-id> --native-trust --source-consent [--existing-credits] [--confirm-subscription-only] [--permission-mode mode]
        crewkite task start-handoff <task-id> [--json] [--home path]
        crewkite task prepare-repository <task-id> <profile-id> --policy file [--native-trust --source-consent] [--existing-credits]
@@ -59,7 +85,8 @@ const help = `Usage: crewkite project add <path> [--json] [--home path]
        crewkite retry <receipt-file> [--output new-file] [--json] [--home path]
 
 Approval commands take an approval ID. Task creation takes a project ID. Other task commands take a task ID.
-Project registration and task creation start no work. Native preparation uses explicit consent or the controller's exact saved consent.
+Conversation creation takes a project ID and a goal, and can start a counted planning turn under its explicit finite consent. Other conversation commands take a task ID.
+Project registration and task create start no work. Native preparation uses explicit consent or the controller's exact saved consent.
 For an Anthropic or Google writer, --confirm-subscription-only confirms subscription login and disabled paid extra usage.
 File handoff targets are optional and permit only later explicit manual transfers within the original budget.
 Handoff preparation requires fresh consent; it starts no writer. Start is a separate command.
@@ -94,10 +121,24 @@ export async function runCli(
         json: { type: 'boolean' },
         home: { type: 'string' },
         help: { type: 'boolean', short: 'h' },
+        text: { type: 'string' },
+        role: { type: 'string' },
+        profile: { type: 'string' },
+        'credit-policy': { type: 'string' },
+        'model-request': { type: 'string' },
+        'context-refs': { type: 'string' },
+        attempts: { type: 'string' },
+        minutes: { type: 'string' },
+        concurrency: { type: 'string' },
+        'before-cursor': { type: 'string' },
+        'question-id': { type: 'string' },
+        'proposal-id': { type: 'string' },
+        'proposal-hash': { type: 'string' },
         title: { type: 'string' },
         outcome: { type: 'string' },
         criterion: { type: 'string', multiple: true },
         policy: { type: 'string' },
+        plan: { type: 'string' },
         grants: { type: 'string' },
         recipe: { type: 'string' },
         'test-file': { type: 'string', multiple: true },
@@ -106,11 +147,15 @@ export async function runCli(
         'existing-credits': { type: 'boolean' },
         'confirm-subscription-only': { type: 'boolean' },
         'permission-mode': { type: 'string' },
+        'maximum-task-ms': { type: 'string' },
+        'context-lines': { type: 'string', multiple: true },
         'handoff-target': { type: 'string', multiple: true },
         output: { type: 'string' },
+        endpoint: { type: 'string' },
+        authentication: { type: 'string' },
+        'observation-hash': { type: 'string' },
         family: { type: 'string' },
         consent: { type: 'boolean' },
-        'no-consent': { type: 'boolean' },
         'model-id': { type: 'string' },
         'thought-level-id': { type: 'string' },
         'confirm-quota-account': { type: 'boolean' },
@@ -130,11 +175,160 @@ export async function runCli(
             (['prepare-evaluation', 'prepare-repository', 'prepare-handoff'].includes(action) &&
               extra.length === 1))
         )) ||
-      !['project', 'task', 'native', 'usage', 'health', 'retry'].includes(area)
+      ![
+        'project',
+        'task',
+        'conversation',
+        'combined',
+        'local',
+        'native',
+        'usage',
+        'health',
+        'retry',
+      ].includes(area)
     )
       throw new Error('Unknown command. Use --help.');
+    const combined = area === 'combined';
+    if (combined) {
+      if (!['prepare', 'status', 'assemble'].includes(action) || !id)
+        throw new Error('Use combined prepare, status or assemble with one parent task ID.');
+      const allowed = new Set(['json', 'home', ...(action === 'prepare' ? ['plan'] : [])]);
+      if (Object.keys(values).some((key) => !allowed.has(key)))
+        throw new Error('This option does not apply to the combined action. Use --help.');
+      if (action === 'prepare' && !values.plan)
+        throw new Error('Supply the explicit --plan JSON file.');
+    } else if (values.plan !== undefined) throw new Error('Plan input requires combined prepare.');
+    const combinedPlan =
+      combined && action === 'prepare'
+        ? PrepareCombinedRunPayloadSchema.parse(readJson(values.plan as string))
+        : undefined;
+    if (combinedPlan && combinedPlan.taskId !== id)
+      throw new Error('The plan must name the same parent task ID.');
+    const local = area === 'local';
+    if (local) {
+      const takesId = action === 'cancel-input' || action === 'select-model';
+      if (
+        ![
+          'status',
+          'configure',
+          'connect',
+          'cancel-input',
+          'disconnect',
+          'refresh-models',
+          'select-model',
+        ].includes(action) ||
+        (takesId ? !id : id !== undefined)
+      )
+        throw new Error(
+          'Use local status, configure, connect, cancel-input, disconnect, refresh-models or select-model.',
+        );
+      const allowed = new Set([
+        'json',
+        'home',
+        ...(action === 'configure' ? ['endpoint', 'authentication'] : []),
+        ...(['connect', 'refresh-models'].includes(action) ? ['consent'] : []),
+        ...(action === 'select-model' ? ['observation-hash'] : []),
+      ]);
+      if (Object.keys(values).some((key) => !allowed.has(key)))
+        throw new Error('This option does not apply to the Local action. Use --help.');
+      if (['connect', 'refresh-models'].includes(action) && !values.consent)
+        throw new Error('This Local action requires explicit --consent.');
+      if (action === 'configure') {
+        LocalEndpointSchema.parse(values.endpoint);
+        if (values.authentication !== undefined) LocalAuthModeSchema.parse(values.authentication);
+      }
+      if (action === 'select-model')
+        LocalModelSelectionSchema.parse({
+          selectionId: id,
+          observationHash: values['observation-hash'],
+        });
+    } else if (
+      values.endpoint !== undefined ||
+      values.authentication !== undefined ||
+      values['observation-hash'] !== undefined
+    )
+      throw new Error('Endpoint, authentication and observation options require a Local action.');
+    const conversation = area === 'conversation';
+    const planning = conversation && ['create', 'configure'].includes(action);
+    const conversationOptions = [
+      'text',
+      'role',
+      'profile',
+      'credit-policy',
+      'model-request',
+      'context-refs',
+      'attempts',
+      'minutes',
+      'concurrency',
+      'before-cursor',
+      'question-id',
+      'proposal-id',
+      'proposal-hash',
+    ];
+    if (conversation) {
+      if (
+        !['create', 'show', 'send', 'answer', 'guide', 'adopt', 'configure'].includes(action) ||
+        !id
+      )
+        throw new Error(
+          'Use conversation create, show, send, answer, guide, adopt or configure with one ID.',
+        );
+      const allowed = new Set([
+        'json',
+        'home',
+        ...(planning
+          ? ['role', 'profile', 'credit-policy', 'attempts', 'minutes', 'concurrency', 'consent']
+          : []),
+        ...(['create', 'send', 'answer', 'guide'].includes(action) ? ['text', 'context-refs'] : []),
+        ...(action === 'configure' ? ['model-request'] : []),
+        ...(action === 'show' ? ['before-cursor'] : []),
+        ...(action === 'answer' ? ['question-id'] : []),
+        ...(action === 'adopt' ? ['proposal-id', 'proposal-hash'] : []),
+      ]);
+      if (Object.keys(values).some((key) => !allowed.has(key)))
+        throw new Error('This option does not apply to the conversation action. Use --help.');
+      if (['create', 'send', 'answer', 'guide'].includes(action) && !values.text?.trim())
+        throw new Error('Supply nonblank --text.');
+      if (action === 'answer' && !values['question-id'])
+        throw new Error('Answer requires --question-id.');
+      if (action === 'adopt' && (!values['proposal-id'] || !values['proposal-hash']))
+        throw new Error('Adopt requires the exact --proposal-id and --proposal-hash.');
+      if (planning && !values.consent) throw new Error('Planning requires explicit --consent.');
+    } else if (conversationOptions.some((key) => values[key as keyof typeof values] !== undefined))
+      throw new Error('Conversation options require a conversation action.');
+    const contextRefs =
+      values['context-refs'] !== undefined
+        ? ConversationContextRefsSchema.parse(readJson(values['context-refs']))
+        : undefined;
+    const planningSelection = planning
+      ? ConversationPlanningSelectionSchema.parse({
+          role: values.role,
+          profileId: values.profile,
+          creditPolicy: values['credit-policy'],
+          limits: Object.fromEntries(
+            ['attempts', 'minutes', 'concurrency'].map((key) => {
+              const value = values[key as 'attempts' | 'minutes' | 'concurrency'];
+              if (!value || !/^[1-9][0-9]*$/.test(value))
+                throw new Error(
+                  'Supply finite positive integer --attempts, --minutes and --concurrency.',
+                );
+              return [key, Number(value)];
+            }),
+          ),
+          consent: 'explicit',
+          ...(values['model-request'] !== undefined
+            ? {
+                modelRequest: ConversationModelRequestSchema.parse(
+                  readJson(values['model-request']),
+                ),
+              }
+            : {}),
+        })
+      : undefined;
     const supported = [
       'create',
+      'amend',
+      'pause',
       'list',
       'show',
       'watch',
@@ -169,21 +363,32 @@ export async function runCli(
     if (area === 'project' && (action !== 'add' || id === undefined))
       throw new Error('Use project add with one repository path.');
     const creatingTask = area === 'task' && action === 'create';
+    const amendingTask = area === 'task' && action === 'amend';
+    if (amendingTask || (area === 'task' && action === 'pause')) {
+      const allowed = new Set([
+        'json',
+        'home',
+        ...(amendingTask ? ['title', 'outcome', 'criterion'] : []),
+      ]);
+      if (Object.keys(values).some((key) => !allowed.has(key)))
+        throw new Error('This option does not apply to the task action. Use --help.');
+    }
     const addingProject = area === 'project' && action === 'add';
     if (
       !creatingTask &&
+      !amendingTask &&
       (values.title !== undefined || values.outcome !== undefined || values.criterion !== undefined)
     )
-      throw new Error('Title, outcome and criteria require task create.');
+      throw new Error('Title, outcome and criteria require task create or amend.');
     if (
-      creatingTask &&
+      (creatingTask || amendingTask) &&
       (!values.title?.trim() ||
         !values.outcome?.trim() ||
         !values.criterion?.length ||
         values.criterion.some((criterion) => !criterion.trim()))
     )
       throw new Error(
-        'Task creation requires a title, outcome and at least one nonblank criterion.',
+        'Task create and amend require a title, outcome and at least one nonblank criterion.',
       );
     if (addingProject && !id?.trim()) throw new Error('Supply a nonblank repository path.');
     if (area === 'health' && action !== undefined)
@@ -204,9 +409,7 @@ export async function runCli(
       throw new Error('Use native profiles, import-google or setup.');
     if (
       settingUpGoogle &&
-      (values.family !== 'google' ||
-        values['no-consent'] ||
-        (['show', 'stop'].includes(id ?? '') && values.consent))
+      (values.family !== 'google' || (['show', 'stop'].includes(id ?? '') && values.consent))
     )
       throw new Error(
         'Use native setup with --family google. Consent applies only to initialize, authenticate or discover.',
@@ -223,17 +426,17 @@ export async function runCli(
       !refreshingUsage &&
       !settingUpGoogle &&
       !importingGoogle &&
-      (values.family !== undefined ||
-        values.consent !== undefined ||
-        values['no-consent'] !== undefined)
+      !planning &&
+      !local &&
+      (values.family !== undefined || values.consent !== undefined)
     )
-      throw new Error('Quota family and consent options require usage refresh.');
+      throw new Error('Family and consent options do not apply to this command.');
     if (refreshingUsage && values.family !== 'google')
       throw new Error('Quota refresh requires --family google.');
-    if (importingGoogle && (values.family !== undefined || values['no-consent']))
+    if (refreshingUsage && values.consent !== undefined)
+      throw new Error('Quota refresh does not take consent.');
+    if (importingGoogle && values.family !== undefined)
       throw new Error('Use native import-google --consent.');
-    if (values.consent && values['no-consent'])
-      throw new Error('Choose --consent or --no-consent.');
     const preparingFile = area === 'task' && action === 'prepare-native';
     const preparingRepository = area === 'task' && action === 'prepare-repository';
     const preparing = preparingFile || preparingRepository;
@@ -262,6 +465,10 @@ export async function runCli(
     const evaluating = area === 'task' && action === 'prepare-evaluation';
     if (values['confirm-subscription-only'] && !preparingFile && !preparingHandoff)
       throw new Error('Subscription confirmation requires task prepare-native or prepare-handoff.');
+    if (values['context-lines'] !== undefined && !preparingFile)
+      throw new Error('Target context lines require task prepare-native.');
+    if (values['maximum-task-ms'] !== undefined && !preparingFile)
+      throw new Error('The task deadline option requires task prepare-native.');
     if (values['permission-mode'] !== undefined && !preparingFile && !preparingHandoff)
       throw new Error('Permission mode requires task prepare-native or prepare-handoff.');
     if (!evaluating && (values.recipe !== undefined || values['test-file'] !== undefined))
@@ -338,28 +545,41 @@ export async function runCli(
     }
     const actor = { id: 'terminal', kind: 'cli' as const };
     const creation =
-      addingProject || creatingTask
+      addingProject || creatingTask || (conversation && action === 'create')
         ? CommandSchema.safeParse({
             protocol: 1,
             key: createCommandKey(),
             actor,
             expectedRevision: 0,
-            command: addingProject ? 'RegisterProject' : 'CreateTask',
+            command: addingProject
+              ? 'RegisterProject'
+              : creatingTask
+                ? 'CreateTask'
+                : 'CreateTaskDiscussion',
             payload: addingProject
               ? { path: resolve(id) }
-              : {
-                  projectId: id,
-                  title: values.title,
-                  outcome: values.outcome,
-                  criteria: values.criterion,
-                },
+              : conversation
+                ? {
+                    projectId: id,
+                    text: values.text,
+                    planning: planningSelection,
+                    ...(contextRefs !== undefined ? { context: contextRefs } : {}),
+                  }
+                : {
+                    projectId: id,
+                    title: values.title,
+                    outcome: values.outcome,
+                    criteria: values.criterion,
+                  },
           })
         : undefined;
     if (creation && !creation.success)
       throw new Error(
         addingProject
           ? 'Repository paths must contain 1 to 4096 characters.'
-          : 'Use a project ID, a title up to 200 characters, an outcome up to 4096 characters and 1 to 100 criteria up to 4096 characters each.',
+          : conversation
+            ? 'Use a project ID, a goal up to 4096 encoded bytes and the explicit planning selection.'
+            : 'Use a project ID, a title up to 200 characters, an outcome up to 4096 characters and 1 to 100 criteria up to 4096 characters each.',
       );
     const connected = await connectController({ ...readControllerEndpoint(home), actor });
     client = connected;
@@ -380,7 +600,7 @@ export async function runCli(
       return connected.command(sent);
     };
     const print = (data: unknown, text: string) =>
-      output.out(values.json ? `${JSON.stringify(data)}\n` : `${text}\n`);
+      output.out(values.json ? `${JSON.stringify(data)}\n` : `${terminalText(text)}\n`);
     const receipt = (
       result: CommandResult,
       command = sent,
@@ -390,7 +610,8 @@ export async function runCli(
       const created =
         succeeded(result) && command?.command === 'RegisterProject'
           ? ProjectSchema.safeParse(result.entity)
-          : succeeded(result) && command?.command === 'CreateTask'
+          : succeeded(result) &&
+              (command?.command === 'CreateTask' || command?.command === 'CreateTaskDiscussion')
             ? TaskSchema.safeParse(result.entity)
             : undefined;
       print(
@@ -416,7 +637,7 @@ export async function runCli(
           pending.data.state === 'waiting' &&
           pending.data.waitingReason === 'approval'
         ) {
-          const fresh = await connected.snapshot();
+          const fresh = await connected.snapshot({ taskId: command.payload.taskId });
           const task = fresh.tasks.find((value) => value.id === command.payload.taskId);
           const candidate = fresh.candidates.filter((value) => value.taskId === task?.id).at(-1);
           const action =
@@ -550,14 +771,7 @@ export async function runCli(
       return succeeded(result) ? 0 : 2;
     }
     if (refreshingUsage) {
-      const result = await request(
-        'ObserveUsage',
-        {
-          family: 'google',
-          ...(values.consent ? { consent: true } : values['no-consent'] ? { consent: false } : {}),
-        },
-        0,
-      );
+      const result = await request('ObserveUsage', { family: 'google' }, 0);
       print(
         { command: sent, result },
         terminalText(
@@ -566,7 +780,61 @@ export async function runCli(
       );
       return succeeded(result) ? 0 : 2;
     }
-    const snapshot = await client.snapshot();
+    const snapshot = await client.snapshot(
+      (area === 'task' || conversation || combined) && id
+        ? action === 'approve' || action === 'deny'
+          ? { approvalId: id }
+          : { taskId: id }
+        : undefined,
+    );
+    if (combined) {
+      const task = requireTask(snapshot, id as string);
+      const group =
+        snapshot.combinedRuns.find(
+          (value) => value.taskId === task.id && value.runId === task.runId,
+        ) ?? null;
+      if (action === 'status') {
+        print(
+          { cursor: snapshot.cursor, combined: group },
+          group
+            ? [
+                `Combined run ${group.runId}, revision ${group.revision}, generation ${group.generation}`,
+                `Preparation ${group.preparationId}, manifest ${group.manifestHash}`,
+                `Phase ${group.phase}, blocker ${group.blocker ?? 'none'}`,
+                ...group.members.map(
+                  (member) =>
+                    `Child ${member.taskId}, run ${member.runId}, scope ${member.scope[0]}, start ${member.start.reason}`,
+                ),
+                ...group.dispatches.map(
+                  (dispatch) =>
+                    `${dispatch.phase}: ${dispatch.state}, ${dispatch.maximumMinutes} minutes, attempt ${dispatch.attemptId ?? 'none'}, check ${dispatch.checkArtifactId ?? 'none'}`,
+                ),
+                `Candidate ${group.candidate ? `${group.candidate.id} ${group.candidate.hash}` : 'none'}`,
+                `Remaining ${group.remainingBudgets.attempts} attempts, ${group.remainingBudgets.minutes} minutes, ${group.remainingBudgets.concurrency} slots`,
+                ...(['start', 'assemble', 'evaluate', 'review', 'accept'] as const).map(
+                  (name) => `${name}: ${group[name].reason}`,
+                ),
+              ].join('\n')
+            : 'No combined run is prepared for the current task.',
+        );
+        return 0;
+      }
+      if (combinedPlan)
+        return await finishAction(await request('PrepareCombinedRun', combinedPlan, task.revision));
+      if (!group?.assemble.available)
+        throw new Error(`Assembly unavailable: ${group?.assemble.reason ?? 'not-prepared'}.`);
+      return await finishAction(
+        await request(
+          'AssembleCombinedCandidate',
+          {
+            taskId: task.id,
+            runId: group.runId,
+            preparationId: group.preparationId,
+          },
+          task.revision,
+        ),
+      );
+    }
     if (area === 'usage') {
       print(
         { cursor: snapshot.cursor, usageReaders: snapshot.usageReaders, usage: snapshot.usage },
@@ -574,7 +842,7 @@ export async function runCli(
           [
             ...snapshot.usageReaders.map(
               (reader) =>
-                `${reader.family} quota reader  ${reader.enabled ? 'enabled' : 'disabled'}  ${reader.reason}  last attempt ${reader.lastAttemptAt ?? 'none'}  last observed ${reader.lastObservedAt ?? 'none'}`,
+                `${reader.family} quota reader  ${reader.reason}  last attempt ${reader.lastAttemptAt ?? 'none'}  last observed ${reader.lastObservedAt ?? 'none'}`,
             ),
             ...snapshot.usage.map(
               ({ observation, state }) =>
@@ -586,6 +854,80 @@ export async function runCli(
       return 0;
     }
 
+    if (local) {
+      const setup = snapshot.localSetup;
+      if (action === 'status') {
+        const profile =
+          snapshot.nativeProfiles.find((value) => value.id === 'local-file-v1') ?? null;
+        print(
+          { cursor: snapshot.cursor, setup: setup ?? null, profile },
+          setup
+            ? [
+                `Local revision ${setup.revision}, connection revision ${setup.connectionRevision}`,
+                `Endpoint ${setup.endpoint ?? 'not configured'}`,
+                `Authentication ${setup.authMode === 'none' ? 'No authentication, this device only' : 'Dedicated token'}`,
+                `Connection ${(setup.connected ?? setup.secretConfigured) ? 'connected' : 'required'}`,
+                `Operation ${setup.operation ? `${setup.operation.kind} ${setup.operation.state} ${setup.operation.operationId}` : 'none'}`,
+                `Generation ${setup.generation}`,
+                `Reason ${setup.reason ?? 'none'}`,
+                `Observation ${setup.observation?.observationHash ?? 'none'}`,
+                `Selected ${setup.selection?.selectionId ?? 'none'}`,
+                ...(setup.observation?.models.map(
+                  (choice) =>
+                    `${choice.selectionId}  ${choice.identity.displayName}  ${choice.identity.format}  ${choice.state}  ${choice.qualification}${choice.reasons.length ? `  ${choice.reasons.join(', ')}` : ''}`,
+                ) ?? []),
+              ].join('\n')
+            : 'Local controls are unavailable in this controller.',
+        );
+        return 0;
+      }
+      if (!setup) throw new Error('Local controls are unavailable in this controller.');
+      if (
+        action === 'cancel-input' &&
+        (setup.operation?.kind !== 'input' || setup.operation.operationId !== id)
+      )
+        throw new Error(
+          'The input operation changed. Read Local status and cancel its exact operation ID.',
+        );
+      if (
+        action === 'select-model' &&
+        (!setup.observation ||
+          setup.observation.observationHash !== values['observation-hash'] ||
+          !setup.observation.models.some((choice) => choice.selectionId === id))
+      )
+        throw new Error(
+          'The observed model choice changed. Read Local status before selecting it.',
+        );
+      const names = {
+        configure: 'ConfigureLocal',
+        connect: 'BeginLocalConnectionInput',
+        'cancel-input': 'CancelLocalConnectionInput',
+        disconnect: 'DisconnectLocal',
+        'refresh-models': 'RefreshLocalModels',
+        'select-model': 'SelectLocalModel',
+      } as const;
+      const result = await request(
+        names[action as keyof typeof names],
+        action === 'configure'
+          ? {
+              endpoint: values.endpoint,
+              ...(values.authentication !== undefined ? { authMode: values.authentication } : {}),
+            }
+          : action === 'cancel-input'
+            ? { operationId: id }
+            : action === 'select-model'
+              ? { selectionId: id, observationHash: values['observation-hash'] }
+              : action === 'disconnect'
+                ? {}
+                : { consent: 'explicit' },
+        setup.revision,
+      );
+      print(
+        { command: sent, result },
+        `${result.reason ?? result.outcome}${result.next ? `\nNext: ${result.next}` : ''}\nCommand key ${sent?.key}`,
+      );
+      return succeeded(result) ? 0 : 2;
+    }
     if (settingUpGoogle) {
       const setup = snapshot.googleAcpSetup;
       if (id === 'show') {
@@ -628,7 +970,7 @@ export async function runCli(
         snapshot.nativeProfiles
           .map((profile) =>
             profile.family === 'local'
-              ? `${profile.id}  ${profile.model}  local resources  native launch unavailable`
+              ? `${profile.id}  ${profile.model}  local resources  ${profile.available ? 'available' : profile.reason}  ${profile.qualifiedAt ? `qualified ${profile.qualifiedAt}` : 'qualification pending'}`
               : profile.family !== 'openai'
                 ? `${profile.id}  ${profile.model}  ${profile.effort} requested effort  effective effort unknown  account class unknown  service tier unknown  ${profile.available ? 'available' : profile.reason}  ${profile.qualifiedAt ? `qualified ${profile.qualifiedAt}` : 'qualification pending'}  billing requires user attestation${profile.family === 'google' ? `  permission modes ${profile.permissionModes.join(', ')}` : ''}`
                 : profile.id === 'openai-repository-v1'
@@ -687,6 +1029,72 @@ export async function runCli(
     }
     if (!id) throw new Error('A task ID is required.');
     const task = requireTask(snapshot, id);
+    if (amendingTask) {
+      const result = await request(
+        'AmendTask',
+        {
+          taskId: task.id,
+          title: values.title,
+          outcome: values.outcome,
+          criteria: values.criterion,
+        },
+        task.revision,
+      );
+      receipt(result);
+      return succeeded(result) ? 0 : 2;
+    }
+    if (conversation) {
+      if (action === 'show') {
+        const status = await request('GetTaskConversationState', { taskId: task.id });
+        if (!succeeded(status) || status.data?.kind !== 'conversation-state') {
+          receipt(status);
+          return 2;
+        }
+        const history = await request('GetTaskConversation', {
+          taskId: task.id,
+          ...(values['before-cursor'] !== undefined
+            ? { beforeCursor: values['before-cursor'] }
+            : {}),
+        });
+        if (!succeeded(history) || history.data?.kind !== 'conversation') {
+          receipt(history);
+          return 2;
+        }
+        if (status.data.state.taskId !== task.id || history.data.taskId !== task.id)
+          throw new Error('The conversation response belongs to a different task.');
+        print(
+          { state: status.data.state, conversation: history.data },
+          [
+            conversationStateText(status.data.state),
+            ...history.data.entries.map(conversationEntryText),
+            `Older page before ${history.data.nextBeforeCursor ?? 'none'}`,
+          ].join('\n'),
+        );
+        return 0;
+      }
+      const names = {
+        configure: 'ConfigureTaskConversation',
+        send: 'SendTaskMessage',
+        answer: 'AnswerTaskQuestion',
+        guide: 'QueueTaskGuidance',
+        adopt: 'AdoptTaskPlan',
+      } as const;
+      const result = await request(
+        names[action as keyof typeof names],
+        {
+          taskId: task.id,
+          ...(planningSelection ? { planning: planningSelection } : {}),
+          ...(values.text !== undefined ? { text: values.text } : {}),
+          ...(contextRefs !== undefined ? { context: contextRefs } : {}),
+          ...(action === 'answer' ? { questionId: values['question-id'] } : {}),
+          ...(action === 'adopt'
+            ? { proposalId: values['proposal-id'], proposalHash: values['proposal-hash'] }
+            : {}),
+        },
+        task.revision,
+      );
+      return await finishAction(result);
+    }
     if (action === 'prepare-evaluation') {
       const profile = snapshot.nativeProfiles.find((profile) => profile.id === extra[0]);
       if (profile && profile.id !== 'openai-file-v1')
@@ -694,14 +1102,25 @@ export async function runCli(
       const run = snapshot.runs.find((run) => run.id === task.runId);
       const candidate = snapshot.candidates.filter((value) => value.taskId === task.id).at(-1);
       const methods = run?.policy.policy.methods ?? [];
+      const combined = snapshot.combinedRuns.find(
+        (value) => value.taskId === task.id && value.runId === run?.id,
+      );
       if (
         !profile?.available ||
         !run ||
         !candidate ||
         task.state !== 'stopped' ||
-        !snapshot.nativeRuns.some((value) => value.runId === run.id)
+        (combined
+          ? run.taskId !== task.id ||
+            combined.phase !== 'awaiting-evaluation' ||
+            !combined.evaluate.available ||
+            combined.candidate?.id !== candidate.id ||
+            combined.candidate.hash !== candidate.hash
+          : !snapshot.nativeRuns.some((value) => value.runId === run.id))
       )
-        throw new Error('A stopped native candidate and available reviewer profile are required.');
+        throw new Error(
+          'A stopped native or current combined candidate and available reviewer profile are required.',
+        );
       if (methods.length !== 1 || methods[0].id !== 'keep-it-simple' || methods[0].cycles !== 1)
         throw new Error(
           'Evaluation requires the saved single keep-it-simple method and one cycle.',
@@ -709,6 +1128,16 @@ export async function runCli(
       const creditPolicy = values['existing-credits'] ? 'existing-credits' : 'ordinary';
       if (!profile.creditPolicies.some((value) => value === creditPolicy))
         throw new Error('This reviewer profile does not support the selected credit policy.');
+      if (
+        combined &&
+        canonicalJson({
+          recipeId: checkRecipe.checkRecipeId,
+          testFiles: 'testFiles' in checkRecipe ? checkRecipe.testFiles : [],
+          reviewer: { profileId: profile.id, methodId: methods[0].id, cycles: 1 },
+          creditPolicy,
+        }) !== canonicalJson(combined.evaluationSelection)
+      )
+        throw new Error('Use the combined run’s saved recipe, test files and reviewer selection.');
       return await finishAction(
         await request(
           'PrepareCandidateEvaluation',
@@ -853,7 +1282,38 @@ export async function runCli(
     }
     if (action === 'prepare-native') {
       const profile = snapshot.nativeProfiles.find((profile) => profile.id === extra[0]);
-      if (profile?.family === 'local') throw new Error('Local native launch is unavailable.');
+      if (values['context-lines'] !== undefined && profile?.id !== 'google-acp-v1')
+        throw new Error('Target context lines require the Google ACP profile.');
+      if (values['maximum-task-ms'] !== undefined && profile?.id !== 'google-acp-v1')
+        throw new Error('The task deadline option requires the Google ACP profile.');
+      if (profile?.family === 'local') {
+        if (!profile.available) throw new Error(`Native profile unavailable: ${profile.reason}.`);
+        if (
+          values['existing-credits'] ||
+          values['confirm-subscription-only'] ||
+          values['permission-mode'] !== undefined ||
+          handoffTargets ||
+          values['model-id'] !== undefined ||
+          values['thought-level-id'] !== undefined ||
+          values['confirm-quota-account']
+        )
+          throw new Error(
+            'Local preparation uses the selected observed model, with no billing, effort or handoff options.',
+          );
+        return await finishAction(
+          await request(
+            'PrepareNativeRun',
+            {
+              taskId: task.id,
+              profileId: profile.id,
+              targetPath: extra[1],
+              policy: PolicySchema.parse(readJson(values.policy as string)),
+              consent: values['native-trust'] && values['source-consent'] ? 'explicit' : 'saved',
+            },
+            task.revision,
+          ),
+        );
+      }
       if (profile?.id === 'openai-repository-v1')
         throw new Error('Use task prepare-repository for repository work.');
       if (!profile?.available)
@@ -867,6 +1327,21 @@ export async function runCli(
       )
         throw new Error('These configuration choices require the Google ACP profile.');
       if (acp) {
+        const contextValues = values['context-lines'];
+        if (
+          contextValues &&
+          (contextValues.length !== 1 || !/^[1-9][0-9]*:[1-9][0-9]*$/.test(contextValues[0] ?? ''))
+        )
+          throw new Error('Choose one inclusive target line window as START:END.');
+        const contextLines = contextValues
+          ? NativeTargetContextLinesSchema.parse({
+              start: Number(contextValues[0]?.split(':')[0]),
+              end: Number(contextValues[0]?.split(':')[1]),
+            })
+          : undefined;
+        const maximumTaskMs = values['maximum-task-ms'];
+        if (maximumTaskMs !== undefined && !['300000', '600000'].includes(maximumTaskMs))
+          throw new Error('Choose a Google task deadline of 300000 or 600000 milliseconds.');
         const setup = snapshot.googleAcpSetup;
         const configuration = profile.configOptions;
         const saved = snapshot.nativeRuns.find(
@@ -936,6 +1411,8 @@ export async function runCli(
               creditPolicy: 'ordinary',
               consent: explicit ? 'explicit' : 'saved',
               proofId: setup.proofId,
+              ...(maximumTaskMs === undefined ? {} : { maximumTaskMs: Number(maximumTaskMs) }),
+              ...(contextLines === undefined ? {} : { contextLines }),
               modelId,
               thoughtLevelId,
               billingAttestation: attestation,
@@ -1058,10 +1535,14 @@ export async function runCli(
       const repositoryText = nativeRun?.repository
         ? `\nRepository ${nativeRun.repository.files} files, ${nativeRun.repository.bytes} bytes\nSource base ${nativeRun.repository.sourceBase}\nManifest ${nativeRun.repository.manifestHash}\nNative sandbox ${nativeRun.execution?.sandbox}\nNative approval ${nativeRun.execution?.approvalPolicy}\nNative network ${nativeRun.execution?.networkAccess === false ? 'off' : 'unknown'}\nExpires ${nativeRun.expiresAt ?? 'unknown'}`
         : '';
+      const localModel = nativeRun?.localModel;
+      const localModelText = localModel
+        ? `\nModel ${localModel.modelKey}\nInstance ${localModel.instanceReference}\nModel bytes ${localModel.modelSizeBytes}\nSetup ${localModel.setupHash}${'identityKind' in localModel ? `\nIdentity runtime metadata, ${localModel.format}\nMetadata ${localModel.metadataHash}\nConnection ${localModel.connectionHash}, revision ${localModel.connectionRevision}` : `\nIdentity retained artifact, ${localModel.artifactSha256}\nQuantization ${localModel.quantization}`}`
+        : '';
       const preview = nativeRun?.repository
         ? `\nNative ${nativeRun.profileId}, ${nativeRun.stage}${repositoryText}`
         : nativeRun
-          ? `\nNative ${nativeRun.profileId}, ${nativeRun.stage}\nTarget ${nativeRun.target?.path ?? 'unknown'}\nBase hash ${nativeRun.target?.baseHash ?? 'unknown'}\nBytes ${nativeRun.target?.bytes ?? 'unknown'}\nExpires ${nativeRun.expiresAt ?? 'unknown'}\nSource base ${run?.source.base ?? 'unknown'}${billingText}${permissionText}`
+          ? `\nNative ${nativeRun.profileId}, ${nativeRun.stage}\nTarget ${nativeRun.target?.path ?? 'unknown'}\nBase hash ${nativeRun.target?.baseHash ?? 'unknown'}\nBytes ${nativeRun.target?.bytes ?? 'unknown'}\nExpires ${nativeRun.expiresAt ?? 'unknown'}\nSource base ${run?.source.base ?? 'unknown'}${billingText}${permissionText}${localModelText}`
           : '';
       const handoffText = nativeRun?.handoff
         ? `\nManual handoff generation ${nativeRun.handoff.generation}\nAllowed recipients ${nativeRun.handoff.targets.map((value) => `${value.profileId}:${value.creditPolicy}`).join(', ')}\nPrepare ${nativeRun.handoff.prepare.reason}\nOriginal limits ${run?.policy.policy.limits.attempts ?? 'unknown'} attempts, ${run?.policy.policy.limits.minutes ?? 'unknown'} minutes${nativeRun.handoff.pending ? `\nPending recipient ${nativeRun.handoff.pending.recipient.profileId}:${nativeRun.handoff.pending.recipient.creditPolicy}\nPreparation ${nativeRun.handoff.pending.preparationId}\nPacket ${nativeRun.handoff.pending.packetId}\nRetained unverified base ${nativeRun.handoff.pending.baseHash}, ${nativeRun.handoff.pending.bytes} bytes\nExpires ${nativeRun.handoff.pending.expiresAt}\nStart ${nativeRun.handoff.pending.start.reason}` : ''}`
@@ -1142,61 +1623,75 @@ export async function runCli(
       return 0;
     }
     if (action === 'watch') {
-      const approvals = snapshot.approvals.filter(
-        (value) => value.taskId === task.id && value.status === 'pending',
-      );
-      print(
-        { type: 'snapshot', cursor: snapshot.cursor, task, approvals },
-        terminalText(
-          `${snapshot.cursor} ${task.state}, revision ${task.revision}${task.next ? `\nNext: ${task.next}` : ''}${approvalText(approvals)}`,
-        ),
-      );
-      const unsubscribe = await client.subscribe(
-        snapshot.cursor,
-        (event) => {
-          if (event.taskId === task.id)
-            print(
-              event,
-              terminalText(
-                `${event.cursor} ${event.type}, revision ${event.revision}${event.type === 'approval.requested' ? approvalText([event.payload]) : event.type === 'task.updated' && event.payload.next ? `\nNext: ${event.payload.next}` : ''}`,
-              ),
-            );
-        },
-        (fresh) => {
-          const current = fresh.tasks.find((item) => item.id === task.id);
-          if (current) {
-            const approvals = fresh.approvals.filter(
-              (value) => value.taskId === current.id && value.status === 'pending',
-            );
-            print(
-              { type: 'snapshot', cursor: fresh.cursor, task: current, approvals },
-              terminalText(
-                `${fresh.cursor} ${current.state}, revision ${current.revision}${current.next ? `\nNext: ${current.next}` : ''}${approvalText(approvals)}`,
-              ),
-            );
-          }
-        },
-      );
-      const stopConnection = client.onConnection((state) => {
-        if (state === 'offline')
-          output.err('Controller offline. The last event cursor is retained.\n');
-      });
       const waiting = Promise.withResolvers<number>();
-      const stop = () => waiting.resolve(0);
-      const stopExhausted = client.onReconnectExhausted(() => {
-        output.err('Reconnect attempts ended. Start the controller, then run task watch again.\n');
-        waiting.resolve(1);
-      });
+      let stopped = false;
+      const stop = () => {
+        stopped = true;
+        waiting.resolve(0);
+        // Closing the client also settles a subscription still being initialized.
+        client?.close();
+      };
+      let unsubscribe: (() => void) | undefined;
+      let stopConnection: (() => void) | undefined;
+      let stopExhausted: (() => void) | undefined;
       process.once('SIGINT', stop);
       process.once('SIGTERM', stop);
       try {
+        const approvals = snapshot.approvals.filter(
+          (value) => value.taskId === task.id && value.status === 'pending',
+        );
+        print(
+          { type: 'snapshot', cursor: snapshot.cursor, task, approvals },
+          terminalText(
+            `${snapshot.cursor} ${task.state}, revision ${task.revision}${task.next ? `\nNext: ${task.next}` : ''}${approvalText(approvals)}`,
+          ),
+        );
+        unsubscribe = await client.subscribe(
+          snapshot.cursor,
+          (event) => {
+            if (event.taskId === task.id)
+              print(
+                event,
+                terminalText(
+                  `${event.cursor} ${event.type}, revision ${event.revision}${event.type === 'approval.requested' ? approvalText([event.payload]) : event.type === 'task.updated' && event.payload.next ? `\nNext: ${event.payload.next}` : ''}`,
+                ),
+              );
+          },
+          (fresh) => {
+            const current = fresh.tasks.find((item) => item.id === task.id);
+            if (current) {
+              const approvals = fresh.approvals.filter(
+                (value) => value.taskId === current.id && value.status === 'pending',
+              );
+              print(
+                { type: 'snapshot', cursor: fresh.cursor, task: current, approvals },
+                terminalText(
+                  `${fresh.cursor} ${current.state}, revision ${current.revision}${current.next ? `\nNext: ${current.next}` : ''}${approvalText(approvals)}`,
+                ),
+              );
+            }
+          },
+        );
+        stopConnection = client.onConnection((state) => {
+          if (state === 'offline' && !stopped)
+            output.err('Controller offline. The last event cursor is retained.\n');
+        });
+        stopExhausted = client.onReconnectExhausted(() => {
+          output.err(
+            'Reconnect attempts ended. Start the controller, then run task watch again.\n',
+          );
+          waiting.resolve(1);
+        });
         return await waiting.promise;
+      } catch (error) {
+        if (stopped) return 0;
+        throw error;
       } finally {
         process.off('SIGINT', stop);
         process.off('SIGTERM', stop);
-        stopExhausted();
-        unsubscribe();
-        stopConnection();
+        stopExhausted?.();
+        unsubscribe?.();
+        stopConnection?.();
       }
     }
     if (!task.runId)
@@ -1210,7 +1705,12 @@ export async function runCli(
       receipt(result);
       return succeeded(result) ? 0 : 2;
     }
-    const names = { start: 'StartRun', stop: 'StopRun', resume: 'ResumeRun' } as const;
+    const names = {
+      start: 'StartRun',
+      pause: 'PauseAdmissions',
+      stop: 'StopRun',
+      resume: 'ResumeRun',
+    } as const;
     const result = await request(
       names[action as keyof typeof names],
       { taskId: task.id, runId: task.runId },
@@ -1219,11 +1719,52 @@ export async function runCli(
     receipt(result);
     return succeeded(result) ? 0 : 2;
   } catch (error) {
-    output.err(`${error instanceof Error ? error.message : 'CLI command failed.'}\n`);
+    output.err(`${terminalText(error instanceof Error ? error.message : 'CLI command failed.')}\n`);
     return 1;
   } finally {
     client?.close();
   }
+}
+
+function conversationStateText(state: TaskConversationState) {
+  const configuration = state.configuration;
+  const choices = state.modelChoices;
+  return [
+    `${state.taskId} ${state.phase}, revision ${state.revision}, contract ${state.contractStatus}`,
+    configuration
+      ? `Primary ${configuration.selection.role}, ${configuration.selection.profileId}, ${configuration.routeId ?? 'route unknown'}, credits ${configuration.selection.creditPolicy}\nRequested model ${configuration.requestedModel ?? 'unknown'}, effective model ${configuration.effectiveModel ?? 'unknown'}\nRequested effort ${configuration.requestedEffort ?? 'unknown'}, effective effort ${configuration.effectiveEffort ?? 'unknown'}`
+      : 'Primary not configured',
+    `Model choices ${choices?.status ?? 'not-observed'}: ${choices?.reason ?? 'not-observed'}`,
+    `Choices observed at ${choices?.observedAt ?? 'none'}`,
+    choices?.observation
+      ? `Observation artifact ${choices.observation.artifactId}, hash ${choices.observation.hash}`
+      : 'Observation none',
+    ...(choices?.models.map(
+      (choice) =>
+        `Observed model ${choice.model}, efforts ${JSON.stringify(choice.efforts)}, default effort ${choice.defaultEffort}`,
+    ) ?? []),
+    state.budget
+      ? `Task limits ${JSON.stringify(state.budget.limits)}\nRemaining ${JSON.stringify(state.budget.remaining)}`
+      : 'Task budget not configured',
+    `Send ${state.send.available ? state.send.disposition : 'unavailable'}: ${state.send.reason}`,
+    `Adopt ${state.adopt.available ? 'available' : 'unavailable'}: ${state.adopt.reason}`,
+    `Current run ${state.currentRunId ?? 'none'}`,
+    ...(state.activeAttempt
+      ? [
+          `Active attempt ${state.activeAttempt.id}, generation ${state.activeAttempt.generation}, ${state.activeAttempt.state}`,
+        ]
+      : []),
+    `Queued inputs ${state.queuedInputCount}`,
+    ...state.pendingQuestions.map((question) => `Pending question ${question.id}`),
+    ...(state.proposal ? [`Proposal ${state.proposal.id}, hash ${state.proposal.hash}`] : []),
+    ...(state.adoptedProposal
+      ? [`Adopted proposal ${state.adoptedProposal.id}, hash ${state.adoptedProposal.hash}`]
+      : []),
+  ].join('\n');
+}
+
+function conversationEntryText(entry: ConversationEntry) {
+  return `${entry.cursor} ${entry.id} ${entry.kind} ${entry.author.kind === 'agent' ? `${entry.author.role} ${entry.author.routeId}` : entry.author.kind}\n${entry.text}${'replyTo' in entry ? `\nReply to ${entry.replyTo}` : ''}${entry.kind === 'plan-proposal' ? `\n${JSON.stringify(entry.proposal, null, 2)}` : ''}`;
 }
 
 function approvalText(approvals: Snapshot['approvals']) {

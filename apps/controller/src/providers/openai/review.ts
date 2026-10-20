@@ -4,6 +4,7 @@ import {
   ArtifactIdSchema,
   AttemptIdSchema,
   CandidateIdSchema,
+  CombinedNativeReviewJobSchema,
   HashSchema,
   NativeTargetPathSchema,
   RouteIdSchema,
@@ -13,12 +14,23 @@ import {
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
 import type { NativeLaunch } from './native-discovery.ts';
-import { StructuredTranscript, type startReplacement, startStructuredTask } from './replacement.ts';
+import {
+  StructuredTranscript,
+  type startReplacement,
+  startStructuredTask,
+  type TranscriptOptions,
+} from './replacement.ts';
 
 const MAX_CONTENT = 65_536;
 const MAX_FILE_INPUT = 256 * 1024;
 const MAX_REPOSITORY_CONTENT = 256 * 1024;
-const MAX_REPOSITORY_INPUT = 384 * 1024;
+// Both full sides of a 188 KB file need 382 KiB before any edit. The client echoes the
+// review text twice, so the structured transcript bounds in replacement.ts must cover it.
+const MAX_REPOSITORY_INPUT = 448 * 1024;
+export const repositoryReviewBudget = {
+  fileBytes: MAX_REPOSITORY_CONTENT,
+  totalBytes: MAX_REPOSITORY_INPUT,
+} as const;
 const utf8 = (value: string, limit = MAX_CONTENT) =>
   value.isWellFormed() && !value.includes('\0') && Buffer.byteLength(value, 'utf8') <= limit;
 const content = z
@@ -30,7 +42,7 @@ const message = z
   .min(1)
   .max(4096)
   .refine((value) => utf8(value, 4096));
-const binding = z.strictObject({
+const legacyBinding = z.strictObject({
   preparationId: ArtifactIdSchema,
   scopeHash: HashSchema,
   taskId: TaskIdSchema,
@@ -50,6 +62,10 @@ const binding = z.strictObject({
   scripted: z.literal(false),
   independence: z.literal('process-only'),
 });
+const binding = z.union([
+  legacyBinding,
+  CombinedNativeReviewJobSchema.safeExtend({ scopeHash: HashSchema }),
+]);
 const commonInput = {
   binding,
   model: z.literal('gpt-6.1-sol'),
@@ -65,6 +81,7 @@ const commonInput = {
 const { context: taskContext, ...sessionInput } = commonInput;
 const fileInput = z.strictObject({
   ...sessionInput,
+  binding: legacyBinding,
   path: NativeTargetPathSchema,
   baseHash: HashSchema,
   original: content,
@@ -143,6 +160,10 @@ export function reviewPlan(value: z.input<typeof input>) {
   const valid =
     'repository' in data
       ? data.repository.candidateManifestHash === data.binding.candidateHash &&
+        (!('origin' in data.binding) ||
+          (data.repository.sourceBase === data.binding.origin.sourceBase &&
+            data.repository.sourceManifestHash === data.binding.origin.sourceManifestHash &&
+            hashCanonical(data.context.criteria) === data.binding.origin.criteriaHash)) &&
         data.repository.changes.every(
           (change, index, changes) =>
             (index === 0 || changes[index - 1].path < change.path) &&
@@ -163,7 +184,7 @@ export function reviewPlan(value: z.input<typeof input>) {
 }
 
 export class ReviewTranscript extends StructuredTranscript<{ review: NativeReview }> {
-  constructor(plan: ReviewPlan, options: { now: () => number; timeoutMs: number }) {
+  constructor(plan: ReviewPlan, options: TranscriptOptions) {
     const trusted = reviewPlan(plan);
     const bindingHash = hashCanonical(trusted.binding);
     super(trusted, options, {

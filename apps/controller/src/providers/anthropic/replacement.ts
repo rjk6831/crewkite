@@ -17,12 +17,14 @@ import {
   AttemptIdSchema,
   HashSchema,
   NativeTargetPathSchema,
+  type Observation,
   SealedHandoffPacketSchema,
 } from '@crewkite/contracts';
 import { verifyHandoff } from '@crewkite/contracts/hash';
 import { z } from 'zod';
 import { groupAbsent, type Schedule } from '../../host/worker.ts';
 import {
+  armOwnedCleanup,
   type NativeLifecycle,
   nativeAuthEnvironment,
   nativeSynchronousHook,
@@ -53,6 +55,7 @@ type Failure =
   | 'storage'
   | 'environment'
   | 'launch'
+  | 'provider'
   | 'protocol'
   | 'limit'
   | 'deadline'
@@ -182,6 +185,9 @@ const result = identity.extend({
 const assistant = identity.extend({
   type: z.literal('assistant'),
   message: z.object({ role: z.literal('assistant'), content: z.array(z.unknown()).max(128) }),
+  is_api_error_message: z.unknown().optional(),
+  api_error: z.unknown().optional(),
+  api_error_params: z.unknown().optional(),
 });
 const user = identity.extend({
   type: z.literal('user'),
@@ -201,83 +207,169 @@ const retry = identity.extend({
 });
 
 const metadataNumber = z.number().finite().nonnegative().max(Number.MAX_SAFE_INTEGER);
-const rateLimitStatus = z.enum(['allowed', 'allowed_warning', 'rejected']);
+// Labels describe account state and grant nothing, so a value a newer client adds stays readable.
+// The use flags report served paid use and stay strict.
+const rateLimitLabel = z.string().max(128);
+const rateLimitInfo = z.object({
+  status: rateLimitLabel,
+  resetsAt: metadataNumber.optional(),
+  rateLimitType: rateLimitLabel.optional(),
+  utilization: metadataNumber.optional(),
+  overageStatus: rateLimitLabel.optional(),
+  overageResetsAt: metadataNumber.optional(),
+  overageDisabledReason: rateLimitLabel.optional(),
+  isUsingOverage: z.boolean().optional(),
+  overageInUse: z.boolean().optional(),
+  overageEnabled: z.boolean().optional(),
+  rateLimitGraceActive: z.boolean().optional(),
+  surpassedThreshold: metadataNumber.optional(),
+  limitScope: rateLimitLabel.optional(),
+  errorCode: rateLimitLabel.optional(),
+  canUserPurchaseCredits: z.boolean().optional(),
+  hasChargeableSavedPaymentMethod: z.boolean().optional(),
+});
 const rateLimit = identity.extend({
   type: z.literal('rate_limit_event'),
   uuid: z.uuid(),
-  rate_limit_info: z.object({
-    status: rateLimitStatus,
-    resetsAt: metadataNumber.optional(),
-    rateLimitType: z
-      .enum([
-        'five_hour',
-        'seven_day',
-        'seven_day_opus',
-        'seven_day_sonnet',
-        'seven_day_overage_included',
-        'overage',
-      ])
+  rate_limit_info: rateLimitInfo,
+});
+
+// Client 2.1.302 reports utilization as the used fraction of a window, above 1 once usage runs
+// past the cap. Reset times are Unix seconds. The five-hour and weekly lengths are documented
+// account windows. The Opus, Sonnet and overage-included buckets are per-model limits with no
+// documented length, so they carry model scope only.
+const usageWindows = {
+  five_hour: { kind: 'rolling', semantics: { scope: 'provider', periodSeconds: 18_000 } },
+  seven_day: { kind: 'weekly', semantics: { scope: 'provider', periodSeconds: 604_800 } },
+  seven_day_opus: { kind: 'model', semantics: { scope: 'model' } },
+  seven_day_sonnet: { kind: 'model', semantics: { scope: 'model' } },
+  seven_day_overage_included: { kind: 'model', semantics: { scope: 'model' } },
+} as const satisfies Record<string, Pick<Observation, 'kind' | 'semantics'>>;
+const isWindow = (name: string | undefined): name is keyof typeof usageWindows =>
+  name !== undefined && Object.hasOwn(usageWindows, name);
+// The last Unix second that still prints as a four-digit-year ISO timestamp.
+const epochSeconds = z.number().int().nonnegative().max(253_402_300_799);
+// Usage can run past the cap, but a reading above twice the cap is not plausible from this
+// client. It stays missing and never reads as an exhausted window.
+const MAXIMUM_UTILIZATION = 2;
+const usageReading = z.object({ utilization: metadataNumber, resetsAt: epochSeconds });
+// The pinned client adds per-response readings for up to three windows on each event.
+const usageEvent = rateLimit.extend({
+  rate_limit_info: rateLimitInfo.extend({
+    unifiedWindows: z
+      .object({
+        five_hour: usageReading.optional(),
+        seven_day: usageReading.optional(),
+        seven_day_overage_included: usageReading.optional(),
+      })
       .optional(),
-    utilization: metadataNumber.optional(),
-    overageStatus: rateLimitStatus.optional(),
-    overageResetsAt: metadataNumber.optional(),
-    overageDisabledReason: z
-      .enum([
-        'overage_not_provisioned',
-        'org_level_disabled',
-        'org_level_disabled_until',
-        'out_of_credits',
-        'seat_tier_level_disabled',
-        'member_level_disabled',
-        'seat_tier_zero_credit_limit',
-        'group_zero_credit_limit',
-        'member_zero_credit_limit',
-        'org_service_level_disabled',
-        'no_limits_configured',
-        'fetch_error',
-        'unknown',
-      ])
-      .optional(),
-    isUsingOverage: z.boolean().optional(),
-    overageInUse: z.boolean().optional(),
-    overageEnabled: z.boolean().optional(),
-    surpassedThreshold: metadataNumber.optional(),
-    limitScope: z.enum(['service', 'channel', 'group_pool']).optional(),
-    errorCode: z.literal('credits_required').optional(),
-    canUserPurchaseCredits: z.boolean().optional(),
-    hasChargeableSavedPaymentMethod: z.boolean().optional(),
   }),
 });
-const envelopes = [
-  'system',
-  'assistant',
-  'result',
-  'control_request',
-  'user',
-  'stream_event',
-  'tool_progress',
-  'auth_status',
-  'tool_use_summary',
-  'rate_limit_event',
-  'prompt_suggestion',
-  'conversation_reset',
-] as const;
+export type AnthropicUsageWindow = Readonly<{
+  windowId: keyof typeof usageWindows;
+  kind: Observation['kind'];
+  semantics: NonNullable<Observation['semantics']>;
+  remainingPercent: number;
+  resetsAt: string | null;
+}>;
+export type AnthropicUsage = Readonly<{
+  windows: readonly AnthropicUsageWindow[];
+  // Usage credits are billed money. They never become an included subscription window.
+  paid: Readonly<{ inUse: boolean; usedPercent: number | null; resetsAt: string | null }> | null;
+}>;
+export type AnthropicUsageHook =
+  | ((usage: AnthropicUsage) => boolean)
+  | ((usage: AnthropicUsage) => void);
+const unixTime = (seconds: number | undefined) => {
+  const parsed = epochSeconds.safeParse(seconds);
+  return parsed.success ? new Date(parsed.data * 1000).toISOString() : null;
+};
+type UsageLimitFailure = Readonly<{
+  kind: 'usage-limit';
+  rateLimitType: keyof typeof usageWindows | null;
+  resetsAt: string | null;
+}>;
+const usageLimitFailure = (value: unknown): UsageLimitFailure | null => {
+  const parsed = rateLimitInfo.safeParse(value);
+  if (!parsed.success || parsed.data.status !== 'rejected') return null;
+  const rateLimitType = isWindow(parsed.data.rateLimitType) ? parsed.data.rateLimitType : null;
+  if (!rateLimitType) return null;
+  return {
+    kind: 'usage-limit',
+    rateLimitType,
+    resetsAt: unixTime(parsed.data.resetsAt),
+  };
+};
+const typedUsageLimit = (message: Record<string, unknown>): UsageLimitFailure | null => {
+  if (message.api_error !== 'usage_limit_reached') return null;
+  if (!message.api_error_params || typeof message.api_error_params !== 'object')
+    return { kind: 'usage-limit', rateLimitType: null, resetsAt: null };
+  const info = (message.api_error_params as Record<string, unknown>).rate_limit_info;
+  return usageLimitFailure(info) ?? { kind: 'usage-limit', rateLimitType: null, resetsAt: null };
+};
+const assistantUsageLimit = (message: z.output<typeof assistant>): UsageLimitFailure | null =>
+  message.is_api_error_message === true ? typedUsageLimit(message) : null;
 
-const subtypes = [
-  'init',
-  'api_retry',
-  'hook_started',
-  'hook_progress',
-  'hook_response',
-  'plugin_install',
-  'informational',
-  'permission_denied',
-  'success',
-  'error_during_execution',
-  'error_max_turns',
-  'error_max_budget_usd',
-  'error_max_structured_output_retries',
-] as const;
+/** Map one rate_limit_event to the windows it reports. A window it omits stays unreported. */
+export function projectAnthropicUsage(event: unknown): AnthropicUsage {
+  const parsed = usageEvent.safeParse(event);
+  if (!parsed.success) throw new ReplacementError('protocol');
+  const info = parsed.data.rate_limit_info;
+  const type = info.rateLimitType;
+  const readings = new Map<keyof typeof usageWindows, { utilization: number; resetsAt?: number }>();
+  if (info.unifiedWindows) {
+    for (const windowId of ['five_hour', 'seven_day', 'seven_day_overage_included'] as const) {
+      const reading = info.unifiedWindows[windowId];
+      if (reading) readings.set(windowId, reading);
+    }
+  } else if (isWindow(type) && info.utilization !== undefined) {
+    // The top-level fields name the window closest to its limit and can repeat a reading held
+    // since an earlier response. They count only when the event has no per-response readings.
+    if (info.resetsAt !== undefined && unixTime(info.resetsAt) === null)
+      throw new ReplacementError('protocol');
+    readings.set(type, { utilization: info.utilization, resetsAt: info.resetsAt });
+  }
+  const inUse = info.isUsingOverage === true || info.overageInUse === true;
+  return {
+    windows: [...readings]
+      .filter(([, reading]) => reading.utilization <= MAXIMUM_UTILIZATION)
+      .map(([windowId, reading]) => ({
+        windowId,
+        ...usageWindows[windowId],
+        remainingPercent: Math.max(0, (10_000 - Math.round(reading.utilization * 10_000)) / 100),
+        resetsAt: unixTime(reading.resetsAt),
+      })),
+    // A paid reading never decides whether the included windows count.
+    paid:
+      type === 'overage' || inUse
+        ? {
+            inUse,
+            usedPercent:
+              type === 'overage' && info.utilization !== undefined
+                ? Math.round(info.utilization * 10_000) / 100
+                : null,
+            resetsAt: unixTime(type === 'overage' ? info.resetsAt : info.overageResetsAt),
+          }
+        : null,
+  };
+}
+
+/** The receiver supplies the receive time. Nothing in the event can set or move it. */
+export function anthropicUsageObservations(
+  windows: AnthropicUsage['windows'],
+  observedAt: string,
+): Omit<Observation, 'routeId'>[] {
+  return windows.map((window) => ({
+    windowId: window.windowId,
+    kind: window.kind,
+    semantics: window.semantics,
+    remaining: { value: window.remainingPercent, unit: 'percent' as const },
+    resetsAt: window.resetsAt,
+    observedAt,
+    source: 'client' as const,
+    confidence: 'reported' as const,
+  }));
+}
 const fields = [
   'session_id',
   'type',
@@ -301,9 +393,59 @@ const fields = [
   'baseHash',
   'uuid',
   'rate_limit_info',
+  'isUsingOverage',
+  'overageInUse',
+  'overageEnabled',
+  'rateLimitType',
+  'rateLimitGraceActive',
   'parent_tool_use_id',
   'isReplay',
+  'status',
+  'permissionMode',
 ] as const;
+
+// The client reports progress and display state in many frames, and each release adds more. Few
+// of them carry authority here: init pins the model and tool set, a retry or a model change
+// alters what ran, and the terminal result is the only proposal. The decoder counts every other
+// frame by name and drops it, so a frame it has never seen cannot stop a finished task.
+const PROTOCOL_NAME = /^[a-z][a-z0-9_]{0,63}$/;
+const MAX_CENSUS_NAMES = 32;
+const handledFrames = new Set([
+  'assistant',
+  'user',
+  'rate_limit_event',
+  'result',
+  'control_request',
+]);
+const authoritySubtypes = new Set([
+  'init',
+  'api_retry',
+  'model_fallback',
+  'model_consent_fallback',
+  'model_refusal_fallback',
+  'model_refusal_no_fallback',
+  // A hook runs a command during the turn, so its frames are never progress.
+  'hook_started',
+  'hook_progress',
+  'hook_response',
+]);
+
+// A diagnostic names the frame and never quotes it. Only a plain identifier of at most 64
+// characters counts as a name, so no frame content can ride along in a type or subtype.
+const protocolName = (value: unknown) =>
+  typeof value === 'string' && PROTOCOL_NAME.test(value) ? value : 'other';
+
+/** The census name of a frame the decoder drops, or null when the frame needs a handler. */
+function progressFrame(record: Record<string, unknown>) {
+  const { type, subtype } = record;
+  if (typeof type !== 'string' || !PROTOCOL_NAME.test(type)) return null;
+  if (type !== 'system') return handledFrames.has(type) ? null : type;
+  return typeof subtype === 'string' &&
+    PROTOCOL_NAME.test(subtype) &&
+    !authoritySubtypes.has(subtype)
+    ? `system/${subtype}`
+    : null;
+}
 export type ReplacementDiagnostic = Readonly<{
   stage: 'before-init' | 'output' | 'complete';
   site:
@@ -313,14 +455,25 @@ export type ReplacementDiagnostic = Readonly<{
     | 'assistant'
     | 'user'
     | 'retry'
+    | 'system'
+    | 'status'
     | 'rate-limit'
     | 'result'
     | 'replacement'
     | 'finish';
-  cause: 'validation' | 'correlation' | 'invalid-json' | 'unsupported' | 'limit' | 'incomplete';
-  envelope: (typeof envelopes)[number] | 'none' | 'other' | 'invalid-json';
-  subtype: (typeof subtypes)[number] | 'other' | null;
+  cause:
+    | 'validation'
+    | 'correlation'
+    | 'invalid-json'
+    | 'unsupported'
+    | 'limit'
+    | 'incomplete'
+    | 'provider-error';
+  // The client's own frame name, or 'other' when the name is not a plain identifier.
+  envelope: string;
+  subtype: string | null;
   field: (typeof fields)[number] | 'other' | null;
+  providerFailure?: UsageLimitFailure;
 }>;
 
 /** Assistant output is never a host command, permission response or replacement authority. */
@@ -333,18 +486,51 @@ export class ReplacementStream {
   private toolsEmpty: boolean | null = null;
   private pluginsEmpty: boolean | null = null;
   private retries = 0;
+  private readonly ignored = new Map<string, number>();
   private site: ReplacementDiagnostic['site'] = 'frame';
   private envelope: ReplacementDiagnostic['envelope'] = 'none';
   private subtype: ReplacementDiagnostic['subtype'] = null;
   private failure: ReplacementDiagnostic | null = null;
+  private usageLimitFailure: UsageLimitFailure | null = null;
+  private readonly usage = new Map<string, string>();
   private readonly plan: WriterPlan;
-  constructor(plan: WriterPlan) {
+  private readonly onUsage: AnthropicUsageHook | undefined;
+  constructor(plan: WriterPlan, onUsage?: AnthropicUsageHook) {
     this.plan = replacementPlan(plan.input);
+    this.onUsage = onUsage;
+  }
+  // One client process sends a window again, unchanged, when its status or another window
+  // moves, and an event without per-response readings can repeat one held since an earlier
+  // response. A reading counts as new only when its whole percent or its reset moves, so a
+  // receiver that stamps each arrival never restamps a re-sent reading. Each call carries at
+  // least one new window.
+  private observeUsage(event: unknown) {
+    if (!this.onUsage) return;
+    const key = (window: AnthropicUsageWindow) =>
+      `${Math.round(window.remainingPercent)}@${window.resetsAt}`;
+    try {
+      const usage = projectAnthropicUsage(event);
+      const windows = usage.windows.filter(
+        (window) => this.usage.get(window.windowId) !== key(window),
+      );
+      if (!windows.length) return;
+      // A refused sink must see the next replay before this process can suppress it.
+      if (this.onUsage({ windows, paid: usage.paid }) === false) return;
+      for (const window of windows) this.usage.set(window.windowId, key(window));
+    } catch {
+      // Usage is advisory. A malformed reading or a failed sink leaves the task as it was.
+    }
+  }
+  private ignore(name: string) {
+    // The ceiling keeps the completion record small whatever the client sends.
+    const key = this.ignored.has(name) || this.ignored.size < MAX_CENSUS_NAMES ? name : 'other';
+    this.ignored.set(key, (this.ignored.get(key) ?? 0) + 1);
   }
   private fail(
     reason: Failure,
     cause: ReplacementDiagnostic['cause'] = 'validation',
     field: ReplacementDiagnostic['field'] = null,
+    providerFailure?: UsageLimitFailure,
   ): never {
     this.failed ??= reason;
     this.failure ??= Object.freeze({
@@ -354,6 +540,7 @@ export class ReplacementStream {
       envelope: this.envelope,
       subtype: this.subtype,
       field,
+      ...(providerFailure ? { providerFailure } : {}),
     });
     this.terminal = null;
     throw new ReplacementError(this.failed, this.failure);
@@ -380,16 +567,27 @@ export class ReplacementStream {
         this.pending = [];
         const record = value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
         const type = record.type;
-        this.envelope = envelopes.find((envelope) => envelope === type) ?? 'other';
-        this.subtype =
-          record.subtype === undefined
-            ? null
-            : (subtypes.find((subtype) => subtype === record.subtype) ?? 'other');
-        if (this.terminal) this.fail('protocol', 'unsupported');
+        this.envelope = protocolName(type);
+        this.subtype = record.subtype === undefined ? null : protocolName(record.subtype);
         this.site = 'identity';
         const envelope = identity.parse(value);
         if (envelope.session_id !== this.plan.sessionId)
           this.fail('protocol', 'correlation', 'session_id');
+        const progress = progressFrame(record);
+        if (progress) {
+          // Progress and display frames carry no proposal authority, before or after init. A
+          // status frame still cannot change the permission mode the launch fixed.
+          if (
+            progress === 'system/status' &&
+            record.permissionMode !== undefined &&
+            record.permissionMode !== 'default'
+          ) {
+            this.site = 'status';
+            this.fail('protocol', 'unsupported', 'permissionMode');
+          }
+          this.ignore(progress);
+          continue;
+        }
         if (!this.initialized) {
           this.site = 'init';
           const message = init.parse(value);
@@ -402,26 +600,53 @@ export class ReplacementStream {
           this.site = 'rate-limit';
           // Subscription metadata grants no permission, billing or replacement authority.
           const info = rateLimit.parse(value).rate_limit_info;
+          this.observeUsage(value);
+          this.usageLimitFailure = usageLimitFailure(info) ?? this.usageLimitFailure;
+          // Extra-usage configuration does not report use. Served overflow still refuses.
+          if (info.isUsingOverage === true) this.fail('protocol', 'unsupported', 'isUsingOverage');
+          if (info.overageInUse === true) this.fail('protocol', 'unsupported', 'overageInUse');
+          if (info.rateLimitType === 'overage')
+            this.fail('protocol', 'unsupported', 'rateLimitType');
           if (
-            info.isUsingOverage === true ||
-            info.overageInUse === true ||
-            info.overageEnabled === true ||
-            info.rateLimitType === 'overage'
+            info.rateLimitGraceActive === true &&
+            (info.overageStatus === 'allowed' || info.overageStatus === 'allowed_warning')
           )
-            this.fail('protocol', 'unsupported', 'rate_limit_info');
+            this.fail('protocol', 'unsupported', 'rateLimitGraceActive');
+        } else if (this.terminal) {
+          // Progress and rate-limit metadata can follow the result. Anything else could change
+          // what ran or replace the proposal.
+          this.site = 'frame';
+          this.fail('protocol', 'unsupported');
         } else if (type === 'assistant') {
           this.site = 'assistant';
-          assistant.parse(value);
+          const message = assistant.parse(value);
+          this.usageLimitFailure = assistantUsageLimit(message) ?? this.usageLimitFailure;
         } else if (type === 'user') {
           this.site = 'user';
           // Native user-role output is discarded. Only the terminal result can supply a proposal.
           user.parse(value);
         } else if (type === 'system') {
+          this.site = 'system';
+          if (record.subtype !== 'api_retry') this.fail('protocol', 'unsupported', 'subtype');
           this.site = 'retry';
           retry.parse(value);
           this.retries++;
+        } else if (type !== 'result') {
+          // A host request or a frame without a protocol name cannot be answered or ignored.
+          this.site = 'frame';
+          this.fail('protocol', 'unsupported', 'type');
         } else {
           this.site = 'result';
+          if (record.is_error === true) {
+            if (typeof record.subtype !== 'string' || !PROTOCOL_NAME.test(record.subtype))
+              this.fail('protocol', 'validation', 'subtype');
+            this.fail(
+              'provider',
+              'provider-error',
+              'is_error',
+              this.usageLimitFailure ?? typedUsageLimit(record) ?? undefined,
+            );
+          }
           const message = result.parse(value);
           this.site = 'replacement';
           const edit = message.structured_output;
@@ -436,7 +661,12 @@ export class ReplacementStream {
         if (error instanceof ReplacementError) throw error;
         let field: ReplacementDiagnostic['field'] = null;
         if (error instanceof z.ZodError) {
-          const label = error.issues[0]?.path.find((part) => typeof part === 'string');
+          const path = error.issues[0]?.path;
+          const rateField =
+            this.site === 'rate-limit' && path?.[0] === 'rate_limit_info'
+              ? fields.find((field) => field === path[1])
+              : undefined;
+          const label = rateField ?? path?.find((part) => typeof part === 'string');
           field = fields.find((field) => field === label) ?? 'other';
         }
         this.fail('protocol', decoded ? 'validation' : 'invalid-json', field);
@@ -453,6 +683,7 @@ export class ReplacementStream {
       nativeToolsReportedEmpty: this.toolsEmpty,
       nativePluginsReportedEmpty: this.pluginsEmpty,
       observedRetries: this.retries,
+      ignoredFrames: Object.fromEntries(this.ignored),
       qualified: false as const,
     };
   }
@@ -479,6 +710,7 @@ export function startReplacement(
     spawn?: Spawn;
     lifecycle?: NativeLifecycle;
     onSubmitted?: () => void;
+    onUsage?: AnthropicUsageHook;
   } = {},
 ) {
   const now = options.now ?? (() => performance.now());
@@ -573,7 +805,7 @@ export function startReplacement(
   } catch {
     throw new ReplacementError('storage');
   }
-  const reader = new ReplacementStream(plan);
+  const reader = new ReplacementStream(plan, options.onUsage);
   if (remaining() <= CLEANUP_MS) throw new ReplacementError('deadline');
   try {
     nativeSynchronousHook(() => options.lifecycle?.beforePhase('task'));
@@ -666,10 +898,19 @@ export function startReplacement(
     }
     if (closed && absent()) return settle();
     signal('SIGTERM');
-    const cleanup = Math.min(CLEANUP_MS, remaining());
-    timers.push(
-      schedule(() => signal('SIGKILL'), Math.min(1000, cleanup)),
-      schedule(settle, cleanup),
+    armOwnedCleanup(
+      {
+        schedule,
+        now,
+        remaining,
+        timers,
+        signal,
+        absent,
+        closed: () => closed,
+        finished: () => finished,
+        settle,
+      },
+      Math.min(CLEANUP_MS, remaining()),
     );
   };
   child.on('error', () => stop('launch'));

@@ -9,6 +9,7 @@ import {
   CursorSchema,
   type Event,
   type Snapshot,
+  type SnapshotScope,
   type TransportMessage,
 } from '@crewkite/contracts';
 import { type ConnectionState, encodeFrame, FrameDecoder } from './index.ts';
@@ -273,18 +274,20 @@ export class ControllerClient {
           });
         },
         this.options.timeoutMs ??
-          (command.command === 'AuthenticateGoogleAcp'
-            ? 130000
-            : command.command === 'InitializeGoogleAcp'
-              ? 15000
-              : ['ObserveUsage', 'DiscoverGoogleAcp', 'StopGoogleAcpSetup'].includes(
-                    command.command,
-                  )
-                ? 30000
-                : command.command === 'PrepareCandidateEvaluation' &&
-                    command.payload.checkRecipeId === 'crewkite-verify-v1'
-                  ? 65000
-                  : 5000),
+          (command.command === 'StartRun'
+            ? 40000
+            : command.command === 'AuthenticateGoogleAcp'
+              ? 130000
+              : command.command === 'InitializeGoogleAcp'
+                ? 15000
+                : ['ObserveUsage', 'DiscoverGoogleAcp', 'StopGoogleAcpSetup'].includes(
+                      command.command,
+                    )
+                  ? 30000
+                  : command.command === 'PrepareCandidateEvaluation' &&
+                      command.payload.checkRecipeId === 'crewkite-verify-v1'
+                    ? 65000
+                    : 5000),
       );
       this.pending.set(command.key, { resolve, timer });
       socket.write(frame);
@@ -306,8 +309,8 @@ export class ControllerClient {
     );
   }
 
-  async snapshot(): Promise<Snapshot> {
-    const result = await this.read('GetSnapshot', {});
+  async snapshot(scope?: SnapshotScope): Promise<Snapshot> {
+    const result = await this.read('GetSnapshot', scope ?? {});
     if (
       (result.outcome !== 'applied' && result.outcome !== 'already-applied') ||
       result.data?.kind !== 'snapshot'

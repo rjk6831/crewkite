@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { join, resolve } from 'node:path';
+import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import { hashCanonical, sealHandoff } from '@crewkite/contracts/hash';
 import { spawnCheckChild as spawn } from '../../host/check-ownership.ts';
@@ -147,8 +149,9 @@ const file=JSON.parse(prompt.split('\nFile: ')[1]);
 assert(args.includes('--sandbox')&&args.includes('--disable-slash-commands'));
 assert(!args.includes('--dangerously-skip-permissions'));
 assert(process.env.HOME&&process.env.USER&&process.env.LOGNAME);
+assert.equal(process.env.AGY_CLI_DISABLE_AUTO_UPDATE,'true');
 const owner=checkOwner();
-assert(Object.keys(process.env).every(key=>['HOME','USER','LOGNAME','PATH','LANG','TERM','NO_COLOR','TMPDIR','__CF_USER_TEXT_ENCODING'].includes(key)||(owner&&key==='CREWKITE_CHECK_OWNER')),JSON.stringify(Object.keys(process.env)));
+assert(Object.keys(process.env).every(key=>['HOME','USER','LOGNAME','PATH','LANG','TERM','NO_COLOR','AGY_CLI_DISABLE_AUTO_UPDATE','TMPDIR','__CF_USER_TEXT_ENCODING'].includes(key)||(owner&&key==='CREWKITE_CHECK_OWNER')),JSON.stringify(Object.keys(process.env)));
 const permissionMode=['strict','always-proceed','proceed-in-sandbox'].includes(mode)?mode:'request-review';
 const start={event:'init',conversation_id:'session',init:{cwd:process.cwd(),tools:['view_file'],permission_mode:permissionMode,model:value('--model')}};
 const result={event:'result',result:{conversation_id:mode==='wrong-session'?'other':'session',status:mode==='failed'?'ERROR':'SUCCESS',response:'discarded',duration_seconds:0,num_turns:1,usage:${JSON.stringify(usage)},structured_output:{...file,content:'export const total = 1;\n'}}};
@@ -534,6 +537,7 @@ else {
           ...environment,
           GOOGLE_API_KEY: 'private-canary',
           GOOGLE_APPLICATION_CREDENTIALS: 'private-canary',
+          AGY_CLI_DISABLE_AUTO_UPDATE: 'false',
         },
         spawn: (_, args, options) => {
           assert.deepEqual(args.slice(0, 4), ['-p', '/config', '--output-format', 'json']);
@@ -541,6 +545,7 @@ else {
           const child = spawn(process.execPath, ['-e', script], options);
           if (child.pid) groups.push(child.pid);
           assert(!('GOOGLE_API_KEY' in (options?.env ?? {})));
+          assert.equal(options?.env?.AGY_CLI_DISABLE_AUTO_UPDATE, 'true');
           return child;
         },
         lifecycle: {
@@ -687,6 +692,68 @@ else {
           assert(!JSON.stringify(outcome).includes('private'));
         }
       }
+    }
+    {
+      let tick = 0,
+        absent = false;
+      const timers: Array<{ delay: number; work: () => void; active: boolean }> = [];
+      const signals: NodeJS.Signals[] = [];
+      const child = new EventEmitter() as ReturnType<typeof spawn>;
+      Object.assign(child, {
+        pid: 12345,
+        stdout: new PassThrough(),
+        stderr: new PassThrough(),
+        unref: () => child,
+      });
+      const handle = startGoogleWriter({
+        client,
+        environment,
+        admission,
+        attemptId,
+        repositoryRoot: resolve('.'),
+        directory,
+        temporaryDirectory: runtime,
+        file,
+        task: 'late shutdown',
+        timeoutMs: 3000,
+        deadline: 3000,
+        now: () => tick,
+        onSubmitted: () => {},
+        spawn: () => child,
+        groupAbsent: () => absent,
+        signalGroup: (_, signal) => {
+          signals.push(signal);
+          if (signal === 'SIGKILL') absent = true;
+        },
+        schedule: (work, delay) => {
+          const timer = { delay, work, active: true };
+          timers.push(timer);
+          return () => {
+            timer.active = false;
+          };
+        },
+      });
+      handle.stop();
+      tick = 2000;
+      const fire = (delay: number) => {
+        const timer = timers.find((value) => value.active && value.delay === delay);
+        assert(timer, `pending ${delay}ms timer`);
+        timer.active = false;
+        timer.work();
+      };
+      fire(1500);
+      fire(250);
+      await new Promise((resolve) => setImmediate(resolve));
+      child.emit('close', null, 'SIGKILL');
+      assert.deepEqual(await handle.result, {
+        reason: 'cancelled',
+        quiescent: true,
+        exitCode: null,
+        signal: 'SIGKILL',
+        metadata: null,
+        diagnostic: null,
+      });
+      assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
     }
     for (const content of ['text\0tail', '\ud800'])
       await assert.rejects(

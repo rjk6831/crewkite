@@ -1,6 +1,7 @@
 import type {
   Command,
   CommandResult,
+  ConversationContextPick,
   DesktopNotice,
   Event,
   Snapshot,
@@ -14,6 +15,13 @@ export type DesktopCommand = Command extends infer Item
     ? Omit<Item, 'protocol' | 'key' | 'actor'>
     : never
   : never;
+export type ConversationContextRequest = {
+  projectId: string;
+  base: string;
+  mode: ConversationContextPick['kind'];
+};
+export type ConversationContextReceipt = { receiptId: string; projectId: string; base: string };
+export type ConversationContextCapture = { receiptId: string; result: CommandResult | null };
 export type ConnectionState = 'connecting' | 'connected' | 'offline';
 export interface DesktopSource {
   getSnapshot(): Promise<Snapshot>;
@@ -22,7 +30,11 @@ export interface DesktopSource {
   onConnection?(listener: (state: ConnectionState) => void): () => void;
   pickProject?(): Promise<CommandResult | null>;
   reconnect?(): Promise<void>;
-  retryCommand?(): Promise<CommandResult | null>;
+  retryCommand?(expected?: DesktopCommand): Promise<CommandResult | null>;
+  pickConversationContext?(
+    input: ConversationContextRequest,
+  ): Promise<ConversationContextCapture | null>;
+  retryConversationContext?(input: ConversationContextReceipt): Promise<ConversationContextCapture>;
   onNotice?(listener: (notice: DesktopNotice) => void): () => void;
 }
 

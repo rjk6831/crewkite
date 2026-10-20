@@ -13,7 +13,7 @@ const contentTypes: Record<string, string> = {
   png: 'image/png',
 };
 const csp =
-  "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
+  "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
 
 export function secureSession(session: Session, rendererRoot: string) {
   const root = realpathSync(rendererRoot);

@@ -395,6 +395,46 @@ test('native context protocol discloses only the selected current bounded task',
       }),
       /outside scratch/,
     );
+    const advertised = createSession(owned.bundle, {
+      client: owned.f.client,
+      now: () => at,
+      save: () => assert.fail('A read cannot save.'),
+    });
+    await initialize(advertised);
+    assert.deepEqual(
+      ((await advertised.receive(frame(2, 'tools/list'))) as Reply).result?.tools?.map(
+        (tool) => tool.name,
+      ),
+      ['retained_patch', 'submit_unverified_result'],
+    );
+    assert.equal(
+      (
+        (await advertised.receive(
+          frame(3, 'tools/call', { name: 'task_context', arguments: {} }),
+        )) as Reply
+      ).error?.code,
+      -32601,
+    );
+    const withoutPatch = OwnedBundleSchema.parse({
+      ...owned.bundle,
+      context: {
+        ...owned.bundle.context,
+        binding: { ...owned.bundle.context.binding, candidate: null, patch: null },
+        patch: '',
+      },
+    });
+    const noRetainedPatch = createSession(withoutPatch, {
+      client: owned.f.client,
+      now: () => at,
+      save: () => assert.fail('A read cannot save.'),
+    });
+    await initialize(noRetainedPatch);
+    assert.deepEqual(
+      ((await noRetainedPatch.receive(frame(2, 'tools/list'))) as Reply).result?.tools?.map(
+        (tool) => tool.name,
+      ),
+      ['submit_unverified_result'],
+    );
     const before = await owned.f.client.snapshot();
     for (const [name, change, allowed] of [
       [
@@ -526,7 +566,7 @@ test('native context protocol discloses only the selected current bounded task',
       });
       await initialize(session);
       const reply = (await session.receive(
-        frame(2, 'tools/call', { name: 'task_context' }),
+        frame(2, 'tools/call', { name: 'retained_patch' }),
       )) as Reply;
       assert.equal(!reply.result?.isError, allowed, name);
       if (allowed) {
