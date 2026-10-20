@@ -9,6 +9,7 @@ import { spawnCheckChild as spawn } from '../../host/check-ownership.ts';
 import { groupAbsent } from '../../host/worker.ts';
 import {
   GoogleWriterError,
+  googleQuotaWindows,
   googleUsageObservations,
   projectGoogleUsage,
   startGoogleUsage,
@@ -167,6 +168,31 @@ test('the google quota read maps zero-turn account buckets to window observation
     confidence: 'reported',
   });
   assert.deepEqual(googleUsageObservations(projected, [], reset()), []);
+
+  const account = projected.map((window) => ({
+    ...window,
+    remainingPercent: window.windowId === 'gemini-argon-wtu-weekly' ? 0 : 96,
+  }));
+  const flash = googleQuotaWindows('gemini-3.8-flash', account);
+  assert.equal(flash.missingRequired, false);
+  assert.deepEqual(
+    flash.windows.map((window) => window.windowId),
+    ['gemini-weekly', 'gemini-5h', '3p-weekly', '3p-5h'],
+  );
+  assert.equal(account.at(-1)?.remainingPercent, 0, 'complete account report stays unchanged');
+  for (const id of ['gemini-weekly', 'gemini-5h'])
+    assert.equal(
+      googleQuotaWindows(
+        'gemini-3.8-flash',
+        account.filter((window) => window.windowId !== id),
+      ).missingRequired,
+      true,
+      id,
+    );
+  const future = { ...account[0], windowId: 'future-weekly', remainingPercent: 0 };
+  assert.equal(googleQuotaWindows('gemini-3.8-flash', [...account, future]).windows.at(-1), future);
+  for (const model of ['gemini-4-argon', 'gemini-3.8-flash-preview', 'Gemini-3.8-flash', 'unknown'])
+    assert.deepEqual(googleQuotaWindows(model, account).windows, account, model);
 
   mkdirSync(resolve('internal'), { recursive: true });
   const home = mkdtempSync(resolve('internal/google-usage-'));

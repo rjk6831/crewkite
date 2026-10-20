@@ -88,6 +88,7 @@ import {
   OwnedCommand,
 } from '../host/worker.ts';
 import { type AcpSetupProof, acpClientPin } from '../providers/google/acp/profile.ts';
+import { GoogleFlashQuotaModelId } from '../providers/google/native-writer.ts';
 import { localStructuredOutput } from '../providers/local/profile.ts';
 import {
   type NativeProfileResolution,
@@ -7214,6 +7215,99 @@ test('google quota authority survives retries and restart while sharing one oper
     3,
   );
   assert.equal(controller.snapshot().usageReaders[0]?.lastObservedAt, context.clock.now());
+  const quotaApi = controller as unknown as {
+    acpQuotaState: (
+      routeId: string,
+      modelId: string,
+      run: { policy: { policy: { reserves: Run['policy']['policy']['reserves'] } } },
+    ) => { windows: Observation[]; needsRefresh: boolean; reserveReason?: string };
+  };
+  const accountWindows = controller.store
+    .list<Observation>('window')
+    .filter((window) => window.routeId === displayRoute.id);
+  const setWindows = (windows: Observation[]) =>
+    controller.store.transaction(() => {
+      for (const window of controller.store
+        .list<Observation>('window')
+        .filter((value) => value.routeId === displayRoute.id))
+        controller.store.db
+          .prepare("DELETE FROM entities WHERE kind='window' AND id=?")
+          .run(`${window.routeId}/${window.windowId}`);
+      for (const window of windows)
+        controller.store.put('window', `${window.routeId}/${window.windowId}`, 0, window);
+    });
+  for (const scenario of [
+    'argon-zero',
+    'relevant-zero',
+    'unknown-zero',
+    'third-party-zero',
+    'stale',
+    'null',
+    'missing',
+    'reserve',
+  ]) {
+    let windows = accountWindows.map((window) => ({
+      ...window,
+      remaining: { unit: 'percent' as const, value: window.windowId.includes('argon') ? 0 : 96 },
+    }));
+    if (scenario === 'missing')
+      windows = windows.filter((window) => window.windowId !== 'gemini-5h');
+    if (scenario === 'unknown-zero' || scenario === 'third-party-zero')
+      windows.push({
+        ...windows[0],
+        windowId: scenario === 'unknown-zero' ? 'future-weekly' : '3p-weekly',
+        remaining: { unit: 'percent', value: 0 },
+      });
+    const observations: Observation[] = windows.map((window) =>
+      window.windowId !== 'gemini-weekly'
+        ? window
+        : {
+            ...window,
+            remaining:
+              scenario === 'null'
+                ? null
+                : { unit: 'percent', value: scenario === 'relevant-zero' ? 0 : 96 },
+            observedAt:
+              scenario === 'stale'
+                ? new Date(Date.parse(context.clock.now()) - 300001).toISOString()
+                : window.observedAt,
+          },
+    );
+    setWindows(observations);
+    const state = quotaApi.acpQuotaState(displayRoute.id, GoogleFlashQuotaModelId, {
+      policy: {
+        policy: {
+          reserves:
+            scenario === 'reserve'
+              ? [
+                  {
+                    routeId: displayRoute.id,
+                    windowId: 'gemini-weekly',
+                    unit: 'percent',
+                    value: 96,
+                  },
+                ]
+              : [],
+        },
+      },
+    });
+    assert.equal(state.needsRefresh, ['stale', 'null', 'missing'].includes(scenario), scenario);
+    assert.equal(
+      !!state.reserveReason,
+      ['relevant-zero', 'unknown-zero', 'third-party-zero', 'reserve'].includes(scenario),
+      scenario,
+    );
+    assert(!state.windows.some((window) => window.windowId.includes('argon')), scenario);
+    assert.equal(
+      controller.store
+        .list<Observation>('window')
+        .filter((window) => window.routeId === displayRoute.id).length,
+      observations.length,
+      'admission preserves the complete account display',
+    );
+  }
+  setWindows(accountWindows);
+
   assert(
     controller.store
       .eventsAfter('0')

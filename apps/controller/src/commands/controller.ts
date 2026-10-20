@@ -226,6 +226,7 @@ import {
 import {
   type GoogleNativeLifecycle,
   GoogleWriterError,
+  googleQuotaWindows,
   googleUsageObservations,
   googleWriterPlan,
   startGoogleConfig,
@@ -8314,7 +8315,7 @@ export class Controller {
           return refuse({ outcome: 'blocked', reason: 'native-preparation-unavailable' });
         const setup = this.store.googleAcpSetup();
         const quota = this.store.transaction(() => ({
-          ...this.acpQuotaState(appointment.route.id, run),
+          ...this.acpQuotaState(appointment.route.id, appointment.acp.modelId, run),
           blocker: this.store.googleOperationBlocker(),
         }));
         pending.authorityRevision = quota.reader.authority_revision;
@@ -12906,12 +12907,15 @@ export class Controller {
     };
   }
 
-  private acpQuotaState(routeId: string, run: Run) {
+  private acpQuotaState(routeId: string, modelId: string, run: Run) {
     const reader = this.store.googleUsageReader();
-    const windows = this.store
-      .list<Observation>('window')
-      .filter((value) => value.routeId === routeId && value.kind !== 'local');
-    let needsRefresh = !reader.last_observed_at || !windows.length;
+    const { windows, missingRequired } = googleQuotaWindows(
+      modelId,
+      this.store
+        .list<Observation>('window')
+        .filter((value) => value.routeId === routeId && value.kind !== 'local'),
+    );
+    let needsRefresh = !reader.last_observed_at || !windows.length || missingRequired;
     let reserveReason: string | undefined;
     const nowMs = Date.parse(this.now());
     for (const window of windows) {
@@ -12961,10 +12965,11 @@ export class Controller {
   ): RouterDecision {
     const { reader, windows, needsRefresh, reserveReason } = this.acpQuotaState(
       appointment.route.id,
+      appointment.acp.modelId,
       run,
     );
     let reason = reserveReason;
-    if (needsRefresh) reason ??= 'Every Google quota bucket needs fresh observations.';
+    if (needsRefresh) reason ??= 'Every applicable Google quota bucket needs fresh observations.';
     if (Date.parse(appointment.expiresAt) <= Date.parse(this.now()))
       reason = 'Native consent expired.';
     return {

@@ -1025,7 +1025,7 @@ export function startGoogleConfig(options: NativeLaunch) {
 }
 
 // The /usage command reports account buckets, one per quota window, with zero model turns.
-// A bucket is an account fact, so the caller attaches it to every Google route it names.
+// Account observations remain complete; admission selects the applicable model pools.
 const usageBucket = z.looseObject({
   id: text(64),
   remaining_fraction: z.number().finite().min(0).max(1),
@@ -1120,6 +1120,24 @@ export function googleUsageObservations(
       confidence: 'reported' as const,
     })),
   );
+}
+
+export const GoogleFlashQuotaModelId = 'gemini-3.8-flash';
+
+export function googleQuotaWindows<T extends { windowId: string }>(
+  modelId: string,
+  observations: readonly T[],
+): { windows: T[]; missingRequired: boolean } {
+  if (modelId !== GoogleFlashQuotaModelId)
+    return { windows: [...observations], missingRequired: false };
+  // This exact model has a separate pool from the independently reported Argon bucket.
+  const windows = observations.filter((window) => window.windowId !== 'gemini-argon-wtu-weekly');
+  return {
+    windows,
+    missingRequired: ['gemini-weekly', 'gemini-5h'].some(
+      (id) => !windows.some((window) => window.windowId === id),
+    ),
+  };
 }
 
 export function startGoogleUsage(options: NativeLaunch) {

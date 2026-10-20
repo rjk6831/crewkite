@@ -46,3 +46,10 @@ I keep provider-policy assessment and technical client qualification in release 
 I no longer wait for an explicit Stop once shutdown is proven. When the controller finds every recorded process group absent, by `ESRCH` alone, and no terminal response exists, it settles the attempt as the turn finishes or as it recovers after a restart. The outcome stays unknown. The intent stops, the lease and reservations release, and the task becomes interrupted with a next step. Nothing is captured, nothing is inferred and the run cannot submit again. Minutes are charged up to the recorded closure time. A group that is still present keeps the hold, and an explicit Stop still settles an attempt a restart left unknown once its groups are gone.
 
 I made this change because a lease and a closed Google gate protect nothing after the process is gone. They only keep the whole home waiting on a person. The same proof now releases a Local turn and an unfinished OpenAI usage read.
+
+
+## Amendment, 2026-10-20
+
+I separate a known model-specific quota pool from an explicitly mapped selection. The [provider notes](../providers.md#google-quota-read) name the exact mapping and required windows. The complete account report remains visible. Admission uses the frozen selection at preflight and again before launch. Unknown pools and unmapped selections retain conservative checks; configured reserves remain mandatory.
+
+A separate model pool reaching zero must not consume the allowance of the mapped selection. Missing required windows still require a fresh read and cannot establish admission. This changes the earlier all-bucket admission rule without changing metadata ownership, observation freshness or account matching.
