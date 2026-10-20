@@ -526,8 +526,11 @@ export function createIntegrationGit(
       return new Promise<GitResult>((resolve, reject) => {
         let settled = false;
         let recorded = false;
+        let cancelObservation: (() => void) | undefined;
         const groupGone = () => group > 0 && absent(group);
         const finish = () => {
+          cancelObservation?.();
+          cancelObservation = undefined;
           const quiescent = closed && stdoutEnded && stderrEnded && groupGone();
           if (settled) {
             if (quiescent && !recorded) {
@@ -555,6 +558,18 @@ export function createIntegrationGit(
           if (now() >= options.deadline) failure ??= 'deadline';
           if (failure) return reject(failure);
           resolve({ stdout: Buffer.concat(output), code, signal });
+        };
+        // Stream closure can precede the operating system reaping the last group member.
+        // Keep ownership until every closure fact is observed or the original deadline ends.
+        const observe = () => {
+          cancelObservation?.();
+          cancelObservation = undefined;
+          if (closed && stdoutEnded && stderrEnded && groupGone()) return finish();
+          if (!settled && closed)
+            cancelObservation = schedule(
+              observe,
+              Math.max(0, Math.min(10, options.deadline - now())),
+            );
         };
         const sendSignal = (value: NodeJS.Signals) => {
           if (!settled && group > 0 && !groupGone()) {
@@ -596,16 +611,17 @@ export function createIntegrationGit(
         });
         child.stdout.once('end', () => {
           stdoutEnded = true;
+          if (closed) observe();
         });
         child.stderr.once('end', () => {
           stderrEnded = true;
+          if (closed) observe();
         });
         child.once('close', (exitCode, exitSignal) => {
           code = exitCode;
           signal = exitSignal;
           closed = true;
-          if (groupGone()) finish();
-          else stop('ownership');
+          observe();
         });
         cancellations.push(
           schedule(() => stop('deadline'), Math.max(0, options.deadline - now() - 100)),

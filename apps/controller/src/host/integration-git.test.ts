@@ -198,6 +198,7 @@ test('integration refs preserve exact trees and expected heads', async (t) => {
 test('integration effects require durable ownership and quiescence', async (t) => {
   const cases = [
     'success',
+    'close before group disappears',
     'intent refused',
     'owner refused',
     'closure refused',
@@ -232,7 +233,15 @@ test('integration effects require durable ownership and quiescence', async (t) =
     const scheduled: Array<{ at: number; work: () => void; cancelled: boolean }> = [];
     const signals: NodeJS.Signals[] = [];
     const close = (code = 0) => {
-      exists = name === 'remaining group';
+      exists = ['remaining group', 'close before group disappears'].includes(name);
+      if (name === 'close before group disappears')
+        scheduled.push({
+          at: current + 1,
+          work: () => {
+            exists = false;
+          },
+          cancelled: false,
+        });
       if (name !== 'missing EOF') {
         child.stdout.end();
         child.stderr.end();
@@ -322,14 +331,30 @@ test('integration effects require durable ownership and quiescence', async (t) =
     const operation = host.initialize({ deadline: 1000, lifecycle });
     if (name === 'stop') operation.stop();
     await new Promise<void>((resolve) => setImmediate(resolve));
-    for (const timer of scheduled.sort((a, b) => a.at - b.at)) {
+    if (name === 'close before group disappears') {
+      assert.equal(closures, 0);
+      assert.deepEqual(signals, []);
+    }
+    while (scheduled.length) {
+      scheduled.sort((a, b) => a.at - b.at);
+      const timer = scheduled.shift();
+      assert(timer);
       if (timer.cancelled) continue;
       current = timer.at;
       timer.work();
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
     const outcome = await operation.result;
-    assert.equal(outcome.reason === null, name === 'success', name);
+    assert.equal(
+      outcome.reason === null,
+      ['success', 'close before group disappears'].includes(name),
+      name,
+    );
+    if (name === 'close before group disappears') {
+      assert.equal(current, 10);
+      assert.equal(closures, 1);
+      assert.deepEqual(signals, []);
+    }
     if (['deadline', 'late close', 'late final'].includes(name))
       assert.equal(outcome.reason, 'deadline', name);
     if (['output', 'stdout error', 'stderr error'].includes(name))
