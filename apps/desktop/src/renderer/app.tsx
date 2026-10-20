@@ -61,6 +61,7 @@ import {
   useRef,
   useState,
 } from 'react';
+import { ActivityView } from './activity.tsx';
 import wordmark from './assets/crewkite-wordmark.png';
 import inverseWordmark from './assets/crewkite-wordmark-inverse.png';
 import { CombinedTask } from './combined-task.tsx';
@@ -1386,7 +1387,12 @@ export function App() {
                             focusRef={approvalCard}
                           />
                         )}
-                        <ActivityView events={taskEvents} task={task} snapshot={snapshot} />
+                        <ActivityView
+                          key={task.id}
+                          task={task}
+                          snapshot={snapshot}
+                          workspace={workspace}
+                        />
                       </>
                     )}
                     {tab === 'Plan' && (
@@ -1724,169 +1730,6 @@ function CombinedTaskPanel({
       onInspect={onInspect}
       onSelectTask={onSelectTask}
     />
-  );
-}
-
-const eventNames: Record<Event['type'], string> = {
-  'task.created': 'Task created',
-  'conversation.entry': 'Conversation entry saved',
-  'combined.updated': 'Combined progress updated',
-  'task.updated': 'Task state updated',
-  'run.prepared': 'Run prepared',
-  'run.admitted': 'Run admitted',
-  'attempt.launched': 'Worker started',
-  'attempt.output': 'Worker output',
-  'approval.requested': 'Approval requested',
-  'approval.resolved': 'Approval resolved',
-  'usage.observed': 'Usage observation received',
-  'route.reserve_reached': 'Reserve reached',
-  'admissions.paused': 'New admissions paused',
-  'handoff.sealed': 'Handoff packet sealed',
-  'attempt.stopping': 'Worker stopping',
-  'attempt.stopped': 'Worker stopped',
-  'ownership.unknown': 'Writer ownership unknown',
-  'run.interrupted': 'Run interrupted',
-  'candidate.sealed': 'Candidate sealed',
-  'check.completed': 'Check completed',
-  'review.completed': 'Review recorded',
-  'candidate.accepted': 'Candidate accepted',
-  'export.created': 'Export created',
-  'run.failed': 'Run failed',
-};
-
-function ActivityView({
-  events,
-  task,
-  snapshot,
-}: {
-  events: Event[];
-  task: Task;
-  snapshot: Snapshot;
-}) {
-  const tail = useRef<HTMLDivElement>(null);
-  const visible = events.filter(({ type }) => type !== 'task.updated');
-  return (
-    <section className="activity-section">
-      <div className="section-heading">
-        <h2>
-          <Activity size={15} />
-          Activity
-        </h2>
-        <span>{visible.length} events received</span>
-      </div>
-      {visible.length === 0 ? (
-        <Empty
-          icon={<Terminal size={24} />}
-          title={task.state === 'draft' ? 'Ready when you are' : 'Retained task state is available'}
-        >
-          {task.state === 'draft'
-            ? 'Prepare a run to inspect the source, team and routing decision. Worker events will appear here.'
-            : 'New events appear while this client is connected. Inspect the other views for retained state.'}
-        </Empty>
-      ) : (
-        <div className="timeline">
-          {visible.map((event) => {
-            const routeId = 'routeId' in event.payload ? event.payload.routeId : null;
-            const provider = snapshot.routes.find(({ id }) => id === routeId);
-            const output = event.type === 'attempt.output' ? event.payload.text : null;
-            const reason =
-              'reason' in event.payload && typeof event.payload.reason === 'string'
-                ? event.payload.reason
-                : null;
-            const outcome =
-              event.type === 'check.completed' || event.type === 'review.completed'
-                ? (event.payload.review?.outcome ??
-                  (event.payload.passed ? 'passed' : 'not passed'))
-                : null;
-            const tone =
-              outcome === 'passed' || event.type === 'candidate.accepted'
-                ? 'success'
-                : outcome === 'failed' || outcome === 'not passed' || event.type === 'run.failed'
-                  ? 'failure'
-                  : outcome === 'blocked' ||
-                      event.type === 'approval.requested' ||
-                      event.type === 'ownership.unknown' ||
-                      event.type === 'run.interrupted' ||
-                      event.type === 'route.reserve_reached' ||
-                      event.type === 'admissions.paused'
-                    ? 'warning'
-                    : 'neutral';
-            return (
-              <article
-                className={`timeline-row timeline-${tone} event-${event.type.replaceAll('.', '-')}`}
-                key={event.id}
-              >
-                <div className="timeline-marker" aria-hidden="true">
-                  {event.type === 'handoff.sealed' ? (
-                    <GitBranch size={13} />
-                  ) : event.type === 'approval.requested' ? (
-                    <ShieldCheck size={13} />
-                  ) : event.type === 'attempt.output' ? (
-                    <Terminal size={12} />
-                  ) : (
-                    <Circle size={8} />
-                  )}
-                </div>
-                <div className="timeline-content">
-                  <div className="timeline-title">
-                    <strong>
-                      {eventNames[event.type]}
-                      {outcome && ` · ${titleCase(outcome)}`}
-                    </strong>
-                    {provider && (
-                      <span className={`provider-label ${familyClass(provider.family)}`}>
-                        {provider.family}
-                      </span>
-                    )}
-                    <time>
-                      {new Date(event.at).toLocaleTimeString([], {
-                        hour: '2-digit',
-                        minute: '2-digit',
-                        hour12: false,
-                      })}
-                    </time>
-                  </div>
-                  {reason && <p>{reason}</p>}
-                  {output && <pre className="worker-output">{output}</pre>}
-                  {event.type === 'handoff.sealed' && (
-                    <div className="inline-packet">
-                      <GitBranch size={15} />
-                      <span>
-                        Version {event.payload.packet.version} ·{' '}
-                        {event.payload.packet.unfinished.length} unfinished item(s)
-                        <small>Checksum {short(event.payload.checksum)}</small>
-                      </span>
-                      <ShieldCheck size={15} />
-                    </div>
-                  )}
-                  {event.type === 'approval.resolved' && (
-                    <p>
-                      {titleCase(event.payload.status)}:{' '}
-                      {effectTarget(
-                        event.payload,
-                        task,
-                        snapshot.projects.find(({ id }) => id === task.projectId)?.name,
-                      )}
-                    </p>
-                  )}
-                </div>
-              </article>
-            );
-          })}
-          <div ref={tail} />
-        </div>
-      )}
-      {visible.length > 6 && (
-        <button
-          type="button"
-          className="text-button jump-latest"
-          onClick={() => tail.current?.scrollIntoView({ block: 'end' })}
-        >
-          Jump to latest
-          <ArrowRight size={13} />
-        </button>
-      )}
-    </section>
   );
 }
 

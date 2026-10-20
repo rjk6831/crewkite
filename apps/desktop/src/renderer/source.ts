@@ -16,6 +16,9 @@ import {
   ProjectIdSchema,
   type Snapshot,
   SnapshotSchema,
+  TaskActivityPageSchema,
+  type TaskActivityRequest,
+  TaskActivityRequestSchema,
 } from '@crewkite/contracts';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPreviewSource } from './preview.ts';
@@ -131,6 +134,30 @@ export function useWorkspace() {
     events: Event[];
     droppedThrough: string | null;
   }>({ events: [], droppedThrough: null });
+  const [activityRevision, setActivityRevision] = useState(0);
+  const readTaskActivity = useCallback(
+    async (input: Omit<TaskActivityRequest, 'limit'> & { limit?: number }) => {
+      if (!source) throw new Error('The desktop bridge is unavailable.');
+      const request = TaskActivityRequestSchema.parse(input);
+      const result = CommandResultSchema.parse(
+        await source.command({ command: 'GetTaskActivity', payload: request }),
+      );
+      if (result.outcome !== 'applied' && result.outcome !== 'already-applied')
+        throw new Error([result.reason ?? result.outcome, result.next].filter(Boolean).join(' '));
+      const parsed = TaskActivityPageSchema.safeParse(result.data);
+      if (!parsed.success)
+        throw new Error('Task activity is unavailable: the retained page is invalid.');
+      const page = parsed.data;
+      if (
+        page.taskId !== request.taskId ||
+        (request.beforeCursor !== undefined &&
+          page.events.some((event) => BigInt(event.cursor) >= BigInt(request.beforeCursor ?? '0')))
+      )
+        throw new Error('Task activity is unavailable: the page does not match the request.');
+      return page;
+    },
+    [source],
+  );
   const [connection, setConnection] = useState('connecting');
   const [error, setError] = useState<string | null>(null);
   const [transportError, setTransportError] = useState<string | null>(null);
@@ -205,7 +232,7 @@ export function useWorkspace() {
       }
       setActivity((current) => {
         if (current.events.some(({ id }) => id === parsed.data.id)) return current;
-        // shortcut: retain 200 activity rows in this view. Upgrade: page older events by cursor.
+        // Bound the shared live tail. Task Activity reads retained pages separately.
         const ordered = [...current.events, parsed.data].sort((a, b) =>
           BigInt(a.cursor) < BigInt(b.cursor) ? -1 : 1,
         );
@@ -227,6 +254,7 @@ export function useWorkspace() {
       connectionState.current = state;
       setConnection(state);
       if (state === 'connected') {
+        setActivityRevision((value) => value + 1);
         setTransportError(null);
         void refresh().catch((failure: unknown) => {
           if (active)
@@ -247,6 +275,7 @@ export function useWorkspace() {
       else if (notice.kind === 'export') setExportNotice(notice);
       else {
         setHistoryGap(notice.after);
+        setActivityRevision((value) => value + 1);
         void refresh().catch(() => {
           if (active)
             setTransportError('History is incomplete. Reconnect to refresh current task state.');
@@ -398,6 +427,8 @@ export function useWorkspace() {
   return {
     snapshot,
     events,
+    readTaskActivity,
+    activityRevision,
     connection,
     preview,
     pending: pending > 0,
