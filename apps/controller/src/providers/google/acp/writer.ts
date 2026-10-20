@@ -875,7 +875,7 @@ export function decodeAcpPermissionAction(options: {
 export function startGoogleAcpWriter(options: AcpWriterOptions) {
   const plan = planSchema.parse(options.plan);
   let prompt = plan.prompt;
-  let metadata = sessionMeta;
+  let metadata: { antigravity: { disabledTools: string[]; enabledTools?: string[] } } = sessionMeta;
   if (plan.contextLines && !options.readTarget) throw new AcpError('configuration');
   if (options.readTarget) {
     const supplied = googleAcpPromptWithTarget(plan, options.readTarget());
@@ -886,6 +886,7 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
       prompt = supplied;
       metadata = {
         antigravity: {
+          enabledTools: ['edit_file', 'finish'],
           disabledTools: [
             ...sessionMeta.antigravity.disabledTools,
             'view_file',

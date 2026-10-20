@@ -237,6 +237,7 @@ export function runAcpPeer(scenario: AcpPeerCase, fresh = false) {
         if (message.params._meta)
           assert.deepEqual(message.params._meta, {
             antigravity: {
+              ...(suppliedSnapshot ? { enabledTools: ['edit_file', 'finish'] } : {}),
               disabledTools: [
                 'create_file',
                 'invoke_subagent',

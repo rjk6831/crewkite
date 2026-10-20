@@ -369,6 +369,11 @@ test('the acp writer binds an imported client and observed configuration before 
           const write = child.stdin.write.bind(child.stdin);
           child.stdin.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
             const frame = JSON.parse(chunk.toString());
+            if (frame.method === 'session/new')
+              assert.deepEqual(frame.params._meta.antigravity.enabledTools, [
+                'edit_file',
+                'finish',
+              ]);
             if (frame.method === 'session/prompt') {
               assert.equal(
                 frame.params.prompt[0].text,
