@@ -918,6 +918,67 @@ test('the acp protocol consumes one complete live permission and never treats co
       locations: [{ path: absolutePath, line: 1 }],
     };
     assert.deepEqual(decode(editFileTool), action);
+    const refusalCases = [
+      { tool: { ...tool, kind: 'other' }, stage: 'mapping-tool-shape' },
+      {
+        tool: { ...editFileTool, rawInput: { ...editFileTool.rawInput, AllowMultiple: true } },
+        stage: 'native-arguments',
+      },
+      {
+        tool: { ...tool, rawInput: { ...input, TargetFile: '../private-target' } },
+        stage: 'scoped-path-location',
+      },
+      {
+        tool: { ...tool, content: [{ ...diff, newText: 'private-value' }] },
+        stage: 'displayed-diff',
+      },
+      {
+        tool,
+        read: () => ({ ...targetState(), hash: 'private-value' }),
+        stage: 'target-snapshot',
+      },
+      {
+        tool,
+        read: () => ({ ...targetState(), content: '0 0', hash: hash('0 0') }),
+        stage: 'unique-hunk-range',
+      },
+      {
+        tool: {
+          ...tool,
+          rawInput: { ...input, ReplacementContent: '界'.repeat(1400) },
+          content: [{ ...diff, newText: '界'.repeat(1400) }],
+        },
+        stage: 'complete-action',
+      },
+      {
+        tool: {
+          ...tool,
+          rawInput: { ...input, ReplacementContent: '11' },
+          content: [{ ...diff, newText: '11' }],
+        },
+        read: () => {
+          const content = `0${'x'.repeat(65535)}`;
+          return { ...targetState(), content, hash: hash(content) };
+        },
+        stage: 'resulting-target',
+      },
+    ];
+    for (const row of refusalCases)
+      assert.throws(
+        () => decode(row.tool, row.read ?? targetState),
+        (error: unknown) => {
+          assert(error instanceof AcpError);
+          assert.equal(error.reason, 'permission');
+          assert.equal(error.diagnostic?.site, 'permission-action');
+          assert.equal(error.diagnostic?.permissionStage, row.stage);
+          assert(!JSON.stringify(error.diagnostic).includes('private-'));
+          if (row.stage === 'complete-action') {
+            assert((error.diagnostic?.permissionActionBytes ?? 0) > 4096);
+            assert((error.diagnostic?.permissionActionBytes ?? Infinity) <= 1048576);
+          }
+          return true;
+        },
+      );
     for (const invalidEditFile of [
       { rawInput: { ...editFileTool.rawInput, AllowMultiple: true } },
       { rawInput: { ...editFileTool.rawInput, StartLine: 2, EndLine: 2 } },
@@ -1264,6 +1325,7 @@ test('the acp protocol consumes one complete live permission and never treats co
             .map((key) => createHash('sha256').update(key).digest('hex'))
             .sort(),
           editArguments: ['TargetFile', 'TargetContent', 'ReplacementContent', 'AllowMultiple'],
+          permissionStage: 'native-arguments',
         });
       if (scenario === 'duplicate') assert.equal(outcome.diagnostic?.site, 'correlation');
       assert.equal(usages, 1, scenario);
@@ -1611,6 +1673,14 @@ setInterval(() => {}, 1000);
       .success,
     false,
   );
+  for (const diagnostic of [
+    { site: 'permission-action', permissionStage: 'private-value' },
+    { site: 'permission-action', permissionActionBytes: 1048577 },
+    { site: 'permission-action', permissionActionBytes: -1 },
+    { site: 'permission-action', permissionActionBytes: 1.5 },
+    { site: 'permission-action', rawInput: 'private-value' },
+  ])
+    assert.equal(AcpDiagnosticSchema.safeParse(diagnostic).success, false);
   const output = new (await import('node:stream')).PassThrough();
   let reason = '';
   const connection = new AcpConnection(output, (error) => {

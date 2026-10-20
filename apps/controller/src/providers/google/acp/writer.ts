@@ -614,146 +614,170 @@ export function decodeAcpPermissionAction(options: {
   toolMappings: readonly AcpToolMapping[];
   readTarget?: () => AcpTargetSnapshot;
 }): AcpPermissionAction {
-  const tool = toolUpdate.parse(options.tool);
-  const mappings = options.toolMappings
-    .map((entry) => AcpToolMappingSchema.parse(entry))
-    .filter(
-      (entry) =>
-        hashCanonical(acpClientPin(entry.client)) === hashCanonical(acpClientPin(options.client)) &&
-        (entry.schema === 'replace-target-v1'
-          ? entry.toolName === tool.name
-          : entry.client.harnessSha256 === options.client.harnessSha256 &&
-            (entry.toolTitle === tool.title || tool.title === 'Run edit_file?') &&
-            tool.name == null),
-    );
-  if (
-    mappings.length !== 1 ||
-    tool.kind !== 'edit' ||
-    tool.status !== 'pending' ||
-    tool.rawOutput != null ||
-    tool._meta != null
-  )
-    throw new AcpError('permission');
-  const mapping = mappings[0];
-  const input =
-    mapping.schema === 'replace-target-v1'
-      ? {
-          ...z
-            .strictObject({ path: text(4096), oldText: text(65536), newText: text(65536) })
-            .parse(tool.rawInput),
-          startLine: undefined,
-          endLine: undefined,
-        }
-      : tool.title === 'Run edit_file?'
-        ? (() => {
-            const raw = z
-              .strictObject({
-                TargetFile: text(4096),
-                TargetContent: text(65536).min(1),
-                ReplacementContent: text(65536),
-                AllowMultiple: z.literal(false).optional(),
-                StartLine: z.number().int().positive().optional(),
-                EndLine: z.number().int().positive().optional(),
-                Instruction: text(4096).optional(),
-                Description: text(4096).optional(),
-                TargetLintErrorIds: z.array(text(200)).max(32).optional(),
-                toolSummary: text(4096).optional(),
-                toolAction: text(4096).optional(),
-              })
-              .refine((v) => (v.StartLine ?? 1) <= (v.EndLine ?? Number.MAX_SAFE_INTEGER))
-              .parse(tool.rawInput);
-            return {
-              path: raw.TargetFile,
-              oldText: raw.TargetContent,
-              newText: raw.ReplacementContent,
-              startLine: raw.StartLine,
-              endLine: raw.EndLine,
-            };
-          })()
-        : (() => {
-            const raw = z
-              .strictObject({
-                TargetFile: text(4096),
-                TargetContent: text(65536).min(1),
-                ReplacementContent: text(65536),
-              })
-              .parse(tool.rawInput);
-            return {
-              path: raw.TargetFile,
-              oldText: raw.TargetContent,
-              newText: raw.ReplacementContent,
-              startLine: undefined,
-              endLine: undefined,
-            };
-          })();
-  const path = scratchPath(options.scratch, input.path);
-  if (path !== options.target.path) throw new AcpError('permission');
-  for (const location of tool.locations ?? [])
+  let stage: NonNullable<AcpDiagnostic['permissionStage']> = 'mapping-tool-shape';
+  let actionBytes: number | undefined;
+  try {
+    const tool = toolUpdate.parse(options.tool);
+    const mappings = options.toolMappings
+      .map((entry) => AcpToolMappingSchema.parse(entry))
+      .filter(
+        (entry) =>
+          hashCanonical(acpClientPin(entry.client)) ===
+            hashCanonical(acpClientPin(options.client)) &&
+          (entry.schema === 'replace-target-v1'
+            ? entry.toolName === tool.name
+            : entry.client.harnessSha256 === options.client.harnessSha256 &&
+              (entry.toolTitle === tool.title || tool.title === 'Run edit_file?') &&
+              tool.name == null),
+      );
     if (
-      scratchPath(options.scratch, location.path) !== path ||
-      (mapping.schema === 'replace-hunk-v1' &&
-        (tool.title === 'Run edit_file?'
-          ? location.line != null && location.line !== input.startLine
-          : location.line != null))
+      mappings.length !== 1 ||
+      tool.kind !== 'edit' ||
+      tool.status !== 'pending' ||
+      tool.rawOutput != null ||
+      tool._meta != null
     )
       throw new AcpError('permission');
-  for (const content of tool.content ?? []) {
-    const diff = z
-      .strictObject({
-        type: z.literal('diff'),
-        path: text(4096),
-        oldText: text(65536),
-        newText: text(65536),
-        _meta: z.strictObject({ kind: z.literal('modify') }).optional(),
-      })
-      .parse(content);
+    const mapping = mappings[0];
+    stage = 'native-arguments';
+    const input =
+      mapping.schema === 'replace-target-v1'
+        ? {
+            ...z
+              .strictObject({ path: text(4096), oldText: text(65536), newText: text(65536) })
+              .parse(tool.rawInput),
+            startLine: undefined,
+            endLine: undefined,
+          }
+        : tool.title === 'Run edit_file?'
+          ? (() => {
+              const raw = z
+                .strictObject({
+                  TargetFile: text(4096),
+                  TargetContent: text(65536).min(1),
+                  ReplacementContent: text(65536),
+                  AllowMultiple: z.literal(false).optional(),
+                  StartLine: z.number().int().positive().optional(),
+                  EndLine: z.number().int().positive().optional(),
+                  Instruction: text(4096).optional(),
+                  Description: text(4096).optional(),
+                  TargetLintErrorIds: z.array(text(200)).max(32).optional(),
+                  toolSummary: text(4096).optional(),
+                  toolAction: text(4096).optional(),
+                })
+                .refine((v) => (v.StartLine ?? 1) <= (v.EndLine ?? Number.MAX_SAFE_INTEGER))
+                .parse(tool.rawInput);
+              return {
+                path: raw.TargetFile,
+                oldText: raw.TargetContent,
+                newText: raw.ReplacementContent,
+                startLine: raw.StartLine,
+                endLine: raw.EndLine,
+              };
+            })()
+          : (() => {
+              const raw = z
+                .strictObject({
+                  TargetFile: text(4096),
+                  TargetContent: text(65536).min(1),
+                  ReplacementContent: text(65536),
+                })
+                .parse(tool.rawInput);
+              return {
+                path: raw.TargetFile,
+                oldText: raw.TargetContent,
+                newText: raw.ReplacementContent,
+                startLine: undefined,
+                endLine: undefined,
+              };
+            })();
+    stage = 'scoped-path-location';
+    const path = scratchPath(options.scratch, input.path);
+    if (path !== options.target.path) throw new AcpError('permission');
+    for (const location of tool.locations ?? [])
+      if (
+        scratchPath(options.scratch, location.path) !== path ||
+        (mapping.schema === 'replace-hunk-v1' &&
+          (tool.title === 'Run edit_file?'
+            ? location.line != null && location.line !== input.startLine
+            : location.line != null))
+      )
+        throw new AcpError('permission');
+    stage = 'displayed-diff';
+    for (const content of tool.content ?? []) {
+      const diff = z
+        .strictObject({
+          type: z.literal('diff'),
+          path: text(4096),
+          oldText: text(65536),
+          newText: text(65536),
+          _meta: z.strictObject({ kind: z.literal('modify') }).optional(),
+        })
+        .parse(content);
+      if (
+        scratchPath(options.scratch, diff.path) !== path ||
+        diff.oldText !== input.oldText ||
+        diff.newText !== input.newText
+      )
+        throw new AcpError('permission');
+    }
+    if (mapping.schema === 'replace-target-v1') {
+      stage = 'complete-action';
+      const proposed = {
+        type: 'replace-target',
+        path,
+        oldText: input.oldText,
+        newText: input.newText,
+        baseHash: createHash('sha256').update(input.oldText).digest('hex'),
+        mode: options.target.mode,
+      };
+      actionBytes = Math.min(Buffer.byteLength(canonicalJson(proposed)), 1048576);
+      return AcpPermissionActionSchema.parse(proposed);
+    }
+    stage = 'target-snapshot';
+    if (!options.readTarget) throw new AcpError('permission');
+    const target = targetSnapshot.parse(options.readTarget());
+    stage = 'unique-hunk-range';
+    const lines = target.content.split('\n');
+    const ranged =
+      input.startLine != null || input.endLine != null
+        ? lines.slice((input.startLine ?? 1) - 1, input.endLine ?? lines.length).join('\n')
+        : target.content;
+    const offset = target.content.indexOf(input.oldText);
     if (
-      scratchPath(options.scratch, diff.path) !== path ||
-      diff.oldText !== input.oldText ||
-      diff.newText !== input.newText
+      target.path !== path ||
+      target.mode !== options.target.mode ||
+      offset < 0 ||
+      target.content.lastIndexOf(input.oldText) !== offset ||
+      !ranged.includes(input.oldText)
     )
       throw new AcpError('permission');
-  }
-  if (mapping.schema === 'replace-target-v1')
-    return AcpPermissionActionSchema.parse({
-      type: 'replace-target',
+    const merged =
+      target.content.slice(0, offset) +
+      input.newText +
+      target.content.slice(offset + input.oldText.length);
+    stage = 'complete-action';
+    const proposed = {
+      type: 'replace-hunk',
       path,
       oldText: input.oldText,
       newText: input.newText,
-      baseHash: createHash('sha256').update(input.oldText).digest('hex'),
-      mode: options.target.mode,
+      baseHash: target.hash,
+      mode: target.mode,
+      afterHash: createHash('sha256').update(merged).digest('hex'),
+    };
+    actionBytes = Math.min(Buffer.byteLength(canonicalJson(proposed)), 1048576);
+    const action = AcpPermissionActionSchema.parse(proposed);
+    stage = 'resulting-target';
+    acpPermissionAfterHash(action, target);
+    return action;
+  } catch {
+    throw new AcpError('permission', {
+      site: 'permission-action',
+      permissionStage: stage,
+      ...(actionBytes === undefined ? {} : { permissionActionBytes: actionBytes }),
     });
-  if (!options.readTarget) throw new AcpError('permission');
-  const target = targetSnapshot.parse(options.readTarget());
-  const lines = target.content.split('\n');
-  const ranged =
-    input.startLine != null || input.endLine != null
-      ? lines.slice((input.startLine ?? 1) - 1, input.endLine ?? lines.length).join('\n')
-      : target.content;
-  const offset = target.content.indexOf(input.oldText);
-  if (
-    target.path !== path ||
-    target.mode !== options.target.mode ||
-    offset < 0 ||
-    target.content.lastIndexOf(input.oldText) !== offset ||
-    !ranged.includes(input.oldText)
-  )
-    throw new AcpError('permission');
-  const merged =
-    target.content.slice(0, offset) +
-    input.newText +
-    target.content.slice(offset + input.oldText.length);
-  const action = AcpPermissionActionSchema.parse({
-    type: 'replace-hunk',
-    path,
-    oldText: input.oldText,
-    newText: input.newText,
-    baseHash: target.hash,
-    mode: target.mode,
-    afterHash: createHash('sha256').update(merged).digest('hex'),
-  });
-  acpPermissionAfterHash(action, target);
-  return action;
+  }
 }
 
 export function startGoogleAcpWriter(options: AcpWriterOptions) {
@@ -958,7 +982,16 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
           seenTools.add(tool.toolCallId);
           tools.set(tool.toolCallId, tool);
           pending.set(tool.toolCallId, { id, binding, proposal });
-        } catch {
+        } catch (error) {
+          if (error instanceof AcpError && error.diagnostic?.permissionStage) {
+            diagnostic = {
+              ...diagnostic,
+              permissionStage: error.diagnostic.permissionStage,
+              ...(error.diagnostic.permissionActionBytes === undefined
+                ? {}
+                : { permissionActionBytes: error.diagnostic.permissionActionBytes }),
+            };
+          }
           reject(id, diagnostic);
         }
       };

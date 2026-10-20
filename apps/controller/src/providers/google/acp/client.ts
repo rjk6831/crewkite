@@ -96,6 +96,19 @@ export const AcpDiagnosticSchema = z.strictObject({
     .optional(),
   rpcCode: z.number().int().safe().optional(),
   pendingToolCount: z.number().int().min(0).max(256).optional(),
+  permissionStage: z
+    .enum([
+      'mapping-tool-shape',
+      'native-arguments',
+      'scoped-path-location',
+      'displayed-diff',
+      'target-snapshot',
+      'unique-hunk-range',
+      'complete-action',
+      'resulting-target',
+    ])
+    .optional(),
+  permissionActionBytes: z.number().int().min(0).max(1048576).optional(),
   // Keep only digests of machine identifiers. Provider text and argument values stay out.
   toolIdentityHash: z
     .string()
