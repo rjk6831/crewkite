@@ -8,7 +8,7 @@ Large-project handling and GitHub/CI work come first. Practical multi-file chang
 
 This file is the implementation entry point. Read it together with [architecture](architecture.md), [testing](testing.md), [distribution](distribution.md), the [roadmap](roadmap.md) and the repository's current local instructions. Inspect the code and current release evidence before changing anything. A planned capability below is a gap to verify, not an existing feature to assume.
 
-Next slice: D2b.1, workspace and task status pages. Every slice below is planned. No D2b source or package is qualified by this document. Start implementation after the D2 package is published with its matching verification, inventory, cold-launch and same-home reopen evidence. Keep that package available while D2b changes proceed.
+Current slice: D2b.1, workspace and task status pages. [D2 UAT 02](https://github.com/rjk6831/crewkite/releases/tag/d2-uat-02) is published with matching verification, inventory, empty-workspace cold-launch and same-home reopen evidence. Its three public assets passed anonymous download and checksum verification. Implementation has started on `feat/daily-work-integration` from the exact published source `32bc92e52ea38d85afc49d03fda433f6807d9c43`; no D2b source or package is qualified yet. Keep the D2 package available while D2b changes proceed.
 
 | Current-slice card | D2b.1 |
 |--------------------|-------|
@@ -23,6 +23,12 @@ For the next implementation, use this instruction:
 > Read docs/daily-work-slices.md. Verify its progress table against main, CI and the published release receipt. Select the first eligible unreleased slice that fits the available lane, including its named acceptance checks and documentation. Coordinate against the active ownership map before writing. Review it independently, commit it, pass the required CI, and publish a separate UAT candidate with matching source and package evidence. Update this file with the result and the next slice. Preserve existing work and authority boundaries. Reuse concrete authorization already given for this repository and release path; request missing authority only for a new destination or effect. Report an observed blocker with its evidence; do not mark unobserved work complete.
 
 Development can begin against a reviewed frozen interface before its dependency is released. Mark that work dependent and test it with local fixtures. A release is eligible only when every listed dependency has released and its required acceptance is recorded. Ship an eligible ready slice even when a lower-numbered independent slice is unfinished; published slice IDs stay stable. Fix a regression that makes existing work unsafe before opening another feature. If a slice needs more than about a day of implementation, split it at a usable boundary and renumber the remaining unreleased rows and dependencies. Published slice IDs never change. Keep the unfinished capability explicit. A schema-only change can accompany the feature it enables; it does not count as that day's usable feature.
+
+## Provider setup during UAT
+
+The current setup still depends on supported installed clients. Google needs a manual pinned-client import before its separate authentication flow. Local needs an already loaded compatible model and explicit connection setup. Planning currently uses the supported OpenAI profile; execution roles keep their own provider boundaries.
+
+I want one setup view that shows the installed build, authentication readiness, included-usage premise and exact next action for each family. It should guide the Google import and Local connection without collecting cloud credentials, enabling paid usage or submitting a test prompt without consent. Record onboarding failures during D2 UAT and ship small corrections when needed. This follow-up does not replace the large-project and GitHub/CI priorities or count as a completed daily-work slice.
 
 ## What exists at the planning baseline
 
@@ -46,7 +52,7 @@ A day is a target for the next usable increment. It includes review and release 
 
 | Slice | Usable result | Depends on | State | Source, CI and UAT evidence |
 |-------|---------------|------------|-------|-----------------------------|
-| D2b.1 | Open large workspace and task status through complete pages | Published D2 | Planned | None |
+| D2b.1 | Open large workspace and task status through complete pages | Published D2 | In progress | Started from `d2-uat-02`; slice verification and UAT package pending |
 | D2b.2 | Read large artifacts and activity output with bounded memory | D2b.1 | Planned | None |
 | D2b.3 | Prepare and retain a project beyond the old source-size limits | D2b.2 | Planned | None |
 | D2b.4 | See GitHub PR, Actions status and full CI logs inside a task | D2b.2 | Planned | None |
