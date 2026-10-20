@@ -9,6 +9,7 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
   type Command,
+  type CommandResult,
   CommandSchema,
   type ConversationEntry,
   type Event,
@@ -164,6 +165,19 @@ test('protocol mismatches reject the handshake without exposing authentication d
 });
 
 test('CLI actions preserve controller bindings and validate exported bytes', async (context) => {
+  const workspaceHeader = (value: Snapshot) => ({
+    kind: 'workspace-state' as const,
+    version: 1 as const,
+    protocol: 1 as const,
+    stamp: { epoch: 'a'.repeat(32), revision: '0' },
+    cursor: value.cursor,
+    routes: value.routes,
+    usage: value.usage,
+    usageReaders: value.usageReaders,
+    nativeProfiles: value.nativeProfiles,
+    googleAcpSetup: value.googleAcpSetup,
+    ...(value.localSetup ? { localSetup: value.localSetup } : {}),
+  });
   const profile = {
     id: 'openai-file-v1',
     family: 'openai' as const,
@@ -1733,27 +1747,30 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     }
     if (message.type !== 'command') return;
     localCommands.push(message.command);
-    const result =
-      message.command.command === 'GetSnapshot'
-        ? {
-            outcome: 'applied' as const,
-            data: {
-              kind: 'snapshot' as const,
-              snapshot: {
-                ...snapshot,
-                localSetup,
-                tasks: [{ ...task, runId: run.id }],
-                runs: [run],
-                nativeProfiles: [localProfile],
-                nativeRuns: [localNativeRun],
-              },
+    let result: CommandResult = ['GetSnapshot', 'GetWorkspaceState'].includes(
+      message.command.command,
+    )
+      ? {
+          outcome: 'applied' as const,
+          data: {
+            kind: 'snapshot' as const,
+            snapshot: {
+              ...snapshot,
+              localSetup,
+              tasks: [{ ...task, runId: run.id }],
+              runs: [run],
+              nativeProfiles: [localProfile],
+              nativeRuns: [localNativeRun],
             },
-          }
-        : {
-            outcome: localOutcome,
-            reason: 'local-result\u001b[31m\rretained',
-            next: 'Read Local status.',
-          };
+          },
+        }
+      : {
+          outcome: localOutcome,
+          reason: 'local-result\u001b[31m\rretained',
+          next: 'Read Local status.',
+        };
+    if (message.command.command === 'GetWorkspaceState' && result.data?.kind === 'snapshot')
+      result = { outcome: 'applied', data: workspaceHeader(result.data.snapshot) };
     socket.write(encodeFrame({ type: 'result', key: message.command.key, result }));
   });
   context.after(() => localFixture.close());
@@ -1839,7 +1856,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     const receipt = JSON.parse(result.output);
     assert.deepEqual(
       localCommands.map((command) => command.command),
-      ['GetSnapshot', row.command],
+      ['GetWorkspaceState', row.command],
     );
     assert.equal(receipt.command.expectedRevision, 7);
     assert.deepEqual(receipt.command.payload, row.payload);
@@ -1854,7 +1871,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
   });
   assert.deepEqual(
     localCommands.map((command) => command.command),
-    ['GetSnapshot'],
+    ['GetWorkspaceState'],
   );
   const plainLocalStatus = await executeLocal(['local', 'status'], false);
   for (const fact of [
@@ -1879,7 +1896,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
   assert(noAuthStatus.output.includes('Connection connected'));
   assert.deepEqual(
     localCommands.map((command) => command.command),
-    ['GetSnapshot'],
+    ['GetWorkspaceState'],
   );
   localSetup = tokenSetup;
   for (const args of [
@@ -1908,7 +1925,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     assert.equal((await executeLocal(args)).code, 1);
     assert.deepEqual(
       localCommands.map((command) => command.command),
-      ['GetSnapshot'],
+      ['GetWorkspaceState'],
     );
   }
   const configuredLocal = localSetup;
@@ -1919,7 +1936,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
   assert.equal((await executeLocal(['local', 'cancel-input', `cmd_${suffix}`])).code, 1);
   assert.deepEqual(
     localCommands.map((command) => command.command),
-    ['GetSnapshot'],
+    ['GetWorkspaceState'],
   );
   localSetup = configuredLocal;
   localOutcome = 'outcome-unknown';
@@ -2022,7 +2039,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
   assert.equal((await executeLocal(['local', 'disconnect'])).code, 1);
   assert.deepEqual(
     localCommands.map((value) => value.command),
-    ['GetSnapshot'],
+    ['GetWorkspaceState'],
   );
 
   for (const scenario of [
@@ -2399,7 +2416,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
                 { ...pendingApproval, approvalId: 'apr_01ARZ3NDEKTSV4RRFFQ69G5FAW' },
               ]
             : [pendingApproval];
-      if (command.command === 'GetSnapshot')
+      if (command.command === 'GetSnapshot' || command.command === 'GetWorkspaceState')
         result = {
           outcome: 'applied',
           data: {
@@ -2514,6 +2531,8 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
             },
           },
         };
+      if (command.command === 'GetWorkspaceState' && result.data?.kind === 'snapshot')
+        result = { outcome: 'applied', data: workspaceHeader(result.data.snapshot) };
       if (command.command === 'ObserveUsage')
         result = usageCase?.reason
           ? {
@@ -3001,7 +3020,12 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       ].some((name) => scenario === `acp-${name}`);
       assert.equal(result.code, invalid ? 1 : 0, result.errors);
       if (invalid) {
-        assert(received.every((value) => value.command === 'GetSnapshot'));
+        assert(
+          received.every(
+            (value) =>
+              value.command === (args[0] === 'native' ? 'GetWorkspaceState' : 'GetSnapshot'),
+          ),
+        );
         continue;
       }
       const data = JSON.parse(result.output);
@@ -3071,7 +3095,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         });
         assert.deepEqual(
           received.map((value) => value.command),
-          ['GetSnapshot'],
+          ['GetWorkspaceState'],
         );
         const plain = await execute(usageCase.args, false);
         assert.match(
