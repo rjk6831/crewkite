@@ -21,7 +21,9 @@ function formatError(error: unknown): string {
   const field = (name: string, value: unknown) => {
     if (value === undefined) return;
     let scalar: string;
-    if (typeof value === 'string') scalar = value;
+    if (typeof value === 'symbol') {
+      scalar = String(value);
+    } else if (typeof value === 'string') scalar = value;
     else if (typeof value === 'bigint') {
       const limit = 1n << 1024n;
       if (value < -limit || value > limit) {
