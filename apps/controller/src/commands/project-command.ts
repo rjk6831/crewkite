@@ -129,7 +129,7 @@ function canonicalDirectory(path: string, label: string): string {
 
 function inside(root: string, path: string): boolean {
   const child = relative(root, path);
-  return child === '' || (!child.startsWith('..') && !isAbsolute(child));
+  return child === '' || (child !== '..' && !child.startsWith('../') && !isAbsolute(child));
 }
 
 function boundedText(value: unknown, label: string, maximum: number): asserts value is string {
@@ -330,10 +330,12 @@ export function startProjectCommand(
     execution.stop();
   };
   const publish = (source: AsyncIterable<Uint8Array>) =>
-    dependencies.publishStream(source).catch((error: unknown) => {
-      stop();
-      throw error;
-    });
+    Promise.resolve()
+      .then(() => dependencies.publishStream(source))
+      .catch((error: unknown) => {
+        stop();
+        throw error;
+      });
   const stdout = publish(execution.stdout);
   const stderr = publish(execution.stderr);
   const result = (async (): Promise<ProjectCommandResult> => {

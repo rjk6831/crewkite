@@ -83,7 +83,9 @@ function lifecycle(): OwnedProjectCommandLifecycle {
 test('project command definitions stay bound to their source, scratch, executable and environment', (t) => {
   const { root, definition } = fixture(t);
   const linked = join(root, 'linked');
+  const dotted = join(definition.scratchRoot, '..cache');
   symlinkSync(definition.cwd, linked);
+  mkdirSync(dotted);
   const cases: Array<{ name: string; value: ProjectCommandDefinition; message: RegExp }> = [
     {
       name: 'source checkout cwd',
@@ -116,6 +118,7 @@ test('project command definitions stay bound to their source, scratch, executabl
     },
   ];
   assert.equal(validateProjectCommandDefinition(definition), definition);
+  assert.equal(validateProjectCommandDefinition({ ...definition, cwd: dotted }).cwd, dotted);
   for (const row of cases)
     assert.throws(() => validateProjectCommandDefinition(row.value), row.message, row.name);
 });
@@ -212,4 +215,33 @@ test('project commands retain streamed output and classify success, failure and 
     assert.equal(request?.shell, false);
     assert.equal(request?.executableSha256, definition.executableSha256);
   }
+
+  let stops = 0;
+  let close: (terminal: OwnedProjectCommandTerminal) => void = () => {};
+  const terminal = new Promise<OwnedProjectCommandTerminal>((resolve) => {
+    close = resolve;
+  });
+  const operation = startProjectCommand(definition, {
+    lifecycle: lifecycle(),
+    publishStream() {
+      throw Error('disk unavailable');
+    },
+    runner: {
+      launch() {
+        return {
+          stdout: asyncBytes([]),
+          stderr: asyncBytes([]),
+          terminal,
+          stop() {
+            stops += 1;
+            close({ code: null, signal: 'SIGTERM', quiescent: true, reason: 'stopped' });
+          },
+        };
+      },
+    },
+  });
+  const failed = await operation.result;
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.reason, 'output');
+  assert.equal(stops, 1);
 });
