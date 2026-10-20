@@ -110,6 +110,22 @@ test('failure diagnosis bounds cause traversal and ignores unreadable object coe
       error: { name: 'ScalarError', code: 17, operator: 'equal', actual: false, expected: null },
       retained: ['ScalarError', '17', 'equal', 'false', 'null'],
     },
+    {
+      error: {
+        name: 'SymbolError',
+        message: 'symbol mismatch',
+        operator: 'strictEqual',
+        actual: Symbol('observed-token'),
+        expected: Symbol('expected-token'),
+      },
+      retained: [
+        'SymbolError',
+        'symbol mismatch',
+        'strictEqual',
+        'observed-token',
+        'expected-token',
+      ],
+    },
     { error: { actual: 1n << 100000n }, retained: ['[truncated]'] },
   ]) {
     const text = await diagnostic(scenario.error);
