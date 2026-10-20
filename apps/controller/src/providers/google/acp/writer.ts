@@ -510,11 +510,14 @@ const permission = z.strictObject({
   toolCall: toolUpdate,
   options: z
     .array(
-      z.strictObject({
-        optionId: acpIdentifier,
-        name: text(200),
-        kind: z.enum(['allow_once', 'allow_always', 'reject_once', 'reject_always']),
-      }),
+      z
+        .strictObject({
+          optionId: acpIdentifier,
+          name: text(200),
+          kind: z.enum(['allow_once', 'allow_always', 'reject_once', 'reject_always']),
+          _meta: z.unknown().optional(),
+        })
+        .transform(({ optionId, name, kind }) => ({ optionId, name, kind })),
     )
     .min(1)
     .max(16),

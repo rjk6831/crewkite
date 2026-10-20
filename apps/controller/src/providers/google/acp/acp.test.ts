@@ -75,16 +75,34 @@ const environment = {
   SECRET_TOKEN: 'must-not-escape',
   BROWSER: 'must-not-escape',
 };
-function fixture(scenario: AcpPeerCase) {
+function fixture(scenario: AcpPeerCase, optionMetadata = false) {
   mkdirSync(resolve('internal'), { recursive: true });
   const home = mkdtempSync(resolve('internal/acp-peer-'));
   const executable = join(home, 'peer');
   const peer = fileURLToPath(
     new URL('../../../../../../packages/testkit/src/providers/acp-peer.ts', import.meta.url),
   );
+  const metadata = optionMetadata
+    ? `
+const emit = process.stdout.write.bind(process.stdout);
+let pending = '';
+process.stdout.write = function(chunk) {
+  pending += String(chunk);
+  for (;;) {
+    const at = pending.indexOf('\\n'); if (at < 0) break;
+    const value = JSON.parse(pending.slice(0, at)); pending = pending.slice(at + 1);
+    if (value.method === 'session/request_permission')
+      for (const option of value.params.options)
+        option._meta = { optionId:'metadata-option', kind:'allow_always', sessionId:'metadata-session', path:'/outside/target' };
+    emit(JSON.stringify(value)+'\\n');
+  }
+  return true;
+};
+`
+    : '';
   writeFileSync(
     executable,
-    `#!${process.execPath}\nimport {runAcpPeer} from ${JSON.stringify(new URL(`file://${peer}`).href)};runAcpPeer(${JSON.stringify(scenario)});\n`,
+    `#!${process.execPath}\nimport {runAcpPeer} from ${JSON.stringify(new URL(`file://${peer}`).href)};${metadata}runAcpPeer(${JSON.stringify(scenario)});\n`,
     { mode: 0o500 },
   );
   writeFileSync(join(home, 'localharness_external'), harness, { mode: 0o500 });
@@ -1198,6 +1216,37 @@ test('the acp protocol consumes one complete live permission and never treats co
     options: [{ optionId: 'once', name: 'Once', kind: 'allow_once' }],
   };
   assert.deepEqual(decodeAcpPermissionRequest(validPermission), validPermission);
+  for (const metadata of [
+    null,
+    true,
+    1,
+    'fixture',
+    [],
+    { optionId: 'other', kind: 'allow_always' },
+  ])
+    assert.deepEqual(
+      decodeAcpPermissionRequest({
+        ...validPermission,
+        options: validPermission.options.map((option) => ({ ...option, _meta: metadata })),
+      }),
+      validPermission,
+    );
+  const withMetadata = {
+    ...validPermission,
+    options: validPermission.options.map((option) => ({
+      ...option,
+      _meta: { optionId: 'once', kind: 'allow_once', sessionId: 'fixture-session' },
+    })),
+  };
+  for (const input of [
+    { ...withMetadata, sessionId: null },
+    { ...withMetadata, toolCall: null },
+    { ...withMetadata, extraAuthority: true },
+    { ...withMetadata, options: [{ ...withMetadata.options[0], kind: null }] },
+    { ...withMetadata, options: [{ ...withMetadata.options[0], optionId: null }] },
+    { ...withMetadata, options: [{ ...withMetadata.options[0], extraAuthority: true }] },
+  ])
+    assert.throws(() => decodeAcpPermissionRequest(input), AcpError);
   for (const [input, expected] of [
     [null, { code: 'invalid_type', field: 'root', type: 'null' }],
     [
@@ -1372,7 +1421,7 @@ process.stdout.write = function(chunk) {
     'outside-execute',
     'hunk-brain-write',
   ] as const) {
-    const f = fixture(scenario);
+    const f = fixture(scenario, true);
     let permissions = 0,
       usages = 0;
     const toolActivity: { toolCallId?: string; status?: string; locations?: unknown[] }[] = [];
