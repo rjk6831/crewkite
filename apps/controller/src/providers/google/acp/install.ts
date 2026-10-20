@@ -213,8 +213,11 @@ export async function installGoogleAcp(
         redirect: 'error',
         credentials: 'omit',
         cache: 'no-store',
+        headers: { 'Accept-Encoding': 'identity' },
       });
+      const encoding = response.headers.get('content-encoding');
       if (
+        (encoding !== null && encoding !== 'identity') ||
         !response.ok ||
         response.status !== 200 ||
         !response.body ||

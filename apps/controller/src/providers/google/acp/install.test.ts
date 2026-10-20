@@ -78,6 +78,7 @@ test('the fixed installer validates before publishing and preserves existing inp
     'cancel',
     'cancel-stream',
     'http',
+    'encoded',
     'layout',
     'inner',
     'staging',
@@ -123,6 +124,7 @@ test('the fixed installer validates before publishing and preserves existing inp
         downloads++;
         assert.equal(init?.redirect, 'error');
         assert.equal(init?.credentials, 'omit');
+        assert.equal(new Headers(init?.headers).get('accept-encoding'), 'identity');
         if (scenario === 'cancel') {
           controller.abort();
           throw Error('cancelled');
@@ -137,7 +139,15 @@ test('the fixed installer validates before publishing and preserves existing inp
               },
             }),
           );
-        return new Response(body, { status: scenario === 'http' ? 404 : 200 });
+        return new Response(body, {
+          status: scenario === 'http' ? 404 : 200,
+          headers:
+            scenario === 'encoded'
+              ? { 'content-encoding': 'gzip', 'content-length': String(body.length) }
+              : scenario === 'success'
+                ? { 'content-encoding': 'identity' }
+                : {},
+        });
       }) as typeof fetch,
       import: {
         verifySignature: async () => {
@@ -180,6 +190,7 @@ test('the fixed installer validates before publishing and preserves existing inp
             cancel: 'cancelled',
             'cancel-stream': 'cancelled',
             http: 'download-unavailable',
+            encoded: 'download-unavailable',
             layout: 'archive-refused',
             inner: 'archive-refused',
             'cancel-signature': 'cancelled',
