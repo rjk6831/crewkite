@@ -4,8 +4,14 @@ import type {
   ConversationContextPick,
   DesktopNotice,
   Event,
+  ProjectPage,
+  ProjectPageRequest,
   Snapshot,
+  SnapshotScope,
+  TaskPage,
+  TaskPageRequest,
   TransportMessage,
+  WorkspaceState,
 } from '@crewkite/contracts';
 import { MAX_FRAME_BYTES, PROTOCOL_VERSION, TransportMessageSchema } from '@crewkite/contracts';
 
@@ -24,7 +30,10 @@ export type ConversationContextReceipt = { receiptId: string; projectId: string;
 export type ConversationContextCapture = { receiptId: string; result: CommandResult | null };
 export type ConnectionState = 'connecting' | 'connected' | 'offline';
 export interface DesktopSource {
-  getSnapshot(): Promise<Snapshot>;
+  getSnapshot(scope?: SnapshotScope): Promise<Snapshot>;
+  workspaceState(): Promise<WorkspaceState>;
+  projectPage(input: ProjectPageRequest): Promise<ProjectPage>;
+  taskPage(input: TaskPageRequest): Promise<TaskPage>;
   command(input: DesktopCommand): Promise<CommandResult>;
   subscribe(onEvent: (event: Event) => void): () => void;
   onConnection?(listener: (state: ConnectionState) => void): () => void;

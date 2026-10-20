@@ -199,6 +199,45 @@ test('an idempotent retry returns the receipt without creating another task', as
   );
 });
 
+test('project validation refusals settle their exact receipt and allow another folder', async (t) => {
+  const { controller, command, directory, source } = await setup(t);
+  const plain = join(directory, 'plain-folder');
+  const longName = join(directory, 'p'.repeat(201));
+  const valid = join(directory, 'another-project');
+  const nested = join(source.directory, 'nested-folder');
+  for (const path of [plain, longName, valid, nested]) mkdirSync(path);
+  for (const path of [longName, valid]) git(path, ['init', '--quiet']);
+  const before = controller.snapshot();
+  for (const [path, reason] of [
+    [join(directory, 'missing'), 'project-folder-unavailable'],
+    [plain, 'project-folder-unavailable'],
+    [nested, 'project-folder-unavailable'],
+    [longName, 'project-folder-name-invalid'],
+  ]) {
+    const request = command('RegisterProject', { path }, 0);
+    const result = await controller.execute(request, 'local-owner');
+    assert.equal(result.outcome, 'blocked');
+    assert.equal(result.reason, reason);
+    assert(result.next);
+    assert.deepEqual(controller.store.receipt(request.key)?.result, result);
+    assert.deepEqual(await controller.execute(request, 'local-owner'), result);
+    const changed = { ...request, payload: { path: valid } };
+    assert.equal(
+      (await controller.execute(changed, 'local-owner')).reason,
+      'idempotency-key-reused',
+    );
+    assert.equal(controller.snapshot().projects.length, before.projects.length);
+    assert.equal(controller.store.cursor(), before.cursor);
+  }
+  const validRequest = command('RegisterProject', { path: valid }, 0);
+  const result = await controller.execute(validRequest, 'local-owner');
+  assert.equal(result.outcome, 'applied');
+  const committedRetry = await controller.execute(validRequest, 'local-owner');
+  assert.equal(committedRetry.outcome, 'already-applied');
+  assert.deepEqual(committedRetry.entity, result.entity);
+  assert.equal(controller.snapshot().projects.length, before.projects.length + 1);
+});
+
 test('task snapshots retain related evidence within the unchanged frame bound', async (t) => {
   const socketRoot = mkdtempSync(
     join(realpathSync(checkOwner()?.stateRoot ?? tmpdir()), 'ck-snap-'),
@@ -358,12 +397,33 @@ test('task snapshots retain related evidence within the unchanged frame bound', 
   assert.throws(() => encodeFrame(globalMessage), ProtocolError);
   const cursor = controller.store.cursor();
   const receipts = controller.store.db.prepare('SELECT COUNT(*) AS n FROM receipts').get()?.n;
+  const header = controller.workspaceState();
+  assert.equal('tasks' in header, false);
+  // Scoped reads must not materialize unrelated entity collections.
+  const list = controller.store.list.bind(controller.store);
+  controller.store.list = (kind) => {
+    if (['task', 'project', 'run', 'attempt', 'candidate', 'approval', 'artifact'].includes(kind))
+      throw Error(`Unbounded scoped collection: ${kind}`);
+    return list(kind);
+  };
   const server = await serveController(controller);
   const client = await connectController({
     ...readControllerEndpoint(controller.home),
     actor: { id: 'scoped-read', kind: 'cli' },
   });
   try {
+    const workspace = await client.workspaceState();
+    const projectStatus = await client.projectPage({
+      stamp: workspace.stamp,
+      projectId: selected.projectId,
+    });
+    assert.equal(projectStatus.projects[0].taskCount, 2);
+    const taskStatus = await client.taskPage({ stamp: workspace.stamp, taskId: selected.id });
+    assert.deepEqual(
+      taskStatus.tasks.map((task) => task.id),
+      [selected.id],
+    );
+    assert.equal(taskStatus.complete, true);
     for (const scope of [{ taskId: selected.id }, { approvalId: records[0].approval.approvalId }]) {
       const snapshot = await client.snapshot(scope);
       assert.deepEqual(
@@ -414,6 +474,7 @@ test('task snapshots retain related evidence within the unchanged frame bound', 
       CommandSchema.safeParse(command('GetSnapshot', { taskId: selected.id, extra: true })).success,
       false,
     );
+    controller.store.list = list;
     assert.deepEqual(controller.snapshot(), before);
     assert.equal(controller.store.cursor(), cursor);
     assert.equal(
@@ -4555,7 +4616,7 @@ test('an appointed native proposal is retained and applied once after every phas
         ),
       );
       controller.store.db.exec(
-        'INSERT INTO native_processes SELECT * FROM native_processes_saved; DROP TABLE native_processes_saved; DROP TABLE combined_ref_intents; DROP TABLE combined_dispatches; DROP TABLE combined_members; DROP TABLE combined_groups; DROP TABLE conversation_entries; DROP TABLE task_conversations; DROP TABLE run_purposes; DROP TABLE local_control; DROP TABLE google_metadata_operations; DROP TABLE google_usage_reader; DROP TABLE native_profile_bindings; DROP TABLE google_acp_setup; DROP INDEX events_task_cursor; PRAGMA user_version=4',
+        'INSERT INTO native_processes SELECT * FROM native_processes_saved; DROP TABLE native_processes_saved; DROP TABLE combined_ref_intents; DROP TABLE combined_dispatches; DROP TABLE combined_members; DROP TABLE combined_groups; DROP TABLE conversation_entries; DROP TABLE task_conversations; DROP TABLE run_purposes; DROP TABLE local_control; DROP TABLE google_metadata_operations; DROP TABLE google_usage_reader; DROP TABLE native_profile_bindings; DROP TABLE google_acp_setup; DROP INDEX events_task_cursor; DROP INDEX entities_kind_id; DROP INDEX task_project_id; DROP INDEX entities_task_id; DROP INDEX entities_run_id; PRAGMA user_version=4',
       );
       controller.store.applyMigrations(new URL('../../migrations/', import.meta.url).pathname);
       assert.deepEqual(controller.store.nativeProcesses(attempt.attempt_id), previous);

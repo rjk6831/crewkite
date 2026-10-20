@@ -1266,6 +1266,52 @@ export const SnapshotScopeSchema = z.union([
   z.strictObject({ approvalId: ApprovalIdSchema }),
 ]);
 export type SnapshotScope = z.infer<typeof SnapshotScopeSchema>;
+
+export const WorkspaceStampSchema = z.strictObject({
+  epoch: z.string().regex(/^[a-f0-9]{32}$/),
+  revision: CursorSchema,
+});
+export type WorkspaceStamp = z.infer<typeof WorkspaceStampSchema>;
+export const WorkspaceContinuationSchema = z
+  .strictObject({
+    version: z.literal(1),
+    stamp: WorkspaceStampSchema,
+    section: z.enum(['projects', 'tasks']),
+    selectionHash: HashSchema,
+    afterId: z.union([ProjectIdSchema, TaskIdSchema]).nullable(),
+    searchRank: z.number().int().min(0).max(3).optional(),
+  })
+  .superRefine((value, context) => {
+    if (
+      (value.section === 'projects' &&
+        (value.afterId === null ||
+          !value.afterId.startsWith('prj_') ||
+          value.searchRank !== undefined)) ||
+      (value.section === 'tasks' && value.afterId !== null && !value.afterId.startsWith('tsk_'))
+    )
+      context.addIssue({
+        code: 'custom',
+        message: 'A workspace continuation must match its section.',
+      });
+  });
+export type WorkspaceContinuation = z.infer<typeof WorkspaceContinuationSchema>;
+const workspacePageRequest = {
+  stamp: WorkspaceStampSchema,
+  after: WorkspaceContinuationSchema.optional(),
+  limit: z.number().int().min(1).max(100).default(50),
+};
+export const ProjectPageRequestSchema = z.strictObject({
+  ...workspacePageRequest,
+  projectId: ProjectIdSchema.optional(),
+});
+export const TaskPageRequestSchema = z.strictObject({
+  ...workspacePageRequest,
+  projectId: ProjectIdSchema.optional(),
+  taskId: TaskIdSchema.optional(),
+  query: text.optional(),
+});
+export type ProjectPageRequest = z.input<typeof ProjectPageRequestSchema>;
+export type TaskPageRequest = z.input<typeof TaskPageRequestSchema>;
 const runRef = z.strictObject({ taskId: TaskIdSchema, runId: RunIdSchema });
 const evaluationFields = {
   taskId: TaskIdSchema,
@@ -2263,6 +2309,9 @@ export const CommandSchema = z.discriminatedUnion('command', [
   ),
   mutate('ExportPatch', z.strictObject({ taskId: TaskIdSchema, candidateId: CandidateIdSchema })),
   read('GetSnapshot', SnapshotScopeSchema),
+  read('GetWorkspaceState', empty),
+  read('GetProjectPage', ProjectPageRequestSchema),
+  read('GetTaskPage', TaskPageRequestSchema),
   read('GetTaskActivity', TaskActivityRequestSchema),
   read('Subscribe', z.strictObject({ after: CursorSchema })),
   read('GetChanges', taskRef),
@@ -2780,7 +2829,124 @@ export const TaskActivityPageSchema = z
       context.addIssue({ code: 'custom', message: 'An activity page exceeds its byte limit.' });
   });
 export type TaskActivityPage = z.infer<typeof TaskActivityPageSchema>;
+export const MAX_WORKSPACE_PAGE_BYTES = 524288;
+export const WorkspaceStateSchema = z
+  .strictObject({
+    kind: z.literal('workspace-state'),
+    version: z.literal(1),
+    protocol: z.literal(1),
+    stamp: WorkspaceStampSchema,
+    cursor: CursorSchema,
+    usageReaders: SnapshotSchema.shape.usageReaders,
+    googleAcpSetup: SnapshotSchema.shape.googleAcpSetup,
+    localSetup: SnapshotSchema.shape.localSetup,
+    nativeProfiles: SnapshotSchema.shape.nativeProfiles,
+    routes: SnapshotSchema.shape.routes,
+    usage: SnapshotSchema.shape.usage,
+  })
+  .refine(
+    (value) => new TextEncoder().encode(JSON.stringify(value)).byteLength <= MAX_FRAME_BYTES - 4096,
+    'The workspace header exceeds its encoded byte limit.',
+  );
+export type WorkspaceState = z.infer<typeof WorkspaceStateSchema>;
+export const TaskSummarySchema = z
+  .strictObject({
+    id: TaskSchema.shape.id,
+    projectId: TaskSchema.shape.projectId,
+    title: TaskSchema.shape.title,
+    state: TaskSchema.shape.state,
+    waitingReason: TaskSchema.shape.waitingReason,
+    revision: TaskSchema.shape.revision,
+    runId: TaskSchema.shape.runId,
+    next: TaskSchema.shape.next,
+    match: z
+      .strictObject({
+        field: z.enum(['title', 'project', 'outcome', 'criterion', 'task-id', 'project-id']),
+        text,
+      })
+      .optional(),
+  })
+  .superRefine((value, context) => {
+    if ((value.state === 'waiting') !== (value.waitingReason !== null))
+      context.addIssue({
+        code: 'custom',
+        message: 'A task summary must preserve its waiting state.',
+      });
+  });
+export type TaskSummary = z.infer<typeof TaskSummarySchema>;
+const workspacePage = {
+  version: z.literal(1),
+  stamp: WorkspaceStampSchema,
+  cursor: CursorSchema,
+  next: WorkspaceContinuationSchema.nullable(),
+  complete: z.boolean(),
+};
+const validWorkspacePage = (page: {
+  stamp: WorkspaceStamp;
+  next: WorkspaceContinuation | null;
+  complete: boolean;
+}) =>
+  page.complete === (page.next === null) &&
+  (page.next === null ||
+    (page.next.stamp.epoch === page.stamp.epoch &&
+      page.next.stamp.revision === page.stamp.revision)) &&
+  new TextEncoder().encode(JSON.stringify(page)).byteLength <= MAX_WORKSPACE_PAGE_BYTES;
+export const ProjectPageSchema = z
+  .strictObject({
+    ...workspacePage,
+    kind: z.literal('project-page'),
+    projects: z
+      .array(z.strictObject({ ...ProjectSchema.shape, taskCount: RevisionSchema }))
+      .max(100),
+  })
+  .refine(
+    (page) =>
+      validWorkspacePage(page) &&
+      (page.next === null || page.next.section === 'projects') &&
+      page.projects.every(
+        (project, index) => index === 0 || page.projects[index - 1].id < project.id,
+      ),
+    'A project page needs a matching continuation, completeness and byte bound.',
+  );
+export const TaskPageSchema = z
+  .strictObject({
+    ...workspacePage,
+    kind: z.literal('task-page'),
+    tasks: z.array(TaskSummarySchema).max(100),
+    scanned: RevisionSchema,
+  })
+  .refine(
+    (page) =>
+      validWorkspacePage(page) &&
+      (page.next === null || page.next.section === 'tasks') &&
+      new Set(page.tasks.map((task) => task.id)).size === page.tasks.length &&
+      page.tasks.every((task, index) => {
+        if (index === 0) return true;
+        const rank = (value: TaskSummary) =>
+          value.match
+            ? ['title', 'project', 'outcome', 'criterion', 'task-id', 'project-id'].indexOf(
+                value.match.field,
+              )
+            : 0;
+        const order = (value: TaskSummary) => {
+          const valueRank = rank(value);
+          return valueRank < 2 ? valueRank : valueRank < 4 ? 2 : 3;
+        };
+        const previous = page.tasks[index - 1];
+        return (
+          order(previous) < order(task) ||
+          (order(previous) === order(task) && previous.id < task.id)
+        );
+      }),
+    'A task page needs a matching continuation, completeness and byte bound.',
+  );
+export type ProjectPage = z.infer<typeof ProjectPageSchema>;
+export type TaskPage = z.infer<typeof TaskPageSchema>;
+
 export const ReadDataSchema = z.discriminatedUnion('kind', [
+  WorkspaceStateSchema,
+  ProjectPageSchema,
+  TaskPageSchema,
   TaskActivityPageSchema,
   z.strictObject({ kind: z.literal('conversation-state'), state: TaskConversationStateSchema }),
   ConversationPageSchema,

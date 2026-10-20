@@ -458,7 +458,10 @@ test('combined tasks share seven real dispatches and require a separate full bar
               foreignKeys[index],
             );
           }
-          assert.equal(legacy.db.prepare('PRAGMA user_version').get()?.user_version, 13);
+          assert.equal(
+            legacy.db.prepare('PRAGMA user_version').get()?.user_version,
+            readdirSync(migrations).filter((file) => /^\d{3}-[a-z0-9-]+\.sql$/.test(file)).length,
+          );
           assert.deepEqual(legacy.db.prepare('PRAGMA foreign_key_check').all(), []);
           assert.throws(() =>
             legacy.db.prepare('UPDATE combined_groups SET integration_milliseconds=60001').run(),

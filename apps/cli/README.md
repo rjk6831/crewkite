@@ -3,7 +3,8 @@
 The CLI connects to the same controller as the desktop. It reads `CREWKITE_HOME`, defaults to `~/.crewkite`, and accepts `--home path` for isolated state.
 
 ```sh
-pnpm crewkite task list --json
+pnpm crewkite task list
+pnpm crewkite task list --pages --json
 pnpm crewkite health --json
 ```
 
@@ -38,7 +39,13 @@ Task commands use IDs returned by the controller:
 
 Task show and watch snapshots include the current task's pending approvals and next action. Each approval carries its exact binding. Plain output lists approval and denial commands; neither runs automatically.
 
-`--json` produces one JSON object for reads and actions. Watch emits one object per line, beginning with its task snapshot. A fresh snapshot replaces that state after a history gap. Ctrl+C stops watching.
+`task list` streams summary rows through bounded pages until the complete list has been read. A failed page leaves the received rows visible and exits with status 1, reporting an incomplete list. Status and setup commands read workspace metadata without loading task history.
+
+`task list --pages --json` emits one versioned task-page object per line. Each object includes its workspace stamp, cursor, summaries, continuation and completeness. Pages contain at most 100 rows and 512 KiB; the default is 50 rows. Only the final page has `complete: true` and `next: null`. Keep pages from one traversal together. A changed workspace can invalidate the continuation; rerun the command to start a new traversal.
+
+`task list --json` retains the legacy `{ cursor, tasks }` object with full task records. It uses the existing global snapshot and its frame limit; large workspaces can exceed that limit.
+
+Other `--json` reads and actions produce one JSON object. Watch emits one object per line, beginning with its task snapshot. A fresh snapshot replaces that state after a history gap. Ctrl+C stops watching.
 
 Watch retains its cursor while the controller is offline. If the bounded reconnect window ends, it prints the next action and exits with status 1. Start the controller and run watch again to reconnect explicitly.
 

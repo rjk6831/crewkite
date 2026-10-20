@@ -20,6 +20,7 @@ import {
   unavailableNativeProfile,
   unavailableRepositoryProfile,
 } from '../apps/controller/src/providers/openai/profile.ts';
+import { CommandReceipts } from '../apps/desktop/src/main/receipts.ts';
 import { encodeFrame, FrameDecoder } from '../packages/client/src/index.ts';
 import {
   type ControllerClient,
@@ -38,9 +39,13 @@ import {
   canonicalJson,
   type Event,
   EventSchema,
+  MAX_FRAME_BYTES,
+  type Snapshot,
   SnapshotSchema,
   type TaskConversationState,
   TaskConversationStateSchema,
+  TaskPageSchema,
+  type TaskSummary,
 } from '../packages/contracts/src/index.ts';
 import { createDemoFixtures, createTestIds } from '../packages/testkit/src/fixtures.ts';
 
@@ -259,6 +264,119 @@ async function enter(button: Locator) {
   await button.click();
 }
 
+function workspaceRead(snapshot: Snapshot, command: Command): CommandResult | null {
+  const stamp = {
+    epoch: '1'.repeat(32),
+    revision: createHash('sha256')
+      .update(
+        canonicalJson({
+          projects: snapshot.projects.map(({ id, name }) => ({ id, name })),
+          tasks: snapshot.tasks.map(({ id, projectId, title, outcome, criteria }) => ({
+            id,
+            projectId,
+            title,
+            outcome,
+            criteria,
+          })),
+        }),
+      )
+      .digest('hex')
+      .slice(0, 12),
+  };
+  stamp.revision = BigInt(`0x${stamp.revision}`).toString();
+  if (command.command === 'GetWorkspaceState') {
+    const {
+      protocol,
+      cursor,
+      routes,
+      usage,
+      usageReaders,
+      nativeProfiles,
+      googleAcpSetup,
+      localSetup,
+    } = snapshot;
+    return {
+      outcome: 'applied',
+      data: {
+        kind: 'workspace-state',
+        version: 1,
+        stamp,
+        protocol,
+        cursor,
+        routes,
+        usage,
+        usageReaders,
+        nativeProfiles,
+        googleAcpSetup,
+        localSetup,
+      },
+    };
+  }
+  if (command.command === 'GetProjectPage')
+    return {
+      outcome: 'applied',
+      data: {
+        kind: 'project-page',
+        version: 1,
+        stamp,
+        cursor: snapshot.cursor,
+        complete: true,
+        next: null,
+        projects: snapshot.projects.map((project) => ({
+          ...project,
+          taskCount: snapshot.tasks.filter((task) => task.projectId === project.id).length,
+        })),
+      },
+    };
+  if (command.command !== 'GetTaskPage') return null;
+  const request = command.payload;
+  const filtered = snapshot.tasks
+    .filter(
+      (task) =>
+        (!request.projectId || task.projectId === request.projectId) &&
+        (!request.taskId || task.id === request.taskId),
+    )
+    .sort((a, b) => (a.id < b.id ? -1 : 1));
+  const rows = filtered
+    .filter((task) => !request.after?.afterId || task.id > request.after.afterId)
+    .slice(0, request.limit);
+  const tasks: TaskSummary[] = rows.map(
+    ({ id, projectId, title, state, waitingReason, revision, runId, next }) => ({
+      id,
+      projectId,
+      title,
+      state,
+      waitingReason,
+      revision,
+      runId,
+      next,
+    }),
+  );
+  const last = rows.at(-1);
+  const complete = !last || !filtered.some((task) => task.id > last.id);
+  return {
+    outcome: 'applied',
+    data: {
+      kind: 'task-page',
+      version: 1,
+      stamp,
+      cursor: snapshot.cursor,
+      tasks,
+      scanned: rows.length,
+      complete,
+      next: complete
+        ? null
+        : {
+            version: 1,
+            stamp,
+            section: 'tasks',
+            selectionHash: '0'.repeat(64),
+            afterId: last?.id ?? null,
+          },
+    },
+  };
+}
+
 async function pauseRenderer(
   application: Awaited<ReturnType<typeof _electron.launch>>,
   page: Page,
@@ -274,9 +392,14 @@ async function pauseRenderer(
     }, url);
 }
 
-async function desktopSnapshot(page: Page) {
+async function desktopSnapshot(page: Page, taskId?: string) {
   try {
-    return SnapshotSchema.parse(await page.evaluate(() => window.crewkite?.getSnapshot()));
+    return SnapshotSchema.parse(
+      await page.evaluate(
+        (selected) => window.crewkite?.getSnapshot(selected ? { taskId: selected } : undefined),
+        taskId,
+      ),
+    );
   } catch (failure) {
     if (
       failure instanceof Error &&
@@ -344,7 +467,9 @@ async function quotaReadBridge(
           socket.write(encodeFrame({ type: 'welcome', protocol: 1, cursor: '0' }));
         if (message.type !== 'command') continue;
         const request = { command: message.command, socket };
-        if (message.command.command === 'GetSnapshot')
+        const workspace = workspaceRead(snapshot, message.command);
+        if (workspace) reply(request, workspace);
+        else if (message.command.command === 'GetSnapshot')
           reply(request, { outcome: 'applied', data: { kind: 'snapshot', snapshot } });
         else if (message.command.command === 'Subscribe') reply(request, { outcome: 'applied' });
         else if (message.command.command === 'GetTaskConversationState')
@@ -814,7 +939,13 @@ async function conversationBridge(
     snapshot.tasks[0].revision += 1;
     if (state) state.revision = snapshot.tasks[0].revision;
   };
+  let holdTaskPage = false;
+  const heldTaskPages: (() => void)[] = [];
+  const detailReads: Command[] = [];
   const response = (command: Command): CommandResult => {
+    if (command.command === 'GetSnapshot') detailReads.push(command);
+    const workspace = workspaceRead(snapshot, command);
+    if (workspace) return workspace;
     if (command.command === 'GetSnapshot')
       return { outcome: 'applied', data: { kind: 'snapshot', snapshot } };
     if (command.command === 'Subscribe') return { outcome: 'applied' };
@@ -1217,7 +1348,13 @@ async function conversationBridge(
                 result: response(message.command),
               }),
             );
-          if (holdContextRead && message.command.command === 'GetArtifact')
+          if (
+            holdTaskPage &&
+            message.command.command === 'GetTaskPage' &&
+            message.command.payload.after
+          )
+            heldTaskPages.push(reply);
+          else if (holdContextRead && message.command.command === 'GetArtifact')
             heldContextReads.push(reply);
           else reply();
         }
@@ -2088,15 +2225,41 @@ async function conversationBridge(
     await expect(
       page.getByText('Queued for the next planning turn', { exact: true }).last(),
     ).toBeVisible();
+    for (let index = 0; index < 51; index++)
+      snapshot.tasks.push({
+        ...snapshot.tasks[0],
+        id: id('tsk'),
+        title: `Retained navigation ${index}`,
+      });
+    publishTask();
+    const moreTasks = page.getByRole('button', { name: 'Load more tasks', exact: true });
+    await expect(moreTasks).toBeVisible();
+    holdTaskPage = true;
+    await moreTasks.click();
+    await expect.poll(() => heldTaskPages.length).toBe(1);
+    await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeEnabled();
     await page.getByRole('button', { name: 'Stop', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Resume', exact: true })).toHaveCount(0);
     await expect(page.getByText('Stopped', { exact: true }).last()).toBeVisible();
+    holdTaskPage = false;
+    for (const release of heldTaskPages.splice(0)) release();
+    await expect(moreTasks).toHaveCount(0);
+    await expect(
+      page.locator('.task-link').filter({ hasText: 'Retained navigation 50' }),
+    ).toBeVisible();
+
     await expect(contextMeter).toHaveAttribute('aria-label', 'Context window, usage unknown');
     await chooseContext('Source folder', '/registered/project/src');
     await composer.fill('Keep this unsent draft.');
     await page.getByRole('tab', { name: 'Plan', exact: true }).click();
     await page.getByRole('tab', { name: 'Conversation', exact: true }).click();
     await expect(composer).toHaveValue('Keep this unsent draft.');
+    assert(detailReads.length > 0);
+    assert(
+      detailReads.every(
+        (command) => command.command === 'GetSnapshot' && 'taskId' in command.payload,
+      ),
+    );
     const mutations = received.length;
     await page.reload();
     await expect(page.getByRole('tab', { name: 'Conversation', exact: true })).toHaveAttribute(
@@ -2233,10 +2396,41 @@ async function taskActivityHistory(
   const at = '2026-10-18T00:00:00.000Z';
   const id = createTestIds(at, 1000n);
   const fixture = createDemoFixtures(at);
+  const invalidProject = join(home, 'invalid-project-choice');
+  const validProject = join(home, 'recovery-project');
+  mkdirSync(invalidProject);
+  mkdirSync(validProject);
+  git(validProject, ['init', '--quiet']);
+  const legacyRegistration = CommandSchema.parse({
+    protocol: 1,
+    key: createCommandKey(),
+    actor: { id: 'desktop', kind: 'desktop' },
+    command: 'RegisterProject',
+    expectedRevision: 0,
+    payload: { path: invalidProject },
+  });
+  const retainedRegistration = new CommandReceipts(home, home);
+  retainedRegistration.retain(legacyRegistration, true);
+  const registrationRequests: Command[] = [];
+
   const task = { ...fixture.task, id: id('tsk'), title: 'Read retained task activity' };
   const other = { ...task, id: id('tsk'), title: 'Inspect a different history' };
   const empty = { ...task, id: id('tsk'), title: 'Inspect an empty history' };
   const blocked = { ...task, id: id('tsk'), title: 'Inspect a blocked history' };
+  const retainedTasks = [
+    task,
+    other,
+    empty,
+    blocked,
+    ...Array.from({ length: 300 }, (_, index) => ({
+      ...task,
+      id: id('tsk'),
+      title: `Retained workspace task ${String(index).padStart(3, '0')}`,
+      outcome: 'x'.repeat(4096),
+    })),
+  ];
+  const lastRetainedTask = retainedTasks.at(-1);
+  assert(lastRetainedTask);
   const options = {
     home,
     now: () => at,
@@ -2260,6 +2454,12 @@ async function taskActivityHistory(
     const execute = runtime.controller.execute.bind(runtime.controller);
     runtime.controller.execute = async (input, principal) => {
       const command = CommandSchema.parse(input);
+      if (command.command === 'RegisterProject') registrationRequests.push(command);
+      if (command.command === 'GetSnapshot')
+        assert(
+          'taskId' in command.payload,
+          'Large workspace clients must read selected task detail only.',
+        );
       const result = await execute(command, principal);
       if (command.command === 'GetTaskActivity') {
         requests.push(command);
@@ -2278,6 +2478,7 @@ async function taskActivityHistory(
     };
   };
   instrument();
+  const controllerReceipt = () => runtime.controller.store.receipt(legacyRegistration.key);
   const append = (taskId: string | null, text: string) =>
     runtime.controller.store.transaction(() =>
       runtime.controller.store.append({
@@ -2295,7 +2496,7 @@ async function taskActivityHistory(
   runtime.controller.store.transaction(() => {
     const project = fixture.snapshot.projects[0];
     runtime.controller.store.put('project', project.id, project.revision, project);
-    for (const value of [task, other, empty, blocked])
+    for (const value of retainedTasks)
       runtime.controller.store.put('task', value.id, value.revision, value);
   });
   for (let index = 0; index < 360; index++) {
@@ -2316,6 +2517,20 @@ async function taskActivityHistory(
   );
   const afterBoundary = append(blocked.id, 'Retained output above the blocked boundary.');
   assert(afterBoundary.type === 'attempt.output');
+  const legacyBytes = Buffer.byteLength(
+    JSON.stringify({
+      type: 'result',
+      key: createCommandKey(),
+      result: {
+        outcome: 'applied',
+        data: { kind: 'snapshot', snapshot: runtime.controller.snapshot() },
+      },
+    }),
+  );
+  assert(
+    legacyBytes > MAX_FRAME_BYTES,
+    'The retained workspace must exceed the legacy full snapshot frame.',
+  );
   const activity = page.locator('.activity-section');
   const outputs = () => activity.locator('.worker-output').allTextContents();
   const seen = new Set<string>();
@@ -2361,6 +2576,47 @@ async function taskActivityHistory(
       'local-owner',
     );
     assert.equal(prerequisite.outcome, 'applied', 'The retained activity API must be installed.');
+    const listing = spawn(
+      node,
+      [join(root, 'apps/cli/src/main.ts'), 'task', 'list', '--pages', '--json', '--home', home],
+      {
+        cwd: root,
+        env: environment(home),
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
+    let listed = '';
+    let listingError = '';
+    listing.stdout?.on('data', (bytes: Buffer) => {
+      listed += bytes.toString();
+    });
+    listing.stderr?.on('data', (bytes: Buffer) => {
+      listingError += bytes.toString();
+    });
+    try {
+      const code = await bounded(
+        new Promise<number | null>((resolve, reject) => {
+          listing.once('error', reject);
+          listing.once('close', resolve);
+        }),
+        10000,
+        'Large workspace CLI page traversal',
+      );
+      assert.equal(code, 0, listingError);
+      const pages = listed
+        .trim()
+        .split('\n')
+        .map((line) => TaskPageSchema.parse(JSON.parse(line)));
+      const listedIds = pages.flatMap((part) => part.tasks.map((row) => row.id));
+      assert.equal(pages.at(-1)?.complete, true);
+      assert.equal(listedIds.length, retainedTasks.length);
+      assert.equal(new Set(listedIds).size, retainedTasks.length);
+      assert.deepEqual(listedIds, retainedTasks.map((row) => row.id).sort());
+      assert.equal(listedIds.at(-1), lastRetainedTask.id);
+    } finally {
+      await stop(listing);
+    }
+
     await application.evaluate(
       async ({ BrowserWindow }, options) => {
         const load = process.mainModule?.require.bind(process.mainModule);
@@ -2395,6 +2651,72 @@ async function taskActivityHistory(
     );
     await page.reload();
     await expect(page.getByText('Controller connected', { exact: true })).toBeVisible();
+    const retryRegistration = page.getByRole('button', {
+      name: 'Retry exact command',
+      exact: true,
+    });
+    await expect(retryRegistration).toBeVisible();
+    await page.reload();
+    await expect(retryRegistration).toBeVisible();
+    assert.equal(controllerReceipt(), undefined);
+    await page.getByRole('button', { name: 'Add project', exact: true }).click();
+    await expect(page.getByRole('alert')).toContainText(
+      'Resolve the pending desktop command first.',
+    );
+    await page.getByRole('button', { name: 'Dismiss error', exact: true }).click();
+    await retryRegistration.click();
+    await expect(page.getByRole('alert')).toContainText('Choose a readable Git repository root.');
+    await expect(retryRegistration).toHaveCount(0);
+    assert.deepEqual(registrationRequests, [legacyRegistration]);
+    assert.equal(controllerReceipt()?.result.outcome, 'blocked');
+    retainedRegistration.load();
+    assert.deepEqual(retainedRegistration.commands, []);
+    await page.getByRole('button', { name: 'Dismiss error', exact: true }).click();
+
+    await expect(page.getByRole('button', { name: task.title, exact: true })).toBeVisible();
+    await expect(page.getByRole('heading', { name: task.title, exact: true })).toBeVisible();
+    await expect(page.locator('.project-group .count')).toHaveText(String(retainedTasks.length));
+    const moreTasks = page.getByRole('button', { name: 'Load more tasks', exact: true });
+    const retainedButtons = page.getByRole('button', { name: /^Retained workspace task / });
+    for (let pageIndex = 1; pageIndex < Math.ceil(retainedTasks.length / 50); pageIndex++) {
+      await moreTasks.click();
+      await expect(retainedButtons).toHaveCount(
+        Math.min((pageIndex + 1) * 50, retainedTasks.length) - 4,
+      );
+    }
+    await expect(moreTasks).toHaveCount(0);
+    await page.getByRole('button', { name: lastRetainedTask.title, exact: true }).click();
+    await expect(
+      page.getByRole('heading', { name: lastRetainedTask.title, exact: true }),
+    ).toBeVisible();
+    console.log(
+      `Retained workspace: ${retainedTasks.length} tasks, legacy snapshot ${legacyBytes} bytes; desktop last-task selection and CLI pages complete.`,
+    );
+    const pickProjectFolder = async (path: string) => {
+      await application.evaluate(({ dialog }, filePath) => {
+        const original = dialog.showOpenDialog;
+        dialog.showOpenDialog = async () => {
+          dialog.showOpenDialog = original;
+          return { canceled: false, filePaths: [filePath] };
+        };
+      }, path);
+      await page.getByRole('button', { name: 'Add project', exact: true }).click();
+    };
+    await pickProjectFolder(invalidProject);
+    await expect(page.getByRole('alert')).toContainText('Choose a readable Git repository root.');
+    await expect(
+      page.getByRole('button', { name: 'Retry exact command', exact: true }),
+    ).toHaveCount(0);
+    await page.getByRole('button', { name: 'Dismiss error', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Add project', exact: true })).toBeEnabled();
+    await pickProjectFolder(validProject);
+    await expect(
+      page.locator('.project-name').filter({ hasText: 'recovery-project' }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole('button', { name: 'Retry exact command', exact: true }),
+    ).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Add project', exact: true })).toBeEnabled();
     await openTask(task.title);
     await expect(
       activity.getByText(marker(359), { exact: true }),
@@ -2479,7 +2801,7 @@ async function taskActivityHistory(
     await openTask(task.title);
     outstanding.release.resolve();
     outstanding = undefined;
-    await desktopSnapshot(page);
+    await desktopSnapshot(page, task.id);
     await page.evaluate(
       () =>
         new Promise<void>((resolve) => {
@@ -2556,6 +2878,34 @@ async function taskActivityHistory(
     await expect(activity.getByText(marker(361), { exact: true })).toBeVisible();
     await inspectWindow();
     assert(BigInt(reconnected.cursor) > BigInt(live.cursor));
+    await runtime.close();
+    await expect(page.getByText('Controller offline', { exact: true })).toBeVisible();
+    const restored = new DatabaseSync(join(home, 'state.sqlite'));
+    try {
+      restored.exec("DELETE FROM events; DELETE FROM sqlite_sequence WHERE name='events'");
+    } finally {
+      restored.close();
+    }
+    runtime = await startController(options);
+    instrument();
+    runtime.controller.store.transaction(() => {
+      const replacement = {
+        ...task,
+        title: 'Inspect restored task detail',
+        revision: task.revision + 1,
+      };
+      runtime.controller.store.put('task', task.id, replacement.revision, replacement);
+    });
+    const restoredEvent = append(task.id, 'Restored home activity');
+    assert(BigInt(restoredEvent.cursor) < BigInt(reconnected.cursor));
+    await expect(
+      page.getByRole('heading', { name: 'Inspect restored task detail', exact: true }),
+    ).toBeVisible();
+    await expect(activity.getByText('Restored home activity', { exact: true })).toBeVisible();
+    append(task.id, 'Restored live activity');
+    await expect(activity.getByText('Restored live activity', { exact: true })).toBeVisible();
+    await expect(activity.getByText(marker(361), { exact: true })).toHaveCount(0);
+
     assert.equal(
       runtime.controller.snapshot().attempts.length,
       0,

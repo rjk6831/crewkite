@@ -5,8 +5,11 @@ import {
   canonicalJson,
   type Event,
   type HandoffPacket,
+  type ProjectPageRequest,
   type Run,
   type Task,
+  type TaskPageRequest,
+  type WorkspaceStamp,
 } from '@crewkite/contracts';
 import { createDemoFixtures, createTestIds, DEMO_TIME } from '@crewkite/testkit';
 import type { DesktopCommand, DesktopSource } from './source.ts';
@@ -284,8 +287,96 @@ export function createPreviewSource(): DesktopSource {
     }
     return { outcome: 'blocked', reason: 'The preview task or run could not be found.' };
   }
+  let projection = '';
+  let generation = 0n;
+  const currentStamp = (): WorkspaceStamp => {
+    const next = canonicalJson({
+      projects: state.projects.map(({ id, name }) => ({ id, name })),
+      tasks: state.tasks.map(({ id, projectId, title, outcome, criteria }) => ({
+        id,
+        projectId,
+        title,
+        outcome,
+        criteria,
+      })),
+    });
+    if (next !== projection) {
+      projection = next;
+      generation += 1n;
+    }
+    return { epoch: '0'.repeat(32), revision: generation.toString() };
+  };
+  const workspaceState = async () => ({
+    kind: 'workspace-state' as const,
+    version: 1 as const,
+    protocol: 1 as const,
+    stamp: currentStamp(),
+    cursor: state.cursor,
+    routes: state.routes,
+    usage: state.usage,
+    usageReaders: state.usageReaders,
+    nativeProfiles: state.nativeProfiles,
+    googleAcpSetup: state.googleAcpSetup,
+    localSetup: state.localSetup,
+  });
+  const projectPage = async (input: Omit<ProjectPageRequest, 'limit'> & { limit?: number }) => ({
+    kind: 'project-page' as const,
+    version: 1 as const,
+    stamp: currentStamp(),
+    cursor: state.cursor,
+    projects: state.projects
+      .filter((project) => !input.projectId || project.id === input.projectId)
+      .map((project) => ({
+        ...project,
+        taskCount: state.tasks.filter((task) => task.projectId === project.id).length,
+      })),
+    next: null,
+    complete: true,
+  });
+  const taskPage = async (input: Omit<TaskPageRequest, 'limit'> & { limit?: number }) => {
+    const query = input.query?.trim();
+    const pattern = query ? new RegExp(query.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&'), 'iu') : null;
+    const tasks = state.tasks
+      .filter(
+        (task) =>
+          (!input.projectId || task.projectId === input.projectId) &&
+          (!input.taskId || task.id === input.taskId),
+      )
+      .flatMap((task) => {
+        const fields = [
+          task.title,
+          state.projects.find((project) => project.id === task.projectId)?.name ?? '',
+          task.outcome,
+          ...task.criteria,
+          task.id,
+          task.projectId,
+        ];
+        if (pattern && !fields.some((text) => pattern.test(text))) return [];
+        const { id, projectId, title, state: status, waitingReason, revision, runId, next } = task;
+        return [{ id, projectId, title, state: status, waitingReason, revision, runId, next }];
+      });
+    return {
+      kind: 'task-page' as const,
+      version: 1 as const,
+      stamp: currentStamp(),
+      cursor: state.cursor,
+      tasks,
+      next: null,
+      complete: true,
+      scanned: state.tasks.length,
+    };
+  };
   return {
-    getSnapshot: async () => structuredClone(state),
+    workspaceState,
+    projectPage,
+    taskPage,
+    getSnapshot: async (scope) => {
+      if (!scope || !('taskId' in scope) || !scope.taskId)
+        throw new Error('Choose a task to read its detail.');
+      const detail = structuredClone(state);
+      detail.tasks = detail.tasks.filter((task) => task.id === scope.taskId);
+      return detail;
+    },
     command,
     subscribe(listener) {
       listeners.add(listener);

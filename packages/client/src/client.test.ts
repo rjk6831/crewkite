@@ -9,6 +9,7 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
   type Command,
+  type CommandResult,
   CommandSchema,
   type ConversationEntry,
   type Event,
@@ -164,6 +165,19 @@ test('protocol mismatches reject the handshake without exposing authentication d
 });
 
 test('CLI actions preserve controller bindings and validate exported bytes', async (context) => {
+  const workspaceHeader = (value: Snapshot) => ({
+    kind: 'workspace-state' as const,
+    version: 1 as const,
+    protocol: 1 as const,
+    stamp: { epoch: 'a'.repeat(32), revision: '0' },
+    cursor: value.cursor,
+    routes: value.routes,
+    usage: value.usage,
+    usageReaders: value.usageReaders,
+    nativeProfiles: value.nativeProfiles,
+    googleAcpSetup: value.googleAcpSetup,
+    ...(value.localSetup ? { localSetup: value.localSetup } : {}),
+  });
   const profile = {
     id: 'openai-file-v1',
     family: 'openai' as const,
@@ -1733,27 +1747,30 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     }
     if (message.type !== 'command') return;
     localCommands.push(message.command);
-    const result =
-      message.command.command === 'GetSnapshot'
-        ? {
-            outcome: 'applied' as const,
-            data: {
-              kind: 'snapshot' as const,
-              snapshot: {
-                ...snapshot,
-                localSetup,
-                tasks: [{ ...task, runId: run.id }],
-                runs: [run],
-                nativeProfiles: [localProfile],
-                nativeRuns: [localNativeRun],
-              },
+    let result: CommandResult = ['GetSnapshot', 'GetWorkspaceState'].includes(
+      message.command.command,
+    )
+      ? {
+          outcome: 'applied' as const,
+          data: {
+            kind: 'snapshot' as const,
+            snapshot: {
+              ...snapshot,
+              localSetup,
+              tasks: [{ ...task, runId: run.id }],
+              runs: [run],
+              nativeProfiles: [localProfile],
+              nativeRuns: [localNativeRun],
             },
-          }
-        : {
-            outcome: localOutcome,
-            reason: 'local-result\u001b[31m\rretained',
-            next: 'Read Local status.',
-          };
+          },
+        }
+      : {
+          outcome: localOutcome,
+          reason: 'local-result\u001b[31m\rretained',
+          next: 'Read Local status.',
+        };
+    if (message.command.command === 'GetWorkspaceState' && result.data?.kind === 'snapshot')
+      result = { outcome: 'applied', data: workspaceHeader(result.data.snapshot) };
     socket.write(encodeFrame({ type: 'result', key: message.command.key, result }));
   });
   context.after(() => localFixture.close());
@@ -1839,7 +1856,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     const receipt = JSON.parse(result.output);
     assert.deepEqual(
       localCommands.map((command) => command.command),
-      ['GetSnapshot', row.command],
+      ['GetWorkspaceState', row.command],
     );
     assert.equal(receipt.command.expectedRevision, 7);
     assert.deepEqual(receipt.command.payload, row.payload);
@@ -1854,7 +1871,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
   });
   assert.deepEqual(
     localCommands.map((command) => command.command),
-    ['GetSnapshot'],
+    ['GetWorkspaceState'],
   );
   const plainLocalStatus = await executeLocal(['local', 'status'], false);
   for (const fact of [
@@ -1879,7 +1896,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
   assert(noAuthStatus.output.includes('Connection connected'));
   assert.deepEqual(
     localCommands.map((command) => command.command),
-    ['GetSnapshot'],
+    ['GetWorkspaceState'],
   );
   localSetup = tokenSetup;
   for (const args of [
@@ -1908,7 +1925,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     assert.equal((await executeLocal(args)).code, 1);
     assert.deepEqual(
       localCommands.map((command) => command.command),
-      ['GetSnapshot'],
+      ['GetWorkspaceState'],
     );
   }
   const configuredLocal = localSetup;
@@ -1919,7 +1936,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
   assert.equal((await executeLocal(['local', 'cancel-input', `cmd_${suffix}`])).code, 1);
   assert.deepEqual(
     localCommands.map((command) => command.command),
-    ['GetSnapshot'],
+    ['GetWorkspaceState'],
   );
   localSetup = configuredLocal;
   localOutcome = 'outcome-unknown';
@@ -2022,7 +2039,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
   assert.equal((await executeLocal(['local', 'disconnect'])).code, 1);
   assert.deepEqual(
     localCommands.map((value) => value.command),
-    ['GetSnapshot'],
+    ['GetWorkspaceState'],
   );
 
   for (const scenario of [
@@ -2399,7 +2416,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
                 { ...pendingApproval, approvalId: 'apr_01ARZ3NDEKTSV4RRFFQ69G5FAW' },
               ]
             : [pendingApproval];
-      if (command.command === 'GetSnapshot')
+      if (command.command === 'GetSnapshot' || command.command === 'GetWorkspaceState')
         result = {
           outcome: 'applied',
           data: {
@@ -2514,6 +2531,8 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
             },
           },
         };
+      if (command.command === 'GetWorkspaceState' && result.data?.kind === 'snapshot')
+        result = { outcome: 'applied', data: workspaceHeader(result.data.snapshot) };
       if (command.command === 'ObserveUsage')
         result = usageCase?.reason
           ? {
@@ -3001,7 +3020,12 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       ].some((name) => scenario === `acp-${name}`);
       assert.equal(result.code, invalid ? 1 : 0, result.errors);
       if (invalid) {
-        assert(received.every((value) => value.command === 'GetSnapshot'));
+        assert(
+          received.every(
+            (value) =>
+              value.command === (args[0] === 'native' ? 'GetWorkspaceState' : 'GetSnapshot'),
+          ),
+        );
         continue;
       }
       const data = JSON.parse(result.output);
@@ -3071,7 +3095,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         });
         assert.deepEqual(
           received.map((value) => value.command),
-          ['GetSnapshot'],
+          ['GetWorkspaceState'],
         );
         const plain = await execute(usageCase.args, false);
         assert.match(
@@ -3749,6 +3773,123 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       if (scenario === 'existing') assert.equal(readFileSync(destination, 'utf8'), 'original');
     }
   }
+});
+
+test('workspace resync reads a small header on startup gaps and reconnects', async (context) => {
+  let headers = 0;
+  let snapshots = 0;
+  let socketToDrop: Socket | undefined;
+  let complete!: () => void;
+  let startup!: () => void;
+  const started = new Promise<void>((done) => {
+    startup = done;
+  });
+  const reconnected = new Promise<void>((done) => {
+    complete = done;
+  });
+  const fixture = await serve((message, socket, connection) => {
+    if (message.type === 'hello') {
+      socketToDrop = socket;
+      socket.write(encodeFrame({ type: 'welcome', protocol: 1, cursor: '2002' }));
+    }
+    if (message.type !== 'command') return;
+    const command = message.command;
+    if (command.command === 'GetSnapshot') snapshots++;
+    if (command.command === 'Subscribe') {
+      if (command.payload.after !== (connection === 1 ? '2002' : '4004'))
+        socket.write(encodeFrame({ type: 'resync', reason: 'history-gap', cursor: '2002' }));
+      socket.write(
+        encodeFrame({ type: 'result', key: command.key, result: { outcome: 'applied' } }),
+      );
+      if (command.payload.after === (connection === 1 ? '2002' : '4004')) {
+        if (connection === 1) startup();
+        else complete();
+      }
+    }
+    if (command.command === 'GetWorkspaceState') {
+      headers++;
+      socket.write(
+        encodeFrame({
+          type: 'result',
+          key: command.key,
+          result: {
+            outcome: 'applied',
+            data: {
+              kind: 'workspace-state',
+              version: 1,
+              protocol: 1,
+              stamp: { epoch: 'a'.repeat(32), revision: '1' },
+              cursor: connection === 1 ? '2002' : '4004',
+              routes: snapshot.routes,
+              usage: snapshot.usage,
+              usageReaders: snapshot.usageReaders,
+              googleAcpSetup: snapshot.googleAcpSetup,
+              localSetup: snapshot.localSetup,
+              nativeProfiles: snapshot.nativeProfiles,
+            },
+          },
+        }),
+      );
+    }
+  });
+  context.after(() => fixture.close());
+  const client = await connectController({ ...fixture, token, actor, reconnectDelaysMs: [0] });
+  context.after(() => client.close());
+  const cursors: string[] = [];
+  await client.subscribe(
+    '0',
+    () => {},
+    () => {
+      throw Error('Legacy snapshot callback used');
+    },
+    {
+      resync: 'workspace',
+      onResync: (header) => cursors.push(header.cursor),
+    },
+  );
+  await started;
+  assert.ok(socketToDrop);
+  socketToDrop.destroy();
+  await reconnected;
+  assert.equal(snapshots, 0);
+  assert.equal(headers, 2);
+  assert.deepEqual(cursors, ['2002', '4004']);
+  let refusals = 0;
+  const refused = await serve((message, socket) => {
+    if (message.type === 'hello')
+      socket.write(encodeFrame({ type: 'welcome', protocol: 1, cursor: '2002' }));
+    if (message.type !== 'command') return;
+    const command = message.command;
+    if (command.command === 'Subscribe') {
+      socket.write(encodeFrame({ type: 'resync', reason: 'history-gap', cursor: '2002' }));
+      socket.write(
+        encodeFrame({ type: 'result', key: command.key, result: { outcome: 'applied' } }),
+      );
+    } else {
+      refusals++;
+      socket.write(
+        encodeFrame({
+          type: 'result',
+          key: command.key,
+          result: { outcome: 'unsupported', reason: 'invalid-command' },
+        }),
+      );
+    }
+  });
+  context.after(() => refused.close());
+  const refusing = await connectController({ ...refused, token, actor, reconnectDelaysMs: [0, 0] });
+  context.after(() => refusing.close());
+  let disconnected!: () => void;
+  const offline = new Promise<void>((done) => {
+    disconnected = done;
+  });
+  refusing.onConnection((state) => {
+    if (state === 'offline') disconnected();
+  });
+  await refusing.subscribe('0', () => {}, undefined, { resync: 'workspace' });
+  await offline;
+  assert.equal(refusals, 1);
+  await assert.rejects(refusing.connect(), /closed/);
 });
 
 test('reconnection replays retained events and snapshots only after a history gap', async (context) => {

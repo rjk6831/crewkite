@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { chmodSync, lstatSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -17,6 +18,7 @@ import {
   type Run,
   type Task,
   TimestampSchema,
+  type WorkspaceStamp,
 } from '@crewkite/contracts';
 
 export type EntityKind =
@@ -169,6 +171,9 @@ export function nativePhaseSequence(
 export class Store {
   readonly db: DatabaseSync;
   private transactionEvents: Event[] | null = null;
+  private readonly workspaceEpoch = randomBytes(16).toString('hex');
+  private workspaceRevision = 0n;
+  private workspaceDirty = false;
   private readonly listeners = new Set<(event: Event) => void>();
 
   constructor(path: string) {
@@ -208,6 +213,8 @@ export class Store {
   transaction<T>(work: () => T): T {
     if (this.transactionEvents) throw new Error('Nested controller transactions are unsupported.');
     this.transactionEvents = [];
+    this.workspaceDirty = false;
+    let projectionChanged = false;
     let active = false;
     let result: T;
     let events: Event[] = [];
@@ -220,6 +227,7 @@ export class Store {
       this.db.exec('COMMIT');
       active = false;
       events = this.transactionEvents;
+      projectionChanged = this.workspaceDirty;
     } catch (error) {
       if (active) {
         try {
@@ -229,7 +237,9 @@ export class Store {
       throw error;
     } finally {
       this.transactionEvents = null;
+      this.workspaceDirty = false;
     }
+    if (projectionChanged) this.workspaceRevision += 1n;
     for (const event of events) {
       for (const listener of this.listeners) {
         try {
@@ -255,13 +265,67 @@ export class Store {
       .map((row) => JSON.parse(row.body as string) as T);
   }
 
+  workspaceStamp(): WorkspaceStamp {
+    return { epoch: this.workspaceEpoch, revision: this.workspaceRevision.toString() };
+  }
+
+  byIds<T>(kind: EntityKind, ids: ReadonlySet<string>): T[] {
+    return [...ids].sort().flatMap((id) => {
+      const value = this.get<T>(kind, id);
+      return value === undefined ? [] : [value];
+    });
+  }
+
+  related<T>(kind: EntityKind, field: 'taskId' | 'runId', ids: ReadonlySet<string>): T[] {
+    if (ids.size === 0) return [];
+    return this.db
+      .prepare(
+        `SELECT body FROM entities WHERE kind=? AND json_extract(body,'$.${field}') IN (${[...ids].map(() => '?').join(',')}) ORDER BY id`,
+      )
+      .all(kind, ...ids)
+      .map((row) => JSON.parse(row.body as string) as T);
+  }
+
+  combinedGroupsForTasks(ids: ReadonlySet<string>): CombinedGroup[] {
+    if (ids.size === 0) return [];
+    const positions = [...ids].map(() => '?').join(',');
+    return this.db
+      .prepare(
+        `SELECT g.* FROM combined_groups g WHERE g.run_id IN (
+          SELECT run_id FROM combined_groups WHERE task_id IN (${positions})
+          UNION SELECT parent_run_id FROM combined_members WHERE task_id IN (${positions})
+        ) ORDER BY g.run_id`,
+      )
+      .all(...ids, ...ids) as CombinedGroup[];
+  }
+
   put(kind: EntityKind, id: string, revision: number, body: unknown) {
     if (!this.transactionEvents) throw new Error('Entity writes require a transaction.');
+    const projection = (value: unknown) => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return canonicalJson(value);
+      const row = value as Record<string, unknown>;
+      return canonicalJson(
+        kind === 'task'
+          ? {
+              id: row.id,
+              projectId: row.projectId,
+              title: row.title,
+              outcome: row.outcome,
+              criteria: row.criteria,
+            }
+          : { id: row.id, name: row.name },
+      );
+    };
+    const navigation = kind === 'task' || kind === 'project';
+    const previous = navigation ? this.get(kind, id) : undefined;
     const result = this.db
       .prepare(`INSERT INTO entities(id,kind,revision,body) VALUES (?,?,?,?)
       ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,body=excluded.body WHERE entities.kind=excluded.kind`)
       .run(id, kind, revision, canonicalJson(body));
     if (result.changes !== 1) throw new Error('Entity identity belongs to a different kind.');
+    // Live status can change while a list is traversed. Membership and search changes invalidate it.
+    if (navigation && (previous === undefined || projection(previous) !== projection(body)))
+      this.workspaceDirty = true;
   }
 
   localControl(): unknown {
@@ -279,10 +343,11 @@ export class Store {
   }
 
   localGenerationBlocker(): 'generation-active' | 'generation-unknown' | undefined {
-    const intents = this.intents().filter((intent) => {
-      const route = this.get<Route>('route', intent.route_id);
-      return intent.state !== 'stopped' && route?.family === 'local' && !route.fake;
-    });
+    const intents = this.db
+      .prepare(`SELECT i.* FROM launch_intents i JOIN entities r ON r.id=i.route_id
+      WHERE i.state!='stopped' AND r.kind='route' AND json_extract(r.body,'$.family')='local'
+      AND json_extract(r.body,'$.fake')=0`)
+      .all() as LaunchIntent[];
     if (
       intents.some(
         (intent) =>

@@ -10,6 +10,7 @@ import {
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { setImmediate } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import {
@@ -42,6 +43,7 @@ import {
   type Task,
   type TaskConversationState,
   TaskSchema,
+  type WorkspaceContinuation,
 } from '@crewkite/contracts';
 
 const googleAcpLabel =
@@ -50,6 +52,7 @@ const googleAcpLabel =
 const help = `Usage: crewkite project add <path> [--json] [--home path]
        crewkite task create <project-id> --title text --outcome text --criterion text [--criterion text ...] [--json] [--home path]
        crewkite task <list|show|watch|start|pause|stop|resume|switch|approve|deny> [id] [--json] [--home path]
+       crewkite task list [--pages --json] [--home path]
        crewkite task amend <task-id> --title text --outcome text --criterion text [--criterion text ...] [--json] [--home path]
        crewkite task switch <task-id> <route-id> [--json] [--home path]
        crewkite conversation <create|configure> <id> --role lead|orchestrator --profile openai-file-v1 --credit-policy ordinary|existing-credits --attempts N --minutes N --concurrency N --consent [--text goal]
@@ -119,6 +122,7 @@ export async function runCli(
       allowPositionals: true,
       options: {
         json: { type: 'boolean' },
+        pages: { type: 'boolean' },
         home: { type: 'string' },
         help: { type: 'boolean', short: 'h' },
         text: { type: 'string' },
@@ -188,6 +192,8 @@ export async function runCli(
       ].includes(area)
     )
       throw new Error('Unknown command. Use --help.');
+    if (values.pages !== undefined && !(area === 'task' && action === 'list' && values.json))
+      throw new Error('--pages requires task list --json.');
     const combined = area === 'combined';
     if (combined) {
       if (!['prepare', 'status', 'assemble'].includes(action) || !id)
@@ -780,6 +786,185 @@ export async function runCli(
       );
       return succeeded(result) ? 0 : 2;
     }
+    if (area === 'usage' || local || area === 'native') {
+      const workspace = await client.workspaceState();
+      if (area === 'usage') {
+        print(
+          {
+            cursor: workspace.cursor,
+            usageReaders: workspace.usageReaders,
+            usage: workspace.usage,
+          },
+          terminalText(
+            [
+              ...workspace.usageReaders.map(
+                (reader) =>
+                  `${reader.family} quota reader  ${reader.reason}  last attempt ${reader.lastAttemptAt ?? 'none'}  last observed ${reader.lastObservedAt ?? 'none'}`,
+              ),
+              ...workspace.usage.map(
+                ({ observation, state }) =>
+                  `${observation.routeId}  ${observation.windowId}  ${observation.remaining ? `${observation.remaining.value} ${observation.remaining.unit} remaining` : 'remaining unknown'}  ${state}  source ${observation.source}  observed ${observation.observedAt}  resets ${observation.resetsAt ?? 'unknown'}`,
+              ),
+            ].join('\n') || 'No usage observations or readers.',
+          ),
+        );
+        return 0;
+      }
+
+      if (local) {
+        const setup = workspace.localSetup;
+        if (action === 'status') {
+          const profile =
+            workspace.nativeProfiles.find((value) => value.id === 'local-file-v1') ?? null;
+          print(
+            { cursor: workspace.cursor, setup: setup ?? null, profile },
+            setup
+              ? [
+                  `Local revision ${setup.revision}, connection revision ${setup.connectionRevision}`,
+                  `Endpoint ${setup.endpoint ?? 'not configured'}`,
+                  `Authentication ${setup.authMode === 'none' ? 'No authentication, this device only' : 'Dedicated token'}`,
+                  `Connection ${(setup.connected ?? setup.secretConfigured) ? 'connected' : 'required'}`,
+                  `Operation ${setup.operation ? `${setup.operation.kind} ${setup.operation.state} ${setup.operation.operationId}` : 'none'}`,
+                  `Generation ${setup.generation}`,
+                  `Reason ${setup.reason ?? 'none'}`,
+                  `Observation ${setup.observation?.observationHash ?? 'none'}`,
+                  `Selected ${setup.selection?.selectionId ?? 'none'}`,
+                  ...(setup.observation?.models.map(
+                    (choice) =>
+                      `${choice.selectionId}  ${choice.identity.displayName}  ${choice.identity.format}  ${choice.state}  ${choice.qualification}${choice.reasons.length ? `  ${choice.reasons.join(', ')}` : ''}`,
+                  ) ?? []),
+                ].join('\n')
+              : 'Local controls are unavailable in this controller.',
+          );
+          return 0;
+        }
+        if (!setup) throw new Error('Local controls are unavailable in this controller.');
+        if (
+          action === 'cancel-input' &&
+          (setup.operation?.kind !== 'input' || setup.operation.operationId !== id)
+        )
+          throw new Error(
+            'The input operation changed. Read Local status and cancel its exact operation ID.',
+          );
+        if (
+          action === 'select-model' &&
+          (!setup.observation ||
+            setup.observation.observationHash !== values['observation-hash'] ||
+            !setup.observation.models.some((choice) => choice.selectionId === id))
+        )
+          throw new Error(
+            'The observed model choice changed. Read Local status before selecting it.',
+          );
+        const names = {
+          configure: 'ConfigureLocal',
+          connect: 'BeginLocalConnectionInput',
+          'cancel-input': 'CancelLocalConnectionInput',
+          disconnect: 'DisconnectLocal',
+          'refresh-models': 'RefreshLocalModels',
+          'select-model': 'SelectLocalModel',
+        } as const;
+        const result = await request(
+          names[action as keyof typeof names],
+          action === 'configure'
+            ? {
+                endpoint: values.endpoint,
+                ...(values.authentication !== undefined ? { authMode: values.authentication } : {}),
+              }
+            : action === 'cancel-input'
+              ? { operationId: id }
+              : action === 'select-model'
+                ? { selectionId: id, observationHash: values['observation-hash'] }
+                : action === 'disconnect'
+                  ? {}
+                  : { consent: 'explicit' },
+          setup.revision,
+        );
+        print(
+          { command: sent, result },
+          `${result.reason ?? result.outcome}${result.next ? `\nNext: ${result.next}` : ''}\nCommand key ${sent?.key}`,
+        );
+        return succeeded(result) ? 0 : 2;
+      }
+      if (settingUpGoogle) {
+        const setup = workspace.googleAcpSetup;
+        if (id === 'show') {
+          const profile =
+            workspace.nativeProfiles.find((value) => value.id === 'google-acp-v1') ?? null;
+          print(
+            { cursor: workspace.cursor, setup, profile },
+            terminalText(
+              `${googleAcpLabel}\nSetup ${setup?.state ?? 'uninitialized'}, revision ${setup?.revision ?? 0}\nReason ${setup?.reason ?? profile?.reason ?? 'not-configured'}\nProof ${setup?.proofId ?? 'none'}\nOperation ${setup?.operationId ?? 'none'}${profile && 'configOptions' in profile ? `\nModels ${profile.configOptions?.model.supported.join(', ') ?? 'unknown'}\nThought levels ${profile.configOptions?.thoughtLevel?.supported.join(', ') ?? 'unknown'}` : ''}`,
+            ),
+          );
+          return 0;
+        }
+        if ((id === 'authenticate' || id === 'discover') && !setup?.proofId)
+          throw new Error('Initialize Google ACP and inspect its retained proof first.');
+        if (id === 'stop' && !setup?.operationId)
+          throw new Error('No exact setup operation is active. Read setup status first.');
+        const names = {
+          initialize: 'InitializeGoogleAcp',
+          authenticate: 'AuthenticateGoogleAcp',
+          discover: 'DiscoverGoogleAcp',
+          stop: 'StopGoogleAcpSetup',
+        } as const;
+        const result = await request(
+          names[id as keyof typeof names],
+          {
+            profileId: 'google-acp-v1',
+            ...(id === 'stop' ? { operationId: setup?.operationId } : { consent: 'explicit' }),
+            ...(id === 'authenticate' || id === 'discover' ? { proofId: setup?.proofId } : {}),
+            ...(id === 'authenticate' ? { method: 'oauth-personal' } : {}),
+          },
+          setup?.revision ?? 0,
+        );
+        receipt(result);
+        return succeeded(result) ? 0 : 2;
+      }
+      if (area === 'native') {
+        print(
+          { profiles: workspace.nativeProfiles },
+          workspace.nativeProfiles
+            .map((profile) =>
+              profile.family === 'local'
+                ? `${profile.id}  ${profile.model}  local resources  ${profile.available ? 'available' : profile.reason}  ${profile.qualifiedAt ? `qualified ${profile.qualifiedAt}` : 'qualification pending'}`
+                : profile.family !== 'openai'
+                  ? `${profile.id}  ${profile.model}  ${profile.effort} requested effort  effective effort unknown  account class unknown  service tier unknown  ${profile.available ? 'available' : profile.reason}  ${profile.qualifiedAt ? `qualified ${profile.qualifiedAt}` : 'qualification pending'}  billing requires user attestation${profile.family === 'google' ? `  permission modes ${profile.permissionModes.join(', ')}` : ''}`
+                  : profile.id === 'openai-repository-v1'
+                    ? `${profile.id}  ${profile.model}  ${profile.effort}  ${profile.available ? 'available' : profile.reason}  ${profile.qualifiedAt ? `qualified ${profile.qualifiedAt}` : 'qualification pending'}  workspace-write  approval never  network off`
+                    : `${profile.id}  ${profile.model}  ${profile.effort}  ${profile.available ? 'available' : profile.reason}`,
+            )
+            .join('\n') +
+            (workspace.nativeProfiles.some((profile) => profile.id === 'google-acp-v1')
+              ? `\n${googleAcpLabel}`
+              : '') || 'No native profiles.',
+        );
+        return 0;
+      }
+    }
+    if (area === 'task' && action === 'list' && (!values.json || values.pages)) {
+      let received = 0;
+      try {
+        const header = await client.workspaceState();
+        let after: WorkspaceContinuation | undefined;
+        do {
+          const page = await client.taskPage({ stamp: header.stamp, ...(after ? { after } : {}) });
+          if (values.json) output.out(`${JSON.stringify(page)}\n`);
+          else
+            for (const task of page.tasks)
+              output.out(`${terminalText(`${task.id}  ${task.state}  ${task.title}`)}\n`);
+          received += page.tasks.length;
+          after = page.next ?? undefined;
+          if (after) await setImmediate();
+        } while (after);
+        if (!values.json && received === 0) output.out('No tasks.\n');
+        return 0;
+      } catch (error) {
+        throw new Error(
+          `Task list incomplete after ${received} rows. ${error instanceof Error ? error.message : 'Read failed.'}`,
+        );
+      }
+    }
     const snapshot = await client.snapshot(
       (area === 'task' || conversation || combined) && id
         ? action === 'approve' || action === 'deny'
@@ -834,155 +1019,6 @@ export async function runCli(
           task.revision,
         ),
       );
-    }
-    if (area === 'usage') {
-      print(
-        { cursor: snapshot.cursor, usageReaders: snapshot.usageReaders, usage: snapshot.usage },
-        terminalText(
-          [
-            ...snapshot.usageReaders.map(
-              (reader) =>
-                `${reader.family} quota reader  ${reader.reason}  last attempt ${reader.lastAttemptAt ?? 'none'}  last observed ${reader.lastObservedAt ?? 'none'}`,
-            ),
-            ...snapshot.usage.map(
-              ({ observation, state }) =>
-                `${observation.routeId}  ${observation.windowId}  ${observation.remaining ? `${observation.remaining.value} ${observation.remaining.unit} remaining` : 'remaining unknown'}  ${state}  source ${observation.source}  observed ${observation.observedAt}  resets ${observation.resetsAt ?? 'unknown'}`,
-            ),
-          ].join('\n') || 'No usage observations or readers.',
-        ),
-      );
-      return 0;
-    }
-
-    if (local) {
-      const setup = snapshot.localSetup;
-      if (action === 'status') {
-        const profile =
-          snapshot.nativeProfiles.find((value) => value.id === 'local-file-v1') ?? null;
-        print(
-          { cursor: snapshot.cursor, setup: setup ?? null, profile },
-          setup
-            ? [
-                `Local revision ${setup.revision}, connection revision ${setup.connectionRevision}`,
-                `Endpoint ${setup.endpoint ?? 'not configured'}`,
-                `Authentication ${setup.authMode === 'none' ? 'No authentication, this device only' : 'Dedicated token'}`,
-                `Connection ${(setup.connected ?? setup.secretConfigured) ? 'connected' : 'required'}`,
-                `Operation ${setup.operation ? `${setup.operation.kind} ${setup.operation.state} ${setup.operation.operationId}` : 'none'}`,
-                `Generation ${setup.generation}`,
-                `Reason ${setup.reason ?? 'none'}`,
-                `Observation ${setup.observation?.observationHash ?? 'none'}`,
-                `Selected ${setup.selection?.selectionId ?? 'none'}`,
-                ...(setup.observation?.models.map(
-                  (choice) =>
-                    `${choice.selectionId}  ${choice.identity.displayName}  ${choice.identity.format}  ${choice.state}  ${choice.qualification}${choice.reasons.length ? `  ${choice.reasons.join(', ')}` : ''}`,
-                ) ?? []),
-              ].join('\n')
-            : 'Local controls are unavailable in this controller.',
-        );
-        return 0;
-      }
-      if (!setup) throw new Error('Local controls are unavailable in this controller.');
-      if (
-        action === 'cancel-input' &&
-        (setup.operation?.kind !== 'input' || setup.operation.operationId !== id)
-      )
-        throw new Error(
-          'The input operation changed. Read Local status and cancel its exact operation ID.',
-        );
-      if (
-        action === 'select-model' &&
-        (!setup.observation ||
-          setup.observation.observationHash !== values['observation-hash'] ||
-          !setup.observation.models.some((choice) => choice.selectionId === id))
-      )
-        throw new Error(
-          'The observed model choice changed. Read Local status before selecting it.',
-        );
-      const names = {
-        configure: 'ConfigureLocal',
-        connect: 'BeginLocalConnectionInput',
-        'cancel-input': 'CancelLocalConnectionInput',
-        disconnect: 'DisconnectLocal',
-        'refresh-models': 'RefreshLocalModels',
-        'select-model': 'SelectLocalModel',
-      } as const;
-      const result = await request(
-        names[action as keyof typeof names],
-        action === 'configure'
-          ? {
-              endpoint: values.endpoint,
-              ...(values.authentication !== undefined ? { authMode: values.authentication } : {}),
-            }
-          : action === 'cancel-input'
-            ? { operationId: id }
-            : action === 'select-model'
-              ? { selectionId: id, observationHash: values['observation-hash'] }
-              : action === 'disconnect'
-                ? {}
-                : { consent: 'explicit' },
-        setup.revision,
-      );
-      print(
-        { command: sent, result },
-        `${result.reason ?? result.outcome}${result.next ? `\nNext: ${result.next}` : ''}\nCommand key ${sent?.key}`,
-      );
-      return succeeded(result) ? 0 : 2;
-    }
-    if (settingUpGoogle) {
-      const setup = snapshot.googleAcpSetup;
-      if (id === 'show') {
-        const profile =
-          snapshot.nativeProfiles.find((value) => value.id === 'google-acp-v1') ?? null;
-        print(
-          { cursor: snapshot.cursor, setup, profile },
-          terminalText(
-            `${googleAcpLabel}\nSetup ${setup?.state ?? 'uninitialized'}, revision ${setup?.revision ?? 0}\nReason ${setup?.reason ?? profile?.reason ?? 'not-configured'}\nProof ${setup?.proofId ?? 'none'}\nOperation ${setup?.operationId ?? 'none'}${profile && 'configOptions' in profile ? `\nModels ${profile.configOptions?.model.supported.join(', ') ?? 'unknown'}\nThought levels ${profile.configOptions?.thoughtLevel?.supported.join(', ') ?? 'unknown'}` : ''}`,
-          ),
-        );
-        return 0;
-      }
-      if ((id === 'authenticate' || id === 'discover') && !setup?.proofId)
-        throw new Error('Initialize Google ACP and inspect its retained proof first.');
-      if (id === 'stop' && !setup?.operationId)
-        throw new Error('No exact setup operation is active. Read setup status first.');
-      const names = {
-        initialize: 'InitializeGoogleAcp',
-        authenticate: 'AuthenticateGoogleAcp',
-        discover: 'DiscoverGoogleAcp',
-        stop: 'StopGoogleAcpSetup',
-      } as const;
-      const result = await request(
-        names[id as keyof typeof names],
-        {
-          profileId: 'google-acp-v1',
-          ...(id === 'stop' ? { operationId: setup?.operationId } : { consent: 'explicit' }),
-          ...(id === 'authenticate' || id === 'discover' ? { proofId: setup?.proofId } : {}),
-          ...(id === 'authenticate' ? { method: 'oauth-personal' } : {}),
-        },
-        setup?.revision ?? 0,
-      );
-      receipt(result);
-      return succeeded(result) ? 0 : 2;
-    }
-    if (area === 'native') {
-      print(
-        { profiles: snapshot.nativeProfiles },
-        snapshot.nativeProfiles
-          .map((profile) =>
-            profile.family === 'local'
-              ? `${profile.id}  ${profile.model}  local resources  ${profile.available ? 'available' : profile.reason}  ${profile.qualifiedAt ? `qualified ${profile.qualifiedAt}` : 'qualification pending'}`
-              : profile.family !== 'openai'
-                ? `${profile.id}  ${profile.model}  ${profile.effort} requested effort  effective effort unknown  account class unknown  service tier unknown  ${profile.available ? 'available' : profile.reason}  ${profile.qualifiedAt ? `qualified ${profile.qualifiedAt}` : 'qualification pending'}  billing requires user attestation${profile.family === 'google' ? `  permission modes ${profile.permissionModes.join(', ')}` : ''}`
-                : profile.id === 'openai-repository-v1'
-                  ? `${profile.id}  ${profile.model}  ${profile.effort}  ${profile.available ? 'available' : profile.reason}  ${profile.qualifiedAt ? `qualified ${profile.qualifiedAt}` : 'qualification pending'}  workspace-write  approval never  network off`
-                  : `${profile.id}  ${profile.model}  ${profile.effort}  ${profile.available ? 'available' : profile.reason}`,
-          )
-          .join('\n') +
-          (snapshot.nativeProfiles.some((profile) => profile.id === 'google-acp-v1')
-            ? `\n${googleAcpLabel}`
-            : '') || 'No native profiles.',
-      );
-      return 0;
     }
     if (action === 'list') {
       print(

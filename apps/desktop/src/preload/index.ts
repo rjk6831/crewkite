@@ -4,7 +4,10 @@ import {
   CommandResultSchema,
   DesktopNoticeSchema,
   EventSchema,
+  ProjectPageSchema,
   SnapshotSchema,
+  TaskPageSchema,
+  WorkspaceStateSchema,
 } from '@crewkite/contracts';
 import { contextBridge, ipcRenderer } from 'electron';
 
@@ -46,8 +49,23 @@ const captureResult = async (
     result: value.result === null ? null : CommandResultSchema.parse(value.result),
   };
 };
+const readPage = async (
+  command: 'GetWorkspaceState' | 'GetProjectPage' | 'GetTaskPage',
+  payload: unknown,
+) => {
+  const result = CommandResultSchema.parse(
+    await ipcRenderer.invoke('crewkite:command', { command, payload }),
+  );
+  if (result.outcome !== 'applied' || !result.data)
+    throw new Error(result.reason ?? 'Workspace read unavailable.');
+  return result.data;
+};
 const bridge: DesktopSource = {
-  getSnapshot: async () => SnapshotSchema.parse(await ipcRenderer.invoke('crewkite:snapshot')),
+  getSnapshot: async (scope) =>
+    SnapshotSchema.parse(await ipcRenderer.invoke('crewkite:snapshot', scope)),
+  workspaceState: async () => WorkspaceStateSchema.parse(await readPage('GetWorkspaceState', {})),
+  projectPage: async (input) => ProjectPageSchema.parse(await readPage('GetProjectPage', input)),
+  taskPage: async (input) => TaskPageSchema.parse(await readPage('GetTaskPage', input)),
   command: async (input) =>
     CommandResultSchema.parse(await ipcRenderer.invoke('crewkite:command', input)),
   subscribe(listener) {

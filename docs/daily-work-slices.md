@@ -2,21 +2,23 @@
 
 I want useful changes in my hands every day or so. I will keep D2b as one milestone and release D2b.1, D2b.2 and subsequent slices independently. Each slice gets its own review, green CI and runnable UAT package. D2c remains available for corrections that need a separate stabilization round. D3 still needs my explicit approval.
 
-Large-project handling and GitHub/CI work come first. Practical multi-file changes and project commands follow. Recovery has to hold throughout, and gets a separate acceptance pass before I claim coding parity. Instant History and Optimized Storage stay in scope after the coding workflow.
+The next candidate must close provider connection and project-selection recovery failures first. Large-project handling and GitHub/CI work follow that usable baseline. Practical multi-file changes and project commands follow. Recovery has to hold throughout, and gets a separate acceptance pass before I claim coding parity. Instant History and Optimized Storage stay in scope after the coding workflow.
 
 ## Start here
 
 This file is the implementation entry point. Read it together with [architecture](architecture.md), [testing](testing.md), [distribution](distribution.md), the [roadmap](roadmap.md) and the repository's current local instructions. Inspect the code and current release evidence before changing anything. A planned capability below is a gap to verify, not an existing feature to assume.
 
-Current slice: D2b.1, workspace and task status pages. [D2 UAT 02](https://github.com/rjk6831/crewkite/releases/tag/d2-uat-02) is published with matching verification, inventory, empty-workspace cold-launch and same-home reopen evidence. Its three public assets passed anonymous download and checksum verification. Implementation has started on `feat/daily-work-integration` from the exact published source `32bc92e52ea38d85afc49d03fda433f6807d9c43`; no D2b source or package is qualified yet. Keep the D2 package available while D2b changes proceed.
+Current slice: D2b.1, workspace and task status pages, with blocking UAT corrections before the next package. [D2 UAT 02](https://github.com/rjk6831/crewkite/releases/tag/d2-uat-02) failed installed UAT and remains available for issue reproduction. Its retained checks, inventory and unquarantined empty-workspace launch evidence do not establish usable provider setup or project registration. The public release marks that failure. No D2b package is qualified yet.
+
+[The runtime repair](https://github.com/rjk6831/crewkite/pull/55) passed required CI and merged. It seals staged runtime resources and records the limits of ad-hoc integrity checks. Downloaded first launch still needs its own evidence. The paging and project-recovery branch has a real-controller desktop and CLI proof with 304 tasks and a 1,365,503-byte legacy snapshot. Matching CI and a replacement package remain pending.
 
 | Current-slice card | D2b.1 |
 |--------------------|-------|
 | Visible result | Open a large workspace, select a task and inspect status through desktop and CLI |
-| Edit boundary | Shared read contracts, store/controller projections, socket client, desktop list/status and CLI list/status |
+| Edit boundary | Shared read contracts, store/controller projections, socket client, desktop and CLI navigation, and terminal project-validation refusals |
 | Deferred | Artifact bytes, large activity bodies, repository capture, context selection and compression |
-| Required proof | All task pages beyond the former 1 MiB snapshot, consistent cursor behavior, reconnect and usable Stop; matching CI and UAT archive |
-| Entry check | Published verified D2 and current main inspected; preserve existing work and source history |
+| Required proof | Complete pages beyond the former 1 MiB snapshot, reconnect and usable Stop; recover an old pending project command and select another folder; matching CI and UAT archive |
+| Entry check | Retained D2 outcomes and current main inspected; preserve existing state, work and source history |
 
 For the next implementation, use this instruction:
 
@@ -28,7 +30,11 @@ Development can begin against a reviewed frozen interface before its dependency 
 
 The current setup still depends on supported installed clients. Google needs a manual pinned-client import before its separate authentication flow. Local needs an already loaded compatible model and explicit connection setup. Planning currently uses the supported OpenAI profile; execution roles keep their own provider boundaries.
 
-I want one setup view that shows the installed build, authentication readiness, included-usage premise and exact next action for each family. It should guide the Google import and Local connection without collecting cloud credentials, enabling paid usage or submitting a test prompt without consent. Record onboarding failures during D2 UAT and ship small corrections when needed. This follow-up does not replace the large-project and GitHub/CI priorities or count as a completed daily-work slice.
+The failed UAT exposed missing provider readiness, an OpenAI quota read that silently failed, a Google initialization button with no client installation path, and a rejected project selection that remained globally pending across restart. These corrections gate the next candidate. They do not add another daily-work slice.
+
+I need one setup view that shows the installed build, observed sign-in state and exact next action for each family. Keep installation, authentication, allowance and coding qualification separate. The Google path must install the reviewed official client and guide personal sign-in without terminal staging. An Anthropic sign-in check must use the native metadata command without a prompt; unavailable standalone quota stays unknown. OpenAI quota refresh must show its result or an actionable failure. Metadata checks cannot block project selection or Stop. Existing uncertain project mutations still need exact reconciliation.
+
+Before another UAT handoff, use a fresh package to open the workspace, connect the supported installed clients, reject an invalid folder, recover the previous pending selection, add a valid project and reopen the same home. Preserve original project files and existing state. Record actual account and device observations separately from offline fixtures.
 
 ## What exists at the planning baseline
 
@@ -52,7 +58,7 @@ A day is a target for the next usable increment. It includes review and release 
 
 | Slice | Usable result | Depends on | State | Source, CI and UAT evidence |
 |-------|---------------|------------|-------|-----------------------------|
-| D2b.1 | Open large workspace and task status through complete pages | Published D2 | In progress | Started from `d2-uat-02`; slice verification and UAT package pending |
+| D2b.1 | Recover project selection and read large workspace status through complete pages | Retained D2 workflow and current main | Qualification pending | Real desktop and CLI proof: 304 tasks, legacy snapshot 1,365,503 bytes; pending-command restart recovery passed. Required CI and package pending |
 | D2b.2 | Read large artifacts and activity output with bounded memory | D2b.1 | Planned | None |
 | D2b.3 | Prepare and retain a project beyond the old source-size limits | D2b.2 | Planned | None |
 | D2b.4 | See GitHub PR, Actions status and full CI logs inside a task | D2b.2 | Planned | None |

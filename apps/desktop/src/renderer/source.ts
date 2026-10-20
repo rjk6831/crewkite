@@ -14,11 +14,19 @@ import {
   type Event,
   EventSchema,
   ProjectIdSchema,
+  type ProjectPage,
+  ProjectPageSchema,
   type Snapshot,
   SnapshotSchema,
   TaskActivityPageSchema,
   type TaskActivityRequest,
   TaskActivityRequestSchema,
+  type TaskPage,
+  type TaskPageRequest,
+  TaskPageSchema,
+  TaskSchema,
+  type WorkspaceState,
+  WorkspaceStateSchema,
 } from '@crewkite/contracts';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPreviewSource } from './preview.ts';
@@ -130,31 +138,180 @@ export function useWorkspace() {
   const preview = new URLSearchParams(window.location.search).get('preview') === '1';
   const source = useMemo(() => (preview ? createPreviewSource() : window.crewkite), [preview]);
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  const [detailStale, setDetailStale] = useState(false);
+  const [header, setHeader] = useState<WorkspaceState | null>(null);
+  const [projects, setProjects] = useState<ProjectPage['projects']>([]);
+  const [projectPage, setProjectPage] = useState<ProjectPage | null>(null);
+  const [taskPages, setTaskPages] = useState<Record<string, TaskPage>>({});
+  const [navigationBusy, setNavigationBusy] = useState(false);
+  const [navigationStale, setNavigationStale] = useState(false);
+  const selectedTask = useRef<string | null>(null);
+  const detailCache = useRef(new Map<string, Snapshot>());
+  const headerRef = useRef<WorkspaceState | null>(null);
+  const commandBarrier = useRef<Promise<void>>(Promise.resolve());
+  const activityTail = useRef<Promise<unknown>>(Promise.resolve());
+  const pageRead = useRef(false);
+  const pageTail = useRef<Promise<unknown>>(Promise.resolve());
+  const queuePage = useCallback(<T>(read: () => Promise<T>): Promise<T> => {
+    const result = pageTail.current.then(read);
+    pageTail.current = result.catch(() => {});
+    return result;
+  }, []);
+  const detailEpoch = useRef<string | undefined>(undefined);
+  const navigationStamp = useRef<string | null>(null);
+  const selectTask = useCallback(
+    async (taskId: string | null) => {
+      selectedTask.current = taskId;
+      setSnapshot(taskId ? (detailCache.current.get(taskId) ?? null) : null);
+      if (!source || !taskId) return;
+      const epoch = headerRef.current?.stamp.epoch;
+      try {
+        const next = SnapshotSchema.parse(await source.getSnapshot({ taskId }));
+        if (selectedTask.current === taskId && headerRef.current?.stamp.epoch === epoch) {
+          setDetailStale(false);
+          detailCache.current.delete(taskId);
+          detailCache.current.set(taskId, next);
+          if (detailCache.current.size > 3) {
+            const oldest = detailCache.current.keys().next().value;
+            if (oldest) detailCache.current.delete(oldest);
+          }
+          const newEpoch = detailEpoch.current !== epoch;
+          detailEpoch.current = epoch;
+          setSnapshot((current) =>
+            newEpoch || !current || BigInt(next.cursor) >= BigInt(current.cursor) ? next : current,
+          );
+        }
+      } catch (failure) {
+        if (selectedTask.current === taskId)
+          setTransportError(
+            failure instanceof Error ? failure.message : 'Task detail is unavailable.',
+          );
+      }
+    },
+    [source],
+  );
+  const readTaskPage = useCallback(
+    async (input: Omit<TaskPageRequest, 'limit'> & { limit?: number }) => {
+      if (!source) throw new Error('The desktop bridge is unavailable.');
+      const page = TaskPageSchema.parse(await queuePage(() => source.taskPage(input)));
+      if (
+        page.stamp.epoch !== input.stamp.epoch ||
+        page.stamp.revision !== input.stamp.revision ||
+        page.tasks.some(
+          (task) =>
+            (input.projectId && task.projectId !== input.projectId) ||
+            (input.taskId && task.id !== input.taskId),
+        )
+      )
+        throw new Error(
+          'The task page does not match this navigation request. Refresh to continue.',
+        );
+      return page;
+    },
+    [source, queuePage],
+  );
+  const loadTasks = useCallback(
+    async (projectId: string, more = false) => {
+      const current = headerRef.current;
+      if (!source || !current || pageRead.current) return;
+      pageRead.current = true;
+      setNavigationBusy(true);
+      try {
+        const previous = taskPages[projectId];
+        const next = await readTaskPage({
+          stamp: current.stamp,
+          projectId,
+          ...(more && previous?.next ? { after: previous.next } : {}),
+        });
+        if (
+          headerRef.current?.stamp.epoch !== next.stamp.epoch ||
+          headerRef.current?.stamp.revision !== next.stamp.revision
+        )
+          return;
+        setTaskPages((pages) => ({
+          ...pages,
+          [projectId]: {
+            ...next,
+            tasks: more ? [...(pages[projectId]?.tasks ?? []), ...next.tasks] : next.tasks,
+          },
+        }));
+      } catch (failure) {
+        setNavigationStale(true);
+        setTransportError(
+          failure instanceof Error ? failure.message : 'Task navigation is unavailable.',
+        );
+      } finally {
+        pageRead.current = false;
+        setNavigationBusy(false);
+      }
+    },
+    [source, taskPages, readTaskPage],
+  );
+  const loadProjects = useCallback(async () => {
+    const current = headerRef.current;
+    if (!source || !current || !projectPage?.next || pageRead.current) return;
+    pageRead.current = true;
+    setNavigationBusy(true);
+    try {
+      const next = ProjectPageSchema.parse(
+        await queuePage(() =>
+          source.projectPage({ stamp: current.stamp, after: projectPage.next ?? undefined }),
+        ),
+      );
+      if (
+        headerRef.current?.stamp.epoch !== next.stamp.epoch ||
+        headerRef.current?.stamp.revision !== next.stamp.revision
+      )
+        return;
+      setProjects((rows) => [...rows, ...next.projects]);
+      setProjectPage(next);
+    } catch (failure) {
+      setNavigationStale(true);
+      setTransportError(
+        failure instanceof Error ? failure.message : 'Project navigation is unavailable.',
+      );
+    } finally {
+      pageRead.current = false;
+      setNavigationBusy(false);
+    }
+  }, [source, projectPage, queuePage]);
   const [{ events, droppedThrough }, setActivity] = useState<{
     events: Event[];
     droppedThrough: string | null;
   }>({ events: [], droppedThrough: null });
   const [activityRevision, setActivityRevision] = useState(0);
   const readTaskActivity = useCallback(
-    async (input: Omit<TaskActivityRequest, 'limit'> & { limit?: number }) => {
-      if (!source) throw new Error('The desktop bridge is unavailable.');
-      const request = TaskActivityRequestSchema.parse(input);
-      const result = CommandResultSchema.parse(
-        await source.command({ command: 'GetTaskActivity', payload: request }),
-      );
-      if (result.outcome !== 'applied' && result.outcome !== 'already-applied')
-        throw new Error([result.reason ?? result.outcome, result.next].filter(Boolean).join(' '));
-      const parsed = TaskActivityPageSchema.safeParse(result.data);
-      if (!parsed.success)
-        throw new Error('Task activity is unavailable: the retained page is invalid.');
-      const page = parsed.data;
-      if (
-        page.taskId !== request.taskId ||
-        (request.beforeCursor !== undefined &&
-          page.events.some((event) => BigInt(event.cursor) >= BigInt(request.beforeCursor ?? '0')))
-      )
-        throw new Error('Task activity is unavailable: the page does not match the request.');
-      return page;
+    (input: Omit<TaskActivityRequest, 'limit'> & { limit?: number }) => {
+      const read = async () => {
+        if (!source) throw new Error('The desktop bridge is unavailable.');
+        for (;;) {
+          const pendingCommand = commandBarrier.current;
+          await pendingCommand;
+          if (pendingCommand === commandBarrier.current) break;
+        }
+        const request = TaskActivityRequestSchema.parse(input);
+        const result = CommandResultSchema.parse(
+          await source.command({ command: 'GetTaskActivity', payload: request }),
+        );
+        if (result.outcome !== 'applied' && result.outcome !== 'already-applied')
+          throw new Error([result.reason ?? result.outcome, result.next].filter(Boolean).join(' '));
+        const parsed = TaskActivityPageSchema.safeParse(result.data);
+        if (!parsed.success)
+          throw new Error('Task activity is unavailable: the retained page is invalid.');
+        const page = parsed.data;
+        if (
+          page.taskId !== request.taskId ||
+          (request.beforeCursor !== undefined &&
+            page.events.some(
+              (event) => BigInt(event.cursor) >= BigInt(request.beforeCursor ?? '0'),
+            ))
+        )
+          throw new Error('Task activity is unavailable: the page does not match the request.');
+        return page;
+      };
+      const result = activityTail.current.then(read);
+      activityTail.current = result.catch(() => {});
+      return result;
     },
     [source],
   );
@@ -172,12 +329,22 @@ export function useWorkspace() {
     { kind: 'export' }
   > | null>(null);
   const connectionState = useRef('connecting');
-  const reading = useRef<Promise<Snapshot> | null>(null);
+  const reading = useRef<Promise<WorkspaceState> | null>(null);
   const dirty = useRef(false);
-  const refresh = useCallback((): Promise<Snapshot> => {
+  const refresh = useCallback((): Promise<WorkspaceState> => {
     if (!source)
       return Promise.reject(
         new Error('The desktop bridge is unavailable. Start the desktop demo to connect.'),
+      );
+    if (
+      typeof source.workspaceState !== 'function' ||
+      typeof source.projectPage !== 'function' ||
+      typeof source.taskPage !== 'function'
+    )
+      return Promise.reject(
+        new Error(
+          'Workspace paging is unavailable with this controller connection. Open the matching desktop package.',
+        ),
       );
     if (reading.current) {
       dirty.current = true;
@@ -186,17 +353,79 @@ export function useWorkspace() {
     const read = async () => {
       for (;;) {
         dirty.current = false;
-        let next: Snapshot;
-        try {
-          next = SnapshotSchema.parse(await source.getSnapshot());
-        } catch (failure) {
-          // A connection notice can arrive while the initial offline read is still settling.
-          if (dirty.current && connectionState.current === 'connected') continue;
-          throw failure;
+        const next = WorkspaceStateSchema.parse(await source.workspaceState());
+        const previous = headerRef.current;
+        const stampKey = `${next.stamp.epoch}:${next.stamp.revision}`;
+        const changed = navigationStamp.current !== stampKey;
+        headerRef.current = next;
+        setHeader(next);
+        if (changed) {
+          setNavigationStale(Boolean(previous));
+          if (previous?.stamp.epoch !== next.stamp.epoch) {
+            detailCache.current.clear();
+            setActivity({ events: [], droppedThrough: null });
+            setDetailStale(Boolean(previous && selectedTask.current));
+          }
+          let page: ProjectPage;
+          try {
+            page = ProjectPageSchema.parse(
+              await queuePage(() => source.projectPage({ stamp: next.stamp })),
+            );
+          } catch (failure) {
+            setNavigationStale(true);
+            throw failure;
+          }
+          if (headerRef.current !== next) continue;
+          setProjects(page.projects);
+          setProjectPage(page);
+          navigationStamp.current = stampKey;
+          setTaskPages({});
+          setNavigationStale(false);
         }
-        setSnapshot((current) =>
-          current === null || BigInt(next.cursor) >= BigInt(current.cursor) ? next : current,
-        );
+        const taskId = selectedTask.current;
+        if (taskId) {
+          try {
+            const detail = SnapshotSchema.parse(await source.getSnapshot({ taskId }));
+            if (selectedTask.current === taskId && headerRef.current === next) {
+              setDetailStale(false);
+              detailCache.current.set(taskId, detail);
+              const newEpoch = detailEpoch.current !== next.stamp.epoch;
+              detailEpoch.current = next.stamp.epoch;
+              setSnapshot((current) =>
+                newEpoch || !current || BigInt(detail.cursor) >= BigInt(current.cursor)
+                  ? detail
+                  : current,
+              );
+              const task = detail.tasks.find((row) => row.id === taskId);
+              if (task)
+                setTaskPages((pages) =>
+                  Object.fromEntries(
+                    Object.entries(pages).map(([id, page]) => [
+                      id,
+                      {
+                        ...page,
+                        tasks: page.tasks.map((row) =>
+                          row.id === task.id
+                            ? {
+                                ...row,
+                                state: task.state,
+                                waitingReason: task.waitingReason,
+                                revision: task.revision,
+                                runId: task.runId,
+                                next: task.next,
+                              }
+                            : row,
+                        ),
+                      },
+                    ]),
+                  ),
+                );
+            }
+          } catch (failure) {
+            if (selectedTask.current === taskId) setSnapshot(null);
+            throw failure;
+          }
+        }
         setTransportError(null);
         if (!source.onNotice && !source.onConnection) {
           connectionState.current = 'connected';
@@ -209,11 +438,11 @@ export function useWorkspace() {
       reading.current = null;
     });
     return reading.current;
-  }, [source]);
+  }, [source, queuePage]);
   useEffect(() => {
     let active = true;
     void refresh().catch((failure: unknown) => {
-      if (active && connectionState.current !== 'connected') {
+      if (active) {
         if (!source?.onNotice && !source?.onConnection) {
           connectionState.current = 'offline';
           setConnection('offline');
@@ -230,6 +459,30 @@ export function useWorkspace() {
         setError('An invalid controller event was rejected. Reconnect to refresh the workspace.');
         return;
       }
+      const updated = TaskSchema.safeParse(parsed.data.payload);
+      if (updated.success)
+        setTaskPages((pages) =>
+          Object.fromEntries(
+            Object.entries(pages).map(([id, page]) => [
+              id,
+              {
+                ...page,
+                tasks: page.tasks.map((row) =>
+                  row.id === updated.data.id
+                    ? {
+                        ...row,
+                        state: updated.data.state,
+                        waitingReason: updated.data.waitingReason,
+                        revision: updated.data.revision,
+                        runId: updated.data.runId,
+                        next: updated.data.next,
+                      }
+                    : row,
+                ),
+              },
+            ]),
+          ),
+        );
       setActivity((current) => {
         if (current.events.some(({ id }) => id === parsed.data.id)) return current;
         // Bound the shared live tail. Task Activity reads retained pages separately.
@@ -341,6 +594,20 @@ export function useWorkspace() {
     (input: DesktopCommand) =>
       perform(async () => {
         if (!source) throw new Error('The desktop bridge is unavailable.');
+        if (
+          input.command === 'GetTaskConversationState' ||
+          input.command === 'GetTaskConversation'
+        ) {
+          const completion = Promise.withResolvers<void>();
+          commandBarrier.current = Promise.all([commandBarrier.current, completion.promise]).then(
+            () => {},
+          );
+          try {
+            return await source.command(input);
+          } finally {
+            completion.resolve();
+          }
+        }
         if (input.command !== 'StartRun' && input.command !== 'StopRun')
           return source.command(input);
         const token = Symbol();
@@ -426,12 +693,23 @@ export function useWorkspace() {
   };
   return {
     snapshot,
+    detailStale,
+    header,
+    projects,
+    projectPage,
+    taskPages,
+    navigationBusy,
+    navigationStale,
+    selectTask,
+    loadTasks,
+    loadProjects,
+    readTaskPage,
     events,
     readTaskActivity,
     activityRevision,
     connection,
     preview,
-    pending: pending > 0,
+    pending: pending > 0 || detailStale,
     pendingStart:
       pendingRuns.flatMap(({ input }) =>
         input.command === 'StartRun' ? [input.payload] : [],
