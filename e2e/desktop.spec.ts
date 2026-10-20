@@ -16,6 +16,7 @@ import {
 import { git } from '../apps/controller/src/host/source.ts';
 import { groupAbsent } from '../apps/controller/src/host/worker.ts';
 import { startController } from '../apps/controller/src/main.ts';
+import { resolveAnthropicNativeProfile } from '../apps/controller/src/providers/anthropic/profile.ts';
 import {
   unavailableNativeProfile,
   unavailableRepositoryProfile,
@@ -642,7 +643,7 @@ async function quotaReadBridge(
         ...unavailableNativeProfile().facts,
         id: 'anthropic-file-v1',
         family: 'anthropic',
-        model: 'claude-sonnet-5-5',
+        model: resolveAnthropicNativeProfile({}).facts.model,
         effort: 'medium',
         effectiveEffort: 'unknown',
         accountClass: 'unknown',
@@ -672,7 +673,7 @@ async function quotaReadBridge(
         family: 'anthropic',
         profileId: 'anthropic-file-v1',
         state: 'signed-in',
-        authMethod: 'claude.ai',
+        authMethod: 'subscription',
         observedAt: new Date().toISOString(),
         reason: null,
         next: 'Sign-in observed. Billing and task qualification remain unknown.',
@@ -682,15 +683,169 @@ async function quotaReadBridge(
       },
     ];
     reply(authCheck, { outcome: 'applied' });
-    await expect(anthropicPanel).toContainText('Signed in with Claude account');
+    await expect(anthropicPanel).toContainText('Signed in with Anthropic account');
     await expect(anthropicPanel).toContainText('Billing and task qualification remain unknown');
     await expect(
       page.getByRole('button', { name: 'Retry exact command', exact: true }),
     ).toHaveCount(0);
-    await page.getByRole('button', { name: 'Initialize Google ACP', exact: true }).click();
+    snapshot.nativeConnections[0] = {
+      ...snapshot.nativeConnections[0],
+      state: 'signed-out',
+      authMethod: 'none',
+    };
+    await page.reload();
+    await page.getByRole('button', { name: 'Connect providers', exact: true }).click();
+    await application.evaluate(({ shell, dialog }) => {
+      const fixture = shell as typeof shell & {
+        fixtureUrls: string[];
+        fixtureErrors: string[];
+        fixtureReject: boolean;
+        fixtureRestore: () => void;
+      };
+      const open = shell.openExternal;
+      const error = dialog.showErrorBox;
+      fixture.fixtureUrls = [];
+      fixture.fixtureErrors = [];
+      fixture.fixtureReject = false;
+      fixture.fixtureRestore = () => {
+        shell.openExternal = open;
+        dialog.showErrorBox = error;
+      };
+      shell.openExternal = async (url) => {
+        fixture.fixtureUrls.push(url);
+        if (fixture.fixtureReject) throw new Error('fixture-browser-unavailable');
+      };
+      dialog.showErrorBox = (title, content) => {
+        fixture.fixtureErrors.push(`${title}: ${content}`);
+      };
+    });
+    const instructions =
+      'https://github.com/rjk6831/crewkite/blob/main/docs/providers.md#anthropic-writer-preparation';
+    await page
+      .getByRole('link', { name: 'native client sign-in instructions', exact: true })
+      .click();
+    await expect
+      .poll(() =>
+        application.evaluate(
+          ({ shell }) => (shell as typeof shell & { fixtureUrls: string[] }).fixtureUrls,
+        ),
+      )
+      .toEqual([instructions]);
+    for (const url of [
+      'https://example.com/',
+      `${instructions}?token=untrusted`,
+      instructions.replace('#anthropic-writer-preparation', '#other'),
+      'file:///tmp/instructions',
+    ])
+      await page.evaluate((value) => {
+        window.open(value, '_blank');
+      }, url);
+    assert.equal(
+      await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().length),
+      1,
+    );
+    assert.deepEqual(
+      await application.evaluate(
+        ({ shell }) => (shell as typeof shell & { fixtureUrls: string[] }).fixtureUrls,
+      ),
+      [instructions],
+    );
+    await application.evaluate(({ shell }) => {
+      (shell as typeof shell & { fixtureReject: boolean }).fixtureReject = true;
+    });
+    await page
+      .getByRole('link', { name: 'native client sign-in instructions', exact: true })
+      .click();
+    await expect
+      .poll(() =>
+        application.evaluate(
+          ({ shell }) => (shell as typeof shell & { fixtureErrors: string[] }).fixtureErrors,
+        ),
+      )
+      .toEqual([
+        `Sign-in instructions could not be opened: Open this address in your browser: ${instructions}`,
+      ]);
+    await application.evaluate(({ shell }) =>
+      (shell as typeof shell & { fixtureRestore: () => void }).fixtureRestore(),
+    );
+
+    const setupPanel = page.getByRole('region', { name: 'Google ACP setup', exact: true });
+    const install = setupPanel.getByRole('button', {
+      name: 'Install official Google client',
+      exact: true,
+    });
+    await install.click();
+    const installation = await next();
+    assert.equal(installation.command.command, 'InstallGoogleAcp');
+    assert.deepEqual(installation.command.payload, {
+      profileId: 'google-acp-v1',
+      consent: 'explicit',
+    });
+    snapshot.googleAcpInstall = {
+      profileId: 'google-acp-v1',
+      state: 'installing',
+      operationId: installation.command.key,
+      observedAt: new Date().toISOString(),
+      reason: null,
+      next: 'Installation in progress.',
+    };
+    await expect(page.getByRole('button', { name: 'Add project', exact: true })).toBeEnabled();
+    await setupPanel.getByRole('button', { name: 'Stop installation', exact: true }).click();
+    const installStop = await next();
+    assert.equal(installStop.command.command, 'StopGoogleAcpInstall');
+    assert.deepEqual(installStop.command.payload, {
+      profileId: 'google-acp-v1',
+      operationId: installation.command.key,
+    });
+    snapshot.googleAcpInstall = {
+      ...snapshot.googleAcpInstall,
+      state: 'blocked',
+      operationId: null,
+      reason: 'google-install-stopped',
+      next: 'Start a new installation.',
+    };
+    reply(installStop, {
+      outcome: 'applied',
+      data: { kind: 'google-acp-install', install: snapshot.googleAcpInstall },
+    });
+    reply(installation, {
+      outcome: 'blocked',
+      reason: 'google-install-stopped',
+      data: { kind: 'google-acp-install', install: snapshot.googleAcpInstall },
+    });
+    await expect(setupPanel.getByRole('status').last()).toContainText('google-install-stopped');
+    await expect(install).toBeEnabled();
+    await install.click();
+    const installed = await next();
+    assert.equal(installed.command.command, 'InstallGoogleAcp');
+    snapshot.googleAcpInstall = {
+      ...snapshot.googleAcpInstall,
+      state: 'installed',
+      reason: null,
+      next: 'Initialize the installed client.',
+    };
+    reply(installed, {
+      outcome: 'applied',
+      data: { kind: 'google-acp-install', install: snapshot.googleAcpInstall },
+    });
+    const verifyInstalled = setupPanel.getByRole('button', {
+      name: 'Verify installed Google client',
+      exact: true,
+    });
+    await expect(verifyInstalled).toBeEnabled();
+    await verifyInstalled.click();
+    const verifyClient = await next();
+    assert.equal(verifyClient.command.command, 'InstallGoogleAcp');
+    reply(verifyClient, {
+      outcome: 'blocked',
+      reason: 'fixture-client-unavailable',
+      data: { kind: 'google-acp-install', install: snapshot.googleAcpInstall },
+    });
+    await expect(setupPanel.getByRole('status').last()).toContainText('fixture-client-unavailable');
+    await expect(verifyInstalled).toBeEnabled();
+    await setupPanel.getByRole('button', { name: 'Initialize Google ACP', exact: true }).click();
     const setupRead = await next();
     assert.equal(setupRead.command.command, 'InitializeGoogleAcp');
-    assert.equal(setupRead.command.expectedRevision, 0);
     snapshot.googleAcpSetup = {
       profileId: 'google-acp-v1',
       revision: 1,
@@ -701,7 +856,6 @@ async function quotaReadBridge(
       auth: { method: null, status: 'unknown' },
       reason: null,
     };
-    const setupPanel = page.getByRole('region', { name: 'Google ACP setup', exact: true });
     await setupPanel.getByRole('button', { name: 'Stop setup', exact: true }).click();
     const setupStop = await next();
     assert.equal(setupStop.command.command, 'StopGoogleAcpSetup');
@@ -710,18 +864,6 @@ async function quotaReadBridge(
       profileId: 'google-acp-v1',
       operationId: setupRead.command.key,
     });
-    assert.match(
-      await rejectCommand({ command: 'GetHealth', payload: {} }),
-      /pending desktop command/u,
-    );
-    assert.match(
-      await rejectCommand({
-        command: 'StopGoogleAcpSetup',
-        expectedRevision: 1,
-        payload: setupStop.command.payload,
-      }),
-      /pending desktop command/u,
-    );
     snapshot.googleAcpSetup = {
       ...snapshot.googleAcpSetup,
       revision: 2,
@@ -732,29 +874,70 @@ async function quotaReadBridge(
       outcome: 'applied',
       data: { kind: 'google-acp-setup', setup: snapshot.googleAcpSetup },
     });
-    await expect(setupPanel.getByRole('status').last()).toContainText('Setup blocked');
-    assert.match(
-      await rejectCommand({ command: 'GetHealth', payload: {} }),
-      /pending desktop command/u,
-    );
-    reply(setupRead, { outcome: 'outcome-unknown', reason: 'fixture-setup-unknown' });
-    await expect(setupPanel.getByRole('status').last()).toContainText('fixture-setup-unknown');
-    assert.match(
-      await rejectCommand({
-        command: 'StopGoogleAcpSetup',
-        expectedRevision: 1,
-        payload: setupStop.command.payload,
-      }),
-      /setup operation changed/u,
-    );
-    const setupRetry = page.evaluate(() => window.crewkite?.retryCommand?.());
-    const repeatedSetup = await next();
-    assert.deepEqual(repeatedSetup.command, setupRead.command);
-    reply(repeatedSetup, {
+    reply(setupRead, {
+      outcome: 'blocked',
+      reason: 'fixture-client-missing',
+      data: { kind: 'google-acp-setup', setup: snapshot.googleAcpSetup },
+    });
+    await expect(setupPanel.getByRole('status').last()).toContainText('fixture-client-missing');
+    await expect(
+      page.getByRole('button', { name: 'Retry exact command', exact: true }),
+    ).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Add project', exact: true })).toBeEnabled();
+    await setupPanel.getByRole('button', { name: 'Initialize Google ACP', exact: true }).click();
+    const initialization = await next();
+    assert.equal(initialization.command.command, 'InitializeGoogleAcp');
+    snapshot.googleAcpSetup = {
+      ...snapshot.googleAcpSetup,
+      revision: 3,
+      state: 'authentication-required',
+      proofId: 'art_01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      client: { version: '1.4.0', sha256: 'a'.repeat(64), signerTeamId: 'fixture-team' },
+      auth: { method: 'oauth-personal', status: 'required' },
+    };
+    reply(initialization, {
       outcome: 'applied',
       data: { kind: 'google-acp-setup', setup: snapshot.googleAcpSetup },
     });
-    assert.equal((await setupRetry)?.outcome, 'applied');
+    await expect(
+      setupPanel.getByRole('button', { name: 'Sign in with Google', exact: true }),
+    ).toBeEnabled();
+    assert.equal(pending.length, 0, 'Sign-in must require a separate explicit click.');
+    await setupPanel.getByRole('button', { name: 'Sign in with Google', exact: true }).click();
+    const authenticate = await next();
+    assert.equal(authenticate.command.command, 'AuthenticateGoogleAcp');
+    assert.deepEqual(authenticate.command.payload, {
+      profileId: 'google-acp-v1',
+      proofId: snapshot.googleAcpSetup.proofId,
+      method: 'oauth-personal',
+      consent: 'explicit',
+    });
+    snapshot.googleAcpSetup = {
+      ...snapshot.googleAcpSetup,
+      revision: 4,
+      auth: { method: 'oauth-personal', status: 'authenticated' },
+    };
+    reply(authenticate, {
+      outcome: 'applied',
+      data: { kind: 'google-acp-setup', setup: snapshot.googleAcpSetup },
+    });
+    await setupPanel.getByRole('button', { name: 'Discover Google choices', exact: true }).click();
+    const discovery = await next();
+    assert.equal(discovery.command.command, 'DiscoverGoogleAcp');
+    assert.deepEqual(discovery.command.payload, {
+      profileId: 'google-acp-v1',
+      proofId: snapshot.googleAcpSetup.proofId,
+      consent: 'explicit',
+    });
+    snapshot.googleAcpSetup = { ...snapshot.googleAcpSetup, revision: 5, state: 'ready' };
+    reply(discovery, {
+      outcome: 'applied',
+      data: { kind: 'google-acp-setup', setup: snapshot.googleAcpSetup },
+    });
+    await expect(setupPanel.getByRole('status').last()).toContainText('Setup ready');
+    await expect(
+      page.getByRole('button', { name: 'Retry exact command', exact: true }),
+    ).toHaveCount(0);
     const fixture = createDemoFixtures('2026-10-17T10:00:00.000Z');
     const preparedTask = { ...fixture.task, revision: 3, runId: 'run_01ARZ3NDEKTSV4RRFFQ69G5FAV' };
     const preparedRun = {

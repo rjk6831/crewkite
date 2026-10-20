@@ -172,8 +172,16 @@ export async function serve(
                   return;
                 }
                 if (
-                  command.command === 'ObserveUsage' ||
-                  command.command === 'CheckNativeConnection' ||
+                  [
+                    'ObserveUsage',
+                    'CheckNativeConnection',
+                    'InstallGoogleAcp',
+                    'StopGoogleAcpInstall',
+                    'InitializeGoogleAcp',
+                    'AuthenticateGoogleAcp',
+                    'DiscoverGoogleAcp',
+                    'StopGoogleAcpSetup',
+                  ].includes(command.command) ||
                   (command.command === 'PrepareCandidateEvaluation' &&
                     command.payload.checkRecipeId === 'crewkite-verify-v1')
                 ) {

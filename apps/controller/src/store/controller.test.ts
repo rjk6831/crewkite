@@ -25,7 +25,7 @@ import { dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { type TestContext, test } from 'node:test';
 import { encodeFrame, FrameDecoder, ProtocolError } from '@crewkite/client';
-import { connectController, readControllerEndpoint } from '@crewkite/client/node';
+import { connectController, createCommandKey, readControllerEndpoint } from '@crewkite/client/node';
 import {
   type Approval,
   type Artifact,
@@ -499,6 +499,27 @@ test('held metadata leaves stop replies reachable on the same authenticated sock
   for (const [kind, payload] of [
     ['ObserveUsage', { family: 'google' }],
     ['CheckNativeConnection', { family: 'anthropic', consent: 'explicit' }],
+    ['InstallGoogleAcp', { profileId: 'google-acp-v1', consent: 'explicit' }],
+    ['StopGoogleAcpInstall', { profileId: 'google-acp-v1', operationId: createCommandKey() }],
+    ['InitializeGoogleAcp', { profileId: 'google-acp-v1', consent: 'explicit' }],
+    [
+      'AuthenticateGoogleAcp',
+      {
+        profileId: 'google-acp-v1',
+        proofId: 'art_01ARZ3NDEKTSV4RRFFQ69G5FAV',
+        method: 'oauth-personal',
+        consent: 'explicit',
+      },
+    ],
+    [
+      'DiscoverGoogleAcp',
+      {
+        profileId: 'google-acp-v1',
+        proofId: 'art_01ARZ3NDEKTSV4RRFFQ69G5FAV',
+        consent: 'explicit',
+      },
+    ],
+    ['StopGoogleAcpSetup', { profileId: 'google-acp-v1', operationId: createCommandKey() }],
   ] as const) {
     const task = TaskSchema.parse(
       (await controller.execute(command('CreateTask', draft.payload, 0), 'local-owner')).entity,

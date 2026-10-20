@@ -1,6 +1,6 @@
 import { globSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { relative, resolve, sep } from 'node:path';
-import type { BrowserWindow, IpcMainInvokeEvent, Session } from 'electron';
+import { type BrowserWindow, dialog, type IpcMainInvokeEvent, type Session, shell } from 'electron';
 
 export const rendererURL = 'app://crewkite/index.html';
 const contentTypes: Record<string, string> = {
@@ -50,7 +50,18 @@ export function secureSession(session: Session, rendererRoot: string) {
 
 export function secureWindow(window: BrowserWindow) {
   const contents = window.webContents;
-  contents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  const signInInstructions =
+    'https://github.com/rjk6831/crewkite/blob/main/docs/providers.md#anthropic-writer-preparation';
+  contents.setWindowOpenHandler(({ url }) => {
+    if (url === signInInstructions)
+      void shell.openExternal(signInInstructions).catch(() => {
+        dialog.showErrorBox(
+          'Sign-in instructions could not be opened',
+          `Open this address in your browser: ${signInInstructions}`,
+        );
+      });
+    return { action: 'deny' };
+  });
   contents.on('will-attach-webview', (event) => event.preventDefault());
   contents.on('will-navigate', (event) => event.preventDefault());
   contents.on('will-frame-navigate', (event) => event.preventDefault());

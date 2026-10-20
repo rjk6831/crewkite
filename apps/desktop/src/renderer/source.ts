@@ -592,7 +592,20 @@ export function useWorkspace() {
   );
   const metadataCommand = useCallback(
     async (
-      input: Extract<DesktopCommand, { command: 'ObserveUsage' | 'CheckNativeConnection' }>,
+      input: Extract<
+        DesktopCommand,
+        {
+          command:
+            | 'ObserveUsage'
+            | 'CheckNativeConnection'
+            | 'InstallGoogleAcp'
+            | 'StopGoogleAcpInstall'
+            | 'InitializeGoogleAcp'
+            | 'AuthenticateGoogleAcp'
+            | 'DiscoverGoogleAcp'
+            | 'StopGoogleAcpSetup';
+        }
+      >,
     ) => {
       if (!source) throw new Error('The desktop bridge is unavailable.');
       const result = CommandResultSchema.parse(await source.command(input));
@@ -609,7 +622,16 @@ export function useWorkspace() {
   );
   const command = useCallback(
     (input: DesktopCommand) => {
-      if (input.command === 'ObserveUsage' || input.command === 'CheckNativeConnection')
+      if (
+        input.command === 'ObserveUsage' ||
+        input.command === 'CheckNativeConnection' ||
+        input.command === 'InstallGoogleAcp' ||
+        input.command === 'StopGoogleAcpInstall' ||
+        input.command === 'InitializeGoogleAcp' ||
+        input.command === 'AuthenticateGoogleAcp' ||
+        input.command === 'DiscoverGoogleAcp' ||
+        input.command === 'StopGoogleAcpSetup'
+      )
         return metadataCommand(input);
       return perform(async () => {
         if (!source) throw new Error('The desktop bridge is unavailable.');

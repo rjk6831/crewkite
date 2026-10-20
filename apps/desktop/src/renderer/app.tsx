@@ -90,6 +90,7 @@ import {
   pendingGoalProject,
   type RegisterComposerRetry,
 } from './conversation-view.tsx';
+import { GoogleSetup } from './google-setup.tsx';
 import {
   type ExecutionPolicySeed,
   googleAcpLabel,
@@ -1120,6 +1121,10 @@ export function App() {
           >
             <Plus size={14} />
             New task
+          </button>
+          <button type="button" className="add-task" onClick={() => setPage('usage')}>
+            <Gauge size={14} />
+            Connect providers
           </button>
         </div>
         <div className="nav-bottom">
@@ -2784,175 +2789,6 @@ function Handoffs({ events, snapshot }: { events: Event[]; snapshot: Snapshot })
   );
 }
 
-function GoogleSetup({
-  snapshot,
-  workspace,
-}: {
-  snapshot: Pick<Snapshot, 'googleAcpSetup' | 'nativeProfiles'>;
-  workspace: Workspace;
-}) {
-  const setup = snapshot.googleAcpSetup;
-  const profile = snapshot.nativeProfiles.find(
-    (value) => value.family === 'google' && 'configOptions' in value,
-  );
-  const [requested, setRequested] = useState<string | null>(null);
-  const [message, setMessage] = useState<string | null>(null);
-  const connected = workspace.connection === 'connected' && !workspace.preview;
-  const active = !!setup?.operationId;
-  async function action(kind: 'initialize' | 'authenticate' | 'discover' | 'stop') {
-    setMessage(null);
-    if (kind !== 'stop') setRequested(kind);
-    try {
-      const current = kind === 'stop' ? (await workspace.refresh()).googleAcpSetup : setup;
-      if (kind === 'stop' && !current?.operationId) {
-        setMessage('No exact setup operation is active. Refresh status before retrying.');
-        return;
-      }
-      if ((kind === 'authenticate' || kind === 'discover') && !current?.proofId) {
-        setMessage('Initialize Google ACP and inspect its retained proof first.');
-        return;
-      }
-      const result = await workspace.command(
-        kind === 'stop'
-          ? {
-              command: 'StopGoogleAcpSetup',
-              expectedRevision: current?.revision ?? 0,
-              payload: { profileId: 'google-acp-v1', operationId: current?.operationId as string },
-            }
-          : kind === 'initialize'
-            ? {
-                command: 'InitializeGoogleAcp',
-                expectedRevision: current?.revision ?? 0,
-                payload: { profileId: 'google-acp-v1', consent: 'explicit' },
-              }
-            : kind === 'authenticate'
-              ? {
-                  command: 'AuthenticateGoogleAcp',
-                  expectedRevision: current?.revision ?? 0,
-                  payload: {
-                    profileId: 'google-acp-v1',
-                    proofId: current?.proofId as string,
-                    method: 'oauth-personal',
-                    consent: 'explicit',
-                  },
-                }
-              : {
-                  command: 'DiscoverGoogleAcp',
-                  expectedRevision: current?.revision ?? 0,
-                  payload: {
-                    profileId: 'google-acp-v1',
-                    proofId: current?.proofId as string,
-                    consent: 'explicit',
-                  },
-                },
-      );
-      setMessage(
-        result.data?.kind === 'google-acp-setup'
-          ? `Setup ${result.data.setup.state}${result.data.setup.reason ? `: ${result.data.setup.reason}` : ''}.`
-          : (result.reason ?? result.outcome),
-      );
-    } catch {
-      setMessage('The setup action could not be confirmed. Refresh status before retrying.');
-    } finally {
-      if (kind !== 'stop') setRequested(null);
-    }
-  }
-  return (
-    <section className="card view-stack" aria-labelledby="google-setup-title">
-      <div className="section-heading">
-        <h2 id="google-setup-title">Google ACP setup</h2>
-        <span>{setup?.state ?? 'uninitialized'}</span>
-      </div>
-      <p className="muted small">{googleAcpLabel}</p>
-      <p className="muted small">
-        Import the official client through the explicit CLI import command first. Initialization and
-        discovery use no model prompt. Personal sign-in may open in your browser, contact Google and
-        write native authentication state. CrewKite retains result codes and safe proofs.
-      </p>
-      <div className="dialog-footer">
-        <button
-          className="button secondary"
-          type="button"
-          disabled={!connected || workspace.pending || active}
-          onClick={() => void action('initialize')}
-        >
-          Initialize Google ACP
-        </button>
-        <button
-          className="button secondary"
-          type="button"
-          disabled={!connected || workspace.pending || active || !setup?.proofId}
-          onClick={() => void action('authenticate')}
-        >
-          Sign in with Google
-        </button>
-        <button
-          className="button secondary"
-          type="button"
-          disabled={
-            !connected ||
-            workspace.pending ||
-            active ||
-            !setup?.proofId ||
-            setup.auth.status !== 'authenticated'
-          }
-          onClick={() => void action('discover')}
-        >
-          Discover Google choices
-        </button>
-        <button
-          className="button secondary"
-          type="button"
-          disabled={!connected || (!requested && !active)}
-          onClick={() => void action('stop')}
-        >
-          Stop setup
-        </button>
-        <button
-          className="button secondary"
-          type="button"
-          disabled={!connected}
-          onClick={() =>
-            void workspace.refresh().catch(() => setMessage('Setup status could not be read.'))
-          }
-        >
-          Refresh setup status
-        </button>
-      </div>
-      {requested && (
-        <p role="status">
-          {titleCase(requested)} requested. Refresh status to inspect the owned operation.
-        </p>
-      )}
-      <p className="muted small">
-        Authentication: {setup?.auth.status ?? 'unknown'}. Availability:{' '}
-        {profile?.reason ?? 'not-configured'}. Setup revision: {setup?.revision ?? 0}.
-      </p>
-      <p className="muted small">
-        Discovery choices establish configuration facts. A verified review mapping and route
-        qualification remain separate requirements.
-      </p>
-      {profile && (
-        <p className="muted small">
-          Models: {profile.configOptions?.model.supported.join(', ') ?? 'unknown'}. Thought levels:{' '}
-          {profile.configOptions?.thoughtLevel?.supported.join(', ') ?? 'unknown'}.
-        </p>
-      )}
-      {setup?.client && (
-        <details>
-          <summary>Client and proof identity</summary>
-          <p>
-            Version {setup.client.version}. Digest {setup.client.sha256}. Signer{' '}
-            {setup.client.signerTeamId}. Proof {setup.proofId ?? 'none'}. Operation{' '}
-            {setup.operationId ?? 'none'}.
-          </p>
-        </details>
-      )}
-      {message && <p role="status">{message}</p>}
-    </section>
-  );
-}
-
 function usageReading(value: UsageGaugeReading, label = value.label): UsageReading {
   const { reserveNote, ...facts } = value;
   return {
@@ -3103,7 +2939,7 @@ function Usage({
                   <>
                     <p role="status">
                       {anthropicConnection?.state === 'signed-in'
-                        ? 'Signed in with Claude account'
+                        ? 'Signed in with Anthropic account'
                         : anthropicConnection?.state === 'signed-out'
                           ? 'Signed out'
                           : `Sign-in ${anthropicConnection?.state ?? 'unchecked'}`}
@@ -3127,7 +2963,15 @@ function Usage({
                     </p>
                     {anthropicConnection?.state === 'signed-out' && (
                       <p className="muted small">
-                        Run claude auth login in the native terminal, then check again.
+                        Follow the{' '}
+                        <a
+                          href="https://github.com/rjk6831/crewkite/blob/main/docs/providers.md#anthropic-writer-preparation"
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          native client sign-in instructions
+                        </a>
+                        , then check again.
                       </p>
                     )}
                     {anthropicConnection?.observedAt && (
