@@ -8067,7 +8067,26 @@ test('google quota authority survives retries and restart while sharing one oper
       groups: number[];
     };
   };
-  await openController.refreshUsage('start');
+  const manualRead = metadata.command('ObserveUsage', { family: 'openai' }, 0);
+  const firstRead = await openController.execute(manualRead, 'local-owner');
+  assert.equal(firstRead.outcome, 'applied');
+  assert.deepEqual(await openController.execute(manualRead, 'local-owner'), {
+    ...firstRead,
+    outcome: 'already-applied',
+  });
+  const exposedReader = () =>
+    openController.snapshot().usageReaders.find((reader) => reader.family === 'openai');
+  assert.equal(exposedReader()?.readReason, 'observed');
+  assert.equal(exposedReader()?.lastObservedAt, metadata.clock.now());
+  assert.equal(
+    (
+      await openController.execute(
+        metadata.command('ObserveUsage', { family: 'openai' }, 0),
+        'local-owner',
+      )
+    ).reason,
+    'usage-reader-cooldown',
+  );
   assert.equal(metadataLaunches, 1);
   const reader = openController
     .snapshot()
@@ -8115,6 +8134,8 @@ test('google quota authority survives retries and restart while sharing one oper
   metadata.clock.advance(270000);
   metadataMode = 'invalid';
   await openController.refreshUsage('interval');
+  assert.notEqual(exposedReader()?.readReason, 'observed');
+  assert.equal(exposedReader()?.lastObservedAt, valid[0].observedAt);
   assert.equal(metadataLaunches, 3);
   assert.equal(state().state, 'quiescent');
   assert.deepEqual(windows(), valid);

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { ObservationSchema, type Route, type Window } from '@crewkite/contracts';
 import { createDemoFixtures, createTestIds, DEMO_TIME } from '@crewkite/testkit';
-import { projectUsagePresentation } from './usage-presentation.ts';
+import { nativeUsageClients, projectUsagePresentation } from './usage-presentation.ts';
 
 const id = createTestIds(DEMO_TIME, 9000n);
 const base = createDemoFixtures().snapshot.routes;
@@ -104,4 +104,35 @@ test('usage projection features a lone model pool by semantics and keeps provide
       claim,
     );
   }
+});
+
+test('native clients remain visible before any usage route exists', () => {
+  const clients = nativeUsageClients({
+    usageReaders: [],
+    nativeProfiles: [
+      { id: 'openai-file-v1', family: 'openai', available: true, reason: 'available' },
+      {
+        id: 'anthropic-file-v1',
+        family: 'anthropic',
+        available: true,
+        reason: 'qualification-pending',
+      },
+      {
+        id: 'anthropic-file-compact-v1',
+        family: 'anthropic',
+        available: true,
+        reason: 'qualification-pending',
+      },
+      { id: 'google-acp-v1', family: 'google', available: false, reason: 'client-unavailable' },
+    ],
+  });
+  assert.deepEqual(
+    clients.map(({ family, profiles, reader }) => [family, profiles.length, reader]),
+    [
+      ['openai', 1, null],
+      ['anthropic', 2, null],
+      ['google', 1, null],
+      ['local', 0, null],
+    ],
+  );
 });

@@ -101,7 +101,11 @@ import { LocalSetup } from './local-setup.tsx';
 import { useWorkspace, type Workspace } from './source.ts';
 import { roleLabels } from './templates.ts';
 import { type UsageCard, UsageGauges, type UsageReading } from './usage-gauges.tsx';
-import { projectUsagePresentation, type UsageGaugeReading } from './usage-presentation.ts';
+import {
+  nativeUsageClients,
+  projectUsagePresentation,
+  type UsageGaugeReading,
+} from './usage-presentation.ts';
 
 const tabs = [
   'Conversation',
@@ -2978,16 +2982,15 @@ function Usage({
     const timer = window.setInterval(() => setDisplayTime(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, [fixture]);
-  const reader = snapshot.usageReaders.find((value) => value.family === 'google');
+  const clients = nativeUsageClients(snapshot);
   const connected = workspace.connection === 'connected' && !workspace.preview;
-  const nextReadAt = reader?.lastAttemptAt ? Date.parse(reader.lastAttemptAt) + 60000 : null;
-  async function observeUsage() {
+  async function observeUsage(family: 'google' | 'openai') {
     setReaderMessage('Quota read in progress.');
     try {
       const result = await workspace.command({
         command: 'ObserveUsage',
         expectedRevision: 0,
-        payload: { family: 'google' },
+        payload: { family },
       });
       setReaderMessage(
         result.outcome === 'applied' || result.outcome === 'already-applied'
@@ -3037,35 +3040,88 @@ function Usage({
       </div>
       <LocalSetup snapshot={snapshot} workspace={workspace} />
       <GoogleSetup snapshot={snapshot} workspace={workspace} />
-      <section className="card" aria-labelledby="google-quota-title">
+      <section aria-labelledby="native-clients-title">
         <div className="section-heading">
-          <h2 id="google-quota-title">Google quota</h2>
-          <span>{reader?.available ? 'Available' : 'Unavailable'}</span>
+          <h2 id="native-clients-title">Native clients</h2>
         </div>
         <p className="muted small">
-          Reads Google quota through the CLI's /usage command. No model request. Reads are on by
-          default when the pinned client is available.
+          Client readiness is separate from retained usage and account allowance.
         </p>
-        <button
-          type="button"
-          className="button secondary"
-          disabled={!connected || workspace.pending || !reader?.available}
-          onClick={() => void observeUsage()}
-        >
-          <RefreshCw size={14} />
-          Refresh Google quota
-        </button>
-        <p className="muted small">
-          Reader status: {reader?.reason ?? 'Reader unavailable'}. Last attempt:{' '}
-          {reader?.lastAttemptAt ?? 'None'}. Last observation: {reader?.lastObservedAt ?? 'None'}.
-        </p>
-        {nextReadAt !== null && nextReadAt > now && (
-          <p className="muted small">
-            Cooldown until {new Date(nextReadAt).toLocaleTimeString()}. Refresh checks the
-            controller cooldown. Failed reads also count. Usage refreshes automatically about every
-            five minutes while connected.
-          </p>
-        )}
+        <div className="capacity-grid">
+          {clients.map(({ family, label, profiles, reader }) => {
+            const nextReadAt = reader?.lastAttemptAt
+              ? Date.parse(reader.lastAttemptAt) + 60000
+              : null;
+            return (
+              <section className="card" key={family} aria-label={`${label} client status`}>
+                <div className="section-heading">
+                  <h3>{label}</h3>
+                  <span>
+                    {profiles.some((profile) => profile.available)
+                      ? 'Supported client present'
+                      : 'Supported client unavailable'}
+                  </span>
+                </div>
+                {profiles.map((profile) => (
+                  <p className="muted small" key={profile.id}>
+                    {profile.id}: {profile.reason}
+                  </p>
+                ))}
+                {profiles.length === 0 && (
+                  <p className="muted small">No native profile is registered.</p>
+                )}
+                {family === 'anthropic' ? (
+                  <p className="muted small">
+                    Standalone quota refresh is unavailable. Usage stays unknown until an explicitly
+                    started task reports it. No prompt is sent to obtain quota.
+                  </p>
+                ) : family === 'local' ? (
+                  <p className="muted small">
+                    Local resource capacity has no subscription quota reader.
+                  </p>
+                ) : (
+                  <>
+                    <p className="muted small">
+                      Reads account quota through the supported native client. No model request.
+                    </p>
+                    <button
+                      type="button"
+                      className="button secondary"
+                      disabled={
+                        !connected ||
+                        workspace.pending ||
+                        !reader?.available ||
+                        reader.readState === 'intent' ||
+                        reader.readState === 'owned'
+                      }
+                      onClick={() => void observeUsage(family)}
+                    >
+                      <RefreshCw size={14} /> Refresh {label} quota
+                    </button>
+                    <p className="muted small">
+                      Reader status: {reader?.reason ?? 'unavailable'}. Last attempt:{' '}
+                      {reader?.lastAttemptAt ?? 'None'}. Last observation:{' '}
+                      {reader?.lastObservedAt ?? 'None'}.
+                    </p>
+                    {reader?.readState && (
+                      <p className="muted small">
+                        Read state: {reader.readState}. Result:{' '}
+                        {reader.readReason ?? 'No completed result'}.
+                        {reader.lastRequest ? ` Last request: ${reader.lastRequest}.` : ''}
+                      </p>
+                    )}
+                    {nextReadAt !== null && nextReadAt > now && (
+                      <p className="muted small">
+                        Cooldown until {new Date(nextReadAt).toLocaleTimeString()}. Failed reads
+                        also count.
+                      </p>
+                    )}
+                  </>
+                )}
+              </section>
+            );
+          })}
+        </div>
         {readerMessage && <p role="status">{readerMessage}</p>}
       </section>
       <section aria-labelledby="allowance-title">
@@ -3094,7 +3150,7 @@ function Usage({
           </>
         ) : (
           <Empty icon={<Gauge />} title="No provider allowance scope">
-            No cloud route is configured.
+            No retained cloud usage route is available. Native-client readiness is shown above.
           </Empty>
         )}
       </section>

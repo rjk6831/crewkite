@@ -125,14 +125,17 @@ A combined parent Pause records its current phase. Child Pause and Resume refuse
 
 Blocked and unknown outcomes remain visible in the action receipt. Save JSON output when a result is uncertain and use `retry <receipt-file>` only for that exact receipt. Retry retains the original command key, payload and expected revision, including the full amendment contract or exact paused run binding. It does not refresh the revision or reread contract flags. No automatic retry, preparation or follow-up action runs after amend or pause.
 
-## Google quota
+## Provider quota
 
 ```sh
 pnpm crewkite usage show --json
 pnpm crewkite usage refresh --family google --json
+pnpm crewkite usage refresh --family openai --json
 ```
 
 The quota reader runs by default when the pinned client is available. Controller startup attempts one read. Authenticated connections can refresh missing, stale or unknown observations, and Google admission can make one needed bounded read. Reads have a 60-second cooldown after each attempt, including failures. Active or unknown Google ownership blocks a read. A fresh reported zero remains fresh and does not cause another read just for being zero.
+
+OpenAI refresh uses the existing pinned native account metadata reader. It sends no model turn. Its status includes the ownership state, bounded result reason and last protocol request, so a timed-out read remains visible without guessing an authentication failure. Anthropic has no standalone quota refresh; its task-reported observations stay separate from client readiness.
 
 The reader calls the pinned Google CLI's headless `/usage` metadata command without a model request. A quota read supplies no coding authority, account identity, provider entitlement or billing hard cap. The [provider boundaries](../../docs/providers.md) describe this status check and its limits.
 

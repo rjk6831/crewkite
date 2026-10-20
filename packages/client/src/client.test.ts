@@ -668,7 +668,8 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       reason: 'client-unavailable',
     },
     { name: 'missing-family', args: ['usage', 'refresh'], invalid: true },
-    { name: 'wrong-family', args: ['usage', 'refresh', '--family', 'openai'], invalid: true },
+    { name: 'openai', args: ['usage', 'refresh', '--family', 'openai'] },
+    { name: 'wrong-family', args: ['usage', 'refresh', '--family', 'anthropic'], invalid: true },
     { name: 'show-family', args: ['usage', 'show', '--family', 'google'], invalid: true },
     { name: 'wrong-command', args: ['health', '--consent'], invalid: true },
     { name: 'extra', args: ['usage', 'show', 'other'], invalid: true },
@@ -3114,7 +3115,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         assert.deepEqual(receipt.command, received[0]);
         assert.equal(receipt.command.expectedRevision, 0);
         assert.deepEqual(receipt.command.payload, {
-          family: 'google',
+          family: usageCase.name === 'openai' ? 'openai' : 'google',
         });
         if (usageCase.reason) {
           assert.equal(receipt.result.reason, usageCase.reason);

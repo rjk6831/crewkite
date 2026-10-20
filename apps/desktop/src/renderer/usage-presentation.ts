@@ -89,6 +89,22 @@ function readingReserve(
   };
 }
 
+export function nativeUsageClients(
+  snapshot: Pick<Snapshot, 'usageReaders'> & {
+    nativeProfiles: readonly Pick<
+      Snapshot['nativeProfiles'][number],
+      'id' | 'family' | 'available' | 'reason'
+    >[];
+  },
+) {
+  return (['openai', 'anthropic', 'google', 'local'] as const).map((family) => ({
+    family,
+    label: familyLabels[family],
+    profiles: snapshot.nativeProfiles.filter((profile) => profile.family === family),
+    reader: snapshot.usageReaders.find((reader) => reader.family === family) ?? null,
+  }));
+}
+
 /** Projection keeps report identity separate from account identity and execution admission. */
 export function projectUsagePresentation(
   snapshot: Pick<Snapshot, 'routes' | 'usage' | 'usageReaders'>,

@@ -819,8 +819,8 @@ export const WindowSchema = z.strictObject({
 });
 export const UsageReaderSchema = z
   .strictObject({
-    id: z.literal('google-usage-v1'),
-    family: z.literal('google'),
+    id: z.enum(['google-usage-v1', 'openai-usage-v1']),
+    family: z.enum(['google', 'openai']),
     clientVersion: label,
     available: z.boolean(),
     reason: z.enum([
@@ -829,12 +829,19 @@ export const UsageReaderSchema = z
       'native-home-unavailable',
       'client-unavailable',
       'client-build-mismatch',
+      'not-configured',
+      'configuration-location-unsupported',
     ]),
+    readState: z.enum(['idle', 'intent', 'owned', 'quiescent', 'unknown']).optional(),
+    readReason: label.nullable().optional(),
+    lastRequest: label.nullable().optional(),
     lastObservedAt: TimestampSchema.nullable(),
     lastAttemptAt: TimestampSchema.nullable().optional(),
   })
   .refine(
-    (reader) => reader.available === (reader.reason === 'available'),
+    (reader) =>
+      reader.available === (reader.reason === 'available') &&
+      reader.id === `${reader.family}-usage-v1`,
     'Reader availability must match its client status.',
   );
 export const RoleSchema = z.strictObject({
@@ -2194,7 +2201,7 @@ export const CommandSchema = z.discriminatedUnion('command', [
     }),
   ),
   mutate('RegisterProject', z.strictObject({ path: text })),
-  mutate('ObserveUsage', z.strictObject({ family: z.literal('google') })),
+  mutate('ObserveUsage', z.strictObject({ family: z.enum(['google', 'openai']) })),
   mutate(
     'InitializeGoogleAcp',
     z.strictObject({ profileId: z.literal('google-acp-v1'), consent: z.literal('explicit') }),
@@ -2656,7 +2663,14 @@ export type CombinedRunPreview = z.infer<typeof CombinedRunPreviewSchema>;
 
 export const SnapshotSchema = z
   .strictObject({
-    usageReaders: z.array(UsageReaderSchema).max(1).default([]),
+    usageReaders: z
+      .array(UsageReaderSchema)
+      .max(2)
+      .refine(
+        (readers) => new Set(readers.map((reader) => reader.id)).size === readers.length,
+        'Usage reader identities must be unique.',
+      )
+      .default([]),
     googleAcpSetup: GoogleAcpSetupSchema.nullable().default(null),
     localSetup: LocalSetupSchema.nullable().optional(),
     nativeProfiles: z

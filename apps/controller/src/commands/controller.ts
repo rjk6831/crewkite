@@ -871,6 +871,10 @@ const OpenAiUsageReadSchema = z.strictObject({
   attemptedAt: TimestampSchema,
   profileHash: HashSchema,
   groups: z.array(z.number().int().positive().safe()).max(2),
+  reason: z.string().min(1).max(200).nullable().optional(),
+  lastRequest: z.string().min(1).max(200).nullable().optional(),
+  lastObservedAt: TimestampSchema.nullable().optional(),
+  commandId: CommandIdSchema.optional(),
 });
 
 type LocalWriterRuntime = {
@@ -1360,7 +1364,7 @@ export class Controller {
       nativeProfiles: this.resolveProfiles().map((profile) => profile.facts),
       localSetup: this.localSetup(),
       googleAcpSetup: this.store.googleAcpSetup(),
-      usageReaders: [this.googleUsageReader()],
+      usageReaders: [this.googleUsageReader(), this.openAiUsageReader()],
       routes: this.store.list('route'),
       usage: this.store
         .list<Observation>('window')
@@ -1494,6 +1498,26 @@ export class Controller {
     });
   }
 
+  private openAiUsageReader() {
+    const resolved = this.options.openAiUsageClient?.();
+    const profile = resolved?.facts.family === 'openai' ? resolved : unavailableNativeProfile();
+    const facts = profile.facts;
+    if (facts.family !== 'openai') throw Error('The usage reader requires an OpenAI profile.');
+    const state = this.openAiUsageState();
+    return UsageReaderSchema.parse({
+      id: 'openai-usage-v1',
+      family: 'openai',
+      clientVersion: facts.clientVersion,
+      available: profile.facts.available,
+      reason: profile.facts.available ? 'available' : profile.facts.reason,
+      readState: state?.state ?? 'idle',
+      readReason: state?.reason ?? null,
+      lastRequest: state?.lastRequest ?? null,
+      lastAttemptAt: state?.attemptedAt ?? null,
+      lastObservedAt: state?.lastObservedAt ?? null,
+    });
+  }
+
   refreshUsage(trigger: 'start' | 'connect' | 'interval'): Promise<void> {
     return Promise.allSettled([
       this.refreshGoogleUsage(trigger),
@@ -1527,7 +1551,10 @@ export class Controller {
     }
   }
 
-  private refreshOpenAiUsage(trigger: 'start' | 'connect' | 'interval'): Promise<void> | undefined {
+  private refreshOpenAiUsage(
+    trigger: 'start' | 'connect' | 'interval' | 'manual',
+    commandId?: string,
+  ): Promise<void> | undefined {
     try {
       if (this.closed || !this.options.openAiUsageClient) return;
       if (this.openAiUsageRead) return this.openAiUsageRead.done;
@@ -1618,6 +1645,10 @@ export class Controller {
         attemptedAt,
         profileHash,
         groups: [],
+        reason: null,
+        lastRequest: null,
+        lastObservedAt: previous?.lastObservedAt ?? null,
+        ...(commandId ? { commandId } : {}),
       });
       this.store.transaction(() => this.saveOpenAiUsage(state));
       const completion = Promise.withResolvers<void>();
@@ -1709,6 +1740,7 @@ export class Controller {
           const known = outcome.quiescent && state.groups.length > 0;
           // Usage follows the supported account check. A later protocol refusal
           // cannot grant authority or erase that validated read. Cancellation revokes it.
+          let published = false;
           if (
             known &&
             performance.now() < deadline &&
@@ -1721,20 +1753,35 @@ export class Controller {
                 throw Error('usage-read-deadline');
             };
             for (const report of reports)
-              this.storeProviderUsage(
-                readerRoute.id,
-                report.value,
-                publicationCurrent,
-                report.prior,
-              );
+              published =
+                this.storeProviderUsage(
+                  readerRoute.id,
+                  report.value,
+                  publicationCurrent,
+                  report.prior,
+                ) || published;
           }
           this.store.transaction(() =>
-            this.saveOpenAiUsage({ ...state, state: known ? 'quiescent' : 'unknown' }),
+            this.saveOpenAiUsage({
+              ...state,
+              state: known ? 'quiescent' : 'unknown',
+              reason: !known
+                ? 'ownership-unknown'
+                : published
+                  ? 'observed'
+                  : (outcome.reason ?? 'no-observations'),
+              lastRequest: outcome.lastRequest,
+              lastObservedAt: published ? this.now() : state.lastObservedAt,
+            }),
           );
         } catch {
           try {
             this.store.transaction(() =>
-              this.saveOpenAiUsage({ ...state, state: invoked ? 'unknown' : 'quiescent' }),
+              this.saveOpenAiUsage({
+                ...state,
+                state: invoked ? 'unknown' : 'quiescent',
+                reason: 'read-failed',
+              }),
             );
           } catch {}
         } finally {
@@ -2109,6 +2156,8 @@ export class Controller {
     command: Extract<Command, { command: 'ObserveUsage' }>,
     principal: string,
   ): Promise<CommandResult> {
+    const pendingReason =
+      command.payload.family === 'openai' ? 'openai-usage-read-pending' : 'usage-read-pending';
     const prior = this.usageRead;
     const hash = hashCanonical(command);
     if (prior?.key === command.key)
@@ -2117,8 +2166,14 @@ export class Controller {
         : Promise.resolve({ outcome: 'denied', reason: 'idempotency-key-reused' });
     if (prior || this.store.receipt(command.key)) {
       let result = this.commitCommand(command, principal);
-      if (result.outcome === 'outcome-unknown' && result.reason === 'usage-read-pending') {
-        result = { outcome: 'outcome-unknown', reason: 'google-ownership-unknown' };
+      if (result.outcome === 'outcome-unknown' && result.reason === pendingReason) {
+        result = {
+          outcome: 'outcome-unknown',
+          reason:
+            command.payload.family === 'openai'
+              ? 'openai-metadata-ownership-unknown'
+              : 'google-ownership-unknown',
+        };
         this.store.transaction(() => this.finishMetadataReceipt(command.key, result));
       }
       return Promise.resolve(result);
@@ -2135,7 +2190,7 @@ export class Controller {
     this.usageRead = pending;
     try {
       const result = this.commitCommand(command, principal);
-      if (result.outcome !== 'outcome-unknown' || result.reason !== 'usage-read-pending')
+      if (result.outcome !== 'outcome-unknown' || result.reason !== pendingReason)
         completion.resolve(result);
     } catch (error) {
       if (this.usageRead === pending) this.usageRead = undefined;
@@ -2150,6 +2205,34 @@ export class Controller {
     command: Extract<Command, { command: 'ObserveUsage' }>,
     effects: (() => void)[],
   ): CommandResult {
+    if (this.usageRead && this.usageRead.key !== command.key)
+      return { outcome: 'blocked', reason: 'usage-reader-busy' };
+    if (command.payload.family === 'openai') {
+      const reader = this.openAiUsageReader();
+      if (!reader.available) return { outcome: 'blocked', reason: reader.reason };
+      if (this.openAiUsageRead)
+        return { outcome: 'blocked', reason: 'openai-metadata-ownership-pending' };
+      if (reader.readState === 'unknown')
+        return { outcome: 'outcome-unknown', reason: 'openai-metadata-ownership-unknown' };
+      if (reader.readState === 'intent' || reader.readState === 'owned')
+        return { outcome: 'blocked', reason: 'openai-metadata-ownership-pending' };
+      if (reader.lastAttemptAt && Date.parse(this.now()) - Date.parse(reader.lastAttemptAt) < 60000)
+        return {
+          outcome: 'blocked',
+          reason: 'usage-reader-cooldown',
+          next: `Refresh after ${new Date(Date.parse(reader.lastAttemptAt) + 60000).toISOString()}.`,
+        };
+      if (
+        this.store.intents().some((intent) => {
+          if (intent.state === 'stopped') return false;
+          const route = this.store.get<Route>('route', intent.route_id);
+          return !route || (route.family === 'openai' && !route.fake);
+        })
+      )
+        return { outcome: 'blocked', reason: 'openai-task-active' };
+      effects.push(() => void this.launchOpenAiUsage(command.key));
+      return { outcome: 'outcome-unknown', reason: 'openai-usage-read-pending' };
+    }
     const reader = this.store.googleUsageReader();
     const now = this.now();
     if (reader.last_attempt_at && Date.parse(now) - Date.parse(reader.last_attempt_at) < 60000)
@@ -2174,6 +2257,47 @@ export class Controller {
       () => void this.launchGoogleUsage(command.key, reader.authority_revision, resolution),
     );
     return { outcome: 'outcome-unknown', reason: 'usage-read-pending' };
+  }
+
+  private async launchOpenAiUsage(commandId: string) {
+    const runtime = this.usageRead;
+    if (!runtime || runtime.key !== commandId) return;
+    let result: CommandResult;
+    try {
+      const read = this.refreshOpenAiUsage('manual', commandId);
+      await read;
+      const state = this.openAiUsageState();
+      result =
+        !read || state?.commandId !== commandId
+          ? { outcome: 'blocked', reason: 'usage-read-unavailable' }
+          : state.state === 'unknown'
+            ? { outcome: 'outcome-unknown', reason: 'openai-metadata-ownership-unknown' }
+            : state.reason === 'observed'
+              ? {
+                  outcome: 'applied',
+                  data: {
+                    kind: 'usage',
+                    windows: this.store
+                      .list<Observation>('window')
+                      .map((observation) =>
+                        deriveWindow(observation, {
+                          nowMs: Date.parse(this.now()),
+                          maxAgeMs: 300000,
+                        }),
+                      ),
+                  },
+                }
+              : { outcome: 'blocked', reason: state.reason ?? 'no-observations' };
+    } catch {
+      result = { outcome: 'outcome-unknown', reason: 'openai-metadata-ownership-unknown' };
+    }
+    try {
+      this.store.transaction(() => this.finishMetadataReceipt(commandId, result));
+    } catch {
+      result = { outcome: 'outcome-unknown', reason: 'openai-metadata-ownership-unknown' };
+    } finally {
+      runtime.resolve(result);
+    }
   }
 
   private async launchGoogleUsage(
@@ -15714,6 +15838,14 @@ export class Controller {
             usage.groups.length && usage.groups.every((group) => groupAbsent(group))
               ? 'quiescent'
               : 'unknown',
+        });
+      if (
+        usage?.commandId &&
+        this.store.receipt(usage.commandId)?.result.reason === 'openai-usage-read-pending'
+      )
+        this.finishMetadataReceipt(usage.commandId, {
+          outcome: 'outcome-unknown',
+          reason: 'openai-metadata-ownership-unknown',
         });
       const local = this.localControl();
       if (local.operation)
