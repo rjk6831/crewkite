@@ -48,6 +48,9 @@ test('package upgrade preserves fixed-path state and refuses unsafe swaps', asyn
   for (const scenario of [
     'installed',
     'old-re-signed',
+    'finder-metadata',
+    'finder-link',
+    'finder-large',
     'old-payload-drift',
     'source-state-link',
     'lease',
@@ -107,6 +110,13 @@ test('package upgrade preserves fixed-path state and refuses unsafe swaps', asyn
     if (scenario === 'old-re-signed')
       writeFileSync(join(target, 'Electron.app/runtime'), 'locally re-signed');
     if (scenario === 'old-payload-drift') writeFileSync(join(target, 'runtime'), 'changed');
+    if (scenario === 'finder-metadata') {
+      writeFileSync(join(source, '.DS_Store'), 'new folder view', { mode: 0o600 });
+      writeFileSync(join(target, '.DS_Store'), 'old folder view', { mode: 0o600 });
+    }
+    if (scenario === 'finder-link') symlinkSync('runtime', join(source, '.DS_Store'));
+    if (scenario === 'finder-large')
+      writeFileSync(join(source, '.DS_Store'), Buffer.alloc(1024 * 1024 + 1), { mode: 0o600 });
     if (scenario === 'source-state-link') {
       const outside = join(root, 'outside-empty');
       mkdirSync(outside);
@@ -142,7 +152,7 @@ test('package upgrade preserves fixed-path state and refuses unsafe swaps', asyn
           },
         },
       );
-      if (scenario === 'installed' || scenario === 'old-re-signed') {
+      if (['installed', 'old-re-signed', 'finder-metadata'].includes(scenario)) {
         const result = await pending;
         assert.equal(result.outcome, 'installed');
         assert.equal(result.target, target);
@@ -151,6 +161,11 @@ test('package upgrade preserves fixed-path state and refuses unsafe swaps', asyn
         assert.deepEqual(readFileSync(join(result.backup, 'state/home/state.sqlite')), before);
         assert.equal(result.stateDigest.length, 64);
         assert.equal(result.previousRuntimeChanged, scenario === 'old-re-signed');
+        assert.equal(result.previousFinderMetadataEntries, scenario === 'finder-metadata' ? 1 : 0);
+        if (scenario === 'finder-metadata') {
+          assert.equal(readFileSync(join(result.backup, '.DS_Store'), 'utf8'), 'old folder view');
+          assert.equal(readFileSync(join(target, '.DS_Store'), 'utf8'), 'new folder view');
+        }
         assert.equal(plan.previousRuntimeChanged, scenario === 'old-re-signed');
         assert.equal(
           readFileSync(join(result.backup, 'Electron.app/runtime'), 'utf8'),
@@ -168,6 +183,8 @@ test('package upgrade preserves fixed-path state and refuses unsafe swaps', asyn
         const reasons = {
           lease: /ownership lease/,
           'old-payload-drift': /inventory differs/,
+          'finder-link': /inventory differs/,
+          'finder-large': /inventory differs/,
           'source-state-link': /replacement state path/,
           'second-rename': /injected swap failure/,
           active: /still in use/,

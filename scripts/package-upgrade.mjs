@@ -130,6 +130,12 @@ function verifyPayload(root, manifest, allowOldRuntimeChanges = false) {
   const expected = [...manifest.files].sort((a, b) =>
     a.path < b.path ? -1 : a.path > b.path ? 1 : 0,
   );
+  const finderMetadata = (row) =>
+    row.path.split('/').at(-1) === '.DS_Store' &&
+    row.target === undefined &&
+    Number.isSafeInteger(row.bytes) &&
+    row.bytes >= 0 &&
+    row.bytes <= 1024 * 1024;
   if (
     expected.some(
       (row) =>
@@ -144,11 +150,13 @@ function verifyPayload(root, manifest, allowOldRuntimeChanges = false) {
     JSON.stringify(
       actual
         .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+        .filter((row) => !finderMetadata(row))
         .filter((row) => !allowOldRuntimeChanges || !row.path.startsWith('Electron.app/'))
         .map(normalize),
     ) !==
       JSON.stringify(
         expected
+          .filter((row) => !finderMetadata(row))
           .filter((row) => !allowOldRuntimeChanges || !row.path.startsWith('Electron.app/'))
           .map(normalize),
       )
@@ -156,8 +164,18 @@ function verifyPayload(root, manifest, allowOldRuntimeChanges = false) {
     fail('The package inventory differs from its manifest. No files were replaced.');
   return {
     rows,
+    finderMetadataEntries: actual.filter(finderMetadata).length,
     runtimeChanged:
-      JSON.stringify(actual.map(normalize)) !== JSON.stringify(expected.map(normalize)),
+      JSON.stringify(
+        actual
+          .filter((row) => row.path.startsWith('Electron.app/') && !finderMetadata(row))
+          .map(normalize),
+      ) !==
+      JSON.stringify(
+        expected
+          .filter((row) => row.path.startsWith('Electron.app/') && !finderMetadata(row))
+          .map(normalize),
+      ),
   };
 }
 function copyRegular(from, to, mode) {
@@ -355,6 +373,7 @@ export async function upgradePackage({ source, target, confirm }, dependencies =
       backup,
       revision: candidate.revision,
       previousRuntimeChanged: previousPayload.runtimeChanged,
+      previousFinderMetadataEntries: previousPayload.finderMetadataEntries,
       previousPayloadEntries: previousPayload.rows.length,
       previousPayloadDigest: hash(JSON.stringify(previousPayload.rows)),
       stateEntries: originalState.length,
