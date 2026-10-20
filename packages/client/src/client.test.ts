@@ -38,6 +38,7 @@ const task = {
   next: 'Prepare the run.',
 };
 const snapshot: Snapshot = {
+  nativeConnections: [],
   protocol: 1,
   cursor: '4',
   projects: [],

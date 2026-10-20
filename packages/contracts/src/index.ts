@@ -2201,6 +2201,10 @@ export const CommandSchema = z.discriminatedUnion('command', [
     }),
   ),
   mutate('RegisterProject', z.strictObject({ path: text })),
+  mutate(
+    'CheckNativeConnection',
+    z.strictObject({ family: z.literal('anthropic'), consent: z.literal('explicit') }),
+  ),
   mutate('ObserveUsage', z.strictObject({ family: z.enum(['google', 'openai']) })),
   mutate(
     'InitializeGoogleAcp',
@@ -2661,8 +2665,45 @@ export const CombinedRunPreviewSchema = z
   });
 export type CombinedRunPreview = z.infer<typeof CombinedRunPreviewSchema>;
 
+export const NativeConnectionStatusSchema = z
+  .strictObject({
+    family: z.literal('anthropic'),
+    profileId: z.literal('anthropic-file-v1'),
+    state: z.enum([
+      'unchecked',
+      'checking',
+      'signed-in',
+      'signed-out',
+      'unsupported',
+      'blocked',
+      'unknown',
+    ]),
+    authMethod: z
+      .enum(['none', 'claude.ai', 'oauth_token', 'api_key', 'api_key_helper', 'third_party'])
+      .nullable(),
+    observedAt: TimestampSchema.nullable(),
+    reason: z.string().min(1).max(200).nullable(),
+    next: z.string().min(1).max(500),
+    billing: z.literal('unknown'),
+    qualified: z.literal(false),
+    quota: z.literal('unknown'),
+  })
+  .refine(
+    (status) =>
+      status.state !== 'signed-in' ||
+      (status.authMethod === 'claude.ai' && status.observedAt !== null),
+    'Signed-in status requires observed native subscription authentication.',
+  )
+  .refine(
+    (status) =>
+      status.state !== 'signed-out' || (status.authMethod === 'none' && status.observedAt !== null),
+    'Signed-out status requires an observed signed-out method.',
+  );
+export type NativeConnectionStatus = z.infer<typeof NativeConnectionStatusSchema>;
+
 export const SnapshotSchema = z
   .strictObject({
+    nativeConnections: z.array(NativeConnectionStatusSchema).max(1).default([]),
     usageReaders: z
       .array(UsageReaderSchema)
       .max(2)
@@ -2854,6 +2895,7 @@ export const WorkspaceStateSchema = z
     usageReaders: SnapshotSchema.shape.usageReaders,
     googleAcpSetup: SnapshotSchema.shape.googleAcpSetup,
     localSetup: SnapshotSchema.shape.localSetup,
+    nativeConnections: SnapshotSchema.shape.nativeConnections,
     nativeProfiles: SnapshotSchema.shape.nativeProfiles,
     routes: SnapshotSchema.shape.routes,
     usage: SnapshotSchema.shape.usage,

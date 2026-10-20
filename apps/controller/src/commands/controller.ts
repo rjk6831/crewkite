@@ -195,6 +195,10 @@ import {
   type Schedule,
 } from '../host/worker.ts';
 import {
+  ConnectionRecordSchema,
+  NativeConnectionChecks,
+} from '../providers/anthropic/native-connection.ts';
+import {
   type NativeLifecycle as AnthropicLifecycle,
   startNativeAuthStatus,
 } from '../providers/anthropic/native-discovery.ts';
@@ -1085,6 +1089,7 @@ export class Controller {
         ownsTurn: (binding, phase) => this.ownsConversationTurn(binding, phase),
       });
       this.recover();
+      this.nativeConnections().recover();
       this.armQuotaRetries();
       for (const row of this.store.db
         .prepare("SELECT candidate_id FROM publications WHERE state='prepared'")
@@ -1124,6 +1129,8 @@ export class Controller {
       return this.executeAcpSetup(command as AcpSetupCommand, principal);
     if (command.command === 'StartRun' && this.isPreparedAcp(command.payload.runId))
       return this.executeAcpStart(command, principal);
+    if (command.command === 'CheckNativeConnection')
+      return this.checkNativeConnection(command, principal);
     if (command.command === 'ObserveUsage') return this.observeUsageCommand(command, principal);
     if (command.command === 'CaptureConversationContext')
       return this.captureConversationContextCommand(command, principal);
@@ -1361,6 +1368,7 @@ export class Controller {
       protocol: 1,
       stamp: this.store.workspaceStamp(),
       cursor: this.store.cursor(),
+      nativeConnections: [this.nativeConnections().status()],
       nativeProfiles: this.resolveProfiles().map((profile) => profile.facts),
       localSetup: this.localSetup(),
       googleAcpSetup: this.store.googleAcpSetup(),
@@ -1416,6 +1424,7 @@ export class Controller {
     try {
       const snapshot = {
         protocol: 1,
+        nativeConnections: header.nativeConnections,
         nativeProfiles: header.nativeProfiles,
         localSetup: header.localSetup,
         googleAcpSetup: header.googleAcpSetup,
@@ -2152,6 +2161,94 @@ export class Controller {
     }
   }
 
+  private connectionChecks?: NativeConnectionChecks;
+
+  private nativeConnections(): NativeConnectionChecks {
+    if (this.connectionChecks) return this.connectionChecks;
+    this.connectionChecks = new NativeConnectionChecks({
+      now: this.now,
+      latest: () => {
+        const row = this.store.db
+          .prepare(
+            "SELECT command_key FROM receipts WHERE command_key LIKE 'native-connection:%' ORDER BY rowid DESC LIMIT 1",
+          )
+          .get() as { command_key: string } | undefined;
+        return row
+          ? ConnectionRecordSchema.parse(this.nativeRecord(row.command_key, 4096).value)
+          : null;
+      },
+      completed: (key) =>
+        this.store.receipt(`native-connection:${key}:complete`)
+          ? ConnectionRecordSchema.parse(
+              this.nativeRecord(`native-connection:${key}:complete`, 4096).value,
+            )
+          : null,
+      append: (record) =>
+        this.store.transaction(() => {
+          const value = ConnectionRecordSchema.parse(record);
+          const artifact = this.nativeArtifact(value);
+          if (value.phase === 'intent')
+            this.store.saveReceipt(value.key, value.requestHash, 'local-owner', {
+              outcome: 'blocked',
+              reason: 'anthropic-connection-check-pending',
+              next: 'Wait for the native sign-in check.',
+            });
+          this.store.saveReceipt(
+            `native-connection:${value.key}:${value.phase}`,
+            artifact.hash,
+            'local-owner',
+            { outcome: 'applied', entity: artifact },
+          );
+        }),
+    });
+    return this.connectionChecks;
+  }
+
+  private async checkNativeConnection(
+    command: Extract<Command, { command: 'CheckNativeConnection' }>,
+    principal: string,
+  ): Promise<CommandResult> {
+    const hash = hashCanonical(command);
+    const receipt = this.store.receipt(command.key);
+    if (receipt && (receipt.hash !== hash || receipt.principal !== principal))
+      return { outcome: 'denied', reason: 'idempotency-key-reused' };
+    if (receipt && receipt.result.reason !== 'anthropic-connection-check-pending')
+      return {
+        ...receipt.result,
+        ...(receipt.result.outcome === 'applied' ? { outcome: 'already-applied' as const } : {}),
+      };
+    if (command.expectedRevision !== 0) return { outcome: 'stale-revision', revision: 0 };
+    const directory = join(this.home, 'native', `connection-${command.key}`);
+    try {
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
+    } catch {
+      return { outcome: 'blocked', reason: 'anthropic-connection-storage-failed' };
+    }
+    const result = await this.nativeConnections().check(
+      {
+        key: command.key,
+        requestHash: hash,
+        profile: this.profileFor('anthropic-file-v1'),
+        directory,
+        repositoryRoot: this.home,
+      },
+      { spawn: this.options.nativeSpawn, schedule: this.options.schedule },
+    );
+    if (result.outcome === 'denied') return result;
+    // Metadata failures are terminal receipts. Task authority keeps its own fresh checks.
+    try {
+      this.store.transaction(() => {
+        const current = this.store.receipt(command.key);
+        if (current?.result.reason === 'anthropic-connection-check-pending')
+          this.finishMetadataReceipt(command.key, result);
+        else if (!current) this.store.saveReceipt(command.key, hash, principal, result);
+      });
+    } catch {
+      return { outcome: 'blocked', reason: 'anthropic-connection-storage-failed' };
+    }
+    return result;
+  }
+
   private observeUsageCommand(
     command: Extract<Command, { command: 'ObserveUsage' }>,
     principal: string,
@@ -2277,14 +2374,12 @@ export class Controller {
                   outcome: 'applied',
                   data: {
                     kind: 'usage',
-                    windows: this.store
-                      .list<Observation>('window')
-                      .map((observation) =>
-                        deriveWindow(observation, {
-                          nowMs: Date.parse(this.now()),
-                          maxAgeMs: 300000,
-                        }),
-                      ),
+                    windows: this.store.list<Observation>('window').map((observation) =>
+                      deriveWindow(observation, {
+                        nowMs: Date.parse(this.now()),
+                        maxAgeMs: 300000,
+                      }),
+                    ),
                   },
                 }
               : { outcome: 'blocked', reason: state.reason ?? 'no-observations' };
@@ -2547,6 +2642,7 @@ export class Controller {
     for (const cancel of this.quotaRetries.values()) cancel();
     this.quotaRetries.clear();
     const native: Promise<unknown>[] = [];
+    if (this.connectionChecks) native.push(this.connectionChecks.close());
     if (this.acpStart) {
       this.acpStart.aborted = true;
       native.push(this.acpStart.promise);
@@ -15844,8 +15940,11 @@ export class Controller {
         this.store.receipt(usage.commandId)?.result.reason === 'openai-usage-read-pending'
       )
         this.finishMetadataReceipt(usage.commandId, {
-          outcome: 'outcome-unknown',
-          reason: 'openai-metadata-ownership-unknown',
+          outcome: this.openAiUsageState()?.state === 'quiescent' ? 'blocked' : 'outcome-unknown',
+          reason:
+            this.openAiUsageState()?.state === 'quiescent'
+              ? 'usage-read-interrupted'
+              : 'openai-metadata-ownership-unknown',
         });
       const local = this.localControl();
       if (local.operation)

@@ -8345,7 +8345,34 @@ test('google quota authority survives retries and restart while sharing one oper
   assert.equal(state().state, 'quiescent', 'close joins physical cleanup before closing the store');
   assert.deepEqual(windows(), valid, 'a cancelled read cannot advance observed time');
   const savedState = state();
-  const saved = openController as unknown as { saveOpenAiUsage: (value: unknown) => void };
+  let saved = openController as unknown as { saveOpenAiUsage: (value: unknown) => void };
+  const interruptedRead = metadata.command('ObserveUsage', { family: 'openai' }, 0);
+  openController.store.transaction(() => {
+    saved.saveOpenAiUsage({ ...savedState, commandId: interruptedRead.key, state: 'quiescent' });
+    openController.store.saveReceipt(
+      interruptedRead.key,
+      hashCanonical(interruptedRead),
+      'local-owner',
+      {
+        outcome: 'outcome-unknown',
+        reason: 'openai-usage-read-pending',
+      },
+    );
+  });
+  await openController.close();
+  openController = new Controller({
+    ...metadataOptions,
+    home: join(metadata.directory, 'home'),
+    now: metadata.clock.now,
+    id: metadata.id,
+  });
+  saved = openController as unknown as { saveOpenAiUsage: (value: unknown) => void };
+  const recoveredRead = await openController.execute(interruptedRead, 'local-owner');
+  assert.equal(recoveredRead.outcome, 'blocked');
+  assert.equal(recoveredRead.reason, 'usage-read-interrupted');
+  assert.deepEqual(windows(), valid);
+  assert.equal(metadataLaunches, finalLaunches, 'closed manual metadata recovery never replays');
+
   const holder = spawnProcess(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], {
     detached: true,
     stdio: 'ignore',
@@ -11116,4 +11143,159 @@ test('planning turns keep task authority and allowance across execution', async 
     assert.equal(createHash('sha256').update(readFileSync(path)).digest('hex'), sentinel.hash);
     assert.equal(lstatSync(path).mode & 0o777, sentinel.mode);
   }
+});
+
+test('native connection checks retain ownership without blocking unrelated tasks', async (t) => {
+  const { AnthropicNativeProfileSchema } = await import('@crewkite/contracts');
+  let launches = 0;
+  const method = 'claude.ai';
+  let child: import('node:child_process').ChildProcessWithoutNullStreams | undefined;
+  const ready = Promise.withResolvers<void>();
+  const base = unavailableNativeProfile();
+  const profile = {
+    ...base,
+    facts: AnthropicNativeProfileSchema.parse({
+      ...base.facts,
+      id: 'anthropic-file-v1',
+      family: 'anthropic',
+      accountClass: 'unknown',
+      serviceTier: 'unknown',
+      creditPolicies: ['ordinary'],
+      effort: 'medium',
+      effectiveEffort: 'unknown',
+      billingBasis: 'requires-user-attestation',
+      maximumFileBytes: 65536,
+      available: true,
+      reason: 'qualification-pending',
+    }),
+    client: { executable: process.execPath, sha256: fixtureClientHash, version: process.version },
+    environment: { ...process.env },
+    locationHash: '2'.repeat(64),
+  } satisfies NativeProfileResolution;
+  const options: Partial<ControllerOptions> = {
+    nativeProfiles: () => [profile],
+    nativeSpawn: (_executable, args, spawnOptions) => {
+      assert.deepEqual(args, ['auth', 'status']);
+      launches++;
+      const ownedChild = spawn(
+        process.execPath,
+        [
+          '-e',
+          `
+        const {MessageChannel}=require('node:worker_threads');
+        const channel=new MessageChannel();channel.port1.on('message',()=>{});
+        process.on('SIGUSR1', () => {
+          process.stdout.write(JSON.stringify({authMethod:${JSON.stringify(method)},email:'discard@example.invalid',token:'discard'}), () => process.exit(0));
+        });
+        process.stderr.write('ready');
+        process.stdin.resume();
+      `,
+        ],
+        spawnOptions,
+      );
+      child = ownedChild;
+      ownedChild.stderr.once('data', () => ready.resolve());
+      return ownedChild;
+    },
+  };
+  let controller: Controller;
+  const context = await setup(t, options, () => controller.close());
+  controller = context.controller;
+  const input = context.command(
+    'CheckNativeConnection',
+    { family: 'anthropic', consent: 'explicit' },
+    0,
+  );
+  const pending = controller.execute(input, 'local-owner');
+  await ready.promise;
+  assert.equal(controller.snapshot().nativeConnections[0]?.state, 'checking');
+  assert.equal(
+    (await controller.execute({ ...context.draft, key: input.key }, 'local-owner')).outcome,
+    'denied',
+  );
+  assert.equal((await controller.execute(context.draft, 'local-owner')).outcome, 'applied');
+  assert.equal(
+    (
+      await controller.execute(
+        context.command('CheckNativeConnection', input.payload, 0),
+        'local-owner',
+      )
+    ).outcome,
+    'blocked',
+  );
+  assert.ok(child);
+  child.kill('SIGUSR1');
+  assert.equal((await pending).outcome, 'applied');
+  const status = controller.snapshot().nativeConnections[0];
+  assert.ok(status);
+  assert.equal(status.state, 'signed-in');
+  assert.equal(status.billing, 'unknown');
+  assert.equal(status.quota, 'unknown');
+  assert.equal(status.qualified, false);
+  assert.equal(JSON.stringify(status).includes('discard'), false);
+  assert.equal((await controller.execute(input, 'local-owner')).outcome, 'already-applied');
+  assert.equal(launches, 1);
+  const owned = controller.store.db
+    .prepare("SELECT command_key FROM receipts WHERE command_key LIKE 'native-connection:%:owned'")
+    .all();
+  assert.equal(owned.length, 1);
+  controller.store.db
+    .prepare('DELETE FROM receipts WHERE command_key=? OR command_key=?')
+    .run(input.key, `native-connection:${input.key}:complete`);
+  await controller.close();
+  controller = new Controller({
+    ...options,
+    home: join(context.directory, 'home'),
+    now: context.clock.now,
+    id: context.id,
+  });
+  const recoveredSnapshot = await controller.execute(
+    context.command('GetSnapshot', {}),
+    'local-owner',
+  );
+  assert.equal(recoveredSnapshot.data?.kind, 'snapshot');
+  if (recoveredSnapshot.data?.kind !== 'snapshot') throw Error('Expected recovered snapshot.');
+  assert.equal(recoveredSnapshot.data.snapshot.nativeConnections[0]?.state, 'blocked');
+  assert.equal(
+    (await controller.execute(input, 'local-owner')).reason,
+    'anthropic-connection-interrupted',
+  );
+  assert.equal(launches, 1);
+  // Retain only the pre-spawn intent, as a crash can leave it without closure proof.
+  controller.store.db
+    .prepare(
+      "DELETE FROM receipts WHERE command_key=? OR (command_key LIKE 'native-connection:%' AND command_key NOT LIKE '%:intent')",
+    )
+    .run(input.key);
+  await controller.close();
+  controller = new Controller({
+    ...options,
+    home: join(context.directory, 'home'),
+    now: context.clock.now,
+    id: context.id,
+  });
+  assert.equal(controller.snapshot().nativeConnections[0]?.state, 'unknown');
+  assert.equal(
+    (
+      await controller.execute(
+        context.command('CheckNativeConnection', input.payload, 0),
+        'local-owner',
+      )
+    ).outcome,
+    'blocked',
+  );
+  assert.equal(launches, 1);
+  assert.equal(
+    (
+      await controller.execute(
+        context.command(
+          'CreateTask',
+          { ...(context.draft.payload as Record<string, unknown>), title: 'Independent work' },
+          0,
+        ),
+        'local-owner',
+      )
+    ).outcome,
+    'applied',
+  );
 });
