@@ -572,6 +572,9 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     'missing-operation',
     'wrong-family',
     'prepare',
+    'deadline-five',
+    'deadline-ten',
+    'deadline-invalid',
     'saved',
     'model',
     'thought',
@@ -1964,6 +1967,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     ['--existing-credits'],
     ['--confirm-subscription-only'],
     ['--permission-mode', 'strict'],
+    ['--maximum-task-ms', '600000'],
     ['--model-id', 'override'],
     ['--thought-level-id', 'override'],
     ['--confirm-quota-account'],
@@ -2923,6 +2927,12 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
                   ? []
                   : ['--thought-level-id', name === 'thought' ? 'invented' : 'thought-low']),
               ]),
+          ...(name.startsWith('deadline-')
+            ? [
+                '--maximum-task-ms',
+                name === 'deadline-five' ? '300000' : name === 'deadline-ten' ? '600000' : '600001',
+              ]
+            : []),
           ...(name === 'credits' ? ['--existing-credits'] : []),
           ...(name === 'mode' ? ['--permission-mode', 'always-proceed'] : []),
           ...(name === 'handoff' ? ['--handoff-target', profile.id] : []),
@@ -2945,6 +2955,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         'handoff',
         'autopilot',
         'import-consent-missing',
+        'deadline-invalid',
       ].some((name) => scenario === `acp-${name}`);
       assert.equal(result.code, invalid ? 1 : 0, result.errors);
       if (invalid) {
@@ -2959,6 +2970,8 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         assert.deepEqual(data.command.payload.binding.acpTarget, acpApproval.acpTarget);
       else if (
         scenario === 'acp-prepare' ||
+        scenario === 'acp-deadline-five' ||
+        scenario === 'acp-deadline-ten' ||
         scenario === 'acp-saved' ||
         scenario === 'acp-model-only'
       ) {
@@ -2978,6 +2991,12 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         assert.equal(data.command.payload.billingAttestation.quotaAccountConfirmed, true);
         assert.equal(data.command.payload.permissionMode, 'request-review');
         assert.equal(data.command.payload.creditPolicy, 'ordinary');
+        if (scenario === 'acp-deadline-five' || scenario === 'acp-deadline-ten')
+          assert.equal(
+            data.command.payload.maximumTaskMs,
+            scenario === 'acp-deadline-five' ? 300000 : 600000,
+          );
+        else assert.equal(Object.hasOwn(data.command.payload, 'maximumTaskMs'), false);
         assert.equal(data.command.payload.consent, scenario === 'acp-saved' ? 'saved' : 'explicit');
       } else {
         assert.equal(data.command.expectedRevision, scenario === 'acp-initialize' ? 0 : 7);

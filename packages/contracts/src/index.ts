@@ -459,6 +459,7 @@ export const GoogleAcpProfileSchema = GoogleNativeProfileSchema.omit({
 })
   .extend({
     id: z.literal('google-acp-v1'),
+    maximumTaskMs: z.union([z.literal(300000), z.literal(600000)]),
     effort: acpIdentifier,
     effortSupported: z.array(acpIdentifier).max(32),
     configOptions: GoogleAcpConfigurationSchema.nullable(),
@@ -1296,6 +1297,7 @@ export const NativePreparationPayloadSchema = z.union([
     creditPolicy: z.literal('ordinary').default('ordinary'),
     billingAttestation: GoogleAcpBillingAttestationSchema,
     permissionMode: z.literal('request-review'),
+    maximumTaskMs: z.union([z.literal(300000), z.literal(600000)]).optional(),
     targetPath: NativeTargetPathSchema,
   }),
   z.strictObject({

@@ -140,6 +140,10 @@ test('process boundaries reject unknown fields and invalid command identity', ()
   assert.deepEqual(CommandSchema.parse(compactWriter), compactWriter);
   for (const payload of [
     { ...combined.payload, children: combined.payload.children.slice(0, 1) },
+    {
+      ...combined.payload,
+      children: combined.payload.children.map((child) => ({ ...child, maximumMinutes: 10 })),
+    },
     { ...combined.payload, children: [combined.payload.children[0], combined.payload.children[0]] },
     {
       ...combined.payload,
@@ -1268,6 +1272,12 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     },
   };
   assert.deepEqual(NativeProfileSchema.parse(acpProfile), acpProfile);
+  assert.deepEqual(NativeProfileSchema.parse({ ...acpProfile, maximumTaskMs: 600000 }), {
+    ...acpProfile,
+    maximumTaskMs: 600000,
+  });
+  for (const maximumTaskMs of [300001, 600001])
+    assert.equal(NativeProfileSchema.safeParse({ ...acpProfile, maximumTaskMs }).success, false);
   const modelOnly = {
     ...acpProfile,
     effort: 'unknown',
@@ -2603,6 +2613,26 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     },
   };
   assert.deepEqual(CommandSchema.parse(acpPreparation), acpPreparation);
+  assert.equal(Object.hasOwn(CommandSchema.parse(acpPreparation).payload, 'maximumTaskMs'), false);
+  for (const maximumTaskMs of [300000, 600000]) {
+    const request = { ...acpPreparation, payload: { ...acpPreparation.payload, maximumTaskMs } };
+    assert.deepEqual(CommandSchema.parse(request), request);
+  }
+  for (const maximumTaskMs of [300001, 600001])
+    assert.equal(
+      CommandSchema.safeParse({
+        ...acpPreparation,
+        payload: { ...acpPreparation.payload, maximumTaskMs },
+      }).success,
+      false,
+    );
+  assert.equal(
+    CommandSchema.safeParse({
+      ...filePreparation,
+      payload: { ...filePreparation.payload, maximumTaskMs: 600000 },
+    }).success,
+    false,
+  );
   assert(
     CommandSchema.safeParse({
       ...acpPreparation,

@@ -394,6 +394,7 @@ const NativeRepositoryAppointmentSchema = NativeFileAppointmentSchema.omit({
   );
 const NativeAcpAppointmentSchema = NativeFileAppointmentSchema.extend({
   profileId: z.literal('google-acp-v1'),
+  maximumTaskMs: z.number().int().min(2001).max(600000),
   client: AcpClientPinSchema.extend({
     executable: z.string().max(4096).refine(isAbsolute),
     harnessSha256: HashSchema,
@@ -8037,7 +8038,7 @@ export class Controller {
 
   private prepareAcp(
     command: Extract<Command, { command: 'PrepareNativeRun' }>,
-    maximumMinutes = 5,
+    maximumMinutes?: number,
   ): CommandResult {
     let writing = false;
     if (command.payload.profileId !== 'google-acp-v1' || !('proofId' in command.payload))
@@ -8076,7 +8077,17 @@ export class Controller {
       )
         throw Error('ACP target is unavailable.');
       const policy = PolicySchema.parse(input.policy);
+      const requestedTaskMs = input.maximumTaskMs ?? 300000;
+      const maximumTaskMs =
+        maximumMinutes === undefined
+          ? requestedTaskMs
+          : Math.min(requestedTaskMs, maximumMinutes * 60000);
       if (
+        requestedTaskMs > profile.facts.maximumTaskMs ||
+        (input.maximumTaskMs !== undefined &&
+          maximumMinutes !== undefined &&
+          requestedTaskMs > maximumMinutes * 60000) ||
+        policy.limits.minutes * 60000 < maximumTaskMs ||
         policy.authority === 'autopilot' ||
         policy.limits.minutes * 60000 < 300000 ||
         !requiredReviewMethodIds(policy.quality).every((id) =>
@@ -8108,6 +8119,7 @@ export class Controller {
         target: { path: target.path, hash: target.hash, mode: target.mode },
         policy,
         billingAttestation: input.billingAttestation,
+        ...(input.maximumTaskMs === undefined ? {} : { maximumTaskMs }),
       });
       const expiresAt =
         input.consent === 'saved'
@@ -8155,7 +8167,7 @@ export class Controller {
         },
         policy,
         expiresAt,
-        maximumTaskMs: maximumMinutes * 60000,
+        maximumTaskMs,
         maximumSubmissions: 1,
       });
       const run = RunSchema.parse({
@@ -12970,6 +12982,11 @@ export class Controller {
     );
     let reason = reserveReason;
     if (needsRefresh) reason ??= 'Every applicable Google quota bucket needs fresh observations.';
+    if (
+      appointment.maximumTaskMs > 300000 &&
+      this.remaining(run).minutes * 60000 < appointment.maximumTaskMs
+    )
+      reason = 'The remaining task allowance cannot cover the saved Google deadline.';
     if (Date.parse(appointment.expiresAt) <= Date.parse(this.now()))
       reason = 'Native consent expired.';
     return {

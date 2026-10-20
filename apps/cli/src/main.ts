@@ -71,7 +71,7 @@ const help = `Usage: crewkite project add <path> [--json] [--home path]
        crewkite native setup <show|initialize|authenticate|discover|stop> --family google [--consent] [--json] [--home path]
        crewkite usage show [--json] [--home path]
        crewkite usage refresh --family google [--json] [--home path]
-       crewkite task prepare-native <task-id> <profile-id> <path> --policy file [--native-trust --source-consent] [--existing-credits] [--confirm-subscription-only] [--permission-mode mode] [--handoff-target profile[:existing-credits] ...]
+       crewkite task prepare-native <task-id> <profile-id> <path> --policy file [--native-trust --source-consent] [--existing-credits] [--confirm-subscription-only] [--maximum-task-ms 300000|600000] [--permission-mode mode] [--handoff-target profile[:existing-credits] ...]
        crewkite task prepare-handoff <task-id> <profile-id> --native-trust --source-consent [--existing-credits] [--confirm-subscription-only] [--permission-mode mode]
        crewkite task start-handoff <task-id> [--json] [--home path]
        crewkite task prepare-repository <task-id> <profile-id> --policy file [--native-trust --source-consent] [--existing-credits]
@@ -146,6 +146,7 @@ export async function runCli(
         'existing-credits': { type: 'boolean' },
         'confirm-subscription-only': { type: 'boolean' },
         'permission-mode': { type: 'string' },
+        'maximum-task-ms': { type: 'string' },
         'handoff-target': { type: 'string', multiple: true },
         output: { type: 'string' },
         endpoint: { type: 'string' },
@@ -462,6 +463,8 @@ export async function runCli(
     const evaluating = area === 'task' && action === 'prepare-evaluation';
     if (values['confirm-subscription-only'] && !preparingFile && !preparingHandoff)
       throw new Error('Subscription confirmation requires task prepare-native or prepare-handoff.');
+    if (values['maximum-task-ms'] !== undefined && !preparingFile)
+      throw new Error('The task deadline option requires task prepare-native.');
     if (values['permission-mode'] !== undefined && !preparingFile && !preparingHandoff)
       throw new Error('Permission mode requires task prepare-native or prepare-handoff.');
     if (!evaluating && (values.recipe !== undefined || values['test-file'] !== undefined))
@@ -1269,6 +1272,8 @@ export async function runCli(
     }
     if (action === 'prepare-native') {
       const profile = snapshot.nativeProfiles.find((profile) => profile.id === extra[0]);
+      if (values['maximum-task-ms'] !== undefined && profile?.id !== 'google-acp-v1')
+        throw new Error('The task deadline option requires the Google ACP profile.');
       if (profile?.family === 'local') {
         if (!profile.available) throw new Error(`Native profile unavailable: ${profile.reason}.`);
         if (
@@ -1310,6 +1315,9 @@ export async function runCli(
       )
         throw new Error('These configuration choices require the Google ACP profile.');
       if (acp) {
+        const maximumTaskMs = values['maximum-task-ms'];
+        if (maximumTaskMs !== undefined && !['300000', '600000'].includes(maximumTaskMs))
+          throw new Error('Choose a Google task deadline of 300000 or 600000 milliseconds.');
         const setup = snapshot.googleAcpSetup;
         const configuration = profile.configOptions;
         const saved = snapshot.nativeRuns.find(
@@ -1379,6 +1387,7 @@ export async function runCli(
               creditPolicy: 'ordinary',
               consent: explicit ? 'explicit' : 'saved',
               proofId: setup.proofId,
+              ...(maximumTaskMs === undefined ? {} : { maximumTaskMs: Number(maximumTaskMs) }),
               modelId,
               thoughtLevelId,
               billingAttestation: attestation,

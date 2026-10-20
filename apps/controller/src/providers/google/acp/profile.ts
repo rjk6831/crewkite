@@ -402,7 +402,7 @@ export function resolveGoogleAcpProfile(
       qualifiedAt: null,
       creditPolicies: ['ordinary'],
       permissionModes: ['request-review'],
-      maximumTaskMs: 300000,
+      maximumTaskMs: 600000,
       maximumFileBytes: 65536,
       maximumSubmissions: 1,
       available: reason === 'qualification-pending',

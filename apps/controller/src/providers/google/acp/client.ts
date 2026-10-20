@@ -458,7 +458,7 @@ export function startAcpProcess<T>(
   if (
     !Number.isSafeInteger(options.timeoutMs) ||
     options.timeoutMs <= 1000 ||
-    options.timeoutMs > 300000
+    options.timeoutMs > 600000
   )
     throw new AcpError('deadline');
   if (process.platform === 'win32' || !isAbsolute(options.directory))

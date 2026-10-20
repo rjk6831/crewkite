@@ -557,6 +557,13 @@ test('the acp writer binds an imported client and observed configuration before 
         { reviewMappings: [f.mapping] },
       ).facts.available;
     assert.equal(resolved(), true);
+    assert.equal(
+      resolveGoogleAcpProfile(
+        { home: f.home, proof: f.proof, environment },
+        { reviewMappings: [f.mapping] },
+      ).facts.maximumTaskMs,
+      600000,
+    );
     // Resolution repeats on every notification. An unchanged client is not
     // read again, and a same-size rewrite in place is still detected.
     const rewritten = readFileSync(managed.executable);
@@ -719,45 +726,74 @@ test('the acp writer binds an imported client and observed configuration before 
       onActivity: () => assert.fail('Stop before prompt sends no turn.'),
     });
     assert.equal((await stoppedAtMarker.result).metadata, null);
-    for (const expiration of ['before-marker', 'after-marker'] as const) {
-      const row = fixture('complete');
-      let clock = 0,
-        markers = 0,
-        outputs = 0;
-      try {
-        const expired = writer(row, {
-          now: () => clock,
-          schedule: () => () => {},
-          spawn: (program, args, opts) => {
-            const child = spawnCheckChild(program, args, opts);
-            const write = child.stdin.write.bind(child.stdin);
-            child.stdin.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
-              if (
-                expiration === 'before-marker' &&
-                String(chunk).includes('"configId":"mode-slot"')
-              )
-                clock = 299000;
-              return Reflect.apply(write, child.stdin, [chunk, ...rest]);
-            }) as typeof child.stdin.write;
-            return child;
-          },
-          onSubmitted: () => {
-            markers++;
-            if (expiration === 'after-marker') clock = 300000;
-          },
-          onActivity: () => {
-            outputs++;
-          },
-        });
-        const outcome = await expired.result;
-        assert.equal(outcome.reason, 'deadline');
-        assert.equal(outcome.metadata, null);
-        assert(outcome.quiescent);
-        assert.equal(markers, expiration === 'before-marker' ? 0 : 1);
-        assert.equal(outputs, 0);
-      } finally {
-        row.dispose();
+    for (const timeoutMs of [undefined, 300000, 600000]) {
+      for (const expiration of ['before-marker', 'after-marker'] as const) {
+        const row = fixture('complete');
+        const limit = timeoutMs ?? 300000;
+        const scheduled: number[] = [];
+        let clock = 0,
+          markers = 0,
+          outputs = 0;
+        try {
+          const expired = writer(row, {
+            ...(timeoutMs === undefined ? {} : { timeoutMs }),
+            now: () => clock,
+            schedule: (_work, ms) => {
+              scheduled.push(ms);
+              return () => {};
+            },
+            spawn: (program, args, opts) => {
+              const child = spawnCheckChild(program, args, opts);
+              const write = child.stdin.write.bind(child.stdin);
+              child.stdin.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
+                if (
+                  expiration === 'before-marker' &&
+                  String(chunk).includes('"configId":"mode-slot"')
+                )
+                  clock = limit - 1000;
+                return Reflect.apply(write, child.stdin, [chunk, ...rest]);
+              }) as typeof child.stdin.write;
+              return child;
+            },
+            onSubmitted: () => {
+              markers++;
+              if (expiration === 'after-marker') clock = limit;
+            },
+            onActivity: () => {
+              outputs++;
+            },
+          });
+          const outcome = await expired.result;
+          assert.equal(outcome.reason, 'deadline');
+          assert.equal(outcome.metadata, null);
+          assert(outcome.quiescent);
+          assert.equal(markers, expiration === 'before-marker' ? 0 : 1);
+          assert.equal(outputs, 0);
+          assert(scheduled.includes(limit - 1000));
+        } finally {
+          row.dispose();
+        }
       }
+    }
+    assert.throws(
+      () => writer(f, { timeoutMs: 600001 }),
+      (error) => error instanceof AcpError && error.reason === 'deadline',
+    );
+    const extended = fixture('complete');
+    let extendedClock = 0;
+    try {
+      const outcome = await writer(extended, {
+        timeoutMs: 600000,
+        now: () => extendedClock,
+        onSubmitted: () => {
+          extendedClock = 300001;
+        },
+      }).result;
+      assert.equal(outcome.reason, null);
+      assert.equal(outcome.metadata?.stopReason, 'end_turn');
+      assert(outcome.quiescent);
+    } finally {
+      extended.dispose();
     }
     let submitted = 0;
     const outcome = await writer(f, {

@@ -8305,7 +8305,7 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
               qualifiedAt: null,
               creditPolicies: ['ordinary'],
               permissionModes: ['request-review'],
-              maximumTaskMs: 300000,
+              maximumTaskMs: 600000,
               maximumFileBytes: 65536,
               maximumSubmissions: 1,
               available,
@@ -8407,12 +8407,17 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       limits: { attempts: 4, minutes: 5, concurrency: 1 },
       effects: fixtures.policy.effects.map((grant) => ({ ...grant, taskId: task.id })),
     };
-    const prepareAcpTask = (target: ReturnType<typeof TaskSchema.parse>) =>
+    const prepareAcpTask = (
+      target: ReturnType<typeof TaskSchema.parse>,
+      maximumTaskMs?: 300000 | 600000,
+      minutes = 5,
+    ) =>
       command(
         'PrepareNativeRun',
         {
           taskId: target.id,
           profileId: 'google-acp-v1',
+          ...(maximumTaskMs === undefined ? {} : { maximumTaskMs }),
           proofId: controller.store.googleAcpSetup().proofId,
           modelId: 'fixture-model',
           thoughtLevelId: 'fixture-low',
@@ -8427,12 +8432,57 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
           },
           policy: {
             ...policy,
+            limits: { ...policy.limits, minutes },
             effects: policy.effects.map((grant) => ({ ...grant, taskId: target.id })),
           },
         },
         target.revision,
       );
     if (row === 'approved') {
+      const frozen: { runId: string; maximumTaskMs: number }[] = [];
+      for (const maximumTaskMs of [undefined, 300000, 600000] as const) {
+        const deadlineTask = TaskSchema.parse(
+          (
+            await controller.execute(
+              command(
+                'CreateTask',
+                {
+                  projectId: task.projectId,
+                  title: `Saved deadline ${maximumTaskMs ?? 'default'}`,
+                  outcome: task.outcome,
+                  criteria: task.criteria,
+                },
+                0,
+              ),
+              'local-owner',
+            )
+          ).entity,
+        );
+        if (maximumTaskMs === 600000) {
+          const before = controller.snapshot();
+          assert.equal(
+            (await controller.execute(prepareAcpTask(deadlineTask, maximumTaskMs), 'local-owner'))
+              .outcome,
+            'blocked',
+          );
+          assert.deepEqual(controller.snapshot(), before);
+        }
+        const result = await controller.execute(
+          prepareAcpTask(deadlineTask, maximumTaskMs, 10),
+          'local-owner',
+        );
+        assert.equal(result.outcome, 'applied');
+        const run = RunSchema.parse(result.entity);
+        frozen.push({ runId: run.id, maximumTaskMs: maximumTaskMs ?? 300000 });
+        for (const saved of frozen)
+          assert.equal(
+            controller.snapshot().nativeRuns.find((value) => value.runId === saved.runId)
+              ?.maximumTaskMs,
+            saved.maximumTaskMs,
+          );
+      }
+      assert.equal(controller.store.intents().length, 0);
+      assert.equal(acpLaunches, setupLaunches);
       const planningTask = TaskSchema.parse(
         (
           await controller.execute(
