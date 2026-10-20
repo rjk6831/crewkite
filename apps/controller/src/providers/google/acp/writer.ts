@@ -893,6 +893,7 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
             'search_directory',
             'find_file',
             'run_command',
+            'search_web',
           ],
         },
       };

@@ -242,7 +242,14 @@ export function runAcpPeer(scenario: AcpPeerCase, fresh = false) {
                 'invoke_subagent',
                 'task_context',
                 ...(suppliedSnapshot
-                  ? ['view_file', 'list_directory', 'search_directory', 'find_file', 'run_command']
+                  ? [
+                      'view_file',
+                      'list_directory',
+                      'search_directory',
+                      'find_file',
+                      'run_command',
+                      'search_web',
+                    ]
                   : []),
               ],
             },
