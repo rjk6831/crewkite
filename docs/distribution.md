@@ -50,3 +50,47 @@ Package output, demo state and desktop profiles stay under `internal/`. Stable a
 The proof makes only its disposable build source unavailable. It preserves the primary checkout, installed dependencies and every worktree. Final test payloads start without initialized state; the exercised proof home and its ledger remain separate. Fixture observations intentionally age after five minutes. The source run instructions describe the explicit named-route option for idle demos.
 
 Each delivered payload needs its own runtime, task, restart and export receipt. The local directory proof does not qualify a branded application bundle, Developer ID signing, notarization, Gatekeeper behavior, general installation or the full promotion and rollback process in [ADR 0014](adr/0014-stable-build-controls-candidate.md).
+
+
+## Downloaded first launch
+
+Check the archive against the release's `SHA256SUMS` before extracting or trusting it. The ad-hoc resource seal checks integrity. It supplies no Developer ID identity, notarization or automatic Gatekeeper acceptance. Opening the runtime directly can show Electron's welcome screen; use `CrewKite.command` to open the workspace.
+
+For the checksum-verified `d2b-uat-01` folder in Downloads, the explicit folder trust step is:
+
+```sh
+(
+  set -e
+  set -C
+  /usr/bin/xattr -l -r -s -x "$HOME/Downloads/d2b-uat-01" > "$HOME/Downloads/d2b-uat-01.quarantine-before.txt"
+  /usr/bin/xattr -d -r -s com.apple.quarantine "$HOME/Downloads/d2b-uat-01"
+)
+```
+
+For a new workspace, open the application launcher afterward:
+
+```sh
+open "$HOME/Downloads/d2b-uat-01/CrewKite.command"
+```
+
+For an existing workspace, keep the fresh replacement unopened and follow the upgrade procedure below.
+
+Use that exact folder only. If the extracted folder has another name or location, stop and use the matching release instructions. Keep the quarantine record alongside the archive. This step removes only download quarantine on that candidate and its contained entries. It changes no global security setting. A checksum mismatch or failed strict signature check needs a corrected package; removing quarantine cannot repair changed bytes. Browser-download cold launch and same-home reopen still need evidence for the exact release.
+
+## Upgrade an existing directory package
+
+Keep the existing app and controller closed until the upgrade finishes. Trust the verified fresh replacement folder before running its upgrade launcher:
+
+```sh
+open "$HOME/Downloads/d2b-uat-01/Upgrade Existing.command"
+```
+
+Do not open the fresh replacement's `CrewKite.command` first. Choose the existing package folder in the picker. The confirmation shows the exact installed path and unique backup path before any copy or rename. Cancel leaves both packages unchanged.
+
+The helper checks the replacement's complete payload inventory and runtime seal, file ownership and contained links. The existing package's non-runtime files must still match its manifest. Existing changes inside `Electron.app` are allowed because the earlier preview may have been re-signed locally. Its actual runtime bytes are inventoried and retained in the backup, and the confirmation and result explicitly report that difference. The helper never executes the old runtime. Its actual complete payload must remain unchanged through preparation. This exception supplies no publisher identity and does not apply to the replacement package. It refuses active files, a remaining desktop profile lock, an unavailable controller ownership lease, non-private state directories, changed state and an occupied destination. It copies into a new sibling folder and verifies the closed state before moving anything. It records only identity, counts and a state digest; it prints no configuration or credential contents. The copy is limited to 100,000 entries, eight GiB and two minutes per inventory pass. A limit refusal leaves the existing package in place.
+
+The old folder moves to the displayed backup, then the prepared replacement takes its exact original path. `state/home` and `state/profile` keep their original absolute paths. Pending desktop receipt names, Local configuration and retained source paths are preserved. Local tokens held only in controller memory must be entered again after restart. The fresh replacement download remains available. Nothing launches automatically.
+
+If the second rename fails, the helper restores the old folder when the original path is still vacant. It never overwrites a folder that appeared during the swap. Keep every named staging and backup folder after a failure. A crash between renames can require manual restoration. The activity checks do not contain a concurrent launch; keep the old app closed throughout.
+
+The backup preserves the old installation's bytes at a different path. Do not launch it there. To roll back, close the upgraded app, preserve its whole folder at another unused path, and restore the whole original backup to the original installed path. Runtime migrations after upgrade and rollback across changed schemas need separate qualification. Copying an initialized `state` folder into another candidate path remains unsupported.

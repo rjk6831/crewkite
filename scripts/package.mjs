@@ -448,6 +448,12 @@ export async function packageDesktop() {
     '#!/bin/sh\nset -eu\nroot=$(CDPATH= cd "$(dirname "$0")" && pwd -P)\nexec "$root/bin/desktop"\n',
     { mode: 0o755 },
   );
+  copy(join(checkout, 'scripts/package-upgrade.mjs'), join(stage, 'scripts/package-upgrade.mjs'));
+  writeFileSync(
+    join(stage, 'Upgrade Existing.command'),
+    '#!/bin/sh\nset -eu\nroot=$(CDPATH= cd "$(dirname "$0")" && pwd -P)\nexec "$root/app/runtime/bin/node" "$root/scripts/package-upgrade.mjs" --source "$root"\n',
+    { mode: 0o755 },
+  );
   const workspace = [
     'apps/controller',
     'apps/cli',
@@ -640,6 +646,8 @@ export async function packageDesktop() {
   }
   for (const entry of [
     'CrewKite.command',
+    'Upgrade Existing.command',
+    'scripts/package-upgrade.mjs',
     'Electron.app/Contents/MacOS/Electron',
     `app/${desktop.main}`,
     'app/out/preload/index.cjs',
