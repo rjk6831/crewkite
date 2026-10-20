@@ -41,6 +41,22 @@ test('authentication metadata waits for bounded owned child and descendant clean
   const root = mkdtempSync(resolve('internal/auth-process-'));
   const sha256 = createHash('sha256').update(readFileSync(process.execPath)).digest('hex');
   const owned: Array<{ child: ChildProcessWithoutNullStreams; closed: Promise<void> }> = [];
+  const waitFor = async <T>(mode: string, phase: string, pending: Promise<T>): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        pending,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(Error(`${mode}: ${phase} did not finish within the metadata deadline`)),
+            30_000,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
   const environment = {
     HOME: root,
     USER: secret,
@@ -167,17 +183,21 @@ test('authentication metadata waits for bounded owned child and descendant clean
       if (mode === 'descendant-deadline') {
         const child = owned.at(-1)?.child;
         assert(child);
-        await new Promise<void>((resolve) => child.once('exit', () => resolve()));
+        await waitFor(
+          mode,
+          'leader exit',
+          new Promise<void>((resolve) => child.once('exit', () => resolve())),
+        );
         assert(deadline, 'leader exit cannot cancel the metadata deadline before EOF');
         deadline();
       } else if (['stopped', 'stubborn', 'deadline'].includes(mode)) {
-        await output;
+        await waitFor(mode, 'first output', output);
         if (mode === 'deadline') {
           assert(deadline);
           deadline();
         } else handle.stop();
       }
-      const result = await handle.result;
+      const result = await waitFor(mode, 'result', handle.result);
       assert.equal(launches, 1, mode);
       assert.equal(result.quiescent, true, mode);
       if (handle.group > 0) assert(groupAbsent(handle.group), mode);
@@ -239,6 +259,7 @@ test('authentication metadata waits for bounded owned child and descendant clean
       });
       let callbackError: unknown;
       const timers: Array<{ milliseconds: number; work: () => void; live: boolean }> = [];
+      let capture = true;
       // Every due callback is found before the first one runs, so the order stays the test's.
       const fire = (order: number[]) => {
         const due = order.map((milliseconds) => {
@@ -246,7 +267,11 @@ test('authentication metadata waits for bounded owned child and descendant clean
           assert(row, `${mode}: pending ${milliseconds}ms callback`);
           return row;
         });
-        for (const row of due) row.work();
+        capture = false;
+        for (const row of due) {
+          row.live = false;
+          row.work();
+        }
       };
       const handle = startNativeAuthStatus(
         { executable: process.execPath, sha256, directory, repositoryRoot: root, environment },
@@ -255,8 +280,18 @@ test('authentication metadata waits for bounded owned child and descendant clean
           schedule: (work, milliseconds) => {
             const row = { milliseconds, work, live: true };
             timers.push(row);
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            if (!capture) {
+              const at = time + milliseconds;
+              timer = setTimeout(() => {
+                row.live = false;
+                time = Math.max(time, at);
+                work();
+              }, milliseconds);
+            }
             return () => {
               row.live = false;
+              clearTimeout(timer);
             };
           },
           spawn: (_executable, _argv, options) => {
@@ -285,7 +320,7 @@ test('authentication metadata waits for bounded owned child and descendant clean
           },
         },
       );
-      await output;
+      await waitFor(mode, 'first output', output);
       handle.stop();
       if (mode !== 'queued-close') {
         // A blocked loop runs the stop timers in one pass. Node runs one duration list at a
@@ -293,7 +328,7 @@ test('authentication metadata waits for bounded owned child and descendant clean
         time = mode === 'late-kill-near-deadline' ? 29_500 : 2000;
         fire(mode === 'late-kill-reversed' ? [2000, 1000] : [1000, 2000]);
       }
-      const result = await handle.result;
+      const result = await waitFor(mode, 'result', handle.result);
       assert.ifError(callbackError);
       assert.equal(result.quiescent, true, mode);
       assert.equal(result.reason, 'stopped', mode);

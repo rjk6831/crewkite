@@ -343,6 +343,7 @@ test('native discovery returns metadata only after its owned process and descend
       const directory = resolve(root, mode);
       mkdirSync(directory, { mode: 0o700 });
       const schedules: Array<{ milliseconds: number; work: () => void; live: boolean }> = [];
+      let capture = true;
       const ready = Promise.withResolvers<void>();
       let clock = 0;
       let phase = 0;
@@ -372,8 +373,18 @@ test('native discovery returns metadata only after its owned process and descend
           schedule: (work, milliseconds) => {
             const row = { work, milliseconds, live: true };
             schedules.push(row);
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            if (!capture) {
+              const at = clock + milliseconds;
+              timer = setTimeout(() => {
+                row.live = false;
+                clock = Math.max(clock, at);
+                work();
+              }, milliseconds);
+            }
             return () => {
               row.live = false;
+              clearTimeout(timer);
             };
           },
           onSubmitted: () => ready.resolve(),
@@ -449,6 +460,7 @@ test('native discovery returns metadata only after its owned process and descend
         // A blocked loop runs an owned task's stop timers in one pass. Node runs one duration
         // list at a time, so an older 2000 ms list can reach the cutoff before the kill.
         clock = mode === 'late-kill-near-deadline' ? 299_500 : 2000;
+        capture = false;
         for (const milliseconds of mode === 'late-kill-reversed'
           ? [250, 2000, 1000]
           : [250, 1000, 2000])
@@ -459,6 +471,7 @@ test('native discovery returns metadata only after its owned process and descend
             clock = 2000;
             assert.equal(closeSeen, false);
             assert(groupAbsent(child.pid as number));
+            if (mode === 'queued-close') capture = false;
             fire(1000);
             fire(2000);
             if (mode === 'unobserved-close') {

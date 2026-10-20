@@ -1183,6 +1183,7 @@ process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(
       const trace: string[] = [];
       // These rows drive the stop timers by hand, so no real timer can run ahead of them.
       const manual = mode === 'queued-close' || mode.startsWith('late-kill');
+      let capture = true;
       const shortened =
         mode.includes('deadline') && mode !== 'deadline' && !mode.startsWith('late');
       const timers: Array<{ delay: number; work: () => void; live: boolean }> = [];
@@ -1194,7 +1195,11 @@ process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(
           assert(row, `${mode}: pending ${delay}ms callback`);
           return row;
         });
-        for (const row of due) row.work();
+        capture = false;
+        for (const row of due) {
+          row.live = false;
+          row.work();
+        }
       };
       let received!: () => void;
       const output = new Promise<void>((resolve) => {
@@ -1259,8 +1264,18 @@ process.stdout.write(frames.map(x=>JSON.stringify(x)).join('\\n')+'\\n',()=>{if(
             if (manual) {
               const row = { delay, work, live: true };
               timers.push(row);
+              let timer: ReturnType<typeof setTimeout> | undefined;
+              if (!capture) {
+                const at = time + delay;
+                timer = setTimeout(() => {
+                  row.live = false;
+                  time = Math.max(time, at);
+                  work();
+                }, delay);
+              }
               return () => {
                 row.live = false;
+                clearTimeout(timer);
               };
             }
             const timer = setTimeout(work, delay);

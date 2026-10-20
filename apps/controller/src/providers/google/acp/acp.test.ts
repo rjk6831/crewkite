@@ -482,6 +482,7 @@ test('the acp writer binds an imported client and observed configuration before 
         );
         let clock = 0;
         const timers: Array<{ delay: number; work: () => void; live: boolean }> = [];
+        let capture = true;
         const ready = Promise.withResolvers<void>();
         const closed = Promise.withResolvers<void>();
         let onExit: (() => void) | undefined;
@@ -500,8 +501,18 @@ test('the acp writer binds an imported client and observed configuration before 
                   ? (work, delay) => {
                       const timer = { delay, work, live: true };
                       timers.push(timer);
+                      let scheduled: ReturnType<typeof setTimeout> | undefined;
+                      if (!capture) {
+                        const at = clock + delay;
+                        scheduled = setTimeout(() => {
+                          timer.live = false;
+                          clock = Math.max(clock, at);
+                          work();
+                        }, delay);
+                      }
                       return () => {
                         timer.live = false;
+                        clearTimeout(scheduled);
                       };
                     }
                   : () => () => {},
@@ -587,6 +598,7 @@ test('the acp writer binds an imported client and observed configuration before 
             clock = 2000;
             onExit = () => {
               try {
+                capture = false;
                 fire(1000);
               } catch (error) {
                 callbackError = error;
@@ -601,6 +613,7 @@ test('the acp writer binds an imported client and observed configuration before 
             // A blocked loop runs the stop timers in one pass. Node runs one duration list at a
             // time, so the 1000 ms cutoff list can reach the cutoff before the 250 ms kill.
             clock = failure === 'late-kill-near-deadline' ? 4500 : 2000;
+            capture = false;
             for (const delay of failure === 'late-kill-reversed' ? [1000, 250] : [250, 1000])
               fire(delay);
           }
