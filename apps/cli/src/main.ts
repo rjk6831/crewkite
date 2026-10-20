@@ -1,15 +1,18 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { once } from 'node:events';
 import {
   closeSync,
   constants,
   fstatSync,
   fsyncSync,
+  linkSync,
   openSync,
   readFileSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { setImmediate } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -18,6 +21,7 @@ import {
   connectController,
   createCommandKey,
   readControllerEndpoint,
+  transferArtifact,
 } from '@crewkite/client/node';
 import {
   ArtifactSchema,
@@ -52,6 +56,8 @@ const googleAcpLabel =
 const help = `Usage: crewkite project add <path> [--json] [--home path]
        crewkite task create <project-id> --title text --outcome text --criterion text [--criterion text ...] [--json] [--home path]
        crewkite task <list|show|watch|start|pause|stop|resume|switch|approve|deny> [id] [--json] [--home path]
+       crewkite artifact <read|verify|save> <artifact-id> [--output new-file] [--json] [--home path]
+       crewkite task activity <task-id> [--before-cursor cursor] [--json] [--home path]
        crewkite task list [--pages --json] [--home path]
        crewkite task amend <task-id> --title text --outcome text --criterion text [--criterion text ...] [--json] [--home path]
        crewkite task switch <task-id> <route-id> [--json] [--home path]
@@ -108,14 +114,21 @@ const terminalText = (value: string) =>
       : `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`,
   );
 
-export async function runCli(
-  args: string[],
-  output: Output = {
-    out: (text) => process.stdout.write(text),
-    err: (text) => process.stderr.write(text),
+const terminalOutput: Output = {
+  out: (text) => {
+    process.stdout.write(text);
   },
-): Promise<number> {
+  err: (text) => {
+    process.stderr.write(text);
+  },
+};
+export async function runCli(args: string[], output: Output = terminalOutput): Promise<number> {
   let client: ControllerClient | undefined;
+  const streamWrite = async (text: string) => {
+    if (output === terminalOutput) {
+      if (!process.stdout.write(text)) await once(process.stdout, 'drain');
+    } else await output.out(text);
+  };
   try {
     const { values, positionals } = parseArgs({
       args,
@@ -180,6 +193,7 @@ export async function runCli(
               extra.length === 1))
         )) ||
       ![
+        'artifact',
         'project',
         'task',
         'conversation',
@@ -300,7 +314,13 @@ export async function runCli(
       if (action === 'adopt' && (!values['proposal-id'] || !values['proposal-hash']))
         throw new Error('Adopt requires the exact --proposal-id and --proposal-hash.');
       if (planning && !values.consent) throw new Error('Planning requires explicit --consent.');
-    } else if (conversationOptions.some((key) => values[key as keyof typeof values] !== undefined))
+    } else if (
+      conversationOptions.some(
+        (key) =>
+          values[key as keyof typeof values] !== undefined &&
+          !(key === 'before-cursor' && area === 'task' && action === 'activity'),
+      )
+    )
       throw new Error('Conversation options require a conversation action.');
     const contextRefs =
       values['context-refs'] !== undefined
@@ -332,6 +352,7 @@ export async function runCli(
         })
       : undefined;
     const supported = [
+      'activity',
       'create',
       'amend',
       'pause',
@@ -524,6 +545,7 @@ export async function runCli(
       );
     if (
       values.output &&
+      !(area === 'artifact' && action === 'save') &&
       !(area === 'retry' || (area === 'task' && ['export', 'approve'].includes(action ?? '')))
     )
       throw new Error('Output requires an export action or its saved receipt.');
@@ -605,6 +627,89 @@ export async function runCli(
       });
       return connected.command(sent);
     };
+    if (area === 'artifact') {
+      if (
+        !id ||
+        !['read', 'verify', 'save'].includes(action) ||
+        Object.keys(values).some(
+          (key) => !['home', 'json', ...(action === 'save' ? ['output'] : [])].includes(key),
+        ) ||
+        (action === 'save' && !values.output)
+      )
+        throw Error(
+          'Use artifact read, verify or save with an artifact ID; save requires --output.',
+        );
+      const first = await connected.artifactRange({ artifactId: id, offset: 0, limit: 65536 });
+      let temporary: string | undefined;
+      let file: number | undefined;
+      const decoder = new TextDecoder();
+      let readOffset = 0;
+      try {
+        if (action === 'save') {
+          temporary = join(
+            dirname(resolve(values.output ?? '')),
+            `.crewkite-output-${randomUUID()}`,
+          );
+          file = openSync(
+            temporary,
+            constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
+            0o600,
+          );
+        }
+        const proof = await transferArtifact(
+          first.artifact,
+          (input) => connected.artifactRange(input),
+          async (bytes) => {
+            if (file !== undefined) writeFileSync(file, bytes);
+            if (action === 'read') {
+              if (values.json)
+                await streamWrite(
+                  `${JSON.stringify({ kind: 'artifact-range', artifact: first.artifact, offset: readOffset, content: Buffer.from(bytes).toString('base64'), encoding: 'base64', eof: readOffset + bytes.length === first.artifact.bytes, integrity: 'unverified-range' })}\n`,
+                );
+              else await streamWrite(terminalText(decoder.decode(bytes, { stream: true })));
+            }
+            readOffset += bytes.length;
+          },
+        );
+        if (action === 'read' && !values.json) await streamWrite(terminalText(decoder.decode()));
+        if (file !== undefined) {
+          fsyncSync(file);
+          closeSync(file);
+          file = undefined;
+        }
+        if (temporary) {
+          const destination = resolve(values.output ?? '');
+          linkSync(temporary, destination);
+          unlinkSync(temporary);
+          temporary = undefined;
+          const directory = openSync(dirname(destination), constants.O_RDONLY);
+          try {
+            fsyncSync(directory);
+          } finally {
+            closeSync(directory);
+          }
+        }
+        if (values.json) await streamWrite(`${JSON.stringify(proof)}\n`);
+        else output.err(`Verified ${proof.bytes} bytes, SHA256 ${proof.hash}.\n`);
+        return 0;
+      } finally {
+        if (file !== undefined) closeSync(file);
+        if (temporary) unlinkSync(temporary);
+      }
+    }
+    if (area === 'task' && action === 'activity') {
+      let beforeCursor = values['before-cursor'];
+      do {
+        const page = await connected.taskActivityPage({
+          taskId: id ?? '',
+          beforeCursor,
+          limit: 100,
+        });
+        await streamWrite(`${JSON.stringify(page)}\n`);
+        beforeCursor = page.nextBeforeCursor ?? undefined;
+      } while (beforeCursor !== undefined);
+      return 0;
+    }
     const print = (data: unknown, text: string) =>
       output.out(values.json ? `${JSON.stringify(data)}\n` : `${terminalText(text)}\n`);
     const receipt = (

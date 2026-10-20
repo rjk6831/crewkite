@@ -59,7 +59,7 @@ A day is a target for the next usable increment. It includes review and release 
 | Slice | Usable result | Depends on | State | Source, CI and UAT evidence |
 |-------|---------------|------------|-------|-----------------------------|
 | D2b.1 | Recover project selection and read large workspace status through complete pages | Retained D2 workflow and current main | Qualification pending | Real desktop and CLI proof: 304 tasks, legacy snapshot 1,365,503 bytes; pending-command restart recovery and required CI passed in PR #56. Replacement package pending |
-| D2b.2 | Read large artifacts and activity output with bounded memory | D2b.1 | Planned | None |
+| D2b.2 | Read large artifacts and activity output with bounded memory | D2b.1 | Qualification pending | Focused real-socket 65 MiB artifact verification, exact 1,229,521-byte retained event, cancellation/reopen and bounded desktop navigation passed. Full CI and replacement qualification pending |
 | D2b.3 | Prepare and retain a project beyond the old source-size limits | D2b.2 | Planned | None |
 | D2b.4 | See GitHub PR, Actions status and full CI logs inside a task | D2b.2 | Planned | None |
 | D2b.5 | Navigate large diffs and select useful context by range | D2b.3 | Planned | None |
@@ -148,6 +148,10 @@ I need to read the complete retained output without allocating it all on each re
 - Stream publication of large content into durable immutable files. Keep the last valid artifact on cancellation or disk failure. Remove the artifact's aggregate 64 MiB read ceiling after its publication and verification path supports the larger bytes.
 - Move large activity bodies behind artifact references while keeping their event identity and order. Define compatibility for already retained oversized events. Page output in the desktop and CLI, with explicit completeness and retrieval failures.
 - Apply backpressure and cancellation. A large read cannot block Stop or unrelated status. Preserve a failed operation and its durable reason without presenting partial output as complete.
+
+The implementation reads at most 64 KiB per artifact request and verifies complete content incrementally in the native client. Legacy buffer APIs keep their 64 MiB cap. A partial text display is explicitly unverified. Activity pages retain the original event identity and exclusive cursor; large bodies use immutable references. The desktop keeps one activity page and cursor-only return navigation. CLI reads honor destination backpressure.
+
+Offline local measurements transferred and checked 129, 257 and 513 MiB fixtures over the authenticated socket in 2.51, 4.41 and 9.22 seconds. Fresh-process peak RSS, including publication and the controller, stayed between 219.6 and 226.3 MiB across those sizes. The 65 MiB fixture took 1.17 seconds with a lower 193.0 MiB peak. These used warm filesystem cache and one collection before the transfer, with no forced collection during it. A 1,229,521-byte SQLite activity body converted in 18-25 ms; a concurrent workspace status read completed in 5-7 ms before conversion finished. SQLite still visits the original body internally. These are local read measurements, with no installed-package performance or real disk-full qualification.
 
 Primary boundaries: `apps/controller/src/artifacts/index.ts`, `apps/controller/src/store/activity.ts`, controller, contracts, client and task output views. This slice leaves repository source capture and provider-context selection unchanged.
 

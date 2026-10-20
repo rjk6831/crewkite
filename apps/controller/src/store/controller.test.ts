@@ -508,6 +508,8 @@ test('held metadata leaves stop replies reachable on the same authenticated sock
   });
   t.after(() => rmSync(socketRoot, { recursive: true, force: true }));
   for (const [kind, payload] of [
+    ['GetArtifactRange', { artifactId: 'art_01ARZ3NDEKTSV4RRFFQ69G5FAV', offset: 0, limit: 65536 }],
+    ['GetTaskActivityPage', { taskId: 'tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV', limit: 100 }],
     ['ObserveUsage', { family: 'google' }],
     ['CheckNativeConnection', { family: 'anthropic', consent: 'explicit' }],
     ['InstallGoogleAcp', { profileId: 'google-acp-v1', consent: 'explicit' }],
@@ -569,7 +571,15 @@ test('held metadata leaves stop replies reachable on the same authenticated sock
       actor: { id: 'terminal', kind: 'cli' },
     });
     try {
-      const metadata = client.command(CommandSchema.parse(command(kind, payload, 0)));
+      const metadata = client.command(
+        CommandSchema.parse(
+          command(
+            kind,
+            payload,
+            kind === 'GetArtifactRange' || kind === 'GetTaskActivityPage' ? undefined : 0,
+          ),
+        ),
+      );
       await entered.promise;
       const current = controller.store.get<Task>('task', task.id);
       assert(current);
