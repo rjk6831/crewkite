@@ -6,6 +6,9 @@ import type {
   Snapshot,
   Task,
   TaskConversationState,
+  TaskPage,
+  TaskSummary,
+  WorkspaceState,
 } from '@crewkite/contracts';
 import {
   CommandSchema,
@@ -310,18 +313,82 @@ function excerpt(text: string, match: TextMatch, radius = 48) {
 
 function CommandPalette({
   commands,
-  tasks,
+  workspace,
   projects,
   onOpenTask,
   onClose,
 }: {
   commands: PaletteCommand[];
-  tasks: Task[];
+  workspace: Workspace;
   projects: { id: string; name: string }[];
   onOpenTask: (id: string) => void;
   onClose: () => void;
 }) {
   const [query, setQuery] = useState('');
+  const [search, setSearch] = useState<{
+    query: string;
+    rows: TaskSummary[];
+    page: TaskPage | null;
+  }>({ query: '', rows: [], page: null });
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const searchGeneration = useRef(0);
+  const searchRead = useRef(false);
+  const trimmedQuery = query.trim();
+  const epoch = workspace.header?.stamp.epoch;
+  const revision = workspace.header?.stamp.revision;
+  const searchRef = useRef(search);
+  searchRef.current = search;
+  const readTaskPage = workspace.readTaskPage;
+  const readSearch = useCallback(
+    async (more = false, generation = searchGeneration.current) => {
+      if (!epoch || revision === undefined || searchRead.current) return;
+      const stamp = { epoch, revision };
+      searchRead.current = true;
+      setSearching(true);
+      setSearchError(null);
+      try {
+        const next = await readTaskPage({
+          stamp,
+          ...(trimmedQuery ? { query: trimmedQuery } : {}),
+          ...(more && searchRef.current.page?.next ? { after: searchRef.current.page.next } : {}),
+        });
+        if (searchGeneration.current !== generation) return;
+        setSearch((current) => ({
+          query: trimmedQuery,
+          rows: more ? [...current.rows, ...next.tasks] : next.tasks,
+          page: next,
+        }));
+      } catch (failure) {
+        if (searchGeneration.current === generation)
+          setSearchError(failure instanceof Error ? failure.message : 'Search is unavailable.');
+      } finally {
+        searchRead.current = false;
+        if (searchGeneration.current === generation) setSearching(false);
+      }
+    },
+    [epoch, revision, trimmedQuery, readTaskPage],
+  );
+  useEffect(() => {
+    const generation = ++searchGeneration.current;
+    setSearch({ query: trimmedQuery, rows: [], page: null });
+    setSearching(true);
+    // Coalesce typing. A previous bounded request may finish before the next one starts.
+    let timer: ReturnType<typeof setTimeout>;
+    const start = () => {
+      if (generation !== searchGeneration.current) return;
+      if (searchRead.current) {
+        timer = setTimeout(start, 50);
+        return;
+      }
+      void readSearch(false, generation);
+    };
+    timer = setTimeout(start, 150);
+    return () => {
+      clearTimeout(timer);
+      searchGeneration.current += 1;
+    };
+  }, [trimmedQuery, readSearch]);
   const [page, setPage] = useState(0);
   const [active, setActive] = useState<string | null>(null);
   const id = useId();
@@ -334,27 +401,26 @@ function CommandPalette({
     const match = findMatch(pattern, command.label);
     return !pattern || match ? [{ command, match }] : [];
   });
-  // Search the whole snapshot first, then page. Title and project matches lead.
-  const taskResults = tasks
-    .flatMap((task) => {
-      if (!pattern) return [{ task, rank: 0, field: null }];
-      const project = projectNames.get(task.projectId) ?? '';
-      const fields: [number, string | null, string][] = [
-        [0, null, task.title],
-        [1, null, project],
-        [2, 'Outcome', task.outcome],
-        ...task.criteria.map((criterion): [number, string, string] => [2, 'Criterion', criterion]),
-        [3, 'Task ID', task.id],
-        [3, 'Project ID', task.projectId],
-      ];
-      for (const [rank, label, text] of fields) {
-        const match = findMatch(pattern, text);
-        if (match)
-          return [{ task, rank, field: label ? { label, ...excerpt(text, match) } : null }];
-      }
-      return [];
-    })
-    .sort((left, right) => left.rank - right.rank);
+  const taskResults = (search.query === trimmed ? search.rows : []).map((task) => {
+    const field = task.match;
+    const label =
+      field &&
+      (
+        {
+          outcome: 'Outcome',
+          criterion: 'Criterion',
+          'task-id': 'Task ID',
+          'project-id': 'Project ID',
+        } as Record<string, string>
+      )[field.field];
+    const match = field ? findMatch(pattern, field.text) : null;
+    return {
+      task,
+      rank: field?.field === 'project' ? 1 : 0,
+      field: field && label && match ? { label, ...excerpt(field.text, match) } : null,
+    };
+  });
+  const complete = search.query === trimmed && search.page?.complete === true;
   const pages = Math.max(1, Math.ceil(taskResults.length / paletteTaskPageSize));
   const currentPage = Math.min(page, pages - 1);
   const offset = currentPage * paletteTaskPageSize;
@@ -396,11 +462,15 @@ function CommandPalette({
   }
   const summary = !pattern
     ? taskResults.length
-      ? `Tasks ${offset + 1}-${offset + shownTasks.length} of ${taskResults.length}`
-      : 'No tasks yet'
+      ? `Tasks ${offset + 1}-${offset + shownTasks.length} of ${taskResults.length}${complete ? '' : ' loaded'}`
+      : complete
+        ? 'No tasks yet'
+        : 'Searching tasks'
     : options.length
       ? `${taskResults.length} ${taskResults.length === 1 ? 'task' : 'tasks'} and ${commandResults.length} ${commandResults.length === 1 ? 'command' : 'commands'} match${taskResults.length > paletteTaskPageSize ? `. Showing ${offset + 1}-${offset + shownTasks.length}` : ''}`
-      : 'No matches';
+      : complete
+        ? 'No matches'
+        : 'Searching tasks';
   function activate(key: string) {
     const option = options.find((value) => value.key === key);
     if (option && !option.disabled) option.run();
@@ -520,7 +590,9 @@ function CommandPalette({
             <legend className="palette-group-label">Tasks</legend>
             {shownTasks.map(({ task, rank, field }) => {
               const key = `task-${task.id}`;
-              const project = projectNames.get(task.projectId) ?? task.projectId;
+              const project =
+                projectNames.get(task.projectId) ??
+                (task.match?.field === 'project' ? task.match.text : task.projectId);
               return (
                 <button key={key} {...optionProps(key, false)}>
                   <span className={`status-dot state-${task.state}`} aria-hidden="true" />
@@ -551,14 +623,44 @@ function CommandPalette({
           </fieldset>
         )}
       </div>
-      {!options.length && (
+      {!options.length && complete && (
         <div className="palette-empty">
           <strong>No tasks or commands match “{trimmed}”.</strong>
           <span>Check the spelling, or search by task ID or project name.</span>
         </div>
       )}
       <div className="palette-footer">
-        <p role="status">{summary}</p>
+        <p role="status">
+          {summary}
+          {!complete ? ' · Search incomplete' : ''}
+        </p>
+        {searchError && (
+          <p role="alert">
+            {searchError}{' '}
+            <button
+              type="button"
+              className="button secondary"
+              onClick={() =>
+                void workspace
+                  .refresh()
+                  .then(() => readSearch())
+                  .catch(() => {})
+              }
+            >
+              Refresh search
+            </button>
+          </p>
+        )}
+        {!complete && (
+          <button
+            type="button"
+            className="button secondary"
+            disabled={searching}
+            onClick={() => void readSearch(Boolean(search.page?.next))}
+          >
+            {searching ? 'Searching' : 'Continue search'}
+          </button>
+        )}
         {taskResults.length > paletteTaskPageSize && (
           <div className="palette-pages">
             <button
@@ -591,7 +693,16 @@ function CommandPalette({
 
 export function App() {
   const workspace = useWorkspace();
-  const { snapshot, connection, preview, error: workspaceError } = workspace;
+  const {
+    snapshot,
+    header,
+    projects,
+    taskPages,
+    connection,
+    preview,
+    error: workspaceError,
+  } = workspace;
+  const metadata = header ? { ...header, projects } : null;
   const connectionLabel = preview
     ? 'Preview data'
     : connection === 'connected'
@@ -601,6 +712,18 @@ export function App() {
         : titleCase(connection);
   const [page, setPage] = useState<'tasks' | 'usage'>('tasks');
   const [selected, setSelected] = useState<string | null>(null);
+  useEffect(() => {
+    void workspace.selectTask(selected);
+  }, [selected, workspace.selectTask]);
+  useEffect(() => {
+    const first = projects[0];
+    if (first && !taskPages[first.id]) void workspace.loadTasks(first.id);
+  }, [projects, taskPages, workspace.loadTasks]);
+  useEffect(() => {
+    if (selected) return;
+    const first = Object.values(taskPages).flatMap((page) => page.tasks)[0];
+    if (first) setSelected(first.id);
+  }, [selected, taskPages]);
   const [tab, setTab] = useState<Tab>('Conversation');
   const [roster, setRoster] = useState(true);
   const [theme, setTheme] = useState(() => readPreference('crewkite-theme') ?? 'dark');
@@ -643,9 +766,7 @@ export function App() {
   const [approvalToReview, setApprovalToReview] = useState<string | null>(null);
   const approvalCard = useRef<HTMLElement>(null);
   const [about, setAbout] = useState(false);
-  const task = newGoal
-    ? undefined
-    : (snapshot?.tasks.find(({ id }) => id === selected) ?? snapshot?.tasks[0]);
+  const task = newGoal ? undefined : snapshot?.tasks.find(({ id }) => id === selected);
   const currentConversation =
     task && conversationState?.taskId === task.id && conversationState.revision === task.revision
       ? conversationState
@@ -883,7 +1004,7 @@ export function App() {
               setNewGoal(true);
               setPage('tasks');
             }}
-            disabled={!snapshot}
+            disabled={!header}
             data-tooltip="New task"
           >
             <Plus size={16} aria-hidden="true" />
@@ -906,41 +1027,73 @@ export function App() {
               <Plus size={15} />
             </button>
           </div>
-          {snapshot?.projects.map((project) => (
+          {projects.map((project) => (
             <div key={project.id} className="project-group">
               <div className="project-name">
                 <ChevronRight size={12} className="expanded" />
                 <Folder size={15} />
                 <span>{project.name}</span>
-                <span className="count">
-                  {snapshot.tasks.filter((value) => value.projectId === project.id).length}
-                </span>
+                <span className="count">{project.taskCount}</span>
               </div>
-              {snapshot.tasks
-                .filter((value) => value.projectId === project.id)
-                .map((value) => (
-                  <button
-                    type="button"
-                    key={value.id}
-                    className={`task-link ${page === 'tasks' && task?.id === value.id ? 'active' : ''}`}
-                    aria-current={page === 'tasks' && task?.id === value.id ? 'page' : undefined}
-                    onClick={() => {
-                      setNewGoal(false);
-                      setSelected(value.id);
-                      setTab('Conversation');
-                      setPage('tasks');
-                    }}
-                  >
-                    <span className={`status-dot state-${value.state}`} />
-                    <span>{value.title}</span>
-                    {value.state === 'waiting' && <span className="notification-dot" />}
-                  </button>
-                ))}
-              {!snapshot.tasks.some((value) => value.projectId === project.id) && (
-                <p className="nav-empty">No tasks yet</p>
+              {(taskPages[project.id]?.tasks ?? []).map((value) => (
+                <button
+                  type="button"
+                  key={value.id}
+                  className={`task-link ${page === 'tasks' && task?.id === value.id ? 'active' : ''}`}
+                  aria-current={page === 'tasks' && task?.id === value.id ? 'page' : undefined}
+                  onClick={() => {
+                    setNewGoal(false);
+                    setSelected(value.id);
+                    setTab('Conversation');
+                    setPage('tasks');
+                  }}
+                >
+                  <span className={`status-dot state-${value.state}`} />
+                  <span>{value.title}</span>
+                  {value.state === 'waiting' && <span className="notification-dot" />}
+                </button>
+              ))}
+              {project.taskCount === 0 && <p className="nav-empty">No tasks yet</p>}
+              {project.taskCount > 0 && !taskPages[project.id] && (
+                <button
+                  type="button"
+                  className="task-link"
+                  disabled={workspace.navigationBusy}
+                  onClick={() => void workspace.loadTasks(project.id)}
+                >
+                  Show tasks
+                </button>
+              )}
+              {taskPages[project.id] && !taskPages[project.id].complete && (
+                <button
+                  type="button"
+                  className="task-link"
+                  disabled={workspace.navigationBusy}
+                  onClick={() => void workspace.loadTasks(project.id, true)}
+                >
+                  Load more tasks
+                </button>
               )}
             </div>
           ))}
+          {workspace.navigationStale && (
+            <p className="nav-empty" role="status">
+              Navigation changed. Refresh to continue.{' '}
+              <button type="button" onClick={() => void workspace.refresh().catch(() => {})}>
+                Refresh navigation
+              </button>
+            </p>
+          )}
+          {workspace.projectPage && !workspace.projectPage.complete && (
+            <button
+              type="button"
+              className="task-link"
+              disabled={workspace.navigationBusy}
+              onClick={() => void workspace.loadProjects()}
+            >
+              Load more projects
+            </button>
+          )}
           {workspace.canPickProject && (
             <button
               type="button"
@@ -959,7 +1112,7 @@ export function App() {
               setNewGoal(true);
               setPage('tasks');
             }}
-            disabled={!snapshot}
+            disabled={!header}
           >
             <Plus size={14} />
             New task
@@ -1016,9 +1169,7 @@ export function App() {
         <header className="topbar">
           <div className="breadcrumbs">
             <Folder size={14} />
-            <span>
-              {snapshot?.projects.find(({ id }) => id === task?.projectId)?.name ?? 'Workspace'}
-            </span>
+            <span>{projects.find(({ id }) => id === task?.projectId)?.name ?? 'Workspace'}</span>
             <ChevronRight size={12} />
             <span>{page === 'usage' ? 'Usage and capacity' : 'Tasks'}</span>
           </div>
@@ -1027,11 +1178,11 @@ export function App() {
               <span />
               {preview
                 ? 'Interface preview'
-                : !snapshot
+                : !header
                   ? 'Route state unavailable'
-                  : snapshot.routes.length === 0
+                  : header.routes.length === 0
                     ? 'No routes configured'
-                    : snapshot.routes.every(({ fake }) => fake)
+                    : header.routes.every(({ fake }) => fake)
                       ? 'Scripted providers'
                       : 'Routes from controller'}
             </span>
@@ -1115,7 +1266,12 @@ export function App() {
             </button>
           </div>
         )}
-        {!snapshot ? (
+        {workspace.detailStale && (
+          <p className="recovery-banner" role="status">
+            Reconnecting task detail. Displayed task state is stale; controls resume after refresh.
+          </p>
+        )}
+        {!header ? (
           <div className="loading-workspace">
             <Empty
               icon={connection === 'offline' ? <AlertTriangle /> : <RefreshCw className="spin" />}
@@ -1133,11 +1289,27 @@ export function App() {
             </button>
           </div>
         ) : page === 'usage' ? (
-          <Usage snapshot={snapshot} run={run} workspace={workspace} />
+          <Usage
+            snapshot={header}
+            attempts={snapshot?.attempts ?? []}
+            run={run}
+            workspace={workspace}
+          />
+        ) : selected && !newGoal && !snapshot ? (
+          <div className="loading-workspace" role="status">
+            <p>Opening selected task detail.</p>
+            <button
+              type="button"
+              className="button secondary"
+              onClick={() => void workspace.selectTask(selected)}
+            >
+              Retry task detail
+            </button>
+          </div>
         ) : (
           <div className={`task-layout ${roster ? '' : 'roster-hidden'}`}>
             <main className="task-main">
-              {task ? (
+              {task && snapshot ? (
                 <>
                   <section className="task-heading">
                     <div className="task-meta">
@@ -1415,7 +1587,7 @@ export function App() {
                 </>
               ) : (
                 <NewGoal
-                  snapshot={snapshot}
+                  snapshot={{ ...header, projects }}
                   workspace={workspace}
                   registerRetry={registerComposerRetry}
                   text={goalDraft}
@@ -1431,7 +1603,7 @@ export function App() {
                 />
               )}
             </main>
-            {roster && (
+            {roster && snapshot && (
               <Roster
                 snapshot={snapshot}
                 run={run}
@@ -1445,11 +1617,11 @@ export function App() {
           <span>
             <ShieldCheck size={12} />
             Local workspace<span className="footer-separator">/</span>
-            {!snapshot
+            {!header
               ? 'Route state unavailable'
-              : snapshot.routes.length === 0
+              : header.routes.length === 0
                 ? 'No routes configured'
-                : snapshot.routes.every(({ fake }) => fake)
+                : header.routes.every(({ fake }) => fake)
                   ? 'All routes are fake'
                   : 'Route state from controller'}
           </span>
@@ -1458,10 +1630,10 @@ export function App() {
           </span>
         </footer>
       </div>
-      {create && snapshot && (
+      {create && metadata && (
         <CreateTask
           workspace={workspace}
-          snapshot={snapshot}
+          snapshot={metadata}
           onClose={() => setCreate(false)}
           onCreated={(id) => {
             setSelected(id);
@@ -1554,8 +1726,8 @@ export function App() {
                 run: () => setAbout(true),
               },
             ]}
-            tasks={snapshot?.tasks ?? []}
-            projects={snapshot?.projects ?? []}
+            workspace={workspace}
+            projects={projects}
             onOpenTask={(id) => {
               setPalette(false);
               setNewGoal(false);
@@ -2608,7 +2780,13 @@ function Handoffs({ events, snapshot }: { events: Event[]; snapshot: Snapshot })
   );
 }
 
-function GoogleSetup({ snapshot, workspace }: { snapshot: Snapshot; workspace: Workspace }) {
+function GoogleSetup({
+  snapshot,
+  workspace,
+}: {
+  snapshot: Pick<Snapshot, 'googleAcpSetup' | 'nativeProfiles'>;
+  workspace: Workspace;
+}) {
   const setup = snapshot.googleAcpSetup;
   const profile = snapshot.nativeProfiles.find(
     (value) => value.family === 'google' && 'configOptions' in value,
@@ -2782,10 +2960,12 @@ function usageReading(value: UsageGaugeReading, label = value.label): UsageReadi
 
 function Usage({
   snapshot,
+  attempts,
   run,
   workspace,
 }: {
-  snapshot: Snapshot;
+  snapshot: WorkspaceState;
+  attempts: Snapshot['attempts'];
   run?: Run;
   workspace: Workspace;
 }) {
@@ -2925,7 +3105,7 @@ function Usage({
               <Activity size={15} />
               Controller activity
             </h2>
-            <span>This workspace</span>
+            <span>Selected task</span>
           </div>
           <table>
             <thead>
@@ -2944,7 +3124,7 @@ function Usage({
                   </td>
                   <td>
                     {
-                      snapshot.attempts.filter(
+                      attempts.filter(
                         ({ routeId, state }) => routeId === route.id && state !== 'intent',
                       ).length
                     }
@@ -2955,7 +3135,8 @@ function Usage({
             </tbody>
           </table>
           <p className="muted small">
-            Activity counters describe this controller. They do not measure account-wide usage.
+            Activity counters describe the selected task detail. They do not measure workspace-wide
+            or account-wide usage.
           </p>
         </section>
         <section className="card hardware-card">
@@ -3020,7 +3201,7 @@ function CreateTask({
   onCreated,
 }: {
   workspace: Workspace;
-  snapshot: Snapshot;
+  snapshot: Pick<Snapshot, 'projects'>;
   onClose: () => void;
   onCreated: (id: string) => void;
 }) {

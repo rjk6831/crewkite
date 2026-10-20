@@ -38,9 +38,11 @@ import {
   canonicalJson,
   type Event,
   EventSchema,
+  type Snapshot,
   SnapshotSchema,
   type TaskConversationState,
   TaskConversationStateSchema,
+  type TaskSummary,
 } from '../packages/contracts/src/index.ts';
 import { createDemoFixtures, createTestIds } from '../packages/testkit/src/fixtures.ts';
 
@@ -259,6 +261,119 @@ async function enter(button: Locator) {
   await button.click();
 }
 
+function workspaceRead(snapshot: Snapshot, command: Command): CommandResult | null {
+  const stamp = {
+    epoch: '1'.repeat(32),
+    revision: createHash('sha256')
+      .update(
+        canonicalJson({
+          projects: snapshot.projects.map(({ id, name }) => ({ id, name })),
+          tasks: snapshot.tasks.map(({ id, projectId, title, outcome, criteria }) => ({
+            id,
+            projectId,
+            title,
+            outcome,
+            criteria,
+          })),
+        }),
+      )
+      .digest('hex')
+      .slice(0, 12),
+  };
+  stamp.revision = BigInt(`0x${stamp.revision}`).toString();
+  if (command.command === 'GetWorkspaceState') {
+    const {
+      protocol,
+      cursor,
+      routes,
+      usage,
+      usageReaders,
+      nativeProfiles,
+      googleAcpSetup,
+      localSetup,
+    } = snapshot;
+    return {
+      outcome: 'applied',
+      data: {
+        kind: 'workspace-state',
+        version: 1,
+        stamp,
+        protocol,
+        cursor,
+        routes,
+        usage,
+        usageReaders,
+        nativeProfiles,
+        googleAcpSetup,
+        localSetup,
+      },
+    };
+  }
+  if (command.command === 'GetProjectPage')
+    return {
+      outcome: 'applied',
+      data: {
+        kind: 'project-page',
+        version: 1,
+        stamp,
+        cursor: snapshot.cursor,
+        complete: true,
+        next: null,
+        projects: snapshot.projects.map((project) => ({
+          ...project,
+          taskCount: snapshot.tasks.filter((task) => task.projectId === project.id).length,
+        })),
+      },
+    };
+  if (command.command !== 'GetTaskPage') return null;
+  const request = command.payload;
+  const filtered = snapshot.tasks
+    .filter(
+      (task) =>
+        (!request.projectId || task.projectId === request.projectId) &&
+        (!request.taskId || task.id === request.taskId),
+    )
+    .sort((a, b) => (a.id < b.id ? -1 : 1));
+  const rows = filtered
+    .filter((task) => !request.after?.afterId || task.id > request.after.afterId)
+    .slice(0, request.limit);
+  const tasks: TaskSummary[] = rows.map(
+    ({ id, projectId, title, state, waitingReason, revision, runId, next }) => ({
+      id,
+      projectId,
+      title,
+      state,
+      waitingReason,
+      revision,
+      runId,
+      next,
+    }),
+  );
+  const last = rows.at(-1);
+  const complete = !last || !filtered.some((task) => task.id > last.id);
+  return {
+    outcome: 'applied',
+    data: {
+      kind: 'task-page',
+      version: 1,
+      stamp,
+      cursor: snapshot.cursor,
+      tasks,
+      scanned: rows.length,
+      complete,
+      next: complete
+        ? null
+        : {
+            version: 1,
+            stamp,
+            section: 'tasks',
+            selectionHash: '0'.repeat(64),
+            afterId: last?.id ?? null,
+          },
+    },
+  };
+}
+
 async function pauseRenderer(
   application: Awaited<ReturnType<typeof _electron.launch>>,
   page: Page,
@@ -344,7 +459,9 @@ async function quotaReadBridge(
           socket.write(encodeFrame({ type: 'welcome', protocol: 1, cursor: '0' }));
         if (message.type !== 'command') continue;
         const request = { command: message.command, socket };
-        if (message.command.command === 'GetSnapshot')
+        const workspace = workspaceRead(snapshot, message.command);
+        if (workspace) reply(request, workspace);
+        else if (message.command.command === 'GetSnapshot')
           reply(request, { outcome: 'applied', data: { kind: 'snapshot', snapshot } });
         else if (message.command.command === 'Subscribe') reply(request, { outcome: 'applied' });
         else if (message.command.command === 'GetTaskConversationState')
@@ -814,7 +931,13 @@ async function conversationBridge(
     snapshot.tasks[0].revision += 1;
     if (state) state.revision = snapshot.tasks[0].revision;
   };
+  let holdTaskPage = false;
+  const heldTaskPages: (() => void)[] = [];
+  const detailReads: Command[] = [];
   const response = (command: Command): CommandResult => {
+    if (command.command === 'GetSnapshot') detailReads.push(command);
+    const workspace = workspaceRead(snapshot, command);
+    if (workspace) return workspace;
     if (command.command === 'GetSnapshot')
       return { outcome: 'applied', data: { kind: 'snapshot', snapshot } };
     if (command.command === 'Subscribe') return { outcome: 'applied' };
@@ -1217,7 +1340,13 @@ async function conversationBridge(
                 result: response(message.command),
               }),
             );
-          if (holdContextRead && message.command.command === 'GetArtifact')
+          if (
+            holdTaskPage &&
+            message.command.command === 'GetTaskPage' &&
+            message.command.payload.after
+          )
+            heldTaskPages.push(reply);
+          else if (holdContextRead && message.command.command === 'GetArtifact')
             heldContextReads.push(reply);
           else reply();
         }
@@ -2088,15 +2217,41 @@ async function conversationBridge(
     await expect(
       page.getByText('Queued for the next planning turn', { exact: true }).last(),
     ).toBeVisible();
+    for (let index = 0; index < 51; index++)
+      snapshot.tasks.push({
+        ...snapshot.tasks[0],
+        id: id('tsk'),
+        title: `Retained navigation ${index}`,
+      });
+    publishTask();
+    const moreTasks = page.getByRole('button', { name: 'Load more tasks', exact: true });
+    await expect(moreTasks).toBeVisible();
+    holdTaskPage = true;
+    await moreTasks.click();
+    await expect.poll(() => heldTaskPages.length).toBe(1);
+    await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeEnabled();
     await page.getByRole('button', { name: 'Stop', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Resume', exact: true })).toHaveCount(0);
     await expect(page.getByText('Stopped', { exact: true }).last()).toBeVisible();
+    holdTaskPage = false;
+    for (const release of heldTaskPages.splice(0)) release();
+    await expect(moreTasks).toHaveCount(0);
+    await expect(
+      page.locator('.task-link').filter({ hasText: 'Retained navigation 50' }),
+    ).toBeVisible();
+
     await expect(contextMeter).toHaveAttribute('aria-label', 'Context window, usage unknown');
     await chooseContext('Source folder', '/registered/project/src');
     await composer.fill('Keep this unsent draft.');
     await page.getByRole('tab', { name: 'Plan', exact: true }).click();
     await page.getByRole('tab', { name: 'Conversation', exact: true }).click();
     await expect(composer).toHaveValue('Keep this unsent draft.');
+    assert(detailReads.length > 0);
+    assert(
+      detailReads.every(
+        (command) => command.command === 'GetSnapshot' && 'taskId' in command.payload,
+      ),
+    );
     const mutations = received.length;
     await page.reload();
     await expect(page.getByRole('tab', { name: 'Conversation', exact: true })).toHaveAttribute(

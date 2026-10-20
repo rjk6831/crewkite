@@ -50,7 +50,13 @@ const modelReasons = {
 };
 const applied = (outcome: string) => outcome === 'applied' || outcome === 'already-applied';
 
-export function LocalSetup({ snapshot, workspace }: { snapshot: Snapshot; workspace: Workspace }) {
+export function LocalSetup({
+  snapshot,
+  workspace,
+}: {
+  snapshot: Pick<Snapshot, 'localSetup'>;
+  workspace: Workspace;
+}) {
   const setup = snapshot.localSetup;
   const authMode = setup?.authMode ?? 'token';
   const connectionReady = setup?.connected ?? setup?.secretConfigured ?? false;

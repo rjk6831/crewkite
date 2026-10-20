@@ -597,7 +597,7 @@ function useContextComposer({
     const current = latest.current;
     if (
       !current.projectId ||
-      !current.workspace.snapshot?.projects.some((project) => project.id === current.projectId)
+      !current.workspace.projects.some((project) => project.id === current.projectId)
     )
       return 'Choose a project before adding context.';
     if (current.workspace.preview) return 'Context capture is unavailable in preview.';
@@ -1154,13 +1154,13 @@ type PlanningFields = {
   consent: boolean;
   modelRequest?: ConversationModelRequest;
 };
-const getPlanningProfile = (snapshot: Snapshot) =>
+const getPlanningProfile = (snapshot: Pick<Snapshot, 'nativeProfiles'>) =>
   snapshot.nativeProfiles.find(
     (profile): profile is Extract<Snapshot['nativeProfiles'][number], { family: 'openai' }> =>
       profile.family === 'openai' && profile.id === 'openai-file-v1',
   );
 function planningComposerControls(
-  snapshot: Snapshot,
+  snapshot: Pick<Snapshot, 'nativeProfiles'>,
   role: PlanningFields['role'] | null,
   config?: TaskConversationState['configuration'],
   controls?: {
@@ -1274,7 +1274,7 @@ function PlanningControls({
 }: {
   value: PlanningFields;
   onChange: (value: PlanningFields) => void;
-  snapshot: Snapshot;
+  snapshot: Pick<Snapshot, 'nativeProfiles'>;
 }) {
   const profile = getPlanningProfile(snapshot);
   return (
@@ -1335,7 +1335,7 @@ export function NewGoal({
 }: {
   text: string;
   onTextChange: (text: string) => void;
-  snapshot: Snapshot;
+  snapshot: Pick<Snapshot, 'projects' | 'nativeProfiles'>;
   workspace: Workspace;
   registerRetry?: RegisterComposerRetry;
   onCreated: (id: string, submitted: string) => void;
