@@ -196,9 +196,19 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       actor: desktopActor,
     });
     if (
-      command.command === 'GetWorkspaceState' ||
-      command.command === 'GetProjectPage' ||
-      command.command === 'GetTaskPage'
+      [
+        'GetWorkspaceState',
+        'GetProjectPage',
+        'GetTaskPage',
+        'ObserveUsage',
+        'CheckNativeConnection',
+        'InstallGoogleAcp',
+        'StopGoogleAcpInstall',
+        'InitializeGoogleAcp',
+        'AuthenticateGoogleAcp',
+        'DiscoverGoogleAcp',
+        'StopGoogleAcpSetup',
+      ].includes(command.command)
     ) {
       if (!client) throw new Error('The controller is offline.');
       const result = CommandResultSchema.parse(await client.command(command));

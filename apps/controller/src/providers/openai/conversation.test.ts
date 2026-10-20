@@ -568,6 +568,8 @@ test('conversation turns use one correlated submission through owned native phas
       const methods: string[] = [];
       const groups: number[] = [];
       const children: { child: ChildProcessWithoutNullStreams; closed: Promise<void> }[] = [];
+      const liveChildren = new Set<ChildProcessWithoutNullStreams>();
+      let primaryFailure: { error: unknown } | undefined;
       let servers = 0;
       let submissions = 0;
       try {
@@ -609,9 +611,16 @@ test('conversation turns use one correlated submission through owned native phas
               const phase =
                 args.at(-1) === 'list' ? 'features' : ++servers === 1 ? 'prepare' : 'task';
               const child = spawnCheckChild(executable, ['-e', peer, 'success', phase], options);
+              liveChildren.add(child);
+              child.once('exit', () => liveChildren.delete(child));
               children.push({
                 child,
-                closed: new Promise((resolve) => child.once('close', () => resolve())),
+                closed: new Promise((resolve) =>
+                  child.once('close', () => {
+                    liveChildren.delete(child);
+                    resolve();
+                  }),
+                ),
               });
               if (child.pid) groups.push(child.pid);
               const write = child.stdin.write.bind(child.stdin);
@@ -693,10 +702,27 @@ test('conversation turns use one correlated submission through owned native phas
           ]);
         assert(!JSON.stringify(result).includes('private-diagnostic-canary'));
         assert(!JSON.stringify(result).includes('private-catalog-canary'));
-      } finally {
-        for (const { child } of children)
-          if (child.pid && !groupAbsent(child.pid)) process.kill(-child.pid, 'SIGKILL');
+      } catch (error) {
+        primaryFailure = { error };
+      }
+      {
+        const cleanupErrors: unknown[] = [];
+        for (const child of liveChildren) {
+          if (child.exitCode !== null || child.signalCode !== null) continue;
+          child.once('error', (error) => cleanupErrors.push(error));
+          try {
+            child.kill('SIGKILL');
+          } catch (error) {
+            cleanupErrors.push(error);
+          }
+        }
         await Promise.all(children.map(({ closed }) => closed));
+        if (cleanupErrors.length)
+          throw new AggregateError(
+            [...(primaryFailure ? [primaryFailure.error] : []), ...cleanupErrors],
+            'Conversation fixture cleanup failed.',
+          );
+        if (primaryFailure) throw primaryFailure.error;
       }
     }
   } finally {

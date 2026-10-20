@@ -10,7 +10,7 @@ This file is the implementation entry point. Read it together with [architecture
 
 Current slice: D2b.1, workspace and task status pages, with blocking UAT corrections before the next package. [D2 UAT 02](https://github.com/rjk6831/crewkite/releases/tag/d2-uat-02) failed installed UAT and remains available for issue reproduction. Its retained checks, inventory and unquarantined empty-workspace launch evidence do not establish usable provider setup or project registration. The public release marks that failure. No D2b package is qualified yet.
 
-[The runtime repair](https://github.com/rjk6831/crewkite/pull/55) passed required CI and merged. It seals staged runtime resources and records the limits of ad-hoc integrity checks. Downloaded first launch still needs its own evidence. The paging and project-recovery branch has a real-controller desktop and CLI proof with 304 tasks and a 1,365,503-byte legacy snapshot. Matching CI and a replacement package remain pending.
+[The runtime repair](https://github.com/rjk6831/crewkite/pull/55) passed required CI and merged. It seals staged runtime resources and records the limits of ad-hoc integrity checks. Downloaded first launch still needs its own evidence. The paging and project-recovery branch has a real-controller desktop and CLI proof with 304 tasks and a 1,365,503-byte legacy snapshot. [The paging and recovery repair](https://github.com/rjk6831/crewkite/pull/56) passed required CI with 101 Node claims and one desktop journey and merged. Provider setup integration and a replacement package remain pending.
 
 | Current-slice card | D2b.1 |
 |--------------------|-------|
@@ -28,7 +28,7 @@ Development can begin against a reviewed frozen interface before its dependency 
 
 ## Provider setup during UAT
 
-The current setup still depends on supported installed clients. Google needs a manual pinned-client import before its separate authentication flow. Local needs an already loaded compatible model and explicit connection setup. Planning currently uses the supported OpenAI profile; execution roles keep their own provider boundaries.
+OpenAI and Anthropic setup still depends on supported installed clients. The Google correction adds installation of the reviewed official ACP client before its separate authentication flow. Local needs an already loaded compatible model and explicit connection setup. Planning currently uses the supported OpenAI profile; execution roles keep their own provider boundaries.
 
 The failed UAT exposed missing provider readiness, an OpenAI quota read that silently failed, a Google initialization button with no client installation path, and a rejected project selection that remained globally pending across restart. These corrections gate the next candidate. They do not add another daily-work slice.
 
@@ -58,7 +58,7 @@ A day is a target for the next usable increment. It includes review and release 
 
 | Slice | Usable result | Depends on | State | Source, CI and UAT evidence |
 |-------|---------------|------------|-------|-----------------------------|
-| D2b.1 | Recover project selection and read large workspace status through complete pages | Retained D2 workflow and current main | Qualification pending | Real desktop and CLI proof: 304 tasks, legacy snapshot 1,365,503 bytes; pending-command restart recovery passed. Required CI and package pending |
+| D2b.1 | Recover project selection and read large workspace status through complete pages | Retained D2 workflow and current main | Qualification pending | Real desktop and CLI proof: 304 tasks, legacy snapshot 1,365,503 bytes; pending-command restart recovery and required CI passed in PR #56. Replacement package pending |
 | D2b.2 | Read large artifacts and activity output with bounded memory | D2b.1 | Planned | None |
 | D2b.3 | Prepare and retain a project beyond the old source-size limits | D2b.2 | Planned | None |
 | D2b.4 | See GitHub PR, Actions status and full CI logs inside a task | D2b.2 | Planned | None |

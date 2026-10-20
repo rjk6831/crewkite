@@ -1512,6 +1512,8 @@ test('process boundaries reject unknown fields and invalid command identity', ()
   };
   assert.deepEqual(SnapshotSchema.parse(oldSnapshot), {
     ...oldSnapshot,
+    nativeConnections: [],
+    googleAcpInstall: null,
     nativeProfiles: [],
     nativeRuns: [],
     candidateEvaluations: [],
@@ -1897,6 +1899,7 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     payload: { family: 'google' },
   };
   assert.deepEqual(CommandSchema.parse(observe), observe);
+  assert(CommandSchema.safeParse({ ...observe, payload: { family: 'openai' } }).success);
   assert.equal(hashCanonical(CommandSchema.parse(observe)), hashCanonical(observe));
   for (const payload of [
     { family: 'google', consent: true },
@@ -1905,7 +1908,7 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     { family: 'google', consent: null },
     { family: 'google', enabled: true },
     { family: 'google', authorityRevision: 1 },
-    { family: 'openai' },
+    { family: 'anthropic' },
     { family: 'google', token: 'synthetic-secret' },
   ])
     assert.equal(

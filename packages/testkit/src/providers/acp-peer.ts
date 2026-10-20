@@ -500,18 +500,30 @@ export function runAcpPeer(scenario: AcpPeerCase, fresh = false) {
           terminal('end_turn');
         } else {
           writeFileSync(join(cwd, 'net.mjs'), 'export const total = 1;\n');
-          terminal('end_turn');
-          if (scenario === 'duplicate') terminal('end_turn');
           if (scenario === 'descendant') {
+            // Keep the parent alive to reap its owned child before the group disappears.
             const child = spawn(
               process.execPath,
               [
                 '-e',
-                'const {MessageChannel}=require("node:worker_threads");const p=new MessageChannel();p.port1.on("message",()=>{});process.on("SIGTERM",()=>{});',
+                'const {MessageChannel}=require("node:worker_threads");const p=new MessageChannel();p.port1.on("message",()=>{});process.on("SIGTERM",()=>{});process.send("ready");',
               ],
-              { stdio: 'inherit' },
+              { stdio: ['inherit', 'inherit', 'inherit', 'ipc'] },
             );
-            child.unref();
+            process.on('SIGTERM', () => {
+              if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+            });
+            child.once('close', () => {
+              input.close();
+              process.stdin.destroy();
+            });
+            child.once('message', (message) => {
+              assert.equal(message, 'ready');
+              terminal('end_turn');
+            });
+          } else {
+            terminal('end_turn');
+            if (scenario === 'duplicate') terminal('end_turn');
           }
         }
       } else if (message.method === 'session/cancel') {

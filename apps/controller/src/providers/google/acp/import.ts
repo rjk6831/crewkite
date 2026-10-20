@@ -12,7 +12,7 @@ import {
   readdirSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, join, relative } from 'node:path';
+import { basename, dirname, join, relative } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { groupAbsent, type Schedule } from '../../../host/worker.ts';
 import {
@@ -305,7 +305,7 @@ function managedSnapshot(home: string, executable: string): string {
 
 /** Import reads fixed staging files. Publishing the private pin is the last write. */
 export async function importGoogleAcp(
-  options: { home: string; consent: 'explicit' },
+  options: { home: string; consent: 'explicit'; installerStaging?: string },
   dependencies: AcpImportDependencies = {},
 ): Promise<AcpImportResult> {
   const refused = (reason: AcpImportResult['reason']): AcpImportResult => ({
@@ -316,8 +316,20 @@ export async function importGoogleAcp(
   try {
     if (options.consent !== 'explicit') return refused('invalid-import');
     validateAcpDirectory(options.home);
-    const staging = join(options.home, 'imports/google-acp-v1');
+    const staging = options.installerStaging ?? join(options.home, 'imports/google-acp-v1');
+    if (
+      options.installerStaging &&
+      (dirname(staging) !== join(options.home, 'imports') ||
+        !/^\.google-acp-install-[A-Za-z0-9]{6}$/.test(basename(staging)))
+    )
+      return refused('invalid-import');
     validateAcpDirectory(staging, options.home);
+    if (
+      options.installerStaging &&
+      JSON.stringify(readdirSync(staging).sort()) !==
+        JSON.stringify(['agy_acp_server.par', 'identity.json', 'localharness_external'])
+    )
+      return refused('invalid-import');
     const identityBytes = readAcpPrivateFile(join(staging, 'identity.json'), 4096);
     const identity = AcpImportIdentitySchema.parse(
       JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(identityBytes)),

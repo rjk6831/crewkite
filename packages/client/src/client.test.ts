@@ -38,6 +38,8 @@ const task = {
   next: 'Prepare the run.',
 };
 const snapshot: Snapshot = {
+  googleAcpInstall: null,
+  nativeConnections: [],
   protocol: 1,
   cursor: '4',
   projects: [],
@@ -171,6 +173,8 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     protocol: 1 as const,
     stamp: { epoch: 'a'.repeat(32), revision: '0' },
     cursor: value.cursor,
+    googleAcpInstall: value.googleAcpInstall,
+    nativeConnections: value.nativeConnections,
     routes: value.routes,
     usage: value.usage,
     usageReaders: value.usageReaders,
@@ -365,7 +369,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     { recipe: 'StartRun', expected: 40000 },
     { recipe: 'StartRun', timeoutMs: 10000, expected: 10000 },
     { recipe: 'StartRun', timeoutMs: 50000, expected: 50000 },
-    { recipe: 'InitializeGoogleAcp', expected: 15000 },
+    { recipe: 'InitializeGoogleAcp', expected: 35000 },
     { recipe: 'AuthenticateGoogleAcp', expected: 130000 },
     { recipe: 'DiscoverGoogleAcp', expected: 30000 },
     { recipe: 'StopGoogleAcpSetup', expected: 30000 },
@@ -668,7 +672,8 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       reason: 'client-unavailable',
     },
     { name: 'missing-family', args: ['usage', 'refresh'], invalid: true },
-    { name: 'wrong-family', args: ['usage', 'refresh', '--family', 'openai'], invalid: true },
+    { name: 'openai', args: ['usage', 'refresh', '--family', 'openai'] },
+    { name: 'wrong-family', args: ['usage', 'refresh', '--family', 'anthropic'], invalid: true },
     { name: 'show-family', args: ['usage', 'show', '--family', 'google'], invalid: true },
     { name: 'wrong-command', args: ['health', '--consent'], invalid: true },
     { name: 'extra', args: ['usage', 'show', 'other'], invalid: true },
@@ -3114,7 +3119,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         assert.deepEqual(receipt.command, received[0]);
         assert.equal(receipt.command.expectedRevision, 0);
         assert.deepEqual(receipt.command.payload, {
-          family: 'google',
+          family: usageCase.name === 'openai' ? 'openai' : 'google',
         });
         if (usageCase.reason) {
           assert.equal(receipt.result.reason, usageCase.reason);
@@ -3823,6 +3828,8 @@ test('workspace resync reads a small header on startup gaps and reconnects', asy
               routes: snapshot.routes,
               usage: snapshot.usage,
               usageReaders: snapshot.usageReaders,
+              googleAcpInstall: snapshot.googleAcpInstall,
+              nativeConnections: snapshot.nativeConnections,
               googleAcpSetup: snapshot.googleAcpSetup,
               localSetup: snapshot.localSetup,
               nativeProfiles: snapshot.nativeProfiles,

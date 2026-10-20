@@ -7,7 +7,7 @@
 
 CrewKite is a desktop workspace and CLI for coding tasks that share one local controller. It tracks approvals, usage observations and retained work across provider routes.
 
-I completed ten real D2 backlog outcomes through the normal checked workflow. I published [D2 UAT 02](https://github.com/rjk6831/crewkite/releases/tag/d2-uat-02) for real-project user acceptance on macOS with Apple Silicon. Its exact-source CI, package inventory, cold launch and same-home reopen passed; public downloads match the recorded checksums. The normal workspace starts without a synthetic project or seeded route catalog. Native profiles connect to their supported clients; Local setup uses an explicitly configured loopback connection. Availability is separate from qualification. The separate Google ACP profile binds its supported mappings to an exact imported client bundle. The [roadmap](docs/roadmap.md) records that task evidence and the separate D2b user-acceptance and D3 gates. The release receipt carries the exact candidate verification and package status.
+I completed ten real D2 backlog outcomes through the checked workflow. [D2 UAT 02](https://github.com/rjk6831/crewkite/releases/tag/d2-uat-02) then failed installed user acceptance. Downloaded launch, provider setup and persistent project-selection errors blocked ordinary use. I retained that candidate for issue reproduction and marked its release accordingly. The earlier checks and task outcomes do not establish installed usability. D2b repairs are landing in stages; a replacement package requires matching CI and installed recovery evidence before another UAT handoff. The [daily-work plan](docs/daily-work-slices.md) tracks that work, and the [roadmap](docs/roadmap.md) keeps D3 behind its separate approval gate.
 
 ## Why I am building it
 
@@ -37,7 +37,7 @@ The [provider notes](docs/providers.md) separate implemented paths from dated qu
 
 ## Task workflow
 
-Open Usage and capacity to inspect route availability and explicit provider setup. Local setup connects to a dedicated loopback runtime, refreshes its observed model list and saves one selection. Dedicated token is the default. An explicit CLI configuration can select no authentication, this device only; the desktop reports that saved mode without a selector or silent fallback. That mode needs no token input after restart. Setup loads no model. An eligible loaded model remains unqualified; the [provider notes](docs/providers.md#local-models) describe the current limits.
+Choose Connect providers before adding a project or task. The same setup controls appear in Usage and capacity, with installed client, sign-in and allowance observations kept separate. Local setup connects to a dedicated loopback runtime, refreshes its observed model list and saves one selection. Dedicated token is the default. An explicit CLI configuration can select no authentication, this device only; the desktop reports that saved mode without a selector or silent fallback. That mode needs no token input after restart. Setup loads no model. An eligible loaded model remains unqualified; the [provider notes](docs/providers.md#local-models) describe the current limits.
 
 Choose New task, select a registered project and review the planning permission before sending. Conversation is the main task view. Answer the primary role's questions and inspect the proposed criteria and scope before choosing Adopt plan. Adoption saves the task contract and opens separate execution preparation. It starts no coding work.
 
@@ -105,7 +105,7 @@ Details live in [docs/roadmap.md](docs/roadmap.md).
 
 For a published candidate, the [preview guide](docs/preview.md#verify-the-download) covers the download checksum and the included desktop launcher.
 
-The [directory package](docs/distribution.md) is the normal desktop path. It carries separate Node and Electron runtimes and the fixed Local credential-input helper. It needs local Git, an existing Git identity for branch acceptance and separately installed provider clients. It downloads no provider or model. A source-only controller has no packaged Local credential-input capability.
+The [directory package](docs/distribution.md) is the normal desktop path. It carries separate Node and Electron runtimes and the fixed Local credential-input helper. It needs local Git and an existing Git identity for branch acceptance. OpenAI and Anthropic use supported installed native clients. Google ACP setup can install its reviewed official client after an explicit action. Local setup downloads or loads no model. A source-only controller has no packaged Local credential-input capability.
 
 For maintainer staging from a committed checkout with the pinned development dependencies already installed:
 

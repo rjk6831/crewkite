@@ -172,8 +172,18 @@ export async function serve(
                   return;
                 }
                 if (
-                  command.command === 'PrepareCandidateEvaluation' &&
-                  command.payload.checkRecipeId === 'crewkite-verify-v1'
+                  [
+                    'ObserveUsage',
+                    'CheckNativeConnection',
+                    'InstallGoogleAcp',
+                    'StopGoogleAcpInstall',
+                    'InitializeGoogleAcp',
+                    'AuthenticateGoogleAcp',
+                    'DiscoverGoogleAcp',
+                    'StopGoogleAcpSetup',
+                  ].includes(command.command) ||
+                  (command.command === 'PrepareCandidateEvaluation' &&
+                    command.payload.checkRecipeId === 'crewkite-verify-v1')
                 ) {
                   detached = true;
                   void respond(command)

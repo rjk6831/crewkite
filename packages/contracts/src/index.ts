@@ -451,6 +451,7 @@ export const GoogleAcpCapabilitiesSchema = z.strictObject({
 export const GoogleAcpReasonSchema = z.enum([
   ...GoogleNativeProfileSchema.shape.reason.options,
   'acp-capability-missing',
+  'acp-setup-timeout',
   'auth-method-mismatch',
   'authentication-required',
 ]);
@@ -522,6 +523,7 @@ export const GoogleAcpSetupSchema = z
       'initializing',
       'authentication-required',
       'authenticating',
+      'discovery-required',
       'discovering',
       'ready',
       'stopping',
@@ -819,8 +821,8 @@ export const WindowSchema = z.strictObject({
 });
 export const UsageReaderSchema = z
   .strictObject({
-    id: z.literal('google-usage-v1'),
-    family: z.literal('google'),
+    id: z.enum(['google-usage-v1', 'openai-usage-v1']),
+    family: z.enum(['google', 'openai']),
     clientVersion: label,
     available: z.boolean(),
     reason: z.enum([
@@ -829,12 +831,19 @@ export const UsageReaderSchema = z
       'native-home-unavailable',
       'client-unavailable',
       'client-build-mismatch',
+      'not-configured',
+      'configuration-location-unsupported',
     ]),
+    readState: z.enum(['idle', 'intent', 'owned', 'quiescent', 'unknown']).optional(),
+    readReason: label.nullable().optional(),
+    lastRequest: label.nullable().optional(),
     lastObservedAt: TimestampSchema.nullable(),
     lastAttemptAt: TimestampSchema.nullable().optional(),
   })
   .refine(
-    (reader) => reader.available === (reader.reason === 'available'),
+    (reader) =>
+      reader.available === (reader.reason === 'available') &&
+      reader.id === `${reader.family}-usage-v1`,
     'Reader availability must match its client status.',
   );
 export const RoleSchema = z.strictObject({
@@ -2194,7 +2203,19 @@ export const CommandSchema = z.discriminatedUnion('command', [
     }),
   ),
   mutate('RegisterProject', z.strictObject({ path: text })),
-  mutate('ObserveUsage', z.strictObject({ family: z.literal('google') })),
+  mutate(
+    'CheckNativeConnection',
+    z.strictObject({ family: z.literal('anthropic'), consent: z.literal('explicit') }),
+  ),
+  mutate(
+    'InstallGoogleAcp',
+    z.strictObject({ profileId: z.literal('google-acp-v1'), consent: z.literal('explicit') }),
+  ),
+  mutate(
+    'StopGoogleAcpInstall',
+    z.strictObject({ profileId: z.literal('google-acp-v1'), operationId: CommandIdSchema }),
+  ),
+  mutate('ObserveUsage', z.strictObject({ family: z.enum(['google', 'openai']) })),
   mutate(
     'InitializeGoogleAcp',
     z.strictObject({ profileId: z.literal('google-acp-v1'), consent: z.literal('explicit') }),
@@ -2654,9 +2675,64 @@ export const CombinedRunPreviewSchema = z
   });
 export type CombinedRunPreview = z.infer<typeof CombinedRunPreviewSchema>;
 
+export const NativeConnectionStatusSchema = z
+  .strictObject({
+    family: z.literal('anthropic'),
+    profileId: z.literal('anthropic-file-v1'),
+    state: z.enum([
+      'unchecked',
+      'checking',
+      'signed-in',
+      'signed-out',
+      'unsupported',
+      'blocked',
+      'unknown',
+    ]),
+    authMethod: z
+      .enum(['none', 'subscription', 'oauth_token', 'api_key', 'api_key_helper', 'third_party'])
+      .nullable(),
+    observedAt: TimestampSchema.nullable(),
+    reason: z.string().min(1).max(200).nullable(),
+    next: z.string().min(1).max(500),
+    billing: z.literal('unknown'),
+    qualified: z.literal(false),
+    quota: z.literal('unknown'),
+  })
+  .refine(
+    (status) =>
+      status.state !== 'signed-in' ||
+      (status.authMethod === 'subscription' && status.observedAt !== null),
+    'Signed-in status requires observed native subscription authentication.',
+  )
+  .refine(
+    (status) =>
+      status.state !== 'signed-out' || (status.authMethod === 'none' && status.observedAt !== null),
+    'Signed-out status requires an observed signed-out method.',
+  );
+export type NativeConnectionStatus = z.infer<typeof NativeConnectionStatusSchema>;
+
+export const GoogleAcpInstallStatusSchema = z.strictObject({
+  profileId: z.literal('google-acp-v1'),
+  state: z.enum(['idle', 'installing', 'stopping', 'installed', 'blocked', 'unknown']),
+  operationId: CommandIdSchema.nullable(),
+  observedAt: TimestampSchema.nullable(),
+  reason: z.string().min(1).max(200).nullable(),
+  next: z.string().min(1).max(500),
+});
+export type GoogleAcpInstallStatus = z.infer<typeof GoogleAcpInstallStatusSchema>;
+
 export const SnapshotSchema = z
   .strictObject({
-    usageReaders: z.array(UsageReaderSchema).max(1).default([]),
+    googleAcpInstall: GoogleAcpInstallStatusSchema.nullable().default(null),
+    nativeConnections: z.array(NativeConnectionStatusSchema).max(1).default([]),
+    usageReaders: z
+      .array(UsageReaderSchema)
+      .max(2)
+      .refine(
+        (readers) => new Set(readers.map((reader) => reader.id)).size === readers.length,
+        'Usage reader identities must be unique.',
+      )
+      .default([]),
     googleAcpSetup: GoogleAcpSetupSchema.nullable().default(null),
     localSetup: LocalSetupSchema.nullable().optional(),
     nativeProfiles: z
@@ -2840,6 +2916,8 @@ export const WorkspaceStateSchema = z
     usageReaders: SnapshotSchema.shape.usageReaders,
     googleAcpSetup: SnapshotSchema.shape.googleAcpSetup,
     localSetup: SnapshotSchema.shape.localSetup,
+    googleAcpInstall: SnapshotSchema.shape.googleAcpInstall,
+    nativeConnections: SnapshotSchema.shape.nativeConnections,
     nativeProfiles: SnapshotSchema.shape.nativeProfiles,
     routes: SnapshotSchema.shape.routes,
     usage: SnapshotSchema.shape.usage,
@@ -2951,6 +3029,7 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('conversation-state'), state: TaskConversationStateSchema }),
   ConversationPageSchema,
   z.strictObject({ kind: z.literal('google-acp-setup'), setup: GoogleAcpSetupSchema }),
+  z.strictObject({ kind: z.literal('google-acp-install'), install: GoogleAcpInstallStatusSchema }),
   sourceInspection,
   z.strictObject({ kind: z.literal('snapshot'), snapshot: SnapshotSchema }),
   z.strictObject({

@@ -195,6 +195,10 @@ import {
   type Schedule,
 } from '../host/worker.ts';
 import {
+  ConnectionRecordSchema,
+  NativeConnectionChecks,
+} from '../providers/anthropic/native-connection.ts';
+import {
   type NativeLifecycle as AnthropicLifecycle,
   startNativeAuthStatus,
 } from '../providers/anthropic/native-discovery.ts';
@@ -204,6 +208,11 @@ import {
   startReplacement as startAnthropicReplacement,
 } from '../providers/anthropic/replacement.ts';
 import { AcpDiagnosticSchema } from '../providers/google/acp/client.ts';
+import type { AcpInstallDependencies } from '../providers/google/acp/install.ts';
+import {
+  GoogleAcpInstallation,
+  InstallRecordSchema,
+} from '../providers/google/acp/install-operation.ts';
 import {
   type AcpClientIdentity,
   AcpClientPinSchema,
@@ -871,6 +880,10 @@ const OpenAiUsageReadSchema = z.strictObject({
   attemptedAt: TimestampSchema,
   profileHash: HashSchema,
   groups: z.array(z.number().int().positive().safe()).max(2),
+  reason: z.string().min(1).max(200).nullable().optional(),
+  lastRequest: z.string().min(1).max(200).nullable().optional(),
+  lastObservedAt: TimestampSchema.nullable().optional(),
+  commandId: CommandIdSchema.optional(),
 });
 
 type LocalWriterRuntime = {
@@ -906,6 +919,7 @@ export type ControllerOptions = {
     resolve?: (proof: AcpSetupProof | null) => AcpProfileResolution;
     spawn?: Parameters<typeof startGoogleAcpSetup>[0]['spawn'];
   };
+  googleAcpInstall?: AcpInstallDependencies;
   registerGoogleAcp?: boolean;
   localInputHelper?: LocalInputHelper;
   localInput?: Parameters<typeof startLocalSecretInput>[2];
@@ -1081,6 +1095,8 @@ export class Controller {
         ownsTurn: (binding, phase) => this.ownsConversationTurn(binding, phase),
       });
       this.recover();
+      this.nativeConnections().recover();
+      this.googleInstallation().recover();
       this.armQuotaRetries();
       for (const row of this.store.db
         .prepare("SELECT candidate_id FROM publications WHERE state='prepared'")
@@ -1120,6 +1136,10 @@ export class Controller {
       return this.executeAcpSetup(command as AcpSetupCommand, principal);
     if (command.command === 'StartRun' && this.isPreparedAcp(command.payload.runId))
       return this.executeAcpStart(command, principal);
+    if (command.command === 'InstallGoogleAcp' || command.command === 'StopGoogleAcpInstall')
+      return this.executeGoogleInstall(command, principal);
+    if (command.command === 'CheckNativeConnection')
+      return this.checkNativeConnection(command, principal);
     if (command.command === 'ObserveUsage') return this.observeUsageCommand(command, principal);
     if (command.command === 'CaptureConversationContext')
       return this.captureConversationContextCommand(command, principal);
@@ -1357,10 +1377,12 @@ export class Controller {
       protocol: 1,
       stamp: this.store.workspaceStamp(),
       cursor: this.store.cursor(),
+      googleAcpInstall: this.googleInstallation().status(),
+      nativeConnections: [this.nativeConnections().status()],
       nativeProfiles: this.resolveProfiles().map((profile) => profile.facts),
       localSetup: this.localSetup(),
       googleAcpSetup: this.store.googleAcpSetup(),
-      usageReaders: [this.googleUsageReader()],
+      usageReaders: [this.googleUsageReader(), this.openAiUsageReader()],
       routes: this.store.list('route'),
       usage: this.store
         .list<Observation>('window')
@@ -1412,6 +1434,8 @@ export class Controller {
     try {
       const snapshot = {
         protocol: 1,
+        googleAcpInstall: header.googleAcpInstall,
+        nativeConnections: header.nativeConnections,
         nativeProfiles: header.nativeProfiles,
         localSetup: header.localSetup,
         googleAcpSetup: header.googleAcpSetup,
@@ -1494,6 +1518,26 @@ export class Controller {
     });
   }
 
+  private openAiUsageReader() {
+    const resolved = this.options.openAiUsageClient?.();
+    const profile = resolved?.facts.family === 'openai' ? resolved : unavailableNativeProfile();
+    const facts = profile.facts;
+    if (facts.family !== 'openai') throw Error('The usage reader requires an OpenAI profile.');
+    const state = this.openAiUsageState();
+    return UsageReaderSchema.parse({
+      id: 'openai-usage-v1',
+      family: 'openai',
+      clientVersion: facts.clientVersion,
+      available: profile.facts.available,
+      reason: profile.facts.available ? 'available' : profile.facts.reason,
+      readState: state?.state ?? 'idle',
+      readReason: state?.reason ?? null,
+      lastRequest: state?.lastRequest ?? null,
+      lastAttemptAt: state?.attemptedAt ?? null,
+      lastObservedAt: state?.lastObservedAt ?? null,
+    });
+  }
+
   refreshUsage(trigger: 'start' | 'connect' | 'interval'): Promise<void> {
     return Promise.allSettled([
       this.refreshGoogleUsage(trigger),
@@ -1527,7 +1571,10 @@ export class Controller {
     }
   }
 
-  private refreshOpenAiUsage(trigger: 'start' | 'connect' | 'interval'): Promise<void> | undefined {
+  private refreshOpenAiUsage(
+    trigger: 'start' | 'connect' | 'interval' | 'manual',
+    commandId?: string,
+  ): Promise<void> | undefined {
     try {
       if (this.closed || !this.options.openAiUsageClient) return;
       if (this.openAiUsageRead) return this.openAiUsageRead.done;
@@ -1618,6 +1665,10 @@ export class Controller {
         attemptedAt,
         profileHash,
         groups: [],
+        reason: null,
+        lastRequest: null,
+        lastObservedAt: previous?.lastObservedAt ?? null,
+        ...(commandId ? { commandId } : {}),
       });
       this.store.transaction(() => this.saveOpenAiUsage(state));
       const completion = Promise.withResolvers<void>();
@@ -1709,6 +1760,7 @@ export class Controller {
           const known = outcome.quiescent && state.groups.length > 0;
           // Usage follows the supported account check. A later protocol refusal
           // cannot grant authority or erase that validated read. Cancellation revokes it.
+          let published = false;
           if (
             known &&
             performance.now() < deadline &&
@@ -1721,20 +1773,35 @@ export class Controller {
                 throw Error('usage-read-deadline');
             };
             for (const report of reports)
-              this.storeProviderUsage(
-                readerRoute.id,
-                report.value,
-                publicationCurrent,
-                report.prior,
-              );
+              published =
+                this.storeProviderUsage(
+                  readerRoute.id,
+                  report.value,
+                  publicationCurrent,
+                  report.prior,
+                ) || published;
           }
           this.store.transaction(() =>
-            this.saveOpenAiUsage({ ...state, state: known ? 'quiescent' : 'unknown' }),
+            this.saveOpenAiUsage({
+              ...state,
+              state: known ? 'quiescent' : 'unknown',
+              reason: !known
+                ? 'ownership-unknown'
+                : published
+                  ? 'observed'
+                  : (outcome.reason ?? 'no-observations'),
+              lastRequest: outcome.lastRequest,
+              lastObservedAt: published ? this.now() : state.lastObservedAt,
+            }),
           );
         } catch {
           try {
             this.store.transaction(() =>
-              this.saveOpenAiUsage({ ...state, state: invoked ? 'unknown' : 'quiescent' }),
+              this.saveOpenAiUsage({
+                ...state,
+                state: invoked ? 'unknown' : 'quiescent',
+                reason: 'read-failed',
+              }),
             );
           } catch {}
         } finally {
@@ -1895,6 +1962,8 @@ export class Controller {
         data: { kind: 'google-acp-setup', setup: next },
       };
     }
+    const installBlocker = this.googleInstallationBlocker();
+    if (installBlocker) return installBlocker;
     const blocker = this.store.googleOperationBlocker();
     if (blocker)
       return { outcome: 'blocked', reason: blocker, data: { kind: 'google-acp-setup', setup } };
@@ -2039,18 +2108,25 @@ export class Controller {
               ? 'ready'
               : !revoked && !outcome.reason && operation === 'initialize'
                 ? 'authentication-required'
-                : 'blocked',
+                : !revoked &&
+                    !outcome.reason &&
+                    operation === 'authenticate' &&
+                    auth.status === 'authenticated'
+                  ? 'discovery-required'
+                  : 'blocked',
           operationId: known ? null : commandId,
           proofId,
           client,
           auth,
           reason: ready
             ? null
-            : outcome.reason === 'authentication'
-              ? 'authentication-required'
-              : !revoked && operation === 'discover'
-                ? 'acp-capability-missing'
-                : null,
+            : !revoked && outcome.reason === 'deadline'
+              ? 'acp-setup-timeout'
+              : outcome.reason === 'authentication'
+                ? 'authentication-required'
+                : !revoked && operation === 'discover'
+                  ? 'acp-capability-missing'
+                  : null,
         });
         this.store.putGoogleAcpSetup(setup);
         result = {
@@ -2061,7 +2137,17 @@ export class Controller {
                   ? 'google-ownership-unknown'
                   : revoked
                     ? 'acp-setup-stopped'
-                    : 'acp-setup-failed',
+                    : outcome.reason === 'deadline'
+                      ? 'acp-setup-timeout'
+                      : 'acp-setup-failed',
+              }
+            : {}),
+          ...(known && !revoked && outcome.reason === 'deadline'
+            ? {
+                next:
+                  operation === 'initialize'
+                    ? 'Initialization timed out after 30 seconds. Retry Initialize; no task was submitted.'
+                    : 'Native setup timed out. Retry this setup step; no task was submitted.',
               }
             : {}),
           data: { kind: 'google-acp-setup', setup },
@@ -2105,10 +2191,223 @@ export class Controller {
     }
   }
 
+  private googleInstallOperation?: GoogleAcpInstallation;
+
+  private googleInstallation(): GoogleAcpInstallation {
+    if (this.googleInstallOperation) return this.googleInstallOperation;
+    const read = (key?: string) => {
+      const row = this.store.db
+        .prepare(
+          'SELECT command_key FROM receipts WHERE command_key LIKE ? ORDER BY rowid DESC LIMIT 1',
+        )
+        .get(key ? `google-acp-install:${key}:%` : 'google-acp-install:%') as
+        | { command_key: string }
+        | undefined;
+      return row ? InstallRecordSchema.parse(this.nativeRecord(row.command_key, 4096).value) : null;
+    };
+    this.googleInstallOperation = new GoogleAcpInstallation({
+      now: this.now,
+      latest: () => read(),
+      forKey: (key) => read(key),
+      append: (record) =>
+        this.store.transaction(() => {
+          const value = InstallRecordSchema.parse(record);
+          const artifact = this.nativeArtifact(value);
+          if (value.phase === 'intent')
+            this.store.saveReceipt(value.key, value.requestHash, 'local-owner', {
+              outcome: 'blocked',
+              reason: 'google-install-pending',
+              data: { kind: 'google-acp-install', install: value.status },
+            });
+          this.store.saveReceipt(
+            `google-acp-install:${value.key}:${value.step}`,
+            artifact.hash,
+            'local-owner',
+            { outcome: 'applied', entity: artifact },
+          );
+        }),
+    });
+    return this.googleInstallOperation;
+  }
+
+  private googleInstallationBlocker(): CommandResult | undefined {
+    const status = this.googleInstallation().status();
+    if (['installing', 'stopping', 'unknown'].includes(status.state))
+      return {
+        outcome: 'blocked',
+        reason:
+          status.state === 'unknown' ? 'google-install-ownership-unknown' : 'google-install-active',
+        next: status.next,
+        data: { kind: 'google-acp-install', install: status },
+      };
+  }
+
+  private async executeGoogleInstall(
+    command: Extract<Command, { command: 'InstallGoogleAcp' | 'StopGoogleAcpInstall' }>,
+    principal: string,
+  ): Promise<CommandResult> {
+    const hash = hashCanonical(command),
+      receipt = this.store.receipt(command.key);
+    if (receipt && (receipt.hash !== hash || receipt.principal !== principal))
+      return { outcome: 'denied', reason: 'idempotency-key-reused' };
+    if (
+      receipt &&
+      !['google-install-pending', 'google-install-stop-pending'].includes(
+        receipt.result.reason ?? '',
+      )
+    )
+      return {
+        ...receipt.result,
+        ...(receipt.result.outcome === 'applied' ? { outcome: 'already-applied' as const } : {}),
+      };
+    if (command.expectedRevision !== 0) return { outcome: 'stale-revision', revision: 0 };
+    const operation = this.googleInstallation();
+    let result: CommandResult;
+    if (command.command === 'StopGoogleAcpInstall') {
+      if (!receipt)
+        this.store.transaction(() =>
+          this.store.saveReceipt(command.key, hash, principal, {
+            outcome: 'blocked',
+            reason: 'google-install-stop-pending',
+            data: { kind: 'google-acp-install', install: operation.status() },
+          }),
+        );
+      result = await operation.stop(command.payload.operationId);
+    } else {
+      const blocker = receipt
+        ? undefined
+        : this.store.transaction(() => this.store.googleOperationBlocker());
+      result = blocker
+        ? {
+            outcome: 'blocked',
+            reason: blocker,
+            data: { kind: 'google-acp-install', install: operation.status() },
+          }
+        : !receipt && (this.acpSetupRuntime || this.acpStart)
+          ? {
+              outcome: 'blocked',
+              reason: 'google-operation-active',
+              data: { kind: 'google-acp-install', install: operation.status() },
+            }
+          : await operation.install(
+              { key: command.key, requestHash: hash, home: this.home },
+              this.options.googleAcpInstall,
+            );
+    }
+    if (result.outcome === 'denied') return result;
+    try {
+      this.store.transaction(() => {
+        const current = this.store.receipt(command.key);
+        if (current && current.hash !== hash) throw Error('Command binding changed.');
+        if (
+          current &&
+          ['google-install-pending', 'google-install-stop-pending'].includes(
+            current.result.reason ?? '',
+          )
+        )
+          this.finishMetadataReceipt(command.key, result);
+        else if (!current) this.store.saveReceipt(command.key, hash, principal, result);
+      });
+    } catch {
+      return { outcome: 'blocked', reason: 'google-install-storage-failed' };
+    }
+    return result;
+  }
+
+  private connectionChecks?: NativeConnectionChecks;
+
+  private nativeConnections(): NativeConnectionChecks {
+    if (this.connectionChecks) return this.connectionChecks;
+    this.connectionChecks = new NativeConnectionChecks({
+      now: this.now,
+      latest: () => {
+        const row = this.store.db
+          .prepare(
+            "SELECT command_key FROM receipts WHERE command_key LIKE 'native-connection:%' ORDER BY rowid DESC LIMIT 1",
+          )
+          .get() as { command_key: string } | undefined;
+        return row
+          ? ConnectionRecordSchema.parse(this.nativeRecord(row.command_key, 4096).value)
+          : null;
+      },
+      completed: (key) =>
+        this.store.receipt(`native-connection:${key}:complete`)
+          ? ConnectionRecordSchema.parse(
+              this.nativeRecord(`native-connection:${key}:complete`, 4096).value,
+            )
+          : null,
+      append: (record) =>
+        this.store.transaction(() => {
+          const value = ConnectionRecordSchema.parse(record);
+          const artifact = this.nativeArtifact(value);
+          if (value.phase === 'intent')
+            this.store.saveReceipt(value.key, value.requestHash, 'local-owner', {
+              outcome: 'blocked',
+              reason: 'anthropic-connection-check-pending',
+              next: 'Wait for the native sign-in check.',
+            });
+          this.store.saveReceipt(
+            `native-connection:${value.key}:${value.phase}`,
+            artifact.hash,
+            'local-owner',
+            { outcome: 'applied', entity: artifact },
+          );
+        }),
+    });
+    return this.connectionChecks;
+  }
+
+  private async checkNativeConnection(
+    command: Extract<Command, { command: 'CheckNativeConnection' }>,
+    principal: string,
+  ): Promise<CommandResult> {
+    const hash = hashCanonical(command);
+    const receipt = this.store.receipt(command.key);
+    if (receipt && (receipt.hash !== hash || receipt.principal !== principal))
+      return { outcome: 'denied', reason: 'idempotency-key-reused' };
+    if (receipt && receipt.result.reason !== 'anthropic-connection-check-pending')
+      return {
+        ...receipt.result,
+        ...(receipt.result.outcome === 'applied' ? { outcome: 'already-applied' as const } : {}),
+      };
+    if (command.expectedRevision !== 0) return { outcome: 'stale-revision', revision: 0 };
+    const directory = join(this.home, 'native', `connection-${command.key}`);
+    try {
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
+    } catch {
+      return { outcome: 'blocked', reason: 'anthropic-connection-storage-failed' };
+    }
+    const result = await this.nativeConnections().check(
+      {
+        key: command.key,
+        requestHash: hash,
+        profile: this.profileFor('anthropic-file-v1'),
+        directory,
+        repositoryRoot: this.home,
+      },
+      { spawn: this.options.nativeSpawn, schedule: this.options.schedule },
+    );
+    if (result.outcome === 'denied') return result;
+    // Metadata failures are terminal receipts. Task authority keeps its own fresh checks.
+    try {
+      this.store.transaction(() => {
+        const current = this.store.receipt(command.key);
+        if (current?.result.reason === 'anthropic-connection-check-pending')
+          this.finishMetadataReceipt(command.key, result);
+        else if (!current) this.store.saveReceipt(command.key, hash, principal, result);
+      });
+    } catch {
+      return { outcome: 'blocked', reason: 'anthropic-connection-storage-failed' };
+    }
+    return result;
+  }
+
   private observeUsageCommand(
     command: Extract<Command, { command: 'ObserveUsage' }>,
     principal: string,
   ): Promise<CommandResult> {
+    const pendingReason =
+      command.payload.family === 'openai' ? 'openai-usage-read-pending' : 'usage-read-pending';
     const prior = this.usageRead;
     const hash = hashCanonical(command);
     if (prior?.key === command.key)
@@ -2117,8 +2416,14 @@ export class Controller {
         : Promise.resolve({ outcome: 'denied', reason: 'idempotency-key-reused' });
     if (prior || this.store.receipt(command.key)) {
       let result = this.commitCommand(command, principal);
-      if (result.outcome === 'outcome-unknown' && result.reason === 'usage-read-pending') {
-        result = { outcome: 'outcome-unknown', reason: 'google-ownership-unknown' };
+      if (result.outcome === 'outcome-unknown' && result.reason === pendingReason) {
+        result = {
+          outcome: 'outcome-unknown',
+          reason:
+            command.payload.family === 'openai'
+              ? 'openai-metadata-ownership-unknown'
+              : 'google-ownership-unknown',
+        };
         this.store.transaction(() => this.finishMetadataReceipt(command.key, result));
       }
       return Promise.resolve(result);
@@ -2135,7 +2440,7 @@ export class Controller {
     this.usageRead = pending;
     try {
       const result = this.commitCommand(command, principal);
-      if (result.outcome !== 'outcome-unknown' || result.reason !== 'usage-read-pending')
+      if (result.outcome !== 'outcome-unknown' || result.reason !== pendingReason)
         completion.resolve(result);
     } catch (error) {
       if (this.usageRead === pending) this.usageRead = undefined;
@@ -2150,6 +2455,34 @@ export class Controller {
     command: Extract<Command, { command: 'ObserveUsage' }>,
     effects: (() => void)[],
   ): CommandResult {
+    if (this.usageRead && this.usageRead.key !== command.key)
+      return { outcome: 'blocked', reason: 'usage-reader-busy' };
+    if (command.payload.family === 'openai') {
+      const reader = this.openAiUsageReader();
+      if (!reader.available) return { outcome: 'blocked', reason: reader.reason };
+      if (this.openAiUsageRead)
+        return { outcome: 'blocked', reason: 'openai-metadata-ownership-pending' };
+      if (reader.readState === 'unknown')
+        return { outcome: 'outcome-unknown', reason: 'openai-metadata-ownership-unknown' };
+      if (reader.readState === 'intent' || reader.readState === 'owned')
+        return { outcome: 'blocked', reason: 'openai-metadata-ownership-pending' };
+      if (reader.lastAttemptAt && Date.parse(this.now()) - Date.parse(reader.lastAttemptAt) < 60000)
+        return {
+          outcome: 'blocked',
+          reason: 'usage-reader-cooldown',
+          next: `Refresh after ${new Date(Date.parse(reader.lastAttemptAt) + 60000).toISOString()}.`,
+        };
+      if (
+        this.store.intents().some((intent) => {
+          if (intent.state === 'stopped') return false;
+          const route = this.store.get<Route>('route', intent.route_id);
+          return !route || (route.family === 'openai' && !route.fake);
+        })
+      )
+        return { outcome: 'blocked', reason: 'openai-task-active' };
+      effects.push(() => void this.launchOpenAiUsage(command.key));
+      return { outcome: 'outcome-unknown', reason: 'openai-usage-read-pending' };
+    }
     const reader = this.store.googleUsageReader();
     const now = this.now();
     if (reader.last_attempt_at && Date.parse(now) - Date.parse(reader.last_attempt_at) < 60000)
@@ -2174,6 +2507,45 @@ export class Controller {
       () => void this.launchGoogleUsage(command.key, reader.authority_revision, resolution),
     );
     return { outcome: 'outcome-unknown', reason: 'usage-read-pending' };
+  }
+
+  private async launchOpenAiUsage(commandId: string) {
+    const runtime = this.usageRead;
+    if (!runtime || runtime.key !== commandId) return;
+    let result: CommandResult;
+    try {
+      const read = this.refreshOpenAiUsage('manual', commandId);
+      await read;
+      const state = this.openAiUsageState();
+      result =
+        !read || state?.commandId !== commandId
+          ? { outcome: 'blocked', reason: 'usage-read-unavailable' }
+          : state.state === 'unknown'
+            ? { outcome: 'outcome-unknown', reason: 'openai-metadata-ownership-unknown' }
+            : state.reason === 'observed'
+              ? {
+                  outcome: 'applied',
+                  data: {
+                    kind: 'usage',
+                    windows: this.store.list<Observation>('window').map((observation) =>
+                      deriveWindow(observation, {
+                        nowMs: Date.parse(this.now()),
+                        maxAgeMs: 300000,
+                      }),
+                    ),
+                  },
+                }
+              : { outcome: 'blocked', reason: state.reason ?? 'no-observations' };
+    } catch {
+      result = { outcome: 'outcome-unknown', reason: 'openai-metadata-ownership-unknown' };
+    }
+    try {
+      this.store.transaction(() => this.finishMetadataReceipt(commandId, result));
+    } catch {
+      result = { outcome: 'outcome-unknown', reason: 'openai-metadata-ownership-unknown' };
+    } finally {
+      runtime.resolve(result);
+    }
   }
 
   private async launchGoogleUsage(
@@ -2423,6 +2795,10 @@ export class Controller {
     for (const cancel of this.quotaRetries.values()) cancel();
     this.quotaRetries.clear();
     const native: Promise<unknown>[] = [];
+    const connectionClosing = this.connectionChecks?.close();
+    if (connectionClosing) native.push(connectionClosing);
+    const installClosing = this.googleInstallOperation?.close();
+    if (installClosing) native.push(installClosing);
     if (this.acpStart) {
       this.acpStart.aborted = true;
       native.push(this.acpStart.promise);
@@ -8462,6 +8838,8 @@ export class Controller {
           });
     if (this.store.receipt(command.key))
       return Promise.resolve(this.commitCommand(command, principal));
+    const installBlocker = this.googleInstallationBlocker();
+    if (installBlocker) return Promise.resolve(installBlocker);
     const deadline = performance.now() + 30000;
     const wallDeadline = Date.parse(this.now()) + 30000;
     const pending = {
@@ -15714,6 +16092,17 @@ export class Controller {
             usage.groups.length && usage.groups.every((group) => groupAbsent(group))
               ? 'quiescent'
               : 'unknown',
+        });
+      if (
+        usage?.commandId &&
+        this.store.receipt(usage.commandId)?.result.reason === 'openai-usage-read-pending'
+      )
+        this.finishMetadataReceipt(usage.commandId, {
+          outcome: this.openAiUsageState()?.state === 'quiescent' ? 'blocked' : 'outcome-unknown',
+          reason:
+            this.openAiUsageState()?.state === 'quiescent'
+              ? 'usage-read-interrupted'
+              : 'openai-metadata-ownership-unknown',
         });
       const local = this.localControl();
       if (local.operation)

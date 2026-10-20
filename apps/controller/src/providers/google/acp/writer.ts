@@ -233,7 +233,7 @@ export function startGoogleAcpSetup(options: AcpSetupOptions) {
   return startAcpProcess(
     {
       ...options,
-      timeoutMs: { initialize: 5000, authenticate: 120000, discover: 20000 }[options.operation],
+      timeoutMs: { initialize: 30000, authenticate: 120000, discover: 20000 }[options.operation],
     },
     async (connection) => {
       const proof = await initialize(connection, options.client);

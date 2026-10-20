@@ -448,6 +448,12 @@ export async function packageDesktop() {
     '#!/bin/sh\nset -eu\nroot=$(CDPATH= cd "$(dirname "$0")" && pwd -P)\nexec "$root/bin/desktop"\n',
     { mode: 0o755 },
   );
+  copy(join(checkout, 'scripts/package-upgrade.mjs'), join(stage, 'scripts/package-upgrade.mjs'));
+  writeFileSync(
+    join(stage, 'Upgrade Existing.command'),
+    '#!/bin/sh\nset -eu\nroot=$(CDPATH= cd "$(dirname "$0")" && pwd -P)\nexec "$root/app/runtime/bin/node" "$root/scripts/package-upgrade.mjs" --source "$root"\n',
+    { mode: 0o755 },
+  );
   const workspace = [
     'apps/controller',
     'apps/cli',
@@ -573,7 +579,7 @@ export async function packageDesktop() {
     );
   for (const filename of ['LICENSE', 'NOTICE'])
     notice('CrewKite', desktop.version, join(checkout, filename), filename);
-  for (const filename of ['LICENSE', 'NOTICE', 'docs/credits.md'])
+  for (const filename of ['LICENSE', 'NOTICE', 'README.md', 'docs'])
     copy(join(checkout, filename), join(stage, filename));
   notice('CrewKite source credits', revision, join(checkout, 'docs/credits.md'), 'credits.md');
   notice('Node', nodeVersion, join(nodeRoot, 'LICENSE'), 'node-LICENSE');
@@ -640,6 +646,8 @@ export async function packageDesktop() {
   }
   for (const entry of [
     'CrewKite.command',
+    'Upgrade Existing.command',
+    'scripts/package-upgrade.mjs',
     'Electron.app/Contents/MacOS/Electron',
     `app/${desktop.main}`,
     'app/out/preload/index.cjs',

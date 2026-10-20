@@ -147,6 +147,26 @@ test('native discovery returns metadata only after its owned process and descend
                 ? [...nativeDiscoveryArguments(directory).slice(0, -3), 'features', 'list']
                 : nativeDiscoveryArguments(directory),
             );
+            // A fresh native database blocks initialization on saved-history backfill.
+            // Keep the client's normal cache while retaining private logs and policy.
+            assert.equal(
+              args.some((argument) => argument.startsWith('sqlite_home=')),
+              false,
+            );
+            for (const setting of [
+              `log_dir=${JSON.stringify(resolve(directory, 'logs'))}`,
+              'approval_policy="on-request"',
+              'approvals_reviewer="user"',
+              'sandbox_mode="read-only"',
+              'web_search="disabled"',
+              'features.plugins=false',
+              'features.remote_plugin=false',
+              'features.apps=false',
+              'features.hooks=false',
+              'features.multi_agent=false',
+            ]) {
+              assert.ok(args.includes(setting), `Missing native policy setting: ${setting}`);
+            }
             assert.equal(options.detached, true);
             assert.equal(options.env.HOME, root);
             assert.equal(options.env.CODEX_HOME, sourceEnvironment.CODEX_HOME);

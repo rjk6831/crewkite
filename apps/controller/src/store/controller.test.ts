@@ -25,7 +25,7 @@ import { dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { type TestContext, test } from 'node:test';
 import { encodeFrame, FrameDecoder, ProtocolError } from '@crewkite/client';
-import { connectController, readControllerEndpoint } from '@crewkite/client/node';
+import { connectController, createCommandKey, readControllerEndpoint } from '@crewkite/client/node';
 import {
   type Approval,
   type Artifact,
@@ -89,6 +89,7 @@ import {
   groupAbsent,
   OwnedCommand,
 } from '../host/worker.ts';
+import { replacementFixture as nativeSubscriptionFixture } from '../providers/anthropic/replacement-fixture.ts';
 import { type AcpSetupProof, acpClientPin } from '../providers/google/acp/profile.ts';
 import { GoogleFlashQuotaModelId } from '../providers/google/native-writer.ts';
 import { localStructuredOutput } from '../providers/local/profile.ts';
@@ -413,6 +414,14 @@ test('task snapshots retain related evidence within the unchanged frame bound', 
   });
   try {
     const workspace = await client.workspaceState();
+    assert.deepEqual(workspace.nativeConnections, header.nativeConnections);
+    assert.equal(workspace.nativeConnections[0]?.state, 'unchecked');
+    assert.deepEqual(workspace.googleAcpInstall, header.googleAcpInstall);
+    assert.equal(workspace.googleAcpInstall?.state, 'idle');
+    assert.deepEqual(
+      workspace.usageReaders.map((reader) => reader.id),
+      ['google-usage-v1', 'openai-usage-v1'],
+    );
     const projectStatus = await client.projectPage({
       stamp: workspace.stamp,
       projectId: selected.projectId,
@@ -440,6 +449,9 @@ test('task snapshots retain related evidence within the unchanged frame bound', 
         new Set(snapshot.artifacts.map((artifact) => artifact.id)),
         new Set([records[0].artifact.id, records[0].log.id]),
       );
+      assert.deepEqual(snapshot.nativeConnections, workspace.nativeConnections);
+      assert.deepEqual(snapshot.googleAcpInstall, workspace.googleAcpInstall);
+      assert.deepEqual(snapshot.usageReaders, workspace.usageReaders);
       assert.deepEqual(snapshot.routes, before.routes);
       assert.deepEqual(snapshot.usage, before.usage);
       const message = {
@@ -484,6 +496,105 @@ test('task snapshots retain related evidence within the unchanged frame bound', 
   } finally {
     client.close();
     await server.close();
+  }
+});
+
+test('held metadata leaves stop replies reachable on the same authenticated socket', async (t) => {
+  const socketRoot = mkdtempSync(
+    join(realpathSync(checkOwner()?.stateRoot ?? tmpdir()), 'ck-meta-'),
+  );
+  const { controller, command, draft, fixtures } = await setup(t, {
+    home: join(socketRoot, 'home'),
+  });
+  t.after(() => rmSync(socketRoot, { recursive: true, force: true }));
+  for (const [kind, payload] of [
+    ['ObserveUsage', { family: 'google' }],
+    ['CheckNativeConnection', { family: 'anthropic', consent: 'explicit' }],
+    ['InstallGoogleAcp', { profileId: 'google-acp-v1', consent: 'explicit' }],
+    ['StopGoogleAcpInstall', { profileId: 'google-acp-v1', operationId: createCommandKey() }],
+    ['InitializeGoogleAcp', { profileId: 'google-acp-v1', consent: 'explicit' }],
+    [
+      'AuthenticateGoogleAcp',
+      {
+        profileId: 'google-acp-v1',
+        proofId: 'art_01ARZ3NDEKTSV4RRFFQ69G5FAV',
+        method: 'oauth-personal',
+        consent: 'explicit',
+      },
+    ],
+    [
+      'DiscoverGoogleAcp',
+      {
+        profileId: 'google-acp-v1',
+        proofId: 'art_01ARZ3NDEKTSV4RRFFQ69G5FAV',
+        consent: 'explicit',
+      },
+    ],
+    ['StopGoogleAcpSetup', { profileId: 'google-acp-v1', operationId: createCommandKey() }],
+  ] as const) {
+    const task = TaskSchema.parse(
+      (await controller.execute(command('CreateTask', draft.payload, 0), 'local-owner')).entity,
+    );
+    const run = RunSchema.parse(
+      (
+        await controller.execute(
+          command(
+            'PrepareRun',
+            {
+              taskId: task.id,
+              policy: { ...fixtures.policy, quality: 'quick', methods: [], effects: [] },
+              roles: quickRoles(fixtures),
+            },
+            task.revision,
+          ),
+          'local-owner',
+        )
+      ).entity,
+    );
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const execute = controller.execute.bind(controller);
+    controller.execute = async (input, principal) => {
+      const parsed = CommandSchema.parse(input);
+      if (parsed.command === kind) {
+        entered.resolve();
+        await release.promise;
+        return { outcome: 'blocked', reason: 'fixture-metadata-unavailable' };
+      }
+      return execute(input, principal);
+    };
+    const server = await serveController(controller);
+    const client = await connectController({
+      ...readControllerEndpoint(controller.home),
+      actor: { id: 'terminal', kind: 'cli' },
+    });
+    try {
+      const metadata = client.command(CommandSchema.parse(command(kind, payload, 0)));
+      await entered.promise;
+      const current = controller.store.get<Task>('task', task.id);
+      assert(current);
+      const stopped = await Promise.race([
+        client.command(
+          CommandSchema.parse(
+            command('StopRun', { taskId: task.id, runId: run.id }, current.revision),
+          ),
+        ),
+        new Promise<never>((_resolve, reject) => {
+          const timer = setTimeout(() => reject(Error('Stop waited for metadata release.')), 2000);
+          timer.unref();
+          t.after(() => clearTimeout(timer));
+        }),
+      ]);
+      assert.equal(stopped.outcome, 'applied');
+      assert.equal(controller.store.get<Task>('task', task.id)?.state, 'stopped');
+      release.resolve();
+      assert.equal((await metadata).reason, 'fixture-metadata-unavailable');
+    } finally {
+      release.resolve();
+      client.close();
+      await server.close();
+      controller.execute = execute;
+    }
   }
 });
 
@@ -842,7 +953,7 @@ test('a committed launch intent survives restart without another launch', async 
   assert.equal(controller.store.intents()[0].pid, null);
   assert.equal((await controller.execute(start, 'local-owner')).outcome, 'already-applied');
   assert.equal(launches, 1);
-  controller.close();
+  assert.equal(controller.close(), undefined);
   const recovered = new Controller({
     home: join(directory, 'home'),
     now: clock.now,
@@ -8067,7 +8178,26 @@ test('google quota authority survives retries and restart while sharing one oper
       groups: number[];
     };
   };
-  await openController.refreshUsage('start');
+  const manualRead = metadata.command('ObserveUsage', { family: 'openai' }, 0);
+  const firstRead = await openController.execute(manualRead, 'local-owner');
+  assert.equal(firstRead.outcome, 'applied');
+  assert.deepEqual(await openController.execute(manualRead, 'local-owner'), {
+    ...firstRead,
+    outcome: 'already-applied',
+  });
+  const exposedReader = () =>
+    openController.snapshot().usageReaders.find((reader) => reader.family === 'openai');
+  assert.equal(exposedReader()?.readReason, 'observed');
+  assert.equal(exposedReader()?.lastObservedAt, metadata.clock.now());
+  assert.equal(
+    (
+      await openController.execute(
+        metadata.command('ObserveUsage', { family: 'openai' }, 0),
+        'local-owner',
+      )
+    ).reason,
+    'usage-reader-cooldown',
+  );
   assert.equal(metadataLaunches, 1);
   const reader = openController
     .snapshot()
@@ -8115,6 +8245,8 @@ test('google quota authority survives retries and restart while sharing one oper
   metadata.clock.advance(270000);
   metadataMode = 'invalid';
   await openController.refreshUsage('interval');
+  assert.notEqual(exposedReader()?.readReason, 'observed');
+  assert.equal(exposedReader()?.lastObservedAt, valid[0].observedAt);
   assert.equal(metadataLaunches, 3);
   assert.equal(state().state, 'quiescent');
   assert.deepEqual(windows(), valid);
@@ -8324,7 +8456,34 @@ test('google quota authority survives retries and restart while sharing one oper
   assert.equal(state().state, 'quiescent', 'close joins physical cleanup before closing the store');
   assert.deepEqual(windows(), valid, 'a cancelled read cannot advance observed time');
   const savedState = state();
-  const saved = openController as unknown as { saveOpenAiUsage: (value: unknown) => void };
+  let saved = openController as unknown as { saveOpenAiUsage: (value: unknown) => void };
+  const interruptedRead = metadata.command('ObserveUsage', { family: 'openai' }, 0);
+  openController.store.transaction(() => {
+    saved.saveOpenAiUsage({ ...savedState, commandId: interruptedRead.key, state: 'quiescent' });
+    openController.store.saveReceipt(
+      interruptedRead.key,
+      hashCanonical(interruptedRead),
+      'local-owner',
+      {
+        outcome: 'outcome-unknown',
+        reason: 'openai-usage-read-pending',
+      },
+    );
+  });
+  await openController.close();
+  openController = new Controller({
+    ...metadataOptions,
+    home: join(metadata.directory, 'home'),
+    now: metadata.clock.now,
+    id: metadata.id,
+  });
+  saved = openController as unknown as { saveOpenAiUsage: (value: unknown) => void };
+  const recoveredRead = await openController.execute(interruptedRead, 'local-owner');
+  assert.equal(recoveredRead.outcome, 'blocked');
+  assert.equal(recoveredRead.reason, 'usage-read-interrupted');
+  assert.deepEqual(windows(), valid);
+  assert.equal(metadataLaunches, finalLaunches, 'closed manual metadata recovery never replays');
+
   const holder = spawnProcess(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], {
     detached: true,
     stdio: 'ignore',
@@ -8658,6 +8817,10 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       const retry = controller.execute(input, 'local-owner');
       assert.deepEqual(await first, await retry);
       assert.equal((await first).outcome, 'applied', canonicalJson(await first));
+      if (name === 'AuthenticateGoogleAcp') {
+        assert.equal(controller.store.googleAcpSetup().state, 'discovery-required');
+        assert.equal(controller.store.googleAcpSetup().auth.status, 'authenticated');
+      }
       assert.equal((await controller.execute(input, 'local-owner')).outcome, 'already-applied');
     }
     assert.equal(controller.store.googleAcpSetup().state, 'ready');
@@ -11095,4 +11258,254 @@ test('planning turns keep task authority and allowance across execution', async 
     assert.equal(createHash('sha256').update(readFileSync(path)).digest('hex'), sentinel.hash);
     assert.equal(lstatSync(path).mode & 0o777, sentinel.mode);
   }
+});
+
+test('native connection checks retain ownership without blocking unrelated tasks', async (t) => {
+  const { AnthropicNativeProfileSchema } = await import('@crewkite/contracts');
+  let launches = 0;
+  let child: import('node:child_process').ChildProcessWithoutNullStreams | undefined;
+  const ready = Promise.withResolvers<void>();
+  const base = unavailableNativeProfile();
+  const profile = {
+    ...base,
+    facts: AnthropicNativeProfileSchema.parse({
+      ...base.facts,
+      id: 'anthropic-file-v1',
+      family: 'anthropic',
+      accountClass: 'unknown',
+      serviceTier: 'unknown',
+      creditPolicies: ['ordinary'],
+      effort: 'medium',
+      effectiveEffort: 'unknown',
+      billingBasis: 'requires-user-attestation',
+      maximumFileBytes: 65536,
+      available: true,
+      reason: 'qualification-pending',
+    }),
+    client: { executable: process.execPath, sha256: fixtureClientHash, version: process.version },
+    environment: { ...process.env },
+    locationHash: '2'.repeat(64),
+  } satisfies NativeProfileResolution;
+  const options: Partial<ControllerOptions> = {
+    nativeProfiles: () => [profile],
+    nativeSpawn: (_executable, args, spawnOptions) => {
+      assert.deepEqual(args, ['auth', 'status']);
+      launches++;
+      const ownedChild = spawn(
+        process.execPath,
+        [
+          '-e',
+          `
+        const {MessageChannel}=require('node:worker_threads');
+        const channel=new MessageChannel();channel.port1.on('message',()=>{});
+        process.on('SIGUSR1', () => {
+          ${nativeSubscriptionFixture(args, { content: '' })}
+          setImmediate(()=>process.exit(0));
+        });
+        process.stderr.write('ready');
+        process.stdin.resume();
+      `,
+        ],
+        spawnOptions,
+      );
+      child = ownedChild;
+      ownedChild.stderr.once('data', () => ready.resolve());
+      return ownedChild;
+    },
+  };
+  let controller: Controller;
+  const context = await setup(t, options, () => controller.close());
+  controller = context.controller;
+  const input = context.command(
+    'CheckNativeConnection',
+    { family: 'anthropic', consent: 'explicit' },
+    0,
+  );
+  const pending = controller.execute(input, 'local-owner');
+  await ready.promise;
+  assert.equal(controller.snapshot().nativeConnections[0]?.state, 'checking');
+  assert.equal(
+    (await controller.execute({ ...context.draft, key: input.key }, 'local-owner')).outcome,
+    'denied',
+  );
+  assert.equal((await controller.execute(context.draft, 'local-owner')).outcome, 'applied');
+  assert.equal(
+    (
+      await controller.execute(
+        context.command('CheckNativeConnection', input.payload, 0),
+        'local-owner',
+      )
+    ).outcome,
+    'blocked',
+  );
+  assert.ok(child);
+  child.kill('SIGUSR1');
+  assert.equal((await pending).outcome, 'applied');
+  const status = controller.snapshot().nativeConnections[0];
+  assert.ok(status);
+  assert.equal(status.state, 'signed-in');
+  assert.equal(status.billing, 'unknown');
+  assert.equal(status.quota, 'unknown');
+  assert.equal(status.qualified, false);
+  assert.equal(JSON.stringify(status).includes('discard'), false);
+  assert.equal((await controller.execute(input, 'local-owner')).outcome, 'already-applied');
+  assert.equal(launches, 1);
+  const owned = controller.store.db
+    .prepare("SELECT command_key FROM receipts WHERE command_key LIKE 'native-connection:%:owned'")
+    .all();
+  assert.equal(owned.length, 1);
+  controller.store.db
+    .prepare('DELETE FROM receipts WHERE command_key=? OR command_key=?')
+    .run(input.key, `native-connection:${input.key}:complete`);
+  await controller.close();
+  controller = new Controller({
+    ...options,
+    home: join(context.directory, 'home'),
+    now: context.clock.now,
+    id: context.id,
+  });
+  const recoveredSnapshot = await controller.execute(
+    context.command('GetSnapshot', {}),
+    'local-owner',
+  );
+  assert.equal(recoveredSnapshot.data?.kind, 'snapshot');
+  if (recoveredSnapshot.data?.kind !== 'snapshot') throw Error('Expected recovered snapshot.');
+  assert.equal(recoveredSnapshot.data.snapshot.nativeConnections[0]?.state, 'blocked');
+  assert.equal(
+    (await controller.execute(input, 'local-owner')).reason,
+    'anthropic-connection-interrupted',
+  );
+  assert.equal(launches, 1);
+  // Retain only the pre-spawn intent, as a crash can leave it without closure proof.
+  controller.store.db
+    .prepare(
+      "DELETE FROM receipts WHERE command_key=? OR (command_key LIKE 'native-connection:%' AND command_key NOT LIKE '%:intent')",
+    )
+    .run(input.key);
+  await controller.close();
+  controller = new Controller({
+    ...options,
+    home: join(context.directory, 'home'),
+    now: context.clock.now,
+    id: context.id,
+  });
+  assert.equal(controller.snapshot().nativeConnections[0]?.state, 'unknown');
+  assert.equal(
+    (
+      await controller.execute(
+        context.command('CheckNativeConnection', input.payload, 0),
+        'local-owner',
+      )
+    ).outcome,
+    'blocked',
+  );
+  assert.equal(launches, 1);
+  assert.equal(
+    (
+      await controller.execute(
+        context.command(
+          'CreateTask',
+          { ...(context.draft.payload as Record<string, unknown>), title: 'Independent work' },
+          0,
+        ),
+        'local-owner',
+      )
+    ).outcome,
+    'applied',
+  );
+});
+
+test('official installation can stop and recover without blocking project work', async (t) => {
+  let started = Promise.withResolvers<void>();
+  let downloads = 0;
+  const options: Partial<ControllerOptions> = {
+    googleUsageClient: () => ({ available: false, reason: 'client-unavailable' }),
+    googleAcpInstall: {
+      fetch: (async (_url: unknown, init?: RequestInit) => {
+        downloads++;
+        assert.ok(init?.signal);
+        started.resolve();
+        await new Promise<void>((_resolve, reject) => {
+          if (init.signal?.aborted) reject(Error('cancelled'));
+          else
+            init.signal?.addEventListener('abort', () => reject(Error('cancelled')), {
+              once: true,
+            });
+        });
+        throw Error('No download result was expected.');
+      }) as typeof fetch,
+    },
+  };
+  let controller: Controller;
+  const context = await setup(t, options, () => controller.close());
+  controller = context.controller;
+  const input = context.command(
+    'InstallGoogleAcp',
+    { profileId: 'google-acp-v1', consent: 'explicit' },
+    0,
+  );
+  const pending = controller.execute(input, 'local-owner');
+  await started.promise;
+  assert.equal(controller.snapshot().googleAcpInstall?.state, 'installing');
+  assert.equal((await controller.execute(context.draft, 'local-owner')).outcome, 'applied');
+  assert.equal(
+    (await controller.execute({ ...context.draft, key: input.key }, 'local-owner')).outcome,
+    'denied',
+  );
+  assert.equal(
+    (
+      await controller.execute(
+        context.command(
+          'InitializeGoogleAcp',
+          { profileId: 'google-acp-v1', consent: 'explicit' },
+          0,
+        ),
+        'local-owner',
+      )
+    ).reason,
+    'google-install-active',
+  );
+  const stop = context.command(
+    'StopGoogleAcpInstall',
+    { profileId: 'google-acp-v1', operationId: input.key },
+    0,
+  );
+  const result = await controller.execute(stop, 'local-owner');
+  assert.equal(result.data?.kind, 'google-acp-install');
+  assert.equal(result.reason, 'cancelled');
+  await pending;
+  assert.equal(controller.snapshot().googleAcpInstall?.state, 'blocked');
+  assert.equal((await controller.execute(input, 'local-owner')).reason, 'cancelled');
+  assert.equal(downloads, 1);
+  controller.store.db
+    .prepare('DELETE FROM receipts WHERE command_key=? OR (command_key LIKE ? AND command_key<>?)')
+    .run(input.key, `google-acp-install:${input.key}:%`, `google-acp-install:${input.key}:0`);
+  await controller.close();
+  const reopen = () =>
+    new Controller({
+      ...options,
+      home: join(context.directory, 'home'),
+      now: context.clock.now,
+      id: context.id,
+    });
+  controller = reopen();
+  const snapshot = await controller.execute(context.command('GetSnapshot', {}), 'local-owner');
+  if (snapshot.data?.kind !== 'snapshot') throw Error('Expected installation snapshot.');
+  assert.equal(snapshot.data.snapshot.googleAcpInstall?.reason, 'google-install-interrupted');
+  assert.equal(
+    (await controller.execute(input, 'local-owner')).reason,
+    'google-install-interrupted',
+  );
+  assert.equal(downloads, 1);
+  started = Promise.withResolvers<void>();
+  const fresh = controller.execute(
+    context.command('InstallGoogleAcp', input.payload, 0),
+    'local-owner',
+  );
+  await started.promise;
+  await controller.close();
+  assert.equal((await fresh).reason, 'cancelled');
+  controller = reopen();
+  assert.equal(controller.snapshot().googleAcpInstall?.state, 'blocked');
+  assert.equal(downloads, 2);
 });

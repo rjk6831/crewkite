@@ -317,6 +317,8 @@ export function createPreviewSource(): DesktopSource {
     usageReaders: state.usageReaders,
     nativeProfiles: state.nativeProfiles,
     googleAcpSetup: state.googleAcpSetup,
+    googleAcpInstall: state.googleAcpInstall,
+    nativeConnections: state.nativeConnections,
     localSetup: state.localSetup,
   });
   const projectPage = async (input: Omit<ProjectPageRequest, 'limit'> & { limit?: number }) => ({
