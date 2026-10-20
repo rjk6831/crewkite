@@ -39,6 +39,9 @@ export const NativeTargetPathSchema = RelativeSourcePathSchema.refine(
   (value) => value.isWellFormed() && !/\p{Cc}/u.test(value),
   'A replacement needs a relative path without control characters.',
 );
+export const NativeTargetContextLinesSchema = z
+  .strictObject({ start: RevisionSchema.min(1), end: RevisionSchema.min(1) })
+  .refine(({ start, end }) => end >= start, 'Context lines need an inclusive ordered range.');
 export const ProjectNodeTestPathSchema = NativeTargetPathSchema.refine(
   (path) => !path.startsWith('-') && !/[?*[\]{}]/.test(path),
   'Node tests need exact relative file paths without options or globs.',
@@ -656,6 +659,7 @@ export const NativeRunSchema = z
       })
       .optional(),
     acp: GoogleAcpSelectionSchema.optional(),
+    contextLines: NativeTargetContextLinesSchema.optional(),
     localModel: LocalModelBindingSchema.optional(),
   })
   .refine(
@@ -670,6 +674,7 @@ export const NativeRunSchema = z
           !run.repository &&
           !run.execution
         : !run.acp &&
+          !run.contextLines &&
           !(run.billingAttestation && 'quotaAccountConfirmed' in run.billingAttestation),
     'An ACP run needs its selected proof, target and separate account attestation.',
   )
@@ -1298,6 +1303,7 @@ export const NativePreparationPayloadSchema = z.union([
     billingAttestation: GoogleAcpBillingAttestationSchema,
     permissionMode: z.literal('request-review'),
     maximumTaskMs: z.union([z.literal(300000), z.literal(600000)]).optional(),
+    contextLines: NativeTargetContextLinesSchema.optional(),
     targetPath: NativeTargetPathSchema,
   }),
   z.strictObject({

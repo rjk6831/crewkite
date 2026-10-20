@@ -2614,6 +2614,37 @@ test('process boundaries reject unknown fields and invalid command identity', ()
   };
   assert.deepEqual(CommandSchema.parse(acpPreparation), acpPreparation);
   assert.equal(Object.hasOwn(CommandSchema.parse(acpPreparation).payload, 'maximumTaskMs'), false);
+  assert.equal(Object.hasOwn(CommandSchema.parse(acpPreparation).payload, 'contextLines'), false);
+  for (const contextLines of [
+    { start: 1, end: 1 },
+    { start: 2, end: 20 },
+  ]) {
+    const request = { ...acpPreparation, payload: { ...acpPreparation.payload, contextLines } };
+    assert.deepEqual(CommandSchema.parse(request), request);
+  }
+  for (const contextLines of [
+    { start: 0, end: 1 },
+    { start: 2, end: 1 },
+    { start: 1.5, end: 2 },
+    { start: 1, end: Number.MAX_SAFE_INTEGER + 1 },
+    { start: 1, end: 2, extra: true },
+  ])
+    assert.equal(
+      CommandSchema.safeParse({
+        ...acpPreparation,
+        payload: { ...acpPreparation.payload, contextLines },
+      }).success,
+      false,
+    );
+  for (const request of [filePreparation, localPreparation])
+    assert.equal(
+      CommandSchema.safeParse({
+        ...request,
+        payload: { ...request.payload, contextLines: { start: 1, end: 1 } },
+      }).success,
+      false,
+    );
+
   for (const maximumTaskMs of [300000, 600000]) {
     const request = { ...acpPreparation, payload: { ...acpPreparation.payload, maximumTaskMs } };
     assert.deepEqual(CommandSchema.parse(request), request);

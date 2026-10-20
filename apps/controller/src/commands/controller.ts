@@ -93,6 +93,7 @@ import {
   type NativeReviewJob,
   NativeReviewJobSchema,
   NativeRunSchema,
+  NativeTargetContextLinesSchema,
   type Observation,
   ObservationSchema,
   type Policy,
@@ -214,6 +215,7 @@ import {
   type AcpPermissionProposal,
   type AcpWriterCompletion,
   acpPermissionAfterHash,
+  googleAcpTargetContext,
   googleAcpWriterPlan,
   startGoogleAcpSetup,
   startGoogleAcpWriter,
@@ -395,6 +397,7 @@ const NativeRepositoryAppointmentSchema = NativeFileAppointmentSchema.omit({
 const NativeAcpAppointmentSchema = NativeFileAppointmentSchema.extend({
   profileId: z.literal('google-acp-v1'),
   maximumTaskMs: z.number().int().min(2001).max(600000),
+  contextLines: NativeTargetContextLinesSchema.optional(),
   client: AcpClientPinSchema.extend({
     executable: z.string().max(4096).refine(isAbsolute),
     harnessSha256: HashSchema,
@@ -7376,7 +7379,14 @@ export class Controller {
               ? { billingAttestation: appointment.billingAttestation }
               : {}),
             ...(appointment.permissionMode ? { permissionMode: appointment.permissionMode } : {}),
-            ...('acp' in appointment ? { acp: appointment.acp } : {}),
+            ...('acp' in appointment
+              ? {
+                  acp: appointment.acp,
+                  ...(appointment.contextLines === undefined
+                    ? {}
+                    : { contextLines: appointment.contextLines }),
+                }
+              : {}),
             ...('repository' in appointment
               ? { repository: appointment.repository, execution: appointment.execution }
               : {
@@ -8076,6 +8086,8 @@ export class Controller {
         new TextDecoder('utf-8', { fatal: true }).decode(target.content).includes('\0')
       )
         throw Error('ACP target is unavailable.');
+      if (input.contextLines)
+        googleAcpTargetContext(target.content.toString('utf8'), input.contextLines);
       const policy = PolicySchema.parse(input.policy);
       const requestedTaskMs = input.maximumTaskMs ?? 300000;
       const maximumTaskMs =
@@ -8120,6 +8132,7 @@ export class Controller {
         policy,
         billingAttestation: input.billingAttestation,
         ...(input.maximumTaskMs === undefined ? {} : { maximumTaskMs }),
+        ...(input.contextLines === undefined ? {} : { contextLines: input.contextLines }),
       });
       const expiresAt =
         input.consent === 'saved'
@@ -8168,6 +8181,7 @@ export class Controller {
         policy,
         expiresAt,
         maximumTaskMs,
+        ...(input.contextLines === undefined ? {} : { contextLines: input.contextLines }),
         maximumSubmissions: 1,
       });
       const run = RunSchema.parse({
@@ -13298,6 +13312,9 @@ export class Controller {
               ...(this.store.get<Task>('task', run.taskId) as Task).criteria,
             ],
             selection: appointment.acp,
+            ...(appointment.contextLines === undefined
+              ? {}
+              : { contextLines: appointment.contextLines }),
             proof: appointment.proof,
             client: appointment.client,
             ...this.options.googleAcp,
@@ -13749,6 +13766,9 @@ export class Controller {
         target: appointment.target,
         criteria,
         selection: appointment.acp,
+        ...(appointment.contextLines === undefined
+          ? {}
+          : { contextLines: appointment.contextLines }),
         proof: appointment.proof,
         ...this.options.googleAcp,
       });

@@ -8411,6 +8411,7 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       target: ReturnType<typeof TaskSchema.parse>,
       maximumTaskMs?: 300000 | 600000,
       minutes = 5,
+      contextLines?: { start: number; end: number },
     ) =>
       command(
         'PrepareNativeRun',
@@ -8418,6 +8419,7 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
           taskId: target.id,
           profileId: 'google-acp-v1',
           ...(maximumTaskMs === undefined ? {} : { maximumTaskMs }),
+          ...(contextLines === undefined ? {} : { contextLines }),
           proofId: controller.store.googleAcpSetup().proofId,
           modelId: 'fixture-model',
           thoughtLevelId: 'fixture-low',
@@ -8481,6 +8483,79 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
             saved.maximumTaskMs,
           );
       }
+      const contextTask = TaskSchema.parse(
+        (
+          await controller.execute(
+            command(
+              'CreateTask',
+              {
+                projectId: task.projectId,
+                title: 'Bind an initial target context window',
+                outcome: task.outcome,
+                criteria: task.criteria,
+              },
+              0,
+            ),
+            'local-owner',
+          )
+        ).entity,
+      );
+      const beforeContext = controller.snapshot();
+      assert.equal(
+        (
+          await controller.execute(
+            prepareAcpTask(contextTask, undefined, 5, { start: 1, end: 99999 }),
+            'local-owner',
+          )
+        ).outcome,
+        'blocked',
+      );
+      assert.deepEqual(controller.snapshot(), beforeContext);
+      const windowCommand = prepareAcpTask(contextTask, undefined, 5, { start: 1, end: 1 });
+      const noConsent = command(
+        'PrepareNativeRun',
+        {
+          ...(windowCommand.payload as Record<string, unknown>),
+          consent: 'saved',
+        },
+        contextTask.revision,
+      );
+      assert.equal((await controller.execute(noConsent, 'local-owner')).outcome, 'blocked');
+      assert.deepEqual(controller.snapshot(), beforeContext);
+      const contextResult = await controller.execute(windowCommand, 'local-owner');
+      assert.equal(contextResult.outcome, 'applied');
+      const contextRun = RunSchema.parse(contextResult.entity);
+      assert.deepEqual(
+        controller.snapshot().nativeRuns.find((value) => value.runId === contextRun.id)
+          ?.contextLines,
+        { start: 1, end: 1 },
+      );
+      const currentContextTask = controller
+        .snapshot()
+        .tasks.find((value) => value.id === contextTask.id) as typeof contextTask;
+      const beforeChangedContext = controller.snapshot();
+      const changedWindow = prepareAcpTask(currentContextTask, undefined, 5);
+      assert.equal(
+        (
+          await controller.execute(
+            {
+              ...changedWindow,
+              payload: { ...(changedWindow.payload as Record<string, unknown>), consent: 'saved' },
+            },
+            'local-owner',
+          )
+        ).outcome,
+        'blocked',
+      );
+      assert.deepEqual(controller.snapshot(), beforeChangedContext);
+      for (const saved of frozen)
+        assert.equal(
+          Object.hasOwn(
+            controller.snapshot().nativeRuns.find((value) => value.runId === saved.runId) ?? {},
+            'contextLines',
+          ),
+          false,
+        );
       assert.equal(controller.store.intents().length, 0);
       assert.equal(acpLaunches, setupLaunches);
       const planningTask = TaskSchema.parse(

@@ -33,6 +33,7 @@ import {
   LocalModelSelectionSchema,
   MAX_FRAME_BYTES,
   NativeHandoffTargetsSchema,
+  NativeTargetContextLinesSchema,
   PolicySchema,
   PrepareCombinedRunPayloadSchema,
   ProjectNodeTestFilesSchema,
@@ -71,7 +72,7 @@ const help = `Usage: crewkite project add <path> [--json] [--home path]
        crewkite native setup <show|initialize|authenticate|discover|stop> --family google [--consent] [--json] [--home path]
        crewkite usage show [--json] [--home path]
        crewkite usage refresh --family google [--json] [--home path]
-       crewkite task prepare-native <task-id> <profile-id> <path> --policy file [--native-trust --source-consent] [--existing-credits] [--confirm-subscription-only] [--maximum-task-ms 300000|600000] [--permission-mode mode] [--handoff-target profile[:existing-credits] ...]
+       crewkite task prepare-native <task-id> <profile-id> <path> --policy file [--native-trust --source-consent] [--existing-credits] [--confirm-subscription-only] [--maximum-task-ms 300000|600000] [--context-lines START:END] [--permission-mode mode] [--handoff-target profile[:existing-credits] ...]
        crewkite task prepare-handoff <task-id> <profile-id> --native-trust --source-consent [--existing-credits] [--confirm-subscription-only] [--permission-mode mode]
        crewkite task start-handoff <task-id> [--json] [--home path]
        crewkite task prepare-repository <task-id> <profile-id> --policy file [--native-trust --source-consent] [--existing-credits]
@@ -147,6 +148,7 @@ export async function runCli(
         'confirm-subscription-only': { type: 'boolean' },
         'permission-mode': { type: 'string' },
         'maximum-task-ms': { type: 'string' },
+        'context-lines': { type: 'string', multiple: true },
         'handoff-target': { type: 'string', multiple: true },
         output: { type: 'string' },
         endpoint: { type: 'string' },
@@ -463,6 +465,8 @@ export async function runCli(
     const evaluating = area === 'task' && action === 'prepare-evaluation';
     if (values['confirm-subscription-only'] && !preparingFile && !preparingHandoff)
       throw new Error('Subscription confirmation requires task prepare-native or prepare-handoff.');
+    if (values['context-lines'] !== undefined && !preparingFile)
+      throw new Error('Target context lines require task prepare-native.');
     if (values['maximum-task-ms'] !== undefined && !preparingFile)
       throw new Error('The task deadline option requires task prepare-native.');
     if (values['permission-mode'] !== undefined && !preparingFile && !preparingHandoff)
@@ -1272,6 +1276,8 @@ export async function runCli(
     }
     if (action === 'prepare-native') {
       const profile = snapshot.nativeProfiles.find((profile) => profile.id === extra[0]);
+      if (values['context-lines'] !== undefined && profile?.id !== 'google-acp-v1')
+        throw new Error('Target context lines require the Google ACP profile.');
       if (values['maximum-task-ms'] !== undefined && profile?.id !== 'google-acp-v1')
         throw new Error('The task deadline option requires the Google ACP profile.');
       if (profile?.family === 'local') {
@@ -1315,6 +1321,18 @@ export async function runCli(
       )
         throw new Error('These configuration choices require the Google ACP profile.');
       if (acp) {
+        const contextValues = values['context-lines'];
+        if (
+          contextValues &&
+          (contextValues.length !== 1 || !/^[1-9][0-9]*:[1-9][0-9]*$/.test(contextValues[0] ?? ''))
+        )
+          throw new Error('Choose one inclusive target line window as START:END.');
+        const contextLines = contextValues
+          ? NativeTargetContextLinesSchema.parse({
+              start: Number(contextValues[0]?.split(':')[0]),
+              end: Number(contextValues[0]?.split(':')[1]),
+            })
+          : undefined;
         const maximumTaskMs = values['maximum-task-ms'];
         if (maximumTaskMs !== undefined && !['300000', '600000'].includes(maximumTaskMs))
           throw new Error('Choose a Google task deadline of 300000 or 600000 milliseconds.');
@@ -1388,6 +1406,7 @@ export async function runCli(
               consent: explicit ? 'explicit' : 'saved',
               proofId: setup.proofId,
               ...(maximumTaskMs === undefined ? {} : { maximumTaskMs: Number(maximumTaskMs) }),
+              ...(contextLines === undefined ? {} : { contextLines }),
               modelId,
               thoughtLevelId,
               billingAttestation: attestation,

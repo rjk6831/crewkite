@@ -574,6 +574,10 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     'prepare',
     'deadline-five',
     'deadline-ten',
+    'context-lines',
+    'context-reversed',
+    'context-unsafe',
+    'context-duplicate',
     'deadline-invalid',
     'saved',
     'model',
@@ -1968,6 +1972,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     ['--confirm-subscription-only'],
     ['--permission-mode', 'strict'],
     ['--maximum-task-ms', '600000'],
+    ['--context-lines', '1:1'],
     ['--model-id', 'override'],
     ['--thought-level-id', 'override'],
     ['--confirm-quota-account'],
@@ -2933,6 +2938,19 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
                 name === 'deadline-five' ? '300000' : name === 'deadline-ten' ? '600000' : '600001',
               ]
             : []),
+          ...(name.startsWith('context-')
+            ? [
+                '--context-lines',
+                name === 'context-lines'
+                  ? '1:2'
+                  : name === 'context-reversed'
+                    ? '2:1'
+                    : name === 'context-unsafe'
+                      ? '1:9007199254740992'
+                      : '1:2',
+                ...(name === 'context-duplicate' ? ['--context-lines', '1:2'] : []),
+              ]
+            : []),
           ...(name === 'credits' ? ['--existing-credits'] : []),
           ...(name === 'mode' ? ['--permission-mode', 'always-proceed'] : []),
           ...(name === 'handoff' ? ['--handoff-target', profile.id] : []),
@@ -2956,6 +2974,9 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         'autopilot',
         'import-consent-missing',
         'deadline-invalid',
+        'context-reversed',
+        'context-unsafe',
+        'context-duplicate',
       ].some((name) => scenario === `acp-${name}`);
       assert.equal(result.code, invalid ? 1 : 0, result.errors);
       if (invalid) {
@@ -2972,6 +2993,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         scenario === 'acp-prepare' ||
         scenario === 'acp-deadline-five' ||
         scenario === 'acp-deadline-ten' ||
+        scenario === 'acp-context-lines' ||
         scenario === 'acp-saved' ||
         scenario === 'acp-model-only'
       ) {
@@ -2997,6 +3019,9 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
             scenario === 'acp-deadline-five' ? 300000 : 600000,
           );
         else assert.equal(Object.hasOwn(data.command.payload, 'maximumTaskMs'), false);
+        if (scenario === 'acp-context-lines')
+          assert.deepEqual(data.command.payload.contextLines, { start: 1, end: 2 });
+        else assert.equal(Object.hasOwn(data.command.payload, 'contextLines'), false);
         assert.equal(data.command.payload.consent, scenario === 'acp-saved' ? 'saved' : 'explicit');
       } else {
         assert.equal(data.command.expectedRevision, scenario === 'acp-initialize' ? 0 : 7);
