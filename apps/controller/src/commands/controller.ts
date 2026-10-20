@@ -1073,6 +1073,7 @@ export class Controller {
         }
       });
       this.artifacts = new ArtifactFiles(join(this.home, 'artifacts'));
+      this.artifacts.recoverIncoming();
       this.evidence = new CandidateEvidence({
         home: this.home,
         artifacts: this.artifacts,

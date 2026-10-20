@@ -8,6 +8,7 @@ import {
   linkSync,
   lstatSync,
   mkdirSync,
+  opendirSync,
   openSync,
   readFileSync,
   unlinkSync,
@@ -39,6 +40,95 @@ export class ArtifactFiles {
     const state = lstatSync(directory);
     if (!state.isDirectory() || state.isSymbolicLink())
       throw new Error('Invalid artifact directory.');
+  }
+
+  // The caller must hold the controller's exclusive writer lease before recovering incoming names.
+  recoverIncoming(): void {
+    const directory = openSync(
+      this.directory,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    let entries: ReturnType<typeof opendirSync> | undefined;
+    let removed = false;
+    const owner = process.getuid?.();
+    const sameEntry = (before: BigIntStats, after: BigIntStats) =>
+      before.dev === after.dev &&
+      before.ino === after.ino &&
+      before.mode === after.mode &&
+      before.uid === after.uid &&
+      before.nlink === after.nlink &&
+      before.size === after.size &&
+      before.mtimeNs === after.mtimeNs &&
+      before.ctimeNs === after.ctimeNs;
+    try {
+      const root = fstatSync(directory, { bigint: true });
+      const currentDirectory = () => {
+        const current = lstatSync(this.directory, { bigint: true });
+        if (
+          !current.isDirectory() ||
+          current.dev !== root.dev ||
+          current.ino !== root.ino ||
+          current.uid !== root.uid ||
+          current.mode !== root.mode
+        )
+          throw Error('The artifact directory changed during recovery.');
+      };
+      if (
+        owner === undefined ||
+        !root.isDirectory() ||
+        root.uid !== BigInt(owner) ||
+        (root.mode & 0o077n) !== 0n
+      )
+        throw Error('Artifact recovery requires an owned private directory.');
+      currentDirectory();
+      entries = opendirSync(this.directory);
+      for (;;) {
+        const entry = entries.readSync();
+        if (!entry) break;
+        if (
+          !/^\.incoming-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+            entry.name,
+          )
+        )
+          continue;
+        currentDirectory();
+        const path = join(this.directory, entry.name);
+        const before = lstatSync(path, { bigint: true });
+        if (
+          !before.isFile() ||
+          before.uid !== BigInt(owner) ||
+          (before.mode & 0o7777n) !== 0o600n ||
+          (before.nlink !== 1n && before.nlink !== 2n)
+        )
+          throw Error('An incoming artifact has an unknown ownership or file identity.');
+        const file = openSync(
+          path,
+          constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+        );
+        try {
+          if (
+            !sameEntry(before, fstatSync(file, { bigint: true })) ||
+            !sameEntry(before, lstatSync(path, { bigint: true }))
+          )
+            throw Error('An incoming artifact changed during recovery.');
+          currentDirectory();
+          unlinkSync(path);
+          removed = true;
+        } finally {
+          closeSync(file);
+        }
+      }
+    } finally {
+      try {
+        if (removed) fsyncSync(directory);
+      } finally {
+        try {
+          entries?.closeSync();
+        } finally {
+          closeSync(directory);
+        }
+      }
+    }
   }
 
   publish(content: Buffer): { hash: string; bytes: number } {

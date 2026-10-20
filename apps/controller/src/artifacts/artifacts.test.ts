@@ -1,7 +1,18 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  existsSync,
+  linkSync,
+  lstatSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -89,6 +100,47 @@ test('streamed artifacts retain complete identities through bounded ranges and f
     new ArtifactFiles(directory).read(previous.hash).toString(),
     'Keep the previous complete artifact.',
   );
+  const linkedContent = Buffer.from('The hash name was linked before the writer exited.');
+  const linkedHash = createHash('sha256').update(linkedContent).digest('hex');
+  const incoming = join(directory, `.incoming-${randomUUID()}`);
+  writeFileSync(incoming, linkedContent, { mode: 0o600 });
+  linkSync(incoming, join(directory, linkedHash));
+  const reader = new ArtifactFiles(directory);
+  assert.equal(lstatSync(join(directory, linkedHash)).nlink, 2);
+  await assert.rejects(reader.verify(linkedHash), /safe regular/);
+  assert.equal(existsSync(incoming), true, 'constructing a reader cannot clean an active writer');
+  const foreign = join(directory, '.incoming-retained-foreign-name');
+  writeFileSync(foreign, 'Keep this unrelated entry.', { mode: 0o600 });
+  // No writer remains after the synthetic crash. Controller startup holds its exclusive lease.
+  reader.recoverIncoming();
+  assert.equal(existsSync(incoming), false);
+  assert.equal(lstatSync(join(directory, linkedHash)).nlink, 1);
+  assert.equal(
+    readdirSync(directory).filter((name) => /^\.incoming-[0-9a-f-]{36}$/.test(name)).length,
+    0,
+  );
+  assert.deepEqual(await reader.verify(linkedHash), {
+    hash: linkedHash,
+    bytes: linkedContent.length,
+  });
+  assert.deepEqual(
+    await reader.publishStream(
+      (async function* () {
+        yield linkedContent;
+      })(),
+    ),
+    {
+      hash: linkedHash,
+      bytes: linkedContent.length,
+    },
+  );
+  assert.equal(readFileSync(foreign, 'utf8'), 'Keep this unrelated entry.');
+  const unknown = join(directory, `.incoming-${randomUUID()}`);
+  symlinkSync(previous.hash, unknown);
+  assert.throws(() => reader.recoverIncoming(), /unknown ownership or file identity/);
+  assert.equal(lstatSync(unknown).isSymbolicLink(), true);
+  assert.equal(reader.read(previous.hash).toString(), 'Keep the previous complete artifact.');
+  unlinkSync(unknown);
   const corrupt = artifacts.publish(Buffer.from('original'));
   writeFileSync(join(directory, corrupt.hash), 'modified');
   assert.equal(
