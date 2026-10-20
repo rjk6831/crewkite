@@ -64,6 +64,40 @@ function regularBytes(path, limit) {
 }
 const digest = (bytes) => createHash('sha256').update(bytes).digest('hex');
 
+/** Installed self-aliases must resolve within the relocated package. */
+export function copyPackagePayload(from, to, excluded = []) {
+  const source = realpathSync(from);
+  const target = resolve(to);
+  if (
+    realpathSync(dirname(target)) !== dirname(target) ||
+    lstatSync(target, { throwIfNoEntry: false })
+  )
+    throw new Error('Runtime package destination must be new and canonical.');
+  const links = [];
+  cpSync(source, target, {
+    recursive: true,
+    verbatimSymlinks: true,
+    force: false,
+    errorOnExist: true,
+    filter: (entry, destination) => {
+      if (excluded.includes(relative(source, entry).split(sep)[0])) return false;
+      if (!lstatSync(entry).isSymbolicLink()) return true;
+      const child = relative(source, realpathSync(entry));
+      if (child === '..' || child.startsWith(`..${sep}`) || isAbsolute(child))
+        throw new Error('Runtime package link escapes its source.');
+      const mapped = join(target, child);
+      symlinkSync(relative(dirname(destination), mapped) || '.', destination);
+      links.push(destination);
+      return false;
+    },
+  });
+  for (const link of links) {
+    const child = relative(target, realpathSync(link));
+    if (child === '..' || child.startsWith(`..${sep}`) || isAbsolute(child))
+      throw new Error('Runtime package link escapes its destination.');
+  }
+}
+
 /** The fixed target prevents a newer build host from raising the package's OS floor. */
 export function inspectLocalInputArtifact(bytes) {
   if (
@@ -410,10 +444,7 @@ export async function packageDesktop() {
     symlinkSync(`../../packages/${name}`, join(runtime, 'node_modules/@crewkite', name));
   const contracts = createRequire(join(checkout, 'packages/contracts/package.json'));
   const zod = dirname(contracts.resolve('zod/package.json'));
-  cpSync(zod, join(runtime, 'node_modules/zod'), {
-    recursive: true,
-    filter: (path) => relative(zod, path).split(sep)[0] !== 'src',
-  });
+  copyPackagePayload(zod, join(runtime, 'node_modules/zod'), ['src']);
   const rootPackages = createRequire(join(checkout, 'package.json'));
   const biome = dirname(rootPackages.resolve('@biomejs/biome/package.json'));
   const biomeManifest = json(join(biome, 'package.json'));
@@ -428,13 +459,8 @@ export async function packageDesktop() {
   )
     throw new Error('The installed Biome payload differs from the frozen root manifest.');
   mkdirSync(join(runtime, 'node_modules/@biomejs'), { recursive: true });
-  cpSync(biome, join(runtime, 'node_modules/@biomejs/biome'), {
-    recursive: true,
-    filter: (path) => relative(biome, path).split(sep)[0] !== 'node_modules',
-  });
-  cpSync(biomeBinary, join(runtime, 'node_modules/@biomejs/cli-darwin-arm64'), {
-    recursive: true,
-  });
+  copyPackagePayload(biome, join(runtime, 'node_modules/@biomejs/biome'), ['node_modules']);
+  copyPackagePayload(biomeBinary, join(runtime, 'node_modules/@biomejs/cli-darwin-arm64'));
   const runtimePackages = await copyRuntimePackages({
     source: checkout,
     from: 'apps/controller/package.json',
