@@ -365,7 +365,9 @@ test('GitHub reads bind status and complete logs to owned GET operations', async
     assert.equal(runner.scripts.length, 0, scenario.name);
     for (const launch of runner.launches) {
       assert.equal(launch.executable, client.path);
+      assert.equal(launch.executableIdentity, 'verified-prelaunch-sha256');
       assert.equal(launch.executableSha256, client.sha256);
+      assert.equal(launch.shell, false);
       assert.deepEqual(launch.argv.slice(0, 5), [
         'api',
         '--method',

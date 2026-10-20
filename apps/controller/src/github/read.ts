@@ -38,10 +38,12 @@ export type GitHubReadRequest =
 export type OwnedProjectCommandRequest = Readonly<{
   operationId: string;
   executable: string;
+  executableIdentity: 'verified-prelaunch-sha256';
   executableSha256: string;
   argv: readonly string[];
   cwd: string;
   environment: Readonly<Record<string, string>>;
+  shell: false;
 }>;
 
 export type OwnedProjectCommandLifecycle = Readonly<{
@@ -404,10 +406,12 @@ function phaseRequest(
   return {
     operationId: `${operationId}-${suffix}`,
     executable: client.path,
+    executableIdentity: 'verified-prelaunch-sha256',
     executableSha256: client.sha256,
     argv,
     cwd: client.cwd,
     environment: clientEnvironment(client, request.repository),
+    shell: false,
   };
 }
 
