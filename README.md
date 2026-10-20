@@ -103,6 +103,8 @@ Details live in [docs/roadmap.md](docs/roadmap.md).
 
 ## Run a local workspace
 
+For a published candidate, the [preview guide](docs/preview.md#verify-the-download) covers the download checksum and the included desktop launcher.
+
 The [directory package](docs/distribution.md) is the normal desktop path. It carries separate Node and Electron runtimes and the fixed Local credential-input helper. It needs local Git, an existing Git identity for branch acceptance and separately installed provider clients. It downloads no provider or model. A source-only controller has no packaged Local credential-input capability.
 
 For maintainer staging from a committed checkout with the pinned development dependencies already installed:

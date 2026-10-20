@@ -2,6 +2,18 @@
 
 This guide gives one practical sequence for trying the candidate on a real project. You need a local Git repository and any provider client you plan to use.
 
+## Verify the download
+
+Download the macOS arm64 ZIP and `SHA256SUMS` from the same published [release](https://github.com/rjk6831/crewkite/releases). Read its release receipt for the exact source revision, tested macOS version, signing status and provider qualification.
+
+From the folder holding both downloaded files, run:
+
+```sh
+shasum -a 256 -c SHA256SUMS
+```
+
+Extract the archive after the checksum passes. Keep its folder together. If macOS blocks opening it, retain the exact message with the candidate identity in your report. The [distribution notes](distribution.md) distinguish directory-package testing from signing and installation checks.
+
 ## Open the candidate
 
 Keep the extracted candidate folder together and double-click `CrewKite.command`. It opens the workspace through the adjacent `bin/desktop` launcher. The folder can move before its first launch. After setup, reopen the same folder to retain its projects, tasks and settings.
