@@ -315,7 +315,9 @@ export async function upgradePackage({ source, target, confirm }, dependencies =
   const move = dependencies.rename ?? renameSync;
   try {
     try {
-      owner.exec('PRAGMA busy_timeout=0; BEGIN EXCLUSIVE;');
+      // This advisory database receives no writes. Keep its journal in memory so closing
+      // the lease after a rename cannot clean up a different file at the old pathname.
+      owner.exec('PRAGMA journal_mode=MEMORY; PRAGMA busy_timeout=0; BEGIN EXCLUSIVE;');
     } catch {
       fail(
         'The controller is active or its ownership lease is unavailable. Quit it before upgrading.',

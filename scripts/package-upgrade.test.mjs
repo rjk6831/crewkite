@@ -4,10 +4,12 @@ import { createHash } from 'node:crypto';
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -15,7 +17,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import { Store } from '../apps/controller/src/store/index.ts';
@@ -45,9 +47,38 @@ function payload(path, id, revision) {
   );
 }
 
+function stateInventory(root) {
+  const rows = [];
+  const walk = (directory) => {
+    for (const name of readdirSync(directory).sort()) {
+      const path = join(directory, name),
+        entry = relative(root, path),
+        state = lstatSync(path);
+      if (state.isDirectory()) {
+        rows.push({ path: entry, directory: true, mode: state.mode & 0o777 });
+        walk(path);
+      } else if (state.isSymbolicLink()) {
+        rows.push({
+          path: entry,
+          link: readlinkSync(path),
+        });
+      } else
+        rows.push({
+          path: entry,
+          bytes: state.size,
+          mode: state.mode & 0o777,
+          sha256: hash(readFileSync(path)),
+        });
+    }
+  };
+  walk(root);
+  return rows;
+}
+
 test('package upgrade preserves fixed-path state and refuses unsafe swaps', async (t) => {
   for (const scenario of [
     'installed',
+    'installed-initialized-owner',
     'old-re-signed',
     'finder-metadata',
     'finder-link',
@@ -73,6 +104,8 @@ test('package upgrade preserves fixed-path state and refuses unsafe swaps', asyn
     for (const path of [state, home, profile]) mkdirSync(path, { mode: 0o700 });
     const ownerPath = join(home, 'owner.sqlite');
     const owner = new DatabaseSync(ownerPath);
+    if (scenario === 'installed-initialized-owner')
+      owner.exec('CREATE TABLE retained(value TEXT);');
     chmodSync(ownerPath, 0o600);
     const store = new Store(join(home, 'state.sqlite'));
     store.applyMigrations(new URL('../apps/controller/migrations', import.meta.url).pathname);
@@ -124,11 +157,12 @@ test('package upgrade preserves fixed-path state and refuses unsafe swaps', asyn
       symlinkSync(outside, join(source, 'state'));
     }
     if (scenario === 'external-link') symlinkSync(root, join(state, 'external'));
+    const originalState = stateInventory(state);
     let renames = 0;
     const execute = (path, args) => {
       if (path !== '/usr/sbin/lsof') return { status: 0, stdout: '', stderr: '' };
       assert.deepEqual(args, ['-nP', '-t', '+D', args.at(-1)]);
-      if (scenario === 'installed')
+      if (scenario.startsWith('installed'))
         return spawnSync(path, args, {
           cwd: root,
           env: { LANG: 'C', PATH: '/usr/bin:/bin' },
@@ -163,14 +197,21 @@ test('package upgrade preserves fixed-path state and refuses unsafe swaps', asyn
           },
         },
       );
-      if (['installed', 'old-re-signed', 'finder-metadata'].includes(scenario)) {
+      if (
+        ['installed', 'installed-initialized-owner', 'old-re-signed', 'finder-metadata'].includes(
+          scenario,
+        )
+      ) {
         const result = await pending;
         assert.equal(result.outcome, 'installed');
         assert.equal(result.target, target);
         assert.equal(readFileSync(join(target, 'runtime'), 'utf8'), 'replacement');
         assert.equal(readFileSync(join(result.backup, 'runtime'), 'utf8'), 'previous');
         assert.deepEqual(readFileSync(join(result.backup, 'state/home/state.sqlite')), before);
-        assert.equal(result.stateDigest.length, 64);
+        assert.deepEqual(stateInventory(state), originalState);
+        assert.deepEqual(stateInventory(join(result.backup, 'state')), originalState);
+        assert.equal(result.stateDigest, hash(JSON.stringify(originalState)));
+        assert.equal(result.stateEntries, originalState.length);
         assert.equal(result.previousRuntimeChanged, scenario === 'old-re-signed');
         assert.equal(result.previousFinderMetadataEntries, scenario === 'finder-metadata' ? 1 : 0);
         if (scenario === 'finder-metadata') {
@@ -212,6 +253,7 @@ test('package upgrade preserves fixed-path state and refuses unsafe swaps', asyn
         assert.deepEqual(readFileSync(join(home, 'state.sqlite')), before, scenario);
         assert.deepEqual(readFileSync(receipts.path), receiptBefore, scenario);
         if (scenario === 'second-rename') {
+          assert.deepEqual(stateInventory(state), originalState);
           assert.equal(renames, 3);
           assert(!existsSync(plan.backup));
         } else assert.equal(renames, 0);
