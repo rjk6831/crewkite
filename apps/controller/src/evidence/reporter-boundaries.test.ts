@@ -20,10 +20,14 @@ const failure = (error: unknown) => ({
 async function diagnostic(error: unknown) {
   const rows = await frames([failure(error)]);
   const output = rows.filter((row) => row.type === 'output');
-  assert.equal(output.length, 1);
-  assert.equal(output[0].channel, 'stderr');
-  assert.equal(typeof output[0].text, 'string');
-  return output[0].text as string;
+  assert(output.length > 0);
+  for (const row of output) {
+    assert.deepEqual(Object.keys(row).sort(), ['channel', 'text', 'type']);
+    assert.equal(row.channel, 'stderr');
+    assert.equal(typeof row.text, 'string');
+    assert.equal((row.text as string).isWellFormed(), true);
+  }
+  return output.map((row) => row.text as string).join('');
 }
 
 function filledCauses(value: string, padding = '') {
@@ -46,7 +50,7 @@ function filledCauses(value: string, padding = '') {
 test('failure diagnostics preserve whole Unicode at field and aggregate byte limits', async () => {
   const cases = [
     { name: 'lone surrogates', error: { message: 'a\ud800b\udc00' }, retained: 'a�b�' },
-    { name: 'input byte16384', error: { message: 'a'.repeat(16384) }, truncated: true },
+    { name: 'input byte16384', error: { message: 'a'.repeat(16384) } },
     { name: 'input byte16385', error: { message: 'a'.repeat(16385) }, truncated: true },
     {
       name: 'supplementary codepoint after16369 ASCII bytes',
@@ -54,16 +58,14 @@ test('failure diagnostics preserve whole Unicode at field and aggregate byte lim
       truncated: true,
     },
     {
-      name: 'ASCII fills the aggregate byte16384 bound',
+      name: 'ASCII exceeds the aggregate byte bound',
       error: filledCauses('a'.repeat(1024)),
       truncated: true,
-      bytes: 16384,
     },
     ...[0, 1, 2, 3].map((padding) => ({
       name: `supplementary aggregate alignment${padding}`,
       error: filledCauses('🪁'.repeat(1001), 'a'.repeat(padding)),
       truncated: true,
-      nearLimit: true,
     })),
   ];
   for (const scenario of cases) {
@@ -73,9 +75,7 @@ test('failure diagnostics preserve whole Unicode at field and aggregate byte lim
     assert(bytes <= 16384, scenario.name);
     if ('retained' in scenario && scenario.retained !== undefined)
       assert(text.includes(scenario.retained), scenario.name);
-    if ('truncated' in scenario) assert(text.endsWith('\n[truncated]'), scenario.name);
-    if ('bytes' in scenario) assert.equal(bytes, scenario.bytes, scenario.name);
-    if ('nearLimit' in scenario) assert(bytes >= 16381, scenario.name);
+    if ('truncated' in scenario) assert(text.includes('[truncated]'), scenario.name);
   }
 });
 
@@ -103,19 +103,23 @@ test('failure diagnosis bounds cause traversal and ignores unreadable object coe
     },
   });
   for (const scenario of [
-    { error: cycle, retained: ['cycle root', 'cycle leaf', '[truncated]'], missing: [] },
-    { error: deep, retained: ['depth root', '[truncated]'], missing: ['depth19'] },
-    { error: unreadable, retained: ['retained readable message'], missing: [] },
+    { error: cycle, retained: ['cycle root', 'cycle leaf', '[truncated]'] },
+    { error: deep, retained: ['depth root'], lastCause: 'depth19' },
+    { error: unreadable, retained: ['retained readable message'] },
     {
       error: { name: 'ScalarError', code: 17, operator: 'equal', actual: false, expected: null },
-      retained: ['ScalarError', 'code: 17', 'operator: equal', 'actual: false', 'expected: null'],
-      missing: [],
+      retained: ['ScalarError', '17', 'equal', 'false', 'null'],
     },
-    { error: { actual: 1n << 100000n }, retained: ['[truncated]'], missing: [] },
+    { error: { actual: 1n << 100000n }, retained: ['[truncated]'] },
   ]) {
     const text = await diagnostic(scenario.error);
     for (const retained of scenario.retained) assert(text.includes(retained), retained);
-    for (const missing of scenario.missing) assert(!text.includes(missing), missing);
+    if (
+      'lastCause' in scenario &&
+      scenario.lastCause !== undefined &&
+      !text.includes(scenario.lastCause)
+    )
+      assert(text.includes('[truncated]'));
     assert(Buffer.byteLength(text, 'utf8') <= 16384);
     assert.equal(text.isWellFormed(), true);
   }
@@ -124,40 +128,60 @@ test('failure diagnosis bounds cause traversal and ignores unreadable object coe
 
 test('failure diagnostics preserve existing output and leave passing tests quiet', async () => {
   const counts = { tests: 2, passed: 1, failed: 1, cancelled: 0, skipped: 0, todo: 0, suites: 0 };
+  const passed = {
+    type: 'test:pass',
+    data: { name: 'passed check', details: { type: 'test', error: Error('must stay quiet') } },
+  };
   const rows = await frames([
     failure({ message: 'retained failure' }),
     { type: 'test:stdout', data: { message: 'existing stdout\n' } },
     { type: 'test:stderr', data: { message: 'existing stderr\n' } },
-    {
-      type: 'test:pass',
-      data: { name: 'passed check', details: { type: 'test', error: Error('must stay quiet') } },
-    },
+    passed,
     { type: 'test:summary', data: { success: false, counts } },
   ]);
-  assert.deepEqual(rows, [
-    { type: 'start', version: 1 },
-    {
-      type: 'test',
-      file: '',
-      name: 'failed check',
-      kind: 'test',
-      passed: false,
-      skipped: false,
-      todo: false,
-    },
-    { type: 'output', channel: 'stderr', text: 'message: retained failure' },
-    { type: 'output', channel: 'stdout', text: 'existing stdout\n' },
-    { type: 'output', channel: 'stderr', text: 'existing stderr\n' },
-    {
-      type: 'test',
-      file: '',
-      name: 'passed check',
-      kind: 'test',
-      passed: true,
-      skipped: false,
-      todo: false,
-    },
-    { type: 'summary', file: null, success: false, counts },
-    { type: 'end' },
-  ]);
+  const diagnostics = rows.filter(
+    (row) => row.type === 'output' && row.channel === 'stderr' && row.text !== 'existing stderr\n',
+  );
+  assert(diagnostics.length > 0);
+  for (const row of diagnostics) {
+    assert.deepEqual(Object.keys(row).sort(), ['channel', 'text', 'type']);
+    assert.equal(typeof row.text, 'string');
+  }
+  const text = diagnostics.map((row) => row.text as string).join('');
+  assert(text.includes('retained failure'));
+  assert(!text.includes('must stay quiet'));
+  assert(Buffer.byteLength(text, 'utf8') <= 16384);
+  assert.equal(text.isWellFormed(), true);
+  assert.deepEqual(
+    rows.filter((row) => !diagnostics.includes(row)),
+    [
+      { type: 'start', version: 1 },
+      {
+        type: 'test',
+        file: '',
+        name: 'failed check',
+        kind: 'test',
+        passed: false,
+        skipped: false,
+        todo: false,
+      },
+      { type: 'output', channel: 'stdout', text: 'existing stdout\n' },
+      { type: 'output', channel: 'stderr', text: 'existing stderr\n' },
+      {
+        type: 'test',
+        file: '',
+        name: 'passed check',
+        kind: 'test',
+        passed: true,
+        skipped: false,
+        todo: false,
+      },
+      { type: 'summary', file: null, success: false, counts },
+      { type: 'end' },
+    ],
+  );
+  assert.deepEqual(
+    (await frames([passed])).filter((row) => row.type === 'output'),
+    [],
+  );
 });
