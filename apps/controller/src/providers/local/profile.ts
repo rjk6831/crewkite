@@ -141,6 +141,14 @@ export const ProposalSchema = z.strictObject({
   content: text(MAX_CONTENT_BYTES),
 });
 const count = z.number().int().nonnegative().safe().nullable();
+export const LOCAL_CODING_SAMPLING = Object.freeze({
+  temperature: 0.6,
+  topKSampling: 20,
+  topPSampling: 0.95,
+  minPSampling: 0,
+  presencePenalty: 0,
+  repeatPenalty: 1,
+});
 export const ProofSchema = z
   .strictObject({
     stopReason: z.enum([
@@ -172,6 +180,16 @@ export const ProofSchema = z
     maxTokens: LocalNativeProfileSchema.shape.maximumOutputTokens,
     contextOverflowPolicy: z.literal('stopAtLimit'),
     draftModel: z.literal(''),
+    sampling: z
+      .strictObject({
+        temperature: z.literal(LOCAL_CODING_SAMPLING.temperature),
+        topKSampling: z.literal(LOCAL_CODING_SAMPLING.topKSampling),
+        topPSampling: z.literal(LOCAL_CODING_SAMPLING.topPSampling),
+        minPSampling: z.literal(LOCAL_CODING_SAMPLING.minPSampling),
+        presencePenalty: z.literal(LOCAL_CODING_SAMPLING.presencePenalty),
+        repeatPenalty: z.literal(LOCAL_CODING_SAMPLING.repeatPenalty),
+      })
+      .optional(),
   })
   .refine((proof) => proof.renderedPromptTokens + proof.maxTokens <= proof.contextLength)
   .refine(
@@ -202,6 +220,11 @@ export const ConfigurationDetailSchema = z
       'context-length',
       'overflow-policy',
       'temperature',
+      'top-k',
+      'top-p',
+      'min-p',
+      'presence-penalty',
+      'repeat-penalty',
       'reasoning-enabled',
       'reasoning-budget',
       'load-draft-disabled',

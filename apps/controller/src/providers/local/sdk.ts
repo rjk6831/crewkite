@@ -18,6 +18,7 @@ import {
   CLEANUP_MS,
   CONTEXT_TOKENS,
   type ConfigurationDetail,
+  LOCAL_CODING_SAMPLING,
   type LocalDiscoveryStart,
   type LocalReason,
   type LocalStart,
@@ -692,7 +693,7 @@ export function startLocalPrediction(
       const responseOptions: LLMRespondOpts = {
         maxTokens: outputTokens,
         reasoningBudget: 1536,
-        temperature: 0.1,
+        ...LOCAL_CODING_SAMPLING,
         enableThinking: true,
         contextOverflowPolicy: 'stopAtLimit',
         draftModel: '',
@@ -734,8 +735,30 @@ export function startLocalPrediction(
         'llm.prediction.temperature',
         'temperature',
         z.number(),
-        (value) => value === 0.1,
+        (value) => value === LOCAL_CODING_SAMPLING.temperature,
       );
+      configurationField(
+        terminal.predictionConfig,
+        'prediction-fields',
+        'llm.prediction.topKSampling',
+        'top-k',
+        z.number().int(),
+        (value) => value === LOCAL_CODING_SAMPLING.topKSampling,
+      );
+      for (const [key, check, expected] of [
+        ['topPSampling', 'top-p', LOCAL_CODING_SAMPLING.topPSampling],
+        ['minPSampling', 'min-p', LOCAL_CODING_SAMPLING.minPSampling],
+        ['repeatPenalty', 'repeat-penalty', LOCAL_CODING_SAMPLING.repeatPenalty],
+        ['llama.presencePenalty', 'presence-penalty', LOCAL_CODING_SAMPLING.presencePenalty],
+      ] as const)
+        configurationField(
+          terminal.predictionConfig,
+          'prediction-fields',
+          `llm.prediction.${key}`,
+          check,
+          z.object({ checked: z.boolean(), value: z.number() }),
+          (value) => value.checked && value.value === expected,
+        );
       configurationField(
         terminal.predictionConfig,
         'prediction-fields',
@@ -869,6 +892,7 @@ export function startLocalPrediction(
         maxTokens: outputTokens,
         contextOverflowPolicy: 'stopAtLimit',
         draftModel: '',
+        sampling: LOCAL_CODING_SAMPLING,
       });
       if (
         proof.promptTokens === null ||

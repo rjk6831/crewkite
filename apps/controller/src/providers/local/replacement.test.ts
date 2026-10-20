@@ -104,7 +104,12 @@ function terminal(
     predictionConfig: kv({
       'llm.prediction.maxPredictedTokens': { checked: true, value: maximumOutputTokens },
       'llm.prediction.contextOverflowPolicy': 'stopAtLimit',
-      'llm.prediction.temperature': 0.1,
+      'llm.prediction.temperature': 0.6,
+      'llm.prediction.topKSampling': 20,
+      'llm.prediction.topPSampling': { checked: true, value: 0.95 },
+      'llm.prediction.minPSampling': { checked: true, value: 0 },
+      'llm.prediction.repeatPenalty': { checked: true, value: 1 },
+      'llm.prediction.llama.presencePenalty': { checked: true, value: 0 },
       'llm.prediction.reasoning.enableThinking': true,
       'llm.prediction.reasoning.budgetTokens': { checked: true, value: 1536 },
       'llm.prediction.speculativeDecoding.draftModel': '',
@@ -1073,7 +1078,12 @@ test('Local ownership needs the same prediction terminal after cancellation or c
     assert.equal(f.prompt, 'rendered chat');
     assert.equal(f.options?.maxTokens, 2048);
     assert.equal(f.options?.reasoningBudget, 1536);
-    assert.equal(f.options?.temperature, 0.1);
+    assert.equal(f.options?.temperature, 0.6);
+    assert.equal(f.options?.topKSampling, 20);
+    assert.equal(f.options?.topPSampling, 0.95);
+    assert.equal(f.options?.minPSampling, 0);
+    assert.equal(f.options?.presencePenalty, 0);
+    assert.equal(f.options?.repeatPenalty, 1);
     assert.equal(f.options?.enableThinking, true);
     assert.equal(f.options?.contextOverflowPolicy, 'stopAtLimit');
     assert.equal(f.options?.draftModel, '');
@@ -1148,6 +1158,16 @@ test('Local ownership needs the same prediction terminal after cancellation or c
       assert.equal(outcome.proposal.content, ending?.[2] ?? 'export const n = 2;\n', row);
       assert.equal(outcome.proof.promptTokens, 3);
       assert.equal(outcome.proof.predictedTokens, null);
+      assert.deepEqual(outcome.proof.sampling, {
+        temperature: 0.6,
+        topKSampling: 20,
+        topPSampling: 0.95,
+        minPSampling: 0,
+        presencePenalty: 0,
+        repeatPenalty: 1,
+      });
+      const { sampling: _sampling, ...legacyProof } = outcome.proof;
+      assert(TerminalSchema.safeParse({ ...outcome, proof: legacyProof }).success);
     }
   }
   const canary = 'private-config-value-must-not-escape';
@@ -1161,13 +1181,6 @@ test('Local ownership needs the same prediction terminal after cancellation or c
     status: string;
     change: (value: ReturnType<typeof terminal>) => void;
   }> = [
-    {
-      check: 'temperature',
-      status: 'mismatch',
-      change: (value) => {
-        setField(value.predictionConfig, 'llm.prediction.temperature', 0.8);
-      },
-    },
     {
       check: 'reasoning-enabled',
       status: 'mismatch',
@@ -1414,6 +1427,41 @@ test('Local ownership needs the same prediction terminal after cancellation or c
         terminal.stats = { ...terminal.stats, ...{ totalDraftTokensCount: value } };
       },
     });
+  for (const [key, check, expected] of [
+    ['temperature', 'temperature', 0.6],
+    ['topKSampling', 'top-k', 20],
+    ['topPSampling', 'top-p', 0.95],
+    ['minPSampling', 'min-p', 0],
+    ['repeatPenalty', 'repeat-penalty', 1],
+    ['llama.presencePenalty', 'presence-penalty', 0],
+  ] as const) {
+    const scalar = key === 'temperature' || key === 'topKSampling';
+    for (const status of ['missing', 'malformed', 'mismatch', ...(scalar ? [] : ['disabled'])])
+      configurationCases.push({
+        check,
+        status: status === 'disabled' ? 'mismatch' : status,
+        change: (value) => {
+          const field = `llm.prediction.${key}`;
+          if (status === 'missing')
+            value.predictionConfig.fields = value.predictionConfig.fields.filter(
+              (entry) => entry.key !== field,
+            );
+          else
+            setField(
+              value.predictionConfig,
+              field,
+              status === 'malformed'
+                ? canary
+                : scalar
+                  ? expected + 1
+                  : {
+                      checked: status !== 'disabled',
+                      value: expected + Number(status !== 'disabled'),
+                    },
+            );
+        },
+      });
+  }
   for (const row of configurationCases) {
     const f = fixture();
     const run = startLocalPrediction(plan, {
