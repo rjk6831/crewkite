@@ -16,7 +16,13 @@ Extract the archive after the checksum passes. Keep its folder together. If macO
 
 ## Open the candidate
 
+The preview has an ad-hoc resource seal. It has no verified Developer ID identity and is not notarized by Apple. Check the release receipt for the exact candidate's first-launch evidence.
+
 Keep the extracted candidate folder together and double-click `CrewKite.command`. It opens the workspace through the adjacent `bin/desktop` launcher. The folder can move before its first launch. After setup, reopen the same folder to retain its projects, tasks and settings.
+
+If macOS blocks the launcher because its developer cannot be verified, open System Settings > Privacy & Security after the blocked attempt. Use Open Anyway for that exact candidate and confirm Open. macOS can also require approval for the adjacent `Electron.app`. Only continue after checking the release and checksum. A resource seal does not establish publisher identity or Apple approval.
+
+If macOS says the app is damaged, stop and retain the exact message and candidate identity. That failure needs a corrected package and fresh verification.
 
 From Terminal, change into that candidate folder and use:
 

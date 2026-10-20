@@ -200,6 +200,26 @@ export function buildLocalInputHelper(checkout, build, dependencies = {}) {
   };
 }
 
+/** A resource seal lets macOS check the copied runtime before its files are inventoried. */
+export function sealElectronBundle(bundle, execute = spawnSync) {
+  const options = {
+    env: { LANG: 'C', PATH: '/usr/bin:/bin' },
+    encoding: 'utf8',
+    timeout: 30000,
+    maxBuffer: 65536,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  };
+  for (const args of [
+    ['--force', '--deep', '--sign', '-', '--preserve-metadata=identifier,entitlements', bundle],
+    ['--verify', '--deep', '--strict', '--verbose=2', bundle],
+  ]) {
+    const result = execute('/usr/bin/codesign', args, options);
+    if (result.error || result.status !== 0 || result.signal)
+      throw new Error('The staged Electron resource seal did not finish successfully.');
+  }
+  return { kind: 'ad-hoc', verified: 'deep-strict', developerID: false, notarized: false };
+}
+
 export async function packageDesktop() {
   const source = resolve(dirname(fileURLToPath(import.meta.url)), '..');
   const git = (...args) => execFileSync('git', args, { cwd: source, encoding: 'utf8' }).trim();
@@ -640,6 +660,7 @@ export async function packageDesktop() {
     'bin/desktop',
   ])
     inside(join(stage, entry));
+  const electronSignature = sealElectronBundle(join(stage, 'Electron.app'));
   inspect(stage);
   writeFileSync(
     join(stage, 'manifest.json'),
@@ -658,7 +679,7 @@ export async function packageDesktop() {
         qualification: 'static-stage-only',
         bootstrap: 'present',
         runtime: { path: 'app/runtime/bin/node', version: nodeVersion, sha256: nodeHash },
-        electron: { version: electronVersion },
+        electron: { version: electronVersion, signature: electronSignature },
         notices,
         files,
       },
