@@ -38,10 +38,12 @@ import {
   canonicalJson,
   type Event,
   EventSchema,
+  MAX_FRAME_BYTES,
   type Snapshot,
   SnapshotSchema,
   type TaskConversationState,
   TaskConversationStateSchema,
+  TaskPageSchema,
   type TaskSummary,
 } from '../packages/contracts/src/index.ts';
 import { createDemoFixtures, createTestIds } from '../packages/testkit/src/fixtures.ts';
@@ -389,9 +391,14 @@ async function pauseRenderer(
     }, url);
 }
 
-async function desktopSnapshot(page: Page) {
+async function desktopSnapshot(page: Page, taskId?: string) {
   try {
-    return SnapshotSchema.parse(await page.evaluate(() => window.crewkite?.getSnapshot()));
+    return SnapshotSchema.parse(
+      await page.evaluate(
+        (selected) => window.crewkite?.getSnapshot(selected ? { taskId: selected } : undefined),
+        taskId,
+      ),
+    );
   } catch (failure) {
     if (
       failure instanceof Error &&
@@ -2392,6 +2399,20 @@ async function taskActivityHistory(
   const other = { ...task, id: id('tsk'), title: 'Inspect a different history' };
   const empty = { ...task, id: id('tsk'), title: 'Inspect an empty history' };
   const blocked = { ...task, id: id('tsk'), title: 'Inspect a blocked history' };
+  const retainedTasks = [
+    task,
+    other,
+    empty,
+    blocked,
+    ...Array.from({ length: 300 }, (_, index) => ({
+      ...task,
+      id: id('tsk'),
+      title: `Retained workspace task ${String(index).padStart(3, '0')}`,
+      outcome: 'x'.repeat(4096),
+    })),
+  ];
+  const lastRetainedTask = retainedTasks.at(-1);
+  assert(lastRetainedTask);
   const options = {
     home,
     now: () => at,
@@ -2415,6 +2436,11 @@ async function taskActivityHistory(
     const execute = runtime.controller.execute.bind(runtime.controller);
     runtime.controller.execute = async (input, principal) => {
       const command = CommandSchema.parse(input);
+      if (command.command === 'GetSnapshot')
+        assert(
+          'taskId' in command.payload,
+          'Large workspace clients must read selected task detail only.',
+        );
       const result = await execute(command, principal);
       if (command.command === 'GetTaskActivity') {
         requests.push(command);
@@ -2450,7 +2476,7 @@ async function taskActivityHistory(
   runtime.controller.store.transaction(() => {
     const project = fixture.snapshot.projects[0];
     runtime.controller.store.put('project', project.id, project.revision, project);
-    for (const value of [task, other, empty, blocked])
+    for (const value of retainedTasks)
       runtime.controller.store.put('task', value.id, value.revision, value);
   });
   for (let index = 0; index < 360; index++) {
@@ -2471,6 +2497,20 @@ async function taskActivityHistory(
   );
   const afterBoundary = append(blocked.id, 'Retained output above the blocked boundary.');
   assert(afterBoundary.type === 'attempt.output');
+  const legacyBytes = Buffer.byteLength(
+    JSON.stringify({
+      type: 'result',
+      key: createCommandKey(),
+      result: {
+        outcome: 'applied',
+        data: { kind: 'snapshot', snapshot: runtime.controller.snapshot() },
+      },
+    }),
+  );
+  assert(
+    legacyBytes > MAX_FRAME_BYTES,
+    'The retained workspace must exceed the legacy full snapshot frame.',
+  );
   const activity = page.locator('.activity-section');
   const outputs = () => activity.locator('.worker-output').allTextContents();
   const seen = new Set<string>();
@@ -2516,6 +2556,47 @@ async function taskActivityHistory(
       'local-owner',
     );
     assert.equal(prerequisite.outcome, 'applied', 'The retained activity API must be installed.');
+    const listing = spawn(
+      node,
+      [join(root, 'apps/cli/src/main.ts'), 'task', 'list', '--pages', '--json', '--home', home],
+      {
+        cwd: root,
+        env: environment(home),
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
+    let listed = '';
+    let listingError = '';
+    listing.stdout?.on('data', (bytes: Buffer) => {
+      listed += bytes.toString();
+    });
+    listing.stderr?.on('data', (bytes: Buffer) => {
+      listingError += bytes.toString();
+    });
+    try {
+      const code = await bounded(
+        new Promise<number | null>((resolve, reject) => {
+          listing.once('error', reject);
+          listing.once('close', resolve);
+        }),
+        10000,
+        'Large workspace CLI page traversal',
+      );
+      assert.equal(code, 0, listingError);
+      const pages = listed
+        .trim()
+        .split('\n')
+        .map((line) => TaskPageSchema.parse(JSON.parse(line)));
+      const listedIds = pages.flatMap((part) => part.tasks.map((row) => row.id));
+      assert.equal(pages.at(-1)?.complete, true);
+      assert.equal(listedIds.length, retainedTasks.length);
+      assert.equal(new Set(listedIds).size, retainedTasks.length);
+      assert.deepEqual(listedIds, retainedTasks.map((row) => row.id).sort());
+      assert.equal(listedIds.at(-1), lastRetainedTask.id);
+    } finally {
+      await stop(listing);
+    }
+
     await application.evaluate(
       async ({ BrowserWindow }, options) => {
         const load = process.mainModule?.require.bind(process.mainModule);
@@ -2550,6 +2631,25 @@ async function taskActivityHistory(
     );
     await page.reload();
     await expect(page.getByText('Controller connected', { exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: task.title, exact: true })).toBeVisible();
+    await expect(page.getByRole('heading', { name: task.title, exact: true })).toBeVisible();
+    await expect(page.locator('.project-group .count')).toHaveText(String(retainedTasks.length));
+    const moreTasks = page.getByRole('button', { name: 'Load more tasks', exact: true });
+    const retainedButtons = page.getByRole('button', { name: /^Retained workspace task / });
+    for (let pageIndex = 1; pageIndex < Math.ceil(retainedTasks.length / 50); pageIndex++) {
+      await moreTasks.click();
+      await expect(retainedButtons).toHaveCount(
+        Math.min((pageIndex + 1) * 50, retainedTasks.length) - 4,
+      );
+    }
+    await expect(moreTasks).toHaveCount(0);
+    await page.getByRole('button', { name: lastRetainedTask.title, exact: true }).click();
+    await expect(
+      page.getByRole('heading', { name: lastRetainedTask.title, exact: true }),
+    ).toBeVisible();
+    console.log(
+      `Retained workspace: ${retainedTasks.length} tasks, legacy snapshot ${legacyBytes} bytes; desktop last-task selection and CLI pages complete.`,
+    );
     await openTask(task.title);
     await expect(
       activity.getByText(marker(359), { exact: true }),
@@ -2634,7 +2734,7 @@ async function taskActivityHistory(
     await openTask(task.title);
     outstanding.release.resolve();
     outstanding = undefined;
-    await desktopSnapshot(page);
+    await desktopSnapshot(page, task.id);
     await page.evaluate(
       () =>
         new Promise<void>((resolve) => {
