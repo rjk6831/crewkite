@@ -579,7 +579,7 @@ export async function packageDesktop() {
     );
   for (const filename of ['LICENSE', 'NOTICE'])
     notice('CrewKite', desktop.version, join(checkout, filename), filename);
-  for (const filename of ['LICENSE', 'NOTICE', 'docs/credits.md'])
+  for (const filename of ['LICENSE', 'NOTICE', 'README.md', 'docs'])
     copy(join(checkout, filename), join(stage, filename));
   notice('CrewKite source credits', revision, join(checkout, 'docs/credits.md'), 'credits.md');
   notice('Node', nodeVersion, join(nodeRoot, 'LICENSE'), 'node-LICENSE');
