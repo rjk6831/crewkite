@@ -200,6 +200,7 @@ import {
   replacementPlan as anthropicReplacementPlan,
   startReplacement as startAnthropicReplacement,
 } from '../providers/anthropic/replacement.ts';
+import { AcpDiagnosticSchema } from '../providers/google/acp/client.ts';
 import {
   type AcpClientIdentity,
   AcpClientPinSchema,
@@ -13121,7 +13122,7 @@ export class Controller {
             attemptId: attempt.id,
             reason: outcome ? outcome.reason : 'launch',
             quiescent: physical,
-            diagnostic: outcome?.diagnostic ?? null,
+            diagnostic: AcpDiagnosticSchema.nullable().parse(outcome?.diagnostic ?? null),
             exitCode: outcome?.exitCode ?? null,
             signal: outcome?.signal ?? null,
             stdoutBytes: outcome?.stdoutBytes ?? 0,

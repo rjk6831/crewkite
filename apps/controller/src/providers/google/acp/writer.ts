@@ -519,6 +519,62 @@ const permission = z.strictObject({
     .min(1)
     .max(16),
 });
+export function decodeAcpPermissionRequest(input: unknown) {
+  const parsed = permission.safeParse(input);
+  if (parsed.success) return parsed.data;
+  const schema = AcpDiagnosticSchema.shape.permissionSchema.unwrap();
+  const issueSchema = schema.shape.issues.element;
+  const unknownKeys = new Set<string>();
+  let unknownKeyCount = 0;
+  for (const issue of parsed.error.issues) {
+    if (issue.code !== 'unrecognized_keys') continue;
+    unknownKeyCount = Math.min(1024, unknownKeyCount + issue.keys.length);
+    for (const key of issue.keys.slice(0, 16)) {
+      if (unknownKeys.size === 16) break;
+      unknownKeys.add(createHash('sha256').update(key).digest('hex'));
+    }
+    if (unknownKeyCount === 1024 && unknownKeys.size === 16) break;
+  }
+  const issues = parsed.error.issues.slice(0, 16).map((issue) => {
+    const path = issue.path.filter((part) => typeof part !== 'number').join('.');
+    const field = issueSchema.shape.field.safeParse(path || 'root').data ?? 'other';
+    let value = input;
+    if (field === 'other') value = undefined;
+    else
+      for (const part of issue.path) {
+        const descriptor =
+          value !== null && typeof value === 'object'
+            ? Object.getOwnPropertyDescriptor(value, part)
+            : undefined;
+        value = descriptor?.value;
+      }
+    return {
+      code: issueSchema.shape.code.safeParse(issue.code).data ?? 'other',
+      field,
+      type:
+        field === 'other'
+          ? 'other'
+          : value === null
+            ? 'null'
+            : Array.isArray(value)
+              ? 'array'
+              : (issueSchema.shape.type.safeParse(typeof value).data ?? 'other'),
+      ...(typeof value === 'string' || Array.isArray(value)
+        ? { size: Math.min(1048576, value.length) }
+        : {}),
+    };
+  });
+  throw new AcpError('permission', {
+    site: 'permission-request',
+    method: 'session/request_permission',
+    permissionSchema: schema.parse({
+      issueCount: Math.min(1024, parsed.error.issues.length),
+      issues,
+      unknownKeyCount,
+      unknownKeyHashes: [...unknownKeys].sort(),
+    }),
+  });
+}
 function scratchPath(root: string, path: string) {
   if (!isAbsolute(path)) throw new AcpError('permission');
   const result = relative(root, path);
@@ -927,7 +983,7 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
           if (method !== 'session/request_permission' || !armed || cancelled)
             return reject(id, diagnostic);
           diagnostic = { site: 'permission-request', method: 'session/request_permission' };
-          const request = permission.parse(params);
+          const request = decodeAcpPermissionRequest(params);
           const tool = mergeTool(tools.get(request.toolCall.toolCallId), request.toolCall);
           observeTool(tool, outsideScratch(options.scratch, tool.locations));
           const carried = editArguments(tool.rawInput);
@@ -1011,6 +1067,8 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
           tools.set(tool.toolCallId, tool);
           pending.set(tool.toolCallId, { id, binding, proposal });
         } catch (error) {
+          if (error instanceof AcpError && error.diagnostic?.permissionSchema)
+            diagnostic = { ...diagnostic, permissionSchema: error.diagnostic.permissionSchema };
           if (error instanceof AcpError && error.diagnostic?.permissionStage) {
             diagnostic = {
               ...diagnostic,

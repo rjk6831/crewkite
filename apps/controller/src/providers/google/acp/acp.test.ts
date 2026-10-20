@@ -48,6 +48,7 @@ import {
   acpPermissionAfterHash,
   decodeAcpConfiguration,
   decodeAcpPermissionAction,
+  decodeAcpPermissionRequest,
   GoogleAcpToolMappings,
   googleAcpPromptWithTarget,
   googleAcpTargetContext,
@@ -1191,6 +1192,152 @@ test('the acp protocol consumes one complete live permission and never treats co
   } finally {
     hunkFixture.dispose();
   }
+  const validPermission = {
+    sessionId: 'fixture-session',
+    toolCall: { toolCallId: 'fixture-tool' },
+    options: [{ optionId: 'once', name: 'Once', kind: 'allow_once' }],
+  };
+  assert.deepEqual(decodeAcpPermissionRequest(validPermission), validPermission);
+  for (const [input, expected] of [
+    [null, { code: 'invalid_type', field: 'root', type: 'null' }],
+    [
+      { ...validPermission, sessionId: null },
+      { code: 'invalid_type', field: 'sessionId', type: 'null' },
+    ],
+    [
+      { ...validPermission, toolCall: null },
+      { code: 'invalid_type', field: 'toolCall', type: 'null' },
+    ],
+    [
+      { ...validPermission, options: null },
+      { code: 'invalid_type', field: 'options', type: 'null' },
+    ],
+    [
+      { ...validPermission, toolCall: { ...validPermission.toolCall, name: 'x'.repeat(201) } },
+      { code: 'too_big', field: 'toolCall.name', type: 'string', size: 201 },
+    ],
+    [
+      {
+        ...validPermission,
+        toolCall: {
+          ...validPermission.toolCall,
+          locations: [{ path: '/private/account/target', line: 0 }],
+        },
+      },
+      { code: 'too_small', field: 'toolCall.locations.line', type: 'number' },
+    ],
+    [
+      {
+        ...validPermission,
+        toolCall: { ...validPermission.toolCall, content: Array(33).fill(null) },
+      },
+      { code: 'too_big', field: 'toolCall.content', type: 'array', size: 33 },
+    ],
+    [
+      { ...validPermission, options: [{ optionId: 'once', name: 'Once', kind: 'private-kind' }] },
+      { code: 'invalid_value', field: 'options.kind', type: 'string', size: 12 },
+    ],
+  ]) {
+    assert.throws(
+      () => decodeAcpPermissionRequest(input),
+      (error) => {
+        assert(error instanceof AcpError);
+        assert.equal(error.reason, 'permission');
+        assert.deepEqual(error.diagnostic, {
+          site: 'permission-request',
+          method: 'session/request_permission',
+          permissionSchema: {
+            issueCount: 1,
+            issues: [expected],
+            unknownKeyCount: 0,
+            unknownKeyHashes: [],
+          },
+        });
+        return true;
+      },
+    );
+  }
+  const unknownNames = Array.from({ length: 1050 }, (_, index) => `private-key-${index}`);
+  assert.throws(
+    () =>
+      decodeAcpPermissionRequest({
+        ...validPermission,
+        ...Object.fromEntries(unknownNames.map((name) => [name, '/private/account/value'])),
+        toolCall: {
+          ...validPermission.toolCall,
+          locations: Array.from({ length: 32 }, () => ({ path: null, line: -1 })),
+        },
+        options: Array.from({ length: 16 }, () => ({ optionId: null, name: null, kind: null })),
+      }),
+    (error) => {
+      assert(error instanceof AcpError);
+      const summary = error.diagnostic?.permissionSchema;
+      assert(summary);
+      assert.equal(summary.issueCount, 113);
+      assert.equal(summary.issues.length, 16);
+      assert.equal(summary.unknownKeyCount, 1024);
+      assert.deepEqual(summary.unknownKeyHashes, unknownNames.slice(0, 16).map(hash).sort());
+      assert(!JSON.stringify(error.diagnostic).includes('private-'));
+      assert(!JSON.stringify(error.diagnostic).includes('/private/'));
+      assert(Buffer.byteLength(JSON.stringify(error.diagnostic)) < 3072);
+      return true;
+    },
+  );
+  const schemaFixture = fixture('permission');
+  try {
+    const peer = readFileSync(schemaFixture.client.executable, 'utf8');
+    const rewrite = `
+const emit = process.stdout.write.bind(process.stdout);
+let pending = '';
+process.stdout.write = function(chunk) {
+  pending += String(chunk);
+  for (;;) {
+    const at = pending.indexOf('\\n'); if (at < 0) break;
+    const value = JSON.parse(pending.slice(0, at)); pending = pending.slice(at + 1);
+    if (value.method === 'session/request_permission') {
+      value.params.toolCall['private-schema-key'] = '/private/account/value';
+      value.params.options[0].name = 'x'.repeat(201);
+    }
+    emit(JSON.stringify(value)+'\\n');
+  }
+  return true;
+};
+`;
+    chmodSync(schemaFixture.client.executable, 0o700);
+    writeFileSync(
+      schemaFixture.client.executable,
+      peer.replace('runAcpPeer("permission");', `${rewrite}runAcpPeer("permission");`),
+    );
+    chmodSync(schemaFixture.client.executable, 0o500);
+    schemaFixture.client.sha256 = hash(readFileSync(schemaFixture.client.executable));
+    schemaFixture.proof.client.sha256 = schemaFixture.client.sha256;
+    schemaFixture.mapping.client.sha256 = schemaFixture.client.sha256;
+    schemaFixture.toolMapping.client.sha256 = schemaFixture.client.sha256;
+    const handle = writer(schemaFixture, {
+      onPermission: () => {
+        throw Error('Invalid schema reached permission approval.');
+      },
+    });
+    const outcome = await handle.result;
+    assert.equal(outcome.reason, 'permission');
+    assert.equal(outcome.diagnostic?.site, 'permission-request');
+    assert.deepEqual(outcome.diagnostic?.permissionSchema, {
+      issueCount: 2,
+      issues: [
+        { code: 'unrecognized_keys', field: 'toolCall', type: 'object' },
+        { code: 'too_big', field: 'options.name', type: 'string', size: 201 },
+      ],
+      unknownKeyCount: 1,
+      unknownKeyHashes: [hash('private-schema-key')],
+    });
+    assert(outcome.quiescent);
+    assert(groupAbsent(handle.group));
+    assert.deepEqual(schemaFixture.phases, ['intent', 'owned', 'quiescent']);
+    assert(!JSON.stringify(outcome).includes('private-schema-key'));
+    assert(!JSON.stringify(outcome).includes('/private/account/'));
+  } finally {
+    schemaFixture.dispose();
+  }
   for (const scenario of [
     'permission',
     'hunk',
@@ -1900,6 +2047,45 @@ setInterval(() => {}, 1000);
     { site: 'permission-action', permissionActionBytes: -1 },
     { site: 'permission-action', permissionActionBytes: 1.5 },
     { site: 'permission-action', rawInput: 'private-value' },
+    {
+      site: 'permission-request',
+      permissionSchema: {
+        issueCount: 1,
+        issues: [{ code: 'invalid_type', field: 'private-field', type: 'null' }],
+        unknownKeyCount: 0,
+        unknownKeyHashes: [],
+      },
+    },
+    ...[
+      { code: 'private-code', field: 'root', type: 'null' },
+      { code: 'invalid_type', field: 'root', type: 'private-type' },
+      { code: 'invalid_type', field: 'root', type: 'string', size: 1048577 },
+      { code: 'invalid_type', field: 'root', type: 'null', message: 'private-value' },
+    ].map((issue) => ({
+      site: 'permission-request',
+      permissionSchema: {
+        issueCount: 1,
+        issues: [issue],
+        unknownKeyCount: 0,
+        unknownKeyHashes: [],
+      },
+    })),
+    ...[
+      { issueCount: 1025 },
+      { unknownKeyCount: 1025 },
+      { issues: Array(17).fill({ code: 'invalid_type', field: 'root', type: 'null' }) },
+      { unknownKeyHashes: ['private-key'] },
+      { unknownKeyHashes: Array(17).fill('a'.repeat(64)) },
+    ].map((extra) => ({
+      site: 'permission-request',
+      permissionSchema: {
+        issueCount: 1,
+        issues: [{ code: 'invalid_type', field: 'root', type: 'null' }],
+        unknownKeyCount: 0,
+        unknownKeyHashes: [],
+        ...extra,
+      },
+    })),
   ])
     assert.equal(AcpDiagnosticSchema.safeParse(diagnostic).success, false);
   const output = new (await import('node:stream')).PassThrough();

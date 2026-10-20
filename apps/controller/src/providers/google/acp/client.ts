@@ -220,6 +220,71 @@ export const AcpDiagnosticSchema = z.strictObject({
     ])
     .optional(),
   permissionActionBytes: z.number().int().min(0).max(1048576).optional(),
+  permissionSchema: z
+    .strictObject({
+      issueCount: z.number().int().min(1).max(1024),
+      issues: z
+        .array(
+          z.strictObject({
+            code: z.enum([
+              'invalid_type',
+              'too_big',
+              'too_small',
+              'invalid_format',
+              'not_multiple_of',
+              'unrecognized_keys',
+              'invalid_union',
+              'invalid_key',
+              'invalid_element',
+              'invalid_value',
+              'custom',
+              'other',
+            ]),
+            field: z.enum([
+              'root',
+              'sessionId',
+              'toolCall',
+              'toolCall.sessionUpdate',
+              'toolCall.toolCallId',
+              'toolCall.name',
+              'toolCall.title',
+              'toolCall.kind',
+              'toolCall.status',
+              'toolCall.rawInput',
+              'toolCall.rawOutput',
+              'toolCall._meta',
+              'toolCall.content',
+              'toolCall.locations',
+              'toolCall.locations.path',
+              'toolCall.locations.line',
+              'options',
+              'options.optionId',
+              'options.name',
+              'options.kind',
+              'other',
+            ]),
+            type: z.enum([
+              'undefined',
+              'null',
+              'array',
+              'object',
+              'string',
+              'number',
+              'boolean',
+              'other',
+            ]),
+            size: z.number().int().min(0).max(1048576).optional(),
+          }),
+        )
+        .min(1)
+        .max(16),
+      unknownKeyCount: z.number().int().min(0).max(1024),
+      unknownKeyHashes: z
+        .array(z.string().regex(/^[0-9a-f]{64}$/))
+        .max(16)
+        .refine((hashes) => new Set(hashes).size === hashes.length),
+    })
+    .optional(),
   // Keep only digests of machine identifiers. Provider text and argument values stay out.
   toolIdentityHash: z
     .string()
