@@ -295,6 +295,8 @@ function workspaceRead(snapshot: Snapshot, command: Command): CommandResult | nu
       usageReaders,
       nativeProfiles,
       googleAcpSetup,
+      googleAcpInstall,
+      nativeConnections,
       localSetup,
     } = snapshot;
     return {
@@ -310,6 +312,8 @@ function workspaceRead(snapshot: Snapshot, command: Command): CommandResult | nu
         usageReaders,
         nativeProfiles,
         googleAcpSetup,
+        googleAcpInstall,
+        nativeConnections,
         localSetup,
       },
     };

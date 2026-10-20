@@ -3,7 +3,13 @@ import { useState } from 'react';
 import { googleAcpLabel } from './launch.tsx';
 import type { Workspace } from './source.ts';
 
-export function GoogleSetup({ snapshot, workspace }: { snapshot: Snapshot; workspace: Workspace }) {
+export function GoogleSetup({
+  snapshot,
+  workspace,
+}: {
+  snapshot: Pick<Snapshot, 'googleAcpSetup' | 'googleAcpInstall' | 'nativeProfiles'>;
+  workspace: Workspace;
+}) {
   const setup = snapshot.googleAcpSetup;
   const installation = snapshot.googleAcpInstall;
   const profile = snapshot.nativeProfiles.find(
