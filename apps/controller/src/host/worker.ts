@@ -367,9 +367,10 @@ export class OwnedCommand {
   failed = false;
   ownershipUnknown = false;
   private bytes = 0;
-  private closedObserved = false;
   private quiescenceRecorded = false;
   private readonly lifecycle?: OwnedCommandLifecycle;
+  // This authority exists only for the fresh child created by this instance. It is never restored
+  // from a saved PID and retires only after positive process-group absence.
   private ownsGroup = false;
   private readonly streaming: boolean;
   private stopEscalation?: () => void;
@@ -433,12 +434,7 @@ export class OwnedCommand {
         resolve({ code: null, signal: null, quiescent: this.group === 0 });
       });
     });
-    this.closed = new Promise((resolve) =>
-      this.child.once('close', () => {
-        this.closedObserved = true;
-        resolve();
-      }),
-    );
+    this.closed = new Promise((resolve) => this.child.once('close', () => resolve()));
     if (streaming) {
       this.stdoutStream = streamChunks(this.child.stdout, () => {
         this.failed = true;
@@ -531,9 +527,6 @@ export class OwnedCommand {
       this.stopEscalation = undefined;
       return false;
     }
-    // Open child pipes keep the fresh in-memory ownership current after leader exit.
-    // Once close is observed, a numeric group alone is historical and is never signaled.
-    if (this.closedObserved) return false;
     try {
       process.kill(-this.group, signal);
       return true;

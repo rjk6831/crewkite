@@ -79,7 +79,7 @@ test('owned commands stream bounded output and keep cancellation owned through c
   const cancelledEvents: string[] = [];
   const ready = Promise.withResolvers<void>();
   const stubborn = "process.on('SIGTERM',()=>{});process.send('ready');setInterval(()=>{},1000);";
-  const descendant = `const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e',${JSON.stringify(stubborn)}],{stdio:['ignore','inherit','inherit','ipc']});child.once('message',()=>process.stdout.write('ready',()=>process.exit(0)));`;
+  const descendant = `const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e',${JSON.stringify(stubborn)}],{stdio:['ignore','ignore','ignore','ipc']});child.once('message',()=>process.stdout.write('ready',()=>process.exit(0)));`;
   const cancelled = new OwnedCommand({
     streaming: true,
     operationId: 'cmd_stream_cancel',
@@ -103,9 +103,11 @@ test('owned commands stream bounded output and keep cancellation owned through c
   const leaderExit = await cancelled.exited;
   assert.equal(leaderExit.code, 0);
   assert.equal(leaderExit.signal, null);
-  cancelled.stop();
   const [beforeStop, cancelledError] = await cancelledOutput;
   await cancelled.closed;
+  assert.equal(await cancelled.quiescent(), false);
+  cancelled.stop();
+  await new Promise((resolve) => setTimeout(resolve, 1100));
   assert.equal(beforeStop.toString('utf8'), 'ready');
   assert.equal(cancelledError.byteLength, 0);
   assert.equal(await cancelled.quiescent(), true);
