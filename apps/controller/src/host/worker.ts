@@ -1,5 +1,17 @@
 import { type ChildProcessWithoutNullStreams, spawn as spawnProcess } from 'node:child_process';
-import { mkdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  realpathSync,
+} from 'node:fs';
+import { basename, isAbsolute, resolve } from 'node:path';
+import type { Readable } from 'node:stream';
 import {
   type FakeWorkerEvent,
   FakeWorkerEventSchema,
@@ -35,6 +47,176 @@ export const defaultSchedule: Schedule = (work, milliseconds) => {
   return () => clearTimeout(timer);
 };
 type Exit = { code: number | null; signal: NodeJS.Signals | null; quiescent: boolean };
+const maximumCommandChunkBytes = 64 * 1024;
+const commandEnvironmentNames = new Set([
+  'CI',
+  'HOME',
+  'LANG',
+  'LC_ALL',
+  'NO_COLOR',
+  'PATH',
+  'TMPDIR',
+  'TZ',
+]);
+const commandShellNames = new Set([
+  'bash',
+  'cmd',
+  'cmd.exe',
+  'dash',
+  'fish',
+  'ksh',
+  'powershell',
+  'pwsh',
+  'sh',
+  'zsh',
+]);
+export type OwnedCommandLaunch = Readonly<{
+  operationId: string;
+  executable: string;
+  executableSha256: string;
+  argv: readonly string[];
+  cwd: string;
+  environment: Readonly<Record<string, string>>;
+  shell: false;
+}>;
+export type OwnedCommandLifecycle = Readonly<{
+  intent: (launch: OwnedCommandLaunch) => void;
+  owned: (group: number) => void;
+  quiescent: (group: number) => void;
+}>;
+
+function synchronous(callback: () => void) {
+  const result: unknown = callback();
+  if (result && typeof (result as PromiseLike<unknown>).then === 'function') {
+    void Promise.resolve(result).catch(() => {});
+    throw Error('Command ownership callbacks must finish synchronously.');
+  }
+}
+
+function commandDirectory(directory: string) {
+  if (!isAbsolute(directory) || resolve(directory) !== directory)
+    throw Error('Command working directory must be absolute.');
+  const state = lstatSync(directory);
+  if (!state.isDirectory() || state.isSymbolicLink() || realpathSync(directory) !== directory)
+    throw Error('Command working directory must be canonical.');
+}
+
+export function verifyOwnedCommandExecutable(executable: string, sha256: string) {
+  if (
+    !isAbsolute(executable) ||
+    resolve(executable) !== executable ||
+    realpathSync(executable) !== executable ||
+    !/^[a-f0-9]{64}$/.test(sha256)
+  )
+    throw Error('Command executable identity is invalid.');
+  if (commandShellNames.has(basename(executable).toLowerCase()))
+    throw Error('Owned commands do not grant shell authority.');
+  const path = lstatSync(executable);
+  if (!path.isFile() || path.isSymbolicLink() || (path.mode & 0o111) === 0)
+    throw Error('Command executable identity is invalid.');
+  const descriptor = openSync(
+    executable,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
+  try {
+    const before = fstatSync(descriptor, { bigint: true });
+    if (!before.isFile() || before.size > 256n * 1024n * 1024n)
+      throw Error('Command executable identity is invalid.');
+    const hash = createHash('sha256');
+    const buffer = Buffer.allocUnsafe(maximumCommandChunkBytes);
+    let bytes = 0n;
+    while (true) {
+      const count = readSync(descriptor, buffer, 0, buffer.length, null);
+      if (count === 0) break;
+      hash.update(buffer.subarray(0, count));
+      bytes += BigInt(count);
+    }
+    const after = fstatSync(descriptor, { bigint: true });
+    if (
+      bytes !== before.size ||
+      (['dev', 'ino', 'size', 'mode', 'uid', 'gid', 'mtimeNs', 'ctimeNs'] as const).some(
+        (key) => before[key] !== after[key],
+      ) ||
+      hash.digest('hex') !== sha256
+    )
+      throw Error('Command executable identity changed.');
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function validateCommandLaunch(launch: OwnedCommandLaunch) {
+  if (
+    !/^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,199}$/.test(launch.operationId) ||
+    launch.shell !== false ||
+    !Array.isArray(launch.argv) ||
+    launch.argv.length > 128
+  )
+    throw Error('Command launch is invalid.');
+  let argumentBytes = 0;
+  for (const argument of launch.argv) {
+    if (
+      typeof argument !== 'string' ||
+      argument.includes('\0') ||
+      Buffer.byteLength(argument) > 8192
+    )
+      throw Error('Command arguments are invalid.');
+    argumentBytes += Buffer.byteLength(argument);
+  }
+  if (argumentBytes > 64 * 1024) throw Error('Command arguments exceed their bound.');
+  if (
+    !launch.environment ||
+    typeof launch.environment !== 'object' ||
+    Array.isArray(launch.environment) ||
+    Object.keys(launch.environment).length > commandEnvironmentNames.size
+  )
+    throw Error('Command environment is invalid.');
+  let environmentBytes = 0;
+  for (const [name, value] of Object.entries(launch.environment)) {
+    if (!commandEnvironmentNames.has(name) || typeof value !== 'string' || value.includes('\0'))
+      throw Error('Command environment is invalid.');
+    environmentBytes += Buffer.byteLength(name) + Buffer.byteLength(value);
+  }
+  if (environmentBytes > 16 * 1024) throw Error('Command environment exceeds its bound.');
+  commandDirectory(launch.cwd);
+  verifyOwnedCommandExecutable(launch.executable, launch.executableSha256);
+}
+
+function streamChunks(source: Readable, failed: () => void): AsyncIterable<Uint8Array> {
+  return {
+    async *[Symbol.asyncIterator]() {
+      try {
+        for await (const value of source) {
+          if (!Buffer.isBuffer(value)) throw Error('Command output must be bytes.');
+          for (let offset = 0; offset < value.length; offset += maximumCommandChunkBytes)
+            yield value.subarray(offset, offset + maximumCommandChunkBytes);
+        }
+      } catch (error) {
+        failed();
+        throw error;
+      }
+    },
+  };
+}
+
+type BufferedCommandOptions = Readonly<{
+  argv: string[];
+  directory: string;
+  environmentHome: string;
+  onSpawn: (pid: number) => void;
+  streaming?: false;
+}>;
+export type StreamingCommandOptions = Readonly<{
+  streaming: true;
+  operationId: string;
+  executable: string;
+  executableSha256: string;
+  argv: readonly string[];
+  directory: string;
+  environment: Readonly<Record<string, string>>;
+  lifecycle: OwnedCommandLifecycle;
+  onSpawn?: (pid: number) => void;
+}>;
 export class OwnedWorker {
   readonly child: ChildProcessWithoutNullStreams;
   readonly exited: Promise<Exit>;
@@ -170,29 +352,58 @@ export class OwnedCommand {
   readonly closed: Promise<void>;
   readonly stdout: Buffer[] = [];
   readonly stderr: Buffer[] = [];
+  readonly stdoutStream?: AsyncIterable<Uint8Array>;
+  readonly stderrStream?: AsyncIterable<Uint8Array>;
   readonly group: number;
   failed = false;
   private bytes = 0;
-  constructor(options: {
-    argv: string[];
-    directory: string;
-    environmentHome: string;
-    onSpawn: (pid: number) => void;
-  }) {
+  private quiescenceError?: unknown;
+  private quiescenceRecorded = false;
+  private readonly lifecycle?: OwnedCommandLifecycle;
+  constructor(options: BufferedCommandOptions | StreamingCommandOptions) {
     if (process.platform === 'win32')
       throw new Error('Process ownership evidence requires a Unix process group.');
-    mkdirSync(options.environmentHome, { recursive: true, mode: 0o700 });
-    this.child = spawn(process.execPath, options.argv, {
-      cwd: options.directory,
-      detached: true,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: {
-        ...checkEnvironment(),
-        PATH: process.env.PATH,
-        LANG: 'C',
-        HOME: options.environmentHome,
-      },
-    });
+    const streaming = options.streaming === true;
+    let launch: OwnedCommandLaunch | undefined;
+    if (streaming) {
+      launch = Object.freeze({
+        operationId: options.operationId,
+        executable: options.executable,
+        executableSha256: options.executableSha256,
+        argv: Object.freeze([...options.argv]),
+        cwd: options.directory,
+        environment: Object.freeze({ ...options.environment }),
+        shell: false,
+      });
+      validateCommandLaunch(launch);
+      synchronous(() => options.lifecycle.intent(launch as OwnedCommandLaunch));
+      commandDirectory(launch.cwd);
+      verifyOwnedCommandExecutable(launch.executable, launch.executableSha256);
+      this.lifecycle = options.lifecycle;
+    } else {
+      mkdirSync(options.environmentHome, { recursive: true, mode: 0o700 });
+    }
+    if (streaming) {
+      if (!launch) throw Error('Command launch is unavailable.');
+      this.child = spawn(launch.executable, [...launch.argv], {
+        cwd: launch.cwd,
+        detached: true,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...launch.environment },
+      });
+    } else {
+      this.child = spawn(process.execPath, [...options.argv], {
+        cwd: options.directory,
+        detached: true,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: {
+          ...checkEnvironment(),
+          PATH: process.env.PATH,
+          LANG: 'C',
+          HOME: options.environmentHome,
+        },
+      });
+    }
     this.group = this.child.pid ?? 0;
     this.exited = new Promise((resolve) => {
       this.child.once('exit', (code, signal) =>
@@ -204,23 +415,54 @@ export class OwnedCommand {
       });
     });
     this.closed = new Promise((resolve) => this.child.once('close', () => resolve()));
-    for (const channel of ['stdout', 'stderr'] as const)
-      this.child[channel].on('data', (chunk: Buffer) => {
-        this.bytes += chunk.length;
-        if (this.bytes > MAX_FRAME_BYTES) {
-          this.failed = true;
-          this.stop();
-          return;
-        }
-        this[channel].push(chunk);
+    if (streaming) {
+      this.stdoutStream = streamChunks(this.child.stdout, () => {
+        this.failed = true;
       });
-    if (this.group) options.onSpawn(this.group);
+      this.stderrStream = streamChunks(this.child.stderr, () => {
+        this.failed = true;
+      });
+    } else {
+      for (const channel of ['stdout', 'stderr'] as const)
+        this.child[channel].on('data', (chunk: Buffer) => {
+          this.bytes += chunk.length;
+          if (this.bytes > MAX_FRAME_BYTES) {
+            this.failed = true;
+            this.stop();
+            return;
+          }
+          this[channel].push(chunk);
+        });
+    }
+    if (this.group)
+      try {
+        if (streaming) synchronous(() => options.lifecycle.owned(this.group));
+        if (streaming) synchronous(() => options.onSpawn?.(this.group));
+        else options.onSpawn(this.group);
+      } catch (error) {
+        try {
+          process.kill(-this.group, 'SIGKILL');
+        } catch {}
+        throw error;
+      }
     this.child.stdin.end();
   }
   async quiescent(schedule: Schedule = defaultSchedule): Promise<boolean> {
+    if (this.quiescenceError) throw this.quiescenceError;
     if (!(await closedWithin(this.closed, schedule))) return false;
     // A descendant can outlive the leader and finish before the streams close.
-    return this.group === 0 ? this.failed : groupAbsent(this.group);
+    const quiescent = this.group === 0 ? this.failed : groupAbsent(this.group);
+    if (quiescent && this.group > 0 && this.lifecycle && !this.quiescenceRecorded) {
+      this.quiescenceRecorded = true;
+      try {
+        synchronous(() => this.lifecycle?.quiescent(this.group));
+      } catch (error) {
+        this.failed = true;
+        this.quiescenceError = error;
+        throw error;
+      }
+    }
+    return quiescent;
   }
   stop() {
     if (
