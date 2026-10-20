@@ -236,3 +236,11 @@ packages/
 docs/           public documentation and ADRs
 scripts/        repository policy checks
 ```
+
+## Planned daily-work extensions
+
+The current limits above describe shipped code, including whole-snapshot and source bounds. [Daily-work slices](daily-work-slices.md) records the implementation order; none of those planned capabilities is established by this section.
+
+[Proposed ADR 0027](adr/0027-page-large-data-without-project-size-ceilings.md) keeps bounded transfer frames while paging views and streaming source, artifacts and integration. Aggregate project size should be limited by available resources and supported content, with explicit failures. A transport frame should not impose that product ceiling. Provider context assembly remains a separate, measured selection over retained local content.
+
+[Proposed ADR 0028](adr/0028-journal-project-commands-and-remote-effects.md) places project commands and GitHub effects under the existing controller owner. Read-only status/log retrieval, local commands and remote publication keep distinct authority. The renderer retains its narrow bridge, and historical receipts cannot authorize replay of an uncertain command or remote effect.

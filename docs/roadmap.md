@@ -10,7 +10,7 @@ I deliver CrewKite in milestones that each make one claim I can test. Dates foll
 | D1a Supervised native work | One qualified official client works in scratch. I can inspect activity and approvals, stop truthfully, keep an edit, reopen it and export it | A real patch from one of my projects that is worth reopening the next day |
 | D1b Checked dogfood | Immutable candidates, independent checks and review, acceptance as a new local branch | A checked result branch with its evidence receipt |
 | D2 Daily-driver release 0.1 | Qualified OpenAI, Anthropic, Google and Local routes in useful roles, durable handoff, honest usage, finite review, two coding slices with a combined check, safe self-development | Ten real tasks from my own backlog, observed end to end |
-| D2b Daily-work scale and acceptance | Large repositories, files and context; local Instant History; optional older-history compression; practical multi-file and GitHub/CI work | A representative real-project acceptance matrix passes at scale, including interruption, recovery and cross-version reopen |
+| D2b Daily-work scale and acceptance | Independently released D2b.1 onward: large projects and GitHub/CI first, multi-file coding and commands next, recovery and measured acceptance, then local history modes | Each slice has its own green CI and UAT package. The representative real-project matrix passes before a coding-scope claim |
 | D2c Optional stabilization | UAT corrections and remaining stabilization identified after D2b | Required corrections are verified; this milestone is used when observed issues need it |
 | D3 Distribution | Package provenance, install, recovery, compatibility, notices, privacy and signing for a stated audience | A clean install on a machine that never saw the source tree |
 
@@ -32,16 +32,15 @@ I am preparing the candidate around normal registered projects and supported pro
 
 ## D2b daily-work acceptance
 
-D2b is planned work after the D2 UAT candidate. I will define a representative daily-work acceptance matrix before claiming this scope is complete:
+I will ship D2b in small usable releases, beginning after the verified D2 UAT package. [Daily-work slices](daily-work-slices.md) is the implementation entry point and progress record. It names the next slice, actual code gaps, dependencies, acceptance and package release steps.
 
-- Handle large files, repositories and context through streaming, pagination, segmented reads, backpressure and indexed retrieval. Remove arbitrary product-size ceilings while keeping finite message framing and resource accounting. Provider context windows remain real constraints; context assembly and compaction must make those limits explicit.
-- Add local Instant History for the conversation, task, tool, attachment and result history CrewKite actually receives. Use indexes, segmented reads and UI virtualization for fast task opening and scrolling without a network round trip. Measure cold and warm large-history latency. Separate cloud-app conversations and server-only data remain outside that access.
-- Offer an optional mode that compresses older history sections independently, with a configurable age threshold. Keep indexes and recent content readily available, decompress requested sections in the background and cache nearby sections. Preserve every retained section and its integrity; measure latency and storage gains.
-- Support practical multi-file edits, commands, diffs, tests, Git branch, commit and push, and GitHub CLI (`gh`) workflows. Include PRs and GitHub Actions/CI status and logs in the normal task workflow, with clear authority, cancellation, durable results and supported native-provider boundaries.
-- Exercise large repositories, files, long conversations and concurrent work through restart, interruption, disk pressure and corrupted archives. Recovery must keep history durable and prevent one large response from blocking unrelated work.
-- Retain matching trusted verification runtimes and their provenance across updates. Test cross-version reopen without repeating a completed model contribution. Include legitimate changes to code, tests, configuration and dependencies while preserving independent verification authority.
+D2b.1 separates workspace/task status from whole-history reads. D2b.2 streams retained artifacts and output; D2b.3 scales project capture. D2b.4 adds task-linked GitHub PR, Actions status and CI logs. Large diffs and context, project commands and useful multi-file changes follow as separate releases, leading into checked push and PR publication. Restart and cross-version recovery complete the representative daily-work acceptance suite before I claim the stated coding scope.
 
-D2c is optional stabilization and UAT correction work, determined by observed issues after D2b. I will approve D3 separately after D2b acceptance and any required stabilization.
+Instant History and optional older-history compression follow the coding releases. They retain the history CrewKite actually receives, with local indexes, segmented reads and measured cold/warm access. Separate cloud-app history still requires a supported access or import path.
+
+One usable release every day or so is the target. The first two slices establish measured throughput; a slice that grows splits at a usable boundary. Each release keeps its source, CI and package evidence separate. D2b.1, D2b.2 and subsequent numbers stay under one milestone, so a small delivery does not redefine the D2 exit or create another distribution milestone.
+
+D2c remains optional stabilization driven by observed UAT issues. Required daily-work corrections cannot be deferred behind a parity claim. I will approve D3 separately after D2b acceptance and any required stabilization.
 
 ## Work packets
 
