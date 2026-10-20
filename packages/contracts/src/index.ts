@@ -451,6 +451,7 @@ export const GoogleAcpCapabilitiesSchema = z.strictObject({
 export const GoogleAcpReasonSchema = z.enum([
   ...GoogleNativeProfileSchema.shape.reason.options,
   'acp-capability-missing',
+  'acp-setup-timeout',
   'auth-method-mismatch',
   'authentication-required',
 ]);

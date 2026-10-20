@@ -294,7 +294,7 @@ export class ControllerClient {
                   : command.command === 'AuthenticateGoogleAcp'
                     ? 130000
                     : command.command === 'InitializeGoogleAcp'
-                      ? 15000
+                      ? 35000
                       : ['ObserveUsage', 'DiscoverGoogleAcp', 'StopGoogleAcpSetup'].includes(
                             command.command,
                           )

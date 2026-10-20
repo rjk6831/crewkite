@@ -744,6 +744,41 @@ test('the acp writer binds an imported client and observed configuration before 
     }).result;
     assert.equal(init.reason, null);
     assert(init.quiescent && init.metadata);
+    for (const elapsed of [4500, 29000]) {
+      const cold = fixture('complete');
+      let clock = 0;
+      const scheduled: { work: () => void; milliseconds: number }[] = [];
+      try {
+        const outcome = await startGoogleAcpSetup({
+          client: cold.client,
+          directory: cold.directory(),
+          environment,
+          operation: 'initialize',
+          priorProof: null,
+          now: () => clock,
+          schedule: (work, milliseconds) => {
+            scheduled.push({ work, milliseconds });
+            return () => {};
+          },
+          lifecycle: {
+            ...cold.lifecycle,
+            owned: (group) => {
+              cold.lifecycle.owned(group);
+              clock = elapsed;
+              scheduled.find((timer) => timer.milliseconds <= elapsed)?.work();
+            },
+          },
+          spawn: spawnCheckChild as AcpSpawn,
+        }).result;
+        assert.equal(outcome.reason, elapsed === 4500 ? null : 'deadline');
+        assert.equal(outcome.metadata !== null, elapsed === 4500);
+        assert.ok(outcome.quiescent);
+        assert.ok(scheduled.some((timer) => timer.milliseconds === 29000));
+        assert.deepEqual(cold.phases, ['intent', 'owned', 'quiescent']);
+      } finally {
+        cold.dispose();
+      }
+    }
     const auth = await startGoogleAcpSetup({
       client: f.client,
       directory: f.directory(),

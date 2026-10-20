@@ -369,7 +369,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     { recipe: 'StartRun', expected: 40000 },
     { recipe: 'StartRun', timeoutMs: 10000, expected: 10000 },
     { recipe: 'StartRun', timeoutMs: 50000, expected: 50000 },
-    { recipe: 'InitializeGoogleAcp', expected: 15000 },
+    { recipe: 'InitializeGoogleAcp', expected: 35000 },
     { recipe: 'AuthenticateGoogleAcp', expected: 130000 },
     { recipe: 'DiscoverGoogleAcp', expected: 30000 },
     { recipe: 'StopGoogleAcpSetup', expected: 30000 },

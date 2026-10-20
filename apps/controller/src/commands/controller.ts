@@ -2115,11 +2115,13 @@ export class Controller {
           auth,
           reason: ready
             ? null
-            : outcome.reason === 'authentication'
-              ? 'authentication-required'
-              : !revoked && operation === 'discover'
-                ? 'acp-capability-missing'
-                : null,
+            : !revoked && outcome.reason === 'deadline'
+              ? 'acp-setup-timeout'
+              : outcome.reason === 'authentication'
+                ? 'authentication-required'
+                : !revoked && operation === 'discover'
+                  ? 'acp-capability-missing'
+                  : null,
         });
         this.store.putGoogleAcpSetup(setup);
         result = {
@@ -2130,7 +2132,17 @@ export class Controller {
                   ? 'google-ownership-unknown'
                   : revoked
                     ? 'acp-setup-stopped'
-                    : 'acp-setup-failed',
+                    : outcome.reason === 'deadline'
+                      ? 'acp-setup-timeout'
+                      : 'acp-setup-failed',
+              }
+            : {}),
+          ...(known && !revoked && outcome.reason === 'deadline'
+            ? {
+                next:
+                  operation === 'initialize'
+                    ? 'Initialization timed out after 30 seconds. Retry Initialize; no task was submitted.'
+                    : 'Native setup timed out. Retry this setup step; no task was submitted.',
               }
             : {}),
           data: { kind: 'google-acp-setup', setup },
