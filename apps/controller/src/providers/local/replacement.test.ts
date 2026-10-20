@@ -153,7 +153,14 @@ function fixture(input: LocalStart = plan) {
       assert.ok(sourceEnd < requirements);
       assert.ok(requirements < outputContract);
       assert.ok(message.content.includes(`\nTitle: ${title}\nOutcome: ${outcome}\n`));
-      assert.ok(message.content.includes(`\nRequirements:\n1. ${criteria[0]}\n`));
+      const allCriteria = criteria
+        .map((criterion, index) => `${index + 1}. ${criterion}`)
+        .join('\n');
+      assert.ok(message.content.includes(`\nRequirements:\n${allCriteria}\n`));
+      const scratchContract =
+        'The controller keeps the registered checkout and index unchanged. Your content is a replacement for the isolated scratch file and must implement the requested edit.';
+      assert.ok(message.content.endsWith(scratchContract));
+      assert.ok(message.content.lastIndexOf(scratchContract) > outputContract);
       assert.ok(message.content.includes('The CURRENT target file to edit'));
       const fence = (edge: string, kind: string, path: string) =>
         `----- ${edge} ${kind} ${path} ${input.binding.attemptId} -----`;

@@ -357,6 +357,7 @@ export function localChat(plan: LocalStart) {
         '',
         `Return one JSON object with version 1, attemptId ${attemptId}, path ${path}, baseHash ${baseHash} and content.`,
         'The content field is the complete new file.',
+        'The controller keeps the registered checkout and index unchanged. Your content is a replacement for the isolated scratch file and must implement the requested edit.',
       ].join('\n'),
     },
   ];
