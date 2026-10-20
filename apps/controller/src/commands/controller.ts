@@ -13112,6 +13112,7 @@ export class Controller {
             signal: outcome?.signal ?? null,
             stdoutBytes: outcome?.stdoutBytes ?? 0,
             stderrBytes: outcome?.stderrBytes ?? 0,
+            ...(outcome ? { stderrSummary: outcome.stderrSummary } : {}),
             trailingUpdates: outcome?.trailingUpdates ?? 0,
             rejectedOutsideWrites: outcome?.rejectedOutsideWrites ?? 0,
             openToolCount: outcome?.openToolCount ?? 0,

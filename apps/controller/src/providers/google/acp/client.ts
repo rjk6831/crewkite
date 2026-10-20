@@ -11,6 +11,117 @@ import {
   validateAcpDirectory,
 } from './profile.ts';
 
+const stderrSignalKinds = [
+  'authentication',
+  'quota',
+  'rate-limit',
+  'resource-exhausted',
+  'network',
+  'backoff',
+  'permission',
+  'model',
+  'uncaught',
+] as const;
+const stderrStatusCodes = [401, 403, 408, 413, 429, 500, 502, 503, 504] as const;
+const stderrCount = z.number().int().min(0).max(1024);
+export const AcpStderrSummarySchema = z.strictObject({
+  lines: stderrCount,
+  unclassifiedLines: stderrCount,
+  oversizedLines: stderrCount,
+  signals: z
+    .array(z.strictObject({ kind: z.enum(stderrSignalKinds), count: stderrCount.min(1) }))
+    .max(stderrSignalKinds.length)
+    .refine((values) => new Set(values.map((value) => value.kind)).size === values.length),
+  httpStatuses: z
+    .array(
+      z.strictObject({
+        code: z.union(stderrStatusCodes.map((code) => z.literal(code))),
+        count: stderrCount.min(1),
+      }),
+    )
+    .max(stderrStatusCodes.length)
+    .refine((values) => new Set(values.map((value) => value.code)).size === values.length),
+});
+export type AcpStderrSummary = z.infer<typeof AcpStderrSummarySchema>;
+const stderrPatterns: Record<(typeof stderrSignalKinds)[number], RegExp> = {
+  authentication: /\b(?:UNAUTHENTICATED|invalid_grant|invalid_token|authentication failed)\b/i,
+  quota: /\b(?:quota_exceeded|insufficient_quota|quota exceeded)\b/i,
+  'resource-exhausted': /\b(?:RESOURCE_EXHAUSTED|ResourceExhausted)\b/,
+  'rate-limit': /\b(?:rate_limit_exceeded|rate limit exceeded|too many requests)\b/i,
+  network:
+    /\b(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|CERT_HAS_EXPIRED|UNABLE_TO_VERIFY_LEAF_SIGNATURE|certificate verify failed)\b|\brpc error: code = (?:Unavailable|DeadlineExceeded)\b/i,
+  backoff: /\b(?:retrying (?:in|after) |backoff(?: delay)?[ :=]+)[0-9]+(?:ms|s| seconds?)?\b/i,
+  permission: /\b(?:PERMISSION_DENIED|permission denied)\b/i,
+  model: /\b(?:MODEL_NOT_FOUND|unsupported model|model not found)\b/i,
+  uncaught: /^(?:Traceback \(most recent call last\):|panic:|fatal error:)/,
+};
+
+// Only fixed signatures survive. An oversized line is discarded in full.
+export class AcpStderrClassifier {
+  private pending = Buffer.alloc(0);
+  private oversized = false;
+  private lines = 0;
+  private unclassifiedLines = 0;
+  private oversizedLines = 0;
+  private readonly signals = new Map<(typeof stderrSignalKinds)[number], number>();
+  private readonly statuses = new Map<(typeof stderrStatusCodes)[number], number>();
+  private line() {
+    this.lines = Math.min(1024, this.lines + 1);
+    if (this.oversized) this.oversizedLines = Math.min(1024, this.oversizedLines + 1);
+    else {
+      const text = this.pending.toString('latin1');
+      let matched = false;
+      for (const kind of stderrSignalKinds)
+        if (stderrPatterns[kind].test(text)) {
+          this.signals.set(kind, Math.min(1024, (this.signals.get(kind) ?? 0) + 1));
+          matched = true;
+        }
+      const status =
+        /\bHTTP(?:\/[12](?:\.[0-9])?)?(?:[ "']+(?:status|error|response))?[ "':=]+(401|403|408|413|429|500|502|503|504)\b/i.exec(
+          text,
+        );
+      if (status) {
+        const code = Number(status[1]) as (typeof stderrStatusCodes)[number];
+        this.statuses.set(code, Math.min(1024, (this.statuses.get(code) ?? 0) + 1));
+        matched = true;
+      }
+      if (!matched) this.unclassifiedLines = Math.min(1024, this.unclassifiedLines + 1);
+    }
+    this.pending = Buffer.alloc(0);
+    this.oversized = false;
+  }
+  push(bytes: Buffer) {
+    let start = 0;
+    while (start < bytes.length) {
+      const end = bytes.indexOf(10, start);
+      const stop = end < 0 ? bytes.length : end;
+      if (!this.oversized) {
+        if (this.pending.length + stop - start > 8192) {
+          this.pending = Buffer.alloc(0);
+          this.oversized = true;
+        } else this.pending = Buffer.concat([this.pending, bytes.subarray(start, stop)]);
+      }
+      if (end < 0) break;
+      this.line();
+      start = end + 1;
+    }
+  }
+  finish(): AcpStderrSummary {
+    if (this.pending.length || this.oversized) this.line();
+    return AcpStderrSummarySchema.parse({
+      lines: this.lines,
+      unclassifiedLines: this.unclassifiedLines,
+      oversizedLines: this.oversizedLines,
+      signals: stderrSignalKinds.flatMap((kind) =>
+        this.signals.has(kind) ? [{ kind, count: this.signals.get(kind) }] : [],
+      ),
+      httpStatuses: stderrStatusCodes.flatMap((code) =>
+        this.statuses.has(code) ? [{ code, count: this.statuses.get(code) }] : [],
+      ),
+    });
+  }
+}
+
 export type AcpReason =
   | 'identity'
   | 'launch'
@@ -204,6 +315,7 @@ export type AcpProcessOutcome<T> = {
   signal: NodeJS.Signals | null;
   stdoutBytes: number;
   stderrBytes: number;
+  stderrSummary: AcpStderrSummary;
   diagnostic: AcpDiagnostic | null;
 };
 export type AcpSpawn = (
@@ -533,8 +645,10 @@ export function startAcpProcess<T>(
   child.stderr.on('error', () =>
     connection.fail(new AcpError('protocol', { site: 'stderr-stream' })),
   );
+  const stderrClassifier = new AcpStderrClassifier();
   child.stderr.on('data', (bytes: Buffer) => {
     stderrBytes += bytes.length;
+    if (stderrBytes <= stderrLimit) stderrClassifier.push(bytes);
     if (stderrBytes > stderrLimit)
       connection.fail(new AcpError('output-limit', { site: 'stderr-output' }));
   });
@@ -643,6 +757,7 @@ export function startAcpProcess<T>(
         signal,
         stdoutBytes: connection.stdoutBytes,
         stderrBytes,
+        stderrSummary: stderrClassifier.finish(),
         diagnostic: connection.diagnostic,
       };
     }

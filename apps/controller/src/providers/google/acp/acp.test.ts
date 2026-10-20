@@ -26,6 +26,8 @@ import {
   AcpError,
   type AcpLifecycle,
   type AcpSpawn,
+  AcpStderrClassifier,
+  AcpStderrSummarySchema,
 } from './client.ts';
 import { type AcpImportDependencies, importGoogleAcp } from './import.ts';
 import {
@@ -1544,6 +1546,7 @@ setInterval(() => {}, 1000);
       writeFileSync(
         f.client.executable,
         `#!${process.execPath}
+process.stderr.write(${name === 'ordinary-stderr' ? JSON.stringify('HTTP status 503\nretrying in 3s\n') : '""'});
 process.stderr.write('x'.repeat(${stderrBytes}));
 process.stdin.on('data', bytes => {
   const request = JSON.parse(bytes.toString());
@@ -1564,7 +1567,17 @@ setInterval(() => {}, 1000);
         spawn: spawnCheckChild as AcpSpawn,
       }).result;
       assert(outcome.quiescent, name);
-      assert.equal(outcome.stderrBytes, stderrBytes, name);
+      const prefixBytes =
+        name === 'ordinary-stderr' ? Buffer.byteLength('HTTP status 503\nretrying in 3s\n') : 0;
+      assert.equal(outcome.stderrBytes, stderrBytes + prefixBytes, name);
+      if (name === 'ordinary-stderr')
+        assert.deepEqual(outcome.stderrSummary, {
+          lines: 3,
+          unclassifiedLines: 0,
+          oversizedLines: 1,
+          signals: [{ kind: 'backoff', count: 1 }],
+          httpStatuses: [{ code: 503, count: 1 }],
+        });
       assert.equal(outcome.reason, name === 'ordinary-stderr' ? null : 'output-limit', name);
       assert.deepEqual(
         outcome.diagnostic,
@@ -1575,6 +1588,91 @@ setInterval(() => {}, 1000);
       f.dispose();
     }
   }
+  const signatureLines = [
+    'UNAUTHENTICATED account=private@example.invalid',
+    'quota_exceeded private/path',
+    'rate_limit_exceeded secret-token',
+    'rpc error: code = ResourceExhausted private reason',
+    'ECONNRESET https://private.invalid?token=secret',
+    'retrying in 3s',
+    'PERMISSION_DENIED /private/home',
+    'MODEL_NOT_FOUND private-model',
+    'Traceback (most recent call last):',
+    'HTTP/2 401 private headers',
+    'HTTP status 403 private body',
+    'HTTP error 429 private body',
+    'HTTP response 503 private body',
+    'HTTP status 200',
+    'retry policy permits 3 attempts',
+    'authentication configured; model catalog loaded; quota refreshed',
+    'private status=429 and private path /HTTP/503',
+  ].join('\n');
+  const expectedSummary = {
+    lines: 17,
+    unclassifiedLines: 4,
+    oversizedLines: 0,
+    signals: [
+      { kind: 'authentication', count: 1 },
+      { kind: 'quota', count: 1 },
+      { kind: 'rate-limit', count: 1 },
+      { kind: 'resource-exhausted', count: 1 },
+      { kind: 'network', count: 1 },
+      { kind: 'backoff', count: 1 },
+      { kind: 'permission', count: 1 },
+      { kind: 'model', count: 1 },
+      { kind: 'uncaught', count: 1 },
+    ],
+    httpStatuses: [
+      { code: 401, count: 1 },
+      { code: 403, count: 1 },
+      { code: 429, count: 1 },
+      { code: 503, count: 1 },
+    ],
+  };
+  for (const chunkSize of [1, 7, 8192]) {
+    const classifier = new AcpStderrClassifier();
+    const bytes = Buffer.from(signatureLines);
+    for (let at = 0; at < bytes.length; at += chunkSize)
+      classifier.push(bytes.subarray(at, at + chunkSize));
+    assert.deepEqual(classifier.finish(), expectedSummary, `stderr chunks ${chunkSize}`);
+    assert.deepEqual(classifier.finish(), expectedSummary, 'EOF flush is idempotent');
+    assert(!JSON.stringify(classifier.finish()).includes('private'));
+  }
+  const oversized = new AcpStderrClassifier();
+  oversized.push(Buffer.from(`UNAUTHENTICATED${'x'.repeat(8193)}`));
+  oversized.push(Buffer.from('HTTP 401\nECONNRESET\n'));
+  assert.deepEqual(oversized.finish(), {
+    lines: 2,
+    unclassifiedLines: 0,
+    oversizedLines: 1,
+    signals: [{ kind: 'network', count: 1 }],
+    httpStatuses: [],
+  });
+  const saturated = new AcpStderrClassifier();
+  saturated.push(Buffer.from('HTTP 503\n'.repeat(1025)));
+  assert.deepEqual(saturated.finish(), {
+    lines: 1024,
+    unclassifiedLines: 0,
+    oversizedLines: 0,
+    signals: [],
+    httpStatuses: [{ code: 503, count: 1024 }],
+  });
+  for (const invalid of [
+    { ...expectedSummary, raw: 'private' },
+    { ...expectedSummary, signals: [{ kind: 'private', count: 1 }] },
+    { ...expectedSummary, signals: [{ kind: 'network', count: 1025 }] },
+    {
+      ...expectedSummary,
+      signals: [
+        { kind: 'network', count: 1 },
+        { kind: 'network', count: 1 },
+      ],
+    },
+    { ...expectedSummary, httpStatuses: [{ code: 200, count: 1 }] },
+    { ...expectedSummary, httpStatuses: [{ code: 503, count: 1.5 }] },
+    { ...expectedSummary, httpStatuses: [{ code: 503, count: 1, message: 'private' }] },
+  ])
+    assert.equal(AcpStderrSummarySchema.safeParse(invalid).success, false);
   const late = fixture('complete');
   let lateClock = 0;
   try {
