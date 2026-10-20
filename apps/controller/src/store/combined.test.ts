@@ -1354,8 +1354,17 @@ test('combined tasks share seven real dispatches and require a separate full bar
       assert.equal(refValue(context.source.directory, 'refs/heads/combined'), acceptedHead);
     }
   };
-  const pending = scenarioQueues.map((scenarios, queue) => run(scenarios, queue));
-  const results = await Promise.allSettled(pending);
+  // Synchronous acceptance and restart work must not consume a sibling fixture's read deadline.
+  // Each scenario still admits and observes its two writers together.
+  const results: PromiseSettledResult<void>[] = [];
+  for (const [queue, scenarios] of scenarioQueues.entries()) {
+    try {
+      await run(scenarios, queue);
+      results.push({ status: 'fulfilled', value: undefined });
+    } catch (reason) {
+      results.push({ status: 'rejected', reason });
+    }
+  }
   for (const [index, result] of results.entries())
     if (result.status === 'rejected') {
       const error = result.reason instanceof Error ? result.reason : Error(String(result.reason));
