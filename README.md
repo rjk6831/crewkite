@@ -11,7 +11,7 @@ I completed ten real D2 backlog outcomes through the normal checked workflow. I 
 
 ## Why I am building it
 
-I use OpenAI and Anthropic coding subscriptions in my daily work. Each has its own interface, allowance and reset schedule. When one runs low, I stop to write a handoff and carry the context to the next tool. I keep that arithmetic in my head while trying to finish the work. Google consumer CLI launch is deferred because its published headless policy excludes third-party application wrappers.
+I use OpenAI, Anthropic and Google coding subscriptions in my daily work. Each has its own interface, allowance and reset schedule. When one runs low, I stop to write a handoff and carry the context to the next tool. I keep that arithmetic in my head while trying to finish the work. Google coding in this preview uses its published ACP agent with my own Google sign-in. Its consumer CLI headless-wrapper route stays unavailable under the published policy. The [provider routes](docs/providers.md#google-acp-writer) describe the shipped workflow and setup.
 
 After upgrading my computer, I am exploring local AI alongside my subscriptions. I want to learn which jobs local models handle well and where a subscription route is more useful. My aim is to make that choice in the same interface, with the task and its history still in front of me.
 
