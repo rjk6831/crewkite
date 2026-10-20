@@ -14,7 +14,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { link, open, unlink } from 'node:fs/promises';
+import { open, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 
 const BUFFER_LIMIT = 64 * 1024 * 1024;
@@ -249,14 +249,22 @@ export class ArtifactFiles {
       const hash = digest.digest('hex');
       options.signal?.throwIfAborted();
       // Once linked, finish publication even if cancellation arrives during the directory flush.
+      let linked = false;
       try {
-        await link(temporary, this.path(hash));
+        linkSync(temporary, this.path(hash));
+        linked = true;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
         const existing = await this.verify(hash, options);
         if (existing.bytes !== bytes) throw new Error('Artifact length does not match its hash.');
       }
-      await unlink(temporary);
+      // Readers require one link. Do not yield between publishing and removing the incoming name.
+      try {
+        unlinkSync(temporary);
+      } catch (error) {
+        if (linked) unlinkSync(this.path(hash));
+        throw error;
+      }
       const directory = await open(this.directory, constants.O_RDONLY);
       try {
         await directory.sync();
