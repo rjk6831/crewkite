@@ -1560,7 +1560,7 @@ export function App() {
                           />
                         )}
                         <ActivityView
-                          key={task.id}
+                          key={`${task.id}:${header.stamp.epoch}`}
                           task={task}
                           snapshot={snapshot}
                           workspace={workspace}

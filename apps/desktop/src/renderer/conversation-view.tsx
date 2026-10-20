@@ -597,7 +597,15 @@ function useContextComposer({
     const current = latest.current;
     if (
       !current.projectId ||
-      !current.workspace.projects.some((project) => project.id === current.projectId)
+      (!current.workspace.projects.some((project) => project.id === current.projectId) &&
+        !(
+          current.draftKey.startsWith('task:') &&
+          current.workspace.snapshot?.tasks.some(
+            (task) =>
+              `task:${task.id}` === current.draftKey && task.projectId === current.projectId,
+          ) &&
+          current.workspace.snapshot.projects.some((project) => project.id === current.projectId)
+        ))
     )
       return 'Choose a project before adding context.';
     if (current.workspace.preview) return 'Context capture is unavailable in preview.';

@@ -2711,6 +2711,34 @@ async function taskActivityHistory(
     await expect(activity.getByText(marker(361), { exact: true })).toBeVisible();
     await inspectWindow();
     assert(BigInt(reconnected.cursor) > BigInt(live.cursor));
+    await runtime.close();
+    await expect(page.getByText('Controller offline', { exact: true })).toBeVisible();
+    const restored = new DatabaseSync(join(home, 'state.sqlite'));
+    try {
+      restored.exec("DELETE FROM events; DELETE FROM sqlite_sequence WHERE name='events'");
+    } finally {
+      restored.close();
+    }
+    runtime = await startController(options);
+    instrument();
+    runtime.controller.store.transaction(() => {
+      const replacement = {
+        ...task,
+        title: 'Inspect restored task detail',
+        revision: task.revision + 1,
+      };
+      runtime.controller.store.put('task', task.id, replacement.revision, replacement);
+    });
+    const restoredEvent = append(task.id, 'Restored home activity');
+    assert(BigInt(restoredEvent.cursor) < BigInt(reconnected.cursor));
+    await expect(
+      page.getByRole('heading', { name: 'Inspect restored task detail', exact: true }),
+    ).toBeVisible();
+    await expect(activity.getByText('Restored home activity', { exact: true })).toBeVisible();
+    append(task.id, 'Restored live activity');
+    await expect(activity.getByText('Restored live activity', { exact: true })).toBeVisible();
+    await expect(activity.getByText(marker(361), { exact: true })).toHaveCount(0);
+
     assert.equal(
       runtime.controller.snapshot().attempts.length,
       0,

@@ -148,7 +148,16 @@ export function useWorkspace() {
   const selectedTask = useRef<string | null>(null);
   const detailCache = useRef(new Map<string, Snapshot>());
   const headerRef = useRef<WorkspaceState | null>(null);
+  const commandBarrier = useRef<Promise<void>>(Promise.resolve());
+  const activityTail = useRef<Promise<unknown>>(Promise.resolve());
   const pageRead = useRef(false);
+  const pageTail = useRef<Promise<unknown>>(Promise.resolve());
+  const queuePage = useCallback(<T>(read: () => Promise<T>): Promise<T> => {
+    const result = pageTail.current.then(read);
+    pageTail.current = result.catch(() => {});
+    return result;
+  }, []);
+  const detailEpoch = useRef<string | undefined>(undefined);
   const navigationStamp = useRef<string | null>(null);
   const selectTask = useCallback(
     async (taskId: string | null) => {
@@ -166,8 +175,10 @@ export function useWorkspace() {
             const oldest = detailCache.current.keys().next().value;
             if (oldest) detailCache.current.delete(oldest);
           }
+          const newEpoch = detailEpoch.current !== epoch;
+          detailEpoch.current = epoch;
           setSnapshot((current) =>
-            !current || BigInt(next.cursor) >= BigInt(current.cursor) ? next : current,
+            newEpoch || !current || BigInt(next.cursor) >= BigInt(current.cursor) ? next : current,
           );
         }
       } catch (failure) {
@@ -182,7 +193,7 @@ export function useWorkspace() {
   const readTaskPage = useCallback(
     async (input: Omit<TaskPageRequest, 'limit'> & { limit?: number }) => {
       if (!source) throw new Error('The desktop bridge is unavailable.');
-      const page = TaskPageSchema.parse(await source.taskPage(input));
+      const page = TaskPageSchema.parse(await queuePage(() => source.taskPage(input)));
       if (
         page.stamp.epoch !== input.stamp.epoch ||
         page.stamp.revision !== input.stamp.revision ||
@@ -197,7 +208,7 @@ export function useWorkspace() {
         );
       return page;
     },
-    [source],
+    [source, queuePage],
   );
   const loadTasks = useCallback(
     async (projectId: string, more = false) => {
@@ -243,7 +254,9 @@ export function useWorkspace() {
     setNavigationBusy(true);
     try {
       const next = ProjectPageSchema.parse(
-        await source.projectPage({ stamp: current.stamp, after: projectPage.next }),
+        await queuePage(() =>
+          source.projectPage({ stamp: current.stamp, after: projectPage.next ?? undefined }),
+        ),
       );
       if (
         headerRef.current?.stamp.epoch !== next.stamp.epoch ||
@@ -261,32 +274,44 @@ export function useWorkspace() {
       pageRead.current = false;
       setNavigationBusy(false);
     }
-  }, [source, projectPage]);
+  }, [source, projectPage, queuePage]);
   const [{ events, droppedThrough }, setActivity] = useState<{
     events: Event[];
     droppedThrough: string | null;
   }>({ events: [], droppedThrough: null });
   const [activityRevision, setActivityRevision] = useState(0);
   const readTaskActivity = useCallback(
-    async (input: Omit<TaskActivityRequest, 'limit'> & { limit?: number }) => {
-      if (!source) throw new Error('The desktop bridge is unavailable.');
-      const request = TaskActivityRequestSchema.parse(input);
-      const result = CommandResultSchema.parse(
-        await source.command({ command: 'GetTaskActivity', payload: request }),
-      );
-      if (result.outcome !== 'applied' && result.outcome !== 'already-applied')
-        throw new Error([result.reason ?? result.outcome, result.next].filter(Boolean).join(' '));
-      const parsed = TaskActivityPageSchema.safeParse(result.data);
-      if (!parsed.success)
-        throw new Error('Task activity is unavailable: the retained page is invalid.');
-      const page = parsed.data;
-      if (
-        page.taskId !== request.taskId ||
-        (request.beforeCursor !== undefined &&
-          page.events.some((event) => BigInt(event.cursor) >= BigInt(request.beforeCursor ?? '0')))
-      )
-        throw new Error('Task activity is unavailable: the page does not match the request.');
-      return page;
+    (input: Omit<TaskActivityRequest, 'limit'> & { limit?: number }) => {
+      const read = async () => {
+        if (!source) throw new Error('The desktop bridge is unavailable.');
+        for (;;) {
+          const pendingCommand = commandBarrier.current;
+          await pendingCommand;
+          if (pendingCommand === commandBarrier.current) break;
+        }
+        const request = TaskActivityRequestSchema.parse(input);
+        const result = CommandResultSchema.parse(
+          await source.command({ command: 'GetTaskActivity', payload: request }),
+        );
+        if (result.outcome !== 'applied' && result.outcome !== 'already-applied')
+          throw new Error([result.reason ?? result.outcome, result.next].filter(Boolean).join(' '));
+        const parsed = TaskActivityPageSchema.safeParse(result.data);
+        if (!parsed.success)
+          throw new Error('Task activity is unavailable: the retained page is invalid.');
+        const page = parsed.data;
+        if (
+          page.taskId !== request.taskId ||
+          (request.beforeCursor !== undefined &&
+            page.events.some(
+              (event) => BigInt(event.cursor) >= BigInt(request.beforeCursor ?? '0'),
+            ))
+        )
+          throw new Error('Task activity is unavailable: the page does not match the request.');
+        return page;
+      };
+      const result = activityTail.current.then(read);
+      activityTail.current = result.catch(() => {});
+      return result;
     },
     [source],
   );
@@ -338,11 +363,14 @@ export function useWorkspace() {
           setNavigationStale(Boolean(previous));
           if (previous?.stamp.epoch !== next.stamp.epoch) {
             detailCache.current.clear();
+            setActivity({ events: [], droppedThrough: null });
             setDetailStale(Boolean(previous && selectedTask.current));
           }
           let page: ProjectPage;
           try {
-            page = ProjectPageSchema.parse(await source.projectPage({ stamp: next.stamp }));
+            page = ProjectPageSchema.parse(
+              await queuePage(() => source.projectPage({ stamp: next.stamp })),
+            );
           } catch (failure) {
             setNavigationStale(true);
             throw failure;
@@ -361,8 +389,12 @@ export function useWorkspace() {
             if (selectedTask.current === taskId && headerRef.current === next) {
               setDetailStale(false);
               detailCache.current.set(taskId, detail);
+              const newEpoch = detailEpoch.current !== next.stamp.epoch;
+              detailEpoch.current = next.stamp.epoch;
               setSnapshot((current) =>
-                !current || BigInt(detail.cursor) >= BigInt(current.cursor) ? detail : current,
+                newEpoch || !current || BigInt(detail.cursor) >= BigInt(current.cursor)
+                  ? detail
+                  : current,
               );
               const task = detail.tasks.find((row) => row.id === taskId);
               if (task)
@@ -406,7 +438,7 @@ export function useWorkspace() {
       reading.current = null;
     });
     return reading.current;
-  }, [source]);
+  }, [source, queuePage]);
   useEffect(() => {
     let active = true;
     void refresh().catch((failure: unknown) => {
@@ -562,6 +594,20 @@ export function useWorkspace() {
     (input: DesktopCommand) =>
       perform(async () => {
         if (!source) throw new Error('The desktop bridge is unavailable.');
+        if (
+          input.command === 'GetTaskConversationState' ||
+          input.command === 'GetTaskConversation'
+        ) {
+          const completion = Promise.withResolvers<void>();
+          commandBarrier.current = Promise.all([commandBarrier.current, completion.promise]).then(
+            () => {},
+          );
+          try {
+            return await source.command(input);
+          } finally {
+            completion.resolve();
+          }
+        }
         if (input.command !== 'StartRun' && input.command !== 'StopRun')
           return source.command(input);
         const token = Symbol();
