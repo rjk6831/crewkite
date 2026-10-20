@@ -21,8 +21,10 @@ const stderrSignalKinds = [
   'permission',
   'model',
   'uncaught',
+  'proxy-connect',
+  'proxy-unexpected',
 ] as const;
-const stderrStatusCodes = [401, 403, 408, 413, 429, 500, 502, 503, 504] as const;
+const stderrStatusCodes = [400, 401, 403, 404, 408, 413, 429, 500, 502, 503, 504] as const;
 const stderrCount = z.number().int().min(0).max(1024);
 export const AcpStderrSummarySchema = z.strictObject({
   lines: stderrCount,
@@ -54,6 +56,8 @@ const stderrPatterns: Record<(typeof stderrSignalKinds)[number], RegExp> = {
   permission: /\b(?:PERMISSION_DENIED|permission denied)\b/i,
   model: /\b(?:MODEL_NOT_FOUND|unsupported model|model not found)\b/i,
   uncaught: /^(?:Traceback \(most recent call last\):|panic:|fatal error:)/,
+  'proxy-connect': /\bProxy failed to connect to CCPA API:/,
+  'proxy-unexpected': /\bProxy unexpected connection error\b/,
 };
 
 // Only fixed signatures survive. An oversized line is discarded in full.
@@ -77,7 +81,7 @@ export class AcpStderrClassifier {
           matched = true;
         }
       const status =
-        /\bHTTP(?:\/[12](?:\.[0-9])?)?(?:[ "']+(?:status|error|response))?[ "':=]+(401|403|408|413|429|500|502|503|504)\b/i.exec(
+        /\bHTTP(?:\/[12](?:\.[0-9])?)?(?:[ "']+(?:status|error|response))?[ "':=]+(400|401|403|404|408|413|429|500|502|503|504)\b/i.exec(
           text,
         );
       if (status) {

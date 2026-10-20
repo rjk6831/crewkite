@@ -1881,8 +1881,10 @@ setInterval(() => {}, 1000);
     'PERMISSION_DENIED /private/home',
     'MODEL_NOT_FOUND private-model',
     'Traceback (most recent call last):',
+    'HTTP status 400 private request',
     'HTTP/2 401 private headers',
     'HTTP status 403 private body',
+    'HTTP response 404 private route',
     'HTTP error 429 private body',
     'HTTP response 503 private body',
     'HTTP status 200',
@@ -1891,7 +1893,7 @@ setInterval(() => {}, 1000);
     'private status=429 and private path /HTTP/503',
   ].join('\n');
   const expectedSummary = {
-    lines: 17,
+    lines: 19,
     unclassifiedLines: 4,
     oversizedLines: 0,
     signals: [
@@ -1906,8 +1908,10 @@ setInterval(() => {}, 1000);
       { kind: 'uncaught', count: 1 },
     ],
     httpStatuses: [
+      { code: 400, count: 1 },
       { code: 401, count: 1 },
       { code: 403, count: 1 },
+      { code: 404, count: 1 },
       { code: 429, count: 1 },
       { code: 503, count: 1 },
     ],
@@ -1920,6 +1924,31 @@ setInterval(() => {}, 1000);
     assert.deepEqual(classifier.finish(), expectedSummary, `stderr chunks ${chunkSize}`);
     assert.deepEqual(classifier.finish(), expectedSummary, 'EOF flush is idempotent');
     assert(!JSON.stringify(classifier.finish()).includes('private'));
+  }
+  for (const scenario of [
+    { line: 'HTTP 502 upstream private body', signals: [] },
+    {
+      line: 'ERROR:root:Proxy failed to connect to CCPA API: HTTP 502 private account',
+      signals: [{ kind: 'proxy-connect', count: 1 }],
+    },
+    {
+      line: 'ERROR:root:Proxy unexpected connection error HTTP 502 private token',
+      signals: [{ kind: 'proxy-unexpected', count: 1 }],
+    },
+  ]) {
+    const classifier = new AcpStderrClassifier();
+    classifier.push(Buffer.from(scenario.line));
+    const summary = classifier.finish();
+    assert.deepEqual(summary, {
+      lines: 1,
+      unclassifiedLines: 0,
+      oversizedLines: 0,
+      signals: scenario.signals,
+      httpStatuses: [{ code: 502, count: 1 }],
+    });
+    assert(!JSON.stringify(summary).includes('private'));
+    assert(!JSON.stringify(summary).includes('account'));
+    assert(!JSON.stringify(summary).includes('token'));
   }
   const oversized = new AcpStderrClassifier();
   oversized.push(Buffer.from(`UNAUTHENTICATED${'x'.repeat(8193)}`));
