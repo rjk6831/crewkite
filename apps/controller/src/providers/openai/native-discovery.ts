@@ -121,7 +121,6 @@ export function nativeDiscoveryArguments(
     'features.hooks': false,
     'features.multi_agent': false,
     log_dir: join(directory, 'logs'),
-    sqlite_home: join(directory, 'sqlite'),
   };
   return [
     ...Object.entries(settings).flatMap(([key, value]) => [
