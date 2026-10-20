@@ -200,10 +200,15 @@ test('an idempotent retry returns the receipt without creating another task', as
 });
 
 test('task snapshots retain related evidence within the unchanged frame bound', async (t) => {
+  const socketRoot = mkdtempSync(
+    join(realpathSync(checkOwner()?.stateRoot ?? tmpdir()), 'ck-snap-'),
+  );
   const { controller, command, draft, fixtures, id } = await setup(t, {
+    home: join(socketRoot, 'home'),
     googleUsageClient: () => ({ available: false, reason: 'client-unavailable' }),
     openAiUsageClient: () => unavailableNativeProfile(),
   });
+  t.after(() => rmSync(socketRoot, { recursive: true, force: true }));
   const unrelatedArtifactId = id('art');
   const selected = TaskSchema.parse(
     (
