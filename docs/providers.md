@@ -4,6 +4,14 @@ I qualify exact routes: a specific client build, account type, model, effort set
 
 A failed or unavailable native profile keeps its own refusal or unknown ownership. It does not authorize a scripted replacement, another account or API billing. Explicit developer fixtures exercise controller mechanics separately. I require dated evidence for the actual client and selected route before treating it as qualified.
 
+## Connecting installed clients
+
+Open Connect providers before creating a task. The setup view separates the installed client, observed sign-in, reported allowance and coding qualification. A metadata failure keeps its reason and next action visible. Metadata reads leave project selection and task Stop available; an uncertain project mutation still requires its exact saved retry.
+
+OpenAI uses the supported native client's existing subscription sign-in. Refresh OpenAI quota reads account and allowance metadata through its native server with no thread or turn. The reader uses the client's ordinary local database cache; forcing a new empty cache caused historical backfill to delay initialization past the read deadline. Private diagnostic output and owned process cleanup retain their existing bounds. A failed refresh preserves earlier observations and their original times.
+
+On 21 October 2026, the corrected OpenAI metadata path completed in 3.36 seconds with one reported allowance window and quiescent process ownership. A separate Anthropic native sign-in check completed in 293 milliseconds and reported subscription authentication. Neither observation submitted a model prompt. They establish those metadata paths only.
+
 ## Current availability
 
 I checked the following primary-source guidance on 17 October 2026. Client behavior and integration permission are separate gates under [ADR 0005](adr/0005-official-clients-on-user-subscriptions.md).
@@ -31,7 +39,7 @@ Each backlog outcome counts once. Failed attempts and support work earn no addit
 
 ## Google ACP writer
 
-The separate `google-acp-v1` profile implements a bounded one-file workflow under [Proposed ADR 0024](adr/0024-integrate-google-through-its-published-acp-agent.md). The [published registry](https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json) lists Google LLC's Antigravity server 1.4.0 for `darwin-aarch64` with a Google-hosted download. The macOS executable is `agy_acp_server.par`, separate from the CLI. No published checksum accompanies that entry. Google's [Zed guide](https://www.antigravity.google/docs/ide/extensions/zed/) documents personal-plan `oauth-personal` authentication for editors.
+The separate `google-acp-v1` profile implements a bounded one-file workflow under [Proposed ADR 0024](adr/0024-integrate-google-through-its-published-acp-agent.md). The [published registry](https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json) identifies Google LLC's Antigravity server and its Google-hosted downloads. On 21 October 2026, the current entry lists version 1.4.1. This preview keeps the reviewed 1.4.0 bundle and its exact mappings. The macOS executable is `agy_acp_server.par`, separate from the CLI. No published checksum accompanies that entry. Google's [Zed guide](https://www.antigravity.google/docs/ide/extensions/zed/) documents personal-plan `oauth-personal` authentication for editors.
 
 The launch card, roster and provider notice use this label:
 
@@ -41,7 +49,11 @@ The launch card, roster and provider notice use this label:
 
 ### Import and setup
 
-Import reads three fixed files under the CrewKite home: `imports/google-acp-v1/agy_acp_server.par`, its required sibling `localharness_external`, and `identity.json` in the same directory. The identity file contains version `1.4.0`, the server's observed SHA-256 in `sha256`, the helper's observed SHA-256 in mandatory `harnessSha256`, and the ten-character Developer ID team in `signerTeamId`. The server limit is 384 MiB; the helper limit is 128 MiB. The staging directory and files must be private and owned by the current user. Symlinked parents, linked files, malformed identity and digest changes refuse. CrewKite downloads no client and chooses no digest or signer on the user's behalf.
+Open Usage and capacity, then Google ACP setup. Install official client downloads the fixed 1.4.0 macOS arm64 archive from Google. The installer requires the reviewed archive SHA-256 `21a32eeab85b394a515510c84539bda4b2504bf2917e0a201f5c4130b13581a5`, both exact executable digests in this profile and the expected Developer ID signature. A changed download, archive layout, digest or signer refuses installation. It reuses an identical managed pin and never replaces a conflicting pin. Download, extraction and both signature checks belong to one retained operation. Stop waits for owned cleanup. A restart settles known interrupted work and preserves uncertain signature ownership without replay.
+
+Installation starts no agent or model prompt. Initialize checks the installed client. Sign in with Google is a separate personal-account action, followed by Discover Google choices. A quota reading comes from the separate CLI reader and does not establish ACP sign-in. These setup actions leave project selection and task Stop available.
+
+Import reads three fixed files under the CrewKite home: `imports/google-acp-v1/agy_acp_server.par`, its required sibling `localharness_external`, and `identity.json` in the same directory. The identity file contains version `1.4.0`, the server's observed SHA-256 in `sha256`, the helper's observed SHA-256 in mandatory `harnessSha256`, and the ten-character Developer ID team in `signerTeamId`. The server limit is 384 MiB; the helper limit is 128 MiB. The staging directory and files must be private and owned by the current user. Symlinked parents, linked files, malformed identity and digest changes refuse. This manual CLI import path remains available. The desktop installer uses its reviewed fixed release identity and private per-attempt staging.
 
 The explicit [CLI import and setup commands](../apps/cli/README.md) copy both executables into private, digest-addressed storage. Import verifies each managed file against the requested macOS Developer ID requirement and rechecks both files before creating the private version 2 `pin.json`. That pin binds both digests and signature receipts. An existing identical bundle pin is reusable; a conflicting pin refuses. Import accepts no caller executable path, replacement pin or credential. It does not start the ACP agent or authenticate. Both owned signature checks share one five-second deadline.
 
@@ -96,6 +108,8 @@ The source-only [native task connector](../apps/controller/src/providers/google/
 On 17 October 2026, native interactive CLI 1.4.0 loaded `task_context`, `retained_patch` and `submit_unverified_result` through workspace MCP configuration. With one-call approval for each tool, it read a synthetic prepared task and its empty patch, then saved 306 bytes of unverified result text. The native process exited normally after 270.898 seconds with its owned group absent. Controller state, source, index, refs, configuration and capability stayed unchanged; no controller intent, controller submission or candidate was created. This qualifies a context-only CLI exchange. App plugin loading and nonempty patch transfer remain unqualified. No native Stop behavior, enforced model or effort, full provider route or single-interface workflow is claimed.
 
 ## Anthropic writer preparation
+
+The Native clients card stays visible without a configured coding route. Check Anthropic sign-in runs only the pinned client's `claude auth status` metadata command. It retains the observed sign-in method and time, with billing, quota and task qualification still unknown. A signed-out client needs `claude auth login` in its own terminal, followed by another sign-in check. CrewKite collects no credentials and submits no prompt for this check. It has no standalone Anthropic quota reader; task-reported usage remains separate.
 
 The provider-local helpers project bounded authentication metadata and own a structured text proposal process. The writer requires an exact executable digest, model and session. A successful result binds one attempt, a frozen relative file path and the original content hash to at most 64 KiB of NUL-free UTF-8 text. Omitting the target preserves the original `net.mjs` behavior. A caller can shorten authentication and task execution with one absolute deadline; the bounds include owned cleanup. Synchronous callbacks record each actual process phase and one conservative submission marker before prompt input. A failed callback prevents a successful result. The writer applies no files and registers no route. Desktop and CLI preparation bind this writer to the native task flow. The installed profile remains qualification-pending while its remaining pilot checks are open. Writer selection and the supported OpenAI reviewer are independent.
 
