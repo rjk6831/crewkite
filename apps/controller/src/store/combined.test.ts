@@ -143,6 +143,12 @@ test('combined tasks share seven real dispatches and require a separate full bar
         const reply = Promise.withResolvers<void>();
         const off = context.observe(controller, (event) => {
           if (
+            event.type === 'task.updated' &&
+            event.taskId === child.id &&
+            ['interrupted', 'stopped', 'failed'].includes(event.payload.state)
+          )
+            throw Error(`Prior child planning terminated: ${context.planningTrace(child.id)}`);
+          if (
             event.type === 'conversation.entry' &&
             event.taskId === child.id &&
             event.payload.kind === 'plan-proposal'
@@ -167,7 +173,13 @@ test('combined tasks share seven real dispatches and require a separate full bar
           'local-owner',
         );
         assert.equal(sent.outcome, 'applied', JSON.stringify(sent));
-        await context.wait('prior child planning proposal', reply.promise);
+        try {
+          await context.wait('prior child planning proposal', reply.promise);
+        } catch (error) {
+          throw new Error(`Prior child planning failed: ${context.planningTrace(child.id)}`, {
+            cause: error,
+          });
+        }
         off();
         context.onWritten(undefined);
         const stateResult = await controller.execute(
