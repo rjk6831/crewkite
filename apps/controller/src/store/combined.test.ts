@@ -143,6 +143,12 @@ test('combined tasks share seven real dispatches and require a separate full bar
         const reply = Promise.withResolvers<void>();
         const off = context.observe(controller, (event) => {
           if (
+            event.type === 'task.updated' &&
+            event.taskId === child.id &&
+            ['interrupted', 'stopped', 'failed'].includes(event.payload.state)
+          )
+            throw Error(`Prior child planning terminated: ${context.planningTrace(child.id)}`);
+          if (
             event.type === 'conversation.entry' &&
             event.taskId === child.id &&
             event.payload.kind === 'plan-proposal'
@@ -167,7 +173,13 @@ test('combined tasks share seven real dispatches and require a separate full bar
           'local-owner',
         );
         assert.equal(sent.outcome, 'applied', JSON.stringify(sent));
-        await context.wait('prior child planning proposal', reply.promise);
+        try {
+          await context.wait('prior child planning proposal', reply.promise);
+        } catch (error) {
+          throw new Error(`Prior child planning failed: ${context.planningTrace(child.id)}`, {
+            cause: error,
+          });
+        }
         off();
         context.onWritten(undefined);
         const stateResult = await controller.execute(
@@ -1342,8 +1354,17 @@ test('combined tasks share seven real dispatches and require a separate full bar
       assert.equal(refValue(context.source.directory, 'refs/heads/combined'), acceptedHead);
     }
   };
-  const pending = scenarioQueues.map((scenarios, queue) => run(scenarios, queue));
-  const results = await Promise.allSettled(pending);
+  // Synchronous acceptance and restart work must not consume a sibling fixture's read deadline.
+  // Each scenario still admits and observes its two writers together.
+  const results: PromiseSettledResult<void>[] = [];
+  for (const [queue, scenarios] of scenarioQueues.entries()) {
+    try {
+      await run(scenarios, queue);
+      results.push({ status: 'fulfilled', value: undefined });
+    } catch (reason) {
+      results.push({ status: 'rejected', reason });
+    }
+  }
   for (const [index, result] of results.entries())
     if (result.status === 'rejected') {
       const error = result.reason instanceof Error ? result.reason : Error(String(result.reason));
