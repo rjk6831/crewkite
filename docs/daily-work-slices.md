@@ -20,9 +20,9 @@ Next slice: D2b.1, workspace and task status pages. Every slice below is planned
 
 For the next implementation, use this instruction:
 
-> Read docs/daily-work-slices.md. Verify its progress table against main, CI and the published release receipt. Implement the first eligible unreleased slice, including its named acceptance checks and documentation. Review it independently, commit it, pass the required CI, and publish a separate UAT candidate with matching source and package evidence. Update this file with the result and the next slice. Preserve existing work and authority boundaries. Reuse concrete authorization already given for this repository and release path; request missing authority only for a new destination or effect. Report an observed blocker with its evidence; do not mark unobserved work complete.
+> Read docs/daily-work-slices.md. Verify its progress table against main, CI and the published release receipt. Select the first eligible unreleased slice that fits the available lane, including its named acceptance checks and documentation. Coordinate against the active ownership map before writing. Review it independently, commit it, pass the required CI, and publish a separate UAT candidate with matching source and package evidence. Update this file with the result and the next slice. Preserve existing work and authority boundaries. Reuse concrete authorization already given for this repository and release path; request missing authority only for a new destination or effect. Report an observed blocker with its evidence; do not mark unobserved work complete.
 
-A release is eligible only when every listed dependency has released and its required acceptance is recorded. Fix a regression that makes existing work unsafe before opening another feature. If a slice needs more than about a day of implementation, split it at a usable boundary and renumber the remaining unreleased rows and dependencies. Published slice IDs never change. Keep the unfinished capability explicit. A schema-only change can accompany the feature it enables; it does not count as that day's usable feature.
+Development can begin against a reviewed frozen interface before its dependency is released. Mark that work dependent and test it with local fixtures. A release is eligible only when every listed dependency has released and its required acceptance is recorded. Ship an eligible ready slice even when a lower-numbered independent slice is unfinished; published slice IDs stay stable. Fix a regression that makes existing work unsafe before opening another feature. If a slice needs more than about a day of implementation, split it at a usable boundary and renumber the remaining unreleased rows and dependencies. Published slice IDs never change. Keep the unfinished capability explicit. A schema-only change can accompany the feature it enables; it does not count as that day's usable feature.
 
 ## What exists at the planning baseline
 
@@ -42,7 +42,7 @@ Recheck these paths at the actual starting commit. Existing behavior may have ad
 
 ## Release order and progress
 
-A day is a target for the next usable increment. It includes review and release work when those finish normally. Large-copy and recovery changes can take longer. I will measure the first two slices before giving the rest calendar dates.
+A day is a target for the next usable increment. It includes review and release work when those finish normally. The parallel schedule below targets the core coding workflow in 3-5 working days after verified D2 shipment and confirmed capacity. Large-copy and recovery failures can move that date. I will re-estimate from the first two release receipts.
 
 | Slice | Usable result | Depends on | State | Source, CI and UAT evidence |
 |-------|---------------|------------|-------|-----------------------------|
@@ -60,6 +60,56 @@ A day is a target for the next usable increment. It includes review and release 
 | D2b.12 | Compress older history without losing access or integrity | D2b.11 | Planned | None |
 
 D2b.3 and D2b.4 can be developed alongside each other after their read contract is stable. D2b.6 can also proceed once the output path is available, so project commands need not wait for every context improvement. Land shared contracts and migrations through one integration owner. Do not create competing command owners. Ship the earliest ready slice without waiting for another lane. History work cannot delay the first usable coding releases.
+
+## Parallel delivery and critical path
+
+I will run at most three implementation lanes, with one integration owner and a separate QA/review role. That is the working limit for this pass. More writers would contend for the same contracts, store, controller wiring and package verification. I can use focused subagents inside a lane for a test fixture, code review or a clearly separate module. Each still needs an owner and an exclusive write scope.
+
+The integration owner records the active worktree, branch, owner and files for each lane before it starts. A lane keeps one writer per file. Helpers use a separate worktree or a disjoint assigned file set. Shared changes are proposed as a diff to the integration owner; they are never silently edited by several lanes.
+
+| Lane | Owns | Starts before dependencies release | Shared boundary |
+|------|------|------------------------------------|-----------------|
+| A, project scale | D2b.2 artifact/output implementation, then D2b.3 source capture and D2b.5 diff/context modules, their focused tests and assigned views | Range-read fixtures, streaming capture, manifest and diff paging implementations against frozen read contracts | Artifact publication, source identity and selected-context contracts |
+| B, GitHub/CI | D2b.4 repository/PR/Actions/log reads, then the remote portion of D2b.8, with operation-specific views and tests | Installed-client inspection, deterministic executable fixtures and remote reconciliation tests | Operation intents, destination authority and immutable log references |
+| C, commands and coding | D2b.6 command runner, then D2b.7 multi-file evaluation and project-check workflow, with assigned tests/views | Command definition and ownership fixtures, changed-test evaluator design and supported-profile gap audit | Existing process owner, check definitions and candidate identity |
+| Integration | D2b.1 list/status projections and wiring; shared contracts, migrations, lockfile, entry points and final composition | Freeze small interfaces and wire completed lane changes incrementally | One schema/migration sequence, one controller owner, one reviewed main |
+| QA/review | Independent diffs, regression fixtures, recovery/compatibility evidence and the D2b.10 daily-work matrix | Begin restart, fault, old-home and responsiveness fixtures on Day 1; prepare representative repositories and backlog issues | Review adds no source or effect authority; findings return to the owning lane |
+
+Use separate planned checkouts under `internal/worktrees/`: `project-scale` on `feat/project-scale`, `github-workflows` on `feat/github-workflows`, and `project-commands` on `feat/project-commands`. The integration checkout uses `feat/daily-work-integration`; a writable acceptance-fixture lane uses `test/daily-work-acceptance`. These are proposed assignments, not checkouts this document created. Inspect existing worktrees before creating or reusing one, preserve its work, and record the actual path and frozen base. Lane A owns the source, integration, artifact and context modules named below. B owns its GitHub module and assigned PR/CI view files. C owns its command module, worker/toolchain changes and assigned command/evaluation views. The integration owner alone edits the shared contracts, central controller wiring, migrations, lockfile and entry points. Record exact test and renderer files before any helper writes them.
+
+A lane can narrow its task further and hand a fixture or review to a subagent. It cannot raise account limits, split one task to evade a cap or assume the other client's subagent feature exists. Provider assignment follows observed current availability and the supported client capability. Verify access and capacity through the existing authorized status/setup path before assigning OpenAI, Anthropic, Google or Local work. Record the ordinary-subscription billing mode, route and remaining campaign limits privately. Keep missing or uncertain capacity unassigned. No paid-credit route or automatic fallback is part of this schedule.
+
+This is the development coordination plan. It makes no claim that the released app already orchestrates these clients or their subagents automatically. It also dispatches no provider work by itself. Existing concrete authorization applies within its scope; new live campaigns and new destinations keep their own authority.
+
+The shared read and output interfaces are the first dependency. Freeze their page/cursor, artifact range/integrity and operation-result shapes before the lanes consume them. Freeze command ownership and error semantics alongside them, so B and C can build fixtures while A completes streaming. A frozen interface includes invalid-input, cancellation and compatibility cases. Changing it requires one integration review and a clear update to every consumer.
+
+| Wave | Independent work | Release gate |
+|------|------------------|--------------|
+| Foundation | Integrate D2b.1; A builds D2b.2; B prepares D2b.4; C prepares D2b.6; QA starts recovery and update fixtures | Publish D2b.1, then D2b.2 only with their actual evidence |
+| Coding features | A develops D2b.3 then D2b.5; B completes D2b.4 and prepares D2b.8; C completes D2b.6 and develops D2b.7 | Publish each ready feature after its table dependencies; D2b.4 or D2b.6 can precede D2b.3 |
+| Joined workflow | Compose D2b.7 and D2b.8; run the restart/update matrix against actual packages; exercise the real backlog issue and final remote head | D2b.9 and D2b.10 close only after the full workflow and required corrections pass |
+
+The longest dependency chain is D2b.1 -> D2b.2 -> D2b.3 -> D2b.5 -> D2b.7 -> D2b.8 -> D2b.9 -> D2b.10. D2b.6 joins before D2b.7; D2b.4 joins before D2b.8. These are release gates. Implementation, tests and review overlap wherever ownership permits.
+
+Recovery work starts with the first contract. Every early slice exercises its own cancellation, restart and retained-data compatibility before release. D2b.9 supplies the joined cross-version and remote-effect proof after those effects exist. It is not the first day anyone looks at recovery.
+
+## First five days
+
+These are working targets, conditional on verified D2 shipment, available ordinary-subscription capacity and no new correctness blocker. A target date never turns missing evidence into a pass.
+
+| Day | Parallel target | Earliest useful release |
+|-----|-----------------|-------------------------|
+| 1 | Freeze shared interfaces, implement workspace/status paging, start ranged output; prepare GitHub and command fixtures; baseline recovery, old-home compatibility and responsiveness | D2b.1, if its exact source, CI and archive checks pass |
+| 2 | Finish large output reads; implement source streaming; connect task-linked GitHub/CI reads and project command output; continue injected interruption tests | D2b.2, then D2b.4 or D2b.6 if ready and eligible |
+| 3 | Complete large-project capture; finish commands and paged diff/context; prepare multi-file checks and remote publication reconciliation | D2b.3 and any ready D2b.4/D2b.6; D2b.5 when its source dependency has released |
+| 4 | Exercise useful multi-file work with changed tests; compose checked push and PR; run the prior-package home through the update path and address failures | D2b.5/D2b.7, then D2b.8 if the exact joined workflow passes |
+| 5 | Finish publication, cross-version and uncertainty cases; run the representative daily-work matrix on the final published head and package; close required gaps | D2b.8/D2b.9/D2b.10 only when all required observations pass |
+
+The 3-5 day target covers D2b.1 through D2b.10 and depends on overlap; it does not mean ten full-day tasks run serially. It has moderate confidence before the first two receipts. Re-estimate after Day 1 and Day 2 using actual contract churn, verification duration and observed route availability. A larger implementation or failed daily-work scenario moves the target or splits the remaining scope visibly. Do not lower the acceptance bar to keep the date.
+
+Adding providers can shorten independent implementation and review. It does not shorten a dependent contract change, remote reconciliation, test execution or exact-package cold/reopen proof. Concurrent large copies and builds also compete for disk and CPU. Keep heavy verification runs scheduled, use focused checks during development, and run the required full verification for each final source. Extra available capacity is useful for independent review and fault-case preparation; it is not a reason to add competing migrations or writers.
+
+History index design and baseline measurements can use idle capacity from Day 1. Implementation uses a lane only when that does not delay the core coding path. Full Instant History and compression in the same 3-5 days are stretch work, with their own format, integrity and retrieval evidence. They remain D2b.11 and D2b.12 even if preliminary design starts early.
 
 A one-day slice means one visible workflow improvement, a named regression check, independent review, green required CI and a matching UAT package. It is a scope boundary, not a calendar guarantee. Source-only progress stays Source verified. If release checks uncover a fault, repair it and keep the previous working package available. The first slice deliberately stops at workspace/task status paging. Large output bodies, source capture, context selection and compression have their own releases.
 
