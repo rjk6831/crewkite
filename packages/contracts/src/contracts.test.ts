@@ -78,6 +78,28 @@ const command = {
 };
 
 test('process boundaries reject unknown fields and invalid command identity', () => {
+  const pageStamp = { epoch: 'a'.repeat(32), revision: '0' };
+  for (const name of ['GetWorkspaceState', 'GetProjectPage', 'GetTaskPage']) {
+    const payload = name === 'GetWorkspaceState' ? {} : { stamp: pageStamp };
+    const read = {
+      protocol: 1,
+      key: `cmd_${suffix}`,
+      actor: command.actor,
+      command: name,
+      payload,
+    };
+    assert.equal(CommandSchema.safeParse(read).success, true);
+    assert.equal(
+      CommandSchema.safeParse({ ...read, payload: { ...payload, extra: true } }).success,
+      false,
+    );
+    if (name !== 'GetWorkspaceState')
+      for (const limit of [0, 101])
+        assert.equal(
+          CommandSchema.safeParse({ ...read, payload: { ...payload, limit } }).success,
+          false,
+        );
+  }
   const combinedId = (prefix: string, index = 0) =>
     `${prefix}_${suffix.slice(0, -1)}${['V', 'W', 'X', 'Y', 'Z', '0', '1', '2'][index]}`;
   const combinedPolicy = {

@@ -130,6 +130,7 @@ import {
   TaskSchema,
   TimestampSchema,
   UsageReaderSchema,
+  WorkspaceStateSchema,
 } from '@crewkite/contracts';
 import { hashCanonical, verifyHandoff } from '@crewkite/contracts/hash';
 import { fakeReviewWorkerPath, fakeWorkerPath } from '@crewkite/testkit/worker';
@@ -296,6 +297,7 @@ import {
   type NativeProcess,
   Store,
 } from '../store/index.ts';
+import { projectPage, taskPage } from '../store/workspace.ts';
 import { availableAllowance, deriveWindow } from '../usage/index.ts';
 import {
   chargedIntegrationMinutes,
@@ -1196,7 +1198,9 @@ export class Controller {
     let result: CommandResult;
     const combinedCommand =
       command.command === 'PrepareCombinedRun' ||
-      ('taskId' in command.payload && !!this.store.combinedGroup(command.payload.taskId));
+      ('taskId' in command.payload &&
+        !!command.payload.taskId &&
+        !!this.store.combinedGroup(command.payload.taskId));
     try {
       result = this.store.transaction<CommandResult>(() => {
         const receipt = this.store.receipt(command.key);
@@ -1346,6 +1350,26 @@ export class Controller {
     });
   }
 
+  workspaceState() {
+    return WorkspaceStateSchema.parse({
+      kind: 'workspace-state',
+      version: 1,
+      protocol: 1,
+      stamp: this.store.workspaceStamp(),
+      cursor: this.store.cursor(),
+      nativeProfiles: this.resolveProfiles().map((profile) => profile.facts),
+      localSetup: this.localSetup(),
+      googleAcpSetup: this.store.googleAcpSetup(),
+      usageReaders: [this.googleUsageReader()],
+      routes: this.store.list('route'),
+      usage: this.store
+        .list<Observation>('window')
+        .map((observation) =>
+          deriveWindow(observation, { nowMs: Date.parse(this.now()), maxAgeMs: 300000 }),
+        ),
+    });
+  }
+
   snapshot(scope?: SnapshotScope): Snapshot {
     const selection = SnapshotScopeSchema.parse(scope ?? {});
     const scoped = 'taskId' in selection || 'approvalId' in selection;
@@ -1355,75 +1379,86 @@ export class Controller {
         : 'approvalId' in selection
           ? this.store.get<Approval>('approval', selection.approvalId)?.taskId
           : undefined;
-    const allTasks = this.store.list<Task>('task');
-    const taskIds = scoped
-      ? new Set(allTasks.filter((task) => task.id === requestedTask).map((task) => task.id))
-      : null;
-    const groups = this.store.combinedGroups();
+    const selected = requestedTask ? this.store.get<Task>('task', requestedTask) : undefined;
+    const taskIds = scoped ? new Set(selected ? [selected.id] : []) : null;
+    let groups = taskIds ? this.store.combinedGroupsForTasks(taskIds) : this.store.combinedGroups();
     if (taskIds) {
-      const memberships = groups.map((group) => [
-        group.task_id,
-        ...this.store.combinedMembers(group.run_id).map((member) => member.task_id),
-      ]);
       let previousSize: number;
       do {
         previousSize = taskIds.size;
+        const memberships = groups.map((group) => [
+          group.task_id,
+          ...this.store.combinedMembers(group.run_id).map((member) => member.task_id),
+        ]);
+
         for (const members of memberships)
           if (members.some((id) => taskIds.has(id))) for (const id of members) taskIds.add(id);
+        if (taskIds.size !== previousSize) groups = this.store.combinedGroupsForTasks(taskIds);
       } while (taskIds.size !== previousSize);
     }
-    const tasks = allTasks.filter((task) => !taskIds || taskIds.has(task.id));
+    const tasks = taskIds ? this.store.byIds<Task>('task', taskIds) : this.store.list<Task>('task');
     const projectIds = new Set(tasks.map((task) => task.projectId));
-    const runs = this.store.list<Run>('run').filter((run) => !taskIds || taskIds.has(run.taskId));
+    const runs = taskIds
+      ? this.store.related<Run>('run', 'taskId', taskIds)
+      : this.store.list<Run>('run');
     const runIds = new Set(runs.map((run) => run.id));
-    const candidates = this.store
-      .list<Candidate>('candidate')
-      .filter((candidate) => !taskIds || taskIds.has(candidate.taskId));
+    const candidates = taskIds
+      ? this.store.related<Candidate>('candidate', 'taskId', taskIds)
+      : this.store.list<Candidate>('candidate');
     const candidateIds = new Set(candidates.map((candidate) => candidate.id));
+    const header = this.workspaceState();
     const priorCache = this.projectionCache;
     this.projectionCache ??= new Map();
     try {
       const snapshot = {
         protocol: 1,
-        nativeProfiles: this.resolveProfiles().map((profile) => profile.facts),
-        localSetup: this.localSetup(),
-        googleAcpSetup: this.store.googleAcpSetup(),
-        usageReaders: [this.googleUsageReader()],
+        nativeProfiles: header.nativeProfiles,
+        localSetup: header.localSetup,
+        googleAcpSetup: header.googleAcpSetup,
+        usageReaders: header.usageReaders,
         nativeRuns: this.nativeRuns(taskIds ? runIds : undefined),
         candidateEvaluations: this.candidateEvaluations(taskIds ?? undefined),
         combinedRuns: groups
           .filter((group) => !taskIds || taskIds.has(group.task_id))
           .map((group) => this.combinedPreview(group)),
         cursor: this.store.cursor(),
-        projects: this.store
-          .list<Project>('project')
-          .filter((project) => !taskIds || projectIds.has(project.id)),
+        projects: taskIds
+          ? this.store.byIds<Project>('project', projectIds)
+          : this.store.list<Project>('project'),
         tasks,
         runs,
-        attempts: this.store
-          .list<Attempt>('attempt')
-          .filter((attempt) => !taskIds || runIds.has(attempt.runId)),
-        routes: this.store.list('route'),
-        approvals: this.store
-          .list<Approval>('approval')
-          .filter((approval) => !taskIds || taskIds.has(approval.taskId)),
+        attempts: taskIds
+          ? this.store.related<Attempt>('attempt', 'runId', runIds)
+          : this.store.list<Attempt>('attempt'),
+        routes: header.routes,
+        approvals: taskIds
+          ? this.store.related<Approval>('approval', 'taskId', taskIds)
+          : this.store.list<Approval>('approval'),
         candidates,
-        artifacts: this.store.list<Artifact>('artifact'),
-        reviewJobs: this.store.db
-          .prepare('SELECT body FROM review_jobs')
-          .all()
-          .map((row) => JSON.parse(row.body as string) as ReviewJob)
-          .filter((job) => !taskIds || taskIds.has(job.taskId)),
-        evidence: this.store.db
-          .prepare('SELECT body FROM evidence')
-          .all()
-          .map((row) => JSON.parse(row.body as string) as CheckResult)
-          .filter((check) => !taskIds || candidateIds.has(check.candidateId)),
-        usage: this.store
-          .list<Observation>('window')
-          .map((observation) =>
-            deriveWindow(observation, { nowMs: Date.parse(this.now()), maxAgeMs: 300000 }),
-          ),
+        artifacts: taskIds ? ([] as Artifact[]) : this.store.list<Artifact>('artifact'),
+        reviewJobs: taskIds
+          ? this.store.related<Attempt>('attempt', 'runId', runIds).flatMap((attempt) => {
+              const row = this.store.db
+                .prepare('SELECT body FROM review_jobs WHERE attempt_id=?')
+                .get(attempt.id);
+              return row ? [JSON.parse(row.body as string) as ReviewJob] : [];
+            })
+          : this.store.db
+              .prepare('SELECT body FROM review_jobs')
+              .all()
+              .map((row) => JSON.parse(row.body as string) as ReviewJob),
+        evidence: taskIds
+          ? [...candidateIds].flatMap((id) =>
+              this.store.db
+                .prepare('SELECT body FROM evidence WHERE candidate_id=?')
+                .all(id)
+                .map((row) => JSON.parse(row.body as string) as CheckResult),
+            )
+          : this.store.db
+              .prepare('SELECT body FROM evidence')
+              .all()
+              .map((row) => JSON.parse(row.body as string) as CheckResult),
+        usage: header.usage,
       };
       if (taskIds) {
         const referenced = new Set<string>();
@@ -1438,7 +1473,7 @@ export class Controller {
           }
         };
         collect({ ...snapshot, artifacts: [] });
-        snapshot.artifacts = snapshot.artifacts.filter((artifact) => referenced.has(artifact.id));
+        snapshot.artifacts = this.store.byIds<Artifact>('artifact', referenced);
       }
       return SnapshotSchema.parse(snapshot);
     } finally {
@@ -2271,7 +2306,10 @@ export class Controller {
               home: resolution.environment.HOME,
               buckets: structuredClone(outcome.metadata),
             };
-          result = { outcome: 'applied', data: { kind: 'usage', windows: this.snapshot().usage } };
+          result = {
+            outcome: 'applied',
+            data: { kind: 'usage', windows: this.workspaceState().usage },
+          };
         }
         this.finishMetadataReceipt(commandId, result);
       });
@@ -2614,7 +2652,11 @@ export class Controller {
           next: 'Amend the total task limits explicitly before requesting a larger execution envelope.',
         };
     }
-    if ('taskId' in command.payload && ['ResumeRun', 'SwitchRoute'].includes(command.command)) {
+    if (
+      'taskId' in command.payload &&
+      command.payload.taskId &&
+      ['ResumeRun', 'SwitchRoute'].includes(command.command)
+    ) {
       const task = this.store.get<Task>('task', command.payload.taskId);
       if (task?.runId && this.store.receipt(`native-run:${task.runId}`)) {
         try {
@@ -2630,6 +2672,7 @@ export class Controller {
     if (
       'taskId' in command.payload &&
       ['AcceptCandidate', 'ExportPatch', 'GetChanges'].includes(command.command) &&
+      command.payload.taskId &&
       this.hasUncertainWriter(command.payload.taskId)
     )
       return {
@@ -2937,13 +2980,44 @@ export class Controller {
           };
         }
       }
+      case 'GetWorkspaceState':
+        return { outcome: 'applied', data: this.workspaceState() };
+      case 'GetProjectPage':
+      case 'GetTaskPage': {
+        try {
+          return {
+            outcome: 'applied',
+            data:
+              command.command === 'GetProjectPage'
+                ? projectPage(this.store, command.payload)
+                : taskPage(this.store, command.payload),
+          };
+        } catch (error) {
+          return {
+            outcome: 'blocked',
+            reason:
+              error instanceof Error &&
+              [
+                'workspace-page-stale',
+                'workspace-page-invalid',
+                'workspace-row-too-large',
+              ].includes(error.message)
+                ? error.message
+                : 'workspace-page-unavailable',
+            next: 'Refresh workspace state and start a new page sequence.',
+          };
+        }
+      }
       case 'GetSnapshot':
         return {
           outcome: 'applied',
           data: { kind: 'snapshot', snapshot: this.snapshot(command.payload) },
         };
       case 'GetUsage':
-        return { outcome: 'applied', data: { kind: 'usage', windows: this.snapshot().usage } };
+        return {
+          outcome: 'applied',
+          data: { kind: 'usage', windows: this.workspaceState().usage },
+        };
       case 'GetHealth':
         return {
           outcome: 'applied',
@@ -7398,31 +7472,90 @@ export class Controller {
   }
 
   private nativeRuns(runIds?: ReadonlySet<string>): z.infer<typeof NativeRunSchema>[] {
-    return this.store.list<Run>('run').flatMap((run) => {
-      if (runIds && !runIds.has(run.id)) return [];
-      const origin = this.store.receipt(this.currentNativePlanKey(run.id));
-      if (!origin) return [];
-      const prepared = this.store.receipt(`native-prepared:${run.id}`);
-      if (this.store.receipt(`local-prepared:${run.id}`)) {
+    return (runIds ? this.store.byIds<Run>('run', runIds) : this.store.list<Run>('run')).flatMap(
+      (run) => {
+        const origin = this.store.receipt(this.currentNativePlanKey(run.id));
+        if (!origin) return [];
+        const prepared = this.store.receipt(`native-prepared:${run.id}`);
+        if (this.store.receipt(`local-prepared:${run.id}`)) {
+          try {
+            const plan = this.localPrepared(run.id);
+            return [
+              NativeRunSchema.parse({
+                runId: run.id,
+                profileId: 'local-file-v1',
+                stage:
+                  prepared &&
+                  this.store.get<Task>('task', run.taskId)?.runId === run.id &&
+                  this.store.get<Task>('task', run.taskId)?.state === 'draft' &&
+                  !this.store.intents().some((intent) => intent.run_id === run.id)
+                    ? 'prepared'
+                    : 'retain-only',
+                expiresAt: plan.expiresAt,
+                localModel: plan.localModel,
+                target: {
+                  ...plan.target,
+                  bytes: plan.manifest.find((file) => file.path === plan.target.path)?.bytes,
+                },
+              }),
+            ];
+          } catch {
+            return [
+              {
+                runId: run.id,
+                profileId: 'unavailable-native-plan',
+                stage: 'retain-only' as const,
+              },
+            ];
+          }
+        }
         try {
-          const plan = this.localPrepared(run.id);
+          const artifact = ArtifactSchema.parse(origin.result.entity);
+          if (artifact.bytes > MAX_FRAME_BYTES) throw Error('Native plan exceeds its bound.');
+          const plan = JSON.parse(this.artifacts.read(artifact.hash).toString('utf8'));
+          const appointment = NativeAppointmentSchema.parse(plan.appointment);
+          const publicScope = NativePublicScopeSchema.safeParse(plan.public).data;
+          const handoff = this.nativeHandoffPreview(run);
+          const quotaRetry = this.quotaRetryPreview(run);
           return [
             NativeRunSchema.parse({
               runId: run.id,
-              profileId: 'local-file-v1',
+              profileId: publicScope?.profileId ?? 'private-native-file',
               stage:
                 prepared &&
                 this.store.get<Task>('task', run.taskId)?.runId === run.id &&
                 this.store.get<Task>('task', run.taskId)?.state === 'draft' &&
+                publicScope &&
                 !this.store.intents().some((intent) => intent.run_id === run.id)
                   ? 'prepared'
                   : 'retain-only',
-              expiresAt: plan.expiresAt,
-              localModel: plan.localModel,
-              target: {
-                ...plan.target,
-                bytes: plan.manifest.find((file) => file.path === plan.target.path)?.bytes,
-              },
+              expiresAt: appointment.expiresAt,
+              maximumTaskMs: appointment.maximumTaskMs,
+              ...(quotaRetry ? { quotaRetry } : {}),
+              ...(handoff ? { handoff } : {}),
+              ...(appointment.billingAttestation
+                ? { billingAttestation: appointment.billingAttestation }
+                : {}),
+              ...(appointment.permissionMode ? { permissionMode: appointment.permissionMode } : {}),
+              ...('acp' in appointment
+                ? {
+                    acp: appointment.acp,
+                    ...(appointment.contextLines === undefined
+                      ? {}
+                      : { contextLines: appointment.contextLines }),
+                  }
+                : {}),
+              ...('repository' in appointment
+                ? { repository: appointment.repository, execution: appointment.execution }
+                : {
+                    target: {
+                      path: appointment.target.path,
+                      baseHash: appointment.target.baseHash,
+                      bytes: plan.manifest.find(
+                        (file: { path: string }) => file.path === appointment.target.path,
+                      )?.bytes,
+                    },
+                  }),
             }),
           ];
         } catch {
@@ -7430,62 +7563,8 @@ export class Controller {
             { runId: run.id, profileId: 'unavailable-native-plan', stage: 'retain-only' as const },
           ];
         }
-      }
-      try {
-        const artifact = ArtifactSchema.parse(origin.result.entity);
-        if (artifact.bytes > MAX_FRAME_BYTES) throw Error('Native plan exceeds its bound.');
-        const plan = JSON.parse(this.artifacts.read(artifact.hash).toString('utf8'));
-        const appointment = NativeAppointmentSchema.parse(plan.appointment);
-        const publicScope = NativePublicScopeSchema.safeParse(plan.public).data;
-        const handoff = this.nativeHandoffPreview(run);
-        const quotaRetry = this.quotaRetryPreview(run);
-        return [
-          NativeRunSchema.parse({
-            runId: run.id,
-            profileId: publicScope?.profileId ?? 'private-native-file',
-            stage:
-              prepared &&
-              this.store.get<Task>('task', run.taskId)?.runId === run.id &&
-              this.store.get<Task>('task', run.taskId)?.state === 'draft' &&
-              publicScope &&
-              !this.store.intents().some((intent) => intent.run_id === run.id)
-                ? 'prepared'
-                : 'retain-only',
-            expiresAt: appointment.expiresAt,
-            maximumTaskMs: appointment.maximumTaskMs,
-            ...(quotaRetry ? { quotaRetry } : {}),
-            ...(handoff ? { handoff } : {}),
-            ...(appointment.billingAttestation
-              ? { billingAttestation: appointment.billingAttestation }
-              : {}),
-            ...(appointment.permissionMode ? { permissionMode: appointment.permissionMode } : {}),
-            ...('acp' in appointment
-              ? {
-                  acp: appointment.acp,
-                  ...(appointment.contextLines === undefined
-                    ? {}
-                    : { contextLines: appointment.contextLines }),
-                }
-              : {}),
-            ...('repository' in appointment
-              ? { repository: appointment.repository, execution: appointment.execution }
-              : {
-                  target: {
-                    path: appointment.target.path,
-                    baseHash: appointment.target.baseHash,
-                    bytes: plan.manifest.find(
-                      (file: { path: string }) => file.path === appointment.target.path,
-                    )?.bytes,
-                  },
-                }),
-          }),
-        ];
-      } catch {
-        return [
-          { runId: run.id, profileId: 'unavailable-native-plan', stage: 'retain-only' as const },
-        ];
-      }
-    });
+      },
+    );
   }
 
   private nativeManualTargets(targets: z.infer<typeof NativeHandoffTargetsSchema>) {
@@ -10680,8 +10759,9 @@ export class Controller {
   }
 
   private candidateEvaluations(taskIds?: ReadonlySet<string>): CandidateEvaluationPreview[] {
-    return this.store.list<Task>('task').flatMap((task) => {
-      if (taskIds && !taskIds.has(task.id)) return [];
+    return (
+      taskIds ? this.store.byIds<Task>('task', taskIds) : this.store.list<Task>('task')
+    ).flatMap((task) => {
       if (!task.runId) return [];
       const receipt =
         this.store.receipt(`evaluation-started:${task.runId}`) ??

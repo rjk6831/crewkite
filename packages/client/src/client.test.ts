@@ -3775,6 +3775,123 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
   }
 });
 
+test('workspace resync reads a small header on startup gaps and reconnects', async (context) => {
+  let headers = 0;
+  let snapshots = 0;
+  let socketToDrop: Socket | undefined;
+  let complete!: () => void;
+  let startup!: () => void;
+  const started = new Promise<void>((done) => {
+    startup = done;
+  });
+  const reconnected = new Promise<void>((done) => {
+    complete = done;
+  });
+  const fixture = await serve((message, socket, connection) => {
+    if (message.type === 'hello') {
+      socketToDrop = socket;
+      socket.write(encodeFrame({ type: 'welcome', protocol: 1, cursor: '2002' }));
+    }
+    if (message.type !== 'command') return;
+    const command = message.command;
+    if (command.command === 'GetSnapshot') snapshots++;
+    if (command.command === 'Subscribe') {
+      if (command.payload.after !== (connection === 1 ? '2002' : '4004'))
+        socket.write(encodeFrame({ type: 'resync', reason: 'history-gap', cursor: '2002' }));
+      socket.write(
+        encodeFrame({ type: 'result', key: command.key, result: { outcome: 'applied' } }),
+      );
+      if (command.payload.after === (connection === 1 ? '2002' : '4004')) {
+        if (connection === 1) startup();
+        else complete();
+      }
+    }
+    if (command.command === 'GetWorkspaceState') {
+      headers++;
+      socket.write(
+        encodeFrame({
+          type: 'result',
+          key: command.key,
+          result: {
+            outcome: 'applied',
+            data: {
+              kind: 'workspace-state',
+              version: 1,
+              protocol: 1,
+              stamp: { epoch: 'a'.repeat(32), revision: '1' },
+              cursor: connection === 1 ? '2002' : '4004',
+              routes: snapshot.routes,
+              usage: snapshot.usage,
+              usageReaders: snapshot.usageReaders,
+              googleAcpSetup: snapshot.googleAcpSetup,
+              localSetup: snapshot.localSetup,
+              nativeProfiles: snapshot.nativeProfiles,
+            },
+          },
+        }),
+      );
+    }
+  });
+  context.after(() => fixture.close());
+  const client = await connectController({ ...fixture, token, actor, reconnectDelaysMs: [0] });
+  context.after(() => client.close());
+  const cursors: string[] = [];
+  await client.subscribe(
+    '0',
+    () => {},
+    () => {
+      throw Error('Legacy snapshot callback used');
+    },
+    {
+      resync: 'workspace',
+      onResync: (header) => cursors.push(header.cursor),
+    },
+  );
+  await started;
+  assert.ok(socketToDrop);
+  socketToDrop.destroy();
+  await reconnected;
+  assert.equal(snapshots, 0);
+  assert.equal(headers, 2);
+  assert.deepEqual(cursors, ['2002', '4004']);
+  let refusals = 0;
+  const refused = await serve((message, socket) => {
+    if (message.type === 'hello')
+      socket.write(encodeFrame({ type: 'welcome', protocol: 1, cursor: '2002' }));
+    if (message.type !== 'command') return;
+    const command = message.command;
+    if (command.command === 'Subscribe') {
+      socket.write(encodeFrame({ type: 'resync', reason: 'history-gap', cursor: '2002' }));
+      socket.write(
+        encodeFrame({ type: 'result', key: command.key, result: { outcome: 'applied' } }),
+      );
+    } else {
+      refusals++;
+      socket.write(
+        encodeFrame({
+          type: 'result',
+          key: command.key,
+          result: { outcome: 'unsupported', reason: 'invalid-command' },
+        }),
+      );
+    }
+  });
+  context.after(() => refused.close());
+  const refusing = await connectController({ ...refused, token, actor, reconnectDelaysMs: [0, 0] });
+  context.after(() => refusing.close());
+  let disconnected!: () => void;
+  const offline = new Promise<void>((done) => {
+    disconnected = done;
+  });
+  refusing.onConnection((state) => {
+    if (state === 'offline') disconnected();
+  });
+  await refusing.subscribe('0', () => {}, undefined, { resync: 'workspace' });
+  await offline;
+  assert.equal(refusals, 1);
+  await assert.rejects(refusing.connect(), /closed/);
+});
+
 test('reconnection replays retained events and snapshots only after a history gap', async (context) => {
   const delivered: string[] = [];
   const subscriptions: string[] = [];

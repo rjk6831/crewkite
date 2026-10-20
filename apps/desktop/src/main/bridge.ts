@@ -22,6 +22,7 @@ import {
   MAX_FRAME_BYTES,
   ProjectIdSchema,
   SnapshotSchema,
+  SnapshotScopeSchema,
 } from '@crewkite/contracts';
 import { type BrowserWindow, dialog, ipcMain } from 'electron';
 import { CommandReceipts, syncDirectory } from './receipts.ts';
@@ -159,10 +160,12 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
     'events',
   ];
   for (const channel of handlers) ipcMain.removeHandler(`crewkite:${channel}`);
-  ipcMain.handle('crewkite:snapshot', async (event) => {
+  ipcMain.handle('crewkite:snapshot', async (event, scope: unknown) => {
     assertSender(event, window);
     if (!client) throw new Error('The controller is offline.');
-    const snapshot = SnapshotSchema.parse(await client.snapshot());
+    const snapshot = SnapshotSchema.parse(
+      await client.snapshot(SnapshotScopeSchema.parse(scope ?? {})),
+    );
     assertSender(event, window);
     return snapshot;
   });
@@ -192,6 +195,16 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       key: createCommandKey(),
       actor: desktopActor,
     });
+    if (
+      command.command === 'GetWorkspaceState' ||
+      command.command === 'GetProjectPage' ||
+      command.command === 'GetTaskPage'
+    ) {
+      if (!client) throw new Error('The controller is offline.');
+      const result = CommandResultSchema.parse(await client.command(command));
+      assertSender(event, window);
+      return result;
+    }
     const stopSetup = command.command === 'StopGoogleAcpSetup';
     const setupCommands = ['InitializeGoogleAcp', 'AuthenticateGoogleAcp', 'DiscoverGoogleAcp'];
     const matchesSetup =
@@ -236,7 +249,7 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
     }
     try {
       if (stopSetup) {
-        const setup = (await client?.snapshot())?.googleAcpSetup;
+        const setup = (await client?.workspaceState())?.googleAcpSetup;
         assertSender(event, window);
         if (
           !setup ||
@@ -335,9 +348,10 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
     busy = true;
     try {
       if (!client) throw new Error('The controller is offline.');
-      const before = SnapshotSchema.parse(await client.snapshot()).projects.find(
-        (project) => project.id === scope.projectId,
-      );
+      const beforeHeader = await client.workspaceState();
+      const before = (
+        await client.projectPage({ stamp: beforeHeader.stamp, projectId: scope.projectId })
+      ).projects[0];
       assertSender(event, window);
       if (!before) throw new Error('The registered project is unavailable.');
       const choice = await dialog.showOpenDialog(window, {
@@ -353,9 +367,10 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       assertSender(event, window);
       if (choice.canceled) return null;
       if (choice.filePaths.length !== 1) throw new Error('Choose one project file or folder.');
-      const after = SnapshotSchema.parse(await client.snapshot()).projects.find(
-        (project) => project.id === scope.projectId,
-      );
+      const afterHeader = await client.workspaceState();
+      const after = (
+        await client.projectPage({ stamp: afterHeader.stamp, projectId: scope.projectId })
+      ).projects[0];
       assertSender(event, window);
       if (!after || after.revision !== before.revision)
         throw new Error('The project changed. Choose context again.');
@@ -488,9 +503,16 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
           }
           if (listening && !window.isDestroyed()) window.webContents.send('crewkite:event', event);
         },
-        (snapshot) => {
-          droppedThrough = snapshot.cursor;
-          notice({ kind: 'history-gap', after: snapshot.cursor });
+        undefined,
+        {
+          resync: 'workspace',
+          onResync: (header) => {
+            events.length = 0;
+            eventBytes = 0;
+            lastCursor = header.cursor;
+            droppedThrough = header.cursor;
+            notice({ kind: 'history-gap', after: header.cursor });
+          },
         },
       );
     } catch {

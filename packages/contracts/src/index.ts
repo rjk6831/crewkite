@@ -1284,10 +1284,15 @@ export const WorkspaceContinuationSchema = z
   .superRefine((value, context) => {
     if (
       (value.section === 'projects' &&
-        (value.afterId === null || !value.afterId.startsWith('prj_') || value.searchRank !== undefined)) ||
+        (value.afterId === null ||
+          !value.afterId.startsWith('prj_') ||
+          value.searchRank !== undefined)) ||
       (value.section === 'tasks' && value.afterId !== null && !value.afterId.startsWith('tsk_'))
     )
-      context.addIssue({ code: 'custom', message: 'A workspace continuation must match its section.' });
+      context.addIssue({
+        code: 'custom',
+        message: 'A workspace continuation must match its section.',
+      });
   });
 export type WorkspaceContinuation = z.infer<typeof WorkspaceContinuationSchema>;
 const workspacePageRequest = {
@@ -1305,8 +1310,8 @@ export const TaskPageRequestSchema = z.strictObject({
   taskId: TaskIdSchema.optional(),
   query: text.optional(),
 });
-export type ProjectPageRequest = z.infer<typeof ProjectPageRequestSchema>;
-export type TaskPageRequest = z.infer<typeof TaskPageRequestSchema>;
+export type ProjectPageRequest = z.input<typeof ProjectPageRequestSchema>;
+export type TaskPageRequest = z.input<typeof TaskPageRequestSchema>;
 const runRef = z.strictObject({ taskId: TaskIdSchema, runId: RunIdSchema });
 const evaluationFields = {
   taskId: TaskIdSchema,
@@ -2863,7 +2868,10 @@ export const TaskSummarySchema = z
   })
   .superRefine((value, context) => {
     if ((value.state === 'waiting') !== (value.waitingReason !== null))
-      context.addIssue({ code: 'custom', message: 'A task summary must preserve its waiting state.' });
+      context.addIssue({
+        code: 'custom',
+        message: 'A task summary must preserve its waiting state.',
+      });
   });
 export type TaskSummary = z.infer<typeof TaskSummarySchema>;
 const workspacePage = {
@@ -2887,12 +2895,17 @@ export const ProjectPageSchema = z
   .strictObject({
     ...workspacePage,
     kind: z.literal('project-page'),
-    projects: z.array(
-      z.strictObject({ ...ProjectSchema.shape, taskCount: RevisionSchema }),
-    ).max(100),
+    projects: z
+      .array(z.strictObject({ ...ProjectSchema.shape, taskCount: RevisionSchema }))
+      .max(100),
   })
   .refine(
-    (page) => validWorkspacePage(page) && (page.next === null || page.next.section === 'projects'),
+    (page) =>
+      validWorkspacePage(page) &&
+      (page.next === null || page.next.section === 'projects') &&
+      page.projects.every(
+        (project, index) => index === 0 || page.projects[index - 1].id < project.id,
+      ),
     'A project page needs a matching continuation, completeness and byte bound.',
   );
 export const TaskPageSchema = z
@@ -2903,7 +2916,28 @@ export const TaskPageSchema = z
     scanned: RevisionSchema,
   })
   .refine(
-    (page) => validWorkspacePage(page) && (page.next === null || page.next.section === 'tasks'),
+    (page) =>
+      validWorkspacePage(page) &&
+      (page.next === null || page.next.section === 'tasks') &&
+      new Set(page.tasks.map((task) => task.id)).size === page.tasks.length &&
+      page.tasks.every((task, index) => {
+        if (index === 0) return true;
+        const rank = (value: TaskSummary) =>
+          value.match
+            ? ['title', 'project', 'outcome', 'criterion', 'task-id', 'project-id'].indexOf(
+                value.match.field,
+              )
+            : 0;
+        const order = (value: TaskSummary) => {
+          const valueRank = rank(value);
+          return valueRank < 2 ? valueRank : valueRank < 4 ? 2 : 3;
+        };
+        const previous = page.tasks[index - 1];
+        return (
+          order(previous) < order(task) ||
+          (order(previous) === order(task) && previous.id < task.id)
+        );
+      }),
     'A task page needs a matching continuation, completeness and byte bound.',
   );
 export type ProjectPage = z.infer<typeof ProjectPageSchema>;

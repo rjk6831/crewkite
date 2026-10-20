@@ -280,9 +280,9 @@ export class Store {
     if (ids.size === 0) return [];
     return this.db
       .prepare(
-        `SELECT body FROM entities WHERE kind=? AND json_extract(body,?) IN (${[...ids].map(() => '?').join(',')}) ORDER BY id`,
+        `SELECT body FROM entities WHERE kind=? AND json_extract(body,'$.${field}') IN (${[...ids].map(() => '?').join(',')}) ORDER BY id`,
       )
-      .all(kind, `$.${field}`, ...ids)
+      .all(kind, ...ids)
       .map((row) => JSON.parse(row.body as string) as T);
   }
 
@@ -306,7 +306,13 @@ export class Store {
       const row = value as Record<string, unknown>;
       return canonicalJson(
         kind === 'task'
-          ? { id: row.id, projectId: row.projectId, title: row.title, outcome: row.outcome, criteria: row.criteria }
+          ? {
+              id: row.id,
+              projectId: row.projectId,
+              title: row.title,
+              outcome: row.outcome,
+              criteria: row.criteria,
+            }
           : { id: row.id, name: row.name },
       );
     };
@@ -337,10 +343,11 @@ export class Store {
   }
 
   localGenerationBlocker(): 'generation-active' | 'generation-unknown' | undefined {
-    const intents = this.intents().filter((intent) => {
-      const route = this.get<Route>('route', intent.route_id);
-      return intent.state !== 'stopped' && route?.family === 'local' && !route.fake;
-    });
+    const intents = this.db
+      .prepare(`SELECT i.* FROM launch_intents i JOIN entities r ON r.id=i.route_id
+      WHERE i.state!='stopped' AND r.kind='route' AND json_extract(r.body,'$.family')='local'
+      AND json_extract(r.body,'$.fake')=0`)
+      .all() as LaunchIntent[];
     if (
       intents.some(
         (intent) =>

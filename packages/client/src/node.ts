@@ -8,9 +8,15 @@ import {
   CommandSchema,
   CursorSchema,
   type Event,
+  type ProjectPageRequest,
+  ProjectPageSchema,
   type Snapshot,
   type SnapshotScope,
+  type TaskPageRequest,
+  TaskPageSchema,
   type TransportMessage,
+  type WorkspaceState,
+  WorkspaceStateSchema,
 } from '@crewkite/contracts';
 import { type ConnectionState, encodeFrame, FrameDecoder } from './index.ts';
 
@@ -30,6 +36,8 @@ interface Subscription {
   cursor: string;
   event: (event: Event) => void;
   resync: (snapshot: Snapshot) => void;
+  workspace: boolean;
+  workspaceResync?: (header: WorkspaceState) => void;
 }
 
 export function createCommandKey(): string {
@@ -89,6 +97,7 @@ export class ControllerClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private resyncing = false;
   private resyncRequested = false;
+  private pagingUnavailable = false;
 
   constructor(options: Options) {
     this.options = options;
@@ -295,7 +304,7 @@ export class ControllerClient {
   }
 
   private read(
-    command: 'GetSnapshot' | 'Subscribe',
+    command: 'GetSnapshot' | 'Subscribe' | 'GetWorkspaceState' | 'GetProjectPage' | 'GetTaskPage',
     payload: Record<string, unknown>,
   ): Promise<CommandResult> {
     return this.command(
@@ -319,13 +328,51 @@ export class ControllerClient {
     return result.data.snapshot;
   }
 
+  private workspaceFailure(result: CommandResult): Error {
+    if (result.outcome === 'unsupported') {
+      this.pagingUnavailable = true;
+      return new Error(
+        'Workspace paging is unavailable with this controller. Use the matching controller package.',
+      );
+    }
+    return new Error(`Workspace read unavailable: ${result.reason ?? result.outcome}.`);
+  }
+
+  async workspaceState() {
+    const result = await this.read('GetWorkspaceState', {});
+    if (result.outcome !== 'applied' || result.data?.kind !== 'workspace-state')
+      throw this.workspaceFailure(result);
+    return WorkspaceStateSchema.parse(result.data);
+  }
+
+  async projectPage(input: ProjectPageRequest) {
+    const result = await this.read('GetProjectPage', input);
+    if (result.outcome !== 'applied' || result.data?.kind !== 'project-page')
+      throw this.workspaceFailure(result);
+    return ProjectPageSchema.parse(result.data);
+  }
+
+  async taskPage(input: TaskPageRequest) {
+    const result = await this.read('GetTaskPage', input);
+    if (result.outcome !== 'applied' || result.data?.kind !== 'task-page')
+      throw this.workspaceFailure(result);
+    return TaskPageSchema.parse(result.data);
+  }
+
   async subscribe(
     after: string,
     event: Subscription['event'],
     resync: Subscription['resync'] = () => {},
+    options?: { resync: 'workspace'; onResync?: (header: WorkspaceState) => void },
   ): Promise<() => void> {
     if (this.subscription) throw new Error('This client already has a subscription.');
-    const subscription = { cursor: CursorSchema.parse(after), event, resync };
+    const subscription = {
+      cursor: CursorSchema.parse(after),
+      event,
+      resync,
+      workspace: options?.resync === 'workspace',
+      workspaceResync: options?.onResync,
+    };
     this.subscription = subscription;
     try {
       const result = await this.read('Subscribe', { after });
@@ -347,16 +394,28 @@ export class ControllerClient {
     try {
       if (freshSnapshot) {
         this.resyncRequested = false;
-        const snapshot = await this.snapshot();
-        if (this.subscription !== subscription) return;
-        subscription.resync(snapshot);
-        subscription.cursor = snapshot.cursor;
+        if (subscription.workspace) {
+          const header = await this.workspaceState();
+          if (this.subscription !== subscription) return;
+          subscription.cursor = header.cursor;
+          subscription.workspaceResync?.(header);
+        } else {
+          const snapshot = await this.snapshot();
+          if (this.subscription !== subscription) return;
+          subscription.resync(snapshot);
+          subscription.cursor = snapshot.cursor;
+        }
       }
       const result = await this.read('Subscribe', { after: subscription.cursor });
       if (result.outcome !== 'applied' && result.outcome !== 'already-applied')
         throw new Error('Controller subscription failed.');
       this.reconnectIndex = 0;
     } catch {
+      if (subscription.workspace && this.pagingUnavailable) {
+        this.closed = true;
+        this.reconnectExhausted = true;
+        for (const listener of this.exhaustedListeners) listener();
+      }
       this.socket?.destroy();
     } finally {
       this.resyncing = false;
