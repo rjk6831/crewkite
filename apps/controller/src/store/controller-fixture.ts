@@ -658,38 +658,44 @@ async function nativeSetup(
     },
     children,
     planningTrace: (taskId: string) => {
-      const task = context.controller.store.get<{ state: string; next: string | null }>(
-        'task',
-        taskId,
-      );
-      const attempts = context.controller.store
-        .list<Attempt>('attempt')
-        .filter(
-          (attempt) =>
-            context.controller.store.get<{ taskId: string }>('run', attempt.runId)?.taskId ===
-            taskId,
-        )
-        .map((attempt) => {
-          const receipt = context.controller.store.receipt(`conversation-completion:${attempt.id}`);
-          const artifact = ArtifactSchema.safeParse(receipt?.result.entity);
-          const completion = artifact.success
-            ? JSON.parse(
-                new ArtifactFiles(join(context.controller.home, 'artifacts'))
-                  .read(artifact.data.hash)
-                  .toString('utf8'),
-              )
-            : null;
-          return {
-            id: attempt.id,
-            state: attempt.state,
-            phases: context.controller.store.nativeProcesses(attempt.id),
-            completion,
-          };
+      try {
+        const task = context.controller.store.get<{ state: string; next: string | null }>(
+          'task',
+          taskId,
+        );
+        const attempts = context.controller.store
+          .list<Attempt>('attempt')
+          .filter(
+            (attempt) =>
+              context.controller.store.get<{ taskId: string }>('run', attempt.runId)?.taskId ===
+              taskId,
+          )
+          .map((attempt) => {
+            const receipt = context.controller.store.receipt(
+              `conversation-completion:${attempt.id}`,
+            );
+            const artifact = ArtifactSchema.safeParse(receipt?.result.entity);
+            const completion = artifact.success
+              ? JSON.parse(
+                  new ArtifactFiles(join(context.controller.home, 'artifacts'))
+                    .read(artifact.data.hash)
+                    .toString('utf8'),
+                )
+              : null;
+            return {
+              id: attempt.id,
+              state: attempt.state,
+              phases: context.controller.store.nativeProcesses(attempt.id),
+              completion,
+            };
+          });
+        return JSON.stringify({
+          task: task ? { state: task.state, next: task.next } : null,
+          attempts,
         });
-      return JSON.stringify({
-        task: task ? { state: task.state, next: task.next } : null,
-        attempts,
-      });
+      } catch {
+        return '{"trace":"unavailable"}';
+      }
     },
     observe,
     wait: <T>(stage: string, pending: Promise<T>, milliseconds?: number) =>
