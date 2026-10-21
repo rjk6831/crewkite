@@ -120,7 +120,7 @@ function launchController(home: string, nativeFixture = false) {
         ?spawn(executable,['-e',googleFixture(args,{content,permissionMode:'strict'})],options)
         :args[0]==='auth'||args.includes('--print')
           ?spawn(executable,['-e',anthropicFixture(args,{content})],options)
-          :spawn(executable,['-e',repositoryWriter?repositoryFixture([{path:'net.mjs',content}]):transcript,'success',args.at(-1)==='list'?'features':++phases%2===1?'prepare':'task'],options);
+          :spawn(executable,['-e',repositoryWriter?repositoryFixture([{path:'net.mjs',content}]):transcript,'success',args.at(-1)==='list'?'features':intent?(++phases%2===1?'prepare':'task'):'task'],options);
     }});
     console.log('CREWKITE_CONTROLLER_READY');
     process.once('SIGTERM',()=>void runtime.close().then(()=>process.exit(0)));
@@ -494,6 +494,8 @@ async function quotaReadBridge(
         else if (message.command.command === 'GetSnapshot')
           reply(request, { outcome: 'applied', data: { kind: 'snapshot', snapshot } });
         else if (message.command.command === 'Subscribe') reply(request, { outcome: 'applied' });
+        else if (message.command.command === 'RefreshTaskModelCatalog')
+          reply(request, { outcome: 'blocked', reason: 'fixture-model-catalog-unavailable' });
         else if (message.command.command === 'GetTaskConversationState')
           reply(
             request,
@@ -1365,6 +1367,8 @@ async function conversationBridge(
     if (command.command === 'GetSnapshot')
       return { outcome: 'applied', data: { kind: 'snapshot', snapshot } };
     if (command.command === 'Subscribe') return { outcome: 'applied' };
+    if (command.command === 'RefreshTaskModelCatalog')
+      return { outcome: 'blocked', reason: 'fixture-model-catalog-unavailable' };
     if (command.command === 'GetArtifact') {
       const context = captured.get(command.payload.artifactId);
       assert(context);
@@ -1597,6 +1601,13 @@ async function conversationBridge(
           effectiveEffort: 'low',
         },
         modelChoices: {
+          status: 'last-observed',
+          observation: modelObservation,
+          observedAt: at,
+          models: modelCatalog,
+          reason: 'available',
+        },
+        projectModelChoices: {
           status: 'last-observed',
           observation: modelObservation,
           observedAt: at,
@@ -4329,6 +4340,9 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
       nativeDialog.getByRole('button', { name: 'Review task', exact: true }),
     ).toBeEnabled();
     await enter(nativeDialog.getByRole('button', { name: 'Review task', exact: true }));
+    await expect(
+      page.getByRole('dialog', { name: 'Review the native proposal', exact: true }),
+    ).toBeVisible();
     const repositoryPrepared = await observer.snapshot();
     const repositoryTask = repositoryPrepared.tasks.find((value) => value.id === nativeTask.id);
     const repositoryNative = repositoryPrepared.nativeRuns.find(

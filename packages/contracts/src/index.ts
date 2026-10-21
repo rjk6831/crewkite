@@ -2139,6 +2139,28 @@ export const ConversationModelCatalogSchema = z
     (catalog) => conversationBytes(catalog) <= 32768,
     'A model catalog exceeds 32768 encoded bytes.',
   );
+export const TaskModelCatalogSchema = z
+  .strictObject({
+    version: z.literal(1),
+    origin: z.literal('connection-metadata'),
+    profileId: z.literal('openai-repository-v1'),
+    taskId: TaskIdSchema,
+    taskRevision: RevisionSchema,
+    source: SourceSchema,
+    observedAt: TimestampSchema,
+    profileHash: HashSchema,
+    client: ConversationModelCatalogSchema.shape.client,
+    locationHash: HashSchema,
+    models: ConversationModelCatalogEntriesSchema,
+  })
+  .refine(
+    (catalog) => conversationBytes(catalog) <= 32768,
+    'A task model catalog exceeds 32768 encoded bytes.',
+  );
+export const ModelCatalogObservationSchema = z.union([
+  ConversationModelCatalogSchema,
+  TaskModelCatalogSchema,
+]);
 const conversationModelFailureReasons = [
   'observation-missing',
   'observation-stale',
@@ -2200,6 +2222,8 @@ export type ConversationModelRequest = z.infer<typeof ConversationModelRequestSc
 export type ConversationModelCatalogEntry = z.infer<typeof ConversationModelCatalogEntrySchema>;
 export type ConversationModelCatalogEntries = z.infer<typeof ConversationModelCatalogEntriesSchema>;
 export type ConversationModelCatalog = z.infer<typeof ConversationModelCatalogSchema>;
+export type TaskModelCatalog = z.infer<typeof TaskModelCatalogSchema>;
+export type ModelCatalogObservation = z.infer<typeof ModelCatalogObservationSchema>;
 export type ConversationModelChoices = z.infer<typeof ConversationModelChoicesSchema>;
 export type ConversationModelReason = z.infer<typeof ConversationModelReasonSchema>;
 export const ConversationPlanningSelectionSchema = z.strictObject({
@@ -2274,6 +2298,7 @@ export const TaskConversationStateSchema = z
       })
       .nullable(),
     modelChoices: ConversationModelChoicesSchema.optional(),
+    projectModelChoices: ConversationModelChoicesSchema.optional(),
     contextUsage: ConversationContextUsageSchema.nullable().optional(),
     currentRunId: RunIdSchema.nullable(),
     activeAttempt: AttemptSchema.nullable(),
@@ -2398,6 +2423,13 @@ export const CommandSchema = z.discriminatedUnion('command', [
   mutate('CancelLocalConnectionInput', z.strictObject({ operationId: CommandIdSchema })),
   mutate('DisconnectLocal', empty),
   read('GetTaskConversationState', z.strictObject({ taskId: TaskIdSchema })),
+  mutate(
+    'RefreshTaskModelCatalog',
+    z.strictObject({
+      taskId: TaskIdSchema,
+      profileId: z.literal('openai-repository-v1'),
+    }),
+  ),
   mutate(
     'CreateTaskDiscussion',
     z.strictObject({

@@ -1046,7 +1046,7 @@ function ExecutionLaunch(props: LaunchProps) {
   );
   const [providerModel, setProviderModel] = useState('');
   const [providerEffort, setProviderEffort] = useState('');
-  const [modelChoices, setModelChoices] = useState<TaskConversationState['modelChoices']>();
+  const [modelChoices, setModelChoices] = useState<TaskConversationState['projectModelChoices']>();
   const configurableProfile = scopeProfiles.find(
     (profile) => 'configOptions' in profile && profile.configOptions,
   );
@@ -1090,6 +1090,8 @@ function ExecutionLaunch(props: LaunchProps) {
     effortOptions[0] ||
     '';
   const active = useRef(false);
+  const taskRevision = useRef(props.task.revision);
+  taskRevision.current = props.task.revision;
   useLayoutEffect(() => {
     active.current = true;
     return () => {
@@ -1101,19 +1103,28 @@ function ExecutionLaunch(props: LaunchProps) {
     if (
       props.workspace.connection !== 'connected' ||
       props.workspace.preview ||
-      !repositoryAvailable
+      !repositoryAvailable ||
+      selectedProviderScope !== 'repository'
     )
       return;
     void workspaceCommand({
-      command: 'GetTaskConversationState',
-      payload: { taskId: props.task.id },
+      command: 'RefreshTaskModelCatalog',
+      expectedRevision: taskRevision.current,
+      payload: { taskId: props.task.id, profileId: 'openai-repository-v1' },
     })
+      .catch(() => undefined)
+      .then(() =>
+        workspaceCommand({
+          command: 'GetTaskConversationState',
+          payload: { taskId: props.task.id },
+        }),
+      )
       .then((result) => {
         if (!active.current) return;
         setModelChoices(
           (result.outcome === 'applied' || result.outcome === 'already-applied') &&
             result.data?.kind === 'conversation-state'
-            ? result.data.state.modelChoices
+            ? result.data.state.projectModelChoices
             : undefined,
         );
       })
@@ -1126,6 +1137,7 @@ function ExecutionLaunch(props: LaunchProps) {
     props.workspace.connection,
     props.workspace.preview,
     repositoryAvailable,
+    selectedProviderScope,
   ]);
   async function chooseAdoptedWorker() {
     if (
@@ -1344,8 +1356,8 @@ function ExecutionLaunch(props: LaunchProps) {
                     ? 'The committed project is prepared in an isolated workspace.'
                     : 'One existing committed file is prepared in independent scratch.'}{' '}
                   {observedChoices
-                    ? 'The model and effort come from the last retained provider catalog and are checked again at Start.'
-                    : 'The retained profile default applies until a successful planning turn records a provider catalog.'}
+                    ? 'The model and effort come from retained provider metadata and are checked again at Start.'
+                    : 'No provider catalog is available. Reconnect OpenAI and reopen this task to read its available models.'}
                 </p>
                 <p className="muted small" role="status">
                   {selectedProfile.available
@@ -2235,12 +2247,17 @@ function NativeLaunch({
             ? result.data.state
             : null;
         const identity = state ? adoptedWorkerIdentity(task, state) : null;
-        const choices = state?.modelChoices;
+        const choices = modelRequest
+          ? [state?.projectModelChoices, state?.modelChoices].find(
+              (candidate) =>
+                candidate?.status === 'last-observed' &&
+                candidate.observation?.artifactId === modelRequest.observation.artifactId &&
+                candidate.observation.hash === modelRequest.observation.hash,
+            )
+          : undefined;
         const modelCurrent =
           !modelRequest ||
           (choices?.status === 'last-observed' &&
-            choices.observation?.artifactId === modelRequest.observation.artifactId &&
-            choices.observation.hash === modelRequest.observation.hash &&
             choices.models.some(
               (choice) =>
                 choice.model === modelRequest.model && choice.efforts.includes(modelRequest.effort),

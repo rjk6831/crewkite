@@ -304,20 +304,22 @@ export class ControllerClient {
                           ? 40000
                           : command.command === 'CheckNativeConnection'
                             ? 35000
-                            : command.command === 'AuthenticateGoogleAcp'
-                              ? 130000
-                              : command.command === 'InitializeGoogleAcp'
-                                ? 35000
-                                : [
-                                      'ObserveUsage',
-                                      'DiscoverGoogleAcp',
-                                      'StopGoogleAcpSetup',
-                                    ].includes(command.command)
-                                  ? 30000
-                                  : command.command === 'PrepareCandidateEvaluation' &&
-                                      command.payload.checkRecipeId === 'crewkite-verify-v1'
-                                    ? 65000
-                                    : 5000),
+                            : command.command === 'RefreshTaskModelCatalog'
+                              ? 30000
+                              : command.command === 'AuthenticateGoogleAcp'
+                                ? 130000
+                                : command.command === 'InitializeGoogleAcp'
+                                  ? 35000
+                                  : [
+                                        'ObserveUsage',
+                                        'DiscoverGoogleAcp',
+                                        'StopGoogleAcpSetup',
+                                      ].includes(command.command)
+                                    ? 30000
+                                    : command.command === 'PrepareCandidateEvaluation' &&
+                                        command.payload.checkRecipeId === 'crewkite-verify-v1'
+                                      ? 65000
+                                      : 5000),
       );
       this.pending.set(command.key, { resolve, timer });
       socket.write(frame);
