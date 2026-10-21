@@ -133,8 +133,10 @@ const workflowRequest = (
   }) satisfies Extract<GitHubReadRequest, { kind: 'workflow-run' }>;
 
 test('GitHub reads bind status and complete logs to owned GET operations', async () => {
+  const ansi = Buffer.from('\u001b[31mfailed step\u001b[0m\n');
   const largePrefix = Buffer.alloc(1024 * 1024 + 31, 120);
   const logChunks = [
+    ansi,
     largePrefix,
     Buffer.from('\nGITHUB_'),
     Buffer.from('TOKEN=github_pat_secret-value\nlast-byte'),
@@ -363,7 +365,7 @@ test('GitHub reads bind status and complete logs to owned GET operations', async
     const result = await operation.result;
     scenario.expected(result);
     assert.equal(runner.scripts.length, 0, scenario.name);
-    for (const launch of runner.launches) {
+    for (const [index, launch] of runner.launches.entries()) {
       assert.equal(launch.executable, client.path);
       assert.equal(launch.executableIdentity, 'verified-prelaunch-sha256');
       assert.equal(launch.executableSha256, client.sha256);
@@ -375,6 +377,8 @@ test('GitHub reads bind status and complete logs to owned GET operations', async
         '--hostname',
         'github.com',
       ]);
+      const content = scenario.request.kind === 'job-log' && index === 1;
+      assert.equal(launch.argv.includes('--allow-escape-sequences'), content, scenario.name);
       assert(!launch.argv.some((value) => /login|token|rerun|cancel|dispatch/i.test(value)));
       assert.deepEqual(launch.environment, {
         HOME: '/home/example',
@@ -387,12 +391,26 @@ test('GitHub reads bind status and complete logs to owned GET operations', async
     }
     if (scenario.name.includes('full log')) {
       const retained = Buffer.concat(stored);
+      assert(retained.subarray(0, ansi.length).equals(ansi));
       assert(!retained.includes(Buffer.from('github_pat_')));
       assert(!retained.includes(Buffer.from('secret-value')));
       assert(retained.subarray(-9).equals(Buffer.from('last-byte')));
       assert.equal(result.state, 'complete');
       if (result.state === 'complete' && result.kind === 'job-log')
         assert.equal(result.artifact.hash, createHash('sha256').update(retained).digest('hex'));
+      assert.deepEqual(runner.launches[1]?.argv, [
+        'api',
+        '--method',
+        'GET',
+        '--hostname',
+        'github.com',
+        '--header',
+        'Accept: application/vnd.github+json',
+        '--header',
+        'X-GitHub-Api-Version: 2022-11-28',
+        '--allow-escape-sequences',
+        '/repos/crew-kite/daily-work/actions/jobs/88/logs',
+      ]);
     }
     assert.equal(
       trace.at(-1),
