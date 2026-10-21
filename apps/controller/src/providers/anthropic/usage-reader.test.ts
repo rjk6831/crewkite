@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { startAnthropicUsageReader } from './native-usage-reader.ts';
+import {
+  type AnthropicUsageReaderTrust,
+  anthropicUsageReaderScope,
+  startAnthropicUsageReader,
+} from './native-usage-reader.ts';
 import {
   AnthropicUsageReader,
   anthropicUsageReaderPlan,
@@ -230,6 +234,10 @@ test('local usage reports preserve server rows and unknown age without model wor
   assert.equal(plan.argv.includes('--disable-slash-commands'), false);
   assert.equal(plan.argv.includes('--bare'), false);
   assert.equal(plan.argv.includes('--model'), false);
+  assert.equal(plan.argv.includes('--safe-mode'), true);
+  assert.equal(plan.argv.includes('--restricted'), true);
+  assert.equal(plan.argv[plan.argv.indexOf('--settings') + 1], '{"disableAllHooks":true}');
+  assert.equal(plan.argv[plan.argv.indexOf('--setting-sources') + 1], '');
   assert.throws(
     () => anthropicUsageReaderPlan({ clientSha256: '0'.repeat(64), sessionId }),
     UsageReaderError,
@@ -237,29 +245,89 @@ test('local usage reports preserve server rows and unknown age without model wor
 });
 
 test('the usage owner bounds output and refuses metadata before physical closure', async () => {
-  assert.throws(
-    () =>
-      startAnthropicUsageReader({
-        operationId: 'usage_refused',
-        executable: '/not-opened/native',
-        executableSha256: sha256,
-        sessionId,
-        directory: '/not-opened',
-        home: '/not-opened',
-        temporary: '/not-opened',
-        lifecycle: {
-          intent() {
-            assert.fail('no intent before policy proof');
-          },
-          owned() {},
-          quiescent() {},
+  const context = {
+    operationId: 'usage_fixture',
+    executable: '/not-opened/native',
+    executableSha256: sha256,
+    sessionId,
+    directory: '/not-opened',
+    home: '/not-opened/home',
+    temporary: '/not-opened/temporary',
+  };
+  const scope = anthropicUsageReaderScope(context);
+  const trust = { nativeTrust: 'accepted' as const, scopeHash: scope.scopeHash };
+  assert.equal(scope.version, 1);
+  assert.equal(scope.purpose, 'native-local-usage');
+  assert.equal(scope.nativeTrust, 'required');
+  assert.equal(scope.command, '/usage');
+  assert.equal(scope.generationRequest, false);
+  assert.equal(scope.policyHooks, 'covered-by-native-client-trust');
+  const lifecycle = {
+    intent() {
+      assert.fail('no intent before explicit native-client trust');
+    },
+    owned() {},
+    quiescent() {},
+  };
+  for (const invalid of [
+    undefined,
+    null,
+    false,
+    {},
+    { ...trust, nativeTrust: 'required' },
+    { ...trust, scopeHash: '0'.repeat(64) },
+    { ...trust, private: 'unrecognized acceptance field' },
+  ])
+    for (const options of [
+      {},
+      {
+        create() {
+          assert.fail('no owner construction before explicit native-client trust');
         },
-      }),
-    (error: unknown) =>
-      error instanceof UsageReaderError && error.reason === 'managed-hooks-unverified',
-  );
+      },
+    ])
+      assert.throws(
+        () =>
+          startAnthropicUsageReader(
+            { ...context, lifecycle, trust: invalid as AnthropicUsageReaderTrust },
+            options,
+          ),
+        (error: unknown) =>
+          error instanceof UsageReaderError && error.reason === 'native-trust-required',
+      );
+  for (const changed of [
+    { operationId: 'another_operation' },
+    { sessionId: uuid },
+    { executable: '/another/native' },
+    { directory: '/another/directory' },
+    { home: '/another/home' },
+    { temporary: '/another/temporary' },
+  ]) {
+    assert.notEqual(
+      anthropicUsageReaderScope({ ...context, ...changed }).scopeHash,
+      trust.scopeHash,
+    );
+    assert.throws(
+      () => startAnthropicUsageReader({ ...context, ...changed, lifecycle, trust }),
+      (error: unknown) =>
+        error instanceof UsageReaderError && error.reason === 'native-trust-required',
+    );
+  }
+  for (const changed of [
+    { executableSha256: '0'.repeat(64) },
+    { sessionId: 'invalid' },
+    { operationId: '' },
+    { directory: 'relative' },
+    { home: '/not-opened/../changed' },
+    { temporary: '/not-opened/temporary\0' },
+  ])
+    assert.throws(
+      () => startAnthropicUsageReader({ ...context, ...changed, lifecycle, trust }),
+      (error: unknown) => error instanceof UsageReaderError && error.reason === 'client',
+    );
   for (const mode of [
     'success',
+    'caller-mutation',
     'stdout-limit',
     'stderr-limit',
     'group-present',
@@ -296,50 +364,54 @@ test('the usage owner bounds output and refuses metadata before physical closure
           mode === 'model-turn' ? { ...terminal, num_turns: 1 } : terminal,
         ]);
     }
-    const handle = startAnthropicUsageReader(
-      {
-        operationId: 'usage_fixture',
-        executable: '/public/fixture',
-        executableSha256: sha256,
-        sessionId,
-        directory: '/private/tmp',
-        home: '/private/tmp',
-        temporary: '/private/tmp',
-        lifecycle: { intent() {}, owned() {}, quiescent() {} },
+    const request = {
+      ...context,
+      trust,
+      lifecycle: { intent() {}, owned() {}, quiescent() {} },
+    };
+    const handle = startAnthropicUsageReader(request, {
+      schedule,
+      now: () => {
+        if (mode === 'caller-mutation') {
+          request.home = '/changed/home';
+          request.executable = '/changed/native';
+          request.directory = '/changed/directory';
+        }
+        return 0;
       },
-      {
-        schedule,
-        now: () => 0,
-        receivedAt: () => at,
-        create(launch) {
-          assert.deepEqual(
-            launch.argv,
-            anthropicUsageReaderPlan({ clientSha256: sha256, sessionId }).argv,
-          );
-          assert.equal(launch.environment.ANTHROPIC_API_KEY, undefined);
-          assert.equal(launch.input, undefined);
-          return {
-            stdoutStream: output(true),
-            stderrStream: output(false),
-            closed: held ? close.promise : Promise.resolve(),
-            exited: Promise.resolve({ code: 0, signal: null, quiescent: mode !== 'group-present' }),
-            inputCompleted: Promise.resolve({ bytes: 0 }),
-            failed: false,
-            ownershipUnknown: false,
-            stop() {
-              stopped.push(true);
-              if (held && mode !== 'unclosed') close.resolve();
-            },
-            async quiescent() {
-              return mode !== 'group-present';
-            },
-          };
-        },
+      receivedAt: () => at,
+      create(launch) {
+        assert.deepEqual(
+          launch.argv,
+          anthropicUsageReaderPlan({ clientSha256: sha256, sessionId }).argv,
+        );
+        assert.equal(launch.environment.ANTHROPIC_API_KEY, undefined);
+        assert.equal(launch.input, undefined);
+        assert.equal(launch.executableSha256, context.executableSha256);
+        assert.equal(launch.executable, context.executable);
+        assert.equal(launch.environment.HOME, context.home);
+        assert.equal(launch.directory, context.directory);
+        return {
+          stdoutStream: output(true),
+          stderrStream: output(false),
+          closed: held ? close.promise : Promise.resolve(),
+          exited: Promise.resolve({ code: 0, signal: null, quiescent: mode !== 'group-present' }),
+          inputCompleted: Promise.resolve({ bytes: 0 }),
+          failed: false,
+          ownershipUnknown: false,
+          stop() {
+            stopped.push(true);
+            if (held && mode !== 'unclosed') close.resolve();
+          },
+          async quiescent() {
+            return mode !== 'group-present';
+          },
+        };
       },
-    );
+    });
     if (mode === 'stopped') handle.stop();
     const result = await handle.result;
-    if (mode === 'success') {
+    if (mode === 'success' || mode === 'caller-mutation') {
       assert(result.reading);
       assert.equal(result.reason, null);
       assert.equal(result.quiescent, true);

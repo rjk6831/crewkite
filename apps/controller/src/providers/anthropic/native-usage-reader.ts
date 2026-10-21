@@ -1,5 +1,7 @@
-import { isAbsolute } from 'node:path';
+import { createHash } from 'node:crypto';
+import { isAbsolute, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
+import { z } from 'zod';
 import {
   defaultSchedule,
   OwnedCommand,
@@ -9,7 +11,6 @@ import {
 } from '../../host/worker.ts';
 import {
   AnthropicUsageReader,
-  anthropicUsageReaderAvailability,
   anthropicUsageReaderPlan,
   UsageReaderError,
 } from './usage-reader.ts';
@@ -28,17 +29,66 @@ type Owner = Pick<
 >;
 type Reading = ReturnType<AnthropicUsageReader['finish']>;
 type Reason = 'protocol' | 'output-limit' | 'deadline' | 'stopped' | 'exit' | 'ownership';
+export type AnthropicUsageReaderContext = Readonly<{
+  operationId: string;
+  executable: string;
+  executableSha256: string;
+  sessionId: string;
+  directory: string;
+  home: string;
+  temporary: string;
+}>;
+const nativeTrust = z.strictObject({
+  nativeTrust: z.literal('accepted'),
+  scopeHash: z.string().regex(/^[a-f0-9]{64}$/),
+});
+export type AnthropicUsageReaderTrust = z.infer<typeof nativeTrust>;
+const usageScope = {
+  version: 1,
+  purpose: 'native-local-usage',
+  nativeTrust: 'required',
+  command: '/usage',
+  generationRequest: false,
+  policyHooks: 'covered-by-native-client-trust',
+} as const;
 
-/** The shared owner holds the fresh group and records intent before any native input. */
+/** The caller obtains explicit native-client trust for this scope before starting the command. */
+export function anthropicUsageReaderScope(input: AnthropicUsageReaderContext) {
+  const plan = anthropicUsageReaderPlan({
+    clientSha256: input.executableSha256,
+    sessionId: input.sessionId,
+  });
+  if (
+    !/^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,199}$/.test(input.operationId) ||
+    [input.executable, input.directory, input.home, input.temporary].some(
+      (path) => !isAbsolute(path) || resolve(path) !== path || path.includes('\0'),
+    )
+  )
+    throw new UsageReaderError('client');
+  return {
+    ...usageScope,
+    scopeHash: createHash('sha256')
+      .update(
+        JSON.stringify({
+          ...usageScope,
+          operationId: input.operationId,
+          executable: input.executable,
+          executableSha256: plan.clientSha256,
+          sessionId: plan.sessionId,
+          directory: input.directory,
+          home: input.home,
+          temporary: input.temporary,
+          argv: plan.argv,
+        }),
+      )
+      .digest('hex'),
+  };
+}
+
+/** Invoke the local command without generation input; native policy hooks remain trusted client behavior. */
 export function startAnthropicUsageReader(
-  input: {
-    operationId: string;
-    executable: string;
-    executableSha256: string;
-    sessionId: string;
-    directory: string;
-    home: string;
-    temporary: string;
+  input: AnthropicUsageReaderContext & {
+    trust?: AnthropicUsageReaderTrust;
     lifecycle: OwnedCommandLifecycle;
   },
   options: {
@@ -48,34 +98,44 @@ export function startAnthropicUsageReader(
     create?: (options: StreamingCommandOptions) => Owner;
   } = {},
 ) {
-  const plan = anthropicUsageReaderPlan({
-    clientSha256: input.executableSha256,
+  const context: AnthropicUsageReaderContext = {
+    operationId: input.operationId,
+    executable: input.executable,
+    executableSha256: input.executableSha256,
     sessionId: input.sessionId,
+    directory: input.directory,
+    home: input.home,
+    temporary: input.temporary,
+  };
+  const lifecycle = input.lifecycle;
+  const scope = anthropicUsageReaderScope(context);
+  const accepted = nativeTrust.safeParse(input.trust);
+  if (!accepted.success || accepted.data.scopeHash !== scope.scopeHash)
+    throw new UsageReaderError('native-trust-required');
+  const plan = anthropicUsageReaderPlan({
+    clientSha256: context.executableSha256,
+    sessionId: context.sessionId,
   });
-  // Managed hooks can run before the first frame. No supported preflight proves them absent yet.
-  // Injected owners exercise this protocol offline and never authorize the default native spawn.
-  if (!options.create) throw new UsageReaderError(anthropicUsageReaderAvailability.reason);
-  if (!isAbsolute(input.home) || !isAbsolute(input.temporary)) throw new UsageReaderError('client');
   const now = options.now ?? (() => performance.now());
   const started = now();
   if (!Number.isFinite(started)) throw new UsageReaderError('client');
   const schedule = options.schedule ?? defaultSchedule;
   const owner = (options.create ?? ((value) => new OwnedCommand(value)))({
     streaming: true,
-    operationId: input.operationId,
-    executable: input.executable,
+    operationId: context.operationId,
+    executable: context.executable,
     executableIdentity: 'verified-prelaunch-sha256',
     executableSha256: plan.clientSha256,
     argv: plan.argv,
-    directory: input.directory,
+    directory: context.directory,
     environment: {
-      HOME: input.home,
-      TMPDIR: input.temporary,
+      HOME: context.home,
+      TMPDIR: context.temporary,
       PATH: '/usr/bin:/bin',
       LANG: 'C',
       NO_COLOR: '1',
     },
-    lifecycle: input.lifecycle,
+    lifecycle,
   });
   if (!owner.stdoutStream || !owner.stderrStream) {
     owner.stop();

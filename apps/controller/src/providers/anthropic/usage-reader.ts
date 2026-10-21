@@ -135,23 +135,13 @@ const terminal = z.object({
 });
 
 export class UsageReaderError extends Error {
-  readonly reason:
-    | 'client'
-    | 'protocol'
-    | 'output-limit'
-    | 'incomplete'
-    | 'managed-hooks-unverified';
+  readonly reason: 'client' | 'protocol' | 'output-limit' | 'incomplete' | 'native-trust-required';
   constructor(reason: UsageReaderError['reason']) {
     super(`Subscription usage reader refused: ${reason}.`);
     this.name = 'UsageReaderError';
     this.reason = reason;
   }
 }
-
-export const anthropicUsageReaderAvailability = Object.freeze({
-  available: false as const,
-  reason: 'managed-hooks-unverified' as const,
-});
 
 /** This exact build has a local non-interactive /usage command and skips the startup model probe. */
 export function anthropicUsageReaderPlan(input: { clientSha256: string; sessionId: string }) {
