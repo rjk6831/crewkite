@@ -692,6 +692,86 @@ async function quotaReadBridge(
     await expect(
       page.getByRole('button', { name: 'Retry exact command', exact: true }),
     ).toHaveCount(0);
+    const usageReader: Snapshot['usageReaders'][number] = {
+      id: 'anthropic-usage-v1',
+      family: 'anthropic',
+      clientVersion: 'fixture',
+      available: true,
+      reason: 'available',
+      lastObservedAt: null,
+      lastAttemptAt: null,
+      readState: 'idle',
+      reading: null,
+      readingScopeHash: null,
+      trust: {
+        scopeHash: 'b'.repeat(64),
+        clientSha256: 'c'.repeat(64),
+        command: '/usage',
+        generationRequest: false,
+        policyHooks: 'covered-by-native-client-trust',
+        accepted: false,
+      },
+    };
+    snapshot.usageReaders.push(usageReader);
+    await page.reload();
+    await page.getByRole('button', { name: 'Usage and capacity', exact: true }).click();
+    const quotaRefresh = anthropicPanel.getByRole('button', {
+      name: 'Refresh Anthropic quota',
+      exact: true,
+    });
+    await quotaRefresh.click();
+    const nativeTrust = page.getByRole('dialog', {
+      name: 'Trust the native usage command',
+      exact: true,
+    });
+    await expect(nativeTrust).toContainText('sends no generation request');
+    await expect(nativeTrust).toContainText('administrator policy hooks');
+    assert.equal(pending.length, 0, 'opening native trust starts no read');
+    await nativeTrust.getByRole('button', { name: 'Cancel', exact: true }).click();
+    assert.equal(pending.length, 0);
+    await quotaRefresh.click();
+    await nativeTrust.getByRole('button', { name: 'Trust and refresh quota', exact: true }).click();
+    const usageRefresh = await next();
+    assert.equal(usageRefresh.command.command, 'RefreshAnthropicUsage');
+    assert.deepEqual(usageRefresh.command.payload, {
+      trust: { nativeTrust: 'accepted', scopeHash: 'b'.repeat(64) },
+    });
+    assert(usageReader.trust);
+    usageReader.trust.accepted = true;
+    usageReader.readState = 'quiescent';
+    usageReader.readReason = 'reported';
+    usageReader.readingScopeHash = usageReader.trust.scopeHash;
+    usageReader.reading = {
+      status: 'reported',
+      source: 'native-local-command',
+      receivedAt: new Date().toISOString(),
+      observedAt: null,
+      freshness: 'unknown',
+      windows: [
+        {
+          kind: 'session',
+          group: 'session',
+          percent: 37,
+          resets_at: null,
+          severity: 'normal',
+          is_active: true,
+        },
+      ],
+      extraUsage: null,
+      modelTurns: 0,
+      qualified: false,
+    };
+    reply(usageRefresh, { outcome: 'applied' });
+    await expect(anthropicPanel).toContainText('Last retained report received');
+    await expect(anthropicPanel).toContainText('Observation time and cache age unknown');
+    await expect(anthropicPanel).toContainText('reported 37%');
+    await expect(anthropicPanel).not.toContainText('Reader ready, not read');
+    await quotaRefresh.click();
+    const rememberedRefresh = await next();
+    assert.equal(rememberedRefresh.command.command, 'RefreshAnthropicUsage');
+    assert.deepEqual(rememberedRefresh.command.payload, {});
+    await expect(nativeTrust).toHaveCount(0);
+    reply(rememberedRefresh, { outcome: 'blocked', reason: 'usage-reader-cooldown' });
     snapshot.nativeConnections[0] = {
       ...snapshot.nativeConnections[0],
       state: 'signed-out',
@@ -1072,6 +1152,24 @@ async function quotaReadBridge(
       assert.equal(duringStop.command.command, 'ObserveUsage');
       reply(duringStop, { outcome: 'blocked', reason: 'usage-reader-cooldown' });
       assert.equal((await independentMetadata)?.outcome, 'blocked');
+      for (const input of [
+        { command: 'RefreshAnthropicUsage', expectedRevision: 0, payload: {} },
+        {
+          command: 'StopAnthropicUsage',
+          expectedRevision: 0,
+          payload: { operationId: starting.command.key },
+        },
+      ]) {
+        const independentUsage = page.evaluate(
+          (value) => window.crewkite?.command(value),
+          input as never,
+        );
+        const pendingUsage = await next();
+        assert.equal(pendingUsage.command.command, input.command);
+        reply(pendingUsage, { outcome: 'blocked', reason: 'fixture-native-usage' });
+        assert.equal((await independentUsage)?.reason, 'fixture-native-usage');
+      }
+
       reply(cancelled, { outcome: 'outcome-unknown', reason: 'fixture-stop-unknown' });
       // Cancellation completion cannot release the original Start command's busy owner.
       await expect(page.getByRole('alert')).toContainText('fixture-stop-unknown');

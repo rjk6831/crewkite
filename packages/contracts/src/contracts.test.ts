@@ -2069,6 +2069,30 @@ test('process boundaries reject unknown fields and invalid command identity', ()
   assert.deepEqual(CommandSchema.parse(observe), observe);
   assert(CommandSchema.safeParse({ ...observe, payload: { family: 'openai' } }).success);
   assert.equal(hashCanonical(CommandSchema.parse(observe)), hashCanonical(observe));
+  const refresh = { ...command, command: 'RefreshAnthropicUsage', payload: {} };
+  assert.deepEqual(CommandSchema.parse(refresh), refresh);
+  assert(
+    CommandSchema.safeParse({
+      ...refresh,
+      payload: { trust: { nativeTrust: 'accepted', scopeHash: 'a'.repeat(64) } },
+    }).success,
+  );
+  for (const payload of [
+    { trust: true },
+    { trust: { nativeTrust: 'accepted' } },
+    { trust: { nativeTrust: 'accepted', scopeHash: 'a'.repeat(64), generation: true } },
+    { existingCredits: true },
+    { family: 'anthropic' },
+  ])
+    assert.equal(CommandSchema.safeParse({ ...refresh, payload }).success, false);
+  assert(
+    CommandSchema.safeParse({
+      ...command,
+      command: 'StopAnthropicUsage',
+      payload: { operationId: command.key },
+    }).success,
+  );
+
   for (const payload of [
     { family: 'google', consent: true },
     { family: 'google', consent: false },

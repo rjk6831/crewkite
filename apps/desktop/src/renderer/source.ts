@@ -653,6 +653,8 @@ export function useWorkspace() {
         {
           command:
             | 'ObserveUsage'
+            | 'RefreshAnthropicUsage'
+            | 'StopAnthropicUsage'
             | 'CheckNativeConnection'
             | 'InstallGoogleAcp'
             | 'StopGoogleAcpInstall'
@@ -680,6 +682,8 @@ export function useWorkspace() {
     (input: DesktopCommand) => {
       if (
         input.command === 'ObserveUsage' ||
+        input.command === 'RefreshAnthropicUsage' ||
+        input.command === 'StopAnthropicUsage' ||
         input.command === 'CheckNativeConnection' ||
         input.command === 'InstallGoogleAcp' ||
         input.command === 'StopGoogleAcpInstall' ||

@@ -142,6 +142,7 @@ const eventNames: Record<Event['type'], string> = {
   'attempt.output': 'Worker output',
   'approval.requested': 'Approval requested',
   'approval.resolved': 'Approval resolved',
+  'usage.reader-updated': 'Usage reader updated',
   'usage.observed': 'Usage observation received',
   'route.reserve_reached': 'Reserve reached',
   'admissions.paused': 'New admissions paused',
