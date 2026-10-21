@@ -3,8 +3,9 @@ import {
   type LocalSetup as LocalSetupState,
   type Snapshot,
 } from '@crewkite/contracts';
-import { useEffect, useId, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { Fact } from './components.tsx';
+import { connectLocalFlow, waitForLocalReadiness } from './local-setup-flow.ts';
 import type { DesktopCommand, Workspace } from './source.ts';
 
 const setupReasons: Record<NonNullable<LocalSetupState['reason']>, string> = {
@@ -13,23 +14,21 @@ const setupReasons: Record<NonNullable<LocalSetupState['reason']>, string> = {
   'connection-unavailable':
     'Local connection failed. Confirm the server authentication setting matches this connection.',
   'input-active': 'The native connection input window is open.',
-  'input-unknown': 'Connection input ownership is unknown. Refresh saved status before continuing.',
-  'discovery-required': 'Refresh the model list to observe the connected runtime.',
+  'input-unknown': 'Connection input ownership is unknown. Reconnect before continuing.',
+  'discovery-required': 'Read the connected runtime to find its loaded model.',
   'discovery-active': 'The controller is reading model metadata.',
-  'discovery-unknown':
-    'Model discovery ownership is unknown. Refresh saved status before continuing.',
-  'model-selection-required': 'Select an observed model.',
+  'discovery-unknown': 'Model discovery ownership is unknown. Reconnect before continuing.',
+  'model-selection-required': 'Choose an observed model.',
   'model-unloaded':
-    'The selected model is installed and unloaded. Load it in the Local app, refresh models, then select it again.',
+    'The selected model is installed and unloaded. Load it in the Local app, then refresh.',
   'model-incompatible':
     'The selected model does not meet this profile. Inspect its observed reasons.',
-  'selection-stale':
-    'The model observation changed. Refresh models and select from the current observation.',
+  'selection-stale': 'The selected model changed. Refresh and choose from the current observation.',
   'generation-active':
     'A Local generation is active. Stop its task before changing this connection.',
   'generation-unknown': 'Local generation ownership is unknown. Connection changes remain blocked.',
   'capability-unavailable': 'The native Local connection input is unavailable.',
-  'setup-unavailable': 'The Local setup is unavailable. Refresh saved status.',
+  'setup-unavailable': 'The Local setup is unavailable. Reconnect to recover current status.',
   'qualification-pending': 'The selected Local writer is unqualified.',
 };
 export const localModelStates = {
@@ -41,7 +40,7 @@ const modelReasons = {
   'unsupported-format': 'Unsupported model format',
   'remote-model': 'Remote model',
   'identity-ambiguous': 'Model identity is ambiguous',
-  'multiple-resident-models': 'Multiple resident models',
+  'multiple-resident-models': 'More than one language model is loaded',
   'resident-embedding': 'Embedding model is resident',
   busy: 'Model is busy',
   context: 'Loaded context length is not 8192 tokens',
@@ -65,6 +64,11 @@ export function LocalSetup({
   const [choiceId, setChoiceId] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [requested, setRequested] = useState<string | null>(null);
+  const [polling, setPolling] = useState(false);
+  const [pollTimedOut, setPollTimedOut] = useState(false);
+  const pollAbort = useRef<AbortController | null>(null);
+  const actionGeneration = useRef(0);
+  const mounted = useRef(true);
   const titleId = useId();
   const endpointErrorId = useId();
   const parsedEndpoint = LocalEndpointSchema.safeParse(endpoint);
@@ -88,12 +92,84 @@ export function LocalSetup({
         : (setup?.selection?.selectionId ?? null),
     );
   }, [models, setup?.selection?.selectionId]);
+  useEffect(
+    () => () => {
+      mounted.current = false;
+      actionGeneration.current++;
+      pollAbort.current?.abort();
+    },
+    [],
+  );
+  function stopPolling() {
+    actionGeneration.current++;
+    pollAbort.current?.abort();
+    pollAbort.current = null;
+    setPolling(false);
+  }
+  function startPolling(targetEndpoint: string) {
+    if (pollAbort.current) return;
+    const control = new AbortController();
+    const generation = actionGeneration.current;
+    pollAbort.current = control;
+    setPolling(true);
+    setPollTimedOut(false);
+    setMessage('Waiting for the connection and model metadata.');
+    void waitForLocalReadiness({
+      endpoint: targetEndpoint,
+      active: () =>
+        mounted.current && !control.signal.aborted && actionGeneration.current === generation,
+      wait: () =>
+        new Promise<void>((resolve) => {
+          const stopped = () => {
+            window.clearTimeout(timer);
+            resolve();
+          };
+          const timer = window.setTimeout(() => {
+            control.signal.removeEventListener('abort', stopped);
+            resolve();
+          }, 1000);
+          control.signal.addEventListener('abort', stopped, { once: true });
+        }),
+      read: async () => (await workspace.refresh()).localSetup,
+      discover: async (current) => {
+        const result = await workspace.command({
+          command: 'RefreshLocalModels',
+          expectedRevision: current.revision,
+          payload: { consent: 'explicit' },
+        });
+        if (control.signal.aborted || !mounted.current || actionGeneration.current !== generation)
+          return false;
+        if (applied(result.outcome)) return true;
+        setMessage(result.next ?? result.reason ?? 'Model metadata could not be read.');
+        return false;
+      },
+    })
+      .then((result) => {
+        if (control.signal.aborted || !mounted.current) return;
+        if (result === 'ready') setMessage('Connection and model metadata are ready.');
+        if (result === 'timeout') {
+          setPollTimedOut(true);
+          setMessage('Taking longer than expected. Try Refresh.');
+        }
+      })
+      .catch(() => {
+        if (!control.signal.aborted && mounted.current)
+          setMessage('Local status could not be refreshed. Reconnect and try again.');
+      })
+      .finally(() => {
+        if (pollAbort.current === control && mounted.current) {
+          pollAbort.current = null;
+          setPolling(false);
+        }
+      });
+  }
   async function action(name: string, command: DesktopCommand) {
     if (!connected || workspace.retryAvailable || requested) return;
     setRequested(name);
     setMessage(null);
     try {
       const result = await workspace.command(command);
+      if (!mounted.current) return;
       setMessage(
         applied(result.outcome)
           ? command.command === 'BeginLocalConnectionInput' ||
@@ -106,25 +182,57 @@ export function LocalSetup({
       );
       if (applied(result.outcome) && command.command === 'ConfigureLocal') setEndpointEdited(false);
     } catch {
-      setMessage(
-        `${name} could not be confirmed. Refresh saved status and use exact retry if available.`,
-      );
+      if (mounted.current)
+        setMessage(`${name} could not be confirmed. Reconnect and use exact retry if available.`);
     } finally {
-      setRequested(null);
+      if (mounted.current) setRequested(null);
+    }
+  }
+  async function connectLocal() {
+    if (!setup || !parsedEndpoint.success || !connected || workspace.retryAvailable || requested)
+      return;
+    stopPolling();
+    const generation = actionGeneration.current;
+    setRequested('Local connection');
+    setMessage(null);
+    setPollTimedOut(false);
+    try {
+      const result = await connectLocalFlow({
+        setup,
+        endpoint: parsedEndpoint.data,
+        authMode,
+        command: workspace.command,
+        active: () => mounted.current && actionGeneration.current === generation,
+      });
+      if (result.kind === 'stopped') return;
+      if (result.kind === 'blocked') {
+        setMessage(
+          result.result.next ?? result.result.reason ?? 'Local connection was not confirmed.',
+        );
+        return;
+      }
+      setEndpointEdited(false);
+      startPolling(parsedEndpoint.data);
+    } catch {
+      if (mounted.current && actionGeneration.current === generation)
+        setMessage(
+          'Local connection could not be confirmed. Reconnect and use exact retry if available.',
+        );
+    } finally {
+      if (mounted.current && actionGeneration.current === generation) setRequested(null);
     }
   }
   return (
     <section className="card view-stack" aria-labelledby={titleId}>
       <div className="section-heading">
         <h2 id={titleId}>Local setup</h2>
-        <span>Writer only · Qualification pending</span>
+        <span>Writer setup</span>
       </div>
       <p className="muted small">
         Connect to an existing Local runtime using its saved authentication mode. Dedicated token
         opens a native input window. No authentication connects without a token to this device's
-        loopback endpoint. CrewKite does not change the runtime's authentication setting. Refresh
-        reads model metadata without loading a model or starting generation. Connecting or
-        refreshing models clears the saved model choice. Select a model from the new observation.
+        loopback endpoint. CrewKite does not change the runtime's authentication setting or load a
+        model. Load the model in the Local app when needed.
       </p>
       <p className="notice" role="status">
         {setup?.reason
@@ -133,7 +241,7 @@ export function LocalSetup({
             : setupReasons[setup.reason]
           : setup
             ? 'Inspect the saved connection and model state.'
-            : 'Local setup is unavailable. Refresh saved status.'}
+            : 'Local setup is unavailable. Reconnect to recover current status.'}
       </p>
       {message && (
         <p className="notice" role="status">
@@ -178,8 +286,10 @@ export function LocalSetup({
           aria-invalid={endpointError}
           aria-describedby={endpointError ? endpointErrorId : undefined}
           onChange={(event) => {
+            stopPolling();
             setEndpoint(event.target.value);
             setEndpointEdited(true);
+            setPollTimedOut(false);
           }}
         />
       </label>
@@ -190,55 +300,21 @@ export function LocalSetup({
       )}
       <div className="button-row">
         <button
-          className="button secondary"
-          type="button"
-          disabled={blocked || !parsedEndpoint.success}
-          onClick={() => {
-            if (setup && parsedEndpoint.success)
-              void action('Endpoint configuration', {
-                command: 'ConfigureLocal',
-                expectedRevision: setup.revision,
-                payload: { endpoint: parsedEndpoint.data, authMode },
-              });
-          }}
-        >
-          Configure endpoint
-        </button>
-        <button
           className="button primary"
           type="button"
-          disabled={blocked || !setup?.endpoint}
+          disabled={blocked || polling || !parsedEndpoint.success}
           onClick={() => {
-            if (setup?.endpoint)
-              void action(authMode === 'none' ? 'Local connection' : 'Connection input', {
-                command: 'BeginLocalConnectionInput',
-                expectedRevision: setup.revision,
-                payload: { consent: 'explicit' },
-              });
+            void connectLocal();
           }}
         >
-          Connect Local
+          Connect
         </button>
         <button
           className="button secondary"
           type="button"
-          disabled={blocked || !connectionReady}
+          disabled={!connected || busy || workspace.retryAvailable || !setup?.endpoint}
           onClick={() => {
-            if (setup)
-              void action('Model refresh', {
-                command: 'RefreshLocalModels',
-                expectedRevision: setup.revision,
-                payload: { consent: 'explicit' },
-              });
-          }}
-        >
-          Refresh models
-        </button>
-        <button
-          className="button secondary"
-          type="button"
-          disabled={blocked || !setup?.endpoint}
-          onClick={() => {
+            stopPolling();
             if (setup)
               void action('Disconnect', {
                 command: 'DisconnectLocal',
@@ -262,6 +338,7 @@ export function LocalSetup({
               type="button"
               disabled={!connected || busy || workspace.retryAvailable}
               onClick={() => {
+                stopPolling();
                 if (setup.operation?.kind === 'input')
                   void action('Connection input cancellation', {
                     command: 'CancelLocalConnectionInput',
@@ -305,7 +382,19 @@ export function LocalSetup({
                 <select
                   value={choiceId ?? ''}
                   disabled={blocked}
-                  onChange={(event) => setChoiceId(event.target.value || null)}
+                  onChange={(event) => {
+                    const next = models.find((model) => model.selectionId === event.target.value);
+                    setChoiceId(next?.selectionId ?? null);
+                    if (next && setup.observation)
+                      void action('Model selection', {
+                        command: 'SelectLocalModel',
+                        expectedRevision: setup.revision,
+                        payload: {
+                          selectionId: next.selectionId,
+                          observationHash: setup.observation.observationHash,
+                        },
+                      });
+                  }}
                 >
                   <option value="">Choose an observed model</option>
                   {models.map((model) => (
@@ -344,24 +433,6 @@ export function LocalSetup({
                   />
                 </div>
               )}
-              <button
-                className="button primary"
-                type="button"
-                disabled={blocked || !selectedChoice || selectedChoice.state === 'incompatible'}
-                onClick={() => {
-                  if (setup.observation && selectedChoice)
-                    void action('Model selection', {
-                      command: 'SelectLocalModel',
-                      expectedRevision: setup.revision,
-                      payload: {
-                        selectionId: selectedChoice.selectionId,
-                        observationHash: setup.observation.observationHash,
-                      },
-                    });
-                }}
-              >
-                Select observed model
-              </button>
               <details className="technical-details">
                 <summary>Observed model details</summary>
                 {models.map((model) => (
@@ -371,7 +442,11 @@ export function LocalSetup({
                     </p>
                     <code>{model.identity.modelKey}</code>
                     {model.reasons.map((reason) => (
-                      <p key={reason}>{modelReasons[reason]}</p>
+                      <p key={reason}>
+                        {reason === 'multiple-resident-models'
+                          ? `${modelReasons[reason]} (${setup.observation?.residentLlms ?? 0}). Keep one language model loaded for this connection.`
+                          : modelReasons[reason]}
+                      </p>
                     ))}
                     <code>Metadata {model.identity.metadataHash}</code>
                   </div>
@@ -387,19 +462,18 @@ export function LocalSetup({
         Model loading and unloading stay in the Local app. Local lead and orchestrator roles remain
         unqualified.
       </p>
-      <button
-        className="button secondary"
-        type="button"
-        disabled={!connected || busy}
-        onClick={() => {
-          void workspace
-            .refresh()
-            .then(() => setMessage('Saved Local status refreshed.'))
-            .catch(() => setMessage('Saved Local status could not be refreshed.'));
-        }}
-      >
-        Refresh saved status
-      </button>
+      {pollTimedOut && (
+        <button
+          className="button secondary"
+          type="button"
+          disabled={!connected || busy || polling || !setup?.endpoint}
+          onClick={() => {
+            if (setup?.endpoint) startPolling(setup.endpoint);
+          }}
+        >
+          Refresh
+        </button>
+      )}
     </section>
   );
 }

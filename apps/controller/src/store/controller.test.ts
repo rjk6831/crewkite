@@ -3700,6 +3700,12 @@ async function localControllerFixture(
     embeddingInstances: 0,
   };
   const observation = { ...observed, observationHash: hashCanonical(observed) };
+  const changedChoice = { ...choice, instanceReference: 'replacement-instance' };
+  const changedObserved = { ...observed, models: [changedChoice] };
+  const changedObservation = {
+    ...changedObserved,
+    observationHash: hashCanonical(changedObserved),
+  };
   const secret = 'private-controller-local-canary';
   const inputPeer = `
 const fs=require('node:fs'); const mode=process.argv[1]; let pending=Buffer.alloc(0);
@@ -3708,7 +3714,7 @@ const prompt=JSON.parse(pending.subarray(4,4+pending.readUInt32BE(0)));pending=B
 const body=Buffer.from(JSON.stringify({binding:prompt.binding,outcome:'submitted',secret:${JSON.stringify(secret)}}));const header=Buffer.alloc(4);header.writeUInt32BE(body.length);
 const finish=()=>{fs.writeSync(3,Buffer.concat([header,body]));process.stdin.destroy();};if(mode==='input-hold')process.stdin.once('end',finish);else finish();});`;
   const clientPeer = `
-const {createInterface}=require('node:readline');const mode=process.argv[1];const observation=${JSON.stringify(observation)};
+const {createInterface}=require('node:readline');const mode=process.argv[1];const observation=mode==='discovery-instance-changed'?${JSON.stringify(changedObservation)}:${JSON.stringify(observation)};
 let plan;const emit=value=>process.stdout.write(JSON.stringify(value)+'\\n');
 const finish=value=>{emit(value);process.stdin.destroy();};
 createInterface({input:process.stdin}).on('line',line=>{const value=JSON.parse(line);
@@ -4002,8 +4008,33 @@ if(value==='submit')finish({type:'terminal',terminal:{kind:'completed',binding:p
     submitted: submitted.promise,
     reopen,
     secret,
+    choice,
+    observation,
   };
 }
+
+test('Local refresh keeps an exact selected instance and clears a changed instance', async (t) => {
+  const context = await localControllerFixture(t);
+  const selected = context.setupState();
+  assert(selected?.selection);
+  assert(selected.setupHash);
+
+  await context.local('RefreshLocalModels', { consent: 'explicit' });
+  assert.deepEqual(context.setupState()?.selection, selected.selection);
+  assert.equal(context.setupState()?.setupHash, selected.setupHash);
+  await context.operationDone();
+  assert.deepEqual(context.setupState()?.selection, selected.selection);
+  assert.equal(context.setupState()?.setupHash, selected.setupHash);
+
+  context.mode('discovery-instance-changed');
+  await context.local('RefreshLocalModels', { consent: 'explicit' });
+  await context.operationDone();
+  const changed = context.setupState();
+  assert.equal(changed?.observation?.models[0].instanceReference, 'replacement-instance');
+  assert.equal(changed?.selection, null);
+  assert.equal(changed?.setupHash, null);
+  assert.equal(changed?.reason, 'model-selection-required');
+});
 
 test('an appointed native proposal is retained and applied once after every phase stops', async (t) => {
   const local = await nativeSetup(t, 'success', {

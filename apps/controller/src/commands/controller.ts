@@ -3868,9 +3868,9 @@ export class Controller {
     this.saveLocal({
       ...control,
       connectionFailed: false,
-      observation: null,
-      selection: null,
-      setupHash: null,
+      observation: kind === 'discovery' ? control.observation : null,
+      selection: kind === 'discovery' ? control.selection : null,
+      setupHash: kind === 'discovery' ? control.setupHash : null,
       operation: {
         kind,
         binding,
@@ -3963,6 +3963,8 @@ export class Controller {
               ) &&
             !this.store.localGenerationBlocker();
           let observation = control.observation;
+          let selection = control.selection;
+          let setupHash = control.setupHash;
           if (known && live && value && 'kind' in value && value.kind === 'ready') {
             const secret = value.candidate.take(current.binding);
             if (secret)
@@ -3979,8 +3981,44 @@ export class Controller {
             'terminal' in value &&
             value.terminal.kind === 'observed' &&
             hashCanonical(value.terminal.binding) === hashCanonical(current.binding)
-          )
-            observation = LocalModelObservationSchema.parse(value.terminal.observation);
+          ) {
+            const nextObservation = LocalModelObservationSchema.parse(value.terminal.observation);
+            const previousChoice = observation?.models.find(
+              (choice) => choice.selectionId === selection?.selectionId,
+            );
+            const selectionId = selection?.selectionId;
+            const nextChoice = nextObservation.models.find(
+              (choice) => choice.selectionId === selectionId,
+            );
+            const retainSelection =
+              selectionId &&
+              previousChoice &&
+              nextChoice &&
+              hashCanonical(previousChoice) === hashCanonical(nextChoice);
+            observation = nextObservation;
+            if (retainSelection && control.endpoint) {
+              selection = {
+                selectionId,
+                observationHash: nextObservation.observationHash,
+              };
+              setupHash = hashCanonical({
+                version: 2,
+                connectionHash: localConfiguredConnectionHash(
+                  control.endpoint,
+                  control.connectionRevision,
+                  control.authMode,
+                ),
+                ...selection,
+              });
+            } else {
+              selection = null;
+              setupHash = null;
+            }
+          } else if (known && live && current.kind === 'discovery') {
+            observation = null;
+            selection = null;
+            setupHash = null;
+          }
           const proof = this.nativeArtifact({
             operationId,
             kind: current.kind,
@@ -4005,6 +4043,8 @@ export class Controller {
             noneConnected: failedConnection ? false : control.noneConnected,
             connectionFailed: failedConnection,
             observation,
+            selection,
+            setupHash,
             operation: known ? null : { ...current, state: 'unknown' },
           });
         });
