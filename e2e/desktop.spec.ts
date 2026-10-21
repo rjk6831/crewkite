@@ -1993,6 +1993,12 @@ async function conversationBridge(
       await expect(
         chooser.getByRole('combobox', { name: 'Scope', exact: true }).locator('option'),
       ).toHaveText(['Project']);
+      await expect(chooser.getByRole('combobox', { name: 'Model', exact: true })).toHaveValue(
+        'fixture-model',
+      );
+      await expect(
+        chooser.getByRole('combobox', { name: 'Model', exact: true }).locator('option'),
+      ).toHaveText(['fixture-model', 'fixture-next']);
       return chooser;
     };
     await choosePolicy('Balanced');
@@ -2052,6 +2058,10 @@ async function conversationBridge(
     refuseWorkerAdoption = false;
     await page.keyboard.press('Escape');
     const workerChooser = await choosePolicy('Balanced');
+    await workerChooser
+      .getByRole('combobox', { name: 'Model', exact: true })
+      .selectOption('fixture-next');
+    await workerChooser.getByRole('combobox', { name: 'Effort', exact: true }).selectOption('high');
     const adoptedState = TaskConversationStateSchema.parse(state);
     assert.equal(adoptedState.contractStatus, 'confirmed');
     assert(adoptedState.adoptedProposal);
@@ -2074,33 +2084,34 @@ async function conversationBridge(
       workerNative.getByRole('textbox', { name: 'File to edit', exact: true }),
     ).toHaveCount(0);
     const prepareWorker = workerNative.getByRole('button', {
-      name: 'Prepare OpenAI work',
+      name: 'Review task',
       exact: true,
     });
-    const workerTrust = workerNative.getByRole('checkbox', {
-      name: 'Trust the existing native client and login',
+    const workerPermission = workerNative.getByRole('checkbox', {
+      name: 'Allow OpenAI to read this project, edit a separate working copy, and run local commands using my signed-in client',
       exact: true,
     });
-    const workerSource = workerNative.getByRole('checkbox', {
-      name: 'Send this committed repository and task text; allow edits in independent scratch',
-      exact: true,
-    });
-    const workerTools = workerNative.getByRole('checkbox', {
-      name: 'Allow local commands for this run',
-      exact: true,
-    });
-    for (const consent of [workerTrust, workerSource, workerTools])
-      await expect(consent).not.toBeChecked();
+    await expect(workerPermission).not.toBeChecked();
+    await expect(
+      workerNative.getByRole('checkbox', {
+        name: 'Trust the existing native client and login',
+        exact: true,
+      }),
+    ).toHaveCount(0);
+    await expect(
+      workerNative.getByRole('checkbox', {
+        name: 'Allow local commands for this run',
+        exact: true,
+      }),
+    ).toHaveCount(0);
+    await expect(
+      workerNative.getByRole('checkbox', {
+        name: 'Allow existing credits after included usage',
+        exact: true,
+      }),
+    ).not.toBeChecked();
     await expect(prepareWorker).toBeDisabled();
-    await workerTrust.check();
-    await workerSource.check();
-    await expect(prepareWorker).toBeDisabled();
-    await workerTools.check();
-    await expect(workerTrust).not.toBeChecked();
-    await expect(workerSource).not.toBeChecked();
-    await expect(prepareWorker).toBeDisabled();
-    await workerTrust.check();
-    await workerSource.check();
+    await workerPermission.check();
     await expect(prepareWorker).toBeEnabled();
     assert.equal(
       received.some((command) =>
@@ -2126,6 +2137,16 @@ async function conversationBridge(
     assert.deepEqual(workerPreparation.payload.policy.methods, [
       { id: 'keep-it-simple', cycles: 1, reviewerRole: 'reviewer' },
     ]);
+    assert(
+      workerPreparation.payload.policy.effects.some(
+        (grant) => grant.action === 'write-scratch' && grant.usesRemaining === 1,
+      ),
+    );
+    assert(
+      workerPreparation.payload.policy.effects.some(
+        (grant) => grant.action === 'run-native-tools' && grant.usesRemaining === 1,
+      ),
+    );
     assert.deepEqual(workerPreparation.payload.policy.limits, {
       attempts: 3,
       minutes: 5,
@@ -2133,9 +2154,17 @@ async function conversationBridge(
     });
     assert.equal(workerPreparation.payload.consent, 'explicit');
     assert.equal(workerPreparation.payload.creditPolicy, 'ordinary');
+    assert('modelRequest' in workerPreparation.payload);
+    assert.deepEqual(workerPreparation.payload.modelRequest, {
+      version: 1,
+      observation: modelObservation,
+      model: 'fixture-next',
+      effort: 'high',
+    });
     assert.deepEqual(Object.keys(workerPreparation.payload).sort(), [
       'consent',
       'creditPolicy',
+      'modelRequest',
       'policy',
       'profileId',
       'taskId',
@@ -2170,7 +2199,7 @@ async function conversationBridge(
     if (await page.getByRole('button', { name: 'Dismiss error', exact: true }).count())
       await page.getByRole('button', { name: 'Dismiss error', exact: true }).click();
     const pendingChooser = await choosePolicy('Balanced');
-    await pendingChooser.getByRole('button', { name: 'Choose OpenAI', exact: true }).click();
+    await pendingChooser.getByRole('button', { name: 'Start task', exact: true }).click();
     const seededNative = page.getByRole('dialog', { name: 'Repository work', exact: true });
     await expect(
       seededNative.getByRole('combobox', { name: 'Execution authority', exact: true }),
@@ -2179,18 +2208,12 @@ async function conversationBridge(
       seededNative.getByRole('textbox', { name: 'File to edit', exact: true }),
     ).toHaveCount(0);
     await seededNative
-      .getByRole('checkbox', { name: 'Allow local commands for this run', exact: true })
-      .check();
-    await seededNative
-      .getByRole('checkbox', { name: 'Trust the existing native client and login', exact: true })
-      .check();
-    await seededNative
       .getByRole('checkbox', {
-        name: 'Send this committed repository and task text; allow edits in independent scratch',
+        name: 'Allow OpenAI to read this project, edit a separate working copy, and run local commands using my signed-in client',
         exact: true,
       })
       .check();
-    await seededNative.getByRole('button', { name: 'Prepare OpenAI work', exact: true }).click();
+    await seededNative.getByRole('button', { name: 'Review task', exact: true }).click();
     await expect(
       page.getByRole('button', { name: 'Retry exact command', exact: true }).first(),
     ).toBeVisible();
@@ -3958,7 +3981,7 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     await expect(
       projectChooser.getByRole('combobox', { name: 'Scope', exact: true }).locator('option'),
     ).toHaveText(['Project']);
-    await enter(projectChooser.getByRole('button', { name: 'Choose OpenAI', exact: true }));
+    await enter(projectChooser.getByRole('button', { name: 'Start task', exact: true }));
     const nativeDialog = page.getByRole('dialog');
     await expect(nativeDialog).toHaveAccessibleName('Repository work');
     await expect(nativeDialog.getByText('Requires Pro', { exact: true })).toHaveCount(0);
@@ -3970,17 +3993,25 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     const trust = nativeDialog.getByLabel('Trust the existing native client and login', {
       exact: true,
     });
-    const repositoryConsent = nativeDialog.getByLabel(
-      'Send this committed repository and task text; allow edits in independent scratch',
+    const projectPermission = nativeDialog.getByLabel(
+      'Allow OpenAI to read this project, edit a separate working copy, and run local commands using my signed-in client',
       { exact: true },
     );
-    const nativeTools = nativeDialog.getByLabel('Allow local commands for this run', {
-      exact: true,
-    });
-    await nativeTools.check();
-    await trust.check();
-    await repositoryConsent.check();
-    await enter(nativeDialog.getByRole('button', { name: 'Prepare OpenAI work', exact: true }));
+    await expect(projectPermission).not.toBeChecked();
+    await expect(trust).toHaveCount(0);
+    await expect(
+      nativeDialog.getByLabel(
+        'Send this committed repository and task text; allow edits in independent scratch',
+        { exact: true },
+      ),
+    ).toHaveCount(0);
+    await expect(
+      nativeDialog.getByLabel('Allow local commands for this run', { exact: true }),
+    ).toHaveCount(0);
+    await expect(nativeDialog).toContainText('Subscription only');
+    await projectPermission.check();
+    await expect(credits).not.toBeChecked();
+    await enter(nativeDialog.getByRole('button', { name: 'Review task', exact: true }));
     await expect(
       page.getByRole('dialog', { name: 'Review the native proposal', exact: true }),
     ).toBeVisible();
@@ -4143,39 +4174,27 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     await enter(
       page
         .getByRole('dialog', { name: 'Choose execution provider', exact: true })
-        .getByRole('button', { name: 'Choose OpenAI', exact: true }),
+        .getByRole('button', { name: 'Start task', exact: true }),
     );
     await expect(nativeDialog.getByLabel('File to edit', { exact: true })).toHaveCount(0);
     await expect(
       nativeDialog.getByRole('combobox', { name: 'Writer profile', exact: true }),
     ).toHaveCount(0);
-    const nextRepositoryConsent = nativeDialog.getByLabel(
-      'Send this committed repository and task text; allow edits in independent scratch',
+    const nextProjectPermission = nativeDialog.getByLabel(
+      'Allow OpenAI to read this project, edit a separate working copy, and run local commands using my signed-in client',
       { exact: true },
     );
-    const nextNativeTools = nativeDialog.getByLabel('Allow local commands for this run', {
-      exact: true,
-    });
-    await expect(nextNativeTools).not.toBeChecked();
+    await expect(nextProjectPermission).not.toBeChecked();
     await expect(credits).not.toBeChecked();
-    await expect(trust).not.toBeChecked();
-    await expect(nextRepositoryConsent).not.toBeChecked();
-    await trust.check();
-    await nextRepositoryConsent.check();
     await expect(
-      nativeDialog.getByRole('button', { name: 'Prepare OpenAI work', exact: true }),
+      nativeDialog.getByRole('button', { name: 'Review task', exact: true }),
     ).toBeDisabled();
-    await nextNativeTools.check();
-    await expect(trust).not.toBeChecked();
-    await expect(nextRepositoryConsent).not.toBeChecked();
-    await credits.check();
-    await nextNativeTools.uncheck();
+    await nextProjectPermission.check();
     await expect(credits).not.toBeChecked();
-    await nextNativeTools.check();
-    await trust.check();
-    await nextRepositoryConsent.check();
-    await expect(nativeDialog).toContainText('may run multiple local commands');
-    await enter(nativeDialog.getByRole('button', { name: 'Prepare OpenAI work', exact: true }));
+    await expect(
+      nativeDialog.getByRole('button', { name: 'Review task', exact: true }),
+    ).toBeEnabled();
+    await enter(nativeDialog.getByRole('button', { name: 'Review task', exact: true }));
     const repositoryPrepared = await observer.snapshot();
     const repositoryTask = repositoryPrepared.tasks.find((value) => value.id === nativeTask.id);
     const repositoryNative = repositoryPrepared.nativeRuns.find(
@@ -4206,6 +4225,14 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
       usesRemaining: 1,
       expiresAt: repositoryNative.expiresAt,
     });
+    const writeGrant = repositoryRun.policy.policy.effects.find(
+      (grant) => grant.action === 'write-scratch',
+    );
+    assert.equal(writeGrant?.taskId, nativeTask.id);
+    assert.equal(writeGrant?.target, toolsGrant.target);
+    assert.equal(writeGrant?.revoked, false);
+    assert.equal(writeGrant?.usesRemaining, 1);
+    assert.equal(writeGrant?.expiresAt, repositoryNative.expiresAt);
     assert.equal(
       repositoryPrepared.attempts.filter((value) => value.runId === repositoryRun.id).length,
       0,
@@ -4222,7 +4249,7 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
       path: join(internal, 'repository-native-prepared-light.png'),
       animations: 'disabled',
     });
-    await enter(nativeDialog.getByRole('button', { name: 'Start native proposal', exact: true }));
+    await enter(nativeDialog.getByRole('button', { name: 'Start task', exact: true }));
     await nativeEvents.wait(
       (event) => event.type === 'candidate.sealed' && event.payload.taskId === nativeTask.id,
     );

@@ -10061,7 +10061,7 @@ test('planning turns keep task authority and allowance across execution', async 
       available: true,
       reason: 'qualification-pending',
     }),
-    locationHash: '4'.repeat(64),
+    locationHash: profile.locationHash,
   } satisfies NativeProfileResolution;
   const options: Partial<ControllerOptions> = {
     identity: { name: 'Fixture owner', email: 'owner@example.invalid' },
@@ -11071,11 +11071,21 @@ test('planning turns keep task authority and allowance across execution', async 
   // freeze five, twenty-one freeze ten and ten freeze the five-minute floor.
   const write = nativePreparation.policy.effects.find((grant) => grant.action === 'write-scratch');
   assert(write);
-  const prepareRepository = async (minutes: number) => {
+  const executionChoices = state(taskId).modelChoices;
+  assert.equal(executionChoices?.status, 'last-observed');
+  assert(executionChoices?.observation);
+  const projectModelRequest = {
+    version: 1 as const,
+    observation: executionChoices.observation,
+    model: 'fixture-secondary',
+    effort: 'medium',
+  };
+  const prepareRepository = async (minutes: number, modelRequest?: typeof projectModelRequest) => {
     const { targetPath: _file, ...repositoryPreparation } = nativePreparation;
     const prepared = await send('PrepareNativeRun', taskId, {
       ...repositoryPreparation,
       profileId: 'openai-repository-v1',
+      ...(modelRequest ? { modelRequest } : {}),
       policy: {
         ...repositoryPreparation.policy,
         limits: { ...repositoryPreparation.policy.limits, minutes },
@@ -11095,9 +11105,99 @@ test('planning turns keep task authority and allowance across execution', async 
         ?.maximumTaskMs,
     };
   };
-  assert.equal((await prepareRepository(12)).frozen, 300_000);
+  const selectedProject = await prepareRepository(12, projectModelRequest);
+  assert.equal(selectedProject.frozen, 300_000);
+  const selectedNative = controller
+    .snapshot()
+    .nativeRuns.find((value) => value.runId === selectedProject.run.id);
+  assert.deepEqual(selectedNative?.modelRequest, projectModelRequest);
+  const selectedRoute = controller
+    .snapshot()
+    .routes.find((route) => route.id === selectedProject.run.roles[0].routeId);
+  assert.equal(selectedRoute?.model, projectModelRequest.model);
+  assert.equal(selectedRoute?.effort.requested, projectModelRequest.effort);
+  const nativeInternals = controller as unknown as {
+    nativeCurrentPlan(run: Run): {
+      appointment: NativePilotAppointment;
+      attempt: Attempt;
+    };
+    planNativeAppointment(appointment: NativePilotAppointment): unknown;
+    repositoryResult(
+      appointment: NativePilotAppointment,
+      attemptId: string,
+      value: unknown,
+    ): unknown;
+  };
+  const selectedPlan = nativeInternals.nativeCurrentPlan(selectedProject.run);
+  assert('repository' in selectedPlan.appointment);
+  const selectedResult = {
+    attemptId: selectedPlan.attempt.id,
+    sourceBase: selectedPlan.appointment.repository.sourceBase,
+    manifestHash: selectedPlan.appointment.repository.manifestHash,
+    execution: selectedPlan.appointment.execution,
+    model: selectedPlan.appointment.route.model,
+    requestedEffort: selectedPlan.appointment.route.effort.requested,
+    qualified: false as const,
+    threadId: 'thread-selected',
+    turnId: 'turn-selected',
+  };
+  assert.throws(
+    () =>
+      nativeInternals.planNativeAppointment({
+        ...selectedPlan.appointment,
+        route: {
+          ...selectedPlan.appointment.route,
+          id: context.id('rte'),
+          model: fixtureModel,
+        },
+      }),
+    /route identity is invalid/,
+  );
+  assert.throws(
+    () =>
+      nativeInternals.repositoryResult(
+        selectedPlan.appointment,
+        selectedPlan.attempt.id,
+        selectedResult,
+      ),
+    /repository result binding changed/,
+  );
+  assert.doesNotThrow(() =>
+    nativeInternals.repositoryResult(selectedPlan.appointment, selectedPlan.attempt.id, {
+      ...selectedResult,
+      effectiveEffort: projectModelRequest.effort,
+    }),
+  );
   const twentyOne = await prepareRepository(21);
   assert.equal(twentyOne.frozen, 600_000);
+  const legacyPlan = nativeInternals.nativeCurrentPlan(twentyOne.run);
+  assert('repository' in legacyPlan.appointment);
+  const legacyAppointment = legacyPlan.appointment;
+  assert.throws(
+    () =>
+      nativeInternals.planNativeAppointment({
+        ...legacyAppointment,
+        route: {
+          ...legacyAppointment.route,
+          id: context.id('rte'),
+          model: projectModelRequest.model,
+        },
+      }),
+    /route identity is invalid/,
+  );
+  assert.doesNotThrow(() =>
+    nativeInternals.repositoryResult(legacyAppointment, legacyPlan.attempt.id, {
+      attemptId: legacyPlan.attempt.id,
+      sourceBase: legacyAppointment.repository.sourceBase,
+      manifestHash: legacyAppointment.repository.manifestHash,
+      execution: legacyAppointment.execution,
+      model: legacyAppointment.route.model,
+      requestedEffort: legacyAppointment.route.effort.requested,
+      qualified: false,
+      threadId: 'thread-legacy',
+      turnId: 'turn-legacy',
+    }),
+  );
   // Lowering the task total to 21 minutes with one spent leaves 20. That covers the ten-minute
   // limit alone and falls short of the eleven minutes behind it.
   const lowerTotal = async (minutes: number) =>
@@ -11119,7 +11219,7 @@ test('planning turns keep task authority and allowance across execution', async 
   // A five-minute writer needs only its own five minutes. A total of 6 with one spent leaves
   // exactly five. The writer lease check follows the budget gate, so a held lease shows that
   // Start passed the gate without launching a process.
-  const ten = await prepareRepository(10);
+  const ten = await prepareRepository(10, projectModelRequest);
   assert.equal(ten.frozen, 300_000);
   assert.equal(await lowerTotal(6), 'applied');
   assert.equal(state(taskId).budget?.remaining.minutes, 5);
@@ -11341,6 +11441,11 @@ test('planning turns keep task authority and allowance across execution', async 
   await controller.close();
   crashAfterIntent = false;
   reopened = new Controller({ ...options, home: controller.home, now: clock.now, id: context.id });
+  assert.deepEqual(
+    reopened.snapshot().nativeRuns.find((value) => value.runId === selectedProject.run.id)
+      ?.modelRequest,
+    projectModelRequest,
+  );
   const afterReopen = await reopened.execute(
     command('GetTaskConversationState', { taskId: catalogTask.id }),
     'local-owner',

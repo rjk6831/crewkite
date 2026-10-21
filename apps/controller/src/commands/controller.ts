@@ -280,6 +280,10 @@ import {
   startConversation,
 } from '../providers/openai/conversation.ts';
 import { OpenAiDiscovery } from '../providers/openai/discovery.ts';
+import {
+  type RetainedOpenAiModelObservation,
+  resolveOpenAiProjectSelection,
+} from '../providers/openai/execution-selection.ts';
 import { startNativeSession } from '../providers/openai/native-discovery.ts';
 import {
   type NativeProfileResolution,
@@ -442,6 +446,7 @@ const NativeRepositoryAppointmentSchema = NativeFileAppointmentSchema.omit({
   .extend({
     repository: NativeRepositoryScopeSchema,
     execution: NativeRepositoryExecutionSchema,
+    modelRequest: ConversationModelRequestSchema.optional(),
     maximumTaskMs: z.number().int().min(2001).max(600_000),
     billingAttestation: z.never().optional(),
     permissionMode: z.never().optional(),
@@ -8156,7 +8161,11 @@ export class Controller {
                   }
                 : {}),
               ...('repository' in appointment
-                ? { repository: appointment.repository, execution: appointment.execution }
+                ? {
+                    repository: appointment.repository,
+                    execution: appointment.execution,
+                    ...(appointment.modelRequest ? { modelRequest: appointment.modelRequest } : {}),
+                  }
                 : {
                     target: {
                       path: appointment.target.path,
@@ -8780,9 +8789,14 @@ export class Controller {
   private nativeProfileRoute(
     profile: NativeProfileResolution,
     creditPolicy: NativePilotAppointment['creditPolicy'],
+    modelRequest?: ConversationModelRequest,
+    selection?: ReturnType<typeof resolveOpenAiProjectSelection>,
   ): Route | undefined {
     if (profile.facts.family === 'local') throw Error('Local native launch is unavailable.');
-    const receipt = this.store.receipt(`native-profile-route:${profile.facts.id}:${creditPolicy}`);
+    if ((modelRequest === undefined) !== (selection === undefined))
+      throw Error('Native model selection is incomplete.');
+    const key = this.nativeProfileRouteKey(profile.facts.id, creditPolicy, modelRequest);
+    const receipt = this.store.receipt(key);
     if (!receipt) return;
     const artifact = ArtifactSchema.parse(receipt.result.entity);
     if (artifact.bytes > MAX_FRAME_BYTES) throw Error('Native route binding exceeds its bound.');
@@ -8794,11 +8808,14 @@ export class Controller {
       id: plan.appointment.route.id,
       family: profile.facts.family,
       displayName: profile.facts.displayName,
-      model: profile.facts.model,
+      model: selection?.model ?? profile.facts.model,
       effort: {
-        requested: profile.facts.effort,
-        effective: profile.facts.family === 'openai' ? profile.facts.effort : 'unknown',
-        supported: [profile.facts.effort],
+        requested: selection?.effort ?? profile.facts.effort,
+        effective:
+          profile.facts.family === 'openai'
+            ? (selection?.effort ?? profile.facts.effort)
+            : 'unknown',
+        supported: [selection?.effort ?? profile.facts.effort],
       },
       billing: creditPolicy === 'ordinary' ? 'included' : 'credits',
       qualified: false,
@@ -8808,11 +8825,62 @@ export class Controller {
       receipt.result.outcome !== 'applied' ||
       plan.public.profileId !== profile.facts.id ||
       plan.appointment.creditPolicy !== creditPolicy ||
+      hashCanonical(
+        ('modelRequest' in plan.appointment ? plan.appointment.modelRequest : undefined) ?? null,
+      ) !== hashCanonical(modelRequest ?? null) ||
       hashCanonical(plan.appointment.client) !== hashCanonical(profile.client) ||
       hashCanonical(route) !== hashCanonical(expected)
     )
       throw Error('Native route binding changed.');
     return expected;
+  }
+
+  private nativeProfileRouteKey(
+    profileId: string,
+    creditPolicy: NativePilotAppointment['creditPolicy'],
+    modelRequest?: ConversationModelRequest,
+  ) {
+    const prefix = `native-profile-route:${profileId}:${creditPolicy}`;
+    return modelRequest
+      ? `${prefix}:${hashCanonical({
+          observation: modelRequest.observation,
+          model: modelRequest.model,
+          effort: modelRequest.effort,
+        })}`
+      : prefix;
+  }
+
+  private openAiProjectSelection(
+    taskId: string,
+    profile: NativeProfileResolution,
+    request?: ConversationModelRequest,
+  ) {
+    if (!request) return resolveOpenAiProjectSelection(undefined, undefined);
+    if (profile.facts.id !== 'openai-repository-v1' || !profile.client || !profile.locationHash)
+      throw Error('The OpenAI project profile is unavailable.');
+    const configuration = this.conversationConfiguration(taskId);
+    const catalog = this.conversationCatalog(taskId, request.observation);
+    const task = this.store.get<Task>('task', taskId);
+    const catalogRun = this.store.get<Run>('run', catalog.runId);
+    const reason = this.conversationCatalogReason(catalog);
+    if (
+      reason ||
+      hashCanonical(configuration?.modelCatalog ?? null) !== hashCanonical(request.observation) ||
+      !task ||
+      !catalogRun ||
+      hashCanonical(catalogRun.source) !==
+        hashCanonical(inspectSource(task.projectId, this.projectPath(task.projectId) as string)) ||
+      hashCanonical(profile.client) !== hashCanonical(catalog.client) ||
+      profile.locationHash !== catalog.locationHash
+    )
+      throw Error(reason ?? 'client-changed');
+    return resolveOpenAiProjectSelection(
+      {
+        observation: request.observation,
+        models: catalog.models,
+      } satisfies RetainedOpenAiModelObservation,
+      request,
+    );
   }
 
   private prepareAcp(
@@ -9776,6 +9844,12 @@ export class Controller {
       if (task?.state !== 'draft') return { outcome: 'blocked', reason: 'task-not-preparable' };
       const gate = this.draftEditGate(task);
       if (gate) return gate;
+      const modelRequest =
+        'modelRequest' in command.payload ? command.payload.modelRequest : undefined;
+      const modelSelection =
+        command.payload.profileId === 'openai-repository-v1'
+          ? this.openAiProjectSelection(task.id, profile, modelRequest)
+          : undefined;
       const source = inspectSource(task.projectId, this.projectPath(task.projectId) as string);
       const files = committedFiles(this.projectPath(task.projectId) as string, source.base);
       const original = filePayload
@@ -9842,6 +9916,7 @@ export class Controller {
         criteria: task.criteria,
         policy,
         creditPolicy: command.payload.creditPolicy,
+        ...(modelRequest ? { modelRequest } : {}),
         ...(billingAttestation ? { billingAttestation: billingAttestation } : {}),
         ...(permissionMode ? { permissionMode: permissionMode } : {}),
         ...(manualTargets ? { manualTargets } : {}),
@@ -9850,7 +9925,12 @@ export class Controller {
         expiresAt = new Date(
           Math.min(Date.parse(expiresAt), Date.parse(this.consentRecord(scopeHash).expiresAt)),
         ).toISOString();
-      const savedRoute = this.nativeProfileRoute(profile, command.payload.creditPolicy);
+      const savedRoute = this.nativeProfileRoute(
+        profile,
+        command.payload.creditPolicy,
+        modelRequest,
+        modelRequest ? modelSelection : undefined,
+      );
       const appointment = freezeNative(
         NativeAppointmentSchema.parse({
           id: command.key.replaceAll('_', '-'),
@@ -9862,11 +9942,12 @@ export class Controller {
               id: this.id('rte'),
               family: facts.family,
               displayName: facts.displayName,
-              model: facts.model,
+              model: modelSelection?.model ?? facts.model,
               effort: {
-                requested: facts.effort,
-                effective: facts.family === 'openai' ? facts.effort : 'unknown',
-                supported: [facts.effort],
+                requested: modelSelection?.effort ?? facts.effort,
+                effective:
+                  facts.family === 'openai' ? (modelSelection?.effort ?? facts.effort) : 'unknown',
+                supported: [modelSelection?.effort ?? facts.effort],
               },
               billing: command.payload.creditPolicy === 'ordinary' ? 'included' : 'credits',
               qualified: false,
@@ -9877,6 +9958,7 @@ export class Controller {
           ...(billingAttestation ? { billingAttestation: billingAttestation } : {}),
           ...(permissionMode ? { permissionMode: permissionMode } : {}),
           ...scope,
+          ...(modelRequest ? { modelRequest } : {}),
           consent: {
             nativeTrust: 'accepted',
             source: command.payload.consent === 'explicit' ? 'explicit' : 'policy',
@@ -12177,7 +12259,8 @@ export class Controller {
         manifestHash: HashSchema,
         execution: NativeRepositoryExecutionSchema,
         model: z.string(),
-        requestedEffort: z.literal('low'),
+        requestedEffort: z.string(),
+        effectiveEffort: z.string().optional(),
         qualified: z.literal(false),
         threadId: z.string().min(1).max(200),
         turnId: z.string().min(1).max(200),
@@ -12189,7 +12272,9 @@ export class Controller {
       result.manifestHash !== appointment.repository.manifestHash ||
       hashCanonical(result.execution) !== hashCanonical(appointment.execution) ||
       result.model !== appointment.route.model ||
-      result.requestedEffort !== appointment.route.effort.requested
+      result.requestedEffort !== appointment.route.effort.requested ||
+      (result.effectiveEffort !== appointment.route.effort.effective &&
+        (!!appointment.modelRequest || result.effectiveEffort !== undefined))
     )
       throw Error('The repository result binding changed.');
     return result;
@@ -13354,22 +13439,32 @@ export class Controller {
       JSON.parse(this.artifacts.read(artifact.hash).toString('utf8')),
     );
     const profile = this.profileFor(plan.public.profileId);
+    const task = this.store.get<Task>('task', run.taskId);
     if (profile.facts.family === 'local') throw Error('Local native launch is unavailable.');
     if (profile.facts.reason === 'provider-policy-restricted')
       throw Error('provider-policy-restricted');
+    const modelRequest =
+      'repository' in plan.appointment ? plan.appointment.modelRequest : undefined;
+    const modelSelection =
+      task && modelRequest
+        ? this.openAiProjectSelection(task.id, profile, modelRequest)
+        : undefined;
     if (
       !profile.facts.available ||
       profile.facts.id !== plan.public.profileId ||
       !profile.facts.creditPolicies.some((policy) => policy === plan.appointment.creditPolicy) ||
       (!('acp' in plan.appointment) &&
-        this.nativeProfileRoute(profile, plan.appointment.creditPolicy)?.id !==
-          plan.appointment.route.id) ||
+        this.nativeProfileRoute(
+          profile,
+          plan.appointment.creditPolicy,
+          modelRequest,
+          modelSelection,
+        )?.id !== plan.appointment.route.id) ||
       profile.locationHash !== plan.public.locationHash ||
       hashCanonical(profile.client) !== hashCanonical(plan.appointment.client) ||
       !profile.environment
     )
       throw Error('Native profile changed.');
-    const task = this.store.get<Task>('task', run.taskId);
     if (
       !task ||
       task.runId !== run.id ||
@@ -13446,6 +13541,16 @@ export class Controller {
     if (task?.state !== 'draft' || this.draftEditGate(task))
       throw new Error('The appointment needs an unstarted draft.');
     const route = appointment.route;
+    const appointmentModelRequest =
+      'repository' in appointment ? appointment.modelRequest : undefined;
+    const appointmentModelSelection =
+      'repository' in appointment
+        ? this.openAiProjectSelection(
+            appointment.taskId,
+            this.profileFor('openai-repository-v1'),
+            appointmentModelRequest,
+          )
+        : undefined;
     const billingAttestation =
       'billingAttestation' in appointment ? appointment.billingAttestation : undefined;
     const permissionMode = 'permissionMode' in appointment ? appointment.permissionMode : undefined;
@@ -13463,11 +13568,19 @@ export class Controller {
           !billingAttestation) ||
       (route.family === 'google') !== !!permissionMode ||
       (route.family === 'google' && !publicScope) ||
+      (!!appointmentModelSelection &&
+        (route.model !== appointmentModelSelection.model ||
+          route.effort.requested !== appointmentModelSelection.effort ||
+          route.effort.effective !== appointmentModelSelection.effort)) ||
       !route.effort.supported.includes(route.effort.requested) ||
       (this.store.get('route', route.id) &&
         (!publicScope ||
-          this.nativeProfileRoute(this.profileFor(publicScope.profileId), appointment.creditPolicy)
-            ?.id !== route.id))
+          this.nativeProfileRoute(
+            this.profileFor(publicScope.profileId),
+            appointment.creditPolicy,
+            appointmentModelRequest,
+            appointmentModelRequest ? appointmentModelSelection : undefined,
+          )?.id !== route.id))
     )
       throw new Error('The appointment route identity is invalid.');
     if (
@@ -13578,11 +13691,19 @@ export class Controller {
     if (
       plan.public &&
       !this.store.receipt(
-        `native-profile-route:${plan.public.profileId}:${appointment.creditPolicy}`,
+        this.nativeProfileRouteKey(
+          plan.public.profileId,
+          appointment.creditPolicy,
+          'repository' in appointment ? appointment.modelRequest : undefined,
+        ),
       )
     )
       this.store.saveReceipt(
-        `native-profile-route:${plan.public.profileId}:${appointment.creditPolicy}`,
+        this.nativeProfileRouteKey(
+          plan.public.profileId,
+          appointment.creditPolicy,
+          'repository' in appointment ? appointment.modelRequest : undefined,
+        ),
         hashCanonical({
           profileId: plan.public.profileId,
           client: appointment.client,
@@ -14549,7 +14670,7 @@ export class Controller {
       return repositoryPlan({
         attemptId: attempt.id,
         model: appointment.route.model as WriterPlan['model'],
-        effort: 'low',
+        effort: appointment.route.effort.requested,
         creditPolicy: appointment.creditPolicy,
         scratchPath: join(this.home, 'scratch', binding.run.id),
         sourceBase: appointment.repository.sourceBase,

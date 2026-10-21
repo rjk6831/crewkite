@@ -655,6 +655,29 @@ export const NativeHandoffPreviewSchema = z
         )),
     'The pending handoff must select a saved recipient and the next writer generation.',
   );
+const conversationModelText = (maximumBytes: number) =>
+  z
+    .string()
+    .min(1)
+    .max(maximumBytes)
+    .refine(
+      (value) =>
+        value.isWellFormed() &&
+        !/\p{Cc}/u.test(value) &&
+        value.trim().length > 0 &&
+        new TextEncoder().encode(value).byteLength <= maximumBytes,
+      'Model metadata needs bounded text without control characters.',
+    );
+const conversationModelObservation = z.strictObject({
+  artifactId: ArtifactIdSchema,
+  hash: HashSchema,
+});
+export const ConversationModelRequestSchema = z.strictObject({
+  version: z.literal(1),
+  observation: conversationModelObservation,
+  model: conversationModelText(200),
+  effort: conversationModelText(32),
+});
 export const NativeRunSchema = z
   .strictObject({
     runId: RunIdSchema,
@@ -676,6 +699,7 @@ export const NativeRunSchema = z
     handoff: NativeHandoffPreviewSchema.optional(),
     repository: NativeRepositoryScopeSchema.optional(),
     execution: NativeRepositoryExecutionSchema.optional(),
+    modelRequest: ConversationModelRequestSchema.optional(),
     target: z
       .strictObject({
         path: NativeTargetPathSchema,
@@ -712,7 +736,7 @@ export const NativeRunSchema = z
           !run.billingAttestation &&
           !run.permissionMode &&
           !run.handoff
-        : !run.repository && !run.execution,
+        : !run.repository && !run.execution && !run.modelRequest,
     'A repository run needs its complete source scope and native execution profile.',
   )
   .refine((run) => !run.handoff || NativeFileProfileIdSchema.safeParse(run.profileId).success)
@@ -1531,6 +1555,7 @@ export const NativePreparationPayloadSchema = z.union([
   z.strictObject({
     ...nativePreparationFields,
     profileId: z.literal('openai-repository-v1'),
+    modelRequest: ConversationModelRequestSchema.optional(),
   }),
   z.strictObject({
     ...nativePreparationFields,
@@ -1990,29 +2015,6 @@ export type ConversationPage = z.infer<typeof ConversationPageSchema>;
 export type ConversationPlanProposal = z.infer<typeof ConversationPlanProposalSchema>;
 export type ConversationTurnBinding = z.infer<typeof ConversationTurnBindingSchema>;
 export type ConversationTurnResult = z.infer<typeof ConversationTurnResultSchema>;
-const conversationModelText = (maximumBytes: number) =>
-  z
-    .string()
-    .min(1)
-    .max(maximumBytes)
-    .refine(
-      (value) =>
-        value.isWellFormed() &&
-        !/\p{Cc}/u.test(value) &&
-        value.trim().length > 0 &&
-        new TextEncoder().encode(value).byteLength <= maximumBytes,
-      'Model metadata needs bounded text without control characters.',
-    );
-const conversationModelObservation = z.strictObject({
-  artifactId: ArtifactIdSchema,
-  hash: HashSchema,
-});
-export const ConversationModelRequestSchema = z.strictObject({
-  version: z.literal(1),
-  observation: conversationModelObservation,
-  model: conversationModelText(200),
-  effort: conversationModelText(32),
-});
 export const ConversationModelCatalogEntrySchema = z
   .strictObject({
     model: ConversationModelRequestSchema.shape.model,

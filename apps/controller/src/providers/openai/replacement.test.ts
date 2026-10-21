@@ -1239,10 +1239,14 @@ test('native proposals and reviews require one matching completed turn and bound
     assert.throws(() =>
       reviewPlan({ ...reviewData, ...change } as Parameters<typeof reviewPlan>[0]),
     );
-    assert.throws(() =>
-      repositoryPlan({ ...repositoryInput, ...change } as Parameters<typeof repositoryPlan>[0]),
-    );
   }
+  const selectedRepositoryInput = repositoryPlan({
+    ...repositoryInput,
+    model: 'fixture-next',
+    effort: 'high',
+  });
+  assert.equal(selectedRepositoryInput.model, 'fixture-next');
+  assert.equal(selectedRepositoryInput.effort, 'high');
   assert.equal(repositoryInput.creditPolicy, 'ordinary');
   assert.equal(resolveRepositoryProfile({}).facts.id, 'openai-repository-v1');
   assert.throws(
@@ -1538,6 +1542,7 @@ test('native proposals and reviews require one matching completed turn and bound
       assert(!JSON.stringify(activities).includes('private-repository-canary'));
       assert.equal(result.manifestHash, repositoryInput.manifestHash);
       assert.equal(result.qualified, false);
+      assert.equal(result.effectiveEffort, repositoryInput.effort);
       assert.equal(Object.hasOwn(result, 'modelChoices'), false);
       assert.equal('replacement' in result, false);
       assert(!JSON.stringify(result).includes('private-repository-canary'));

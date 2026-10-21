@@ -1,5 +1,6 @@
 import {
   type Candidate,
+  type ConversationModelRequest,
   formatReviewTarget,
   type Guidance,
   NativeFileProfileIdSchema,
@@ -966,6 +967,7 @@ function ExecutionLaunch(props: LaunchProps) {
         profileId: string;
         modelId?: string;
         effortId?: string;
+        modelRequest?: ConversationModelRequest;
         adoptedWorker?: AdoptedWorkerIdentity;
       }
     | 'demo'
@@ -991,6 +993,8 @@ function ExecutionLaunch(props: LaunchProps) {
   const selectableProfiles = props.snapshot.nativeProfiles.filter(
     (profile) => profile.id === 'openai-repository-v1' && availableForNewExecution(profile),
   );
+  const repositoryAvailable = selectableProfiles.length > 0;
+  const workspaceCommand = props.workspace.command;
   const providerFamilies = [...new Set(selectableProfiles.map((profile) => profile.family))];
   const [providerFamily, setProviderFamily] = useState<
     Snapshot['nativeProfiles'][number]['family'] | ''
@@ -1020,6 +1024,7 @@ function ExecutionLaunch(props: LaunchProps) {
   );
   const [providerModel, setProviderModel] = useState('');
   const [providerEffort, setProviderEffort] = useState('');
+  const [modelChoices, setModelChoices] = useState<TaskConversationState['modelChoices']>();
   const configurableProfile = scopeProfiles.find(
     (profile) => 'configOptions' in profile && profile.configOptions,
   );
@@ -1027,9 +1032,15 @@ function ExecutionLaunch(props: LaunchProps) {
     configurableProfile && 'configOptions' in configurableProfile
       ? configurableProfile.configOptions
       : null;
-  const modelOptions = configurableOptions
-    ? configurableOptions.model.supported
-    : [...new Set(scopeProfiles.map((profile) => profile.model))];
+  const observedChoices =
+    selectedProviderScope === 'repository' && modelChoices?.status === 'last-observed'
+      ? modelChoices
+      : undefined;
+  const modelOptions = observedChoices
+    ? observedChoices.models.map((choice) => choice.model)
+    : configurableOptions
+      ? configurableOptions.model.supported
+      : [...new Set(scopeProfiles.map((profile) => profile.model))];
   const selectedModel =
     (modelOptions.includes(providerModel) ? providerModel : '') ||
     configurableOptions?.model.currentValue ||
@@ -1039,16 +1050,19 @@ function ExecutionLaunch(props: LaunchProps) {
     configurableProfile ??
     scopeProfiles.find((profile) => profile.model === selectedModel) ??
     scopeProfiles[0];
-  const effortOptions = selectedProfile
-    ? 'configOptions' in selectedProfile && selectedProfile.configOptions?.thoughtLevel
-      ? selectedProfile.configOptions.thoughtLevel.supported
-      : 'effort' in selectedProfile && selectedProfile.effort !== 'unknown'
-        ? [selectedProfile.effort]
-        : []
-    : [];
+  const effortOptions = observedChoices
+    ? (observedChoices.models.find((choice) => choice.model === selectedModel)?.efforts ?? [])
+    : selectedProfile
+      ? 'configOptions' in selectedProfile && selectedProfile.configOptions?.thoughtLevel
+        ? selectedProfile.configOptions.thoughtLevel.supported
+        : 'effort' in selectedProfile && selectedProfile.effort !== 'unknown'
+          ? [selectedProfile.effort]
+          : []
+      : [];
   const selectedEffort =
     (effortOptions.includes(providerEffort) ? providerEffort : '') ||
-    (selectedProfile && 'configOptions' in selectedProfile
+    observedChoices?.models.find((choice) => choice.model === selectedModel)?.defaultEffort ||
+    (!observedChoices && selectedProfile && 'configOptions' in selectedProfile
       ? selectedProfile.configOptions?.thoughtLevel?.currentValue
       : undefined) ||
     effortOptions[0] ||
@@ -1060,6 +1074,37 @@ function ExecutionLaunch(props: LaunchProps) {
       active.current = false;
     };
   }, []);
+  useEffect(() => {
+    setModelChoices(undefined);
+    if (
+      props.workspace.connection !== 'connected' ||
+      props.workspace.preview ||
+      !repositoryAvailable
+    )
+      return;
+    void workspaceCommand({
+      command: 'GetTaskConversationState',
+      payload: { taskId: props.task.id },
+    })
+      .then((result) => {
+        if (!active.current) return;
+        setModelChoices(
+          (result.outcome === 'applied' || result.outcome === 'already-applied') &&
+            result.data?.kind === 'conversation-state'
+            ? result.data.state.modelChoices
+            : undefined,
+        );
+      })
+      .catch(() => {
+        if (active.current) setModelChoices(undefined);
+      });
+  }, [
+    props.task.id,
+    workspaceCommand,
+    props.workspace.connection,
+    props.workspace.preview,
+    repositoryAvailable,
+  ]);
   async function chooseAdoptedWorker() {
     if (
       readingWorker ||
@@ -1093,6 +1138,16 @@ function ExecutionLaunch(props: LaunchProps) {
         scope: 'repository',
         profileId: 'openai-repository-v1',
         adoptedWorker: identity,
+        ...(observedChoices?.observation && selectedModel && selectedEffort
+          ? {
+              modelRequest: {
+                version: 1,
+                observation: observedChoices.observation,
+                model: selectedModel,
+                effort: selectedEffort,
+              },
+            }
+          : {}),
       });
     } catch {
       if (active.current) setWorkerMessage(changedAdoption);
@@ -1123,6 +1178,7 @@ function ExecutionLaunch(props: LaunchProps) {
         initialAuthority={authority}
         initialModelId={choice.modelId}
         initialEffortId={choice.effortId}
+        initialModelRequest={choice.modelRequest}
         scope={choice.scope}
         initialProfileId={choice.profileId}
         adoptedWorker={choice.adoptedWorker}
@@ -1178,21 +1234,28 @@ function ExecutionLaunch(props: LaunchProps) {
                 ))}
               </select>
             </label>
-            <label>
-              Model
-              <select
-                value={selectedModel}
-                disabled={blocked}
-                onChange={(event) => setProviderModel(event.target.value)}
-              >
-                {modelOptions.map((model) => (
-                  <option key={model} value={model}>
-                    {model}
-                  </option>
-                ))}
-              </select>
-            </label>
-            {effortOptions.length ? (
+            {observedChoices ? (
+              <label>
+                Model
+                <select
+                  value={selectedModel}
+                  disabled={blocked}
+                  onChange={(event) => {
+                    setProviderModel(event.target.value);
+                    setProviderEffort('');
+                  }}
+                >
+                  {modelOptions.map((model) => (
+                    <option key={model} value={model}>
+                      {model}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ) : (
+              <p className="muted small">Model: {selectedModel} profile default</p>
+            )}
+            {observedChoices && effortOptions.length ? (
               <label>
                 Effort
                 <select
@@ -1258,8 +1321,9 @@ function ExecutionLaunch(props: LaunchProps) {
                   {selectedProviderScope === 'repository'
                     ? 'The committed project is prepared in an isolated workspace.'
                     : 'One existing committed file is prepared in independent scratch.'}{' '}
-                  The selected model and effort come from this provider's retained profile or setup
-                  proof.
+                  {observedChoices
+                    ? 'The model and effort come from the last retained provider catalog and are checked again at Start.'
+                    : 'The retained profile default applies until a successful planning turn records a provider catalog.'}
                 </p>
                 <p className="muted small" role="status">
                   {selectedProfile.available
@@ -1278,11 +1342,22 @@ function ExecutionLaunch(props: LaunchProps) {
                       profileId: selectedProfile.id,
                       ...(selectedModel ? { modelId: selectedModel } : {}),
                       ...(selectedEffort ? { effortId: selectedEffort } : {}),
+                      ...(observedChoices?.observation && selectedModel && selectedEffort
+                        ? {
+                            modelRequest: {
+                              version: 1,
+                              observation: observedChoices.observation,
+                              model: selectedModel,
+                              effort: selectedEffort,
+                            },
+                          }
+                        : {}),
                     })
                   }
                 >
-                  {selectedProfile.available ? 'Choose' : 'Inspect'}{' '}
-                  {executionProviderLabel(selectedProfile)}
+                  {selectedProfile.available && selectedProviderScope === 'repository'
+                    ? 'Start task'
+                    : `${selectedProfile.available ? 'Choose' : 'Inspect'} ${executionProviderLabel(selectedProfile)}`}
                   <ArrowRight size={14} />
                 </button>
               </>
@@ -1797,6 +1872,7 @@ function NativeLaunch({
   initialAuthority,
   initialModelId,
   initialEffortId,
+  initialModelRequest,
   adoptedWorker,
   onSelectLocal,
   onAuthorityChange,
@@ -1809,6 +1885,7 @@ function NativeLaunch({
   initialAuthority?: Policy['authority'];
   initialModelId?: string;
   initialEffortId?: string;
+  initialModelRequest?: ConversationModelRequest;
   adoptedWorker?: AdoptedWorkerIdentity;
 }) {
   const project = snapshot.projects.find((value) => value.id === task.projectId);
@@ -1867,6 +1944,7 @@ function NativeLaunch({
   const [thoughtLevelId, setThoughtLevelId] = useState(
     current?.acp?.thoughtLevelId ?? initialEffortId ?? '',
   );
+  const modelRequest = current?.modelRequest ?? initialModelRequest;
   const [quotaAccount, setQuotaAccount] = useState(false);
   const configuration = acpProfile?.configOptions;
   const selectedModel = modelId || configuration?.model.currentValue || '';
@@ -1998,6 +2076,7 @@ function NativeLaunch({
   function resetConsent() {
     setNativeTrust(false);
     setSourceConsent(false);
+    setNativeTools(false);
     setSavedConsent(false);
     setExistingCredits(false);
   }
@@ -2071,12 +2150,16 @@ function NativeLaunch({
                 : 'Enter the file to edit. The placeholder is an instruction, not a selected file.',
             ]
           : []),
-        ...(!savedConsent && !nativeTrust ? ['Confirm trust in the existing native client.'] : []),
-        ...(!savedConsent && !sourceConsent
-          ? [`Allow this committed ${repository ? 'project' : 'file'} and task text to be sent.`]
+        ...(repository && !savedConsent && !(nativeTrust && sourceConsent && nativeTools)
+          ? [
+              'Allow OpenAI to read this project, edit a separate working copy, and run local commands using your signed-in client.',
+            ]
           : []),
-        ...(repository && !savedConsent && !nativeTools
-          ? ['Allow local commands for this project run.']
+        ...(!repository && !savedConsent && !nativeTrust
+          ? ['Confirm trust in the existing native client.']
+          : []),
+        ...(!repository && !savedConsent && !sourceConsent
+          ? [`Allow this committed ${repository ? 'project' : 'file'} and task text to be sent.`]
           : []),
         ...(attestedBilling && !savedConsent && !subscriptionLogin
           ? ['Confirm that this login uses the existing subscription.']
@@ -2117,21 +2200,40 @@ function NativeLaunch({
     )
       return;
     try {
-      if (adoptedWorker) {
+      if (repository && (adoptedWorker || modelRequest)) {
         setCheckingWorker(true);
         const result = await workspace.command({
           command: 'GetTaskConversationState',
           payload: { taskId: task.id },
         });
         if (!active.current) return;
-        const identity =
+        const state =
           (result.outcome === 'applied' || result.outcome === 'already-applied') &&
           result.data?.kind === 'conversation-state'
-            ? adoptedWorkerIdentity(task, result.data.state)
+            ? result.data.state
             : null;
-        if (!identity || JSON.stringify(identity) !== JSON.stringify(adoptedWorker)) {
+        const identity = state ? adoptedWorkerIdentity(task, state) : null;
+        const choices = state?.modelChoices;
+        const modelCurrent =
+          !modelRequest ||
+          (choices?.status === 'last-observed' &&
+            choices.observation?.artifactId === modelRequest.observation.artifactId &&
+            choices.observation.hash === modelRequest.observation.hash &&
+            choices.models.some(
+              (choice) =>
+                choice.model === modelRequest.model && choice.efforts.includes(modelRequest.effort),
+            ));
+        if (
+          (adoptedWorker &&
+            (!identity || JSON.stringify(identity) !== JSON.stringify(adoptedWorker))) ||
+          !modelCurrent
+        ) {
           setWorkerInvalid(true);
-          setMessage(changedAdoption);
+          setMessage(
+            modelCurrent
+              ? changedAdoption
+              : 'The selected model or effort is no longer in the retained catalog. Choose it again.',
+          );
           return;
         }
       }
@@ -2182,6 +2284,7 @@ function NativeLaunch({
               policy: submittedPolicy,
               creditPolicy: existingCredits ? 'existing-credits' : 'ordinary',
               consent: savedConsent ? 'saved' : 'explicit',
+              ...(modelRequest ? { modelRequest } : {}),
             }
           : acpProfile
             ? {
@@ -2259,6 +2362,11 @@ function NativeLaunch({
             <h2>{profile ? executionProviderLabel(profile) : 'Native proposal'}</h2>
             <span>{profile?.available ? 'Client profile available' : 'Setup needed'}</span>
           </div>
+          {repository && modelRequest && (
+            <p className="muted small">
+              Selected model {modelRequest.model} · Effort {modelRequest.effort}
+            </p>
+          )}
           {!prepared && !repository && (
             <label>
               Writer profile
@@ -2289,9 +2397,9 @@ function NativeLaunch({
               <summary>Provider details</summary>
               <div className="facts-grid">
                 <span>Client {profile.clientVersion}</span>
-                <span>Model {profile.model}</span>
+                <span>Model {modelRequest?.model ?? profile.model}</span>
                 <span>
-                  {profile.effort}
+                  {modelRequest?.effort ?? profile.effort}
                   {attestedBilling ? ' requested effort' : ' effort'}
                 </span>
                 {attestedBilling && <span>Effective effort unknown</span>}
@@ -2460,11 +2568,61 @@ function NativeLaunch({
                 <p>
                   The controller freezes the committed base and repository manifest before Start.
                 </p>
-                <p className="muted small">
-                  The native client can edit independent scratch and run local commands. Network
-                  access is disabled by this native profile. Requests needing native approval are
-                  refused.
-                </p>
+                {!savedConsent && (
+                  <label className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={nativeTrust && sourceConsent && nativeTools}
+                      onChange={(event) => {
+                        const allowed = event.target.checked;
+                        setNativeTrust(allowed);
+                        setSourceConsent(allowed);
+                        setNativeTools(allowed);
+                      }}
+                    />
+                    Allow OpenAI to read this project, edit a separate working copy, and run local
+                    commands using my signed-in client
+                  </label>
+                )}
+                <p>{existingCredits ? 'Subscription and existing credits' : 'Subscription only'}</p>
+                <details>
+                  <summary>Details</summary>
+                  <label className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={savedConsent}
+                      disabled={
+                        !saved || JSON.stringify(policy) !== JSON.stringify(saved.policy.policy)
+                      }
+                      onChange={(event) => setSavedConsent(event.target.checked)}
+                    />
+                    Use saved consent for this exact project and policy
+                  </label>
+                  {savedConsent && (
+                    <p className="muted small">
+                      Saved consent includes the exact project, signed-in client and local-command
+                      permission.
+                    </p>
+                  )}
+                  <label className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={existingCredits}
+                      disabled={
+                        !profile?.creditPolicies.some((value) => value === 'existing-credits')
+                      }
+                      onChange={(event) => setExistingCredits(event.target.checked)}
+                    />
+                    Allow existing credits after included usage
+                  </label>
+                  <p className="muted small">
+                    The client edits independent scratch and may run multiple local commands during
+                    this bounded task. The command permission is consumed once at Start. Network
+                    access is disabled by this profile, and requests needing native approval are
+                    refused. Existing credits have no provider hard spending cap; CrewKite does not
+                    request a reset, purchase or top-up.
+                  </p>
+                </details>
               </>
             ) : (
               <>
@@ -2830,40 +2988,20 @@ function NativeLaunch({
                 )}
               </>
             )}
-            <label className="checkbox-label">
-              <input
-                type="checkbox"
-                checked={savedConsent}
-                disabled={!saved || JSON.stringify(policy) !== JSON.stringify(saved.policy.policy)}
-                onChange={(event) => setSavedConsent(event.target.checked)}
-              />
-              Use saved consent for this exact {repository ? 'repository' : 'file'} and policy
-            </label>
-            {repository && !savedConsent && (
-              <>
-                <label className="checkbox-label">
-                  <input
-                    type="checkbox"
-                    checked={nativeTools}
-                    onChange={(event) => {
-                      setNativeTools(event.target.checked);
-                      resetConsent();
-                    }}
-                  />
-                  Allow local commands for this run
-                </label>
-                <p className="muted small">
-                  The native client may run multiple local commands during this bounded task. This
-                  permission is consumed once when the run starts.
-                </p>
-              </>
+            {!repository && (
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={savedConsent}
+                  disabled={
+                    !saved || JSON.stringify(policy) !== JSON.stringify(saved.policy.policy)
+                  }
+                  onChange={(event) => setSavedConsent(event.target.checked)}
+                />
+                Use saved consent for this exact file and policy
+              </label>
             )}
-            {repository && savedConsent && (
-              <p className="muted small">
-                Saved consent must include the exact local-command permission for this project.
-              </p>
-            )}
-            {!savedConsent && (
+            {!repository && !savedConsent && (
               <>
                 <label className="checkbox-label">
                   <input
@@ -2879,9 +3017,8 @@ function NativeLaunch({
                     checked={sourceConsent}
                     onChange={(event) => setSourceConsent(event.target.checked)}
                   />
-                  {repository
-                    ? 'Send this committed repository and task text; allow edits in independent scratch'
-                    : 'Send this committed file and task text; allow its replacement in independent scratch'}
+                  Send this committed file and task text; allow its replacement in independent
+                  scratch
                 </label>
               </>
             )}
@@ -2889,7 +3026,7 @@ function NativeLaunch({
               Native global and project guidance may apply. Tool containment remains unqualified.
               Saved consent must match the controller's exact recorded scope.
             </p>
-            {!attestedBilling && (
+            {!repository && !attestedBilling && (
               <>
                 <label className="checkbox-label">
                   <input
@@ -3005,7 +3142,7 @@ function NativeLaunch({
                   )
               }
             >
-              Start native proposal
+              {repository ? 'Start task' : 'Start native proposal'}
               <ArrowRight size={14} />
             </button>
           </>
@@ -3026,7 +3163,9 @@ function NativeLaunch({
             }
             onClick={() => void prepareNative()}
           >
-            Prepare {profile ? executionProviderLabel(profile) : 'provider'} work
+            {repository
+              ? 'Review task'
+              : `Prepare ${profile ? executionProviderLabel(profile) : 'provider'} work`}
             <ArrowRight size={14} />
           </button>
         )}
