@@ -12,6 +12,7 @@ import {
 } from 'node:fs';
 import { basename, isAbsolute, resolve } from 'node:path';
 import type { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import {
   type FakeWorkerEvent,
   FakeWorkerEventSchema,
@@ -225,6 +226,7 @@ export type StreamingCommandOptions = Readonly<{
   directory: string;
   environment: Readonly<Record<string, string>>;
   lifecycle: OwnedCommandLifecycle;
+  input?: AsyncIterable<Uint8Array>;
 }>;
 export class OwnedWorker {
   readonly child: ChildProcessWithoutNullStreams;
@@ -363,6 +365,7 @@ export class OwnedCommand {
   readonly stderr: Buffer[] = [];
   readonly stdoutStream?: AsyncIterable<Uint8Array>;
   readonly stderrStream?: AsyncIterable<Uint8Array>;
+  readonly inputCompleted: Promise<{ bytes: number }>;
   readonly group: number;
   failed = false;
   ownershipUnknown = false;
@@ -373,6 +376,7 @@ export class OwnedCommand {
   // from a saved PID and retires only after positive process-group absence.
   private ownsGroup = false;
   private readonly streaming: boolean;
+  private cancelInput?: (error: Error) => void;
   private stopEscalation?: () => void;
   private stopRequested = false;
   constructor(options: BufferedCommandOptions | StreamingCommandOptions) {
@@ -381,6 +385,7 @@ export class OwnedCommand {
     const streaming = options.streaming === true;
     this.streaming = streaming;
     let launch: OwnedCommandLaunch | undefined;
+    let inputFailure: unknown;
     if (streaming) {
       launch = Object.freeze({
         operationId: options.operationId,
@@ -464,15 +469,83 @@ export class OwnedCommand {
           if (!launch) throw Error('Command launch is unavailable.');
           commandDirectory(launch.cwd);
           verifyOwnedCommandExecutable(launch.executable, launch.executableSha256);
-        } catch {
+        } catch (error) {
           // Keep the only fresh child handle so output, close and group absence remain observable.
           this.failed = true;
           this.ownershipUnknown = true;
+          inputFailure = error;
           this.signalOwnedGroup('SIGKILL');
         }
       else options.onSpawn(this.group);
     }
-    this.child.stdin.end();
+    if (!streaming) {
+      this.child.stdin.end();
+      this.inputCompleted = Promise.resolve({ bytes: 0 });
+    } else if (!this.group || this.ownershipUnknown) {
+      this.child.stdin.destroy();
+      this.inputCompleted = Promise.reject(
+        inputFailure ?? Error('Command input ownership is unavailable.'),
+      );
+      void this.inputCompleted.catch(() => {});
+    } else if (!options.input) {
+      this.child.stdin.end();
+      this.inputCompleted = Promise.resolve({ bytes: 0 });
+    } else {
+      let bytes = 0;
+      let iterator: AsyncIterator<Uint8Array>;
+      try {
+        iterator = options.input[Symbol.asyncIterator]();
+      } catch (error) {
+        this.failed = true;
+        this.inputCompleted = Promise.reject(error);
+        void this.inputCompleted.catch(() => {});
+        this.stop();
+        return;
+      }
+      const cancellation = Promise.withResolvers<never>();
+      void cancellation.promise.catch(() => {});
+      let settled = false;
+      let returnStarted = false;
+      const returnInput = () => {
+        if (returnStarted) return;
+        returnStarted = true;
+        try {
+          void Promise.resolve(iterator.return?.()).catch(() => {});
+        } catch {}
+      };
+      this.cancelInput = (error) => {
+        if (settled) return;
+        cancellation.reject(error);
+        returnInput();
+      };
+      const boundedInput = async function* () {
+        try {
+          for (;;) {
+            const next = await Promise.race([iterator.next(), cancellation.promise]);
+            if (next.done) return;
+            const value = next.value;
+            if (!(value instanceof Uint8Array) || value.byteLength > maximumCommandChunkBytes)
+              throw Error('Command input needs bounded byte chunks.');
+            if (!Number.isSafeInteger(bytes + value.byteLength))
+              throw Error('Command input exceeds its byte bound.');
+            bytes += value.byteLength;
+            yield value;
+          }
+        } finally {
+          settled = true;
+          returnInput();
+        }
+      };
+      this.inputCompleted = pipeline(boundedInput(), this.child.stdin).then(
+        () => ({ bytes }),
+        (error) => {
+          this.failed = true;
+          this.stop();
+          throw error;
+        },
+      );
+      void this.inputCompleted.catch(() => {});
+    }
   }
   async quiescent(schedule: Schedule = defaultSchedule): Promise<boolean> {
     if (!(await closedWithin(this.closed, schedule))) return false;
@@ -497,6 +570,8 @@ export class OwnedCommand {
   }
   stop() {
     if (this.streaming) {
+      this.cancelInput?.(Error('Command input was stopped.'));
+      this.child.stdin.destroy();
       if (this.stopRequested) return;
       this.stopRequested = true;
       if (!this.signalOwnedGroup('SIGTERM')) return;
