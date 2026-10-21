@@ -2738,6 +2738,13 @@ async function taskActivityHistory(
         release: ReturnType<typeof Promise.withResolvers<void>>;
       }
     | undefined;
+  let startupDetail:
+    | {
+        entered: ReturnType<typeof Promise.withResolvers<void>>;
+        release: ReturnType<typeof Promise.withResolvers<void>>;
+      }
+    | undefined;
+  const startupConversation = Promise.withResolvers<void>();
   let rangeReads = 0;
   let failNextRange = false;
   const requests: Array<Extract<Command, { command: 'GetTaskActivityPage' }>> = [];
@@ -2759,7 +2766,13 @@ async function taskActivityHistory(
           'taskId' in command.payload,
           'Large workspace clients must read selected task detail only.',
         );
+      if (command.command === 'GetTaskConversationState' && startupDetail)
+        startupConversation.resolve();
       const result = await execute(command, principal);
+      if (command.command === 'GetSnapshot' && startupDetail) {
+        startupDetail.entered.resolve();
+        await startupDetail.release.promise;
+      }
       if (command.command === 'GetArtifactRange') {
         rangeReads++;
         if (failNextRange) {
@@ -2969,13 +2982,28 @@ async function taskActivityHistory(
       exact: true,
     });
     await expect(retryRegistration).toBeVisible();
+    startupDetail = {
+      entered: Promise.withResolvers<void>(),
+      release: Promise.withResolvers<void>(),
+    };
     await page.reload();
+    await bounded(startupDetail.entered.promise, 5000, 'Delayed initial task detail');
     await expect(retryRegistration).toBeVisible();
     assert.equal(controllerReceipt(), undefined);
     await page.getByRole('button', { name: 'Add project', exact: true }).click();
     await expect(page.getByRole('alert')).toContainText(
       'Resolve the pending desktop command first.',
     );
+    startupDetail.release.resolve();
+    await bounded(
+      startupConversation.promise,
+      5000,
+      'Automatic conversation read after task detail',
+    );
+    await expect(page.getByRole('alert')).toContainText(
+      'Resolve the pending desktop command first.',
+    );
+    startupDetail = undefined;
     await page.getByRole('button', { name: 'Dismiss error', exact: true }).click();
     await retryRegistration.click();
     await expect(page.getByRole('alert')).toContainText('Choose a readable Git repository root.');
@@ -3282,6 +3310,7 @@ async function taskActivityHistory(
     );
   } finally {
     held?.release.resolve();
+    startupDetail?.release.resolve();
     outstanding?.release.resolve();
     await application.evaluate(() => {
       const state = globalThis as unknown as { activityGraderClient?: ControllerClient };

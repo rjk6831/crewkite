@@ -576,13 +576,13 @@ export function useWorkspace() {
       stopNotices?.();
     };
   }, [source, refresh]);
-  const track = useCallback(async <T>(action: () => Promise<T>): Promise<T> => {
+  const track = useCallback(async <T>(action: () => Promise<T>, reportError = true): Promise<T> => {
     setPending((value) => value + 1);
-    setError(null);
+    if (reportError) setError(null);
     try {
       return await action();
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : 'The command failed.');
+      if (reportError) setError(failure instanceof Error ? failure.message : 'The command failed.');
       throw failure;
     } finally {
       setPending((value) => value - 1);
@@ -591,6 +591,7 @@ export function useWorkspace() {
   const perform = useCallback(
     <T extends CommandResult | ConversationContextCapture | null>(
       action: () => Promise<T>,
+      reportError = true,
     ): Promise<T> =>
       track(async () => {
         const value = await action();
@@ -603,25 +604,26 @@ export function useWorkspace() {
                 : CommandResultSchema.parse(value.result)
               : CommandResultSchema.parse(value);
         if (!result) return value;
-        if (result.outcome !== 'applied' && result.outcome !== 'already-applied') {
+        if (reportError && result.outcome !== 'applied' && result.outcome !== 'already-applied') {
           setError([result.reason ?? result.outcome, result.next].filter(Boolean).join(' '));
         }
         try {
           await refresh();
         } catch (failure) {
-          setError(
-            [
-              `Command outcome: ${result.outcome}.`,
-              result.reason,
-              result.next,
-              `Workspace refresh failed: ${failure instanceof Error ? failure.message : 'reconnect to recover current state.'}`,
-            ]
-              .filter(Boolean)
-              .join(' '),
-          );
+          if (reportError)
+            setError(
+              [
+                `Command outcome: ${result.outcome}.`,
+                result.reason,
+                result.next,
+                `Workspace refresh failed: ${failure instanceof Error ? failure.message : 'reconnect to recover current state.'}`,
+              ]
+                .filter(Boolean)
+                .join(' '),
+            );
         }
         return value;
-      }),
+      }, reportError),
     [refresh, track],
   );
   const metadataCommand = useCallback(
@@ -667,6 +669,8 @@ export function useWorkspace() {
         input.command === 'StopGoogleAcpSetup'
       )
         return metadataCommand(input);
+      const reportError =
+        input.command !== 'GetTaskConversationState' && input.command !== 'GetTaskConversation';
       return perform(async () => {
         if (!source) throw new Error('The desktop bridge is unavailable.');
         if (input.command !== 'StartRun' && input.command !== 'StopRun')
@@ -678,7 +682,7 @@ export function useWorkspace() {
         } finally {
           setPendingRuns((current) => current.filter((value) => value.token !== token));
         }
-      });
+      }, reportError);
     },
     [source, perform, metadataCommand],
   );
