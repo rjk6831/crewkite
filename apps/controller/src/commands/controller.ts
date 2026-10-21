@@ -210,6 +210,7 @@ import {
   replacementPlan as anthropicReplacementPlan,
   startReplacement as startAnthropicReplacement,
 } from '../providers/anthropic/replacement.ts';
+import { AnthropicUsageRefresh } from '../providers/anthropic/usage-refresh.ts';
 import { AcpDiagnosticSchema } from '../providers/google/acp/client.ts';
 import type { AcpInstallDependencies } from '../providers/google/acp/install.ts';
 import {
@@ -954,6 +955,9 @@ export type ControllerOptions = {
   nativeProfile?: () => NativeProfileResolution;
   nativeProfiles?: () => NativeProfileResolution[];
   nativeSpawn?: Parameters<typeof startReplacement>[2]['spawn'];
+  anthropicUsageReader?: Parameters<
+    typeof import('../providers/anthropic/native-usage-reader.ts').startAnthropicUsageReader
+  >[1];
   openAiUsageClient?: () => NativeProfileResolution;
   openAiUsageSpawn?: Parameters<typeof startNativeSession>[1]['spawn'];
   googleUsageClient?: () => GoogleUsageClientResolution;
@@ -1143,6 +1147,7 @@ export class Controller {
       });
       this.recover();
       this.nativeConnections().recover();
+      this.anthropicUsage().recover();
       this.googleInstallation().recover();
       this.taskOperations().recover();
       this.armQuotaRetries();
@@ -1228,6 +1233,8 @@ export class Controller {
       return this.executeGoogleInstall(command, principal);
     if (command.command === 'CheckNativeConnection')
       return this.checkNativeConnection(command, principal);
+    if (command.command === 'RefreshAnthropicUsage' || command.command === 'StopAnthropicUsage')
+      return this.anthropicUsage().execute(command);
     if (command.command === 'ObserveUsage') return this.observeUsageCommand(command, principal);
     if (command.command === 'CaptureConversationContext')
       return this.captureConversationContextCommand(command, principal);
@@ -1546,7 +1553,11 @@ export class Controller {
       localSetup: this.localSetup(),
       localHardware: localHardwareStatus(this.now()),
       googleAcpSetup: this.store.googleAcpSetup(),
-      usageReaders: [this.googleUsageReader(), this.openAiUsageReader()],
+      usageReaders: [
+        this.googleUsageReader(),
+        this.openAiUsageReader(),
+        this.anthropicUsage().status(),
+      ],
       routes: this.store.list('route'),
       usage: this.store
         .list<Observation>('window')
@@ -1669,6 +1680,39 @@ export class Controller {
     }
   }
 
+  private anthropicUsageRuntime?: AnthropicUsageRefresh;
+  private anthropicUsage() {
+    this.anthropicUsageRuntime ??= new AnthropicUsageRefresh({
+      store: this.store,
+      artifacts: this.artifacts,
+      home: this.home,
+      now: this.now,
+      artifactId: () => this.id('art'),
+      resolve: () => this.profileFor('anthropic-file-v1'),
+      blocked: () => {
+        const connection = this.nativeConnections().status();
+        if (connection.state === 'unknown') return 'anthropic-connection-ownership-unknown';
+        if (connection.state === 'checking') return 'anthropic-connection-ownership-pending';
+        if (connection.state === 'signed-out') return 'anthropic-sign-in-required';
+        if (
+          this.store.intents().some((intent) => {
+            if (intent.state === 'stopped') return false;
+            const route = this.store.get<Route>('route', intent.route_id);
+            return !route || (route.family === 'anthropic' && !route.fake);
+          })
+        )
+          return 'anthropic-task-active';
+      },
+      changed: () =>
+        this.store.transaction(() =>
+          this.event('usage.reader-updated', null, 0, this.anthropicUsage().status()),
+        ),
+      schedule: this.options.schedule,
+      reader: this.options.anthropicUsageReader,
+    });
+    return this.anthropicUsageRuntime;
+  }
+
   private googleUsageReader() {
     const reader = this.store.googleUsageReader();
     return UsageReaderSchema.parse({
@@ -1725,6 +1769,7 @@ export class Controller {
 
   private openAiUsageBlocker(routeId: string | Route) {
     const route = typeof routeId === 'string' ? this.store.get<Route>('route', routeId) : routeId;
+    if (route?.family === 'anthropic' && !route.fake) return this.anthropicUsage().blocker();
     if (route?.family !== 'openai' || route.fake) return;
     try {
       const state = this.openAiUsageState();
@@ -2535,6 +2580,8 @@ export class Controller {
         ...(receipt.result.outcome === 'applied' ? { outcome: 'already-applied' as const } : {}),
       };
     if (command.expectedRevision !== 0) return { outcome: 'stale-revision', revision: 0 };
+    const usageBlocker = this.anthropicUsage().blocker();
+    if (usageBlocker) return { outcome: 'blocked', reason: usageBlocker };
     const directory = join(this.home, 'native', `connection-${command.key}`);
     try {
       mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -2963,6 +3010,8 @@ export class Controller {
     if (operationClosing) native.push(operationClosing);
     this.outputAbort.abort();
     native.push(...this.outputReads);
+    const usageClosing = this.anthropicUsageRuntime?.close();
+    if (usageClosing) native.push(usageClosing);
     const connectionClosing = this.connectionChecks?.close();
     if (connectionClosing) native.push(connectionClosing);
     const installClosing = this.googleInstallOperation?.close();

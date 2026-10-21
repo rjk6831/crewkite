@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { encodeFrame, FrameDecoder } from '@crewkite/client';
 import {
+  type Command,
   type CommandResult,
   CommandResultSchema,
   type TaskPage,
@@ -51,6 +52,7 @@ test('CLI lists traverse empty pages and preserve incomplete output', async (con
   let fail = false;
   let pageIndex = 0;
   const commands: string[] = [];
+  const usageRequests: Command[] = [];
   const sockets = new Set<Socket>();
   const server = createServer((socket) => {
     sockets.add(socket);
@@ -93,6 +95,12 @@ test('CLI lists traverse empty pages and preserve incomplete output', async (con
             result = { outcome: 'applied', data: page };
           }
           pageIndex++;
+        } else if (
+          command.command === 'RefreshAnthropicUsage' ||
+          command.command === 'StopAnthropicUsage'
+        ) {
+          usageRequests.push(command);
+          result = { outcome: 'applied' };
         } else throw new Error(`Unexpected read ${command.command}`);
         socket.write(encodeFrame({ type: 'result', key: command.key, result }));
       }
@@ -127,6 +135,41 @@ test('CLI lists traverse empty pages and preserve incomplete output', async (con
   ]) {
     assert.equal((await execute(args)).code, 0);
     assert.deepEqual(commands, ['GetWorkspaceState']);
+  }
+  for (const [args, name, payload] of [
+    [
+      [
+        'usage',
+        'refresh',
+        '--family',
+        'anthropic',
+        '--native-trust',
+        '--usage-scope',
+        'a'.repeat(64),
+      ],
+      'RefreshAnthropicUsage',
+      { trust: { nativeTrust: 'accepted', scopeHash: 'a'.repeat(64) } },
+    ],
+    [['usage', 'refresh', '--family', 'anthropic'], 'RefreshAnthropicUsage', {}],
+    [
+      ['usage', 'stop', 'cmd_01ARZ3NDEKTSV4RRFFQ69G5FAV', '--family', 'anthropic'],
+      'StopAnthropicUsage',
+      { operationId: 'cmd_01ARZ3NDEKTSV4RRFFQ69G5FAV' },
+    ],
+  ] as const) {
+    const result = await execute([...args]);
+    assert.equal(result.code, 0, result.err);
+    assert.deepEqual(commands, [name]);
+    assert.deepEqual(usageRequests.at(-1)?.payload, payload);
+  }
+  for (const args of [
+    ['usage', 'refresh', '--family', 'anthropic', '--native-trust'],
+    ['usage', 'refresh', '--family', 'anthropic', '--usage-scope', 'a'.repeat(64)],
+    ['usage', 'refresh', '--family', 'openai', '--usage-scope', 'a'.repeat(64)],
+    ['usage', 'stop', 'cmd_01ARZ3NDEKTSV4RRFFQ69G5FAV', '--family', 'google'],
+  ]) {
+    assert.equal((await execute(args)).code, 1);
+    assert.deepEqual(commands, []);
   }
   for (const json of [false, true]) {
     const result = await execute(['task', 'list', ...(json ? ['--pages', '--json'] : [])]);

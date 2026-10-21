@@ -875,10 +875,55 @@ export const WindowSchema = z.strictObject({
   observation: ObservationSchema,
   state: WindowStateSchema,
 });
+export const AnthropicUsageReadingSchema = z.strictObject({
+  source: z.literal('native-local-command'),
+  status: z.enum(['reported', 'unavailable']),
+  receivedAt: TimestampSchema,
+  observedAt: z.null(),
+  freshness: z.literal('unknown'),
+  windows: z
+    .array(
+      z.strictObject({
+        kind: label,
+        group: label,
+        percent: z.number().finite().min(0).max(100),
+        resets_at: TimestampSchema.nullable(),
+        scope: z
+          .strictObject({
+            model: z.strictObject({ display_name: label }).nullable().optional(),
+            surface: z.strictObject({ display_name: label }).nullable().optional(),
+          })
+          .nullable()
+          .optional(),
+        severity: label,
+        is_active: z.boolean(),
+      }),
+    )
+    .max(64),
+  extraUsage: z
+    .strictObject({
+      is_enabled: z.boolean(),
+      monthly_limit: z.number().finite().nonnegative().nullable(),
+      used_credits: z.number().finite().nonnegative().nullable(),
+      utilization: z.number().finite().nonnegative().nullable(),
+      currency: label.nullable().optional(),
+    })
+    .nullable(),
+  modelTurns: z.literal(0),
+  qualified: z.literal(false),
+});
+export const AnthropicUsageTrustSchema = z.strictObject({
+  scopeHash: HashSchema,
+  clientSha256: HashSchema,
+  command: z.literal('/usage'),
+  generationRequest: z.literal(false),
+  policyHooks: z.literal('covered-by-native-client-trust'),
+  accepted: z.boolean(),
+});
 export const UsageReaderSchema = z
   .strictObject({
-    id: z.enum(['google-usage-v1', 'openai-usage-v1']),
-    family: z.enum(['google', 'openai']),
+    id: z.enum(['google-usage-v1', 'openai-usage-v1', 'anthropic-usage-v1']),
+    family: z.enum(['google', 'openai', 'anthropic']),
     clientVersion: label,
     available: z.boolean(),
     reason: z.enum([
@@ -893,13 +938,22 @@ export const UsageReaderSchema = z
     readState: z.enum(['idle', 'intent', 'owned', 'quiescent', 'unknown']).optional(),
     readReason: label.nullable().optional(),
     lastRequest: label.nullable().optional(),
+    trust: AnthropicUsageTrustSchema.optional(),
+    reading: AnthropicUsageReadingSchema.nullable().optional(),
+    readingScopeHash: HashSchema.nullable().optional(),
+    operationId: CommandIdSchema.nullable().optional(),
     lastObservedAt: TimestampSchema.nullable(),
     lastAttemptAt: TimestampSchema.nullable().optional(),
   })
   .refine(
     (reader) =>
       reader.available === (reader.reason === 'available') &&
-      reader.id === `${reader.family}-usage-v1`,
+      reader.id === `${reader.family}-usage-v1` &&
+      (reader.family === 'anthropic' ||
+        (!reader.trust &&
+          reader.reading === undefined &&
+          reader.readingScopeHash === undefined &&
+          reader.operationId === undefined)),
     'Reader availability must match its client status.',
   );
 export const RoleSchema = z.strictObject({
@@ -2405,6 +2459,15 @@ export const CommandSchema = z.discriminatedUnion('command', [
   ),
   mutate('ObserveUsage', z.strictObject({ family: z.enum(['google', 'openai']) })),
   mutate(
+    'RefreshAnthropicUsage',
+    z.strictObject({
+      trust: z
+        .strictObject({ scopeHash: HashSchema, nativeTrust: z.literal('accepted') })
+        .optional(),
+    }),
+  ),
+  mutate('StopAnthropicUsage', z.strictObject({ operationId: CommandIdSchema })),
+  mutate(
     'InitializeGoogleAcp',
     z.strictObject({ profileId: z.literal('google-acp-v1'), consent: z.literal('explicit') }),
   ),
@@ -2965,7 +3028,7 @@ export const SnapshotSchema = z
     nativeConnections: z.array(NativeConnectionStatusSchema).max(1).default([]),
     usageReaders: z
       .array(UsageReaderSchema)
-      .max(2)
+      .max(3)
       .refine(
         (readers) => new Set(readers.map((reader) => reader.id)).size === readers.length,
         'Usage reader identities must be unique.',
@@ -3523,6 +3586,7 @@ export const EventSchema = z.discriminatedUnion('type', [
   event('approval.requested', ApprovalSchema),
   event('approval.resolved', ApprovalSchema),
   event('usage.observed', ObservationSchema),
+  event('usage.reader-updated', UsageReaderSchema),
   event(
     'route.reserve_reached',
     z.strictObject({ routeId: RouteIdSchema, windowId: label, reason: text }),

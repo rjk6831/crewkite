@@ -2,7 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { ObservationSchema, type Route, type Window } from '@crewkite/contracts';
 import { createDemoFixtures, createTestIds, DEMO_TIME } from '@crewkite/testkit';
-import { nativeUsageClients, projectUsagePresentation } from './usage-presentation.ts';
+import {
+  anthropicUsageCard,
+  nativeUsageClients,
+  projectUsagePresentation,
+} from './usage-presentation.ts';
 
 const id = createTestIds(DEMO_TIME, 9000n);
 const base = createDemoFixtures().snapshot.routes;
@@ -135,4 +139,86 @@ test('native clients remain visible before any usage route exists', () => {
       ['local', 0, null],
     ],
   );
+});
+
+test('native usage gauges convert reported used percent without inventing freshness', () => {
+  const scopeHash = 'a'.repeat(64);
+  const reader = {
+    id: 'anthropic-usage-v1' as const,
+    family: 'anthropic' as const,
+    clientVersion: 'fixture',
+    available: true,
+    reason: 'available' as const,
+    lastObservedAt: null,
+    readingScopeHash: scopeHash,
+    trust: {
+      scopeHash,
+      clientSha256: 'b'.repeat(64),
+      command: '/usage' as const,
+      generationRequest: false as const,
+      policyHooks: 'covered-by-native-client-trust' as const,
+      accepted: true,
+    },
+    reading: {
+      status: 'reported' as const,
+      source: 'native-local-command' as const,
+      receivedAt: DEMO_TIME,
+      observedAt: null,
+      freshness: 'unknown' as const,
+      windows: [0, 37, 100].map((percent) => ({
+        kind: 'session',
+        group: `row-${percent}`,
+        percent,
+        resets_at: DEMO_TIME,
+        severity: 'normal',
+        is_active: false,
+        scope: {
+          model: { display_name: 'Coding model' },
+          surface: { display_name: 'Native client' },
+        },
+      })),
+      extraUsage: null,
+      modelTurns: 0 as const,
+      qualified: false as const,
+    },
+  };
+  const before = JSON.stringify(reader);
+  const card = anthropicUsageCard({ usageReaders: [reader] });
+  assert(card);
+  const rows = [...card.primary, ...(card.auxiliary ?? [])];
+  assert.deepEqual(
+    rows.map((row) => row.remaining),
+    [100, 63, 0].map((value) => ({ value, unit: 'percent' })),
+  );
+  assert(
+    rows.every(
+      (row) =>
+        row.state === 'reported' &&
+        row.observedAt === null &&
+        row.resetsAt === DEMO_TIME &&
+        row.reserve === undefined,
+    ),
+  );
+  assert(card.tags?.includes('Current scope'));
+  assert(card.notice?.includes('cache age unknown'));
+  assert(rows.every((row) => row.note?.includes(scopeHash)));
+  assert(rows.every((row) => row.label === 'Coding model · Native client · session'));
+  const repeated = anthropicUsageCard({
+    usageReaders: [
+      {
+        ...reader,
+        reading: {
+          ...reader.reading,
+          windows: [reader.reading.windows[0], reader.reading.windows[0]],
+        },
+      },
+    ],
+  });
+  assert.equal(new Set(repeated?.primary.map((row) => row.id)).size, 2);
+  assert.equal(JSON.stringify(reader), before);
+  const prior = anthropicUsageCard({
+    usageReaders: [{ ...reader, readingScopeHash: 'c'.repeat(64) }],
+  });
+  assert(prior?.tags?.includes('Earlier or unknown scope'));
+  assert.equal(anthropicUsageCard({ usageReaders: [] }), null);
 });

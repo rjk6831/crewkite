@@ -1,0 +1,237 @@
+import { createHash } from 'node:crypto';
+import { isAbsolute, resolve } from 'node:path';
+import { performance } from 'node:perf_hooks';
+import { z } from 'zod';
+import {
+  defaultSchedule,
+  OwnedCommand,
+  type OwnedCommandLifecycle,
+  type Schedule,
+  type StreamingCommandOptions,
+} from '../../host/worker.ts';
+import {
+  AnthropicUsageReader,
+  anthropicUsageReaderPlan,
+  UsageReaderError,
+} from './usage-reader.ts';
+
+type Owner = Pick<
+  OwnedCommand,
+  | 'stdoutStream'
+  | 'stderrStream'
+  | 'closed'
+  | 'exited'
+  | 'inputCompleted'
+  | 'failed'
+  | 'ownershipUnknown'
+  | 'stop'
+  | 'quiescent'
+>;
+type Reading = ReturnType<AnthropicUsageReader['finish']>;
+type Reason = 'protocol' | 'output-limit' | 'deadline' | 'stopped' | 'exit' | 'ownership';
+export type AnthropicUsageReaderContext = Readonly<{
+  operationId: string;
+  executable: string;
+  executableSha256: string;
+  sessionId: string;
+  directory: string;
+  home: string;
+  temporary: string;
+}>;
+const nativeTrust = z.strictObject({
+  nativeTrust: z.literal('accepted'),
+  scopeHash: z.string().regex(/^[a-f0-9]{64}$/),
+});
+export type AnthropicUsageReaderTrust = z.infer<typeof nativeTrust>;
+const usageScope = {
+  version: 1,
+  purpose: 'native-local-usage',
+  nativeTrust: 'required',
+  command: '/usage',
+  generationRequest: false,
+  policyHooks: 'covered-by-native-client-trust',
+} as const;
+
+/** The caller obtains explicit native-client trust for this scope before starting the command. */
+export function anthropicUsageReaderScope(input: AnthropicUsageReaderContext) {
+  const plan = anthropicUsageReaderPlan({
+    clientSha256: input.executableSha256,
+    sessionId: input.sessionId,
+  });
+  if (
+    !/^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,199}$/.test(input.operationId) ||
+    [input.executable, input.directory, input.home, input.temporary].some(
+      (path) => !isAbsolute(path) || resolve(path) !== path || path.includes('\0'),
+    )
+  )
+    throw new UsageReaderError('client');
+  return {
+    ...usageScope,
+    scopeHash: createHash('sha256')
+      .update(
+        JSON.stringify({
+          ...usageScope,
+          operationId: input.operationId,
+          executable: input.executable,
+          executableSha256: plan.clientSha256,
+          sessionId: plan.sessionId,
+          directory: input.directory,
+          home: input.home,
+          temporary: input.temporary,
+          argv: plan.argv,
+        }),
+      )
+      .digest('hex'),
+  };
+}
+
+/** Invoke the local command without generation input; native policy hooks remain trusted client behavior. */
+export function startAnthropicUsageReader(
+  input: AnthropicUsageReaderContext & {
+    trust?: AnthropicUsageReaderTrust;
+    lifecycle: OwnedCommandLifecycle;
+  },
+  options: {
+    now?: () => number;
+    receivedAt?: () => string;
+    schedule?: Schedule;
+    create?: (options: StreamingCommandOptions) => Owner;
+  } = {},
+) {
+  const context: AnthropicUsageReaderContext = {
+    operationId: input.operationId,
+    executable: input.executable,
+    executableSha256: input.executableSha256,
+    sessionId: input.sessionId,
+    directory: input.directory,
+    home: input.home,
+    temporary: input.temporary,
+  };
+  const lifecycle = input.lifecycle;
+  const scope = anthropicUsageReaderScope(context);
+  const accepted = nativeTrust.safeParse(input.trust);
+  if (!accepted.success || accepted.data.scopeHash !== scope.scopeHash)
+    throw new UsageReaderError('native-trust-required');
+  const plan = anthropicUsageReaderPlan({
+    clientSha256: context.executableSha256,
+    sessionId: context.sessionId,
+  });
+  const now = options.now ?? (() => performance.now());
+  const started = now();
+  if (!Number.isFinite(started)) throw new UsageReaderError('client');
+  const schedule = options.schedule ?? defaultSchedule;
+  const owner = (options.create ?? ((value) => new OwnedCommand(value)))({
+    streaming: true,
+    operationId: context.operationId,
+    executable: context.executable,
+    executableIdentity: 'verified-prelaunch-sha256',
+    executableSha256: plan.clientSha256,
+    argv: plan.argv,
+    directory: context.directory,
+    environment: {
+      HOME: context.home,
+      TMPDIR: context.temporary,
+      PATH: '/usr/bin:/bin',
+      LANG: 'C',
+      NO_COLOR: '1',
+    },
+    lifecycle,
+  });
+  if (!owner.stdoutStream || !owner.stderrStream) {
+    owner.stop();
+    throw new UsageReaderError('protocol');
+  }
+  const parser = new AnthropicUsageReader(plan.sessionId);
+  let reason: Reason | null = null;
+  let cancelCleanup: (() => void) | undefined;
+  const boundary = Promise.withResolvers<void>();
+  let cleanupExpired = false;
+  const stop = (value: Reason = 'stopped') => {
+    reason ??= value;
+    owner.stop();
+    cancelCleanup ??= schedule(() => {
+      cleanupExpired = true;
+      boundary.resolve();
+    }, 3000);
+  };
+  const cancelDeadline = schedule(() => stop('deadline'), plan.timeoutMs);
+  const drain = async (source: AsyncIterable<Uint8Array>, stdout: boolean) => {
+    let bytes = 0;
+    try {
+      for await (const chunk of source) {
+        bytes += chunk.byteLength;
+        const limit = stdout ? plan.maximumStdoutBytes : plan.maximumStderrBytes;
+        if (bytes > limit) stop('output-limit');
+        if (reason === null && stdout) parser.feed(chunk);
+      }
+    } catch (error) {
+      stop(
+        error instanceof UsageReaderError && error.reason === 'output-limit'
+          ? 'output-limit'
+          : 'protocol',
+      );
+    }
+  };
+  const output = Promise.all([drain(owner.stdoutStream, true), drain(owner.stderrStream, false)]);
+  const result = (async () => {
+    let reading: Reading | null = null;
+    let exit: Awaited<Owner['exited']> | undefined;
+    void owner.exited.then((value) => {
+      exit = value;
+    });
+    const closed = await Promise.race([
+      Promise.all([owner.closed, owner.inputCompleted, output]).then(
+        () => true,
+        () => {
+          stop('protocol');
+          return false;
+        },
+      ),
+      boundary.promise.then(() => false),
+    ]);
+    let quiescent = false;
+    if (closed) {
+      const current = now();
+      if (!Number.isFinite(current) || current < started || current - started > plan.timeoutMs)
+        stop('deadline');
+      quiescent = await Promise.race([
+        owner.quiescent(schedule),
+        boundary.promise.then(() => false),
+      ]);
+    }
+    if (!quiescent) {
+      stop('ownership');
+      while (closed && !quiescent && !cleanupExpired) {
+        const again = await Promise.race([
+          new Promise<boolean>((resolve) => schedule(() => resolve(true), 25)),
+          boundary.promise.then(() => false),
+        ]);
+        if (!again) break;
+        quiescent = await Promise.race([
+          owner.quiescent(schedule),
+          boundary.promise.then(() => false),
+        ]);
+      }
+    }
+    if (!quiescent || owner.ownershipUnknown) reason = 'ownership';
+    else if (owner.failed || exit?.code !== 0 || exit.signal !== null) reason ??= 'exit';
+    if (reason === null) {
+      try {
+        reading = parser.finish((options.receivedAt ?? (() => new Date().toISOString()))());
+      } catch {
+        reason = 'protocol';
+      }
+    }
+    cancelDeadline();
+    cancelCleanup?.();
+    return {
+      reading,
+      reason,
+      quiescent,
+      exitCode: exit?.code ?? null,
+      signal: exit?.signal ?? null,
+      modelPrompt: false as const,
+    };
+  })();
+  return { result, stop: () => stop() };
+}

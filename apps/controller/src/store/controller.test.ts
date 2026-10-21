@@ -451,7 +451,7 @@ test('task snapshots retain related evidence within the unchanged frame bound', 
     assert.equal(workspace.googleAcpInstall?.state, 'idle');
     assert.deepEqual(
       workspace.usageReaders.map((reader) => reader.id),
-      ['google-usage-v1', 'openai-usage-v1'],
+      ['google-usage-v1', 'openai-usage-v1', 'anthropic-usage-v1'],
     );
     const projectStatus = await client.projectPage({
       stamp: workspace.stamp,
@@ -536,12 +536,15 @@ test('held metadata leaves stop replies reachable on the same authenticated sock
   );
   const { controller, command, draft, fixtures } = await setup(t, {
     home: join(socketRoot, 'home'),
+    googleUsageClient: () => ({ available: false, reason: 'client-unavailable' }),
   });
   t.after(() => rmSync(socketRoot, { recursive: true, force: true }));
   for (const [kind, payload] of [
     ['GetArtifactRange', { artifactId: 'art_01ARZ3NDEKTSV4RRFFQ69G5FAV', offset: 0, limit: 65536 }],
     ['GetTaskActivityPage', { taskId: 'tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV', limit: 100 }],
     ['ObserveUsage', { family: 'google' }],
+    ['RefreshAnthropicUsage', {}],
+    ['StopAnthropicUsage', { operationId: createCommandKey() }],
     ['CheckNativeConnection', { family: 'anthropic', consent: 'explicit' }],
     ['InstallGoogleAcp', { profileId: 'google-acp-v1', consent: 'explicit' }],
     ['StopGoogleAcpInstall', { profileId: 'google-acp-v1', operationId: createCommandKey() }],

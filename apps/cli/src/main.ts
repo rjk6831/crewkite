@@ -90,7 +90,8 @@ const help = `Usage: crewkite project add <path> [--json] [--home path]
        crewkite native import-google --consent [--json] [--home path]
        crewkite native setup <show|initialize|authenticate|discover|stop> --family google [--consent] [--json] [--home path]
        crewkite usage show [--json] [--home path]
-       crewkite usage refresh --family google|openai [--json] [--home path]
+       crewkite usage refresh --family google|openai|anthropic [--native-trust --usage-scope hash] [--json] [--home path]
+       crewkite usage stop <operation-id> --family anthropic [--json] [--home path]
        crewkite task prepare-native <task-id> <profile-id> <path> --policy file [--native-trust --source-consent] [--existing-credits] [--confirm-subscription-only] [--maximum-task-ms 300000|600000] [--context-lines START:END] [--permission-mode mode] [--handoff-target profile[:existing-credits] ...]
        crewkite task prepare-handoff <task-id> <profile-id> --native-trust --source-consent [--existing-credits] [--confirm-subscription-only] [--permission-mode mode]
        crewkite task start-handoff <task-id> [--json] [--home path]
@@ -176,6 +177,7 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
         recipe: { type: 'string' },
         'test-file': { type: 'string', multiple: true },
         'native-trust': { type: 'boolean' },
+        'usage-scope': { type: 'string' },
         'source-consent': { type: 'boolean' },
         'existing-credits': { type: 'boolean' },
         'confirm-subscription-only': { type: 'boolean' },
@@ -521,10 +523,18 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
     )
       throw new Error('This action requires explicit --consent.');
     const refreshingUsage = area === 'usage' && action === 'refresh';
-    if (area === 'usage' && (!['show', 'refresh'].includes(action) || id !== undefined))
-      throw new Error('Use usage show or usage refresh --family google|openai.');
+    const stoppingUsage = area === 'usage' && action === 'stop';
+    const anthropicRefresh = refreshingUsage && values.family === 'anthropic';
+    if (
+      area === 'usage' &&
+      (!['show', 'refresh', 'stop'].includes(action) || (stoppingUsage ? !id : id !== undefined))
+    )
+      throw new Error(
+        'Use usage show, usage refresh --family google|openai|anthropic, or usage stop <operation-id> --family anthropic.',
+      );
     if (
       !refreshingUsage &&
+      !stoppingUsage &&
       !settingUpGoogle &&
       !importingGoogle &&
       !planning &&
@@ -532,10 +542,22 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
       (values.family !== undefined || values.consent !== undefined)
     )
       throw new Error('Family and consent options do not apply to this command.');
-    if (refreshingUsage && !['google', 'openai'].includes(values.family ?? ''))
-      throw new Error('Quota refresh requires --family google or openai.');
-    if (refreshingUsage && values.consent !== undefined)
+    if (refreshingUsage && !['google', 'openai', 'anthropic'].includes(values.family ?? ''))
+      throw new Error('Quota refresh requires --family google, openai or anthropic.');
+    if ((refreshingUsage || stoppingUsage) && values.consent !== undefined)
       throw new Error('Quota refresh does not take consent.');
+    if (stoppingUsage && values.family !== 'anthropic')
+      throw new Error('Usage stop requires --family anthropic.');
+    if (values['usage-scope'] !== undefined && !anthropicRefresh)
+      throw new Error('Usage scope requires Anthropic quota refresh.');
+    if (
+      anthropicRefresh &&
+      (Boolean(values['native-trust']) !== Boolean(values['usage-scope']) ||
+        (values['usage-scope'] && !/^[a-f0-9]{64}$/.test(values['usage-scope'])))
+    )
+      throw new Error(
+        'First refresh requires --native-trust and the exact --usage-scope hash from usage show. This trusts native client policy hooks; no generation request is sent.',
+      );
     if (importingGoogle && values.family !== undefined)
       throw new Error('Use native import-google --consent.');
     const preparingFile = area === 'task' && action === 'prepare-native';
@@ -611,7 +633,7 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
       !preparingHandoff &&
       !(operationAction && action === 'command-start') &&
       (values.policy ||
-        values['native-trust'] ||
+        (values['native-trust'] && !anthropicRefresh) ||
         values['source-consent'] ||
         values['existing-credits'])
     )
@@ -1074,8 +1096,18 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
       );
       return succeeded(result) ? 0 : 2;
     }
-    if (refreshingUsage) {
-      const result = await request('ObserveUsage', { family: values.family }, 0);
+    if (refreshingUsage || stoppingUsage) {
+      const result = stoppingUsage
+        ? await request('StopAnthropicUsage', { operationId: id }, 0)
+        : anthropicRefresh
+          ? await request(
+              'RefreshAnthropicUsage',
+              values['native-trust']
+                ? { trust: { nativeTrust: 'accepted', scopeHash: values['usage-scope'] } }
+                : {},
+              0,
+            )
+          : await request('ObserveUsage', { family: values.family }, 0);
       print(
         { command: sent, result },
         terminalText(
@@ -1099,6 +1131,24 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
                 (reader) =>
                   `${reader.family} quota reader  ${reader.reason}${reader.readState ? `  ${reader.readState}, ${reader.readReason ?? 'no result'}${reader.lastRequest ? `, last request ${reader.lastRequest}` : ''}` : ''}  last attempt ${reader.lastAttemptAt ?? 'none'}  last observed ${reader.lastObservedAt ?? 'none'}`,
               ),
+              ...workspace.usageReaders
+                .filter((reader) => reader.family === 'anthropic')
+                .flatMap((reader) => [
+                  ...(reader.trust
+                    ? [
+                        `Native usage trust ${reader.trust.accepted ? 'accepted' : 'required'}  scope ${reader.trust.scopeHash}  client ${reader.trust.clientSha256}  command /usage  native policy hooks trusted  no generation request`,
+                      ]
+                    : []),
+                  ...(reader.reading
+                    ? [
+                        `Report received ${reader.reading.receivedAt}; observation time/cache age unknown.`,
+                        ...reader.reading.windows.map(
+                          (row) =>
+                            `${row.kind}/${row.group}  reported ${row.percent}%  resets ${row.resets_at ?? 'unknown'}  age unknown`,
+                        ),
+                      ]
+                    : []),
+                ]),
               ...workspace.usage.map(
                 ({ observation, state }) =>
                   `${observation.routeId}  ${observation.windowId}  ${observation.remaining ? `${observation.remaining.value} ${observation.remaining.unit} remaining` : 'remaining unknown'}  ${state}  source ${observation.source}  observed ${observation.observedAt}  resets ${observation.resetsAt ?? 'unknown'}`,

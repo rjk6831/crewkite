@@ -300,22 +300,24 @@ export class ControllerClient {
                       ? 200000
                       : command.command === 'StopGoogleAcpInstall'
                         ? 15000
-                        : command.command === 'CheckNativeConnection'
-                          ? 35000
-                          : command.command === 'AuthenticateGoogleAcp'
-                            ? 130000
-                            : command.command === 'InitializeGoogleAcp'
-                              ? 35000
-                              : [
-                                    'ObserveUsage',
-                                    'DiscoverGoogleAcp',
-                                    'StopGoogleAcpSetup',
-                                  ].includes(command.command)
-                                ? 30000
-                                : command.command === 'PrepareCandidateEvaluation' &&
-                                    command.payload.checkRecipeId === 'crewkite-verify-v1'
-                                  ? 65000
-                                  : 5000),
+                        : ['RefreshAnthropicUsage', 'StopAnthropicUsage'].includes(command.command)
+                          ? 40000
+                          : command.command === 'CheckNativeConnection'
+                            ? 35000
+                            : command.command === 'AuthenticateGoogleAcp'
+                              ? 130000
+                              : command.command === 'InitializeGoogleAcp'
+                                ? 35000
+                                : [
+                                      'ObserveUsage',
+                                      'DiscoverGoogleAcp',
+                                      'StopGoogleAcpSetup',
+                                    ].includes(command.command)
+                                  ? 30000
+                                  : command.command === 'PrepareCandidateEvaluation' &&
+                                      command.payload.checkRecipeId === 'crewkite-verify-v1'
+                                    ? 65000
+                                    : 5000),
       );
       this.pending.set(command.key, { resolve, timer });
       socket.write(frame);

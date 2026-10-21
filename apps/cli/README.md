@@ -139,7 +139,16 @@ pnpm crewkite usage refresh --family openai --json
 
 The quota reader runs by default when the pinned client is available. Controller startup attempts one read. Authenticated connections can refresh missing, stale or unknown observations, and Google admission can make one needed bounded read. Reads have a 60-second cooldown after each attempt, including failures. Active or unknown Google ownership blocks a read. A fresh reported zero remains fresh and does not cause another read just for being zero.
 
-OpenAI refresh uses the existing pinned native account metadata reader. It sends no model turn. Its status includes the ownership state, bounded result reason and last protocol request, so a timed-out read remains visible without guessing an authentication failure. Anthropic has no standalone quota refresh; its task-reported observations stay separate from client readiness.
+OpenAI refresh uses the existing pinned native account metadata reader. It sends no model turn. Its status includes the ownership state, bounded result reason and last protocol request, so a timed-out read remains visible without guessing an authentication failure. Anthropic refresh invokes the pinned native local `/usage` command and sends no generation request. The first refresh needs explicit native-client trust for the exact scope shown by `usage show`. Native user or administrator policy hooks are covered by that trust. I retain consent only for the same client, command and reader policy.
+
+```sh
+pnpm crewkite usage show --json
+pnpm crewkite usage refresh --family anthropic --native-trust --usage-scope <scope-hash> --json
+pnpm crewkite usage refresh --family anthropic --json
+pnpm crewkite usage stop <operation-id> --family anthropic --json
+```
+
+Later refreshes reuse matching trust. Stop joins the existing operation. Anthropic has its own sixty-second cooldown after every attempted read, including failures; active or unknown Anthropic task, sign-in or usage ownership blocks another read. The report keeps native window rows and extra-usage metadata separately. Receipt time is visible while observation time and cache age remain unknown. A failed refresh retains the previous report and its provenance. This report grants no coding authority, included billing or task qualification. Offline fixtures verify this path; no new live subscription qualification is claimed.
 
 The reader calls the pinned Google CLI's headless `/usage` metadata command without a model request. A quota read supplies no coding authority, account identity, provider entitlement or billing hard cap. The [provider boundaries](../../docs/providers.md) describe this status check and its limits.
 

@@ -7,6 +7,8 @@ import {
   type Window,
 } from '@crewkite/contracts';
 
+import type { UsageCard, UsageReading } from './usage-gauges.tsx';
+
 type Reserve = Policy['reserves'][number];
 type UsageReader = Snapshot['usageReaders'][number];
 
@@ -242,4 +244,47 @@ export function projectUsagePresentation(
       notice: notices.join(' '),
     };
   });
+}
+
+/** Pinned native schema defines percent as used; this conversion is display-only. */
+export function anthropicUsageCard(snapshot: Pick<Snapshot, 'usageReaders'>): UsageCard | null {
+  const reader = snapshot.usageReaders.find((value) => value.id === 'anthropic-usage-v1');
+  if (!reader) return null;
+  const reading = reader.reading;
+  const scope = reader.readingScopeHash ?? 'unknown';
+  const matching = !!reader.trust && scope === reader.trust.scopeHash;
+  const rows: UsageReading[] = (reading?.windows ?? []).map((row, index) => ({
+    id: `${index}:${JSON.stringify(row)}`,
+    windowId: `${row.kind}:${row.group}`,
+    label: `${[row.scope?.model?.display_name, row.scope?.surface?.display_name].filter(Boolean).join(' · ') || row.group} · ${row.kind}`,
+    remaining: { value: 100 - row.percent, unit: 'percent' },
+    state: 'reported',
+    observedAt: null,
+    resetsAt: row.resets_at,
+    source: 'client',
+    confidence: 'reported',
+    note: `Native report: ${row.percent}% used. Report scope ${scope}. Observation time and cache age unknown.`,
+  }));
+  return {
+    id: 'native-quota:anthropic',
+    title: 'Anthropic native quota',
+    scope: 'Native local usage report',
+    tags: ['Age unknown', matching ? 'Current scope' : 'Earlier or unknown scope'],
+    notice: reading
+      ? `Last retained report received ${new Date(reading.receivedAt).toLocaleString()}. Observation time and cache age unknown.`
+      : 'Refresh quota in Native clients to read the native report.',
+    primary: rows.slice(0, 2),
+    auxiliary: rows.slice(2),
+    credits: reading?.extraUsage
+      ? [
+          {
+            id: 'native-extra-usage',
+            label: 'Extra usage',
+            value: reading.extraUsage.is_enabled ? 'Enabled' : 'Disabled',
+            note: 'Separate from included allowance.',
+          },
+        ]
+      : [],
+    emptyText: 'No subscription allowance was reported. Coding allowance remains unknown.',
+  };
 }

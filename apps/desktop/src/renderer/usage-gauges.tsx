@@ -6,7 +6,7 @@ import './usage-gauges.css';
 export type UsageAmount = NonNullable<Observation['remaining']>;
 
 // The parent decides freshness. This component never promotes a reading to fresh.
-export type UsageReadingState = Window['state'] | 'unavailable';
+export type UsageReadingState = Window['state'] | 'unavailable' | 'reported';
 
 export type UsageReading = {
   // Unique within its card. It is the React key, separate from the raw provider window ID.
@@ -161,14 +161,15 @@ function describe(reading: UsageReading, nowMs: number) {
     usableReserve.value <= 100
       ? usableReserve.value
       : null;
-  const exhausted = known && remaining.value <= 0;
+  const exhausted = known && state !== 'reported' && remaining.value <= 0;
   const atReserve =
     known &&
+    state !== 'reported' &&
     !exhausted &&
     usableReserve !== null &&
     usableReserve.unit === remaining.unit &&
     remaining.value <= usableReserve.value;
-  const dated = state === 'stale' || state === 'reset-pending';
+  const dated = state === 'stale' || state === 'reset-pending' || state === 'reported';
   const observedAt = time(reading.observedAt);
   const resetsAt = time(reading.resetsAt);
   const observed = observedAt === null ? null : nowMs - observedAt;
@@ -188,14 +189,16 @@ function describe(reading: UsageReading, nowMs: number) {
     resetsAt,
     tone: !known ? 'none' : exhausted ? 'exhausted' : atReserve ? 'low' : dated ? 'dated' : 'ok',
     observedText:
-      observed === null
-        ? 'Never observed'
-        : Number.isNaN(observed)
-          ? 'Observation time unreadable'
-          : // A reading can land just after the parent's clock tick. Treat a small lead as now.
-            observed < -60_000
-            ? 'Observation time is ahead of this clock'
-            : `${state === 'fresh' ? 'Observed' : 'Last observed'} ${observed < 60_000 ? 'just now' : `${formatSpan(observed)} ago`}`,
+      state === 'reported'
+        ? 'Observation time and cache age unknown'
+        : observed === null
+          ? 'Never observed'
+          : Number.isNaN(observed)
+            ? 'Observation time unreadable'
+            : // A reading can land just after the parent's clock tick. Treat a small lead as now.
+              observed < -60_000
+              ? 'Observation time is ahead of this clock'
+              : `${state === 'fresh' ? 'Observed' : 'Last observed'} ${observed < 60_000 ? 'just now' : `${formatSpan(observed)} ago`}`,
     resetText:
       resets === null
         ? 'Reset time not reported'
@@ -315,6 +318,12 @@ export function UsageGauge({
         At reserve
       </Chip>,
     );
+  if (reading.state === 'reported')
+    chips.push(
+      <Chip key="reported" tone="dated" icon={<Clock size={11} aria-hidden="true" />}>
+        Age unknown
+      </Chip>,
+    );
   if (reading.state === 'stale')
     chips.push(
       <Chip key="stale" tone="dated" icon={<Clock size={11} aria-hidden="true" />}>
@@ -425,7 +434,7 @@ export function UsageGauge({
               ? reading.state === 'unavailable'
                 ? 'No reading'
                 : 'No usable report'
-              : `${remaining.unit === 'percent' ? '' : `${remaining.unit} `}${view.dated ? 'left when observed' : 'remaining'}`}
+              : `${remaining.unit === 'percent' ? '' : `${remaining.unit} `}${reading.state === 'reported' ? 'reported remaining' : view.dated ? 'left when observed' : 'remaining'}`}
           </span>
         </p>
       </div>
@@ -477,6 +486,7 @@ const flagText: Record<string, string> = {
   exhausted: 'Exhausted',
   low: 'At reserve',
   stale: 'Stale',
+  reported: 'Age unknown',
   'reset-pending': 'Reset pending',
 };
 
@@ -526,7 +536,13 @@ function UsageMeter({
           `${amountDigits(remaining.value)} ${remaining.unit}`
         )}
         {view.known && (
-          <span className="usage-sr-only">{view.dated ? ' left when observed' : ' remaining'}</span>
+          <span className="usage-sr-only">
+            {reading.state === 'reported'
+              ? ' reported remaining, age unknown'
+              : view.dated
+                ? ' left when observed'
+                : ' remaining'}
+          </span>
         )}
       </span>
       <span className="usage-meter-reset">

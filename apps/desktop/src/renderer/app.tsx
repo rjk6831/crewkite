@@ -105,6 +105,7 @@ import { useWorkspace, type Workspace } from './source.ts';
 import { roleLabels } from './templates.ts';
 import { type UsageCard, UsageGauges, type UsageReading } from './usage-gauges.tsx';
 import {
+  anthropicUsageCard,
   nativeUsageClients,
   projectUsagePresentation,
   type UsageGaugeReading,
@@ -2943,6 +2944,40 @@ function Usage({
   const anthropicConnection = snapshot.nativeConnections.find(
     (value) => value.family === 'anthropic',
   );
+  const setAnthropicMessage = (message: string) =>
+    setReaderMessages((current) => ({ ...current, anthropic: message }));
+  const [usageTrust, setUsageTrust] = useState<Snapshot['usageReaders'][number]['trust'] | null>(
+    null,
+  );
+  async function refreshAnthropic(trust?: NonNullable<Snapshot['usageReaders'][number]['trust']>) {
+    setUsageTrust(null);
+    setMetadataBusy((current) => ({ ...current, anthropic: true }));
+    setAnthropicMessage('Reading the native local usage report.');
+    try {
+      const result = await workspace.metadataCommand({
+        command: 'RefreshAnthropicUsage',
+        expectedRevision: 0,
+        payload: trust ? { trust: { scopeHash: trust.scopeHash, nativeTrust: 'accepted' } } : {},
+      });
+      setAnthropicMessage(
+        result.outcome === 'applied' || result.outcome === 'already-applied'
+          ? 'Native usage report retained. Report age is unknown.'
+          : [result.reason ?? result.outcome, result.next].filter(Boolean).join('. '),
+      );
+    } catch (failure) {
+      setAnthropicMessage(failure instanceof Error ? failure.message : 'The usage refresh failed.');
+    } finally {
+      setMetadataBusy((current) => ({ ...current, anthropic: false }));
+    }
+  }
+  async function stopAnthropicUsage(operationId: string) {
+    const result = await workspace.metadataCommand({
+      command: 'StopAnthropicUsage',
+      expectedRevision: 0,
+      payload: { operationId },
+    });
+    setAnthropicMessage(result.reason ?? result.outcome);
+  }
   async function checkAnthropic() {
     setMetadataBusy((current) => ({ ...current, anthropic: true }));
     setReaderMessages((current) => ({ ...current, anthropic: 'Checking Anthropic sign-in.' }));
@@ -3028,6 +3063,8 @@ function Usage({
       .map((reading) => usageReading(reading)),
     emptyText: 'No usage observations.',
   }));
+  const nativeQuota = anthropicUsageCard(snapshot);
+  if (nativeQuota) cards.push(nativeQuota);
   return (
     <main className="usage-page">
       <div className="page-heading">
@@ -3041,6 +3078,38 @@ function Usage({
             : 'Controller observations'}
         </span>
       </div>
+      {usageTrust && (
+        <Dialog title="Trust the native usage command" onClose={() => setUsageTrust(null)}>
+          <p>
+            CrewKite will invoke the pinned native client’s local /usage command. It sends no
+            generation request.
+          </p>
+          <p>
+            Your native client can apply user or administrator policy hooks. Those hooks are covered
+            by this native-client trust.
+          </p>
+          <p>
+            Trust is remembered for this exact client, command and reader policy. A changed scope
+            requires consent again. Sign-in alone does not grant trust.
+          </p>
+          <details>
+            <summary>Command identity</summary>
+            <p>Command: {usageTrust.command}</p>
+            <p>Client checksum: {usageTrust.clientSha256}</p>
+            <p>Scope checksum: {usageTrust.scopeHash}</p>
+          </details>
+          <button type="button" className="button secondary" onClick={() => setUsageTrust(null)}>
+            Cancel
+          </button>
+          <button
+            type="button"
+            className="button primary"
+            onClick={() => void refreshAnthropic(usageTrust)}
+          >
+            Trust and refresh quota
+          </button>
+        </Dialog>
+      )}
       <LocalSetup snapshot={snapshot} workspace={workspace} />
       <GoogleSetup snapshot={snapshot} workspace={workspace} />
       <section aria-labelledby="native-clients-title">
@@ -3063,11 +3132,13 @@ function Usage({
             const quotaAvailable =
               family === 'local'
                 ? 'No cloud quota'
-                : reader?.lastObservedAt
-                  ? 'Reported'
-                  : reader?.available
-                    ? 'Reader ready, not read'
-                    : 'Unknown';
+                : family === 'anthropic' && reader?.reading
+                  ? `Received ${new Date(reader.reading.receivedAt).toLocaleTimeString()} · age unknown`
+                  : reader?.lastObservedAt
+                    ? 'Reported'
+                    : reader?.available
+                      ? 'Reader ready, not read'
+                      : 'Unknown';
             const readerMessage = family === 'local' ? null : readerMessages[family];
             return (
               <section className="card" key={family} aria-label={`${label} client status`}>
@@ -3136,10 +3207,48 @@ function Usage({
                         qualification remain unknown.
                       </p>
                     )}
+                    <button
+                      type="button"
+                      className="button secondary"
+                      disabled={
+                        !connected ||
+                        !reader?.available ||
+                        metadataBusy.anthropic ||
+                        reader.readState === 'intent' ||
+                        reader.readState === 'owned' ||
+                        reader.readState === 'unknown' ||
+                        (nextReadAt !== null && nextReadAt > now)
+                      }
+                      onClick={() =>
+                        reader?.trust?.accepted
+                          ? void refreshAnthropic()
+                          : setUsageTrust(reader?.trust ?? null)
+                      }
+                    >
+                      <RefreshCw size={14} /> Refresh Anthropic quota
+                    </button>
+                    {reader?.operationId &&
+                      (reader.readState === 'intent' || reader.readState === 'owned') && (
+                        <button
+                          type="button"
+                          className="button secondary"
+                          onClick={() => void stopAnthropicUsage(reader.operationId as string)}
+                        >
+                          Stop quota refresh
+                        </button>
+                      )}
                     <p className="muted small">
-                      Standalone quota refresh is unavailable. Usage stays unknown until an
-                      explicitly started task reports it. No prompt is sent to obtain quota.
+                      Invokes the native local /usage command and sends no generation request.
+                      Sign-in does not grant native-client trust. Reported quota can be cached; its
+                      age stays unknown.
                     </p>
+                    {reader?.readReason && <p role="status">Last refresh: {reader.readReason}.</p>}
+                    {nextReadAt !== null && nextReadAt > now && (
+                      <p className="muted small">
+                        Refresh available after {new Date(nextReadAt).toLocaleTimeString()}. Failed
+                        reads also count.
+                      </p>
+                    )}
                   </>
                 ) : family === 'local' ? (
                   <div className="local-usage-copy">

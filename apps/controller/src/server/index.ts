@@ -197,6 +197,8 @@ export async function serve(
                     'ReadGitHub',
                     'StopProjectOperation',
                     'ObserveUsage',
+                    'RefreshAnthropicUsage',
+                    'StopAnthropicUsage',
                     'CheckNativeConnection',
                     'InstallGoogleAcp',
                     'StopGoogleAcpInstall',
