@@ -1254,6 +1254,160 @@ export const RuntimeManifestSchema = z.strictObject({
 });
 export type RuntimeManifest = z.infer<typeof RuntimeManifestSchema>;
 
+export const ProjectCommandRecipeSchema = z.enum(['lint', 'test', 'build']);
+export const ProjectCommandDeadlineSchema = z
+  .number()
+  .int()
+  .min(1000)
+  .max(86400000)
+  .default(900000);
+const commandArgument = z
+  .string()
+  .max(8192)
+  .refine(
+    (value) =>
+      value.isWellFormed() &&
+      !value.includes('\0') &&
+      new TextEncoder().encode(value).byteLength <= 8192,
+  );
+const commandArguments = z
+  .array(commandArgument)
+  .max(128)
+  .refine(
+    (values) =>
+      values.reduce((bytes, value) => bytes + new TextEncoder().encode(value).byteLength, 0) <=
+      65536,
+  );
+const commandEnvironment = z
+  .partialRecord(
+    z.enum(['CI', 'HOME', 'LANG', 'LC_ALL', 'NO_COLOR', 'PATH', 'TMPDIR', 'TZ']),
+    z
+      .string()
+      .max(4096)
+      .refine((value) => value.isWellFormed() && !value.includes('\0')),
+  )
+  .refine(
+    (values) =>
+      Object.entries(values).reduce(
+        (bytes, [key, value]) =>
+          bytes +
+          new TextEncoder().encode(key).byteLength +
+          new TextEncoder().encode(value ?? '').byteLength,
+        0,
+      ) <= 16384,
+  );
+const commandDirectoryRelative = z
+  .string()
+  .min(1)
+  .max(4096)
+  .refine(
+    (value) =>
+      value.isWellFormed() &&
+      new TextEncoder().encode(value).byteLength <= 4096 &&
+      (value === '.' ||
+        (!/[\\:\p{Cc}]/u.test(value) &&
+          !value.startsWith('/') &&
+          value
+            .split('/')
+            .every(
+              (part) =>
+                part.length > 0 && part !== '.' && part !== '..' && part.toLowerCase() !== '.git',
+            ))),
+  );
+const commandExecutable = z
+  .string()
+  .min(1)
+  .max(4096)
+  .refine(
+    (value) =>
+      value.isWellFormed() &&
+      !value.includes('\0') &&
+      new TextEncoder().encode(value).byteLength <= 4096,
+  );
+export const PrepareProjectCommandRequestSchema = z
+  .strictObject({
+    taskId: TaskIdSchema,
+    recipe: ProjectCommandRecipeSchema,
+    executable: commandExecutable,
+    argv: commandArguments,
+    cwdRelative: commandDirectoryRelative.default('.'),
+    environment: commandEnvironment.optional(),
+    deadlineMs: ProjectCommandDeadlineSchema,
+  })
+  .refine((value) => new TextEncoder().encode(JSON.stringify(value)).byteLength <= 262144);
+export const ProjectCommandPreviewSchema = z
+  .strictObject({
+    version: z.literal(1),
+    id: CommandIdSchema,
+    taskId: TaskIdSchema,
+    taskRevision: RevisionSchema,
+    source: SourceSchema,
+    sourceMode: z.literal('committed-head'),
+    repositoryRoot: z.string().min(1).max(4096),
+    scratchRoot: z.string().min(1).max(4096),
+    cwd: z.string().min(1).max(4096),
+    recipe: ProjectCommandRecipeSchema,
+    executable: commandExecutable,
+    executableSha256: HashSchema,
+    executableIdentity: z.literal('verified-prelaunch-sha256'),
+    argv: commandArguments,
+    environment: commandEnvironment,
+    deadlineMs: ProjectCommandDeadlineSchema,
+    nativeTrust: z.literal('required'),
+  })
+  .refine(
+    (value) => new TextEncoder().encode(JSON.stringify(value)).byteLength <= 262144,
+    'Command definition exceeds its encoded limit.',
+  );
+export type ProjectCommandPreview = z.infer<typeof ProjectCommandPreviewSchema>;
+const githubRepository = z.strictObject({
+  host: z.string().regex(/^[a-zA-Z0-9](?:[a-zA-Z0-9.-]{0,251}[a-zA-Z0-9])?$/),
+  owner: z.string().regex(/^(?!\.{1,2}$)[a-zA-Z0-9_.-]{1,100}$/),
+  name: z.string().regex(/^(?!\.{1,2}$)[a-zA-Z0-9_.-]{1,100}$/),
+});
+const githubId = z.string().regex(/^[1-9][0-9]{0,19}$/);
+const githubBinding = {
+  repository: githubRepository,
+  headSha: z.string().regex(/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/),
+};
+export const GitHubReadRequestSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ ...githubBinding, kind: z.literal('pull-request'), pullRequest: githubId }),
+  z.strictObject({
+    ...githubBinding,
+    kind: z.literal('workflow-run'),
+    runId: githubId,
+    attempt: z.number().int().min(1).max(10000),
+  }),
+  z.strictObject({
+    ...githubBinding,
+    kind: z.literal('job-log'),
+    runId: githubId,
+    attempt: z.number().int().min(1).max(10000),
+    jobId: githubId,
+  }),
+]);
+export type GitHubReadRequest = z.infer<typeof GitHubReadRequestSchema>;
+export const TaskOperationSummarySchema = z.strictObject({
+  id: CommandIdSchema,
+  taskId: TaskIdSchema,
+  kind: z.enum(['project-command', 'github-read']),
+  state: z.enum(['prepared', 'running', 'stopping', 'succeeded', 'failed', 'cancelled', 'unknown']),
+  observedAt: TimestampSchema,
+  reason: text.nullable(),
+  next: text.nullable(),
+  definition: ArtifactSchema,
+  stdout: ArtifactSchema.nullable(),
+  stderr: ArtifactSchema.nullable(),
+  result: ArtifactSchema.nullable(),
+});
+export type TaskOperationSummary = z.infer<typeof TaskOperationSummarySchema>;
+export const TaskOperationsRequestSchema = z.strictObject({
+  taskId: TaskIdSchema,
+  beforeId: CommandIdSchema.optional(),
+  limit: z.number().int().min(1).max(20).default(20),
+});
+export type TaskOperationsRequest = z.input<typeof TaskOperationsRequestSchema>;
+
 const actor = z.strictObject({ id: label, kind: z.enum(['desktop', 'cli', 'controller']) });
 const envelope = { protocol: z.literal(1), key: CommandIdSchema, actor };
 const mutation = { ...envelope, expectedRevision: RevisionSchema };
@@ -2335,6 +2489,33 @@ export const CommandSchema = z.discriminatedUnion('command', [
   read('GetTaskPage', TaskPageRequestSchema),
   read('GetTaskActivity', TaskActivityRequestSchema),
   read('GetTaskActivityPage', TaskActivityRequestSchema),
+  read('GetTaskOperations', TaskOperationsRequestSchema),
+  read(
+    'GetProjectOperation',
+    z.strictObject({ taskId: TaskIdSchema, operationId: CommandIdSchema }),
+  ),
+  mutate('PrepareProjectCommand', PrepareProjectCommandRequestSchema),
+  mutate(
+    'StartProjectCommand',
+    z.strictObject({
+      taskId: TaskIdSchema,
+      operationId: CommandIdSchema,
+      definitionHash: HashSchema,
+      grant: GrantSchema.extend({
+        action: z.literal('run-native-tools'),
+        target: HashSchema,
+        revoked: z.literal(false),
+        usesRemaining: z.literal(1),
+      }),
+      sourceConsent: z.literal('explicit'),
+      nativeTrust: z.literal('accepted'),
+    }),
+  ),
+  mutate('ReadGitHub', z.strictObject({ taskId: TaskIdSchema, request: GitHubReadRequestSchema })),
+  mutate(
+    'StopProjectOperation',
+    z.strictObject({ taskId: TaskIdSchema, operationId: CommandIdSchema }),
+  ),
   read(
     'GetArtifactRange',
     z.strictObject({
@@ -3109,8 +3290,73 @@ export const TaskPageSchema = z
 export type ProjectPage = z.infer<typeof ProjectPageSchema>;
 export type TaskPage = z.infer<typeof TaskPageSchema>;
 
+export const TaskOperationsPageSchema = z
+  .strictObject({
+    kind: z.literal('task-operations'),
+    taskId: TaskIdSchema,
+    operations: z.array(TaskOperationSummarySchema).max(20),
+    nextBeforeId: CommandIdSchema.nullable(),
+  })
+  .refine(
+    (page) =>
+      page.operations.every(
+        (operation, index) =>
+          operation.taskId === page.taskId &&
+          (index === 0 || operation.id < page.operations[index - 1].id),
+      ) &&
+      (page.nextBeforeId === null || page.nextBeforeId === page.operations.at(-1)?.id) &&
+      new TextEncoder().encode(JSON.stringify(page)).byteLength <= 524288,
+    'Operation pages need matching ordered identities and bounded bytes.',
+  );
+export const GitHubObservationSchema = z
+  .strictObject({
+    state: z.enum(['complete', 'unavailable', 'cancelled', 'unknown']),
+    status: z
+      .enum([
+        'open',
+        'draft',
+        'closed',
+        'merged',
+        'pending',
+        'passed',
+        'failed',
+        'cancelled',
+        'neutral',
+        'skipped',
+      ])
+      .nullable(),
+    fetchedAt: TimestampSchema,
+    url: z.string().url().max(4096).nullable(),
+    reason: text.nullable(),
+  })
+  .refine((value) =>
+    value.state === 'complete'
+      ? value.status !== null && value.url !== null && value.reason === null
+      : value.status === null && value.url === null && value.reason !== null,
+  );
+export const ProjectOperationDataSchema = z
+  .strictObject({
+    kind: z.literal('project-operation'),
+    operation: TaskOperationSummarySchema,
+    definition: ProjectCommandPreviewSchema.nullable(),
+    githubRequest: GitHubReadRequestSchema.nullable(),
+    githubResult: GitHubObservationSchema.nullable(),
+  })
+  .refine(
+    (value) =>
+      value.operation.kind === 'project-command'
+        ? value.definition !== null &&
+          value.githubRequest === null &&
+          value.githubResult === null &&
+          value.definition.id === value.operation.id &&
+          value.definition.taskId === value.operation.taskId
+        : value.definition === null && value.githubRequest !== null,
+    'Operation detail must match its kind and task identity.',
+  );
 export const ReadDataSchema = z.discriminatedUnion('kind', [
   WorkspaceStateSchema,
+  TaskOperationsPageSchema,
+  ProjectOperationDataSchema,
   ProjectPageSchema,
   TaskPageSchema,
   TaskActivityPageSchema,
@@ -3216,6 +3462,7 @@ export const AttemptOutputSchema = z.union([
   z.strictObject({ ...outputFields, channel: z.literal('acp'), acp: AcpActivitySchema }),
 ]);
 export const EventSchema = z.discriminatedUnion('type', [
+  event('operation.updated', TaskOperationSummarySchema),
   event('combined.updated', CombinedRunPreviewSchema),
   event('conversation.entry', ConversationEntrySchema),
   event('task.created', TaskSchema),

@@ -35,6 +35,7 @@ import {
   FakeWorkerEventSchema,
   FakeWorkerInputSchema,
   formatReviewTarget,
+  GitHubReadRequestSchema,
   GoogleAcpSetupSchema,
   GrantSchema,
   LocalEndpointSchema,
@@ -51,6 +52,9 @@ import {
   NativeRunSchema,
   ObservationSchema,
   PolicySchema,
+  PrepareProjectCommandRequestSchema,
+  ProjectCommandPreviewSchema,
+  ProjectOperationDataSchema,
   parseReviewTarget,
   ReadDataSchema,
   RemainingBudgetsSchema,
@@ -78,6 +82,170 @@ const command = {
 };
 
 test('process boundaries reject unknown fields and invalid command identity', () => {
+  const operationInput = {
+    taskId: `tsk_${suffix}`,
+    recipe: 'test',
+    executable: '/tools/test',
+    argv: [],
+    environment: {},
+  };
+  assert.equal(PrepareProjectCommandRequestSchema.parse(operationInput).deadlineMs, 900000);
+  assert.equal(
+    PrepareProjectCommandRequestSchema.safeParse({ ...operationInput, environment: { CI: '1' } })
+      .success,
+    true,
+  );
+  assert.equal(
+    PrepareProjectCommandRequestSchema.safeParse({
+      ...operationInput,
+      environment: { SECRET: 'x' },
+    }).success,
+    false,
+  );
+  assert.equal(
+    PrepareProjectCommandRequestSchema.safeParse({ ...operationInput, argv: ['界'.repeat(8192)] })
+      .success,
+    false,
+  );
+  assert.equal(
+    PrepareProjectCommandRequestSchema.safeParse({
+      ...operationInput,
+      argv: Array(9).fill('x'.repeat(8192)),
+    }).success,
+    false,
+  );
+  for (const cwdRelative of ['/tmp', '../escape', 'a/../b', 'a\\b', '.git', 'a/./b', 'a\0b'])
+    assert.equal(
+      PrepareProjectCommandRequestSchema.safeParse({ ...operationInput, cwdRelative }).success,
+      false,
+    );
+  assert.equal(
+    PrepareProjectCommandRequestSchema.safeParse({
+      ...operationInput,
+      cwdRelative: 'packages/core',
+    }).success,
+    true,
+  );
+  assert.equal(
+    PrepareProjectCommandRequestSchema.safeParse({ ...operationInput, executable: '/tools/te\0st' })
+      .success,
+    false,
+  );
+  assert.equal(
+    PrepareProjectCommandRequestSchema.safeParse({ ...operationInput, cwdRelative: '\ud800' })
+      .success,
+    false,
+  );
+  assert.equal(
+    PrepareProjectCommandRequestSchema.safeParse({ ...operationInput, executable: '/tools/\ud800' })
+      .success,
+    false,
+  );
+  const operationPreview = ProjectCommandPreviewSchema.parse({
+    version: 1,
+    id: `cmd_${suffix}`,
+    taskId: `tsk_${suffix}`,
+    taskRevision: 0,
+    source: {
+      projectId: `prj_${suffix}`,
+      base: 'a'.repeat(40),
+      branch: 'main',
+      dirtyCount: 0,
+      untrackedCount: 0,
+    },
+    sourceMode: 'committed-head',
+    repositoryRoot: '/repo',
+    scratchRoot: '/scratch',
+    cwd: '/scratch',
+    recipe: 'test',
+    executable: '/tools/test',
+    executableSha256: 'b'.repeat(64),
+    executableIdentity: 'verified-prelaunch-sha256',
+    argv: [],
+    environment: { CI: '1' },
+    deadlineMs: 900000,
+    nativeTrust: 'required',
+  });
+  const operationDetail = {
+    kind: 'project-operation',
+    operation: {
+      id: operationPreview.id,
+      taskId: operationPreview.taskId,
+      kind: 'project-command',
+      state: 'prepared',
+      observedAt: '2026-10-21T00:00:00.000Z',
+      reason: null,
+      next: null,
+      definition: {
+        id: `art_${suffix}`,
+        hash: 'c'.repeat(64),
+        bytes: 1,
+        mediaType: 'application/json',
+      },
+      stdout: null,
+      stderr: null,
+      result: null,
+    },
+    definition: operationPreview,
+    githubRequest: null,
+    githubResult: null,
+  };
+  assert.equal(ProjectOperationDataSchema.safeParse(operationDetail).success, true);
+  assert.equal(
+    ProjectOperationDataSchema.safeParse({ ...operationDetail, definition: null }).success,
+    false,
+  );
+  assert.equal(
+    ProjectOperationDataSchema.safeParse({
+      ...operationDetail,
+      definition: { ...operationPreview, taskId: 'tsk_01ARZ3NDEKTSV4RRFFQ69G5FAW' },
+    }).success,
+    false,
+  );
+  const githubRead = {
+    kind: 'pull-request',
+    repository: { host: 'github.com', owner: 'example', name: 'project' },
+    headSha: 'a'.repeat(64),
+    pullRequest: '1',
+  };
+  assert.equal(GitHubReadRequestSchema.safeParse(githubRead).success, true);
+  assert.equal(
+    GitHubReadRequestSchema.safeParse({
+      ...githubRead,
+      repository: { ...githubRead.repository, host: '-host' },
+    }).success,
+    false,
+  );
+  const operationStart = {
+    ...command,
+    command: 'StartProjectCommand',
+    payload: {
+      taskId: operationPreview.taskId,
+      operationId: operationPreview.id,
+      definitionHash: 'c'.repeat(64),
+      sourceConsent: 'explicit',
+      nativeTrust: 'accepted',
+      grant: {
+        taskId: operationPreview.taskId,
+        action: 'run-native-tools',
+        target: 'c'.repeat(64),
+        revoked: false,
+        usesRemaining: 1,
+        expiresAt: '2026-10-21T00:30:00.000Z',
+      },
+    },
+  };
+  assert.equal(CommandSchema.safeParse(operationStart).success, true);
+  assert.equal(
+    CommandSchema.safeParse({
+      ...operationStart,
+      payload: {
+        ...operationStart.payload,
+        grant: { ...operationStart.payload.grant, usesRemaining: 0 },
+      },
+    }).success,
+    false,
+  );
   const pageStamp = { epoch: 'a'.repeat(32), revision: '0' };
   for (const name of ['GetWorkspaceState', 'GetProjectPage', 'GetTaskPage']) {
     const payload = name === 'GetWorkspaceState' ? {} : { stamp: pageStamp };
