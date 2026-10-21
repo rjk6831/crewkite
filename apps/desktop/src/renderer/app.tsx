@@ -16,6 +16,7 @@ import {
   ProjectSchema,
   requiredReviewMethodIds,
   TaskIdSchema,
+  TaskSchema,
 } from '@crewkite/contracts';
 import { createDemoFixtures } from '@crewkite/testkit';
 import {
@@ -738,6 +739,7 @@ export function App() {
     () => readPreference('crewkite-sidebar-collapsed-v1') === '1',
   );
   const [create, setCreate] = useState(false);
+  const [createProjectId, setCreateProjectId] = useState<string>();
   const [newGoal, setNewGoal] = useState(() => Boolean(pendingGoalProject()));
   const [savedDrafts] = useState(readConversationDrafts);
   const [goalDraft, setGoalDraft] = useState(savedDrafts.goal);
@@ -774,6 +776,10 @@ export function App() {
   const approvalCard = useRef<HTMLElement>(null);
   const [about, setAbout] = useState(false);
   const task = newGoal ? undefined : snapshot?.tasks.find(({ id }) => id === selected);
+  function openCreateTask(projectId?: string) {
+    setCreateProjectId(projectId ?? task?.projectId ?? projects[0]?.id);
+    setCreate(true);
+  }
   const currentConversation =
     task && conversationState?.taskId === task.id && conversationState.revision === task.revision
       ? conversationState
@@ -1003,44 +1009,49 @@ export function App() {
           <span className="nav-text">Search</span>
           <kbd>⌘ K</kbd>
         </button>
-        {collapsed && (
-          <button
-            type="button"
-            className="nav-item"
-            onClick={() => {
-              setNewGoal(true);
-              setPage('tasks');
-            }}
-            disabled={!header}
-            data-tooltip="New task"
-          >
-            <Plus size={16} aria-hidden="true" />
-            <span className="nav-text">New task</span>
-          </button>
-        )}
+        <button
+          type="button"
+          className="nav-item"
+          onClick={() => openCreateTask()}
+          disabled={!header}
+          data-tooltip="New task"
+          aria-label="New task"
+        >
+          <Plus size={16} aria-hidden="true" />
+          <span className="nav-text">New task</span>
+        </button>
         {/* The list stays mounted while the rail shows, so it keeps its scroll position. */}
         <div className="nav-scroll" hidden={collapsed}>
-          <div className="nav-label">
-            WORKSPACE
+          <div className="nav-label">PROJECTS</div>
+          {workspace.canPickProject && (
             <button
               type="button"
-              className="icon-button"
-              onClick={() => {
-                setNewGoal(true);
-                setPage('tasks');
-              }}
-              aria-label="New task"
+              className="add-task"
+              disabled={workspace.pending || connection !== 'connected'}
+              onClick={() => void workspace.pickProject().catch(() => {})}
             >
-              <Plus size={15} />
+              <Folder size={14} />
+              Add project
             </button>
-          </div>
+          )}
           {projects.map((project) => (
             <div key={project.id} className="project-group">
               <div className="project-name">
                 <ChevronRight size={12} className="expanded" />
                 <Folder size={15} />
-                <span>{project.name}</span>
+                <span className="project-title" title={project.name}>
+                  {project.name}
+                </span>
                 <span className="count">{project.taskCount}</span>
+                <button
+                  type="button"
+                  className="icon-button"
+                  aria-label={`New task in ${project.name}`}
+                  title={`New task in ${project.name}`}
+                  onClick={() => openCreateTask(project.id)}
+                >
+                  <Plus size={14} aria-hidden="true" />
+                </button>
               </div>
               {(taskPages[project.id]?.tasks ?? []).map((value) => (
                 <button
@@ -1060,7 +1071,20 @@ export function App() {
                   {value.state === 'waiting' && <span className="notification-dot" />}
                 </button>
               ))}
-              {project.taskCount === 0 && <p className="nav-empty">No tasks yet</p>}
+              {project.taskCount === 0 && (
+                <div>
+                  <p className="nav-empty">No tasks yet</p>
+                  <button
+                    type="button"
+                    className="task-link"
+                    aria-label={`Create first task in ${project.name}`}
+                    onClick={() => openCreateTask(project.id)}
+                  >
+                    <Plus size={14} aria-hidden="true" />
+                    New task
+                  </button>
+                </div>
+              )}
               {project.taskCount > 0 && !taskPages[project.id] && (
                 <button
                   type="button"
@@ -1101,17 +1125,6 @@ export function App() {
               Load more projects
             </button>
           )}
-          {workspace.canPickProject && (
-            <button
-              type="button"
-              className="add-task"
-              disabled={workspace.pending || connection !== 'connected'}
-              onClick={() => void workspace.pickProject().catch(() => {})}
-            >
-              <Folder size={14} />
-              Add project
-            </button>
-          )}
           <button
             type="button"
             className="add-task"
@@ -1122,7 +1135,7 @@ export function App() {
             disabled={!header}
           >
             <Plus size={14} />
-            New task
+            Plan with AI
           </button>
           <button type="button" className="add-task" onClick={() => setPage('usage')}>
             <Gauge size={14} />
@@ -1603,22 +1616,37 @@ export function App() {
                     {tab === 'Handoffs' && <Handoffs events={taskEvents} snapshot={snapshot} />}
                   </div>
                 </>
+              ) : newGoal ? (
+                <>
+                  <p className="muted small" role="status">
+                    New task draft. This unsent planning draft is saved as a task after a successful
+                    send.
+                  </p>
+                  <NewGoal
+                    snapshot={{ ...header, projects }}
+                    workspace={workspace}
+                    registerRetry={registerComposerRetry}
+                    text={goalDraft}
+                    onTextChange={setGoalDraft}
+                    onManual={() => openCreateTask()}
+                    onCreated={(id, submitted) => {
+                      setPage('tasks');
+                      setSelected(id);
+                      setNewGoal(false);
+                      setTab('Conversation');
+                      setGoalDraft((value) => (value === submitted ? '' : value));
+                    }}
+                  />
+                </>
               ) : (
-                <NewGoal
-                  snapshot={{ ...header, projects }}
-                  workspace={workspace}
-                  registerRetry={registerComposerRetry}
-                  text={goalDraft}
-                  onTextChange={setGoalDraft}
-                  onManual={() => setCreate(true)}
-                  onCreated={(id, submitted) => {
-                    setPage('tasks');
-                    setSelected(id);
-                    setNewGoal(false);
-                    setTab('Conversation');
-                    setGoalDraft((value) => (value === submitted ? '' : value));
-                  }}
-                />
+                <Empty icon={<Plus />} title="Create a task">
+                  <p>
+                    Define the outcome and acceptance criteria, then save the task to a project.
+                  </p>
+                  <button type="button" className="button primary" onClick={() => openCreateTask()}>
+                    Define a task
+                  </button>
+                </Empty>
               )}
             </main>
             {roster && snapshot && (
@@ -1651,14 +1679,23 @@ export function App() {
       {create && metadata && (
         <CreateTask
           workspace={workspace}
-          snapshot={metadata}
+          snapshot={{
+            projects: [
+              ...projects,
+              ...(snapshot?.projects.filter(
+                (project) => !projects.some(({ id }) => id === project.id),
+              ) ?? []),
+            ],
+          }}
+          initialProjectId={createProjectId}
           onClose={() => setCreate(false)}
           onCreated={(id) => {
             setSelected(id);
             setNewGoal(false);
             setPage('tasks');
             setCreate(false);
-            setLaunch(true);
+            setCollapsed(false);
+            setTab('Conversation');
           }}
         />
       )}
@@ -1697,10 +1734,7 @@ export function App() {
                 id: 'new-task',
                 label: 'New task',
                 icon: <Plus size={17} />,
-                run: () => {
-                  setNewGoal(true);
-                  setPage('tasks');
-                },
+                run: () => openCreateTask(),
               },
               {
                 id: 'usage',
@@ -3219,11 +3253,13 @@ function Usage({
 function CreateTask({
   workspace,
   snapshot,
+  initialProjectId,
   onClose,
   onCreated,
 }: {
   workspace: Workspace;
   snapshot: Pick<Snapshot, 'projects'>;
+  initialProjectId?: string;
   onClose: () => void;
   onCreated: (id: string) => void;
 }) {
@@ -3231,7 +3267,11 @@ function CreateTask({
   const [title, setTitle] = useState(template?.title ?? '');
   const [outcome, setOutcome] = useState(template?.outcome ?? '');
   const [criteria, setCriteria] = useState(template?.criteria.join('\n') ?? '');
-  const [projectId, setProjectId] = useState(snapshot.projects[0]?.id ?? '');
+  const [projectId, setProjectId] = useState(
+    snapshot.projects.some((project) => project.id === initialProjectId)
+      ? (initialProjectId ?? '')
+      : (snapshot.projects[0]?.id ?? ''),
+  );
   const [message, setMessage] = useState<string | null>(null);
   const payload = {
     projectId,
@@ -3262,12 +3302,13 @@ function CreateTask({
         expectedRevision: 0,
         payload,
       });
+      const saved = TaskSchema.safeParse(result.entity);
       if (
         (result.outcome === 'applied' || result.outcome === 'already-applied') &&
-        result.entity &&
-        'state' in result.entity
+        saved.success &&
+        saved.data.projectId === projectId
       )
-        onCreated(result.entity.id);
+        onCreated(saved.data.id);
       else setMessage(result.next ?? result.reason ?? 'The task could not be created.');
     } catch (failure) {
       setMessage(failure instanceof Error ? failure.message : 'The task could not be created.');

@@ -388,6 +388,15 @@ kbd {
   color: var(--text-muted);
   font-size: 12px;
 }
+.project-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.project-name > svg {
+  flex-shrink: 0;
+}
 .expanded {
   transform: rotate(90deg);
 }
