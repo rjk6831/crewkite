@@ -2225,7 +2225,10 @@ async function conversationBridge(
     assert.equal(explicitPreparation.payload.profileId, 'openai-repository-v1');
     assert.equal('targetPath' in explicitPreparation.payload, false);
     await seededNative.getByRole('button', { name: 'Cancel', exact: true }).click();
-    await page.getByRole('button', { name: 'Prepare run', exact: true }).click();
+    await page
+      .getByRole('tabpanel', { name: 'Plan', exact: true })
+      .getByRole('button', { name: 'Prepare run', exact: true })
+      .click();
     await expect(pendingChooser).toBeVisible();
     await expect(
       pendingChooser.getByRole('combobox', { name: 'Execution authority', exact: true }),
@@ -2237,7 +2240,10 @@ async function conversationBridge(
     await expect(
       page.getByRole('button', { name: 'Retry exact command', exact: true }),
     ).toHaveCount(0);
-    await page.getByRole('button', { name: 'Prepare run', exact: true }).click();
+    await page
+      .getByRole('tabpanel', { name: 'Plan', exact: true })
+      .getByRole('button', { name: 'Prepare run', exact: true })
+      .click();
     await expect(pendingChooser).toBeVisible();
     await expect(
       pendingChooser.getByRole('combobox', { name: 'Execution authority', exact: true }),
@@ -3668,7 +3674,10 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
       'true',
     );
     await page.getByRole('tab', { name: 'Plan', exact: true }).click();
-    await page.getByRole('button', { name: 'Prepare run', exact: true }).click();
+    await page
+      .getByRole('tabpanel', { name: 'Plan', exact: true })
+      .getByRole('button', { name: 'Prepare run', exact: true })
+      .click();
     await enter(
       page
         .getByRole('dialog', { name: 'Choose execution provider', exact: true })
@@ -3963,7 +3972,10 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
       page.getByRole('heading', { name: 'Retain one native file proposal', exact: true }),
     ).toBeVisible();
     await page.getByRole('tab', { name: 'Plan', exact: true }).click();
-    await page.getByRole('button', { name: 'Prepare run', exact: true }).click();
+    await page
+      .getByRole('tabpanel', { name: 'Plan', exact: true })
+      .getByRole('button', { name: 'Prepare run', exact: true })
+      .click();
     const nativeFileProfile = replacementProfiles.find(
       (profile) => profile.id === 'openai-file-v1',
     );
