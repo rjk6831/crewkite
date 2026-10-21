@@ -3,6 +3,7 @@ import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } fr
 import { createConnection, type Socket } from 'node:net';
 import { join } from 'node:path';
 import {
+  ArtifactRangeSchema,
   type Command,
   type CommandResult,
   CommandSchema,
@@ -12,6 +13,8 @@ import {
   ProjectPageSchema,
   type Snapshot,
   type SnapshotScope,
+  TaskActivityOutputPageSchema,
+  type TaskActivityRequest,
   type TaskPageRequest,
   TaskPageSchema,
   type TransportMessage,
@@ -310,7 +313,14 @@ export class ControllerClient {
   }
 
   private read(
-    command: 'GetSnapshot' | 'Subscribe' | 'GetWorkspaceState' | 'GetProjectPage' | 'GetTaskPage',
+    command:
+      | 'GetSnapshot'
+      | 'Subscribe'
+      | 'GetWorkspaceState'
+      | 'GetProjectPage'
+      | 'GetTaskPage'
+      | 'GetArtifactRange'
+      | 'GetTaskActivityPage',
     payload: Record<string, unknown>,
   ): Promise<CommandResult> {
     return this.command(
@@ -363,6 +373,38 @@ export class ControllerClient {
     if (result.outcome !== 'applied' || result.data?.kind !== 'task-page')
       throw this.workspaceFailure(result);
     return TaskPageSchema.parse(result.data);
+  }
+
+  async artifactRange(input: { artifactId: string; offset: number; limit: number }) {
+    const result = await this.read('GetArtifactRange', input);
+    if (result.outcome !== 'applied' || result.data?.kind !== 'artifact-range')
+      throw new Error(`Artifact read unavailable: ${result.reason ?? result.outcome}.`);
+    const range = ArtifactRangeSchema.parse(result.data);
+    if (
+      range.artifact.id !== input.artifactId ||
+      range.offset !== input.offset ||
+      Buffer.from(range.content, 'base64').length > input.limit
+    )
+      throw new Error('Artifact range binding failed.');
+    return range;
+  }
+
+  async taskActivityPage(input: TaskActivityRequest) {
+    const result = await this.read('GetTaskActivityPage', input);
+    if (result.outcome !== 'applied' || result.data?.kind !== 'task-activity-page')
+      throw new Error(`Activity read unavailable: ${result.reason ?? result.outcome}.`);
+    const page = TaskActivityOutputPageSchema.parse(result.data);
+    if (
+      page.taskId !== input.taskId ||
+      page.entries.some(
+        (entry) =>
+          input.beforeCursor !== undefined &&
+          BigInt(entry.kind === 'event' ? entry.event.cursor : entry.cursor) >=
+            BigInt(input.beforeCursor),
+      )
+    )
+      throw new Error('Activity page binding failed.');
+    return page;
   }
 
   async subscribe(
@@ -441,3 +483,5 @@ export async function connectController(options: Options): Promise<ControllerCli
   await client.connect();
   return client;
 }
+
+export { transferArtifact } from './output.ts';

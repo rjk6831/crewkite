@@ -2732,7 +2732,22 @@ async function taskActivityHistory(
     localInputHelper: undefined,
   };
   let runtime = await startController(options);
-  const requests: Array<Extract<Command, { command: 'GetTaskActivity' }>> = [];
+  let heldRange:
+    | {
+        entered: ReturnType<typeof Promise.withResolvers<void>>;
+        release: ReturnType<typeof Promise.withResolvers<void>>;
+      }
+    | undefined;
+  let startupDetail:
+    | {
+        entered: ReturnType<typeof Promise.withResolvers<void>>;
+        release: ReturnType<typeof Promise.withResolvers<void>>;
+      }
+    | undefined;
+  const startupConversation = Promise.withResolvers<void>();
+  let rangeReads = 0;
+  let failNextRange = false;
+  const requests: Array<Extract<Command, { command: 'GetTaskActivityPage' }>> = [];
   let held:
     | {
         taskId: string;
@@ -2751,8 +2766,27 @@ async function taskActivityHistory(
           'taskId' in command.payload,
           'Large workspace clients must read selected task detail only.',
         );
+      if (command.command === 'GetTaskConversationState' && startupDetail)
+        startupConversation.resolve();
       const result = await execute(command, principal);
-      if (command.command === 'GetTaskActivity') {
+      if (command.command === 'GetSnapshot' && startupDetail) {
+        startupDetail.entered.resolve();
+        await startupDetail.release.promise;
+      }
+      if (command.command === 'GetArtifactRange') {
+        rangeReads++;
+        if (failNextRange) {
+          failNextRange = false;
+          return { outcome: 'blocked', reason: 'fixture-output-range-failed' };
+        }
+        const waiting = heldRange;
+        if (waiting) {
+          heldRange = undefined;
+          waiting.entered.resolve();
+          await waiting.release.promise;
+        }
+      }
+      if (command.command === 'GetTaskActivityPage') {
         requests.push(command);
         const waiting = held;
         if (
@@ -2803,7 +2837,7 @@ async function taskActivityHistory(
       at,
       revision: 0,
       type: 'task.updated',
-      payload: { ...blocked, criteria: Array.from({ length: 100 }, () => 'é'.repeat(4096)) },
+      payload: { ...blocked, criteria: Array.from({ length: 100 }, () => '界'.repeat(4096)) },
     }),
   );
   const afterBoundary = append(blocked.id, 'Retained output above the blocked boundary.');
@@ -2827,6 +2861,7 @@ async function taskActivityHistory(
   const seen = new Set<string>();
   const inspectWindow = async () => {
     const text = (await outputs()).map((value) => value.trim());
+    assert(text.length <= 100, 'Rendered history retains only one bounded page.');
     assert(text.every((value) => !value.startsWith('Other task') && !value.startsWith('Global')));
     assert.equal(
       new Set(text).size,
@@ -2947,13 +2982,28 @@ async function taskActivityHistory(
       exact: true,
     });
     await expect(retryRegistration).toBeVisible();
+    startupDetail = {
+      entered: Promise.withResolvers<void>(),
+      release: Promise.withResolvers<void>(),
+    };
     await page.reload();
+    await bounded(startupDetail.entered.promise, 5000, 'Delayed initial task detail');
     await expect(retryRegistration).toBeVisible();
     assert.equal(controllerReceipt(), undefined);
     await page.getByRole('button', { name: 'Add project', exact: true }).click();
     await expect(page.getByRole('alert')).toContainText(
       'Resolve the pending desktop command first.',
     );
+    startupDetail.release.resolve();
+    await bounded(
+      startupConversation.promise,
+      5000,
+      'Automatic conversation read after task detail',
+    );
+    await expect(page.getByRole('alert')).toContainText(
+      'Resolve the pending desktop command first.',
+    );
+    startupDetail = undefined;
     await page.getByRole('button', { name: 'Dismiss error', exact: true }).click();
     await retryRegistration.click();
     await expect(page.getByRole('alert')).toContainText('Choose a readable Git repository root.');
@@ -3018,14 +3068,7 @@ async function taskActivityHistory(
     outstanding = hold(task.id, true);
     await older().press('Enter');
     await bounded(outstanding.entered.promise, 5000, 'Older activity read');
-    const anchor = await activity.locator('.worker-output').evaluateAll((nodes) => {
-      const row = nodes.find((node) => {
-        const bounds = node.getBoundingClientRect();
-        return bounds.top >= 0 && bounds.top < window.innerHeight;
-      });
-      if (!row) throw Error('The older-page action needs a visible existing event anchor.');
-      return { text: row.textContent ?? '', top: row.getBoundingClientRect().top };
-    });
+    const previousWindow = await outputs();
     outstanding.release.resolve();
     outstanding = undefined;
     await expect
@@ -3034,12 +3077,17 @@ async function taskActivityHistory(
         return Math.min(...[...seen].map((value) => Number(value.slice(-4))));
       })
       .toBeLessThan(oldestBefore);
-    await expect
-      .poll(async () => {
-        const bounds = await activity.getByText(anchor.text, { exact: true }).boundingBox();
-        return bounds === null ? Infinity : Math.abs(bounds.y - anchor.top);
-      })
-      .toBeLessThan(3);
+    assert((await outputs()).length <= 100, 'Only one bounded activity page may be retained.');
+    await expect(activity.getByText(marker(359), { exact: true })).toHaveCount(0);
+    await activity.getByRole('button', { name: 'Load newer activity', exact: true }).click();
+    await expect(activity.getByText(marker(359), { exact: true })).toBeVisible();
+    assert.deepEqual(
+      await outputs(),
+      previousWindow,
+      'Cursor return navigation restores the newer page.',
+    );
+    await older().press('Enter');
+    await expect(activity.getByText(marker(359), { exact: true })).toHaveCount(0);
     await inspectWindow();
     for (let pageIndex = 0; pageIndex < original.length && !seen.has(marker(0)); pageIndex++) {
       const before = seen.size;
@@ -3108,21 +3156,73 @@ async function taskActivityHistory(
     await expect(older()).toHaveCount(0);
     await openTask(blocked.title);
     await expect(activity.getByText(afterBoundary.payload.text, { exact: true })).toBeVisible();
-    await older().press('Enter');
-    await expect(activity.getByRole('alert')).toContainText(
-      /too large|size|activity-event-too-large/i,
+    const output = activity.getByRole('region', { name: /^Output / });
+    await expect(output).toHaveCount(1);
+    const originalBody = canonicalJson(oversized);
+    assert(Buffer.byteLength(originalBody) > MAX_FRAME_BYTES);
+    await output.getByRole('button', { name: 'Read output', exact: true }).click();
+    await expect(output.getByText(/Bytes 0-65536 of/)).toBeVisible();
+    const chunks = [(await output.locator('pre').textContent()) ?? ''];
+    let outputPageIndex = 1;
+    while (
+      await output.getByRole('button', { name: 'Next output page', exact: true }).isEnabled()
+    ) {
+      await output.getByRole('button', { name: 'Next output page', exact: true }).click();
+      await expect(
+        output
+          .getByRole('status')
+          .filter({ hasText: new RegExp(`^Bytes ${outputPageIndex * 65536}-`) }),
+      ).toBeVisible();
+      outputPageIndex++;
+      chunks.push((await output.locator('pre').textContent()) ?? '');
+    }
+    assert.equal(
+      chunks.join(''),
+      originalBody,
+      'Sequential output pages preserve UTF-8 seams and all bytes.',
     );
-    await expect(
-      activity.getByText(
-        /beginning of (?:the )?(?:task )?activity|no (?:earlier|older) (?:activity|events)/i,
-      ),
-    ).toHaveCount(0);
-    const blockedRequests = requests.filter((value) => value.payload.taskId === blocked.id);
-    assert(blockedRequests.some((value) => value.payload.beforeCursor === afterBoundary.cursor));
-    assert(
-      !blockedRequests.some((value) => value.payload.beforeCursor === oversized.cursor),
-      'An oversized row must not be skipped.',
+    await expect(output.getByText(/End of retained output/)).toBeVisible();
+    failNextRange = true;
+    await output.getByRole('button', { name: 'Restart output', exact: true }).click();
+    await expect(output.getByRole('alert')).toContainText('fixture-output-range-failed');
+    await output.getByRole('button', { name: 'Retry output page', exact: true }).click();
+    await expect(output.getByText(/Bytes 0-65536 of/)).toBeVisible();
+    assert.equal(
+      await output.locator('pre').textContent(),
+      chunks[0],
+      'A failed restart retries byte zero with a fresh UTF-8 decoder.',
     );
+    const waitingRange = {
+      entered: Promise.withResolvers<void>(),
+      release: Promise.withResolvers<void>(),
+    };
+    heldRange = waitingRange;
+    const beforeVerificationReads = rangeReads;
+    await output.getByRole('button', { name: 'Verify complete output', exact: true }).click();
+    try {
+      await bounded(waitingRange.entered.promise, 5000, 'Held output verification range');
+      await expect(page.getByRole('button', { name: 'Add project', exact: true })).toBeEnabled();
+      const health = await bounded(
+        page.evaluate(() => window.crewkite?.command({ command: 'GetHealth', payload: {} })),
+        5000,
+        'Health while output verification is held',
+      );
+      assert.equal(health?.outcome, 'applied');
+      await output.getByRole('button', { name: 'Cancel verification', exact: true }).click();
+    } finally {
+      waitingRange.release.resolve();
+    }
+    await expect(output.getByRole('status').last()).toContainText(/abort|cancel/i);
+    assert.equal(
+      rangeReads,
+      beforeVerificationReads + 1,
+      'Cancellation must not fetch a second range.',
+    );
+    await output.getByRole('button', { name: 'Verify complete output', exact: true }).click();
+    await expect(output.getByRole('status').last()).toHaveText(
+      'Complete output checksum verified.',
+    );
+    await expect(page.getByRole('button', { name: 'Add project', exact: true })).toBeEnabled();
     await expect(activity.getByText(afterBoundary.payload.text, { exact: true })).toBeVisible();
     const corrupt = append(other.id, 'Retained output after a repaired history.');
     assert(corrupt.type === 'attempt.output');
@@ -3173,7 +3273,9 @@ async function taskActivityHistory(
     await expect(page.getByText('Controller offline', { exact: true })).toBeVisible();
     const restored = new DatabaseSync(join(home, 'state.sqlite'));
     try {
-      restored.exec("DELETE FROM events; DELETE FROM sqlite_sequence WHERE name='events'");
+      restored.exec(
+        "DELETE FROM activity_output; DELETE FROM events; DELETE FROM sqlite_sequence WHERE name='events'",
+      );
     } finally {
       restored.close();
     }
@@ -3194,6 +3296,10 @@ async function taskActivityHistory(
     ).toBeVisible();
     await expect(activity.getByText('Restored home activity', { exact: true })).toBeVisible();
     append(task.id, 'Restored live activity');
+    await expect(
+      activity.getByRole('status').filter({ hasText: 'New activity is available' }),
+    ).toBeVisible();
+    await activity.getByRole('button', { name: 'Jump to latest', exact: true }).click();
     await expect(activity.getByText('Restored live activity', { exact: true })).toBeVisible();
     await expect(activity.getByText(marker(361), { exact: true })).toHaveCount(0);
 
@@ -3204,6 +3310,7 @@ async function taskActivityHistory(
     );
   } finally {
     held?.release.resolve();
+    startupDetail?.release.resolve();
     outstanding?.release.resolve();
     await application.evaluate(() => {
       const state = globalThis as unknown as { activityGraderClient?: ControllerClient };

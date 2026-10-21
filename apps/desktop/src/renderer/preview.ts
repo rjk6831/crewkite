@@ -26,6 +26,7 @@ export function createPreviewSource(): DesktopSource {
   state.tasks = [structuredClone(fixtures.task)];
   const id = createTestIds(DEMO_TIME, 1000n);
   const listeners = new Set<(event: Event) => void>();
+  const history: Event[] = [];
   let cursor = 0n;
   let diff = '';
   function emit(type: Event['type'], payload: unknown, task: Task) {
@@ -41,6 +42,7 @@ export function createPreviewSource(): DesktopSource {
       type,
       payload,
     } as Event;
+    history.push(event);
     for (const listener of listeners) listener(structuredClone(event));
   }
   function update(task: Task, change: Partial<Task>) {
@@ -67,6 +69,24 @@ export function createPreviewSource(): DesktopSource {
       };
     }
     switch (input.command) {
+      case 'GetTaskActivityPage': {
+        const all = history.filter(
+          (event) =>
+            event.taskId === input.payload.taskId &&
+            (!input.payload.beforeCursor ||
+              BigInt(event.cursor) < BigInt(input.payload.beforeCursor)),
+        );
+        const events = all.slice(-input.payload.limit);
+        return {
+          outcome: 'applied',
+          data: {
+            kind: 'task-activity-page',
+            taskId: input.payload.taskId,
+            entries: events.map((event) => ({ kind: 'event' as const, event })),
+            nextBeforeCursor: all.length > events.length ? events[0].cursor : null,
+          },
+        };
+      }
       case 'CreateTask': {
         const created: Task = {
           ...input.payload,

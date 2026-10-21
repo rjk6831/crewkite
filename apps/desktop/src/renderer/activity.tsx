@@ -1,29 +1,28 @@
-import type { Event, Snapshot, Task } from '@crewkite/contracts';
+import type { Event, Snapshot, Task, TaskActivityOutputPage } from '@crewkite/contracts';
 import { Activity, ArrowRight, Circle, GitBranch, ShieldCheck, Terminal } from 'lucide-react';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { effectTarget, familyClass, short, titleCase } from './components.tsx';
+import { OutputView } from './output-view.tsx';
 import type { Workspace } from './source.ts';
 
-function mergeEvents(current: Event[], incoming: Event[]) {
-  const events = new Map(current.map((event) => [event.id, event]));
-  for (const event of incoming) events.set(event.id, event);
-  return [...events.values()].sort((a, b) =>
-    BigInt(a.cursor) < BigInt(b.cursor) ? -1 : BigInt(a.cursor) > BigInt(b.cursor) ? 1 : 0,
-  );
-}
+type ActivityEntry = Event | Exclude<TaskActivityOutputPage['entries'][number], { kind: 'event' }>;
 
 function useActivityHistory(taskId: Task['id'], workspace: Workspace) {
   const { readTaskActivity, activityRevision, events: live } = workspace;
   const section = useRef<HTMLElement>(null);
   const anchor = useRef<{ row: HTMLElement; top: number; panel: HTMLElement } | null>(null);
-  const [events, setEvents] = useState<Event[]>([]);
-  const retained = useRef<Event[]>([]);
+  const [events, setEvents] = useState<ActivityEntry[]>([]);
   const [before, setBefore] = useState<string | null>(null);
   const headCursor = useRef<string | null>(null);
+  const currentCursor = useRef<string | undefined>(undefined);
+  const newer = useRef<Array<string | undefined>>([]);
+  const [newerCount, setNewerCount] = useState(0);
+  const [headChanged, setHeadChanged] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const failed = useRef<string | undefined>(undefined);
+  type Direction = 'head' | 'older' | 'newer';
+  const failed = useRef<{ cursor: string | undefined; direction: Direction } | null>(null);
   const generation = useRef(0);
   const busy = useRef(false);
   const refreshPending = useRef<number | null>(null);
@@ -47,11 +46,16 @@ function useActivityHistory(taskId: Task['id'], workspace: Workspace) {
       saved.panel.scrollTop += saved.row.getBoundingClientRect().top - saved.top;
   });
   const load = useCallback(
-    async (cursor?: string, retry = false) => {
+    async (cursor?: string, retry = false, direction: Direction = 'head') => {
       if (busy.current) return;
       busy.current = true;
       const token = generation.current;
-      const requested = retry ? failed.current : cursor;
+      const moving = retry ? (failed.current?.direction ?? direction) : direction;
+      const requested = retry
+        ? failed.current?.cursor
+        : moving === 'newer'
+          ? newer.current.at(-1)
+          : cursor;
       rememberAnchor();
       setLoading(true);
       setError(null);
@@ -59,22 +63,25 @@ function useActivityHistory(taskId: Task['id'], workspace: Workspace) {
         const page = await readTaskActivity({ taskId, beforeCursor: requested, limit: 100 });
         if (generation.current !== token) return;
         rememberAnchor();
-        // A disjoint head reopens pagination so reconnects cannot hide retained events.
-        const first = page.events[0];
-        const overlaps =
-          first &&
-          headCursor.current !== null &&
-          BigInt(first.cursor) <= BigInt(headCursor.current);
-        if (requested !== undefined || !overlaps) setBefore(page.nextBeforeCursor);
-        if (requested === undefined) headCursor.current = page.events.at(-1)?.cursor ?? null;
-        retained.current = mergeEvents(retained.current, page.events);
-        setEvents(retained.current);
+        const entries = page.entries.map((entry) => (entry.kind === 'event' ? entry.event : entry));
+        if (moving === 'older') newer.current.push(currentCursor.current);
+        else if (moving === 'newer') newer.current.pop();
+        else newer.current = [];
+        if (requested === undefined) {
+          headCursor.current = entries.at(-1)?.cursor ?? null;
+          setHeadChanged(false);
+        }
+        currentCursor.current = requested;
+        setNewerCount(newer.current.length);
+        setBefore(page.nextBeforeCursor);
+        // Retain one bounded server page. Return navigation stores only cursors.
+        setEvents(entries);
         setLoaded(true);
-        failed.current = undefined;
+        failed.current = null;
       } catch (failure) {
         if (generation.current !== token) return;
         rememberAnchor();
-        failed.current = requested;
+        failed.current = { cursor: requested, direction: moving };
         setError(failure instanceof Error ? failure.message : 'Task activity is unavailable.');
       } finally {
         if (generation.current === token) {
@@ -100,16 +107,27 @@ function useActivityHistory(taskId: Task['id'], workspace: Workspace) {
   );
   useEffect(() => {
     if (busy.current) refreshPending.current = activityRevision + refreshTick;
-    else void load();
-  }, [activityRevision, refreshTick, load]);
+    else if (currentCursor.current === undefined) void load();
+    else {
+      rememberAnchor();
+      setHeadChanged(true);
+    }
+  }, [activityRevision, refreshTick, load, rememberAnchor]);
   useEffect(() => {
-    const incoming = live.filter((event) => event.taskId === taskId);
-    if (!incoming.some((event) => !retained.current.some(({ id }) => id === event.id))) return;
+    if (!loaded) return;
+    if (
+      !live.some(
+        (event) =>
+          event.taskId === taskId &&
+          !events.some((known) => known.id === event.id) &&
+          (headCursor.current === null || BigInt(event.cursor) > BigInt(headCursor.current)),
+      )
+    )
+      return;
     rememberAnchor();
-    retained.current = mergeEvents(retained.current, incoming);
-    setEvents(retained.current);
-  }, [live, taskId, rememberAnchor]);
-  return { events, loading, error, loaded, before, load, section };
+    setHeadChanged(true);
+  }, [live, taskId, rememberAnchor, loaded, events]);
+  return { events, loading, error, loaded, before, load, section, newerCount, headChanged };
 }
 
 const eventNames: Record<Event['type'], string> = {
@@ -148,12 +166,10 @@ export function ActivityView({
   task: Task;
   snapshot: Snapshot;
 }) {
-  const { events, loading, error, loaded, before, load, section } = useActivityHistory(
-    task.id,
-    workspace,
-  );
+  const { events, loading, error, loaded, before, load, section, newerCount, headChanged } =
+    useActivityHistory(task.id, workspace);
   const tail = useRef<HTMLDivElement>(null);
-  const visible = events.filter(({ type }) => type !== 'task.updated');
+  const visible = events.filter((event) => 'artifact' in event || event.type !== 'task.updated');
   return (
     <section className="activity-section" ref={section}>
       <div className="section-heading">
@@ -161,8 +177,21 @@ export function ActivityView({
           <Activity size={15} />
           Activity
         </h2>
-        <span>{visible.length} events received</span>
+        <span>{visible.length} events on this page</span>
       </div>
+      {headChanged && (
+        <p role="status">New activity is available. Read the latest page when ready.</p>
+      )}
+      {newerCount > 0 && (
+        <button
+          type="button"
+          className="text-button"
+          disabled={loading}
+          onClick={() => void load(undefined, false, 'newer')}
+        >
+          Load newer activity
+        </button>
+      )}
       {error && <p role="alert">{error}</p>}
       {loading && <p role="status">Loading activity...</p>}
       {error ? (
@@ -179,7 +208,7 @@ export function ActivityView({
           type="button"
           className="text-button"
           disabled={loading}
-          onClick={() => load(before)}
+          onClick={() => load(before, false, 'older')}
         >
           Load older activity
         </button>
@@ -189,6 +218,22 @@ export function ActivityView({
       {visible.length > 0 && (
         <div className="timeline">
           {visible.map((event) => {
+            if ('artifact' in event)
+              return (
+                <article className="timeline-row" key={event.id} data-activity-id={event.id}>
+                  <div className="timeline-content">
+                    <strong>{event.type} · retained output</strong>
+                    <p className="muted small">
+                      Event {event.id} · cursor {event.cursor} · {event.at}
+                    </p>
+                    <OutputView
+                      key={event.artifact.hash}
+                      artifact={event.artifact}
+                      workspace={workspace}
+                    />
+                  </div>
+                </article>
+              );
             const routeId = 'routeId' in event.payload ? event.payload.routeId : null;
             const provider = snapshot.routes.find(({ id }) => id === routeId);
             const output = event.type === 'attempt.output' ? event.payload.text : null;
@@ -280,11 +325,14 @@ export function ActivityView({
           <div ref={tail} />
         </div>
       )}
-      {visible.length > 6 && (
+      {(visible.length > 6 || newerCount > 0 || headChanged) && (
         <button
           type="button"
           className="text-button jump-latest"
-          onClick={() => tail.current?.scrollIntoView({ block: 'end' })}
+          onClick={() => {
+            if (newerCount > 0 || headChanged) void load();
+            else tail.current?.scrollIntoView({ block: 'end' });
+          }}
         >
           Jump to latest
           <ArrowRight size={13} />

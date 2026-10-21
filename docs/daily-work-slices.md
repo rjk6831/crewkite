@@ -2,22 +2,26 @@
 
 I want useful changes in my hands every day or so. I will keep D2b as one milestone and release D2b.1, D2b.2 and subsequent slices independently. Each slice gets its own review, green CI and runnable UAT package. D2c remains available for corrections that need a separate stabilization round. D3 still needs my explicit approval.
 
-The next candidate must close provider connection and project-selection recovery failures first. Large-project handling and GitHub/CI work follow that usable baseline. Practical multi-file changes and project commands follow. Recovery has to hold throughout, and gets a separate acceptance pass before I claim coding parity. Instant History and Optimized Storage stay in scope after the coding workflow.
+D2b.1 has released provider connection and project-selection recovery corrections. Large-project handling and GitHub/CI work follow that usable baseline. Practical multi-file changes and project commands follow. Recovery has to hold throughout, and gets a separate acceptance pass before I claim coding parity. Instant History and Optimized Storage stay in scope after the coding workflow.
 
 ## Start here
 
 This file is the implementation entry point. Read it together with [architecture](architecture.md), [testing](testing.md), [distribution](distribution.md), the [roadmap](roadmap.md) and the repository's current local instructions. Inspect the code and current release evidence before changing anything. A planned capability below is a gap to verify, not an existing feature to assume.
 
-Current slice: D2b.1, workspace and task status pages, with blocking UAT corrections before the next package. [D2 UAT 02](https://github.com/rjk6831/crewkite/releases/tag/d2-uat-02) failed installed UAT and remains available for issue reproduction. Its retained checks, inventory and unquarantined empty-workspace launch evidence do not establish usable provider setup or project registration. The public release marks that failure. No D2b package is qualified yet.
+Current slice: D2b.2, artifact and activity output reads. D2b.1 is released as [D2b UAT 01](https://github.com/rjk6831/crewkite/releases/tag/d2b-uat-01). [D2 UAT 02](https://github.com/rjk6831/crewkite/releases/tag/d2-uat-02) remains marked as failed installed UAT and available for issue reproduction.
 
-[The runtime repair](https://github.com/rjk6831/crewkite/pull/55) passed required CI and merged. It seals staged runtime resources and records the limits of ad-hoc integrity checks. Downloaded first launch still needs its own evidence. The paging and project-recovery branch has a real-controller desktop and CLI proof with 304 tasks and a 1,365,503-byte legacy snapshot. [The paging and recovery repair](https://github.com/rjk6831/crewkite/pull/56) passed required CI with 101 Node claims and one desktop journey and merged. Provider setup integration and a replacement package remain pending.
+The released source is [`db0b8a11a8888b7d09bcea2899aa889e361470b9`](https://github.com/rjk6831/crewkite/commit/db0b8a11a8888b7d09bcea2899aa889e361470b9), merged as [`929f69b1802ea58fc56f5693de664cc56ee04020`](https://github.com/rjk6831/crewkite/commit/929f69b1802ea58fc56f5693de664cc56ee04020) with the same tree, `d336b0572e8ec6543aff906e3acd761e2fbeb81e`. Its [required CI](https://github.com/rjk6831/crewkite/actions/runs/39509480936) passed 109 Node claims and one desktop journey. The real-controller paging proof reached all 304 tasks through desktop and CLI beyond the former 1 MiB snapshot limit.
 
-| Current-slice card | D2b.1 |
+The public ZIP is 196,286,107 bytes with SHA-256 `96e8aaa7da4555a5543c20bd921026e7473702d5712cb2c407a6d35c7046aa40`. Its browser-downloaded bytes matched the archive. Native extraction retained quarantine, and a documented folder-only trust step preceded cold launch and same-home reopen. A disposable D2 UAT 02 upgrade passed migrations 13 to 14, preserved the complete backup and target state, retained Local configuration and recovered the old pending project selection before registering a valid project. The existing installation was unchanged. The [release receipt](https://github.com/rjk6831/crewkite/releases/download/d2b-uat-01/release.json) records these observations. Human UAT is pending. The package is ad-hoc sealed, has no Developer ID signature or notarization, and the isolated cold-launch proof did not repeat native account login.
+
+[D2b.2 implementation](https://github.com/rjk6831/crewkite/pull/60) has passed 111 Node claims and one desktop journey locally. Required CI and package qualification remain pending. Large repository capture, project commands and GitHub operations remain unreleased.
+
+| Current-slice card | D2b.2 |
 |--------------------|-------|
-| Visible result | Open a large workspace, select a task and inspect status through desktop and CLI |
-| Edit boundary | Shared read contracts, store/controller projections, socket client, desktop and CLI navigation, and terminal project-validation refusals |
-| Deferred | Artifact bytes, large activity bodies, repository capture, context selection and compression |
-| Required proof | Complete pages beyond the former 1 MiB snapshot, reconnect and usable Stop; recover an old pending project command and select another folder; matching CI and UAT archive |
+| Visible result | Read complete large artifacts and oversized activity output through bounded pages |
+| Edit boundary | Artifact publication and range reads, activity references, native verification, controller/client wiring and output views |
+| Deferred | Repository capture, context selection, project commands, GitHub operations and compression |
+| Required proof | Complete artifacts above 64 MiB and oversized activity bodies, bounded memory, cancellation/reconnect and usable Stop; matching CI and UAT archive |
 | Entry check | Retained D2 outcomes and current main inspected; preserve existing state, work and source history |
 
 For the next implementation, use this instruction:
@@ -30,11 +34,11 @@ Development can begin against a reviewed frozen interface before its dependency 
 
 OpenAI and Anthropic setup still depends on supported installed clients. The Google correction adds installation of the reviewed official ACP client before its separate authentication flow. Local needs an already loaded compatible model and explicit connection setup. Planning currently uses the supported OpenAI profile; execution roles keep their own provider boundaries.
 
-The failed UAT exposed missing provider readiness, an OpenAI quota read that silently failed, a Google initialization button with no client installation path, and a rejected project selection that remained globally pending across restart. These corrections gate the next candidate. They do not add another daily-work slice.
+The failed UAT exposed missing provider readiness, an OpenAI quota read that silently failed, a Google initialization button with no client installation path, and a rejected project selection that remained globally pending across restart. D2b.1 includes these corrections. They do not add another daily-work slice.
 
 I need one setup view that shows the installed build, observed sign-in state and exact next action for each family. Keep installation, authentication, allowance and coding qualification separate. The Google path must install the reviewed official client and guide personal sign-in without terminal staging. An Anthropic sign-in check must use the native metadata command without a prompt; unavailable standalone quota stays unknown. OpenAI quota refresh must show its result or an actionable failure. Metadata checks cannot block project selection or Stop. Existing uncertain project mutations still need exact reconciliation.
 
-Before another UAT handoff, use a fresh package to open the workspace, connect the supported installed clients, reject an invalid folder, recover the previous pending selection, add a valid project and reopen the same home. Preserve original project files and existing state. Record actual account and device observations separately from offline fixtures.
+For each later UAT handoff, repeat the fresh-package and same-home recovery checks. Record supported-client connection separately from the isolated cold-launch proof, and include invalid-folder refusal, pending-selection recovery and valid project registration. Preserve original project files and existing state. Record actual account and device observations separately from offline fixtures.
 
 ## What exists at the planning baseline
 
@@ -58,8 +62,8 @@ A day is a target for the next usable increment. It includes review and release 
 
 | Slice | Usable result | Depends on | State | Source, CI and UAT evidence |
 |-------|---------------|------------|-------|-----------------------------|
-| D2b.1 | Recover project selection and read large workspace status through complete pages | Retained D2 workflow and current main | Qualification pending | Real desktop and CLI proof: 304 tasks, legacy snapshot 1,365,503 bytes; pending-command restart recovery and required CI passed in PR #56. Replacement package pending |
-| D2b.2 | Read large artifacts and activity output with bounded memory | D2b.1 | Planned | None |
+| D2b.1 | Recover project selection and read large workspace status through complete pages | Retained D2 workflow and current main | Released; human UAT pending | [D2b UAT 01](https://github.com/rjk6831/crewkite/releases/tag/d2b-uat-01): required CI 109+1, exact browser download and installed cold/reopen proof, complete disposable old-home upgrade and project recovery |
+| D2b.2 | Read large artifacts and activity output with bounded memory | D2b.1 | Qualification pending | Focused real-socket 65 MiB artifact verification, exact 1,229,521-byte retained event, cancellation/reopen and bounded desktop navigation passed. Local 111+1 passed in [PR #60](https://github.com/rjk6831/crewkite/pull/60); required CI and replacement qualification pending |
 | D2b.3 | Prepare and retain a project beyond the old source-size limits | D2b.2 | Planned | None |
 | D2b.4 | See GitHub PR, Actions status and full CI logs inside a task | D2b.2 | Planned | None |
 | D2b.5 | Navigate large diffs and select useful context by range | D2b.3 | Planned | None |
@@ -148,6 +152,10 @@ I need to read the complete retained output without allocating it all on each re
 - Stream publication of large content into durable immutable files. Keep the last valid artifact on cancellation or disk failure. Remove the artifact's aggregate 64 MiB read ceiling after its publication and verification path supports the larger bytes.
 - Move large activity bodies behind artifact references while keeping their event identity and order. Define compatibility for already retained oversized events. Page output in the desktop and CLI, with explicit completeness and retrieval failures.
 - Apply backpressure and cancellation. A large read cannot block Stop or unrelated status. Preserve a failed operation and its durable reason without presenting partial output as complete.
+
+The implementation reads at most 64 KiB per artifact request and verifies complete content incrementally in the native client. Legacy buffer APIs keep their 64 MiB cap. A partial text display is explicitly unverified. Activity pages retain the original event identity and exclusive cursor; large bodies use immutable references. The desktop keeps one activity page and cursor-only return navigation. CLI reads honor destination backpressure.
+
+Offline local measurements transferred and checked 129, 257 and 513 MiB fixtures over the authenticated socket in 2.51, 4.41 and 9.22 seconds. Fresh-process peak RSS, including publication and the controller, stayed between 219.6 and 226.3 MiB across those sizes. The 65 MiB fixture took 1.17 seconds with a lower 193.0 MiB peak. These used warm filesystem cache and one collection before the transfer, with no forced collection during it. A 1,229,521-byte SQLite activity body converted in 18-25 ms; a concurrent workspace status read completed in 5-7 ms before conversion finished. SQLite still visits the original body internally. These are local read measurements, with no installed-package performance or real disk-full qualification.
 
 Primary boundaries: `apps/controller/src/artifacts/index.ts`, `apps/controller/src/store/activity.ts`, controller, contracts, client and task output views. This slice leaves repository source capture and provider-context selection unchanged.
 

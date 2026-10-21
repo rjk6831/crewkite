@@ -125,11 +125,17 @@ The command set for the first release:
 | `InitializeGoogleAcp`, `AuthenticateGoogleAcp`, `DiscoverGoogleAcp` | Run one explicit setup operation under the shared Google gate and persisted setup revision; retain safe proof without a task prompt |
 | `StopGoogleAcpSetup` | Revoke the current setup operation by its exact ID and persisted revision, request owned cleanup and retain unresolved ownership |
 | `GetChanges`, `GetArtifact`, `GetUsage` | Bounded reads of immutable content and sourced usage observations |
-| `GetTaskActivity` | Bounded pages of retained task events using an exclusive cursor, with no mutation authority |
+| `GetTaskActivity` | Bounded legacy pages of whole task events using an exclusive cursor, with no mutation authority |
+| `GetTaskActivityPage` | Bounded activity pages with immutable body references for oversized retained events |
+| `GetArtifactRange` | At most 64 KiB of claimed immutable content, explicitly unverified until complete checksum validation |
 | `AcceptCandidate` | Eligible candidate, current authority, an unused destination ref, idempotent publication |
 | `GetHealth`, `ExportDiagnostics` | Controller availability; provider qualification remains profile-specific and diagnostic export remains unsupported |
 
 The controller exposes registered project and artifact IDs. It exposes no arbitrary shell, URL fetch or unrestricted file-read command. Public command payloads accept no connection credential value.
+
+Artifact publication streams bounded chunks into an incoming file, computes SHA256 incrementally and flushes the completed file before publishing its hash. Cancellation or failure preserves existing artifacts. Native range readers verify the complete length and checksum incrementally before returning a whole-content proof. A displayed range supplies no such proof. The bounded legacy buffer APIs retain their 64 MiB ceiling; repository capture and provider-context limits are unchanged.
+
+Large activity rows retain their exact original UTF-8 JSON and cursor. The controller streams SQLite byte substrings to an artifact and commits its mapping only after durable publication. Interrupted conversion can retry after reopen. SQLite still visits the original row internally; this is not incremental SQLite BLOB storage. Oversized subscription history triggers resync and remains accessible through activity pages. The desktop retains one activity page, cursor-only return navigation and one 64 KiB text page per opened body. Native verification and output reads leave Stop and status available. CLI output waits for a slow destination before fetching the next range.
 
 ## State
 

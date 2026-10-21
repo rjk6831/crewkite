@@ -296,7 +296,7 @@ import {
   startReview,
 } from '../providers/openai/review.ts';
 import { chooseRoute } from '../routing/index.ts';
-import { taskActivityPage } from '../store/activity.ts';
+import { activityBodyChunks, taskActivityOutputPage, taskActivityPage } from '../store/activity.ts';
 import { createIds, type IdPrefix } from '../store/ids.ts';
 import {
   type CombinedDispatch,
@@ -937,6 +937,9 @@ export class Controller {
   readonly id: (prefix: IdPrefix) => string;
 
   private artifacts!: ArtifactFiles;
+  private readonly outputAbort = new AbortController();
+  private readonly outputPreparations = new Map<string, Promise<Artifact>>();
+  private readonly outputReads = new Set<Promise<CommandResult>>();
   private evidence!: CandidateEvidence;
   private readonly formatting = new Map<
     string,
@@ -1073,6 +1076,7 @@ export class Controller {
         }
       });
       this.artifacts = new ArtifactFiles(join(this.home, 'artifacts'));
+      this.artifacts.recoverIncoming();
       this.evidence = new CandidateEvidence({
         home: this.home,
         artifacts: this.artifacts,
@@ -1125,6 +1129,15 @@ export class Controller {
         next: 'Send a valid protocol 1 command.',
       };
     const command = parsed.data;
+    if (command.command === 'GetArtifactRange' || command.command === 'GetTaskActivityPage') {
+      const reading = this.readOutput(command);
+      this.outputReads.add(reading);
+      try {
+        return await reading;
+      } finally {
+        this.outputReads.delete(reading);
+      }
+    }
     if (
       [
         'InitializeGoogleAcp',
@@ -1201,6 +1214,81 @@ export class Controller {
     )
       return this.prepareVerificationCommand(command, principal);
     return this.commitCommand(command, principal, preflightFailure);
+  }
+
+  private async readOutput(
+    command: Extract<Command, { command: 'GetArtifactRange' | 'GetTaskActivityPage' }>,
+  ): Promise<CommandResult> {
+    try {
+      if (command.command === 'GetArtifactRange') {
+        const artifact = this.store.get<Artifact>('artifact', command.payload.artifactId);
+        if (!artifact) return { outcome: 'blocked', reason: 'artifact-not-found' };
+        const range = await this.artifacts.readRange(artifact.hash, command.payload);
+        if (range.totalBytes !== artifact.bytes) throw Error('artifact-length-mismatch');
+        return CommandResultSchema.parse({
+          outcome: 'applied',
+          data: {
+            kind: 'artifact-range',
+            artifact,
+            offset: command.payload.offset,
+            encoding: 'base64',
+            content: range.bytes.toString('base64'),
+            eof: range.eof,
+            integrity: 'unverified-range',
+          },
+        });
+      }
+      if (!this.store.get<Task>('task', command.payload.taskId))
+        return { outcome: 'blocked', reason: 'task-not-found' };
+      const data = await taskActivityOutputPage(
+        this.store.db,
+        command.payload,
+        (cursor, eventId, bytes) => this.prepareActivityOutput(cursor, eventId, bytes),
+      );
+      return { outcome: 'applied', data };
+    } catch {
+      return {
+        outcome: 'blocked',
+        reason: 'output-read-unavailable',
+        next: 'Retained output could not be read. No history was skipped. Retry the same page.',
+      };
+    }
+  }
+
+  private prepareActivityOutput(cursor: string, eventId: string, bytes: number): Promise<Artifact> {
+    const pending = this.outputPreparations.get(cursor);
+    if (pending) return pending;
+    const preparing = (async () => {
+      const mapping = this.store.db
+        .prepare('SELECT event_id,artifact_id FROM activity_output WHERE cursor=?')
+        .get(BigInt(cursor));
+      if (mapping) {
+        const artifact = this.store.get<Artifact>('artifact', mapping.artifact_id as string);
+        if (mapping.event_id !== eventId || !artifact || artifact.bytes !== bytes)
+          throw Error('activity-output-invalid');
+        return artifact;
+      }
+      const published = await this.artifacts.publishStream(
+        activityBodyChunks(this.store.db, cursor, eventId, bytes, this.outputAbort.signal),
+        { signal: this.outputAbort.signal },
+      );
+      this.outputAbort.signal.throwIfAborted();
+      const artifact = ArtifactSchema.parse({
+        id: this.id('art'),
+        ...published,
+        mediaType: 'application/vnd.crewkite.event+json',
+      });
+      this.store.transaction(() => {
+        this.store.put('artifact', artifact.id, 0, artifact);
+        this.store.db
+          .prepare('INSERT INTO activity_output(cursor,event_id,artifact_id) VALUES (?,?,?)')
+          .run(BigInt(cursor), eventId, artifact.id);
+      });
+      return artifact;
+    })();
+    this.outputPreparations.set(cursor, preparing);
+    void preparing.finally(() => this.outputPreparations.delete(cursor)).catch(() => {});
+    return preparing;
   }
 
   private commitCommand(
@@ -2795,6 +2883,8 @@ export class Controller {
     for (const cancel of this.quotaRetries.values()) cancel();
     this.quotaRetries.clear();
     const native: Promise<unknown>[] = [];
+    this.outputAbort.abort();
+    native.push(...this.outputReads);
     const connectionClosing = this.connectionChecks?.close();
     if (connectionClosing) native.push(connectionClosing);
     const installClosing = this.googleInstallOperation?.close();

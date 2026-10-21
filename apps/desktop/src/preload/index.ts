@@ -1,5 +1,7 @@
 import type { ConversationContextCapture, DesktopSource } from '@crewkite/client';
 import {
+  ArtifactSchema,
+  ArtifactVerificationSchema,
   CommandIdSchema,
   CommandResultSchema,
   DesktopNoticeSchema,
@@ -61,6 +63,16 @@ const readPage = async (
   return result.data;
 };
 const bridge: DesktopSource = {
+  verifyArtifact: async (input) =>
+    ArtifactVerificationSchema.parse(
+      await ipcRenderer.invoke('crewkite:verify-artifact', {
+        requestId: input.requestId,
+        artifact: ArtifactSchema.parse(input.artifact),
+      }),
+    ),
+  cancelArtifactVerification: async (requestId) => {
+    await ipcRenderer.invoke('crewkite:cancel-artifact-verification', requestId);
+  },
   getSnapshot: async (scope) =>
     SnapshotSchema.parse(await ipcRenderer.invoke('crewkite:snapshot', scope)),
   workspaceState: async () => WorkspaceStateSchema.parse(await readPage('GetWorkspaceState', {})),

@@ -1,5 +1,8 @@
 import {
+  type Artifact,
+  ArtifactRangeSchema,
   ArtifactSchema,
+  ArtifactVerificationSchema,
   CONVERSATION_CONTEXT_MEDIA_TYPE,
   CommandIdSchema,
   type CommandResult,
@@ -18,7 +21,7 @@ import {
   ProjectPageSchema,
   type Snapshot,
   SnapshotSchema,
-  TaskActivityPageSchema,
+  TaskActivityOutputPageSchema,
   type TaskActivityRequest,
   TaskActivityRequestSchema,
   type TaskPage,
@@ -148,7 +151,6 @@ export function useWorkspace() {
   const selectedTask = useRef<string | null>(null);
   const detailCache = useRef(new Map<string, Snapshot>());
   const headerRef = useRef<WorkspaceState | null>(null);
-  const commandBarrier = useRef<Promise<void>>(Promise.resolve());
   const activityTail = useRef<Promise<unknown>>(Promise.resolve());
   const pageRead = useRef(false);
   const pageTail = useRef<Promise<unknown>>(Promise.resolve());
@@ -284,26 +286,23 @@ export function useWorkspace() {
     (input: Omit<TaskActivityRequest, 'limit'> & { limit?: number }) => {
       const read = async () => {
         if (!source) throw new Error('The desktop bridge is unavailable.');
-        for (;;) {
-          const pendingCommand = commandBarrier.current;
-          await pendingCommand;
-          if (pendingCommand === commandBarrier.current) break;
-        }
         const request = TaskActivityRequestSchema.parse(input);
         const result = CommandResultSchema.parse(
-          await source.command({ command: 'GetTaskActivity', payload: request }),
+          await source.command({ command: 'GetTaskActivityPage', payload: request }),
         );
         if (result.outcome !== 'applied' && result.outcome !== 'already-applied')
           throw new Error([result.reason ?? result.outcome, result.next].filter(Boolean).join(' '));
-        const parsed = TaskActivityPageSchema.safeParse(result.data);
+        const parsed = TaskActivityOutputPageSchema.safeParse(result.data);
         if (!parsed.success)
           throw new Error('Task activity is unavailable: the retained page is invalid.');
         const page = parsed.data;
         if (
           page.taskId !== request.taskId ||
           (request.beforeCursor !== undefined &&
-            page.events.some(
-              (event) => BigInt(event.cursor) >= BigInt(request.beforeCursor ?? '0'),
+            page.entries.some(
+              (entry) =>
+                BigInt(entry.kind === 'event' ? entry.event.cursor : entry.cursor) >=
+                BigInt(request.beforeCursor ?? '0'),
             ))
         )
           throw new Error('Task activity is unavailable: the page does not match the request.');
@@ -312,6 +311,41 @@ export function useWorkspace() {
       const result = activityTail.current.then(read);
       activityTail.current = result.catch(() => {});
       return result;
+    },
+    [source],
+  );
+  const readArtifactRange = useCallback(
+    async (artifact: Artifact, offset: number) => {
+      if (!source) throw new Error('The desktop bridge is unavailable.');
+      const result = CommandResultSchema.parse(
+        await source.command({
+          command: 'GetArtifactRange',
+          payload: { artifactId: artifact.id, offset, limit: 65536 },
+        }),
+      );
+      if (result.outcome !== 'applied') throw new Error(result.reason ?? 'Output is unavailable.');
+      const page = ArtifactRangeSchema.parse(result.data);
+      if (page.offset !== offset || canonicalJson(page.artifact) !== canonicalJson(artifact))
+        throw new Error('The output identity changed.');
+      return page;
+    },
+    [source],
+  );
+  const verifyArtifact = useCallback(
+    async (requestId: string, artifact: Artifact) => {
+      if (!source?.verifyArtifact) throw new Error('Output verification is unavailable.');
+      const proof = ArtifactVerificationSchema.parse(
+        await source.verifyArtifact({ requestId, artifact }),
+      );
+      if (proof.hash !== artifact.hash || proof.bytes !== artifact.bytes)
+        throw new Error('Output verification identity changed.');
+      return proof;
+    },
+    [source],
+  );
+  const cancelArtifactVerification = useCallback(
+    async (requestId: string) => {
+      await source?.cancelArtifactVerification?.(requestId);
     },
     [source],
   );
@@ -542,13 +576,13 @@ export function useWorkspace() {
       stopNotices?.();
     };
   }, [source, refresh]);
-  const track = useCallback(async <T>(action: () => Promise<T>): Promise<T> => {
+  const track = useCallback(async <T>(action: () => Promise<T>, reportError = true): Promise<T> => {
     setPending((value) => value + 1);
-    setError(null);
+    if (reportError) setError(null);
     try {
       return await action();
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : 'The command failed.');
+      if (reportError) setError(failure instanceof Error ? failure.message : 'The command failed.');
       throw failure;
     } finally {
       setPending((value) => value - 1);
@@ -557,6 +591,7 @@ export function useWorkspace() {
   const perform = useCallback(
     <T extends CommandResult | ConversationContextCapture | null>(
       action: () => Promise<T>,
+      reportError = true,
     ): Promise<T> =>
       track(async () => {
         const value = await action();
@@ -569,25 +604,26 @@ export function useWorkspace() {
                 : CommandResultSchema.parse(value.result)
               : CommandResultSchema.parse(value);
         if (!result) return value;
-        if (result.outcome !== 'applied' && result.outcome !== 'already-applied') {
+        if (reportError && result.outcome !== 'applied' && result.outcome !== 'already-applied') {
           setError([result.reason ?? result.outcome, result.next].filter(Boolean).join(' '));
         }
         try {
           await refresh();
         } catch (failure) {
-          setError(
-            [
-              `Command outcome: ${result.outcome}.`,
-              result.reason,
-              result.next,
-              `Workspace refresh failed: ${failure instanceof Error ? failure.message : 'reconnect to recover current state.'}`,
-            ]
-              .filter(Boolean)
-              .join(' '),
-          );
+          if (reportError)
+            setError(
+              [
+                `Command outcome: ${result.outcome}.`,
+                result.reason,
+                result.next,
+                `Workspace refresh failed: ${failure instanceof Error ? failure.message : 'reconnect to recover current state.'}`,
+              ]
+                .filter(Boolean)
+                .join(' '),
+            );
         }
         return value;
-      }),
+      }, reportError),
     [refresh, track],
   );
   const metadataCommand = useCallback(
@@ -633,22 +669,10 @@ export function useWorkspace() {
         input.command === 'StopGoogleAcpSetup'
       )
         return metadataCommand(input);
+      const reportError =
+        input.command !== 'GetTaskConversationState' && input.command !== 'GetTaskConversation';
       return perform(async () => {
         if (!source) throw new Error('The desktop bridge is unavailable.');
-        if (
-          input.command === 'GetTaskConversationState' ||
-          input.command === 'GetTaskConversation'
-        ) {
-          const completion = Promise.withResolvers<void>();
-          commandBarrier.current = Promise.all([commandBarrier.current, completion.promise]).then(
-            () => {},
-          );
-          try {
-            return await source.command(input);
-          } finally {
-            completion.resolve();
-          }
-        }
         if (input.command !== 'StartRun' && input.command !== 'StopRun')
           return source.command(input);
         const token = Symbol();
@@ -658,7 +682,7 @@ export function useWorkspace() {
         } finally {
           setPendingRuns((current) => current.filter((value) => value.token !== token));
         }
-      });
+      }, reportError);
     },
     [source, perform, metadataCommand],
   );
@@ -748,6 +772,9 @@ export function useWorkspace() {
     readTaskPage,
     events,
     readTaskActivity,
+    readArtifactRange,
+    verifyArtifact,
+    cancelArtifactVerification,
     activityRevision,
     connection,
     preview,

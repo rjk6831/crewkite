@@ -13,6 +13,7 @@ import {
   type Event,
   EventSchema,
   GoogleAcpSetupSchema,
+  MAX_FRAME_BYTES,
   ReviewJobSchema,
   type Route,
   type Run,
@@ -438,11 +439,21 @@ export class Store {
 
   eventsAfter(cursor: string): Event[] {
     if (BigInt(cursor) > BigInt(this.cursor())) throw new Error('history-gap');
+    const budget = MAX_FRAME_BYTES - 4096;
     const rows = this.db
-      .prepare('SELECT body FROM events WHERE cursor>? ORDER BY cursor LIMIT 1001')
-      .all(BigInt(cursor));
-    if (rows.length > 1000) throw new Error('history-gap');
-    return rows.map((row) => EventSchema.parse(JSON.parse(row.body as string)));
+      .prepare(`SELECT length(CAST(body AS BLOB)) AS bytes,
+      CASE WHEN length(CAST(body AS BLOB))<=? THEN body END AS body
+      FROM events WHERE cursor>? ORDER BY cursor LIMIT 1001`)
+      .iterate(budget, BigInt(cursor));
+    const events: Event[] = [];
+    let bytes = 0;
+    for (const row of rows) {
+      if (events.length === 1000 || row.body === null || bytes + (row.bytes as number) > budget)
+        throw new Error('history-gap');
+      bytes += row.bytes as number;
+      events.push(EventSchema.parse(JSON.parse(row.body as string)));
+    }
+    return events;
   }
 
   intents(): LaunchIntent[] {

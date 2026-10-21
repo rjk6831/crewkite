@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { connectController, readControllerEndpoint } from '@crewkite/client/node';
 import {
   CommandSchema,
   type Event,
@@ -13,12 +15,14 @@ import {
   type TaskActivityRequest,
   TaskActivityRequestSchema,
 } from '@crewkite/contracts';
+import { transferArtifact } from '../../../../packages/client/src/output.ts';
 import { Controller } from '../commands/controller.ts';
+import { serve } from '../server/index.ts';
 import { taskActivityPage } from './activity.ts';
 import { Store } from './index.ts';
 
 test('task activity pages retain every whole event across cursor and byte boundaries', async (t) => {
-  const directory = mkdtempSync(join(resolve('internal'), 'activity-page-test-'));
+  const directory = mkdtempSync(join(tmpdir(), 'ck-activity-'));
   const path = join(directory, 'state.sqlite');
   let store = new Store(path);
   let controller: Controller | undefined;
@@ -180,7 +184,7 @@ test('task activity pages retain every whole event across cursor and byte bounda
       at: original[0].at,
       revision: 0,
       type: 'task.updated',
-      payload: { ...task, criteria: Array.from({ length: 100 }, () => 'é'.repeat(4096)) },
+      payload: { ...task, criteria: Array.from({ length: 100 }, () => '界'.repeat(4096)) },
     }),
   );
   assert.throws(() => read(), /activity-event-too-large/);
@@ -189,6 +193,96 @@ test('task activity pages retain every whole event across cursor and byte bounda
     reason: 'activity-event-too-large',
     next: 'One retained event exceeds the page size. No history was skipped.',
   });
+  const outputResult = await controller.execute(
+    { ...envelope, command: 'GetTaskActivityPage', payload: { taskId: task.id, limit: 1 } },
+    'local-owner',
+  );
+  assert.equal(outputResult.outcome, 'applied');
+  assert.equal(outputResult.data?.kind, 'task-activity-page');
+  if (outputResult.data?.kind !== 'task-activity-page') throw Error('Missing output page.');
+  const reference = outputResult.data.entries[0];
+  assert.equal(reference.kind, 'event-body');
+  if (reference.kind !== 'event-body') throw Error('Missing event body reference.');
+  assert.equal(reference.id, tooLarge.id);
+  assert.equal(reference.cursor, tooLarge.cursor);
+  const chunks: Buffer[] = [];
+  await transferArtifact(
+    reference.artifact,
+    async (payload) => {
+      assert(controller);
+      const result = await controller.execute(
+        { ...envelope, command: 'GetArtifactRange', payload },
+        'local-owner',
+      );
+      if (result.data?.kind !== 'artifact-range') throw Error('Missing event body range.');
+      return result.data;
+    },
+    (bytes) => {
+      chunks.push(Buffer.from(bytes));
+    },
+  );
+  assert.equal(
+    Buffer.concat(chunks).toString(),
+    store.db.prepare('SELECT body FROM events WHERE event_id=?').get(tooLarge.id)?.body,
+  );
+  assert.equal(outputResult.data.nextBeforeCursor, tooLarge.cursor);
+  const following = await controller.execute(
+    {
+      ...envelope,
+      command: 'GetTaskActivityPage',
+      payload: { taskId: task.id, beforeCursor: tooLarge.cursor, limit: 1 },
+    },
+    'local-owner',
+  );
+  assert.equal(following.data?.kind, 'task-activity-page');
+  if (following.data?.kind === 'task-activity-page')
+    assert.deepEqual(following.data.entries, [{ kind: 'event', event: highEvent }]);
+  const server = await serve(controller);
+  const client = await connectController({
+    ...readControllerEndpoint(directory),
+    actor: { id: 'terminal', kind: 'cli' },
+  });
+  const gap = Promise.withResolvers<void>();
+  try {
+    await client.subscribe(
+      '0',
+      () => {},
+      () => assert.fail('Workspace recovery cannot request a global snapshot.'),
+      {
+        resync: 'workspace',
+        onResync: (header) => {
+          assert.equal(header.kind, 'workspace-state');
+          gap.resolve();
+        },
+      },
+    );
+    await gap.promise;
+    assert.equal((await client.workspaceState()).kind, 'workspace-state');
+  } finally {
+    client.close();
+    await server.close();
+  }
+  store.db.prepare('DELETE FROM activity_output WHERE event_id=?').run(tooLarge.id);
+  const interrupted = controller.execute(
+    { ...envelope, command: 'GetTaskActivityPage', payload: { taskId: task.id, limit: 1 } },
+    'local-owner',
+  );
+  await controller.close();
+  assert.equal((await interrupted).reason, 'output-read-unavailable');
+  controller = new Controller({
+    home: directory,
+    nativeProfiles: () => [],
+    googleUsageClient: () => ({ available: false, reason: 'client-unavailable' }),
+  });
+  store = controller.store;
+  assert.equal(store.db.prepare('SELECT count(*) AS count FROM activity_output').get()?.count, 0);
+  const retried = await controller.execute(
+    { ...envelope, command: 'GetTaskActivityPage', payload: { taskId: task.id, limit: 1 } },
+    'local-owner',
+  );
+  assert.equal(retried.data?.kind, 'task-activity-page');
+  store.db.prepare('DELETE FROM activity_output WHERE event_id=?').run(tooLarge.id);
+
   assert.deepEqual(read(tooLarge.cursor, 1).events, [highEvent]);
   const afterLarge = append(task.id, 'A small event after the oversized row.');
   const boundary = read();

@@ -45,6 +45,10 @@ Task show and watch snapshots include the current task's pending approvals and n
 
 `task list --json` retains the legacy `{ cursor, tasks }` object with full task records. It uses the existing global snapshot and its frame limit; large workspaces can exceed that limit.
 
+`task activity <task-id> [--before-cursor cursor]` emits bounded activity page objects until the beginning of retained history. Large bodies appear as `event-body` references with their original event identity and an artifact. No event is omitted to fit a page. A failed read exits with an error; retry the last requested cursor.
+
+Use `artifact read <artifact-id>` for sequential text display, or add `--json` for base64 range objects followed by a complete checksum proof. Each range is explicitly unverified. A checksum failure leaves received ranges visible and exits with an error. `artifact verify <artifact-id>` checks the complete content without displaying it. `artifact save <artifact-id> --output new-file` stages the content and creates the destination only after exact length and SHA256 verification. Existing destinations are preserved. These commands use bounded range requests and accept retained content above 64 MiB.
+
 Other `--json` reads and actions produce one JSON object. Watch emits one object per line, beginning with its task snapshot. A fresh snapshot replaces that state after a history gap. Ctrl+C stops watching.
 
 Watch retains its cursor while the controller is offline. If the bounded reconnect window ends, it prints the next action and exits with status 1. Start the controller and run watch again to reconnect explicitly.

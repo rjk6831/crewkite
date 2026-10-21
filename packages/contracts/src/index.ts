@@ -1264,7 +1264,7 @@ export const TaskActivityRequestSchema = z.strictObject({
   beforeCursor: CursorSchema.optional(),
   limit: z.number().int().min(1).max(100).default(100),
 });
-export type TaskActivityRequest = z.infer<typeof TaskActivityRequestSchema>;
+export type TaskActivityRequest = z.input<typeof TaskActivityRequestSchema>;
 const mutate = <T extends string, S extends z.ZodType>(command: T, payload: S) =>
   z.strictObject({ ...mutation, command: z.literal(command), payload });
 const empty = z.strictObject({});
@@ -2334,6 +2334,15 @@ export const CommandSchema = z.discriminatedUnion('command', [
   read('GetProjectPage', ProjectPageRequestSchema),
   read('GetTaskPage', TaskPageRequestSchema),
   read('GetTaskActivity', TaskActivityRequestSchema),
+  read('GetTaskActivityPage', TaskActivityRequestSchema),
+  read(
+    'GetArtifactRange',
+    z.strictObject({
+      artifactId: ArtifactIdSchema,
+      offset: RevisionSchema,
+      limit: z.number().int().min(1).max(65536),
+    }),
+  ),
   read('Subscribe', z.strictObject({ after: CursorSchema })),
   read('GetChanges', taskRef),
   read(
@@ -2905,6 +2914,85 @@ export const TaskActivityPageSchema = z
       context.addIssue({ code: 'custom', message: 'An activity page exceeds its byte limit.' });
   });
 export type TaskActivityPage = z.infer<typeof TaskActivityPageSchema>;
+export const ArtifactRangeSchema = z
+  .strictObject({
+    kind: z.literal('artifact-range'),
+    artifact: ArtifactSchema,
+    offset: RevisionSchema,
+    encoding: z.literal('base64'),
+    content: z.string().max(87384),
+    eof: z.boolean(),
+    integrity: z.literal('unverified-range'),
+  })
+  .refine((value) => {
+    const content = value.content;
+    if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(content))
+      return false;
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    if (
+      (content.endsWith('==') && (alphabet.indexOf(content.at(-3) ?? '') & 15) !== 0) ||
+      (content.endsWith('=') &&
+        !content.endsWith('==') &&
+        (alphabet.indexOf(content.at(-2) ?? '') & 3) !== 0)
+    )
+      return false;
+    const bytes =
+      (content.length / 4) * 3 - (content.endsWith('==') ? 2 : content.endsWith('=') ? 1 : 0);
+    return (
+      bytes <= 65536 &&
+      value.offset + bytes <= value.artifact.bytes &&
+      value.eof === (value.offset + bytes === value.artifact.bytes) &&
+      (bytes > 0 || value.eof)
+    );
+  }, 'Artifact ranges need canonical bounded bytes and exact length.');
+export const ArtifactVerificationSchema = z.strictObject({
+  integrity: z.literal('whole-verified'),
+  hash: HashSchema,
+  bytes: RevisionSchema,
+});
+export type ArtifactRange = z.infer<typeof ArtifactRangeSchema>;
+export const ActivityBodyReferenceSchema = z.strictObject({
+  kind: z.literal('event-body'),
+  id: EventIdSchema,
+  cursor: CursorSchema,
+  taskId: TaskIdSchema,
+  at: TimestampSchema,
+  revision: RevisionSchema,
+  type: z
+    .string()
+    .min(1)
+    .max(100)
+    .refine((type) => EventSchema.options.some((event) => event.shape.type.value === type)),
+  artifact: ArtifactSchema,
+});
+export const TaskActivityOutputPageSchema = z
+  .strictObject({
+    kind: z.literal('task-activity-page'),
+    taskId: TaskIdSchema,
+    entries: z
+      .array(
+        z.discriminatedUnion('kind', [
+          z.strictObject({ kind: z.literal('event'), event: z.lazy(() => EventSchema) }),
+          ActivityBodyReferenceSchema,
+        ]),
+      )
+      .max(100),
+    nextBeforeCursor: CursorSchema.nullable(),
+  })
+  .refine((page) => {
+    const identities = page.entries.map((entry) => (entry.kind === 'event' ? entry.event : entry));
+    return (
+      identities.every(
+        (entry, index) =>
+          entry.taskId === page.taskId &&
+          (index === 0 || BigInt(entry.cursor) > BigInt(identities[index - 1].cursor)),
+      ) &&
+      new Set(identities.map((entry) => entry.id)).size === identities.length &&
+      (page.nextBeforeCursor === null || page.nextBeforeCursor === identities[0]?.cursor) &&
+      new TextEncoder().encode(JSON.stringify(page)).byteLength <= MAX_TASK_ACTIVITY_PAGE_BYTES
+    );
+  }, 'Activity output needs ordered distinct identities and bounded pages.');
+export type TaskActivityOutputPage = z.infer<typeof TaskActivityOutputPageSchema>;
 export const MAX_WORKSPACE_PAGE_BYTES = 524288;
 export const WorkspaceStateSchema = z
   .strictObject({
@@ -3026,6 +3114,8 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
   ProjectPageSchema,
   TaskPageSchema,
   TaskActivityPageSchema,
+  ArtifactRangeSchema,
+  TaskActivityOutputPageSchema,
   z.strictObject({ kind: z.literal('conversation-state'), state: TaskConversationStateSchema }),
   ConversationPageSchema,
   z.strictObject({ kind: z.literal('google-acp-setup'), setup: GoogleAcpSetupSchema }),

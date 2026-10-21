@@ -508,6 +508,8 @@ test('held metadata leaves stop replies reachable on the same authenticated sock
   });
   t.after(() => rmSync(socketRoot, { recursive: true, force: true }));
   for (const [kind, payload] of [
+    ['GetArtifactRange', { artifactId: 'art_01ARZ3NDEKTSV4RRFFQ69G5FAV', offset: 0, limit: 65536 }],
+    ['GetTaskActivityPage', { taskId: 'tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV', limit: 100 }],
     ['ObserveUsage', { family: 'google' }],
     ['CheckNativeConnection', { family: 'anthropic', consent: 'explicit' }],
     ['InstallGoogleAcp', { profileId: 'google-acp-v1', consent: 'explicit' }],
@@ -569,7 +571,15 @@ test('held metadata leaves stop replies reachable on the same authenticated sock
       actor: { id: 'terminal', kind: 'cli' },
     });
     try {
-      const metadata = client.command(CommandSchema.parse(command(kind, payload, 0)));
+      const metadata = client.command(
+        CommandSchema.parse(
+          command(
+            kind,
+            payload,
+            kind === 'GetArtifactRange' || kind === 'GetTaskActivityPage' ? undefined : 0,
+          ),
+        ),
+      );
       await entered.promise;
       const current = controller.store.get<Task>('task', task.id);
       assert(current);
@@ -4727,7 +4737,7 @@ test('an appointed native proposal is retained and applied once after every phas
         ),
       );
       controller.store.db.exec(
-        'INSERT INTO native_processes SELECT * FROM native_processes_saved; DROP TABLE native_processes_saved; DROP TABLE combined_ref_intents; DROP TABLE combined_dispatches; DROP TABLE combined_members; DROP TABLE combined_groups; DROP TABLE conversation_entries; DROP TABLE task_conversations; DROP TABLE run_purposes; DROP TABLE local_control; DROP TABLE google_metadata_operations; DROP TABLE google_usage_reader; DROP TABLE native_profile_bindings; DROP TABLE google_acp_setup; DROP INDEX events_task_cursor; DROP INDEX entities_kind_id; DROP INDEX task_project_id; DROP INDEX entities_task_id; DROP INDEX entities_run_id; PRAGMA user_version=4',
+        'INSERT INTO native_processes SELECT * FROM native_processes_saved; DROP TABLE native_processes_saved; DROP TABLE activity_output; DROP TABLE combined_ref_intents; DROP TABLE combined_dispatches; DROP TABLE combined_members; DROP TABLE combined_groups; DROP TABLE conversation_entries; DROP TABLE task_conversations; DROP TABLE run_purposes; DROP TABLE local_control; DROP TABLE google_metadata_operations; DROP TABLE google_usage_reader; DROP TABLE native_profile_bindings; DROP TABLE google_acp_setup; DROP INDEX events_task_cursor; DROP INDEX entities_kind_id; DROP INDEX task_project_id; DROP INDEX entities_task_id; DROP INDEX entities_run_id; PRAGMA user_version=4',
       );
       controller.store.applyMigrations(new URL('../../migrations/', import.meta.url).pathname);
       assert.deepEqual(controller.store.nativeProcesses(attempt.attempt_id), previous);
@@ -4736,6 +4746,10 @@ test('an appointed native proposal is retained and applied once after every phas
         readdirSync(new URL('../../migrations/', import.meta.url)).filter((name) =>
           /^\d{3}-[a-z0-9-]+\.sql$/.test(name),
         ).length,
+      );
+      assert.equal(
+        controller.store.db.prepare('SELECT count(*) AS count FROM activity_output').get()?.count,
+        0,
       );
       assert.equal('enabled' in controller.store.googleUsageReader(), false);
       assert.deepEqual(controller.store.googleMetadataOperations(), []);

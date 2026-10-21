@@ -159,7 +159,22 @@ export async function serve(
                   try {
                     const replay = controller.store.eventsAfter(command.payload.after);
                     for (const event of replay) send({ type: 'event', event });
-                    unsubscribe = controller.subscribe((event) => send({ type: 'event', event }));
+                    unsubscribe = controller.subscribe((event) => {
+                      const size = controller.store.db
+                        .prepare(
+                          'SELECT length(CAST(body AS BLOB)) AS bytes FROM events WHERE cursor=?',
+                        )
+                        .get(BigInt(event.cursor));
+                      if (typeof size?.bytes === 'number' && size.bytes > MAX_FRAME_BYTES - 4096) {
+                        send({
+                          type: 'resync',
+                          reason: 'history-gap',
+                          cursor: controller.store.cursor(),
+                        });
+                        return;
+                      }
+                      send({ type: 'event', event });
+                    });
                     send({ type: 'result', key: command.key, result: { outcome: 'applied' } });
                   } catch {
                     send({
@@ -173,6 +188,8 @@ export async function serve(
                 }
                 if (
                   [
+                    'GetArtifactRange',
+                    'GetTaskActivityPage',
                     'ObserveUsage',
                     'CheckNativeConnection',
                     'InstallGoogleAcp',

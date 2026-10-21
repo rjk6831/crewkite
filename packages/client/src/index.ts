@@ -1,4 +1,5 @@
 import type {
+  Artifact,
   Command,
   CommandResult,
   ConversationContextPick,
@@ -35,6 +36,11 @@ export interface DesktopSource {
   projectPage(input: ProjectPageRequest): Promise<ProjectPage>;
   taskPage(input: TaskPageRequest): Promise<TaskPage>;
   command(input: DesktopCommand): Promise<CommandResult>;
+  verifyArtifact?(input: {
+    requestId: string;
+    artifact: Artifact;
+  }): Promise<{ integrity: 'whole-verified'; hash: string; bytes: number }>;
+  cancelArtifactVerification?(requestId: string): Promise<void>;
   subscribe(onEvent: (event: Event) => void): () => void;
   onConnection?(listener: (state: ConnectionState) => void): () => void;
   pickProject?(): Promise<CommandResult | null>;
