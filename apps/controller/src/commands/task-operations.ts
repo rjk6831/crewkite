@@ -24,7 +24,7 @@ import {
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
 import type { ArtifactFiles } from '../artifacts/index.ts';
-import { type GitHubExecutable, startGitHubRead } from '../github/read.ts';
+import { type GitHubExecutable, githubReadArgv, startGitHubRead } from '../github/read.ts';
 import { committedFiles, git, inspectSource, materialize } from '../host/source.ts';
 import { groupAbsent, verifyOwnedCommandExecutable } from '../host/worker.ts';
 import type { Store } from '../store/index.ts';
@@ -617,7 +617,13 @@ export class TaskOperations {
       cwd,
       environment: { HOME: homedir(), PATH: process.env.PATH ?? '', LC_ALL: 'C' },
     };
-    const artifact = this.artifact({ version: 1, taskId: task.id, request: requested, client });
+    const artifact = this.artifact({
+      version: 1,
+      taskId: task.id,
+      request: requested,
+      client,
+      argv: githubReadArgv(requested),
+    });
     const record = this.journal.createAndBegin(
       { id: operationId, taskId: task.id, kind: 'github-read', definition: artifact },
       command.key,

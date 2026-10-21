@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { isAbsolute, relative, resolve } from 'node:path';
 import {
   AttemptIdSchema,
+  ConversationModelRequestSchema,
   HashSchema,
   NativeRepositoryExecutionSchema,
   NativeTargetPathSchema,
@@ -33,8 +34,8 @@ const context = z.strictObject({
 });
 const input = z.strictObject({
   attemptId: AttemptIdSchema,
-  model: z.literal('gpt-6.1-sol'),
-  effort: z.literal('low'),
+  model: ConversationModelRequestSchema.shape.model,
+  effort: ConversationModelRequestSchema.shape.effort,
   creditPolicy: z.enum(['ordinary', 'existing-credits']).default('ordinary'),
   scratchPath: text(4096).refine(isAbsolute),
   sourceBase: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/),
@@ -646,6 +647,7 @@ export class RepositoryTranscript {
       turnId: this.turnId,
       model: this.plan.model,
       requestedEffort: this.plan.effort,
+      effectiveEffort: this.plan.effort,
       observedRetries: this.retries,
       qualified: false as const,
     };

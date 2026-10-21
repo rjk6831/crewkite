@@ -212,7 +212,7 @@ function endpoint(...parts: string[]) {
   return `/${parts.map((part) => encodeURIComponent(part)).join('/')}`;
 }
 
-function apiArgv(repository: GitHubRepository, path: string) {
+function apiArgv(repository: GitHubRepository, path: string, allowEscapeSequences = false) {
   return [
     'api',
     '--method',
@@ -223,6 +223,7 @@ function apiArgv(repository: GitHubRepository, path: string) {
     'Accept: application/vnd.github+json',
     '--header',
     'X-GitHub-Api-Version: 2022-11-28',
+    ...(allowEscapeSequences ? ['--allow-escape-sequences'] : []),
     path,
   ] as const;
 }
@@ -248,6 +249,14 @@ function logPath(request: Extract<GitHubReadRequest, { kind: 'job-log' }>) {
     request.repository.owner,
     request.repository.name,
   )}${endpoint('actions', 'jobs', request.jobId, 'logs')}`;
+}
+
+export function githubReadArgv(request: GitHubReadRequest) {
+  return {
+    metadata: apiArgv(request.repository, metadataPath(request)),
+    content:
+      request.kind === 'job-log' ? apiArgv(request.repository, logPath(request), true) : null,
+  } as const;
 }
 
 function lowerAscii(bytes: Buffer) {
@@ -433,6 +442,7 @@ export function startGitHubRead(
   };
   if (!Number.isFinite(Date.parse(source.fetchedAt)))
     throw new Error('GitHub retrieval time is invalid.');
+  const argv = githubReadArgv(request);
   const stopExecution = (execution: OwnedProjectCommandExecution) => {
     if (stopped.has(execution)) return;
     stopped.add(execution);
@@ -458,7 +468,7 @@ export function startGitHubRead(
   const result = (async (): Promise<GitHubReadResult> => {
     let metadata: OwnedProjectCommandExecution | null;
     try {
-      metadata = launch('metadata', apiArgv(request.repository, metadataPath(request)));
+      metadata = launch('metadata', argv.metadata);
     } catch {
       return readFailure('unavailable', 'launch', null, source);
     }
@@ -563,10 +573,11 @@ export function startGitHubRead(
     }
     const jobUrl = safeUrl(body.html_url, request.repository.host);
     if (!jobUrl) return readFailure('unavailable', 'unavailable', null, source);
+    if (!argv.content) return readFailure('unavailable', 'unavailable', null, source);
 
     let content: OwnedProjectCommandExecution | null;
     try {
-      content = launch('content', apiArgv(request.repository, logPath(request)));
+      content = launch('content', argv.content);
     } catch {
       return readFailure('unavailable', 'launch', null, source);
     }

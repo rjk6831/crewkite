@@ -2490,6 +2490,22 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     },
   };
   assert.ok(CommandSchema.safeParse(projectChecks).success);
+  const pythonChecks = {
+    ...evaluation,
+    payload: {
+      ...evaluation.payload,
+      checkRecipeId: 'project-python-unittest-v1',
+      testFiles: ['tests/test_core.py', 'tests/test_io.py'],
+    },
+  };
+  assert.ok(CommandSchema.safeParse(pythonChecks).success);
+  assert.equal(
+    CommandSchema.safeParse({
+      ...pythonChecks,
+      payload: { ...pythonChecks.payload, testFiles: ['tests/test_core.mjs'] },
+    }).success,
+    false,
+  );
   const toolchainChecks = {
     ...evaluation,
     payload: { ...evaluation.payload, checkRecipeId: 'crewkite-verify-v1' },
@@ -2569,6 +2585,12 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     localAcceptance: { available: false, reason: 'evidence-incomplete' },
   };
   assert.deepEqual(CandidateEvaluationPreviewSchema.parse(preview), preview);
+  const pythonPreview = {
+    ...preview,
+    recipe: 'project-python-unittest-v1',
+    testFiles: [{ path: 'tests/test_core.py', hash: 'a'.repeat(64), bytes: 1, mode: '100644' }],
+  };
+  assert.deepEqual(CandidateEvaluationPreviewSchema.parse(pythonPreview), pythonPreview);
   const { testFiles: _legacyFiles, ...legacyPreview } = preview;
   assert.deepEqual(CandidateEvaluationPreviewSchema.parse(legacyPreview), preview);
   const verification = {

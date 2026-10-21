@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import {
   chmodSync,
   existsSync,
@@ -189,7 +190,14 @@ test('explicit task operations retain local output and fixed GitHub reads withou
   const gh = join(bin, 'gh');
   writeFileSync(
     gh,
-    `#!${realpathSync(process.execPath)}\nconsole.log(JSON.stringify({number:1,head:{sha:'${base}'},state:'open',draft:false,html_url:'https://github.com/example/project/pull/1'}));\n`,
+    `#!${realpathSync(process.execPath)}
+const endpoint=process.argv.at(-1);
+const allowsEscapes=process.argv.includes('--allow-escape-sequences');
+if(endpoint.endsWith('/pulls/1')&&!allowsEscapes) console.log(JSON.stringify({number:1,head:{sha:'${base}'},state:'open',draft:false,html_url:'https://github.com/example/project/pull/1'}));
+else if(endpoint.endsWith('/actions/jobs/88')&&!allowsEscapes) console.log(JSON.stringify({id:88,run_id:77,run_attempt:2,head_sha:'${base}',status:'completed',conclusion:'success',html_url:'https://github.com/example/project/actions/runs/77/job/88'}));
+else if(endpoint.endsWith('/actions/jobs/88/logs')&&allowsEscapes) process.stdout.write(Buffer.from([27,91,51,49,109,102,97,105,108,101,100,27,91,48,109,10]));
+else process.exitCode=3;
+`,
   );
   chmodSync(gh, 0o700);
   process.env.PATH = `${bin}:${previousPath ?? ''}`;
@@ -208,11 +216,80 @@ test('explicit task operations retain local output and fixed GitHub reads withou
   assert.equal(remote.data.operation.state, 'succeeded');
   assert.equal(remote.data.githubResult?.status, 'open');
   assert.equal(remote.data.githubResult?.url, 'https://github.com/example/project/pull/1');
+  const remoteDefinition = JSON.parse(
+    artifacts.read(remote.data.operation.definition.hash).toString('utf8'),
+  );
+  assert.deepEqual(remoteDefinition.argv, {
+    metadata: [
+      'api',
+      '--method',
+      'GET',
+      '--hostname',
+      'github.com',
+      '--header',
+      'Accept: application/vnd.github+json',
+      '--header',
+      'X-GitHub-Api-Version: 2022-11-28',
+      '/repos/example/project/pulls/1',
+    ],
+    content: null,
+  });
   assert(remote.data.operation.result);
   const result = JSON.parse(artifacts.read(remote.data.operation.result.hash).toString('utf8'));
   assert.equal(result.status, 'open');
   assert.equal(result.source.headSha, base);
   assert.equal((await operations.execute(read)).outcome, 'already-applied');
+  const jobRead = command('ReadGitHub', {
+    taskId: task.id,
+    request: {
+      kind: 'job-log',
+      repository: { host: 'github.com', owner: 'example', name: 'project' },
+      headSha: base,
+      runId: '77',
+      attempt: 2,
+      jobId: '88',
+    },
+  });
+  const jobRemote = await operations.execute(jobRead);
+  assert.equal(jobRemote.outcome, 'applied', JSON.stringify(jobRemote));
+  assert(jobRemote.data?.kind === 'project-operation');
+  assert.equal(jobRemote.data.operation.state, 'succeeded');
+  assert(jobRemote.data.operation.stdout);
+  const jobDefinition = JSON.parse(
+    artifacts.read(jobRemote.data.operation.definition.hash).toString('utf8'),
+  );
+  assert.deepEqual(jobDefinition.argv.content, [
+    'api',
+    '--method',
+    'GET',
+    '--hostname',
+    'github.com',
+    '--header',
+    'Accept: application/vnd.github+json',
+    '--header',
+    'X-GitHub-Api-Version: 2022-11-28',
+    '--allow-escape-sequences',
+    '/repos/example/project/actions/jobs/88/logs',
+  ]);
+  const retainedLog = Buffer.from([
+    27, 91, 51, 49, 109, 102, 97, 105, 108, 101, 100, 27, 91, 48, 109, 10,
+  ]);
+  assert(artifacts.read(jobRemote.data.operation.stdout.hash).equals(retainedLog));
+  assert.equal(
+    jobRemote.data.operation.stdout.hash,
+    createHash('sha256').update(retainedLog).digest('hex'),
+  );
+  assert.deepEqual(await artifacts.verify(jobRemote.data.operation.stdout.hash), {
+    hash: jobRemote.data.operation.stdout.hash,
+    bytes: retainedLog.length,
+  });
+  const retainedRange = await artifacts.readRange(jobRemote.data.operation.stdout.hash, {
+    offset: 0,
+    limit: 8,
+  });
+  assert(retainedRange.bytes.equals(retainedLog.subarray(0, 8)));
+  assert.equal(retainedRange.totalBytes, retainedLog.length);
+  assert.equal(retainedRange.eof, false);
   const publishJson = artifacts.publish.bind(artifacts);
   let failResult = true;
   artifacts.publish = (bytes) => {

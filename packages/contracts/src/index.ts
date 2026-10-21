@@ -51,6 +51,15 @@ export const ProjectNodeTestFilesSchema = z
   .min(1)
   .max(32)
   .refine((paths) => new Set(paths).size === paths.length, 'Node test files must be distinct.');
+export const ProjectPythonTestPathSchema = NativeTargetPathSchema.refine(
+  (path) => path.endsWith('.py') && !path.startsWith('-') && !/[?*[\]{}]/.test(path),
+  'Python tests need exact relative .py paths without options or globs.',
+);
+export const ProjectPythonTestFilesSchema = z
+  .array(ProjectPythonTestPathSchema)
+  .min(1)
+  .max(32)
+  .refine((paths) => new Set(paths).size === paths.length, 'Python test files must be distinct.');
 const OpenAiNativeProfileSchema = z.strictObject({
   id: label,
   family: z.literal('openai'),
@@ -384,6 +393,29 @@ export const LocalSetupSchema = z
   )
   .refine(localProjectionFits, 'Local setup exceeds its encoded byte bound.');
 export type LocalSetup = z.infer<typeof LocalSetupSchema>;
+export const LocalHardwareStatusSchema = z
+  .strictObject({
+    cpuModel: localText(200).nullable(),
+    logicalCores: RevisionSchema.min(1).max(4096).nullable(),
+    architecture: z
+      .string()
+      .regex(/^[A-Za-z0-9._-]{1,32}$/)
+      .nullable(),
+    platform: z
+      .string()
+      .regex(/^[A-Za-z0-9._-]{1,32}$/)
+      .nullable(),
+    totalMemoryBytes: RevisionSchema.min(1).nullable(),
+    availableMemoryBytes: RevisionSchema.nullable(),
+    sampledAt: TimestampSchema,
+  })
+  .refine(
+    (status) =>
+      status.availableMemoryBytes === null ||
+      (status.totalMemoryBytes !== null && status.availableMemoryBytes <= status.totalMemoryBytes),
+    'Available Local memory needs a valid total memory bound.',
+  );
+export type LocalHardwareStatus = z.infer<typeof LocalHardwareStatusSchema>;
 export const LocalNativeProfileSchema = z
   .strictObject({
     id: z.literal('local-file-v1'),
@@ -632,6 +664,29 @@ export const NativeHandoffPreviewSchema = z
         )),
     'The pending handoff must select a saved recipient and the next writer generation.',
   );
+const conversationModelText = (maximumBytes: number) =>
+  z
+    .string()
+    .min(1)
+    .max(maximumBytes)
+    .refine(
+      (value) =>
+        value.isWellFormed() &&
+        !/\p{Cc}/u.test(value) &&
+        value.trim().length > 0 &&
+        new TextEncoder().encode(value).byteLength <= maximumBytes,
+      'Model metadata needs bounded text without control characters.',
+    );
+const conversationModelObservation = z.strictObject({
+  artifactId: ArtifactIdSchema,
+  hash: HashSchema,
+});
+export const ConversationModelRequestSchema = z.strictObject({
+  version: z.literal(1),
+  observation: conversationModelObservation,
+  model: conversationModelText(200),
+  effort: conversationModelText(32),
+});
 export const NativeRunSchema = z
   .strictObject({
     runId: RunIdSchema,
@@ -653,6 +708,7 @@ export const NativeRunSchema = z
     handoff: NativeHandoffPreviewSchema.optional(),
     repository: NativeRepositoryScopeSchema.optional(),
     execution: NativeRepositoryExecutionSchema.optional(),
+    modelRequest: ConversationModelRequestSchema.optional(),
     target: z
       .strictObject({
         path: NativeTargetPathSchema,
@@ -689,7 +745,7 @@ export const NativeRunSchema = z
           !run.billingAttestation &&
           !run.permissionMode &&
           !run.handoff
-        : !run.repository && !run.execution,
+        : !run.repository && !run.execution && !run.modelRequest,
     'A repository run needs its complete source scope and native execution profile.',
   )
   .refine((run) => !run.handoff || NativeFileProfileIdSchema.safeParse(run.profileId).success)
@@ -1508,6 +1564,7 @@ export const NativePreparationPayloadSchema = z.union([
   z.strictObject({
     ...nativePreparationFields,
     profileId: z.literal('openai-repository-v1'),
+    modelRequest: ConversationModelRequestSchema.optional(),
   }),
   z.strictObject({
     ...nativePreparationFields,
@@ -1967,29 +2024,6 @@ export type ConversationPage = z.infer<typeof ConversationPageSchema>;
 export type ConversationPlanProposal = z.infer<typeof ConversationPlanProposalSchema>;
 export type ConversationTurnBinding = z.infer<typeof ConversationTurnBindingSchema>;
 export type ConversationTurnResult = z.infer<typeof ConversationTurnResultSchema>;
-const conversationModelText = (maximumBytes: number) =>
-  z
-    .string()
-    .min(1)
-    .max(maximumBytes)
-    .refine(
-      (value) =>
-        value.isWellFormed() &&
-        !/\p{Cc}/u.test(value) &&
-        value.trim().length > 0 &&
-        new TextEncoder().encode(value).byteLength <= maximumBytes,
-      'Model metadata needs bounded text without control characters.',
-    );
-const conversationModelObservation = z.strictObject({
-  artifactId: ArtifactIdSchema,
-  hash: HashSchema,
-});
-export const ConversationModelRequestSchema = z.strictObject({
-  version: z.literal(1),
-  observation: conversationModelObservation,
-  model: conversationModelText(200),
-  effort: conversationModelText(32),
-});
 export const ConversationModelCatalogEntrySchema = z
   .strictObject({
     model: ConversationModelRequestSchema.shape.model,
@@ -2446,6 +2480,11 @@ export const CommandSchema = z.discriminatedUnion('command', [
         checkRecipeId: z.literal('project-node-tests-v1'),
         testFiles: ProjectNodeTestFilesSchema,
       }),
+      z.strictObject({
+        ...evaluationFields,
+        checkRecipeId: z.literal('project-python-unittest-v1'),
+        testFiles: ProjectPythonTestFilesSchema,
+      }),
       z.strictObject({ ...evaluationFields, checkRecipeId: z.literal('crewkite-verify-v1') }),
     ]),
   ),
@@ -2663,12 +2702,17 @@ export const CandidateEvaluationPreviewSchema = z
     candidateId: CandidateIdSchema,
     candidateHash: HashSchema,
     preparationId: ArtifactIdSchema,
-    recipe: z.enum(['node-tests-v1', 'project-node-tests-v1', 'crewkite-verify-v1']),
+    recipe: z.enum([
+      'node-tests-v1',
+      'project-node-tests-v1',
+      'project-python-unittest-v1',
+      'crewkite-verify-v1',
+    ]),
     verification: CrewKiteVerifyPreviewSchema.optional(),
     testFiles: z
       .array(
         z.strictObject({
-          path: ProjectNodeTestPathSchema,
+          path: z.union([ProjectNodeTestPathSchema, ProjectPythonTestPathSchema]),
           hash: HashSchema,
           bytes: RevisionSchema,
           mode: z.enum(['100644', '100755']),
@@ -2725,8 +2769,12 @@ export const CandidateEvaluationPreviewSchema = z
       context.addIssue({ code: 'custom', message: 'Evaluation needs one exact source scope.' });
     const paths = value.testFiles.map((file) => file.path);
     if (
-      (value.recipe === 'project-node-tests-v1' && paths.length === 0) ||
-      (value.recipe !== 'project-node-tests-v1' && paths.length !== 0) ||
+      (['project-node-tests-v1', 'project-python-unittest-v1'].includes(value.recipe) &&
+        paths.length === 0) ||
+      (!['project-node-tests-v1', 'project-python-unittest-v1'].includes(value.recipe) &&
+        paths.length !== 0) ||
+      (value.recipe === 'project-python-unittest-v1' &&
+        !paths.every((path) => ProjectPythonTestPathSchema.safeParse(path).success)) ||
       new Set(paths).size !== paths.length
     )
       context.addIssue({ code: 'custom', message: 'Check files must match the selected recipe.' });
@@ -3185,6 +3233,7 @@ export const WorkspaceStateSchema = z
     usageReaders: SnapshotSchema.shape.usageReaders,
     googleAcpSetup: SnapshotSchema.shape.googleAcpSetup,
     localSetup: SnapshotSchema.shape.localSetup,
+    localHardware: LocalHardwareStatusSchema.optional(),
     googleAcpInstall: SnapshotSchema.shape.googleAcpInstall,
     nativeConnections: SnapshotSchema.shape.nativeConnections,
     nativeProfiles: SnapshotSchema.shape.nativeProfiles,

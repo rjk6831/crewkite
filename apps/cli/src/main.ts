@@ -45,6 +45,7 @@ import {
   PrepareCombinedRunPayloadSchema,
   PrepareProjectCommandRequestSchema,
   ProjectNodeTestFilesSchema,
+  ProjectPythonTestFilesSchema,
   ProjectSchema,
   type Snapshot,
   type Task,
@@ -94,7 +95,7 @@ const help = `Usage: crewkite project add <path> [--json] [--home path]
        crewkite task prepare-handoff <task-id> <profile-id> --native-trust --source-consent [--existing-credits] [--confirm-subscription-only] [--permission-mode mode]
        crewkite task start-handoff <task-id> [--json] [--home path]
        crewkite task prepare-repository <task-id> <profile-id> --policy file [--native-trust --source-consent] [--existing-credits]
-       crewkite task prepare-evaluation <task-id> <profile-id> --grants file [--recipe node-tests-v1|project-node-tests-v1|crewkite-verify-v1] [--test-file path ...] [--native-trust --source-consent] [--existing-credits]
+       crewkite task prepare-evaluation <task-id> <profile-id> --grants file [--recipe node-tests-v1|project-node-tests-v1|project-python-unittest-v1|crewkite-verify-v1] [--test-file path ...] [--native-trust --source-consent] [--existing-credits]
        crewkite task <start-checks|start-review> <task-id> [--json] [--home path]
        crewkite task accept <task-id> <destination-ref> [--json] [--home path]
        crewkite task changes <task-id> [--json] [--home path]
@@ -574,19 +575,36 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
     if (!evaluating && (values.recipe !== undefined || values['test-file'] !== undefined))
       throw new Error('Check recipe options require task prepare-evaluation.');
     const recipe = values.recipe ?? 'node-tests-v1';
-    if (!['node-tests-v1', 'project-node-tests-v1', 'crewkite-verify-v1'].includes(recipe))
-      throw new Error('Choose node-tests-v1, project-node-tests-v1 or crewkite-verify-v1.');
-    if (recipe !== 'project-node-tests-v1' && values['test-file'] !== undefined)
-      throw new Error('Test files require --recipe project-node-tests-v1.');
+    if (
+      ![
+        'node-tests-v1',
+        'project-node-tests-v1',
+        'project-python-unittest-v1',
+        'crewkite-verify-v1',
+      ].includes(recipe)
+    )
+      throw new Error(
+        'Choose node-tests-v1, project-node-tests-v1, project-python-unittest-v1 or crewkite-verify-v1.',
+      );
+    if (
+      !['project-node-tests-v1', 'project-python-unittest-v1'].includes(recipe) &&
+      values['test-file'] !== undefined
+    )
+      throw new Error('Test files require a project test recipe.');
     const checkRecipe =
       recipe === 'project-node-tests-v1'
         ? {
             checkRecipeId: 'project-node-tests-v1' as const,
             testFiles: ProjectNodeTestFilesSchema.parse(values['test-file'] ?? []),
           }
-        : recipe === 'crewkite-verify-v1'
-          ? { checkRecipeId: 'crewkite-verify-v1' as const }
-          : { checkRecipeId: 'node-tests-v1' as const };
+        : recipe === 'project-python-unittest-v1'
+          ? {
+              checkRecipeId: 'project-python-unittest-v1' as const,
+              testFiles: ProjectPythonTestFilesSchema.parse(values['test-file'] ?? []),
+            }
+          : recipe === 'crewkite-verify-v1'
+            ? { checkRecipeId: 'crewkite-verify-v1' as const }
+            : { checkRecipeId: 'node-tests-v1' as const };
     if (
       !preparing &&
       !evaluating &&

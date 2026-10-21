@@ -243,7 +243,7 @@ test('task snapshots retain related evidence within the unchanged frame bound', 
   const socketRoot = mkdtempSync(
     join(realpathSync(checkOwner()?.stateRoot ?? tmpdir()), 'ck-snap-'),
   );
-  const { controller, command, draft, fixtures, id } = await setup(t, {
+  const { controller, command, draft, fixtures, clock, id } = await setup(t, {
     home: join(socketRoot, 'home'),
     googleUsageClient: () => ({ available: false, reason: 'client-unavailable' }),
     openAiUsageClient: () => unavailableNativeProfile(),
@@ -400,6 +400,26 @@ test('task snapshots retain related evidence within the unchanged frame bound', 
   const receipts = controller.store.db.prepare('SELECT COUNT(*) AS n FROM receipts').get()?.n;
   const header = controller.workspaceState();
   assert.equal('tasks' in header, false);
+  assert(header.localHardware);
+  assert.equal(header.localHardware.sampledAt, clock.now());
+  assert.deepEqual(Object.keys(header.localHardware).sort(), [
+    'architecture',
+    'availableMemoryBytes',
+    'cpuModel',
+    'logicalCores',
+    'platform',
+    'sampledAt',
+    'totalMemoryBytes',
+  ]);
+  assert(
+    header.localHardware.logicalCores === null ||
+      (header.localHardware.logicalCores >= 1 && header.localHardware.logicalCores <= 4096),
+  );
+  assert(
+    header.localHardware.availableMemoryBytes === null ||
+      (header.localHardware.totalMemoryBytes !== null &&
+        header.localHardware.availableMemoryBytes <= header.localHardware.totalMemoryBytes),
+  );
   // Scoped reads must not materialize unrelated entity collections.
   const list = controller.store.list.bind(controller.store);
   controller.store.list = (kind) => {
@@ -414,6 +434,17 @@ test('task snapshots retain related evidence within the unchanged frame bound', 
   });
   try {
     const workspace = await client.workspaceState();
+    assert(workspace.localHardware);
+    const { availableMemoryBytes: headerAvailableMemory, ...headerHardware } = header.localHardware;
+    const { availableMemoryBytes: workspaceAvailableMemory, ...workspaceHardware } =
+      workspace.localHardware;
+    assert.deepEqual(workspaceHardware, headerHardware);
+    assert(
+      workspaceAvailableMemory === null ||
+        (workspace.localHardware.totalMemoryBytes !== null &&
+          workspaceAvailableMemory <= workspace.localHardware.totalMemoryBytes),
+    );
+    assert(headerAvailableMemory === null || headerAvailableMemory >= 0);
     assert.deepEqual(workspace.nativeConnections, header.nativeConnections);
     assert.equal(workspace.nativeConnections[0]?.state, 'unchecked');
     assert.deepEqual(workspace.googleAcpInstall, header.googleAcpInstall);
@@ -3666,6 +3697,7 @@ async function localControllerFixture(
   initialMode = 'completed',
   authMode: 'token' | 'none' = 'token',
   formatting?: string,
+  authority: Run['policy']['policy']['authority'] = 'guided',
 ) {
   let mode = initialMode;
   let context: Awaited<ReturnType<typeof setup>>;
@@ -3700,6 +3732,12 @@ async function localControllerFixture(
     embeddingInstances: 0,
   };
   const observation = { ...observed, observationHash: hashCanonical(observed) };
+  const changedChoice = { ...choice, instanceReference: 'replacement-instance' };
+  const changedObserved = { ...observed, models: [changedChoice] };
+  const changedObservation = {
+    ...changedObserved,
+    observationHash: hashCanonical(changedObserved),
+  };
   const secret = 'private-controller-local-canary';
   const inputPeer = `
 const fs=require('node:fs'); const mode=process.argv[1]; let pending=Buffer.alloc(0);
@@ -3708,7 +3746,7 @@ const prompt=JSON.parse(pending.subarray(4,4+pending.readUInt32BE(0)));pending=B
 const body=Buffer.from(JSON.stringify({binding:prompt.binding,outcome:'submitted',secret:${JSON.stringify(secret)}}));const header=Buffer.alloc(4);header.writeUInt32BE(body.length);
 const finish=()=>{fs.writeSync(3,Buffer.concat([header,body]));process.stdin.destroy();};if(mode==='input-hold')process.stdin.once('end',finish);else finish();});`;
   const clientPeer = `
-const {createInterface}=require('node:readline');const mode=process.argv[1];const observation=${JSON.stringify(observation)};
+const {createInterface}=require('node:readline');const mode=process.argv[1];const observation=mode==='discovery-instance-changed'?${JSON.stringify(changedObservation)}:${JSON.stringify(observation)};
 let plan;const emit=value=>process.stdout.write(JSON.stringify(value)+'\\n');
 const finish=value=>{emit(value);process.stdin.destroy();};
 createInterface({input:process.stdin}).on('line',line=>{const value=JSON.parse(line);
@@ -3930,7 +3968,7 @@ if(value==='submit')finish({type:'terminal',terminal:{kind:'completed',binding:p
   const task = TaskSchema.parse((await controller.execute(context.draft, 'local-owner')).entity);
   const policy = {
     ...fixtures.policy,
-    authority: 'guided',
+    authority,
     quality: 'quick',
     methods: [{ id: 'keep-it-simple', cycles: 1, reviewerRole: 'advisor' }],
     limits: { attempts: 3, minutes: 5, concurrency: 1 },
@@ -4002,8 +4040,70 @@ if(value==='submit')finish({type:'terminal',terminal:{kind:'completed',binding:p
     submitted: submitted.promise,
     reopen,
     secret,
+    choice,
+    observation,
   };
 }
+
+test('Local refresh keeps an exact selected instance and clears a changed instance', async (t) => {
+  const context = await localControllerFixture(t);
+  const selected = context.setupState();
+  assert(selected?.selection);
+  assert(selected.setupHash);
+
+  await context.local('RefreshLocalModels', { consent: 'explicit' });
+  assert.deepEqual(context.setupState()?.selection, selected.selection);
+  assert.equal(context.setupState()?.setupHash, selected.setupHash);
+  await context.operationDone();
+  assert.deepEqual(context.setupState()?.selection, selected.selection);
+  assert.equal(context.setupState()?.setupHash, selected.setupHash);
+
+  context.mode('discovery-instance-changed');
+  await context.local('RefreshLocalModels', { consent: 'explicit' });
+  await context.operationDone();
+  const changed = context.setupState();
+  assert.equal(changed?.observation?.models[0].instanceReference, 'replacement-instance');
+  assert.equal(changed?.selection, null);
+  assert.equal(changed?.setupHash, null);
+  assert.equal(changed?.reason, 'model-selection-required');
+});
+
+test('Local preparation freezes every authority and refuses changed effects after reopen', async (t) => {
+  for (const authority of ['guided', 'balanced', 'autopilot'] as const) {
+    await t.test(authority, async (t) => {
+      const context = await localControllerFixture(t, 'completed', 'none', undefined, authority);
+      assert.equal(context.run.policy.policy.authority, authority);
+      assert.equal(context.controller.store.intents().length, 0);
+
+      const reopened = await context.reopen();
+      const retained = reopened.store.get<Run>('run', context.run.id);
+      assert(retained);
+      assert.equal(retained.policy.policy.authority, authority);
+      assert.equal(
+        reopened.snapshot().nativeRuns.find((run) => run.runId === context.run.id)?.stage,
+        'prepared',
+      );
+      assert.equal(reopened.store.intents().length, 0);
+
+      const changedPolicy = {
+        ...retained.policy.policy,
+        effects: retained.policy.policy.effects.map((grant) =>
+          grant.action === 'write-scratch' ? { ...grant, usesRemaining: 0 as const } : grant,
+        ),
+      };
+      reopened.store.transaction(() =>
+        reopened.store.put('run', retained.id, retained.revision, {
+          ...retained,
+          policy: { policy: changedPolicy, hash: hashCanonical(changedPolicy) },
+        }),
+      );
+      const refused = await reopened.execute(context.start, 'local-owner');
+      assert.equal(refused.outcome, 'blocked');
+      assert.equal(refused.reason, 'local-start-unavailable');
+      assert.equal(reopened.store.intents().length, 0);
+    });
+  }
+});
 
 test('an appointed native proposal is retained and applied once after every phase stops', async (t) => {
   const local = await nativeSetup(t, 'success', {
@@ -9961,7 +10061,7 @@ test('planning turns keep task authority and allowance across execution', async 
       available: true,
       reason: 'qualification-pending',
     }),
-    locationHash: '4'.repeat(64),
+    locationHash: profile.locationHash,
   } satisfies NativeProfileResolution;
   const options: Partial<ControllerOptions> = {
     identity: { name: 'Fixture owner', email: 'owner@example.invalid' },
@@ -10971,11 +11071,21 @@ test('planning turns keep task authority and allowance across execution', async 
   // freeze five, twenty-one freeze ten and ten freeze the five-minute floor.
   const write = nativePreparation.policy.effects.find((grant) => grant.action === 'write-scratch');
   assert(write);
-  const prepareRepository = async (minutes: number) => {
+  const executionChoices = state(taskId).modelChoices;
+  assert.equal(executionChoices?.status, 'last-observed');
+  assert(executionChoices?.observation);
+  const projectModelRequest = {
+    version: 1 as const,
+    observation: executionChoices.observation,
+    model: 'fixture-secondary',
+    effort: 'medium',
+  };
+  const prepareRepository = async (minutes: number, modelRequest?: typeof projectModelRequest) => {
     const { targetPath: _file, ...repositoryPreparation } = nativePreparation;
     const prepared = await send('PrepareNativeRun', taskId, {
       ...repositoryPreparation,
       profileId: 'openai-repository-v1',
+      ...(modelRequest ? { modelRequest } : {}),
       policy: {
         ...repositoryPreparation.policy,
         limits: { ...repositoryPreparation.policy.limits, minutes },
@@ -10995,9 +11105,99 @@ test('planning turns keep task authority and allowance across execution', async 
         ?.maximumTaskMs,
     };
   };
-  assert.equal((await prepareRepository(12)).frozen, 300_000);
+  const selectedProject = await prepareRepository(12, projectModelRequest);
+  assert.equal(selectedProject.frozen, 300_000);
+  const selectedNative = controller
+    .snapshot()
+    .nativeRuns.find((value) => value.runId === selectedProject.run.id);
+  assert.deepEqual(selectedNative?.modelRequest, projectModelRequest);
+  const selectedRoute = controller
+    .snapshot()
+    .routes.find((route) => route.id === selectedProject.run.roles[0].routeId);
+  assert.equal(selectedRoute?.model, projectModelRequest.model);
+  assert.equal(selectedRoute?.effort.requested, projectModelRequest.effort);
+  const nativeInternals = controller as unknown as {
+    nativeCurrentPlan(run: Run): {
+      appointment: NativePilotAppointment;
+      attempt: Attempt;
+    };
+    planNativeAppointment(appointment: NativePilotAppointment): unknown;
+    repositoryResult(
+      appointment: NativePilotAppointment,
+      attemptId: string,
+      value: unknown,
+    ): unknown;
+  };
+  const selectedPlan = nativeInternals.nativeCurrentPlan(selectedProject.run);
+  assert('repository' in selectedPlan.appointment);
+  const selectedResult = {
+    attemptId: selectedPlan.attempt.id,
+    sourceBase: selectedPlan.appointment.repository.sourceBase,
+    manifestHash: selectedPlan.appointment.repository.manifestHash,
+    execution: selectedPlan.appointment.execution,
+    model: selectedPlan.appointment.route.model,
+    requestedEffort: selectedPlan.appointment.route.effort.requested,
+    qualified: false as const,
+    threadId: 'thread-selected',
+    turnId: 'turn-selected',
+  };
+  assert.throws(
+    () =>
+      nativeInternals.planNativeAppointment({
+        ...selectedPlan.appointment,
+        route: {
+          ...selectedPlan.appointment.route,
+          id: context.id('rte'),
+          model: fixtureModel,
+        },
+      }),
+    /route identity is invalid/,
+  );
+  assert.throws(
+    () =>
+      nativeInternals.repositoryResult(
+        selectedPlan.appointment,
+        selectedPlan.attempt.id,
+        selectedResult,
+      ),
+    /repository result binding changed/,
+  );
+  assert.doesNotThrow(() =>
+    nativeInternals.repositoryResult(selectedPlan.appointment, selectedPlan.attempt.id, {
+      ...selectedResult,
+      effectiveEffort: projectModelRequest.effort,
+    }),
+  );
   const twentyOne = await prepareRepository(21);
   assert.equal(twentyOne.frozen, 600_000);
+  const legacyPlan = nativeInternals.nativeCurrentPlan(twentyOne.run);
+  assert('repository' in legacyPlan.appointment);
+  const legacyAppointment = legacyPlan.appointment;
+  assert.throws(
+    () =>
+      nativeInternals.planNativeAppointment({
+        ...legacyAppointment,
+        route: {
+          ...legacyAppointment.route,
+          id: context.id('rte'),
+          model: projectModelRequest.model,
+        },
+      }),
+    /route identity is invalid/,
+  );
+  assert.doesNotThrow(() =>
+    nativeInternals.repositoryResult(legacyAppointment, legacyPlan.attempt.id, {
+      attemptId: legacyPlan.attempt.id,
+      sourceBase: legacyAppointment.repository.sourceBase,
+      manifestHash: legacyAppointment.repository.manifestHash,
+      execution: legacyAppointment.execution,
+      model: legacyAppointment.route.model,
+      requestedEffort: legacyAppointment.route.effort.requested,
+      qualified: false,
+      threadId: 'thread-legacy',
+      turnId: 'turn-legacy',
+    }),
+  );
   // Lowering the task total to 21 minutes with one spent leaves 20. That covers the ten-minute
   // limit alone and falls short of the eleven minutes behind it.
   const lowerTotal = async (minutes: number) =>
@@ -11019,7 +11219,7 @@ test('planning turns keep task authority and allowance across execution', async 
   // A five-minute writer needs only its own five minutes. A total of 6 with one spent leaves
   // exactly five. The writer lease check follows the budget gate, so a held lease shows that
   // Start passed the gate without launching a process.
-  const ten = await prepareRepository(10);
+  const ten = await prepareRepository(10, projectModelRequest);
   assert.equal(ten.frozen, 300_000);
   assert.equal(await lowerTotal(6), 'applied');
   assert.equal(state(taskId).budget?.remaining.minutes, 5);
@@ -11241,6 +11441,11 @@ test('planning turns keep task authority and allowance across execution', async 
   await controller.close();
   crashAfterIntent = false;
   reopened = new Controller({ ...options, home: controller.home, now: clock.now, id: context.id });
+  assert.deepEqual(
+    reopened.snapshot().nativeRuns.find((value) => value.runId === selectedProject.run.id)
+      ?.modelRequest,
+    projectModelRequest,
+  );
   const afterReopen = await reopened.execute(
     command('GetTaskConversationState', { taskId: catalogTask.id }),
     'local-owner',

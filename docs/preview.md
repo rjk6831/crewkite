@@ -35,18 +35,22 @@ I record the exact source revision, verification and provider qualification in t
 
 ## Start a task
 
+These steps describe the next candidate workflow. Do not use them with the latest download until a matching package and release receipt pass the required checks.
+
 1. Open the normal candidate. Packaging details are in the [distribution notes](distribution.md).
-2. Choose Connect providers and check the clients you plan to use. This needs no project or task.
+2. Choose Connect providers and check the clients you plan to use. Coding setup readiness and quota are separate facts. A connected client does not make every Project engine ready.
 3. Choose Add project and select the exact Git repository root. A refused folder reports its reason and permits another selection after its saved command settles.
-4. Choose New task, select that project, and read the planning permission before sending anything.
+4. On that project row, choose New task. The project is already selected. Enter a title, outcome and one acceptance criterion per line, then choose Create task. The global New task action opens the same form with a project selector.
 
 ## Plan before coding
 
-Planning and coding are separate. Send a bounded objective, then read the answers, criteria and scope. Choose Adopt plan only when they match your intent. Adoption saves the task contract and starts no coding work.
+Plan with AI is optional. If you use it, send a bounded objective, read the answers, criteria and scope, and choose Adopt plan only when they match your intent. Adoption saves the task contract and starts no coding work.
 
-Execution is a second step. Prepare the source, permissions and finite limits, review them, then choose Start.
+For a normal new task, choose Prepare run. Keep the Project scope and OpenAI Project profile, then select a model and effort from the loaded advertised choices when available. Choose Start task to open the permission draft. Subscription only is the default. Read the exact source and policy, then select “Allow OpenAI to read this project, edit a separate working copy, and run local commands using my signed-in client.” Choose Review task to save that preparation, review it once more, then choose Start task. Work runs in a separate scratch copy.
 
 A material model or effort Save creates a linked planning run and returns the contract to provisional, so adopt a fresh valid plan before preparing execution again. Make material planning changes before execution begins, since that Save is scoped to the discussion. Once an execution run exists, it is retained, and material planning changes are unavailable there. Ordinary messages remain guidance and do not replace that run.
+
+Manual single-file targeting is retained for saved legacy runs but is not the normal entry for a new task. The project check recipe appears only when the source contains the supported recipe files.
 
 ## Review the result
 
@@ -61,10 +65,10 @@ Use Stop to end active work. Reopening the same home launches nothing. An uncert
 Open Connect providers from the workspace sidebar. The same controls appear in Usage and capacity.
 
 - Refresh OpenAI quota reads the supported installed client's existing subscription session. It submits no model prompt. Readiness failures show the retained reason and next action.
-- Check Anthropic sign-in observes the supported installed native client. A signed-out client needs its own native sign-in, described in the [provider instructions](providers.md#anthropic-writer-preparation). The idle allowance remains unknown because this integration has no standalone reader.
-- Install official Google client downloads and verifies the reviewed ACP bundle. Then Initialize Google ACP, choose Sign in with Google and Discover Google choices. Personal sign-in may open a browser. The separate Google quota gauge does not establish an ACP connection.
+- Check Anthropic sign-in observes the supported installed native client. A signed-out client needs its own native sign-in, described in the [provider instructions](providers.md#anthropic-writer-preparation). There is no standalone Anthropic quota gauge; allowance stays unknown until a supported reader or an explicitly started task reports it.
+- Connect Google downloads and verifies the reviewed official ACP client when needed, initializes it, pauses for explicit Sign in with Google in the browser, and then discovers choices automatically. You complete and control the Google account sign-in. The separate Google quota gauge does not establish coding readiness.
 
-Local uses a dedicated token by default. The packaged app asks for it and keeps it in controller memory, so it is requested again after a restart. An explicit CLI configuration can instead select no authentication, limited to this device's loopback address. The main interface has no selector and never switches modes automatically. See the [provider notes](providers.md#local-models) and the [CLI guide](../apps/cli/README.md). Model eligibility is not qualification. An eligible model stays unmeasured until separate evidence covers it.
+Local uses a dedicated token by default. Enter the loopback endpoint and choose Connect once. The packaged app saves a changed endpoint, requests the token through its native input, connects and discovers loaded models automatically. It checks status once per second for up to 20 attempts without overlapping requests; use the single Refresh action if it takes longer. Select an observed model to save it immediately. Load or unload models in the Local app. An explicit CLI configuration can instead select no authentication, limited to this device's loopback address. The main interface has no selector and never switches modes automatically. See the [provider notes](providers.md#local-models) and the [CLI guide](../apps/cli/README.md). Model eligibility is not qualification. An eligible model stays unmeasured until separate evidence covers it.
 
 ### Use Google for one file
 
