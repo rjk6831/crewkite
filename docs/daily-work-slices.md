@@ -8,21 +8,23 @@ D2b.1 has released provider connection and project-selection recovery correction
 
 This file is the implementation entry point. Read it together with [architecture](architecture.md), [testing](testing.md), [distribution](distribution.md), the [roadmap](roadmap.md) and the repository's current local instructions. Inspect the code and current release evidence before changing anything. A planned capability below is a gap to verify, not an existing feature to assume.
 
-Current slice: D2b.2, artifact and activity output reads. D2b.1 is released as [D2b UAT 01](https://github.com/rjk6831/crewkite/releases/tag/d2b-uat-01). [D2 UAT 02](https://github.com/rjk6831/crewkite/releases/tag/d2-uat-02) remains marked as failed installed UAT and available for issue reproduction.
+Current download: [D2b UAT 02](https://github.com/rjk6831/crewkite/releases/tag/d2b-uat-02), artifact and activity output reads. Human UAT is pending. D2b.1 remains available as [D2b UAT 01](https://github.com/rjk6831/crewkite/releases/tag/d2b-uat-01). [D2 UAT 02](https://github.com/rjk6831/crewkite/releases/tag/d2-uat-02) remains marked as failed installed UAT and available for issue reproduction.
 
-The released source is [`db0b8a11a8888b7d09bcea2899aa889e361470b9`](https://github.com/rjk6831/crewkite/commit/db0b8a11a8888b7d09bcea2899aa889e361470b9), merged as [`929f69b1802ea58fc56f5693de664cc56ee04020`](https://github.com/rjk6831/crewkite/commit/929f69b1802ea58fc56f5693de664cc56ee04020) with the same tree, `d336b0572e8ec6543aff906e3acd761e2fbeb81e`. Its [required CI](https://github.com/rjk6831/crewkite/actions/runs/39509480936) passed 109 Node claims and one desktop journey. The real-controller paging proof reached all 304 tasks through desktop and CLI beyond the former 1 MiB snapshot limit.
+The D2b.1 source is [`db0b8a11a8888b7d09bcea2899aa889e361470b9`](https://github.com/rjk6831/crewkite/commit/db0b8a11a8888b7d09bcea2899aa889e361470b9), merged as [`929f69b1802ea58fc56f5693de664cc56ee04020`](https://github.com/rjk6831/crewkite/commit/929f69b1802ea58fc56f5693de664cc56ee04020) with the same tree, `d336b0572e8ec6543aff906e3acd761e2fbeb81e`. Its [required CI](https://github.com/rjk6831/crewkite/actions/runs/39509480936) passed 109 Node claims and one desktop journey. The real-controller paging proof reached all 304 tasks through desktop and CLI beyond the former 1 MiB snapshot limit.
 
-The public ZIP is 196,286,107 bytes with SHA-256 `96e8aaa7da4555a5543c20bd921026e7473702d5712cb2c407a6d35c7046aa40`. Its browser-downloaded bytes matched the archive. Native extraction retained quarantine, and a documented folder-only trust step preceded cold launch and same-home reopen. A disposable D2 UAT 02 upgrade passed migrations 13 to 14, preserved the complete backup and target state, retained Local configuration and recovered the old pending project selection before registering a valid project. The existing installation was unchanged. The [release receipt](https://github.com/rjk6831/crewkite/releases/download/d2b-uat-01/release.json) records these observations. Human UAT is pending. The package is ad-hoc sealed, has no Developer ID signature or notarization, and the isolated cold-launch proof did not repeat native account login.
+The D2b.1 ZIP is 196,286,107 bytes with SHA-256 `96e8aaa7da4555a5543c20bd921026e7473702d5712cb2c407a6d35c7046aa40`. Its browser-downloaded bytes matched the archive. Native extraction retained quarantine, and a documented folder-only trust step preceded cold launch and same-home reopen. A disposable D2 UAT 02 upgrade passed migrations 13 to 14, preserved the complete backup and target state, retained Local configuration and recovered the old pending project selection before registering a valid project. The existing installation was unchanged. The [release receipt](https://github.com/rjk6831/crewkite/releases/download/d2b-uat-01/release.json) records these observations. Human UAT is pending. The package is ad-hoc sealed, has no Developer ID signature or notarization, and the isolated cold-launch proof did not repeat native account login.
 
-[D2b.2 implementation](https://github.com/rjk6831/crewkite/pull/60) has passed 111 Node claims and one desktop journey locally. Required CI and package qualification remain pending. Large repository capture, project commands and GitHub operations remain unreleased.
+D2b.2 source [`466f9f704f1517e9659b0e8ce2df15143a5ed0d5`](https://github.com/rjk6831/crewkite/commit/466f9f704f1517e9659b0e8ce2df15143a5ed0d5) merged as [`aaa3fa38fc4526578fd4d17366194577c7365d47`](https://github.com/rjk6831/crewkite/commit/aaa3fa38fc4526578fd4d17366194577c7365d47) with the same tree, `00b04a66cee740e683623b5fe28d7de5f52f79ed`. Its [required CI](https://github.com/rjk6831/crewkite/actions/runs/39567783678) passed 111 Node claims and one desktop journey. The matching package passed its independent inventory, disposable upgrade, cold launch and same-home reopen checks. The ZIP is 196,306,721 bytes with SHA-256 `ea71d8139a8e10678c6630ab69d4b254537d138983da488de9c45fcd213b1e4c`. Anonymous downloads matched the ZIP, release receipt and checksum file. The GitHub CLI download matched the archive used for native extraction and cold/reopen checks. Chrome blocked this candidate before file creation; the earlier D2b.1 browser proof remains separate. The [D2b UAT 02 receipt](https://github.com/rjk6831/crewkite/releases/download/d2b-uat-02/release.json) records the observed limits. Human UAT remains pending.
 
-| Current-slice card | D2b.2 |
-|--------------------|-------|
-| Visible result | Read complete large artifacts and oversized activity output through bounded pages |
-| Edit boundary | Artifact publication and range reads, activity references, native verification, controller/client wiring and output views |
-| Deferred | Repository capture, context selection, project commands, GitHub operations and compression |
-| Required proof | Complete artifacts above 64 MiB and oversized activity bodies, bounded memory, cancellation/reconnect and usable Stop; matching CI and UAT archive |
-| Entry check | Retained D2 outcomes and current main inspected; preserve existing state, work and source history |
+D2b.3 through D2b.7 have implementation and fixture work in progress. Their helpers and focused checks do not qualify complete features. D2b.4 GitHub/CI reads and D2b.6 project commands are the next eligible runnable slices while D2b.3 large-source work continues. D2b.5 and D2b.7 retain their release dependencies below.
+
+| Next-slice card | D2b.4 or D2b.6 |
+|-----------------|----------------|
+| Visible result | Inspect task-linked GitHub status and logs, or run and stop an explicit project command with retained output |
+| Edit boundary | The assigned GitHub or command lane and its frozen controller interface |
+| Deferred | Whole-project source capture, context selection, multi-file acceptance and history modes |
+| Required proof | A complete runnable desktop/CLI path, ownership and restart evidence, matching CI and a separate UAT archive |
+| Entry check | D2b.2 released; preserve existing state and coordinate shared wiring through one integration owner |
 
 For the next implementation, use this instruction:
 
@@ -63,12 +65,12 @@ A day is a target for the next usable increment. It includes review and release 
 | Slice | Usable result | Depends on | State | Source, CI and UAT evidence |
 |-------|---------------|------------|-------|-----------------------------|
 | D2b.1 | Recover project selection and read large workspace status through complete pages | Retained D2 workflow and current main | Released; human UAT pending | [D2b UAT 01](https://github.com/rjk6831/crewkite/releases/tag/d2b-uat-01): required CI 109+1, exact browser download and installed cold/reopen proof, complete disposable old-home upgrade and project recovery |
-| D2b.2 | Read large artifacts and activity output with bounded memory | D2b.1 | Qualification pending | Focused real-socket 65 MiB artifact verification, exact 1,229,521-byte retained event, cancellation/reopen and bounded desktop navigation passed. Local 111+1 passed in [PR #60](https://github.com/rjk6831/crewkite/pull/60); required CI and replacement qualification pending |
-| D2b.3 | Prepare and retain a project beyond the old source-size limits | D2b.2 | Planned | None |
-| D2b.4 | See GitHub PR, Actions status and full CI logs inside a task | D2b.2 | Planned | None |
-| D2b.5 | Navigate large diffs and select useful context by range | D2b.3 | Planned | None |
-| D2b.6 | Run and stop explicit project commands with durable output | D2b.2 | Planned | None |
-| D2b.7 | Complete a useful multi-file change with matching diffs and tests | D2b.5, D2b.6 | Planned | None |
+| D2b.2 | Read large artifacts and activity output with bounded memory | D2b.1 | Released; human UAT pending | [D2b UAT 02](https://github.com/rjk6831/crewkite/releases/tag/d2b-uat-02): required CI 111+1, independent package audit, disposable upgrade and cold/reopen checks. The focused 65 MiB artifact and exact 1,229,521-byte activity proofs remain scoped measurements |
+| D2b.3 | Prepare and retain a project beyond the old source-size limits | D2b.2 | In progress; unreleased | Implementation and fixtures in progress; complete runnable acceptance pending |
+| D2b.4 | See GitHub PR, Actions status and full CI logs inside a task | D2b.2 | In progress; unreleased | Implementation and fixtures in progress; complete runnable acceptance pending |
+| D2b.5 | Navigate large diffs and select useful context by range | D2b.3 | In progress; unreleased | Implementation and fixtures in progress; complete runnable acceptance pending |
+| D2b.6 | Run and stop explicit project commands with durable output | D2b.2 | In progress; unreleased | Implementation and fixtures in progress; complete runnable acceptance pending |
+| D2b.7 | Complete a useful multi-file change with matching diffs and tests | D2b.5, D2b.6 | In progress; unreleased | Implementation and fixtures in progress; complete runnable acceptance pending |
 | D2b.8 | Publish a checked branch and open or update its PR | D2b.4, D2b.7 | Planned | None |
 | D2b.9 | Recover work and verification across restart and application updates | D2b.8 | Planned | None |
 | D2b.10 | Pass the representative daily-work suite and close its observed gaps | D2b.9 | Planned | None |
