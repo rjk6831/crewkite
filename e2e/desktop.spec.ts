@@ -1,7 +1,15 @@
 import assert from 'node:assert/strict';
 import { type ChildProcess, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync } from 'node:fs';
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  writeFileSync,
+} from 'node:fs';
 import { createRequire } from 'node:module';
 import { createServer, type Socket } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
@@ -3321,6 +3329,229 @@ async function taskActivityHistory(
   }
 }
 
+async function projectOperationsJourney(
+  application: Awaited<ReturnType<typeof _electron.launch>>,
+  page: Page,
+) {
+  const home = mkdtempSync(join(internal, 'operations-ui-'));
+  const source = join(home, 'source');
+  mkdirSync(source);
+  git(source, ['init', '--quiet']);
+  const script =
+    "import {writeFileSync,existsSync} from 'node:fs'; console.log('Committed operation output; excluded=' + existsSync('excluded.txt')); writeFileSync('operation-started','ready'); setInterval(() => {}, 1000);\n";
+  writeFileSync(join(source, 'run.mjs'), script);
+  git(source, ['add', 'run.mjs']);
+  git(source, [
+    '-c',
+    'user.name=Fixture',
+    '-c',
+    'user.email=fixture@example.invalid',
+    'commit',
+    '--quiet',
+    '-m',
+    'Add disposable operation fixture',
+  ]);
+  const head = git(source, ['rev-parse', 'HEAD']).toString().trim();
+  writeFileSync(
+    join(source, 'run.mjs'),
+    script.replace('Committed operation', 'Uncommitted operation'),
+  );
+  writeFileSync(join(source, 'excluded.txt'), 'not copied');
+  const original = sourceIdentity(source);
+  const at = new Date().toISOString();
+  const fixture = createDemoFixtures(at);
+  const id = createTestIds(at, 16000n);
+  const task = { ...fixture.task, id: id('tsk'), title: 'Review and stop a project command' };
+  const project = fixture.snapshot.projects[0];
+  const options = {
+    home,
+    id,
+    nativeProfiles: () => [],
+    googleUsageClient: () => ({ available: false as const, reason: 'client-unavailable' as const }),
+    registerGoogleAcp: false,
+    localInputHelper: undefined,
+  };
+  let runtime = await startController(options);
+  const stopEntered = Promise.withResolvers<void>();
+  const stopRelease = Promise.withResolvers<void>();
+  let startSettled = false;
+  let operationId: string | undefined;
+  let scratch: string | undefined;
+  let pageReads = 0;
+  let failFirstPage = true;
+  let execute = runtime.controller.execute.bind(runtime.controller);
+  const instrument = () => {
+    execute = runtime.controller.execute.bind(runtime.controller);
+    runtime.controller.execute = async (input, principal) => {
+      const command = CommandSchema.parse(input);
+      if (command.command === 'GetTaskOperations') {
+        pageReads++;
+        if (failFirstPage) {
+          failFirstPage = false;
+          return { outcome: 'blocked', reason: 'fixture-operation-history-unavailable' };
+        }
+      }
+      if (command.command === 'StopProjectOperation') {
+        stopEntered.resolve();
+        await stopRelease.promise;
+      }
+      const result = await execute(command, principal);
+      if (
+        command.command === 'PrepareProjectCommand' &&
+        result.data?.kind === 'project-operation'
+      ) {
+        operationId = result.data.operation.id;
+        scratch = result.data.definition?.scratchRoot;
+        assert.equal(result.data.definition?.source.dirtyCount, 1);
+        assert.equal(result.data.definition?.source.untrackedCount, 1);
+      }
+      if (command.command === 'StartProjectCommand') startSettled = true;
+      return result;
+    };
+  };
+  instrument();
+  runtime.controller.store.transaction(() => {
+    runtime.controller.store.put('project', project.id, project.revision, project);
+    runtime.controller.store.put('task', task.id, task.revision, task);
+    runtime.controller.store.db
+      .prepare('INSERT INTO project_paths(project_id,path) VALUES (?,?)')
+      .run(project.id, source);
+  });
+  try {
+    await application.evaluate(
+      async ({ BrowserWindow }, options) => {
+        const load = process.mainModule?.require.bind(process.mainModule);
+        if (!load) throw Error('The desktop fixture module loader is unavailable.');
+        const { installBridge } = load(
+          options.bridge,
+        ) as typeof import('../apps/desktop/src/main/bridge.ts');
+        const { connectController } = load(
+          options.client,
+        ) as typeof import('../packages/client/src/node.ts');
+        const { desktopActor } = load(
+          options.runtime,
+        ) as typeof import('../apps/desktop/src/main/runtime.ts');
+        const client = await connectController({ ...options.endpoint, actor: desktopActor });
+        (globalThis as unknown as { operationsClient?: ControllerClient }).operationsClient =
+          client;
+        await installBridge(BrowserWindow.getAllWindows()[0], {
+          paths: { home: options.home, profile: options.home },
+          connect: async () => client,
+          resetClient: () => client.close(),
+        } as never);
+      },
+      {
+        bridge: join(root, 'apps/desktop/src/main/bridge.ts'),
+        client: join(root, 'packages/client/src/node.ts'),
+        runtime: join(root, 'apps/desktop/src/main/runtime.ts'),
+        endpoint: readControllerEndpoint(home),
+        home,
+      },
+    );
+    await page.reload();
+    await expect(page.getByText('Controller connected', { exact: true })).toBeVisible();
+    await page.getByRole('button', { name: task.title, exact: true }).click();
+    await page.getByRole('tab', { name: 'Operations', exact: true }).click();
+    const operations = page.getByRole('region', { name: 'Task operations', exact: true });
+    await expect(operations.getByRole('alert')).toContainText(
+      'fixture-operation-history-unavailable',
+    );
+    await expect(
+      operations.getByText('No project operations are retained for this task.', { exact: true }),
+    ).toHaveCount(0);
+    await operations.getByRole('button', { name: 'Refresh', exact: true }).click();
+    await expect(
+      operations.getByText('No project operations are retained for this task.', { exact: true }),
+    ).toBeVisible();
+    await operations.getByLabel('Executable path', { exact: true }).fill(node);
+    await operations
+      .getByLabel('Arguments, one exact value per line', { exact: true })
+      .fill('run.mjs');
+    await operations.getByRole('button', { name: 'Prepare exact definition', exact: true }).click();
+    const card = operations.getByRole('article');
+    await expect(card.getByText('Prepared for review', { exact: true })).toBeVisible();
+    await expect(card.getByText(head, { exact: true })).toBeVisible();
+    await expect(
+      card.locator('.fact').filter({ hasText: 'Changed files excluded' }).locator('strong'),
+    ).toHaveText('1');
+    await expect(
+      card.locator('.fact').filter({ hasText: 'Untracked files excluded' }).locator('strong'),
+    ).toHaveText('1');
+    await expect(
+      card.getByText(
+        'Only committed source at this head is copied when you Start. Local changes and untracked files are excluded.',
+        { exact: true },
+      ),
+    ).toBeVisible();
+    const start = card.getByRole('button', { name: 'Start exact definition', exact: true });
+    await expect(start).toBeDisabled();
+    await card.getByRole('checkbox').check();
+    await start.click();
+    await expect(card.getByText('Running', { exact: true })).toBeVisible();
+    await expect.poll(() => scratch && existsSync(join(scratch, 'operation-started'))).toBe(true);
+    assert.equal(startSettled, false, 'Start remains pending while the actual owned process runs.');
+    assert.equal(
+      new CommandReceipts(home, home).commands.length,
+      0,
+      'Owned operations must not create a global unknown receipt.',
+    );
+    await expect(page.getByRole('button', { name: 'Add project', exact: true })).toBeEnabled();
+    await card.getByRole('button', { name: 'Stop', exact: true }).click();
+    await bounded(
+      stopEntered.promise,
+      5000,
+      'Stop alongside held Start on the same desktop connection',
+    );
+    assert.equal(startSettled, false, 'Stop must reach the controller before Start returns.');
+    stopRelease.resolve();
+    await expect(card.getByText('Cancelled', { exact: true })).toBeVisible();
+    assert(operationId);
+    const detail = await execute(
+      CommandSchema.parse({
+        protocol: 1,
+        key: createCommandKey(),
+        actor: { id: 'operation-observer', kind: 'cli' },
+        command: 'GetProjectOperation',
+        payload: { taskId: task.id, operationId },
+      }),
+      'local-owner',
+    );
+    assert.equal(detail.data?.kind, 'project-operation');
+    assert(detail.data?.kind === 'project-operation' && detail.data.operation.stdout);
+    const output = card.getByRole('region', {
+      name: `Output ${detail.data.operation.stdout.id}`,
+      exact: true,
+    });
+    await output.getByRole('button', { name: 'Read output', exact: true }).click();
+    await expect(output.locator('pre')).toHaveText('Committed operation output; excluded=false\n');
+    assert.deepEqual(
+      sourceIdentity(source),
+      original,
+      'Project execution must preserve dirty source/index files.',
+    );
+    assert.equal(new CommandReceipts(home, home).commands.length, 0);
+    await expect(
+      page.getByRole('button', { name: 'Retry exact command', exact: true }),
+    ).toHaveCount(0);
+    await runtime.close();
+    await expect(page.getByText('Controller offline', { exact: true })).toBeVisible();
+    const readsBeforeReconnect = pageReads;
+    runtime = await startController(options);
+    instrument();
+    await expect(page.getByText('Controller connected', { exact: true })).toBeVisible();
+    await expect.poll(() => pageReads).toBeGreaterThan(readsBeforeReconnect);
+    await expect(card.getByText('Cancelled', { exact: true })).toBeVisible();
+  } finally {
+    stopRelease.resolve();
+    await application.evaluate(() => {
+      const state = globalThis as unknown as { operationsClient?: ControllerClient };
+      state.operationsClient?.close();
+      delete state.operationsClient;
+    });
+    await runtime.close();
+  }
+}
+
 test('desktop and CLI retain one checked task through handoff and restart', async () => {
   test.setTimeout(120000);
   mkdirSync(internal, { recursive: true });
@@ -4338,6 +4569,7 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     assert.deepEqual(sourceIdentity(source), original);
 
     await taskActivityHistory(application, page);
+    await projectOperationsJourney(application, page);
     await quotaReadBridge(application, page);
     await conversationBridge(application, page);
     const isolatedUsage = new DatabaseSync(join(home, 'state.sqlite'), { readOnly: true });

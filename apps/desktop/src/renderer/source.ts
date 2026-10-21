@@ -626,6 +626,26 @@ export function useWorkspace() {
       }, reportError),
     [refresh, track],
   );
+  const operationCommand = useCallback(
+    async (
+      input: Extract<
+        DesktopCommand,
+        {
+          command:
+            | 'GetTaskOperations'
+            | 'GetProjectOperation'
+            | 'PrepareProjectCommand'
+            | 'StartProjectCommand'
+            | 'ReadGitHub'
+            | 'StopProjectOperation';
+        }
+      >,
+    ) => {
+      if (!source) throw new Error('The desktop bridge is unavailable.');
+      return CommandResultSchema.parse(await source.command(input));
+    },
+    [source],
+  );
   const metadataCommand = useCallback(
     async (
       input: Extract<
@@ -794,6 +814,7 @@ export function useWorkspace() {
     refresh,
     command,
     metadataCommand,
+    operationCommand,
     pickProject,
     canPickProject: !!source?.pickProject,
     pickConversationContext,

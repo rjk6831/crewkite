@@ -66,6 +66,19 @@ Open Connect providers from the workspace sidebar. The same controls appear in U
 
 Local uses a dedicated token by default. The packaged app asks for it and keeps it in controller memory, so it is requested again after a restart. An explicit CLI configuration can instead select no authentication, limited to this device's loopback address. The main interface has no selector and never switches modes automatically. See the [provider notes](providers.md#local-models) and the [CLI guide](../apps/cli/README.md). Model eligibility is not qualification. An eligible model stays unmeasured until separate evidence covers it.
 
+### Use Google for one file
+
+The Google ACP profile can edit one existing committed UTF-8 text file within 64 KiB. A recorded workflow completed checks, separate review, local branch acceptance and same-home reopen. Other advertised models remain subject to their own observed behavior and quota rules; see the [current model boundaries](providers.md#google-acp-writer).
+
+1. Complete the Google setup sequence above and confirm that discovery has returned model choices. A missing client, incomplete sign-in or missing verified permission mapping keeps preparation unavailable.
+2. Add the Git project and create a task. If you use planning, review and adopt its file scope before execution. The current primary planning role uses the supported OpenAI profile; Google selection happens during coding preparation.
+3. Open execution preparation, choose Native file proposal and select Google ACP single-file proposal. Choose the existing committed target, an advertised Google model and its optional thought level. Set finite limits that leave room for the later check and review.
+4. Review the subscription-only and separate quota-account confirmations, native trust and source-sharing permission. Choose Prepare native proposal, inspect the saved source and settings, then Start. Preparation sends no model prompt. Start rechecks the selected configuration and quota.
+5. Inspect each pending edit's exact old and new text and approve or deny it. Every edit needs its own human decision. Open Changes after normal completion to inspect the retained candidate.
+6. Open Checks and review, select a supported OpenAI reviewer and prepare the separate check and review permissions. Run the supported checks, then start review after they pass. A passing candidate still needs destination-specific approval before Accept candidate creates a new local branch. Quit and reopen the same installed CrewKite folder with its existing home, then inspect the retained task and candidate. Keep the initialized home in place.
+
+Google project commands, repository-wide editing, delegation, lead and orchestrator roles, formal review and automatic handoff are not implemented in this profile. The manual [native workspace connector](providers.md#google-native-workspace-context) shares bounded task context with a separately operated native client and retains unverified output. The [CLI guide](../apps/cli/README.md#google-acp-setup) also documents the explicit setup and single-file task commands.
+
 ## Usage and context
 
 Usage shows reported or last-observed values with their source and time. Missing data appears as unknown. CrewKite does not estimate how full a window is from tokens, and it does not infer quota from them. After a successful OpenAI planning turn, the composer can show last-observed context tokens and reported capacity. Without reported capacity, the percentage stays unknown.

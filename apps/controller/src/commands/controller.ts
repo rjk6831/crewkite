@@ -315,6 +315,11 @@ import {
   remainingCombinedBudgets,
   unspentIntegrationMinutes,
 } from './budgets.ts';
+import {
+  type TaskOperationCommand,
+  TaskOperations,
+  taskOperationSummary,
+} from './task-operations.ts';
 
 // A repository writer leaves this long for the verify check and review that follow it.
 const evaluationFloorMinutes = 11;
@@ -1101,6 +1106,7 @@ export class Controller {
       this.recover();
       this.nativeConnections().recover();
       this.googleInstallation().recover();
+      this.taskOperations().recover();
       this.armQuotaRetries();
       for (const row of this.store.db
         .prepare("SELECT candidate_id FROM publications WHERE state='prepared'")
@@ -1111,6 +1117,26 @@ export class Controller {
       this.owner.close();
       throw error;
     }
+  }
+
+  private taskOperationRuntime?: TaskOperations;
+  private taskOperations(): TaskOperations {
+    if (this.taskOperationRuntime) return this.taskOperationRuntime;
+    this.taskOperationRuntime = new TaskOperations({
+      store: this.store,
+      artifacts: this.artifacts,
+      home: this.home,
+      now: this.now,
+      id: (prefix) => this.id(prefix),
+      event: (record) =>
+        this.event(
+          'operation.updated',
+          record.taskId,
+          record.revision,
+          taskOperationSummary(record),
+        ),
+    });
+    return this.taskOperationRuntime;
   }
 
   async execute(input: unknown, principal: string): Promise<CommandResult> {
@@ -1129,6 +1155,17 @@ export class Controller {
         next: 'Send a valid protocol 1 command.',
       };
     const command = parsed.data;
+    if (
+      [
+        'PrepareProjectCommand',
+        'StartProjectCommand',
+        'ReadGitHub',
+        'StopProjectOperation',
+        'GetTaskOperations',
+        'GetProjectOperation',
+      ].includes(command.command)
+    )
+      return this.taskOperations().execute(command as TaskOperationCommand);
     if (command.command === 'GetArtifactRange' || command.command === 'GetTaskActivityPage') {
       const reading = this.readOutput(command);
       this.outputReads.add(reading);
@@ -2883,6 +2920,8 @@ export class Controller {
     for (const cancel of this.quotaRetries.values()) cancel();
     this.quotaRetries.clear();
     const native: Promise<unknown>[] = [];
+    const operationClosing = this.taskOperationRuntime?.close();
+    if (operationClosing) native.push(operationClosing);
     this.outputAbort.abort();
     native.push(...this.outputReads);
     const connectionClosing = this.connectionChecks?.close();
@@ -3065,6 +3104,20 @@ export class Controller {
     acpContext?: CapturedContext,
     contextCapture?: ReturnType<typeof captureConversationContext>,
   ): CommandResult {
+    if (
+      'taskId' in command.payload &&
+      typeof command.payload.taskId === 'string' &&
+      ['PrepareRun', 'PrepareNativeRun', 'PrepareCombinedRun', 'StartRun', 'ResumeRun'].includes(
+        command.command,
+      ) &&
+      this.taskOperationRuntime?.busyTask(command.payload.taskId)
+    )
+      return {
+        outcome: 'blocked',
+        reason: 'task-operation-active',
+        next: 'Stop or reconcile the exact project command before starting a task writer.',
+      };
+
     if ('taskId' in command.payload && typeof command.payload.taskId === 'string') {
       const group = this.store.combinedGroup(command.payload.taskId);
       if (
@@ -3343,6 +3396,8 @@ export class Controller {
         return this.switchRoute(command, effects);
       case 'StopRun': {
         const result = this.stop(command, effects);
+        if (result.outcome === 'applied')
+          effects.push(() => this.taskOperationRuntime?.stopTask(command.payload.taskId));
         const start = this.acpStart;
         if (
           result.outcome === 'applied' &&

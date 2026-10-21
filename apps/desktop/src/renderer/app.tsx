@@ -99,6 +99,7 @@ import {
   NativeHandoff,
 } from './launch.tsx';
 import { LocalSetup } from './local-setup.tsx';
+import { ProjectOperationsPanel } from './project-operations-panel.tsx';
 import { useWorkspace, type Workspace } from './source.ts';
 import { roleLabels } from './templates.ts';
 import { type UsageCard, UsageGauges, type UsageReading } from './usage-gauges.tsx';
@@ -116,6 +117,7 @@ const tabs = [
   'Checks and review',
   'Handoffs',
   'Activity',
+  'Operations',
 ] as const;
 type Tab = (typeof tabs)[number];
 const roleNames: Role['role'][] = [
@@ -1575,6 +1577,13 @@ export function App() {
                           workspace={workspace}
                         />
                       </>
+                    )}
+                    {tab === 'Operations' && (
+                      <ProjectOperationsPanel
+                        key={`${task.id}:${header.stamp.epoch}`}
+                        taskId={task.id}
+                        workspace={workspace}
+                      />
                     )}
                     {tab === 'Plan' && (
                       <Plan
