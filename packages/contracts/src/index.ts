@@ -384,6 +384,29 @@ export const LocalSetupSchema = z
   )
   .refine(localProjectionFits, 'Local setup exceeds its encoded byte bound.');
 export type LocalSetup = z.infer<typeof LocalSetupSchema>;
+export const LocalHardwareStatusSchema = z
+  .strictObject({
+    cpuModel: localText(200).nullable(),
+    logicalCores: RevisionSchema.min(1).max(4096).nullable(),
+    architecture: z
+      .string()
+      .regex(/^[A-Za-z0-9._-]{1,32}$/)
+      .nullable(),
+    platform: z
+      .string()
+      .regex(/^[A-Za-z0-9._-]{1,32}$/)
+      .nullable(),
+    totalMemoryBytes: RevisionSchema.min(1).nullable(),
+    availableMemoryBytes: RevisionSchema.nullable(),
+    sampledAt: TimestampSchema,
+  })
+  .refine(
+    (status) =>
+      status.availableMemoryBytes === null ||
+      (status.totalMemoryBytes !== null && status.availableMemoryBytes <= status.totalMemoryBytes),
+    'Available Local memory needs a valid total memory bound.',
+  );
+export type LocalHardwareStatus = z.infer<typeof LocalHardwareStatusSchema>;
 export const LocalNativeProfileSchema = z
   .strictObject({
     id: z.literal('local-file-v1'),
@@ -3185,6 +3208,7 @@ export const WorkspaceStateSchema = z
     usageReaders: SnapshotSchema.shape.usageReaders,
     googleAcpSetup: SnapshotSchema.shape.googleAcpSetup,
     localSetup: SnapshotSchema.shape.localSetup,
+    localHardware: LocalHardwareStatusSchema.optional(),
     googleAcpInstall: SnapshotSchema.shape.googleAcpInstall,
     nativeConnections: SnapshotSchema.shape.nativeConnections,
     nativeProfiles: SnapshotSchema.shape.nativeProfiles,

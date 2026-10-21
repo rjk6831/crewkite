@@ -243,7 +243,7 @@ test('task snapshots retain related evidence within the unchanged frame bound', 
   const socketRoot = mkdtempSync(
     join(realpathSync(checkOwner()?.stateRoot ?? tmpdir()), 'ck-snap-'),
   );
-  const { controller, command, draft, fixtures, id } = await setup(t, {
+  const { controller, command, draft, fixtures, clock, id } = await setup(t, {
     home: join(socketRoot, 'home'),
     googleUsageClient: () => ({ available: false, reason: 'client-unavailable' }),
     openAiUsageClient: () => unavailableNativeProfile(),
@@ -400,6 +400,26 @@ test('task snapshots retain related evidence within the unchanged frame bound', 
   const receipts = controller.store.db.prepare('SELECT COUNT(*) AS n FROM receipts').get()?.n;
   const header = controller.workspaceState();
   assert.equal('tasks' in header, false);
+  assert(header.localHardware);
+  assert.equal(header.localHardware.sampledAt, clock.now());
+  assert.deepEqual(Object.keys(header.localHardware).sort(), [
+    'architecture',
+    'availableMemoryBytes',
+    'cpuModel',
+    'logicalCores',
+    'platform',
+    'sampledAt',
+    'totalMemoryBytes',
+  ]);
+  assert(
+    header.localHardware.logicalCores === null ||
+      (header.localHardware.logicalCores >= 1 && header.localHardware.logicalCores <= 4096),
+  );
+  assert(
+    header.localHardware.availableMemoryBytes === null ||
+      (header.localHardware.totalMemoryBytes !== null &&
+        header.localHardware.availableMemoryBytes <= header.localHardware.totalMemoryBytes),
+  );
   // Scoped reads must not materialize unrelated entity collections.
   const list = controller.store.list.bind(controller.store);
   controller.store.list = (kind) => {
@@ -414,6 +434,17 @@ test('task snapshots retain related evidence within the unchanged frame bound', 
   });
   try {
     const workspace = await client.workspaceState();
+    assert(workspace.localHardware);
+    const { availableMemoryBytes: headerAvailableMemory, ...headerHardware } = header.localHardware;
+    const { availableMemoryBytes: workspaceAvailableMemory, ...workspaceHardware } =
+      workspace.localHardware;
+    assert.deepEqual(workspaceHardware, headerHardware);
+    assert(
+      workspaceAvailableMemory === null ||
+        (workspace.localHardware.totalMemoryBytes !== null &&
+          workspaceAvailableMemory <= workspace.localHardware.totalMemoryBytes),
+    );
+    assert(headerAvailableMemory === null || headerAvailableMemory >= 0);
     assert.deepEqual(workspace.nativeConnections, header.nativeConnections);
     assert.equal(workspace.nativeConnections[0]?.state, 'unchecked');
     assert.deepEqual(workspace.googleAcpInstall, header.googleAcpInstall);

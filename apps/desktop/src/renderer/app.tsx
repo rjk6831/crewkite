@@ -2846,6 +2846,85 @@ function usageReading(value: UsageGaugeReading, label = value.label): UsageReadi
   };
 }
 
+const formatMemory = (bytes: number | null | undefined) =>
+  bytes === null || bytes === undefined ? 'Unknown' : `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
+
+function LocalHardwareCard({
+  snapshot,
+  workspace,
+}: {
+  snapshot: Pick<WorkspaceState, 'localHardware' | 'localSetup'>;
+  workspace: Workspace;
+}) {
+  const [refreshError, setRefreshError] = useState(false);
+  useEffect(() => {
+    let active = true;
+    void workspace.refresh().catch(() => {
+      if (active) setRefreshError(true);
+    });
+    return () => {
+      active = false;
+    };
+  }, [workspace.refresh]);
+  const setup = snapshot.localSetup;
+  const selection = setup?.selection;
+  const selectedModel =
+    selection &&
+    setup.reason !== 'selection-stale' &&
+    setup.observation?.observationHash === selection.observationHash
+      ? setup.observation.models.find((model) => model.selectionId === selection.selectionId)
+      : null;
+  const hardware = snapshot.localHardware;
+  const memory =
+    hardware?.totalMemoryBytes === null || hardware?.totalMemoryBytes === undefined
+      ? 'Unknown'
+      : hardware.availableMemoryBytes === null
+        ? `${formatMemory(hardware.totalMemoryBytes)} total, available unknown`
+        : `${formatMemory(hardware.availableMemoryBytes)} available of ${formatMemory(hardware.totalMemoryBytes)}`;
+  return (
+    <section className="card hardware-card">
+      <div className="section-heading">
+        <h2>
+          <Cpu size={15} />
+          Local hardware
+        </h2>
+        <span>{selectedModel ? 'Model selected' : hardware ? 'Hardware reported' : 'Unknown'}</span>
+      </div>
+      <div className="hardware-symbol">
+        <Cpu size={26} />
+      </div>
+      <h3>No provider quota</h3>
+      <p className="muted">Local inference depends on resident models and available hardware.</p>
+      <div className="hardware-row">
+        <span>Selected model</span>
+        <span>{selectedModel?.identity.displayName ?? 'Not selected'}</span>
+      </div>
+      <div className="hardware-row">
+        <span>Processor</span>
+        <span>{hardware?.cpuModel ?? 'Unknown'}</span>
+      </div>
+      <div className="hardware-row">
+        <span>Logical CPU cores</span>
+        <span>{hardware?.logicalCores ?? 'Unknown'}</span>
+      </div>
+      <div className="hardware-row">
+        <span>System</span>
+        <span>
+          {[hardware?.platform, hardware?.architecture].filter(Boolean).join(' ') || 'Unknown'}
+        </span>
+      </div>
+      <div className="hardware-row">
+        <span>Memory</span>
+        <span>{memory}</span>
+      </div>
+      <p className="muted small">
+        {hardware ? `Sampled ${hardware.sampledAt}.` : 'Hardware metadata is unavailable.'}
+        {refreshError ? ' The latest refresh could not be read.' : ''}
+      </p>
+    </section>
+  );
+}
+
 function Usage({
   snapshot,
   attempts,
@@ -2949,7 +3028,6 @@ function Usage({
       .map((reading) => usageReading(reading)),
     emptyText: 'No usage observations.',
   }));
-  const local = snapshot.routes.find(({ family }) => family === 'local');
   return (
     <main className="usage-page">
       <div className="page-heading">
@@ -3192,31 +3270,7 @@ function Usage({
             or account-wide usage.
           </p>
         </section>
-        <section className="card hardware-card">
-          <div className="section-heading">
-            <h2>
-              <Cpu size={15} />
-              Local hardware
-            </h2>
-            <span>{local?.qualified ? 'Route configured' : 'Unavailable'}</span>
-          </div>
-          <div className="hardware-symbol">
-            <Cpu size={26} />
-          </div>
-          <h3>No provider quota</h3>
-          <p className="muted">
-            Local inference depends on resident models and available hardware.
-          </p>
-          <div className="hardware-row">
-            <span>Memory observations</span>
-            <span>Unavailable</span>
-          </div>
-          <div className="hardware-row">
-            <span>Configured model</span>
-            <span>{local?.model ?? 'Not configured'}</span>
-          </div>
-          <p className="muted small">Hardware measurements are unavailable.</p>
-        </section>
+        <LocalHardwareCard snapshot={snapshot} workspace={workspace} />
       </div>
       <section className="card credits-card">
         <div className="section-heading">

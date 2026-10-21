@@ -13,6 +13,7 @@ import {
   readFileSync,
   realpathSync,
 } from 'node:fs';
+import { arch, cpus, freemem, platform, totalmem } from 'node:os';
 import { basename, isAbsolute, join, relative } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
@@ -76,6 +77,8 @@ import {
   LimitsSchema,
   LocalAuthModeSchema,
   LocalEndpointSchema,
+  type LocalHardwareStatus,
+  LocalHardwareStatusSchema,
   LocalModelObservationSchema,
   LocalModelSelectionSchema,
   LocalNativeProfileSchema,
@@ -326,6 +329,36 @@ const evaluationFloorMinutes = 11;
 // Owned cleanup escalates to SIGKILL within a second. A minute covers a slow host and matches the
 // whole-minute granularity of the minute ledger.
 const cleanupReserveMs = 60_000;
+const localHardwareStatus = (sampledAt: string): LocalHardwareStatus => {
+  const processors = cpus();
+  const model = processors.find((processor) => processor.model.trim())?.model.trim() ?? null;
+  const cpuModel =
+    model?.isWellFormed() === true &&
+    !/\p{Cc}/u.test(model) &&
+    new TextEncoder().encode(model).length <= 200
+      ? model
+      : null;
+  const architecture = arch();
+  const operatingSystem = platform();
+  const totalMemory = totalmem();
+  const availableMemory = freemem();
+  return LocalHardwareStatusSchema.parse({
+    cpuModel,
+    logicalCores: processors.length > 0 && processors.length <= 4096 ? processors.length : null,
+    architecture: /^[A-Za-z0-9._-]{1,32}$/.test(architecture) ? architecture : null,
+    platform: /^[A-Za-z0-9._-]{1,32}$/.test(operatingSystem) ? operatingSystem : null,
+    totalMemoryBytes: Number.isSafeInteger(totalMemory) && totalMemory > 0 ? totalMemory : null,
+    availableMemoryBytes:
+      Number.isSafeInteger(availableMemory) &&
+      availableMemory >= 0 &&
+      Number.isSafeInteger(totalMemory) &&
+      totalMemory > 0 &&
+      availableMemory <= totalMemory
+        ? availableMemory
+        : null,
+    sampledAt,
+  });
+};
 const nativeProviderRestriction: CommandResult = {
   outcome: 'blocked',
   reason: 'provider-policy-restricted',
@@ -1506,6 +1539,7 @@ export class Controller {
       nativeConnections: [this.nativeConnections().status()],
       nativeProfiles: this.resolveProfiles().map((profile) => profile.facts),
       localSetup: this.localSetup(),
+      localHardware: localHardwareStatus(this.now()),
       googleAcpSetup: this.store.googleAcpSetup(),
       usageReaders: [this.googleUsageReader(), this.openAiUsageReader()],
       routes: this.store.list('route'),
