@@ -1727,6 +1727,9 @@ async function conversationBridge(
       await page.keyboard.press('Escape');
     };
 
+    const expandNavigation = page.getByRole('button', { name: 'Expand sidebar', exact: true });
+    if (await expandNavigation.isVisible()) await expandNavigation.click();
+    await page.getByRole('button', { name: 'Plan with AI', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'New goal', exact: true })).toBeVisible();
     const toolbar = page.getByRole('group', { name: 'Composer controls', exact: true });
     const modelControl = toolbar.getByRole('button', { name: /^Architect model:/ });
@@ -3612,7 +3615,6 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
       dialog.showSaveDialog = async () => ({ canceled: false, filePath: path });
     }, destination);
     await enter(page.getByRole('button', { name: 'New task', exact: true }).first());
-    await page.getByRole('button', { name: 'Create task manually', exact: true }).click();
     const manualTask = createDemoFixtures().task;
     await expect(page.getByLabel('Task title', { exact: true })).toHaveValue('');
     await expect(page.getByLabel('Outcome', { exact: true })).toHaveValue('');
@@ -3627,6 +3629,13 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     const created = await timeline.wait((event) => event.type === 'task.created');
     assert.equal(created.type, 'task.created');
     const taskId = created.payload.id;
+    await expect(page.getByRole('heading', { name: manualTask.title, exact: true })).toBeVisible();
+    await expect(page.getByRole('tab', { name: 'Conversation', exact: true })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+    await page.getByRole('tab', { name: 'Plan', exact: true }).click();
+    await page.getByRole('button', { name: 'Prepare run', exact: true }).click();
     await enter(
       page
         .getByRole('dialog', { name: 'Choose execution provider', exact: true })
@@ -3913,11 +3922,15 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
       .toEqual(replacementProfiles);
     await expect(page.getByText('Controller connected', { exact: true })).toBeVisible();
     await enter(page.getByRole('button', { name: 'New task', exact: true }).first());
-    await page.getByRole('button', { name: 'Create task manually', exact: true }).click();
     await page.getByLabel('Task title', { exact: true }).fill('Retain one native file proposal');
     await page.getByLabel('Outcome', { exact: true }).fill(manualTask.outcome);
     await page.getByLabel(/^Acceptance criteria/).fill(manualTask.criteria.join('\n'));
     await enter(page.getByRole('dialog').getByRole('button', { name: 'Create task', exact: true }));
+    await expect(
+      page.getByRole('heading', { name: 'Retain one native file proposal', exact: true }),
+    ).toBeVisible();
+    await page.getByRole('tab', { name: 'Plan', exact: true }).click();
+    await page.getByRole('button', { name: 'Prepare run', exact: true }).click();
     const nativeFileProfile = replacementProfiles.find(
       (profile) => profile.id === 'openai-file-v1',
     );
@@ -4567,6 +4580,71 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     );
     assert.equal(git(source, ['rev-parse', acceptedRef]).toString().trim(), acceptedCommit);
     assert.deepEqual(sourceIdentity(source), original);
+
+    const sidebarSource = join(home, 'sidebar-project');
+    mkdirSync(sidebarSource);
+    git(sidebarSource, ['init', '--quiet']);
+    const sidebarProject = cli(home, 'project', 'add', sidebarSource);
+    assert.equal(sidebarProject.result.outcome, 'applied');
+    const sidebarProjectId = sidebarProject.result.entity.id;
+    const projectGroup = page.locator('.project-group').filter({
+      has: page.getByText('sidebar-project', { exact: true }),
+    });
+    await expect(projectGroup.locator('.count')).toHaveText('0');
+    await expect(projectGroup.getByText('No tasks yet', { exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Collapse sidebar', exact: true }).click();
+    await page.getByRole('button', { name: 'New task', exact: true }).click();
+    const definitionDialog = page.getByRole('dialog', { name: 'New task', exact: true });
+    await expect(definitionDialog.getByLabel('Task title', { exact: true })).toHaveValue('');
+    await expect(definitionDialog.getByLabel('Project', { exact: true })).toHaveValue(
+      nativeTask.projectId,
+    );
+    await page.keyboard.press('Escape');
+    await page.getByRole('button', { name: 'Expand sidebar', exact: true }).click();
+    await projectGroup
+      .getByRole('button', { name: 'New task in sidebar-project', exact: true })
+      .click();
+    await expect(definitionDialog.getByLabel('Project', { exact: true })).toHaveValue(
+      sidebarProjectId,
+    );
+    await expect(projectGroup.locator('.count')).toHaveText('0');
+    await page.keyboard.press('Escape');
+    await expect(projectGroup.getByText('No tasks yet', { exact: true })).toBeVisible();
+    await projectGroup
+      .getByRole('button', { name: 'Create first task in sidebar-project', exact: true })
+      .click();
+    await expect(definitionDialog.getByLabel('Project', { exact: true })).toHaveValue(
+      sidebarProjectId,
+    );
+    const sidebarTaskTitle = 'Retain a manually defined task in its chosen project';
+    await definitionDialog.getByLabel('Task title', { exact: true }).fill(sidebarTaskTitle);
+    await definitionDialog
+      .getByLabel('Outcome', { exact: true })
+      .fill('Save the reviewed task definition in the selected project.');
+    await definitionDialog
+      .getByLabel(/^Acceptance criteria/)
+      .fill('The saved task belongs to sidebar-project.');
+    await definitionDialog.getByRole('button', { name: 'Create task', exact: true }).click();
+    await expect(definitionDialog).toHaveCount(0);
+    await expect(page.getByRole('heading', { name: sidebarTaskTitle, exact: true })).toBeVisible();
+    await expect(page.getByRole('tab', { name: 'Conversation', exact: true })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+    await expect(projectGroup.locator('.count')).toHaveText('1');
+    await expect(
+      projectGroup.getByRole('button', { name: sidebarTaskTitle, exact: true }),
+    ).toHaveAttribute('aria-current', 'page');
+    await expect(projectGroup.getByText('No tasks yet', { exact: true })).toHaveCount(0);
+    await expect(
+      page.getByRole('dialog', { name: 'Choose execution provider', exact: true }),
+    ).toHaveCount(0);
+    const savedSidebarTask = (await observer.snapshot()).tasks.find(
+      (task) => task.title === sidebarTaskTitle,
+    );
+    assert(savedSidebarTask);
+    assert.equal(savedSidebarTask.projectId, sidebarProjectId);
+    assert.equal(savedSidebarTask.state, 'draft');
 
     await taskActivityHistory(application, page);
     await projectOperationsJourney(application, page);

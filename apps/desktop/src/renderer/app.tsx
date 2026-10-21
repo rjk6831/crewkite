@@ -776,6 +776,11 @@ export function App() {
   const approvalCard = useRef<HTMLElement>(null);
   const [about, setAbout] = useState(false);
   const task = newGoal ? undefined : snapshot?.tasks.find(({ id }) => id === selected);
+  const selectedProjectId = task?.projectId;
+  useEffect(() => {
+    if (selectedProjectId && !taskPages[selectedProjectId])
+      void workspace.loadTasks(selectedProjectId);
+  }, [selectedProjectId, taskPages, workspace.loadTasks]);
   function openCreateTask(projectId?: string) {
     setCreateProjectId(projectId ?? task?.projectId ?? projects[0]?.id);
     setCreate(true);
