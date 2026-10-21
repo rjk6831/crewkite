@@ -3142,9 +3142,16 @@ function Usage({
                     </p>
                   </>
                 ) : family === 'local' ? (
-                  <p className="muted small">
-                    Local resource capacity has no subscription quota reader.
-                  </p>
+                  <div className="local-usage-copy">
+                    <pre>
+                      <code>
+                        {
+                          'Roots.NoLimits({ engine: localAI, subscriptionQuota: null, limits: [hardware, imagination] });'
+                        }
+                      </code>
+                    </pre>
+                    <p className="muted small">Runs on your hardware. No subscription quota.</p>
+                  </div>
                 ) : (
                   <>
                     <p className="muted small">
@@ -3481,6 +3488,10 @@ function About({ onClose, preview }: { onClose: () => void; preview: boolean }) 
   return (
     <Dialog title="About CrewKite" eyebrow="LOCAL CODING WORKSPACE" onClose={onClose}>
       <div className="about-content">
+        <div className="about-attribution">
+          <strong>CrewKite by Roots No Limits LLC</strong>
+          <span>Created by Raymond J. Kraft</span>
+        </div>
         <p>
           One controller owns task state, authority and result identity. The desktop and CLI are
           clients of the same workspace.
@@ -3520,8 +3531,8 @@ function About({ onClose, preview }: { onClose: () => void; preview: boolean }) 
           reviews that ran.
         </p>
         <div className="about-license">
-          <span>Apache License 2.0</span>
-          <span>Copyright 2026 Raymond J. Kraft</span>
+          <span>Roots No Limits LLC</span>
+          <span>Apache License 2.0 · Copyright 2026 Raymond J. Kraft</span>
         </div>
       </div>
     </Dialog>

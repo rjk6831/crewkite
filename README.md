@@ -7,6 +7,8 @@
 
 CrewKite is a desktop workspace and CLI for coding tasks that share one local controller. It tracks approvals, usage observations and retained work across provider routes.
 
+CrewKite by Roots No Limits LLC. Created by Raymond J. Kraft.
+
 I completed ten real D2 backlog outcomes through the checked workflow. [D2 UAT 02](https://github.com/rjk6831/crewkite/releases/tag/d2-uat-02) then failed installed user acceptance. Downloaded launch, provider setup and persistent project-selection errors blocked ordinary use. That candidate remains available for issue reproduction.
 
 [D2b UAT 02](https://github.com/rjk6831/crewkite/releases/tag/d2b-uat-02) adds bounded artifact reads and retained activity output to the workspace paging, provider setup and project-selection recovery released in [D2b UAT 01](https://github.com/rjk6831/crewkite/releases/tag/d2b-uat-01). Its [required CI](https://github.com/rjk6831/crewkite/actions/runs/39567783678) passed 111 Node claims and one desktop journey. The matching package passed static inventory, disposable upgrade, cold launch and same-home reopen checks. Public anonymous downloads matched all three release assets. The GitHub CLI download matched the archive; Chrome blocked this candidate before creating a file. Human UAT remains pending.

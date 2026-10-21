@@ -1805,6 +1805,26 @@ kbd {
   margin-bottom: 0;
   font-size: 9px;
 }
+.local-usage-copy {
+  display: grid;
+  gap: 9px;
+}
+.local-usage-copy pre {
+  margin: 0;
+  padding: 11px 12px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-muted);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 9px;
+  line-height: 1.55;
+}
+.local-usage-copy p {
+  margin: 0;
+}
 .credit-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -2361,6 +2381,19 @@ kbd {
 .about-content > p {
   font-size: 11px;
 }
+.about-attribution {
+  display: grid;
+  gap: 5px;
+  margin-bottom: 18px;
+}
+.about-attribution strong {
+  color: var(--text);
+  font-size: 16px;
+}
+.about-attribution span {
+  color: var(--text-muted);
+  font-size: 11px;
+}
 .about-build {
   display: flex;
   align-items: center;
@@ -2418,6 +2451,7 @@ kbd {
   border-top: 1px solid var(--border);
   margin-top: 24px;
   padding-top: 16px;
+  flex-wrap: wrap;
 }
 .spin {
   animation: spin 1.5s linear infinite;
