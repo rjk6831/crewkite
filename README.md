@@ -7,7 +7,11 @@
 
 CrewKite is a desktop workspace and CLI for coding tasks that share one local controller. It tracks approvals, usage observations and retained work across provider routes.
 
-I completed ten real D2 backlog outcomes through the checked workflow. [D2 UAT 02](https://github.com/rjk6831/crewkite/releases/tag/d2-uat-02) then failed installed user acceptance. Downloaded launch, provider setup and persistent project-selection errors blocked ordinary use. I retained that candidate for issue reproduction and marked its release accordingly. The earlier checks and task outcomes do not establish installed usability. D2b repairs are landing in stages; a replacement package requires matching CI and installed recovery evidence before another UAT handoff. The [daily-work plan](docs/daily-work-slices.md) tracks that work, and the [roadmap](docs/roadmap.md) keeps D3 behind its separate approval gate.
+I completed ten real D2 backlog outcomes through the checked workflow. [D2 UAT 02](https://github.com/rjk6831/crewkite/releases/tag/d2-uat-02) then failed installed user acceptance. Downloaded launch, provider setup and persistent project-selection errors blocked ordinary use. That candidate remains available for issue reproduction.
+
+[D2b UAT 01](https://github.com/rjk6831/crewkite/releases/tag/d2b-uat-01) is now published with workspace paging, guided provider setup and recovery from a pending project selection. Its [required CI](https://github.com/rjk6831/crewkite/actions/runs/39509480936) passed 109 Node claims and one desktop journey. The checksum-matched browser download passed native extraction, cold launch and same-home reopen on one existing Mac. A disposable upgrade from D2 UAT 02 preserved the complete target and backup state, retained Local configuration and recovered the pending project command before adding a valid project. Human UAT remains pending.
+
+This macOS arm64 preview has an ad-hoc integrity seal. It has no Developer ID signature or notarization and needs the documented trust step scoped to the verified folder. The isolated cold-launch check did not repeat native account sign-in. The public [release receipt](https://github.com/rjk6831/crewkite/releases/download/d2b-uat-01/release.json) records the source, archive checksum and qualification limits. Large artifact reads, project commands and GitHub work remain unreleased. The [daily-work plan](docs/daily-work-slices.md) tracks the next slices; [D3](docs/roadmap.md) keeps its separate approval gate.
 
 ## Why I am building it
 
@@ -66,7 +70,7 @@ The diagram shows the supported decision flow. Checks, review and branch accepta
 
 Collapse sidebar keeps Search, New task and Usage and capacity in a compact rail. Expand sidebar restores the project and task list.
 
-Press `Cmd+K` or `Ctrl+K`, or choose Search, to open tasks and commands. Search matches task titles, outcomes, criteria, task and project IDs, project names and command labels in the current snapshot. Conversation messages are not searched. Tasks show their project, state and task ID suffix, with five matches per page.
+Press `Cmd+K` or `Ctrl+K`, or choose Search, to open tasks and commands. Search pages the retained task collection by task titles, outcomes, criteria, task and project IDs and project names, alongside command labels. Conversation messages are not searched. Tasks show their project, state and task ID suffix, with five matches per page.
 
 Use Up and Down to select a result, then Enter to open it. Page Up and Page Down move between task pages; Previous tasks and Next tasks provide the same controls. `Escape` closes search and dialogs.
 
