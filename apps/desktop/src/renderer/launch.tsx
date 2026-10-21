@@ -988,7 +988,9 @@ function ExecutionLaunch(props: LaunchProps) {
   });
   const [readingWorker, setReadingWorker] = useState(false);
   const [workerMessage, setWorkerMessage] = useState<string | null>(null);
-  const selectableProfiles = props.snapshot.nativeProfiles.filter(availableForNewExecution);
+  const selectableProfiles = props.snapshot.nativeProfiles.filter(
+    (profile) => profile.id === 'openai-repository-v1' && availableForNewExecution(profile),
+  );
   const providerFamilies = [...new Set(selectableProfiles.map((profile) => profile.family))];
   const [providerFamily, setProviderFamily] = useState<
     Snapshot['nativeProfiles'][number]['family'] | ''
@@ -1141,9 +1143,10 @@ function ExecutionLaunch(props: LaunchProps) {
             Resolve the pending command before choosing another provider.
           </p>
         )}
-        {!props.snapshot.nativeProfiles.length && (
+        {!selectableProfiles.length && (
           <p className="notice" role="status">
-            The provider catalog is unavailable. Refresh the saved workspace before preparing.
+            OpenAI Project is unavailable in this controller snapshot. Refresh the saved workspace
+            before preparing.
           </p>
         )}
         {!!selectableProfiles.length && (
