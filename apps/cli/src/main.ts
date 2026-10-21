@@ -8,6 +8,7 @@ import {
   linkSync,
   openSync,
   readFileSync,
+  readSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -33,6 +34,7 @@ import {
   ConversationModelRequestSchema,
   ConversationPlanningSelectionSchema,
   canonicalJson,
+  GitHubReadRequestSchema,
   LocalAuthModeSchema,
   LocalEndpointSchema,
   LocalModelSelectionSchema,
@@ -41,6 +43,7 @@ import {
   NativeTargetContextLinesSchema,
   PolicySchema,
   PrepareCombinedRunPayloadSchema,
+  PrepareProjectCommandRequestSchema,
   ProjectNodeTestFilesSchema,
   ProjectSchema,
   type Snapshot,
@@ -57,6 +60,12 @@ const help = `Usage: crewkite project add <path> [--json] [--home path]
        crewkite task create <project-id> --title text --outcome text --criterion text [--criterion text ...] [--json] [--home path]
        crewkite task <list|show|watch|start|pause|stop|resume|switch|approve|deny> [id] [--json] [--home path]
        crewkite artifact <read|verify|save> <artifact-id> [--output new-file] [--json] [--home path]
+       crewkite task operations <task-id> [--before-id operation-id] [--limit 1..20] [--json] [--home path]
+       crewkite task operation <task-id> <operation-id> [--json] [--home path]
+       crewkite task command-prepare <task-id> --definition file [--json] [--home path]
+       crewkite task command-start <task-id> <operation-id> --definition-hash hash --copy-committed-source --native-trust [--json] [--home path]
+       crewkite task operation-stop <task-id> <operation-id> [--json] [--home path]
+       crewkite task github <task-id> --request file [--json] [--home path]
        crewkite task activity <task-id> [--before-cursor cursor] [--json] [--home path]
        crewkite task list [--pages --json] [--home path]
        crewkite task amend <task-id> --title text --outcome text --criterion text [--criterion text ...] [--json] [--home path]
@@ -136,6 +145,12 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
       options: {
         json: { type: 'boolean' },
         pages: { type: 'boolean' },
+        definition: { type: 'string' },
+        request: { type: 'string' },
+        'definition-hash': { type: 'string' },
+        'copy-committed-source': { type: 'boolean' },
+        'before-id': { type: 'string' },
+        limit: { type: 'string' },
         home: { type: 'string' },
         help: { type: 'boolean', short: 'h' },
         text: { type: 'string' },
@@ -183,11 +198,63 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
       return 0;
     }
     const [area, action, id, ...extra] = positionals;
+    const operationAction =
+      area === 'task' &&
+      [
+        'operations',
+        'operation',
+        'command-prepare',
+        'command-start',
+        'operation-stop',
+        'github',
+      ].includes(action);
+    if (operationAction) {
+      const options = [
+        'json',
+        'home',
+        ...(action === 'operations'
+          ? ['before-id', 'limit']
+          : action === 'command-prepare'
+            ? ['definition']
+            : action === 'command-start'
+              ? ['definition-hash', 'copy-committed-source', 'native-trust']
+              : action === 'github'
+                ? ['request']
+                : []),
+      ];
+      if (!id || Object.keys(values).some((key) => !options.includes(key)))
+        throw Error('Invalid operation options. Use --help.');
+      const takesOperation = ['operation', 'command-start', 'operation-stop'].includes(action);
+      if (extra.length !== (takesOperation ? 1 : 0))
+        throw Error('Use the exact task and operation identities.');
+      if (action === 'command-prepare' && !values.definition)
+        throw Error('Supply --definition with the exact command JSON.');
+      if (action === 'github' && !values.request)
+        throw Error('Supply --request with the scoped GitHub read JSON.');
+      if (
+        action === 'command-start' &&
+        (!values['definition-hash'] || !values['copy-committed-source'] || !values['native-trust'])
+      )
+        throw Error(
+          'Start requires --definition-hash, --copy-committed-source and --native-trust.',
+        );
+    } else if (
+      [
+        'definition',
+        'request',
+        'definition-hash',
+        'copy-committed-source',
+        'before-id',
+        'limit',
+      ].some((key) => key in values)
+    )
+      throw Error('These options require a task operation action.');
     if (
       (extra.length &&
         !(
           area === 'task' &&
-          ((['switch', 'accept'].includes(action) && extra.length === 1) ||
+          ((['switch', 'accept', 'operation', 'command-start', 'operation-stop'].includes(action) &&
+            extra.length === 1) ||
             (action === 'prepare-native' && extra.length === 2) ||
             (['prepare-evaluation', 'prepare-repository', 'prepare-handoff'].includes(action) &&
               extra.length === 1))
@@ -352,6 +419,12 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
         })
       : undefined;
     const supported = [
+      'operations',
+      'operation',
+      'command-prepare',
+      'command-start',
+      'operation-stop',
+      'github',
       'activity',
       'create',
       'amend',
@@ -518,6 +591,7 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
       !preparing &&
       !evaluating &&
       !preparingHandoff &&
+      !(operationAction && action === 'command-start') &&
       (values.policy ||
         values['native-trust'] ||
         values['source-consent'] ||
@@ -853,6 +927,107 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
       receipt(result, command, savedTo);
       return succeeded(result) ? 0 : 2;
     };
+    if (operationAction) {
+      const finishOperation = async (result: CommandResult) => {
+        const code = await finishAction(result);
+        if (!values.json && result.data?.kind === 'project-operation') {
+          const data = result.data;
+          output.out(
+            terminalText(
+              `Operation ${data.operation.id}  ${data.operation.state}\nDefinition hash ${data.operation.definition.hash}\n${data.githubResult ? `GitHub ${data.githubResult.state} ${data.githubResult.status ?? data.githubResult.reason}\n` : ''}`,
+            ),
+          );
+        }
+        return code;
+      };
+      if (action === 'operations') {
+        const result = await request('GetTaskOperations', {
+          taskId: id,
+          ...(values['before-id'] ? { beforeId: values['before-id'] } : {}),
+          limit: values.limit === undefined ? 20 : Number(values.limit),
+        });
+        if (!succeeded(result) || result.data?.kind !== 'task-operations')
+          return await finishOperation(result);
+        const page = result.data;
+        if (page.taskId !== id) throw Error('The operation page names another task.');
+        print(
+          page,
+          terminalText(
+            `${page.operations.map((operation) => `${operation.id}  ${operation.kind}  ${operation.state}${operation.reason ? `  ${operation.reason}` : ''}`).join('\n') || 'No retained operations.'}\n${page.nextBeforeId ? `More operations: --before-id ${page.nextBeforeId}` : 'Complete through this page.'}`,
+          ),
+        );
+        return 0;
+      }
+      if (action === 'operation') {
+        const result = await request('GetProjectOperation', { taskId: id, operationId: extra[0] });
+        if (!succeeded(result) || result.data?.kind !== 'project-operation')
+          return await finishOperation(result);
+        if (result.data.operation.taskId !== id || result.data.operation.id !== extra[0])
+          throw Error('The operation identity changed.');
+        print(result.data, terminalText(JSON.stringify(result.data, null, 2)));
+        return 0;
+      }
+      if (action === 'command-prepare') {
+        const definition = PrepareProjectCommandRequestSchema.parse(
+          readOperationJson(values.definition as string),
+        );
+        if (definition.taskId !== id) throw Error('The definition must name the same task.');
+        return await finishOperation(await request('PrepareProjectCommand', definition, 0));
+      }
+      if (action === 'operation-stop')
+        return await finishOperation(
+          await request('StopProjectOperation', { taskId: id, operationId: extra[0] }, 0),
+        );
+      if (action === 'github')
+        return await finishOperation(
+          await request(
+            'ReadGitHub',
+            {
+              taskId: id,
+              request: GitHubReadRequestSchema.parse(readOperationJson(values.request as string)),
+            },
+            0,
+          ),
+        );
+      const reviewed = await request('GetProjectOperation', { taskId: id, operationId: extra[0] });
+      if (!succeeded(reviewed)) return await finishOperation(reviewed);
+      if (reviewed.data?.kind !== 'project-operation' || !reviewed.data.definition)
+        throw Error('The reviewed command definition is unavailable.');
+      const data = reviewed.data;
+      if (
+        data.operation.id !== extra[0] ||
+        data.operation.taskId !== id ||
+        data.operation.state !== 'prepared' ||
+        data.operation.definition.hash !== values['definition-hash']
+      )
+        throw Error(
+          'The reviewed operation or definition hash changed. Inspect it before starting.',
+        );
+      const definition = data.definition;
+      if (!definition) throw Error('The reviewed command definition is unavailable.');
+      const expiresAt = new Date(Date.now() + definition.deadlineMs + 5000).toISOString();
+      return await finishOperation(
+        await request(
+          'StartProjectCommand',
+          {
+            taskId: id,
+            operationId: extra[0],
+            definitionHash: values['definition-hash'],
+            sourceConsent: 'explicit',
+            nativeTrust: 'accepted',
+            grant: {
+              action: 'run-native-tools',
+              target: values['definition-hash'],
+              taskId: id,
+              expiresAt,
+              revoked: false,
+              usesRemaining: 1,
+            },
+          },
+          0,
+        ),
+      );
+    }
     if (creation?.success) {
       sent = creation.data;
       return await finishAction(await connected.command(sent));
@@ -1915,6 +2090,37 @@ function approvalText(approvals: Snapshot['approvals']) {
         `\nApproval ${approval.approvalId}: ${approval.action} ${approval.target}\n${approval.consequence}\nApprove: crewkite task approve ${approval.approvalId}\nDeny: crewkite task deny ${approval.approvalId}`,
     )
     .join('');
+}
+
+function readOperationJson(path: string): unknown {
+  const file = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+  try {
+    const before = fstatSync(file);
+    if (!before.isFile() || before.size > 262144)
+      throw Error('Operation input must be a regular JSON file up to 262144 bytes.');
+    const buffer = Buffer.alloc(262145);
+    let length = 0;
+    while (length < buffer.length) {
+      const read = readSync(file, buffer, length, buffer.length - length, null);
+      if (!read) break;
+      length += read;
+    }
+    const after = fstatSync(file);
+    if (
+      length > 262144 ||
+      before.size !== length ||
+      before.mtimeMs !== after.mtimeMs ||
+      before.ctimeMs !== after.ctimeMs
+    )
+      throw Error('Operation input changed or exceeded its bound.');
+    try {
+      return JSON.parse(buffer.subarray(0, length).toString('utf8'));
+    } catch {
+      throw Error('Operation input must contain valid JSON.');
+    }
+  } finally {
+    closeSync(file);
+  }
 }
 
 function readJson(path: string): unknown {

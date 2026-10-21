@@ -476,3 +476,42 @@ pnpm crewkite retry receipt.json --json
 Retry validates the bounded receipt file and resends its command unchanged. It never builds a new approval or refreshes an old grant. For an applied export receipt, `retry receipt.json --output new.patch` saves the same verified artifact without creating another export command. A failed local save still prints the original action receipt. Both interfaces use the controller's policy and permission rules.
 
 Exit status is 0 for an applied action or a successful read, 2 for a controller refusal or uncertain result, and 1 for local input or connection errors. JSON preserves typed provider output. Plain output escapes terminal controls. Plain watch output contains event identities and revisions.
+
+## Project commands and GitHub reads
+
+Operations belong to one task. List one bounded page of up to twenty operations, then use its explicit continuation to inspect older entries. JSON preserves the exact page, including `nextBeforeId`; a non-null value means more history remains.
+
+```sh
+crewkite task operations TASK --limit 20 --json
+crewkite task operations TASK --before-id OPERATION --json
+crewkite task operation TASK OPERATION --json
+```
+
+Prepare a command from an explicit JSON file. Preparation freezes the committed source and executable identity and starts no command. The file names the same task, a `lint`, `test` or `build` recipe, executable, argument array, relative working directory and deadline from 1,000 to 86,400,000 milliseconds. An optional `environment` object accepts only the contract's named environment keys. Inputs must be regular files, cannot use a final symbolic link and must fit 262,144 bytes.
+
+```json
+{"taskId":"TASK","recipe":"test","executable":"/absolute/path/to/node","argv":["test.mjs"],"cwdRelative":".","deadlineMs":30000}
+```
+
+```sh
+crewkite task command-prepare TASK --definition command.json --json
+crewkite task operation TASK OPERATION --json
+crewkite task command-start TASK OPERATION --definition-hash HASH --copy-committed-source --native-trust --json
+crewkite task operation-stop TASK OPERATION --json
+```
+
+Command results are retained exploratory evidence from the reviewed committed HEAD. Candidate acceptance still requires its configured trusted checks and review.
+
+Review the returned definition and its artifact hash before Start. Start re-reads that exact prepared operation and requires the same hash. Both flags are explicit authority for the committed-source copy and native tool execution. The CLI creates a fresh, single-use `run-native-tools` grant targeted to the hash, expiring five seconds after the loaded command deadline. Stop names the exact operation and does not load a workspace snapshot. Output artifacts use the existing `artifact read`, `verify` and `save` commands. An uncertain result stays retained; it does not authorize another launch.
+
+GitHub reads use a separate JSON request with an explicit repository host, owner, name and immutable `headSha`. Supported kinds are `pull-request` with `pullRequest`, `workflow-run` with `runId` and numeric `attempt`, or `job-log` with those run fields and `jobId`. Remote IDs are decimal strings. These are fixed GET operations through the controller, with no login or remote mutation command.
+
+```json
+{"kind":"job-log","repository":{"host":"github.com","owner":"OWNER","name":"REPOSITORY"},"headSha":"EXACT_HEAD_SHA","runId":"123","attempt":1,"jobId":"456"}
+```
+
+```sh
+crewkite task github TASK --request github-read.json --json
+```
+
+Mutation output retains the exact command key and result through the normal receipt format. `crewkite retry RECEIPT` resends that same command identity; it grants no new operation. Missing authentication, changed source and unavailable output keep their controller reason.
