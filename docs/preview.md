@@ -35,7 +35,7 @@ I record the exact source revision, verification and provider qualification in t
 
 ## Start a task
 
-These steps describe the next candidate workflow. Do not use them with the latest download until a matching package and release receipt pass the required checks.
+These steps apply to the [D2b UAT 03 prerelease](https://github.com/rjk6831/crewkite/releases/tag/d2b-uat-03). Read its release receipt before testing a provider route.
 
 1. Open the normal candidate. Packaging details are in the [distribution notes](distribution.md).
 2. Choose Connect providers and check the clients you plan to use. Coding setup readiness and quota are separate facts. A connected client does not make every Project engine ready.
@@ -46,7 +46,7 @@ These steps describe the next candidate workflow. Do not use them with the lates
 
 Plan with AI is optional. If you use it, send a bounded objective, read the answers, criteria and scope, and choose Adopt plan only when they match your intent. Adoption saves the task contract and starts no coding work.
 
-For a normal new task, choose Prepare run. Keep the Project scope and OpenAI Project profile, then select a model and effort from the loaded advertised choices when available. Choose Start task to open the permission draft. Subscription only is the default. Read the exact source and policy, then select “Allow OpenAI to read this project, edit a separate working copy, and run local commands using my signed-in client.” Choose Review task to save that preparation, review it once more, then choose Start task. Work runs in a separate scratch copy.
+For a normal new task, choose Prepare run. Keep the Project scope and OpenAI Project profile. A successful planning turn can retain advertised model and effort choices; the profile default applies before that catalog exists. Choose Start task to open the permission draft. Subscription only is the default. Read the exact source and policy, then select “Allow OpenAI to read this project, edit a separate working copy, and run local commands using my signed-in client.” Choose Review task to save that preparation, review it once more, then choose Start task. Work runs in a separate scratch copy.
 
 A material model or effort Save creates a linked planning run and returns the contract to provisional, so adopt a fresh valid plan before preparing execution again. Make material planning changes before execution begins, since that Save is scoped to the discussion. Once an execution run exists, it is retained, and material planning changes are unavailable there. Ordinary messages remain guidance and do not replace that run.
 
@@ -70,18 +70,9 @@ Open Connect providers from the workspace sidebar. The same controls appear in U
 
 Local uses a dedicated token by default. Enter the loopback endpoint and choose Connect once. The packaged app saves a changed endpoint, requests the token through its native input, connects and discovers loaded models automatically. It checks status once per second for up to 20 attempts without overlapping requests; use the single Refresh action if it takes longer. Select an observed model to save it immediately. Load or unload models in the Local app. An explicit CLI configuration can instead select no authentication, limited to this device's loopback address. The main interface has no selector and never switches modes automatically. See the [provider notes](providers.md#local-models) and the [CLI guide](../apps/cli/README.md). Model eligibility is not qualification. An eligible model stays unmeasured until separate evidence covers it.
 
-### Use Google for one file
+### Google single-file support
 
-The Google ACP profile can edit one existing committed UTF-8 text file within 64 KiB. A recorded workflow completed checks, separate review, local branch acceptance and same-home reopen. Other advertised models remain subject to their own observed behavior and quota rules; see the [current model boundaries](providers.md#google-acp-writer).
-
-1. Complete the Google setup sequence above and confirm that discovery has returned model choices. A missing client, incomplete sign-in or missing verified permission mapping keeps preparation unavailable.
-2. Add the Git project and create a task. If you use planning, review and adopt its file scope before execution. The current primary planning role uses the supported OpenAI profile; Google selection happens during coding preparation.
-3. Open execution preparation, choose Native file proposal and select Google ACP single-file proposal. Choose the existing committed target, an advertised Google model and its optional thought level. Set finite limits that leave room for the later check and review.
-4. Review the subscription-only and separate quota-account confirmations, native trust and source-sharing permission. Choose Prepare native proposal, inspect the saved source and settings, then Start. Preparation sends no model prompt. Start rechecks the selected configuration and quota.
-5. Inspect each pending edit's exact old and new text and approve or deny it. Every edit needs its own human decision. Open Changes after normal completion to inspect the retained candidate.
-6. Open Checks and review, select a supported OpenAI reviewer and prepare the separate check and review permissions. Run the supported checks, then start review after they pass. A passing candidate still needs destination-specific approval before Accept candidate creates a new local branch. Quit and reopen the same installed CrewKite folder with its existing home, then inspect the retained task and candidate. Keep the initialized home in place.
-
-Google project commands, repository-wide editing, delegation, lead and orchestrator roles, formal review and automatic handoff are not implemented in this profile. The manual [native workspace connector](providers.md#google-native-workspace-context) shares bounded task context with a separately operated native client and retains unverified output. The [CLI guide](../apps/cli/README.md#google-acp-setup) also documents the explicit setup and single-file task commands.
+The Google ACP profile retains its bounded one-file workflow for existing saved runs and the CLI. It is not offered in the normal New task execution chooser. Each edit still needs a separate approval. Google project commands, repository-wide editing, delegation, lead and orchestrator roles, formal review and automatic handoff are not implemented in this profile. See the [current model boundaries](providers.md#google-acp-writer) and [CLI setup and task commands](../apps/cli/README.md#google-acp-setup).
 
 ## Usage and context
 
