@@ -718,7 +718,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     },
     { name: 'missing-family', args: ['usage', 'refresh'], invalid: true },
     { name: 'openai', args: ['usage', 'refresh', '--family', 'openai'] },
-    { name: 'wrong-family', args: ['usage', 'refresh', '--family', 'anthropic'], invalid: true },
+    { name: 'wrong-family', args: ['usage', 'refresh', '--family', 'local'], invalid: true },
     { name: 'show-family', args: ['usage', 'show', '--family', 'google'], invalid: true },
     { name: 'wrong-command', args: ['health', '--consent'], invalid: true },
     { name: 'extra', args: ['usage', 'show', 'other'], invalid: true },
