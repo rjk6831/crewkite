@@ -29,6 +29,15 @@ Running Claude Code in a product requires the publisher's agreement to Anthropic
 
 The shipped `google-acp-v1` profile has its own setup, model selection and edit approvals. Its design decision remains [Proposed ADR 0024](adr/0024-integrate-google-through-its-published-acp-agent.md). The older consumer `google-file-v1` profile refuses preparation and Start before native discovery, and the interface keeps that separate refusal visible. An installed client or user billing attestation establishes no integration permission or guaranteed included billing. Anthropic keeps its existing local native path without forcing a login method.
 
+The next candidate changes the normal task entry while preserving old runs:
+
+| Task path | New task entry | Retained state |
+|-----------|----------------|----------------|
+| OpenAI Project | Normal path for a newly defined task. It reads the committed project, works in separate scratch and requires explicit local-command permission. | Model and effort bind to the retained advertised catalog and are checked again at Start. Subscription only is the default. |
+| Legacy single-file profiles | Not offered as the normal new-task path. | Existing saved runs remain inspectable and recoverable under their original source and profile. |
+
+This interface change is unreleased until a matching package and release receipt complete their required checks. A connected provider or advertised model alone does not make the OpenAI Project engine or any other Project engine ready.
+
 Retained candidates remain inspectable and exportable through the existing permission path. I can save a patch and open a provider's native app myself. CrewKite does not automate that transfer, claim automatic import or reuse the native app's account through a fallback.
 
 The following sections record exact pilot mechanics and adapter limits. Prior Google evidence does not authorize new consumer launches. General live routing remains unqualified.
