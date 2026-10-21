@@ -367,7 +367,9 @@ export function ProjectOperations({
       </div>
       <p className="muted small">
         Prepare local checks before starting them, or request GitHub status and logs with GET-only
-        reads. These controls do not grant planning authority or authorize remote changes.
+        reads. These commands use the reviewed committed source. Candidate acceptance still requires
+        its configured checks and review. These controls do not grant planning authority or
+        authorize remote changes.
       </p>
       {error && <p role="alert">{error}</p>}
 
