@@ -1,4 +1,4 @@
-import type { Artifact, GitHubReadRequest } from '@crewkite/contracts';
+import type { Artifact, GitHubObservationSchema, GitHubReadRequest } from '@crewkite/contracts';
 import { GitPullRequest, Play, RefreshCw, ShieldCheck, Square, Terminal } from 'lucide-react';
 import { type FormEvent, type ReactNode, useRef, useState } from 'react';
 import { Fact } from './components.tsx';
@@ -37,6 +37,7 @@ export type ProjectOperationSummary = Readonly<{
   observedAt: string;
   definition?: ProjectCommandDefinitionView;
   githubRequest?: GitHubReadRequest;
+  githubResult?: ReturnType<typeof GitHubObservationSchema.parse>;
   artifacts?: readonly Artifact[];
 }>;
 
@@ -183,6 +184,28 @@ function OperationCard({
                 <Fact label="Job" value={operation.githubRequest.jobId} />
               )}
             </>
+          )}
+        </section>
+      )}
+      {operation.githubResult && (
+        <section aria-label="Observed GitHub status" className="facts-grid">
+          <Fact
+            label="GitHub status"
+            value={operation.githubResult.status ?? operation.githubResult.state}
+          />
+          <Fact
+            label="Fetched"
+            value={
+              <time dateTime={operation.githubResult.fetchedAt}>
+                {operation.githubResult.fetchedAt}
+              </time>
+            }
+          />
+          {operation.githubResult.url && (
+            <Fact label="Source URL" value={<code>{operation.githubResult.url}</code>} />
+          )}
+          {operation.githubResult.reason && (
+            <Fact label="Read reason" value={operation.githubResult.reason} />
           )}
         </section>
       )}

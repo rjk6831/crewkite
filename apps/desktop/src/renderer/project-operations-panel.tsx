@@ -51,6 +51,7 @@ export function ProjectOperationsPanel({
           let summary = operation;
           let definition: ProjectOperationSummary['definition'];
           let githubRequest: ProjectOperationSummary['githubRequest'];
+          let githubResult: ProjectOperationSummary['githubResult'];
           if (operation.kind === 'github-read' || operation.state === 'prepared') {
             const detailResult = await operationCommand({
               command: 'GetProjectOperation',
@@ -71,6 +72,7 @@ export function ProjectOperationsPanel({
               throw new Error('Operation definition identity changed. Refresh to review it.');
             summary = detail.operation;
             githubRequest = detail.githubRequest ?? undefined;
+            githubResult = detail.githubResult ?? undefined;
             if (detail.definition)
               definition = {
                 hash: operation.definition.hash,
@@ -91,6 +93,7 @@ export function ProjectOperationsPanel({
             ...summary,
             definition,
             githubRequest,
+            githubResult,
             artifacts: [summary.stdout, summary.stderr, summary.result].filter(
               (artifact): artifact is Artifact => artifact !== null,
             ),
