@@ -131,6 +131,7 @@ function useActivityHistory(taskId: Task['id'], workspace: Workspace) {
 }
 
 const eventNames: Record<Event['type'], string> = {
+  'operation.updated': 'Operation status updated',
   'task.created': 'Task created',
   'conversation.entry': 'Conversation entry saved',
   'combined.updated': 'Combined progress updated',

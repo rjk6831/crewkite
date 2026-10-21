@@ -190,6 +190,12 @@ export async function serve(
                   [
                     'GetArtifactRange',
                     'GetTaskActivityPage',
+                    'GetTaskOperations',
+                    'GetProjectOperation',
+                    'PrepareProjectCommand',
+                    'StartProjectCommand',
+                    'ReadGitHub',
+                    'StopProjectOperation',
                     'ObserveUsage',
                     'CheckNativeConnection',
                     'InstallGoogleAcp',

@@ -1,4 +1,4 @@
-import type { Artifact } from '@crewkite/contracts';
+import type { Artifact, GitHubReadRequest } from '@crewkite/contracts';
 import { GitPullRequest, Play, RefreshCw, ShieldCheck, Square, Terminal } from 'lucide-react';
 import { type FormEvent, type ReactNode, useRef, useState } from 'react';
 import { Fact } from './components.tsx';
@@ -16,6 +16,8 @@ export type ProjectCommandDefinitionView = Readonly<{
   hash: string;
   recipe: 'lint' | 'test' | 'build';
   sourceHead: string;
+  dirtyCount: number;
+  untrackedCount: number;
   executable: string;
   executableSha256: string;
   argv: readonly string[];
@@ -34,6 +36,7 @@ export type ProjectOperationSummary = Readonly<{
   next: string | null;
   observedAt: string;
   definition?: ProjectCommandDefinitionView;
+  githubRequest?: GitHubReadRequest;
   artifacts?: readonly Artifact[];
 }>;
 
@@ -59,6 +62,7 @@ export type ReadGitHubInput = Readonly<{
 
 export type ProjectOperationsProps = Readonly<{
   operations: readonly ProjectOperationSummary[];
+  historyKnown?: boolean;
   onPrepare: (input: PrepareProjectCommandInput) => void | Promise<void>;
   onStart: (input: { operationId: string; definitionHash: string }) => void | Promise<void>;
   onStop: (operationId: string) => void | Promise<void>;
@@ -88,6 +92,8 @@ function DefinitionFacts({ definition }: { definition: ProjectCommandDefinitionV
         <Fact label="Deadline" value={`${definition.deadlineMs} ms`} />
         <Fact label="Definition hash" value={<code>{definition.hash}</code>} />
         <Fact label="Source head" value={<code>{definition.sourceHead}</code>} />
+        <Fact label="Changed files excluded" value={definition.dirtyCount} />
+        <Fact label="Untracked files excluded" value={definition.untrackedCount} />
         <Fact label="Executable" value={<code>{definition.executable}</code>} />
         <Fact
           label="Executable SHA-256 (verified before launch)"
@@ -96,6 +102,10 @@ function DefinitionFacts({ definition }: { definition: ProjectCommandDefinitionV
         <Fact label="Working directory" value={<code>{definition.cwd}</code>} />
         <Fact label="Native trust" value={definition.nativeTrust} />
       </div>
+      <p className="muted small">
+        Only committed source at this head is copied when you Start. Local changes and untracked
+        files are excluded.
+      </p>
       <div>
         <p className="muted small">Arguments, one exact value per line</p>
         <pre className="worker-output">
@@ -156,6 +166,26 @@ function OperationCard({
         />
         <Fact label="Reason" value={operation.reason ?? 'No reason reported'} />
       </div>
+      {operation.githubRequest && (
+        <section aria-label="GitHub request binding" className="facts-grid">
+          <Fact label="GitHub request" value={operation.githubRequest.kind} />
+          <Fact label="Host" value={operation.githubRequest.repository.host} />
+          <Fact label="Owner" value={operation.githubRequest.repository.owner} />
+          <Fact label="Repository" value={operation.githubRequest.repository.name} />
+          <Fact label="Requested head" value={<code>{operation.githubRequest.headSha}</code>} />
+          {operation.githubRequest.kind === 'pull-request' ? (
+            <Fact label="Pull request" value={operation.githubRequest.pullRequest} />
+          ) : (
+            <>
+              <Fact label="Workflow run" value={operation.githubRequest.runId} />
+              <Fact label="Attempt" value={operation.githubRequest.attempt} />
+              {operation.githubRequest.kind === 'job-log' && (
+                <Fact label="Job" value={operation.githubRequest.jobId} />
+              )}
+            </>
+          )}
+        </section>
+      )}
       {operation.next && <p className="muted small">Next: {operation.next}</p>}
       {definition && (
         <details className="technical-details" open={canStart}>
@@ -210,6 +240,7 @@ function OperationCard({
 
 export function ProjectOperations({
   operations,
+  historyKnown = true,
   onPrepare,
   onStart,
   onStop,
@@ -482,7 +513,9 @@ export function ProjectOperations({
         </button>
       </form>
 
-      {operations.length === 0 ? (
+      {!historyKnown ? (
+        <p>Operation history has not loaded.</p>
+      ) : operations.length === 0 ? (
         <section className="card">
           <p>No project operations are retained for this task.</p>
         </section>
