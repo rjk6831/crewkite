@@ -909,6 +909,26 @@ function adoptedWorkerIdentity(task: Task, state: TaskConversationState) {
 const changedAdoption =
   'The adopted plan changed. Review and adopt the current plan before preparing.';
 
+function executionFamilyLabel(family: Snapshot['nativeProfiles'][number]['family']) {
+  return family === 'google' ? 'Google ACP' : familyName(family);
+}
+
+function executionProviderLabel(profile: Snapshot['nativeProfiles'][number]) {
+  if (profile.id === 'google-acp-v1') return 'Google ACP';
+  return familyName(profile.family);
+}
+
+function availableForNewExecution(profile: Snapshot['nativeProfiles'][number]) {
+  return !['anthropic-file-compact-v1', 'google-file-v1'].includes(profile.id);
+}
+
+type ExecutionProfile = Snapshot['nativeProfiles'][number];
+type CloudExecutionProfile = Exclude<ExecutionProfile, { family: 'local' }>;
+
+function isCloudExecutionProfile(profile: ExecutionProfile): profile is CloudExecutionProfile {
+  return profile.family !== 'local';
+}
+
 // Adoption changes advance the task revision. Remount to discard pending reads and consent.
 export function Launch(props: LaunchProps) {
   return (
@@ -944,6 +964,8 @@ function ExecutionLaunch(props: LaunchProps) {
     | {
         scope: 'file' | 'repository' | 'local';
         profileId: string;
+        modelId?: string;
+        effortId?: string;
         adoptedWorker?: AdoptedWorkerIdentity;
       }
     | 'demo'
@@ -966,6 +988,69 @@ function ExecutionLaunch(props: LaunchProps) {
   });
   const [readingWorker, setReadingWorker] = useState(false);
   const [workerMessage, setWorkerMessage] = useState<string | null>(null);
+  const selectableProfiles = props.snapshot.nativeProfiles.filter(availableForNewExecution);
+  const providerFamilies = [...new Set(selectableProfiles.map((profile) => profile.family))];
+  const [providerFamily, setProviderFamily] = useState<
+    Snapshot['nativeProfiles'][number]['family'] | ''
+  >(() => providerFamilies.find((family) => family === 'openai') ?? providerFamilies[0] ?? '');
+  const selectedProviderFamily = providerFamilies.includes(
+    providerFamily as Snapshot['nativeProfiles'][number]['family'],
+  )
+    ? providerFamily
+    : (providerFamilies.find((family) => family === 'openai') ?? providerFamilies[0] ?? '');
+  const [providerScope, setProviderScope] = useState<'file' | 'repository'>('file');
+  const providerProfiles = selectableProfiles.filter(
+    (profile) => profile.family === selectedProviderFamily,
+  );
+  const availableScopes = [
+    ...new Set(
+      providerProfiles.map((profile) =>
+        profile.id === 'openai-repository-v1' ? ('repository' as const) : ('file' as const),
+      ),
+    ),
+  ];
+  const selectedProviderScope = availableScopes.includes(providerScope)
+    ? providerScope
+    : (availableScopes[0] ?? 'file');
+  const scopeProfiles = providerProfiles.filter(
+    (profile) =>
+      (profile.id === 'openai-repository-v1' ? 'repository' : 'file') === selectedProviderScope,
+  );
+  const [providerModel, setProviderModel] = useState('');
+  const [providerEffort, setProviderEffort] = useState('');
+  const configurableProfile = scopeProfiles.find(
+    (profile) => 'configOptions' in profile && profile.configOptions,
+  );
+  const configurableOptions =
+    configurableProfile && 'configOptions' in configurableProfile
+      ? configurableProfile.configOptions
+      : null;
+  const modelOptions = configurableOptions
+    ? configurableOptions.model.supported
+    : [...new Set(scopeProfiles.map((profile) => profile.model))];
+  const selectedModel =
+    (modelOptions.includes(providerModel) ? providerModel : '') ||
+    configurableOptions?.model.currentValue ||
+    modelOptions[0] ||
+    '';
+  const selectedProfile =
+    configurableProfile ??
+    scopeProfiles.find((profile) => profile.model === selectedModel) ??
+    scopeProfiles[0];
+  const effortOptions = selectedProfile
+    ? 'configOptions' in selectedProfile && selectedProfile.configOptions?.thoughtLevel
+      ? selectedProfile.configOptions.thoughtLevel.supported
+      : 'effort' in selectedProfile && selectedProfile.effort !== 'unknown'
+        ? [selectedProfile.effort]
+        : []
+    : [];
+  const selectedEffort =
+    (effortOptions.includes(providerEffort) ? providerEffort : '') ||
+    (selectedProfile && 'configOptions' in selectedProfile
+      ? selectedProfile.configOptions?.thoughtLevel?.currentValue
+      : undefined) ||
+    effortOptions[0] ||
+    '';
   const active = useRef(false);
   useLayoutEffect(() => {
     active.current = true;
@@ -1027,22 +1112,20 @@ function ExecutionLaunch(props: LaunchProps) {
     );
   if (choice === 'demo' && demoAvailable)
     return <ScriptedLaunch {...props} onBack={() => setChoice(null)} />;
-  if (
-    choice &&
-    choice !== 'demo' &&
-    (choice.scope !== 'local' ||
-      authority === 'guided' ||
-      savedNative?.profileId === 'local-file-v1')
-  )
+  if (choice && choice !== 'demo')
     return choice.scope === 'local' ? (
-      <LocalFileLaunch {...props} onBack={() => setChoice(null)} />
+      <LocalFileLaunch {...props} initialAuthority={authority} onBack={() => setChoice(null)} />
     ) : (
       <NativeLaunch
         {...props}
         initialAuthority={authority}
+        initialModelId={choice.modelId}
+        initialEffortId={choice.effortId}
         scope={choice.scope}
         initialProfileId={choice.profileId}
         adoptedWorker={choice.adoptedWorker}
+        onSelectLocal={() => setChoice({ scope: 'local', profileId: 'local-file-v1' })}
+        onAuthorityChange={setAuthority}
         onBack={() => setChoice(null)}
       />
     );
@@ -1053,21 +1136,6 @@ function ExecutionLaunch(props: LaunchProps) {
         <p>
           Choose a provider and scope. Review its source sharing and permissions before preparing.
         </p>
-        <label>
-          Future execution authority
-          <select
-            value={authority}
-            disabled={blocked}
-            onChange={(event) => {
-              setAuthority(event.target.value as Policy['authority']);
-              setChoice(null);
-            }}
-          >
-            <option value="guided">Guided</option>
-            <option value="balanced">Balanced</option>
-            <option value="autopilot">Autopilot</option>
-          </select>
-        </label>
         {blocked && (
           <p className="notice" role="status">
             Resolve the pending command before choosing another provider.
@@ -1078,58 +1146,168 @@ function ExecutionLaunch(props: LaunchProps) {
             The provider catalog is unavailable. Refresh the saved workspace before preparing.
           </p>
         )}
-        {workerMessage && <p role="status">{workerMessage}</p>}
-        <button
-          type="button"
-          className="button secondary"
-          disabled={
-            blocked ||
-            props.workspace.connection !== 'connected' ||
-            props.workspace.preview ||
-            !props.snapshot.nativeProfiles.some(
-              (profile) => profile.id === 'openai-repository-v1' && profile.available,
-            )
-          }
-          onClick={() => void chooseAdoptedWorker()}
-        >
-          Prepare adopted repository worker
-        </button>
-        {props.snapshot.nativeProfiles.map((profile) => {
-          const scope =
-            profile.family === 'local'
-              ? 'local'
-              : profile.id === 'openai-repository-v1'
-                ? 'repository'
-                : 'file';
-          return (
-            <section key={profile.id} className="view-stack">
-              <h3>{profile.displayName}</h3>
-              <p className="muted small">
-                {familyName(profile.family)} · {scope === 'repository' ? 'Repository' : 'One file'}
-                {' · '}Requested model {profile.model}
-              </p>
-              <p className="muted small" role="status">
-                {profile.available ? 'Preparation available' : 'Preparation unavailable'} ·{' '}
-                {titleCase(profile.reason.replaceAll('-', ' '))}
-              </p>
-              {profile.family === 'local' && authority !== 'guided' && (
-                <p className="notice" role="status">
-                  Local preparation supports Guided authority only. Choose Guided to prepare with
-                  Local.
-                </p>
-              )}
-              <button
-                type="button"
-                className="button secondary"
-                disabled={blocked || (profile.family === 'local' && authority !== 'guided')}
-                onClick={() => setChoice({ scope, profileId: profile.id })}
+        {!!selectableProfiles.length && (
+          <section className="card view-stack">
+            <label>
+              Provider
+              <select
+                value={selectedProviderFamily}
+                disabled={blocked}
+                onChange={(event) => {
+                  const family = event.target.value as Snapshot['nativeProfiles'][number]['family'];
+                  const nextProfiles = selectableProfiles.filter(
+                    (profile) => profile.family === family,
+                  );
+                  setProviderFamily(family);
+                  setProviderScope(
+                    nextProfiles.some((profile) => profile.id !== 'openai-repository-v1')
+                      ? 'file'
+                      : 'repository',
+                  );
+                  setProviderModel('');
+                  setProviderEffort('');
+                }}
               >
-                {profile.available ? 'Choose' : 'Inspect'} {profile.displayName}
-                <ArrowRight size={14} />
-              </button>
-            </section>
-          );
-        })}
+                {providerFamilies.map((family) => (
+                  <option key={family} value={family}>
+                    {executionFamilyLabel(family)}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Model
+              <select
+                value={selectedModel}
+                disabled={blocked}
+                onChange={(event) => setProviderModel(event.target.value)}
+              >
+                {modelOptions.map((model) => (
+                  <option key={model} value={model}>
+                    {model}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {effortOptions.length ? (
+              <label>
+                Effort
+                <select
+                  value={selectedEffort}
+                  disabled={blocked}
+                  onChange={(event) => setProviderEffort(event.target.value)}
+                >
+                  {effortOptions.map((effort) => (
+                    <option key={effort} value={effort}>
+                      {effort}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ) : (
+              <p className="muted small">Effort: The provider advertises no selectable effort.</p>
+            )}
+            <label>
+              Scope
+              <select
+                value={selectedProviderScope}
+                disabled={blocked}
+                onChange={(event) => {
+                  setProviderScope(event.target.value as 'file' | 'repository');
+                  setProviderModel('');
+                  setProviderEffort('');
+                }}
+              >
+                {availableScopes.map((scope) => (
+                  <option key={scope} value={scope}>
+                    {scope === 'repository' ? 'Project' : 'File'}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Execution authority
+              <select
+                value={authority}
+                disabled={blocked}
+                onChange={(event) => {
+                  setAuthority(event.target.value as Policy['authority']);
+                  setChoice(null);
+                }}
+              >
+                <option value="guided">Guided</option>
+                <option value="balanced">Balanced</option>
+                <option value="autopilot">Autopilot</option>
+              </select>
+            </label>
+            <p className="muted small">
+              {
+                {
+                  guided: 'Guided keeps actions at explicit prompts.',
+                  balanced: 'Balanced can use the prepared grants for bounded work.',
+                  autopilot: 'Autopilot can continue within the prepared grants and limits.',
+                }[authority]
+              }
+            </p>
+            {selectedProfile && (
+              <>
+                <p className="muted small">
+                  {selectedProviderScope === 'repository'
+                    ? 'The committed project is prepared in an isolated workspace.'
+                    : 'One existing committed file is prepared in independent scratch.'}{' '}
+                  The selected model and effort come from this provider's retained profile or setup
+                  proof.
+                </p>
+                <p className="muted small" role="status">
+                  {selectedProfile.available
+                    ? 'Provider profile available'
+                    : 'Provider profile unavailable'}
+                  {' · '}
+                  {titleCase(selectedProfile.reason.replaceAll('-', ' '))}
+                </p>
+                <button
+                  type="button"
+                  className="button secondary"
+                  disabled={blocked}
+                  onClick={() =>
+                    setChoice({
+                      scope: selectedProfile.family === 'local' ? 'local' : selectedProviderScope,
+                      profileId: selectedProfile.id,
+                      ...(selectedModel ? { modelId: selectedModel } : {}),
+                      ...(selectedEffort ? { effortId: selectedEffort } : {}),
+                    })
+                  }
+                >
+                  {selectedProfile.available ? 'Choose' : 'Inspect'}{' '}
+                  {executionProviderLabel(selectedProfile)}
+                  <ArrowRight size={14} />
+                </button>
+              </>
+            )}
+          </section>
+        )}
+        {workerMessage && <p role="status">{workerMessage}</p>}
+        <details>
+          <summary>Use the adopted project plan</summary>
+          <p className="muted small">
+            This uses the current adopted plan with the OpenAI Project profile.
+          </p>
+          <button
+            type="button"
+            className="button secondary"
+            disabled={
+              blocked ||
+              props.workspace.connection !== 'connected' ||
+              props.workspace.preview ||
+              !props.snapshot.nativeProfiles.some(
+                (profile) => profile.id === 'openai-repository-v1' && profile.available,
+              )
+            }
+            onClick={() => void chooseAdoptedWorker()}
+          >
+            Prepare adopted project plan
+          </button>
+        </details>
         {demoAvailable && (
           <button
             type="button"
@@ -1154,9 +1332,10 @@ function LocalFileLaunch({
   task,
   snapshot,
   workspace,
+  initialAuthority,
   onClose,
   onBack,
-}: LaunchProps & { onBack: () => void }) {
+}: LaunchProps & { initialAuthority?: Policy['authority']; onBack: () => void }) {
   const project = snapshot.projects.find((value) => value.id === task.projectId);
   const profile = snapshot.nativeProfiles.find(
     (value) => value.family === 'local' && value.id === 'local-file-v1',
@@ -1190,13 +1369,16 @@ function LocalFileLaunch({
       snapshot.localSetup?.generation === 'idle' &&
       !snapshot.localSetup.operation,
   );
-  const policy: Policy = {
-    authority: 'guided',
+  const policy: Policy = saved?.policy.policy ?? {
+    authority: initialAuthority ?? 'guided',
     quality: 'quick',
     methods: [{ id: 'keep-it-simple', cycles: 1, reviewerRole: 'reviewer' }],
     limits: { attempts: 3, minutes: Number(minutes), concurrency: 1 },
     reserves: [],
-    unknownUsage: { rule: 'fixed-allowance', allowance: { launches: 1, minutes: Number(minutes) } },
+    unknownUsage: {
+      rule: 'fixed-allowance',
+      allowance: { launches: 1, minutes: Number(minutes) },
+    },
     effects: [
       {
         taskId: task.id,
@@ -1221,6 +1403,25 @@ function LocalFileLaunch({
     capability?.stage === 'prepared' &&
     capability.localModel?.setupHash === setupHash &&
     Boolean(capability.expiresAt && Date.parse(capability.expiresAt) > Date.now());
+  const missingActions = prepared
+    ? []
+    : [
+        ...(!connected ? ['Reconnect the saved workspace.'] : []),
+        ...(workspace.pending
+          ? ['Wait for the current command to finish.']
+          : workspace.retryAvailable
+            ? ['Resolve the uncertain command before preparing.']
+            : []),
+        ...(!profile?.available || !matchingSetup
+          ? ['Configure Local, refresh its models and select one compatible loaded model.']
+          : []),
+        ...(!validTarget
+          ? [targetPath ? 'Enter one valid project-relative file path.' : 'Enter the file to edit.']
+          : []),
+        ...(!valid ? ['Set maximum task minutes from 1 to 5.'] : []),
+        ...(!trust ? ['Confirm trust in the connected Local runtime and selected model.'] : []),
+        ...(!sourceConsent ? ['Allow this committed file and task text to be sent.'] : []),
+      ];
   const clearConsent = () => {
     setTrust(false);
     setSourceConsent(false);
@@ -1273,7 +1474,9 @@ function LocalFileLaunch({
       else {
         setMessage(
           result.next ??
-            result.reason ??
+            (result.reason === 'native-target-unavailable'
+              ? 'Choose an existing committed text file in this project.'
+              : result.reason) ??
             'The Local preparation was not confirmed. Inspect the saved task.',
         );
         if (result.outcome === 'outcome-unknown') setUncertain('prepare');
@@ -1366,8 +1569,10 @@ function LocalFileLaunch({
         )}
         <section className="card view-stack">
           <div className="section-heading">
-            <h2>{profile?.displayName ?? 'Local writer unavailable'}</h2>
-            <span>Writer only · Qualification pending</span>
+            <h2>Local</h2>
+            <span>
+              {profile?.available && matchingSetup ? 'Local profile available' : 'Setup needed'}
+            </span>
           </div>
           <p className="muted small">
             One replacement in independent scratch. Local lead, orchestrator and formal review
@@ -1402,6 +1607,7 @@ function LocalFileLaunch({
             <section className="card view-stack">
               <h2>Saved Local target</h2>
               <Fact label="Frozen model" value={capability?.localModel?.modelKey ?? 'Unknown'} />
+              <Fact label="Execution authority" value={titleCase(policy.authority)} />
               <code>{capability?.target?.path ?? 'Unavailable'}</code>
               <p>{capability?.target?.bytes ?? 'Unknown'} bytes</p>
               <p>
@@ -1437,10 +1643,10 @@ function LocalFileLaunch({
         ) : (
           <section className="card view-stack">
             <label>
-              Existing committed target
+              File to edit
               <input
                 value={targetPath}
-                placeholder="src/example.ts"
+                placeholder="Project-relative path"
                 aria-invalid={targetPath.length > 0 && !validTarget}
                 aria-describedby={targetPath.length > 0 && !validTarget ? targetErrorId : undefined}
                 onChange={(event) => {
@@ -1469,8 +1675,8 @@ function LocalFileLaunch({
               />
             </label>
             <p className="muted small">
-              Guided · Quick · One coder · 3 total attempts · One writer submission. The controller
-              rechecks the task allowance and exact model before Start.
+              {titleCase(policy.authority)} · Quick · One coder · 3 total attempts · One writer
+              submission. The controller rechecks the task allowance and exact model before Start.
             </p>
             <label className="checkbox-label">
               <input
@@ -1503,6 +1709,16 @@ function LocalFileLaunch({
           Patch export requires its own exact permission. Checks and the required review remain
           pending and unavailable in this Local flow. Acceptance is unavailable.
         </p>
+        {!prepared && !!missingActions.length && (
+          <section className="notice" role="status">
+            <p>To prepare this work:</p>
+            <ul>
+              {missingActions.map((action) => (
+                <li key={action}>{action}</li>
+              ))}
+            </ul>
+          </section>
+        )}
         {prepared && !startable && (
           <p className="muted small" role="status">
             Start needs the current prepared run, matching Local setup, available profile and
@@ -1551,7 +1767,7 @@ function LocalFileLaunch({
             disabled={!allowed}
             onClick={() => void prepare()}
           >
-            Prepare Local proposal
+            Prepare Local work
             <ArrowRight size={14} />
           </button>
         )}
@@ -1576,12 +1792,20 @@ function NativeLaunch({
   scope,
   initialProfileId,
   initialAuthority,
+  initialModelId,
+  initialEffortId,
   adoptedWorker,
+  onSelectLocal,
+  onAuthorityChange,
 }: LaunchProps & {
   onBack: () => void;
+  onSelectLocal: () => void;
+  onAuthorityChange: (authority: Policy['authority']) => void;
   scope: 'file' | 'repository';
   initialProfileId?: string;
   initialAuthority?: Policy['authority'];
+  initialModelId?: string;
+  initialEffortId?: string;
   adoptedWorker?: AdoptedWorkerIdentity;
 }) {
   const project = snapshot.projects.find((value) => value.id === task.projectId);
@@ -1595,16 +1819,37 @@ function NativeLaunch({
       active.current = false;
     };
   }, []);
-  const profiles = snapshot.nativeProfiles
-    .filter((value) => value.family !== 'local')
-    .filter((value) => (value.id === 'openai-repository-v1') === repository);
   const current = snapshot.nativeRuns.find(
     (value) =>
       value.runId === task.runId &&
       value.profileId !== 'local-file-v1' &&
       (value.profileId === 'openai-repository-v1') === repository,
   );
+  const selectableNativeProfiles = snapshot.nativeProfiles
+    .filter(isCloudExecutionProfile)
+    .filter((value) => (value.id === 'openai-repository-v1') === repository)
+    .filter(availableForNewExecution);
+  const currentHiddenProfile = snapshot.nativeProfiles
+    .filter(isCloudExecutionProfile)
+    .find(
+      (value) =>
+        value.id === current?.profileId &&
+        (value.id === 'openai-repository-v1') === repository &&
+        !availableForNewExecution(value),
+    );
+  const profiles = currentHiddenProfile
+    ? [...selectableNativeProfiles, currentHiddenProfile]
+    : selectableNativeProfiles;
+  const localProfile = repository
+    ? undefined
+    : snapshot.nativeProfiles.find((value) => value.id === 'local-file-v1');
+  const writerProfiles = localProfile
+    ? [...selectableNativeProfiles, localProfile]
+    : selectableNativeProfiles;
   const saved = current ? snapshot.runs.find((value) => value.id === task.runId) : undefined;
+  const frozenRoute = saved
+    ? snapshot.routes.find((route) => route.id === saved.roles[0]?.routeId)
+    : undefined;
   const [profileId, setProfileId] = useState(
     current?.profileId ??
       initialProfileId ??
@@ -1615,8 +1860,10 @@ function NativeLaunch({
   const profile = profiles.find((value) => value.id === profileId);
   const google = profile?.family === 'google';
   const acpProfile = profile?.family === 'google' && 'configOptions' in profile ? profile : null;
-  const [modelId, setModelId] = useState(current?.acp?.modelId ?? '');
-  const [thoughtLevelId, setThoughtLevelId] = useState(current?.acp?.thoughtLevelId ?? '');
+  const [modelId, setModelId] = useState(current?.acp?.modelId ?? initialModelId ?? '');
+  const [thoughtLevelId, setThoughtLevelId] = useState(
+    current?.acp?.thoughtLevelId ?? initialEffortId ?? '',
+  );
   const [quotaAccount, setQuotaAccount] = useState(false);
   const configuration = acpProfile?.configOptions;
   const selectedModel = modelId || configuration?.model.currentValue || '';
@@ -1693,7 +1940,12 @@ function NativeLaunch({
   const capability = snapshot.nativeRuns.find((value) => value.runId === prepared?.id);
   const connected = workspace.connection === 'connected' && !workspace.preview;
   const allowed =
-    connected && profile?.available && !workspace.pending && !checkingWorker && !workerInvalid;
+    connected &&
+    profile?.available &&
+    !workspace.pending &&
+    !workspace.retryAvailable &&
+    !checkingWorker &&
+    !workerInvalid;
   const supportedAuthority = !google || policy.authority !== 'autopilot';
   const validConsent = savedConsent || (nativeTrust && sourceConsent);
   const validTools = !repository || savedConsent || nativeTools;
@@ -1793,6 +2045,56 @@ function NativeLaunch({
         } as Partial<Record<Snapshot['nativeProfiles'][number]['reason'], string>>
       )[profile.reason] ?? 'The controller has no supported native profile.')
     : 'The controller has no supported native profile.';
+  const validTarget = repository || NativeTargetPathSchema.safeParse(targetPath).success;
+  const missingActions = prepared
+    ? []
+    : [
+        ...(workspace.connection !== 'connected'
+          ? ['Reconnect the saved workspace.']
+          : workspace.preview
+            ? ['Open the live workspace to prepare work.']
+            : []),
+        ...(workspace.pending || checkingWorker
+          ? ['Wait for the current command to finish.']
+          : workspace.retryAvailable
+            ? ['Resolve the uncertain command before preparing.']
+            : []),
+        ...(!profile?.available ? [unavailable] : []),
+        ...(!supportedAuthority ? ['Choose Guided or Balanced authority.'] : []),
+        ...(!repository && !validTarget
+          ? [
+              targetPath
+                ? 'Enter one existing committed project-relative file path.'
+                : 'Enter the file to edit. The placeholder is an instruction, not a selected file.',
+            ]
+          : []),
+        ...(!savedConsent && !nativeTrust ? ['Confirm trust in the existing native client.'] : []),
+        ...(!savedConsent && !sourceConsent
+          ? [`Allow this committed ${repository ? 'project' : 'file'} and task text to be sent.`]
+          : []),
+        ...(repository && !savedConsent && !nativeTools
+          ? ['Allow local commands for this project run.']
+          : []),
+        ...(attestedBilling && !savedConsent && !subscriptionLogin
+          ? ['Confirm that this login uses the existing subscription.']
+          : []),
+        ...(attestedBilling && !savedConsent && !extraUsageDisabled
+          ? ['Confirm that paid extra usage is disabled for this login.']
+          : []),
+        ...(attestedBilling && savedConsent && !billingAttestation
+          ? [
+              'Saved subscription confirmations no longer match this provider setup. Turn off saved consent and confirm the current settings.',
+            ]
+          : []),
+        ...(acpProfile && !savedConsent && !quotaAccount
+          ? ['Confirm that quota reads and ACP sign-in use the same Google account.']
+          : []),
+        ...(!validPermissionMode ? ['Choose the current native permission mode.'] : []),
+        ...(!validHandoff ? ['Complete the manual writer transfer limits.'] : []),
+        ...(!validAcp && acpProfile && snapshot.googleAcpSetup?.state !== 'ready'
+          ? ['Finish Google ACP setup and refresh its retained proof.']
+          : []),
+      ];
   function leavePreparation(next: () => void) {
     active.current = false;
     next();
@@ -1917,7 +2219,9 @@ function NativeLaunch({
       } else
         setMessage(
           result.next ??
-            'The target, native consent or saved policy is unavailable. Review the proposal again.',
+            (result.reason === 'native-target-unavailable'
+              ? 'Choose an existing committed text file in this project.'
+              : 'The target, native consent or saved policy is unavailable. Review the proposal again.'),
         );
     } catch {
       if (adoptedWorker) setWorkerInvalid(true);
@@ -1949,8 +2253,8 @@ function NativeLaunch({
         )}
         <section className="card">
           <div className="section-heading">
-            <h2>{profile?.displayName ?? 'Native proposal'}</h2>
-            <span>{attestedBilling ? 'Subscription confirmation required' : 'Requires Pro'}</span>
+            <h2>{profile ? executionProviderLabel(profile) : 'Native proposal'}</h2>
+            <span>{profile?.available ? 'Client profile available' : 'Setup needed'}</span>
           </div>
           {!prepared && !repository && (
             <label>
@@ -1958,14 +2262,18 @@ function NativeLaunch({
               <select
                 value={profileId}
                 onChange={(event) => {
+                  if (event.target.value === 'local-file-v1') {
+                    leavePreparation(onSelectLocal);
+                    return;
+                  }
                   setProfileId(event.target.value);
                   setHandoffEnabled(false);
                   resetScope();
                 }}
               >
-                {profiles.map((value) => (
+                {writerProfiles.map((value) => (
                   <option key={value.id} value={value.id}>
-                    {value.displayName}
+                    {executionProviderLabel(value)} · {value.model}
                     {value.available ? '' : ' (unavailable)'}
                   </option>
                 ))}
@@ -1974,31 +2282,34 @@ function NativeLaunch({
           )}
           {acpProfile && <p className="muted small">{googleAcpLabel}</p>}
           {profile && (
-            <div className="facts-grid">
-              <span>Client {profile.clientVersion}</span>
-              <span>{profile.model}</span>
-              <span>
-                {profile.effort}
-                {attestedBilling ? ' requested effort' : ' effort'}
-              </span>
-              {attestedBilling && <span>Effective effort unknown</span>}
-              {attestedBilling && <span>Account class unknown</span>}
-              <span>
-                {attestedBilling ? 'Service tier unknown' : `${profile.serviceTier} tier`}
-              </span>
-              {(attestedBilling || repository) && (
+            <details>
+              <summary>Provider details</summary>
+              <div className="facts-grid">
+                <span>Client {profile.clientVersion}</span>
+                <span>Model {profile.model}</span>
                 <span>
-                  {profile.qualifiedAt
-                    ? `Qualified ${profile.qualifiedAt.slice(0, 10)}`
-                    : 'Qualification pending'}
+                  {profile.effort}
+                  {attestedBilling ? ' requested effort' : ' effort'}
                 </span>
-              )}
-            </div>
+                {attestedBilling && <span>Effective effort unknown</span>}
+                {attestedBilling && <span>Account class unknown</span>}
+                <span>
+                  {attestedBilling ? 'Service tier unknown' : `${profile.serviceTier} tier`}
+                </span>
+                {(attestedBilling || repository) && (
+                  <span>
+                    {profile.qualifiedAt
+                      ? `Qualified ${profile.qualifiedAt.slice(0, 10)}`
+                      : 'Qualification pending'}
+                  </span>
+                )}
+              </div>
+              <p className="muted small">
+                Required native client metadata is checked when the run starts. A provider hard
+                spending cap remains unverified.
+              </p>
+            </details>
           )}
-          <p className="muted small">
-            Required native client metadata is checked when the run starts. A provider hard spending
-            cap remains unverified.
-          </p>
           {!profile?.available && (
             <p className="notice" role="status">
               {unavailable}
@@ -2010,6 +2321,11 @@ function NativeLaunch({
             <p className="notice">
               Saved execution authority: {titleCase(prepared.policy.policy.authority)}. This
               prepared policy is frozen.
+            </p>
+            <p className="muted small">
+              Frozen model {frozenRoute?.model ?? 'Unknown'} · Requested effort{' '}
+              {frozenRoute?.effort.requested ?? 'unknown'} · Effective effort{' '}
+              {frozenRoute?.effort.effective ?? 'unknown'}
             </p>
             <SourceFacts source={prepared.source} />
             <section className="card" aria-label="Prepared native target">
@@ -2112,7 +2428,9 @@ function NativeLaunch({
                 value={policy.authority}
                 disabled={workspace.pending || workspace.retryAvailable}
                 onChange={(event) => {
-                  setPolicy({ ...policy, authority: event.target.value as Policy['authority'] });
+                  const authority = event.target.value as Policy['authority'];
+                  setPolicy({ ...policy, authority });
+                  onAuthorityChange(authority);
                   resetScope();
                 }}
               >
@@ -2148,13 +2466,13 @@ function NativeLaunch({
             ) : (
               <>
                 <label>
-                  Committed file path
+                  File to edit
                   <input
                     autoFocus
                     value={targetPath}
                     maxLength={4096}
                     spellCheck={false}
-                    placeholder="docs/providers.md"
+                    placeholder="Project-relative path"
                     onChange={(event) => {
                       setTargetPath(event.target.value);
                       resetScope();
@@ -2162,13 +2480,26 @@ function NativeLaunch({
                   />
                 </label>
                 <p className="muted small">
-                  Choose one existing text file in {project?.name ?? 'this project'}. The controller
-                  freezes its committed base, hash and size before Start.
+                  Type the project-relative path to one existing committed text file in{' '}
+                  {project?.name ?? 'this project'}. The controller freezes its committed base, hash
+                  and size before Start.
                 </p>
+                {!validTarget && (
+                  <p className="notice" role="status">
+                    {targetPath
+                      ? 'Enter one existing committed project-relative file path.'
+                      : 'Enter the file to edit. The placeholder is an instruction, not a selected file.'}
+                  </p>
+                )}
               </>
             )}
             {!repository && !acpProfile && (
-              <>
+              <details>
+                <summary>Manual writer transfers</summary>
+                <p className="muted small">
+                  Leave this off for one writer. Turn it on only when the same file may be handed to
+                  another provider after a confirmed stop.
+                </p>
                 <label className="checkbox-label">
                   <input
                     type="checkbox"
@@ -2187,7 +2518,7 @@ function NativeLaunch({
                       Choose allowed future writers. Each transfer waits for confirmed Stop and
                       fresh recipient consent. These choices do not enable automatic routing.
                     </p>
-                    {profiles
+                    {selectableNativeProfiles
                       .filter(
                         (recipient) => NativeFileProfileIdSchema.safeParse(recipient.id).success,
                       )
@@ -2352,7 +2683,7 @@ function NativeLaunch({
                     )}
                   </section>
                 )}
-              </>
+              </details>
             )}
             {acpProfile && (
               <>
@@ -2587,6 +2918,16 @@ function NativeLaunch({
             : 'Handoff remains unavailable.'}{' '}
           The original checkout stays unchanged.
         </p>
+        {!prepared && !!missingActions.length && (
+          <section className="notice" role="status">
+            <p>To prepare this work:</p>
+            <ul>
+              {missingActions.map((action) => (
+                <li key={action}>{action}</li>
+              ))}
+            </ul>
+          </section>
+        )}
         {prepared && capability?.stage !== 'prepared' && (
           <p className="notice" role="status">
             This run cannot start again. Inspect Changes or export its retained patch.
@@ -2632,6 +2973,8 @@ function NativeLaunch({
                 disabled={workspace.pending}
                 onClick={() => {
                   setPrepared(null);
+                  if (profile && !availableForNewExecution(profile))
+                    setProfileId(selectableNativeProfiles[0]?.id ?? '');
                   resetScope();
                   setMessage(null);
                 }}
@@ -2676,11 +3019,11 @@ function NativeLaunch({
               !validPermissionMode ||
               !validHandoff ||
               !validAcp ||
-              (!repository && !NativeTargetPathSchema.safeParse(targetPath).success)
+              !validTarget
             }
             onClick={() => void prepareNative()}
           >
-            Prepare native proposal
+            Prepare {profile ? executionProviderLabel(profile) : 'provider'} work
             <ArrowRight size={14} />
           </button>
         )}

@@ -3697,6 +3697,7 @@ async function localControllerFixture(
   initialMode = 'completed',
   authMode: 'token' | 'none' = 'token',
   formatting?: string,
+  authority: Run['policy']['policy']['authority'] = 'guided',
 ) {
   let mode = initialMode;
   let context: Awaited<ReturnType<typeof setup>>;
@@ -3967,7 +3968,7 @@ if(value==='submit')finish({type:'terminal',terminal:{kind:'completed',binding:p
   const task = TaskSchema.parse((await controller.execute(context.draft, 'local-owner')).entity);
   const policy = {
     ...fixtures.policy,
-    authority: 'guided',
+    authority,
     quality: 'quick',
     methods: [{ id: 'keep-it-simple', cycles: 1, reviewerRole: 'advisor' }],
     limits: { attempts: 3, minutes: 5, concurrency: 1 },
@@ -4065,6 +4066,43 @@ test('Local refresh keeps an exact selected instance and clears a changed instan
   assert.equal(changed?.selection, null);
   assert.equal(changed?.setupHash, null);
   assert.equal(changed?.reason, 'model-selection-required');
+});
+
+test('Local preparation freezes every authority and refuses changed effects after reopen', async (t) => {
+  for (const authority of ['guided', 'balanced', 'autopilot'] as const) {
+    await t.test(authority, async (t) => {
+      const context = await localControllerFixture(t, 'completed', 'none', undefined, authority);
+      assert.equal(context.run.policy.policy.authority, authority);
+      assert.equal(context.controller.store.intents().length, 0);
+
+      const reopened = await context.reopen();
+      const retained = reopened.store.get<Run>('run', context.run.id);
+      assert(retained);
+      assert.equal(retained.policy.policy.authority, authority);
+      assert.equal(
+        reopened.snapshot().nativeRuns.find((run) => run.runId === context.run.id)?.stage,
+        'prepared',
+      );
+      assert.equal(reopened.store.intents().length, 0);
+
+      const changedPolicy = {
+        ...retained.policy.policy,
+        effects: retained.policy.policy.effects.map((grant) =>
+          grant.action === 'write-scratch' ? { ...grant, usesRemaining: 0 as const } : grant,
+        ),
+      };
+      reopened.store.transaction(() =>
+        reopened.store.put('run', retained.id, retained.revision, {
+          ...retained,
+          policy: { policy: changedPolicy, hash: hashCanonical(changedPolicy) },
+        }),
+      );
+      const refused = await reopened.execute(context.start, 'local-owner');
+      assert.equal(refused.outcome, 'blocked');
+      assert.equal(refused.reason, 'local-start-unavailable');
+      assert.equal(reopened.store.intents().length, 0);
+    });
+  }
 });
 
 test('an appointed native proposal is retained and applied once after every phase stops', async (t) => {

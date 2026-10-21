@@ -9216,7 +9216,6 @@ export class Controller {
         return { outcome: 'blocked', reason: 'local-model-unavailable' };
       const policy = PolicySchema.parse(command.payload.policy);
       if (
-        policy.authority !== 'guided' ||
         policy.quality !== 'quick' ||
         policy.reserves.length ||
         (policy.methods?.length ?? 0) !== 1 ||
