@@ -51,6 +51,15 @@ export const ProjectNodeTestFilesSchema = z
   .min(1)
   .max(32)
   .refine((paths) => new Set(paths).size === paths.length, 'Node test files must be distinct.');
+export const ProjectPythonTestPathSchema = NativeTargetPathSchema.refine(
+  (path) => path.endsWith('.py') && !path.startsWith('-') && !/[?*[\]{}]/.test(path),
+  'Python tests need exact relative .py paths without options or globs.',
+);
+export const ProjectPythonTestFilesSchema = z
+  .array(ProjectPythonTestPathSchema)
+  .min(1)
+  .max(32)
+  .refine((paths) => new Set(paths).size === paths.length, 'Python test files must be distinct.');
 const OpenAiNativeProfileSchema = z.strictObject({
   id: label,
   family: z.literal('openai'),
@@ -2471,6 +2480,11 @@ export const CommandSchema = z.discriminatedUnion('command', [
         checkRecipeId: z.literal('project-node-tests-v1'),
         testFiles: ProjectNodeTestFilesSchema,
       }),
+      z.strictObject({
+        ...evaluationFields,
+        checkRecipeId: z.literal('project-python-unittest-v1'),
+        testFiles: ProjectPythonTestFilesSchema,
+      }),
       z.strictObject({ ...evaluationFields, checkRecipeId: z.literal('crewkite-verify-v1') }),
     ]),
   ),
@@ -2688,12 +2702,17 @@ export const CandidateEvaluationPreviewSchema = z
     candidateId: CandidateIdSchema,
     candidateHash: HashSchema,
     preparationId: ArtifactIdSchema,
-    recipe: z.enum(['node-tests-v1', 'project-node-tests-v1', 'crewkite-verify-v1']),
+    recipe: z.enum([
+      'node-tests-v1',
+      'project-node-tests-v1',
+      'project-python-unittest-v1',
+      'crewkite-verify-v1',
+    ]),
     verification: CrewKiteVerifyPreviewSchema.optional(),
     testFiles: z
       .array(
         z.strictObject({
-          path: ProjectNodeTestPathSchema,
+          path: z.union([ProjectNodeTestPathSchema, ProjectPythonTestPathSchema]),
           hash: HashSchema,
           bytes: RevisionSchema,
           mode: z.enum(['100644', '100755']),
@@ -2750,8 +2769,12 @@ export const CandidateEvaluationPreviewSchema = z
       context.addIssue({ code: 'custom', message: 'Evaluation needs one exact source scope.' });
     const paths = value.testFiles.map((file) => file.path);
     if (
-      (value.recipe === 'project-node-tests-v1' && paths.length === 0) ||
-      (value.recipe !== 'project-node-tests-v1' && paths.length !== 0) ||
+      (['project-node-tests-v1', 'project-python-unittest-v1'].includes(value.recipe) &&
+        paths.length === 0) ||
+      (!['project-node-tests-v1', 'project-python-unittest-v1'].includes(value.recipe) &&
+        paths.length !== 0) ||
+      (value.recipe === 'project-python-unittest-v1' &&
+        !paths.every((path) => ProjectPythonTestPathSchema.safeParse(path).success)) ||
       new Set(paths).size !== paths.length
     )
       context.addIssue({ code: 'custom', message: 'Check files must match the selected recipe.' });

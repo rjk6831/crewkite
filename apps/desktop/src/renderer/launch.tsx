@@ -12,6 +12,7 @@ import {
   type Policy,
   PolicySchema,
   ProjectNodeTestFilesSchema,
+  ProjectPythonTestFilesSchema,
   type ReviewMethod,
   type Role,
   type Run,
@@ -129,6 +130,7 @@ const evaluationReasons = {
 const evaluationRecipes = {
   'node-tests-v1': 'Sample project tests',
   'project-node-tests-v1': 'Project Node tests',
+  'project-python-unittest-v1': 'Project Python unittest',
   'crewkite-verify-v1': 'CrewKite verification',
 };
 const verificationStages = {
@@ -245,10 +247,15 @@ export function NativeEvaluation({
   );
   const methodName = (id: ReviewMethod['id']) =>
     methodCatalog.find((value) => value.id === id)?.name ?? 'Unavailable method';
-  const projectTests = selectedRecipe === 'project-node-tests-v1';
+  const projectTests = ['project-node-tests-v1', 'project-python-unittest-v1'].includes(
+    selectedRecipe,
+  );
+  const pythonTests = selectedRecipe === 'project-python-unittest-v1';
   const fullVerification = selectedRecipe === 'crewkite-verify-v1';
   const visibleRecipe = prepared && !editing ? prepared.recipe : selectedRecipe;
-  const testFiles = ProjectNodeTestFilesSchema.safeParse(
+  const testFiles = (
+    pythonTests ? ProjectPythonTestFilesSchema : ProjectNodeTestFilesSchema
+  ).safeParse(
     selection?.testFiles ?? testFileInput.split(/\r?\n/u).filter((path) => path.length > 0),
   );
   const preparedMatches =
@@ -311,7 +318,9 @@ export function NativeEvaluation({
           taskId: task.id,
           candidateId: candidate.id,
           ...(projectTests && testFiles.success
-            ? { checkRecipeId: 'project-node-tests-v1' as const, testFiles: testFiles.data }
+            ? pythonTests
+              ? { checkRecipeId: 'project-python-unittest-v1' as const, testFiles: testFiles.data }
+              : { checkRecipeId: 'project-node-tests-v1' as const, testFiles: testFiles.data }
             : fullVerification
               ? { checkRecipeId: 'crewkite-verify-v1' as const }
               : { checkRecipeId: 'node-tests-v1' as const }),
@@ -321,7 +330,11 @@ export function NativeEvaluation({
           grants: [
             {
               action: 'run-check' as const,
-              target: fullVerification ? 'crewkite verify' : 'node --test',
+              target: fullVerification
+                ? 'crewkite verify'
+                : pythonTests
+                  ? 'python -m unittest'
+                  : 'node --test',
             },
             {
               action: 'run-review' as const,
@@ -408,6 +421,12 @@ export function NativeEvaluation({
         <p className="muted small">
           Local code runs with your system permissions. Dependencies are not installed. Imports can
           use Node built-ins and files in the check copy.
+        </p>
+      )}
+      {visibleRecipe === 'project-python-unittest-v1' && (
+        <p className="muted small">
+          Local code runs with your system permissions. CrewKite uses the pinned system Python 3.9
+          or newer and installs no dependencies.
         </p>
       )}
       {visibleRecipe === 'crewkite-verify-v1' && (
@@ -643,15 +662,18 @@ export function NativeEvaluation({
                     setRecipe(
                       event.target.value === 'project-node-tests-v1'
                         ? 'project-node-tests-v1'
-                        : event.target.value === 'crewkite-verify-v1'
-                          ? 'crewkite-verify-v1'
-                          : 'node-tests-v1',
+                        : event.target.value === 'project-python-unittest-v1'
+                          ? 'project-python-unittest-v1'
+                          : event.target.value === 'crewkite-verify-v1'
+                            ? 'crewkite-verify-v1'
+                            : 'node-tests-v1',
                     );
                     resetConsent();
                   }}
                 >
                   <option value="node-tests-v1">Sample project tests</option>
                   <option value="project-node-tests-v1">Project Node tests</option>
+                  <option value="project-python-unittest-v1">Project Python unittest</option>
                   <option value="crewkite-verify-v1">CrewKite verification</option>
                 </select>
               </label>

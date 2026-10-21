@@ -10937,7 +10937,11 @@ export class Controller {
     )
       throw Error('The saved budget cannot cover one check and one review.');
     const expected = [
-      command.payload.checkRecipeId === 'crewkite-verify-v1' ? verificationTarget : 'node --test',
+      command.payload.checkRecipeId === 'crewkite-verify-v1'
+        ? verificationTarget
+        : command.payload.checkRecipeId === 'project-python-unittest-v1'
+          ? 'python -m unittest'
+          : 'node --test',
       formatReviewTarget({ methodId: selected.methodId, cycle: 1 }),
     ];
     const grants = command.payload.grants;
@@ -11111,7 +11115,8 @@ export class Controller {
               ),
               criteria: task.criteria,
               selection:
-                command.payload.checkRecipeId === 'project-node-tests-v1'
+                command.payload.checkRecipeId === 'project-node-tests-v1' ||
+                command.payload.checkRecipeId === 'project-python-unittest-v1'
                   ? {
                       recipeId: command.payload.checkRecipeId,
                       testFiles: command.payload.testFiles,
@@ -11551,7 +11556,8 @@ export class Controller {
               ? { verification: verificationPreview(plan.definition) }
               : {}),
             testFiles:
-              plan.definition.recipeId === 'project-node-tests-v1'
+              plan.definition.recipeId === 'project-node-tests-v1' ||
+              plan.definition.recipeId === 'project-python-unittest-v1'
                 ? plan.definition.collection
                 : [],
             definitionHash: plan.definition.definitionHash,
@@ -11724,7 +11730,7 @@ export class Controller {
     this.updateTask(this.store.get<Task>('task', plan.run.taskId) as Task, {
       state: 'checking',
       waitingReason: null,
-      next: 'Running the frozen Node checks. Native review waits for passing checks and a separate start.',
+      next: 'Running the frozen local checks. Native review waits for passing checks and a separate start.',
     });
     effects.push(() =>
       this.launchCheck(
@@ -12033,7 +12039,9 @@ export class Controller {
       selection:
         plan.definition.recipeId === 'project-node-tests-v1'
           ? { recipeId: plan.definition.recipeId, testFiles: plan.definition.required.files }
-          : undefined,
+          : plan.definition.recipeId === 'project-python-unittest-v1'
+            ? { recipeId: plan.definition.recipeId, testFiles: plan.definition.required.files }
+            : undefined,
     });
   }
 
@@ -17722,6 +17730,10 @@ export class Controller {
         const result = this.evidence.recordCheck({
           candidate,
           plan,
+          sourceFiles:
+            plan.recipeId === 'project-python-unittest-v1'
+              ? committedFiles(this.projectPath(run.source.projectId) as string, run.source.base)
+              : undefined,
           passed:
             exit.code === 0 &&
             !job.failed &&

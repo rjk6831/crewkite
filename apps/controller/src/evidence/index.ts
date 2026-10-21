@@ -36,6 +36,13 @@ import { treeInventoryRecords } from '../host/toolchain.ts';
 import { groupAbsent } from '../host/worker.ts';
 import type { IdPrefix } from '../store/ids.ts';
 import {
+  evaluatePythonCheck,
+  type PythonCheckDefinition,
+  PythonCheckDefinitionSchema,
+  preparePythonCheck,
+  validPythonCheckDefinition,
+} from './python-check.ts';
+import {
   type ToolchainDefinition,
   ToolchainDefinitionSchema,
   validToolchainDefinition,
@@ -80,13 +87,15 @@ export const NodeCheckDefinitionSchema = z.discriminatedUnion('recipeId', [
 export type NodeCheckDefinition = z.infer<typeof NodeCheckDefinitionSchema>;
 export const CheckDefinitionSchema = z.union([
   NodeCheckDefinitionSchema,
+  PythonCheckDefinitionSchema,
   ToolchainDefinitionSchema,
 ]);
 export type CheckDefinition = z.infer<typeof CheckDefinitionSchema>;
-export type CheckPlan = NodeCheckDefinition & { directory: string };
+export type CheckPlan = (NodeCheckDefinition | PythonCheckDefinition) & { directory: string };
 export type NodeCheckSelection =
   | { recipeId: 'node-tests-v1' }
-  | { recipeId: 'project-node-tests-v1'; testFiles: string[] };
+  | { recipeId: 'project-node-tests-v1'; testFiles: string[] }
+  | { recipeId: 'project-python-unittest-v1'; testFiles: string[] };
 
 const MAX_BYTES = 64 * 1024 * 1024;
 const MAX_PREVIEW = 262144;
@@ -147,7 +156,7 @@ function evaluator(): string {
 
 function definition(
   plan: Pick<
-    CheckPlan,
+    NodeCheckDefinition,
     'argv' | 'collection' | 'criteria' | 'evaluator' | 'required' | 'reporterHash'
   > & { guardHash?: string; combined?: z.infer<typeof CombinedCheckContextSchema> },
 ): string {
@@ -167,6 +176,16 @@ export function completedCheckDefinitionMatches(
   saved: CheckDefinition,
   current: CheckDefinition,
 ): boolean {
+  if (
+    saved.recipeId === 'project-python-unittest-v1' ||
+    current.recipeId === 'project-python-unittest-v1'
+  )
+    return (
+      saved.recipeId === current.recipeId &&
+      validPythonCheckDefinition(saved) &&
+      validPythonCheckDefinition(current) &&
+      hashCanonical(saved) === hashCanonical(current)
+    );
   if (saved.recipeId === 'crewkite-verify-v1' || current.recipeId === 'crewkite-verify-v1')
     return (
       saved.recipeId === current.recipeId &&
@@ -706,9 +725,25 @@ export class CandidateEvidence {
     criteria: string[];
     selection?: NodeCheckSelection;
     combined?: z.infer<typeof CombinedCheckContextSchema>;
-  }): NodeCheckDefinition {
+  }): NodeCheckDefinition | PythonCheckDefinition {
     const { base, files } = this.read(input.candidate);
     verified(base, input.sourceFiles);
+    if (input.selection?.recipeId === 'project-python-unittest-v1')
+      return preparePythonCheck({
+        candidateId: input.candidate.id,
+        candidateHash: input.candidate.hash,
+        source: input.sourceFiles,
+        candidate: files,
+        criteria: input.criteria,
+        testFiles: input.selection.testFiles,
+        python: '/usr/bin/python3',
+        budget: {
+          deadline: Date.now() + 10_000,
+          now: Date.now,
+          maximumEntries: 10_000,
+          maximumBytes: MAX_BYTES,
+        },
+      });
     if (input.selection?.recipeId === 'project-node-tests-v1') {
       const paths = ProjectNodeTestFilesSchema.parse(input.selection.testFiles).sort();
       const collection = paths.map((path) => {
@@ -795,15 +830,19 @@ export class CandidateEvidence {
     candidate: Candidate;
     sourceFiles: FileContent[];
     criteria: string[];
-    expected?: NodeCheckDefinition;
+    expected?: NodeCheckDefinition | PythonCheckDefinition;
   }): CheckPlan {
     const current = this.describeChecks({
       ...input,
-      ...(input.expected?.combined ? { combined: input.expected.combined } : {}),
+      ...(input.expected && 'combined' in input.expected && input.expected.combined
+        ? { combined: input.expected.combined }
+        : {}),
       selection:
         input.expected?.recipeId === 'project-node-tests-v1'
           ? { recipeId: input.expected.recipeId, testFiles: input.expected.required.files }
-          : undefined,
+          : input.expected?.recipeId === 'project-python-unittest-v1'
+            ? { recipeId: input.expected.recipeId, testFiles: input.expected.required.files }
+            : undefined,
     });
     if (input.expected && hashCanonical(current) !== hashCanonical(input.expected))
       throw new Error('The frozen check definition changed.');
@@ -812,35 +851,63 @@ export class CandidateEvidence {
     return { ...current, directory };
   }
 
-  recordCheck(input: { candidate: Candidate; plan: CheckPlan; passed: boolean; output: Buffer }): {
+  recordCheck(input: {
+    candidate: Candidate;
+    plan: CheckPlan;
+    passed: boolean;
+    output: Buffer;
+    sourceFiles?: FileContent[];
+  }): {
     evidence: CheckResult;
     artifacts: Artifact[];
   } {
     const { candidate, plan } = input;
-    if (
-      plan.candidateId !== candidate.id ||
-      plan.candidateHash !== candidate.hash ||
-      definition(plan) !== plan.definitionHash
-    )
+    if (plan.candidateId !== candidate.id || plan.candidateHash !== candidate.hash)
       throw new Error('Check plan does not bind this candidate and definition.');
     const { base } = this.read(candidate);
     let unchanged = false;
     let complete = false;
     let tests = 0;
+    let verified = false;
     try {
-      // Exit zero cannot bless a test that rewrites the code it just evaluated.
-      unchanged =
-        this.hash(base, readFiles(plan.directory)) === candidate.hash &&
-        evaluator() === plan.evaluator &&
-        digest(readFileSync(reporterPath)) === plan.reporterHash &&
-        (plan.recipeId !== 'project-node-tests-v1' ||
-          digest(readFileSync(guardPath)) === plan.guardHash);
-      // Node can pass a file that exits during import without running its original tests.
-      ({ complete, tests } = report(input.output, plan.required));
+      if (plan.recipeId === 'project-python-unittest-v1') {
+        if (!input.sourceFiles) throw Error('Python check source is unavailable.');
+        const { directory: _directory, ...definition } = plan;
+        const outcome = evaluatePythonCheck({
+          definition,
+          source: input.sourceFiles,
+          candidate: this.read(candidate).files,
+          checkedCandidate: readFiles(plan.directory),
+          exitCode: input.passed ? 0 : 1,
+          output: input.output,
+          budget: {
+            deadline: Date.now() + 10_000,
+            now: Date.now,
+            maximumEntries: 10_000,
+            maximumBytes: MAX_BYTES,
+          },
+        });
+        unchanged = outcome.sourceUnchanged && outcome.candidateUnchanged;
+        complete = outcome.complete;
+        tests = outcome.tests;
+        verified = outcome.passed;
+      } else {
+        if (definition(plan) !== plan.definitionHash) throw Error('Check definition changed.');
+        // Exit zero cannot bless a test that rewrites the code it just evaluated.
+        unchanged =
+          this.hash(base, readFiles(plan.directory)) === candidate.hash &&
+          evaluator() === plan.evaluator &&
+          digest(readFileSync(reporterPath)) === plan.reporterHash &&
+          (plan.recipeId !== 'project-node-tests-v1' ||
+            digest(readFileSync(guardPath)) === plan.guardHash);
+        // Node can pass a file that exits during import without running its original tests.
+        ({ complete, tests } = report(input.output, plan.required));
+        verified = unchanged && complete;
+      }
     } catch {
       // An unreadable copy or incomplete report cannot establish a passing check.
     }
-    const passed = input.passed && unchanged && complete;
+    const passed = input.passed && verified;
     const log = this.publish(input.output, 'text/plain');
     const metadata = this.publish(
       Buffer.from(
@@ -848,7 +915,7 @@ export class CandidateEvidence {
           candidateId: candidate.id,
           candidateHash: candidate.hash,
           definitionHash: plan.definitionHash,
-          ...(plan.combined ? { combined: plan.combined } : {}),
+          ...('combined' in plan && plan.combined ? { combined: plan.combined } : {}),
           evaluator: plan.evaluator,
           passed,
           unchanged,
