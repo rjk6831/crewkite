@@ -180,9 +180,17 @@ The adapter accepts all four native permission modes only when init matches cont
 
 The primary conversation uses the supported OpenAI profile for Lead or Orchestrator. Its first turn keeps the profile's fixed model and low effort. A successful accepted turn can publish the sanitized catalog already discovered by that same transcript, after owned cleanup. No separate discovery request or startup polling runs for the selectors. The retained catalog is last-observed guidance, with at most 20 model IDs and 16 effort IDs per model.
 
-An explicit Save binds the requested pair to that immutable observation and the exact supported profile and client. The next admitted planning turn checks current advertised choices, Pro metadata, ordinary allowance or explicitly allowed existing credits, and disabled MCP servers before creating its thread. Exact thread model and effort acknowledgement is required before the prompt. A missing pair refuses without a fallback, effective settings stay unknown, and the saved request remains inspectable. Discovery provides no stable account identity or same-account continuity proof. These choices broaden planning only; writer, repository and reviewer profiles keep their own pinned inputs. A catalog entry or acknowledged pair establishes no live qualification.
+An explicit Save binds the requested pair to that immutable observation and the exact supported profile and client. The next admitted planning turn checks current advertised choices, Pro metadata, ordinary allowance or explicitly allowed existing credits, and disabled MCP servers before creating its thread. Exact thread model and effort acknowledgement is required before the prompt. A missing pair refuses without a fallback, effective settings stay unknown, and the saved request remains inspectable. Discovery provides no stable account identity or same-account continuity proof. These choices broaden planning only. Project execution uses its separate catalog below; other writer and reviewer profiles retain their own inputs. A catalog entry or acknowledged pair establishes no live qualification.
 
 On 17 October 2026, one normal planning turn retained an adoptable proposal and a seven-model last-observed catalog. The same completed turn reported 24,384 context tokens and a 475,000-token capacity, bound to its run and immutable observation. These reported values establish no quota balance or completed coding task.
+
+## Project model choices
+
+D2b UAT 05 reads the supported native OpenAI catalog when Project preparation opens. The read creates no thread or model turn. Its retained observation binds the task definition, committed source, profile, native client and local configuration. Planning choices remain separate.
+
+Preparation freezes the selected advertised model and effort with that exact observation. Start checks the binding and current advertised pair before sending a prompt. A missing pair refuses without substitution. Requested selections and observed effective values remain separate. Stop and restart retain ownership facts; an uncertain read cannot authorize replay or task execution.
+
+The source and controlled regression journey qualify these bindings. No live account discovery or alternate-model execution was performed for UAT 05. An advertised pair establishes no account entitlement or measured coding quality.
 
 ## OpenAI writer preparation
 

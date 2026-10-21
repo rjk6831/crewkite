@@ -9,7 +9,11 @@ CrewKite is a desktop workspace and CLI for coding tasks that share one local co
 
 CrewKite by Roots No Limits LLC. Created by Raymond J. Kraft.
 
-[D2b UAT 04](https://github.com/rjk6831/crewkite/releases/tag/d2b-uat-04) is the current prerelease. It adds a manual, trusted native Anthropic `/usage` report to the shared remaining-allowance gauges. Its [required CI](https://github.com/rjk6831/crewkite/actions/runs/39610727447) passed 144 Node claims and one desktop journey.
+[D2b UAT 05](https://github.com/rjk6831/crewkite/releases/tag/d2b-uat-05) is the current prerelease. It adds OpenAI Project model and effort selection before planning. Its [required CI](https://github.com/rjk6831/crewkite/actions/runs/39617852147) passed 146 Node claims and one desktop journey.
+
+The 196,439,723-byte ZIP passed cold launch, restart and a UAT 04 upgrade with exact state preservation, backup and reopen. Public anonymous downloads matched all three assets. Human UAT, live account catalog discovery and alternate-model execution remain unqualified for this release. The [release receipt](https://github.com/rjk6831/crewkite/releases/download/d2b-uat-05/release.json) records source `fb735357`, tree `96cd6262`, the archive checksum and qualification limits. The package remains ad-hoc signed and unnotarized.
+
+[D2b UAT 04](https://github.com/rjk6831/crewkite/releases/tag/d2b-uat-04) introduced a manual, trusted native Anthropic `/usage` report to the shared remaining-allowance gauges. Its [required CI](https://github.com/rjk6831/crewkite/actions/runs/39610727447) passed 144 Node claims and one desktop journey.
 
 The 196,430,760-byte ZIP passed cold launch and restart checks. An upgrade from UAT 03 preserved the exact retained state, wrote its backup and reopened successfully. A separate-gauge fixture also passed. Public anonymous downloads matched all three release assets. Human UAT and a live Anthropic usage read remain pending. This exact candidate has an ad-hoc integrity seal and no notarization. The public [release receipt](https://github.com/rjk6831/crewkite/releases/download/d2b-uat-04/release.json) records source `25ccd74`, tree `3ef524c3`, the archive checksum and qualification limits.
 

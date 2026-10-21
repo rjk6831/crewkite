@@ -35,7 +35,7 @@ I record the exact source revision, verification and provider qualification in t
 
 ## Start a task
 
-These steps apply to the [D2b UAT 04 prerelease](https://github.com/rjk6831/crewkite/releases/tag/d2b-uat-04). Read its release receipt before testing a provider route. Required CI passed 144 Node claims and one desktop journey. The package passed cold launch, restart, exact UAT 03 state upgrade with backup and reopen, and a separate-gauge fixture. Public anonymous downloads matched all three assets. Human UAT and a live Anthropic usage read remain pending; the package has an ad-hoc integrity seal and is not notarized.
+These steps apply to the [D2b UAT 05 prerelease](https://github.com/rjk6831/crewkite/releases/tag/d2b-uat-05). Read its release receipt before testing a provider route. Required CI passed 146 Node claims and one desktop journey. The package passed cold launch, restart and an exact UAT 04 state upgrade with backup and reopen. Public anonymous downloads matched all three assets. Model-catalog binding has controlled regression coverage; live account discovery, alternate-model execution and human UAT remain unqualified for this release. The package has an ad-hoc integrity seal and is not notarized.
 
 1. Open the normal candidate. Packaging details are in the [distribution notes](distribution.md).
 2. Choose Connect providers and check the clients you plan to use. Coding setup readiness and quota are separate facts. A connected client does not make every Project engine ready.
@@ -46,7 +46,7 @@ These steps apply to the [D2b UAT 04 prerelease](https://github.com/rjk6831/crew
 
 Plan with AI is optional. If you use it, send a bounded objective, read the answers, criteria and scope, and choose Adopt plan only when they match your intent. Adoption saves the task contract and starts no coding work.
 
-For a normal new task, choose Prepare run. Keep the Project scope and OpenAI Project profile. A successful planning turn can retain advertised model and effort choices; the profile default applies before that catalog exists. Choose Start task to open the permission draft. Subscription only is the default. Read the exact source and policy, then select “Allow OpenAI to read this project, edit a separate working copy, and run local commands using my signed-in client.” Choose Review task to save that preparation, review it once more, then choose Start task. Work runs in a separate scratch copy.
+For a normal new task, choose Prepare run. Keep the Project scope and OpenAI Project profile. Choose the task-bound model and effort when advertised, then choose Start task to open the permission draft. Catalog reads require no planning turn; the profile default applies when no explicit choice is saved. Subscription only is the default. Read the exact source and policy, then select “Allow OpenAI to read this project, edit a separate working copy, and run local commands using my signed-in client.” Choose Review task to save that preparation, review it once more, then choose Start task. Work runs in a separate scratch copy.
 
 A material model or effort Save creates a linked planning run and returns the contract to provisional, so adopt a fresh valid plan before preparing execution again. Make material planning changes before execution begins, since that Save is scoped to the discussion. Once an execution run exists, it is retained, and material planning changes are unavailable there. Ordinary messages remain guidance and do not replace that run.
 
