@@ -32,6 +32,7 @@ Each record states one decision, the context that forced it, why I chose it and 
 | [0026](0026-bind-combined-acceptance-to-checked-origins.md) | Bind combined acceptance to checked contributor origins | Proposed |
 | [0027](0027-page-large-data-without-project-size-ceilings.md) | Page large data without aggregate project-size ceilings | Proposed |
 | [0028](0028-journal-project-commands-and-remote-effects.md) | Journal project commands and remote effects | Proposed |
+| [0029](0029-native-repository-context-and-handoff.md) | Own repository context and handoff in the controller | Proposed |
 
 ## Writing a new record
 
