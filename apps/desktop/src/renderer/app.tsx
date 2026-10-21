@@ -2818,29 +2818,35 @@ function Usage({
   run?: Run;
   workspace: Workspace;
 }) {
-  const [readerMessage, setReaderMessage] = useState<string | null>(null);
+  const [readerMessages, setReaderMessages] = useState<
+    Partial<Record<'openai' | 'anthropic' | 'google', string>>
+  >({});
   const [metadataBusy, setMetadataBusy] = useState<Record<string, boolean>>({});
   const anthropicConnection = snapshot.nativeConnections.find(
     (value) => value.family === 'anthropic',
   );
   async function checkAnthropic() {
     setMetadataBusy((current) => ({ ...current, anthropic: true }));
-    setReaderMessage('Checking Anthropic sign-in.');
+    setReaderMessages((current) => ({ ...current, anthropic: 'Checking Anthropic sign-in.' }));
     try {
       const result = await workspace.metadataCommand({
         command: 'CheckNativeConnection',
         expectedRevision: 0,
         payload: { family: 'anthropic', consent: 'explicit' },
       });
-      setReaderMessage(
-        result.outcome === 'applied' || result.outcome === 'already-applied'
-          ? 'Anthropic sign-in check completed.'
-          : [result.reason ?? result.outcome, result.next].filter(Boolean).join('. '),
-      );
+      setReaderMessages((current) => ({
+        ...current,
+        anthropic:
+          result.outcome === 'applied' || result.outcome === 'already-applied'
+            ? 'Anthropic sign-in check completed.'
+            : [result.reason ?? result.outcome, result.next].filter(Boolean).join('. '),
+      }));
     } catch (failure) {
-      setReaderMessage(
-        failure instanceof Error ? failure.message : 'Anthropic sign-in could not be checked.',
-      );
+      setReaderMessages((current) => ({
+        ...current,
+        anthropic:
+          failure instanceof Error ? failure.message : 'Anthropic sign-in could not be checked.',
+      }));
     } finally {
       setMetadataBusy((current) => ({ ...current, anthropic: false }));
     }
@@ -2857,20 +2863,25 @@ function Usage({
   const connected = workspace.connection === 'connected' && !workspace.preview;
   async function observeUsage(family: 'google' | 'openai') {
     setMetadataBusy((current) => ({ ...current, [family]: true }));
-    setReaderMessage('Quota read in progress.');
+    setReaderMessages((current) => ({ ...current, [family]: 'Quota read in progress.' }));
     try {
       const result = await workspace.metadataCommand({
         command: 'ObserveUsage',
         expectedRevision: 0,
         payload: { family },
       });
-      setReaderMessage(
-        result.outcome === 'applied' || result.outcome === 'already-applied'
-          ? 'Quota read successful.'
-          : [result.reason ?? result.outcome, result.next].filter(Boolean).join('. '),
-      );
+      setReaderMessages((current) => ({
+        ...current,
+        [family]:
+          result.outcome === 'applied' || result.outcome === 'already-applied'
+            ? 'Quota read successful.'
+            : [result.reason ?? result.outcome, result.next].filter(Boolean).join('. '),
+      }));
     } catch (failure) {
-      setReaderMessage(failure instanceof Error ? failure.message : 'The quota command failed.');
+      setReaderMessages((current) => ({
+        ...current,
+        [family]: failure instanceof Error ? failure.message : 'The quota command failed.',
+      }));
     } finally {
       setMetadataBusy((current) => ({ ...current, [family]: false }));
     }
@@ -2880,7 +2891,8 @@ function Usage({
     ...snapshot.usage.map(({ observation }) => Date.parse(observation.observedAt)),
   );
   const now = fixture ? fixtureTime : displayTime;
-  const cloud = snapshot.routes.filter(({ family }) => family !== 'local');
+  const families = ['openai', 'anthropic', 'google', 'local'] as const;
+  const cloudFamilies = ['openai', 'anthropic', 'google'] as const;
   const scopes = projectUsagePresentation(snapshot, run?.policy.policy.reserves ?? null, now);
   const cards: UsageCard[] = scopes.map((scope) => ({
     id: scope.id,
@@ -2926,6 +2938,20 @@ function Usage({
             const nextReadAt = reader?.lastAttemptAt
               ? Date.parse(reader.lastAttemptAt) + 60000
               : null;
+            const cooldownSeconds =
+              nextReadAt !== null && nextReadAt > now
+                ? Math.max(1, Math.ceil((nextReadAt - now) / 1000))
+                : 0;
+            const codingReady = profiles.some((profile) => profile.available);
+            const quotaAvailable =
+              family === 'local'
+                ? 'No cloud quota'
+                : reader?.lastObservedAt
+                  ? 'Reported'
+                  : reader?.available
+                    ? 'Reader ready, not read'
+                    : 'Unknown';
+            const readerMessage = family === 'local' ? null : readerMessages[family];
             return (
               <section className="card" key={family} aria-label={`${label} client status`}>
                 <div className="section-heading">
@@ -2944,6 +2970,10 @@ function Usage({
                 {profiles.length === 0 && (
                   <p className="muted small">No native profile is registered.</p>
                 )}
+                <div className="facts-grid compact">
+                  <Fact label="Coding setup ready" value={codingReady ? 'Yes' : 'No'} />
+                  <Fact label="Quota available" value={quotaAvailable} />
+                </div>
                 {family === 'anthropic' ? (
                   <>
                     <p role="status">
@@ -3011,7 +3041,8 @@ function Usage({
                         metadataBusy[family] ||
                         !reader?.available ||
                         reader.readState === 'intent' ||
-                        reader.readState === 'owned'
+                        reader.readState === 'owned' ||
+                        cooldownSeconds > 0
                       }
                       onClick={() => void observeUsage(family)}
                     >
@@ -3023,9 +3054,8 @@ function Usage({
                         <p role="status">Latest quota read successful.</p>
                       )}
                     <p className="muted small">
-                      Reader status: {reader?.reason ?? 'unavailable'}. Last attempt:{' '}
-                      {reader?.lastAttemptAt ?? 'None'}. Last observation:{' '}
-                      {reader?.lastObservedAt ?? 'None'}.
+                      Reader status: {reader?.reason ?? 'unavailable'}. Updated:{' '}
+                      {reader?.lastObservedAt ?? 'Not observed'}.
                     </p>
                     {reader?.readState && (
                       <p className="muted small">
@@ -3034,19 +3064,18 @@ function Usage({
                         {reader.lastRequest ? ` Last request: ${reader.lastRequest}.` : ''}
                       </p>
                     )}
-                    {nextReadAt !== null && nextReadAt > now && (
+                    {cooldownSeconds > 0 && (
                       <p className="muted small">
-                        Cooldown until {new Date(nextReadAt).toLocaleTimeString()}. Failed reads
-                        also count.
+                        Refresh available in {cooldownSeconds}s. Failed reads also count.
                       </p>
                     )}
                   </>
                 )}
+                {readerMessage && <p role="status">{readerMessage}</p>}
               </section>
             );
           })}
         </div>
-        {readerMessage && <p role="status">{readerMessage}</p>}
       </section>
       <section aria-labelledby="allowance-title">
         <div className="section-heading">
@@ -3096,22 +3125,27 @@ function Usage({
               </tr>
             </thead>
             <tbody>
-              {snapshot.routes.map((route) => (
-                <tr key={route.id}>
-                  <td>
-                    <span className={`provider-dot ${familyClass(route.family)}`} />
-                    {familyName(route.family)}
-                  </td>
-                  <td>
-                    {
-                      attempts.filter(
-                        ({ routeId, state }) => routeId === route.id && state !== 'intent',
-                      ).length
-                    }
-                  </td>
-                  <td className="muted">Not measured</td>
-                </tr>
-              ))}
+              {families.map((family) => {
+                const routeIds = new Set(
+                  snapshot.routes.filter((route) => route.family === family).map(({ id }) => id),
+                );
+                return (
+                  <tr key={family}>
+                    <td>
+                      <span className={`provider-dot ${familyClass(family)}`} />
+                      {familyName(family)}
+                    </td>
+                    <td>
+                      {
+                        attempts.filter(
+                          ({ routeId, state }) => routeIds.has(routeId) && state !== 'intent',
+                        ).length
+                      }
+                    </td>
+                    <td className="muted">Not measured</td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
           <p className="muted small">
@@ -3154,16 +3188,24 @@ function Usage({
           <span>Separate from subscription allowance</span>
         </div>
         <div className="credit-grid">
-          {cloud.map((route) => (
-            <div className="credit-row" key={route.id}>
-              <span className={`provider-dot ${familyClass(route.family)}`} />
+          {cloudFamilies.map((family) => (
+            <div className="credit-row" key={family}>
+              <span className={`provider-dot ${familyClass(family)}`} />
               <div>
-                <strong>{familyName(route.family)}</strong>
+                <strong>{familyName(family)}</strong>
                 <small>No account credit balance reported</small>
               </div>
               <span className="credit-off">Unknown</span>
             </div>
           ))}
+          <div className="credit-row">
+            <span className={`provider-dot ${familyClass('local')}`} />
+            <div>
+              <strong>{familyName('local')}</strong>
+              <small>Local inference has no cloud credit balance</small>
+            </div>
+            <span className="credit-off">No cloud credits</span>
+          </div>
         </div>
         <p className="muted small">
           Using existing credits requires a billing selection when preparing a run. A provider limit
