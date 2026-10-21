@@ -105,6 +105,7 @@ import { useWorkspace, type Workspace } from './source.ts';
 import { roleLabels } from './templates.ts';
 import { type UsageCard, UsageGauges, type UsageReading } from './usage-gauges.tsx';
 import {
+  anthropicUsageCard,
   nativeUsageClients,
   projectUsagePresentation,
   type UsageGaugeReading,
@@ -3062,6 +3063,8 @@ function Usage({
       .map((reading) => usageReading(reading)),
     emptyText: 'No usage observations.',
   }));
+  const nativeQuota = anthropicUsageCard(snapshot);
+  if (nativeQuota) cards.push(nativeQuota);
   return (
     <main className="usage-page">
       <div className="page-heading">
@@ -3245,53 +3248,6 @@ function Usage({
                         Refresh available after {new Date(nextReadAt).toLocaleTimeString()}. Failed
                         reads also count.
                       </p>
-                    )}
-                    {reader?.reading && (
-                      <section aria-label="Anthropic reported quota">
-                        <p className="muted small">
-                          Last retained report received{' '}
-                          {new Date(reader.reading.receivedAt).toLocaleString()}. Observation time
-                          and cache age unknown.
-                        </p>
-                        {reader.readingScopeHash !== reader.trust?.scopeHash && (
-                          <p className="muted small">
-                            This report belongs to an earlier client or reader policy.
-                          </p>
-                        )}
-                        {reader.reading.windows.map((row) => (
-                          <div key={JSON.stringify(row)}>
-                            <label>
-                              {row.scope?.model?.display_name ??
-                                row.scope?.surface?.display_name ??
-                                row.group}{' '}
-                              · {row.kind}: reported {row.percent}%
-                              <progress
-                                aria-label={`${row.group} reported usage`}
-                                max={100}
-                                value={row.percent}
-                              />
-                            </label>
-                            <p className="muted small">
-                              Reset{' '}
-                              {row.resets_at ? new Date(row.resets_at).toLocaleString() : 'unknown'}
-                              . Report age unknown.
-                            </p>
-                          </div>
-                        ))}
-                        {reader.reading.status === 'unavailable' && (
-                          <p>
-                            No subscription allowance was reported. Sign-in and coding allowance
-                            remain separate.
-                          </p>
-                        )}
-                        {reader.reading.extraUsage && (
-                          <p className="muted small">
-                            Extra usage is{' '}
-                            {reader.reading.extraUsage.is_enabled ? 'enabled' : 'disabled'} in the
-                            native report. It is separate from included allowance.
-                          </p>
-                        )}
-                      </section>
                     )}
                   </>
                 ) : family === 'local' ? (

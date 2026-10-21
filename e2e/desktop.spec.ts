@@ -752,7 +752,7 @@ async function quotaReadBridge(
           kind: 'session',
           group: 'session',
           percent: 37,
-          resets_at: null,
+          resets_at: '2030-01-01T00:00:00.000Z',
           severity: 'normal',
           is_active: true,
         },
@@ -762,9 +762,19 @@ async function quotaReadBridge(
       qualified: false,
     };
     reply(usageRefresh, { outcome: 'applied' });
-    await expect(anthropicPanel).toContainText('Last retained report received');
-    await expect(anthropicPanel).toContainText('Observation time and cache age unknown');
-    await expect(anthropicPanel).toContainText('reported 37%');
+    const nativeAllowance = page.getByRole('article', {
+      name: 'Anthropic native quota',
+      exact: true,
+    });
+    await expect(nativeAllowance).toBeVisible();
+    await expect(nativeAllowance).toContainText('Last retained report received');
+    await expect(nativeAllowance).toContainText('Observation time and cache age unknown');
+    await expect(nativeAllowance.locator('.usage-gauge-value')).toContainText('63%');
+    await expect(nativeAllowance.locator('.usage-gauge-caption')).toHaveText('reported remaining');
+    await expect(
+      nativeAllowance.locator('time[datetime="2030-01-01T00:00:00.000Z"]').first(),
+    ).toBeVisible();
+    await expect(anthropicPanel.locator('progress')).toHaveCount(0);
     await expect(anthropicPanel).not.toContainText('Reader ready, not read');
     await quotaRefresh.click();
     const rememberedRefresh = await next();
