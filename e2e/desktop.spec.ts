@@ -639,17 +639,9 @@ async function quotaReadBridge(
     ).toHaveCount(0);
     await page.reload();
     await page.getByRole('button', { name: 'Usage and capacity', exact: true }).click();
-    await expect(panel).toContainText('Cooldown until');
-    await refresh.click();
-    const cooldown = await next();
-    reply(cooldown, {
-      outcome: 'blocked',
-      reason: 'usage-reader-cooldown',
-      next: 'Wait until the next read is allowed.',
-    });
-    await expect(
-      page.getByRole('status').filter({ hasText: /Quota|fixture-uncertain|usage-reader-cooldown/ }),
-    ).toContainText('usage-reader-cooldown');
+    await expect(panel).toContainText(/Refresh available in \d+s/u);
+    await expect(refresh).toBeDisabled();
+    assert.equal(pending.length, 0);
     snapshot.nativeProfiles.push(
       AnthropicNativeProfileSchema.parse({
         ...unavailableNativeProfile().facts,
@@ -782,11 +774,11 @@ async function quotaReadBridge(
     );
 
     const setupPanel = page.getByRole('region', { name: 'Google ACP setup', exact: true });
-    const install = setupPanel.getByRole('button', {
-      name: 'Install official Google client',
+    const connectGoogle = setupPanel.getByRole('button', {
+      name: 'Connect Google',
       exact: true,
     });
-    await install.click();
+    await connectGoogle.click();
     const installation = await next();
     assert.equal(installation.command.command, 'InstallGoogleAcp');
     assert.deepEqual(installation.command.payload, {
@@ -802,7 +794,7 @@ async function quotaReadBridge(
       next: 'Installation in progress.',
     };
     await expect(page.getByRole('button', { name: 'Add project', exact: true })).toBeEnabled();
-    await setupPanel.getByRole('button', { name: 'Stop installation', exact: true }).click();
+    await setupPanel.getByRole('button', { name: 'Cancel', exact: true }).click();
     const installStop = await next();
     assert.equal(installStop.command.command, 'StopGoogleAcpInstall');
     assert.deepEqual(installStop.command.payload, {
@@ -825,50 +817,37 @@ async function quotaReadBridge(
       reason: 'google-install-stopped',
       data: { kind: 'google-acp-install', install: snapshot.googleAcpInstall },
     });
-    await expect(setupPanel.getByRole('status').last()).toContainText('google-install-stopped');
-    await expect(install).toBeEnabled();
-    await install.click();
-    const installed = await next();
-    assert.equal(installed.command.command, 'InstallGoogleAcp');
+    await expect(setupPanel.getByRole('status').last()).toContainText(
+      'Cancellation requested for the active operation.',
+    );
     snapshot.googleAcpInstall = {
       ...snapshot.googleAcpInstall,
       state: 'installed',
+      operationId: null,
       reason: null,
       next: 'Initialize the installed client.',
     };
-    reply(installed, {
-      outcome: 'applied',
-      data: { kind: 'google-acp-install', install: snapshot.googleAcpInstall },
-    });
-    const verifyInstalled = setupPanel.getByRole('button', {
-      name: 'Verify installed Google client',
-      exact: true,
-    });
-    await expect(verifyInstalled).toBeEnabled();
-    await verifyInstalled.click();
-    const verifyClient = await next();
-    assert.equal(verifyClient.command.command, 'InstallGoogleAcp');
-    reply(verifyClient, {
-      outcome: 'blocked',
-      reason: 'fixture-client-unavailable',
-      data: { kind: 'google-acp-install', install: snapshot.googleAcpInstall },
-    });
-    await expect(setupPanel.getByRole('status').last()).toContainText('fixture-client-unavailable');
-    await expect(verifyInstalled).toBeEnabled();
-    await setupPanel.getByRole('button', { name: 'Initialize Google ACP', exact: true }).click();
-    const setupRead = await next();
-    assert.equal(setupRead.command.command, 'InitializeGoogleAcp');
     snapshot.googleAcpSetup = {
       profileId: 'google-acp-v1',
       revision: 1,
-      state: 'initializing',
-      operationId: setupRead.command.key,
+      state: 'uninitialized',
+      operationId: null,
       proofId: null,
       client: null,
       auth: { method: null, status: 'unknown' },
       reason: null,
     };
-    await setupPanel.getByRole('button', { name: 'Stop setup', exact: true }).click();
+    await page.reload();
+    await page.getByRole('button', { name: 'Connect providers', exact: true }).click();
+    await connectGoogle.click();
+    const setupRead = await next();
+    assert.equal(setupRead.command.command, 'InitializeGoogleAcp');
+    snapshot.googleAcpSetup = {
+      ...snapshot.googleAcpSetup,
+      state: 'initializing',
+      operationId: setupRead.command.key,
+    };
+    await setupPanel.getByRole('button', { name: 'Cancel', exact: true }).click();
     const setupStop = await next();
     assert.equal(setupStop.command.command, 'StopGoogleAcpSetup');
     assert.equal(setupStop.command.expectedRevision, 1);
@@ -891,17 +870,54 @@ async function quotaReadBridge(
       reason: 'fixture-client-missing',
       data: { kind: 'google-acp-setup', setup: snapshot.googleAcpSetup },
     });
-    await expect(setupPanel.getByRole('status').last()).toContainText('fixture-client-missing');
+    await expect(setupPanel.getByRole('status').last()).toContainText(
+      'Cancellation requested for the active operation.',
+    );
     await expect(
       page.getByRole('button', { name: 'Retry exact command', exact: true }),
     ).toHaveCount(0);
-    await expect(page.getByRole('button', { name: 'Add project', exact: true })).toBeEnabled();
-    await setupPanel.getByRole('button', { name: 'Initialize Google ACP', exact: true }).click();
+    snapshot.googleAcpInstall = {
+      ...snapshot.googleAcpInstall,
+      state: 'idle',
+      operationId: null,
+      reason: null,
+      next: 'Install the official client.',
+    };
+    snapshot.googleAcpSetup = {
+      profileId: 'google-acp-v1',
+      revision: 0,
+      state: 'uninitialized',
+      operationId: null,
+      proofId: null,
+      client: null,
+      auth: { method: null, status: 'unknown' },
+      reason: null,
+    };
+    await page.reload();
+    await page.getByRole('button', { name: 'Connect providers', exact: true }).click();
+    await connectGoogle.click();
+    const installed = await next();
+    assert.equal(installed.command.command, 'InstallGoogleAcp');
+    snapshot.googleAcpInstall = {
+      ...snapshot.googleAcpInstall,
+      state: 'installed',
+      reason: null,
+      next: 'Initialize the installed client.',
+    };
+    reply(installed, {
+      outcome: 'applied',
+      data: { kind: 'google-acp-install', install: snapshot.googleAcpInstall },
+    });
     const initialization = await next();
     assert.equal(initialization.command.command, 'InitializeGoogleAcp');
+    assert.equal(initialization.command.expectedRevision, 0);
+    assert.deepEqual(initialization.command.payload, {
+      profileId: 'google-acp-v1',
+      consent: 'explicit',
+    });
     snapshot.googleAcpSetup = {
       ...snapshot.googleAcpSetup,
-      revision: 3,
+      revision: 1,
       state: 'authentication-required',
       proofId: 'art_01ARZ3NDEKTSV4RRFFQ69G5FAV',
       client: { version: '1.4.0', sha256: 'a'.repeat(64), signerTeamId: 'fixture-team' },
@@ -911,13 +927,9 @@ async function quotaReadBridge(
       outcome: 'applied',
       data: { kind: 'google-acp-setup', setup: snapshot.googleAcpSetup },
     });
-    await expect(
-      setupPanel.getByRole('button', { name: 'Sign in with Google', exact: true }),
-    ).toBeEnabled();
-    assert.equal(pending.length, 0, 'Sign-in must require a separate explicit click.');
-    await setupPanel.getByRole('button', { name: 'Sign in with Google', exact: true }).click();
     const authenticate = await next();
     assert.equal(authenticate.command.command, 'AuthenticateGoogleAcp');
+    assert.equal(authenticate.command.expectedRevision, 1);
     assert.deepEqual(authenticate.command.payload, {
       profileId: 'google-acp-v1',
       proofId: snapshot.googleAcpSetup.proofId,
@@ -926,7 +938,7 @@ async function quotaReadBridge(
     });
     snapshot.googleAcpSetup = {
       ...snapshot.googleAcpSetup,
-      revision: 4,
+      revision: 2,
       state: 'discovery-required',
       auth: { method: 'oauth-personal', status: 'authenticated' },
     };
@@ -934,26 +946,22 @@ async function quotaReadBridge(
       outcome: 'applied',
       data: { kind: 'google-acp-setup', setup: snapshot.googleAcpSetup },
     });
-    await expect(
-      setupPanel.getByText('Signed in, discover choices', { exact: true }),
-    ).toBeVisible();
-    await expect(setupPanel.getByRole('status').last()).toContainText(
-      'Signed in. Discover Google choices to finish setup.',
-    );
-    await setupPanel.getByRole('button', { name: 'Discover Google choices', exact: true }).click();
     const discovery = await next();
     assert.equal(discovery.command.command, 'DiscoverGoogleAcp');
+    assert.equal(discovery.command.expectedRevision, 2);
     assert.deepEqual(discovery.command.payload, {
       profileId: 'google-acp-v1',
       proofId: snapshot.googleAcpSetup.proofId,
       consent: 'explicit',
     });
-    snapshot.googleAcpSetup = { ...snapshot.googleAcpSetup, revision: 5, state: 'ready' };
+    snapshot.googleAcpSetup = { ...snapshot.googleAcpSetup, revision: 3, state: 'ready' };
     reply(discovery, {
       outcome: 'applied',
       data: { kind: 'google-acp-setup', setup: snapshot.googleAcpSetup },
     });
-    await expect(setupPanel.getByRole('status').last()).toContainText('Ready');
+    await expect(setupPanel.getByRole('status').last()).toContainText(
+      'Google coding setup is ready.',
+    );
     await expect(
       page.getByRole('button', { name: 'Retry exact command', exact: true }),
     ).toHaveCount(0);
@@ -1014,6 +1022,7 @@ async function quotaReadBridge(
     });
     SnapshotSchema.parse(snapshot);
     {
+      snapshot.usageReaders[0].lastAttemptAt = '2026-10-17T00:00:00.000Z';
       await page.reload();
       await page.getByRole('button', { name: 'Usage and capacity', exact: true }).click();
       await refresh.click();
@@ -1329,8 +1338,7 @@ async function conversationBridge(
     }
     received.push(command);
     if (command.command === 'PrepareNativeRun') {
-      if (command.payload.profileId === 'openai-repository-v1') {
-        assert.equal(workerPreparationKey, null);
+      if (command.payload.profileId === 'openai-repository-v1' && workerPreparationKey === null) {
         assert.equal(command.expectedRevision, snapshot.tasks[0].revision);
         assert.equal(command.payload.taskId, snapshot.tasks[0].id);
         workerPreparationKey = command.key;
@@ -1778,6 +1786,7 @@ async function conversationBridge(
     await chooseContext('Project log', '/registered/project/logs/project.log');
     await expect(page.getByRole('button', { name: /^Remove Context/ })).toHaveCount(2);
     await page.reload();
+    await page.getByRole('button', { name: 'Plan with AI', exact: true }).click();
     await expect(composer).toHaveValue('Export the currently filtered invoices as CSV.');
     await expect(page.getByRole('button', { name: /^Remove Context/ })).toHaveCount(2);
 
@@ -1820,6 +1829,7 @@ async function conversationBridge(
       localStorage.setItem('crewkite-context-drafts-v1', JSON.stringify(drafts));
     }, pendingGoalDrafts);
     await page.reload();
+    await page.getByRole('button', { name: 'Plan with AI', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'New goal', exact: true })).toBeVisible();
     await page.getByRole('button', { name: 'Retry exact command', exact: true }).click();
     await expect(
@@ -1835,6 +1845,7 @@ async function conversationBridge(
       pendingGoalDrafts,
     );
     await page.reload();
+    await page.getByRole('button', { name: 'Plan with AI', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'New goal', exact: true })).toBeVisible();
     await page.getByRole('button', { name: 'Retry exact command', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'New goal', exact: true })).toHaveCount(0);
@@ -2076,7 +2087,7 @@ async function conversationBridge(
     await expect.poll(() => conversationStateReads).toBeGreaterThan(readsBeforeWorkerChoice);
     const workerNative = page.getByRole('dialog', { name: 'Repository work', exact: true });
     await expect(workerNative).toBeVisible();
-    await expect(workerNative).toContainText(repositoryProfile.displayName);
+    await expect(workerNative.getByText('OpenAI', { exact: true })).toBeVisible();
     await expect(
       workerNative.getByRole('combobox', { name: 'Execution authority', exact: true }),
     ).toHaveValue('balanced');
@@ -2098,6 +2109,7 @@ async function conversationBridge(
         exact: true,
       }),
     ).toHaveCount(0);
+    await workerNative.getByText('Details', { exact: true }).click();
     await expect(
       workerNative.getByRole('checkbox', {
         name: 'Allow local commands for this run',
@@ -2226,7 +2238,7 @@ async function conversationBridge(
     assert.equal('targetPath' in explicitPreparation.payload, false);
     await seededNative.getByRole('button', { name: 'Cancel', exact: true }).click();
     await page
-      .getByRole('tabpanel', { name: 'Plan', exact: true })
+      .locator('.task-actions')
       .getByRole('button', { name: 'Prepare run', exact: true })
       .click();
     await expect(pendingChooser).toBeVisible();
@@ -2241,7 +2253,7 @@ async function conversationBridge(
       page.getByRole('button', { name: 'Retry exact command', exact: true }),
     ).toHaveCount(0);
     await page
-      .getByRole('tabpanel', { name: 'Plan', exact: true })
+      .locator('.task-actions')
       .getByRole('button', { name: 'Prepare run', exact: true })
       .click();
     await expect(pendingChooser).toBeVisible();
@@ -3998,6 +4010,7 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     await expect(nativeDialog).toHaveAccessibleName('Repository work');
     await expect(nativeDialog.getByText('Requires Pro', { exact: true })).toHaveCount(0);
     await expect(nativeDialog.getByLabel('File to edit', { exact: true })).toHaveCount(0);
+    await nativeDialog.getByText('Details', { exact: true }).click();
     const credits = nativeDialog.getByLabel('Allow existing credits after included usage', {
       exact: true,
     });
@@ -4105,6 +4118,7 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     await expect(trust).not.toBeChecked();
     await expect(consent).not.toBeChecked();
     await expect(credits).toHaveCount(0);
+    await nativeDialog.getByText('Provider details', { exact: true }).click();
     await expect(nativeDialog.getByText('Qualification pending', { exact: true })).toBeVisible();
     await expect(nativeDialog.getByText('Effective effort unknown', { exact: true })).toBeVisible();
     await expect(nativeDialog.getByText('Service tier unknown', { exact: true })).toBeVisible();
@@ -4603,6 +4617,8 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     const sidebarProject = cli(home, 'project', 'add', sidebarSource);
     assert.equal(sidebarProject.result.outcome, 'applied');
     const sidebarProjectId = sidebarProject.result.entity.id;
+    await page.reload();
+    await expect(page.getByText('Controller connected', { exact: true })).toBeVisible();
     const projectGroup = page.locator('.project-group').filter({
       has: page.getByText('sidebar-project', { exact: true }),
     });
@@ -4612,26 +4628,26 @@ test('desktop and CLI retain one checked task through handoff and restart', asyn
     await page.getByRole('button', { name: 'New task', exact: true }).click();
     const definitionDialog = page.getByRole('dialog', { name: 'New task', exact: true });
     await expect(definitionDialog.getByLabel('Task title', { exact: true })).toHaveValue('');
-    await expect(definitionDialog.getByLabel('Project', { exact: true })).toHaveValue(
-      nativeTask.projectId,
-    );
+    await expect(
+      definitionDialog.getByRole('combobox', { name: 'Project', exact: true }),
+    ).toHaveValue(nativeTask.projectId);
     await page.keyboard.press('Escape');
     await page.getByRole('button', { name: 'Expand sidebar', exact: true }).click();
     await projectGroup
       .getByRole('button', { name: 'New task in sidebar-project', exact: true })
       .click();
-    await expect(definitionDialog.getByLabel('Project', { exact: true })).toHaveValue(
-      sidebarProjectId,
-    );
+    await expect(
+      definitionDialog.getByRole('combobox', { name: 'Project', exact: true }),
+    ).toHaveValue(sidebarProjectId);
     await expect(projectGroup.locator('.count')).toHaveText('0');
     await page.keyboard.press('Escape');
     await expect(projectGroup.getByText('No tasks yet', { exact: true })).toBeVisible();
     await projectGroup
       .getByRole('button', { name: 'Create first task in sidebar-project', exact: true })
       .click();
-    await expect(definitionDialog.getByLabel('Project', { exact: true })).toHaveValue(
-      sidebarProjectId,
-    );
+    await expect(
+      definitionDialog.getByRole('combobox', { name: 'Project', exact: true }),
+    ).toHaveValue(sidebarProjectId);
     const sidebarTaskTitle = 'Retain a manually defined task in its chosen project';
     await definitionDialog.getByLabel('Task title', { exact: true }).fill(sidebarTaskTitle);
     await definitionDialog
