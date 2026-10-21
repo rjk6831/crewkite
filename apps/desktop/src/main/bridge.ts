@@ -257,6 +257,7 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
         'RefreshAnthropicUsage',
         'StopAnthropicUsage',
         'CheckNativeConnection',
+        'RefreshTaskModelCatalog',
         'InstallGoogleAcp',
         'StopGoogleAcpInstall',
         'InitializeGoogleAcp',

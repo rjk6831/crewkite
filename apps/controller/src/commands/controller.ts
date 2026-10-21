@@ -86,6 +86,8 @@ import {
   type LocalSetup,
   LocalSetupSchema,
   MAX_FRAME_BYTES,
+  type ModelCatalogObservation,
+  ModelCatalogObservationSchema,
   NativeBillingAttestationSchema,
   NativeHandoffPreviewSchema,
   NativeHandoffTargetSchema,
@@ -130,6 +132,8 @@ import {
   type TaskConversationState,
   TaskConversationStateSchema,
   TaskIdSchema,
+  type TaskModelCatalog,
+  TaskModelCatalogSchema,
   TaskSchema,
   TimestampSchema,
   UsageReaderSchema,
@@ -285,6 +289,7 @@ import {
   type RetainedOpenAiModelObservation,
   resolveOpenAiProjectSelection,
 } from '../providers/openai/execution-selection.ts';
+import { startOpenAiModelCatalogObservation } from '../providers/openai/model-catalog.ts';
 import { startNativeSession } from '../providers/openai/native-discovery.ts';
 import {
   type NativeProfileResolution,
@@ -929,6 +934,17 @@ const OpenAiUsageReadSchema = z.strictObject({
   lastObservedAt: TimestampSchema.nullable().optional(),
   commandId: CommandIdSchema.optional(),
 });
+const TaskModelCatalogOperationSchema = z.strictObject({
+  version: z.literal(1),
+  commandId: CommandIdSchema,
+  commandHash: HashSchema,
+  taskId: TaskIdSchema,
+  taskRevision: RevisionSchema,
+  sourceHash: HashSchema,
+  profileHash: HashSchema,
+  state: z.enum(['intent', 'owned', 'quiescent', 'unknown']),
+  groups: z.array(z.number().int().positive().safe()).max(2),
+});
 
 type LocalWriterRuntime = {
   plan: LocalPrepared;
@@ -1034,6 +1050,15 @@ export class Controller {
     stopped: boolean;
     handle?: { stop: () => void };
     done: Promise<void>;
+  };
+  private taskModelCatalogRead?: {
+    key: string;
+    hash: string;
+    principal: string;
+    taskId: string;
+    stopped: boolean;
+    stop?: () => void;
+    promise: Promise<CommandResult>;
   };
   private usageResolution: GoogleUsageClientResolution;
   private googleUsageReport?: {
@@ -1198,6 +1223,9 @@ export class Controller {
         next: 'Send a valid protocol 1 command.',
       };
     const command = parsed.data;
+    try {
+      this.reconcileTaskModelCatalogOperations();
+    } catch {}
     if (
       [
         'PrepareProjectCommand',
@@ -1235,6 +1263,16 @@ export class Controller {
       return this.checkNativeConnection(command, principal);
     if (command.command === 'RefreshAnthropicUsage' || command.command === 'StopAnthropicUsage')
       return this.anthropicUsage().execute(command);
+    if (command.command === 'RefreshTaskModelCatalog')
+      return this.refreshTaskModelCatalog(command, principal);
+    if (
+      command.command === 'StopRun' &&
+      this.taskModelCatalogRead?.taskId === command.payload.taskId
+    ) {
+      this.taskModelCatalogRead.stopped = true;
+      this.taskModelCatalogRead.stop?.();
+      await this.taskModelCatalogRead.promise;
+    }
     if (command.command === 'ObserveUsage') return this.observeUsageCommand(command, principal);
     if (command.command === 'CaptureConversationContext')
       return this.captureConversationContextCommand(command, principal);
@@ -1772,6 +1810,8 @@ export class Controller {
     if (route?.family === 'anthropic' && !route.fake) return this.anthropicUsage().blocker();
     if (route?.family !== 'openai' || route.fake) return;
     try {
+      if (this.taskModelCatalogRead) return 'openai-metadata-ownership-pending';
+      if (this.taskModelCatalogOwnershipUnknown()) return 'openai-metadata-ownership-unknown';
       const state = this.openAiUsageState();
       if (state?.state === 'unknown') return 'openai-metadata-ownership-unknown';
       if (state && state.state !== 'quiescent') return 'openai-metadata-ownership-pending';
@@ -1786,6 +1826,8 @@ export class Controller {
   ): Promise<void> | undefined {
     try {
       if (this.closed || !this.options.openAiUsageClient) return;
+      this.reconcileTaskModelCatalogOperations();
+      if (this.taskModelCatalogRead || this.taskModelCatalogOwnershipUnknown()) return;
       if (this.openAiUsageRead) return this.openAiUsageRead.done;
       const profile = this.options.openAiUsageClient();
       if (
@@ -2613,6 +2655,265 @@ export class Controller {
     return result;
   }
 
+  private refreshTaskModelCatalog(
+    command: Extract<Command, { command: 'RefreshTaskModelCatalog' }>,
+    principal: string,
+  ): Promise<CommandResult> {
+    const hash = hashCanonical(command);
+    const receipt = this.store.receipt(command.key);
+    if (receipt && (receipt.hash !== hash || receipt.principal !== principal))
+      return Promise.resolve({ outcome: 'denied', reason: 'idempotency-key-reused' });
+    if (receipt)
+      return Promise.resolve({
+        ...receipt.result,
+        ...(receipt.result.outcome === 'applied' ? { outcome: 'already-applied' as const } : {}),
+      });
+    this.reconcileTaskModelCatalogOperations();
+    const active = this.taskModelCatalogRead;
+    if (active)
+      return active.key === command.key && active.hash === hash && active.principal === principal
+        ? active.promise
+        : Promise.resolve({ outcome: 'blocked', reason: 'openai-metadata-ownership-pending' });
+    const task = this.store.get<Task>('task', command.payload.taskId);
+    if (!task) return Promise.resolve({ outcome: 'blocked', reason: 'task-not-found' });
+    if (task.revision !== command.expectedRevision)
+      return Promise.resolve({ outcome: 'stale-revision', revision: task.revision });
+    if (this.taskModelCatalogOwnershipUnknown())
+      return Promise.resolve({
+        outcome: 'outcome-unknown',
+        reason: 'openai-metadata-ownership-unknown',
+      });
+    const usage = this.openAiUsageState();
+    if (usage?.state === 'unknown')
+      return Promise.resolve({
+        outcome: 'outcome-unknown',
+        reason: 'openai-metadata-ownership-unknown',
+      });
+    if (
+      this.openAiUsageRead ||
+      (usage && usage.state !== 'quiescent') ||
+      this.taskOperationRuntime?.busyTask(task.id) ||
+      this.store.intents().some((intent) => {
+        if (intent.state === 'stopped') return false;
+        const route = this.store.get<Route>('route', intent.route_id);
+        return !route || (route.family === 'openai' && !route.fake);
+      })
+    )
+      return Promise.resolve({ outcome: 'blocked', reason: 'openai-task-active' });
+    const runtime = {
+      key: command.key,
+      hash,
+      principal,
+      taskId: task.id,
+      stopped: false,
+      stop: undefined as (() => void) | undefined,
+      promise: undefined as unknown as Promise<CommandResult>,
+    };
+    runtime.promise = Promise.resolve()
+      .then(() => this.readTaskModelCatalog(command, principal, runtime))
+      .finally(() => {
+        if (this.taskModelCatalogRead === runtime) this.taskModelCatalogRead = undefined;
+      });
+    this.taskModelCatalogRead = runtime;
+    return runtime.promise;
+  }
+
+  private async readTaskModelCatalog(
+    command: Extract<Command, { command: 'RefreshTaskModelCatalog' }>,
+    principal: string,
+    runtime: NonNullable<Controller['taskModelCatalogRead']>,
+  ): Promise<CommandResult> {
+    const commandHash = hashCanonical(command);
+    const task = this.store.get<Task>('task', command.payload.taskId);
+    const projectPath = task && this.projectPath(task.projectId);
+    if (!task || task.revision !== command.expectedRevision || !projectPath)
+      return task
+        ? { outcome: 'stale-revision', revision: task.revision }
+        : { outcome: 'blocked', reason: 'task-not-found' };
+    const source = inspectSource(task.projectId, projectPath);
+    const profile = this.profileFor(command.payload.profileId);
+    if (
+      !profile.facts.available ||
+      profile.facts.family !== 'openai' ||
+      !profile.client ||
+      !profile.environment ||
+      !profile.locationHash
+    )
+      return { outcome: 'blocked', reason: 'openai-model-catalog-unavailable' };
+    const profileBindingHash = hashCanonical({
+      facts: profile.facts,
+      client: profile.client,
+      locationHash: profile.locationHash,
+    });
+    const operation = TaskModelCatalogOperationSchema.parse({
+      version: 1,
+      commandId: command.key,
+      commandHash,
+      taskId: task.id,
+      taskRevision: task.revision,
+      sourceHash: hashCanonical(source),
+      profileHash: profileBindingHash,
+      state: 'intent',
+      groups: [],
+    });
+    const directory = join(this.home, 'native', `task-model-catalog-${command.key}`);
+    try {
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
+      this.store.transaction(() => this.saveTaskModelCatalogOperation(operation));
+    } catch {
+      return { outcome: 'blocked', reason: 'openai-model-catalog-storage-failed' };
+    }
+    const operationCurrent = () => {
+      const savedOperation = this.taskModelCatalogOperation(task.id);
+      if (
+        savedOperation?.commandId !== operation.commandId ||
+        savedOperation.commandHash !== operation.commandHash ||
+        !['intent', 'owned', 'quiescent'].includes(savedOperation.state)
+      )
+        throw Error('Model catalog ownership changed.');
+      return savedOperation;
+    };
+    const semanticCurrent = () => {
+      if (this.closed || runtime.stopped || this.taskModelCatalogRead !== runtime)
+        throw Error('Model catalog read is no longer current.');
+      const savedTask = this.store.get<Task>('task', task.id);
+      const savedPath = savedTask && this.projectPath(savedTask.projectId);
+      const savedProfile = this.profileFor(command.payload.profileId);
+      const savedOperation = operationCurrent();
+      if (
+        !savedTask ||
+        savedTask.revision !== operation.taskRevision ||
+        !savedPath ||
+        hashCanonical(inspectSource(savedTask.projectId, savedPath)) !== operation.sourceHash ||
+        hashCanonical({
+          facts: savedProfile.facts,
+          client: savedProfile.client,
+          locationHash: savedProfile.locationHash,
+        }) !== operation.profileHash
+      )
+        throw Error('Model catalog binding changed.');
+      return savedOperation;
+    };
+    let handle: ReturnType<typeof startOpenAiModelCatalogObservation> | undefined;
+    let launchUncertain = false;
+    try {
+      const nativeSpawn = this.options.nativeSpawn ?? spawn;
+      handle = startOpenAiModelCatalogObservation(
+        profile,
+        { directory, repositoryRoot: this.home },
+        {
+          timeoutMs: 20000,
+          observedAt: this.now,
+          schedule: this.options.schedule,
+          spawn: (executable, args, options) => {
+            try {
+              return nativeSpawn(executable, args, options);
+            } catch (error) {
+              launchUncertain = true;
+              throw error;
+            }
+          },
+          lifecycle: {
+            beforePhase: () => {
+              this.store.transaction(() => {
+                const saved = semanticCurrent();
+                this.saveTaskModelCatalogOperation({
+                  ...saved,
+                  state: 'intent',
+                  groups: [],
+                });
+              });
+            },
+            owned: (_phase, group) => {
+              this.store.transaction(() => {
+                const saved = operationCurrent();
+                this.saveTaskModelCatalogOperation({
+                  ...saved,
+                  state: 'owned',
+                  groups: [...new Set([...saved.groups, group])],
+                });
+              });
+            },
+            quiescent: (_phase, group) => {
+              this.store.transaction(() => {
+                const saved = operationCurrent();
+                const groups = saved.groups.filter((candidate) => candidate !== group);
+                this.saveTaskModelCatalogOperation({
+                  ...saved,
+                  state: groups.length ? 'owned' : 'quiescent',
+                  groups,
+                });
+              });
+            },
+          },
+        },
+      );
+      runtime.stop = handle.stop;
+      if (this.closed || runtime.stopped || this.taskModelCatalogRead !== runtime) handle.stop();
+      const outcome = await handle.result;
+      const saved = semanticCurrent();
+      if (
+        outcome.reason ||
+        !outcome.quiescent ||
+        !outcome.metadata ||
+        saved.state !== 'quiescent' ||
+        saved.groups.length
+      )
+        throw Error('Model catalog discovery was not retained.');
+      const catalog = TaskModelCatalogSchema.parse({
+        ...outcome.metadata,
+        origin: 'connection-metadata',
+        taskId: task.id,
+        taskRevision: task.revision,
+        source,
+      });
+      const result = this.store.transaction(() => {
+        semanticCurrent();
+        const artifact = this.nativeArtifact(catalog);
+        const catalogKey = `task-model-catalog:${task.id}`;
+        this.store.db.prepare('DELETE FROM receipts WHERE command_key=?').run(catalogKey);
+        this.store.saveReceipt(catalogKey, artifact.hash, 'local-owner', {
+          outcome: 'applied',
+          entity: artifact,
+        });
+        const applied = { outcome: 'applied' as const, entity: artifact };
+        this.store.saveReceipt(command.key, commandHash, principal, applied);
+        return applied;
+      });
+      return result;
+    } catch {
+      let ownershipUnknown = false;
+      try {
+        this.store.transaction(() => {
+          const saved = this.taskModelCatalogOperation(task.id);
+          if (saved?.commandId !== command.key || saved.state === 'quiescent') return;
+          const observedGroups = [...new Set([...saved.groups, ...(handle?.groups ?? [])])];
+          const activeGroups = observedGroups.filter((group) => !groupAbsent(group));
+          ownershipUnknown = launchUncertain || activeGroups.length > 0;
+          this.saveTaskModelCatalogOperation({
+            ...saved,
+            state: ownershipUnknown ? 'unknown' : 'quiescent',
+            groups: activeGroups,
+          });
+        });
+      } catch {
+        ownershipUnknown = true;
+      }
+      const result: CommandResult = {
+        outcome: ownershipUnknown ? ('outcome-unknown' as const) : 'blocked',
+        reason: ownershipUnknown
+          ? 'openai-metadata-ownership-unknown'
+          : 'openai-model-catalog-unavailable',
+      };
+      try {
+        this.store.transaction(() =>
+          this.store.saveReceipt(command.key, commandHash, principal, result),
+        );
+      } catch {}
+      return result;
+    }
+  }
+
   private observeUsageCommand(
     command: Extract<Command, { command: 'ObserveUsage' }>,
     principal: string,
@@ -3029,6 +3330,11 @@ export class Controller {
       this.openAiUsageRead.stopped = true;
       this.openAiUsageRead.handle?.stop();
       native.push(this.openAiUsageRead.done);
+    }
+    if (this.taskModelCatalogRead) {
+      this.taskModelCatalogRead.stopped = true;
+      this.taskModelCatalogRead.stop?.();
+      native.push(this.taskModelCatalogRead.promise);
     }
     if (this.usageRead) {
       this.usageRead.abort.abort();
@@ -4266,6 +4572,119 @@ export class Controller {
     this.store.putConversationTask(taskId, ConversationConfigurationSchema.parse(value));
   }
 
+  private taskModelCatalogOperation(taskId: string) {
+    const key = `task-model-catalog-operation:${taskId}`;
+    return this.store.receipt(key)
+      ? TaskModelCatalogOperationSchema.parse(this.nativeRecord(key, 4096).value)
+      : undefined;
+  }
+
+  private reconcileTaskModelCatalogOperations() {
+    const rows = this.store.db
+      .prepare(
+        "SELECT command_key FROM receipts WHERE command_key LIKE 'task-model-catalog-operation:%'",
+      )
+      .all() as { command_key: string }[];
+    for (const { command_key } of rows) {
+      const operation = TaskModelCatalogOperationSchema.parse(
+        this.nativeRecord(command_key, 4096).value,
+      );
+      if (
+        operation.state !== 'quiescent' &&
+        operation.groups.length > 0 &&
+        operation.groups.every(groupAbsent)
+      )
+        this.store.transaction(() =>
+          this.saveTaskModelCatalogOperation({
+            ...operation,
+            state: 'quiescent',
+            groups: [],
+          }),
+        );
+    }
+  }
+
+  private taskModelCatalogOwnershipUnknown() {
+    try {
+      const rows = this.store.db
+        .prepare(
+          "SELECT command_key FROM receipts WHERE command_key LIKE 'task-model-catalog-operation:%'",
+        )
+        .all() as { command_key: string }[];
+      return rows.some(
+        ({ command_key }) =>
+          TaskModelCatalogOperationSchema.parse(this.nativeRecord(command_key, 4096).value)
+            .state !== 'quiescent',
+      );
+    } catch {
+      return true;
+    }
+  }
+
+  private saveTaskModelCatalogOperation(value: z.infer<typeof TaskModelCatalogOperationSchema>) {
+    const operation = TaskModelCatalogOperationSchema.parse(value);
+    const key = `task-model-catalog-operation:${operation.taskId}`;
+    const artifact = this.nativeArtifact(operation);
+    this.store.db.prepare('DELETE FROM receipts WHERE command_key=?').run(key);
+    this.store.saveReceipt(key, artifact.hash, 'local-owner', {
+      outcome: 'applied',
+      entity: artifact,
+    });
+  }
+
+  private taskModelCatalogReference(taskId: string) {
+    const receipt = this.store.receipt(`task-model-catalog:${taskId}`);
+    if (!receipt?.result.entity) return;
+    const artifact = ArtifactSchema.safeParse(receipt.result.entity);
+    if (!artifact.success || artifact.data.hash !== receipt.hash) return;
+    return { artifactId: artifact.data.id, hash: artifact.data.hash };
+  }
+
+  private taskModelCatalog(
+    taskId: string,
+    reference: ConversationModelRequest['observation'],
+    prepared = false,
+  ): TaskModelCatalog {
+    const artifact = this.store.get<Artifact>('artifact', reference.artifactId);
+    if (!artifact || artifact.hash !== reference.hash) throw Error('observation-missing');
+    if (artifact.bytes > 32768) throw Error('catalog-unavailable');
+    const content = this.artifacts.read(artifact.hash);
+    if (content.length !== artifact.bytes) throw Error('catalog-unavailable');
+    const catalog = TaskModelCatalogSchema.parse(JSON.parse(content.toString('utf8')));
+    const retained = this.store.receipt(`task-model-catalog:${taskId}`);
+    const task = this.store.get<Task>('task', taskId);
+    const projectPath = task && this.projectPath(task.projectId);
+    if (
+      catalog.taskId !== taskId ||
+      !task ||
+      (!prepared && catalog.taskRevision !== task.revision) ||
+      catalog.source.projectId !== task.projectId ||
+      !projectPath ||
+      hashCanonical(catalog.source) !== hashCanonical(inspectSource(task.projectId, projectPath)) ||
+      (!prepared &&
+        (retained?.hash !== artifact.hash ||
+          hashCanonical(retained.result.entity ?? null) !== hashCanonical(artifact)))
+    )
+      throw Error('observation-stale');
+    return catalog;
+  }
+
+  private modelCatalog(
+    taskId: string,
+    reference: ConversationModelRequest['observation'],
+    prepared = false,
+  ): ModelCatalogObservation {
+    const artifact = this.store.get<Artifact>('artifact', reference.artifactId);
+    if (!artifact || artifact.hash !== reference.hash) throw Error('observation-missing');
+    if (artifact.bytes > 32768) throw Error('catalog-unavailable');
+    const parsed = ModelCatalogObservationSchema.parse(
+      JSON.parse(this.artifacts.read(artifact.hash).toString('utf8')),
+    );
+    return 'origin' in parsed
+      ? this.taskModelCatalog(taskId, reference, prepared)
+      : this.conversationCatalog(taskId, reference);
+  }
+
   private conversationCatalog(
     taskId: string,
     reference: ConversationModelRequest['observation'],
@@ -4344,7 +4763,7 @@ export class Controller {
   }
 
   private conversationCatalogReason(
-    catalog: ConversationModelCatalog,
+    catalog: ModelCatalogObservation,
   ): ConversationModelFailureReason | undefined {
     const profile = this.profileFor(catalog.profileId);
     if (
@@ -4363,7 +4782,8 @@ export class Controller {
     const request = selection.modelRequest;
     if (!request) return;
     try {
-      const catalog = this.conversationCatalog(taskId, request.observation);
+      const catalog = this.modelCatalog(taskId, request.observation);
+      if (catalog.profileId !== selection.profileId) return 'observation-stale';
       const changed = this.conversationCatalogReason(catalog);
       if (changed) return changed;
       const model = catalog.models.find((value) => value.model === request.model);
@@ -4379,10 +4799,11 @@ export class Controller {
   }
 
   private conversationModelChoices(
-    taskId: string,
+    _taskId: string,
     config: ConversationConfiguration | undefined,
   ): ConversationModelChoices {
-    if (!config?.modelCatalog)
+    const observation = config?.modelCatalog;
+    if (!observation)
       return {
         status: 'not-observed',
         observation: null,
@@ -4391,22 +4812,61 @@ export class Controller {
         reason: 'not-observed',
       };
     try {
-      const catalog = this.conversationCatalog(taskId, config.modelCatalog);
+      const catalog = this.conversationCatalog(_taskId, observation);
       const reason = this.conversationCatalogReason(catalog);
       if (reason && reason !== 'client-changed')
         return {
           status: 'unavailable',
-          observation: config.modelCatalog,
+          observation,
           observedAt: catalog.observedAt,
           models: [],
           reason,
         };
       return {
         status: reason === 'client-changed' ? 'client-changed' : 'last-observed',
-        observation: config.modelCatalog,
+        observation,
         observedAt: catalog.observedAt,
         models: catalog.models,
-        reason: reason ?? config.modelFailure ?? 'available',
+        reason: reason ?? config?.modelFailure ?? 'available',
+      };
+    } catch {
+      return {
+        status: 'unavailable',
+        observation: null,
+        observedAt: null,
+        models: [],
+        reason: 'catalog-unavailable',
+      };
+    }
+  }
+
+  private projectModelChoices(taskId: string): ConversationModelChoices {
+    const observation = this.taskModelCatalogReference(taskId);
+    if (!observation)
+      return {
+        status: 'not-observed',
+        observation: null,
+        observedAt: null,
+        models: [],
+        reason: 'not-observed',
+      };
+    try {
+      const catalog = this.taskModelCatalog(taskId, observation);
+      const reason = this.conversationCatalogReason(catalog);
+      if (reason && reason !== 'client-changed')
+        return {
+          status: 'unavailable',
+          observation,
+          observedAt: catalog.observedAt,
+          models: [],
+          reason,
+        };
+      return {
+        status: reason === 'client-changed' ? 'client-changed' : 'last-observed',
+        observation,
+        observedAt: catalog.observedAt,
+        models: catalog.models,
+        reason: reason ?? 'available',
       };
     } catch {
       return {
@@ -4932,6 +5392,7 @@ export class Controller {
           }
         : null,
       modelChoices: this.conversationModelChoices(task.id, config),
+      projectModelChoices: this.projectModelChoices(task.id),
       contextUsage: this.conversationContextUsage(task, config),
       currentRunId: task.runId,
       activeAttempt: active,
@@ -4986,7 +5447,9 @@ export class Controller {
       adoptedProposal: prior?.adoptedProposal ?? null,
       effectiveModel: null,
       effectiveEffort: null,
-      ...(prior?.modelCatalog ? { modelCatalog: prior.modelCatalog } : {}),
+      ...(selection.modelRequest?.observation || prior?.modelCatalog
+        ? { modelCatalog: selection.modelRequest?.observation ?? prior?.modelCatalog }
+        : {}),
     });
     this.saveConversationConfiguration(task.id, config);
     const policy = PolicySchema.parse({
@@ -8903,21 +9366,28 @@ export class Controller {
     taskId: string,
     profile: NativeProfileResolution,
     request?: ConversationModelRequest,
+    prepared = false,
   ) {
     if (!request) return resolveOpenAiProjectSelection(undefined, undefined);
     if (profile.facts.id !== 'openai-repository-v1' || !profile.client || !profile.locationHash)
       throw Error('The OpenAI project profile is unavailable.');
     const configuration = this.conversationConfiguration(taskId);
-    const catalog = this.conversationCatalog(taskId, request.observation);
+    const catalog = this.modelCatalog(taskId, request.observation, prepared);
     const task = this.store.get<Task>('task', taskId);
-    const catalogRun = this.store.get<Run>('run', catalog.runId);
     const reason = this.conversationCatalogReason(catalog);
+    const retained =
+      (prepared && 'origin' in catalog) ||
+      [this.taskModelCatalogReference(taskId), configuration?.modelCatalog].some(
+        (reference) => hashCanonical(reference ?? null) === hashCanonical(request.observation),
+      );
+    const source =
+      'origin' in catalog ? catalog.source : this.store.get<Run>('run', catalog.runId)?.source;
     if (
       reason ||
-      hashCanonical(configuration?.modelCatalog ?? null) !== hashCanonical(request.observation) ||
+      !retained ||
       !task ||
-      !catalogRun ||
-      hashCanonical(catalogRun.source) !==
+      !source ||
+      hashCanonical(source) !==
         hashCanonical(inspectSource(task.projectId, this.projectPath(task.projectId) as string)) ||
       hashCanonical(profile.client) !== hashCanonical(catalog.client) ||
       profile.locationHash !== catalog.locationHash
@@ -13504,7 +13974,7 @@ export class Controller {
       'repository' in plan.appointment ? plan.appointment.modelRequest : undefined;
     const modelSelection =
       task && modelRequest
-        ? this.openAiProjectSelection(task.id, profile, modelRequest)
+        ? this.openAiProjectSelection(task.id, profile, modelRequest, true)
         : undefined;
     if (
       !profile.facts.available ||

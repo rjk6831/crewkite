@@ -11074,7 +11074,16 @@ test('planning turns keep task authority and allowance across execution', async 
   // freeze five, twenty-one freeze ten and ten freeze the five-minute floor.
   const write = nativePreparation.policy.effects.find((grant) => grant.action === 'write-scratch');
   assert(write);
-  const executionChoices = state(taskId).modelChoices;
+  const planningChoices = state(taskId).modelChoices;
+  assert.equal(planningChoices?.status, 'last-observed');
+  const catalogRefresh = command(
+    'RefreshTaskModelCatalog',
+    { taskId, profileId: 'openai-repository-v1' },
+    current(taskId).revision,
+  );
+  assert.equal((await controller.execute(catalogRefresh, 'local-owner')).outcome, 'applied');
+  assert.deepEqual(state(taskId).modelChoices, planningChoices);
+  const executionChoices = state(taskId).projectModelChoices;
   assert.equal(executionChoices?.status, 'last-observed');
   assert(executionChoices?.observation);
   const projectModelRequest = {
@@ -11119,6 +11128,14 @@ test('planning turns keep task authority and allowance across execution', async 
     .routes.find((route) => route.id === selectedProject.run.roles[0].routeId);
   assert.equal(selectedRoute?.model, projectModelRequest.model);
   assert.equal(selectedRoute?.effort.requested, projectModelRequest.effort);
+  controller.store.db
+    .prepare('INSERT INTO writer_leases(task_id,attempt_id,generation) VALUES (?,?,0)')
+    .run(taskId, selectedProject.run.id);
+  assert.equal(
+    (await send('StartRun', taskId, { runId: selectedProject.run.id })).reason,
+    'writer-lease-held',
+  );
+  controller.store.db.prepare('DELETE FROM writer_leases WHERE task_id=?').run(taskId);
   const nativeInternals = controller as unknown as {
     nativeCurrentPlan(run: Run): {
       appointment: NativePilotAppointment;
@@ -11154,7 +11171,7 @@ test('planning turns keep task authority and allowance across execution', async 
           model: fixtureModel,
         },
       }),
-    /route identity is invalid/,
+    /observation-stale/,
   );
   assert.throws(
     () =>
@@ -11222,7 +11239,19 @@ test('planning turns keep task authority and allowance across execution', async 
   // A five-minute writer needs only its own five minutes. A total of 6 with one spent leaves
   // exactly five. The writer lease check follows the budget gate, so a held lease shows that
   // Start passed the gate without launching a process.
-  const ten = await prepareRepository(10, projectModelRequest);
+  const nextCatalogRefresh = command(
+    'RefreshTaskModelCatalog',
+    { taskId, profileId: 'openai-repository-v1' },
+    current(taskId).revision,
+  );
+  assert.equal((await controller.execute(nextCatalogRefresh, 'local-owner')).outcome, 'applied');
+  const nextExecutionChoices = state(taskId).projectModelChoices;
+  assert.equal(nextExecutionChoices?.status, 'last-observed');
+  assert(nextExecutionChoices?.observation);
+  const ten = await prepareRepository(10, {
+    ...projectModelRequest,
+    observation: nextExecutionChoices.observation,
+  });
   assert.equal(ten.frozen, 300_000);
   assert.equal(await lowerTotal(6), 'applied');
   assert.equal(state(taskId).budget?.remaining.minutes, 5);
@@ -11480,6 +11509,146 @@ test('planning turns keep task authority and allowance across execution', async 
     assert.equal(createHash('sha256').update(readFileSync(path)).digest('hex'), sentinel.hash);
     assert.equal(lstatSync(path).mode & 0o777, sentinel.mode);
   }
+});
+
+test('task model catalogs retain metadata without starting a model turn', async (t) => {
+  let reopened: Controller | undefined;
+  let phases = 0;
+  let failPhase: number | undefined;
+  const base = unavailableRepositoryProfile();
+  const profile = {
+    ...base,
+    facts: NativeRepositoryProfileSchema.parse({
+      ...base.facts,
+      model: fixtureModel,
+      clientVersion: process.version,
+      available: true,
+      reason: 'qualification-pending',
+    }),
+    client: { executable: process.execPath, sha256: fixtureClientHash, version: process.version },
+    environment: { ...process.env },
+    locationHash: '7'.repeat(64),
+  } satisfies NativeProfileResolution;
+  const options: Partial<ControllerOptions> = {
+    nativeProfiles: () => [profile],
+    nativeSpawn: (executable, args, spawnOptions) => {
+      phases++;
+      if (phases === failPhase) throw new Error('fixture spawn ownership is uncertain');
+      return spawn(
+        executable,
+        ['-e', fixture, 'success', args.at(-1) === 'list' ? 'features' : 'discovery'],
+        spawnOptions,
+      );
+    },
+  };
+  const context = await setup(t, options, async (controller) => {
+    await controller.close();
+    await reopened?.close();
+  });
+  const task = TaskSchema.parse(
+    (await context.controller.execute(context.draft, 'local-owner')).entity,
+  );
+  const refresh = context.command(
+    'RefreshTaskModelCatalog',
+    { taskId: task.id, profileId: 'openai-repository-v1' },
+    task.revision,
+  );
+  const result = await context.controller.execute(refresh, 'local-owner');
+  assert.equal(result.outcome, 'applied', JSON.stringify(result));
+  const catalogInternals = (controller: Controller) =>
+    controller as unknown as {
+      taskModelCatalogOperation: (taskId: string) => {
+        version: 1;
+        commandId: string;
+        commandHash: string;
+        taskId: string;
+        taskRevision: number;
+        sourceHash: string;
+        profileHash: string;
+        state: 'intent' | 'owned' | 'quiescent' | 'unknown';
+        groups: number[];
+      };
+      saveTaskModelCatalogOperation: (operation: unknown) => void;
+    };
+  assert.deepEqual(catalogInternals(context.controller).taskModelCatalogOperation(task.id), {
+    ...catalogInternals(context.controller).taskModelCatalogOperation(task.id),
+    state: 'quiescent',
+    groups: [],
+  });
+  assert.equal(phases, 2);
+  assert.equal(context.controller.store.intents().length, 0);
+  assert.equal(context.controller.store.list('attempt').length, 0);
+  assert.equal(context.controller.store.get<Task>('task', task.id)?.revision, task.revision);
+  const readState = async (controller: Controller) => {
+    const state = await controller.execute(
+      context.command('GetTaskConversationState', { taskId: task.id }),
+      'local-owner',
+    );
+    assert.equal(state.data?.kind, 'conversation-state');
+    if (state.data?.kind !== 'conversation-state') throw new Error('Conversation state missing.');
+    return state.data.state;
+  };
+  const observed = await readState(context.controller);
+  assert.equal(observed.modelChoices?.status, 'not-observed');
+  assert.equal(observed.projectModelChoices?.status, 'last-observed');
+  assert.deepEqual(observed.projectModelChoices?.models, [
+    { model: fixtureModel, efforts: ['low'], defaultEffort: 'low' },
+  ]);
+  assert(observed.projectModelChoices?.observation);
+  await context.controller.close();
+  reopened = new Controller({
+    ...options,
+    home: context.controller.home,
+    now: context.clock.now,
+    id: context.id,
+  });
+  const retained = await readState(reopened);
+  assert.deepEqual(retained.projectModelChoices, observed.projectModelChoices);
+  writeFileSync(join(context.source.directory, 'catalog-drift.txt'), 'source changed\n');
+  assert.equal((await readState(reopened)).projectModelChoices?.status, 'unavailable');
+  const refreshed = await reopened.execute(
+    context.command(
+      'RefreshTaskModelCatalog',
+      { taskId: task.id, profileId: 'openai-repository-v1' },
+      task.revision,
+    ),
+    'local-owner',
+  );
+  assert.equal(refreshed.outcome, 'applied', JSON.stringify(refreshed));
+  assert.equal((await readState(reopened)).projectModelChoices?.status, 'last-observed');
+  assert.equal(phases, 4);
+  const retainedOperation = catalogInternals(reopened).taskModelCatalogOperation(task.id);
+  reopened.store.transaction(() =>
+    catalogInternals(reopened).saveTaskModelCatalogOperation({
+      ...retainedOperation,
+      state: 'unknown',
+      groups: [2_147_483_647],
+    }),
+  );
+  const recovered = await reopened.execute(
+    context.command(
+      'RefreshTaskModelCatalog',
+      { taskId: task.id, profileId: 'openai-repository-v1' },
+      task.revision,
+    ),
+    'local-owner',
+  );
+  assert.equal(recovered.outcome, 'applied', JSON.stringify(recovered));
+  assert.equal(catalogInternals(reopened).taskModelCatalogOperation(task.id).state, 'quiescent');
+  assert.equal(phases, 6);
+  failPhase = 8;
+  const uncertain = await reopened.execute(
+    context.command(
+      'RefreshTaskModelCatalog',
+      { taskId: task.id, profileId: 'openai-repository-v1' },
+      task.revision,
+    ),
+    'local-owner',
+  );
+  assert.equal(uncertain.outcome, 'outcome-unknown');
+  assert.equal(uncertain.reason, 'openai-metadata-ownership-unknown');
+  assert.equal(catalogInternals(reopened).taskModelCatalogOperation(task.id).state, 'unknown');
+  assert.equal(phases, 8);
 });
 
 test('native connection checks retain ownership without blocking unrelated tasks', async (t) => {

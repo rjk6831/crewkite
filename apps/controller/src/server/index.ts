@@ -200,6 +200,7 @@ export async function serve(
                     'RefreshAnthropicUsage',
                     'StopAnthropicUsage',
                     'CheckNativeConnection',
+                    'RefreshTaskModelCatalog',
                     'InstallGoogleAcp',
                     'StopGoogleAcpInstall',
                     'InitializeGoogleAcp',

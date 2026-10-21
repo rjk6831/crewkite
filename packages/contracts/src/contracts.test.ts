@@ -67,6 +67,7 @@ import {
   SourceDetailsSchema,
   SourceSchema,
   TaskConversationStateSchema,
+  TaskModelCatalogSchema,
   TransportMessageSchema,
   UsageReaderSchema,
 } from './index.ts';
@@ -974,6 +975,33 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     models: [catalogModel],
   };
   assert.deepEqual(ConversationModelCatalogSchema.parse(catalog), catalog);
+  const taskCatalog = {
+    version: 1,
+    origin: 'connection-metadata',
+    profileId: 'openai-repository-v1',
+    taskId: conversationBinding.taskId,
+    taskRevision: 4,
+    source: {
+      projectId: `prj_${suffix}`,
+      base: 'e'.repeat(40),
+      branch: 'main',
+      dirtyCount: 0,
+      untrackedCount: 0,
+    },
+    observedAt: catalog.observedAt,
+    profileHash: catalog.profileHash,
+    client: catalog.client,
+    locationHash: catalog.locationHash,
+    models: catalog.models,
+  } as const;
+  assert.deepEqual(TaskModelCatalogSchema.parse(taskCatalog), taskCatalog);
+  for (const change of [
+    { origin: 'planning-turn' },
+    { profileId: 'openai-file-v1' },
+    { taskRevision: -1 },
+    { source: { ...taskCatalog.source, projectId: conversationBinding.taskId } },
+  ])
+    assert.equal(TaskModelCatalogSchema.safeParse({ ...taskCatalog, ...change }).success, false);
   const maximumModels = Array.from({ length: 20 }, (_, index) => ({
     model: 'm'.repeat(198) + String(index).padStart(2, '0'),
     efforts: Array.from(
@@ -1360,6 +1388,18 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     payload: { taskId: conversationBinding.taskId },
   };
   assert.deepEqual(CommandSchema.parse(conversationStateRead), conversationStateRead);
+  const refreshTaskModels = {
+    protocol: 1,
+    key: command.key,
+    actor: command.actor,
+    expectedRevision: 4,
+    command: 'RefreshTaskModelCatalog',
+    payload: {
+      taskId: conversationBinding.taskId,
+      profileId: 'openai-repository-v1',
+    },
+  };
+  assert.deepEqual(CommandSchema.parse(refreshTaskModels), refreshTaskModels);
   const conversationRead = {
     protocol: 1,
     key: command.key,

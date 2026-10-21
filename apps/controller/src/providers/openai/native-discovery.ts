@@ -596,7 +596,13 @@ function nativeSession<T>(
 /** Metadata callers retain their original deadline and cleanup behavior. */
 export function startNativeSession<T>(
   launch: NativeLaunch,
-  options: { timeoutMs: number; now?: () => number; schedule?: Schedule; spawn?: Spawn },
+  options: {
+    timeoutMs: number;
+    now?: () => number;
+    schedule?: Schedule;
+    spawn?: Spawn;
+    lifecycle?: NativeLifecycle;
+  },
   createReader: (remainingMs: number) => NativeTranscript<T>,
 ) {
   return nativeSession(launch, options, createReader);
