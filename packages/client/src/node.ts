@@ -286,26 +286,36 @@ export class ControllerClient {
           });
         },
         this.options.timeoutMs ??
-          (command.command === 'StartRun'
-            ? 40000
-            : command.command === 'InstallGoogleAcp'
-              ? 200000
-              : command.command === 'StopGoogleAcpInstall'
-                ? 15000
-                : command.command === 'CheckNativeConnection'
-                  ? 35000
-                  : command.command === 'AuthenticateGoogleAcp'
-                    ? 130000
-                    : command.command === 'InitializeGoogleAcp'
-                      ? 35000
-                      : ['ObserveUsage', 'DiscoverGoogleAcp', 'StopGoogleAcpSetup'].includes(
-                            command.command,
-                          )
-                        ? 30000
-                        : command.command === 'PrepareCandidateEvaluation' &&
-                            command.payload.checkRecipeId === 'crewkite-verify-v1'
-                          ? 65000
-                          : 5000),
+          (command.command === 'PrepareProjectCommand'
+            ? 65000
+            : command.command === 'StartProjectCommand'
+              ? 86410000
+              : command.command === 'ReadGitHub'
+                ? 125000
+                : command.command === 'StopProjectOperation'
+                  ? 10000
+                  : command.command === 'StartRun'
+                    ? 40000
+                    : command.command === 'InstallGoogleAcp'
+                      ? 200000
+                      : command.command === 'StopGoogleAcpInstall'
+                        ? 15000
+                        : command.command === 'CheckNativeConnection'
+                          ? 35000
+                          : command.command === 'AuthenticateGoogleAcp'
+                            ? 130000
+                            : command.command === 'InitializeGoogleAcp'
+                              ? 35000
+                              : [
+                                    'ObserveUsage',
+                                    'DiscoverGoogleAcp',
+                                    'StopGoogleAcpSetup',
+                                  ].includes(command.command)
+                                ? 30000
+                                : command.command === 'PrepareCandidateEvaluation' &&
+                                    command.payload.checkRecipeId === 'crewkite-verify-v1'
+                                  ? 65000
+                                  : 5000),
       );
       this.pending.set(command.key, { resolve, timer });
       socket.write(frame);

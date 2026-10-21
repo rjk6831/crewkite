@@ -63,9 +63,11 @@ const terminal = new Set<OperationRecord['state']>(['succeeded', 'failed', 'canc
 export class OperationStore {
   private readonly store: Store;
   private readonly now: () => string;
-  constructor(store: Store, now: () => string) {
+  private readonly changed?: (record: OperationRecord) => void;
+  constructor(store: Store, now: () => string, changed?: (record: OperationRecord) => void) {
     this.store = store;
     this.now = now;
+    this.changed = changed;
   }
 
   get(id: string): OperationRecord | null {
@@ -135,6 +137,7 @@ export class OperationStore {
         'INSERT INTO task_operations(operation_id,task_id,kind,state,revision,body) VALUES (?,?,?,?,?,?)',
       )
       .run(value.id, value.taskId, value.kind, value.state, value.revision, canonicalJson(value));
+    this.changed?.(value);
     return value;
   }
 
@@ -164,31 +167,57 @@ export class OperationStore {
       )
       .run(value.state, value.revision, canonicalJson(value), id, current.revision);
     if (written.changes !== 1) throw Error('Operation changed during its update.');
+    this.changed?.(value);
     return value;
   }
 
   begin(id: string, key: string, requestHash: string, authorize: () => void): OperationRecord {
     CommandIdSchema.parse(key);
     HashSchema.parse(requestHash);
+    return this.store.transaction(() => this.beginInTransaction(id, key, requestHash, authorize));
+  }
+
+  createAndBegin(
+    input: Pick<OperationRecord, 'id' | 'taskId' | 'kind' | 'definition'>,
+    key: string,
+    requestHash: string,
+    authorize: () => void,
+    registerDefinition: () => void,
+  ): OperationRecord {
+    CommandIdSchema.parse(key);
+    HashSchema.parse(requestHash);
     return this.store.transaction(() => {
-      const prior = this.store.receipt(key);
-      if (prior)
-        throw Error(
-          prior.hash === requestHash ? 'operation-already-recorded' : 'idempotency-key-reused',
-        );
-      const prepared = this.get(id);
-      if (prepared?.state !== 'prepared') throw Error('Operation cannot start again.');
-      authorize();
-      const value = this.update(id, (current) => {
-        if (current.state !== 'prepared') throw Error('Operation cannot start again.');
-        return { ...current, key, requestHash, state: 'running' };
-      });
-      this.store.saveReceipt(key, requestHash, 'local-owner', {
-        outcome: 'blocked',
-        reason: 'operation-pending',
-      });
-      return value;
+      registerDefinition();
+      this.create(input);
+      return this.beginInTransaction(input.id, key, requestHash, authorize);
     });
+  }
+
+  private beginInTransaction(
+    id: string,
+    key: string,
+    requestHash: string,
+    authorize: () => void,
+  ): OperationRecord {
+    const prior = this.store.receipt(key);
+    if (prior)
+      throw Error(
+        prior.hash === requestHash ? 'operation-already-recorded' : 'idempotency-key-reused',
+      );
+    const prepared = this.get(id);
+    if (prepared?.state !== 'prepared') throw Error('Operation cannot start again.');
+    authorize();
+    const value = this.update(id, (current) => ({
+      ...current,
+      key,
+      requestHash,
+      state: 'running',
+    }));
+    this.store.saveReceipt(key, requestHash, 'local-owner', {
+      outcome: 'blocked',
+      reason: 'operation-pending',
+    });
+    return value;
   }
 
   stopping(id: string): OperationRecord {
@@ -270,7 +299,7 @@ export class OperationStore {
   }
 
   // Recovery observes historical groups without signaling them or replaying an intent.
-  recover(absent: (group: number) => boolean): void {
+  recover(absent: (group: number) => boolean, active: ReadonlySet<string> = new Set()): void {
     let after = '';
     for (;;) {
       const rows = this.store.db
@@ -280,6 +309,7 @@ export class OperationStore {
       if (rows.length === 0) return;
       for (const row of rows) {
         after = row.operation_id as string;
+        if (active.has(after)) continue;
         const saved = this.get(after);
         if (!saved) throw Error('Operation is unavailable.');
         const known = saved.phases.every(

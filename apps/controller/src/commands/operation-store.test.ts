@@ -49,6 +49,28 @@ test('task operation ownership recovers without replay or unrelated mutation unc
         definition,
       }),
     );
+  const rejectedDefinition = { ...definition, id: id('art', 999) };
+  assert.throws(
+    () =>
+      journal.createAndBegin(
+        {
+          id: id('cmd', 999),
+          taskId: task.id,
+          kind: 'github-read',
+          definition: rejectedDefinition,
+        },
+        id('cmd', 998),
+        'd'.repeat(64),
+        () => {
+          throw Error('admission-refused');
+        },
+        () => store.put('artifact', rejectedDefinition.id, 0, rejectedDefinition),
+      ),
+    /admission-refused/,
+  );
+  assert.equal(journal.get(id('cmd', 999)), null);
+  assert.equal(store.get('artifact', rejectedDefinition.id), undefined);
+  assert.equal(store.receipt(id('cmd', 998)), undefined);
   const first = create(1);
   let admissions = 0;
   journal.begin(first.id, id('cmd', 101), 'b'.repeat(64), () => {

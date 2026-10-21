@@ -367,6 +367,10 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     { recipe: null, expected: 5000 },
     { recipe: 'usage', expected: 30000 },
     { recipe: 'StartRun', expected: 40000 },
+    { recipe: 'PrepareProjectCommand', expected: 65000 },
+    { recipe: 'StartProjectCommand', expected: 86410000 },
+    { recipe: 'ReadGitHub', expected: 125000 },
+    { recipe: 'StopProjectOperation', expected: 10000 },
     { recipe: 'StartRun', timeoutMs: 10000, expected: 10000 },
     { recipe: 'StartRun', timeoutMs: 50000, expected: 50000 },
     { recipe: 'InitializeGoogleAcp', expected: 35000 },
@@ -390,73 +394,114 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     try {
       context.mock.timers.enable({ apis: ['setTimeout'] });
       const command: Command =
-        row.recipe === null
-          ? { protocol: 1, key: `cmd_${suffix}`, actor, command: 'GetSnapshot', payload: {} }
-          : row.recipe === 'usage'
-            ? {
-                protocol: 1,
-                key: `cmd_${suffix}`,
-                actor,
-                command: 'ObserveUsage',
-                expectedRevision: 0,
-                payload: { family: 'google' },
-              }
-            : row.recipe === 'StartRun'
+        row.recipe === 'PrepareProjectCommand' ||
+        row.recipe === 'StartProjectCommand' ||
+        row.recipe === 'ReadGitHub' ||
+        row.recipe === 'StopProjectOperation'
+          ? CommandSchema.parse({
+              protocol: 1,
+              key: `cmd_${suffix}`,
+              actor,
+              expectedRevision: 0,
+              command: row.recipe,
+              payload:
+                row.recipe === 'PrepareProjectCommand'
+                  ? { taskId: task.id, recipe: 'test', executable: '/tools/node', argv: [] }
+                  : row.recipe === 'StartProjectCommand'
+                    ? {
+                        taskId: task.id,
+                        operationId: `cmd_${suffix}`,
+                        definitionHash: 'a'.repeat(64),
+                        sourceConsent: 'explicit',
+                        nativeTrust: 'accepted',
+                        grant: {
+                          taskId: task.id,
+                          action: 'run-native-tools',
+                          target: 'a'.repeat(64),
+                          expiresAt: evaluation.expiresAt,
+                          revoked: false,
+                          usesRemaining: 1,
+                        },
+                      }
+                    : row.recipe === 'ReadGitHub'
+                      ? {
+                          taskId: task.id,
+                          request: {
+                            kind: 'pull-request',
+                            repository: { host: 'github.com', owner: 'example', name: 'project' },
+                            headSha: 'a'.repeat(40),
+                            pullRequest: '1',
+                          },
+                        }
+                      : { taskId: task.id, operationId: `cmd_${suffix}` },
+            })
+          : row.recipe === null
+            ? { protocol: 1, key: `cmd_${suffix}`, actor, command: 'GetSnapshot', payload: {} }
+            : row.recipe === 'usage'
               ? {
                   protocol: 1,
                   key: `cmd_${suffix}`,
                   actor,
-                  command: 'StartRun',
-                  expectedRevision: task.revision,
-                  payload: { taskId: task.id, runId: run.id },
+                  command: 'ObserveUsage',
+                  expectedRevision: 0,
+                  payload: { family: 'google' },
                 }
-              : row.recipe === 'InitializeGoogleAcp' ||
-                  row.recipe === 'AuthenticateGoogleAcp' ||
-                  row.recipe === 'DiscoverGoogleAcp' ||
-                  row.recipe === 'StopGoogleAcpSetup'
-                ? CommandSchema.parse({
+              : row.recipe === 'StartRun'
+                ? {
                     protocol: 1,
                     key: `cmd_${suffix}`,
                     actor,
-                    command: row.recipe,
-                    expectedRevision: 0,
-                    payload: {
-                      profileId: 'google-acp-v1',
-                      ...(row.recipe === 'StopGoogleAcpSetup'
-                        ? { operationId: `cmd_${suffix}` }
-                        : { consent: 'explicit' }),
-                      ...(['AuthenticateGoogleAcp', 'DiscoverGoogleAcp'].includes(row.recipe)
-                        ? { proofId: artifact.id }
-                        : {}),
-                      ...(row.recipe === 'AuthenticateGoogleAcp'
-                        ? { method: 'oauth-personal' }
-                        : {}),
-                    },
-                  })
-                : {
-                    protocol: 1,
-                    key: `cmd_${suffix}`,
-                    actor,
-                    command: 'PrepareCandidateEvaluation',
+                    command: 'StartRun',
                     expectedRevision: task.revision,
-                    payload: {
-                      taskId: task.id,
-                      candidateId: candidate.id,
-                      ...(row.recipe === 'project-node-tests-v1'
-                        ? { checkRecipeId: row.recipe, testFiles: projectTestFiles }
-                        : { checkRecipeId: row.recipe }),
-                      reviewer: { profileId: profile.id, methodId: 'keep-it-simple', cycles: 1 },
-                      creditPolicy: 'ordinary',
-                      consent: 'explicit',
-                      grants: grants.map((grant) => ({
-                        ...grant,
-                        target:
-                          grant.action === 'run-check' && row.recipe === 'crewkite-verify-v1'
-                            ? 'crewkite verify'
-                            : grant.target,
-                      })),
-                    },
-                  };
+                    payload: { taskId: task.id, runId: run.id },
+                  }
+                : row.recipe === 'InitializeGoogleAcp' ||
+                    row.recipe === 'AuthenticateGoogleAcp' ||
+                    row.recipe === 'DiscoverGoogleAcp' ||
+                    row.recipe === 'StopGoogleAcpSetup'
+                  ? CommandSchema.parse({
+                      protocol: 1,
+                      key: `cmd_${suffix}`,
+                      actor,
+                      command: row.recipe,
+                      expectedRevision: 0,
+                      payload: {
+                        profileId: 'google-acp-v1',
+                        ...(row.recipe === 'StopGoogleAcpSetup'
+                          ? { operationId: `cmd_${suffix}` }
+                          : { consent: 'explicit' }),
+                        ...(['AuthenticateGoogleAcp', 'DiscoverGoogleAcp'].includes(row.recipe)
+                          ? { proofId: artifact.id }
+                          : {}),
+                        ...(row.recipe === 'AuthenticateGoogleAcp'
+                          ? { method: 'oauth-personal' }
+                          : {}),
+                      },
+                    })
+                  : {
+                      protocol: 1,
+                      key: `cmd_${suffix}`,
+                      actor,
+                      command: 'PrepareCandidateEvaluation',
+                      expectedRevision: task.revision,
+                      payload: {
+                        taskId: task.id,
+                        candidateId: candidate.id,
+                        ...(row.recipe === 'project-node-tests-v1'
+                          ? { checkRecipeId: row.recipe, testFiles: projectTestFiles }
+                          : { checkRecipeId: row.recipe }),
+                        reviewer: { profileId: profile.id, methodId: 'keep-it-simple', cycles: 1 },
+                        creditPolicy: 'ordinary',
+                        consent: 'explicit',
+                        grants: grants.map((grant) => ({
+                          ...grant,
+                          target:
+                            grant.action === 'run-check' && row.recipe === 'crewkite-verify-v1'
+                              ? 'crewkite verify'
+                              : grant.target,
+                        })),
+                      },
+                    };
       let settled = false;
       const response = client.command(command).then((value) => {
         settled = true;
