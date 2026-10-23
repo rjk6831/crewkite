@@ -22,6 +22,8 @@
   --amber: #e1be83;
   --red: #ec9992;
   --green: #9ed3ad;
+  --diff-add-text: var(--green);
+  --diff-del-text: var(--red);
   --shadow: 0 24px 100px #0007;
   background: var(--background);
   color: var(--text);
@@ -46,6 +48,8 @@
   --amber: #8e621c;
   --red: #b64b44;
   --green: #33744a;
+  --diff-add-text: #276040;
+  --diff-del-text: #9c3a34;
   --shadow: 0 24px 100px #34482d25;
 }
 
@@ -97,6 +101,10 @@ a {
 }
 a:hover {
   text-decoration: underline;
+}
+::placeholder {
+  color: var(--text-dim);
+  opacity: 1;
 }
 code,
 pre,

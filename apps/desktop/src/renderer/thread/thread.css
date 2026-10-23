@@ -515,9 +515,11 @@
 }
 :is(.th-diff, .th-patch) .is-add {
   background: color-mix(in srgb, var(--green) 11%, transparent);
+  color: var(--diff-add-text);
 }
 :is(.th-diff, .th-patch) .is-del {
   background: color-mix(in srgb, var(--red) 11%, transparent);
+  color: var(--diff-del-text);
 }
 .th-diff-more {
   color: var(--text-dim);
@@ -844,7 +846,8 @@
   color: var(--text-dim);
   font-size: 11px;
 }
-.th-menu-head.is-off {
+/* A family that is not connected dims its name and keeps the reason readable. */
+.th-menu-head.is-off > :not(:last-child) {
   opacity: 0.55;
 }
 .th-menu button {
