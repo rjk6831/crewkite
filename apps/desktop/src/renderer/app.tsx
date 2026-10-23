@@ -969,6 +969,7 @@ function About({ onClose, preview }: { onClose: () => void; preview: boolean }) 
       <div className="about-content">
         <div className="about-attribution">
           <strong>CrewKite by Roots No Limits LLC</strong>
+          <span>Soar to new heights with CrewKite.</span>
           <span>Created by Raymond J. Kraft</span>
         </div>
         <p>
