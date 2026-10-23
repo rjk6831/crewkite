@@ -1,8 +1,10 @@
-import type {
-  ChatCatalogRead,
-  ChatEffort,
-  ChatFamily,
-  ChatModelSelection,
+import {
+  type ChatCatalogRead,
+  type ChatEffort,
+  type ChatFamily,
+  type ChatModelSelection,
+  rankFamilies,
+  tightestAllowance,
 } from '@crewkite/contracts';
 import { ArrowRightLeft, Check, ChevronDown } from 'lucide-react';
 import { type KeyboardEvent, useEffect, useId, useRef, useState } from 'react';
@@ -23,13 +25,10 @@ export const effortLabels: Record<ChatEffort, string> = {
 // The window with the least left decides what the person can still do, so it is the one shown.
 function allowance(entry: Entry, nowMs: number): string {
   if (entry.family === 'local' && entry.remaining.length === 0) return 'Runs on this computer';
-  const known = entry.remaining.filter((window) => window.percent !== null);
-  if (known.length === 0) return 'Allowance unknown';
-  const tight = known.reduce((least, window) =>
-    (window.percent ?? 100) < (least.percent ?? 100) ? window : least,
-  );
-  const left = `${Math.floor(tight.percent ?? 0)}% left`;
-  const reset = tight.resetsAt ? Date.parse(tight.resetsAt) - nowMs : null;
+  const { percent, resetsAt } = tightestAllowance(entry);
+  if (percent === null) return 'Allowance unknown';
+  const left = `${Math.floor(percent)}% left`;
+  const reset = resetsAt ? Date.parse(resetsAt) - nowMs : null;
   return reset !== null && reset > 0 ? `${left}, resets in ${formatSpan(reset)}` : left;
 }
 
@@ -38,25 +37,24 @@ export function findModel(catalog: ChatCatalogRead | null, selection: ChatModelS
   return { entry, model: entry?.models.find(({ model }) => model === selection?.model) };
 }
 
-// A new thread starts on the connected family with the most allowance left. A family that reports
-// nothing ranks below one that reports something, and the local family ranks last.
-export function defaultSelection(catalog: ChatCatalogRead | null): ChatModelSelection | null {
-  const rank = (entry: Entry) => {
-    const known = entry.remaining.flatMap(({ percent }) => (percent === null ? [] : [percent]));
-    return known.length > 0 ? Math.min(...known) : entry.family === 'local' ? -2 : -1;
-  };
-  const ranked = (catalog?.families ?? [])
-    .filter((entry) => entry.connected && entry.models.length > 0)
-    .sort((a, b) => rank(b) - rank(a));
-  const entry = ranked[0];
+// The top family in the contract ranking, on its default model. A family with no models listed
+// cannot be picked, so it does not compete.
+export function defaultSelection(
+  catalog: ChatCatalogRead | null,
+  exclude: readonly ChatFamily[] = [],
+): ChatModelSelection | null {
+  const [entry] = rankFamilies(
+    (catalog?.families ?? []).filter((value) => value.models.length > 0),
+    exclude,
+  );
   const model = entry?.models.find(({ model }) => model === entry.defaultModel) ?? entry?.models[0];
   return entry && model
     ? { family: entry.family, model: model.model, effort: model.defaultEffort }
     : null;
 }
 
-// The picked model moves the thread when it belongs to another family. Otherwise the connected family
-// with the most allowance left is offered, so the action works without a prior pick.
+// The picked model moves the thread when it belongs to another family. Otherwise the best ranked
+// other family is offered, so the action works without a prior pick.
 function handoffTarget(
   catalog: ChatCatalogRead | null,
   selection: ChatModelSelection | null,
@@ -64,16 +62,7 @@ function handoffTarget(
 ): ChatModelSelection | null {
   if (!currentFamily) return null;
   if (selection && selection.family !== currentFamily) return selection;
-  const left = (entry: Entry) =>
-    Math.min(100, ...entry.remaining.map((window) => window.percent ?? 100));
-  const options = (catalog?.families ?? [])
-    .filter((entry) => entry.connected && entry.family !== currentFamily && entry.models.length > 0)
-    .sort((a, b) => left(b) - left(a));
-  const entry = options[0];
-  const model = entry?.models.find(({ model }) => model === entry.defaultModel) ?? entry?.models[0];
-  return entry && model
-    ? { family: entry.family, model: model.model, effort: model.defaultEffort }
-    : null;
+  return defaultSelection(catalog, [currentFamily]);
 }
 
 export function ModelPicker({

@@ -34,20 +34,25 @@ const entry = (
   remaining,
 });
 
-test('the rail lists every connected family and says unknown when a value is missing', () => {
+test('the rail shows the tightest window per connected family and flags a reset that has passed', () => {
   const catalog: ChatCatalogRead = {
     families: [
-      entry('openai', true, [window('five-hour', 40, at(90)), window('weekly', 10, at(2880))]),
-      // The window reset an hour ago, so its percent says nothing about now.
+      // The null window reports nothing, so the 10% window decides.
+      entry('openai', true, [
+        window('five-hour', 40, at(90)),
+        window('weekly', 10, at(2880)),
+        window('monthly', null, at(30)),
+      ]),
+      // The window reset an hour ago. Its percent is the last one observed and the row says so.
       entry('anthropic', true, [window('weekly', 55, at(-60))]),
       entry('google', false, []),
       entry('local', true, []),
     ],
   };
   assert.deepEqual(railRows(catalog, NOW), [
-    { family: 'openai', percent: 10, resetsIn: 2880 * 60_000, onDevice: false },
-    { family: 'anthropic', percent: null, resetsIn: null, onDevice: false },
-    { family: 'local', percent: null, resetsIn: null, onDevice: true },
+    { family: 'openai', percent: 10, resetsIn: 2880 * 60_000, resetPassed: false, onDevice: false },
+    { family: 'anthropic', percent: 55, resetsIn: null, resetPassed: true, onDevice: false },
+    { family: 'local', percent: null, resetsIn: null, resetPassed: false, onDevice: true },
   ]);
   assert.deepEqual(railRows(null, NOW), []);
 });

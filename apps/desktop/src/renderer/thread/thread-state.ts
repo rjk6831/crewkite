@@ -34,7 +34,14 @@ export type { Block, FileDiff, ToolBlock, TurnView } from './turn-fold.ts';
 export type ThreadEvent = { type: string; cursor: string; taskId: string | null; payload: unknown };
 
 type Stamped = { cursor: bigint | null; event: AgentEvent };
-type TurnRecord = { events: Stamped[]; cursors: ReadonlySet<string>; view: TurnView };
+// skip counts stream events that a read without a cursor already folded and the stream will deliver
+// once more. It is empty whenever the read carries a cursor.
+type TurnRecord = {
+  events: Stamped[];
+  cursors: ReadonlySet<string>;
+  view: TurnView;
+  skip: ReadonlyMap<string, number>;
+};
 export type PendingMessage = { localId: string; text: string; attachments: string[]; at: string };
 
 export type ThreadState = {
@@ -45,6 +52,8 @@ export type ThreadState = {
   turnMeta: Record<string, ChatTurn>;
   turns: Record<string, TurnRecord>;
   pending: PendingMessage[];
+  /** The log cursor of the latest read. Stream events at or below it are already in the state. */
+  readCursor: bigint | null;
 };
 
 export type ThreadAction =
@@ -65,6 +74,7 @@ export const initialThreadState = (taskId: string): ThreadState => ({
   turnMeta: {},
   turns: {},
   pending: [],
+  readCursor: null,
 });
 
 const key = (cursor: bigint | null) => cursor ?? -1n;
@@ -74,9 +84,58 @@ function foldEvents(events: Stamped[]): TurnView {
   return events.reduce((view, { event }) => applyEvent(view, event), blankTurn(''));
 }
 
+const noSkip: ReadonlyMap<string, number> = new Map();
+
+// Events that add to a block. Applying one twice doubles the text, the tool output or the notice,
+// so a read without a cursor has to be matched against the stream by count.
+function appendKey(event: AgentEvent): string | null {
+  switch (event.type) {
+    case 'text.delta':
+      return `text:${event.itemId}`;
+    case 'thinking.delta':
+      return `thinking:${event.itemId}`;
+    case 'tool.output':
+      return `tool:${event.callId}`;
+    case 'provider.notice':
+      return 'notice';
+    default:
+      return null;
+  }
+}
+
+function tally(events: readonly Stamped[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const { event } of events) {
+    const name = appendKey(event);
+    if (name) counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  return counts;
+}
+
+// The snapshot holds the first N appends of each block. The record it replaces had folded M of them,
+// so the next N - M appends from the stream are copies. A skip left over from an earlier read is
+// still owed.
+// shortcut: assumes the replaced record holds every append since the turn began. Upgrade: delete this
+// once every controller sends the read cursor.
+function owedAfterRead(snapshot: readonly Stamped[], before: TurnRecord | undefined) {
+  const owed = new Map<string, number>();
+  const applied = tally(before?.events ?? []);
+  for (const [name, total] of tally(snapshot)) {
+    const left = total - (applied.get(name) ?? 0) + (before?.skip.get(name) ?? 0);
+    if (left > 0) owed.set(name, left);
+  }
+  return owed;
+}
+
 function addAgentEvent(state: ThreadState, event: AgentEvent, cursor: string | null): ThreadState {
   const existing = state.turns[event.turnId];
   if (cursor !== null && existing?.cursors.has(cursor)) return state;
+  const name = appendKey(event);
+  const owed = name ? (existing?.skip.get(name) ?? 0) : 0;
+  if (existing && name && owed > 0) {
+    const skip = new Map(existing.skip).set(name, owed - 1);
+    return { ...state, turns: { ...state.turns, [event.turnId]: { ...existing, skip } } };
+  }
   const stamped: Stamped = { cursor: cursor === null ? null : parseCursor(cursor), event };
   const events = existing?.events ?? [];
   const last = events.at(-1);
@@ -97,7 +156,11 @@ function addAgentEvent(state: ThreadState, event: AgentEvent, cursor: string | n
     cursor === null
       ? (existing?.cursors ?? new Set<string>())
       : new Set([...(existing?.cursors ?? []), cursor]);
-  return { ...state, turns: { ...state.turns, [event.turnId]: { events: next, cursors, view } } };
+  const skip = existing?.skip ?? noSkip;
+  return {
+    ...state,
+    turns: { ...state.turns, [event.turnId]: { events: next, cursors, view, skip } },
+  };
 }
 
 function asMessage(payload: unknown): ChatMessage | null {
@@ -129,6 +192,12 @@ function addMessages(state: ThreadState, incoming: ChatMessage[], replace = fals
 
 function applyOne(state: ThreadState, event: ThreadEvent): ThreadState {
   if (event.taskId && event.taskId !== state.taskId) return state;
+  // A read reflects the log up to its cursor. Messages merge by id, so only the three stream events
+  // need the check.
+  if (state.readCursor !== null && event.type !== 'conversation.entry') {
+    const at = parseCursor(event.cursor);
+    if (at !== null && at <= state.readCursor) return state;
+  }
   switch (event.type) {
     case 'agent.event': {
       const parsed = AgentEventSchema.safeParse(event.payload);
@@ -167,11 +236,13 @@ export function reduceThread(state: ThreadState, action: ThreadAction): ThreadSt
           loaded: true,
           thread: read.thread,
           turnMeta: Object.fromEntries(read.turns.map((turn) => [turn.id, turn])),
+          readCursor: read.cursor === undefined ? null : parseCursor(read.cursor),
         },
         read.messages,
         true,
       );
       // The snapshot of an unfinished turn is complete, so it replaces what the stream built.
+      // Events still queued from before the read are dropped by cursor, or by count without one.
       const live = new Map<string, Stamped[]>();
       for (const event of read.liveEvents)
         live.set(event.turnId, [...(live.get(event.turnId) ?? []), { cursor: null, event }]);
@@ -181,6 +252,7 @@ export function reduceThread(state: ThreadState, action: ThreadAction): ThreadSt
           events,
           cursors: new Set(),
           view: { ...foldEvents(events), id: turnId },
+          skip: next.readCursor === null ? owedAfterRead(events, state.turns[turnId]) : noSkip,
         };
       next = { ...next, turns };
       return next;

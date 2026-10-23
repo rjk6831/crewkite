@@ -1,18 +1,20 @@
 // Frames assumed from the controller, one per event:
 //   { type: 'agent.event', cursor: '12', taskId: <tsk>, payload: <AgentEvent> }
 //   { type: 'conversation.entry', cursor: '10', taskId: <tsk>, payload: <ChatMessage> }
-// A thread read has no cursor of its own. Messages carry theirs and live events do not.
+// A thread read carries the log cursor it reflects when the controller sends one. The live events
+// inside a read carry no cursor of their own.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type {
   AgentEvent,
+  ChatCatalogRead,
   ChatFailure,
   ChatMessage,
   ChatThread,
   ChatThreadRead,
   ChatTurn,
 } from '@crewkite/contracts';
-import { limitOffer } from './handoff-offer.ts';
+import { limitOffer, offerChoices } from './handoff-offer.ts';
 import {
   initialThreadState,
   reduceThread,
@@ -219,27 +221,20 @@ test('the limit offer shows only while the newest turn is the one that hit a lim
   };
   const stopped = [user(10, 'Add the guard'), begin(turn, 11), end(turn, 12, 'limit')];
 
-  assert.deepEqual(offer(stopped), {
-    turnId: turn,
-    family: 'openai',
-    text: 'Add the guard',
-    attachments: [],
-  });
+  assert.deepEqual(offer(stopped), { turnId: turn, family: 'openai' });
   // The message is on its way to another provider, so the choice is made.
   assert.equal(offer(stopped, true), null);
   // A newer turn that finished, or stopped for another reason, leaves nothing to offer.
-  const newer = (text: string, stopReason: 'limit' | 'error' | 'done') => [
+  const newer = (stopReason: 'limit' | 'error' | 'done') => [
     ...stopped,
-    user(13, text),
+    user(13, 'Try again'),
     begin(second, 14),
     end(second, 15, stopReason),
   ];
-  assert.equal(offer(newer('Add the guard', 'done')), null);
-  assert.equal(offer(newer('Try again', 'error')), null);
-  // A newer turn that also hit a limit moves the offer to it and to its own message.
-  const again = offer(newer('Try again', 'limit'));
-  assert.equal(again?.turnId, second);
-  assert.equal(again?.text, 'Try again');
+  assert.equal(offer(newer('done')), null);
+  assert.equal(offer(newer('error')), null);
+  // A newer turn that also hit a limit moves the offer to it.
+  assert.equal(offer(newer('limit'))?.turnId, second);
 
   // A reopened thread has the stored turns and no stream. The stored failure carries the cause.
   const stored = (
@@ -288,7 +283,6 @@ test('the limit offer shows only while the newest turn is the one that hit a lim
     );
   const first = stored(1, 'failed', 'usage-limit');
   assert.equal(reopened([first])?.family, 'anthropic');
-  assert.equal(reopened([first])?.text, 'Add the guard');
   assert.equal(reopened([first, stored(2, 'done', 'usage-limit')]), null);
   assert.equal(reopened([first, stored(2, 'failed', 'client-exit')]), null);
   // A stored stop reason decides before the failure kind. Turns without one keep the fallback above.
@@ -345,4 +339,117 @@ test('a reply restored from a thread read keeps the role of its turn for the bad
       role,
     );
   }
+});
+
+test('stream events that a thread read already covers apply once', () => {
+  const thread: ChatThread = {
+    taskId: task,
+    scratchReady: true,
+    base: null,
+    selection: null,
+    permissionPolicy: 'ask',
+    sessions: [],
+    activeTurnId: turn,
+    autoHandoff: false,
+  };
+  const delta = (cursor: number, text: string) =>
+    agent(cursor, { type: 'text.delta', itemId: 'a', text });
+  const output = (cursor: number, chunk: string) =>
+    agent(cursor, { type: 'tool.output', callId: 'c1', chunk });
+  const shown = (state: ReturnType<typeof initialThreadState>) => {
+    const { blocks } = turnOf(threadItems(state));
+    const text = blocks.find((block) => block.kind === 'text');
+    const tool = blocks.find((block) => block.kind === 'tool');
+    return {
+      text: text?.kind === 'text' ? text.text : '',
+      output: tool?.kind === 'tool' ? tool.output : '',
+    };
+  };
+  // Every case is a view that folded `before`, then reloaded while `after` was still queued.
+  const fresh = [started(10), delta(11, 'Hello'), output(12, 'line\n')];
+  const cases = [
+    {
+      name: 'cursor, view had folded nothing',
+      before: [],
+      live: fresh,
+      cursor: '12',
+      after: [...fresh, delta(13, ' there'), output(14, 'more\n')],
+      want: { text: 'Hello there', output: 'line\nmore\n' },
+    },
+    {
+      name: 'no cursor, view had folded nothing',
+      before: [],
+      live: fresh,
+      cursor: undefined,
+      after: [...fresh, delta(13, ' there'), output(14, 'more\n')],
+      want: { text: 'Hello there', output: 'line\nmore\n' },
+    },
+    {
+      name: 'cursor, view had folded part of the read',
+      before: [started(10), delta(11, 'Hel')],
+      live: [started(10), delta(11, 'Hel'), delta(12, 'lo')],
+      cursor: '12',
+      after: [delta(12, 'lo'), delta(13, '!')],
+      want: { text: 'Hello!', output: '' },
+    },
+    {
+      name: 'no cursor, view had folded part of the read',
+      before: [started(10), delta(11, 'Hel')],
+      live: [started(10), delta(11, 'Hel'), delta(12, 'lo')],
+      cursor: undefined,
+      after: [delta(12, 'lo'), delta(13, '!')],
+      want: { text: 'Hello!', output: '' },
+    },
+  ];
+  for (const { name, before, live, cursor, after, want } of cases) {
+    let state = reduceThread(initialThreadState(task), { type: 'events', events: before });
+    state = reduceThread(state, {
+      type: 'loaded',
+      read: {
+        thread,
+        turns: [],
+        messages: [],
+        liveEvents: live.map((event) => event.payload as AgentEvent),
+        ...(cursor ? { cursor } : {}),
+      },
+    });
+    state = reduceThread(state, { type: 'events', events: after });
+    assert.deepEqual(shown(state), want, name);
+  }
+});
+
+test('the offer ranks the other connected families by allowance and leaves out one at zero', () => {
+  const models = [{ model: 'm', label: 'M', efforts: [], defaultEffort: 'default' as const }];
+  const family = (name: ChatCatalogRead['families'][number]['family'], percent: number | null) => ({
+    family: name,
+    connected: true,
+    reason: null,
+    models,
+    defaultModel: 'm',
+    remaining:
+      percent === null
+        ? []
+        : [{ windowId: 'weekly', label: 'Weekly', percent, resetsAt: null, observedAt: null }],
+  });
+  const catalog: ChatCatalogRead = {
+    families: [
+      family('openai', 5),
+      family('anthropic', 60.9),
+      family('google', 0),
+      family('local', null),
+    ],
+  };
+  // Anthropic leads on allowance, the local family has no figure and ranks last, and Google is
+  // out because a turn there would end on the limit it already hit. OpenAI stopped.
+  assert.deepEqual(
+    offerChoices(catalog, 'openai').map(({ family, percent }) => [family, percent]),
+    [
+      ['anthropic', 60],
+      ['local', null],
+    ],
+  );
+  assert.deepEqual(
+    offerChoices(catalog, 'anthropic').map(({ family }) => family),
+    ['openai', 'local'],
+  );
 });

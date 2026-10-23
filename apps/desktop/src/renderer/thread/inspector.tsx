@@ -8,6 +8,7 @@ import type {
 import { X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { familyName } from '../components.tsx';
+import { permissionPolicies } from '../settings/preferences.ts';
 import { UsageGauges } from '../usage-gauges.tsx';
 import { projectUsagePresentation } from '../usage-presentation.ts';
 import { ChangesPanel } from './changes-panel.tsx';
@@ -25,11 +26,6 @@ const roleNames: Record<ChatRole, string> = {
   reviewer: 'Reviewer',
   advisor: 'Advisor',
 };
-const policies: { id: ChatPermissionPolicy; label: string }[] = [
-  { id: 'ask', label: 'Ask each time' },
-  { id: 'allow-edits', label: 'Allow edits' },
-  { id: 'allow-all', label: 'Allow all' },
-];
 
 function UsageTab({ header, preview }: { header: WorkspaceState | null; preview: boolean }) {
   const now = useUsageClock(header?.usage ?? [], preview);
@@ -129,7 +125,7 @@ function ThreadTab({
             onConfigure({ permissionPolicy: event.target.value as ChatPermissionPolicy })
           }
         >
-          {policies.map((policy) => (
+          {permissionPolicies.map((policy) => (
             <option key={policy.id} value={policy.id}>
               {policy.label}
             </option>

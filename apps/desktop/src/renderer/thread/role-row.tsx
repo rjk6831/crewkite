@@ -21,11 +21,7 @@ function roleDefault(
   catalog: ChatCatalogRead | null,
   answeredBy: ChatFamily | null,
 ): ChatModelSelection | null {
-  const others =
-    catalog && answeredBy
-      ? { families: catalog.families.filter((entry) => entry.family !== answeredBy) }
-      : catalog;
-  return defaultSelection(others) ?? defaultSelection(catalog);
+  return (answeredBy ? defaultSelection(catalog, [answeredBy]) : null) ?? defaultSelection(catalog);
 }
 
 /**
@@ -66,7 +62,7 @@ export function useRoleRun({
   function why(action: RoleAction): string | null {
     if (blocked) return blocked;
     if (running) return 'Wait for the current turn to finish.';
-    if (!defaultSelection(catalog)) return 'No provider is connected.';
+    if (!defaultSelection(catalog)) return 'No connected provider has allowance left.';
     if (action === 'reviewer' && !thread?.scratchReady)
       return 'There is no scratch copy to review yet.';
     if (action === 'advisor' && !currentFamily) return 'There is no answer to look at yet.';
