@@ -70,6 +70,8 @@ test('tools refuse paths that leave the scratch copy', async () => {
   const { root, scratch, outside, context } = fixture();
   try {
     symlinkSync(outside, join(scratch, 'link'));
+    // A link whose target does not exist yet would create the file wherever it points.
+    symlinkSync(join(outside, 'later.txt'), join(scratch, 'dangling.txt'));
     mkdirSync(join(scratch, '.git'));
     writeFileSync(join(scratch, '.git', 'config'), '[core]\n');
     for (const [name, args, reason] of [
@@ -81,6 +83,7 @@ test('tools refuse paths that leave the scratch copy', async () => {
       ],
       ['read_range', { path: 'link/secret.txt', start: 1, end: 1 }, /through a link/],
       ['write', { path: 'link/new.txt', content: 'x' }, /through a link/],
+      ['write', { path: 'dangling.txt', content: 'x' }, /through a link/],
       ['edit', { path: '.git/config', old: '[core]', new: '[hooks]' }, /inside \.git/],
     ] as const) {
       const outcome = await runTool(name, args, context);
@@ -88,6 +91,7 @@ test('tools refuse paths that leave the scratch copy', async () => {
       assert.match(outcome.output, reason);
     }
     assert.equal(existsSync(join(outside, 'new.txt')), false);
+    assert.equal(existsSync(join(outside, 'later.txt')), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

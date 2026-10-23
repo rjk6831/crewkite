@@ -1,6 +1,5 @@
 import { execFileSync, spawn } from 'node:child_process';
 import {
-  existsSync,
   lstatSync,
   mkdirSync,
   readdirSync,
@@ -170,11 +169,28 @@ export function scratchPath(scratch: string, value: string) {
   if (parts.includes('.git')) throw new ToolError('Paths inside .git are not available.');
   const root = realpathSync(scratch);
   const full = resolve(root, value);
+  const outside = () => new ToolError(`${value} leads outside the project through a link.`);
+  const inside = (path: string) => path === root || path.startsWith(root + sep);
+  // Walk up to the nearest entry that exists without following links. A dangling link counts
+  // as present here, so a write through it cannot land wherever the link points.
   let probe = full;
-  while (!existsSync(probe)) probe = dirname(probe);
-  const real = realpathSync(probe);
-  if (real !== root && !real.startsWith(root + sep))
-    throw new ToolError(`${value} leads outside the project through a link.`);
+  for (;;) {
+    const stat = lstatSync(probe, { throwIfNoEntry: false });
+    if (stat) {
+      if (stat.isSymbolicLink()) {
+        let target: string;
+        try {
+          target = realpathSync(probe);
+        } catch {
+          throw outside();
+        }
+        if (!inside(target)) throw outside();
+      }
+      break;
+    }
+    probe = dirname(probe);
+  }
+  if (!inside(realpathSync(probe))) throw outside();
   return { full, relative: relative(root, full).split(sep).join('/') };
 }
 
