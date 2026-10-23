@@ -139,6 +139,8 @@ const toolKinds = new Map<string, ChatToolKind>([
 ]);
 const toolKind = (kind: string | null | undefined): ChatToolKind =>
   toolKinds.get(kind ?? '') ?? 'other';
+// Kinds whose result goes only to the model. A fetch arrives as other.
+const passiveKinds = new Set<ChatToolKind>(['read', 'search', 'other']);
 
 // Listed in the order the person sees them.
 const optionKinds = new Map<string, { kind: ChatPermissionOption['kind']; label: string }>([
@@ -686,18 +688,50 @@ export function googleChatAdapter(deps: {
           finish(call, 'error', 'The turn ended before this tool reported a result.');
       }
 
-      function tool(raw: Record<string, unknown>) {
-        const update = toolUpdate.safeParse(raw);
-        if (!update.success)
+      // This agent keys a call's terminal update by a frame id, which is the permission prompt's
+      // id when the call went through one and the call id otherwise. When that id differs from
+      // the announced one, the card spins until the turn ends. Two fallbacks close it. A terminal
+      // update with an unknown id and no title completes the newest open call, of the same kind
+      // when it names one, and never opens a card of its own. And once the agent moves on to
+      // another call, to its reply or to a usage update, a read, search or other call is done,
+      // since its result went back to the model. Edits and commands wait for a real status,
+      // because the person needs to know how they went. So does a call behind an open
+      // permission card.
+      function settle(except?: string) {
+        for (const call of calls.values())
+          if (
+            !call.done &&
+            call.id !== except &&
+            passiveKinds.has(call.kind) &&
+            ![...pending.values()].some((entry) => entry.callId === call.id)
+          )
+            finish(call, 'ok', 'The result went back to the model.');
+      }
+      function tool(raw: Record<string, unknown>, announced: boolean) {
+        const parsed = toolUpdate.safeParse(raw);
+        if (!parsed.success)
           return noticeOnce(
             'tool',
             'The Google client sent a tool update this app could not read.',
           );
-        const call = upsert(update.data);
-        if (typeof update.data.rawOutput === 'string' && call.seen === '')
-          output(call, update.data.rawOutput);
-        if (update.data.status === 'completed') finish(call, 'ok');
-        else if (update.data.status === 'failed') finish(call, 'error');
+        let update = parsed.data;
+        const ends = update.status === 'completed' || update.status === 'failed';
+        if (!announced && ends && !calls.has(update.toolCallId) && !update.title?.trim()) {
+          const kind = update.kind ? toolKind(update.kind) : null;
+          const open = [...calls.values()]
+            .filter((call) => !call.done && (!kind || call.kind === kind))
+            .at(-1);
+          if (!open) return;
+          update = { ...update, toolCallId: open.id };
+        }
+        if (announced) settle(update.toolCallId);
+        // A late update for a closed card would put output under a finished result.
+        if (calls.get(update.toolCallId)?.done) return;
+        const call = upsert(update);
+        if (typeof update.rawOutput === 'string' && call.seen === '')
+          output(call, update.rawOutput);
+        if (update.status === 'completed') finish(call, 'ok');
+        else if (update.status === 'failed') finish(call, 'error');
       }
       function plan(raw: Record<string, unknown>) {
         const parsed = planUpdate.safeParse(raw);
@@ -732,6 +766,7 @@ export function googleChatAdapter(deps: {
         switch (kind.data.sessionUpdate) {
           case 'agent_message_chunk':
           case 'agent_thought_chunk': {
+            if (kind.data.sessionUpdate === 'agent_message_chunk') settle();
             const block = blockUpdate.parse(raw).content;
             if (block?.type === 'text')
               chunk(
@@ -746,11 +781,13 @@ export function googleChatAdapter(deps: {
             return;
           }
           case 'tool_call':
+            return tool(raw, true);
           case 'tool_call_update':
-            return tool(raw);
+            return tool(raw, false);
           case 'plan':
             return plan(raw);
           case 'usage_update':
+            settle();
             return context(raw);
           default:
             if (!quietUpdates.has(kind.data.sessionUpdate))

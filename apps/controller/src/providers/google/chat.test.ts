@@ -51,12 +51,18 @@ const environment = {
   SECRET_TOKEN: 'must-not-escape',
 };
 
-// Renames the edit kind on the peer's output lines, so a scenario can announce a tool kind the
-// adapter does not know. The peer splits each line across writes, so this joins them first.
+// Passes each line the peer writes through `edit`, the source of a function from one line to
+// the lines sent in its place, so a scenario can play framing the scripted agent does not. The
+// peer splits each line across writes, so this joins them first.
+const rewrite = (edit: string) =>
+  `const out=process.stdout.write.bind(process.stdout);const edit=${edit};let held='';process.stdout.write=(chunk)=>{held+=chunk;const lines=held.split('\\n');held=lines.pop();for(const line of lines)for(const next of edit(line))out(next+'\\n');return true;};`;
+// Renames the edit kind, so a scenario can announce a tool kind the adapter does not know.
 const announce = (kind: string) =>
-  `const out=process.stdout.write.bind(process.stdout);let held='';process.stdout.write=(chunk)=>{held+=chunk;const lines=held.split('\\n');held=lines.pop();for(const line of lines)out(line.replace('"kind":"edit"',${JSON.stringify(`"kind":${JSON.stringify(kind)}`)})+'\\n');return true;};`;
+  rewrite(
+    `(line)=>[line.replace('"kind":"edit"',${JSON.stringify(`"kind":${JSON.stringify(kind)}`)})]`,
+  );
 
-function rig(scenario: AcpChatPeerCase, announced?: string) {
+function rig(scenario: AcpChatPeerCase, prelude = '') {
   mkdirSync(resolve('internal'), { recursive: true });
   const home = mkdtempSync(resolve('internal/acp-chat-'));
   const executable = join(home, 'peer');
@@ -65,7 +71,7 @@ function rig(scenario: AcpChatPeerCase, announced?: string) {
   );
   writeFileSync(
     executable,
-    `#!${process.execPath}\nimport {runAcpChatPeer} from ${JSON.stringify(pathToFileURL(peer).href)};${announced ? announce(announced) : ''}runAcpChatPeer(${JSON.stringify(scenario)});\n`,
+    `#!${process.execPath}\nimport {runAcpChatPeer} from ${JSON.stringify(pathToFileURL(peer).href)};${prelude}runAcpChatPeer(${JSON.stringify(scenario)});\n`,
     { mode: 0o500 },
   );
   writeFileSync(join(home, 'localharness_external'), harness, { mode: 0o500 });
@@ -346,6 +352,87 @@ test('a turn streams thinking, tools and text in order, and the next turn resume
   }
 });
 
+test('a card closes on a completion under an unknown id or when the agent moves on, and an edit waits for its status', async () => {
+  const trail = (events: AgentEvent[]) =>
+    events.flatMap((event) =>
+      event.type === 'tool.started' || event.type === 'tool.output'
+        ? [`${event.type.slice(5)} ${event.callId}`]
+        : event.type === 'tool.completed'
+          ? [
+              `${event.status} ${event.callId}${event.diff ? ' with diff' : ''}${event.summary ? `: ${event.summary}` : ''}`,
+            ]
+          : [],
+    );
+  const rows: { edit: (line: string) => string[]; trail: string[] }[] = [
+    {
+      // The read's completion arrives under a frame id the agent never announced.
+      edit: (line) => {
+        const frame = JSON.parse(line);
+        const update = frame.params?.update;
+        if (update?.toolCallId === 'read-1' && update.status === 'completed')
+          update.toolCallId = 'frame-9';
+        return [JSON.stringify(frame)];
+      },
+      trail: [
+        'started read-1',
+        'output read-1',
+        'ok read-1',
+        'started edit-1',
+        'ok edit-1 with diff',
+      ],
+    },
+    {
+      // An edit opens first, the read never reports, and a search starts after both.
+      edit: (line) => {
+        const frame = JSON.parse(line);
+        const update = frame.params?.update;
+        const swap = (next: object) =>
+          JSON.stringify({ ...frame, params: { ...frame.params, update: next } });
+        if (update?.sessionUpdate === 'tool_call' && update.toolCallId === 'read-1')
+          return [
+            swap({
+              sessionUpdate: 'tool_call',
+              toolCallId: 'edit-1',
+              title: 'Edit net.mjs',
+              kind: 'edit',
+              status: 'pending',
+            }),
+            line,
+          ];
+        if (update?.sessionUpdate === 'tool_call' && update.toolCallId === 'edit-1')
+          return [
+            swap({
+              sessionUpdate: 'tool_call',
+              toolCallId: 'search-1',
+              title: 'Search total',
+              kind: 'search',
+              status: 'in_progress',
+            }),
+          ];
+        return update?.toolCallId === 'read-1' && update.status === 'completed' ? [] : [line];
+      },
+      trail: [
+        'started edit-1',
+        'started read-1',
+        'ok read-1: The result went back to the model.',
+        'started search-1',
+        'ok edit-1 with diff',
+        'ok search-1: The result went back to the model.',
+      ],
+    },
+  ];
+  for (const row of rows) {
+    const f = rig('chat-stream', rewrite(String(row.edit)));
+    try {
+      const turn = await run(f, request(f));
+      assert.deepEqual(trail(turn.events), row.trail);
+      assert.equal(turn.result.stopReason, 'done');
+    } finally {
+      f.dispose();
+    }
+  }
+});
+
 test('a permission request parks the turn until answered, and the policy answers only what it allows', async () => {
   const options = [
     { id: 'once', label: 'Once', kind: 'allow-once' },
@@ -414,7 +501,7 @@ test('a permission request parks the turn until answered, and the policy answers
       changed: [],
     },
   ] as const) {
-    const f = rig(row.scenario, 'announced' in row ? row.announced : undefined);
+    const f = rig(row.scenario, 'announced' in row && row.announced ? announce(row.announced) : '');
     try {
       let answered = false;
       const patch = {
