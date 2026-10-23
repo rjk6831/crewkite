@@ -27,13 +27,17 @@ import { ArtifactFiles } from '../artifacts/index.ts';
 import type { Controller } from '../commands/controller.ts';
 import { setup } from '../store/controller-fixture.ts';
 import { Store } from '../store/index.ts';
-import { type ChatTurnRequest, chatFailure } from './adapter.ts';
+import {
+  type ChatAdapter,
+  type ChatTurnRequest,
+  type ChatTurnResult,
+  chatFailure,
+} from './adapter.ts';
 import { ChatService } from './service.ts';
 
 const selection = { family: 'openai', model: 'fixture-model', effort: 'default' } as const;
 
-async function chat(t: TestContext, turns: ChatScriptStep[][]) {
-  const adapter = createScriptedChatAdapter({ family: 'openai', turns });
+async function open<Adapter extends ChatAdapter>(t: TestContext, adapter: Adapter) {
   const context = await setup(t, { chatAdapters: new Map([['openai', adapter]]) });
   const { controller, command } = context;
   const task = (await controller.execute(context.draft, 'local-owner')).entity as Task;
@@ -45,6 +49,9 @@ async function chat(t: TestContext, turns: ChatScriptStep[][]) {
     (await run('ReadChatThread', payload)).data as ChatThreadRead & { kind: 'chat-thread' };
   return { controller, adapter, task, run, send, read };
 }
+
+const chat = (t: TestContext, turns: ChatScriptStep[][]) =>
+  open(t, createScriptedChatAdapter({ family: 'openai', turns }));
 
 /** Subscribe before the command that causes the event, then await. */
 function next(
@@ -489,4 +496,95 @@ test('a reviewer turn runs read only with the review brief and the ask policy, w
   assert.equal(thread.thread.permissionPolicy, 'allow-all');
   assert.equal(thread.thread.sessions.length, 1);
   assert.equal(thread.turns.at(-1)?.role, 'reviewer');
+});
+
+// The scripted adapter has no allow-thread option and no tool event, so this one plays what a real
+// adapter emits for an edit: tool.started, then permission.requested for the same call. The first
+// turn asks once and the later turns reply at once. It keeps every request it receives.
+function editingAdapter() {
+  const requests: ChatTurnRequest[] = [];
+  const adapter: ChatAdapter = {
+    family: 'openai',
+    startTurn(request, emit) {
+      requests.push(request);
+      const { turnId } = request;
+      const asks = requests.length === 1;
+      let answer = (_choice: string) => {};
+      const result = (async (): Promise<ChatTurnResult> => {
+        await Promise.resolve();
+        emit({
+          type: 'turn.started',
+          turnId,
+          family: 'openai',
+          model: request.selection.model,
+          effort: request.selection.effort,
+          role: request.role,
+        });
+        if (asks) {
+          const choice = new Promise<string>((resolve) => {
+            answer = resolve;
+          });
+          emit({ type: 'tool.started', turnId, callId: 'call-1', kind: 'edit', title: 'net.mjs' });
+          emit({
+            type: 'permission.requested',
+            turnId,
+            requestId: 'edit-1',
+            callId: 'call-1',
+            question: 'Change net.mjs?',
+            detail: null,
+            options: [
+              { id: 'allow-once', label: 'Allow once', kind: 'allow-once' },
+              { id: 'allow-thread', label: 'Allow for this thread', kind: 'allow-thread' },
+              { id: 'deny', label: 'Deny', kind: 'deny' },
+            ],
+          });
+          emit({ type: 'permission.resolved', turnId, requestId: 'edit-1', choice: await choice });
+        }
+        emit({ type: 'turn.completed', turnId, stopReason: 'done', failure: null });
+        return {
+          stopReason: 'done',
+          failure: null,
+          assistantText: '',
+          session: null,
+          usage: null,
+          changedPaths: [],
+        };
+      })();
+      return { respondPermission: (_id, choice) => answer(choice), stop() {}, groups: [], result };
+    },
+  };
+  return Object.assign(adapter, { requests });
+}
+
+test('allow for this thread records the tool kind and the next turn carries it', {
+  timeout: 30000,
+}, async (t) => {
+  const { controller, adapter, run, send, read } = await open(t, editingAdapter());
+  const parked = turnReaches(controller, 'waiting-permission');
+  await send('Fix the rounding.');
+  const turn = await parked;
+
+  const announced = next(
+    controller,
+    (event) =>
+      event.type === 'chat.thread' && event.payload.permissionGrants?.includes('edit') === true,
+  );
+  const done = turnReaches(controller, 'done');
+  const choice = 'allow-thread';
+  assert.equal(
+    (await run('ResolveChatPermission', { turnId: turn.id, requestId: 'edit-1', choice }, 0))
+      .outcome,
+    'applied',
+  );
+  await announced;
+  await done;
+  assert.deepEqual((await read()).thread.permissionGrants, ['edit']);
+
+  const second = turnReaches(controller, 'done');
+  await send('Now the totals.');
+  await second;
+  assert.deepEqual(
+    adapter.requests.map((request) => request.permissionGrants),
+    [[], ['edit']],
+  );
 });
