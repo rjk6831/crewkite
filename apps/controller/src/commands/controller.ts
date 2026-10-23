@@ -3856,6 +3856,13 @@ export class Controller {
         return this.chat().configure(command.payload);
       case 'HandoffChatThread':
         return this.chat().handoff(command.payload);
+      case 'AcceptChatChanges':
+        return this.chat().accept(
+          command.payload,
+          typeof this.options.identity === 'function'
+            ? this.options.identity()
+            : this.options.identity,
+        );
       case 'ReadChatThread':
       case 'ReadChatChanges':
         if (!this.store.get<Task>('task', command.payload.taskId))

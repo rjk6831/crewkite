@@ -25,6 +25,7 @@ import { type ChatScriptStep, createScriptedChatAdapter } from '@crewkite/testki
 import { createSyntheticRepository } from '@crewkite/testkit/repository';
 import { ArtifactFiles } from '../artifacts/index.ts';
 import type { Controller } from '../commands/controller.ts';
+import { git } from '../host/source.ts';
 import { setup } from '../store/controller-fixture.ts';
 import { Store } from '../store/index.ts';
 import { type ChatTurnRequest, chatFailure } from './adapter.ts';
@@ -34,8 +35,11 @@ const selection = { family: 'openai', model: 'fixture-model', effort: 'default' 
 
 async function chat(t: TestContext, turns: ChatScriptStep[][]) {
   const adapter = createScriptedChatAdapter({ family: 'openai', turns });
-  const context = await setup(t, { chatAdapters: new Map([['openai', adapter]]) });
-  const { controller, command } = context;
+  const context = await setup(t, {
+    chatAdapters: new Map([['openai', adapter]]),
+    identity: { name: 'Fixture owner', email: 'owner@example.invalid' },
+  });
+  const { controller, command, source } = context;
   const task = (await controller.execute(context.draft, 'local-owner')).entity as Task;
   const run = (name: string, payload: object, revision?: number) =>
     controller.execute(command(name, { taskId: task.id, ...payload }, revision), 'local-owner');
@@ -43,7 +47,7 @@ async function chat(t: TestContext, turns: ChatScriptStep[][]) {
     run('SendChatMessage', { text, selection }, task.revision) as Promise<CommandResult>;
   const read = async (payload: object = {}) =>
     (await run('ReadChatThread', payload)).data as ChatThreadRead & { kind: 'chat-thread' };
-  return { controller, adapter, task, run, send, read };
+  return { controller, adapter, task, run, send, read, source };
 }
 
 /** Subscribe before the command that causes the event, then await. */
@@ -489,4 +493,66 @@ test('a reviewer turn runs read only with the review brief and the ask policy, w
   assert.equal(thread.thread.permissionPolicy, 'allow-all');
   assert.equal(thread.thread.sessions.length, 1);
   assert.equal(thread.turns.at(-1)?.role, 'reviewer');
+});
+
+test('accept commits the scratch edit on the base as a new branch and leaves the checkout alone', {
+  timeout: 30000,
+}, async (t) => {
+  const { controller, adapter, task, run, send, read, source } = await chat(t, [
+    [{ kind: 'text', itemId: 'reply', chunks: ['Edited.'] }],
+  ]);
+  const done = turnReaches(controller, 'done');
+  await send('Fix the rounding.');
+  await done;
+  appendFileSync(join(adapter.requests[0].scratch.directory, 'net.mjs'), '// accepted\n');
+  const repo = (...args: string[]) => git(source.directory, args).toString('utf8').trim();
+  const checkout = () => [
+    repo('rev-parse', 'HEAD'),
+    repo('symbolic-ref', 'HEAD'),
+    repo('status', '--porcelain=v1', '--untracked-files=all'),
+  ];
+  const before = checkout();
+  const base = before[0];
+  const branch = 'refs/heads/crewkite/fix-rounding';
+  const accept = () => run('AcceptChatChanges', { branch: 'crewkite/fix-rounding' }, task.revision);
+
+  const result = await accept();
+  assert.equal(result.outcome, 'applied');
+  const commit = repo('rev-parse', branch);
+  assert.deepEqual(result.data, {
+    kind: 'chat-acceptance',
+    branch: 'crewkite/fix-rounding',
+    commit,
+    fileCount: 1,
+  });
+  assert.equal(repo('rev-parse', `${branch}^`), base);
+  assert.equal(repo('rev-list', '--count', `${base}..${branch}`), '1');
+  assert.equal(repo('diff', '--name-only', base, branch), 'net.mjs');
+  assert.match(repo('show', `${branch}:net.mjs`), /\/\/ accepted$/);
+  assert.equal(
+    repo('log', '-1', '--format=%s|%an <%ae>', branch),
+    `CrewKite: ${task.title}|Fixture owner <owner@example.invalid>`,
+  );
+  assert.deepEqual(checkout(), before);
+  const thread = await read();
+  assert.equal(thread.thread.lastAcceptance?.commit, commit);
+  assert.equal(thread.messages.at(-1)?.text, 'Accepted 1 file to branch crewkite/fix-rounding.');
+
+  assert.equal((await accept()).reason, 'branch-exists');
+  assert.equal(repo('rev-parse', branch), commit);
+});
+
+test('accept is refused while a turn is running', { timeout: 30000 }, async (t) => {
+  const { controller, task, run, send } = await chat(t, [
+    [{ kind: 'text', itemId: 'reply', chunks: ['Working'], complete: false }, { kind: 'wait' }],
+  ]);
+  const streaming = next(
+    controller,
+    (event) => event.type === 'agent.event' && event.payload.type === 'text.delta',
+  );
+  await send('Fix the rounding.');
+  await streaming;
+
+  const result = await run('AcceptChatChanges', { branch: 'crewkite/fix-rounding' }, task.revision);
+  assert.deepEqual([result.outcome, result.reason], ['blocked', 'turn-running']);
 });
