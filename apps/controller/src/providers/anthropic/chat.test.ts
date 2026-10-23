@@ -414,13 +414,21 @@ test('a new session gets the framing and a saved one is resumed with the prompt 
   }
 });
 
-test('an unknown event type is reported once and does not end the turn', async (t) => {
+test('an unknown event is reported once, routine system events are not, and neither ends the turn', async (t) => {
   const mystery = { type: 'mystery_event', session_id: fresh, detail: 'new in a later build' };
+  const system = (subtype: string, fields: object) => ({
+    out: { type: 'system', subtype, session_id: fresh, ...fields },
+  });
   const turn = run([
     'read',
     { out: init() },
     { out: mystery },
     { out: mystery },
+    system('status', { status: 'requesting' }),
+    system('commands_changed', { commands: ['review'] }),
+    system('thinking_tokens', { tokens: 120 }),
+    system('compact_boundary', { compact_metadata: { trigger: 'auto' } }),
+    system('announcement', { content: 'A message for the person.' }),
     { out: reply('msg_3', [{ type: 'text', text: 'Still here.' }]) },
     { out: done() },
     'drain',
@@ -428,8 +436,13 @@ test('an unknown event type is reported once and does not end the turn', async (
   t.after(turn.cleanup);
   const result = await turn.handle.result;
   const notices = turn.events.filter((event) => event.type === 'provider.notice');
-  assert.equal(notices.length, 1);
-  assert.match(notices[0]?.message ?? '', /mystery_event/);
+  assert.deepEqual(
+    notices.map((notice) => notice.message),
+    [
+      'The client sent a mystery_event event, which CrewKite does not show.',
+      'The client sent a system/announcement event, which CrewKite does not show.',
+    ],
+  );
   assert.equal(result.stopReason, 'done');
   assert.equal(result.assistantText, 'Still here.');
 });

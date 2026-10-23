@@ -173,6 +173,12 @@ const USAGE_LIMIT = /usage limit|limit reached|hit your limit|out of usage/i;
 const SIGNED_OUT =
   /\/login\b|\bnot logged in\b|\blog ?in\b|\bsign(?:ed)? ?in\b|authenticat|\boauth\b|invalid api key/i;
 const NAME = /^[a-z][a-z0-9_]{0,63}$/;
+const QUIET_SYSTEM = new Set(['status', 'commands_changed', 'thinking_tokens']);
+const carriesText = (value: unknown) =>
+  ['content', 'message', 'text'].some((key) => {
+    const field = record(value)[key];
+    return typeof field === 'string' && field.trim() !== '';
+  });
 const label = (value: string | undefined) => (value && NAME.test(value) ? value : 'unnamed');
 const clip = (value: string, limit: number) =>
   value.length > limit ? value.slice(0, limit) : value;
@@ -912,7 +918,12 @@ function startTurn(
     const nested = typeof head.data.parent_tool_use_id === 'string';
     switch (type) {
       case 'system':
-        return subtype === 'init' ? onInit(value) : unknown(`system/${label(subtype)}`);
+        if (subtype === 'init') return onInit(value);
+        // Status, command list and thinking token updates arrive in every turn and carry nothing
+        // to read. A system event with its own text still gets a notice, since the thread
+        // does not show that text.
+        if (QUIET_SYSTEM.has(subtype ?? '') || !carriesText(value)) return;
+        return unknown(`system/${label(subtype)}`);
       case 'stream_event':
         return nested ? undefined : onStream(value);
       case 'assistant':
