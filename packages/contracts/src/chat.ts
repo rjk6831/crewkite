@@ -233,12 +233,12 @@ export const ConfigureChatThreadPayloadSchema = z.strictObject({
 });
 export const AcceptChatChangesPayloadSchema = z.strictObject({
   taskId: id('tsk'),
-  /** A new local branch name. The controller refuses an existing branch. */
+  /** A new local branch name in the form the publication path accepts: lower case, digits, / and -. */
   branch: z
     .string()
     .min(1)
     .max(200)
-    .regex(/^(?!.*(\.\.|\/\/|@\{|\\|\s))[A-Za-z0-9][A-Za-z0-9._/-]*[A-Za-z0-9]$/),
+    .regex(/^(?!.*\/\/)[a-z0-9][a-z0-9/-]*[a-z0-9]$/),
 });
 export const HandoffChatThreadPayloadSchema = z.strictObject({
   taskId: id('tsk'),
