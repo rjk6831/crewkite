@@ -17,6 +17,7 @@ import type {
 import { limitOffer, offerChoices } from './handoff-offer.ts';
 import {
   initialThreadState,
+  lastFamily,
   reduceThread,
   type ThreadEvent,
   type ThreadItem,
@@ -397,6 +398,25 @@ test('the limit offer shows only while the newest turn is the one that hit a lim
   // A stored stop reason decides before the failure kind. Turns without one keep the fallback above.
   assert.equal(reopened([stored(1, 'failed', 'client-exit', 'limit')])?.family, 'anthropic');
   assert.equal(reopened([stored(1, 'failed', 'usage-limit', 'error')]), null);
+
+  // A second opinion borrows another family for one turn. The picker still moves the thread away
+  // from the family that answered, so it never offers that family as the place to continue.
+  const advisor = id('trn', 3);
+  const advised = run([
+    begin(turn, 11),
+    agent(12, { type: 'text.completed', itemId: 'a', text: 'Done.' }),
+    end(turn, 13, 'done'),
+    on(advisor, 14, {
+      type: 'turn.started',
+      family: 'local',
+      model: 'local-1',
+      effort: 'default',
+      role: 'advisor',
+    }),
+    on(advisor, 15, { type: 'text.completed', itemId: 'a', text: 'Looks right.' }),
+    end(advisor, 16, 'done'),
+  ]);
+  assert.equal(lastFamily(advised), 'openai');
 });
 
 test('a reply restored from a thread read keeps the role of its turn for the badge', () => {

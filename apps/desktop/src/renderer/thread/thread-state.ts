@@ -387,8 +387,11 @@ export function latestContext(items: readonly ThreadItem[]): TurnView['context']
   return null;
 }
 
+// The family that answered last. A reviewer or advisor borrows a model for one turn and leaves the
+// thread where it was, so the handoff target and the second look skip those turns.
 export function lastFamily(items: readonly ThreadItem[]): ChatFamily | null {
   for (const item of items.toReversed())
-    if (item.kind === 'turn' && item.turn.identity) return item.turn.identity.family;
+    if (item.kind === 'turn' && item.turn.identity?.role === 'assistant')
+      return item.turn.identity.family;
   return null;
 }
