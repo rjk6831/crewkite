@@ -326,6 +326,112 @@ function statsNotice(rounds: readonly LLMPredictionStats[], totalSeconds: number
   ].join(', ');
 }
 
+// A chat template without native tool calls leaves the call in the reply text. These are the forms
+// small models write: the Hermes JSON form inside <tool_call>, the Qwen form with <function=name>
+// and <parameter=key> tags, the same with each parameter as its own <key> tag, and a bare
+// <function=name> block with no wrapper.
+export const TEXT_CALL_EXAMPLE =
+  '<tool_call>{"name": "read_range", "arguments": {"path": "src/main.py", "start": 1, "end": 40}}</tool_call>';
+const TEXT_CALL_OPENER = /<tool_call>|<function=/g;
+const TEXT_CALL_FUNCTION = /^<function=([^>]+)>([\s\S]*?)(?:<\/function>)?$/;
+const TEXT_CALL_PARAMETER =
+  /\s*(?:<parameter=([^>]+)>([\s\S]*?)<\/parameter>|<([A-Za-z_][\w-]*)>([\s\S]*?)<\/\3>)/y;
+const NUMBER = /^-?\d+(\.\d+)?$/;
+
+type LocalTool = (typeof LOCAL_TOOLS)[number];
+export type TextToolCall =
+  | { ok: true; name: string; arguments: Record<string, unknown> }
+  | { ok: false; error: string };
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+const unquote = (value: string) => value.trim().replace(/^["']|["']$/g, '');
+
+function readTextCall(body: string, tools: readonly LocalTool[]): TextToolCall {
+  const unreadable = {
+    ok: false,
+    error: `That tool call could not be read. Write it as ${TEXT_CALL_EXAMPLE}`,
+  } as const;
+  let name: unknown;
+  let args: unknown;
+  if (body.startsWith('{')) {
+    try {
+      const value: unknown = JSON.parse(body);
+      if (!isRecord(value)) return unreadable;
+      name = value.name;
+      args = value.arguments ?? value.parameters ?? {};
+      if (typeof args === 'string') args = JSON.parse(args);
+    } catch {
+      return unreadable;
+    }
+  } else {
+    const match = TEXT_CALL_FUNCTION.exec(body);
+    if (!match) return unreadable;
+    name = unquote(match[1]);
+    const values: Record<string, string> = {};
+    let read = 0;
+    TEXT_CALL_PARAMETER.lastIndex = 0;
+    for (
+      let found = TEXT_CALL_PARAMETER.exec(match[2]);
+      found;
+      found = TEXT_CALL_PARAMETER.exec(match[2])
+    ) {
+      // Qwen writes each value on its own lines. One newline on each side belongs to the markup.
+      values[unquote(found[1] ?? found[3])] = (found[2] ?? found[4]).replace(/^\r?\n|\r?\n$/g, '');
+      read = TEXT_CALL_PARAMETER.lastIndex;
+    }
+    if (match[2].slice(read).trim()) return unreadable;
+    args = values;
+  }
+  if (typeof name !== 'string' || !name || !isRecord(args)) return unreadable;
+  const tool = tools.find((candidate) => candidate.function.name === name);
+  if (!tool)
+    return {
+      ok: false,
+      error: `There is no tool named ${name.slice(0, 100)}. Use ${tools.map((candidate) => candidate.function.name).join(', ')}.`,
+    };
+  // Tag values are always text. A schema that wants a number gets one.
+  const schema: Record<string, { type?: string }> = tool.function.parameters.properties;
+  const numeric = (key: string) => /^(integer|number)$/.test(schema[key]?.type ?? '');
+  return {
+    ok: true,
+    name,
+    arguments: Object.fromEntries(
+      Object.entries(args).map(([key, value]) => [
+        key,
+        typeof value === 'string' && numeric(key) && NUMBER.test(value.trim())
+          ? Number(value)
+          : value,
+      ]),
+    ),
+  };
+}
+
+/**
+ * Tool calls a model wrote as text, in order, and the reply text around them. Only the tools
+ * offered this turn count. A block that cannot be read or names another tool comes back as an
+ * error the model reads. Nothing here throws.
+ */
+export function parseTextToolCalls(text: string, tools: readonly LocalTool[] = LOCAL_TOOLS) {
+  const calls: TextToolCall[] = [];
+  let rest = '';
+  let at = 0;
+  for (const open of text.matchAll(TEXT_CALL_OPENER)) {
+    if (open.index < at) continue;
+    rest += text.slice(at, open.index);
+    const wrapped = open[0] === '<tool_call>';
+    const close = wrapped ? '</tool_call>' : '</function>';
+    const end = text.indexOf(close, open.index + open[0].length);
+    // A stop string or the token limit can leave the last block open. Read what is there.
+    at = end < 0 ? text.length : end + close.length;
+    const body = wrapped
+      ? text.slice(open.index + open[0].length, end < 0 ? text.length : end)
+      : text.slice(open.index, at);
+    calls.push(readTextCall(body.trim(), tools));
+  }
+  return { calls, rest: rest + text.slice(at) };
+}
+
 export function localChatAdapter(deps: { connect: LocalConnect }): ChatAdapter {
   return {
     family: 'local',

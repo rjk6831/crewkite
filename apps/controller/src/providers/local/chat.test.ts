@@ -14,7 +14,7 @@ import type {
   Tool,
 } from '@lmstudio/sdk';
 import type { ChatHistoryEntry, ChatTurnHandle, ChatTurnRequest } from '../../chat/adapter.ts';
-import { type LoadedModelLike, localChatAdapter } from './chat.ts';
+import { type LoadedModelLike, localChatAdapter, parseTextToolCalls } from './chat.ts';
 
 // Frames assumed from @lmstudio/sdk 2.1.0, `LLMDynamicHandle.act` and `internalAct` in
 // dist/index.mjs. A live run against LM Studio confirms them.
@@ -375,6 +375,64 @@ test('the local client is disposed when the turn ends', async () => {
     }
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a tool call written as text parses in each form small models use', () => {
+  const read = { name: 'read_range', arguments: { path: 'src/a.ts', start: 1, end: 2 } };
+  const cases: [form: string, text: string, calls: unknown[], rest: string][] = [
+    [
+      'json',
+      'Reading.\n<tool_call>{"name": "read_range", "arguments": {"path": "src/a.ts", "start": 1, "end": 2}}</tool_call>',
+      [read],
+      'Reading.\n',
+    ],
+    [
+      'parameter tags',
+      '<tool_call><function=read_range><parameter=path>src/a.ts</parameter><parameter=start>1</parameter><parameter=end>2</parameter></function></tool_call>',
+      [read],
+      '',
+    ],
+    [
+      'a tag per parameter',
+      '<tool_call>\n<function=read_range>\n<path>src/a.ts</path>\n<parameter=start>\n1\n</parameter>\n<end>2</end>\n</function>\n</tool_call>',
+      [read],
+      '',
+    ],
+    [
+      'bare function',
+      '<function=search>\n<parameter=pattern>\ndef \n</parameter>\n</function>\nDone.',
+      [{ name: 'search', arguments: { pattern: 'def ' } }],
+      '\nDone.',
+    ],
+    [
+      'unknown tool',
+      '<tool_call>{"name": "list_files", "arguments": {}}</tool_call>',
+      ['There is no tool named list_files. Use read_range, search, edit, write, run.'],
+      '',
+    ],
+    [
+      'malformed',
+      '<tool_call>{"name": "read_range", "arguments": {"path": </tool_call> Then more.',
+      [/^That tool call could not be read\./],
+      ' Then more.',
+    ],
+    ['plain text', 'Use a <b> tag when a < b.', [], 'Use a <b> tag when a < b.'],
+  ];
+  for (const [form, text, calls, rest] of cases) {
+    const parsed = parseTextToolCalls(text);
+    assert.equal(parsed.calls.length, calls.length, form);
+    for (const [index, call] of parsed.calls.entries()) {
+      const expected = calls[index];
+      if (expected instanceof RegExp) assert.match(call.ok ? '' : call.error, expected, form);
+      else
+        assert.deepEqual(
+          call.ok ? { name: call.name, arguments: call.arguments } : call.error,
+          expected,
+          form,
+        );
+    }
+    assert.equal(parsed.rest, rest, form);
   }
 });
 
