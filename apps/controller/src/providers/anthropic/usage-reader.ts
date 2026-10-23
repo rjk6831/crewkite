@@ -8,22 +8,24 @@ const label = z
   .refine((value) => value.isWellFormed() && !/\p{Cc}/u.test(value));
 const timestamp = z.iso.datetime({ offset: true });
 const zero = z.literal(0);
-const session = z.strictObject({
+// The client ships weekly, so unknown keys pass everywhere. Only the gauge fields and the zero
+// values that prove no model ran stay pinned.
+const session = z.object({
   total_cost_usd: zero,
   total_api_duration_ms: zero,
   total_duration_ms: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   total_lines_added: zero,
   total_lines_removed: zero,
-  model_usage: z.record(z.string(), z.never()),
+  model_usage: z.record(z.string(), z.unknown()),
 });
 const scope = z
-  .strictObject({
-    model: z.strictObject({ display_name: label }).nullable().optional(),
-    surface: z.strictObject({ display_name: label }).nullable().optional(),
+  .object({
+    model: z.object({ display_name: label }).nullable().optional(),
+    surface: z.object({ display_name: label }).nullable().optional(),
   })
   .nullable()
   .optional();
-const row = z.strictObject({
+const row = z.object({
   kind: label,
   group: label,
   percent: z.number().finite().min(0).max(100),
@@ -32,40 +34,40 @@ const row = z.strictObject({
   severity: label,
   is_active: z.boolean(),
 });
-const extra = z.strictObject({
+const extra = z.object({
   is_enabled: z.boolean(),
   monthly_limit: z.number().finite().nonnegative().nullable(),
   used_credits: z.number().finite().nonnegative().nullable(),
   utilization: z.number().finite().nonnegative().nullable(),
   currency: label.nullable().optional(),
 });
-const report = z.strictObject({
+const report = z.object({
   session,
   rate_limits: z
-    .strictObject({
+    .object({
       limits: z.array(row).max(64).nullable(),
       extra_usage: extra.nullable().optional(),
     })
     .nullable(),
 });
-const zeroUsage = z.strictObject({
+const zeroUsage = z.object({
   input_tokens: zero,
   output_tokens: zero,
   cache_creation_input_tokens: zero.nullable().optional(),
   cache_read_input_tokens: zero.nullable().optional(),
   cache_creation: z
-    .strictObject({ ephemeral_1h_input_tokens: zero, ephemeral_5m_input_tokens: zero })
+    .object({ ephemeral_1h_input_tokens: zero, ephemeral_5m_input_tokens: zero })
     .nullable()
     .optional(),
   server_tool_use: z
-    .strictObject({ web_search_requests: zero, web_fetch_requests: zero })
+    .object({ web_search_requests: zero, web_fetch_requests: zero })
     .nullable()
     .optional(),
   service_tier: label.nullable().optional(),
   inference_geo: label.nullable().optional(),
   speed: label.nullable().optional(),
   iterations: z.array(z.never()).nullable().optional(),
-  output_tokens_details: z.strictObject({ thinking_tokens: zero.optional() }).nullable().optional(),
+  output_tokens_details: z.object({ thinking_tokens: zero.optional() }).nullable().optional(),
   fallback_credit: z.null().optional(),
 });
 const identity = { session_id: z.uuid(), uuid: z.uuid() };
@@ -77,7 +79,7 @@ const init = z.object({
   mcp_servers: z.array(z.never()),
   plugins: z.array(z.never()).optional(),
 });
-const localOutput = z.strictObject({
+const localOutput = z.object({
   ...identity,
   type: z.literal('system'),
   subtype: z.literal('local_command_output'),
@@ -87,7 +89,7 @@ const localReport = z.object({
   ...identity,
   type: z.literal('assistant'),
   parent_tool_use_id: z.null(),
-  local_command_run: z.strictObject({ command: z.literal('usage'), args: z.literal('') }),
+  local_command_run: z.object({ command: z.literal('usage'), args: z.literal('') }),
   local_command_outcome: z.never().optional(),
   usage_report: report,
   batch_tool_uses: z.array(z.never()).optional(),
@@ -97,23 +99,23 @@ const localReport = z.object({
   message: z.object({
     role: z.literal('assistant'),
     content: z
-      .array(z.strictObject({ type: z.literal('text'), text: z.string().max(maximumStdoutBytes) }))
+      .array(z.object({ type: z.literal('text'), text: z.string().max(maximumStdoutBytes) }))
       .max(4),
     stop_reason: z.literal('end_turn'),
     usage: zeroUsage.optional(),
   }),
 });
-const noSubagents = z.strictObject({
+const noSubagents = z.object({
   spawned: zero,
-  requested: z.strictObject({ background: zero, foreground: zero, unset: zero }),
+  requested: z.object({ background: zero, foreground: zero, unset: zero }),
   started_in_background: zero,
   by_type: z.record(z.string(), zero),
   max_depth: zero,
   spawned_by_subagents: zero,
   completed: zero,
   failed: zero,
-  killed: z.strictObject({ parent: zero, user: zero, system: zero }),
-  refused: z.strictObject({ depth_limit: zero, concurrency_limit: zero, budget: zero }),
+  killed: z.object({ parent: zero, user: zero, system: zero }),
+  refused: z.object({ depth_limit: zero, concurrency_limit: zero, budget: zero }),
 });
 const terminal = z.object({
   ...identity,
@@ -123,7 +125,7 @@ const terminal = z.object({
   num_turns: zero,
   duration_api_ms: zero,
   total_cost_usd: zero,
-  modelUsage: z.record(z.string(), z.never()),
+  modelUsage: z.record(z.string(), z.unknown()),
   usage: zeroUsage,
   permission_denials: z.array(z.never()),
   deferred_tool_use: z.never().optional(),
