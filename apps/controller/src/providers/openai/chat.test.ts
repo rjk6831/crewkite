@@ -340,19 +340,38 @@ test('a command approval holds the turn until respondPermission answers it', asy
 
 test('a command kind the thread allows is answered without asking only inside the scratch copy', async () => {
   // Every row holds a command grant. Only a command run from inside the copy is answered from it,
-  // with no respondPermission call. A network prompt has no cwd, so it goes to the person.
+  // with no respondPermission call. A network prompt names its host and goes to the person under
+  // every policy.
+  const network = {
+    question: 'Allow network access to registry.npmjs.org over HTTPS?',
+    detail: 'Host: registry.npmjs.org\nProtocol: HTTPS\n\npnpm test\n\nRuns the test suite.',
+  };
   const rows: Array<{
+    policy?: ChatPermissionPolicy;
     detail: { cwd?: string; network?: boolean };
     answered: string[];
     decision: string;
+    asked?: { question: string; detail: string };
   }> = [
     { detail: { cwd: '.' }, answered: ['allow-thread'], decision: 'acceptForSession' },
     { detail: { cwd: '..' }, answered: [], decision: 'decline' },
-    { detail: { network: true }, answered: [], decision: 'decline' },
+    { detail: { network: true }, answered: [], decision: 'decline', asked: network },
+    {
+      policy: 'allow-all',
+      detail: { network: true },
+      answered: [],
+      decision: 'decline',
+      asked: network,
+    },
   ];
   for (const row of rows) {
-    const run = turn('approval', { permissionGrants: ['command'], detail: row.detail });
+    const run = turn('approval', {
+      permissionPolicy: row.policy,
+      permissionGrants: ['command'],
+      detail: row.detail,
+    });
     const asked = await run.when('permission.requested');
+    if (row.asked) assert.deepEqual({ question: asked.question, detail: asked.detail }, row.asked);
     const answered = run.events.flatMap((event) =>
       event.type === 'permission.resolved' ? [event.choice] : [],
     );

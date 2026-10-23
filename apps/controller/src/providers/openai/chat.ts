@@ -264,7 +264,17 @@ const approval = z.object({
   command: maybe(z.string()),
   cwd: maybe(z.string()),
   grantRoot: maybe(z.string()),
+  // A network access prompt names the host and protocol here and leaves out the command and cwd.
+  networkApprovalContext: maybe(
+    z.object({ host: z.string().min(1), protocol: maybe(z.string().min(1)) }),
+  ),
 });
+const PROTOCOLS = new Map([
+  ['http', 'HTTP'],
+  ['https', 'HTTPS'],
+  ['socks5Tcp', 'SOCKS5 TCP'],
+  ['socks5Udp', 'SOCKS5 UDP'],
+]);
 
 type RpcId = z.output<typeof rpcId>;
 type Reply = { result: unknown } | { error: z.output<typeof rpcError> };
@@ -641,7 +651,13 @@ class OpenAiChatTurn {
     }
     const value = approval.safeParse(params).data;
     const callId = value?.itemId ?? null;
+    const network = kind === 'command' ? value?.networkApprovalContext : null;
+    const host = network ? clip(network.host, 1024) : '';
+    const protocol = network?.protocol
+      ? (PROTOCOLS.get(network.protocol) ?? clip(network.protocol, 40))
+      : '';
     const detail = [
+      network ? `Host: ${host}${protocol ? `\nProtocol: ${protocol}` : ''}` : '',
       value?.command ?? (callId ? this.tools.get(callId) : undefined) ?? '',
       value?.reason ?? '',
       value?.grantRoot ? `Grants write access to ${value.grantRoot}.` : '',
@@ -655,20 +671,26 @@ class OpenAiChatTurn {
       turnId: this.request.turnId,
       requestId: answerId,
       callId,
-      question: kind === 'command' ? 'Run this command?' : 'Apply these file changes?',
+      question: network
+        ? `Allow network access to ${host}${protocol ? ` over ${protocol}` : ''}?`
+        : kind === 'command'
+          ? 'Run this command?'
+          : 'Apply these file changes?',
       detail: detail ? clip(detail, 16_384) : null,
       options: OPTIONS,
     });
     const policy = this.request.permissionPolicy;
     // Review and advice turns read only.
     if (this.request.readOnly) return this.answer(answerId, 'deny');
+    // Network access reaches past the scratch copy, and no policy or grant covers a host, so the
+    // person decides each one.
+    if (network) return;
     // allow-all answers every command. Edits land only in the scratch copy, so under allow-all an
     // edit passes the same check as under allow-edits.
     if (policy === 'allow-all' && kind === 'command') return this.answer(answerId, 'allow-once');
     // From here every automatic answer covers the scratch copy only. A change with no reported
     // paths, a path or grant root outside scratch, or a command with no cwd or a cwd outside it
-    // goes to the person. A network access prompt arrives as a command approval with no command
-    // and no cwd, so a command grant never answers it.
+    // goes to the person.
     const paths = callId ? (this.edits.get(callId) ?? []) : [];
     const grantRoot = value?.grantRoot ? this.local(value.grantRoot) : '';
     const contained =
