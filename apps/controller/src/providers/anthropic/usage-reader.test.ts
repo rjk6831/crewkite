@@ -84,6 +84,34 @@ test('a usage read maps each reported limit and ignores what it does not show', 
       windows: [...reported, usageWindow('monthly_pool', 0, null)],
     },
     {
+      name: 'a limit it cannot read is dropped and the others stay',
+      input: bytes([
+        init,
+        withLimits([
+          ...limits,
+          { ...limits[0], kind: 'monthly_pool', percent: null },
+          { ...limits[1], kind: 'daily_pool', resets_at: '2026-10-30T07:00:00' },
+        ]),
+        terminal,
+      ]),
+      windows: reported,
+    },
+    {
+      name: 'a scoped model name with a dot and a space takes the model ID form',
+      input: bytes([
+        init,
+        withLimits([
+          ...limits.slice(0, 2),
+          { ...limits[2], scope: { model: { display_name: 'Opus 4.1' } } },
+        ]),
+        terminal,
+      ]),
+      windows: [
+        ...reported.slice(0, 2),
+        usageWindow('weekly-opus-4-1', 81, '2026-10-30T07:00:00.449Z'),
+      ],
+    },
+    {
       name: 'unknown fields and frames',
       input: bytes([
         { ...init, ...later },
@@ -123,8 +151,8 @@ test('a usage read maps each reported limit and ignores what it does not show', 
       error: 'client-error',
     },
     {
-      name: 'unreadable limit',
-      input: bytes([init, withLimits([{ ...limits[0], percent: '50%' }]), terminal]),
+      name: 'unreadable limit list',
+      input: bytes([init, withLimits({ session: 50 }), terminal]),
       error: 'unreadable-report',
     },
     { name: 'not JSON', input: Buffer.from('{\n'), error: 'not-json' },

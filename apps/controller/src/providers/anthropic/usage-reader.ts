@@ -9,7 +9,8 @@ const name = z
   .refine((value) => value.isWellFormed() && !/\p{Cc}/u.test(value));
 const timestamp = z.iso.datetime({ offset: true });
 // The client adds fields and frames from one weekly build to the next. These schemas hold only
-// what the gauge shows, so anything else the client prints is ignored and never fails a read.
+// what the gauge shows, so anything else the client prints is ignored and never fails a read. A
+// limit entry this schema cannot read is dropped, and the others still reach the gauge.
 const limit = z.object({
   kind: name,
   percent: z.number().finite().nonnegative(),
@@ -19,7 +20,7 @@ const limit = z.object({
 const report = z.object({
   rate_limits: z
     .object({
-      limits: z.array(limit).max(64).nullish(),
+      limits: z.array(z.unknown()).max(64).nullish(),
       // The switch is a display fact. A change in its shape drops it and keeps the gauge.
       extra_usage: z.object({ is_enabled: z.boolean() }).nullish().catch(null),
     })
@@ -89,7 +90,9 @@ export function anthropicUsageReaderPlan(input: { clientSha256: string; sessionI
 export type AnthropicUsageReaderPlan = ReturnType<typeof anthropicUsageReaderPlan>;
 
 // The client reports used percent and the gauge shows what is left. A limit past its cap has
-// nothing left. The window IDs match the five-hour and weekly windows of the other families.
+// nothing left. The window IDs match the five-hour and weekly windows of the other families. A
+// scoped window takes the model's display name in the model ID form, so Opus 4.1 becomes
+// weekly-opus-4-1.
 function usageWindow(value: z.output<typeof limit>) {
   const model = value.scope?.model?.display_name;
   return {
@@ -99,7 +102,7 @@ function usageWindow(value: z.output<typeof limit>) {
         : value.kind === 'weekly_all'
           ? 'weekly'
           : value.kind === 'weekly_scoped' && model
-            ? `weekly-${model.toLowerCase().replace(/\s+/g, '-')}`
+            ? `weekly-${model.toLowerCase().replace(/[\s.]+/g, '-')}`
             : value.kind,
     remaining: { value: Math.max(0, 100 - value.percent), unit: 'percent' as const },
     resetsAt: value.resets_at ? new Date(value.resets_at).toISOString() : null,
@@ -151,7 +154,11 @@ export class AnthropicUsageReader {
       try {
         const parsed = report.parse(fields.usage_report).rate_limits;
         this.reading = {
-          windows: parsed?.limits?.map(usageWindow) ?? null,
+          windows:
+            parsed?.limits?.flatMap((entry) => {
+              const value = limit.safeParse(entry);
+              return value.success ? [usageWindow(value.data)] : [];
+            }) ?? null,
           extraUsage: parsed?.extra_usage ?? null,
         };
       } catch {
