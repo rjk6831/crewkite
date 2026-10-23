@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import { type AgentEvent, AgentEventSchema } from '@crewkite/contracts';
 import type {
   ChatInput,
+  ChatMessage,
   GuardToolCallController,
   LLM,
   LLMPredictionStats,
@@ -40,8 +41,11 @@ type Step =
   | { wait: () => void };
 type Round = { steps: Step[]; stats: Partial<LLMPredictionStats> };
 
+// The scripted rounds run across `act` calls, the way one model keeps answering a growing chat.
 function fakeModel(rounds: Round[], clock: { now: number }) {
   const calls: { chat: ChatInput; tools: Tool[]; signal?: AbortSignal }[] = [];
+  let next = 0;
+  let callId = 0;
   const model: LoadedModelLike = {
     countTokens: async (text) => Math.ceil(text.length / 4),
     async act(chat, tools, options) {
@@ -54,25 +58,30 @@ function fakeModel(rounds: Round[], clock: { now: number }) {
         } as PredictionResult);
         return;
       }
-      let callId = 0;
-      for (const [roundIndex, round] of rounds.entries()) {
+      for (let roundIndex = 0; next < rounds.length; roundIndex++) {
+        const round = rounds[next++];
+        let content = '';
+        let native = false;
         for (const step of round.steps) {
           options.signal?.throwIfAborted();
-          if ('text' in step || 'reasoning' in step)
+          if ('text' in step || 'reasoning' in step) {
+            const fragment = 'text' in step ? step.text : step.reasoning;
+            content += fragment;
             options.onPredictionFragment?.({
               roundIndex,
-              content: 'text' in step ? step.text : step.reasoning,
+              content: fragment,
               reasoningType: 'text' in step ? 'none' : 'reasoning',
               tokensCount: 1,
               containsDrafted: false,
               isStructural: false,
             });
-          else if ('wait' in step)
+          } else if ('wait' in step)
             await new Promise((_, reject) => {
               options.signal?.addEventListener('abort', () => reject(new Error('cancelled')));
               step.wait();
             });
           else {
+            native = true;
             const tool = tools.find((candidate) => candidate.name === step.call) as RawFunctionTool;
             const id = callId++;
             let allowed = false;
@@ -96,7 +105,15 @@ function fakeModel(rounds: Round[], clock: { now: number }) {
         clock.now += 1000;
         const stats = { stopReason: 'eosFound', ...round.stats };
         options.onPredictionCompleted?.({ stats } as PredictionResult);
+        options.onMessage?.({
+          getRole: () => 'assistant',
+          getText: () => content,
+          getToolCallRequests: () => [],
+          getToolCallResults: () => [],
+        } as unknown as ChatMessage);
         options.onRoundEnd?.(roundIndex);
+        // The runtime ends `act` after a round without a native call.
+        if (!native) return;
       }
     },
   };
@@ -307,6 +324,118 @@ test('a local turn streams, reads freely, edits after permission and reports its
       chat.slice(1).map((message) => message.content),
       ['Rename n to count in src/a.ts.', result.assistantText, 'Thanks.'],
     );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('tool calls written as text run through the same gate and their results go back', async () => {
+  const { root, scratch, clock, request } = fixture();
+  try {
+    const json =
+      '<tool_call>{"name": "read_range", "arguments": {"path": "src/a.ts", "start": 1, "end": 2}}</tool_call>';
+    const tagged =
+      '<tool_call>\n<function=edit>\n<path>src/a.ts</path>\n<parameter=old>\nexport const n = 1;\n</parameter>\n<parameter=new>\nexport const count = 1;\n</parameter>\n</function>\n</tool_call>';
+    const stats = (promptTokensCount: number, predictedTokensCount: number) => ({
+      promptTokensCount,
+      predictedTokensCount,
+      tokensPerSecond: 20,
+    });
+    const { model, calls } = fakeModel(
+      [
+        {
+          // The opening tag arrives split across fragments.
+          steps: [
+            { reasoning: 'Let me read the file.' },
+            { text: 'Reading src/a.ts.\n<tool' },
+            { text: json.slice(5, 40) },
+            { text: json.slice(40) },
+          ],
+          stats: stats(900, 40),
+        },
+        { steps: [{ text: tagged }], stats: stats(1100, 60) },
+        {
+          steps: [{ text: '<function=read_range><parameter=path>src/a.ts</function>' }],
+          stats: stats(1300, 20),
+        },
+        { steps: [{ text: 'Renamed n to count.' }], stats: stats(1400, 10) },
+      ],
+      clock,
+    );
+    const turn = start(model, 8192, request(0));
+    const result = await turn.handle.result;
+    const { events } = turn;
+
+    assert.deepEqual(
+      events.map((event) => event.type),
+      [
+        'turn.started',
+        'thinking.delta',
+        'thinking.completed',
+        'text.delta',
+        'text.completed',
+        'tool.started',
+        'tool.output',
+        'tool.completed',
+        'tool.started',
+        'permission.requested',
+        'permission.resolved',
+        'tool.output',
+        'tool.completed',
+        'text.delta',
+        'text.completed',
+        'text.delta',
+        'text.completed',
+        'provider.notice',
+        'usage.context',
+        'turn.completed',
+      ],
+    );
+    const started = events.filter((event) => event.type === 'tool.started');
+    assert.deepEqual(
+      started.map((event) => [event.kind, event.title]),
+      [
+        ['read', 'Read src/a.ts:1-2'],
+        ['edit', 'Edit src/a.ts'],
+      ],
+    );
+    const asked = events.find((event) => event.type === 'permission.requested');
+    assert.equal(asked?.callId, started[1].callId);
+    assert.deepEqual(
+      events.flatMap((event) => (event.type === 'text.delta' ? [event.text] : [])),
+      [
+        'Reading src/a.ts.\n',
+        'The model wrote a tool call this app could not read.',
+        'Renamed n to count.',
+      ],
+    );
+    assert.equal(
+      readFileSync(join(scratch, 'src/a.ts'), 'utf8'),
+      'export const count = 1;\nexport const twice = n * 2;\n',
+    );
+
+    // Each result goes back after the model's own words, and the next round starts from there.
+    assert.equal(calls.length, 4);
+    assert.match(calls[1].chat.at(-2)?.content ?? '', /Reading src\/a\.ts\.\n<tool_call>\{"name"/);
+    assert.deepEqual(calls[1].chat.at(-1), {
+      role: 'user',
+      content:
+        '<tool_response>\nsrc/a.ts lines 1-2 of 2\n1: export const n = 1;\n2: export const twice = n * 2;\n</tool_response>',
+    });
+    assert.match(calls[2].chat.at(-1)?.content ?? '', /^<tool_response>\nEdited src\/a\.ts\./);
+    assert.match(calls[3].chat.at(-1)?.content ?? '', /That tool call could not be read/);
+    assert.equal(calls[3].chat.length, 8);
+
+    assert.deepEqual(
+      events.filter((event) => event.type === 'provider.notice').map((event) => event.message),
+      ['Local: 1,400 in, 130 out, 20 tok/s, 4.0 s total'],
+    );
+    assert.equal(result.stopReason, 'done');
+    assert.equal(
+      result.assistantText,
+      'Reading src/a.ts.\n\n\nThe model wrote a tool call this app could not read.\n\nRenamed n to count.',
+    );
+    assert.deepEqual(result.changedPaths, ['src/a.ts']);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

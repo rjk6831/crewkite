@@ -4,6 +4,8 @@ import { dirname, join } from 'node:path';
 import type { AgentEvent, ChatFailure, ChatPermissionOption } from '@crewkite/contracts';
 import type {
   ChatInput,
+  ChatMessage,
+  ChatMessageInput,
   LLMActionOpts,
   LLMPredictionStats,
   PredictionResult,
@@ -55,7 +57,14 @@ export type LocalConnect = (request: ChatTurnRequest) => Promise<{
 }>;
 
 const MAX_TOOL_CALLS = 12;
+// Each round gets tools until the last one, which must answer in text.
+const MAX_ROUNDS = MAX_TOOL_CALLS + 2;
 const CHANGING_TOOLS = new Set<string>(['edit', 'write', 'run']);
+// Review and advice turns read only.
+const offeredTools = (request: ChatTurnRequest) =>
+  LOCAL_TOOLS.filter(
+    ({ function: definition }) => !request.readOnly || !CHANGING_TOOLS.has(definition.name),
+  );
 const OUTPUT_SHARE = 0.25;
 const MAP_SHARE = 0.18;
 const SUMMARY_SHARE = 0.6;
@@ -432,6 +441,46 @@ export function parseTextToolCalls(text: string, tools: readonly LocalTool[] = L
   return { calls, rest: rest + text.slice(at) };
 }
 
+const TEXT_CALL_OPENERS = ['<tool_call>', '<function='];
+const UNREADABLE_CALL = 'The model wrote a tool call this app could not read.';
+
+/**
+ * Where streamed reply text has to start waiting: at the first opening tag, or at a tail that could
+ * still grow into one. `open` is true once a whole opening tag is there.
+ */
+function heldFrom(text: string) {
+  const at = text.search(TEXT_CALL_OPENER);
+  if (at >= 0) return { at, open: true };
+  for (let size = Math.min(text.length, 10); size > 0; size--)
+    if (TEXT_CALL_OPENERS.some((opener) => opener.startsWith(text.slice(-size))))
+      return { at: text.length - size, open: false };
+  return { at: text.length, open: false };
+}
+
+const toolResponse = (output: string) => `<tool_response>\n${output}\n</tool_response>`;
+
+/**
+ * A finished message carried into the next `act` call. Native calls and their results are written
+ * as <tool_call> and <tool_response> text, so the carried history stays plain messages.
+ */
+function plainMessage(message: ChatMessage): ChatMessageInput {
+  if (message.getRole() === 'tool')
+    return {
+      role: 'user',
+      content: message
+        .getToolCallResults()
+        .map((result) => toolResponse(result.content))
+        .join('\n'),
+    };
+  const calls = message
+    .getToolCallRequests()
+    .map(
+      (call) =>
+        `<tool_call>${JSON.stringify({ name: call.name, arguments: call.arguments ?? {} })}</tool_call>`,
+    );
+  return { role: 'assistant', content: [message.getText(), ...calls].filter(Boolean).join('\n') };
+}
+
 export function localChatAdapter(deps: { connect: LocalConnect }): ChatAdapter {
   return {
     family: 'local',
@@ -494,6 +543,45 @@ function startLocalTurn(
     emit({ type: 'thinking.delta', turnId, itemId: thinking, text: chunk });
   };
 
+  // A model without native tool calls writes them into its reply. From the first opening tag on,
+  // the round's text waits for the round to end, so markup never reaches the thread as text.
+  const offered = offeredTools(request);
+  let held = '';
+  let holding = false;
+  let nativeRound = false;
+  let written: TextToolCall[] = [];
+  const speak = (chunk: string) => {
+    if (holding) {
+      held += chunk;
+      return;
+    }
+    const value = held + chunk;
+    const from = heldFrom(value);
+    say(value.slice(0, from.at));
+    held = value.slice(from.at);
+    holding = from.open;
+  };
+  const settleRound = () => {
+    const parsed = holding ? parseTextToolCalls(held, offered) : null;
+    const value = held;
+    const native = nativeRound;
+    held = '';
+    holding = false;
+    nativeRound = false;
+    if (!parsed?.calls.length) {
+      say(value);
+      return;
+    }
+    if (parsed.rest.trim()) say(parsed.rest);
+    // The runtime runs the calls it reported. Running the written ones too would run them twice.
+    if (native) return;
+    if (parsed.calls.some((call) => !call.ok)) {
+      closeText();
+      say(UNREADABLE_CALL);
+    }
+    written.push(...parsed.calls);
+  };
+
   let release!: () => void;
   const released = new Promise<void>((resolve) => {
     release = resolve;
@@ -547,50 +635,17 @@ function startLocalTurn(
     return answer;
   };
 
-  const prepared = new Map<number, PreparedTool>();
-  const tools = LOCAL_TOOLS.filter(
-    // Review and advice turns read only.
-    ({ function: definition }) => !request.readOnly || !CHANGING_TOOLS.has(definition.name),
-  ).map(
-    ({ function: definition }): Tool => ({
-      type: 'rawFunction',
-      name: definition.name,
-      description: definition.description,
-      parametersJsonSchema: definition.parameters,
-      // prepareTool checks arguments, so a bad call gets a tool card and an answer the model reads.
-      checkParameters: () => {},
-      implementation: async (_parameters, context) => {
-        const callId = `${turnId}:call-${context.callId}`;
-        const tool = prepared.get(context.callId);
-        prepared.delete(context.callId);
-        if (!tool) return 'The call was not checked and did not run.';
-        const outcome = await tool.execute();
-        if (tool.name !== 'run')
-          emit({
-            type: 'tool.output',
-            turnId,
-            callId,
-            chunk: fitBytes(outcome.output, OUTPUT_BYTES),
-          });
-        if (outcome.changedPath) changed.add(outcome.changedPath);
-        emit({
-          type: 'tool.completed',
-          turnId,
-          callId,
-          status: outcome.status,
-          ...(outcome.diff ? { diff: outcome.diff } : {}),
-          summary: outcome.output.split('\n', 1)[0].slice(0, 200),
-        });
-        return outcome.output;
-      },
-    }),
-  );
-
-  const guardToolCall: LLMActionOpts['guardToolCall'] = async (_round, sdkCallId, guard) => {
+  /**
+   * Check, gate and plan one call. Native calls and calls written as text both come through here,
+   * so they share the call limit, the permission prompt and the tool card.
+   */
+  const admit = async (
+    callId: string,
+    name: string,
+    input: unknown,
+  ): Promise<{ tool: PreparedTool } | { refused: string }> => {
     closeText();
     closeThinking();
-    const callId = `${turnId}:call-${sdkCallId}`;
-    const input = guard.toolCallRequest.arguments ?? {};
     let streamed = 0;
     // A per-call context: `permitted` turns true only after the person allows a command.
     const context = {
@@ -613,11 +668,11 @@ function startLocalTurn(
         streamed = truncated ? OUTPUT_BYTES + 1 : streamed + bytes;
       },
     };
-    const tool = prepareTool(guard.toolCallRequest.name, input, context);
+    const tool = prepareTool(name, input, context);
     emit({ type: 'tool.started', turnId, callId, kind: tool.kind, title: tool.title, input });
-    const refuse = (status: 'error' | 'denied', summary: string, reason: string) => {
+    const refuse = (status: 'error' | 'denied', summary: string, refused: string) => {
       emit({ type: 'tool.completed', turnId, callId, status, summary });
-      guard.deny(reason);
+      return { refused };
     };
     if (++toolCalls > MAX_TOOL_CALLS)
       return refuse(
@@ -655,8 +710,70 @@ function startLocalTurn(
       if (choice === 'allow-thread' && !granted) grants.add(gate);
     }
     context.permitted = true;
-    prepared.set(sdkCallId, tool);
+    return { tool };
+  };
+
+  /** Run an admitted call and return what the model reads. */
+  const execute = async (callId: string, tool: PreparedTool) => {
+    const outcome = await tool.execute();
+    if (tool.name !== 'run')
+      emit({ type: 'tool.output', turnId, callId, chunk: fitBytes(outcome.output, OUTPUT_BYTES) });
+    if (outcome.changedPath) changed.add(outcome.changedPath);
+    emit({
+      type: 'tool.completed',
+      turnId,
+      callId,
+      status: outcome.status,
+      ...(outcome.diff ? { diff: outcome.diff } : {}),
+      summary: outcome.output.split('\n', 1)[0].slice(0, 200),
+    });
+    return outcome.output;
+  };
+
+  const prepared = new Map<number, PreparedTool>();
+  const tools = offered.map(
+    ({ function: definition }): Tool => ({
+      type: 'rawFunction',
+      name: definition.name,
+      description: definition.description,
+      parametersJsonSchema: definition.parameters,
+      // prepareTool checks arguments, so a bad call gets a tool card and an answer the model reads.
+      checkParameters: () => {},
+      implementation: async (_parameters, context) => {
+        const tool = prepared.get(context.callId);
+        prepared.delete(context.callId);
+        if (!tool) return 'The call was not checked and did not run.';
+        return execute(`${turnId}:call-${context.callId}`, tool);
+      },
+    }),
+  );
+
+  const guardToolCall: LLMActionOpts['guardToolCall'] = async (_round, sdkCallId, guard) => {
+    nativeRound = true;
+    const call = guard.toolCallRequest;
+    const verdict = await admit(`${turnId}:call-${sdkCallId}`, call.name, call.arguments ?? {});
+    if ('refused' in verdict) return guard.deny(verdict.refused);
+    prepared.set(sdkCallId, verdict.tool);
     guard.allow();
+  };
+
+  // Written calls run in order through the same gate as native ones. Their results go back in one
+  // user message, wrapped the way Hermes and Qwen chat templates wrap tool results.
+  let textCalls = 0;
+  const runWritten = async (calls: readonly TextToolCall[]) => {
+    const results: string[] = [];
+    for (const call of calls) {
+      if (!call.ok) {
+        results.push(toolResponse(call.error));
+        continue;
+      }
+      const callId = `${turnId}:text-call-${++textCalls}`;
+      const verdict = await admit(callId, call.name, call.arguments);
+      results.push(
+        toolResponse('refused' in verdict ? verdict.refused : await execute(callId, verdict.tool)),
+      );
+    }
+    return results.join('\n');
   };
 
   const run = async (): Promise<ChatTurnResult> => {
@@ -745,33 +862,59 @@ function startLocalTurn(
       return finish('done', null);
     }
 
+    // `act` runs rounds until one ends without a native call. When that round wrote its calls as
+    // text, they run here and `act` starts again with the results, inside the same round budget.
+    let chat = prompt.chat;
     try {
-      await bounded(
-        model.act(prompt.chat, tools, {
-          maxTokens: Math.floor(contextLength * OUTPUT_SHARE),
-          contextOverflowPolicy: 'stopAtLimit',
-          // Each round gets tools until the last one, which must answer in text.
-          maxPredictionRounds: MAX_TOOL_CALLS + 2,
-          signal: abort.signal,
-          onPredictionFragment: (fragment) => {
-            if (ending || fragment.isStructural) return;
-            if (fragment.reasoningType === 'reasoning') think(fragment.content);
-            else if (fragment.reasoningType === 'none') say(fragment.content);
-          },
-          onRoundEnd: () => {
-            closeText();
-            closeThinking();
-          },
-          onPredictionCompleted: (result) => {
-            rounds.push(result.stats);
-          },
-          guardToolCall,
-          handleInvalidToolRequest: (error, call) => {
-            notice('warning', 'Local: the model sent a tool call CrewKite could not read.');
-            return call ? `That tool call was invalid: ${error.message}` : undefined;
-          },
-        }),
-      );
+      for (;;) {
+        const appended: ChatInput = [];
+        written = [];
+        await bounded(
+          model.act(chat, tools, {
+            maxTokens: Math.floor(contextLength * OUTPUT_SHARE),
+            contextOverflowPolicy: 'stopAtLimit',
+            maxPredictionRounds: MAX_ROUNDS - rounds.length,
+            signal: abort.signal,
+            onPredictionFragment: (fragment) => {
+              if (ending || fragment.isStructural) return;
+              if (fragment.reasoningType === 'reasoning') think(fragment.content);
+              else if (fragment.reasoningType === 'none') speak(fragment.content);
+            },
+            onMessage: (message) => {
+              appended.push(plainMessage(message));
+            },
+            onRoundEnd: () => {
+              settleRound();
+              closeText();
+              closeThinking();
+            },
+            onPredictionCompleted: (result) => {
+              rounds.push(result.stats);
+            },
+            guardToolCall,
+            handleInvalidToolRequest: (error, call) => {
+              notice('warning', 'Local: the model sent a tool call CrewKite could not read.');
+              if (!call) return undefined;
+              // The SDK answers this call and starts another round on its own.
+              nativeRound = true;
+              return `That tool call was invalid: ${error.message}`;
+            },
+          }),
+        );
+        const cut = rounds.some((stats) =>
+          ['contextLengthReached', 'modelUnloaded'].includes(stats.stopReason),
+        );
+        if (ending || cut || !written.length) break;
+        if (rounds.length >= MAX_ROUNDS) {
+          notice(
+            'warning',
+            'Local: the model was still calling tools when the turn ran out of rounds.',
+          );
+          break;
+        }
+        const results = await bounded(runWritten(written));
+        chat = [...chat, ...appended, { role: 'user', content: results }];
+      }
     } catch (error) {
       return ending ? ended() : finish('error', streamFailure(error));
     }
