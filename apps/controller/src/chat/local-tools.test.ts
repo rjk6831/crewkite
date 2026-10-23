@@ -82,6 +82,11 @@ test('tools refuse paths that leave the scratch copy', async () => {
         /outside the project/,
       ],
       ['read_range', { path: 'link/secret.txt', start: 1, end: 1 }, /through a link/],
+      [
+        'read_range',
+        { path: join(scratch, '..', 'outside', 'secret.txt'), start: 1, end: 1 },
+        /outside the project/,
+      ],
       ['write', { path: 'link/new.txt', content: 'x' }, /through a link/],
       ['write', { path: 'dangling.txt', content: 'x' }, /through a link/],
       ['edit', { path: '.git/config', old: '[core]', new: '[hooks]' }, /inside \.git/],
@@ -92,6 +97,15 @@ test('tools refuse paths that leave the scratch copy', async () => {
     }
     assert.equal(existsSync(join(outside, 'new.txt')), false);
     assert.equal(existsSync(join(outside, 'later.txt')), false);
+    // A model copies the absolute path it was shown. Inside the copy, it is the same file.
+    writeFileSync(join(scratch, 'inside.txt'), 'kept\n');
+    const absolute = await runTool(
+      'read_range',
+      { path: join(scratch, 'inside.txt'), start: 1, end: 1 },
+      context,
+    );
+    assert.equal(absolute.status, 'ok', absolute.output);
+    assert.match(absolute.output, /kept/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

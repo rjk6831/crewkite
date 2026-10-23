@@ -153,6 +153,15 @@ class ToolError extends Error {}
 
 /** Resolve a model-supplied path inside scratch. Rejects absolute paths, `..`, .git and escaping symlinks. */
 export function scratchPath(scratch: string, value: string) {
+  // Models copy the absolute path they were shown. One inside the copy is the same file.
+  if (isAbsolute(value) && value.length <= 1024 && !value.includes('\0'))
+    for (const base of [scratch, realpathSync(scratch)]) {
+      const within = relative(base, resolve(value));
+      if (within && !within.startsWith('..') && !isAbsolute(within)) {
+        value = within.split(sep).join('/');
+        break;
+      }
+    }
   const parts = value.split(/[\\/]+/);
   if (
     !value ||
