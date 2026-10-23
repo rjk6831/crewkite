@@ -136,15 +136,23 @@ function fixture() {
 function start(model: LoadedModelLike, contextLength: number, request: ChatTurnRequest) {
   const events: AgentEvent[] = [];
   let handle: ChatTurnHandle | undefined;
+  let disposals = 0;
   const adapter = localChatAdapter({
-    connect: async () => ({ model, contextLength, modelKey: 'local-fixture' }),
+    connect: async () => ({
+      model,
+      contextLength,
+      modelKey: 'local-fixture',
+      dispose: async () => {
+        disposals++;
+      },
+    }),
   });
   handle = adapter.startTurn(request, (event) => {
     events.push(AgentEventSchema.parse(event));
     if (event.type === 'permission.requested')
       handle?.respondPermission(event.requestId, 'allow-once');
   });
-  return { events, handle };
+  return { events, handle, disposals: () => disposals };
 }
 
 test('a local turn streams, reads freely, edits after permission and reports its stats', async () => {
@@ -315,6 +323,36 @@ test('stop cancels the model mid-turn and ends the turn as stopped', async () =>
       failure: result.failure,
     });
     assert.ok(!JSON.stringify(turn.events).includes('Never sent.'));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('the local client is disposed when the turn ends', async () => {
+  const { root, clock, request } = fixture();
+  try {
+    let turn: ReturnType<typeof start> | undefined;
+    const failing: LoadedModelLike = {
+      countTokens: async (text) => Math.ceil(text.length / 4),
+      act: async () => {
+        throw new Error('socket hang up');
+      },
+    };
+    const finishing = fakeModel([{ steps: [{ text: 'Done.' }], stats: {} }], clock).model;
+    const stopping = fakeModel(
+      [{ steps: [{ wait: () => turn?.handle.stop() }], stats: {} }],
+      clock,
+    ).model;
+    for (const [stopReason, model] of [
+      ['done', finishing],
+      ['stopped', stopping],
+      ['error', failing],
+    ] as const) {
+      turn = start(model, 8192, request(0));
+      const result = await turn.handle.result;
+      assert.equal(result.stopReason, stopReason);
+      assert.equal(turn.disposals(), 1, stopReason);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
