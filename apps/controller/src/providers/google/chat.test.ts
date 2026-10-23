@@ -51,7 +51,12 @@ const environment = {
   SECRET_TOKEN: 'must-not-escape',
 };
 
-function rig(scenario: AcpChatPeerCase) {
+// Renames the edit kind on the peer's output lines, so a scenario can announce a tool kind the
+// adapter does not know. The peer splits each line across writes, so this joins them first.
+const announce = (kind: string) =>
+  `const out=process.stdout.write.bind(process.stdout);let held='';process.stdout.write=(chunk)=>{held+=chunk;const lines=held.split('\\n');held=lines.pop();for(const line of lines)out(line.replace('"kind":"edit"',${JSON.stringify(`"kind":${JSON.stringify(kind)}`)})+'\\n');return true;};`;
+
+function rig(scenario: AcpChatPeerCase, announced?: string) {
   mkdirSync(resolve('internal'), { recursive: true });
   const home = mkdtempSync(resolve('internal/acp-chat-'));
   const executable = join(home, 'peer');
@@ -60,7 +65,7 @@ function rig(scenario: AcpChatPeerCase) {
   );
   writeFileSync(
     executable,
-    `#!${process.execPath}\nimport {runAcpChatPeer} from ${JSON.stringify(pathToFileURL(peer).href)};runAcpChatPeer(${JSON.stringify(scenario)});\n`,
+    `#!${process.execPath}\nimport {runAcpChatPeer} from ${JSON.stringify(pathToFileURL(peer).href)};${announced ? announce(announced) : ''}runAcpChatPeer(${JSON.stringify(scenario)});\n`,
     { mode: 0o500 },
   );
   writeFileSync(join(home, 'localharness_external'), harness, { mode: 0o500 });
@@ -369,11 +374,27 @@ test('a permission request parks the turn until answered, and the policy answers
       status: 'ok',
       changed: [],
     },
+    {
+      // The client announces a kind this app does not know, so the call counts as other. A
+      // thread grant for other does not answer it.
+      policy: 'ask',
+      scenario: 'chat-permission',
+      announced: 'think',
+      grants: ['other'],
+      answer: 'once',
+      selected: 'once',
+      status: 'ok',
+      changed: [],
+    },
   ] as const) {
-    const f = rig(row.scenario);
+    const f = rig(row.scenario, 'announced' in row ? row.announced : undefined);
     try {
       let answered = false;
-      const turn = await run(f, request(f, { permissionPolicy: row.policy }), (event, handle) => {
+      const patch = {
+        permissionPolicy: row.policy,
+        ...('grants' in row ? { permissionGrants: row.grants } : {}),
+      };
+      const turn = await run(f, request(f, patch), (event, handle) => {
         if (event.type === 'permission.requested' && row.answer !== null)
           setImmediate(() => {
             answered = true;
