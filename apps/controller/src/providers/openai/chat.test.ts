@@ -124,8 +124,8 @@ const scripts = {
   ],
   limit: () => [
     ['account/rateLimits/updated', { rateLimits: { limitId: 'codex', primary: { usedPercent: 100, windowDurationMins: 300, resetsAt: 1793000000 }, secondary: null } }],
-    ['error', { ...ids(), willRetry: false, error: limit }],
-    done('failed', limit),
+    ['error', { ...ids(), willRetry: false, error: given.error ?? limit }],
+    done('failed', given.error ?? limit),
   ],
   reply: () => [['item/completed', { ...ids(), item: message('message-1', 'Hello.') }], done()],
 };
@@ -172,8 +172,8 @@ function turn(
     permissionPolicy?: ChatPermissionPolicy;
     permissionGrants?: ChatToolKind[];
     /**
-     * Scenario input for the peer: a command cwd or a network prompt, or a file change path, its
-     * move destination and grant root.
+     * Scenario input for the peer: a command cwd or a network prompt, a file change path, its
+     * move destination and grant root, or the error that ends a turn.
      */
     detail?: {
       cwd?: string;
@@ -181,6 +181,7 @@ function turn(
       path?: string;
       movePath?: string;
       grantRoot?: string;
+      error?: { message: string; codexErrorInfo: string | null };
     };
     /** Runs on the empty scratch copy before the turn starts. */
     prepare?: (scratch: string) => void;
@@ -427,21 +428,38 @@ test('an unknown notification is reported once and the turn still completes', as
   assert.equal(result.assistantText, 'Done.');
 });
 
-test('a usage limit error ends the turn as a limit with the reset time', async () => {
-  const run = turn('limit');
-  const result = await run.settled();
-  assert.equal(result.stopReason, 'limit');
-  assert.deepEqual(result.failure, {
-    stage: 'stream',
-    kind: 'usage-limit',
-    message: 'Codex reached a usage limit.',
-    providerMessage: "You've hit your usage limit. Try again later.",
-    method: null,
-    code: null,
-    resetsAt: new Date(1_793_000_000 * 1000).toISOString(),
-    nextAction: 'Continue on another provider, or wait for the reset.',
-  });
-  assert.equal(run.usage.at(-1)?.windows[0].remaining?.value, 0);
+test('only a used-up plan ends the turn as a limit with the reset time', async () => {
+  // The client's error code decides. The text decides only when the code is missing, and a
+  // transient rate limit stays an ordinary error that a resend can finish.
+  const resetsAt = new Date(1_793_000_000 * 1000).toISOString();
+  const usage = "You've hit your usage limit. Try again later.";
+  const rate = 'Rate limit reached. Please try again in 20s.';
+  const rows: Array<{
+    error?: { message: string; codexErrorInfo: string | null };
+    expected: [string, string | undefined, string | null];
+  }> = [
+    { expected: ['limit', 'usage-limit', resetsAt] },
+    {
+      error: { message: rate, codexErrorInfo: 'rateLimitExceeded' },
+      expected: ['error', 'protocol', null],
+    },
+    {
+      error: { message: usage, codexErrorInfo: null },
+      expected: ['limit', 'usage-limit', resetsAt],
+    },
+    { error: { message: rate, codexErrorInfo: null }, expected: ['error', 'protocol', null] },
+  ];
+  for (const row of rows) {
+    const run = turn('limit', row.error ? { detail: { error: row.error } } : {});
+    const { stopReason, failure } = await run.settled();
+    assert.deepEqual(
+      [stopReason, failure?.kind, failure?.resetsAt],
+      row.expected,
+      JSON.stringify(row),
+    );
+    assert.equal(failure?.providerMessage, row.error?.message ?? usage);
+    assert.equal(run.usage.at(-1)?.windows[0].remaining?.value, 0);
+  }
 });
 
 test('the next turn resumes the thread with its own approval policy and sends only the prompt', async () => {

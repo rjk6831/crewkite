@@ -190,7 +190,7 @@ const QUIET = new Set([
   'account/updated',
   'remoteControl/status/changed',
 ]);
-const LIMIT_TEXT = /\b(usage|rate) limit/i;
+const LIMIT_TEXT = /\busage limit/i;
 
 // Each schema names only the fields this file reads. Optional fields fall back on their own, so
 // one renamed field never drops the rest of a frame.
@@ -271,13 +271,12 @@ type Outcome = Pick<ChatTurnResult, 'stopReason' | 'failure'>;
 
 const clip = (value: string, limit: number) =>
   value.length > limit ? value.slice(0, limit) : value;
+// A used-up plan hands the work to another provider. rateLimitExceeded is a transient 429 the
+// client retries, and treating it as a used-up plan would hand off work that a retry finishes. The
+// message text decides only when the client sends no code, as an RPC error reply does.
 const isLimit = (error: ProviderError) => {
   const info = error?.codexErrorInfo;
-  return (
-    info === 'usageLimitExceeded' ||
-    (typeof info === 'object' && info !== null && 'usageLimitExceeded' in info) ||
-    LIMIT_TEXT.test(error?.message ?? '')
-  );
+  return info === 'usageLimitExceeded' || (info == null && LIMIT_TEXT.test(error?.message ?? ''));
 };
 
 class OpenAiChatTurn {
