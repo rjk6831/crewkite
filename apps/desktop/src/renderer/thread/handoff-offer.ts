@@ -14,9 +14,6 @@ export type LimitOffer = {
   turnId: string;
   /** The family that stopped. It is never offered as the place to continue. */
   family: ChatFamily;
-  /** The message that hit the limit, sent again on the family the person picks. */
-  text: string;
-  attachments: string[];
 };
 
 // A turn known from a read has a sequence. One seen only on the stream is newer than all of them.
@@ -45,11 +42,7 @@ export function limitOffer(state: ThreadState): LimitOffer | null {
     : (completed?.type === 'turn.completed' && completed.stopReason === 'limit') ||
       failure?.kind === 'usage-limit';
   const family = record?.view.identity?.family ?? meta?.selection.family;
-  const message =
-    state.messages.find((value) => value.id === meta?.userMessageId) ??
-    state.messages.findLast((value) => value.author.kind === 'user');
-  if (!limited || !family || !message) return null;
-  return { turnId: id, family, text: message.text, attachments: [...message.attachments] };
+  return limited && family ? { turnId: id, family } : null;
 }
 
 export type OfferChoice = {

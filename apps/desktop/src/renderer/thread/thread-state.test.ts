@@ -221,27 +221,20 @@ test('the limit offer shows only while the newest turn is the one that hit a lim
   };
   const stopped = [user(10, 'Add the guard'), begin(turn, 11), end(turn, 12, 'limit')];
 
-  assert.deepEqual(offer(stopped), {
-    turnId: turn,
-    family: 'openai',
-    text: 'Add the guard',
-    attachments: [],
-  });
+  assert.deepEqual(offer(stopped), { turnId: turn, family: 'openai' });
   // The message is on its way to another provider, so the choice is made.
   assert.equal(offer(stopped, true), null);
   // A newer turn that finished, or stopped for another reason, leaves nothing to offer.
-  const newer = (text: string, stopReason: 'limit' | 'error' | 'done') => [
+  const newer = (stopReason: 'limit' | 'error' | 'done') => [
     ...stopped,
-    user(13, text),
+    user(13, 'Try again'),
     begin(second, 14),
     end(second, 15, stopReason),
   ];
-  assert.equal(offer(newer('Add the guard', 'done')), null);
-  assert.equal(offer(newer('Try again', 'error')), null);
-  // A newer turn that also hit a limit moves the offer to it and to its own message.
-  const again = offer(newer('Try again', 'limit'));
-  assert.equal(again?.turnId, second);
-  assert.equal(again?.text, 'Try again');
+  assert.equal(offer(newer('done')), null);
+  assert.equal(offer(newer('error')), null);
+  // A newer turn that also hit a limit moves the offer to it.
+  assert.equal(offer(newer('limit'))?.turnId, second);
 
   // A reopened thread has the stored turns and no stream. The stored failure carries the cause.
   const stored = (
@@ -290,7 +283,6 @@ test('the limit offer shows only while the newest turn is the one that hit a lim
     );
   const first = stored(1, 'failed', 'usage-limit');
   assert.equal(reopened([first])?.family, 'anthropic');
-  assert.equal(reopened([first])?.text, 'Add the guard');
   assert.equal(reopened([first, stored(2, 'done', 'usage-limit')]), null);
   assert.equal(reopened([first, stored(2, 'failed', 'client-exit')]), null);
   // A stored stop reason decides before the failure kind. Turns without one keep the fallback above.
