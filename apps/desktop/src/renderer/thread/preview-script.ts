@@ -27,6 +27,8 @@ export type PreviewBus = {
   /** Publishes an event and returns its cursor. A function payload receives that cursor. */
   publish: (type: string, payload: unknown) => string;
   advance: (cursor: bigint) => void;
+  /** The cursor of the last published event, which a read reports as the point it reflects. */
+  cursor: () => string;
 };
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -321,7 +323,13 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
     const ok: CommandResult = { outcome: 'applied' };
     switch (name) {
       case 'ReadChatThread': {
-        const read: ChatThreadRead = { thread, turns, messages, liveEvents: live };
+        const read: ChatThreadRead = {
+          thread,
+          turns,
+          messages,
+          liveEvents: live,
+          cursor: bus.cursor(),
+        };
         return data(read);
       }
       case 'ReadChatChanges': {

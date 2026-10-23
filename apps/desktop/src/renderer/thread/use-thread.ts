@@ -11,9 +11,6 @@ import {
 const isTurnEnd = (event: ThreadEvent) =>
   event.type === 'agent.event' &&
   (event.payload as { type?: string } | null)?.type === 'turn.completed';
-const turnOf = (event: ThreadEvent) =>
-  event.type === 'agent.event' ? (event.payload as { turnId?: string } | null)?.turnId : undefined;
-
 // Loads the thread once, then applies the live stream on top. Events are held until the read
 // returns and then applied on top of it, and the reducer drops the ones the read already covers. A
 // finished turn triggers one more read so the stored messages and the streamed view cannot drift
@@ -72,18 +69,9 @@ export function useThread(source: ThreadSource, taskId: string, connection: stri
         if (!active) return;
         dispatch({ type: 'loaded', read });
         setError(null);
-        // With a cursor the reducer drops what the read covers, so every held event can go in and
-        // the ones emitted while the read was in flight are kept.
-        const covered = new Set(read.turns.map((turn) => turn.id));
-        const fresh = held.filter((entry) => {
-          const turnId = turnOf(entry);
-          return (
-            read.cursor !== undefined ||
-            entry.type === 'conversation.entry' ||
-            (turnId !== undefined && !covered.has(turnId))
-          );
-        });
-        if (fresh.length > 0) dispatch({ type: 'events', events: fresh });
+        // The reducer drops what the read covers by cursor, so every held event goes in and the
+        // ones emitted while the read was in flight are kept.
+        if (held.length > 0) dispatch({ type: 'events', events: held.splice(0) });
         ready = true;
       })
       .catch((failure: unknown) => {

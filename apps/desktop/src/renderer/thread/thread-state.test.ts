@@ -278,6 +278,7 @@ test('the limit offer shows only while the newest turn is the one that hit a lim
             (event) => event.payload as ChatMessage,
           ),
           liveEvents: [],
+          cursor: '20',
         },
       }),
     );
@@ -330,6 +331,7 @@ test('a reply restored from a thread read keeps the role of its turn for the bad
       },
     ],
     liveEvents: [],
+    cursor: '11',
   });
   for (const role of ['reviewer', 'advisor'] as const) {
     const state = reduceThread(initialThreadState(task), { type: 'loaded', read: read(role) });
@@ -369,7 +371,7 @@ test('stream events that a thread read already covers apply once', () => {
   const fresh = [started(10), delta(11, 'Hello'), output(12, 'line\n')];
   const cases = [
     {
-      name: 'cursor, view had folded nothing',
+      name: 'view had folded nothing',
       before: [],
       live: fresh,
       cursor: '12',
@@ -377,15 +379,7 @@ test('stream events that a thread read already covers apply once', () => {
       want: { text: 'Hello there', output: 'line\nmore\n' },
     },
     {
-      name: 'no cursor, view had folded nothing',
-      before: [],
-      live: fresh,
-      cursor: undefined,
-      after: [...fresh, delta(13, ' there'), output(14, 'more\n')],
-      want: { text: 'Hello there', output: 'line\nmore\n' },
-    },
-    {
-      name: 'cursor, view had folded part of the read',
+      name: 'view had folded part of the read',
       before: [started(10), delta(11, 'Hel')],
       live: [started(10), delta(11, 'Hel'), delta(12, 'lo')],
       cursor: '12',
@@ -393,12 +387,14 @@ test('stream events that a thread read already covers apply once', () => {
       want: { text: 'Hello!', output: '' },
     },
     {
-      name: 'no cursor, view had folded part of the read',
-      before: [started(10), delta(11, 'Hel')],
+      // The stream got past the read before the read returned. The snapshot must not erase what
+      // the stream already delivered, because the stream will not send it again.
+      name: 'view had folded an event past the read cursor',
+      before: [started(10), delta(11, 'Hel'), delta(12, 'lo'), delta(13, '!')],
       live: [started(10), delta(11, 'Hel'), delta(12, 'lo')],
-      cursor: undefined,
-      after: [delta(12, 'lo'), delta(13, '!')],
-      want: { text: 'Hello!', output: '' },
+      cursor: '12',
+      after: [delta(14, '?')],
+      want: { text: 'Hello!?', output: '' },
     },
   ];
   for (const { name, before, live, cursor, after, want } of cases) {
@@ -410,7 +406,7 @@ test('stream events that a thread read already covers apply once', () => {
         turns: [],
         messages: [],
         liveEvents: live.map((event) => event.payload as AgentEvent),
-        ...(cursor ? { cursor } : {}),
+        cursor,
       },
     });
     state = reduceThread(state, { type: 'events', events: after });

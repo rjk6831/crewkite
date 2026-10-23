@@ -288,10 +288,7 @@ export const ChatThreadReadSchema = z.strictObject({
   /** Events of turns that have not finished, oldest first, so a reopened view can rebuild them. */
   liveEvents: z.array(AgentEventSchema).max(5000),
   /** The event log cursor this read reflects. A view drops stream events at or below it. */
-  cursor: z
-    .string()
-    .regex(/^(0|[1-9][0-9]{0,19})$/)
-    .optional(),
+  cursor: z.string().regex(/^(0|[1-9][0-9]{0,19})$/),
 });
 export type ChatThreadRead = z.infer<typeof ChatThreadReadSchema>;
 

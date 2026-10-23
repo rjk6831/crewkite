@@ -66,6 +66,7 @@ export function createPreviewSource(): DesktopSource {
               state.cursor = to.toString();
             }
           },
+          cursor: () => state.cursor,
         },
         taskId,
         taskId === fixtures.task.id,

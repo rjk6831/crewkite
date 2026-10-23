@@ -34,14 +34,7 @@ export type { Block, FileDiff, ToolBlock, TurnView } from './turn-fold.ts';
 export type ThreadEvent = { type: string; cursor: string; taskId: string | null; payload: unknown };
 
 type Stamped = { cursor: bigint | null; event: AgentEvent };
-// skip counts stream events that a read without a cursor already folded and the stream will deliver
-// once more. It is empty whenever the read carries a cursor.
-type TurnRecord = {
-  events: Stamped[];
-  cursors: ReadonlySet<string>;
-  view: TurnView;
-  skip: ReadonlyMap<string, number>;
-};
+type TurnRecord = { events: Stamped[]; cursors: ReadonlySet<string>; view: TurnView };
 export type PendingMessage = { localId: string; text: string; attachments: string[]; at: string };
 
 export type ThreadState = {
@@ -84,58 +77,9 @@ function foldEvents(events: Stamped[]): TurnView {
   return events.reduce((view, { event }) => applyEvent(view, event), blankTurn(''));
 }
 
-const noSkip: ReadonlyMap<string, number> = new Map();
-
-// Events that add to a block. Applying one twice doubles the text, the tool output or the notice,
-// so a read without a cursor has to be matched against the stream by count.
-function appendKey(event: AgentEvent): string | null {
-  switch (event.type) {
-    case 'text.delta':
-      return `text:${event.itemId}`;
-    case 'thinking.delta':
-      return `thinking:${event.itemId}`;
-    case 'tool.output':
-      return `tool:${event.callId}`;
-    case 'provider.notice':
-      return 'notice';
-    default:
-      return null;
-  }
-}
-
-function tally(events: readonly Stamped[]): Map<string, number> {
-  const counts = new Map<string, number>();
-  for (const { event } of events) {
-    const name = appendKey(event);
-    if (name) counts.set(name, (counts.get(name) ?? 0) + 1);
-  }
-  return counts;
-}
-
-// The snapshot holds the first N appends of each block. The record it replaces had folded M of them,
-// so the next N - M appends from the stream are copies. A skip left over from an earlier read is
-// still owed.
-// shortcut: assumes the replaced record holds every append since the turn began. Upgrade: delete this
-// once every controller sends the read cursor.
-function owedAfterRead(snapshot: readonly Stamped[], before: TurnRecord | undefined) {
-  const owed = new Map<string, number>();
-  const applied = tally(before?.events ?? []);
-  for (const [name, total] of tally(snapshot)) {
-    const left = total - (applied.get(name) ?? 0) + (before?.skip.get(name) ?? 0);
-    if (left > 0) owed.set(name, left);
-  }
-  return owed;
-}
-
 function addAgentEvent(state: ThreadState, event: AgentEvent, cursor: string | null): ThreadState {
   const existing = state.turns[event.turnId];
   if (cursor !== null && existing?.cursors.has(cursor)) return state;
-  const name = appendKey(event);
-  const owed = name ? (existing?.skip.get(name) ?? 0) : 0;
-  if (existing && name && owed > 0) {
-    const skip = new Map(existing.skip).set(name, owed - 1);
-    return { ...state, turns: { ...state.turns, [event.turnId]: { ...existing, skip } } };
-  }
   const stamped: Stamped = { cursor: cursor === null ? null : parseCursor(cursor), event };
   const events = existing?.events ?? [];
   const last = events.at(-1);
@@ -156,11 +100,7 @@ function addAgentEvent(state: ThreadState, event: AgentEvent, cursor: string | n
     cursor === null
       ? (existing?.cursors ?? new Set<string>())
       : new Set([...(existing?.cursors ?? []), cursor]);
-  const skip = existing?.skip ?? noSkip;
-  return {
-    ...state,
-    turns: { ...state.turns, [event.turnId]: { events: next, cursors, view, skip } },
-  };
+  return { ...state, turns: { ...state.turns, [event.turnId]: { events: next, cursors, view } } };
 }
 
 function asMessage(payload: unknown): ChatMessage | null {
@@ -193,7 +133,7 @@ function addMessages(state: ThreadState, incoming: ChatMessage[], replace = fals
 function applyOne(state: ThreadState, event: ThreadEvent): ThreadState {
   if (event.taskId && event.taskId !== state.taskId) return state;
   // A read reflects the log up to its cursor. Messages merge by id, so only the three stream events
-  // need the check.
+  // need the check. Before the first read every event applies; the read then replaces the turn.
   if (state.readCursor !== null && event.type !== 'conversation.entry') {
     const at = parseCursor(event.cursor);
     if (at !== null && at <= state.readCursor) return state;
@@ -230,32 +170,36 @@ export function reduceThread(state: ThreadState, action: ThreadAction): ThreadSt
     case 'loaded': {
       const { read } = action;
       if (read.thread.taskId !== state.taskId) return state;
-      let next = addMessages(
+      const next = addMessages(
         {
           ...state,
           loaded: true,
           thread: read.thread,
           turnMeta: Object.fromEntries(read.turns.map((turn) => [turn.id, turn])),
-          readCursor: read.cursor === undefined ? null : parseCursor(read.cursor),
+          readCursor: parseCursor(read.cursor),
         },
         read.messages,
         true,
       );
-      // The snapshot of an unfinished turn is complete, so it replaces what the stream built.
-      // Events still queued from before the read are dropped by cursor, or by count without one.
+      // The snapshot of an unfinished turn is complete up to the read cursor, so it replaces what
+      // the stream built. Events the stream delivered past that cursor before the read returned
+      // are kept on top; everything at or below it is already in the snapshot.
       const live = new Map<string, Stamped[]>();
       for (const event of read.liveEvents)
         live.set(event.turnId, [...(live.get(event.turnId) ?? []), { cursor: null, event }]);
       const turns = { ...next.turns };
-      for (const [turnId, events] of live)
+      for (const [turnId, snapshot] of live) {
+        const after = (state.turns[turnId]?.events ?? []).filter(
+          ({ cursor }) => cursor !== null && next.readCursor !== null && cursor > next.readCursor,
+        );
+        const events = [...snapshot, ...after];
         turns[turnId] = {
           events,
-          cursors: new Set(),
+          cursors: new Set(after.map(({ cursor }) => String(cursor))),
           view: { ...foldEvents(events), id: turnId },
-          skip: next.readCursor === null ? owedAfterRead(events, state.turns[turnId]) : noSkip,
         };
-      next = { ...next, turns };
-      return next;
+      }
+      return { ...next, turns };
     }
     case 'sending':
       return { ...state, pending: [...state.pending, action.pending] };
