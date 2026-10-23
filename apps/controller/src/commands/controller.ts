@@ -36,7 +36,6 @@ import {
   TimestampSchema,
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
-import { LMStudioClient } from '@lmstudio/sdk';
 import { ArtifactFiles } from '../artifacts/index.ts';
 import type { ChatAdapter, ChatTurnRequest } from '../chat/adapter.ts';
 import { buildChatCatalog } from '../chat/catalog.ts';
@@ -71,8 +70,8 @@ import {
   resolveGoogleUsageClient,
 } from '../providers/google/profile.ts';
 import { localChatAdapter } from '../providers/local/chat.ts';
+import { connectLocalModel } from '../providers/local/chat-connect.ts';
 import type { startLocalDiscovery, startLocalReplacement } from '../providers/local/replacement.ts';
-import { silentLogger } from '../providers/local/sdk.ts';
 import type { LocalInputHelper, startLocalSecretInput } from '../providers/local/secure-input.ts';
 import { openAiChatAdapter } from '../providers/openai/chat.ts';
 import type { startNativeSession } from '../providers/openai/native-discovery.ts';
@@ -510,21 +509,13 @@ export class Controller {
         const control = this.localControl();
         if (!control.endpoint || !this.localConnected(control))
           throw Error('Local is not connected. Open Settings, load a model and connect Local.');
-        const secret = this.localSecret?.secret.toString('utf8');
+        const secret = this.localSecret?.secret.toString('utf8') ?? null;
         if (control.authMode !== 'none' && !secret) throw Error('The Local token is unavailable.');
-        const runtime = new LMStudioClient({
-          baseUrl: control.endpoint,
-          ...(control.authMode === 'none' ? {} : { apiToken: secret }),
-          verboseErrorMessages: false,
-          logger: silentLogger,
+        return connectLocalModel({
+          endpoint: control.endpoint,
+          token: control.authMode === 'none' ? null : secret,
+          model: request.selection.model,
         });
-        const loaded = await runtime.llm.listLoaded();
-        const model =
-          loaded.find((value) => value.modelKey === request.selection.model) ??
-          loaded.find((value) => value.identifier === request.selection.model) ??
-          loaded[0];
-        if (!model) throw Error('No model is loaded in the Local app.');
-        return { model, contextLength: await model.getContextLength(), modelKey: model.modelKey };
       },
     });
     return new Map<ChatFamily, ChatAdapter>([
