@@ -54,10 +54,14 @@ type Result = {
   changedPaths: string[];
 };
 
-/** Turn N plays `turns[N]`, or the last script once the list runs out. */
+/**
+ * Turn N plays `turns[N]`, or the last script once the list runs out. Every handle reports
+ * `groups` as its process groups; the scripted turn itself spawns nothing.
+ */
 export function createScriptedChatAdapter(options: {
   family: ChatFamily;
   turns: readonly (readonly ChatScriptStep[])[];
+  groups?: readonly number[];
 }) {
   const requests: ScriptedChatRequest[] = [];
   return {
@@ -175,7 +179,7 @@ export function createScriptedChatAdapter(options: {
           stopped = true;
           wake();
         },
-        groups: [] as number[],
+        groups: [...(options.groups ?? [])],
         result: play(),
       };
     },

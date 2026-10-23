@@ -162,6 +162,8 @@ export const ChatTurnSchema = z.strictObject({
   handoffFrom: ChatFamilySchema.nullable().default(null),
   /** Set when the turn settles. A reopened view uses it where live events are gone. */
   stopReason: z.enum(['done', 'stopped', 'limit', 'error']).nullable().optional(),
+  /** Process groups of the turn not yet proven gone. Startup recovery checks them again. */
+  groups: z.array(z.number().int().positive()).max(64).optional(),
 });
 export type ChatTurn = z.infer<typeof ChatTurnSchema>;
 
@@ -190,6 +192,11 @@ export const ChatThreadSchema = z.strictObject({
   autoHandoff: z.boolean().default(false),
   /** Tool kinds the person allowed for the whole thread. Adapters answer these without asking. */
   permissionGrants: z.array(ChatToolKindSchema).max(8).optional(),
+  /**
+   * A provider process outlived its turn. No turn runs and nothing is accepted until a
+   * controller start finds every recorded process group gone.
+   */
+  ownershipUnknown: z.boolean().optional(),
   /** The last branch acceptance from this thread's scratch copy. */
   lastAcceptance: z
     .strictObject({

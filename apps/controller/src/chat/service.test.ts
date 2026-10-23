@@ -86,7 +86,7 @@ function turnReaches(
   ).then((event) => event.payload as ChatTurn);
 }
 
-function agentEvents(controller: Controller): AgentEvent[] {
+function agentEvents(controller: Pick<Controller, 'store'>): AgentEvent[] {
   return controller.store
     .eventsAfter('0')
     .flatMap((event) => (event.type === 'agent.event' ? [event.payload] : []));
@@ -320,6 +320,67 @@ test('startup recovery fails a turn whose controller stopped before it finished'
   assert.equal(turn.failure?.message, 'The turn did not finish before the controller restarted.');
   assert.equal(thread.thread.activeTurnId, null);
   assert.deepEqual(thread.messages.at(-1)?.author, { kind: 'system', turnId: turn.id });
+});
+
+// The test replaces the process table, so the group number is never signaled for real.
+test('a provider process that outlives its turn blocks the thread until a restart finds it gone', {
+  timeout: 30000,
+}, async (t) => {
+  const group = 4242;
+  const present = new Set([group]);
+  const signals: string[] = [];
+  const thread = standalone(t, {
+    adapters: new Map([
+      [
+        'openai',
+        createScriptedChatAdapter({
+          family: 'openai',
+          groups: [group],
+          turns: [[{ kind: 'text', itemId: 'reply', chunks: ['Done.'] }]],
+        }),
+      ],
+    ]),
+    groupAbsent: (value) => !present.has(value),
+    signalGroup: (value, signal) => {
+      signals.push(`${value} ${signal}`);
+    },
+    schedule: (work) => {
+      setImmediate(work);
+      return () => {};
+    },
+  });
+  const { store, taskId } = thread;
+  const failed = turnReaches(thread, 'failed');
+  thread.send('Fix the rounding.');
+  const turn = await failed;
+
+  assert.deepEqual(signals, [`${group} SIGTERM`, `${group} SIGKILL`]);
+  assert.equal(turn.failure?.message, 'The provider process did not exit.');
+  assert.deepEqual(turn.groups, [group]);
+  const completed = agentEvents(thread).at(-1);
+  assert.equal(completed?.type === 'turn.completed' && completed.stopReason, 'error');
+  assert.equal(thread.read().thread.ownershipUnknown, true);
+  const accept = store.transaction(() =>
+    thread.service.accept({ taskId, branch: 'crewkite/fix-rounding' }, undefined),
+  );
+  assert.deepEqual(
+    [thread.send('Again.').reason, accept.reason],
+    ['ownership-unknown', 'ownership-unknown'],
+  );
+
+  // A restart while the group is present keeps the block. The next one, once it is gone, lifts it.
+  let restarted = thread.start();
+  restarted.recover();
+  assert.equal(thread.read(restarted).thread.ownershipUnknown, true);
+  present.clear();
+  restarted = thread.start();
+  restarted.recover();
+  const after = thread.read(restarted);
+  assert.equal(after.thread.ownershipUnknown, undefined);
+  assert.equal(after.turns[0].groups, undefined);
+  const done = turnReaches(thread, 'done');
+  assert.equal(thread.send('Again.', selection, restarted).outcome, 'applied');
+  await done;
 });
 
 test('a thread read returns messages in cursor order and the live events of the open turn', {
