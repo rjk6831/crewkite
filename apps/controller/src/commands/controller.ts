@@ -375,6 +375,10 @@ export class Controller {
       projectPath: (projectId) => this.projectPath(projectId),
       resolveSelection: (_taskId, selection) => this.chatSelection(selection),
       catalog: () => this.chatCatalog(),
+      // A settled turn spent allowance, so the gauge reads again under the trust already given.
+      onTurnSettled: (family) => {
+        if (family === 'anthropic') void this.anthropicUsage().refreshAfterTurn(this.id('cmd'));
+      },
     });
     return this.chatRuntime;
   }
@@ -384,6 +388,7 @@ export class Controller {
     return buildChatCatalog({
       profiles: profiles.map((profile) => profile.facts),
       openAiModels: this.latestOpenAiModels(profiles)?.models ?? null,
+      anthropicModel: this.anthropicUsage().clientModel(),
       local: this.localSetup(),
       windows: this.store.list<Observation>('window').map((observation) => ({
         family: this.store.get<Route>('route', observation.routeId)?.family,
