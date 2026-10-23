@@ -759,7 +759,7 @@ export function Conversation({
             disabled={loading}
             aria-invalid={Boolean(composerError)}
             aria-describedby={`${composerId}-hint${composerError ? ` ${composerId}-error` : ''}`}
-            placeholder={composer.placeholder ?? 'Soar to new heights with CrewKite'}
+            placeholder={composer.placeholder ?? 'Ask about this project or describe a change'}
             onChange={(event) => composer.onChange(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
