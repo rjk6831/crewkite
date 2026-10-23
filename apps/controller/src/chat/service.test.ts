@@ -336,6 +336,7 @@ test('a provider process that outlives its turn blocks the thread until a restar
   timeout: 30000,
 }, async (t) => {
   const group = 4242;
+  const reused = 4300;
   const present = new Set([group]);
   const signals: string[] = [];
   const thread = standalone(t, {
@@ -344,7 +345,7 @@ test('a provider process that outlives its turn blocks the thread until a restar
         'openai',
         createScriptedChatAdapter({
           family: 'openai',
-          groups: [group],
+          groups: [group, reused],
           turns: [[{ kind: 'text', itemId: 'reply', chunks: ['Done.'] }]],
         }),
       ],
@@ -359,9 +360,17 @@ test('a provider process that outlives its turn blocks the thread until a restar
     },
   });
   const { store, taskId } = thread;
+  // The second group has exited by the time the turn row first saves its groups. Later in the
+  // turn its number belongs to another process.
+  const stop = store.subscribe((event) => {
+    if (event.type !== 'chat.turn' || !event.payload.groups) return;
+    present.add(reused);
+    stop();
+  });
   const failed = turnReaches(thread, 'failed');
   thread.send('Fix the rounding.');
   const turn = await failed;
+  present.delete(reused);
 
   assert.deepEqual(signals, [`${group} SIGTERM`, `${group} SIGKILL`]);
   assert.equal(turn.failure?.message, 'The provider process did not exit.');

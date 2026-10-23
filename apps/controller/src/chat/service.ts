@@ -134,6 +134,11 @@ type LiveTurn = {
   started: boolean;
   /** How many process groups the handle had reported when the turn row last saved them. */
   reported: number;
+  /**
+   * Groups seen absent during this turn. Adapters never drop a group from their list and PIDs
+   * wrap, so if one of these numbers shows up again it belongs to another process.
+   */
+  gone: Set<number>;
   done: Promise<void>;
 };
 
@@ -529,6 +534,7 @@ export class ChatService {
       noticed: false,
       started: false,
       reported: 0,
+      gone: new Set(),
       done: Promise.resolve(),
     };
     this.live.set(turn.id, live);
@@ -539,7 +545,7 @@ export class ChatService {
     let result = await this.outcome(turn, live);
     // The thread stays busy until the provider's processes are gone. Whatever the adapter
     // reported, a process that will not exit makes the turn a failure.
-    const left = await this.quiesce(live.handle?.groups ?? []);
+    const left = await this.quiesce(live);
     if (left.length) result = { ...result, stopReason: 'error', failure: processFailure() };
     this.finish(turn.id, live, result, left);
   }
@@ -570,18 +576,27 @@ export class ChatService {
    * Prove every reported process group gone, and only ESRCH proves it. A group still present
    * gets SIGTERM, SIGKILL a second later, and one more second to exit. Returns what is left.
    */
-  private async quiesce(reported: readonly number[]): Promise<number[]> {
-    const absent = this.deps.groupAbsent ?? groupAbsent;
+  private async quiesce(live: LiveTurn): Promise<number[]> {
     const signal = this.deps.signalGroup ?? signalGroup;
     const schedule = this.deps.schedule ?? defaultSchedule;
-    const left = () => owned(reported).filter((group) => !absent(group));
     for (const name of ['SIGTERM', 'SIGKILL'] as const) {
-      const present = left();
+      const present = this.present(live);
       if (!present.length) return [];
       for (const group of present) signal(group, name);
       await new Promise<void>((resolve) => schedule(resolve, 1000));
     }
-    return left();
+    return this.present(live);
+  }
+
+  /** Reported groups not yet seen absent. Once a group is seen absent, it stays gone for the turn. */
+  private present(live: LiveTurn): number[] {
+    const absent = this.deps.groupAbsent ?? groupAbsent;
+    return owned(live.handle?.groups ?? []).filter((group) => {
+      if (live.gone.has(group)) return false;
+      if (!absent(group)) return true;
+      live.gone.add(group);
+      return false;
+    });
   }
 
   private async start(turn: ChatTurn, live: LiveTurn): Promise<ChatTurnResult> {
@@ -622,9 +637,7 @@ export class ChatService {
     live.reported = reported.length;
     const turn = this.turn(turnId);
     if (!turn || !OPEN_STATES.has(turn.state)) return;
-    const absent = this.deps.groupAbsent ?? groupAbsent;
-    const present = reported.filter((group) => !absent(group));
-    this.putTurn(this.task(turn.taskId) as Task, withGroups(turn, present));
+    this.putTurn(this.task(turn.taskId) as Task, withGroups(turn, this.present(live)));
   }
 
   private request(turn: ChatTurn): ChatTurnRequest {
