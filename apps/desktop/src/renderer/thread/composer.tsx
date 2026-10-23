@@ -153,7 +153,12 @@ export function Composer({
     const path = adding?.trim();
     if (path && !attachments.includes(path) && attachments.length < 32)
       setAttachments([...attachments, path]);
+    closeAttach();
+  }
+  // The message box takes focus back, so the next key goes where the person was typing.
+  function closeAttach() {
     setAdding(null);
+    field.current?.focus();
   }
 
   return (
@@ -166,12 +171,7 @@ export function Composer({
           />
         )}
         {adding !== null && (
-          <AttachRow
-            value={adding}
-            onChange={setAdding}
-            onAdd={addPath}
-            onClose={() => setAdding(null)}
-          />
+          <AttachRow value={adding} onChange={setAdding} onAdd={addPath} onClose={closeAttach} />
         )}
         <textarea
           ref={field}

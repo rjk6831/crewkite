@@ -5,7 +5,7 @@ import type {
   ChatRole,
   ChatThread,
 } from '@crewkite/contracts';
-import { type KeyboardEvent, useState } from 'react';
+import { type KeyboardEvent, useEffect, useRef, useState } from 'react';
 import { sendMessage, type ThreadSource } from './commands.ts';
 import { defaultSelection, ModelPicker } from './model-picker.tsx';
 
@@ -56,6 +56,12 @@ export function useRoleRun({
   const [role, setRole] = useState<RoleAction | null>(null);
   const [pick, setPick] = useState<ChatModelSelection | null>(null);
   const picked = pick ?? roleDefault(catalog, currentFamily);
+  const rowRef = useRef<HTMLDivElement>(null);
+  const opener = useRef<Element | null>(null);
+  // Focus moves into the row when it opens, so Escape reaches it from the keyboard.
+  useEffect(() => {
+    if (role) rowRef.current?.querySelector('button')?.focus();
+  }, [role]);
 
   function why(action: RoleAction): string | null {
     if (blocked) return blocked;
@@ -70,6 +76,7 @@ export function useRoleRun({
     if (role === action) return setRole(null);
     onOpenCatalog();
     setPick(null);
+    opener.current = document.activeElement;
     setRole(action);
   }
   async function run() {
@@ -87,17 +94,19 @@ export function useRoleRun({
       onNote(failure instanceof Error ? failure.message : 'The request was not sent.');
     }
   }
-  // Escape closes the row unless an open menu inside it already took the key.
+  // Escape closes the row unless an open menu inside it already took the key. Focus goes back to
+  // the button that opened it.
   function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (event.key !== 'Escape' || event.defaultPrevented) return;
     event.preventDefault();
     setRole(null);
+    if (opener.current instanceof HTMLElement) opener.current.focus();
   }
 
   const row =
     taskId && role ? (
       // biome-ignore lint/a11y/noStaticElementInteractions: the handler only closes the row on Escape
-      <div className="th-attach-row" id="th-role-row" onKeyDown={onKeyDown}>
+      <div className="th-attach-row" id="th-role-row" ref={rowRef} onKeyDown={onKeyDown}>
         <ModelPicker
           catalog={catalog}
           selection={picked}
