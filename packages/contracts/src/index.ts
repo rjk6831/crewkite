@@ -1,5 +1,24 @@
 import { z } from 'zod';
 import { canonicalJson } from './canonical.ts';
+import {
+  AgentEventSchema,
+  ChatCatalogReadSchema,
+  ChatChangesReadSchema,
+  ChatFamilySchema,
+  ChatRoleSchema,
+  ChatThreadReadSchema,
+  ChatThreadSchema,
+  ChatTurnIdSchema,
+  ChatTurnSchema,
+  ConfigureChatThreadPayloadSchema,
+  HandoffChatThreadPayloadSchema,
+  ReadChatCatalogPayloadSchema,
+  ReadChatChangesPayloadSchema,
+  ReadChatThreadPayloadSchema,
+  ResolveChatPermissionPayloadSchema,
+  SendChatMessagePayloadSchema,
+  StopChatTurnPayloadSchema,
+} from './chat.ts';
 
 export const PROTOCOL_VERSION = 1;
 export const MAX_FRAME_BYTES = 1024 * 1024;
@@ -1978,13 +1997,50 @@ const conversationAgent = z.strictObject({
   routeId: RouteIdSchema,
 });
 const conversationUser = z.strictObject({ kind: z.literal('user') });
+// Chat messages share the conversation log so one cursor orders every message of a thread.
+const chatEntryText = (bytes: number) =>
+  z
+    .string()
+    .min(1)
+    .max(bytes)
+    .refine(
+      (value) =>
+        value.isWellFormed() &&
+        !value.includes('\0') &&
+        new TextEncoder().encode(value).length <= bytes,
+      'Chat text needs valid Unicode without null bytes.',
+    );
+const chatEntryKinds = new Set(['user-message', 'chat-assistant', 'chat-system']);
+/** One chat entry must fit a 524288-byte conversation page with its envelope. */
+export const MAX_CHAT_ENTRY_BYTES = 520_192;
 export const ConversationEntrySchema = z
   .discriminatedUnion('kind', [
     z.strictObject({
       ...conversationEntryFields,
       kind: z.literal('user-message'),
+      // Planning input stays bounded by its command payload. Chat input can be longer.
+      text: chatEntryText(65_536),
       author: conversationUser,
       context: ConversationContextRefsSchema.optional(),
+      attachments: z.array(z.string().min(1).max(4096)).max(32).optional(),
+    }),
+    z.strictObject({
+      ...conversationEntryFields,
+      kind: z.literal('chat-assistant'),
+      text: chatEntryText(262_144),
+      author: z.strictObject({
+        kind: z.literal('assistant'),
+        turnId: ChatTurnIdSchema,
+        family: ChatFamilySchema,
+        model: label,
+        role: ChatRoleSchema,
+      }),
+    }),
+    z.strictObject({
+      ...conversationEntryFields,
+      kind: z.literal('chat-system'),
+      text: chatEntryText(8192),
+      author: z.strictObject({ kind: z.literal('system'), turnId: ChatTurnIdSchema.nullable() }),
     }),
     z.strictObject({
       ...conversationEntryFields,
@@ -2039,7 +2095,7 @@ export const ConversationEntrySchema = z
         code: 'custom',
         message: 'Conversation output must match its admitted turn.',
       });
-    if (conversationBytes(entry) > 73728)
+    if (conversationBytes(entry) > (chatEntryKinds.has(entry.kind) ? MAX_CHAT_ENTRY_BYTES : 73728))
       context.addIssue({
         code: 'custom',
         message: 'A conversation entry exceeds its encoded byte limit.',
@@ -2397,6 +2453,14 @@ export const TaskConversationStateSchema = z
   });
 export type TaskConversationState = z.infer<typeof TaskConversationStateSchema>;
 export const CommandSchema = z.discriminatedUnion('command', [
+  mutate('SendChatMessage', SendChatMessagePayloadSchema),
+  mutate('ResolveChatPermission', ResolveChatPermissionPayloadSchema),
+  mutate('StopChatTurn', StopChatTurnPayloadSchema),
+  mutate('ConfigureChatThread', ConfigureChatThreadPayloadSchema),
+  mutate('HandoffChatThread', HandoffChatThreadPayloadSchema),
+  read('ReadChatThread', ReadChatThreadPayloadSchema),
+  read('ReadChatChanges', ReadChatChangesPayloadSchema),
+  read('ReadChatCatalog', ReadChatCatalogPayloadSchema),
   mutate(
     'CaptureConversationContext',
     z.strictObject({
@@ -3498,6 +3562,9 @@ export const ProjectOperationDataSchema = z
     'Operation detail must match its kind and task identity.',
   );
 export const ReadDataSchema = z.discriminatedUnion('kind', [
+  ChatThreadReadSchema.extend({ kind: z.literal('chat-thread') }),
+  ChatChangesReadSchema.extend({ kind: z.literal('chat-changes') }),
+  ChatCatalogReadSchema.extend({ kind: z.literal('chat-catalog') }),
   WorkspaceStateSchema,
   TaskOperationsPageSchema,
   ProjectOperationDataSchema,
@@ -3609,6 +3676,9 @@ export const EventSchema = z.discriminatedUnion('type', [
   event('operation.updated', TaskOperationSummarySchema),
   event('combined.updated', CombinedRunPreviewSchema),
   event('conversation.entry', ConversationEntrySchema),
+  event('agent.event', AgentEventSchema),
+  event('chat.turn', ChatTurnSchema),
+  event('chat.thread', ChatThreadSchema),
   event('task.created', TaskSchema),
   event('task.updated', TaskSchema),
   event('run.prepared', RunSchema),

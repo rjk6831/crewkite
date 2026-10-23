@@ -51,6 +51,7 @@ import {
   ConversationContextBundleSchema,
   type ConversationContextRefs,
   ConversationContextUsageSchema,
+  type ConversationEntry,
   ConversationEntrySchema,
   type ConversationModelCatalog,
   ConversationModelCatalogSchema,
@@ -781,6 +782,13 @@ function freezeNative<T>(value: T): T {
     Object.freeze(value);
   }
   return value;
+}
+
+/** Chat replies share the conversation log. Planning turns read planning entries only. */
+function planningEntry(
+  entry: ConversationEntry,
+): entry is Exclude<ConversationEntry, { kind: 'chat-assistant' | 'chat-system' }> {
+  return entry.kind !== 'chat-assistant' && entry.kind !== 'chat-system';
 }
 
 const ConversationConfigurationSchema = z.strictObject({
@@ -5682,22 +5690,27 @@ export class Controller {
     const attempt = this.jobAttempt(run, config.routeId);
     const directory = join(this.home, 'conversation', run.id, attempt.id);
     const ceiling = BigInt(pending[pending.length - 1].cursor);
+    const planning =
+      "json_extract(body,'$.kind') NOT IN ('input-delivery','chat-assistant','chat-system')";
     const rows = this.store.db
       .prepare(
-        "SELECT body FROM conversation_entries WHERE task_id=? AND sequence<=? AND json_extract(body,'$.kind')<>'input-delivery' ORDER BY sequence DESC LIMIT 100",
+        `SELECT body FROM conversation_entries WHERE task_id=? AND sequence<=? AND ${planning} ORDER BY sequence DESC LIMIT 100`,
       )
       .all(taskId, ceiling);
     const total = this.store.db
       .prepare(
-        "SELECT COUNT(*) AS count FROM conversation_entries WHERE task_id=? AND sequence<=? AND json_extract(body,'$.kind')<>'input-delivery'",
+        `SELECT COUNT(*) AS count FROM conversation_entries WHERE task_id=? AND sequence<=? AND ${planning}`,
       )
       .get(taskId, ceiling)?.count as number;
     const historyEntries = rows
       .reverse()
-      .map((row) => ConversationEntrySchema.parse(JSON.parse(row.body as string)));
+      .map((row) => ConversationEntrySchema.parse(JSON.parse(row.body as string)))
+      .filter(planningEntry);
     if (pending.some((entry) => 'context' in entry && entry.context?.length)) {
       const retained = new Set(historyEntries.map((entry) => entry.id));
-      historyEntries.push(...pending.filter((entry) => !retained.has(entry.id)));
+      historyEntries.push(
+        ...pending.filter(planningEntry).filter((entry) => !retained.has(entry.id)),
+      );
       historyEntries.sort((left, right) => (BigInt(left.cursor) < BigInt(right.cursor) ? -1 : 1));
     }
     const history = historyEntries.map((entry) => ({ role: entry.author.kind, text: entry.text }));
