@@ -114,11 +114,19 @@ export function ModelPicker({
         trigger.current?.focus();
       } else if (!root.current?.contains(event.target as Node)) setOpen(false);
     };
+    // Focus that moves to something else, such as the search dialog, closes the menu too.
+    const leave = (event: FocusEvent) => {
+      if (event.relatedTarget instanceof Node && !root.current?.contains(event.relatedTarget))
+        setOpen(false);
+    };
+    const element = root.current;
     document.addEventListener('pointerdown', close);
     document.addEventListener('keydown', close, true);
+    element?.addEventListener('focusout', leave);
     return () => {
       document.removeEventListener('pointerdown', close);
       document.removeEventListener('keydown', close, true);
+      element?.removeEventListener('focusout', leave);
     };
   }, [open]);
   // Focus lands on the chosen model, so the arrow keys work as soon as the menu opens.

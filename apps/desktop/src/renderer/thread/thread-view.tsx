@@ -61,6 +61,7 @@ export function ThreadView({
   const [notice, setNotice] = useState<string | null>(null);
   const counter = useRef(0);
   const composer = useRef<ComposerHandle>(null);
+  const toggle = useRef<HTMLButtonElement>(null);
   const thread = state.thread;
   const changesKey = useMemo(() => changeCount(items), [items]);
   const offer = useMemo(() => limitOffer(state), [state]);
@@ -130,6 +131,11 @@ export function ThreadView({
       ),
     [source, task.id, dispatch],
   );
+  // Focus inside the panel moves to the toolbar button first, so closing does not drop it.
+  const closeInspector = useCallback(() => {
+    if (document.activeElement?.closest('.th-inspector')) toggle.current?.focus();
+    setInspector((current) => ({ ...current, open: false }));
+  }, []);
   const openChanges = useCallback(
     (path: string) => setInspector({ open: true, tab: 'changes', focus: path }),
     [],
@@ -171,6 +177,7 @@ export function ThreadView({
             {badge}
           </span>
           <button
+            ref={toggle}
             type="button"
             className="th-icon th-bar-toggle"
             aria-label="Toggle inspector"
@@ -224,7 +231,7 @@ export function ThreadView({
           preview={preview}
           tab={inspector.tab}
           onTab={(tab) => setInspector({ ...inspector, tab })}
-          onClose={() => setInspector({ ...inspector, open: false })}
+          onClose={closeInspector}
           changesKey={changesKey}
           focusPath={inspector.focus}
           onConfigure={(patch) => void configure(patch)}
