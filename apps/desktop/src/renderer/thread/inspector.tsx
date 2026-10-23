@@ -9,7 +9,9 @@ import { X } from 'lucide-react';
 import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
+  type RefObject,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from 'react';
@@ -37,15 +39,12 @@ const roleNames: Record<ChatRole, string> = {
 // default width when it is.
 const widthKey = 'crewkite-inspector-width-v1';
 const minWidth = 320;
-const maxShare = 0.6;
+const threadMinWidth = 520;
 const keyStep = 16;
 const narrowWindow = 1180;
 
 // A narrow window keeps the smaller default so the thread still has room beside the panel.
 const defaultWidth = (viewport: number) => (viewport <= narrowWindow ? 320 : 380);
-const maxWidth = (viewport: number) => Math.max(minWidth, Math.floor(viewport * maxShare));
-const clampWidth = (width: number, viewport: number) =>
-  Math.min(Math.max(Math.round(width), minWidth), maxWidth(viewport));
 
 function readWidth(): number | null {
   try {
@@ -63,26 +62,35 @@ function writeWidth(width: number | null) {
 }
 
 /**
- * The width follows the window as it shrinks, and the chosen value stays as picked, so a window
- * that grows again gets the panel back at the width the person set.
+ * The thread and the panel share the window less the navigation rail. The panel stops where the
+ * thread would drop below its minimum, which at the 1080 px window minimum with the rail open is
+ * 360 px. Room too narrow for both keeps the panel at its own minimum. The chosen value stays as
+ * picked, so a wider window or a collapsed rail gets the panel back at the width the person set.
  */
-function useInspectorWidth() {
+function useInspectorWidth(panel: RefObject<HTMLElement | null>) {
   const [chosen, setChosen] = useState<number | null>(readWidth);
-  const [viewport, setViewport] = useState(() => window.innerWidth);
-  useEffect(() => {
-    const resize = () => setViewport(window.innerWidth);
-    window.addEventListener('resize', resize);
-    return () => window.removeEventListener('resize', resize);
-  }, []);
-  const width = clampWidth(chosen ?? defaultWidth(viewport), viewport);
+  const [room, setRoom] = useState(() => window.innerWidth);
+  // Measured before paint, so a saved width never shows wider than the room allows. The rail has
+  // its own widths per window size and when collapsed, so the room is read from the layout.
+  useLayoutEffect(() => {
+    const area = panel.current?.parentElement;
+    if (!area) return;
+    const measure = () => setRoom(area.clientWidth);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(area);
+    return () => observer.disconnect();
+  }, [panel]);
+  const max = Math.max(minWidth, room - threadMinWidth);
+  const clamp = (width: number) => Math.min(Math.max(Math.round(width), minWidth), max);
   return {
-    width,
+    width: clamp(chosen ?? defaultWidth(window.innerWidth)),
     min: minWidth,
-    max: maxWidth(viewport),
+    max,
     // A drag changes the width on every move and saves it once, when the pointer is released.
-    preview: (next: number) => setChosen(clampWidth(next, window.innerWidth)),
+    preview: (next: number) => setChosen(clamp(next)),
     save: (next: number | null) => {
-      const value = next === null ? null : clampWidth(next, window.innerWidth);
+      const value = next === null ? null : clamp(next);
       setChosen(value);
       writeWidth(value);
     },
@@ -113,7 +121,8 @@ function ResizeHandle({
   const move = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (!drag.current) return;
     // The panel sits on the right, so moving the pointer left makes it wider.
-    const next = clampWidth(drag.current.start + drag.current.x - event.clientX, window.innerWidth);
+    const wanted = Math.round(drag.current.start + drag.current.x - event.clientX);
+    const next = Math.min(Math.max(wanted, min), max);
     drag.current.latest = next;
     onPreview(next);
   };
@@ -152,6 +161,9 @@ function ResizeHandle({
       onPointerMove={move}
       onPointerUp={end}
       onPointerCancel={end}
+      // The capture can end without a pointerup reaching the handle, for example when the button
+      // is released outside the window. The drag ends with it, so a later hover never resizes.
+      onLostPointerCapture={end}
       onDoubleClick={() => onSave(null)}
       onKeyDown={press}
     />
@@ -303,7 +315,8 @@ export function Inspector({
   focusPath: string | null;
   onConfigure: (patch: { permissionPolicy?: ChatPermissionPolicy; autoHandoff?: boolean }) => void;
 }) {
-  const size = useInspectorWidth();
+  const panel = useRef<HTMLElement>(null);
+  const size = useInspectorWidth(panel);
   // Escape closes the panel unless a picker or field inside it already took the key, or a dialog
   // such as search is open and owns it.
   useEffect(() => {
@@ -316,7 +329,12 @@ export function Inspector({
     return () => document.removeEventListener('keydown', close);
   }, [onClose]);
   return (
-    <aside className="th-inspector" aria-label="Inspector" style={{ width: size.width }}>
+    <aside
+      ref={panel}
+      className="th-inspector"
+      aria-label="Inspector"
+      style={{ width: size.width }}
+    >
       <ResizeHandle
         width={size.width}
         min={size.min}
