@@ -157,6 +157,9 @@ const eventNames: Record<Event['type'], string> = {
   'candidate.accepted': 'Candidate accepted',
   'export.created': 'Export created',
   'run.failed': 'Run failed',
+  'agent.event': 'Agent activity',
+  'chat.turn': 'Turn updated',
+  'chat.thread': 'Thread updated',
 };
 
 export function ActivityView({

@@ -32,6 +32,9 @@ import {
   CandidateEvaluationPreviewSchema,
   CandidateEvaluationStartReasonSchema,
   CandidateSchema,
+  type ChatCatalogRead,
+  type ChatFamily,
+  type ChatModelSelection,
   type CheckResult,
   CheckResultSchema,
   CONVERSATION_CONTEXT_MEDIA_TYPE,
@@ -51,6 +54,7 @@ import {
   ConversationContextBundleSchema,
   type ConversationContextRefs,
   ConversationContextUsageSchema,
+  type ConversationEntry,
   ConversationEntrySchema,
   type ConversationModelCatalog,
   ConversationModelCatalogSchema,
@@ -143,6 +147,9 @@ import { hashCanonical, verifyHandoff } from '@crewkite/contracts/hash';
 import { fakeReviewWorkerPath, fakeWorkerPath } from '@crewkite/testkit/worker';
 import { z } from 'zod';
 import { ArtifactFiles } from '../artifacts/index.ts';
+import type { ChatAdapter } from '../chat/adapter.ts';
+import { buildChatCatalog } from '../chat/catalog.ts';
+import { ChatService } from '../chat/service.ts';
 import { buildHandoff } from '../continuity/index.ts';
 import { captureConversationContext } from '../conversation/context.ts';
 import { type FrozenConversationTurn, TaskConversation } from '../conversation/conversation.ts';
@@ -783,6 +790,13 @@ function freezeNative<T>(value: T): T {
   return value;
 }
 
+/** Chat replies share the conversation log. Planning turns read planning entries only. */
+function planningEntry(
+  entry: ConversationEntry,
+): entry is Exclude<ConversationEntry, { kind: 'chat-assistant' | 'chat-system' }> {
+  return entry.kind !== 'chat-assistant' && entry.kind !== 'chat-system';
+}
+
 const ConversationConfigurationSchema = z.strictObject({
   revision: z.number().int().nonnegative().safe(),
   contractStatus: z.enum(['provisional', 'confirmed']),
@@ -989,6 +1003,8 @@ export type ControllerOptions = {
   localDiscovery?: Omit<Parameters<typeof startLocalDiscovery>[2], 'lifecycle'>;
   localWriter?: Omit<Parameters<typeof startLocalReplacement>[2], 'lifecycle' | 'onSubmitted'>;
   prepareVerification?: typeof prepareToolchain;
+  /** Chat adapters by family. A family without one refuses new chat turns. */
+  chatAdapters?: ReadonlyMap<ChatFamily, ChatAdapter>;
 };
 const migrations = fileURLToPath(new URL('../../migrations/', import.meta.url));
 const runtimeRoot = fileURLToPath(new URL('../../../../', import.meta.url));
@@ -1175,6 +1191,7 @@ export class Controller {
       this.anthropicUsage().recover();
       this.googleInstallation().recover();
       this.taskOperations().recover();
+      this.chat().recover();
       this.armQuotaRetries();
       for (const row of this.store.db
         .prepare("SELECT candidate_id FROM publications WHERE state='prepared'")
@@ -1205,6 +1222,109 @@ export class Controller {
         ),
     });
     return this.taskOperationRuntime;
+  }
+
+  private chatRuntime?: ChatService;
+  private chat(): ChatService {
+    this.chatRuntime ??= new ChatService({
+      store: this.store,
+      artifacts: this.artifacts,
+      home: this.home,
+      now: this.now,
+      // shortcut: the shared ID helpers have no turn prefix. A fresh message ID lends its
+      // time-ordered suffix. Upgrade: add 'trn' to IdPrefix and to the testkit ID helper.
+      id: (prefix) => (prefix === 'trn' ? `trn_${this.id('msg').slice(4)}` : this.id(prefix)),
+      emit: (type, taskId, revision, payload) => this.event(type, taskId, revision, payload),
+      adapters: this.options.chatAdapters ?? new Map(),
+      resolveEnvironment: (family) => this.chatEnvironment(family),
+      projectPath: (projectId) => this.projectPath(projectId),
+      resolveSelection: (_taskId, selection) => this.chatSelection(selection),
+      catalog: () => this.chatCatalog(),
+    });
+    return this.chatRuntime;
+  }
+
+  private chatCatalog(): ChatCatalogRead {
+    const profiles = this.resolveProfiles();
+    return buildChatCatalog({
+      profiles: profiles.map((profile) => profile.facts),
+      openAiModels: this.latestOpenAiModels(profiles),
+      local: this.localSetup(),
+      windows: this.store.list<Observation>('window').map((observation) => ({
+        family: this.store.get<Route>('route', observation.routeId)?.family,
+        observation,
+      })),
+      nowMs: Date.parse(this.now()),
+    });
+  }
+
+  /** The newest OpenAI model list observed with the same client and profile as now. */
+  private latestOpenAiModels(profiles: NativeProfileResolution[]) {
+    let latest: ModelCatalogObservation | undefined;
+    const keys = this.store.db
+      .prepare(
+        "SELECT command_key FROM receipts WHERE command_key LIKE 'task-model-catalog:%' OR command_key LIKE 'conversation-model-catalog:%'",
+      )
+      .all();
+    for (const { command_key: key } of keys) {
+      try {
+        const catalog = ModelCatalogObservationSchema.parse(
+          this.nativeRecord(key as string, 32768).value,
+        );
+        const profile = profiles.find((value) => value.facts.id === catalog.profileId);
+        if (
+          !profile?.facts.available ||
+          hashCanonical(profile.client) !== hashCanonical(catalog.client) ||
+          profile.locationHash !== catalog.locationHash ||
+          hashCanonical(profile.facts) !== catalog.profileHash
+        )
+          continue;
+        if (!latest || Date.parse(catalog.observedAt) > Date.parse(latest.observedAt))
+          latest = catalog;
+      } catch {
+        // A damaged or partial observation is not a model list.
+      }
+    }
+    return latest?.models ?? null;
+  }
+
+  private chatSelection(selection?: ChatModelSelection): ChatModelSelection | null {
+    const families = this.chatCatalog().families;
+    if (selection) {
+      const models = families.find((entry) => entry.family === selection.family)?.models ?? [];
+      const model = models.find((entry) => entry.model === selection.model);
+      // An empty list means no catalog was observed. The adapter then reports a bad model.
+      if (models.length && !model) return null;
+      if (model && selection.effort !== 'default' && !model.efforts.includes(selection.effort))
+        return null;
+      return selection;
+    }
+    for (const entry of families) {
+      const name = entry.defaultModel ?? entry.models[0]?.model;
+      if (!entry.connected || !name) continue;
+      const model = entry.models.find((value) => value.model === name);
+      return { family: entry.family, model: name, effort: model?.defaultEffort ?? 'default' };
+    }
+    return null;
+  }
+
+  private chatEnvironment(family: ChatFamily): NodeJS.ProcessEnv {
+    const preferred: Record<ChatFamily, string[]> = {
+      openai: ['openai-repository-v1', 'openai-file-v1'],
+      anthropic: ['anthropic-file-v1', 'anthropic-file-compact-v1'],
+      google: ['google-acp-v1'],
+      local: [],
+    };
+    const profiles = this.resolveProfiles();
+    for (const id of preferred[family]) {
+      const profile = profiles.find((value) => value.facts.id === id);
+      if (profile?.facts.available && profile.environment) return { ...profile.environment };
+    }
+    return Object.fromEntries(
+      Object.entries({ HOME: process.env.HOME, PATH: process.env.PATH }).filter(
+        (entry) => entry[1] !== undefined,
+      ),
+    );
   }
 
   async execute(input: unknown, principal: string): Promise<CommandResult> {
@@ -3309,6 +3429,8 @@ export class Controller {
     const native: Promise<unknown>[] = [];
     const operationClosing = this.taskOperationRuntime?.close();
     if (operationClosing) native.push(operationClosing);
+    const chatClosing = this.chatRuntime?.close();
+    if (chatClosing) native.push(chatClosing);
     this.outputAbort.abort();
     native.push(...this.outputReads);
     const usageClosing = this.anthropicUsageRuntime?.close();
@@ -3613,6 +3735,32 @@ export class Controller {
         };
     }
     switch (command.command) {
+      case 'SendChatMessage':
+        return this.chat().sendMessage(command.payload, effects);
+      case 'ResolveChatPermission':
+        return this.chat().resolvePermission(command.payload, effects);
+      case 'StopChatTurn':
+        return this.chat().stopTurn(command.payload, effects);
+      case 'ConfigureChatThread':
+        return this.chat().configure(command.payload);
+      case 'HandoffChatThread':
+        return this.chat().handoff(command.payload);
+      case 'ReadChatThread':
+      case 'ReadChatChanges':
+        if (!this.store.get<Task>('task', command.payload.taskId))
+          return { outcome: 'blocked', reason: 'task-not-found' };
+        return {
+          outcome: 'applied',
+          data:
+            command.command === 'ReadChatThread'
+              ? { kind: 'chat-thread', ...this.chat().readThread(command.payload) }
+              : { kind: 'chat-changes', ...this.chat().readChanges(command.payload) },
+        };
+      case 'ReadChatCatalog':
+        return {
+          outcome: 'applied',
+          data: { kind: 'chat-catalog', ...this.chat().readCatalog(command.payload) },
+        };
       case 'ConfigureLocal':
       case 'BeginLocalConnectionInput':
       case 'CancelLocalConnectionInput':
@@ -5682,22 +5830,27 @@ export class Controller {
     const attempt = this.jobAttempt(run, config.routeId);
     const directory = join(this.home, 'conversation', run.id, attempt.id);
     const ceiling = BigInt(pending[pending.length - 1].cursor);
+    const planning =
+      "json_extract(body,'$.kind') NOT IN ('input-delivery','chat-assistant','chat-system')";
     const rows = this.store.db
       .prepare(
-        "SELECT body FROM conversation_entries WHERE task_id=? AND sequence<=? AND json_extract(body,'$.kind')<>'input-delivery' ORDER BY sequence DESC LIMIT 100",
+        `SELECT body FROM conversation_entries WHERE task_id=? AND sequence<=? AND ${planning} ORDER BY sequence DESC LIMIT 100`,
       )
       .all(taskId, ceiling);
     const total = this.store.db
       .prepare(
-        "SELECT COUNT(*) AS count FROM conversation_entries WHERE task_id=? AND sequence<=? AND json_extract(body,'$.kind')<>'input-delivery'",
+        `SELECT COUNT(*) AS count FROM conversation_entries WHERE task_id=? AND sequence<=? AND ${planning}`,
       )
       .get(taskId, ceiling)?.count as number;
     const historyEntries = rows
       .reverse()
-      .map((row) => ConversationEntrySchema.parse(JSON.parse(row.body as string)));
+      .map((row) => ConversationEntrySchema.parse(JSON.parse(row.body as string)))
+      .filter(planningEntry);
     if (pending.some((entry) => 'context' in entry && entry.context?.length)) {
       const retained = new Set(historyEntries.map((entry) => entry.id));
-      historyEntries.push(...pending.filter((entry) => !retained.has(entry.id)));
+      historyEntries.push(
+        ...pending.filter(planningEntry).filter((entry) => !retained.has(entry.id)),
+      );
       historyEntries.sort((left, right) => (BigInt(left.cursor) < BigInt(right.cursor) ? -1 : 1));
     }
     const history = historyEntries.map((entry) => ({ role: entry.author.kind, text: entry.text }));

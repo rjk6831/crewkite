@@ -5,6 +5,7 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./chat-adapter": "./src/chat-adapter.ts",
     "./repository": "./src/repository.ts",
     "./worker": "./src/worker.ts"
   },
