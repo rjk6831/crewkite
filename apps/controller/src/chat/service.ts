@@ -31,6 +31,7 @@ import {
   HandoffChatThreadPayloadSchema,
   MAX_CHAT_ENTRY_BYTES,
   type Project,
+  rankFamilies,
   type Task,
 } from '@crewkite/contracts';
 import { z } from 'zod';
@@ -48,6 +49,7 @@ import {
   materialize,
   readCandidateFiles,
 } from '../host/source.ts';
+import { defaultSchedule, groupAbsent, type Schedule } from '../host/worker.ts';
 import type { Store } from '../store/index.ts';
 import {
   type ChatAdapter,
@@ -91,6 +93,10 @@ export type ChatServiceDeps = {
    * `remaining` holds the latest observed usage windows with null for anything not observed.
    */
   catalog: (taskId?: string) => ChatCatalogRead;
+  /** Process table access and timers. Tests replace them; the defaults are the real ones. */
+  groupAbsent?: (group: number) => boolean;
+  signalGroup?: (group: number, signal: NodeJS.Signals) => void;
+  schedule?: Schedule;
 };
 
 type Payload<C extends Command['command']> = Extract<Command, { command: C }>['payload'];
@@ -107,10 +113,13 @@ type Ending = {
   session: ChatSession | null;
   /** Stored on the turn so a reopened view knows why it ended. */
   stopReason: NonNullable<ChatTurn['stopReason']>;
+  /** Process groups still present. Any entry blocks the thread until a restart proves it gone. */
+  groups: readonly number[];
 };
 type FileDiff = ChatChangesRead['files'][number];
 type LiveTurn = {
   taskId: string;
+  role: ChatTurn['role'];
   handle: ChatTurnHandle | null;
   stopRequested: boolean;
   finished: boolean;
@@ -123,7 +132,8 @@ type LiveTurn = {
   noticed: boolean;
   /** Adapters differ on whether they announce the turn edges. The service owns both. */
   started: boolean;
-  completed: boolean;
+  /** How many process groups the handle had reported when the turn row last saved them. */
+  reported: number;
   done: Promise<void>;
 };
 
@@ -157,6 +167,15 @@ const blocked = (reason: string, next?: string): CommandResult => ({
   reason,
   ...(next ? { next } : {}),
 });
+const QUIT_PROCESS = 'Quit the leftover provider process, then restart CrewKite.';
+const ownershipUnknown = () => blocked('ownership-unknown', QUIT_PROCESS);
+const processFailure = () =>
+  chatFailure({
+    stage: 'finish',
+    kind: 'internal',
+    message: 'The provider process did not exit.',
+    nextAction: QUIT_PROCESS,
+  });
 const stoppedResult: ChatTurnResult = {
   stopReason: 'stopped',
   failure: null,
@@ -186,6 +205,8 @@ export class ChatService {
     const thread = this.thread(task.id);
     if (thread.activeTurnId)
       return blocked('turn-running', 'Wait for the reply or stop it, then send again.');
+    // A process from an earlier turn may still write to the scratch copy.
+    if (thread.ownershipUnknown) return ownershipUnknown();
     const selection = payload.selection
       ? this.deps.resolveSelection(task.id, payload.selection)
       : ((thread.selection && this.deps.resolveSelection(task.id, thread.selection)) ??
@@ -222,10 +243,12 @@ export class ChatService {
     if (!open || !option)
       return blocked('permission-not-pending', 'Refresh the thread and answer the open request.');
     live.permissions.delete(payload.requestId);
-    // Allow for this thread covers the kind of tool the request was about. A request with no
-    // known call is filed under other.
-    if (option.kind === 'allow-thread')
-      this.grant(payload.taskId, live.kinds.get(open.callId ?? '') ?? 'other');
+    // Allow for this thread covers the kind of tool the request was about, in later assistant
+    // turns. A request with no known kind, or one filed under other, could be anything, so the
+    // answer stays with this turn. So does one given to a reviewer or advisor, which never edits.
+    const kind = live.kinds.get(open.callId ?? '');
+    if (option.kind === 'allow-thread' && kind && kind !== 'other' && live.role === 'assistant')
+      this.grant(payload.taskId, kind);
     effects.push(() =>
       this.call(() => live.handle?.respondPermission(payload.requestId, payload.choice)),
     );
@@ -272,6 +295,7 @@ export class ChatService {
     const thread = this.thread(task.id);
     if (thread.activeTurnId)
       return blocked('turn-running', 'Stop the reply, then switch providers.');
+    if (thread.ownershipUnknown) return ownershipUnknown();
     const stopped =
       effects && payload.reason === 'limit' ? this.stoppedOnLimit(task.id) : undefined;
     // The person may have moved the thread already. The packet still names the family that stopped.
@@ -304,6 +328,8 @@ export class ChatService {
     const thread = this.thread(task.id);
     if (thread.activeTurnId)
       return blocked('turn-running', 'Wait for the reply or stop it, then accept.');
+    // The scratch copy may still change under a process nobody owns.
+    if (thread.ownershipUnknown) return ownershipUnknown();
     const root = this.deps.projectPath(task.projectId);
     if (!root) return blocked('project-not-found', 'Add the project again, then accept.');
     const base = thread.base;
@@ -383,6 +409,8 @@ export class ChatService {
   }
 
   readThread(payload: Payload<'ReadChatThread'>): ChatThreadRead {
+    // Reads run synchronously on the one connection, so nothing lands between this and the rows.
+    const cursor = this.deps.store.cursor();
     const thread = this.thread(payload.taskId);
     const liveEvents = thread.activeTurnId
       ? newest(compact(this.agentEvents(payload.taskId, thread.activeTurnId)), LIVE_EVENT_BYTES)
@@ -393,7 +421,7 @@ export class ChatService {
       this.messages(payload.taskId, payload.beforeCursor, payload.limit),
       READ_BYTES - used,
     );
-    return ChatThreadReadSchema.parse({ thread, turns, messages, liveEvents });
+    return ChatThreadReadSchema.parse({ thread, turns, messages, liveEvents, cursor });
   }
 
   readChanges(payload: Payload<'ReadChatChanges'>): ChatChangesRead {
@@ -424,28 +452,55 @@ export class ChatService {
     );
   }
 
-  /** A turn left open by a previous controller process has no owner. Fail it visibly. */
+  /**
+   * A turn left open by a previous controller process has no owner. Fail it visibly. Process
+   * groups that no one proved gone are checked again, and a thread stays blocked while any of
+   * them is present. A saved group is never signaled: after a restart its number may belong to
+   * another process.
+   */
   recover() {
-    const open = this.deps.store.db
+    const absent = this.deps.groupAbsent ?? groupAbsent;
+    const rows = this.deps.store.db
       .prepare(
-        "SELECT id,task_id FROM chat_turns WHERE json_extract(body,'$.state') IN ('queued','running','waiting-permission') ORDER BY task_id,sequence",
+        "SELECT id,task_id FROM chat_turns WHERE json_extract(body,'$.state') IN ('queued','running','waiting-permission') OR json_array_length(body,'$.groups')>0 ORDER BY task_id,sequence",
       )
       .all() as { id: string; task_id: string }[];
-    if (!open.length) return;
+    const flagged = this.deps.store.db
+      .prepare("SELECT task_id FROM chat_threads WHERE json_extract(body,'$.ownershipUnknown')=1")
+      .all() as { task_id: string }[];
+    if (!rows.length && !flagged.length) return;
     this.deps.store.transaction(() => {
-      for (const row of open) {
-        if (this.live.has(row.id)) continue;
-        this.settle(row.id, {
-          state: 'failed',
-          failure: chatFailure({
-            stage: 'stream',
-            kind: 'internal',
-            message: 'The turn did not finish before the controller restarted.',
-          }),
-          text: streamedText(this.agentEvents(row.task_id, row.id)),
-          session: null,
-          stopReason: 'error',
-        });
+      for (const row of rows) {
+        const turn = this.turn(row.id);
+        if (!turn || this.live.has(turn.id)) continue;
+        const left = (turn.groups ?? []).filter((group) => !absent(group));
+        if (OPEN_STATES.has(turn.state))
+          this.settle(turn.id, {
+            state: 'failed',
+            failure: left.length
+              ? processFailure()
+              : chatFailure({
+                  stage: 'stream',
+                  kind: 'internal',
+                  message: 'The turn did not finish before the controller restarted.',
+                }),
+            text: streamedText(this.agentEvents(turn.taskId, turn.id)),
+            session: null,
+            stopReason: 'error',
+            groups: left,
+          });
+        else if (left.length !== turn.groups?.length)
+          this.putTurn(this.task(turn.taskId) as Task, withGroups(turn, left));
+      }
+      for (const taskId of new Set(flagged.map((row) => row.task_id))) {
+        const task = this.task(taskId);
+        const { ownershipUnknown: _, ...thread } = this.thread(taskId);
+        const held = this.deps.store.db
+          .prepare(
+            "SELECT 1 FROM chat_turns WHERE task_id=? AND json_array_length(body,'$.groups')>0",
+          )
+          .get(taskId);
+        if (task && !held) this.putThread(task, thread);
       }
     });
   }
@@ -464,6 +519,7 @@ export class ChatService {
   private launch(turn: ChatTurn) {
     const live: LiveTurn = {
       taskId: turn.taskId,
+      role: turn.role,
       handle: null,
       stopRequested: false,
       finished: false,
@@ -472,7 +528,7 @@ export class ChatService {
       kinds: new Map(),
       noticed: false,
       started: false,
-      completed: false,
+      reported: 0,
       done: Promise.resolve(),
     };
     this.live.set(turn.id, live);
@@ -480,12 +536,20 @@ export class ChatService {
   }
 
   private async run(turn: ChatTurn, live: LiveTurn) {
-    let result: ChatTurnResult;
+    let result = await this.outcome(turn, live);
+    // The thread stays busy until the provider's processes are gone. Whatever the adapter
+    // reported, a process that will not exit makes the turn a failure.
+    const left = await this.quiesce(live.handle?.groups ?? []);
+    if (left.length) result = { ...result, stopReason: 'error', failure: processFailure() };
+    this.finish(turn.id, live, result, left);
+  }
+
+  private async outcome(turn: ChatTurn, live: LiveTurn): Promise<ChatTurnResult> {
     try {
-      result = await this.start(turn, live);
+      return await this.start(turn, live);
     } catch (error) {
       const reason = error instanceof Error ? error.message.slice(0, 2000) : 'Unknown error.';
-      result = {
+      return {
         ...stoppedResult,
         stopReason: 'error',
         failure: chatFailure(
@@ -500,7 +564,24 @@ export class ChatService {
         ),
       };
     }
-    this.finish(turn.id, live, result);
+  }
+
+  /**
+   * Prove every reported process group gone, and only ESRCH proves it. A group still present
+   * gets SIGTERM, SIGKILL a second later, and one more second to exit. Returns what is left.
+   */
+  private async quiesce(reported: readonly number[]): Promise<number[]> {
+    const absent = this.deps.groupAbsent ?? groupAbsent;
+    const signal = this.deps.signalGroup ?? signalGroup;
+    const schedule = this.deps.schedule ?? defaultSchedule;
+    const left = () => owned(reported).filter((group) => !absent(group));
+    for (const name of ['SIGTERM', 'SIGKILL'] as const) {
+      const present = left();
+      if (!present.length) return [];
+      for (const group of present) signal(group, name);
+      await new Promise<void>((resolve) => schedule(resolve, 1000));
+    }
+    return left();
   }
 
   private async start(turn: ChatTurn, live: LiveTurn): Promise<ChatTurnResult> {
@@ -521,8 +602,29 @@ export class ChatService {
       role: turn.role,
     });
     live.handle = adapter.startTurn(request, (event) => this.record(turn, live, event));
+    try {
+      this.deps.store.transaction(() => this.saveGroups(turn.id, live));
+    } catch {
+      // The finish still proves the groups gone. Only a crash before then loses them.
+    }
     if (this.closed || live.stopRequested) live.handle.stop();
     return live.handle.result;
+  }
+
+  /**
+   * Save the groups a live turn has reported, so startup recovery can check them after a crash.
+   * Adapters add a group when they spawn, so the list is saved again when it grows. Groups
+   * already gone are left out.
+   */
+  private saveGroups(turnId: string, live: LiveTurn) {
+    const reported = owned(live.handle?.groups ?? []);
+    if (reported.length === live.reported) return;
+    live.reported = reported.length;
+    const turn = this.turn(turnId);
+    if (!turn || !OPEN_STATES.has(turn.state)) return;
+    const absent = this.deps.groupAbsent ?? groupAbsent;
+    const present = reported.filter((group) => !absent(group));
+    this.putTurn(this.task(turn.taskId) as Task, withGroups(turn, present));
   }
 
   private request(turn: ChatTurn): ChatTurnRequest {
@@ -534,11 +636,11 @@ export class ChatService {
     const message = this.findEntry(task.id, turn.userMessageId);
     if (message?.kind !== 'user-message' || !thread.base)
       throw Error('The message for this turn is missing.');
-    const prompt = withAttachments(message.text, message.attachments ?? []);
+    const directory = this.scratchDirectory(task.id);
+    const prompt = withAttachments(message.text, message.attachments ?? [], directory);
     const history = this.history(task.id, message.cursor);
     const work = join(this.deps.home, 'chat', task.id, 'turns', turn.id);
     mkdirSync(work, { recursive: true, mode: 0o700 });
-    const directory = this.scratchDirectory(task.id);
     const handoff = turn.handoffFrom ? this.takeHandoff(task) : null;
     return {
       turnId: turn.id,
@@ -588,7 +690,7 @@ export class ChatService {
     );
   }
 
-  private record(turn: ChatTurn, live: LiveTurn, value: AgentEvent) {
+  private record(turn: ChatTurn, live: LiveTurn, value: AgentEvent, settling = false) {
     if (live.finished) return;
     const parsed = AgentEventSchema.safeParse(value);
     let event: AgentEvent;
@@ -607,10 +709,8 @@ export class ChatService {
       if (live.started) return;
       live.started = true;
     }
-    if (event.type === 'turn.completed') {
-      if (live.completed) return;
-      live.completed = true;
-    }
+    // The turn is complete when the service settles it, after its processes are proven gone.
+    if (event.type === 'turn.completed' && !settling) return;
     addText(live.items, event);
     if (event.type === 'tool.started') live.kinds.set(event.callId, event.kind);
     if (event.type === 'permission.requested')
@@ -623,25 +723,26 @@ export class ChatService {
         if (event.type === 'permission.requested') this.setState(turn.id, 'waiting-permission');
         if (event.type === 'permission.resolved' && !live.permissions.size)
           this.setState(turn.id, 'running');
+        this.saveGroups(turn.id, live);
       });
     } catch {
       // An adapter never sees controller failures. The turn result still settles the row.
     }
   }
 
-  private finish(turnId: string, live: LiveTurn, result: ChatTurnResult) {
+  private finish(turnId: string, live: LiveTurn, result: ChatTurnResult, left: number[]) {
     const turn = this.turn(turnId);
-    if (turn && !live.completed)
-      this.record(turn, live, {
-        type: 'turn.completed',
-        turnId,
-        stopReason: result.stopReason,
-        failure: result.failure,
-      });
+    if (turn)
+      this.record(
+        turn,
+        live,
+        { type: 'turn.completed', turnId, stopReason: result.stopReason, failure: result.failure },
+        true,
+      );
     live.finished = true;
     this.live.delete(turnId);
     try {
-      this.deps.store.transaction(() => this.settle(turnId, ending(result, live.items)));
+      this.deps.store.transaction(() => this.settle(turnId, ending(result, live.items, left)));
     } catch {
       // The row stays open. Startup recovery fails it with a visible reason.
     }
@@ -666,14 +767,20 @@ export class ChatService {
           text: fitText(end.text, 262_144),
         })
       : null;
-    this.putTurn(task, {
-      ...turn,
-      state: end.state,
-      endedAt: this.deps.now(),
-      failure: end.failure,
-      assistantMessageId: reply?.id ?? null,
-      stopReason: end.stopReason,
-    });
+    this.putTurn(
+      task,
+      withGroups(
+        {
+          ...turn,
+          state: end.state,
+          endedAt: this.deps.now(),
+          failure: end.failure,
+          assistantMessageId: reply?.id ?? null,
+          stopReason: end.stopReason,
+        },
+        end.groups,
+      ),
+    );
     const thread = this.thread(task.id);
     const session =
       turn.role === 'assistant' && end.session?.family === turn.selection.family
@@ -685,6 +792,8 @@ export class ChatService {
       sessions: session
         ? [...thread.sessions.filter((value) => value.family !== session.family), session]
         : thread.sessions,
+      // Only startup recovery clears this, once it finds every group gone.
+      ...(end.groups.length ? { ownershipUnknown: true } : {}),
     });
     if (end.stopReason === 'limit') this.appendLimitLine(task, turn, end.failure);
     if (end.failure)
@@ -720,6 +829,18 @@ export class ChatService {
       const thread = this.thread(task.id);
       // A person who already moved the thread has made the choice.
       if (!thread.autoHandoff || thread.selection?.family !== turn.selection.family) return;
+      // One automatic move per message. The catalog can be stale, and a family it still shows
+      // with allowance may stop on its limit too. A second move would bounce between them.
+      if (this.movedOnLimit(turn)) {
+        this.deps.store.transaction(() =>
+          this.appendEntry(task, {
+            kind: 'chat-system',
+            author: { kind: 'system', turnId: turn.id },
+            text: 'Automatic handoff already moved this message once. Pick a provider to continue.',
+          }),
+        );
+        return;
+      }
       const selection = this.nextFamily(task.id, turn.selection.family);
       if (!selection) return;
       const effects: Effects = [];
@@ -732,6 +853,17 @@ export class ChatService {
     } catch {
       // The limit line stands and the card in the thread still offers the switch.
     }
+  }
+
+  /** True when this turn reran a message that an earlier turn left on a usage limit. */
+  private movedOnLimit(turn: ChatTurn): boolean {
+    if (!turn.handoffFrom) return false;
+    return this.deps.store.db
+      .prepare(
+        "SELECT body FROM chat_turns WHERE task_id=? AND sequence<? AND json_extract(body,'$.userMessageId')=?",
+      )
+      .all(turn.taskId, turn.sequence, turn.userMessageId)
+      .some((row) => endedOnLimit(ChatTurnSchema.parse(JSON.parse(row.body as string))));
   }
 
   /** The newest turn, when it ended on a usage limit and the person has written nothing since. */
@@ -779,9 +911,12 @@ export class ChatService {
     // still waiting for the next answer.
     const own = role === 'assistant';
     const pending = own ? this.pendingHandoff(task.id) : null;
+    let handoffFrom: ChatFamily | null = null;
     // Sending on the provider the thread came from cancels the switch.
-    const handoffFrom = pending && pending.from !== selection.family ? pending.from : null;
-    if (pending && !handoffFrom) this.setHandoff(task.id, null);
+    if (pending && pending.from === selection.family) this.setHandoff(task.id, null);
+    else if (pending) handoffFrom = pending.from;
+    // A family picked in the composer starts cold too, so the switch is a manual handoff.
+    else if (own) handoffFrom = this.switchedFrom(task.id, selection.family);
     const turn = ChatTurnSchema.parse({
       id: this.deps.id('trn'),
       taskId: task.id,
@@ -806,17 +941,24 @@ export class ChatService {
     effects.push(() => this.launch(turn));
   }
 
-  /** Highest remaining percent, then soonest reset. The family that stopped never qualifies. */
-  private nextFamily(taskId: string, stopped: ChatFamily): ChatModelSelection | null {
-    const ranked = this.deps
-      .catalog(taskId)
-      .families.filter(
-        (entry) =>
-          entry.connected && entry.family !== stopped && this.deps.adapters.has(entry.family),
+  /** The family of the last assistant turn, when it differs from the one about to answer. */
+  private switchedFrom(taskId: string, family: ChatFamily): ChatFamily | null {
+    const row = this.deps.store.db
+      .prepare(
+        "SELECT body FROM chat_turns WHERE task_id=? AND json_extract(body,'$.role')='assistant' ORDER BY sequence DESC LIMIT 1",
       )
-      .map((entry) => ({ entry, ...allowance(entry.remaining) }))
-      .sort((a, b) => b.percent - a.percent || a.resetsAt - b.resetsAt);
-    for (const { entry } of ranked) {
+      .get(taskId);
+    const last = row ? ChatTurnSchema.parse(JSON.parse(row.body as string)) : undefined;
+    return last && last.selection.family !== family ? last.selection.family : null;
+  }
+
+  /**
+   * The first family in the shared ranking with an adapter and a usable default model. The
+   * family that stopped and any family at zero never qualify.
+   */
+  private nextFamily(taskId: string, stopped: ChatFamily): ChatModelSelection | null {
+    for (const entry of rankFamilies(this.deps.catalog(taskId).families, [stopped])) {
+      if (!this.deps.adapters.has(entry.family)) continue;
       const model = entry.defaultModel ?? entry.models[0]?.model;
       if (!model) continue;
       const effort = entry.models.find((value) => value.model === model)?.defaultEffort;
@@ -1249,7 +1391,11 @@ function fitHistory(
   return kept;
 }
 
-function ending(result: ChatTurnResult, items: ReadonlyMap<string, string>): Ending {
+function ending(
+  result: ChatTurnResult,
+  items: ReadonlyMap<string, string>,
+  groups: readonly number[],
+): Ending {
   const stopReason =
     result.stopReason === 'done' || result.stopReason === 'stopped' || result.stopReason === 'limit'
       ? result.stopReason
@@ -1278,21 +1424,35 @@ function ending(result: ChatTurnResult, items: ReadonlyMap<string, string>): End
     // Adapters may report only finished items on stop. The streamed text is what was shown.
     text: reportedText.trim() ? reportedText : joinText(items),
     session: session.success ? session.data : null,
+    groups,
   };
 }
 
 /**
- * The window with the least left says how much a family can still do. A family with no
- * observed percent ranks below every family with one, and an unknown reset ranks last.
+ * Distinct groups a signal can safely reach. Zero or one would reach this process's own group
+ * or every process.
  */
-function allowance(remaining: ChatCatalogRead['families'][number]['remaining']) {
-  const [tightest] = remaining
-    .filter((window) => window.percent !== null)
-    .sort((a, b) => (a.percent ?? 0) - (b.percent ?? 0) || reset(a.resetsAt) - reset(b.resetsAt));
-  return { percent: tightest?.percent ?? -1, resetsAt: reset(tightest?.resetsAt ?? null) };
+function owned(groups: readonly number[]): number[] {
+  return [...new Set(groups)].filter((group) => Number.isSafeInteger(group) && group > 1);
 }
 
-const reset = (at: string | null) => (at ? Date.parse(at) : Number.MAX_SAFE_INTEGER);
+function signalGroup(group: number, signal: NodeJS.Signals) {
+  if (!owned([group]).length) return;
+  try {
+    process.kill(-group, signal);
+  } catch {
+    // ESRCH means the group is already gone. The next check proves it.
+  }
+}
+
+/**
+ * The turn with these groups recorded, or with none when the list is empty.
+ * shortcut: the row keeps the newest 64. Upgrade: a table of turn groups.
+ */
+function withGroups(turn: ChatTurn, groups: readonly number[]): ChatTurn {
+  const { groups: _, ...rest } = turn;
+  return groups.length ? { ...rest, groups: groups.slice(-64) } : rest;
+}
 
 function addText(items: Map<string, string>, event: AgentEvent) {
   if (event.type === 'text.delta')

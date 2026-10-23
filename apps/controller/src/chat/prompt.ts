@@ -1,3 +1,4 @@
+import { resolve, sep } from 'node:path';
 import type { ChatFamily } from '@crewkite/contracts';
 import type { ChatHistoryEntry } from './adapter.ts';
 
@@ -98,8 +99,33 @@ export function adviceContext(
   return [...lines, `The last answer:\n\n${text}`].join('\n');
 }
 
-export function withAttachments(text: string, attachments: readonly string[]): string {
-  return attachments.length ? `${text}\n\nAttached paths:\n${attachments.join('\n')}` : text;
+/**
+ * The model works in the scratch copy, and the person reviews only what changes there. A path
+ * that resolves outside the copy is left out, with one line saying so.
+ */
+export function withAttachments(
+  text: string,
+  attachments: readonly string[],
+  directory: string,
+): string {
+  const root = resolve(directory);
+  const inside = (path: string) => {
+    const target = resolve(root, path);
+    return target === root || target.startsWith(`${root}${sep}`);
+  };
+  const kept = attachments.filter(inside);
+  const dropped = attachments.filter((path) => !inside(path));
+  return [
+    text,
+    ...(kept.length ? [`Attached paths:\n${kept.join('\n')}`] : []),
+    ...(dropped.length
+      ? [
+          dropped
+            .map((path) => `Attachment outside the scratch copy was not included: ${path}`)
+            .join('\n'),
+        ]
+      : []),
+  ].join('\n\n');
 }
 
 /**
