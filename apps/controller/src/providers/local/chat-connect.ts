@@ -23,15 +23,17 @@ export async function connectLocalModel(input: {
   };
   try {
     const loaded = await runtime.llm.listLoaded();
-    const model =
+    const requested =
       loaded.find((value) => value.modelKey === input.model) ??
-      loaded.find((value) => value.identifier === input.model) ??
-      loaded[0];
+      loaded.find((value) => value.identifier === input.model);
+    const model = requested ?? loaded[0];
     if (!model) throw Error('No model is loaded in the Local app.');
     return {
       model,
       contextLength: await model.getContextLength(),
       modelKey: model.modelKey,
+      // True when the asked-for model is not loaded and the first loaded one stands in.
+      fellBack: requested === undefined,
       dispose,
     };
   } catch (error) {

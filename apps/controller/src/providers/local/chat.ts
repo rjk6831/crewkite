@@ -42,11 +42,15 @@ export type LoadedModelLike = {
   act(chat: ChatInput, tools: Tool[], options: LLMActionOpts): Promise<unknown>;
   countTokens(text: string): Promise<number>;
 };
-/** `dispose` closes the runtime client the connection opened. It is safe to call more than once. */
+/**
+ * `fellBack` is true when the requested model is not loaded and `modelKey` names another one.
+ * `dispose` closes the runtime client the connection opened. It is safe to call more than once.
+ */
 export type LocalConnect = (request: ChatTurnRequest) => Promise<{
   model: LoadedModelLike;
   contextLength: number;
   modelKey: string;
+  fellBack: boolean;
   dispose: () => Promise<void>;
 }>;
 
@@ -605,12 +609,18 @@ function startLocalTurn(
       return ending ? ended() : finish('error', connectFailure(error));
     }
     if (ending) return ended();
-    const { model, contextLength, modelKey } = connection;
+    const { model, contextLength, modelKey, fellBack } = connection;
+    if (fellBack)
+      notice(
+        'warning',
+        `Local: ${request.selection.model} is not loaded, so ${modelKey} answered. Load ${request.selection.model} or pick ${modelKey} in the composer.`,
+      );
     usage = { usedTokens: 0, capacityTokens: contextLength };
     session = {
       family: 'local',
       sessionId: modelKey.slice(0, 512),
-      model: request.selection.model,
+      // The thread shows the model that answered, not the one that was asked for.
+      model: (fellBack ? modelKey : request.selection.model).slice(0, 200),
       updatedAt: new Date(now()).toISOString(),
     };
 

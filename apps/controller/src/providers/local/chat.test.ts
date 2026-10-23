@@ -133,7 +133,12 @@ function fixture() {
   return { root, scratch, home, clock, request };
 }
 
-function start(model: LoadedModelLike, contextLength: number, request: ChatTurnRequest) {
+function start(
+  model: LoadedModelLike,
+  contextLength: number,
+  request: ChatTurnRequest,
+  loaded = { modelKey: 'local-fixture', fellBack: false },
+) {
   const events: AgentEvent[] = [];
   let handle: ChatTurnHandle | undefined;
   let disposals = 0;
@@ -141,7 +146,7 @@ function start(model: LoadedModelLike, contextLength: number, request: ChatTurnR
     connect: async () => ({
       model,
       contextLength,
-      modelKey: 'local-fixture',
+      ...loaded,
       dispose: async () => {
         disposals++;
       },
@@ -279,8 +284,23 @@ test('a local turn streams, reads freely, edits after permission and reports its
       { role: 'user', text: 'Rename n to count in src/a.ts.' },
       { role: 'assistant', text: result.assistantText },
     ] satisfies ChatHistoryEntry[];
-    await start(second.model, 8192, request(1, { history: later, prompt: 'Thanks.' })).handle
-      .result;
+    // The requested model is not loaded on this turn, so the first loaded one answers. The turn
+    // says so once, and the session records the model that answered.
+    const fallback = start(second.model, 8192, request(1, { history: later, prompt: 'Thanks.' }), {
+      modelKey: 'loaded-fixture',
+      fellBack: true,
+    });
+    const next = await fallback.handle.result;
+    assert.deepEqual(fallback.events[1], {
+      type: 'provider.notice',
+      turnId: turnIds[1],
+      level: 'warning',
+      message:
+        'Local: local-fixture is not loaded, so loaded-fixture answered. Load local-fixture or pick loaded-fixture in the composer.',
+    });
+    assert.equal(fallback.events.filter((event) => event.type === 'provider.notice').length, 2);
+    assert.equal(next.session?.sessionId, 'loaded-fixture');
+    assert.equal(next.session?.model, 'loaded-fixture');
     const chat = second.calls[0].chat;
     assert.ok(chat[0].content?.includes(SUMMARY));
     assert.deepEqual(
