@@ -331,14 +331,16 @@ test('startup recovery fails a turn whose controller stopped before it finished'
   assert.deepEqual(thread.messages.at(-1)?.author, { kind: 'system', turnId: turn.id });
 });
 
-// The test replaces the process table, so the group number is never signaled for real.
-test('a provider process that outlives its turn blocks the thread until a restart finds it gone', {
+// The test replaces the process table and the boot instant, so no group number is signaled for
+// real.
+test('a provider process that outlives its turn blocks the thread until a later check finds it gone', {
   timeout: 30000,
 }, async (t) => {
   const group = 4242;
   const reused = 4300;
   const present = new Set([group]);
   const signals: string[] = [];
+  let booted = new Date(0).toISOString();
   const thread = standalone(t, {
     adapters: new Map([
       [
@@ -358,6 +360,7 @@ test('a provider process that outlives its turn blocks the thread until a restar
       setImmediate(work);
       return () => {};
     },
+    bootedAt: () => booted,
   });
   const { store, taskId } = thread;
   // The second group has exited by the time the turn row first saves its groups. Later in the
@@ -373,7 +376,13 @@ test('a provider process that outlives its turn blocks the thread until a restar
   present.delete(reused);
 
   assert.deepEqual(signals, [`${group} SIGTERM`, `${group} SIGKILL`]);
-  assert.equal(turn.failure?.message, 'The provider process did not exit.');
+  assert.deepEqual(
+    [turn.failure?.message, turn.failure?.nextAction],
+    [
+      'The provider process (group 4242) did not exit.',
+      'Quit process group 4242, then send again.',
+    ],
+  );
   assert.deepEqual(turn.groups, [group]);
   const completed = agentEvents(thread).at(-1);
   assert.equal(completed?.type === 'turn.completed' && completed.stopReason, 'error');
@@ -382,23 +391,38 @@ test('a provider process that outlives its turn blocks the thread until a restar
     thread.service.accept({ taskId, branch: 'crewkite/fix-rounding' }, undefined),
   );
   assert.deepEqual(
-    [thread.send('Again.').reason, accept.reason],
-    ['ownership-unknown', 'ownership-unknown'],
+    [thread.send('Again.'), accept].map((result) => [result.reason, result.next]),
+    [
+      ['ownership-unknown', 'Quit process group 4242, then send again.'],
+      ['ownership-unknown', 'Quit process group 4242, then accept.'],
+    ],
   );
 
-  // A restart while the group is present keeps the block. The next one, once it is gone, lifts it.
-  let restarted = thread.start();
+  // A restart while the group is present keeps the block.
+  const restarted = thread.start();
   restarted.recover();
   assert.equal(thread.read(restarted).thread.ownershipUnknown, true);
+  // Once the group is gone, the next send checks again and goes ahead without a restart.
   present.clear();
-  restarted = thread.start();
-  restarted.recover();
+  const done = turnReaches(thread, 'done');
+  assert.equal(thread.send('Again.', selection, restarted).outcome, 'applied');
   const after = thread.read(restarted);
   assert.equal(after.thread.ownershipUnknown, undefined);
   assert.equal(after.turns[0].groups, undefined);
-  const done = turnReaches(thread, 'done');
-  assert.equal(thread.send('Again.', selection, restarted).outcome, 'applied');
   await done;
+
+  // No process survives a reboot, so a group saved before one is gone even when its number is
+  // in use again.
+  present.add(group);
+  const held = turnReaches(thread, 'failed');
+  thread.send('Once more.', selection, restarted);
+  assert.deepEqual((await held).groups, [group]);
+  booted = thread.clock.advance(60_000);
+  const rebooted = thread.start();
+  rebooted.recover();
+  const clear = thread.read(rebooted);
+  assert.equal(clear.thread.ownershipUnknown, undefined);
+  assert.equal(clear.turns.at(-1)?.groups, undefined);
 });
 
 test('a thread read returns messages in cursor order and the live events of the open turn', {
