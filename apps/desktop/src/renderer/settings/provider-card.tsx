@@ -1,9 +1,10 @@
 import type { ChatCatalogRead, ChatFamily, WorkspaceState } from '@crewkite/contracts';
-import { type ReactNode, useId } from 'react';
+import { type ReactNode, useId, useState } from 'react';
 import { familyClass, familyName } from '../components.tsx';
 import type { Workspace } from '../source.ts';
 import { type UsageCard, UsageGauges } from '../usage-gauges.tsx';
 import type { UsageGaugeCard } from '../usage-presentation.ts';
+import { readFamilyDefaults, writeFamilyDefault } from './preferences.ts';
 import type { ProviderActions } from './provider-actions.ts';
 
 export type CatalogEntry = ChatCatalogRead['families'][number];
@@ -27,24 +28,70 @@ const reasonText = (reason: string) => {
 
 const modelLimit = 12;
 
-function Models({ entry, children }: { entry: CatalogEntry | undefined; children?: ReactNode }) {
+// The family's models and the default the person picks among them. A choice the provider no
+// longer lists stays saved, and the catalog's default applies until the model is listed again.
+function Models({
+  family,
+  entry,
+  children,
+}: {
+  family: ChatFamily;
+  entry: CatalogEntry | undefined;
+  children?: ReactNode;
+}) {
   const models = entry?.models ?? [];
+  const selectId = useId();
+  const hintId = useId();
+  const [chosen, setChosen] = useState(() => readFamilyDefaults()[family] ?? '');
+  const listed = models.some(({ model }) => model === chosen);
+  const current = listed ? chosen : entry?.defaultModel;
+  const fallback = models.find(({ model }) => model === entry?.defaultModel)?.label;
   return (
     <section className="st-block" aria-label="Models">
       <div className="st-subhead">
         <h3>Models</h3>
         {models.length > 0 && <span>{models.length} listed</span>}
       </div>
+      {entry?.connected && models.length > 1 && (
+        <div className="st-field">
+          <label className="st-name" htmlFor={selectId}>
+            Default model
+          </label>
+          <small className="st-hint" id={hintId}>
+            A new thread on this provider starts on it. The rail and the picker show its allowance.
+          </small>
+          <div className="st-controls">
+            <select
+              id={selectId}
+              aria-describedby={hintId}
+              value={listed ? chosen : ''}
+              onChange={(event) => {
+                setChosen(event.target.value);
+                writeFamilyDefault(family, event.target.value || null);
+              }}
+            >
+              <option value="">
+                {fallback ? `Provider default (${fallback})` : 'Provider default'}
+              </option>
+              {models.map((model) => (
+                <option key={model.model} value={model.model}>
+                  {model.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+      )}
       {models.length > 0 ? (
         <ul className="st-models">
           {models.slice(0, modelLimit).map((model) => (
             <li
               key={model.model}
-              className={model.model === entry?.defaultModel ? 'is-default' : undefined}
+              className={model.model === current ? 'is-default' : undefined}
               title={model.efforts.length > 1 ? `Effort: ${model.efforts.join(', ')}` : model.model}
             >
               {model.label}
-              {model.model === entry?.defaultModel && <em>default</em>}
+              {model.model === current && <em>default</em>}
             </li>
           ))}
           {models.length > modelLimit && (
@@ -123,7 +170,9 @@ export function ProviderCard({
       <div className="st-body">
         <div className="st-col">{main}</div>
         <div className="st-col">
-          <Models entry={entry}>{models}</Models>
+          <Models family={family} entry={entry}>
+            {models}
+          </Models>
           {side}
         </div>
       </div>

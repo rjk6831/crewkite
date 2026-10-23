@@ -2,7 +2,13 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { ChatCatalogRead } from '@crewkite/contracts';
 import { railRows } from './allowance.ts';
-import { preferredSelection, readThreadDefaults, writeThreadDefaults } from './preferences.ts';
+import {
+  familyModel,
+  preferredSelection,
+  readThreadDefaults,
+  writeFamilyDefault,
+  writeThreadDefaults,
+} from './preferences.ts';
 
 const NOW = Date.parse('2026-10-23T12:00:00.000Z');
 const at = (minutes: number) => new Date(NOW + minutes * 60_000).toISOString();
@@ -93,4 +99,27 @@ test('saved thread defaults survive bad storage and apply only to a connected, l
     store,
   );
   assert.equal(preferredSelection(catalog, store), null);
+
+  // A family's default model survives a reload. Once the family stops listing it, the catalog's
+  // default takes over, also for a thread default whose own model is gone.
+  const openai = catalog.families[0];
+  const larger = {
+    ...openai,
+    models: [...openai.models, { ...openai.models[0], model: 'large-2' }],
+  };
+  writeFamilyDefault('openai', 'large-2', store);
+  assert.equal(familyModel(larger, store), 'large-2');
+  assert.equal(familyModel(openai, store), 'large-1');
+  writeThreadDefaults(
+    {
+      selection: { family: 'openai', model: 'large-9', effort: 'high' },
+      permissionPolicy: 'ask',
+    },
+    store,
+  );
+  assert.deepEqual(preferredSelection(catalog, store), {
+    family: 'openai',
+    model: 'large-1',
+    effort: 'high',
+  });
 });

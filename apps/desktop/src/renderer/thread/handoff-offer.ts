@@ -5,9 +5,10 @@ import {
   rankFamilies,
   tightestAllowance,
 } from '@crewkite/contracts';
+import { familyModel } from '../settings/preferences.ts';
 import { activeTurnId, type ThreadState } from './thread-state.ts';
 
-// What the thread offers after a provider stops on a usage limit. Both functions are pure so the
+// What the thread offers after a provider stops on a usage limit. Both are plain functions so the
 // rule can be tested without React.
 
 export type LimitOffer = {
@@ -57,8 +58,9 @@ export type OfferChoice = {
  * order the contract ranks them. A family with nothing left is not offered.
  */
 export function offerChoices(catalog: ChatCatalogRead, stopped: ChatFamily): OfferChoice[] {
-  return rankFamilies(catalog.families, [stopped]).flatMap((entry) => {
-    const model = entry.defaultModel ?? entry.models[0]?.model;
+  const ranked = rankFamilies(catalog.families, [stopped], (entry) => familyModel(entry));
+  return ranked.flatMap((entry) => {
+    const model = familyModel(entry) ?? entry.models[0]?.model;
     if (!model) return [];
     const effort = entry.models.find((value) => value.model === model)?.defaultEffort;
     const { percent } = tightestAllowance(entry, model);

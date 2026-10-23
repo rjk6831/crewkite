@@ -1,5 +1,8 @@
 import {
+  type ChatCatalogEntry,
   type ChatCatalogRead,
+  type ChatFamily,
+  ChatFamilySchema,
   type ChatModelSelection,
   ChatModelSelectionSchema,
   type ChatPermissionPolicy,
@@ -54,17 +57,84 @@ export function writeThreadDefaults(next: ThreadDefaults, store: Store | null = 
   } catch {}
 }
 
-/** The saved model for a new thread, or null when its family is no longer connected or lists it. */
+// Family default models live under their own key. The General card keeps a copy of the thread
+// defaults while it is open, and one shared key would let that copy overwrite a model picked on a
+// provider card.
+const familyKey = 'crewkite-family-models-v1';
+
+export type FamilyDefaults = Partial<Record<ChatFamily, string>>;
+
+const listeners = new Set<() => void>();
+
+/** Calls `listener` after a family default changes. Returns the call that stops it. */
+export function onFamilyDefaults(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => void listeners.delete(listener);
+}
+
+export function readFamilyDefaults(store: Store | null = browserStore()): FamilyDefaults {
+  try {
+    const raw = store?.getItem(familyKey);
+    const saved = raw ? (JSON.parse(raw) as Record<string, unknown> | null) : null;
+    const defaults: FamilyDefaults = {};
+    for (const family of ChatFamilySchema.options) {
+      const model = saved?.[family];
+      if (typeof model === 'string' && model.length > 0 && model.length <= 200)
+        defaults[family] = model;
+    }
+    return defaults;
+  } catch {
+    return {};
+  }
+}
+
+/** Saves the default model for one family. Null goes back to the catalog's default. */
+export function writeFamilyDefault(
+  family: ChatFamily,
+  model: string | null,
+  store: Store | null = browserStore(),
+) {
+  const next = readFamilyDefaults(store);
+  if (model) next[family] = model;
+  else delete next[family];
+  try {
+    store?.setItem(familyKey, JSON.stringify(next));
+  } catch {}
+  for (const listener of listeners) listener();
+}
+
+/**
+ * The model a family's allowance and default pick follow: the person's choice while the family
+ * still lists it, else the catalog's default. A choice the catalog dropped stays saved, so it
+ * applies again if the model comes back.
+ */
+export function familyModel(
+  entry: Pick<ChatCatalogEntry, 'family' | 'models' | 'defaultModel'>,
+  store: Store | null = browserStore(),
+): string | null {
+  const chosen = readFamilyDefaults(store)[entry.family];
+  return chosen && entry.models.some(({ model }) => model === chosen) ? chosen : entry.defaultModel;
+}
+
+/**
+ * The saved model for a new thread. When its family no longer lists it, the family's default model
+ * takes its place. Null when the family is not connected or lists neither.
+ */
 export function preferredSelection(
   catalog: ChatCatalogRead | null,
   store: Store | null = browserStore(),
 ): ChatModelSelection | null {
   const saved = readThreadDefaults(store).selection;
   const entry = catalog?.families.find(({ family }) => family === saved?.family);
-  const model = entry?.models.find(({ model }) => model === saved?.model);
-  if (!saved || !entry?.connected || !model) return null;
+  if (!saved || !entry?.connected) return null;
+  const fallback = familyModel(entry, store);
+  const model =
+    entry.models.find(({ model }) => model === saved.model) ??
+    entry.models.find(({ model }) => model === fallback);
+  if (!model) return null;
   return {
-    ...saved,
+    family: entry.family,
+    model: model.model,
     effort: model.efforts.includes(saved.effort) ? saved.effort : model.defaultEffort,
   };
 }

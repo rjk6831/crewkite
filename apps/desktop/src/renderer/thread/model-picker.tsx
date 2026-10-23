@@ -9,6 +9,7 @@ import {
 import { ArrowRightLeft, Check, ChevronDown } from 'lucide-react';
 import { type KeyboardEvent, useEffect, useId, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
+import { familyModel } from '../settings/preferences.ts';
 import { formatSpan } from '../usage-gauges.tsx';
 
 type Entry = ChatCatalogRead['families'][number];
@@ -29,7 +30,7 @@ const left = (percent: number | null) =>
 // family line follows its default model. A window named for another model does not count.
 function allowance(entry: Entry, nowMs: number): string {
   if (entry.family === 'local' && entry.remaining.length === 0) return 'Runs on this computer';
-  const { percent, resetsAt } = tightestAllowance(entry, entry.defaultModel);
+  const { percent, resetsAt } = tightestAllowance(entry, familyModel(entry));
   const reset = resetsAt ? Date.parse(resetsAt) - nowMs : null;
   return percent !== null && reset !== null && reset > 0
     ? `${left(percent)}, resets in ${formatSpan(reset)}`
@@ -40,7 +41,7 @@ function allowance(entry: Entry, nowMs: number): string {
 // on its row when that differs from the family line.
 function modelAllowance(entry: Entry, model: string): string | null {
   const own = left(tightestAllowance(entry, model).percent);
-  return own === left(tightestAllowance(entry, entry.defaultModel).percent) ? null : own;
+  return own === left(tightestAllowance(entry, familyModel(entry)).percent) ? null : own;
 }
 
 export function findModel(catalog: ChatCatalogRead | null, selection: ChatModelSelection | null) {
@@ -57,8 +58,10 @@ export function defaultSelection(
   const [entry] = rankFamilies(
     (catalog?.families ?? []).filter((value) => value.models.length > 0),
     exclude,
+    (value) => familyModel(value),
   );
-  const model = entry?.models.find(({ model }) => model === entry.defaultModel) ?? entry?.models[0];
+  const chosen = entry && familyModel(entry);
+  const model = entry?.models.find(({ model }) => model === chosen) ?? entry?.models[0];
   return entry && model
     ? { family: entry.family, model: model.model, effort: model.defaultEffort }
     : null;

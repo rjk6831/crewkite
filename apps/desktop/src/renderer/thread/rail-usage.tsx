@@ -2,6 +2,7 @@ import type { WorkspaceState } from '@crewkite/contracts';
 import { useEffect, useState } from 'react';
 import { familyName } from '../components.tsx';
 import { railRows } from '../settings/allowance.ts';
+import { onFamilyDefaults } from '../settings/preferences.ts';
 import { useCatalog } from '../settings/use-catalog.ts';
 import { formatSpan } from '../usage-gauges.tsx';
 import type { ThreadSource } from './commands.ts';
@@ -19,9 +20,14 @@ export function RailUsage({
 }) {
   const { catalog } = useCatalog(source, header);
   const [now, setNow] = useState(Date.now);
+  // A default model picked in Settings changes which windows count, so the rows redraw at once.
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 30_000);
-    return () => window.clearInterval(timer);
+    const stop = onFamilyDefaults(() => setNow(Date.now()));
+    return () => {
+      window.clearInterval(timer);
+      stop();
+    };
   }, []);
   const rows = railRows(catalog, now);
   if (rows.length === 0) return null;
