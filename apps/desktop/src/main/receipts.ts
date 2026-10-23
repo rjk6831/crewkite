@@ -98,7 +98,10 @@ export class CommandReceipts {
     const next = this.commands.filter((item) => item.key !== command.key);
     if (pending) next.push(command);
     const content = next.map((item) => JSON.stringify(item)).join('\n');
-    const stop = command.command === 'StopRun' || command.command === 'StopGoogleAcpSetup';
+    const stop =
+      command.command === 'StopRun' ||
+      command.command === 'StopGoogleAcpSetup' ||
+      command.command === 'StopChatTurn';
     if (
       pending &&
       (next.length > (stop ? 33 : 32) ||
