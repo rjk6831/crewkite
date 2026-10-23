@@ -172,6 +172,9 @@ function remaining(input: ChatCatalogInput, family: ChatFamily): Entry['remainin
           current && observation.remaining?.unit === 'percent' ? observation.remaining.value : null,
         resetsAt: observation.resetsAt,
         observedAt: observation.observedAt,
+        // The scope tells a provider or pool window from one for a single model, which the id
+        // alone cannot always do.
+        ...(observation.semantics ? { scope: observation.semantics.scope } : {}),
       };
     });
 }

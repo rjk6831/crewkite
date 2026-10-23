@@ -337,6 +337,8 @@ export const ChatCatalogEntrySchema = z.strictObject({
         percent: z.number().min(0).max(100).nullable(),
         resetsAt: timestamp.nullable(),
         observedAt: timestamp.nullable(),
+        /** The scope the usage observation reported. Missing when the reader did not say. */
+        scope: z.enum(['provider', 'model', 'pool']).optional(),
       }),
     )
     .max(8)
@@ -390,27 +392,32 @@ const windowTokens = (windowId: string) =>
     .filter((token) => token !== '' && !genericWindowTokens.has(token));
 
 /**
- * Whether a usage window limits a model. A window whose id names a model applies only to a model
- * whose id carries every token it names. It takes every token, since an id such as
+ * Whether a usage window limits a model. A window the reader scoped to the provider or to a shared
+ * pool limits every model. Otherwise a window whose id names a model applies only to a model whose
+ * id carries every token it names. It takes every token, since an id such as
  * `<vendor>-<model>-weekly` also carries the vendor prefix that every model id of the family
  * shares. A window that names no model applies to every model, and an unknown model counts every
- * window. `reported` lists every window id the family reports. Tokens all of them carry name the
- * family's own bucket, such as a client name, and never narrow a window.
+ * window. `reported` lists every window id the family reports. With two or more, tokens all of
+ * them carry name the family's own bucket, such as a client name, and never narrow a window. A
+ * lone window shares every token with itself, so it names no bucket.
  */
 export function windowAppliesTo(
-  windowId: string,
+  window: Pick<ChatCatalogEntry['remaining'][number], 'windowId' | 'scope'>,
   model: string | null,
   reported: readonly string[] = [],
 ): boolean {
-  if (model === null) return true;
-  const shared = reported
-    .map(windowTokens)
-    .reduce<string[] | null>(
-      (common, tokens) => (common ? common.filter((token) => tokens.includes(token)) : tokens),
-      null,
-    );
+  if (model === null || window.scope === 'provider' || window.scope === 'pool') return true;
+  const ids = [...new Set(reported)];
+  const shared =
+    ids.length < 2
+      ? []
+      : ids
+          .map(windowTokens)
+          .reduce((common, tokens) => common.filter((token) => tokens.includes(token)));
   const id = model.toLowerCase();
-  return windowTokens(windowId).every((token) => id.includes(token) || shared?.includes(token));
+  return windowTokens(window.windowId).every(
+    (token) => id.includes(token) || shared.includes(token),
+  );
 }
 
 /**
@@ -425,9 +432,7 @@ export function tightestAllowance(
   resetsAt: string | null;
 } {
   const reported = entry.remaining.map((window) => window.windowId);
-  const windows = entry.remaining.filter((window) =>
-    windowAppliesTo(window.windowId, model, reported),
-  );
+  const windows = entry.remaining.filter((window) => windowAppliesTo(window, model, reported));
   let tightest: { percent: number; resetsAt: string | null } | null = null;
   for (const window of windows) {
     if (window.percent === null) continue;

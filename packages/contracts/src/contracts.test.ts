@@ -3231,9 +3231,10 @@ test('canonical identity ignores key order and detects changed content', () => {
   assert.throws(() => canonicalJson(cycle));
 });
 
-test('a usage window limits only the models its id names', () => {
+test('a usage window limits only the models its scope and id name', () => {
   // Ids follow the shapes providers report: a vendor prefix, a model name, a length.
-  const rows: [string, string | null, boolean, string[]?][] = [
+  type Scope = 'provider' | 'model' | 'pool';
+  const rows: [string, string | null, boolean, string[]?, Scope?][] = [
     ['acme-deep-wtu-weekly', 'acme-3.8-quick', false],
     ['acme-deep-wtu-weekly', 'acme-deep-2', true],
     ['acme-deep-wtu-weekly', null, true],
@@ -3246,7 +3247,18 @@ test('a usage window limits only the models its id names', () => {
     ['seven_day', 'mid-4-5', true],
     // Every window the family reports carries the client's bucket name, so it names no model.
     ['client:primary', 'large-1', true, ['client:primary', 'client:secondary']],
+    // A lone window shares every token with itself, so it names no bucket. Reported alone, a
+    // window for one model still limits only that model, with its scope given or not.
+    ['weekly-tale', 'mid-4-5', false, ['weekly-tale'], 'model'],
+    ['weekly-tale', 'mid-4-5', false, ['weekly-tale']],
+    // A provider or pool scope limits every model, whatever the id carries.
+    ['client:primary', 'large-1', true, ['client:primary'], 'provider'],
+    ['acme-deep-weekly', 'acme-3.8-quick', true, ['acme-deep-weekly'], 'pool'],
   ];
-  for (const [windowId, model, applies, reported] of rows)
-    assert.equal(windowAppliesTo(windowId, model, reported), applies, `${windowId} on ${model}`);
+  for (const [windowId, model, applies, reported, scope] of rows)
+    assert.equal(
+      windowAppliesTo({ windowId, scope }, model, reported),
+      applies,
+      `${windowId} ${scope ?? 'unscoped'} on ${model}`,
+    );
 });
