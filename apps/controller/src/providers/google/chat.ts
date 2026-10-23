@@ -1,4 +1,5 @@
-import { isAbsolute, relative, resolve } from 'node:path';
+import { closeSync, constants, openSync, writeSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import type {
   AgentEvent,
@@ -57,6 +58,9 @@ type Ending = { stopReason: ChatTurnResult['stopReason']; failure: ChatFailure |
 const maximumTurnMs = chatAcpLimits.maxTimeoutMs;
 const outputLimitBytes = 64 * 1024;
 const pieceLimit = 60_000;
+const traceLineLimit = 5000;
+// The last 256 bytes stay free for the line that says the trace stopped.
+const traceByteLimit = 2 * 1024 * 1024 - 256;
 const noJournal: AcpLifecycle = { beforePhase() {}, owned() {}, quiescent() {} };
 
 const optionalText = z.string().nullish().catch(undefined);
@@ -171,6 +175,32 @@ const pieces = (value: string) =>
     value.slice(i * pieceLimit, (i + 1) * pieceLimit),
   );
 const lines = (value: string) => (value === '' ? [] : value.replace(/\n$/, '').split('\n'));
+const fields = (value: unknown): Record<string, unknown> =>
+  value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+/** A frame field as the trace keeps it. Text is clipped and a nested value keeps only its type. */
+const traceField = (value: unknown) =>
+  typeof value === 'string'
+    ? clip(value, 200)
+    : value === undefined || value === null || typeof value !== 'object'
+      ? value
+      : Array.isArray(value)
+        ? '(array)'
+        : '(object)';
+/** Names and states of one update or tool call. Content and output text never go in. */
+const frameFacts = (value: unknown) => {
+  const frame = fields(value);
+  return {
+    toolCallId: traceField(frame.toolCallId),
+    status: traceField(frame.status),
+    kind: traceField(frame.kind),
+    title: traceField(frame.title),
+    keys: Object.keys(frame)
+      .slice(0, 32)
+      .map((key) => clip(key, 60)),
+  };
+};
 
 class TurnFailure extends Error {
   readonly failure: ChatFailure;
@@ -445,6 +475,66 @@ export function googleChatAdapter(deps: {
         { rpc: RpcId; callId: string; options: Map<string, ChatPermissionOption['kind']> }
       >();
 
+      // One line of metadata per frame goes to the private work folder, so a client whose framing
+      // does not match this file can be diagnosed from a real run. A trace that cannot be
+      // written is dropped and the turn goes on.
+      const started = now();
+      let traceFile: number | null = null;
+      let traceLines = 0;
+      let traceBytes = 0;
+      function closeTrace() {
+        if (traceFile === null) return;
+        try {
+          closeSync(traceFile);
+        } catch {}
+        traceFile = null;
+      }
+      function trace(entry: () => Record<string, unknown>) {
+        if (traceFile === null) return;
+        try {
+          const ms = Math.round(now() - started);
+          let line = `${JSON.stringify({ ms, ...entry() })}\n`;
+          const full =
+            traceLines >= traceLineLimit || traceBytes + Buffer.byteLength(line) > traceByteLimit;
+          if (full)
+            line = `${JSON.stringify({ ms, truncated: true, note: 'The trace stops here at 5000 lines or 2 MB.' })}\n`;
+          writeSync(traceFile, line);
+          traceLines++;
+          traceBytes += Buffer.byteLength(line);
+          if (full) closeTrace();
+        } catch {
+          closeTrace();
+        }
+      }
+      function traceFrame(method: string, params: Record<string, unknown>, id?: RpcId) {
+        trace(() => {
+          const update = method === 'session/update';
+          const subject = update ? params.update : (params.toolCall ?? params);
+          return {
+            ...(update
+              ? { update: traceField(fields(subject).sessionUpdate) }
+              : { method: clip(method, 80) }),
+            ...(id === undefined ? {} : { id: traceField(id) }),
+            ...frameFacts(subject),
+            // update() drops a frame for another session without a word.
+            ...(update && phase === 'turn' && params.sessionId !== sessionId
+              ? { otherSession: true }
+              : {}),
+            bytes: Buffer.byteLength(JSON.stringify(params)),
+          };
+        });
+      }
+      function reply(live: AcpConnection, id: RpcId, result: { outcome: Record<string, unknown> }) {
+        live.respond(id, result);
+        trace(() => ({
+          reply: 'session/request_permission',
+          id: traceField(id),
+          outcome: traceField(result.outcome.outcome),
+          optionId: traceField(result.outcome.optionId),
+          bytes: Buffer.byteLength(JSON.stringify(result)),
+        }));
+      }
+
       const notice = (message: string, level: 'info' | 'warning' = 'info') =>
         send({ type: 'provider.notice', turnId, level, message: clip(message, 4000) });
       const noticeOnce = (key: string, message: string) => {
@@ -695,7 +785,7 @@ export function googleChatAdapter(deps: {
               'permission',
               'The Google client sent a permission request this app could not read.',
             );
-          return live.respond(id, declined);
+          return reply(live, id, declined);
         }
         const ranked: { option: ChatPermissionOption; rank: number }[] = [];
         for (const raw of parsed.data.options) {
@@ -721,7 +811,7 @@ export function googleChatAdapter(deps: {
             'permission',
             'The Google client sent a permission request with no usable choices.',
           );
-          return live.respond(id, declined);
+          return reply(live, id, declined);
         }
         const call = upsert(parsed.data.toolCall);
         const allow =
@@ -731,7 +821,7 @@ export function googleChatAdapter(deps: {
         const refuses =
           request.readOnly === true && (call.kind === 'edit' || call.kind === 'command');
         const reject = options.find((option) => option.kind === 'deny');
-        if (refuses && !reject) return live.respond(id, declined);
+        if (refuses && !reject) return reply(live, id, declined);
         // Edits land only in the scratch copy, so allow-edits and allow-all answer an edit only when
         // it names paths and all of them are inside. allow-all answers every other kind.
         const policy = request.permissionPolicy;
@@ -784,7 +874,7 @@ export function googleChatAdapter(deps: {
         });
         if (automatic) {
           if (refuses) call.denied = true;
-          live.respond(id, { outcome: { outcome: 'selected', optionId: automatic.id } });
+          reply(live, id, { outcome: { outcome: 'selected', optionId: automatic.id } });
           send({ type: 'permission.resolved', turnId, requestId, choice: automatic.id });
         }
       }
@@ -793,7 +883,7 @@ export function googleChatAdapter(deps: {
         if (cancelled || promptDone) return;
         cancelled = true;
         for (const [requestId, entry] of pending) {
-          connection?.respond(entry.rpc, declined);
+          if (connection) reply(connection, entry.rpc, declined);
           send({ type: 'permission.resolved', turnId, requestId, choice: 'cancelled' });
         }
         pending.clear();
@@ -817,6 +907,9 @@ export function googleChatAdapter(deps: {
         lastFault = tapFaults(live);
         live.onNotification = (method, params) =>
           guard(() => {
+            // A replayed conversation can run to thousands of frames and would fill the trace
+            // before the turn starts.
+            if (phase !== 'replay') traceFrame(method, params);
             if (method !== 'session/update')
               return noticeOnce(
                 `method:${method}`,
@@ -826,7 +919,11 @@ export function googleChatAdapter(deps: {
               if (buffered.length < 64) buffered.push(params);
             } else if (phase === 'turn') update(params);
           });
-        live.onRequest = (id, method, params) => guard(() => answer(id, method, params));
+        live.onRequest = (id, method, params) =>
+          guard(() => {
+            traceFrame(method, params, id);
+            answer(id, method, params);
+          });
         onStop(cancel);
         try {
           const handshake = initialized.parse(
@@ -981,6 +1078,15 @@ export function googleChatAdapter(deps: {
             work,
           );
           if (running.group > 0) groups.push(running.group);
+          // startAcpProcess has checked that the folder is private and owned, and no frame is
+          // read before this line runs. O_NOFOLLOW keeps a link there from moving the trace.
+          try {
+            traceFile = openSync(
+              join(request.work.directory, 'acp-trace.jsonl'),
+              constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
+              0o600,
+            );
+          } catch {}
         } catch (error) {
           // The client refuses a changed executable or an unsafe folder with a plain Error.
           startFailure =
@@ -1044,6 +1150,7 @@ export function googleChatAdapter(deps: {
         closeTools();
         send({ type: 'turn.completed', turnId, ...ending });
         closed = true;
+        closeTrace();
         const session: ChatSession | null = sessionId
           ? {
               family: 'google',
@@ -1072,7 +1179,7 @@ export function googleChatAdapter(deps: {
           const call = calls.get(entry.callId);
           if (call && kind === 'deny') call.denied = true;
           try {
-            connection.respond(entry.rpc, { outcome: { outcome: 'selected', optionId: choice } });
+            reply(connection, entry.rpc, { outcome: { outcome: 'selected', optionId: choice } });
           } catch {
             return;
           }

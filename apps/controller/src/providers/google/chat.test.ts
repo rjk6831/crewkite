@@ -182,7 +182,8 @@ test('a turn streams thinking, tools and text in order, and the next turn resume
   const f = rig('chat-stream');
   const g = rig('chat-lost');
   try {
-    const first = await run(f, request(f));
+    const firstRequest = request(f);
+    const first = await run(f, firstRequest);
     assert.deepEqual(types(first.events), [
       'turn.started',
       'usage.context',
@@ -272,6 +273,24 @@ test('a turn streams thinking, tools and text in order, and the next turn resume
       promptText(first.frames),
       'You are working in a scratch copy of demo.\n\nWhat does this project do?',
     );
+    // The frame trace names each frame and never carries file content or tool output.
+    const trace = readFileSync(join(firstRequest.work.directory, 'acp-trace.jsonl'), 'utf8');
+    assert(!trace.includes('export const'));
+    const { bytes, ...announced } = trace
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .find((line) => line.toolCallId === 'read-1');
+    assert(bytes > 100);
+    assert.deepEqual(announced, {
+      ms: 0,
+      update: 'tool_call',
+      toolCallId: 'read-1',
+      status: 'in_progress',
+      kind: 'read',
+      title: 'Read net.mjs',
+      keys: ['sessionUpdate', 'toolCallId', 'title', 'kind', 'status', 'rawInput', 'locations'],
+    });
 
     // The agent replays the old conversation while it loads. None of it reaches the thread, and
     // the prompt carries no framing because the session already has it.
