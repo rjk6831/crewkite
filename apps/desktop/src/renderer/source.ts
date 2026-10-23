@@ -33,6 +33,7 @@ import {
 } from '@crewkite/contracts';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPreviewSource } from './preview.ts';
+import { isStreamEvent, isThreadEvent } from './thread/commands.ts';
 
 export type { DesktopCommand, DesktopSource } from '@crewkite/client';
 
@@ -488,8 +489,14 @@ export function useWorkspace() {
     });
     const unsubscribe = source?.subscribe((value) => {
       if (!active) return;
+      // The open thread reads streamed output itself. Re-reading the workspace per delta would flood
+      // the controller.
+      if (isStreamEvent((value as { type: string }).type)) return;
       const parsed = EventSchema.safeParse(value);
       if (!parsed.success) {
+        // A chat message arrives as conversation.entry with a payload the workspace schema does not
+        // describe. The open thread folds it. Anything else that fails the schema is a real fault.
+        if (isThreadEvent((value as { type: string }).type)) return;
         setError('An invalid controller event was rejected. Reconnect to refresh the workspace.');
         return;
       }
@@ -784,6 +791,7 @@ export function useWorkspace() {
     }
   };
   return {
+    source,
     snapshot,
     detailStale,
     header,

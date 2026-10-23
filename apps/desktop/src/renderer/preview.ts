@@ -13,6 +13,7 @@ import {
 } from '@crewkite/contracts';
 import { createDemoFixtures, createTestIds, DEMO_TIME } from '@crewkite/testkit';
 import type { DesktopCommand, DesktopSource } from './source.ts';
+import { createThreadScript } from './thread/preview-script.ts';
 
 async function hash(value: unknown) {
   const bytes = new TextEncoder().encode(canonicalJson(value));
@@ -29,7 +30,7 @@ export function createPreviewSource(): DesktopSource {
   const history: Event[] = [];
   let cursor = 0n;
   let diff = '';
-  function emit(type: Event['type'], payload: unknown, task: Task) {
+  function emit(type: Event['type'] | string, payload: unknown, task: Task) {
     cursor += 1n;
     state.cursor = cursor.toString();
     const event = {
@@ -40,10 +41,49 @@ export function createPreviewSource(): DesktopSource {
       taskId: task.id,
       revision: task.revision,
       type,
-      payload,
+      // A thread event may build its payload from the cursor it is given.
+      payload: typeof payload === 'function' ? payload(state.cursor) : payload,
     } as Event;
-    history.push(event);
+    // Streamed thread output is live only. The retained task history never lists it.
+    if (!/^(agent\.event|chat\.)/.test(type)) history.push(event);
     for (const listener of listeners) listener(structuredClone(event));
+    return state.cursor;
+  }
+  const chatCommands = new Set([
+    'ReadChatThread',
+    'ReadChatChanges',
+    'ReadChatCatalog',
+    'SendChatMessage',
+    'ResolveChatPermission',
+    'StopChatTurn',
+    'ConfigureChatThread',
+    'HandoffChatThread',
+  ]);
+  const scripts = new Map<string, ReturnType<typeof createThreadScript>>();
+  function chatCommand(name: string, payload: Record<string, unknown>): CommandResult | null {
+    if (!chatCommands.has(name)) return null;
+    // The catalog read has no task, and the scripted thread answers it for the demo task.
+    const taskId = typeof payload.taskId === 'string' ? payload.taskId : fixtures.task.id;
+    const task = state.tasks.find(({ id }) => id === taskId);
+    if (!task) return { outcome: 'blocked', reason: 'The preview task could not be found.' };
+    let script = scripts.get(taskId);
+    if (!script) {
+      script = createThreadScript(
+        {
+          publish: (type, value) => emit(type, value, task),
+          advance(to) {
+            if (cursor < to) {
+              cursor = to;
+              state.cursor = to.toString();
+            }
+          },
+        },
+        taskId,
+        taskId === fixtures.task.id,
+      );
+      scripts.set(taskId, script);
+    }
+    return script.command(name, payload);
   }
   function update(task: Task, change: Partial<Task>) {
     Object.assign(task, change, { revision: task.revision + 1 });
@@ -54,6 +94,11 @@ export function createPreviewSource(): DesktopSource {
     ...(entity ? { entity, revision: entity.revision } : {}),
   });
   async function command(input: DesktopCommand): Promise<CommandResult> {
+    const chat = chatCommand(
+      (input as { command: string }).command,
+      input.payload as Record<string, unknown>,
+    );
+    if (chat) return chat;
     const taskId =
       'taskId' in input.payload
         ? input.payload.taskId
