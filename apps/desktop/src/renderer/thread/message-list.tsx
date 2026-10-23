@@ -104,6 +104,7 @@ export function MessageList({
   const scroller = useRef<HTMLDivElement>(null);
   const column = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
+  const lastTop = useRef(0);
   const [away, setAway] = useState(false);
   const last = items.at(-1);
   const populated = items.length > 0;
@@ -127,12 +128,17 @@ export function MessageList({
     watch.observe(element);
     return () => watch.disconnect();
   }, [populated]);
+  // Content can grow between a pinned scroll and its queued scroll event, so the view looks far
+  // from the end without the person moving. Only a move up releases the follow. A return to the
+  // end restores it.
   function onScroll() {
     const element = scroller.current;
     if (!element) return;
     const near = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
-    stick.current = near;
-    setAway(!near);
+    if (near) stick.current = true;
+    else if (element.scrollTop < lastTop.current) stick.current = false;
+    lastTop.current = element.scrollTop;
+    setAway(!stick.current);
   }
   return (
     <div className="th-scroll-frame">
