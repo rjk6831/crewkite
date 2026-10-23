@@ -49,6 +49,7 @@ import { scratchChanges } from './changes.ts';
 import {
   adviceContext,
   familyName,
+  type HandoffReason,
   handoffPacket,
   handoffReason,
   reviewContext,
@@ -92,9 +93,10 @@ type Ending = {
   failure: ChatFailure | null;
   text: string;
   session: ChatSession | null;
-  /** The provider stopped the turn on a usage limit. */
-  limit?: boolean;
+  /** Stored on the turn so a reopened view knows why it ended. */
+  stopReason: NonNullable<ChatTurn['stopReason']>;
 };
+type FileDiff = ChatChangesRead['files'][number];
 type LiveTurn = {
   taskId: string;
   handle: ChatTurnHandle | null;
@@ -127,6 +129,16 @@ const READ_BYTES = 900 * 1024;
 const LIVE_EVENT_BYTES = 192 * 1024;
 const TURN_BYTES = 96 * 1024;
 const CHAT_KINDS = "('user-message','chat-assistant','chat-system')";
+// A handoff packet stays under 96 KiB. Patches claim up to 48 KiB and the transcript keeps at
+// least 24 KiB of what is left.
+const PACKET_BYTES = 96 * 1024;
+const PACKET_PATCH_BYTES = 48 * 1024;
+const PACKET_TRANSCRIPT_BYTES = 24 * 1024;
+const PACKET_LISTED_FILES = 200;
+const PACKET_ENTRY_CHARACTERS = 8000;
+const CHECK_LINES = 5;
+const CHECK_CHARACTERS = 1500;
+const CUT_MARKER_BYTES = 32;
 
 const blocked = (reason: string, next?: string): CommandResult => ({
   outcome: 'blocked',
@@ -181,35 +193,12 @@ export class ChatService {
     });
     if (!message) return blocked('message-too-large', 'Shorten the message or attach fewer paths.');
     this.saveEntry(task, message);
-    // A reviewer or advisor borrows another model. The thread keeps its own choice and any switch
-    // still waiting for the next answer.
-    const own = payload.role === 'assistant';
-    const pending = own ? this.pendingHandoff(task.id) : null;
-    // Sending on the provider the thread came from cancels the switch.
-    const handoffFrom = pending && pending.from !== selection.family ? pending.from : null;
-    if (pending && !handoffFrom) this.setHandoff(task.id, null);
-    const turn = ChatTurnSchema.parse({
-      id: this.deps.id('trn'),
-      taskId: task.id,
-      sequence: this.nextSequence(task.id),
-      role: payload.role,
-      selection,
-      userMessageId: message.id,
-      assistantMessageId: null,
-      state: 'running',
-      startedAt: this.deps.now(),
-      endedAt: null,
-      failure: null,
-      handoffFrom,
-    });
-    this.putTurn(task, turn);
-    this.putThread(task, {
-      ...thread,
-      base,
-      selection: own ? selection : thread.selection,
-      activeTurnId: turn.id,
-    });
-    effects.push(() => this.launch(turn));
+    this.openTurn(
+      task,
+      thread,
+      { selection, role: payload.role, messageId: message.id, base },
+      effects,
+    );
     return { outcome: 'applied', revision: task.revision };
   }
 
@@ -260,13 +249,21 @@ export class ChatService {
     return { outcome: 'applied' };
   }
 
-  handoff(payload: Payload<'HandoffChatThread'>): CommandResult {
+  /**
+   * Move the thread to another provider. With `reason: 'limit'` and a stopped message nobody has
+   * followed up on, the new turn starts on that same message, so the thread keeps one copy of it.
+   * Without `effects` the thread moves and no turn starts.
+   */
+  handoff(payload: Payload<'HandoffChatThread'>, effects?: Effects): CommandResult {
     const task = this.task(payload.taskId);
     if (!task) return blocked('task-not-found');
     const thread = this.thread(task.id);
     if (thread.activeTurnId)
       return blocked('turn-running', 'Stop the reply, then switch providers.');
-    const from = thread.selection?.family;
+    const stopped =
+      effects && payload.reason === 'limit' ? this.stoppedOnLimit(task.id) : undefined;
+    // The person may have moved the thread already. The packet still names the family that stopped.
+    const from = stopped?.selection.family ?? thread.selection?.family;
     if (!from || from === payload.selection.family)
       return blocked('handoff-needs-another-provider', 'Pick a different provider to continue on.');
     const selection = this.deps.resolveSelection(task.id, payload.selection);
@@ -275,11 +272,13 @@ export class ChatService {
       return blocked('provider-unavailable', 'Connect this provider in Settings or pick another.');
     this.putThread(task, { ...thread, selection });
     this.setHandoff(task.id, { from, reason: payload.reason });
-    this.appendEntry(task, {
-      kind: 'chat-system',
-      author: { kind: 'system', turnId: null },
-      text: `Continued on ${familyName[selection.family]} from ${familyName[from]}. Reason: ${handoffReason(payload.reason)}.`,
-    });
+    if (thread.selection?.family !== selection.family)
+      this.appendEntry(task, {
+        kind: 'chat-system',
+        author: { kind: 'system', turnId: null },
+        text: `Continued on ${familyName[selection.family]} from ${familyName[from]}. Reason: ${handoffReason(payload.reason)}.`,
+      });
+    if (stopped && effects) this.resend(task, stopped, effects);
     return { outcome: 'applied' };
   }
 
@@ -345,6 +344,7 @@ export class ChatService {
           }),
           text: streamedText(this.agentEvents(row.task_id, row.id)),
           session: null,
+          stopReason: 'error',
         });
       }
     });
@@ -446,12 +446,12 @@ export class ChatService {
       role: turn.role,
       selection: turn.selection,
       prompt: turn.handoffFrom
-        ? handoffPacket({
+        ? this.packet(turn, {
             from: turn.handoffFrom,
-            to: turn.selection.family,
             reason: handoff?.reason ?? 'manual',
+            root,
+            base: thread.base,
             history,
-            files: this.changedFiles(task.id, root, thread.base),
             prompt,
           })
         : prompt,
@@ -572,6 +572,7 @@ export class ChatService {
       endedAt: this.deps.now(),
       failure: end.failure,
       assistantMessageId: reply?.id ?? null,
+      stopReason: end.stopReason,
     });
     const thread = this.thread(task.id);
     const session =
@@ -585,7 +586,7 @@ export class ChatService {
         ? [...thread.sessions.filter((value) => value.family !== session.family), session]
         : thread.sessions,
     });
-    if (end.limit) this.appendLimitLine(task, turn, end.failure);
+    if (end.stopReason === 'limit') this.appendLimitLine(task, turn, end.failure);
     if (end.failure)
       this.appendEntry(task, {
         kind: 'chat-system',
@@ -607,8 +608,9 @@ export class ChatService {
 
   /**
    * With auto handoff on, a limit stop moves the thread to the family with the most allowance
-   * left and sends the same message there. The handoff and the send commit together, so a
-   * refusal leaves the thread where it was. Without a taker the person chooses from the card.
+   * left and runs the same message there. The handoff opens the new turn, so both commit
+   * together and a refusal leaves the thread where it was. Without a taker the person chooses
+   * from the card.
    */
   private continueOnLimit(turnId: string) {
     try {
@@ -618,29 +620,90 @@ export class ChatService {
       const thread = this.thread(task.id);
       // A person who already moved the thread has made the choice.
       if (!thread.autoHandoff || thread.selection?.family !== turn.selection.family) return;
-      const message = this.findEntry(task.id, turn.userMessageId);
       const selection = this.nextFamily(task.id, turn.selection.family);
-      if (message?.kind !== 'user-message' || !selection) return;
+      if (!selection) return;
       const effects: Effects = [];
       this.deps.store.transaction(() => {
-        const moved = this.handoff({ taskId: task.id, selection, reason: 'limit' });
-        if (moved.outcome !== 'applied') throw Error('The thread could not move on.');
-        const sent = this.sendMessage(
-          {
-            taskId: task.id,
-            text: message.text,
-            selection,
-            role: turn.role,
-            attachments: message.attachments ?? [],
-          },
-          effects,
-        );
-        if (sent.outcome !== 'applied') throw Error('The message could not be sent again.');
+        const moved = this.handoff({ taskId: task.id, selection, reason: 'limit' }, effects);
+        if (moved.outcome !== 'applied' || effects.length === 0)
+          throw Error('The thread could not move on.');
       });
       for (const effect of effects) this.call(effect);
     } catch {
       // The limit line stands and the card in the thread still offers the switch.
     }
+  }
+
+  /** The newest turn, when it ended on a usage limit and the person has written nothing since. */
+  private stoppedOnLimit(taskId: string): ChatTurn | undefined {
+    const row = this.deps.store.db
+      .prepare('SELECT body FROM chat_turns WHERE task_id=? ORDER BY sequence DESC LIMIT 1')
+      .get(taskId);
+    const turn = row ? ChatTurnSchema.parse(JSON.parse(row.body as string)) : undefined;
+    if (!turn || !endedOnLimit(turn)) return;
+    const newest = this.deps.store.db
+      .prepare(
+        "SELECT id FROM conversation_entries WHERE task_id=? AND json_extract(body,'$.kind')='user-message' ORDER BY sequence DESC LIMIT 1",
+      )
+      .get(taskId);
+    return newest?.id === turn.userMessageId ? turn : undefined;
+  }
+
+  /** Run the stopped message again on the provider the thread just moved to. No new entry is written. */
+  private resend(task: Task, stopped: ChatTurn, effects: Effects) {
+    const thread = this.thread(task.id);
+    const message = this.findEntry(task.id, stopped.userMessageId);
+    if (message?.kind !== 'user-message' || !thread.selection || !thread.base) return;
+    this.openTurn(
+      task,
+      thread,
+      { selection: thread.selection, role: stopped.role, messageId: message.id, base: thread.base },
+      effects,
+    );
+  }
+
+  /** Open a running turn on a saved user message. The launch waits for the command to commit. */
+  private openTurn(
+    task: Task,
+    thread: ChatThread,
+    input: {
+      selection: ChatModelSelection;
+      role: ChatTurn['role'];
+      messageId: string;
+      base: string;
+    },
+    effects: Effects,
+  ) {
+    const { selection, role, messageId, base } = input;
+    // A reviewer or advisor borrows another model. The thread keeps its own choice and any switch
+    // still waiting for the next answer.
+    const own = role === 'assistant';
+    const pending = own ? this.pendingHandoff(task.id) : null;
+    // Sending on the provider the thread came from cancels the switch.
+    const handoffFrom = pending && pending.from !== selection.family ? pending.from : null;
+    if (pending && !handoffFrom) this.setHandoff(task.id, null);
+    const turn = ChatTurnSchema.parse({
+      id: this.deps.id('trn'),
+      taskId: task.id,
+      sequence: this.nextSequence(task.id),
+      role,
+      selection,
+      userMessageId: messageId,
+      assistantMessageId: null,
+      state: 'running',
+      startedAt: this.deps.now(),
+      endedAt: null,
+      failure: null,
+      handoffFrom,
+    });
+    this.putTurn(task, turn);
+    this.putThread(task, {
+      ...thread,
+      base,
+      selection: own ? selection : thread.selection,
+      activeTurnId: turn.id,
+    });
+    effects.push(() => this.launch(turn));
   }
 
   /** Highest remaining percent, then soonest reset. The family that stopped never qualifies. */
@@ -720,14 +783,95 @@ export class ChatService {
     return reviewContext(name, directory, base, files);
   }
 
-  private changedFiles(taskId: string, root: string, base: string): string[] | null {
+  private scratchDiff(taskId: string, root: string, base: string): FileDiff[] | null {
     try {
-      return scratchChanges(root, this.scratchDirectory(taskId), base, false).map(
-        (file) => `${file.path} +${file.additions} -${file.deletions}`,
-      );
+      return scratchChanges(root, this.scratchDirectory(taskId), base);
     } catch {
       return null;
     }
+  }
+
+  /**
+   * The next provider starts cold, so the packet states what the scratch copy holds and where
+   * the stopped turn left off. Patches take up to 48 KiB and the transcript fills the rest of
+   * 96 KiB. The shared packet prints the file list under its own heading, so each section added
+   * after the list carries a title of its own.
+   * shortcut: the new message itself is never cut. Upgrade: refuse a message that cannot fit.
+   */
+  private packet(
+    turn: ChatTurn,
+    input: {
+      from: ChatFamily;
+      reason: HandoffReason;
+      root: string;
+      base: string;
+      history: readonly ChatHistoryEntry[];
+      prompt: string;
+    },
+  ): string {
+    const changes = this.scratchDiff(turn.taskId, input.root, input.base);
+    const stopped = this.stoppedLines(turn);
+    const checks = this.checkLines(turn.taskId);
+    const build = (history: readonly ChatHistoryEntry[], patches: readonly string[]) =>
+      handoffPacket({
+        from: input.from,
+        to: turn.selection.family,
+        reason: input.reason,
+        history,
+        files: [...changeList(changes), ...stopped, ...patches, ...checks],
+        prompt: input.prompt,
+      });
+    const room = PACKET_BYTES - Buffer.byteLength(build([], []));
+    const patches = changes
+      ? patchSections(changes, Math.min(PACKET_PATCH_BYTES, room - PACKET_TRANSCRIPT_BYTES))
+      : [];
+    const history = fitHistory(
+      input.history,
+      (kept) => Buffer.byteLength(build(kept, patches)) <= PACKET_BYTES,
+    );
+    return build(history, patches);
+  }
+
+  /** Which provider stopped, why, and the tool call that never completed. */
+  private stoppedLines(turn: ChatTurn): string[] {
+    const previous = this.turns(turn.taskId).findLast(
+      (value) => value.sequence < turn.sequence && value.role === 'assistant',
+    );
+    if (!previous || previous.state === 'done') return [];
+    const why = endedOnLimit(previous)
+      ? 'usage limit reached'
+      : previous.state === 'stopped'
+        ? 'stopped by the person'
+        : 'error';
+    const events = this.agentEvents(turn.taskId, previous.id, ['tool.started', 'tool.completed']);
+    const finished = new Set(
+      events.flatMap((event) => (event.type === 'tool.completed' ? [event.callId] : [])),
+    );
+    const open = events.findLast(
+      (event) => event.type === 'tool.started' && !finished.has(event.callId),
+    );
+    return [
+      '',
+      'Stopped turn:',
+      `${familyName[previous.selection.family]} ended its last turn early. Reason: ${why}.${previous.failure ? ` ${previous.failure.message}` : ''}`,
+      ...(open?.type === 'tool.started'
+        ? [`In progress when it stopped: ${clip(open.title, 200)} (${open.kind}).`]
+        : []),
+    ];
+  }
+
+  /** The newest system lines that mention checks, such as an acceptance result, oldest first. */
+  private checkLines(taskId: string): string[] {
+    const lines = this.deps.store.db
+      .prepare(
+        "SELECT body FROM conversation_entries WHERE task_id=? AND json_extract(body,'$.kind')='chat-system' AND json_extract(body,'$.text') LIKE '%check%' ORDER BY sequence DESC LIMIT ?",
+      )
+      .all(taskId, CHECK_LINES)
+      .reverse()
+      .map((row) =>
+        clip(ConversationEntrySchema.parse(JSON.parse(row.body as string)).text, CHECK_CHARACTERS),
+      );
+    return lines.length ? ['', 'System lines in this thread that mention checks:', ...lines] : [];
   }
 
   private scratchDirectory(taskId: string) {
@@ -883,12 +1027,19 @@ export class ChatService {
       });
   }
 
-  private agentEvents(taskId: string, turnId: string): AgentEvent[] {
+  private agentEvents(
+    taskId: string,
+    turnId: string,
+    types: readonly AgentEvent['type'][] = [],
+  ): AgentEvent[] {
+    const only = types.length
+      ? ` AND json_extract(body,'$.payload.type') IN (${types.map(() => '?').join(',')})`
+      : '';
     return this.deps.store.db
       .prepare(
-        "SELECT body FROM events WHERE task_id=? AND json_extract(body,'$.type')='agent.event' AND json_extract(body,'$.payload.turnId')=? ORDER BY cursor",
+        `SELECT body FROM events WHERE task_id=? AND json_extract(body,'$.type')='agent.event' AND json_extract(body,'$.payload.turnId')=?${only} ORDER BY cursor`,
       )
-      .all(taskId, turnId)
+      .all(taskId, turnId, ...types)
       .map((row) => AgentEventSchema.parse(JSON.parse(row.body as string).payload));
   }
 }
@@ -910,11 +1061,102 @@ function chatMessage(entry: ConversationEntry): ChatMessage | undefined {
     : undefined;
 }
 
+/** Turns written before stop reasons were stored fall back to the failure kind. */
+function endedOnLimit(turn: ChatTurn): boolean {
+  return turn.stopReason
+    ? turn.stopReason === 'limit'
+    : turn.state === 'failed' && turn.failure?.kind === 'usage-limit';
+}
+
+const clip = (text: string, characters: number) =>
+  text.length > characters ? `${text.slice(0, characters).toWellFormed()} [trimmed]` : text;
+
+function changeList(files: readonly FileDiff[] | null): string[] {
+  if (files === null) return ['The scratch changes could not be read.'];
+  if (files.length === 0) return ['No files changed yet.'];
+  return [
+    ...files
+      .slice(0, PACKET_LISTED_FILES)
+      .map((file) => `${file.path} +${file.additions} -${file.deletions}`),
+    ...(files.length > PACKET_LISTED_FILES
+      ? [`And ${files.length - PACKET_LISTED_FILES} more files.`]
+      : []),
+  ];
+}
+
+/**
+ * Unified patches, largest first, until the byte budget is spent. A patch that does not fit is
+ * cut at a line and ends with a marker that says how many lines went. Files with no patch, or
+ * none that fits, are named.
+ */
+function patchSections(files: readonly FileDiff[], budget: number): string[] {
+  // The titles and the list of skipped files take the last 2 KiB.
+  let left = budget - 2048;
+  const skipped = files.flatMap((file) => (file.patch === null ? [file.path] : []));
+  const patches = files
+    .flatMap((file) =>
+      file.patch === null ? [] : [{ path: file.path, patch: file.patch.trimEnd() }],
+    )
+    .sort((a, b) => Buffer.byteLength(b.patch) - Buffer.byteLength(a.patch));
+  const shown: string[] = [];
+  for (const { path, patch } of patches) {
+    const lines = patch.split('\n');
+    const whole = Buffer.byteLength(patch) + 2;
+    if (whole <= left) {
+      shown.push(patch);
+      left -= whole;
+      continue;
+    }
+    const kept: string[] = [];
+    let used = CUT_MARKER_BYTES;
+    for (const line of lines) {
+      const next = used + Buffer.byteLength(line) + 1;
+      if (next > left) break;
+      used = next;
+      kept.push(line);
+    }
+    // Two header lines say nothing about the change.
+    if (kept.length <= 2) {
+      skipped.push(path);
+      continue;
+    }
+    shown.push([...kept, `[${lines.length - kept.length} lines cut]`].join('\n'));
+    left -= used;
+  }
+  return [
+    ...(shown.length ? ['', 'Patches, largest first:', shown.join('\n\n')] : []),
+    ...(skipped.length
+      ? [
+          '',
+          `No patch shown for these files (binary, too large or out of room): ${skipped.join(', ').slice(0, 1024)}`,
+        ]
+      : []),
+  ];
+}
+
+/**
+ * Cap long entries first, then drop the oldest until the packet fits.
+ * shortcut: dropped entries are gone. Upgrade: summarize them from durable facts.
+ */
+function fitHistory(
+  history: readonly ChatHistoryEntry[],
+  fits: (kept: readonly ChatHistoryEntry[]) => boolean,
+): ChatHistoryEntry[] {
+  let kept = [...history];
+  if (!fits(kept))
+    kept = kept.map((entry) => ({ ...entry, text: clip(entry.text, PACKET_ENTRY_CHARACTERS) }));
+  while (kept.length > 0 && !fits(kept)) kept = kept.slice(1);
+  return kept;
+}
+
 function ending(result: ChatTurnResult, items: ReadonlyMap<string, string>): Ending {
-  const state =
-    result.stopReason === 'done' ? 'done' : result.stopReason === 'stopped' ? 'stopped' : 'failed';
+  const stopReason =
+    result.stopReason === 'done' || result.stopReason === 'stopped' || result.stopReason === 'limit'
+      ? result.stopReason
+      : 'error';
+  const state = stopReason === 'done' ? 'done' : stopReason === 'stopped' ? 'stopped' : 'failed';
   const reported = ChatFailureSchema.safeParse(result.failure);
-  const limit = result.stopReason === 'limit';
+  const limit = stopReason === 'limit';
   const failure =
     state !== 'failed'
       ? null
@@ -932,7 +1174,7 @@ function ending(result: ChatTurnResult, items: ReadonlyMap<string, string>): End
   return {
     state,
     failure,
-    limit,
+    stopReason,
     // Adapters may report only finished items on stop. The streamed text is what was shown.
     text: reportedText.trim() ? reportedText : joinText(items),
     session: session.success ? session.data : null,

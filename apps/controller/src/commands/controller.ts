@@ -3855,7 +3855,7 @@ export class Controller {
       case 'ConfigureChatThread':
         return this.chat().configure(command.payload);
       case 'HandoffChatThread':
-        return this.chat().handoff(command.payload);
+        return this.chat().handoff(command.payload, effects);
       case 'ReadChatThread':
       case 'ReadChatChanges':
         if (!this.store.get<Task>('task', command.payload.taskId))

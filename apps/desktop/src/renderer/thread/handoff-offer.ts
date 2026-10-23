@@ -32,9 +32,12 @@ export function limitOffer(state: ThreadState): LimitOffer | null {
   const meta = state.turnMeta[id];
   const completed = record?.events.findLast(({ event }) => event.type === 'turn.completed')?.event;
   const failure = record?.view.failure ?? meta?.failure ?? null;
-  const limited =
-    (completed?.type === 'turn.completed' && completed.stopReason === 'limit') ||
-    failure?.kind === 'usage-limit';
+  // The stored stop reason is exact. Turns written before it existed fall back to what the
+  // stream or the failure says.
+  const limited = meta?.stopReason
+    ? meta.stopReason === 'limit'
+    : (completed?.type === 'turn.completed' && completed.stopReason === 'limit') ||
+      failure?.kind === 'usage-limit';
   const family = record?.view.identity?.family ?? meta?.selection.family;
   const message =
     state.messages.find((value) => value.id === meta?.userMessageId) ??

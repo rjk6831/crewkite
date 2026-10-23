@@ -212,7 +212,12 @@ test('the limit offer shows only while the newest turn is the one that hit a lim
   assert.equal(again?.text, 'Try again');
 
   // A reopened thread has the stored turns and no stream. The stored failure carries the cause.
-  const stored = (n: number, state: ChatTurn['state'], cause: ChatFailure['kind']): ChatTurn => ({
+  const stored = (
+    n: number,
+    state: ChatTurn['state'],
+    cause: ChatFailure['kind'],
+    stopReason?: ChatTurn['stopReason'],
+  ): ChatTurn => ({
     id: id('trn', n),
     taskId: task,
     sequence: n - 1,
@@ -225,6 +230,7 @@ test('the limit offer shows only while the newest turn is the one that hit a lim
     endedAt: stamp,
     failure: state === 'failed' ? failure(cause) : null,
     handoffFrom: null,
+    ...(stopReason ? { stopReason } : {}),
   });
   const thread: ChatThread = {
     taskId: task,
@@ -255,6 +261,9 @@ test('the limit offer shows only while the newest turn is the one that hit a lim
   assert.equal(reopened([first])?.text, 'Add the guard');
   assert.equal(reopened([first, stored(2, 'done', 'usage-limit')]), null);
   assert.equal(reopened([first, stored(2, 'failed', 'client-exit')]), null);
+  // A stored stop reason decides before the failure kind. Turns without one keep the fallback above.
+  assert.equal(reopened([stored(1, 'failed', 'client-exit', 'limit')])?.family, 'anthropic');
+  assert.equal(reopened([stored(1, 'failed', 'usage-limit', 'error')]), null);
 });
 
 test('a reply restored from a thread read keeps the role of its turn for the badge', () => {
