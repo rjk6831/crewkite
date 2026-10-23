@@ -88,6 +88,8 @@ type Ending = {
   failure: ChatFailure | null;
   text: string;
   session: ChatSession | null;
+  /** The provider stopped the turn on a usage limit. */
+  limit?: boolean;
 };
 type LiveTurn = {
   taskId: string;
@@ -515,6 +517,8 @@ export class ChatService {
     } catch {
       // The row stays open. Startup recovery fails it with a visible reason.
     }
+    if (result.stopReason === 'limit' && !live.stopRequested && !this.closed)
+      this.continueOnLimit(turnId);
   }
 
   private settle(turnId: string, end: Ending) {
@@ -550,12 +554,86 @@ export class ChatService {
         ? [...thread.sessions.filter((value) => value.family !== session.family), session]
         : thread.sessions,
     });
+    if (end.limit) this.appendLimitLine(task, turn, end.failure);
     if (end.failure)
       this.appendEntry(task, {
         kind: 'chat-system',
         author: { kind: 'system', turnId: turn.id },
         text: fitText(`${end.failure.message} ${end.failure.nextAction}`, 16_384),
       });
+  }
+
+  private appendLimitLine(task: Task, turn: ChatTurn, failure: ChatFailure | null) {
+    const resets = failure?.resetsAt
+      ? `at ${new Date(failure.resetsAt).toISOString().slice(0, 16).replace('T', ' ')} UTC`
+      : 'at an unknown time';
+    this.appendEntry(task, {
+      kind: 'chat-system',
+      author: { kind: 'system', turnId: turn.id },
+      text: `${familyName[turn.selection.family]} reached its usage limit. Resets ${resets}.`,
+    });
+  }
+
+  /**
+   * With auto handoff on, a limit stop moves the thread to the family with the most allowance
+   * left and sends the same message there. The handoff and the send commit together, so a
+   * refusal leaves the thread where it was. Without a taker the person chooses from the card.
+   */
+  private continueOnLimit(turnId: string) {
+    try {
+      const turn = this.turn(turnId);
+      const task = turn && this.task(turn.taskId);
+      if (!turn || !task || turn.state !== 'failed') return;
+      const thread = this.thread(task.id);
+      // A person who already moved the thread has made the choice.
+      if (!thread.autoHandoff || thread.selection?.family !== turn.selection.family) return;
+      const message = this.findEntry(task.id, turn.userMessageId);
+      const selection = this.nextFamily(task.id, turn.selection.family);
+      if (message?.kind !== 'user-message' || !selection) return;
+      const effects: Effects = [];
+      this.deps.store.transaction(() => {
+        const moved = this.handoff({ taskId: task.id, selection, reason: 'limit' });
+        if (moved.outcome !== 'applied') throw Error('The thread could not move on.');
+        const sent = this.sendMessage(
+          {
+            taskId: task.id,
+            text: message.text,
+            selection,
+            role: turn.role,
+            attachments: message.attachments ?? [],
+          },
+          effects,
+        );
+        if (sent.outcome !== 'applied') throw Error('The message could not be sent again.');
+      });
+      for (const effect of effects) this.call(effect);
+    } catch {
+      // The limit line stands and the card in the thread still offers the switch.
+    }
+  }
+
+  /** Highest remaining percent, then soonest reset. The family that stopped never qualifies. */
+  private nextFamily(taskId: string, stopped: ChatFamily): ChatModelSelection | null {
+    const ranked = this.deps
+      .catalog(taskId)
+      .families.filter(
+        (entry) =>
+          entry.connected && entry.family !== stopped && this.deps.adapters.has(entry.family),
+      )
+      .map((entry) => ({ entry, ...allowance(entry.remaining) }))
+      .sort((a, b) => b.percent - a.percent || a.resetsAt - b.resetsAt);
+    for (const { entry } of ranked) {
+      const model = entry.defaultModel ?? entry.models[0]?.model;
+      if (!model) continue;
+      const effort = entry.models.find((value) => value.model === model)?.defaultEffort;
+      const selection = this.deps.resolveSelection(taskId, {
+        family: entry.family,
+        model,
+        effort: effort ?? 'default',
+      });
+      if (selection) return selection;
+    }
+    return null;
   }
 
   private activeLive(taskId: string, turnId: string): LiveTurn | undefined {
@@ -789,11 +867,25 @@ function ending(result: ChatTurnResult, items: ReadonlyMap<string, string>): End
   return {
     state,
     failure,
+    limit,
     // Adapters may report only finished items on stop. The streamed text is what was shown.
     text: reportedText.trim() ? reportedText : joinText(items),
     session: session.success ? session.data : null,
   };
 }
+
+/**
+ * The window with the least left says how much a family can still do. A family with no
+ * observed percent ranks below every family with one, and an unknown reset ranks last.
+ */
+function allowance(remaining: ChatCatalogRead['families'][number]['remaining']) {
+  const [tightest] = remaining
+    .filter((window) => window.percent !== null)
+    .sort((a, b) => (a.percent ?? 0) - (b.percent ?? 0) || reset(a.resetsAt) - reset(b.resetsAt));
+  return { percent: tightest?.percent ?? -1, resetsAt: reset(tightest?.resetsAt ?? null) };
+}
+
+const reset = (at: string | null) => (at ? Date.parse(at) : Number.MAX_SAFE_INTEGER);
 
 function addText(items: Map<string, string>, event: AgentEvent) {
   if (event.type === 'text.delta')

@@ -10,6 +10,8 @@ import {
   type ThreadSource,
 } from './commands.ts';
 import { Composer, type SendInput } from './composer.tsx';
+import { LimitOfferCard } from './handoff-card.tsx';
+import { type LimitOffer, limitOffer } from './handoff-offer.ts';
 import { Inspector, type InspectorTab } from './inspector.tsx';
 import { MessageList } from './message-list.tsx';
 import { lastFamily, latestContext } from './thread-state.ts';
@@ -59,6 +61,7 @@ export function ThreadView({
   const counter = useRef(0);
   const thread = state.thread;
   const changesKey = useMemo(() => changeCount(items), [items]);
+  const offer = useMemo(() => limitOffer(state), [state]);
 
   const send = useCallback(
     async ({ text, attachments, selection }: SendInput) => {
@@ -99,6 +102,19 @@ export function ThreadView({
       await reload();
     },
     [source, task.id, reload],
+  );
+  // Move the thread when it is not on the chosen family yet, then send the stopped message again.
+  // Sending hides the card, so a refusal there reaches the person through the composer notice.
+  const continueOnLimit = useCallback(
+    async (selection: ChatModelSelection, stopped: LimitOffer) => {
+      if (thread?.selection?.family !== selection.family)
+        await handoffThread(source, { taskId: task.id, selection, reason: 'limit' });
+      await send({ text: stopped.text, attachments: stopped.attachments, selection }).catch(
+        (failure: unknown) =>
+          setNotice(failure instanceof Error ? failure.message : 'The message was not sent.'),
+      );
+    },
+    [source, task.id, thread?.selection?.family, send],
   );
   const configure = useCallback(
     (patch: { permissionPolicy?: ChatPermissionPolicy; autoHandoff?: boolean }) =>
@@ -167,6 +183,15 @@ export function ThreadView({
           </button>
         </header>
         <MessageList items={items} empty={empty} onResolve={resolve} onOpenChanges={openChanges} />
+        {offer && (
+          <LimitOfferCard
+            key={offer.turnId}
+            source={source}
+            taskId={task.id}
+            offer={offer}
+            onContinue={continueOnLimit}
+          />
+        )}
         <Composer
           key={task.id}
           source={source}

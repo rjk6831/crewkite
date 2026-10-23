@@ -11,6 +11,8 @@ import { type TestContext, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import type {
   AgentEvent,
+  ChatCatalogRead,
+  ChatFamily,
   ChatThreadRead,
   ChatTurn,
   CommandResult,
@@ -45,7 +47,10 @@ async function chat(t: TestContext, turns: ChatScriptStep[][]) {
 }
 
 /** Subscribe before the command that causes the event, then await. */
-function next(controller: Controller, match: (event: Event) => boolean): Promise<Event> {
+function next(
+  controller: Pick<Controller, 'store'>,
+  match: (event: Event) => boolean,
+): Promise<Event> {
   return new Promise((resolve) => {
     const stop = controller.store.subscribe((event) => {
       if (!match(event)) return;
@@ -55,7 +60,10 @@ function next(controller: Controller, match: (event: Event) => boolean): Promise
   });
 }
 
-function turnReaches(controller: Controller, state: ChatTurn['state']): Promise<ChatTurn> {
+function turnReaches(
+  controller: Pick<Controller, 'store'>,
+  state: ChatTurn['state'],
+): Promise<ChatTurn> {
   return next(
     controller,
     (event) => event.type === 'chat.turn' && event.payload.state === state,
@@ -288,4 +296,160 @@ test('a thread read returns messages in cursor order and the live events of the 
     earlier.messages.map((message) => message.text),
     ['First reply.'],
   );
+});
+
+// A limit stop needs a second connected family. The controller fixture reads its catalog from the
+// clients on this machine, so these tests build the service with a catalog of their own.
+function limitThread(t: TestContext, options: { autoHandoff: boolean; resetsAt: string | null }) {
+  const directory = mkdtempSync(join(tmpdir(), 'crewkite-chat-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const clock = createTestClock();
+  const ids = createTestIds(clock.now());
+  const fixtures = createDemoFixtures(clock.now());
+  const repository = createSyntheticRepository(join(directory, 'demo-shop'));
+  const store = new Store(join(directory, 'state.sqlite'));
+  t.after(() => store.close());
+  store.applyMigrations(fileURLToPath(new URL('../../migrations/', import.meta.url)));
+  const project: Project = { id: fixtures.task.projectId, name: 'demo-shop', revision: 0 };
+  store.transaction(() => {
+    store.put('project', project.id, 0, project);
+    store.put('task', fixtures.task.id, 0, fixtures.task);
+  });
+  const limit = chatFailure({
+    stage: 'stream',
+    kind: 'usage-limit',
+    message: 'The weekly limit is reached.',
+    resetsAt: options.resetsAt,
+  });
+  const reply = (text: string): ChatScriptStep[][] => [
+    [{ kind: 'text', itemId: 'reply', chunks: [text] }],
+  ];
+  const adapters = new Map([
+    [
+      'openai',
+      createScriptedChatAdapter({
+        family: 'openai',
+        turns: [[{ kind: 'fail', stopReason: 'limit', failure: limit }]],
+      }),
+    ],
+    ['anthropic', createScriptedChatAdapter({ family: 'anthropic', turns: reply('Not chosen.') })],
+    ['google', createScriptedChatAdapter({ family: 'google', turns: reply('Carrying on.') })],
+    ['local', createScriptedChatAdapter({ family: 'local', turns: reply('Not chosen.') })],
+  ] as const);
+  const inHours = (count: number) =>
+    new Date(Date.parse(clock.now()) + count * 3_600_000).toISOString();
+  const entry = (
+    family: ChatFamily,
+    percent: number,
+    resetsAt: string,
+  ): ChatCatalogRead['families'][number] => ({
+    family,
+    connected: true,
+    reason: null,
+    models: [
+      { model: `${family}-model`, label: family, efforts: ['default'], defaultEffort: 'default' },
+    ],
+    defaultModel: `${family}-model`,
+    remaining: [
+      { windowId: 'weekly', label: 'weekly', percent, resetsAt, observedAt: clock.now() },
+    ],
+  });
+  // OpenAI has the most left but it is the family that stopped. Google and Anthropic tie on
+  // percent, so the sooner reset decides. Local resets first but has less left.
+  const catalog: ChatCatalogRead = {
+    families: [
+      entry('openai', 99, inHours(1)),
+      entry('anthropic', 80, inHours(5)),
+      entry('google', 80, inHours(2)),
+      entry('local', 60, inHours(1)),
+    ],
+  };
+  const service = new ChatService({
+    store,
+    artifacts: new ArtifactFiles(join(directory, 'artifacts')),
+    home: directory,
+    now: clock.now,
+    id: (prefix) => (prefix === 'trn' ? `trn_${ids('msg').slice(4)}` : ids(prefix)),
+    emit: (type, taskId, revision, payload) =>
+      store.append({
+        protocol: 1,
+        id: ids('evt'),
+        at: clock.now(),
+        taskId,
+        revision,
+        type,
+        payload,
+      }),
+    adapters,
+    resolveEnvironment: () => ({}),
+    projectPath: () => repository.directory,
+    resolveSelection: (_taskId, value) => value ?? null,
+    catalog: () => catalog,
+  });
+  const taskId = fixtures.task.id;
+  store.transaction(() => service.configure({ taskId, autoHandoff: options.autoHandoff }));
+  const send = (text: string) => {
+    const effects: (() => void)[] = [];
+    store.transaction(() =>
+      service.sendMessage({ taskId, text, selection, role: 'assistant', attachments: [] }, effects),
+    );
+    for (const effect of effects) effect();
+  };
+  const read = () => service.readThread({ taskId, limit: 100 });
+  return { store, adapters, limit, send, read };
+}
+
+test('a usage limit writes a system line, and auto handoff sends the message to the next family', {
+  timeout: 30000,
+}, async (t) => {
+  const on = limitThread(t, { autoHandoff: true, resetsAt: '2026-10-23T14:00:00.000Z' });
+  const continued = turnReaches(on, 'done');
+  on.send('Fix the rounding.');
+  const second = await continued;
+
+  const thread = on.read();
+  const line = 'OpenAI reached its usage limit. Resets at 2026-10-23 14:00 UTC.';
+  assert.deepEqual(
+    thread.messages.map((message) => message.text),
+    [
+      'Fix the rounding.',
+      line,
+      `${on.limit.message} ${on.limit.nextAction}`,
+      'Continued on Google from OpenAI. Reason: usage limit reached.',
+      'Fix the rounding.',
+      'Carrying on.',
+    ],
+  );
+  assert.deepEqual(
+    thread.turns.map((turn) => [turn.state, turn.selection.family, turn.handoffFrom]),
+    [
+      ['failed', 'openai', null],
+      ['done', 'google', 'openai'],
+    ],
+  );
+  assert.equal(thread.thread.selection?.model, 'google-model');
+  assert.equal(thread.thread.sessions[0]?.sessionId, `session-${second.id}`);
+  const [request] = on.adapters.get('google')?.requests ?? [];
+  assert.match(request.prompt, /moved from OpenAI to Google\. Reason: usage limit reached\./);
+  assert.match(request.prompt, /New message:\nFix the rounding\./);
+  for (const family of ['anthropic', 'local'] as const)
+    assert.equal(on.adapters.get(family)?.requests.length, 0);
+
+  const off = limitThread(t, { autoHandoff: false, resetsAt: null });
+  const stopped = turnReaches(off, 'failed');
+  off.send('Fix the rounding.');
+  await stopped;
+
+  const kept = off.read();
+  assert.deepEqual(
+    kept.messages.map((message) => message.text),
+    [
+      'Fix the rounding.',
+      'OpenAI reached its usage limit. Resets at an unknown time.',
+      `${off.limit.message} ${off.limit.nextAction}`,
+    ],
+  );
+  assert.equal(kept.turns.length, 1);
+  assert.equal(kept.thread.selection?.family, 'openai');
+  assert.equal(kept.thread.activeTurnId, null);
 });
