@@ -1,7 +1,8 @@
 // Frames assumed from the controller, one per event:
 //   { type: 'agent.event', cursor: '12', taskId: <tsk>, payload: <AgentEvent> }
 //   { type: 'conversation.entry', cursor: '10', taskId: <tsk>, payload: <ChatMessage> }
-// A thread read has no cursor of its own. Messages carry theirs and live events do not.
+// A thread read carries the log cursor it reflects when the controller sends one. The live events
+// inside a read carry no cursor of their own.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type {
@@ -344,5 +345,82 @@ test('a reply restored from a thread read keeps the role of its turn for the bad
       { family: 'google', model: 'large-2', effort: 'default', role },
       role,
     );
+  }
+});
+
+test('stream events that a thread read already covers apply once', () => {
+  const thread: ChatThread = {
+    taskId: task,
+    scratchReady: true,
+    base: null,
+    selection: null,
+    permissionPolicy: 'ask',
+    sessions: [],
+    activeTurnId: turn,
+    autoHandoff: false,
+  };
+  const delta = (cursor: number, text: string) =>
+    agent(cursor, { type: 'text.delta', itemId: 'a', text });
+  const output = (cursor: number, chunk: string) =>
+    agent(cursor, { type: 'tool.output', callId: 'c1', chunk });
+  const shown = (state: ReturnType<typeof initialThreadState>) => {
+    const { blocks } = turnOf(threadItems(state));
+    const text = blocks.find((block) => block.kind === 'text');
+    const tool = blocks.find((block) => block.kind === 'tool');
+    return {
+      text: text?.kind === 'text' ? text.text : '',
+      output: tool?.kind === 'tool' ? tool.output : '',
+    };
+  };
+  // Every case is a view that folded `before`, then reloaded while `after` was still queued.
+  const fresh = [started(10), delta(11, 'Hello'), output(12, 'line\n')];
+  const cases = [
+    {
+      name: 'cursor, view had folded nothing',
+      before: [],
+      live: fresh,
+      cursor: '12',
+      after: [...fresh, delta(13, ' there'), output(14, 'more\n')],
+      want: { text: 'Hello there', output: 'line\nmore\n' },
+    },
+    {
+      name: 'no cursor, view had folded nothing',
+      before: [],
+      live: fresh,
+      cursor: undefined,
+      after: [...fresh, delta(13, ' there'), output(14, 'more\n')],
+      want: { text: 'Hello there', output: 'line\nmore\n' },
+    },
+    {
+      name: 'cursor, view had folded part of the read',
+      before: [started(10), delta(11, 'Hel')],
+      live: [started(10), delta(11, 'Hel'), delta(12, 'lo')],
+      cursor: '12',
+      after: [delta(12, 'lo'), delta(13, '!')],
+      want: { text: 'Hello!', output: '' },
+    },
+    {
+      name: 'no cursor, view had folded part of the read',
+      before: [started(10), delta(11, 'Hel')],
+      live: [started(10), delta(11, 'Hel'), delta(12, 'lo')],
+      cursor: undefined,
+      after: [delta(12, 'lo'), delta(13, '!')],
+      want: { text: 'Hello!', output: '' },
+    },
+  ];
+  for (const { name, before, live, cursor, after, want } of cases) {
+    let state = reduceThread(initialThreadState(task), { type: 'events', events: before });
+    state = reduceThread(state, {
+      type: 'loaded',
+      read: {
+        thread,
+        turns: [],
+        messages: [],
+        liveEvents: live.map((event) => event.payload as AgentEvent),
+        ...(cursor ? { cursor } : {}),
+      },
+    });
+    state = reduceThread(state, { type: 'events', events: after });
+    assert.deepEqual(shown(state), want, name);
   }
 });
