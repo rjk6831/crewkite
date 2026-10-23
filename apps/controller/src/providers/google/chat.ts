@@ -23,6 +23,7 @@ import {
   type AcpProcessOutcome,
   type AcpSpawn,
   type AcpStderrSummary,
+  chatAcpLimits,
   startAcpProcess,
 } from './acp/client.ts';
 import type { AcpClientIdentity } from './acp/profile.ts';
@@ -53,7 +54,7 @@ type RpcId = Parameters<AcpConnection['respond']>[0];
 type Fault = { code: number; message: string; data?: unknown };
 type Ending = { stopReason: ChatTurnResult['stopReason']; failure: ChatFailure | null };
 
-const maximumTurnMs = 600_000;
+const maximumTurnMs = chatAcpLimits.maxTimeoutMs;
 const outputLimitBytes = 64 * 1024;
 const pieceLimit = 60_000;
 const noJournal: AcpLifecycle = { beforePhase() {}, owned() {}, quiescent() {} };
@@ -954,6 +955,7 @@ export function googleChatAdapter(deps: {
               environment: launch.environment ?? request.environment,
               lifecycle: launch.lifecycle ?? noJournal,
               timeoutMs: Math.min(maximumTurnMs, Math.max(2000, timeout)),
+              limits: chatAcpLimits,
               spawn: launch.spawn,
               schedule: launch.schedule,
             },
