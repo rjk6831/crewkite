@@ -664,19 +664,31 @@
 }
 .th-attach-row {
   display: flex;
+  align-items: center;
   gap: 6px;
-  margin-bottom: 8px;
+  margin: 0 0 8px;
+}
+/* The role row sits under the text, so its spacing runs the other way. */
+#th-role-row {
+  margin: 8px 0 0;
 }
 .th-attach-row input {
-  padding: 5px 8px;
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  padding: 0 10px;
   font-size: 12px;
 }
-.th-attach-row button {
+.th-attach-row > button {
+  height: 32px;
   padding: 0 12px;
   border: 1px solid var(--border-strong);
-  border-radius: 6px;
-  background: var(--surface-raised);
+  border-radius: 8px;
+  background-color: var(--surface-raised);
   font-size: 12px;
+}
+.th-attach-row > button:hover:not(:disabled) {
+  background-color: var(--surface-hover);
 }
 .th-composer-bar {
   display: flex;
@@ -832,6 +844,39 @@
   padding-left: 10px;
   border-top: 1px solid var(--border);
   border-radius: 0 0 7px 7px;
+  color: var(--text-muted);
+}
+
+/* The picker inside the role row takes the same height as the field and buttons beside it. */
+.th-attach-row .th-picker {
+  flex: 1;
+  min-width: 0;
+  gap: 6px;
+}
+.th-attach-row .th-picker > .th-pill,
+.th-attach-row .th-effort select {
+  height: 32px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background-color: var(--surface-raised);
+  font-size: 12px;
+}
+.th-attach-row .th-picker > .th-pill {
+  flex: 1;
+  min-width: 0;
+  padding: 0 10px;
+  color: var(--text);
+}
+.th-attach-row .th-picker > .th-pill > svg:last-child {
+  margin-left: auto;
+}
+.th-attach-row .th-picker > .th-pill:hover,
+.th-attach-row .th-picker > .th-pill[aria-expanded="true"],
+.th-attach-row .th-effort select:hover {
+  background-color: var(--surface-hover);
+}
+.th-attach-row .th-effort select {
+  padding: 0 8px;
   color: var(--text-muted);
 }
 

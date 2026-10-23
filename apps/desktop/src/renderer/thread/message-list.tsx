@@ -1,12 +1,12 @@
-import { ArrowDown, Paperclip } from 'lucide-react';
+import { ArrowDown } from 'lucide-react';
 import { memo, type ReactNode, useLayoutEffect, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
+import { AttachmentChips } from './attach.tsx';
 import { FailureLine, PermissionCard, ThinkingCard, ToolCard } from './cards.tsx';
 import { Markdown } from './markdown.tsx';
 import type { ThreadItem, TurnView } from './thread-state.ts';
 
 const roleLabels = { assistant: null, reviewer: 'Reviewer', advisor: 'Advisor' } as const;
-const basename = (path: string) => path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
 
 type TurnHandlers = {
   onResolve: (turn: TurnView, requestId: string, choice: string) => Promise<void>;
@@ -82,16 +82,7 @@ const TurnRow = memo(function TurnRow({
 function UserRow({ item }: { item: Extract<ThreadItem, { kind: 'user' }> }) {
   return (
     <div className={item.pending ? 'th-row th-user is-pending' : 'th-row th-user'}>
-      {item.attachments.length > 0 && (
-        <ul className="th-chips" aria-label="Attachments">
-          {item.attachments.map((path) => (
-            <li key={path} title={path}>
-              <Paperclip size={12} aria-hidden="true" />
-              {basename(path)}
-            </li>
-          ))}
-        </ul>
-      )}
+      {item.attachments.length > 0 && <AttachmentChips paths={item.attachments} />}
       <div className="th-bubble">{item.text}</div>
     </div>
   );
