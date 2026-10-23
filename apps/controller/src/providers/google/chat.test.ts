@@ -382,7 +382,8 @@ test('a card closes on a completion under an unknown id or when the agent moves 
       ],
     },
     {
-      // An edit opens first, the read never reports, and a search starts after both.
+      // An edit opens first, a read runs beside it, and a search starts while the read is still
+      // running. The read then fails. A new call does not close the read, so its status stands.
       edit: (line) => {
         const frame = JSON.parse(line);
         const update = frame.params?.update;
@@ -408,14 +409,15 @@ test('a card closes on a completion under an unknown id or when the agent moves 
               kind: 'search',
               status: 'in_progress',
             }),
+            swap({ sessionUpdate: 'tool_call_update', toolCallId: 'read-1', status: 'failed' }),
           ];
         return update?.toolCallId === 'read-1' && update.status === 'completed' ? [] : [line];
       },
       trail: [
         'started edit-1',
         'started read-1',
-        'ok read-1: The result went back to the model.',
         'started search-1',
+        'error read-1',
         'ok edit-1 with diff',
         'ok search-1: The result went back to the model.',
       ],

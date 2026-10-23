@@ -697,15 +697,17 @@ export function googleChatAdapter(deps: {
       // the announced one, the card spins until the turn ends. Two fallbacks close it. A terminal
       // update with an unknown id and no title completes the newest open read, search or other
       // call, or the newest open call of the kind it names, and never opens a card of its own.
-      // And once the agent moves on to another call, to its reply or to a usage update, a read,
-      // search or other call is done, since its result went back to the model. Edits and
-      // commands wait for a real status, because the person needs to know how they went. So does
-      // a call behind an open permission card, which no fallback closes.
+      // And once the agent moves on to its reply or to a usage update, a read, search or other
+      // call is done, since its result went back to the model. A live run sent a usage update
+      // after every read. A new call is no such sign, because calls can run side by side and a
+      // read still running can fail. Edits and commands wait for a real status, because the
+      // person needs to know how they went. So does a call behind an open permission card,
+      // which no fallback closes.
       const asking = (call: Call) =>
         [...pending.values()].some((entry) => entry.callId === call.id);
-      function settle(except?: string) {
+      function settle() {
         for (const call of calls.values())
-          if (!call.done && call.id !== except && passiveKinds.has(call.kind) && !asking(call))
+          if (!call.done && passiveKinds.has(call.kind) && !asking(call))
             finish(call, 'ok', 'The result went back to the model.');
       }
       function tool(raw: Record<string, unknown>, announced: boolean) {
@@ -730,7 +732,6 @@ export function googleChatAdapter(deps: {
           if (!open) return;
           update = { ...update, toolCallId: open.id };
         }
-        if (announced) settle(update.toolCallId);
         // A late update for a closed card would put output under a finished result.
         if (calls.get(update.toolCallId)?.done) return;
         const call = upsert(update);
