@@ -1,6 +1,12 @@
 // Frames these tests assume from the native client in `--print` stream-json mode. The constants
 // below are the recorded lines; a live run should confirm each one.
 //
+// argv: --print --output-format stream-json --input-format stream-json --verbose
+//   --include-partial-messages --permission-prompt-tool stdio --setting-sources user
+//   --settings {"disableAllHooks":true} --permission-mode default|acceptEdits --model M
+//   [--effort E] [--resume S]. With --setting-sources user the scratch copy's own .claude
+//   settings never load, so no project allow rule answers an ask before CrewKite sees it.
+//
 // stdin, one JSON object per line:
 //   {"type":"user","message":{"role":"user","content":[{"type":"text","text":"..."}]}}
 //   {"type":"control_response","response":{"subtype":"success","request_id":"req-1",
@@ -21,15 +27,21 @@
 // - Rate limits arrive as rate_limit_event with rate_limit_info. rate_limit and rateLimitInfo
 //   are accepted as well.
 // - The last assistant frame's usage is the context in use; modelUsage gives the window.
+// - Only a result's subtype must keep its shape. errors, usage and modelUsage may change.
 // - SIGINT to the group ends a running turn. A failed resume exits non-zero without a result.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { type AgentEvent, AgentEventSchema, type ChatSession } from '@crewkite/contracts';
+import {
+  type AgentEvent,
+  AgentEventSchema,
+  type ChatSession,
+  type ChatToolKind,
+} from '@crewkite/contracts';
 import { spawnCheckChild } from '../../host/check-ownership.ts';
 import { groupAbsent } from '../../host/worker.ts';
 import { anthropicChatAdapter } from './chat.ts';
@@ -58,14 +70,16 @@ const reply = (id: string, content: unknown[], usage?: unknown) => ({
   parent_tool_use_id: null,
   message: { id, role: 'assistant', model, content, ...(usage ? { usage } : {}) },
 });
+// The error entry and the zero window are shapes CrewKite does not read. They must not fail a turn.
 const done = (session = fresh) => ({
   type: 'result',
   subtype: 'success',
   is_error: false,
   session_id: session,
   result: 'ok',
+  errors: [{ message: 'reported as an object' }],
   usage: { input_tokens: 2400, output_tokens: 80 },
-  modelUsage: { [model]: { contextWindow: 200_000 } },
+  modelUsage: { [model]: { contextWindow: 200_000 }, 'claude-haiku-5': { contextWindow: 0 } },
 });
 const streamed = (session = fresh): Step[] => [
   'read',
@@ -97,10 +111,15 @@ function delta(index: number, type: string, field: string, text: string) {
   return { type: 'content_block_delta', index, delta: { type, [field]: text } };
 }
 
-function run(steps: Step[], session: ChatSession | null = null) {
+function run(
+  script: Step[] | ((scratch: string) => Step[]),
+  session: ChatSession | null = null,
+  permissionGrants: ChatToolKind[] = [],
+) {
   const root = mkdtempSync(join(tmpdir(), 'crewkite-chat-'));
   mkdirSync(join(root, 'scratch'));
   mkdirSync(join(root, 'work'));
+  const steps = typeof script === 'function' ? script(join(root, 'scratch')) : script;
   const events: AgentEvent[] = [];
   const waiting = new Map<string, (event: AgentEvent) => void>();
   const launched = { argv: [] as string[], input: [] as string[] };
@@ -134,6 +153,7 @@ function run(steps: Step[], session: ChatSession | null = null) {
       scratch: { directory: join(root, 'scratch'), base: 'a'.repeat(40), projectName: 'demo' },
       work: { directory: join(root, 'work'), home: root },
       permissionPolicy: 'ask',
+      permissionGrants,
       deadlineMs: 60_000,
       environment: { HOME: root, PATH: '/usr/bin:/bin' },
       now: () => Date.parse('2026-10-23T00:00:00.000Z'),
@@ -270,6 +290,42 @@ test('a tool permission ask parks the turn until the answer reaches the client',
   );
 });
 
+test('an edit grant does not cover a path outside the scratch copy', async (t) => {
+  // The scratch copy holds `link`, a link to its parent. Paths keep their '..' unnormalized.
+  const rows = [
+    { file: 'src/notes.md', answered: ['allow-thread'] },
+    { file: '../notes.md', answered: [] },
+    { file: 'link/notes.md', answered: [] },
+  ];
+  for (const row of rows) {
+    const turn = run(
+      (scratch) => {
+        symlinkSync(dirname(scratch), join(scratch, 'link'));
+        const input = { file_path: `${scratch}/${row.file}`, content: 'Notes.' };
+        const ask = { subtype: 'can_use_tool', tool_name: 'Write', input, tool_use_id: 'toolu_1' };
+        return [
+          'read',
+          { out: init() },
+          { out: { type: 'control_request', request_id: 'req-1', request: ask } },
+          'read',
+          { out: done() },
+          'drain',
+        ];
+      },
+      null,
+      ['edit'],
+    );
+    t.after(turn.cleanup);
+    const asked = await turn.next('permission.requested');
+    const answered = turn.events.flatMap((event) =>
+      event.type === 'permission.resolved' ? [event.choice] : [],
+    );
+    assert.deepEqual(answered, row.answered, row.file);
+    if (!answered.length) turn.handle.respondPermission(asked.requestId, 'deny');
+    assert.equal((await turn.handle.result).stopReason, 'done');
+  }
+});
+
 test('stop ends a running turn as stopped and leaves no process behind', async (t) => {
   const turn = run(['read', { out: init() }, 'hold']);
   t.after(turn.cleanup);
@@ -318,6 +374,8 @@ test('a new session gets the framing and a saved one is resumed with the prompt 
     '--include-partial-messages',
     '--permission-prompt-tool',
     'stdio',
+    '--setting-sources',
+    'user',
     '--settings',
     '{"disableAllHooks":true}',
     '--permission-mode',
