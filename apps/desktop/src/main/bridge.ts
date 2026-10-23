@@ -275,8 +275,12 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       activeCommand?.command === 'StartRun' &&
       activeCommand.payload.taskId === command.payload.taskId &&
       activeCommand.payload.runId === command.payload.runId;
-    const cancellation = stopSetup || matchesStart;
-    if (cancelling || (busy && !(matchesSetup || matchesStart)))
+    // A chat turn runs on its own in the controller. Its stop has to get through while another
+    // desktop command holds the lock or waits for an exact retry, so it neither waits for a lock
+    // nor takes one.
+    const stopTurn = command.command === 'StopChatTurn';
+    const cancellation = stopSetup || matchesStart || stopTurn;
+    if (!stopTurn && (cancelling || (busy && !(matchesSetup || matchesStart))))
       throw new Error('Wait for the pending desktop command.');
     if (
       receipts.commands.length &&
@@ -293,6 +297,13 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
     )
       throw new Error('Retry the existing uncertain stop with its exact command key.');
     if (
+      command.command === 'StopChatTurn' &&
+      receipts.commands.some(
+        (item) => item.command === 'StopChatTurn' && item.payload.turnId === command.payload.turnId,
+      )
+    )
+      throw new Error('Retry the existing uncertain stop with its exact command key.');
+    if (
       stopSetup &&
       receipts.commands.some(
         (item) =>
@@ -301,8 +312,9 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       )
     )
       throw new Error('Retry the existing uncertain setup stop with its exact command key.');
-    if (cancellation) cancelling = true;
-    else {
+    const lock = stopTurn ? null : cancellation ? 'cancelling' : 'busy';
+    if (lock === 'cancelling') cancelling = true;
+    if (lock === 'busy') {
       busy = true;
       activeCommand = command;
     }
@@ -321,8 +333,8 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       assertSender(event, window);
       return result;
     } finally {
-      if (cancellation) cancelling = false;
-      else {
+      if (lock === 'cancelling') cancelling = false;
+      if (lock === 'busy') {
         busy = false;
         activeCommand = null;
       }
