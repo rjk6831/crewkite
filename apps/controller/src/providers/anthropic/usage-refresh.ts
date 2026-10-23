@@ -159,7 +159,8 @@ export class AnthropicUsageRefresh {
       available: !!binding,
       reason: binding ? 'available' : 'client-unavailable',
       readState: state?.state ?? 'idle',
-      readReason: state?.reason ?? null,
+      // Records from the earlier strict reader say only `protocol`, which tells the person nothing.
+      readReason: state?.reason === 'protocol' ? 'unreadable-output' : (state?.reason ?? null),
       operationId: state && state.state !== 'quiescent' ? state.operationId : null,
       lastAttemptAt: state?.attemptedAt ?? null,
       lastObservedAt: null,

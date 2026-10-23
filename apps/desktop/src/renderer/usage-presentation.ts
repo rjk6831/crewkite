@@ -246,6 +246,33 @@ export function projectUsagePresentation(
   });
 }
 
+// What each failed usage read was missing. Codes not listed here are shown as they are.
+const failedReads = new Map([
+  ['no-usage-report', 'The client printed no usage report before it exited.'],
+  ['no-result', 'The client exited without a result frame.'],
+  [
+    'unreadable-report',
+    'The usage report in the assistant frame has a rate limit CrewKite cannot read.',
+  ],
+  ['not-json', 'The client printed a line that is not JSON.'],
+  ['client-error', 'The result frame reported an error.'],
+  ['usage-unavailable', 'The usage report had no rate limits.'],
+  ['unreadable-output', 'An earlier CrewKite version could not read the client output.'],
+]);
+const nextSteps = new Map([
+  ['client-error', 'Check the Anthropic sign-in, then refresh.'],
+  ['usage-unavailable', 'Check that the client is signed in with a subscription plan.'],
+  ['unreadable-output', 'Refresh to read it again.'],
+]);
+
+/** The status line for the last Anthropic usage read. */
+export function anthropicReadReason(reason: string, clientVersion: string): string {
+  const failed = failedReads.get(reason);
+  if (!failed) return `Last refresh: ${reason}.`;
+  const version = clientVersion === 'unknown' ? 'the client version' : `client ${clientVersion}`;
+  return `Last refresh failed. ${failed} ${nextSteps.get(reason) ?? `Update CrewKite or report ${version}.`}`;
+}
+
 const primaryLabels = new Map([
   ['weekly', 'Weekly'],
   ['five-hour', 'Five-hour'],

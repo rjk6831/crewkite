@@ -1,6 +1,7 @@
 import { RefreshCw } from 'lucide-react';
 import { Dialog } from '../components.tsx';
 import { usageCards } from '../thread/usage-cards.ts';
+import { anthropicReadReason } from '../usage-presentation.ts';
 import { ClientStatus, clientFor } from './client-status.tsx';
 import { Allowance, type CardProps, ProviderCard } from './provider-card.tsx';
 
@@ -102,14 +103,17 @@ export function AnthropicCard({ header, workspace, entry, now, actions, scopes }
             Invokes the native local /usage command and sends no generation request. Sign-in does
             not grant native-client trust. Reported quota can be cached; its age stays unknown.
           </p>
-          {reader?.readReason && <p role="status">Last refresh: {reader.readReason}.</p>}
+          {reader?.readReason && (
+            <p role="status">{anthropicReadReason(reader.readReason, reader.clientVersion)}</p>
+          )}
           {cooldownSeconds > 0 && nextReadAt !== null && (
             <p className="st-note">
               Refresh available after {new Date(nextReadAt).toLocaleTimeString()}. Failed reads also
               count.
             </p>
           )}
-          {message && <p role="status">{message}</p>}
+          {/* A failed read returns its reason code, which the line above already explains. */}
+          {message && message !== reader?.readReason && <p role="status">{message}</p>}
           {actions.trust && (
             <Dialog title="Trust the native usage command" onClose={() => actions.setTrust(null)}>
               <p>
