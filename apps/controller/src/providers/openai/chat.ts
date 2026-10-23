@@ -628,9 +628,12 @@ class OpenAiChatTurn {
     const policy = this.request.permissionPolicy;
     // Review and advice turns read only.
     if (this.request.readOnly) return this.answer(answerId, 'deny');
-    if (policy === 'allow-all') return this.answer(answerId, 'allow-once');
-    // allow-edits and thread grants cover the scratch copy only. A change with no reported paths,
-    // a path or grant root outside scratch, or a command run from outside it goes to the person.
+    // allow-all answers every command. Edits land only in the scratch copy, so under allow-all an
+    // edit passes the same check as under allow-edits.
+    if (policy === 'allow-all' && kind === 'command') return this.answer(answerId, 'allow-once');
+    // From here every automatic answer covers the scratch copy only. A change with no reported
+    // paths, a path or grant root outside scratch, or a command run from outside it goes to the
+    // person.
     const paths = callId ? (this.edits.get(callId) ?? []) : [];
     const grantRoot = value?.grantRoot ? this.local(value.grantRoot) : '';
     const contained =
@@ -638,7 +641,8 @@ class OpenAiChatTurn {
         ? paths.length > 0 && paths.every((entry) => entry.inside) && grantRoot !== null
         : !value?.cwd || this.local(value.cwd) !== null;
     if (!contained) return;
-    if (policy === 'allow-edits' && kind === 'edit') return this.answer(answerId, 'allow-once');
+    if ((policy === 'allow-edits' || policy === 'allow-all') && kind === 'edit')
+      return this.answer(answerId, 'allow-once');
     // Thread grant: the person allowed this kind for the whole thread. Both events still go out,
     // so the thread shows what was allowed and why nobody was asked.
     if (threadGrant(this.request, kind)) this.answer(answerId, 'allow-thread');

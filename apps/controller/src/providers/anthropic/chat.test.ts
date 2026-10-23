@@ -39,6 +39,7 @@ import { fileURLToPath } from 'node:url';
 import {
   type AgentEvent,
   AgentEventSchema,
+  type ChatPermissionPolicy,
   type ChatSession,
   type ChatToolKind,
 } from '@crewkite/contracts';
@@ -115,6 +116,7 @@ function run(
   script: Step[] | ((scratch: string) => Step[]),
   session: ChatSession | null = null,
   permissionGrants: ChatToolKind[] = [],
+  permissionPolicy: ChatPermissionPolicy = 'ask',
 ) {
   const root = mkdtempSync(join(tmpdir(), 'crewkite-chat-'));
   mkdirSync(join(root, 'scratch'));
@@ -152,7 +154,7 @@ function run(
       session,
       scratch: { directory: join(root, 'scratch'), base: 'a'.repeat(40), projectName: 'demo' },
       work: { directory: join(root, 'work'), home: root },
-      permissionPolicy: 'ask',
+      permissionPolicy,
       permissionGrants,
       deadlineMs: 60_000,
       environment: { HOME: root, PATH: '/usr/bin:/bin' },
@@ -290,14 +292,16 @@ test('a tool permission ask parks the turn until the answer reaches the client',
   );
 });
 
-test('a thread grant covers neither an edit outside the scratch copy nor the other kind', async (t) => {
-  // Every row holds edit and other grants. The scratch copy holds `link`, a link to its parent,
-  // and paths keep their '..' unnormalized. WebFetch is of the other kind.
+test('an edit outside the scratch copy asks under a thread grant or allow-all, and no grant covers the other kind', async (t) => {
+  // Every row holds edit and other grants and runs under the ask policy unless it names one. The
+  // scratch copy holds `link`, a link to its parent, and paths keep their '..' unnormalized.
+  // WebFetch is of the other kind.
   const rows = [
     { tool: 'Write', file: 'src/notes.md', answered: ['allow-thread'] },
     { tool: 'Write', file: '../notes.md', answered: [] },
     { tool: 'Write', file: 'link/notes.md', answered: [] },
     { tool: 'WebFetch', file: null, answered: [] },
+    { tool: 'Write', file: '../notes.md', policy: 'allow-all' as const, answered: [] },
   ];
   for (const row of rows) {
     const turn = run(
@@ -318,13 +322,14 @@ test('a thread grant covers neither an edit outside the scratch copy nor the oth
       },
       null,
       ['edit', 'other'],
+      row.policy,
     );
     t.after(turn.cleanup);
     const asked = await turn.next('permission.requested');
     const answered = turn.events.flatMap((event) =>
       event.type === 'permission.resolved' ? [event.choice] : [],
     );
-    assert.deepEqual(answered, row.answered, row.file ?? row.tool);
+    assert.deepEqual(answered, row.answered, JSON.stringify(row));
     if (!answered.length) turn.handle.respondPermission(asked.requestId, 'deny');
     assert.equal((await turn.handle.result).stopReason, 'done');
   }

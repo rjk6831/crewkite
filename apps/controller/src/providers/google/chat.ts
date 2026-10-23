@@ -732,14 +732,16 @@ export function googleChatAdapter(deps: {
           request.readOnly === true && (call.kind === 'edit' || call.kind === 'command');
         const reject = options.find((option) => option.kind === 'deny');
         if (refuses && !reject) return live.respond(id, declined);
-        // An edit outside the scratch copy is always the person's call.
+        // Edits land only in the scratch copy, so allow-edits and allow-all answer an edit only when
+        // it names paths and all of them are inside. allow-all answers every other kind.
+        const policy = request.permissionPolicy;
         const permitted =
           allow &&
-          (request.permissionPolicy === 'allow-all' ||
-            (request.permissionPolicy === 'allow-edits' &&
-              call.kind === 'edit' &&
+          (call.kind === 'edit'
+            ? (policy === 'allow-edits' || policy === 'allow-all') &&
               call.paths.size > 0 &&
-              !call.outside))
+              !call.outside
+            : policy === 'allow-all')
             ? allow
             : undefined;
         // Thread grant: a kind the person allowed for the whole thread is answered without

@@ -354,18 +354,24 @@ test('a command kind the thread allows is answered without asking only inside th
   );
 });
 
-test('a write outside the scratch copy still asks under allow-edits', async () => {
-  // Every row also holds an edit grant, so neither rule may answer a change that leaves the copy
-  // by '..', through a link, or with a grant root outside it.
-  const rows: Array<{ detail: { path: string; grantRoot?: string }; answered: string[] }> = [
+test('a write outside the scratch copy still asks under allow-edits and allow-all', async () => {
+  // Every row also holds an edit grant, so no rule may answer a change that leaves the copy by
+  // '..', through a link, or with a grant root outside it. Rows run under allow-edits unless they
+  // name a policy.
+  const rows: Array<{
+    policy?: ChatPermissionPolicy;
+    detail: { path: string; grantRoot?: string };
+    answered: string[];
+  }> = [
     { detail: { path: 'src/app.ts' }, answered: ['allow-once'] },
     { detail: { path: '../outside.txt' }, answered: [] },
     { detail: { path: 'link/outside.txt' }, answered: [] },
     { detail: { path: 'src/app.ts', grantRoot: '..' }, answered: [] },
+    { policy: 'allow-all', detail: { path: '../outside.txt' }, answered: [] },
   ];
   for (const row of rows) {
     const run = turn('edit', {
-      permissionPolicy: 'allow-edits',
+      permissionPolicy: row.policy ?? 'allow-edits',
       permissionGrants: ['edit'],
       detail: row.detail,
       prepare: (scratch) => symlinkSync(dirname(scratch), join(scratch, 'link')),
@@ -374,7 +380,7 @@ test('a write outside the scratch copy still asks under allow-edits', async () =
     const answered = run.events.flatMap((event) =>
       event.type === 'permission.resolved' ? [event.choice] : [],
     );
-    assert.deepEqual(answered, row.answered, JSON.stringify(row.detail));
+    assert.deepEqual(answered, row.answered, JSON.stringify(row));
     if (!answered.length) run.handle.respondPermission(asked.requestId, 'deny');
     assert.equal((await run.settled()).stopReason, 'done');
   }

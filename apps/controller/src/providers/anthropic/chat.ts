@@ -737,9 +737,10 @@ function startTurn(
       (allowed.has(toolName) ||
         (kind !== 'other' && request.permissionGrants?.includes(kind) === true));
     // Review and advice turns read only. Those three tools never ask, so any ask is declined.
+    // Edits land only in the scratch copy, so allow-all sends an edit outside it to the person.
     const automatic = request.readOnly
       ? 'deny'
-      : request.permissionPolicy === 'allow-all'
+      : request.permissionPolicy === 'allow-all' && (kind !== 'edit' || inside)
         ? 'allow-once'
         : granted
           ? 'allow-thread'

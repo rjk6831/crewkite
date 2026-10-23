@@ -375,6 +375,14 @@ test('a permission request parks the turn until answered, and the policy answers
       changed: [],
     },
     {
+      policy: 'allow-all',
+      scenario: 'chat-permission-outside',
+      answer: 'deny',
+      selected: 'deny',
+      status: 'denied',
+      changed: [],
+    },
+    {
       // The client announces a kind this app does not know, so the call counts as other. A
       // thread grant for other does not answer it.
       policy: 'ask',
