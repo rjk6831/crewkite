@@ -730,9 +730,12 @@ function startTurn(
     const entry = { toolName, input, callId };
     // Thread grant: a kind the person allowed for the whole thread is answered without asking.
     // For an edit the grant covers the scratch copy only, so a file outside it is asked about.
+    // `other` spans every tool CrewKite cannot name, from web fetches to MCP tools, so no grant
+    // covers it. An allow for this thread given in this turn names the one tool.
     const granted =
       (kind !== 'edit' || inside) &&
-      (allowed.has(toolName) || request.permissionGrants?.includes(kind) === true);
+      (allowed.has(toolName) ||
+        (kind !== 'other' && request.permissionGrants?.includes(kind) === true));
     // Review and advice turns read only. Those three tools never ask, so any ask is declined.
     const automatic = request.readOnly
       ? 'deny'

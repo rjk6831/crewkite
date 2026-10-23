@@ -290,19 +290,23 @@ test('a tool permission ask parks the turn until the answer reaches the client',
   );
 });
 
-test('an edit grant does not cover a path outside the scratch copy', async (t) => {
-  // The scratch copy holds `link`, a link to its parent. Paths keep their '..' unnormalized.
+test('a thread grant covers neither an edit outside the scratch copy nor the other kind', async (t) => {
+  // Every row holds edit and other grants. The scratch copy holds `link`, a link to its parent,
+  // and paths keep their '..' unnormalized. WebFetch is of the other kind.
   const rows = [
-    { file: 'src/notes.md', answered: ['allow-thread'] },
-    { file: '../notes.md', answered: [] },
-    { file: 'link/notes.md', answered: [] },
+    { tool: 'Write', file: 'src/notes.md', answered: ['allow-thread'] },
+    { tool: 'Write', file: '../notes.md', answered: [] },
+    { tool: 'Write', file: 'link/notes.md', answered: [] },
+    { tool: 'WebFetch', file: null, answered: [] },
   ];
   for (const row of rows) {
     const turn = run(
       (scratch) => {
         symlinkSync(dirname(scratch), join(scratch, 'link'));
-        const input = { file_path: `${scratch}/${row.file}`, content: 'Notes.' };
-        const ask = { subtype: 'can_use_tool', tool_name: 'Write', input, tool_use_id: 'toolu_1' };
+        const input = row.file
+          ? { file_path: `${scratch}/${row.file}`, content: 'Notes.' }
+          : { url: 'https://example.com/' };
+        const ask = { subtype: 'can_use_tool', tool_name: row.tool, input, tool_use_id: 'toolu_1' };
         return [
           'read',
           { out: init() },
@@ -313,14 +317,14 @@ test('an edit grant does not cover a path outside the scratch copy', async (t) =
         ];
       },
       null,
-      ['edit'],
+      ['edit', 'other'],
     );
     t.after(turn.cleanup);
     const asked = await turn.next('permission.requested');
     const answered = turn.events.flatMap((event) =>
       event.type === 'permission.resolved' ? [event.choice] : [],
     );
-    assert.deepEqual(answered, row.answered, row.file);
+    assert.deepEqual(answered, row.answered, row.file ?? row.tool);
     if (!answered.length) turn.handle.respondPermission(asked.requestId, 'deny');
     assert.equal((await turn.handle.result).stopReason, 'done');
   }

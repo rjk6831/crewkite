@@ -65,6 +65,10 @@ const approvalPolicy = (request: ChatTurnRequest) =>
 // Review and advice turns read only.
 const sandboxMode = (request: ChatTurnRequest) =>
   request.readOnly ? 'read-only' : 'workspace-write';
+// `other` spans every tool CrewKite cannot name, so no thread grant covers it. Only commands and
+// file changes ask here today; the guard holds if another request kind starts asking.
+const threadGrant = (request: ChatTurnRequest, kind: ChatToolKind) =>
+  kind !== 'other' && request.permissionGrants?.includes(kind) === true;
 
 /** Chat edits the scratch copy, and every question the client asks comes back to CrewKite. */
 function nativeChatArguments(directory: string, request: ChatTurnRequest): string[] {
@@ -637,7 +641,7 @@ class OpenAiChatTurn {
     if (policy === 'allow-edits' && kind === 'edit') return this.answer(answerId, 'allow-once');
     // Thread grant: the person allowed this kind for the whole thread. Both events still go out,
     // so the thread shows what was allowed and why nobody was asked.
-    if (this.request.permissionGrants?.includes(kind)) this.answer(answerId, 'allow-thread');
+    if (threadGrant(this.request, kind)) this.answer(answerId, 'allow-thread');
   }
 
   private answer(requestId: string, choice: string) {
