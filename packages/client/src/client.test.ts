@@ -743,51 +743,6 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     model: 'planning-model-choice',
     effort: 'native-effort-high',
   };
-  const modelRequestPath = join(timedFixture.home, 'planning-model-request.json');
-  writeFileSync(modelRequestPath, JSON.stringify(modelRequest));
-  const contextRefs = ['V', 'W', 'X', 'Y'].map((ending, index) => ({
-    artifactId: `art_01ARZ3NDEKTSV4RRFFQ69G5FA${ending}`,
-    hash: (index + 1).toString(16).repeat(64),
-  }));
-  const contextRefsPath = join(timedFixture.home, 'conversation-context-refs.json');
-  writeFileSync(contextRefsPath, JSON.stringify(contextRefs.slice(0, 2)));
-  const emptyContextRefsPath = join(timedFixture.home, 'empty-context-refs.json');
-  writeFileSync(emptyContextRefsPath, '[]');
-  const maximumContextRefsPath = join(timedFixture.home, 'maximum-context-refs.json');
-  writeFileSync(maximumContextRefsPath, JSON.stringify(contextRefs));
-  const invalidContextRefs = [
-    '{',
-    '{}',
-    JSON.stringify([{ artifactId: 'not-an-artifact', hash: '1'.repeat(64) }]),
-    JSON.stringify([{ ...contextRefs[0], hash: 'bad' }]),
-    JSON.stringify([{ ...contextRefs[0], path: '/tmp/source' }]),
-    JSON.stringify([contextRefs[0], { ...contextRefs[1], artifactId: contextRefs[0].artifactId }]),
-    JSON.stringify([contextRefs[0], { ...contextRefs[1], hash: contextRefs[0].hash }]),
-    JSON.stringify([
-      ...contextRefs,
-      { artifactId: 'art_01ARZ3NDEKTSV4RRFFQ69G5FAZ', hash: '5'.repeat(64) },
-    ]),
-    `${JSON.stringify(contextRefs)}${' '.repeat(MAX_FRAME_BYTES)}`,
-  ].map((text, index) => {
-    const path = join(timedFixture.home, `invalid-context-refs-${index}.json`);
-    writeFileSync(path, text);
-    return path;
-  });
-  const invalidModelRequests = [
-    '{',
-    '[]',
-    JSON.stringify({ ...modelRequest, version: 2 }),
-    JSON.stringify({ ...modelRequest, model: 'é'.repeat(101) }),
-    JSON.stringify({ ...modelRequest, effort: 'é'.repeat(17) }),
-    JSON.stringify({ ...modelRequest, observation: { ...modelRequest.observation, hash: 'bad' } }),
-    JSON.stringify({ ...modelRequest, provider: 'arbitrary' }),
-    JSON.stringify({ ...modelRequest, observation: { ...modelRequest.observation, path: '/tmp' } }),
-    `${JSON.stringify(modelRequest)}${' '.repeat(MAX_FRAME_BYTES)}`,
-  ].map((text, index) => {
-    const path = join(timedFixture.home, `invalid-planning-request-${index}.json`);
-    writeFileSync(path, text);
-    return path;
-  });
   const conversationState: TaskConversationState = {
     taskId: task.id,
     revision: task.revision,
@@ -844,202 +799,13 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     kind: 'user-message',
     author: { kind: 'user' },
   };
-  const planningArgs = [
-    '--role',
-    'lead',
-    '--profile',
-    'openai-file-v1',
-    '--credit-policy',
-    'ordinary',
-    '--attempts',
-    '8',
-    '--minutes',
-    '20',
-    '--concurrency',
-    '2',
-    '--consent',
-  ];
   const conversationRows = [
-    {
-      args: ['create', task.projectId, '--text', 'Repair the total', ...planningArgs],
-      command: 'CreateTaskDiscussion',
-      payload: { projectId: task.projectId, text: 'Repair the total', planning: planningSelection },
-    },
-    {
-      args: [
-        'configure',
-        task.id,
-        ...planningArgs.map((value) =>
-          value === 'lead' ? 'orchestrator' : value === 'ordinary' ? 'existing-credits' : value,
-        ),
-      ],
-      command: 'ConfigureTaskConversation',
-      payload: {
-        taskId: task.id,
-        planning: { ...planningSelection, role: 'orchestrator', creditPolicy: 'existing-credits' },
-      },
-    },
-    {
-      args: ['configure', task.id, ...planningArgs, '--model-request', modelRequestPath],
-      command: 'ConfigureTaskConversation',
-      payload: { taskId: task.id, planning: { ...planningSelection, modelRequest } },
-    },
-    {
-      args: ['send', task.id, '--text', 'Keep this exact message'],
-      command: 'SendTaskMessage',
-      payload: { taskId: task.id, text: 'Keep this exact message' },
-    },
-    {
-      args: [
-        'create',
-        task.projectId,
-        '--text',
-        'Inspect the captured source',
-        ...planningArgs,
-        '--context-refs',
-        contextRefsPath,
-      ],
-      command: 'CreateTaskDiscussion',
-      payload: {
-        projectId: task.projectId,
-        text: 'Inspect the captured source',
-        planning: planningSelection,
-        context: contextRefs.slice(0, 2),
-      },
-    },
-    ...[
-      { action: 'send', command: 'SendTaskMessage' },
-      { action: 'guide', command: 'QueueTaskGuidance' },
-      { action: 'answer', command: 'AnswerTaskQuestion' },
-    ].map(({ action, command }) => ({
-      args: [
-        action,
-        task.id,
-        '--text',
-        'Keep the exact captured refs',
-        ...(action === 'answer' ? ['--question-id', conversationEntry.id] : []),
-        '--context-refs',
-        contextRefsPath,
-      ],
-      command,
-      payload: {
-        taskId: task.id,
-        text: 'Keep the exact captured refs',
-        ...(action === 'answer' ? { questionId: conversationEntry.id } : {}),
-        context: contextRefs.slice(0, 2),
-      },
-    })),
-    ...[
-      { path: emptyContextRefsPath, context: [] },
-      { path: maximumContextRefsPath, context: contextRefs },
-    ].map(({ path, context }) => ({
-      args: ['send', task.id, '--text', 'Preserve explicit refs', '--context-refs', path],
-      command: 'SendTaskMessage',
-      payload: { taskId: task.id, text: 'Preserve explicit refs', context },
-    })),
-    {
-      args: ['guide', task.id, '--text', 'Keep the scope bounded'],
-      command: 'QueueTaskGuidance',
-      payload: { taskId: task.id, text: 'Keep the scope bounded' },
-    },
-    {
-      args: [
-        'answer',
-        task.id,
-        '--question-id',
-        conversationEntry.id,
-        '--text',
-        'The total includes tax',
-      ],
-      command: 'AnswerTaskQuestion',
-      payload: {
-        taskId: task.id,
-        questionId: conversationEntry.id,
-        text: 'The total includes tax',
-      },
-    },
-    {
-      args: [
-        'adopt',
-        task.id,
-        '--proposal-id',
-        conversationState.proposal?.id as string,
-        '--proposal-hash',
-        'c'.repeat(64),
-      ],
-      command: 'AdoptTaskPlan',
-      payload: {
-        taskId: task.id,
-        proposalId: conversationState.proposal?.id,
-        proposalHash: 'c'.repeat(64),
-      },
-    },
     {
       args: ['show', task.id, '--before-cursor', '9'],
       command: 'GetTaskConversation',
       payload: { taskId: task.id, beforeCursor: '9' },
     },
     ...[
-      [
-        'create',
-        task.projectId,
-        '--text',
-        'Goal',
-        ...planningArgs.filter((value) => value !== '--consent'),
-      ],
-      [
-        'create',
-        task.projectId,
-        '--text',
-        'Goal',
-        ...planningArgs.map((value) => (value === 'lead' ? 'coder' : value)),
-      ],
-      [
-        'configure',
-        task.id,
-        ...planningArgs.map((value) => (value === 'openai-file-v1' ? '/tmp/client' : value)),
-      ],
-      ['configure', task.id, ...planningArgs.map((value) => (value === '8' ? '1e2' : value))],
-      ['configure', task.id, ...planningArgs.map((value) => (value === '20' ? '1441' : value))],
-      ['configure', task.id, ...planningArgs, '--text', 'No scope amendment'],
-      ...invalidModelRequests.map((path) => [
-        'configure',
-        task.id,
-        ...planningArgs,
-        '--model-request',
-        path,
-      ]),
-      [
-        'create',
-        task.projectId,
-        '--text',
-        'Goal',
-        ...planningArgs,
-        '--model-request',
-        modelRequestPath,
-      ],
-      ['show', task.id, '--model-request', modelRequestPath],
-      ['send', task.id, '--text', 'No configuration change', '--model-request', modelRequestPath],
-      ['configure', task.id, ...planningArgs, '--model-request'],
-      ['send', task.id, '--text', ' '],
-      ['send', task.id, '--text', 'é'.repeat(2049)],
-      ['send', task.id, '--text', 'No grants', '--grants', 'grant.json'],
-      ...invalidContextRefs.map((path) => [
-        'send',
-        task.id,
-        '--text',
-        'Reject invalid refs',
-        '--context-refs',
-        path,
-      ]),
-      ['show', task.id, '--context-refs', contextRefsPath],
-      ['configure', task.id, ...planningArgs, '--context-refs', contextRefsPath],
-      ['send', task.id, '--text', 'No missing refs file', '--context-refs'],
-      ['send', task.id, '--text', 'No authority', '--consent'],
-      ['answer', task.id, '--text', 'Missing question'],
-      ['answer', task.id, '--question-id', 'not-an-id', '--text', 'Bad question'],
-      ['adopt', task.id, '--proposal-id', conversationEntry.id],
-      ['adopt', task.id, '--proposal-id', conversationEntry.id, '--proposal-hash', 'bad-hash'],
       ['show', task.id, '--before-cursor', '-1'],
       ['show', task.id, '--policy', 'policy.json'],
       ['show', task.id, 'extra'],
@@ -1047,7 +813,6 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     ].map((args) => ({ args, command: null, payload: null })),
   ];
   const conversationCommands: Command[] = [];
-  let conversationOutcome: 'applied' | 'outcome-unknown' | 'blocked' = 'applied';
   const conversationFixture = await serve((message, socket) => {
     if (message.type === 'hello')
       socket.write(encodeFrame({ type: 'welcome', protocol: 1, cursor: snapshot.cursor }));
@@ -1072,12 +837,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
                   nextBeforeCursor: '7',
                 },
               }
-            : {
-                outcome: conversationOutcome,
-                reason: 'queued\u001b[31m\rinput',
-                next: 'Read conversation state.',
-                entity: task,
-              };
+            : { outcome: 'blocked', reason: 'unexpected-command' };
     socket.write(encodeFrame({ type: 'result', key: command.key, result }));
   });
   context.after(() => conversationFixture.close());
@@ -1098,15 +858,6 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     );
     return { code, output, errors };
   };
-  for (const args of [
-    ['task', 'show', task.id, '--context-refs', contextRefsPath],
-    ['usage', 'show', '--context-refs', contextRefsPath],
-  ]) {
-    conversationCommands.length = 0;
-    const refused = await executeConversation(args);
-    assert.equal(refused.code, 1, args.join(' '));
-    assert(conversationCommands.every((command) => command.command === 'GetSnapshot'));
-  }
   for (const row of conversationRows) {
     conversationCommands.length = 0;
     const result = await executeConversation(['conversation', ...row.args]);
@@ -1125,126 +876,34 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     const command = conversationCommands.at(-1);
     assert.equal(command?.command, row.command);
     assert.deepEqual(command?.payload, row.payload);
-    if (row.command === 'GetTaskConversation') {
-      assert.deepEqual(
-        conversationCommands.map((command) => command.command),
-        ['GetSnapshot', 'GetTaskConversationState', 'GetTaskConversation'],
-      );
-      assert.deepEqual(JSON.parse(result.output), {
-        state: conversationState,
-        conversation: {
-          kind: 'conversation',
-          taskId: task.id,
-          entries: [conversationEntry],
-          nextBeforeCursor: '7',
-        },
-      });
-      const plain = await executeConversation(['conversation', ...row.args], false);
-      assert(plain.output.includes('effective model unknown'));
-      assert(plain.output.includes(conversationEntry.id));
-      assert(plain.output.includes('Older page before 7'));
-      assert(plain.output.includes(modelRequest.model));
-      assert(plain.output.includes(modelRequest.effort));
-      assert(plain.output.includes('last-observed'));
-      assert(plain.output.includes(modelRequest.observation.artifactId));
-      assert(plain.output.includes(modelRequest.observation.hash));
-      assert(plain.output.includes(conversationState.modelChoices?.observedAt as string));
-      assert(!plain.output.includes('\u001b'));
-      assert(plain.output.includes('\\u001b'));
-      assert(!plain.output.includes('\r'));
-      assert(plain.output.includes('\\u000d'));
-    } else {
-      assert.equal(
-        command && 'expectedRevision' in command ? command.expectedRevision : null,
-        row.command === 'CreateTaskDiscussion' ? 0 : task.revision,
-      );
-      const receipt = JSON.parse(result.output);
-      assert.deepEqual(receipt.command, command);
-      if (row.command === 'ConfigureTaskConversation')
-        assert.deepEqual(
-          conversationCommands.map((value) => value.command),
-          ['GetSnapshot', 'ConfigureTaskConversation'],
-        );
-      const plain = await executeConversation(['conversation', ...row.args], false);
-      assert(!plain.output.includes('\u001b'));
-      assert(plain.output.includes('\\u001b'));
-      assert(!plain.output.includes('\r'));
-      assert(plain.output.includes('\\u000d'));
-    }
+    assert.deepEqual(
+      conversationCommands.map((command) => command.command),
+      ['GetSnapshot', 'GetTaskConversationState', 'GetTaskConversation'],
+    );
+    assert.deepEqual(JSON.parse(result.output), {
+      state: conversationState,
+      conversation: {
+        kind: 'conversation',
+        taskId: task.id,
+        entries: [conversationEntry],
+        nextBeforeCursor: '7',
+      },
+    });
+    const plain = await executeConversation(['conversation', ...row.args], false);
+    assert(plain.output.includes('effective model unknown'));
+    assert(plain.output.includes(conversationEntry.id));
+    assert(plain.output.includes('Older page before 7'));
+    assert(plain.output.includes(modelRequest.model));
+    assert(plain.output.includes(modelRequest.effort));
+    assert(plain.output.includes('last-observed'));
+    assert(plain.output.includes(modelRequest.observation.artifactId));
+    assert(plain.output.includes(modelRequest.observation.hash));
+    assert(plain.output.includes(conversationState.modelChoices?.observedAt as string));
+    assert(!plain.output.includes('\u001b'));
+    assert(plain.output.includes('\\u001b'));
+    assert(!plain.output.includes('\r'));
+    assert(plain.output.includes('\\u000d'));
   }
-  conversationOutcome = 'outcome-unknown';
-  const uncertainConversation = await executeConversation([
-    'conversation',
-    'send',
-    task.id,
-    '--text',
-    'Keep the original key',
-  ]);
-  assert.equal(uncertainConversation.code, 2);
-  const savedConversationReceipt = JSON.parse(uncertainConversation.output);
-  const conversationReceiptPath = join(conversationFixture.home, 'conversation-receipt.json');
-  writeFileSync(conversationReceiptPath, uncertainConversation.output);
-  conversationOutcome = 'applied';
-  const retriedConversation = await executeConversation(['retry', conversationReceiptPath]);
-  assert.equal(retriedConversation.code, 0, retriedConversation.errors);
-  assert.deepEqual(
-    JSON.parse(retriedConversation.output).command,
-    savedConversationReceipt.command,
-  );
-  assert.deepEqual(conversationCommands.at(-1), savedConversationReceipt.command);
-  conversationOutcome = 'outcome-unknown';
-  const uncertainModelRequest = await executeConversation([
-    'conversation',
-    'configure',
-    task.id,
-    ...planningArgs,
-    '--model-request',
-    modelRequestPath,
-  ]);
-  assert.equal(uncertainModelRequest.code, 2, uncertainModelRequest.errors);
-  const savedModelRequest = JSON.parse(uncertainModelRequest.output);
-  assert.deepEqual(savedModelRequest.command.payload.planning.modelRequest, modelRequest);
-  const modelReceiptPath = join(conversationFixture.home, 'model-request-receipt.json');
-  writeFileSync(modelReceiptPath, uncertainModelRequest.output);
-  writeFileSync(modelRequestPath, '{');
-  conversationOutcome = 'applied';
-  const retriedModelRequest = await executeConversation(['retry', modelReceiptPath]);
-  assert.equal(retriedModelRequest.code, 0, retriedModelRequest.errors);
-  assert.deepEqual(JSON.parse(retriedModelRequest.output).command, savedModelRequest.command);
-  assert.deepEqual(conversationCommands.at(-1), savedModelRequest.command);
-  writeFileSync(modelRequestPath, JSON.stringify(modelRequest));
-  conversationOutcome = 'outcome-unknown';
-  const uncertainContext = await executeConversation([
-    'conversation',
-    'send',
-    task.id,
-    '--text',
-    'Keep refs on exact retry',
-    '--context-refs',
-    contextRefsPath,
-  ]);
-  assert.equal(uncertainContext.code, 2, uncertainContext.errors);
-  const savedContextReceipt = JSON.parse(uncertainContext.output);
-  assert.deepEqual(savedContextReceipt.command.payload.context, contextRefs.slice(0, 2));
-  const contextReceiptPath = join(conversationFixture.home, 'context-refs-receipt.json');
-  writeFileSync(contextReceiptPath, uncertainContext.output);
-  writeFileSync(contextRefsPath, '[]');
-  conversationOutcome = 'applied';
-  const retriedContext = await executeConversation(['retry', contextReceiptPath]);
-  assert.equal(retriedContext.code, 0, retriedContext.errors);
-  assert.deepEqual(JSON.parse(retriedContext.output).command, savedContextReceipt.command);
-  assert.deepEqual(conversationCommands.at(-1), savedContextReceipt.command);
-  writeFileSync(contextRefsPath, JSON.stringify(contextRefs.slice(0, 2)));
-  conversationOutcome = 'blocked';
-  const refusedConversation = await executeConversation([
-    'conversation',
-    'guide',
-    task.id,
-    '--text',
-    'No new authority',
-  ]);
-  assert.equal(refusedConversation.code, 2);
-  assert.equal(JSON.parse(refusedConversation.output).result.outcome, 'blocked');
 
   let lifecycleTask: import('@crewkite/contracts').Task = { ...task };
   let lifecycleOutcome: 'applied' | 'outcome-unknown' | 'blocked' = 'applied';

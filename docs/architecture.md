@@ -141,15 +141,13 @@ The command set for the first release:
 |---------|----------|
 | `RegisterProject`, `InspectSource` | Explicit path selection, base revision, bounded dirty and untracked file details, stable project ID |
 | `CreateTask`, `AmendTask`, `PrepareRun` | Saved criteria, versioned amendments, a frozen preview of source, routes, checks and limits |
-| `CreateTaskDiscussion`, `ConfigureTaskConversation` | Retired. Explicit primary planning profile, role, credit choice and finite task limits |
-| `SendTaskMessage`, `QueueTaskGuidance`, `AnswerTaskQuestion` | Retired. Retained input under current planning authority; active work queues guidance for a later turn |
-| `AdoptTaskPlan` | Retired. Bind the exact retained proposal to the task contract without starting execution |
-| `CaptureConversationContext` | Retired. Capture selected committed source or explicit project logs into a bounded immutable artifact |
+| `GetTaskConversationState`, `GetTaskConversation` | Read a task's retained conversation; new messages go through the chat thread |
 | `SendChatMessage` | Store a user message and start one turn on the selected provider and model, with the role the message asks for |
 | `ResolveChatPermission` | Answer one open permission request with an option it offered |
 | `StopChatTurn` | Interrupt the running turn through the provider's own protocol and wait for its processes to exit |
 | `ConfigureChatThread` | Save the thread's provider and model, permission policy and automatic handoff setting |
 | `HandoffChatThread` | Move the thread to another provider; the next message carries the handoff packet |
+| `AcceptChatChanges` | Commit the scratch copy on the thread's base as one new local branch; the checkout stays untouched |
 | `ReadChatThread`, `ReadChatChanges`, `ReadChatCatalog` | Bounded reads of the thread, of the scratch diff against its base, and of the providers and models the composer can offer |
 | `ConfigureLocal`, `BeginLocalConnectionInput`, `RefreshLocalModels`, `SelectLocalModel`, `DisconnectLocal` | Explicit loopback setup, private credential input and observed model selection under the persisted Local revision |
 | `PrepareCombinedRun` | Freeze a parent and two scoped children, shared dispatch allowances, checks and reviewer without starting work |

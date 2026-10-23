@@ -1,17 +1,11 @@
 import { createHash } from 'node:crypto';
 import { closeSync, constants, fsyncSync, openSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type {
-  ConversationContextCapture,
-  ConversationContextReceipt,
-  ConversationContextRequest,
-} from '@crewkite/client';
 import { type ControllerClient, createCommandKey, transferArtifact } from '@crewkite/client/node';
 import {
   ArtifactSchema,
   ArtifactVerificationSchema,
   type Command,
-  CommandIdSchema,
   type CommandResult,
   CommandResultSchema,
   CommandSchema,
@@ -21,7 +15,6 @@ import {
   type Event,
   EventSchema,
   MAX_FRAME_BYTES,
-  ProjectIdSchema,
   SnapshotSchema,
   SnapshotScopeSchema,
 } from '@crewkite/contracts';
@@ -159,8 +152,6 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
     'snapshot',
     'command',
     'pick-project',
-    'pick-context',
-    'retry-context',
     'reconnect',
     'retry',
     'events',
@@ -230,8 +221,7 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       'protocol' in value ||
       'key' in value ||
       'actor' in value ||
-      value.command === 'RegisterProject' ||
-      value.command === 'CaptureConversationContext'
+      value.command === 'RegisterProject'
     )
       throw new Error('The desktop command requests trusted metadata or a native-only action.');
     const command = CommandSchema.parse({
@@ -364,126 +354,6 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       return result;
     } finally {
       busy = false;
-    }
-  });
-  function contextScope(input: unknown, retry: false): ConversationContextRequest;
-  function contextScope(input: unknown, retry: true): ConversationContextReceipt;
-  function contextScope(input: unknown, retry: boolean) {
-    if (!input || typeof input !== 'object' || Array.isArray(input))
-      throw new Error('The context selection is invalid.');
-    const keys = Object.keys(input);
-    const allowed = retry ? ['receiptId', 'projectId', 'base'] : ['projectId', 'base', 'mode'];
-    if (
-      keys.length !== allowed.length ||
-      keys.some((key) => !allowed.includes(key)) ||
-      !('projectId' in input) ||
-      !('base' in input) ||
-      typeof input.base !== 'string' ||
-      !/^[a-f0-9]{40}$/.test(input.base)
-    )
-      throw new Error('The context selection is invalid.');
-    const projectId = ProjectIdSchema.parse(input.projectId);
-    const base = input.base;
-    if (retry) {
-      if (!('receiptId' in input)) throw new Error('The context receipt is missing.');
-      return { projectId, base, receiptId: CommandIdSchema.parse(input.receiptId) };
-    }
-    if (
-      !('mode' in input) ||
-      (input.mode !== 'source-file' && input.mode !== 'source-folder' && input.mode !== 'log-file')
-    )
-      throw new Error('The context selection mode is invalid.');
-    return { projectId, base, mode: input.mode };
-  }
-  async function capture(
-    command: Extract<Command, { command: 'CaptureConversationContext' }>,
-    assertCurrent: () => void,
-  ): Promise<ConversationContextCapture> {
-    try {
-      const result = await send(command);
-      assertCurrent();
-      return { receiptId: command.key, result };
-    } catch (failure) {
-      assertCurrent();
-      if (!receipts.commands.some((item) => item.key === command.key)) throw failure;
-      return { receiptId: command.key, result: null };
-    }
-  }
-  ipcMain.handle('crewkite:pick-context', async (event, input: unknown) => {
-    assertSender(event, window);
-    const scope = contextScope(input, false);
-    if (busy || cancelling || receipts.commands.length)
-      throw new Error('Resolve the pending desktop command first.');
-    busy = true;
-    try {
-      if (!client) throw new Error('The controller is offline.');
-      const beforeHeader = await client.workspaceState();
-      const before = (
-        await client.projectPage({ stamp: beforeHeader.stamp, projectId: scope.projectId })
-      ).projects[0];
-      assertSender(event, window);
-      if (!before) throw new Error('The registered project is unavailable.');
-      const choice = await dialog.showOpenDialog(window, {
-        title: scope.mode === 'log-file' ? 'Choose a project log' : 'Choose project source',
-        message:
-          scope.mode === 'source-folder'
-            ? 'Committed nonempty UTF-8 files inside the project. Up to 32 files, 8 KiB each, 32 KiB encoded total.'
-            : scope.mode === 'log-file'
-              ? 'Nonempty UTF-8 log inside the project, outside hidden folders. 8 KiB at most.'
-              : 'Committed nonempty UTF-8 file inside the project. 8 KiB at most.',
-        properties: [scope.mode === 'source-folder' ? 'openDirectory' : 'openFile'],
-      });
-      assertSender(event, window);
-      if (choice.canceled) return null;
-      if (choice.filePaths.length !== 1) throw new Error('Choose one project file or folder.');
-      const afterHeader = await client.workspaceState();
-      const after = (
-        await client.projectPage({ stamp: afterHeader.stamp, projectId: scope.projectId })
-      ).projects[0];
-      assertSender(event, window);
-      if (!after || after.revision !== before.revision)
-        throw new Error('The project changed. Choose context again.');
-      const command = CommandSchema.parse({
-        protocol: 1,
-        key: createCommandKey(),
-        actor: desktopActor,
-        command: 'CaptureConversationContext',
-        expectedRevision: after.revision,
-        payload: {
-          projectId: scope.projectId,
-          base: scope.base,
-          selections: [{ kind: scope.mode, path: choice.filePaths[0] }],
-        },
-      });
-      if (command.command !== 'CaptureConversationContext')
-        throw new Error('The context command is invalid.');
-      activeCommand = command;
-      return await capture(command, () => assertSender(event, window));
-    } finally {
-      busy = false;
-      activeCommand = null;
-    }
-  });
-  ipcMain.handle('crewkite:retry-context', async (event, input: unknown) => {
-    assertSender(event, window);
-    const scope = contextScope(input, true);
-    if (busy || cancelling) throw new Error('Wait for the pending desktop command.');
-    const command = receipts.commands[0];
-    if (
-      receipts.commands.length !== 1 ||
-      command?.command !== 'CaptureConversationContext' ||
-      command.key !== scope.receiptId ||
-      command.payload.projectId !== scope.projectId ||
-      command.payload.base !== scope.base
-    )
-      throw new Error('The retained context receipt does not match this draft.');
-    busy = true;
-    activeCommand = command;
-    try {
-      return await capture(command, () => assertSender(event, window));
-    } finally {
-      busy = false;
-      activeCommand = null;
     }
   });
   ipcMain.handle('crewkite:retry', async (event, expected: unknown) => {

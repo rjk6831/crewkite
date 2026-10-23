@@ -8,7 +8,6 @@ import {
   type CommandResult,
   type Run,
   type Task,
-  TaskConversationStateSchema,
   TaskSchema,
 } from '@crewkite/contracts';
 import {
@@ -32,7 +31,7 @@ test('combined tasks share seven real dispatches and require a separate full bar
       'closed-before-check',
       'empty-journal',
     ],
-    ['recovered', 'quota', 'stopped', 'unknown', 'child-budget', 'quota-both', 'quota-stop'],
+    ['recovered', 'quota', 'stopped', 'unknown', 'quota-both', 'quota-stop'],
   ] as const;
   let fullBarrier = Promise.resolve();
   const enterFullBarrier = async () => {
@@ -121,87 +120,6 @@ test('combined tasks share seven real dispatches and require a separate full bar
             ).entity,
           ),
         );
-      for (const [index, child] of children.entries()) {
-        const configured = await controller.execute(
-          command(
-            'ConfigureTaskConversation',
-            {
-              taskId: child.id,
-              planning: {
-                role: 'lead',
-                profileId: 'openai-file-v1',
-                creditPolicy: 'ordinary',
-                consent: 'explicit',
-                limits: { attempts: 3, minutes: 5, concurrency: 1 },
-              },
-            },
-            child.revision,
-          ),
-          'local-owner',
-        );
-        assert.equal(configured.outcome, 'applied', JSON.stringify(configured));
-        const reply = Promise.withResolvers<void>();
-        const off = context.observe(controller, (event) => {
-          if (
-            event.type === 'task.updated' &&
-            event.taskId === child.id &&
-            ['interrupted', 'stopped', 'failed'].includes(event.payload.state)
-          )
-            throw Error(`Prior child planning terminated: ${context.planningTrace(child.id)}`);
-          if (
-            event.type === 'conversation.entry' &&
-            event.taskId === child.id &&
-            event.payload.kind === 'plan-proposal'
-          )
-            reply.resolve();
-        });
-        context.onWritten((message, phase) => {
-          if (
-            scenario === 'child-budget' &&
-            index === 0 &&
-            phase === 'task' &&
-            message.method === 'turn/start'
-          )
-            context.clock.advance(1000);
-        });
-        const sent = await controller.execute(
-          command(
-            'SendTaskMessage',
-            { taskId: child.id, text: 'Retain this bounded scope.' },
-            configured.revision,
-          ),
-          'local-owner',
-        );
-        assert.equal(sent.outcome, 'applied', JSON.stringify(sent));
-        try {
-          await context.wait('prior child planning proposal', reply.promise);
-        } catch (error) {
-          throw new Error(`Prior child planning failed: ${context.planningTrace(child.id)}`, {
-            cause: error,
-          });
-        }
-        off();
-        context.onWritten(undefined);
-        const stateResult = await controller.execute(
-          command('GetTaskConversationState', { taskId: child.id }),
-          'local-owner',
-        );
-        const state = TaskConversationStateSchema.parse(
-          stateResult.data && 'state' in stateResult.data ? stateResult.data.state : undefined,
-        );
-        assert(state.proposal);
-        const current = controller.snapshot().tasks.find((task) => task.id === child.id) as Task;
-        const adopted = await controller.execute(
-          command(
-            'AdoptTaskPlan',
-            { taskId: child.id, proposalId: state.proposal.id, proposalHash: state.proposal.hash },
-            current.revision,
-          ),
-          'local-owner',
-        );
-        assert.equal(adopted.outcome, 'applied', JSON.stringify(adopted));
-        children[index] = TaskSchema.parse(adopted.entity);
-      }
       const expiresAt = new Date(Date.parse(context.clock.now()) + 300000).toISOString();
       const policy = {
         ...context.appointment.policy,
@@ -334,25 +252,12 @@ test('combined tasks share seven real dispatches and require a separate full bar
             'blocked',
           );
           assert.equal(controller.snapshot().combinedRuns.length, 0);
-          assert.equal(
-            controller.store
-              .intents()
-              .filter((intent) => controller.store.runPurpose(intent.run_id) !== 'conversation')
-              .length,
-            0,
-          );
+          assert.equal(controller.store.intents().length, 0);
         }
       const prepared = await controller.execute(
         command('PrepareCombinedRun', input, rev()),
         'local-owner',
       );
-      if (scenario === 'child-budget') {
-        assert.equal(prepared.outcome, 'blocked');
-        assert.equal(prepared.reason, 'combined-child-budget-insufficient');
-        assert.equal(controller.snapshot().combinedRuns.length, 0);
-        assert.equal(controller.store.intents().length, 2);
-        continue;
-      }
       assert.equal(prepared.outcome, 'applied', JSON.stringify(prepared));
       const preview = phase();
       assert(preview);
@@ -487,7 +392,7 @@ test('combined tasks share seven real dispatches and require a separate full bar
         assert.deepEqual(scoped.combinedRuns, [preview]);
         assert(scoped.artifacts.some((artifact) => artifact.id === preview.preparationId));
       }
-      assert.equal(controller.snapshot().attempts.length, 2);
+      assert.equal(controller.snapshot().attempts.length, 0);
       assert.deepEqual(
         preview.dispatches.map((dispatch) => dispatch.state),
         Array(7).fill('reserved'),
@@ -556,7 +461,7 @@ test('combined tasks share seven real dispatches and require a separate full bar
             );
         controller = await context.restart();
         assert.equal(phase()?.phase, 'paused');
-        assert.equal(controller.store.intents().length, 2);
+        assert.equal(controller.store.intents().length, 0);
         if (scenario === 'empty-journal') {
           assert.equal(controller.store.combinedRefIntents(preview.runId)[0].state, 'prepared');
           controller.store.db
@@ -565,7 +470,7 @@ test('combined tasks share seven real dispatches and require a separate full bar
           controller = await context.restart();
           assert.equal(phase()?.phase, 'unknown');
           assert.equal(controller.store.combinedRefIntents(preview.runId)[0].state, 'unknown');
-          assert.equal(controller.store.intents().length, 2);
+          assert.equal(controller.store.intents().length, 0);
           assert.equal(
             phase()?.dispatches.every((slot) => slot.state === 'reserved'),
             true,
@@ -595,7 +500,7 @@ test('combined tasks share seven real dispatches and require a separate full bar
           'applied',
         );
         assert.equal(phase()?.phase, 'prepared');
-        assert.equal(controller.store.intents().length, 2);
+        assert.equal(controller.store.intents().length, 0);
       }
       let closeBeforeCheck: Promise<void> | undefined;
       let stopBeforeCheck: Promise<CommandResult> | undefined;
@@ -643,7 +548,6 @@ test('combined tasks share seven real dispatches and require a separate full bar
         assert.equal(
           controller.store
             .intents()
-            .filter((intent) => controller.store.runPurpose(intent.run_id) !== 'conversation')
             .every((intent) => intent.pid === null && intent.state === 'stopped'),
           true,
         );
@@ -657,7 +561,6 @@ test('combined tasks share seven real dispatches and require a separate full bar
         assert.equal(
           controller.store
             .intents()
-            .filter((intent) => controller.store.runPurpose(intent.run_id) !== 'conversation')
             .every((intent) => intent.pid === null && intent.state === 'stopped'),
           true,
         );
@@ -1072,13 +975,7 @@ test('combined tasks share seven real dispatches and require a separate full bar
         );
         assert.equal(exportedResult.outcome, 'applied', JSON.stringify(exportedResult));
         assert.equal(ArtifactSchema.parse(exportedResult.entity).mediaType, 'text/x-patch');
-        assert.equal(
-          controller.store
-            .intents()
-            .filter((intent) => controller.store.runPurpose(intent.run_id) !== 'conversation')
-            .length,
-          5,
-        );
+        assert.equal(controller.store.intents().length, 5);
       }
 
       const evaluation = await controller.execute(
@@ -1259,13 +1156,8 @@ test('combined tasks share seven real dispatches and require a separate full bar
       );
       assert.equal(phase()?.phase, 'ready', JSON.stringify(phase()));
       const snapshot = controller.snapshot();
-      assert.equal(snapshot.attempts.length, scenario === 'quota' ? 10 : 9);
-      assert.equal(
-        controller.store
-          .intents()
-          .filter((intent) => controller.store.runPurpose(intent.run_id) !== 'conversation').length,
-        scenario === 'quota' ? 8 : 7,
-      );
+      assert.equal(snapshot.attempts.length, scenario === 'quota' ? 8 : 7);
+      assert.equal(controller.store.intents().length, scenario === 'quota' ? 8 : 7);
       assert(
         snapshot.reviewJobs?.every(
           (job) => !job.scripted && 'origin' in job && !('writerAttemptId' in job),

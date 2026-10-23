@@ -29,10 +29,7 @@ import {
   type Command,
   type CommandResult,
   CommandSchema,
-  ConversationContextRefsSchema,
   type ConversationEntry,
-  ConversationModelRequestSchema,
-  ConversationPlanningSelectionSchema,
   canonicalJson,
   GitHubReadRequestSchema,
   LocalAuthModeSchema,
@@ -71,13 +68,7 @@ const help = `Usage: crewkite project add <path> [--json] [--home path]
        crewkite task list [--pages --json] [--home path]
        crewkite task amend <task-id> --title text --outcome text --criterion text [--criterion text ...] [--json] [--home path]
        crewkite task switch <task-id> <route-id> [--json] [--home path]
-       crewkite conversation <create|configure> <id> --role lead|orchestrator --profile openai-file-v1 --credit-policy ordinary|existing-credits --attempts N --minutes N --concurrency N --consent [--text goal]
-       crewkite conversation create <project-id> --text goal --role lead|orchestrator --profile openai-file-v1 --credit-policy ordinary|existing-credits --attempts N --minutes N --concurrency N --consent [--context-refs file]
-       crewkite conversation configure <task-id> --role lead|orchestrator --profile openai-file-v1 --credit-policy ordinary|existing-credits --attempts N --minutes N --concurrency N --consent [--model-request file]
        crewkite conversation show <task-id> [--before-cursor cursor] [--json] [--home path]
-       crewkite conversation <send|guide> <task-id> --text text [--context-refs file] [--json] [--home path]
-       crewkite conversation answer <task-id> --question-id message-id --text text [--context-refs file] [--json] [--home path]
-       crewkite conversation adopt <task-id> --proposal-id message-id --proposal-hash hash [--json] [--home path]
        crewkite local status [--json] [--home path]
        crewkite local configure --endpoint ws://127.0.0.1:port [--authentication token|none] [--json] [--home path]
        crewkite local <connect|refresh-models> --consent [--json] [--home path]
@@ -105,7 +96,7 @@ const help = `Usage: crewkite project add <path> [--json] [--home path]
        crewkite retry <receipt-file> [--output new-file] [--json] [--home path]
 
 Approval commands take an approval ID. Task creation takes a project ID. Other task commands take a task ID.
-Conversation creation takes a project ID and a goal, and can start a counted planning turn under its explicit finite consent. Other conversation commands take a task ID.
+Conversation show takes a task ID and reads its retained conversation.
 Project registration and task create start no work. Native preparation uses explicit consent or the controller's exact saved consent.
 For an Anthropic or Google writer, --confirm-subscription-only confirms subscription login and disabled paid extra usage.
 File handoff targets are optional and permit only later explicit manual transfers within the original budget.
@@ -155,19 +146,7 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
         limit: { type: 'string' },
         home: { type: 'string' },
         help: { type: 'boolean', short: 'h' },
-        text: { type: 'string' },
-        role: { type: 'string' },
-        profile: { type: 'string' },
-        'credit-policy': { type: 'string' },
-        'model-request': { type: 'string' },
-        'context-refs': { type: 'string' },
-        attempts: { type: 'string' },
-        minutes: { type: 'string' },
-        concurrency: { type: 'string' },
         'before-cursor': { type: 'string' },
-        'question-id': { type: 'string' },
-        'proposal-id': { type: 'string' },
-        'proposal-hash': { type: 'string' },
         title: { type: 'string' },
         outcome: { type: 'string' },
         criterion: { type: 'string', multiple: true },
@@ -339,88 +318,12 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
     )
       throw new Error('Endpoint, authentication and observation options require a Local action.');
     const conversation = area === 'conversation';
-    const planning = conversation && ['create', 'configure'].includes(action);
-    const conversationOptions = [
-      'text',
-      'role',
-      'profile',
-      'credit-policy',
-      'model-request',
-      'context-refs',
-      'attempts',
-      'minutes',
-      'concurrency',
-      'before-cursor',
-      'question-id',
-      'proposal-id',
-      'proposal-hash',
-    ];
     if (conversation) {
-      if (
-        !['create', 'show', 'send', 'answer', 'guide', 'adopt', 'configure'].includes(action) ||
-        !id
-      )
-        throw new Error(
-          'Use conversation create, show, send, answer, guide, adopt or configure with one ID.',
-        );
-      const allowed = new Set([
-        'json',
-        'home',
-        ...(planning
-          ? ['role', 'profile', 'credit-policy', 'attempts', 'minutes', 'concurrency', 'consent']
-          : []),
-        ...(['create', 'send', 'answer', 'guide'].includes(action) ? ['text', 'context-refs'] : []),
-        ...(action === 'configure' ? ['model-request'] : []),
-        ...(action === 'show' ? ['before-cursor'] : []),
-        ...(action === 'answer' ? ['question-id'] : []),
-        ...(action === 'adopt' ? ['proposal-id', 'proposal-hash'] : []),
-      ]);
-      if (Object.keys(values).some((key) => !allowed.has(key)))
+      if (action !== 'show' || !id) throw new Error('Use conversation show with one task ID.');
+      if (Object.keys(values).some((key) => !['json', 'home', 'before-cursor'].includes(key)))
         throw new Error('This option does not apply to the conversation action. Use --help.');
-      if (['create', 'send', 'answer', 'guide'].includes(action) && !values.text?.trim())
-        throw new Error('Supply nonblank --text.');
-      if (action === 'answer' && !values['question-id'])
-        throw new Error('Answer requires --question-id.');
-      if (action === 'adopt' && (!values['proposal-id'] || !values['proposal-hash']))
-        throw new Error('Adopt requires the exact --proposal-id and --proposal-hash.');
-      if (planning && !values.consent) throw new Error('Planning requires explicit --consent.');
-    } else if (
-      conversationOptions.some(
-        (key) =>
-          values[key as keyof typeof values] !== undefined &&
-          !(key === 'before-cursor' && area === 'task' && action === 'activity'),
-      )
-    )
+    } else if (values['before-cursor'] !== undefined && !(area === 'task' && action === 'activity'))
       throw new Error('Conversation options require a conversation action.');
-    const contextRefs =
-      values['context-refs'] !== undefined
-        ? ConversationContextRefsSchema.parse(readJson(values['context-refs']))
-        : undefined;
-    const planningSelection = planning
-      ? ConversationPlanningSelectionSchema.parse({
-          role: values.role,
-          profileId: values.profile,
-          creditPolicy: values['credit-policy'],
-          limits: Object.fromEntries(
-            ['attempts', 'minutes', 'concurrency'].map((key) => {
-              const value = values[key as 'attempts' | 'minutes' | 'concurrency'];
-              if (!value || !/^[1-9][0-9]*$/.test(value))
-                throw new Error(
-                  'Supply finite positive integer --attempts, --minutes and --concurrency.',
-                );
-              return [key, Number(value)];
-            }),
-          ),
-          consent: 'explicit',
-          ...(values['model-request'] !== undefined
-            ? {
-                modelRequest: ConversationModelRequestSchema.parse(
-                  readJson(values['model-request']),
-                ),
-              }
-            : {}),
-        })
-      : undefined;
     const supported = [
       'operations',
       'operation',
@@ -537,7 +440,6 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
       !stoppingUsage &&
       !settingUpGoogle &&
       !importingGoogle &&
-      !planning &&
       !local &&
       (values.family !== undefined || values.consent !== undefined)
     )
@@ -687,41 +589,28 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
     }
     const actor = { id: 'terminal', kind: 'cli' as const };
     const creation =
-      addingProject || creatingTask || (conversation && action === 'create')
+      addingProject || creatingTask
         ? CommandSchema.safeParse({
             protocol: 1,
             key: createCommandKey(),
             actor,
             expectedRevision: 0,
-            command: addingProject
-              ? 'RegisterProject'
-              : creatingTask
-                ? 'CreateTask'
-                : 'CreateTaskDiscussion',
+            command: addingProject ? 'RegisterProject' : 'CreateTask',
             payload: addingProject
               ? { path: resolve(id) }
-              : conversation
-                ? {
-                    projectId: id,
-                    text: values.text,
-                    planning: planningSelection,
-                    ...(contextRefs !== undefined ? { context: contextRefs } : {}),
-                  }
-                : {
-                    projectId: id,
-                    title: values.title,
-                    outcome: values.outcome,
-                    criteria: values.criterion,
-                  },
+              : {
+                  projectId: id,
+                  title: values.title,
+                  outcome: values.outcome,
+                  criteria: values.criterion,
+                },
           })
         : undefined;
     if (creation && !creation.success)
       throw new Error(
         addingProject
           ? 'Repository paths must contain 1 to 4096 characters.'
-          : conversation
-            ? 'Use a project ID, a goal up to 4096 encoded bytes and the explicit planning selection.'
-            : 'Use a project ID, a title up to 200 characters, an outcome up to 4096 characters and 1 to 100 criteria up to 4096 characters each.',
+          : 'Use a project ID, a title up to 200 characters, an outcome up to 4096 characters and 1 to 100 criteria up to 4096 characters each.',
       );
     const connected = await connectController({ ...readControllerEndpoint(home), actor });
     client = connected;
@@ -835,8 +724,7 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
       const created =
         succeeded(result) && command?.command === 'RegisterProject'
           ? ProjectSchema.safeParse(result.entity)
-          : succeeded(result) &&
-              (command?.command === 'CreateTask' || command?.command === 'CreateTaskDiscussion')
+          : succeeded(result) && command?.command === 'CreateTask'
             ? TaskSchema.safeParse(result.entity)
             : undefined;
       print(
@@ -1428,56 +1316,30 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
       return succeeded(result) ? 0 : 2;
     }
     if (conversation) {
-      if (action === 'show') {
-        const status = await request('GetTaskConversationState', { taskId: task.id });
-        if (!succeeded(status) || status.data?.kind !== 'conversation-state') {
-          receipt(status);
-          return 2;
-        }
-        const history = await request('GetTaskConversation', {
-          taskId: task.id,
-          ...(values['before-cursor'] !== undefined
-            ? { beforeCursor: values['before-cursor'] }
-            : {}),
-        });
-        if (!succeeded(history) || history.data?.kind !== 'conversation') {
-          receipt(history);
-          return 2;
-        }
-        if (status.data.state.taskId !== task.id || history.data.taskId !== task.id)
-          throw new Error('The conversation response belongs to a different task.');
-        print(
-          { state: status.data.state, conversation: history.data },
-          [
-            conversationStateText(status.data.state),
-            ...history.data.entries.map(conversationEntryText),
-            `Older page before ${history.data.nextBeforeCursor ?? 'none'}`,
-          ].join('\n'),
-        );
-        return 0;
+      const status = await request('GetTaskConversationState', { taskId: task.id });
+      if (!succeeded(status) || status.data?.kind !== 'conversation-state') {
+        receipt(status);
+        return 2;
       }
-      const names = {
-        configure: 'ConfigureTaskConversation',
-        send: 'SendTaskMessage',
-        answer: 'AnswerTaskQuestion',
-        guide: 'QueueTaskGuidance',
-        adopt: 'AdoptTaskPlan',
-      } as const;
-      const result = await request(
-        names[action as keyof typeof names],
-        {
-          taskId: task.id,
-          ...(planningSelection ? { planning: planningSelection } : {}),
-          ...(values.text !== undefined ? { text: values.text } : {}),
-          ...(contextRefs !== undefined ? { context: contextRefs } : {}),
-          ...(action === 'answer' ? { questionId: values['question-id'] } : {}),
-          ...(action === 'adopt'
-            ? { proposalId: values['proposal-id'], proposalHash: values['proposal-hash'] }
-            : {}),
-        },
-        task.revision,
+      const history = await request('GetTaskConversation', {
+        taskId: task.id,
+        ...(values['before-cursor'] !== undefined ? { beforeCursor: values['before-cursor'] } : {}),
+      });
+      if (!succeeded(history) || history.data?.kind !== 'conversation') {
+        receipt(history);
+        return 2;
+      }
+      if (status.data.state.taskId !== task.id || history.data.taskId !== task.id)
+        throw new Error('The conversation response belongs to a different task.');
+      print(
+        { state: status.data.state, conversation: history.data },
+        [
+          conversationStateText(status.data.state),
+          ...history.data.entries.map(conversationEntryText),
+          `Older page before ${history.data.nextBeforeCursor ?? 'none'}`,
+        ].join('\n'),
       );
-      return await finishAction(result);
+      return 0;
     }
     if (action === 'prepare-evaluation') {
       const profile = snapshot.nativeProfiles.find((profile) => profile.id === extra[0]);

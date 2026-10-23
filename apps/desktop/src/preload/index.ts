@@ -1,8 +1,7 @@
-import type { ConversationContextCapture, DesktopSource } from '@crewkite/client';
+import type { DesktopSource } from '@crewkite/client';
 import {
   ArtifactSchema,
   ArtifactVerificationSchema,
-  CommandIdSchema,
   CommandResultSchema,
   DesktopNoticeSchema,
   EventSchema,
@@ -30,26 +29,6 @@ ipcRenderer.on('crewkite:notice', (_event, value: unknown) => {
 const result = async (channel: string, input?: unknown) => {
   const value: unknown = await ipcRenderer.invoke(channel, ...(input === undefined ? [] : [input]));
   return value === null ? null : CommandResultSchema.parse(value);
-};
-const captureResult = async (
-  channel: string,
-  input: unknown,
-): Promise<ConversationContextCapture | null> => {
-  const value: unknown = await ipcRenderer.invoke(channel, input);
-  if (value === null) return null;
-  if (
-    !value ||
-    typeof value !== 'object' ||
-    Array.isArray(value) ||
-    Object.keys(value).length !== 2 ||
-    !('receiptId' in value) ||
-    !('result' in value)
-  )
-    throw new Error('The context receipt is invalid.');
-  return {
-    receiptId: CommandIdSchema.parse(value.receiptId),
-    result: value.result === null ? null : CommandResultSchema.parse(value.result),
-  };
 };
 const readPage = async (
   command: 'GetWorkspaceState' | 'GetProjectPage' | 'GetTaskPage',
@@ -108,12 +87,6 @@ const bridge: DesktopSource = {
     await ipcRenderer.invoke('crewkite:reconnect');
   },
   retryCommand: (expected) => result('crewkite:retry', expected),
-  pickConversationContext: (input) => captureResult('crewkite:pick-context', input),
-  retryConversationContext: async (input) => {
-    const value = await captureResult('crewkite:retry-context', input);
-    if (!value) throw new Error('The context receipt is missing.');
-    return value;
-  },
   onNotice(listener) {
     for (const notice of recent.values()) listener(notice);
     notices.add(listener);
