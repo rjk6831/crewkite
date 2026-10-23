@@ -1,7 +1,7 @@
 import type { ChatCatalogRead, ChatFamily, ChatModelSelection } from '@crewkite/contracts';
 import { useEffect, useState } from 'react';
 import { familyName } from '../components.tsx';
-import { readCatalog, type ThreadSource } from './commands.ts';
+import { handoffThread, readCatalog, type ThreadSource } from './commands.ts';
 import { type LimitOffer, offerChoices } from './handoff-offer.ts';
 import './handoff-card.css';
 
@@ -9,17 +9,19 @@ const reason = (failure: unknown, fallback: string) =>
   failure instanceof Error ? failure.message : fallback;
 
 // Under the thread after a provider stops on a usage limit. One button per other connected
-// family. The parent keys it by turn, so each limit reads the catalog once.
+// family. A button sends one command, HandoffChatThread. The controller moves the thread and runs
+// the stopped message again on the new provider, so the thread keeps a single copy of it. The
+// parent keys the card by turn, so each limit reads the catalog once.
 export function LimitOfferCard({
   source,
   taskId,
   offer,
-  onContinue,
 }: {
   source: ThreadSource;
   taskId: string;
   offer: LimitOffer;
-  onContinue: (selection: ChatModelSelection, offer: LimitOffer) => Promise<void>;
+  /** Not called. The controller sends the stopped message again once the handoff lands. */
+  onContinue?: (selection: ChatModelSelection, offer: LimitOffer) => Promise<void>;
 }) {
   const [catalog, setCatalog] = useState<ChatCatalogRead | null>(null);
   const [busy, setBusy] = useState<ChatFamily | null>(null);
@@ -41,9 +43,9 @@ export function LimitOfferCard({
     setBusy(selection.family);
     setProblem(null);
     try {
-      await onContinue(selection, offer);
+      await handoffThread(source, { taskId, selection, reason: 'limit' });
     } catch (failure) {
-      setProblem(reason(failure, 'The message was not sent again.'));
+      setProblem(reason(failure, 'The thread did not move.'));
     } finally {
       setBusy(null);
     }

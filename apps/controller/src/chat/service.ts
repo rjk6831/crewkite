@@ -177,35 +177,12 @@ export class ChatService {
     });
     if (!message) return blocked('message-too-large', 'Shorten the message or attach fewer paths.');
     this.saveEntry(task, message);
-    // A reviewer or advisor borrows another model. The thread keeps its own choice and any switch
-    // still waiting for the next answer.
-    const own = payload.role === 'assistant';
-    const pending = own ? this.pendingHandoff(task.id) : null;
-    // Sending on the provider the thread came from cancels the switch.
-    const handoffFrom = pending && pending.from !== selection.family ? pending.from : null;
-    if (pending && !handoffFrom) this.setHandoff(task.id, null);
-    const turn = ChatTurnSchema.parse({
-      id: this.deps.id('trn'),
-      taskId: task.id,
-      sequence: this.nextSequence(task.id),
-      role: payload.role,
-      selection,
-      userMessageId: message.id,
-      assistantMessageId: null,
-      state: 'running',
-      startedAt: this.deps.now(),
-      endedAt: null,
-      failure: null,
-      handoffFrom,
-    });
-    this.putTurn(task, turn);
-    this.putThread(task, {
-      ...thread,
-      base,
-      selection: own ? selection : thread.selection,
-      activeTurnId: turn.id,
-    });
-    effects.push(() => this.launch(turn));
+    this.openTurn(
+      task,
+      thread,
+      { selection, role: payload.role, messageId: message.id, base },
+      effects,
+    );
     return { outcome: 'applied', revision: task.revision };
   }
 
@@ -248,13 +225,21 @@ export class ChatService {
     return { outcome: 'applied' };
   }
 
-  handoff(payload: Payload<'HandoffChatThread'>): CommandResult {
+  /**
+   * Move the thread to another provider. With `reason: 'limit'` and a stopped message nobody has
+   * followed up on, the new turn starts on that same message, so the thread keeps one copy of it.
+   * Without `effects` the thread moves and no turn starts.
+   */
+  handoff(payload: Payload<'HandoffChatThread'>, effects?: Effects): CommandResult {
     const task = this.task(payload.taskId);
     if (!task) return blocked('task-not-found');
     const thread = this.thread(task.id);
     if (thread.activeTurnId)
       return blocked('turn-running', 'Stop the reply, then switch providers.');
-    const from = thread.selection?.family;
+    const stopped =
+      effects && payload.reason === 'limit' ? this.stoppedOnLimit(task.id) : undefined;
+    // The person may have moved the thread already. The packet still names the family that stopped.
+    const from = stopped?.selection.family ?? thread.selection?.family;
     if (!from || from === payload.selection.family)
       return blocked('handoff-needs-another-provider', 'Pick a different provider to continue on.');
     const selection = this.deps.resolveSelection(task.id, payload.selection);
@@ -263,11 +248,13 @@ export class ChatService {
       return blocked('provider-unavailable', 'Connect this provider in Settings or pick another.');
     this.putThread(task, { ...thread, selection });
     this.setHandoff(task.id, { from, reason: payload.reason });
-    this.appendEntry(task, {
-      kind: 'chat-system',
-      author: { kind: 'system', turnId: null },
-      text: `Continued on ${familyName[selection.family]} from ${familyName[from]}. Reason: ${handoffReason(payload.reason)}.`,
-    });
+    if (thread.selection?.family !== selection.family)
+      this.appendEntry(task, {
+        kind: 'chat-system',
+        author: { kind: 'system', turnId: null },
+        text: `Continued on ${familyName[selection.family]} from ${familyName[from]}. Reason: ${handoffReason(payload.reason)}.`,
+      });
+    if (stopped && effects) this.resend(task, stopped, effects);
     return { outcome: 'applied' };
   }
 
@@ -596,8 +583,9 @@ export class ChatService {
 
   /**
    * With auto handoff on, a limit stop moves the thread to the family with the most allowance
-   * left and sends the same message there. The handoff and the send commit together, so a
-   * refusal leaves the thread where it was. Without a taker the person chooses from the card.
+   * left and runs the same message there. The handoff opens the new turn, so both commit
+   * together and a refusal leaves the thread where it was. Without a taker the person chooses
+   * from the card.
    */
   private continueOnLimit(turnId: string) {
     try {
@@ -607,29 +595,90 @@ export class ChatService {
       const thread = this.thread(task.id);
       // A person who already moved the thread has made the choice.
       if (!thread.autoHandoff || thread.selection?.family !== turn.selection.family) return;
-      const message = this.findEntry(task.id, turn.userMessageId);
       const selection = this.nextFamily(task.id, turn.selection.family);
-      if (message?.kind !== 'user-message' || !selection) return;
+      if (!selection) return;
       const effects: Effects = [];
       this.deps.store.transaction(() => {
-        const moved = this.handoff({ taskId: task.id, selection, reason: 'limit' });
-        if (moved.outcome !== 'applied') throw Error('The thread could not move on.');
-        const sent = this.sendMessage(
-          {
-            taskId: task.id,
-            text: message.text,
-            selection,
-            role: turn.role,
-            attachments: message.attachments ?? [],
-          },
-          effects,
-        );
-        if (sent.outcome !== 'applied') throw Error('The message could not be sent again.');
+        const moved = this.handoff({ taskId: task.id, selection, reason: 'limit' }, effects);
+        if (moved.outcome !== 'applied' || effects.length === 0)
+          throw Error('The thread could not move on.');
       });
       for (const effect of effects) this.call(effect);
     } catch {
       // The limit line stands and the card in the thread still offers the switch.
     }
+  }
+
+  /** The newest turn, when it ended on a usage limit and the person has written nothing since. */
+  private stoppedOnLimit(taskId: string): ChatTurn | undefined {
+    const row = this.deps.store.db
+      .prepare('SELECT body FROM chat_turns WHERE task_id=? ORDER BY sequence DESC LIMIT 1')
+      .get(taskId);
+    const turn = row ? ChatTurnSchema.parse(JSON.parse(row.body as string)) : undefined;
+    if (!turn || !endedOnLimit(turn)) return;
+    const newest = this.deps.store.db
+      .prepare(
+        "SELECT id FROM conversation_entries WHERE task_id=? AND json_extract(body,'$.kind')='user-message' ORDER BY sequence DESC LIMIT 1",
+      )
+      .get(taskId);
+    return newest?.id === turn.userMessageId ? turn : undefined;
+  }
+
+  /** Run the stopped message again on the provider the thread just moved to. No new entry is written. */
+  private resend(task: Task, stopped: ChatTurn, effects: Effects) {
+    const thread = this.thread(task.id);
+    const message = this.findEntry(task.id, stopped.userMessageId);
+    if (message?.kind !== 'user-message' || !thread.selection || !thread.base) return;
+    this.openTurn(
+      task,
+      thread,
+      { selection: thread.selection, role: stopped.role, messageId: message.id, base: thread.base },
+      effects,
+    );
+  }
+
+  /** Open a running turn on a saved user message. The launch waits for the command to commit. */
+  private openTurn(
+    task: Task,
+    thread: ChatThread,
+    input: {
+      selection: ChatModelSelection;
+      role: ChatTurn['role'];
+      messageId: string;
+      base: string;
+    },
+    effects: Effects,
+  ) {
+    const { selection, role, messageId, base } = input;
+    // A reviewer or advisor borrows another model. The thread keeps its own choice and any switch
+    // still waiting for the next answer.
+    const own = role === 'assistant';
+    const pending = own ? this.pendingHandoff(task.id) : null;
+    // Sending on the provider the thread came from cancels the switch.
+    const handoffFrom = pending && pending.from !== selection.family ? pending.from : null;
+    if (pending && !handoffFrom) this.setHandoff(task.id, null);
+    const turn = ChatTurnSchema.parse({
+      id: this.deps.id('trn'),
+      taskId: task.id,
+      sequence: this.nextSequence(task.id),
+      role,
+      selection,
+      userMessageId: messageId,
+      assistantMessageId: null,
+      state: 'running',
+      startedAt: this.deps.now(),
+      endedAt: null,
+      failure: null,
+      handoffFrom,
+    });
+    this.putTurn(task, turn);
+    this.putThread(task, {
+      ...thread,
+      base,
+      selection: own ? selection : thread.selection,
+      activeTurnId: turn.id,
+    });
+    effects.push(() => this.launch(turn));
   }
 
   /** Highest remaining percent, then soonest reset. The family that stopped never qualifies. */
@@ -888,6 +937,13 @@ function chatMessage(entry: ConversationEntry): ChatMessage | undefined {
   return entry.kind === 'chat-assistant' || entry.kind === 'chat-system'
     ? { ...common, author: entry.author, attachments: [] }
     : undefined;
+}
+
+/** Turns written before stop reasons were stored fall back to the failure kind. */
+function endedOnLimit(turn: ChatTurn): boolean {
+  return turn.stopReason
+    ? turn.stopReason === 'limit'
+    : turn.state === 'failed' && turn.failure?.kind === 'usage-limit';
 }
 
 function ending(result: ChatTurnResult, items: ReadonlyMap<string, string>): Ending {

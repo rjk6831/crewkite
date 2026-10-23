@@ -399,7 +399,7 @@ function limitThread(t: TestContext, options: { autoHandoff: boolean; resetsAt: 
   return { store, adapters, limit, send, read };
 }
 
-test('a usage limit writes a system line, and auto handoff sends the message to the next family', {
+test('a usage limit writes a system line, and auto handoff runs the same message once on the next family', {
   timeout: 30000,
 }, async (t) => {
   const on = limitThread(t, { autoHandoff: true, resetsAt: '2026-10-23T14:00:00.000Z' });
@@ -416,17 +416,22 @@ test('a usage limit writes a system line, and auto handoff sends the message to 
       line,
       `${on.limit.message} ${on.limit.nextAction}`,
       'Continued on Google from OpenAI. Reason: usage limit reached.',
-      'Fix the rounding.',
       'Carrying on.',
     ],
   );
   assert.deepEqual(
-    thread.turns.map((turn) => [turn.state, turn.selection.family, turn.handoffFrom]),
+    thread.turns.map((turn) => [
+      turn.state,
+      turn.stopReason,
+      turn.selection.family,
+      turn.handoffFrom,
+    ]),
     [
-      ['failed', 'openai', null],
-      ['done', 'google', 'openai'],
+      ['failed', 'limit', 'openai', null],
+      ['done', 'done', 'google', 'openai'],
     ],
   );
+  assert.equal(thread.turns[1].userMessageId, thread.turns[0].userMessageId);
   assert.equal(thread.thread.selection?.model, 'google-model');
   assert.equal(thread.thread.sessions[0]?.sessionId, `session-${second.id}`);
   const [request] = on.adapters.get('google')?.requests ?? [];
