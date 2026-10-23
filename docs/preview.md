@@ -1,6 +1,6 @@
 # Trying the preview
 
-This guide gives one practical sequence for trying the candidate on a real project. You need a local Git repository and any provider client you plan to use.
+This guide takes about two minutes once the app is open. You need a local Git repository with at least one commit and a signed-in client for one provider.
 
 ## Verify the download
 
@@ -33,51 +33,19 @@ From Terminal, change into that candidate folder and use:
 
 I record the exact source revision, verification and provider qualification in the candidate's release receipt. A working launcher does not establish a qualified provider route. The [distribution notes](distribution.md) describe the directory package and remaining install checks.
 
-## Start a task
+## Walkthrough
 
-These steps apply to the [D2b UAT 05 prerelease](https://github.com/rjk6831/crewkite/releases/tag/d2b-uat-05). Read its release receipt before testing a provider route. Required CI passed 146 Node claims and one desktop journey. The package passed cold launch, restart and an exact UAT 04 state upgrade with backup and reopen. Public anonymous downloads matched all three assets. Model-catalog binding has controlled regression coverage; live account discovery, alternate-model execution and human UAT remain unqualified for this release. The package has an ad-hoc integrity seal and is not notarized.
+1. Connect a provider. Open Settings in the left rail. Each provider has a card with its sign-in or connection state, the models it offers and the allowance it has left. Connect one provider there. [Provider routes](providers.md) lists what each provider needs first.
+2. Add a project. Choose Add project in the left rail and select the root of a Git repository.
+3. Start a thread. Choose New thread. The composer reads "Ask about this project or describe a change". Pick a provider and model from the menu in the composer, then ask about the project, for example "What does this project do and what would you change first?"
+4. Watch it stream. The answer appears as the provider writes it. Each file read or search shows as a tool card, and a Thinking card appears for providers that report their reasoning. Choose Stop to end a turn early.
+5. Ask for a change. A permission request appears in the thread with the exact edit or command. Choose Allow once, Allow for this thread or Deny. The default is to ask every time. The edit lands in a scratch copy of the project, and your checkout is not touched.
+6. Open Changes. Choose Open in Changes on the edit's tool card, or toggle the inspector and select Changes. It lists each changed file against the base commit, with the diff one click away.
+7. Switch provider mid-thread. Open the provider and model menu, pick a model from another provider, open the menu again and choose Continue on another provider. The thread adds a line such as "Continued on Anthropic from OpenAI. Reason: switched in the composer." The next message runs on the new provider in the same scratch copy. It starts from your messages, the earlier answers and the list of changed files.
+8. Accept to a branch. The thread has no accept action yet. The edits stay in the scratch copy until branch acceptance is wired into the thread, and your checkout stays unchanged.
 
-1. Open the normal candidate. Packaging details are in the [distribution notes](distribution.md).
-2. Choose Connect providers and check the clients you plan to use. Coding setup readiness and quota are separate facts. A connected client does not make every Project engine ready.
-3. Choose Add project and select the exact Git repository root. A refused folder reports its reason and permits another selection after its saved command settles.
-4. On that project row, choose New task. The project is already selected. Enter a title, outcome and one acceptance criterion per line, then choose Create task. The global New task action opens the same form with a project selector.
-
-## Plan before coding
-
-Plan with AI is optional. If you use it, send a bounded objective, read the answers, criteria and scope, and choose Adopt plan only when they match your intent. Adoption saves the task contract and starts no coding work.
-
-For a normal new task, choose Prepare run. Keep the Project scope and OpenAI Project profile. Choose the task-bound model and effort when advertised, then choose Start task to open the permission draft. Catalog reads require no planning turn; the profile default applies when no explicit choice is saved. Subscription only is the default. Read the exact source and policy, then select “Allow OpenAI to read this project, edit a separate working copy, and run local commands using my signed-in client.” Choose Review task to save that preparation, review it once more, then choose Start task. Work runs in a separate scratch copy.
-
-A material model or effort Save creates a linked planning run and returns the contract to provisional, so adopt a fresh valid plan before preparing execution again. Make material planning changes before execution begins, since that Save is scoped to the discussion. Once an execution run exists, it is retained, and material planning changes are unavailable there. Ordinary messages remain guidance and do not replace that run.
-
-Manual single-file targeting is retained for saved legacy runs but is not the normal entry for a new task. The project check recipe appears only when the source contains the supported recipe files.
-
-## Review the result
-
-Open Changes to inspect the retained work. Checks and review are separate actions with their own permissions. A passing result still needs your approval for that destination before CrewKite creates one new local branch. Nothing merges, checks out, pushes or publishes, and your original checkout stays unchanged.
-
-## Stop and reopen
-
-Use Stop to end active work. Reopening the same home launches nothing. An uncertain command keeps its original receipt, so you can retry that exact command. Unresolved ownership is shown as such and gives no permission to relaunch the work or treat it as complete.
-
-## Providers
-
-Open Connect providers from the workspace sidebar. The same controls appear in Usage and capacity.
-
-- Refresh OpenAI quota reads the supported installed client's existing subscription session. It submits no model prompt. Readiness failures show the retained reason and next action.
-- Check Anthropic sign-in observes the supported installed native client. A signed-out client needs its own native sign-in, described in the [provider instructions](providers.md#anthropic-writer-preparation). Refresh Anthropic quota separately asks for trust to run the pinned client's native `/usage` report and show its values in the shared remaining-allowance gauges. This path has no live qualification yet. It shows a local receipt time, while observation age and account scope remain unknown, and it does not establish current task admission or exhaustion.
-- Connect Google downloads and verifies the reviewed official ACP client when needed, initializes it, pauses for explicit Sign in with Google in the browser, and then discovers choices automatically. You complete and control the Google account sign-in. The separate Google quota gauge does not establish coding readiness.
-
-Local uses a dedicated token by default. Enter the loopback endpoint and choose Connect once. The packaged app saves a changed endpoint, requests the token through its native input, connects and discovers loaded models automatically. It checks status once per second for up to 20 attempts without overlapping requests; use the single Refresh action if it takes longer. Select an observed model to save it immediately. Load or unload models in the Local app. An explicit CLI configuration can instead select no authentication, limited to this device's loopback address. The main interface has no selector and never switches modes automatically. See the [provider notes](providers.md#local-models) and the [CLI guide](../apps/cli/README.md). Model eligibility is not qualification. An eligible model stays unmeasured until separate evidence covers it.
-
-### Google single-file support
-
-The Google ACP profile retains its bounded one-file workflow for existing saved runs and the CLI. It is not offered in the normal New task execution chooser. Each edit still needs a separate approval. Google project commands, repository-wide editing, delegation, lead and orchestrator roles, formal review and automatic handoff are not implemented in this profile. See the [current model boundaries](providers.md#google-acp-writer) and [CLI setup and task commands](../apps/cli/README.md#google-acp-setup).
-
-## Usage and context
-
-Usage shows reported or last-observed values with their source and time. Missing data appears as unknown. CrewKite does not estimate how full a window is from tokens, and it does not infer quota from them. After a successful OpenAI planning turn, the composer can show last-observed context tokens and reported capacity. Without reported capacity, the percentage stays unknown.
+A turn that a crash leaves open shows as failed, with a plain reason, when the controller restarts. Reopening starts no work.
 
 ## Send a short record
 
-Keep a short record of the concrete result you observed, any refusal, the changes or evidence retained, how Stop and reopen behaved, and whether the next action was clear. A few sentences is enough. The [roadmap](roadmap.md) lists the open evidence gates.
+Keep a short record of what you asked, which provider answered, any refusal or error line, what Changes showed, and whether the next action was clear. A few sentences is enough. The [roadmap](roadmap.md) lists the open evidence gates.

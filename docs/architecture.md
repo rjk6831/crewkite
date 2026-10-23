@@ -19,7 +19,42 @@ Provider adapters stay inside the controller until a second consumer needs them.
 
 A fresh normal workspace has no seeded project or fixture route catalog. Its prepared native profiles and explicit Local connection use their real provider protocols. Developer demo and preview modes remain explicit. A failed native operation retains its own refusal or uncertainty; it grants no fallback authority.
 
+## Chat thread
+
+A thread is one conversation about one project. The first message creates the task record, and every later message belongs to it. The controller keeps the thread's base commit, the current provider and model, a permission policy, and one native session ID for each provider that has run on the thread.
+
+A turn is one user message and the provider's response until it yields. A thread runs one turn at a time, and a turn has a thirty minute deadline. The turn is the unit of Stop and process cleanup. It ends as done, stopped or failed. A usage-limit refusal ends as failed, with the reset time on the failure when the provider reports one.
+
+An adapter owns one native process or connection for one turn. Each implements `ChatAdapter` in `apps/controller/src/chat/adapter.ts`: `startTurn` returns a handle with `respondPermission`, `stop`, the process groups the controller has to prove absent, and a `result` promise. Adapters are the only code that knows a provider's protocol. [Provider routes](providers.md) names the transport of each.
+
+```text
+renderer ---- SendChatMessage ----> controller
+                                      one turn at a time per thread
+                                      scratch copy of the base commit
+                                            |
+                                            v
+                                         adapter <----> provider client
+                                            |
+                                     AgentEvent stream
+                                            |
+                    event log <-------------+-------------> renderer
+renderer ---- ResolveChatPermission ----> controller ----> adapter
+```
+
+Adapters emit the `AgentEvent` values defined in `packages/contracts/src/chat.ts`: turn start, text and thinking deltas with one completed event per item, tool start, output and completion, permission requested and resolved, context usage, provider notices and turn completion. The controller validates each event, appends it to the event log under the task and forwards it to clients as `agent.event`. An event it cannot read becomes one provider notice per turn and never ends the turn. The renderer folds the stream into messages and cards and knows nothing provider-specific. A view that opens in the middle of a turn rebuilds it from the log. The controller also emits `chat.turn` and `chat.thread` when those records change, and `conversation.entry` for each stored message.
+
+The first turn copies the committed files of the project's HEAD into a scratch directory under the controller home, and that commit becomes the thread's base. Every adapter runs with the copy as its working directory. Changes compares the copy with the base commit and honors the base's ignore rules. The person's checkout is never written. Edits leave the copy only through branch acceptance under [ADR 0008](adr/0008-isolated-writers-local-branch-acceptance.md), and the thread has no accept action yet.
+
+A permission request is an event in the thread. The adapter asks with the provider's own question and a list of options: allow once, allow for this thread, deny. The thread view shows it inline and `ResolveChatPermission` answers it. The controller accepts an answer only for a request that is open on the active turn, and only with an option that request offered. It then hands the answer to the adapter, which passes it through the provider's native approval channel. Model text cannot answer a request, which keeps [ADR 0002](adr/0002-authority-in-deterministic-code.md) intact. The thread's permission policy sets what an adapter may answer for itself: ask each time, allow edits or allow all. A new thread asks every time.
+
+A failed turn keeps a failure record: the stage, a kind, one sentence saying what happened, the provider's own message and method when it has them, and the next action. The thread shows it as a system line. `protocol` is a kind for the record and is never the text the person reads.
+
+`HandoffChatThread` moves a thread to another provider. The controller never asks the stopped model to summarize its own work, in line with [ADR 0007](adr/0007-recover-from-durable-facts.md). The next turn's first prompt is built from stored facts: the last 60 messages of the transcript, with user messages verbatim, the last three assistant answers in full and earlier answers cut to 600 characters, the changed files with their line counts, and the new message. The new provider reads the files itself in the same scratch copy. The earlier provider's session ID stays on the thread, so moving back resumes it when that provider allows.
+
 ## Task conversation
+
+The structured planning turn described in this section is retired. It sent the whole history to a read-only session as one prompt with an output schema and kept only a final answer that matched the schema. The [chat thread](#chat-thread) replaces it, and [ADR 0036](adr/0036-the-chat-thread-is-the-product-center.md) records why. The tables it wrote stay in the schema because migrations only append. The rest of this section records how it worked.
+
 
 The task's primary conversation retains messages, queued guidance, questions, answers and proposed plans with their run and attempt bindings. A planning turn needs explicit consent, the supported primary profile and finite limits. The current selection permits Lead or Orchestrator through `openai-file-v1`, with a separate existing-credit choice. Requested model and effort remain distinct from observed effective settings. Planning consumes the task's budget; reading history, reconnecting and reopening admit no turn.
 
@@ -106,10 +141,16 @@ The command set for the first release:
 |---------|----------|
 | `RegisterProject`, `InspectSource` | Explicit path selection, base revision, bounded dirty and untracked file details, stable project ID |
 | `CreateTask`, `AmendTask`, `PrepareRun` | Saved criteria, versioned amendments, a frozen preview of source, routes, checks and limits |
-| `CreateTaskDiscussion`, `ConfigureTaskConversation` | Explicit primary planning profile, role, credit choice and finite task limits |
-| `SendTaskMessage`, `QueueTaskGuidance`, `AnswerTaskQuestion` | Retained input under current planning authority; active work queues guidance for a later turn |
-| `AdoptTaskPlan` | Bind the exact retained proposal to the task contract without starting execution |
-| `CaptureConversationContext` | Capture selected committed source or explicit project logs into a bounded immutable artifact |
+| `CreateTaskDiscussion`, `ConfigureTaskConversation` | Retired. Explicit primary planning profile, role, credit choice and finite task limits |
+| `SendTaskMessage`, `QueueTaskGuidance`, `AnswerTaskQuestion` | Retired. Retained input under current planning authority; active work queues guidance for a later turn |
+| `AdoptTaskPlan` | Retired. Bind the exact retained proposal to the task contract without starting execution |
+| `CaptureConversationContext` | Retired. Capture selected committed source or explicit project logs into a bounded immutable artifact |
+| `SendChatMessage` | Store a user message and start one turn on the selected provider and model, with the role the message asks for |
+| `ResolveChatPermission` | Answer one open permission request with an option it offered |
+| `StopChatTurn` | Interrupt the running turn through the provider's own protocol and wait for its processes to exit |
+| `ConfigureChatThread` | Save the thread's provider and model, permission policy and automatic handoff setting |
+| `HandoffChatThread` | Move the thread to another provider; the next message carries the handoff packet |
+| `ReadChatThread`, `ReadChatChanges`, `ReadChatCatalog` | Bounded reads of the thread, of the scratch diff against its base, and of the providers and models the composer can offer |
 | `ConfigureLocal`, `BeginLocalConnectionInput`, `RefreshLocalModels`, `SelectLocalModel`, `DisconnectLocal` | Explicit loopback setup, private credential input and observed model selection under the persisted Local revision |
 | `PrepareCombinedRun` | Freeze a parent and two scoped children, shared dispatch allowances, checks and reviewer without starting work |
 | `AssembleCombinedCandidate` | Replay both retained child deltas through ordered checks and guarded private ref updates; seal a candidate for separate final evaluation |
