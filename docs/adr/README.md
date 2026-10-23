@@ -33,6 +33,7 @@ Each record states one decision, the context that forced it, why I chose it and 
 | [0027](0027-page-large-data-without-project-size-ceilings.md) | Page large data without aggregate project-size ceilings | Proposed |
 | [0028](0028-journal-project-commands-and-remote-effects.md) | Journal project commands and remote effects | Proposed |
 | [0029](0029-native-repository-context-and-handoff.md) | Own repository context and handoff in the controller | Proposed |
+| [0036](0036-the-chat-thread-is-the-product-center.md) | Make the chat thread the product center | Proposed |
 
 ## Writing a new record
 
