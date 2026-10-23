@@ -1,3 +1,5 @@
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import type {
   AgentEvent,
   ChatEffort,
@@ -5,6 +7,7 @@ import type {
   ChatFamily,
   ChatRole,
   ChatSession,
+  ChatToolKind,
 } from '@crewkite/contracts';
 
 // A scripted chat provider for controller tests. It emits the same AgentEvent stream a real
@@ -16,6 +19,15 @@ export type ChatScriptStep =
   | { kind: 'text'; itemId: string; chunks: string[]; complete?: boolean }
   /** Ask for permission and wait for respondPermission with this request ID. */
   | { kind: 'permission'; requestId: string; question: string }
+  /** Report one tool call. `write` puts a file into the scratch copy before the call completes. */
+  | {
+      kind: 'tool';
+      callId: string;
+      toolKind: ChatToolKind;
+      title: string;
+      output?: string;
+      write?: { path: string; content: string };
+    }
   /** Park until stop(). */
   | { kind: 'wait' }
   /** End the turn with this failure. */
@@ -64,6 +76,7 @@ export function createScriptedChatAdapter(options: {
         // Like a native client that drops the open item on interrupt, a stop reports only
         // completed items. The controller keeps what was streamed.
         const completed: string[] = [];
+        const written: string[] = [];
         const end = (stopReason: Result['stopReason'], failure: ChatFailure | null): Result => {
           emit({ type: 'turn.completed', turnId, stopReason, failure });
           return {
@@ -80,7 +93,7 @@ export function createScriptedChatAdapter(options: {
                   }
                 : null,
             usage: null,
-            changedPaths: [],
+            changedPaths: written,
           };
         };
         await tick();
@@ -113,6 +126,29 @@ export function createScriptedChatAdapter(options: {
             const choice = answers.get(step.requestId);
             if (choice)
               emit({ type: 'permission.resolved', turnId, requestId: step.requestId, choice });
+          }
+          if (step.kind === 'tool') {
+            await tick();
+            if (stopped) break;
+            emit({
+              type: 'tool.started',
+              turnId,
+              callId: step.callId,
+              kind: step.toolKind,
+              title: step.title,
+            });
+            if (step.output)
+              emit({ type: 'tool.output', turnId, callId: step.callId, chunk: step.output });
+            if (step.write) {
+              const root = resolve(request.scratch.directory);
+              const target = resolve(root, step.write.path);
+              if (!target.startsWith(`${root}/`))
+                throw new Error('A scripted write has to stay inside the scratch copy.');
+              mkdirSync(dirname(target), { recursive: true });
+              writeFileSync(target, step.write.content);
+              written.push(step.write.path);
+            }
+            emit({ type: 'tool.completed', turnId, callId: step.callId, status: 'ok' });
           }
           if (step.kind === 'text') {
             let text = '';

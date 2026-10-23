@@ -15,13 +15,49 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { checkOwner } from '../apps/controller/src/host/check-ownership.ts';
 import { configuredIdentity } from '../apps/controller/src/host/publication.ts';
 import { startController } from '../apps/controller/src/main.ts';
+import { unavailableNativeProfile } from '../apps/controller/src/providers/openai/profile.ts';
 import { createCommandKey } from '../packages/client/src/node.ts';
-import { CommandSchema, SnapshotSchema } from '../packages/contracts/src/index.ts';
+import {
+  AnthropicNativeProfileSchema,
+  CommandSchema,
+  SnapshotSchema,
+} from '../packages/contracts/src/index.ts';
+import {
+  type ChatScriptStep,
+  createScriptedChatAdapter,
+} from '../packages/testkit/src/chat-adapter.ts';
 import { createDemoFixtures } from '../packages/testkit/src/index.ts';
 import { createSyntheticRepository } from '../packages/testkit/src/repository.ts';
 import { prepareStateDirectory, syncDirectory } from './demo-state.ts';
 
-export async function startDemoController(home: string) {
+// A chat script gives the chat a scripted Anthropic family. The catalog needs one available
+// profile to offer a model, and the adapter plays the script, so no provider client runs.
+const scriptedProfile = {
+  facts: AnthropicNativeProfileSchema.parse({
+    id: 'anthropic-file-v1',
+    family: 'anthropic',
+    displayName: 'Scripted chat',
+    clientVersion: '0.0.0',
+    model: 'scripted-model',
+    effort: 'medium',
+    effectiveEffort: 'unknown',
+    accountClass: 'unknown',
+    serviceTier: 'unknown',
+    billingBasis: 'requires-user-attestation',
+    qualifiedAt: null,
+    creditPolicies: ['ordinary'],
+    maximumTaskMs: 300000,
+    maximumFileBytes: 65536,
+    maximumSubmissions: 1,
+    available: true,
+    reason: 'available',
+  }),
+};
+
+export async function startDemoController(
+  home: string,
+  options: { chatScript?: readonly ChatScriptStep[] } = {},
+) {
   const directory = resolve(home);
   const root = fileURLToPath(new URL('..', import.meta.url));
   const internal =
@@ -89,6 +125,18 @@ export async function startDemoController(home: string) {
       process.env.CREWKITE_FIXTURE_IDENTITY === '1'
         ? { name: 'CrewKite fixture', email: 'fixture@example.invalid' }
         : () => configuredIdentity(directory),
+    ...(options.chatScript && {
+      nativeProfiles: () => [unavailableNativeProfile(), scriptedProfile],
+      nativeSpawn: () => {
+        throw new Error('The scripted chat does not start a provider client.');
+      },
+      chatAdapters: new Map([
+        [
+          'anthropic',
+          createScriptedChatAdapter({ family: 'anthropic', turns: [options.chatScript] }),
+        ],
+      ]),
+    }),
     scenarioForRoute: (route, generation) =>
       generation === 0 && route.family === 'anthropic'
         ? 'approval-reserve'
@@ -122,7 +170,12 @@ export async function startDemoController(home: string) {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
     if (!process.env.CREWKITE_HOME) throw new Error('Choose an explicit demo home.');
-    const runtime = await startDemoController(process.env.CREWKITE_HOME);
+    // The desktop journey passes its script as JSON. It is test input, not a command.
+    const script = process.env.CREWKITE_DEMO_CHAT_SCRIPT;
+    const runtime = await startDemoController(
+      process.env.CREWKITE_HOME,
+      script ? { chatScript: JSON.parse(script) as ChatScriptStep[] } : {},
+    );
     console.log('CREWKITE_CONTROLLER_READY');
     let closing = false;
     const close = async () => {
