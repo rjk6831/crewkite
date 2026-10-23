@@ -106,10 +106,7 @@ The command set for the first release:
 |---------|----------|
 | `RegisterProject`, `InspectSource` | Explicit path selection, base revision, bounded dirty and untracked file details, stable project ID |
 | `CreateTask`, `AmendTask`, `PrepareRun` | Saved criteria, versioned amendments, a frozen preview of source, routes, checks and limits |
-| `CreateTaskDiscussion`, `ConfigureTaskConversation` | Explicit primary planning profile, role, credit choice and finite task limits |
-| `SendTaskMessage`, `QueueTaskGuidance`, `AnswerTaskQuestion` | Retained input under current planning authority; active work queues guidance for a later turn |
-| `AdoptTaskPlan` | Bind the exact retained proposal to the task contract without starting execution |
-| `CaptureConversationContext` | Capture selected committed source or explicit project logs into a bounded immutable artifact |
+| `GetTaskConversationState`, `GetTaskConversation` | Read a task's retained conversation; new messages go through the chat thread |
 | `ConfigureLocal`, `BeginLocalConnectionInput`, `RefreshLocalModels`, `SelectLocalModel`, `DisconnectLocal` | Explicit loopback setup, private credential input and observed model selection under the persisted Local revision |
 | `PrepareCombinedRun` | Freeze a parent and two scoped children, shared dispatch allowances, checks and reviewer without starting work |
 | `AssembleCombinedCandidate` | Replay both retained child deltas through ordered checks and guarded private ref updates; seal a candidate for separate final evaluation |
