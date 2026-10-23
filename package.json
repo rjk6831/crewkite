@@ -20,7 +20,7 @@
     "desktop:install": "pnpm --filter @crewkite/desktop exec install-electron",
     "demo": "pnpm build && node scripts/demo.ts",
     "demo:controller": "node scripts/demo-controller.ts",
-    "test:desktop": "playwright test e2e/desktop.spec.ts --workers=1 --reporter=line --output=internal/test-results",
+    "test:desktop": "playwright test e2e/thread.spec.ts --workers=1 --reporter=line --output=internal/test-results",
     "screenshots": "node scripts/capture-desktop.mjs"
   },
   "devDependencies": {
