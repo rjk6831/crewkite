@@ -119,6 +119,7 @@ type Ending = {
 type FileDiff = ChatChangesRead['files'][number];
 type LiveTurn = {
   taskId: string;
+  role: ChatTurn['role'];
   handle: ChatTurnHandle | null;
   stopRequested: boolean;
   finished: boolean;
@@ -242,10 +243,12 @@ export class ChatService {
     if (!open || !option)
       return blocked('permission-not-pending', 'Refresh the thread and answer the open request.');
     live.permissions.delete(payload.requestId);
-    // Allow for this thread covers the kind of tool the request was about. A request with no
-    // known call is filed under other.
-    if (option.kind === 'allow-thread')
-      this.grant(payload.taskId, live.kinds.get(open.callId ?? '') ?? 'other');
+    // Allow for this thread covers the kind of tool the request was about, in later assistant
+    // turns. A request with no known kind, or one filed under other, could be anything, so the
+    // answer stays with this turn. So does one given to a reviewer or advisor, which never edits.
+    const kind = live.kinds.get(open.callId ?? '');
+    if (option.kind === 'allow-thread' && kind && kind !== 'other' && live.role === 'assistant')
+      this.grant(payload.taskId, kind);
     effects.push(() =>
       this.call(() => live.handle?.respondPermission(payload.requestId, payload.choice)),
     );
@@ -514,6 +517,7 @@ export class ChatService {
   private launch(turn: ChatTurn) {
     const live: LiveTurn = {
       taskId: turn.taskId,
+      role: turn.role,
       handle: null,
       stopRequested: false,
       finished: false,

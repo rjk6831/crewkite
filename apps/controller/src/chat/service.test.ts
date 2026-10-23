@@ -15,6 +15,7 @@ import type {
   ChatFamily,
   ChatModelSelection,
   ChatThreadRead,
+  ChatToolKind,
   ChatTurn,
   CommandResult,
   Event,
@@ -663,16 +664,17 @@ test('a reviewer turn runs read only with the review brief and the ask policy, w
 });
 
 // The scripted adapter has no allow-thread option and no tool event, so this one plays what a real
-// adapter emits for an edit: tool.started, then permission.requested for the same call. The first
-// turn asks once and the later turns reply at once. It keeps every request it receives.
-function editingAdapter() {
+// adapter emits for a tool call: tool.started, then permission.requested for the same call. Turn N
+// asks about `asks[N]`: a tool kind, null for a request with no tool call, or nothing once the
+// list runs out. It keeps every request it receives.
+function editingAdapter(asks: readonly (ChatToolKind | null)[]) {
   const requests: ChatTurnRequest[] = [];
   const adapter: ChatAdapter = {
     family: 'openai',
     startTurn(request, emit) {
+      const ask = asks[requests.length];
       requests.push(request);
       const { turnId } = request;
-      const asks = requests.length === 1;
       let answer = (_choice: string) => {};
       const result = (async (): Promise<ChatTurnResult> => {
         await Promise.resolve();
@@ -684,17 +686,18 @@ function editingAdapter() {
           effort: request.selection.effort,
           role: request.role,
         });
-        if (asks) {
+        if (ask !== undefined) {
           const choice = new Promise<string>((resolve) => {
             answer = resolve;
           });
-          emit({ type: 'tool.started', turnId, callId: 'call-1', kind: 'edit', title: 'net.mjs' });
+          if (ask)
+            emit({ type: 'tool.started', turnId, callId: 'call-1', kind: ask, title: 'net' });
           emit({
             type: 'permission.requested',
             turnId,
             requestId: 'edit-1',
-            callId: 'call-1',
-            question: 'Change net.mjs?',
+            callId: ask ? 'call-1' : null,
+            question: 'Go ahead?',
             detail: null,
             options: [
               { id: 'allow-once', label: 'Allow once', kind: 'allow-once' },
@@ -720,36 +723,35 @@ function editingAdapter() {
   return Object.assign(adapter, { requests });
 }
 
-test('allow for this thread records the tool kind and the next turn carries it', {
+// The edit grant is kept. An ask with no tool call and an ask during a review stay with their turn.
+test('allow for this thread records the tool kind for later assistant turns and nothing else', {
   timeout: 30000,
 }, async (t) => {
-  const { controller, adapter, run, send, read } = await open(t, editingAdapter());
-  const parked = turnReaches(controller, 'waiting-permission');
-  await send('Fix the rounding.');
-  const turn = await parked;
-
-  const announced = next(
-    controller,
-    (event) =>
-      event.type === 'chat.thread' && event.payload.permissionGrants?.includes('edit') === true,
+  const { controller, adapter, task, run, send, read } = await open(
+    t,
+    editingAdapter(['edit', null, 'command']),
   );
-  const done = turnReaches(controller, 'done');
-  const choice = 'allow-thread';
-  assert.equal(
-    (await run('ResolveChatPermission', { turnId: turn.id, requestId: 'edit-1', choice }, 0))
-      .outcome,
-    'applied',
-  );
-  await announced;
-  await done;
+  const allow = async (sent: () => Promise<CommandResult>) => {
+    const parked = turnReaches(controller, 'waiting-permission');
+    const done = turnReaches(controller, 'done');
+    await sent();
+    const turn = await parked;
+    const answer = { turnId: turn.id, requestId: 'edit-1', choice: 'allow-thread' };
+    assert.equal((await run('ResolveChatPermission', answer, 0)).outcome, 'applied');
+    await done;
+  };
+  await allow(() => send('Fix the rounding.'));
+  await allow(() => send('Run the build.'));
+  const review = { text: 'Review it.', role: 'reviewer', selection };
+  await allow(() => run('SendChatMessage', review, task.revision));
   assert.deepEqual((await read()).thread.permissionGrants, ['edit']);
 
-  const second = turnReaches(controller, 'done');
+  const last = turnReaches(controller, 'done');
   await send('Now the totals.');
-  await second;
+  await last;
   assert.deepEqual(
     adapter.requests.map((request) => request.permissionGrants),
-    [[], ['edit']],
+    [[], ['edit'], [], ['edit']],
   );
 });
 
