@@ -511,7 +511,10 @@ class OpenAiChatTurn {
         this.startTurn(true, history);
       });
     if (session?.family !== 'openai') return start(false);
-    this.call('thread/resume', { threadId: session.sessionId, ...settings }, (reply) => {
+    // The client keeps the history and CrewKite reads only the thread ID. With every turn in the
+    // reply, a long thread outgrows the line limit and the resume fails.
+    const resume = { threadId: session.sessionId, ...settings, excludeTurns: true };
+    this.call('thread/resume', resume, (reply) => {
       const thread = 'result' in reply ? threadReply.safeParse(reply.result) : null;
       if (thread?.success) {
         this.threadId = thread.data.thread.id;

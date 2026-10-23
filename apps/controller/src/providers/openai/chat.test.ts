@@ -11,7 +11,7 @@
 //   {"id":2,"method":"account/read","params":{"refreshToken":false}}
 //   {"id":3,"method":"account/rateLimits/read","params":{"supportsLunaReserve":false,"excludeResetCreditDetails":true}}
 //   {"id":4,"method":"thread/start","params":{"model":M,"modelProvider":"openai","cwd":SCRATCH,"approvalPolicy":"untrusted"|"on-request","approvalsReviewer":"user","sandbox":"workspace-write","serviceTier":"default","config":{"model_reasoning_effort":E},"ephemeral":false}}
-//   {"id":4,"method":"thread/resume","params":{"threadId":T, same settings without ephemeral}}
+//   {"id":4,"method":"thread/resume","params":{"threadId":T, same settings without ephemeral,"excludeTurns":true}}
 //   {"id":5,"method":"turn/start","params":{"threadId":T,"input":[{"type":"text","text":TEXT}]}}
 //   {"id":R,"result":{"decision":"accept"|"acceptForSession"|"decline"}}, the answer to approval request R
 //   {"id":N,"method":"turn/interrupt","params":{"threadId":T,"turnId":U}}
@@ -511,6 +511,7 @@ test('the next turn resumes the thread with its own approval policy and sends on
         ...settings,
         cwd: second.scratch,
         approvalPolicy: 'on-request',
+        excludeTurns: true,
       },
     },
     {
