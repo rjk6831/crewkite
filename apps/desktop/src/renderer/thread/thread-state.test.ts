@@ -83,9 +83,11 @@ test('events fold into one timeline in cursor order', () => {
     turnOf(items).blocks.map((block) => block.kind),
     ['tool', 'text'],
   );
+});
 
+test('a turn sits right after the user message that started it', () => {
   // Messages count on the conversation, 13 and 15, and agent events on the event log, 616 and 657.
-  // A turn still sits right after the user message that started it.
+  // The message decides where the turn goes.
   const [first, second] = [id('trn', 2), id('trn', 3)];
   const thread: ChatThread = {
     taskId: task,
@@ -601,25 +603,26 @@ test('stream events that a thread read already covers apply once', () => {
   }
 });
 
+// A connected family on one model with one weekly window, or no window when the percent is null.
+const connected = (name: ChatFamily, percent: number | null) => ({
+  family: name,
+  connected: true,
+  reason: null,
+  models: [{ model: 'm', label: 'M', efforts: [], defaultEffort: 'default' as const }],
+  defaultModel: 'm',
+  remaining:
+    percent === null
+      ? []
+      : [{ windowId: 'weekly', label: 'Weekly', percent, resetsAt: null, observedAt: null }],
+});
+
 test('the offer ranks the other connected families by allowance and leaves out one at zero', () => {
-  const models = [{ model: 'm', label: 'M', efforts: [], defaultEffort: 'default' as const }];
-  const family = (name: ChatCatalogRead['families'][number]['family'], percent: number | null) => ({
-    family: name,
-    connected: true,
-    reason: null,
-    models,
-    defaultModel: 'm',
-    remaining:
-      percent === null
-        ? []
-        : [{ windowId: 'weekly', label: 'Weekly', percent, resetsAt: null, observedAt: null }],
-  });
   const catalog: ChatCatalogRead = {
     families: [
-      family('openai', 5),
-      family('anthropic', 60.9),
-      family('google', 0),
-      family('local', null),
+      connected('openai', 5),
+      connected('anthropic', 60.9),
+      connected('google', 0),
+      connected('local', null),
     ],
   };
   // Anthropic leads on allowance, the local family has no figure and ranks last, and Google is
@@ -635,9 +638,11 @@ test('the offer ranks the other connected families by allowance and leaves out o
     offerChoices(catalog, 'anthropic').map(({ family }) => family),
     ['openai', 'local'],
   );
+});
 
-  // Google reports a weekly pool for one model next to the family's own windows. The empty pool
-  // does not hold back the default model, which still has 95% of the weekly window.
+test("an empty pool for another model does not hold back the family's default model", () => {
+  // Google reports a weekly pool for one model next to the family's own windows. The default
+  // model still has 95% of the weekly window.
   const pooled = (percent: number, windowId: string) => ({
     windowId,
     label: windowId,
@@ -646,7 +651,7 @@ test('the offer ranks the other connected families by allowance and leaves out o
     observedAt: null,
   });
   const google = {
-    ...family('google', null),
+    ...connected('google', null),
     models: [
       { model: 'acme-quick', label: 'Quick', efforts: [], defaultEffort: 'default' as const },
       { model: 'acme-deep', label: 'Deep', efforts: [], defaultEffort: 'default' as const },
@@ -655,7 +660,7 @@ test('the offer ranks the other connected families by allowance and leaves out o
     remaining: [pooled(95, 'acme-weekly'), pooled(100, 'acme-5h'), pooled(0, 'acme-deep-weekly')],
   };
   assert.deepEqual(
-    offerChoices({ families: [catalog.families[1], google] }, 'openai').map(
+    offerChoices({ families: [connected('anthropic', 60.9), google] }, 'openai').map(
       ({ family, selection, percent }) => [family, selection.model, percent],
     ),
     [
