@@ -228,43 +228,44 @@ export function Composer({
                 </button>
               );
             })}
-          <span className="th-spacer" />
-          {context?.capacity && (
-            <ContextGauge
-              usedTokens={context.used}
-              capacityTokens={context.capacity}
-              measurement="current"
-              updating={running}
-              size={22}
-            />
-          )}
-          {running ? (
-            <button
-              type="button"
-              className="th-send is-stop"
-              aria-label="Stop"
-              title="Stop"
-              onClick={() =>
-                onStop().catch((failure: unknown) =>
-                  setNote(
-                    failure instanceof Error ? failure.message : 'The turn could not be stopped.',
-                  ),
-                )
-              }
-            >
-              <Square size={13} fill="currentColor" aria-hidden="true" />
-            </button>
-          ) : (
-            <button
-              type="submit"
-              className="th-send"
-              aria-label="Send"
-              title={blocked ?? 'Send'}
-              disabled={!text.trim() || !!blocked}
-            >
-              <ArrowUp size={16} aria-hidden="true" />
-            </button>
-          )}
+          <div className="th-bar-end">
+            {context?.capacity && (
+              <ContextGauge
+                usedTokens={context.used}
+                capacityTokens={context.capacity}
+                measurement="current"
+                updating={running}
+                size={22}
+              />
+            )}
+            {running ? (
+              <button
+                type="button"
+                className="th-send is-stop"
+                aria-label="Stop"
+                title="Stop"
+                onClick={() =>
+                  onStop().catch((failure: unknown) =>
+                    setNote(
+                      failure instanceof Error ? failure.message : 'The turn could not be stopped.',
+                    ),
+                  )
+                }
+              >
+                <Square size={13} fill="currentColor" aria-hidden="true" />
+              </button>
+            ) : (
+              <button
+                type="submit"
+                className="th-send"
+                aria-label="Send"
+                title={blocked ?? 'Send'}
+                disabled={!text.trim() || !!blocked}
+              >
+                <ArrowUp size={16} aria-hidden="true" />
+              </button>
+            )}
+          </div>
         </div>
       </form>
       {(blocked ?? notice ?? note) && (

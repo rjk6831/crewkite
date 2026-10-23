@@ -725,12 +725,16 @@
 }
 .th-composer-bar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 4px;
   margin-top: 6px;
 }
-.th-spacer {
-  flex: 1;
+.th-bar-end {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
 }
 .th-icon {
   display: inline-grid;
