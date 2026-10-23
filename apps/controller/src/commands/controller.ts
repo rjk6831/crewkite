@@ -145,9 +145,10 @@ import {
 } from '@crewkite/contracts';
 import { hashCanonical, verifyHandoff } from '@crewkite/contracts/hash';
 import { fakeReviewWorkerPath, fakeWorkerPath } from '@crewkite/testkit/worker';
+import { LMStudioClient } from '@lmstudio/sdk';
 import { z } from 'zod';
 import { ArtifactFiles } from '../artifacts/index.ts';
-import type { ChatAdapter } from '../chat/adapter.ts';
+import type { ChatAdapter, ChatTurnRequest } from '../chat/adapter.ts';
 import { buildChatCatalog } from '../chat/catalog.ts';
 import { ChatService } from '../chat/service.ts';
 import { buildHandoff } from '../continuity/index.ts';
@@ -208,6 +209,7 @@ import {
   OwnedWorker,
   type Schedule,
 } from '../host/worker.ts';
+import { anthropicChatAdapter } from '../providers/anthropic/chat.ts';
 import {
   ConnectionRecordSchema,
   NativeConnectionChecks,
@@ -248,6 +250,7 @@ import {
   startGoogleAcpSetup,
   startGoogleAcpWriter,
 } from '../providers/google/acp/writer.ts';
+import { googleChatAdapter } from '../providers/google/chat.ts';
 import {
   type CapturedContext,
   captureContext,
@@ -268,6 +271,7 @@ import {
   googleUsageDescriptor,
   resolveGoogleUsageClient,
 } from '../providers/google/profile.ts';
+import { localChatAdapter } from '../providers/local/chat.ts';
 import {
   localConfiguredConnectionHash,
   resolveLocalConnection,
@@ -280,11 +284,13 @@ import {
   localTests,
 } from '../providers/local/profile.ts';
 import { startLocalDiscovery, startLocalReplacement } from '../providers/local/replacement.ts';
+import { silentLogger } from '../providers/local/sdk.ts';
 import {
   type LocalInputHelper,
   type LocalInputResult,
   startLocalSecretInput,
 } from '../providers/local/secure-input.ts';
+import { openAiChatAdapter } from '../providers/openai/chat.ts';
 import {
   type ConversationPlan,
   conversationBindingHash,
@@ -1235,7 +1241,7 @@ export class Controller {
       // time-ordered suffix. Upgrade: add 'trn' to IdPrefix and to the testkit ID helper.
       id: (prefix) => (prefix === 'trn' ? `trn_${this.id('msg').slice(4)}` : this.id(prefix)),
       emit: (type, taskId, revision, payload) => this.event(type, taskId, revision, payload),
-      adapters: this.options.chatAdapters ?? new Map(),
+      adapters: this.options.chatAdapters ?? this.defaultChatAdapters(),
       resolveEnvironment: (family) => this.chatEnvironment(family),
       projectPath: (projectId) => this.projectPath(projectId),
       resolveSelection: (_taskId, selection) => this.chatSelection(selection),
@@ -1316,15 +1322,104 @@ export class Controller {
       local: [],
     };
     const profiles = this.resolveProfiles();
+    // Writer profiles trim PATH to the system directories. A chat turn runs the person's own
+    // commands through the client, so it keeps the PATH the controller was started with.
+    const path = process.env.PATH ? { PATH: process.env.PATH } : {};
     for (const id of preferred[family]) {
       const profile = profiles.find((value) => value.facts.id === id);
-      if (profile?.facts.available && profile.environment) return { ...profile.environment };
+      if (profile?.facts.available && profile.environment)
+        return { ...profile.environment, ...path };
     }
     return Object.fromEntries(
-      Object.entries({ HOME: process.env.HOME, PATH: process.env.PATH }).filter(
-        (entry) => entry[1] !== undefined,
-      ),
+      Object.entries({ HOME: process.env.HOME, ...path }).filter((entry) => entry[1] !== undefined),
     );
+  }
+
+  /** One adapter per family, each resolving its client from the profiles at launch time. */
+  private defaultChatAdapters(): Map<ChatFamily, ChatAdapter> {
+    const client = (ids: string[], family: string) => {
+      const profile = this.resolveProfiles().find(
+        (value) => ids.includes(value.facts.id) && value.facts.available && value.client,
+      );
+      if (!profile?.client) throw Error(`The ${family} client is not connected.`);
+      return profile.client;
+    };
+    const openai = openAiChatAdapter({
+      launch: (request: ChatTurnRequest) => ({
+        ...client(['openai-repository-v1', 'openai-file-v1'], 'OpenAI'),
+        directory: request.work.directory,
+        repositoryRoot: this.home,
+        environment: request.environment,
+      }),
+      spawn: this.options.nativeSpawn as Parameters<typeof openAiChatAdapter>[0]['spawn'],
+    });
+    const anthropic = anthropicChatAdapter({
+      launch: () => client(['anthropic-file-v1', 'anthropic-file-compact-v1'], 'Anthropic'),
+      spawn: this.options.nativeSpawn as Parameters<typeof anthropicChatAdapter>[0]['spawn'],
+      schedule: this.options.schedule,
+    });
+    const google = googleChatAdapter({
+      launch: (request: ChatTurnRequest) => {
+        const setup = this.store.googleAcpSetup();
+        const resolution = this.acpResolution();
+        if (setup.state !== 'ready' || !setup.proofId || !resolution.client)
+          throw Error('The Google client is not connected.');
+        const proof = validateAcpSetupProof(
+          this.acpProof(setup.proofId),
+          resolution.client,
+          this.options.googleAcp?.reviewMappings,
+        );
+        const select = (value: { optionId: string; supported: readonly string[] }) => ({
+          optionId: value.optionId,
+          supported: value.supported,
+        });
+        return {
+          client: resolution.client as AcpClientIdentity,
+          configuration: proof.configOptions
+            ? {
+                model: select(proof.configOptions.model),
+                thoughtLevel: proof.configOptions.thoughtLevel
+                  ? select(proof.configOptions.thoughtLevel)
+                  : null,
+              }
+            : null,
+          reviewMode: proof.reviewMode
+            ? { configId: proof.reviewMode.configId, valueId: proof.reviewMode.valueId }
+            : null,
+          environment: resolution.environment ?? request.environment,
+          spawn: this.options.googleAcp?.spawn,
+          schedule: this.options.schedule,
+        };
+      },
+    });
+    const local = localChatAdapter({
+      connect: async (request: ChatTurnRequest) => {
+        const control = this.localControl();
+        if (!control.endpoint || !this.localConnected(control))
+          throw Error('Local is not connected. Open Settings, load a model and connect Local.');
+        const secret = this.localSecret?.secret.toString('utf8');
+        if (control.authMode !== 'none' && !secret) throw Error('The Local token is unavailable.');
+        const runtime = new LMStudioClient({
+          baseUrl: control.endpoint,
+          ...(control.authMode === 'none' ? {} : { apiToken: secret }),
+          verboseErrorMessages: false,
+          logger: silentLogger,
+        });
+        const loaded = await runtime.llm.listLoaded();
+        const model =
+          loaded.find((value) => value.modelKey === request.selection.model) ??
+          loaded.find((value) => value.identifier === request.selection.model) ??
+          loaded[0];
+        if (!model) throw Error('No model is loaded in the Local app.');
+        return { model, contextLength: await model.getContextLength(), modelKey: model.modelKey };
+      },
+    });
+    return new Map<ChatFamily, ChatAdapter>([
+      ['openai', openai],
+      ['anthropic', anthropic],
+      ['google', google],
+      ['local', local],
+    ]);
   }
 
   async execute(input: unknown, principal: string): Promise<CommandResult> {

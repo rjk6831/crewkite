@@ -99,6 +99,9 @@ type LiveTurn = {
   /** Open permission requests and the option IDs each one accepts. */
   permissions: Map<string, string[]>;
   noticed: boolean;
+  /** Adapters differ on whether they announce the turn edges. The service owns both. */
+  started: boolean;
+  completed: boolean;
   done: Promise<void>;
 };
 
@@ -343,6 +346,8 @@ export class ChatService {
       items: new Map(),
       permissions: new Map(),
       noticed: false,
+      started: false,
+      completed: false,
       done: Promise.resolve(),
     };
     this.live.set(turn.id, live);
@@ -382,6 +387,14 @@ export class ChatService {
     const request = this.request(turn);
     // The first turn copies the project, which takes time. Stop may have arrived meanwhile.
     if (this.closed || live.stopRequested) return stoppedResult;
+    this.record(turn, live, {
+      type: 'turn.started',
+      turnId: turn.id,
+      family: turn.selection.family,
+      model: turn.selection.model,
+      effort: turn.selection.effort,
+      role: turn.role,
+    });
     live.handle = adapter.startTurn(request, (event) => this.record(turn, live, event));
     if (this.closed || live.stopRequested) live.handle.stop();
     return live.handle.result;
@@ -458,6 +471,14 @@ export class ChatService {
         message: 'The provider sent an update that could not be read. The reply may be incomplete.',
       };
     }
+    if (event.type === 'turn.started') {
+      if (live.started) return;
+      live.started = true;
+    }
+    if (event.type === 'turn.completed') {
+      if (live.completed) return;
+      live.completed = true;
+    }
     addText(live.items, event);
     if (event.type === 'permission.requested')
       live.permissions.set(
@@ -479,6 +500,14 @@ export class ChatService {
   }
 
   private finish(turnId: string, live: LiveTurn, result: ChatTurnResult) {
+    const turn = this.turn(turnId);
+    if (turn && !live.completed)
+      this.record(turn, live, {
+        type: 'turn.completed',
+        turnId,
+        stopReason: result.stopReason,
+        failure: result.failure,
+      });
     live.finished = true;
     this.live.delete(turnId);
     try {
