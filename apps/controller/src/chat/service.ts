@@ -90,8 +90,8 @@ type Ending = {
   failure: ChatFailure | null;
   text: string;
   session: ChatSession | null;
-  /** The provider stopped the turn on a usage limit. */
-  limit?: boolean;
+  /** Stored on the turn so a reopened view knows why it ended. */
+  stopReason: NonNullable<ChatTurn['stopReason']>;
 };
 type LiveTurn = {
   taskId: string;
@@ -333,6 +333,7 @@ export class ChatService {
           }),
           text: streamedText(this.agentEvents(row.task_id, row.id)),
           session: null,
+          stopReason: 'error',
         });
       }
     });
@@ -559,6 +560,7 @@ export class ChatService {
       endedAt: this.deps.now(),
       failure: end.failure,
       assistantMessageId: reply?.id ?? null,
+      stopReason: end.stopReason,
     });
     const thread = this.thread(task.id);
     const session =
@@ -572,7 +574,7 @@ export class ChatService {
         ? [...thread.sessions.filter((value) => value.family !== session.family), session]
         : thread.sessions,
     });
-    if (end.limit) this.appendLimitLine(task, turn, end.failure);
+    if (end.stopReason === 'limit') this.appendLimitLine(task, turn, end.failure);
     if (end.failure)
       this.appendEntry(task, {
         kind: 'chat-system',
@@ -889,10 +891,13 @@ function chatMessage(entry: ConversationEntry): ChatMessage | undefined {
 }
 
 function ending(result: ChatTurnResult, items: ReadonlyMap<string, string>): Ending {
-  const state =
-    result.stopReason === 'done' ? 'done' : result.stopReason === 'stopped' ? 'stopped' : 'failed';
+  const stopReason =
+    result.stopReason === 'done' || result.stopReason === 'stopped' || result.stopReason === 'limit'
+      ? result.stopReason
+      : 'error';
+  const state = stopReason === 'done' ? 'done' : stopReason === 'stopped' ? 'stopped' : 'failed';
   const reported = ChatFailureSchema.safeParse(result.failure);
-  const limit = result.stopReason === 'limit';
+  const limit = stopReason === 'limit';
   const failure =
     state !== 'failed'
       ? null
@@ -910,7 +915,7 @@ function ending(result: ChatTurnResult, items: ReadonlyMap<string, string>): End
   return {
     state,
     failure,
-    limit,
+    stopReason,
     // Adapters may report only finished items on stop. The streamed text is what was shown.
     text: reportedText.trim() ? reportedText : joinText(items),
     session: session.success ? session.data : null,
