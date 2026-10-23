@@ -6,6 +6,7 @@ import type {
   ChatPermissionPolicy,
   ChatRole,
   ChatSession,
+  ChatToolKind,
 } from '@crewkite/contracts';
 
 // One interface for every provider behind the chat. The controller owns the thread, the
@@ -32,6 +33,8 @@ export type ChatTurnRequest = Readonly<{
   /** Private per-turn working directory under the controller home, for logs and sockets. */
   work: Readonly<{ directory: string; home: string }>;
   permissionPolicy: ChatPermissionPolicy;
+  /** Tool kinds already allowed for the whole thread. Answer these without asking. */
+  permissionGrants?: readonly ChatToolKind[];
   /** Review and advice turns. The adapter offers no edit or command tool and declines any ask. */
   readOnly?: boolean;
   /** Wall-clock budget for the whole turn, in milliseconds. */

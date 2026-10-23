@@ -160,6 +160,8 @@ export const ChatTurnSchema = z.strictObject({
   endedAt: timestamp.nullable(),
   failure: ChatFailureSchema.nullable(),
   handoffFrom: ChatFamilySchema.nullable().default(null),
+  /** Set when the turn settles. A reopened view uses it where live events are gone. */
+  stopReason: z.enum(['done', 'stopped', 'limit', 'error']).nullable().optional(),
 });
 export type ChatTurn = z.infer<typeof ChatTurnSchema>;
 
@@ -186,6 +188,22 @@ export const ChatThreadSchema = z.strictObject({
   sessions: z.array(ChatSessionSchema).max(8).default([]),
   activeTurnId: ChatTurnIdSchema.nullable().default(null),
   autoHandoff: z.boolean().default(false),
+  /** Tool kinds the person allowed for the whole thread. Adapters answer these without asking. */
+  permissionGrants: z.array(ChatToolKindSchema).max(8).optional(),
+  /** The last branch acceptance from this thread's scratch copy. */
+  lastAcceptance: z
+    .strictObject({
+      branch: z.string().min(1).max(200),
+      at: timestamp,
+      fileCount: z.number().int().nonnegative(),
+      commit: z
+        .string()
+        .regex(/^[a-f0-9]{40}$/)
+        .nullable()
+        .default(null),
+    })
+    .nullable()
+    .optional(),
 });
 export type ChatThread = z.infer<typeof ChatThreadSchema>;
 
@@ -212,6 +230,15 @@ export const ConfigureChatThreadPayloadSchema = z.strictObject({
   selection: ChatModelSelectionSchema.optional(),
   permissionPolicy: ChatPermissionPolicySchema.optional(),
   autoHandoff: z.boolean().optional(),
+});
+export const AcceptChatChangesPayloadSchema = z.strictObject({
+  taskId: id('tsk'),
+  /** A new local branch name. The controller refuses an existing branch. */
+  branch: z
+    .string()
+    .min(1)
+    .max(200)
+    .regex(/^(?!.*(\.\.|\/\/|@\{|\\|\s))[A-Za-z0-9][A-Za-z0-9._/-]*[A-Za-z0-9]$/),
 });
 export const HandoffChatThreadPayloadSchema = z.strictObject({
   taskId: id('tsk'),

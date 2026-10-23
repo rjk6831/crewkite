@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { canonicalJson } from './canonical.ts';
 import {
+  AcceptChatChangesPayloadSchema,
   AgentEventSchema,
   ChatCatalogReadSchema,
   ChatChangesReadSchema,
@@ -2458,6 +2459,7 @@ export const CommandSchema = z.discriminatedUnion('command', [
   mutate('StopChatTurn', StopChatTurnPayloadSchema),
   mutate('ConfigureChatThread', ConfigureChatThreadPayloadSchema),
   mutate('HandoffChatThread', HandoffChatThreadPayloadSchema),
+  mutate('AcceptChatChanges', AcceptChatChangesPayloadSchema),
   read('ReadChatThread', ReadChatThreadPayloadSchema),
   read('ReadChatChanges', ReadChatChangesPayloadSchema),
   read('ReadChatCatalog', ReadChatCatalogPayloadSchema),
