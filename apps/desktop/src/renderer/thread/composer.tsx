@@ -2,6 +2,7 @@ import type {
   ChatCatalogRead,
   ChatFamily,
   ChatModelSelection,
+  ChatRole,
   ChatThread,
 } from '@crewkite/contracts';
 import { ArrowUp, Paperclip, Square, X } from 'lucide-react';
@@ -10,11 +11,13 @@ import {
   type KeyboardEvent,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from 'react';
+import { familyName } from '../components.tsx';
 import { ContextGauge } from '../context-gauge.tsx';
-import { configureThread, readCatalog, type ThreadSource } from './commands.ts';
+import { configureThread, readCatalog, sendMessage, type ThreadSource } from './commands.ts';
 import { defaultSelection, ModelPicker } from './model-picker.tsx';
 
 export type SendInput = {
@@ -22,6 +25,45 @@ export type SendInput = {
   attachments: string[];
   selection: ChatModelSelection | null;
 };
+
+type RoleAction = Exclude<ChatRole, 'assistant'>;
+const roleActions: Record<RoleAction, { label: string; prompt: string }> = {
+  reviewer: { label: 'Review changes', prompt: 'Review the current changes.' },
+  advisor: { label: 'Second opinion', prompt: 'Give a second opinion on the last answer.' },
+};
+type RoleChoice = { key: string; label: string; selection: ChatModelSelection };
+
+// Every model of a connected family, in catalog order.
+function roleChoices(catalog: ChatCatalogRead | null): RoleChoice[] {
+  return (catalog?.families ?? [])
+    .filter((entry) => entry.connected)
+    .flatMap((entry) =>
+      entry.models.map((model) => ({
+        key: `${entry.family}/${model.model}`,
+        label: `${familyName(entry.family)} · ${model.label}`,
+        selection: { family: entry.family, model: model.model, effort: model.defaultEffort },
+      })),
+    );
+}
+
+// The default is a family other than the one that answered last, so the second look is
+// independent. With one connected family, that family is the only choice.
+function roleDefault(
+  catalog: ChatCatalogRead | null,
+  choices: readonly RoleChoice[],
+  answeredBy: ChatFamily | null,
+): RoleChoice | undefined {
+  const others =
+    catalog && answeredBy
+      ? { families: catalog.families.filter((entry) => entry.family !== answeredBy) }
+      : catalog;
+  const pick = defaultSelection(others) ?? defaultSelection(catalog);
+  return (
+    choices.find(
+      (choice) => choice.selection.family === pick?.family && choice.selection.model === pick.model,
+    ) ?? choices[0]
+  );
+}
 
 // Unsent text survives switching threads for as long as the window stays open.
 const drafts = new Map<string, string>();
@@ -60,6 +102,8 @@ export function Composer({
   const [catalog, setCatalog] = useState<ChatCatalogRead | null>(null);
   const [selection, setSelection] = useState<ChatModelSelection | null>(thread?.selection ?? null);
   const [note, setNote] = useState<string | null>(null);
+  const [role, setRole] = useState<RoleAction | null>(null);
+  const [roleKey, setRoleKey] = useState<string | null>(null);
   const field = useRef<HTMLTextAreaElement>(null);
 
   const loadCatalog = useCallback(() => {
@@ -77,6 +121,10 @@ export function Composer({
     if (thread?.selection) setSelection(thread.selection);
   }, [thread?.selection]);
   const chosen = selection ?? defaultSelection(catalog);
+  const choices = useMemo(() => roleChoices(catalog), [catalog]);
+  const picked =
+    choices.find((choice) => choice.key === roleKey) ??
+    roleDefault(catalog, choices, currentFamily);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: the box resizes when its text changes
   useEffect(() => {
@@ -111,6 +159,37 @@ export function Composer({
       setText((current) => current || sent.text);
       setAttachments((current) => (current.length > 0 ? current : sent.attachments));
       setNote(failure instanceof Error ? failure.message : 'The message was not sent.');
+    }
+  }
+  function roleBlock(action: RoleAction): string | null {
+    if (blocked) return blocked;
+    if (running) return 'Wait for the current turn to finish.';
+    if (choices.length === 0) return 'No provider is connected.';
+    if (action === 'reviewer' && !thread?.scratchReady)
+      return 'There is no scratch copy to review yet.';
+    if (action === 'advisor' && !currentFamily) return 'There is no answer to look at yet.';
+    return null;
+  }
+  function toggleRole(action: RoleAction) {
+    if (role === action) return setRole(null);
+    loadCatalog();
+    setRoleKey(null);
+    setRole(action);
+  }
+  // The model is picked for this one turn. The thread keeps its own model.
+  async function runRole() {
+    if (!role || !taskId || !picked || running || blocked) return;
+    try {
+      await sendMessage(source, {
+        taskId,
+        text: roleActions[role].prompt,
+        selection: picked.selection,
+        role,
+      });
+      setRole(null);
+      setNote(null);
+    } catch (failure) {
+      setNote(failure instanceof Error ? failure.message : 'The request was not sent.');
     }
   }
   function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -178,6 +257,34 @@ export function Composer({
           }}
           onKeyDown={onKeyDown}
         />
+        {taskId && role && (
+          <div className="th-attach-row" id="th-role-row">
+            <select
+              aria-label={`${roleActions[role].label}: provider and model`}
+              value={picked?.key ?? ''}
+              onChange={(event) => setRoleKey(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Escape') setRole(null);
+              }}
+            >
+              {choices.map((choice) => (
+                <option key={choice.key} value={choice.key}>
+                  {choice.label}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              disabled={!picked || running || !!blocked}
+              onClick={() => void runRole()}
+            >
+              Run
+            </button>
+            <button type="button" onClick={() => setRole(null)}>
+              Cancel
+            </button>
+          </div>
+        )}
         <div className="th-composer-bar">
           <button
             type="button"
@@ -202,6 +309,24 @@ export function Composer({
               )
             }
           />
+          {taskId &&
+            (Object.keys(roleActions) as RoleAction[]).map((action) => {
+              const why = roleBlock(action);
+              return (
+                <button
+                  key={action}
+                  type="button"
+                  className="th-pill"
+                  aria-expanded={role === action}
+                  aria-controls={role === action ? 'th-role-row' : undefined}
+                  disabled={why !== null}
+                  title={why ?? undefined}
+                  onClick={() => toggleRole(action)}
+                >
+                  {roleActions[action].label}
+                </button>
+              );
+            })}
           <span className="th-spacer" />
           {context?.capacity && (
             <ContextGauge

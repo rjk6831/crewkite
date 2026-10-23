@@ -1,10 +1,17 @@
-import type { ChatPermissionPolicy, ChatThread, WorkspaceState } from '@crewkite/contracts';
+import type {
+  ChatPermissionPolicy,
+  ChatRole,
+  ChatThread,
+  ChatTurn,
+  WorkspaceState,
+} from '@crewkite/contracts';
 import { X } from 'lucide-react';
+import { useEffect, useState } from 'react';
 import { familyName } from '../components.tsx';
 import { UsageGauges } from '../usage-gauges.tsx';
 import { projectUsagePresentation } from '../usage-presentation.ts';
 import { ChangesPanel } from './changes-panel.tsx';
-import type { ThreadSource } from './commands.ts';
+import { readThread, type ThreadSource } from './commands.ts';
 import { usageCards, useUsageClock } from './usage-cards.ts';
 
 export type InspectorTab = 'changes' | 'usage' | 'thread';
@@ -13,6 +20,11 @@ const tabs: { id: InspectorTab; label: string }[] = [
   { id: 'usage', label: 'Usage' },
   { id: 'thread', label: 'Thread' },
 ];
+const roleNames: Record<ChatRole, string> = {
+  assistant: 'Assistant',
+  reviewer: 'Reviewer',
+  advisor: 'Advisor',
+};
 const policies: { id: ChatPermissionPolicy; label: string }[] = [
   { id: 'ask', label: 'Ask each time' },
   { id: 'allow-edits', label: 'Allow edits' },
@@ -33,14 +45,30 @@ function UsageTab({ header, preview }: { header: WorkspaceState | null; preview:
 }
 
 function ThreadTab({
+  source,
   taskId,
   thread,
   onConfigure,
 }: {
+  source: ThreadSource;
   taskId: string;
   thread: ChatThread | null;
   onConfigure: (patch: { permissionPolicy?: ChatPermissionPolicy; autoHandoff?: boolean }) => void;
 }) {
+  const [turns, setTurns] = useState<ChatTurn[] | null>(null);
+  const active = thread?.activeTurnId ?? null;
+  // The thread record changes when a turn starts and when it ends, and the list follows it.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: the active turn reloads the list
+  useEffect(() => {
+    let current = true;
+    readThread(source, taskId).then(
+      (read) => current && setTurns(read.turns),
+      () => current && setTurns(null),
+    );
+    return () => {
+      current = false;
+    };
+  }, [source, taskId, active]);
   return (
     <div className="th-facts">
       <dl>
@@ -60,6 +88,23 @@ function ThreadTab({
                 <li key={session.family}>
                   {familyName(session.family)} · {session.model}
                   <code title={session.sessionId}>{session.sessionId.slice(0, 12)}</code>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            'None yet'
+          )}
+        </dd>
+        <dt>Turns</dt>
+        <dd>
+          {turns === null ? (
+            'Not available yet'
+          ) : turns.length > 0 ? (
+            <ul>
+              {turns.map((turn) => (
+                <li key={turn.id}>
+                  {roleNames[turn.role]} · {familyName(turn.selection.family)} ·{' '}
+                  {turn.selection.model}
                 </li>
               ))}
             </ul>
@@ -161,7 +206,7 @@ export function Inspector({
         )}
         {tab === 'usage' && <UsageTab header={header} preview={preview} />}
         {tab === 'thread' && (
-          <ThreadTab taskId={taskId} thread={thread} onConfigure={onConfigure} />
+          <ThreadTab source={source} taskId={taskId} thread={thread} onConfigure={onConfigure} />
         )}
       </div>
     </aside>
