@@ -9,9 +9,10 @@ import {
   stopTurn,
   type ThreadSource,
 } from './commands.ts';
-import { Composer, type SendInput } from './composer.tsx';
+import { Composer, type ComposerHandle, type SendInput } from './composer.tsx';
+import { EmptyThread } from './empty-thread.tsx';
 import { LimitOfferCard } from './handoff-card.tsx';
-import { type LimitOffer, limitOffer } from './handoff-offer.ts';
+import { limitOffer } from './handoff-offer.ts';
 import { Inspector, type InspectorTab } from './inspector.tsx';
 import { MessageList } from './message-list.tsx';
 import { lastFamily, latestContext } from './thread-state.ts';
@@ -59,6 +60,8 @@ export function ThreadView({
   }>({ open: false, tab: 'changes', focus: null });
   const [notice, setNotice] = useState<string | null>(null);
   const counter = useRef(0);
+  const composer = useRef<ComposerHandle>(null);
+  const toggle = useRef<HTMLButtonElement>(null);
   const thread = state.thread;
   const changesKey = useMemo(() => changeCount(items), [items]);
   const offer = useMemo(() => limitOffer(state), [state]);
@@ -103,19 +106,6 @@ export function ThreadView({
     },
     [source, task.id, reload],
   );
-  // Move the thread when it is not on the chosen family yet, then send the stopped message again.
-  // Sending hides the card, so a refusal there reaches the person through the composer notice.
-  const continueOnLimit = useCallback(
-    async (selection: ChatModelSelection, stopped: LimitOffer) => {
-      if (thread?.selection?.family !== selection.family)
-        await handoffThread(source, { taskId: task.id, selection, reason: 'limit' });
-      await send({ text: stopped.text, attachments: stopped.attachments, selection }).catch(
-        (failure: unknown) =>
-          setNotice(failure instanceof Error ? failure.message : 'The message was not sent.'),
-      );
-    },
-    [source, task.id, thread?.selection?.family, send],
-  );
   const configure = useCallback(
     (patch: { permissionPolicy?: ChatPermissionPolicy; autoHandoff?: boolean }) =>
       configureThread(source, { taskId: task.id, ...patch }).then(
@@ -128,6 +118,11 @@ export function ThreadView({
       ),
     [source, task.id, dispatch],
   );
+  // Focus inside the panel moves to the toolbar button first, so closing does not drop it.
+  const closeInspector = useCallback(() => {
+    if (document.activeElement?.closest('.th-inspector')) toggle.current?.focus();
+    setInspector((current) => ({ ...current, open: false }));
+  }, []);
   const openChanges = useCallback(
     (path: string) => setInspector({ open: true, tab: 'changes', focus: path }),
     [],
@@ -153,10 +148,7 @@ export function ThreadView({
       </div>
     )
   ) : (
-    <div className="th-empty">
-      <p>{projectName}</p>
-      <p className="th-muted">Edits happen in a scratch copy. Review them under Changes.</p>
-    </div>
+    <EmptyThread onPick={(text) => composer.current?.fill(text)} />
   );
 
   return (
@@ -172,6 +164,7 @@ export function ThreadView({
             {badge}
           </span>
           <button
+            ref={toggle}
             type="button"
             className="th-icon th-bar-toggle"
             aria-label="Toggle inspector"
@@ -182,17 +175,19 @@ export function ThreadView({
             <PanelRight size={16} aria-hidden="true" />
           </button>
         </header>
-        <MessageList items={items} empty={empty} onResolve={resolve} onOpenChanges={openChanges} />
-        {offer && (
-          <LimitOfferCard
-            key={offer.turnId}
-            source={source}
-            taskId={task.id}
-            offer={offer}
-            onContinue={continueOnLimit}
-          />
-        )}
+        <MessageList
+          items={items}
+          empty={empty}
+          footer={
+            offer && (
+              <LimitOfferCard key={offer.turnId} source={source} taskId={task.id} offer={offer} />
+            )
+          }
+          onResolve={resolve}
+          onOpenChanges={openChanges}
+        />
         <Composer
+          ref={composer}
           key={task.id}
           source={source}
           taskId={task.id}
@@ -218,7 +213,7 @@ export function ThreadView({
           preview={preview}
           tab={inspector.tab}
           onTab={(tab) => setInspector({ ...inspector, tab })}
-          onClose={() => setInspector({ ...inspector, open: false })}
+          onClose={closeInspector}
           changesKey={changesKey}
           focusPath={inspector.focus}
           onConfigure={(patch) => void configure(patch)}

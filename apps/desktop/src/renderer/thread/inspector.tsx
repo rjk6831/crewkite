@@ -176,6 +176,17 @@ export function Inspector({
   focusPath: string | null;
   onConfigure: (patch: { permissionPolicy?: ChatPermissionPolicy; autoHandoff?: boolean }) => void;
 }) {
+  // Escape closes the panel unless a picker or field inside it already took the key, or a dialog
+  // such as search is open and owns it.
+  useEffect(() => {
+    const close = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented) return;
+      if (document.querySelector('dialog[open]')) return;
+      onClose();
+    };
+    document.addEventListener('keydown', close);
+    return () => document.removeEventListener('keydown', close);
+  }, [onClose]);
   return (
     <aside className="th-inspector" aria-label="Inspector">
       <div className="th-inspector-head">

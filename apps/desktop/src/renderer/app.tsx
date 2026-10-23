@@ -31,22 +31,13 @@ import {
 import wordmark from './assets/crewkite-wordmark.png';
 import inverseWordmark from './assets/crewkite-wordmark-inverse.png';
 import { Dialog, short, titleCase } from './components.tsx';
+import { Empty, WorkspaceEmpty } from './empty-state.tsx';
 import { withThreadDefaults } from './settings/preferences.ts';
 import { SettingsPage } from './settings/settings-page.tsx';
 import { useWorkspace, type Workspace } from './source.ts';
 import { NewThread } from './thread/new-thread.tsx';
 import { RailUsage } from './thread/rail-usage.tsx';
 import { ThreadView } from './thread/thread-view.tsx';
-
-function Empty({ icon, title, children }: { icon: ReactNode; title: string; children: ReactNode }) {
-  return (
-    <div className="empty">
-      <span className="empty-icon">{icon}</span>
-      <h3>{title}</h3>
-      <p>{children}</p>
-    </div>
-  );
-}
 
 // Local preferences only. Storage can be full or blocked, and the app keeps working with defaults.
 function readPreference(key: string) {
@@ -885,9 +876,13 @@ export function App() {
             connection={connection}
           />
         ) : (
-          <Empty icon={<SquarePen />} title="No threads yet">
-            Start a thread to ask about a project or describe a change.
-          </Empty>
+          <WorkspaceEmpty
+            projects={projects}
+            canAddProject={workspace.canPickProject}
+            busy={workspace.pending || connection !== 'connected'}
+            onAddProject={() => void workspace.pickProject().catch(() => {})}
+            onNewThread={() => startThread()}
+          />
         )}
         <footer className="statusbar">
           <span>

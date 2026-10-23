@@ -3,7 +3,8 @@ import { Folder } from 'lucide-react';
 import { useRef } from 'react';
 import type { DesktopCommand } from '../source.ts';
 import { sendMessage, type ThreadSource } from './commands.ts';
-import { Composer, type SendInput } from './composer.tsx';
+import { Composer, type ComposerHandle, type SendInput } from './composer.tsx';
+import { EmptyThread } from './empty-thread.tsx';
 import './thread.css';
 
 type Project = { id: string; name: string };
@@ -43,6 +44,7 @@ export function NewThread({
 }) {
   // A send that fails after the task exists keeps the task, so a retry does not create a second one.
   const created = useRef<Task | null>(null);
+  const composer = useRef<ComposerHandle>(null);
   const project = projects.find(({ id }) => id === projectId);
 
   async function send({ text, attachments, selection }: SendInput) {
@@ -87,32 +89,24 @@ export function NewThread({
           )}
         </header>
         <div className="th-scroll-frame">
-          <div className="th-scroll">
-            <div className="th-column">
+          <div className="th-blank">
+            {project ? (
+              <EmptyThread onPick={(text) => composer.current?.fill(text)} />
+            ) : (
               <div className="th-empty">
-                {project ? (
-                  <>
-                    <p>{project.name}</p>
-                    <p className="th-muted">
-                      Edits happen in a scratch copy. Review them under Changes.
-                    </p>
-                  </>
-                ) : (
-                  <>
-                    <p>No project yet</p>
-                    <p className="th-muted">Add a Git repository to start a thread.</p>
-                    {onAddProject && (
-                      <button type="button" className="th-button" onClick={onAddProject}>
-                        Add project
-                      </button>
-                    )}
-                  </>
+                <p>No project yet</p>
+                <p className="th-muted">Add a Git repository to start a thread.</p>
+                {onAddProject && (
+                  <button type="button" className="th-button" onClick={onAddProject}>
+                    Add project
+                  </button>
                 )}
               </div>
-            </div>
+            )}
           </div>
         </div>
         <Composer
+          ref={composer}
           source={source}
           taskId={null}
           thread={null}

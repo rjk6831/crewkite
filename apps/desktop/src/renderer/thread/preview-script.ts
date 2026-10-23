@@ -179,8 +179,35 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
     } catch {
       stopReason = 'stopped';
     }
-    emit({ type: 'turn.completed', turnId, stopReason, failure: null });
-    const text = live.findLast((event) => event.type === 'text.completed');
+    // A stop arrives as a failure of kind 'stopped', the way the adapters report it.
+    emit({
+      type: 'turn.completed',
+      turnId,
+      stopReason,
+      failure:
+        stopReason === 'done'
+          ? null
+          : {
+              stage: 'stream',
+              kind: 'stopped',
+              message: 'The turn was stopped.',
+              providerMessage: null,
+              method: null,
+              code: null,
+              resetsAt: null,
+              nextAction: 'Send a new message to continue.',
+            },
+    });
+    // The controller keeps what was streamed, so a stopped turn stores its partial text.
+    const last = live.findLast((e) => e.type === 'text.delta' || e.type === 'text.completed');
+    const text =
+      last?.type === 'text.completed'
+        ? last.text
+        : last
+          ? live
+              .flatMap((e) => (e.type === 'text.delta' && e.itemId === last.itemId ? [e.text] : []))
+              .join('')
+          : '';
     const author = {
       kind: 'assistant',
       turnId,
@@ -188,7 +215,7 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
       model: selection.model,
       role: 'assistant',
     } as const;
-    const stored = text?.type === 'text.completed' ? say(author, text.text) : undefined;
+    const stored = text ? say(author, text) : undefined;
     const turn = turns.find(({ id }) => id === turnId);
     if (turn)
       setTurn({
@@ -244,7 +271,7 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
     const selection = thread.selection ?? SELECTION;
     const turnId = mint('trn');
     const user = messages.findLast(({ author }) => author.kind === 'user');
-    setTurn({
+    const turn: ChatTurn = {
       id: turnId,
       taskId,
       sequence: turns.length,
@@ -257,7 +284,8 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
       endedAt: null,
       failure: null,
       handoffFrom: null,
-    });
+    };
+    setTurn(turn);
     setThread({ activeTurnId: turnId });
     emit({
       type: 'turn.started',
@@ -267,6 +295,15 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
       effort: selection.effort,
       role: 'assistant',
     });
+    // The preview catalog has OpenAI at 0% left, so a turn on it stops on its limit as a real one would.
+    if (selection.family === 'openai') {
+      const failure = usageLimit();
+      emit({ type: 'turn.completed', turnId, stopReason: 'limit', failure });
+      setTurn({ ...turn, state: 'failed', endedAt: ago(0), failure });
+      live = [];
+      setThread({ activeTurnId: null });
+      return;
+    }
     await finish(turnId, selection, async () => {
       await stream(turnId, 'thinking', 'th', 'Preview turn. No provider runs here.');
       await stream(

@@ -94,11 +94,16 @@ function withBlocks(view: TurnView, blocks: Block[]): TurnView {
   return { ...view, blocks, status: view.ended ? view.status : liveStatus(blocks) };
 }
 
+// Adapters report a stop with a failure of kind 'stopped'. A stop is something the person asked
+// for, so it ends the turn as stopped and leaves no failure to show.
+export const isStop = (failure: ChatFailure | null | undefined) => failure?.kind === 'stopped';
+
 function finish(view: TurnView, event: Extract<AgentEvent, { type: 'turn.completed' }>): TurnView {
+  const failure = isStop(event.failure) ? null : event.failure;
   const status: TurnStatus =
-    event.failure || event.stopReason === 'error' || event.stopReason === 'limit'
+    failure || event.stopReason === 'error' || event.stopReason === 'limit'
       ? 'failed'
-      : event.stopReason === 'stopped'
+      : event.stopReason === 'stopped' || isStop(event.failure)
         ? 'stopped'
         : 'done';
   const blocks = view.blocks.map((block): Block => {
@@ -106,7 +111,7 @@ function finish(view: TurnView, event: Extract<AgentEvent, { type: 'turn.complet
     if (block.kind === 'tool' && block.status === 'running') return { ...block, status: 'stopped' };
     return block;
   });
-  return { ...view, blocks, ended: true, status, failure: event.failure };
+  return { ...view, blocks, ended: true, status, failure };
 }
 
 export function applyEvent(view: TurnView, event: AgentEvent): TurnView {
