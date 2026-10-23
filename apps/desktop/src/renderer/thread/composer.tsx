@@ -17,6 +17,7 @@ import {
 } from 'react';
 import { familyName } from '../components.tsx';
 import { ContextGauge } from '../context-gauge.tsx';
+import { preferredSelection } from '../settings/preferences.ts';
 import { configureThread, readCatalog, sendMessage, type ThreadSource } from './commands.ts';
 import { defaultSelection, ModelPicker } from './model-picker.tsx';
 
@@ -120,7 +121,7 @@ export function Composer({
   useEffect(() => {
     if (thread?.selection) setSelection(thread.selection);
   }, [thread?.selection]);
-  const chosen = selection ?? defaultSelection(catalog);
+  const chosen = selection ?? preferredSelection(catalog) ?? defaultSelection(catalog);
   const choices = useMemo(() => roleChoices(catalog), [catalog]);
   const picked =
     choices.find((choice) => choice.key === roleKey) ??

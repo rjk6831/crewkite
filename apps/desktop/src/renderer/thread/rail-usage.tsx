@@ -1,49 +1,61 @@
 import type { WorkspaceState } from '@crewkite/contracts';
+import { useEffect, useState } from 'react';
+import { familyName } from '../components.tsx';
+import { railRows } from '../settings/allowance.ts';
+import { useCatalog } from '../settings/use-catalog.ts';
 import { formatSpan } from '../usage-gauges.tsx';
-import { projectUsagePresentation, type UsageGaugeReading } from '../usage-presentation.ts';
-import { useUsageClock } from './usage-cards.ts';
+import type { ThreadSource } from './commands.ts';
 
-type Row = { id: string; label: string; percent: number; resetsIn: number | null };
-
-// The reading with the least left says how much a provider can still do, so it is the one shown.
-function tightest(...readings: (UsageGaugeReading | null)[]) {
-  const known = readings.filter(
-    (reading): reading is UsageGaugeReading =>
-      reading?.remaining?.unit === 'percent' && reading.state !== 'unknown',
-  );
-  return known.sort((a, b) => (a.remaining?.value ?? 0) - (b.remaining?.value ?? 0))[0] ?? null;
-}
-
-export function RailUsage({ header, preview }: { header: WorkspaceState; preview: boolean }) {
-  const now = useUsageClock(header.usage, preview);
-  const rows: Row[] = [];
-  for (const card of projectUsagePresentation(header, null, now)) {
-    const reading = tightest(
-      card.primary.weekly,
-      card.primary.fiveHour,
-      card.featured,
-      ...card.satellites,
-    );
-    if (reading?.remaining)
-      rows.push({
-        id: card.id,
-        label: card.label,
-        percent: Math.floor(reading.remaining.value),
-        resetsIn: reading.resetsAt ? Date.parse(reading.resetsAt) - now : null,
-      });
-  }
+/**
+ * One row per connected family: percent left on its tightest window and when that resets. The
+ * rows come from the catalog the composer uses, so the rail and the model picker agree.
+ */
+export function RailUsage({
+  source,
+  header,
+}: {
+  source: ThreadSource | undefined;
+  header: WorkspaceState;
+}) {
+  const { catalog } = useCatalog(source, header);
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const rows = railRows(catalog, now);
   if (rows.length === 0) return null;
   return (
     <section className="rail-usage" aria-label="Provider allowance">
       {rows.map((row) => (
-        <div key={row.id} className="rail-usage-row">
-          <span className="rail-usage-label">{row.label}</span>
-          <span className="rail-usage-value">{row.percent}% left</span>
-          <span className="rail-usage-bar" aria-hidden="true">
-            <span style={{ width: `${row.percent}%` }} />
+        <div key={row.family} className="rail-usage-row">
+          <span className="rail-usage-label">{familyName(row.family)}</span>
+          <span
+            className={
+              row.percent !== null
+                ? 'rail-usage-value'
+                : row.onDevice
+                  ? 'rail-usage-value is-device'
+                  : 'rail-usage-value is-unknown'
+            }
+          >
+            {row.percent !== null
+              ? `${row.percent}% left`
+              : row.onDevice
+                ? 'on this computer'
+                : 'unknown'}
           </span>
-          {row.resetsIn !== null && row.resetsIn > 0 && (
-            <span className="rail-usage-reset">resets in {formatSpan(row.resetsIn)}</span>
+          {!row.onDevice && (
+            <>
+              <span className="rail-usage-bar" aria-hidden="true">
+                <span style={{ width: `${row.percent ?? 0}%` }} />
+              </span>
+              <span className="rail-usage-reset">
+                {row.resetsIn !== null && row.resetsIn > 0
+                  ? `resets in ${formatSpan(row.resetsIn)}`
+                  : 'reset unknown'}
+              </span>
+            </>
           )}
         </div>
       ))}

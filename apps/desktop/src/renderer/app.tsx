@@ -1,15 +1,11 @@
-import type { Run, Snapshot, TaskPage, TaskSummary, WorkspaceState } from '@crewkite/contracts';
+import type { TaskPage, TaskSummary } from '@crewkite/contracts';
 import {
-  Activity,
   AlertTriangle,
   ArrowRight,
   ArrowUpRight,
   ChevronLeft,
   ChevronRight,
-  Clock,
-  Cpu,
   Folder,
-  Gauge,
   Info,
   Moon,
   PanelLeftClose,
@@ -21,7 +17,6 @@ import {
   ShieldCheck,
   SquarePen,
   Sun,
-  Wallet,
   X,
 } from 'lucide-react';
 import {
@@ -35,16 +30,13 @@ import {
 } from 'react';
 import wordmark from './assets/crewkite-wordmark.png';
 import inverseWordmark from './assets/crewkite-wordmark-inverse.png';
-import { Dialog, Fact, familyClass, familyName, short, titleCase } from './components.tsx';
-import { GoogleSetup } from './google-setup.tsx';
-import { LocalSetup } from './local-setup.tsx';
+import { Dialog, short, titleCase } from './components.tsx';
+import { withThreadDefaults } from './settings/preferences.ts';
+import { SettingsPage } from './settings/settings-page.tsx';
 import { useWorkspace, type Workspace } from './source.ts';
 import { NewThread } from './thread/new-thread.tsx';
 import { RailUsage } from './thread/rail-usage.tsx';
 import { ThreadView } from './thread/thread-view.tsx';
-import { usageCards } from './thread/usage-cards.ts';
-import { UsageGauges } from './usage-gauges.tsx';
-import { nativeUsageClients, projectUsagePresentation } from './usage-presentation.ts';
 
 function Empty({ icon, title, children }: { icon: ReactNode; title: string; children: ReactNode }) {
   return (
@@ -507,7 +499,7 @@ export function App() {
       : connection === 'offline'
         ? 'Controller offline'
         : titleCase(connection);
-  const [page, setPage] = useState<'tasks' | 'usage'>('tasks');
+  const [page, setPage] = useState<'tasks' | 'settings'>('tasks');
   const [selected, setSelected] = useState<string | null>(null);
   useEffect(() => {
     void workspace.selectTask(selected);
@@ -546,7 +538,6 @@ export function App() {
     setSelected(id);
     setPage('tasks');
   }
-  const run = snapshot?.runs.find(({ id }) => id === task?.runId);
   // Runs before the dialog opens and after it is removed, so focus goes back where it came from.
   useLayoutEffect(() => {
     if (palette) {
@@ -738,13 +729,13 @@ export function App() {
             </button>
           )}
         </div>
-        {header && !collapsed && <RailUsage header={header} preview={preview} />}
+        {header && !collapsed && <RailUsage source={threadSource} header={header} />}
         <div className="nav-bottom">
           <button
             type="button"
-            className={`nav-item ${page === 'usage' ? 'active' : ''}`}
-            aria-current={page === 'usage' ? 'page' : undefined}
-            onClick={() => setPage('usage')}
+            className={`nav-item ${page === 'settings' ? 'active' : ''}`}
+            aria-current={page === 'settings' ? 'page' : undefined}
+            onClick={() => setPage('settings')}
             data-tooltip="Settings"
           >
             <Settings size={16} aria-hidden="true" />
@@ -792,7 +783,7 @@ export function App() {
             <Folder size={14} />
             <span>Workspace</span>
             <ChevronRight size={12} />
-            <span>{page === 'usage' ? 'Settings' : 'Threads'}</span>
+            <span>{page === 'settings' ? 'Settings' : 'Threads'}</span>
           </div>
         </header>
         {preview && (
@@ -853,13 +844,8 @@ export function App() {
               Retry connection
             </button>
           </div>
-        ) : page === 'usage' ? (
-          <Usage
-            snapshot={header}
-            attempts={snapshot?.attempts ?? []}
-            run={run}
-            workspace={workspace}
-          />
+        ) : page === 'settings' ? (
+          <SettingsPage workspace={workspace} header={header} theme={theme} onTheme={setTheme} />
         ) : !threadSource ? (
           <div className="loading-workspace" role="alert">
             <p>The desktop bridge is unavailable.</p>
@@ -867,7 +853,7 @@ export function App() {
         ) : newThread !== null ? (
           <NewThread
             source={threadSource}
-            createTask={workspace.command}
+            createTask={withThreadDefaults(threadSource, workspace.command)}
             projects={projects}
             projectId={newThread}
             onProject={setNewThread}
@@ -935,7 +921,7 @@ export function App() {
                 id: 'settings',
                 label: 'Open settings',
                 icon: <Settings size={17} />,
-                run: () => setPage('usage'),
+                run: () => setPage('settings'),
               },
               {
                 id: 'about',
@@ -955,567 +941,6 @@ export function App() {
         </Dialog>
       )}
     </div>
-  );
-}
-
-const formatMemory = (bytes: number | null | undefined) =>
-  bytes === null || bytes === undefined ? 'Unknown' : `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
-
-function LocalHardwareCard({
-  snapshot,
-  workspace,
-}: {
-  snapshot: Pick<WorkspaceState, 'localHardware' | 'localSetup'>;
-  workspace: Workspace;
-}) {
-  const [refreshError, setRefreshError] = useState(false);
-  useEffect(() => {
-    let active = true;
-    void workspace.refresh().catch(() => {
-      if (active) setRefreshError(true);
-    });
-    return () => {
-      active = false;
-    };
-  }, [workspace.refresh]);
-  const setup = snapshot.localSetup;
-  const selection = setup?.selection;
-  const selectedModel =
-    selection &&
-    setup.reason !== 'selection-stale' &&
-    setup.observation?.observationHash === selection.observationHash
-      ? setup.observation.models.find((model) => model.selectionId === selection.selectionId)
-      : null;
-  const hardware = snapshot.localHardware;
-  const memory =
-    hardware?.totalMemoryBytes === null || hardware?.totalMemoryBytes === undefined
-      ? 'Unknown'
-      : hardware.availableMemoryBytes === null
-        ? `${formatMemory(hardware.totalMemoryBytes)} total, available unknown`
-        : `${formatMemory(hardware.availableMemoryBytes)} available of ${formatMemory(hardware.totalMemoryBytes)}`;
-  return (
-    <section className="card hardware-card">
-      <div className="section-heading">
-        <h2>
-          <Cpu size={15} />
-          Local hardware
-        </h2>
-        <span>{selectedModel ? 'Model selected' : hardware ? 'Hardware reported' : 'Unknown'}</span>
-      </div>
-      <div className="hardware-symbol">
-        <Cpu size={26} />
-      </div>
-      <h3>No provider quota</h3>
-      <p className="muted">Local inference depends on resident models and available hardware.</p>
-      <div className="hardware-row">
-        <span>Selected model</span>
-        <span>{selectedModel?.identity.displayName ?? 'Not selected'}</span>
-      </div>
-      <div className="hardware-row">
-        <span>Processor</span>
-        <span>{hardware?.cpuModel ?? 'Unknown'}</span>
-      </div>
-      <div className="hardware-row">
-        <span>Logical CPU cores</span>
-        <span>{hardware?.logicalCores ?? 'Unknown'}</span>
-      </div>
-      <div className="hardware-row">
-        <span>System</span>
-        <span>
-          {[hardware?.platform, hardware?.architecture].filter(Boolean).join(' ') || 'Unknown'}
-        </span>
-      </div>
-      <div className="hardware-row">
-        <span>Memory</span>
-        <span>{memory}</span>
-      </div>
-      <p className="muted small">
-        {hardware ? `Sampled ${hardware.sampledAt}.` : 'Hardware metadata is unavailable.'}
-        {refreshError ? ' The latest refresh could not be read.' : ''}
-      </p>
-    </section>
-  );
-}
-
-function Usage({
-  snapshot,
-  attempts,
-  run,
-  workspace,
-}: {
-  snapshot: WorkspaceState;
-  attempts: Snapshot['attempts'];
-  run?: Run;
-  workspace: Workspace;
-}) {
-  const [readerMessages, setReaderMessages] = useState<
-    Partial<Record<'openai' | 'anthropic' | 'google', string>>
-  >({});
-  const [metadataBusy, setMetadataBusy] = useState<Record<string, boolean>>({});
-  const anthropicConnection = snapshot.nativeConnections.find(
-    (value) => value.family === 'anthropic',
-  );
-  const setAnthropicMessage = (message: string) =>
-    setReaderMessages((current) => ({ ...current, anthropic: message }));
-  const [usageTrust, setUsageTrust] = useState<Snapshot['usageReaders'][number]['trust'] | null>(
-    null,
-  );
-  async function refreshAnthropic(trust?: NonNullable<Snapshot['usageReaders'][number]['trust']>) {
-    setUsageTrust(null);
-    setMetadataBusy((current) => ({ ...current, anthropic: true }));
-    setAnthropicMessage('Reading the native local usage report.');
-    try {
-      const result = await workspace.metadataCommand({
-        command: 'RefreshAnthropicUsage',
-        expectedRevision: 0,
-        payload: trust ? { trust: { scopeHash: trust.scopeHash, nativeTrust: 'accepted' } } : {},
-      });
-      setAnthropicMessage(
-        result.outcome === 'applied' || result.outcome === 'already-applied'
-          ? 'Native usage report retained. Report age is unknown.'
-          : [result.reason ?? result.outcome, result.next].filter(Boolean).join('. '),
-      );
-    } catch (failure) {
-      setAnthropicMessage(failure instanceof Error ? failure.message : 'The usage refresh failed.');
-    } finally {
-      setMetadataBusy((current) => ({ ...current, anthropic: false }));
-    }
-  }
-  async function stopAnthropicUsage(operationId: string) {
-    const result = await workspace.metadataCommand({
-      command: 'StopAnthropicUsage',
-      expectedRevision: 0,
-      payload: { operationId },
-    });
-    setAnthropicMessage(result.reason ?? result.outcome);
-  }
-  async function checkAnthropic() {
-    setMetadataBusy((current) => ({ ...current, anthropic: true }));
-    setReaderMessages((current) => ({ ...current, anthropic: 'Checking Anthropic sign-in.' }));
-    try {
-      const result = await workspace.metadataCommand({
-        command: 'CheckNativeConnection',
-        expectedRevision: 0,
-        payload: { family: 'anthropic', consent: 'explicit' },
-      });
-      setReaderMessages((current) => ({
-        ...current,
-        anthropic:
-          result.outcome === 'applied' || result.outcome === 'already-applied'
-            ? 'Anthropic sign-in check completed.'
-            : [result.reason ?? result.outcome, result.next].filter(Boolean).join('. '),
-      }));
-    } catch (failure) {
-      setReaderMessages((current) => ({
-        ...current,
-        anthropic:
-          failure instanceof Error ? failure.message : 'Anthropic sign-in could not be checked.',
-      }));
-    } finally {
-      setMetadataBusy((current) => ({ ...current, anthropic: false }));
-    }
-  }
-  const [displayTime, setDisplayTime] = useState(Date.now);
-  const fixture = workspace.preview;
-  useEffect(() => {
-    if (fixture) return;
-    setDisplayTime(Date.now());
-    const timer = window.setInterval(() => setDisplayTime(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [fixture]);
-  const clients = nativeUsageClients(snapshot);
-  const connected = workspace.connection === 'connected' && !workspace.preview;
-  async function observeUsage(family: 'google' | 'openai') {
-    setMetadataBusy((current) => ({ ...current, [family]: true }));
-    setReaderMessages((current) => ({ ...current, [family]: 'Quota read in progress.' }));
-    try {
-      const result = await workspace.metadataCommand({
-        command: 'ObserveUsage',
-        expectedRevision: 0,
-        payload: { family },
-      });
-      setReaderMessages((current) => ({
-        ...current,
-        [family]:
-          result.outcome === 'applied' || result.outcome === 'already-applied'
-            ? 'Quota read successful.'
-            : [result.reason ?? result.outcome, result.next].filter(Boolean).join('. '),
-      }));
-    } catch (failure) {
-      setReaderMessages((current) => ({
-        ...current,
-        [family]: failure instanceof Error ? failure.message : 'The quota command failed.',
-      }));
-    } finally {
-      setMetadataBusy((current) => ({ ...current, [family]: false }));
-    }
-  }
-  const fixtureTime = Math.max(
-    0,
-    ...snapshot.usage.map(({ observation }) => Date.parse(observation.observedAt)),
-  );
-  const now = fixture ? fixtureTime : displayTime;
-  const families = ['openai', 'anthropic', 'google', 'local'] as const;
-  const cloudFamilies = ['openai', 'anthropic', 'google'] as const;
-  const scopes = projectUsagePresentation(snapshot, run?.policy.policy.reserves ?? null, now);
-  const cards = usageCards(scopes, snapshot);
-  return (
-    <main className="usage-page">
-      <div className="page-heading">
-        <p className="eyebrow">WORKSPACE CAPACITY</p>
-        <h1>Usage and capacity</h1>
-        <p>Allowance stays in the provider's own units. Missing observations stay unknown.</p>
-        <span className="fixture-clock">
-          <Clock size={13} />
-          {fixture
-            ? `Fixture clock · ${new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })}`
-            : 'Controller observations'}
-        </span>
-      </div>
-      {usageTrust && (
-        <Dialog title="Trust the native usage command" onClose={() => setUsageTrust(null)}>
-          <p>
-            CrewKite will invoke the pinned native client’s local /usage command. It sends no
-            generation request.
-          </p>
-          <p>
-            Your native client can apply user or administrator policy hooks. Those hooks are covered
-            by this native-client trust.
-          </p>
-          <p>
-            Trust is remembered for this exact client, command and reader policy. A changed scope
-            requires consent again. Sign-in alone does not grant trust.
-          </p>
-          <details>
-            <summary>Command identity</summary>
-            <p>Command: {usageTrust.command}</p>
-            <p>Client checksum: {usageTrust.clientSha256}</p>
-            <p>Scope checksum: {usageTrust.scopeHash}</p>
-          </details>
-          <button type="button" className="button secondary" onClick={() => setUsageTrust(null)}>
-            Cancel
-          </button>
-          <button
-            type="button"
-            className="button primary"
-            onClick={() => void refreshAnthropic(usageTrust)}
-          >
-            Trust and refresh quota
-          </button>
-        </Dialog>
-      )}
-      <LocalSetup snapshot={snapshot} workspace={workspace} />
-      <GoogleSetup snapshot={snapshot} workspace={workspace} />
-      <section aria-labelledby="native-clients-title">
-        <div className="section-heading">
-          <h2 id="native-clients-title">Native clients</h2>
-        </div>
-        <p className="muted small">
-          Client readiness is separate from retained usage and account allowance.
-        </p>
-        <div className="capacity-grid">
-          {clients.map(({ family, label, profiles, reader }) => {
-            const nextReadAt = reader?.lastAttemptAt
-              ? Date.parse(reader.lastAttemptAt) + 60000
-              : null;
-            const cooldownSeconds =
-              nextReadAt !== null && nextReadAt > now
-                ? Math.max(1, Math.ceil((nextReadAt - now) / 1000))
-                : 0;
-            const codingReady = profiles.some((profile) => profile.available);
-            const quotaAvailable =
-              family === 'local'
-                ? 'No cloud quota'
-                : family === 'anthropic' && reader?.reading
-                  ? `Received ${new Date(reader.reading.receivedAt).toLocaleTimeString()} · age unknown`
-                  : reader?.lastObservedAt
-                    ? 'Reported'
-                    : reader?.available
-                      ? 'Reader ready, not read'
-                      : 'Unknown';
-            const readerMessage = family === 'local' ? null : readerMessages[family];
-            return (
-              <section className="card" key={family} aria-label={`${label} client status`}>
-                <div className="section-heading">
-                  <h3>{label}</h3>
-                  <span>
-                    {profiles.some((profile) => profile.available)
-                      ? 'Supported client present'
-                      : 'Supported client unavailable'}
-                  </span>
-                </div>
-                {profiles.map((profile) => (
-                  <p className="muted small" key={profile.id}>
-                    {profile.id}: {profile.reason}
-                  </p>
-                ))}
-                {profiles.length === 0 && (
-                  <p className="muted small">No native profile is registered.</p>
-                )}
-                <div className="facts-grid compact">
-                  <Fact label="Coding setup ready" value={codingReady ? 'Yes' : 'No'} />
-                  <Fact label="Quota available" value={quotaAvailable} />
-                </div>
-                {family === 'anthropic' ? (
-                  <>
-                    <p role="status">
-                      {anthropicConnection?.state === 'signed-in'
-                        ? 'Signed in with Anthropic account'
-                        : anthropicConnection?.state === 'signed-out'
-                          ? 'Signed out'
-                          : `Sign-in ${anthropicConnection?.state ?? 'unchecked'}`}
-                    </p>
-                    <button
-                      type="button"
-                      className="button secondary"
-                      disabled={
-                        !connected ||
-                        !profiles.some((profile) => profile.available) ||
-                        metadataBusy.anthropic ||
-                        anthropicConnection?.state === 'checking'
-                      }
-                      onClick={() => void checkAnthropic()}
-                    >
-                      Check Anthropic sign-in
-                    </button>
-                    <p className="muted small">
-                      {anthropicConnection?.next ??
-                        'Check the existing native client sign-in. No model prompt is sent.'}
-                    </p>
-                    {anthropicConnection?.state === 'signed-out' && (
-                      <p className="muted small">
-                        Follow the{' '}
-                        <a
-                          href="https://github.com/rjk6831/crewkite/blob/main/docs/providers.md#anthropic-writer-preparation"
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          native client sign-in instructions
-                        </a>
-                        , then check again.
-                      </p>
-                    )}
-                    {anthropicConnection?.observedAt && (
-                      <p className="muted small">
-                        Last checked: {anthropicConnection.observedAt}. Billing and task
-                        qualification remain unknown.
-                      </p>
-                    )}
-                    <button
-                      type="button"
-                      className="button secondary"
-                      disabled={
-                        !connected ||
-                        !reader?.available ||
-                        metadataBusy.anthropic ||
-                        reader.readState === 'intent' ||
-                        reader.readState === 'owned' ||
-                        reader.readState === 'unknown' ||
-                        (nextReadAt !== null && nextReadAt > now)
-                      }
-                      onClick={() =>
-                        reader?.trust?.accepted
-                          ? void refreshAnthropic()
-                          : setUsageTrust(reader?.trust ?? null)
-                      }
-                    >
-                      <RefreshCw size={14} /> Refresh Anthropic quota
-                    </button>
-                    {reader?.operationId &&
-                      (reader.readState === 'intent' || reader.readState === 'owned') && (
-                        <button
-                          type="button"
-                          className="button secondary"
-                          onClick={() => void stopAnthropicUsage(reader.operationId as string)}
-                        >
-                          Stop quota refresh
-                        </button>
-                      )}
-                    <p className="muted small">
-                      Invokes the native local /usage command and sends no generation request.
-                      Sign-in does not grant native-client trust. Reported quota can be cached; its
-                      age stays unknown.
-                    </p>
-                    {reader?.readReason && <p role="status">Last refresh: {reader.readReason}.</p>}
-                    {nextReadAt !== null && nextReadAt > now && (
-                      <p className="muted small">
-                        Refresh available after {new Date(nextReadAt).toLocaleTimeString()}. Failed
-                        reads also count.
-                      </p>
-                    )}
-                  </>
-                ) : family === 'local' ? (
-                  <div className="local-usage-copy">
-                    <pre>
-                      <code>
-                        {
-                          'Roots.NoLimits({ engine: localAI, subscriptionQuota: null, limits: [hardware, imagination] });'
-                        }
-                      </code>
-                    </pre>
-                    <p className="muted small">Runs on your hardware. No subscription quota.</p>
-                  </div>
-                ) : (
-                  <>
-                    <p className="muted small">
-                      Reads account quota through the supported native client. No model request.
-                    </p>
-                    <button
-                      type="button"
-                      className="button secondary"
-                      disabled={
-                        !connected ||
-                        metadataBusy[family] ||
-                        !reader?.available ||
-                        reader.readState === 'intent' ||
-                        reader.readState === 'owned' ||
-                        cooldownSeconds > 0
-                      }
-                      onClick={() => void observeUsage(family)}
-                    >
-                      <RefreshCw size={14} /> Refresh {label} quota
-                    </button>
-                    {family === 'openai' &&
-                      reader?.readState === 'quiescent' &&
-                      reader.readReason === 'observed' && (
-                        <p role="status">Latest quota read successful.</p>
-                      )}
-                    <p className="muted small">
-                      Reader status: {reader?.reason ?? 'unavailable'}. Updated:{' '}
-                      {reader?.lastObservedAt ?? 'Not observed'}.
-                    </p>
-                    {reader?.readState && (
-                      <p className="muted small">
-                        Read state: {reader.readState}. Result:{' '}
-                        {reader.readReason ?? 'No completed result'}.
-                        {reader.lastRequest ? ` Last request: ${reader.lastRequest}.` : ''}
-                      </p>
-                    )}
-                    {cooldownSeconds > 0 && (
-                      <p className="muted small">
-                        Refresh available in {cooldownSeconds}s. Failed reads also count.
-                      </p>
-                    )}
-                  </>
-                )}
-                {readerMessage && <p role="status">{readerMessage}</p>}
-              </section>
-            );
-          })}
-        </div>
-      </section>
-      <section aria-labelledby="allowance-title">
-        <div className="section-heading">
-          <h2 id="allowance-title">Provider allowances</h2>
-          <span>
-            {run ? 'Reserve markers follow the selected task run' : 'Reported observations'}
-          </span>
-        </div>
-        {cards.length ? (
-          <>
-            <UsageGauges cards={cards} nowMs={now} />
-            <details className="technical-details">
-              <summary>Represented routes</summary>
-              {scopes.map((scope) => (
-                <div key={scope.id}>
-                  <p>
-                    {scope.label}: {scope.scopeLabel}
-                  </p>
-                  {scope.routeIds.map((id) => (
-                    <code key={id}>{id}</code>
-                  ))}
-                </div>
-              ))}
-            </details>
-          </>
-        ) : (
-          <Empty icon={<Gauge />} title="No provider allowance scope">
-            No retained cloud usage route is available. Native-client readiness is shown above.
-          </Empty>
-        )}
-      </section>
-      <div className="capacity-grid">
-        <section className="card activity-capacity">
-          <div className="section-heading">
-            <h2>
-              <Activity size={15} />
-              Controller activity
-            </h2>
-            <span>Selected task</span>
-          </div>
-          <table>
-            <thead>
-              <tr>
-                <th>Route</th>
-                <th>Recorded attempts</th>
-                <th>Active minutes</th>
-              </tr>
-            </thead>
-            <tbody>
-              {families.map((family) => {
-                const routeIds = new Set(
-                  snapshot.routes.filter((route) => route.family === family).map(({ id }) => id),
-                );
-                return (
-                  <tr key={family}>
-                    <td>
-                      <span className={`provider-dot ${familyClass(family)}`} />
-                      {familyName(family)}
-                    </td>
-                    <td>
-                      {
-                        attempts.filter(
-                          ({ routeId, state }) => routeIds.has(routeId) && state !== 'intent',
-                        ).length
-                      }
-                    </td>
-                    <td className="muted">Not measured</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-          <p className="muted small">
-            Activity counters describe the selected task detail. They do not measure workspace-wide
-            or account-wide usage.
-          </p>
-        </section>
-        <LocalHardwareCard snapshot={snapshot} workspace={workspace} />
-      </div>
-      <section className="card credits-card">
-        <div className="section-heading">
-          <h2>
-            <Wallet size={15} />
-            Paid credits
-          </h2>
-          <span>Separate from subscription allowance</span>
-        </div>
-        <div className="credit-grid">
-          {cloudFamilies.map((family) => (
-            <div className="credit-row" key={family}>
-              <span className={`provider-dot ${familyClass(family)}`} />
-              <div>
-                <strong>{familyName(family)}</strong>
-                <small>No account credit balance reported</small>
-              </div>
-              <span className="credit-off">Unknown</span>
-            </div>
-          ))}
-          <div className="credit-row">
-            <span className={`provider-dot ${familyClass('local')}`} />
-            <div>
-              <strong>{familyName('local')}</strong>
-              <small>Local inference has no cloud credit balance</small>
-            </div>
-            <span className="credit-off">No cloud credits</span>
-          </div>
-        </div>
-        <p className="muted small">
-          Using existing credits requires a billing selection when preparing a run. A provider limit
-          does not grant that permission.
-        </p>
-      </section>
-    </main>
   );
 }
 
