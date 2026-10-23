@@ -637,7 +637,7 @@ export class ChatService {
     if (message?.kind !== 'user-message' || !thread.base)
       throw Error('The message for this turn is missing.');
     const directory = this.scratchDirectory(task.id);
-    const prompt = withAttachments(message.text, message.attachments ?? [], directory);
+    const prompt = withAttachments(message.text, message.attachments ?? [], directory, root);
     const history = this.history(task.id, message.cursor);
     const work = join(this.deps.home, 'chat', task.id, 'turns', turn.id);
     mkdirSync(work, { recursive: true, mode: 0o700 });

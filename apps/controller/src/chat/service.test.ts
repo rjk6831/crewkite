@@ -96,7 +96,7 @@ function agentEvents(controller: Pick<Controller, 'store'>): AgentEvent[] {
 test('a sent message streams agent events and saves the reply when the turn finishes', {
   timeout: 30000,
 }, async (t) => {
-  const { controller, adapter, task, run, read } = await chat(t, [
+  const { controller, adapter, task, run, read, source } = await chat(t, [
     [{ kind: 'text', itemId: 'reply', chunks: ['It sells ', 'things.'] }],
   ]);
   const states: string[] = [];
@@ -107,7 +107,7 @@ test('a sent message streams agent events and saves the reply when the turn fini
   const message = {
     text: 'What does this project do?',
     selection,
-    attachments: ['net.mjs', '../outside.txt'],
+    attachments: ['net.mjs', join(source.directory, 'package.json'), '../outside.txt'],
   };
   assert.equal((await run('SendChatMessage', message, task.revision)).outcome, 'applied');
   const turn = await done;
@@ -131,7 +131,7 @@ test('a sent message streams agent events and saves the reply when the turn fini
   const [request] = adapter.requests;
   assert.equal(
     request.prompt,
-    'What does this project do?\n\nAttached paths:\nnet.mjs\n\nAttachment outside the scratch copy was not included: ../outside.txt',
+    'What does this project do?\n\nAttached paths:\nnet.mjs\npackage.json\n\nAttachment outside the scratch copy was not included: ../outside.txt',
   );
   assert.deepEqual(request.history, []);
   assert.match(request.systemContext, /demo-shop/);

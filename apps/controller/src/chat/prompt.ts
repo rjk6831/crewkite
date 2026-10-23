@@ -1,4 +1,4 @@
-import { resolve, sep } from 'node:path';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
 import type { ChatFamily } from '@crewkite/contracts';
 import type { ChatHistoryEntry } from './adapter.ts';
 
@@ -101,20 +101,26 @@ export function adviceContext(
 
 /**
  * The model works in the scratch copy, and the person reviews only what changes there. A path
- * that resolves outside the copy is left out, with one line saying so.
+ * under the project root, the way an editor or Finder copies it, means the same file in the
+ * copy. Any other path that resolves outside the copy is left out, with one line saying so.
  */
 export function withAttachments(
   text: string,
   attachments: readonly string[],
   directory: string,
+  projectRoot: string,
 ): string {
   const root = resolve(directory);
-  const inside = (path: string) => {
-    const target = resolve(root, path);
-    return target === root || target.startsWith(`${root}${sep}`);
-  };
-  const kept = attachments.filter(inside);
-  const dropped = attachments.filter((path) => !inside(path));
+  const project = resolve(projectRoot);
+  const under = (base: string, target: string) =>
+    target === base || target.startsWith(`${base}${sep}`);
+  const inProject = (path: string) =>
+    isAbsolute(path) && under(project, resolve(path))
+      ? relative(project, resolve(path)) || '.'
+      : path;
+  const inside = (path: string) => under(root, resolve(root, path));
+  const kept = attachments.map(inProject).filter(inside);
+  const dropped = attachments.filter((path) => !inside(inProject(path)));
   return [
     text,
     ...(kept.length ? [`Attached paths:\n${kept.join('\n')}`] : []),
