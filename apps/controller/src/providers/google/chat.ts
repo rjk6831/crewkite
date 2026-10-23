@@ -727,14 +727,22 @@ export function googleChatAdapter(deps: {
         const allow =
           options.find((option) => option.kind === 'allow-once') ??
           options.find((option) => option.kind === 'allow-thread');
+        // Review and advice turns read only.
+        const refuses =
+          request.readOnly === true && (call.kind === 'edit' || call.kind === 'command');
+        const reject = options.find((option) => option.kind === 'deny');
+        if (refuses && !reject) return live.respond(id, declined);
         // An edit outside the scratch copy is always the person's call.
-        const automatic =
+        const permitted =
           allow &&
           (request.permissionPolicy === 'allow-all' ||
             (request.permissionPolicy === 'allow-edits' &&
               call.kind === 'edit' &&
               call.paths.size > 0 &&
-              !call.outside));
+              !call.outside))
+            ? allow
+            : undefined;
+        const automatic = refuses ? reject : permitted;
         const requestId = `${turnId}:permission:${++permissionCount}`;
         const detail = [
           call.paths.size ? `Paths: ${[...call.paths].join(', ')}` : '',
@@ -765,8 +773,9 @@ export function googleChatAdapter(deps: {
           options,
         });
         if (automatic) {
-          live.respond(id, { outcome: { outcome: 'selected', optionId: allow.id } });
-          send({ type: 'permission.resolved', turnId, requestId, choice: allow.id });
+          if (refuses) call.denied = true;
+          live.respond(id, { outcome: { outcome: 'selected', optionId: automatic.id } });
+          send({ type: 'permission.resolved', turnId, requestId, choice: automatic.id });
         }
       }
 
