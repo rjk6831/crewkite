@@ -1,0 +1,1043 @@
+import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { lstatSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve } from 'node:path';
+import type {
+  AgentEvent,
+  ChatFailure,
+  ChatPermissionOption,
+  ChatToolKind,
+} from '@crewkite/contracts';
+import { z } from 'zod';
+import {
+  type ChatAdapter,
+  type ChatTurnHandle,
+  type ChatTurnRequest,
+  type ChatTurnResult,
+  chatFailure,
+} from '../../chat/adapter.ts';
+import { defaultSchedule, groupAbsent } from '../../host/worker.ts';
+import {
+  type OpenAiUsageHook,
+  type OpenAiUsageWindow,
+  openAiUsageReporter,
+  projectOpenAiUsage,
+  type UsageReporter,
+} from './discovery.ts';
+import { type NativeLaunch, nativeDiscoveryEnvironment } from './native-discovery.ts';
+
+// One chat turn on the app-server: one owned client process, one thread opened or resumed, one
+// turn. The process lives for the turn because a turn is the unit of Stop and cleanup. The thread
+// persists in the client's own history, so the next turn resumes it by ID.
+
+type Spawn = (
+  executable: string,
+  args: string[],
+  options: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    detached: true;
+    stdio: ['pipe', 'pipe', 'pipe'];
+  },
+) => ChildProcessWithoutNullStreams;
+
+export type OpenAiChatDeps = Readonly<{
+  launch: (request: ChatTurnRequest) => NativeLaunch;
+  onUsage?: OpenAiUsageHook;
+  /** Tests replace the client with a scripted peer. */
+  spawn?: Spawn;
+}>;
+
+export function openAiChatAdapter(deps: OpenAiChatDeps): ChatAdapter {
+  return {
+    family: 'openai',
+    startTurn: (request, emit) => new OpenAiChatTurn(deps, request, emit).handle,
+  };
+}
+
+/** Chat edits the scratch copy, and every escalation comes back to CrewKite for an answer. */
+function nativeChatArguments(directory: string): string[] {
+  const settings = {
+    model_provider: 'openai',
+    openai_base_url: '',
+    chatgpt_base_url: 'https://chatgpt.com/backend-api/',
+    service_tier: 'default',
+    approval_policy: 'on-request',
+    approvals_reviewer: 'user',
+    sandbox_mode: 'workspace-write',
+    web_search: 'disabled',
+    'features.plugins': false,
+    'features.remote_plugin': false,
+    'features.apps': false,
+    'features.hooks': false,
+    'features.multi_agent': false,
+    log_dir: join(directory, 'logs'),
+  };
+  return [
+    ...Object.entries(settings).flatMap(([key, value]) => [
+      '-c',
+      `${key}=${JSON.stringify(value)}`,
+    ]),
+    'app-server',
+    '--stdio',
+    '--strict-config',
+  ];
+}
+
+// Identity and storage checks copied from startTranscript and childDirectory in
+// native-discovery.ts. The chat path spawns its own process, so it repeats them here.
+function verifiedClient(launch: NativeLaunch) {
+  if (process.platform === 'win32') throw new Error('Chat requires Unix process ownership.');
+  if (!isAbsolute(launch.executable) || !/^[a-f0-9]{64}$/.test(launch.sha256))
+    throw new Error('Chat requires an exact executable identity.');
+  const executable = realpathSync(launch.executable);
+  if (!lstatSync(executable).isFile()) throw new Error('The client must be a regular file.');
+  if (createHash('sha256').update(readFileSync(executable)).digest('hex') !== launch.sha256)
+    throw new Error('The client executable identity changed.');
+  return executable;
+}
+
+function privateStorage(launch: NativeLaunch) {
+  if (!isAbsolute(launch.directory) || !isAbsolute(launch.repositoryRoot))
+    throw new Error('Chat requires absolute storage directories.');
+  const root = realpathSync(launch.repositoryRoot);
+  const rootStat = lstatSync(launch.repositoryRoot);
+  if (
+    !rootStat.isDirectory() ||
+    rootStat.isSymbolicLink() ||
+    rootStat.uid !== process.getuid?.() ||
+    (rootStat.mode & 0o022) !== 0
+  )
+    throw new Error('Chat storage requires an owned root without shared write access.');
+  const directory = resolve(launch.directory);
+  const contained = relative(root, directory);
+  if (!contained || contained.startsWith('..') || isAbsolute(contained))
+    throw new Error('Chat storage must stay within its root.');
+  let current = root;
+  for (const part of contained.split('/')) {
+    current = join(current, part);
+    const stat = lstatSync(current);
+    if (
+      !stat.isDirectory() ||
+      stat.isSymbolicLink() ||
+      stat.uid !== process.getuid?.() ||
+      (stat.mode & (current === directory ? 0o077 : 0o022)) !== 0
+    )
+      throw new Error('Chat storage must be owned and private without symlink parents.');
+  }
+  const logs = join(directory, 'logs');
+  try {
+    mkdirSync(logs, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  }
+  const stat = lstatSync(logs);
+  if (
+    !stat.isDirectory() ||
+    stat.isSymbolicLink() ||
+    stat.uid !== process.getuid?.() ||
+    (stat.mode & 0o077) !== 0
+  )
+    throw new Error('Chat logs must be a contained directory.');
+  return directory;
+}
+
+// AgentEvent text fields hold 64 KiB. Longer deltas go out in pieces.
+const TEXT_LIMIT = 65_536;
+const OUTPUT_LIMIT = 65_536;
+// A completed command item repeats up to 1 MiB of retained output, and JSON escaping can write each
+// byte as six. A 16 MiB line covers that. Anything longer is not a frame this client sends.
+const LINE_LIMIT = 16 * 1024 * 1024;
+const OPTIONS: ChatPermissionOption[] = [
+  { id: 'allow-once', label: 'Allow once', kind: 'allow-once' },
+  { id: 'allow-thread', label: 'Allow for this thread', kind: 'allow-thread' },
+  { id: 'deny', label: 'Deny', kind: 'deny' },
+];
+// shortcut: acceptForSession lasts as long as the client process, and that is one turn here.
+// Upgrade: the controller keeps thread grants and answers repeats, or one process per thread.
+const DECISIONS = new Map([
+  ['allow-once', 'accept'],
+  ['allow-thread', 'acceptForSession'],
+  ['deny', 'decline'],
+]);
+// Thread and account notices with nothing to show in a chat turn. Any other unknown method is
+// reported once per turn, so a client update shows up in the thread.
+const QUIET = new Set([
+  'thread/started',
+  'thread/status/changed',
+  'thread/settings/updated',
+  'thread/name/updated',
+  'thread/readState/changed',
+  'thread/queue/changed',
+  'turn/diff/updated',
+  'turn/plan/updated',
+  'serverRequest/resolved',
+  'account/updated',
+  'remoteControl/status/changed',
+]);
+const LIMIT_TEXT = /\b(usage|rate) limit/i;
+
+// Each schema names only the fields this file reads. Optional fields fall back on their own, so
+// one renamed field never drops the rest of a frame.
+const id = z.string().min(1).max(200);
+const rpcId = z.union([z.number().int().safe(), id]);
+const maybe = <T extends z.ZodType>(schema: T) => schema.nullish().catch(null);
+const envelope = z.object({
+  id: rpcId.optional(),
+  method: z.string().min(1).max(200).optional(),
+  params: z.unknown().optional(),
+  result: z.unknown().optional(),
+  error: z.unknown().optional(),
+});
+const rpcError = z.object({ code: maybe(z.number().int().safe()), message: maybe(z.string()) });
+const accountReply = z.object({ account: z.object({ type: z.string() }).nullable() });
+const limitsReply = z.object({ ordinaryUsageAllowed: maybe(z.boolean()) });
+const threadReply = z.object({ thread: z.object({ id: z.string().min(1).max(512) }) });
+const turnReply = z.object({ turn: z.object({ id }) });
+const scope = z.object({ threadId: z.string() });
+const itemFrame = z.object({ item: z.unknown().optional() });
+const itemHead = z.object({ id, type: z.string() });
+const agentItem = z.object({ text: maybe(z.string()) });
+const reasoningItem = z.object({ summary: maybe(z.array(z.string())) });
+const commandItem = z.object({ command: maybe(z.string()), cwd: maybe(z.string()) });
+const changeItem = z.object({ changes: maybe(z.array(z.object({ path: z.string().min(1) }))) });
+const mcpItem = z.object({ server: maybe(z.string()), tool: maybe(z.string()) });
+const searchItem = z.object({ query: maybe(z.string()) });
+const toolEnd = z.object({
+  status: maybe(z.string()),
+  exitCode: maybe(z.number().int()),
+  aggregatedOutput: maybe(z.string()),
+});
+const delta = z.object({ itemId: id, delta: z.string() });
+const summaryPart = z.object({ itemId: id, summaryIndex: z.number().int() });
+const tokenUsage = z.object({
+  tokenUsage: z.object({
+    last: z.object({ totalTokens: z.number().int().nonnegative() }),
+    modelContextWindow: maybe(z.number().int().positive()),
+  }),
+});
+const notice = z.object({
+  message: maybe(z.string()),
+  summary: maybe(z.string()),
+  details: maybe(z.string()),
+});
+const turnError = z.object({ message: maybe(z.string()), codexErrorInfo: z.unknown().optional() });
+const errorNotice = z.object({ error: maybe(turnError), willRetry: maybe(z.boolean()) });
+const turnDone = z.object({
+  turn: z.object({ id: maybe(id), status: maybe(z.string()), error: maybe(turnError) }),
+});
+const approval = z.object({
+  itemId: maybe(id),
+  reason: maybe(z.string()),
+  command: maybe(z.string()),
+  grantRoot: maybe(z.string()),
+});
+
+type RpcId = z.output<typeof rpcId>;
+type Reply = { result: unknown } | { error: z.output<typeof rpcError> };
+type ProviderError = {
+  message?: string | null;
+  codexErrorInfo?: unknown;
+  code?: number | null;
+} | null;
+type Outcome = Pick<ChatTurnResult, 'stopReason' | 'failure'>;
+
+const clip = (value: string, limit: number) =>
+  value.length > limit ? value.slice(0, limit) : value;
+const isLimit = (error: ProviderError) => {
+  const info = error?.codexErrorInfo;
+  return (
+    info === 'usageLimitExceeded' ||
+    (typeof info === 'object' && info !== null && 'usageLimitExceeded' in info) ||
+    LIMIT_TEXT.test(error?.message ?? '')
+  );
+};
+
+class OpenAiChatTurn {
+  readonly handle: ChatTurnHandle;
+  private readonly request: ChatTurnRequest;
+  private readonly emit: (event: AgentEvent) => void;
+  private readonly reportUsage: UsageReporter;
+  private readonly roots: string[];
+  private child: ChildProcessWithoutNullStreams | null = null;
+  private group = 0;
+  private nextId = 1;
+  private readonly waiting = new Map<RpcId, (reply: Reply) => void>();
+  private threadId: string | null = null;
+  private turnId: string | null = null;
+  // A terminal error notice. The failure is built when the turn ends, so a rate-limit update
+  // that lands in between still supplies the reset time.
+  private terminal: ProviderError | undefined;
+  private outcome: Outcome | null = null;
+  private closing = false;
+  private closed = false;
+  private settled = false;
+  private readonly timers: Array<() => void> = [];
+  private parts: Buffer[] = [];
+  private size = 0;
+  private readonly texts: string[] = [];
+  private readonly thinking = new Set<string>();
+  // Started tool calls and the text an approval question shows for them.
+  private readonly tools = new Map<string, string>();
+  private readonly output = new Map<string, number>();
+  private readonly changed = new Set<string>();
+  private readonly approvals = new Map<string, RpcId>();
+  private approvalCount = 0;
+  private readonly reported = new Set<string>();
+  private readonly windows = new Map<string, OpenAiUsageWindow>();
+  private usage: ChatTurnResult['usage'] = null;
+  private readonly finish: (result: ChatTurnResult) => void;
+
+  constructor(deps: OpenAiChatDeps, request: ChatTurnRequest, emit: (event: AgentEvent) => void) {
+    this.request = request;
+    this.emit = emit;
+    this.reportUsage = openAiUsageReporter(deps.onUsage);
+    let finish: (result: ChatTurnResult) => void = () => {};
+    const result = new Promise<ChatTurnResult>((resolve) => {
+      finish = resolve;
+    });
+    this.finish = finish;
+    const scratch = resolve(request.scratch.directory);
+    let real = scratch;
+    try {
+      real = realpathSync(scratch);
+    } catch {}
+    this.roots = [...new Set([scratch, real])];
+    const refused = this.launch(deps);
+    this.handle = {
+      respondPermission: (requestId, choice) => this.answer(requestId, choice),
+      stop: () => this.stop(),
+      groups: this.group > 0 ? [this.group] : [],
+      result,
+    };
+    if (refused) {
+      // The controller gets its handle before any event, even when the client never starts.
+      queueMicrotask(() => {
+        this.fail(refused);
+        this.settle();
+      });
+      return;
+    }
+    // Timers hold at most 2^31 - 1 ms. A longer budget would fire at once.
+    this.later(Math.min(Math.max(1, request.deadlineMs), 2_147_483_647), () => {
+      this.interrupt();
+      this.fail(
+        chatFailure({
+          stage: 'stream',
+          kind: 'timeout',
+          message: 'The turn reached its time limit.',
+        }),
+      );
+    });
+    this.initialize();
+  }
+
+  private launch(deps: OpenAiChatDeps): ChatFailure | null {
+    let step: 'client' | 'storage' | 'spawn' = 'client';
+    try {
+      const launch = deps.launch(this.request);
+      const executable = verifiedClient(launch);
+      step = 'storage';
+      const directory = privateStorage(launch);
+      const env = nativeDiscoveryEnvironment(launch.environment);
+      step = 'spawn';
+      const child = (deps.spawn ?? spawn)(executable, nativeChatArguments(directory), {
+        cwd: this.request.scratch.directory,
+        env,
+        detached: true,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      this.child = child;
+      this.group = child.pid ?? 0;
+      child.stdout.on('data', (chunk: Buffer) => this.data(chunk));
+      // Unread stderr would fill its pipe and stall the client. Its text stays private.
+      child.stderr.resume();
+      // A broken pipe also closes the child, and the close handler reports it.
+      child.stdin.on('error', () => {});
+      child.on('error', () => {
+        this.fail(
+          chatFailure({
+            stage: 'launch',
+            kind: 'client-missing',
+            message: 'Codex could not start.',
+          }),
+        );
+        if (this.group === 0) this.settle();
+      });
+      child.on('close', (code, signal) => this.exited(code, signal));
+      return null;
+    } catch {
+      if (step === 'storage')
+        return chatFailure({
+          stage: 'launch',
+          kind: 'internal',
+          message: 'CrewKite could not prepare private storage for Codex.',
+        });
+      return chatFailure({
+        stage: 'launch',
+        kind: 'client-missing',
+        message:
+          step === 'client'
+            ? 'Codex is missing or changed since Settings checked it.'
+            : 'Codex could not start.',
+      });
+    }
+  }
+
+  // The same metadata requests as the discovery transcript. Admission here acts only on the
+  // sign-in and on whether included usage remains.
+  private initialize() {
+    this.call(
+      'initialize',
+      {
+        clientInfo: { name: 'crewkite', title: 'CrewKite', version: '0.0.0' },
+        capabilities: { experimentalApi: false, explicitGatewayOauth: true },
+      },
+      (reply) => {
+        if ('error' in reply)
+          return this.fail(this.providerFailure('session', 'initialize', reply.error));
+        this.write({ method: 'initialized' });
+        this.call('account/read', { refreshToken: false }, (reply) => {
+          if ('error' in reply)
+            return this.fail(this.providerFailure('session', 'account/read', reply.error));
+          const account = accountReply.safeParse(reply.result);
+          if (!account.success)
+            return this.fail(
+              chatFailure({
+                stage: 'session',
+                kind: 'protocol',
+                method: 'account/read',
+                message: 'Codex sent account details CrewKite could not read.',
+              }),
+            );
+          // A subscription sign-in is the billing premise. An API key or other account would bill
+          // per token, so chat does not run on one.
+          if (account.data.account?.type !== 'chatgpt')
+            return this.fail(
+              chatFailure({
+                stage: 'session',
+                kind: 'signed-out',
+                method: 'account/read',
+                message:
+                  account.data.account === null
+                    ? 'Codex is not signed in.'
+                    : 'Codex is not signed in with a ChatGPT plan.',
+              }),
+            );
+          this.call(
+            'account/rateLimits/read',
+            { supportsLunaReserve: false, excludeResetCreditDetails: true },
+            (reply) => {
+              // Usage is advisory, so a failed read does not stop the turn.
+              if ('result' in reply) {
+                this.rateLimits('account/rateLimits/read', reply.result);
+                if (limitsReply.safeParse(reply.result).data?.ordinaryUsageAllowed === false)
+                  return this.fail(
+                    chatFailure({
+                      stage: 'session',
+                      kind: 'usage-limit',
+                      method: 'account/rateLimits/read',
+                      message: 'The ChatGPT plan has no included Codex usage left.',
+                      resetsAt: this.resetsAt(),
+                    }),
+                  );
+              }
+              this.openThread();
+            },
+          );
+        });
+      },
+    );
+  }
+
+  private openThread() {
+    const { selection, scratch, session } = this.request;
+    const settings = {
+      model: selection.model,
+      modelProvider: 'openai',
+      cwd: scratch.directory,
+      approvalPolicy: 'on-request',
+      approvalsReviewer: 'user',
+      sandbox: 'workspace-write',
+      serviceTier: 'default',
+      ...(selection.effort === 'default'
+        ? {}
+        : { config: { model_reasoning_effort: selection.effort } }),
+    };
+    const start = (history: boolean) =>
+      this.call('thread/start', { ...settings, ephemeral: false }, (reply) => {
+        if ('error' in reply)
+          return this.fail(this.providerFailure('session', 'thread/start', reply.error));
+        const thread = threadReply.safeParse(reply.result);
+        if (!thread.success)
+          return this.fail(
+            chatFailure({
+              stage: 'session',
+              kind: 'protocol',
+              method: 'thread/start',
+              message: 'Codex started a thread without an ID.',
+            }),
+          );
+        this.threadId = thread.data.thread.id;
+        this.startTurn(true, history);
+      });
+    if (session?.family !== 'openai') return start(false);
+    this.call('thread/resume', { threadId: session.sessionId, ...settings }, (reply) => {
+      const thread = 'result' in reply ? threadReply.safeParse(reply.result) : null;
+      if (thread?.success) {
+        this.threadId = thread.data.thread.id;
+        return this.startTurn(false, false);
+      }
+      // A thread can vanish from the client's history. Starting fresh with the transcript keeps
+      // the conversation going, where a failure here would repeat on every later message.
+      this.notice(
+        'warning',
+        'Codex could not resume the earlier thread. A new thread starts with the transcript so far.',
+      );
+      start(true);
+    });
+  }
+
+  private startTurn(fresh: boolean, history: boolean) {
+    const { systemContext, prompt } = this.request;
+    const transcript = history
+      ? this.request.history
+          .map((entry) => `${entry.role === 'user' ? 'User' : 'Assistant'}: ${entry.text}`)
+          .join('\n\n')
+      : '';
+    const text = fresh ? [systemContext, transcript, prompt].filter(Boolean).join('\n\n') : prompt;
+    this.call(
+      'turn/start',
+      { threadId: this.threadId, input: [{ type: 'text', text }] },
+      (reply) => {
+        if ('error' in reply)
+          return this.fail(this.providerFailure('prompt', 'turn/start', reply.error));
+        this.turnId ??= turnReply.safeParse(reply.result).data?.turn.id ?? null;
+      },
+    );
+  }
+
+  private data(chunk: Buffer) {
+    let start = 0;
+    let end = chunk.indexOf(10);
+    while (end >= 0 && !this.outcome) {
+      const piece = chunk.subarray(start, end);
+      start = end + 1;
+      if (this.size + piece.length > LINE_LIMIT) return this.oversized();
+      const line = this.parts.length ? Buffer.concat([...this.parts, piece]) : piece;
+      this.parts = [];
+      this.size = 0;
+      this.frame(line.toString('utf8'));
+      end = chunk.indexOf(10, start);
+    }
+    if (this.outcome || start === chunk.length) return;
+    this.size += chunk.length - start;
+    if (this.size > LINE_LIMIT) return this.oversized();
+    this.parts.push(chunk.subarray(start));
+  }
+
+  private oversized() {
+    this.fail(
+      chatFailure({
+        stage: 'stream',
+        kind: 'protocol',
+        message: 'Codex sent a message larger than 16 MiB.',
+      }),
+    );
+  }
+
+  private frame(text: string) {
+    if (!text.trim()) return;
+    let value: unknown;
+    try {
+      value = JSON.parse(text);
+    } catch {
+      return this.noticeOnce('', 'warning', 'Codex sent a line CrewKite could not read.');
+    }
+    const message = envelope.safeParse(value);
+    if (!message.success)
+      return this.noticeOnce('', 'warning', 'Codex sent a line CrewKite could not read.');
+    const { id, method, params } = message.data;
+    if (method !== undefined)
+      return id === undefined
+        ? this.notification(method, params)
+        : this.serverRequest(id, method, params);
+    if (id === undefined) return;
+    const waiter = this.waiting.get(id);
+    this.waiting.delete(id);
+    if (message.data.error != null) {
+      const error = rpcError.safeParse(message.data.error);
+      waiter?.({ error: error.success ? error.data : { code: null, message: null } });
+    } else waiter?.({ result: message.data.result });
+  }
+
+  private serverRequest(requestId: RpcId, method: string, params: unknown) {
+    const kind =
+      method === 'item/commandExecution/requestApproval'
+        ? 'command'
+        : method === 'item/fileChange/requestApproval'
+          ? 'edit'
+          : null;
+    if (!kind) {
+      this.unknown(method);
+      // An unanswered request would hold the turn until its deadline.
+      return this.write({
+        id: requestId,
+        error: { code: -32601, message: `CrewKite does not handle ${method}.` },
+      });
+    }
+    const value = approval.safeParse(params).data;
+    const callId = value?.itemId ?? null;
+    const detail = [
+      value?.command ?? (callId ? this.tools.get(callId) : undefined) ?? '',
+      value?.reason ?? '',
+      value?.grantRoot ? `Grants write access to ${value.grantRoot}.` : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+    const answerId = `approval-${++this.approvalCount}`;
+    this.approvals.set(answerId, requestId);
+    this.send({
+      type: 'permission.requested',
+      turnId: this.request.turnId,
+      requestId: answerId,
+      callId,
+      question: kind === 'command' ? 'Run this command?' : 'Apply these file changes?',
+      detail: detail ? clip(detail, 16_384) : null,
+      options: OPTIONS,
+    });
+    const policy = this.request.permissionPolicy;
+    if (policy === 'allow-all' || (policy === 'allow-edits' && kind === 'edit'))
+      this.answer(answerId, 'allow-once');
+  }
+
+  private answer(requestId: string, choice: string) {
+    const target = this.approvals.get(requestId);
+    const decision = DECISIONS.get(choice);
+    if (target === undefined || !decision || this.outcome) return;
+    this.approvals.delete(requestId);
+    this.write({ id: target, result: { decision } });
+    this.send({ type: 'permission.resolved', turnId: this.request.turnId, requestId, choice });
+  }
+
+  private notification(method: string, params: unknown) {
+    const thread = scope.safeParse(params);
+    if (thread.success && this.threadId && thread.data.threadId !== this.threadId) return;
+    const turnId = this.request.turnId;
+    switch (method) {
+      case 'turn/started':
+        this.turnId ??= turnReply.safeParse(params).data?.turn.id ?? null;
+        return;
+      case 'item/started':
+        return this.started(itemFrame.safeParse(params).data?.item);
+      case 'item/completed':
+        return this.completed(itemFrame.safeParse(params).data?.item);
+      case 'item/agentMessage/delta': {
+        const value = delta.safeParse(params).data;
+        if (value)
+          this.pieces(value.delta, (text) =>
+            this.send({ type: 'text.delta', turnId, itemId: value.itemId, text }),
+          );
+        return;
+      }
+      case 'item/reasoning/summaryTextDelta':
+      case 'item/reasoning/textDelta': {
+        const value = delta.safeParse(params).data;
+        if (value) this.think(value.itemId, value.delta);
+        return;
+      }
+      case 'item/reasoning/summaryPartAdded': {
+        const value = summaryPart.safeParse(params).data;
+        if (value && value.summaryIndex > 0 && this.thinking.has(value.itemId))
+          this.think(value.itemId, '\n\n');
+        return;
+      }
+      case 'item/commandExecution/outputDelta':
+      case 'item/fileChange/outputDelta': {
+        const value = delta.safeParse(params).data;
+        if (value) this.toolOutput(value.itemId, value.delta);
+        return;
+      }
+      case 'thread/tokenUsage/updated': {
+        const value = tokenUsage.safeParse(params).data?.tokenUsage;
+        if (!value) return;
+        this.usage = {
+          usedTokens: value.last.totalTokens,
+          capacityTokens: value.modelContextWindow ?? null,
+        };
+        return this.send({ type: 'usage.context', turnId, ...this.usage });
+      }
+      case 'account/rateLimits/updated':
+        return this.rateLimits(method, params);
+      case 'warning':
+      case 'deprecationNotice':
+      case 'configWarning': {
+        const value = notice.safeParse(params).data;
+        const text = [value?.message ?? value?.summary, value?.details].filter(Boolean).join(' ');
+        if (text) this.notice('warning', text);
+        return;
+      }
+      case 'error': {
+        const value = errorNotice.safeParse(params).data;
+        if (value?.willRetry) {
+          this.notice('warning', value.error?.message || 'Codex is retrying the request.');
+          return;
+        }
+        this.terminal ??= value?.error ?? null;
+        return;
+      }
+      case 'turn/completed': {
+        const turn = turnDone.safeParse(params).data?.turn;
+        if (turn?.id && this.turnId && turn.id !== this.turnId) return;
+        if (turn?.status === 'interrupted')
+          return this.fail(
+            chatFailure({
+              stage: 'stream',
+              kind: 'stopped',
+              message: 'Codex interrupted the turn.',
+            }),
+          );
+        if (this.terminal !== undefined || turn?.status === 'failed')
+          return this.fail(
+            this.providerFailure('stream', null, this.terminal ?? turn?.error ?? null),
+          );
+        return this.end({ stopReason: 'done', failure: null });
+      }
+      default:
+        if (!QUIET.has(method)) this.unknown(method);
+    }
+  }
+
+  private started(raw: unknown) {
+    const head = itemHead.safeParse(raw).data;
+    if (!head || this.tools.has(head.id)) return;
+    let kind: ChatToolKind = 'other';
+    let title: string;
+    let input: Record<string, unknown>;
+    let detail: string;
+    if (head.type === 'commandExecution') {
+      const value = commandItem.safeParse(raw).data;
+      detail = value?.command?.trim() ?? '';
+      kind = 'command';
+      title = detail || 'Run a command';
+      input = { command: detail, cwd: value?.cwd ?? null };
+    } else if (head.type === 'fileChange') {
+      const paths = this.paths(raw).map((entry) => entry.path);
+      detail = paths.join('\n');
+      kind = 'edit';
+      title = paths.length ? `Edit ${paths.join(', ')}` : 'Edit files';
+      input = { paths };
+    } else if (head.type === 'mcpToolCall') {
+      const value = mcpItem.safeParse(raw).data;
+      detail = [value?.server, value?.tool].filter(Boolean).join(': ');
+      title = detail || 'Call a tool';
+      input = { server: value?.server ?? null, tool: value?.tool ?? null };
+    } else if (head.type === 'webSearch') {
+      detail = searchItem.safeParse(raw).data?.query?.trim() ?? '';
+      title = detail ? `Search the web for ${detail}` : 'Search the web';
+      input = { query: detail || null };
+    } else return;
+    this.tools.set(head.id, detail);
+    this.send({
+      type: 'tool.started',
+      turnId: this.request.turnId,
+      callId: head.id,
+      kind,
+      title: clip(title, 1024),
+      input,
+    });
+  }
+
+  private completed(raw: unknown) {
+    const head = itemHead.safeParse(raw).data;
+    if (!head) return;
+    const turnId = this.request.turnId;
+    if (head.type === 'agentMessage') {
+      const text = agentItem.safeParse(raw).data?.text ?? '';
+      if (!text) return;
+      this.texts.push(text);
+      // shortcut: text.completed holds 64 KiB, so a longer message is cut in the event. The
+      // result carries the whole text. Upgrade: a larger bound in the contract.
+      return this.send({
+        type: 'text.completed',
+        turnId,
+        itemId: head.id,
+        text: clip(text, TEXT_LIMIT),
+      });
+    }
+    if (head.type === 'reasoning') {
+      if (!this.thinking.has(head.id)) {
+        // Some builds send the summary only on completion. It still belongs in the thinking card.
+        const summary = reasoningItem.safeParse(raw).data?.summary?.join('\n\n') ?? '';
+        if (!summary) return;
+        this.think(head.id, summary);
+      }
+      return this.send({ type: 'thinking.completed', turnId, itemId: head.id });
+    }
+    if (!['commandExecution', 'fileChange', 'mcpToolCall', 'webSearch'].includes(head.type)) return;
+    this.started(raw);
+    const value = toolEnd.safeParse(raw).data;
+    const status =
+      value?.status === 'declined'
+        ? 'denied'
+        : value?.status === 'failed' || (value?.exitCode != null && value.exitCode !== 0)
+          ? 'error'
+          : 'ok';
+    if (head.type === 'commandExecution' && !this.output.has(head.id) && value?.aggregatedOutput)
+      this.toolOutput(head.id, value.aggregatedOutput);
+    let summary: string | undefined;
+    if (head.type === 'fileChange' && status === 'ok') {
+      const paths = this.paths(raw);
+      for (const entry of paths) if (entry.inside) this.changed.add(entry.path);
+      summary = `Changed ${paths.length} ${paths.length === 1 ? 'file' : 'files'}.`;
+    } else if (head.type === 'commandExecution' && value?.exitCode != null)
+      summary = `Exit code ${value.exitCode}.`;
+    this.send({
+      type: 'tool.completed',
+      turnId,
+      callId: head.id,
+      status,
+      ...(summary ? { summary } : {}),
+    });
+  }
+
+  /** Scratch-relative paths when the change is inside scratch, as reported otherwise. */
+  private paths(raw: unknown) {
+    const seen = new Map<string, boolean>();
+    for (const change of changeItem.safeParse(raw).data?.changes ?? []) {
+      const local = isAbsolute(change.path)
+        ? this.roots
+            .map((root) => relative(root, change.path))
+            .find((path) => path && !path.startsWith('..') && !isAbsolute(path))
+        : change.path;
+      seen.set(local ?? change.path, local !== undefined && !local.startsWith('..'));
+    }
+    return [...seen].map(([path, inside]) => ({ path, inside }));
+  }
+
+  private think(itemId: string, text: string) {
+    this.thinking.add(itemId);
+    this.pieces(text, (piece) =>
+      this.send({ type: 'thinking.delta', turnId: this.request.turnId, itemId, text: piece }),
+    );
+  }
+
+  private pieces(text: string, send: (piece: string) => void) {
+    for (let start = 0; start < text.length; start += TEXT_LIMIT)
+      send(text.slice(start, start + TEXT_LIMIT));
+  }
+
+  /** Output is bounded per call. The chunk that crosses the bound is cut and marked. */
+  private toolOutput(callId: string, chunk: string) {
+    const used = this.output.get(callId) ?? 0;
+    if (used > OUTPUT_LIMIT || !chunk) return;
+    const room = OUTPUT_LIMIT - used;
+    const truncated = chunk.length > room;
+    this.output.set(callId, truncated ? OUTPUT_LIMIT + 1 : used + chunk.length);
+    this.send({
+      type: 'tool.output',
+      turnId: this.request.turnId,
+      callId,
+      chunk: truncated ? chunk.slice(0, room) : chunk,
+      ...(truncated ? { truncated: true } : {}),
+    });
+  }
+
+  private rateLimits(
+    method: 'account/rateLimits/read' | 'account/rateLimits/updated',
+    payload: unknown,
+  ) {
+    this.reportUsage(method, payload);
+    try {
+      for (const window of projectOpenAiUsage(method, payload).windows)
+        this.windows.set(window.windowId, {
+          ...window,
+          resetsAt: window.resetsAt ?? this.windows.get(window.windowId)?.resetsAt ?? null,
+        });
+    } catch {
+      // A usage shape this reader cannot project leaves the reset time unknown.
+    }
+  }
+
+  /** The latest reset among exhausted windows, since all of them must reset before work resumes. */
+  private resetsAt() {
+    let latest: string | null = null;
+    for (const window of this.windows.values())
+      if (window.remaining?.value === 0 && window.resetsAt && (!latest || window.resetsAt > latest))
+        latest = window.resetsAt;
+    return latest;
+  }
+
+  private providerFailure(
+    stage: ChatFailure['stage'],
+    method: string | null,
+    error: ProviderError,
+  ): ChatFailure {
+    const common = {
+      stage,
+      method,
+      providerMessage: error?.message ? clip(error.message, 16_384) : null,
+      code: error?.code ?? null,
+    };
+    if (isLimit(error))
+      return chatFailure({
+        ...common,
+        kind: 'usage-limit',
+        message: 'Codex reached a usage limit.',
+        resetsAt: this.resetsAt(),
+      });
+    if (error?.codexErrorInfo === 'unauthorized')
+      return chatFailure({ ...common, kind: 'signed-out', message: 'Codex is not signed in.' });
+    return chatFailure({
+      ...common,
+      kind: 'protocol',
+      message: method ? `Codex refused ${method}.` : 'Codex ended the turn with an error.',
+    });
+  }
+
+  private unknown(method: string) {
+    this.noticeOnce(
+      method,
+      'info',
+      `Codex sent ${clip(method, 200)}. CrewKite does not read it yet.`,
+    );
+  }
+
+  private noticeOnce(key: string, level: 'info' | 'warning', message: string) {
+    if (this.reported.has(key)) return;
+    this.reported.add(key);
+    this.notice(level, message);
+  }
+
+  private notice(level: 'info' | 'warning', message: string) {
+    this.send({
+      type: 'provider.notice',
+      turnId: this.request.turnId,
+      level,
+      message: clip(message, 4096),
+    });
+  }
+
+  private call(method: string, params: unknown, then: (reply: Reply) => void) {
+    const requestId = this.nextId++;
+    this.waiting.set(requestId, then);
+    this.write({ id: requestId, method, params });
+  }
+
+  private write(value: unknown) {
+    if (!this.child || this.closing || this.closed) return;
+    this.child.stdin.write(`${JSON.stringify(value)}\n`);
+  }
+
+  private send(event: AgentEvent) {
+    if (this.outcome) return;
+    try {
+      this.emit(event);
+    } catch {
+      // A failing receiver cannot reach back into the client stream.
+    }
+  }
+
+  private interrupt() {
+    if (this.threadId && this.turnId)
+      this.write({
+        id: this.nextId++,
+        method: 'turn/interrupt',
+        params: { threadId: this.threadId, turnId: this.turnId },
+      });
+  }
+
+  private stop() {
+    if (this.outcome) return;
+    this.interrupt();
+    this.fail(chatFailure({ stage: 'stream', kind: 'stopped', message: 'The turn was stopped.' }));
+  }
+
+  private fail(failure: ChatFailure) {
+    this.end({
+      stopReason:
+        failure.kind === 'usage-limit' ? 'limit' : failure.kind === 'stopped' ? 'stopped' : 'error',
+      failure,
+    });
+  }
+
+  private end(outcome: Outcome) {
+    if (this.outcome) return;
+    this.outcome = outcome;
+    try {
+      this.emit({ type: 'turn.completed', turnId: this.request.turnId, ...outcome });
+    } catch {
+      // The result below still carries the outcome.
+    }
+    this.shutdown();
+  }
+
+  private shutdown() {
+    if (this.closing || !this.child) return;
+    this.closing = true;
+    // The client exits when its input closes. The signals reach anything left in the group.
+    this.child.stdin.end();
+    this.later(250, () => this.signal('SIGTERM'));
+    this.later(1250, () => this.signal('SIGKILL'));
+    // A group that outlives SIGKILL is still listed in `groups` for the controller to prove absent.
+    this.later(2250, () => this.settle());
+  }
+
+  private exited(code: number | null, signal: NodeJS.Signals | null) {
+    this.closed = true;
+    if (this.terminal !== undefined) this.fail(this.providerFailure('stream', null, this.terminal));
+    this.fail(
+      chatFailure({
+        stage: this.threadId ? 'stream' : 'session',
+        kind: 'client-exit',
+        message: signal
+          ? `Codex stopped on ${signal} before the turn finished.`
+          : `Codex exited with code ${code} before the turn finished.`,
+      }),
+    );
+    if (this.group === 0 || groupAbsent(this.group)) this.settle();
+    else this.signal('SIGTERM');
+  }
+
+  private signal(value: NodeJS.Signals) {
+    if (this.group <= 0 || groupAbsent(this.group)) return;
+    try {
+      process.kill(-this.group, value);
+    } catch {
+      // Only an observed absent group proves that a failed signal needs no further action.
+    }
+  }
+
+  private later(milliseconds: number, work: () => void) {
+    this.timers.push(defaultSchedule(work, milliseconds));
+  }
+
+  private settle() {
+    if (this.settled) return;
+    this.settled = true;
+    for (const cancel of this.timers.splice(0)) cancel();
+    const { selection, session } = this.request;
+    const now = this.request.now ?? Date.now;
+    this.finish({
+      ...(this.outcome ?? {
+        stopReason: 'error',
+        failure: chatFailure({
+          stage: 'finish',
+          kind: 'internal',
+          message: 'The turn ended without an outcome.',
+        }),
+      }),
+      assistantText: this.texts.join('\n\n'),
+      session: this.threadId
+        ? {
+            family: 'openai',
+            sessionId: this.threadId,
+            model: selection.model,
+            updatedAt: new Date(now()).toISOString(),
+          }
+        : session,
+      usage: this.usage,
+      changedPaths: [...this.changed],
+    });
+  }
+}
