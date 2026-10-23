@@ -1031,8 +1031,8 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
                     ? [
                         `Report received ${reader.reading.receivedAt}; observation time/cache age unknown.`,
                         ...reader.reading.windows.map(
-                          (row) =>
-                            `${row.kind}/${row.group}  reported ${row.percent}%  resets ${row.resets_at ?? 'unknown'}  age unknown`,
+                          (window) =>
+                            `${window.windowId}  ${window.remaining.value} percent remaining  resets ${window.resetsAt ?? 'unknown'}  age unknown`,
                         ),
                       ]
                     : []),

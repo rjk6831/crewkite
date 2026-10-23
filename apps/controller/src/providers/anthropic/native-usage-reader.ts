@@ -28,7 +28,7 @@ type Owner = Pick<
   | 'quiescent'
 >;
 type Reading = ReturnType<AnthropicUsageReader['finish']>;
-type Reason = 'protocol' | 'output-limit' | 'deadline' | 'stopped' | 'exit' | 'ownership';
+type Reason = UsageReaderError['reason'] | 'deadline' | 'stopped' | 'exit' | 'ownership';
 export type AnthropicUsageReaderContext = Readonly<{
   operationId: string;
   executable: string;
@@ -139,9 +139,9 @@ export function startAnthropicUsageReader(
   });
   if (!owner.stdoutStream || !owner.stderrStream) {
     owner.stop();
-    throw new UsageReaderError('protocol');
+    throw new UsageReaderError('client');
   }
-  const parser = new AnthropicUsageReader(plan.sessionId);
+  const parser = new AnthropicUsageReader();
   let reason: Reason | null = null;
   let cancelCleanup: (() => void) | undefined;
   const boundary = Promise.withResolvers<void>();
@@ -165,11 +165,7 @@ export function startAnthropicUsageReader(
         if (reason === null && stdout) parser.feed(chunk);
       }
     } catch (error) {
-      stop(
-        error instanceof UsageReaderError && error.reason === 'output-limit'
-          ? 'output-limit'
-          : 'protocol',
-      );
+      stop(error instanceof UsageReaderError ? error.reason : 'exit');
     }
   };
   const output = Promise.all([drain(owner.stdoutStream, true), drain(owner.stderrStream, false)]);
@@ -183,7 +179,7 @@ export function startAnthropicUsageReader(
       Promise.all([owner.closed, owner.inputCompleted, output]).then(
         () => true,
         () => {
-          stop('protocol');
+          stop('exit');
           return false;
         },
       ),
@@ -218,8 +214,8 @@ export function startAnthropicUsageReader(
     if (reason === null) {
       try {
         reading = parser.finish((options.receivedAt ?? (() => new Date().toISOString()))());
-      } catch {
-        reason = 'protocol';
+      } catch (error) {
+        reason = error instanceof UsageReaderError ? error.reason : 'exit';
       }
     }
     cancelDeadline();

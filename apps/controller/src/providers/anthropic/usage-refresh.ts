@@ -31,7 +31,9 @@ const recordSchema = z.strictObject({
   attemptedAt: TimestampSchema,
   groups: z.array(z.number().int().positive().safe()).max(1),
   reason: z.string().min(1).max(200).nullable(),
-  reading: AnthropicUsageReadingSchema.nullable(),
+  // A reading saved in an earlier shape no longer parses. It is dropped and the next read
+  // replaces it, so an old record never blocks the reader.
+  reading: AnthropicUsageReadingSchema.nullable().catch(null),
   readingScopeHash: HashSchema.nullable(),
 });
 type Record = z.infer<typeof recordSchema>;

@@ -141,7 +141,7 @@ test('native clients remain visible before any usage route exists', () => {
   );
 });
 
-test('native usage gauges convert reported used percent without inventing freshness', () => {
+test('native usage gauges show the remaining percent without inventing freshness', () => {
   const scopeHash = 'a'.repeat(64);
   const reader = {
     id: 'anthropic-usage-v1' as const,
@@ -165,17 +165,14 @@ test('native usage gauges convert reported used percent without inventing freshn
       receivedAt: DEMO_TIME,
       observedAt: null,
       freshness: 'unknown' as const,
-      windows: [0, 37, 100].map((percent) => ({
-        kind: 'session',
-        group: `row-${percent}`,
-        percent,
-        resets_at: DEMO_TIME,
-        severity: 'normal',
-        is_active: false,
-        scope: {
-          model: { display_name: 'Coding model' },
-          surface: { display_name: 'Native client' },
-        },
+      windows: [
+        { windowId: 'scoped-pool', value: 100 },
+        { windowId: 'five-hour', value: 63 },
+        { windowId: 'weekly', value: 0 },
+      ].map(({ windowId, value }) => ({
+        windowId,
+        remaining: { value, unit: 'percent' as const },
+        resetsAt: DEMO_TIME,
       })),
       extraUsage: null,
       modelTurns: 0 as const,
@@ -187,8 +184,12 @@ test('native usage gauges convert reported used percent without inventing freshn
   assert(card);
   const rows = [...card.primary, ...(card.auxiliary ?? [])];
   assert.deepEqual(
-    rows.map((row) => row.remaining),
-    [100, 63, 0].map((value) => ({ value, unit: 'percent' })),
+    rows.map((row) => [row.label, row.remaining?.value]),
+    [
+      ['Weekly', 0],
+      ['Five-hour', 63],
+      ['scoped-pool', 100],
+    ],
   );
   assert(
     rows.every(
@@ -202,14 +203,13 @@ test('native usage gauges convert reported used percent without inventing freshn
   assert(card.tags?.includes('Current scope'));
   assert(card.notice?.includes('cache age unknown'));
   assert(rows.every((row) => row.note?.includes(scopeHash)));
-  assert(rows.every((row) => row.label === 'Coding model · Native client · session'));
   const repeated = anthropicUsageCard({
     usageReaders: [
       {
         ...reader,
         reading: {
           ...reader.reading,
-          windows: [reader.reading.windows[0], reader.reading.windows[0]],
+          windows: [reader.reading.windows[1], reader.reading.windows[1]],
         },
       },
     ],

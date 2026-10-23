@@ -902,34 +902,20 @@ export const AnthropicUsageReadingSchema = z.strictObject({
   receivedAt: TimestampSchema,
   observedAt: z.null(),
   freshness: z.literal('unknown'),
+  // One window per reported limit: five-hour, weekly, weekly-<model>, or the limit's own kind.
   windows: z
     .array(
       z.strictObject({
-        kind: label,
-        group: label,
-        percent: z.number().finite().min(0).max(100),
-        resets_at: TimestampSchema.nullable(),
-        scope: z
-          .strictObject({
-            model: z.strictObject({ display_name: label }).nullable().optional(),
-            surface: z.strictObject({ display_name: label }).nullable().optional(),
-          })
-          .nullable()
-          .optional(),
-        severity: label,
-        is_active: z.boolean(),
+        windowId: label,
+        remaining: z.strictObject({
+          value: z.number().finite().min(0).max(100),
+          unit: z.literal('percent'),
+        }),
+        resetsAt: TimestampSchema.nullable(),
       }),
     )
     .max(64),
-  extraUsage: z
-    .strictObject({
-      is_enabled: z.boolean(),
-      monthly_limit: z.number().finite().nonnegative().nullable(),
-      used_credits: z.number().finite().nonnegative().nullable(),
-      utilization: z.number().finite().nonnegative().nullable(),
-      currency: label.nullable().optional(),
-    })
-    .nullable(),
+  extraUsage: z.strictObject({ is_enabled: z.boolean() }).nullable(),
   modelTurns: z.literal(0),
   qualified: z.literal(false),
 });

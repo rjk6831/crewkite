@@ -246,25 +246,33 @@ export function projectUsagePresentation(
   });
 }
 
-/** Pinned native schema defines percent as used; this conversion is display-only. */
+const primaryLabels = new Map([
+  ['weekly', 'Weekly'],
+  ['five-hour', 'Five-hour'],
+]);
+
+/** The controller turned the report's used percent into what remains. */
 export function anthropicUsageCard(snapshot: Pick<Snapshot, 'usageReaders'>): UsageCard | null {
   const reader = snapshot.usageReaders.find((value) => value.id === 'anthropic-usage-v1');
   if (!reader) return null;
   const reading = reader.reading;
   const scope = reader.readingScopeHash ?? 'unknown';
   const matching = !!reader.trust && scope === reader.trust.scopeHash;
-  const rows: UsageReading[] = (reading?.windows ?? []).map((row, index) => ({
-    id: `${index}:${JSON.stringify(row)}`,
-    windowId: `${row.kind}:${row.group}`,
-    label: `${[row.scope?.model?.display_name, row.scope?.surface?.display_name].filter(Boolean).join(' · ') || row.group} · ${row.kind}`,
-    remaining: { value: 100 - row.percent, unit: 'percent' },
+  const rows: UsageReading[] = (reading?.windows ?? []).map((window, index) => ({
+    id: `${index}:${window.windowId}`,
+    windowId: window.windowId,
+    label: primaryLabels.get(window.windowId) ?? window.windowId,
+    remaining: window.remaining,
     state: 'reported',
     observedAt: null,
-    resetsAt: row.resets_at,
+    resetsAt: window.resetsAt,
     source: 'client',
     confidence: 'reported',
-    note: `Native report: ${row.percent}% used. Report scope ${scope}. Observation time and cache age unknown.`,
+    note: `Native report. Report scope ${scope}. Observation time and cache age unknown.`,
   }));
+  const primary = [...primaryLabels.keys()].flatMap((id) =>
+    rows.filter((row) => row.windowId === id),
+  );
   return {
     id: 'native-quota:anthropic',
     title: 'Anthropic native quota',
@@ -273,8 +281,8 @@ export function anthropicUsageCard(snapshot: Pick<Snapshot, 'usageReaders'>): Us
     notice: reading
       ? `Last retained report received ${new Date(reading.receivedAt).toLocaleString()}. Observation time and cache age unknown.`
       : 'Refresh quota in Native clients to read the native report.',
-    primary: rows.slice(0, 2),
-    auxiliary: rows.slice(2),
+    primary,
+    auxiliary: rows.filter((row) => !primary.includes(row)),
     credits: reading?.extraUsage
       ? [
           {

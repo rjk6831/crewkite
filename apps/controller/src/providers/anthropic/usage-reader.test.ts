@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
@@ -24,242 +24,128 @@ const sessionId = '46eb17cd-01e8-480d-99f4-a741f189715d';
 const uuid = '46eb17cd-01e8-480d-99f4-a741f189715f';
 const sha256 = '5262ce9de86243fed0d21edc39b271555d56780d0112e2b194439fe1c6662d37';
 const at = '2026-10-21T01:00:00.000Z';
-const usage = {
-  input_tokens: 0,
-  output_tokens: 0,
-  cache_creation_input_tokens: 0,
-  cache_read_input_tokens: 0,
-};
-const report = {
-  session: {
-    total_cost_usd: 0,
-    total_api_duration_ms: 0,
-    total_duration_ms: 13,
-    total_lines_added: 0,
-    total_lines_removed: 0,
-    model_usage: {},
+// Client 2.1.302 output for the exact plan, with display text, paths and long lists replaced.
+const [init, assistant, terminal] = readFileSync(
+  new URL('./usage-fixture.jsonl', import.meta.url),
+  'utf8',
+)
+  .trim()
+  .split('\n')
+  .map((line) => JSON.parse(line));
+const limits = assistant.usage_report.rate_limits.limits;
+const withLimits = (value: unknown) => ({
+  ...assistant,
+  usage_report: {
+    ...assistant.usage_report,
+    rate_limits: { ...assistant.usage_report.rate_limits, limits: value },
   },
-  rate_limits: {
-    limits: [
-      {
-        kind: 'session',
-        group: 'session',
-        percent: 0,
-        resets_at: at,
-        severity: 'normal',
-        is_active: true,
-      },
-      {
-        kind: 'weekly_scoped',
-        group: 'weekly',
-        percent: 70,
-        resets_at: null,
-        scope: { model: { display_name: 'Advertised model' } },
-        severity: 'warning',
-        is_active: false,
-      },
-    ],
-    extra_usage: {
-      is_enabled: false,
-      monthly_limit: 100,
-      used_credits: 0,
-      utilization: 0,
-      currency: 'USD',
-    },
-  },
-};
-const init = {
-  type: 'system',
-  subtype: 'init',
-  session_id: sessionId,
-  uuid,
-  tools: [],
-  mcp_servers: [],
-  plugins: [],
-};
-const local = {
-  type: 'system',
-  subtype: 'local_command_output',
-  session_id: sessionId,
-  uuid,
-  content: 'private display text is discarded',
-};
-const assistant = {
-  type: 'assistant',
-  session_id: sessionId,
-  uuid,
-  parent_tool_use_id: null,
-  local_command_run: { command: 'usage', args: '' },
-  usage_report: report,
-  message: {
-    role: 'assistant',
-    content: [{ type: 'text', text: 'private account display is discarded' }],
-    stop_reason: 'end_turn',
-    usage,
-  },
-};
-const subagents = {
-  spawned: 0,
-  requested: { background: 0, foreground: 0, unset: 0 },
-  started_in_background: 0,
-  by_type: {},
-  max_depth: 0,
-  spawned_by_subagents: 0,
-  completed: 0,
-  failed: 0,
-  killed: { parent: 0, user: 0, system: 0 },
-  refused: { depth_limit: 0, concurrency_limit: 0, budget: 0 },
-};
-const terminal = {
-  type: 'result',
-  subtype: 'success',
-  session_id: sessionId,
-  uuid,
-  is_error: false,
-  num_turns: 0,
-  duration_api_ms: 0,
-  total_cost_usd: 0,
-  modelUsage: {},
-  usage,
-  permission_denials: [],
-  subagent_stats: subagents,
-  safety_stops: 0,
-};
+});
+const usageWindow = (windowId: string, value: number, resetsAt: string | null) => ({
+  windowId,
+  remaining: { value, unit: 'percent' },
+  resetsAt,
+});
+const reported = [
+  usageWindow('five-hour', 50, '2026-10-23T18:20:00.448Z'),
+  usageWindow('weekly', 83, '2026-10-30T07:00:00.448Z'),
+  usageWindow('weekly-fable', 81, '2026-10-30T07:00:00.449Z'),
+];
 const bytes = (frames: unknown[]) =>
   Buffer.from(`${frames.map((frame) => JSON.stringify(frame)).join('\n')}\n`);
-const read = (frames: unknown[]) => {
-  const parser = new AnthropicUsageReader(sessionId);
-  parser.feed(bytes(frames));
-  return parser.finish(at);
-};
 
-test('local usage reports preserve server rows and unknown age without model work', () => {
-  const expected = read([init, local, assistant, terminal]);
-  assert.equal(expected.status, 'reported');
-  assert.equal(expected.observedAt, null);
-  assert.equal(expected.freshness, 'unknown');
-  assert.equal(expected.receivedAt, at);
-  assert.deepEqual(expected.windows, report.rate_limits.limits);
-  assert.deepEqual(expected.extraUsage, report.rate_limits.extra_usage);
-  assert.equal(expected.modelTurns, 0);
-  assert.equal(JSON.stringify(expected).includes('private'), false);
-  assert.equal(
-    read([init, { ...assistant, usage_report: { ...report, rate_limits: null } }, terminal]).status,
-    'unavailable',
-  );
-  assert.equal(
-    read([
-      init,
-      { ...assistant, usage_report: { ...report, rate_limits: { limits: null } } },
-      terminal,
-    ]).status,
-    'unavailable',
-  );
-  assert.equal(
-    read([
-      init,
-      { ...assistant, usage_report: { ...report, rate_limits: { limits: [] } } },
-      terminal,
-    ]).status,
-    'reported',
-  );
-  const raw = bytes([init, local, assistant, terminal]);
-  const chunked = new AnthropicUsageReader(sessionId);
-  for (const byte of raw) chunked.feed(Uint8Array.of(byte));
-  assert.deepEqual(chunked.finish(at), expected);
-  const drifted = {
-    ...report,
-    new_section: { anything: [1, 2] },
-    session: {
-      ...report.session,
-      model_usage: { 'a-model': { input_tokens: 12, cost: 0.4 }, 'another-model': {} },
-      new_total: 3,
+test('a usage read maps each reported limit and ignores what it does not show', () => {
+  const later = { later_field: { nested: [1] } };
+  const rows: {
+    name: string;
+    input: Buffer;
+    bytewise?: boolean;
+    status?: string;
+    windows?: unknown[];
+    error?: UsageReaderError['reason'];
+  }[] = [
+    { name: 'full report', input: bytes([init, assistant, terminal]), windows: reported },
+    {
+      name: 'full report one byte at a time',
+      input: bytes([init, assistant, terminal]),
+      bytewise: true,
+      windows: reported,
     },
-    rate_limits: {
-      ...report.rate_limits,
-      new_note: 'x',
-      limits: report.rate_limits.limits.map((row) => ({ ...row, new_flag: true })),
-      extra_usage: { ...report.rate_limits.extra_usage, new_tier: 'x' },
+    {
+      name: 'unknown limit kind past its cap',
+      input: bytes([
+        init,
+        withLimits([
+          ...limits,
+          { ...limits[0], kind: 'monthly_pool', percent: 110, resets_at: null },
+        ]),
+        terminal,
+      ]),
+      windows: [...reported, usageWindow('monthly_pool', 0, null)],
     },
-  };
-  assert.deepEqual(
-    read([
-      { ...init, new_field: 1 },
-      { ...local, new_field: 1 },
-      {
-        ...assistant,
-        new_field: 1,
-        local_command_run: { command: 'usage', args: '', new_field: 1 },
-        usage_report: drifted,
-        message: { ...assistant.message, new_field: 1, usage: { ...usage, new_counter: 0 } },
-      },
-      { ...terminal, new_field: 1, modelUsage: { 'a-model': { inputTokens: 12 } } },
-    ]),
-    expected,
-  );
-  for (const invalid of [
-    [assistant, terminal],
-    [init, assistant],
-    [init, local, terminal],
-    [init, assistant, assistant, terminal],
-    [init, assistant, terminal, local],
-    [init, { ...assistant, session_id: uuid }, terminal],
-    [init, { ...assistant, local_command_run: { command: 'other', args: '' } }, terminal],
-    [init, { ...assistant, local_command_outcome: { kind: 'failed' } }, terminal],
-    [
-      init,
-      {
-        ...assistant,
-        message: { ...assistant.message, content: [{ type: 'tool_use', text: 'private' }] },
-      },
-      terminal,
-    ],
-    [
-      init,
-      { ...assistant, message: { ...assistant.message, usage: { ...usage, output_tokens: 1 } } },
-      terminal,
-    ],
-    [init, { ...assistant, batch_tool_uses: [{}] }, terminal],
-    [init, assistant, { ...terminal, deferred_tool_use: {} }],
-    [init, assistant, { ...terminal, subagent_stats: [] }],
-    [init, assistant, { ...terminal, subagent_stats: { ...subagents, spawned: 1 } }],
-    [init, assistant, { ...terminal, queued_turn_count: 1 }],
-    [init, assistant, { ...terminal, safety_stops: 1 }],
-    [
-      init,
-      assistant,
-      {
-        ...terminal,
-        usage: { ...usage, server_tool_use: { web_search_requests: 1, web_fetch_requests: 0 } },
-      },
-    ],
-    [init, assistant, { ...terminal, usage: { ...usage, iterations: [{}] } }],
-    [init, assistant, { ...terminal, num_turns: 1 }],
-    [init, assistant, { ...terminal, duration_api_ms: 1 }],
-    [init, assistant, { ...terminal, total_cost_usd: 0.01 }],
-    [init, { type: 'rate_limit_event', session_id: sessionId }, assistant, terminal],
-    [init, { type: 'control_request', session_id: sessionId }, assistant, terminal],
-    [
-      init,
-      {
-        ...assistant,
-        usage_report: {
-          ...report,
-          rate_limits: { limits: [{ ...report.rate_limits.limits[0], percent: 101 }] },
+    {
+      name: 'unknown fields and frames',
+      input: bytes([
+        { ...init, ...later },
+        { type: 'rate_limit_event', ...later },
+        { type: 'system', subtype: 'status', ...later },
+        {
+          ...withLimits(
+            limits.map((row: { scope: object | null }) => ({
+              ...row,
+              ...later,
+              scope: row.scope && { ...row.scope, ...later },
+            })),
+          ),
+          ...later,
         },
-      },
-      terminal,
-    ],
-  ])
-    assert.throws(() => read(invalid), UsageReaderError);
-  for (const raw of [Buffer.from('{\n'), Buffer.from([0xff, 10]), Buffer.alloc(131073, 65)]) {
-    const parser = new AnthropicUsageReader(sessionId);
-    assert.throws(() => parser.feed(raw), UsageReaderError);
-    assert.throws(() => parser.finish(at), UsageReaderError);
+        { ...terminal, ...later },
+      ]),
+      windows: reported,
+    },
+    {
+      name: 'no rate limits',
+      input: bytes([init, withLimits(null), terminal]),
+      status: 'unavailable',
+      windows: [],
+    },
+    { name: 'no report', input: bytes([init, terminal]), error: 'no-usage-report' },
+    { name: 'no result', input: bytes([init, assistant]), error: 'no-result' },
+    {
+      name: 'error result',
+      input: bytes([init, assistant, { ...terminal, is_error: true }]),
+      error: 'client-error',
+    },
+    {
+      name: 'unreadable limit',
+      input: bytes([init, withLimits([{ ...limits[0], percent: '50%' }]), terminal]),
+      error: 'unreadable-report',
+    },
+    { name: 'not JSON', input: Buffer.from('{\n'), error: 'not-json' },
+    { name: 'not UTF-8', input: Buffer.from([0xff, 10]), error: 'not-json' },
+    { name: 'over the output limit', input: Buffer.alloc(131073, 65), error: 'output-limit' },
+  ];
+  for (const row of rows) {
+    const parser = new AnthropicUsageReader();
+    const read = () => {
+      if (row.bytewise) for (const byte of row.input) parser.feed(Uint8Array.of(byte));
+      else parser.feed(row.input);
+      return parser.finish(at);
+    };
+    if (row.error) {
+      assert.throws(
+        read,
+        (error: unknown) => error instanceof UsageReaderError && error.reason === row.error,
+        row.name,
+      );
+      continue;
+    }
+    const reading = read();
+    assert.equal(reading.status, row.status ?? 'reported', row.name);
+    assert.deepEqual(reading.windows, row.windows, row.name);
+    assert.deepEqual(reading.extraUsage, { is_enabled: false }, row.name);
+    assert.equal(reading.observedAt, null, row.name);
+    assert.equal(reading.freshness, 'unknown', row.name);
   }
-  const truncated = new AnthropicUsageReader(sessionId);
-  truncated.feed(Buffer.from('{'));
-  assert.throws(() => truncated.finish(at), UsageReaderError);
   const plan = anthropicUsageReaderPlan({ clientSha256: sha256, sessionId });
   assert.equal(plan.argv.at(-1), '/usage');
   assert.equal(plan.argv.includes('--print'), true);
@@ -363,7 +249,7 @@ test('the usage owner bounds output and refuses metadata before physical closure
     'stdout-limit',
     'stderr-limit',
     'group-present',
-    'model-turn',
+    'error-result',
     'deadline',
     'stopped',
     'unclosed',
@@ -391,9 +277,8 @@ test('the usage owner bounds output and refuses metadata before physical closure
       else if (stdout)
         yield bytes([
           init,
-          local,
           assistant,
-          mode === 'model-turn' ? { ...terminal, num_turns: 1 } : terminal,
+          mode === 'error-result' ? { ...terminal, is_error: true } : terminal,
         ]);
     }
     const request = {
@@ -458,7 +343,7 @@ test('the usage owner bounds output and refuses metadata before physical closure
             ? 'ownership'
             : mode === 'deadline' || mode === 'stopped'
               ? mode
-              : 'protocol',
+              : 'client-error',
       );
       assert(stopped.length > 0);
     }
@@ -468,7 +353,7 @@ test('the usage owner bounds output and refuses metadata before physical closure
 
 function refreshFixture(
   t: TestContext,
-  mode: 'success' | 'held' | 'unknown' | 'protocol' | 'large' = 'success',
+  mode: 'success' | 'held' | 'unknown' | 'error' | 'large' = 'success',
 ) {
   const directory = mkdtempSync(join(realpathSync(tmpdir()), 'ck-usage-'));
   const clock = createTestClock(at);
@@ -547,28 +432,14 @@ function refreshFixture(
               [
                 init,
                 mode === 'large'
-                  ? {
-                      ...assistant,
-                      usage_report: {
-                        ...report,
-                        rate_limits: {
-                          limits: Array.from({ length: 48 }, (_, index) => ({
-                            kind: '漢'.repeat(128),
-                            group: `${index}${'漢'.repeat(126)}`,
-                            severity: '漢'.repeat(128),
-                            percent: 50,
-                            resets_at: null,
-                            is_active: true,
-                            scope: {
-                              model: { display_name: '漢'.repeat(128) },
-                              surface: { display_name: '漢'.repeat(128) },
-                            },
-                          })),
-                        },
-                      },
-                    }
+                  ? withLimits(
+                      Array.from({ length: 64 }, () => ({
+                        ...limits[2],
+                        scope: { model: { display_name: '漢'.repeat(128) }, surface: null },
+                      })),
+                    )
                   : assistant,
-                mode === 'protocol' ? { ...terminal, num_turns: 1 } : terminal,
+                mode === 'error' ? { ...terminal, is_error: true } : terminal,
               ].map((frame) => ({ ...frame, session_id: selectedSession })),
             );
         }
@@ -647,7 +518,7 @@ test('manual usage consent and the age-unknown report survive exact retries and 
   assert.equal(retained?.reading?.observedAt, null);
   assert.equal(retained?.reading?.freshness, 'unknown');
   assert.equal(retained?.reading?.receivedAt, at);
-  assert.deepEqual(retained?.reading?.windows, report.rate_limits.limits);
+  assert.deepEqual(retained?.reading?.windows, reported);
   assert.equal(retained?.readingScopeHash, retained?.trust?.scopeHash);
   assert.equal((await f.controller.execute(request, 'local-owner')).outcome, 'already-applied');
   assert.equal(
@@ -703,7 +574,7 @@ test('manual usage Stop, failed cooldown and uncertain ownership never replay a 
     'applied',
   );
   const largeReading = large.status()?.reading;
-  assert(largeReading && Buffer.byteLength(JSON.stringify(largeReading)) > 65536);
+  assert.equal(largeReading?.windows.length, 64);
   await large.reopen();
   assert.deepEqual(large.status()?.reading, largeReading);
   const publicationFailure = refreshFixture(t);
@@ -725,7 +596,7 @@ test('manual usage Stop, failed cooldown and uncertain ownership never replay a 
   assert.equal(failedResult.reason, 'usage-read-failed');
   assert.equal(publicationFailure.calls(), 0);
   assert.equal(publicationFailure.status()?.readState, 'quiescent');
-  for (const mode of ['held', 'unknown', 'protocol'] as const) {
+  for (const mode of ['held', 'unknown', 'error'] as const) {
     const f = refreshFixture(t, mode);
     const trust = f.status()?.trust;
     assert(trust);
