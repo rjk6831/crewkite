@@ -604,6 +604,31 @@ test('a usage limit writes a system line, and auto handoff runs the same message
     off.adapters.get('google')?.requests[0]?.prompt ?? '',
     /^This thread moved from OpenAI to Google\. Reason: switched in the composer\.$/m,
   );
+
+  // Google answered last. A pick of Local in the composer, a Continue on Anthropic and a second
+  // pick of Local still leave Local starting cold, so it gets the packet from Google.
+  const pick = (family: ChatFamily): ChatModelSelection => ({
+    family,
+    model: `${family}-model`,
+    effort: 'default',
+  });
+  const { store, service, taskId } = off;
+  store.transaction(() => service.configure({ taskId, selection: pick('local') }));
+  store.transaction(() =>
+    service.handoff({ taskId, selection: pick('anthropic'), reason: 'manual' }),
+  );
+  store.transaction(() => service.configure({ taskId, selection: pick('local') }));
+  const local = turnReaches(off, 'done');
+  off.send('Keep going.', null);
+  await local;
+  assert.equal(
+    off.read().messages.at(-3)?.text,
+    'Continued on Anthropic from Google. Reason: switched in the composer.',
+  );
+  assert.match(
+    off.adapters.get('local')?.requests[0]?.prompt ?? '',
+    /^This thread moved from Google to Local\. Reason: switched in the composer\.$/m,
+  );
 });
 
 // Every connected family stops on its limit. At zero the catalog offers nothing. At 50 percent it

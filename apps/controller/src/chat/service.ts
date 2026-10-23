@@ -307,8 +307,9 @@ export class ChatService {
     if (left.length) return ownershipUnknown(left, 'switch providers');
     const stopped =
       effects && payload.reason === 'limit' ? this.stoppedOnLimit(task.id) : undefined;
-    // The person may have moved the thread already. The packet still names the family that stopped.
-    const from = stopped?.selection.family ?? thread.selection?.family;
+    // The composer changes the selection on every pick, so the packet names the family of the
+    // last assistant turn. A thread with no assistant turn yet moves from its selection.
+    const from = this.answeredOn(task.id) ?? thread.selection?.family;
     if (!from || from === payload.selection.family)
       return blocked('handoff-needs-another-provider', 'Pick a different provider to continue on.');
     const selection = this.deps.resolveSelection(task.id, payload.selection);
@@ -970,8 +971,9 @@ export class ChatService {
     // Sending on the provider the thread came from cancels the switch.
     if (pending && pending.from === selection.family) this.setHandoff(task.id, null);
     else if (pending) handoffFrom = pending.from;
-    // A family picked in the composer starts cold too, so the switch is a manual handoff.
-    else if (own) handoffFrom = this.switchedFrom(task.id, selection.family);
+    // A family picked in the composer starts cold too, so the switch is a manual handoff. A
+    // cancelled switch says nothing about which family answered last, so the check still runs.
+    if (own && !handoffFrom) handoffFrom = this.switchedFrom(task.id, selection.family);
     const turn = ChatTurnSchema.parse({
       id: this.deps.id('trn'),
       taskId: task.id,
@@ -998,13 +1000,18 @@ export class ChatService {
 
   /** The family of the last assistant turn, when it differs from the one about to answer. */
   private switchedFrom(taskId: string, family: ChatFamily): ChatFamily | null {
+    const last = this.answeredOn(taskId);
+    return last !== family ? last : null;
+  }
+
+  /** The family of the last assistant turn. A reviewer or advisor borrows a model and does not count. */
+  private answeredOn(taskId: string): ChatFamily | null {
     const row = this.deps.store.db
       .prepare(
         "SELECT body FROM chat_turns WHERE task_id=? AND json_extract(body,'$.role')='assistant' ORDER BY sequence DESC LIMIT 1",
       )
       .get(taskId);
-    const last = row ? ChatTurnSchema.parse(JSON.parse(row.body as string)) : undefined;
-    return last && last.selection.family !== family ? last.selection.family : null;
+    return row ? ChatTurnSchema.parse(JSON.parse(row.body as string)).selection.family : null;
   }
 
   /**
