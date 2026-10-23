@@ -141,60 +141,36 @@ test('provider discovery emits only correlated metadata and excludes private fie
       pendingNotice: true,
       reason: 'incomplete',
     },
-    ...[
-      { method: 'configWarning', params: { summary: privateText, details: null, extra: true } },
-      { method: 'account/updated', params: { authMode: 'future-auth', planType: null } },
-      {
-        method: 'configWarning',
-        params: {
-          summary: '',
-          details: null,
-          range: { start: { line: 0, column: 1 }, end: { line: 1, column: 1 } },
+    {
+      // Discovery reads only the remote control status, so a method, field or value a later
+      // client adds passes.
+      name: 'a notice passes whatever method, fields or values it carries',
+      notices: [
+        { method: 'warning', params: { message: privateText } },
+        { method: 'unknown/private-method', emittedAtMs: 1.5, params: { secret: privateText } },
+        { method: 'configWarning', params: { summary: privateText, details: 7, extra: true } },
+        { method: 'account/updated', params: { authMode: 'future-auth', planType: 'sci' } },
+        {
+          method: 'remoteControl/status/changed',
+          params: { status: 'disabled', serverName: privateText, extra: privateText },
         },
-      },
-      { method: 'unknown/private-method', params: { secret: privateText } },
-    ].map(
-      (value): Scenario => ({
-        name: 'malformed or unknown startup notice stops',
-        notices: [value],
-        reason: 'invalid-message',
-      }),
-    ),
-    ...[null, 1.5, Number.MAX_SAFE_INTEGER + 1, privateText].map(
-      (emittedAtMs): Scenario => ({
-        name: 'notification timestamp must be an optional safe integer',
-        notices: [{ method: 'configWarning', emittedAtMs, params: { summary: '', details: null } }],
-        reason: 'invalid-message',
-      }),
-    ),
-    ...[
-      {
-        status: 'connected',
-        serverName: privateText,
-        installationId: privateText,
-        environmentId: null,
-      },
-      { status: 'disabled', serverName: privateText, installationId: privateText },
-      {
-        status: 'disabled',
-        serverName: privateText,
-        installationId: privateText,
-        environmentId: null,
-        extra: privateText,
-      },
-      {
-        status: 'disabled',
-        serverName: privateText,
-        installationId: 'a'.repeat(4097),
-        environmentId: null,
-      },
-    ].map(
-      (params): Scenario => ({
-        name: 'unexpected or malformed remote status stops metadata',
-        notices: [{ method: 'remoteControl/status/changed', emittedAtMs: 1234, params }],
-        reason: 'invalid-message',
-      }),
-    ),
+      ],
+    },
+    {
+      name: 'remote control that is not disabled stops metadata',
+      notices: [
+        {
+          method: 'remoteControl/status/changed',
+          params: {
+            status: 'connecting',
+            serverName: privateText,
+            installationId: privateText,
+            environmentId: null,
+          },
+        },
+      ],
+      reason: 'invalid-message',
+    },
     {
       name: 'known notification cannot precede initialize response',
       wire: () =>
@@ -202,16 +178,6 @@ test('provider discovery emits only correlated metadata and excludes private fie
       reason: 'unexpected-message',
     },
     ...[
-      {
-        params: { summary: privateText, details: null, path: null },
-        fields: { path: 'null' as const },
-        extraParamsFields: false,
-      },
-      {
-        params: { summary: privateText, details: null, range: null },
-        fields: { range: 'null' as const },
-        extraParamsFields: false,
-      },
       {
         params: { summary: privateText, details: 7 },
         fields: { details: 'number' as const },
@@ -224,8 +190,8 @@ test('provider discovery emits only correlated metadata and excludes private fie
       },
     ].map(
       ({ params, fields, extraParamsFields }): Scenario => ({
-        name: 'refused notice reveals only fixed field kinds',
-        notices: [{ method: 'configWarning', params }],
+        name: 'refused server request reveals only fixed field kinds',
+        notices: [{ id: 7, method: 'configWarning', params }],
         reason: 'invalid-message',
         refusal: { kind: 'config-warning', fields, extraParamsFields },
       }),
@@ -389,6 +355,22 @@ test('provider discovery emits only correlated metadata and excludes private fie
         },
       }),
     ),
+    {
+      // Admission treats any type but rate_limit_reached as a refusal, so a new one is safe to pass.
+      name: 'a limit type a later client adds reaches admission',
+      change: (values) => {
+        values[2] = {
+          ordinaryUsageAllowed: false,
+          rateLimits: { limitId: 'codex', rateLimitReachedType: 'workspace_future_limit_reached' },
+        };
+        return values;
+      },
+      check: (value) =>
+        assert.equal(
+          value.limits.rateLimits.rateLimitReachedType,
+          'workspace_future_limit_reached',
+        ),
+    },
     ...[null, { availableCount: 0, credits: null }].map(
       (rateLimitResetCredits): Scenario => ({
         name: 'missing reset detail does not turn the reset count into a usage balance',
@@ -407,7 +389,7 @@ test('provider discovery emits only correlated metadata and excludes private fie
       { rateLimits: { credits: { hasCredits: true, unlimited: false, balance: 1 } } },
       { rateLimits: { credits: { hasCredits: true, unlimited: false, balance: '1'.repeat(129) } } },
       { rateLimits: { spendControlReached: 'false' } },
-      { rateLimits: { rateLimitReachedType: privateText } },
+      { rateLimits: { rateLimitReachedType: 'x'.repeat(65) } },
       { rateLimits: {}, rateLimitResetCredits: { availableCount: -1 } },
       { rateLimits: {}, rateLimitResetCredits: { availableCount: 1.5 } },
       { rateLimits: {}, rateLimitResetCredits: { availableCount: Number.MAX_SAFE_INTEGER + 1 } },
@@ -475,11 +457,6 @@ test('provider discovery emits only correlated metadata and excludes private fie
       reason: 'invalid-message',
     },
     {
-      name: 'turn notification',
-      wire: () => line({ method: 'turn/started', params: { text: privateText } }),
-      reason: 'invalid-message',
-    },
-    {
       name: 'error body is never echoed',
       wire: () =>
         line({ id: 1, error: { code: 500, message: privateText, data: { token: privateText } } }),
@@ -491,9 +468,9 @@ test('provider discovery emits only correlated metadata and excludes private fie
       reason: 'invalid-message',
     },
     {
-      name: 'unknown envelope field',
-      wire: () => line({ id: 1, result: {}, token: privateText }),
-      reason: 'invalid-message',
+      name: 'an envelope field a later client adds passes',
+      wire: (value, index) =>
+        line({ id: index + 1, result: value, jsonrpc: '2.0', token: privateText }),
     },
     { name: 'wrong result shape', change: () => [privateText], reason: 'invalid-message' },
     {
@@ -517,12 +494,11 @@ test('provider discovery emits only correlated metadata and excludes private fie
     { name: 'expired injected deadline', deadline: true, reason: 'deadline' },
     { name: 'partial transcript', change: (values) => values.slice(0, 2), reason: 'incomplete' },
     {
-      name: 'catalog requires another page',
+      name: 'a longer catalog keeps the first page the contract holds',
       change: (values) => {
-        values[3] = { ...catalog(), nextCursor: 'next-page' };
+        values[3] = { ...catalog(), nextCursor: '20' };
         return values;
       },
-      reason: 'catalog-incomplete',
     },
     {
       name: 'too many models',
