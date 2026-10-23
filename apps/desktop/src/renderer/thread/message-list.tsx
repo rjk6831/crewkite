@@ -1,5 +1,5 @@
 import { ArrowDown } from 'lucide-react';
-import { memo, type ReactNode, useLayoutEffect, useRef, useState } from 'react';
+import { memo, type ReactNode, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
 import { AttachmentChips } from './attach.tsx';
 import { FailureLine, PermissionCard, ThinkingCard, ToolCard } from './cards.tsx';
@@ -91,16 +91,21 @@ function UserRow({ item }: { item: Extract<ThreadItem, { kind: 'user' }> }) {
 export function MessageList({
   items,
   empty,
+  footer,
   onResolve,
   onOpenChanges,
 }: {
   items: readonly ThreadItem[];
   empty: ReactNode;
+  /** Sits after the last item and scrolls with the thread. */
+  footer?: ReactNode;
 } & TurnHandlers) {
   const scroller = useRef<HTMLDivElement>(null);
+  const column = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const [away, setAway] = useState(false);
   const last = items.at(-1);
+  const populated = items.length > 0;
   // Follow the newest output unless the person scrolled up. Sending a message always follows.
   // biome-ignore lint/correctness/useExhaustiveDependencies: every change to the items moves the view
   useLayoutEffect(() => {
@@ -109,6 +114,18 @@ export function MessageList({
     if (last?.kind === 'user' && last.pending) stick.current = true;
     if (stick.current) element.scrollTop = element.scrollHeight;
   }, [items, last]);
+  // The footer fills in after its own read, and a card opens or closes without a new item. Both
+  // change the height with no render here, so the column is watched for the follow.
+  useEffect(() => {
+    const element = column.current;
+    if (!element || !populated) return;
+    const watch = new ResizeObserver(() => {
+      const view = scroller.current;
+      if (view && stick.current) view.scrollTop = view.scrollHeight;
+    });
+    watch.observe(element);
+    return () => watch.disconnect();
+  }, [populated]);
   function onScroll() {
     const element = scroller.current;
     if (!element) return;
@@ -118,41 +135,44 @@ export function MessageList({
   }
   return (
     <div className="th-scroll-frame">
-      <div className="th-scroll" ref={scroller} onScroll={onScroll}>
-        <div className="th-column">
-          {items.length === 0
-            ? empty
-            : items.map((item) => {
-                switch (item.kind) {
-                  case 'user':
-                    return <UserRow key={item.key} item={item} />;
-                  case 'turn':
-                    return (
-                      <TurnRow
-                        key={item.key}
-                        turn={item.turn}
-                        onResolve={onResolve}
-                        onOpenChanges={onOpenChanges}
-                      />
-                    );
-                  case 'failure':
-                    return (
-                      <div key={item.key} className="th-row">
-                        <FailureLine failure={item.failure} />
-                      </div>
-                    );
-                  case 'system':
-                    return (
-                      <div key={item.key} className="th-system" role="status">
-                        <span>{item.text}</span>
-                      </div>
-                    );
-                  default:
-                    return null;
-                }
-              })}
+      {populated ? (
+        <div className="th-scroll" ref={scroller} onScroll={onScroll}>
+          <div className="th-column" ref={column}>
+            {items.map((item) => {
+              switch (item.kind) {
+                case 'user':
+                  return <UserRow key={item.key} item={item} />;
+                case 'turn':
+                  return (
+                    <TurnRow
+                      key={item.key}
+                      turn={item.turn}
+                      onResolve={onResolve}
+                      onOpenChanges={onOpenChanges}
+                    />
+                  );
+                case 'failure':
+                  return (
+                    <div key={item.key} className="th-row">
+                      <FailureLine failure={item.failure} />
+                    </div>
+                  );
+                case 'system':
+                  return (
+                    <div key={item.key} className="th-system" role="status">
+                      <span>{item.text}</span>
+                    </div>
+                  );
+                default:
+                  return null;
+              }
+            })}
+            {footer}
+          </div>
         </div>
-      </div>
+      ) : (
+        <div className="th-blank">{empty}</div>
+      )}
       {away && (
         <button
           type="button"

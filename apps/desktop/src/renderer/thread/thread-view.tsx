@@ -182,16 +182,23 @@ export function ThreadView({
             <PanelRight size={16} aria-hidden="true" />
           </button>
         </header>
-        <MessageList items={items} empty={empty} onResolve={resolve} onOpenChanges={openChanges} />
-        {offer && (
-          <LimitOfferCard
-            key={offer.turnId}
-            source={source}
-            taskId={task.id}
-            offer={offer}
-            onContinue={continueOnLimit}
-          />
-        )}
+        <MessageList
+          items={items}
+          empty={empty}
+          footer={
+            offer && (
+              <LimitOfferCard
+                key={offer.turnId}
+                source={source}
+                taskId={task.id}
+                offer={offer}
+                onContinue={continueOnLimit}
+              />
+            )
+          }
+          onResolve={resolve}
+          onOpenChanges={openChanges}
+        />
         <Composer
           key={task.id}
           source={source}

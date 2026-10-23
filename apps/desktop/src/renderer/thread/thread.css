@@ -116,11 +116,17 @@
   max-width: 760px;
   margin: 0 auto;
 }
+.th-blank {
+  display: grid;
+  place-items: center;
+  height: 100%;
+  padding: 24px 24px 56px;
+  overflow-y: auto;
+}
 .th-empty {
   display: grid;
   gap: 6px;
   justify-items: center;
-  margin-top: 22vh;
   text-align: center;
 }
 .th-empty > p:first-child {

@@ -244,7 +244,7 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
     const selection = thread.selection ?? SELECTION;
     const turnId = mint('trn');
     const user = messages.findLast(({ author }) => author.kind === 'user');
-    setTurn({
+    const turn: ChatTurn = {
       id: turnId,
       taskId,
       sequence: turns.length,
@@ -257,7 +257,8 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
       endedAt: null,
       failure: null,
       handoffFrom: null,
-    });
+    };
+    setTurn(turn);
     setThread({ activeTurnId: turnId });
     emit({
       type: 'turn.started',
@@ -267,6 +268,15 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
       effort: selection.effort,
       role: 'assistant',
     });
+    // The preview catalog has OpenAI at 0% left, so a turn on it stops on its limit as a real one would.
+    if (selection.family === 'openai') {
+      const failure = usageLimit();
+      emit({ type: 'turn.completed', turnId, stopReason: 'limit', failure });
+      setTurn({ ...turn, state: 'failed', endedAt: ago(0), failure });
+      live = [];
+      setThread({ activeTurnId: null });
+      return;
+    }
     await finish(turnId, selection, async () => {
       await stream(turnId, 'thinking', 'th', 'Preview turn. No provider runs here.');
       await stream(
