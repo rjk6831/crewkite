@@ -14,7 +14,7 @@ import {
   realpathSync,
 } from 'node:fs';
 import { arch, cpus, freemem, platform, totalmem } from 'node:os';
-import { basename, isAbsolute, join, relative } from 'node:path';
+import { basename, isAbsolute, join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
@@ -37,7 +37,6 @@ import {
   type ChatModelSelection,
   type CheckResult,
   CheckResultSchema,
-  CONVERSATION_CONTEXT_MEDIA_TYPE,
   type CombinedCheckContextSchema,
   CombinedDispatchPhaseSchema,
   type CombinedNativeReviewJob,
@@ -51,21 +50,10 @@ import {
   type CommandResult,
   CommandResultSchema,
   CommandSchema,
-  ConversationContextBundleSchema,
-  type ConversationContextRefs,
-  ConversationContextUsageSchema,
-  type ConversationEntry,
-  ConversationEntrySchema,
-  type ConversationModelCatalog,
-  ConversationModelCatalogSchema,
   type ConversationModelChoices,
   type ConversationModelReason,
   type ConversationModelRequest,
   ConversationModelRequestSchema,
-  type ConversationPlanningSelection,
-  ConversationPlanningSelectionSchema,
-  type ConversationTurnBinding,
-  ConversationTurnBindingSchema,
   canonicalJson,
   type Event,
   EventSchema,
@@ -78,7 +66,6 @@ import {
   type Grant,
   GrantSchema,
   HashSchema,
-  LimitsSchema,
   LocalAuthModeSchema,
   LocalEndpointSchema,
   type LocalHardwareStatus,
@@ -131,7 +118,6 @@ import {
   SnapshotSchema,
   type SnapshotScope,
   SnapshotScopeSchema,
-  SourceSchema,
   type Task,
   type TaskConversationState,
   TaskConversationStateSchema,
@@ -152,8 +138,7 @@ import type { ChatAdapter, ChatTurnRequest } from '../chat/adapter.ts';
 import { buildChatCatalog } from '../chat/catalog.ts';
 import { ChatService } from '../chat/service.ts';
 import { buildHandoff } from '../continuity/index.ts';
-import { captureConversationContext } from '../conversation/context.ts';
-import { type FrozenConversationTurn, TaskConversation } from '../conversation/conversation.ts';
+import { TaskConversation } from '../conversation/conversation.ts';
 import {
   CandidateEvidence,
   type CheckDefinition,
@@ -291,18 +276,11 @@ import {
   startLocalSecretInput,
 } from '../providers/local/secure-input.ts';
 import { openAiChatAdapter } from '../providers/openai/chat.ts';
-import {
-  type ConversationPlan,
-  conversationBindingHash,
-  conversationPlan,
-  startConversation,
-} from '../providers/openai/conversation.ts';
 import { OpenAiDiscovery } from '../providers/openai/discovery.ts';
 import {
   type RetainedOpenAiModelObservation,
   resolveOpenAiProjectSelection,
 } from '../providers/openai/execution-selection.ts';
-import { startOpenAiModelCatalogObservation } from '../providers/openai/model-catalog.ts';
 import { startNativeSession } from '../providers/openai/native-discovery.ts';
 import {
   type NativeProfileResolution,
@@ -335,7 +313,6 @@ import {
 import { projectPage, taskPage } from '../store/workspace.ts';
 import { availableAllowance, deriveWindow } from '../usage/index.ts';
 import {
-  chargedIntegrationMinutes,
   chargedMinutes,
   remainingBudgets,
   remainingCombinedBudgets,
@@ -796,58 +773,10 @@ function freezeNative<T>(value: T): T {
   return value;
 }
 
-/** Chat replies share the conversation log. Planning turns read planning entries only. */
-function planningEntry(
-  entry: ConversationEntry,
-): entry is Exclude<ConversationEntry, { kind: 'chat-assistant' | 'chat-system' }> {
-  return entry.kind !== 'chat-assistant' && entry.kind !== 'chat-system';
-}
-
-const ConversationConfigurationSchema = z.strictObject({
-  revision: z.number().int().nonnegative().safe(),
-  contractStatus: z.enum(['provisional', 'confirmed']),
-  contextCriteria: z.array(z.string().min(1).max(4096)).max(100),
-  selection: ConversationPlanningSelectionSchema,
-  routeId: RouteSchema.shape.id,
-  source: SourceSchema,
-  profileHash: HashSchema,
-  client: z
-    .strictObject({
-      executable: z.string().max(4096).refine(isAbsolute),
-      sha256: HashSchema,
-      version: z.string().min(1).max(200),
-    })
-    .nullable(),
-  locationHash: HashSchema.nullable(),
-  limits: LimitsSchema,
-  paused: z.boolean(),
-  adoptedProposal: z
-    .strictObject({
-      id: z.string(),
-      hash: HashSchema,
-      runId: RunSchema.shape.id,
-      revision: z.number().int().nonnegative().safe(),
-    })
-    .nullable(),
-  effectiveModel: z.string().min(1).max(200).nullable(),
-  effectiveEffort: z.string().min(1).max(200).nullable(),
-  modelCatalog: ConversationModelRequestSchema.shape.observation.optional(),
-  modelFailure: z.enum(['model-unavailable', 'effort-unavailable']).optional(),
-});
-type ConversationConfiguration = z.infer<typeof ConversationConfigurationSchema>;
 type ConversationModelFailureReason = Exclude<
   ConversationModelReason,
   'available' | 'not-observed'
 >;
-type ConversationRuntime = {
-  input: ConversationPlan;
-  attempt: Attempt;
-  authorityHash: string;
-  stopped: boolean;
-  handle?: ReturnType<typeof startConversation>;
-  done: Promise<void>;
-};
-
 const LocalOperationBindingSchema = z.strictObject({
   version: z.union([z.literal(1), z.literal(2)]),
   operationId: CommandIdSchema,
@@ -954,18 +883,6 @@ const OpenAiUsageReadSchema = z.strictObject({
   lastObservedAt: TimestampSchema.nullable().optional(),
   commandId: CommandIdSchema.optional(),
 });
-const TaskModelCatalogOperationSchema = z.strictObject({
-  version: z.literal(1),
-  commandId: CommandIdSchema,
-  commandHash: HashSchema,
-  taskId: TaskIdSchema,
-  taskRevision: RevisionSchema,
-  sourceHash: HashSchema,
-  profileHash: HashSchema,
-  state: z.enum(['intent', 'owned', 'quiescent', 'unknown']),
-  groups: z.array(z.number().int().positive().safe()).max(2),
-});
-
 type LocalWriterRuntime = {
   plan: LocalPrepared;
   binding: LocalStart['binding'];
@@ -1056,8 +973,6 @@ export class Controller {
     string,
     { stop: () => void; done: Promise<unknown> }
   >();
-  private readonly conversationWorkers = new Map<string, ConversationRuntime>();
-  private readonly pendingConversationLaunches = new Set<string>();
   private conversation!: TaskConversation;
   private readonly owner: DatabaseSync;
   private closed = false;
@@ -1072,15 +987,6 @@ export class Controller {
     stopped: boolean;
     handle?: { stop: () => void };
     done: Promise<void>;
-  };
-  private taskModelCatalogRead?: {
-    key: string;
-    hash: string;
-    principal: string;
-    taskId: string;
-    stopped: boolean;
-    stop?: () => void;
-    promise: Promise<CommandResult>;
   };
   private usageResolution: GoogleUsageClientResolution;
   private googleUsageReport?: {
@@ -1182,16 +1088,7 @@ export class Controller {
         },
       });
       this.profiles = this.resolveProfiles();
-      this.conversation = new TaskConversation(this.store, {
-        now: this.now,
-        messageId: () => this.id('msg'),
-        publish: (entries, task) => {
-          this.event('task.updated', task.id, task.revision, task);
-          for (const entry of entries)
-            this.event('conversation.entry', task.id, task.revision, entry);
-        },
-        ownsTurn: (binding, phase) => this.ownsConversationTurn(binding, phase),
-      });
+      this.conversation = new TaskConversation(this.store);
       this.recover();
       this.nativeConnections().recover();
       this.anthropicUsage().recover();
@@ -1438,9 +1335,6 @@ export class Controller {
         next: 'Send a valid protocol 1 command.',
       };
     const command = parsed.data;
-    try {
-      this.reconcileTaskModelCatalogOperations();
-    } catch {}
     if (
       [
         'PrepareProjectCommand',
@@ -1478,19 +1372,7 @@ export class Controller {
       return this.checkNativeConnection(command, principal);
     if (command.command === 'RefreshAnthropicUsage' || command.command === 'StopAnthropicUsage')
       return this.anthropicUsage().execute(command);
-    if (command.command === 'RefreshTaskModelCatalog')
-      return this.refreshTaskModelCatalog(command, principal);
-    if (
-      command.command === 'StopRun' &&
-      this.taskModelCatalogRead?.taskId === command.payload.taskId
-    ) {
-      this.taskModelCatalogRead.stopped = true;
-      this.taskModelCatalogRead.stop?.();
-      await this.taskModelCatalogRead.promise;
-    }
     if (command.command === 'ObserveUsage') return this.observeUsageCommand(command, principal);
-    if (command.command === 'CaptureConversationContext')
-      return this.captureConversationContextCommand(command, principal);
     const preparing = this.verificationPreparation;
     if (preparing?.key === command.key)
       return preparing.hash === hashCanonical(command) && preparing.principal === principal
@@ -1632,7 +1514,6 @@ export class Controller {
     preflightFailure?: CommandResult,
     verification?: PreparedVerification,
     acpContext?: CapturedContext,
-    contextCapture?: ReturnType<typeof captureConversationContext>,
   ): CommandResult {
     if (this.closed && !preflightFailure)
       return { outcome: 'blocked', reason: 'controller-closing' };
@@ -1662,9 +1543,7 @@ export class Controller {
         }
         const stale = this.checkRevision(command);
         const result = CommandResultSchema.parse(
-          stale ??
-            preflightFailure ??
-            this.apply(command, effects, verification, acpContext, contextCapture),
+          stale ?? preflightFailure ?? this.apply(command, effects, verification, acpContext),
         );
         this.store.saveReceipt(command.key, hash, principal, result);
         return result;
@@ -1683,114 +1562,6 @@ export class Controller {
     return effects.length > 0 && result.outcome === 'outcome-unknown'
       ? (this.store.receipt(command.key)?.result ?? result)
       : result;
-  }
-
-  private captureConversationContextCommand(
-    command: Extract<Command, { command: 'CaptureConversationContext' }>,
-    principal: string,
-  ): CommandResult {
-    if (this.store.receipt(command.key) || this.checkRevision(command))
-      return this.commitCommand(command, principal);
-    let capture: ReturnType<typeof captureConversationContext>;
-    try {
-      const root = this.projectPath(command.payload.projectId);
-      if (!root) throw Error('project-not-found');
-      const source = inspectSource(command.payload.projectId, root);
-      if (source.base !== command.payload.base) throw Error('conversation-context-source-changed');
-      capture = captureConversationContext({
-        projectRoot: root,
-        projectId: command.payload.projectId,
-        base: command.payload.base,
-        selections: command.payload.selections.map((selection) => {
-          const path = relative(root, selection.path);
-          if (isAbsolute(path) || path === '..' || path.startsWith('../'))
-            throw Error('conversation-context-outside-project');
-          return { ...selection, path };
-        }),
-      });
-      if (
-        this.closed ||
-        this.projectPath(command.payload.projectId) !== root ||
-        hashCanonical(inspectSource(command.payload.projectId, root)) !== hashCanonical(source)
-      )
-        throw Error('conversation-context-source-changed');
-    } catch (error) {
-      const message = error instanceof Error ? error.message : '';
-      const reason = [
-        'conversation-context-source-changed',
-        'conversation-context-outside-project',
-      ].includes(message)
-        ? message
-        : /8192|32768|32 files|four context/.test(message)
-          ? 'conversation-context-too-large'
-          : 'conversation-context-unavailable';
-      return this.commitCommand(command, principal, {
-        outcome: 'blocked',
-        reason,
-        next: 'Select bounded text in the registered project at its current commit.',
-      });
-    }
-    return this.commitCommand(command, principal, undefined, undefined, undefined, capture);
-  }
-
-  private conversationContext(
-    refs: ConversationContextRefs | undefined,
-    projectId: string,
-    base: string,
-  ) {
-    return (refs ?? []).map((ref) => {
-      const key = `conversation-context:${ref.artifactId}`;
-      const retained = this.nativeRecord(key, 4096);
-      const proof = z
-        .strictObject({
-          artifactId: ArtifactSchema.shape.id,
-          hash: HashSchema,
-          projectId: ProjectSchema.shape.id,
-          base: z.string().regex(/^[a-f0-9]{40}$/),
-          projectRevision: z.number().int().nonnegative().safe(),
-          commandKey: z.string(),
-          commandHash: HashSchema,
-        })
-        .parse(retained.value);
-      const capture = this.store.receipt(proof.commandKey);
-      const artifact = ArtifactSchema.parse(this.store.get('artifact', ref.artifactId));
-      if (
-        this.store.receipt(key)?.principal !== 'local-owner' ||
-        this.store.receipt(key)?.hash !== retained.artifact.hash ||
-        capture?.principal !== 'local-owner' ||
-        capture.hash !== proof.commandHash ||
-        capture.result.outcome !== 'applied' ||
-        hashCanonical(capture.result.entity) !== hashCanonical(artifact)
-      )
-        throw Error('conversation-context-invalid');
-      if (
-        proof.artifactId !== artifact.id ||
-        proof.hash !== ref.hash ||
-        proof.projectId !== projectId ||
-        proof.base !== base ||
-        artifact.hash !== ref.hash ||
-        artifact.bytes > 32768 ||
-        artifact.mediaType !== CONVERSATION_CONTEXT_MEDIA_TYPE
-      )
-        throw Error('conversation-context-invalid');
-      const bytes = this.artifacts.read(ref.hash);
-      const bundle = ConversationContextBundleSchema.parse(JSON.parse(bytes.toString('utf8')));
-      if (
-        bundle.projectId !== projectId ||
-        bundle.base !== base ||
-        bytes.length !== artifact.bytes ||
-        hashCanonical(bundle) !== ref.hash ||
-        bundle.files.some((file) => {
-          const text = Buffer.from(file.text);
-          return (
-            text.length !== file.bytes ||
-            createHash('sha256').update(text).digest('hex') !== file.hash
-          );
-        })
-      )
-        throw Error('conversation-context-invalid');
-      return { artifactId: artifact.id, hash: artifact.hash, bundle };
-    });
   }
 
   workspaceState() {
@@ -2025,8 +1796,6 @@ export class Controller {
     if (route?.family === 'anthropic' && !route.fake) return this.anthropicUsage().blocker();
     if (route?.family !== 'openai' || route.fake) return;
     try {
-      if (this.taskModelCatalogRead) return 'openai-metadata-ownership-pending';
-      if (this.taskModelCatalogOwnershipUnknown()) return 'openai-metadata-ownership-unknown';
       const state = this.openAiUsageState();
       if (state?.state === 'unknown') return 'openai-metadata-ownership-unknown';
       if (state && state.state !== 'quiescent') return 'openai-metadata-ownership-pending';
@@ -2041,8 +1810,6 @@ export class Controller {
   ): Promise<void> | undefined {
     try {
       if (this.closed || !this.options.openAiUsageClient) return;
-      this.reconcileTaskModelCatalogOperations();
-      if (this.taskModelCatalogRead || this.taskModelCatalogOwnershipUnknown()) return;
       if (this.openAiUsageRead) return this.openAiUsageRead.done;
       const profile = this.options.openAiUsageClient();
       if (
@@ -2870,265 +2637,6 @@ export class Controller {
     return result;
   }
 
-  private refreshTaskModelCatalog(
-    command: Extract<Command, { command: 'RefreshTaskModelCatalog' }>,
-    principal: string,
-  ): Promise<CommandResult> {
-    const hash = hashCanonical(command);
-    const receipt = this.store.receipt(command.key);
-    if (receipt && (receipt.hash !== hash || receipt.principal !== principal))
-      return Promise.resolve({ outcome: 'denied', reason: 'idempotency-key-reused' });
-    if (receipt)
-      return Promise.resolve({
-        ...receipt.result,
-        ...(receipt.result.outcome === 'applied' ? { outcome: 'already-applied' as const } : {}),
-      });
-    this.reconcileTaskModelCatalogOperations();
-    const active = this.taskModelCatalogRead;
-    if (active)
-      return active.key === command.key && active.hash === hash && active.principal === principal
-        ? active.promise
-        : Promise.resolve({ outcome: 'blocked', reason: 'openai-metadata-ownership-pending' });
-    const task = this.store.get<Task>('task', command.payload.taskId);
-    if (!task) return Promise.resolve({ outcome: 'blocked', reason: 'task-not-found' });
-    if (task.revision !== command.expectedRevision)
-      return Promise.resolve({ outcome: 'stale-revision', revision: task.revision });
-    if (this.taskModelCatalogOwnershipUnknown())
-      return Promise.resolve({
-        outcome: 'outcome-unknown',
-        reason: 'openai-metadata-ownership-unknown',
-      });
-    const usage = this.openAiUsageState();
-    if (usage?.state === 'unknown')
-      return Promise.resolve({
-        outcome: 'outcome-unknown',
-        reason: 'openai-metadata-ownership-unknown',
-      });
-    if (
-      this.openAiUsageRead ||
-      (usage && usage.state !== 'quiescent') ||
-      this.taskOperationRuntime?.busyTask(task.id) ||
-      this.store.intents().some((intent) => {
-        if (intent.state === 'stopped') return false;
-        const route = this.store.get<Route>('route', intent.route_id);
-        return !route || (route.family === 'openai' && !route.fake);
-      })
-    )
-      return Promise.resolve({ outcome: 'blocked', reason: 'openai-task-active' });
-    const runtime = {
-      key: command.key,
-      hash,
-      principal,
-      taskId: task.id,
-      stopped: false,
-      stop: undefined as (() => void) | undefined,
-      promise: undefined as unknown as Promise<CommandResult>,
-    };
-    runtime.promise = Promise.resolve()
-      .then(() => this.readTaskModelCatalog(command, principal, runtime))
-      .finally(() => {
-        if (this.taskModelCatalogRead === runtime) this.taskModelCatalogRead = undefined;
-      });
-    this.taskModelCatalogRead = runtime;
-    return runtime.promise;
-  }
-
-  private async readTaskModelCatalog(
-    command: Extract<Command, { command: 'RefreshTaskModelCatalog' }>,
-    principal: string,
-    runtime: NonNullable<Controller['taskModelCatalogRead']>,
-  ): Promise<CommandResult> {
-    const commandHash = hashCanonical(command);
-    const task = this.store.get<Task>('task', command.payload.taskId);
-    const projectPath = task && this.projectPath(task.projectId);
-    if (!task || task.revision !== command.expectedRevision || !projectPath)
-      return task
-        ? { outcome: 'stale-revision', revision: task.revision }
-        : { outcome: 'blocked', reason: 'task-not-found' };
-    const source = inspectSource(task.projectId, projectPath);
-    const profile = this.profileFor(command.payload.profileId);
-    if (
-      !profile.facts.available ||
-      profile.facts.family !== 'openai' ||
-      !profile.client ||
-      !profile.environment ||
-      !profile.locationHash
-    )
-      return { outcome: 'blocked', reason: 'openai-model-catalog-unavailable' };
-    const profileBindingHash = hashCanonical({
-      facts: profile.facts,
-      client: profile.client,
-      locationHash: profile.locationHash,
-    });
-    const operation = TaskModelCatalogOperationSchema.parse({
-      version: 1,
-      commandId: command.key,
-      commandHash,
-      taskId: task.id,
-      taskRevision: task.revision,
-      sourceHash: hashCanonical(source),
-      profileHash: profileBindingHash,
-      state: 'intent',
-      groups: [],
-    });
-    const directory = join(this.home, 'native', `task-model-catalog-${command.key}`);
-    try {
-      mkdirSync(directory, { recursive: true, mode: 0o700 });
-      this.store.transaction(() => this.saveTaskModelCatalogOperation(operation));
-    } catch {
-      return { outcome: 'blocked', reason: 'openai-model-catalog-storage-failed' };
-    }
-    const operationCurrent = () => {
-      const savedOperation = this.taskModelCatalogOperation(task.id);
-      if (
-        savedOperation?.commandId !== operation.commandId ||
-        savedOperation.commandHash !== operation.commandHash ||
-        !['intent', 'owned', 'quiescent'].includes(savedOperation.state)
-      )
-        throw Error('Model catalog ownership changed.');
-      return savedOperation;
-    };
-    const semanticCurrent = () => {
-      if (this.closed || runtime.stopped || this.taskModelCatalogRead !== runtime)
-        throw Error('Model catalog read is no longer current.');
-      const savedTask = this.store.get<Task>('task', task.id);
-      const savedPath = savedTask && this.projectPath(savedTask.projectId);
-      const savedProfile = this.profileFor(command.payload.profileId);
-      const savedOperation = operationCurrent();
-      if (
-        !savedTask ||
-        savedTask.revision !== operation.taskRevision ||
-        !savedPath ||
-        hashCanonical(inspectSource(savedTask.projectId, savedPath)) !== operation.sourceHash ||
-        hashCanonical({
-          facts: savedProfile.facts,
-          client: savedProfile.client,
-          locationHash: savedProfile.locationHash,
-        }) !== operation.profileHash
-      )
-        throw Error('Model catalog binding changed.');
-      return savedOperation;
-    };
-    let handle: ReturnType<typeof startOpenAiModelCatalogObservation> | undefined;
-    let launchUncertain = false;
-    try {
-      const nativeSpawn = this.options.nativeSpawn ?? spawn;
-      handle = startOpenAiModelCatalogObservation(
-        profile,
-        { directory, repositoryRoot: this.home },
-        {
-          timeoutMs: 20000,
-          observedAt: this.now,
-          schedule: this.options.schedule,
-          spawn: (executable, args, options) => {
-            try {
-              return nativeSpawn(executable, args, options);
-            } catch (error) {
-              launchUncertain = true;
-              throw error;
-            }
-          },
-          lifecycle: {
-            beforePhase: () => {
-              this.store.transaction(() => {
-                const saved = semanticCurrent();
-                this.saveTaskModelCatalogOperation({
-                  ...saved,
-                  state: 'intent',
-                  groups: [],
-                });
-              });
-            },
-            owned: (_phase, group) => {
-              this.store.transaction(() => {
-                const saved = operationCurrent();
-                this.saveTaskModelCatalogOperation({
-                  ...saved,
-                  state: 'owned',
-                  groups: [...new Set([...saved.groups, group])],
-                });
-              });
-            },
-            quiescent: (_phase, group) => {
-              this.store.transaction(() => {
-                const saved = operationCurrent();
-                const groups = saved.groups.filter((candidate) => candidate !== group);
-                this.saveTaskModelCatalogOperation({
-                  ...saved,
-                  state: groups.length ? 'owned' : 'quiescent',
-                  groups,
-                });
-              });
-            },
-          },
-        },
-      );
-      runtime.stop = handle.stop;
-      if (this.closed || runtime.stopped || this.taskModelCatalogRead !== runtime) handle.stop();
-      const outcome = await handle.result;
-      const saved = semanticCurrent();
-      if (
-        outcome.reason ||
-        !outcome.quiescent ||
-        !outcome.metadata ||
-        saved.state !== 'quiescent' ||
-        saved.groups.length
-      )
-        throw Error('Model catalog discovery was not retained.');
-      const catalog = TaskModelCatalogSchema.parse({
-        ...outcome.metadata,
-        origin: 'connection-metadata',
-        taskId: task.id,
-        taskRevision: task.revision,
-        source,
-      });
-      const result = this.store.transaction(() => {
-        semanticCurrent();
-        const artifact = this.nativeArtifact(catalog);
-        const catalogKey = `task-model-catalog:${task.id}`;
-        this.store.db.prepare('DELETE FROM receipts WHERE command_key=?').run(catalogKey);
-        this.store.saveReceipt(catalogKey, artifact.hash, 'local-owner', {
-          outcome: 'applied',
-          entity: artifact,
-        });
-        const applied = { outcome: 'applied' as const, entity: artifact };
-        this.store.saveReceipt(command.key, commandHash, principal, applied);
-        return applied;
-      });
-      return result;
-    } catch {
-      let ownershipUnknown = false;
-      try {
-        this.store.transaction(() => {
-          const saved = this.taskModelCatalogOperation(task.id);
-          if (saved?.commandId !== command.key || saved.state === 'quiescent') return;
-          const observedGroups = [...new Set([...saved.groups, ...(handle?.groups ?? [])])];
-          const activeGroups = observedGroups.filter((group) => !groupAbsent(group));
-          ownershipUnknown = launchUncertain || activeGroups.length > 0;
-          this.saveTaskModelCatalogOperation({
-            ...saved,
-            state: ownershipUnknown ? 'unknown' : 'quiescent',
-            groups: activeGroups,
-          });
-        });
-      } catch {
-        ownershipUnknown = true;
-      }
-      const result: CommandResult = {
-        outcome: ownershipUnknown ? ('outcome-unknown' as const) : 'blocked',
-        reason: ownershipUnknown
-          ? 'openai-metadata-ownership-unknown'
-          : 'openai-model-catalog-unavailable',
-      };
-      try {
-        this.store.transaction(() =>
-          this.store.saveReceipt(command.key, commandHash, principal, result),
-        );
-      } catch {}
-      return result;
-    }
-  }
-
   private observeUsageCommand(
     command: Extract<Command, { command: 'ObserveUsage' }>,
     principal: string,
@@ -3548,11 +3056,6 @@ export class Controller {
       this.openAiUsageRead.handle?.stop();
       native.push(this.openAiUsageRead.done);
     }
-    if (this.taskModelCatalogRead) {
-      this.taskModelCatalogRead.stopped = true;
-      this.taskModelCatalogRead.stop?.();
-      native.push(this.taskModelCatalogRead.promise);
-    }
     if (this.usageRead) {
       this.usageRead.abort.abort();
       native.push(this.usageRead.promise);
@@ -3582,11 +3085,6 @@ export class Controller {
       native.push(this.localOperation.done);
     }
     for (const runtime of this.localWriters.values()) {
-      runtime.stopped = true;
-      runtime.handle?.stop();
-      native.push(runtime.done);
-    }
-    for (const runtime of this.conversationWorkers.values()) {
       runtime.stopped = true;
       runtime.handle?.stop();
       native.push(runtime.done);
@@ -3669,17 +3167,9 @@ export class Controller {
         };
       return;
     }
-    if (command.command === 'CaptureConversationContext') {
-      const project = this.store.get<Project>('project', command.payload.projectId);
-      if (!project) return { outcome: 'blocked', reason: 'project-not-found' };
-      if (project.revision !== command.expectedRevision)
-        return { outcome: 'stale-revision', entity: project, revision: project.revision };
-      return;
-    }
     if (
       command.command === 'RegisterProject' ||
       command.command === 'CreateTask' ||
-      command.command === 'CreateTaskDiscussion' ||
       command.command === 'ObserveUsage' ||
       command.command === 'InitializeGoogleAcp' ||
       command.command === 'AuthenticateGoogleAcp' ||
@@ -3713,7 +3203,6 @@ export class Controller {
     effects: (() => void)[],
     verification?: PreparedVerification,
     acpContext?: CapturedContext,
-    contextCapture?: ReturnType<typeof captureConversationContext>,
   ): CommandResult {
     if (
       'taskId' in command.payload &&
@@ -3743,8 +3232,6 @@ export class Controller {
           'StartCandidateEvaluation',
           'StartCandidateReview',
           'AcceptCandidate',
-          'ConfigureTaskConversation',
-          'AdoptTaskPlan',
           'ResumeRun',
           'SwitchRoute',
           'PrepareCombinedRun',
@@ -3762,24 +3249,6 @@ export class Controller {
           outcome: 'blocked',
           reason: 'combined-member-owned',
           next: 'Inspect the parent combined run. Child work cannot be accepted independently.',
-        };
-    }
-    if (
-      command.command === 'PrepareRun' ||
-      command.command === 'PrepareNativeRun' ||
-      command.command === 'PrepareCombinedRun'
-    ) {
-      const config = this.conversationConfiguration(command.payload.taskId);
-      if (
-        config &&
-        (['attempts', 'minutes', 'concurrency'] as const).some(
-          (axis) => command.payload.policy.limits[axis] > config.limits[axis],
-        )
-      )
-        return {
-          outcome: 'blocked',
-          reason: 'task-limit-exceeded',
-          next: 'Amend the total task limits explicitly before requesting a larger execution envelope.',
         };
     }
     if (
@@ -3880,13 +3349,6 @@ export class Controller {
             state: this.conversationState(command.payload.taskId),
           },
         };
-      case 'CreateTaskDiscussion':
-      case 'ConfigureTaskConversation':
-      case 'SendTaskMessage':
-      case 'QueueTaskGuidance':
-      case 'AnswerTaskQuestion':
-      case 'AdoptTaskPlan':
-        return this.conversationCommand(command, effects);
       case 'InitializeGoogleAcp':
       case 'AuthenticateGoogleAcp':
       case 'DiscoverGoogleAcp':
@@ -3894,34 +3356,6 @@ export class Controller {
         return this.applyAcpSetup(command, effects);
       case 'ObserveUsage':
         return this.observeUsage(command, effects);
-      case 'CaptureConversationContext': {
-        if (
-          !contextCapture ||
-          contextCapture.bundle.projectId !== command.payload.projectId ||
-          contextCapture.bundle.base !== command.payload.base
-        )
-          return { outcome: 'blocked', reason: 'conversation-context-unavailable' };
-        const artifact = ArtifactSchema.parse({
-          id: this.id('art'),
-          ...this.artifacts.publish(contextCapture.content),
-          mediaType: CONVERSATION_CONTEXT_MEDIA_TYPE,
-        });
-        this.saveArtifacts([artifact]);
-        const proof = this.nativeArtifact({
-          artifactId: artifact.id,
-          hash: artifact.hash,
-          projectId: command.payload.projectId,
-          base: command.payload.base,
-          projectRevision: command.expectedRevision,
-          commandKey: command.key,
-          commandHash: hashCanonical(command),
-        });
-        this.store.saveReceipt(`conversation-context:${artifact.id}`, proof.hash, 'local-owner', {
-          outcome: 'applied',
-          entity: proof,
-        });
-        return { outcome: 'applied', entity: artifact };
-      }
       case 'RegisterProject': {
         let path: string;
         try {
@@ -4806,75 +4240,6 @@ export class Controller {
     }
   }
 
-  private conversationConfiguration(taskId: string): ConversationConfiguration | undefined {
-    const value = this.store.conversationTask(taskId);
-    return value === undefined ? undefined : ConversationConfigurationSchema.parse(value);
-  }
-
-  private saveConversationConfiguration(taskId: string, value: ConversationConfiguration) {
-    this.store.putConversationTask(taskId, ConversationConfigurationSchema.parse(value));
-  }
-
-  private taskModelCatalogOperation(taskId: string) {
-    const key = `task-model-catalog-operation:${taskId}`;
-    return this.store.receipt(key)
-      ? TaskModelCatalogOperationSchema.parse(this.nativeRecord(key, 4096).value)
-      : undefined;
-  }
-
-  private reconcileTaskModelCatalogOperations() {
-    const rows = this.store.db
-      .prepare(
-        "SELECT command_key FROM receipts WHERE command_key LIKE 'task-model-catalog-operation:%'",
-      )
-      .all() as { command_key: string }[];
-    for (const { command_key } of rows) {
-      const operation = TaskModelCatalogOperationSchema.parse(
-        this.nativeRecord(command_key, 4096).value,
-      );
-      if (
-        operation.state !== 'quiescent' &&
-        operation.groups.length > 0 &&
-        operation.groups.every(groupAbsent)
-      )
-        this.store.transaction(() =>
-          this.saveTaskModelCatalogOperation({
-            ...operation,
-            state: 'quiescent',
-            groups: [],
-          }),
-        );
-    }
-  }
-
-  private taskModelCatalogOwnershipUnknown() {
-    try {
-      const rows = this.store.db
-        .prepare(
-          "SELECT command_key FROM receipts WHERE command_key LIKE 'task-model-catalog-operation:%'",
-        )
-        .all() as { command_key: string }[];
-      return rows.some(
-        ({ command_key }) =>
-          TaskModelCatalogOperationSchema.parse(this.nativeRecord(command_key, 4096).value)
-            .state !== 'quiescent',
-      );
-    } catch {
-      return true;
-    }
-  }
-
-  private saveTaskModelCatalogOperation(value: z.infer<typeof TaskModelCatalogOperationSchema>) {
-    const operation = TaskModelCatalogOperationSchema.parse(value);
-    const key = `task-model-catalog-operation:${operation.taskId}`;
-    const artifact = this.nativeArtifact(operation);
-    this.store.db.prepare('DELETE FROM receipts WHERE command_key=?').run(key);
-    this.store.saveReceipt(key, artifact.hash, 'local-owner', {
-      outcome: 'applied',
-      entity: artifact,
-    });
-  }
-
   private taskModelCatalogReference(taskId: string) {
     const receipt = this.store.receipt(`task-model-catalog:${taskId}`);
     if (!receipt?.result.entity) return;
@@ -4916,96 +4281,19 @@ export class Controller {
     taskId: string,
     reference: ConversationModelRequest['observation'],
     prepared = false,
-  ): ModelCatalogObservation {
+  ): TaskModelCatalog {
     const artifact = this.store.get<Artifact>('artifact', reference.artifactId);
     if (!artifact || artifact.hash !== reference.hash) throw Error('observation-missing');
     if (artifact.bytes > 32768) throw Error('catalog-unavailable');
     const parsed = ModelCatalogObservationSchema.parse(
       JSON.parse(this.artifacts.read(artifact.hash).toString('utf8')),
     );
-    return 'origin' in parsed
-      ? this.taskModelCatalog(taskId, reference, prepared)
-      : this.conversationCatalog(taskId, reference);
+    // Only a task catalog can back a model request. A catalog a planning turn retained is refused.
+    if (!('origin' in parsed)) throw Error('observation-stale');
+    return this.taskModelCatalog(taskId, reference, prepared);
   }
 
-  private conversationCatalog(
-    taskId: string,
-    reference: ConversationModelRequest['observation'],
-  ): ConversationModelCatalog {
-    const artifact = this.store.get<Artifact>('artifact', reference.artifactId);
-    if (!artifact || artifact.hash !== reference.hash) throw Error('observation-missing');
-    if (artifact.bytes > 32768) throw Error('catalog-unavailable');
-    const content = this.artifacts.read(artifact.hash);
-    if (content.length !== artifact.bytes) throw Error('catalog-unavailable');
-    const catalog = ConversationModelCatalogSchema.parse(JSON.parse(content.toString('utf8')));
-    const retained = this.nativeRecord(`conversation-model-catalog:${catalog.attemptId}`, 32768);
-    const attempt = this.store.get<Attempt>('attempt', catalog.attemptId);
-    const run = this.store.get<Run>('run', catalog.runId);
-    const route = attempt && this.store.get<Route>('route', attempt.routeId);
-    const intent = this.store.intents().find((value) => value.attempt_id === catalog.attemptId);
-    const completion = this.nativeRecord(`conversation-completion:${catalog.attemptId}`, 4096)
-      .value as {
-      attemptId: string;
-      quiescent: boolean;
-      submitted: boolean;
-      reason: string | null;
-    };
-    const saved = this.nativeRecord(`conversation-turn:${catalog.attemptId}`)
-      .value as ConversationPlan & {
-      authorityHash: string;
-    };
-    const { authorityHash, ...payload } = saved;
-    const input = conversationPlan(payload);
-    const submission = this.nativeRecord(
-      `conversation-submission:${catalog.attemptId}`,
-      4096,
-      'outcome-unknown',
-    ).value as { attemptId: string; bindingHash: string };
-    if (
-      catalog.taskId !== taskId ||
-      (catalog.contextUsage && catalog.contextUsage.model !== input.model) ||
-      hashCanonical(retained.artifact) !== hashCanonical(artifact) ||
-      this.store.receipt(`conversation-model-catalog:${catalog.attemptId}`)?.hash !==
-        artifact.hash ||
-      !attempt ||
-      attempt.state !== 'stopped' ||
-      attempt.runId !== catalog.runId ||
-      attempt.generation !== catalog.generation ||
-      attempt.routeId !== input.binding.routeId ||
-      route?.model !== input.model ||
-      route.effort.requested !== input.effort ||
-      run?.taskId !== taskId ||
-      run.decision.inputsHash !== authorityHash ||
-      !run.roles.some(
-        (role) => role.role === input.binding.role && role.routeId === attempt.routeId,
-      ) ||
-      intent?.task_id !== taskId ||
-      intent.run_id !== catalog.runId ||
-      intent.route_id !== attempt.routeId ||
-      intent.generation !== catalog.generation ||
-      intent.state !== 'stopped' ||
-      intent.finished_at === null ||
-      this.store.runPurpose(catalog.runId) !== 'conversation' ||
-      !this.store.nativePhasesComplete(catalog.attemptId, 'openai') ||
-      completion.attemptId !== catalog.attemptId ||
-      completion.quiescent !== true ||
-      completion.submitted !== true ||
-      completion.reason !== null ||
-      submission.attemptId !== catalog.attemptId ||
-      submission.bindingHash !== conversationBindingHash(input) ||
-      input.binding.taskId !== taskId ||
-      input.binding.runId !== catalog.runId ||
-      input.binding.attemptId !== catalog.attemptId ||
-      input.binding.generation !== catalog.generation ||
-      !catalog.models.some(
-        (model) => model.model === input.model && model.efforts.includes(input.effort),
-      )
-    )
-      throw Error('observation-stale');
-    return catalog;
-  }
-
-  private conversationCatalogReason(
+  private catalogReason(
     catalog: ModelCatalogObservation,
   ): ConversationModelFailureReason | undefined {
     const profile = this.profileFor(catalog.profileId);
@@ -5016,71 +4304,6 @@ export class Controller {
       return 'client-changed';
     if (hashCanonical(profile.facts) !== catalog.profileHash) return 'observation-stale';
     if (!profile.facts.available) return 'catalog-unavailable';
-  }
-
-  private conversationModelReason(
-    taskId: string,
-    selection: ConversationPlanningSelection,
-  ): ConversationModelFailureReason | undefined {
-    const request = selection.modelRequest;
-    if (!request) return;
-    try {
-      const catalog = this.modelCatalog(taskId, request.observation);
-      if (catalog.profileId !== selection.profileId) return 'observation-stale';
-      const changed = this.conversationCatalogReason(catalog);
-      if (changed) return changed;
-      const model = catalog.models.find((value) => value.model === request.model);
-      if (!model) return 'model-unavailable';
-      if (!model.efforts.includes(request.effort)) return 'effort-unavailable';
-    } catch (error) {
-      return error instanceof Error && error.message === 'observation-missing'
-        ? 'observation-missing'
-        : error instanceof Error && error.message === 'observation-stale'
-          ? 'observation-stale'
-          : 'catalog-unavailable';
-    }
-  }
-
-  private conversationModelChoices(
-    _taskId: string,
-    config: ConversationConfiguration | undefined,
-  ): ConversationModelChoices {
-    const observation = config?.modelCatalog;
-    if (!observation)
-      return {
-        status: 'not-observed',
-        observation: null,
-        observedAt: null,
-        models: [],
-        reason: 'not-observed',
-      };
-    try {
-      const catalog = this.conversationCatalog(_taskId, observation);
-      const reason = this.conversationCatalogReason(catalog);
-      if (reason && reason !== 'client-changed')
-        return {
-          status: 'unavailable',
-          observation,
-          observedAt: catalog.observedAt,
-          models: [],
-          reason,
-        };
-      return {
-        status: reason === 'client-changed' ? 'client-changed' : 'last-observed',
-        observation,
-        observedAt: catalog.observedAt,
-        models: catalog.models,
-        reason: reason ?? config?.modelFailure ?? 'available',
-      };
-    } catch {
-      return {
-        status: 'unavailable',
-        observation: null,
-        observedAt: null,
-        models: [],
-        reason: 'catalog-unavailable',
-      };
-    }
   }
 
   private projectModelChoices(taskId: string): ConversationModelChoices {
@@ -5095,7 +4318,7 @@ export class Controller {
       };
     try {
       const catalog = this.taskModelCatalog(taskId, observation);
-      const reason = this.conversationCatalogReason(catalog);
+      const reason = this.catalogReason(catalog);
       if (reason && reason !== 'client-changed')
         return {
           status: 'unavailable',
@@ -5122,101 +4345,6 @@ export class Controller {
     }
   }
 
-  private conversationContextUsage(
-    task: Task,
-    config: ConversationConfiguration | undefined,
-  ): TaskConversationState['contextUsage'] {
-    if (!config?.modelCatalog || !task.runId) return null;
-    try {
-      const catalog = this.conversationCatalog(task.id, config.modelCatalog);
-      const route = this.store.get<Route>('route', config.routeId);
-      if (
-        !catalog.contextUsage ||
-        catalog.runId !== task.runId ||
-        catalog.contextUsage.model !== route?.model ||
-        this.conversationCatalogReason(catalog)
-      )
-        return null;
-      const { threadId: _thread, turnId: _turn, ...measurement } = catalog.contextUsage;
-      return ConversationContextUsageSchema.parse({
-        ...measurement,
-        observation: config.modelCatalog,
-        runId: catalog.runId,
-        attemptId: catalog.attemptId,
-        generation: catalog.generation,
-        observedAt: catalog.observedAt,
-      });
-    } catch {
-      return null;
-    }
-  }
-
-  private conversationModel(
-    selection: ConversationPlanningSelection,
-    configurationRevision: number,
-  ) {
-    const request = selection.modelRequest;
-    return {
-      model: request?.model ?? this.profileFor(selection.profileId).facts.model,
-      effort: request?.effort ?? 'low',
-      ...(request
-        ? { selection: { version: 1 as const, configurationRevision, modelRequest: request } }
-        : {}),
-    };
-  }
-
-  private taskAllowance(taskId: string) {
-    const config = this.conversationConfiguration(taskId);
-    if (!config) return null;
-    const intents = this.chargeableIntents();
-    const combined = this.store.combinedGroup(taskId);
-    const memberRun = combined
-      ? this.store.combinedMembers(combined.run_id).find((member) => member.task_id === taskId)
-          ?.run_id
-      : undefined;
-    const slots = combined
-      ? this.store
-          .combinedDispatches(combined.run_id)
-          .filter(
-            (slot) =>
-              combined.task_id === taskId ||
-              this.store.get<Attempt>('attempt', slot.attempt_id ?? '')?.runId === memberRun,
-          )
-      : [];
-    const ledger = intents.filter(
-      (intent) =>
-        intent.task_id === taskId || slots.some((slot) => slot.attempt_id === intent.attempt_id),
-    );
-    const minutes = ledger.reduce(
-      (sum, intent) => {
-        const run = this.store.get<Run>('run', intent.run_id);
-        let reserved =
-          slots.find((slot) => slot.attempt_id === intent.attempt_id)?.maximum_minutes ??
-          run?.policy.policy.limits.minutes ??
-          config.limits.minutes;
-        if (this.store.runPurpose(intent.run_id) === 'conversation') {
-          try {
-            const plan = this.nativeRecord(`conversation-turn:${intent.attempt_id}`).value as {
-              binding: ConversationTurnBinding;
-            };
-            reserved = ConversationTurnBindingSchema.parse(plan.binding).limitMinutes;
-          } catch {}
-        }
-        return sum + chargedMinutes(intent, reserved);
-      },
-      combined?.task_id === taskId ? chargedIntegrationMinutes(combined) : 0,
-    );
-    return {
-      attempts: Math.max(0, config.limits.attempts - ledger.length),
-      minutes: Math.max(0, config.limits.minutes - minutes),
-      concurrency: Math.max(
-        0,
-        config.limits.concurrency -
-          (combined ? ledger : intents).filter((intent) => intent.state !== 'stopped').length,
-      ),
-    };
-  }
-
   private remaining(run: Run) {
     const intents = this.chargeableIntents();
     const group = this.store.combinedGroup(run.id);
@@ -5226,7 +4354,7 @@ export class Controller {
         .filter((intent) => this.confirmedQuotaDenial(intent))
         .map((intent) => intent.attempt_id),
     );
-    const own = group
+    return group
       ? remainingCombinedBudgets(
           this.store.get<Run>('run', group.run_id) as Run,
           intents,
@@ -5235,25 +4363,6 @@ export class Controller {
           ignored,
         )
       : remainingBudgets(run, intents);
-    let task = this.taskAllowance(group?.task_id ?? run.taskId);
-    if (group && group.task_id !== run.taskId) {
-      const child = this.taskAllowance(run.taskId);
-      if (child)
-        task = task
-          ? {
-              attempts: Math.min(task.attempts, child.attempts),
-              minutes: Math.min(task.minutes, child.minutes),
-              concurrency: Math.min(task.concurrency, child.concurrency),
-            }
-          : child;
-    }
-    return task
-      ? {
-          attempts: Math.min(own.attempts, task.attempts),
-          minutes: Math.min(own.minutes, task.minutes),
-          concurrency: Math.min(own.concurrency, task.concurrency),
-        }
-      : own;
   }
 
   private confirmedQuotaDenial(intent: LaunchIntent) {
@@ -5275,195 +4384,9 @@ export class Controller {
     return this.store.intents().filter((intent) => !this.confirmedQuotaDenial(intent));
   }
 
-  private conversationBoundary(
-    taskId: string,
-  ): TaskConversationState['adopt']['reason'] | undefined {
-    const active = this.store
-      .intents()
-      .filter((intent) => intent.task_id === taskId && intent.state !== 'stopped');
-    if (
-      active.some((intent) => ['outcome-unknown', 'interrupted'].includes(intent.state)) ||
-      this.hasUncertainWriter(taskId)
-    )
-      return 'ownership-unknown';
-    if (
-      active.length ||
-      this.store.db.prepare('SELECT 1 FROM writer_leases WHERE task_id=?').get(taskId)
-    )
-      return 'owner-active';
-    if (
-      this.store.db
-        .prepare(
-          "SELECT 1 FROM pending_effects WHERE task_id=? AND state IN ('pending','approved','unknown') LIMIT 1",
-        )
-        .get(taskId)
-    )
-      return 'effects-unresolved';
-    for (const intent of this.store
-      .intents()
-      .filter(
-        (value) =>
-          value.task_id === taskId && this.store.runPurpose(value.run_id) === 'conversation',
-      )) {
-      const phases = this.store.nativeProcesses(intent.attempt_id);
-      if (phases.some((phase) => phase.state !== 'quiescent')) return 'ownership-unknown';
-      if (!phases.length && !this.store.receipt(`conversation-completion:${intent.attempt_id}`))
-        return 'ownership-unknown';
-    }
-  }
-
-  private conversationAuthority(config: ConversationConfiguration) {
-    return hashCanonical({
-      role: config.selection.role,
-      profileId: config.selection.profileId,
-      creditPolicy: config.selection.creditPolicy,
-      ...(config.selection.modelRequest ? { modelRequest: config.selection.modelRequest } : {}),
-      source: config.source,
-      profileHash: config.profileHash,
-      client: config.client,
-      locationHash: config.locationHash,
-      routeId: config.routeId,
-    });
-  }
-
-  private conversationProfile(config: ConversationConfiguration) {
-    const profile = this.profileFor(config.selection.profileId);
-    if (
-      !profile.facts.available ||
-      profile.facts.family !== 'openai' ||
-      profile.facts.id !== config.selection.profileId ||
-      !profile.client ||
-      !profile.environment ||
-      !profile.locationHash ||
-      !profile.facts.creditPolicies.includes(config.selection.creditPolicy) ||
-      hashCanonical(profile.facts) !== config.profileHash ||
-      hashCanonical(profile.client) !== hashCanonical(config.client) ||
-      profile.locationHash !== config.locationHash
-    )
-      throw Error('profile-unavailable');
-    return profile as NativeProfileResolution & {
-      client: NonNullable<NativeProfileResolution['client']>;
-      environment: NodeJS.ProcessEnv;
-      locationHash: string;
-    };
-  }
-
-  private conversationInputFits(
-    task: Pick<Task, 'id' | 'runId' | 'title' | 'outcome'>,
-    selection: ConversationPlanningSelection,
-    criteria: string[],
-  ) {
-    const profile = this.profileFor(selection.profileId);
-    if (!profile.facts.available) return true;
-    const identity = '00000000000000000000000000';
-    const scope = {
-      paths: [] as string[],
-      roles: ['coder', 'reviewer', 'advisor'] as ('coder' | 'reviewer' | 'advisor')[],
-      checks: ['node-tests-v1', 'project-node-tests-v1', 'crewkite-verify-v1'],
-    };
-    try {
-      // Reserve framing space so every permitted message fits with the full task contract.
-      conversationPlan({
-        binding: {
-          taskId: task.id,
-          runId: task.runId ?? `run_${identity}`,
-          attemptId: `att_${identity}`,
-          generation: Number.MAX_SAFE_INTEGER,
-          routeId: `rte_${identity}`,
-          role: selection.role,
-          taskRevision: Number.MAX_SAFE_INTEGER,
-          conversationRevision: Number.MAX_SAFE_INTEGER,
-          scopeHash: hashCanonical(scope),
-          limitMinutes: 5,
-        },
-        ...this.conversationModel(selection, Number.MAX_SAFE_INTEGER),
-        creditPolicy: selection.creditPolicy,
-        directory: join(this.home, 'conversation', `run_${identity}`, `att_${identity}`),
-        context: { title: task.title, outcome: task.outcome, criteria },
-        scope,
-        history: [
-          { role: 'user', text: '\u0001'.repeat(4096) },
-          { role: 'controller', text: 'x'.repeat(512) },
-        ],
-        omittedHistoryCount: Number.MAX_SAFE_INTEGER,
-      });
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  private conversationContextFits(
-    task: Pick<Task, 'id' | 'projectId' | 'runId' | 'title' | 'outcome'>,
-    selection: ConversationPlanningSelection,
-    criteria: string[],
-    text: string,
-    refs: ConversationContextRefs | undefined,
-  ): boolean {
-    const pending = this.conversation.pendingInputs(task.id);
-    if (!refs?.length && !pending.some((entry) => 'context' in entry && entry.context?.length))
-      return true;
-    const config = this.conversationConfiguration(task.id);
-    const base =
-      config?.source.base ??
-      inspectSource(task.projectId, this.projectPath(task.projectId) as string).base;
-    const entries = [
-      ...pending.map((entry) => ({
-        id: entry.id,
-        text: entry.text,
-        context: 'context' in entry ? entry.context : undefined,
-      })),
-      { id: `msg_${'0'.repeat(26)}`, text, context: refs },
-    ];
-    const profile = this.profileFor(selection.profileId);
-    if (!profile.facts.available) return true;
-    const identity = '0'.repeat(26);
-    const scope = {
-      paths: [] as string[],
-      roles: ['coder', 'reviewer', 'advisor'] as ('coder' | 'reviewer' | 'advisor')[],
-      checks: ['node-tests-v1', 'project-node-tests-v1', 'crewkite-verify-v1'],
-    };
-    try {
-      const attachments = entries.flatMap((entry) =>
-        this.conversationContext(entry.context, task.projectId, base).map((attachment) => ({
-          messageId: entry.id,
-          ...attachment,
-        })),
-      );
-      conversationPlan({
-        binding: {
-          taskId: task.id,
-          runId: task.runId ?? `run_${identity}`,
-          attemptId: `att_${identity}`,
-          generation: Number.MAX_SAFE_INTEGER,
-          routeId: `rte_${identity}`,
-          role: selection.role,
-          taskRevision: Number.MAX_SAFE_INTEGER,
-          conversationRevision: Number.MAX_SAFE_INTEGER,
-          scopeHash: hashCanonical(scope),
-          limitMinutes: 5,
-        },
-        ...this.conversationModel(selection, Number.MAX_SAFE_INTEGER),
-        creditPolicy: selection.creditPolicy,
-        directory: join(this.home, 'conversation', `run_${identity}`, `att_${identity}`),
-        context: { title: task.title, outcome: task.outcome, criteria },
-        scope,
-        contextSource: { projectId: task.projectId, base },
-        contextAttachments: attachments,
-        history: entries.map((entry) => ({ role: 'user', text: entry.text, messageId: entry.id })),
-        omittedHistoryCount: Number.MAX_SAFE_INTEGER,
-      });
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
   private conversationState(taskId: string): TaskConversationState {
     const task = this.store.get<Task>('task', taskId);
     if (!task) throw Error('task-not-found');
-    const config = this.conversationConfiguration(task.id);
-    const run = task.runId ? this.store.get<Run>('run', task.runId) : undefined;
     const purpose = task.runId ? (this.store.runPurpose(task.runId) ?? null) : null;
     const intents = this.store
       .intents()
@@ -5503,106 +4426,10 @@ export class Controller {
       AND NOT EXISTS (SELECT 1 FROM conversation_entries delivery WHERE delivery.task_id=input.task_id
         AND json_extract(delivery.body,'$.kind')='input-delivery' AND json_extract(delivery.body,'$.replyTo')=input.id)`)
       .get(task.id)?.count as number;
-    const allowance = this.taskAllowance(task.id);
-    let send: TaskConversationState['send'] = {
-      available: false,
-      reason: 'not-configured',
-      disposition: null,
-    };
-    if (this.closed) send.reason = 'controller-closing';
-    else if (
-      this.store.db
-        .prepare(
-          "SELECT 1 FROM pending_effects WHERE task_id=? AND state IN ('pending','approved','unknown') LIMIT 1",
-        )
-        .get(task.id)
-    )
-      send.reason = 'effects-unresolved';
-    else if (unknown) send.reason = 'ownership-unknown';
-    else if (config?.paused || task.state === 'stopping') send.reason = 'admissions-paused';
-    else if (this.store.combinedGroup(task.id)) {
-      const group = this.store.combinedGroup(task.id) as CombinedGroup;
-      send =
-        config && !['stopped', 'accepted', 'blocked', 'paused', 'unknown'].includes(group.phase)
-          ? { available: true, reason: 'queued-at-boundary', disposition: 'queue' }
-          : { available: false, reason: 'execution-active', disposition: null };
-    } else if (active && purpose)
-      send = { available: true, reason: 'queued-at-boundary', disposition: 'queue' };
-    else if (run && purpose === 'execution') {
-      const boundary = this.conversationBoundary(task.id);
-      send = boundary
-        ? { available: false, reason: boundary, disposition: null }
-        : { available: true, reason: 'queued-at-boundary', disposition: 'queue' };
-    } else if (config && run && purpose === 'conversation' && allowance) {
-      send.reason = 'available';
-      try {
-        this.conversationProfile(config);
-      } catch {
-        send.reason = 'profile-unavailable';
-      }
-      if (send.reason === 'available')
-        send.reason = this.conversationModelReason(task.id, config.selection) ?? 'available';
-      if (
-        send.reason === 'available' &&
-        hashCanonical(inspectSource(task.projectId, this.projectPath(task.projectId) as string)) !==
-          hashCanonical(config.source)
-      )
-        send.reason = 'source-changed';
-      const boundary = this.conversationBoundary(task.id);
-      if (send.reason === 'available' && boundary) send.reason = boundary;
-      if (
-        send.reason === 'available' &&
-        !this.conversationInputFits(
-          task,
-          config.selection,
-          config.contractStatus === 'provisional' ? config.contextCriteria : task.criteria,
-        )
-      )
-        send.reason = 'conversation-input-too-large';
-      if (send.reason === 'available' && allowance.attempts === 0)
-        send.reason = 'attempt-budget-exhausted';
-      if (send.reason === 'available' && allowance.minutes === 0)
-        send.reason = 'minute-budget-exhausted';
-      if (send.reason === 'available' && allowance.concurrency === 0)
-        send.reason = 'concurrency-exhausted';
-      if (send.reason === 'available')
-        send = {
-          available: true,
-          reason: 'available',
-          disposition: 'turn',
-        };
-    }
-    let adopt: TaskConversationState['adopt'] = { available: false, reason: 'proposal-missing' };
-    if (proposal && config && allowance && purpose === 'conversation') {
-      const boundary = this.conversationBoundary(task.id);
-      const newerInput = this.store.db
-        .prepare(
-          "SELECT 1 FROM conversation_entries WHERE task_id=? AND sequence>? AND json_extract(body,'$.kind') IN ('user-message','guidance','answer') LIMIT 1",
-        )
-        .get(task.id, BigInt(proposalEntry?.cursor ?? '0'));
-      adopt.reason =
-        boundary ??
-        (config.paused
-          ? 'admissions-paused'
-          : pendingQuestions.length
-            ? 'pending-question'
-            : queuedInputCount || newerInput
-              ? 'pending-input'
-              : 'available');
-      adopt.available = adopt.reason === 'available';
-      if (
-        adopt.available &&
-        hashCanonical(inspectSource(task.projectId, this.projectPath(task.projectId) as string)) !==
-          hashCanonical(config.source)
-      ) {
-        adopt = { available: false, reason: 'source-changed' };
-      }
-    }
-    const route = config ? this.store.get<Route>('route', config.routeId) : undefined;
     return TaskConversationStateSchema.parse({
       taskId: task.id,
       revision: task.revision,
-      contractStatus: config?.contractStatus ?? 'confirmed',
+      contractStatus: 'confirmed',
       purpose,
       phase: unknown
         ? 'unknown'
@@ -5618,735 +4445,25 @@ export class Controller {
                 ? 'stopped'
                 : purpose === 'execution'
                   ? 'execution'
-                  : config
-                    ? config.contractStatus === 'confirmed'
-                      ? 'planned'
-                      : 'discussion'
-                    : 'idle',
-      configuration: config
-        ? {
-            revision: config.revision,
-            selection: config.selection,
-            routeId: config.routeId,
-            requestedModel: route?.model ?? null,
-            requestedEffort: route?.effort.requested ?? null,
-            effectiveModel: config.effectiveModel,
-            effectiveEffort: config.effectiveEffort,
-          }
-        : null,
-      modelChoices: this.conversationModelChoices(task.id, config),
+                  : 'idle',
+      configuration: null,
       projectModelChoices: this.projectModelChoices(task.id),
-      contextUsage: this.conversationContextUsage(task, config),
       currentRunId: task.runId,
       activeAttempt: active,
-      budget: config && allowance ? { limits: config.limits, remaining: allowance } : null,
+      budget: null,
       queuedInputCount,
       pendingQuestions,
       proposal,
-      adoptedProposal: config?.adoptedProposal ?? null,
-      send,
-      adopt,
-    });
-  }
-
-  private configureConversation(
-    task: Task,
-    selection: ConversationPlanningSelection,
-    provisional: boolean,
-    initial = false,
-  ) {
-    const profile = this.profileFor(selection.profileId);
-    const source = inspectSource(task.projectId, this.projectPath(task.projectId) as string);
-    committedFiles(this.projectPath(task.projectId) as string, source.base);
-    const prior = this.conversationConfiguration(task.id);
-    const selected = this.conversationModel(selection, (prior?.revision ?? 0) + 1);
-    const route = RouteSchema.parse({
-      id: this.id('rte'),
-      family: 'openai',
-      displayName: 'Supervised planning',
-      model: selected.model,
-      effort: {
-        requested: selected.effort,
-        effective: 'unknown',
-        supported: [selected.effort],
+      adoptedProposal: null,
+      // Messages go through the chat thread. This read reports retained entries, and nothing here
+      // can be sent or adopted.
+      send: {
+        available: false,
+        reason: this.closed ? 'controller-closing' : 'not-configured',
+        disposition: null,
       },
-      billing: selection.creditPolicy === 'existing-credits' ? 'credits' : 'included',
-      qualified: false,
-      fake: false,
+      adopt: { available: false, reason: 'not-configured' },
     });
-    this.store.put('route', route.id, 0, route);
-    const config = ConversationConfigurationSchema.parse({
-      revision: (prior?.revision ?? 0) + 1,
-      contractStatus: provisional ? 'provisional' : (prior?.contractStatus ?? 'confirmed'),
-      contextCriteria: initial ? [] : task.criteria,
-      selection,
-      routeId: route.id,
-      source,
-      profileHash: hashCanonical(profile.facts),
-      client: profile.client ?? null,
-      locationHash: profile.locationHash ?? null,
-      limits: selection.limits,
-      paused: false,
-      adoptedProposal: prior?.adoptedProposal ?? null,
-      effectiveModel: null,
-      effectiveEffort: null,
-      ...(selection.modelRequest?.observation || prior?.modelCatalog
-        ? { modelCatalog: selection.modelRequest?.observation ?? prior?.modelCatalog }
-        : {}),
-    });
-    this.saveConversationConfiguration(task.id, config);
-    const policy = PolicySchema.parse({
-      authority: 'guided',
-      quality: 'quick',
-      effects: [],
-      limits: selection.limits,
-      reserves: [],
-      unknownUsage: {
-        rule: 'fixed-allowance',
-        allowance: { launches: selection.limits.attempts, minutes: selection.limits.minutes },
-      },
-    });
-    const run = RunSchema.parse({
-      id: this.id('run'),
-      taskId: task.id,
-      source,
-      policy: { policy, hash: hashCanonical(policy) },
-      roles: [{ role: selection.role, routeId: route.id, pinned: true, approvedFallbacks: [] }],
-      decision: {
-        chosen: route.id,
-        rejected: [],
-        rule: 'manual',
-        inputsHash: this.conversationAuthority(config),
-      },
-      revision: 0,
-    });
-    this.store.put('run', run.id, 0, run);
-    this.store.putRunPurpose(run, 'conversation', task.runId);
-    const updated = this.updateTask(task, {
-      runId: run.id,
-      state: 'draft',
-      waitingReason: null,
-      next: 'Describe the task or answer the pending question.',
-    });
-    this.event('run.prepared', task.id, updated.revision, run);
-    return updated;
-  }
-
-  private conversationCommand(
-    command: Extract<
-      Command,
-      {
-        command:
-          | 'CreateTaskDiscussion'
-          | 'ConfigureTaskConversation'
-          | 'SendTaskMessage'
-          | 'QueueTaskGuidance'
-          | 'AnswerTaskQuestion'
-          | 'AdoptTaskPlan';
-      }
-    >,
-    effects: (() => void)[],
-  ): CommandResult {
-    if (command.command === 'CreateTaskDiscussion') {
-      if (!this.projectPath(command.payload.projectId))
-        return { outcome: 'blocked', reason: 'project-not-found' };
-      const text = command.payload.text;
-      if (!text.trim()) return { outcome: 'denied', reason: 'empty-message' };
-      let task = TaskSchema.parse({
-        id: this.id('tsk'),
-        projectId: command.payload.projectId,
-        title: text.trim().split('\n')[0].slice(0, 200).toWellFormed(),
-        outcome: text,
-        criteria: ['Confirm acceptance criteria before execution.'],
-        state: 'draft',
-        waitingReason: null,
-        revision: 0,
-        runId: null,
-        next: 'Clarify the task before execution.',
-      });
-      const modelReason = this.conversationModelReason(task.id, command.payload.planning);
-      if (modelReason) return { outcome: 'blocked', reason: modelReason };
-      if (!this.conversationInputFits(task, command.payload.planning, []))
-        return { outcome: 'blocked', reason: 'conversation-input-too-large' };
-      try {
-        this.conversationContext(
-          command.payload.context,
-          task.projectId,
-          inspectSource(task.projectId, this.projectPath(task.projectId) as string).base,
-        );
-      } catch {
-        return { outcome: 'blocked', reason: 'conversation-context-invalid' };
-      }
-      if (
-        !this.conversationContextFits(
-          task,
-          command.payload.planning,
-          [],
-          text,
-          command.payload.context,
-        )
-      )
-        return { outcome: 'blocked', reason: 'conversation-context-too-large' };
-      this.store.put('task', task.id, 0, task);
-      this.event('task.created', task.id, 0, task);
-      task = this.configureConversation(task, command.payload.planning, true, true);
-      const message = this.conversation.recordMessage(
-        task.id,
-        text,
-        'user-message',
-        command.payload.context,
-      );
-      if (!message.applied) return { outcome: 'blocked', reason: message.reason };
-      this.admitConversation(task.id, effects);
-      const current = this.store.get<Task>('task', task.id) as Task;
-      return { outcome: 'applied', entity: current, revision: current.revision };
-    }
-    const task = this.store.get<Task>('task', command.payload.taskId);
-    if (!task) return { outcome: 'blocked', reason: 'task-not-found' };
-    if (command.command === 'ConfigureTaskConversation') {
-      const prior = this.conversationConfiguration(task.id);
-      const selection = command.payload.planning;
-      const same =
-        prior &&
-        hashCanonical({ ...selection, limits: prior.selection.limits }) ===
-          hashCanonical(prior.selection);
-      const lower =
-        prior &&
-        (['attempts', 'minutes', 'concurrency'] as const).every(
-          (axis) => selection.limits[axis] <= prior.limits[axis],
-        );
-      if (same && lower) {
-        this.saveConversationConfiguration(task.id, {
-          ...prior,
-          revision: prior.revision + 1,
-          selection,
-          limits: selection.limits,
-        });
-        const updated = this.updateTask(task, {});
-        return { outcome: 'applied', entity: updated, revision: updated.revision };
-      }
-      if (this.store.runPurpose(task.runId ?? '') === 'execution')
-        return {
-          outcome: 'blocked',
-          reason: 'task-not-discussing',
-          next: 'The current execution run is retained. Start a separate task to plan new work.',
-        };
-      const boundary = this.conversationBoundary(task.id);
-      if (boundary) return { outcome: 'blocked', reason: boundary };
-      const modelReason = this.conversationModelReason(task.id, selection);
-      if (modelReason) return { outcome: 'blocked', reason: modelReason };
-      if (!this.conversationInputFits(task, selection, task.criteria))
-        return { outcome: 'blocked', reason: 'conversation-input-too-large' };
-      const updated = this.configureConversation(task, selection, true);
-      return { outcome: 'applied', entity: updated, revision: updated.revision };
-    }
-    if (command.command === 'AdoptTaskPlan') {
-      const state = this.conversationState(task.id);
-      if (!state.adopt.available) return { outcome: 'blocked', reason: state.adopt.reason };
-      if (
-        state.proposal?.id !== command.payload.proposalId ||
-        state.proposal.hash !== command.payload.proposalHash
-      )
-        return { outcome: 'blocked', reason: 'proposal-hash-changed' };
-      const entry = this.planProposal(task.id, state.proposal);
-      if (!entry) return { outcome: 'blocked', reason: 'proposal-not-current' };
-      const config = this.conversationConfiguration(task.id) as ConversationConfiguration;
-      this.saveConversationConfiguration(task.id, {
-        ...config,
-        contractStatus: 'confirmed',
-        adoptedProposal: state.proposal,
-      });
-      const updated = this.updateTask(task, {
-        criteria: entry.proposal.criteria,
-        state: 'draft',
-        waitingReason: null,
-        next: 'Plan adopted. Prepare the execution contract.',
-      });
-      return { outcome: 'applied', entity: updated, revision: updated.revision };
-    }
-    if (!command.payload.text.trim()) return { outcome: 'denied', reason: 'empty-message' };
-    const state = this.conversationState(task.id);
-    if (!state.send.available) return { outcome: 'blocked', reason: state.send.reason };
-    try {
-      this.conversationContext(
-        command.payload.context,
-        task.projectId,
-        this.conversationConfiguration(task.id)?.source.base ??
-          inspectSource(task.projectId, this.projectPath(task.projectId) as string).base,
-      );
-    } catch {
-      return { outcome: 'blocked', reason: 'conversation-context-invalid' };
-    }
-    const config = this.conversationConfiguration(task.id);
-    if (
-      config &&
-      !this.conversationContextFits(
-        task,
-        config.selection,
-        config.contractStatus === 'provisional' ? config.contextCriteria : task.criteria,
-        command.payload.text,
-        command.payload.context,
-      )
-    )
-      return { outcome: 'blocked', reason: 'conversation-context-too-large' };
-    const saved =
-      command.command === 'AnswerTaskQuestion'
-        ? this.conversation.answerQuestion(
-            task.id,
-            command.payload.questionId,
-            command.payload.text,
-            command.payload.context,
-          )
-        : this.conversation.recordMessage(
-            task.id,
-            command.payload.text,
-            command.command === 'QueueTaskGuidance' || state.purpose === 'execution'
-              ? 'guidance'
-              : 'user-message',
-            command.payload.context,
-          );
-    if (!saved.applied) return { outcome: 'blocked', reason: saved.reason };
-    if (state.send.disposition === 'turn') this.admitConversation(task.id, effects);
-    const current = this.store.get<Task>('task', task.id) as Task;
-    return { outcome: 'applied', entity: current, revision: current.revision };
-  }
-
-  private admitConversation(taskId: string, effects: (() => void)[]): CommandResult {
-    const state = this.conversationState(taskId);
-    if (!state.send.available || state.send.disposition !== 'turn')
-      return { outcome: 'blocked', reason: state.send.reason };
-    const task = this.store.get<Task>('task', taskId) as Task;
-    const config = this.conversationConfiguration(taskId) as ConversationConfiguration;
-    const run = this.store.get<Run>('run', task.runId as string) as Run;
-    const pending = this.conversation.pendingInputs(taskId);
-    if (!pending.length) return { outcome: 'blocked', reason: 'pending-input' };
-    const profile = this.conversationProfile(config);
-    const allowance = this.remaining(run);
-    const attempt = this.jobAttempt(run, config.routeId);
-    const directory = join(this.home, 'conversation', run.id, attempt.id);
-    const ceiling = BigInt(pending[pending.length - 1].cursor);
-    const planning =
-      "json_extract(body,'$.kind') NOT IN ('input-delivery','chat-assistant','chat-system')";
-    const rows = this.store.db
-      .prepare(
-        `SELECT body FROM conversation_entries WHERE task_id=? AND sequence<=? AND ${planning} ORDER BY sequence DESC LIMIT 100`,
-      )
-      .all(taskId, ceiling);
-    const total = this.store.db
-      .prepare(
-        `SELECT COUNT(*) AS count FROM conversation_entries WHERE task_id=? AND sequence<=? AND ${planning}`,
-      )
-      .get(taskId, ceiling)?.count as number;
-    const historyEntries = rows
-      .reverse()
-      .map((row) => ConversationEntrySchema.parse(JSON.parse(row.body as string)))
-      .filter(planningEntry);
-    if (pending.some((entry) => 'context' in entry && entry.context?.length)) {
-      const retained = new Set(historyEntries.map((entry) => entry.id));
-      historyEntries.push(
-        ...pending.filter(planningEntry).filter((entry) => !retained.has(entry.id)),
-      );
-      historyEntries.sort((left, right) => (BigInt(left.cursor) < BigInt(right.cursor) ? -1 : 1));
-    }
-    const history = historyEntries.map((entry) => ({ role: entry.author.kind, text: entry.text }));
-    const contextInput = () => {
-      const contextAttachments = historyEntries.flatMap((entry) =>
-        'context' in entry
-          ? this.conversationContext(entry.context, task.projectId, config.source.base).map(
-              (attachment) => ({ messageId: entry.id, ...attachment }),
-            )
-          : [],
-      );
-      return contextAttachments.length
-        ? {
-            contextSource: { projectId: task.projectId, base: config.source.base },
-            contextAttachments,
-            history: historyEntries.map((entry) => ({
-              role: entry.author.kind,
-              text: entry.text,
-              ...(entry.author.kind === 'user' ? { messageId: entry.id } : {}),
-            })),
-          }
-        : { history };
-    };
-    const files = committedFiles(this.projectPath(task.projectId) as string, config.source.base);
-    const scope = {
-      paths: files.slice(0, 1000).map((file) => file.path),
-      roles: ['coder', 'reviewer', 'advisor'] as ('coder' | 'reviewer' | 'advisor')[],
-      checks: ['node-tests-v1', 'project-node-tests-v1', 'crewkite-verify-v1'],
-    };
-    const binding = ConversationTurnBindingSchema.parse({
-      taskId,
-      runId: run.id,
-      attemptId: attempt.id,
-      generation: attempt.generation,
-      routeId: config.routeId,
-      role: config.selection.role,
-      taskRevision: task.revision,
-      conversationRevision: this.conversation.revision(taskId),
-      scopeHash: hashCanonical(scope),
-      limitMinutes: Math.min(5, allowance.minutes),
-    });
-    try {
-      contextInput();
-    } catch {
-      return { outcome: 'blocked', reason: 'conversation-context-invalid' };
-    }
-    let input: ConversationPlan | undefined;
-    let omitted = Math.max(0, total - history.length);
-    while (!input) {
-      try {
-        input = conversationPlan({
-          binding,
-          ...this.conversationModel(config.selection, config.revision),
-          creditPolicy: config.selection.creditPolicy,
-          directory,
-          context: {
-            title: task.title,
-            outcome: task.outcome,
-            criteria:
-              config.contractStatus === 'provisional' ? config.contextCriteria : task.criteria,
-          },
-          scope,
-          ...contextInput(),
-          omittedHistoryCount: omitted,
-        });
-      } catch {
-        if (history.length > 1) {
-          const retained = new Set(pending.map((entry) => entry.id));
-          const old = historyEntries.findIndex((entry) => !retained.has(entry.id));
-          const protectedContext = pending.some(
-            (entry) => 'context' in entry && entry.context?.length,
-          );
-          const index = old >= 0 ? old : protectedContext ? -1 : history.length - 1;
-          if (index >= 0) {
-            history.splice(index, 1);
-            historyEntries.splice(index, 1);
-            omitted++;
-          } else if (scope.paths.length) {
-            scope.paths.pop();
-            binding.scopeHash = hashCanonical(scope);
-          } else return { outcome: 'blocked', reason: 'conversation-context-too-large' };
-        } else if (scope.paths.length) {
-          scope.paths.pop();
-          binding.scopeHash = hashCanonical(scope);
-        } else return { outcome: 'blocked', reason: 'conversation-input-too-large' };
-      }
-    }
-    input = freezeNative(input);
-    const selectedIds = new Set(historyEntries.map((entry) => entry.id));
-    const included = pending.filter((entry) => selectedIds.has(entry.id));
-    if (!included.length) return { outcome: 'blocked', reason: 'conversation-input-too-large' };
-    const artifact = this.nativeArtifact({
-      ...input,
-      authorityHash: this.conversationAuthority(config),
-    });
-    this.store.saveReceipt(`conversation-turn:${attempt.id}`, artifact.hash, 'local-owner', {
-      outcome: 'applied',
-      entity: artifact,
-    });
-    if (!this.store.receipt(`allocation:${run.id}`))
-      this.store.saveReceipt(
-        `allocation:${run.id}`,
-        this.conversationAuthority(config),
-        'local-owner',
-        { outcome: 'applied', entity: run },
-      );
-    this.admitJob(run, attempt, directory, binding.limitMinutes);
-    this.saveConversationConfiguration(task.id, {
-      ...config,
-      effectiveModel: null,
-      effectiveEffort: null,
-    });
-    const started = this.updateTask(this.store.get<Task>('task', task.id) as Task, {
-      state: 'running',
-      waitingReason: null,
-      next: 'The planning turn is running.',
-    });
-    const frozen: FrozenConversationTurn = {
-      binding: input.binding,
-      scope: input.scope,
-      bindingHash: conversationBindingHash(input),
-    };
-    const delivery = this.conversation.includeInputs(
-      frozen,
-      included.map((entry) => entry.id),
-    );
-    if (!delivery.applied) throw Error(delivery.reason);
-    this.event('run.admitted', task.id, started.revision, run);
-    this.pendingConversationLaunches.add(attempt.id);
-    effects.push(() => {
-      this.pendingConversationLaunches.delete(attempt.id);
-      const intent = this.store.intents().find((value) => value.attempt_id === attempt.id);
-      if (!intent) throw Error('The planning launch intent is unavailable.');
-      if (intent.state === 'stopped') return;
-      this.options.afterIntent?.(intent);
-      this.launchConversation(
-        input as ConversationPlan,
-        attempt,
-        this.conversationAuthority(config),
-        profile.environment,
-      );
-    });
-    return {
-      outcome: 'applied',
-      entity: this.store.get<Task>('task', task.id),
-      revision: (this.store.get<Task>('task', task.id) as Task).revision,
-    };
-  }
-
-  private ownsConversationTurn(
-    binding: ConversationTurnBinding,
-    phase: 'input' | 'result',
-  ): boolean {
-    try {
-      if (this.store.runPurpose(binding.runId) !== 'conversation') return false;
-      const saved = this.nativeRecord(`conversation-turn:${binding.attemptId}`)
-        .value as ConversationPlan & { authorityHash: string };
-      const config = this.conversationConfiguration(binding.taskId);
-      if (
-        !config ||
-        saved.authorityHash !== this.conversationAuthority(config) ||
-        hashCanonical(saved.binding) !== hashCanonical(binding)
-      )
-        return false;
-      const task = this.store.get<Task>('task', binding.taskId);
-      if (
-        !task ||
-        task.runId !== binding.runId ||
-        hashCanonical({
-          title: task.title,
-          outcome: task.outcome,
-          criteria:
-            config.contractStatus === 'provisional' ? config.contextCriteria : task.criteria,
-        }) !== hashCanonical(saved.context)
-      )
-        return false;
-      const intent = this.store.intents().find((value) => value.attempt_id === binding.attemptId);
-      return phase === 'input'
-        ? !!intent && intent.state === 'intent'
-        : intent?.state === 'stopped' &&
-            this.store.nativePhasesComplete(binding.attemptId, 'openai');
-    } catch {
-      return false;
-    }
-  }
-
-  private launchConversation(
-    input: ConversationPlan,
-    attempt: Attempt,
-    authorityHash: string,
-    environment: NodeJS.ProcessEnv,
-  ) {
-    const completed = Promise.withResolvers<void>();
-    const runtime: ConversationRuntime = {
-      input,
-      attempt,
-      authorityHash,
-      stopped: false,
-      done: completed.promise,
-    };
-    this.conversationWorkers.set(attempt.id, runtime);
-    const current = () => {
-      const config = this.conversationConfiguration(input.binding.taskId);
-      const task = this.store.get<Task>('task', input.binding.taskId);
-      if (
-        this.closed ||
-        runtime.stopped ||
-        !config ||
-        config.paused ||
-        authorityHash !== this.conversationAuthority(config) ||
-        task?.runId !== input.binding.runId ||
-        task.state !== 'running' ||
-        this.jobDeadline(attempt.id, input.binding.limitMinutes) <= 0 ||
-        hashCanonical({
-          title: task.title,
-          outcome: task.outcome,
-          criteria:
-            config.contractStatus === 'provisional' ? config.contextCriteria : task.criteria,
-        }) !== hashCanonical(input.context) ||
-        hashCanonical(inspectSource(task.projectId, this.projectPath(task.projectId) as string)) !==
-          hashCanonical(config.source)
-      )
-        throw Error('Planning authority changed.');
-      this.conversationProfile(config);
-      const modelReason = this.conversationModelReason(input.binding.taskId, config.selection);
-      if (modelReason) throw Error(modelReason);
-      if (input.contextAttachments?.length)
-        for (const attachment of input.contextAttachments)
-          this.conversationContext([attachment], task.projectId, config.source.base);
-    };
-    const finish = (outcome: Awaited<ReturnType<typeof startConversation>['result']> | null) => {
-      try {
-        const phases = this.store.nativeProcesses(attempt.id);
-        const quiescent =
-          (outcome?.quiescent === true && phases.every((phase) => phase.state === 'quiescent')) ||
-          (!runtime.handle && phases.length === 0);
-        let valid = false;
-        try {
-          current();
-          valid =
-            quiescent &&
-            outcome?.reason === null &&
-            !!outcome.metadata &&
-            this.store.nativePhasesComplete(attempt.id, 'openai');
-        } catch {}
-        if (
-          !this.settleJob(attempt, quiescent, true, () => {
-            const proof = this.nativeArtifact({
-              attemptId: attempt.id,
-              quiescent,
-              submitted: !!outcome?.metadata,
-              reason: outcome ? outcome.reason : 'launch',
-              ignoredNotifications: outcome?.ignoredNotifications ?? {},
-            });
-            this.store.saveReceipt(
-              `conversation-completion:${attempt.id}`,
-              proof.hash,
-              'local-owner',
-              { outcome: 'applied', entity: proof },
-            );
-            if (valid && outcome?.metadata) {
-              const config = this.conversationConfiguration(
-                input.binding.taskId,
-              ) as ConversationConfiguration;
-              const result = this.conversation.recordReply(
-                {
-                  binding: input.binding,
-                  scope: input.scope,
-                  bindingHash: conversationBindingHash(input),
-                },
-                outcome.metadata.conversation,
-              );
-              if (!result.applied) valid = false;
-              else {
-                const profile = this.conversationProfile(config);
-                const catalog = ConversationModelCatalogSchema.parse({
-                  version: 1,
-                  profileId: config.selection.profileId,
-                  taskId: input.binding.taskId,
-                  runId: input.binding.runId,
-                  attemptId: input.binding.attemptId,
-                  generation: input.binding.generation,
-                  observedAt: this.now(),
-                  profileHash: config.profileHash,
-                  client: profile.client,
-                  locationHash: config.locationHash,
-                  models: outcome.metadata.modelChoices,
-                  ...(outcome.metadata.contextUsage
-                    ? { contextUsage: outcome.metadata.contextUsage }
-                    : {}),
-                });
-                const observation = this.nativeArtifact(catalog);
-                this.store.saveReceipt(
-                  `conversation-model-catalog:${attempt.id}`,
-                  observation.hash,
-                  'local-owner',
-                  { outcome: 'applied', entity: observation },
-                );
-                const updated = {
-                  ...config,
-                  effectiveModel: input.model,
-                  effectiveEffort: input.effort,
-                  modelCatalog: { artifactId: observation.id, hash: observation.hash },
-                };
-                delete updated.modelFailure;
-                this.saveConversationConfiguration(input.binding.taskId, updated);
-              }
-            } else if (
-              quiescent &&
-              !runtime.stopped &&
-              !this.closed &&
-              (outcome?.diagnostic?.cause === 'model-unavailable' ||
-                outcome?.diagnostic?.cause === 'effort-unavailable')
-            ) {
-              const config = this.conversationConfiguration(input.binding.taskId);
-              if (config && authorityHash === this.conversationAuthority(config))
-                this.saveConversationConfiguration(input.binding.taskId, {
-                  ...config,
-                  modelFailure: outcome.diagnostic.cause,
-                });
-            }
-            const task = this.store.get<Task>('task', input.binding.taskId) as Task;
-            this.updateTask(task, {
-              state: runtime.stopped || this.closed ? 'stopped' : valid ? 'draft' : 'interrupted',
-              waitingReason: null,
-              next:
-                runtime.stopped || this.closed
-                  ? 'Planning stopped. Continue explicitly when ready.'
-                  : valid
-                    ? 'Review the reply and plan before execution.'
-                    : outcome?.diagnostic?.cause === 'model-unavailable'
-                      ? 'The requested model is unavailable. Save another choice or explicitly try again.'
-                      : outcome?.diagnostic?.cause === 'effort-unavailable'
-                        ? 'The requested effort is unavailable. Save another choice or explicitly try again.'
-                        : 'The planning turn has no verified reply. Inspect retained history before continuing.',
-            });
-          })
-        )
-          return;
-        this.conversationWorkers.delete(attempt.id);
-        if (
-          !this.closed &&
-          !runtime.stopped &&
-          valid &&
-          this.conversation.pendingInputs(input.binding.taskId).length
-        ) {
-          const effects: (() => void)[] = [];
-          this.store.transaction(() => this.admitConversation(input.binding.taskId, effects));
-          for (const effect of effects) effect();
-        }
-      } catch {
-        try {
-          this.settleJob(attempt, false, true);
-        } catch {}
-      } finally {
-        completed.resolve();
-      }
-    };
-    try {
-      current();
-      const config = this.conversationConfiguration(
-        input.binding.taskId,
-      ) as ConversationConfiguration;
-      const profile = this.conversationProfile(config);
-      mkdirSync(input.directory, { recursive: true, mode: 0o700 });
-      runtime.handle = startConversation(
-        { ...profile.client, directory: input.directory, repositoryRoot: this.home, environment },
-        input,
-        {
-          timeoutMs: this.jobDeadline(attempt.id, input.binding.limitMinutes),
-          schedule: this.options.schedule,
-          spawn: this.options.nativeSpawn,
-          onSubmitted: () => {
-            current();
-            this.store.transaction(() => {
-              const artifact = this.nativeArtifact({
-                attemptId: attempt.id,
-                bindingHash: conversationBindingHash(input),
-              });
-              this.store.saveReceipt(
-                `conversation-submission:${attempt.id}`,
-                artifact.hash,
-                'local-owner',
-                { outcome: 'outcome-unknown', entity: artifact },
-              );
-            });
-          },
-          ...this.providerUsage(
-            attempt,
-            current,
-            () => this.conversationWorkers.get(attempt.id) === runtime && !runtime.stopped,
-            ['metadata-preparation', 'app-server-task'],
-          ),
-          lifecycle: this.nativeLifecycle(attempt, current),
-        },
-      );
-      if (runtime.stopped || this.closed) runtime.handle.stop();
-      void runtime.handle.result.then(finish, () => finish(null));
-    } catch {
-      finish(null);
-    }
   }
 
   private combinedManifest(group: CombinedGroup): CombinedManifest {
@@ -6587,29 +4704,6 @@ export class Controller {
         this.store.db.prepare('SELECT 1 FROM pending_effects WHERE task_id=? LIMIT 1').get(task.id)
       )
         return { outcome: 'blocked', reason: 'combined-draft-has-work' };
-    }
-    const allowance = this.taskAllowance(parent.id);
-    if (
-      allowance &&
-      (allowance.attempts < 7 ||
-        allowance.minutes <
-          4 +
-            (input.integration?.maximumMinutes ?? 1) +
-            input.children[0].maximumMinutes +
-            input.children[1].maximumMinutes +
-            input.reviewer.maximumMinutes ||
-        allowance.concurrency < 2)
-    )
-      return { outcome: 'blocked', reason: 'combined-task-budget-insufficient' };
-    for (const [index, child] of children.entries()) {
-      const allowance = this.taskAllowance((child as Task).id);
-      if (
-        allowance &&
-        (allowance.attempts < 1 ||
-          allowance.minutes < input.children[index].maximumMinutes ||
-          allowance.concurrency < 1)
-      )
-        return { outcome: 'blocked', reason: 'combined-child-budget-insufficient' };
     }
     const source = inspectSource(parent.projectId, this.projectPath(parent.projectId) as string);
     const files = committedFiles(this.projectPath(parent.projectId) as string, source.base);
@@ -7956,33 +6050,6 @@ export class Controller {
   }
 
   private draftEditGate(task: Task): CommandResult | undefined {
-    const discussion = this.conversationConfiguration(task.id);
-    if (discussion?.contractStatus === 'provisional')
-      return {
-        outcome: 'blocked',
-        reason: 'task-contract-unconfirmed',
-        next: 'Review and adopt a plan before preparing execution.',
-      };
-    if (this.store.runPurpose(task.runId ?? '') === 'conversation') {
-      const blocked = this.conversationBoundary(task.id);
-      if (blocked) return { outcome: 'blocked', reason: blocked };
-      const state = this.conversationState(task.id);
-      if (
-        !discussion?.adoptedProposal ||
-        discussion.adoptedProposal.runId !== task.runId ||
-        state.proposal?.id !== discussion.adoptedProposal.id ||
-        state.proposal.hash !== discussion.adoptedProposal.hash ||
-        !state.adopt.available
-      )
-        return {
-          outcome: 'blocked',
-          reason: 'proposal-not-current',
-          next: 'Adopt the current planning proposal before preparing execution.',
-        };
-      if (!this.planProposal(task.id, discussion.adoptedProposal))
-        return { outcome: 'blocked', reason: 'proposal-hash-changed' };
-      return;
-    }
     if (task.state !== 'draft') return;
     const run = task.runId ? this.store.get<Run>('run', task.runId) : undefined;
     const lease = this.store.db
@@ -8001,8 +6068,10 @@ export class Controller {
       };
     if (task.runId && (!run || run.taskId !== task.id))
       return { outcome: 'blocked', reason: 'run-not-current' };
+    // A retired planning run never wrote to the project, so its turns do not lock the draft.
     if (
       run &&
+      this.store.runPurpose(run.id) !== 'conversation' &&
       (run.revision !== 0 ||
         this.store.list<Attempt>('attempt').some((attempt) => attempt.runId === run.id) ||
         this.store.intents().some((intent) => intent.run_id === run.id) ||
@@ -8154,26 +6223,12 @@ export class Controller {
       return command.command === 'StartRun'
         ? this.startLocal(command, effects)
         : { outcome: 'blocked', reason: 'native-pilot-retain-only' };
-    if (run && this.store.runPurpose(run.id) === 'conversation') {
-      if (!task || run.taskId !== task.id || task.runId !== run.id)
-        return { outcome: 'blocked', reason: 'run-not-current' };
-      if (command.command !== 'ResumeRun')
-        return { outcome: 'blocked', reason: 'planning-run-requires-message' };
-      const boundary = this.conversationBoundary(run.taskId);
-      if (boundary) return { outcome: 'blocked', reason: boundary };
-      const config = this.conversationConfiguration(run.taskId);
-      if (!config) return { outcome: 'blocked', reason: 'not-configured' };
-      this.saveConversationConfiguration(run.taskId, { ...config, paused: false });
-      if (!this.conversation.pendingInputs(run.taskId).length) {
-        const updated = this.updateTask(task as Task, {
-          state: 'draft',
-          waitingReason: null,
-          next: 'Send a message to continue planning.',
-        });
-        return { outcome: 'applied', entity: updated, revision: updated.revision };
-      }
-      return this.admitConversation(run.taskId, effects);
-    }
+    if (run && this.store.runPurpose(run.id) === 'conversation')
+      return {
+        outcome: 'blocked',
+        reason: 'planning-run-retired',
+        next: 'Prepare an execution run for this task.',
+      };
     if (this.closed) return { outcome: 'blocked', reason: 'controller-closing' };
     if (
       !native &&
@@ -9619,22 +7674,18 @@ export class Controller {
     if (!request) return resolveOpenAiProjectSelection(undefined, undefined);
     if (profile.facts.id !== 'openai-repository-v1' || !profile.client || !profile.locationHash)
       throw Error('The OpenAI project profile is unavailable.');
-    const configuration = this.conversationConfiguration(taskId);
     const catalog = this.modelCatalog(taskId, request.observation, prepared);
     const task = this.store.get<Task>('task', taskId);
-    const reason = this.conversationCatalogReason(catalog);
+    const reason = this.catalogReason(catalog);
     const retained =
-      (prepared && 'origin' in catalog) ||
-      [this.taskModelCatalogReference(taskId), configuration?.modelCatalog].some(
-        (reference) => hashCanonical(reference ?? null) === hashCanonical(request.observation),
-      );
-    const source =
-      'origin' in catalog ? catalog.source : this.store.get<Run>('run', catalog.runId)?.source;
+      prepared ||
+      hashCanonical(this.taskModelCatalogReference(taskId) ?? null) ===
+        hashCanonical(request.observation);
+    const source = catalog.source;
     if (
       reason ||
       !retained ||
       !task ||
-      !source ||
       hashCanonical(source) !==
         hashCanonical(inspectSource(task.projectId, this.projectPath(task.projectId) as string)) ||
       hashCanonical(profile.client) !== hashCanonical(catalog.client) ||
@@ -15390,36 +13441,6 @@ export class Controller {
     };
   }
 
-  // A stored plan proposal counts only while its body still matches the referenced hash.
-  private planProposal(taskId: string, reference: { id: string; hash: string }) {
-    const row = this.store.db
-      .prepare('SELECT body FROM conversation_entries WHERE id=? AND task_id=?')
-      .get(reference.id, taskId);
-    const entry =
-      row &&
-      (JSON.parse(row.body as string) as Extract<
-        import('@crewkite/contracts').ConversationEntry,
-        { kind: 'plan-proposal' }
-      >);
-    return entry?.kind === 'plan-proposal' && hashCanonical(entry.proposal) === reference.hash
-      ? entry
-      : undefined;
-  }
-
-  // An adopted plan names the paths its coder slices may change while the task keeps the
-  // plan's criteria. Other tasks name none. A stored proposal that no longer matches its
-  // adopted hash throws.
-  private adoptedCoderScope(taskId: string): string[] {
-    const adopted = this.conversationConfiguration(taskId)?.adoptedProposal;
-    if (!adopted) return [];
-    const entry = this.planProposal(taskId, adopted);
-    if (!entry) throw Error('The adopted plan changed.');
-    const task = this.store.get<Task>('task', taskId) as Task;
-    if (hashCanonical(entry.proposal.criteria) !== hashCanonical(task.criteria)) return [];
-    const coder = entry.proposal.slices.filter((slice) => slice.role === 'coder');
-    return [...new Set(coder.flatMap((slice) => slice.scope))].sort();
-  }
-
   private nativeWriterPlan(binding: Omit<NativeBinding, 'planArtifact'>) {
     const { appointment, attempt } = binding;
     const criteria = [
@@ -15458,7 +13479,7 @@ export class Controller {
         },
         limits: {
           deadlineMs: appointment.maximumTaskMs,
-          paths: this.adoptedCoderScope(binding.run.taskId),
+          paths: [],
           // Verification preparation needs this journey and lockfile in the source.
           ...(committed('e2e/desktop.spec.ts') && committed('pnpm-lock.yaml')
             ? verificationGuidance
@@ -16720,8 +14741,6 @@ export class Controller {
       } catch {
         // Stop still closes launch authority when retained evidence cannot support evaluation.
       }
-      const config = this.conversationConfiguration(task.id);
-      if (config) this.saveConversationConfiguration(task.id, { ...config, paused: true });
       const updated = this.updateTask(
         task,
         restore ?? {
@@ -16794,53 +14813,6 @@ export class Controller {
         next: 'Waiting for the Local runtime terminal and client closure.',
       });
       effects.push(() => localRuntime.handle?.stop());
-      return { outcome: 'applied', entity: updated, revision: updated.revision };
-    }
-    if (
-      this.pendingConversationLaunches.has(active.attempt_id) &&
-      active.state === 'intent' &&
-      this.store.runPurpose(active.run_id) === 'conversation' &&
-      !this.store.nativeProcesses(active.attempt_id).length
-    ) {
-      this.pendingConversationLaunches.delete(active.attempt_id);
-      const config = this.conversationConfiguration(task.id) as ConversationConfiguration;
-      this.saveConversationConfiguration(task.id, { ...config, paused: true });
-      const attempt = this.store.get<Attempt>('attempt', active.attempt_id) as Attempt;
-      const stopped = { ...attempt, state: 'stopped' as const, revision: attempt.revision + 1 };
-      this.store.put('attempt', attempt.id, stopped.revision, stopped);
-      this.store.db
-        .prepare("UPDATE launch_intents SET state='stopped',finished_at=? WHERE attempt_id=?")
-        .run(this.now(), attempt.id);
-      this.store.db.prepare('DELETE FROM writer_leases WHERE attempt_id=?').run(attempt.id);
-      this.store.db.prepare('DELETE FROM reservations WHERE attempt_id=?').run(attempt.id);
-      const proof = this.nativeArtifact({
-        attemptId: attempt.id,
-        quiescent: true,
-        unspawned: true,
-      });
-      this.store.saveReceipt(`conversation-completion:${attempt.id}`, proof.hash, 'local-owner', {
-        outcome: 'applied',
-        entity: proof,
-      });
-      const updated = this.updateTask(task, {
-        state: 'stopped',
-        waitingReason: null,
-        next: 'Planning stopped before its process launched.',
-      });
-      this.event('attempt.stopped', task.id, updated.revision, stopped);
-      return { outcome: 'applied', entity: updated, revision: updated.revision };
-    }
-    const conversationRuntime = this.conversationWorkers.get(active.attempt_id);
-    if (conversationRuntime) {
-      const config = this.conversationConfiguration(task.id);
-      if (config) this.saveConversationConfiguration(task.id, { ...config, paused: true });
-      conversationRuntime.stopped = true;
-      const updated = this.updateTask(task, {
-        state: 'stopping',
-        waitingReason: null,
-        next: 'Waiting for the owned planning turn to stop.',
-      });
-      effects.push(() => conversationRuntime.handle?.stop());
       return { outcome: 'applied', entity: updated, revision: updated.revision };
     }
     const nativeReview = this.nativeReviewWorkers.get(active.attempt_id);
@@ -17300,11 +15272,6 @@ export class Controller {
         }
       }
       for (const intent of this.store.intents().filter((value) => value.state !== 'stopped')) {
-        if (this.store.runPurpose(intent.run_id) === 'conversation') {
-          const config = this.conversationConfiguration(intent.task_id);
-          if (config)
-            this.saveConversationConfiguration(intent.task_id, { ...config, paused: true });
-        }
         const attempt = this.store.get<Attempt>('attempt', intent.attempt_id);
         const run = this.store.get<Run>('run', intent.run_id);
         const task = this.store.get<Task>('task', intent.task_id);

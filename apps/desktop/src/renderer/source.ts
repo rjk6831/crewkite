@@ -424,7 +424,6 @@ export function useWorkspace() {
             | 'RefreshAnthropicUsage'
             | 'StopAnthropicUsage'
             | 'CheckNativeConnection'
-            | 'RefreshTaskModelCatalog'
             | 'InstallGoogleAcp'
             | 'StopGoogleAcpInstall'
             | 'InitializeGoogleAcp'
@@ -454,7 +453,6 @@ export function useWorkspace() {
         input.command === 'RefreshAnthropicUsage' ||
         input.command === 'StopAnthropicUsage' ||
         input.command === 'CheckNativeConnection' ||
-        input.command === 'RefreshTaskModelCatalog' ||
         input.command === 'InstallGoogleAcp' ||
         input.command === 'StopGoogleAcpInstall' ||
         input.command === 'InitializeGoogleAcp' ||
