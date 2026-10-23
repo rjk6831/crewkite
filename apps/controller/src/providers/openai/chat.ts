@@ -16,6 +16,7 @@ import {
   type ChatTurnResult,
   chatFailure,
 } from '../../chat/adapter.ts';
+import { scratchPath } from '../../chat/local-tools.ts';
 import { defaultSchedule, groupAbsent } from '../../host/worker.ts';
 import {
   type OpenAiUsageHook,
@@ -55,17 +56,26 @@ export function openAiChatAdapter(deps: OpenAiChatDeps): ChatAdapter {
   };
 }
 
-/** Chat edits the scratch copy, and every escalation comes back to CrewKite for an answer. */
-function nativeChatArguments(directory: string, readOnly = false): string[] {
+// `untrusted` brings every file change, and every command outside the client's own short list of
+// read-only ones, back to CrewKite as a question. allow-edits starts there too, and serverRequest
+// answers the edits that stay inside scratch. allow-all lets the client work inside its sandbox and
+// asks only to leave it.
+const approvalPolicy = (request: ChatTurnRequest) =>
+  request.permissionPolicy === 'allow-all' ? 'on-request' : 'untrusted';
+// Review and advice turns read only.
+const sandboxMode = (request: ChatTurnRequest) =>
+  request.readOnly ? 'read-only' : 'workspace-write';
+
+/** Chat edits the scratch copy, and every question the client asks comes back to CrewKite. */
+function nativeChatArguments(directory: string, request: ChatTurnRequest): string[] {
   const settings = {
     model_provider: 'openai',
     openai_base_url: '',
     chatgpt_base_url: 'https://chatgpt.com/backend-api/',
     service_tier: 'default',
-    approval_policy: 'on-request',
+    approval_policy: approvalPolicy(request),
     approvals_reviewer: 'user',
-    // Review and advice turns read only.
-    sandbox_mode: readOnly ? 'read-only' : 'workspace-write',
+    sandbox_mode: sandboxMode(request),
     web_search: 'disabled',
     'features.plugins': false,
     'features.remote_plugin': false,
@@ -231,6 +241,7 @@ const approval = z.object({
   itemId: maybe(id),
   reason: maybe(z.string()),
   command: maybe(z.string()),
+  cwd: maybe(z.string()),
   grantRoot: maybe(z.string()),
 });
 
@@ -280,6 +291,8 @@ class OpenAiChatTurn {
   private readonly thinking = new Set<string>();
   // Started tool calls and the text an approval question shows for them.
   private readonly tools = new Map<string, string>();
+  // The paths each started file change reported, which its approval request does not repeat.
+  private readonly edits = new Map<string, Array<{ path: string; inside: boolean }>>();
   private readonly output = new Map<string, number>();
   private readonly changed = new Set<string>();
   private readonly approvals = new Map<string, RpcId>();
@@ -342,7 +355,7 @@ class OpenAiChatTurn {
       const directory = privateStorage(launch);
       const env = nativeDiscoveryEnvironment(launch.environment);
       step = 'spawn';
-      const args = nativeChatArguments(directory, this.request.readOnly);
+      const args = nativeChatArguments(directory, this.request);
       const child = (deps.spawn ?? spawn)(executable, args, {
         cwd: this.request.scratch.directory,
         env,
@@ -458,10 +471,9 @@ class OpenAiChatTurn {
       model: selection.model,
       modelProvider: 'openai',
       cwd: scratch.directory,
-      approvalPolicy: 'on-request',
+      approvalPolicy: approvalPolicy(this.request),
       approvalsReviewer: 'user',
-      // Review and advice turns read only.
-      sandbox: this.request.readOnly ? 'read-only' : 'workspace-write',
+      sandbox: sandboxMode(this.request),
       serviceTier: 'default',
       ...(selection.effort === 'default'
         ? {}
@@ -612,8 +624,17 @@ class OpenAiChatTurn {
     const policy = this.request.permissionPolicy;
     // Review and advice turns read only.
     if (this.request.readOnly) return this.answer(answerId, 'deny');
-    if (policy === 'allow-all' || (policy === 'allow-edits' && kind === 'edit'))
-      return this.answer(answerId, 'allow-once');
+    if (policy === 'allow-all') return this.answer(answerId, 'allow-once');
+    // allow-edits and thread grants cover the scratch copy only. A change with no reported paths,
+    // a path or grant root outside scratch, or a command run from outside it goes to the person.
+    const paths = callId ? (this.edits.get(callId) ?? []) : [];
+    const grantRoot = value?.grantRoot ? this.local(value.grantRoot) : '';
+    const contained =
+      kind === 'edit'
+        ? paths.length > 0 && paths.every((entry) => entry.inside) && grantRoot !== null
+        : !value?.cwd || this.local(value.cwd) !== null;
+    if (!contained) return;
+    if (policy === 'allow-edits' && kind === 'edit') return this.answer(answerId, 'allow-once');
     // Thread grant: the person allowed this kind for the whole thread. Both events still go out,
     // so the thread shows what was allowed and why nobody was asked.
     if (this.request.permissionGrants?.includes(kind)) this.answer(answerId, 'allow-thread');
@@ -730,7 +751,9 @@ class OpenAiChatTurn {
       title = detail || 'Run a command';
       input = { command: detail, cwd: value?.cwd ?? null };
     } else if (head.type === 'fileChange') {
-      const paths = this.paths(raw).map((entry) => entry.path);
+      const entries = this.paths(raw);
+      this.edits.set(head.id, entries);
+      const paths = entries.map((entry) => entry.path);
       detail = paths.join('\n');
       kind = 'edit';
       title = paths.length ? `Edit ${paths.join(', ')}` : 'Edit files';
@@ -813,14 +836,30 @@ class OpenAiChatTurn {
   private paths(raw: unknown) {
     const seen = new Map<string, boolean>();
     for (const change of changeItem.safeParse(raw).data?.changes ?? []) {
-      const local = isAbsolute(change.path)
-        ? this.roots
-            .map((root) => relative(root, change.path))
-            .find((path) => path && !path.startsWith('..') && !isAbsolute(path))
-        : change.path;
-      seen.set(local ?? change.path, local !== undefined && !local.startsWith('..'));
+      const local = this.local(change.path);
+      seen.set(local || change.path, Boolean(local));
     }
     return [...seen].map(([path, inside]) => ({ path, inside }));
+  }
+
+  /**
+   * A reported path relative to scratch, '' for scratch itself, or null when it leaves the copy
+   * through `..` or a link, or lands in .git, which the controller runs git in.
+   */
+  private local(path: string): string | null {
+    const scratch = this.request.scratch.directory;
+    const full = resolve(scratch, path);
+    for (const root of this.roots) {
+      const local = relative(root, full);
+      if (local === '') return '';
+      if (local.startsWith('..') || isAbsolute(local)) continue;
+      try {
+        return scratchPath(scratch, local).relative;
+      } catch {
+        return null;
+      }
+    }
+    return null;
   }
 
   private think(itemId: string, text: string) {
