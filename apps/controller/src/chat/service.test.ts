@@ -21,7 +21,11 @@ import type {
   Task,
 } from '@crewkite/contracts';
 import { createDemoFixtures, createTestClock, createTestIds } from '@crewkite/testkit';
-import { type ChatScriptStep, createScriptedChatAdapter } from '@crewkite/testkit/chat-adapter';
+import {
+  type ChatScriptStep,
+  createScriptedChatAdapter,
+  type ScriptedChatRequest,
+} from '@crewkite/testkit/chat-adapter';
 import { createSyntheticRepository } from '@crewkite/testkit/repository';
 import { ArtifactFiles } from '../artifacts/index.ts';
 import type { Controller } from '../commands/controller.ts';
@@ -324,14 +328,28 @@ function limitThread(t: TestContext, options: { autoHandoff: boolean; resetsAt: 
   const reply = (text: string): ChatScriptStep[][] => [
     [{ kind: 'text', itemId: 'reply', chunks: [text] }],
   ];
+  const scripted = createScriptedChatAdapter({
+    family: 'openai',
+    turns: [[{ kind: 'fail', stopReason: 'limit', failure: limit }]],
+  });
+  // The stopped provider had edited a file and was in the middle of a command when the limit hit.
+  const stopped = {
+    ...scripted,
+    startTurn(request: ScriptedChatRequest, emit: (event: AgentEvent) => void) {
+      appendFileSync(join(request.scratch.directory, 'net.mjs'), '// half done\n');
+      const handle = scripted.startTurn(request, emit);
+      emit({
+        type: 'tool.started',
+        turnId: request.turnId,
+        callId: 'call-1',
+        kind: 'command',
+        title: 'Run the tests',
+      });
+      return handle;
+    },
+  };
   const adapters = new Map([
-    [
-      'openai',
-      createScriptedChatAdapter({
-        family: 'openai',
-        turns: [[{ kind: 'fail', stopReason: 'limit', failure: limit }]],
-      }),
-    ],
+    ['openai', stopped],
     ['anthropic', createScriptedChatAdapter({ family: 'anthropic', turns: reply('Not chosen.') })],
     ['google', createScriptedChatAdapter({ family: 'google', turns: reply('Carrying on.') })],
     ['local', createScriptedChatAdapter({ family: 'local', turns: reply('Not chosen.') })],
@@ -437,6 +455,14 @@ test('a usage limit writes a system line, and auto handoff runs the same message
   const [request] = on.adapters.get('google')?.requests ?? [];
   assert.match(request.prompt, /moved from OpenAI to Google\. Reason: usage limit reached\./);
   assert.match(request.prompt, /New message:\nFix the rounding\./);
+  assert.match(request.prompt, /^net\.mjs \+1 -0$/m);
+  assert.match(request.prompt, /^\+\/\/ half done$/m);
+  assert.match(
+    request.prompt,
+    /^OpenAI ended its last turn early\. Reason: usage limit reached\./m,
+  );
+  assert.match(request.prompt, /^In progress when it stopped: Run the tests \(command\)\.$/m);
+  assert.ok(Buffer.byteLength(request.prompt) < 96 * 1024);
   for (const family of ['anthropic', 'local'] as const)
     assert.equal(on.adapters.get(family)?.requests.length, 0);
 
