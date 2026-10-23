@@ -122,7 +122,7 @@ export class NativeLaunchCommands {
           deadlineMs: appointment.maximumTaskMs,
           paths: [],
           // Verification preparation needs this journey and lockfile in the source.
-          ...(committed('e2e/desktop.spec.ts') && committed('pnpm-lock.yaml')
+          ...(committed('e2e/thread.spec.ts') && committed('pnpm-lock.yaml')
             ? verificationGuidance
             : { checks: [], frozen: [] }),
           review: repositoryReviewBudget,

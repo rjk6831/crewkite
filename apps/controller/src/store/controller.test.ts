@@ -2191,7 +2191,7 @@ fixtureTest('attached fixture keeps the admitted stage group', async () => {
       ...file,
       tests: definition.required.tests,
     })),
-    journey: { file: 'e2e/desktop.spec.ts', title: journeyTitle, hash: fixtureClientHash } as const,
+    journey: { file: 'e2e/thread.spec.ts', title: journeyTitle, hash: fixtureClientHash } as const,
     stages: [...verificationStages] as [...typeof verificationStages],
     provenancePattern: 'fixture',
     maximumMinutes: 10 as const,
@@ -2409,7 +2409,7 @@ fixtureTest('attached fixture keeps the admitted stage group', async () => {
       const scenario = ${JSON.stringify(scenario)};
       const reporter = new Reporter();
       const test = { id: 'journey', title: ${JSON.stringify(journeyTitle)},
-        location: { file: ${JSON.stringify(resolve('e2e/desktop.spec.ts'))} },
+        location: { file: ${JSON.stringify(resolve('e2e/thread.spec.ts'))} },
         expectedStatus: scenario === 'expected failure' ? 'failed' : 'passed' };
       reporter.onBegin({}, { allTests: () => scenario === 'extra case' ? [test, test] : [test] });
       reporter.onTestEnd(test, { status: 'passed', retry: scenario === 'retry' ? 1 : 0, errors: [] });

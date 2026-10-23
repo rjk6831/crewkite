@@ -32,7 +32,8 @@ export const toolchainWorkspaces = [
   'packages/testkit',
 ] as const;
 export const verificationTarget = 'crewkite verify';
-export const journeyTitle = 'desktop and CLI retain one checked task through handoff and restart';
+export const journeyTitle =
+  'a new thread streams a reply, asks before editing and lists the edited file';
 export const verificationStages = [
   'policy',
   'lint',
@@ -91,7 +92,7 @@ export const ToolchainDefinitionSchema = z.strictObject({
     .min(1)
     .max(100),
   journey: z.strictObject({
-    file: z.literal('e2e/desktop.spec.ts'),
+    file: z.literal('e2e/thread.spec.ts'),
     title: z.literal(journeyTitle),
     hash: HashSchema,
   }),
@@ -163,7 +164,7 @@ const stageGuidance: Record<(typeof verificationStages)[number], string> = {
   types: 'tsc --noEmit',
   'node-tests': 'every committed *.test.ts and *.test.mjs under apps, packages and scripts',
   build: 'electron-vite build in apps/desktop',
-  desktop: 'playwright test e2e/desktop.spec.ts',
+  desktop: 'playwright test e2e/thread.spec.ts',
 };
 export const verificationGuidance = {
   checks: verificationStages.map((stage) => `${stage}: ${stageGuidance[stage]}`),
@@ -330,7 +331,7 @@ export async function prepareToolchain(input: {
       ...metadata(entry),
       tests: nodeTestNames(entry.content.toString('utf8')),
     }));
-  const journey = source.find((entry) => entry.path === 'e2e/desktop.spec.ts');
+  const journey = source.find((entry) => entry.path === 'e2e/thread.spec.ts');
   const lock = source.find((entry) => entry.path === 'pnpm-lock.yaml');
   if (!journey || !lock || !version.startsWith('git version '))
     throw Error('Verification source identity is missing.');
@@ -371,7 +372,7 @@ export async function prepareToolchain(input: {
       desktop: manifestEntry(require, '@playwright/test', 'playwright'),
     },
     collection,
-    journey: { file: 'e2e/desktop.spec.ts' as const, title: journeyTitle, hash: journey.hash },
+    journey: { file: 'e2e/thread.spec.ts' as const, title: journeyTitle, hash: journey.hash },
     stages: [...verificationStages] as [...typeof verificationStages],
     provenancePattern: input.provenancePattern,
     maximumMinutes: 10 as const,
