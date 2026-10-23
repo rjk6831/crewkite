@@ -3669,6 +3669,22 @@ export class Controller {
         };
       return;
     }
+    if (
+      [
+        'SendChatMessage',
+        'ResolveChatPermission',
+        'StopChatTurn',
+        'ConfigureChatThread',
+        'HandoffChatThread',
+        'AcceptChatChanges',
+      ].includes(command.command)
+    ) {
+      // A thread streams events many times a second. Its commands serialize on the active turn,
+      // so a revision race would only block Stop at the moment it matters most.
+      if (!('taskId' in command.payload) || !this.store.get<Task>('task', command.payload.taskId))
+        return { outcome: 'blocked', reason: 'task-not-found', next: 'Choose a registered task.' };
+      return;
+    }
     if (command.command === 'CaptureConversationContext') {
       const project = this.store.get<Project>('project', command.payload.projectId);
       if (!project) return { outcome: 'blocked', reason: 'project-not-found' };

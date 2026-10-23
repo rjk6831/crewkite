@@ -17,10 +17,12 @@ import {
 } from '@crewkite/contracts';
 import type { DesktopCommand, DesktopSource } from '../source.ts';
 
-// shortcut: the chat commands are not in CommandSchema yet, so each one is cast to DesktopCommand
-// here and nowhere else. Upgrade: send typed commands once the contract lists them and delete this
-// cast.
+// The chat commands are listed in CommandSchema. The cast stays in this one file so the thread
+// view never spells a command name anywhere else.
 export type ThreadSource = Pick<DesktopSource, 'command' | 'subscribe'>;
+// Mutations carry a revision by contract. The controller does not race chat commands on it, so
+// the thread sends zero and never has to chase the task revision while events stream.
+const CHAT_REVISION = 0;
 // The desktop does not depend on zod directly, so payload types come from the schema objects.
 type Input<S extends { _zod: { input: unknown } }> = S['_zod']['input'];
 
@@ -29,7 +31,11 @@ async function run(
   command: string,
   payload: unknown,
 ): Promise<CommandResult> {
-  const result = await source.command({ command, payload } as unknown as DesktopCommand);
+  const result = await source.command({
+    command,
+    payload,
+    ...(command.startsWith('Read') ? {} : { expectedRevision: CHAT_REVISION }),
+  } as unknown as DesktopCommand);
   if (result.outcome !== 'applied' && result.outcome !== 'already-applied')
     throw new Error(
       [result.reason ?? 'The controller did not accept this request.', result.next]
