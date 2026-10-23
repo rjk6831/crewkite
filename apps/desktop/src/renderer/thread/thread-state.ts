@@ -234,20 +234,37 @@ const STEP = 1000n;
 const FAILURE_OFFSET = 500n;
 const LAST = 1n << 80n;
 
-// Where a turn without cursored events belongs: after the last message written before it started.
-function startOrder(meta: ChatTurn, messages: readonly ChatMessage[]): bigint {
+// A turn's slot right after a message. The sequence keeps two turns on one message in order.
+const after = (cursor: bigint, meta: ChatTurn) =>
+  cursor * STEP + 1n + BigInt(Math.min(meta.sequence, 400));
+
+// The cursor of the last message written by the time the turn started.
+function startedAfter(meta: ChatTurn, messages: readonly ChatMessage[]): bigint {
   const started = Date.parse(meta.startedAt);
-  const before = messages.findLast((message) => Date.parse(message.at) <= started);
-  return (before ? BigInt(before.cursor) * STEP : 0n) + 1n + BigInt(Math.min(meta.sequence, 400));
+  return BigInt(messages.findLast((message) => Date.parse(message.at) <= started)?.cursor ?? 0);
 }
 
-// The ordered rows of the thread. Persisted messages and turns share one timeline by cursor. A turn
-// that was built from the stream sits at its first event. One restored from a read sits by the time
-// it started, or at its stored reply.
+// A turn sits right after the user message that started it. Messages count on the conversation
+// and agent events on the event log, two different clocks, so the message decides. A later turn on
+// the same message, the rerun after a limit handoff, also follows the lines written before it
+// started, such as the handoff notice.
+function askedOrder(meta: ChatTurn, asked: ChatMessage, state: ThreadState): bigint {
+  const rerun = Object.values(state.turnMeta).some(
+    (turn) => turn.userMessageId === meta.userMessageId && turn.sequence < meta.sequence,
+  );
+  const cursor = BigInt(asked.cursor);
+  const started = rerun ? startedAfter(meta, state.messages) : 0n;
+  return after(started > cursor ? started : cursor, meta);
+}
+
+// The ordered rows of the thread. A turn seen only on the stream keeps its first event cursor
+// until its record arrives and names the message. A turn whose message is not loaded sits by the
+// time it started, or at its stored reply.
 export function threadItems(state: ThreadState): ThreadItem[] {
   const rows: { order: bigint; item: ThreadItem }[] = [];
   const replies = new Map<string, ChatMessage>();
   const failed = new Set<string>();
+  const byId = new Map(state.messages.map((message) => [message.id, message]));
   for (const turn of Object.values(state.turnMeta))
     if (turn.failure && !isStop(turn.failure)) failed.add(turn.id);
   for (const record of Object.values(state.turns))
@@ -314,15 +331,18 @@ export function threadItems(state: ThreadState): ThreadItem[] {
     const failure = base.failure ?? (stopped ? null : (meta?.failure ?? null));
     const ended = record ? base.ended : status !== 'running' && status !== 'waiting-permission';
     const turn: TurnView = { ...base, identity, status, blocks, failure, ended };
+    const asked = meta && byId.get(meta.userMessageId);
     const firstCursor = record?.events[0]?.cursor ?? null;
     const order =
-      firstCursor !== null
-        ? firstCursor * STEP
-        : meta
-          ? startOrder(meta, state.messages)
-          : reply
-            ? BigInt(reply.cursor) * STEP
-            : LAST;
+      meta && asked
+        ? askedOrder(meta, asked, state)
+        : firstCursor !== null
+          ? firstCursor * STEP
+          : meta
+            ? after(startedAfter(meta, state.messages), meta)
+            : reply
+              ? BigInt(reply.cursor) * STEP
+              : LAST;
     if (blocks.length > 0 || !ended || status === 'stopped')
       rows.push({ order, item: { kind: 'turn', key: `turn:${id}`, turn } });
     if (failure)

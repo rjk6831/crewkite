@@ -29,12 +29,21 @@ const turn = id('trn', 1);
 const stamp = '2026-10-23T10:00:00.000Z';
 
 type Body = AgentEvent extends infer E ? (E extends AgentEvent ? Omit<E, 'turnId'> : never) : never;
-const agent = (cursor: number, event: Body): ThreadEvent => ({
+const on = (turnId: string, cursor: number, event: Body): ThreadEvent => ({
   type: 'agent.event',
   cursor: String(cursor),
   taskId: task,
-  payload: { ...event, turnId: turn },
+  payload: { ...event, turnId },
 });
+const agent = (cursor: number, event: Body) => on(turn, cursor, event);
+const begin = (turnId: string, cursor: number) =>
+  on(turnId, cursor, {
+    type: 'turn.started',
+    family: 'openai',
+    model: 'large-1',
+    effort: 'default',
+    role: 'assistant',
+  });
 const user = (cursor: number, text: string): ThreadEvent => {
   const message: ChatMessage = {
     id: id('msg', cursor),
@@ -47,14 +56,7 @@ const user = (cursor: number, text: string): ThreadEvent => {
   };
   return { type: 'conversation.entry', cursor: String(cursor), taskId: task, payload: message };
 };
-const started = (cursor: number) =>
-  agent(cursor, {
-    type: 'turn.started',
-    family: 'openai',
-    model: 'large-1',
-    effort: 'default',
-    role: 'assistant',
-  });
+const started = (cursor: number) => begin(turn, cursor);
 const run = (events: ThreadEvent[]) =>
   threadItems(reduceThread(initialThreadState(task), { type: 'events', events }));
 const turnOf = (items: ThreadItem[]) => {
@@ -77,6 +79,126 @@ test('events fold into one timeline in cursor order', () => {
   assert.deepEqual(
     turnOf(items).blocks.map((block) => block.kind),
     ['tool', 'text'],
+  );
+
+  // Messages count on the conversation, 13 and 15, and agent events on the event log, 616 and 657.
+  // A turn still sits right after the user message that started it.
+  const [first, second] = [id('trn', 2), id('trn', 3)];
+  const thread: ChatThread = {
+    taskId: task,
+    scratchReady: true,
+    base: null,
+    selection: null,
+    permissionPolicy: 'ask',
+    sessions: [],
+    activeTurnId: null,
+    autoHandoff: false,
+  };
+  const at = (minutes: number) => new Date(Date.parse(stamp) + minutes * 60_000).toISOString();
+  const record = (turnId: string, sequence: number, asked: number, more: Partial<ChatTurn> = {}) =>
+    ({
+      id: turnId,
+      taskId: task,
+      sequence,
+      role: 'assistant',
+      selection: { family: 'openai', model: 'large-1', effort: 'default' },
+      userMessageId: id('msg', asked),
+      assistantMessageId: null,
+      state: 'done',
+      startedAt: stamp,
+      endedAt: stamp,
+      failure: null,
+      handoffFrom: null,
+      ...more,
+    }) satisfies ChatTurn;
+  const meta = (turn: ChatTurn, cursor: number): ThreadEvent => ({
+    type: 'chat.turn',
+    cursor: String(cursor),
+    taskId: task,
+    payload: turn,
+  });
+  const line = (cursor: number, author: ChatMessage['author'], text: string, written = stamp) => ({
+    ...(user(cursor, text).payload as ChatMessage),
+    author,
+    at: written,
+  });
+  const reply = (cursor: number, turnId: string, written = stamp) =>
+    line(
+      cursor,
+      { kind: 'assistant', turnId, family: 'openai', model: 'large-1', role: 'assistant' },
+      'Done.',
+      written,
+    );
+  const asked = (cursor: number) => user(cursor, `Question ${cursor}`).payload as ChatMessage;
+  const keys = (state: ReturnType<typeof initialThreadState>) =>
+    threadItems(state).map((item) => item.key);
+  const load = (turns: ChatTurn[], messages: ChatMessage[]) =>
+    reduceThread(initialThreadState(task), {
+      type: 'loaded',
+      read: { thread, turns, messages, liveEvents: [], cursor: '700' },
+    });
+  const interleaved = [id('msg', 13), `turn:${first}`, id('msg', 15), `turn:${second}`];
+
+  // Two finished turns restored from a read, with every message written in the same minute.
+  assert.deepEqual(
+    keys(
+      load(
+        [record(first, 0, 13), record(second, 1, 15)],
+        [asked(13), reply(14, first), asked(15), reply(16, second)],
+      ),
+    ),
+    interleaved,
+  );
+
+  // Both turns built from the stream. The second is still running when its record arrives.
+  let live = reduceThread(initialThreadState(task), {
+    type: 'events',
+    events: [
+      user(13, 'Question 13'),
+      begin(first, 616),
+      on(first, 617, { type: 'text.completed', itemId: 'a', text: 'Done.' }),
+      on(first, 618, { type: 'turn.completed', stopReason: 'done', failure: null }),
+      meta(record(first, 0, 13), 619),
+      user(15, 'Question 15'),
+      begin(second, 657),
+      on(second, 658, { type: 'text.delta', itemId: 'a', text: 'Look' }),
+    ],
+  });
+  assert.deepEqual(keys(live), interleaved);
+  live = reduceThread(live, {
+    type: 'events',
+    events: [meta(record(second, 1, 15, { state: 'running', endedAt: null }), 659)],
+  });
+  assert.deepEqual(keys(live), interleaved);
+
+  // A limit handoff runs the same message again. The rerun follows the handoff line, and the
+  // first turn's failure stays above both.
+  const limit: ChatFailure = {
+    stage: 'stream',
+    kind: 'usage-limit',
+    message: 'The weekly limit is reached.',
+    providerMessage: null,
+    method: null,
+    code: null,
+    resetsAt: null,
+    nextAction: 'Continue on another provider.',
+  };
+  assert.deepEqual(
+    keys(
+      load(
+        [
+          record(first, 0, 10, { state: 'failed', failure: limit }),
+          record(second, 1, 10, { startedAt: at(2) }),
+        ],
+        [
+          asked(10),
+          line(11, { kind: 'system', turnId: first }, 'OpenAI reached its usage limit.', at(1)),
+          line(12, { kind: 'system', turnId: null }, 'Continued on Anthropic from OpenAI.', at(2)),
+          reply(13, second, at(3)),
+        ],
+      ),
+    ),
+    [id('msg', 10), `failure:${first}`, id('msg', 12), `turn:${second}`],
   );
 });
 
@@ -187,20 +309,6 @@ test('the limit offer shows only while the newest turn is the one that hit a lim
     resetsAt: null,
     nextAction: 'Continue on another provider.',
   });
-  const on = (turnId: string, cursor: number, event: Body): ThreadEvent => ({
-    type: 'agent.event',
-    cursor: String(cursor),
-    taskId: task,
-    payload: { ...event, turnId },
-  });
-  const begin = (turnId: string, cursor: number) =>
-    on(turnId, cursor, {
-      type: 'turn.started',
-      family: 'openai',
-      model: 'large-1',
-      effort: 'default',
-      role: 'assistant',
-    });
   const end = (turnId: string, cursor: number, stopReason: 'limit' | 'error' | 'done') =>
     on(turnId, cursor, {
       type: 'turn.completed',
