@@ -278,10 +278,11 @@ function chatArguments(request: ChatTurnRequest, resume: string | null) {
     '--include-partial-messages',
     '--permission-prompt-tool',
     'stdio',
-    // The scratch copy carries the project's own .claude settings, and their allow rules would
-    // answer before CrewKite is asked. User settings only, with hooks off in every source.
+    // Settings files carry allow rules that answer before CrewKite is asked, in the scratch
+    // copy's own file and in the person's user file. No source loads; hooks stay off too. The
+    // usage read runs the same way and signs in fine, so sign-in does not depend on settings.
     '--setting-sources',
-    'user',
+    '',
     '--settings',
     '{"disableAllHooks":true}',
     '--permission-mode',

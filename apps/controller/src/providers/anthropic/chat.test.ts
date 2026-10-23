@@ -2,10 +2,10 @@
 // below are the recorded lines; a live run should confirm each one.
 //
 // argv: --print --output-format stream-json --input-format stream-json --verbose
-//   --include-partial-messages --permission-prompt-tool stdio --setting-sources user
+//   --include-partial-messages --permission-prompt-tool stdio --setting-sources ''
 //   --settings {"disableAllHooks":true} --permission-mode default|acceptEdits --model M
-//   [--effort E] [--resume S]. With --setting-sources user the scratch copy's own .claude
-//   settings never load, so no project allow rule answers an ask before CrewKite sees it.
+//   [--effort E] [--resume S]. With no setting sources neither the scratch copy's own .claude
+//   settings nor the user file load, so no allow rule answers an ask before CrewKite sees it.
 //
 // stdin, one JSON object per line:
 //   {"type":"user","message":{"role":"user","content":[{"type":"text","text":"..."}]}}
@@ -384,7 +384,7 @@ test('a new session gets the framing and a saved one is resumed with the prompt 
     '--permission-prompt-tool',
     'stdio',
     '--setting-sources',
-    'user',
+    '',
     '--settings',
     '{"disableAllHooks":true}',
     '--permission-mode',
