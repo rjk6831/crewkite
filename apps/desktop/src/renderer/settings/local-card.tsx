@@ -6,7 +6,16 @@ import { type CardProps, ProviderCard } from './provider-card.tsx';
 const gib = (bytes: number | null | undefined) =>
   bytes === null || bytes === undefined ? 'Unknown' : `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
 
-function Hardware({ header }: { header: WorkspaceState }) {
+// A small aside under the note, which already states the fact in words. The snippet is hidden from
+// assistive technology so it does not read out as a second statement.
+const allowanceSnippet = `function allowance(localAI) {
+  try { return Roots.NoLimits(localAI).limit; } // null
+  catch (limit) {
+    return [hardware, imagination].includes(limit) ? limit : null;
+  }
+}`;
+
+function Hardware({ header, connected }: { header: WorkspaceState; connected: boolean }) {
   const hardware = header.localHardware;
   const memory =
     hardware?.totalMemoryBytes == null
@@ -24,6 +33,11 @@ function Hardware({ header }: { header: WorkspaceState }) {
         Runs on this computer. There is no subscription allowance, so speed and context depend on
         the loaded model and free memory.
       </p>
+      {connected && (
+        <pre className="st-code" aria-hidden="true">
+          <code>{allowanceSnippet}</code>
+        </pre>
+      )}
       <div className="facts-grid compact">
         <Fact label="Processor" value={hardware?.cpuModel ?? 'Unknown'} />
         <Fact label="Logical cores" value={hardware?.logicalCores ?? 'Unknown'} />
@@ -46,7 +60,7 @@ export function LocalCard({ header, workspace, entry }: CardProps) {
       entry={entry}
       detail={header.localSetup?.endpoint ?? undefined}
       main={<LocalSetup snapshot={header} workspace={workspace} />}
-      side={<Hardware header={header} />}
+      side={<Hardware header={header} connected={entry?.connected === true} />}
     />
   );
 }

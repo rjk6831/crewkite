@@ -116,6 +116,18 @@
   line-height: 1.6;
   overflow-wrap: anywhere;
 }
+.st-code {
+  margin: 0;
+  padding: 8px 10px;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--background);
+  color: var(--text-dim);
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10.5px;
+  line-height: 1.6;
+}
 .st-actions {
   display: flex;
   flex-wrap: wrap;
