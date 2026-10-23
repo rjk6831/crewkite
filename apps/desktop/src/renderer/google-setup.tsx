@@ -6,8 +6,10 @@ import {
   pollGoogleSetupStatus,
   runGoogleSetupFlow,
 } from './google-setup-flow.ts';
-import { googleAcpLabel } from './launch.tsx';
 import type { Workspace } from './source.ts';
+
+const googleAcpLabel =
+  'Google’s published ACP agent, signed in with your own Google account. Google documents this agent for editors; CrewKite is not named.';
 
 const setupLabels: Record<string, string> = {
   uninitialized: 'Not initialized',

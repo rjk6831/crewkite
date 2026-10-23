@@ -1,29 +1,12 @@
 import {
-  type Artifact,
-  ArtifactRangeSchema,
-  ArtifactSchema,
-  ArtifactVerificationSchema,
-  CONVERSATION_CONTEXT_MEDIA_TYPE,
-  CommandIdSchema,
   type CommandResult,
   CommandResultSchema,
-  type ConversationContextBundle,
-  ConversationContextBundleSchema,
-  type ConversationContextRef,
-  ConversationContextRefSchema,
-  canonicalJson,
-  type DesktopNotice,
   DesktopNoticeSchema,
-  type Event,
   EventSchema,
-  ProjectIdSchema,
   type ProjectPage,
   ProjectPageSchema,
   type Snapshot,
   SnapshotSchema,
-  TaskActivityOutputPageSchema,
-  type TaskActivityRequest,
-  TaskActivityRequestSchema,
   type TaskPage,
   type TaskPageRequest,
   TaskPageSchema,
@@ -37,105 +20,12 @@ import { isStreamEvent, isThreadEvent } from './thread/commands.ts';
 
 export type { DesktopCommand, DesktopSource } from '@crewkite/client';
 
-import type {
-  ConversationContextCapture,
-  ConversationContextReceipt,
-  ConversationContextRequest,
-  DesktopCommand,
-  DesktopSource,
-} from '@crewkite/client';
+import type { DesktopCommand, DesktopSource } from '@crewkite/client';
 
 declare global {
   interface Window {
     crewkite?: DesktopSource;
   }
-}
-
-export class ConversationContextCaptureError extends Error {
-  readonly receipt: ConversationContextReceipt;
-  constructor(receipt: ConversationContextReceipt) {
-    super('The context capture outcome is uncertain. Retry this capture before choosing again.');
-    this.name = 'ConversationContextCaptureError';
-    this.receipt = Object.freeze({ ...receipt });
-  }
-}
-export type ResolvedConversationContext = {
-  ref: ConversationContextRef;
-  bundle: ConversationContextBundle;
-};
-function contextReceipt(input: ConversationContextReceipt): ConversationContextReceipt {
-  if (Object.keys(input).length !== 3 || !/^[a-f0-9]{40}$/.test(input.base))
-    throw new Error('The context receipt is invalid.');
-  return {
-    receiptId: CommandIdSchema.parse(input.receiptId),
-    projectId: ProjectIdSchema.parse(input.projectId),
-    base: input.base,
-  };
-}
-const digest = async (bytes: Uint8Array<ArrayBuffer>) =>
-  Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)), (byte) =>
-    byte.toString(16).padStart(2, '0'),
-  ).join('');
-export async function resolveConversationContext(
-  source: Pick<DesktopSource, 'command'>,
-  input: ConversationContextRef,
-): Promise<ResolvedConversationContext> {
-  const ref = ConversationContextRefSchema.parse(input);
-  let artifact: ReturnType<typeof ArtifactSchema.parse> | null = null;
-  const bytes = new Uint8Array(32768);
-  let offset = 0;
-  for (;;) {
-    const part = CommandResultSchema.parse(
-      await source.command({
-        command: 'GetArtifact',
-        payload: { artifactId: ref.artifactId, offset, limit: 8192 },
-      }),
-    );
-    if (
-      (part.outcome !== 'applied' && part.outcome !== 'already-applied') ||
-      part.data?.kind !== 'artifact'
-    )
-      throw new Error('The context artifact is unavailable.');
-    const data = part.data;
-    if (!artifact) artifact = ArtifactSchema.parse(data.artifact);
-    if (
-      artifact.id !== ref.artifactId ||
-      artifact.hash !== ref.hash ||
-      artifact.mediaType !== CONVERSATION_CONTEXT_MEDIA_TYPE ||
-      artifact.bytes < 1 ||
-      artifact.bytes > bytes.length ||
-      canonicalJson(data.artifact) !== canonicalJson(artifact) ||
-      data.offset !== offset ||
-      data.encoding !== 'base64' ||
-      data.content.length > 10924
-    )
-      throw new Error('The context artifact identity changed.');
-    const decoded = atob(data.content);
-    if (
-      btoa(decoded) !== data.content ||
-      decoded.length < 1 ||
-      decoded.length !== Math.min(8192, artifact.bytes - offset) ||
-      offset + decoded.length > artifact.bytes
-    )
-      throw new Error('The context artifact chunk is invalid.');
-    for (let index = 0; index < decoded.length; index++)
-      bytes[offset + index] = decoded.charCodeAt(index);
-    offset += decoded.length;
-    if (data.eof !== (offset === artifact.bytes))
-      throw new Error('The context artifact length changed.');
-    if (data.eof) break;
-  }
-  const content = bytes.slice(0, offset);
-  if ((await digest(content)) !== ref.hash)
-    throw new Error('The context artifact checksum changed.');
-  const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(content);
-  const bundle = ConversationContextBundleSchema.parse(JSON.parse(text));
-  if (canonicalJson(bundle) !== text) throw new Error('The context artifact is not canonical.');
-  for (const file of bundle.files) {
-    if ((await digest(new TextEncoder().encode(file.text))) !== file.hash)
-      throw new Error('The context file checksum changed.');
-  }
-  return { ref, bundle };
 }
 
 export function useWorkspace() {
@@ -152,7 +42,6 @@ export function useWorkspace() {
   const selectedTask = useRef<string | null>(null);
   const detailCache = useRef(new Map<string, Snapshot>());
   const headerRef = useRef<WorkspaceState | null>(null);
-  const activityTail = useRef<Promise<unknown>>(Promise.resolve());
   const pageRead = useRef(false);
   const pageTail = useRef<Promise<unknown>>(Promise.resolve());
   const queuePage = useCallback(<T>(read: () => Promise<T>): Promise<T> => {
@@ -278,91 +167,11 @@ export function useWorkspace() {
       setNavigationBusy(false);
     }
   }, [source, projectPage, queuePage]);
-  const [{ events, droppedThrough }, setActivity] = useState<{
-    events: Event[];
-    droppedThrough: string | null;
-  }>({ events: [], droppedThrough: null });
-  const [activityRevision, setActivityRevision] = useState(0);
-  const readTaskActivity = useCallback(
-    (input: Omit<TaskActivityRequest, 'limit'> & { limit?: number }) => {
-      const read = async () => {
-        if (!source) throw new Error('The desktop bridge is unavailable.');
-        const request = TaskActivityRequestSchema.parse(input);
-        const result = CommandResultSchema.parse(
-          await source.command({ command: 'GetTaskActivityPage', payload: request }),
-        );
-        if (result.outcome !== 'applied' && result.outcome !== 'already-applied')
-          throw new Error([result.reason ?? result.outcome, result.next].filter(Boolean).join(' '));
-        const parsed = TaskActivityOutputPageSchema.safeParse(result.data);
-        if (!parsed.success)
-          throw new Error('Task activity is unavailable: the retained page is invalid.');
-        const page = parsed.data;
-        if (
-          page.taskId !== request.taskId ||
-          (request.beforeCursor !== undefined &&
-            page.entries.some(
-              (entry) =>
-                BigInt(entry.kind === 'event' ? entry.event.cursor : entry.cursor) >=
-                BigInt(request.beforeCursor ?? '0'),
-            ))
-        )
-          throw new Error('Task activity is unavailable: the page does not match the request.');
-        return page;
-      };
-      const result = activityTail.current.then(read);
-      activityTail.current = result.catch(() => {});
-      return result;
-    },
-    [source],
-  );
-  const readArtifactRange = useCallback(
-    async (artifact: Artifact, offset: number) => {
-      if (!source) throw new Error('The desktop bridge is unavailable.');
-      const result = CommandResultSchema.parse(
-        await source.command({
-          command: 'GetArtifactRange',
-          payload: { artifactId: artifact.id, offset, limit: 65536 },
-        }),
-      );
-      if (result.outcome !== 'applied') throw new Error(result.reason ?? 'Output is unavailable.');
-      const page = ArtifactRangeSchema.parse(result.data);
-      if (page.offset !== offset || canonicalJson(page.artifact) !== canonicalJson(artifact))
-        throw new Error('The output identity changed.');
-      return page;
-    },
-    [source],
-  );
-  const verifyArtifact = useCallback(
-    async (requestId: string, artifact: Artifact) => {
-      if (!source?.verifyArtifact) throw new Error('Output verification is unavailable.');
-      const proof = ArtifactVerificationSchema.parse(
-        await source.verifyArtifact({ requestId, artifact }),
-      );
-      if (proof.hash !== artifact.hash || proof.bytes !== artifact.bytes)
-        throw new Error('Output verification identity changed.');
-      return proof;
-    },
-    [source],
-  );
-  const cancelArtifactVerification = useCallback(
-    async (requestId: string) => {
-      await source?.cancelArtifactVerification?.(requestId);
-    },
-    [source],
-  );
   const [connection, setConnection] = useState('connecting');
   const [error, setError] = useState<string | null>(null);
   const [transportError, setTransportError] = useState<string | null>(null);
   const [pending, setPending] = useState(0);
-  const [pendingRuns, setPendingRuns] = useState<
-    { token: symbol; input: Extract<DesktopCommand, { command: 'StartRun' | 'StopRun' }> }[]
-  >([]);
   const [retryAvailable, setRetryAvailable] = useState(false);
-  const [historyGap, setHistoryGap] = useState<string | null>(null);
-  const [exportNotice, setExportNotice] = useState<Extract<
-    DesktopNotice,
-    { kind: 'export' }
-  > | null>(null);
   const connectionState = useRef('connecting');
   const reading = useRef<Promise<WorkspaceState> | null>(null);
   const dirty = useRef(false);
@@ -398,7 +207,6 @@ export function useWorkspace() {
           setNavigationStale(Boolean(previous));
           if (previous?.stamp.epoch !== next.stamp.epoch) {
             detailCache.current.clear();
-            setActivity({ events: [], droppedThrough: null });
             setDetailStale(Boolean(previous && selectedTask.current));
           }
           let page: ProjectPage;
@@ -524,18 +332,6 @@ export function useWorkspace() {
             ]),
           ),
         );
-      setActivity((current) => {
-        if (current.events.some(({ id }) => id === parsed.data.id)) return current;
-        // Bound the shared live tail. Task Activity reads retained pages separately.
-        const ordered = [...current.events, parsed.data].sort((a, b) =>
-          BigInt(a.cursor) < BigInt(b.cursor) ? -1 : 1,
-        );
-        return {
-          events: ordered.slice(-200),
-          droppedThrough:
-            ordered.length > 200 ? ordered[ordered.length - 201].cursor : current.droppedThrough,
-        };
-      });
       void refresh().catch((failure: unknown) => {
         if (active)
           setTransportError(
@@ -548,7 +344,6 @@ export function useWorkspace() {
       connectionState.current = state;
       setConnection(state);
       if (state === 'connected') {
-        setActivityRevision((value) => value + 1);
         setTransportError(null);
         void refresh().catch((failure: unknown) => {
           if (active)
@@ -566,15 +361,11 @@ export function useWorkspace() {
       const notice = parsed.data;
       if (notice.kind === 'connection') changedConnection(notice.state);
       else if (notice.kind === 'retry') setRetryAvailable(notice.available);
-      else if (notice.kind === 'export') setExportNotice(notice);
-      else {
-        setHistoryGap(notice.after);
-        setActivityRevision((value) => value + 1);
+      else if (notice.kind === 'history-gap')
         void refresh().catch(() => {
           if (active)
             setTransportError('History is incomplete. Reconnect to refresh current task state.');
         });
-      }
     });
     return () => {
       active = false;
@@ -596,20 +387,10 @@ export function useWorkspace() {
     }
   }, []);
   const perform = useCallback(
-    <T extends CommandResult | ConversationContextCapture | null>(
-      action: () => Promise<T>,
-      reportError = true,
-    ): Promise<T> =>
+    <T extends CommandResult | null>(action: () => Promise<T>, reportError = true): Promise<T> =>
       track(async () => {
         const value = await action();
-        const result =
-          value === null
-            ? null
-            : 'receiptId' in value
-              ? value.result === null
-                ? null
-                : CommandResultSchema.parse(value.result)
-              : CommandResultSchema.parse(value);
+        const result = value === null ? null : CommandResultSchema.parse(value);
         if (!result) return value;
         if (reportError && result.outcome !== 'applied' && result.outcome !== 'already-applied') {
           setError([result.reason ?? result.outcome, result.next].filter(Boolean).join(' '));
@@ -632,26 +413,6 @@ export function useWorkspace() {
         return value;
       }, reportError),
     [refresh, track],
-  );
-  const operationCommand = useCallback(
-    async (
-      input: Extract<
-        DesktopCommand,
-        {
-          command:
-            | 'GetTaskOperations'
-            | 'GetProjectOperation'
-            | 'PrepareProjectCommand'
-            | 'StartProjectCommand'
-            | 'ReadGitHub'
-            | 'StopProjectOperation';
-        }
-      >,
-    ) => {
-      if (!source) throw new Error('The desktop bridge is unavailable.');
-      return CommandResultSchema.parse(await source.command(input));
-    },
-    [source],
   );
   const metadataCommand = useCallback(
     async (
@@ -706,15 +467,7 @@ export function useWorkspace() {
         input.command !== 'GetTaskConversationState' && input.command !== 'GetTaskConversation';
       return perform(async () => {
         if (!source) throw new Error('The desktop bridge is unavailable.');
-        if (input.command !== 'StartRun' && input.command !== 'StopRun')
-          return source.command(input);
-        const token = Symbol();
-        setPendingRuns((current) => [...current, { token, input }]);
-        try {
-          return await source.command(input);
-        } finally {
-          setPendingRuns((current) => current.filter((value) => value.token !== token));
-        }
+        return source.command(input);
       }, reportError);
     },
     [source, perform, metadataCommand],
@@ -729,55 +482,6 @@ export function useWorkspace() {
       if (!source?.retryCommand)
         throw new Error('Exact command retry is unavailable in this view.');
       return source.retryCommand(expected);
-    });
-  const resolveContext = (ref: ConversationContextRef) =>
-    track(async () => {
-      if (!source) throw new Error('The desktop bridge is unavailable.');
-      return resolveConversationContext(source, ref);
-    });
-  const finishCapture = async (
-    scope: { projectId: string; base: string },
-    capture: ConversationContextCapture,
-  ): Promise<ResolvedConversationContext> => {
-    const receipt = contextReceipt({
-      projectId: scope.projectId,
-      base: scope.base,
-      receiptId: capture.receiptId,
-    });
-    const result = capture.result === null ? null : CommandResultSchema.parse(capture.result);
-    if (!result || result.outcome === 'outcome-unknown')
-      throw new ConversationContextCaptureError(receipt);
-    if (result.outcome !== 'applied' && result.outcome !== 'already-applied')
-      throw new Error([result.reason ?? result.outcome, result.next].filter(Boolean).join(' '));
-    const artifact = ArtifactSchema.parse(result.entity);
-    const resolved = await resolveContext({ artifactId: artifact.id, hash: artifact.hash });
-    if (resolved.bundle.projectId !== scope.projectId || resolved.bundle.base !== scope.base)
-      throw new Error('The context artifact belongs to a different project or base.');
-    return resolved;
-  };
-  const pickConversationContext = (input: ConversationContextRequest) =>
-    track(async () => {
-      if (!source?.pickConversationContext)
-        throw new Error('Context selection is unavailable in this view.');
-      const capture = await perform(() =>
-        source.pickConversationContext
-          ? source.pickConversationContext(input)
-          : Promise.reject(new Error('Context selection is unavailable.')),
-      );
-      return capture === null ? null : finishCapture(input, capture);
-    });
-  const retryConversationContext = (input: ConversationContextReceipt) =>
-    track(async () => {
-      const receipt = contextReceipt(input);
-      if (!source?.retryConversationContext)
-        throw new Error('Context retry is unavailable in this view.');
-      const capture = await perform(() =>
-        source.retryConversationContext
-          ? source.retryConversationContext(receipt)
-          : Promise.reject(new Error('Context retry is unavailable.')),
-      );
-      if (capture.receiptId !== receipt.receiptId) throw new Error('The context receipt changed.');
-      return finishCapture(receipt, capture);
     });
   const reconnect = async () => {
     setTransportError(null);
@@ -804,43 +508,22 @@ export function useWorkspace() {
     loadTasks,
     loadProjects,
     readTaskPage,
-    events,
-    readTaskActivity,
-    readArtifactRange,
-    verifyArtifact,
-    cancelArtifactVerification,
-    activityRevision,
     connection,
     preview,
     pending: pending > 0 || detailStale,
-    pendingStart:
-      pendingRuns.flatMap(({ input }) =>
-        input.command === 'StartRun' ? [input.payload] : [],
-      )[0] ?? null,
-    pendingStop: pendingRuns.some(({ input }) => input.command === 'StopRun'),
     error: error ?? transportError,
     setError: (value: string | null) => {
       setError(value);
       if (value === null) setTransportError(null);
     },
-    dismissError: (expected: string) =>
-      setError((current) => (current === expected ? null : current)),
     refresh,
     command,
     metadataCommand,
-    operationCommand,
     pickProject,
     canPickProject: !!source?.pickProject,
-    pickConversationContext,
-    retryConversationContext,
-    resolveConversationContext: resolveContext,
-    canPickConversationContext: !!source?.pickConversationContext,
     reconnect,
     retryCommand,
     retryAvailable,
-    historyGap: historyGap ?? droppedThrough,
-    exportNotice,
-    dismissExportNotice: () => setExportNotice(null),
   };
 }
 
