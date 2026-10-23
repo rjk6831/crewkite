@@ -382,8 +382,7 @@ test('tool calls written as text run through the same gate and their results go 
         'permission.resolved',
         'tool.output',
         'tool.completed',
-        'text.delta',
-        'text.completed',
+        'provider.notice',
         'text.delta',
         'text.completed',
         'provider.notice',
@@ -403,11 +402,7 @@ test('tool calls written as text run through the same gate and their results go 
     assert.equal(asked?.callId, started[1].callId);
     assert.deepEqual(
       events.flatMap((event) => (event.type === 'text.delta' ? [event.text] : [])),
-      [
-        'Reading src/a.ts.\n',
-        'The model wrote a tool call this app could not read.',
-        'Renamed n to count.',
-      ],
+      ['Reading src/a.ts.\n', 'Renamed n to count.'],
     );
     assert.equal(
       readFileSync(join(scratch, 'src/a.ts'), 'utf8'),
@@ -428,13 +423,14 @@ test('tool calls written as text run through the same gate and their results go 
 
     assert.deepEqual(
       events.filter((event) => event.type === 'provider.notice').map((event) => event.message),
-      ['Local: 1,400 in, 130 out, 20 tok/s, 4.0 s total'],
+      [
+        // The unreadable call is a notice, so it stays out of the stored reply.
+        'Local: the model wrote a tool call CrewKite could not read. Try again or pick another model.',
+        'Local: 1,400 in, 130 out, 20 tok/s, 4.0 s total',
+      ],
     );
     assert.equal(result.stopReason, 'done');
-    assert.equal(
-      result.assistantText,
-      'Reading src/a.ts.\n\n\nThe model wrote a tool call this app could not read.\n\nRenamed n to count.',
-    );
+    assert.equal(result.assistantText, 'Reading src/a.ts.\n\n\nRenamed n to count.');
     assert.deepEqual(result.changedPaths, ['src/a.ts']);
   } finally {
     rmSync(root, { recursive: true, force: true });

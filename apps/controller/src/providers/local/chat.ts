@@ -445,7 +445,10 @@ export function parseTextToolCalls(text: string, tools: readonly LocalTool[] = L
 }
 
 const TEXT_CALL_OPENERS = ['<tool_call>', '<function='];
-const UNREADABLE_CALL = 'The model wrote a tool call this app could not read.';
+// A notice, so the words stay out of the reply that later prompts and handoffs carry. The model
+// gets its own error for the call.
+const UNREADABLE_CALL =
+  'Local: the model wrote a tool call CrewKite could not read. Try again or pick another model.';
 
 /**
  * Where streamed reply text has to start waiting: at the first opening tag, or at a tail that could
@@ -578,10 +581,7 @@ function startLocalTurn(
     if (parsed.rest.trim()) say(parsed.rest);
     // The runtime runs the calls it reported. Running the written ones too would run them twice.
     if (native) return;
-    if (parsed.calls.some((call) => !call.ok)) {
-      closeText();
-      say(UNREADABLE_CALL);
-    }
+    if (parsed.calls.some((call) => !call.ok)) notice('warning', UNREADABLE_CALL);
     written.push(...parsed.calls);
   };
 
@@ -911,7 +911,7 @@ function startLocalTurn(
         if (rounds.length >= MAX_ROUNDS) {
           notice(
             'warning',
-            'Local: the model was still calling tools when the turn ran out of rounds.',
+            'Local: the model was still calling tools when the turn ran out of rounds. Send a follow-up to continue, or split the request into smaller steps.',
           );
           break;
         }

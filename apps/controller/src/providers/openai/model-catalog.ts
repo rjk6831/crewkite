@@ -87,7 +87,7 @@ export function modelReadFailure(outcome: { reason: string | null; lastRequest: 
     case 'launch':
       return 'The OpenAI client could not be started. Check that it is installed, then refresh.';
     case 'output-limit':
-      return 'The OpenAI client wrote more output than a model read allows.';
+      return 'The OpenAI client wrote more output than a model read allows. Update the client, then refresh.';
     case 'stopped':
       return 'The model read stopped before it finished. Refresh to try again.';
   }
@@ -100,7 +100,7 @@ export function modelReadFailure(outcome: { reason: string | null; lastRequest: 
       return 'The OpenAI client settings differ from the ones CrewKite runs it with. Update the client, then refresh.';
     case 'model/list':
     case 'complete':
-      return 'The OpenAI client listed no models CrewKite can offer.';
+      return 'The OpenAI client listed no models CrewKite can offer. Update the client, then refresh.';
     default:
       return `The OpenAI client stopped answering at ${outcome.lastRequest}. Update the client, then refresh.`;
   }
