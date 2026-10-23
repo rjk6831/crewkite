@@ -29,7 +29,8 @@
 //   turn/started {"threadId","turn":{"id"}}
 //   item/started and item/completed {"threadId","turnId","item":{"id","type",...}} where type is
 //     agentMessage {"text"}, reasoning {"summary":[...]}, commandExecution {"command","cwd","status",
-//     "exitCode","aggregatedOutput"}, fileChange {"changes":[{"path"}],"status"}, mcpToolCall
+//     "exitCode","aggregatedOutput"}, fileChange {"changes":[{"path","kind":{"type","move_path"}}],
+//     "status"} where move_path is snake case and set only for a rename, mcpToolCall
 //     {"server","tool","status"} or webSearch {"query"}
 //   item/agentMessage/delta, item/reasoning/summaryTextDelta, item/reasoning/textDelta,
 //     item/commandExecution/outputDelta {"threadId","turnId","itemId","delta"}
@@ -103,7 +104,7 @@ const scripts = {
     { id: 0, method: 'item/commandExecution/requestApproval', params: { ...ids(), itemId: 'command-1', reason: 'Runs the test suite.', ...(given.network ? { networkApprovalContext: { host: 'registry.npmjs.org', protocol: 'https' } } : { command: 'pnpm test', ...(given.cwd ? { cwd: here(given.cwd) } : {}) }) } },
   ],
   edit: () => [
-    ['item/started', { ...ids(), item: { id: 'change-1', type: 'fileChange', changes: [{ path: here(given.path), kind: { type: 'add' }, diff: 'x\n' }], status: 'inProgress' } }],
+    ['item/started', { ...ids(), item: { id: 'change-1', type: 'fileChange', changes: [{ path: here(given.path), kind: given.movePath ? { type: 'update', move_path: here(given.movePath) } : { type: 'add' }, diff: 'x\n' }], status: 'inProgress' } }],
     { id: 0, method: 'item/fileChange/requestApproval', params: { ...ids(), itemId: 'change-1', reason: null, grantRoot: given.grantRoot ? here(given.grantRoot) : null } },
   ],
   approved: () => [
@@ -171,10 +172,16 @@ function turn(
     permissionPolicy?: ChatPermissionPolicy;
     permissionGrants?: ChatToolKind[];
     /**
-     * Scenario input for the peer: a command cwd or a network prompt, or a file change path and
-     * grant root.
+     * Scenario input for the peer: a command cwd or a network prompt, or a file change path, its
+     * move destination and grant root.
      */
-    detail?: { cwd?: string; network?: boolean; path?: string; grantRoot?: string };
+    detail?: {
+      cwd?: string;
+      network?: boolean;
+      path?: string;
+      movePath?: string;
+      grantRoot?: string;
+    };
     /** Runs on the empty scratch copy before the turn starts. */
     prepare?: (scratch: string) => void;
   } = {},
@@ -349,16 +356,17 @@ test('a command kind the thread allows is answered without asking only inside th
 
 test('a write outside the scratch copy still asks under allow-edits and allow-all', async () => {
   // Every row also holds an edit grant, so no rule may answer a change that leaves the copy by
-  // '..', through a link, or with a grant root outside it. Rows run under allow-edits unless they
-  // name a policy.
+  // '..', through a link, by a rename, or with a grant root outside it. Rows run under
+  // allow-edits unless they name a policy.
   const rows: Array<{
     policy?: ChatPermissionPolicy;
-    detail: { path: string; grantRoot?: string };
+    detail: { path: string; movePath?: string; grantRoot?: string };
     answered: string[];
   }> = [
     { detail: { path: 'src/app.ts' }, answered: ['allow-once'] },
     { detail: { path: '../outside.txt' }, answered: [] },
     { detail: { path: 'link/outside.txt' }, answered: [] },
+    { detail: { path: 'src/app.ts', movePath: '../outside.ts' }, answered: [] },
     { detail: { path: 'src/app.ts', grantRoot: '..' }, answered: [] },
     { policy: 'allow-all', detail: { path: '../outside.txt' }, answered: [] },
   ];

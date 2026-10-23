@@ -215,7 +215,18 @@ const itemHead = z.object({ id, type: z.string() });
 const agentItem = z.object({ text: maybe(z.string()) });
 const reasoningItem = z.object({ summary: maybe(z.array(z.string())) });
 const commandItem = z.object({ command: maybe(z.string()), cwd: maybe(z.string()) });
-const changeItem = z.object({ changes: maybe(z.array(z.object({ path: z.string().min(1) }))) });
+// A rename is an update with a destination. The client spells `move_path` in snake case. A
+// malformed entry drops the whole list, and a change with no paths goes to the person.
+const changeItem = z.object({
+  changes: maybe(
+    z.array(
+      z.object({
+        path: z.string().min(1),
+        kind: z.object({ move_path: z.string().min(1).nullish() }).nullish(),
+      }),
+    ),
+  ),
+});
 const mcpItem = z.object({ server: maybe(z.string()), tool: maybe(z.string()) });
 const searchItem = z.object({ query: maybe(z.string()) });
 const toolEnd = z.object({
@@ -841,13 +852,18 @@ class OpenAiChatTurn {
     });
   }
 
-  /** Scratch-relative paths when the change is inside scratch, as reported otherwise. */
+  /**
+   * Scratch-relative paths when the change is inside scratch, as reported otherwise. A move
+   * reports its destination too, so a rename out of scratch fails containment.
+   */
   private paths(raw: unknown) {
     const seen = new Map<string, boolean>();
-    for (const change of changeItem.safeParse(raw).data?.changes ?? []) {
-      const local = this.local(change.path);
-      seen.set(local || change.path, Boolean(local));
-    }
+    for (const change of changeItem.safeParse(raw).data?.changes ?? [])
+      for (const path of [change.path, change.kind?.move_path]) {
+        if (!path) continue;
+        const local = this.local(path);
+        seen.set(local || path, Boolean(local));
+      }
     return [...seen].map(([path, inside]) => ({ path, inside }));
   }
 
