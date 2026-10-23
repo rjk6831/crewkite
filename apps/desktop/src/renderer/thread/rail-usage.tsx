@@ -51,9 +51,11 @@ export function RailUsage({
                 <span style={{ width: `${row.percent ?? 0}%` }} />
               </span>
               <span className="rail-usage-reset">
-                {row.resetsIn !== null && row.resetsIn > 0
+                {row.resetsIn !== null
                   ? `resets in ${formatSpan(row.resetsIn)}`
-                  : 'reset unknown'}
+                  : row.resetPassed
+                    ? 'reset passed'
+                    : 'reset unknown'}
               </span>
             </>
           )}

@@ -7,13 +7,14 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type {
   AgentEvent,
+  ChatCatalogRead,
   ChatFailure,
   ChatMessage,
   ChatThread,
   ChatThreadRead,
   ChatTurn,
 } from '@crewkite/contracts';
-import { limitOffer } from './handoff-offer.ts';
+import { limitOffer, offerChoices } from './handoff-offer.ts';
 import {
   initialThreadState,
   reduceThread,
@@ -423,4 +424,40 @@ test('stream events that a thread read already covers apply once', () => {
     state = reduceThread(state, { type: 'events', events: after });
     assert.deepEqual(shown(state), want, name);
   }
+});
+
+test('the offer ranks the other connected families by allowance and leaves out one at zero', () => {
+  const models = [{ model: 'm', label: 'M', efforts: [], defaultEffort: 'default' as const }];
+  const family = (name: ChatCatalogRead['families'][number]['family'], percent: number | null) => ({
+    family: name,
+    connected: true,
+    reason: null,
+    models,
+    defaultModel: 'm',
+    remaining:
+      percent === null
+        ? []
+        : [{ windowId: 'weekly', label: 'Weekly', percent, resetsAt: null, observedAt: null }],
+  });
+  const catalog: ChatCatalogRead = {
+    families: [
+      family('openai', 5),
+      family('anthropic', 60.9),
+      family('google', 0),
+      family('local', null),
+    ],
+  };
+  // Anthropic leads on allowance, the local family has no figure and ranks last, and Google is
+  // out because a turn there would end on the limit it already hit. OpenAI stopped.
+  assert.deepEqual(
+    offerChoices(catalog, 'openai').map(({ family, percent }) => [family, percent]),
+    [
+      ['anthropic', 60],
+      ['local', null],
+    ],
+  );
+  assert.deepEqual(
+    offerChoices(catalog, 'anthropic').map(({ family }) => family),
+    ['openai', 'local'],
+  );
 });

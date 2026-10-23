@@ -1,4 +1,10 @@
-import type { ChatCatalogRead, ChatFamily, ChatModelSelection } from '@crewkite/contracts';
+import {
+  type ChatCatalogRead,
+  type ChatFamily,
+  type ChatModelSelection,
+  rankFamilies,
+  tightestAllowance,
+} from '@crewkite/contracts';
 import { activeTurnId, type ThreadState } from './thread-state.ts';
 
 // What the thread offers after a provider stops on a usage limit. Both functions are pure so the
@@ -53,20 +59,21 @@ export type OfferChoice = {
   percent: number | null;
 };
 
-/** One choice per connected family other than the one that stopped, on its default model. */
+/**
+ * One choice per connected family other than the one that stopped, on its default model, in the
+ * order the contract ranks them. A family with nothing left is not offered.
+ */
 export function offerChoices(catalog: ChatCatalogRead, stopped: ChatFamily): OfferChoice[] {
-  return catalog.families.flatMap((entry) => {
+  return rankFamilies(catalog.families, [stopped]).flatMap((entry) => {
     const model = entry.defaultModel ?? entry.models[0]?.model;
-    if (!entry.connected || entry.family === stopped || !model) return [];
+    if (!model) return [];
     const effort = entry.models.find((value) => value.model === model)?.defaultEffort;
-    const known = entry.remaining.flatMap((window) =>
-      window.percent === null ? [] : [window.percent],
-    );
+    const { percent } = tightestAllowance(entry);
     return [
       {
         family: entry.family,
         selection: { family: entry.family, model, effort: effort ?? 'default' },
-        percent: known.length > 0 ? Math.floor(Math.min(...known)) : null,
+        percent: percent === null ? null : Math.floor(percent),
       },
     ];
   });
