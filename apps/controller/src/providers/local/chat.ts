@@ -619,7 +619,7 @@ function startLocalTurn(
     session = {
       family: 'local',
       sessionId: modelKey.slice(0, 512),
-      // The thread shows the model that answered, not the one that was asked for.
+      // The thread shows the model that answered.
       model: (fellBack ? modelKey : request.selection.model).slice(0, 200),
       updatedAt: new Date(now()).toISOString(),
     };
