@@ -403,7 +403,7 @@ function startLocalTurn(
   const deadline = setTimeout(() => stop('timeout'), Math.min(request.deadlineMs, 2 ** 31 - 1));
   deadline.unref();
 
-  const ask = (callId: string, tool: PreparedTool) => {
+  const ask = (callId: string, tool: PreparedTool, granted: boolean) => {
     const requestId = `${turnId}:permission-${++permissions}`;
     const question =
       tool.name === 'run'
@@ -427,6 +427,8 @@ function startLocalTurn(
       detail: tool.detail === null ? null : fitBytes(tool.detail, 16_384),
       options: PERMISSION_OPTIONS,
     });
+    // Thread grant: answer at once, so the thread still shows the request and the choice.
+    if (granted) pending.get(requestId)?.('allow-thread');
     return answer;
   };
 
@@ -512,14 +514,18 @@ function startLocalTurn(
       emit({ type: 'tool.output', turnId, callId, chunk: fitBytes(tool.error, OUTPUT_BYTES) });
       return refuse('error', tool.error.slice(0, 200), tool.error);
     }
+    // allow-all also runs commands without asking. Allow-edits still asks before a command.
     const gate =
       tool.name === 'run'
-        ? 'command'
+        ? request.permissionPolicy === 'allow-all'
+          ? null
+          : 'command'
         : tool.kind === 'edit' && request.permissionPolicy === 'ask'
           ? 'edit'
           : null;
+    const granted = gate !== null && request.permissionGrants?.includes(gate) === true;
     if (gate && !grants.has(gate)) {
-      const choice = await ask(callId, tool);
+      const choice = await ask(callId, tool, granted);
       if (ending) {
         emit({ type: 'tool.completed', turnId, callId, status: 'denied', summary: 'Stopped.' });
         throw new Error('The turn was stopped.');
@@ -530,7 +536,8 @@ function startLocalTurn(
           'Declined by the person.',
           'The person declined this call. Do not retry it. Continue without it or ask them.',
         );
-      if (choice === 'allow-thread') grants.add(gate);
+      // A thread grant is answered call by call. Only a choice made now covers the rest of the turn.
+      if (choice === 'allow-thread' && !granted) grants.add(gate);
     }
     context.permitted = true;
     prepared.set(sdkCallId, tool);

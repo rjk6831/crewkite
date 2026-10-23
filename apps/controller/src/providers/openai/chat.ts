@@ -154,8 +154,8 @@ const OPTIONS: ChatPermissionOption[] = [
   { id: 'allow-thread', label: 'Allow for this thread', kind: 'allow-thread' },
   { id: 'deny', label: 'Deny', kind: 'deny' },
 ];
-// shortcut: acceptForSession lasts as long as the client process, and that is one turn here.
-// Upgrade: the controller keeps thread grants and answers repeats, or one process per thread.
+// acceptForSession lasts as long as the client process, and that is one turn here. The controller
+// keeps the thread's grants, and serverRequest answers a granted kind on every later turn.
 const DECISIONS = new Map([
   ['allow-once', 'accept'],
   ['allow-thread', 'acceptForSession'],
@@ -613,7 +613,10 @@ class OpenAiChatTurn {
     // Review and advice turns read only.
     if (this.request.readOnly) return this.answer(answerId, 'deny');
     if (policy === 'allow-all' || (policy === 'allow-edits' && kind === 'edit'))
-      this.answer(answerId, 'allow-once');
+      return this.answer(answerId, 'allow-once');
+    // Thread grant: the person allowed this kind for the whole thread. Both events still go out,
+    // so the thread shows what was allowed and why nobody was asked.
+    if (this.request.permissionGrants?.includes(kind)) this.answer(answerId, 'allow-thread');
   }
 
   private answer(requestId: string, choice: string) {

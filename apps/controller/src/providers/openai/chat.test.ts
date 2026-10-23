@@ -43,6 +43,7 @@ import {
   AgentEventSchema,
   type ChatPermissionPolicy,
   type ChatSession,
+  type ChatToolKind,
 } from '@crewkite/contracts';
 import { spawnCheckChild as spawn } from '../../host/check-ownership.ts';
 import { groupAbsent } from '../../host/worker.ts';
@@ -149,7 +150,11 @@ const strip = (events: AgentEvent[]) => events.map(({ turnId: _turnId, ...rest }
 
 function turn(
   scenario: string,
-  options: { session?: ChatSession; permissionPolicy?: ChatPermissionPolicy } = {},
+  options: {
+    session?: ChatSession;
+    permissionPolicy?: ChatPermissionPolicy;
+    permissionGrants?: ChatToolKind[];
+  } = {},
 ) {
   const home = mkdtempSync(join(root, `${scenario}-`));
   const scratch = join(home, 'scratch');
@@ -180,6 +185,7 @@ function turn(
       scratch: { directory: scratch, base: 'a'.repeat(40), projectName: 'demo' },
       work: { directory: work, home },
       permissionPolicy: options.permissionPolicy ?? 'ask',
+      permissionGrants: options.permissionGrants ?? [],
       deadlineMs: 10_000,
       environment,
       now: () => Date.parse('2026-10-23T12:00:00.000Z'),
@@ -280,6 +286,34 @@ test('a command approval holds the turn until respondPermission answers it', asy
   assert.deepEqual(
     run.frames().find((frame) => frame.id === 0),
     { id: 0, result: { decision: 'accept' } },
+  );
+  assert.equal(result.stopReason, 'done');
+});
+
+test('a command kind the thread allows is answered without asking and both events are emitted', async () => {
+  // No respondPermission call: the adapter answers from the grants in the request.
+  const run = turn('approval', { permissionGrants: ['command'] });
+  const result = await run.settled();
+  const events = strip(run.events);
+  assert.deepEqual(
+    events.map((event) => event.type),
+    [
+      'tool.started',
+      'permission.requested',
+      'permission.resolved',
+      'tool.output',
+      'tool.completed',
+      'turn.completed',
+    ],
+  );
+  assert.deepEqual(events[2], {
+    type: 'permission.resolved',
+    requestId: 'approval-1',
+    choice: 'allow-thread',
+  });
+  assert.deepEqual(
+    run.frames().find((frame) => frame.id === 0),
+    { id: 0, result: { decision: 'acceptForSession' } },
   );
   assert.equal(result.stopReason, 'done');
 });
