@@ -27,6 +27,8 @@ Rules I hold the router and the UI to:
 
 Unlike units never combine. Subscription windows, API credits, local hardware and CI minutes appear in separate views.
 
+The chat picker and the handoff ranking count a model-scoped window only for models whose ID carries the window's model tokens, and a provider or pool window for every model. Google writer admission keeps the exact-ID exemption in [Google quota read](providers.md#google-quota-read) and counts that pool for every other model.
+
 ## Routing sequence
 
 The router is a deterministic function of the task, the resolved policy, the observations, the reservations and the clock. Given the same inputs it returns the same route and the same reasons.
