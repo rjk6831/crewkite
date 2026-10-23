@@ -12,6 +12,7 @@ import {
   type WorkspaceStamp,
 } from '@crewkite/contracts';
 import { createDemoFixtures, createTestIds, DEMO_TIME } from '@crewkite/testkit';
+import { settingsPreview } from './settings/preview-data.ts';
 import type { DesktopCommand, DesktopSource } from './source.ts';
 import { createThreadScript } from './thread/preview-script.ts';
 
@@ -25,6 +26,8 @@ export function createPreviewSource(): DesktopSource {
   const fixtures = createDemoFixtures();
   const state = structuredClone(fixtures.snapshot);
   state.tasks = [structuredClone(fixtures.task)];
+  const { localHardware, ...providers } = settingsPreview(state.routes, DEMO_TIME);
+  Object.assign(state, providers);
   const id = createTestIds(DEMO_TIME, 1000n);
   const listeners = new Set<(event: Event) => void>();
   const history: Event[] = [];
@@ -385,6 +388,7 @@ export function createPreviewSource(): DesktopSource {
     googleAcpInstall: state.googleAcpInstall,
     nativeConnections: state.nativeConnections,
     localSetup: state.localSetup,
+    localHardware,
   });
   const projectPage = async (input: Omit<ProjectPageRequest, 'limit'> & { limit?: number }) => ({
     kind: 'project-page' as const,

@@ -14,6 +14,7 @@ import {
   useState,
 } from 'react';
 import { ContextGauge } from '../context-gauge.tsx';
+import { preferredSelection } from '../settings/preferences.ts';
 import { configureThread, readCatalog, type ThreadSource } from './commands.ts';
 import { defaultSelection, ModelPicker } from './model-picker.tsx';
 
@@ -76,7 +77,7 @@ export function Composer({
   useEffect(() => {
     if (thread?.selection) setSelection(thread.selection);
   }, [thread?.selection]);
-  const chosen = selection ?? defaultSelection(catalog);
+  const chosen = selection ?? preferredSelection(catalog) ?? defaultSelection(catalog);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: the box resizes when its text changes
   useEffect(() => {
