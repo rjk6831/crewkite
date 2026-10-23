@@ -68,6 +68,7 @@ const TurnRow = memo(function TurnRow({
             return null;
         }
       })}
+      {turn.status === 'stopped' && <p className="th-stopped">Stopped.</p>}
       {quiet(turn) && (
         <span className="th-working" role="status" aria-label="Working">
           <i />

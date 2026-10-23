@@ -15,6 +15,7 @@ import {
 import {
   applyEvent,
   blankTurn,
+  isStop,
   type TurnIdentity,
   type TurnStatus,
   type TurnView,
@@ -231,7 +232,8 @@ export function threadItems(state: ThreadState): ThreadItem[] {
   const rows: { order: bigint; item: ThreadItem }[] = [];
   const replies = new Map<string, ChatMessage>();
   const failed = new Set<string>();
-  for (const turn of Object.values(state.turnMeta)) if (turn.failure) failed.add(turn.id);
+  for (const turn of Object.values(state.turnMeta))
+    if (turn.failure && !isStop(turn.failure)) failed.add(turn.id);
   for (const record of Object.values(state.turns))
     if (record.view.failure) failed.add(record.view.id);
   for (const message of state.messages) {
@@ -277,7 +279,14 @@ export function threadItems(state: ThreadState): ThreadItem[] {
               role: reply.author.role,
             }
           : null);
-    const status = record ? base.status : meta ? metaStatus(meta.state) : 'done';
+    const stopped = isStop(meta?.failure);
+    const status: TurnStatus = stopped
+      ? 'stopped'
+      : record
+        ? base.status
+        : meta
+          ? metaStatus(meta.state)
+          : 'done';
     const hasText = base.blocks.some((block) => block.kind === 'text' && block.text !== '');
     const blocks =
       reply && reply.text !== '' && !hasText
@@ -286,7 +295,7 @@ export function threadItems(state: ThreadState): ThreadItem[] {
             { kind: 'text' as const, id: 'text:reply', text: reply.text, done: true },
           ]
         : base.blocks;
-    const failure = base.failure ?? meta?.failure ?? null;
+    const failure = base.failure ?? (stopped ? null : (meta?.failure ?? null));
     const ended = record ? base.ended : status !== 'running' && status !== 'waiting-permission';
     const turn: TurnView = { ...base, identity, status, blocks, failure, ended };
     const firstCursor = record?.events[0]?.cursor ?? null;
@@ -298,7 +307,7 @@ export function threadItems(state: ThreadState): ThreadItem[] {
           : reply
             ? BigInt(reply.cursor) * STEP
             : LAST;
-    if (blocks.length > 0 || !ended)
+    if (blocks.length > 0 || !ended || status === 'stopped')
       rows.push({ order, item: { kind: 'turn', key: `turn:${id}`, turn } });
     if (failure)
       rows.push({

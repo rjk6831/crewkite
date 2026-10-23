@@ -143,6 +143,36 @@ test('a failed turn adds a system line with the cause and the next action', () =
   assert.equal(line.failure.nextAction, 'Continue on another provider.');
 });
 
+test('a stopped turn ends quietly with its partial text and no failure line', () => {
+  const stop: ChatFailure = {
+    stage: 'stream',
+    kind: 'stopped',
+    message: 'The turn was stopped.',
+    providerMessage: null,
+    method: null,
+    code: null,
+    resetsAt: null,
+    nextAction: 'Send a new message to continue.',
+  };
+  const end = (cursor: number) =>
+    agent(cursor, { type: 'turn.completed', stopReason: 'stopped', failure: stop });
+  const items = run([
+    started(10),
+    agent(11, { type: 'text.delta', itemId: 'a', text: 'The guard ' }),
+    end(12),
+  ]);
+  assert.deepEqual(
+    items.map((item) => item.kind),
+    ['turn'],
+  );
+  const view = turnOf(items);
+  assert.equal(view.status, 'stopped');
+  assert.equal(view.failure, null);
+  assert.equal(view.blocks[0].kind === 'text' && view.blocks[0].text, 'The guard ');
+  // A stop before any output still leaves a row, so the person sees that it stopped.
+  assert.equal(turnOf(run([started(10), end(11)])).status, 'stopped');
+});
+
 test('the limit offer shows only while the newest turn is the one that hit a limit', () => {
   const second = id('trn', 2);
   const failure = (kind: ChatFailure['kind']): ChatFailure => ({

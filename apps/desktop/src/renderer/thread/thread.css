@@ -234,6 +234,10 @@
 .th-notice.is-warning {
   color: var(--amber);
 }
+.th-stopped {
+  color: var(--text-dim);
+  font-size: 12px;
+}
 .th-working {
   display: inline-flex;
   gap: 4px;
