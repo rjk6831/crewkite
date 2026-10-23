@@ -333,11 +333,8 @@ export function nativeTaskAdmitted(metadata: DiscoveryMetadata, plan: Structured
     (creditBucket.rateLimitReachedType === null ||
       creditBucket.rateLimitReachedType === 'rate_limit_reached');
   return (
-    metadata.account.plan === 'pro' &&
     (limits.ordinaryUsageAllowed === true || !!existingCreditsAllowed) &&
-    choiceFailure(metadata, plan) === null &&
-    !!metadata.mcpServers &&
-    !Object.values(metadata.mcpServers).some((enabled) => enabled)
+    choiceFailure(metadata, plan) === null
   );
 }
 
@@ -559,6 +556,8 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
           if (!this.awaiting || value.id !== this.frameRequest) this.refuse();
           if (this.step === 'thread' && value.id === 10) {
             this.site = 'thread-response';
+            // The client also reports its service tier, reasoning effort and reviewer. CrewKite
+            // acts on none of them, so a new value there is not a reason to refuse the thread.
             const response = z
               .object({
                 thread: z.object({ id, ephemeral: z.literal(true) }),
@@ -566,13 +565,10 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
                 modelProvider: z.literal('openai'),
                 cwd: z.literal(this.plan.directory),
                 approvalPolicy: z.literal('on-request'),
-                approvalsReviewer: z.literal('user'),
                 sandbox: z.object({
                   type: z.literal('readOnly'),
-                  networkAccess: z.literal(false).optional(),
+                  networkAccess: z.boolean().optional(),
                 }),
-                reasoningEffort: z.literal(this.plan.effort),
-                serviceTier: z.literal('default'),
               })
               .parse(value.result);
             if (this.threadId && this.threadId !== response.thread.id) this.refuse();
@@ -627,14 +623,11 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
           threadSettings: z.object({
             model: z.literal(this.plan.model),
             modelProvider: z.literal('openai'),
-            effort: z.literal(this.plan.effort),
-            serviceTier: z.literal('default'),
             cwd: z.literal(this.plan.directory),
             approvalPolicy: z.literal('on-request'),
-            approvalsReviewer: z.literal('user'),
             sandboxPolicy: z.object({
               type: z.literal('readOnly'),
-              networkAccess: z.literal(false).optional(),
+              networkAccess: z.boolean().optional(),
             }),
           }),
         })

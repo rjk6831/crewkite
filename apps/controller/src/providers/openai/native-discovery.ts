@@ -450,10 +450,8 @@ class FeatureList implements NativeTranscript<DisabledFeatures> {
     const lines = new TextDecoder('utf-8', { fatal: true }).decode(this.bytes).split('\n');
     if (lines.pop() !== '' || lines.length > 512) throw new Error('Feature output is incomplete.');
     for (const line of lines) {
-      const row =
-        /^([a-z][a-z0-9_.]{0,99})\s+(under development|experimental|stable|deprecated|removed)\s+(true|false)$/.exec(
-          line,
-        );
+      // Only the five disabled features are acted on. The maturity label and other names can change.
+      const row = /^([a-z][a-z0-9_.-]{0,99})\s+([a-z]+(?: [a-z]+){0,3})\s+(true|false)$/.exec(line);
       if (!row || values.has(row[1])) throw new Error('Feature output is invalid.');
       values.set(row[1], row[3] === 'true');
     }

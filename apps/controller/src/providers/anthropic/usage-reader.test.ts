@@ -167,6 +167,36 @@ test('local usage reports preserve server rows and unknown age without model wor
   const chunked = new AnthropicUsageReader(sessionId);
   for (const byte of raw) chunked.feed(Uint8Array.of(byte));
   assert.deepEqual(chunked.finish(at), expected);
+  const drifted = {
+    ...report,
+    new_section: { anything: [1, 2] },
+    session: {
+      ...report.session,
+      model_usage: { 'a-model': { input_tokens: 12, cost: 0.4 }, 'another-model': {} },
+      new_total: 3,
+    },
+    rate_limits: {
+      ...report.rate_limits,
+      new_note: 'x',
+      limits: report.rate_limits.limits.map((row) => ({ ...row, new_flag: true })),
+      extra_usage: { ...report.rate_limits.extra_usage, new_tier: 'x' },
+    },
+  };
+  assert.deepEqual(
+    read([
+      { ...init, new_field: 1 },
+      { ...local, new_field: 1 },
+      {
+        ...assistant,
+        new_field: 1,
+        local_command_run: { command: 'usage', args: '', new_field: 1 },
+        usage_report: drifted,
+        message: { ...assistant.message, new_field: 1, usage: { ...usage, new_counter: 0 } },
+      },
+      { ...terminal, new_field: 1, modelUsage: { 'a-model': { inputTokens: 12 } } },
+    ]),
+    expected,
+  );
   for (const invalid of [
     [assistant, terminal],
     [init, assistant],
@@ -175,11 +205,6 @@ test('local usage reports preserve server rows and unknown age without model wor
     [init, assistant, terminal, local],
     [init, { ...assistant, session_id: uuid }, terminal],
     [init, { ...assistant, local_command_run: { command: 'other', args: '' } }, terminal],
-    [
-      init,
-      { ...assistant, local_command_run: { command: 'usage', args: '', plugin: 'foreign' } },
-      terminal,
-    ],
     [init, { ...assistant, local_command_outcome: { kind: 'failed' } }, terminal],
     [
       init,
@@ -212,10 +237,8 @@ test('local usage reports preserve server rows and unknown age without model wor
     [init, assistant, { ...terminal, num_turns: 1 }],
     [init, assistant, { ...terminal, duration_api_ms: 1 }],
     [init, assistant, { ...terminal, total_cost_usd: 0.01 }],
-    [init, assistant, { ...terminal, modelUsage: { model: {} } }],
     [init, { type: 'rate_limit_event', session_id: sessionId }, assistant, terminal],
     [init, { type: 'control_request', session_id: sessionId }, assistant, terminal],
-    [init, { ...assistant, usage_report: { ...report, secret: 'private' } }, terminal],
     [
       init,
       {

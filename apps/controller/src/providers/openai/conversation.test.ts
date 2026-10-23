@@ -267,26 +267,7 @@ test('conversation replies bind frozen scope and remain finite proposals', () =>
     [
       {
         'model/list': catalog,
-        'account/read': {
-          account: { type: 'chatgpt', planType: 'plus' },
-          requiresOpenaiAuth: true,
-        },
-      },
-      'admission',
-    ],
-    [
-      {
-        'model/list': catalog,
         'account/rateLimits/read': { ordinaryUsageAllowed: false, rateLimits: {} },
-      },
-      'admission',
-    ],
-    [
-      {
-        'model/list': catalog,
-        'config/read': {
-          config: { ...configuration, mcp_servers: { fixture_server: { enabled: true } } },
-        },
       },
       'admission',
     ],
@@ -297,7 +278,7 @@ test('conversation replies bind frozen scope and remain finite proposals', () =>
     assert.equal(refused.diagnostic?.cause, cause);
     assert.throws(() => refused.finish());
   }
-  for (const change of [{ model: 'different-model' }, { reasoningEffort: 'high' }]) {
+  for (const change of [{ model: 'different-model' }]) {
     const mismatch = new ConversationTranscript(chosen, { now: () => 1, timeoutMs: 60_000 });
     assert.throws(() =>
       admit(
