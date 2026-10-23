@@ -632,14 +632,15 @@ class OpenAiChatTurn {
     // edit passes the same check as under allow-edits.
     if (policy === 'allow-all' && kind === 'command') return this.answer(answerId, 'allow-once');
     // From here every automatic answer covers the scratch copy only. A change with no reported
-    // paths, a path or grant root outside scratch, or a command run from outside it goes to the
-    // person.
+    // paths, a path or grant root outside scratch, or a command with no cwd or a cwd outside it
+    // goes to the person. A network access prompt arrives as a command approval with no command
+    // and no cwd, so a command grant never answers it.
     const paths = callId ? (this.edits.get(callId) ?? []) : [];
     const grantRoot = value?.grantRoot ? this.local(value.grantRoot) : '';
     const contained =
       kind === 'edit'
         ? paths.length > 0 && paths.every((entry) => entry.inside) && grantRoot !== null
-        : !value?.cwd || this.local(value.cwd) !== null;
+        : !!value?.cwd && this.local(value.cwd) !== null;
     if (!contained) return;
     if ((policy === 'allow-edits' || policy === 'allow-all') && kind === 'edit')
       return this.answer(answerId, 'allow-once');

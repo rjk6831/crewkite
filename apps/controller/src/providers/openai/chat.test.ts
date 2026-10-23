@@ -21,7 +21,9 @@
 //   account/read result {"account":{"type":"chatgpt"}|null}
 //   account/rateLimits/read result {"ordinaryUsageAllowed":B,"rateLimits":{"limitId","primary":{"usedPercent","windowDurationMins","resetsAt"}}}
 //   thread/start and thread/resume result {"thread":{"id":T}}; turn/start result {"turn":{"id":U}}
-//   {"id":R,"method":"item/commandExecution/requestApproval","params":{"threadId","turnId","itemId","reason","command","cwd"}}
+//   {"id":R,"method":"item/commandExecution/requestApproval","params":{"threadId","turnId","itemId","reason","command","cwd"}},
+//     or for a network access prompt {"threadId","turnId","itemId","reason","networkApprovalContext":{"host","protocol"}}
+//     with no command and no cwd
 //   {"id":R,"method":"item/fileChange/requestApproval","params":{"threadId","turnId","itemId","reason","grantRoot"}},
 //     always after item/started for the same fileChange item, which carries the paths
 //   turn/started {"threadId","turn":{"id"}}
@@ -97,7 +99,8 @@ const scripts = {
   ],
   approval: () => [
     ['item/started', { ...ids(), item: command }],
-    { id: 0, method: 'item/commandExecution/requestApproval', params: { ...ids(), itemId: 'command-1', reason: 'Runs the test suite.', command: 'pnpm test', ...(given.cwd ? { cwd: here(given.cwd) } : {}) } },
+    // A network access prompt names the host and leaves out the command and its cwd.
+    { id: 0, method: 'item/commandExecution/requestApproval', params: { ...ids(), itemId: 'command-1', reason: 'Runs the test suite.', ...(given.network ? { networkApprovalContext: { host: 'registry.npmjs.org', protocol: 'https' } } : { command: 'pnpm test', ...(given.cwd ? { cwd: here(given.cwd) } : {}) }) } },
   ],
   edit: () => [
     ['item/started', { ...ids(), item: { id: 'change-1', type: 'fileChange', changes: [{ path: here(given.path), kind: { type: 'add' }, diff: 'x\n' }], status: 'inProgress' } }],
@@ -167,8 +170,11 @@ function turn(
     session?: ChatSession;
     permissionPolicy?: ChatPermissionPolicy;
     permissionGrants?: ChatToolKind[];
-    /** Scenario input for the peer: a command cwd, or a file change path and grant root. */
-    detail?: { cwd?: string; path?: string; grantRoot?: string };
+    /**
+     * Scenario input for the peer: a command cwd or a network prompt, or a file change path and
+     * grant root.
+     */
+    detail?: { cwd?: string; network?: boolean; path?: string; grantRoot?: string };
     /** Runs on the empty scratch copy before the turn starts. */
     prepare?: (scratch: string) => void;
   } = {},
@@ -314,44 +320,31 @@ test('a command approval holds the turn until respondPermission answers it', asy
 });
 
 test('a command kind the thread allows is answered without asking only inside the scratch copy', async () => {
-  // No respondPermission call: the adapter answers from the grants in the request.
-  const run = turn('approval', { permissionGrants: ['command'], detail: { cwd: '.' } });
-  const result = await run.settled();
-  const events = strip(run.events);
-  assert.deepEqual(
-    events.map((event) => event.type),
-    [
-      'tool.started',
-      'permission.requested',
-      'permission.resolved',
-      'tool.output',
-      'tool.completed',
-      'turn.completed',
-    ],
-  );
-  assert.deepEqual(events[2], {
-    type: 'permission.resolved',
-    requestId: 'approval-1',
-    choice: 'allow-thread',
-  });
-  assert.deepEqual(
-    run.frames().find((frame) => frame.id === 0),
-    { id: 0, result: { decision: 'acceptForSession' } },
-  );
-  assert.equal(result.stopReason, 'done');
-  // The same grant does not cover a command that runs from outside the copy.
-  const outside = turn('approval', { permissionGrants: ['command'], detail: { cwd: '..' } });
-  const asked = await outside.when('permission.requested');
-  assert.equal(
-    outside.events.some((event) => event.type === 'permission.resolved'),
-    false,
-  );
-  outside.handle.respondPermission(asked.requestId, 'deny');
-  await outside.settled();
-  assert.deepEqual(
-    outside.frames().find((frame) => frame.id === 0),
-    { id: 0, result: { decision: 'decline' } },
-  );
+  // Every row holds a command grant. Only a command run from inside the copy is answered from it,
+  // with no respondPermission call. A network prompt has no cwd, so it goes to the person.
+  const rows: Array<{
+    detail: { cwd?: string; network?: boolean };
+    answered: string[];
+    decision: string;
+  }> = [
+    { detail: { cwd: '.' }, answered: ['allow-thread'], decision: 'acceptForSession' },
+    { detail: { cwd: '..' }, answered: [], decision: 'decline' },
+    { detail: { network: true }, answered: [], decision: 'decline' },
+  ];
+  for (const row of rows) {
+    const run = turn('approval', { permissionGrants: ['command'], detail: row.detail });
+    const asked = await run.when('permission.requested');
+    const answered = run.events.flatMap((event) =>
+      event.type === 'permission.resolved' ? [event.choice] : [],
+    );
+    assert.deepEqual(answered, row.answered, JSON.stringify(row));
+    if (!answered.length) run.handle.respondPermission(asked.requestId, 'deny');
+    assert.equal((await run.settled()).stopReason, 'done');
+    assert.deepEqual(
+      run.frames().find((frame) => frame.id === 0),
+      { id: 0, result: { decision: row.decision } },
+    );
+  }
 });
 
 test('a write outside the scratch copy still asks under allow-edits and allow-all', async () => {
