@@ -40,12 +40,9 @@ async function run(
   payload: unknown,
 ): Promise<CommandResult> {
   const result = await dispatch(source, command, payload);
+  // The reason is a code for the log. The next step is the sentence written for the person.
   if (result.outcome !== 'applied' && result.outcome !== 'already-applied')
-    throw new Error(
-      [result.reason ?? 'The controller did not accept this request.', result.next]
-        .filter(Boolean)
-        .join(' '),
-    );
+    throw new Error(result.next ?? result.reason ?? 'The controller did not accept this request.');
   return result;
 }
 
