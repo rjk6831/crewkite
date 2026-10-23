@@ -133,18 +133,31 @@ function fixture() {
   return { root, scratch, home, clock, request };
 }
 
-function start(model: LoadedModelLike, contextLength: number, request: ChatTurnRequest) {
+function start(
+  model: LoadedModelLike,
+  contextLength: number,
+  request: ChatTurnRequest,
+  loaded = { modelKey: 'local-fixture', fellBack: false },
+) {
   const events: AgentEvent[] = [];
   let handle: ChatTurnHandle | undefined;
+  let disposals = 0;
   const adapter = localChatAdapter({
-    connect: async () => ({ model, contextLength, modelKey: 'local-fixture' }),
+    connect: async () => ({
+      model,
+      contextLength,
+      ...loaded,
+      dispose: async () => {
+        disposals++;
+      },
+    }),
   });
   handle = adapter.startTurn(request, (event) => {
     events.push(AgentEventSchema.parse(event));
     if (event.type === 'permission.requested')
       handle?.respondPermission(event.requestId, 'allow-once');
   });
-  return { events, handle };
+  return { events, handle, disposals: () => disposals };
 }
 
 test('a local turn streams, reads freely, edits after permission and reports its stats', async () => {
@@ -271,8 +284,23 @@ test('a local turn streams, reads freely, edits after permission and reports its
       { role: 'user', text: 'Rename n to count in src/a.ts.' },
       { role: 'assistant', text: result.assistantText },
     ] satisfies ChatHistoryEntry[];
-    await start(second.model, 8192, request(1, { history: later, prompt: 'Thanks.' })).handle
-      .result;
+    // The requested model is not loaded on this turn, so the first loaded one answers. The turn
+    // says so once, and the session records the model that answered.
+    const fallback = start(second.model, 8192, request(1, { history: later, prompt: 'Thanks.' }), {
+      modelKey: 'loaded-fixture',
+      fellBack: true,
+    });
+    const next = await fallback.handle.result;
+    assert.deepEqual(fallback.events[1], {
+      type: 'provider.notice',
+      turnId: turnIds[1],
+      level: 'warning',
+      message:
+        'Local: local-fixture is not loaded, so loaded-fixture answered. Load local-fixture or pick loaded-fixture in the composer.',
+    });
+    assert.equal(fallback.events.filter((event) => event.type === 'provider.notice').length, 2);
+    assert.equal(next.session?.sessionId, 'loaded-fixture');
+    assert.equal(next.session?.model, 'loaded-fixture');
     const chat = second.calls[0].chat;
     assert.ok(chat[0].content?.includes(SUMMARY));
     assert.deepEqual(
@@ -315,6 +343,36 @@ test('stop cancels the model mid-turn and ends the turn as stopped', async () =>
       failure: result.failure,
     });
     assert.ok(!JSON.stringify(turn.events).includes('Never sent.'));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('the local client is disposed when the turn ends', async () => {
+  const { root, clock, request } = fixture();
+  try {
+    let turn: ReturnType<typeof start> | undefined;
+    const failing: LoadedModelLike = {
+      countTokens: async (text) => Math.ceil(text.length / 4),
+      act: async () => {
+        throw new Error('socket hang up');
+      },
+    };
+    const finishing = fakeModel([{ steps: [{ text: 'Done.' }], stats: {} }], clock).model;
+    const stopping = fakeModel(
+      [{ steps: [{ wait: () => turn?.handle.stop() }], stats: {} }],
+      clock,
+    ).model;
+    for (const [stopReason, model] of [
+      ['done', finishing],
+      ['stopped', stopping],
+      ['error', failing],
+    ] as const) {
+      turn = start(model, 8192, request(0));
+      const result = await turn.handle.result;
+      assert.equal(result.stopReason, stopReason);
+      assert.equal(turn.disposals(), 1, stopReason);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -744,9 +744,10 @@ export function googleChatAdapter(deps: {
             : undefined;
         // Thread grant: a kind the person allowed for the whole thread is answered without
         // asking, on the allow-thread option when the client offers one. A call that touches
-        // paths outside the scratch copy is still the person's call.
+        // paths outside the scratch copy is still the person's call. A grant never covers
+        // `other`, because that kind says nothing about what the call does.
         const granted =
-          request.permissionGrants?.includes(call.kind) && !call.outside
+          call.kind !== 'other' && request.permissionGrants?.includes(call.kind) && !call.outside
             ? (options.find((option) => option.kind === 'allow-thread') ?? allow)
             : undefined;
         const automatic = refuses ? reject : (granted ?? permitted);

@@ -42,9 +42,17 @@ export type LoadedModelLike = {
   act(chat: ChatInput, tools: Tool[], options: LLMActionOpts): Promise<unknown>;
   countTokens(text: string): Promise<number>;
 };
-export type LocalConnect = (
-  request: ChatTurnRequest,
-) => Promise<{ model: LoadedModelLike; contextLength: number; modelKey: string }>;
+/**
+ * `fellBack` is true when the requested model is not loaded and `modelKey` names another one.
+ * `dispose` closes the runtime client the connection opened. It is safe to call more than once.
+ */
+export type LocalConnect = (request: ChatTurnRequest) => Promise<{
+  model: LoadedModelLike;
+  contextLength: number;
+  modelKey: string;
+  fellBack: boolean;
+  dispose: () => Promise<void>;
+}>;
 
 const MAX_TOOL_CALLS = 12;
 const CHANGING_TOOLS = new Set<string>(['edit', 'write', 'run']);
@@ -342,6 +350,7 @@ function startLocalTurn(
   const texts: string[] = [];
   const noticed = new Set<string>();
   let ending: 'stopped' | 'timeout' | null = null;
+  let connecting: ReturnType<LocalConnect> | null = null;
   let items = 0;
   let permissions = 0;
   let toolCalls = 0;
@@ -594,17 +603,24 @@ function startLocalTurn(
     });
     let connection: Awaited<ReturnType<LocalConnect>>;
     try {
-      connection = await bounded(connect(request));
+      connecting = connect(request);
+      connection = await bounded(connecting);
     } catch (error) {
       return ending ? ended() : finish('error', connectFailure(error));
     }
     if (ending) return ended();
-    const { model, contextLength, modelKey } = connection;
+    const { model, contextLength, modelKey, fellBack } = connection;
+    if (fellBack)
+      notice(
+        'warning',
+        `Local: ${request.selection.model} is not loaded, so ${modelKey} answered. Load ${request.selection.model} or pick ${modelKey} in the composer.`,
+      );
     usage = { usedTokens: 0, capacityTokens: contextLength };
     session = {
       family: 'local',
       sessionId: modelKey.slice(0, 512),
-      model: request.selection.model,
+      // The thread shows the model that answered, not the one that was asked for.
+      model: (fellBack ? modelKey : request.selection.model).slice(0, 200),
       updatedAt: new Date(now()).toISOString(),
     };
 
@@ -705,7 +721,13 @@ function startLocalTurn(
         changedPaths: [...changed],
       } satisfies ChatTurnResult;
     })
-    .finally(() => clearTimeout(deadline));
+    .finally(() => {
+      clearTimeout(deadline);
+      // Every turn opens its own client. A connect that gave up on a stop and lands later is
+      // closed here too. Nothing waits on the disposal: a runtime that never answers cancel
+      // keeps it pending, and that must not hold the turn open.
+      connecting?.then((connection) => connection.dispose()).catch(() => {});
+    });
 
   return {
     respondPermission: (requestId, choice) => pending.get(requestId)?.(choice),
