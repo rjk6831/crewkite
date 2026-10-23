@@ -17,7 +17,7 @@ import {
   chatFailure,
 } from '../../chat/adapter.ts';
 import { scratchPath } from '../../chat/local-tools.ts';
-import { defaultSchedule, groupAbsent } from '../../host/worker.ts';
+import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
 import {
   type OpenAiUsageHook,
   type OpenAiUsageWindow,
@@ -47,6 +47,8 @@ export type OpenAiChatDeps = Readonly<{
   onUsage?: OpenAiUsageHook;
   /** Tests replace the client with a scripted peer. */
   spawn?: Spawn;
+  /** Tests run the wait after Stop by hand. */
+  schedule?: Schedule;
 }>;
 
 export function openAiChatAdapter(deps: OpenAiChatDeps): ChatAdapter {
@@ -295,6 +297,8 @@ class OpenAiChatTurn {
   // that lands in between still supplies the reset time.
   private terminal: ProviderError | undefined;
   private outcome: Outcome | null = null;
+  // turn/interrupt went out. The stream stays open for the client's turn/completed after that.
+  private interrupting = false;
   private closing = false;
   private closed = false;
   private settled = false;
@@ -315,10 +319,12 @@ class OpenAiChatTurn {
   private readonly windows = new Map<string, OpenAiUsageWindow>();
   private usage: ChatTurnResult['usage'] = null;
   private readonly finish: (result: ChatTurnResult) => void;
+  private readonly schedule: Schedule;
 
   constructor(deps: OpenAiChatDeps, request: ChatTurnRequest, emit: (event: AgentEvent) => void) {
     this.request = request;
     this.emit = emit;
+    this.schedule = deps.schedule ?? defaultSchedule;
     this.reportUsage = openAiUsageReporter(deps.onUsage);
     let finish: (result: ChatTurnResult) => void = () => {};
     const result = new Promise<ChatTurnResult>((resolve) => {
@@ -549,10 +555,15 @@ class OpenAiChatTurn {
     );
   }
 
+  /** Frames matter until the turn ends, and after an interrupt until the client confirms it. */
+  private get reading() {
+    return !this.closing && (!this.outcome || this.interrupting);
+  }
+
   private data(chunk: Buffer) {
     let start = 0;
     let end = chunk.indexOf(10);
-    while (end >= 0 && !this.outcome) {
+    while (end >= 0 && this.reading) {
       const piece = chunk.subarray(start, end);
       start = end + 1;
       if (this.size + piece.length > LINE_LIMIT) return this.oversized();
@@ -562,7 +573,7 @@ class OpenAiChatTurn {
       this.frame(line.toString('utf8'));
       end = chunk.indexOf(10, start);
     }
-    if (this.outcome || start === chunk.length) return;
+    if (!this.reading || start === chunk.length) return;
     this.size += chunk.length - start;
     if (this.size > LINE_LIMIT) return this.oversized();
     this.parts.push(chunk.subarray(start));
@@ -590,6 +601,12 @@ class OpenAiChatTurn {
     if (!message.success)
       return this.noticeOnce('', 'warning', 'Codex sent a line CrewKite could not read.');
     const { id, method, params } = message.data;
+    // After an interrupt only the client's completion matters. It closes the turn in the thread's
+    // history, so the next message resumes a finished turn.
+    if (this.outcome) {
+      if (id === undefined && method === 'turn/completed') this.shutdown();
+      return;
+    }
     if (method !== undefined)
       return id === undefined
         ? this.notification(method, params)
@@ -1013,12 +1030,13 @@ class OpenAiChatTurn {
   }
 
   private interrupt() {
-    if (this.threadId && this.turnId)
-      this.write({
-        id: this.nextId++,
-        method: 'turn/interrupt',
-        params: { threadId: this.threadId, turnId: this.turnId },
-      });
+    if (this.interrupting || !this.threadId || !this.turnId) return;
+    this.interrupting = true;
+    this.write({
+      id: this.nextId++,
+      method: 'turn/interrupt',
+      params: { threadId: this.threadId, turnId: this.turnId },
+    });
   }
 
   private stop() {
@@ -1043,7 +1061,11 @@ class OpenAiChatTurn {
     } catch {
       // The result below still carries the outcome.
     }
-    this.shutdown();
+    // The client records an interrupted turn when it sends turn/completed. Closing its input
+    // before that leaves the turn open in the thread's history. A client that never answers is
+    // shut down after two seconds.
+    if (this.interrupting) this.later(2000, () => this.shutdown());
+    else this.shutdown();
   }
 
   private shutdown() {
@@ -1083,7 +1105,7 @@ class OpenAiChatTurn {
   }
 
   private later(milliseconds: number, work: () => void) {
-    this.timers.push(defaultSchedule(work, milliseconds));
+    this.timers.push(this.schedule(work, milliseconds));
   }
 
   private settle() {

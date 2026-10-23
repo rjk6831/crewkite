@@ -54,7 +54,7 @@ import {
   type ChatToolKind,
 } from '@crewkite/contracts';
 import { spawnCheckChild as spawn } from '../../host/check-ownership.ts';
-import { groupAbsent } from '../../host/worker.ts';
+import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
 import { openAiChatAdapter } from './chat.ts';
 import type { OpenAiUsage } from './discovery.ts';
 
@@ -138,6 +138,8 @@ input.on('line', (line) => {
   const value = JSON.parse(line);
   if (value.method === undefined) return play(scenario === 'edit' ? 'reply' : 'approved');
   if (value.id === undefined) return;
+  // A hung client never answers the interrupt.
+  if (value.method === 'turn/interrupt' && given.silent) return;
   let result = replies[value.method];
   // Fields CrewKite does not read change shape between client builds.
   if (value.method === 'thread/start') result = { thread: { id: threadId, preview: '' }, model: value.params.model, sandbox: { type: 'futureSandbox' } };
@@ -173,7 +175,8 @@ function turn(
     permissionGrants?: ChatToolKind[];
     /**
      * Scenario input for the peer: a command cwd or a network prompt, a file change path, its
-     * move destination and grant root, or the error that ends a turn.
+     * move destination and grant root, the error that ends a turn, or a client that never
+     * answers an interrupt.
      */
     detail?: {
       cwd?: string;
@@ -182,9 +185,11 @@ function turn(
       movePath?: string;
       grantRoot?: string;
       error?: { message: string; codexErrorInfo: string | null };
+      silent?: boolean;
     };
     /** Runs on the empty scratch copy before the turn starts. */
     prepare?: (scratch: string) => void;
+    schedule?: Schedule;
   } = {},
 ) {
   const home = mkdtempSync(join(root, `${scenario}-`));
@@ -207,6 +212,7 @@ function turn(
       const input = JSON.stringify(options.detail ?? null);
       return spawn(process.execPath, [path, scenario, frames, input], spawnOptions);
     },
+    schedule: options.schedule,
   });
   const handle = adapter.startTurn(
     {
@@ -388,26 +394,45 @@ test('a write outside the scratch copy still asks under allow-edits and allow-al
   }
 });
 
-test('stop interrupts the native turn, ends the process group and reports stopped', async () => {
-  const run = turn('stop');
-  await run.when('text.delta');
-  run.handle.stop();
-  const result = await run.settled();
-  assert.deepEqual(run.frames().at(-1), {
-    id: 6,
-    method: 'turn/interrupt',
-    params: { threadId: 'thread-1', turnId: 'turn-1' },
-  });
-  assert.equal(result.stopReason, 'stopped');
-  assert.equal(result.failure?.kind, 'stopped');
-  assert.equal(result.session?.sessionId, 'thread-1');
-  assert.deepEqual(strip(run.events).at(-1), {
-    type: 'turn.completed',
-    stopReason: 'stopped',
-    failure: result.failure,
-  });
-  assert.equal(run.handle.groups.length, 1);
-  for (const group of run.handle.groups) assert(groupAbsent(group));
+test('stop interrupts the native turn, waits for the client to confirm it and ends the process group', {
+  timeout: 30_000,
+}, async () => {
+  // The test runs the two-second wait by hand and every other timer as usual. A client that
+  // confirms the interrupt is shut down before the wait ends. One that never answers is shut down
+  // when the wait runs.
+  for (const silent of [false, true]) {
+    const waits: Array<() => void> = [];
+    const run = turn('stop', {
+      detail: { silent },
+      schedule: (work, milliseconds) => {
+        if (milliseconds !== 2000) return defaultSchedule(work, milliseconds);
+        waits.push(work);
+        return () => {};
+      },
+    });
+    await run.when('text.delta');
+    run.handle.stop();
+    // The thread shows the stop at once. Only the client process waits.
+    assert.deepEqual(strip(run.events).at(-1)?.type, 'turn.completed');
+    assert.equal(waits.length, 1);
+    if (silent) waits[0]();
+    const result = await run.settled();
+    assert.deepEqual(run.frames().at(-1), {
+      id: 6,
+      method: 'turn/interrupt',
+      params: { threadId: 'thread-1', turnId: 'turn-1' },
+    });
+    assert.equal(result.stopReason, 'stopped');
+    assert.equal(result.failure?.kind, 'stopped');
+    assert.equal(result.session?.sessionId, 'thread-1');
+    assert.deepEqual(strip(run.events).at(-1), {
+      type: 'turn.completed',
+      stopReason: 'stopped',
+      failure: result.failure,
+    });
+    assert.equal(run.handle.groups.length, 1);
+    for (const group of run.handle.groups) assert(groupAbsent(group));
+  }
 });
 
 test('an unknown notification is reported once and the turn still completes', async () => {
