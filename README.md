@@ -9,7 +9,7 @@ CrewKite is a desktop chat for coding on the OpenAI, Anthropic and Google subscr
 
 CrewKite by Roots No Limits LLC. Created by Raymond J. Kraft.
 
-![The CrewKite thread view with the Changes panel open.](docs/images/thread.png)
+![The thread view: a streamed reply, a thinking card, tool cards with a diff and an inline permission prompt.](docs/images/thread.png)
 
 ## Install
 

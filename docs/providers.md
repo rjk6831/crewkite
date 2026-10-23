@@ -82,7 +82,7 @@ A failed or unavailable native profile keeps its own refusal or unknown ownershi
 
 ### Connecting installed clients
 
-Open Connect providers before creating a task. The setup view separates the installed client, observed sign-in, reported allowance and coding qualification. A metadata failure keeps its reason and next action visible. Metadata reads leave project selection and task Stop available; an uncertain project mutation still requires its exact saved retry.
+Open Settings before starting a thread. The provider cards separate the installed client, observed sign-in, reported allowance and coding qualification. A metadata failure keeps its reason and next action visible. Metadata reads leave project selection and task Stop available; an uncertain project mutation still requires its exact saved retry.
 
 OpenAI uses the supported native client's existing subscription sign-in. Refresh OpenAI quota reads account and allowance metadata through its native server with no thread or turn. The reader uses the client's ordinary local database cache; forcing a new empty cache caused historical backfill to delay initialization past the read deadline. Private diagnostic output and owned process cleanup retain their existing bounds. A failed refresh preserves earlier observations and their original times.
 
