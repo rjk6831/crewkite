@@ -399,13 +399,16 @@ test('a thread read returns messages in cursor order and the live events of the 
     (event) => event.type === 'agent.event' && event.payload.type === 'text.delta',
   );
   await send('Second question.');
-  const { turnId } = (await streaming).payload as AgentEvent;
+  const streamed = await streaming;
+  const { turnId } = streamed.payload as AgentEvent;
 
   const thread = await read();
   assert.deepEqual(
     thread.messages.map((message) => message.text),
     ['First question.', 'First reply.', 'Second question.'],
   );
+  // The open turn waits after its delta, so the delta is the newest event the read reflects.
+  assert.equal(thread.cursor, streamed.cursor);
   const cursors = thread.messages.map((message) => BigInt(message.cursor));
   assert.deepEqual(
     cursors,

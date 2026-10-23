@@ -409,6 +409,8 @@ export class ChatService {
   }
 
   readThread(payload: Payload<'ReadChatThread'>): ChatThreadRead {
+    // Reads run synchronously on the one connection, so nothing lands between this and the rows.
+    const cursor = this.deps.store.cursor();
     const thread = this.thread(payload.taskId);
     const liveEvents = thread.activeTurnId
       ? newest(compact(this.agentEvents(payload.taskId, thread.activeTurnId)), LIVE_EVENT_BYTES)
@@ -419,7 +421,7 @@ export class ChatService {
       this.messages(payload.taskId, payload.beforeCursor, payload.limit),
       READ_BYTES - used,
     );
-    return ChatThreadReadSchema.parse({ thread, turns, messages, liveEvents });
+    return ChatThreadReadSchema.parse({ thread, turns, messages, liveEvents, cursor });
   }
 
   readChanges(payload: Payload<'ReadChatChanges'>): ChatChangesRead {
