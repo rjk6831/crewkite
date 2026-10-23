@@ -85,10 +85,13 @@ const SETTINGS_ACTION = 'Open LM Studio, load a model and connect Local in Setti
 const SHORTEN_ACTION = 'Shorten the request or split it into smaller steps, then send again.';
 
 function systemPrompt(request: ChatTurnRequest, outputTokens: number) {
+  const names = offeredTools(request).map((tool) => tool.function.name);
   return [
     request.systemContext,
     '',
     'You work through tools. Search for names and read the lines you need before you answer. Paths are relative to the project root.',
+    // Some chat templates have no native tool calls. The loop reads this form from the reply.
+    `Call one tool at a time: ${names.slice(0, -1).join(', ')} or ${names.at(-1)}. If you have no native tool calling, write the call as ${TEXT_CALL_EXAMPLE} and end your reply there.`,
     `Tool results are bounded: read_range returns at most ${READ_LINES} lines, search at most ${SEARCH_HITS} hits, and run the last ${RUN_TAIL_LINES} lines of output within ${RUN_SECONDS} seconds.`,
     'Read narrow ranges. The context window is small and every result stays in it until the turn ends.',
     'Use edit for exact replacements in existing files and write only for new files. The person may decline an edit or a command; continue without it.',
