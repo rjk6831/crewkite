@@ -6,7 +6,13 @@ import type {
   WorkspaceState,
 } from '@crewkite/contracts';
 import { X } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import {
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+  useEffect,
+  useRef,
+  useState,
+} from 'react';
 import { familyName } from '../components.tsx';
 import { permissionPolicies } from '../settings/preferences.ts';
 import { UsageGauges } from '../usage-gauges.tsx';
@@ -26,6 +32,131 @@ const roleNames: Record<ChatRole, string> = {
   reviewer: 'Reviewer',
   advisor: 'Advisor',
 };
+
+// The chosen width is a local preference. Storage can be blocked, and the panel falls back to the
+// default width when it is.
+const widthKey = 'crewkite-inspector-width-v1';
+const minWidth = 320;
+const maxShare = 0.6;
+const keyStep = 16;
+const narrowWindow = 1180;
+
+// A narrow window keeps the smaller default so the thread still has room beside the panel.
+const defaultWidth = (viewport: number) => (viewport <= narrowWindow ? 320 : 380);
+const maxWidth = (viewport: number) => Math.max(minWidth, Math.floor(viewport * maxShare));
+const clampWidth = (width: number, viewport: number) =>
+  Math.min(Math.max(Math.round(width), minWidth), maxWidth(viewport));
+
+function readWidth(): number | null {
+  try {
+    const width = Number.parseInt(localStorage.getItem(widthKey) ?? '', 10);
+    return Number.isFinite(width) ? width : null;
+  } catch {
+    return null;
+  }
+}
+function writeWidth(width: number | null) {
+  try {
+    if (width === null) localStorage.removeItem(widthKey);
+    else localStorage.setItem(widthKey, String(width));
+  } catch {}
+}
+
+/**
+ * The width follows the window as it shrinks, and the chosen value stays as picked, so a window
+ * that grows again gets the panel back at the width the person set.
+ */
+function useInspectorWidth() {
+  const [chosen, setChosen] = useState<number | null>(readWidth);
+  const [viewport, setViewport] = useState(() => window.innerWidth);
+  useEffect(() => {
+    const resize = () => setViewport(window.innerWidth);
+    window.addEventListener('resize', resize);
+    return () => window.removeEventListener('resize', resize);
+  }, []);
+  const width = clampWidth(chosen ?? defaultWidth(viewport), viewport);
+  return {
+    width,
+    min: minWidth,
+    max: maxWidth(viewport),
+    // A drag changes the width on every move and saves it once, when the pointer is released.
+    preview: (next: number) => setChosen(clampWidth(next, window.innerWidth)),
+    save: (next: number | null) => {
+      const value = next === null ? null : clampWidth(next, window.innerWidth);
+      setChosen(value);
+      writeWidth(value);
+    },
+  };
+}
+
+function ResizeHandle({
+  width,
+  min,
+  max,
+  onPreview,
+  onSave,
+}: {
+  width: number;
+  min: number;
+  max: number;
+  onPreview: (width: number) => void;
+  onSave: (width: number | null) => void;
+}) {
+  const drag = useRef<{ x: number; start: number; latest: number | null } | null>(null);
+  const [dragging, setDragging] = useState(false);
+  const begin = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    drag.current = { x: event.clientX, start: width, latest: null };
+    setDragging(true);
+  };
+  const move = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!drag.current) return;
+    // The panel sits on the right, so moving the pointer left makes it wider.
+    const next = clampWidth(drag.current.start + drag.current.x - event.clientX, window.innerWidth);
+    drag.current.latest = next;
+    onPreview(next);
+  };
+  const end = () => {
+    if (!drag.current) return;
+    // A click or a double-click never moves the pointer, and it must not pin the default width.
+    if (drag.current.latest !== null) onSave(drag.current.latest);
+    drag.current = null;
+    setDragging(false);
+  };
+  const press = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    // The handle is on the left edge, so Left moves the edge left and widens the panel.
+    const target: Record<string, number> = {
+      ArrowLeft: width + keyStep,
+      ArrowRight: width - keyStep,
+      Home: min,
+      End: max,
+    };
+    if (!Object.hasOwn(target, event.key)) return;
+    event.preventDefault();
+    onSave(target[event.key]);
+  };
+  return (
+    // biome-ignore lint/a11y/useSemanticElements: a separator that takes focus and keys is a window splitter, which <hr> cannot be
+    <div
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="Resize inspector"
+      aria-valuemin={min}
+      aria-valuemax={max}
+      aria-valuenow={width}
+      tabIndex={0}
+      className={dragging ? 'th-resize is-dragging' : 'th-resize'}
+      title="Drag to resize. Double-click to reset."
+      onPointerDown={begin}
+      onPointerMove={move}
+      onPointerUp={end}
+      onPointerCancel={end}
+      onDoubleClick={() => onSave(null)}
+      onKeyDown={press}
+    />
+  );
+}
 
 function UsageTab({ header, preview }: { header: WorkspaceState | null; preview: boolean }) {
   const now = useUsageClock(header?.usage ?? [], preview);
@@ -172,6 +303,7 @@ export function Inspector({
   focusPath: string | null;
   onConfigure: (patch: { permissionPolicy?: ChatPermissionPolicy; autoHandoff?: boolean }) => void;
 }) {
+  const size = useInspectorWidth();
   // Escape closes the panel unless a picker or field inside it already took the key, or a dialog
   // such as search is open and owns it.
   useEffect(() => {
@@ -184,7 +316,14 @@ export function Inspector({
     return () => document.removeEventListener('keydown', close);
   }, [onClose]);
   return (
-    <aside className="th-inspector" aria-label="Inspector">
+    <aside className="th-inspector" aria-label="Inspector" style={{ width: size.width }}>
+      <ResizeHandle
+        width={size.width}
+        min={size.min}
+        max={size.max}
+        onPreview={size.preview}
+        onSave={size.save}
+      />
       <div className="th-inspector-head">
         <div role="tablist" aria-label="Inspector sections">
           {tabs.map((item) => (
