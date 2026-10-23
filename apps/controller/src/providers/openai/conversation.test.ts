@@ -14,7 +14,7 @@ import {
   conversationPlan,
   startConversation,
 } from './conversation.ts';
-import { configuration, fixture, replies, running, threadResult } from './replacement-fixture.ts';
+import { fixture, replies, running, threadResult } from './replacement-fixture.ts';
 
 const scope = { paths: ['net.mjs'], roles: ['coder' as const], checks: ['node-net'] };
 const plan = (directory: string) =>
@@ -278,23 +278,16 @@ test('conversation replies bind frozen scope and remain finite proposals', () =>
     assert.equal(refused.diagnostic?.cause, cause);
     assert.throws(() => refused.finish());
   }
-  for (const change of [{ model: 'different-model' }]) {
-    const mismatch = new ConversationTranscript(chosen, { now: () => 1, timeoutMs: 60_000 });
-    assert.throws(() =>
-      admit(
-        mismatch,
-        chosen.directory,
-        { 'model/list': catalog },
-        {
-          ...threadResult(chosen.directory),
-          model: requested.model,
-          reasoningEffort: requested.effort,
-          ...change,
-        },
-      ),
-    );
-    assert.equal(mismatch.submitted, false);
-  }
+  const mismatch = new ConversationTranscript(chosen, { now: () => 1, timeoutMs: 60_000 });
+  assert.throws(() =>
+    admit(
+      mismatch,
+      chosen.directory,
+      { 'model/list': catalog },
+      { ...threadResult(chosen.directory), model: 'different-model' },
+    ),
+  );
+  assert.equal(mismatch.submitted, false);
   const unfinished = new ConversationTranscript(chosen, { now: () => 1, timeoutMs: 60_000 });
   assert.throws(() => unfinished.finish());
 
