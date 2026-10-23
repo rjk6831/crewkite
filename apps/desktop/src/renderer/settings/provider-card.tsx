@@ -59,6 +59,7 @@ function Models({
           </label>
           <small className="st-hint" id={hintId}>
             A new thread on this provider starts on it. The rail and the picker show its allowance.
+            Automatic handoff after a limit uses the provider's own default.
           </small>
           <div className="st-controls">
             <select
