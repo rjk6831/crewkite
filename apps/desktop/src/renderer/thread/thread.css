@@ -134,6 +134,27 @@
   font-weight: 500;
   letter-spacing: -0.3px;
 }
+.th-examples {
+  display: grid;
+  gap: 8px;
+  justify-items: center;
+  margin: 16px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.th-examples button {
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.4;
+}
+.th-examples button:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
 .th-button {
   margin-top: 8px;
   padding: 7px 14px;

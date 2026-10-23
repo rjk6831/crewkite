@@ -9,7 +9,8 @@ import {
   stopTurn,
   type ThreadSource,
 } from './commands.ts';
-import { Composer, type SendInput } from './composer.tsx';
+import { Composer, type ComposerHandle, type SendInput } from './composer.tsx';
+import { EmptyThread } from './empty-thread.tsx';
 import { LimitOfferCard } from './handoff-card.tsx';
 import { type LimitOffer, limitOffer } from './handoff-offer.ts';
 import { Inspector, type InspectorTab } from './inspector.tsx';
@@ -59,6 +60,7 @@ export function ThreadView({
   }>({ open: false, tab: 'changes', focus: null });
   const [notice, setNotice] = useState<string | null>(null);
   const counter = useRef(0);
+  const composer = useRef<ComposerHandle>(null);
   const thread = state.thread;
   const changesKey = useMemo(() => changeCount(items), [items]);
   const offer = useMemo(() => limitOffer(state), [state]);
@@ -153,10 +155,7 @@ export function ThreadView({
       </div>
     )
   ) : (
-    <div className="th-empty">
-      <p>{projectName}</p>
-      <p className="th-muted">Edits happen in a scratch copy. Review them under Changes.</p>
-    </div>
+    <EmptyThread onPick={(text) => composer.current?.fill(text)} />
   );
 
   return (
@@ -200,6 +199,7 @@ export function ThreadView({
           onOpenChanges={openChanges}
         />
         <Composer
+          ref={composer}
           key={task.id}
           source={source}
           taskId={task.id}

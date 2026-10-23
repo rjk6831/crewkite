@@ -38,12 +38,23 @@ import { NewThread } from './thread/new-thread.tsx';
 import { RailUsage } from './thread/rail-usage.tsx';
 import { ThreadView } from './thread/thread-view.tsx';
 
-function Empty({ icon, title, children }: { icon: ReactNode; title: string; children: ReactNode }) {
+function Empty({
+  icon,
+  title,
+  action,
+  children,
+}: {
+  icon: ReactNode;
+  title: string;
+  action?: ReactNode;
+  children: ReactNode;
+}) {
   return (
     <div className="empty">
       <span className="empty-icon">{icon}</span>
       <h3>{title}</h3>
       <p>{children}</p>
+      {action}
     </div>
   );
 }
@@ -884,10 +895,46 @@ export function App() {
             preview={preview}
             connection={connection}
           />
+        ) : projects.length === 0 ? (
+          <div className="loading-workspace">
+            <Empty
+              icon={<Folder />}
+              title="No project yet"
+              action={
+                workspace.canPickProject && (
+                  <button
+                    type="button"
+                    className="button primary"
+                    disabled={workspace.pending || connection !== 'connected'}
+                    onClick={() => void workspace.pickProject().catch(() => {})}
+                  >
+                    Add project
+                  </button>
+                )
+              }
+            >
+              Add a Git repository to start a thread.
+            </Empty>
+          </div>
+        ) : projects.every(({ taskCount }) => taskCount === 0) ? (
+          <div className="loading-workspace">
+            <Empty
+              icon={<SquarePen />}
+              title="No threads yet"
+              action={
+                <button type="button" className="button primary" onClick={() => startThread()}>
+                  <SquarePen size={14} aria-hidden="true" />
+                  New thread
+                </button>
+              }
+            >
+              Start a thread to ask about a project or describe a change.
+            </Empty>
+          </div>
         ) : (
-          <Empty icon={<SquarePen />} title="No threads yet">
-            Start a thread to ask about a project or describe a change.
-          </Empty>
+          <div className="loading-workspace" role="status">
+            <p>Opening thread.</p>
+          </div>
         )}
         <footer className="statusbar">
           <span>
