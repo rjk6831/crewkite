@@ -13,15 +13,15 @@ export type RailRow = {
 };
 
 /**
- * One row per connected family, in catalog order. The figure is the contract's tightest window,
- * the one the model picker and the handoff offer use. A reset time that has passed is flagged
- * here only. The percent stays the last one observed.
+ * One row per connected family, in catalog order. The figure is the contract's tightest window for
+ * the family's default model, the one the model picker and the handoff offer use. A reset time
+ * that has passed is flagged here only. The percent stays the last one observed.
  */
 export function railRows(catalog: ChatCatalogRead | null, nowMs: number): RailRow[] {
   return (catalog?.families ?? [])
     .filter((entry) => entry.connected)
     .map((entry) => {
-      const { percent, resetsAt } = tightestAllowance(entry);
+      const { percent, resetsAt } = tightestAllowance(entry, entry.defaultModel);
       const until = resetsAt ? Date.parse(resetsAt) - nowMs : null;
       return {
         family: entry.family,

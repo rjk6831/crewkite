@@ -360,30 +360,96 @@ export const ReadChatCatalogPayloadSchema = z.strictObject({ taskId: id('tsk').o
 
 export type ChatCatalogEntry = z.infer<typeof ChatCatalogEntrySchema>;
 
-/** The tightest window a family reports: lowest known percent, with its reset time. */
-export function tightestAllowance(entry: Pick<ChatCatalogEntry, 'remaining'>): {
+// Words a window id uses for its length, its slot or its scope. None of them names a model.
+const genericWindowTokens = new Set([
+  'weekly',
+  'daily',
+  'monthly',
+  'five',
+  'seven',
+  'hour',
+  'day',
+  'session',
+  'all',
+  'scoped',
+  'wtu',
+  '3p',
+  '5h',
+  'limit',
+  'quota',
+  'window',
+  'model',
+  'primary',
+  'secondary',
+]);
+
+const windowTokens = (windowId: string) =>
+  windowId
+    .toLowerCase()
+    .split(/[-_:]/)
+    .filter((token) => token !== '' && !genericWindowTokens.has(token));
+
+/**
+ * Whether a usage window limits a model. A window whose id names a model applies only to a model
+ * whose id carries every token it names. It takes every token, since an id such as
+ * `<vendor>-<model>-weekly` also carries the vendor prefix that every model id of the family
+ * shares. A window that names no model applies to every model, and an unknown model counts every
+ * window. `reported` lists every window id the family reports. Tokens all of them carry name the
+ * family's own bucket, such as a client name, and never narrow a window.
+ */
+export function windowAppliesTo(
+  windowId: string,
+  model: string | null,
+  reported: readonly string[] = [],
+): boolean {
+  if (model === null) return true;
+  const shared = reported
+    .map(windowTokens)
+    .reduce<string[] | null>(
+      (common, tokens) => (common ? common.filter((token) => tokens.includes(token)) : tokens),
+      null,
+    );
+  const id = model.toLowerCase();
+  return windowTokens(windowId).every((token) => id.includes(token) || shared?.includes(token));
+}
+
+/**
+ * The tightest window that limits a model: lowest known percent, with its reset time. A window
+ * named for another model of the family does not count. Without a model every window counts.
+ */
+export function tightestAllowance(
+  entry: Pick<ChatCatalogEntry, 'remaining'>,
+  model: string | null = null,
+): {
   percent: number | null;
   resetsAt: string | null;
 } {
+  const reported = entry.remaining.map((window) => window.windowId);
+  const windows = entry.remaining.filter((window) =>
+    windowAppliesTo(window.windowId, model, reported),
+  );
   let tightest: { percent: number; resetsAt: string | null } | null = null;
-  for (const window of entry.remaining) {
+  for (const window of windows) {
     if (window.percent === null) continue;
     if (!tightest || window.percent < tightest.percent)
       tightest = { percent: window.percent, resetsAt: window.resetsAt };
   }
-  return tightest ?? { percent: null, resetsAt: entry.remaining[0]?.resetsAt ?? null };
+  return tightest ?? { percent: null, resetsAt: windows[0]?.resetsAt ?? null };
 }
 
 /**
  * Families in the order a person would pick them: connected first, then most allowance left,
- * then soonest reset. A family with no known percent ranks after every known one. A family at
- * zero never ranks, since a turn there ends on the limit it already hit.
+ * then soonest reset. Each family is scored on the model it would run, `modelFor`, which is the
+ * catalog default unless the caller tracks another. A family with no known percent ranks after
+ * every known one. A family at zero never ranks, since a turn there ends on the limit it already
+ * hit.
  */
 export function rankFamilies(
   families: readonly ChatCatalogEntry[],
   exclude: readonly ChatCatalogEntry['family'][] = [],
+  modelFor: (entry: ChatCatalogEntry) => string | null = (entry) => entry.defaultModel,
 ): ChatCatalogEntry[] {
-  const score = (entry: ChatCatalogEntry) => tightestAllowance(entry);
+  const score = (entry: ChatCatalogEntry) => tightestAllowance(entry, modelFor(entry));
   return families
     .filter((entry) => entry.connected && !exclude.includes(entry.family))
     .filter((entry) => score(entry).percent !== 0)

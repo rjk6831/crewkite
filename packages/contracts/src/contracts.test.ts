@@ -66,6 +66,7 @@ import {
   TaskModelCatalogSchema,
   TransportMessageSchema,
   UsageReaderSchema,
+  windowAppliesTo,
 } from './index.ts';
 
 const suffix = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
@@ -3228,4 +3229,24 @@ test('canonical identity ignores key order and detects changed content', () => {
   const cycle: { self?: unknown } = {};
   cycle.self = cycle;
   assert.throws(() => canonicalJson(cycle));
+});
+
+test('a usage window limits only the models its id names', () => {
+  // Ids follow the shapes providers report: a vendor prefix, a model name, a length.
+  const rows: [string, string | null, boolean, string[]?][] = [
+    ['acme-deep-wtu-weekly', 'acme-3.8-quick', false],
+    ['acme-deep-wtu-weekly', 'acme-deep-2', true],
+    ['acme-deep-wtu-weekly', null, true],
+    ['acme-weekly', 'acme-3.8-quick', true],
+    ['3p-5h', 'acme-3.8-quick', true],
+    ['weekly-tale', 'mid-4-5', false],
+    ['weekly-tale', 'Tale-1', true],
+    ['weekly', 'mid-4-5', true],
+    ['five-hour', 'mid-4-5', true],
+    ['seven_day', 'mid-4-5', true],
+    // Every window the family reports carries the client's bucket name, so it names no model.
+    ['client:primary', 'large-1', true, ['client:primary', 'client:secondary']],
+  ];
+  for (const [windowId, model, applies, reported] of rows)
+    assert.equal(windowAppliesTo(windowId, model, reported), applies, `${windowId} on ${model}`);
 });

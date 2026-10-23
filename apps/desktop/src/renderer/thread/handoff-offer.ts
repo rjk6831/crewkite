@@ -61,7 +61,7 @@ export function offerChoices(catalog: ChatCatalogRead, stopped: ChatFamily): Off
     const model = entry.defaultModel ?? entry.models[0]?.model;
     if (!model) return [];
     const effort = entry.models.find((value) => value.model === model)?.defaultEffort;
-    const { percent } = tightestAllowance(entry);
+    const { percent } = tightestAllowance(entry, model);
     return [
       {
         family: entry.family,

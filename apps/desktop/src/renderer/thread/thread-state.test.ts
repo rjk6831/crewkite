@@ -576,4 +576,32 @@ test('the offer ranks the other connected families by allowance and leaves out o
     offerChoices(catalog, 'anthropic').map(({ family }) => family),
     ['openai', 'local'],
   );
+
+  // Google reports a weekly pool for one model next to the family's own windows. The empty pool
+  // does not hold back the default model, which still has 95% of the weekly window.
+  const pooled = (percent: number, windowId: string) => ({
+    windowId,
+    label: windowId,
+    percent,
+    resetsAt: null,
+    observedAt: null,
+  });
+  const google = {
+    ...family('google', null),
+    models: [
+      { model: 'acme-quick', label: 'Quick', efforts: [], defaultEffort: 'default' as const },
+      { model: 'acme-deep', label: 'Deep', efforts: [], defaultEffort: 'default' as const },
+    ],
+    defaultModel: 'acme-quick',
+    remaining: [pooled(95, 'acme-weekly'), pooled(100, 'acme-5h'), pooled(0, 'acme-deep-weekly')],
+  };
+  assert.deepEqual(
+    offerChoices({ families: [catalog.families[1], google] }, 'openai').map(
+      ({ family, selection, percent }) => [family, selection.model, percent],
+    ),
+    [
+      ['google', 'acme-quick', 95],
+      ['anthropic', 'm', 60],
+    ],
+  );
 });

@@ -22,14 +22,25 @@ export const effortLabels: Record<ChatEffort, string> = {
   default: 'Default',
 };
 
-// The window with the least left decides what the person can still do, so it is the one shown.
+const left = (percent: number | null) =>
+  percent === null ? 'Allowance unknown' : `${Math.floor(percent)}% left`;
+
+// The window with the least left decides what the person can still do, so it is the one shown. The
+// family line follows its default model. A window named for another model does not count.
 function allowance(entry: Entry, nowMs: number): string {
   if (entry.family === 'local' && entry.remaining.length === 0) return 'Runs on this computer';
-  const { percent, resetsAt } = tightestAllowance(entry);
-  if (percent === null) return 'Allowance unknown';
-  const left = `${Math.floor(percent)}% left`;
+  const { percent, resetsAt } = tightestAllowance(entry, entry.defaultModel);
   const reset = resetsAt ? Date.parse(resetsAt) - nowMs : null;
-  return reset !== null && reset > 0 ? `${left}, resets in ${formatSpan(reset)}` : left;
+  return percent !== null && reset !== null && reset > 0
+    ? `${left(percent)}, resets in ${formatSpan(reset)}`
+    : left(percent);
+}
+
+// A model with a window of its own, such as a weekly pool for one model, shows what it has left
+// on its row when that differs from the family line.
+function modelAllowance(entry: Entry, model: string): string | null {
+  const own = left(tightestAllowance(entry, model).percent);
+  return own === left(tightestAllowance(entry, entry.defaultModel).percent) ? null : own;
 }
 
 export function findModel(catalog: ChatCatalogRead | null, selection: ChatModelSelection | null) {
@@ -203,6 +214,7 @@ export function ModelPicker({
               {family.models.map((item) => {
                 const checked =
                   selection?.family === family.family && selection.model === item.model;
+                const own = family.connected ? modelAllowance(family, item.model) : null;
                 return (
                   <button
                     key={item.model}
@@ -221,6 +233,7 @@ export function ModelPicker({
                     }}
                   >
                     <span>{item.label}</span>
+                    {own && <em>{own}</em>}
                     {checked && <Check size={14} aria-hidden="true" />}
                   </button>
                 );
