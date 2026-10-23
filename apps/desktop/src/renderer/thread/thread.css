@@ -428,6 +428,10 @@
 .th-card > button:not(:disabled):hover {
   background: var(--surface-hover);
 }
+/* The card clips its children, so the default outside ring would vanish. Draw it inside. */
+.th-card > button:focus-visible {
+  outline-offset: -2px;
+}
 .th-card-title {
   flex: 0 1 auto;
   min-width: 0;
@@ -990,6 +994,9 @@
 }
 .th-changes > ul > li > button:hover {
   background: var(--surface-hover);
+}
+.th-changes > ul > li > button:focus-visible {
+  outline-offset: -2px;
 }
 .th-changes > ul > li > button .th-chevron {
   margin-left: 0;
