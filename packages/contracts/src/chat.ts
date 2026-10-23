@@ -224,3 +224,88 @@ export type ChatEffort = z.infer<typeof ChatEffortSchema>;
 export type ChatPermissionPolicy = z.infer<typeof ChatPermissionPolicySchema>;
 export type ChatTurnState = z.infer<typeof ChatTurnStateSchema>;
 export type ChatToolKind = z.infer<typeof ChatToolKindSchema>;
+
+// Read shapes. The thread view loads one of these, then applies live events on top.
+export const ChatMessageSchema = z.strictObject({
+  id: id('msg'),
+  taskId: id('tsk'),
+  at: timestamp,
+  cursor: z.string().regex(/^(0|[1-9][0-9]{0,19})$/),
+  author: z.union([
+    z.strictObject({ kind: z.literal('user') }),
+    z.strictObject({
+      kind: z.literal('assistant'),
+      turnId: ChatTurnIdSchema,
+      family: ChatFamilySchema,
+      model: short,
+      role: ChatRoleSchema,
+    }),
+    z.strictObject({ kind: z.literal('system'), turnId: ChatTurnIdSchema.nullable() }),
+  ]),
+  text: z.string().max(262_144),
+  attachments: z.array(z.string().min(1).max(4096)).max(32).default([]),
+});
+export type ChatMessage = z.infer<typeof ChatMessageSchema>;
+
+export const ChatThreadReadSchema = z.strictObject({
+  thread: ChatThreadSchema,
+  turns: z.array(ChatTurnSchema).max(500),
+  messages: z.array(ChatMessageSchema).max(1000),
+  /** Events of turns that have not finished, oldest first, so a reopened view can rebuild them. */
+  liveEvents: z.array(AgentEventSchema).max(5000),
+});
+export type ChatThreadRead = z.infer<typeof ChatThreadReadSchema>;
+
+export const ChatChangesReadSchema = z.strictObject({
+  taskId: id('tsk'),
+  base: z
+    .string()
+    .regex(/^[a-f0-9]{40}$/)
+    .nullable(),
+  files: z.array(ChatFileDiffSchema).max(2000),
+});
+export type ChatChangesRead = z.infer<typeof ChatChangesReadSchema>;
+
+export const ChatCatalogEntrySchema = z.strictObject({
+  family: ChatFamilySchema,
+  connected: z.boolean(),
+  reason: z.string().max(1024).nullable().default(null),
+  models: z
+    .array(
+      z.strictObject({
+        model: short,
+        label: short,
+        efforts: z.array(ChatEffortSchema).max(8),
+        defaultEffort: ChatEffortSchema,
+      }),
+    )
+    .max(64),
+  defaultModel: short.nullable().default(null),
+  remaining: z
+    .array(
+      z.strictObject({
+        windowId: short,
+        label: short,
+        percent: z.number().min(0).max(100).nullable(),
+        resetsAt: timestamp.nullable(),
+        observedAt: timestamp.nullable(),
+      }),
+    )
+    .max(8)
+    .default([]),
+});
+export const ChatCatalogReadSchema = z.strictObject({
+  families: z.array(ChatCatalogEntrySchema).max(4),
+});
+export type ChatCatalogRead = z.infer<typeof ChatCatalogReadSchema>;
+
+export const ReadChatThreadPayloadSchema = z.strictObject({
+  taskId: id('tsk'),
+  beforeCursor: z
+    .string()
+    .regex(/^(0|[1-9][0-9]{0,19})$/)
+    .optional(),
+  limit: z.number().int().min(1).max(200).default(100),
+});
+export const ReadChatChangesPayloadSchema = z.strictObject({ taskId: id('tsk') });
+export const ReadChatCatalogPayloadSchema = z.strictObject({ taskId: id('tsk').optional() });
