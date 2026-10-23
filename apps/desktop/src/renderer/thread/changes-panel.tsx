@@ -18,6 +18,25 @@ const refusals: Record<string, string> = {
   'branch-not-created': 'The branch was not created. Choose another name and try again.',
 };
 
+type Files = ChatChangesRead['files'];
+
+// The diff each thread last accepted. While the Changes tab shows the same diff, the branch already
+// holds it and a second acceptance would only collide with that branch name.
+// shortcut: kept while the window stays open. The thread record has the file count only, which
+// cannot prove the diff is the same, so after a restart the button is enabled again.
+// Upgrade: store a digest of the accepted diff on the thread record.
+const acceptedDiffs = new Map<string, { branch: string; files: Files }>();
+
+const sameFiles = (left: Files, right: Files) =>
+  left.length === right.length &&
+  left.every(
+    (file, index) =>
+      file.path === right[index].path &&
+      file.additions === right[index].additions &&
+      file.deletions === right[index].deletions &&
+      file.patch === right[index].patch,
+  );
+
 // The controller takes lower case letters, digits, hyphens and slashes. A title with none of
 // those still gets a name that is unique to the thread.
 function branchName(title: string, taskId: string) {
@@ -34,13 +53,13 @@ function AcceptControl({
   taskId,
   title,
   thread,
-  empty,
+  files,
 }: {
   source: ThreadSource;
   taskId: string;
   title: string;
   thread: ChatThread | null;
-  empty: boolean;
+  files: Files;
 }) {
   const [branch, setBranch] = useState(() => branchName(title, taskId));
   const [busy, setBusy] = useState(false);
@@ -48,6 +67,8 @@ function AcceptControl({
   const [accepted, setAccepted] = useState<Extract<Acceptance, { accepted: true }> | null>(null);
   // The command result shows at once. The thread record keeps it for the next time the tab opens.
   const last = accepted ?? thread?.lastAcceptance ?? null;
+  const diff = acceptedDiffs.get(taskId);
+  const done = Boolean(last && diff?.branch === last.branch && sameFiles(diff.files, files));
 
   async function accept(event: FormEvent) {
     event.preventDefault();
@@ -55,8 +76,10 @@ function AcceptControl({
     setRefusal(null);
     try {
       const answer = await acceptChanges(source, { taskId, branch: branch.trim() });
-      if (answer.accepted) setAccepted(answer);
-      else setRefusal(refusals[answer.reason] ?? answer.next ?? 'The changes were not accepted.');
+      if (answer.accepted) {
+        acceptedDiffs.set(taskId, { branch: answer.branch, files });
+        setAccepted(answer);
+      } else setRefusal(refusals[answer.reason] ?? answer.next ?? 'The changes were not accepted.');
     } catch (failure) {
       setRefusal(failure instanceof Error ? failure.message : 'The changes were not accepted.');
     } finally {
@@ -77,7 +100,10 @@ function AcceptControl({
       <button
         type="submit"
         className="th-button"
-        disabled={busy || empty || Boolean(thread?.activeTurnId) || !branch.trim()}
+        disabled={
+          busy || done || files.length === 0 || Boolean(thread?.activeTurnId) || !branch.trim()
+        }
+        title={done && last ? `These changes are on ${last.branch}.` : undefined}
       >
         Accept to branch
       </button>
@@ -158,7 +184,7 @@ export function ChangesPanel({
       taskId={taskId}
       title={title}
       thread={thread}
-      empty={data.files.length === 0}
+      files={data.files}
     />
   );
   if (data.files.length === 0)
