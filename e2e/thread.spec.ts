@@ -107,7 +107,9 @@ test('a new thread streams a reply, asks before editing and lists the edited fil
     const page = await application.firstWindow();
     await page.setViewportSize({ width: 1440, height: 900 });
     await expect(page.getByText('Controller connected', { exact: true })).toBeVisible();
-    await page.getByRole('button', { name: 'New thread', exact: true }).click();
+    // The rail button carries the label. The empty workspace shows a second button with the same
+    // text once the project list arrives, so the role query would match two.
+    await page.getByLabel('New thread', { exact: true }).click();
     await page
       .getByPlaceholder('Ask about this project or describe a change')
       .fill('Implement netMinor in net.mjs');
