@@ -505,8 +505,10 @@ function refreshFixture(
 
 test('manual usage consent and the age-unknown report survive exact retries and reopen', async (t) => {
   const f = refreshFixture(t);
+  const afterTurn = () => f.controller.anthropicUsage().refreshAfterTurn(f.command().key);
   const initial = f.status();
   assert(initial?.available && initial.trust && !initial.trust.accepted);
+  assert.equal(afterTurn(), undefined);
   const untouched = f.controller
     .workspaceState()
     .usageReaders.filter((reader) => reader.family !== 'anthropic');
@@ -546,9 +548,15 @@ test('manual usage consent and the age-unknown report survive exact retries and 
   assert.deepEqual(f.status()?.reading, retained?.reading);
   assert.equal(f.status()?.trust?.accepted, true);
   assert.equal(f.calls(), 1);
+  // A settled turn reads again only once the last read is more than a minute old.
+  f.clock.advance(60000);
+  assert.equal(afterTurn(), undefined);
+  f.clock.advance(1);
+  await afterTurn();
+  assert.equal(f.calls(), 2);
   f.clock.advance(60000);
   assert.equal((await f.controller.execute(f.command(), 'local-owner')).outcome, 'applied');
-  assert.equal(f.calls(), 2);
+  assert.equal(f.calls(), 3);
   const previousReport = f.status()?.reading;
   f.clock.advance(60000);
   f.changeScope();
@@ -562,9 +570,10 @@ test('manual usage consent and the age-unknown report survive exact retries and 
     (await f.controller.execute(f.command(), 'local-owner')).reason,
     'native-trust-required',
   );
+  assert.equal(afterTurn(), undefined);
   assert.deepEqual(f.status()?.reading, previousReport);
   assert.notEqual(f.status()?.readingScopeHash, f.status()?.trust?.scopeHash);
-  assert.equal(f.calls(), 2);
+  assert.equal(f.calls(), 3);
 });
 
 test('manual usage Stop, failed cooldown and uncertain ownership never replay a native read', async (t) => {
@@ -629,6 +638,7 @@ test('manual usage Stop, failed cooldown and uncertain ownership never replay a 
       'anthropic-metadata-ownership-pending',
     );
     if (mode === 'held') {
+      assert.equal(f.controller.anthropicUsage().refreshAfterTurn(f.command().key), undefined);
       assert.equal(
         (await f.controller.execute(f.command(), 'local-owner')).reason,
         'anthropic-metadata-ownership-pending',

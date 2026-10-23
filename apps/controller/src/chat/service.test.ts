@@ -521,10 +521,15 @@ function limitThread(t: TestContext, options: { autoHandoff: boolean; resetsAt: 
     familyEntry('google', 80, inHours(2), now),
     familyEntry('local', 60, inHours(1), now),
   ];
-  const thread = standalone(t, { adapters, catalog: () => ({ families }) });
+  const settled: [string, string][] = [];
+  const thread = standalone(t, {
+    adapters,
+    catalog: () => ({ families }),
+    onTurnSettled: (family, taskId) => settled.push([family, taskId]),
+  });
   const { store, service, taskId } = thread;
   store.transaction(() => service.configure({ taskId, autoHandoff: options.autoHandoff }));
-  return { ...thread, adapters, limit };
+  return { ...thread, adapters, limit, settled };
 }
 
 test('a usage limit writes a system line, and auto handoff runs the same message once on the next family', {
@@ -560,6 +565,10 @@ test('a usage limit writes a system line, and auto handoff runs the same message
     ],
   );
   assert.equal(thread.turns[1].userMessageId, thread.turns[0].userMessageId);
+  assert.deepEqual(on.settled, [
+    ['openai', on.taskId],
+    ['google', on.taskId],
+  ]);
   assert.equal(thread.thread.selection?.model, 'google-model');
   assert.equal(thread.thread.sessions[0]?.sessionId, `session-${second.id}`);
   const [request] = on.adapters.get('google')?.requests ?? [];

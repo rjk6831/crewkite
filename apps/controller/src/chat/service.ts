@@ -94,6 +94,11 @@ export type ChatServiceDeps = {
    * `remaining` holds the latest observed usage windows with null for anything not observed.
    */
   catalog: (taskId?: string) => ChatCatalogRead;
+  /**
+   * Runs once a turn of any role has settled, so the controller can read usage the turn spent.
+   * It runs outside the turn's transaction, and a throw never reaches the turn.
+   */
+  onTurnSettled?: (family: ChatFamily, taskId: string) => void;
   /** Process table access and timers. Tests replace them; the defaults are the real ones. */
   groupAbsent?: (group: number) => boolean;
   signalGroup?: (group: number, signal: NodeJS.Signals) => void;
@@ -801,7 +806,14 @@ export class ChatService {
       this.deps.store.transaction(() => this.settle(turnId, ending(result, live.items, left)));
     } catch {
       // The row stays open. Startup recovery fails it with a visible reason.
+      return;
     }
+    if (turn && !this.closed)
+      try {
+        this.deps.onTurnSettled?.(turn.selection.family, turn.taskId);
+      } catch {
+        // A usage read that fails to start changes nothing about the turn.
+      }
     if (result.stopReason === 'limit' && !live.stopRequested && !this.closed)
       this.continueOnLimit(turnId);
   }

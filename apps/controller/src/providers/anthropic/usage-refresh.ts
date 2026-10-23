@@ -7,6 +7,7 @@ import {
   type Command,
   CommandIdSchema,
   type CommandResult,
+  CommandSchema,
   canonicalJson,
   HashSchema,
   TimestampSchema,
@@ -407,6 +408,33 @@ export class AnthropicUsageRefresh {
       completion.resolve({ outcome: 'outcome-unknown', reason: 'anthropic-usage-storage-failed' });
     });
     return active.done;
+  }
+
+  /**
+   * A settled chat turn spent some allowance, so the gauge reads again on its own. It reads only
+   * under trust the person already gave, when the last read is more than a minute old, and never
+   * beside another read. Anything else skips it without a receipt.
+   */
+  refreshAfterTurn(key: string): Promise<unknown> | undefined {
+    try {
+      if (this.closed || this.active || this.blocker() || this.options.blocked()) return;
+      const binding = this.binding();
+      if (!binding || !this.trusted(binding.scopeHash)) return;
+      const previous = this.state();
+      if (previous && Date.parse(this.options.now()) - Date.parse(previous.attemptedAt) <= 60_000)
+        return;
+      const command = CommandSchema.parse({
+        protocol: 1,
+        key,
+        actor: { id: 'controller', kind: 'controller' },
+        command: 'RefreshAnthropicUsage',
+        expectedRevision: 0,
+        payload: {},
+      }) as UsageCommand;
+      return this.execute(command).catch(() => undefined);
+    } catch {
+      return;
+    }
   }
 
   close(): Promise<unknown> | undefined {
