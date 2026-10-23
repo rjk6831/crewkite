@@ -2,6 +2,7 @@ import { z } from 'zod';
 import {
   AcceptChatChangesPayloadSchema,
   AgentEventSchema,
+  ChatCatalogChangeSchema,
   ChatCatalogReadSchema,
   ChatChangesReadSchema,
   ChatFamilySchema,
@@ -15,6 +16,7 @@ import {
   ReadChatCatalogPayloadSchema,
   ReadChatChangesPayloadSchema,
   ReadChatThreadPayloadSchema,
+  RefreshChatModelsPayloadSchema,
   ResolveChatPermissionPayloadSchema,
   SendChatMessagePayloadSchema,
   StopChatTurnPayloadSchema,
@@ -2357,6 +2359,7 @@ export const CommandSchema = z.discriminatedUnion('command', [
   read('ReadChatThread', ReadChatThreadPayloadSchema),
   read('ReadChatChanges', ReadChatChangesPayloadSchema),
   read('ReadChatCatalog', ReadChatCatalogPayloadSchema),
+  mutate('RefreshChatModels', RefreshChatModelsPayloadSchema),
   mutate(
     'ConfigureLocal',
     z.strictObject({ endpoint: LocalEndpointSchema, authMode: LocalAuthModeSchema.optional() }),
@@ -3516,6 +3519,7 @@ export const EventSchema = z.discriminatedUnion('type', [
   event('agent.event', AgentEventSchema),
   event('chat.turn', ChatTurnSchema),
   event('chat.thread', ChatThreadSchema),
+  event('chat.catalog', ChatCatalogChangeSchema),
   event('task.created', TaskSchema),
   event('task.updated', TaskSchema),
   event('run.prepared', RunSchema),

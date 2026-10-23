@@ -630,6 +630,16 @@ export const OpenAiUsageReadSchema = z.strictObject({
   lastObservedAt: TimestampSchema.nullable().optional(),
   commandId: CommandIdSchema.optional(),
 });
+/**
+ * The last chat model read. A group stays listed until it exits or a later check finds it gone,
+ * so a crash mid-read leaves the evidence for the next one.
+ */
+export const ChatModelReadSchema = z.strictObject({
+  version: z.literal(1),
+  attemptedAt: TimestampSchema,
+  groups: z.array(z.number().int().positive().safe()).max(2),
+  reason: z.string().min(1).max(400).nullable(),
+});
 export type LocalWriterRuntime = {
   plan: LocalPrepared;
   binding: LocalStart['binding'];

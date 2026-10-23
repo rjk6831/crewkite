@@ -76,6 +76,36 @@ export function matchesOpenAiModelCatalogObservation(
   }
 }
 
+/**
+ * A failed model read in words a person can act on. The session reason alone says too little:
+ * most failures come back as `protocol`, and the request that was waiting tells them apart.
+ */
+export function modelReadFailure(outcome: { reason: string | null; lastRequest: string }) {
+  switch (outcome.reason) {
+    case 'deadline':
+      return 'The OpenAI client did not list its models within 20 seconds. Refresh to try again.';
+    case 'launch':
+      return 'The OpenAI client could not be started. Check that it is installed, then refresh.';
+    case 'output-limit':
+      return 'The OpenAI client wrote more output than a model read allows.';
+    case 'stopped':
+      return 'The model read stopped before it finished. Refresh to try again.';
+  }
+  switch (outcome.lastRequest) {
+    case 'account/read':
+      return 'The OpenAI client reported no ChatGPT sign-in. Sign in with a ChatGPT plan, then refresh.';
+    case 'features-list':
+    case 'config/read':
+    case 'configRequirements/read':
+      return 'The OpenAI client settings differ from the ones CrewKite runs it with. Update the client, then refresh.';
+    case 'model/list':
+    case 'complete':
+      return 'The OpenAI client listed no models CrewKite can offer.';
+    default:
+      return `The OpenAI client stopped answering at ${outcome.lastRequest}. Update the client, then refresh.`;
+  }
+}
+
 /** Read the native catalog without creating a thread or submitting a model turn. */
 export function startOpenAiModelCatalogObservation(
   profile: NativeProfileResolution,

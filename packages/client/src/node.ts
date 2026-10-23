@@ -310,6 +310,7 @@ export class ControllerClient {
                                 ? 35000
                                 : [
                                       'ObserveUsage',
+                                      'RefreshChatModels',
                                       'DiscoverGoogleAcp',
                                       'StopGoogleAcpSetup',
                                     ].includes(command.command)

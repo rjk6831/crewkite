@@ -252,6 +252,18 @@ export const HandoffChatThreadPayloadSchema = z.strictObject({
   selection: ChatModelSelectionSchema,
   reason: z.enum(['manual', 'limit']).default('manual'),
 });
+// Only the OpenAI list comes from a separate read. The other families list what their profile or
+// setup already holds.
+export const RefreshChatModelsPayloadSchema = z.strictObject({ family: z.literal('openai') });
+
+/** Sent when a model read ends, so open pickers read the catalog again. */
+export const ChatCatalogChangeSchema = z.strictObject({
+  family: z.literal('openai'),
+  models: z.number().int().min(0).max(64),
+  /** What went wrong, in words for the person. Null when the read stored a list. */
+  reason: z.string().min(1).max(400).nullable(),
+});
+export type ChatCatalogChange = z.infer<typeof ChatCatalogChangeSchema>;
 export type ChatFamily = z.infer<typeof ChatFamilySchema>;
 export type ChatRole = z.infer<typeof ChatRoleSchema>;
 export type ChatEffort = z.infer<typeof ChatEffortSchema>;

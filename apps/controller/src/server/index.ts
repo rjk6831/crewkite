@@ -197,6 +197,7 @@ export async function serve(
                     'ReadGitHub',
                     'StopProjectOperation',
                     'ObserveUsage',
+                    'RefreshChatModels',
                     'RefreshAnthropicUsage',
                     'StopAnthropicUsage',
                     'CheckNativeConnection',

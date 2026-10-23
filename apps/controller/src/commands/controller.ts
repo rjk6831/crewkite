@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import {
   chmodSync,
   closeSync,
@@ -46,7 +47,7 @@ import type { prepareToolchain } from '../evidence/toolchain-definition.ts';
 import { ToolchainVerification } from '../evidence/toolchain-verify.ts';
 import type { GitIdentity } from '../host/publication.ts';
 import { inspectSourceDetails, projectRoot } from '../host/source.ts';
-import type { OwnedCommand, OwnedWorker, Schedule } from '../host/worker.ts';
+import { groupAbsent, type OwnedCommand, type OwnedWorker, type Schedule } from '../host/worker.ts';
 import { anthropicChatAdapter } from '../providers/anthropic/chat.ts';
 import type { NativeConnectionChecks } from '../providers/anthropic/native-connection.ts';
 import type { AnthropicUsageRefresh } from '../providers/anthropic/usage-refresh.ts';
@@ -74,6 +75,11 @@ import { connectLocalModel } from '../providers/local/chat-connect.ts';
 import type { startLocalDiscovery, startLocalReplacement } from '../providers/local/replacement.ts';
 import type { LocalInputHelper, startLocalSecretInput } from '../providers/local/secure-input.ts';
 import { openAiChatAdapter } from '../providers/openai/chat.ts';
+import {
+  modelReadFailure,
+  type OpenAiModelCatalogObservation,
+  startOpenAiModelCatalogObservation,
+} from '../providers/openai/model-catalog.ts';
 import type { startNativeSession } from '../providers/openai/native-discovery.ts';
 import type { NativeProfileResolution } from '../providers/openai/profile.ts';
 import type { startReplacement } from '../providers/openai/replacement.ts';
@@ -98,6 +104,7 @@ import { RecoveryCommands } from './recovery.ts';
 import { RunCommands } from './runs.ts';
 import {
   type AcpSetupCommand,
+  ChatModelReadSchema,
   type FakeRuntime,
   type LocalOperationRuntime,
   type LocalSecretCell,
@@ -116,6 +123,10 @@ import { UsageCommands } from './usage.ts';
 import { WriterCommands } from './writers.ts';
 
 export type { NativePilotAppointment } from './schemas.ts';
+
+// The newest OpenAI model list the chat path read, and the record of the read that produced it.
+const CHAT_MODEL_CATALOG = 'chat-model-catalog:openai';
+const CHAT_MODEL_READ = 'chat-model-read:openai';
 
 export type ControllerOptions = {
   home: string;
@@ -197,6 +208,11 @@ export class Controller {
   private closing?: Promise<void>;
   readonly workers = new Map<string, FakeRuntime | NativeRuntime>();
   readonly quotaRetries = new Map<string, () => void>();
+  private chatModelRead?: {
+    stopped: boolean;
+    stop?: () => void;
+    promise: Promise<CommandResult>;
+  };
   openAiUsageRead?: {
     id: string;
     stopped: boolean;
@@ -406,6 +422,149 @@ export class Controller {
     return latest?.models ?? null;
   }
 
+  /** The OpenAI profile a chat turn launches with, in the adapter's order of preference. */
+  private chatOpenAiProfile(profiles = this.resolveProfiles()) {
+    for (const id of ['openai-repository-v1', 'openai-file-v1']) {
+      const profile = profiles.find((value) => value.facts.id === id);
+      if (profile?.facts.available && profile.client && profile.environment && profile.locationHash)
+        return profile;
+    }
+  }
+
+  private chatModelReadRecord() {
+    if (!this.store.receipt(CHAT_MODEL_READ)) return null;
+    return ChatModelReadSchema.parse(this.nativeRecord(CHAT_MODEL_READ, 4096).value);
+  }
+
+  private retainNativeRecord(key: string, value: unknown) {
+    const artifact = this.nativeArtifact(value);
+    this.store.db.prepare('DELETE FROM receipts WHERE command_key=?').run(key);
+    this.store.saveReceipt(key, artifact.hash, 'local-owner', {
+      outcome: 'applied',
+      entity: artifact,
+    });
+  }
+
+  /** At most one model read runs. A second caller gets the result of the one in flight. */
+  private readChatModels(): Promise<CommandResult> {
+    if (this.chatModelRead) return this.chatModelRead.promise;
+    const runtime = { stopped: false } as NonNullable<Controller['chatModelRead']>;
+    runtime.promise = Promise.resolve()
+      .then(() => this.runChatModelRead(runtime))
+      .catch(
+        (): CommandResult => ({
+          outcome: 'blocked',
+          reason: 'model-read-unavailable',
+          next: 'CrewKite could not record the model read. Refresh models to try again.',
+        }),
+      )
+      .finally(() => {
+        if (this.chatModelRead === runtime) this.chatModelRead = undefined;
+      });
+    this.chatModelRead = runtime;
+    return runtime.promise;
+  }
+
+  /**
+   * Reads the client's model list through its app-server, with no thread and no model turn. Each
+   * process group is saved as it starts and dropped once it exits, so a crash mid-read leaves the
+   * groups for the next read to check. While one is still present no new read starts.
+   */
+  private async runChatModelRead(
+    runtime: NonNullable<Controller['chatModelRead']>,
+  ): Promise<CommandResult> {
+    if (this.closed || runtime.stopped) return { outcome: 'blocked', reason: 'controller-closing' };
+    const profile = this.chatOpenAiProfile();
+    if (!profile)
+      return {
+        outcome: 'blocked',
+        reason: 'provider-unavailable',
+        next: 'Install the OpenAI client and sign in, then refresh models.',
+      };
+    const leftover = (this.chatModelReadRecord()?.groups ?? []).filter(
+      (group) => !groupAbsent(group),
+    );
+    if (leftover.length)
+      return {
+        outcome: 'blocked',
+        reason: 'ownership-unknown',
+        next: `Quit process ${leftover.join(', ')} from the last model read, then refresh models.`,
+      };
+    const record = ChatModelReadSchema.parse({
+      version: 1,
+      attemptedAt: this.now(),
+      groups: [],
+      reason: null,
+    });
+    const save = () =>
+      this.store.transaction(() => this.retainNativeRecord(CHAT_MODEL_READ, record));
+    // One directory serves every read. Reads never overlap, and a fresh one each time would pile up
+    // a log folder per day.
+    const directory = join(this.home, 'native', 'chat-models-openai');
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    save();
+    let handle: ReturnType<typeof startOpenAiModelCatalogObservation> | undefined;
+    let observation: OpenAiModelCatalogObservation | null = null;
+    let failure: Parameters<typeof modelReadFailure>[0] = {
+      reason: 'launch',
+      lastRequest: 'initialize',
+    };
+    try {
+      handle = startOpenAiModelCatalogObservation(
+        profile,
+        { directory, repositoryRoot: this.home },
+        {
+          timeoutMs: 20_000,
+          observedAt: this.now,
+          schedule: this.options.schedule,
+          spawn: this.options.nativeSpawn ?? spawn,
+          lifecycle: {
+            beforePhase: () => {
+              if (this.closed || runtime.stopped) throw Error('The model read was stopped.');
+            },
+            owned: (_phase, group) => {
+              record.groups = [...record.groups, group];
+              save();
+            },
+            quiescent: (_phase, group) => {
+              record.groups = record.groups.filter((value) => value !== group);
+              save();
+            },
+          },
+        },
+      );
+      runtime.stop = handle.stop;
+      if (this.closed || runtime.stopped) handle.stop();
+      const outcome = await handle.result;
+      failure = outcome;
+      if (outcome.quiescent && !outcome.reason) observation = outcome.metadata;
+    } catch {
+      // A launch that throws has no process of its own. Groups it started are checked below.
+    }
+    record.groups = [...new Set([...record.groups, ...(handle?.groups ?? [])])].filter(
+      (group) => !groupAbsent(group),
+    );
+    if (record.groups.length) observation = null;
+    record.reason = record.groups.length
+      ? `Process ${record.groups.join(', ')} from the model read did not exit. Quit it, then refresh models.`
+      : observation
+        ? null
+        : modelReadFailure(failure);
+    if (this.chatModelRead === runtime) this.chatModelRead = undefined;
+    this.store.transaction(() => {
+      this.retainNativeRecord(CHAT_MODEL_READ, ChatModelReadSchema.parse(record));
+      if (observation) this.retainNativeRecord(CHAT_MODEL_CATALOG, observation);
+      this.event('chat.catalog', null, 0, {
+        family: 'openai',
+        models: observation?.models.length ?? 0,
+        reason: record.reason,
+      });
+    });
+    if (record.reason)
+      return { outcome: 'blocked', reason: 'model-read-failed', next: record.reason };
+    return { outcome: 'applied', data: { kind: 'chat-catalog', ...this.chatCatalog() } };
+  }
+
   private chatSelection(selection?: ChatModelSelection): ChatModelSelection | null {
     const families = this.chatCatalog().families;
     if (selection) {
@@ -580,6 +739,8 @@ export class Controller {
     if (command.command === 'RefreshAnthropicUsage' || command.command === 'StopAnthropicUsage')
       return this.anthropicUsage().execute(command);
     if (command.command === 'ObserveUsage') return this.observeUsageCommand(command, principal);
+    // A model read changes no task and no authority. A retry with the same key reads again.
+    if (command.command === 'RefreshChatModels') return this.readChatModels();
     const preparing = this.verificationPreparation;
     if (preparing?.key === command.key)
       return preparing.hash === hashCanonical(command) && preparing.principal === principal
@@ -805,6 +966,11 @@ export class Controller {
       this.acpSetupRuntime.stopped = true;
       this.acpSetupRuntime.handle?.stop();
       native.push(this.acpSetupRuntime.promise);
+    }
+    if (this.chatModelRead) {
+      this.chatModelRead.stopped = true;
+      this.chatModelRead.stop?.();
+      native.push(this.chatModelRead.promise);
     }
     if (this.openAiUsageRead) {
       this.openAiUsageRead.stopped = true;
