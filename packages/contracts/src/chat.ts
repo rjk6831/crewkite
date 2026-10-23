@@ -207,7 +207,7 @@ export const ChatThreadSchema = z.strictObject({
 });
 export type ChatThread = z.infer<typeof ChatThreadSchema>;
 
-// Command payloads. Lane A wires these into CommandSchema in index.ts.
+// Command payloads, listed in CommandSchema.
 export const SendChatMessagePayloadSchema = z.strictObject({
   taskId: id('tsk'),
   text: z.string().min(1).max(65_536),
@@ -280,6 +280,11 @@ export const ChatThreadReadSchema = z.strictObject({
   messages: z.array(ChatMessageSchema).max(1000),
   /** Events of turns that have not finished, oldest first, so a reopened view can rebuild them. */
   liveEvents: z.array(AgentEventSchema).max(5000),
+  /** The event log cursor this read reflects. A view drops stream events at or below it. */
+  cursor: z
+    .string()
+    .regex(/^(0|[1-9][0-9]{0,19})$/)
+    .optional(),
 });
 export type ChatThreadRead = z.infer<typeof ChatThreadReadSchema>;
 
@@ -336,3 +341,45 @@ export const ReadChatThreadPayloadSchema = z.strictObject({
 });
 export const ReadChatChangesPayloadSchema = z.strictObject({ taskId: id('tsk') });
 export const ReadChatCatalogPayloadSchema = z.strictObject({ taskId: id('tsk').optional() });
+
+export type ChatCatalogEntry = z.infer<typeof ChatCatalogEntrySchema>;
+
+/** The tightest window a family reports: lowest known percent, with its reset time. */
+export function tightestAllowance(entry: Pick<ChatCatalogEntry, 'remaining'>): {
+  percent: number | null;
+  resetsAt: string | null;
+} {
+  let tightest: { percent: number; resetsAt: string | null } | null = null;
+  for (const window of entry.remaining) {
+    if (window.percent === null) continue;
+    if (!tightest || window.percent < tightest.percent)
+      tightest = { percent: window.percent, resetsAt: window.resetsAt };
+  }
+  return tightest ?? { percent: null, resetsAt: entry.remaining[0]?.resetsAt ?? null };
+}
+
+/**
+ * Families in the order a person would pick them: connected first, then most allowance left,
+ * then soonest reset. A family with no known percent ranks after every known one. A family at
+ * zero never ranks, since a turn there ends on the limit it already hit.
+ */
+export function rankFamilies(
+  families: readonly ChatCatalogEntry[],
+  exclude: readonly ChatCatalogEntry['family'][] = [],
+): ChatCatalogEntry[] {
+  const score = (entry: ChatCatalogEntry) => tightestAllowance(entry);
+  return families
+    .filter((entry) => entry.connected && !exclude.includes(entry.family))
+    .filter((entry) => score(entry).percent !== 0)
+    .sort((left, right) => {
+      const a = score(left);
+      const b = score(right);
+      if (a.percent === null && b.percent !== null) return 1;
+      if (b.percent === null && a.percent !== null) return -1;
+      if (a.percent !== null && b.percent !== null && a.percent !== b.percent)
+        return b.percent - a.percent;
+      const resetA = a.resetsAt ? Date.parse(a.resetsAt) : Number.POSITIVE_INFINITY;
+      const resetB = b.resetsAt ? Date.parse(b.resetsAt) : Number.POSITIVE_INFINITY;
+      return resetA - resetB;
+    });
+}
