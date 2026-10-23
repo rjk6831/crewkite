@@ -548,6 +548,17 @@ test('a usage limit writes a system line, and auto handoff runs the same message
   assert.equal(kept.turns.length, 1);
   assert.equal(kept.thread.selection?.family, 'openai');
   assert.equal(kept.thread.activeTurnId, null);
+
+  // A family picked in the composer starts cold, so it gets the packet too.
+  const picked = { family: 'google', model: 'google-model', effort: 'default' } as const;
+  off.store.transaction(() => off.service.configure({ taskId: off.taskId, selection: picked }));
+  const switched = turnReaches(off, 'done');
+  off.send('Go on.', null);
+  await switched;
+  assert.match(
+    off.adapters.get('google')?.requests[0]?.prompt ?? '',
+    /^This thread moved from OpenAI to Google\. Reason: switched in the composer\.$/m,
+  );
 });
 
 // Every connected family stops on its limit. At zero the catalog offers nothing. At 50 percent it

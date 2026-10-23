@@ -905,9 +905,12 @@ export class ChatService {
     // still waiting for the next answer.
     const own = role === 'assistant';
     const pending = own ? this.pendingHandoff(task.id) : null;
+    let handoffFrom: ChatFamily | null = null;
     // Sending on the provider the thread came from cancels the switch.
-    const handoffFrom = pending && pending.from !== selection.family ? pending.from : null;
-    if (pending && !handoffFrom) this.setHandoff(task.id, null);
+    if (pending && pending.from === selection.family) this.setHandoff(task.id, null);
+    else if (pending) handoffFrom = pending.from;
+    // A family picked in the composer starts cold too, so the switch is a manual handoff.
+    else if (own) handoffFrom = this.switchedFrom(task.id, selection.family);
     const turn = ChatTurnSchema.parse({
       id: this.deps.id('trn'),
       taskId: task.id,
@@ -930,6 +933,17 @@ export class ChatService {
       activeTurnId: turn.id,
     });
     effects.push(() => this.launch(turn));
+  }
+
+  /** The family of the last assistant turn, when it differs from the one about to answer. */
+  private switchedFrom(taskId: string, family: ChatFamily): ChatFamily | null {
+    const row = this.deps.store.db
+      .prepare(
+        "SELECT body FROM chat_turns WHERE task_id=? AND json_extract(body,'$.role')='assistant' ORDER BY sequence DESC LIMIT 1",
+      )
+      .get(taskId);
+    const last = row ? ChatTurnSchema.parse(JSON.parse(row.body as string)) : undefined;
+    return last && last.selection.family !== family ? last.selection.family : null;
   }
 
   /**
