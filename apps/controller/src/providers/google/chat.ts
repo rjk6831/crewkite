@@ -436,11 +436,15 @@ export function googleChatAdapter(deps: {
             kind: 'model-unavailable',
             message: `The Google client does not offer the model ${clip(request.selection.model, 100)}.`,
           });
-        else if (!launch.reviewMode && request.permissionPolicy !== 'allow-all')
+        // Every policy keeps edits inside the scratch copy, and only the asking mode lets
+        // CrewKite see an edit before it lands. Without it the client would edit on its own
+        // under allow-all too, so no policy starts a turn.
+        else if (!launch.reviewMode)
           early = chatFailure({
             stage: 'launch',
             kind: 'client-missing',
             message: 'The Google client has no verified mode for asking before it edits.',
+            nextAction: 'Run Connect Google again so discovery can verify the mode.',
           });
       } catch (error) {
         early = chatFailure({
