@@ -14,7 +14,9 @@ The transport is the OpenAI client's app-server over stdio. CrewKite starts the 
 
 Agent message and reasoning deltas, command and file-change items with their output, and `thread/tokenUsage/updated` map to events. Command and file-change approval requests become permission requests in the thread. Stop sends `turn/interrupt`, then SIGTERM, then SIGKILL. A usage-limit refusal ends the turn with its reset time.
 
-Set up first: install the OpenAI client and sign in with a ChatGPT plan. The adapter reads the account at the start of each turn and refuses an API-key sign-in, because that would bill per token. When the plan reports no included usage left, the turn ends before any prompt with a usage-limit failure and the reset time. The composer lists the models the controller last observed from the client.
+Set up first: install the OpenAI client and sign in with a ChatGPT plan. The adapter reads the account at the start of each turn and refuses an API-key sign-in, because that would bill per token. When the plan reports no included usage left, the turn ends before any prompt with a usage-limit failure and the reset time.
+
+The composer lists the models the controller last observed from the client. It learns them from a separate app-server session that runs `model/list` and opens no thread. A catalog read starts one in the background when no list from the current client exists or the newest is a day old. After a failure the next background read waits a minute. The default is the profile's model when the client lists it, otherwise the first model listed.
 
 Live qualification pending.
 

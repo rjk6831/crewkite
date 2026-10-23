@@ -78,6 +78,7 @@ import { openAiChatAdapter } from '../providers/openai/chat.ts';
 import {
   modelReadFailure,
   type OpenAiModelCatalogObservation,
+  OpenAiModelCatalogObservationSchema,
   startOpenAiModelCatalogObservation,
 } from '../providers/openai/model-catalog.ts';
 import type { startNativeSession } from '../providers/openai/native-discovery.ts';
@@ -382,7 +383,7 @@ export class Controller {
     const profiles = this.resolveProfiles();
     return buildChatCatalog({
       profiles: profiles.map((profile) => profile.facts),
-      openAiModels: this.latestOpenAiModels(profiles),
+      openAiModels: this.latestOpenAiModels(profiles)?.models ?? null,
       local: this.localSetup(),
       windows: this.store.list<Observation>('window').map((observation) => ({
         family: this.store.get<Route>('route', observation.routeId)?.family,
@@ -392,19 +393,24 @@ export class Controller {
     });
   }
 
-  /** The newest OpenAI model list observed with the same client and profile as now. */
+  /**
+   * The newest OpenAI model list observed with the same client and profile as now. The chat read
+   * keeps its own record, read first. Lists the removed task and planning flows kept still count.
+   */
   private latestOpenAiModels(profiles: NativeProfileResolution[]) {
-    let latest: ModelCatalogObservation | undefined;
+    let latest: ModelCatalogObservation | OpenAiModelCatalogObservation | undefined;
     const keys = this.store.db
       .prepare(
-        "SELECT command_key FROM receipts WHERE command_key LIKE 'task-model-catalog:%' OR command_key LIKE 'conversation-model-catalog:%'",
+        "SELECT command_key FROM receipts WHERE command_key=? OR command_key LIKE 'task-model-catalog:%' OR command_key LIKE 'conversation-model-catalog:%' ORDER BY command_key=? DESC",
       )
-      .all();
+      .all(CHAT_MODEL_CATALOG, CHAT_MODEL_CATALOG);
     for (const { command_key: key } of keys) {
       try {
-        const catalog = ModelCatalogObservationSchema.parse(
-          this.nativeRecord(key as string, 32768).value,
-        );
+        const value = this.nativeRecord(key as string, 32768).value;
+        const catalog =
+          key === CHAT_MODEL_CATALOG
+            ? OpenAiModelCatalogObservationSchema.parse(value)
+            : ModelCatalogObservationSchema.parse(value);
         const profile = profiles.find((value) => value.facts.id === catalog.profileId);
         if (
           !profile?.facts.available ||
@@ -419,7 +425,27 @@ export class Controller {
         // A damaged or partial observation is not a model list.
       }
     }
-    return latest?.models ?? null;
+    return latest;
+  }
+
+  /**
+   * Starts a model read when the picker has nothing current: no list from the client a turn
+   * would use, or one older than a day. After a failed read the next one waits a minute.
+   */
+  private refreshStaleChatModels() {
+    try {
+      if (this.closed || this.chatModelRead) return;
+      const profiles = this.resolveProfiles();
+      if (!this.chatOpenAiProfile(profiles)) return;
+      const now = Date.parse(this.now());
+      const observed = this.latestOpenAiModels(profiles);
+      if (observed && now - Date.parse(observed.observedAt) < 86_400_000) return;
+      const last = this.chatModelReadRecord();
+      if (last?.reason && now - Date.parse(last.attemptedAt) < 60_000) return;
+      void this.readChatModels();
+    } catch {
+      // A damaged read record leaves the catalog as it is. Refresh models reports the failure.
+    }
   }
 
   /** The OpenAI profile a chat turn launches with, in the adapter's order of preference. */
@@ -1265,6 +1291,7 @@ export class Controller {
               : { kind: 'chat-changes', ...this.chat().readChanges(command.payload) },
         };
       case 'ReadChatCatalog':
+        this.refreshStaleChatModels();
         return {
           outcome: 'applied',
           data: { kind: 'chat-catalog', ...this.chat().readCatalog(command.payload) },

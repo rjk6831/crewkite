@@ -39,7 +39,16 @@ function openai(input: ChatCatalogInput): Entry {
   const models = (input.openAiModels ?? []).map((value) =>
     chatModel(value.model, value.efforts, value.defaultEffort),
   );
-  return entry(input, 'openai', !!ready, profiles[0]?.reason, models, ready?.model);
+  // The profile pins a model the client may no longer list. Default to one it does list.
+  const listed = !models.length || models.some((value) => value.model === ready?.model);
+  return entry(
+    input,
+    'openai',
+    !!ready,
+    profiles[0]?.reason,
+    models,
+    listed ? ready?.model : models[0].model,
+  );
 }
 
 function anthropic(input: ChatCatalogInput): Entry {

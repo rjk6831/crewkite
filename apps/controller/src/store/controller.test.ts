@@ -8626,6 +8626,62 @@ test('google quota authority survives retries and restart while sharing one oper
   assert.equal(metadataLaunches, finalLaunches, 'releasing a read never replays it');
 });
 
+test('a catalog read with no stored model list starts one model read and the picker lists the models it returns', async (t) => {
+  const profile = {
+    ...unavailableNativeProfile(),
+    facts: {
+      ...unavailableNativeProfile().facts,
+      available: true,
+      reason: 'available',
+      model: fixtureModel,
+      clientVersion: process.version,
+    },
+    client: { executable: process.execPath, version: process.version, sha256: fixtureClientHash },
+    environment: { ...process.env },
+    locationHash: '1'.repeat(64),
+  } satisfies NativeProfileResolution;
+  const phases: string[] = [];
+  const { controller, command } = await setup(t, {
+    nativeProfiles: () => [profile],
+    nativeSpawn: (executable, args, options) => {
+      const phase = args.at(-1) === 'list' ? 'features' : 'app-server';
+      phases.push(phase);
+      return spawn(executable, ['-e', fixture, 'success', phase], options);
+    },
+  });
+  const openAi = async () => {
+    const { data } = await controller.execute(command('ReadChatCatalog', {}), 'local-owner');
+    assert(data?.kind === 'chat-catalog');
+    return data.families.find((entry) => entry.family === 'openai');
+  };
+  const ended = new Promise<unknown>((resolve) => {
+    const stop = controller.subscribe((event) => {
+      if (event.type !== 'chat.catalog') return;
+      stop();
+      resolve(event.payload);
+    });
+  });
+  assert.deepEqual((await openAi())?.models, []);
+  assert.deepEqual((await openAi())?.models, [], 'a read while one runs starts no other');
+  assert.deepEqual(await ended, { family: 'openai', models: 1, reason: null });
+  const stored = controller.nativeRecord('chat-model-catalog:openai', 32768).value as {
+    profileId: string;
+    models: unknown[];
+  };
+  assert.equal(stored.profileId, profile.facts.id);
+  assert.deepEqual(stored.models, [
+    { model: fixtureModel, efforts: ['low'], defaultEffort: 'low' },
+  ]);
+  const listed = await openAi();
+  assert.deepEqual(
+    listed?.models.map((entry) => entry.model),
+    [fixtureModel],
+  );
+  assert.equal(listed?.defaultModel, fixtureModel);
+  // One read is the feature check and one app-server. A fresh list starts nothing more.
+  assert.deepEqual(phases, ['features', 'app-server']);
+});
+
 test('an acp scratch permission binds one live action and crash recovery cannot invent completion', async (t) => {
   for (const row of [
     'approved',
