@@ -83,6 +83,35 @@ const notification = z.object({ method: z.string().min(1).max(200), id: z.never(
 // A task's metadata phase runs through this reader, and remote control reaching the client
 // refuses a task. Only the status decides; the notice's other fields pass.
 const remoteControl = z.object({ params: z.object({ status: z.literal('disabled') }) });
+// A notice carries authority when it ends or moves the thread, opens a realtime session, reroutes
+// the model, starts a hook or MCP server, changes the account or remote control, or touches
+// approvals. A task's transcript refuses every one of them. Discovery runs as a task's metadata
+// phase, so it refuses them too, except the account update and remote control status that arrive
+// at startup. Any other notice passes.
+const authorityNotices: ReadonlySet<string> = new Set([
+  'thread/archived',
+  'thread/unarchived',
+  'thread/deleted',
+  'thread/closed',
+  'thread/reverted',
+  'thread/environment/connected',
+  'thread/environment/disconnected',
+  'remoteControl/status/changed',
+  'model/rerouted',
+  'hook/started',
+  'hook/completed',
+  'account/updated',
+  'account/login/completed',
+  'account/gatewayOAuth/changed',
+  'item/autoApprovalReview/started',
+  'item/autoApprovalReview/completed',
+  'autoApprovalReview/strictReviewRequired',
+  'guardianWarning',
+]);
+export const authorityNotice = (method: string) =>
+  authorityNotices.has(method) ||
+  method.startsWith('thread/realtime/') ||
+  method.startsWith('mcpServer/');
 export type DiscoveryEnvelope =
   | 'response'
   | 'error'
@@ -546,6 +575,7 @@ export type DiscoveryRequest =
 type Failure =
   | 'invalid-message'
   | 'unexpected-message'
+  | 'authority-notice'
   | 'upstream-error'
   | 'limit'
   | 'deadline'
@@ -678,6 +708,8 @@ export class OpenAiDiscovery {
         if (decoded !== null && typeof decoded === 'object' && 'method' in decoded) {
           const value = notification.parse(decoded);
           if (value.method === 'remoteControl/status/changed') remoteControl.parse(decoded);
+          else if (value.method !== 'account/updated' && authorityNotice(value.method))
+            this.fail('authority-notice');
           if (this.step === 0) this.fail('unexpected-message');
           this.envelope =
             value.method === 'configWarning'

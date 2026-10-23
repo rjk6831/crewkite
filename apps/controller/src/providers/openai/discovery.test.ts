@@ -172,6 +172,13 @@ test('provider discovery emits only correlated metadata and excludes private fie
       reason: 'invalid-message',
     },
     {
+      // A task's metadata phase runs through discovery, so a notice the task transcript refuses
+      // stops it here too.
+      name: 'a notice that carries authority stops metadata',
+      notices: [{ method: 'hook/started', params: { threadId: privateText } }],
+      reason: 'authority-notice',
+    },
+    {
       name: 'known notification cannot precede initialize response',
       wire: () =>
         line({ method: 'configWarning', params: { summary: privateText, details: null } }),

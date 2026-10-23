@@ -12,7 +12,12 @@ import {
 } from '@crewkite/contracts';
 import { verifyHandoff } from '@crewkite/contracts/hash';
 import { z } from 'zod';
-import { type DiscoveryMetadata, OpenAiDiscovery, type OpenAiUsageHook } from './discovery.ts';
+import {
+  authorityNotice,
+  type DiscoveryMetadata,
+  OpenAiDiscovery,
+  type OpenAiUsageHook,
+} from './discovery.ts';
 import { type NativeLaunch, type NativeTranscript, startNativeTask } from './native-discovery.ts';
 
 const MAX_CONTENT = 65_536;
@@ -174,33 +179,6 @@ const fields = [
   'path',
   'baseHash',
 ] as const;
-// A transcript ignores a notice it does not consume, unless the notice ends or moves the thread,
-// opens a realtime session, reroutes the model, starts a hook or MCP server, changes the account or
-// remote control, or touches approvals.
-const authorityNotices: ReadonlySet<string> = new Set([
-  'thread/archived',
-  'thread/unarchived',
-  'thread/deleted',
-  'thread/closed',
-  'thread/reverted',
-  'thread/environment/connected',
-  'thread/environment/disconnected',
-  'remoteControl/status/changed',
-  'model/rerouted',
-  'hook/started',
-  'hook/completed',
-  'account/updated',
-  'account/login/completed',
-  'account/gatewayOAuth/changed',
-  'item/autoApprovalReview/started',
-  'item/autoApprovalReview/completed',
-  'autoApprovalReview/strictReviewRequired',
-  'guardianWarning',
-]);
-export const authorityNotice = (method: string) =>
-  authorityNotices.has(method) ||
-  method.startsWith('thread/realtime/') ||
-  method.startsWith('mcpServer/');
 
 /** Ignored notices are counted by method hash so a completion record shows what arrived. */
 export class NoticeCensus {
