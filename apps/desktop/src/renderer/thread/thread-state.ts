@@ -387,9 +387,16 @@ export function latestContext(items: readonly ThreadItem[]): TurnView['context']
   return null;
 }
 
-// The family that answered last. A reviewer or advisor borrows a model for one turn and leaves the
-// thread where it was, so the handoff target and the second look skip those turns.
-export function lastFamily(items: readonly ThreadItem[]): ChatFamily | null {
+// The family that answered last, counted the way the controller counts it: the assistant turn with
+// the highest sequence, whatever its state. A turn that hit its limit before any text has no row,
+// and it still moved the thread. A reviewer or advisor borrows a model for one turn and leaves the
+// thread where it was, so the handoff target and the second look skip those turns. Before any turn
+// record arrives, the rows decide.
+export function lastFamily(state: ThreadState, items: readonly ThreadItem[]): ChatFamily | null {
+  let last: ChatTurn | null = null;
+  for (const turn of Object.values(state.turnMeta))
+    if (turn.role === 'assistant' && (!last || turn.sequence > last.sequence)) last = turn;
+  if (last) return last.selection.family;
   for (const item of items.toReversed())
     if (item.kind === 'turn' && item.turn.identity?.role === 'assistant')
       return item.turn.identity.family;

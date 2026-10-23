@@ -9,7 +9,9 @@ import type {
   AgentEvent,
   ChatCatalogRead,
   ChatFailure,
+  ChatFamily,
   ChatMessage,
+  ChatRole,
   ChatThread,
   ChatThreadRead,
   ChatTurn,
@@ -398,25 +400,82 @@ test('the limit offer shows only while the newest turn is the one that hit a lim
   // A stored stop reason decides before the failure kind. Turns without one keep the fallback above.
   assert.equal(reopened([stored(1, 'failed', 'client-exit', 'limit')])?.family, 'anthropic');
   assert.equal(reopened([stored(1, 'failed', 'usage-limit', 'error')]), null);
+});
 
-  // A second opinion borrows another family for one turn. The picker still moves the thread away
-  // from the family that answered, so it never offers that family as the place to continue.
-  const advisor = id('trn', 3);
-  const advised = run([
-    begin(turn, 11),
-    agent(12, { type: 'text.completed', itemId: 'a', text: 'Done.' }),
-    end(turn, 13, 'done'),
-    on(advisor, 14, {
-      type: 'turn.started',
-      family: 'local',
-      model: 'local-1',
-      effort: 'default',
-      role: 'advisor',
-    }),
-    on(advisor, 15, { type: 'text.completed', itemId: 'a', text: 'Looks right.' }),
-    end(advisor, 16, 'done'),
-  ]);
-  assert.equal(lastFamily(advised), 'openai');
+test('the thread moves away from the family of its newest assistant turn, even one with no text', () => {
+  const second = id('trn', 2);
+  const limit: ChatFailure = {
+    stage: 'stream',
+    kind: 'usage-limit',
+    message: 'The weekly limit is reached.',
+    providerMessage: null,
+    method: null,
+    code: null,
+    resetsAt: null,
+    nextAction: 'Continue on another provider.',
+  };
+  const opened = (turnId: string, cursor: number, family: ChatFamily, role: ChatRole) =>
+    on(turnId, cursor, { type: 'turn.started', family, model: 'large-1', effort: 'default', role });
+  const done = (turnId: string, cursor: number) =>
+    on(turnId, cursor, { type: 'turn.completed', stopReason: 'done', failure: null });
+  const record = (
+    turnId: string,
+    sequence: number,
+    family: ChatFamily,
+    state: ChatTurn['state'],
+  ): ThreadEvent => ({
+    type: 'chat.turn',
+    cursor: String(30 + sequence),
+    taskId: task,
+    payload: {
+      id: turnId,
+      taskId: task,
+      sequence,
+      role: 'assistant',
+      selection: { family, model: 'large-1', effort: 'default' },
+      userMessageId: id('msg', 10),
+      assistantMessageId: null,
+      state,
+      startedAt: stamp,
+      endedAt: stamp,
+      failure: state === 'failed' ? limit : null,
+      handoffFrom: null,
+    } satisfies ChatTurn,
+  });
+  const family = (events: ThreadEvent[]) => {
+    const state = reduceThread(initialThreadState(task), { type: 'events', events });
+    return lastFamily(state, threadItems(state));
+  };
+
+  // Anthropic answered, then OpenAI hit its limit before any text. That turn has no row, and the
+  // controller still counts it as the family the thread is on.
+  assert.equal(
+    family([
+      user(10, 'Add the guard'),
+      record(turn, 0, 'anthropic', 'done'),
+      opened(turn, 11, 'anthropic', 'assistant'),
+      agent(12, { type: 'text.completed', itemId: 'a', text: 'Done.' }),
+      done(turn, 13),
+      record(second, 1, 'openai', 'failed'),
+      opened(second, 14, 'openai', 'assistant'),
+      on(second, 15, { type: 'turn.completed', stopReason: 'limit', failure: limit }),
+    ]),
+    'openai',
+  );
+
+  // Before any record arrives the rows decide. A second opinion borrows another family for one
+  // turn, so it is never the family the thread moves away from.
+  assert.equal(
+    family([
+      opened(turn, 11, 'openai', 'assistant'),
+      agent(12, { type: 'text.completed', itemId: 'a', text: 'Done.' }),
+      done(turn, 13),
+      opened(second, 14, 'local', 'advisor'),
+      on(second, 15, { type: 'text.completed', itemId: 'a', text: 'Looks right.' }),
+      done(second, 16),
+    ]),
+    'openai',
+  );
 });
 
 test('a reply restored from a thread read keeps the role of its turn for the badge', () => {

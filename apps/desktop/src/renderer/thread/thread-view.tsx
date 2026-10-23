@@ -194,7 +194,7 @@ export function ThreadView({
           thread={thread}
           running={activeTurn !== null}
           context={latestContext(items)}
-          currentFamily={lastFamily(items)}
+          currentFamily={lastFamily(state, items)}
           blocked={connection === 'connected' ? null : 'Reconnect to the controller to send.'}
           notice={notice}
           onSend={send}
