@@ -26,7 +26,7 @@ export function SettingsPage({
   theme: string;
   onTheme: (theme: 'dark' | 'light') => void;
 }) {
-  const { catalog, error } = useCatalog(workspace.source, header);
+  const { catalog, error, modelRead } = useCatalog(workspace.source, header);
   const actions = useProviderActions(workspace);
   // A preview shows its fixtures at the time they were observed. A live page ticks each second so
   // the quota cooldown counts down.
@@ -58,7 +58,7 @@ export function SettingsPage({
           </p>
         )}
         <GeneralCard catalog={catalog} theme={theme} onTheme={onTheme} />
-        <OpenAiCard {...card} entry={entry('openai')} />
+        <OpenAiCard {...card} entry={entry('openai')} modelRead={modelRead} />
         <AnthropicCard {...card} entry={entry('anthropic')} />
         <GoogleCard {...card} entry={entry('google')} />
         <LocalCard {...card} entry={entry('local')} />

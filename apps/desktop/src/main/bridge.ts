@@ -241,6 +241,7 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
         'ReadChatThread',
         'ReadChatChanges',
         'ReadChatCatalog',
+        'RefreshChatModels',
         'GetProjectOperation',
         'PrepareProjectCommand',
         'StartProjectCommand',

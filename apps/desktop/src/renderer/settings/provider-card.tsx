@@ -27,7 +27,7 @@ const reasonText = (reason: string) => {
 
 const modelLimit = 12;
 
-function Models({ entry }: { entry: CatalogEntry | undefined }) {
+function Models({ entry, children }: { entry: CatalogEntry | undefined; children?: ReactNode }) {
   const models = entry?.models ?? [];
   return (
     <section className="st-block" aria-label="Models">
@@ -60,6 +60,7 @@ function Models({ entry }: { entry: CatalogEntry | undefined }) {
               : 'Models appear after this provider connects.'}
         </p>
       )}
+      {children}
     </section>
   );
 }
@@ -95,6 +96,7 @@ export function ProviderCard({
   detail,
   main,
   side,
+  models,
 }: {
   family: ChatFamily;
   entry: CatalogEntry | undefined;
@@ -102,6 +104,8 @@ export function ProviderCard({
   detail?: string;
   main: ReactNode;
   side: ReactNode;
+  /** Shown under the model list, such as a way to read it again. */
+  models?: ReactNode;
 }) {
   const titleId = useId();
   return (
@@ -119,7 +123,7 @@ export function ProviderCard({
       <div className="st-body">
         <div className="st-col">{main}</div>
         <div className="st-col">
-          <Models entry={entry} />
+          <Models entry={entry}>{models}</Models>
           {side}
         </div>
       </div>

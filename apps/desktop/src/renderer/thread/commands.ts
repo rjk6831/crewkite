@@ -12,6 +12,7 @@ import {
   ReadChatCatalogPayloadSchema,
   ReadChatChangesPayloadSchema,
   ReadChatThreadPayloadSchema,
+  RefreshChatModelsPayloadSchema,
   ResolveChatPermissionPayloadSchema,
   SendChatMessagePayloadSchema,
   StopChatTurnPayloadSchema,
@@ -81,6 +82,10 @@ export const readCatalog = (source: ThreadSource, taskId?: string): Promise<Chat
     ReadChatCatalogPayloadSchema.parse({ taskId }),
     ChatCatalogReadSchema,
   );
+
+// A read can take 20 seconds and its refusal names the next step, so the result comes back as is.
+export const refreshModels = (source: ThreadSource) =>
+  dispatch(source, 'RefreshChatModels', RefreshChatModelsPayloadSchema.parse({ family: 'openai' }));
 
 export const sendMessage = (
   source: ThreadSource,

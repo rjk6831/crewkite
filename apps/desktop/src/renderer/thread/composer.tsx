@@ -93,6 +93,14 @@ export function Composer({
       );
   }, [source, taskId]);
   useEffect(loadCatalog, [loadCatalog]);
+  // A model read that ends sends chat.catalog, so the picker shows what it found.
+  useEffect(
+    () =>
+      source.subscribe((event) => {
+        if (event.type === 'chat.catalog') loadCatalog();
+      }),
+    [source, loadCatalog],
+  );
   useEffect(() => {
     if (thread?.selection) setSelection(thread.selection);
   }, [thread?.selection]);
