@@ -45,9 +45,11 @@ import {
 } from './adapter.ts';
 import { scratchChanges } from './changes.ts';
 import {
+  adviceContext,
   familyName,
   handoffPacket,
   handoffReason,
+  reviewContext,
   systemContext,
   withAttachments,
 } from './prompt.ts';
@@ -175,7 +177,10 @@ export class ChatService {
     });
     if (!message) return blocked('message-too-large', 'Shorten the message or attach fewer paths.');
     this.saveEntry(task, message);
-    const pending = this.pendingHandoff(task.id);
+    // A reviewer or advisor borrows another model. The thread keeps its own choice and any switch
+    // still waiting for the next answer.
+    const own = payload.role === 'assistant';
+    const pending = own ? this.pendingHandoff(task.id) : null;
     // Sending on the provider the thread came from cancels the switch.
     const handoffFrom = pending && pending.from !== selection.family ? pending.from : null;
     if (pending && !handoffFrom) this.setHandoff(task.id, null);
@@ -194,7 +199,12 @@ export class ChatService {
       handoffFrom,
     });
     this.putTurn(task, turn);
-    this.putThread(task, { ...thread, base, selection, activeTurnId: turn.id });
+    this.putThread(task, {
+      ...thread,
+      base,
+      selection: own ? selection : thread.selection,
+      activeTurnId: turn.id,
+    });
     effects.push(() => this.launch(turn));
     return { outcome: 'applied', revision: task.revision };
   }
@@ -432,13 +442,18 @@ export class ChatService {
             prompt,
           })
         : prompt,
-      systemContext: systemContext(project.name, directory),
+      systemContext: this.context(turn.role, project.name, directory, root, thread.base, history),
       // The packet carries the transcript, so a handoff turn sends no separate history.
       history: turn.handoffFrom ? [] : history,
-      session: thread.sessions.find((session) => session.family === turn.selection.family) ?? null,
+      // A review or an opinion starts a fresh native session, so its brief always reaches the model.
+      session:
+        turn.role === 'assistant'
+          ? (thread.sessions.find((session) => session.family === turn.selection.family) ?? null)
+          : null,
       scratch: { directory, base: thread.base, projectName: project.name },
       work: { directory: work, home: this.deps.home },
-      permissionPolicy: thread.permissionPolicy,
+      permissionPolicy: turn.role === 'assistant' ? thread.permissionPolicy : 'ask',
+      readOnly: turn.role !== 'assistant',
       deadlineMs: TURN_DEADLINE_MS,
       environment: this.deps.resolveEnvironment(turn.selection.family),
       now: () => Date.parse(this.deps.now()),
@@ -546,7 +561,10 @@ export class ChatService {
       assistantMessageId: reply?.id ?? null,
     });
     const thread = this.thread(task.id);
-    const session = end.session?.family === turn.selection.family ? end.session : null;
+    const session =
+      turn.role === 'assistant' && end.session?.family === turn.selection.family
+        ? end.session
+        : null;
     this.putThread(task, {
       ...thread,
       activeTurnId: thread.activeTurnId === turn.id ? null : thread.activeTurnId,
@@ -662,6 +680,31 @@ export class ChatService {
     } catch {
       return null;
     }
+  }
+
+  /** Reviewer and advisor turns get their own brief. Every other turn gets the project framing. */
+  private context(
+    role: ChatTurn['role'],
+    name: string,
+    directory: string,
+    root: string,
+    base: string,
+    history: readonly ChatHistoryEntry[],
+  ): string {
+    if (role === 'advisor')
+      return adviceContext(
+        name,
+        directory,
+        history.findLast((entry) => entry.role === 'assistant')?.text ?? null,
+      );
+    if (role !== 'reviewer') return systemContext(name, directory);
+    let files: ChatChangesRead['files'] | null = null;
+    try {
+      files = scratchChanges(root, directory, base);
+    } catch {
+      // The brief says the changes could not be read, and the model works from the files.
+    }
+    return reviewContext(name, directory, base, files);
   }
 
   private changedFiles(taskId: string, root: string, base: string): string[] | null {

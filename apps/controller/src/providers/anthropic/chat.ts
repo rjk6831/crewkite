@@ -261,6 +261,8 @@ function chatArguments(request: ChatTurnRequest, resume: string | null) {
     '{"disableAllHooks":true}',
     '--permission-mode',
     request.permissionPolicy === 'ask' ? 'default' : 'acceptEdits',
+    // Review and advice turns read only.
+    ...(request.readOnly ? ['--allowedTools', 'Read,Grep,Glob'] : []),
     '--model',
     model,
     // The client documents low, medium, high, xhigh and max. It has no minimal level.
@@ -696,8 +698,10 @@ function startTurn(
             ? `Allow ${toolName} on ${target}?`
             : `Allow ${toolName}?`;
     const entry = { toolName, input, callId };
-    const automatic =
-      request.permissionPolicy === 'allow-all'
+    // Review and advice turns read only. Those three tools never ask, so any ask is declined.
+    const automatic = request.readOnly
+      ? 'deny'
+      : request.permissionPolicy === 'allow-all'
         ? 'allow-once'
         : allowed.has(toolName)
           ? 'allow-thread'

@@ -56,7 +56,7 @@ export function openAiChatAdapter(deps: OpenAiChatDeps): ChatAdapter {
 }
 
 /** Chat edits the scratch copy, and every escalation comes back to CrewKite for an answer. */
-function nativeChatArguments(directory: string): string[] {
+function nativeChatArguments(directory: string, readOnly = false): string[] {
   const settings = {
     model_provider: 'openai',
     openai_base_url: '',
@@ -64,7 +64,8 @@ function nativeChatArguments(directory: string): string[] {
     service_tier: 'default',
     approval_policy: 'on-request',
     approvals_reviewer: 'user',
-    sandbox_mode: 'workspace-write',
+    // Review and advice turns read only.
+    sandbox_mode: readOnly ? 'read-only' : 'workspace-write',
     web_search: 'disabled',
     'features.plugins': false,
     'features.remote_plugin': false,
@@ -341,7 +342,8 @@ class OpenAiChatTurn {
       const directory = privateStorage(launch);
       const env = nativeDiscoveryEnvironment(launch.environment);
       step = 'spawn';
-      const child = (deps.spawn ?? spawn)(executable, nativeChatArguments(directory), {
+      const args = nativeChatArguments(directory, this.request.readOnly);
+      const child = (deps.spawn ?? spawn)(executable, args, {
         cwd: this.request.scratch.directory,
         env,
         detached: true,
@@ -458,7 +460,8 @@ class OpenAiChatTurn {
       cwd: scratch.directory,
       approvalPolicy: 'on-request',
       approvalsReviewer: 'user',
-      sandbox: 'workspace-write',
+      // Review and advice turns read only.
+      sandbox: this.request.readOnly ? 'read-only' : 'workspace-write',
       serviceTier: 'default',
       ...(selection.effort === 'default'
         ? {}
@@ -607,6 +610,8 @@ class OpenAiChatTurn {
       options: OPTIONS,
     });
     const policy = this.request.permissionPolicy;
+    // Review and advice turns read only.
+    if (this.request.readOnly) return this.answer(answerId, 'deny');
     if (policy === 'allow-all' || (policy === 'allow-edits' && kind === 'edit'))
       this.answer(answerId, 'allow-once');
   }

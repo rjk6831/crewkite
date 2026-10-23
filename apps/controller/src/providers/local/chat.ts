@@ -47,6 +47,7 @@ export type LocalConnect = (
 ) => Promise<{ model: LoadedModelLike; contextLength: number; modelKey: string }>;
 
 const MAX_TOOL_CALLS = 12;
+const CHANGING_TOOLS = new Set<string>(['edit', 'write', 'run']);
 const OUTPUT_SHARE = 0.25;
 const MAP_SHARE = 0.18;
 const SUMMARY_SHARE = 0.6;
@@ -430,7 +431,10 @@ function startLocalTurn(
   };
 
   const prepared = new Map<number, PreparedTool>();
-  const tools = LOCAL_TOOLS.map(
+  const tools = LOCAL_TOOLS.filter(
+    // Review and advice turns read only.
+    ({ function: definition }) => !request.readOnly || !CHANGING_TOOLS.has(definition.name),
+  ).map(
     ({ function: definition }): Tool => ({
       type: 'rawFunction',
       name: definition.name,

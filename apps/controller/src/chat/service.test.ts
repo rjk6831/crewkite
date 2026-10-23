@@ -4,7 +4,7 @@
 //   and turn.completed { stopReason, failure } before the result settles.
 // On stop it reports only completed items, like a native client that drops the open item.
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { type TestContext, test } from 'node:test';
@@ -27,7 +27,7 @@ import { ArtifactFiles } from '../artifacts/index.ts';
 import type { Controller } from '../commands/controller.ts';
 import { setup } from '../store/controller-fixture.ts';
 import { Store } from '../store/index.ts';
-import { chatFailure } from './adapter.ts';
+import { type ChatTurnRequest, chatFailure } from './adapter.ts';
 import { ChatService } from './service.ts';
 
 const selection = { family: 'openai', model: 'fixture-model', effort: 'default' } as const;
@@ -452,4 +452,41 @@ test('a usage limit writes a system line, and auto handoff sends the message to 
   assert.equal(kept.turns.length, 1);
   assert.equal(kept.thread.selection?.family, 'openai');
   assert.equal(kept.thread.activeTurnId, null);
+});
+
+test('a reviewer turn runs read only with the review brief and the ask policy, whatever the thread allows', {
+  timeout: 30000,
+}, async (t) => {
+  const { controller, adapter, task, run, send, read } = await chat(t, [
+    [{ kind: 'text', itemId: 'answer', chunks: ['Changed net.mjs.'] }],
+    [{ kind: 'text', itemId: 'review', chunks: ['One finding.'] }],
+  ]);
+  const configure = { permissionPolicy: 'allow-all' };
+  assert.equal((await run('ConfigureChatThread', configure, task.revision)).outcome, 'applied');
+  const first = turnReaches(controller, 'done');
+  await send('Change net.mjs.');
+  await first;
+  // The scripted adapter hands back the request it received, which carries these two fields.
+  const requests = adapter.requests as unknown as ChatTurnRequest[];
+  appendFileSync(join(requests[0].scratch.directory, 'net.mjs'), '// reviewed\n');
+
+  const second = turnReaches(controller, 'done');
+  const review = { text: 'Review the current changes.', role: 'reviewer', selection };
+  assert.equal((await run('SendChatMessage', review, task.revision)).outcome, 'applied');
+  await second;
+
+  const [assistant, reviewer] = requests;
+  assert.equal(assistant.permissionPolicy, 'allow-all');
+  assert.equal(assistant.readOnly, false);
+  assert.equal(reviewer.permissionPolicy, 'ask');
+  assert.equal(reviewer.readOnly, true);
+  assert.equal(reviewer.session, null);
+  assert.match(reviewer.systemContext, /ordered by severity/);
+  assert.match(reviewer.systemContext, /Do not edit/);
+  assert.match(reviewer.systemContext, /^net\.mjs \+1 -0$/m);
+  assert.match(reviewer.systemContext, /^\+\/\/ reviewed$/m);
+  const thread = await read();
+  assert.equal(thread.thread.permissionPolicy, 'allow-all');
+  assert.equal(thread.thread.sessions.length, 1);
+  assert.equal(thread.turns.at(-1)?.role, 'reviewer');
 });

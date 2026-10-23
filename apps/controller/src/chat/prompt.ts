@@ -22,6 +22,82 @@ export function systemContext(projectName: string, directory: string): string {
   ].join('\n');
 }
 
+// A review reads the changed files and their patches, so the patches get a fixed share of the prompt.
+const REVIEW_PATCH_BYTES = 48 * 1024;
+// shortcut: the file list stops at 300 names. Upgrade: summarize by directory past that.
+const REVIEW_LISTED_FILES = 300;
+const ADVICE_ANSWER_CHARACTERS = 16_000;
+
+type ReviewFile = { path: string; additions: number; deletions: number; patch: string | null };
+
+/**
+ * Brief for a reviewer turn. It lists every changed file with its counts, then as many whole
+ * patches as fit in 48 KiB, and names the files whose patch had to be left out.
+ */
+export function reviewContext(
+  projectName: string,
+  directory: string,
+  base: string,
+  files: readonly ReviewFile[] | null,
+): string {
+  const lines = [
+    `You are reviewing changes in the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
+    `Review the current changes in that copy against the base commit ${base}.`,
+    'Do not edit, create or delete files, and do not run commands. You may read and search files to check a change against the code around it.',
+    'List your findings ordered by severity, most severe first. For each one, name the file and the line, say what is wrong and why it matters, and say what you would change. If you find nothing worth reporting, say so in one sentence.',
+  ];
+  if (files === null) return [...lines, 'The changes could not be read.'].join('\n');
+  if (files.length === 0)
+    return [...lines, 'No files have changed since the base commit.'].join('\n');
+  let budget = REVIEW_PATCH_BYTES;
+  const shown: string[] = [];
+  const left: string[] = [];
+  for (const file of files) {
+    const bytes = file.patch === null ? 0 : Buffer.byteLength(file.patch);
+    if (file.patch !== null && bytes <= budget) {
+      budget -= bytes;
+      shown.push(file.patch.trimEnd());
+    } else left.push(file.path);
+  }
+  const listed = [
+    ...files
+      .slice(0, REVIEW_LISTED_FILES)
+      .map((file) => `${file.path} +${file.additions} -${file.deletions}`),
+    ...(files.length > REVIEW_LISTED_FILES
+      ? [`And ${files.length - REVIEW_LISTED_FILES} more files.`]
+      : []),
+  ].join('\n');
+  return [
+    ...lines,
+    `Changed files:\n${listed}`,
+    shown.length ? `Patches:\n\n${shown.join('\n\n')}` : '',
+    left.length
+      ? `These files have no patch above because it is binary or did not fit in 48 KiB. Read them in the scratch copy:\n${left.slice(0, REVIEW_LISTED_FILES).join('\n')}`
+      : '',
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+}
+
+/** Brief for an advisor turn: a short second opinion on the last assistant answer. */
+export function adviceContext(
+  projectName: string,
+  directory: string,
+  answer: string | null,
+): string {
+  const lines = [
+    `You are giving a second opinion in a thread about the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
+    'Do not edit, create or delete files, and do not run commands. You may read and search files to check the answer.',
+    'Say what holds up, what is wrong or missing, and what you would do next. Keep it under 300 words.',
+  ];
+  if (answer === null) return [...lines, 'There is no earlier answer in this thread.'].join('\n');
+  const text =
+    answer.length > ADVICE_ANSWER_CHARACTERS
+      ? `${answer.slice(0, ADVICE_ANSWER_CHARACTERS).toWellFormed()} [trimmed]`
+      : answer;
+  return [...lines, `The last answer:\n\n${text}`].join('\n');
+}
+
 export function withAttachments(text: string, attachments: readonly string[]): string {
   return attachments.length ? `${text}\n\nAttached paths:\n${attachments.join('\n')}` : text;
 }

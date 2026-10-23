@@ -9,6 +9,7 @@ import type {
   ChatFailure,
   ChatMessage,
   ChatThread,
+  ChatThreadRead,
   ChatTurn,
 } from '@crewkite/contracts';
 import { limitOffer } from './handoff-offer.ts';
@@ -254,4 +255,55 @@ test('the limit offer shows only while the newest turn is the one that hit a lim
   assert.equal(reopened([first])?.text, 'Add the guard');
   assert.equal(reopened([first, stored(2, 'done', 'usage-limit')]), null);
   assert.equal(reopened([first, stored(2, 'failed', 'client-exit')]), null);
+});
+
+test('a reply restored from a thread read keeps the role of its turn for the badge', () => {
+  const read = (role: 'reviewer' | 'advisor'): ChatThreadRead => ({
+    thread: {
+      taskId: task,
+      scratchReady: true,
+      base: null,
+      selection: null,
+      permissionPolicy: 'ask',
+      sessions: [],
+      activeTurnId: null,
+      autoHandoff: false,
+    },
+    turns: [
+      {
+        id: turn,
+        taskId: task,
+        sequence: 0,
+        role,
+        selection: { family: 'google', model: 'large-2', effort: 'default' },
+        userMessageId: id('msg', 10),
+        assistantMessageId: id('msg', 11),
+        state: 'done',
+        startedAt: stamp,
+        endedAt: stamp,
+        failure: null,
+        handoffFrom: null,
+      },
+    ],
+    messages: [
+      {
+        id: id('msg', 11),
+        taskId: task,
+        at: stamp,
+        cursor: '11',
+        author: { kind: 'assistant', turnId: turn, family: 'google', model: 'large-2', role },
+        text: 'Two findings.',
+        attachments: [],
+      },
+    ],
+    liveEvents: [],
+  });
+  for (const role of ['reviewer', 'advisor'] as const) {
+    const state = reduceThread(initialThreadState(task), { type: 'loaded', read: read(role) });
+    assert.deepEqual(
+      turnOf(threadItems(state)).identity,
+      { family: 'google', model: 'large-2', effort: 'default', role },
+      role,
+    );
+  }
 });
