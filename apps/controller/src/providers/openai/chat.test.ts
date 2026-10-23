@@ -1,12 +1,16 @@
 // Native frames this adapter assumes, one JSON object per line. A live run on the pinned client
 // should confirm each of them.
 //
+// Launch: `-c approval_policy="untrusted"` for the ask and allow-edits policies, "on-request" for
+// allow-all, and the same value as approvalPolicy below. Under untrusted the client asks before
+// every file change and every command outside its own read-only list.
+//
 // Client to server, ids counted from 1 per process:
 //   {"id":1,"method":"initialize","params":{"clientInfo":{"name":"crewkite","title":"CrewKite","version":"0.0.0"},"capabilities":{"experimentalApi":false,"explicitGatewayOauth":true}}}
 //   {"method":"initialized"}
 //   {"id":2,"method":"account/read","params":{"refreshToken":false}}
 //   {"id":3,"method":"account/rateLimits/read","params":{"supportsLunaReserve":false,"excludeResetCreditDetails":true}}
-//   {"id":4,"method":"thread/start","params":{"model":M,"modelProvider":"openai","cwd":SCRATCH,"approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":"workspace-write","serviceTier":"default","config":{"model_reasoning_effort":E},"ephemeral":false}}
+//   {"id":4,"method":"thread/start","params":{"model":M,"modelProvider":"openai","cwd":SCRATCH,"approvalPolicy":"untrusted"|"on-request","approvalsReviewer":"user","sandbox":"workspace-write","serviceTier":"default","config":{"model_reasoning_effort":E},"ephemeral":false}}
 //   {"id":4,"method":"thread/resume","params":{"threadId":T, same settings without ephemeral}}
 //   {"id":5,"method":"turn/start","params":{"threadId":T,"input":[{"type":"text","text":TEXT}]}}
 //   {"id":R,"result":{"decision":"accept"|"acceptForSession"|"decline"}}, the answer to approval request R
@@ -17,8 +21,9 @@
 //   account/read result {"account":{"type":"chatgpt"}|null}
 //   account/rateLimits/read result {"ordinaryUsageAllowed":B,"rateLimits":{"limitId","primary":{"usedPercent","windowDurationMins","resetsAt"}}}
 //   thread/start and thread/resume result {"thread":{"id":T}}; turn/start result {"turn":{"id":U}}
-//   {"id":R,"method":"item/commandExecution/requestApproval","params":{"threadId","turnId","itemId","reason","command"}}
-//   {"id":R,"method":"item/fileChange/requestApproval","params":{"threadId","turnId","itemId","reason","grantRoot"}}
+//   {"id":R,"method":"item/commandExecution/requestApproval","params":{"threadId","turnId","itemId","reason","command","cwd"}}
+//   {"id":R,"method":"item/fileChange/requestApproval","params":{"threadId","turnId","itemId","reason","grantRoot"}},
+//     always after item/started for the same fileChange item, which carries the paths
 //   turn/started {"threadId","turn":{"id"}}
 //   item/started and item/completed {"threadId","turnId","item":{"id","type",...}} where type is
 //     agentMessage {"text"}, reasoning {"summary":[...]}, commandExecution {"command","cwd","status",
@@ -35,8 +40,8 @@
 
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { after, test } from 'node:test';
 import {
   type AgentEvent,
@@ -55,7 +60,11 @@ import type { OpenAiUsage } from './discovery.ts';
 const peer = String.raw`
 const { appendFileSync } = require('node:fs');
 const { createInterface } = require('node:readline');
-const [scenario, frames] = process.argv.slice(2);
+const [scenario, frames, detail] = process.argv.slice(2);
+const given = JSON.parse(detail ?? 'null') ?? {};
+// Paths in a scenario are relative to the scratch copy, which is this process's cwd. They stay
+// unnormalized so the adapter has to resolve the '..' itself.
+const here = (path) => process.cwd() + '/' + path;
 const send = (value) => process.stdout.write(JSON.stringify(value) + '\n');
 const running = { id: 'turn-1', status: 'inProgress', items: [], error: null };
 let threadId = 'thread-1';
@@ -88,7 +97,11 @@ const scripts = {
   ],
   approval: () => [
     ['item/started', { ...ids(), item: command }],
-    { id: 0, method: 'item/commandExecution/requestApproval', params: { ...ids(), itemId: 'command-1', reason: 'Runs the test suite.', command: 'pnpm test' } },
+    { id: 0, method: 'item/commandExecution/requestApproval', params: { ...ids(), itemId: 'command-1', reason: 'Runs the test suite.', command: 'pnpm test', ...(given.cwd ? { cwd: here(given.cwd) } : {}) } },
+  ],
+  edit: () => [
+    ['item/started', { ...ids(), item: { id: 'change-1', type: 'fileChange', changes: [{ path: here(given.path), kind: { type: 'add' }, diff: 'x\n' }], status: 'inProgress' } }],
+    { id: 0, method: 'item/fileChange/requestApproval', params: { ...ids(), itemId: 'change-1', reason: null, grantRoot: given.grantRoot ? here(given.grantRoot) : null } },
   ],
   approved: () => [
     ['item/commandExecution/outputDelta', { ...ids(), itemId: 'command-1', delta: 'ok\n' }],
@@ -119,7 +132,7 @@ const input = createInterface({ input: process.stdin });
 input.on('line', (line) => {
   appendFileSync(frames, line + '\n');
   const value = JSON.parse(line);
-  if (value.method === undefined) return play('approved');
+  if (value.method === undefined) return play(scenario === 'edit' ? 'reply' : 'approved');
   if (value.id === undefined) return;
   let result = replies[value.method];
   // Fields CrewKite does not read change shape between client builds.
@@ -154,6 +167,10 @@ function turn(
     session?: ChatSession;
     permissionPolicy?: ChatPermissionPolicy;
     permissionGrants?: ChatToolKind[];
+    /** Scenario input for the peer: a command cwd, or a file change path and grant root. */
+    detail?: { cwd?: string; path?: string; grantRoot?: string };
+    /** Runs on the empty scratch copy before the turn starts. */
+    prepare?: (scratch: string) => void;
   } = {},
 ) {
   const home = mkdtempSync(join(root, `${scenario}-`));
@@ -161,16 +178,21 @@ function turn(
   const work = join(home, 'work');
   mkdirSync(scratch);
   mkdirSync(work, { mode: 0o700 });
+  options.prepare?.(scratch);
   const frames = join(home, 'frames.jsonl');
   const events: AgentEvent[] = [];
   const listeners: Array<(event: AgentEvent) => void> = [];
   const usage: OpenAiUsage[] = [];
   const environment = { HOME: home, PATH: process.env.PATH };
+  let args: string[] = [];
   const adapter = openAiChatAdapter({
     launch: () => ({ executable, sha256, directory: work, repositoryRoot: home, environment }),
     onUsage: (value) => usage.push(value),
-    spawn: (path, _args, spawnOptions) =>
-      spawn(process.execPath, [path, scenario, frames], spawnOptions),
+    spawn: (path, clientArgs, spawnOptions) => {
+      args = clientArgs;
+      const input = JSON.stringify(options.detail ?? null);
+      return spawn(process.execPath, [path, scenario, frames, input], spawnOptions);
+    },
   });
   const handle = adapter.startTurn(
     {
@@ -200,6 +222,7 @@ function turn(
     events,
     usage,
     scratch,
+    args: () => args,
     frames: () =>
       readFileSync(frames, 'utf8')
         .trimEnd()
@@ -290,9 +313,9 @@ test('a command approval holds the turn until respondPermission answers it', asy
   assert.equal(result.stopReason, 'done');
 });
 
-test('a command kind the thread allows is answered without asking and both events are emitted', async () => {
+test('a command kind the thread allows is answered without asking only inside the scratch copy', async () => {
   // No respondPermission call: the adapter answers from the grants in the request.
-  const run = turn('approval', { permissionGrants: ['command'] });
+  const run = turn('approval', { permissionGrants: ['command'], detail: { cwd: '.' } });
   const result = await run.settled();
   const events = strip(run.events);
   assert.deepEqual(
@@ -316,6 +339,45 @@ test('a command kind the thread allows is answered without asking and both event
     { id: 0, result: { decision: 'acceptForSession' } },
   );
   assert.equal(result.stopReason, 'done');
+  // The same grant does not cover a command that runs from outside the copy.
+  const outside = turn('approval', { permissionGrants: ['command'], detail: { cwd: '..' } });
+  const asked = await outside.when('permission.requested');
+  assert.equal(
+    outside.events.some((event) => event.type === 'permission.resolved'),
+    false,
+  );
+  outside.handle.respondPermission(asked.requestId, 'deny');
+  await outside.settled();
+  assert.deepEqual(
+    outside.frames().find((frame) => frame.id === 0),
+    { id: 0, result: { decision: 'decline' } },
+  );
+});
+
+test('a write outside the scratch copy still asks under allow-edits', async () => {
+  // Every row also holds an edit grant, so neither rule may answer a change that leaves the copy
+  // by '..', through a link, or with a grant root outside it.
+  const rows: Array<{ detail: { path: string; grantRoot?: string }; answered: string[] }> = [
+    { detail: { path: 'src/app.ts' }, answered: ['allow-once'] },
+    { detail: { path: '../outside.txt' }, answered: [] },
+    { detail: { path: 'link/outside.txt' }, answered: [] },
+    { detail: { path: 'src/app.ts', grantRoot: '..' }, answered: [] },
+  ];
+  for (const row of rows) {
+    const run = turn('edit', {
+      permissionPolicy: 'allow-edits',
+      permissionGrants: ['edit'],
+      detail: row.detail,
+      prepare: (scratch) => symlinkSync(dirname(scratch), join(scratch, 'link')),
+    });
+    const asked = await run.when('permission.requested');
+    const answered = run.events.flatMap((event) =>
+      event.type === 'permission.resolved' ? [event.choice] : [],
+    );
+    assert.deepEqual(answered, row.answered, JSON.stringify(row.detail));
+    if (!answered.length) run.handle.respondPermission(asked.requestId, 'deny');
+    assert.equal((await run.settled()).stopReason, 'done');
+  }
 });
 
 test('stop interrupts the native turn, ends the process group and reports stopped', async () => {
@@ -375,22 +437,24 @@ test('a usage limit error ends the turn as a limit with the reset time', async (
   assert.equal(run.usage.at(-1)?.windows[0].remaining?.value, 0);
 });
 
-test('the next turn resumes the thread the first turn started and sends only the prompt', async () => {
+test('the next turn resumes the thread with its own approval policy and sends only the prompt', async () => {
   const first = turn('reply');
   const { session } = await first.settled();
   assert(session);
-  const second = turn('reply', { session });
+  const second = turn('reply', { session, permissionPolicy: 'allow-all' });
   const result = await second.settled();
   const settings = {
     model: 'gpt-6.1-sol',
     modelProvider: 'openai',
     cwd: first.scratch,
-    approvalPolicy: 'on-request',
+    approvalPolicy: 'untrusted',
     approvalsReviewer: 'user',
     sandbox: 'workspace-write',
     serviceTier: 'default',
     config: { model_reasoning_effort: 'low' },
   };
+  assert(first.args().includes('approval_policy="untrusted"'));
+  assert(second.args().includes('approval_policy="on-request"'));
   assert.deepEqual(first.frames().slice(4), [
     { id: 4, method: 'thread/start', params: { ...settings, ephemeral: false } },
     {
@@ -417,7 +481,12 @@ test('the next turn resumes the thread the first turn started and sends only the
     {
       id: 4,
       method: 'thread/resume',
-      params: { threadId: 'thread-1', ...settings, cwd: second.scratch },
+      params: {
+        threadId: 'thread-1',
+        ...settings,
+        cwd: second.scratch,
+        approvalPolicy: 'on-request',
+      },
     },
     {
       id: 5,

@@ -10,7 +10,7 @@ import {
   realpathSync,
 } from 'node:fs';
 import { userInfo } from 'node:os';
-import { isAbsolute, join, relative } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import type {
   AgentEvent,
@@ -26,6 +26,7 @@ import {
   type ChatTurnResult,
   chatFailure,
 } from '../../chat/adapter.ts';
+import { scratchPath } from '../../chat/local-tools.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
 import { armOwnedCleanup } from './native-discovery.ts';
 
@@ -146,17 +147,20 @@ const rateLimit = z.object({
   rate_limit_info: rateInfo.optional(),
   rateLimitInfo: rateInfo.optional(),
 });
+// Only the subtype has to parse. Every other field falls back to undefined on its own, so a
+// finished turn does not fail because one detail changed shape in a later build.
+const loose = <T extends z.ZodType>(schema: T) => schema.optional().catch(undefined);
 const result = z.object({
   subtype: z.string().optional(),
-  is_error: z.boolean().optional(),
-  session_id: z.string().optional(),
-  result: z.string().optional(),
-  errors: z.array(z.string()).optional(),
-  api_error: z.string().optional(),
-  usage: usage.optional(),
-  modelUsage: z
-    .record(z.string(), z.object({ contextWindow: z.number().int().positive().optional() }))
-    .optional(),
+  is_error: loose(z.boolean()),
+  session_id: loose(z.string()),
+  result: loose(z.string()),
+  errors: loose(z.array(z.unknown())),
+  api_error: loose(z.string()),
+  usage: loose(usage),
+  modelUsage: loose(
+    z.record(z.string(), z.object({ contextWindow: loose(z.number().int().positive()) }).catch({})),
+  ),
 });
 
 // Copied from replacement.ts: the last Unix second that still prints as a four-digit year.
@@ -257,6 +261,10 @@ function chatArguments(request: ChatTurnRequest, resume: string | null) {
     '--include-partial-messages',
     '--permission-prompt-tool',
     'stdio',
+    // The scratch copy carries the project's own .claude settings, and their allow rules would
+    // answer before CrewKite is asked. User settings only, with hooks off in every source.
+    '--setting-sources',
+    'user',
     '--settings',
     '{"disableAllHooks":true}',
     '--permission-mode',
@@ -445,19 +453,41 @@ function startTurn(
       // Only an absent group proves a failed signal needs nothing more.
     }
   };
+  // The client may report a path through the scratch directory as given or through its real path.
+  let real = scratch;
+  try {
+    real = realpathSync(scratch);
+  } catch {}
+  const roots = [...new Set([resolve(scratch), real])];
+  /** A path relative to scratch, or null when it leaves through `..` or a link, or lands in .git. */
+  const local = (file: string) => {
+    const full = resolve(scratch, file);
+    for (const root of roots) {
+      const inside = relative(root, full);
+      if (!inside || inside.startsWith('..') || isAbsolute(inside)) continue;
+      try {
+        return scratchPath(scratch, inside).relative;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  };
   // Paths inside the scratch copy show relative to it. The target is what a person needs to
   // recognize the call: the file, the pattern or the command.
   const describe = (name: string, input: Record<string, unknown>) => {
     const text = (value: unknown) => (typeof value === 'string' && value ? value : undefined);
     const file = text(input.file_path) ?? text(input.notebook_path);
-    const inside = file === undefined ? '' : relative(scratch, file);
-    const path =
-      file && isAbsolute(file) && inside && !inside.startsWith('..') && !isAbsolute(inside)
-        ? inside
-        : file;
+    const inside = file === undefined ? null : local(file);
+    const path = inside ?? file;
     const target =
       path ?? text(input.pattern) ?? text(input.command) ?? text(input.path) ?? text(input.url);
-    return { kind: toolKinds.get(name) ?? 'other', path: path ?? null, target: target ?? null };
+    return {
+      kind: toolKinds.get(name) ?? 'other',
+      path: path ?? null,
+      inside: inside !== null,
+      target: target ?? null,
+    };
   };
 
   const complete = (item: Item, text: string) => {
@@ -688,7 +718,7 @@ function startTurn(
     const toolName = ask.tool_name ?? ask.toolName ?? 'tool';
     const input = ask.input ?? {};
     const callId = ask.tool_use_id ?? ask.toolUseId ?? null;
-    const { kind, target } = describe(toolName, input);
+    const { kind, target, inside } = describe(toolName, input);
     const question =
       kind === 'command' && target
         ? `Run ${target}?`
@@ -699,13 +729,19 @@ function startTurn(
             : `Allow ${toolName}?`;
     const entry = { toolName, input, callId };
     // Thread grant: a kind the person allowed for the whole thread is answered without asking.
-    const granted = request.permissionGrants?.includes(kind) === true;
+    // For an edit the grant covers the scratch copy only, so a file outside it is asked about.
+    // `other` spans every tool CrewKite cannot name, from web fetches to MCP tools, so no grant
+    // covers it. An allow for this thread given in this turn names the one tool.
+    const granted =
+      (kind !== 'edit' || inside) &&
+      (allowed.has(toolName) ||
+        (kind !== 'other' && request.permissionGrants?.includes(kind) === true));
     // Review and advice turns read only. Those three tools never ask, so any ask is declined.
     const automatic = request.readOnly
       ? 'deny'
       : request.permissionPolicy === 'allow-all'
         ? 'allow-once'
-        : allowed.has(toolName) || granted
+        : granted
           ? 'allow-thread'
           : null;
     // The ask is open before the event goes out, so an answer given from inside the
@@ -789,7 +825,8 @@ function startTurn(
       }
       if (data.subtype === 'success' && data.is_error !== true) decide('done');
       else {
-        const text = [data.result, ...(data.errors ?? [])].filter(Boolean).join('\n');
+        const errors = (data.errors ?? []).filter((entry) => typeof entry === 'string');
+        const text = [data.result, ...errors].filter(Boolean).join('\n');
         const base = {
           stage: 'stream' as const,
           providerMessage: clip(text, 16_384) || null,
