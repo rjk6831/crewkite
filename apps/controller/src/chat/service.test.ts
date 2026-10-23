@@ -96,7 +96,7 @@ function agentEvents(controller: Pick<Controller, 'store'>): AgentEvent[] {
 test('a sent message streams agent events and saves the reply when the turn finishes', {
   timeout: 30000,
 }, async (t) => {
-  const { controller, adapter, send, read } = await chat(t, [
+  const { controller, adapter, task, run, read } = await chat(t, [
     [{ kind: 'text', itemId: 'reply', chunks: ['It sells ', 'things.'] }],
   ]);
   const states: string[] = [];
@@ -104,7 +104,12 @@ test('a sent message streams agent events and saves the reply when the turn fini
     if (event.type === 'chat.turn') states.push(event.payload.state);
   });
   const done = turnReaches(controller, 'done');
-  assert.equal((await send('What does this project do?')).outcome, 'applied');
+  const message = {
+    text: 'What does this project do?',
+    selection,
+    attachments: ['net.mjs', '../outside.txt'],
+  };
+  assert.equal((await run('SendChatMessage', message, task.revision)).outcome, 'applied');
   const turn = await done;
 
   assert.deepEqual(states, ['running', 'done']);
@@ -124,7 +129,10 @@ test('a sent message streams agent events and saves the reply when the turn fini
   assert.equal(thread.thread.activeTurnId, null);
   assert.equal(thread.thread.sessions[0]?.sessionId, `session-${turn.id}`);
   const [request] = adapter.requests;
-  assert.equal(request.prompt, 'What does this project do?');
+  assert.equal(
+    request.prompt,
+    'What does this project do?\n\nAttached paths:\nnet.mjs\n\nAttachment outside the scratch copy was not included: ../outside.txt',
+  );
   assert.deepEqual(request.history, []);
   assert.match(request.systemContext, /demo-shop/);
   assert.ok(existsSync(join(request.scratch.directory, 'net.mjs')));

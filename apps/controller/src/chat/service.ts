@@ -636,11 +636,11 @@ export class ChatService {
     const message = this.findEntry(task.id, turn.userMessageId);
     if (message?.kind !== 'user-message' || !thread.base)
       throw Error('The message for this turn is missing.');
-    const prompt = withAttachments(message.text, message.attachments ?? []);
+    const directory = this.scratchDirectory(task.id);
+    const prompt = withAttachments(message.text, message.attachments ?? [], directory);
     const history = this.history(task.id, message.cursor);
     const work = join(this.deps.home, 'chat', task.id, 'turns', turn.id);
     mkdirSync(work, { recursive: true, mode: 0o700 });
-    const directory = this.scratchDirectory(task.id);
     const handoff = turn.handoffFrom ? this.takeHandoff(task) : null;
     return {
       turnId: turn.id,
