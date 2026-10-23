@@ -31,6 +31,7 @@ import {
   HandoffChatThreadPayloadSchema,
   MAX_CHAT_ENTRY_BYTES,
   type Project,
+  rankFamilies,
   type Task,
 } from '@crewkite/contracts';
 import { z } from 'zod';
@@ -720,6 +721,18 @@ export class ChatService {
       const thread = this.thread(task.id);
       // A person who already moved the thread has made the choice.
       if (!thread.autoHandoff || thread.selection?.family !== turn.selection.family) return;
+      // One automatic move per message. The catalog can be stale, and a family it still shows
+      // with allowance may stop on its limit too. A second move would bounce between them.
+      if (this.movedOnLimit(turn)) {
+        this.deps.store.transaction(() =>
+          this.appendEntry(task, {
+            kind: 'chat-system',
+            author: { kind: 'system', turnId: turn.id },
+            text: 'Automatic handoff already moved this message once. Pick a provider to continue.',
+          }),
+        );
+        return;
+      }
       const selection = this.nextFamily(task.id, turn.selection.family);
       if (!selection) return;
       const effects: Effects = [];
@@ -732,6 +745,17 @@ export class ChatService {
     } catch {
       // The limit line stands and the card in the thread still offers the switch.
     }
+  }
+
+  /** True when this turn reran a message that an earlier turn left on a usage limit. */
+  private movedOnLimit(turn: ChatTurn): boolean {
+    if (!turn.handoffFrom) return false;
+    return this.deps.store.db
+      .prepare(
+        "SELECT body FROM chat_turns WHERE task_id=? AND sequence<? AND json_extract(body,'$.userMessageId')=?",
+      )
+      .all(turn.taskId, turn.sequence, turn.userMessageId)
+      .some((row) => endedOnLimit(ChatTurnSchema.parse(JSON.parse(row.body as string))));
   }
 
   /** The newest turn, when it ended on a usage limit and the person has written nothing since. */
@@ -806,17 +830,13 @@ export class ChatService {
     effects.push(() => this.launch(turn));
   }
 
-  /** Highest remaining percent, then soonest reset. The family that stopped never qualifies. */
+  /**
+   * The first family in the shared ranking with an adapter and a usable default model. The
+   * family that stopped and any family at zero never qualify.
+   */
   private nextFamily(taskId: string, stopped: ChatFamily): ChatModelSelection | null {
-    const ranked = this.deps
-      .catalog(taskId)
-      .families.filter(
-        (entry) =>
-          entry.connected && entry.family !== stopped && this.deps.adapters.has(entry.family),
-      )
-      .map((entry) => ({ entry, ...allowance(entry.remaining) }))
-      .sort((a, b) => b.percent - a.percent || a.resetsAt - b.resetsAt);
-    for (const { entry } of ranked) {
+    for (const entry of rankFamilies(this.deps.catalog(taskId).families, [stopped])) {
+      if (!this.deps.adapters.has(entry.family)) continue;
       const model = entry.defaultModel ?? entry.models[0]?.model;
       if (!model) continue;
       const effort = entry.models.find((value) => value.model === model)?.defaultEffort;
@@ -1280,19 +1300,6 @@ function ending(result: ChatTurnResult, items: ReadonlyMap<string, string>): End
     session: session.success ? session.data : null,
   };
 }
-
-/**
- * The window with the least left says how much a family can still do. A family with no
- * observed percent ranks below every family with one, and an unknown reset ranks last.
- */
-function allowance(remaining: ChatCatalogRead['families'][number]['remaining']) {
-  const [tightest] = remaining
-    .filter((window) => window.percent !== null)
-    .sort((a, b) => (a.percent ?? 0) - (b.percent ?? 0) || reset(a.resetsAt) - reset(b.resetsAt));
-  return { percent: tightest?.percent ?? -1, resetsAt: reset(tightest?.resetsAt ?? null) };
-}
-
-const reset = (at: string | null) => (at ? Date.parse(at) : Number.MAX_SAFE_INTEGER);
 
 function addText(items: Map<string, string>, event: AgentEvent) {
   if (event.type === 'text.delta')
