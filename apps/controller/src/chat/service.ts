@@ -12,12 +12,14 @@ import {
   ChatFamilySchema,
   type ChatMessage,
   type ChatModelSelection,
+  type ChatPermissionOption,
   type ChatSession,
   ChatSessionSchema,
   type ChatThread,
   type ChatThreadRead,
   ChatThreadReadSchema,
   ChatThreadSchema,
+  type ChatToolKind,
   type ChatTurn,
   ChatTurnSchema,
   type Command,
@@ -100,8 +102,10 @@ type LiveTurn = {
   finished: boolean;
   /** Streamed text by item, kept so a stop or crash keeps what the person already saw. */
   items: Map<string, string>;
-  /** Open permission requests and the option IDs each one accepts. */
-  permissions: Map<string, string[]>;
+  /** Open permission requests: the options each one accepts and the tool call it is about. */
+  permissions: Map<string, { options: readonly ChatPermissionOption[]; callId: string | null }>;
+  /** Tool kind by call ID. A thread grant covers a kind, and only the tool event names it. */
+  kinds: Map<string, ChatToolKind>;
   noticed: boolean;
   /** Adapters differ on whether they announce the turn edges. The service owns both. */
   started: boolean;
@@ -212,9 +216,15 @@ export class ChatService {
   resolvePermission(payload: Payload<'ResolveChatPermission'>, effects: Effects): CommandResult {
     const live = this.activeLive(payload.taskId, payload.turnId);
     if (!live) return blocked('no-active-turn');
-    if (!live.permissions.get(payload.requestId)?.includes(payload.choice))
+    const open = live.permissions.get(payload.requestId);
+    const option = open?.options.find((entry) => entry.id === payload.choice);
+    if (!open || !option)
       return blocked('permission-not-pending', 'Refresh the thread and answer the open request.');
     live.permissions.delete(payload.requestId);
+    // Allow for this thread covers the kind of tool the request was about. A request with no
+    // known call is filed under other.
+    if (option.kind === 'allow-thread')
+      this.grant(payload.taskId, live.kinds.get(open.callId ?? '') ?? 'other');
     effects.push(() =>
       this.call(() => live.handle?.respondPermission(payload.requestId, payload.choice)),
     );
@@ -243,6 +253,8 @@ export class ChatService {
       ...thread,
       selection,
       permissionPolicy: payload.permissionPolicy ?? thread.permissionPolicy,
+      // Choosing ask again takes back everything the thread allowed.
+      ...(payload.permissionPolicy === 'ask' ? { permissionGrants: [] } : {}),
       autoHandoff: payload.autoHandoff ?? thread.autoHandoff,
     });
     return { outcome: 'applied' };
@@ -357,6 +369,7 @@ export class ChatService {
       finished: false,
       items: new Map(),
       permissions: new Map(),
+      kinds: new Map(),
       noticed: false,
       started: false,
       completed: false,
@@ -453,6 +466,8 @@ export class ChatService {
       scratch: { directory, base: thread.base, projectName: project.name },
       work: { directory: work, home: this.deps.home },
       permissionPolicy: turn.role === 'assistant' ? thread.permissionPolicy : 'ask',
+      // A reviewer or advisor reads only, so what the thread allowed does not reach it.
+      permissionGrants: turn.role === 'assistant' ? (thread.permissionGrants ?? []) : [],
       readOnly: turn.role !== 'assistant',
       deadlineMs: TURN_DEADLINE_MS,
       environment: this.deps.resolveEnvironment(turn.selection.family),
@@ -497,11 +512,9 @@ export class ChatService {
       live.completed = true;
     }
     addText(live.items, event);
+    if (event.type === 'tool.started') live.kinds.set(event.callId, event.kind);
     if (event.type === 'permission.requested')
-      live.permissions.set(
-        event.requestId,
-        event.options.map((option) => option.id),
-      );
+      live.permissions.set(event.requestId, { options: event.options, callId: event.callId });
     if (event.type === 'permission.resolved') live.permissions.delete(event.requestId);
     try {
       this.deps.store.transaction(() => {
@@ -734,6 +747,15 @@ export class ChatService {
       .run(task.id, canonicalJson(value));
     this.deps.emit('chat.thread', task.id, task.revision, value);
     return value;
+  }
+
+  /** Remember a tool kind the person allowed for the whole thread. Each kind is kept once. */
+  private grant(taskId: string, kind: ChatToolKind) {
+    const task = this.task(taskId);
+    const thread = this.thread(taskId);
+    const grants = thread.permissionGrants ?? [];
+    if (!task || grants.includes(kind)) return;
+    this.putThread(task, { ...thread, permissionGrants: [...grants, kind] });
   }
 
   private pendingHandoff(taskId: string): Handoff | null {

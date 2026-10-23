@@ -698,12 +698,14 @@ function startTurn(
             ? `Allow ${toolName} on ${target}?`
             : `Allow ${toolName}?`;
     const entry = { toolName, input, callId };
+    // Thread grant: a kind the person allowed for the whole thread is answered without asking.
+    const granted = request.permissionGrants?.includes(kind) === true;
     // Review and advice turns read only. Those three tools never ask, so any ask is declined.
     const automatic = request.readOnly
       ? 'deny'
       : request.permissionPolicy === 'allow-all'
         ? 'allow-once'
-        : allowed.has(toolName)
+        : allowed.has(toolName) || granted
           ? 'allow-thread'
           : null;
     // The ask is open before the event goes out, so an answer given from inside the
