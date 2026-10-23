@@ -279,9 +279,10 @@ test('a turn streams thinking, tools and text in order, and the next turn resume
       promptText(first.frames),
       'You are working in a scratch copy of demo.\n\nWhat does this project do?',
     );
-    // The frame trace names each frame and never carries file content or tool output.
+    // The frame trace names each frame and never carries file content, tool output or a title,
+    // which for a command is the command line.
     const trace = readFileSync(join(firstRequest.work.directory, 'acp-trace.jsonl'), 'utf8');
-    assert(!trace.includes('export const'));
+    assert(!trace.includes('export const') && !trace.includes('Read net.mjs'));
     const { bytes, ...announced } = trace
       .split('\n')
       .filter(Boolean)
@@ -294,7 +295,7 @@ test('a turn streams thinking, tools and text in order, and the next turn resume
       toolCallId: 'read-1',
       status: 'in_progress',
       kind: 'read',
-      title: 'Read net.mjs',
+      titleLength: 12,
       keys: ['sessionUpdate', 'toolCallId', 'title', 'kind', 'status', 'rawInput', 'locations'],
     });
 

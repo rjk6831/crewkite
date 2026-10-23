@@ -190,14 +190,17 @@ const traceField = (value: unknown) =>
       : Array.isArray(value)
         ? '(array)'
         : '(object)';
-/** Names and states of one update or tool call. Content and output text never go in. */
+/**
+ * Names and states of one update or tool call. Content and output text never go in. A command
+ * call's title is its command line, so only the title's length does.
+ */
 const frameFacts = (value: unknown) => {
   const frame = fields(value);
   return {
     toolCallId: traceField(frame.toolCallId),
     status: traceField(frame.status),
     kind: traceField(frame.kind),
-    title: traceField(frame.title),
+    titleLength: typeof frame.title === 'string' ? frame.title.length : undefined,
     keys: Object.keys(frame)
       .slice(0, 32)
       .map((key) => clip(key, 60)),
