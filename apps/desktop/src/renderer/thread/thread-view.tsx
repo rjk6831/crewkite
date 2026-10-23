@@ -212,6 +212,7 @@ export function ThreadView({
         <Inspector
           source={source}
           taskId={task.id}
+          title={task.title}
           thread={thread}
           header={header}
           preview={preview}

@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   type AgentEvent,
@@ -35,7 +35,19 @@ import {
 } from '@crewkite/contracts';
 import { z } from 'zod';
 import type { ArtifactFiles } from '../artifacts/index.ts';
-import { committedFiles, git, materialize } from '../host/source.ts';
+import {
+  applyPublication,
+  type GitIdentity,
+  preparePublication,
+  refValue,
+} from '../host/publication.ts';
+import {
+  committedFiles,
+  type FileContent,
+  git,
+  materialize,
+  readCandidateFiles,
+} from '../host/source.ts';
 import type { Store } from '../store/index.ts';
 import {
   type ChatAdapter,
@@ -280,6 +292,94 @@ export class ChatService {
       });
     if (stopped && effects) this.resend(task, stopped, effects);
     return { outcome: 'applied' };
+  }
+
+  /**
+   * Commit the scratch copy on the thread's base and point a new local branch at it. The
+   * project's checkout, index and HEAD stay as they are (ADR 0008).
+   */
+  accept(payload: Payload<'AcceptChatChanges'>, identity: GitIdentity | undefined): CommandResult {
+    const task = this.task(payload.taskId);
+    if (!task) return blocked('task-not-found');
+    const thread = this.thread(task.id);
+    if (thread.activeTurnId)
+      return blocked('turn-running', 'Wait for the reply or stop it, then accept.');
+    const root = this.deps.projectPath(task.projectId);
+    if (!root) return blocked('project-not-found', 'Add the project again, then accept.');
+    const base = thread.base;
+    if (!base || !thread.scratchReady)
+      return blocked('no-changes', 'Ask for a change in this thread first.');
+    const ref = `refs/heads/${payload.branch}`;
+    let existing: string | null;
+    try {
+      existing = refValue(root, ref);
+    } catch {
+      return blocked(
+        'branch-name-unsupported',
+        'Use lower case letters, digits, hyphens and slashes in the branch name.',
+      );
+    }
+    if (existing !== null) return blocked('branch-exists', 'Choose an unused branch name.');
+    // The person reviewed the diff against the base. A branch from an older commit would need a
+    // rebase they never saw.
+    if (this.head(task) !== base)
+      return blocked('base-moved', 'Start a new thread on the current commit.');
+    if (!identity)
+      return blocked('git-identity-missing', 'Configure a Git name and email before acceptance.');
+    const scratch = this.scratchDirectory(task.id);
+    let fileCount: number;
+    let files: FileContent[];
+    try {
+      // The Changes tab count, so the system line matches what the person reviewed.
+      fileCount = scratchChanges(root, scratch, base, false).length;
+      files = readCandidateFiles(scratch, root, base);
+    } catch {
+      return blocked(
+        'scratch-unreadable',
+        'Ask the assistant to remove links and special files from the scratch copy.',
+      );
+    }
+    if (!fileCount) return blocked('no-changes', 'Ask for a change in this thread first.');
+    const at = this.deps.now();
+    const work = mkdtempSync(join(this.deps.home, 'chat', task.id, 'accept-'));
+    let commit: string;
+    try {
+      const prepared = preparePublication({
+        source: root,
+        repository: work,
+        base,
+        files,
+        identity,
+        at,
+        message: `CrewKite: ${task.title.replace(/\s+/g, ' ').trim()}\n`,
+      });
+      applyPublication({
+        source: root,
+        pack: prepared.pack,
+        destinationRef: ref,
+        treeOid: prepared.treeOid,
+        commitOid: prepared.commitOid,
+        base,
+      });
+      commit = prepared.commitOid;
+    } catch {
+      return blocked('branch-not-created', 'Choose another branch name and accept again.');
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+    this.putThread(task, {
+      ...thread,
+      lastAcceptance: { branch: payload.branch, at, fileCount, commit },
+    });
+    this.appendEntry(task, {
+      kind: 'chat-system',
+      author: { kind: 'system', turnId: null },
+      text: `Accepted ${fileCount} ${fileCount === 1 ? 'file' : 'files'} to branch ${payload.branch}.`,
+    });
+    return {
+      outcome: 'applied',
+      data: { kind: 'chat-acceptance', branch: payload.branch, commit, fileCount },
+    };
   }
 
   readThread(payload: Payload<'ReadChatThread'>): ChatThreadRead {

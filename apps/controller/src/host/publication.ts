@@ -45,6 +45,8 @@ export function preparePublication(input: {
   files: FileContent[];
   identity: GitIdentity;
   at: string;
+  /** Chat acceptance names the thread. Candidates keep the checked-candidate message. */
+  message?: string;
 }) {
   if (input.base.length !== 40)
     throw new Error('Publication from this Git object format is unsupported in D0.');
@@ -59,7 +61,8 @@ export function preparePublication(input: {
   const commitOid = git(
     input.repository,
     ['commit-tree', treeOid, '-p', input.base],
-    `feat: apply checked task candidate\n\nApply the accepted candidate after its required checks.\n\nSigned-off-by: ${identity.name} <${identity.email}>\n`,
+    input.message ??
+      `feat: apply checked task candidate\n\nApply the accepted candidate after its required checks.\n\nSigned-off-by: ${identity.name} <${identity.email}>\n`,
     { ...identity, at },
   )
     .toString()

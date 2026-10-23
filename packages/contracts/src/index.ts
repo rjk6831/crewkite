@@ -3567,6 +3567,12 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
   ChatThreadReadSchema.extend({ kind: z.literal('chat-thread') }),
   ChatChangesReadSchema.extend({ kind: z.literal('chat-changes') }),
   ChatCatalogReadSchema.extend({ kind: z.literal('chat-catalog') }),
+  z.strictObject({
+    kind: z.literal('chat-acceptance'),
+    branch: AcceptChatChangesPayloadSchema.shape.branch,
+    commit: z.string().regex(/^[a-f0-9]{40}$/),
+    fileCount: z.number().int().nonnegative(),
+  }),
   WorkspaceStateSchema,
   TaskOperationsPageSchema,
   ProjectOperationDataSchema,

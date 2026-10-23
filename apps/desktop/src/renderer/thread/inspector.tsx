@@ -57,6 +57,7 @@ function ThreadTab({
 }) {
   const [turns, setTurns] = useState<ChatTurn[] | null>(null);
   const active = thread?.activeTurnId ?? null;
+  const accepted = thread?.lastAcceptance;
   // The thread record changes when a turn starts and when it ends, and the list follows it.
   // biome-ignore lint/correctness/useExhaustiveDependencies: the active turn reloads the list
   useEffect(() => {
@@ -80,6 +81,12 @@ function ThreadTab({
         <dd>{thread?.base ? <code>{thread.base}</code> : 'None yet'}</dd>
         <dt>Scratch copy</dt>
         <dd>{thread?.scratchReady ? 'Ready' : 'Created on the first edit'}</dd>
+        <dt>Accepted</dt>
+        <dd>
+          {accepted
+            ? `${accepted.branch} · ${accepted.fileCount} ${accepted.fileCount === 1 ? 'file' : 'files'}`
+            : 'Not yet'}
+        </dd>
         <dt>Sessions</dt>
         <dd>
           {thread && thread.sessions.length > 0 ? (
@@ -145,6 +152,7 @@ function ThreadTab({
 export function Inspector({
   source,
   taskId,
+  title,
   thread,
   header,
   preview,
@@ -157,6 +165,7 @@ export function Inspector({
 }: {
   source: ThreadSource;
   taskId: string;
+  title: string;
   thread: ChatThread | null;
   header: WorkspaceState | null;
   preview: boolean;
@@ -200,6 +209,8 @@ export function Inspector({
           <ChangesPanel
             source={source}
             taskId={taskId}
+            title={title}
+            thread={thread}
             refreshKey={changesKey}
             focusPath={focusPath}
           />

@@ -1,4 +1,5 @@
 import {
+  AcceptChatChangesPayloadSchema,
   type ChatCatalogRead,
   ChatCatalogReadSchema,
   type ChatChangesRead,
@@ -26,16 +27,19 @@ const CHAT_REVISION = 0;
 // The desktop does not depend on zod directly, so payload types come from the schema objects.
 type Input<S extends { _zod: { input: unknown } }> = S['_zod']['input'];
 
+const dispatch = (source: ThreadSource, command: string, payload: unknown) =>
+  source.command({
+    command,
+    payload,
+    ...(command.startsWith('Read') ? {} : { expectedRevision: CHAT_REVISION }),
+  } as unknown as DesktopCommand);
+
 async function run(
   source: ThreadSource,
   command: string,
   payload: unknown,
 ): Promise<CommandResult> {
-  const result = await source.command({
-    command,
-    payload,
-    ...(command.startsWith('Read') ? {} : { expectedRevision: CHAT_REVISION }),
-  } as unknown as DesktopCommand);
+  const result = await dispatch(source, command, payload);
   if (result.outcome !== 'applied' && result.outcome !== 'already-applied')
     throw new Error(
       [result.reason ?? 'The controller did not accept this request.', result.next]
@@ -99,6 +103,24 @@ export const handoffThread = (
   source: ThreadSource,
   input: Input<typeof HandoffChatThreadPayloadSchema>,
 ) => run(source, 'HandoffChatThread', HandoffChatThreadPayloadSchema.parse(input));
+
+export type Acceptance =
+  | { accepted: true; branch: string; commit: string; fileCount: number }
+  | { accepted: false; reason: string; next: string | null };
+// Refusals come back as values so the Changes tab can name each reason on its own line.
+export async function acceptChanges(
+  source: ThreadSource,
+  input: Input<typeof AcceptChatChangesPayloadSchema>,
+): Promise<Acceptance> {
+  const payload = AcceptChatChangesPayloadSchema.safeParse(input);
+  if (!payload.success) return { accepted: false, reason: 'branch-name-unsupported', next: null };
+  const result = await dispatch(source, 'AcceptChatChanges', payload.data);
+  if (result.outcome === 'applied' && result.data?.kind === 'chat-acceptance') {
+    const { branch, commit, fileCount } = result.data;
+    return { accepted: true, branch, commit, fileCount };
+  }
+  return { accepted: false, reason: result.reason ?? 'not-accepted', next: result.next ?? null };
+}
 
 // The controller events the thread view folds. A conversation entry also reaches the workspace,
 // which still reads it. The other three are streamed output and thread state. They change many

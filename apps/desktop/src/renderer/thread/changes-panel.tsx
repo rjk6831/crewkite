@@ -1,17 +1,116 @@
-import type { ChatChangesRead } from '@crewkite/contracts';
+import type { ChatChangesRead, ChatThread } from '@crewkite/contracts';
 import { ChevronRight } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { type FormEvent, useEffect, useRef, useState } from 'react';
 import { lineClass } from './cards.tsx';
-import { readChanges, type ThreadSource } from './commands.ts';
+import { type Acceptance, acceptChanges, readChanges, type ThreadSource } from './commands.ts';
+import { CodeBlock } from './markdown.tsx';
+
+const refusals: Record<string, string> = {
+  'turn-running': 'A reply is still running. Accept when it ends.',
+  'no-changes': 'The scratch copy has no changes to accept.',
+  'branch-exists': 'That branch already exists. Choose another name.',
+  'branch-name-unsupported': 'Use lower case letters, digits, hyphens and slashes.',
+  'base-moved':
+    "The project moved past this thread's base commit. Start a new thread on the current commit.",
+  'git-identity-missing': 'Set a Git name and email on this machine, then accept again.',
+  'scratch-unreadable':
+    'The scratch copy holds links or special files. Ask the assistant to remove them.',
+  'branch-not-created': 'The branch was not created. Choose another name and try again.',
+};
+
+// The controller takes lower case letters, digits, hyphens and slashes. A title with none of
+// those still gets a name that is unique to the thread.
+function branchName(title: string, taskId: string) {
+  const slug = title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .slice(0, 60)
+    .replace(/^-+|-+$/g, '');
+  return `crewkite/${slug || taskId.slice(-8).toLowerCase()}`;
+}
+
+function AcceptControl({
+  source,
+  taskId,
+  title,
+  thread,
+  empty,
+}: {
+  source: ThreadSource;
+  taskId: string;
+  title: string;
+  thread: ChatThread | null;
+  empty: boolean;
+}) {
+  const [branch, setBranch] = useState(() => branchName(title, taskId));
+  const [busy, setBusy] = useState(false);
+  const [refusal, setRefusal] = useState<string | null>(null);
+  const [accepted, setAccepted] = useState<Extract<Acceptance, { accepted: true }> | null>(null);
+  // The command result shows at once. The thread record keeps it for the next time the tab opens.
+  const last = accepted ?? thread?.lastAcceptance ?? null;
+
+  async function accept(event: FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setRefusal(null);
+    try {
+      const answer = await acceptChanges(source, { taskId, branch: branch.trim() });
+      if (answer.accepted) setAccepted(answer);
+      else setRefusal(refusals[answer.reason] ?? answer.next ?? 'The changes were not accepted.');
+    } catch (failure) {
+      setRefusal(failure instanceof Error ? failure.message : 'The changes were not accepted.');
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <form className="th-changes" onSubmit={(event) => void accept(event)}>
+      <label>
+        New local branch
+        <input
+          value={branch}
+          spellCheck={false}
+          autoComplete="off"
+          onChange={(event) => setBranch(event.target.value)}
+        />
+      </label>
+      <button
+        type="submit"
+        className="th-button"
+        disabled={busy || empty || Boolean(thread?.activeTurnId) || !branch.trim()}
+      >
+        Accept to branch
+      </button>
+      {refusal && (
+        <p className="th-error" role="alert">
+          {refusal}
+        </p>
+      )}
+      {last && (
+        <>
+          <p className="th-muted" role="status">
+            On branch {last.branch}
+            {last.commit && ` (${last.commit.slice(0, 7)})`}
+          </p>
+          <CodeBlock lang="sh" text={`git switch ${last.branch}`} />
+        </>
+      )}
+    </form>
+  );
+}
 
 export function ChangesPanel({
   source,
   taskId,
+  title,
+  thread,
   refreshKey,
   focusPath,
 }: {
   source: ThreadSource;
   taskId: string;
+  title: string;
+  thread: ChatThread | null;
   refreshKey: number;
   focusPath: string | null;
 }) {
@@ -53,14 +152,27 @@ export function ChangesPanel({
   if (!data) return <p className="th-muted">Reading changes.</p>;
   const additions = data.files.reduce((sum, file) => sum + file.additions, 0);
   const deletions = data.files.reduce((sum, file) => sum + file.deletions, 0);
+  const accept = (
+    <AcceptControl
+      source={source}
+      taskId={taskId}
+      title={title}
+      thread={thread}
+      empty={data.files.length === 0}
+    />
+  );
   if (data.files.length === 0)
     return (
-      <p className="th-muted">
-        No edits yet. Changes made in the scratch copy appear here against the base commit.
-      </p>
+      <div className="th-changes">
+        {accept}
+        <p className="th-muted">
+          No edits yet. Changes made in the scratch copy appear here against the base commit.
+        </p>
+      </div>
     );
   return (
     <div className="th-changes">
+      {accept}
       <p className="th-muted">
         {data.files.length} {data.files.length === 1 ? 'file' : 'files'}{' '}
         <span className="is-add">+{additions}</span> <span className="is-del">-{deletions}</span>
