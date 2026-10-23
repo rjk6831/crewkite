@@ -119,7 +119,8 @@
 .st-code {
   margin: 0;
   padding: 8px 10px;
-  overflow-x: auto;
+  overflow: hidden;
+  white-space: pre-wrap;
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--background);

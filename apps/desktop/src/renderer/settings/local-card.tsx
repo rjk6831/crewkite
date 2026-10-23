@@ -7,7 +7,9 @@ const gib = (bytes: number | null | undefined) =>
   bytes === null || bytes === undefined ? 'Unknown' : `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
 
 // A small aside under the note, which already states the fact in words. The snippet is hidden from
-// assistive technology so it does not read out as a second statement.
+// assistive technology so it does not read out as a second statement. It wraps and never scrolls,
+// since Chromium makes a scrolling box a tab stop, and one inside aria-hidden is a stop with no
+// name.
 const allowanceSnippet = `function allowance(localAI) {
   try { return Roots.NoLimits(localAI).limit; } // null
   catch (limit) {
@@ -34,7 +36,7 @@ function Hardware({ header, connected }: { header: WorkspaceState; connected: bo
         the loaded model and free memory.
       </p>
       {connected && (
-        <pre className="st-code" aria-hidden="true">
+        <pre className="st-code" aria-hidden="true" tabIndex={-1}>
           <code>{allowanceSnippet}</code>
         </pre>
       )}
