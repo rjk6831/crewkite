@@ -26,7 +26,7 @@ The transport is the Anthropic client in print mode with stream-json in and out.
 
 The first turn learns the session ID from the client's init message. Later turns start with `--resume` and that ID. Under Ask each time the client runs in its default permission mode. Under Allow edits and Allow all it runs in accept-edits mode. Stop closes stdin, sends SIGINT, then SIGTERM, then SIGKILL. A rate-limit or usage-limit error ends the turn with its reset time when the client reports one.
 
-Set up first: install the Anthropic client and sign in with your own subscription. A signed-out client ends the turn with a failure that says to sign in. The [boundaries below](#boundaries-i-hold-for-every-route) apply: CrewKite collects no credentials and sets no API key. The composer lists the models the Anthropic profiles pin.
+Set up first: install the Anthropic client and sign in with your own subscription. A signed-out client ends the turn with a failure that says to sign in. The [boundaries below](#boundaries-i-hold-for-every-route) apply: CrewKite collects no credentials and sets no API key. The composer lists the four chat models the client offers on a subscription plan: `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5` and `claude-haiku-5-5`, each at default, low, medium, high or extra high effort. Default passes no effort flag and leaves the level to the client. The composer starts on the model the client named when it last read usage, if that is one of the four, and on `claude-sonnet-5-5` otherwise. The pinned profiles still decide whether Anthropic shows as connected.
 
 Live qualification pending.
 

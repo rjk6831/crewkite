@@ -111,6 +111,7 @@ export function settingsPreview(routes: Snapshot['routes'], now: string) {
             { windowId: 'weekly', remaining: { value: 30, unit: 'percent' }, resetsAt: at(120) },
           ],
           extraUsage: null,
+          model: null,
           modelTurns: 0,
           qualified: false,
         },

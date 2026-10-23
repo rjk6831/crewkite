@@ -916,6 +916,8 @@ export const AnthropicUsageReadingSchema = z.strictObject({
     )
     .max(64),
   extraUsage: z.strictObject({ is_enabled: z.boolean() }).nullable(),
+  // The model the client named in the init frame of the same read.
+  model: label.nullable(),
   modelTurns: z.literal(0),
   qualified: z.literal(false),
 });

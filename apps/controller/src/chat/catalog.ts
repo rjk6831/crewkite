@@ -7,6 +7,11 @@ import {
   type LocalSetup,
   type Observation,
 } from '@crewkite/contracts';
+import {
+  anthropicChatEfforts,
+  anthropicChatModels,
+  anthropicDefaultChatModel,
+} from '../providers/anthropic/chat.ts';
 import type { NativeProfileResolution } from '../providers/openai/profile.ts';
 import { deriveWindow } from '../usage/index.ts';
 
@@ -18,6 +23,8 @@ export type ChatCatalogInput = {
   profiles: readonly NativeProfileResolution['facts'][];
   /** The newest OpenAI model list observed with the client resolved now, or null. */
   openAiModels: readonly ObservedModel[] | null;
+  /** The model the Anthropic client named in its last usage read, or null. */
+  anthropicModel?: string | null;
   local: LocalSetup;
   windows: readonly { family: ChatFamily | undefined; observation: Observation }[];
   nowMs: number;
@@ -54,11 +61,20 @@ function openai(input: ChatCatalogInput): Entry {
 function anthropic(input: ChatCatalogInput): Entry {
   const profiles = input.profiles.filter((profile) => profile.family === 'anthropic');
   const ready = profiles.find((profile) => profile.available);
-  // Each profile pins one model. Together they are the fixed list this client offers.
-  const models = profiles.map((profile) =>
-    chatModel(profile.model, [profile.effort], profile.effort),
+  // The pinned profiles say whether the client is here. A chat turn can use every model the
+  // client offers, which is more than the profiles pin.
+  const models = profiles.length
+    ? anthropicChatModels.map((model) => chatModel(model, anthropicChatEfforts, 'default'))
+    : [];
+  const reported = anthropicChatModels.find((model) => model === input.anthropicModel);
+  return entry(
+    input,
+    'anthropic',
+    !!ready,
+    profiles[0]?.reason,
+    models,
+    reported ?? anthropicDefaultChatModel,
   );
-  return entry(input, 'anthropic', !!ready, profiles[0]?.reason, models, ready?.model);
 }
 
 function google(input: ChatCatalogInput): Entry {

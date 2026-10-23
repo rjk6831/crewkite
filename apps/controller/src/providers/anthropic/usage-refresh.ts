@@ -181,6 +181,16 @@ export class AnthropicUsageRefresh {
     });
   }
 
+  /** The model the client named in its last usage read, or null. The chat catalog starts there. */
+  clientModel(): string | null {
+    try {
+      return this.state()?.reading?.model ?? null;
+    } catch {
+      // A damaged record must not take the model picker down with it.
+      return null;
+    }
+  }
+
   blocker() {
     const state = this.state();
     return state?.state === 'unknown'

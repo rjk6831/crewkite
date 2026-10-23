@@ -249,6 +249,17 @@ function chatEnvironment(source: NodeJS.ProcessEnv, temporary: string): NodeJS.P
   };
 }
 
+// The chat models the client offers on a subscription plan, and the efforts chatArguments can
+// pass. Default passes no flag and leaves the level to the client.
+export const anthropicChatModels = [
+  'claude-fable-5-1',
+  'claude-opus-5-5',
+  'claude-sonnet-5-5',
+  'claude-haiku-5-5',
+] as const;
+export const anthropicDefaultChatModel = 'claude-sonnet-5-5';
+export const anthropicChatEfforts = ['default', 'low', 'medium', 'high', 'xhigh'] as const;
+
 function chatArguments(request: ChatTurnRequest, resume: string | null) {
   const { effort, model } = request.selection;
   return [

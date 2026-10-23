@@ -61,6 +61,7 @@ test('a usage read maps each reported limit and ignores what it does not show', 
     bytewise?: boolean;
     status?: string;
     windows?: unknown[];
+    model?: string | null;
     error?: UsageReaderError['reason'];
   }[] = [
     { name: 'full report', input: bytes([init, assistant, terminal]), windows: reported },
@@ -103,6 +104,12 @@ test('a usage read maps each reported limit and ignores what it does not show', 
       windows: reported,
     },
     {
+      name: 'init with a model it cannot read',
+      input: bytes([{ ...init, model: 7 }, assistant, terminal]),
+      windows: reported,
+      model: null,
+    },
+    {
       name: 'no rate limits',
       input: bytes([init, withLimits(null), terminal]),
       status: 'unavailable',
@@ -143,6 +150,7 @@ test('a usage read maps each reported limit and ignores what it does not show', 
     assert.equal(reading.status, row.status ?? 'reported', row.name);
     assert.deepEqual(reading.windows, row.windows, row.name);
     assert.deepEqual(reading.extraUsage, { is_enabled: false }, row.name);
+    assert.equal(reading.model, row.model === undefined ? 'claude-opus-5-5' : row.model, row.name);
     assert.equal(reading.observedAt, null, row.name);
     assert.equal(reading.freshness, 'unknown', row.name);
   }
@@ -519,6 +527,7 @@ test('manual usage consent and the age-unknown report survive exact retries and 
   assert.equal(retained?.reading?.freshness, 'unknown');
   assert.equal(retained?.reading?.receivedAt, at);
   assert.deepEqual(retained?.reading?.windows, reported);
+  assert.equal(f.controller.anthropicUsage().clientModel(), 'claude-opus-5-5');
   assert.equal(retained?.readingScopeHash, retained?.trust?.scopeHash);
   assert.equal((await f.controller.execute(request, 'local-owner')).outcome, 'already-applied');
   assert.equal(

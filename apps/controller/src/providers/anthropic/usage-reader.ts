@@ -117,6 +117,7 @@ export class AnthropicUsageReader {
       }
     | undefined;
   private ended = false;
+  private model: string | null = null;
 
   feed(chunk: Uint8Array) {
     if (this.failure) throw new UsageReaderError(this.failure);
@@ -142,7 +143,11 @@ export class AnthropicUsageReader {
     const head = frame.safeParse(value);
     if (!head.success) return;
     const fields = value as Record<string, unknown>;
-    if (head.data.type === 'assistant' && fields.usage_report != null) {
+    if (head.data.type === 'system' && fields.subtype === 'init') {
+      // The chat composer starts on this model. A value it cannot read leaves the default.
+      const model = name.safeParse(fields.model);
+      this.model = model.success ? model.data : null;
+    } else if (head.data.type === 'assistant' && fields.usage_report != null) {
       try {
         const parsed = report.parse(fields.usage_report).rate_limits;
         this.reading = {
@@ -174,6 +179,7 @@ export class AnthropicUsageReader {
       freshness: 'unknown' as const,
       windows: this.reading.windows ?? [],
       extraUsage: this.reading.extraUsage,
+      model: this.model,
       // The plan runs a local command with no tools and no prompt, so no model turn is asked for.
       modelTurns: 0 as const,
       qualified: false as const,

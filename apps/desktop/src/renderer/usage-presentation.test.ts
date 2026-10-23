@@ -175,6 +175,7 @@ test('native usage gauges show the remaining percent without inventing freshness
         resetsAt: DEMO_TIME,
       })),
       extraUsage: null,
+      model: null,
       modelTurns: 0 as const,
       qualified: false as const,
     },
