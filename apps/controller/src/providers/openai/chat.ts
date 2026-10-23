@@ -177,8 +177,8 @@ const DECISIONS = new Map([
   ['allow-thread', 'acceptForSession'],
   ['deny', 'decline'],
 ]);
-// Thread and account notices with nothing to show in a chat turn. Any other unknown method is
-// reported once per turn, so a client update shows up in the thread.
+// Thread, account and client housekeeping notices with nothing to show in a chat turn. Any other
+// unknown method is reported once per turn, so a client update shows up in the thread.
 const QUIET = new Set([
   'thread/started',
   'thread/status/changed',
@@ -189,8 +189,12 @@ const QUIET = new Set([
   'turn/diff/updated',
   'turn/plan/updated',
   'serverRequest/resolved',
+  'thread/compacted',
+  'item/commandExecution/terminalInteraction',
   'account/updated',
   'remoteControl/status/changed',
+  'mcpServer/startupStatus/updated',
+  'skills/changed',
 ]);
 const LIMIT_TEXT = /\busage limit/i;
 
@@ -720,8 +724,7 @@ class OpenAiChatTurn {
           this.think(value.itemId, '\n\n');
         return;
       }
-      case 'item/commandExecution/outputDelta':
-      case 'item/fileChange/outputDelta': {
+      case 'item/commandExecution/outputDelta': {
         const value = delta.safeParse(params).data;
         if (value) this.toolOutput(value.itemId, value.delta);
         return;

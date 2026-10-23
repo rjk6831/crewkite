@@ -117,6 +117,11 @@ const scripts = {
     ['item/agentMessage/delta', { ...ids(), itemId: 'message-1', delta: 'Partial' }],
   ],
   unknown: () => [
+    // Housekeeping notices the thread does not show.
+    ['mcpServer/startupStatus/updated', { name: 'fixture', status: 'starting', error: null }],
+    ['item/commandExecution/terminalInteraction', { ...ids(), itemId: 'command-1', processId: '1', stdin: '' }],
+    ['skills/changed', {}],
+    ['thread/compacted', ids()],
     ['fixture/newNotice', { ...ids(), value: 1 }],
     ['fixture/newNotice', { ...ids(), value: 2 }],
     ['item/completed', { ...ids(), item: message('message-1', 'Done.') }],
@@ -435,7 +440,7 @@ test('stop interrupts the native turn, waits for the client to confirm it and en
   }
 });
 
-test('an unknown notification is reported once and the turn still completes', async () => {
+test('only an unknown notification is reported, once, and the turn still completes', async () => {
   const run = turn('unknown');
   const result = await run.settled();
   assert.deepEqual(
