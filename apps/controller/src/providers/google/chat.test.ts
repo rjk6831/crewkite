@@ -420,6 +420,48 @@ test('a card closes on a completion under an unknown id or when the agent moves 
         'ok search-1: The result went back to the model.',
       ],
     },
+    {
+      // A usage update closes the read, the edit parks on a permission card, and the read's
+      // completion arrives late under a frame id with no title. It must not close the edit.
+      edit: (line) => {
+        const frame = JSON.parse(line);
+        const update = frame.params?.update;
+        const swap = (next: object) =>
+          JSON.stringify({ ...frame, params: { ...frame.params, update: next } });
+        if (update?.sessionUpdate === 'tool_call' && update.toolCallId === 'read-1')
+          return [line, swap({ sessionUpdate: 'usage_update', used: 20, size: 1024 })];
+        if (update?.sessionUpdate === 'tool_call' && update.toolCallId === 'edit-1')
+          return [
+            swap({
+              ...update,
+              content: [{ type: 'diff', path: 'net.mjs', oldText: 'a\n', newText: 'b\n' }],
+            }),
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: 'perm-9',
+              method: 'session/request_permission',
+              params: {
+                sessionId: frame.params.sessionId,
+                toolCall: { toolCallId: 'edit-1' },
+                options: [{ optionId: 'once', name: 'Once', kind: 'allow_once' }],
+              },
+            }),
+            swap({
+              sessionUpdate: 'tool_call_update',
+              toolCallId: 'frame-9',
+              status: 'completed',
+              content: [{ type: 'content', content: { type: 'text', text: 'export const' } }],
+            }),
+          ];
+        return update?.sessionUpdate === 'tool_call_update' ? [] : [line];
+      },
+      trail: [
+        'started read-1',
+        'ok read-1: The result went back to the model.',
+        'started edit-1',
+        'error edit-1: The turn ended before this tool reported a result.',
+      ],
+    },
   ];
   for (const row of rows) {
     const f = rig('chat-stream', rewrite(String(row.edit)));

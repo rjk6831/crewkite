@@ -695,20 +695,17 @@ export function googleChatAdapter(deps: {
       // This agent keys a call's terminal update by a frame id, which is the permission prompt's
       // id when the call went through one and the call id otherwise. When that id differs from
       // the announced one, the card spins until the turn ends. Two fallbacks close it. A terminal
-      // update with an unknown id and no title completes the newest open call, of the same kind
-      // when it names one, and never opens a card of its own. And once the agent moves on to
-      // another call, to its reply or to a usage update, a read, search or other call is done,
-      // since its result went back to the model. Edits and commands wait for a real status,
-      // because the person needs to know how they went. So does a call behind an open
-      // permission card.
+      // update with an unknown id and no title completes the newest open read, search or other
+      // call, or the newest open call of the kind it names, and never opens a card of its own.
+      // And once the agent moves on to another call, to its reply or to a usage update, a read,
+      // search or other call is done, since its result went back to the model. Edits and
+      // commands wait for a real status, because the person needs to know how they went. So does
+      // a call behind an open permission card, which no fallback closes.
+      const asking = (call: Call) =>
+        [...pending.values()].some((entry) => entry.callId === call.id);
       function settle(except?: string) {
         for (const call of calls.values())
-          if (
-            !call.done &&
-            call.id !== except &&
-            passiveKinds.has(call.kind) &&
-            ![...pending.values()].some((entry) => entry.callId === call.id)
-          )
+          if (!call.done && call.id !== except && passiveKinds.has(call.kind) && !asking(call))
             finish(call, 'ok', 'The result went back to the model.');
       }
       function tool(raw: Record<string, unknown>, announced: boolean) {
@@ -723,7 +720,12 @@ export function googleChatAdapter(deps: {
         if (!announced && ends && !calls.has(update.toolCallId) && !update.title?.trim()) {
           const kind = update.kind ? toolKind(update.kind) : null;
           const open = [...calls.values()]
-            .filter((call) => !call.done && (!kind || call.kind === kind))
+            .filter(
+              (call) =>
+                !call.done &&
+                !asking(call) &&
+                (kind ? call.kind === kind : passiveKinds.has(call.kind)),
+            )
             .at(-1);
           if (!open) return;
           update = { ...update, toolCallId: open.id };
