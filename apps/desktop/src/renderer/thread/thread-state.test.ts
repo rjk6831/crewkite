@@ -4,7 +4,14 @@
 // A thread read has no cursor of its own. Messages carry theirs and live events do not.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import type { AgentEvent, ChatFailure, ChatMessage } from '@crewkite/contracts';
+import type {
+  AgentEvent,
+  ChatFailure,
+  ChatMessage,
+  ChatThread,
+  ChatTurn,
+} from '@crewkite/contracts';
+import { limitOffer } from './handoff-offer.ts';
 import {
   initialThreadState,
   reduceThread,
@@ -133,4 +140,118 @@ test('a failed turn adds a system line with the cause and the next action', () =
   const line = items[0];
   assert.ok(line.kind === 'failure');
   assert.equal(line.failure.nextAction, 'Continue on another provider.');
+});
+
+test('the limit offer shows only while the newest turn is the one that hit a limit', () => {
+  const second = id('trn', 2);
+  const failure = (kind: ChatFailure['kind']): ChatFailure => ({
+    stage: 'stream',
+    kind,
+    message: 'The turn stopped.',
+    providerMessage: null,
+    method: null,
+    code: null,
+    resetsAt: null,
+    nextAction: 'Continue on another provider.',
+  });
+  const on = (turnId: string, cursor: number, event: Body): ThreadEvent => ({
+    type: 'agent.event',
+    cursor: String(cursor),
+    taskId: task,
+    payload: { ...event, turnId },
+  });
+  const begin = (turnId: string, cursor: number) =>
+    on(turnId, cursor, {
+      type: 'turn.started',
+      family: 'openai',
+      model: 'large-1',
+      effort: 'default',
+      role: 'assistant',
+    });
+  const end = (turnId: string, cursor: number, stopReason: 'limit' | 'error' | 'done') =>
+    on(turnId, cursor, {
+      type: 'turn.completed',
+      stopReason,
+      failure:
+        stopReason === 'done'
+          ? null
+          : failure(stopReason === 'limit' ? 'usage-limit' : 'client-exit'),
+    });
+  const offer = (events: ThreadEvent[], pending = false) => {
+    let state = reduceThread(initialThreadState(task), { type: 'events', events });
+    if (pending)
+      state = reduceThread(state, {
+        type: 'sending',
+        pending: { localId: 'local-1', text: 'Add the guard', attachments: [], at: stamp },
+      });
+    return limitOffer(state);
+  };
+  const stopped = [user(10, 'Add the guard'), begin(turn, 11), end(turn, 12, 'limit')];
+
+  assert.deepEqual(offer(stopped), {
+    turnId: turn,
+    family: 'openai',
+    text: 'Add the guard',
+    attachments: [],
+  });
+  // The message is on its way to another provider, so the choice is made.
+  assert.equal(offer(stopped, true), null);
+  // A newer turn that finished, or stopped for another reason, leaves nothing to offer.
+  const newer = (text: string, stopReason: 'limit' | 'error' | 'done') => [
+    ...stopped,
+    user(13, text),
+    begin(second, 14),
+    end(second, 15, stopReason),
+  ];
+  assert.equal(offer(newer('Add the guard', 'done')), null);
+  assert.equal(offer(newer('Try again', 'error')), null);
+  // A newer turn that also hit a limit moves the offer to it and to its own message.
+  const again = offer(newer('Try again', 'limit'));
+  assert.equal(again?.turnId, second);
+  assert.equal(again?.text, 'Try again');
+
+  // A reopened thread has the stored turns and no stream. The stored failure carries the cause.
+  const stored = (n: number, state: ChatTurn['state'], cause: ChatFailure['kind']): ChatTurn => ({
+    id: id('trn', n),
+    taskId: task,
+    sequence: n - 1,
+    role: 'assistant',
+    selection: { family: 'anthropic', model: 'large-2', effort: 'default' },
+    userMessageId: id('msg', 10 * n),
+    assistantMessageId: null,
+    state,
+    startedAt: stamp,
+    endedAt: stamp,
+    failure: state === 'failed' ? failure(cause) : null,
+    handoffFrom: null,
+  });
+  const thread: ChatThread = {
+    taskId: task,
+    scratchReady: false,
+    base: null,
+    selection: null,
+    permissionPolicy: 'ask',
+    sessions: [],
+    activeTurnId: null,
+    autoHandoff: false,
+  };
+  const reopened = (turns: ChatTurn[]) =>
+    limitOffer(
+      reduceThread(initialThreadState(task), {
+        type: 'loaded',
+        read: {
+          thread,
+          turns,
+          messages: [user(10, 'Add the guard'), user(20, 'Try again')].map(
+            (event) => event.payload as ChatMessage,
+          ),
+          liveEvents: [],
+        },
+      }),
+    );
+  const first = stored(1, 'failed', 'usage-limit');
+  assert.equal(reopened([first])?.family, 'anthropic');
+  assert.equal(reopened([first])?.text, 'Add the guard');
+  assert.equal(reopened([first, stored(2, 'done', 'usage-limit')]), null);
+  assert.equal(reopened([first, stored(2, 'failed', 'client-exit')]), null);
 });
