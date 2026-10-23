@@ -148,6 +148,9 @@ export function GoogleSetup({
         pollAbort.current?.abort();
         pollAbort.current = null;
         setRequested(null);
+        // The poll gives up after about 20 seconds, and a browser sign-in often takes longer.
+        // Once the flow ends, the slow-setup line no longer describes anything.
+        setPollTimedOut(false);
       }
     }
   }
@@ -259,7 +262,7 @@ export function GoogleSetup({
       </div>
       {requested && <p role="status">{stageLabels[requested]}…</p>}
       {ready && <p role="status">Google coding setup is ready.</p>}
-      {pollTimedOut && (
+      {pollTimedOut && !ready && (
         <p role="status">Taking longer than expected. Review status before retrying.</p>
       )}
       {installation?.reason && (
