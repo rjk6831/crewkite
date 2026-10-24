@@ -63,6 +63,7 @@ import {
 import { scratchChanges } from './changes.ts';
 import {
   adviceContext,
+  challengeContext,
   familyName,
   type HandoffReason,
   handoffPacket,
@@ -1074,7 +1075,7 @@ export class ChatService {
     }
   }
 
-  /** Reviewer and advisor turns get their own brief. Every other turn gets the project framing. */
+  /** Each read-only role gets its own brief. An assistant turn gets the project framing. */
   private context(
     role: ChatTurn['role'],
     name: string,
@@ -1083,12 +1084,9 @@ export class ChatService {
     base: string,
     history: readonly ChatHistoryEntry[],
   ): string {
-    if (role === 'advisor')
-      return adviceContext(
-        name,
-        directory,
-        history.findLast((entry) => entry.role === 'assistant')?.text ?? null,
-      );
+    const answer = history.findLast((entry) => entry.role === 'assistant')?.text ?? null;
+    if (role === 'advisor') return adviceContext(name, directory, answer);
+    if (role === 'challenger') return challengeContext(name, directory, answer);
     if (role !== 'reviewer') return systemContext(name, directory);
     let files: ChatChangesRead['files'] | null = null;
     try {

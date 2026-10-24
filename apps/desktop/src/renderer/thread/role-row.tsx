@@ -29,8 +29,9 @@ function roleDefault(
 }
 
 /**
- * The Review changes and Second opinion actions. `row` is the one-line picker under the text box
- * while an action is open. The model is picked for this one turn and the thread keeps its own.
+ * The Review changes, Second opinion and Challenge assumptions actions. `row` is the one-line
+ * picker under the text box while an action is open. The model is picked for this one turn and the
+ * thread keeps its own.
  */
 export function useRoleRun({
   source,
@@ -69,7 +70,7 @@ export function useRoleRun({
     if (!defaultSelection(catalog)) return 'No connected provider has allowance left.';
     if (action === 'reviewer' && !thread?.scratchReady)
       return 'There is no scratch copy to review yet.';
-    if (action === 'advisor' && !currentFamily) return 'There is no answer to look at yet.';
+    if (action !== 'reviewer' && !currentFamily) return 'There is no answer to look at yet.';
     return null;
   }
   function toggle(action: RoleAction) {

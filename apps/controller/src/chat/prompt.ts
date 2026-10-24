@@ -99,6 +99,25 @@ export function adviceContext(
   return [...lines, `The last answer:\n\n${text}`].join('\n');
 }
 
+/** Brief for a challenger turn: the assumptions the last answer rests on, and which may not hold. */
+export function challengeContext(
+  projectName: string,
+  directory: string,
+  answer: string | null,
+): string {
+  const lines = [
+    `You are challenging the last answer in a thread about the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
+    'Do not edit, create or delete files, and do not run commands. You may read and search files to check an assumption.',
+    'Name the assumptions the answer rests on, starting with the one that would change it most if it were wrong. For each, say whether it is verified, unverified or wrong, and what evidence would settle it. Keep it under 300 words.',
+  ];
+  if (answer === null) return [...lines, 'There is no earlier answer in this thread.'].join('\n');
+  const text =
+    answer.length > ADVICE_ANSWER_CHARACTERS
+      ? `${answer.slice(0, ADVICE_ANSWER_CHARACTERS).toWellFormed()} [trimmed]`
+      : answer;
+  return [...lines, `The last answer:\n\n${text}`].join('\n');
+}
+
 /**
  * The model works in the scratch copy, and the person reviews only what changes there. A path
  * under the project root, the way an editor or Finder copies it, means the same file in the
