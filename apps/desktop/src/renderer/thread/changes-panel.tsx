@@ -9,7 +9,6 @@ import {
   pushBranch,
   readBranchStatus,
   readChanges,
-  readThread,
   type ThreadSource,
 } from './commands.ts';
 import { CodeBlock } from './markdown.tsx';
@@ -262,15 +261,17 @@ function AcceptControl({
   title,
   thread,
   files,
+  lastReply,
 }: {
   source: ThreadSource;
   taskId: string;
   title: string;
   thread: ChatThread | null;
   files: Files;
+  lastReply: string | undefined;
 }) {
   const [branch, setBranch] = useState(() => branchName(title, taskId));
-  const [message, setMessage] = useState(() => suggestedMessage(title, undefined));
+  const [message, setMessage] = useState(() => suggestedMessage(title, lastReply));
   const edited = useRef(false);
   const [busy, setBusy] = useState(false);
   const [refusal, setRefusal] = useState<string | null>(null);
@@ -280,20 +281,11 @@ function AcceptControl({
   const diff = acceptedDiffs.get(taskId);
   const done = Boolean(last && diff?.branch === last.branch && sameFiles(diff.files, files));
 
-  // The suggestion waits for the thread's messages. Once the person types, it stays theirs.
+  // The suggestion follows the last reply that wrote the copy. Once the person types, it stays
+  // theirs.
   useEffect(() => {
-    let active = true;
-    readThread(source, taskId).then(
-      (read) => {
-        const reply = read.messages.findLast(({ author }) => author.kind === 'assistant');
-        if (active && !edited.current) setMessage(suggestedMessage(title, reply?.text));
-      },
-      () => {},
-    );
-    return () => {
-      active = false;
-    };
-  }, [source, taskId, title]);
+    if (!edited.current) setMessage(suggestedMessage(title, lastReply));
+  }, [title, lastReply]);
 
   async function accept(event: FormEvent) {
     event.preventDefault();
@@ -382,6 +374,7 @@ export function ChangesPanel({
   thread,
   refreshKey,
   focusPath,
+  lastReply,
 }: {
   source: ThreadSource;
   taskId: string;
@@ -389,6 +382,8 @@ export function ChangesPanel({
   thread: ChatThread | null;
   refreshKey: number;
   focusPath: string | null;
+  /** The text of the last builder or fixer reply, for the commit message suggestion. */
+  lastReply: string | undefined;
 }) {
   const [data, setData] = useState<ChatChangesRead | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -435,6 +430,7 @@ export function ChangesPanel({
       title={title}
       thread={thread}
       files={data.files}
+      lastReply={lastReply}
     />
   );
   if (data.files.length === 0)

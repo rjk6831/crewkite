@@ -9,6 +9,7 @@ import {
   type ChatThread,
   type ChatTurn,
   type WorkspaceState,
+  writesScratch,
 } from '@crewkite/contracts';
 import { ArrowRightLeft, RefreshCw, X } from 'lucide-react';
 import {
@@ -362,9 +363,9 @@ function AutoHandoff({
   );
 }
 
-// The turns and messages come from the thread view's own state, which a failed reload leaves as it
-// was and the stream keeps current. The tab used to read the whole thread again on every turn start
-// and end, and a read that timed out behind other controller reads emptied the list.
+// The turns and messages come from the thread view's own state, which the stream keeps current and
+// a failed reload leaves as it was. A read of its own would queue behind other controller reads,
+// and one that timed out would empty the list.
 function ThreadTab({
   taskId,
   thread,
@@ -700,6 +701,11 @@ export function Inspector({
             thread={thread}
             refreshKey={changesKey}
             focusPath={focusPath}
+            lastReply={
+              messages.findLast(
+                ({ author }) => author.kind === 'assistant' && writesScratch(author.role),
+              )?.text
+            }
           />
         )}
         {tab === 'usage' && <UsageTab source={source} header={header} preview={preview} />}
