@@ -19,7 +19,7 @@ import {
   resolveAnthropicNativeProfile,
 } from './providers/anthropic/profile.ts';
 import { resolveGoogleNativeProfile } from './providers/google/profile.ts';
-import { gpuFacts } from './providers/local/hardware.ts';
+import { startGpuProbe } from './providers/local/hardware.ts';
 import { resolveNativeProfile, resolveRepositoryProfile } from './providers/openai/profile.ts';
 import { serve } from './server/index.ts';
 
@@ -147,7 +147,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   try {
     // The GPU report takes a moment, so it starts with the process and the first workspace read
     // after it lands carries the core count.
-    gpuFacts();
+    startGpuProbe();
     const runtime = await startController({ home, identity: () => configuredIdentity(home) });
     console.log(`Controller ready at ${runtime.socketPath}`);
     let closing = false;

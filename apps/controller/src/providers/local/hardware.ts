@@ -94,16 +94,19 @@ export async function probeGpu(
 let probing = false;
 let facts: GpuFacts | null | undefined;
 
+/** Starts the probe once. The controller process calls it at launch; tests never do. */
+export function startGpuProbe() {
+  if (probing) return;
+  probing = true;
+  void probeGpu().then((value) => {
+    facts = value;
+  });
+}
+
 /**
- * The cached probe result. The first call starts the probe, so a read before it lands gets
- * undefined and the caller leaves the GPU fields out until the next read.
+ * The cached probe result. Undefined until the launch probe has answered, and always in a
+ * process that never started it, so the caller leaves the GPU fields out.
  */
 export function gpuFacts(): GpuFacts | null | undefined {
-  if (!probing) {
-    probing = true;
-    void probeGpu().then((value) => {
-      facts = value;
-    });
-  }
   return facts;
 }
