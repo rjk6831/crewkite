@@ -1245,27 +1245,25 @@
 }
 /* Local has no allowance to spend, so its bar is always full, with the infinity mark on top. */
 .rail-usage-unlimited {
-  --rail-unlimited: #9a7fe0;
   position: relative;
   display: grid;
   place-items: center;
   height: 12px;
 }
-:root[data-theme="light"] .rail-usage-unlimited {
-  --rail-unlimited: #6c4ea5;
-}
+/* The bar is the Local panel of the kite, gold, like the mark beside it. The glyph takes the
+   text tint so it reads in both themes. */
 .rail-usage-unlimited::before {
   content: "";
   position: absolute;
   inset: 4.5px 0;
   border-radius: 2px;
-  background: var(--rail-unlimited);
+  background: var(--family-local-fill);
 }
 .rail-usage-unlimited span {
   position: relative;
   padding: 0 4px;
   background: var(--sidebar);
-  color: var(--rail-unlimited);
+  color: var(--family-local);
   font-size: 13px;
   line-height: 12px;
 }
