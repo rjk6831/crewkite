@@ -1315,6 +1315,43 @@ test('send now and a policy change act on the running turn, and balanced answers
       policy: null,
       answered: false,
     },
+    // The shell joins quoted pieces and short flags carry their value, so each of these does
+    // more than read. An edit inside .git could make a later git command run code.
+    {
+      kind: 'command',
+      input: { command: "find . -del''ete" },
+      mode: 'balanced',
+      policy: null,
+      answered: false,
+    },
+    {
+      kind: 'command',
+      input: { command: 'rg "--pr"e sh notes.txt' },
+      mode: 'balanced',
+      policy: null,
+      answered: false,
+    },
+    {
+      kind: 'command',
+      input: { command: 'grep -f/etc/passwd x' },
+      mode: 'balanced',
+      policy: null,
+      answered: false,
+    },
+    {
+      kind: 'command',
+      input: { command: 'rg --hostname-bin=./x foo' },
+      mode: 'balanced',
+      policy: null,
+      answered: false,
+    },
+    {
+      kind: 'edit',
+      input: { path: '.git/config' },
+      mode: 'balanced',
+      policy: null,
+      answered: false,
+    },
   ] as const;
   for (const row of cases) {
     const adapter = editingAdapter([row.kind], row.input);

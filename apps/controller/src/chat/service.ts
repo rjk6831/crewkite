@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { uptime } from 'node:os';
-import { isAbsolute, join, resolve, sep } from 'node:path';
+import { join, resolve } from 'node:path';
 import {
   type AgentEvent,
   AgentEventSchema,
@@ -70,6 +70,7 @@ import {
   pushChatBranch,
   readChatBranchStatus,
 } from './git.ts';
+import { scratchPath } from './local-tools.ts';
 import {
   adviceContext,
   challengeContext,
@@ -213,10 +214,14 @@ type CrewStep = keyof typeof CREW_ROLES;
 // Commands balanced mode runs without asking. Each reads files and changes nothing.
 const READ_ONLY_COMMANDS = new Set(['ls', 'cat', 'head', 'tail', 'wc', 'rg', 'grep', 'find']);
 const READ_ONLY_GIT = new Set(['status', 'diff', 'log', 'show']);
-// find can run, delete or write through these. rg runs a preprocessor with --pre. git diff and
-// show write a file with --output and run configured programs with --ext-diff and --textconv.
+// find can run, delete or write through these. rg runs programs with --pre, --hostname-bin and
+// --search-zip. git diff and show write a file with --output and run configured programs with
+// --ext-diff and --textconv.
 const WRITING_FLAGS =
-  /^(-exec|-execdir|-ok|-okdir|-delete|-fprint0?|-fprintf|-fls|--pre|--output|--ext-diff|--textconv)(=|$)/;
+  /^(-exec|-execdir|-ok|-okdir|-delete|-fprint0?|-fprintf|-fls|--pre|--pre-glob|--hostname-bin|-z|--search-zip|--output|--ext-diff|--textconv)(=|$)/;
+// A word balanced mode answers for is plain: no quotes, globs, variables or escapes the shell
+// would rewrite before the program sees it.
+const PLAIN_WORD = /^[A-Za-z0-9._/=:,+@%-]+$/;
 
 const blocked = (reason: string, next?: string): CommandResult => ({
   outcome: 'blocked',
@@ -1965,10 +1970,19 @@ function statedFindings(text: string): number | null {
   return found;
 }
 
-const insideDirectory = (root: string, path: string) => {
-  const target = resolve(root, path);
-  return target === root || target.startsWith(`${root}${sep}`);
-};
+/**
+ * A path inside the scratch copy by the rules the Local tools use: no `..`, nothing in `.git`, and
+ * no link that leads out of the copy. The copy itself counts as inside.
+ */
+function inScratch(scratch: string, path: string): boolean {
+  if (resolve(path) === resolve(scratch) || path === '.') return true;
+  try {
+    scratchPath(scratch, path);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * True when the tool input names at least one file and every one is inside the scratch copy. An
@@ -1982,11 +1996,21 @@ function editsInside(input: unknown, scratch: string): boolean {
     if (typeof value === 'string') return [value];
     return Array.isArray(value) ? value : [];
   });
-  const root = resolve(scratch);
   return (
     paths.length > 0 &&
-    paths.every((path) => typeof path === 'string' && path !== '' && insideDirectory(root, path))
+    paths.every((path) => typeof path === 'string' && path !== '' && inScratch(scratch, path))
   );
+}
+
+/**
+ * Every spelling of a path an argument can carry: the word, each part around `=`, and the tail
+ * after a short flag written together with its value, such as `-f/etc/passwd`.
+ */
+function pathParts(word: string): string[] {
+  const parts = [word, ...word.split('=')];
+  const short = /^-([A-Za-z]+)(.+)$/.exec(word);
+  if (short) for (let at = 1; at <= short[1].length; at++) parts.push(word.slice(at + 1));
+  return parts.filter((part) => part !== '' && !part.startsWith('-'));
 }
 
 /**
@@ -1997,22 +2021,17 @@ function editsInside(input: unknown, scratch: string): boolean {
 function readOnlyCommand(input: unknown, scratch: string): boolean {
   if (!input || typeof input !== 'object') return false;
   const { command, cwd } = input as Record<string, unknown>;
-  if (typeof command !== 'string' || /[;&|<>`$(){}\\\n\r]/.test(command)) return false;
-  const root = resolve(scratch);
-  if (cwd != null && (typeof cwd !== 'string' || !insideDirectory(root, cwd))) return false;
-  const words = [...command.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map(
-    (match) => match[1] ?? match[2] ?? match[3],
-  );
+  if (typeof command !== 'string') return false;
+  if (cwd != null && (typeof cwd !== 'string' || !inScratch(scratch, cwd))) return false;
+  const words = command.trim().split(/[ \t]+/);
+  if (!words.every((word) => PLAIN_WORD.test(word))) return false;
   const [program, ...rest] = words;
-  if (!program) return false;
   if (program === 'git' ? !READ_ONLY_GIT.has(rest[0] ?? '') : !READ_ONLY_COMMANDS.has(program))
     return false;
   return rest.every(
     (word) =>
       !WRITING_FLAGS.test(word) &&
-      !isAbsolute(word) &&
-      !word.startsWith('~') &&
-      !word.split(/[/=]/).includes('..'),
+      pathParts(word).every((part) => !part.startsWith('~') && inScratch(scratch, part)),
   );
 }
 
