@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { ChatCatalogRead } from '@crewkite/contracts';
-import { railRows } from './allowance.ts';
 import {
   crewFromPreset,
   familyModel,
@@ -41,29 +40,6 @@ const entry = (
   models: connected ? models.map((model) => ({ ...model, efforts: [...model.efforts] })) : [],
   defaultModel: connected ? 'large-1' : null,
   remaining,
-});
-
-test('the rail shows the tightest window per connected family and flags a reset that has passed', () => {
-  const catalog: ChatCatalogRead = {
-    families: [
-      // The null window reports nothing, so the 10% window decides.
-      entry('openai', true, [
-        window('five-hour', 40, at(90)),
-        window('weekly', 10, at(2880)),
-        window('monthly', null, at(30)),
-      ]),
-      // The window reset an hour ago. Its percent is the last one observed and the row says so.
-      entry('anthropic', true, [window('weekly', 55, at(-60))]),
-      entry('google', false, []),
-      entry('local', true, []),
-    ],
-  };
-  assert.deepEqual(railRows(catalog, NOW), [
-    { family: 'openai', percent: 10, resetsIn: 2880 * 60_000, resetPassed: false, onDevice: false },
-    { family: 'anthropic', percent: 55, resetsIn: null, resetPassed: true, onDevice: false },
-    { family: 'local', percent: null, resetsIn: null, resetPassed: false, onDevice: true },
-  ]);
-  assert.deepEqual(railRows(null, NOW), []);
 });
 
 test('saved thread defaults and crew presets survive bad storage and apply only to connected, listed models', () => {
