@@ -308,14 +308,14 @@ test('the rail shows five-hour and weekly bars, one bar for a single window, and
     {
       claim: 'OpenAI primary is the five-hour bar and secondary the weekly bar',
       entry: entry('openai', [
-        window('codex:primary', 'five-hour', 12, 40),
-        window('codex:secondary', 'weekly', 70, 4000),
+        window('client:primary', 'five-hour', 12, 40),
+        window('client:secondary', 'weekly', 70, 4000),
       ]),
       expect: { bars: ['5 h 12%', 'week 70%'], resetsIn: 40 * 60_000, read: 'Read 2 min ago' },
     },
     {
       claim: 'a family with one window gets one bar, and an unconnected reader asks for Connect',
-      entry: entry('google', [window('gemini-daily', 'gemini-daily', 99, 600)], {
+      entry: entry('google', [window('pool-daily', 'pool-daily', 99, 600)], {
         connected: false,
         needsConnect: true,
         models: [],

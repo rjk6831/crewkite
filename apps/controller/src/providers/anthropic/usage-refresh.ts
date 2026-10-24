@@ -497,8 +497,9 @@ export class AnthropicUsageRefresh {
 
   /**
    * The gauge reads on its own when the controller starts, after each chat turn settles, since a
-   * turn spent some allowance, and every ten minutes while no Anthropic turn runs. It reads only when the client resolves, the last read is more
-   * than a minute old and no other read runs. Anything else skips it without a receipt.
+   * turn spent some allowance, and every ten minutes while no Anthropic turn runs. It reads only
+   * when the client resolves, the last read is more than a minute old and no other read runs.
+   * Anything else skips it without a receipt.
    */
   refreshWhenDue(key: string): Promise<unknown> | undefined {
     try {

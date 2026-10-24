@@ -126,8 +126,8 @@ function BranchStatus({
   );
 }
 
-// Every step here is the person's click. Push asks once more, because it is the first action that
-// sends anything off this computer, and it runs with their own git credentials.
+// Every step here is the person's click. Push asks once more, because it publishes the branch to a
+// remote with their own git credentials.
 function GitSteps({
   source,
   taskId,
@@ -203,10 +203,7 @@ function GitSteps({
       {!pushed &&
         (confirming ? (
           <div>
-            <p>
-              Push {branch} to origin with your own git credentials? Nothing else leaves this
-              computer.
-            </p>
+            <p>Push {branch} to origin with your own git credentials?</p>
             <button type="button" className="th-button" disabled={busy} onClick={() => void push()}>
               Push
             </button>{' '}

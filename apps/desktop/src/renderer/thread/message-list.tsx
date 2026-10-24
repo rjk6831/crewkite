@@ -19,7 +19,7 @@ const roleLabels = {
 } as const;
 
 /**
- * `OpenAI · gpt-6.1-sol · Ultra`, after the family mark. A default effort is left out: the client
+ * `OpenAI · large-1 · Ultra`, after the family mark. A default effort is left out: the client
  * picked it and the label would say nothing.
  */
 export function modelLine(selection: {

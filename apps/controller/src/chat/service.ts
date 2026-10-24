@@ -1576,6 +1576,7 @@ export class ChatService {
       [stopped],
       undefined,
       this.thread(taskId).handoffMode,
+      Date.parse(this.deps.now()),
     );
     for (const entry of ranked) {
       if (!this.deps.adapters.has(entry.family)) continue;
