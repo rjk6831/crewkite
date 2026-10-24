@@ -231,8 +231,11 @@ export class ChatService {
     const free = !thread.activeTurnId && !left.length;
     if (free && !thread.queued.length) return this.begin(task, thread, payload, effects);
     if (free) {
+      // The oldest queued message goes first. One that cannot start any more, say on a family
+      // that is gone, blocks the queue until it is removed, so the person hears about that one.
       const started = this.startQueued(task, effects);
-      if (started.outcome !== 'applied') return started;
+      if (started.outcome !== 'applied')
+        return blocked('queue-blocked', 'Remove the first queued message, then send again.');
     }
     return this.enqueue(task, payload);
   }
@@ -1048,10 +1051,12 @@ export class ChatService {
   }
 
   /**
-   * Start the next queued message once the thread is free. A usage limit on the newest turn holds
-   * the queue, since the next message would stop on the same limit. Continuing from the card reruns
-   * the stopped message and the queue moves once that turn settles. A new send starts the oldest
-   * queued message right away. A leftover process holds the queue until a later check finds it gone.
+   * Start the next queued message once the thread is free. A failed newest turn holds the queue:
+   * on a usage limit the next message would stop on the same limit, and after a sign-out or a
+   * launch failure eight queued messages would be eight failures. Continuing from the card reruns
+   * the stopped message and the queue moves once that turn settles, and a new send starts the
+   * oldest queued message right away. A leftover process holds the queue until a later check
+   * finds it gone.
    */
   private continueQueue(taskId: string) {
     const effects: Effects = [];
@@ -1062,16 +1067,16 @@ export class ChatService {
         if (!task || !thread.queued.length || thread.activeTurnId || thread.ownershipUnknown)
           return;
         const newest = this.newestTurn(taskId);
-        if (newest && endedOnLimit(newest)) return;
+        if (newest && (newest.state === 'failed' || endedOnLimit(newest))) return;
         const started = this.startQueued(task, effects);
         if (started.outcome !== 'applied')
           this.appendEntry(task, {
             kind: 'chat-system',
             author: { kind: 'system', turnId: null },
             text: [
-              'The next queued message did not start.',
+              'The first queued message did not start.',
               started.next,
-              'It starts when you send another message.',
+              'Remove it to let the next one go.',
             ]
               .filter(Boolean)
               .join(' '),
@@ -1153,7 +1158,13 @@ export class ChatService {
    * family that stopped and any family at zero never qualify.
    */
   private nextFamily(taskId: string, stopped: ChatFamily): ChatModelSelection | null {
-    for (const entry of rankFamilies(this.deps.catalog(taskId).families, [stopped])) {
+    const ranked = rankFamilies(
+      this.deps.catalog(taskId).families,
+      [stopped],
+      undefined,
+      this.thread(taskId).handoffMode,
+    );
+    for (const entry of ranked) {
       if (!this.deps.adapters.has(entry.family)) continue;
       const model = entry.defaultModel ?? entry.models[0]?.model;
       if (!model) continue;

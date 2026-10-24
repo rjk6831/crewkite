@@ -13,6 +13,7 @@ import type {
   AgentEvent,
   ChatCatalogRead,
   ChatFamily,
+  ChatHandoffMode,
   ChatModelSelection,
   ChatThread,
   ChatThreadRead,
@@ -516,7 +517,7 @@ test('a message sent during a turn waits and starts when the turn ends', {
 
     const idle = settles(thread);
     const effects: (() => void)[] = [];
-    store.transaction(() =>
+    const ended = store.transaction(() =>
       row.end === 'stop'
         ? service.stopTurn({ taskId, turnId }, effects)
         : service.resolvePermission(
@@ -524,6 +525,13 @@ test('a message sent during a turn waits and starts when the turn ends', {
             effects,
           ),
     );
+    // Stop hands the cleared messages back, so the composer can offer the text again.
+    if (row.end === 'stop')
+      assert.deepEqual(
+        ended.data?.kind === 'chat-queue' ? ended.data.messages.map((m) => m.text) : null,
+        row.send.slice(0, 8),
+        row.name,
+      );
     for (const effect of effects) effect();
     await idle;
 
@@ -601,7 +609,10 @@ test('a thread read returns messages in cursor order and the live events of the 
 });
 
 // A limit stop needs a second connected family, so these tests bring a catalog of their own.
-function limitThread(t: TestContext, options: { autoHandoff: boolean; resetsAt: string | null }) {
+function limitThread(
+  t: TestContext,
+  options: { autoHandoff: boolean; resetsAt: string | null; handoffMode?: ChatHandoffMode },
+) {
   const limit = chatFailure({
     stage: 'stream',
     kind: 'usage-limit',
@@ -655,7 +666,13 @@ function limitThread(t: TestContext, options: { autoHandoff: boolean; resetsAt: 
     onTurnSettled: (family, taskId) => settled.push([family, taskId]),
   });
   const { store, service, taskId } = thread;
-  store.transaction(() => service.configure({ taskId, autoHandoff: options.autoHandoff }));
+  store.transaction(() =>
+    service.configure({
+      taskId,
+      autoHandoff: options.autoHandoff,
+      ...(options.handoffMode ? { handoffMode: options.handoffMode } : {}),
+    }),
+  );
   return { ...thread, adapters, limit, settled };
 }
 
@@ -718,9 +735,28 @@ test('a usage limit writes a system line, and auto handoff runs the same message
   for (const family of ['anthropic', 'local'] as const)
     assert.equal(on.adapters.get(family)?.requests.length, 0);
 
+  // Under resets-first, Local's allowance goes before Google's: it resets in an hour.
+  const soonest = limitThread(t, {
+    autoHandoff: true,
+    resetsAt: null,
+    handoffMode: 'resets-first',
+  });
+  const moved = settles(soonest);
+  soonest.send('Fix the rounding.');
+  await moved;
+  assert.deepEqual(
+    soonest.read().turns.map((turn) => [turn.selection.family, turn.handoffFrom]),
+    [
+      ['openai', null],
+      ['local', 'openai'],
+    ],
+  );
+
   const off = limitThread(t, { autoHandoff: false, resetsAt: null });
   const stopped = turnReaches(off, 'failed');
   off.send('Fix the rounding.');
+  // Queued during the turn. With no move it would stop on the same limit, so it waits.
+  off.send('Then the totals.');
   await stopped;
 
   const kept = off.read();
@@ -735,6 +771,13 @@ test('a usage limit writes a system line, and auto handoff runs the same message
   assert.equal(kept.turns.length, 1);
   assert.equal(kept.thread.selection?.family, 'openai');
   assert.equal(kept.thread.activeTurnId, null);
+  assert.deepEqual(
+    kept.thread.queued.map((message) => message.text),
+    ['Then the totals.'],
+  );
+  off.store.transaction(() =>
+    off.service.configure({ taskId: off.taskId, dequeue: kept.thread.queued[0].id }),
+  );
 
   // A family picked in the composer starts cold, so it gets the packet too.
   const picked = { family: 'google', model: 'google-model', effort: 'default' } as const;

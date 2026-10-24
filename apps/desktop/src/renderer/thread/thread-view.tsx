@@ -106,6 +106,9 @@ export function ThreadView({
     const result = await stopTurn(source, { taskId: task.id, turnId: activeTurn });
     const cleared = result.data?.kind === 'chat-queue' ? result.data.messages : [];
     if (cleared.length) composer.current?.restore(cleared.map((item) => item.text).join('\n\n'));
+    // The text comes back as plain messages. A queued action or attachment has to be chosen again.
+    if (cleared.some((item) => item.role !== 'assistant' || item.attachments.length))
+      setNotice('The queued text is back in the composer. Pick the action or attachments again.');
   }, [source, task.id, activeTurn]);
   const dequeue = useCallback(
     (id: string) =>
