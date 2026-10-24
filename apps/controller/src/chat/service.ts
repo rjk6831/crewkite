@@ -1,12 +1,13 @@
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { uptime } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join, resolve, sep } from 'node:path';
 import {
   type AgentEvent,
   AgentEventSchema,
   type ChatCatalogRead,
   ChatCatalogReadSchema,
   type ChatChangesRead,
+  type ChatCrewChain,
   type ChatFailure,
   ChatFailureSchema,
   type ChatFamily,
@@ -14,6 +15,7 @@ import {
   type ChatMessage,
   type ChatModelSelection,
   type ChatPermissionOption,
+  type ChatPermissionPolicy,
   type ChatQueuedMessage,
   type ChatSession,
   ChatSessionSchema,
@@ -30,11 +32,11 @@ import {
   ConversationEntrySchema,
   canonicalJson,
   type Event,
-  HandoffChatThreadPayloadSchema,
   MAX_CHAT_ENTRY_BYTES,
   type Project,
   rankFamilies,
   type Task,
+  writesScratch,
 } from '@crewkite/contracts';
 import { z } from 'zod';
 import type { ArtifactFiles } from '../artifacts/index.ts';
@@ -72,6 +74,7 @@ import {
   adviceContext,
   challengeContext,
   familyName,
+  fixerBrief,
   type HandoffReason,
   handoffPacket,
   handoffReason,
@@ -143,9 +146,18 @@ type LiveTurn = {
   /** Streamed text by item, kept so a stop or crash keeps what the person already saw. */
   items: Map<string, string>;
   /** Open permission requests: the options each one accepts and the tool call it is about. */
-  permissions: Map<string, { options: readonly ChatPermissionOption[]; callId: string | null }>;
+  permissions: Map<
+    string,
+    { options: readonly ChatPermissionOption[]; callId: string | null; question: string }
+  >;
   /** Tool kind by call ID. A thread grant covers a kind, and only the tool event names it. */
   kinds: Map<string, ChatToolKind>;
+  /** Title and input by call ID, so CrewKite can tell where an edit lands and what a command runs. */
+  calls: Map<string, { title: string; input: unknown }>;
+  /** The policy the adapter launched with. It answers what that policy covers on its own. */
+  policy: ChatPermissionPolicy;
+  /** Send now stopped this turn. Its queued message starts next with the stopped turn's packet. */
+  steered: boolean;
   noticed: boolean;
   /** Adapters differ on whether they announce the turn edges. The service owns both. */
   started: boolean;
@@ -161,7 +173,8 @@ type LiveTurn = {
 
 const HandoffSchema = z.strictObject({
   from: ChatFamilySchema,
-  reason: HandoffChatThreadPayloadSchema.shape.reason,
+  // steer: Send now stopped the last reply, so the next message carries what it left behind.
+  reason: z.enum(['manual', 'limit', 'steer']),
 });
 type Handoff = z.infer<typeof HandoffSchema>;
 
@@ -186,6 +199,20 @@ const CUT_MARKER_BYTES = 32;
 // The thread record holds at most eight queued messages, in a quarter of a 1 MiB frame.
 const QUEUE_LIMIT = 8;
 const QUEUE_BYTES = 256 * 1024;
+// The crew chain: each step is an ordinary turn on the text the matching action in the thread
+// sends. A review names its findings, a fixer runs on them, and two fix rounds is the most.
+const CREW_REVIEW = 'Review the current changes.';
+const CREW_CHALLENGE = 'Challenge the assumptions behind the last answer.';
+const MAX_FIXES = 2;
+const CREW_ROLES = { review: 'reviewer', fix: 'fixer', challenge: 'challenger' } as const;
+type CrewStep = keyof typeof CREW_ROLES;
+// Commands balanced mode runs without asking. Each reads files and changes nothing.
+const READ_ONLY_COMMANDS = new Set(['ls', 'cat', 'head', 'tail', 'wc', 'rg', 'grep', 'find']);
+const READ_ONLY_GIT = new Set(['status', 'diff', 'log', 'show']);
+// find can run, delete or write through these. rg runs a preprocessor with --pre. git diff and
+// show write a file with --output and run configured programs with --ext-diff and --textconv.
+const WRITING_FLAGS =
+  /^(-exec|-execdir|-ok|-okdir|-delete|-fprint0?|-fprintf|-fls|--pre|--output|--ext-diff|--textconv)(=|$)/;
 
 const blocked = (reason: string, next?: string): CommandResult => ({
   outcome: 'blocked',
@@ -258,7 +285,7 @@ export class ChatService {
     // turns. A request with no known kind, or one filed under other, could be anything, so the
     // answer stays with this turn. So does one given to a reviewer or advisor, which never edits.
     const kind = live.kinds.get(open.callId ?? '');
-    if (option.kind === 'allow-thread' && kind && kind !== 'other' && live.role === 'assistant')
+    if (option.kind === 'allow-thread' && kind && kind !== 'other' && writesScratch(live.role))
       this.grant(payload.taskId, kind);
     effects.push(() =>
       this.call(() => live.handle?.respondPermission(payload.requestId, payload.choice)),
@@ -279,7 +306,13 @@ export class ChatService {
     return { outcome: 'applied', data: { kind: 'chat-queue', messages: thread.queued } };
   }
 
-  configure(payload: Payload<'ConfigureChatThread'>): CommandResult {
+  /**
+   * A new policy also answers the open asks of the running turn that it covers. The answers go
+   * out after commit, through `effects` when the caller passes them, otherwise on the microtask
+   * after the command's synchronous transaction. Either way they read the committed thread, so a
+   * rolled back command answers nothing.
+   */
+  configure(payload: Payload<'ConfigureChatThread'>, effects?: Effects): CommandResult {
     const task = this.task(payload.taskId);
     if (!task) return blocked('task-not-found');
     const thread = this.thread(task.id);
@@ -290,6 +323,14 @@ export class ChatService {
       return blocked('selection-unavailable', 'Pick a model the provider lists.');
     if (payload.dequeue && !thread.queued.some((message) => message.id === payload.dequeue))
       return blocked('message-not-queued', 'It is no longer queued. If it started, Stop ends it.');
+    // A thread with no crew is manual.
+    const crew = payload.crew === undefined ? thread.crew : payload.crew;
+    if (!crew && payload.flightMode && payload.flightMode !== 'manual')
+      return blocked('crew-missing', 'Pick a crew, then choose a flight mode.');
+    const flightMode = crew ? (payload.flightMode ?? thread.flightMode) : 'manual';
+    // Entering glide turns automatic handoff on, so a limit moves the step on. The person can turn
+    // it off afterwards, and then glide stops on a limit like the other modes.
+    const entersGlide = flightMode === 'glide' && thread.flightMode !== 'glide';
     this.putThread(task, {
       ...thread,
       queued: thread.queued.filter((message) => message.id !== payload.dequeue),
@@ -297,10 +338,30 @@ export class ChatService {
       permissionPolicy: payload.permissionPolicy ?? thread.permissionPolicy,
       // Choosing ask again takes back everything the thread allowed.
       ...(payload.permissionPolicy === 'ask' ? { permissionGrants: [] } : {}),
-      autoHandoff: payload.autoHandoff ?? thread.autoHandoff,
+      autoHandoff: entersGlide ? true : (payload.autoHandoff ?? thread.autoHandoff),
       handoffMode: payload.handoffMode ?? thread.handoffMode,
+      crew,
+      flightMode,
     });
+    if (payload.permissionPolicy && thread.activeTurnId) {
+      const answer = () => this.answerCovered(task.id);
+      if (effects) effects.push(answer);
+      else queueMicrotask(answer);
+    }
     return { outcome: 'applied' };
+  }
+
+  /** Answer every open ask of the running turn that the thread now covers. */
+  private answerCovered(taskId: string) {
+    const thread = this.thread(taskId);
+    const live = thread.activeTurnId ? this.activeLive(taskId, thread.activeTurnId) : undefined;
+    if (!live) return;
+    for (const requestId of [...live.permissions.keys()]) {
+      const choice = this.covered(thread, live, requestId);
+      if (!choice) continue;
+      live.permissions.delete(requestId);
+      this.call(() => live.handle?.respondPermission(requestId, choice));
+    }
   }
 
   /**
@@ -434,8 +495,24 @@ export class ChatService {
    * Stop the running turn and start a queued message as soon as the provider lets go, with the
    * stopped turn's packet, the same path a limit stop takes.
    */
-  steer(_payload: Payload<'SteerChatMessage'>, _effects: Effects): CommandResult {
-    return blocked('steer-unavailable', 'Stop the reply, then send the message.');
+  steer(payload: Payload<'SteerChatMessage'>, effects: Effects): CommandResult {
+    const task = this.task(payload.taskId);
+    if (!task) return blocked('task-not-found');
+    const thread = this.thread(task.id);
+    const live = thread.activeTurnId ? this.activeLive(task.id, thread.activeTurnId) : undefined;
+    if (!live) return blocked('nothing-running', 'Nothing is running. Send the message.');
+    const message = thread.queued.find((entry) => entry.id === payload.messageId);
+    if (!message)
+      return blocked('message-not-queued', 'It is no longer queued. If it started, Stop ends it.');
+    // Stop keeps the queue here. Once the provider lets go the queue starts its first message.
+    live.stopRequested = true;
+    live.steered = true;
+    this.putThread(task, {
+      ...thread,
+      queued: [message, ...thread.queued.filter((entry) => entry.id !== message.id)],
+    });
+    effects.push(() => this.call(() => live.handle?.stop()));
+    return { outcome: 'applied' };
   }
 
   pushBranch(payload: Payload<'PushChatBranch'>): Promise<CommandResult> {
@@ -536,7 +613,12 @@ export class ChatService {
     const waiting = this.deps.store.db
       .prepare("SELECT task_id FROM chat_threads WHERE json_array_length(body,'$.queued')>0")
       .all() as { task_id: string }[];
-    if (!rows.length && !flagged.length && !waiting.length) return;
+    const chains = this.deps.store.db
+      .prepare(
+        "SELECT task_id FROM chat_threads WHERE json_extract(body,'$.crewChain.step') IN ('review','fix','challenge')",
+      )
+      .all() as { task_id: string }[];
+    if (!rows.length && !flagged.length && !waiting.length && !chains.length) return;
     this.deps.store.transaction(() => {
       for (const row of rows) {
         const turn = this.turn(row.id);
@@ -560,6 +642,14 @@ export class ChatService {
       for (const taskId of new Set([...rows, ...flagged].map((row) => row.task_id))) {
         const task = this.task(taskId);
         if (task) this.release(task);
+      }
+      // The step turn failed above, so the chain stops where it was. Nothing relaunches on its own.
+      for (const row of chains) {
+        const task = this.task(row.task_id);
+        const thread = this.thread(row.task_id);
+        const open = thread.activeTurnId ? this.turn(thread.activeTurnId) : undefined;
+        if (task && thread.crewChain && !(open && OPEN_STATES.has(open.state)))
+          this.stopCrew(task, thread, thread.crewChain, 'CrewKite restarted');
       }
     });
     for (const row of waiting) this.continueQueue(row.task_id);
@@ -635,6 +725,9 @@ export class ChatService {
       items: new Map(),
       permissions: new Map(),
       kinds: new Map(),
+      calls: new Map(),
+      policy: 'ask',
+      steered: false,
       noticed: false,
       started: false,
       reported: 0,
@@ -710,6 +803,7 @@ export class ChatService {
     if (!adapter) throw Error('No adapter is registered for this provider.');
     if (this.closed || live.stopRequested) return stoppedResult;
     const request = this.request(turn);
+    live.policy = request.permissionPolicy;
     // The first turn copies the project, which takes time. Stop may have arrived meanwhile.
     if (this.closed || live.stopRequested) return stoppedResult;
     this.record(turn, live, {
@@ -759,6 +853,10 @@ export class ChatService {
     const work = join(this.deps.home, 'chat', task.id, 'turns', turn.id);
     mkdirSync(work, { recursive: true, mode: 0o700 });
     const handoff = turn.handoffFrom ? this.takeHandoff(task) : null;
+    const writer = writesScratch(turn.role);
+    // Balanced mode answers the safe asks itself, so the adapter sends every ask here whatever
+    // the thread allows.
+    const balanced = writer && thread.flightMode === 'balanced';
     return {
       turnId: turn.id,
       taskId: task.id,
@@ -774,20 +872,19 @@ export class ChatService {
             prompt,
           })
         : prompt,
-      systemContext: this.context(turn.role, project.name, directory, root, thread.base, history),
+      systemContext: this.context(turn, project.name, directory, root, thread, history),
       // The packet carries the transcript, so a handoff turn sends no separate history.
       history: turn.handoffFrom ? [] : history,
       // A review or an opinion starts a fresh native session, so its brief always reaches the model.
-      session:
-        turn.role === 'assistant'
-          ? (thread.sessions.find((session) => session.family === turn.selection.family) ?? null)
-          : null,
+      session: writer
+        ? (thread.sessions.find((session) => session.family === turn.selection.family) ?? null)
+        : null,
       scratch: { directory, base: thread.base, projectName: project.name },
       work: { directory: work, home: this.deps.home },
-      permissionPolicy: turn.role === 'assistant' ? thread.permissionPolicy : 'ask',
+      permissionPolicy: writer && !balanced ? thread.permissionPolicy : 'ask',
       // A reviewer or advisor reads only, so what the thread allowed does not reach it.
-      permissionGrants: turn.role === 'assistant' ? (thread.permissionGrants ?? []) : [],
-      readOnly: turn.role !== 'assistant',
+      permissionGrants: writer && !balanced ? (thread.permissionGrants ?? []) : [],
+      readOnly: !writer,
       deadlineMs: TURN_DEADLINE_MS,
       environment: this.deps.resolveEnvironment(turn.selection.family),
       now: () => Date.parse(this.deps.now()),
@@ -829,9 +926,16 @@ export class ChatService {
     // The turn is complete when the service settles it, after its processes are proven gone.
     if (event.type === 'turn.completed' && !settling) return;
     addText(live.items, event);
-    if (event.type === 'tool.started') live.kinds.set(event.callId, event.kind);
+    if (event.type === 'tool.started') {
+      live.kinds.set(event.callId, event.kind);
+      live.calls.set(event.callId, { title: event.title, input: event.input });
+    }
     if (event.type === 'permission.requested')
-      live.permissions.set(event.requestId, { options: event.options, callId: event.callId });
+      live.permissions.set(event.requestId, {
+        options: event.options,
+        callId: event.callId,
+        question: event.question,
+      });
     if (event.type === 'permission.resolved') live.permissions.delete(event.requestId);
     try {
       this.deps.store.transaction(() => {
@@ -840,11 +944,64 @@ export class ChatService {
         if (event.type === 'permission.requested') this.setState(turn.id, 'waiting-permission');
         if (event.type === 'permission.resolved' && !live.permissions.size)
           this.setState(turn.id, 'running');
+        if (event.type === 'turn.stats') {
+          const row = this.turn(turn.id);
+          if (row && OPEN_STATES.has(row.state)) this.putTurn(task, { ...row, stats: event.stats });
+        }
         this.saveGroups(turn.id, live);
       });
     } catch {
       // An adapter never sees controller failures. The turn result still settles the row.
     }
+    // The thread is read at ask time, so a mode or policy changed during the turn applies to this
+    // ask. Adapters register an ask before they emit it, so this answer finds it.
+    if (event.type === 'permission.requested') {
+      const choice = this.covered(this.thread(turn.taskId), live, event.requestId);
+      if (choice) {
+        live.permissions.delete(event.requestId);
+        const respond = () =>
+          this.call(() => live.handle?.respondPermission(event.requestId, choice));
+        // An ask emitted before startTurn returned has no handle yet. It has one a tick later.
+        if (live.handle) respond();
+        else queueMicrotask(respond);
+      }
+    }
+  }
+
+  /**
+   * The allow option CrewKite picks for an open ask, or null when the person decides. Balanced
+   * answers edits inside the scratch copy and read-only commands, whatever the thread allows.
+   * Otherwise the adapter already applied the policy it launched with, so only a policy changed
+   * since then answers here: allow-edits covers edits inside the scratch copy, allow-all every
+   * ask with an allow option except an edit outside the copy. Network access and asks during
+   * read-only turns always go to the person.
+   */
+  private covered(thread: ChatThread, live: LiveTurn, requestId: string): string | null {
+    const open = live.permissions.get(requestId);
+    const allow =
+      open?.options.find((option) => option.kind === 'allow-once') ??
+      open?.options.find((option) => option.kind === 'allow-thread');
+    if (!open || !allow || !writesScratch(live.role)) return null;
+    const balanced = thread.flightMode === 'balanced';
+    const policy = thread.permissionPolicy;
+    if (!balanced && policy === live.policy) return null;
+    const call = live.calls.get(open.callId ?? '');
+    const kind = live.kinds.get(open.callId ?? '');
+    const words = `${open.question}\n${call?.title ?? ''}`;
+    if (/\bnetwork\b/i.test(words)) return null;
+    const scratch = this.scratchDirectory(live.taskId);
+    if (balanced) {
+      // shortcut: the event carries no change type, so a delete is known by its words.
+      // Upgrade: a delete flag on tool.started.
+      if (kind === 'edit')
+        return !/\b(delete|remove|rm)\b/i.test(words) && editsInside(call?.input, scratch)
+          ? allow.id
+          : null;
+      return kind === 'command' && readOnlyCommand(call?.input, scratch) ? allow.id : null;
+    }
+    if (kind === 'edit')
+      return policy !== 'ask' && editsInside(call?.input, scratch) ? allow.id : null;
+    return policy === 'allow-all' ? allow.id : null;
   }
 
   private finish(turnId: string, live: LiveTurn, result: ChatTurnResult, left: number[]) {
@@ -859,7 +1016,16 @@ export class ChatService {
     live.finished = true;
     this.live.delete(turnId);
     try {
-      this.deps.store.transaction(() => this.settle(turnId, ending(result, live.items, left)));
+      this.deps.store.transaction(() => {
+        const end = ending(result, live.items, left);
+        this.settle(turnId, end);
+        // Send now: the queued message picks up where this reply stopped, with its packet. A
+        // review or an opinion left nothing behind in the scratch copy to carry over.
+        const next = turn && this.thread(turn.taskId).queued[0];
+        const carries = live.steered && end.state !== 'done' && writesScratch(live.role);
+        if (turn && next && carries && writesScratch(next.role))
+          this.setHandoff(turn.taskId, { from: turn.selection.family, reason: 'steer' });
+      });
     } catch {
       // The row stays open. Startup recovery fails it with a visible reason.
       return;
@@ -872,6 +1038,7 @@ export class ChatService {
       }
     if (result.stopReason === 'limit' && !live.stopRequested && !this.closed)
       this.continueOnLimit(turnId);
+    if (turn && !this.closed) this.advanceCrew(turnId);
     // A handoff above opens the rerun first. The queue waits for that turn to settle.
     if (turn && !this.closed) this.continueQueue(turn.taskId);
   }
@@ -889,6 +1056,7 @@ export class ChatService {
             family: turn.selection.family,
             model: turn.selection.model,
             role: turn.role,
+            effort: turn.selection.effort,
           },
           text: fitText(end.text, 262_144),
         })
@@ -909,7 +1077,7 @@ export class ChatService {
     );
     const thread = this.thread(task.id);
     const session =
-      turn.role === 'assistant' && end.session?.family === turn.selection.family
+      writesScratch(turn.role) && end.session?.family === turn.selection.family
         ? end.session
         : null;
     this.putThread(task, {
@@ -953,11 +1121,16 @@ export class ChatService {
       const task = turn && this.task(turn.taskId);
       if (!turn || !task || turn.state !== 'failed') return;
       const thread = this.thread(task.id);
+      // A crew step reruns on its own and leaves the thread's pick alone. A fixer on the thread's
+      // family moves the thread like the builder would.
+      const own = writesScratch(turn.role) && thread.selection?.family === turn.selection.family;
+      const step = crewRole(thread) === turn.role && !own;
       // A person who already moved the thread has made the choice.
-      if (!thread.autoHandoff || thread.selection?.family !== turn.selection.family) return;
+      if (!thread.autoHandoff || (!step && thread.selection?.family !== turn.selection.family))
+        return;
       // One automatic move per message. The catalog can be stale, and a family it still shows
       // with allowance may stop on its limit too. A second move would bounce between them.
-      if (this.movedOnLimit(turn)) {
+      if (this.movedOnLimit(turn, step)) {
         this.deps.store.transaction(() =>
           this.appendEntry(task, {
             kind: 'chat-system',
@@ -971,6 +1144,7 @@ export class ChatService {
       if (!selection) return;
       const effects: Effects = [];
       this.deps.store.transaction(() => {
+        if (step) return this.rerunStep(task, turn, selection, effects);
         const moved = this.handoff({ taskId: task.id, selection, reason: 'limit' }, effects);
         if (moved.outcome !== 'applied' || effects.length === 0)
           throw Error('The thread could not move on.');
@@ -981,9 +1155,169 @@ export class ChatService {
     }
   }
 
-  /** True when this turn reran a message that an earlier turn left on a usage limit. */
-  private movedOnLimit(turn: ChatTurn): boolean {
-    if (!turn.handoffFrom) return false;
+  /** Run a crew step that stopped on a limit again on another family, on the same message. */
+  private rerunStep(task: Task, turn: ChatTurn, selection: ChatModelSelection, effects: Effects) {
+    const thread = this.thread(task.id);
+    if (thread.activeTurnId || !thread.base) throw Error('The step could not move on.');
+    // A fixer on another family starts cold, so it gets the packet with the limit as the reason.
+    if (writesScratch(turn.role))
+      this.setHandoff(task.id, { from: turn.selection.family, reason: 'limit' });
+    this.appendEntry(task, {
+      kind: 'chat-system',
+      author: { kind: 'system', turnId: null },
+      text: `Continued on ${familyName[selection.family]} from ${familyName[turn.selection.family]}. Reason: ${handoffReason('limit')}.`,
+    });
+    this.openTurn(
+      task,
+      thread,
+      { selection, role: turn.role, messageId: turn.userMessageId, base: thread.base },
+      effects,
+    );
+  }
+
+  /**
+   * Move the crew chain on after a turn settles. A done builder turn in balanced or glide starts
+   * it when the crew has a reviewer. A done step starts the next one. A message from the person,
+   * a stop, a failure or a limit nobody moved on ends it with one line that says why. A rerun on
+   * another family is already open when a limit moved the step, and the chain waits for it.
+   */
+  private advanceCrew(turnId: string) {
+    const effects: Effects = [];
+    try {
+      this.deps.store.transaction(() => {
+        const turn = this.turn(turnId);
+        const task = turn && this.task(turn.taskId);
+        if (!turn || !task) return;
+        const thread = this.thread(task.id);
+        // A builder turn always starts a fresh chain, so a chain left mid-step by a failed write
+        // never blocks the next one.
+        const chain = thread.crewChain;
+        if (!chain || turn.role !== crewRole(thread)) {
+          const reviewer = thread.crew?.members.some((member) => member.role === 'reviewer');
+          if (turn.role !== 'assistant' || turn.state !== 'done') return;
+          if (thread.flightMode === 'manual' || !reviewer || thread.activeTurnId) return;
+          const fresh = {
+            builderTurnId: turn.id,
+            step: 'review',
+            reviewRounds: 0,
+            fixes: 0,
+            reason: null,
+          } as const;
+          if (thread.queued.length)
+            return this.stopCrew(task, thread, fresh, 'you sent a new message');
+          return this.crewStep(task, thread, fresh, effects);
+        }
+        // A limit already opened the rerun on another family. Its own settle moves the chain on.
+        if (thread.activeTurnId) return;
+        if (thread.queued.length)
+          return this.stopCrew(task, thread, chain, 'you sent a new message');
+        if (turn.state === 'stopped')
+          return this.stopCrew(task, thread, chain, 'you stopped the reply');
+        if (endedOnLimit(turn))
+          return this.stopCrew(
+            task,
+            thread,
+            chain,
+            `${familyName[turn.selection.family]} reached its usage limit`,
+          );
+        if (turn.state !== 'done')
+          return this.stopCrew(task, thread, chain, `the ${chain.step} failed`);
+        if (thread.flightMode === 'manual')
+          return this.stopCrew(task, thread, chain, 'the thread is in manual mode');
+        if (chain.step === 'fix')
+          return this.crewStep(
+            task,
+            thread,
+            { ...chain, step: 'review', fixes: chain.fixes + 1 },
+            effects,
+          );
+        if (chain.step === 'challenge') return this.finishCrew(task, thread, chain);
+        const review = turn.assistantMessageId
+          ? this.findEntry(task.id, turn.assistantMessageId)?.text
+          : undefined;
+        const findings = review === undefined ? null : statedFindings(review);
+        const reviewed = { ...chain, reviewRounds: chain.reviewRounds + 1 };
+        if (findings === null)
+          return this.stopCrew(
+            task,
+            thread,
+            reviewed,
+            'the review did not state its findings',
+            'Ask for a fix or review again.',
+          );
+        if (findings > 0 && chain.fixes < MAX_FIXES && review)
+          return this.crewStep(task, thread, { ...reviewed, step: 'fix' }, effects, review);
+        return this.crewStep(task, thread, { ...reviewed, step: 'challenge' }, effects);
+      });
+    } catch {
+      // The chain stays where it was. The person can still run each step from the thread.
+      return;
+    }
+    for (const effect of effects) this.call(effect);
+  }
+
+  /** Save the chain at this step and open its turn. A challenge with no challenger finishes. */
+  private crewStep(
+    task: Task,
+    thread: ChatThread,
+    chain: ChatCrewChain,
+    effects: Effects,
+    review?: string,
+  ) {
+    const step = chain.step as CrewStep;
+    const members = thread.crew?.members ?? [];
+    const member = (role: string) => members.find((entry) => entry.role === role)?.selection;
+    const selection =
+      step === 'fix' ? (member('fixer') ?? member('builder')) : member(CREW_ROLES[step]);
+    if (!selection && step === 'challenge') return this.finishCrew(task, thread, chain);
+    if (!selection)
+      return this.stopCrew(task, thread, chain, `the crew has no ${CREW_ROLES[step]}`);
+    const saved = this.putThread(task, { ...thread, crewChain: chain });
+    const text =
+      step === 'review' ? CREW_REVIEW : step === 'fix' ? fixerBrief(review ?? '') : CREW_CHALLENGE;
+    const started = this.begin(
+      task,
+      saved,
+      { text, role: CREW_ROLES[step], selection, attachments: [] },
+      effects,
+    );
+    if (started.outcome !== 'applied')
+      this.stopCrew(task, this.thread(task.id), chain, `the ${step} could not start`, started.next);
+  }
+
+  private finishCrew(task: Task, thread: ChatThread, chain: ChatCrewChain) {
+    this.putThread(task, { ...thread, crewChain: { ...chain, step: 'finished', reason: null } });
+    const rounds = `${chain.reviewRounds} review ${chain.reviewRounds === 1 ? 'round' : 'rounds'}`;
+    const fixes = `${chain.fixes} ${chain.fixes === 1 ? 'fix' : 'fixes'}`;
+    this.appendEntry(task, {
+      kind: 'chat-system',
+      author: { kind: 'system', turnId: null },
+      text: `Crew finished: ${rounds}, ${fixes}.`,
+    });
+  }
+
+  private stopCrew(
+    task: Task,
+    thread: ChatThread,
+    chain: ChatCrewChain,
+    cause: string,
+    next?: string,
+  ) {
+    const reason = `${cause[0].toUpperCase()}${cause.slice(1)}.`;
+    this.putThread(task, { ...thread, crewChain: { ...chain, step: 'stopped', reason } });
+    this.appendEntry(task, {
+      kind: 'chat-system',
+      author: { kind: 'system', turnId: null },
+      text: `Crew stopped: ${cause}.${next ? ` ${next}` : ''}`,
+    });
+  }
+
+  /**
+   * True when this turn reran a message that an earlier turn left on a usage limit. A crew step
+   * rerun carries no handoff mark, so for a step any earlier limit on the message counts.
+   */
+  private movedOnLimit(turn: ChatTurn, step = false): boolean {
+    if (!turn.handoffFrom && !step) return false;
     return this.deps.store.db
       .prepare(
         "SELECT body FROM chat_turns WHERE task_id=? AND sequence<? AND json_extract(body,'$.userMessageId')=?",
@@ -1157,11 +1491,13 @@ export class ChatService {
     const { selection, role, messageId, base } = input;
     // A reviewer or advisor borrows another model. The thread keeps its own choice and any switch
     // still waiting for the next answer.
-    const own = role === 'assistant';
+    const own = writesScratch(role);
     const pending = own ? this.pendingHandoff(task.id) : null;
     let handoffFrom: ChatFamily | null = null;
-    // Sending on the provider the thread came from cancels the switch.
-    if (pending && pending.from === selection.family) this.setHandoff(task.id, null);
+    // Sending on the provider the thread came from cancels the switch. After Send now the same
+    // provider still needs to hear what the stopped reply left behind.
+    if (pending && pending.from === selection.family && pending.reason !== 'steer')
+      this.setHandoff(task.id, null);
     else if (pending) handoffFrom = pending.from;
     // A family picked in the composer starts cold too, so the switch is a manual handoff. A
     // cancelled switch says nothing about which family answered last, so the check still runs.
@@ -1181,10 +1517,11 @@ export class ChatService {
       handoffFrom,
     });
     this.putTurn(task, turn);
+    // A fixer runs on the crew's pick, so the thread keeps the person's own.
     this.putThread(task, {
       ...thread,
       base,
-      selection: own ? selection : thread.selection,
+      selection: role === 'assistant' ? selection : thread.selection,
       activeTurnId: turn.id,
     });
     effects.push(() => this.launch(turn));
@@ -1196,11 +1533,11 @@ export class ChatService {
     return last !== family ? last : null;
   }
 
-  /** The family of the last assistant turn. A reviewer or advisor borrows a model and does not count. */
+  /** The family of the last turn that wrote. A reviewer or advisor borrows a model and does not count. */
   private answeredOn(taskId: string): ChatFamily | null {
     const row = this.deps.store.db
       .prepare(
-        "SELECT body FROM chat_turns WHERE task_id=? AND json_extract(body,'$.role')='assistant' ORDER BY sequence DESC LIMIT 1",
+        "SELECT body FROM chat_turns WHERE task_id=? AND json_extract(body,'$.role') IN ('assistant','fixer') ORDER BY sequence DESC LIMIT 1",
       )
       .get(taskId);
     return row ? ChatTurnSchema.parse(JSON.parse(row.body as string)).selection.family : null;
@@ -1260,26 +1597,46 @@ export class ChatService {
     }
   }
 
-  /** Each read-only role gets its own brief. An assistant turn gets the project framing. */
+  /**
+   * Each read-only role gets its own brief. An assistant or fixer turn gets the project framing.
+   * Inside a crew chain the review states its count and the challenger reads the last answer
+   * that wrote, past the reviews in between.
+   */
   private context(
-    role: ChatTurn['role'],
+    turn: ChatTurn,
     name: string,
     directory: string,
     root: string,
-    base: string,
+    thread: ChatThread,
     history: readonly ChatHistoryEntry[],
   ): string {
-    const answer = history.findLast((entry) => entry.role === 'assistant')?.text ?? null;
+    const { role } = turn;
+    const crew = crewRole(thread) === role;
+    const answer =
+      (crew && role === 'challenger'
+        ? this.lastWrite(turn.taskId)
+        : history.findLast((entry) => entry.role === 'assistant')?.text) ?? null;
     if (role === 'advisor') return adviceContext(name, directory, answer);
     if (role === 'challenger') return challengeContext(name, directory, answer);
     if (role !== 'reviewer') return systemContext(name, directory);
+    const base = thread.base ?? '';
     let files: ChatChangesRead['files'] | null = null;
     try {
       files = scratchChanges(root, directory, base);
     } catch {
       // The brief says the changes could not be read, and the model works from the files.
     }
-    return reviewContext(name, directory, base, files);
+    return reviewContext(name, directory, base, files, crew);
+  }
+
+  /** The newest reply from a turn that wrote to the scratch copy. */
+  private lastWrite(taskId: string): string | undefined {
+    const row = this.deps.store.db
+      .prepare(
+        "SELECT body FROM conversation_entries WHERE task_id=? AND json_extract(body,'$.kind')='chat-assistant' AND json_extract(body,'$.author.role') IN ('assistant','fixer') ORDER BY sequence DESC LIMIT 1",
+      )
+      .get(taskId);
+    return row ? ConversationEntrySchema.parse(JSON.parse(row.body as string)).text : undefined;
   }
 
   private scratchDiff(taskId: string, root: string, base: string): FileDiff[] | null {
@@ -1334,7 +1691,7 @@ export class ChatService {
   /** Which provider stopped, why, and the tool call that never completed. */
   private stoppedLines(turn: ChatTurn): string[] {
     const previous = this.turns(turn.taskId).findLast(
-      (value) => value.sequence < turn.sequence && value.role === 'assistant',
+      (value) => value.sequence < turn.sequence && writesScratch(value.role),
     );
     if (!previous || previous.state === 'done') return [];
     const why = endedOnLimit(previous)
@@ -1575,6 +1932,73 @@ function userEntry(input: Message): EntryDraft {
 
 function sameSelection(a: ChatModelSelection, b: ChatModelSelection | null): boolean {
   return a.family === b?.family && a.model === b.model && a.effort === b.effort;
+}
+
+/** The role of the running crew step, or null when no chain runs. */
+function crewRole(thread: ChatThread): ChatTurn['role'] | null {
+  const step = thread.crewChain?.step;
+  return step && step in CREW_ROLES ? CREW_ROLES[step as CrewStep] : null;
+}
+
+/** The count on the last `Findings: N` line of a review, or null when it states none. */
+function statedFindings(text: string): number | null {
+  let found: number | null = null;
+  for (const line of text.split('\n')) {
+    const match = /^Findings:\s*(\d{1,4})$/i.exec(line.trim().replace(/^[`*_]+|[`*_.]+$/g, ''));
+    if (match) found = Number(match[1]);
+  }
+  return found;
+}
+
+const insideDirectory = (root: string, path: string) => {
+  const target = resolve(root, path);
+  return target === root || target.startsWith(`${root}${sep}`);
+};
+
+/**
+ * True when the tool input names at least one file and every one is inside the scratch copy. An
+ * input that names none could write anywhere, so it goes to the person.
+ */
+function editsInside(input: unknown, scratch: string): boolean {
+  if (!input || typeof input !== 'object') return false;
+  const fields = input as Record<string, unknown>;
+  const paths = ['file_path', 'notebook_path', 'path', 'filePath', 'paths'].flatMap((key) => {
+    const value = fields[key];
+    if (typeof value === 'string') return [value];
+    return Array.isArray(value) ? value : [];
+  });
+  const root = resolve(scratch);
+  return (
+    paths.length > 0 &&
+    paths.every((path) => typeof path === 'string' && path !== '' && insideDirectory(root, path))
+  );
+}
+
+/**
+ * True for one command from the read-only set that stays in the scratch copy. Any shell operator,
+ * substitution or redirect could chain a second command, so those go to the person, and so does
+ * an argument that points outside the copy or a flag that writes or runs something.
+ */
+function readOnlyCommand(input: unknown, scratch: string): boolean {
+  if (!input || typeof input !== 'object') return false;
+  const { command, cwd } = input as Record<string, unknown>;
+  if (typeof command !== 'string' || /[;&|<>`$(){}\\\n\r]/.test(command)) return false;
+  const root = resolve(scratch);
+  if (cwd != null && (typeof cwd !== 'string' || !insideDirectory(root, cwd))) return false;
+  const words = [...command.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map(
+    (match) => match[1] ?? match[2] ?? match[3],
+  );
+  const [program, ...rest] = words;
+  if (!program) return false;
+  if (program === 'git' ? !READ_ONLY_GIT.has(rest[0] ?? '') : !READ_ONLY_COMMANDS.has(program))
+    return false;
+  return rest.every(
+    (word) =>
+      !WRITING_FLAGS.test(word) &&
+      !isAbsolute(word) &&
+      !word.startsWith('~') &&
+      !word.split(/[/=]/).includes('..'),
+  );
 }
 
 /** Turns written before stop reasons were stored fall back to the failure kind. */

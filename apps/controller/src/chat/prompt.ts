@@ -9,9 +9,10 @@ export const familyName: Record<ChatFamily, string> = {
   local: 'Local',
 };
 
-export type HandoffReason = 'manual' | 'limit';
+export type HandoffReason = 'manual' | 'limit' | 'steer';
 
 export function handoffReason(reason: HandoffReason): string {
+  if (reason === 'steer') return 'the person sent a new message during the reply';
   return reason === 'limit' ? 'usage limit reached' : 'switched in the composer';
 }
 
@@ -33,19 +34,26 @@ type ReviewFile = { path: string; additions: number; deletions: number; patch: s
 
 /**
  * Brief for a reviewer turn. It lists every changed file with its counts, then as many whole
- * patches as fit in 48 KiB, and names the files whose patch had to be left out.
+ * patches as fit in 48 KiB, and names the files whose patch had to be left out. A review inside
+ * a crew chain ends on a count line, so the controller decides on a fix without reading prose.
  */
 export function reviewContext(
   projectName: string,
   directory: string,
   base: string,
   files: readonly ReviewFile[] | null,
+  statesFindings = false,
 ): string {
   const lines = [
     `You are reviewing changes in the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
     `Review the current changes in that copy against the base commit ${base}.`,
     'Do not edit, create or delete files, and do not run commands. You may read and search files to check a change against the code around it.',
     'List your findings ordered by severity, most severe first. For each one, name the file and the line, say what is wrong and why it matters, and say what you would change. If you find nothing worth reporting, say so in one sentence.',
+    ...(statesFindings
+      ? [
+          'End your reply with one line that reads exactly `Findings: N`, where N is the number of findings you listed. Write `Findings: 0` when there are none.',
+        ]
+      : []),
   ];
   if (files === null) return [...lines, 'The changes could not be read.'].join('\n');
   if (files.length === 0)
@@ -118,6 +126,28 @@ export function challengeContext(
   return [...lines, `The last answer:\n\n${text}`].join('\n');
 }
 
+const FIXER_REVIEW_CHARACTERS = 16_000;
+
+/**
+ * The message a fixer turn answers. It is the builder again, so it may resume the builder's native
+ * session, which skips the system context. The findings therefore travel in the message itself.
+ */
+export function fixerBrief(review: string): string {
+  const text =
+    review.length > FIXER_REVIEW_CHARACTERS
+      ? `${review.slice(0, FIXER_REVIEW_CHARACTERS).toWellFormed()} [trimmed]`
+      : review;
+  return [
+    'A review of the changes in the scratch copy found the problems quoted below. Fix each one in the scratch copy. Read a file before you change it.',
+    'When you are done, say what you changed for each finding. Name any finding you left alone and say why.',
+    `The review:\n\n${text
+      .trim()
+      .split('\n')
+      .map((line) => `> ${line}`)
+      .join('\n')}`,
+  ].join('\n\n');
+}
+
 /**
  * The model works in the scratch copy, and the person reviews only what changes there. A path
  * under the project root, the way an editor or Finder copies it, means the same file in the
@@ -183,8 +213,14 @@ export function handoffPacket(input: {
       : input.files.length
         ? input.files.join('\n')
         : 'No files changed yet.';
+  // Send now stops a reply and starts the next message on the same family. The packet then tells
+  // the model what the stopped reply left behind.
+  const opening =
+    input.from === input.to
+      ? `The last reply on ${familyName[input.from]} was stopped before it finished. Reason: ${handoffReason(input.reason)}.`
+      : `This thread moved from ${familyName[input.from]} to ${familyName[input.to]}. Reason: ${handoffReason(input.reason)}.`;
   return [
-    `This thread moved from ${familyName[input.from]} to ${familyName[input.to]}. Reason: ${handoffReason(input.reason)}.`,
+    opening,
     'Earlier work is in the same scratch copy. Read files before you change them.',
     `Conversation so far, oldest first:\n\n${transcript.join('\n\n') || 'No earlier messages.'}`,
     `Files changed in the scratch copy against the base commit:\n${files}`,

@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import type {
   AgentEvent,
   ChatCatalogRead,
+  ChatCrew,
   ChatFamily,
   ChatHandoffMode,
   ChatModelSelection,
@@ -921,7 +922,7 @@ test('a reviewer turn runs read only with the review brief and the ask policy, w
 // adapter emits for a tool call: tool.started, then permission.requested for the same call. Turn N
 // asks about `asks[N]`: a tool kind, null for a request with no tool call, or nothing once the
 // list runs out. It keeps every request it receives.
-function editingAdapter(asks: readonly (ChatToolKind | null)[]) {
+function editingAdapter(asks: readonly (ChatToolKind | null)[], input?: unknown) {
   const requests: ChatTurnRequest[] = [];
   const adapter: ChatAdapter = {
     family: 'openai',
@@ -945,7 +946,14 @@ function editingAdapter(asks: readonly (ChatToolKind | null)[]) {
             answer = resolve;
           });
           if (ask)
-            emit({ type: 'tool.started', turnId, callId: 'call-1', kind: ask, title: 'net' });
+            emit({
+              type: 'tool.started',
+              turnId,
+              callId: 'call-1',
+              kind: ask,
+              title: 'net',
+              input,
+            });
           emit({
             type: 'permission.requested',
             turnId,
@@ -1069,4 +1077,323 @@ test('accept is refused while a turn is running', { timeout: 30000 }, async (t) 
 
   const result = await run('AcceptChatChanges', { branch: 'crewkite/fix-rounding' }, task.revision);
   assert.deepEqual([result.outcome, result.reason], ['blocked', 'turn-running']);
+});
+
+// Builder and fixer run on OpenAI, the reviewer on Anthropic, the challenger on Google. The crew
+// has no fixer of its own, so the fix runs on the builder's pick. A limit row stops the first
+// review on Anthropic; Local has the most allowance left, so the step reruns there.
+test('the crew chain runs review, fix, second review and challenger, and stops where a step stops', {
+  timeout: 30000,
+}, async (t) => {
+  const pick = (family: ChatFamily): ChatModelSelection => ({
+    family,
+    model: `${family}-model`,
+    effort: 'default',
+  });
+  const reply = (text: string): ChatScriptStep[] => [{ kind: 'text', itemId: 'r', chunks: [text] }];
+  const limit = chatFailure({ stage: 'stream', kind: 'usage-limit', message: 'Limit.' });
+  const limited: ChatScriptStep[] = [{ kind: 'fail', stopReason: 'limit', failure: limit }];
+  const twoFindings = 'Rounding drops a cent in net.mjs.\nTotals skip tax.\nFindings: 2';
+  const cases = [
+    {
+      name: 'findings 2 then 0',
+      reviews: [reply(twoFindings), reply('Clean.\nFindings: 0')],
+      autoHandoff: undefined,
+      turns: [
+        ['assistant', 'openai'],
+        ['reviewer', 'anthropic'],
+        ['fixer', 'openai'],
+        ['reviewer', 'anthropic'],
+        ['challenger', 'google'],
+      ],
+      line: 'Crew finished: 2 review rounds, 1 fix.',
+      chain: { step: 'finished', reviewRounds: 2, fixes: 1, reason: null },
+    },
+    {
+      name: 'findings 0 at once',
+      reviews: [reply('Clean.\nFindings: 0')],
+      autoHandoff: undefined,
+      turns: [
+        ['assistant', 'openai'],
+        ['reviewer', 'anthropic'],
+        ['challenger', 'google'],
+      ],
+      line: 'Crew finished: 1 review round, 0 fixes.',
+      chain: { step: 'finished', reviewRounds: 1, fixes: 0, reason: null },
+    },
+    {
+      name: 'no findings line',
+      reviews: [reply('Looks fine to me.')],
+      autoHandoff: undefined,
+      turns: [
+        ['assistant', 'openai'],
+        ['reviewer', 'anthropic'],
+      ],
+      line: 'Crew stopped: the review did not state its findings. Ask for a fix or review again.',
+      chain: {
+        step: 'stopped',
+        reviewRounds: 1,
+        fixes: 0,
+        reason: 'The review did not state its findings.',
+      },
+    },
+    {
+      name: 'limit with handoff on',
+      reviews: [limited],
+      autoHandoff: undefined,
+      turns: [
+        ['assistant', 'openai'],
+        ['reviewer', 'anthropic'],
+        ['reviewer', 'local'],
+        ['challenger', 'google'],
+      ],
+      line: 'Crew finished: 1 review round, 0 fixes.',
+      chain: { step: 'finished', reviewRounds: 1, fixes: 0, reason: null },
+    },
+    {
+      name: 'limit with handoff off',
+      reviews: [limited],
+      autoHandoff: false,
+      turns: [
+        ['assistant', 'openai'],
+        ['reviewer', 'anthropic'],
+      ],
+      line: 'Crew stopped: Anthropic reached its usage limit.',
+      chain: {
+        step: 'stopped',
+        reviewRounds: 0,
+        fixes: 0,
+        reason: 'Anthropic reached its usage limit.',
+      },
+    },
+  ] as const;
+  for (const row of cases) {
+    const now = createTestClock().now();
+    const adapters = new Map([
+      [
+        'openai',
+        createScriptedChatAdapter({
+          family: 'openai',
+          turns: [reply('Built it.'), reply('Fixed both.')],
+        }),
+      ],
+      ['anthropic', createScriptedChatAdapter({ family: 'anthropic', turns: row.reviews })],
+      ['google', createScriptedChatAdapter({ family: 'google', turns: [reply('It holds.')] })],
+      [
+        'local',
+        createScriptedChatAdapter({ family: 'local', turns: [reply('Clean.\nFindings: 0')] }),
+      ],
+    ] as const);
+    const families = [
+      familyEntry('openai', 10, null, now),
+      familyEntry('anthropic', 50, null, now),
+      familyEntry('google', 10, null, now),
+      familyEntry('local', 90, null, now),
+    ];
+    const thread = standalone(t, { adapters, catalog: () => ({ families }) });
+    const { store, service, taskId } = thread;
+    const crew: ChatCrew = {
+      name: 'Full crew',
+      members: [
+        { role: 'builder', selection: pick('openai') },
+        { role: 'reviewer', selection: pick('anthropic') },
+        { role: 'challenger', selection: pick('google') },
+      ],
+    };
+    store.transaction(() => service.configure({ taskId, crew, flightMode: 'glide' }));
+    // Entering glide turns automatic handoff on. The person may turn it off again.
+    assert.equal(thread.read().thread.autoHandoff, true, row.name);
+    if (row.autoHandoff === false)
+      store.transaction(() => service.configure({ taskId, autoHandoff: false }));
+    const ended = next(
+      thread,
+      (event) =>
+        event.type === 'conversation.entry' &&
+        (event.payload as { text: string }).text.startsWith('Crew '),
+    );
+    thread.send('Fix the rounding.', pick('openai'));
+    await ended;
+
+    const read = thread.read();
+    assert.deepEqual(
+      read.turns.map((turn) => [turn.role, turn.selection.family]),
+      row.turns,
+      row.name,
+    );
+    assert.equal(read.messages.at(-1)?.text, row.line, row.name);
+    const { builderTurnId, ...chain } = read.thread.crewChain ?? {};
+    assert.equal(builderTurnId, read.turns[0].id, row.name);
+    assert.deepEqual(chain, row.chain, row.name);
+    // The person's pick stays on the builder whatever the crew borrowed.
+    assert.equal(read.thread.selection?.family, 'openai', row.name);
+    const reviewed = adapters.get('anthropic')?.requests[0];
+    assert.match(reviewed?.systemContext ?? '', /reads exactly `Findings: N`/, row.name);
+    assert.equal(reviewed?.prompt, 'Review the current changes.', row.name);
+    const assistant = read.messages.find((message) => message.author.kind === 'assistant');
+    assert.equal(
+      assistant?.author.kind === 'assistant' && assistant.author.effort,
+      'default',
+      row.name,
+    );
+    if (row.name !== 'findings 2 then 0') continue;
+    const fix = adapters.get('openai')?.requests[1];
+    assert.equal(fix?.role, 'fixer');
+    assert.match(fix?.prompt ?? '', /^> Totals skip tax\.$/m);
+    assert.match(fix?.prompt ?? '', /Fix each one in the scratch copy/);
+    // The fixer is the builder again: it resumes the builder's session.
+    assert.equal(fix?.session?.sessionId, `session-${read.turns[0].id}`);
+  }
+});
+
+// Each row parks a turn on one ask. Balanced answers safe asks at ask time. A policy changed
+// while the ask is open answers what it covers. Anything else waits for the person.
+test('send now and a policy change act on the running turn, and balanced answers only safe asks', {
+  timeout: 30000,
+}, async (t) => {
+  const crew: ChatCrew = {
+    name: 'Pair',
+    members: [
+      { role: 'builder', selection },
+      { role: 'reviewer', selection },
+    ],
+  };
+  const cases = [
+    {
+      kind: 'edit',
+      input: { path: 'net.mjs' },
+      mode: 'manual',
+      policy: 'allow-edits',
+      answered: true,
+    },
+    {
+      kind: 'command',
+      input: { command: 'ls' },
+      mode: 'manual',
+      policy: 'allow-edits',
+      answered: false,
+    },
+    {
+      kind: 'command',
+      input: { command: 'npm i' },
+      mode: 'manual',
+      policy: 'allow-all',
+      answered: true,
+    },
+    {
+      kind: 'command',
+      input: { command: 'git diff --stat' },
+      mode: 'balanced',
+      policy: null,
+      answered: true,
+    },
+    {
+      kind: 'command',
+      input: { command: 'find . -delete' },
+      mode: 'balanced',
+      policy: null,
+      answered: false,
+    },
+    {
+      kind: 'edit',
+      input: { path: '../outside.mjs' },
+      mode: 'balanced',
+      policy: null,
+      answered: false,
+    },
+  ] as const;
+  for (const row of cases) {
+    const adapter = editingAdapter([row.kind], row.input);
+    const thread = standalone(t, { adapters: new Map([['openai', adapter]]) });
+    const { store, service, taskId } = thread;
+    // The thread allows everything. Balanced still asks before a risky action.
+    store.transaction(() =>
+      service.configure({
+        taskId,
+        permissionPolicy: 'allow-all',
+        ...(row.mode === 'balanced' ? { crew, flightMode: 'balanced' } : {}),
+      }),
+    );
+    if (row.mode === 'manual')
+      store.transaction(() => service.configure({ taskId, permissionPolicy: 'ask' }));
+    const name = `${row.mode} ${row.policy} ${JSON.stringify(row.input)}`;
+    const parked = turnReaches(thread, 'waiting-permission');
+    const idle = settles(thread);
+    thread.send('Go.');
+    const turn = await parked;
+    assert.equal(adapter.requests[0].permissionPolicy, 'ask', name);
+    if (row.policy) {
+      const effects: (() => void)[] = [];
+      store.transaction(() => service.configure({ taskId, permissionPolicy: row.policy }, effects));
+      for (const effect of effects) effect();
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    const open = thread.read().turns[0].state === 'waiting-permission';
+    assert.equal(open, !row.answered, name);
+    if (open) {
+      const effects: (() => void)[] = [];
+      store.transaction(() =>
+        service.resolvePermission(
+          { taskId, turnId: turn.id, requestId: 'edit-1', choice: 'deny' },
+          effects,
+        ),
+      );
+      for (const effect of effects) effect();
+    }
+    await idle;
+    const resolved = agentEvents(thread).find((event) => event.type === 'permission.resolved');
+    assert.equal(
+      resolved?.type === 'permission.resolved' && resolved.choice,
+      row.answered ? 'allow-once' : 'deny',
+      name,
+    );
+  }
+
+  // Send now: the queued message goes first, the reply stops, and the message starts on the same
+  // family with what the stopped reply left behind. The rest of the queue keeps its place.
+  const scripted = createScriptedChatAdapter({
+    family: 'openai',
+    turns: [
+      [{ kind: 'text', itemId: 'reply', chunks: ['Half'], complete: false }, { kind: 'wait' }],
+      [{ kind: 'text', itemId: 'reply', chunks: ['Done.'] }],
+    ],
+  });
+  const thread = standalone(t, { adapters: new Map([['openai', scripted]]) });
+  const { store, service, taskId } = thread;
+  const steer = (messageId: string) => {
+    const effects: (() => void)[] = [];
+    const result = store.transaction(() => service.steer({ taskId, messageId }, effects));
+    for (const effect of effects) effect();
+    return result;
+  };
+  assert.equal(
+    steer('msg_0000000000000000000000000000').next,
+    'Nothing is running. Send the message.',
+  );
+  const streaming = next(
+    thread,
+    (event) => event.type === 'agent.event' && event.payload.type === 'text.delta',
+  );
+  thread.send('First.');
+  await streaming;
+  thread.send('Second.');
+  thread.send('Third.');
+  const [second, third] = thread.read().thread.queued;
+  assert.equal(steer('msg_0000000000000000000000000000').reason, 'message-not-queued');
+  const idle = settles(thread);
+  assert.equal(steer(third.id).outcome, 'applied');
+  await idle;
+  const read = thread.read();
+  assert.deepEqual(
+    read.turns.map((turn) => [turn.state, turn.userMessageId]),
+    [
+      ['stopped', read.turns[0].userMessageId],
+      ['done', third.id],
+      ['done', second.id],
+    ],
+  );
+  const packet = scripted.requests[1].prompt;
+  assert.match(packet, /^The last reply on OpenAI was stopped before it finished\./m);
+  assert.match(packet, /^OpenAI ended its last turn early\. Reason: stopped by the person\.$/m);
+  assert.match(packet, /New message:\nThird\.$/);
+  assert.equal(scripted.requests[2].prompt, 'Second.');
 });
