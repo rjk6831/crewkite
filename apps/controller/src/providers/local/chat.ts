@@ -1,7 +1,12 @@
 import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import type { AgentEvent, ChatFailure, ChatPermissionOption } from '@crewkite/contracts';
+import type {
+  AgentEvent,
+  ChatFailure,
+  ChatPermissionOption,
+  ChatTurnStats,
+} from '@crewkite/contracts';
 import type {
   ChatInput,
   ChatMessage,
@@ -102,12 +107,14 @@ function systemPrompt(request: ChatTurnRequest, outputTokens: number) {
 // The rolling summary is model input only and never reaches the thread, so the person keeps the
 // raw turns. It sits beside the task's turn directories, in <home>/chat/<taskId>/local-summary.json,
 // and records how many history entries it covers with their hash. When the history under it
-// changes, the hash no longer matches and the summary is ignored.
+// changes, the hash no longer matches and the summary is ignored. `count` is how many times the
+// summary was written or extended; files from before it existed count as one.
 const SummarySchema = z.object({
   version: z.literal(1),
   covered: z.number().int().nonnegative(),
   coveredHash: z.string(),
   summary: z.string().min(1).max(16_384),
+  count: z.number().int().min(1).max(10_000).default(1),
 });
 type Summary = z.output<typeof SummarySchema>;
 const summaryFile = (request: ChatTurnRequest) =>
@@ -128,20 +135,24 @@ function loadSummary(request: ChatTurnRequest): Summary | null {
   }
 }
 
-function saveSummary(request: ChatTurnRequest, summary: string) {
+function saveSummary(request: ChatTurnRequest, summary: string, count: number) {
   const file = summaryFile(request);
   const value: Summary = {
     version: 1,
     covered: request.history.length,
     coveredHash: historyHash(request.history),
     summary,
+    count,
   };
   mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
   writeFileSync(`${file}.tmp`, JSON.stringify(value), { mode: 0o600 });
   renameSync(`${file}.tmp`, file);
 }
 
-type Prompt = { kind: 'fits'; chat: ChatInput; summary: Summary | null } | { kind: 'too-large' };
+/** `carried` is true when the summary fit and went into the prompt. */
+type Prompt =
+  | { kind: 'fits'; chat: ChatInput; summary: Summary | null; carried: boolean }
+  | { kind: 'too-large' };
 
 async function buildPrompt(
   request: ChatTurnRequest,
@@ -182,6 +193,7 @@ async function buildPrompt(
 
   let history = request.history;
   const summary = loadSummary(request);
+  let carried = false;
   if (summary) {
     const section = `\n\nSummary of earlier turns in this thread:\n${summary.summary}`;
     const tokens = await model.countTokens(section);
@@ -189,6 +201,7 @@ async function buildPrompt(
       system += section;
       left -= tokens;
       history = history.slice(summary.covered);
+      carried = true;
     }
   }
   const kept: ChatHistoryEntry[] = [];
@@ -203,6 +216,7 @@ async function buildPrompt(
   return {
     kind: 'fits',
     summary,
+    carried,
     chat: [
       { role: 'system', content: system },
       ...kept.map((entry) => ({ role: entry.role, content: entry.text })),
@@ -313,12 +327,16 @@ function streamFailure(error: unknown): ChatFailure {
 }
 
 /**
- * One notice line, for example `Local: 1,842 in, 412 out, 1.9 s to first token, 21 tok/s, 14.0 s
- * total`. In is the last round's prompt, the most context the turn used. Out sums every round.
- * Total is the turn's wall clock, tool calls and permission waits included.
+ * The turn's measure from the runtime's per-round stats. In is the last round's prompt, the most
+ * context the turn used. Out sums every round, and tokens per second divides it by the time spent
+ * predicting. Turn time is the wall clock, tool calls and permission waits included.
  */
-function statsNotice(rounds: readonly LLMPredictionStats[], totalSeconds: number) {
-  const last = rounds.at(-1);
+function turnStats(
+  rounds: readonly LLMPredictionStats[],
+  turnMs: number,
+  context: { used: number; capacity: number | null },
+  summaries: number,
+): ChatTurnStats {
   const out = rounds.reduce((sum, stats) => sum + (stats.predictedTokensCount ?? 0), 0);
   const seconds = rounds.reduce(
     (sum, stats) =>
@@ -329,13 +347,18 @@ function statsNotice(rounds: readonly LLMPredictionStats[], totalSeconds: number
     0,
   );
   const first = rounds[0]?.timeToFirstTokenSec;
-  return [
-    `Local: ${(last?.promptTokensCount ?? 0).toLocaleString('en-US')} in`,
-    `${out.toLocaleString('en-US')} out`,
-    ...(first === undefined ? [] : [`${first.toFixed(1)} s to first token`]),
-    ...(seconds > 0 ? [`${Math.round(out / seconds)} tok/s`] : []),
-    `${totalSeconds.toFixed(1)} s total`,
-  ].join(', ');
+  const tokensIn = rounds.at(-1)?.promptTokensCount ?? null;
+  const reported = rounds.some((stats) => stats.predictedTokensCount !== undefined);
+  return {
+    tokensIn,
+    tokensOut: reported ? out : null,
+    tokensPerSecond: seconds > 0 ? Math.round((out / seconds) * 10) / 10 : null,
+    firstTokenMs: first === undefined ? null : Math.round(first * 1000),
+    turnMs: Math.max(0, Math.round(turnMs)),
+    contextUsed: tokensIn === null ? null : context.used,
+    contextCapacity: context.capacity,
+    summaries,
+  };
 }
 
 // A chat template without native tool calls leaves the call in the reply text. These are the forms
@@ -510,6 +533,7 @@ function startLocalTurn(
   const rounds: LLMPredictionStats[] = [];
   const texts: string[] = [];
   const noticed = new Set<string>();
+  let summaries = 0;
   let ending: 'stopped' | 'timeout' | null = null;
   let connecting: ReturnType<LocalConnect> | null = null;
   let items = 0;
@@ -779,20 +803,27 @@ function startLocalTurn(
     return results.join('\n');
   };
 
+  const usedContext = () => {
+    const last = rounds.at(-1);
+    return (last?.promptTokensCount ?? 0) + (last?.predictedTokensCount ?? 0);
+  };
+
   const run = async (): Promise<ChatTurnResult> => {
     let usage: ChatTurnResult['usage'] = null;
     let session: ChatTurnResult['session'] = null;
     const finish = (stopReason: ChatTurnResult['stopReason'], failure: ChatFailure | null) => {
       closeText();
       closeThinking();
+      // A turn that never reached the model has nothing measured, so it reports no stats.
       if (rounds.length) {
-        notice('info', statsNotice(rounds, Math.max(0, now() - began) / 1000));
-        const last = rounds[rounds.length - 1];
-        usage = {
-          usedTokens: (last.promptTokensCount ?? 0) + (last.predictedTokensCount ?? 0),
-          capacityTokens: usage?.capacityTokens ?? null,
-        };
+        usage = { usedTokens: usedContext(), capacityTokens: usage?.capacityTokens ?? null };
         emit({ type: 'usage.context', turnId, ...usage });
+        const context = { used: usage.usedTokens, capacity: usage.capacityTokens };
+        emit({
+          type: 'turn.stats',
+          turnId,
+          stats: turnStats(rounds, now() - began, context, summaries),
+        });
       }
       emit({ type: 'turn.completed', turnId, stopReason, failure });
       return {
@@ -864,6 +895,7 @@ function startLocalTurn(
       );
       return finish('done', null);
     }
+    if (prompt.carried && prompt.summary) summaries = prompt.summary.count;
 
     // `act` runs rounds until one ends without a native call. When that round wrote its calls as
     // text, they run here and `act` starts again with the results, inside the same round budget.
@@ -946,7 +978,21 @@ function startLocalTurn(
         const summary = await bounded(
           summarize(request, model, contextLength, prompt.summary, abort.signal),
         );
-        if (summary) saveSummary(request, summary);
+        if (summary) {
+          summaries = (prompt.summary?.count ?? 0) + 1;
+          saveSummary(request, summary, summaries);
+          emit({
+            type: 'context.compacted',
+            turnId,
+            summaries,
+            coveredTurns: Math.max(
+              1,
+              request.history.filter((entry) => entry.role === 'user').length,
+            ),
+            usedTokens: usedContext(),
+            capacityTokens: contextLength,
+          });
+        }
       } catch {
         if (ending) return ended();
         notice('warning', 'Local: the summary of earlier turns could not be updated.');

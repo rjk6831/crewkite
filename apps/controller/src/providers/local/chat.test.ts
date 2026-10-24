@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -242,8 +243,9 @@ test('a local turn streams, reads freely, edits after permission and reports its
         'tool.completed',
         'text.delta',
         'text.completed',
-        'provider.notice',
+        'context.compacted',
         'usage.context',
+        'turn.stats',
         'turn.completed',
       ],
     );
@@ -257,11 +259,21 @@ test('a local turn streams, reads freely, edits after permission and reports its
     );
     const asked = events.find((event) => event.type === 'permission.requested');
     assert.equal(asked?.callId, started[1].callId);
-    assert.deepEqual(
-      events.filter((event) => event.type === 'provider.notice').map((event) => event.message),
-      ['Local: 5,842 in, 412 out, 1.9 s to first token, 21 tok/s, 3.0 s total'],
-    );
     assert.deepEqual(events.at(-2), {
+      type: 'turn.stats',
+      turnId: turnIds[0],
+      stats: {
+        tokensIn: 5842,
+        tokensOut: 412,
+        tokensPerSecond: 21,
+        firstTokenMs: 1900,
+        turnMs: 3000,
+        contextUsed: 6054,
+        contextCapacity: 8192,
+        summaries: 1,
+      },
+    });
+    assert.deepEqual(events.at(-3), {
       type: 'usage.context',
       turnId: turnIds[0],
       usedTokens: 6054,
@@ -315,7 +327,7 @@ test('a local turn streams, reads freely, edits after permission and reports its
       message:
         'Local: local-fixture is not loaded, so loaded-fixture answered. Load local-fixture or pick loaded-fixture in the composer.',
     });
-    assert.equal(fallback.events.filter((event) => event.type === 'provider.notice').length, 2);
+    assert.equal(fallback.events.filter((event) => event.type === 'provider.notice').length, 1);
     assert.equal(next.session?.sessionId, 'loaded-fixture');
     assert.equal(next.session?.model, 'loaded-fixture');
     const chat = second.calls[0].chat;
@@ -324,6 +336,61 @@ test('a local turn streams, reads freely, edits after permission and reports its
       chat.slice(1).map((message) => message.content),
       ['Rename n to count in src/a.ts.', result.assistantText, 'Thanks.'],
     );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a turn that compacts emits context.compacted and ends with turn.stats carrying the summary count', async () => {
+  const { root, home, clock, request } = fixture();
+  try {
+    // A summary already covers the first two entries, so this turn carries it and then extends it.
+    const history: ChatHistoryEntry[] = [
+      { role: 'user', text: 'What is n?' },
+      { role: 'assistant', text: 'A constant in src/a.ts.' },
+      { role: 'user', text: 'Where is it used?' },
+      { role: 'assistant', text: 'In twice, on the next line.' },
+    ];
+    const sidecar = join(home, 'chat', taskId, 'local-summary.json');
+    mkdirSync(join(home, 'chat', taskId), { recursive: true });
+    writeFileSync(
+      sidecar,
+      JSON.stringify({
+        version: 1,
+        covered: 2,
+        coveredHash: createHash('sha256')
+          .update(JSON.stringify(history.slice(0, 2).map((entry) => [entry.role, entry.text])))
+          .digest('hex'),
+        summary: 'n is a constant in src/a.ts.',
+      }),
+    );
+    const { model } = fakeModel(
+      [
+        {
+          steps: [{ text: 'Done.' }],
+          stats: { promptTokensCount: 6000, predictedTokensCount: 97 },
+        },
+      ],
+      clock,
+    );
+    const turn = start(model, 8192, request(0, { history }));
+    await turn.handle.result;
+
+    assert.deepEqual(
+      turn.events.slice(-4).map((event) => event.type),
+      ['context.compacted', 'usage.context', 'turn.stats', 'turn.completed'],
+    );
+    assert.deepEqual(turn.events.at(-4), {
+      type: 'context.compacted',
+      turnId: turnIds[0],
+      summaries: 2,
+      coveredTurns: 2,
+      usedTokens: 6097,
+      capacityTokens: 8192,
+    });
+    const stats = turn.events.at(-2);
+    assert.equal(stats?.type === 'turn.stats' && stats.stats.summaries, 2);
+    assert.equal(JSON.parse(readFileSync(sidecar, 'utf8')).count, 2);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -385,8 +452,8 @@ test('tool calls written as text run through the same gate and their results go 
         'provider.notice',
         'text.delta',
         'text.completed',
-        'provider.notice',
         'usage.context',
+        'turn.stats',
         'turn.completed',
       ],
     );
@@ -426,7 +493,6 @@ test('tool calls written as text run through the same gate and their results go 
       [
         // The unreadable call is a notice, so it stays out of the stored reply.
         'Local: the model wrote a tool call CrewKite could not read. Try again or pick another model.',
-        'Local: 1,400 in, 130 out, 20 tok/s, 4.0 s total',
       ],
     );
     assert.equal(result.stopReason, 'done');

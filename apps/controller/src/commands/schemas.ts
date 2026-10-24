@@ -60,6 +60,7 @@ import { AcpClientPinSchema, AcpSetupProofSchema } from '../providers/google/acp
 import type { AcpWriterCompletion, startGoogleAcpWriter } from '../providers/google/acp/writer.ts';
 import type { CapturedContext } from '../providers/google/native-extension/connector.ts';
 import type { startGoogleWriter } from '../providers/google/native-writer.ts';
+import { type GpuFacts, gpuFacts } from '../providers/local/hardware.ts';
 import type { LocalStart } from '../providers/local/profile.ts';
 import type { startLocalReplacement } from '../providers/local/replacement.ts';
 import { ReplacementPathSchema, type startReplacement } from '../providers/openai/replacement.ts';
@@ -73,7 +74,10 @@ export const evaluationFloorMinutes = 11;
 // Owned cleanup escalates to SIGKILL within a second. A minute covers a slow host and matches the
 // whole-minute granularity of the minute ledger.
 export const cleanupReserveMs = 60_000;
-export const localHardwareStatus = (sampledAt: string): LocalHardwareStatus => {
+export const localHardwareStatus = (
+  sampledAt: string,
+  gpu: GpuFacts | null | undefined = gpuFacts(),
+): LocalHardwareStatus => {
   const processors = cpus();
   const model = processors.find((processor) => processor.model.trim())?.model.trim() ?? null;
   const cpuModel =
@@ -100,6 +104,8 @@ export const localHardwareStatus = (sampledAt: string): LocalHardwareStatus => {
       availableMemory <= totalMemory
         ? availableMemory
         : null,
+    // Left out off Apple Silicon and until the launch probe has answered.
+    ...(gpu ? gpu : {}),
     sampledAt,
   });
 };
