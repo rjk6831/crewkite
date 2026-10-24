@@ -134,6 +134,8 @@ type Ending = {
   stopReason: NonNullable<ChatTurn['stopReason']>;
   /** Process groups still present. Any entry blocks the thread until a later check finds it gone. */
   groups: readonly number[];
+  /** The effort the client reported, when it differs from the one requested. */
+  effort?: ChatModelSelection['effort'];
 };
 type FileDiff = ChatChangesRead['files'][number];
 type Message = Pick<ChatQueuedMessage, 'text' | 'role' | 'selection' | 'attachments'>;
@@ -161,6 +163,8 @@ type LiveTurn = {
   noticed: boolean;
   /** Adapters differ on whether they announce the turn edges. The service owns both. */
   started: boolean;
+  /** The effort the client reports it runs at, when it differs from the one requested. */
+  effort?: ChatModelSelection['effort'];
   /** How many process groups the handle had reported when the turn row last saved them. */
   reported: number;
   /**
@@ -920,7 +924,18 @@ export class ChatService {
       };
     }
     if (event.type === 'turn.started') {
-      if (live.started) return;
+      // The service announces the turn with the requested effort. An adapter that learns the
+      // effort the client actually runs at sends its own start, which corrects the badge only.
+      if (live.started) {
+        if (
+          event.family !== turn.selection.family ||
+          event.model !== turn.selection.model ||
+          event.role !== turn.role ||
+          event.effort === (live.effort ?? turn.selection.effort)
+        )
+          return;
+        live.effort = event.effort;
+      }
       live.started = true;
     }
     // The turn is complete when the service settles it, after its processes are proven gone.
@@ -1017,7 +1032,7 @@ export class ChatService {
     this.live.delete(turnId);
     try {
       this.deps.store.transaction(() => {
-        const end = ending(result, live.items, left);
+        const end = { ...ending(result, live.items, left), effort: live.effort };
         this.settle(turnId, end);
         // Send now: the queued message picks up where this reply stopped, with its packet. A
         // review or an opinion left nothing behind in the scratch copy to carry over.
@@ -1056,7 +1071,7 @@ export class ChatService {
             family: turn.selection.family,
             model: turn.selection.model,
             role: turn.role,
-            effort: turn.selection.effort,
+            effort: end.effort ?? turn.selection.effort,
           },
           text: fitText(end.text, 262_144),
         })

@@ -18,8 +18,8 @@ import {
   chatFailure,
 } from '../../chat/adapter.ts';
 import { scratchPath } from '../../chat/local-tools.ts';
+import { frameTrace } from '../../chat/trace.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
-import { frameTrace } from '../google/chat.ts';
 import {
   type OpenAiUsageHook,
   type OpenAiUsageWindow,
