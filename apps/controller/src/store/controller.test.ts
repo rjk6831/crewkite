@@ -398,7 +398,11 @@ test('task snapshots retain related evidence within the unchanged frame bound', 
   assert.equal('tasks' in header, false);
   assert(header.localHardware);
   assert.equal(header.localHardware.sampledAt, clock.now());
-  assert.deepEqual(Object.keys(header.localHardware).sort(), [
+  // The GPU fields join on Apple Silicon once the launch probe has answered.
+  const keys = Object.keys(header.localHardware).filter(
+    (key) => key !== 'gpuCores' && key !== 'gpuModel',
+  );
+  assert.deepEqual(keys.sort(), [
     'architecture',
     'availableMemoryBytes',
     'cpuModel',
