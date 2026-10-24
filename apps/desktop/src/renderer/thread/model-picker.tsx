@@ -11,6 +11,7 @@ import { type KeyboardEvent, useEffect, useId, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
 import { familyModel } from '../settings/preferences.ts';
 import { formatSpan } from '../usage-gauges.tsx';
+import { FamilyMark } from './family-mark.tsx';
 
 type Entry = ChatCatalogRead['families'][number];
 
@@ -212,7 +213,7 @@ export function ModelPicker({
               title={family.connected ? undefined : (family.reason ?? 'Not connected')}
             >
               <div className={family.connected ? 'th-menu-head' : 'th-menu-head is-off'}>
-                <span className={`th-dot family-${family.family}`} aria-hidden="true" />
+                <FamilyMark family={family.family} />
                 <strong>{familyName(family.family)}</strong>
                 <span>{family.connected ? allowance(family, nowMs) : 'Not connected'}</span>
               </div>

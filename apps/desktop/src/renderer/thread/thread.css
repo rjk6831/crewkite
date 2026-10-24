@@ -1067,6 +1067,11 @@
 .th-toggle input {
   width: auto;
 }
+.th-session {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
 
 /* Left rail allowance summary */
 .rail-usage {
@@ -1084,7 +1089,15 @@
   font-size: 11px;
 }
 .rail-usage-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   color: var(--text-muted);
+}
+.rail-usage-label .family-mark {
+  width: 14px;
+  height: 14px;
+  font-size: 8.5px;
 }
 .rail-usage-value {
   color: var(--text);
@@ -1100,7 +1113,7 @@
 .rail-usage-bar span {
   display: block;
   height: 100%;
-  background: var(--accent);
+  background: var(--family, var(--accent));
 }
 .rail-usage-reset {
   grid-column: 1 / -1;

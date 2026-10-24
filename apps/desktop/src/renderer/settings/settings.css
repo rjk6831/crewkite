@@ -40,6 +40,12 @@
   min-height: 24px;
   margin-bottom: 18px;
 }
+.st-card-head .family-mark {
+  width: 20px;
+  height: 20px;
+  border-radius: 5px;
+  font-size: 11px;
+}
 .st-card-head h2 {
   font-size: 15px;
   font-weight: 600;

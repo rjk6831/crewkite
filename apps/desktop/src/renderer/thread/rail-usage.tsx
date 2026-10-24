@@ -6,6 +6,7 @@ import { onFamilyDefaults } from '../settings/preferences.ts';
 import { useCatalog } from '../settings/use-catalog.ts';
 import { formatSpan } from '../usage-gauges.tsx';
 import type { ThreadSource } from './commands.ts';
+import { FamilyMark } from './family-mark.tsx';
 
 /**
  * One row per connected family: percent left on its tightest window and when that resets. The
@@ -35,7 +36,10 @@ export function RailUsage({
     <section className="rail-usage" aria-label="Provider allowance">
       {rows.map((row) => (
         <div key={row.family} className="rail-usage-row">
-          <span className="rail-usage-label">{familyName(row.family)}</span>
+          <span className="rail-usage-label">
+            <FamilyMark family={row.family} />
+            {familyName(row.family)}
+          </span>
           <span
             className={
               row.percent !== null
@@ -54,7 +58,10 @@ export function RailUsage({
           {!row.onDevice && (
             <>
               <span className="rail-usage-bar" aria-hidden="true">
-                <span style={{ width: `${row.percent ?? 0}%` }} />
+                <span
+                  className={`family-${row.family}`}
+                  style={{ width: `${row.percent ?? 0}%` }}
+                />
               </span>
               <span className="rail-usage-reset">
                 {row.resetsIn !== null

@@ -1,7 +1,8 @@
 import type { ChatCatalogRead, ChatFamily, WorkspaceState } from '@crewkite/contracts';
 import { type ReactNode, useId, useState } from 'react';
-import { familyClass, familyName } from '../components.tsx';
+import { familyName } from '../components.tsx';
 import type { Workspace } from '../source.ts';
+import { FamilyMark } from '../thread/family-mark.tsx';
 import { type UsageCard, UsageGauges } from '../usage-gauges.tsx';
 import type { UsageGaugeCard } from '../usage-presentation.ts';
 import { readFamilyDefaults, writeFamilyDefault } from './preferences.ts';
@@ -159,7 +160,7 @@ export function ProviderCard({
   return (
     <section className="st-card" aria-labelledby={titleId}>
       <header className="st-card-head">
-        <span className={`provider-dot ${familyClass(family)}`} aria-hidden="true" />
+        <FamilyMark family={family} />
         <h2 id={titleId}>{familyName(family)}</h2>
         <span className={entry?.connected ? 'st-pill is-on' : 'st-pill'}>
           {!entry ? 'Unknown' : entry.connected ? 'Connected' : 'Not connected'}

@@ -22,6 +22,7 @@ import { UsageGauges } from '../usage-gauges.tsx';
 import { projectUsagePresentation } from '../usage-presentation.ts';
 import { ChangesPanel } from './changes-panel.tsx';
 import { readThread, type ThreadSource } from './commands.ts';
+import { FamilyMark } from './family-mark.tsx';
 import { usageCards, useUsageClock } from './usage-cards.ts';
 
 export type InspectorTab = 'changes' | 'usage' | 'thread';
@@ -238,7 +239,10 @@ function ThreadTab({
             <ul>
               {thread.sessions.map((session) => (
                 <li key={session.family}>
-                  {familyName(session.family)} · {session.model}
+                  <span className="th-session">
+                    <FamilyMark family={session.family} />
+                    {familyName(session.family)} · {session.model}
+                  </span>
                   <code title={session.sessionId}>{session.sessionId.slice(0, 12)}</code>
                 </li>
               ))}

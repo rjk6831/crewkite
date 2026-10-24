@@ -3,6 +3,7 @@ import { memo, type ReactNode, useEffect, useLayoutEffect, useRef, useState } fr
 import { familyName } from '../components.tsx';
 import { AttachmentChips } from './attach.tsx';
 import { FailureLine, PermissionCard, ThinkingCard, ToolCard } from './cards.tsx';
+import { FamilyMark } from './family-mark.tsx';
 import { Markdown } from './markdown.tsx';
 import type { ThreadItem, TurnView } from './thread-state.ts';
 
@@ -35,7 +36,7 @@ const TurnRow = memo(function TurnRow({
     <article className="th-row th-assistant" aria-busy={!turn.ended}>
       {identity && (
         <header className="th-turn-head">
-          <span className={`th-dot family-${identity.family}`} aria-hidden="true" />
+          <FamilyMark family={identity.family} />
           <span>
             {familyName(identity.family)} · {identity.model}
           </span>
