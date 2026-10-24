@@ -402,6 +402,7 @@ export class Controller {
         })),
         ...this.anthropicUsage().catalogWindows(),
       ],
+      turns: this.store.db,
       nowMs: Date.parse(this.now()),
     });
   }
