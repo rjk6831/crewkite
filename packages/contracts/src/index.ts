@@ -6,6 +6,7 @@ import {
   ChatCatalogReadSchema,
   ChatChangesReadSchema,
   ChatFamilySchema,
+  ChatQueuedMessageSchema,
   ChatRoleSchema,
   ChatThreadReadSchema,
   ChatThreadSchema,
@@ -3396,6 +3397,11 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
     branch: AcceptChatChangesPayloadSchema.shape.branch,
     commit: z.string().regex(/^[a-f0-9]{40}$/),
     fileCount: z.number().int().nonnegative(),
+  }),
+  /** What a stop took out of the thread's queue, so the composer can give the text back. */
+  z.strictObject({
+    kind: z.literal('chat-queue'),
+    messages: z.array(ChatQueuedMessageSchema).max(8),
   }),
   WorkspaceStateSchema,
   TaskOperationsPageSchema,

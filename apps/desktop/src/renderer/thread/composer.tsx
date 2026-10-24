@@ -240,6 +240,7 @@ export function Composer({
             catalog={catalog}
             selection={chosen}
             currentFamily={currentFamily}
+            handoffMode={thread?.handoffMode}
             running={running}
             nowMs={Date.now()}
             onOpen={loadCatalog}

@@ -262,12 +262,12 @@ export class ChatService {
     if (!live) return blocked('no-active-turn');
     // The turn result marks the row stopped once the provider has let go.
     live.stopRequested = true;
-    // Stop ends the wait too. The view still has the queue it showed and puts the texts back.
+    // Stop ends the wait too. The cleared messages go back so the composer can offer the text.
     const task = this.task(payload.taskId);
     const thread = this.thread(payload.taskId);
     if (task && thread.queued.length) this.putThread(task, { ...thread, queued: [] });
     effects.push(() => this.call(() => live.handle?.stop()));
-    return { outcome: 'applied' };
+    return { outcome: 'applied', data: { kind: 'chat-queue', messages: thread.queued } };
   }
 
   configure(payload: Payload<'ConfigureChatThread'>): CommandResult {
@@ -289,6 +289,7 @@ export class ChatService {
       // Choosing ask again takes back everything the thread allowed.
       ...(payload.permissionPolicy === 'ask' ? { permissionGrants: [] } : {}),
       autoHandoff: payload.autoHandoff ?? thread.autoHandoff,
+      handoffMode: payload.handoffMode ?? thread.handoffMode,
     });
     return { outcome: 'applied' };
   }

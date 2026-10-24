@@ -100,14 +100,13 @@ export function ThreadView({
     },
     [source, task.id, dispatch, waits],
   );
-  // Stop clears the queue, and the texts go back into an empty composer.
-  // shortcut: they come from the queue this view last saw, so a message queued in the same instant
-  // as the stop is not restored. Upgrade: return the cleared messages in the stop result.
+  // Stop clears the queue, and the texts the controller took out go back into an empty composer.
   const stop = useCallback(async () => {
     if (!activeTurn) return;
-    await stopTurn(source, { taskId: task.id, turnId: activeTurn });
-    if (queued?.length) composer.current?.restore(queued.map((item) => item.text).join('\n\n'));
-  }, [source, task.id, activeTurn, queued]);
+    const result = await stopTurn(source, { taskId: task.id, turnId: activeTurn });
+    const cleared = result.data?.kind === 'chat-queue' ? result.data.messages : [];
+    if (cleared.length) composer.current?.restore(cleared.map((item) => item.text).join('\n\n'));
+  }, [source, task.id, activeTurn]);
   const dequeue = useCallback(
     (id: string) =>
       configureThread(source, { taskId: task.id, dequeue: id }).then(
