@@ -397,7 +397,9 @@ export class ChatService {
         files,
         identity,
         at,
-        message: `CrewKite: ${task.title.replace(/\s+/g, ' ').trim()}\n`,
+        message: payload.message?.trim()
+          ? `${payload.message.trimEnd()}\n`
+          : `CrewKite: ${task.title.replace(/\s+/g, ' ').trim()}\n`,
       });
       applyPublication({
         source: root,
