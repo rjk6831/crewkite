@@ -149,6 +149,18 @@ export class ProviderCommands {
         data: { kind: 'google-acp-setup', setup: next },
       };
     }
+    // Automatic consent is the controller's own launch-time step. From anyone else it would
+    // put a click in the journal that nobody made.
+    if (
+      'consent' in command.payload &&
+      command.payload.consent === 'automatic' &&
+      command.actor.kind !== 'controller'
+    )
+      return {
+        outcome: 'denied',
+        reason: 'consent-required',
+        data: { kind: 'google-acp-setup', setup },
+      };
     const installBlocker = this.googleInstallationBlocker();
     if (installBlocker) return installBlocker;
     const blocker = this.store.googleOperationBlocker();

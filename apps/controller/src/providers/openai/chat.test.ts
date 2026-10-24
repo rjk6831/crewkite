@@ -155,7 +155,7 @@ input.on('line', (line) => {
   if (value.method === 'turn/interrupt' && given.silent) return;
   let result = replies[value.method];
   // Fields CrewKite does not read change shape between client builds.
-  if (value.method === 'thread/start') result = { thread: { id: threadId, preview: '' }, model: value.params.model, sandbox: { type: 'futureSandbox' } };
+  if (value.method === 'thread/start') result = { thread: { id: threadId, preview: '' }, model: value.params.model, sandbox: { type: 'futureSandbox' }, ...(scenario === 'ignored-policy' ? { approvalPolicy: 'never' } : {}) };
   if (value.method === 'thread/resume') {
     threadId = value.params.threadId;
     result = { thread: { id: threadId } };
@@ -598,6 +598,29 @@ test('a client that fails before its turn runs leaves its error output and last 
         method: null,
         code: null,
         detail: 'starting\nError: invalid configuration\n\nsent #1 initialize',
+      },
+    },
+    {
+      // A thread that names another policy than the one sent would run edits without asking.
+      scenario: 'ignored-policy',
+      failure: {
+        stage: 'session',
+        kind: 'protocol',
+        message:
+          'Codex opened the thread under the never policy, and CrewKite asked for untrusted.',
+        providerMessage: null,
+        method: 'thread/start',
+        code: null,
+        detail: [
+          'received #1 result',
+          'sent initialized',
+          'sent #2 account/read',
+          'received #2 result',
+          'sent #3 account/rateLimits/read',
+          'received #3 result',
+          'sent #4 thread/start',
+          'received #4 result',
+        ].join('\n'),
       },
     },
     {

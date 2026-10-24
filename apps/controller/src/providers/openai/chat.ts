@@ -226,7 +226,13 @@ const envelope = z.object({
 const rpcError = z.object({ code: maybe(z.number().int().safe()), message: maybe(z.string()) });
 const accountReply = z.object({ account: z.object({ type: z.string() }).nullable() });
 const limitsReply = z.object({ ordinaryUsageAllowed: maybe(z.boolean()) });
-const threadReply = z.object({ thread: z.object({ id: z.string().min(1).max(512) }) });
+// The reply names the policy the thread runs under. A build that leaves it out is taken at its
+// word; one that names another policy than the one sent is not, since edits would then run
+// without asking.
+const threadReply = z.object({
+  thread: z.object({ id: z.string().min(1).max(512) }),
+  approvalPolicy: z.unknown().optional(),
+});
 const turnReply = z.object({ turn: z.object({ id }) });
 const scope = z.object({ threadId: z.string() });
 const itemFrame = z.object({ item: z.unknown().optional() });
@@ -542,6 +548,7 @@ class OpenAiChatTurn {
               message: 'Codex started a thread without an ID.',
             }),
           );
+        if (!this.policyApplied(thread.data, 'thread/start')) return;
         this.threadId = thread.data.thread.id;
         this.startTurn(true, history);
       });
@@ -552,6 +559,7 @@ class OpenAiChatTurn {
     this.call('thread/resume', resume, (reply) => {
       const thread = 'result' in reply ? threadReply.safeParse(reply.result) : null;
       if (thread?.success) {
+        if (!this.policyApplied(thread.data, 'thread/resume')) return;
         this.threadId = thread.data.thread.id;
         return this.startTurn(false, false);
       }
@@ -563,6 +571,20 @@ class OpenAiChatTurn {
       );
       start(true);
     });
+  }
+
+  private policyApplied(reply: z.infer<typeof threadReply>, method: string): boolean {
+    const wanted = approvalPolicy(this.request);
+    if (reply.approvalPolicy === undefined || reply.approvalPolicy === wanted) return true;
+    this.fail(
+      chatFailure({
+        stage: 'session',
+        kind: 'protocol',
+        method,
+        message: `Codex opened the thread under the ${String(reply.approvalPolicy).slice(0, 40)} policy, and CrewKite asked for ${wanted}.`,
+      }),
+    );
+    return false;
   }
 
   private startTurn(fresh: boolean, history: boolean) {
