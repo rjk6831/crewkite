@@ -61,7 +61,9 @@ export function openAiChatAdapter(deps: OpenAiChatDeps): ChatAdapter {
 // `untrusted` brings every file change, and every command outside the client's own short list of
 // read-only ones, back to CrewKite as a question. allow-edits starts there too, and serverRequest
 // answers the edits that stay inside scratch. allow-all lets the client work inside its sandbox and
-// asks only to leave it.
+// asks only to leave it. The policy goes on thread/start and thread/resume, which still take
+// `untrusted`. The client's config loader refuses `approval_policy = "untrusted"` at startup, and
+// the app-server then exits before it answers initialize, so the launch override stays on-request.
 const approvalPolicy = (request: ChatTurnRequest) =>
   request.permissionPolicy === 'allow-all' ? 'on-request' : 'untrusted';
 // Review and advice turns read only.
@@ -79,7 +81,7 @@ function nativeChatArguments(directory: string, request: ChatTurnRequest): strin
     openai_base_url: '',
     chatgpt_base_url: 'https://chatgpt.com/backend-api/',
     service_tier: 'default',
-    approval_policy: approvalPolicy(request),
+    approval_policy: 'on-request',
     approvals_reviewer: 'user',
     sandbox_mode: sandboxMode(request),
     web_search: 'disabled',
@@ -525,9 +527,6 @@ class OpenAiChatTurn {
       approvalsReviewer: 'user',
       sandbox: sandboxMode(this.request),
       serviceTier: 'default',
-      ...(selection.effort === 'default'
-        ? {}
-        : { config: { model_reasoning_effort: selection.effort } }),
     };
     const start = (history: boolean) =>
       this.call('thread/start', { ...settings, ephemeral: false }, (reply) => {
@@ -567,16 +566,23 @@ class OpenAiChatTurn {
   }
 
   private startTurn(fresh: boolean, history: boolean) {
-    const { systemContext, prompt } = this.request;
+    const { systemContext, prompt, selection } = this.request;
     const transcript = history
       ? this.request.history
           .map((entry) => `${entry.role === 'user' ? 'User' : 'Assistant'}: ${entry.text}`)
           .join('\n\n')
       : '';
     const text = fresh ? [systemContext, transcript, prompt].filter(Boolean).join('\n\n') : prompt;
+    // turn/start sets the effort for this turn and the ones after it. thread/start and
+    // thread/resume have no effort field, so every turn names its own and a resumed thread follows
+    // the composer. Default sends none and leaves the thread's level as it is.
     this.call(
       'turn/start',
-      { threadId: this.threadId, input: [{ type: 'text', text }] },
+      {
+        threadId: this.threadId,
+        input: [{ type: 'text', text }],
+        ...(selection.effort === 'default' ? {} : { effort: selection.effort }),
+      },
       (reply) => {
         if ('error' in reply)
           return this.fail(this.providerFailure('prompt', 'turn/start', reply.error));

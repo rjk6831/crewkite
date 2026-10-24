@@ -1,18 +1,20 @@
 // Native frames this adapter assumes, one JSON object per line. A live run on the pinned client
 // should confirm each of them.
 //
-// Launch: `-c approval_policy="untrusted"` for the ask and allow-edits policies, "on-request" for
-// allow-all, and the same value as approvalPolicy below. Under untrusted the client asks before
-// every file change and every command outside its own read-only list.
+// Launch: `-c approval_policy="on-request"` under every policy. The client's config loader refuses
+// "untrusted" and the app-server exits before it answers initialize. The thread's own policy goes
+// in approvalPolicy below: "untrusted" for the ask and allow-edits policies, "on-request" for
+// allow-all. Under untrusted the client asks before every file change and every command outside
+// its own read-only list.
 //
 // Client to server, ids counted from 1 per process:
 //   {"id":1,"method":"initialize","params":{"clientInfo":{"name":"crewkite","title":"CrewKite","version":"0.0.0"},"capabilities":{"experimentalApi":false,"explicitGatewayOauth":true}}}
 //   {"method":"initialized"}
 //   {"id":2,"method":"account/read","params":{"refreshToken":false}}
 //   {"id":3,"method":"account/rateLimits/read","params":{"supportsLunaReserve":false,"excludeResetCreditDetails":true}}
-//   {"id":4,"method":"thread/start","params":{"model":M,"modelProvider":"openai","cwd":SCRATCH,"approvalPolicy":"untrusted"|"on-request","approvalsReviewer":"user","sandbox":"workspace-write","serviceTier":"default","config":{"model_reasoning_effort":E},"ephemeral":false}}
+//   {"id":4,"method":"thread/start","params":{"model":M,"modelProvider":"openai","cwd":SCRATCH,"approvalPolicy":"untrusted"|"on-request","approvalsReviewer":"user","sandbox":"workspace-write","serviceTier":"default","ephemeral":false}}
 //   {"id":4,"method":"thread/resume","params":{"threadId":T, same settings without ephemeral,"excludeTurns":true}}
-//   {"id":5,"method":"turn/start","params":{"threadId":T,"input":[{"type":"text","text":TEXT}]}}
+//   {"id":5,"method":"turn/start","params":{"threadId":T,"input":[{"type":"text","text":TEXT}],"effort":E}}, effort left out for default
 //   {"id":R,"result":{"decision":"accept"|"acceptForSession"|"decline"}}, the answer to approval request R
 //   {"id":N,"method":"turn/interrupt","params":{"threadId":T,"turnId":U}}
 //
@@ -531,10 +533,13 @@ test('the next turn resumes the thread with its own approval policy and sends on
     approvalsReviewer: 'user',
     sandbox: 'workspace-write',
     serviceTier: 'default',
-    config: { model_reasoning_effort: 'low' },
   };
-  assert(first.args().includes('approval_policy="untrusted"'));
-  assert(second.args().includes('approval_policy="on-request"'));
+  // The launch never names untrusted, which the client refuses at startup. The thread calls
+  // carry each turn's own policy.
+  for (const run of [first, second]) {
+    assert(run.args().includes('approval_policy="on-request"'));
+    assert(!run.args().some((arg) => arg.includes('untrusted')));
+  }
   assert.deepEqual(first.frames().slice(4), [
     { id: 4, method: 'thread/start', params: { ...settings, ephemeral: false } },
     {
@@ -543,6 +548,7 @@ test('the next turn resumes the thread with its own approval policy and sends on
       params: {
         threadId: 'thread-1',
         input: [{ type: 'text', text: `${systemContext}\n\n${prompt}` }],
+        effort: 'low',
       },
     },
   ]);
@@ -572,7 +578,7 @@ test('the next turn resumes the thread with its own approval policy and sends on
     {
       id: 5,
       method: 'turn/start',
-      params: { threadId: 'thread-1', input: [{ type: 'text', text: prompt }] },
+      params: { threadId: 'thread-1', input: [{ type: 'text', text: prompt }], effort: 'low' },
     },
   ]);
   assert.equal(result.session?.sessionId, 'thread-1');
