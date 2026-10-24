@@ -20,6 +20,8 @@ export const effortLabels: Record<ChatEffort, string> = {
   medium: 'Medium',
   high: 'High',
   xhigh: 'Extra high',
+  ultra: 'Ultra',
+  max: 'Max',
   default: 'Default',
 };
 

@@ -13,6 +13,10 @@ export type RoleAction = Exclude<ChatRole, 'assistant'>;
 export const roleActions: Record<RoleAction, { label: string; prompt: string }> = {
   reviewer: { label: 'Review changes', prompt: 'Review the current changes.' },
   advisor: { label: 'Second opinion', prompt: 'Give a second opinion on the last answer.' },
+  challenger: {
+    label: 'Challenge assumptions',
+    prompt: 'Challenge the assumptions behind the last answer.',
+  },
 };
 
 // The default is a family other than the one that answered last, so the second look is

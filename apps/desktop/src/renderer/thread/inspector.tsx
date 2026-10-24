@@ -33,6 +33,7 @@ const roleNames: Record<ChatRole, string> = {
   assistant: 'Assistant',
   reviewer: 'Reviewer',
   advisor: 'Advisor',
+  challenger: 'Challenger',
 };
 
 // The chosen width is a local preference. Storage can be blocked, and the panel falls back to the

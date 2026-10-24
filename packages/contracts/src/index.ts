@@ -897,7 +897,9 @@ export const WindowSchema = z.strictObject({
   state: WindowStateSchema,
 });
 export const AnthropicUsageReadingSchema = z.strictObject({
-  source: z.literal('native-local-command'),
+  // The local /usage command reports every window. A turn's rate limit frames report the
+  // five-hour and weekly windows the request touched, with no extra command.
+  source: z.enum(['native-local-command', 'turn-rate-limit']),
   status: z.enum(['reported', 'unavailable']),
   receivedAt: TimestampSchema,
   observedAt: z.null(),

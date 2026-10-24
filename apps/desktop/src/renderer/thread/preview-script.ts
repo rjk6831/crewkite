@@ -52,6 +52,8 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
     sessions: [],
     activeTurnId: null,
     autoHandoff: false,
+    handoffMode: 'most-left',
+    queued: [],
   };
   const messages: ChatMessage[] = [];
   const turns: ChatTurn[] = [];

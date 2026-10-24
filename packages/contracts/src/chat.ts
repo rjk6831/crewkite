@@ -12,8 +12,27 @@ const timestamp = z.iso.datetime();
 
 export const ChatTurnIdSchema = id('trn');
 export const ChatFamilySchema = z.enum(['openai', 'anthropic', 'google', 'local']);
-export const ChatRoleSchema = z.enum(['assistant', 'reviewer', 'advisor']);
-export const ChatEffortSchema = z.enum(['minimal', 'low', 'medium', 'high', 'xhigh', 'default']);
+// A reviewer reads the changes. An advisor gives a second opinion on the last answer. A
+// challenger argues against the assumptions the last answer rests on. The last three read only.
+export const ChatRoleSchema = z.enum(['assistant', 'reviewer', 'advisor', 'challenger']);
+// The clients name their own levels. OpenAI offers up to ultra on some models, Anthropic up to max.
+export const ChatEffortSchema = z.enum([
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'ultra',
+  'max',
+  'default',
+]);
+/**
+ * How the thread picks the next family when a limit stops a turn and automatic handoff is on.
+ * most-left takes the family with the most allowance left. resets-first spends the allowance that
+ * resets soonest while it lasts.
+ */
+export const ChatHandoffModeSchema = z.enum(['most-left', 'resets-first']);
+export type ChatHandoffMode = z.infer<typeof ChatHandoffModeSchema>;
 
 /** The person's selection for the next turn. The controller validates it against the catalog. */
 export const ChatModelSelectionSchema = z.strictObject({
@@ -178,6 +197,17 @@ export type ChatSession = z.infer<typeof ChatSessionSchema>;
 
 export const ChatPermissionPolicySchema = z.enum(['ask', 'allow-edits', 'allow-all']);
 
+/** A message waiting for the running turn to finish. The composer can still take it back. */
+export const ChatQueuedMessageSchema = z.strictObject({
+  id: id('msg'),
+  at: timestamp,
+  text: z.string().min(1).max(65_536),
+  role: ChatRoleSchema.default('assistant'),
+  selection: ChatModelSelectionSchema.optional(),
+  attachments: z.array(z.string().min(1).max(4096)).max(32).default([]),
+});
+export type ChatQueuedMessage = z.infer<typeof ChatQueuedMessageSchema>;
+
 export const ChatThreadSchema = z.strictObject({
   taskId: id('tsk'),
   scratchReady: z.boolean(),
@@ -190,6 +220,12 @@ export const ChatThreadSchema = z.strictObject({
   sessions: z.array(ChatSessionSchema).max(8).default([]),
   activeTurnId: ChatTurnIdSchema.nullable().default(null),
   autoHandoff: z.boolean().default(false),
+  handoffMode: ChatHandoffModeSchema.default('most-left'),
+  /**
+   * Messages sent while a turn was running, oldest first. Each starts its own turn, in order,
+   * once the thread is free. Stopping the running turn clears them.
+   */
+  queued: z.array(ChatQueuedMessageSchema).max(8).default([]),
   /** Tool kinds the person allowed for the whole thread. Adapters answer these without asking. */
   permissionGrants: z.array(ChatToolKindSchema).max(8).optional(),
   /**
@@ -237,6 +273,7 @@ export const ConfigureChatThreadPayloadSchema = z.strictObject({
   selection: ChatModelSelectionSchema.optional(),
   permissionPolicy: ChatPermissionPolicySchema.optional(),
   autoHandoff: z.boolean().optional(),
+  handoffMode: ChatHandoffModeSchema.optional(),
 });
 export const AcceptChatChangesPayloadSchema = z.strictObject({
   taskId: id('tsk'),
@@ -325,6 +362,8 @@ export const ChatCatalogEntrySchema = z.strictObject({
         label: short,
         efforts: z.array(ChatEffortSchema).max(8),
         defaultEffort: ChatEffortSchema,
+        /** The client lists it only on request, as with an older model kept for old threads. */
+        hidden: z.boolean().optional(),
       }),
     )
     .max(64),
@@ -453,20 +492,25 @@ export function rankFamilies(
   families: readonly ChatCatalogEntry[],
   exclude: readonly ChatCatalogEntry['family'][] = [],
   modelFor: (entry: ChatCatalogEntry) => string | null = (entry) => entry.defaultModel,
+  mode: ChatHandoffMode = 'most-left',
 ): ChatCatalogEntry[] {
   const score = (entry: ChatCatalogEntry) => tightestAllowance(entry, modelFor(entry));
+  const reset = (value: string | null) => (value ? Date.parse(value) : Number.POSITIVE_INFINITY);
   return families
     .filter((entry) => entry.connected && !exclude.includes(entry.family))
     .filter((entry) => score(entry).percent !== 0)
     .sort((left, right) => {
       const a = score(left);
       const b = score(right);
+      // A family with no reading sorts last in both modes. It may be out already.
       if (a.percent === null && b.percent !== null) return 1;
       if (b.percent === null && a.percent !== null) return -1;
+      // Allowance that resets soonest is lost soonest, so resets-first spends it while it lasts.
+      // A window with no reset time counts as the farthest away.
+      if (mode === 'resets-first' && reset(a.resetsAt) !== reset(b.resetsAt))
+        return reset(a.resetsAt) - reset(b.resetsAt);
       if (a.percent !== null && b.percent !== null && a.percent !== b.percent)
         return b.percent - a.percent;
-      const resetA = a.resetsAt ? Date.parse(a.resetsAt) : Number.POSITIVE_INFINITY;
-      const resetB = b.resetsAt ? Date.parse(b.resetsAt) : Number.POSITIVE_INFINITY;
-      return resetA - resetB;
+      return reset(a.resetsAt) - reset(b.resetsAt);
     });
 }

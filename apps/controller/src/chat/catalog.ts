@@ -136,6 +136,7 @@ function chatModel(
   efforts: readonly string[],
   preferred: string,
   label = model,
+  hidden = false,
 ): Model {
   const known = [
     ...new Set(
@@ -152,6 +153,7 @@ function chatModel(
     label,
     efforts: list,
     defaultEffort: wanted.success && list.includes(wanted.data) ? wanted.data : list[0],
+    ...(hidden ? { hidden } : {}),
   };
 }
 

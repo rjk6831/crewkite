@@ -98,6 +98,8 @@ test('a turn sits right after the user message that started it', () => {
     sessions: [],
     activeTurnId: null,
     autoHandoff: false,
+    handoffMode: 'most-left',
+    queued: [],
   };
   const at = (minutes: number) => new Date(Date.parse(stamp) + minutes * 60_000).toISOString();
   const record = (turnId: string, sequence: number, asked: number, more: Partial<ChatTurn> = {}) =>
@@ -379,6 +381,8 @@ test('the limit offer shows only while the newest turn is the one that hit a lim
     sessions: [],
     activeTurnId: null,
     autoHandoff: false,
+    handoffMode: 'most-left',
+    queued: [],
   };
   const reopened = (turns: ChatTurn[]) =>
     limitOffer(
@@ -491,6 +495,8 @@ test('a reply restored from a thread read keeps the role of its turn for the bad
       sessions: [],
       activeTurnId: null,
       autoHandoff: false,
+      handoffMode: 'most-left',
+      queued: [],
     },
     turns: [
       {
@@ -542,6 +548,8 @@ test('stream events that a thread read already covers apply once', () => {
     sessions: [],
     activeTurnId: turn,
     autoHandoff: false,
+    handoffMode: 'most-left',
+    queued: [],
   };
   const delta = (cursor: number, text: string) =>
     agent(cursor, { type: 'text.delta', itemId: 'a', text });

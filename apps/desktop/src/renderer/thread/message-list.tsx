@@ -6,7 +6,12 @@ import { FailureLine, PermissionCard, ThinkingCard, ToolCard } from './cards.tsx
 import { Markdown } from './markdown.tsx';
 import type { ThreadItem, TurnView } from './thread-state.ts';
 
-const roleLabels = { assistant: null, reviewer: 'Reviewer', advisor: 'Advisor' } as const;
+const roleLabels = {
+  assistant: null,
+  reviewer: 'Reviewer',
+  advisor: 'Advisor',
+  challenger: 'Challenger',
+} as const;
 
 type TurnHandlers = {
   onResolve: (turn: TurnView, requestId: string, choice: string) => Promise<void>;
