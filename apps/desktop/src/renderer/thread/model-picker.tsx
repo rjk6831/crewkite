@@ -2,11 +2,12 @@ import {
   type ChatCatalogRead,
   type ChatEffort,
   type ChatFamily,
+  type ChatHandoffMode,
   type ChatModelSelection,
   rankFamilies,
   tightestAllowance,
 } from '@crewkite/contracts';
-import { ArrowRightLeft, Check, ChevronDown } from 'lucide-react';
+import { ArrowRightLeft, Check, ChevronDown, ChevronRight } from 'lucide-react';
 import { type KeyboardEvent, useEffect, useId, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
 import { familyModel } from '../settings/preferences.ts';
@@ -53,15 +54,18 @@ export function findModel(catalog: ChatCatalogRead | null, selection: ChatModelS
 }
 
 // The top family in the contract ranking, on its default model. A family with no models listed
-// cannot be picked, so it does not compete.
+// cannot be picked, so it does not compete. The thread's handoff mode orders the families the same
+// way an automatic handoff would.
 export function defaultSelection(
   catalog: ChatCatalogRead | null,
   exclude: readonly ChatFamily[] = [],
+  mode: ChatHandoffMode = 'most-left',
 ): ChatModelSelection | null {
   const [entry] = rankFamilies(
     (catalog?.families ?? []).filter((value) => value.models.length > 0),
     exclude,
     (value) => familyModel(value),
+    mode,
   );
   const chosen = entry && familyModel(entry);
   const model = entry?.models.find(({ model }) => model === chosen) ?? entry?.models[0];
@@ -76,10 +80,11 @@ function handoffTarget(
   catalog: ChatCatalogRead | null,
   selection: ChatModelSelection | null,
   currentFamily: ChatFamily | null,
+  mode: ChatHandoffMode,
 ): ChatModelSelection | null {
   if (!currentFamily) return null;
   if (selection && selection.family !== currentFamily) return selection;
-  return defaultSelection(catalog, [currentFamily]);
+  return defaultSelection(catalog, [currentFamily], mode);
 }
 
 export function ModelPicker({
@@ -91,6 +96,7 @@ export function ModelPicker({
   onOpen,
   onSelect,
   onHandoff,
+  handoffMode = 'most-left',
   label: menuLabel = 'Provider and model',
 }: {
   catalog: ChatCatalogRead | null;
@@ -102,9 +108,13 @@ export function ModelPicker({
   onSelect: (selection: ChatModelSelection) => void;
   /** Without it the menu lists models only. The thread moves providers from the main composer. */
   onHandoff?: (selection: ChatModelSelection) => Promise<void>;
+  /** The thread's mode, so the suggested provider is the one an automatic handoff would pick. */
+  handoffMode?: ChatHandoffMode;
   label?: string;
 }) {
   const [open, setOpen] = useState(false);
+  // Families whose legacy models are shown. Every opening starts with them folded away.
+  const [legacy, setLegacy] = useState<ReadonlySet<ChatFamily>>(new Set());
   const root = useRef<HTMLDivElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
   const menu = useRef<HTMLDivElement>(null);
@@ -168,7 +178,7 @@ export function ModelPicker({
   const label = selection
     ? `${familyName(selection.family)} · ${model?.label ?? selection.model}`
     : 'Choose a model';
-  const target = onHandoff ? handoffTarget(catalog, selection, currentFamily) : null;
+  const target = onHandoff ? handoffTarget(catalog, selection, currentFamily, handoffMode) : null;
   const targetName = target
     ? `${familyName(target.family)} · ${findModel(catalog, target).model?.label ?? target.model}`
     : null;
@@ -187,7 +197,10 @@ export function ModelPicker({
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
         onClick={() => {
-          if (!open) onOpen();
+          if (!open) {
+            onOpen();
+            setLegacy(new Set());
+          }
           setOpen(!open);
         }}
       >
@@ -206,46 +219,77 @@ export function ModelPicker({
           onKeyDown={onMenuKey}
         >
           {!catalog && <p className="th-menu-empty">Models are not available yet.</p>}
-          {catalog?.families.map((family) => (
-            <div
-              key={family.family}
-              className="th-menu-group"
-              title={family.connected ? undefined : (family.reason ?? 'Not connected')}
-            >
-              <div className={family.connected ? 'th-menu-head' : 'th-menu-head is-off'}>
-                <FamilyMark family={family.family} />
-                <strong>{familyName(family.family)}</strong>
-                <span>{family.connected ? allowance(family, nowMs) : 'Not connected'}</span>
+          {catalog?.families.map((family) => {
+            const item = (model: Entry['models'][number]) => {
+              const checked =
+                selection?.family === family.family && selection.model === model.model;
+              const own = family.connected ? modelAllowance(family, model.model) : null;
+              return (
+                <button
+                  key={model.model}
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={checked}
+                  disabled={!family.connected}
+                  title={family.connected ? undefined : (family.reason ?? 'Not connected')}
+                  onClick={() => {
+                    onSelect({
+                      family: family.family,
+                      model: model.model,
+                      effort: checked && selection ? selection.effort : model.defaultEffort,
+                    });
+                    setOpen(false);
+                  }}
+                >
+                  <span>{model.label}</span>
+                  {own && <em>{own}</em>}
+                  {checked && <Check size={14} aria-hidden="true" />}
+                </button>
+              );
+            };
+            const older = family.models.filter((model) => model.hidden);
+            const shown = legacy.has(family.family);
+            // A legacy model the thread already runs on stays in view with the group folded.
+            const kept = older.filter(
+              (model) => selection?.family === family.family && selection.model === model.model,
+            );
+            return (
+              <div
+                key={family.family}
+                className="th-menu-group"
+                title={family.connected ? undefined : (family.reason ?? 'Not connected')}
+              >
+                <div className={family.connected ? 'th-menu-head' : 'th-menu-head is-off'}>
+                  <FamilyMark family={family.family} />
+                  <strong>{familyName(family.family)}</strong>
+                  <span>{family.connected ? allowance(family, nowMs) : 'Not connected'}</span>
+                </div>
+                {family.models.filter((model) => !model.hidden).map(item)}
+                {older.length > 0 && (
+                  <>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="th-menu-legacy"
+                      aria-expanded={shown}
+                      disabled={!family.connected}
+                      onClick={() => {
+                        const next = new Set(legacy);
+                        if (shown) next.delete(family.family);
+                        else next.add(family.family);
+                        setLegacy(next);
+                      }}
+                    >
+                      <ChevronRight size={13} className="th-chevron" aria-hidden="true" />
+                      <span>{shown ? 'Legacy' : 'Show legacy'}</span>
+                      <em>{older.length}</em>
+                    </button>
+                    {(shown ? older : kept).map(item)}
+                  </>
+                )}
               </div>
-              {family.models.map((item) => {
-                const checked =
-                  selection?.family === family.family && selection.model === item.model;
-                const own = family.connected ? modelAllowance(family, item.model) : null;
-                return (
-                  <button
-                    key={item.model}
-                    type="button"
-                    role="menuitemradio"
-                    aria-checked={checked}
-                    disabled={!family.connected}
-                    title={family.connected ? undefined : (family.reason ?? 'Not connected')}
-                    onClick={() => {
-                      onSelect({
-                        family: family.family,
-                        model: item.model,
-                        effort: checked && selection ? selection.effort : item.defaultEffort,
-                      });
-                      setOpen(false);
-                    }}
-                  >
-                    <span>{item.label}</span>
-                    {own && <em>{own}</em>}
-                    {checked && <Check size={14} aria-hidden="true" />}
-                  </button>
-                );
-              })}
-            </div>
-          ))}
+            );
+          })}
           {onHandoff && (
             <button
               type="button"

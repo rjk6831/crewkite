@@ -1,6 +1,7 @@
 import {
   type ChatCatalogRead,
   type ChatFamily,
+  type ChatHandoffMode,
   type ChatModelSelection,
   rankFamilies,
   tightestAllowance,
@@ -15,6 +16,8 @@ export type LimitOffer = {
   turnId: string;
   /** The family that stopped. It is never offered as the place to continue. */
   family: ChatFamily;
+  /** The thread's handoff mode. The offer ranks the other families the way it says. */
+  mode: ChatHandoffMode;
 };
 
 // A turn known from a read has a sequence. One seen only on the stream is newer than all of them.
@@ -43,7 +46,8 @@ export function limitOffer(state: ThreadState): LimitOffer | null {
     : (completed?.type === 'turn.completed' && completed.stopReason === 'limit') ||
       failure?.kind === 'usage-limit';
   const family = record?.view.identity?.family ?? meta?.selection.family;
-  return limited && family ? { turnId: id, family } : null;
+  const mode = state.thread?.handoffMode ?? 'most-left';
+  return limited && family ? { turnId: id, family, mode } : null;
 }
 
 export type OfferChoice = {
@@ -55,10 +59,14 @@ export type OfferChoice = {
 
 /**
  * One choice per connected family other than the one that stopped, on its default model, in the
- * order the contract ranks them. A family with nothing left is not offered.
+ * order the contract ranks them for the thread's mode. A family with nothing left is not offered.
  */
-export function offerChoices(catalog: ChatCatalogRead, stopped: ChatFamily): OfferChoice[] {
-  const ranked = rankFamilies(catalog.families, [stopped], (entry) => familyModel(entry));
+export function offerChoices(
+  catalog: ChatCatalogRead,
+  stopped: ChatFamily,
+  mode: ChatHandoffMode = 'most-left',
+): OfferChoice[] {
+  const ranked = rankFamilies(catalog.families, [stopped], (entry) => familyModel(entry), mode);
   return ranked.flatMap((entry) => {
     const model = familyModel(entry) ?? entry.models[0]?.model;
     if (!model) return [];

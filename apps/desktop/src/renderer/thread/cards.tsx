@@ -4,6 +4,7 @@ import {
   Check,
   ChevronRight,
   CircleX,
+  FileSearch,
   FileText,
   LoaderCircle,
   Pencil,
@@ -15,7 +16,13 @@ import {
 } from 'lucide-react';
 import { type ReactNode, useState } from 'react';
 import { formatSpan } from '../usage-gauges.tsx';
-import type { PermissionBlock, ThinkingBlock, ToolBlock } from './turn-fold.ts';
+import {
+  type PermissionBlock,
+  runLabel,
+  type ThinkingBlock,
+  type ToolBlock,
+  type ToolRun,
+} from './turn-fold.ts';
 
 const toolIcons = {
   read: FileText,
@@ -32,18 +39,26 @@ const lastLine = (text: string) =>
     .filter(Boolean)
     .at(-1) ?? '';
 
+// A finished block with no text never reaches this card; viewBlocks leaves it out. A live one with
+// no text yet has nothing to open.
 export function ThinkingCard({ block, ended }: { block: ThinkingBlock; ended: boolean }) {
   const [open, setOpen] = useState(false);
   const live = !block.done && !ended;
+  const hasBody = block.text.trim() !== '';
   return (
     <div className={live ? 'th-card th-thinking is-live' : 'th-card th-thinking'}>
-      <button type="button" aria-expanded={open} onClick={() => setOpen(!open)}>
+      <button
+        type="button"
+        aria-expanded={hasBody ? open : undefined}
+        disabled={!hasBody}
+        onClick={() => setOpen(!open)}
+      >
         <Brain size={14} aria-hidden="true" />
         <span className="th-card-title">{live ? 'Thinking' : 'Thought'}</span>
         {!open && <span className="th-preview">{lastLine(block.text)}</span>}
-        <ChevronRight size={14} className="th-chevron" aria-hidden="true" />
+        {hasBody && <ChevronRight size={14} className="th-chevron" aria-hidden="true" />}
       </button>
-      {open && <div className="th-thinking-body">{block.text}</div>}
+      {open && hasBody && <div className="th-thinking-body">{block.text}</div>}
     </div>
   );
 }
@@ -135,6 +150,39 @@ export function ToolCard({
   );
 }
 
+export function ToolRunCard({
+  run,
+  onOpenChanges,
+}: {
+  run: ToolRun;
+  onOpenChanges: (path: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const kinds = new Set(run.tools.map((tool) => tool.toolKind));
+  const Icon = kinds.size > 1 ? FileSearch : kinds.has('search') ? Search : FileText;
+  return (
+    <div className="th-run">
+      <div className="th-card th-tool is-ok">
+        <button type="button" aria-expanded={open} onClick={() => setOpen(!open)}>
+          <Icon size={14} aria-hidden="true" />
+          <span className="th-card-title th-run-title">{runLabel(run)}</span>
+          <span className="th-tool-status">
+            <StatusMark status="ok" />
+          </span>
+          <ChevronRight size={14} className="th-chevron" aria-hidden="true" />
+        </button>
+      </div>
+      {open && (
+        <div className="th-run-list">
+          {run.tools.map((tool) => (
+            <ToolCard key={tool.id} block={tool} onOpenChanges={onOpenChanges} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function PermissionCard({
   block,
   ended,
@@ -219,6 +267,7 @@ export function FailureLine({ failure }: { failure: ChatFailure }) {
           <summary>Provider details</summary>
           {failure.providerMessage && <pre>{failure.providerMessage}</pre>}
           <p className="th-muted">{facts.join(' · ')}</p>
+          {failure.detail && <pre className="th-failure-detail">{failure.detail}</pre>}
         </details>
       </div>
     </div>

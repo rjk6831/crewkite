@@ -569,6 +569,22 @@
   line-height: 1.5;
   white-space: pre-wrap;
 }
+/* A folded run of reads and searches. The summary reads as a sentence, the cards inside keep paths. */
+.th-run {
+  display: grid;
+  gap: 6px;
+}
+.th-tool .th-run-title {
+  color: var(--text-muted);
+  font-family: inherit;
+}
+.th-run-list {
+  display: grid;
+  gap: 6px;
+  margin-left: 9px;
+  padding-left: 11px;
+  border-left: 1px solid var(--border);
+}
 .th-permission {
   display: grid;
   gap: 10px;
@@ -664,6 +680,13 @@
   border-radius: 8px;
   background: var(--background);
   white-space: pre-wrap;
+}
+/* The client's last output lines. Twelve lines show, the rest scroll. */
+.th-failure .th-failure-detail {
+  max-height: calc(12lh + 18px);
+  color: var(--text-dim);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 /* Composer */
@@ -880,6 +903,16 @@
   font-size: 11.5px;
   font-style: normal;
 }
+.th-menu .th-menu-legacy {
+  justify-content: flex-start;
+  gap: 5px;
+  padding-left: 21px;
+  color: var(--text-dim);
+  font-size: 11.5px;
+}
+.th-menu-legacy .th-chevron {
+  margin-left: 0;
+}
 .th-menu .th-menu-foot {
   gap: 8px;
   justify-content: flex-start;
@@ -1067,10 +1100,98 @@
 .th-toggle input {
   width: auto;
 }
+.th-facts select:disabled {
+  opacity: 0.55;
+}
 .th-session {
   display: flex;
   align-items: center;
   gap: 6px;
+}
+.th-handoff {
+  display: grid;
+  gap: 10px;
+}
+/* Turns hang under the message they answered, with one thin guide per group. */
+.th-turns {
+  display: grid;
+  gap: 8px;
+  font-size: 12px;
+}
+.th-turns h3 {
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 400;
+}
+.th-turns ol {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.th-turns > ol {
+  gap: 12px;
+}
+.th-turn-ask {
+  color: var(--text);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.th-turns .th-turn-list {
+  gap: 8px;
+  margin: 6px 0 0 7px;
+  padding-left: 11px;
+  border-left: 1px solid var(--border);
+}
+.th-turn {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.th-turn-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.th-turn-model {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.th-turn-state {
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.th-turn-state:is(.is-running, .is-waiting-permission) {
+  color: var(--blue);
+}
+.th-turn-state.is-failed {
+  color: var(--red);
+}
+.th-turn-state.is-limit {
+  color: var(--amber);
+}
+.th-turn-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 6px;
+  padding-left: 22px;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.th-turn-meta > * {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.th-turn-meta > * + *::before {
+  content: "·";
+  margin-right: 2px;
 }
 
 /* Left rail allowance summary */

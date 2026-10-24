@@ -2,10 +2,11 @@ import { ArrowDown } from 'lucide-react';
 import { memo, type ReactNode, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
 import { AttachmentChips } from './attach.tsx';
-import { FailureLine, PermissionCard, ThinkingCard, ToolCard } from './cards.tsx';
+import { FailureLine, PermissionCard, ThinkingCard, ToolCard, ToolRunCard } from './cards.tsx';
 import { FamilyMark } from './family-mark.tsx';
 import { Markdown } from './markdown.tsx';
 import type { ThreadItem, TurnView } from './thread-state.ts';
+import { viewBlocks } from './turn-fold.ts';
 
 const roleLabels = {
   assistant: null,
@@ -43,14 +44,16 @@ const TurnRow = memo(function TurnRow({
           {role && <span className="th-role">{role}</span>}
         </header>
       )}
-      {turn.blocks.map((block): ReactNode => {
+      {viewBlocks(turn.blocks, turn.ended).map((block): ReactNode => {
         switch (block.kind) {
           case 'text':
-            return block.text === '' ? null : (
+            return (
               <div key={block.id} className={block.done || turn.ended ? '' : 'is-streaming'}>
                 <Markdown text={block.text} />
               </div>
             );
+          case 'run':
+            return <ToolRunCard key={block.id} run={block} onOpenChanges={onOpenChanges} />;
           case 'thinking':
             return <ThinkingCard key={block.id} block={block} ended={turn.ended} />;
           case 'tool':

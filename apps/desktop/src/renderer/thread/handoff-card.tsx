@@ -50,7 +50,7 @@ export function LimitOfferCard({
   }
 
   if (!catalog && !problem) return null;
-  const choices = catalog ? offerChoices(catalog, offer.family) : [];
+  const choices = catalog ? offerChoices(catalog, offer.family, offer.mode) : [];
   return (
     <section className="th-row th-offer" aria-label="Continue on another provider">
       {catalog && choices.length === 0 && (

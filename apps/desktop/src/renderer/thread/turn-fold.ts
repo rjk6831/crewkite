@@ -114,6 +114,59 @@ function finish(view: TurnView, event: Extract<AgentEvent, { type: 'turn.complet
   return { ...view, blocks, ended: true, status, failure };
 }
 
+/** Two or more finished reads and searches in a row, shown as one line that opens into the cards. */
+export type ToolRun = { kind: 'run'; id: string; tools: ToolBlock[] };
+
+// A read or search that finished cleanly has nothing to act on, so a run of them collapses. A
+// running card, an edit, a command, a failure and a call that asked first keep their own card.
+const routine = (block: ToolBlock, asked: ReadonlySet<string>) =>
+  (block.toolKind === 'read' || block.toolKind === 'search') &&
+  block.status === 'ok' &&
+  block.diff === null &&
+  !asked.has(block.id);
+
+// A text item with no text yet, and a thinking block that ended with none, such as a redacted one
+// or a summary that never came. They draw nothing, so they must not split a run either.
+const blank = (block: Block, ended: boolean) =>
+  (block.kind === 'text' && block.text === '') ||
+  (block.kind === 'thinking' && block.text.trim() === '' && (block.done || ended));
+
+/** The blocks of a turn as the thread lays them out. Only the view changes; the turn stays as is. */
+export function viewBlocks(blocks: readonly Block[], ended: boolean): (Block | ToolRun)[] {
+  const asked = new Set(
+    blocks.flatMap((block) =>
+      block.kind === 'permission' && block.callId ? [`tool:${block.callId}`] : [],
+    ),
+  );
+  const laid: (Block | ToolRun)[] = [];
+  let run: ToolBlock[] = [];
+  const close = () => {
+    if (run.length > 1) laid.push({ kind: 'run', id: `run:${run[0].id}`, tools: run });
+    else laid.push(...run);
+    run = [];
+  };
+  for (const block of blocks) {
+    if (blank(block, ended)) continue;
+    if (block.kind === 'tool' && routine(block, asked)) {
+      run.push(block);
+      continue;
+    }
+    close();
+    laid.push(block);
+  }
+  close();
+  return laid;
+}
+
+export function runLabel(run: ToolRun): string {
+  const reads = run.tools.filter((tool) => tool.toolKind === 'read').length;
+  const searches = run.tools.length - reads;
+  const read = `${reads} ${reads === 1 ? 'file' : 'files'}`;
+  const searched = searches === 1 ? 'once' : `${searches} times`;
+  if (searches === 0) return `Read ${read}`;
+  return reads === 0 ? `Searched ${searched}` : `Read ${read}, searched ${searched}`;
+}
+
 export function applyEvent(view: TurnView, event: AgentEvent): TurnView {
   switch (event.type) {
     case 'turn.started':

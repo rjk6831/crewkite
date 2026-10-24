@@ -25,6 +25,7 @@ import {
   type ThreadItem,
   threadItems,
 } from './thread-state.ts';
+import { type Block, runLabel, type ToolBlock, viewBlocks } from './turn-fold.ts';
 
 const id = (prefix: string, n: number) => `${prefix}_0${String(n).padStart(25, '0')}`;
 const task = id('tsk', 1);
@@ -336,7 +337,7 @@ test('the limit offer shows only while the newest turn is the one that hit a lim
   };
   const stopped = [user(10, 'Add the guard'), begin(turn, 11), end(turn, 12, 'limit')];
 
-  assert.deepEqual(offer(stopped), { turnId: turn, family: 'openai' });
+  assert.deepEqual(offer(stopped), { turnId: turn, family: 'openai', mode: 'most-left' });
   // The message is on its way to another provider, so the choice is made.
   assert.equal(offer(stopped, true), null);
   // A newer turn that finished, or stopped for another reason, leaves nothing to offer.
@@ -406,6 +407,91 @@ test('the limit offer shows only while the newest turn is the one that hit a lim
   // A stored stop reason decides before the failure kind. Turns without one keep the fallback above.
   assert.equal(reopened([stored(1, 'failed', 'client-exit', 'limit')])?.family, 'anthropic');
   assert.equal(reopened([stored(1, 'failed', 'usage-limit', 'error')]), null);
+});
+
+test('finished reads and searches in a row fold into one line, and anything to act on stands alone', () => {
+  const tool = (call: string, toolKind: ToolBlock['toolKind'], more: Partial<ToolBlock> = {}) =>
+    ({
+      kind: 'tool',
+      id: `tool:${call}`,
+      toolKind,
+      title: call,
+      input: undefined,
+      output: '',
+      truncated: false,
+      status: 'ok',
+      diff: null,
+      summary: null,
+      ...more,
+    }) satisfies ToolBlock;
+  const thought = (item: string, text: string, done = true): Block => ({
+    kind: 'thinking',
+    id: `thinking:${item}`,
+    text,
+    done,
+  });
+  const said: Block = { kind: 'text', id: 'text:a', text: 'Now the tests.', done: true };
+  const asked: Block = {
+    kind: 'permission',
+    id: 'permission:p1',
+    requestId: 'p1',
+    callId: 'r3',
+    question: 'Read the key file?',
+    detail: null,
+    options: [{ id: 'once', label: 'Allow once', kind: 'allow-once' }],
+    choice: 'once',
+  };
+  // A run shows as its label and any other block as its id.
+  const cases: { name: string; blocks: Block[]; ended?: boolean; want: string[] }[] = [
+    {
+      name: 'reads and searches fold',
+      blocks: [tool('r1', 'read'), tool('r2', 'read'), tool('s1', 'search')],
+      want: ['Read 2 files, searched once'],
+    },
+    { name: 'a lone read keeps its card', blocks: [tool('r1', 'read')], want: ['tool:r1'] },
+    {
+      name: 'a running read ends the run',
+      blocks: [tool('r1', 'read'), tool('r2', 'read'), tool('r3', 'read', { status: 'running' })],
+      ended: false,
+      want: ['Read 2 files', 'tool:r3'],
+    },
+    {
+      name: 'an edit, a command, a failure and text stand alone',
+      blocks: [
+        tool('s1', 'search'),
+        tool('s2', 'search'),
+        tool('e1', 'edit'),
+        tool('r1', 'read'),
+        said,
+        tool('r2', 'read'),
+        tool('c1', 'command'),
+        tool('r3', 'read', { status: 'error' }),
+      ],
+      want: ['Searched 2 times', 'tool:e1', 'tool:r1', 'text:a', 'tool:r2', 'tool:c1', 'tool:r3'],
+    },
+    {
+      name: 'a read that asked first stands alone',
+      blocks: [tool('r1', 'read'), tool('r2', 'read'), tool('r3', 'read'), asked],
+      want: ['Read 2 files', 'tool:r3', 'permission:p1'],
+    },
+    {
+      name: 'a thought that ended with no text draws nothing and keeps the run',
+      blocks: [tool('r1', 'read'), thought('a', ''), tool('r2', 'read'), thought('b', 'Tests.')],
+      want: ['Read 2 files', 'thinking:b'],
+    },
+    {
+      name: 'a live thought with no text yet still shows',
+      blocks: [thought('a', '', false)],
+      ended: false,
+      want: ['thinking:a'],
+    },
+  ];
+  for (const { name, blocks, ended = true, want } of cases)
+    assert.deepEqual(
+      viewBlocks(blocks, ended).map((item) => (item.kind === 'run' ? runLabel(item) : item.id)),
+      want,
+      name,
+    );
 });
 
 test('the thread moves away from the family of its newest assistant turn, even one with no text', () => {
@@ -624,7 +710,7 @@ const connected = (name: ChatFamily, percent: number | null) => ({
       : [{ windowId: 'weekly', label: 'Weekly', percent, resetsAt: null, observedAt: null }],
 });
 
-test('the offer ranks the other connected families by allowance and leaves out one at zero', () => {
+test('the offer ranks the other connected families by the thread mode and leaves out one at zero', () => {
   const catalog: ChatCatalogRead = {
     families: [
       connected('openai', 5),
@@ -645,6 +731,18 @@ test('the offer ranks the other connected families by allowance and leaves out o
   assert.deepEqual(
     offerChoices(catalog, 'anthropic').map(({ family }) => family),
     ['openai', 'local'],
+  );
+  // In resets-first mode the allowance that resets soonest goes first, while it lasts.
+  const soon = {
+    ...connected('google', 20),
+    remaining: [
+      { windowId: 'weekly', label: 'Weekly', percent: 20, resetsAt: stamp, observedAt: null },
+    ],
+  };
+  const families = [connected('anthropic', 60.9), soon];
+  assert.deepEqual(
+    offerChoices({ families }, 'openai', 'resets-first').map(({ family }) => family),
+    ['google', 'anthropic'],
   );
 });
 

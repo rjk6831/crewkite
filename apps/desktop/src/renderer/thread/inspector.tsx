@@ -1,12 +1,13 @@
 import type {
   ChatHandoffMode,
+  ChatMessage,
   ChatPermissionPolicy,
   ChatRole,
   ChatThread,
   ChatTurn,
   WorkspaceState,
 } from '@crewkite/contracts';
-import { X } from 'lucide-react';
+import { ArrowRightLeft, X } from 'lucide-react';
 import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
@@ -37,6 +38,10 @@ const roleNames: Record<ChatRole, string> = {
   advisor: 'Advisor',
   challenger: 'Challenger',
 };
+const handoffModes: { id: ChatHandoffMode; label: string }[] = [
+  { id: 'most-left', label: 'the provider with the most allowance left' },
+  { id: 'resets-first', label: 'the provider whose allowance resets soonest' },
+];
 
 // The chosen width is a local preference. Storage can be blocked, and the panel falls back to the
 // default width when it is.
@@ -186,6 +191,86 @@ function UsageTab({ header, preview }: { header: WorkspaceState | null; preview:
   return <UsageGauges cards={cards} nowMs={now} />;
 }
 
+const stateLabels: Record<ChatTurn['state'], string> = {
+  queued: 'Queued',
+  running: 'Running',
+  'waiting-permission': 'Waiting',
+  done: 'Done',
+  stopped: 'Stopped',
+  failed: 'Failed',
+};
+
+// The stored stop reason is exact. A turn written before it existed falls back to the failure.
+function turnState(turn: ChatTurn): { label: string; tone: string } {
+  const limited = turn.stopReason
+    ? turn.stopReason === 'limit'
+    : turn.failure?.kind === 'usage-limit';
+  if (turn.state === 'failed' && limited) return { label: 'Limit reached', tone: 'limit' };
+  if (turn.failure?.kind === 'stopped') return { label: 'Stopped', tone: 'stopped' };
+  return { label: stateLabels[turn.state], tone: turn.state };
+}
+
+const endedLabel = (iso: string) => {
+  const at = new Date(iso);
+  return at.toDateString() === new Date().toDateString()
+    ? at.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+    : at.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+};
+
+const asked = (text: string) => {
+  const line = text.replace(/\s+/g, ' ').trim();
+  return line.length > 80 ? `${line.slice(0, 79)}…` : line;
+};
+
+type TurnGroup = { messageId: string; text: string | null; turns: ChatTurn[] };
+
+// Turns in sequence order under the message each one answered. A rerun after a handoff answers the
+// same message, so it lands in the same group as the turn that stopped.
+function turnGroups(turns: readonly ChatTurn[], messages: readonly ChatMessage[]): TurnGroup[] {
+  const texts = new Map(messages.map((message) => [message.id, message.text]));
+  const groups = new Map<string, TurnGroup>();
+  for (const turn of turns.toSorted((a, b) => a.sequence - b.sequence)) {
+    const group = groups.get(turn.userMessageId) ?? {
+      messageId: turn.userMessageId,
+      text: texts.get(turn.userMessageId) ?? null,
+      turns: [],
+    };
+    group.turns.push(turn);
+    groups.set(turn.userMessageId, group);
+  }
+  return [...groups.values()];
+}
+
+function TurnRow({ turn }: { turn: ChatTurn }) {
+  const { family, model } = turn.selection;
+  const state = turnState(turn);
+  return (
+    <li className="th-turn">
+      <div className="th-turn-line">
+        <FamilyMark family={family} />
+        <span className="th-turn-model" title={model}>
+          {familyName(family)} · {model}
+        </span>
+        <span className={`th-turn-state is-${state.tone}`}>{state.label}</span>
+      </div>
+      <div className="th-turn-meta">
+        <span>{roleNames[turn.role]}</span>
+        {turn.handoffFrom && (
+          <span>
+            <ArrowRightLeft size={11} aria-hidden="true" />
+            From {familyName(turn.handoffFrom)}
+          </span>
+        )}
+        {turn.endedAt && (
+          <time dateTime={turn.endedAt} title={turn.endedAt}>
+            Ended {endedLabel(turn.endedAt)}
+          </time>
+        )}
+      </div>
+    </li>
+  );
+}
+
 function ThreadTab({
   source,
   taskId,
@@ -201,7 +286,7 @@ function ThreadTab({
     handoffMode?: ChatHandoffMode;
   }) => void;
 }) {
-  const [turns, setTurns] = useState<ChatTurn[] | null>(null);
+  const [read, setRead] = useState<{ turns: ChatTurn[]; messages: ChatMessage[] } | null>(null);
   const active = thread?.activeTurnId ?? null;
   const accepted = thread?.lastAcceptance;
   // The thread record changes when a turn starts and when it ends, and the list follows it.
@@ -209,13 +294,14 @@ function ThreadTab({
   useEffect(() => {
     let current = true;
     readThread(source, taskId).then(
-      (read) => current && setTurns(read.turns),
-      () => current && setTurns(null),
+      (value) => current && setRead({ turns: value.turns, messages: value.messages }),
+      () => current && setRead(null),
     );
     return () => {
       current = false;
     };
   }, [source, taskId, active]);
+  const groups = read ? turnGroups(read.turns, read.messages) : [];
   return (
     <div className="th-facts">
       <dl>
@@ -251,23 +337,6 @@ function ThreadTab({
             'None yet'
           )}
         </dd>
-        <dt>Turns</dt>
-        <dd>
-          {turns === null ? (
-            'Not available yet'
-          ) : turns.length > 0 ? (
-            <ul>
-              {turns.map((turn) => (
-                <li key={turn.id}>
-                  {roleNames[turn.role]} · {familyName(turn.selection.family)} ·{' '}
-                  {turn.selection.model}
-                </li>
-              ))}
-            </ul>
-          ) : (
-            'None yet'
-          )}
-        </dd>
       </dl>
       <label>
         Permissions
@@ -285,15 +354,56 @@ function ThreadTab({
           ))}
         </select>
       </label>
-      <label className="th-toggle">
-        <input
-          type="checkbox"
-          checked={thread?.autoHandoff ?? false}
-          disabled={!thread}
-          onChange={(event) => onConfigure({ autoHandoff: event.target.checked })}
-        />
-        Continue on another provider when a limit is reached
-      </label>
+      <div className="th-handoff">
+        <label className="th-toggle">
+          <input
+            type="checkbox"
+            checked={thread?.autoHandoff ?? false}
+            disabled={!thread}
+            onChange={(event) => onConfigure({ autoHandoff: event.target.checked })}
+          />
+          Continue on another provider when a limit is reached
+        </label>
+        <label>
+          When a limit is reached, continue on
+          <select
+            value={thread?.handoffMode ?? 'most-left'}
+            disabled={!thread?.autoHandoff}
+            onChange={(event) =>
+              onConfigure({ handoffMode: event.target.value as ChatHandoffMode })
+            }
+          >
+            {handoffModes.map((mode) => (
+              <option key={mode.id} value={mode.id}>
+                {mode.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+      <section className="th-turns" aria-labelledby="th-turns-head">
+        <h3 id="th-turns-head">Turns</h3>
+        {read === null ? (
+          <p className="th-muted">Not available yet.</p>
+        ) : groups.length === 0 ? (
+          <p className="th-muted">None yet.</p>
+        ) : (
+          <ol>
+            {groups.map((group) => (
+              <li key={group.messageId}>
+                <p className="th-turn-ask" title={group.text ?? undefined}>
+                  {group.text ? asked(group.text) : 'An earlier message'}
+                </p>
+                <ol className="th-turn-list">
+                  {group.turns.map((turn) => (
+                    <TurnRow key={turn.id} turn={turn} />
+                  ))}
+                </ol>
+              </li>
+            ))}
+          </ol>
+        )}
+      </section>
     </div>
   );
 }
