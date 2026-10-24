@@ -14,6 +14,7 @@ import type {
   ChatCatalogRead,
   ChatFamily,
   ChatModelSelection,
+  ChatThread,
   ChatThreadRead,
   ChatToolKind,
   ChatTurn,
@@ -85,6 +86,15 @@ function turnReaches(
     controller,
     (event) => event.type === 'chat.turn' && event.payload.state === state,
   ).then((event) => event.payload as ChatTurn);
+}
+
+/** The thread is free and no message waits. */
+function settles(controller: Pick<Controller, 'store'>): Promise<Event> {
+  return next(controller, (event) => {
+    if (event.type !== 'chat.thread') return false;
+    const thread = event.payload as ChatThread;
+    return thread.activeTurnId === null && thread.queued.length === 0;
+  });
 }
 
 function agentEvents(controller: Pick<Controller, 'store'>): AgentEvent[] {
@@ -391,25 +401,36 @@ test('a provider process that outlives its turn blocks the thread until a later 
     thread.service.accept({ taskId, branch: 'crewkite/fix-rounding' }, undefined),
   );
   assert.deepEqual(
-    [thread.send('Again.'), accept].map((result) => [result.reason, result.next]),
-    [
-      ['ownership-unknown', 'Quit process group 4242, then send again.'],
-      ['ownership-unknown', 'Quit process group 4242, then accept.'],
-    ],
+    [accept.reason, accept.next],
+    ['ownership-unknown', 'Quit process group 4242, then accept.'],
   );
 
-  // A restart while the group is present keeps the block.
+  // A message sent meanwhile waits. A restart while the group is present keeps the block and
+  // starts nothing.
+  assert.equal(thread.send('Again.').outcome, 'applied');
   const restarted = thread.start();
   restarted.recover();
-  assert.equal(thread.read(restarted).thread.ownershipUnknown, true);
-  // Once the group is gone, the next send checks again and goes ahead without a restart.
+  const blocked = thread.read(restarted);
+  assert.equal(blocked.thread.ownershipUnknown, true);
+  assert.deepEqual(
+    blocked.thread.queued.map((message) => message.text),
+    ['Again.'],
+  );
+  assert.equal(blocked.turns.length, 1);
+  // Once the group is gone, the next send checks again without a restart. The waiting message
+  // goes first.
   present.clear();
-  const done = turnReaches(thread, 'done');
-  assert.equal(thread.send('Again.', selection, restarted).outcome, 'applied');
+  const idle = settles(thread);
+  assert.equal(thread.send('And again.', selection, restarted).outcome, 'applied');
   const after = thread.read(restarted);
   assert.equal(after.thread.ownershipUnknown, undefined);
   assert.equal(after.turns[0].groups, undefined);
-  await done;
+  assert.equal(after.messages.at(-1)?.text, 'Again.');
+  assert.deepEqual(
+    after.thread.queued.map((message) => message.text),
+    ['And again.'],
+  );
+  await idle;
 
   // No process survives a reboot, so a group saved before one is gone even when its number is
   // in use again.
@@ -423,6 +444,112 @@ test('a provider process that outlives its turn blocks the thread until a later 
   const clear = thread.read(rebooted);
   assert.equal(clear.thread.ownershipUnknown, undefined);
   assert.equal(clear.turns.at(-1)?.groups, undefined);
+});
+
+// The first turn parks on a permission request, so later messages have a turn to wait behind. Each
+// row ends that turn its own way: the answer lets it finish, or Stop ends it.
+test('a message sent during a turn waits and starts when the turn ends', {
+  timeout: 30000,
+}, async (t) => {
+  const first = 'Fix the rounding.';
+  const later = ['Then the totals.', 'Then the docs.'];
+  const many = Array.from({ length: 9 }, (_, index) => `Step ${index + 1}.`);
+  const full = ['queue-full', 'Wait for a queued message to start, or remove one.'];
+  const cases = [
+    {
+      name: 'queue then start',
+      send: later,
+      remove: null,
+      end: 'answer',
+      asked: [first, ...later],
+    },
+    { name: 'stop clears', send: later, remove: null, end: 'stop', asked: [first] },
+    {
+      name: 'dequeue removes',
+      send: later,
+      remove: later[0],
+      end: 'answer',
+      asked: [first, later[1]],
+    },
+    { name: 'queue-full refuses', send: many, remove: null, end: 'stop', asked: [first] },
+  ];
+  const users = (read: ChatThreadRead) => read.messages.filter((m) => m.author.kind === 'user');
+  for (const row of cases) {
+    const thread = standalone(t, {
+      adapters: new Map([
+        [
+          'openai',
+          createScriptedChatAdapter({
+            family: 'openai',
+            turns: [
+              [
+                { kind: 'permission', requestId: 'edit-1', question: 'Edit net.mjs?' },
+                { kind: 'text', itemId: 'reply', chunks: ['Done.'] },
+              ],
+              [{ kind: 'text', itemId: 'reply', chunks: ['Done.'] }],
+            ],
+          }),
+        ],
+      ]),
+    });
+    const { store, service, taskId } = thread;
+    const parked = turnReaches(thread, 'waiting-permission');
+    thread.send(first);
+    const { id: turnId } = await parked;
+    const refused = row.send
+      .map((text) => thread.send(text))
+      .flatMap((result) => (result.outcome === 'applied' ? [] : [[result.reason, result.next]]));
+    assert.deepEqual(refused, row.send.length > 8 ? [full] : [], row.name);
+    const waiting = thread.read();
+    assert.deepEqual(
+      users(waiting).map((message) => message.text),
+      [first],
+      row.name,
+    );
+    assert.deepEqual(
+      waiting.thread.queued.map((message) => message.text),
+      row.send.slice(0, 8),
+      row.name,
+    );
+    const removed = waiting.thread.queued.find((message) => message.text === row.remove);
+    if (removed) store.transaction(() => service.configure({ taskId, dequeue: removed.id }));
+
+    const idle = settles(thread);
+    const effects: (() => void)[] = [];
+    store.transaction(() =>
+      row.end === 'stop'
+        ? service.stopTurn({ taskId, turnId }, effects)
+        : service.resolvePermission(
+            { taskId, turnId, requestId: 'edit-1', choice: 'allow-once' },
+            effects,
+          ),
+    );
+    for (const effect of effects) effect();
+    await idle;
+
+    const after = thread.read();
+    assert.deepEqual(
+      users(after).map((message) => message.text),
+      row.asked,
+      row.name,
+    );
+    // A queued message joins the conversation under the ID it had while it waited.
+    const started = waiting.thread.queued
+      .filter((message) => row.asked.includes(message.text))
+      .map((message) => message.id);
+    assert.deepEqual(
+      users(after)
+        .slice(1)
+        .map((message) => message.id),
+      started,
+      row.name,
+    );
+    assert.deepEqual(
+      after.turns.slice(1).map((turn) => turn.userMessageId),
+      started,
+      row.name,
+    );
+  }
 });
 
 test('a thread read returns messages in cursor order and the live events of the open turn', {
@@ -536,9 +663,11 @@ test('a usage limit writes a system line, and auto handoff runs the same message
   timeout: 30000,
 }, async (t) => {
   const on = limitThread(t, { autoHandoff: true, resetsAt: '2026-10-23T14:00:00.000Z' });
-  const continued = turnReaches(on, 'done');
+  const idle = settles(on);
   on.send('Fix the rounding.');
-  const second = await continued;
+  // Sent while the first turn runs. It waits for the rerun and follows the thread to Google.
+  on.send('Then the totals.');
+  await idle;
 
   const thread = on.read();
   const line = 'OpenAI reached its usage limit. Resets at 2026-10-23 14:00 UTC.';
@@ -549,6 +678,8 @@ test('a usage limit writes a system line, and auto handoff runs the same message
       line,
       `${on.limit.message} ${on.limit.nextAction}`,
       'Continued on Google from OpenAI. Reason: usage limit reached.',
+      'Carrying on.',
+      'Then the totals.',
       'Carrying on.',
     ],
   );
@@ -562,15 +693,17 @@ test('a usage limit writes a system line, and auto handoff runs the same message
     [
       ['failed', 'limit', 'openai', null],
       ['done', 'done', 'google', 'openai'],
+      ['done', 'done', 'google', null],
     ],
   );
   assert.equal(thread.turns[1].userMessageId, thread.turns[0].userMessageId);
   assert.deepEqual(on.settled, [
     ['openai', on.taskId],
     ['google', on.taskId],
+    ['google', on.taskId],
   ]);
   assert.equal(thread.thread.selection?.model, 'google-model');
-  assert.equal(thread.thread.sessions[0]?.sessionId, `session-${second.id}`);
+  assert.equal(thread.thread.sessions[0]?.sessionId, `session-${thread.turns[2].id}`);
   const [request] = on.adapters.get('google')?.requests ?? [];
   assert.match(request.prompt, /moved from OpenAI to Google\. Reason: usage limit reached\./);
   assert.match(request.prompt, /New message:\nFix the rounding\./);

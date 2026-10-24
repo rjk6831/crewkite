@@ -14,6 +14,7 @@ import {
   type ChatMessage,
   type ChatModelSelection,
   type ChatPermissionOption,
+  type ChatQueuedMessage,
   type ChatSession,
   ChatSessionSchema,
   type ChatThread,
@@ -126,6 +127,7 @@ type Ending = {
   groups: readonly number[];
 };
 type FileDiff = ChatChangesRead['files'][number];
+type Message = Pick<ChatQueuedMessage, 'text' | 'role' | 'selection' | 'attachments'>;
 type LiveTurn = {
   taskId: string;
   role: ChatTurn['role'];
@@ -175,6 +177,9 @@ const PACKET_ENTRY_CHARACTERS = 8000;
 const CHECK_LINES = 5;
 const CHECK_CHARACTERS = 1500;
 const CUT_MARKER_BYTES = 32;
+// The thread record holds at most eight queued messages, in a quarter of a 1 MiB frame.
+const QUEUE_LIMIT = 8;
+const QUEUE_BYTES = 256 * 1024;
 
 const blocked = (reason: string, next?: string): CommandResult => ({
   outcome: 'blocked',
@@ -214,40 +219,22 @@ export class ChatService {
     this.deps = deps;
   }
 
+  /**
+   * A message sent while a turn runs, or while a process from an earlier turn may still write to
+   * the scratch copy, waits in the thread. Messages that already wait go first, so a free thread
+   * starts the oldest one and this one joins the end of the line.
+   */
   sendMessage(payload: Payload<'SendChatMessage'>, effects: Effects): CommandResult {
     const task = this.task(payload.taskId);
     if (!task) return blocked('task-not-found');
     const { thread, left } = this.checkedThread(task);
-    if (thread.activeTurnId)
-      return blocked('turn-running', 'Wait for the reply or stop it, then send again.');
-    // A process from an earlier turn may still write to the scratch copy.
-    if (left.length) return ownershipUnknown(left, 'send again');
-    const selection = payload.selection
-      ? this.deps.resolveSelection(task.id, payload.selection)
-      : ((thread.selection && this.deps.resolveSelection(task.id, thread.selection)) ??
-        this.deps.resolveSelection(task.id));
-    if (!selection)
-      return blocked('selection-unavailable', 'Pick a provider and model in the composer.');
-    if (!this.deps.adapters.has(selection.family))
-      return blocked('provider-unavailable', 'Connect this provider in Settings or pick another.');
-    const base = thread.base ?? this.head(task);
-    if (!base)
-      return blocked('project-head-unavailable', 'Commit once in this project, then send again.');
-    const message = this.draftEntry(task, {
-      kind: 'user-message',
-      author: { kind: 'user' },
-      text: payload.text,
-      ...(payload.attachments.length ? { attachments: payload.attachments } : {}),
-    });
-    if (!message) return blocked('message-too-large', 'Shorten the message or attach fewer paths.');
-    this.saveEntry(task, message);
-    this.openTurn(
-      task,
-      thread,
-      { selection, role: payload.role, messageId: message.id, base },
-      effects,
-    );
-    return { outcome: 'applied', revision: task.revision };
+    const free = !thread.activeTurnId && !left.length;
+    if (free && !thread.queued.length) return this.begin(task, thread, payload, effects);
+    if (free) {
+      const started = this.startQueued(task, effects);
+      if (started.outcome !== 'applied') return started;
+    }
+    return this.enqueue(task, payload);
   }
 
   resolvePermission(payload: Payload<'ResolveChatPermission'>, effects: Effects): CommandResult {
@@ -275,6 +262,10 @@ export class ChatService {
     if (!live) return blocked('no-active-turn');
     // The turn result marks the row stopped once the provider has let go.
     live.stopRequested = true;
+    // Stop ends the wait too. The view still has the queue it showed and puts the texts back.
+    const task = this.task(payload.taskId);
+    const thread = this.thread(payload.taskId);
+    if (task && thread.queued.length) this.putThread(task, { ...thread, queued: [] });
     effects.push(() => this.call(() => live.handle?.stop()));
     return { outcome: 'applied' };
   }
@@ -288,8 +279,11 @@ export class ChatService {
       : thread.selection;
     if (payload.selection && !selection)
       return blocked('selection-unavailable', 'Pick a model the provider lists.');
+    if (payload.dequeue && !thread.queued.some((message) => message.id === payload.dequeue))
+      return blocked('message-not-queued', 'It is no longer queued. If it started, Stop ends it.');
     this.putThread(task, {
       ...thread,
+      queued: thread.queued.filter((message) => message.id !== payload.dequeue),
       selection,
       permissionPolicy: payload.permissionPolicy ?? thread.permissionPolicy,
       // Choosing ask again takes back everything the thread allowed.
@@ -471,7 +465,7 @@ export class ChatService {
   /**
    * A turn left open by a previous controller process has no owner. Fail it visibly. Process
    * groups that no one proved gone are checked again, and a thread stays blocked while any of
-   * them is present.
+   * them is present. Messages queued before the restart start once their thread is free.
    */
   recover() {
     const rows = this.deps.store.db
@@ -482,7 +476,10 @@ export class ChatService {
     const flagged = this.deps.store.db
       .prepare("SELECT task_id FROM chat_threads WHERE json_extract(body,'$.ownershipUnknown')=1")
       .all() as { task_id: string }[];
-    if (!rows.length && !flagged.length) return;
+    const waiting = this.deps.store.db
+      .prepare("SELECT task_id FROM chat_threads WHERE json_array_length(body,'$.queued')>0")
+      .all() as { task_id: string }[];
+    if (!rows.length && !flagged.length && !waiting.length) return;
     this.deps.store.transaction(() => {
       for (const row of rows) {
         const turn = this.turn(row.id);
@@ -508,6 +505,7 @@ export class ChatService {
         if (task) this.release(task);
       }
     });
+    for (const row of waiting) this.continueQueue(row.task_id);
   }
 
   /**
@@ -817,6 +815,8 @@ export class ChatService {
       }
     if (result.stopReason === 'limit' && !live.stopRequested && !this.closed)
       this.continueOnLimit(turnId);
+    // A handoff above opens the rerun first. The queue waits for that turn to settle.
+    if (turn && !this.closed) this.continueQueue(turn.taskId);
   }
 
   private settle(turnId: string, end: Ending) {
@@ -935,12 +935,16 @@ export class ChatService {
       .some((row) => endedOnLimit(ChatTurnSchema.parse(JSON.parse(row.body as string))));
   }
 
-  /** The newest turn, when it ended on a usage limit and the person has written nothing since. */
-  private stoppedOnLimit(taskId: string): ChatTurn | undefined {
+  private newestTurn(taskId: string): ChatTurn | undefined {
     const row = this.deps.store.db
       .prepare('SELECT body FROM chat_turns WHERE task_id=? ORDER BY sequence DESC LIMIT 1')
       .get(taskId);
-    const turn = row ? ChatTurnSchema.parse(JSON.parse(row.body as string)) : undefined;
+    return row ? ChatTurnSchema.parse(JSON.parse(row.body as string)) : undefined;
+  }
+
+  /** The newest turn, when it ended on a usage limit and the person has written nothing since. */
+  private stoppedOnLimit(taskId: string): ChatTurn | undefined {
+    const turn = this.newestTurn(taskId);
     if (!turn || !endedOnLimit(turn)) return;
     const newest = this.deps.store.db
       .prepare(
@@ -961,6 +965,122 @@ export class ChatService {
       { selection: thread.selection, role: stopped.role, messageId: message.id, base: thread.base },
       effects,
     );
+  }
+
+  /** Write the user message and open its turn. A new message and a queued one start the same way. */
+  private begin(
+    task: Task,
+    thread: ChatThread,
+    input: Message,
+    effects: Effects,
+    id?: string,
+  ): CommandResult {
+    const selection = this.pick(task, thread, input.selection);
+    if ('outcome' in selection) return selection;
+    const base = thread.base ?? this.head(task);
+    if (!base)
+      return blocked('project-head-unavailable', 'Commit once in this project, then send again.');
+    const message = this.draftEntry(task, userEntry(input), id);
+    if (!message) return blocked('message-too-large', 'Shorten the message or attach fewer paths.');
+    this.saveEntry(task, message);
+    this.openTurn(
+      task,
+      thread,
+      { selection, role: input.role, messageId: message.id, base },
+      effects,
+    );
+    return { outcome: 'applied', revision: task.revision };
+  }
+
+  private pick(
+    task: Task,
+    thread: ChatThread,
+    wanted: ChatModelSelection | undefined,
+  ): ChatModelSelection | CommandResult {
+    const selection = wanted
+      ? this.deps.resolveSelection(task.id, wanted)
+      : ((thread.selection && this.deps.resolveSelection(task.id, thread.selection)) ??
+        this.deps.resolveSelection(task.id));
+    if (!selection)
+      return blocked('selection-unavailable', 'Pick a provider and model in the composer.');
+    if (!this.deps.adapters.has(selection.family))
+      return blocked('provider-unavailable', 'Connect this provider in Settings or pick another.');
+    return selection;
+  }
+
+  /**
+   * Keep a message until the thread is free. It joins the conversation when its turn starts, under
+   * the ID it gets here. An assistant message keeps its own pick only when it differs from the
+   * thread's, so a handoff while it waits carries it to the new provider.
+   */
+  private enqueue(task: Task, input: Message): CommandResult {
+    const thread = this.thread(task.id);
+    const selection = this.pick(task, thread, input.selection);
+    if ('outcome' in selection) return selection;
+    const draft = this.draftEntry(task, userEntry(input));
+    if (!draft) return blocked('message-too-large', 'Shorten the message or attach fewer paths.');
+    const own = input.role !== 'assistant' || !sameSelection(selection, thread.selection);
+    const queued = [
+      ...thread.queued,
+      {
+        id: draft.id,
+        at: draft.at,
+        text: input.text,
+        role: input.role,
+        attachments: input.attachments,
+        ...(own ? { selection } : {}),
+      },
+    ];
+    // The thread record travels in every chat.thread event, and an event must fit one frame.
+    if (queued.length > QUEUE_LIMIT || size(queued) > QUEUE_BYTES)
+      return blocked('queue-full', 'Wait for a queued message to start, or remove one.');
+    this.putThread(task, { ...thread, queued });
+    return { outcome: 'applied', revision: task.revision };
+  }
+
+  /** Start the oldest queued message. A refusal writes nothing, so the message keeps its place. */
+  private startQueued(task: Task, effects: Effects): CommandResult {
+    const thread = this.thread(task.id);
+    const [first, ...rest] = thread.queued;
+    if (!first) return { outcome: 'applied' };
+    return this.begin(task, { ...thread, queued: rest }, first, effects, first.id);
+  }
+
+  /**
+   * Start the next queued message once the thread is free. A usage limit on the newest turn holds
+   * the queue, since the next message would stop on the same limit. Continuing from the card reruns
+   * the stopped message and the queue moves once that turn settles. A new send starts the oldest
+   * queued message right away. A leftover process holds the queue until a later check finds it gone.
+   */
+  private continueQueue(taskId: string) {
+    const effects: Effects = [];
+    try {
+      this.deps.store.transaction(() => {
+        const task = this.task(taskId);
+        const thread = this.thread(taskId);
+        if (!task || !thread.queued.length || thread.activeTurnId || thread.ownershipUnknown)
+          return;
+        const newest = this.newestTurn(taskId);
+        if (newest && endedOnLimit(newest)) return;
+        const started = this.startQueued(task, effects);
+        if (started.outcome !== 'applied')
+          this.appendEntry(task, {
+            kind: 'chat-system',
+            author: { kind: 'system', turnId: null },
+            text: [
+              'The next queued message did not start.',
+              started.next,
+              'It starts when you send another message.',
+            ]
+              .filter(Boolean)
+              .join(' '),
+          });
+      });
+    } catch {
+      // The queue stays as it was. The next send or a restart tries again.
+      return;
+    }
+    for (const effect of effects) this.call(effect);
   }
 
   /** Open a running turn on a saved user message. The launch waits for the command to commit. */
@@ -1273,10 +1393,14 @@ export class ChatService {
   }
 
   /** Validate before writing so an oversized message blocks the command without a rollback. */
-  private draftEntry(task: Task, draft: EntryDraft): ConversationEntry | undefined {
+  private draftEntry(
+    task: Task,
+    draft: EntryDraft,
+    id = this.deps.id('msg'),
+  ): ConversationEntry | undefined {
     const parsed = ConversationEntrySchema.safeParse({
       ...draft,
-      id: this.deps.id('msg'),
+      id,
       taskId: task.id,
       revision: task.revision,
       cursor: '0',
@@ -1373,6 +1497,19 @@ function chatMessage(entry: ConversationEntry): ChatMessage | undefined {
   return entry.kind === 'chat-assistant' || entry.kind === 'chat-system'
     ? { ...common, author: entry.author, attachments: [] }
     : undefined;
+}
+
+function userEntry(input: Message): EntryDraft {
+  return {
+    kind: 'user-message',
+    author: { kind: 'user' },
+    text: input.text,
+    ...(input.attachments.length ? { attachments: input.attachments } : {}),
+  };
+}
+
+function sameSelection(a: ChatModelSelection, b: ChatModelSelection | null): boolean {
+  return a.family === b?.family && a.model === b.model && a.effort === b.effort;
 }
 
 /** Turns written before stop reasons were stored fall back to the failure kind. */
