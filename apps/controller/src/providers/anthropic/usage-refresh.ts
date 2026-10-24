@@ -147,18 +147,38 @@ export class AnthropicUsageRefresh {
     return { context, scopeHash, clientVersion: profile.client.version };
   }
 
-  /** The newer of the last /usage reading and the last turn reading. */
-  private current(state = this.state()): Current | null {
+  /** The last /usage reading and the last turn reading, each under its own time. */
+  private parts(state = this.state()): { native: Current | null; turn: Current | null } {
     const native = state?.reading
       ? { reading: state.reading, readingScopeHash: state.readingScopeHash }
       : null;
     // A turn reading saved in an earlier shape is dropped, as the /usage reading is.
     const parsed = turnSchema.safeParse(this.read(latestTurn));
-    const turn = parsed.success ? parsed.data : null;
+    return { native, turn: parsed.success ? parsed.data : null };
+  }
+
+  /**
+   * The reading the card shows: the newer of the two, with the windows the other still speaks
+   * for. A turn frame names the five-hour and weekly windows, so the per-model windows of the
+   * last /usage read stay, and its model and extra-usage switch stay with them. Windows from
+   * another client scope are not kept, since the scope label would then cover them too.
+   */
+  private current(state = this.state()): Current | null {
+    const { native, turn } = this.parts(state);
     if (!turn || !native) return turn ?? native;
-    return Date.parse(turn.reading.receivedAt) >= Date.parse(native.reading.receivedAt)
-      ? turn
-      : native;
+    const turnNewer = Date.parse(turn.reading.receivedAt) >= Date.parse(native.reading.receivedAt);
+    if (turn.readingScopeHash !== native.readingScopeHash) return turnNewer ? turn : native;
+    const windows = new Map(native.reading.windows.map((window) => [window.windowId, window]));
+    if (turnNewer) for (const window of turn.reading.windows) windows.set(window.windowId, window);
+    return {
+      reading: {
+        ...(turnNewer ? turn.reading : native.reading),
+        windows: [...windows.values()].slice(0, 64),
+        extraUsage: native.reading.extraUsage,
+        model: native.reading.model,
+      },
+      readingScopeHash: native.readingScopeHash,
+    };
   }
 
   status() {
@@ -447,9 +467,9 @@ export class AnthropicUsageRefresh {
   }
 
   /**
-   * A turn's rate limit frame replaces the windows it reports and keeps the rest of the current
-   * reading, such as the per-model windows of the last /usage read. Windows from another client
-   * scope are not kept, since the scope label would then cover them too.
+   * A turn's rate limit frame is kept on its own, with only the windows it named, so each window
+   * carries the time it was read. A tool-heavy turn sends dozens of frames that mostly repeat
+   * the last one; a repeat inside a minute writes nothing.
    */
   recordTurnReading(value: z.input<typeof AnthropicUsageReadingSchema>) {
     if (this.closed) return;
@@ -458,20 +478,15 @@ export class AnthropicUsageRefresh {
     try {
       scopeHash = this.binding()?.scopeHash ?? null;
     } catch {}
-    const base = this.current();
-    const kept = base?.readingScopeHash === scopeHash ? base.reading : null;
-    const windows = new Map(kept?.windows.map((window) => [window.windowId, window]));
-    for (const window of reading.windows) windows.set(window.windowId, window);
-    const current = turnSchema.parse({
-      reading: {
-        ...reading,
-        windows: [...windows.values()].slice(0, 64),
-        // The frame names neither, so the last /usage read still speaks for both.
-        extraUsage: kept?.extraUsage ?? null,
-        model: kept?.model ?? null,
-      },
-      readingScopeHash: scopeHash,
-    });
+    const previous = this.parts().turn;
+    if (
+      previous &&
+      previous.readingScopeHash === scopeHash &&
+      Date.parse(reading.receivedAt) - Date.parse(previous.reading.receivedAt) < 60_000 &&
+      canonicalJson(previous.reading.windows) === canonicalJson(reading.windows)
+    )
+      return;
+    const current = turnSchema.parse({ reading, readingScopeHash: scopeHash });
     this.options.store.transaction(() => this.write(latestTurn, current, true));
     this.options.changed();
   }
@@ -482,23 +497,34 @@ export class AnthropicUsageRefresh {
    * window (weekly-opus) is scoped to its model and the others to the provider.
    */
   catalogWindows(): { family: 'anthropic'; observation: CatalogObservation }[] {
-    let reading: Current['reading'] | null = null;
+    let parts: ReturnType<AnthropicUsageRefresh['parts']>;
     try {
-      reading = this.current()?.reading ?? null;
+      parts = this.parts();
     } catch {
       return [];
     }
-    if (reading?.status !== 'reported') return [];
-    return reading.windows.map((window) => ({
-      family: 'anthropic',
-      observation: {
-        windowId: window.windowId,
-        remaining: window.remaining,
-        resetsAt: window.resetsAt,
-        observedAt: reading.receivedAt,
-        semantics: { scope: window.windowId.startsWith('weekly-') ? 'model' : 'provider' },
-      },
-    }));
+    const { native, turn } = parts;
+    // Each window keeps the time of the read that produced it, so a per-model percent from a
+    // /usage read days ago does not pass as fresh because a turn frame came in today.
+    const sources = [native, turn].filter(
+      (part): part is Current =>
+        part?.reading.status === 'reported' &&
+        part.readingScopeHash === (native ?? turn)?.readingScopeHash,
+    );
+    const windows = new Map<string, CatalogObservation>();
+    for (const part of sources)
+      for (const window of part.reading.windows) {
+        const seen = windows.get(window.windowId);
+        if (seen && Date.parse(seen.observedAt) > Date.parse(part.reading.receivedAt)) continue;
+        windows.set(window.windowId, {
+          windowId: window.windowId,
+          remaining: window.remaining,
+          resetsAt: window.resetsAt,
+          observedAt: part.reading.receivedAt,
+          semantics: { scope: window.windowId.startsWith('weekly-') ? 'model' : 'provider' },
+        });
+      }
+    return [...windows.values()].map((observation) => ({ family: 'anthropic', observation }));
   }
 
   close(): Promise<unknown> | undefined {

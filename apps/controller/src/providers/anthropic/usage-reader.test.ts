@@ -604,12 +604,27 @@ test('a usage read needs no consent and survives retries and reopen, and a turn 
   assert.equal(f.calls(), 2);
   // The turn frame reports the five-hour window. The weekly and per-model windows stay.
   f.clock.advance(1);
+  const turnAt = f.clock.now();
   turn([usageWindow('five-hour', 71, '2026-10-23T18:20:00.000Z')]);
   assert.deepEqual(f.status()?.reading?.windows, [
     usageWindow('five-hour', 71, '2026-10-23T18:20:00.000Z'),
     ...reported.slice(1),
   ]);
   assert.equal(f.controller.anthropicUsage().clientModel(), 'claude-opus-5-5');
+  // The catalog dates each window by the read that produced it, and a repeated frame inside a
+  // minute writes no second artifact.
+  const artifacts = () => f.controller.store.list('artifact').length;
+  const published = artifacts();
+  turn([usageWindow('five-hour', 71, '2026-10-23T18:20:00.000Z')]);
+  assert.equal(artifacts(), published);
+  const dated = Object.fromEntries(
+    f.controller
+      .anthropicUsage()
+      .catalogWindows()
+      .map(({ observation }) => [observation.windowId, observation.observedAt]),
+  );
+  assert.equal(dated['five-hour'], turnAt);
+  assert.equal(dated.weekly, f.status()?.lastAttemptAt ?? null);
   f.clock.advance(60000);
   assert.equal((await f.controller.execute(f.command(), 'local-owner')).outcome, 'applied');
   assert.equal(f.calls(), 3);

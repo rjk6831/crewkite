@@ -13,6 +13,7 @@ import {
   anthropicDefaultChatModel,
 } from '../providers/anthropic/chat.ts';
 import type { NativeProfileResolution } from '../providers/openai/profile.ts';
+import { windowState } from '../usage/index.ts';
 
 type Entry = ChatCatalogRead['families'][number];
 type Model = Entry['models'][number];
@@ -42,17 +43,6 @@ export type CatalogObservation = Pick<
   'windowId' | 'remaining' | 'resetsAt' | 'observedAt' | 'semantics'
 >;
 
-// The same reading as deriveWindow, on the fields alone: a future observation and a missing
-// remaining say nothing, a passed reset says nothing about now, and five minutes makes it stale.
-function windowState(observation: CatalogObservation, nowMs: number) {
-  const observedAt = Date.parse(observation.observedAt);
-  if (!(observedAt <= nowMs)) return 'unknown';
-  if (observation.resetsAt !== null && Date.parse(observation.resetsAt) <= nowMs)
-    return 'reset-pending';
-  if (observation.remaining === null) return 'unknown';
-  return nowMs - observedAt > 300000 ? 'stale' : 'fresh';
-}
-
 /**
  * What the composer can offer, built from facts the controller already holds. A value
  * CrewKite has not observed stays null or empty. Nothing here starts a provider process.
@@ -71,7 +61,8 @@ function openai(input: ChatCatalogInput): Entry {
   );
   // The profile pins a model the client may no longer list. Default to one it does list, and to
   // one it shows in its own picker before a hidden one.
-  const listed = !models.length || models.some((value) => value.model === ready?.model);
+  const listed =
+    !models.length || models.some((value) => value.model === ready?.model && !value.hidden);
   return entry(
     input,
     'openai',
@@ -188,7 +179,7 @@ function remaining(input: ChatCatalogInput, family: ChatFamily): Entry['remainin
     .sort((left, right) => left.windowId.localeCompare(right.windowId))
     .slice(0, 8)
     .map((observation) => {
-      const state = windowState(observation, input.nowMs);
+      const state = windowState(observation, { nowMs: input.nowMs, maxAgeMs: 300000 });
       // Past a reset the old percent says nothing about now.
       const current = state === 'fresh' || state === 'stale';
       return {
