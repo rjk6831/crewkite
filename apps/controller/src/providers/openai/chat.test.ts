@@ -65,6 +65,9 @@ const { appendFileSync } = require('node:fs');
 const { createInterface } = require('node:readline');
 const [scenario, frames, detail] = process.argv.slice(2);
 const given = JSON.parse(detail ?? 'null') ?? {};
+// A client that rejects its configuration says so on stderr and exits before it reads a line.
+if (scenario === 'crash')
+  process.stderr.write('\u001b[2mstarting\u001b[0m\n\nError: invalid configuration\n', () => process.exit(1));
 // Paths in a scenario are relative to the scratch copy, which is this process's cwd. They stay
 // unnormalized so the adapter has to resolve the '..' itself.
 const here = (path) => process.cwd() + '/' + path;
@@ -139,8 +142,11 @@ const play = (name) => {
 };
 const input = createInterface({ input: process.stdin });
 input.on('line', (line) => {
+  if (scenario === 'crash') return;
   appendFileSync(frames, line + '\n');
   const value = JSON.parse(line);
+  if (value.method === 'turn/start' && scenario === 'refuse')
+    return send({ id: value.id, error: { code: -32602, message: 'Invalid params: thread not loaded\nretry later' } });
   if (value.method === undefined) return play(scenario === 'edit' ? 'reply' : 'approved');
   if (value.id === undefined) return;
   // A hung client never answers the interrupt.
@@ -570,4 +576,50 @@ test('the next turn resumes the thread with its own approval policy and sends on
     },
   ]);
   assert.equal(result.session?.sessionId, 'thread-1');
+});
+
+test('a client that fails before its turn runs leaves its error output and last frames in the failure', async () => {
+  // Stderr comes first without terminal escapes, then the last eight frames as single lines that
+  // name a method or id and an error, never a prompt or a result.
+  const rows = [
+    {
+      scenario: 'crash',
+      failure: {
+        stage: 'session',
+        kind: 'client-exit',
+        message: 'Codex exited with code 1 before the turn finished.',
+        providerMessage: 'Error: invalid configuration',
+        method: null,
+        code: null,
+        detail: 'starting\nError: invalid configuration\n\nsent #1 initialize',
+      },
+    },
+    {
+      scenario: 'refuse',
+      failure: {
+        stage: 'prompt',
+        kind: 'protocol',
+        message: 'Codex refused turn/start.',
+        providerMessage: 'Invalid params: thread not loaded\nretry later',
+        method: 'turn/start',
+        code: -32602,
+        detail: [
+          'sent #2 account/read',
+          'received #2 result',
+          'sent #3 account/rateLimits/read',
+          'received #3 result',
+          'sent #4 thread/start',
+          'received #4 result',
+          'sent #5 turn/start',
+          'received #5 error -32602: Invalid params: thread not loaded retry later',
+        ].join('\n'),
+      },
+    },
+  ];
+  for (const row of rows) {
+    const { stopReason, failure } = await turn(row.scenario).settled();
+    assert.equal(stopReason, 'error', row.scenario);
+    const { nextAction: _nextAction, resetsAt: _resetsAt, ...kept } = failure ?? {};
+    assert.deepEqual(kept, row.failure, row.scenario);
+  }
 });

@@ -78,9 +78,21 @@ export function matchesOpenAiModelCatalogObservation(
 
 /**
  * A failed model read in words a person can act on. The session reason alone says too little:
- * most failures come back as `protocol`, and the request that was waiting tells them apart.
+ * most failures come back as `protocol`, and the request that was waiting tells them apart. A
+ * client that exits early names its cause on stderr, so the last line it wrote follows, within
+ * the 400 characters a reason holds.
  */
-export function modelReadFailure(outcome: { reason: string | null; lastRequest: string }) {
+export function modelReadFailure(outcome: {
+  reason: string | null;
+  lastRequest: string;
+  stderr?: readonly string[];
+}) {
+  const reason = readFailure(outcome);
+  const said = outcome.stderr?.at(-1);
+  return said ? `${reason} The client wrote: ${said}`.slice(0, 400) : reason;
+}
+
+function readFailure(outcome: { reason: string | null; lastRequest: string }) {
   switch (outcome.reason) {
     case 'deadline':
       return 'The OpenAI client did not list its models within 20 seconds. Refresh to try again.';

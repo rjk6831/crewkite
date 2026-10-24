@@ -25,7 +25,7 @@ import {
   projectOpenAiUsage,
   type UsageReporter,
 } from './discovery.ts';
-import { type NativeLaunch, nativeDiscoveryEnvironment } from './native-discovery.ts';
+import { type NativeLaunch, nativeDiscoveryEnvironment, StderrTail } from './native-discovery.ts';
 
 // One chat turn on the app-server: one owned client process, one thread opened or resumed, one
 // turn. The process lives for the turn because a turn is the unit of Stop and cleanup. The thread
@@ -197,6 +197,17 @@ const QUIET = new Set([
   'skills/changed',
 ]);
 const LIMIT_TEXT = /\busage limit/i;
+// A failure here or an early exit carries what the client wrote last. The setup requests fail on
+// configuration, sign-in or protocol drift, and the reason is usually on stderr.
+const EVIDENCE = new Set([
+  'initialize',
+  'account/read',
+  'thread/start',
+  'thread/resume',
+  'turn/start',
+]);
+const FRAMES = 8;
+const DETAIL_LIMIT = 4096;
 
 // Each schema names only the fields this file reads. Optional fields fall back on their own, so
 // one renamed field never drops the rest of a frame.
@@ -331,6 +342,10 @@ class OpenAiChatTurn {
   private approvalCount = 0;
   private readonly reported = new Set<string>();
   private readonly windows = new Map<string, OpenAiUsageWindow>();
+  private readonly stderr = new StderrTail();
+  // One line per frame in either direction: method or id and any error. Never params or results,
+  // which hold the prompt and file contents.
+  private readonly frames: string[] = [];
   private usage: ChatTurnResult['usage'] = null;
   private readonly finish: (result: ChatTurnResult) => void;
   private readonly schedule: Schedule;
@@ -399,8 +414,9 @@ class OpenAiChatTurn {
       this.child = child;
       this.group = child.pid ?? 0;
       child.stdout.on('data', (chunk: Buffer) => this.data(chunk));
-      // Unread stderr would fill its pipe and stall the client. Its text stays private.
-      child.stderr.resume();
+      // Unread stderr would fill its pipe and stall the client. Only its tail is kept, for a
+      // failure's detail.
+      child.stderr.on('data', (chunk: Buffer) => this.stderr.push(chunk));
       // A broken pipe also closes the child, and the close handler reports it.
       child.stdin.on('error', () => {});
       child.on('error', () => {
@@ -609,9 +625,11 @@ class OpenAiChatTurn {
     try {
       value = JSON.parse(text);
     } catch {
+      this.track('received', null);
       return this.noticeOnce('', 'warning', 'Codex sent a line CrewKite could not read.');
     }
     const message = envelope.safeParse(value);
+    this.track('received', message.data ?? null);
     if (!message.success)
       return this.noticeOnce('', 'warning', 'Codex sent a line CrewKite could not read.');
     const { id, method, params } = message.data;
@@ -1042,7 +1060,53 @@ class OpenAiChatTurn {
 
   private write(value: unknown) {
     if (!this.child || this.closing || this.closed) return;
+    this.track('sent', envelope.safeParse(value).data ?? null);
     this.child.stdin.write(`${JSON.stringify(value)}\n`);
+  }
+
+  /** Keeps the last frames as single lines: direction, id, method, and any error's code and text. */
+  private track(direction: 'sent' | 'received', value: z.output<typeof envelope> | null) {
+    let line = `${direction} a line CrewKite could not read`;
+    if (value) {
+      const error =
+        value.error != null
+          ? rpcError.safeParse(value.error).data
+          : value.method === 'error'
+            ? errorNotice.safeParse(value.params).data?.error
+            : null;
+      const head = [
+        direction,
+        value.id === undefined ? '' : `#${clip(String(value.id), 40)}`,
+        value.method ?? (value.error != null ? 'error' : 'result'),
+      ];
+      const code = error && 'code' in error && error.code != null ? ` ${error.code}` : '';
+      const text = error?.message
+        ? `: ${clip(error.message.replace(/\s+/g, ' ').trim(), 200)}`
+        : '';
+      line = `${head.filter(Boolean).join(' ')}${code}${text}`;
+    }
+    this.frames.push(line);
+    if (this.frames.length > FRAMES) this.frames.shift();
+  }
+
+  /**
+   * What the client wrote before it failed: its last stderr lines, a blank line, then the last
+   * frames. The frames take what they need and stderr keeps its newest text in the rest.
+   */
+  private evidence(failure: ChatFailure): ChatFailure {
+    const lines = this.stderr.lines();
+    const frames = this.frames.join('\n');
+    const said = lines.join('\n');
+    const room = Math.max(0, DETAIL_LIMIT - frames.length - 2);
+    const detail = [said.slice(Math.max(0, said.length - room)), frames]
+      .filter(Boolean)
+      .join('\n\n');
+    const last = lines.at(-1);
+    return {
+      ...failure,
+      providerMessage: failure.providerMessage ?? (last ? clip(last, 16_384) : null),
+      ...(detail ? { detail: clip(detail, DETAIL_LIMIT) } : {}),
+    };
   }
 
   private send(event: AgentEvent) {
@@ -1071,10 +1135,12 @@ class OpenAiChatTurn {
   }
 
   private fail(failure: ChatFailure) {
+    if (this.outcome) return;
+    const evidence = failure.kind === 'client-exit' || EVIDENCE.has(failure.method ?? '');
     this.end({
       stopReason:
         failure.kind === 'usage-limit' ? 'limit' : failure.kind === 'stopped' ? 'stopped' : 'error',
-      failure,
+      failure: evidence ? this.evidence(failure) : failure,
     });
   }
 

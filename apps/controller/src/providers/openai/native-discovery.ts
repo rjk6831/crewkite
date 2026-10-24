@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { lstatSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
+import { stripVTControlCharacters } from 'node:util';
 import { groupAbsent, type Schedule } from '../../host/worker.ts';
 import {
   type DiscoveryEnvelope,
@@ -48,7 +49,31 @@ type Outcome<T = DiscoveryMetadata> = {
   notifications: number;
   stdoutBytes: number;
   stderrBytes: number;
+  /** The last lines the client wrote to stderr, oldest first. */
+  stderr: readonly string[];
 };
+
+/**
+ * The last 4 KiB a client wrote to stderr. A client that exits before it answers says why there,
+ * and nowhere else. Only the tail is kept, and only in memory.
+ */
+export class StderrTail {
+  private bytes = Buffer.alloc(0);
+  private cut = false;
+
+  push(chunk: Buffer) {
+    const joined = Buffer.concat([this.bytes, chunk]);
+    this.cut ||= joined.length > 4096;
+    this.bytes = joined.subarray(Math.max(0, joined.length - 4096));
+  }
+
+  /** Non-empty lines without terminal escapes. A line the window cut at its front is dropped. */
+  lines(): string[] {
+    const lines = stripVTControlCharacters(this.bytes.toString('utf8')).split(/\r?\n/);
+    if (this.cut) lines.shift();
+    return lines.map((line) => line.trimEnd()).filter(Boolean);
+  }
+}
 export type NativeTranscript<T> = {
   next: () => Uint8Array | null;
   push: (bytes: Uint8Array) => void;
@@ -229,6 +254,7 @@ function startTranscript<T>(
   let received = 0;
   let stdoutBytes = 0;
   let stderrBytes = 0;
+  const stderr = new StderrTail();
   let stopping = false;
   let owned = false;
   let killedAt: number | undefined;
@@ -264,6 +290,7 @@ function startTranscript<T>(
       notifications: reader.notifications,
       stdoutBytes,
       stderrBytes,
+      stderr: stderr.lines(),
     });
   };
   const absent = () => group === 0 || groupAbsent(group);
@@ -386,6 +413,7 @@ function startTranscript<T>(
   });
   child.stderr.on('data', (bytes: Buffer) => {
     stderrBytes += bytes.length;
+    stderr.push(bytes);
     received += bytes.length;
     if (received > (reader.outputLimit ?? 1_048_576)) stop('output-limit');
   });
