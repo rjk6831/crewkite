@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { AnthropicNativeProfileSchema } from '@crewkite/contracts';
@@ -343,6 +343,8 @@ test('the usage owner bounds output and refuses metadata before physical closure
         assert.equal(launch.executableSha256, context.executableSha256);
         assert.equal(launch.executable, context.executable);
         assert.equal(launch.environment.HOME, context.home);
+        // The client finds its Keychain sign-in under this name.
+        assert.equal(launch.environment.USER, userInfo().username);
         assert.equal(launch.directory, context.directory);
         return {
           stdoutStream: output(true),
@@ -444,9 +446,11 @@ function refreshFixture(
         assert.deepEqual(Object.keys(launch.environment).sort(), [
           'HOME',
           'LANG',
+          'LOGNAME',
           'NO_COLOR',
           'PATH',
           'TMPDIR',
+          'USER',
         ]);
         launch.lifecycle.intent({
           operationId: launch.operationId,

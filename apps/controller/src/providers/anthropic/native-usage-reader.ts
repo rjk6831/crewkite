@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { userInfo } from 'node:os';
 import { isAbsolute, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { z } from 'zod';
@@ -130,6 +131,10 @@ export function startAnthropicUsageReader(
     directory: context.directory,
     environment: {
       HOME: context.home,
+      // The client reads its sign-in from the Keychain under this name, so without it /usage runs
+      // signed out and prints no usage report.
+      USER: userInfo().username,
+      LOGNAME: userInfo().username,
       TMPDIR: context.temporary,
       PATH: '/usr/bin:/bin',
       LANG: 'C',

@@ -58,10 +58,13 @@ const commandEnvironmentNames = new Set([
   'HOME',
   'LANG',
   'LC_ALL',
+  // The Anthropic client looks up its Keychain sign-in under the login name.
+  'LOGNAME',
   'NO_COLOR',
   'PATH',
   'TMPDIR',
   'TZ',
+  'USER',
   'XDG_CONFIG_HOME',
 ]);
 const commandShellNames = new Set([
