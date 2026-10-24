@@ -1,4 +1,5 @@
 import type {
+  ChatHandoffMode,
   ChatPermissionPolicy,
   ChatRole,
   ChatThread,
@@ -193,7 +194,11 @@ function ThreadTab({
   source: ThreadSource;
   taskId: string;
   thread: ChatThread | null;
-  onConfigure: (patch: { permissionPolicy?: ChatPermissionPolicy; autoHandoff?: boolean }) => void;
+  onConfigure: (patch: {
+    permissionPolicy?: ChatPermissionPolicy;
+    autoHandoff?: boolean;
+    handoffMode?: ChatHandoffMode;
+  }) => void;
 }) {
   const [turns, setTurns] = useState<ChatTurn[] | null>(null);
   const active = thread?.activeTurnId ?? null;
@@ -314,7 +319,11 @@ export function Inspector({
   onClose: () => void;
   changesKey: number;
   focusPath: string | null;
-  onConfigure: (patch: { permissionPolicy?: ChatPermissionPolicy; autoHandoff?: boolean }) => void;
+  onConfigure: (patch: {
+    permissionPolicy?: ChatPermissionPolicy;
+    autoHandoff?: boolean;
+    handoffMode?: ChatHandoffMode;
+  }) => void;
 }) {
   const panel = useRef<HTMLElement>(null);
   const size = useInspectorWidth(panel);

@@ -56,7 +56,9 @@ export type ThreadAction =
   | { type: 'dismiss'; localId: string }
   | {
       type: 'configured';
-      patch: Partial<Pick<ChatThread, 'permissionPolicy' | 'autoHandoff' | 'selection'>>;
+      patch: Partial<
+        Pick<ChatThread, 'permissionPolicy' | 'autoHandoff' | 'handoffMode' | 'selection'>
+      >;
     };
 
 export const initialThreadState = (taskId: string): ThreadState => ({

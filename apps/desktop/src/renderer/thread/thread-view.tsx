@@ -1,4 +1,9 @@
-import type { ChatModelSelection, ChatPermissionPolicy, WorkspaceState } from '@crewkite/contracts';
+import type {
+  ChatHandoffMode,
+  ChatModelSelection,
+  ChatPermissionPolicy,
+  WorkspaceState,
+} from '@crewkite/contracts';
 import { GitBranch, PanelRight } from 'lucide-react';
 import { useCallback, useMemo, useRef, useState } from 'react';
 import {
@@ -107,7 +112,11 @@ export function ThreadView({
     [source, task.id, reload],
   );
   const configure = useCallback(
-    (patch: { permissionPolicy?: ChatPermissionPolicy; autoHandoff?: boolean }) =>
+    (patch: {
+      permissionPolicy?: ChatPermissionPolicy;
+      autoHandoff?: boolean;
+      handoffMode?: ChatHandoffMode;
+    }) =>
       configureThread(source, { taskId: task.id, ...patch }).then(
         () => {
           dispatch({ type: 'configured', patch });

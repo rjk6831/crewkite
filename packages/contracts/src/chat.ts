@@ -71,6 +71,8 @@ export const ChatFailureSchema = z.strictObject({
   code: z.number().int().nullable().default(null),
   resetsAt: timestamp.nullable().default(null),
   nextAction: z.string().min(1).max(1024),
+  /** What the client wrote before it failed: the last lines of its error output or frames. */
+  detail: z.string().max(4096).optional(),
 });
 export type ChatFailure = z.infer<typeof ChatFailureSchema>;
 
@@ -274,6 +276,8 @@ export const ConfigureChatThreadPayloadSchema = z.strictObject({
   permissionPolicy: ChatPermissionPolicySchema.optional(),
   autoHandoff: z.boolean().optional(),
   handoffMode: ChatHandoffModeSchema.optional(),
+  /** Take a queued message back before it starts. */
+  dequeue: id('msg').optional(),
 });
 export const AcceptChatChangesPayloadSchema = z.strictObject({
   taskId: id('tsk'),
