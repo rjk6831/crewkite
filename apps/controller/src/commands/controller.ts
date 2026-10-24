@@ -247,6 +247,8 @@ export class Controller {
     handle?: ReturnType<typeof startGoogleAcpSetup>;
     stopped: boolean;
   };
+  /** The Google setup steps the controller starts on its own at launch. */
+  googleAcpPreparation?: Promise<void>;
   acpStart?: {
     key: string;
     hash: string;
@@ -337,6 +339,9 @@ export class Controller {
       this.owner.close();
       throw error;
     }
+    // Google setup is three client runs and can take a minute. Recovery above has settled any
+    // interrupted step, so the runs that need no click start here.
+    this.googleAcpPreparation = this.prepareGoogleAcp().catch(() => {});
   }
 
   private taskOperationRuntime?: TaskOperations;

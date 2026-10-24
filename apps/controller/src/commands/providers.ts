@@ -6,6 +6,7 @@ import {
   type Command,
   type CommandResult,
   CommandResultSchema,
+  CommandSchema,
   GoogleAcpSetupSchema,
   LocalModelObservationSchema,
   type LocalSetup,
@@ -203,6 +204,73 @@ export class ProviderCommands {
       reason: 'acp-setup-pending',
       data: { kind: 'google-acp-setup', setup: next },
     };
+  }
+
+  /**
+   * The setup step that can run without the person, or null. Initialize and discover start no
+   * prompt and open no browser. Authenticate opens a browser, so it waits for a click. The
+   * initialize reply names sign-in methods and no sign-in status, so discover runs only on a
+   * proof that already records a finished sign-in. Only a controller that registers the real
+   * client prepares it; a harness that drives each step leaves registration off.
+   */
+  googleAcpPreparationStep(this: Controller): 'initialize' | 'discover' | null {
+    if (
+      !this.options.registerGoogleAcp ||
+      this.closed ||
+      this.acpSetupRuntime ||
+      this.acpStart ||
+      this.googleInstallationBlocker() ||
+      this.store.transaction(() => this.store.googleOperationBlocker())
+    )
+      return null;
+    const setup = this.store.googleAcpSetup();
+    if (setup.operationId || setup.state === 'unknown') return null;
+    const resolution = this.acpResolution();
+    if (!resolution.client || !resolution.environment) return null;
+    let proof: AcpSetupProof | null = null;
+    try {
+      const stored = this.acpProof(setup.proofId);
+      if (stored)
+        proof = validateAcpSetupProof(
+          stored,
+          resolution.client,
+          this.options.googleAcp?.reviewMappings,
+        );
+    } catch {}
+    if (proof && setup.state === 'ready') return null;
+    if (proof?.auth.status === 'authenticated') return 'discover';
+    // A fresh initialize would bring the same proof back. The next step is the person's sign-in.
+    if (proof && setup.state === 'authentication-required') return null;
+    return 'initialize';
+  }
+
+  /**
+   * Takes the Google client as far toward ready as it can go without the person, one attempt
+   * per step. Each step is an ordinary setup command, so ownership, the process journal and
+   * stop on shutdown work as they do for a click, and a failure lands in the setup state.
+   */
+  async prepareGoogleAcp(this: Controller) {
+    const attempted = new Set<string>();
+    for (;;) {
+      const step = this.googleAcpPreparationStep();
+      if (!step || attempted.has(step)) return;
+      attempted.add(step);
+      const setup = this.store.googleAcpSetup();
+      const command = CommandSchema.parse({
+        protocol: 1,
+        key: this.id('cmd'),
+        actor: { id: 'controller', kind: 'controller' },
+        command: step === 'initialize' ? 'InitializeGoogleAcp' : 'DiscoverGoogleAcp',
+        expectedRevision: setup.revision,
+        // The contract takes one consent value. The controller actor marks a step nobody clicked.
+        payload: {
+          profileId: 'google-acp-v1',
+          consent: 'explicit',
+          ...(step === 'discover' ? { proofId: setup.proofId } : {}),
+        },
+      }) as AcpSetupCommand;
+      await this.executeAcpSetup(command, 'local-owner');
+    }
   }
 
   async launchAcpSetup(
@@ -497,6 +565,10 @@ export class ProviderCommands {
     } catch {
       return { outcome: 'blocked', reason: 'google-install-storage-failed' };
     }
+    // A new client has no proof yet. Initializing before the reply means the card's next step
+    // is the sign-in, and an install that nobody follows up still leaves the client initialized.
+    if (command.command === 'InstallGoogleAcp' && result.outcome === 'applied')
+      await this.prepareGoogleAcp().catch(() => {});
     return result;
   }
 
