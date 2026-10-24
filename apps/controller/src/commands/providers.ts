@@ -262,10 +262,9 @@ export class ProviderCommands {
         actor: { id: 'controller', kind: 'controller' },
         command: step === 'initialize' ? 'InitializeGoogleAcp' : 'DiscoverGoogleAcp',
         expectedRevision: setup.revision,
-        // The contract takes one consent value. The controller actor marks a step nobody clicked.
         payload: {
           profileId: 'google-acp-v1',
-          consent: 'explicit',
+          consent: 'automatic',
           ...(step === 'discover' ? { proofId: setup.proofId } : {}),
         },
       }) as AcpSetupCommand;

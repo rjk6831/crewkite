@@ -2390,9 +2390,14 @@ export const CommandSchema = z.discriminatedUnion('command', [
     }),
   ),
   mutate('StopAnthropicUsage', z.strictObject({ operationId: CommandIdSchema })),
+  // Initialize and discover run on their own at launch as well as on a click. Authenticate opens
+  // a browser, so only a person starts it.
   mutate(
     'InitializeGoogleAcp',
-    z.strictObject({ profileId: z.literal('google-acp-v1'), consent: z.literal('explicit') }),
+    z.strictObject({
+      profileId: z.literal('google-acp-v1'),
+      consent: z.enum(['explicit', 'automatic']),
+    }),
   ),
   mutate(
     'AuthenticateGoogleAcp',
@@ -2408,7 +2413,7 @@ export const CommandSchema = z.discriminatedUnion('command', [
     z.strictObject({
       profileId: z.literal('google-acp-v1'),
       proofId: ArtifactIdSchema,
-      consent: z.literal('explicit'),
+      consent: z.enum(['explicit', 'automatic']),
     }),
   ),
   mutate(
