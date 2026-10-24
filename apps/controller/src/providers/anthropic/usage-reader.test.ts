@@ -42,7 +42,7 @@ const withLimits = (value: unknown) => ({
 });
 const usageWindow = (windowId: string, value: number, resetsAt: string | null) => ({
   windowId,
-  remaining: { value, unit: 'percent' },
+  remaining: { value, unit: 'percent' as const },
   resetsAt,
 });
 const reported = [
@@ -547,27 +547,31 @@ function refreshFixture(
   };
 }
 
-test('manual usage consent and the age-unknown report survive exact retries and reopen', async (t) => {
+test('a usage read needs no consent and survives retries and reopen, and a turn replaces only its windows', async (t) => {
   const f = refreshFixture(t);
-  const afterTurn = () => f.controller.anthropicUsage().refreshAfterTurn(f.command().key);
+  const whenDue = () => f.controller.anthropicUsage().refreshWhenDue(f.command().key);
+  const turn = (windows: ReturnType<typeof usageWindow>[]) =>
+    f.controller.anthropicUsage().recordTurnReading({
+      source: 'turn-rate-limit',
+      status: 'reported',
+      receivedAt: f.clock.now(),
+      observedAt: null,
+      freshness: 'unknown',
+      windows,
+      extraUsage: null,
+      model: null,
+      modelTurns: 0,
+      qualified: false,
+    });
   const initial = f.status();
-  assert(initial?.available && initial.trust && !initial.trust.accepted);
-  assert.equal(afterTurn(), undefined);
+  assert(initial?.available && initial.trust?.accepted);
   const untouched = f.controller
     .workspaceState()
     .usageReaders.filter((reader) => reader.family !== 'anthropic');
-  assert.equal(
-    (await f.controller.execute(f.command(), 'local-owner')).reason,
-    'native-trust-required',
-  );
-  assert.equal(f.calls(), 0);
-  const request = f.command('RefreshAnthropicUsage', {
-    trust: { nativeTrust: 'accepted', scopeHash: initial.trust.scopeHash },
-  });
+  const request = f.command();
   assert.equal((await f.controller.execute(request, 'local-owner')).outcome, 'applied');
   assert.equal(f.calls(), 1);
   const retained = f.status();
-  assert.equal(retained?.trust?.accepted, true);
   assert.equal(retained?.lastObservedAt, null);
   assert.equal(retained?.reading?.observedAt, null);
   assert.equal(retained?.reading?.freshness, 'unknown');
@@ -576,8 +580,9 @@ test('manual usage consent and the age-unknown report survive exact retries and 
   assert.equal(f.controller.anthropicUsage().clientModel(), 'claude-opus-5-5');
   assert.equal(retained?.readingScopeHash, retained?.trust?.scopeHash);
   assert.equal((await f.controller.execute(request, 'local-owner')).outcome, 'already-applied');
+  const trust = { nativeTrust: 'accepted', scopeHash: initial.trust.scopeHash };
   assert.equal(
-    (await f.controller.execute({ ...request, payload: {} }, 'local-owner')).reason,
+    (await f.controller.execute({ ...request, payload: { trust } }, 'local-owner')).reason,
     'idempotency-key-reused',
   );
   assert.equal(
@@ -590,34 +595,37 @@ test('manual usage consent and the age-unknown report survive exact retries and 
   );
   await f.reopen();
   assert.deepEqual(f.status()?.reading, retained?.reading);
-  assert.equal(f.status()?.trust?.accepted, true);
   assert.equal(f.calls(), 1);
   // A settled turn reads again only once the last read is more than a minute old.
   f.clock.advance(60000);
-  assert.equal(afterTurn(), undefined);
+  assert.equal(whenDue(), undefined);
   f.clock.advance(1);
-  await afterTurn();
+  await whenDue();
   assert.equal(f.calls(), 2);
+  // The turn frame reports the five-hour window. The weekly and per-model windows stay.
+  f.clock.advance(1);
+  turn([usageWindow('five-hour', 71, '2026-10-23T18:20:00.000Z')]);
+  assert.deepEqual(f.status()?.reading?.windows, [
+    usageWindow('five-hour', 71, '2026-10-23T18:20:00.000Z'),
+    ...reported.slice(1),
+  ]);
+  assert.equal(f.controller.anthropicUsage().clientModel(), 'claude-opus-5-5');
   f.clock.advance(60000);
   assert.equal((await f.controller.execute(f.command(), 'local-owner')).outcome, 'applied');
   assert.equal(f.calls(), 3);
+  assert.deepEqual(f.status()?.reading?.windows, reported);
   const previousReport = f.status()?.reading;
   f.clock.advance(60000);
   f.changeScope();
-  assert.equal(f.status()?.trust?.accepted, false);
-  assert.equal(
-    (await f.controller.execute(f.command('RefreshAnthropicUsage', request.payload), 'local-owner'))
-      .reason,
-    'native-trust-scope-changed',
-  );
-  assert.equal(
-    (await f.controller.execute(f.command(), 'local-owner')).reason,
-    'native-trust-required',
-  );
-  assert.equal(afterTurn(), undefined);
   assert.deepEqual(f.status()?.reading, previousReport);
   assert.notEqual(f.status()?.readingScopeHash, f.status()?.trust?.scopeHash);
-  assert.equal(f.calls(), 3);
+  // A trust payload an earlier desktop sends still reads, under the new scope too.
+  assert.equal(
+    (await f.controller.execute(f.command('RefreshAnthropicUsage', { trust }), 'local-owner'))
+      .outcome,
+    'applied',
+  );
+  assert.equal(f.calls(), 4);
 });
 
 test('manual usage Stop, failed cooldown and uncertain ownership never replay a native read', async (t) => {
@@ -682,7 +690,7 @@ test('manual usage Stop, failed cooldown and uncertain ownership never replay a 
       'anthropic-metadata-ownership-pending',
     );
     if (mode === 'held') {
-      assert.equal(f.controller.anthropicUsage().refreshAfterTurn(f.command().key), undefined);
+      assert.equal(f.controller.anthropicUsage().refreshWhenDue(f.command().key), undefined);
       assert.equal(
         (await f.controller.execute(f.command(), 'local-owner')).reason,
         'anthropic-metadata-ownership-pending',

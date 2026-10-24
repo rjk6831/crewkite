@@ -23,6 +23,9 @@ import { anthropicUsageReaderScope, startAnthropicUsageReader } from './native-u
 import { maximumDetail } from './usage-reader.ts';
 
 const latest = 'usage-reader:anthropic';
+// Turn readings keep a record of their own. A /usage read in flight saves its whole record when
+// it ends, so a turn reading written into that record could be lost.
+const latestTurn = 'usage-turn:anthropic';
 // Twice the bounded native stdout leaves space for the ownership journal around a report.
 const maximumRecordBytes = 256 * 1024;
 const recordSchema = z.strictObject({
@@ -41,6 +44,11 @@ const recordSchema = z.strictObject({
   detail: z.string().max(maximumDetail).nullable().catch(null),
 });
 type Record = z.infer<typeof recordSchema>;
+const turnSchema = z.strictObject({
+  reading: AnthropicUsageReadingSchema,
+  readingScopeHash: HashSchema.nullable(),
+});
+type Current = z.infer<typeof turnSchema>;
 type UsageCommand = Extract<Command, { command: 'RefreshAnthropicUsage' | 'StopAnthropicUsage' }>;
 
 /** A manual local command uses the same durable owner as other trusted native operations. */
@@ -138,16 +146,18 @@ export class AnthropicUsageRefresh {
     return { context, scopeHash, clientVersion: profile.client.version };
   }
 
-  private trusted(scopeHash: string) {
-    const value = this.read(`anthropic-usage-trust:${scopeHash}`);
-    if (value === null) return false;
-    return z
-      .strictObject({
-        scopeHash: z.literal(scopeHash),
-        nativeTrust: z.literal('accepted'),
-        acceptedAt: TimestampSchema,
-      })
-      .safeParse(value).success;
+  /** The newer of the last /usage reading and the last turn reading. */
+  private current(state = this.state()): Current | null {
+    const native = state?.reading
+      ? { reading: state.reading, readingScopeHash: state.readingScopeHash }
+      : null;
+    // A turn reading saved in an earlier shape is dropped, as the /usage reading is.
+    const parsed = turnSchema.safeParse(this.read(latestTurn));
+    const turn = parsed.success ? parsed.data : null;
+    if (!turn || !native) return turn ?? native;
+    return Date.parse(turn.reading.receivedAt) >= Date.parse(native.reading.receivedAt)
+      ? turn
+      : native;
   }
 
   status() {
@@ -156,6 +166,7 @@ export class AnthropicUsageRefresh {
       binding = this.binding();
     } catch {}
     const state = this.state();
+    const current = this.current(state);
     const reader = {
       id: 'anthropic-usage-v1',
       family: 'anthropic',
@@ -168,8 +179,10 @@ export class AnthropicUsageRefresh {
       operationId: state && state.state !== 'quiescent' ? state.operationId : null,
       lastAttemptAt: state?.attemptedAt ?? null,
       lastObservedAt: null,
-      reading: state?.reading ?? null,
-      readingScopeHash: state?.readingScopeHash ?? null,
+      reading: current?.reading ?? null,
+      readingScopeHash: current?.readingScopeHash ?? null,
+      // The resolved, hash-pinned client is the native trust profile of ADR 0009, so its /usage
+      // command needs no consent of its own, as with the Google reader.
       ...(binding
         ? {
             trust: {
@@ -178,7 +191,7 @@ export class AnthropicUsageRefresh {
               command: '/usage',
               generationRequest: false,
               policyHooks: 'covered-by-native-client-trust',
-              accepted: this.trusted(binding.scopeHash),
+              accepted: true,
             },
           }
         : {}),
@@ -283,19 +296,8 @@ export class AnthropicUsageRefresh {
     const attemptedAt = this.options.now();
     if (previous && Date.parse(attemptedAt) - Date.parse(previous.attemptedAt) < 60000)
       return refused('usage-reader-cooldown');
-    const trustKey = `anthropic-usage-trust:${binding.scopeHash}`;
-    if (command.payload.trust && command.payload.trust.scopeHash !== binding.scopeHash)
-      return refused('native-trust-scope-changed');
-    if (!this.trusted(binding.scopeHash)) {
-      if (!command.payload.trust) return refused('native-trust-required');
-      store.transaction(() =>
-        this.write(trustKey, {
-          scopeHash: binding.scopeHash,
-          nativeTrust: 'accepted',
-          acceptedAt: attemptedAt,
-        }),
-      );
-    }
+    // A trust payload from an earlier desktop still parses. The resolved client needs none, so the
+    // payload changes nothing.
     const record: Record = {
       operationId: command.key,
       requestHash,
@@ -420,15 +422,15 @@ export class AnthropicUsageRefresh {
   }
 
   /**
-   * A settled chat turn spent some allowance, so the gauge reads again on its own. It reads only
-   * under trust the person already gave, when the last read is more than a minute old, and never
-   * beside another read. Anything else skips it without a receipt.
+   * The gauge reads on its own when the controller starts and after each chat turn settles, since
+   * a turn spent some allowance. It reads only when the client resolves, the last read is more
+   * than a minute old and no other read runs. Anything else skips it without a receipt.
    */
-  refreshAfterTurn(key: string): Promise<unknown> | undefined {
+  refreshWhenDue(key: string): Promise<unknown> | undefined {
     try {
       if (this.closed || this.active || this.blocker() || this.options.blocked()) return;
       const binding = this.binding();
-      if (!binding || !this.trusted(binding.scopeHash)) return;
+      if (!binding) return;
       const previous = this.state();
       if (previous && Date.parse(this.options.now()) - Date.parse(previous.attemptedAt) <= 60_000)
         return;
@@ -444,6 +446,36 @@ export class AnthropicUsageRefresh {
     } catch {
       return;
     }
+  }
+
+  /**
+   * A turn's rate limit frame replaces the windows it reports and keeps the rest of the current
+   * reading, such as the per-model windows of the last /usage read. Windows from another client
+   * scope are not kept, since the scope label would then cover them too.
+   */
+  recordTurnReading(value: z.input<typeof AnthropicUsageReadingSchema>) {
+    if (this.closed) return;
+    const reading = AnthropicUsageReadingSchema.parse(value);
+    let scopeHash: string | null = null;
+    try {
+      scopeHash = this.binding()?.scopeHash ?? null;
+    } catch {}
+    const base = this.current();
+    const kept = base?.readingScopeHash === scopeHash ? base.reading : null;
+    const windows = new Map(kept?.windows.map((window) => [window.windowId, window]));
+    for (const window of reading.windows) windows.set(window.windowId, window);
+    const current = turnSchema.parse({
+      reading: {
+        ...reading,
+        windows: [...windows.values()].slice(0, 64),
+        // The frame names neither, so the last /usage read still speaks for both.
+        extraUsage: kept?.extraUsage ?? null,
+        model: kept?.model ?? null,
+      },
+      readingScopeHash: scopeHash,
+    });
+    this.options.store.transaction(() => this.write(latestTurn, current, true));
+    this.options.changed();
   }
 
   close(): Promise<unknown> | undefined {

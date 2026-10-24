@@ -14,6 +14,7 @@ import { isAbsolute, join, relative, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import type {
   AgentEvent,
+  AnthropicUsageReadingSchema,
   ChatFailure,
   ChatPermissionOption,
   ChatToolKind,
@@ -54,6 +55,7 @@ type Item = {
   tool?: { id: string; name: string; json: string };
 };
 type Ask = { toolName: string; input: Record<string, unknown>; callId: string | null };
+type UsageReading = z.infer<typeof AnthropicUsageReadingSchema>;
 
 const CLEANUP_MS = 2_000;
 const TERM_MS = 500;
@@ -76,11 +78,20 @@ const usage = z.object({
   cache_creation_input_tokens: tokens.nullish(),
   cache_read_input_tokens: tokens.nullish(),
 });
+// Only the subtype has to parse. Every other field falls back to undefined on its own, so a
+// finished turn does not fail because one detail changed shape in a later build.
+const loose = <T extends z.ZodType>(schema: T) => schema.optional().catch(undefined);
+// The window readings are loose too: one that changed shape drops out, and the status still
+// decides the turn.
+const windowReading = z.object({ utilization: z.unknown(), resetsAt: z.unknown() });
 const rateInfo = z.object({
   status: z.string().optional(),
   resetsAt: z.number().optional(),
   isUsingOverage: z.boolean().optional(),
   overageInUse: z.boolean().optional(),
+  rateLimitType: loose(z.string()),
+  utilization: loose(z.number()),
+  unifiedWindows: loose(z.record(z.string(), loose(windowReading))),
 });
 const block = z.object({
   type: z.string(),
@@ -147,9 +158,6 @@ const rateLimit = z.object({
   rate_limit_info: rateInfo.optional(),
   rateLimitInfo: rateInfo.optional(),
 });
-// Only the subtype has to parse. Every other field falls back to undefined on its own, so a
-// finished turn does not fail because one detail changed shape in a later build.
-const loose = <T extends z.ZodType>(schema: T) => schema.optional().catch(undefined);
 const result = z.object({
   subtype: z.string().optional(),
   is_error: loose(z.boolean()),
@@ -169,6 +177,43 @@ const unixTime = (seconds: unknown) => {
   const parsed = epochSeconds.safeParse(seconds);
   return parsed.success ? new Date(parsed.data * 1000).toISOString() : null;
 };
+// A used fraction above 1 may be a reading in another unit, so it counts as unreadable and never
+// shows as an exhausted window.
+const fraction = z.number().min(0).max(1);
+// The window IDs the /usage read produces: five_hour is five-hour, seven_day is weekly and
+// seven_day_opus is weekly-opus. Paid overage is billed money and never an included window.
+const windowId = (name: string) =>
+  name === 'five_hour'
+    ? 'five-hour'
+    : name === 'seven_day'
+      ? 'weekly'
+      : /^seven_day_[a-z][a-z0-9_]{0,63}$/.test(name)
+        ? `weekly-${name.slice('seven_day_'.length).replaceAll('_', '-')}`
+        : null;
+type WindowReading = { utilization?: unknown; resetsAt?: unknown } | undefined;
+/**
+ * The windows one rate limit frame reports. The per-response readings count first. The top-level
+ * fields name only the window closest to its limit and stand in when those give nothing.
+ */
+function turnWindows(info: z.output<typeof rateInfo>): UsageReading['windows'] {
+  const read = (entries: [string, WindowReading][]) =>
+    entries.flatMap(([name, reading]) => {
+      const id = windowId(name);
+      const used = fraction.safeParse(reading?.utilization);
+      if (!id || !used.success) return [];
+      const value = (10_000 - Math.round(used.data * 10_000)) / 100;
+      return [
+        {
+          windowId: id,
+          remaining: { value, unit: 'percent' as const },
+          resetsAt: unixTime(reading?.resetsAt),
+        },
+      ];
+    });
+  const unified = read(Object.entries(info.unifiedWindows ?? {})).slice(0, 64);
+  if (unified.length || !info.rateLimitType) return unified;
+  return read([[info.rateLimitType, info]]);
+}
 const USAGE_LIMIT = /usage limit|limit reached|hit your limit|out of usage/i;
 const SIGNED_OUT =
   /\/login\b|\bnot logged in\b|\blog ?in\b|\bsign(?:ed)? ?in\b|authenticat|\boauth\b|invalid api key/i;
@@ -264,7 +309,7 @@ export const anthropicChatModels = [
   'claude-haiku-5-5',
 ] as const;
 export const anthropicDefaultChatModel = 'claude-sonnet-5-5';
-export const anthropicChatEfforts = ['default', 'low', 'medium', 'high', 'xhigh'] as const;
+export const anthropicChatEfforts = ['default', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 
 function chatArguments(request: ChatTurnRequest, resume: string | null) {
   const { effort, model } = request.selection;
@@ -301,6 +346,8 @@ export function anthropicChatAdapter(deps: {
   launch: (request: ChatTurnRequest) => { executable: string; sha256: string };
   spawn?: Spawn;
   schedule?: Schedule;
+  /** Each rate limit frame that reports a window. The last one in a turn is the newest. */
+  onUsage?: (reading: UsageReading) => void;
 }): ChatAdapter {
   return { family: 'anthropic', startTurn: (request, emit) => startTurn(deps, request, emit) };
 }
@@ -794,6 +841,26 @@ function startTurn(
       ? (parsed.data.rate_limit_info ?? parsed.data.rateLimitInfo)
       : undefined;
     if (!info) return unreadable(name);
+    const windows = turnWindows(info);
+    if (windows.length && deps.onUsage) {
+      const at = now();
+      try {
+        deps.onUsage({
+          source: 'turn-rate-limit',
+          status: 'reported',
+          receivedAt: new Date(Number.isFinite(at) ? at : Date.now()).toISOString(),
+          observedAt: null,
+          freshness: 'unknown',
+          windows,
+          extraUsage: null,
+          model: null,
+          modelTurns: 0,
+          qualified: false,
+        });
+      } catch {
+        // Usage is advisory. A failing sink leaves the turn as it was.
+      }
+    }
     if (info.isUsingOverage === true || info.overageInUse === true)
       notice('overage', 'This turn is using paid extra usage on the Anthropic account.', 'warning');
     if (info.status === 'allowed_warning')

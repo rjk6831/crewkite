@@ -375,9 +375,9 @@ export class Controller {
       projectPath: (projectId) => this.projectPath(projectId),
       resolveSelection: (_taskId, selection) => this.chatSelection(selection),
       catalog: () => this.chatCatalog(),
-      // A settled turn spent allowance, so the gauge reads again under the trust already given.
+      // A settled turn spent allowance, so the gauge reads again.
       onTurnSettled: (family) => {
-        if (family === 'anthropic') void this.anthropicUsage().refreshAfterTurn(this.id('cmd'));
+        if (family === 'anthropic') void this.anthropicUsage().refreshWhenDue(this.id('cmd'));
       },
     });
     return this.chatRuntime;
@@ -659,6 +659,7 @@ export class Controller {
       launch: () => client(['anthropic-file-v1', 'anthropic-file-compact-v1'], 'Anthropic'),
       spawn: this.options.nativeSpawn as Parameters<typeof anthropicChatAdapter>[0]['spawn'],
       schedule: this.options.schedule,
+      onUsage: (reading) => this.anthropicUsage().recordTurnReading(reading),
     });
     const google = googleChatAdapter({
       launch: (request: ChatTurnRequest) => {

@@ -1,5 +1,4 @@
 import { RefreshCw } from 'lucide-react';
-import { Dialog } from '../components.tsx';
 import { usageCards } from '../thread/usage-cards.ts';
 import { anthropicReadReason } from '../usage-presentation.ts';
 import { ClientStatus, clientFor } from './client-status.tsx';
@@ -83,11 +82,7 @@ export function AnthropicCard({ header, workspace, entry, now, actions, scopes }
                 reader.readState === 'unknown' ||
                 (nextReadAt !== null && nextReadAt > now)
               }
-              onClick={() =>
-                reader?.trust?.accepted
-                  ? void actions.refreshAnthropic()
-                  : actions.setTrust(reader?.trust ?? null)
-              }
+              onClick={() => void actions.refreshAnthropic()}
             >
               <RefreshCw size={14} /> Refresh Anthropic quota
             </button>
@@ -103,8 +98,8 @@ export function AnthropicCard({ header, workspace, entry, now, actions, scopes }
               )}
           </div>
           <p className="st-note">
-            Invokes the native local /usage command and sends no generation request. Sign-in does
-            not grant native-client trust. Reported quota can be cached; its age stays unknown.
+            CrewKite runs the client's /usage command to read allowance. Sign in with your
+            subscription first.
           </p>
           {reader?.readReason && (
             <p role="status">{anthropicReadReason(reader.readReason, reader.clientVersion)}</p>
@@ -123,42 +118,6 @@ export function AnthropicCard({ header, workspace, entry, now, actions, scopes }
           )}
           {/* A failed read returns its reason code, which the line above already explains. */}
           {message && message !== reader?.readReason && <p role="status">{message}</p>}
-          {actions.trust && (
-            <Dialog title="Trust the native usage command" onClose={() => actions.setTrust(null)}>
-              <p>
-                CrewKite will invoke the pinned native client’s local /usage command. It sends no
-                generation request.
-              </p>
-              <p>
-                Your native client can apply user or administrator policy hooks. Those hooks are
-                covered by this native-client trust.
-              </p>
-              <p>
-                Trust is remembered for this exact client, command and reader policy. A changed
-                scope requires consent again. Sign-in alone does not grant trust.
-              </p>
-              <details>
-                <summary>Command identity</summary>
-                <p>Command: {actions.trust.command}</p>
-                <p>Client checksum: {actions.trust.clientSha256}</p>
-                <p>Scope checksum: {actions.trust.scopeHash}</p>
-              </details>
-              <button
-                type="button"
-                className="button secondary"
-                onClick={() => actions.setTrust(null)}
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                className="button primary"
-                onClick={() => actions.trust && void actions.refreshAnthropic(actions.trust)}
-              >
-                Trust and refresh quota
-              </button>
-            </Dialog>
-          )}
         </ClientStatus>
       }
       side={

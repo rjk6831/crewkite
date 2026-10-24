@@ -18,6 +18,9 @@
 //   {"type":"user","parent_tool_use_id":null,"message":{"content":[{"type":"tool_result",...}]}}
 //   {"type":"control_request","request_id":"...","request":{"subtype":"can_use_tool",
 //     "tool_name":"Bash","input":{...},"tool_use_id":"toolu_..."}}
+//   {"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour",
+//     "utilization":0.29,"resetsAt":<unix seconds>,"unifiedWindows":{"five_hour":{...},
+//     "seven_day":{"utilization":0.4,"resetsAt":<unix seconds>}}}}
 //   {"type":"result","subtype":"success","is_error":false,"session_id":"...",
 //     "modelUsage":{"<model>":{"contextWindow":200000}}}
 //
@@ -39,6 +42,7 @@ import { fileURLToPath } from 'node:url';
 import {
   type AgentEvent,
   AgentEventSchema,
+  AnthropicUsageReadingSchema,
   type ChatPermissionPolicy,
   type ChatSession,
   type ChatToolKind,
@@ -125,6 +129,7 @@ function run(
   const events: AgentEvent[] = [];
   const waiting = new Map<string, (event: AgentEvent) => void>();
   const launched = { argv: [] as string[], input: [] as string[] };
+  const usage: unknown[] = [];
   const spawn: Spawn = (executable, argv, options) => {
     launched.argv = argv;
     const child = spawnCheckChild(
@@ -142,6 +147,7 @@ function run(
   const handle = anthropicChatAdapter({
     launch: () => ({ executable: fixture, sha256 }),
     spawn,
+    onUsage: (reading) => usage.push(reading),
   }).startTurn(
     {
       turnId,
@@ -170,7 +176,14 @@ function run(
     new Promise<Extract<AgentEvent, { type: T }>>((resolve) =>
       waiting.set(type, resolve as (event: AgentEvent) => void),
     );
-  return { handle, events, launched, next, cleanup: () => rmSync(root, { recursive: true }) };
+  return {
+    handle,
+    events,
+    launched,
+    usage,
+    next,
+    cleanup: () => rmSync(root, { recursive: true }),
+  };
 }
 
 test('streamed thinking and text arrive in order and the session id comes back', async (t) => {
@@ -369,6 +382,60 @@ test('a client that exits without a result is reported with its last stderr line
     turn.events.map((event) => event.type),
     ['turn.completed'],
   );
+});
+
+test('a rate limit frame reports each window it can read, per-response readings first', async (t) => {
+  const window = (windowId: string, value: number, resetsAt: string) => ({
+    windowId,
+    remaining: { value, unit: 'percent' },
+    resetsAt,
+  });
+  const fiveHour = { utilization: 0.29, resetsAt: 1_792_771_200 };
+  const weekly = { utilization: 0.4, resetsAt: 1_793_318_400, status: 'allowed' };
+  const rows = [
+    {
+      info: {
+        rateLimitType: 'five_hour',
+        utilization: 0.9,
+        unifiedWindows: { five_hour: fiveHour, seven_day: weekly },
+      },
+      windows: [
+        window('five-hour', 71, '2026-10-23T16:00:00.000Z'),
+        window('weekly', 60, '2026-10-30T00:00:00.000Z'),
+      ],
+    },
+    {
+      info: { rateLimitType: 'seven_day_opus', utilization: 0.25, resetsAt: 1_793_232_000 },
+      windows: [window('weekly-opus', 75, '2026-10-29T00:00:00.000Z')],
+    },
+    {
+      info: { unifiedWindows: { five_hour: { ...fiveHour, utilization: 1.4 }, seven_day: weekly } },
+      windows: [window('weekly', 60, '2026-10-30T00:00:00.000Z')],
+    },
+    { info: { rateLimitType: 'overage', utilization: 0.1 }, windows: [] },
+    { info: { unifiedWindows: { five_hour: 'changed shape' } }, windows: [] },
+  ];
+  const turn = run([
+    'read',
+    { out: init() },
+    ...rows.map(({ info }) => ({
+      out: { type: 'rate_limit_event', rate_limit_info: { status: 'allowed', ...info } },
+    })),
+    { out: done() },
+    'drain',
+  ]);
+  t.after(turn.cleanup);
+  assert.equal((await turn.handle.result).stopReason, 'done');
+  // One reading per frame with a window, so the last frame of a turn is the newest reading.
+  const readings = turn.usage.map((value) => AnthropicUsageReadingSchema.parse(value));
+  assert.deepEqual(
+    readings.map((reading) => reading.windows),
+    rows.flatMap((row) => (row.windows.length ? [row.windows] : [])),
+  );
+  for (const reading of readings) {
+    assert.equal(reading.source, 'turn-rate-limit');
+    assert.equal(reading.receivedAt, '2026-10-23T00:00:00.000Z');
+  }
 });
 
 test('a new session gets the framing and a saved one is resumed with the prompt alone', async (t) => {

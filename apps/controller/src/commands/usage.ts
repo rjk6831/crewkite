@@ -111,6 +111,8 @@ export class UsageCommands {
     return Promise.allSettled([
       this.refreshGoogleUsage(trigger),
       this.refreshOpenAiUsage(trigger),
+      // The Anthropic gauge reads once at start. Turns and the card's Refresh read it after that.
+      trigger === 'start' ? this.anthropicUsage().refreshWhenDue(this.id('cmd')) : undefined,
     ]).then(() => {});
   }
 

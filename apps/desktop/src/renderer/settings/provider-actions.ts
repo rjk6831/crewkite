@@ -1,9 +1,7 @@
-import type { Snapshot } from '@crewkite/contracts';
 import { useState } from 'react';
 import type { Workspace } from '../source.ts';
 
 type Family = 'openai' | 'anthropic' | 'google';
-type Trust = NonNullable<Snapshot['usageReaders'][number]['trust']>;
 const applied = (outcome: string) => outcome === 'applied' || outcome === 'already-applied';
 const refusal = (result: { outcome: string; reason?: string; next?: string }) =>
   [result.reason ?? result.outcome, result.next].filter(Boolean).join('. ');
@@ -15,23 +13,19 @@ const refusal = (result: { outcome: string; reason?: string; next?: string }) =>
 export function useProviderActions(workspace: Workspace) {
   const [messages, setMessages] = useState<Partial<Record<Family, string>>>({});
   const [busy, setBusy] = useState<Partial<Record<Family, boolean>>>({});
-  const [trust, setTrust] = useState<Trust | null>(null);
   const say = (family: Family, message: string) =>
     setMessages((current) => ({ ...current, [family]: message }));
   const work = (family: Family, on: boolean) =>
     setBusy((current) => ({ ...current, [family]: on }));
 
-  async function refreshAnthropic(accepted?: Trust) {
-    setTrust(null);
+  async function refreshAnthropic() {
     work('anthropic', true);
     say('anthropic', 'Reading the native local usage report.');
     try {
       const result = await workspace.metadataCommand({
         command: 'RefreshAnthropicUsage',
         expectedRevision: 0,
-        payload: accepted
-          ? { trust: { scopeHash: accepted.scopeHash, nativeTrust: 'accepted' } }
-          : {},
+        payload: {},
       });
       say(
         'anthropic',
@@ -94,8 +88,6 @@ export function useProviderActions(workspace: Workspace) {
   return {
     messages,
     busy,
-    trust,
-    setTrust,
     refreshAnthropic,
     stopAnthropicUsage,
     checkAnthropic,
