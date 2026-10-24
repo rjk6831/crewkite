@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -61,6 +62,19 @@ test('edit refuses a missing or repeated match and applies a unique one with a d
         '',
       ].join('\n'),
     });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('search lists a copy that sits in an ignored folder of another repository', async () => {
+  const { root, scratch, context } = fixture();
+  try {
+    execFileSync('git', ['init', '--quiet', root]);
+    writeFileSync(join(root, '.gitignore'), 'scratch/\n');
+    writeFileSync(join(scratch, 'main.py'), 'import os\n\ndef main():\n    pass\n');
+    const found = await runTool('search', { pattern: '^def ' }, context);
+    assert.equal(found.output, 'main.py:3: def main():');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

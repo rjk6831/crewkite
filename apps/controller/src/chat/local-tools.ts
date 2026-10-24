@@ -272,7 +272,11 @@ export function listFiles(scratch: string, environment: NodeJS.ProcessEnv) {
       ['ls-files', '-z', '--cached', '--others', '--exclude-standard', '--deduplicate'],
       {
         cwd: root,
-        env: environment,
+        // A chat scratch copy is a plain folder. Without the ceiling, Git walks up into the
+        // repository that holds it and lists nothing when that repository ignores the copy, as a
+        // checkout ignores a home under internal/. Outside a checkout Git fails and the walk below
+        // lists the copy.
+        env: { ...environment, GIT_CEILING_DIRECTORIES: dirname(root) },
         maxBuffer: 64 * 1024 * 1024,
         timeout: 10_000,
         stdio: ['ignore', 'pipe', 'ignore'],
