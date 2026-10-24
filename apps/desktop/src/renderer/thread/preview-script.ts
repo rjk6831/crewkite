@@ -144,6 +144,15 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
     thread = {
       ...thread,
       activeTurnId: openTurn,
+      queued: [
+        {
+          id: mint('msg'),
+          at: ago(12_000),
+          text: 'Then add a test for a discount larger than the subtotal.',
+          role: 'assistant',
+          attachments: [],
+        },
+      ],
       sessions: [
         {
           family: 'openai',
@@ -231,6 +240,12 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
     live = [];
     stopped = false;
     setThread({ activeTurnId: null });
+    // Like the controller, the oldest queued message starts once the turn has ended.
+    const [first, ...rest] = thread.queued;
+    if (!first) return;
+    setThread({ queued: rest });
+    say({ kind: 'user' }, first.text);
+    void answer(first.text);
   }
 
   async function afterPermission(choice: string) {
@@ -345,8 +360,20 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
       case 'ReadChatCatalog':
         return data(catalog());
       case 'SendChatMessage':
-        if (thread.activeTurnId)
-          return { outcome: 'blocked', reason: 'A turn is already running in this thread.' };
+        if (thread.activeTurnId) {
+          if (thread.queued.length >= 8)
+            return { outcome: 'blocked', reason: 'queue-full', next: 'Remove a queued message.' };
+          const text = String(payload.text);
+          const message = {
+            id: mint('msg'),
+            at: ago(0),
+            text,
+            role: 'assistant' as const,
+            attachments: [],
+          };
+          setThread({ queued: [...thread.queued, message] });
+          return ok;
+        }
         say({ kind: 'user' }, String(payload.text));
         void answer(String(payload.text));
         return ok;
@@ -357,11 +384,13 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
         return ok;
       case 'StopChatTurn':
         stopped = true;
+        setThread({ queued: [] });
         if (awaiting) void afterPermission('deny');
         return ok;
       case 'ConfigureChatThread': {
-        const { taskId: _task, ...patch } = payload;
-        setThread(patch as Partial<ChatThread>);
+        const { taskId: _task, dequeue, ...patch } = payload;
+        const queued = thread.queued.filter((message) => message.id !== dequeue);
+        setThread({ ...(patch as Partial<ChatThread>), queued });
         return ok;
       }
       case 'HandoffChatThread': {

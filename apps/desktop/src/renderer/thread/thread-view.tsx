@@ -20,6 +20,7 @@ import { LimitOfferCard } from './handoff-card.tsx';
 import { limitOffer } from './handoff-offer.ts';
 import { Inspector, type InspectorTab } from './inspector.tsx';
 import { MessageList } from './message-list.tsx';
+import { QueuedList } from './queued-list.tsx';
 import { lastFamily, latestContext } from './thread-state.ts';
 import type { TurnView } from './turn-fold.ts';
 import { useThread } from './use-thread.ts';
@@ -71,14 +72,19 @@ export function ThreadView({
   const changesKey = useMemo(() => changeCount(items), [items]);
   const offer = useMemo(() => limitOffer(state), [state]);
 
+  const queued = thread?.queued;
+  // The controller queues a message while the thread is busy. The queued list shows that one, so
+  // the pending bubble is only for a message that starts now.
+  const waits = activeTurn !== null || !!queued?.length || !!thread?.ownershipUnknown;
   const send = useCallback(
     async ({ text, attachments, selection }: SendInput) => {
       counter.current += 1;
       const localId = `local-${counter.current}`;
-      dispatch({
-        type: 'sending',
-        pending: { localId, text, attachments, at: new Date().toISOString() },
-      });
+      if (!waits)
+        dispatch({
+          type: 'sending',
+          pending: { localId, text, attachments, at: new Date().toISOString() },
+        });
       try {
         await sendMessage(source, {
           taskId: task.id,
@@ -92,11 +98,25 @@ export function ThreadView({
         throw failure;
       }
     },
-    [source, task.id, dispatch],
+    [source, task.id, dispatch, waits],
   );
+  // Stop clears the queue, and the texts go back into an empty composer.
+  // shortcut: they come from the queue this view last saw, so a message queued in the same instant
+  // as the stop is not restored. Upgrade: return the cleared messages in the stop result.
   const stop = useCallback(async () => {
-    if (activeTurn) await stopTurn(source, { taskId: task.id, turnId: activeTurn });
-  }, [source, task.id, activeTurn]);
+    if (!activeTurn) return;
+    await stopTurn(source, { taskId: task.id, turnId: activeTurn });
+    if (queued?.length) composer.current?.restore(queued.map((item) => item.text).join('\n\n'));
+  }, [source, task.id, activeTurn, queued]);
+  const dequeue = useCallback(
+    (id: string) =>
+      configureThread(source, { taskId: task.id, dequeue: id }).then(
+        () => setNotice(null),
+        (failure: unknown) =>
+          setNotice(failure instanceof Error ? failure.message : 'The message was not removed.'),
+      ),
+    [source, task.id],
+  );
   const resolve = useCallback(
     (turn: TurnView, requestId: string, choice: string) =>
       resolvePermission(source, { taskId: task.id, turnId: turn.id, requestId, choice }).then(
@@ -137,6 +157,12 @@ export function ThreadView({
     [],
   );
 
+  // A running turn is the usual reason to wait. These two hold the queue after a turn has ended.
+  const held = thread?.ownershipUnknown
+    ? 'Waiting for a provider process from an earlier turn to exit. Quit it, then send another message.'
+    : offer
+      ? 'Waiting for a provider. Continue on another one above, or send another message.'
+      : null;
   const badge = thread?.scratchReady
     ? 'Scratch copy'
     : thread?.base
@@ -195,6 +221,7 @@ export function ThreadView({
           onResolve={resolve}
           onOpenChanges={openChanges}
         />
+        <QueuedList queued={queued ?? []} held={held} onRemove={dequeue} />
         <Composer
           ref={composer}
           key={task.id}

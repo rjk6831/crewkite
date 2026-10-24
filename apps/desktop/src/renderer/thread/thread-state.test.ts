@@ -305,6 +305,33 @@ test('a stopped turn ends quietly with its partial text and no failure line', ()
   assert.equal(turnOf(run([started(10), end(11)])).status, 'stopped');
 });
 
+// The view only guesses whether a message will wait. When the controller queues one the view
+// thought would start, the queued list shows it and the bubble goes.
+test('a message the controller queued leaves no pending bubble', () => {
+  const text = 'Then the totals.';
+  const thread: ChatThread = {
+    taskId: task,
+    scratchReady: true,
+    base: null,
+    selection: null,
+    permissionPolicy: 'ask',
+    sessions: [],
+    activeTurnId: turn,
+    autoHandoff: false,
+    handoffMode: 'most-left',
+    queued: [{ id: id('msg', 9), at: stamp, text, role: 'assistant', attachments: [] }],
+  };
+  const pending = { localId: 'local-1', text, attachments: [], at: stamp };
+  const sent = reduceThread(initialThreadState(task), { type: 'sending', pending });
+  const event: ThreadEvent = { type: 'chat.thread', cursor: '20', taskId: task, payload: thread };
+  const queued = reduceThread(sent, { type: 'events', events: [event] });
+  assert.deepEqual(threadItems(queued), []);
+  assert.deepEqual(
+    queued.thread?.queued.map((message) => message.text),
+    [text],
+  );
+});
+
 test('the limit offer shows only while the newest turn is the one that hit a limit', () => {
   const second = id('trn', 2);
   const failure = (kind: ChatFailure['kind']): ChatFailure => ({

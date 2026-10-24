@@ -132,6 +132,13 @@ function addMessages(state: ThreadState, incoming: ChatMessage[], replace = fals
   return { ...state, messages, pending };
 }
 
+// A message the controller queued shows in the queued list until it starts, so its pending bubble
+// goes as soon as the thread record names it.
+function unqueued(pending: PendingMessage[], thread: ChatThread): PendingMessage[] {
+  const waiting = thread.queued.map((message) => message.text);
+  return pending.filter((item) => !waiting.includes(item.text));
+}
+
 function applyOne(state: ThreadState, event: ThreadEvent): ThreadState {
   if (event.taskId && event.taskId !== state.taskId) return state;
   // A read reflects the log up to its cursor. Messages merge by id, so only the three stream events
@@ -153,7 +160,7 @@ function applyOne(state: ThreadState, event: ThreadEvent): ThreadState {
     case 'chat.thread': {
       const parsed = ChatThreadSchema.safeParse(event.payload);
       return parsed.success && parsed.data.taskId === state.taskId
-        ? { ...state, thread: parsed.data }
+        ? { ...state, thread: parsed.data, pending: unqueued(state.pending, parsed.data) }
         : state;
     }
     case 'conversation.entry': {
@@ -177,6 +184,7 @@ export function reduceThread(state: ThreadState, action: ThreadAction): ThreadSt
           ...state,
           loaded: true,
           thread: read.thread,
+          pending: unqueued(state.pending, read.thread),
           turnMeta: Object.fromEntries(read.turns.map((turn) => [turn.id, turn])),
           readCursor: parseCursor(read.cursor),
         },

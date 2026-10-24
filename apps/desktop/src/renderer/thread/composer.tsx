@@ -28,8 +28,12 @@ export type SendInput = {
   selection: ChatModelSelection | null;
 };
 
-/** What the empty thread view can ask of the composer. */
-export type ComposerHandle = { fill: (text: string) => void };
+/** What the thread view can ask of the composer. */
+export type ComposerHandle = {
+  fill: (text: string) => void;
+  /** Put text back, as after a stop clears the queue, unless the box already holds some. */
+  restore: (text: string) => void;
+};
 
 // Unsent text survives switching threads for as long as the window stays open.
 const drafts = new Map<string, string>();
@@ -71,16 +75,22 @@ export function Composer({
   const [selection, setSelection] = useState<ChatModelSelection | null>(thread?.selection ?? null);
   const [note, setNote] = useState<string | null>(null);
   const field = useRef<HTMLTextAreaElement>(null);
-  useImperativeHandle(ref, () => ({
-    fill(value) {
+  useImperativeHandle(ref, () => {
+    const fill = (value: string) => {
       setText(value);
       drafts.set(draftKey, value);
       const element = field.current;
       element?.focus();
       // The caret goes to the end so the person can keep typing.
       requestAnimationFrame(() => element?.setSelectionRange(value.length, value.length));
-    },
-  }));
+    };
+    return {
+      fill,
+      restore: (value) => {
+        if (!text.trim()) fill(value);
+      },
+    };
+  });
 
   const loadCatalog = useCallback(() => {
     readCatalog(source, taskId ?? undefined)
@@ -136,8 +146,9 @@ export function Composer({
   }
   async function submit(event?: FormEvent) {
     event?.preventDefault();
+    // A message sent while a turn runs waits in the thread and starts when the turn ends.
     const body = text.trim();
-    if (!body || running || blocked) return;
+    if (!body || blocked) return;
     const sent = { text: body, attachments };
     setText('');
     setAttachments([]);
@@ -193,6 +204,27 @@ export function Composer({
           }}
           onKeyDown={onKeyDown}
         />
+        {taskId && (
+          <div className="th-roles">
+            {(Object.keys(roleActions) as RoleAction[]).map((action) => {
+              const why = roles.why(action);
+              return (
+                <button
+                  key={action}
+                  type="button"
+                  className="th-pill"
+                  aria-expanded={roles.role === action}
+                  aria-controls={roles.role === action ? 'th-role-row' : undefined}
+                  disabled={why !== null}
+                  title={why ?? undefined}
+                  onClick={() => roles.toggle(action)}
+                >
+                  {roleActions[action].label}
+                </button>
+              );
+            })}
+          </div>
+        )}
         {roles.row}
         <div className="th-composer-bar">
           <button
@@ -218,24 +250,6 @@ export function Composer({
               )
             }
           />
-          {taskId &&
-            (Object.keys(roleActions) as RoleAction[]).map((action) => {
-              const why = roles.why(action);
-              return (
-                <button
-                  key={action}
-                  type="button"
-                  className="th-pill"
-                  aria-expanded={roles.role === action}
-                  aria-controls={roles.role === action ? 'th-role-row' : undefined}
-                  disabled={why !== null}
-                  title={why ?? undefined}
-                  onClick={() => roles.toggle(action)}
-                >
-                  {roleActions[action].label}
-                </button>
-              );
-            })}
           <div className="th-bar-end">
             {context?.capacity && (
               <ContextGauge
@@ -246,7 +260,7 @@ export function Composer({
                 size={22}
               />
             )}
-            {running ? (
+            {running && (
               <button
                 type="button"
                 className="th-send is-stop"
@@ -262,17 +276,16 @@ export function Composer({
               >
                 <Square size={13} fill="currentColor" aria-hidden="true" />
               </button>
-            ) : (
-              <button
-                type="submit"
-                className="th-send"
-                aria-label="Send"
-                title={blocked ?? 'Send'}
-                disabled={!text.trim() || !!blocked}
-              >
-                <ArrowUp size={16} aria-hidden="true" />
-              </button>
             )}
+            <button
+              type="submit"
+              className="th-send"
+              aria-label="Send"
+              title={blocked ?? (running ? 'Send when this turn ends' : 'Send')}
+              disabled={!text.trim() || !!blocked}
+            >
+              <ArrowUp size={16} aria-hidden="true" />
+            </button>
           </div>
         </div>
       </form>

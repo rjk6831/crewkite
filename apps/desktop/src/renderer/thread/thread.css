@@ -1262,3 +1262,72 @@
     animation: none;
   }
 }
+
+/* Queued messages sit under the message list and line up with the composer. */
+.th-queued {
+  flex-shrink: 0;
+  padding: 0 24px 8px;
+}
+.th-queued-note {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 0 4px 6px;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.th-queued ol {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 760px;
+  max-height: 30vh;
+  margin: 0 auto;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+.th-queued-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 34px;
+  padding: 3px 4px 3px 12px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 10px;
+  background: var(--surface);
+  font-size: 12px;
+}
+.th-queued-label {
+  flex-shrink: 0;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.th-queued-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.th-queued-remove {
+  flex-shrink: 0;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background-color: var(--surface-raised);
+  font-size: 12px;
+}
+.th-queued-remove:hover:not(:disabled) {
+  background-color: var(--surface-hover);
+}
+
+/* The role actions get a row under the text box. At its 760 px cap the bar cannot hold them beside
+   the model menu, the gauge, Stop and Send. Below 380 px the last one wraps in the same style. */
+.th-roles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
