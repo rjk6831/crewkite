@@ -141,6 +141,8 @@ const toolKind = (kind: string | null | undefined): ChatToolKind =>
   toolKinds.get(kind ?? '') ?? 'other';
 // Kinds whose result goes only to the model. A fetch arrives as other.
 const passiveKinds = new Set<ChatToolKind>(['read', 'search', 'other']);
+// The agent answers a stop with this line. The thread already ends with its own Stopped line.
+const stopLine = /\s*the request was cancell?ed by the client\.?\s*$/i;
 
 // Listed in the order the person sees them.
 const optionKinds = new Map<string, { kind: ChatPermissionOption['kind']; label: string }>([
@@ -206,6 +208,38 @@ const frameFacts = (value: unknown) => {
       .map((key) => clip(key, 60)),
   };
 };
+
+/** The first raw input field under one of `names`, compared without case or underscores. */
+function inputField(input: unknown, names: readonly string[]) {
+  for (const [key, value] of Object.entries(fields(input)))
+    if (names.includes(key.toLowerCase().replaceAll('_', ''))) return value;
+}
+
+/**
+ * A card title the way the other families write one: the file, the pattern or the command. The
+ * agent titles every read with its tool name, so fifteen reads would say the same thing. Null
+ * when the frame does not name the target, and the agent's own title stays.
+ */
+function cardTitle(kind: ChatToolKind, place: string | null, input: unknown): string | null {
+  const words = (names: readonly string[]) => {
+    const value = inputField(input, names);
+    return typeof value === 'string' && value.trim() ? value.trim() : null;
+  };
+  const line = (names: readonly string[]) => {
+    const value = inputField(input, names);
+    return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : null;
+  };
+  if (kind === 'read' && place) {
+    const start = line(['start', 'startline']);
+    const end = line(['end', 'endline']);
+    return `Read ${place}${start && end ? ` lines ${start}-${end}` : ''}`;
+  }
+  if (kind === 'edit' && place) return `Edit ${place}`;
+  const pattern = kind === 'search' ? words(['pattern', 'query', 'regex']) : null;
+  if (pattern) return `Search ${pattern}${place ? ` in ${place}` : ''}`;
+  const command = kind === 'command' ? words(['command', 'commandline', 'cmd']) : null;
+  return command ? `Run ${clip(command.split(/\r?\n/)[0], 120)}` : null;
+}
 
 class TurnFailure extends Error {
   readonly failure: ChatFailure;
@@ -476,6 +510,7 @@ export function googleChatAdapter(deps: {
       const texts: string[] = [];
       let item: { kind: 'text' | 'thinking'; id: string; text: string } | null = null;
       let itemCount = 0;
+      let afterStop = '';
       let lastPlan = '';
       let usage: ChatTurnResult['usage'] = null;
       let permissionCount = 0;
@@ -602,6 +637,7 @@ export function googleChatAdapter(deps: {
       }
       function upsert(update: ToolUpdate): Call {
         let call = calls.get(update.toolCallId);
+        const fresh = !call;
         if (!call) {
           closeItem();
           call = {
@@ -619,13 +655,37 @@ export function googleChatAdapter(deps: {
             truncated: false,
           };
           calls.set(call.id, call);
+        } else {
+          if (update.kind) call.kind = toolKind(update.kind);
+          if (update.title?.trim()) call.title = update.title.trim();
+          if (update.rawInput !== undefined) call.rawInput = update.rawInput;
+        }
+        // The first place the frame names, relative to the scratch copy when it is inside. The
+        // copy itself names no place.
+        let place: string | null = null;
+        for (const entry of update.locations ?? []) {
+          const parsed = location.safeParse(entry);
+          if (!parsed.success) continue;
+          const found = inside(parsed.data.path);
+          if (found) call.paths.add(found);
+          else call.outside = true;
+          place ??=
+            found ?? (resolve(scratch, parsed.data.path) === scratch ? null : parsed.data.path);
+        }
+        if (fresh) {
           const raw = update.rawInput === undefined ? undefined : JSON.stringify(update.rawInput);
           send({
             type: 'tool.started',
             turnId,
             callId: call.id,
             kind: call.kind,
-            title: clip(call.title || update.kind || 'Tool call', 1024),
+            title: clip(
+              cardTitle(call.kind, place, update.rawInput) ||
+                call.title ||
+                update.kind ||
+                'Tool call',
+              1024,
+            ),
             ...(raw === undefined
               ? {}
               : {
@@ -635,17 +695,6 @@ export function googleChatAdapter(deps: {
                       : { truncated: true, preview: raw.slice(0, 2048) },
                 }),
           });
-        } else {
-          if (update.kind) call.kind = toolKind(update.kind);
-          if (update.title?.trim()) call.title = update.title.trim();
-          if (update.rawInput !== undefined) call.rawInput = update.rawInput;
-        }
-        for (const entry of update.locations ?? []) {
-          const place = location.safeParse(entry);
-          if (!place.success) continue;
-          const found = inside(place.data.path);
-          if (found) call.paths.add(found);
-          else call.outside = true;
         }
         for (const entry of update.content ?? []) {
           const words = wordsContent.safeParse(entry);
@@ -705,13 +754,13 @@ export function googleChatAdapter(deps: {
       // after every read. A new call is no such sign, because calls can run side by side and a
       // read still running can fail. Edits and commands wait for a real status, because the
       // person needs to know how they went. So does a call behind an open permission card,
-      // which no fallback closes.
+      // which no fallback closes. A card closed this way has nothing to add, so it gets no
+      // summary and stays one line.
       const asking = (call: Call) =>
         [...pending.values()].some((entry) => entry.callId === call.id);
       function settle() {
         for (const call of calls.values())
-          if (!call.done && passiveKinds.has(call.kind) && !asking(call))
-            finish(call, 'ok', 'The result went back to the model.');
+          if (!call.done && passiveKinds.has(call.kind) && !asking(call)) finish(call, 'ok');
       }
       function tool(raw: Record<string, unknown>, announced: boolean) {
         const parsed = toolUpdate.safeParse(raw);
@@ -776,13 +825,13 @@ export function googleChatAdapter(deps: {
         switch (kind.data.sessionUpdate) {
           case 'agent_message_chunk':
           case 'agent_thought_chunk': {
-            if (kind.data.sessionUpdate === 'agent_message_chunk') settle();
+            const message = kind.data.sessionUpdate === 'agent_message_chunk';
+            if (message) settle();
             const block = blockUpdate.parse(raw).content;
-            if (block?.type === 'text')
-              chunk(
-                kind.data.sessionUpdate === 'agent_message_chunk' ? 'text' : 'thinking',
-                block.text ?? '',
-              );
+            // Words after the person's stop wait for the turn to end, so the agent's stop line
+            // can be told apart from the rest even when it arrives in pieces.
+            if (block?.type === 'text' && message && cancelled) afterStop += block.text ?? '';
+            else if (block?.type === 'text') chunk(message ? 'text' : 'thinking', block.text ?? '');
             else if (block)
               noticeOnce(
                 `content:${block.type}`,
@@ -1193,6 +1242,8 @@ export function googleChatAdapter(deps: {
           };
         }
         phase = 'done';
+        const rest = afterStop.replace(stopLine, '');
+        if (rest.trim()) chunk('text', rest);
         closeItem();
         closeTools();
         send({ type: 'turn.completed', turnId, ...ending });

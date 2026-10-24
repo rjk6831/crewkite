@@ -353,7 +353,7 @@ test('a turn streams thinking, tools and text in order, and the next turn resume
   }
 });
 
-test('a card closes on a completion under an unknown id or when the agent moves on, and an edit waits for its status', async () => {
+test('a card names its target, closes on a completion under an unknown id or when the agent moves on, and an edit waits for its status', async () => {
   const trail = (events: AgentEvent[]) =>
     events.flatMap((event) =>
       event.type === 'tool.started' || event.type === 'tool.output'
@@ -364,7 +364,93 @@ test('a card closes on a completion under an unknown id or when the agent moves 
             ]
           : [],
     );
-  const rows: { edit: (line: string) => string[]; trail: string[] }[] = [
+  const rows: { edit: (line: string) => string[]; trail: string[]; titles?: string[] }[] = [
+    {
+      // The agent titles each call with its tool name. A card names the file, the pattern or
+      // the command when the frame gives one, and keeps the agent's title when it does not.
+      edit: (line) => {
+        const frame = JSON.parse(line);
+        const update = frame.params?.update;
+        if (update?.toolCallId === 'read-1' && update.sessionUpdate === 'tool_call_update')
+          return [];
+        if (update?.toolCallId !== 'read-1') return [line];
+        const file = update.locations[0].path;
+        const cwd = file.slice(0, file.lastIndexOf('/'));
+        const call = (toolCallId: string, kind: string, rawInput: object, path?: string) =>
+          JSON.stringify({
+            ...frame,
+            params: {
+              ...frame.params,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId,
+                title: `${kind}_tool`,
+                kind,
+                status: 'in_progress',
+                rawInput,
+                ...(path ? { locations: [{ path }] } : {}),
+              },
+            },
+          });
+        return [
+          call('read-1', 'read', { AbsolutePath: file, StartLine: 3, EndLine: 9 }, file),
+          call('read-2', 'read', {}, '/outside/notes.md'),
+          call('read-3', 'read', {}),
+          call('search-1', 'search', { Query: 'total' }, `${cwd}/src`),
+          call('search-2', 'search', { Query: 'total' }, cwd),
+          call('edit-2', 'edit', {}, file),
+          call('run-1', 'execute', { CommandLine: `${'x'.repeat(130)}\nsecond line` }),
+        ];
+      },
+      titles: [
+        'Read net.mjs lines 3-9',
+        'Read /outside/notes.md',
+        'read_tool',
+        'Search total in src',
+        'Search total',
+        'Edit net.mjs',
+        `Run ${'x'.repeat(119)}…`,
+        'Edit net.mjs',
+      ],
+      trail: [
+        'started read-1',
+        'started read-2',
+        'started read-3',
+        'started search-1',
+        'started search-2',
+        'started edit-2',
+        'started run-1',
+        'started edit-1',
+        'ok edit-1 with diff',
+        'ok read-1',
+        'ok read-2',
+        'ok read-3',
+        'ok search-1',
+        'ok search-2',
+        'error edit-2: The turn ended before this tool reported a result.',
+        'error run-1: The turn ended before this tool reported a result.',
+      ],
+    },
+    {
+      // A fetch arrives as other. The agent's reply closes it with no output and no words, so
+      // the card stays one line.
+      edit: (line) => {
+        const frame = JSON.parse(line);
+        const update = frame.params?.update;
+        if (update?.toolCallId !== 'read-1') return [line];
+        if (update.sessionUpdate === 'tool_call_update') return [];
+        return [
+          JSON.stringify({
+            ...frame,
+            params: {
+              ...frame.params,
+              update: { ...update, toolCallId: 'fetch-1', kind: 'fetch', locations: undefined },
+            },
+          }),
+        ];
+      },
+      trail: ['started fetch-1', 'started edit-1', 'ok edit-1 with diff', 'ok fetch-1'],
+    },
     {
       // The read's completion arrives under a frame id the agent never announced.
       edit: (line) => {
@@ -420,7 +506,7 @@ test('a card closes on a completion under an unknown id or when the agent moves 
         'started search-1',
         'error read-1',
         'ok edit-1 with diff',
-        'ok search-1: The result went back to the model.',
+        'ok search-1',
       ],
     },
     {
@@ -460,7 +546,7 @@ test('a card closes on a completion under an unknown id or when the agent moves 
       },
       trail: [
         'started read-1',
-        'ok read-1: The result went back to the model.',
+        'ok read-1',
         'started edit-1',
         'error edit-1: The turn ended before this tool reported a result.',
       ],
@@ -471,6 +557,11 @@ test('a card closes on a completion under an unknown id or when the agent moves 
     try {
       const turn = await run(f, request(f));
       assert.deepEqual(trail(turn.events), row.trail);
+      if (row.titles)
+        assert.deepEqual(
+          of(turn.events, 'tool.started').map((event) => event.title),
+          row.titles,
+        );
       assert.equal(turn.result.stopReason, 'done');
     } finally {
       f.dispose();
@@ -597,8 +688,30 @@ test('a permission request parks the turn until answered, and the policy answers
 });
 
 test('stop sends a cancel, keeps the partial text, declines a parked permission and reports stopped', async () => {
-  const f = rig('chat-cancel');
+  // The agent answers a cancel with a line of its own, here in two pieces. After the person's
+  // stop it stays out of the thread. When the agent cancels on its own, it is the reply.
+  const said = (text: string) =>
+    JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId: 'chat-session-1',
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },
+      },
+    });
+  const f = rig(
+    'chat-cancel',
+    rewrite(
+      `(line)=>line.includes('"stopReason":"cancelled"')?[${JSON.stringify(said('\n\nThe request was '))},${JSON.stringify(said('cancelled by the client.'))},line]:[line]`,
+    ),
+  );
   const g = rig('chat-permission');
+  const h = rig(
+    'chat-max-tokens',
+    rewrite(
+      `(line)=>[line.replace('"max_tokens"','"cancelled"').replace('"cut off"','"The request was cancelled by the client."')]`,
+    ),
+  );
   try {
     const turn = await run(f, request(f), (event, handle) => {
       if (event.type === 'text.delta') setImmediate(() => handle.stop());
@@ -636,9 +749,14 @@ test('stop sends a cancel, keeps the partial text, declines a parked permission 
     );
     assert.equal(parked.result.stopReason, 'stopped');
     assert.equal(parked.result.failure, null);
+
+    const own = await run(h, request(h));
+    assert.equal(own.result.stopReason, 'stopped');
+    assert.equal(own.result.assistantText, 'The request was cancelled by the client.');
   } finally {
     f.dispose();
     g.dispose();
+    h.dispose();
   }
 });
 
