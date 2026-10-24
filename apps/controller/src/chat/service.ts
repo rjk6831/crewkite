@@ -535,19 +535,19 @@ export class ChatService {
   private gitHost(): ChatGitHost {
     return {
       thread: (taskId) => (this.task(taskId) ? this.thread(taskId) : null),
-      saveThread: (taskId, thread) => {
-        const task = this.task(taskId);
-        if (task) this.putThread(task, thread);
-      },
-      note: (taskId, text) => {
-        const task = this.task(taskId);
-        if (task)
+      // The git step answers outside the command transaction, and the events these writes emit
+      // need one of their own.
+      journal: (taskId, update, text) =>
+        this.deps.store.transaction(() => {
+          const task = this.task(taskId);
+          if (!task) return;
+          this.putThread(task, update(this.thread(taskId)));
           this.appendEntry(task, {
             kind: 'chat-system',
             author: { kind: 'system', turnId: null },
             text,
           });
-      },
+        }),
       projectRoot: (taskId) => {
         const task = this.task(taskId);
         return task && this.deps.projectPath(task.projectId);

@@ -38,10 +38,10 @@ function host(root: string, thread: ChatThread, gh?: (args: string[]) => ToolRun
   let saved = thread;
   const value: ChatGitHost = {
     thread: () => saved,
-    saveThread: (_id, next) => {
-      saved = ChatThreadSchema.parse(next);
+    journal: (_id, update, line) => {
+      saved = ChatThreadSchema.parse(update(saved));
+      notes.push(line);
     },
-    note: (_id, text) => notes.push(text),
     projectRoot: () => root,
     now: () => now,
     run: (tool, args, cwd) =>

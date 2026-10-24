@@ -23,9 +23,12 @@ export type ToolRunner = (
 /** What the git steps after Accept need from the chat service. */
 export type ChatGitHost = {
   thread: (taskId: string) => ChatThread | null;
-  saveThread: (taskId: string, thread: ChatThread) => void;
-  /** Appends a system line to the thread. */
-  note: (taskId: string, text: string) => void;
+  /**
+   * Saves the thread as `update` makes it from the current row and appends the system line, in
+   * one transaction. The git step can take minutes, so the update starts from the row as it is
+   * then, never from the one read before the push.
+   */
+  journal: (taskId: string, update: (thread: ChatThread) => ChatThread, line: string) => void;
   /** The project checkout the thread belongs to. */
   projectRoot: (taskId: string) => string | undefined;
   now: () => string;
@@ -200,18 +203,20 @@ export async function pushChatBranch(
       lastLine(push?.stderr ?? '') ?? 'git push failed.',
       'Check the remote and your git credentials, then push again.',
     );
-  // The push can take minutes. Turns and the queue may have moved on since the first read.
-  host.saveThread(payload.taskId, {
-    ...(host.thread(payload.taskId) ?? thread),
-    lastPush: {
-      branch: payload.branch,
-      remote: payload.remote,
-      commit,
-      at: host.now(),
-      pullRequestUrl: null,
-    },
-  });
-  host.note(payload.taskId, `Pushed ${payload.branch} to ${payload.remote}.`);
+  host.journal(
+    payload.taskId,
+    (current) => ({
+      ...current,
+      lastPush: {
+        branch: payload.branch,
+        remote: payload.remote,
+        commit,
+        at: host.now(),
+        pullRequestUrl: null,
+      },
+    }),
+    `Pushed ${payload.branch} to ${payload.remote}.`,
+  );
   return { outcome: 'applied', data: result };
 }
 
@@ -235,12 +240,9 @@ export async function openChatPullRequest(
     return blocked('project-not-found', 'Add the project again, then open a pull request.');
   const run = host.run ?? toolRunner();
   const save = (url: string, via: 'gh' | 'compare-link'): CommandResult => {
-    host.saveThread(payload.taskId, {
-      ...(host.thread(payload.taskId) ?? thread),
-      lastPush: { ...pushed, pullRequestUrl: url },
-    });
-    host.note(
+    host.journal(
       payload.taskId,
+      (current) => ({ ...current, lastPush: { ...pushed, pullRequestUrl: url } }),
       via === 'gh'
         ? `Opened a pull request for ${payload.branch}.`
         : `Copied the compare link for ${payload.branch}.`,

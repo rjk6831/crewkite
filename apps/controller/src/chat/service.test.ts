@@ -1062,6 +1062,21 @@ test('accept commits the scratch edit on the base as a new branch and leaves the
 
   assert.equal((await accept()).reason, 'branch-exists');
   assert.equal(repo('rev-parse', branch), commit);
+
+  // The push runs outside the command transaction and still journals the thread.
+  const remote = join(source.directory, '..', 'remote.git');
+  git(source.directory, ['init', '--quiet', '--bare', remote]);
+  repo('remote', 'add', 'origin', remote);
+  const pushed = await run(
+    'PushChatBranch',
+    { branch: 'crewkite/fix-rounding', confirmed: true },
+    task.revision,
+  );
+  assert.equal(pushed.outcome, 'applied');
+  assert.equal(git(remote, ['rev-parse', branch]).toString('utf8').trim(), commit);
+  const after = await read();
+  assert.equal(after.thread.lastPush?.commit, commit);
+  assert.equal(after.messages.at(-1)?.text, 'Pushed crewkite/fix-rounding to origin.');
 });
 
 test('accept is refused while a turn is running', { timeout: 30000 }, async (t) => {
