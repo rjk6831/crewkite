@@ -1,6 +1,6 @@
 import { RefreshCw } from 'lucide-react';
 import { usageCards } from '../thread/usage-cards.ts';
-import { anthropicReadReason } from '../usage-presentation.ts';
+import { anthropicReadReason, readAgo } from '../usage-presentation.ts';
 import { ClientStatus, clientFor } from './client-status.tsx';
 import { Allowance, type CardProps, ProviderCard } from './provider-card.tsx';
 
@@ -18,6 +18,7 @@ export function AnthropicCard({ header, workspace, entry, now, actions, scopes }
   const busy = actions.busy.anthropic;
   const message = actions.messages.anthropic;
   const detail = reader?.detail;
+  const read = readAgo(entry?.readAt ?? reader?.reading?.receivedAt, now);
   const cards = usageCards(
     scopes.filter(({ family }) => family === 'anthropic'),
     header,
@@ -95,9 +96,10 @@ export function AnthropicCard({ header, workspace, entry, now, actions, scopes }
                 </button>
               )}
           </div>
+          {read && <p role="status">{read}</p>}
           <p className="st-note">
-            CrewKite runs the client's /usage command to read allowance. Sign in with your
-            subscription first.
+            CrewKite runs the client's /usage command to read allowance, and again every ten minutes
+            while no Anthropic turn runs. Sign in with your subscription first.
           </p>
           {reader?.readReason && (
             <p role="status">{anthropicReadReason(reader.readReason, reader.clientVersion)}</p>

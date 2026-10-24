@@ -1205,8 +1205,7 @@
 }
 .rail-usage-row {
   display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 2px 8px;
+  gap: 3px;
   font-size: 11px;
 }
 .rail-usage-label {
@@ -1220,12 +1219,20 @@
   height: 14px;
   font-size: 8.5px;
 }
+/* A bar and its figure on one line. Two lines when the family reports five-hour and weekly. */
+.rail-usage-meter {
+  display: grid;
+  grid-template-columns: 1fr 5.5em;
+  align-items: center;
+  gap: 8px;
+}
 .rail-usage-value {
   color: var(--text);
   font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
 }
 .rail-usage-bar {
-  grid-column: 1 / -1;
   height: 3px;
   border-radius: 2px;
   background: var(--border);
@@ -1236,7 +1243,69 @@
   height: 100%;
   background: var(--family-fill, var(--family, var(--accent)));
 }
+/* Local has no allowance to spend, so its bar is always full, with the infinity mark on top. */
+.rail-usage-unlimited {
+  --rail-unlimited: #9a7fe0;
+  position: relative;
+  display: grid;
+  place-items: center;
+  height: 12px;
+}
+:root[data-theme="light"] .rail-usage-unlimited {
+  --rail-unlimited: #6c4ea5;
+}
+.rail-usage-unlimited::before {
+  content: "";
+  position: absolute;
+  inset: 4.5px 0;
+  border-radius: 2px;
+  background: var(--rail-unlimited);
+}
+.rail-usage-unlimited span {
+  position: relative;
+  padding: 0 4px;
+  background: var(--sidebar);
+  color: var(--rail-unlimited);
+  font-size: 13px;
+  line-height: 12px;
+}
 .rail-usage-reset {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text-dim);
+}
+.rail-usage-connect {
+  justify-self: start;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.rail-usage-connect:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* Inspector Usage tab: one Refresh per provider above the gauges. */
+.th-usage-refresh {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 12px;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+}
+.th-usage-refresh-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 2px 8px;
+}
+.th-usage-refresh small {
   grid-column: 1 / -1;
   color: var(--text-dim);
 }

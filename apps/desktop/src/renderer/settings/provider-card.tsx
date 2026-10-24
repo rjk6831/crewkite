@@ -1,5 +1,5 @@
 import type { ChatCatalogRead, ChatFamily, WorkspaceState } from '@crewkite/contracts';
-import { type ReactNode, useId, useState } from 'react';
+import { type ReactNode, useEffect, useId, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
 import type { Workspace } from '../source.ts';
 import { FamilyMark } from '../thread/family-mark.tsx';
@@ -28,6 +28,14 @@ const reasonText = (reason: string) => {
 };
 
 const modelLimit = 12;
+
+// The rail's Connect link names the card before it opens Settings, and the card scrolls itself
+// into view when it mounts. A plain value is enough: one page opens at a time.
+let pendingCard: ChatFamily | null = null;
+export function focusSettingsCard(family: ChatFamily) {
+  pendingCard = family;
+  document.getElementById(`st-card-${family}`)?.scrollIntoView({ block: 'start' });
+}
 
 // The family's models and the default the person picks among them. A choice the provider no
 // longer lists stays saved, and the catalog's default applies until the model is listed again.
@@ -157,8 +165,14 @@ export function ProviderCard({
   models?: ReactNode;
 }) {
   const titleId = useId();
+  const card = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (pendingCard !== family) return;
+    pendingCard = null;
+    card.current?.scrollIntoView({ block: 'start' });
+  }, [family]);
   return (
-    <section className="st-card" aria-labelledby={titleId}>
+    <section ref={card} id={`st-card-${family}`} className="st-card" aria-labelledby={titleId}>
       <header className="st-card-head">
         <FamilyMark family={family} />
         <h2 id={titleId}>{familyName(family)}</h2>

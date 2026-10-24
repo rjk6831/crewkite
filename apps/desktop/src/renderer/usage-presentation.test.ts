@@ -1,11 +1,18 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { ObservationSchema, type Route, type Window } from '@crewkite/contracts';
+import {
+  type ChatCatalogRead,
+  type LocalSetup,
+  ObservationSchema,
+  type Route,
+  type Window,
+} from '@crewkite/contracts';
 import { createDemoFixtures, createTestIds, DEMO_TIME } from '@crewkite/testkit';
 import {
   anthropicUsageCard,
   nativeUsageClients,
   projectUsagePresentation,
+  railFamilies,
 } from './usage-presentation.ts';
 
 const id = createTestIds(DEMO_TIME, 9000n);
@@ -202,8 +209,9 @@ test('native usage gauges show the remaining percent without inventing freshness
     ),
   );
   assert(card.tags?.includes('Current scope'));
-  assert(card.notice?.includes('cache age unknown'));
-  assert(rows.every((row) => row.note?.includes(scopeHash)));
+  // The age sentence sits in each reading's Details. The read time is CrewKite's, not the report's.
+  assert(rows.every((row) => row.note?.startsWith('Age unknown.') && row.note.includes(scopeHash)));
+  assert(rows.every((row) => row.readAt === DEMO_TIME));
   const repeated = anthropicUsageCard({
     usageReaders: [
       {
@@ -222,4 +230,119 @@ test('native usage gauges show the remaining percent without inventing freshness
   });
   assert(prior?.tags?.includes('Earlier or unknown scope'));
   assert.equal(anthropicUsageCard({ usageReaders: [] }), null);
+});
+
+test('the rail shows five-hour and weekly bars, one bar for a single window, and No limits for Local', () => {
+  type Entry = ChatCatalogRead['families'][number];
+  const at = (minutes: number) => new Date(nowMs + minutes * 60_000).toISOString();
+  const window = (windowId: string, label: string, percent: number, resetIn: number) => ({
+    windowId,
+    label,
+    percent,
+    resetsAt: at(resetIn),
+    observedAt: at(-2),
+  });
+  const entry = (family: Entry['family'], remaining: Entry['remaining'], more = {}): Entry => ({
+    family,
+    connected: true,
+    reason: null,
+    models: [
+      { model: 'large-1', label: 'Large 1', efforts: ['default'], defaultEffort: 'default' },
+    ],
+    defaultModel: 'large-1',
+    remaining,
+    readAt: at(-2),
+    ...more,
+  });
+  const loaded = {
+    selectionId: 'a'.repeat(64),
+    identity: {
+      modelKey: 'local-27b',
+      displayName: '27B',
+      format: 'gguf',
+      sizeBytes: Math.round(15.2 * 1024 ** 3),
+      quantization: { name: 'Q4_K_M', bits: 4 },
+      selectedVariant: null,
+      metadataHash: 'b'.repeat(64),
+    },
+    instanceReference: 'instance-1',
+    contextLength: 8192,
+    state: 'loaded-eligible',
+    reasons: [],
+    qualification: 'unqualified',
+  };
+  const localSetup = {
+    observation: { models: [loaded] },
+    selection: { selectionId: loaded.selectionId },
+  } as unknown as LocalSetup;
+  const hardware = {
+    cpuModel: 'Apple M5 Pro',
+    logicalCores: 15,
+    architecture: 'arm64',
+    platform: 'darwin',
+    totalMemoryBytes: 48 * 1024 ** 3,
+    availableMemoryBytes: 31 * 1024 ** 3,
+    gpuCores: 20,
+    sampledAt: at(0),
+  };
+  const stats = {
+    tokensIn: 6097,
+    tokensOut: 400,
+    tokensPerSecond: 18.4,
+    firstTokenMs: 900,
+    turnMs: 22_000,
+    contextUsed: 6097,
+    contextCapacity: 8192,
+    summaries: 2,
+  };
+  const rows: { claim: string; entry: Entry; expect: Record<string, unknown> }[] = [
+    {
+      claim: 'Anthropic five-hour and weekly get a bar each, and another model pool does not count',
+      entry: entry('anthropic', [
+        window('five-hour', 'five-hour', 68, 90),
+        window('weekly', 'weekly', 63, 2880),
+        window('weekly-fable', 'weekly', 20, 2880),
+      ]),
+      expect: { bars: ['5 h 68%', 'week 63%'], resetsIn: 2880 * 60_000, read: 'Read 2 min ago' },
+    },
+    {
+      claim: 'OpenAI primary is the five-hour bar and secondary the weekly bar',
+      entry: entry('openai', [
+        window('codex:primary', 'five-hour', 12, 40),
+        window('codex:secondary', 'weekly', 70, 4000),
+      ]),
+      expect: { bars: ['5 h 12%', 'week 70%'], resetsIn: 40 * 60_000, read: 'Read 2 min ago' },
+    },
+    {
+      claim: 'a family with one window gets one bar, and an unconnected reader asks for Connect',
+      entry: entry('google', [window('gemini-daily', 'gemini-daily', 99, 600)], {
+        connected: false,
+        needsConnect: true,
+        models: [],
+        defaultModel: null,
+        readAt: at(-125),
+      }),
+      expect: { bars: ['99% left'], needsConnect: true, read: 'Read 2 h ago' },
+    },
+    {
+      claim: 'Local has no bars, reads No limits and carries the hardware line',
+      entry: entry('local', [], { lastTurnStats: stats, readAt: null }),
+      expect: {
+        bars: [],
+        unlimited: true,
+        read: null,
+        detail:
+          'Apple M5 Pro · 20 GPU cores · 48 GB memory, 31 GB free · 27B Q4_K_M, 15.2 GB, 8,192 context · 18.4 tok/s last turn',
+      },
+    },
+  ];
+  for (const { claim, entry: family, expect } of rows) {
+    const [row] = railFamilies({ families: [family] }, nowMs, { hardware, localSetup });
+    const view = { ...row, bars: row.bars.map((bar) => bar.text) };
+    for (const [key, value] of Object.entries(expect))
+      assert.deepEqual(view[key as keyof typeof view], value, `${claim}: ${key}`);
+  }
+  // An unconnected family that reads no usage stays off the rail.
+  const hidden = entry('google', [], { connected: false });
+  assert.deepEqual(railFamilies({ families: [hidden] }, nowMs), []);
 });

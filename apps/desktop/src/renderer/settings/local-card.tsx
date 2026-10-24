@@ -1,7 +1,8 @@
 import type { WorkspaceState } from '@crewkite/contracts';
 import { Fact } from '../components.tsx';
 import { LocalSetup } from '../local-setup.tsx';
-import { type CardProps, ProviderCard } from './provider-card.tsx';
+import { localFacts } from '../usage-presentation.ts';
+import { type CardProps, type CatalogEntry, ProviderCard } from './provider-card.tsx';
 
 const gib = (bytes: number | null | undefined) =>
   bytes === null || bytes === undefined ? 'Unknown' : `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
@@ -17,8 +18,10 @@ const allowanceSnippet = `function allowance(localAI) {
   }
 }`;
 
-function Hardware({ header, connected }: { header: WorkspaceState; connected: boolean }) {
+function Hardware({ header, entry }: { header: WorkspaceState; entry: CatalogEntry | undefined }) {
   const hardware = header.localHardware;
+  const connected = entry?.connected === true;
+  const facts = localFacts(hardware, header.localSetup, entry?.lastTurnStats ?? null);
   const memory =
     hardware?.totalMemoryBytes == null
       ? 'Unknown'
@@ -50,6 +53,10 @@ function Hardware({ header, connected }: { header: WorkspaceState; connected: bo
           }
         />
         <Fact label="Memory" value={memory} />
+        {hardware?.gpuModel && <Fact label="GPU" value={hardware.gpuModel} />}
+        {facts.gpu && <Fact label="GPU cores" value={hardware?.gpuCores ?? 'Unknown'} />}
+        {facts.model && <Fact label="Loaded model" value={facts.model} />}
+        {facts.speed && <Fact label="Last turn" value={facts.speed} />}
       </div>
     </section>
   );
@@ -62,7 +69,7 @@ export function LocalCard({ header, workspace, entry }: CardProps) {
       entry={entry}
       detail={header.localSetup?.endpoint ?? undefined}
       main={<LocalSetup snapshot={header} workspace={workspace} />}
-      side={<Hardware header={header} connected={entry?.connected === true} />}
+      side={<Hardware header={header} entry={entry} />}
     />
   );
 }

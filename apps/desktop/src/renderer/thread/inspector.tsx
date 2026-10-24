@@ -10,7 +10,7 @@ import {
   type ChatTurn,
   type WorkspaceState,
 } from '@crewkite/contracts';
-import { ArrowRightLeft, X } from 'lucide-react';
+import { ArrowRightLeft, RefreshCw, X } from 'lucide-react';
 import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
@@ -21,6 +21,7 @@ import {
   useState,
 } from 'react';
 import { familyName } from '../components.tsx';
+import { clientFor } from '../settings/client-status.tsx';
 import {
   crewFromPreset,
   crewPresetNames,
@@ -30,6 +31,7 @@ import {
   permissionPolicies,
   readCrewPresets,
 } from '../settings/preferences.ts';
+import { useProviderActions } from '../settings/provider-actions.ts';
 import { useCatalog } from '../settings/use-catalog.ts';
 import { UsageGauges } from '../usage-gauges.tsx';
 import { projectUsagePresentation } from '../usage-presentation.ts';
@@ -191,17 +193,71 @@ function ResizeHandle({
   );
 }
 
-function UsageTab({ header, preview }: { header: WorkspaceState | null; preview: boolean }) {
+const refreshFamilies = ['openai', 'anthropic', 'google'] as const;
+
+function UsageTab({
+  source,
+  header,
+  preview,
+}: {
+  source: ThreadSource;
+  header: WorkspaceState | null;
+  preview: boolean;
+}) {
   const now = useUsageClock(header?.usage ?? [], preview);
+  // The same quota commands the Settings cards send. The workspace reads its snapshot again on
+  // the reader events they cause, so the gauges below update without a reload here.
+  const actions = useProviderActions({ metadataCommand: (input) => source.command(input) });
   if (!header) return <p className="th-muted">Usage is not available yet.</p>;
   const cards = usageCards(projectUsagePresentation(header, null, now), header);
-  if (cards.length === 0)
-    return (
-      <p className="th-muted">
-        No provider usage has been read yet. Connect a provider in Settings.
-      </p>
-    );
-  return <UsageGauges cards={cards} nowMs={now} />;
+  const refresh = refreshFamilies.flatMap((family) => {
+    const { label, reader, cooldownSeconds } = clientFor(header, family, now);
+    if (!reader) return [];
+    const reading = reader.readState === 'intent' || reader.readState === 'owned';
+    return [
+      <li key={family} className="th-usage-refresh-row">
+        <span>{label}</span>
+        <button
+          type="button"
+          className="th-button"
+          aria-label={`Refresh ${label} usage`}
+          disabled={
+            preview ||
+            !reader.available ||
+            actions.busy[family] ||
+            reading ||
+            reader.readState === 'unknown' ||
+            cooldownSeconds > 0
+          }
+          title={cooldownSeconds > 0 ? `Refresh available in ${cooldownSeconds}s.` : undefined}
+          onClick={() =>
+            void (family === 'anthropic'
+              ? actions.refreshAnthropic()
+              : actions.observeUsage(family))
+          }
+        >
+          <RefreshCw size={13} aria-hidden="true" /> {reading ? 'Reading' : 'Refresh'}
+        </button>
+        {actions.messages[family] && <small role="status">{actions.messages[family]}</small>}
+      </li>,
+    ];
+  });
+  return (
+    <>
+      {refresh.length > 0 && (
+        <ul className="th-usage-refresh" aria-label="Refresh usage">
+          {refresh}
+        </ul>
+      )}
+      {cards.length === 0 ? (
+        <p className="th-muted">
+          No provider usage has been read yet. Connect a provider in Settings.
+        </p>
+      ) : (
+        <UsageGauges cards={cards} nowMs={now} />
+      )}
+    </>
+  );
 }
 
 const stateLabels: Record<ChatTurn['state'], string> = {
@@ -646,7 +702,7 @@ export function Inspector({
             focusPath={focusPath}
           />
         )}
-        {tab === 'usage' && <UsageTab header={header} preview={preview} />}
+        {tab === 'usage' && <UsageTab source={source} header={header} preview={preview} />}
         {tab === 'crew' && <CrewTab source={source} thread={thread} onConfigure={onConfigure} />}
         {tab === 'thread' && (
           <ThreadTab

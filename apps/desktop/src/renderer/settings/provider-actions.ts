@@ -10,7 +10,7 @@ const refusal = (result: { outcome: string; reason?: string; next?: string }) =>
  * The quota and sign-in commands the provider cards send, with the status line each one leaves
  * behind. Every command goes through the workspace, which refreshes the snapshot afterwards.
  */
-export function useProviderActions(workspace: Workspace) {
+export function useProviderActions(workspace: Pick<Workspace, 'metadataCommand'>) {
   const [messages, setMessages] = useState<Partial<Record<Family, string>>>({});
   const [busy, setBusy] = useState<Partial<Record<Family, boolean>>>({});
   const say = (family: Family, message: string) =>

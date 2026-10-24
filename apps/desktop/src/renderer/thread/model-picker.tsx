@@ -220,6 +220,10 @@ export function ModelPicker({
         >
           {!catalog && <p className="th-menu-empty">Models are not available yet.</p>}
           {catalog?.families.map((family) => {
+            // Usage reads before Connect, so the family is listed and greyed with the next step.
+            const offTitle = family.needsConnect
+              ? 'Connect in Settings'
+              : (family.reason ?? 'Not connected');
             const item = (model: Entry['models'][number]) => {
               const checked =
                 selection?.family === family.family && selection.model === model.model;
@@ -231,7 +235,7 @@ export function ModelPicker({
                   role="menuitemradio"
                   aria-checked={checked}
                   disabled={!family.connected}
-                  title={family.connected ? undefined : (family.reason ?? 'Not connected')}
+                  title={family.connected ? undefined : offTitle}
                   onClick={() => {
                     onSelect({
                       family: family.family,
@@ -257,12 +261,18 @@ export function ModelPicker({
               <div
                 key={family.family}
                 className="th-menu-group"
-                title={family.connected ? undefined : (family.reason ?? 'Not connected')}
+                title={family.connected ? undefined : offTitle}
               >
                 <div className={family.connected ? 'th-menu-head' : 'th-menu-head is-off'}>
                   <FamilyMark family={family.family} />
                   <strong>{familyName(family.family)}</strong>
-                  <span>{family.connected ? allowance(family, nowMs) : 'Not connected'}</span>
+                  <span>
+                    {family.connected
+                      ? allowance(family, nowMs)
+                      : family.needsConnect
+                        ? 'Connect in Settings'
+                        : 'Not connected'}
+                  </span>
                 </div>
                 {family.models.filter((model) => !model.hidden).map(item)}
                 {older.length > 0 && (

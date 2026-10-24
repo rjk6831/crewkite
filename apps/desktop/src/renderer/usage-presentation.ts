@@ -1,10 +1,17 @@
 import {
+  type ChatCatalogEntry,
+  type ChatCatalogRead,
+  type ChatFamily,
   canonicalJson,
+  type LocalHardwareStatus,
+  type LocalSetup,
   type Observation,
   type Policy,
   type Route,
   type Snapshot,
+  tightestAllowance,
   type Window,
+  windowAppliesTo,
 } from '@crewkite/contracts';
 
 import type { UsageCard, UsageReading } from './usage-gauges.tsx';
@@ -296,7 +303,8 @@ export function anthropicUsageCard(snapshot: Pick<Snapshot, 'usageReaders'>): Us
     resetsAt: window.resetsAt,
     source: 'client',
     confidence: 'reported',
-    note: `Native report. Report scope ${scope}. Observation time and cache age unknown.`,
+    readAt: reading?.receivedAt ?? null,
+    note: `Age unknown. The report gives no observation time or cache age. Report scope ${scope}.`,
   }));
   const primary = [...primaryLabels.keys()].flatMap((id) =>
     rows.filter((row) => row.windowId === id),
@@ -305,10 +313,9 @@ export function anthropicUsageCard(snapshot: Pick<Snapshot, 'usageReaders'>): Us
     id: 'native-quota:anthropic',
     title: 'Anthropic native quota',
     scope: 'Native local usage report',
-    tags: ['Age unknown', matching ? 'Current scope' : 'Earlier or unknown scope'],
-    notice: reading
-      ? `Last retained report received ${new Date(reading.receivedAt).toLocaleString()}. Observation time and cache age unknown.`
-      : 'Refresh quota in Native clients to read the native report.',
+    tags: [matching ? 'Current scope' : 'Earlier or unknown scope'],
+    // The footer says when the report was read, and each reading's Details says its age is unknown.
+    notice: reading ? undefined : 'Refresh Anthropic quota to read the native report.',
     primary,
     auxiliary: rows.filter((row) => !primary.includes(row)),
     credits: reading?.extraUsage
@@ -323,4 +330,141 @@ export function anthropicUsageCard(snapshot: Pick<Snapshot, 'usageReaders'>): Us
       : [],
     emptyText: 'No subscription allowance was reported. Coding allowance remains unknown.',
   };
+}
+
+/** How long ago CrewKite read a report, in minutes and then hours. */
+export function readAgo(readAt: string | null | undefined, nowMs: number): string | null {
+  const at = readAt ? Date.parse(readAt) : Number.NaN;
+  if (!Number.isFinite(at)) return null;
+  const minutes = Math.floor(Math.max(0, nowMs - at) / 60_000);
+  if (minutes < 1) return 'Read just now';
+  return minutes < 60 ? `Read ${minutes} min ago` : `Read ${Math.floor(minutes / 60)} h ago`;
+}
+
+export type RailBar = { text: string; percent: number | null };
+export type RailFamily = {
+  family: ChatFamily;
+  /** Two bars when the family reports a five-hour and a weekly window, else one. Empty for Local. */
+  bars: RailBar[];
+  /** The family runs on this computer and reports no allowance. */
+  unlimited: boolean;
+  /** Milliseconds until the tightest window resets. Null when unknown or already passed. */
+  resetsIn: number | null;
+  resetPassed: boolean;
+  /** Usage reads, but chat waits for Connect in Settings. */
+  needsConnect: boolean;
+  read: string | null;
+  /** The hardware and model line for Local, with every unknown part left out. */
+  detail: string | null;
+};
+
+const barNames = { 'five-hour': '5 h', weekly: 'week' } as const;
+const percentText = (percent: number | null) =>
+  percent === null ? 'unknown' : `${Math.floor(percent)}%`;
+
+/**
+ * One row per family the rail shows: connected ones, and ones whose usage reads before Connect.
+ * The catalog labels each window five-hour or weekly when it knows the period. Within a period the
+ * window with the least left for the family's model wins, so a weekly pool for another model does
+ * not count. The reset line follows the tightest window overall, the same one the picker shows.
+ */
+export function railFamilies(
+  catalog: ChatCatalogRead | null,
+  nowMs: number,
+  options: {
+    modelFor?: (entry: ChatCatalogEntry) => string | null;
+    hardware?: LocalHardwareStatus | null;
+    localSetup?: LocalSetup | null;
+  } = {},
+): RailFamily[] {
+  const modelFor = options.modelFor ?? ((entry) => entry.defaultModel);
+  return (catalog?.families ?? [])
+    .filter((entry) => entry.connected || entry.needsConnect === true)
+    .map((entry) => {
+      const model = modelFor(entry);
+      const unlimited = entry.family === 'local' && entry.remaining.length === 0;
+      const reported = entry.remaining.map((window) => window.windowId);
+      const applies = entry.remaining.filter((window) => windowAppliesTo(window, model, reported));
+      const period = (label: keyof typeof barNames) =>
+        tightestAllowance(
+          { remaining: applies.filter((window) => window.label.toLowerCase() === label) },
+          null,
+        );
+      const both = (['five-hour', 'weekly'] as const).every((label) =>
+        applies.some((window) => window.label.toLowerCase() === label),
+      );
+      const tightest = tightestAllowance(entry, model);
+      const bars: RailBar[] = unlimited
+        ? []
+        : both
+          ? (['five-hour', 'weekly'] as const).map((label) => {
+              const { percent } = period(label);
+              return { text: `${barNames[label]} ${percentText(percent)}`, percent };
+            })
+          : [
+              {
+                text:
+                  tightest.percent === null ? 'unknown' : `${percentText(tightest.percent)} left`,
+                percent: tightest.percent,
+              },
+            ];
+      const until = tightest.resetsAt ? Date.parse(tightest.resetsAt) - nowMs : null;
+      return {
+        family: entry.family,
+        bars,
+        unlimited,
+        resetsIn: until !== null && until > 0 ? until : null,
+        resetPassed: until !== null && until <= 0,
+        needsConnect: !entry.connected,
+        read: readAgo(entry.readAt, nowMs),
+        detail:
+          entry.family === 'local'
+            ? localFacts(options.hardware, options.localSetup, entry.lastTurnStats).line
+            : null,
+      };
+    });
+}
+
+const gigabytes = (bytes: number) => `${Math.round(bytes / 1024 ** 3)} GB`;
+
+/**
+ * What the machine and the loaded model report, for the Local card rows and the rail hover. A
+ * part the controller has not observed stays null and drops out of the line.
+ */
+export function localFacts(
+  hardware: LocalHardwareStatus | null | undefined,
+  setup: LocalSetup | null | undefined,
+  stats: ChatCatalogEntry['lastTurnStats'],
+) {
+  const loaded = setup?.observation?.models.filter((choice) => choice.state === 'loaded-eligible');
+  const choice =
+    loaded?.find((value) => value.selectionId === setup?.selection?.selectionId) ?? null;
+  const total = hardware?.totalMemoryBytes ?? null;
+  const free = hardware?.availableMemoryBytes ?? null;
+  const name = choice
+    ? [choice.identity.displayName, choice.identity.quantization?.name].filter(Boolean).join(' ')
+    : null;
+  const facts = {
+    processor: hardware?.cpuModel ?? hardware?.gpuModel ?? null,
+    gpu: hardware?.gpuCores ? `${hardware.gpuCores} GPU cores` : null,
+    memory:
+      total === null
+        ? null
+        : `${gigabytes(total)} memory${free === null ? '' : `, ${gigabytes(free)} free`}`,
+    model: choice
+      ? [
+          name,
+          `${(choice.identity.sizeBytes / 1024 ** 3).toFixed(1)} GB`,
+          choice.contextLength === null
+            ? null
+            : `${choice.contextLength.toLocaleString('en-US')} context`,
+        ]
+          .filter(Boolean)
+          .join(', ')
+      : null,
+    speed:
+      stats?.tokensPerSecond == null ? null : `${stats.tokensPerSecond.toFixed(1)} tok/s last turn`,
+  };
+  const parts = Object.values(facts).filter((value): value is string => value !== null);
+  return { ...facts, line: parts.length ? parts.join(' · ') : null };
 }

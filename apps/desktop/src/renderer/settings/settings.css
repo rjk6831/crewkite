@@ -268,7 +268,6 @@
 }
 
 /* Rail strip. Every connected family has a row, and a missing value reads unknown. */
-.rail-usage-value.is-unknown,
-.rail-usage-value.is-device {
+.rail-usage-value.is-unknown {
   color: var(--text-dim);
 }

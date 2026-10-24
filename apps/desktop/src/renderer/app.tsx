@@ -720,7 +720,13 @@ export function App() {
             </button>
           )}
         </div>
-        {header && !collapsed && <RailUsage source={threadSource} header={header} />}
+        {header && !collapsed && (
+          <RailUsage
+            source={threadSource}
+            header={header}
+            onOpenSettings={() => setPage('settings')}
+          />
+        )}
         <div className="nav-bottom">
           <button
             type="button"
