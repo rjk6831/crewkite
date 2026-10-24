@@ -609,7 +609,7 @@ test('the thread moves away from the family of its newest assistant turn, even o
   );
 });
 
-test('a reply restored from a thread read keeps the role and effort of its turn for the badge', () => {
+test('a reply restored from a thread read keeps the role, effort and stats of its turn', () => {
   const read = (role: 'reviewer' | 'advisor' | 'fixer', effort?: 'ultra'): ChatThreadRead => ({
     thread: {
       taskId: task,
@@ -640,6 +640,7 @@ test('a reply restored from a thread read keeps the role and effort of its turn 
         endedAt: stamp,
         failure: null,
         handoffFrom: null,
+        stats,
       },
     ],
     messages: [
@@ -663,6 +664,16 @@ test('a reply restored from a thread read keeps the role and effort of its turn 
     liveEvents: [],
     cursor: '11',
   });
+  const stats = {
+    tokensIn: 5800,
+    tokensOut: 300,
+    tokensPerSecond: 18,
+    firstTokenMs: 900,
+    turnMs: 21000,
+    contextUsed: 6097,
+    contextCapacity: 8192,
+    summaries: 2,
+  };
   for (const [role, effort] of [
     ['reviewer', undefined],
     ['advisor', undefined],
@@ -677,6 +688,8 @@ test('a reply restored from a thread read keeps the role and effort of its turn 
       { family: 'google', model: 'large-2', effort: effort ?? 'default', role },
       role,
     );
+    // The live events are gone after a reload; the turn row still carries the stats line.
+    assert.deepEqual(turnOf(threadItems(state)).stats, stats, role);
   }
 });
 

@@ -342,7 +342,10 @@ export function threadItems(state: ThreadState): ThreadItem[] {
         : base.blocks;
     const failure = base.failure ?? (stopped ? null : (meta?.failure ?? null));
     const ended = record ? base.ended : status !== 'running' && status !== 'waiting-permission';
-    const turn: TurnView = { ...base, identity, status, blocks, failure, ended };
+    // Live events of a finished turn are gone after a reload. The turn row keeps its stats, and
+    // their summary count stands in for the rolling summary cards.
+    const stats = base.stats ?? meta?.stats ?? null;
+    const turn: TurnView = { ...base, identity, status, blocks, failure, ended, stats };
     const asked = meta && byId.get(meta.userMessageId);
     const firstCursor = record?.events[0]?.cursor ?? null;
     const order =
