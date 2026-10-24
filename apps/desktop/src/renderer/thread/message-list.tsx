@@ -7,6 +7,7 @@ import { FamilyMark } from './family-mark.tsx';
 import { Markdown } from './markdown.tsx';
 import type { ThreadItem, TurnView } from './thread-state.ts';
 import { viewBlocks } from './turn-fold.ts';
+import { TurnStats } from './turn-stats.tsx';
 
 const roleLabels = {
   assistant: null,
@@ -79,6 +80,7 @@ const TurnRow = memo(function TurnRow({
         }
       })}
       {turn.status === 'stopped' && <p className="th-stopped">Stopped.</p>}
+      <TurnStats turn={turn} />
       {quiet(turn) && (
         <span className="th-working" role="status" aria-label="Working">
           <i />

@@ -6,6 +6,7 @@ import type {
   ChatPermissionOption,
   ChatRole,
   ChatToolKind,
+  ChatTurnStats,
 } from '@crewkite/contracts';
 
 // One assistant turn as the thread shows it: text, thinking, tool calls and permission requests in
@@ -46,7 +47,21 @@ export type NoticeBlock = {
   level: 'info' | 'warning';
   message: string;
 };
-export type Block = TextBlock | ThinkingBlock | ToolBlock | PermissionBlock | NoticeBlock;
+/** The adapter folded earlier turns into a rolling summary to fit the model's context. */
+export type CompactedBlock = {
+  kind: 'compacted';
+  id: string;
+  summaries: number;
+  coveredTurns: number;
+  capacity: number;
+};
+export type Block =
+  | TextBlock
+  | ThinkingBlock
+  | ToolBlock
+  | PermissionBlock
+  | NoticeBlock
+  | CompactedBlock;
 
 export type TurnIdentity = {
   family: ChatFamily;
@@ -62,6 +77,7 @@ export type TurnView = {
   ended: boolean;
   blocks: Block[];
   context: { used: number; capacity: number | null } | null;
+  stats: ChatTurnStats | null;
   failure: ChatFailure | null;
 };
 
@@ -72,6 +88,7 @@ export const blankTurn = (id: string): TurnView => ({
   ended: false,
   blocks: [],
   context: null,
+  stats: null,
   failure: null,
 });
 
@@ -287,10 +304,22 @@ export function applyEvent(view: TurnView, event: AgentEvent): TurnView {
           message: event.message,
         },
       ]);
-    // Stats and compaction carry no block of their own yet.
     case 'turn.stats':
-    case 'context.compacted':
-      return view;
+      return { ...view, stats: event.stats };
+    case 'context.compacted': {
+      // One card per summary write. A replayed event lands on the same card.
+      const id = `compacted:${event.summaries}`;
+      return withBlocks(
+        view,
+        put(view.blocks, id, () => ({
+          kind: 'compacted',
+          id,
+          summaries: event.summaries,
+          coveredTurns: event.coveredTurns,
+          capacity: event.capacityTokens,
+        })),
+      );
+    }
     case 'turn.completed':
       return finish(view, event);
   }
