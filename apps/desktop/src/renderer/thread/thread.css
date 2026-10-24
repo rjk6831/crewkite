@@ -239,7 +239,7 @@
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: currentColor;
+  background: var(--family-fill, currentColor);
   flex-shrink: 0;
 }
 .th-role {
@@ -1234,7 +1234,7 @@
 .rail-usage-bar span {
   display: block;
   height: 100%;
-  background: var(--family, var(--accent));
+  background: var(--family-fill, var(--family, var(--accent)));
 }
 .rail-usage-reset {
   grid-column: 1 / -1;

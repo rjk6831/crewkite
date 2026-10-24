@@ -24,10 +24,16 @@
   --green: #9ed3ad;
   --diff-add-text: var(--green);
   --diff-del-text: var(--red);
-  --family-openai: #7ccf9c;
-  --family-anthropic: #e8a477;
-  --family-google: #7fb0f0;
-  --family-local: #bba0ee;
+  /* The four kite panels, one per family: teal, coral, indigo and gold. Fills take the panel
+     colour as drawn; text takes a tint of it that reads at 4.5:1 on every surface. */
+  --family-openai-fill: #40b0a8;
+  --family-anthropic-fill: #e87860;
+  --family-google-fill: #4850a8;
+  --family-local-fill: #e0b860;
+  --family-openai: #5fcfc4;
+  --family-anthropic: #f0917c;
+  --family-google: #9aa2ec;
+  --family-local: #e8c56e;
   --shadow: 0 24px 100px #0007;
   background: var(--background);
   color: var(--text);
@@ -54,10 +60,10 @@
   --green: #33744a;
   --diff-add-text: #276040;
   --diff-del-text: #9c3a34;
-  --family-openai: #2b7048;
-  --family-anthropic: #9a5427;
-  --family-google: #2e63a6;
-  --family-local: #6c4ea5;
+  --family-openai: #1a6f69;
+  --family-anthropic: #b4482f;
+  --family-google: #3d45a0;
+  --family-local: #7a5d10;
   --shadow: 0 24px 100px #34482d25;
 }
 
@@ -783,15 +789,19 @@ kbd {
    colouring the text around it. Every value passes 4.5:1 on the card and hover backgrounds. */
 .family-openai {
   --family: var(--family-openai);
+  --family-fill: var(--family-openai-fill);
 }
 .family-anthropic {
   --family: var(--family-anthropic);
+  --family-fill: var(--family-anthropic-fill);
 }
 .family-google {
   --family: var(--family-google);
+  --family-fill: var(--family-google-fill);
 }
 .family-local {
   --family: var(--family-local);
+  --family-fill: var(--family-local-fill);
 }
 :is(.family-openai, .family-anthropic, .family-google, .family-local) {
   color: var(--family);
@@ -802,9 +812,9 @@ kbd {
   place-items: center;
   width: 16px;
   height: 16px;
-  border: 1px solid color-mix(in srgb, var(--family, currentColor) 35%, transparent);
+  border: 1px solid color-mix(in srgb, var(--family-fill, currentColor) 45%, transparent);
   border-radius: 4px;
-  background: color-mix(in srgb, var(--family, currentColor) 10%, transparent);
+  background: color-mix(in srgb, var(--family-fill, currentColor) 14%, transparent);
   font-size: 9.5px;
   font-weight: 600;
   line-height: 1;
