@@ -70,6 +70,13 @@
 * {
   box-sizing: border-box;
 }
+/* The shell scrolls its own panes. A document scrollbar beside them would scroll the whole
+   window, so the page itself never scrolls. */
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+}
 body {
   margin: 0;
   min-width: 720px;
