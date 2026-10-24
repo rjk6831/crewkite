@@ -1347,6 +1347,21 @@ test('send now and a policy change act on the running turn, and balanced answers
     },
     {
       kind: 'edit',
+      input: { paths: ['net.mjs'] },
+      mode: 'balanced',
+      policy: null,
+      answered: true,
+    },
+    // The OpenAI adapter flags a change the client tags as a delete.
+    {
+      kind: 'edit',
+      input: { paths: ['net.mjs'], deletes: true },
+      mode: 'balanced',
+      policy: null,
+      answered: false,
+    },
+    {
+      kind: 'edit',
       input: { path: '.git/config' },
       mode: 'balanced',
       policy: null,

@@ -246,14 +246,17 @@ const itemHead = z.object({ id, type: z.string() });
 const agentItem = z.object({ text: maybe(z.string()) });
 const reasoningItem = z.object({ summary: maybe(z.array(z.string())) });
 const commandItem = z.object({ command: maybe(z.string()), cwd: maybe(z.string()) });
-// A rename is an update with a destination. The client spells `move_path` in snake case. A
-// malformed entry drops the whole list, and a change with no paths goes to the person.
+// A rename is an update with a destination. The client spells `move_path` in snake case and tags
+// each change add, update or delete. A malformed entry drops the whole list, and a change with no
+// paths goes to the person.
 const changeItem = z.object({
   changes: maybe(
     z.array(
       z.object({
         path: z.string().min(1),
-        kind: z.object({ move_path: z.string().min(1).nullish() }).nullish(),
+        kind: z
+          .object({ type: z.string().optional(), move_path: z.string().min(1).nullish() })
+          .nullish(),
       }),
     ),
   ),
@@ -886,8 +889,15 @@ class OpenAiChatTurn {
       const paths = entries.map((entry) => entry.path);
       detail = paths.join('\n');
       kind = 'edit';
-      title = paths.length ? `Edit ${paths.join(', ')}` : 'Edit files';
-      input = { paths };
+      // A delete says so in the title and the input, so no automatic answer mistakes it for an
+      // edit.
+      const deletes = (changeItem.safeParse(raw).data?.changes ?? []).some(
+        (change) => change.kind?.type === 'delete',
+      );
+      title = paths.length
+        ? `${deletes ? 'Delete or edit' : 'Edit'} ${paths.join(', ')}`
+        : 'Edit files';
+      input = deletes ? { paths, deletes } : { paths };
     } else if (head.type === 'mcpToolCall') {
       const value = mcpItem.safeParse(raw).data;
       detail = [value?.server, value?.tool].filter(Boolean).join(': ');

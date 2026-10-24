@@ -1011,10 +1011,13 @@ export class ChatService {
     if (/\bnetwork\b/i.test(words)) return null;
     const scratch = this.scratchDirectory(live.taskId);
     if (balanced) {
-      // shortcut: the event carries no change type, so a delete is known by its words.
-      // Upgrade: a delete flag on tool.started.
+      // shortcut: the event carries no change type, so a delete is known by its words or by the
+      // flag the OpenAI adapter sets. Upgrade: a delete flag on tool.started.
+      const deletes = (call?.input as { deletes?: unknown } | undefined)?.deletes === true;
       if (kind === 'edit')
-        return !/\b(delete|remove|rm)\b/i.test(words) && editsInside(call?.input, scratch)
+        return !deletes &&
+          !/\b(delete|remove|rm)\b/i.test(words) &&
+          editsInside(call?.input, scratch)
           ? allow.id
           : null;
       return kind === 'command' && readOnlyCommand(call?.input, scratch) ? allow.id : null;
