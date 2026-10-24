@@ -290,7 +290,12 @@ export class ControllerClient {
             ? 65000
             : command.command === 'StartProjectCommand'
               ? 86410000
-              : command.command === 'ReadGitHub'
+              : [
+                    'ReadGitHub',
+                    'PushChatBranch',
+                    'OpenChatPullRequest',
+                    'ReadChatBranchStatus',
+                  ].includes(command.command)
                 ? 125000
                 : command.command === 'StopProjectOperation'
                   ? 10000
