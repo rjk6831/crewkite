@@ -1,5 +1,6 @@
 import {
   ConversationModelCatalogEntriesSchema,
+  ConversationModelCatalogEntrySchema,
   ConversationModelCatalogSchema,
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
@@ -8,6 +9,23 @@ import { type DiscoveryMetadata, OpenAiDiscovery } from './discovery.ts';
 import { type NativeLifecycle, startNativeSession } from './native-discovery.ts';
 import type { NativeProfileResolution } from './profile.ts';
 
+// The client lists older models only on request. The flag keeps them apart in the picker, and the
+// contract's own bounds still hold for the list.
+const observedModels = z
+  .array(
+    z.strictObject({
+      ...ConversationModelCatalogEntrySchema.shape,
+      hidden: z.literal(true).optional(),
+    }),
+  )
+  .refine(
+    (models) =>
+      ConversationModelCatalogEntriesSchema.safeParse(
+        models.map(({ hidden: _hidden, ...model }) => model),
+      ).success,
+    'A model list needs distinct bounded entries with supported efforts.',
+  );
+
 export const OpenAiModelCatalogObservationSchema = z.strictObject({
   version: z.literal(1),
   profileId: z.enum(['openai-file-v1', 'openai-repository-v1']),
@@ -15,7 +33,7 @@ export const OpenAiModelCatalogObservationSchema = z.strictObject({
   profileHash: ConversationModelCatalogSchema.shape.profileHash,
   client: ConversationModelCatalogSchema.shape.client,
   locationHash: ConversationModelCatalogSchema.shape.locationHash,
-  models: ConversationModelCatalogEntriesSchema,
+  models: observedModels,
 });
 
 export type OpenAiModelCatalogObservation = z.infer<typeof OpenAiModelCatalogObservationSchema>;
@@ -55,6 +73,7 @@ export function openAiModelCatalogObservation(
       model: model.model,
       efforts: model.supportedReasoningEfforts,
       defaultEffort: model.defaultReasoningEffort,
+      ...(model.hidden ? { hidden: true } : {}),
     })),
   });
 }
@@ -118,7 +137,10 @@ function readFailure(outcome: { reason: string | null; lastRequest: string }) {
   }
 }
 
-/** Read the native catalog without creating a thread or submitting a model turn. */
+/**
+ * Read the native catalog without creating a thread or submitting a model turn. The read asks for
+ * hidden models too, so a thread that started on an older model can still pick it.
+ */
 export function startOpenAiModelCatalogObservation(
   profile: NativeProfileResolution,
   paths: { directory: string; repositoryRoot: string },
@@ -144,6 +166,7 @@ export function startOpenAiModelCatalogObservation(
         timeoutMs: remaining,
         readConfiguration: true,
         configurationDirectory: paths.directory,
+        includeHidden: true,
       }),
   );
   const result = handle.result.then((outcome) => {

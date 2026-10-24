@@ -16,7 +16,12 @@ import type { NativeProfileResolution } from '../providers/openai/profile.ts';
 
 type Entry = ChatCatalogRead['families'][number];
 type Model = Entry['models'][number];
-type ObservedModel = { model: string; efforts: readonly string[]; defaultEffort: string };
+type ObservedModel = {
+  model: string;
+  efforts: readonly string[];
+  defaultEffort: string;
+  hidden?: boolean;
+};
 
 export type ChatCatalogInput = {
   profiles: readonly NativeProfileResolution['facts'][];
@@ -62,9 +67,10 @@ function openai(input: ChatCatalogInput): Entry {
   const profiles = input.profiles.filter((profile) => profile.family === 'openai');
   const ready = profiles.find((profile) => profile.available);
   const models = (input.openAiModels ?? []).map((value) =>
-    chatModel(value.model, value.efforts, value.defaultEffort),
+    chatModel(value.model, value.efforts, value.defaultEffort, value.model, value.hidden),
   );
-  // The profile pins a model the client may no longer list. Default to one it does list.
+  // The profile pins a model the client may no longer list. Default to one it does list, and to
+  // one it shows in its own picker before a hidden one.
   const listed = !models.length || models.some((value) => value.model === ready?.model);
   return entry(
     input,
@@ -72,7 +78,7 @@ function openai(input: ChatCatalogInput): Entry {
     !!ready,
     profiles[0]?.reason,
     models,
-    listed ? ready?.model : models[0].model,
+    listed ? ready?.model : (models.find((value) => !value.hidden) ?? models[0]).model,
   );
 }
 

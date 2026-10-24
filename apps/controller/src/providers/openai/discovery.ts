@@ -37,9 +37,13 @@ const outgoing = z.union([
     }),
   }),
   z.strictObject({
-    id: z.literal(4),
+    id: z.union([z.literal(4), z.literal(7)]),
     method: z.literal('model/list'),
-    params: z.strictObject({ limit: z.literal(20), includeHidden: z.literal(false) }),
+    params: z.strictObject({
+      limit: z.literal(20),
+      includeHidden: z.boolean(),
+      cursor: text(200).optional(),
+    }),
   }),
   z.strictObject({
     id: z.literal(5),
@@ -67,10 +71,11 @@ const requests: z.input<typeof outgoing>[][] = [
       params: { supportsLunaReserve: false, excludeResetCreditDetails: true },
     },
   ],
-  [{ id: 4, method: 'model/list', params: { limit: 20, includeHidden: false } }],
 ];
+// The fixed requests, then model/list, whose page and cursor depend on the read.
+const STEPS = requests.length + 1;
 // A reply holds a result or an error, never both. Envelope fields a later client adds pass.
-const responseId = z.number().int().min(1).max(6);
+const responseId = z.number().int().min(1).max(7);
 const response = z.union([
   z.object({ id: responseId, result: z.unknown(), error: z.never().optional() }),
   z.object({ id: responseId, error: z.unknown(), result: z.never().optional() }),
@@ -454,9 +459,10 @@ export function openAiUsageReporter(hook: OpenAiUsageHook | undefined): UsageRep
   };
 }
 
-// shortcut: the conversation catalog contract holds at most 20 models, so discovery reads the
-// first page of 20 in the client's order and ignores the cursor. A model past that page is not
-// offered. Upgrade: raise the contract bound and page through model/list.
+// shortcut: the conversation catalog contract holds at most 20 models, so a read keeps 20. The
+// client sorts hidden models in among the listed ones, so with hidden models a full first page can
+// push a listed model off it. Only then does the read take one more page, and listed models come
+// first in what it keeps. Upgrade: raise the contract bound and page through model/list.
 const models = z
   .object({
     data: z
@@ -467,15 +473,18 @@ const models = z
             model: id,
             supportedReasoningEfforts: z.array(z.object({ reasoningEffort: text(32) })).max(16),
             defaultReasoningEffort: text(32),
+            hidden: z.boolean().nullish(),
           })
-          .transform(({ supportedReasoningEfforts, ...value }) => ({
+          .transform(({ supportedReasoningEfforts, hidden, ...value }) => ({
             ...value,
             supportedReasoningEfforts: supportedReasoningEfforts.map(
               (entry) => entry.reasoningEffort,
             ),
+            ...(hidden ? { hidden: true as const } : {}),
           })),
       )
       .max(20),
+    nextCursor: text(200).nullish(),
   })
   .refine(
     (catalog) =>
@@ -616,6 +625,10 @@ export class OpenAiDiscovery {
   private requirementsRequested = false;
   private requirements?: DiscoveryMetadata['requirements'];
   private readonly configurationDirectory?: string;
+  private readonly includeHidden: boolean;
+  private readonly modelPages: DiscoveryMetadata['models'][] = [];
+  // Set once a full first page with hidden models names a next page.
+  private modelCursor: string | null = null;
   // One reporter per client process. Transcripts send their sparse updates through it too, so
   // an update merges with this process's read.
   readonly reportUsage: UsageReporter;
@@ -627,6 +640,8 @@ export class OpenAiDiscovery {
     readMcpConfiguration?: boolean;
     configurationDirectory?: string;
     onUsage?: OpenAiUsageHook;
+    /** List the models the client keeps out of its picker, flagged hidden. */
+    includeHidden?: boolean;
   }) {
     this.now = options.now;
     this.reportUsage = openAiUsageReporter(options.onUsage);
@@ -646,6 +661,7 @@ export class OpenAiDiscovery {
     this.configurationDirectory = options.configurationDirectory;
     if (this.readConfiguration && !text(4096).safeParse(this.configurationDirectory).success)
       throw new DiscoveryError('invalid-message');
+    this.includeHidden = options.includeHidden ?? false;
   }
 
   private fail(reason: Failure): never {
@@ -662,7 +678,7 @@ export class OpenAiDiscovery {
 
   next(): Uint8Array | null {
     this.check();
-    if (this.awaiting || this.pending.length || this.step === requests.length) return null;
+    if (this.awaiting || this.pending.length || this.step === STEPS) return null;
     if (this.readConfiguration && this.step === 2 && !this.configuration) {
       this.configurationRequested = true;
       this.awaiting = true;
@@ -677,7 +693,22 @@ export class OpenAiDiscovery {
         `${JSON.stringify(outgoing.parse({ id: 6, method: 'configRequirements/read' }))}\n`,
       );
     }
-    const messages = requests[this.step].map((message) => outgoing.parse(message));
+    const cursor = this.modelCursor;
+    const messages = (
+      this.step === requests.length
+        ? [
+            {
+              id: cursor ? 7 : 4,
+              method: 'model/list',
+              params: {
+                limit: 20,
+                includeHidden: this.includeHidden,
+                ...(cursor ? { cursor } : {}),
+              },
+            },
+          ]
+        : requests[this.step]
+    ).map((message) => outgoing.parse(message));
     this.awaiting = true;
     return new TextEncoder().encode(
       `${messages.map((message) => JSON.stringify(message)).join('\n')}\n`,
@@ -760,9 +791,31 @@ export class OpenAiDiscovery {
             this.reportUsage('account/rateLimits/read', value.result);
             this.limits = limits.parse(value.result);
             break;
-          case 3:
-            this.models = models.parse(value.result).data;
+          case 3: {
+            const page = models.parse(value.result);
+            this.modelPages.push(page.data);
+            if (
+              this.includeHidden &&
+              !this.modelCursor &&
+              page.data.length === 20 &&
+              page.nextCursor
+            ) {
+              this.modelCursor = page.nextCursor;
+              this.awaiting = false;
+              continue;
+            }
+            const all = this.modelPages.flat();
+            if (
+              new Set(all.map((entry) => entry.id)).size !== all.length ||
+              new Set(all.map((entry) => entry.model)).size !== all.length
+            )
+              this.fail('invalid-message');
+            this.models = [
+              ...all.filter((entry) => !entry.hidden),
+              ...all.filter((entry) => entry.hidden),
+            ].slice(0, 20);
             break;
+          }
         }
         this.awaiting = false;
         this.step++;
@@ -778,7 +831,7 @@ export class OpenAiDiscovery {
     this.check();
     if (
       this.pending.length ||
-      this.step !== requests.length ||
+      this.step !== STEPS ||
       !this.platform ||
       !this.account ||
       !this.limits ||
@@ -799,7 +852,9 @@ export class OpenAiDiscovery {
   }
 
   private expectedId(): number {
-    return this.configurationRequested ? 5 : this.requirementsRequested ? 6 : this.step + 1;
+    if (this.configurationRequested) return 5;
+    if (this.requirementsRequested) return 6;
+    return this.step === requests.length && this.modelCursor ? 7 : this.step + 1;
   }
 
   get lastEnvelope(): DiscoveryEnvelope {
@@ -815,7 +870,7 @@ export class OpenAiDiscovery {
   }
 
   get complete(): boolean {
-    return this.step === requests.length && this.failed === null && this.pending.length === 0;
+    return this.step === STEPS && this.failed === null && this.pending.length === 0;
   }
 
   get pendingRequest(): DiscoveryRequest {

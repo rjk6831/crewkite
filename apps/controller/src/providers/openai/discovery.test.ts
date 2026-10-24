@@ -75,6 +75,7 @@ type Scenario = {
   configuration?: Record<string, unknown>;
   requirements?: unknown;
   usage?: OpenAiUsage[];
+  includeHidden?: boolean;
 };
 
 test('provider discovery emits only correlated metadata and excludes private fields', () => {
@@ -508,6 +509,30 @@ test('provider discovery emits only correlated metadata and excludes private fie
       },
     },
     {
+      // Hidden models sort in among listed ones, so a full first page can hide a listed model.
+      name: 'a full page with hidden models reads one more and keeps listed models first',
+      includeHidden: true,
+      change: (values) => {
+        values[3] = {
+          data: Array.from({ length: 20 }, (_, index) => ({
+            ...catalog().data[0],
+            id: `legacy-${index}`,
+            model: `legacy-${index}`,
+            hidden: true,
+          })),
+          nextCursor: '20',
+        };
+        values[4] = catalog();
+        return values;
+      },
+      wire: (value, index) => line({ id: index === 4 ? 7 : index + 1, result: value }),
+      check: (value) => {
+        assert.equal(value.models.length, 20);
+        assert.deepEqual(value.models[1].hidden, true);
+        assert.equal(value.models[19].model, 'legacy-18');
+      },
+    },
+    {
       name: 'too many models',
       change: (values) => {
         values[3] = { ...catalog(), data: Array(21).fill(catalog().data[0]) };
@@ -574,6 +599,7 @@ test('provider discovery emits only correlated metadata and excludes private fie
       readConfiguration: !!scenario.configuration,
       configurationDirectory: '/workspace',
       onUsage: (usage: OpenAiUsage) => usages.push(usage),
+      includeHidden: scenario.includeHidden,
     };
     const reader = new OpenAiDiscovery(options);
     const emitted: unknown[] = [];
@@ -723,6 +749,18 @@ test('provider discovery emits only correlated metadata and excludes private fie
           ...(scenario.configuration ? ['config/read', 'configRequirements/read'] : []),
           'account/rateLimits/read',
           'model/list',
+          ...(scenario.includeHidden ? ['model/list'] : []),
+        ],
+      );
+    if (scenario.includeHidden)
+      assert.deepEqual(
+        emitted.flatMap((message) => {
+          const { method, params } = message as { method: string; params: unknown };
+          return method === 'model/list' ? [params] : [];
+        }),
+        [
+          { limit: 20, includeHidden: true },
+          { limit: 20, includeHidden: true, cursor: '20' },
         ],
       );
   }
