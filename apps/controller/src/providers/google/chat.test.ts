@@ -819,25 +819,32 @@ test('the end of a prompt becomes a stop reason, and a quota error carries its r
   }
 });
 
-test('an unknown update is reported once and the turn goes on', async () => {
+test('an unknown update or method goes to the frame trace and never the thread, and the turn goes on', async () => {
   const f = rig('chat-unknown');
   try {
-    const turn = await run(f, request(f));
+    // The launch offers no thought-level choice, so a high selection runs at the client default
+    // and the badge says so.
+    const req = request(f, {
+      selection: { family: 'google', model: 'fixture-model', effort: 'high' },
+    });
+    const turn = await run(f, req);
+    assert.equal(of(turn.events, 'turn.started')[0]?.effort, 'default');
     assert.deepEqual(types(turn.events), [
       'turn.started',
-      'provider.notice',
-      'provider.notice',
       'text.delta',
       'text.completed',
       'turn.completed',
     ]);
-    assert.deepEqual(
-      of(turn.events, 'provider.notice').map((event) => event.message),
-      [
-        'The Google client sent an update this app does not show: fancy_new_update.',
-        'The Google client sent a message this app does not use: $/progress.',
-      ],
-    );
+    const trace = readFileSync(join(req.work.directory, 'acp-trace.jsonl'), 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    assert.deepEqual(trace.flatMap((line) => line.update ?? line.method ?? []).slice(-4), [
+      'fancy_new_update',
+      '$/progress',
+      'fancy_new_update',
+      'agent_message_chunk',
+    ]);
     assert.equal(turn.result.stopReason, 'done');
     assert.equal(turn.result.assistantText, 'still here');
   } finally {

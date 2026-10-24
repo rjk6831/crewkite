@@ -22,7 +22,8 @@
 //   {"id":n,"result":...} or {"id":n,"error":{"code":C,"message":S}}
 //   account/read result {"account":{"type":"chatgpt"}|null}
 //   account/rateLimits/read result {"ordinaryUsageAllowed":B,"rateLimits":{"limitId","primary":{"usedPercent","windowDurationMins","resetsAt"}}}
-//   thread/start and thread/resume result {"thread":{"id":T}}; turn/start result {"turn":{"id":U}}
+//   thread/start and thread/resume result {"thread":{"id":T},"reasoningEffort":E}, the effort a
+//     turn that sends none runs at; turn/start result {"turn":{"id":U}}
 //   {"id":R,"method":"item/commandExecution/requestApproval","params":{"threadId","turnId","itemId","reason","command","cwd"}},
 //     or for a network access prompt {"threadId","turnId","itemId","reason","networkApprovalContext":{"host","protocol"}}
 //     with no command and no cwd
@@ -51,6 +52,7 @@ import { after, test } from 'node:test';
 import {
   type AgentEvent,
   AgentEventSchema,
+  type ChatEffort,
   type ChatPermissionPolicy,
   type ChatSession,
   type ChatToolKind,
@@ -155,7 +157,7 @@ input.on('line', (line) => {
   if (value.method === 'turn/interrupt' && given.silent) return;
   let result = replies[value.method];
   // Fields CrewKite does not read change shape between client builds.
-  if (value.method === 'thread/start') result = { thread: { id: threadId, preview: '' }, model: value.params.model, sandbox: { type: 'futureSandbox' }, ...(scenario === 'ignored-policy' ? { approvalPolicy: 'never' } : {}) };
+  if (value.method === 'thread/start') result = { thread: { id: threadId, preview: '' }, model: value.params.model, reasoningEffort: 'medium', sandbox: { type: 'futureSandbox' }, ...(scenario === 'ignored-policy' ? { approvalPolicy: 'never' } : {}) };
   if (value.method === 'thread/resume') {
     threadId = value.params.threadId;
     result = { thread: { id: threadId } };
@@ -184,6 +186,7 @@ function turn(
   scenario: string,
   options: {
     session?: ChatSession;
+    effort?: ChatEffort;
     permissionPolicy?: ChatPermissionPolicy;
     permissionGrants?: ChatToolKind[];
     /**
@@ -232,7 +235,7 @@ function turn(
       turnId,
       taskId: 'tsk_01M51M322B2AEBXD9MA74CBCFM',
       role: 'assistant',
-      selection: { family: 'openai', model: 'gpt-6.1-sol', effort: 'low' },
+      selection: { family: 'openai', model: 'gpt-6.1-sol', effort: options.effort ?? 'low' },
       prompt,
       systemContext,
       history: [],
@@ -255,6 +258,7 @@ function turn(
     events,
     usage,
     scratch,
+    work,
     args: () => args,
     frames: () =>
       readFileSync(frames, 'utf8')
@@ -282,6 +286,13 @@ test('streamed thinking and text reach the thread in the order the client sends 
   const run = turn('stream');
   const result = await run.settled();
   assert.deepEqual(strip(run.events), [
+    {
+      type: 'turn.started',
+      family: 'openai',
+      model: 'gpt-6.1-sol',
+      effort: 'low',
+      role: 'assistant',
+    },
     { type: 'thinking.delta', itemId: 'reasoning-1', text: 'Reading ' },
     { type: 'thinking.delta', itemId: 'reasoning-1', text: 'the tests.' },
     { type: 'thinking.completed', itemId: 'reasoning-1' },
@@ -312,6 +323,13 @@ test('a command approval holds the turn until respondPermission answers it', asy
   // The peer sends nothing more until it reads an answer, so these are all the events so far.
   assert.deepEqual(strip(run.events), [
     {
+      type: 'turn.started',
+      family: 'openai',
+      model: 'gpt-6.1-sol',
+      effort: 'low',
+      role: 'assistant',
+    },
+    {
       type: 'tool.started',
       callId: 'command-1',
       kind: 'command',
@@ -333,7 +351,7 @@ test('a command approval holds the turn until respondPermission answers it', asy
   ]);
   run.handle.respondPermission(request.requestId, 'allow-once');
   const result = await run.settled();
-  assert.deepEqual(strip(run.events.slice(2)), [
+  assert.deepEqual(strip(run.events.slice(3)), [
     { type: 'permission.resolved', requestId: 'approval-1', choice: 'allow-once' },
     { type: 'tool.output', callId: 'command-1', chunk: 'ok\n' },
     { type: 'tool.completed', callId: 'command-1', status: 'ok', summary: 'Exit code 0.' },
@@ -467,18 +485,22 @@ test('stop interrupts the native turn, waits for the client to confirm it and en
   }
 });
 
-test('only an unknown notification is reported, once, and the turn still completes', async () => {
+test('an unknown notification goes to the turn trace and never the thread, and the turn completes', async () => {
   const run = turn('unknown');
   const result = await run.settled();
   assert.deepEqual(
     run.events.filter((event) => event.type === 'provider.notice'),
+    [],
+  );
+  // Housekeeping notices stay out of the trace too. Each unknown frame gets its own line.
+  assert.deepEqual(
+    readFileSync(join(run.work, 'trace.jsonl'), 'utf8')
+      .trimEnd()
+      .split('\n')
+      .map((line) => JSON.parse(line)),
     [
-      {
-        type: 'provider.notice',
-        turnId,
-        level: 'info',
-        message: 'Codex sent fixture/newNotice. CrewKite does not read it yet.',
-      },
+      { ms: 0, method: 'fixture/newNotice' },
+      { ms: 0, method: 'fixture/newNotice' },
     ],
   );
   assert.equal(result.stopReason, 'done');
@@ -519,12 +541,24 @@ test('only a used-up plan ends the turn as a limit with the reset time', async (
   }
 });
 
-test('the next turn resumes the thread with its own approval policy and sends only the prompt', async () => {
-  const first = turn('reply');
+test('the next turn resumes the thread with its own approval policy and effort and sends only the prompt', async () => {
+  // A default turn sends no effort and runs at the level the thread reply names.
+  const first = turn('reply', { effort: 'default' });
   const { session } = await first.settled();
   assert(session);
   const second = turn('reply', { session, permissionPolicy: 'allow-all' });
   const result = await second.settled();
+  assert.deepEqual(
+    [first, second].map((run) => run.events.find((event) => event.type === 'turn.started')),
+    ['medium', 'low'].map((effort) => ({
+      type: 'turn.started',
+      turnId,
+      family: 'openai',
+      model: 'gpt-6.1-sol',
+      effort,
+      role: 'assistant',
+    })),
+  );
   const settings = {
     model: 'gpt-6.1-sol',
     modelProvider: 'openai',
@@ -548,7 +582,6 @@ test('the next turn resumes the thread with its own approval policy and sends on
       params: {
         threadId: 'thread-1',
         input: [{ type: 'text', text: `${systemContext}\n\n${prompt}` }],
-        effort: 'low',
       },
     },
   ]);

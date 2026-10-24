@@ -12,12 +12,13 @@ import {
 import { userInfo } from 'node:os';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
-import type {
-  AgentEvent,
-  AnthropicUsageReadingSchema,
-  ChatFailure,
-  ChatPermissionOption,
-  ChatToolKind,
+import {
+  type AgentEvent,
+  type AnthropicUsageReadingSchema,
+  ChatEffortSchema,
+  type ChatFailure,
+  type ChatPermissionOption,
+  type ChatToolKind,
 } from '@crewkite/contracts';
 import { z } from 'zod';
 import {
@@ -29,6 +30,7 @@ import {
 } from '../../chat/adapter.ts';
 import { scratchPath } from '../../chat/local-tools.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
+import { frameTrace } from '../google/chat.ts';
 import { armOwnedCleanup } from './native-discovery.ts';
 
 // One chat turn on the official claude client: `--print` with stream-json in both directions,
@@ -66,6 +68,7 @@ const MAX_LINE_BYTES = 16 * 1024 * 1024;
 const MAX_TEXT = 65_536;
 const MAX_INPUT_BYTES = 65_536;
 const MAX_STDERR = 16_384;
+const TRACE_LIMITS = { lines: 5000, bytes: 256 * 1024 };
 
 const id = z.string().min(1).max(200);
 // Session IDs and models go into argv, so neither may start with a dash or carry whitespace.
@@ -109,7 +112,13 @@ const frame = z.object({
   subtype: z.string().optional(),
   parent_tool_use_id: z.string().nullish(),
 });
-const init = z.object({ session_id: sessionId, model: z.string().min(1).max(200).optional() });
+// effort is the level the client sends after its own default, caps and model downgrades, and
+// null when it sends none. Builds that do not publish it leave it out.
+const init = z.object({
+  session_id: sessionId,
+  model: z.string().min(1).max(200).optional(),
+  effort: ChatEffortSchema.exclude(['default']).nullish().catch(undefined),
+});
 const streamEvent = z.object({
   event: z.object({
     type: z.string(),
@@ -219,11 +228,6 @@ const SIGNED_OUT =
   /\/login\b|\bnot logged in\b|\blog ?in\b|\bsign(?:ed)? ?in\b|authenticat|\boauth\b|invalid api key/i;
 const NAME = /^[a-z][a-z0-9_]{0,63}$/;
 const QUIET_SYSTEM = new Set(['status', 'commands_changed', 'thinking_tokens']);
-const carriesText = (value: unknown) =>
-  ['content', 'message', 'text'].some((key) => {
-    const field = record(value)[key];
-    return typeof field === 'string' && field.trim() !== '';
-  });
 const label = (value: string | undefined) => (value && NAME.test(value) ? value : 'unnamed');
 const clip = (value: string, limit: number) =>
   value.length > limit ? value.slice(0, limit) : value;
@@ -490,10 +494,16 @@ function startTurn(
     noticed.add(key);
     send({ type: 'provider.notice', turnId, level, message });
   };
-  const unknown = (name: string) =>
-    notice(`unknown:${name}`, `The client sent a ${name} event, which CrewKite does not show.`);
+  // An event CrewKite does not handle goes to the turn's trace and never to the thread. The file
+  // appears with the first one.
+  const trace = frameTrace(now, TRACE_LIMITS);
+  const unknown = (name: string) => {
+    trace.open(join(request.work.directory, 'trace.jsonl'));
+    trace.write(() => ({ method: name }));
+  };
+  // One notice per turn for an event CrewKite acts on and could not read.
   const unreadable = (name: string) =>
-    notice(`unreadable:${name}`, `The client sent a ${name} event that CrewKite could not read.`);
+    notice('unreadable', `The client sent a ${name} event that CrewKite could not read.`);
   const write = (value: unknown) => {
     if (!inputOpen) return;
     try {
@@ -621,12 +631,20 @@ function startTurn(
     if (parsed.data.model) model = parsed.data.model;
     if (started) return;
     started = true;
+    // The badge names the level the turn runs at. The client's own report wins, since it covers
+    // its default and any cap. Without one, a level chatArguments did not pass runs at default.
+    const { effort } = request.selection;
     send({
       type: 'turn.started',
       turnId,
       family: 'anthropic',
       model,
-      effort: request.selection.effort,
+      effort:
+        parsed.data.effort === undefined
+          ? effort === 'minimal'
+            ? 'default'
+            : effort
+          : (parsed.data.effort ?? 'default'),
       role: request.role,
     });
     if (request.selection.effort === 'minimal')
@@ -974,10 +992,7 @@ function startTurn(
     try {
       value = JSON.parse(line);
     } catch {
-      return notice(
-        'invalid-json',
-        'The client wrote a line that is not JSON. CrewKite skipped it.',
-      );
+      return notice('unreadable', 'The client wrote a line that is not JSON. CrewKite skipped it.');
     }
     const head = frame.safeParse(value);
     if (!head.success) return unknown('unnamed');
@@ -987,10 +1002,9 @@ function startTurn(
     switch (type) {
       case 'system':
         if (subtype === 'init') return onInit(value);
-        // Status, command list and thinking token updates arrive in every turn and carry nothing
-        // to read. A system event with its own text still gets a notice, since the thread
-        // does not show that text.
-        if (QUIET_SYSTEM.has(subtype ?? '') || !carriesText(value)) return;
+        // Status, command list and thinking token updates arrive in every turn and would fill
+        // the trace.
+        if (QUIET_SYSTEM.has(subtype ?? '')) return;
         return unknown(`system/${label(subtype)}`);
       case 'stream_event':
         return nested ? undefined : onStream(value);
@@ -1018,6 +1032,7 @@ function startTurn(
     if (settled) return;
     settled = true;
     for (const cancelTimer of timers) cancelTimer();
+    trace.close();
     // Items cut off by a stop or an exit still close, so the thread shows what arrived.
     for (const message of messages.values())
       for (const item of message.items)

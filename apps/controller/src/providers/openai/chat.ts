@@ -2,11 +2,12 @@ import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { lstatSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
-import type {
-  AgentEvent,
-  ChatFailure,
-  ChatPermissionOption,
-  ChatToolKind,
+import {
+  type AgentEvent,
+  ChatEffortSchema,
+  type ChatFailure,
+  type ChatPermissionOption,
+  type ChatToolKind,
 } from '@crewkite/contracts';
 import { z } from 'zod';
 import {
@@ -18,6 +19,7 @@ import {
 } from '../../chat/adapter.ts';
 import { scratchPath } from '../../chat/local-tools.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
+import { frameTrace } from '../google/chat.ts';
 import {
   type OpenAiUsageHook,
   type OpenAiUsageWindow,
@@ -167,6 +169,7 @@ const OUTPUT_LIMIT = 65_536;
 // A completed command item repeats up to 1 MiB of retained output, and JSON escaping can write each
 // byte as six. A 16 MiB line covers that. Anything longer is not a frame this client sends.
 const LINE_LIMIT = 16 * 1024 * 1024;
+const TRACE_LIMITS = { lines: 5000, bytes: 256 * 1024 };
 const OPTIONS: ChatPermissionOption[] = [
   { id: 'allow-once', label: 'Allow once', kind: 'allow-once' },
   { id: 'allow-thread', label: 'Allow for this thread', kind: 'allow-thread' },
@@ -180,7 +183,8 @@ const DECISIONS = new Map([
   ['deny', 'decline'],
 ]);
 // Thread, account and client housekeeping notices with nothing to show in a chat turn. Any other
-// unknown method is reported once per turn, so a client update shows up in the thread.
+// method goes to the turn's trace, so a client update can be diagnosed without a line in the
+// thread.
 const QUIET = new Set([
   'thread/started',
   'thread/status/changed',
@@ -228,10 +232,12 @@ const accountReply = z.object({ account: z.object({ type: z.string() }).nullable
 const limitsReply = z.object({ ordinaryUsageAllowed: maybe(z.boolean()) });
 // The reply names the policy the thread runs under. A build that leaves it out is taken at its
 // word; one that names another policy than the one sent is not, since edits would then run
-// without asking.
+// without asking. The reply also names the thread's reasoning effort, which a default turn
+// keeps.
 const threadReply = z.object({
   thread: z.object({ id: z.string().min(1).max(512) }),
   approvalPolicy: z.unknown().optional(),
+  reasoningEffort: ChatEffortSchema.exclude(['default']).optional().catch(undefined),
 });
 const turnReply = z.object({ turn: z.object({ id }) });
 const scope = z.object({ threadId: z.string() });
@@ -325,6 +331,7 @@ class OpenAiChatTurn {
   private nextId = 1;
   private readonly waiting = new Map<RpcId, (reply: Reply) => void>();
   private threadId: string | null = null;
+  private threadEffort: z.output<typeof threadReply>['reasoningEffort'];
   private turnId: string | null = null;
   // A terminal error notice. The failure is built when the turn ends, so a rate-limit update
   // that lands in between still supplies the reset time.
@@ -348,12 +355,13 @@ class OpenAiChatTurn {
   private readonly changed = new Set<string>();
   private readonly approvals = new Map<string, RpcId>();
   private approvalCount = 0;
-  private readonly reported = new Set<string>();
+  private reported = false;
   private readonly windows = new Map<string, OpenAiUsageWindow>();
   private readonly stderr = new StderrTail();
   // One line per frame in either direction: method or id and any error. Never params or results,
   // which hold the prompt and file contents.
   private readonly frames: string[] = [];
+  private readonly trace: ReturnType<typeof frameTrace>;
   private usage: ChatTurnResult['usage'] = null;
   private readonly finish: (result: ChatTurnResult) => void;
   private readonly schedule: Schedule;
@@ -363,6 +371,7 @@ class OpenAiChatTurn {
     this.emit = emit;
     this.schedule = deps.schedule ?? defaultSchedule;
     this.reportUsage = openAiUsageReporter(deps.onUsage);
+    this.trace = frameTrace(request.now ?? Date.now, TRACE_LIMITS);
     let finish: (result: ChatTurnResult) => void = () => {};
     const result = new Promise<ChatTurnResult>((resolve) => {
       finish = resolve;
@@ -550,6 +559,7 @@ class OpenAiChatTurn {
           );
         if (!this.policyApplied(thread.data, 'thread/start')) return;
         this.threadId = thread.data.thread.id;
+        this.threadEffort = thread.data.reasoningEffort;
         this.startTurn(true, history);
       });
     if (session?.family !== 'openai') return start(false);
@@ -561,6 +571,7 @@ class OpenAiChatTurn {
       if (thread?.success) {
         if (!this.policyApplied(thread.data, 'thread/resume')) return;
         this.threadId = thread.data.thread.id;
+        this.threadEffort = thread.data.reasoningEffort;
         return this.startTurn(false, false);
       }
       // A thread can vanish from the client's history. Starting fresh with the transcript keeps
@@ -609,6 +620,16 @@ class OpenAiChatTurn {
         if ('error' in reply)
           return this.fail(this.providerFailure('prompt', 'turn/start', reply.error));
         this.turnId ??= turnReply.safeParse(reply.result).data?.turn.id ?? null;
+        // The client accepted the effort. A default turn runs at the thread's own level.
+        this.send({
+          type: 'turn.started',
+          turnId: this.request.turnId,
+          family: 'openai',
+          model: selection.model,
+          effort:
+            selection.effort === 'default' ? (this.threadEffort ?? 'default') : selection.effort,
+          role: this.request.role,
+        });
       },
     );
   }
@@ -654,12 +675,11 @@ class OpenAiChatTurn {
       value = JSON.parse(text);
     } catch {
       this.track('received', null);
-      return this.noticeOnce('', 'warning', 'Codex sent a line CrewKite could not read.');
+      return this.unreadable();
     }
     const message = envelope.safeParse(value);
     this.track('received', message.data ?? null);
-    if (!message.success)
-      return this.noticeOnce('', 'warning', 'Codex sent a line CrewKite could not read.');
+    if (!message.success) return this.unreadable();
     const { id, method, params } = message.data;
     // After an interrupt only the client's completion matters. It closes the turn in the thread's
     // history, so the next message resumes a finished turn.
@@ -688,7 +708,7 @@ class OpenAiChatTurn {
           ? 'edit'
           : null;
     if (!kind) {
-      this.unknown(method);
+      this.unknown(method, requestId);
       // An unanswered request would hold the turn until its deadline.
       return this.write({
         id: requestId,
@@ -1057,18 +1077,20 @@ class OpenAiChatTurn {
     });
   }
 
-  private unknown(method: string) {
-    this.noticeOnce(
-      method,
-      'info',
-      `Codex sent ${clip(method, 200)}. CrewKite does not read it yet.`,
-    );
+  /** One trace line per frame CrewKite does not handle. The file appears on the first one. */
+  private unknown(method: string, requestId?: RpcId) {
+    this.trace.open(join(this.request.work.directory, 'trace.jsonl'));
+    this.trace.write(() => ({
+      method: clip(method, 200),
+      ...(requestId === undefined ? {} : { id: requestId }),
+    }));
   }
 
-  private noticeOnce(key: string, level: 'info' | 'warning', message: string) {
-    if (this.reported.has(key)) return;
-    this.reported.add(key);
-    this.notice(level, message);
+  /** One notice per turn for a line CrewKite could not read. The frame log keeps each one. */
+  private unreadable() {
+    if (this.reported) return;
+    this.reported = true;
+    this.notice('warning', 'Codex sent a line CrewKite could not read.');
   }
 
   private notice(level: 'info' | 'warning', message: string) {
@@ -1231,6 +1253,7 @@ class OpenAiChatTurn {
     if (this.settled) return;
     this.settled = true;
     for (const cancel of this.timers.splice(0)) cancel();
+    this.trace.close();
     const { selection, session } = this.request;
     const now = this.request.now ?? Date.now;
     this.finish({

@@ -12,7 +12,9 @@
 //   {"type":"control_response","response":{"subtype":"success","request_id":"req-1",
 //     "response":{"behavior":"allow","updatedInput":{...}}}}
 // stdout, one JSON object per line:
-//   {"type":"system","subtype":"init","session_id":"...","model":"..."}
+//   {"type":"system","subtype":"init","session_id":"...","model":"...","effort":"high"|null}, where
+//     effort is the level the client sends after its default and caps, null for none, and left
+//     out by builds that do not publish it
 //   {"type":"stream_event","parent_tool_use_id":null,"event":{...Messages API stream event...}}
 //   {"type":"assistant","parent_tool_use_id":null,"message":{"id":"msg_...","content":[ONE block]}}
 //   {"type":"user","parent_tool_use_id":null,"message":{"content":[{"type":"tool_result",...}]}}
@@ -43,6 +45,7 @@ import {
   type AgentEvent,
   AgentEventSchema,
   AnthropicUsageReadingSchema,
+  type ChatEffort,
   type ChatPermissionPolicy,
   type ChatSession,
   type ChatToolKind,
@@ -62,7 +65,13 @@ const fresh = '0f6c2a51-7a3e-4c1b-9d55-1f2e3a4b5c6d';
 const systemContext = 'You are working in a scratch copy of demo.';
 const prompt = 'What does this project do?';
 
-const init = (session = fresh) => ({ type: 'system', subtype: 'init', session_id: session, model });
+const init = (session = fresh, effort?: string | null) => ({
+  type: 'system',
+  subtype: 'init',
+  session_id: session,
+  model,
+  ...(effort === undefined ? {} : { effort }),
+});
 const stream = (event: unknown) => ({
   type: 'stream_event',
   session_id: fresh,
@@ -86,9 +95,9 @@ const done = (session = fresh) => ({
   usage: { input_tokens: 2400, output_tokens: 80 },
   modelUsage: { [model]: { contextWindow: 200_000 }, 'claude-haiku-5': { contextWindow: 0 } },
 });
-const streamed = (session = fresh): Step[] => [
+const streamed = (session = fresh, effort?: string | null): Step[] => [
   'read',
-  { out: init(session) },
+  { out: init(session, effort) },
   { out: stream({ type: 'message_start', message: { id: 'msg_1' } }) },
   { out: stream({ type: 'content_block_start', index: 0, content_block: { type: 'thinking' } }) },
   { out: stream(delta(0, 'thinking_delta', 'thinking', 'Reading ')) },
@@ -121,6 +130,7 @@ function run(
   session: ChatSession | null = null,
   permissionGrants: ChatToolKind[] = [],
   permissionPolicy: ChatPermissionPolicy = 'ask',
+  effort: ChatEffort = 'default',
 ) {
   const root = mkdtempSync(join(tmpdir(), 'crewkite-chat-'));
   mkdirSync(join(root, 'scratch'));
@@ -153,7 +163,7 @@ function run(
       turnId,
       taskId: 'tsk_00000000000000000000000001',
       role: 'assistant',
-      selection: { family: 'anthropic', model, effort: 'default' },
+      selection: { family: 'anthropic', model, effort },
       prompt,
       systemContext,
       history: [],
@@ -182,6 +192,7 @@ function run(
     launched,
     usage,
     next,
+    work: join(root, 'work'),
     cleanup: () => rmSync(root, { recursive: true }),
   };
 }
@@ -438,7 +449,7 @@ test('a rate limit frame reports each window it can read, per-response readings 
   }
 });
 
-test('a new session gets the framing and a saved one is resumed with the prompt alone', async (t) => {
+test('a new session gets the framing, a saved one is resumed with the prompt alone, and the badge shows the effort the turn runs at', async (t) => {
   const saved = 'a3d9c0e2-5b47-4f18-8c6a-2e9d7b1f4a30';
   const base = [
     '--print',
@@ -459,20 +470,43 @@ test('a new session gets the framing and a saved one is resumed with the prompt 
     '--model',
     model,
   ];
+  // The client's own report of its effort wins. Without one, the level passed is the level, and
+  // minimal, which the client lacks, runs at default.
+  const saving = { family: 'anthropic' as const, sessionId: saved, model, updatedAt: 'x' };
   const rows = [
     { session: null, argv: base, text: `${systemContext}\n\n${prompt}`, id: fresh },
     {
-      session: { family: 'anthropic' as const, sessionId: saved, model, updatedAt: 'x' },
+      session: saving,
       argv: [...base, '--resume', saved],
       text: prompt,
       id: saved,
+      reported: 'xhigh',
+      badge: 'xhigh',
+    },
+    {
+      session: null,
+      argv: [...base, '--effort', 'high'],
+      text: `${systemContext}\n\n${prompt}`,
+      id: fresh,
+      effort: 'high' as const,
+      badge: 'high',
+    },
+    {
+      session: null,
+      argv: base,
+      text: `${systemContext}\n\n${prompt}`,
+      id: fresh,
+      effort: 'minimal' as const,
+      reported: null,
     },
   ];
   for (const row of rows) {
-    const turn = run(streamed(row.id), row.session);
+    const turn = run(streamed(row.id, row.reported), row.session, [], 'ask', row.effort);
     t.after(turn.cleanup);
     const result = await turn.handle.result;
     assert.deepEqual(turn.launched.argv, row.argv);
+    const started = turn.events.find((event) => event.type === 'turn.started');
+    assert.equal(started?.effort, row.badge ?? 'default', JSON.stringify(row));
     assert.deepEqual(JSON.parse(turn.launched.input[0] ?? ''), {
       type: 'user',
       message: { role: 'user', content: [{ type: 'text', text: row.text }] },
@@ -481,7 +515,7 @@ test('a new session gets the framing and a saved one is resumed with the prompt 
   }
 });
 
-test('an unknown event is reported once, routine system events are not, and neither ends the turn', async (t) => {
+test('an unknown event goes to the turn trace and never the thread, routine system events go nowhere, and neither ends the turn', async (t) => {
   const mystery = { type: 'mystery_event', session_id: fresh, detail: 'new in a later build' };
   const system = (subtype: string, fields: object) => ({
     out: { type: 'system', subtype, session_id: fresh, ...fields },
@@ -502,13 +536,18 @@ test('an unknown event is reported once, routine system events are not, and neit
   ]);
   t.after(turn.cleanup);
   const result = await turn.handle.result;
-  const notices = turn.events.filter((event) => event.type === 'provider.notice');
   assert.deepEqual(
-    notices.map((notice) => notice.message),
-    [
-      'The client sent a mystery_event event, which CrewKite does not show.',
-      'The client sent a system/announcement event, which CrewKite does not show.',
-    ],
+    turn.events.filter((event) => event.type === 'provider.notice'),
+    [],
+  );
+  assert.deepEqual(
+    readFileSync(join(turn.work, 'trace.jsonl'), 'utf8')
+      .trimEnd()
+      .split('\n')
+      .map((line) => JSON.parse(line)),
+    ['mystery_event', 'mystery_event', 'system/compact_boundary', 'system/announcement'].map(
+      (method) => ({ ms: 0, method }),
+    ),
   );
   assert.equal(result.stopReason, 'done');
   assert.equal(result.assistantText, 'Still here.');

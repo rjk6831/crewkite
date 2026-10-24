@@ -31,8 +31,8 @@ import type { AcpClientIdentity } from './acp/profile.ts';
 
 // One chat turn on the published ACP agent. The connection, process ownership and stop
 // handling come from acp/client.ts. This file translates between the protocol and AgentEvents.
-// Everything read from the agent is parsed tolerantly: an unknown field is ignored, and an
-// unknown update is reported once and never ends the turn.
+// Everything read from the agent is parsed tolerantly: an unknown field is ignored, an unknown
+// update or method goes only to the frame trace, and neither ends the turn.
 
 type Select = { optionId: string; supported: readonly string[] };
 
@@ -58,9 +58,7 @@ type Ending = { stopReason: ChatTurnResult['stopReason']; failure: ChatFailure |
 const maximumTurnMs = chatAcpLimits.maxTimeoutMs;
 const outputLimitBytes = 64 * 1024;
 const pieceLimit = 60_000;
-const traceLineLimit = 5000;
-// The last 256 bytes stay free for the line that says the trace stopped.
-const traceByteLimit = 2 * 1024 * 1024 - 256;
+const traceLimits = { lines: 5000, bytes: 2 * 1024 * 1024 };
 const noJournal: AcpLifecycle = { beforePhase() {}, owned() {}, quiescent() {} };
 
 const optionalText = z.string().nullish().catch(undefined);
@@ -153,14 +151,6 @@ const optionKinds = new Map<string, { kind: ChatPermissionOption['kind']; label:
 ]);
 const optionOrder = [...optionKinds.keys()];
 
-// Housekeeping updates that carry nothing to show.
-const quietUpdates = new Set([
-  'user_message_chunk',
-  'available_commands_update',
-  'current_mode_update',
-  'config_option_update',
-  'session_info_update',
-]);
 const limitWords = /quota|rate.?limit|exhaust|too many requests|\b429\b/i;
 const limitSignals = new Set(['quota', 'rate-limit', 'resource-exhausted']);
 const exitSites = new Set([
@@ -443,6 +433,59 @@ type Call = {
   truncated: boolean;
 };
 
+/**
+ * A bounded JSON lines file in a turn's private work folder, one line per entry with the
+ * milliseconds since the trace was made. Writes before open() and after the limit are dropped.
+ * O_NOFOLLOW keeps a link at the path from moving the file. A trace that cannot be written is
+ * dropped and the turn goes on.
+ */
+export function frameTrace(now: () => number, limits: { lines: number; bytes: number }) {
+  const started = now();
+  let opened = false;
+  let file: number | null = null;
+  let lines = 0;
+  let bytes = 0;
+  const close = () => {
+    if (file === null) return;
+    try {
+      closeSync(file);
+    } catch {}
+    file = null;
+  };
+  return {
+    /** Creates the file once. A second call leaves the trace as it is. */
+    open(path: string) {
+      if (opened) return;
+      opened = true;
+      try {
+        file = openSync(
+          path,
+          constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
+          0o600,
+        );
+      } catch {}
+    },
+    write(entry: () => Record<string, unknown>) {
+      if (file === null) return;
+      try {
+        const ms = Math.round(now() - started);
+        let line = `${JSON.stringify({ ms, ...entry() })}\n`;
+        // The last 256 bytes stay free for the line that says the trace stopped.
+        const full = lines >= limits.lines || bytes + Buffer.byteLength(line) > limits.bytes - 256;
+        if (full)
+          line = `${JSON.stringify({ ms, truncated: true, note: `The trace stops here at ${limits.lines} lines or ${limits.bytes / 1024} KiB.` })}\n`;
+        writeSync(file, line);
+        lines++;
+        bytes += Buffer.byteLength(line);
+        if (full) close();
+      } catch {
+        close();
+      }
+    },
+    close,
+  };
+}
+
 export function googleChatAdapter(deps: {
   launch: (request: ChatTurnRequest) => GoogleChatLaunch;
 }): ChatAdapter {
@@ -520,36 +563,9 @@ export function googleChatAdapter(deps: {
       >();
 
       // One line of metadata per frame goes to the private work folder, so a client whose framing
-      // does not match this file can be diagnosed from a real run. A trace that cannot be
-      // written is dropped and the turn goes on.
-      const started = now();
-      let traceFile: number | null = null;
-      let traceLines = 0;
-      let traceBytes = 0;
-      function closeTrace() {
-        if (traceFile === null) return;
-        try {
-          closeSync(traceFile);
-        } catch {}
-        traceFile = null;
-      }
-      function trace(entry: () => Record<string, unknown>) {
-        if (traceFile === null) return;
-        try {
-          const ms = Math.round(now() - started);
-          let line = `${JSON.stringify({ ms, ...entry() })}\n`;
-          const full =
-            traceLines >= traceLineLimit || traceBytes + Buffer.byteLength(line) > traceByteLimit;
-          if (full)
-            line = `${JSON.stringify({ ms, truncated: true, note: 'The trace stops here at 5000 lines or 2 MB.' })}\n`;
-          writeSync(traceFile, line);
-          traceLines++;
-          traceBytes += Buffer.byteLength(line);
-          if (full) closeTrace();
-        } catch {
-          closeTrace();
-        }
-      }
+      // does not match this file can be diagnosed from a real run.
+      const frames = frameTrace(now, traceLimits);
+      const trace = frames.write;
       function traceFrame(method: string, params: Record<string, unknown>, id?: RpcId) {
         trace(() => {
           const update = method === 'session/update';
@@ -581,9 +597,11 @@ export function googleChatAdapter(deps: {
 
       const notice = (message: string, level: 'info' | 'warning' = 'info') =>
         send({ type: 'provider.notice', turnId, level, message: clip(message, 4000) });
-      const noticeOnce = (key: string, message: string) => {
-        if (noticed.has(key)) return;
-        noticed.add(key);
+      // One notice per turn for a frame CrewKite acts on and could not read. Every frame is in
+      // the trace already, so later ones add nothing the trace lacks.
+      const unreadable = (message: string) => {
+        if (noticed.has('unreadable')) return;
+        noticed.add('unreadable');
         notice(message);
       };
 
@@ -765,10 +783,7 @@ export function googleChatAdapter(deps: {
       function tool(raw: Record<string, unknown>, announced: boolean) {
         const parsed = toolUpdate.safeParse(raw);
         if (!parsed.success)
-          return noticeOnce(
-            'tool',
-            'The Google client sent a tool update this app could not read.',
-          );
+          return unreadable('The Google client sent a tool update this app could not read.');
         let update = parsed.data;
         const ends = update.status === 'completed' || update.status === 'failed';
         if (!announced && ends && !calls.has(update.toolCallId) && !update.title?.trim()) {
@@ -795,7 +810,7 @@ export function googleChatAdapter(deps: {
       function plan(raw: Record<string, unknown>) {
         const parsed = planUpdate.safeParse(raw);
         if (!parsed.success)
-          return noticeOnce('plan', 'The Google client sent a plan this app could not read.');
+          return unreadable('The Google client sent a plan this app could not read.');
         const marks: Record<string, string> = { completed: '[x]', in_progress: '[~]' };
         const body = parsed.data.entries
           .map((entry) => `- ${marks[entry.status ?? ''] ?? '[ ]'} ${entry.content}`)
@@ -819,8 +834,7 @@ export function googleChatAdapter(deps: {
       function update(params: Record<string, unknown>) {
         if (params.sessionId !== sessionId) return;
         const kind = updateKind.safeParse(params.update);
-        if (!kind.success)
-          return noticeOnce('session/update', 'The Google client sent an update without a kind.');
+        if (!kind.success) return unreadable('The Google client sent an update without a kind.');
         const raw = params.update as Record<string, unknown>;
         switch (kind.data.sessionUpdate) {
           case 'agent_message_chunk':
@@ -833,8 +847,7 @@ export function googleChatAdapter(deps: {
             if (block?.type === 'text' && message && cancelled) afterStop += block.text ?? '';
             else if (block?.type === 'text') chunk(message ? 'text' : 'thinking', block.text ?? '');
             else if (block)
-              noticeOnce(
-                `content:${block.type}`,
+              unreadable(
                 `The Google client sent ${clip(block.type, 40)} content this app does not show.`,
               );
             return;
@@ -848,12 +861,6 @@ export function googleChatAdapter(deps: {
           case 'usage_update':
             settle();
             return context(raw);
-          default:
-            if (!quietUpdates.has(kind.data.sessionUpdate))
-              noticeOnce(
-                `update:${kind.data.sessionUpdate}`,
-                `The Google client sent an update this app does not show: ${clip(kind.data.sessionUpdate, 60)}.`,
-              );
         }
       }
 
@@ -862,13 +869,7 @@ export function googleChatAdapter(deps: {
       function answer(id: RpcId, method: string, params: Record<string, unknown>) {
         const live = connection;
         if (!live) return;
-        if (method !== 'session/request_permission') {
-          noticeOnce(
-            `request:${method}`,
-            `The Google client asked for something this app does not provide: ${clip(method, 80)}.`,
-          );
-          return live.respond(id, {});
-        }
+        if (method !== 'session/request_permission') return live.respond(id, {});
         const parsed = permissionRequest.safeParse(params);
         if (
           !parsed.success ||
@@ -877,10 +878,7 @@ export function googleChatAdapter(deps: {
           parsed.data.sessionId !== sessionId
         ) {
           if (phase === 'turn' && !cancelled)
-            noticeOnce(
-              'permission',
-              'The Google client sent a permission request this app could not read.',
-            );
+            unreadable('The Google client sent a permission request this app could not read.');
           return reply(live, id, declined);
         }
         const ranked: { option: ChatPermissionOption; rank: number }[] = [];
@@ -903,10 +901,7 @@ export function googleChatAdapter(deps: {
           .slice(0, 6)
           .map((r) => r.option);
         if (!options.length) {
-          noticeOnce(
-            'permission',
-            'The Google client sent a permission request with no usable choices.',
-          );
+          unreadable('The Google client sent a permission request with no usable choices.');
           return reply(live, id, declined);
         }
         const call = upsert(parsed.data.toolCall);
@@ -1006,11 +1001,7 @@ export function googleChatAdapter(deps: {
             // A replayed conversation can run to thousands of frames and would fill the trace
             // before the turn starts.
             if (phase !== 'replay') traceFrame(method, params);
-            if (method !== 'session/update')
-              return noticeOnce(
-                `method:${method}`,
-                `The Google client sent a message this app does not use: ${clip(method, 80)}.`,
-              );
+            if (method !== 'session/update') return;
             if (phase === 'setup') {
               if (buffered.length < 64) buffered.push(params);
             } else if (phase === 'turn') update(params);
@@ -1176,13 +1167,7 @@ export function googleChatAdapter(deps: {
           if (running.group > 0) groups.push(running.group);
           // startAcpProcess has checked that the folder is private and owned, and no frame is
           // read before this line runs. O_NOFOLLOW keeps a link there from moving the trace.
-          try {
-            traceFile = openSync(
-              join(request.work.directory, 'acp-trace.jsonl'),
-              constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
-              0o600,
-            );
-          } catch {}
+          frames.open(join(request.work.directory, 'acp-trace.jsonl'));
         } catch (error) {
           // The client refuses a changed executable or an unsafe folder with a plain Error.
           startFailure =
@@ -1221,12 +1206,16 @@ export function googleChatAdapter(deps: {
         let ending: Ending;
         try {
           await Promise.resolve();
+          // The badge names the level the turn runs at. A level the client does not offer, or a
+          // launch with no thought-level choice, leaves the client at its default.
+          const { effort } = request.selection;
+          const offered = launch?.configuration?.thoughtLevel?.supported.includes(effort);
           send({
             type: 'turn.started',
             turnId,
             family: 'google',
             model: request.selection.model,
-            effort: request.selection.effort,
+            effort: offered ? effort : 'default',
             role: request.role,
           });
           const failure = early ?? startFailure;
@@ -1248,7 +1237,7 @@ export function googleChatAdapter(deps: {
         closeTools();
         send({ type: 'turn.completed', turnId, ...ending });
         closed = true;
-        closeTrace();
+        frames.close();
         const session: ChatSession | null = sessionId
           ? {
               family: 'google',
