@@ -2,7 +2,6 @@ import type {
   Artifact,
   Command,
   CommandResult,
-  ConversationContextPick,
   DesktopNotice,
   Event,
   ProjectPage,
@@ -22,13 +21,6 @@ export type DesktopCommand = Command extends infer Item
     ? Omit<Item, 'protocol' | 'key' | 'actor'>
     : never
   : never;
-export type ConversationContextRequest = {
-  projectId: string;
-  base: string;
-  mode: ConversationContextPick['kind'];
-};
-export type ConversationContextReceipt = { receiptId: string; projectId: string; base: string };
-export type ConversationContextCapture = { receiptId: string; result: CommandResult | null };
 export type ConnectionState = 'connecting' | 'connected' | 'offline';
 export interface DesktopSource {
   getSnapshot(scope?: SnapshotScope): Promise<Snapshot>;
@@ -46,10 +38,6 @@ export interface DesktopSource {
   pickProject?(): Promise<CommandResult | null>;
   reconnect?(): Promise<void>;
   retryCommand?(expected?: DesktopCommand): Promise<CommandResult | null>;
-  pickConversationContext?(
-    input: ConversationContextRequest,
-  ): Promise<ConversationContextCapture | null>;
-  retryConversationContext?(input: ConversationContextReceipt): Promise<ConversationContextCapture>;
   onNotice?(listener: (notice: DesktopNotice) => void): () => void;
 }
 

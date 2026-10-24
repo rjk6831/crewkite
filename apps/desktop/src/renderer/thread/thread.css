@@ -1,0 +1,1400 @@
+/* Thread view. Colors come from the shared tokens in style.css, so both themes work unchanged. */
+
+.workspace-body.is-thread > :is(.topbar, .statusbar) {
+  display: none;
+}
+
+.thread {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+.th-main {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.th-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.th-muted {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.th-error {
+  color: var(--red);
+  font-size: 12px;
+}
+.is-add {
+  color: var(--green);
+}
+.is-del {
+  color: var(--red);
+}
+.is-hunk {
+  color: var(--blue);
+}
+
+/* Title line */
+.th-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 46px;
+  padding: 0 14px 0 24px;
+  flex-shrink: 0;
+}
+.th-title {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.th-project {
+  color: var(--text-dim);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.th-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.th-bar-toggle {
+  margin-left: auto;
+}
+.th-project-select {
+  position: relative;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-dim);
+}
+.th-project-select select {
+  width: auto;
+  padding: 3px 22px 3px 6px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+/* Messages */
+.th-scroll-frame {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+.th-scroll {
+  height: 100%;
+  padding: 8px 24px 28px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.th-column {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  max-width: 760px;
+  margin: 0 auto;
+}
+.th-blank {
+  display: grid;
+  place-items: center;
+  height: 100%;
+  padding: 24px 24px 56px;
+  overflow-y: auto;
+}
+.th-empty {
+  display: grid;
+  gap: 6px;
+  justify-items: center;
+  text-align: center;
+}
+.th-empty > p:first-child {
+  font-size: 18px;
+  font-weight: 500;
+  letter-spacing: -0.3px;
+}
+.th-examples {
+  display: grid;
+  gap: 8px;
+  justify-items: center;
+  margin: 16px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.th-examples button {
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.4;
+}
+.th-examples button:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+.th-button {
+  margin-top: 8px;
+  padding: 7px 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  color: var(--text);
+  font-size: 12px;
+}
+.th-button:hover {
+  background: var(--surface-hover);
+}
+.th-row {
+  min-width: 0;
+}
+.th-user {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  align-self: flex-end;
+  max-width: 82%;
+}
+.th-user.is-pending {
+  opacity: 0.6;
+}
+.th-bubble {
+  padding: 9px 14px;
+  border: 1px solid var(--border);
+  border-radius: 16px 16px 4px;
+  background: var(--surface-raised);
+  font-size: 14px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.th-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.th-chips li {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 220px;
+  padding: 3px 8px;
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.th-chips button {
+  display: inline-grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+}
+.th-assistant {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 14px;
+}
+.th-turn-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.th-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--family-fill, currentColor);
+  flex-shrink: 0;
+}
+.th-role {
+  padding: 1px 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  color: var(--text-muted);
+}
+.th-notice {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.th-notice.is-warning {
+  color: var(--amber);
+}
+.th-stopped {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.th-working {
+  display: inline-flex;
+  gap: 4px;
+  padding: 4px 0;
+}
+.th-working i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  animation: th-pulse 1.2s ease-in-out infinite;
+}
+.th-working i:nth-child(2) {
+  animation-delay: 0.15s;
+}
+.th-working i:nth-child(3) {
+  animation-delay: 0.3s;
+}
+.th-system {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.th-system::before,
+.th-system::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+.th-system span {
+  max-width: 78%;
+  text-align: center;
+}
+.th-jump {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface-raised);
+  box-shadow: var(--shadow);
+  color: var(--text);
+  font-size: 12px;
+  transform: translateX(-50%);
+}
+
+/* Markdown */
+.th-md {
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.th-md > * + * {
+  margin-top: 0.75em;
+}
+.th-md :is(h2, h3, h4, h5, h6) {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.1px;
+  line-height: 1.4;
+}
+.th-md h2 {
+  font-size: 17px;
+}
+.th-md :is(ul, ol) {
+  margin: 0;
+  padding-left: 1.4em;
+}
+.th-md li + li {
+  margin-top: 0.25em;
+}
+.th-md blockquote {
+  margin: 0;
+  padding-left: 12px;
+  border-left: 2px solid var(--border-strong);
+  color: var(--text-muted);
+}
+.th-md :not(pre) > code {
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--surface-raised);
+  font-size: 12.5px;
+}
+.th-md-url {
+  color: var(--text-dim);
+  font-family: "JetBrains Mono", monospace;
+  font-size: 12px;
+}
+.th-code {
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  overflow: hidden;
+}
+.th-code figcaption {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 6px 4px 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+}
+.th-code button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.th-code button:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+.th-code pre {
+  margin: 0;
+  padding: 10px 12px;
+  overflow-x: auto;
+  line-height: 1.55;
+}
+.is-streaming > .th-md > :last-child::after {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 14px;
+  margin-left: 3px;
+  background: var(--text-muted);
+  vertical-align: -2px;
+  animation: th-blink 1s steps(2, start) infinite;
+}
+
+/* Cards */
+.th-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  overflow: hidden;
+  font-size: 12px;
+}
+.th-card > button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  text-align: left;
+}
+.th-card > button:disabled {
+  cursor: default;
+  opacity: 1;
+}
+.th-card > button:not(:disabled):hover {
+  background: var(--surface-hover);
+}
+/* The card clips its children, so the default outside ring would vanish. Draw it inside. */
+.th-card > button:focus-visible {
+  outline-offset: -2px;
+}
+.th-card-title {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.th-tool .th-card-title {
+  flex: 1;
+  color: var(--text);
+  font-family: "JetBrains Mono", monospace;
+  font-size: 12px;
+}
+.th-preview {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-dim);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.th-chevron {
+  margin-left: auto;
+  color: var(--text-dim);
+  transition: transform 140ms ease-out;
+}
+[aria-expanded="true"] > .th-chevron {
+  transform: rotate(90deg);
+}
+.th-preview + .th-chevron {
+  margin-left: 0;
+}
+.th-thinking.is-live > button > svg:first-child {
+  animation: th-pulse 1.4s ease-in-out infinite;
+}
+.th-thinking-body {
+  max-height: 240px;
+  padding: 2px 12px 10px 32px;
+  overflow-y: auto;
+  color: var(--text-muted);
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+.th-tool-status {
+  display: inline-grid;
+  place-items: center;
+}
+.th-tool.is-running .th-tool-status {
+  color: var(--blue);
+}
+.th-tool.is-ok .th-tool-status {
+  color: var(--green);
+}
+.th-tool.is-error .th-tool-status {
+  color: var(--red);
+}
+.th-tool.is-denied .th-tool-status {
+  color: var(--amber);
+}
+.th-spin {
+  animation: spin 1.2s linear infinite;
+}
+.th-diff,
+.th-patch {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 6px 0;
+  border-top: 1px solid var(--border);
+  background: var(--background);
+  line-height: 1.55;
+  overflow-x: auto;
+}
+.th-patch {
+  max-height: 360px;
+  overflow-y: auto;
+  border-radius: 0 0 8px 8px;
+}
+.th-diff span,
+.th-patch span {
+  display: block;
+  min-width: max-content;
+  padding: 0 10px;
+  white-space: pre;
+}
+:is(.th-diff, .th-patch) .is-add {
+  background: color-mix(in srgb, var(--green) 11%, transparent);
+  color: var(--diff-add-text);
+}
+:is(.th-diff, .th-patch) .is-del {
+  background: color-mix(in srgb, var(--red) 11%, transparent);
+  color: var(--diff-del-text);
+}
+.th-diff-more {
+  color: var(--text-dim);
+}
+.th-tool-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 10px;
+  border-top: 1px solid var(--border);
+  color: var(--text-dim);
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+}
+.th-tool-foot button {
+  padding: 3px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent);
+  font-family: Inter, sans-serif;
+  font-size: 11px;
+}
+.th-tool-foot button:hover {
+  background: var(--surface-hover);
+}
+.th-tool-body {
+  display: grid;
+  gap: 6px;
+  padding: 0 10px 10px;
+}
+.th-tool-body pre,
+.th-permission pre {
+  max-height: 200px;
+  margin: 0;
+  padding: 8px 10px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--background);
+  color: var(--text-muted);
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+/* A folded run of reads and searches. The summary reads as a sentence, the cards inside keep paths. */
+.th-run {
+  display: grid;
+  gap: 6px;
+}
+.th-tool .th-run-title {
+  color: var(--text-muted);
+  font-family: inherit;
+}
+.th-run-list {
+  display: grid;
+  gap: 6px;
+  margin-left: 9px;
+  padding-left: 11px;
+  border-left: 1px solid var(--border);
+}
+.th-permission {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border-color: color-mix(in srgb, var(--amber) 40%, var(--border));
+}
+.th-resolved {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.th-permission-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: var(--amber);
+}
+.th-permission-head p {
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.th-permission.is-resolved {
+  border-color: var(--border);
+}
+.th-permission.is-resolved .th-permission-head {
+  color: var(--text-dim);
+}
+.th-permission-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.th-option {
+  padding: 6px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 500;
+}
+.th-option:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+.th-option.is-allow-once {
+  border-color: transparent;
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+.th-option.is-deny {
+  color: var(--red);
+}
+.th-failure {
+  display: flex;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--red) 35%, var(--border));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--red) 6%, transparent);
+  font-size: 13px;
+}
+.th-failure > svg {
+  margin-top: 2px;
+  color: var(--red);
+  flex-shrink: 0;
+}
+.th-failure > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.th-failure-message {
+  font-weight: 500;
+}
+.th-failure details {
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.th-failure summary {
+  cursor: pointer;
+}
+.th-failure pre {
+  margin: 6px 0;
+  padding: 8px 10px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--background);
+  white-space: pre-wrap;
+}
+/* The client's last output lines. Twelve lines show, the rest scroll. */
+.th-failure .th-failure-detail {
+  max-height: calc(12lh + 18px);
+  color: var(--text-dim);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+/* Composer */
+.th-composer-wrap {
+  flex-shrink: 0;
+  padding: 0 24px 14px;
+}
+.th-composer {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 10px 10px 8px 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: 18px;
+  background: var(--surface);
+  box-shadow: 0 2px 14px #0002;
+}
+.th-composer:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border-strong));
+}
+.th-composer textarea {
+  display: block;
+  width: 100%;
+  max-height: 200px;
+  padding: 4px 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  font-size: 14px;
+  line-height: 1.55;
+  outline: none;
+  resize: none;
+}
+.th-composer .th-chips {
+  margin-bottom: 8px;
+}
+.th-attach-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 8px;
+}
+/* The role row sits under the text, so its spacing runs the other way. */
+#th-role-row {
+  margin: 8px 0 0;
+}
+.th-attach-row input {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+.th-attach-row > button {
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background-color: var(--surface-raised);
+  font-size: 12px;
+}
+.th-attach-row > button:hover:not(:disabled) {
+  background-color: var(--surface-hover);
+}
+.th-composer-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+}
+.th-bar-end {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+.th-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+.th-icon:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+.th-icon[aria-pressed="true"] {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+.th-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
+  padding: 0 8px 0 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.th-pill:hover,
+.th-pill[aria-expanded="true"] {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+.th-send {
+  display: inline-grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  margin-left: 4px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--accent-ink);
+  flex-shrink: 0;
+}
+.th-send.is-stop {
+  background: var(--text);
+  color: var(--background);
+}
+.th-note {
+  max-width: 760px;
+  margin: 6px auto 0;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.th-picker {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.th-effort select {
+  width: auto;
+  height: 30px;
+  padding: 0 6px 0 8px;
+  border: 0;
+  border-radius: 8px;
+  background-color: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.th-effort select:hover {
+  background-color: var(--surface-hover);
+}
+.th-menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: 20;
+  width: 330px;
+  max-height: min(70vh, 460px);
+  padding: 6px;
+  overflow-y: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  background: var(--surface-raised);
+  box-shadow: var(--shadow);
+}
+.th-menu-empty {
+  padding: 8px 10px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.th-menu-group + .th-menu-group {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
+.th-menu-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+.th-menu-head span:last-child {
+  margin-left: auto;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+/* A family that is not connected dims its name and keeps the reason readable. */
+.th-menu-head.is-off > :not(:last-child) {
+  opacity: 0.55;
+}
+.th-menu button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px 7px 25px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  font-size: 12.5px;
+  text-align: left;
+}
+.th-menu button:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+.th-menu button em {
+  margin-left: auto;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  font-style: normal;
+}
+.th-menu .th-menu-legacy {
+  justify-content: flex-start;
+  gap: 5px;
+  padding-left: 21px;
+  color: var(--text-dim);
+  font-size: 11.5px;
+}
+.th-menu-legacy .th-chevron {
+  margin-left: 0;
+}
+.th-menu .th-menu-foot {
+  gap: 8px;
+  justify-content: flex-start;
+  margin-top: 4px;
+  padding-left: 10px;
+  border-top: 1px solid var(--border);
+  border-radius: 0 0 7px 7px;
+  color: var(--text-muted);
+}
+
+/* The picker inside the role row takes the same height as the field and buttons beside it. */
+.th-attach-row .th-picker {
+  flex: 1;
+  min-width: 0;
+  gap: 6px;
+}
+.th-attach-row .th-picker > .th-pill,
+.th-attach-row .th-effort select {
+  height: 32px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background-color: var(--surface-raised);
+  font-size: 12px;
+}
+.th-attach-row .th-picker > .th-pill {
+  flex: 1;
+  min-width: 0;
+  padding: 0 10px;
+  color: var(--text);
+}
+.th-attach-row .th-picker > .th-pill > svg:last-child {
+  margin-left: auto;
+}
+.th-attach-row .th-picker > .th-pill:hover,
+.th-attach-row .th-picker > .th-pill[aria-expanded="true"],
+.th-attach-row .th-effort select:hover {
+  background-color: var(--surface-hover);
+}
+.th-attach-row .th-effort select {
+  padding: 0 8px;
+  color: var(--text-muted);
+}
+
+/* Inspector. The component sets the width inline because it holds the chosen value and its limits. */
+.th-inspector {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-left: 1px solid var(--border);
+  background: var(--sidebar);
+  flex-shrink: 0;
+}
+.th-resize {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 2;
+  width: 6px;
+  cursor: col-resize;
+  touch-action: none;
+  user-select: none;
+}
+.th-resize:hover,
+.th-resize.is-dragging {
+  background: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+.th-resize:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.th-inspector-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 46px;
+  padding: 0 8px 0 10px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.th-inspector-head [role="tablist"] {
+  display: flex;
+  gap: 2px;
+}
+.th-inspector-head [role="tab"] {
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.th-inspector-head [role="tab"]:hover,
+.th-inspector-head [role="tab"].active {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+.th-inspector-body {
+  flex: 1;
+  min-height: 0;
+  padding: 14px;
+  overflow-y: auto;
+}
+.th-changes {
+  display: grid;
+  gap: 10px;
+}
+.th-changes ul {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.th-changes > ul > li {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  overflow: hidden;
+}
+.th-changes > ul > li > button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  background: transparent;
+  font-size: 12px;
+  text-align: left;
+}
+.th-changes > ul > li > button:hover {
+  background: var(--surface-hover);
+}
+.th-changes > ul > li > button:focus-visible {
+  outline-offset: -2px;
+}
+.th-changes > ul > li > button .th-chevron {
+  margin-left: 0;
+}
+.th-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.th-facts {
+  display: grid;
+  gap: 16px;
+}
+.th-facts dl {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 8px 10px;
+  margin: 0;
+  font-size: 12px;
+}
+.th-facts dt {
+  color: var(--text-dim);
+}
+.th-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.th-facts ul {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.th-facts li code {
+  display: block;
+  color: var(--text-dim);
+}
+.th-toggle {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+.th-toggle input {
+  width: auto;
+}
+.th-facts select:disabled {
+  opacity: 0.55;
+}
+.th-session {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.th-handoff {
+  display: grid;
+  gap: 10px;
+}
+/* Turns hang under the message they answered, with one thin guide per group. */
+.th-turns {
+  display: grid;
+  gap: 8px;
+  font-size: 12px;
+}
+.th-turns h3 {
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 400;
+}
+.th-turns ol {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.th-turns > ol {
+  gap: 12px;
+}
+.th-turn-ask {
+  color: var(--text);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.th-turns .th-turn-list {
+  gap: 8px;
+  margin: 6px 0 0 7px;
+  padding-left: 11px;
+  border-left: 1px solid var(--border);
+}
+.th-turn {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.th-turn-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.th-turn-model {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.th-turn-state {
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.th-turn-state:is(.is-running, .is-waiting-permission) {
+  color: var(--blue);
+}
+.th-turn-state.is-failed {
+  color: var(--red);
+}
+.th-turn-state.is-limit {
+  color: var(--amber);
+}
+.th-turn-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 6px;
+  padding-left: 22px;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.th-turn-meta > * {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.th-turn-meta > * + *::before {
+  content: "·";
+  margin-right: 2px;
+}
+
+/* Left rail allowance summary */
+.rail-usage {
+  display: grid;
+  gap: 10px;
+  margin: 0 -12px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.rail-usage-row {
+  display: grid;
+  gap: 3px;
+  font-size: 11px;
+}
+.rail-usage-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+}
+.rail-usage-label .family-mark {
+  width: 14px;
+  height: 14px;
+  font-size: 8.5px;
+}
+/* A bar and its figure on one line. Two lines when the family reports five-hour and weekly. */
+.rail-usage-meter {
+  display: grid;
+  grid-template-columns: 1fr 5.5em;
+  align-items: center;
+  gap: 8px;
+}
+.rail-usage-value {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+.rail-usage-bar {
+  height: 3px;
+  border-radius: 2px;
+  background: var(--border);
+  overflow: hidden;
+}
+.rail-usage-bar span {
+  display: block;
+  height: 100%;
+  background: var(--family-fill, var(--family, var(--accent)));
+}
+/* Local has no allowance to spend, so its bar is always full, with the infinity mark on top. */
+.rail-usage-unlimited {
+  position: relative;
+  display: grid;
+  place-items: center;
+  height: 12px;
+}
+/* The bar is the Local panel of the kite, gold, like the mark beside it. The glyph takes the
+   text tint so it reads in both themes. */
+.rail-usage-unlimited::before {
+  content: "";
+  position: absolute;
+  inset: 4.5px 0;
+  border-radius: 2px;
+  background: var(--family-local-fill);
+}
+.rail-usage-unlimited span {
+  position: relative;
+  padding: 0 4px;
+  background: var(--sidebar);
+  color: var(--family-local);
+  font-size: 13px;
+  line-height: 12px;
+}
+.rail-usage-reset {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text-dim);
+}
+.rail-usage-connect {
+  justify-self: start;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.rail-usage-connect:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* Inspector Usage tab: one Refresh per provider above the gauges. */
+.th-usage-refresh {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 12px;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+}
+.th-usage-refresh-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 2px 8px;
+}
+.th-usage-refresh small {
+  grid-column: 1 / -1;
+  color: var(--text-dim);
+}
+.navigation.is-collapsed .rail-usage {
+  display: none;
+}
+
+@keyframes th-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+@keyframes th-blink {
+  to {
+    visibility: hidden;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .th-spin,
+  .th-working i,
+  .th-thinking.is-live > button > svg:first-child,
+  .is-streaming > .th-md > :last-child::after {
+    animation: none;
+  }
+}
+
+/* Queued messages sit under the message list and line up with the composer. */
+.th-queued {
+  flex-shrink: 0;
+  padding: 0 24px 8px;
+}
+.th-queued-note {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 0 4px 6px;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.th-queued ol {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 760px;
+  max-height: 30vh;
+  margin: 0 auto;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+.th-queued-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 34px;
+  padding: 3px 4px 3px 12px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 10px;
+  background: var(--surface);
+  font-size: 12px;
+}
+.th-queued-label {
+  flex-shrink: 0;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.th-queued-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.th-queued-remove {
+  flex-shrink: 0;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background-color: var(--surface-raised);
+  font-size: 12px;
+}
+.th-queued-remove:hover:not(:disabled) {
+  background-color: var(--surface-hover);
+}
+
+/* The role actions get a row under the text box. At its 760 px cap the bar cannot hold them beside
+   the model menu, the gauge, Stop and Send. Below 380 px the last one wraps in the same style. */
+.th-roles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}

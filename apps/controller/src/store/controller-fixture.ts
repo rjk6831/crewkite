@@ -7,8 +7,6 @@ import type { TestContext } from 'node:test';
 import {
   AnthropicNativeProfileSchema,
   type Approval,
-  ArtifactSchema,
-  type Attempt,
   GoogleNativeProfileSchema,
   NativeRepositoryProfileSchema,
   ProjectSchema,
@@ -17,7 +15,6 @@ import {
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { createDemoFixtures, createTestClock, createTestIds } from '@crewkite/testkit';
 import { createSyntheticRepository, writeChallengeSolution } from '@crewkite/testkit/repository';
-import { ArtifactFiles } from '../artifacts/index.ts';
 import {
   Controller,
   type ControllerOptions,
@@ -287,13 +284,7 @@ async function nativeSetup(
               : pending?.phase === 'metadata-preparation'
                 ? 'prepare'
                 : 'task';
-      if (
-        mode === 'combined-unknown' &&
-        phase === 'features' &&
-        context.controller.store.runPurpose(
-          context.controller.store.get<Attempt>('attempt', pending?.attempt_id ?? '')?.runId ?? '',
-        ) !== 'conversation'
-      )
+      if (mode === 'combined-unknown' && phase === 'features')
         throw Error('The fixture could not spawn its admitted phase.');
       let transcript = fixture;
       if (mode.includes('checked')) {
@@ -334,7 +325,7 @@ async function nativeSetup(
         'const edit = {version:1,attemptId:message.params.outputSchema.properties.attemptId.const,path,baseHash:message.params.outputSchema.properties.baseHash.const,content:content(path)};';
       transcript = transcript.replace(
         replacement,
-        `const edit = message.params.outputSchema.properties.message ? {version:1,bindingHash:message.params.outputSchema.properties.bindingHash.const,message:'The scoped request is retained.',questions:[],proposal:{summary:'Keep the bounded export.',criteria:JSON.parse(message.params.input[0].text.split('\\n').at(-1)).context.criteria,slices:[{id:'target',title:'Change the bounded target',role:'coder',scope:[JSON.parse(message.params.input[0].text.split('\\n').at(-1)).context.title.endsWith('a')?'src/a.mjs':'src/b.mjs'],dependsOn:[]}],checks:[]}} : message.params.outputSchema.properties.bindingHash ? {version:1,bindingHash:message.params.outputSchema.properties.bindingHash.const,methodId:message.params.outputSchema.properties.methodId.const,cycle:1,outcome:${JSON.stringify(mode === 'checked-blocked' ? 'blocked' : 'passed')},findings:[],summary:'The bounded review completed.'} : ${replacement.slice('const edit = '.length)}`,
+        `const edit = message.params.outputSchema.properties.bindingHash ? {version:1,bindingHash:message.params.outputSchema.properties.bindingHash.const,methodId:message.params.outputSchema.properties.methodId.const,cycle:1,outcome:${JSON.stringify(mode === 'checked-blocked' ? 'blocked' : 'passed')},findings:[],summary:'The bounded review completed.'} : ${replacement.slice('const edit = '.length)}`,
       );
       const repositoryWriter =
         repository &&
@@ -465,7 +456,7 @@ async function nativeSetup(
                   .get(attempt.attempt_id);
                 assert(
                   context.controller.store.receipt(
-                    `${context.controller.store.runPurpose(attempt.run_id) === 'conversation' ? 'conversation-submission' : review ? 'native-review-submission' : 'native-submission'}:${attempt.attempt_id}`,
+                    `${review ? 'native-review-submission' : 'native-submission'}:${attempt.attempt_id}`,
                   ),
                 );
               }
@@ -657,46 +648,6 @@ async function nativeSetup(
       return context.controller;
     },
     children,
-    planningTrace: (taskId: string) => {
-      try {
-        const task = context.controller.store.get<{ state: string; next: string | null }>(
-          'task',
-          taskId,
-        );
-        const attempts = context.controller.store
-          .list<Attempt>('attempt')
-          .filter(
-            (attempt) =>
-              context.controller.store.get<{ taskId: string }>('run', attempt.runId)?.taskId ===
-              taskId,
-          )
-          .map((attempt) => {
-            const receipt = context.controller.store.receipt(
-              `conversation-completion:${attempt.id}`,
-            );
-            const artifact = ArtifactSchema.safeParse(receipt?.result.entity);
-            const completion = artifact.success
-              ? JSON.parse(
-                  new ArtifactFiles(join(context.controller.home, 'artifacts'))
-                    .read(artifact.data.hash)
-                    .toString('utf8'),
-                )
-              : null;
-            return {
-              id: attempt.id,
-              state: attempt.state,
-              phases: context.controller.store.nativeProcesses(attempt.id),
-              completion,
-            };
-          });
-        return JSON.stringify({
-          task: task ? { state: task.state, next: task.next } : null,
-          attempts,
-        });
-      } catch {
-        return '{"trace":"unavailable"}';
-      }
-    },
     observe,
     wait: <T>(stage: string, pending: Promise<T>, milliseconds?: number) =>
       nativeWait(

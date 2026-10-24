@@ -2,140 +2,46 @@ import { z } from 'zod';
 
 const clientSha256 = '5262ce9de86243fed0d21edc39b271555d56780d0112e2b194439fe1c6662d37';
 const maximumStdoutBytes = 131_072;
-const label = z
+const name = z
   .string()
+  .min(1)
   .max(128)
   .refine((value) => value.isWellFormed() && !/\p{Cc}/u.test(value));
 const timestamp = z.iso.datetime({ offset: true });
-const zero = z.literal(0);
-const session = z.strictObject({
-  total_cost_usd: zero,
-  total_api_duration_ms: zero,
-  total_duration_ms: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-  total_lines_added: zero,
-  total_lines_removed: zero,
-  model_usage: z.record(z.string(), z.never()),
+// The client adds fields and frames from one weekly build to the next. These schemas hold only
+// what the gauge shows, so anything else the client prints is ignored and never fails a read. A
+// limit entry this schema cannot read is dropped, and the others still reach the gauge.
+const limit = z.object({
+  kind: name,
+  percent: z.number().finite().nonnegative(),
+  resets_at: timestamp.nullish(),
+  scope: z.object({ model: z.object({ display_name: name }).nullish() }).nullish(),
 });
-const scope = z
-  .strictObject({
-    model: z.strictObject({ display_name: label }).nullable().optional(),
-    surface: z.strictObject({ display_name: label }).nullable().optional(),
-  })
-  .nullable()
-  .optional();
-const row = z.strictObject({
-  kind: label,
-  group: label,
-  percent: z.number().finite().min(0).max(100),
-  resets_at: timestamp.nullable(),
-  scope,
-  severity: label,
-  is_active: z.boolean(),
-});
-const extra = z.strictObject({
-  is_enabled: z.boolean(),
-  monthly_limit: z.number().finite().nonnegative().nullable(),
-  used_credits: z.number().finite().nonnegative().nullable(),
-  utilization: z.number().finite().nonnegative().nullable(),
-  currency: label.nullable().optional(),
-});
-const report = z.strictObject({
-  session,
+const report = z.object({
   rate_limits: z
-    .strictObject({
-      limits: z.array(row).max(64).nullable(),
-      extra_usage: extra.nullable().optional(),
+    .object({
+      limits: z.array(z.unknown()).max(64).nullish(),
+      // The switch is a display fact. A change in its shape drops it and keeps the gauge.
+      extra_usage: z.object({ is_enabled: z.boolean() }).nullish().catch(null),
     })
-    .nullable(),
+    .nullish(),
 });
-const zeroUsage = z.strictObject({
-  input_tokens: zero,
-  output_tokens: zero,
-  cache_creation_input_tokens: zero.nullable().optional(),
-  cache_read_input_tokens: zero.nullable().optional(),
-  cache_creation: z
-    .strictObject({ ephemeral_1h_input_tokens: zero, ephemeral_5m_input_tokens: zero })
-    .nullable()
-    .optional(),
-  server_tool_use: z
-    .strictObject({ web_search_requests: zero, web_fetch_requests: zero })
-    .nullable()
-    .optional(),
-  service_tier: label.nullable().optional(),
-  inference_geo: label.nullable().optional(),
-  speed: label.nullable().optional(),
-  iterations: z.array(z.never()).nullable().optional(),
-  output_tokens_details: z.strictObject({ thinking_tokens: zero.optional() }).nullable().optional(),
-  fallback_credit: z.null().optional(),
-});
-const identity = { session_id: z.uuid(), uuid: z.uuid() };
-const init = z.object({
-  ...identity,
-  type: z.literal('system'),
-  subtype: z.literal('init'),
-  tools: z.array(z.never()),
-  mcp_servers: z.array(z.never()),
-  plugins: z.array(z.never()).optional(),
-});
-const localOutput = z.strictObject({
-  ...identity,
-  type: z.literal('system'),
-  subtype: z.literal('local_command_output'),
-  content: z.string().max(maximumStdoutBytes),
-});
-const localReport = z.object({
-  ...identity,
-  type: z.literal('assistant'),
-  parent_tool_use_id: z.null(),
-  local_command_run: z.strictObject({ command: z.literal('usage'), args: z.literal('') }),
-  local_command_outcome: z.never().optional(),
-  usage_report: report,
-  batch_tool_uses: z.array(z.never()).optional(),
-  is_api_error_message: z.literal(false).optional(),
-  api_error: z.never().optional(),
-  api_error_params: z.never().optional(),
-  message: z.object({
-    role: z.literal('assistant'),
-    content: z
-      .array(z.strictObject({ type: z.literal('text'), text: z.string().max(maximumStdoutBytes) }))
-      .max(4),
-    stop_reason: z.literal('end_turn'),
-    usage: zeroUsage.optional(),
-  }),
-});
-const noSubagents = z.strictObject({
-  spawned: zero,
-  requested: z.strictObject({ background: zero, foreground: zero, unset: zero }),
-  started_in_background: zero,
-  by_type: z.record(z.string(), zero),
-  max_depth: zero,
-  spawned_by_subagents: zero,
-  completed: zero,
-  failed: zero,
-  killed: z.strictObject({ parent: zero, user: zero, system: zero }),
-  refused: z.strictObject({ depth_limit: zero, concurrency_limit: zero, budget: zero }),
-});
-const terminal = z.object({
-  ...identity,
-  type: z.literal('result'),
-  subtype: z.literal('success'),
-  is_error: z.literal(false),
-  num_turns: zero,
-  duration_api_ms: zero,
-  total_cost_usd: zero,
-  modelUsage: z.record(z.string(), z.never()),
-  usage: zeroUsage,
-  permission_denials: z.array(z.never()),
-  deferred_tool_use: z.never().optional(),
-  subagent_stats: noSubagents.optional(),
-  queued_turn_count: zero.optional(),
-  safety_stops: zero.optional(),
-  terminal_reason: z.never().optional(),
-  interrupted_by_shutdown: z.never().optional(),
-});
+const frame = z.object({ type: z.string() });
+const reply = z.object({ content: z.array(z.unknown()).max(4096) });
+const textBlock = z.object({ type: z.literal('text'), text: z.string() });
+/** The bound on what a read keeps of the client's own words. */
+export const maximumDetail = 2048;
 
 export class UsageReaderError extends Error {
-  readonly reason: 'client' | 'protocol' | 'output-limit' | 'incomplete' | 'native-trust-required';
+  readonly reason:
+    | 'client'
+    | 'output-limit'
+    | 'native-trust-required'
+    | 'not-json'
+    | 'no-usage-report'
+    | 'unreadable-report'
+    | 'no-result'
+    | 'client-error';
   constructor(reason: UsageReaderError['reason']) {
     super(`Subscription usage reader refused: ${reason}.`);
     this.name = 'UsageReaderError';
@@ -186,71 +92,118 @@ export function anthropicUsageReaderPlan(input: { clientSha256: string; sessionI
   };
 }
 export type AnthropicUsageReaderPlan = ReturnType<typeof anthropicUsageReaderPlan>;
-export type AnthropicUsageReport = z.output<typeof report>;
+
+// The client reports used percent and the gauge shows what is left. A limit past its cap has
+// nothing left. The window IDs match the five-hour and weekly windows of the other families. A
+// scoped window takes the model's display name in the model ID form, so Opus 4.1 becomes
+// weekly-opus-4-1.
+function usageWindow(value: z.output<typeof limit>) {
+  const model = value.scope?.model?.display_name;
+  return {
+    windowId:
+      value.kind === 'session'
+        ? 'five-hour'
+        : value.kind === 'weekly_all'
+          ? 'weekly'
+          : value.kind === 'weekly_scoped' && model
+            ? `weekly-${model.toLowerCase().replace(/[\s.]+/g, '-')}`
+            : value.kind,
+    remaining: { value: Math.max(0, 100 - value.percent), unit: 'percent' as const },
+    resetsAt: value.resets_at ? new Date(value.resets_at).toISOString() : null,
+  };
+}
 
 export class AnthropicUsageReader {
   private pending = Buffer.alloc(0);
   private bytes = 0;
-  private initialized = false;
-  private complete = false;
-  private value: AnthropicUsageReport | undefined;
-  private failed = false;
+  private failure: UsageReaderError['reason'] | undefined;
+  private reading:
+    | {
+        windows: ReturnType<typeof usageWindow>[] | null;
+        extraUsage: { is_enabled: boolean } | null;
+      }
+    | undefined;
+  private ended = false;
+  private model: string | null = null;
+  private said = '';
 
-  private readonly sessionId: string;
-  constructor(sessionId: string) {
-    this.sessionId = z.uuid().parse(sessionId);
+  /** The tail of the text the client answered with, so a failed read can show its reply. */
+  reply() {
+    return this.said.trim();
   }
 
   feed(chunk: Uint8Array) {
+    if (this.failure) throw new UsageReaderError(this.failure);
     try {
-      if (this.failed || !(chunk instanceof Uint8Array)) throw new UsageReaderError('protocol');
       this.bytes += chunk.byteLength;
       if (this.bytes > maximumStdoutBytes) throw new UsageReaderError('output-limit');
       this.pending = Buffer.concat([this.pending, chunk]);
-      for (;;) {
-        const end = this.pending.indexOf(10);
-        if (end < 0) break;
+      for (let end = this.pending.indexOf(10); end >= 0; end = this.pending.indexOf(10)) {
         const line = this.pending.subarray(0, end);
         this.pending = this.pending.subarray(end + 1);
-        const value: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(line));
-        const frame = z
-          .object({ session_id: z.literal(this.sessionId), type: z.string() })
-          .parse(value);
-        if (this.complete) throw new UsageReaderError('protocol');
-        if (!this.initialized) {
-          init.parse(value);
-          this.initialized = true;
-        } else if (frame.type === 'assistant') {
-          if (this.value) throw new UsageReaderError('protocol');
-          this.value = localReport.parse(value).usage_report;
-        } else if (frame.type === 'system') {
-          localOutput.parse(value);
-        } else {
-          terminal.parse(value);
-          this.complete = true;
-        }
+        this.line(line);
       }
     } catch (error) {
-      this.failed = true;
-      if (error instanceof UsageReaderError) throw error;
-      throw new UsageReaderError('protocol');
+      this.failure = error instanceof UsageReaderError ? error.reason : 'not-json';
+      throw new UsageReaderError(this.failure);
+    }
+  }
+
+  private line(bytes: Uint8Array) {
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    if (!text.trim()) return;
+    const value: unknown = JSON.parse(text);
+    const head = frame.safeParse(value);
+    if (!head.success) return;
+    const fields = value as Record<string, unknown>;
+    if (head.data.type === 'system' && fields.subtype === 'init') {
+      // The chat composer starts on this model. A value it cannot read leaves the default.
+      const model = name.safeParse(fields.model);
+      this.model = model.success ? model.data : null;
+    } else if (head.data.type === 'assistant') {
+      const message = reply.safeParse(fields.message);
+      for (const entry of message.success ? message.data.content : []) {
+        const block = textBlock.safeParse(entry);
+        if (block.success) this.said = `${this.said}\n${block.data.text}`.slice(-maximumDetail);
+      }
+      if (fields.usage_report == null) return;
+      try {
+        const parsed = report.parse(fields.usage_report).rate_limits;
+        this.reading = {
+          windows:
+            parsed?.limits?.flatMap((entry) => {
+              const value = limit.safeParse(entry);
+              return value.success ? [usageWindow(value.data)] : [];
+            }) ?? null,
+          extraUsage: parsed?.extra_usage ?? null,
+        };
+      } catch {
+        throw new UsageReaderError('unreadable-report');
+      }
+    } else if (head.data.type === 'result') {
+      if (fields.is_error === true) throw new UsageReaderError('client-error');
+      this.ended = true;
     }
   }
 
   finish(receivedAt: string) {
-    if (this.failed || this.pending.length || !this.initialized || !this.complete || !this.value)
-      throw new UsageReaderError('incomplete');
+    // A last line without its newline still counts.
+    if (this.pending.length) this.feed(Uint8Array.of(10));
+    if (this.failure) throw new UsageReaderError(this.failure);
+    if (!this.reading) throw new UsageReaderError('no-usage-report');
+    if (!this.ended) throw new UsageReaderError('no-result');
     timestamp.parse(receivedAt);
-    const limits = this.value.rate_limits;
     return {
-      status: limits?.limits == null ? ('unavailable' as const) : ('reported' as const),
+      status: this.reading.windows ? ('reported' as const) : ('unavailable' as const),
       source: 'native-local-command' as const,
       receivedAt,
       // The structured twin has no fetch timestamp. Text and receipt time cannot supply one.
       observedAt: null,
       freshness: 'unknown' as const,
-      windows: limits?.limits ?? [],
-      extraUsage: limits?.extra_usage ?? null,
+      windows: this.reading.windows ?? [],
+      extraUsage: this.reading.extraUsage,
+      model: this.model,
+      // The plan runs a local command with no tools and no prompt, so no model turn is asked for.
       modelTurns: 0 as const,
       qualified: false as const,
     };

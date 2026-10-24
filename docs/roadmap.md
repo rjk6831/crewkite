@@ -32,6 +32,8 @@ I published [D2 UAT 02](https://github.com/rjk6831/crewkite/releases/tag/d2-uat-
 
 ## D2b daily-work acceptance
 
+The current line of work is the chat thread. A thread is a streamed session on one scratch copy of a project, with four provider adapters behind one event contract, permissions answered in the thread and a handoff that moves the thread between providers. [Proposed ADR 0036](adr/0036-the-chat-thread-is-the-product-center.md) records the decision and what it removes. None of the four adapters has a live run on record yet, and [provider routes](providers.md#chat-adapters) says so for each.
+
 I will ship D2b in small usable releases, beginning after the verified D2 UAT package. [Daily-work slices](daily-work-slices.md) is the implementation entry point and progress record. It names the next slice, actual code gaps, dependencies, acceptance and package release steps.
 
 D2b.1 separates workspace/task status from whole-history reads. D2b.2 streams retained artifacts and output; D2b.3 scales project capture. D2b.4 adds task-linked GitHub PR, Actions status and CI logs. Large diffs and context, project commands and useful multi-file changes follow as separate releases, leading into checked push and PR publication. Restart and cross-version recovery complete the representative daily-work acceptance suite before I claim the stated coding scope.

@@ -29,7 +29,7 @@ const setupReasons: Record<NonNullable<LocalSetupState['reason']>, string> = {
   'generation-unknown': 'Local generation ownership is unknown. Connection changes remain blocked.',
   'capability-unavailable': 'The native Local connection input is unavailable.',
   'setup-unavailable': 'The Local setup is unavailable. Reconnect to recover current status.',
-  'qualification-pending': 'The selected Local writer is unqualified.',
+  'qualification-pending': 'Connected. The loaded model is eligible for chat.',
 };
 export const localModelStates = {
   'installed-unloaded': 'Installed and unloaded',

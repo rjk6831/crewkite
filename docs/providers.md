@@ -1,20 +1,98 @@
 # Provider routes
 
+CrewKite reaches each provider through that provider's own client, signed in on your machine with your own subscription. The chat thread runs one adapter per family: OpenAI, Anthropic, Google and Local. This page names the transport of each, what you have to set up first and whether a live run is on record. The file and repository writers that came before the chat thread keep their dated qualification notes under [Writers](#writers).
+
+## Chat adapters
+
+Every adapter implements `ChatAdapter` and turns its client's native events into the same `AgentEvent` stream. It parses only the fields CrewKite uses. Anything it does not recognize shows once per turn as a notice and never ends the turn. A failure carries its stage, the cause, the provider's own message and a next action. Each turn runs the client in its own process group, and Stop interrupts through the client's protocol before it signals the group.
+
+The tests run each adapter against a scripted peer that speaks the frames recorded at the top of its test file. They show the mechanics work. A live run on the real client qualifies a route, as [Qualification](#qualification) describes.
+
+### OpenAI
+
+The transport is the OpenAI client's app-server over stdio. CrewKite starts the installed client as `app-server --stdio` for each turn and speaks JSON-RPC to it. The first turn opens a persistent thread with `thread/start` and `ephemeral: false`, rooted at the scratch copy. Later turns call `thread/resume` with the saved thread ID, so the client's own history carries the conversation. The sandbox is `workspace-write`, approvals come to the person, and web search, plugins, apps, hooks and multi-agent features are off for the turn. The launch sets `approval_policy` to `on-request`, because current client builds refuse `untrusted` in configuration and exit before they answer `initialize`. The thread calls carry the policy for the turn: `untrusted` under Ask each time and Allow edits, `on-request` under Allow all. The composer offers the effort levels the client lists for each model, up to `xhigh` or `ultra` where a model has them. The selected level goes on `turn/start`, which sets it for that turn and the ones after it.
+
+Agent message and reasoning deltas, command and file-change items with their output, and `thread/tokenUsage/updated` map to events. Command and file-change approval requests become permission requests in the thread. A network access request names the host and protocol and always goes to the person; no policy or grant answers it. Stop sends `turn/interrupt`, waits up to two seconds for the turn to complete as interrupted so the client records it, then SIGTERM, then SIGKILL. A usage-limit refusal ends the turn with its reset time. When the client exits early or refuses a setup request, the failure keeps the last lines it wrote to stderr and its last eight frames, one line each with the method or ID and any error. Prompts and results stay out of it.
+
+Set up first: install the OpenAI client and sign in with a ChatGPT plan. The adapter reads the account at the start of each turn and refuses an API-key sign-in, because that would bill per token. When the plan reports no included usage left, the turn ends before any prompt with a usage-limit failure and the reset time.
+
+The composer lists the models the controller last observed from the client. It learns them from a separate app-server session that runs `model/list` with `includeHidden: true` and opens no thread. A catalog read starts one in the background when no list from the current client exists or the newest is a day old. After a failure the next background read waits a minute. Refresh models in Settings starts one by hand and shows why the last read failed, with the last line the client wrote to stderr. Models the client keeps out of its own picker come back flagged hidden, and the composer shows them under Legacy so a thread can stay on an older model. The client sorts hidden models among the listed ones, so a full first page of 20 leads to one more page, and listed models come first in the 20 CrewKite keeps. The default is the profile's model when the client lists it, otherwise the first model the client shows in its picker.
+
+Live qualification pending.
+
+### Anthropic
+
+The transport is the Anthropic client in print mode with stream-json in and out. CrewKite starts it for each turn with `--print --output-format stream-json --input-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio`, the model and effort the person picked, and hooks disabled for the turn. The user message goes in on stdin as one JSON line. Text, thinking and tool-use blocks stream out and map to events. Permission asks arrive as control requests on stdout, and CrewKite's answers go back on stdin while the turn runs.
+
+The first turn learns the session ID from the client's init message. Later turns start with `--resume` and that ID. The client starts with no settings source, so neither the scratch copy's own settings file nor your user settings file loads: an allow rule in either would answer before CrewKite's prompt, and a deny rule in your user file does not apply inside a thread either. CrewKite's own policy decides every ask, and under Allow all that means every command the model proposes. Sign-in does not depend on settings; the usage read runs the same way. Under Ask each time the client runs in its default permission mode. Under Allow edits and Allow all it runs in accept-edits mode. Stop closes stdin, sends SIGINT, then SIGTERM, then SIGKILL. A rate-limit or usage-limit error ends the turn with its reset time when the client reports one.
+
+Set up first: install the Anthropic client and sign in with your own subscription. A signed-out client ends the turn with a failure that says to sign in. The [boundaries below](#boundaries-i-hold-for-every-route) apply: CrewKite collects no credentials and sets no API key. The composer lists the four chat models the client offers on a subscription plan: `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5` and `claude-haiku-5-5`, each at default, low, medium, high, extra high or max effort. Default passes no effort flag and leaves the level to the client. The composer starts on the model the client named when it last read usage, if that is one of the four, and on `claude-sonnet-5-5` otherwise. The pinned profiles still decide whether Anthropic shows as connected.
+
+The usage gauge has two sources. Every turn streams rate limit frames, and each one fills the five-hour and weekly windows while the turn runs. A frame replaces only the windows it names. The client's `/usage` command adds the per-model windows. It runs when the controller starts, after each turn and on Refresh in Settings, at most once a minute and never beside another read. Neither source asks for consent. The resolved, hash-pinned client is the native trust profile of [ADR 0009](adr/0009-native-client-trust-profile.md), and the Google reader already runs by default. A failed `/usage` read keeps what the client wrote, its reply text and the end of its error output, up to 2,048 characters.
+
+Live qualification pending.
+
+### Google
+
+The transport is Google's published ACP agent, with CrewKite as the protocol client over the agent's stdio. Each turn starts the pinned agent and sends `initialize` with filesystem and terminal services off, so the agent works with its own tools in the scratch copy. It then sends `session/load` with the saved session ID when the agent supports loading, and `session/new` otherwise, both rooted at the scratch copy. It sets the model and thought level with `session/set_config_option` and sends `session/prompt`.
+
+`agent_message_chunk` and `agent_thought_chunk` updates stream as text and thinking. `tool_call` and `tool_call_update` become tool cards. A card names the file, pattern or command the frame gives, such as `Read src/app.ts lines 3-9`, and keeps the agent's own title when the frame names none. `session/request_permission` becomes a permission request. Stop sends `session/cancel` and answers open requests as cancelled. Quota, rate-limit and resource-exhausted errors end the turn with a limit.
+
+Set up first: Connect Google in Settings installs and verifies the reviewed official client, initializes it, pauses for Sign in with Google in the browser and discovers the model choices. When the controller starts, and after an install, it runs the steps that need no click on its own: Initialize when no ready proof exists, and Discover when the proof already records a sign-in. Sign in with Google always waits for the person, because the agent may open a browser. The adapter needs that setup in its ready state, and the composer lists the models discovery advertised. The [pin and import details](#google-acp-writer) and the separate [quota read](#google-quota-read) are unchanged.
+
+Live qualification pending.
+
+### Local
+
+The transport is the LM Studio SDK over the loopback connection from Local setup. The model runtime has no agent loop, so CrewKite runs one. Each turn builds a small prompt, calls the SDK's `act` for the tool rounds and streams prediction fragments as text and thinking. The tools are CrewKite's own: `read_range` returns up to 120 lines, `search` up to 30 hits, `edit` replaces exact text, `write` creates a file, and `run` stops after 120 seconds and returns the last 60 lines of output. A turn makes at most 12 tool calls, paths stay inside the scratch copy, and the prompt tells the model each bound. A command always asks first. Edits ask under Ask each time. A model whose chat template has no native tool calling writes its call as text, in the `<tool_call>` JSON form or the `<function=name>` tag form; CrewKite reads those from the reply, runs them through the same permission gate and tool cards, and feeds the result back, so the raw markup never reaches the thread. The prompt names that fallback form for the model.
+
+The small context window sets the prompt budget. The reply gets a quarter of the window. A project outline of paths and exported symbols, most imported files first and cached per base commit, takes up to 18%. The newest turns fill what remains. When a turn leaves the conversation above 60% of the window, CrewKite writes a short summary of the earlier turns for later prompts. The thread keeps the raw turns. A request that cannot fit gets one line saying so and a smaller first step. After each turn a notice shows tokens in and out, time to first token, tokens per second and total time.
+
+Set up first: run LM Studio with its server on the loopback address, load one model and connect Local in Settings. The composer lists loaded models that pass the eligibility checks under [Local models](#local-models). Local has no usage gauge.
+
+Live qualification pending.
+
+## Qualification
+
+A route is qualified when dated evidence covers:
+
+- The exact executable and its digest, the OS and the client version
+- Authentication through the client's own supported login
+- Model, native effort levels and which settings the route can enforce
+- Tool and file boundaries, including denial of paths outside the scratch copy
+- Approval correlation, interruption and stop behavior
+- Billing mode, including what happens after included usage runs out
+
+Each fact is recorded as supported, unsupported or unknown. Discovery spends no inference. An upgrade or account change requalifies the facts it can affect.
+
+## Boundaries I hold for every route
+
+- Cloud-provider authentication stays with the native client and its credential store.
+- Ambient API keys and billing overrides are excluded from child environments.
+- Missing required billing evidence or a required subscription attestation blocks launch. There is no hidden fallback to paid API usage.
+- Existing-credit spending defaults off per provider. Controls must state whether the provider enforces a hard cap.
+- CrewKite never buys credits, tops up an account or changes a plan.
+- A code license on an open-source proxy or SDK never grants a right to reuse subscription credentials.
+
+## Writers
+
+The sections below record the file and repository writers that came before the chat thread, with the dated evidence I gathered for each. The chat adapters find their clients through these profiles. Setup steps here name the screens as they were when I recorded them, and connection now lives in Settings.
+
 The preview supports bounded coding through explicit OpenAI, Anthropic and Google native profiles, with a separately configured Local runtime. Google coding uses its published ACP agent to edit one existing committed text file. Each edit needs a human decision; checks, separate OpenAI review and destination acceptance follow afterward. A dated Flash workflow completed that full path and same-home reopen. The separate quota reader reports allowance and grants no coding authority.
 
 I qualify a specific client build, account type, model, effort setting, billing mode and role. An advertised model can be selectable before its coding behavior has been measured. Google repository work, project commands, delegation, lead and orchestrator roles, formal review and automatic handoff are not implemented in the ACP profile. General live routing remains unqualified.
 
 A failed or unavailable native profile keeps its own refusal or unknown ownership. It does not authorize a scripted replacement, another account or API billing. Explicit developer fixtures exercise controller mechanics separately. I require dated evidence for the actual client and selected route before treating it as qualified.
 
-## Connecting installed clients
+### Connecting installed clients
 
-Open Connect providers before creating a task. The setup view separates the installed client, observed sign-in, reported allowance and coding qualification. A metadata failure keeps its reason and next action visible. Metadata reads leave project selection and task Stop available; an uncertain project mutation still requires its exact saved retry.
+Open Settings before starting a thread. The provider cards separate the installed client, observed sign-in, reported allowance and coding qualification. A metadata failure keeps its reason and next action visible. Metadata reads leave project selection and task Stop available; an uncertain project mutation still requires its exact saved retry.
 
 OpenAI uses the supported native client's existing subscription sign-in. Refresh OpenAI quota reads account and allowance metadata through its native server with no thread or turn. The reader uses the client's ordinary local database cache; forcing a new empty cache caused historical backfill to delay initialization past the read deadline. Private diagnostic output and owned process cleanup retain their existing bounds. A failed refresh preserves earlier observations and their original times.
 
 On 21 October 2026, the corrected OpenAI metadata path completed in 3.36 seconds with one reported allowance window and quiescent process ownership. A separate Anthropic native sign-in check completed in 293 milliseconds and reported subscription authentication. Neither observation submitted a model prompt. They establish those metadata paths only.
 
-## Current availability
+### Current availability
 
 I checked the following primary-source guidance on 17 October 2026 and rechecked Google's FAQ and editor guide on 21 October. Client behavior and integration permission are separate gates under [ADR 0005](adr/0005-official-clients-on-user-subscriptions.md).
 
@@ -42,13 +120,13 @@ Retained candidates remain inspectable and exportable through the existing permi
 
 The following sections record exact pilot mechanics and adapter limits. Prior Google evidence does not authorize new consumer launches. General live routing remains unqualified.
 
-## D2 checked-workflow evidence
+### D2 checked-workflow evidence
 
 On 2026-10-20, ten distinct real D2 backlog outcomes completed original checks, separate native review, destination acceptance and same-home reopen. The record includes useful Google ACP and Local file contributions and one combined two-slice outcome counted once. The release receipt identifies each exact client or runtime, selected model and settings, billing premise and immutable acceptance record. This establishes the recorded bounded workflows. Active ACP Stop, installed recovery and unobserved roles require their own dated evidence; normal completion does not prove them. Available model metadata alone supplies no qualification. The dated accepted Local contribution qualifies only its recorded runtime, model and bounded role.
 
 Each backlog outcome counts once. Failed attempts and support work earn no additional count. The Local reporter task starts from an existing implementation with direct Unicode and byte-bound corrections. Its recorded native contribution repairs a remaining Symbol-diagnostic gap. The Google documentation task starts from an existing CLI guide; its recorded native contribution corrects the remaining reader-disable statement. All original criteria, full verification and separate native review apply to each complete retained result, with expanded diagnostic cases for the Local reporter. The release receipt distinguishes each inherited baseline from its native delta.
 
-## Google ACP writer
+### Google ACP writer
 
 The separate `google-acp-v1` profile implements a bounded one-file workflow under [Proposed ADR 0024](adr/0024-integrate-google-through-its-published-acp-agent.md). The [published registry](https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json) identifies Google LLC's Antigravity server and its Google-hosted downloads. On 21 October 2026, the current entry lists version 1.4.1. This preview keeps the reviewed 1.4.0 bundle and its exact mappings. The macOS executable is `agy_acp_server.par`, separate from the CLI. No published checksum accompanies that entry. Google's [Zed guide](https://www.antigravity.google/docs/ide/extensions/zed/) documents personal-plan `oauth-personal` authentication for editors.
 
@@ -62,13 +140,13 @@ The launch card, roster and provider notice use this label:
 
 [Proposed ADR 0024](adr/0024-integrate-google-through-its-published-acp-agent.md) records why I separated successful consumer pilots from integration permission and chose a distinct protocol boundary. The production mapping binds server SHA-256 `34e0cd2fe6fcafc4b280a81d38026c55689e54c0619c6729a781f1ebfefa1d88`, helper SHA-256 `e7d236a0761ef904cee649e6f42e56861ca953457f8f62bcd0cdf649640d0ff5`, signer team `EQHXZ8M8AV` and version `1.4.0`. It recognizes the `mode` option's `default` value as request-review and the strict bounded replacement mappings for `Run replace_file_content?` and `Run edit_file?`. The target, old text and replacement text must form one unique bounded hunk. Extra controls, other tools and unrecognized permission shapes refuse. A current authenticated setup proof and fresh configuration acknowledgement are still required. Static mappings and scripted protocol coverage establish no live result by themselves. The dated checked-workflow record above supplies the observed coding and permission evidence; active Stop and installed recovery keep their separate gates.
 
-### Import and setup
+#### Import and setup
 
 Open Usage and capacity, then Google ACP setup. Install official client downloads the fixed 1.4.0 macOS arm64 archive from Google. The installer requires the reviewed archive SHA-256 `21a32eeab85b394a515510c84539bda4b2504bf2917e0a201f5c4130b13581a5`, both exact executable digests in this profile and the expected Developer ID signature. A changed download, archive layout, digest or signer refuses installation. It reuses an identical managed pin and never replaces a conflicting pin. Download, extraction and both signature checks belong to one retained operation. Stop waits for owned cleanup. A restart settles known interrupted work and preserves uncertain signature ownership without replay.
 
 On 21 October 2026, a fresh private-home installation downloaded the official archive, matched all three pinned digests and completed both macOS signature checks in 12.715 seconds. Both owned groups closed and were absent. That installation performed no authentication or model request.
 
-Installation starts no agent or model prompt. Initialize checks the installed client. Sign in with Google is a separate personal-account action, followed by Discover Google choices. A quota reading comes from the separate CLI reader and does not establish ACP sign-in. These setup actions leave project selection and task Stop available.
+Installation starts no model prompt. Initialize checks the installed client, and the controller runs it once an installation finishes. Sign in with Google is a separate personal-account action, followed by Discover Google choices. A quota reading comes from the separate CLI reader and does not establish ACP sign-in. These setup actions leave project selection and task Stop available.
 
 Import reads three fixed files under the CrewKite home: `imports/google-acp-v1/agy_acp_server.par`, its required sibling `localharness_external`, and `identity.json` in the same directory. The identity file contains version `1.4.0`, the server's observed SHA-256 in `sha256`, the helper's observed SHA-256 in mandatory `harnessSha256`, and the ten-character Developer ID team in `signerTeamId`. The server limit is 384 MiB; the helper limit is 128 MiB. The staging directory and files must be private and owned by the current user. Symlinked parents, linked files, malformed identity and digest changes refuse. This manual CLI import path remains available. The desktop installer uses its reviewed fixed release identity and private per-attempt staging.
 
@@ -78,7 +156,7 @@ Setup exposes separate Initialize, Authenticate, Discover and Stop actions. Init
 
 On 17 October 2026, the imported 1.4.0 bundle completed personal-account authentication through normal setup after 43.213 seconds. A separate Discover completed after 10.936 seconds without a task prompt. Its proof retained two model IDs, three thought-level IDs and three mode values. Both operations closed with quiescent ownership and submitted no coding task. That discovery preceded activation of the client-bound mapping and retained a null review-mode proof; the mapping requires a fresh matching proof before preparation.
 
-### Prepare, approve and stop
+#### Prepare, approve and stop
 
 Preparation freezes the selected committed target, original hash and mode, setup proof, client identity, observed model, optional thought level and policy. The target must be existing NUL-free UTF-8 text within 64 KiB. Guided and balanced authority require a human decision for every native permission request. The ordinary-subscription and disabled-overage confirmations remain user assertions. Preparation also requires a separate assertion that CLI quota and ACP sign-in use the same account. Shared native HOME proves no identity or entitlement. Every applicable account bucket must be fresh and above reserve, and every configured reserve must be satisfied. Start can refresh missing or stale quota once, subject to the quota reader's ownership and cooldown gates.
 
@@ -102,7 +180,7 @@ Evaluation needs separately prepared local-check authority. Native review uses a
 
 Stop cancels pending permissions, sends `session/cancel` and waits for the original prompt's `cancelled` response. It closes the session when supported and requires closed streams and an absent owned process group. EOF before the terminal response leaves the outcome unknown. Once every recorded process group is absent, the controller settles the turn on its own, as it finishes or after a restart, and an explicit Stop can do the same for a turn a restart left unknown. Settling keeps the submission and completion evidence, captures nothing, marks the task interrupted and reopens the home for later Google work. A group that is still present keeps the home blocked. Stop retains partial work as unverified and blocks a late completed-capture receipt. Restart never resubmits or infers completion from quiet scratch. After the terminal response, closing the session is cleanup. A failed close keeps the recorded outcome. Trailing usage, command, session and tool progress updates are counted and ignored. A second response or a permission request after the terminal response still fails. A read, search or background tool left open at a clean terminal response lets the turn finish. The completion record keeps their count and fixed kind names, with no provider tool IDs. A pending permission or an open file edit still refuses. Autopilot, automatic Google handoff and repository-wide ACP editing remain unavailable.
 
-## Google quota read
+### Google quota read
 
 The `google-usage-v1` reader is separate from coding authority. The pinned CLI's `agy -p /usage --output-format json` metadata command runs by default when that client is present. There is no quota opt-in, consent field or enable/disable toggle. The [CLI usage documentation](https://www.antigravity.google/docs/cli/commands/usage/) describes a backend quota refresh. [Proposed ADR 0024](adr/0024-integrate-google-through-its-published-acp-agent.md) records why I treat the validated zero-turn operation as a status check.
 
@@ -118,19 +196,19 @@ ACP preparation requires a separate user assertion that CLI quota and ACP sign-i
 
 Final admission rechecks every applicable bucket and every configured reserve, current account assertion, setup proof, source and current task authority. The frozen task selection determines applicability at both preflight and final admission. Stop for the exact pending task and run or controller close prevents late admission. A failed read cannot fall back to old windows or a fixed allowance. Fresh quota needs no new read and is unaffected by the read cooldown. These checks establish no ACP qualification or integration permission. ACP context tokens never substitute for account allowance.
 
-## Google native workspace context
+### Google native workspace context
 
 The source-only [native task connector](../apps/controller/src/providers/google/native-extension/README.md) prepares workspace MCP configuration for the provider's native interactive CLI, or a workspace plugin for its app. An explicit local command selects one existing task and freezes its revision, run, source, candidate and bounded retained patch. Each tool rechecks that binding. The native client owns inference, model, effort, approvals and Stop. The connector launches no provider and exposes no controller mutation. One bounded result can be saved in an ignored sidecar labelled unverified; it establishes no check, review, accepted work or inference-stop evidence. The consumer headless-wrapper restriction stays in force.
 
 On 17 October 2026, native interactive CLI 1.4.0 loaded `task_context`, `retained_patch` and `submit_unverified_result` through workspace MCP configuration. With one-call approval for each tool, it read a synthetic prepared task and its empty patch, then saved 306 bytes of unverified result text. The native process exited normally after 270.898 seconds with its owned group absent. Controller state, source, index, refs, configuration and capability stayed unchanged; no controller intent, controller submission or candidate was created. This qualifies a context-only CLI exchange. App plugin loading and nonempty patch transfer remain unqualified. No native Stop behavior, enforced model or effort, full provider route or single-interface workflow is claimed.
 
-## Anthropic writer preparation
+### Anthropic writer preparation
 
-The Native clients card stays visible without a configured coding route. Check Anthropic sign-in runs only the pinned client's `claude auth status` metadata command. It retains the observed sign-in method and time, with billing, quota and task qualification still unknown. A signed-out client needs `claude auth login` in its own terminal, followed by another sign-in check. CrewKite collects no credentials and submits no prompt for this check. Sign-in does not grant native-client trust for a quota refresh.
+The Native clients card stays visible without a configured coding route. Check Anthropic sign-in runs only the pinned client's `claude auth status` metadata command. It retains the observed sign-in method and time, with billing, quota and task qualification still unknown. A signed-out client needs `claude auth login` in its own terminal, followed by another sign-in check. CrewKite collects no credentials and submits no prompt for this check.
 
-D2b UAT 04 adds Refresh Anthropic quota. It invokes the pinned native client's built-in local `/usage` command without a generation request. The first refresh presents native-client trust for the exact client, command and reader policy; user or administrator policy hooks remain covered by that native-client trust. I remember this decision only while its scope remains unchanged. Later refreshes use the same single action. Stop quota refresh stops and joins the existing owned operation. The reader has a separate sixty-second cooldown after each attempt, including failures, and refuses overlapping Anthropic task or sign-in ownership.
+D2b UAT 04 adds Refresh Anthropic quota. It invokes the pinned native client's built-in local `/usage` command without a generation request. User or administrator policy hooks stay covered by the native trust profile, so the read asks for no consent of its own. The reader also runs once on its own when the controller starts and after an Anthropic chat turn settles, when the last read is more than a minute old. It never runs beside another read and asks for nothing. Stop quota refresh stops and joins the existing owned operation. The reader has a separate sixty-second cooldown after each attempt, including failures, and refuses overlapping Anthropic task or sign-in ownership.
 
-The retained structured report preserves native window rows and separate extra-usage metadata. Reported used percentages appear as remaining values in the shared allowance gauges. Its local receipt time is visible, but the native report supplies no observation timestamp or account identity, so cache age and account scope stay unknown. A failed read keeps the last retained report and its original provenance. A report from an earlier client or reader-policy scope is labelled accordingly. The reader sends no model prompt and enables no paid fallback. I do not turn this receipt into current task-admission or exhaustion evidence, included billing or writer qualification. Offline fixtures cover the parser, explicit trust, persistence and Stop path; this implementation has no new live subscription qualification claim.
+The reader keeps only what CrewKite shows: each rate limit's kind, used percent, reset and model scope, the extra-usage switch, the model the client names in its init frame, and whether the result reported an error. A `session` limit becomes the `five-hour` window, `weekly_all` becomes `weekly`, and a `weekly_scoped` limit with a model scope becomes `weekly-` plus the model name in lower case, for example `weekly-fable`. A kind the reader does not know keeps its own name. Used percent becomes the remaining value in the shared allowance gauges, and a limit past its cap shows none left. The client adds fields from one build to the next, so every other field and frame it prints is ignored. A failed read says what was missing, for example no usage report before the client exited, and asks for a CrewKite update or a report of the client version. Its local receipt time is visible, but the native report supplies no observation timestamp or account identity, so cache age and account scope stay unknown. A failed read keeps the last retained report and its original provenance. A report from an earlier client or reader-policy scope is labelled accordingly. The reader sends no model prompt and enables no paid fallback. I do not turn this receipt into current task-admission or exhaustion evidence, included billing or writer qualification. The parser fixture is the client's own output for this command, with display text, paths and long lists replaced. Offline fixtures cover the parser, persistence and Stop path; this implementation has no new live subscription qualification claim.
 
 The provider-local helpers project bounded authentication metadata and own a structured text proposal process. The writer requires an exact executable digest, model and session. A successful result binds one attempt, a frozen relative file path and the original content hash to at most 64 KiB of NUL-free UTF-8 text. Omitting the target preserves the original `net.mjs` behavior. A caller can shorten authentication and task execution with one absolute deadline; the bounds include owned cleanup. Synchronous callbacks record each actual process phase and one conservative submission marker before prompt input. A failed callback prevents a successful result. The writer applies no files and registers no route. Desktop and CLI preparation bind this writer to the native task flow. The installed profile remains qualification-pending while its remaining pilot checks are open. Writer selection and the supported OpenAI reviewer are independent.
 
@@ -156,7 +234,7 @@ For a combined run, only a denied native child slot reopens. Its sibling must ha
 
 Task execution separately receives Anthropic rate-limit readings on its exact route. Before the next 04 manual reader was implemented, a zero-model metadata check against client 2.1.302 on 17 October 2026 returned an unavailable usage result and no windows. That result established no fresh idle allowance and diagnosed no account or sign-in condition.
 
-## Prior Google writer pilot
+### Prior Google writer pilot
 
 The Google adapter reads [structured headless output](https://www.antigravity.google/docs/cli/headless) and returns a bounded file replacement tied to an attempt, relative path and original content hash. It requires an exact client identity and dated controller-owned admission evidence. It applies no file changes and registers no route. Its scripted fixture covers malformed output, session binding, refusal before launch and process cleanup.
 
@@ -176,7 +254,9 @@ Five synthetic tasks were submitted on 16 October 2026. The first two stopped on
 
 The adapter accepts all four native permission modes only when init matches controller-owned admission evidence. It changes no global setting and passes no permission bypass flag. This uses the native trust profile and establishes no tool containment or approval interception. Live evidence covers `always-proceed` and `request-review`. Effective effort, request-level billing and the remaining native pilot checks remain unverified. Strict and proceed-in-sandbox qualification remain pending. No consumer-headless Google route is qualified. The separate shipped ACP workflow retains its dated evidence above.
 
-## Primary planning choices
+### Primary planning choices
+
+The structured planning turn is retired under [ADR 0036](adr/0036-the-chat-thread-is-the-product-center.md). This section and the next record how it chose models.
 
 The primary conversation uses the supported OpenAI profile for Lead or Orchestrator. Its first turn keeps the profile's fixed model and low effort. A successful accepted turn can publish the sanitized catalog already discovered by that same transcript, after owned cleanup. No separate discovery request or startup polling runs for the selectors. The retained catalog is last-observed guidance, with at most 20 model IDs and 16 effort IDs per model.
 
@@ -184,7 +264,7 @@ An explicit Save binds the requested pair to that immutable observation and the 
 
 On 17 October 2026, one normal planning turn retained an adoptable proposal and a seven-model last-observed catalog. The same completed turn reported 24,384 context tokens and a 475,000-token capacity, bound to its run and immutable observation. These reported values establish no quota balance or completed coding task.
 
-## Project model choices
+### Project model choices
 
 D2b UAT 05 reads the supported native OpenAI catalog when Project preparation opens. The read creates no thread or model turn. Its retained observation binds the task definition, committed source, profile, native client and local configuration. Planning choices remain separate.
 
@@ -192,7 +272,7 @@ Preparation freezes the selected advertised model and effort with that exact obs
 
 The source and controlled regression journey qualify these bindings. No live account discovery or alternate-model execution was performed for UAT 05. An advertised pair establishes no account entitlement or measured coding quality.
 
-## OpenAI writer preparation
+### OpenAI writer preparation
 
 The provider-local parser follows the [Codex app-server](https://learn.chatgpt.com/docs/app-server) metadata transcript and [0.163.0 protocol fields](https://github.com/openai/codex/tree/83086188ae0614bd882818ff1aa23f3194962012/codex-rs/app-server-protocol/src/protocol/v2). It covers initialization, account metadata without a forced token refresh, rate-limit metadata and one bounded model catalog page. Replies must match the outstanding request. Missing or non-ChatGPT account metadata stops discovery before limits or models are requested. Native email, account IDs, credential fields and raw diagnostics are excluded from the projected output. Model and effort IDs remain bounded, untrusted provider text. The process owner checks the executable digest and native configuration, then requires closed streams and absent process groups before returning a result.
 
@@ -224,7 +304,7 @@ Idle publication requires a validated supported-account reading and physical clo
 
 Each OpenAI task transcript checks the notices that carry state, such as thread and turn identity, settings, items, turn completion, errors and rate limits. A notice that ends or moves the thread, opens a realtime session, reroutes the model, starts a hook or MCP server, changes the account or remote control, or concerns automatic approval review refuses the task. Other notices are ignored, such as command output and moderation metadata. Authentication recovery and model verification notices are ignored by design, and a client version bump requires re-auditing the authority set. The completion record counts ignored notices by method hash for up to sixteen methods, with one shared count for the rest. Progress that arrives after turn completion keeps the result, and a late token count still updates the reported context use. A second completion, a new item or an error still refuses it. The repository writer also ignores message and reasoning deltas, diffs, plans and token counts, which a long run produces by the thousand. One turn may start 4,096 items, send 16,384 checked notices and report 32 upstream retries. The client retains at most 1 MiB of each command's output and sends it twice, as deltas and again in the completed item, and JSON escaping can write each byte as six. The client caps the delta stream by chunk count and sets no byte cap, so a command that prints more than about 15 MiB still ends the turn with a limit refusal. The total of 16 MiB bounds the whole turn, so one line may use any part of it and no separate line limit applies.
 
-### Repository work
+#### Repository work
 
 The separate `openai-repository-v1` profile uses the exact 0.163.0 client build, Pro metadata, `gpt-6.1-sol` at low effort and the default tier. It freezes the committed source base and manifest, bounded to 10,000 files and 64 MiB. Preparation requires scratch-write and `run-native-tools` grants for that task and project. The tools grant is consumed once at launch and permits multiple local commands during the bounded task. File consent cannot authorize it. Existing credits default off. A repository writer leaves the run's eleven-minute evaluation floor for its check and review. Its deadline is the shorter of ten minutes and the run's minutes less that floor, never below five minutes, and includes preparation and owned cleanup. Preparation saves that deadline. Start refuses a repository writer longer than five minutes unless the run and the task allowance still hold that deadline plus the eleven-minute floor. A five-minute writer, which any run of 16 minutes or less gets, starts with its own five minutes. A file writer needs only its saved deadline. Reviews keep five minutes. The writer's task data also carries its deadline, the coder paths of an adopted plan whose criteria the task still carries, the `crewkite-verify-v1` stages and frozen paths when the source has that recipe's journey and lockfile, and the review budget. Its instructions state that scratch holds committed files only, with no installed dependencies.
 
@@ -238,7 +318,7 @@ That run used explicitly enabled existing credits. It ran no CrewKite checks, re
 
 On 17 October 2026, a separate normal desktop task exercised Stop after a durable submission marker and a live owned repository task process were observed. It retained interrupted, unverified work without a completed repository capture or application receipt. All three native phases became quiescent and their groups were absent. Original source, index and refs stayed unchanged. Normal Quit and same-home reopen preserved the task, scratch and bound artifacts without another submission. Existing credits were explicitly enabled for this run. This establishes active Stop for this exact OpenAI repository profile. Full profile qualification remains pending, and its qualification date remains unset. Existing single-file pilot evidence keeps its separate scope.
 
-## Applying a replacement
+### Applying a replacement
 
 The source helper separately rechecks the full saved scratch manifest and the opened target before replacing one existing regular file. It refuses links, mismatched hashes and stale file metadata. It preserves permissions, truncates to the replacement length and syncs the file. A write failure can retain unverified scratch and requires explicit recovery.
 
@@ -248,7 +328,7 @@ Preparation performs no provider I/O. The controller freezes source base, path, 
 
 `StartRun` uses the same admission, leases, reservations and owned processes as the retained-patch helper. Provider-specific native metadata checks run inside that deadline. The Anthropic subscription premise remains user-attested. Prior Google configuration reads established no account identity. The controller retains the proposal, waits for quiescence and rechecks authority before applying one scratch replacement. Inspection and patch export survive restart. Each native writer permits one submission. Stop cancels an unstarted preparation or waits for active native cleanup. Writer resume, route switching and scripted continuation remain unavailable. Opt-in [manual native file handoff](continuity.md#manual-native-file-handoffs) has offline fixture coverage with explicit recipients and fresh consent; connected transfer remains unqualified. The Google consumer profile stays unavailable while supported alternatives are investigated. Local acceptance uses the separate checked-candidate path below. The original checkout stays unchanged. General live routing remains unqualified.
 
-## Candidate checks and review
+### Candidate checks and review
 
 The desktop and CLI use `PrepareCandidateEvaluation` to freeze separate authority for one stopped native candidate. The default `node-tests-v1` recipe covers the synthetic `net.mjs` project. The explicit `project-node-tests-v1` recipe selects up to 32 exact committed Node test files. Selected test bytes must remain unchanged in the candidate. The fixed Node runtime and structured reporter require successful tests from every selected file. A pinned import guard prevents accidental imports outside the independent check copy. It provides no filesystem or network containment; local project code runs with ordinary user permissions under the separate check grant. No dependencies are installed or borrowed from the original checkout. Missing dependencies fail checks. Package-manager checks and arbitrary commands remain unsupported. The saved quality floor must be covered by one `keep-it-simple` cycle; preparation cannot lower it. Native trust and source consent cover the original file, candidate and task text, with exact one-use check and review permissions. Reviewer credit spending defaults off separately from the writer. The supplemental allowance permits one local check and one additional native review within the remaining original attempts, minutes and concurrency.
 
@@ -258,29 +338,7 @@ Matching completed checks and native review can make a candidate ready for local
 
 The retained sample candidate also completed local branch acceptance through the normal CLI after 2.408 seconds, with no model submission. The CLI recovered the saved request, used its existing destination approval and replayed the applied result with the same key. The new branch contained the exact checked candidate. The same home reopened accepted state and retained its evidence. Original source, index and scratch stayed unchanged; all five owned processes closed with zero exit status and all six historical native groups were absent. This verifies the sample check recipe and same-family, process-only review followed by local publication. A later useful CrewKite UI result completed the checked-branch workflow through the Mac directory package, with same-family process independence only. The [roadmap](roadmap.md) records that separate proof and its matching installed-source requirement. Arbitrary repository acceptance and installer recovery remain unqualified.
 
-## Qualification
-
-A route is qualified when dated evidence covers:
-
-- The exact executable and its digest, the OS and the client version
-- Authentication through the client's own supported login
-- Model, native effort levels and which settings the route can enforce
-- Tool and file boundaries, including denial of paths outside the scratch copy
-- Approval correlation, interruption and stop behavior
-- Billing mode, including what happens after included usage runs out
-
-Each fact is recorded as supported, unsupported or unknown. Discovery spends no inference. An upgrade or account change requalifies the facts it can affect.
-
-## Boundaries I hold for every route
-
-- Cloud-provider authentication stays with the native client and its credential store.
-- Ambient API keys and billing overrides are excluded from child environments.
-- Missing required billing evidence or a required subscription attestation blocks launch. There is no hidden fallback to paid API usage.
-- Existing-credit spending defaults off per provider. Controls must state whether the provider enforces a hard cap.
-- CrewKite never buys credits, tops up an account or changes a plan.
-- A code license on an open-source proxy or SDK never grants a right to reuse subscription credentials.
-
-## Local models
+### Local models
 
 Local inference is optional. Explicit setup uses a literal loopback connection at `ws://127.0.0.1:<port>`. Dedicated-token authentication is the default, including old configurations without an explicit mode. Discovery reads installed variants and loaded instances without loading or downloading a model. It records the observed runtime and model metadata; no fixed model name, parameter count or machine memory size determines eligibility. An installed model can remain unloaded or incompatible.
 

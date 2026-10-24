@@ -1,6 +1,7 @@
 import type { Observation, Window } from '@crewkite/contracts';
 import { CircleAlert, CircleHelp, CircleSlash, Clock, Target } from 'lucide-react';
 import { type ReactNode, useEffect, useId, useState } from 'react';
+import { readAgo } from './usage-presentation.ts';
 import './usage-gauges.css';
 
 export type UsageAmount = NonNullable<Observation['remaining']>;
@@ -23,6 +24,8 @@ export type UsageReading = {
   reserveNote?: string;
   constraining?: boolean;
   note?: string;
+  /** When CrewKite received a report that carries no observation time of its own. */
+  readAt?: string | null;
 };
 
 export type UsageCredit = { id: string; label: string; value: string; note?: string };
@@ -190,7 +193,7 @@ function describe(reading: UsageReading, nowMs: number) {
     tone: !known ? 'none' : exhausted ? 'exhausted' : atReserve ? 'low' : dated ? 'dated' : 'ok',
     observedText:
       state === 'reported'
-        ? 'Observation time and cache age unknown'
+        ? (readAgo(reading.readAt, nowMs) ?? 'Observation time and cache age unknown')
         : observed === null
           ? 'Never observed'
           : Number.isNaN(observed)
@@ -316,12 +319,6 @@ export function UsageGauge({
     chips.push(
       <Chip key="reserve" tone="low" icon={<CircleAlert size={11} aria-hidden="true" />}>
         At reserve
-      </Chip>,
-    );
-  if (reading.state === 'reported')
-    chips.push(
-      <Chip key="reported" tone="dated" icon={<Clock size={11} aria-hidden="true" />}>
-        Age unknown
       </Chip>,
     );
   if (reading.state === 'stale')
@@ -486,7 +483,6 @@ const flagText: Record<string, string> = {
   exhausted: 'Exhausted',
   low: 'At reserve',
   stale: 'Stale',
-  reported: 'Age unknown',
   'reset-pending': 'Reset pending',
 };
 
@@ -512,7 +508,8 @@ function UsageMeter({
     reading.constraining ? 'constraining' : null,
     view.exhausted ? 'exhausted' : null,
     view.atReserve ? 'low' : null,
-    view.dated ? reading.state : null,
+    // A report with no age says so in Details, so its line carries no flag.
+    view.dated && reading.state !== 'reported' ? reading.state : null,
   ].filter((flag) => flag !== null);
   return (
     <li

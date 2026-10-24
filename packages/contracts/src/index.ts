@@ -1,5 +1,35 @@
 import { z } from 'zod';
-import { canonicalJson } from './canonical.ts';
+import {
+  AcceptChatChangesPayloadSchema,
+  AgentEventSchema,
+  ChatBranchStatusSchema,
+  ChatCatalogChangeSchema,
+  ChatCatalogReadSchema,
+  ChatChangesReadSchema,
+  ChatEffortSchema,
+  ChatFamilySchema,
+  ChatPullRequestResultSchema,
+  ChatPushResultSchema,
+  ChatQueuedMessageSchema,
+  ChatRoleSchema,
+  ChatThreadReadSchema,
+  ChatThreadSchema,
+  ChatTurnIdSchema,
+  ChatTurnSchema,
+  ConfigureChatThreadPayloadSchema,
+  HandoffChatThreadPayloadSchema,
+  OpenChatPullRequestPayloadSchema,
+  PushChatBranchPayloadSchema,
+  ReadChatBranchStatusPayloadSchema,
+  ReadChatCatalogPayloadSchema,
+  ReadChatChangesPayloadSchema,
+  ReadChatThreadPayloadSchema,
+  RefreshChatModelsPayloadSchema,
+  ResolveChatPermissionPayloadSchema,
+  SendChatMessagePayloadSchema,
+  SteerChatMessagePayloadSchema,
+  StopChatTurnPayloadSchema,
+} from './chat.ts';
 
 export const PROTOCOL_VERSION = 1;
 export const MAX_FRAME_BYTES = 1024 * 1024;
@@ -407,6 +437,10 @@ export const LocalHardwareStatusSchema = z
       .nullable(),
     totalMemoryBytes: RevisionSchema.min(1).nullable(),
     availableMemoryBytes: RevisionSchema.nullable(),
+    /** GPU cores the system reports, read once at launch on Apple Silicon. */
+    gpuCores: RevisionSchema.min(1).max(4096).nullable().optional(),
+    /** The chip or GPU name the same report gives, such as an Apple Silicon chip name. */
+    gpuModel: localText(200).nullable().optional(),
     sampledAt: TimestampSchema,
   })
   .refine(
@@ -876,39 +910,29 @@ export const WindowSchema = z.strictObject({
   state: WindowStateSchema,
 });
 export const AnthropicUsageReadingSchema = z.strictObject({
-  source: z.literal('native-local-command'),
+  // The local /usage command reports every window. A turn's rate limit frames report the
+  // five-hour and weekly windows the request touched, with no extra command.
+  source: z.enum(['native-local-command', 'turn-rate-limit']),
   status: z.enum(['reported', 'unavailable']),
   receivedAt: TimestampSchema,
   observedAt: z.null(),
   freshness: z.literal('unknown'),
+  // One window per reported limit: five-hour, weekly, weekly-<model>, or the limit's own kind.
   windows: z
     .array(
       z.strictObject({
-        kind: label,
-        group: label,
-        percent: z.number().finite().min(0).max(100),
-        resets_at: TimestampSchema.nullable(),
-        scope: z
-          .strictObject({
-            model: z.strictObject({ display_name: label }).nullable().optional(),
-            surface: z.strictObject({ display_name: label }).nullable().optional(),
-          })
-          .nullable()
-          .optional(),
-        severity: label,
-        is_active: z.boolean(),
+        windowId: label,
+        remaining: z.strictObject({
+          value: z.number().finite().min(0).max(100),
+          unit: z.literal('percent'),
+        }),
+        resetsAt: TimestampSchema.nullable(),
       }),
     )
     .max(64),
-  extraUsage: z
-    .strictObject({
-      is_enabled: z.boolean(),
-      monthly_limit: z.number().finite().nonnegative().nullable(),
-      used_credits: z.number().finite().nonnegative().nullable(),
-      utilization: z.number().finite().nonnegative().nullable(),
-      currency: label.nullable().optional(),
-    })
-    .nullable(),
+  extraUsage: z.strictObject({ is_enabled: z.boolean() }).nullable(),
+  // The model the client named in the init frame of the same read.
+  model: label.nullable(),
   modelTurns: z.literal(0),
   qualified: z.literal(false),
 });
@@ -944,6 +968,8 @@ export const UsageReaderSchema = z
     operationId: CommandIdSchema.nullable().optional(),
     lastObservedAt: TimestampSchema.nullable(),
     lastAttemptAt: TimestampSchema.nullable().optional(),
+    /** What the client wrote during the last read: its reply text, then its error output. */
+    detail: z.string().max(2048).nullable().optional(),
   })
   .refine(
     (reader) =>
@@ -1759,89 +1785,6 @@ export const NativeHandoffPreparationPayloadSchema = z.union([
 ]);
 const conversationBytes = (value: unknown) =>
   new TextEncoder().encode(JSON.stringify(value)).length;
-export const CONVERSATION_CONTEXT_MEDIA_TYPE = 'application/vnd.crewkite.conversation-context+json';
-const contextBase = z.string().regex(/^[a-f0-9]{40}$/);
-const contextPath = NativeTargetPathSchema.refine(
-  (path) =>
-    new TextEncoder().encode(path).length <= 1024 &&
-    path.split('/').length <= 16 &&
-    !path
-      .split('/')
-      .some(
-        (part) =>
-          /^(?:\.git|\.hg|\.svn|node_modules|\.pnpm|\.yarn|\.ssh|\.aws|\.azure|\.gnupg|\.config|\.kube|\.docker|\.npmrc|\.netrc|\.pypirc|\.git-credentials|\.env(?:\..*)?|credentials(?:\..*)?|secrets?(?:\..*)?|id_rsa.*|id_ed25519.*)$/i.test(
-            part,
-          ) || /\.(?:pem|key|p12|pfx|keystore|keychain(?:-db)?)$/i.test(part),
-      ),
-  'Context needs a bounded source path outside excluded locations.',
-);
-const contextText = z
-  .string()
-  .min(1)
-  .max(8192)
-  .refine(
-    (value) =>
-      value.isWellFormed() &&
-      new TextEncoder().encode(value).length <= 8192 &&
-      ![...value].some((character) => {
-        const point = character.codePointAt(0) as number;
-        return (point < 32 && ![9, 10, 13].includes(point)) || (point >= 127 && point <= 159);
-      }),
-    'Context needs bounded UTF-8 text without binary control bytes.',
-  );
-const contextFile = z
-  .strictObject({
-    kind: z.enum(['source', 'log']),
-    path: contextPath,
-    mode: z.enum(['100644', '100755']),
-    hash: HashSchema,
-    bytes: RevisionSchema.min(1).max(8192),
-    text: contextText,
-  })
-  .refine(
-    (file) =>
-      file.bytes === new TextEncoder().encode(file.text).length &&
-      (file.kind !== 'log' || !file.path.split('/').some((part) => part.startsWith('.'))),
-    'Context byte counts must match complete text and logs cannot read hidden locations.',
-  );
-export const ConversationContextBundleSchema = z
-  .strictObject({
-    version: z.literal(1),
-    projectId: ProjectIdSchema,
-    base: contextBase,
-    files: z.array(contextFile).min(1).max(32),
-  })
-  .superRefine((bundle, context) => {
-    const seen = new Set<string>(),
-      prefixes = new Map<string, string>();
-    let valid = true;
-    for (const [index, file] of bundle.files.entries()) {
-      const key = file.path.normalize('NFC').toLowerCase();
-      if (
-        seen.has(key) ||
-        prefixes.has(key) ||
-        (index > 0 && bundle.files[index - 1].path >= file.path)
-      )
-        valid = false;
-      const parts = file.path.split('/');
-      for (let end = 1; end <= parts.length; end++) {
-        const prefix = parts.slice(0, end).join('/'),
-          canonical = prefix.normalize('NFC').toLowerCase();
-        if (
-          (end < parts.length && seen.has(canonical)) ||
-          (prefixes.has(canonical) && prefixes.get(canonical) !== prefix)
-        )
-          valid = false;
-        prefixes.set(canonical, prefix);
-      }
-      seen.add(key);
-    }
-    if (!valid || new TextEncoder().encode(canonicalJson(bundle)).length > 32768)
-      context.addIssue({
-        code: 'custom',
-        message: 'Context needs ordered collision-free paths and at most 32768 canonical bytes.',
-      });
-  });
 export const ConversationContextRefSchema = z.strictObject({
   artifactId: ArtifactIdSchema,
   hash: HashSchema,
@@ -1855,30 +1798,8 @@ export const ConversationContextRefsSchema = z
       new Set(refs.map((ref) => ref.hash)).size === refs.length,
     'Context references need distinct artifact IDs and hashes.',
   );
-export const ConversationContextPickSchema = z.strictObject({
-  kind: z.enum(['source-file', 'source-folder', 'log-file']),
-  path: z
-    .string()
-    .min(1)
-    .max(4096)
-    .refine(
-      (path) =>
-        path.startsWith('/') &&
-        path.isWellFormed() &&
-        !path.includes('\\') &&
-        !/\p{Cc}/u.test(path) &&
-        new TextEncoder().encode(path).length <= 4096 &&
-        !path
-          .split('/')
-          .slice(1)
-          .some((part) => !part || part === '.' || part === '..'),
-      'A native context pick needs an absolute bounded path.',
-    ),
-});
-export type ConversationContextBundle = z.infer<typeof ConversationContextBundleSchema>;
 export type ConversationContextRef = z.infer<typeof ConversationContextRefSchema>;
 export type ConversationContextRefs = z.infer<typeof ConversationContextRefsSchema>;
-export type ConversationContextPick = z.infer<typeof ConversationContextPickSchema>;
 export const ConversationTextSchema = z
   .string()
   .min(1)
@@ -1978,13 +1899,51 @@ const conversationAgent = z.strictObject({
   routeId: RouteIdSchema,
 });
 const conversationUser = z.strictObject({ kind: z.literal('user') });
+// Chat messages share the conversation log so one cursor orders every message of a thread.
+const chatEntryText = (bytes: number) =>
+  z
+    .string()
+    .min(1)
+    .max(bytes)
+    .refine(
+      (value) =>
+        value.isWellFormed() &&
+        !value.includes('\0') &&
+        new TextEncoder().encode(value).length <= bytes,
+      'Chat text needs valid Unicode without null bytes.',
+    );
+const chatEntryKinds = new Set(['user-message', 'chat-assistant', 'chat-system']);
+/** One chat entry must fit a 524288-byte conversation page with its envelope. */
+export const MAX_CHAT_ENTRY_BYTES = 520_192;
 export const ConversationEntrySchema = z
   .discriminatedUnion('kind', [
     z.strictObject({
       ...conversationEntryFields,
       kind: z.literal('user-message'),
+      // Planning input stays bounded by its command payload. Chat input can be longer.
+      text: chatEntryText(65_536),
       author: conversationUser,
       context: ConversationContextRefsSchema.optional(),
+      attachments: z.array(z.string().min(1).max(4096)).max(32).optional(),
+    }),
+    z.strictObject({
+      ...conversationEntryFields,
+      kind: z.literal('chat-assistant'),
+      text: chatEntryText(262_144),
+      author: z.strictObject({
+        kind: z.literal('assistant'),
+        turnId: ChatTurnIdSchema,
+        family: ChatFamilySchema,
+        model: label,
+        role: ChatRoleSchema,
+        effort: ChatEffortSchema.optional(),
+      }),
+    }),
+    z.strictObject({
+      ...conversationEntryFields,
+      kind: z.literal('chat-system'),
+      text: chatEntryText(8192),
+      author: z.strictObject({ kind: z.literal('system'), turnId: ChatTurnIdSchema.nullable() }),
     }),
     z.strictObject({
       ...conversationEntryFields,
@@ -2039,7 +1998,7 @@ export const ConversationEntrySchema = z
         code: 'custom',
         message: 'Conversation output must match its admitted turn.',
       });
-    if (conversationBytes(entry) > 73728)
+    if (conversationBytes(entry) > (chatEntryKinds.has(entry.kind) ? MAX_CHAT_ENTRY_BYTES : 73728))
       context.addIssue({
         code: 'custom',
         message: 'A conversation entry exceeds its encoded byte limit.',
@@ -2397,22 +2356,20 @@ export const TaskConversationStateSchema = z
   });
 export type TaskConversationState = z.infer<typeof TaskConversationStateSchema>;
 export const CommandSchema = z.discriminatedUnion('command', [
-  mutate(
-    'CaptureConversationContext',
-    z.strictObject({
-      projectId: ProjectIdSchema,
-      base: contextBase,
-      selections: z
-        .array(ConversationContextPickSchema)
-        .min(1)
-        .max(4)
-        .refine(
-          (picks) =>
-            new Set(picks.map((pick) => `${pick.kind}:${pick.path}`)).size === picks.length,
-          'Native context picks must be distinct.',
-        ),
-    }),
-  ),
+  mutate('SendChatMessage', SendChatMessagePayloadSchema),
+  mutate('ResolveChatPermission', ResolveChatPermissionPayloadSchema),
+  mutate('StopChatTurn', StopChatTurnPayloadSchema),
+  mutate('ConfigureChatThread', ConfigureChatThreadPayloadSchema),
+  mutate('HandoffChatThread', HandoffChatThreadPayloadSchema),
+  mutate('AcceptChatChanges', AcceptChatChangesPayloadSchema),
+  read('ReadChatThread', ReadChatThreadPayloadSchema),
+  read('ReadChatChanges', ReadChatChangesPayloadSchema),
+  read('ReadChatCatalog', ReadChatCatalogPayloadSchema),
+  mutate('RefreshChatModels', RefreshChatModelsPayloadSchema),
+  mutate('SteerChatMessage', SteerChatMessagePayloadSchema),
+  mutate('PushChatBranch', PushChatBranchPayloadSchema),
+  mutate('OpenChatPullRequest', OpenChatPullRequestPayloadSchema),
+  read('ReadChatBranchStatus', ReadChatBranchStatusPayloadSchema),
   mutate(
     'ConfigureLocal',
     z.strictObject({ endpoint: LocalEndpointSchema, authMode: LocalAuthModeSchema.optional() }),
@@ -2423,58 +2380,9 @@ export const CommandSchema = z.discriminatedUnion('command', [
   mutate('CancelLocalConnectionInput', z.strictObject({ operationId: CommandIdSchema })),
   mutate('DisconnectLocal', empty),
   read('GetTaskConversationState', z.strictObject({ taskId: TaskIdSchema })),
-  mutate(
-    'RefreshTaskModelCatalog',
-    z.strictObject({
-      taskId: TaskIdSchema,
-      profileId: z.literal('openai-repository-v1'),
-    }),
-  ),
-  mutate(
-    'CreateTaskDiscussion',
-    z.strictObject({
-      projectId: ProjectIdSchema,
-      text: ConversationTextSchema,
-      planning: ConversationPlanningSelectionSchema,
-      context: ConversationContextRefsSchema.optional(),
-    }),
-  ),
-  mutate(
-    'ConfigureTaskConversation',
-    z.strictObject({ taskId: TaskIdSchema, planning: ConversationPlanningSelectionSchema }),
-  ),
-  mutate(
-    'AdoptTaskPlan',
-    z.strictObject({ taskId: TaskIdSchema, proposalId: MessageIdSchema, proposalHash: HashSchema }),
-  ),
   read(
     'GetTaskConversation',
     z.strictObject({ taskId: TaskIdSchema, beforeCursor: CursorSchema.optional() }),
-  ),
-  mutate(
-    'SendTaskMessage',
-    z.strictObject({
-      taskId: TaskIdSchema,
-      text: ConversationTextSchema,
-      context: ConversationContextRefsSchema.optional(),
-    }),
-  ),
-  mutate(
-    'QueueTaskGuidance',
-    z.strictObject({
-      taskId: TaskIdSchema,
-      text: ConversationTextSchema,
-      context: ConversationContextRefsSchema.optional(),
-    }),
-  ),
-  mutate(
-    'AnswerTaskQuestion',
-    z.strictObject({
-      taskId: TaskIdSchema,
-      questionId: MessageIdSchema,
-      text: ConversationTextSchema,
-      context: ConversationContextRefsSchema.optional(),
-    }),
   ),
   mutate('RegisterProject', z.strictObject({ path: text })),
   mutate(
@@ -2499,9 +2407,14 @@ export const CommandSchema = z.discriminatedUnion('command', [
     }),
   ),
   mutate('StopAnthropicUsage', z.strictObject({ operationId: CommandIdSchema })),
+  // Initialize and discover run on their own at launch as well as on a click. Authenticate opens
+  // a browser, so only a person starts it.
   mutate(
     'InitializeGoogleAcp',
-    z.strictObject({ profileId: z.literal('google-acp-v1'), consent: z.literal('explicit') }),
+    z.strictObject({
+      profileId: z.literal('google-acp-v1'),
+      consent: z.enum(['explicit', 'automatic']),
+    }),
   ),
   mutate(
     'AuthenticateGoogleAcp',
@@ -2517,7 +2430,7 @@ export const CommandSchema = z.discriminatedUnion('command', [
     z.strictObject({
       profileId: z.literal('google-acp-v1'),
       proofId: ArtifactIdSchema,
-      consent: z.literal('explicit'),
+      consent: z.enum(['explicit', 'automatic']),
     }),
   ),
   mutate(
@@ -3498,6 +3411,23 @@ export const ProjectOperationDataSchema = z
     'Operation detail must match its kind and task identity.',
   );
 export const ReadDataSchema = z.discriminatedUnion('kind', [
+  ChatThreadReadSchema.extend({ kind: z.literal('chat-thread') }),
+  ChatChangesReadSchema.extend({ kind: z.literal('chat-changes') }),
+  ChatCatalogReadSchema.extend({ kind: z.literal('chat-catalog') }),
+  z.strictObject({
+    kind: z.literal('chat-acceptance'),
+    branch: AcceptChatChangesPayloadSchema.shape.branch,
+    commit: z.string().regex(/^[a-f0-9]{40}$/),
+    fileCount: z.number().int().nonnegative(),
+  }),
+  ChatPushResultSchema.extend({ kind: z.literal('chat-push') }),
+  ChatPullRequestResultSchema.extend({ kind: z.literal('chat-pull-request') }),
+  ChatBranchStatusSchema.extend({ kind: z.literal('chat-branch-status') }),
+  /** What a stop took out of the thread's queue, so the composer can give the text back. */
+  z.strictObject({
+    kind: z.literal('chat-queue'),
+    messages: z.array(ChatQueuedMessageSchema).max(8),
+  }),
   WorkspaceStateSchema,
   TaskOperationsPageSchema,
   ProjectOperationDataSchema,
@@ -3609,6 +3539,10 @@ export const EventSchema = z.discriminatedUnion('type', [
   event('operation.updated', TaskOperationSummarySchema),
   event('combined.updated', CombinedRunPreviewSchema),
   event('conversation.entry', ConversationEntrySchema),
+  event('agent.event', AgentEventSchema),
+  event('chat.turn', ChatTurnSchema),
+  event('chat.thread', ChatThreadSchema),
+  event('chat.catalog', ChatCatalogChangeSchema),
   event('task.created', TaskSchema),
   event('task.updated', TaskSchema),
   event('run.prepared', RunSchema),
@@ -3740,6 +3674,7 @@ export type Event = z.infer<typeof EventSchema>;
 export type FakeWorkerInput = z.infer<typeof FakeWorkerInputSchema>;
 export type FakeWorkerEvent = z.infer<typeof FakeWorkerEventSchema>;
 export { canonicalJson } from './canonical.ts';
+export * from './chat.ts';
 
 export type Grant = z.infer<typeof GrantSchema>;
 export type Effect = z.infer<typeof EffectSchema>;

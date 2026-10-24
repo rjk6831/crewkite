@@ -1,5 +1,6 @@
 import {
   ConversationModelCatalogEntriesSchema,
+  ConversationModelCatalogEntrySchema,
   ConversationModelCatalogSchema,
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
@@ -8,6 +9,23 @@ import { type DiscoveryMetadata, OpenAiDiscovery } from './discovery.ts';
 import { type NativeLifecycle, startNativeSession } from './native-discovery.ts';
 import type { NativeProfileResolution } from './profile.ts';
 
+// The client lists older models only on request. The flag keeps them apart in the picker, and the
+// contract's own bounds still hold for the list.
+const observedModels = z
+  .array(
+    z.strictObject({
+      ...ConversationModelCatalogEntrySchema.shape,
+      hidden: z.literal(true).optional(),
+    }),
+  )
+  .refine(
+    (models) =>
+      ConversationModelCatalogEntriesSchema.safeParse(
+        models.map(({ hidden: _hidden, ...model }) => model),
+      ).success,
+    'A model list needs distinct bounded entries with supported efforts.',
+  );
+
 export const OpenAiModelCatalogObservationSchema = z.strictObject({
   version: z.literal(1),
   profileId: z.enum(['openai-file-v1', 'openai-repository-v1']),
@@ -15,7 +33,7 @@ export const OpenAiModelCatalogObservationSchema = z.strictObject({
   profileHash: ConversationModelCatalogSchema.shape.profileHash,
   client: ConversationModelCatalogSchema.shape.client,
   locationHash: ConversationModelCatalogSchema.shape.locationHash,
-  models: ConversationModelCatalogEntriesSchema,
+  models: observedModels,
 });
 
 export type OpenAiModelCatalogObservation = z.infer<typeof OpenAiModelCatalogObservationSchema>;
@@ -55,6 +73,7 @@ export function openAiModelCatalogObservation(
       model: model.model,
       efforts: model.supportedReasoningEfforts,
       defaultEffort: model.defaultReasoningEffort,
+      ...(model.hidden ? { hidden: true } : {}),
     })),
   });
 }
@@ -76,7 +95,52 @@ export function matchesOpenAiModelCatalogObservation(
   }
 }
 
-/** Read the native catalog without creating a thread or submitting a model turn. */
+/**
+ * A failed model read in words a person can act on. The session reason alone says too little:
+ * most failures come back as `protocol`, and the request that was waiting tells them apart. A
+ * client that exits early names its cause on stderr, so the last line it wrote follows, within
+ * the 400 characters a reason holds.
+ */
+export function modelReadFailure(outcome: {
+  reason: string | null;
+  lastRequest: string;
+  stderr?: readonly string[];
+}) {
+  const reason = readFailure(outcome);
+  const said = outcome.stderr?.at(-1);
+  return said ? `${reason} The client wrote: ${said}`.slice(0, 400) : reason;
+}
+
+function readFailure(outcome: { reason: string | null; lastRequest: string }) {
+  switch (outcome.reason) {
+    case 'deadline':
+      return 'The OpenAI client did not list its models within 20 seconds. Refresh to try again.';
+    case 'launch':
+      return 'The OpenAI client could not be started. Check that it is installed, then refresh.';
+    case 'output-limit':
+      return 'The OpenAI client wrote more output than a model read allows. Update the client, then refresh.';
+    case 'stopped':
+      return 'The model read stopped before it finished. Refresh to try again.';
+  }
+  switch (outcome.lastRequest) {
+    case 'account/read':
+      return 'The OpenAI client reported no ChatGPT sign-in. Sign in with a ChatGPT plan, then refresh.';
+    case 'features-list':
+    case 'config/read':
+    case 'configRequirements/read':
+      return 'The OpenAI client settings differ from the ones CrewKite runs it with. Update the client, then refresh.';
+    case 'model/list':
+    case 'complete':
+      return 'The OpenAI client listed no models CrewKite can offer. Update the client, then refresh.';
+    default:
+      return `The OpenAI client stopped answering at ${outcome.lastRequest}. Update the client, then refresh.`;
+  }
+}
+
+/**
+ * Read the native catalog without creating a thread or submitting a model turn. The read asks for
+ * hidden models too, so a thread that started on an older model can still pick it.
+ */
 export function startOpenAiModelCatalogObservation(
   profile: NativeProfileResolution,
   paths: { directory: string; repositoryRoot: string },
@@ -102,6 +166,7 @@ export function startOpenAiModelCatalogObservation(
         timeoutMs: remaining,
         readConfiguration: true,
         configurationDirectory: paths.directory,
+        includeHidden: true,
       }),
   );
   const result = handle.result.then((outcome) => {

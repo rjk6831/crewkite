@@ -53,6 +53,17 @@ export function secureWindow(window: BrowserWindow) {
   const signInInstructions =
     'https://github.com/rjk6831/crewkite/blob/main/docs/providers.md#anthropic-writer-preparation';
   contents.setWindowOpenHandler(({ url }) => {
+    // The Changes tab links to a pull request, a compare page or a CI run on GitHub. Those open in
+    // the person's browser; every other window open stays denied.
+    if (githubWorkLink(url)) {
+      void shell.openExternal(url).catch(() => {
+        dialog.showErrorBox(
+          'The link could not be opened',
+          `Open this address in your browser: ${url}`,
+        );
+      });
+      return { action: 'deny' };
+    }
     if (url === signInInstructions)
       void shell.openExternal(signInInstructions).catch(() => {
         dialog.showErrorBox(
@@ -66,6 +77,25 @@ export function secureWindow(window: BrowserWindow) {
   contents.on('will-navigate', (event) => event.preventDefault());
   contents.on('will-frame-navigate', (event) => event.preventDefault());
   contents.on('will-redirect', (event) => event.preventDefault());
+}
+
+function githubWorkLink(value: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  return (
+    url.protocol === 'https:' &&
+    url.hostname === 'github.com' &&
+    url.username === '' &&
+    url.password === '' &&
+    url.port === '' &&
+    /^\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/(pull\/[0-9]+|compare\/[^/]+|actions\/runs\/[0-9]+)(\/.*)?$/.test(
+      url.pathname,
+    )
+  );
 }
 
 export function assertSender(event: IpcMainInvokeEvent, window: BrowserWindow) {

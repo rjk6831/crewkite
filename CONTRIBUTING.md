@@ -6,6 +6,8 @@ CrewKite is early. I review every change myself, and these rules keep the codeba
 
 Use Node 24 (see `.nvmrc`) and pnpm. `pnpm install` points git at the hooks in `.githooks`, which check branch names, commit messages and staged paths before anything leaves your machine.
 
+Run `pnpm install` inside every git worktree you add. A worktree that borrows the main checkout's `node_modules` resolves `@crewkite/*` to the main checkout, so its own edits to `packages/contracts` never reach its type check or its tests.
+
 ## Branches and pull requests
 
 - Name branches `<type>/<kebab-topic>`, for example `feat/usage-gauges` or `fix/stale-approval`.

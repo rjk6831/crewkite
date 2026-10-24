@@ -406,6 +406,27 @@ export type AcpProcessOptions = {
   now?: () => number;
   schedule?: Schedule;
   spawn?: AcpSpawn;
+  /** A chat turn streams far more than a bounded writer. Callers raise these on purpose. */
+  limits?: Partial<AcpLimits>;
+};
+
+export type AcpLimits = {
+  maxTimeoutMs: number;
+  stdoutBytes: number;
+  frames: number;
+  requests: number;
+};
+export const writerAcpLimits: AcpLimits = {
+  maxTimeoutMs: 600000,
+  stdoutBytes: 4194304,
+  frames: 4096,
+  requests: 128,
+};
+export const chatAcpLimits: AcpLimits = {
+  maxTimeoutMs: 7200000,
+  stdoutBytes: 134217728,
+  frames: 262144,
+  requests: 4096,
 };
 
 const stderrLimit = 1048576;
@@ -463,14 +484,17 @@ export class AcpConnection {
   readonly output: Writable;
   private readonly failOwner: (error: AcpError) => void;
   private readonly checkActive: () => void;
+  private readonly limits: AcpLimits;
   constructor(
     output: Writable,
     fail: (error: AcpError) => void,
     checkActive: () => void = () => {},
+    limits: AcpLimits = writerAcpLimits,
   ) {
     this.output = output;
     this.failOwner = fail;
     this.checkActive = checkActive;
+    this.limits = limits;
   }
   assertActive() {
     this.checkActive();
@@ -486,12 +510,12 @@ export class AcpConnection {
       throw this.failure ?? new AcpError('protocol', { site: 'write' });
     const line = `${JSON.stringify(value)}\n`;
     this.sent += Buffer.byteLength(line);
-    if (Buffer.byteLength(line) > 1048576 || this.sent > 4194304)
+    if (Buffer.byteLength(line) > 1048576 || this.sent > this.limits.stdoutBytes)
       throw new AcpError('output-limit');
     this.output.write(line);
   }
   request(method: string, params: object, accept?: (value: unknown) => void): Promise<unknown> {
-    if (this.requests.size >= 32 || this.nextId >= 128)
+    if (this.requests.size >= 32 || this.nextId >= this.limits.requests)
       return Promise.reject(new AcpError('output-limit'));
     const id = ++this.nextId;
     const result = Promise.withResolvers<unknown>();
@@ -528,13 +552,13 @@ export class AcpConnection {
     let diagnostic: AcpDiagnostic = { site: 'json-bound' };
     try {
       this.received += chunk.byteLength;
-      if (this.received > 4194304) throw new AcpError('output-limit');
+      if (this.received > this.limits.stdoutBytes) throw new AcpError('output-limit');
       this.pending = Buffer.concat([this.pending, chunk]);
       for (;;) {
         diagnostic = { site: 'json-bound' };
         const end = this.pending.indexOf(10);
         if (end < 0) break;
-        if (end > 1048576 || ++this.frames > 4096) throw new AcpError('output-limit');
+        if (end > 1048576 || ++this.frames > this.limits.frames) throw new AcpError('output-limit');
         const bytes = this.pending.subarray(0, end);
         this.pending = this.pending.subarray(end + 1);
         diagnostic = { site: 'utf8' };
@@ -636,10 +660,11 @@ export function startAcpProcess<T>(
 ) {
   const now = options.now ?? (() => performance.now());
   const started = now();
+  const limits: AcpLimits = { ...writerAcpLimits, ...options.limits };
   if (
     !Number.isSafeInteger(options.timeoutMs) ||
     options.timeoutMs <= 1000 ||
-    options.timeoutMs > 600000
+    options.timeoutMs > limits.maxTimeoutMs
   )
     throw new AcpError('deadline');
   if (process.platform === 'win32' || !isAbsolute(options.directory))
@@ -705,7 +730,9 @@ export function startAcpProcess<T>(
       if (stopping) throw new AcpError(reason === 'deadline' ? 'deadline' : 'stopped');
       if (now() - started >= options.timeoutMs - 1000) throw new AcpError('deadline');
     },
+    limits,
   );
+
   child.stdout.on('data', (bytes: Buffer) => connection.push(bytes));
   child.stdout.once('end', () => connection.end());
   child.stdout.on('error', () =>

@@ -279,6 +279,20 @@ export async function packageDesktop() {
   if (git('status', '--porcelain', '--untracked-files=no'))
     throw new Error('Commit the tracked source changes before packaging.');
   const revision = git('rev-parse', 'HEAD');
+  // A package built from a checkout that fell behind its remote branch tests old code and the
+  // live check then reports fixed bugs again. The warning names the gap; it does not stop the build.
+  for (const ref of ['origin/feat/chat-thread', 'origin/main']) {
+    let behind = '';
+    try {
+      behind = git('rev-list', '--count', `HEAD..${ref}`);
+    } catch {
+      continue;
+    }
+    if (behind !== '0')
+      console.warn(
+        `Warning: ${ref} is ${behind} commits ahead of this checkout (${revision.slice(0, 7)}).`,
+      );
+  }
   const bootstrapFiles = ['scripts/demo-controller.ts', 'scripts/demo-state.ts'];
   const committedInputs = [...bootstrapFiles, 'apps/controller/src/main.ts', helperSourcePath];
   for (const path of committedInputs) {
@@ -695,7 +709,7 @@ export async function packageDesktop() {
       2,
     )}\n`,
   );
-  console.log(`Static package staged at ${stage}`);
+  console.log(`Static package staged at ${stage} from revision ${revision.slice(0, 7)}`);
   console.log(`Disposable build source retained at ${checkout}`);
   console.log('Desktop, relocation and recovery journeys remain unqualified.');
   console.log(

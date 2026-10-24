@@ -19,6 +19,7 @@ import {
   resolveAnthropicNativeProfile,
 } from './providers/anthropic/profile.ts';
 import { resolveGoogleNativeProfile } from './providers/google/profile.ts';
+import { startGpuProbe } from './providers/local/hardware.ts';
 import { resolveNativeProfile, resolveRepositoryProfile } from './providers/openai/profile.ts';
 import { serve } from './server/index.ts';
 
@@ -144,6 +145,9 @@ export async function startController(options: ControllerOptions) {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const home = process.env.CREWKITE_HOME ?? join(homedir(), '.crewkite');
   try {
+    // The GPU report takes a moment, so it starts with the process and the first workspace read
+    // after it lands carries the core count.
+    startGpuProbe();
     const runtime = await startController({ home, identity: () => configuredIdentity(home) });
     console.log(`Controller ready at ${runtime.socketPath}`);
     let closing = false;
