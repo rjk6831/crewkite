@@ -37,6 +37,7 @@ const roleNames: Record<ChatRole, string> = {
   reviewer: 'Reviewer',
   advisor: 'Advisor',
   challenger: 'Challenger',
+  fixer: 'Fixer',
 };
 const handoffModes: { id: ChatHandoffMode; label: string }[] = [
   { id: 'most-left', label: 'the provider with the most allowance left' },

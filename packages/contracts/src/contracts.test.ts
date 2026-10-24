@@ -6,6 +6,9 @@ import {
   ApprovalBindingSchema,
   AttemptOutputSchema,
   CandidateEvaluationPreviewSchema,
+  type ChatCatalogEntry,
+  ChatCrewSchema,
+  type ChatHandoffMode,
   CheckEventSchema,
   CheckResultSchema,
   CombinedNativeReviewJobSchema,
@@ -58,6 +61,7 @@ import {
   RoleSchema,
   RouteSchema,
   RuntimeManifestSchema,
+  rankFamilies,
   requiredReviewMethodIds,
   SnapshotSchema,
   SourceDetailsSchema,
@@ -3261,4 +3265,61 @@ test('a usage window limits only the models its scope and id name', () => {
       applies,
       `${windowId} ${scope ?? 'unscoped'} on ${model}`,
     );
+});
+
+test('each handoff mode ranks the families by its own rule', () => {
+  const now = Date.parse('2026-10-24T00:00:00.000Z');
+  const inHours = (hours: number) => new Date(now + hours * 3_600_000).toISOString();
+  const family = (
+    name: ChatCatalogEntry['family'],
+    percent: number | null,
+    resetsAt: string | null,
+  ): ChatCatalogEntry => ({
+    family: name,
+    connected: true,
+    reason: null,
+    models: [],
+    defaultModel: null,
+    remaining:
+      percent === null
+        ? []
+        : [{ windowId: 'weekly', label: 'Weekly', percent, resetsAt, observedAt: null }],
+  });
+  // OpenAI has the most left. Anthropic resets soonest. Google has the best pace: 60 percent over
+  // five hours is 12 an hour, against 10 for Anthropic and under 2 for OpenAI. Local reports none.
+  const families = [
+    family('openai', 80, inHours(48)),
+    family('anthropic', 20, inHours(2)),
+    family('google', 60, inHours(5)),
+    family('local', null, null),
+  ];
+  const rows: [ChatHandoffMode, string][] = [
+    ['most-left', 'openai google anthropic local'],
+    ['resets-first', 'anthropic google openai local'],
+    ['balanced', 'google anthropic openai local'],
+    ['local-first', 'local google anthropic openai'],
+  ];
+  for (const [mode, order] of rows)
+    assert.equal(
+      rankFamilies(families, [], () => null, mode, now)
+        .map((entry) => entry.family)
+        .join(' '),
+      order,
+      mode,
+    );
+});
+
+test('a crew names a builder and each role once', () => {
+  const selection = { family: 'openai', model: 'large-1', effort: 'default' } as const;
+  assert.ok(
+    ChatCrewSchema.safeParse({ name: 'Solo', members: [{ role: 'builder', selection }] }).success,
+  );
+  for (const members of [
+    [{ role: 'reviewer', selection }],
+    [
+      { role: 'builder', selection },
+      { role: 'builder', selection },
+    ],
+  ])
+    assert.equal(ChatCrewSchema.safeParse({ name: 'Bad', members }).success, false);
 });

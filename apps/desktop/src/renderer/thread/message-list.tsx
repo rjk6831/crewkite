@@ -13,6 +13,7 @@ const roleLabels = {
   reviewer: 'Reviewer',
   advisor: 'Advisor',
   challenger: 'Challenger',
+  fixer: 'Fixer',
 } as const;
 
 type TurnHandlers = {

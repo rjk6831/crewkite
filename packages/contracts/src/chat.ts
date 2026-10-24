@@ -13,8 +13,12 @@ const timestamp = z.iso.datetime();
 export const ChatTurnIdSchema = id('trn');
 export const ChatFamilySchema = z.enum(['openai', 'anthropic', 'google', 'local']);
 // A reviewer reads the changes. An advisor gives a second opinion on the last answer. A
-// challenger argues against the assumptions the last answer rests on. The last three read only.
-export const ChatRoleSchema = z.enum(['assistant', 'reviewer', 'advisor', 'challenger']);
+// challenger argues against the assumptions the last answer rests on. Those three read only. A
+// fixer is the builder again, run with a review's findings, and writes like the assistant.
+export const ChatRoleSchema = z.enum(['assistant', 'reviewer', 'advisor', 'challenger', 'fixer']);
+/** Roles whose turns edit the scratch copy. Every other role runs read only. */
+export const writesScratch = (role: z.infer<typeof ChatRoleSchema>) =>
+  role === 'assistant' || role === 'fixer';
 // The clients name their own levels. OpenAI offers up to ultra on some models, Anthropic up to max.
 export const ChatEffortSchema = z.enum([
   'minimal',
@@ -29,9 +33,16 @@ export const ChatEffortSchema = z.enum([
 /**
  * How the thread picks the next family when a limit stops a turn and automatic handoff is on.
  * most-left takes the family with the most allowance left. resets-first spends the allowance that
- * resets soonest while it lasts.
+ * resets soonest while it lasts. balanced ranks by allowance left per hour until reset, so every
+ * window is spent at the rate it can afford. local-first takes Local while it is connected, then
+ * ranks the rest as balanced.
  */
-export const ChatHandoffModeSchema = z.enum(['most-left', 'resets-first']);
+export const ChatHandoffModeSchema = z.enum([
+  'most-left',
+  'resets-first',
+  'balanced',
+  'local-first',
+]);
 export type ChatHandoffMode = z.infer<typeof ChatHandoffModeSchema>;
 
 /** The person's selection for the next turn. The controller validates it against the catalog. */
@@ -41,6 +52,52 @@ export const ChatModelSelectionSchema = z.strictObject({
   effort: ChatEffortSchema.default('default'),
 });
 export type ChatModelSelection = z.infer<typeof ChatModelSelectionSchema>;
+
+/**
+ * Who runs each step of the chain after a builder turn. The builder answers the person, the
+ * reviewer reads the changes, the fixer is the builder again with the findings, and the challenger
+ * argues against the assumptions. Builder is required; a crew without a reviewer has no chain.
+ */
+export const ChatCrewRoleSchema = z.enum(['builder', 'reviewer', 'challenger', 'fixer']);
+export type ChatCrewRole = z.infer<typeof ChatCrewRoleSchema>;
+export const ChatCrewSchema = z
+  .strictObject({
+    name: z.string().min(1).max(60),
+    members: z
+      .array(z.strictObject({ role: ChatCrewRoleSchema, selection: ChatModelSelectionSchema }))
+      .min(1)
+      .max(4),
+  })
+  .refine(
+    (crew) => new Set(crew.members.map((member) => member.role)).size === crew.members.length,
+    'A crew names each role at most once.',
+  )
+  .refine(
+    (crew) => crew.members.some((member) => member.role === 'builder'),
+    'A crew needs a builder.',
+  );
+export type ChatCrew = z.infer<typeof ChatCrewSchema>;
+
+/**
+ * How far the crew runs on its own. manual runs nothing after a builder turn. balanced runs the
+ * chain and asks before risky actions. glide runs the chain to the end and stops only on a
+ * failure, or on a permission the policy does not cover. Entering glide turns automatic handoff
+ * on, so a usage limit moves the step to the next family.
+ */
+export const ChatFlightModeSchema = z.enum(['manual', 'balanced', 'glide']);
+export type ChatFlightMode = z.infer<typeof ChatFlightModeSchema>;
+
+/** Where the crew chain stands after the builder turn it follows. One chain runs at a time. */
+export const ChatCrewChainSchema = z.strictObject({
+  /** The builder turn the chain follows. */
+  builderTurnId: ChatTurnIdSchema,
+  step: z.enum(['review', 'fix', 'challenge', 'finished', 'stopped']),
+  reviewRounds: z.number().int().min(0).max(3),
+  fixes: z.number().int().min(0).max(2),
+  /** Why the chain stopped early, in words for the person. Null while it runs or once it finishes. */
+  reason: z.string().min(1).max(400).nullable().default(null),
+});
+export type ChatCrewChain = z.infer<typeof ChatCrewChainSchema>;
 
 export const ChatToolKindSchema = z.enum(['read', 'search', 'edit', 'command', 'other']);
 
@@ -84,6 +141,20 @@ export const ChatFileDiffSchema = z.strictObject({
 });
 
 const turnRef = { turnId: ChatTurnIdSchema };
+
+/** Measured cost of one turn. Null where the runtime did not report the value. */
+export const ChatTurnStatsSchema = z.strictObject({
+  tokensIn: z.number().int().nonnegative().nullable(),
+  tokensOut: z.number().int().nonnegative().nullable(),
+  tokensPerSecond: z.number().nonnegative().finite().nullable(),
+  firstTokenMs: z.number().int().nonnegative().nullable(),
+  turnMs: z.number().int().nonnegative(),
+  contextUsed: z.number().int().nonnegative().nullable(),
+  contextCapacity: z.number().int().positive().nullable(),
+  /** Rolling summaries the prompt carried, counting one written during this turn. */
+  summaries: z.number().int().min(0).max(10_000),
+});
+export type ChatTurnStats = z.infer<typeof ChatTurnStatsSchema>;
 
 /** One normalized event from a running agent turn. Order inside a turn is the order emitted. */
 export const AgentEventSchema = z.discriminatedUnion('type', [
@@ -149,6 +220,17 @@ export const AgentEventSchema = z.discriminatedUnion('type', [
     level: z.enum(['info', 'warning']),
     message: z.string().min(1).max(4096),
   }),
+  // The adapter's own measure of the turn. Local reports it every turn; others may not.
+  z.strictObject({ type: z.literal('turn.stats'), ...turnRef, stats: ChatTurnStatsSchema }),
+  // The adapter folded earlier turns into a rolling summary to fit the model's context.
+  z.strictObject({
+    type: z.literal('context.compacted'),
+    ...turnRef,
+    summaries: z.number().int().min(1).max(10_000),
+    coveredTurns: z.number().int().min(1).max(100_000),
+    usedTokens: z.number().int().nonnegative(),
+    capacityTokens: z.number().int().positive(),
+  }),
   z.strictObject({
     type: z.literal('turn.completed'),
     ...turnRef,
@@ -185,6 +267,8 @@ export const ChatTurnSchema = z.strictObject({
   stopReason: z.enum(['done', 'stopped', 'limit', 'error']).nullable().optional(),
   /** Process groups of the turn not yet proven gone. The next command and startup check again. */
   groups: z.array(z.number().int().positive()).max(64).optional(),
+  /** The last turn.stats the adapter reported. */
+  stats: ChatTurnStatsSchema.optional(),
 });
 export type ChatTurn = z.infer<typeof ChatTurnSchema>;
 
@@ -228,6 +312,11 @@ export const ChatThreadSchema = z.strictObject({
    * once the thread is free. Stopping the running turn clears them.
    */
   queued: z.array(ChatQueuedMessageSchema).max(8).default([]),
+  /** The crew the thread runs and how far it runs on its own. A thread with no crew is manual. */
+  crew: ChatCrewSchema.nullable().default(null),
+  flightMode: ChatFlightModeSchema.default('manual'),
+  /** The chain after the last builder turn. Null when no chain has run in this thread. */
+  crewChain: ChatCrewChainSchema.nullable().default(null),
   /** Tool kinds the person allowed for the whole thread. Adapters answer these without asking. */
   permissionGrants: z.array(ChatToolKindSchema).max(8).optional(),
   /**
@@ -246,6 +335,18 @@ export const ChatThreadSchema = z.strictObject({
         .regex(/^[a-f0-9]{40}$/)
         .nullable()
         .default(null),
+    })
+    .nullable()
+    .optional(),
+  /** The last push of an accepted branch, made by the person's click with their git credentials. */
+  lastPush: z
+    .strictObject({
+      branch: z.string().min(1).max(200),
+      remote: z.string().min(1).max(100),
+      commit: z.string().regex(/^[a-f0-9]{40}$/),
+      at: timestamp,
+      /** The pull request opened for the branch, or the compare link the person was given. */
+      pullRequestUrl: z.url().max(2048).nullable().default(null),
     })
     .nullable()
     .optional(),
@@ -278,6 +379,14 @@ export const ConfigureChatThreadPayloadSchema = z.strictObject({
   handoffMode: ChatHandoffModeSchema.optional(),
   /** Take a queued message back before it starts. */
   dequeue: id('msg').optional(),
+  /** Null clears the crew; the thread goes back to manual. */
+  crew: ChatCrewSchema.nullable().optional(),
+  flightMode: ChatFlightModeSchema.optional(),
+});
+/** Stop the running turn cleanly and start a queued message now, with the stopped turn's packet. */
+export const SteerChatMessagePayloadSchema = z.strictObject({
+  taskId: id('tsk'),
+  messageId: id('msg'),
 });
 export const AcceptChatChangesPayloadSchema = z.strictObject({
   taskId: id('tsk'),
@@ -287,7 +396,64 @@ export const AcceptChatChangesPayloadSchema = z.strictObject({
     .min(1)
     .max(200)
     .regex(/^(?!.*\/\/)[a-z0-9][a-z0-9/-]*[a-z0-9]$/),
+  /** The commit message. The controller writes its own when the person leaves it out. */
+  message: z.string().min(1).max(4096).optional(),
 });
+const branchName = AcceptChatChangesPayloadSchema.shape.branch;
+/**
+ * Push an accepted branch with the person's own git credentials. Only a person's click sends it,
+ * after the confirmation sentence; `confirmed` records that they saw it.
+ */
+export const PushChatBranchPayloadSchema = z.strictObject({
+  taskId: id('tsk'),
+  branch: branchName,
+  remote: z
+    .string()
+    .regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/)
+    .default('origin'),
+  confirmed: z.literal(true),
+});
+/** Open a pull request for a pushed branch through gh, or hand back the compare link. */
+export const OpenChatPullRequestPayloadSchema = z.strictObject({
+  taskId: id('tsk'),
+  branch: branchName,
+  title: z.string().min(1).max(256),
+  body: z.string().max(16_384).default(''),
+});
+export const ReadChatBranchStatusPayloadSchema = z.strictObject({
+  taskId: id('tsk'),
+  branch: branchName,
+});
+export const ChatPushResultSchema = z.strictObject({
+  branch: branchName,
+  remote: z.string().min(1).max(100),
+  commit: z.string().regex(/^[a-f0-9]{40}$/),
+});
+export const ChatPullRequestResultSchema = z.strictObject({
+  url: z.url().max(2048),
+  /** gh opened the request, or gh is missing and this is the compare link to open by hand. */
+  via: z.enum(['gh', 'compare-link']),
+});
+export const ChatBranchStatusSchema = z.strictObject({
+  branch: branchName,
+  /** Null when gh is missing or cannot read the repository; the reason says which. */
+  runs: z
+    .array(
+      z.strictObject({
+        id: z.string().min(1).max(64),
+        name: z.string().min(1).max(256),
+        status: z.enum(['queued', 'in_progress', 'completed', 'waiting', 'requested', 'pending']),
+        conclusion: z.string().min(1).max(64).nullable(),
+        url: z.url().max(2048),
+        createdAt: timestamp,
+      }),
+    )
+    .max(20)
+    .nullable(),
+  reason: z.string().min(1).max(400).nullable(),
+  readAt: timestamp,
+});
+export type ChatBranchStatus = z.infer<typeof ChatBranchStatusSchema>;
 export const HandoffChatThreadPayloadSchema = z.strictObject({
   taskId: id('tsk'),
   selection: ChatModelSelectionSchema,
@@ -326,6 +492,7 @@ export const ChatMessageSchema = z.strictObject({
       family: ChatFamilySchema,
       model: short,
       role: ChatRoleSchema,
+      effort: ChatEffortSchema.optional(),
     }),
     z.strictObject({ kind: z.literal('system'), turnId: ChatTurnIdSchema.nullable() }),
   ]),
@@ -386,6 +553,12 @@ export const ChatCatalogEntrySchema = z.strictObject({
     )
     .max(8)
     .default([]),
+  /** When the usage reader last received a reading for the family. Null when it never has. */
+  readAt: timestamp.nullable().optional(),
+  /** The family's client is installed and its usage reads, but chat needs Connect first. */
+  needsConnect: z.boolean().optional(),
+  /** The last turn's stats on this family, for the rail and the Local card. */
+  lastTurnStats: ChatTurnStatsSchema.nullable().optional(),
 });
 export const ChatCatalogReadSchema = z.strictObject({
   families: z.array(ChatCatalogEntrySchema).max(4),
@@ -486,29 +659,47 @@ export function tightestAllowance(
 }
 
 /**
- * Families in the order a person would pick them: connected first, then most allowance left,
- * then soonest reset. Each family is scored on the model it would run, `modelFor`, which is the
- * catalog default unless the caller tracks another. A family with no known percent ranks after
- * every known one. A family at zero never ranks, since a turn there ends on the limit it already
- * hit.
+ * Families in the order a person would pick them: connected first, then by the thread's mode, on
+ * the model each family would run, `modelFor`, which is the catalog default unless the caller
+ * tracks another. A family with no known percent ranks after every known one. A family at zero
+ * never ranks, since a turn there ends on the limit it already hit. `now` is injected so balanced
+ * ranks the same in a test as on the clock.
  */
 export function rankFamilies(
   families: readonly ChatCatalogEntry[],
   exclude: readonly ChatCatalogEntry['family'][] = [],
   modelFor: (entry: ChatCatalogEntry) => string | null = (entry) => entry.defaultModel,
   mode: ChatHandoffMode = 'most-left',
+  now: number = Date.now(),
 ): ChatCatalogEntry[] {
   const score = (entry: ChatCatalogEntry) => tightestAllowance(entry, modelFor(entry));
   const reset = (value: string | null) => (value ? Date.parse(value) : Number.POSITIVE_INFINITY);
+  // Percent left per hour until reset. A reset closer than fifteen minutes counts as fifteen, so
+  // a window about to refill does not outrank everything on a tiny divisor. A window with no
+  // reset time spreads over an infinite span and ranks after every timed window.
+  const rate = (allowance: { percent: number; resetsAt: string | null }) =>
+    allowance.percent / Math.max((reset(allowance.resetsAt) - now) / 3_600_000, 0.25);
   return families
     .filter((entry) => entry.connected && !exclude.includes(entry.family))
     .filter((entry) => score(entry).percent !== 0)
     .sort((left, right) => {
+      if (mode === 'local-first' && (left.family === 'local') !== (right.family === 'local'))
+        return left.family === 'local' ? -1 : 1;
       const a = score(left);
       const b = score(right);
-      // A family with no reading sorts last in both modes. It may be out already.
+      // A family with no reading sorts last in every mode. It may be out already.
       if (a.percent === null && b.percent !== null) return 1;
       if (b.percent === null && a.percent !== null) return -1;
+      if (
+        a.percent !== null &&
+        b.percent !== null &&
+        (mode === 'balanced' || mode === 'local-first')
+      ) {
+        const pace =
+          rate({ percent: b.percent, resetsAt: b.resetsAt }) -
+          rate({ percent: a.percent, resetsAt: a.resetsAt });
+        if (pace !== 0) return pace;
+      }
       // Allowance that resets soonest is lost soonest, so resets-first spends it while it lasts.
       // A window with no reset time counts as the farthest away.
       if (mode === 'resets-first' && reset(a.resetsAt) !== reset(b.resetsAt))

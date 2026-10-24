@@ -53,6 +53,9 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
     activeTurnId: null,
     autoHandoff: false,
     handoffMode: 'most-left',
+    crew: null,
+    flightMode: 'manual',
+    crewChain: null,
     queued: [],
   };
   const messages: ChatMessage[] = [];

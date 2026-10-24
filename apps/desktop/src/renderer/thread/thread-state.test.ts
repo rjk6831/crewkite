@@ -100,6 +100,9 @@ test('a turn sits right after the user message that started it', () => {
     activeTurnId: null,
     autoHandoff: false,
     handoffMode: 'most-left',
+    crew: null,
+    flightMode: 'manual',
+    crewChain: null,
     queued: [],
   };
   const at = (minutes: number) => new Date(Date.parse(stamp) + minutes * 60_000).toISOString();
@@ -319,6 +322,9 @@ test('a message the controller queued leaves no pending bubble', () => {
     activeTurnId: turn,
     autoHandoff: false,
     handoffMode: 'most-left',
+    crew: null,
+    flightMode: 'manual',
+    crewChain: null,
     queued: [{ id: id('msg', 9), at: stamp, text, role: 'assistant', attachments: [] }],
   };
   const pending = { localId: 'local-1', text, attachments: [], at: stamp };
@@ -410,6 +416,9 @@ test('the limit offer shows only while the newest turn is the one that hit a lim
     activeTurnId: null,
     autoHandoff: false,
     handoffMode: 'most-left',
+    crew: null,
+    flightMode: 'manual',
+    crewChain: null,
     queued: [],
   };
   const reopened = (turns: ChatTurn[]) =>
@@ -609,6 +618,9 @@ test('a reply restored from a thread read keeps the role of its turn for the bad
       activeTurnId: null,
       autoHandoff: false,
       handoffMode: 'most-left',
+      crew: null,
+      flightMode: 'manual',
+      crewChain: null,
       queued: [],
     },
     turns: [
@@ -662,6 +674,9 @@ test('stream events that a thread read already covers apply once', () => {
     activeTurnId: turn,
     autoHandoff: false,
     handoffMode: 'most-left',
+    crew: null,
+    flightMode: 'manual',
+    crewChain: null,
     queued: [],
   };
   const delta = (cursor: number, text: string) =>

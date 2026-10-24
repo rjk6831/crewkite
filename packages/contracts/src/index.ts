@@ -2,10 +2,14 @@ import { z } from 'zod';
 import {
   AcceptChatChangesPayloadSchema,
   AgentEventSchema,
+  ChatBranchStatusSchema,
   ChatCatalogChangeSchema,
   ChatCatalogReadSchema,
   ChatChangesReadSchema,
+  ChatEffortSchema,
   ChatFamilySchema,
+  ChatPullRequestResultSchema,
+  ChatPushResultSchema,
   ChatQueuedMessageSchema,
   ChatRoleSchema,
   ChatThreadReadSchema,
@@ -14,12 +18,16 @@ import {
   ChatTurnSchema,
   ConfigureChatThreadPayloadSchema,
   HandoffChatThreadPayloadSchema,
+  OpenChatPullRequestPayloadSchema,
+  PushChatBranchPayloadSchema,
+  ReadChatBranchStatusPayloadSchema,
   ReadChatCatalogPayloadSchema,
   ReadChatChangesPayloadSchema,
   ReadChatThreadPayloadSchema,
   RefreshChatModelsPayloadSchema,
   ResolveChatPermissionPayloadSchema,
   SendChatMessagePayloadSchema,
+  SteerChatMessagePayloadSchema,
   StopChatTurnPayloadSchema,
 } from './chat.ts';
 
@@ -429,6 +437,10 @@ export const LocalHardwareStatusSchema = z
       .nullable(),
     totalMemoryBytes: RevisionSchema.min(1).nullable(),
     availableMemoryBytes: RevisionSchema.nullable(),
+    /** GPU cores the system reports, read once at launch on Apple Silicon. */
+    gpuCores: RevisionSchema.min(1).max(4096).nullable().optional(),
+    /** The chip or GPU name the same report gives, such as an Apple Silicon chip name. */
+    gpuModel: localText(200).nullable().optional(),
     sampledAt: TimestampSchema,
   })
   .refine(
@@ -1924,6 +1936,7 @@ export const ConversationEntrySchema = z
         family: ChatFamilySchema,
         model: label,
         role: ChatRoleSchema,
+        effort: ChatEffortSchema.optional(),
       }),
     }),
     z.strictObject({
@@ -2353,6 +2366,10 @@ export const CommandSchema = z.discriminatedUnion('command', [
   read('ReadChatChanges', ReadChatChangesPayloadSchema),
   read('ReadChatCatalog', ReadChatCatalogPayloadSchema),
   mutate('RefreshChatModels', RefreshChatModelsPayloadSchema),
+  mutate('SteerChatMessage', SteerChatMessagePayloadSchema),
+  mutate('PushChatBranch', PushChatBranchPayloadSchema),
+  mutate('OpenChatPullRequest', OpenChatPullRequestPayloadSchema),
+  read('ReadChatBranchStatus', ReadChatBranchStatusPayloadSchema),
   mutate(
     'ConfigureLocal',
     z.strictObject({ endpoint: LocalEndpointSchema, authMode: LocalAuthModeSchema.optional() }),
@@ -3403,6 +3420,9 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
     commit: z.string().regex(/^[a-f0-9]{40}$/),
     fileCount: z.number().int().nonnegative(),
   }),
+  ChatPushResultSchema.extend({ kind: z.literal('chat-push') }),
+  ChatPullRequestResultSchema.extend({ kind: z.literal('chat-pull-request') }),
+  ChatBranchStatusSchema.extend({ kind: z.literal('chat-branch-status') }),
   /** What a stop took out of the thread's queue, so the composer can give the text back. */
   z.strictObject({
     kind: z.literal('chat-queue'),

@@ -287,6 +287,10 @@ export function applyEvent(view: TurnView, event: AgentEvent): TurnView {
           message: event.message,
         },
       ]);
+    // Stats and compaction carry no block of their own yet.
+    case 'turn.stats':
+    case 'context.compacted':
+      return view;
     case 'turn.completed':
       return finish(view, event);
   }
