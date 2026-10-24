@@ -1297,7 +1297,7 @@ export class Controller {
       case 'StopChatTurn':
         return this.chat().stopTurn(command.payload, effects);
       case 'ConfigureChatThread':
-        return this.chat().configure(command.payload);
+        return this.chat().configure(command.payload, effects);
       case 'HandoffChatThread':
         return this.chat().handoff(command.payload, effects);
       case 'SteerChatMessage':
