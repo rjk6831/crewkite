@@ -781,6 +781,19 @@ export class Controller {
     if (command.command === 'ObserveUsage') return this.observeUsageCommand(command, principal);
     // A model read changes no task and no authority. A retry with the same key reads again.
     if (command.command === 'RefreshChatModels') return this.readChatModels();
+    // Git steps after Accept run git and gh, which wait on the network, so they answer later.
+    if (
+      command.command === 'PushChatBranch' ||
+      command.command === 'OpenChatPullRequest' ||
+      command.command === 'ReadChatBranchStatus'
+    ) {
+      if (!this.store.get<Task>('task', command.payload.taskId))
+        return { outcome: 'blocked', reason: 'task-not-found', next: 'Choose a registered task.' };
+      if (command.command === 'PushChatBranch') return this.chat().pushBranch(command.payload);
+      if (command.command === 'OpenChatPullRequest')
+        return this.chat().openPullRequest(command.payload);
+      return this.chat().branchStatus(command.payload);
+    }
     const preparing = this.verificationPreparation;
     if (preparing?.key === command.key)
       return preparing.hash === hashCanonical(command) && preparing.principal === principal
@@ -1136,6 +1149,7 @@ export class Controller {
         'ConfigureChatThread',
         'HandoffChatThread',
         'AcceptChatChanges',
+        'SteerChatMessage',
       ].includes(command.command)
     ) {
       // A thread streams events many times a second. Its commands serialize on the active turn,
@@ -1286,6 +1300,8 @@ export class Controller {
         return this.chat().configure(command.payload);
       case 'HandoffChatThread':
         return this.chat().handoff(command.payload, effects);
+      case 'SteerChatMessage':
+        return this.chat().steer(command.payload, effects);
       case 'AcceptChatChanges':
         return this.chat().accept(
           command.payload,

@@ -242,6 +242,7 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
         'ReadChatChanges',
         'ReadChatCatalog',
         'RefreshChatModels',
+        'ReadChatBranchStatus',
         'GetProjectOperation',
         'PrepareProjectCommand',
         'StartProjectCommand',
@@ -276,10 +277,10 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       activeCommand?.command === 'StartRun' &&
       activeCommand.payload.taskId === command.payload.taskId &&
       activeCommand.payload.runId === command.payload.runId;
-    // A chat turn runs on its own in the controller. Its stop has to get through while another
-    // desktop command holds the lock or waits for an exact retry, so it neither waits for a lock
-    // nor takes one.
-    const stopTurn = command.command === 'StopChatTurn';
+    // A chat turn runs on its own in the controller. Its stop, and a steer that stops it, have to
+    // get through while another desktop command holds the lock or waits for an exact retry, so
+    // they neither wait for a lock nor take one.
+    const stopTurn = command.command === 'StopChatTurn' || command.command === 'SteerChatMessage';
     const cancellation = stopSetup || matchesStart || stopTurn;
     if (!stopTurn && (cancelling || (busy && !(matchesSetup || matchesStart))))
       throw new Error('Wait for the pending desktop command.');

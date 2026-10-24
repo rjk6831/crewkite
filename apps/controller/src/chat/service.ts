@@ -63,6 +63,12 @@ import {
 } from './adapter.ts';
 import { scratchChanges } from './changes.ts';
 import {
+  type ChatGitHost,
+  openChatPullRequest,
+  pushChatBranch,
+  readChatBranchStatus,
+} from './git.ts';
+import {
   adviceContext,
   challengeContext,
   familyName,
@@ -419,6 +425,51 @@ export class ChatService {
     return {
       outcome: 'applied',
       data: { kind: 'chat-acceptance', branch: payload.branch, commit, fileCount },
+    };
+  }
+
+  /**
+   * Stop the running turn and start a queued message as soon as the provider lets go, with the
+   * stopped turn's packet, the same path a limit stop takes.
+   */
+  steer(_payload: Payload<'SteerChatMessage'>, _effects: Effects): CommandResult {
+    return blocked('steer-unavailable', 'Stop the reply, then send the message.');
+  }
+
+  pushBranch(payload: Payload<'PushChatBranch'>): Promise<CommandResult> {
+    return pushChatBranch(this.gitHost(), payload);
+  }
+
+  openPullRequest(payload: Payload<'OpenChatPullRequest'>): Promise<CommandResult> {
+    return openChatPullRequest(this.gitHost(), payload);
+  }
+
+  async branchStatus(payload: Payload<'ReadChatBranchStatus'>): Promise<CommandResult> {
+    const status = await readChatBranchStatus(this.gitHost(), payload);
+    return { outcome: 'applied', data: { kind: 'chat-branch-status', ...status } };
+  }
+
+  private gitHost(): ChatGitHost {
+    return {
+      thread: (taskId) => (this.task(taskId) ? this.thread(taskId) : null),
+      saveThread: (taskId, thread) => {
+        const task = this.task(taskId);
+        if (task) this.putThread(task, thread);
+      },
+      note: (taskId, text) => {
+        const task = this.task(taskId);
+        if (task)
+          this.appendEntry(task, {
+            kind: 'chat-system',
+            author: { kind: 'system', turnId: null },
+            text,
+          });
+      },
+      projectRoot: (taskId) => {
+        const task = this.task(taskId);
+        return task && this.deps.projectPath(task.projectId);
+      },
+      now: this.deps.now,
     };
   }
 
