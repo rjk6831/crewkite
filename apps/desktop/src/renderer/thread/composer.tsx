@@ -16,7 +16,7 @@ import {
   useState,
 } from 'react';
 import { ContextGauge } from '../context-gauge.tsx';
-import { preferredSelection } from '../settings/preferences.ts';
+import { flightModes, preferredSelection } from '../settings/preferences.ts';
 import { AttachmentChips, AttachRow } from './attach.tsx';
 import { configureThread, readCatalog, type ThreadSource } from './commands.ts';
 import { defaultSelection, ModelPicker } from './model-picker.tsx';
@@ -52,6 +52,7 @@ export function Composer({
   onStop,
   onConfigured,
   onHandoff,
+  onOpenCrew,
 }: {
   ref?: Ref<ComposerHandle>;
   source: ThreadSource;
@@ -66,6 +67,8 @@ export function Composer({
   onStop: () => Promise<void>;
   onConfigured: (selection: ChatModelSelection) => void;
   onHandoff: (selection: ChatModelSelection) => Promise<void>;
+  /** Opens the inspector on the Crew tab. A new thread has no crew yet and leaves it out. */
+  onOpenCrew?: () => void;
 }) {
   const draftKey = taskId ?? 'new';
   const [text, setText] = useState(() => drafts.get(draftKey) ?? '');
@@ -115,6 +118,7 @@ export function Composer({
     if (thread?.selection) setSelection(thread.selection);
   }, [thread?.selection]);
   const chosen = selection ?? preferredSelection(catalog) ?? defaultSelection(catalog);
+  const flight = flightModes.find(({ id }) => id === thread?.flightMode) ?? flightModes[0];
   const roles = useRoleRun({
     source,
     taskId,
@@ -251,6 +255,17 @@ export function Composer({
               )
             }
           />
+          {onOpenCrew && thread && (
+            <button
+              type="button"
+              className="th-pill th-flight"
+              data-mode={flight.id}
+              title={`${flight.title} Open Crew to change it.`}
+              onClick={onOpenCrew}
+            >
+              {thread.crew ? `${flight.label} · ${thread.crew.name}` : flight.label}
+            </button>
+          )}
           <div className="th-bar-end">
             {context?.capacity && (
               <ContextGauge

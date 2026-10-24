@@ -5,6 +5,7 @@ import { AttachmentChips } from './attach.tsx';
 import { FailureLine, PermissionCard, ThinkingCard, ToolCard, ToolRunCard } from './cards.tsx';
 import { FamilyMark } from './family-mark.tsx';
 import { Markdown } from './markdown.tsx';
+import { effortLabels } from './model-picker.tsx';
 import type { ThreadItem, TurnView } from './thread-state.ts';
 import { viewBlocks } from './turn-fold.ts';
 import { TurnStats } from './turn-stats.tsx';
@@ -16,6 +17,22 @@ const roleLabels = {
   challenger: 'Challenger',
   fixer: 'Fixer',
 } as const;
+
+/**
+ * `OpenAI · gpt-6.1-sol · Ultra`, after the family mark. A default effort is left out: the client
+ * picked it and the label would say nothing.
+ */
+export function modelLine(selection: {
+  family: string;
+  model: string;
+  effort?: keyof typeof effortLabels;
+}) {
+  const effort =
+    selection.effort && selection.effort !== 'default'
+      ? ` · ${effortLabels[selection.effort]}`
+      : '';
+  return `${familyName(selection.family)} · ${selection.model}${effort}`;
+}
 
 type TurnHandlers = {
   onResolve: (turn: TurnView, requestId: string, choice: string) => Promise<void>;
@@ -40,9 +57,7 @@ const TurnRow = memo(function TurnRow({
       {identity && (
         <header className="th-turn-head">
           <FamilyMark family={identity.family} />
-          <span>
-            {familyName(identity.family)} · {identity.model}
-          </span>
+          <span>{modelLine(identity)}</span>
           {role && <span className="th-role">{role}</span>}
         </header>
       )}

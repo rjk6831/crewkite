@@ -2,20 +2,42 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'r
 import { isThreadEvent, readThread, type ThreadSource } from './commands.ts';
 import {
   activeTurnId,
+  FIRST_READ_BACKOFF,
   initialThreadState,
+  type ReadClock,
   reduceThread,
+  retryRead,
   type ThreadEvent,
+  TRY_AGAIN_AFTER_MS,
   threadItems,
 } from './thread-state.ts';
+
+const browserClock: ReadClock = {
+  now: () => Date.now(),
+  wait: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+};
 
 const isTurnEnd = (event: ThreadEvent) =>
   event.type === 'agent.event' &&
   (event.payload as { type?: string } | null)?.type === 'turn.completed';
+const message = (failure: unknown) =>
+  failure instanceof Error ? failure.message : 'The thread could not be loaded.';
+
 // Loads the thread once, then applies the live stream on top. Events are held until the read
 // returns and then applied on top of it, and the reducer drops the ones the read already covers. A
 // finished turn triggers one more read so the stored messages and the streamed view cannot drift
 // apart.
-export function useThread(source: ThreadSource, taskId: string, connection: string) {
+//
+// The controller answers one command at a time, so a read can wait behind slower ones and time
+// out. The first read retries on a backoff and reports a failure only after ten seconds; the
+// skeleton holds the space until then. A later read that fails leaves the state as it was and
+// tries once more.
+export function useThread(
+  source: ThreadSource,
+  taskId: string,
+  connection: string,
+  clock: ReadClock = browserClock,
+) {
   const [state, dispatch] = useReducer(reduceThread, taskId, initialThreadState);
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
@@ -25,14 +47,18 @@ export function useThread(source: ThreadSource, taskId: string, connection: stri
     if (reading.current) return;
     reading.current = true;
     try {
-      dispatch({ type: 'loaded', read: await readThread(source, taskId) });
+      const read = await retryRead(() => readThread(source, taskId), clock, {
+        delays: [FIRST_READ_BACKOFF[2]],
+        giveUpAfter: 0,
+      });
+      dispatch({ type: 'loaded', read });
       setError(null);
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : 'The thread could not be loaded.');
+      setError(message(failure));
     } finally {
       reading.current = false;
     }
-  }, [source, taskId]);
+  }, [source, taskId, clock]);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: attempt and connection restart the load
   useEffect(() => {
@@ -64,7 +90,12 @@ export function useThread(source: ThreadSource, taskId: string, connection: stri
       if (!frame) frame = requestAnimationFrame(flush);
     });
     reading.current = true;
-    readThread(source, taskId)
+    setError(null);
+    retryRead(() => readThread(source, taskId), clock, {
+      delays: FIRST_READ_BACKOFF,
+      giveUpAfter: TRY_AGAIN_AFTER_MS,
+      active: () => active,
+    })
       .then((read) => {
         if (!active) return;
         dispatch({ type: 'loaded', read });
@@ -75,8 +106,7 @@ export function useThread(source: ThreadSource, taskId: string, connection: stri
         ready = true;
       })
       .catch((failure: unknown) => {
-        if (active)
-          setError(failure instanceof Error ? failure.message : 'The thread could not be loaded.');
+        if (active) setError(message(failure));
       })
       .finally(() => {
         reading.current = false;
@@ -86,7 +116,7 @@ export function useThread(source: ThreadSource, taskId: string, connection: stri
       unsubscribe();
       if (frame) cancelAnimationFrame(frame);
     };
-  }, [source, taskId, connection, attempt, reload]);
+  }, [source, taskId, connection, attempt, reload, clock]);
 
   const items = useMemo(() => threadItems(state), [state]);
   return {

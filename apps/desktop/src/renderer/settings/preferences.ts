@@ -1,17 +1,23 @@
 import {
   type ChatCatalogEntry,
   type ChatCatalogRead,
+  type ChatCrew,
+  type ChatCrewRole,
   type ChatFamily,
   ChatFamilySchema,
+  type ChatFlightMode,
+  type ChatHandoffMode,
+  ChatHandoffModeSchema,
   type ChatModelSelection,
   ChatModelSelectionSchema,
   type ChatPermissionPolicy,
   ChatPermissionPolicySchema,
+  rankFamilies,
   TaskSchema,
 } from '@crewkite/contracts';
 import { configureThread, type ThreadSource } from '../thread/commands.ts';
 
-// One key holds both defaults for new threads. Storage can be full, blocked or edited by hand, so
+// One key holds the defaults for new threads. Storage can be full, blocked or edited by hand, so
 // every read and write tolerates failure and a bad value falls back to the built-in default.
 const key = 'crewkite-thread-defaults-v1';
 
@@ -19,6 +25,7 @@ export type ThreadDefaults = {
   /** Null lets the composer pick the connected family with the most allowance left. */
   selection: ChatModelSelection | null;
   permissionPolicy: ChatPermissionPolicy;
+  handoffMode: ChatHandoffMode;
 };
 type Store = Pick<Storage, 'getItem' | 'setItem'>;
 
@@ -27,6 +34,53 @@ export const permissionPolicies: { id: ChatPermissionPolicy; label: string }[] =
   { id: 'allow-edits', label: 'Allow edits' },
   { id: 'allow-all', label: 'Allow all' },
 ];
+
+export const handoffModes: { id: ChatHandoffMode; label: string; title: string }[] = [
+  {
+    id: 'most-left',
+    label: 'Most allowance left',
+    title: 'The family with the highest percent remaining on its tightest window.',
+  },
+  {
+    id: 'resets-first',
+    label: 'Resets soonest',
+    title:
+      'The family whose allowance resets first, while it has any left; allowance that expires unused is lost.',
+  },
+  {
+    id: 'balanced',
+    label: 'Balanced',
+    title:
+      'Allowance per hour until reset (percent remaining divided by hours to reset), highest first; this spends every window at the rate it can afford.',
+  },
+  {
+    id: 'local-first',
+    label: 'Local first',
+    title: 'Local when it is connected, otherwise Balanced.',
+  },
+];
+
+export const flightModes: { id: ChatFlightMode; label: string; title: string }[] = [
+  { id: 'manual', label: 'Manual', title: 'Each step is yours. The crew runs nothing on its own.' },
+  {
+    id: 'balanced',
+    label: 'Balanced',
+    title:
+      'After each reply the crew reviews, fixes and challenges, and asks before commands outside the read-only set, network access, work outside the scratch copy and deletes.',
+  },
+  {
+    id: 'glide',
+    label: 'Glide',
+    title:
+      "The crew runs the chain to the end and stops only on a failure or a permission the thread's policy does not cover. Automatic handoff turns on.",
+  },
+];
+
+const builtIn: ThreadDefaults = {
+  selection: null,
+  permissionPolicy: 'ask',
+  handoffMode: 'most-left',
+};
 
 function browserStore(): Store | null {
   try {
@@ -42,12 +96,14 @@ export function readThreadDefaults(store: Store | null = browserStore()): Thread
     const saved = raw ? (JSON.parse(raw) as Record<string, unknown> | null) : null;
     const selection = ChatModelSelectionSchema.safeParse(saved?.selection);
     const policy = ChatPermissionPolicySchema.safeParse(saved?.permissionPolicy);
+    const mode = ChatHandoffModeSchema.safeParse(saved?.handoffMode);
     return {
       selection: selection.success ? selection.data : null,
-      permissionPolicy: policy.success ? policy.data : 'ask',
+      permissionPolicy: policy.success ? policy.data : builtIn.permissionPolicy,
+      handoffMode: mode.success ? mode.data : builtIn.handoffMode,
     };
   } catch {
-    return { selection: null, permissionPolicy: 'ask' };
+    return builtIn;
   }
 }
 
@@ -140,8 +196,9 @@ export function preferredSelection(
 }
 
 /**
- * Applies the saved permission policy to a thread right after its task is created. If the call
- * fails the thread stays on Ask each time, the strictest policy, and the Thread tab shows it.
+ * Applies the saved permission policy and handoff mode to a thread right after its task is
+ * created, in the thread's first configure. If the call fails the thread stays on Ask each time,
+ * the strictest policy, and the Thread tab shows it.
  */
 export function withThreadDefaults<Input, Result extends { outcome: string; entity?: unknown }>(
   source: ThreadSource,
@@ -149,14 +206,125 @@ export function withThreadDefaults<Input, Result extends { outcome: string; enti
 ): (input: Input) => Promise<Result> {
   return async (input) => {
     const result = await createTask(input);
-    const { permissionPolicy } = readThreadDefaults();
+    const { permissionPolicy, handoffMode } = readThreadDefaults();
+    const patch = {
+      ...(permissionPolicy !== builtIn.permissionPolicy ? { permissionPolicy } : {}),
+      ...(handoffMode !== builtIn.handoffMode ? { handoffMode } : {}),
+    };
     const created = TaskSchema.safeParse(result.entity);
     if (
-      permissionPolicy !== 'ask' &&
+      Object.keys(patch).length > 0 &&
       created.success &&
       (result.outcome === 'applied' || result.outcome === 'already-applied')
     )
-      await configureThread(source, { taskId: created.data.id, permissionPolicy }).catch(() => {});
+      await configureThread(source, { taskId: created.data.id, ...patch }).catch(() => {});
     return result;
   };
+}
+
+// Crew presets keep only the roles the person pinned to a model. Every other role is picked when a
+// thread starts from the preset, so a preset still works after a family disconnects.
+const presetKey = 'crewkite-crew-presets-v1';
+
+export const crewRoleNames: Record<ChatCrewRole, string> = {
+  builder: 'Builder',
+  reviewer: 'Reviewer',
+  challenger: 'Challenger',
+  fixer: 'Fixer',
+};
+const presetRoles = {
+  Solo: ['builder'],
+  Pair: ['builder', 'reviewer'],
+  'Full crew': ['builder', 'reviewer', 'challenger', 'fixer'],
+} as const satisfies Record<string, readonly ChatCrewRole[]>;
+export type CrewPresetName = keyof typeof presetRoles;
+export const crewPresetNames = Object.keys(presetRoles) as CrewPresetName[];
+export type CrewPreset = {
+  name: CrewPresetName;
+  /** Null picks the role's model when a thread starts from the preset. */
+  members: { role: ChatCrewRole; selection: ChatModelSelection | null }[];
+};
+
+export function readCrewPresets(store: Store | null = browserStore()): CrewPreset[] {
+  let saved: Record<string, Record<string, unknown> | undefined> | null = null;
+  try {
+    const raw = store?.getItem(presetKey);
+    saved = raw ? JSON.parse(raw) : null;
+  } catch {}
+  return crewPresetNames.map((name) => ({
+    name,
+    members: presetRoles[name].map((role) => {
+      const pinned = ChatModelSelectionSchema.safeParse(saved?.[name]?.[role]);
+      return { role, selection: pinned.success ? pinned.data : null };
+    }),
+  }));
+}
+
+export function writeCrewPresets(presets: CrewPreset[], store: Store | null = browserStore()) {
+  const pins = Object.fromEntries(
+    presets.map((preset) => [
+      preset.name,
+      Object.fromEntries(
+        preset.members.flatMap(({ role, selection }) => (selection ? [[role, selection]] : [])),
+      ),
+    ]),
+  );
+  try {
+    store?.setItem(presetKey, JSON.stringify(pins));
+  } catch {}
+}
+
+const listed = (catalog: ChatCatalogRead, selection: ChatModelSelection | null) => {
+  const entry = catalog.families.find(({ family }) => family === selection?.family);
+  return Boolean(entry?.connected && entry.models.some(({ model }) => model === selection?.model));
+};
+const onDefault = (entry: ChatCatalogEntry, store: Store | null): ChatModelSelection | null => {
+  const chosen = familyModel(entry, store);
+  const model = entry.models.find(({ model }) => model === chosen) ?? entry.models[0];
+  return model ? { family: entry.family, model: model.model, effort: model.defaultEffort } : null;
+};
+
+/**
+ * The crew a thread gets from a preset. A pinned model applies while its family is connected and
+ * lists it. The builder is otherwise the thread's own selection, else the first connected family.
+ * The reviewer and the challenger go to the best ranked other families under the thread's mode, so
+ * a second look comes from another model. With one family connected they share it. The fixer is
+ * the builder again. Null when no family is connected.
+ */
+export function crewFromPreset(
+  preset: CrewPreset,
+  catalog: ChatCatalogRead,
+  threadSelection: ChatModelSelection | null,
+  mode: ChatHandoffMode = 'most-left',
+  now: number = Date.now(),
+  store: Store | null = browserStore(),
+): ChatCrew | null {
+  const usable = catalog.families.filter((entry) => entry.connected && entry.models.length > 0);
+  const pinned = (role: ChatCrewRole) => {
+    const selection = preset.members.find((member) => member.role === role)?.selection ?? null;
+    return listed(catalog, selection) ? selection : null;
+  };
+  const first = usable[0];
+  const builder =
+    pinned('builder') ??
+    (listed(catalog, threadSelection) ? threadSelection : null) ??
+    (first ? onDefault(first, store) : null);
+  if (!builder) return null;
+  const best = (exclude: ChatFamily[]) => {
+    const [entry] = rankFamilies(usable, exclude, (value) => familyModel(value, store), mode, now);
+    return entry ? onDefault(entry, store) : null;
+  };
+  // The challenger takes a family the reviewer left free when there is one.
+  const taken: ChatFamily[] = [builder.family];
+  const members: ChatCrew['members'] = [];
+  for (const { role } of preset.members) {
+    const selection =
+      role === 'builder'
+        ? builder
+        : (pinned(role) ??
+          (role === 'fixer' ? builder : (best(taken) ?? best([builder.family]) ?? builder)));
+    if (role !== 'fixer') taken.push(selection.family);
+    members.push({ role, selection });
+  }
+  return { name: preset.name, members };
 }

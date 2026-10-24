@@ -6,26 +6,30 @@ const SHOWN_CHARACTERS = 200;
 /**
  * Messages sent while a turn runs. They start in this order once the thread is free, and each one
  * joins the conversation only then. `held` says why they wait when a running turn is not the
- * reason.
+ * reason. Send now stops the running reply and starts that message at once.
  */
 export function QueuedList({
   queued,
   held,
+  running,
   onRemove,
+  onSendNow,
 }: {
   queued: readonly ChatQueuedMessage[];
   held: string | null;
-  /** Settles either way. The caller reports a refusal. */
+  running: boolean;
+  /** Both settle either way. The caller reports a refusal. */
   onRemove: (id: string) => Promise<void>;
+  onSendNow: (id: string) => Promise<void>;
 }) {
-  const [removing, setRemoving] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
   if (queued.length === 0) return null;
-  async function remove(id: string) {
-    setRemoving(id);
+  async function act(id: string, action: (id: string) => Promise<void>) {
+    setBusy(id);
     try {
-      await onRemove(id);
+      await action(id);
     } finally {
-      setRemoving(null);
+      setBusy(null);
     }
   }
   return (
@@ -38,12 +42,24 @@ export function QueuedList({
             <span className="th-queued-text" title={message.text}>
               {message.text.slice(0, SHOWN_CHARACTERS)}
             </span>
+            {running && (
+              <button
+                type="button"
+                className="th-queued-remove"
+                disabled={busy !== null}
+                title="Stops the current reply and sends this message now."
+                aria-label={`Send now: ${message.text.slice(0, 80)}`}
+                onClick={() => void act(message.id, onSendNow)}
+              >
+                Send now
+              </button>
+            )}
             <button
               type="button"
               className="th-queued-remove"
-              disabled={removing !== null}
+              disabled={busy !== null}
               aria-label={`Remove queued message: ${message.text.slice(0, 80)}`}
-              onClick={() => void remove(message.id)}
+              onClick={() => void act(message.id, onRemove)}
             >
               Remove
             </button>

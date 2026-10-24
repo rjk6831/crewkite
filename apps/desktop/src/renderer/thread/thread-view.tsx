@@ -1,32 +1,42 @@
-import type {
-  ChatHandoffMode,
-  ChatModelSelection,
-  ChatPermissionPolicy,
-  WorkspaceState,
-} from '@crewkite/contracts';
+import type { ChatModelSelection, WorkspaceState } from '@crewkite/contracts';
 import { GitBranch, PanelRight } from 'lucide-react';
 import { useCallback, useMemo, useRef, useState } from 'react';
+import { familyName } from '../components.tsx';
 import {
   configureThread,
   handoffThread,
   resolvePermission,
   sendMessage,
+  steerMessage,
   stopTurn,
   type ThreadSource,
 } from './commands.ts';
 import { Composer, type ComposerHandle, type SendInput } from './composer.tsx';
 import { EmptyThread } from './empty-thread.tsx';
+import { FamilyMark } from './family-mark.tsx';
 import { LimitOfferCard } from './handoff-card.tsx';
 import { limitOffer } from './handoff-offer.ts';
 import { Inspector, type InspectorTab } from './inspector.tsx';
-import { MessageList } from './message-list.tsx';
+import { MessageList, modelLine } from './message-list.tsx';
 import { QueuedList } from './queued-list.tsx';
-import { lastFamily, latestContext } from './thread-state.ts';
+import { lastFamily, latestContext, type ThreadSettings } from './thread-state.ts';
 import type { TurnView } from './turn-fold.ts';
 import { useThread } from './use-thread.ts';
 import './thread.css';
 
 export type ThreadTask = { id: string; title: string };
+
+// Grey lines where the conversation will be while the thread opens. A read that is only slow
+// never shows a failure; use-thread reports one after ten seconds of retries.
+function OpeningThread() {
+  return (
+    <div className="th-skeleton" role="status" aria-label="Opening thread">
+      <i />
+      <i />
+      <i />
+    </div>
+  );
+}
 
 // A change in the number of edited files or finished turns asks the Changes tab to read again.
 function changeCount(items: ReturnType<typeof useThread>['items']) {
@@ -70,6 +80,7 @@ export function ThreadView({
   const toggle = useRef<HTMLButtonElement>(null);
   const thread = state.thread;
   const changesKey = useMemo(() => changeCount(items), [items]);
+  const turns = useMemo(() => Object.values(state.turnMeta), [state.turnMeta]);
   const offer = useMemo(() => limitOffer(state), [state]);
 
   const queued = thread?.queued;
@@ -110,6 +121,16 @@ export function ThreadView({
     if (cleared.some((item) => item.role !== 'assistant' || item.attachments.length))
       setNotice('The queued text is back in the composer. Pick the action or attachments again.');
   }, [source, task.id, activeTurn]);
+  // The controller stops the reply and starts this message with what the stopped turn was doing.
+  const sendNow = useCallback(
+    (id: string) =>
+      steerMessage(source, { taskId: task.id, messageId: id }).then(
+        () => setNotice(null),
+        (failure: unknown) =>
+          setNotice(failure instanceof Error ? failure.message : 'The message was not sent.'),
+      ),
+    [source, task.id],
+  );
   const dequeue = useCallback(
     (id: string) =>
       configureThread(source, { taskId: task.id, dequeue: id }).then(
@@ -133,12 +154,10 @@ export function ThreadView({
     },
     [source, task.id, reload],
   );
+  // The controller can change more than the patch, such as automatic handoff on entering Glide.
+  // Its chat.thread event brings the whole record; the patch shows at once until then.
   const configure = useCallback(
-    (patch: {
-      permissionPolicy?: ChatPermissionPolicy;
-      autoHandoff?: boolean;
-      handoffMode?: ChatHandoffMode;
-    }) =>
+    (patch: ThreadSettings) =>
       configureThread(source, { taskId: task.id, ...patch }).then(
         () => {
           dispatch({ type: 'configured', patch });
@@ -170,6 +189,8 @@ export function ThreadView({
     : thread?.base
       ? `Base ${thread.base.slice(0, 7)}`
       : 'No edits yet';
+  // The read retries for ten seconds before it reports a failure, so a slow controller shows the
+  // skeleton and nothing else.
   const empty = !state.loaded ? (
     error ? (
       <div className="th-empty" role="alert">
@@ -180,9 +201,7 @@ export function ThreadView({
         </button>
       </div>
     ) : (
-      <div className="th-empty" role="status">
-        <p className="th-muted">Opening thread.</p>
-      </div>
+      <OpeningThread />
     )
   ) : (
     <EmptyThread onPick={(text) => composer.current?.fill(text)} />
@@ -192,6 +211,12 @@ export function ThreadView({
     <div className={inspector.open ? 'thread has-inspector' : 'thread'}>
       <section className="th-main" aria-label="Thread">
         <header className="th-bar">
+          {thread?.selection && (
+            <span className="th-bar-family" title={modelLine(thread.selection)}>
+              <FamilyMark family={thread.selection.family} />
+              <span className="th-sr">{familyName(thread.selection.family)}</span>
+            </span>
+          )}
           <h1 className="th-title" title={task.title}>
             {task.title}
           </h1>
@@ -223,7 +248,13 @@ export function ThreadView({
           onResolve={resolve}
           onOpenChanges={openChanges}
         />
-        <QueuedList queued={queued ?? []} held={held} onRemove={dequeue} />
+        <QueuedList
+          queued={queued ?? []}
+          held={held}
+          running={activeTurn !== null}
+          onRemove={dequeue}
+          onSendNow={sendNow}
+        />
         <Composer
           ref={composer}
           key={task.id}
@@ -239,6 +270,7 @@ export function ThreadView({
           onStop={stop}
           onConfigured={(selection) => dispatch({ type: 'configured', patch: { selection } })}
           onHandoff={handoff}
+          onOpenCrew={() => setInspector({ open: true, tab: 'crew', focus: null })}
         />
       </section>
       {inspector.open && (
@@ -247,6 +279,9 @@ export function ThreadView({
           taskId={task.id}
           title={task.title}
           thread={thread}
+          turns={turns}
+          messages={state.messages}
+          loaded={state.loaded}
           header={header}
           preview={preview}
           tab={inspector.tab}

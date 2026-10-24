@@ -1,11 +1,14 @@
-import type {
-  ChatHandoffMode,
-  ChatMessage,
-  ChatPermissionPolicy,
-  ChatRole,
-  ChatThread,
-  ChatTurn,
-  WorkspaceState,
+import {
+  type ChatCrewChain,
+  ChatCrewRoleSchema,
+  type ChatFlightMode,
+  type ChatHandoffMode,
+  type ChatMessage,
+  type ChatPermissionPolicy,
+  type ChatRole,
+  type ChatThread,
+  type ChatTurn,
+  type WorkspaceState,
 } from '@crewkite/contracts';
 import { ArrowRightLeft, X } from 'lucide-react';
 import {
@@ -18,18 +21,31 @@ import {
   useState,
 } from 'react';
 import { familyName } from '../components.tsx';
-import { permissionPolicies } from '../settings/preferences.ts';
+import {
+  crewFromPreset,
+  crewPresetNames,
+  crewRoleNames,
+  flightModes,
+  handoffModes,
+  permissionPolicies,
+  readCrewPresets,
+} from '../settings/preferences.ts';
+import { useCatalog } from '../settings/use-catalog.ts';
 import { UsageGauges } from '../usage-gauges.tsx';
 import { projectUsagePresentation } from '../usage-presentation.ts';
 import { ChangesPanel } from './changes-panel.tsx';
-import { readThread, type ThreadSource } from './commands.ts';
+import type { ThreadSource } from './commands.ts';
 import { FamilyMark } from './family-mark.tsx';
+import { modelLine } from './message-list.tsx';
+import type { ThreadSettings } from './thread-state.ts';
 import { usageCards, useUsageClock } from './usage-cards.ts';
+import './crew.css';
 
-export type InspectorTab = 'changes' | 'usage' | 'thread';
+export type InspectorTab = 'changes' | 'usage' | 'crew' | 'thread';
 const tabs: { id: InspectorTab; label: string }[] = [
   { id: 'changes', label: 'Changes' },
   { id: 'usage', label: 'Usage' },
+  { id: 'crew', label: 'Crew' },
   { id: 'thread', label: 'Thread' },
 ];
 const roleNames: Record<ChatRole, string> = {
@@ -39,10 +55,6 @@ const roleNames: Record<ChatRole, string> = {
   challenger: 'Challenger',
   fixer: 'Fixer',
 };
-const handoffModes: { id: ChatHandoffMode; label: string }[] = [
-  { id: 'most-left', label: 'the provider with the most allowance left' },
-  { id: 'resets-first', label: 'the provider whose allowance resets soonest' },
-];
 
 // The chosen width is a local preference. Storage can be blocked, and the panel falls back to the
 // default width when it is.
@@ -242,15 +254,16 @@ function turnGroups(turns: readonly ChatTurn[], messages: readonly ChatMessage[]
   return [...groups.values()];
 }
 
-function TurnRow({ turn }: { turn: ChatTurn }) {
-  const { family, model } = turn.selection;
+// The effort the client reported on the reply beats the one the thread asked for.
+function TurnRow({ turn, reply }: { turn: ChatTurn; reply: ChatMessage | undefined }) {
   const state = turnState(turn);
+  const effort = reply?.author.kind === 'assistant' ? reply.author.effort : undefined;
   return (
     <li className="th-turn">
       <div className="th-turn-line">
-        <FamilyMark family={family} />
-        <span className="th-turn-model" title={model}>
-          {familyName(family)} · {model}
+        <FamilyMark family={turn.selection.family} />
+        <span className="th-turn-model" title={turn.selection.model}>
+          {modelLine({ ...turn.selection, effort: effort ?? turn.selection.effort })}
         </span>
         <span className={`th-turn-state is-${state.tone}`}>{state.label}</span>
       </div>
@@ -272,37 +285,49 @@ function TurnRow({ turn }: { turn: ChatTurn }) {
   );
 }
 
-function ThreadTab({
-  source,
-  taskId,
+/** The thread's own automatic handoff setting. Glide turns it on; the person can turn it off. */
+function AutoHandoff({
   thread,
   onConfigure,
 }: {
-  source: ThreadSource;
+  thread: ChatThread | null;
+  onConfigure: (patch: ThreadSettings) => void;
+}) {
+  return (
+    <label className="th-toggle">
+      <input
+        type="checkbox"
+        checked={thread?.autoHandoff ?? false}
+        disabled={!thread}
+        onChange={(event) => onConfigure({ autoHandoff: event.target.checked })}
+      />
+      Continue on another provider when a limit is reached
+    </label>
+  );
+}
+
+// The turns and messages come from the thread view's own state, which a failed reload leaves as it
+// was and the stream keeps current. The tab used to read the whole thread again on every turn start
+// and end, and a read that timed out behind other controller reads emptied the list.
+function ThreadTab({
+  taskId,
+  thread,
+  turns,
+  messages,
+  loaded,
+  onConfigure,
+}: {
   taskId: string;
   thread: ChatThread | null;
-  onConfigure: (patch: {
-    permissionPolicy?: ChatPermissionPolicy;
-    autoHandoff?: boolean;
-    handoffMode?: ChatHandoffMode;
-  }) => void;
+  turns: readonly ChatTurn[];
+  messages: readonly ChatMessage[];
+  loaded: boolean;
+  onConfigure: (patch: ThreadSettings) => void;
 }) {
-  const [read, setRead] = useState<{ turns: ChatTurn[]; messages: ChatMessage[] } | null>(null);
-  const active = thread?.activeTurnId ?? null;
   const accepted = thread?.lastAcceptance;
-  // The thread record changes when a turn starts and when it ends, and the list follows it.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: the active turn reloads the list
-  useEffect(() => {
-    let current = true;
-    readThread(source, taskId).then(
-      (value) => current && setRead({ turns: value.turns, messages: value.messages }),
-      () => current && setRead(null),
-    );
-    return () => {
-      current = false;
-    };
-  }, [source, taskId, active]);
-  const groups = read ? turnGroups(read.turns, read.messages) : [];
+  const groups = turnGroups(turns, messages);
+  const replies = new Map(messages.map((message) => [message.id, message]));
+  const mode = handoffModes.find(({ id }) => id === thread?.handoffMode) ?? handoffModes[0];
   return (
     <div className="th-facts">
       <dl>
@@ -356,27 +381,21 @@ function ThreadTab({
         </select>
       </label>
       <div className="th-handoff">
-        <label className="th-toggle">
-          <input
-            type="checkbox"
-            checked={thread?.autoHandoff ?? false}
-            disabled={!thread}
-            onChange={(event) => onConfigure({ autoHandoff: event.target.checked })}
-          />
-          Continue on another provider when a limit is reached
-        </label>
+        <AutoHandoff thread={thread} onConfigure={onConfigure} />
+        {/* The limit offer and the picker rank by the mode too, so it stays open with the box off. */}
         <label>
-          When a limit is reached, continue on
+          Handoff mode
           <select
-            value={thread?.handoffMode ?? 'most-left'}
-            disabled={!thread?.autoHandoff}
+            value={mode.id}
+            title={mode.title}
+            disabled={!thread}
             onChange={(event) =>
               onConfigure({ handoffMode: event.target.value as ChatHandoffMode })
             }
           >
-            {handoffModes.map((mode) => (
-              <option key={mode.id} value={mode.id}>
-                {mode.label}
+            {handoffModes.map((item) => (
+              <option key={item.id} value={item.id} title={item.title}>
+                {item.label}
               </option>
             ))}
           </select>
@@ -384,7 +403,7 @@ function ThreadTab({
       </div>
       <section className="th-turns" aria-labelledby="th-turns-head">
         <h3 id="th-turns-head">Turns</h3>
-        {read === null ? (
+        {!loaded ? (
           <p className="th-muted">Not available yet.</p>
         ) : groups.length === 0 ? (
           <p className="th-muted">None yet.</p>
@@ -397,7 +416,13 @@ function ThreadTab({
                 </p>
                 <ol className="th-turn-list">
                   {group.turns.map((turn) => (
-                    <TurnRow key={turn.id} turn={turn} />
+                    <TurnRow
+                      key={turn.id}
+                      turn={turn}
+                      reply={
+                        turn.assistantMessageId ? replies.get(turn.assistantMessageId) : undefined
+                      }
+                    />
                   ))}
                 </ol>
               </li>
@@ -409,11 +434,129 @@ function ThreadTab({
   );
 }
 
+const counted = (count: number, one: string, many: string) =>
+  `${count} ${count === 1 ? one : many}`;
+
+function chainLine(chain: ChatCrewChain | null): string {
+  if (!chain) return 'No chain has run in this thread yet.';
+  switch (chain.step) {
+    case 'review':
+      return `Reviewing, round ${chain.reviewRounds + 1}`;
+    case 'fix':
+      return 'Fixing';
+    case 'challenge':
+      return 'Challenging';
+    case 'finished':
+      return `Finished: ${counted(chain.reviewRounds, 'review round', 'review rounds')}, ${counted(chain.fixes, 'fix', 'fixes')}.`;
+    case 'stopped':
+      return `Stopped: ${chain.reason ?? 'no reason was recorded.'}`;
+  }
+}
+
+function CrewTab({
+  source,
+  thread,
+  onConfigure,
+}: {
+  source: ThreadSource;
+  thread: ChatThread | null;
+  onConfigure: (patch: ThreadSettings) => void;
+}) {
+  // Read once when the tab opens and again when a model read ends. A preset only needs to know
+  // which families are connected, and every extra catalog read waits in the controller's queue.
+  const { catalog } = useCatalog(source, null);
+  const [note, setNote] = useState<string | null>(null);
+  const crew = thread?.crew ?? null;
+  const mode = flightModes.find(({ id }) => id === thread?.flightMode) ?? flightModes[0];
+  function start(name: string) {
+    const preset = readCrewPresets().find((value) => value.name === name);
+    if (!preset || !thread) return;
+    const next = catalog && crewFromPreset(preset, catalog, thread.selection, thread.handoffMode);
+    setNote(next ? null : 'Connect a provider in Settings, then start from a preset.');
+    if (next) onConfigure({ crew: next });
+  }
+  return (
+    <div className="th-facts">
+      <dl>
+        <dt>Crew</dt>
+        <dd>{crew?.name ?? 'None yet'}</dd>
+        <dt>Chain</dt>
+        <dd>{chainLine(thread?.crewChain ?? null)}</dd>
+      </dl>
+      <ul className="th-crew-roles" aria-label="Roles">
+        {ChatCrewRoleSchema.options.map((role) => {
+          const member = crew?.members.find((value) => value.role === role);
+          // The fixer is the builder again unless the crew names its own.
+          const fallback = role === 'fixer' && crew ? 'The builder, with the findings' : null;
+          return (
+            <li key={role}>
+              <span className="th-crew-role">{crewRoleNames[role]}</span>
+              {member ? (
+                <span className="th-session" title={member.selection.model}>
+                  <FamilyMark family={member.selection.family} />
+                  <span className="th-crew-model">{modelLine(member.selection)}</span>
+                </span>
+              ) : (
+                <span className="th-muted">{fallback ?? 'Not in this crew'}</span>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+      <label>
+        Start from preset
+        <select value="" disabled={!thread} onChange={(event) => start(event.target.value)}>
+          <option value="" disabled>
+            Choose a preset
+          </option>
+          {crewPresetNames.map((name) => (
+            <option key={name} value={name}>
+              {name}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        Flight mode
+        <select
+          value={mode.id}
+          title={mode.title}
+          disabled={!thread}
+          onChange={(event) => onConfigure({ flightMode: event.target.value as ChatFlightMode })}
+        >
+          {flightModes.map((item) => (
+            <option
+              key={item.id}
+              value={item.id}
+              title={item.title}
+              disabled={!crew && item.id !== 'manual'}
+            >
+              {item.label}
+            </option>
+          ))}
+        </select>
+      </label>
+      <p className="th-muted">
+        {crew ? mode.title : 'Start from a preset to run the crew in Balanced or Glide.'}
+      </p>
+      <AutoHandoff thread={thread} onConfigure={onConfigure} />
+      {note && (
+        <p className="th-note" role="status">
+          {note}
+        </p>
+      )}
+    </div>
+  );
+}
+
 export function Inspector({
   source,
   taskId,
   title,
   thread,
+  turns,
+  messages,
+  loaded,
   header,
   preview,
   tab,
@@ -427,6 +570,9 @@ export function Inspector({
   taskId: string;
   title: string;
   thread: ChatThread | null;
+  turns: readonly ChatTurn[];
+  messages: readonly ChatMessage[];
+  loaded: boolean;
   header: WorkspaceState | null;
   preview: boolean;
   tab: InspectorTab;
@@ -434,11 +580,7 @@ export function Inspector({
   onClose: () => void;
   changesKey: number;
   focusPath: string | null;
-  onConfigure: (patch: {
-    permissionPolicy?: ChatPermissionPolicy;
-    autoHandoff?: boolean;
-    handoffMode?: ChatHandoffMode;
-  }) => void;
+  onConfigure: (patch: ThreadSettings) => void;
 }) {
   const panel = useRef<HTMLElement>(null);
   const size = useInspectorWidth(panel);
@@ -505,8 +647,16 @@ export function Inspector({
           />
         )}
         {tab === 'usage' && <UsageTab header={header} preview={preview} />}
+        {tab === 'crew' && <CrewTab source={source} thread={thread} onConfigure={onConfigure} />}
         {tab === 'thread' && (
-          <ThreadTab source={source} taskId={taskId} thread={thread} onConfigure={onConfigure} />
+          <ThreadTab
+            taskId={taskId}
+            thread={thread}
+            turns={turns}
+            messages={messages}
+            loaded={loaded}
+            onConfigure={onConfigure}
+          />
         )}
       </div>
     </aside>

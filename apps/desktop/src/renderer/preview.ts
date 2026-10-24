@@ -51,6 +51,7 @@ export function createPreviewSource(): DesktopSource {
     'PushChatBranch',
     'OpenChatPullRequest',
     'ReadChatBranchStatus',
+    'SteerChatMessage',
   ]);
   const scripts = new Map<string, ReturnType<typeof createThreadScript>>();
   function chatCommand(name: string, payload: Record<string, unknown>): CommandResult | null {

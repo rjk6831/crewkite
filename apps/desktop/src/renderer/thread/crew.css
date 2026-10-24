@@ -1,0 +1,83 @@
+/* The crew and flight mode controls, the header mark and the opening skeleton. */
+.th-bar-family {
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
+.th-flight {
+  border: 1px solid var(--border-strong);
+}
+.th-flight[data-mode="balanced"] {
+  color: var(--blue);
+}
+.th-flight[data-mode="glide"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.th-crew-roles {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  font-size: 12px;
+  list-style: none;
+}
+.th-crew-roles li {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+}
+.th-crew-role {
+  color: var(--text-dim);
+}
+.th-crew-model {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Three lines the width of a short exchange, so the thread does not jump when it fills in. */
+.th-skeleton {
+  display: grid;
+  gap: 12px;
+  justify-items: start;
+  width: min(560px, 100%);
+}
+.th-skeleton i {
+  display: block;
+  height: 12px;
+  border-radius: 6px;
+  background: var(--surface-hover);
+  animation: th-pulse 1.6s ease-in-out infinite;
+}
+.th-skeleton i:nth-child(1) {
+  justify-self: end;
+  width: 46%;
+}
+.th-skeleton i:nth-child(2) {
+  width: 88%;
+}
+.th-skeleton i:nth-child(3) {
+  width: 64%;
+}
+@media (prefers-reduced-motion: reduce) {
+  .th-skeleton i {
+    animation: none;
+  }
+}
+
+.st-crew {
+  display: grid;
+  gap: 8px;
+}
+.st-crew-role {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  color: var(--text-dim);
+  font-size: 12px;
+}

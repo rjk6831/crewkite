@@ -20,6 +20,7 @@ import {
   RefreshChatModelsPayloadSchema,
   ResolveChatPermissionPayloadSchema,
   SendChatMessagePayloadSchema,
+  SteerChatMessagePayloadSchema,
   StopChatTurnPayloadSchema,
 } from '@crewkite/contracts';
 import type { DesktopCommand, DesktopSource } from '../source.ts';
@@ -102,6 +103,11 @@ export const resolvePermission = (
 ) => run(source, 'ResolveChatPermission', ResolveChatPermissionPayloadSchema.parse(input));
 export const stopTurn = (source: ThreadSource, input: Input<typeof StopChatTurnPayloadSchema>) =>
   run(source, 'StopChatTurn', StopChatTurnPayloadSchema.parse(input));
+// A refusal throws with the controller's next step, such as "Nothing is running. Send the message."
+export const steerMessage = (
+  source: ThreadSource,
+  input: Input<typeof SteerChatMessagePayloadSchema>,
+) => run(source, 'SteerChatMessage', SteerChatMessagePayloadSchema.parse(input));
 export const configureThread = (
   source: ThreadSource,
   input: Input<typeof ConfigureChatThreadPayloadSchema>,

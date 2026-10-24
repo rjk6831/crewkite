@@ -54,12 +54,12 @@ export type ThreadAction =
   | { type: 'events'; events: ThreadEvent[] }
   | { type: 'sending'; pending: PendingMessage }
   | { type: 'dismiss'; localId: string }
-  | {
-      type: 'configured';
-      patch: Partial<
-        Pick<ChatThread, 'permissionPolicy' | 'autoHandoff' | 'handoffMode' | 'selection'>
-      >;
-    };
+  | { type: 'configured'; patch: ThreadSettings & Partial<Pick<ChatThread, 'selection'>> };
+
+/** The thread settings the inspector and the composer change through ConfigureChatThread. */
+export type ThreadSettings = Partial<
+  Pick<ChatThread, 'permissionPolicy' | 'autoHandoff' | 'handoffMode' | 'crew' | 'flightMode'>
+>;
 
 export const initialThreadState = (taskId: string): ThreadState => ({
   taskId,
@@ -310,15 +310,17 @@ export function threadItems(state: ThreadState): ThreadItem[] {
     const meta = state.turnMeta[id];
     const reply = replies.get(id);
     const base = record?.view ?? blankTurn(id);
+    // The effort the client reported on the stored reply beats the one the thread asked for.
+    const reported = reply?.author.kind === 'assistant' ? reply.author.effort : undefined;
     const identity: TurnIdentity | null =
       base.identity ??
       (meta
-        ? { ...meta.selection, role: meta.role }
+        ? { ...meta.selection, effort: reported ?? meta.selection.effort, role: meta.role }
         : reply?.author.kind === 'assistant'
           ? {
               family: reply.author.family,
               model: reply.author.model,
-              effort: 'default',
+              effort: reported ?? 'default',
               role: reply.author.role,
             }
           : null);
@@ -411,4 +413,35 @@ export function lastFamily(state: ThreadState, items: readonly ThreadItem[]): Ch
     if (item.kind === 'turn' && item.turn.identity?.role === 'assistant')
       return item.turn.identity.family;
   return null;
+}
+
+export type ReadClock = { now: () => number; wait: (ms: number) => Promise<void> };
+
+/** The first read of a thread retries on this backoff, then every two seconds. */
+export const FIRST_READ_BACKOFF = [250, 500, 1000, 2000] as const;
+/** A first read that keeps failing offers Try again once this much time has passed. */
+export const TRY_AGAIN_AFTER_MS = 10_000;
+
+/**
+ * Runs `read` until it succeeds. Each failure waits the next delay, and the last delay repeats.
+ * The failure goes to the caller once every delay has run and `giveUpAfter` has passed since the
+ * first try, or as soon as `active` says the caller is gone. The controller answers one command at
+ * a time, so a read can wait behind slower ones and time out while nothing is wrong.
+ */
+export async function retryRead<T>(
+  read: () => Promise<T>,
+  clock: ReadClock,
+  options: { delays: readonly number[]; giveUpAfter: number; active?: () => boolean },
+): Promise<T> {
+  const started = clock.now();
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await read();
+    } catch (failure) {
+      const spent = attempt >= options.delays.length;
+      if (spent && clock.now() - started >= options.giveUpAfter) throw failure;
+      await clock.wait(options.delays[Math.min(attempt, options.delays.length - 1)]);
+      if (options.active?.() === false) throw failure;
+    }
+  }
 }

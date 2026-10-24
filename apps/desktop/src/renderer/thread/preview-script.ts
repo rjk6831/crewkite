@@ -391,9 +391,53 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
         if (awaiting) void afterPermission('deny');
         return ok;
       case 'ConfigureChatThread': {
-        const { taskId: _task, dequeue, ...patch } = payload;
+        const {
+          taskId: _task,
+          dequeue,
+          ...patch
+        } = payload as Partial<ChatThread> & {
+          taskId: string;
+          dequeue?: string;
+        };
         const queued = thread.queued.filter((message) => message.id !== dequeue);
-        setThread({ ...(patch as Partial<ChatThread>), queued });
+        // Like the controller: no crew means manual, and entering glide turns automatic handoff on.
+        const crew = patch.crew === undefined ? thread.crew : patch.crew;
+        if (!crew && patch.flightMode && patch.flightMode !== 'manual')
+          return {
+            outcome: 'blocked',
+            reason: 'crew-missing',
+            next: 'Pick a crew, then choose a flight mode.',
+          };
+        const flightMode = crew ? (patch.flightMode ?? thread.flightMode) : 'manual';
+        const glides = flightMode === 'glide' && thread.flightMode !== 'glide';
+        setThread({
+          ...patch,
+          crew,
+          flightMode,
+          autoHandoff: glides ? true : (patch.autoHandoff ?? thread.autoHandoff),
+          queued,
+        });
+        return ok;
+      }
+      // Stop the reply and keep the queue, with this message first. The stopped turn's finish
+      // starts it, the way a limit stop hands over.
+      case 'SteerChatMessage': {
+        const message = thread.queued.find(({ id }) => id === payload.messageId);
+        if (!thread.activeTurnId)
+          return {
+            outcome: 'blocked',
+            reason: 'nothing-running',
+            next: 'Nothing is running. Send the message.',
+          };
+        if (!message)
+          return {
+            outcome: 'blocked',
+            reason: 'message-not-queued',
+            next: 'It is no longer queued. If it started, Stop ends it.',
+          };
+        setThread({ queued: [message, ...thread.queued.filter(({ id }) => id !== message.id)] });
+        stopped = true;
+        if (awaiting) void afterPermission('deny');
         return ok;
       }
       case 'HandoffChatThread': {

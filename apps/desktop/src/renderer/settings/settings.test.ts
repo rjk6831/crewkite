@@ -3,9 +3,12 @@ import { test } from 'node:test';
 import type { ChatCatalogRead } from '@crewkite/contracts';
 import { railRows } from './allowance.ts';
 import {
+  crewFromPreset,
   familyModel,
   preferredSelection,
+  readCrewPresets,
   readThreadDefaults,
+  writeCrewPresets,
   writeFamilyDefault,
   writeThreadDefaults,
 } from './preferences.ts';
@@ -63,7 +66,7 @@ test('the rail shows the tightest window per connected family and flags a reset 
   assert.deepEqual(railRows(null, NOW), []);
 });
 
-test('saved thread defaults survive bad storage and apply only to a connected, listed model', () => {
+test('saved thread defaults and crew presets survive bad storage and apply only to connected, listed models', () => {
   const values = new Map<string, string>();
   const store = {
     getItem: (key: string) => values.get(key) ?? null,
@@ -72,15 +75,19 @@ test('saved thread defaults survive bad storage and apply only to a connected, l
   const catalog: ChatCatalogRead = {
     families: [entry('openai', true, []), entry('anthropic', false, [])],
   };
-  assert.deepEqual(readThreadDefaults(store), { selection: null, permissionPolicy: 'ask' });
+  const none = { selection: null, permissionPolicy: 'ask', handoffMode: 'most-left' };
+  assert.deepEqual(readThreadDefaults(store), none);
   values.set('crewkite-thread-defaults-v1', '{not json');
-  assert.deepEqual(readThreadDefaults(store), { selection: null, permissionPolicy: 'ask' });
-  assert.deepEqual(readThreadDefaults(null), { selection: null, permissionPolicy: 'ask' });
+  assert.deepEqual(readThreadDefaults(store), none);
+  assert.deepEqual(readThreadDefaults(null), none);
+  values.set('crewkite-thread-defaults-v1', '{"handoffMode":"balanced"}');
+  assert.equal(readThreadDefaults(store).handoffMode, 'balanced');
 
   writeThreadDefaults(
     {
       selection: { family: 'openai', model: 'large-1', effort: 'medium' },
       permissionPolicy: 'allow-edits',
+      handoffMode: 'most-left',
     },
     store,
   );
@@ -95,6 +102,7 @@ test('saved thread defaults survive bad storage and apply only to a connected, l
     {
       selection: { family: 'anthropic', model: 'large-1', effort: 'low' },
       permissionPolicy: 'ask',
+      handoffMode: 'most-left',
     },
     store,
   );
@@ -114,6 +122,7 @@ test('saved thread defaults survive bad storage and apply only to a connected, l
     {
       selection: { family: 'openai', model: 'large-9', effort: 'high' },
       permissionPolicy: 'ask',
+      handoffMode: 'most-left',
     },
     store,
   );
@@ -122,4 +131,47 @@ test('saved thread defaults survive bad storage and apply only to a connected, l
     model: 'large-1',
     effort: 'high',
   });
+
+  // A preset puts the reviewer and the challenger on other connected families, the best ranked
+  // first, and the fixer on the builder. A pin applies only while its family lists the model.
+  const three: ChatCatalogRead = {
+    families: [
+      entry('openai', true, [window('weekly', 30, at(600))]),
+      entry('anthropic', true, [window('weekly', 80, at(600))]),
+      entry('google', true, [window('weekly', 50, at(600))]),
+    ],
+  };
+  const roles = (crew: ReturnType<typeof crewFromPreset>) =>
+    crew?.members.map(({ role, selection }) => `${role}:${selection.family}`);
+  const [, pair, full] = readCrewPresets(store);
+  assert.deepEqual(roles(crewFromPreset(full, three, null, 'most-left', NOW, store)), [
+    'builder:openai',
+    'reviewer:anthropic',
+    'challenger:google',
+    'fixer:openai',
+  ]);
+  const lone: ChatCatalogRead = { families: [entry('openai', true, [])] };
+  assert.deepEqual(roles(crewFromPreset(pair, lone, null, 'most-left', NOW, store)), [
+    'builder:openai',
+    'reviewer:openai',
+  ]);
+  const pinned = { family: 'google' as const, model: 'large-1', effort: 'low' as const };
+  writeCrewPresets(
+    readCrewPresets(store).map((preset) =>
+      preset.name === 'Pair'
+        ? { ...preset, members: [preset.members[0], { role: 'reviewer', selection: pinned }] }
+        : preset,
+    ),
+    store,
+  );
+  const repinned = readCrewPresets(store)[1];
+  assert.deepEqual(roles(crewFromPreset(repinned, three, null, 'most-left', NOW, store)), [
+    'builder:openai',
+    'reviewer:google',
+  ]);
+  assert.deepEqual(roles(crewFromPreset(repinned, lone, null, 'most-left', NOW, store)), [
+    'builder:openai',
+    'reviewer:openai',
+  ]);
+  assert.equal(crewFromPreset(repinned, { families: [] }, null, 'most-left', NOW, store), null);
 });

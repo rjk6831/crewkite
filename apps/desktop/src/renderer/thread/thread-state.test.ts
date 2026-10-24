@@ -18,11 +18,14 @@ import type {
 } from '@crewkite/contracts';
 import { limitOffer, offerChoices } from './handoff-offer.ts';
 import {
+  FIRST_READ_BACKOFF,
   initialThreadState,
   lastFamily,
   reduceThread,
+  retryRead,
   type ThreadEvent,
   type ThreadItem,
+  TRY_AGAIN_AFTER_MS,
   threadItems,
 } from './thread-state.ts';
 import { type Block, runLabel, type ToolBlock, viewBlocks } from './turn-fold.ts';
@@ -606,8 +609,8 @@ test('the thread moves away from the family of its newest assistant turn, even o
   );
 });
 
-test('a reply restored from a thread read keeps the role of its turn for the badge', () => {
-  const read = (role: 'reviewer' | 'advisor'): ChatThreadRead => ({
+test('a reply restored from a thread read keeps the role and effort of its turn for the badge', () => {
+  const read = (role: 'reviewer' | 'advisor' | 'fixer', effort?: 'ultra'): ChatThreadRead => ({
     thread: {
       taskId: task,
       scratchReady: true,
@@ -645,7 +648,14 @@ test('a reply restored from a thread read keeps the role of its turn for the bad
         taskId: task,
         at: stamp,
         cursor: '11',
-        author: { kind: 'assistant', turnId: turn, family: 'google', model: 'large-2', role },
+        author: {
+          kind: 'assistant',
+          turnId: turn,
+          family: 'google',
+          model: 'large-2',
+          role,
+          ...(effort ? { effort } : {}),
+        },
         text: 'Two findings.',
         attachments: [],
       },
@@ -653,11 +663,18 @@ test('a reply restored from a thread read keeps the role of its turn for the bad
     liveEvents: [],
     cursor: '11',
   });
-  for (const role of ['reviewer', 'advisor'] as const) {
-    const state = reduceThread(initialThreadState(task), { type: 'loaded', read: read(role) });
+  for (const [role, effort] of [
+    ['reviewer', undefined],
+    ['advisor', undefined],
+    ['fixer', 'ultra'],
+  ] as const) {
+    const state = reduceThread(initialThreadState(task), {
+      type: 'loaded',
+      read: read(role, effort),
+    });
     assert.deepEqual(
       turnOf(threadItems(state)).identity,
-      { family: 'google', model: 'large-2', effort: 'default', role },
+      { family: 'google', model: 'large-2', effort: effort ?? 'default', role },
       role,
     );
   }
@@ -816,4 +833,31 @@ test("an empty pool for another model does not hold back the family's default mo
       ['anthropic', 'm', 60],
     ],
   );
+});
+
+test('the first read retries on the backoff and offers Try again only after ten seconds', async () => {
+  let now = 0;
+  const waits: number[] = [];
+  const clock = {
+    now: () => now,
+    wait: async (ms: number) => {
+      waits.push(ms);
+      now += ms;
+    },
+  };
+  const options = { delays: FIRST_READ_BACKOFF, giveUpAfter: TRY_AGAIN_AFTER_MS };
+  // A controller busy for a second and a half answers on the fourth try, with no failure shown.
+  let calls = 0;
+  const slow = () => (++calls < 4 ? Promise.reject(new Error('busy')) : Promise.resolve('read'));
+  assert.equal(await retryRead(slow, clock, options), 'read');
+  assert.deepEqual(waits, [250, 500, 1000]);
+  // One that never answers fails once ten seconds have passed, the last delay repeating.
+  now = 0;
+  waits.length = 0;
+  await assert.rejects(
+    retryRead(() => Promise.reject(new Error('down')), clock, options),
+    /down/,
+  );
+  assert.deepEqual(waits, [250, 500, 1000, 2000, 2000, 2000, 2000, 2000]);
+  assert.ok(now >= TRY_AGAIN_AFTER_MS && now - 2000 < TRY_AGAIN_AFTER_MS);
 });
