@@ -406,6 +406,63 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
         setThread({ selection: next });
         return ok;
       }
+      // The git steps answer the way the controller does after a push to a github.com remote with
+      // gh installed, so the Changes tab shows each step without touching a repository.
+      case 'AcceptChatChanges': {
+        const branch = String(payload.branch);
+        if (!seeded) return { outcome: 'blocked', reason: 'no-changes' };
+        const commit = '7'.repeat(40);
+        setThread({ lastAcceptance: { branch, at: ago(0), fileCount: 1, commit }, lastPush: null });
+        say({ kind: 'system', turnId: null }, `Accepted 1 file to branch ${branch}.`);
+        return data({ kind: 'chat-acceptance', branch, commit, fileCount: 1 });
+      }
+      case 'PushChatBranch': {
+        const accepted = thread.lastAcceptance;
+        if (!accepted?.commit || accepted.branch !== payload.branch)
+          return {
+            outcome: 'blocked',
+            reason: 'branch-not-accepted',
+            next: 'Accept the changes to this branch, then push.',
+          };
+        const { branch, commit } = accepted;
+        setThread({
+          lastPush: { branch, remote: 'origin', commit, at: ago(0), pullRequestUrl: null },
+        });
+        say({ kind: 'system', turnId: null }, `Pushed ${branch} to origin.`);
+        return data({ kind: 'chat-push', branch, remote: 'origin', commit });
+      }
+      case 'OpenChatPullRequest': {
+        const pushed = thread.lastPush;
+        if (!pushed || pushed.branch !== payload.branch)
+          return {
+            outcome: 'blocked',
+            reason: 'branch-not-pushed',
+            next: 'Push the branch, then open a pull request.',
+          };
+        const url = 'https://github.com/rjk6831/demo-shop/pull/12';
+        setThread({ lastPush: { ...pushed, pullRequestUrl: url } });
+        say({ kind: 'system', turnId: null }, `Opened a pull request for ${pushed.branch}.`);
+        return data({ kind: 'chat-pull-request', url, via: 'gh' });
+      }
+      case 'ReadChatBranchStatus':
+        return data({
+          kind: 'chat-branch-status',
+          branch: String(payload.branch),
+          runs: thread.lastPush
+            ? [
+                {
+                  id: '9001',
+                  name: 'verify',
+                  status: 'in_progress',
+                  conclusion: null,
+                  url: 'https://github.com/rjk6831/demo-shop/actions/runs/9001',
+                  createdAt: thread.lastPush.at,
+                },
+              ]
+            : [],
+          reason: null,
+          readAt: ago(0),
+        });
       default:
         return null;
     }

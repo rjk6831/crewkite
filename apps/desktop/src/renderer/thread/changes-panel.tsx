@@ -1,8 +1,17 @@
-import type { ChatChangesRead, ChatThread } from '@crewkite/contracts';
+import type { ChatBranchStatus, ChatChangesRead, ChatThread } from '@crewkite/contracts';
 import { ChevronRight } from 'lucide-react';
 import { type FormEvent, useEffect, useRef, useState } from 'react';
 import { lineClass } from './cards.tsx';
-import { type Acceptance, acceptChanges, readChanges, type ThreadSource } from './commands.ts';
+import {
+  type Acceptance,
+  acceptChanges,
+  openPullRequest,
+  pushBranch,
+  readBranchStatus,
+  readChanges,
+  readThread,
+  type ThreadSource,
+} from './commands.ts';
 import { CodeBlock } from './markdown.tsx';
 
 const refusals: Record<string, string> = {
@@ -48,6 +57,205 @@ function branchName(title: string, taskId: string) {
   return `crewkite/${slug || taskId.slice(-8).toLowerCase()}`;
 }
 
+// The title names the change. The first line of the last reply is usually the assistant's own
+// summary of what it did, which is the closest thing to a commit body the thread already has.
+function suggestedMessage(title: string, reply: string | undefined) {
+  const subject = title.replace(/\s+/g, ' ').trim();
+  const summary = reply
+    ?.split('\n')
+    .map((line) => line.replace(/^[#>*\-\s]+/, '').trim())
+    .find(Boolean)
+    ?.slice(0, 200);
+  return summary ? `${subject}\n\n${summary}` : subject;
+}
+
+const CI_POLL_MS = 30_000;
+
+function runLine(status: ChatBranchStatus) {
+  if (!status.runs) return status.reason ?? 'CI runs are unavailable.';
+  const newest = status.runs[0];
+  if (!newest) return `No CI runs for ${status.branch} yet.`;
+  return `${newest.name}: ${newest.conclusion ?? newest.status.replace('_', ' ')}`;
+}
+
+function BranchStatus({
+  source,
+  taskId,
+  branch,
+}: {
+  source: ThreadSource;
+  taskId: string;
+  branch: string;
+}) {
+  const [status, setStatus] = useState<ChatBranchStatus | null>(null);
+  // The panel only exists while the Changes tab is open, so unmounting it stops the polling.
+  useEffect(() => {
+    let active = true;
+    const poll = () =>
+      readBranchStatus(source, taskId, branch).then(
+        (next) => active && setStatus(next),
+        (failure: unknown) =>
+          active &&
+          setStatus({
+            branch,
+            runs: null,
+            reason: failure instanceof Error ? failure.message : 'CI runs are unavailable.',
+            readAt: new Date().toISOString(),
+          }),
+      );
+    void poll();
+    const timer = window.setInterval(() => void poll(), CI_POLL_MS);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [source, taskId, branch]);
+  if (!status) return <p className="th-muted">Reading CI runs.</p>;
+  const newest = status.runs?.[0];
+  return (
+    <p className="th-muted" role="status">
+      CI {runLine(status)}
+      {newest && (
+        <>
+          {' '}
+          <a href={newest.url} title={newest.url} target="_blank" rel="noreferrer">
+            Open run
+          </a>
+        </>
+      )}
+    </p>
+  );
+}
+
+// Every step here is the person's click. Push asks once more, because it is the first action that
+// sends anything off this computer, and it runs with their own git credentials.
+function GitSteps({
+  source,
+  taskId,
+  branch,
+  commit,
+  thread,
+  message,
+}: {
+  source: ThreadSource;
+  taskId: string;
+  branch: string;
+  commit: string | null;
+  thread: ChatThread | null;
+  message: string;
+}) {
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [refusal, setRefusal] = useState<string | null>(null);
+  const [pushedHere, setPushedHere] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [opened, setOpened] = useState<string | null>(null);
+  const journal = thread?.lastPush?.branch === branch ? thread.lastPush : null;
+  const pushed = pushedHere || Boolean(journal);
+  const pullRequestUrl = opened ?? journal?.pullRequestUrl ?? null;
+
+  async function step(action: () => Promise<void>) {
+    setBusy(true);
+    setRefusal(null);
+    try {
+      await action();
+    } catch (failure) {
+      setRefusal(failure instanceof Error ? failure.message : 'The step did not run.');
+    } finally {
+      setBusy(false);
+    }
+  }
+  const push = () =>
+    step(async () => {
+      setConfirming(false);
+      const answer = await pushBranch(source, taskId, branch);
+      if (answer.done) setPushedHere(true);
+      else setRefusal(answer.message);
+    });
+  const open = () =>
+    step(async () => {
+      const [title = branch, ...rest] = message.split('\n');
+      const answer = await openPullRequest(source, {
+        taskId,
+        branch,
+        title: title.trim() || branch,
+        body: rest.join('\n').trim(),
+      });
+      if (!answer.done) {
+        setRefusal(answer.message);
+        return;
+      }
+      setOpened(answer.url);
+      if (answer.via !== 'compare-link' || !answer.url) {
+        setNotice('Pull request opened.');
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(answer.url);
+        setNotice('Compare link copied.');
+      } catch {
+        // The clipboard can be blocked. The link below stays selectable.
+        setNotice('Copy the compare link below.');
+      }
+    });
+
+  return (
+    <div className="th-changes">
+      {!pushed &&
+        (confirming ? (
+          <div>
+            <p>
+              Push {branch} to origin with your own git credentials? Nothing else leaves this
+              computer.
+            </p>
+            <button type="button" className="th-button" disabled={busy} onClick={() => void push()}>
+              Push
+            </button>{' '}
+            <button type="button" className="th-button" onClick={() => setConfirming(false)}>
+              Cancel
+            </button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            className="th-button"
+            disabled={busy || !commit}
+            title={commit ? undefined : 'Accept again to record the commit, then push.'}
+            onClick={() => setConfirming(true)}
+          >
+            Push branch
+          </button>
+        ))}
+      {pushed && (
+        <>
+          <p className="th-muted" role="status">
+            Pushed {branch} to {journal?.remote ?? 'origin'}
+          </p>
+          <button type="button" className="th-button" disabled={busy} onClick={() => void open()}>
+            Open pull request
+          </button>
+          {notice && (
+            <p className="th-muted" role="status">
+              {notice}
+            </p>
+          )}
+          {pullRequestUrl && (
+            <a href={pullRequestUrl} target="_blank" rel="noreferrer">
+              {pullRequestUrl}
+            </a>
+          )}
+          <BranchStatus source={source} taskId={taskId} branch={branch} />
+        </>
+      )}
+      {refusal && (
+        <p className="th-error" role="alert">
+          {refusal}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function AcceptControl({
   source,
   taskId,
@@ -62,6 +270,8 @@ function AcceptControl({
   files: Files;
 }) {
   const [branch, setBranch] = useState(() => branchName(title, taskId));
+  const [message, setMessage] = useState(() => suggestedMessage(title, undefined));
+  const edited = useRef(false);
   const [busy, setBusy] = useState(false);
   const [refusal, setRefusal] = useState<string | null>(null);
   const [accepted, setAccepted] = useState<Extract<Acceptance, { accepted: true }> | null>(null);
@@ -70,12 +280,31 @@ function AcceptControl({
   const diff = acceptedDiffs.get(taskId);
   const done = Boolean(last && diff?.branch === last.branch && sameFiles(diff.files, files));
 
+  // The suggestion waits for the thread's messages. Once the person types, it stays theirs.
+  useEffect(() => {
+    let active = true;
+    readThread(source, taskId).then(
+      (read) => {
+        const reply = read.messages.findLast(({ author }) => author.kind === 'assistant');
+        if (active && !edited.current) setMessage(suggestedMessage(title, reply?.text));
+      },
+      () => {},
+    );
+    return () => {
+      active = false;
+    };
+  }, [source, taskId, title]);
+
   async function accept(event: FormEvent) {
     event.preventDefault();
     setBusy(true);
     setRefusal(null);
     try {
-      const answer = await acceptChanges(source, { taskId, branch: branch.trim() });
+      const answer = await acceptChanges(source, {
+        taskId,
+        branch: branch.trim(),
+        ...(message.trim() ? { message: message.trim() } : {}),
+      });
       if (answer.accepted) {
         acceptedDiffs.set(taskId, { branch: answer.branch, files });
         setAccepted(answer);
@@ -95,6 +324,19 @@ function AcceptControl({
           spellCheck={false}
           autoComplete="off"
           onChange={(event) => setBranch(event.target.value)}
+        />
+      </label>
+      <label>
+        Commit message
+        <textarea
+          value={message}
+          rows={4}
+          maxLength={4096}
+          spellCheck
+          onChange={(event) => {
+            edited.current = true;
+            setMessage(event.target.value);
+          }}
         />
       </label>
       <button
@@ -119,6 +361,14 @@ function AcceptControl({
             {last.commit && ` (${last.commit.slice(0, 7)})`}
           </p>
           <CodeBlock lang="sh" text={`git switch ${last.branch}`} />
+          <GitSteps
+            source={source}
+            taskId={taskId}
+            branch={last.branch}
+            commit={last.commit}
+            thread={thread}
+            message={message}
+          />
         </>
       )}
     </form>

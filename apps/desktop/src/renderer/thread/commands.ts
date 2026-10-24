@@ -1,5 +1,7 @@
 import {
   AcceptChatChangesPayloadSchema,
+  type ChatBranchStatus,
+  ChatBranchStatusSchema,
   type ChatCatalogRead,
   ChatCatalogReadSchema,
   type ChatChangesRead,
@@ -9,6 +11,9 @@ import {
   type CommandResult,
   ConfigureChatThreadPayloadSchema,
   HandoffChatThreadPayloadSchema,
+  OpenChatPullRequestPayloadSchema,
+  PushChatBranchPayloadSchema,
+  ReadChatBranchStatusPayloadSchema,
   ReadChatCatalogPayloadSchema,
   ReadChatChangesPayloadSchema,
   ReadChatThreadPayloadSchema,
@@ -123,6 +128,45 @@ export async function acceptChanges(
   }
   return { accepted: false, reason: result.reason ?? 'not-accepted', next: result.next ?? null };
 }
+
+export type GitStep =
+  | { done: true; url: string | null; via: 'gh' | 'compare-link' | null }
+  | { done: false; message: string };
+// A push or pull request refusal carries git's or gh's own last line as its reason. That line is
+// worth showing with the next step. A reason code is not.
+async function gitStep(source: ThreadSource, command: string, payload: unknown): Promise<GitStep> {
+  const result = await dispatch(source, command, payload);
+  if (result.outcome === 'applied' || result.outcome === 'already-applied') {
+    const data = result.data;
+    if (data?.kind === 'chat-pull-request') return { done: true, url: data.url, via: data.via };
+    return { done: true, url: null, via: null };
+  }
+  const said = result.reason && !/^[a-z-]+$/.test(result.reason) ? result.reason : null;
+  const message = [said, result.next].filter(Boolean).join(' ');
+  return { done: false, message: message || 'The step did not run.' };
+}
+/** Only the confirmation button calls this, so `confirmed` is always the person's answer. */
+export const pushBranch = (source: ThreadSource, taskId: string, branch: string) =>
+  gitStep(
+    source,
+    'PushChatBranch',
+    PushChatBranchPayloadSchema.parse({ taskId, branch, confirmed: true }),
+  );
+export const openPullRequest = (
+  source: ThreadSource,
+  input: Input<typeof OpenChatPullRequestPayloadSchema>,
+) => gitStep(source, 'OpenChatPullRequest', OpenChatPullRequestPayloadSchema.parse(input));
+export const readBranchStatus = (
+  source: ThreadSource,
+  taskId: string,
+  branch: string,
+): Promise<ChatBranchStatus> =>
+  read(
+    source,
+    'ReadChatBranchStatus',
+    ReadChatBranchStatusPayloadSchema.parse({ taskId, branch }),
+    ChatBranchStatusSchema,
+  );
 
 // The controller events the thread view folds. A conversation entry also reaches the workspace,
 // which still reads it. The other three are streamed output and thread state. They change many
