@@ -13,7 +13,6 @@ import {
   anthropicDefaultChatModel,
 } from '../providers/anthropic/chat.ts';
 import type { NativeProfileResolution } from '../providers/openai/profile.ts';
-import { deriveWindow } from '../usage/index.ts';
 
 type Entry = ChatCatalogRead['families'][number];
 type Model = Entry['models'][number];
@@ -26,9 +25,28 @@ export type ChatCatalogInput = {
   /** The model the Anthropic client named in its last usage read, or null. */
   anthropicModel?: string | null;
   local: LocalSetup;
-  windows: readonly { family: ChatFamily | undefined; observation: Observation }[];
+  /**
+   * The route windows the readers wrote, plus the Anthropic reading's windows, which belong to
+   * no route. Only the fields the gauge needs, so a reading without a route can join.
+   */
+  windows: readonly { family: ChatFamily | undefined; observation: CatalogObservation }[];
   nowMs: number;
 };
+export type CatalogObservation = Pick<
+  Observation,
+  'windowId' | 'remaining' | 'resetsAt' | 'observedAt' | 'semantics'
+>;
+
+// The same reading as deriveWindow, on the fields alone: a future observation and a missing
+// remaining say nothing, a passed reset says nothing about now, and five minutes makes it stale.
+function windowState(observation: CatalogObservation, nowMs: number) {
+  const observedAt = Date.parse(observation.observedAt);
+  if (!(observedAt <= nowMs)) return 'unknown';
+  if (observation.resetsAt !== null && Date.parse(observation.resetsAt) <= nowMs)
+    return 'reset-pending';
+  if (observation.remaining === null) return 'unknown';
+  return nowMs - observedAt > 300000 ? 'stale' : 'fresh';
+}
 
 /**
  * What the composer can offer, built from facts the controller already holds. A value
@@ -164,7 +182,7 @@ function remaining(input: ChatCatalogInput, family: ChatFamily): Entry['remainin
     .sort((left, right) => left.windowId.localeCompare(right.windowId))
     .slice(0, 8)
     .map((observation) => {
-      const state = deriveWindow(observation, { nowMs: input.nowMs, maxAgeMs: 300000 }).state;
+      const state = windowState(observation, input.nowMs);
       // Past a reset the old percent says nothing about now.
       const current = state === 'fresh' || state === 'stale';
       return {

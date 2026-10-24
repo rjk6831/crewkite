@@ -955,6 +955,8 @@ export const UsageReaderSchema = z
     operationId: CommandIdSchema.nullable().optional(),
     lastObservedAt: TimestampSchema.nullable(),
     lastAttemptAt: TimestampSchema.nullable().optional(),
+    /** What the client wrote during the last read: its reply text, then its error output. */
+    detail: z.string().max(2048).nullable().optional(),
   })
   .refine(
     (reader) =>

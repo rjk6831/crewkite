@@ -390,10 +390,13 @@ export class Controller {
       openAiModels: this.latestOpenAiModels(profiles)?.models ?? null,
       anthropicModel: this.anthropicUsage().clientModel(),
       local: this.localSetup(),
-      windows: this.store.list<Observation>('window').map((observation) => ({
-        family: this.store.get<Route>('route', observation.routeId)?.family,
-        observation,
-      })),
+      windows: [
+        ...this.store.list<Observation>('window').map((observation) => ({
+          family: this.store.get<Route>('route', observation.routeId)?.family,
+          observation,
+        })),
+        ...this.anthropicUsage().catalogWindows(),
+      ],
       nowMs: Date.parse(this.now()),
     });
   }

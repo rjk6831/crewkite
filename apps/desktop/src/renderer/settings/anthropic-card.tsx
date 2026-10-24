@@ -17,9 +17,7 @@ export function AnthropicCard({ header, workspace, entry, now, actions, scopes }
   const connected = workspace.connection === 'connected' && !workspace.preview;
   const busy = actions.busy.anthropic;
   const message = actions.messages.anthropic;
-  // shortcut: the reader contract has no detail field yet, so this reads it loosely. Upgrade:
-  // read reader.detail once UsageReaderSchema carries it.
-  const detail = (reader as { detail?: string | null } | null)?.detail;
+  const detail = reader?.detail;
   const cards = usageCards(
     scopes.filter(({ family }) => family === 'anthropic'),
     header,

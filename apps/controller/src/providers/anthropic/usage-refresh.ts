@@ -16,6 +16,7 @@ import {
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
 import type { ArtifactFiles } from '../../artifacts/index.ts';
+import type { CatalogObservation } from '../../chat/catalog.ts';
 import { groupAbsent, type Schedule } from '../../host/worker.ts';
 import type { Store } from '../../store/index.ts';
 import type { NativeProfileResolution } from '../openai/profile.ts';
@@ -196,10 +197,7 @@ export class AnthropicUsageRefresh {
           }
         : {}),
     };
-    // shortcut: the reader contract has no detail field, so the client's words stay in the record
-    // until it does. Upgrade: add `detail` to UsageReaderSchema and always return it.
-    const withDetail = UsageReaderSchema.safeParse({ ...reader, detail: state?.detail ?? null });
-    return withDetail.success ? withDetail.data : UsageReaderSchema.parse(reader);
+    return UsageReaderSchema.parse({ ...reader, detail: state?.detail ?? null });
   }
 
   /** The model the client named in its last usage read, or null. The chat catalog starts there. */
@@ -476,6 +474,31 @@ export class AnthropicUsageRefresh {
     });
     this.options.store.transaction(() => this.write(latestTurn, current, true));
     this.options.changed();
+  }
+
+  /**
+   * The current reading as catalog windows, so the rail and the composer see the same allowance
+   * as the Settings card. The reading has no route, so these carry no route ID. A per-model
+   * window (weekly-opus) is scoped to its model and the others to the provider.
+   */
+  catalogWindows(): { family: 'anthropic'; observation: CatalogObservation }[] {
+    let reading: Current['reading'] | null = null;
+    try {
+      reading = this.current()?.reading ?? null;
+    } catch {
+      return [];
+    }
+    if (reading?.status !== 'reported') return [];
+    return reading.windows.map((window) => ({
+      family: 'anthropic',
+      observation: {
+        windowId: window.windowId,
+        remaining: window.remaining,
+        resetsAt: window.resetsAt,
+        observedAt: reading.receivedAt,
+        semantics: { scope: window.windowId.startsWith('weekly-') ? 'model' : 'provider' },
+      },
+    }));
   }
 
   close(): Promise<unknown> | undefined {
