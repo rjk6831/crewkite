@@ -37,7 +37,7 @@ import { SettingsPage } from './settings/settings-page.tsx';
 import { useWorkspace, type Workspace } from './source.ts';
 import { NewThread } from './thread/new-thread.tsx';
 import { RailUsage } from './thread/rail-usage.tsx';
-import { ThreadView } from './thread/thread-view.tsx';
+import { OpeningThread, ThreadView } from './thread/thread-view.tsx';
 
 // Local preferences only. Storage can be full or blocked, and the app keeps working with defaults.
 function readPreference(key: string) {
@@ -855,16 +855,7 @@ export function App() {
             blocked={connection === 'connected' ? null : 'Reconnect to the controller to send.'}
           />
         ) : selected && !snapshot ? (
-          <div className="loading-workspace" role="status">
-            <p>Opening thread.</p>
-            <button
-              type="button"
-              className="button secondary"
-              onClick={() => void workspace.selectTask(selected)}
-            >
-              Try again
-            </button>
-          </div>
+          <OpeningSnapshot key={selected} onRetry={() => void workspace.selectTask(selected)} />
         ) : task ? (
           <ThreadView
             key={task.id}
@@ -1016,5 +1007,25 @@ function About({ onClose, preview }: { onClose: () => void; preview: boolean }) 
         </div>
       </div>
     </Dialog>
+  );
+}
+
+// The task read for a new thread usually lands within a second. A skeleton holds the space, and
+// Try again shows only when ten seconds pass without it.
+function OpeningSnapshot({ onRetry }: { onRetry: () => void }) {
+  const [late, setLate] = useState(false);
+  useEffect(() => {
+    const timer = setTimeout(() => setLate(true), 10_000);
+    return () => clearTimeout(timer);
+  }, []);
+  return (
+    <div className="loading-workspace" role="status">
+      <OpeningThread />
+      {late && (
+        <button type="button" className="button secondary" onClick={onRetry}>
+          Try again
+        </button>
+      )}
+    </div>
   );
 }

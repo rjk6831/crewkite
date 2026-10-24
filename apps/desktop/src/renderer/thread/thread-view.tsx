@@ -28,7 +28,7 @@ export type ThreadTask = { id: string; title: string };
 
 // Grey lines where the conversation will be while the thread opens. A read that is only slow
 // never shows a failure; use-thread reports one after ten seconds of retries.
-function OpeningThread() {
+export function OpeningThread() {
   return (
     <div className="th-skeleton" role="status" aria-label="Opening thread">
       <i />
