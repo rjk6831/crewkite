@@ -409,6 +409,7 @@ function refreshFixture(
   const clock = createTestClock(at);
   const id = createTestIds(at);
   let calls = 0;
+  const timers: { work: () => void; milliseconds: number }[] = [];
   const released = Promise.withResolvers<void>();
   const owned = Promise.withResolvers<void>();
   let profile: NativeProfileResolution = {
@@ -445,6 +446,7 @@ function refreshFixture(
       assert.fail('No native auth or model process is allowed.');
     },
     schedule(work: () => void, milliseconds: number) {
+      timers.push({ work, milliseconds });
       if (mode === 'unknown' && (milliseconds === 25 || milliseconds === 3000))
         queueMicrotask(work);
       return () => {};
@@ -535,6 +537,8 @@ function refreshFixture(
     command,
     status,
     clock,
+    id,
+    timers,
     owned: owned.promise,
     calls: () => calls,
     changeScope() {
@@ -753,4 +757,47 @@ test('manual usage Stop, failed cooldown and uncertain ownership never replay a 
       );
     assert.equal(f.calls(), 1);
   }
+});
+
+test('the gauge reads every ten minutes while no Anthropic turn runs', async (t) => {
+  const f = refreshFixture(t);
+  // The reader's own timers stay under a minute. The periodic read is the one at a minute or more.
+  const periodic = () => f.timers.filter((timer) => timer.milliseconds >= 60_000);
+  const read = async () => {
+    periodic().at(-1)?.work();
+    while (f.status()?.readState === 'intent' || f.status()?.readState === 'owned')
+      await new Promise(setImmediate);
+  };
+  const taskId = f.id('tsk');
+  const turn = (state: string) =>
+    f.controller.store.db
+      .prepare(
+        'INSERT INTO chat_turns(id,task_id,sequence,body) VALUES (?,?,0,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body',
+      )
+      .run('trn_fixture', taskId, JSON.stringify({ selection: { family: 'anthropic' }, state }));
+  f.controller.store.db
+    .prepare("INSERT INTO entities(id,kind,revision,body) VALUES (?,'task',0,'{}')")
+    .run(taskId);
+  const rows: { claim: string; advance: number; turn: string | null; calls: number }[] = [
+    { claim: 'the first timer reads when nothing was read yet', advance: 0, turn: null, calls: 1 },
+    { claim: 'a timer before ten minutes reads nothing', advance: 59_000, turn: null, calls: 1 },
+    {
+      claim: 'a running Anthropic turn holds the read',
+      advance: 541_000,
+      turn: 'running',
+      calls: 1,
+    },
+    { claim: 'the read runs once the turn settles', advance: 60_000, turn: 'done', calls: 2 },
+  ];
+  for (const row of rows) {
+    f.clock.advance(row.advance);
+    if (row.turn) turn(row.turn);
+    await read();
+    assert.equal(f.calls(), row.calls, row.claim);
+  }
+  // Each timer lands ten minutes after the last attempt, and a missed one checks again a minute on.
+  assert.deepEqual(
+    periodic().map((timer) => timer.milliseconds),
+    [600_000, 600_000, 541_000, 60_000, 600_000],
+  );
 });

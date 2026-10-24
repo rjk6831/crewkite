@@ -1,9 +1,12 @@
+import type { DatabaseSync } from 'node:sqlite';
 import {
   type ChatCatalogRead,
   ChatCatalogReadSchema,
   type ChatEffort,
   ChatEffortSchema,
   type ChatFamily,
+  type ChatTurnStats,
+  ChatTurnStatsSchema,
   type LocalSetup,
   type Observation,
 } from '@crewkite/contracts';
@@ -36,6 +39,8 @@ export type ChatCatalogInput = {
    * no route. Only the fields the gauge needs, so a reading without a route can join.
    */
   windows: readonly { family: ChatFamily | undefined; observation: CatalogObservation }[];
+  /** The database that holds the chat turns, for each family's last turn stats. Null stats without it. */
+  turns?: Pick<DatabaseSync, 'prepare'>;
   nowMs: number;
 };
 export type CatalogObservation = Pick<
@@ -125,6 +130,9 @@ function local(input: ChatCatalogInput): Entry {
     ),
     defaultModel: connected ? (selected?.identity.modelKey ?? null) : null,
     remaining: remaining(input, 'local'),
+    readAt: null,
+    needsConnect: false,
+    lastTurnStats: lastTurnStats(input, 'local'),
   };
 }
 
@@ -136,13 +144,20 @@ function entry(
   models: Model[],
   defaultModel: string | undefined,
 ): Entry {
+  const windows = remaining(input, family);
   return {
     family,
     connected,
     reason: connected ? null : (reason ?? 'not-configured'),
     models: [...new Map(models.map((model) => [model.model, model])).values()].slice(0, 64),
     defaultModel: connected ? (defaultModel ?? null) : null,
-    remaining: remaining(input, family),
+    remaining: windows,
+    readAt: readAt(input, family),
+    // The quota reader runs without Connect, as the Google reader does, so the rail can show
+    // allowance for a family the composer cannot use yet. A percent from before a reset says
+    // nothing about the account now, so it does not count.
+    needsConnect: !connected && windows.some((window) => window.percent !== null),
+    lastTurnStats: lastTurnStats(input, family),
   };
 }
 
@@ -184,7 +199,7 @@ function remaining(input: ChatCatalogInput, family: ChatFamily): Entry['remainin
       const current = state === 'fresh' || state === 'stale';
       return {
         windowId: observation.windowId,
-        label: observation.windowId,
+        label: windowLabel(observation),
         percent:
           current && observation.remaining?.unit === 'percent' ? observation.remaining.value : null,
         resetsAt: observation.resetsAt,
@@ -194,4 +209,54 @@ function remaining(input: ChatCatalogInput, family: ChatFamily): Entry['remainin
         ...(observation.semantics ? { scope: observation.semantics.scope } : {}),
       };
     });
+}
+
+/**
+ * The period a window covers, as `five-hour` or `weekly`, so the rail can draw one bar for each.
+ * The reported period decides when there is one. Otherwise the id does: the Anthropic readers write
+ * five-hour, weekly and weekly-<model>, and the OpenAI client calls its five-hour window primary
+ * and its weekly one secondary. Any other window keeps its id.
+ */
+function windowLabel(observation: CatalogObservation): string {
+  const id = observation.windowId;
+  const period = observation.semantics?.periodSeconds;
+  if (period === 18_000) return 'five-hour';
+  if (period === 604_800) return 'weekly';
+  if (period !== undefined) return id;
+  if (id === 'five-hour' || id.endsWith(':primary')) return 'five-hour';
+  if (id === 'weekly' || id.startsWith('weekly-') || id.endsWith(':secondary')) return 'weekly';
+  return id;
+}
+
+/**
+ * When the family's reader last brought in a reading: the newest window it wrote. An Anthropic
+ * window carries the receivedAt of its reading, and the other readers stamp every window of a
+ * read with the time the read landed.
+ */
+function readAt(input: ChatCatalogInput, family: ChatFamily): string | null {
+  let newest: string | null = null;
+  for (const window of input.windows)
+    if (
+      window.family === family &&
+      (newest === null || Date.parse(window.observation.observedAt) > Date.parse(newest))
+    )
+      newest = window.observation.observedAt;
+  return newest;
+}
+
+/** The stats of the newest turn on the family that has them. A row it cannot read counts as none. */
+function lastTurnStats(input: ChatCatalogInput, family: ChatFamily): ChatTurnStats | null {
+  if (!input.turns) return null;
+  try {
+    const row = input.turns
+      .prepare(
+        "SELECT json_extract(body,'$.stats') AS stats FROM chat_turns WHERE json_extract(body,'$.selection.family')=? AND json_type(body,'$.stats')='object' ORDER BY json_extract(body,'$.startedAt') DESC LIMIT 1",
+      )
+      .get(family) as { stats?: unknown } | undefined;
+    if (typeof row?.stats !== 'string') return null;
+    const parsed = ChatTurnStatsSchema.safeParse(JSON.parse(row.stats));
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
 }

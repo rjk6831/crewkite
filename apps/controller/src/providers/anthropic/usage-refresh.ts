@@ -17,7 +17,7 @@ import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
 import type { ArtifactFiles } from '../../artifacts/index.ts';
 import type { CatalogObservation } from '../../chat/catalog.ts';
-import { groupAbsent, type Schedule } from '../../host/worker.ts';
+import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
 import type { Store } from '../../store/index.ts';
 import type { NativeProfileResolution } from '../openai/profile.ts';
 import { anthropicUsageReaderScope, startAnthropicUsageReader } from './native-usage-reader.ts';
@@ -29,6 +29,10 @@ const latest = 'usage-reader:anthropic';
 const latestTurn = 'usage-turn:anthropic';
 // Twice the bounded native stdout leaves space for the ownership journal around a report.
 const maximumRecordBytes = 256 * 1024;
+// The gauge reads on its own this often while the controller runs, so the rail stays near current
+// between turns. A minute is the floor, the same as the read cooldown.
+const periodicReadMs = 600_000;
+const minimumRecheckMs = 60_000;
 const recordSchema = z.strictObject({
   operationId: CommandIdSchema,
   requestHash: HashSchema,
@@ -62,6 +66,7 @@ export class AnthropicUsageRefresh {
     done: Promise<CommandResult>;
   };
   private closed = false;
+  private cancelPeriodic?: () => void;
 
   private readonly options: {
     store: Store;
@@ -77,6 +82,57 @@ export class AnthropicUsageRefresh {
   };
   constructor(options: AnthropicUsageRefresh['options']) {
     this.options = options;
+    this.armPeriodic();
+  }
+
+  /**
+   * Arms the next periodic read for ten minutes after the last attempt, or a minute from now when
+   * that has passed. A read after a turn moves the next one back, so the two never stack.
+   */
+  private armPeriodic() {
+    if (this.closed) return;
+    let delay = periodicReadMs;
+    try {
+      const previous = this.state();
+      if (previous)
+        delay = Math.min(
+          periodicReadMs,
+          Math.max(
+            minimumRecheckMs,
+            Date.parse(previous.attemptedAt) + periodicReadMs - Date.parse(this.options.now()),
+          ),
+        );
+    } catch {}
+    this.cancelPeriodic = (this.options.schedule ?? defaultSchedule)(
+      () => this.periodicRead(),
+      delay,
+    );
+  }
+
+  private periodicRead() {
+    if (this.closed) return;
+    try {
+      const previous = this.state();
+      const due =
+        !previous ||
+        Date.parse(this.options.now()) - Date.parse(previous.attemptedAt) >= periodicReadMs;
+      // A running turn reports its own rate limit frames, and the read after it settles follows.
+      if (due && !this.anthropicTurnRunning())
+        // shortcut: the refresh has no command ID helper of its own, so a fresh artifact ID lends
+        // its time-ordered suffix. Upgrade: pass the controller's ID helper in the options.
+        void this.refreshWhenDue(`cmd_${this.options.artifactId().slice(4)}`);
+    } catch {}
+    // The read above saved its attempt time before it returned, so the next one lands ten
+    // minutes after it.
+    this.armPeriodic();
+  }
+
+  private anthropicTurnRunning(): boolean {
+    return !!this.options.store.db
+      .prepare(
+        "SELECT 1 FROM chat_turns WHERE json_extract(body,'$.selection.family')='anthropic' AND json_extract(body,'$.state') IN ('queued','running','waiting-permission') LIMIT 1",
+      )
+      .get();
   }
 
   private read(key: string): unknown | null {
@@ -440,8 +496,8 @@ export class AnthropicUsageRefresh {
   }
 
   /**
-   * The gauge reads on its own when the controller starts and after each chat turn settles, since
-   * a turn spent some allowance. It reads only when the client resolves, the last read is more
+   * The gauge reads on its own when the controller starts, after each chat turn settles, since a
+   * turn spent some allowance, and every ten minutes while no Anthropic turn runs. It reads only when the client resolves, the last read is more
    * than a minute old and no other read runs. Anything else skips it without a receipt.
    */
   refreshWhenDue(key: string): Promise<unknown> | undefined {
@@ -529,6 +585,7 @@ export class AnthropicUsageRefresh {
 
   close(): Promise<unknown> | undefined {
     this.closed = true;
+    this.cancelPeriodic?.();
     if (!this.active) return;
     this.active.stopped = true;
     this.active.handle?.stop();
