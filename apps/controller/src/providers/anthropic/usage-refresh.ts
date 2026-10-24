@@ -20,6 +20,7 @@ import { groupAbsent, type Schedule } from '../../host/worker.ts';
 import type { Store } from '../../store/index.ts';
 import type { NativeProfileResolution } from '../openai/profile.ts';
 import { anthropicUsageReaderScope, startAnthropicUsageReader } from './native-usage-reader.ts';
+import { maximumDetail } from './usage-reader.ts';
 
 const latest = 'usage-reader:anthropic';
 // Twice the bounded native stdout leaves space for the ownership journal around a report.
@@ -36,6 +37,8 @@ const recordSchema = z.strictObject({
   // replaces it, so an old record never blocks the reader.
   reading: AnthropicUsageReadingSchema.nullable().catch(null),
   readingScopeHash: HashSchema.nullable(),
+  // What the client wrote during the last read. A record from before this field reads as null.
+  detail: z.string().max(maximumDetail).nullable().catch(null),
 });
 type Record = z.infer<typeof recordSchema>;
 type UsageCommand = Extract<Command, { command: 'RefreshAnthropicUsage' | 'StopAnthropicUsage' }>;
@@ -153,7 +156,7 @@ export class AnthropicUsageRefresh {
       binding = this.binding();
     } catch {}
     const state = this.state();
-    return UsageReaderSchema.parse({
+    const reader = {
       id: 'anthropic-usage-v1',
       family: 'anthropic',
       clientVersion: binding?.clientVersion ?? 'unknown',
@@ -179,7 +182,11 @@ export class AnthropicUsageRefresh {
             },
           }
         : {}),
-    });
+    };
+    // shortcut: the reader contract has no detail field, so the client's words stay in the record
+    // until it does. Upgrade: add `detail` to UsageReaderSchema and always return it.
+    const withDetail = UsageReaderSchema.safeParse({ ...reader, detail: state?.detail ?? null });
+    return withDetail.success ? withDetail.data : UsageReaderSchema.parse(reader);
   }
 
   /** The model the client named in its last usage read, or null. The chat catalog starts there. */
@@ -299,6 +306,7 @@ export class AnthropicUsageRefresh {
       reason: null,
       reading: previous?.reading ?? null,
       readingScopeHash: previous?.readingScopeHash ?? null,
+      detail: null,
     };
     store.transaction(() => {
       store.saveReceipt(command.key, requestHash, 'local-owner', {
@@ -372,6 +380,7 @@ export class AnthropicUsageRefresh {
               ? 'native-trust-scope-changed'
               : (outcome.reason ??
                 (outcome.reading?.status === 'reported' ? 'reported' : 'usage-unavailable'));
+        record.detail = outcome.detail;
         if (known && !active.stopped && !this.closed && matching && outcome.reading) {
           record.reading = AnthropicUsageReadingSchema.parse(outcome.reading);
           record.readingScopeHash = binding.scopeHash;

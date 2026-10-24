@@ -63,6 +63,7 @@ test('a usage read maps each reported limit and ignores what it does not show', 
     windows?: unknown[];
     model?: string | null;
     error?: UsageReaderError['reason'];
+    reply?: string;
   }[] = [
     { name: 'full report', input: bytes([init, assistant, terminal]), windows: reported },
     {
@@ -144,6 +145,12 @@ test('a usage read maps each reported limit and ignores what it does not show', 
       windows: [],
     },
     { name: 'no report', input: bytes([init, terminal]), error: 'no-usage-report' },
+    {
+      name: 'a reply with no report keeps its text',
+      input: bytes([init, { ...assistant, usage_report: undefined }, terminal]),
+      error: 'no-usage-report',
+      reply: 'Usage summary placeholder.',
+    },
     { name: 'no result', input: bytes([init, assistant]), error: 'no-result' },
     {
       name: 'error result',
@@ -172,6 +179,7 @@ test('a usage read maps each reported limit and ignores what it does not show', 
         (error: unknown) => error instanceof UsageReaderError && error.reason === row.error,
         row.name,
       );
+      if (row.reply !== undefined) assert.equal(parser.reply(), row.reply, row.name);
       continue;
     }
     const reading = read();
@@ -316,6 +324,7 @@ test('the usage owner bounds output and refuses metadata before physical closure
           assistant,
           mode === 'error-result' ? { ...terminal, is_error: true } : terminal,
         ]);
+      else yield Buffer.from('Loaded no settings.\n');
     }
     const request = {
       ...context,
@@ -366,6 +375,9 @@ test('the usage owner bounds output and refuses metadata before physical closure
     });
     if (mode === 'stopped') handle.stop();
     const result = await handle.result;
+    // What the client wrote stays with the result, its reply first, whether or not the read failed.
+    if (mode === 'success' || mode === 'error-result')
+      assert.equal(result.detail, 'Usage summary placeholder.\n\nLoaded no settings.');
     if (mode === 'success' || mode === 'caller-mutation') {
       assert(result.reading);
       assert.equal(result.reason, null);

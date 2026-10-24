@@ -13,6 +13,7 @@ import {
 import {
   AnthropicUsageReader,
   anthropicUsageReaderPlan,
+  maximumDetail,
   UsageReaderError,
 } from './usage-reader.ts';
 
@@ -52,6 +53,15 @@ const usageScope = {
   generationRequest: false,
   policyHooks: 'covered-by-native-client-trust',
 } as const;
+
+// A read that fails says only which part was missing. What the client wrote is the cause, so the
+// result keeps its reply text and, after a blank line, the end of its error output.
+function detail(reply: string, errors: Buffer) {
+  // The tail can start inside a character. Its replacement mark says nothing.
+  const tail = new TextDecoder().decode(errors).replace(/^\u{FFFD}+/u, '');
+  const text = [reply, tail.trim()].filter(Boolean).join('\n\n');
+  return text ? text.slice(0, maximumDetail) : null;
+}
 
 /** The caller obtains explicit native-client trust for this scope before starting the command. */
 export function anthropicUsageReaderScope(input: AnthropicUsageReaderContext) {
@@ -147,6 +157,7 @@ export function startAnthropicUsageReader(
     throw new UsageReaderError('client');
   }
   const parser = new AnthropicUsageReader();
+  let errors = Buffer.alloc(0);
   let reason: Reason | null = null;
   let cancelCleanup: (() => void) | undefined;
   const boundary = Promise.withResolvers<void>();
@@ -167,6 +178,7 @@ export function startAnthropicUsageReader(
         bytes += chunk.byteLength;
         const limit = stdout ? plan.maximumStdoutBytes : plan.maximumStderrBytes;
         if (bytes > limit) stop('output-limit');
+        if (!stdout) errors = Buffer.concat([errors, chunk]).subarray(-maximumDetail);
         if (reason === null && stdout) parser.feed(chunk);
       }
     } catch (error) {
@@ -231,6 +243,7 @@ export function startAnthropicUsageReader(
       quiescent,
       exitCode: exit?.code ?? null,
       signal: exit?.signal ?? null,
+      detail: detail(parser.reply(), errors),
       modelPrompt: false as const,
     };
   })();

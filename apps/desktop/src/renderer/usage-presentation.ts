@@ -260,6 +260,7 @@ const failedReads = new Map([
   ['unreadable-output', 'An earlier CrewKite version could not read the client output.'],
 ]);
 const nextSteps = new Map([
+  ['no-usage-report', 'The client answered without a usage report. Its reply is below.'],
   ['client-error', 'Check the Anthropic sign-in, then refresh.'],
   ['usage-unavailable', 'Check that the client is signed in with a subscription plan.'],
   ['unreadable-output', 'Refresh to read it again.'],

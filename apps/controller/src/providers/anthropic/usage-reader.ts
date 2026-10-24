@@ -27,6 +27,10 @@ const report = z.object({
     .nullish(),
 });
 const frame = z.object({ type: z.string() });
+const reply = z.object({ content: z.array(z.unknown()).max(4096) });
+const textBlock = z.object({ type: z.literal('text'), text: z.string() });
+/** The bound on what a read keeps of the client's own words. */
+export const maximumDetail = 2048;
 
 export class UsageReaderError extends Error {
   readonly reason:
@@ -121,6 +125,12 @@ export class AnthropicUsageReader {
     | undefined;
   private ended = false;
   private model: string | null = null;
+  private said = '';
+
+  /** The tail of the text the client answered with, so a failed read can show its reply. */
+  reply() {
+    return this.said.trim();
+  }
 
   feed(chunk: Uint8Array) {
     if (this.failure) throw new UsageReaderError(this.failure);
@@ -150,7 +160,13 @@ export class AnthropicUsageReader {
       // The chat composer starts on this model. A value it cannot read leaves the default.
       const model = name.safeParse(fields.model);
       this.model = model.success ? model.data : null;
-    } else if (head.data.type === 'assistant' && fields.usage_report != null) {
+    } else if (head.data.type === 'assistant') {
+      const message = reply.safeParse(fields.message);
+      for (const entry of message.success ? message.data.content : []) {
+        const block = textBlock.safeParse(entry);
+        if (block.success) this.said = `${this.said}\n${block.data.text}`.slice(-maximumDetail);
+      }
+      if (fields.usage_report == null) return;
       try {
         const parsed = report.parse(fields.usage_report).rate_limits;
         this.reading = {
