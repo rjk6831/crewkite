@@ -11,7 +11,7 @@ import {
   WorkspaceStateSchema,
 } from '@crewkite/contracts';
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
-import { desktopFiles } from '../shared/attach.ts';
+import { desktopFiles, droppedPaths, MAX_ATTACH_FILES } from '../shared/attach.ts';
 import { TASK_ID_PATTERN, threadAttention } from '../shared/thread-notice.ts';
 
 const events = new Set<Parameters<DesktopSource['subscribe']>[0]>();
@@ -74,8 +74,8 @@ const pathOf = (file: File) => {
 // reads the clipboard image for it.
 const attachFiles: NonNullable<DesktopSource['attachFiles']> = async (input) => {
   if (input.from === 'picker') return findFiles({ from: 'picker' });
-  const files = [...input.files].slice(0, 32);
-  const paths = files.map(pathOf).filter(Boolean);
+  const files: unknown[] = [...input.files].slice(0, MAX_ATTACH_FILES);
+  const paths = droppedPaths(files, pathOf);
   const found = paths.length > 0 ? await findFiles({ from: 'paths', paths }) : [];
   const unnamed = input.from === 'paste' && paths.length < files.length;
   return unnamed ? [...found, ...(await findFiles({ from: 'clipboard' }))] : found;

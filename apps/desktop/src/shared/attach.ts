@@ -39,6 +39,19 @@ export function attachRequest(value: unknown): AttachRequest | null {
   return null;
 }
 
+/**
+ * The paths the preload sends main for dropped or pasted files. Only a File the system gave the
+ * page has one, and `pathOf` (webUtils.getPathForFile) is what reads it. A string or other value
+ * from the renderer never becomes a path, so main never describes or grants a path the page named.
+ */
+export function droppedPaths(files: readonly unknown[], pathOf: (file: File) => string): string[] {
+  return files.slice(0, MAX_ATTACH_FILES).flatMap((file) => {
+    if (file === null || typeof file !== 'object') return [];
+    const path = pathOf(file as File);
+    return path ? [path] : [];
+  });
+}
+
 const desktopFile = (value: unknown): value is DesktopFile => {
   if (!value || typeof value !== 'object') return false;
   const file = value as Record<string, unknown>;
