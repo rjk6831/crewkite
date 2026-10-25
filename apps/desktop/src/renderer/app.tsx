@@ -14,7 +14,6 @@ import {
   RefreshCw,
   Search,
   Settings,
-  ShieldCheck,
   SquarePen,
   Sun,
   X,
@@ -32,6 +31,7 @@ import wordmark from './assets/crewkite-wordmark.png';
 import inverseWordmark from './assets/crewkite-wordmark-inverse.png';
 import { Dialog, short, titleCase } from './components.tsx';
 import { Empty, WorkspaceEmpty } from './empty-state.tsx';
+import { ExternalLink } from './external-link.tsx';
 import { withThreadDefaults } from './settings/preferences.ts';
 import { SettingsPage } from './settings/settings-page.tsx';
 import { useWorkspace, type Workspace } from './source.ts';
@@ -79,7 +79,7 @@ function Highlight({ text, match }: { text: string; match: TextMatch | null }) {
     </>
   );
 }
-// Outcomes and criteria can run long. Show the words around the match and keep surrogate pairs whole.
+// Matched text can run long. Show the words around the match and keep surrogate pairs whole.
 function excerpt(text: string, match: TextMatch, radius = 48) {
   let start = Math.max(0, match.index - radius);
   let end = Math.min(text.length, match.index + match.length + radius);
@@ -188,7 +188,7 @@ function CommandPalette({
       field &&
       (
         {
-          outcome: 'Outcome',
+          outcome: 'First message',
           criterion: 'Criterion',
           'task-id': 'Thread ID',
           'project-id': 'Project ID',
@@ -284,7 +284,7 @@ function CommandPalette({
           aria-autocomplete="list"
           aria-activedescendant={activeId}
           aria-describedby={`${id}-scope`}
-          placeholder="Title, outcome, criteria, ID or project"
+          placeholder="Title, first message, ID or project"
           autoComplete="off"
           spellCheck={false}
           value={query}
@@ -333,8 +333,8 @@ function CommandPalette({
         />
       </div>
       <p className="palette-scope" id={`${id}-scope`}>
-        Threads and commands. Searches thread titles, outcomes, criteria, IDs and projects.
-        Conversation messages are not searched.
+        Threads and commands. Searches thread titles, project names, the first message of each
+        thread and IDs. Later messages are not searched.
       </p>
       <div
         className="palette-results"
@@ -883,18 +883,11 @@ export function App() {
         )}
         <footer className="statusbar">
           <span>
-            <ShieldCheck size={12} />
             Local workspace<span className="footer-separator">/</span>
-            {!header
-              ? 'Route state unavailable'
-              : header.routes.length === 0
-                ? 'No routes configured'
-                : header.routes.every(({ fake }) => fake)
-                  ? 'All routes are fake'
-                  : 'Route state from controller'}
+            {connectionLabel}
           </span>
           <span>
-            Authority stays in the controller<kbd>⌘ K</kbd>
+            Search<kbd>⌘ K</kbd>
           </span>
         </footer>
       </div>
@@ -939,26 +932,24 @@ export function App() {
 const credits = [
   {
     name: 'Ponytail',
-    method: 'Keep it simple',
-    description: 'A simplicity lens and the build-less ladder.',
+    description: 'The contribution ladder in CONTRIBUTING.md is adapted from it.',
     repository: 'DietrichGebert/ponytail',
     pin: '552acd5efd0aeae2583a12efe39373d2f076f25e',
   },
   {
     name: 'ADHD',
-    method: 'Challenge assumptions',
-    description: 'Bounded assumption challenges during planning.',
+    description: 'Influenced the design of bounded assumption challenges.',
     repository: 'UditAkhourii/adhd',
     pin: '7b91ce601ed951c1a9658c63f6f9550d2486525b',
   },
   {
     name: 'multi',
-    method: 'Second opinion and Round-robin review',
-    description: 'Independent and round-robin review methods.',
+    description: 'Influenced the design of independent and round-robin review.',
     repository: 'szarkans/multi',
     pin: 'fcbe236a4fff1e513756c80e63ffb590b0fb1b19',
   },
 ];
+const noticesLink = 'https://github.com/rjk6831/crewkite/blob/main/docs/credits.md';
 
 function About({ onClose, preview }: { onClose: () => void; preview: boolean }) {
   return (
@@ -970,43 +961,35 @@ function About({ onClose, preview }: { onClose: () => void; preview: boolean }) 
           <span>Created by Raymond J. Kraft</span>
         </div>
         <p>
-          One controller owns task state, authority and result identity. The desktop and CLI are
-          clients of the same workspace.
+          CrewKite runs coding threads against Anthropic, OpenAI, Google and Local models. Each
+          thread works in a scratch copy of your project, and edits reach your repository only when
+          you accept them from the Changes tab.
         </p>
         {preview && (
           <div className="about-build">
-            <span className="prototype-tag">D0</span>
-            <span>Scripted providers · no live inference qualification</span>
+            <span>Preview data with scripted replies</span>
           </div>
         )}
-        <h3>Method acknowledgments</h3>
+        <h3>Credits</h3>
         <p className="muted">
-          These projects shaped the review methods. Credits describe method influence. No runtime
-          code from these projects is included.
+          These projects influenced the design. No runtime code from them is included.{' '}
+          <ExternalLink href={noticesLink}>Notices and license texts</ExternalLink>
         </p>
         <div className="credit-sources">
           {credits.map((credit) => (
             <section key={credit.name}>
               <div>
-                <h4>{credit.method}</h4>
-                <a
-                  href={`https://github.com/${credit.repository}/tree/${credit.pin}`}
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  {credit.name}
+                <h4>{credit.name}</h4>
+                <ExternalLink href={`https://github.com/${credit.repository}/tree/${credit.pin}`}>
+                  {credit.repository}
                   <ArrowUpRight size={12} />
-                </a>
+                </ExternalLink>
               </div>
               <p>{credit.description}</p>
               <code>Source revision {short(credit.pin)}</code>
             </section>
           ))}
         </div>
-        <p className="muted small">
-          Method configuration is saved in the run policy. Candidate evidence records the checks and
-          reviews that ran.
-        </p>
         <div className="about-license">
           <span>Roots No Limits LLC</span>
           <span>Apache License 2.0 · Copyright 2026 Raymond J. Kraft</span>
