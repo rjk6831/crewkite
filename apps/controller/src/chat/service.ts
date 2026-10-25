@@ -211,7 +211,8 @@ type LiveTurn = {
 const HandoffSchema = z.strictObject({
   from: ChatFamilySchema,
   // steer: Send now stopped the last reply, so the next message carries what it left behind.
-  reason: z.enum(['manual', 'limit', 'steer']),
+  // model: another model of the same family was picked in the composer.
+  reason: z.enum(['manual', 'limit', 'steer', 'model']),
 });
 type Handoff = z.infer<typeof HandoffSchema>;
 
@@ -680,6 +681,9 @@ export class ChatService {
   retryTurn(payload: Payload<'RetryChatTurn'>, effects: Effects): CommandResult {
     const task = this.task(payload.taskId);
     if (!task) return blocked('task-not-found');
+    // No turn path runs Continue yet, so it refuses with a step the person can take now.
+    if (payload.mode === 'continue')
+      return blocked('continue-unavailable', 'Send a message asking for the rest of the reply.');
     const { thread, left } = this.checkedThread(task);
     const action = payload.mode === 'retry' ? 'retry' : 'regenerate';
     if (thread.activeTurnId)

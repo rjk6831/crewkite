@@ -151,6 +151,17 @@ export const ChatFileDiffSchema = z.strictObject({
 
 const turnRef = { turnId: ChatTurnIdSchema };
 
+/**
+ * A reply that ended because it used its whole output budget. Reasoning counts inside the budget,
+ * so the person sees where it went. The partial reply stays in the thread and Continue picks it up.
+ */
+export const ChatOutputLimitSchema = z.strictObject({
+  reasoningTokens: z.number().int().nonnegative(),
+  replyTokens: z.number().int().nonnegative(),
+  allowedTokens: z.number().int().positive(),
+});
+export type ChatOutputLimit = z.infer<typeof ChatOutputLimitSchema>;
+
 /** Measured cost of one turn. Null where the runtime did not report the value. */
 export const ChatTurnStatsSchema = z.strictObject({
   tokensIn: z.number().int().nonnegative().nullable(),
@@ -230,6 +241,11 @@ export const AgentEventSchema = z.discriminatedUnion('type', [
     ...turnRef,
     level: z.enum(['info', 'warning']),
     message: z.string().min(1).max(4096),
+    /**
+     * The client said this about its own state, such as a resume warning or a settings change. It
+     * is not model output, so the view keeps it in the turn trace.
+     */
+    trace: z.literal(true).optional(),
   }),
   // The adapter's own measure of the turn. Local reports it every turn; others may not.
   z.strictObject({ type: z.literal('turn.stats'), ...turnRef, stats: ChatTurnStatsSchema }),
@@ -247,6 +263,8 @@ export const AgentEventSchema = z.discriminatedUnion('type', [
     ...turnRef,
     stopReason: z.enum(['done', 'stopped', 'limit', 'error']),
     failure: ChatFailureSchema.nullable().default(null),
+    /** Set when the reply stopped at the output limit. The stop reason stays done. */
+    outputLimit: ChatOutputLimitSchema.optional(),
   }),
 ]);
 export type AgentEvent = z.infer<typeof AgentEventSchema>;
@@ -280,6 +298,8 @@ export const ChatTurnSchema = z.strictObject({
   groups: z.array(z.number().int().positive()).max(64).optional(),
   /** The last turn.stats the adapter reported. */
   stats: ChatTurnStatsSchema.optional(),
+  /** Set when the reply stopped at the output limit, so a reopened view can offer Continue. */
+  outputLimit: ChatOutputLimitSchema.optional(),
 });
 export type ChatTurn = z.infer<typeof ChatTurnSchema>;
 
@@ -289,6 +309,11 @@ export const ChatSessionSchema = z.strictObject({
   sessionId: z.string().min(1).max(512),
   model: short,
   updatedAt: timestamp,
+  /**
+   * The sequence of the newest turn this session has seen. Turns after it ran on other families
+   * and reach the session in a delta packet. Missing on sessions saved before the field existed.
+   */
+  seenSequence: z.number().int().nonnegative().optional(),
 });
 export type ChatSession = z.infer<typeof ChatSessionSchema>;
 
@@ -555,12 +580,16 @@ export const ImportChatAttachmentPayloadSchema = z.strictObject({
     }),
   ]),
 });
-/** Run the message that started a turn again. Regenerate keeps the earlier reply in the thread. */
+/**
+ * Run the message that started a turn again. Regenerate keeps the earlier reply in the thread.
+ * Continue follows a reply that stopped at the output limit with a new turn that picks it up, and
+ * the partial reply stays.
+ */
 export const RetryChatTurnPayloadSchema = z.strictObject({
   taskId: id('tsk'),
   turnId: ChatTurnIdSchema,
   selection: ChatModelSelectionSchema.optional(),
-  mode: z.enum(['retry', 'regenerate']),
+  mode: z.enum(['retry', 'regenerate', 'continue']),
 });
 /** Same bounds as a task title. */
 export const RenameChatThreadPayloadSchema = z.strictObject({ taskId: id('tsk'), title: short });
@@ -647,6 +676,13 @@ export const ChatChangesReadSchema = z.strictObject({
 });
 export type ChatChangesRead = z.infer<typeof ChatChangesReadSchema>;
 
+/**
+ * How one file reaches one family. native: the client takes the type in its own block. path: the
+ * family gets a path line or a link its tools can open. none: the family cannot take the file.
+ */
+export const ChatAttachmentDeliverySchema = z.enum(['native', 'path', 'none']);
+export type ChatAttachmentDelivery = z.infer<typeof ChatAttachmentDeliverySchema>;
+
 export const ChatCatalogEntrySchema = z.strictObject({
   family: ChatFamilySchema,
   connected: z.boolean(),
@@ -689,6 +725,11 @@ export const ChatCatalogEntrySchema = z.strictObject({
    * Null when the client reports nothing.
    */
   accepts: z.array(z.string().max(128)).max(64).nullable().default(null),
+  /**
+   * How a file that matches nothing in `accepts` reaches the family. A file that matches is
+   * native. Missing when the family reports nothing.
+   */
+  unlisted: ChatAttachmentDeliverySchema.exclude(['native']).optional(),
 });
 export const ChatCatalogReadSchema = z.strictObject({
   families: z.array(ChatCatalogEntrySchema).max(4),

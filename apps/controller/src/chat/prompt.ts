@@ -21,11 +21,13 @@ export const familyName: Record<ChatFamily, string> = {
 };
 
 // rerun: Retry or Regenerate on the family that already answered the message, in a new session.
-export type HandoffReason = 'manual' | 'limit' | 'steer' | 'rerun';
+// model: the person picked another model of the same family, which starts a new native session.
+export type HandoffReason = 'manual' | 'limit' | 'steer' | 'rerun' | 'model';
 
 export function handoffReason(reason: HandoffReason): string {
   if (reason === 'rerun') return 'the person asked for the reply again';
   if (reason === 'steer') return 'the person sent a new message during the reply';
+  if (reason === 'model') return 'model changed in the composer';
   return reason === 'limit' ? 'usage limit reached' : 'switched in the composer';
 }
 

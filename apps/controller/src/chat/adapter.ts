@@ -4,6 +4,7 @@ import type {
   ChatFailure,
   ChatFamily,
   ChatModelSelection,
+  ChatOutputLimit,
   ChatPermissionPolicy,
   ChatRole,
   ChatSession,
@@ -68,6 +69,8 @@ export type ChatTurnResult = Readonly<{
   usage: { usedTokens: number; capacityTokens: number | null } | null;
   /** Paths the adapter believes it changed in scratch. The controller recomputes the real diff. */
   changedPaths: readonly string[];
+  /** Set when the reply stopped at the output limit. The stop reason stays done. */
+  outputLimit?: ChatOutputLimit;
 }>;
 
 export type ChatTurnHandle = Readonly<{
