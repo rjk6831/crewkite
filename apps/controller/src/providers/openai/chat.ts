@@ -13,7 +13,6 @@ import {
 import { extname, isAbsolute, join, relative, resolve } from 'node:path';
 import {
   type AgentEvent,
-  type ChatAttachment,
   ChatEffortSchema,
   type ChatFailure,
   type ChatPermissionOption,
@@ -228,11 +227,8 @@ const DETAIL_LIMIT = 4096;
 const AUDIO = /^\.(wav|mp3|m4a|webm|ogg)$/i;
 const MODEL_PAGES = 5;
 
-// shortcut: ChatTurnRequest has no files field yet, so the adapter reads it through this type.
-// Upgrade: read request.files directly once chat/adapter.ts declares it.
-type TurnFile = Readonly<{ attachment: ChatAttachment; path: string }>;
-const turnFiles = (request: ChatTurnRequest): readonly TurnFile[] =>
-  (request as { files?: readonly TurnFile[] }).files ?? [];
+type TurnFile = NonNullable<ChatTurnRequest['files']>[number];
+const turnFiles = (request: ChatTurnRequest): readonly TurnFile[] => request.files ?? [];
 type Media = {
   input: { type: 'localImage' | 'localAudio'; path: string };
   kind: 'image' | 'audio';

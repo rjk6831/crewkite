@@ -338,8 +338,8 @@ function historyBlock(history: readonly ChatHistoryEntry[]) {
 type TurnFile = NonNullable<ChatTurnRequest['files']>[number];
 type PromptBlock = Record<string, unknown>;
 
-// AcpConnection refuses any line over 1 MiB. The margin covers the request envelope.
-const promptLineBytes = 1_048_576 - 16 * 1024;
+// The chat connection refuses a line over its line limit. The margin covers the request envelope.
+const promptLineBytes = chatAcpLimits.lineBytes - 16 * 1024;
 const textTypes = /^(text\/|application\/(json|xml|yaml|x-yaml|toml|javascript|sql|x-sh)$)/;
 
 /**

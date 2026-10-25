@@ -851,7 +851,7 @@ test('the end of a prompt becomes a stop reason, a quota error carries its reset
       scenario: 'chat-attach',
       stopReason: 'done',
       failure: null,
-      files: (f: Rig) => [stored(f, 'large.png', 'image/png', Buffer.alloc(800 * 1024, 1))],
+      files: (f: Rig) => [stored(f, 'large.png', 'image/png', Buffer.alloc(16 * 1024 * 1024, 1))],
       blocks: (files: Stored[]) => files.map(link),
       capabilities: declared,
       notice: 'Sent as a file link, too large to send inline: large.png.',
