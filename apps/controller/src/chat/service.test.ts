@@ -1114,6 +1114,31 @@ test('accept commits the scratch edit on the base as a new branch and leaves the
   const after = await read();
   assert.equal(after.thread.lastPush?.commit, commit);
   assert.equal(after.messages.at(-1)?.text, 'Pushed crewkite/fix-rounding to origin.');
+
+  // The base advanced to the accepted commit, so Changes is empty and the next Accept stacks on it.
+  // Every read loads the thread record from the store, so a restarted controller sees the same base.
+  assert.equal(after.thread.base, commit);
+  const changes = await run('ReadChatChanges', {});
+  assert.deepEqual(changes.data, {
+    kind: 'chat-changes',
+    taskId: task.id,
+    base: commit,
+    files: [],
+  });
+  // HEAD moves on. Accept still starts from the thread's base and leaves HEAD where it is.
+  advance(repo('rev-parse', 'HEAD^{tree}'));
+  const moved = checkout();
+  appendFileSync(join(scratch, 'net.mjs'), '// second\n');
+  const second = await run('AcceptChatChanges', { branch: 'crewkite/second' }, task.revision);
+  const note = `The branch starts at this thread's base commit ${commit.slice(0, 7)}. HEAD stays where it is.`;
+  assert.deepEqual([second.outcome, second.next], ['applied', note]);
+  const stacked = repo('rev-parse', 'refs/heads/crewkite/second');
+  assert.equal(repo('rev-parse', 'refs/heads/crewkite/second^'), commit);
+  assert.equal(repo('diff', '--name-only', commit, stacked), 'net.mjs');
+  assert.deepEqual(checkout(), moved);
+  const last = await read();
+  assert.equal(last.thread.base, stacked);
+  assert.equal(last.messages.at(-1)?.text, `Accepted 1 file to branch crewkite/second. ${note}`);
 });
 
 test('accept is refused while a turn is running', { timeout: 30000 }, async (t) => {

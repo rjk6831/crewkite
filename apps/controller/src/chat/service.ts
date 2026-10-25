@@ -416,7 +416,9 @@ export class ChatService {
 
   /**
    * Commit the scratch copy on the thread's base and point a new local branch at it. The
-   * project's checkout, index and HEAD stay as they are (ADR 0008).
+   * project's checkout, index and HEAD stay as they are (ADR 0008). The branch starts from the
+   * base whatever HEAD is now, because that base is what the person reviewed. The base then
+   * advances to the new commit, so a later Accept builds on this one.
    */
   accept(payload: Payload<'AcceptChatChanges'>, identity: GitIdentity | undefined): CommandResult {
     const task = this.task(payload.taskId);
@@ -442,10 +444,6 @@ export class ChatService {
       );
     }
     if (existing !== null) return blocked('branch-exists', 'Choose an unused branch name.');
-    // The person reviewed the diff against the base. A branch from an older commit would need a
-    // rebase they never saw.
-    if (this.head(task) !== base)
-      return blocked('base-moved', 'Start a new thread on the current commit.');
     if (!identity)
       return blocked('git-identity-missing', 'Configure a Git name and email before acceptance.');
     const scratch = this.scratchDirectory(task.id);
@@ -495,18 +493,26 @@ export class ChatService {
     } finally {
       rmSync(work, { recursive: true, force: true });
     }
+    // The new tree is the copy's files plus the base entries it left out, so the copy matches
+    // the new base and Changes starts empty.
     this.putThread(task, {
       ...thread,
+      base: commit,
       lastAcceptance: { branch: payload.branch, at, fileCount, commit },
     });
+    const note =
+      this.head(task) === base
+        ? null
+        : `The branch starts at this thread's base commit ${base.slice(0, 7)}. HEAD stays where it is.`;
     this.appendEntry(task, {
       kind: 'chat-system',
       author: { kind: 'system', turnId: null },
-      text: `Accepted ${fileCount} ${fileCount === 1 ? 'file' : 'files'} to branch ${payload.branch}.`,
+      text: `Accepted ${fileCount} ${fileCount === 1 ? 'file' : 'files'} to branch ${payload.branch}.${note ? ` ${note}` : ''}`,
     });
     return {
       outcome: 'applied',
       data: { kind: 'chat-acceptance', branch: payload.branch, commit, fileCount },
+      ...(note ? { next: note } : {}),
     };
   }
 

@@ -18,8 +18,6 @@ const refusals: Record<string, string> = {
   'no-changes': 'The scratch copy has no changes to accept.',
   'branch-exists': 'That branch already exists. Choose another name.',
   'branch-name-unsupported': 'Use lower case letters, digits, hyphens and slashes.',
-  'base-moved':
-    "The project moved past this thread's base commit. Start a new thread on the current commit.",
   'git-identity-missing': 'Set a Git name and email on this machine, then accept again.',
   'scratch-unreadable':
     'The scratch copy holds new links or special files, or a link from the base commit changed. Restore them, then accept again.',
@@ -349,6 +347,11 @@ function AcceptControl({
             On branch {last.branch}
             {last.commit && ` (${last.commit.slice(0, 7)})`}
           </p>
+          {accepted?.note && (
+            <p className="th-muted" role="status">
+              {accepted.note}
+            </p>
+          )}
           <CodeBlock lang="sh" text={`git switch ${last.branch}`} />
           <GitSteps
             source={source}
