@@ -1174,7 +1174,7 @@ test('a scratch copy holds links that stay inside, skips what it cannot hold and
   assert.notEqual(accepted, tree);
   assert.equal(treeFromFiles(join(directory, 'round'), source.files, source.kept), tree);
 
-  // A held link must still be the same link, or the read refuses.
+  // Accept takes held links from the base, so whatever the copy holds there stays out of the read.
   const changes: [string, () => void, () => void][] = [
     [
       'replaced',
@@ -1206,7 +1206,8 @@ test('a scratch copy holds links that stay inside, skips what it cannot hold and
   ];
   for (const [name, change, restore] of changes) {
     change();
-    assert.throws(read, /changed the link/, name);
+    assert.deepEqual(read(), candidate, name);
+    assert.equal(treeFromFiles(join(directory, name), read(), source.kept), accepted, name);
     restore();
     assert.deepEqual(read(), candidate, name);
   }

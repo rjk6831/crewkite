@@ -13,6 +13,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -1323,12 +1324,25 @@ test('discard restores, removes or recovers one path and refuses links and entri
     'notes/new/added.txt',
     'sentinels/executable.sh',
   ]);
+  const listed = async (path: string) =>
+    ((await run('ReadChatChanges', {})).data as { files: { path: string; patch: string }[] }).files
+      .find((file) => file.path === path)
+      ?.patch.split('\n')[0];
+  const relinked = () => assert.equal(readlinkSync(join(scratch, 'NOTES.md')), 'net.mjs');
+  const replaceLink = () => {
+    rmSync(join(scratch, 'NOTES.md'));
+    writeFileSync(join(scratch, 'NOTES.md'), 'a file now\n');
+  };
   const rows: {
     path: string;
     reason?: string;
     line?: string;
     check?: () => void;
     before?: () => void;
+    /** The first patch line Changes shows for the path before the discard. */
+    listed?: string;
+    /** Accept to this branch first. It takes the link from the base. */
+    accept?: string;
   }[] = [
     {
       path: 'sentinels/executable.sh',
@@ -1353,7 +1367,43 @@ test('discard restores, removes or recovers one path and refuses links and entri
         assert.deepEqual(readFileSync(join(scratch, 'index.html')), committed('index.html')),
     },
     { path: 'index.html', reason: 'not-changed' },
-    { path: 'NOTES.md', reason: 'link-path' },
+    { path: 'NOTES.md', reason: 'not-changed' },
+    {
+      path: 'NOTES.md',
+      before: replaceLink,
+      listed: 'Link replaced',
+      line: 'Restored the link NOTES.md from the base commit',
+      check: relinked,
+    },
+    {
+      path: 'NOTES.md',
+      before: () => rmSync(join(scratch, 'NOTES.md')),
+      listed: 'Link removed',
+      line: 'Restored the link NOTES.md from the base commit',
+      check: relinked,
+    },
+    {
+      path: 'NOTES.md',
+      before: () => {
+        replaceLink();
+        appendFileSync(join(scratch, 'net.mjs'), '// changed\n');
+      },
+      listed: 'Link replaced',
+      accept: 'crewkite/link-replaced',
+      line: 'Restored the link NOTES.md from the base commit',
+      check: relinked,
+    },
+    {
+      path: 'NOTES.md',
+      before: () => {
+        rmSync(join(scratch, 'NOTES.md'));
+        appendFileSync(join(scratch, 'net.mjs'), '// changed\n');
+      },
+      listed: 'Link removed',
+      accept: 'crewkite/link-removed',
+      line: 'Restored the link NOTES.md from the base commit',
+      check: relinked,
+    },
     { path: 'vendor/lib', reason: 'skipped-path' },
     {
       path: 'vendor/lib/extra.txt',
@@ -1379,6 +1429,19 @@ test('discard restores, removes or recovers one path and refuses links and entri
   ];
   for (const row of rows) {
     row.before?.();
+    if (row.listed) assert.equal(await listed(row.path), row.listed, row.path);
+    if (row.accept) {
+      const accepted = await run('AcceptChatChanges', { branch: row.accept }, task.revision);
+      assert.deepEqual(accepted.data, {
+        kind: 'chat-acceptance',
+        branch: row.accept,
+        commit: repo('rev-parse', row.accept),
+        fileCount: 1,
+      });
+      assert.equal(repo('ls-tree', row.accept, 'NOTES.md'), repo('ls-tree', 'HEAD', 'NOTES.md'));
+      // The copy's version is still there, and Changes still says it will not be accepted.
+      assert.equal(await listed(row.path), row.listed, row.accept);
+    }
     const result = await discard(row.path);
     if (row.reason) {
       assert.deepEqual([result.outcome, result.reason], ['blocked', row.reason], row.path);

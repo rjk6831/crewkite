@@ -9,6 +9,7 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   rmdirSync,
@@ -18,7 +19,14 @@ import {
 } from 'node:fs';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import type { ChatChangesRead } from '@crewkite/contracts';
-import { committedFiles, type FileContent, git, readCandidateFiles } from '../host/source.ts';
+import {
+  committedFiles,
+  type FileContent,
+  git,
+  type LinkEntry,
+  readCandidateFiles,
+  restoreLink,
+} from '../host/source.ts';
 
 type FileDiff = ChatChangesRead['files'][number];
 type Op = { op: ' ' | '-' | '+'; line: string };
@@ -39,19 +47,27 @@ export function scratchChanges(
 ): FileDiff[] {
   const source = committedFiles(repository, base, { scratch: true });
   const before = byPath(source.files);
-  // Committed ignore rules keep generated files such as installed packages out of the diff. Links
-  // and skipped entries always come from the base, so they never show as changes.
+  // Committed ignore rules keep generated files such as installed packages out of the diff.
+  // Skipped entries always come from the base, so they never show as changes.
   const after = byPath(readCandidateFiles(scratch, repository, base, source));
-  const paths = [...new Set([...before.keys(), ...after.keys()])].sort();
+  // Accept takes held links from the base too. One the copy changed shows, so the person sees
+  // that the copy's version stays out.
+  const links = new Map<string, { link: LinkEntry; change: LinkChange }>();
+  for (const link of source.links) {
+    const change = linkChange(scratch, link);
+    if (change) links.set(link.path, { link, change });
+  }
+  const paths = [...new Set([...before.keys(), ...after.keys(), ...links.keys()])].sort();
   const files: FileDiff[] = [];
   let budget = patches ? TOTAL_PATCH_BYTES : 0;
   for (const path of paths) {
     const old = before.get(path);
     const next = after.get(path);
-    if (old && next && old.hash === next.hash && old.mode === next.mode) continue;
+    const held = links.get(path);
+    if (!held && old && next && old.hash === next.hash && old.mode === next.mode) continue;
     // shortcut: the read shape holds 2000 files. Upgrade: page changes when a thread needs more.
     if (files.length === 2000) break;
-    const diff = fileDiff(path, old, next);
+    const diff = held ? linkDiff(held.link, held.change) : fileDiff(path, old, next);
     const bytes = diff.patch === null ? 0 : Buffer.byteLength(diff.patch);
     const keep = diff.patch !== null && diff.patch.length <= PATCH_CHARACTERS && bytes <= budget;
     if (keep) budget -= bytes;
@@ -60,15 +76,49 @@ export function scratchChanges(
   return files;
 }
 
+type DiscardDone = 'restored' | 'removed' | 'recovered' | 'relinked';
 export type DiscardOutcome =
-  | { done: 'restored' | 'removed' | 'recovered' }
+  | { done: DiscardDone }
   | { refused: 'link-path' | 'skipped-path' | 'outside-copy' | 'path-blocked' | 'not-changed' };
 
 const pathKey = (path: string) => path.normalize('NFC').toLowerCase();
 
+type LinkChange = 'replaced' | 'removed' | 'changed';
+
+/** How the copy differs from the base at one of the base's links. Null when the link is intact. */
+function linkChange(scratch: string, link: LinkEntry): LinkChange | null {
+  const parts = link.path.split('/');
+  for (let end = 1; end < parts.length; end++) {
+    const state = lstatSync(join(scratch, ...parts.slice(0, end)), { throwIfNoEntry: false });
+    if (!state) return 'removed';
+    if (!state.isDirectory()) return 'replaced';
+  }
+  const folder = parts.slice(0, -1).join('/');
+  const key = pathKey(link.path);
+  // A case-insensitive volume reaches the link under any spelling, so every match counts.
+  const names = readdirSync(join(scratch, folder)).filter(
+    (name) => pathKey(folder ? `${folder}/${name}` : name) === key,
+  );
+  if (!names.length) return 'removed';
+  if (names.length > 1 || names[0] !== parts.at(-1)) return 'replaced';
+  const at = join(scratch, link.path);
+  if (!lstatSync(at).isSymbolicLink()) return 'replaced';
+  return readlinkSync(at) === link.target ? null : 'changed';
+}
+
+function linkDiff(link: LinkEntry, change: LinkChange): FileDiff {
+  const kept = `Accept takes ${link.path} -> ${link.target} from the base commit.`;
+  const body =
+    change === 'removed'
+      ? `${kept} Discard puts the link back.`
+      : `${kept} The copy's version here is not accepted. Discard puts the link back.`;
+  return { path: link.path, additions: 0, deletions: 0, patch: `Link ${change}\n${body}\n` };
+}
+
 /**
  * Put one path of the scratch copy back the way the base has it. A changed file gets the base bytes
- * and mode, a file the copy added is removed, and a file the copy deleted comes back. Links and
+ * and mode, a file the copy added is removed, and a file the copy deleted comes back. A base link
+ * the copy replaced, removed or changed is made again with its base target. Paths under a link and
  * entries the copy never held stay as they are, because Accept always takes them from the base.
  */
 export function discardScratchPath(
@@ -82,12 +132,13 @@ export function discardScratchPath(
   const wanted = pathKey(path);
   const covers = (held: string) =>
     wanted === pathKey(held) || wanted.startsWith(`${pathKey(held)}/`);
-  if (source.links.some((link) => covers(link.path))) return { refused: 'link-path' };
+  const link = source.links.find((entry) => pathKey(entry.path) === wanted);
+  if (!link && source.links.some((entry) => covers(entry.path))) return { refused: 'link-path' };
   if (source.skipped.some((entry) => covers(entry.path))) return { refused: 'skipped-path' };
   const root = realpathSync.native(scratch);
-  const target = resolve(root, path);
+  const target = resolve(root, link?.path ?? path);
   if (!target.startsWith(`${root}${sep}`)) return { refused: 'outside-copy' };
-  const parts = path.split('/');
+  const parts = (link?.path ?? path).split('/');
   // Every write below goes through real directories only. A link the copy added on the way could
   // send it anywhere.
   for (let end = 1; end < parts.length; end++) {
@@ -100,6 +151,11 @@ export function discardScratchPath(
         : { refused: 'outside-copy' };
     }
     if (!state.isDirectory()) return { refused: 'path-blocked' };
+  }
+  if (link) {
+    if (!linkChange(root, link)) return { refused: 'not-changed' };
+    restoreLink(root, source.links, link.path);
+    return { done: 'relinked' };
   }
   const state = lstatSync(target, { throwIfNoEntry: false });
   if (state?.isSymbolicLink()) return { refused: 'link-path' };
