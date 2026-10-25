@@ -857,6 +857,24 @@ test('the end of a prompt becomes a stop reason, a quota error carries its reset
       notice: 'Sent as a file link, too large to send inline: large.png.',
     },
     {
+      // An earlier file goes as a link even where the agent declared its block, with no notice.
+      scenario: 'chat-attach',
+      stopReason: 'done',
+      failure: null,
+      files: (f: Rig) => [{ ...stored(f, 'shot.png', 'image/png', png), earlier: true }],
+      blocks: (files: Stored[]) => files.map(link),
+      capabilities: declared,
+    },
+    {
+      // A prompt error over earlier files alone is not a refusal of them.
+      scenario: 'chat-error',
+      stopReason: 'error',
+      failure: { kind: 'protocol', method: 'session/prompt', code: -32603, resetsAt: null },
+      files: (f: Rig) => [{ ...stored(f, 'shot.png', 'image/png', png), earlier: true }],
+      blocks: (files: Stored[]) => files.map(link),
+      capabilities: none,
+    },
+    {
       // An agent that declares nothing gets a link, which every agent must accept.
       scenario: 'chat-stream',
       stopReason: 'done',

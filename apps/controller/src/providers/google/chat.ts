@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { closeSync, constants, fstatSync, openSync, readFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { pathToFileURL } from 'node:url';
@@ -345,8 +345,9 @@ const textTypes = /^(text\/|application\/(json|xml|yaml|x-yaml|toml|javascript|s
 /**
  * The prompt as content blocks, text first, then one block per file in the richest form the
  * agent declared. Every agent must accept a resource_link, so a file gets one when no flag
- * covers it, or when its inline form would not fit in the frame. `linked` names the files that
- * had an inline form and went as a link for size.
+ * covers it, or when its inline form would not fit in the frame. A file from an earlier message
+ * always goes as a link and is never read. `linked` names the files that had an inline form and
+ * went as a link for size. `attached` is true when the prompt carried a file of this message.
  */
 function promptBlocks(
   text: string,
@@ -358,7 +359,7 @@ function promptBlocks(
   const linked: string[] = [];
   let bytes = Buffer.byteLength(JSON.stringify(blocks));
   const fits = (block: PromptBlock) => bytes + Buffer.byteLength(JSON.stringify(block)) + 1;
-  for (const { attachment, path } of files) {
+  for (const { attachment, path, earlier } of files) {
     const { mimeType, name } = attachment;
     const uri = pathToFileURL(path).href;
     const link: PromptBlock = {
@@ -368,8 +369,9 @@ function promptBlocks(
       mimeType,
       size: attachment.bytes,
     };
-    const kind =
-      capabilities.image && mimeType.startsWith('image/')
+    const kind = earlier
+      ? null
+      : capabilities.image && mimeType.startsWith('image/')
         ? 'image'
         : capabilities.audio && mimeType.startsWith('audio/')
           ? 'audio'
@@ -377,11 +379,16 @@ function promptBlocks(
             ? 'resource'
             : null;
     let block = link;
-    // Base64 is four bytes for every three. A file that cannot fit is never read.
-    if (kind && bytes + Math.ceil(attachment.bytes / 3) * 4 + 512 <= promptLineBytes) {
-      let raw: Buffer;
+    // The size on disk decides, so a file that cannot fit is never read. Base64 is four bytes
+    // for every three.
+    let raw: Buffer | null = null;
+    if (kind) {
+      let fd: number | null = null;
       try {
-        raw = readFileSync(path);
+        fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+        const stat = fstatSync(fd);
+        if (!stat.isFile()) throw new Error(`${name} is not a regular file`);
+        if (bytes + Math.ceil(stat.size / 3) * 4 + 512 <= promptLineBytes) raw = readFileSync(fd);
       } catch (error) {
         throw new TurnFailure(
           chatFailure({
@@ -391,7 +398,11 @@ function promptBlocks(
             providerMessage: error instanceof Error ? clip(error.message, 2000) : null,
           }),
         );
+      } finally {
+        if (fd !== null) closeSync(fd);
       }
+    }
+    if (kind && raw) {
       const decoded = raw.toString('utf8');
       const plain = textTypes.test(mimeType) && Buffer.from(decoded).equals(raw);
       block =
@@ -410,7 +421,7 @@ function promptBlocks(
     bytes = fits(block);
     blocks.push(block);
   }
-  return { blocks, linked };
+  return { blocks, linked, attached: files.some((file) => !file.earlier) };
 }
 
 function failureFor(
@@ -1164,13 +1175,15 @@ export function googleChatAdapter(deps: {
           }
           parts.push(request.prompt);
           stage = 'prompt';
-          const { blocks, linked } = promptBlocks(
+          const prompt = promptBlocks(
             parts.filter(Boolean).join('\n\n'),
             request.files ?? [],
             capabilities,
             stage,
           );
-          attached = blocks.length > 1;
+          const { blocks, linked } = prompt;
+          // An error over files from earlier messages alone is not read as a refusal of them.
+          attached = prompt.attached;
           if (linked.length)
             notice(
               `Sent as a file link, too large to send inline: ${linked.map((name) => clip(name, 200)).join(', ')}.`,
