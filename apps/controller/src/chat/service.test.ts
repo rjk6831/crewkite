@@ -2080,6 +2080,28 @@ test('rename sets the thread title, and delete removes the thread, its scratch c
   assert.equal(remove().reason, 'thread-has-runs');
   store.db.prepare("DELETE FROM entities WHERE id='run_held'").run();
 
+  // Rows: large events keep their output in artifacts. One holds a hash nothing else names, and
+  // its file goes. The other shares its hash with an artifact outside the thread, and the file stays.
+  const artifacts = new ArtifactFiles(join(dirname(root), 'artifacts'));
+  const cursors = store.db
+    .prepare('SELECT cursor,event_id FROM events WHERE task_id=? ORDER BY cursor LIMIT 2')
+    .all(taskId) as { cursor: number; event_id: string }[];
+  const outputs = ['alone', 'shared'].map((content, index) => ({
+    id: `art_output${index}`,
+    ...artifacts.publish(Buffer.from(content)),
+    mediaType: 'application/vnd.crewkite.event+json',
+  }));
+  const kept = { ...outputs[1], id: 'art_kept', mediaType: 'text/plain' };
+  store.transaction(() => {
+    for (const [index, artifact] of [...outputs, kept].entries()) {
+      store.put('artifact', artifact.id, 0, artifact);
+      if (artifact !== kept)
+        store.db
+          .prepare('INSERT INTO activity_output(cursor,event_id,artifact_id) VALUES (?,?,?)')
+          .run(cursors[index].cursor, cursors[index].event_id, artifact.id);
+    }
+  });
+
   // The controller stops after the delete commits and before its folder goes. Startup finishes it.
   const folder = dirname(scripted.requests[0].scratch.directory);
   const ref = `refs/crewkite/threads/${taskId}`;
@@ -2091,6 +2113,12 @@ test('rename sets the thread title, and delete removes the thread, its scratch c
   assert.equal(existsSync(folder), false);
   assert.equal(git(root, ['for-each-ref', ref]).toString(), '');
   assert.equal(store.get('task', taskId), undefined);
+  assert.deepEqual(
+    [...outputs, kept].map((artifact) => store.get('artifact', artifact.id) !== undefined),
+    [false, false, true],
+  );
+  assert.throws(() => artifacts.read(outputs[0].hash), /ENOENT/);
+  assert.equal(artifacts.read(kept.hash).toString(), 'shared');
   for (const table of ['conversation_entries', 'chat_turns', 'chat_threads', 'events'])
     assert.equal(
       store.db.prepare(`SELECT count(*) AS rows FROM ${table} WHERE task_id=?`).get(taskId)?.rows,

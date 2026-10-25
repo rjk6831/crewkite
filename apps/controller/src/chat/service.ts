@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path';
 import {
   type AgentEvent,
   AgentEventSchema,
+  type Artifact,
   type ChatAttachment,
   type ChatCatalogRead,
   ChatCatalogReadSchema,
@@ -254,6 +255,8 @@ const WRITING_FLAGS =
 // would rewrite before the program sees it.
 const PLAIN_WORD = /^[A-Za-z0-9._/=:,+@%-]+$/;
 
+// The media type of the artifacts that hold large event output (commands/controller.ts).
+const EVENT_OUTPUT = 'application/vnd.crewkite.event+json';
 // One receipt per stored name. The same bytes under another name can carry another type.
 const fileKey = (taskId: string, file: Pick<ChatAttachment, 'id' | 'name'>) =>
   `chat-file:${taskId}:${file.id}:${file.name}`;
@@ -794,6 +797,14 @@ export class ChatService {
       return blocked('turn-running', 'Stop the reply, then delete the thread.');
     // A process that outlived its turn may still write to the scratch copy.
     if (left.length) return ownershipUnknown(left, 'delete the thread');
+    // A large event keeps its output in an artifact that only its activity row names. The rows go
+    // with the task, and the artifacts go after commit.
+    const outputs = this.deps.store.db
+      .prepare(
+        'SELECT artifact_id FROM activity_output WHERE cursor IN (SELECT cursor FROM events WHERE task_id=?)',
+      )
+      .all(task.id)
+      .map((row) => row.artifact_id as string);
     if (task.runId || !this.deps.store.removeTask(task.id))
       return blocked(
         'thread-has-runs',
@@ -809,8 +820,38 @@ export class ChatService {
       'local-owner',
       { outcome: 'applied', entity: task },
     );
-    effects.push(() => this.removeFromDisk(task));
+    effects.push(() => {
+      this.removeOutputs(outputs);
+      this.removeFromDisk(task);
+    });
     return { outcome: 'applied' };
+  }
+
+  /**
+   * Remove event output artifacts that no activity row names, and each file once no artifact names
+   * its hash. The file goes before the record, so a crash between the two leaves a record that
+   * startup finds and removes.
+   */
+  private removeOutputs(ids: readonly string[]) {
+    const db = this.deps.store.db;
+    for (const id of ids) {
+      try {
+        const artifact = this.deps.store.get<Artifact>('artifact', id);
+        if (!artifact || artifact.mediaType !== EVENT_OUTPUT) continue;
+        if (db.prepare('SELECT 1 FROM activity_output WHERE artifact_id=?').get(id)) continue;
+        const shared = db
+          .prepare(
+            "SELECT 1 FROM entities WHERE kind='artifact' AND id<>? AND json_extract(body,'$.hash')=?",
+          )
+          .get(id, artifact.hash);
+        if (!shared) this.deps.artifacts.remove(artifact.hash);
+        this.deps.store.transaction(() =>
+          db.prepare("DELETE FROM entities WHERE kind='artifact' AND id=?").run(id),
+        );
+      } catch {
+        // Startup tries again while the record is there.
+      }
+    }
   }
 
   private gitHost(): ChatGitHost {
@@ -2220,6 +2261,17 @@ export class ChatService {
       if (task?.id === key.slice('chat-deleted:'.length) && /^tsk_[A-Za-z0-9]+$/.test(task.id))
         if (existsSync(join(this.deps.home, 'chat', task.id))) this.removeFromDisk(task);
     }
+    // An event output artifact and its activity row are written together, so one with no row is
+    // left from a delete.
+    if (rows.length)
+      this.removeOutputs(
+        this.deps.store.db
+          .prepare(
+            "SELECT id FROM entities WHERE kind='artifact' AND json_extract(body,'$.mediaType')=? AND id NOT IN (SELECT artifact_id FROM activity_output)",
+          )
+          .all(EVENT_OUTPUT)
+          .map((row) => row.id as string),
+      );
   }
 
   private task(taskId: string): Task | undefined {
