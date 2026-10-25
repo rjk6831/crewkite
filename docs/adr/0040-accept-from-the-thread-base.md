@@ -23,9 +23,9 @@ This record amends ADR 0008 and leaves its text as it is.
   - A submodule (a gitlink, mode 160000) is skipped.
   - A path or a link target that is not UTF-8 is skipped.
   - A base with more than 100,000 entries fails with a message that names the count. The 64 MiB limit on file bytes stays.
-- The thread record lists the first 64 skipped entries with a reason each, and the Changes tab shows "Skipped N entries the scratch copy cannot hold". Accept copies every link and every skipped entry into the new tree from the base, byte for byte, whatever the copy holds at that path. It refuses when the copy changed a held link, added a link or a special file, or holds a `.git` folder.
+- The thread record lists the first 64 skipped entries with a reason each, and the Changes tab shows "Skipped N entries the scratch copy cannot hold". Accept copies every link and every skipped entry into the new tree from the base, byte for byte, whatever the copy holds at that path. A held link the copy replaced, removed or pointed elsewhere still goes into the branch as the base has it, and Changes lists that path with the reason until I discard it. Accept refuses when the copy added a new link or a special file, or holds a `.git` folder.
 - The writer path for tasks keeps its strict form: no links, no submodules and the 10,000 file limit.
-- Each file in Changes has Discard. It asks first and names the file. It restores that path in the scratch copy to the base: a changed file gets the base bytes and mode, a file the thread added is removed, and a deleted file comes back. It refuses a link, a skipped entry, a path that leads outside the copy through a link, a path blocked by another entry and a file that already matches the base. It waits while a turn runs, and it writes one system line. Accept then carries what is left. Discard works on whole files.
+- Each file in Changes has Discard. It asks first and names the file. It restores that path in the scratch copy to the base: a changed file gets the base bytes and mode, a file the thread added is removed, and a deleted file comes back. On a held link the copy changed, it removes whatever is at that path and makes the base link again, with the same checks the copy uses when it is first written. It refuses a skipped entry, a path that leads outside the copy through a link, a path blocked by another entry and a file that already matches the base. It waits while a turn runs, and it writes one system line. Accept then carries what is left. Discard works on whole files.
 
 ## Why
 
@@ -48,6 +48,6 @@ Discard exists because Accept took everything in the copy. A thread with one wro
 - A skipped entry is invisible to the model. A submodule has no files in the copy, and the model cannot edit it.
 - A base over 100,000 entries or 64 MiB cannot start a thread.
 - The thread record keeps 64 skipped entries, so a longer list shows as "64 or more". The first turn writes no line about them, and the Changes tab is the only place they appear.
-- Discard on a link or a skipped entry is refused, because Accept takes those from the base whatever the copy holds.
+- Discard on a skipped entry is refused, because Accept takes it from the base whatever the copy holds. A held link the copy changed stays listed in Changes after Accept, since the copy still holds its own version, until I discard it.
 - Hunk-level discard is not covered.
 - The accept, base ref and discard paths have fixture coverage and no live run on record.
