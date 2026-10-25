@@ -1,12 +1,7 @@
-import type { DesktopSource } from '@crewkite/client';
 import type { ChatAttachment } from '@crewkite/contracts';
 import { Ellipsis, FileText, LoaderCircle, Paperclip, X } from 'lucide-react';
 import { type RefObject, useCallback, useEffect, useRef, useState } from 'react';
-import {
-  ATTACHMENT_ID_PATTERN,
-  type AttachmentAction,
-  type AttachmentActions,
-} from '../../shared/open-file.ts';
+import { ATTACHMENT_ID_PATTERN, type AttachmentAction } from '../../shared/open-file.ts';
 
 export const basename = (path: string) => path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
 
@@ -52,7 +47,7 @@ const previewable = (mimeType: string | null) =>
   mimeType !== null && (mimeType.startsWith('image/') || mimeType === 'application/pdf');
 
 // The bridge is the desktop's. A browser preview has none, and its chips only show.
-const desktop = () => window.crewkite as (DesktopSource & AttachmentActions) | undefined;
+const desktop = () => window.crewkite;
 const canOpen = () => typeof desktop()?.openAttachment === 'function';
 
 function ChipMenu({

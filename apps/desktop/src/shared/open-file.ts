@@ -1,21 +1,12 @@
+import type { DesktopAttachmentTarget } from '@crewkite/client';
 import { TASK_ID_PATTERN } from './thread-notice.ts';
 
 // The one request shape the page sends main to open a file it stored for a thread. The page names
 // the file by thread, hash and name, never by path, and main builds the path under the controller
 // home. Main checks the shape on every call because the renderer is not trusted.
 
-export type AttachmentAction = 'preview' | 'reveal' | 'save';
-export type AttachmentTarget = {
-  action: AttachmentAction;
-  taskId: string;
-  id: string;
-  name: string;
-};
-/** `cancelled` is a Save as dialog the person closed. */
-export type AttachmentOutcome = 'done' | 'cancelled';
-export interface AttachmentActions {
-  openAttachment?(target: AttachmentTarget): Promise<AttachmentOutcome>;
-}
+export type AttachmentTarget = DesktopAttachmentTarget;
+export type AttachmentAction = AttachmentTarget['action'];
 
 /** The extensions that preview. Quick Look and the default viewer handle each of them. */
 export const PREVIEW_EXTENSIONS: ReadonlySet<string> = new Set([

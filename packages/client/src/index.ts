@@ -30,6 +30,13 @@ export type DesktopFile = { path: string; name: string; bytes: number; thumbnail
 export type DesktopAttachInput =
   | { from: 'picker' }
   | { from: 'drop' | 'paste'; files: readonly File[] };
+/** A stored attachment, named by thread, hash and name. The page never names a path. */
+export type DesktopAttachmentTarget = {
+  action: 'preview' | 'reveal' | 'save';
+  taskId: string;
+  id: string;
+  name: string;
+};
 export interface DesktopSource {
   getSnapshot(scope?: SnapshotScope): Promise<Snapshot>;
   workspaceState(): Promise<WorkspaceState>;
@@ -45,6 +52,8 @@ export interface DesktopSource {
   onConnection?(listener: (state: ConnectionState) => void): () => void;
   openLink?(url: string): Promise<'opened' | 'declined' | 'refused'>;
   attachFiles?(input: DesktopAttachInput): Promise<DesktopFile[]>;
+  /** Preview, reveal or save a file the controller stored for a thread. Main builds the path. */
+  openAttachment?(target: DesktopAttachmentTarget): Promise<'done' | 'cancelled'>;
   pickProject?(): Promise<CommandResult | null>;
   reconnect?(): Promise<void>;
   retryCommand?(expected?: DesktopCommand): Promise<CommandResult | null>;

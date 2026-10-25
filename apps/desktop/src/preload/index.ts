@@ -12,7 +12,7 @@ import {
 } from '@crewkite/contracts';
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import { desktopFiles, droppedPaths, MAX_ATTACH_FILES } from '../shared/attach.ts';
-import { type AttachmentActions, attachmentTarget } from '../shared/open-file.ts';
+import { attachmentTarget } from '../shared/open-file.ts';
 import { TASK_ID_PATTERN, threadAttention } from '../shared/thread-notice.ts';
 
 const events = new Set<Parameters<DesktopSource['subscribe']>[0]>();
@@ -81,7 +81,7 @@ const attachFiles: NonNullable<DesktopSource['attachFiles']> = async (input) => 
   const unnamed = input.from === 'paste' && paths.length < files.length;
   return unnamed ? [...found, ...(await findFiles({ from: 'clipboard' }))] : found;
 };
-const bridge: DesktopSource & AttachmentActions = {
+const bridge: DesktopSource = {
   verifyArtifact: async (input) =>
     ArtifactVerificationSchema.parse(
       await ipcRenderer.invoke('crewkite:verify-artifact', {
