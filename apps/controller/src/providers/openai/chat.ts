@@ -585,10 +585,17 @@ class OpenAiChatTurn {
    * cannot use into placeholder text and runs the turn anyway, so a file it would drop refuses
    * the turn here. The client reads localImage and localAudio paths itself, outside the sandbox.
    * Under both sandbox modes CrewKite sets, the sandbox reads the whole disk, so the model's
-   * tools can open the file a path line names in the controller home.
+   * tools can open the file a path line names in the controller home. A file from an earlier
+   * message always goes as a path line and never refuses the turn.
    */
   private sortFiles(): ChatFailure | null {
-    for (const { attachment, path } of turnFiles(this.request)) {
+    for (const { attachment, path, earlier } of turnFiles(this.request)) {
+      if (earlier) {
+        this.lines.push(
+          `Attached earlier: ${attachment.name} (${attachment.mimeType}, ${attachment.bytes} bytes) at ${path}`,
+        );
+        continue;
+      }
       const name = clip(attachment.name, 255);
       const rejected = (message: string) =>
         chatFailure({ stage: 'prompt', kind: 'attachment-rejected', message });
