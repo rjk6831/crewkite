@@ -821,8 +821,31 @@ test('events that a thread read or a stored turn read already covers apply once'
       late: [delta(11, 'Hello'), output(12, 'line\n')],
       want: { text: 'Hello', output: 'line\n' },
     },
+    {
+      // A later page failed, or the page cap ended the read. The turn shows what was read.
+      name: 'a stored turn read that stopped early shows what it read and says so',
+      before: [],
+      live: [],
+      cursor: '20',
+      after: [],
+      stored: [[started(10), delta(11, 'Hello')]],
+      partial: true,
+      want: { text: 'Hello', output: '' },
+      note: "Part of this turn's history could not load.",
+    },
   ];
-  for (const { name, before, live, cursor, after, stored = [], late = [], want } of cases) {
+  for (const {
+    name,
+    before,
+    live,
+    cursor,
+    after,
+    stored = [],
+    late = [],
+    partial = false,
+    want,
+    note,
+  } of cases) {
     let state = reduceThread(initialThreadState(task), { type: 'events', events: before });
     state = reduceThread(state, {
       type: 'loaded',
@@ -840,9 +863,11 @@ test('events that a thread read or a stored turn read already covers apply once'
         type: 'history',
         turnId: turn,
         events: events.map((event) => event.payload as AgentEvent),
+        partial,
       });
     state = reduceThread(state, { type: 'events', events: late });
     assert.deepEqual(shown(state), want, name);
+    assert.equal(state.historyNotes[turn], note, `${name} (note)`);
   }
 });
 
