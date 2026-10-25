@@ -1886,9 +1886,12 @@ test('a file is stored once by its hash, and its path reaches every turn that ru
         effects,
       ),
     );
+  // Rows: an unknown id or name is refused, and the type comes from the import, whatever the
+  // payload says.
   assert.equal(ask([{ ...file, id: 'f'.repeat(64) }]).reason, 'file-not-found');
+  assert.equal(ask([{ ...file, name: 'other.png' }]).reason, 'file-not-found');
   const failed = turnReaches({ store }, 'failed');
-  assert.equal(ask([file]).outcome, 'applied');
+  assert.equal(ask([{ ...file, mimeType: 'text/plain' }]).outcome, 'applied');
   const turn = await failed;
   const [sent] = (adapters.get('openai')?.requests ?? []) as ChatTurnRequest[];
   const path = sent.files?.[0]?.path ?? '';
