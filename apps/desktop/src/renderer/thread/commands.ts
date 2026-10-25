@@ -118,7 +118,7 @@ export const handoffThread = (
 ) => run(source, 'HandoffChatThread', HandoffChatThreadPayloadSchema.parse(input));
 
 export type Acceptance =
-  | { accepted: true; branch: string; commit: string; fileCount: number }
+  | { accepted: true; branch: string; commit: string; fileCount: number; note: string | null }
   | { accepted: false; reason: string; next: string | null };
 // Refusals come back as values so the Changes tab can name each reason on its own line.
 export async function acceptChanges(
@@ -130,7 +130,7 @@ export async function acceptChanges(
   const result = await dispatch(source, 'AcceptChatChanges', payload.data);
   if (result.outcome === 'applied' && result.data?.kind === 'chat-acceptance') {
     const { branch, commit, fileCount } = result.data;
-    return { accepted: true, branch, commit, fileCount };
+    return { accepted: true, branch, commit, fileCount, note: result.next ?? null };
   }
   return { accepted: false, reason: result.reason ?? 'not-accepted', next: result.next ?? null };
 }
