@@ -59,7 +59,7 @@ export type ThreadAttentionInput = {
   notice: {
     taskId: string;
     title: string;
-    kind: 'reply' | 'permission' | 'crew' | 'crew-stopped';
+    kind: 'reply' | 'failed' | 'permission' | 'crew' | 'crew-stopped';
   } | null;
 };
 
