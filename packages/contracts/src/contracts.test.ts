@@ -1443,6 +1443,13 @@ test('process boundaries reject unknown fields and invalid command identity', ()
       reason: 'not-configured',
     }).success,
   );
+  // The context comes from the bound instance, at whatever size it reports.
+  for (const change of [
+    { contextLength: 16384 },
+    { contextLength: 1_048_576 },
+    { available: false, modelBinding: null, reason: 'not-configured', contextLength: null },
+  ])
+    assert(NativeProfileSchema.safeParse({ ...localProfile, ...change }).success);
   for (const change of [
     { family: 'openai' },
     { billing: 'included' },
@@ -1454,7 +1461,8 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     { modelBinding: { ...localModel, modelSizeBytes: 0 } },
     { modelBinding: { ...localModel, setupHash: 'invalid' } },
     { modelBinding: { ...localModel, quantization: 'other' } },
-    { contextLength: 16384 },
+    { contextLength: 0 },
+    { contextLength: null },
     { maximumOutputTokens: 2049 },
     { maximumOutputTokens: 8192 },
     { maximumSubmissions: 2 },
@@ -1770,6 +1778,7 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     { residentLlms: 2, residents: [resident(0, 8192), resident(1, 32768)] },
     { models: [{ ...observedChoice, contextLength: 32768 }] },
     { models: [{ ...observedChoice, contextLength: 1_048_576 }] },
+    { embeddingInstances: 1 },
   ])
     assert.deepEqual(LocalModelObservationSchema.parse({ ...observation, ...change }), {
       ...observation,
@@ -1802,7 +1811,6 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     { residentLlms: 0 },
     { residents: [resident(0, 8192), resident(1, 8192)] },
     { residentLlms: 2, residents: [resident(0, 0), resident(1, 8192)] },
-    { embeddingInstances: 1 },
     { embeddingInstances: 9 },
     { runtime: { ...observation.runtime, build: -1 } },
     { runtime: { ...observation.runtime, executable: '/arbitrary/runtime' } },
@@ -3601,6 +3609,18 @@ test('the chat schemas accept the shapes the renderer sends and reject the ones 
       'turn stats without the summaries count are refused',
       ChatTurnStatsSchema,
       { ...stats, summaries: undefined },
+      false,
+    ],
+    [
+      'turn stats may split output into reasoning and reply',
+      ChatTurnStatsSchema,
+      { ...stats, reasoningTokens: 90, replyTokens: 30 },
+      true,
+    ],
+    [
+      'a negative reasoning count is refused',
+      ChatTurnStatsSchema,
+      { ...stats, reasoningTokens: -1, replyTokens: 30 },
       false,
     ],
     [

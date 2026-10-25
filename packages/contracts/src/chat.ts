@@ -173,6 +173,9 @@ export const ChatTurnStatsSchema = z.strictObject({
   contextCapacity: z.number().int().positive().nullable(),
   /** Rolling summaries the prompt carried, counting one written during this turn. */
   summaries: z.number().int().min(0).max(10_000),
+  /** Output tokens spent reasoning and on the reply, where the runtime splits them. */
+  reasoningTokens: z.number().int().nonnegative().optional(),
+  replyTokens: z.number().int().nonnegative().optional(),
 });
 export type ChatTurnStats = z.infer<typeof ChatTurnStatsSchema>;
 

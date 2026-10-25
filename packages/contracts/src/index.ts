@@ -307,7 +307,7 @@ export const LocalModelObservationSchema = z
       handles.length <= value.residentLlms &&
       (value.residents === undefined || value.residents.length === value.residentLlms) &&
       (!value.models.some((model) => model.state === 'loaded-eligible') ||
-        (value.residentLlms >= 1 && value.embeddingInstances === 0)) &&
+        value.residentLlms >= 1) &&
       localProjectionFits(value)
     );
   }, 'Local discovery needs distinct choices within its handle and byte bounds.');
@@ -493,7 +493,8 @@ export const LocalNativeProfileSchema = z
     model: label,
     modelBinding: LocalModelBindingSchema.nullable(),
     billing: z.literal('local'),
-    contextLength: z.literal(8192),
+    /** The context the bound instance reports. Null until a model is bound. */
+    contextLength: RevisionSchema.min(1).nullable(),
     maximumOutputTokens: z.union([z.literal(2048), z.literal(4096)]),
     qualifiedAt: z.iso.date().nullable(),
     maximumTaskMs: z.literal(300000),
@@ -519,6 +520,10 @@ export const LocalNativeProfileSchema = z
   .refine(
     (profile) => !profile.modelBinding || profile.model === profile.modelBinding.modelKey,
     'A Local profile must name its bound model.',
+  )
+  .refine(
+    (profile) => !profile.modelBinding || profile.contextLength !== null,
+    'A bound Local profile carries the context its instance reports.',
   );
 const acpIdentifier = label.refine(
   (value) => value.isWellFormed() && !/\p{Cc}/u.test(value),
