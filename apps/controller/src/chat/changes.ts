@@ -120,12 +120,14 @@ function linkDiff(link: LinkEntry, change: LinkChange): FileDiff {
  * and mode, a file the copy added is removed, and a file the copy deleted comes back. A base link
  * the copy replaced, removed or changed is made again with its base target. Paths under a link and
  * entries the copy never held stay as they are, because Accept always takes them from the base.
+ * `writing` hears the outcome just before the first change on disk.
  */
 export function discardScratchPath(
   repository: string,
   scratch: string,
   base: string,
   path: string,
+  writing?: (done: DiscardDone) => void,
 ): DiscardOutcome {
   const source = committedFiles(repository, base, { scratch: true });
   // A case-insensitive volume reaches a held entry under any spelling.
@@ -154,6 +156,7 @@ export function discardScratchPath(
   }
   if (link) {
     if (!linkChange(root, link)) return { refused: 'not-changed' };
+    writing?.('relinked');
     restoreLink(root, source.links, link.path);
     return { done: 'relinked' };
   }
@@ -166,11 +169,13 @@ export function discardScratchPath(
     if (source.files.some((file) => pathKey(file.path) === wanted))
       return { refused: 'path-blocked' };
     if (!state) return { refused: 'not-changed' };
+    writing?.('removed');
     unlinkSync(target);
     prune(root, dirname(target));
     return { done: 'removed' };
   }
   if (state && sameFile(target, original)) return { refused: 'not-changed' };
+  writing?.(state ? 'restored' : 'recovered');
   mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
   // A rename replaces the directory entry, so a hard link the copy made to another file keeps its
   // bytes.
@@ -185,6 +190,34 @@ export function discardScratchPath(
     throw error;
   }
   return { done: state ? 'restored' : 'recovered' };
+}
+
+/** The discard about to change the copy, kept on disk so a retry after a crash finds it. */
+export type DiscardMark = { key: string; path: string; base: string; done: DiscardDone };
+
+export function writeDiscardMark(file: string, mark: DiscardMark) {
+  const temporary = `${file}.${randomBytes(6).toString('hex')}`;
+  try {
+    writeFileSync(temporary, JSON.stringify(mark), { flag: 'wx', mode: 0o600 });
+    renameSync(temporary, file);
+  } catch (error) {
+    rmSync(temporary, { force: true });
+    throw error;
+  }
+}
+
+export function readDiscardMark(file: string): DiscardMark | null {
+  try {
+    const mark = JSON.parse(readFileSync(file, 'utf8')) as Partial<DiscardMark>;
+    return typeof mark.key === 'string' &&
+      typeof mark.path === 'string' &&
+      typeof mark.base === 'string' &&
+      ['restored', 'removed', 'recovered', 'relinked'].includes(mark.done as string)
+      ? (mark as DiscardMark)
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function sameFile(file: string, original: FileContent) {
