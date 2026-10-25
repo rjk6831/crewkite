@@ -89,6 +89,7 @@ import {
 import { scratchPath } from './local-tools.ts';
 import {
   adviceContext,
+  byteSize,
   challengeContext,
   familyName,
   fixerBrief,
@@ -219,6 +220,9 @@ const PACKET_BYTES = 96 * 1024;
 const PACKET_PATCH_BYTES = 48 * 1024;
 const PACKET_TRANSCRIPT_BYTES = 24 * 1024;
 const PACKET_LISTED_FILES = 200;
+// Files of earlier messages that travel with a packet. The packet lists each one on a line.
+const EARLIER_FILES = 32;
+const EARLIER_FILE_LINE_BYTES = 8 * 1024;
 const PACKET_ENTRY_CHARACTERS = 8000;
 const CHECK_LINES = 5;
 const CHECK_CHARACTERS = 1500;
@@ -1118,7 +1122,7 @@ export class ChatService {
       writer && !fresh
         ? (thread.sessions.find((value) => value.family === turn.selection.family) ?? null)
         : null;
-    const files = this.turnFiles(task.id, message, !!turn.handoffFrom);
+    const files = this.turnFiles(task.id, message, carries, session ? turn.selection.family : null);
     const work = join(this.deps.home, 'chat', task.id, 'turns', turn.id);
     mkdirSync(work, { recursive: true, mode: 0o700 });
     const handoff = turn.handoffFrom ? this.takeHandoff(task) : null;
@@ -2045,44 +2049,71 @@ export class ChatService {
   }
 
   /**
-   * The files a turn sends. A turn that continues on another family also sends the files of the
-   * earlier messages its packet can quote, so the next provider sees what the conversation saw. A
-   * file of the message itself that is gone fails the turn. An earlier one that is gone is left out.
+   * The files a turn sends. A turn with a packet also sends the files of the earlier messages the
+   * packet can quote, marked earlier, so the adapter names each one and never refuses the turn
+   * over it. A resumed session already holds the files of the messages it ran, so those stay out.
+   * The newest 32 earlier files go, and their lines in the packet stay under 8 KiB, so the
+   * transcript keeps its room. A file of the message itself that is gone fails the turn. An
+   * earlier one that is gone is left out.
    */
   private turnFiles(
     taskId: string,
     message: ConversationEntry,
-    handoff: boolean,
+    carries: boolean,
+    resumed: ChatFamily | null,
   ): NonNullable<ChatTurnRequest['files']> {
     const own = message.kind === 'user-message' ? (message.files ?? []) : [];
     const folder = this.filesFolder(taskId);
+    const key = (attachment: ChatAttachment) => `${attachment.id}/${attachment.name}`;
     const seen = new Set<string>();
     const files: NonNullable<ChatTurnRequest['files']>[number][] = [];
-    for (const attachment of [
-      ...(handoff ? this.earlierFiles(taskId, message.cursor) : []),
-      ...own,
-    ]) {
-      const key = `${attachment.id}/${attachment.name}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
+    for (const attachment of own) {
+      if (seen.has(key(attachment))) continue;
+      seen.add(key(attachment));
       const path = storedFile(folder, attachment);
-      if (path) files.push({ attachment, path });
-      else if (own.includes(attachment))
-        throw Error(`${attachment.name} is no longer stored. Attach it again and send.`);
+      if (!path) throw Error(`${attachment.name} is no longer stored. Attach it again and send.`);
+      files.push({ attachment, path });
     }
-    return files;
+    if (!carries) return files;
+    const earlier: typeof files = [];
+    let listed = 0;
+    for (const attachment of this.earlierFiles(taskId, message.cursor, resumed)) {
+      if (earlier.length === EARLIER_FILES) break;
+      if (seen.has(key(attachment))) continue;
+      seen.add(key(attachment));
+      const path = storedFile(folder, attachment);
+      if (!path) continue;
+      listed += Buffer.byteLength(
+        `${attachment.name} (${attachment.mimeType}, ${byteSize(attachment.bytes)})\n`,
+      );
+      if (listed > EARLIER_FILE_LINE_BYTES) break;
+      earlier.push({ attachment, path, earlier: true });
+    }
+    return [...earlier.reverse(), ...files];
   }
 
-  /** Files on the user messages inside the packet's transcript window, oldest first. */
-  private earlierFiles(taskId: string, beforeCursor: string): ChatAttachment[] {
+  /**
+   * Files on the user messages inside the packet's transcript window, newest first. With a
+   * resumed session, the messages a writing turn on its family ran are left out.
+   */
+  private earlierFiles(
+    taskId: string,
+    beforeCursor: string,
+    resumed: ChatFamily | null,
+  ): ChatAttachment[] {
+    const ran = this.deps.store.db.prepare(
+      "SELECT 1 FROM chat_turns WHERE task_id=? AND json_extract(body,'$.userMessageId')=? AND json_extract(body,'$.selection.family')=? AND json_extract(body,'$.role') IN ('assistant','fixer')",
+    );
     return this.deps.store.db
       .prepare(
-        "SELECT body FROM (SELECT sequence,body FROM conversation_entries WHERE task_id=? AND sequence<? AND json_extract(body,'$.kind') IN ('user-message','chat-assistant') ORDER BY sequence DESC LIMIT ?) ORDER BY sequence",
+        "SELECT body FROM conversation_entries WHERE task_id=? AND sequence<? AND json_extract(body,'$.kind') IN ('user-message','chat-assistant') ORDER BY sequence DESC LIMIT ?",
       )
       .all(taskId, BigInt(beforeCursor), HISTORY_LIMIT)
       .flatMap((row) => {
         const entry = ConversationEntrySchema.parse(JSON.parse(row.body as string));
-        return entry.kind === 'user-message' ? (entry.files ?? []) : [];
+        if (entry.kind !== 'user-message') return [];
+        if (resumed && ran.get(taskId, entry.id, resumed)) return [];
+        return [...(entry.files ?? [])].reverse();
       });
   }
 

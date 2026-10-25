@@ -2053,6 +2053,57 @@ test('a file is stored once by its hash, and its path reaches every turn that ru
       assert.doesNotMatch(request.prompt, /Two\./, family);
     }
   }
+
+  // Rows: a handoff to Google carries the newest 32 earlier files marked earlier, and the file of
+  // the message itself unmarked. Back on OpenAI the resumed session already holds the files of the
+  // messages it ran, so only the one Google saw travels.
+  const families = new Map(
+    (['openai', 'google'] as const).map((family) => [
+      family,
+      createScriptedChatAdapter({ family, turns: [reply('Seen.')] }),
+    ]),
+  );
+  const carry = standalone(t, { adapters: families });
+  const notes = Array.from({ length: 34 }, (_value, index) => {
+    const source = { name: `n${index}.txt`, mimeType: 'text/plain', base64: btoa(`note ${index}`) };
+    const stored = carry.store.transaction(() =>
+      carry.service.importAttachment({ taskId: carry.taskId, source }),
+    ).data as ChatAttachment & { kind: 'chat-attachment' };
+    const { kind: _kind, ...attachment } = stored;
+    return attachment;
+  });
+  const message = async (files: ChatAttachment[], choice: ChatModelSelection) => {
+    const done = turnReaches({ store: carry.store }, 'done');
+    act(carry.store, (effects) =>
+      carry.service.sendMessage(
+        {
+          taskId: carry.taskId,
+          text: 'Read these.',
+          selection: choice,
+          role: 'assistant',
+          attachments: [],
+          files,
+        },
+        effects,
+      ),
+    );
+    await done;
+  };
+  await message(notes.slice(0, 32), selection);
+  await message(notes.slice(32), selection);
+  await message([notes[33]], google);
+  await message([], selection);
+  const names = (request: ScriptedChatRequest) =>
+    ((request as ChatTurnRequest).files ?? []).map(
+      (file) => `${file.attachment.name}${file.earlier ? ' earlier' : ''}`,
+    );
+  assert.deepEqual(names(families.get('google')?.requests[0] as ScriptedChatRequest), [
+    ...notes.slice(1, 33).map((note) => `${note.name} earlier`),
+    'n33.txt',
+  ]);
+  assert.deepEqual(names(families.get('openai')?.requests[2] as ScriptedChatRequest), [
+    'n33.txt earlier',
+  ]);
 });
 
 test('rename sets the thread title, and delete removes the thread, its scratch copy and files for good', {
