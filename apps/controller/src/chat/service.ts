@@ -248,7 +248,7 @@ const blocked = (reason: string, next?: string): CommandResult => ({
   ...(next ? { next } : {}),
 });
 const discardRefusals: Record<string, string> = {
-  'link-path': 'Links come from the base commit as they are. Discard leaves them alone.',
+  'link-path': 'Discard leaves links the base commit does not hold, and paths under a link, alone.',
   'skipped-path': 'The scratch copy does not hold this entry, so there is nothing to discard.',
   'outside-copy': 'This path leads outside the scratch copy.',
   'path-blocked': 'Another entry in the scratch copy sits at this path. Discard that one first.',
@@ -479,13 +479,17 @@ export class ChatService {
     try {
       const source = committedFiles(root, base, { scratch: true });
       kept = source.kept;
-      // The Changes tab count, so the system line matches what the person reviewed.
-      fileCount = scratchChanges(root, scratch, base, false).length;
+      // The Changes tab count, so the system line matches what the person reviewed. A base link
+      // the copy changed is listed there and comes from the base, so it is not counted.
+      const links = new Set(source.links.map((link) => link.path));
+      fileCount = scratchChanges(root, scratch, base, false).filter(
+        (file) => !links.has(file.path),
+      ).length;
       files = readCandidateFiles(scratch, root, base, source);
     } catch {
       return blocked(
         'scratch-unreadable',
-        'Remove new links and special files from the scratch copy, and restore any link from the base commit.',
+        'Remove new links and special files from the scratch copy.',
       );
     }
     if (!fileCount) return blocked('no-changes', 'Ask for a change in this thread first.');
@@ -706,7 +710,9 @@ export class ChatService {
           ? `Discarded ${payload.path}, a file added in this thread.`
           : outcome.done === 'recovered'
             ? `Restored ${payload.path} from the base commit ${short}.`
-            : `Discarded the changes to ${payload.path}. It matches the base commit ${short}.`,
+            : outcome.done === 'relinked'
+              ? `Restored the link ${payload.path} from the base commit ${short}.`
+              : `Discarded the changes to ${payload.path}. It matches the base commit ${short}.`,
     });
     return { outcome: 'applied' };
   }
