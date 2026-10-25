@@ -51,8 +51,14 @@ export function RailUsage({
         <div
           key={row.family}
           className={row.needsConnect ? 'rail-usage-row is-waiting' : 'rail-usage-row'}
-          title={row.detail ?? undefined}
+          // A native title shows late and never on keyboard focus. The detail card shows on both.
+          tabIndex={row.detail ? 0 : undefined}
         >
+          {row.detail && (
+            <span className="rail-usage-detail" aria-hidden="true">
+              {row.detail}
+            </span>
+          )}
           <span className="rail-usage-label">
             <FamilyMark family={row.family} />
             {familyName(row.family)}
