@@ -134,7 +134,18 @@ function asMessage(payload: unknown): ChatMessage | null {
   if (!entry.success || !['user-message', 'guidance', 'answer'].includes(entry.data.kind))
     return null;
   const { id, taskId, at, cursor, text } = entry.data;
-  return { id, taskId, at, cursor, text, author: { kind: 'user' }, attachments: [], files: [] };
+  // The stored entry names the files, so the chips stay when it replaces the pending message.
+  const sent = entry.data.kind === 'user-message' ? entry.data : null;
+  return {
+    id,
+    taskId,
+    at,
+    cursor,
+    text,
+    author: { kind: 'user' },
+    attachments: sent?.attachments ?? [],
+    files: sent?.files ?? [],
+  };
 }
 
 // A replacing read keeps the messages older than its own oldest one, which came from Load earlier.
@@ -307,7 +318,15 @@ export type ThreadItem =
     }
   | { kind: 'turn'; key: string; turn: TurnView }
   | { kind: 'failure'; key: string; turnId: string; failure: ChatFailure }
-  | { kind: 'system'; key: string; at: string; text: string };
+  | {
+      kind: 'system';
+      key: string;
+      at: string;
+      text: string;
+      /** The two models around a model change, so the card can name both. */
+      handoff: { from: TurnModel; to: TurnModel } | null;
+    };
+type TurnModel = Pick<ChatModelSelection, 'family' | 'model'>;
 
 const metaStatus = (state: ChatTurn['state']): TurnStatus =>
   state === 'queued' || state === 'running'
@@ -343,6 +362,29 @@ function askedOrder(meta: ChatTurn, asked: ChatMessage, state: ThreadState): big
   return after(started > cursor ? started : cursor, meta);
 }
 
+const MODEL_CHANGE = /Reason: model changed in the composer\.$/;
+
+// A model change inside one family writes a line with the family only. The turn before it and the
+// first turn after it hold the models, so the card names both from the turns.
+function modelChange(
+  message: ChatMessage,
+  state: ThreadState,
+): { from: TurnModel; to: TurnModel } | null {
+  if (!MODEL_CHANGE.test(message.text)) return null;
+  const at = Date.parse(message.at);
+  const turns = Object.values(state.turnMeta)
+    .filter((turn) => turn.role === 'assistant')
+    .sort((a, b) => a.sequence - b.sequence);
+  const to = turns.find((turn) => Date.parse(turn.startedAt) >= at);
+  const from = turns.findLast((turn) => Date.parse(turn.startedAt) < at);
+  return from && to
+    ? {
+        from: { family: from.selection.family, model: from.selection.model },
+        to: { family: to.selection.family, model: to.selection.model },
+      }
+    : null;
+}
+
 // The ordered rows of the thread. A turn seen only on the stream keeps its first event cursor
 // until its record arrives and names the message. A turn whose message is not loaded sits by the
 // time it started, or at its stored reply.
@@ -374,7 +416,13 @@ export function threadItems(state: ThreadState): ThreadItem[] {
     else if (!message.author.turnId || !failed.has(message.author.turnId))
       rows.push({
         order,
-        item: { kind: 'system', key: message.id, at: message.at, text: message.text },
+        item: {
+          kind: 'system',
+          key: message.id,
+          at: message.at,
+          text: message.text,
+          handoff: modelChange(message, state),
+        },
       });
   }
   const ids = new Set([
@@ -422,7 +470,17 @@ export function threadItems(state: ThreadState): ThreadItem[] {
     // Live events of a finished turn are gone after a reload. The turn row keeps its stats, and
     // their summary count stands in for the rolling summary cards.
     const stats = base.stats ?? meta?.stats ?? null;
-    const turn: TurnView = { ...base, identity, status, blocks, failure, ended, stats };
+    const outputLimit = base.outputLimit ?? meta?.outputLimit ?? null;
+    const turn: TurnView = {
+      ...base,
+      identity,
+      status,
+      blocks,
+      failure,
+      ended,
+      stats,
+      outputLimit,
+    };
     const asked = meta && byId.get(meta.userMessageId);
     const firstCursor = record?.events[0]?.cursor ?? null;
     const order =

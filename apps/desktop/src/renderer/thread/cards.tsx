@@ -339,6 +339,51 @@ export function RerunControl({
   );
 }
 
+/**
+ * A reply that stopped at its output limit. The line gives the counts and Continue asks for the
+ * rest. The partial reply stays above it. `line` is null when the controller already wrote the
+ * same line into the thread.
+ */
+export function OutputLimitControl({
+  line,
+  onContinue,
+}: {
+  line: string | null;
+  onContinue: () => Promise<void>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  async function run() {
+    setBusy(true);
+    setError(null);
+    try {
+      await onContinue();
+    } catch (failure) {
+      setError(runFailure(failure));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="th-output-limit">
+      {line && <p role="status">{line}</p>}
+      <button
+        type="button"
+        className="th-pill th-outline"
+        disabled={busy}
+        onClick={() => void run()}
+      >
+        Continue
+      </button>
+      {error && (
+        <p className="th-error" role="alert">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
 /** The families a rejected message has not tried yet, in the order `tryWithChoices` gives. */
 export function TryWith({
   choices,

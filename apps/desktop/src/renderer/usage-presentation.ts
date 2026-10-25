@@ -450,7 +450,7 @@ export function localFacts(
     memory:
       total === null
         ? null
-        : `${gigabytes(total)} memory${free === null ? '' : `, ${gigabytes(free)} free`}`,
+        : `${gigabytes(total)} memory${free === null ? '' : `, ${gigabytes(free)} available`}`,
     model: choice
       ? [
           name,

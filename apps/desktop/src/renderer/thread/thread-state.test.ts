@@ -16,8 +16,9 @@ import type {
   ChatThreadRead,
   ChatTurn,
 } from '@crewkite/contracts';
-import { acceptsType, tryWithChoices } from './file-fit.ts';
+import { acceptsType, deliveryNote, deliveryOf, tryWithChoices } from './file-fit.ts';
 import { limitOffer, offerChoices } from './handoff-offer.ts';
+import { outputLimitLine, outputSplit } from './output-limit.ts';
 import {
   earlierCursor,
   FIRST_READ_BACKOFF,
@@ -345,6 +346,42 @@ test('a message the controller queued leaves no pending bubble', () => {
     queued.thread?.queued.map((message) => message.text),
     [text],
   );
+
+  // The chips show on the pending message and stay when the stored entry replaces it. The entry
+  // arrives in its stored shape, which names the files.
+  const file = { id: 'a'.repeat(64), name: 'plan.pdf', mimeType: 'application/pdf', bytes: 9 };
+  const sentFiles = reduceThread(initialThreadState(task), {
+    type: 'sending',
+    pending: { localId: 'local-2', text: 'See the plan', files: [file], at: stamp },
+  });
+  const userItem = (state: typeof sentFiles) => {
+    const item = threadItems(state).find((row) => row.kind === 'user');
+    return item?.kind === 'user' ? item : undefined;
+  };
+  assert.deepEqual(userItem(sentFiles)?.files, [file]);
+  const stored = reduceThread(sentFiles, {
+    type: 'events',
+    events: [
+      {
+        type: 'conversation.entry',
+        cursor: '30',
+        taskId: task,
+        payload: {
+          kind: 'user-message',
+          id: id('msg', 30),
+          taskId: task,
+          revision: 1,
+          cursor: '30',
+          at: stamp,
+          author: { kind: 'user' },
+          text: 'See the plan',
+          files: [file],
+        },
+      },
+    ],
+  });
+  assert.equal(userItem(stored)?.pending, false);
+  assert.deepEqual(userItem(stored)?.files, [file]);
 });
 
 test('the limit offer shows only while the newest turn is the one that hit a limit', () => {
@@ -963,6 +1000,34 @@ test('reported file types decide the chip note and lead the Try with order', () 
   ];
   for (const [accepts, mimeType, want] of matches)
     assert.equal(acceptsType(accepts, mimeType), want, `${accepts} ${mimeType}`);
+  // The state a file gets: listed is native, unlisted is what the catalog says, nothing reported
+  // says nothing. Only a file the family cannot receive at all warns on the chip.
+  const delivery: [string[] | null, 'path' | 'none' | undefined, string, string | null, boolean][] =
+    [
+      [['image/*'], 'path', 'image/png', 'Anthropic takes this file as an image.', false],
+      [
+        ['image/*'],
+        'path',
+        'application/zip',
+        'Sent as a file path. Anthropic can open it with its tools.',
+        false,
+      ],
+      [
+        ['image/*'],
+        'none',
+        'application/zip',
+        'Anthropic cannot take this file. The turn will stop and offer another provider.',
+        true,
+      ],
+      [null, 'none', 'application/zip', null, false],
+      [['image/*'], undefined, 'application/zip', null, false],
+    ];
+  for (const [accepts, unlisted, mimeType, title, warn] of delivery) {
+    const how = deliveryOf({ accepts, unlisted }, mimeType);
+    const note = how && deliveryNote('Anthropic', how, mimeType);
+    assert.equal(note?.title ?? null, title, `${accepts} ${unlisted} ${mimeType}`);
+    assert.equal(note?.warn ?? false, warn, `${accepts} ${unlisted} ${mimeType}`);
+  }
   const family = (name: ChatFamily, percent: number, accepts: string[] | null) => ({
     ...connected(name, percent),
     accepts,
@@ -1179,4 +1244,95 @@ test('the first read retries on the backoff and offers Try again only after ten 
   );
   assert.deepEqual(waits, [250, 500, 1000, 2000, 2000, 2000, 2000, 2000]);
   assert.ok(now >= TRY_AGAIN_AFTER_MS && now - 2000 < TRY_AGAIN_AFTER_MS);
+});
+
+test('an output limit and a model change reach the view with the numbers and models from the turns', () => {
+  const limit = { reasoningTokens: 3900, replyTokens: 700, allowedTokens: 4600 };
+  assert.equal(
+    outputLimitLine(limit),
+    'Reply stopped at the output limit: 3,900 reasoning and 700 reply of 4,600 allowed.',
+  );
+  assert.equal(outputSplit(limit), 'reasoning 3,900 · reply 700');
+  const meta = (
+    n: number,
+    model: string,
+    startedAt: string,
+    outputLimit?: typeof limit,
+  ): ChatTurn => ({
+    id: id('trn', n),
+    taskId: task,
+    sequence: n - 1,
+    role: 'assistant',
+    selection: { family: 'openai', model, effort: 'default' },
+    userMessageId: id('msg', 10),
+    assistantMessageId: null,
+    state: 'done',
+    startedAt,
+    endedAt: startedAt,
+    failure: null,
+    handoffFrom: null,
+    ...(outputLimit ? { outputLimit } : {}),
+  });
+  const note: ChatMessage = {
+    id: id('msg', 20),
+    taskId: task,
+    at: '2026-10-23T10:05:00.000Z',
+    cursor: '20',
+    author: { kind: 'system', turnId: null },
+    text: 'Continued on OpenAI from OpenAI. Reason: model changed in the composer.',
+    attachments: [],
+    files: [],
+  };
+  const state = reduceThread(initialThreadState(task), {
+    type: 'loaded',
+    read: {
+      thread: {
+        taskId: task,
+        scratchReady: true,
+        base: null,
+        selection: null,
+        permissionPolicy: 'ask',
+        sessions: [],
+        activeTurnId: null,
+        autoHandoff: false,
+        handoffMode: 'most-left',
+        crew: null,
+        flightMode: 'manual',
+        crewChain: null,
+        queued: [],
+      },
+      turns: [
+        meta(1, 'gpt-6-sol', '2026-10-23T10:00:00.000Z', limit),
+        meta(2, 'gpt-6.1-sol', '2026-10-23T10:06:00.000Z'),
+      ],
+      messages: [
+        user(10, 'Go').payload as ChatMessage,
+        {
+          ...note,
+          id: id('msg', 11),
+          cursor: '11',
+          at: '2026-10-23T10:01:00.000Z',
+          author: {
+            kind: 'assistant',
+            turnId: id('trn', 1),
+            family: 'openai',
+            model: 'gpt-6-sol',
+            role: 'assistant',
+          },
+          text: 'Partial reply',
+        },
+        note,
+      ],
+      liveEvents: [],
+      cursor: '20',
+    } as ChatThreadRead,
+  });
+  const items = threadItems(state);
+  const first = items.find((row) => row.kind === 'turn' && row.turn.id === id('trn', 1));
+  assert.deepEqual(first?.kind === 'turn' && first.turn.outputLimit, limit);
+  const line = items.find((row) => row.kind === 'system');
+  assert.deepEqual(line?.kind === 'system' && line.handoff, {
+    from: { family: 'openai', model: 'gpt-6-sol' },
+    to: { family: 'openai', model: 'gpt-6.1-sol' },
+  });
 });

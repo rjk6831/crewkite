@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { type Command, CommandSchema } from '@crewkite/contracts';
 import { droppedPaths } from '../shared/attach.ts';
-import { PathGrants } from './grants.ts';
+import { attachmentTarget } from '../shared/open-file.ts';
+import { PathGrants, storedAttachmentPath } from './grants.ts';
 
 const taskId = `tsk_${'0'.repeat(25)}1`;
 const picked = '/Users/me/Documents/plan.pdf';
@@ -50,4 +51,33 @@ test('main sends an import by path only for a path it gave the window', () => {
   const pathOf = (value: File) => (value === file ? picked : '');
   assert.deepEqual(droppedPaths([secret], pathOf), [], 'attach with a raw path string is refused');
   assert.deepEqual(droppedPaths([file, secret, null], pathOf), [picked], 'a dropped file is named');
+
+  // A stored attachment is named by thread, hash and name. Main builds the path itself and refuses
+  // anything that would leave that thread's files folder.
+  const home = '/home/crewkite';
+  const hash = 'a'.repeat(64);
+  const stored = `${home}/chat/${taskId}/files/${hash}`;
+  const open = (change: object) => ({
+    action: 'preview',
+    taskId,
+    id: hash,
+    name: 'plan.pdf',
+    ...change,
+  });
+  const resolved = (input: unknown) => {
+    const target = attachmentTarget(input);
+    return target && storedAttachmentPath(home, target);
+  };
+  const opens: [string, unknown, string | null][] = [
+    ['a stored file resolves under its thread', open({}), `${stored}/plan.pdf`],
+    ['a name that climbs out is refused', open({ name: '../../x' }), null],
+    ['a parent name is refused', open({ name: '..' }), null],
+    ['a folder part in the name is refused', open({ name: 'a/b.pdf' }), null],
+    ['a hash that is not a hash is refused', open({ id: '../..' }), null],
+    ['a thread id that is not a thread id is refused', open({ taskId: '../../etc' }), null],
+    ['an absolute path in the name is refused', open({ name: secret }), null],
+    ['an unknown action is refused', open({ action: 'run' }), null],
+    ['an extra field is refused', open({ path: secret }), null],
+  ];
+  for (const [claim, input, want] of opens) assert.equal(resolved(input), want, claim);
 });

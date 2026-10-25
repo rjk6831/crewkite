@@ -5,6 +5,8 @@ import type {
   ChatFamily,
   ChatModelSelection,
   ChatThread,
+  LocalSetup,
+  WorkspaceState,
 } from '@crewkite/contracts';
 import { ArrowUp, Paperclip, Square } from 'lucide-react';
 import {
@@ -21,10 +23,11 @@ import {
 } from 'react';
 import { familyName } from '../components.tsx';
 import { ContextGauge } from '../context-gauge.tsx';
+import { lastSeen, observeOpenConnection } from '../local-setup-flow.ts';
 import { flightModes, preferredSelection } from '../settings/preferences.ts';
 import { type ChipFile, chipOf, FileChips, keepThumbnail } from './attach.tsx';
 import { configureThread, importAttachment, readCatalog, type ThreadSource } from './commands.ts';
-import { acceptsType } from './file-fit.ts';
+import { deliveryNote, deliveryOf } from './file-fit.ts';
 import { defaultSelection, ModelPicker } from './model-picker.tsx';
 import { type RoleAction, roleActions, useRoleRun } from './role-row.tsx';
 
@@ -42,6 +45,7 @@ export type SendInput = {
 
 /** What the thread view can ask of the composer. */
 export type ComposerHandle = {
+  focus: () => void;
   fill: (text: string) => void;
   /** Put text and files back, as after a stop clears the queue, unless the box already holds some. */
   restore: (text: string, files?: readonly ChatAttachment[]) => void;
@@ -81,6 +85,7 @@ export function Composer({
   onHandoff,
   onOpenCrew,
   onCatalog,
+  localState,
 }: {
   ref?: Ref<ComposerHandle>;
   source: ThreadSource;
@@ -99,6 +104,8 @@ export function Composer({
   onOpenCrew?: () => void;
   /** Each catalog the composer reads, so the thread can offer the same families. */
   onCatalog?: (catalog: ChatCatalogRead) => void;
+  /** The saved Local setup, and a workspace read to get its current revision. */
+  localState?: { setup: LocalSetup | null | undefined; refresh: () => Promise<WorkspaceState> };
 }) {
   const draftKey = taskId ?? 'new';
   const [text, setText] = useState(() => drafts.get(draftKey) ?? '');
@@ -118,6 +125,7 @@ export function Composer({
       requestAnimationFrame(() => element?.setSelectionRange(value.length, value.length));
     };
     return {
+      focus: () => field.current?.focus(),
       fill,
       restore: (value, back = []) => {
         if (!text.trim()) fill(value);
@@ -182,6 +190,18 @@ export function Composer({
         setNote(failure instanceof Error ? failure.message : 'The choice was not saved.'),
     );
   }
+  const refreshLocal = localState?.refresh;
+  const observeLocal = useCallback(() => {
+    if (!refreshLocal) return;
+    observeOpenConnection(async () => (await refreshLocal()).localSetup, source.command).then(
+      (read) => read && loadCatalog(),
+      () => {},
+    );
+  }, [refreshLocal, source.command, loadCatalog]);
+  const seen =
+    localState?.setup && !localState.setup.connected
+      ? lastSeen(localState.setup.observedAt, Date.now())
+      : null;
   const adding = files.some((file) => file.busy);
   const canAttach = !!source.attachFiles && !blocked;
   async function submit(event?: FormEvent) {
@@ -258,10 +278,15 @@ export function Composer({
   }
   const entry = catalog?.families.find(({ family }) => family === chosen?.family);
   // Only what the selected family's client reported. A client that reported nothing gets no line.
-  const typeNote = (file: ChipFile) =>
-    entry && file.mimeType && acceptsType(entry.accepts, file.mimeType) === false
-      ? `${familyName(entry.family)} may not take this file type`
+  const delivery = (file: ChipFile) => {
+    const how = entry && file.mimeType ? deliveryOf(entry, file.mimeType) : null;
+    return how && entry && file.mimeType
+      ? deliveryNote(familyName(entry.family), how, file.mimeType)
       : null;
+  };
+  const typeNote = (file: ChipFile) =>
+    (delivery(file)?.warn ? delivery(file)?.title : null) ?? null;
+  const typeHover = (file: ChipFile) => delivery(file)?.title ?? null;
   function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return;
     event.preventDefault();
@@ -286,7 +311,9 @@ export function Composer({
       >
         <FileChips
           files={files}
+          taskId={taskId ?? undefined}
           note={typeNote}
+          hover={typeHover}
           onRemove={(key) => {
             setFiles(files.filter((file) => file.key !== key));
             field.current?.focus();
@@ -346,6 +373,8 @@ export function Composer({
             running={running}
             nowMs={Date.now()}
             onOpen={loadCatalog}
+            localSeen={seen}
+            onObserve={refreshLocal ? observeLocal : undefined}
             onSelect={select}
             onHandoff={(next) =>
               onHandoff(next).catch((failure: unknown) =>

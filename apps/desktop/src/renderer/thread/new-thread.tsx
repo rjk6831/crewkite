@@ -2,11 +2,13 @@ import {
   type ChatAttachment,
   type ChatCatalogRead,
   ChatFamilySchema,
+  type LocalSetup,
   type Task,
   TaskSchema,
+  type WorkspaceState,
 } from '@crewkite/contracts';
 import { Folder } from 'lucide-react';
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
 import { focusSettingsCard } from '../settings/provider-card.tsx';
 import type { DesktopCommand } from '../source.ts';
@@ -78,6 +80,9 @@ export function NewThread({
   onAddProject,
   onOpenSettings,
   blocked,
+  focusComposer = false,
+  localSetup,
+  refresh,
 }: {
   source: ThreadSource;
   createTask: (
@@ -91,12 +96,21 @@ export function NewThread({
   /** Opens Settings. The first-run card focuses a family's card before calling it. */
   onOpenSettings?: () => void;
   blocked: string | null;
+  /** Put the cursor in the message box, as after Add project. */
+  focusComposer?: boolean;
+  localSetup?: LocalSetup | null;
+  refresh?: () => Promise<WorkspaceState>;
 }) {
   // A send that fails after the task exists keeps the task, so a retry does not create a second one.
   const created = useRef<Task | null>(null);
   const composer = useRef<ComposerHandle>(null);
   const [catalog, setCatalog] = useState<ChatCatalogRead | null>(null);
   const project = projects.find(({ id }) => id === projectId);
+  // The box is blocked until the project is in the list, and a blocked box takes no focus.
+  const ready = !!project;
+  useEffect(() => {
+    if (focusComposer && ready) composer.current?.focus();
+  }, [focusComposer, ready]);
   // Until the catalog is read, nothing says no family is connected, so Send stays open.
   const firstRun = catalog !== null && !catalog.families.some((family) => family.connected);
 
@@ -184,6 +198,7 @@ export function NewThread({
           onConfigured={() => {}}
           onHandoff={async () => {}}
           onCatalog={setCatalog}
+          localState={refresh ? { setup: localSetup, refresh } : undefined}
         />
       </section>
     </div>

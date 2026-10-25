@@ -7,27 +7,15 @@ import { type CardProps, type CatalogEntry, ProviderCard } from './provider-card
 const gib = (bytes: number | null | undefined) =>
   bytes === null || bytes === undefined ? 'Unknown' : `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
 
-// A small aside under the note, which already states the fact in words. The snippet is hidden from
-// assistive technology so it does not read out as a second statement. It wraps and never scrolls,
-// since Chromium makes a scrolling box a tab stop, and one inside aria-hidden is a stop with no
-// name.
-const allowanceSnippet = `function allowance(localAI) {
-  try { return Roots.NoLimits(localAI).limit; } // null
-  catch (limit) {
-    return [hardware, imagination].includes(limit) ? limit : null;
-  }
-}`;
-
 function Hardware({ header, entry }: { header: WorkspaceState; entry: CatalogEntry | undefined }) {
   const hardware = header.localHardware;
-  const connected = entry?.connected === true;
   const facts = localFacts(hardware, header.localSetup, entry?.lastTurnStats ?? null);
   const memory =
     hardware?.totalMemoryBytes == null
       ? 'Unknown'
       : hardware.availableMemoryBytes === null
         ? `${gib(hardware.totalMemoryBytes)} total, available unknown`
-        : `${gib(hardware.availableMemoryBytes)} free of ${gib(hardware.totalMemoryBytes)}`;
+        : `${gib(hardware.availableMemoryBytes)} available of ${gib(hardware.totalMemoryBytes)}`;
   return (
     <section className="st-block" aria-label="Local hardware">
       <div className="st-subhead">
@@ -36,13 +24,8 @@ function Hardware({ header, entry }: { header: WorkspaceState; entry: CatalogEnt
       </div>
       <p className="st-note">
         Runs on this computer. There is no subscription allowance, so speed and context depend on
-        the loaded model and free memory.
+        the loaded model and available memory.
       </p>
-      {connected && (
-        <pre className="st-code" aria-hidden="true" tabIndex={-1}>
-          <code>{allowanceSnippet}</code>
-        </pre>
-      )}
       <div className="facts-grid compact">
         <Fact label="Processor" value={hardware?.cpuModel ?? 'Unknown'} />
         <Fact label="Logical cores" value={hardware?.logicalCores ?? 'Unknown'} />

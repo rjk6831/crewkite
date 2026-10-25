@@ -1,6 +1,7 @@
 import type { ChatFamily, WorkspaceState } from '@crewkite/contracts';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
+import { connectInPlace, WITHOUT_TOKEN } from '../local-setup-flow.ts';
 import { familyModel, onFamilyDefaults } from '../settings/preferences.ts';
 import { focusSettingsCard } from '../settings/provider-card.tsx';
 import { useCatalog } from '../settings/use-catalog.ts';
@@ -18,11 +19,14 @@ export function RailUsage({
   source,
   header,
   onOpenSettings,
+  refresh,
 }: {
   source: ThreadSource | undefined;
   header: WorkspaceState;
   /** Opens the Settings page. The rail marks the card to scroll to first. */
   onOpenSettings?: () => void;
+  /** Reads the workspace again and returns it, so Connect can follow the Local setup. */
+  refresh?: () => Promise<WorkspaceState>;
 }) {
   const { catalog } = useCatalog(source, header);
   const [now, setNow] = useState(Date.now);
@@ -35,16 +39,56 @@ export function RailUsage({
       stop();
     };
   }, []);
+  const [localNote, setLocalNote] = useState<string | null>(null);
+  const [connecting, setConnecting] = useState(false);
+  const attempt = useRef(0);
   const rows = railFamilies(catalog, now, {
     modelFor: (entry) => familyModel(entry),
     hardware: header.localHardware,
     localSetup: header.localSetup,
   });
   if (rows.length === 0) return null;
-  const connect = (family: ChatFamily) => {
+  const settings = (family: ChatFamily) => {
     focusSettingsCard(family);
     onOpenSettings?.();
   };
+  // Local connects here with the saved endpoint and auth mode. Settings opens only when the runtime
+  // wants a token this window does not hold, and the token window is already up by then.
+  async function connectLocal() {
+    const setup = header.localSetup;
+    if (!source || !refresh || !setup || connecting) return settings('local');
+    attempt.current += 1;
+    const mine = attempt.current;
+    setConnecting(true);
+    setLocalNote('Connecting');
+    try {
+      const result = await connectInPlace({
+        setup,
+        command: source.command,
+        read: async () => (await refresh()).localSetup,
+        wait: () => new Promise((resolve) => window.setTimeout(resolve, 1000)),
+        active: () => attempt.current === mine,
+      });
+      if (result.kind === 'stopped') return;
+      if (result.kind === 'settings') {
+        setLocalNote(null);
+        settings('local');
+      } else
+        setLocalNote(
+          result.kind === 'connected'
+            ? result.withoutToken
+              ? WITHOUT_TOKEN
+              : 'Connected'
+            : result.message,
+        );
+    } catch {
+      setLocalNote('Local could not be reached. Open Settings to connect.');
+    } finally {
+      setConnecting(false);
+    }
+  }
+  const connect = (family: ChatFamily) =>
+    family === 'local' ? void connectLocal() : settings(family);
   return (
     <section className="rail-usage" aria-label="Provider allowance">
       {rows.map((row) => (
@@ -102,11 +146,17 @@ export function RailUsage({
               {row.read && <span>{row.read}</span>}
             </span>
           )}
+          {row.family === 'local' && localNote && (
+            <span className="rail-usage-reset" role="status">
+              {localNote}
+            </span>
+          )}
           {row.needsConnect &&
             (onOpenSettings ? (
               <button
                 type="button"
                 className="rail-usage-connect"
+                disabled={row.family === 'local' && connecting}
                 onClick={() => connect(row.family)}
               >
                 Connect

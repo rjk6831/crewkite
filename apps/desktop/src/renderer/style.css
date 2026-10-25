@@ -398,6 +398,12 @@ kbd {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.project-name.is-selected {
+  color: var(--text);
+}
+.project-name.is-selected .project-title {
+  font-weight: 600;
+}
 .project-name > svg {
   flex-shrink: 0;
 }
