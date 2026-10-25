@@ -257,6 +257,9 @@ const WRITING_FLAGS =
 // would rewrite before the program sees it.
 const PLAIN_WORD = /^[A-Za-z0-9._/=:,+@%-]+$/;
 
+// One receipt per stored name. The same bytes under another name can carry another type.
+const fileKey = (taskId: string, file: Pick<ChatAttachment, 'id' | 'name'>) =>
+  `chat-file:${taskId}:${file.id}:${file.name}`;
 const NOT_STORED =
   'CrewKite could not copy the file. Check the free disk space, then attach it again.';
 const blocked = (reason: string, next?: string): CommandResult => ({
@@ -316,15 +319,22 @@ export class ChatService {
   sendMessage(payload: Payload<'SendChatMessage'>, effects: Effects): CommandResult {
     const task = this.task(payload.taskId);
     if (!task) return blocked('task-not-found');
-    // A queued message is checked now too, so the person hears about a missing file at send.
+    // A queued message is checked now too, so the person hears about a missing file at send. Each
+    // file comes from what its import stored, so the type the controller detected decides how a
+    // provider reads the bytes.
     // shortcut: the payload, the queued message and the user entry need at least one character of
     // text, so a message with files and no text cannot be sent yet. Upgrade: allow empty text
     // when files are present in those three schemas.
-    if (payload.files.some((file) => !storedFile(this.filesFolder(task.id), file)))
+    const files = payload.files.flatMap((file) => {
+      const stored = this.storedAttachment(task.id, file);
+      return stored ? [stored.attachment] : [];
+    });
+    if (files.length !== payload.files.length)
       return blocked('file-not-found', 'Attach the file again, then send.');
+    const message = { ...payload, files };
     const { thread, left } = this.checkedThread(task);
     const free = !thread.activeTurnId && !left.length;
-    if (free && !thread.queued.length) return this.begin(task, thread, payload, effects);
+    if (free && !thread.queued.length) return this.begin(task, thread, message, effects);
     if (free) {
       // The oldest queued message goes first. One that cannot start any more, say on a family
       // that is gone, blocks the queue until it is removed, so the person hears about that one.
@@ -332,7 +342,7 @@ export class ChatService {
       if (started.outcome !== 'applied')
         return blocked('queue-blocked', 'Remove the first queued message, then send again.');
     }
-    return this.enqueue(task, payload);
+    return this.enqueue(task, message);
   }
 
   resolvePermission(payload: Payload<'ResolveChatPermission'>, effects: Effects): CommandResult {
@@ -652,7 +662,7 @@ export class ChatService {
     }
     const file = staged.attachment;
     const data = { kind: 'chat-attachment', ...file } as const;
-    const key = `chat-file:${task.id}:${file.id}`;
+    const key = fileKey(task.id, file);
     if (!this.deps.store.receipt(key))
       this.deps.store.saveReceipt(key, file.id, 'local-owner', { outcome: 'applied', data });
     return { outcome: 'applied', data };
@@ -2105,16 +2115,15 @@ export class ChatService {
     resumed: ChatFamily | null,
   ): NonNullable<ChatTurnRequest['files']> {
     const own = message.kind === 'user-message' ? (message.files ?? []) : [];
-    const folder = this.filesFolder(taskId);
     const key = (attachment: ChatAttachment) => `${attachment.id}/${attachment.name}`;
     const seen = new Set<string>();
     const files: NonNullable<ChatTurnRequest['files']>[number][] = [];
     for (const attachment of own) {
       if (seen.has(key(attachment))) continue;
       seen.add(key(attachment));
-      const path = storedFile(folder, attachment);
-      if (!path) throw Error(`${attachment.name} is no longer stored. Attach it again and send.`);
-      files.push({ attachment, path });
+      const stored = this.storedAttachment(taskId, attachment);
+      if (!stored) throw Error(`${attachment.name} is no longer stored. Attach it again and send.`);
+      files.push(stored);
     }
     if (!carries) return files;
     const earlier: typeof files = [];
@@ -2123,15 +2132,29 @@ export class ChatService {
       if (earlier.length === EARLIER_FILES) break;
       if (seen.has(key(attachment))) continue;
       seen.add(key(attachment));
-      const path = storedFile(folder, attachment);
-      if (!path) continue;
-      listed += Buffer.byteLength(
-        `${attachment.name} (${attachment.mimeType}, ${byteSize(attachment.bytes)})\n`,
-      );
+      const stored = this.storedAttachment(taskId, attachment);
+      if (!stored) continue;
+      const { name, mimeType, bytes } = stored.attachment;
+      listed += Buffer.byteLength(`${name} (${mimeType}, ${byteSize(bytes)})\n`);
       if (listed > EARLIER_FILE_LINE_BYTES) break;
-      earlier.push({ attachment, path, earlier: true });
+      earlier.push({ ...stored, earlier: true });
     }
     return [...earlier.reverse(), ...files];
+  }
+
+  /**
+   * A file as its import stored it, with the type the controller detected, and where it is. Null
+   * when this thread never imported that id under that name, or the copy is gone.
+   */
+  private storedAttachment(
+    taskId: string,
+    file: Pick<ChatAttachment, 'id' | 'name'>,
+  ): { attachment: ChatAttachment; path: string } | null {
+    const data = this.deps.store.receipt(fileKey(taskId, file))?.result.data;
+    if (data?.kind !== 'chat-attachment') return null;
+    const { kind: _kind, ...attachment } = data;
+    const path = storedFile(this.filesFolder(taskId), attachment);
+    return path ? { attachment, path } : null;
   }
 
   /**
