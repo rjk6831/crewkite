@@ -31,6 +31,7 @@ import type {
   ChatThreadRead,
   ChatToolKind,
   ChatTurn,
+  ChatTurnEventsRead,
   CommandResult,
   Event,
   Project,
@@ -72,7 +73,7 @@ async function open<Adapter extends ChatAdapter>(t: TestContext, adapter: Adapte
     run('SendChatMessage', { text, selection }, task.revision) as Promise<CommandResult>;
   const read = async (payload: object = {}) =>
     (await run('ReadChatThread', payload)).data as ChatThreadRead & { kind: 'chat-thread' };
-  return { controller, adapter, task, run, send, read, source };
+  return { controller, adapter, task, run, send, read, source, command, draft: context.draft };
 }
 
 const chat = (t: TestContext, turns: ChatScriptStep[][]) =>
@@ -586,7 +587,7 @@ test('a message sent during a turn waits and starts when the turn ends', {
 test('a thread read returns messages in cursor order and the live events of the open turn', {
   timeout: 30000,
 }, async (t) => {
-  const { controller, send, read } = await chat(t, [
+  const { controller, send, read, run, command, draft } = await chat(t, [
     [{ kind: 'text', itemId: 'first', chunks: ['First reply.'] }],
     [{ kind: 'text', itemId: 'second', chunks: ['Working'], complete: false }, { kind: 'wait' }],
   ]);
@@ -629,6 +630,79 @@ test('a thread read returns messages in cursor order and the live events of the 
     earlier.messages.map((message) => message.text),
     ['First reply.'],
   );
+
+  // A turn's stored events read back whole, oldest first, a page at a time under the cap.
+  const [done, running] = thread.turns;
+  const turnEvents = (payload: object) => run('ReadChatTurnEvents', payload);
+  const pageOf = (result: CommandResult) => {
+    assert.equal(result.outcome, 'applied', result.next);
+    return result.data as ChatTurnEventsRead;
+  };
+  const stored = (turnId: string) =>
+    agentEvents(controller).filter((event) => event.turnId === turnId);
+  const whole = pageOf(await turnEvents({ turnId: done.id }));
+  assert.deepEqual(whole.events, stored(done.id));
+  assert.equal(whole.nextAfterCursor, null);
+  assert.deepEqual(pageOf(await turnEvents({ turnId: running.id })).events, stored(running.id));
+  let serial = 0;
+  const append = (event: AgentEvent) => {
+    serial += 1;
+    return controller.store.transaction(() =>
+      controller.store.append({
+        protocol: 1,
+        id: `evt_7${String(serial).padStart(25, '0')}`,
+        at: '2026-10-25T10:00:00.000Z',
+        taskId: done.taskId,
+        revision: 0,
+        type: 'agent.event',
+        payload: event,
+      }),
+    );
+  };
+  const large = Array.from({ length: 12 }, (_, index) =>
+    append({
+      type: 'text.delta',
+      turnId: done.id,
+      itemId: 'large',
+      text: 'abcdefghijkl'[index].repeat(60_000),
+    }),
+  );
+  // The cursor is exclusive, so the read starts after the last event the turn already had.
+  const pages = [pageOf(await turnEvents({ turnId: done.id, afterCursor: thread.cursor }))];
+  for (let after = pages[0].nextAfterCursor; after; after = pages.at(-1)?.nextAfterCursor ?? null)
+    pages.push(pageOf(await turnEvents({ turnId: done.id, afterCursor: after })));
+  assert.ok(pages.length > 1);
+  for (const page of pages)
+    assert.ok(Buffer.byteLength(JSON.stringify({ kind: 'chat-turn-events', ...page })) <= 524_288);
+  assert.deepEqual(
+    pages.flatMap((page) => page.events),
+    large.map((event) => event.payload),
+  );
+  // An event that alone exceeds the page is refused, and no later event is skipped past it.
+  const oversized = append({
+    type: 'tool.started',
+    turnId: done.id,
+    callId: 'call-1',
+    kind: 'read',
+    title: 'Read a large file',
+    input: 'x'.repeat(600_000),
+  });
+  const refused = await turnEvents({ turnId: done.id, afterCursor: large.at(-1)?.cursor });
+  assert.equal(refused.outcome, 'blocked');
+  assert.equal(refused.reason, 'turn-event-too-large');
+  assert.equal(
+    pageOf(await turnEvents({ turnId: done.id, afterCursor: oversized.cursor })).events.length,
+    0,
+  );
+  // A turn is read only through the thread it belongs to.
+  const other = (await controller.execute(command('CreateTask', draft.payload, 0), 'local-owner'))
+    .entity as Task;
+  const foreign = await controller.execute(
+    command('ReadChatTurnEvents', { taskId: other.id, turnId: done.id }),
+    'local-owner',
+  );
+  assert.equal(foreign.outcome, 'blocked');
+  assert.equal(foreign.reason, 'turn-not-found');
 });
 
 // A limit stop needs a second connected family, so these tests bring a catalog of their own.
