@@ -136,6 +136,8 @@ const scripts = {
     ['thread/compacted', ids()],
     ['fixture/newNotice', { ...ids(), value: 1 }],
     ['fixture/newNotice', { ...ids(), value: 2 }],
+    // The client's word on its own settings. It is not model output.
+    ['configWarning', { summary: 'The thread was recorded with another model.' }],
     ['item/completed', { ...ids(), item: message('message-1', 'Done.') }],
     done(),
   ],
@@ -510,9 +512,18 @@ test('stop interrupts the native turn, waits for the client to confirm it and en
 test('an unknown notification goes to the turn trace and never the thread, and the turn completes', async () => {
   const run = turn('unknown');
   const result = await run.settled();
+  // A client warning is a notice marked for the turn trace, never a line in the reply.
   assert.deepEqual(
     run.events.filter((event) => event.type === 'provider.notice'),
-    [],
+    [
+      {
+        type: 'provider.notice',
+        turnId,
+        level: 'warning',
+        message: 'The thread was recorded with another model.',
+        trace: true,
+      },
+    ],
   );
   // Housekeeping notices stay out of the trace too. Each unknown frame gets its own line.
   assert.deepEqual(

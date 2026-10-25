@@ -689,6 +689,7 @@ class OpenAiChatTurn {
       this.notice(
         'warning',
         'Codex could not resume the earlier thread. A new thread starts with the transcript so far.',
+        true,
       );
       start(true);
     });
@@ -947,13 +948,13 @@ class OpenAiChatTurn {
       case 'configWarning': {
         const value = notice.safeParse(params).data;
         const text = [value?.message ?? value?.summary, value?.details].filter(Boolean).join(' ');
-        if (text) this.notice('warning', text);
+        if (text) this.notice('warning', text, true);
         return;
       }
       case 'error': {
         const value = errorNotice.safeParse(params).data;
         if (value?.willRetry) {
-          this.notice('warning', value.error?.message || 'Codex is retrying the request.');
+          this.notice('warning', value.error?.message || 'Codex is retrying the request.', true);
           return;
         }
         this.terminal ??= value?.error ?? null;
@@ -1221,12 +1222,14 @@ class OpenAiChatTurn {
     this.notice('warning', 'Codex sent a line CrewKite could not read.');
   }
 
-  private notice(level: 'info' | 'warning', message: string) {
+  /** `trace` marks what the client says about its own state. The view keeps it in the turn trace. */
+  private notice(level: 'info' | 'warning', message: string, trace = false) {
     this.send({
       type: 'provider.notice',
       turnId: this.request.turnId,
       level,
       message: clip(message, 4096),
+      ...(trace ? { trace: true as const } : {}),
     });
   }
 

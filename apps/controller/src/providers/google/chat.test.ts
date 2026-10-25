@@ -350,8 +350,8 @@ test('a turn streams thinking, tools and text in order, and the next turn resume
       }),
     );
     assert.deepEqual(
-      of(lost.events, 'provider.notice').map((event) => [event.level, event.message]),
-      [['warning', 'Previous session could not be resumed; started a new one.']],
+      of(lost.events, 'provider.notice').map((event) => [event.level, event.message, event.trace]),
+      [['warning', 'Previous session could not be resumed; started a new one.', true]],
     );
     assert.deepEqual(methods(lost.frames).slice(0, 3), [
       'initialize',

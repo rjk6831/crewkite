@@ -677,8 +677,16 @@ export function googleChatAdapter(deps: {
         }));
       }
 
-      const notice = (message: string, level: 'info' | 'warning' = 'info') =>
-        send({ type: 'provider.notice', turnId, level, message: clip(message, 4000) });
+      // `trace` marks what the client says about its session or settings. The view keeps it in the
+      // turn trace.
+      const notice = (message: string, level: 'info' | 'warning' = 'info', trace = false) =>
+        send({
+          type: 'provider.notice',
+          turnId,
+          level,
+          message: clip(message, 4000),
+          ...(trace ? { trace: true as const } : {}),
+        });
       // One notice per turn for a frame CrewKite acts on and could not read. Every frame is in
       // the trace already, so later ones add nothing the trace lacks.
       const unreadable = (message: string) => {
@@ -1145,7 +1153,7 @@ export function googleChatAdapter(deps: {
             }
           }
           if (prior && !resumed)
-            notice('Previous session could not be resumed; started a new one.', 'warning');
+            notice('Previous session could not be resumed; started a new one.', 'warning', true);
           if (!resumed && !cancelled) {
             phase = 'setup';
             sessionId = newSession.parse(
@@ -1178,7 +1186,12 @@ export function googleChatAdapter(deps: {
             if (setup.thoughtLevel && effort !== 'default') {
               if (setup.thoughtLevel.supported.includes(effort))
                 await set(setup.thoughtLevel.optionId, effort);
-              else notice(`The Google client has no ${effort} thought level; using its default.`);
+              else
+                notice(
+                  `The Google client has no ${effort} thought level; using its default.`,
+                  'info',
+                  true,
+                );
             }
           }
           if (launch?.reviewMode) await set(launch.reviewMode.configId, launch.reviewMode.valueId);

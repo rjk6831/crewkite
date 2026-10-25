@@ -689,10 +689,16 @@ function startTurn(
   const decide = (stopReason: Outcome['stopReason'], failure: ChatFailure | null = null) => {
     outcome ??= { stopReason, failure };
   };
-  const notice = (key: string, message: string, level: 'info' | 'warning' = 'info') => {
+  // `trace` marks what the client says about its own settings. The view keeps it in the turn trace.
+  const notice = (
+    key: string,
+    message: string,
+    level: 'info' | 'warning' = 'info',
+    trace = false,
+  ) => {
     if (noticed.has(key)) return;
     noticed.add(key);
-    send({ type: 'provider.notice', turnId, level, message });
+    send({ type: 'provider.notice', turnId, level, message, ...(trace ? { trace: true } : {}) });
   };
   // An event CrewKite does not handle goes to the turn's trace and never to the thread. The file
   // appears with the first one.
@@ -848,7 +854,12 @@ function startTurn(
       role: request.role,
     });
     if (request.selection.effort === 'minimal')
-      notice('effort', 'The client has no minimal effort level, so this turn runs at its default.');
+      notice(
+        'effort',
+        'The client has no minimal effort level, so this turn runs at its default.',
+        'info',
+        true,
+      );
   };
   const onStream = (value: unknown) => {
     const parsed = streamEvent.safeParse(value);
