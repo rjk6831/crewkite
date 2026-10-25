@@ -347,6 +347,22 @@ export class ArtifactFiles {
     }
   }
 
+  /** Remove a published file. The caller checks first that no artifact names the hash. */
+  remove(hash: string): void {
+    try {
+      unlinkSync(this.path(hash));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
+    const directory = openSync(this.directory, constants.O_RDONLY);
+    try {
+      fsyncSync(directory);
+    } finally {
+      closeSync(directory);
+    }
+  }
+
   private path(hash: string) {
     if (!/^[a-f0-9]{64}$/.test(hash)) throw new Error('Invalid artifact identity.');
     return join(this.directory, hash);
