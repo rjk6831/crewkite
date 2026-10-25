@@ -1,11 +1,17 @@
 import { execFileSync, spawn } from 'node:child_process';
 import {
+  closeSync,
+  constants,
+  fstatSync,
+  ftruncateSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   realpathSync,
-  writeFileSync,
+  statSync,
+  writeSync,
 } from 'node:fs';
 import { basename, dirname, isAbsolute, matchesGlob, relative, resolve, sep } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
@@ -151,11 +157,45 @@ const ArgumentSchemas = {
 
 class ToolError extends Error {}
 
+// The JS realpath applies a link's target to the path as text, so `here/..` drops `here` even
+// when `here` points elsewhere. The kernel resolves `..` against where the link leads, and the
+// kernel is what opens the file, so every containment check uses its answer.
+const kernelPath = realpathSync.native;
+const within = (root: string, path: string) => path === root || path.startsWith(root + sep);
+const escapes = (shown: string) =>
+  new ToolError(`${shown} leads outside the project through a link.`);
+
+/**
+ * Open a file in the copy and prove the open file is the one its path names inside the copy.
+ * The path was checked when the call was planned. A link swapped in since then would carry the
+ * open outside, so the check runs again on what was opened. Nonblocking, so a FIFO swapped in
+ * cannot hang the turn. A hard link to an outside file passes; no path check can see one.
+ */
+function openInside(root: string, full: string, shown: string, flags: number, mode?: number) {
+  const fd = openSync(full, flags | constants.O_NONBLOCK, mode);
+  try {
+    const opened = fstatSync(fd);
+    let named: string;
+    try {
+      named = kernelPath(full);
+    } catch {
+      throw new ToolError(`${shown} changed while it was being opened. Try again.`);
+    }
+    const found = statSync(named, { throwIfNoEntry: false });
+    if (!within(root, named) || found?.dev !== opened.dev || found?.ino !== opened.ino)
+      throw escapes(shown);
+    return { fd, stat: opened };
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
 /** Resolve a model-supplied path inside scratch. Rejects absolute paths, `..`, .git and escaping symlinks. */
 export function scratchPath(scratch: string, value: string) {
   // Models copy the absolute path they were shown. One inside the copy is the same file.
   if (isAbsolute(value) && value.length <= 1024 && !value.includes('\0'))
-    for (const base of [scratch, realpathSync(scratch)]) {
+    for (const base of [scratch, kernelPath(scratch)]) {
       const within = relative(base, resolve(value));
       if (within && !within.startsWith('..') && !isAbsolute(within)) {
         value = within.split(sep).join('/');
@@ -176,10 +216,9 @@ export function scratchPath(scratch: string, value: string) {
       `${value} is outside the project. Use a path relative to the project root.`,
     );
   if (parts.includes('.git')) throw new ToolError('Paths inside .git are not available.');
-  const root = realpathSync(scratch);
+  const root = kernelPath(scratch);
   const full = resolve(root, value);
-  const outside = () => new ToolError(`${value} leads outside the project through a link.`);
-  const inside = (path: string) => path === root || path.startsWith(root + sep);
+  const outside = () => escapes(value);
   // Walk up to the nearest entry that exists without following links. A dangling link counts
   // as present here, so a write through it cannot land wherever the link points.
   let probe = full;
@@ -189,18 +228,29 @@ export function scratchPath(scratch: string, value: string) {
       if (stat.isSymbolicLink()) {
         let target: string;
         try {
-          target = realpathSync(probe);
+          target = kernelPath(probe);
         } catch {
           throw outside();
         }
-        if (!inside(target)) throw outside();
+        if (!within(root, target)) throw outside();
       }
       break;
     }
     probe = dirname(probe);
   }
-  if (!inside(realpathSync(probe))) throw outside();
-  return { full, relative: relative(root, full).split(sep).join('/') };
+  if (!within(root, kernelPath(probe))) throw outside();
+  return { root, full, relative: relative(root, full).split(sep).join('/') };
+}
+
+/** A file in the copy as text, read through the same checks the tools use. */
+export function readScratchFile(scratch: string, value: string) {
+  const file = scratchPath(scratch, value);
+  const { fd } = openInside(file.root, file.full, file.relative, constants.O_RDONLY);
+  try {
+    return readFileSync(fd, 'utf8');
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /** The longest prefix of `text` within `bytes` bytes. The decoder holds back a split character. */
@@ -212,15 +262,34 @@ const bound = (text: string, bytes = OUTPUT_BYTES) =>
     ? text
     : `${fitBytes(text, bytes - 64)}\n[output cut at ${bytes / 1024} KiB]`;
 
-function readText(full: string, shown: string) {
-  const stat = lstatSync(full, { throwIfNoEntry: false });
-  if (!stat?.isFile()) throw new ToolError(`${shown} is not a file.`);
+type ScratchFile = ReturnType<typeof scratchPath>;
+
+/** Text of an open file. The size and type come from the open file, so a swap cannot change them. */
+function readOpen(fd: number, stat: ReturnType<typeof fstatSync>, shown: string) {
+  if (!stat.isFile()) throw new ToolError(`${shown} is not a file.`);
   if (stat.size > READ_BYTES) throw new ToolError(`${shown} is too large to read.`);
-  const raw = readFileSync(full);
+  const raw = readFileSync(fd);
   const text = raw.toString('utf8');
   if (raw.subarray(0, 8000).includes(0) || !Buffer.from(text).equals(raw))
     throw new ToolError(`${shown} is not UTF-8 text.`);
   return text;
+}
+
+function readText(file: ScratchFile) {
+  // A link at the last step is refused before the open, which would follow it.
+  if (!lstatSync(file.full, { throwIfNoEntry: false })?.isFile())
+    throw new ToolError(`${file.relative} is not a file.`);
+  const { fd, stat } = openInside(file.root, file.full, file.relative, constants.O_RDONLY);
+  try {
+    return readOpen(fd, stat, file.relative);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function writeAll(fd: number, text: string) {
+  const data = Buffer.from(text);
+  for (let at = 0; at < data.length; ) at += writeSync(fd, data, at, data.length - at, at);
 }
 
 const lines = (text: string) => (text === '' ? [] : text.replace(/\r?\n$/, '').split(/\r?\n/));
@@ -264,7 +333,7 @@ export function unifiedDiff(file: string, before: string, after: string, context
 
 /** Files in scratch, without ignored ones when scratch is a Git checkout. Symlinks are skipped. */
 export function listFiles(scratch: string, environment: NodeJS.ProcessEnv) {
-  const root = realpathSync(scratch);
+  const root = kernelPath(scratch);
   let paths: string[];
   try {
     paths = execFileSync(
@@ -320,7 +389,7 @@ function search(scratch: string, environment: NodeJS.ProcessEnv, pattern: string
   } catch {
     regex = new RegExp(escapeRegExp(pattern));
   }
-  const root = realpathSync(scratch);
+  const root = kernelPath(scratch);
   const hits: string[] = [];
   let more = false;
   for (const file of listFiles(scratch, environment)) {
@@ -333,7 +402,19 @@ function search(scratch: string, environment: NodeJS.ProcessEnv, pattern: string
       continue;
     let text: string;
     try {
-      text = readFileSync(resolve(root, file.path), 'utf8');
+      // listFiles saw a file at this path. A folder above it can still be a link.
+      const { fd, stat } = openInside(
+        root,
+        resolve(root, file.path),
+        file.path,
+        constants.O_RDONLY,
+      );
+      try {
+        if (!stat.isFile() || stat.size > SEARCH_FILE_BYTES) continue;
+        text = readFileSync(fd, 'utf8');
+      } finally {
+        closeSync(fd);
+      }
     } catch {
       continue;
     }
@@ -359,7 +440,7 @@ function search(scratch: string, environment: NodeJS.ProcessEnv, pattern: string
 function runCommand(command: string, context: ToolContext) {
   return new Promise<{ status: 'ok' | 'error'; output: string }>((settle) => {
     const child = spawn('/bin/sh', ['-c', command], {
-      cwd: realpathSync(context.scratch),
+      cwd: kernelPath(context.scratch),
       env: context.environment,
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -487,7 +568,7 @@ export function prepareTool(name: string, input: unknown, context: ToolContext):
         const call = ArgumentSchemas.read_range.parse(args);
         const file = scratchPath(context.scratch, call.path);
         return ready(null, async () => {
-          const rows = lines(readText(file.full, file.relative));
+          const rows = lines(readText(file));
           if (call.start > rows.length)
             throw new ToolError(`${file.relative} has ${rows.length} lines.`);
           const end = Math.min(
@@ -515,7 +596,7 @@ export function prepareTool(name: string, input: unknown, context: ToolContext):
       case 'edit': {
         const call = ArgumentSchemas.edit.parse(args);
         const file = scratchPath(context.scratch, call.path);
-        const before = readText(file.full, file.relative);
+        const before = readText(file);
         // Models write \n. A CRLF file only matches when the edit uses its line endings.
         const crlf = before.includes('\r\n');
         const old = crlf ? call.old.replace(/\r?\n/g, '\r\n') : call.old;
@@ -535,9 +616,19 @@ export function prepareTool(name: string, input: unknown, context: ToolContext):
         const after = before.slice(0, first) + next + before.slice(first + old.length);
         const diff = unifiedDiff(file.relative, before, after);
         return ready(diff.patch, async () => {
-          if (readText(file.full, file.relative) !== before)
-            throw new ToolError(`${file.relative} changed before the edit ran. Read it again.`);
-          writeFileSync(file.full, after);
+          // One open file for the compare and the write, so the bytes compared are the bytes
+          // replaced.
+          if (!lstatSync(file.full, { throwIfNoEntry: false })?.isFile())
+            throw new ToolError(`${file.relative} is not a file.`);
+          const { fd, stat } = openInside(file.root, file.full, file.relative, constants.O_RDWR);
+          try {
+            if (readOpen(fd, stat, file.relative) !== before)
+              throw new ToolError(`${file.relative} changed before the edit ran. Read it again.`);
+            ftruncateSync(fd, 0);
+            writeAll(fd, after);
+          } finally {
+            closeSync(fd);
+          }
           return {
             status: 'ok',
             output: bound(`Edited ${file.relative}.\n${diff.patch ?? ''}`),
@@ -555,8 +646,26 @@ export function prepareTool(name: string, input: unknown, context: ToolContext):
           return failed(`New files must be under ${WRITE_BYTES / 1024} KiB.`);
         const diff = unifiedDiff(file.relative, '', call.content);
         return ready(diff.patch, async () => {
+          // The folders may have changed since the call was planned. Check them again before
+          // creating any, and once more after.
+          scratchPath(context.scratch, call.path);
           mkdirSync(dirname(file.full), { recursive: true });
-          writeFileSync(file.full, call.content, { flag: 'wx' });
+          if (!within(file.root, kernelPath(dirname(file.full)))) throw escapes(file.relative);
+          // O_EXCL never follows a link at the last step. A folder swapped for a link after the
+          // check above can still place the new empty file outside; the open check then refuses
+          // to write into it. Node has no openat, which would close that gap.
+          const { fd } = openInside(
+            file.root,
+            file.full,
+            file.relative,
+            constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+            0o666,
+          );
+          try {
+            writeAll(fd, call.content);
+          } finally {
+            closeSync(fd);
+          }
           return {
             status: 'ok',
             output: `Created ${file.relative} with ${diff.additions} lines.`,
