@@ -26,6 +26,7 @@ import {
   lastFamily,
   lastReply,
   latestContext,
+  newestTurnId,
   type ThreadItem,
   type ThreadSettings,
   triedFamilies,
@@ -209,15 +210,22 @@ export function ThreadView({
     },
     [source, task.id],
   );
-  const replyId = useMemo(() => (activeTurn ? null : lastReply(items)), [activeTurn, items]);
+  const replyId = useMemo(
+    () => (activeTurn ? null : lastReply(state, items)),
+    [activeTurn, state, items],
+  );
+  const newestId = useMemo(() => newestTurnId(state), [state]);
   const current = thread?.selection ?? null;
   const actions = (item: ThreadItem): ReactNode => {
     if (item.kind !== 'turn' && item.kind !== 'failure') return null;
     const turnId = item.kind === 'turn' ? item.turn.id : item.turnId;
     const note = item.kind === 'turn' ? state.historyNotes[turnId] : undefined;
-    const retryable = item.kind === 'failure' || item.turn.status === 'stopped';
+    // The controller reruns only the newest turn, so an older failure offers nothing to run.
+    const newest = turnId === newestId;
+    const retryable = newest && (item.kind === 'failure' || item.turn.status === 'stopped');
     const regenerate = item.kind === 'turn' && turnId === replyId;
-    const rejected = item.kind === 'failure' && item.failure.kind === 'attachment-rejected';
+    const rejected =
+      newest && item.kind === 'failure' && item.failure.kind === 'attachment-rejected';
     if (!note && !retryable && !regenerate) return null;
     const choices =
       rejected && catalog
