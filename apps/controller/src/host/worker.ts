@@ -508,13 +508,24 @@ export class OwnedCommand {
       const cancellation = Promise.withResolvers<never>();
       void cancellation.promise.catch(() => {});
       let settled = false;
-      let returnStarted = false;
+      let returned: Promise<void> | undefined;
+      // The source may be parked inside its own await when the command stops, and its cleanup runs
+      // only after it resumes. Input is not complete until that cleanup ran, or until a source that
+      // never answers has had a second.
       const returnInput = () => {
-        if (returnStarted) return;
-        returnStarted = true;
-        try {
-          void Promise.resolve(iterator.return?.()).catch(() => {});
-        } catch {}
+        returned ??= new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, 1000);
+          const done = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+          try {
+            Promise.resolve(iterator.return?.()).then(done, done);
+          } catch {
+            done();
+          }
+        });
+        return returned;
       };
       this.cancelInput = (error) => {
         if (settled) return;
@@ -536,7 +547,7 @@ export class OwnedCommand {
           }
         } finally {
           settled = true;
-          returnInput();
+          await returnInput();
         }
       };
       this.inputCompleted = pipeline(boundedInput(), this.child.stdin).then(
