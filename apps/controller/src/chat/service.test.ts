@@ -317,7 +317,7 @@ function standalone(t: TestContext, deps: Partial<ChatServiceDeps> = {}) {
     return result;
   };
   const read = (on = service) => on.readThread({ taskId, limit: 100 });
-  return { clock, store, taskId, service, start, send, read };
+  return { clock, store, taskId, service, start, send, read, root: repository.directory };
 }
 
 /** A catalog entry with one model and one weekly window. */
@@ -1926,4 +1926,59 @@ test('a file is stored once by its hash, and its path reaches every turn that ru
     ],
   );
   assert.ok(thread.turns.every((value) => value.userMessageId === turn.userMessageId));
+});
+
+test('rename sets the thread title, and delete removes the thread, its scratch copy and files for good', {
+  timeout: 30000,
+}, async (t) => {
+  const scripted = createScriptedChatAdapter({ family: 'openai', turns: [[{ kind: 'wait' }]] });
+  const { store, service, taskId, start, send, root } = standalone(t, {
+    adapters: new Map([['openai', scripted]]),
+  });
+  const pasted = { name: 'note.txt', mimeType: 'text/plain', base64: 'aGVsbG8=' };
+  store.transaction(() => service.importAttachment({ taskId, source: pasted }));
+  const running = turnReaches({ store }, 'running');
+  const launched = next(
+    { store },
+    (event) => event.type === 'agent.event' && event.payload.type === 'turn.started',
+  );
+  send('Read the note.');
+  const turn = await running;
+  await launched;
+  const remove = (on = service) => act(store, (effects) => on.deleteThread({ taskId }, effects));
+  assert.equal(remove().reason, 'turn-running');
+  const stopped = turnReaches({ store }, 'stopped');
+  act(store, (effects) => service.stopTurn({ taskId, turnId: turn.id }, effects));
+  await stopped;
+
+  const rename = (title: string) =>
+    store.transaction(() => service.renameThread({ taskId, title }));
+  assert.equal(rename(' \n ').reason, 'title-empty');
+  const renamed = rename('  Sales\n chart ').entity as Task;
+  assert.deepEqual([renamed.title, renamed.revision], ['Sales chart', 1]);
+  assert.deepEqual(store.get<Task>('task', taskId), renamed);
+
+  // A run that names the task keeps it.
+  store.transaction(() => store.put('run', 'run_held', 0, { id: 'run_held', taskId }));
+  assert.equal(remove().reason, 'thread-has-runs');
+  store.db.prepare("DELETE FROM entities WHERE id='run_held'").run();
+
+  // The controller stops after the delete commits and before its folder goes. Startup finishes it.
+  const folder = dirname(scripted.requests[0].scratch.directory);
+  const ref = `refs/crewkite/threads/${taskId}`;
+  git(root, ['update-ref', ref, scripted.requests[0].scratch.base]);
+  assert.equal(store.transaction(() => service.deleteThread({ taskId }, [])).outcome, 'applied');
+  assert.ok(existsSync(join(folder, 'files')));
+  const restarted = start();
+  restarted.recover();
+  assert.equal(existsSync(folder), false);
+  assert.equal(git(root, ['for-each-ref', ref]).toString(), '');
+  assert.equal(store.get('task', taskId), undefined);
+  for (const table of ['conversation_entries', 'chat_turns', 'chat_threads', 'events'])
+    assert.equal(
+      store.db.prepare(`SELECT count(*) AS rows FROM ${table} WHERE task_id=?`).get(taskId)?.rows,
+      0,
+      table,
+    );
+  assert.equal(remove(restarted).reason, 'task-not-found');
 });

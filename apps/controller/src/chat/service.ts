@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { uptime } from 'node:os';
 import { join, resolve } from 'node:path';
 import {
@@ -40,8 +40,10 @@ import {
   type Project,
   rankFamilies,
   type Task,
+  TaskSchema,
   writesScratch,
 } from '@crewkite/contracts';
+import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
 import type { ArtifactFiles } from '../artifacts/index.ts';
 import {
@@ -68,7 +70,12 @@ import {
   type ChatTurnResult,
   chatFailure,
 } from './adapter.ts';
-import { discardScratchPath, scratchChanges, writeThreadBaseRef } from './changes.ts';
+import {
+  deleteThreadBaseRef,
+  discardScratchPath,
+  scratchChanges,
+  writeThreadBaseRef,
+} from './changes.ts';
 import { FileRefused, filesFolder, storedFile, storeFile } from './files.ts';
 import {
   type ChatGitHost,
@@ -705,14 +712,50 @@ export class ChatService {
     return { outcome: 'applied' };
   }
 
+  /** The thread's title is its task's title. A paste can carry line breaks, so spaces collapse. */
   renameThread(payload: Payload<'RenameChatThread'>): CommandResult {
-    if (!this.task(payload.taskId)) return blocked('task-not-found');
-    return unavailable('Rename');
+    const task = this.task(payload.taskId);
+    if (!task) return blocked('task-not-found');
+    const title = payload.title.replace(/\s+/g, ' ').trim();
+    if (!title) return blocked('title-empty', 'Type a title for the thread.');
+    if (title === task.title) return { outcome: 'applied', entity: task, revision: task.revision };
+    const renamed = TaskSchema.parse({ ...task, title, revision: task.revision + 1 });
+    this.deps.store.put('task', renamed.id, renamed.revision, renamed);
+    this.deps.emit('task.updated', renamed.id, renamed.revision, renamed);
+    return { outcome: 'applied', entity: renamed, revision: renamed.revision };
   }
 
-  deleteThread(payload: Payload<'DeleteChatThread'>, _effects: Effects): CommandResult {
-    if (!this.task(payload.taskId)) return blocked('task-not-found');
-    return unavailable('Delete');
+  /**
+   * Remove the thread, its conversation and its events. Branches it accepted stay in the
+   * repository. The delete is journaled under `chat-deleted:<task>` in the same commit, and the
+   * thread's folder under the controller home goes after commit. Startup removes any folder a
+   * crash left behind, so nothing of the thread comes back.
+   */
+  deleteThread(payload: Payload<'DeleteChatThread'>, effects: Effects): CommandResult {
+    const task = this.task(payload.taskId);
+    if (!task) return blocked('task-not-found');
+    const { thread, left } = this.checkedThread(task);
+    if (thread.activeTurnId)
+      return blocked('turn-running', 'Stop the reply, then delete the thread.');
+    // A process that outlived its turn may still write to the scratch copy.
+    if (left.length) return ownershipUnknown(left, 'delete the thread');
+    if (task.runId || !this.deps.store.removeTask(task.id))
+      return blocked(
+        'thread-has-runs',
+        'This task has runs outside the chat, so it stays. Only a chat thread can be deleted.',
+      );
+    const files = `chat-file:${task.id}:`;
+    this.deps.store.db
+      .prepare('DELETE FROM receipts WHERE substr(command_key,1,length(?))=?')
+      .run(files, files);
+    this.deps.store.saveReceipt(
+      `chat-deleted:${task.id}`,
+      hashCanonical({ taskId: task.id }),
+      'local-owner',
+      { outcome: 'applied', entity: task },
+    );
+    effects.push(() => this.removeFromDisk(task));
+    return { outcome: 'applied' };
   }
 
   private gitHost(): ChatGitHost {
@@ -789,6 +832,7 @@ export class ChatService {
    * them is present. Messages queued before the restart start once their thread is free.
    */
   recover() {
+    this.sweepDeleted();
     const rows = this.deps.store.db
       .prepare(
         "SELECT id,task_id FROM chat_turns WHERE json_extract(body,'$.state') IN ('queued','running','waiting-permission') OR json_array_length(body,'$.groups')>0 ORDER BY task_id,sequence",
@@ -2046,6 +2090,36 @@ export class ChatService {
       author: { kind: 'system', turnId: null },
       text: `Continued on ${familyName[selection.family]} from ${familyName[from]}. Reason: ${handoffReason('manual')}.`,
     });
+  }
+
+  /**
+   * The base ref in the project, then the thread's whole folder: scratch copy, files and per-turn
+   * work folders. The folder goes last, so a folder still present means the ref may be too.
+   */
+  private removeFromDisk(task: Task) {
+    const root = this.deps.projectPath(task.projectId);
+    try {
+      if (root) deleteThreadBaseRef(root, task.id);
+    } catch {
+      // A ref left behind keeps one commit alive and changes nothing else.
+    }
+    try {
+      rmSync(join(this.deps.home, 'chat', task.id), { recursive: true, force: true });
+    } catch {
+      // Startup tries again while the folder is there.
+    }
+  }
+
+  /** Finish a delete whose effect never ran because the controller stopped first. */
+  private sweepDeleted() {
+    const rows = this.deps.store.db
+      .prepare("SELECT command_key FROM receipts WHERE substr(command_key,1,13)='chat-deleted:'")
+      .all() as { command_key: string }[];
+    for (const { command_key: key } of rows) {
+      const task = this.deps.store.receipt(key)?.result.entity as Task | undefined;
+      if (task?.id === key.slice('chat-deleted:'.length) && /^tsk_[A-Za-z0-9]+$/.test(task.id))
+        if (existsSync(join(this.deps.home, 'chat', task.id))) this.removeFromDisk(task);
+    }
   }
 
   private task(taskId: string): Task | undefined {
