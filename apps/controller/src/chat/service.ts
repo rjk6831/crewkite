@@ -1752,7 +1752,7 @@ export class ChatService {
         : history.findLast((entry) => entry.role === 'assistant')?.text) ?? null;
     if (role === 'advisor') return adviceContext(name, directory, answer);
     if (role === 'challenger') return challengeContext(name, directory, answer);
-    if (role !== 'reviewer') return systemContext(name, directory);
+    if (role !== 'reviewer') return systemContext(name, directory, turn.selection.family);
     const base = thread.base ?? '';
     let files: ChatChangesRead['files'] | null = null;
     try {

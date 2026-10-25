@@ -1,5 +1,8 @@
-import { isAbsolute, relative, resolve, sep } from 'node:path';
+import { closeSync, constants, fstatSync, openSync, readSync, realpathSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { ChatFamily } from '@crewkite/contracts';
+import { anthropicInstructionFile } from '../providers/anthropic/instructions.ts';
+import { googleInstructionFile } from '../providers/google/instructions.ts';
 import type { ChatHistoryEntry } from './adapter.ts';
 
 export const familyName: Record<ChatFamily, string> = {
@@ -16,12 +19,92 @@ export function handoffReason(reason: HandoffReason): string {
   return reason === 'limit' ? 'usage limit reached' : 'switched in the composer';
 }
 
-export function systemContext(projectName: string, directory: string): string {
-  return [
+/**
+ * The framing for an assistant or fixer turn. The Anthropic client launches with no setting
+ * sources and Local has no instruction loader, so those two get the project's instruction files
+ * here. The OpenAI and Google clients read their own files from the working folder.
+ */
+export function systemContext(projectName: string, directory: string, family: ChatFamily): string {
+  const framing = [
     `You are working on the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
     'Read and edit files only inside that copy. The person reviews every change in Changes before it reaches their repository.',
     'When you change files, say which files you changed and why.',
+    'The scratch copy has no `.git` folder and no installed dependencies, so git commands and tests may fail there.',
   ].join('\n');
+  const instructions =
+    family === 'anthropic' || family === 'local' ? projectInstructions(directory) : [];
+  return [framing, ...instructions].join('\n\n');
+}
+
+/** Instruction files at the scratch root, in the order systemContext reads them. */
+export const instructionFiles = ['AGENTS.md', anthropicInstructionFile, googleInstructionFile];
+const INSTRUCTION_BYTES = 64 * 1024;
+const INSTRUCTIONS_CUT = '[The project instructions stop here at the 64 KiB limit.]';
+
+/**
+ * One section per instruction file at the scratch root, in a fixed order. A link that resolves to a
+ * file inside the copy counts once, under the first name that reaches it. Headers and text share
+ * 64 KiB, and a cut ends on a whole line.
+ */
+function projectInstructions(directory: string): string[] {
+  let root: string;
+  try {
+    root = realpathSync.native(directory);
+  } catch {
+    return [];
+  }
+  const read = new Set<string>();
+  const sections: string[] = [];
+  let used = 0;
+  for (const name of instructionFiles) {
+    let file: string;
+    try {
+      file = realpathSync.native(join(root, name));
+    } catch {
+      continue;
+    }
+    if (!file.startsWith(`${root}${sep}`) || read.has(file)) continue;
+    read.add(file);
+    const header = `Project instructions from ${name}:\n\n`;
+    const room = INSTRUCTION_BYTES - used - Buffer.byteLength(header);
+    const bytes = readFileStart(file, Math.max(room, 0) + 1);
+    if (bytes === null || bytes.length === 0) continue;
+    if (bytes.length <= room) {
+      sections.push(`${header}${bytes.toString('utf8').trimEnd()}`);
+      used += Buffer.byteLength(header) + bytes.length;
+      continue;
+    }
+    const end = room > 0 ? bytes.lastIndexOf(10, room - 1) : -1;
+    const kept = end < 0 ? '' : bytes.subarray(0, end).toString('utf8').trimEnd();
+    sections.push(kept ? `${header}${kept}\n${INSTRUCTIONS_CUT}` : INSTRUCTIONS_CUT);
+    break;
+  }
+  return sections;
+}
+
+/** The first bytes of a regular file, or null for anything else. A FIFO never blocks the read. */
+function readFileStart(path: string, limit: number): Buffer | null {
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+  } catch {
+    return null;
+  }
+  try {
+    if (!fstatSync(fd).isFile()) return null;
+    const buffer = Buffer.alloc(limit);
+    let length = 0;
+    while (length < limit) {
+      const count = readSync(fd, buffer, length, limit - length, length);
+      if (count === 0) break;
+      length += count;
+    }
+    return buffer.subarray(0, length);
+  } catch {
+    return null;
+  } finally {
+    closeSync(fd);
+  }
 }
 
 // A review reads the changed files and their patches, so the patches get a fixed share of the prompt.

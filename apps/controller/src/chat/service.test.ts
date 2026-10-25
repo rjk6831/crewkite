@@ -159,6 +159,7 @@ test('a sent message streams agent events and saves the reply when the turn fini
   );
   assert.deepEqual(request.history, []);
   assert.match(request.systemContext, /demo-shop/);
+  assert.match(request.systemContext, /no `\.git` folder and no installed dependencies/);
   assert.ok(existsSync(join(request.scratch.directory, 'net.mjs')));
 });
 
