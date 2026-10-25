@@ -3,11 +3,17 @@
 // checks the shape again on every call, because the renderer is not trusted, and writes the text
 // itself from the kind.
 
-export type ThreadNoticeKind = 'reply' | 'permission' | 'crew' | 'crew-stopped';
+export type ThreadNoticeKind = 'reply' | 'failed' | 'permission' | 'crew' | 'crew-stopped';
 export type ThreadNotice = { taskId: string; title: string; kind: ThreadNoticeKind };
 export type ThreadAttention = { badge: number; notice: ThreadNotice | null };
 
-const KINDS: readonly ThreadNoticeKind[] = ['reply', 'permission', 'crew', 'crew-stopped'];
+const KINDS: readonly ThreadNoticeKind[] = [
+  'reply',
+  'failed',
+  'permission',
+  'crew',
+  'crew-stopped',
+];
 export const TASK_ID_PATTERN = /^tsk_[0-7][0-9A-HJKMNP-TV-Z]{25}$/;
 const MAX_BADGE = 9999;
 // Same bound as a thread title.
@@ -16,6 +22,7 @@ const MAX_TITLE = 200;
 export function noticeText(notice: ThreadNotice): string {
   const said = {
     reply: 'reply finished',
+    failed: 'reply failed',
     permission: 'waiting for permission',
     crew: 'crew finished',
     'crew-stopped': 'crew stopped',

@@ -11,7 +11,7 @@ const open = `tsk_${'0'.repeat(25)}1`;
 const other = `tsk_${'0'.repeat(25)}2`;
 const turn = `trn_${'0'.repeat(25)}1`;
 
-test('a finished reply, a waiting permission and a crew end post a notice unless that thread is in view', () => {
+test('a finished or failed reply, a waiting permission and a crew end post a notice unless that thread is in view', () => {
   let cursor = 10;
   const at = (taskId: string, type: string, payload: object): RailEvent => {
     cursor += 1;
@@ -36,11 +36,29 @@ test('a finished reply, a waiting permission and a crew end post a notice unless
       [`${other}:reply`],
     ],
     [
-      'a stopped or failed reply posts nothing',
+      'a stopped reply posts nothing',
+      () => [streamed(other, { type: 'turn.completed', stopReason: 'stopped' })],
+      away,
+      [],
+    ],
+    [
+      'a reply that ends in an error or a usage limit while unfocused posts a failed notice',
       () => [
-        streamed(other, { type: 'turn.completed', stopReason: 'stopped' }),
         streamed(other, { type: 'turn.completed', stopReason: 'error' }),
+        streamed(open, { type: 'turn.completed', stopReason: 'limit' }),
       ],
+      away,
+      [`${other}:failed`, `${open}:failed`],
+    ],
+    [
+      'a failed reply in the open thread posts nothing',
+      () => [streamed(open, { type: 'turn.completed', stopReason: 'error' })],
+      focusedOn(open),
+      [],
+    ],
+    [
+      'a failed step inside a running crew chain posts nothing',
+      () => [chain(other, 'fix'), streamed(other, { type: 'turn.completed', stopReason: 'error' })],
       away,
       [],
     ],
