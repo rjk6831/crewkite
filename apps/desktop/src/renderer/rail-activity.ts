@@ -6,7 +6,10 @@ import type { ThreadNoticeKind } from '../shared/thread-notice.ts';
 
 export type RailEvent = { type: string; cursor: string; taskId: string | null; payload: unknown };
 
-/** The same rule the controller applies to the newest turn when it builds a summary. */
+/**
+ * The same rule the controller applies to the newest turn when it builds a summary. The other copy
+ * is chatActivity in apps/controller/src/store/workspace.ts; change both together.
+ */
 export function turnActivity(state: ChatTurnState): ChatThreadActivity {
   if (state === 'queued' || state === 'running') return 'running';
   if (state === 'waiting-permission') return 'waiting';
