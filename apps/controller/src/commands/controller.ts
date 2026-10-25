@@ -60,7 +60,7 @@ import {
   validateAcpSetupProof,
 } from '../providers/google/acp/profile.ts';
 import type { AcpDependencies, startGoogleAcpSetup } from '../providers/google/acp/writer.ts';
-import { googleChatAdapter } from '../providers/google/chat.ts';
+import { type GooglePromptCapabilities, googleChatAdapter } from '../providers/google/chat.ts';
 import type { CapturedContext } from '../providers/google/native-extension/connector.ts';
 import type {
   googleUsageObservations,
@@ -388,13 +388,20 @@ export class Controller {
     return this.chatRuntime;
   }
 
+  // What the Google and Local clients last reported about the files they take. Memory only: the
+  // next turn on each family reports again.
+  private googlePrompt: GooglePromptCapabilities | null = null;
+  private localVision: { modelKey: string; vision: boolean } | null = null;
+
   private chatCatalog(): ChatCatalogRead {
     const profiles = this.resolveProfiles();
     return buildChatCatalog({
       profiles: profiles.map((profile) => profile.facts),
       openAiModels: this.latestOpenAiModels(profiles)?.models ?? null,
       anthropicModel: this.anthropicUsage().clientModel(),
+      googlePrompt: this.googlePrompt,
       local: this.localSetup(),
+      localVision: this.localVision,
       windows: [
         ...this.store.list<Observation>('window').map((observation) => ({
           family: this.store.get<Route>('route', observation.routeId)?.family,
@@ -671,6 +678,9 @@ export class Controller {
       onUsage: (reading) => this.anthropicUsage().recordTurnReading(reading),
     });
     const google = googleChatAdapter({
+      onPromptCapabilities: (capabilities) => {
+        this.googlePrompt = capabilities;
+      },
       launch: (request: ChatTurnRequest) => {
         const setup = this.store.googleAcpSetup();
         const resolution = this.acpResolution();
@@ -711,11 +721,13 @@ export class Controller {
           throw Error('Local is not connected. Open Settings, load a model and connect Local.');
         const secret = this.localSecret?.secret.toString('utf8') ?? null;
         if (control.authMode !== 'none' && !secret) throw Error('The Local token is unavailable.');
-        return connectLocalModel({
+        const connection = await connectLocalModel({
           endpoint: control.endpoint,
           token: control.authMode === 'none' ? null : secret,
           model: request.selection.model,
         });
+        this.localVision = { modelKey: connection.modelKey, vision: connection.vision };
+        return connection;
       },
     });
     return new Map<ChatFamily, ChatAdapter>([

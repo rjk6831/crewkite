@@ -11,6 +11,7 @@ import type {
   ChatInput,
   ChatMessage,
   ChatMessageInput,
+  FilesNamespace,
   LLMActionOpts,
   LLMPredictionStats,
   PredictionResult,
@@ -49,17 +50,73 @@ export type LoadedModelLike = {
   act(chat: ChatInput, tools: Tool[], options: LLMActionOpts): Promise<unknown>;
   countTokens(text: string): Promise<number>;
 };
+/** The part of the SDK client's file namespace this adapter uses. */
+export type LocalFiles = Pick<FilesNamespace, 'prepareImageBase64'>;
 /**
  * `fellBack` is true when the requested model is not loaded and `modelKey` names another one.
- * `dispose` closes the runtime client the connection opened. It is safe to call more than once.
+ * `vision` is what the runtime reports for that model. `files` belongs to the same client, so
+ * an image it prepares lives as long as the turn. `dispose` closes the runtime client the
+ * connection opened. It is safe to call more than once.
  */
 export type LocalConnect = (request: ChatTurnRequest) => Promise<{
   model: LoadedModelLike;
   contextLength: number;
   modelKey: string;
   fellBack: boolean;
+  vision: boolean;
+  files: LocalFiles;
   dispose: () => Promise<void>;
 }>;
+
+/**
+ * Types Local inlines into the message as text. The model reads them like the rest of the
+ * message, so they count toward its context. The catalog reports the same list.
+ */
+export const LOCAL_TEXT_TYPES = [
+  'text/*',
+  'application/json',
+  'application/xml',
+  'application/yaml',
+  'application/x-yaml',
+  'application/toml',
+  'application/javascript',
+  'application/sql',
+  'application/x-sh',
+] as const;
+const textType = (mimeType: string) => {
+  const base = mimeType.split(';')[0].trim().toLowerCase();
+  return base.startsWith('text/') || (LOCAL_TEXT_TYPES as readonly string[]).includes(base);
+};
+
+type TurnFile = NonNullable<ChatTurnRequest['files']>[number];
+
+/**
+ * Sort the turn's files before any token is spent. Images go to a vision model as images, text
+ * goes into the message under its name, and anything else is refused with the reason.
+ */
+function sortFiles(files: readonly TurnFile[], vision: boolean, modelKey: string) {
+  const texts: string[] = [];
+  const images: TurnFile[] = [];
+  const refused: string[] = [];
+  for (const file of files) {
+    const { name, mimeType } = file.attachment;
+    if (mimeType.startsWith('image/')) {
+      if (vision) images.push(file);
+      else refused.push(`${name}: the loaded model ${modelKey} does not take images`);
+      continue;
+    }
+    if (!textType(mimeType)) {
+      refused.push(`${name}: Local takes images and text files, and this file is ${mimeType}`);
+      continue;
+    }
+    const raw = readFileSync(file.path);
+    const text = raw.toString('utf8');
+    if (raw.subarray(0, 8000).includes(0) || !Buffer.from(text).equals(raw))
+      refused.push(`${name}: it is not UTF-8 text`);
+    else texts.push(`Attached file ${name}:\n${text}`);
+  }
+  return { texts, images, refused };
+}
 
 const MAX_TOOL_CALLS = 12;
 // Each round gets tools until the last one, which must answer in text.
@@ -154,8 +211,10 @@ type Prompt =
   | { kind: 'fits'; chat: ChatInput; summary: Summary | null; carried: boolean }
   | { kind: 'too-large' };
 
+/** `message` is the person's text with any text files inlined after it. */
 async function buildPrompt(
   request: ChatTurnRequest,
+  message: string,
   model: LoadedModelLike,
   contextLength: number,
   warn: (message: string) => void,
@@ -164,7 +223,7 @@ async function buildPrompt(
   const count = async (text: string) => (await model.countTokens(text)) + MESSAGE_TOKENS;
   let left = contextLength - outputTokens;
   let system = systemPrompt(request, outputTokens);
-  left -= (await count(system)) + (await count(request.prompt));
+  left -= (await count(system)) + (await count(message));
   if (left < 0) return { kind: 'too-large' };
 
   const mapBudget = Math.min(Math.floor(contextLength * MAP_SHARE), left);
@@ -220,7 +279,7 @@ async function buildPrompt(
     chat: [
       { role: 'system', content: system },
       ...kept.map((entry) => ({ role: entry.role, content: entry.text })),
-      { role: 'user', content: request.prompt },
+      { role: 'user', content: message },
     ],
   };
 }
@@ -881,10 +940,40 @@ function startLocalTurn(
       updatedAt: new Date(now()).toISOString(),
     };
 
+    let files: ReturnType<typeof sortFiles>;
+    try {
+      files = sortFiles(request.files ?? [], connection.vision, modelKey);
+    } catch (error) {
+      return finish(
+        'error',
+        chatFailure({
+          stage: 'session',
+          kind: 'internal',
+          message: 'CrewKite could not read a stored file for this turn.',
+          providerMessage: describeError(error).slice(0, 16_384),
+        }),
+      );
+    }
+    if (files.refused.length)
+      return finish(
+        'error',
+        chatFailure({
+          stage: 'session',
+          kind: 'attachment-rejected',
+          message: `Local cannot take ${files.refused.join('; ')}.`.slice(0, 4096),
+        }),
+      );
+
     let prompt: Prompt;
     try {
       prompt = await bounded(
-        buildPrompt(request, model, contextLength, (message) => notice('warning', message)),
+        buildPrompt(
+          request,
+          [request.prompt, ...files.texts].join('\n\n'),
+          model,
+          contextLength,
+          (message) => notice('warning', message),
+        ),
       );
     } catch (error) {
       return ending ? ended() : finish('error', connectFailure(error));
@@ -900,6 +989,37 @@ function startLocalTurn(
     // `act` runs rounds until one ends without a native call. When that round wrote its calls as
     // text, they run here and `act` starts again with the results, inside the same round budget.
     let chat = prompt.chat;
+    if (files.images.length) {
+      try {
+        const images = await bounded(
+          Promise.all(
+            files.images.map(({ attachment, path }) =>
+              connection.files.prepareImageBase64(
+                attachment.name,
+                readFileSync(path).toString('base64'),
+              ),
+            ),
+          ),
+        );
+        // The person's message carries the images. Later `act` calls resend the same message,
+        // so the model keeps seeing them for the whole turn.
+        chat = [...chat.slice(0, -1), { ...chat[chat.length - 1], images }];
+      } catch (error) {
+        if (ending) return ended();
+        const failure = streamFailure(error);
+        return finish(
+          'error',
+          failure.kind === 'internal'
+            ? chatFailure({
+                stage: 'session',
+                kind: 'attachment-rejected',
+                message: 'LM Studio did not accept the attached images.',
+                providerMessage: failure.providerMessage,
+              })
+            : failure,
+        );
+      }
+    }
     try {
       for (;;) {
         const appended: ChatInput = [];

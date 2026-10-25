@@ -16,6 +16,8 @@ import {
   anthropicChatModels,
   anthropicDefaultChatModel,
 } from '../providers/anthropic/chat.ts';
+import type { GooglePromptCapabilities } from '../providers/google/chat.ts';
+import { LOCAL_TEXT_TYPES } from '../providers/local/chat.ts';
 import type { NativeProfileResolution } from '../providers/openai/profile.ts';
 import { windowState } from '../usage/index.ts';
 
@@ -36,7 +38,11 @@ export type ChatCatalogInput = {
   openAiModels: readonly ObservedModel[] | null;
   /** The model the Anthropic client named in its last usage read, or null. */
   anthropicModel?: string | null;
+  /** What the Google client's last initialize declared in this controller's life, or null. */
+  googlePrompt?: GooglePromptCapabilities | null;
   local: LocalSetup;
+  /** The vision flag the runtime reported for a model at the last Local connect, or null. */
+  localVision?: { modelKey: string; vision: boolean } | null;
   /**
    * The route windows the readers wrote, plus the Anthropic reading's windows, which belong to
    * no route. Only the fields the gauge needs, so a reading without a route can join.
@@ -119,14 +125,26 @@ function google(input: ChatCatalogInput): Entry {
   const models = (configuration?.model.supported ?? []).map((model) =>
     chatModel(model, thought?.supported ?? [], thought?.currentValue ?? 'default'),
   );
-  return entry(
-    input,
-    'google',
-    profile?.available === true,
-    profile?.reason,
-    models,
-    configuration?.model.currentValue,
-  );
+  // The agent declares its prompt blocks at each initialize. An embedded resource can carry any
+  // file, so that flag covers every type.
+  const declared = input.googlePrompt;
+  return {
+    ...entry(
+      input,
+      'google',
+      profile?.available === true,
+      profile?.reason,
+      models,
+      configuration?.model.currentValue,
+    ),
+    accepts: declared
+      ? [
+          ...(declared.image ? ['image/*'] : []),
+          ...(declared.audio ? ['audio/*'] : []),
+          ...(declared.embeddedContext ? ['*/*'] : []),
+        ]
+      : null,
+  };
 }
 
 function local(input: ChatCatalogInput): Entry {
@@ -136,6 +154,12 @@ function local(input: ChatCatalogInput): Entry {
     (choice) => choice.selectionId === input.local.selection?.selectionId,
   );
   const connected = input.local.connected === true;
+  // Text files are inlined for any model. Images need a model the runtime says has vision.
+  // shortcut: vision comes from the last connect, so it is unknown until a turn runs. Upgrade:
+  // a vision field on LocalModelChoice, read with getModelInfo at discovery.
+  const model = (selected ?? loaded[0])?.identity.modelKey;
+  const vision =
+    model !== undefined && input.localVision?.modelKey === model && input.localVision.vision;
   return {
     family: 'local',
     connected,
@@ -151,7 +175,7 @@ function local(input: ChatCatalogInput): Entry {
     // between launches. A machine that never set one up shows nothing.
     needsConnect: !connected && input.local.endpoint !== null,
     lastTurnStats: lastTurnStats(input, 'local'),
-    accepts: null,
+    accepts: model === undefined ? null : [...(vision ? ['image/*'] : []), ...LOCAL_TEXT_TYPES],
   };
 }
 
