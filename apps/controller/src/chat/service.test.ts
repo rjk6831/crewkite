@@ -1836,14 +1836,27 @@ test('a file is stored once by its hash, and its path reaches every turn that ru
       }),
     ],
   ] as const);
-  const { store, service, taskId, read } = standalone(t, { adapters });
+  const { store, service, taskId, read, root } = standalone(t, { adapters });
   const outside = mkdtempSync(join(tmpdir(), 'crewkite-attach-'));
   t.after(() => rmSync(outside, { recursive: true, force: true }));
   const png = Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.alloc(32, 7)]);
   writeFileSync(join(outside, 'chart.png'), png);
-  const importing = (source: Parameters<ChatService['importAttachment']>[0]['source']) =>
-    store.transaction(() => service.importAttachment({ taskId, source }));
-  const first = importing({ path: join(outside, 'chart.png') });
+  // The copy is whole before the transaction opens, and a partial one a crash left goes first.
+  const folder = join(dirname(root), 'chat', taskId, 'files');
+  const partials = () => readdirSync(folder).filter((name) => name.startsWith('.import-'));
+  mkdirSync(folder, { recursive: true });
+  writeFileSync(join(folder, '.import-0123456789ab-0123456789abcdef'), 'partial');
+  const staged: number[] = [];
+  const importing = (source: Parameters<ChatService['importAttachment']>[0]['source']) => {
+    const payload = { taskId, source };
+    return service.importing(payload, () => {
+      staged.push(...partials().map((name) => statSync(join(folder, name)).size));
+      return store.transaction(() => service.importAttachment(payload));
+    });
+  };
+  const first = await importing({ path: join(outside, 'chart.png') });
+  assert.deepEqual(staged, [png.length]);
+  assert.deepEqual(partials(), []);
   assert.deepEqual(first.data, {
     kind: 'chat-attachment',
     id: createHash('sha256').update(png).digest('hex'),
@@ -1851,11 +1864,12 @@ test('a file is stored once by its hash, and its path reaches every turn that ru
     mimeType: 'image/png',
     bytes: png.length,
   });
-  assert.deepEqual(importing({ path: join(outside, 'chart.png') }), first);
+  assert.deepEqual(await importing({ path: join(outside, 'chart.png') }), first);
   const pasted = { name: 'chart.png', mimeType: 'image/png', base64: png.toString('base64') };
-  assert.deepEqual(importing(pasted), first);
+  assert.deepEqual(await importing(pasted), first);
   for (const path of [outside, join(outside, 'missing.png'), '/dev/null'])
-    assert.equal(importing({ path }).reason, 'file-refused', path);
+    assert.equal((await importing({ path })).reason, 'file-refused', path);
+  assert.deepEqual(partials(), []);
 
   const { kind: _, ...file } = first.data as ChatAttachment & { kind: 'chat-attachment' };
   const ask = (files: ChatAttachment[]) =>
@@ -1979,14 +1993,18 @@ test('a file is stored once by its hash, and its path reaches every turn that ru
     ]),
   );
   const carry = standalone(t, { adapters: families });
-  const notes = Array.from({ length: 34 }, (_value, index) => {
+  const notes: ChatAttachment[] = [];
+  for (let index = 0; index < 34; index++) {
     const source = { name: `n${index}.txt`, mimeType: 'text/plain', base64: btoa(`note ${index}`) };
-    const stored = carry.store.transaction(() =>
-      carry.service.importAttachment({ taskId: carry.taskId, source }),
-    ).data as ChatAttachment & { kind: 'chat-attachment' };
-    const { kind: _kind, ...attachment } = stored;
-    return attachment;
-  });
+    const payload = { taskId: carry.taskId, source };
+    const stored = await carry.service.importing(payload, () =>
+      carry.store.transaction(() => carry.service.importAttachment(payload)),
+    );
+    const { kind: _kind, ...attachment } = stored.data as ChatAttachment & {
+      kind: 'chat-attachment';
+    };
+    notes.push(attachment);
+  }
   const message = async (files: ChatAttachment[], choice: ChatModelSelection) => {
     const done = turnReaches({ store: carry.store }, 'done');
     act(carry.store, (effects) =>
@@ -2029,7 +2047,10 @@ test('rename sets the thread title, and delete removes the thread, its scratch c
     adapters: new Map([['openai', scripted]]),
   });
   const pasted = { name: 'note.txt', mimeType: 'text/plain', base64: 'aGVsbG8=' };
-  store.transaction(() => service.importAttachment({ taskId, source: pasted }));
+  const imported = { taskId, source: pasted };
+  await service.importing(imported, () =>
+    store.transaction(() => service.importAttachment(imported)),
+  );
   const running = turnReaches({ store }, 'running');
   const launched = next(
     { store },

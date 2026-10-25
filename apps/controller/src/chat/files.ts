@@ -1,20 +1,15 @@
 import { createHash, randomBytes } from 'node:crypto';
 import {
-  closeSync,
   constants,
   copyFileSync,
-  fstatSync,
   linkSync,
   lstatSync,
   mkdirSync,
-  openSync,
   readdirSync,
-  readSync,
   renameSync,
   rmSync,
-  writeFileSync,
-  writeSync,
 } from 'node:fs';
+import { type FileHandle, open, writeFile } from 'node:fs/promises';
 import { basename, extname, join } from 'node:path';
 import { type ChatAttachment, ChatAttachmentSchema } from '@crewkite/contracts';
 
@@ -37,17 +32,30 @@ const CHUNK_BYTES = 1024 * 1024;
 const HEAD_BYTES = 64 * 1024;
 const MIME = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9!#$&^_.+-]+$/i;
 
+export type StagedFile = Readonly<{ attachment: ChatAttachment; temporary: string }>;
+
+// A partial copy carries the mark of the controller process that writes it. Only one controller
+// runs at a time, so a copy under another mark is one a crash left behind.
+const PARTIAL = '.import-';
+const RUN = randomBytes(6).toString('hex');
+
 /**
- * Copy one file into the folder and name it by the hash of its bytes. A path is read in chunks,
- * so a large file never sits whole in memory. The same bytes stored before are kept, and a new
- * name for them is a hard link to the stored copy.
+ * Copy one file to a temporary name in the folder and hash it as it streams. This runs before the
+ * command's transaction, so a large file or one that downloads on open holds up no other thread.
+ * A path is read in chunks, so a large file never sits whole in memory. Partial copies a crash
+ * left go first.
  */
-export function storeFile(folder: string, source: FileSource): ChatAttachment {
+export async function stageFile(folder: string, source: FileSource): Promise<StagedFile> {
   mkdirSync(folder, { recursive: true, mode: 0o700 });
-  const temporary = join(folder, `.import-${randomBytes(8).toString('hex')}`);
+  for (const name of readdirSync(folder))
+    if (name.startsWith(PARTIAL) && !name.startsWith(`${PARTIAL}${RUN}-`))
+      rmSync(join(folder, name), { force: true });
+  const temporary = join(folder, `${PARTIAL}${RUN}-${randomBytes(8).toString('hex')}`);
   try {
     const read =
-      'path' in source ? copyFrom(source.path, temporary) : writeBytes(source.base64, temporary);
+      'path' in source
+        ? await copyFrom(source.path, temporary)
+        : await writeBytes(source.base64, temporary);
     const name = fileName('path' in source ? basename(source.path) : source.name);
     const attachment = ChatAttachmentSchema.parse({
       id: read.hash,
@@ -55,11 +63,28 @@ export function storeFile(folder: string, source: FileSource): ChatAttachment {
       mimeType: detectType(read.head, name, 'path' in source ? null : source.mimeType),
       bytes: read.bytes,
     });
-    place(folder, attachment, temporary);
-    return attachment;
-  } finally {
+    return { attachment, temporary };
+  } catch (error) {
     rmSync(temporary, { force: true });
+    throw error;
   }
+}
+
+/**
+ * Move a staged copy to `<sha256>/<name>`. The same bytes stored before are kept, and a new name
+ * for them is a hard link to the stored copy.
+ */
+export function placeFile(folder: string, staged: StagedFile) {
+  try {
+    place(folder, staged.attachment, staged.temporary);
+  } finally {
+    dropStaged(staged);
+  }
+}
+
+/** Remove a staged copy that did not go into place. */
+export function dropStaged(staged: StagedFile) {
+  rmSync(staged.temporary, { force: true });
 }
 
 /** Where a stored file is, or null when this thread holds no file with that id, name and size. */
@@ -75,11 +100,11 @@ export function storedFile(folder: string, attachment: ChatAttachment): string |
 
 type Read = { hash: string; bytes: number; head: Buffer };
 
-function copyFrom(path: string, temporary: string): Read {
-  let input: number;
+async function copyFrom(path: string, temporary: string): Promise<Read> {
+  let input: FileHandle;
   try {
     // A pipe would block an ordinary open until something writes to it.
-    input = openSync(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+    input = await open(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     throw new FileRefused(
@@ -89,13 +114,13 @@ function copyFrom(path: string, temporary: string): Read {
     );
   }
   try {
-    const stat = fstatSync(input);
+    const stat = await input.stat();
     if (stat.isDirectory()) throw new FileRefused('Attach the files inside the folder one by one.');
     if (!stat.isFile())
       throw new FileRefused(
         'Only regular files can be attached. Devices, sockets and pipes cannot.',
       );
-    const output = openSync(temporary, 'wx', 0o600);
+    const output = await open(temporary, 'wx', 0o600);
     try {
       const hash = createHash('sha256');
       const buffer = Buffer.allocUnsafe(CHUNK_BYTES);
@@ -104,7 +129,7 @@ function copyFrom(path: string, temporary: string): Read {
       for (;;) {
         let count: number;
         try {
-          count = readSync(input, buffer, 0, CHUNK_BYTES, null);
+          count = (await input.read(buffer, 0, CHUNK_BYTES, null)).bytesRead;
         } catch {
           throw new FileRefused('The file could not be read to the end. Attach it again.');
         }
@@ -113,21 +138,21 @@ function copyFrom(path: string, temporary: string): Read {
         hash.update(chunk);
         if (bytes < HEAD_BYTES) head.push(Buffer.from(chunk.subarray(0, HEAD_BYTES - bytes)));
         for (let written = 0; written < count; )
-          written += writeSync(output, chunk, written, count - written);
+          written += (await output.write(chunk, written, count - written)).bytesWritten;
         bytes += count;
       }
       return { hash: hash.digest('hex'), bytes, head: Buffer.concat(head) };
     } finally {
-      closeSync(output);
+      await output.close();
     }
   } finally {
-    closeSync(input);
+    await input.close();
   }
 }
 
-function writeBytes(base64: string, temporary: string): Read {
+async function writeBytes(base64: string, temporary: string): Promise<Read> {
   const data = Buffer.from(base64, 'base64');
-  writeFileSync(temporary, data, { flag: 'wx', mode: 0o600 });
+  await writeFile(temporary, data, { flag: 'wx', mode: 0o600 });
   return {
     hash: createHash('sha256').update(data).digest('hex'),
     bytes: data.length,
