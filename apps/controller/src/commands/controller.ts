@@ -807,6 +807,9 @@ export class Controller {
         return this.chat().openPullRequest(command.payload);
       return this.chat().branchStatus(command.payload);
     }
+    // The file copies before the command's transaction opens. A replay answers from its receipt.
+    if (command.command === 'ImportChatAttachment' && !this.store.receipt(command.key))
+      return this.chat().importing(command.payload, () => this.commitCommand(command, principal));
     const preparing = this.verificationPreparation;
     if (preparing?.key === command.key)
       return preparing.hash === hashCanonical(command) && preparing.principal === principal
