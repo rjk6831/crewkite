@@ -1106,11 +1106,22 @@ export class ChatService {
     const directory = this.scratchDirectory(task.id);
     const prompt = withAttachments(message.text, message.attachments ?? [], directory, root);
     const history = this.history(task.id, message.cursor);
+    const writer = writesScratch(turn.role);
+    // A review or an opinion starts a fresh native session, so its brief always reaches the model.
+    // So does a rerun of a message that already has a reply: the old session holds that reply.
+    const fresh = writer && this.answeredBefore(turn);
+    // Anthropic and Google read no history in a new session, so a rerun on the family that
+    // answered carries the conversation before the message in a packet, as a handoff does.
+    const rerun = fresh && !turn.handoffFrom;
+    const carries = !!turn.handoffFrom || rerun;
+    const session =
+      writer && !fresh
+        ? (thread.sessions.find((value) => value.family === turn.selection.family) ?? null)
+        : null;
     const files = this.turnFiles(task.id, message, !!turn.handoffFrom);
     const work = join(this.deps.home, 'chat', task.id, 'turns', turn.id);
     mkdirSync(work, { recursive: true, mode: 0o700 });
     const handoff = turn.handoffFrom ? this.takeHandoff(task) : null;
-    const writer = writesScratch(turn.role);
     // Balanced mode answers the safe asks itself, so the adapter sends every ask here whatever
     // the thread allows.
     const balanced = writer && thread.flightMode === 'balanced';
@@ -1119,10 +1130,10 @@ export class ChatService {
       taskId: task.id,
       role: turn.role,
       selection: turn.selection,
-      prompt: turn.handoffFrom
+      prompt: carries
         ? this.packet(turn, {
-            from: turn.handoffFrom,
-            reason: handoff?.reason ?? 'manual',
+            from: turn.handoffFrom ?? turn.selection.family,
+            reason: handoff?.reason ?? (rerun ? 'rerun' : 'manual'),
             root,
             base: thread.base,
             history,
@@ -1132,15 +1143,9 @@ export class ChatService {
         : prompt,
       files,
       systemContext: this.context(turn, project.name, directory, root, thread, history),
-      // The packet carries the transcript, so a handoff turn sends no separate history.
-      history: turn.handoffFrom ? [] : history,
-      // A review or an opinion starts a fresh native session, so its brief always reaches the model.
-      // So does a rerun of a message that already has a reply: the old session holds that reply,
-      // and the transcript up to the message rebuilds everything before it.
-      session:
-        writer && !this.answeredBefore(turn)
-          ? (thread.sessions.find((session) => session.family === turn.selection.family) ?? null)
-          : null,
+      // The packet carries the transcript, so a turn with a packet sends no separate history.
+      history: carries ? [] : history,
+      session,
       scratch: { directory, base: thread.base, projectName: project.name },
       work: { directory: work, home: this.deps.home },
       permissionPolicy: writer && !balanced ? thread.permissionPolicy : 'ask',
