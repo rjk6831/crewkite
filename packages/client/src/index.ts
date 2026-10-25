@@ -35,6 +35,7 @@ export interface DesktopSource {
   cancelArtifactVerification?(requestId: string): Promise<void>;
   subscribe(onEvent: (event: Event) => void): () => void;
   onConnection?(listener: (state: ConnectionState) => void): () => void;
+  openLink?(url: string): Promise<'opened' | 'declined' | 'refused'>;
   pickProject?(): Promise<CommandResult | null>;
   reconnect?(): Promise<void>;
   retryCommand?(expected?: DesktopCommand): Promise<CommandResult | null>;
