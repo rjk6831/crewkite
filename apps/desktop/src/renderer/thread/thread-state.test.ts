@@ -1247,7 +1247,7 @@ test('the first read retries on the backoff and offers Try again only after ten 
   assert.ok(now >= TRY_AGAIN_AFTER_MS && now - 2000 < TRY_AGAIN_AFTER_MS);
 });
 
-test('an output limit and a model change reach the view with the numbers and models from the turns', () => {
+test('an output limit and a model change reach the view with the numbers and the line the controller stored', () => {
   const limit = { reasoningTokens: 3900, replyTokens: 700, allowedTokens: 4600 };
   assert.equal(
     outputLimitLine(limit),
@@ -1298,7 +1298,7 @@ test('an output limit and a model change reach the view with the numbers and mod
     at: '2026-10-23T10:05:00.000Z',
     cursor: '20',
     author: { kind: 'system', turnId: null },
-    text: 'Continued on OpenAI from OpenAI. Reason: model changed in the composer.',
+    text: 'Continued on OpenAI (large-2) from OpenAI (large-1). Reason: model changed in the composer.',
     attachments: [],
     files: [],
   };
@@ -1349,9 +1349,7 @@ test('an output limit and a model change reach the view with the numbers and mod
   const items = threadItems(state);
   const first = items.find((row) => row.kind === 'turn' && row.turn.id === id('trn', 1));
   assert.deepEqual(first?.kind === 'turn' && first.turn.outputLimit, limit);
+  // The view shows the line the controller stored, which already names both models.
   const line = items.find((row) => row.kind === 'system');
-  assert.deepEqual(line?.kind === 'system' && line.handoff, {
-    from: { family: 'openai', model: 'large-1' },
-    to: { family: 'openai', model: 'large-2' },
-  });
+  assert.equal(line?.kind === 'system' && line.text, note.text);
 });

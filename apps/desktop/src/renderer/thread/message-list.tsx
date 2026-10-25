@@ -147,17 +147,6 @@ function UserRow({
   );
 }
 
-// The line a model change writes, with both models named from the turns around it. The reason is
-// the one the controller wrote.
-function handoffLine(item: Extract<ThreadItem, { kind: 'system' }>): string {
-  if (!item.handoff) return item.text;
-  const { from, to } = item.handoff;
-  const reason = item.text.slice(item.text.lastIndexOf('Reason:'));
-  return `Continued on ${modelName(to)} from ${modelName(from)}. ${reason}`;
-}
-const modelName = (turn: { family: string; model: string }) =>
-  `${familyName(turn.family)} (${turn.model})`;
-
 function Row({
   item,
   taskId,
@@ -178,7 +167,7 @@ function Row({
     case 'system':
       return (
         <div className="th-system" role="status">
-          <span>{handoffLine(item)}</span>
+          <span>{item.text}</span>
         </div>
       );
     default:
