@@ -34,8 +34,8 @@ import {
   READ_LINES,
   RUN_SECONDS,
   RUN_TAIL_LINES,
+  readScratchFile,
   SEARCH_HITS,
-  scratchPath,
 } from '../../chat/local-tools.ts';
 import { cachedRepoMap } from '../../chat/repo-map.ts';
 
@@ -177,7 +177,7 @@ async function buildPrompt(
         get files() {
           return listFiles(root, request.environment);
         },
-        read: (path) => readFileSync(scratchPath(root, path).full, 'utf8'),
+        read: (path) => readScratchFile(root, path),
         budgetTokens: mapBudget,
       });
       const section = `\n\nProject outline, most imported files first:\n${map.text}`;

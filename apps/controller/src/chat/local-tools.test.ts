@@ -86,6 +86,12 @@ test('tools refuse paths that leave the scratch copy', async () => {
     symlinkSync(outside, join(scratch, 'link'));
     // A link whose target does not exist yet would create the file wherever it points.
     symlinkSync(join(outside, 'later.txt'), join(scratch, 'dangling.txt'));
+    // `here` is the copy itself, so the kernel takes `here/..` to the folder above it. Read as
+    // text, the same target names a decoy folder inside the copy.
+    symlinkSync('.', join(scratch, 'here'));
+    symlinkSync('here/../outside', join(scratch, 'escape'));
+    mkdirSync(join(scratch, 'outside'));
+    writeFileSync(join(scratch, 'outside', 'secret.txt'), 'decoy\n');
     mkdirSync(join(scratch, '.git'));
     writeFileSync(join(scratch, '.git', 'config'), '[core]\n');
     for (const [name, args, reason] of [
@@ -103,6 +109,8 @@ test('tools refuse paths that leave the scratch copy', async () => {
       ],
       ['write', { path: 'link/new.txt', content: 'x' }, /through a link/],
       ['write', { path: 'dangling.txt', content: 'x' }, /through a link/],
+      ['read_range', { path: 'escape/secret.txt', start: 1, end: 1 }, /through a link/],
+      ['write', { path: 'escape/new.txt', content: 'x' }, /through a link/],
       ['edit', { path: '.git/config', old: '[core]', new: '[hooks]' }, /inside \.git/],
     ] as const) {
       const outcome = await runTool(name, args, context);
