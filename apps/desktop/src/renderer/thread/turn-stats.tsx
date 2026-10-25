@@ -1,6 +1,6 @@
 import type { ChatOutputLimit, ChatTurnStats } from '@crewkite/contracts';
 import { FoldVertical } from 'lucide-react';
-import { outputSplit } from './output-limit.ts';
+import { statsSplit } from './output-limit.ts';
 import type { CompactedBlock, TurnView } from './turn-fold.ts';
 import './turn-stats.css';
 
@@ -16,7 +16,8 @@ export function statsLine(stats: ChatTurnStats, limit: ChatOutputLimit | null = 
   const parts: string[] = [];
   if (stats.contextUsed !== null && stats.contextCapacity !== null)
     parts.push(`Context ${count(stats.contextUsed)} of ${count(stats.contextCapacity)}`);
-  if (limit) parts.push(outputSplit(limit));
+  const split = statsSplit(stats, limit);
+  if (split) parts.push(split);
   if (stats.summaries > 0)
     parts.push(`${count(stats.summaries)} ${stats.summaries === 1 ? 'summary' : 'summaries'}`);
   if (stats.tokensPerSecond !== null) parts.push(`${Math.round(stats.tokensPerSecond)} tok/s`);

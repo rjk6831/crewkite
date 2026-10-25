@@ -30,12 +30,13 @@ export async function connectLocalModel(input: {
     if (!model) throw Error('No model is loaded in the Local app.');
     // The runtime lists a reasoning budget in the model's base configuration only when the loaded
     // model and its chat template can honor one. A model with only a thinking toggle lists none.
-    const base = await model.getBasePredictionConfig();
+    // A runtime that cannot answer still runs the turn, with no reasoning budget set.
+    const base = await model.getBasePredictionConfig().catch(() => null);
     return {
       model,
       // Every Local budget is a function of the context this instance reports.
       contextLength: await model.getContextLength(),
-      reasoningBudget: base.reasoningBudget !== undefined,
+      reasoningBudget: base?.reasoningBudget !== undefined,
       modelKey: model.modelKey,
       // True when the asked-for model is not loaded and the first loaded one stands in.
       fellBack: requested === undefined,

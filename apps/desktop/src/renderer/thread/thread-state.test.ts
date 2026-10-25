@@ -15,10 +15,11 @@ import type {
   ChatThread,
   ChatThreadRead,
   ChatTurn,
+  ChatTurnStats,
 } from '@crewkite/contracts';
 import { acceptsType, deliveryNote, deliveryOf, tryWithChoices } from './file-fit.ts';
 import { limitOffer, offerChoices } from './handoff-offer.ts';
-import { outputLimitLine, outputSplit } from './output-limit.ts';
+import { outputLimitLine, outputSplit, statsSplit } from './output-limit.ts';
 import {
   earlierCursor,
   FIRST_READ_BACKOFF,
@@ -1253,6 +1254,24 @@ test('an output limit and a model change reach the view with the numbers and mod
     'Reply stopped at the output limit: 3,900 reasoning and 700 reply of 4,600 allowed.',
   );
   assert.equal(outputSplit(limit), 'reasoning 3,900 · reply 700');
+  // Every Local turn shows its split from the stats. The limit stands in for a turn without one.
+  const stats: ChatTurnStats = {
+    tokensIn: 5000,
+    tokensOut: 1950,
+    tokensPerSecond: null,
+    firstTokenMs: null,
+    turnMs: 1000,
+    contextUsed: 6950,
+    contextCapacity: 8192,
+    summaries: 0,
+  };
+  const splits: [ChatTurnStats, typeof limit | null, string | null][] = [
+    [{ ...stats, reasoningTokens: 1310, replyTokens: 640 }, null, 'reasoning 1,310 · reply 640'],
+    [{ ...stats, reasoningTokens: 0, replyTokens: 1950 }, limit, 'reasoning 0 · reply 1,950'],
+    [stats, limit, 'reasoning 3,900 · reply 700'],
+    [stats, null, null],
+  ];
+  for (const [given, stopped, want] of splits) assert.equal(statsSplit(given, stopped), want);
   const meta = (
     n: number,
     model: string,
@@ -1302,8 +1321,8 @@ test('an output limit and a model change reach the view with the numbers and mod
         queued: [],
       },
       turns: [
-        meta(1, 'gpt-6-sol', '2026-10-23T10:00:00.000Z', limit),
-        meta(2, 'gpt-6.1-sol', '2026-10-23T10:06:00.000Z'),
+        meta(1, 'large-1', '2026-10-23T10:00:00.000Z', limit),
+        meta(2, 'large-2', '2026-10-23T10:06:00.000Z'),
       ],
       messages: [
         user(10, 'Go').payload as ChatMessage,
@@ -1316,7 +1335,7 @@ test('an output limit and a model change reach the view with the numbers and mod
             kind: 'assistant',
             turnId: id('trn', 1),
             family: 'openai',
-            model: 'gpt-6-sol',
+            model: 'large-1',
             role: 'assistant',
           },
           text: 'Partial reply',
@@ -1332,7 +1351,7 @@ test('an output limit and a model change reach the view with the numbers and mod
   assert.deepEqual(first?.kind === 'turn' && first.turn.outputLimit, limit);
   const line = items.find((row) => row.kind === 'system');
   assert.deepEqual(line?.kind === 'system' && line.handoff, {
-    from: { family: 'openai', model: 'gpt-6-sol' },
-    to: { family: 'openai', model: 'gpt-6.1-sol' },
+    from: { family: 'openai', model: 'large-1' },
+    to: { family: 'openai', model: 'large-2' },
   });
 });
