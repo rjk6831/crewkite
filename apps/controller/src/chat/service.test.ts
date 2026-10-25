@@ -1272,7 +1272,7 @@ test('accept and discard are refused while a turn is running', { timeout: 30000 
 test('discard restores, removes or recovers one path and refuses links and entries the copy never held', {
   timeout: 30000,
 }, async (t) => {
-  const { controller, adapter, task, run, send, read, source } = await chat(t, [
+  const { controller, adapter, task, run, send, read, source, command } = await chat(t, [
     [{ kind: 'text', itemId: 'reply', chunks: ['Edited.'] }],
   ]);
   const repo = (...args: string[]) => git(source.directory, args).toString('utf8').trim();
@@ -1343,6 +1343,8 @@ test('discard restores, removes or recovers one path and refuses links and entri
     listed?: string;
     /** Accept to this branch first. It takes the link from the base. */
     accept?: string;
+    /** The receipt commit fails after the restore, and the same key runs again. */
+    crash?: boolean;
   }[] = [
     {
       path: 'sentinels/executable.sh',
@@ -1367,6 +1369,12 @@ test('discard restores, removes or recovers one path and refuses links and entri
         assert.deepEqual(readFileSync(join(scratch, 'index.html')), committed('index.html')),
     },
     { path: 'index.html', reason: 'not-changed' },
+    {
+      path: 'net.mjs',
+      line: 'Discarded the changes to net.mjs. It matches the base commit',
+      crash: true,
+      check: () => assert.deepEqual(readFileSync(join(scratch, 'net.mjs')), committed('net.mjs')),
+    },
     { path: 'NOTES.md', reason: 'not-changed' },
     {
       path: 'NOTES.md',
@@ -1442,7 +1450,21 @@ test('discard restores, removes or recovers one path and refuses links and entri
       // The copy's version is still there, and Changes still says it will not be accepted.
       assert.equal(await listed(row.path), row.listed, row.accept);
     }
-    const result = await discard(row.path);
+    let result: CommandResult;
+    if (row.crash) {
+      const once = command('DiscardChatChange', { taskId: task.id, path: row.path }, task.revision);
+      const save = controller.store.saveReceipt;
+      controller.store.saveReceipt = () => {
+        throw new Error('Crash before the receipt commits.');
+      };
+      await assert.rejects(controller.execute(once, 'local-owner'), /Crash/);
+      controller.store.saveReceipt = save;
+      result = await controller.execute(once, 'local-owner');
+      const lines = (await read()).messages.filter((message) =>
+        message.text.startsWith(row.line ?? ''),
+      );
+      assert.equal(lines.length, 1, row.path);
+    } else result = await discard(row.path);
     if (row.reason) {
       assert.deepEqual([result.outcome, result.reason], ['blocked', row.reason], row.path);
       continue;
