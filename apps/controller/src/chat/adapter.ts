@@ -1,5 +1,6 @@
 import type {
   AgentEvent,
+  ChatAttachment,
   ChatFailure,
   ChatFamily,
   ChatModelSelection,
@@ -22,6 +23,13 @@ export type ChatTurnRequest = Readonly<{
   selection: ChatModelSelection;
   /** The user's text for this turn. A handoff packet is prepended by the controller. */
   prompt: string;
+  /**
+   * Files for this turn, stored under the controller home and outside the scratch copy. A turn
+   * that continues on another family also carries the files earlier messages attached.
+   * shortcut: optional so request fixtures built before files keep their shape. Upgrade: make it
+   * required once every fixture passes it.
+   */
+  files?: readonly Readonly<{ attachment: ChatAttachment; path: string }>[];
   /** CrewKite's framing for the model: project, scratch rules, what to do with results. */
   systemContext: string;
   /** Transcript so far, oldest first. Adapters with a resumable native session may ignore it. */

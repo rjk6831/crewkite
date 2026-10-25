@@ -1,5 +1,8 @@
-import { isAbsolute, relative, resolve, sep } from 'node:path';
-import type { ChatFamily } from '@crewkite/contracts';
+import { statSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import type { ChatAttachment, ChatFamily } from '@crewkite/contracts';
+import { anthropicInstructionFile } from '../providers/anthropic/instructions.ts';
+import { googleInstructionFile } from '../providers/google/instructions.ts';
 import type { ChatHistoryEntry } from './adapter.ts';
 
 export const familyName: Record<ChatFamily, string> = {
@@ -14,6 +17,24 @@ export type HandoffReason = 'manual' | 'limit' | 'steer';
 export function handoffReason(reason: HandoffReason): string {
   if (reason === 'steer') return 'the person sent a new message during the reply';
   return reason === 'limit' ? 'usage limit reached' : 'switched in the composer';
+}
+
+/**
+ * Instruction files at the scratch root, in the order systemContext reads them.
+ * shortcut: a stand-in with the name the project instructions work exports. Upgrade: keep that
+ * version when the two meet.
+ */
+export const instructionFiles = ['AGENTS.md', anthropicInstructionFile, googleInstructionFile];
+
+/** The instruction files the scratch copy holds, so the next provider knows where to look. */
+export function presentInstructions(directory: string): string[] {
+  return instructionFiles.filter((name) => {
+    try {
+      return statSync(join(directory, name)).isFile();
+    } catch {
+      return false;
+    }
+  });
 }
 
 export function systemContext(projectName: string, directory: string): string {
@@ -195,6 +216,10 @@ export function handoffPacket(input: {
   history: readonly ChatHistoryEntry[];
   files: readonly string[] | null;
   prompt: string;
+  /** Instruction files at the scratch root. The next provider reads them from the copy. */
+  instructions?: readonly string[];
+  /** Files the conversation carried. The request for the new message sends each of them again. */
+  attachments?: readonly Pick<ChatAttachment, 'name' | 'mimeType' | 'bytes'>[];
 }): string {
   const answers = input.history.flatMap((entry, index) =>
     entry.role === 'assistant' ? [index] : [],
@@ -224,6 +249,29 @@ export function handoffPacket(input: {
     'Earlier work is in the same scratch copy. Read files before you change them.',
     `Conversation so far, oldest first:\n\n${transcript.join('\n\n') || 'No earlier messages.'}`,
     `Files changed in the scratch copy against the base commit:\n${files}`,
+    ...(input.instructions?.length
+      ? [`Project instructions: ${input.instructions.join(', ')}`]
+      : []),
+    ...(input.attachments?.length
+      ? [
+          `Files the person attached in this thread. They come with the new message:\n${input.attachments
+            .map((file) => `${file.name} (${file.mimeType}, ${byteSize(file.bytes)})`)
+            .join('\n')}`,
+        ]
+      : []),
     `New message:\n${input.prompt}`,
   ].join('\n\n');
+}
+
+/** "812 bytes", "12.4 KiB", "3.0 MiB". */
+export function byteSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} ${bytes === 1 ? 'byte' : 'bytes'}`;
+  const units = ['KiB', 'MiB', 'GiB', 'TiB'];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${value.toFixed(1)} ${units[unit]}`;
 }
