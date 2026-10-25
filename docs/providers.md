@@ -32,7 +32,7 @@ Set up first: install the Anthropic client and sign in with your own subscriptio
 
 The usage gauge has two sources. Every turn streams rate limit frames, and each one fills the five-hour and weekly windows while the turn runs. A frame replaces only the windows it names. The client's `/usage` command adds the per-model windows. It runs when the controller starts, after each turn and on Refresh in Settings, at most once a minute and never beside another read. Neither source asks for consent. The resolved, hash-pinned client is the native trust profile of [ADR 0009](adr/0009-native-client-trust-profile.md), and the Google reader already runs by default. A failed `/usage` read keeps what the client wrote, its reply text and the end of its error output, up to 2,048 characters.
 
-Attachments: files go in the stream-json user message, before the text. JPEG, PNG, GIF and WebP images go as base64 image blocks, a PDF as a base64 document block and a UTF-8 `text/` file as a text document block. Any other file goes as a path line, and the thread's files folder joins the launch through `--add-dir` so the client's tools can read it. An `invalid_request` error with status 400 on a turn that sent blocks ends the turn as `attachment-rejected`.
+Attachments: files go in the stream-json user message, before the text. JPEG, PNG, GIF and WebP images go as base64 image blocks, a PDF as a base64 document block and a UTF-8 `text/` file as a text document block. Any other file goes as a path line, and the thread's files folder joins the launch through `--add-dir` so the client's tools can read it. An `invalid_request` error or status 400 on a turn that sent blocks ends the turn as `attachment-rejected`.
 
 Live qualification pending.
 
