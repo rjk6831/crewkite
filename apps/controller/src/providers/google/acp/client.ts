@@ -412,18 +412,22 @@ export type AcpProcessOptions = {
 
 export type AcpLimits = {
   maxTimeoutMs: number;
+  /** The largest single line CrewKite writes. A chat prompt carries attached files inline. */
+  lineBytes: number;
   stdoutBytes: number;
   frames: number;
   requests: number;
 };
 export const writerAcpLimits: AcpLimits = {
   maxTimeoutMs: 600000,
+  lineBytes: 1048576,
   stdoutBytes: 4194304,
   frames: 4096,
   requests: 128,
 };
 export const chatAcpLimits: AcpLimits = {
   maxTimeoutMs: 7200000,
+  lineBytes: 20971520,
   stdoutBytes: 134217728,
   frames: 262144,
   requests: 4096,
@@ -510,7 +514,7 @@ export class AcpConnection {
       throw this.failure ?? new AcpError('protocol', { site: 'write' });
     const line = `${JSON.stringify(value)}\n`;
     this.sent += Buffer.byteLength(line);
-    if (Buffer.byteLength(line) > 1048576 || this.sent > this.limits.stdoutBytes)
+    if (Buffer.byteLength(line) > this.limits.lineBytes || this.sent > this.limits.stdoutBytes)
       throw new AcpError('output-limit');
     this.output.write(line);
   }

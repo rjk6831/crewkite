@@ -22,6 +22,14 @@ export type DesktopCommand = Command extends infer Item
     : never
   : never;
 export type ConnectionState = 'connecting' | 'connected' | 'offline';
+/**
+ * A file main found for the composer. The renderer sends the path on to the controller and never
+ * opens it. `thumbnail` is a small PNG data URL, present only for an image main could decode.
+ */
+export type DesktopFile = { path: string; name: string; bytes: number; thumbnail: string | null };
+export type DesktopAttachInput =
+  | { from: 'picker' }
+  | { from: 'drop' | 'paste'; files: readonly File[] };
 export interface DesktopSource {
   getSnapshot(scope?: SnapshotScope): Promise<Snapshot>;
   workspaceState(): Promise<WorkspaceState>;
@@ -35,11 +43,25 @@ export interface DesktopSource {
   cancelArtifactVerification?(requestId: string): Promise<void>;
   subscribe(onEvent: (event: Event) => void): () => void;
   onConnection?(listener: (state: ConnectionState) => void): () => void;
+  openLink?(url: string): Promise<'opened' | 'declined' | 'refused'>;
+  attachFiles?(input: DesktopAttachInput): Promise<DesktopFile[]>;
   pickProject?(): Promise<CommandResult | null>;
   reconnect?(): Promise<void>;
   retryCommand?(expected?: DesktopCommand): Promise<CommandResult | null>;
   onNotice?(listener: (notice: DesktopNotice) => void): () => void;
+  /** Set the dock badge and post at most one system notification for a thread. */
+  threadAttention?(input: ThreadAttentionInput): Promise<void>;
+  /** A clicked thread notification asks the window to open that thread. */
+  onOpenThread?(listener: (taskId: string) => void): () => void;
 }
+export type ThreadAttentionInput = {
+  badge: number;
+  notice: {
+    taskId: string;
+    title: string;
+    kind: 'reply' | 'failed' | 'permission' | 'crew' | 'crew-stopped';
+  } | null;
+};
 
 export class ProtocolError extends Error {
   readonly reason: 'protocol-mismatch' | 'invalid-frame';

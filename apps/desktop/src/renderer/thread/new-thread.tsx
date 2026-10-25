@@ -1,11 +1,58 @@
-import { type Task, TaskSchema } from '@crewkite/contracts';
+import {
+  type ChatAttachment,
+  type ChatCatalogRead,
+  ChatFamilySchema,
+  type Task,
+  TaskSchema,
+} from '@crewkite/contracts';
 import { Folder } from 'lucide-react';
-import { useRef } from 'react';
+import { useRef, useState } from 'react';
+import { familyName } from '../components.tsx';
+import { focusSettingsCard } from '../settings/provider-card.tsx';
 import type { DesktopCommand } from '../source.ts';
-import { sendMessage, type ThreadSource } from './commands.ts';
+import { importAttachment, sendMessage, type ThreadSource } from './commands.ts';
 import { Composer, type ComposerHandle, type SendInput } from './composer.tsx';
 import { EmptyThread } from './empty-thread.tsx';
+import { FamilyMark } from './family-mark.tsx';
 import './thread.css';
+
+const NO_PROVIDER = 'Connect a provider in Settings';
+
+/** What New thread shows while no family is connected. Each family links to its Settings card. */
+function FirstRun({ onOpenSettings }: { onOpenSettings?: () => void }) {
+  return (
+    <div className="th-empty th-first-run">
+      <p>Connect a provider to start</p>
+      <p className="th-muted">
+        {onOpenSettings ? 'Pick one to open its card in Settings.' : 'Connect one in Settings.'}
+      </p>
+      <ul className="th-first-run-list" aria-label="Providers">
+        {ChatFamilySchema.options.map((family) => (
+          <li key={family}>
+            {onOpenSettings ? (
+              <button
+                type="button"
+                className="th-first-run-item"
+                onClick={() => {
+                  focusSettingsCard(family);
+                  onOpenSettings();
+                }}
+              >
+                <FamilyMark family={family} />
+                <span>{familyName(family)}</span>
+              </button>
+            ) : (
+              <span className="th-first-run-item">
+                <FamilyMark family={family} />
+                <span>{familyName(family)}</span>
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
 
 type Project = { id: string; name: string };
 
@@ -29,6 +76,7 @@ export function NewThread({
   onProject,
   onCreated,
   onAddProject,
+  onOpenSettings,
   blocked,
 }: {
   source: ThreadSource;
@@ -40,14 +88,21 @@ export function NewThread({
   onProject: (id: string) => void;
   onCreated: (taskId: string) => void;
   onAddProject: (() => void) | null;
+  /** Opens Settings. The first-run card focuses a family's card before calling it. */
+  onOpenSettings?: () => void;
   blocked: string | null;
 }) {
   // A send that fails after the task exists keeps the task, so a retry does not create a second one.
   const created = useRef<Task | null>(null);
   const composer = useRef<ComposerHandle>(null);
+  const [catalog, setCatalog] = useState<ChatCatalogRead | null>(null);
   const project = projects.find(({ id }) => id === projectId);
+  // Until the catalog is read, nothing says no family is connected, so Send stays open.
+  const firstRun = catalog !== null && !catalog.families.some((family) => family.connected);
 
-  async function send({ text, attachments, selection }: SendInput) {
+  // The first send creates the task. The files wait as paths until then, and the controller stores
+  // them under the new task before the message goes.
+  async function send({ text, files, selection }: SendInput) {
     if (!project) throw new Error('Choose a project first.');
     if (!created.current) {
       const result = await createTask({
@@ -60,13 +115,17 @@ export function NewThread({
         throw new Error(result.next ?? result.reason ?? 'The thread could not be created.');
       created.current = saved.data;
     }
+    const taskId = created.current.id;
+    const stored: ChatAttachment[] = [];
+    for (const item of files)
+      stored.push(item.file ?? (await importAttachment(source, taskId, item.path ?? '')));
     await sendMessage(source, {
-      taskId: created.current.id,
+      taskId,
       text,
-      attachments,
+      files: stored,
       ...(selection ? { selection } : {}),
     });
-    onCreated(created.current.id);
+    onCreated(taskId);
   }
 
   return (
@@ -90,7 +149,9 @@ export function NewThread({
         </header>
         <div className="th-scroll-frame">
           <div className="th-blank">
-            {project ? (
+            {project && firstRun ? (
+              <FirstRun onOpenSettings={onOpenSettings} />
+            ) : project ? (
               <EmptyThread onPick={(text) => composer.current?.fill(text)} />
             ) : (
               <div className="th-empty">
@@ -113,12 +174,16 @@ export function NewThread({
           running={false}
           context={null}
           currentFamily={null}
-          blocked={blocked ?? (project ? null : 'Add a project to send a message.')}
+          blocked={
+            blocked ??
+            (!project ? 'Add a project to send a message.' : firstRun ? NO_PROVIDER : null)
+          }
           notice={null}
           onSend={send}
           onStop={async () => {}}
           onConfigured={() => {}}
           onHandoff={async () => {}}
+          onCatalog={setCatalog}
         />
       </section>
     </div>

@@ -5,6 +5,7 @@ import { lineClass } from './cards.tsx';
 import {
   type Acceptance,
   acceptChanges,
+  discardChange,
   openPullRequest,
   pushBranch,
   readBranchStatus,
@@ -18,22 +19,22 @@ const refusals: Record<string, string> = {
   'no-changes': 'The scratch copy has no changes to accept.',
   'branch-exists': 'That branch already exists. Choose another name.',
   'branch-name-unsupported': 'Use lower case letters, digits, hyphens and slashes.',
-  'base-moved':
-    "The project moved past this thread's base commit. Start a new thread on the current commit.",
   'git-identity-missing': 'Set a Git name and email on this machine, then accept again.',
   'scratch-unreadable':
-    'The scratch copy holds links or special files. Ask the assistant to remove them.',
+    'The scratch copy holds new links or special files, or a link from the base commit changed. Restore them, then accept again.',
   'branch-not-created': 'The branch was not created. Choose another name and try again.',
 };
 
 type Files = ChatChangesRead['files'];
+type Skipped = NonNullable<ChatThread['skipped']>;
 
 // The diff each thread last accepted. While the Changes tab shows the same diff, the branch already
-// holds it and a second acceptance would only collide with that branch name.
+// holds it and a second acceptance would only collide with that branch name. The note says where
+// the branch starts when HEAD had moved, and it stays when the tab closes and opens again.
 // shortcut: kept while the window stays open. The thread record has the file count only, which
 // cannot prove the diff is the same, so after a restart the button is enabled again.
 // Upgrade: store a digest of the accepted diff on the thread record.
-const acceptedDiffs = new Map<string, { branch: string; files: Files }>();
+const acceptedDiffs = new Map<string, { branch: string; files: Files; note: string | null }>();
 
 const sameFiles = (left: Files, right: Files) =>
   left.length === right.length &&
@@ -259,6 +260,7 @@ function AcceptControl({
   thread,
   files,
   lastReply,
+  onAccepted,
 }: {
   source: ThreadSource;
   taskId: string;
@@ -266,6 +268,8 @@ function AcceptControl({
   thread: ChatThread | null;
   files: Files;
   lastReply: string | undefined;
+  /** The base advances to the accepted commit, so the diff needs a new read. */
+  onAccepted: () => void;
 }) {
   const [branch, setBranch] = useState(() => branchName(title, taskId));
   const [message, setMessage] = useState(() => suggestedMessage(title, lastReply));
@@ -277,6 +281,7 @@ function AcceptControl({
   const last = accepted ?? thread?.lastAcceptance ?? null;
   const diff = acceptedDiffs.get(taskId);
   const done = Boolean(last && diff?.branch === last.branch && sameFiles(diff.files, files));
+  const note = accepted?.note ?? (last && diff?.branch === last.branch ? diff.note : null);
 
   // The suggestion follows the last reply that wrote the copy. Once the person types, it stays
   // theirs.
@@ -295,8 +300,9 @@ function AcceptControl({
         ...(message.trim() ? { message: message.trim() } : {}),
       });
       if (answer.accepted) {
-        acceptedDiffs.set(taskId, { branch: answer.branch, files });
+        acceptedDiffs.set(taskId, { branch: answer.branch, files, note: answer.note });
         setAccepted(answer);
+        onAccepted();
       } else setRefusal(refusals[answer.reason] ?? answer.next ?? 'The changes were not accepted.');
     } catch (failure) {
       setRefusal(failure instanceof Error ? failure.message : 'The changes were not accepted.');
@@ -349,6 +355,11 @@ function AcceptControl({
             On branch {last.branch}
             {last.commit && ` (${last.commit.slice(0, 7)})`}
           </p>
+          {note && (
+            <p className="th-muted" role="status">
+              {note}
+            </p>
+          )}
           <CodeBlock lang="sh" text={`git switch ${last.branch}`} />
           <GitSteps
             source={source}
@@ -361,6 +372,108 @@ function AcceptControl({
         </>
       )}
     </form>
+  );
+}
+
+const skipReasons: Record<Skipped[number]['reason'], string> = {
+  'link-outside': 'link outside the repository',
+  submodule: 'submodule',
+  'path-encoding': 'name is not UTF-8',
+};
+
+// The thread record keeps at most 64 entries, so a full list may stand for more.
+function SkippedNote({ skipped }: { skipped: Skipped }) {
+  const count = skipped.length >= 64 ? '64 or more' : String(skipped.length);
+  return (
+    <details className="th-skipped">
+      <summary>
+        Skipped {count} {skipped.length === 1 ? 'entry' : 'entries'} the scratch copy cannot hold
+      </summary>
+      <ul>
+        {skipped.map((entry) => (
+          <li key={entry.path}>
+            <span className="th-path" title={entry.path}>
+              {entry.path}
+            </span>{' '}
+            ({skipReasons[entry.reason]})
+          </li>
+        ))}
+      </ul>
+    </details>
+  );
+}
+
+// Discard always asks first and names the file, because the scratch copy keeps no other version.
+function DiscardControl({
+  source,
+  taskId,
+  file,
+  running,
+  onDiscarded,
+}: {
+  source: ThreadSource;
+  taskId: string;
+  file: Files[number];
+  running: boolean;
+  onDiscarded: () => void;
+}) {
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [refusal, setRefusal] = useState<string | null>(null);
+  const added = file.patch?.startsWith('--- /dev/null\n') ?? false;
+
+  async function discard() {
+    setBusy(true);
+    setRefusal(null);
+    try {
+      const answer = await discardChange(source, { taskId, path: file.path });
+      if (answer.discarded) {
+        setConfirming(false);
+        onDiscarded();
+      } else setRefusal(answer.next ?? 'The file was not discarded.');
+    } catch (failure) {
+      setRefusal(failure instanceof Error ? failure.message : 'The file was not discarded.');
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <>
+      <button
+        type="button"
+        className="th-discard"
+        disabled={busy || running}
+        title={running ? 'Discard when the reply ends.' : undefined}
+        onClick={() => setConfirming(true)}
+      >
+        Discard
+      </button>
+      {confirming && (
+        <div className="th-discard-confirm">
+          <p>
+            {added
+              ? `Remove ${file.path}? This thread added it.`
+              : `Discard the changes to ${file.path}? It goes back to the base commit.`}
+          </p>
+          <button
+            type="button"
+            className="th-button"
+            disabled={busy || running}
+            onClick={() => void discard()}
+          >
+            Discard
+          </button>{' '}
+          <button type="button" className="th-button" onClick={() => setConfirming(false)}>
+            Cancel
+          </button>
+        </div>
+      )}
+      {refusal && (
+        <p className="th-error th-discard-confirm" role="alert">
+          {refusal}
+        </p>
+      )}
+    </>
   );
 }
 
@@ -385,9 +498,12 @@ export function ChangesPanel({
   const [data, setData] = useState<ChatChangesRead | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [open, setOpen] = useState<ReadonlySet<string>>(new Set());
+  // Discard and Accept change the diff without a turn, so they ask for their own read.
+  const [reads, setReads] = useState(0);
+  const reread = () => setReads((count) => count + 1);
   const focused = useRef<HTMLLIElement>(null);
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: refreshKey asks for a new read
+  // biome-ignore lint/correctness/useExhaustiveDependencies: refreshKey and reads ask for a new read
   useEffect(() => {
     let active = true;
     readChanges(source, taskId).then(
@@ -404,7 +520,7 @@ export function ChangesPanel({
     return () => {
       active = false;
     };
-  }, [source, taskId, refreshKey]);
+  }, [source, taskId, refreshKey, reads]);
   useEffect(() => {
     if (!focusPath) return;
     setOpen((current) => new Set(current).add(focusPath));
@@ -428,12 +544,15 @@ export function ChangesPanel({
       thread={thread}
       files={data.files}
       lastReply={lastReply}
+      onAccepted={reread}
     />
   );
+  const skipped = thread?.skipped?.length ? <SkippedNote skipped={thread.skipped} /> : null;
   if (data.files.length === 0)
     return (
       <div className="th-changes">
         {accept}
+        {skipped}
         <p className="th-muted">
           No edits yet. Changes made in the scratch copy appear here against the base commit.
         </p>
@@ -442,6 +561,7 @@ export function ChangesPanel({
   return (
     <div className="th-changes">
       {accept}
+      {skipped}
       <p className="th-muted">
         {data.files.length} {data.files.length === 1 ? 'file' : 'files'}{' '}
         <span className="is-add">+{additions}</span> <span className="is-del">-{deletions}</span>
@@ -451,7 +571,11 @@ export function ChangesPanel({
         {data.files.map((file) => {
           const expanded = open.has(file.path);
           return (
-            <li key={file.path} ref={file.path === focusPath ? focused : undefined}>
+            <li
+              key={file.path}
+              className="th-file"
+              ref={file.path === focusPath ? focused : undefined}
+            >
               <button
                 type="button"
                 aria-expanded={expanded}
@@ -468,6 +592,13 @@ export function ChangesPanel({
                 <span className="is-add">+{file.additions}</span>
                 <span className="is-del">-{file.deletions}</span>
               </button>
+              <DiscardControl
+                source={source}
+                taskId={taskId}
+                file={file}
+                running={Boolean(thread?.activeTurnId)}
+                onDiscarded={reread}
+              />
               {expanded &&
                 (file.patch ? (
                   <pre className="th-patch">

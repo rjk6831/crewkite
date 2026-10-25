@@ -11,10 +11,13 @@ import {
   type Observation,
 } from '@crewkite/contracts';
 import {
+  anthropicChatAccepts,
   anthropicChatEfforts,
   anthropicChatModels,
   anthropicDefaultChatModel,
 } from '../providers/anthropic/chat.ts';
+import type { GooglePromptCapabilities } from '../providers/google/chat.ts';
+import { LOCAL_TEXT_TYPES } from '../providers/local/chat.ts';
 import type { NativeProfileResolution } from '../providers/openai/profile.ts';
 import { windowState } from '../usage/index.ts';
 
@@ -25,6 +28,8 @@ type ObservedModel = {
   efforts: readonly string[];
   defaultEffort: string;
   hidden?: boolean;
+  /** What model/list reported the model takes, when the observation recorded it. */
+  inputModalities?: readonly string[];
 };
 
 export type ChatCatalogInput = {
@@ -33,7 +38,11 @@ export type ChatCatalogInput = {
   openAiModels: readonly ObservedModel[] | null;
   /** The model the Anthropic client named in its last usage read, or null. */
   anthropicModel?: string | null;
+  /** What the Google client's last initialize declared in this controller's life, or null. */
+  googlePrompt?: GooglePromptCapabilities | null;
   local: LocalSetup;
+  /** The vision flag the runtime reported for a model at the last Local connect, or null. */
+  localVision?: { modelKey: string; vision: boolean } | null;
   /**
    * The route windows the readers wrote, plus the Anthropic reading's windows, which belong to
    * no route. Only the fields the gauge needs, so a reading without a route can join.
@@ -68,14 +77,21 @@ function openai(input: ChatCatalogInput): Entry {
   // one it shows in its own picker before a hidden one.
   const listed =
     !models.length || models.some((value) => value.model === ready?.model && !value.hidden);
-  return entry(
-    input,
-    'openai',
-    !!ready,
-    profiles[0]?.reason,
-    models,
-    listed ? ready?.model : (models.find((value) => !value.hidden) ?? models[0]).model,
-  );
+  const fallback = listed
+    ? ready?.model
+    : (models.find((value) => !value.hidden) ?? models[0]).model;
+  // The default model's own report decides, since a thread starts on it. An observation from
+  // before the read kept modalities reports nothing.
+  const modalities = input.openAiModels?.find((value) => value.model === fallback)?.inputModalities;
+  return {
+    ...entry(input, 'openai', !!ready, profiles[0]?.reason, models, fallback),
+    accepts: modalities
+      ? [
+          ...(modalities.includes('image') ? ['image/*'] : []),
+          ...(modalities.includes('audio') ? ['audio/*'] : []),
+        ]
+      : null,
+  };
 }
 
 function anthropic(input: ChatCatalogInput): Entry {
@@ -87,14 +103,19 @@ function anthropic(input: ChatCatalogInput): Entry {
     ? anthropicChatModels.map((model) => chatModel(model, anthropicChatEfforts, 'default'))
     : [];
   const reported = anthropicChatModels.find((model) => model === input.anthropicModel);
-  return entry(
-    input,
-    'anthropic',
-    !!ready,
-    profiles[0]?.reason,
-    models,
-    reported ?? anthropicDefaultChatModel,
-  );
+  return {
+    ...entry(
+      input,
+      'anthropic',
+      !!ready,
+      profiles[0]?.reason,
+      models,
+      reported ?? anthropicDefaultChatModel,
+    ),
+    // The client's input protocol fixes these types for every model, so they hold wherever the
+    // client is installed.
+    accepts: profiles.length ? [...anthropicChatAccepts] : null,
+  };
 }
 
 function google(input: ChatCatalogInput): Entry {
@@ -104,14 +125,26 @@ function google(input: ChatCatalogInput): Entry {
   const models = (configuration?.model.supported ?? []).map((model) =>
     chatModel(model, thought?.supported ?? [], thought?.currentValue ?? 'default'),
   );
-  return entry(
-    input,
-    'google',
-    profile?.available === true,
-    profile?.reason,
-    models,
-    configuration?.model.currentValue,
-  );
+  // The agent declares its prompt blocks at each initialize. An embedded resource can carry any
+  // file, so that flag covers every type.
+  const declared = input.googlePrompt;
+  return {
+    ...entry(
+      input,
+      'google',
+      profile?.available === true,
+      profile?.reason,
+      models,
+      configuration?.model.currentValue,
+    ),
+    accepts: declared
+      ? [
+          ...(declared.image ? ['image/*'] : []),
+          ...(declared.audio ? ['audio/*'] : []),
+          ...(declared.embeddedContext ? ['*/*'] : []),
+        ]
+      : null,
+  };
 }
 
 function local(input: ChatCatalogInput): Entry {
@@ -121,6 +154,12 @@ function local(input: ChatCatalogInput): Entry {
     (choice) => choice.selectionId === input.local.selection?.selectionId,
   );
   const connected = input.local.connected === true;
+  // Text files are inlined for any model. Images need a model the runtime says has vision.
+  // shortcut: vision comes from the last connect, so it is unknown until a turn runs. Upgrade:
+  // a vision field on LocalModelChoice, read with getModelInfo at discovery.
+  const model = (selected ?? loaded[0])?.identity.modelKey;
+  const vision =
+    model !== undefined && input.localVision?.modelKey === model && input.localVision.vision;
   return {
     family: 'local',
     connected,
@@ -136,6 +175,7 @@ function local(input: ChatCatalogInput): Entry {
     // between launches. A machine that never set one up shows nothing.
     needsConnect: !connected && input.local.endpoint !== null,
     lastTurnStats: lastTurnStats(input, 'local'),
+    accepts: model === undefined ? null : [...(vision ? ['image/*'] : []), ...LOCAL_TEXT_TYPES],
   };
 }
 
@@ -161,6 +201,7 @@ function entry(
     // nothing about the account now, so it does not count.
     needsConnect: !connected && windows.some((window) => window.percent !== null),
     lastTurnStats: lastTurnStats(input, family),
+    accepts: null,
   };
 }
 

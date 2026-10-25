@@ -8,6 +8,7 @@ import {
   type WorkspaceStamp,
 } from '@crewkite/contracts';
 import { createDemoFixtures, createTestIds, DEMO_TIME } from '@crewkite/testkit';
+import { externalLink } from '../shared/external-link.ts';
 import { settingsPreview } from './settings/preview-data.ts';
 import type { DesktopCommand, DesktopSource } from './source.ts';
 import { createThreadScript } from './thread/preview-script.ts';
@@ -180,7 +181,19 @@ export function createPreviewSource(): DesktopSource {
         ];
         if (pattern && !fields.some((text) => pattern.test(text))) return [];
         const { id, projectId, title, state: status, waitingReason, revision, runId, next } = task;
-        return [{ id, projectId, title, state: status, waitingReason, revision, runId, next }];
+        return [
+          {
+            id,
+            projectId,
+            title,
+            state: status,
+            waitingReason,
+            revision,
+            runId,
+            next,
+            chatActivity: 'idle' as const,
+          },
+        ];
       });
     return {
       kind: 'task-page' as const,
@@ -212,6 +225,13 @@ export function createPreviewSource(): DesktopSource {
     onConnection(listener) {
       listener('connected');
       return () => {};
+    },
+    // The browser preview has no main process, so it opens the checked address itself.
+    openLink: async (url) => {
+      const target = externalLink(url);
+      if (!target) return 'refused';
+      window.open(target.href, '_blank', 'noopener,noreferrer');
+      return 'opened';
     },
   };
 }

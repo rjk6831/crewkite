@@ -34,6 +34,10 @@ export async function connectLocalModel(input: {
       modelKey: model.modelKey,
       // True when the asked-for model is not loaded and the first loaded one stands in.
       fellBack: requested === undefined,
+      // What the runtime reports for the loaded model. Images go only to a model that says yes.
+      vision: model.vision === true,
+      // Uploaded images live until this client is disposed, which is the end of the turn.
+      files: runtime.files,
       dispose,
     };
   } catch (error) {

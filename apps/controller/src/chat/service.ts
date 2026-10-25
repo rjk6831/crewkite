@@ -1,9 +1,11 @@
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { uptime } from 'node:os';
 import { join, resolve } from 'node:path';
 import {
   type AgentEvent,
   AgentEventSchema,
+  type Artifact,
+  type ChatAttachment,
   type ChatCatalogRead,
   ChatCatalogReadSchema,
   type ChatChangesRead,
@@ -25,6 +27,8 @@ import {
   ChatThreadSchema,
   type ChatToolKind,
   type ChatTurn,
+  type ChatTurnEventsRead,
+  ChatTurnEventsReadSchema,
   ChatTurnSchema,
   type Command,
   type CommandResult,
@@ -33,11 +37,14 @@ import {
   canonicalJson,
   type Event,
   MAX_CHAT_ENTRY_BYTES,
+  MAX_CHAT_TURN_EVENTS_BYTES,
   type Project,
   rankFamilies,
   type Task,
+  TaskSchema,
   writesScratch,
 } from '@crewkite/contracts';
+import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
 import type { ArtifactFiles } from '../artifacts/index.ts';
 import {
@@ -50,6 +57,7 @@ import {
   committedFiles,
   type FileContent,
   git,
+  type KeptEntry,
   materialize,
   readCandidateFiles,
 } from '../host/source.ts';
@@ -63,7 +71,24 @@ import {
   type ChatTurnResult,
   chatFailure,
 } from './adapter.ts';
-import { scratchChanges } from './changes.ts';
+import {
+  type DiscardOutcome,
+  deleteThreadBaseRef,
+  discardScratchPath,
+  readDiscardMark,
+  scratchChanges,
+  writeDiscardMark,
+  writeThreadBaseRef,
+} from './changes.ts';
+import {
+  dropStaged,
+  FileRefused,
+  filesFolder,
+  placeFile,
+  type StagedFile,
+  stageFile,
+  storedFile,
+} from './files.ts';
 import {
   type ChatGitHost,
   openChatPullRequest,
@@ -73,12 +98,14 @@ import {
 import { scratchPath } from './local-tools.ts';
 import {
   adviceContext,
+  byteSize,
   challengeContext,
   familyName,
   fixerBrief,
   type HandoffReason,
   handoffPacket,
   handoffReason,
+  presentInstructions,
   reviewContext,
   systemContext,
   withAttachments,
@@ -139,7 +166,7 @@ type Ending = {
   effort?: ChatModelSelection['effort'];
 };
 type FileDiff = ChatChangesRead['files'][number];
-type Message = Pick<ChatQueuedMessage, 'text' | 'role' | 'selection' | 'attachments'>;
+type Message = Pick<ChatQueuedMessage, 'text' | 'role' | 'selection' | 'attachments' | 'files'>;
 type LiveTurn = {
   taskId: string;
   role: ChatTurn['role'];
@@ -202,6 +229,9 @@ const PACKET_BYTES = 96 * 1024;
 const PACKET_PATCH_BYTES = 48 * 1024;
 const PACKET_TRANSCRIPT_BYTES = 24 * 1024;
 const PACKET_LISTED_FILES = 200;
+// Files of earlier messages that travel with a packet. The packet lists each one on a line.
+const EARLIER_FILES = 32;
+const EARLIER_FILE_LINE_BYTES = 8 * 1024;
 const PACKET_ENTRY_CHARACTERS = 8000;
 const CHECK_LINES = 5;
 const CHECK_CHARACTERS = 1500;
@@ -228,11 +258,25 @@ const WRITING_FLAGS =
 // would rewrite before the program sees it.
 const PLAIN_WORD = /^[A-Za-z0-9._/=:,+@%-]+$/;
 
+// The media type of the artifacts that hold large event output (commands/controller.ts).
+const EVENT_OUTPUT = 'application/vnd.crewkite.event+json';
+// One receipt per stored name. The same bytes under another name can carry another type.
+const fileKey = (taskId: string, file: Pick<ChatAttachment, 'id' | 'name'>) =>
+  `chat-file:${taskId}:${file.id}:${file.name}`;
+const NOT_STORED =
+  'CrewKite could not copy the file. Check the free disk space, then attach it again.';
 const blocked = (reason: string, next?: string): CommandResult => ({
   outcome: 'blocked',
   reason,
   ...(next ? { next } : {}),
 });
+const discardRefusals: Record<string, string> = {
+  'link-path': 'Discard leaves links the base commit does not hold, and paths under a link, alone.',
+  'skipped-path': 'The scratch copy does not hold this entry, so there is nothing to discard.',
+  'outside-copy': 'This path leads outside the scratch copy.',
+  'path-blocked': 'Another entry in the scratch copy sits at this path. Discard that one first.',
+  'not-changed': 'This file has no changes to discard.',
+};
 // The numbers are what the person looks for with ps. The next command checks them again.
 const ownershipUnknown = (groups: readonly number[], then: string) =>
   blocked('ownership-unknown', `Quit process ${groupNames(groups)}, then ${then}.`);
@@ -261,6 +305,10 @@ export class ChatService {
   private readonly deps: ChatServiceDeps;
   private readonly live = new Map<string, LiveTurn>();
   private closed = false;
+  /** The copy `importing` made, for the import command it commits next. */
+  private staged:
+    | { payload: Payload<'ImportChatAttachment'>; staged: StagedFile | CommandResult }
+    | undefined;
 
   constructor(deps: ChatServiceDeps) {
     this.deps = deps;
@@ -274,9 +322,22 @@ export class ChatService {
   sendMessage(payload: Payload<'SendChatMessage'>, effects: Effects): CommandResult {
     const task = this.task(payload.taskId);
     if (!task) return blocked('task-not-found');
+    // A queued message is checked now too, so the person hears about a missing file at send. Each
+    // file comes from what its import stored, so the type the controller detected decides how a
+    // provider reads the bytes.
+    // shortcut: the payload, the queued message and the user entry need at least one character of
+    // text, so a message with files and no text cannot be sent yet. Upgrade: allow empty text
+    // when files are present in those three schemas.
+    const files = payload.files.flatMap((file) => {
+      const stored = this.storedAttachment(task.id, file);
+      return stored ? [stored.attachment] : [];
+    });
+    if (files.length !== payload.files.length)
+      return blocked('file-not-found', 'Attach the file again, then send.');
+    const message = { ...payload, files };
     const { thread, left } = this.checkedThread(task);
     const free = !thread.activeTurnId && !left.length;
-    if (free && !thread.queued.length) return this.begin(task, thread, payload, effects);
+    if (free && !thread.queued.length) return this.begin(task, thread, message, effects);
     if (free) {
       // The oldest queued message goes first. One that cannot start any more, say on a family
       // that is gone, blocks the queue until it is removed, so the person hears about that one.
@@ -284,7 +345,7 @@ export class ChatService {
       if (started.outcome !== 'applied')
         return blocked('queue-blocked', 'Remove the first queued message, then send again.');
     }
-    return this.enqueue(task, payload);
+    return this.enqueue(task, message);
   }
 
   resolvePermission(payload: Payload<'ResolveChatPermission'>, effects: Effects): CommandResult {
@@ -415,7 +476,9 @@ export class ChatService {
 
   /**
    * Commit the scratch copy on the thread's base and point a new local branch at it. The
-   * project's checkout, index and HEAD stay as they are (ADR 0008).
+   * project's checkout, index and HEAD stay as they are (ADR 0008). The branch starts from the
+   * base whatever HEAD is now, because that base is what the person reviewed. The base then
+   * advances to the new commit, so a later Accept builds on this one.
    */
   accept(payload: Payload<'AcceptChatChanges'>, identity: GitIdentity | undefined): CommandResult {
     const task = this.task(payload.taskId);
@@ -441,23 +504,26 @@ export class ChatService {
       );
     }
     if (existing !== null) return blocked('branch-exists', 'Choose an unused branch name.');
-    // The person reviewed the diff against the base. A branch from an older commit would need a
-    // rebase they never saw.
-    if (this.head(task) !== base)
-      return blocked('base-moved', 'Start a new thread on the current commit.');
     if (!identity)
       return blocked('git-identity-missing', 'Configure a Git name and email before acceptance.');
     const scratch = this.scratchDirectory(task.id);
     let fileCount: number;
     let files: FileContent[];
+    let kept: KeptEntry[];
     try {
-      // The Changes tab count, so the system line matches what the person reviewed.
-      fileCount = scratchChanges(root, scratch, base, false).length;
-      files = readCandidateFiles(scratch, root, base);
+      const source = committedFiles(root, base, { scratch: true });
+      kept = source.kept;
+      // The Changes tab count, so the system line matches what the person reviewed. A base link
+      // the copy changed is listed there and comes from the base, so it is not counted.
+      const links = new Set(source.links.map((link) => link.path));
+      fileCount = scratchChanges(root, scratch, base, false).filter(
+        (file) => !links.has(file.path),
+      ).length;
+      files = readCandidateFiles(scratch, root, base, source);
     } catch {
       return blocked(
         'scratch-unreadable',
-        'Ask the assistant to remove links and special files from the scratch copy.',
+        'Remove new links and special files from the scratch copy.',
       );
     }
     if (!fileCount) return blocked('no-changes', 'Ask for a change in this thread first.');
@@ -470,6 +536,7 @@ export class ChatService {
         repository: work,
         base,
         files,
+        kept,
         identity,
         at,
         message: payload.message?.trim()
@@ -490,18 +557,27 @@ export class ChatService {
     } finally {
       rmSync(work, { recursive: true, force: true });
     }
+    // The new tree is the copy's files plus the base entries it left out, so the copy matches
+    // the new base and Changes starts empty.
+    this.pinBase(task, root, commit);
     this.putThread(task, {
       ...thread,
+      base: commit,
       lastAcceptance: { branch: payload.branch, at, fileCount, commit },
     });
+    const note =
+      this.head(task) === base
+        ? null
+        : `The branch starts at this thread's base commit ${base.slice(0, 7)}. HEAD stays where it is.`;
     this.appendEntry(task, {
       kind: 'chat-system',
       author: { kind: 'system', turnId: null },
-      text: `Accepted ${fileCount} ${fileCount === 1 ? 'file' : 'files'} to branch ${payload.branch}.`,
+      text: `Accepted ${fileCount} ${fileCount === 1 ? 'file' : 'files'} to branch ${payload.branch}.${note ? ` ${note}` : ''}`,
     });
     return {
       outcome: 'applied',
       data: { kind: 'chat-acceptance', branch: payload.branch, commit, fileCount },
+      ...(note ? { next: note } : {}),
     };
   }
 
@@ -540,6 +616,268 @@ export class ChatService {
   async branchStatus(payload: Payload<'ReadChatBranchStatus'>): Promise<CommandResult> {
     const status = await readChatBranchStatus(this.gitHost(), payload);
     return { outcome: 'applied', data: { kind: 'chat-branch-status', ...status } };
+  }
+
+  /**
+   * Copy the file of an import before `commit` opens the command's transaction, so a large file
+   * or one that downloads on open holds up no other thread. `commit` runs synchronously, and the
+   * import inside it only moves the copy into place.
+   */
+  async importing(
+    payload: Payload<'ImportChatAttachment'>,
+    commit: () => CommandResult,
+  ): Promise<CommandResult> {
+    if (!this.task(payload.taskId)) return commit();
+    let staged: StagedFile | CommandResult;
+    try {
+      staged = await stageFile(this.filesFolder(payload.taskId), payload.source);
+    } catch (error) {
+      staged =
+        error instanceof FileRefused
+          ? blocked('file-refused', error.message)
+          : blocked('file-not-stored', NOT_STORED);
+    }
+    this.staged = { payload, staged };
+    try {
+      return commit();
+    } finally {
+      this.staged = undefined;
+      if (!('outcome' in staged)) dropStaged(staged);
+    }
+  }
+
+  /**
+   * Move the copy `importing` made into place and journal it under its hash. The bytes land on
+   * disk before the command commits, so a rolled back import leaves a stored file no message
+   * names, and the next import of the same bytes reuses it.
+   */
+  importAttachment(payload: Payload<'ImportChatAttachment'>): CommandResult {
+    const task = this.task(payload.taskId);
+    if (!task) return blocked('task-not-found');
+    const staged = this.staged?.payload === payload ? this.staged.staged : undefined;
+    this.staged = undefined;
+    if (!staged) return blocked('file-not-stored', NOT_STORED);
+    if ('outcome' in staged) return staged;
+    try {
+      placeFile(this.filesFolder(task.id), staged);
+    } catch {
+      return blocked('file-not-stored', NOT_STORED);
+    }
+    const file = staged.attachment;
+    const data = { kind: 'chat-attachment', ...file } as const;
+    const key = fileKey(task.id, file);
+    if (!this.deps.store.receipt(key))
+      this.deps.store.saveReceipt(key, file.id, 'local-owner', { outcome: 'applied', data });
+    return { outcome: 'applied', data };
+  }
+
+  /**
+   * Run the message behind the newest turn again. Retry takes a failed or stopped turn. Regenerate
+   * takes a turn with a reply, writes a "Regenerated" line and keeps that reply. A selection on
+   * another family moves the thread through the handoff path, so the packet and the handoff line
+   * appear and the request carries the conversation's files.
+   */
+  retryTurn(payload: Payload<'RetryChatTurn'>, effects: Effects): CommandResult {
+    const task = this.task(payload.taskId);
+    if (!task) return blocked('task-not-found');
+    const { thread, left } = this.checkedThread(task);
+    const action = payload.mode === 'retry' ? 'retry' : 'regenerate';
+    if (thread.activeTurnId)
+      return blocked('turn-running', `Wait for the reply or stop it, then ${action}.`);
+    if (left.length) return ownershipUnknown(left, action);
+    const turn = this.turn(payload.turnId);
+    if (!turn || turn.taskId !== task.id) return blocked('turn-not-found');
+    if (turn.id !== this.newestTurn(task.id)?.id)
+      return blocked(
+        'turn-not-latest',
+        `Only the newest turn can be ${action === 'retry' ? 'retried' : 'regenerated'}.`,
+      );
+    if (payload.mode === 'retry' && turn.state !== 'failed' && turn.state !== 'stopped')
+      return blocked('turn-not-retryable', 'This turn finished. Regenerate runs it again.');
+    if (payload.mode === 'regenerate' && !turn.assistantMessageId)
+      return blocked('no-reply', 'This turn has no reply to regenerate. Retry runs it again.');
+    if (this.findEntry(task.id, turn.userMessageId)?.kind !== 'user-message')
+      return blocked('message-missing', 'Send the message again.');
+    const selection = this.pick(task, thread, payload.selection ?? turn.selection);
+    if ('outcome' in selection) return selection;
+    // A refusal still commits, so every check runs before the first write.
+    const base = thread.base ?? this.head(task);
+    if (!base)
+      return blocked('project-head-unavailable', 'Commit once in this project, then try again.');
+    const moved = this.moveForRetry(task, thread, turn, selection);
+    if (moved) return moved;
+    if (payload.mode === 'regenerate')
+      this.appendEntry(task, {
+        kind: 'chat-system',
+        author: { kind: 'system', turnId: null },
+        text: 'Regenerated',
+      });
+    this.openTurn(
+      task,
+      this.thread(task.id),
+      { selection, role: turn.role, messageId: turn.userMessageId, base },
+      effects,
+    );
+    return { outcome: 'applied', revision: task.revision };
+  }
+
+  /** A turn's stored events after the cursor, oldest first, in whole events up to the page cap. */
+  readTurnEvents(payload: Payload<'ReadChatTurnEvents'>): CommandResult {
+    if (!this.task(payload.taskId)) return blocked('task-not-found');
+    if (this.turn(payload.turnId)?.taskId !== payload.taskId)
+      return blocked('turn-not-found', 'Choose a turn of this thread.');
+    const page = turnEventPage(
+      this.deps.store,
+      payload.taskId,
+      payload.turnId,
+      payload.afterCursor ?? '0',
+    );
+    if (!page)
+      return blocked(
+        'turn-event-too-large',
+        'One stored event of this turn exceeds the page size. No events were skipped.',
+      );
+    return { outcome: 'applied', data: { kind: 'chat-turn-events', ...page } };
+  }
+
+  /**
+   * Put one path of the scratch copy back the way the thread's base has it. Changes then leaves it
+   * out, so Accept carries only what is left. A system line records each discard.
+   */
+  discardChange(payload: Payload<'DiscardChatChange'>, key?: string): CommandResult {
+    const task = this.task(payload.taskId);
+    if (!task) return blocked('task-not-found');
+    const { thread, left } = this.checkedThread(task);
+    if (thread.activeTurnId)
+      return blocked('turn-running', 'Wait for the reply or stop it, then discard.');
+    if (left.length) return ownershipUnknown(left, 'discard');
+    const root = this.deps.projectPath(task.projectId);
+    if (!root) return blocked('project-not-found', 'Add the project again, then discard.');
+    const base = thread.base;
+    if (!base || !thread.scratchReady)
+      return blocked('not-changed', 'This file has no changes to discard.');
+    // The copy changes before the receipt commits. A crash between the two leaves the mark, and the
+    // retry of that command finds the copy already restored. Its line rolled back with the
+    // receipt, so the retry answers applied and writes it.
+    const file = join(this.deps.home, 'chat', task.id, 'discard.json');
+    const mark = key ? readDiscardMark(file) : null;
+    const retried =
+      mark && mark.key === key && mark.path === payload.path && mark.base === base
+        ? mark.done
+        : null;
+    let outcome: DiscardOutcome;
+    try {
+      outcome = discardScratchPath(
+        root,
+        this.scratchDirectory(task.id),
+        base,
+        payload.path,
+        key ? (done) => writeDiscardMark(file, { key, path: payload.path, base, done }) : undefined,
+      );
+    } catch {
+      return blocked('scratch-unreadable', 'The scratch copy could not be read. Discard again.');
+    }
+    if (retried && 'refused' in outcome && outcome.refused === 'not-changed')
+      outcome = { done: retried };
+    if ('refused' in outcome) return blocked(outcome.refused, discardRefusals[outcome.refused]);
+    const short = base.slice(0, 7);
+    this.appendEntry(task, {
+      kind: 'chat-system',
+      author: { kind: 'system', turnId: null },
+      text:
+        outcome.done === 'removed'
+          ? `Discarded ${payload.path}, a file added in this thread.`
+          : outcome.done === 'recovered'
+            ? `Restored ${payload.path} from the base commit ${short}.`
+            : outcome.done === 'relinked'
+              ? `Restored the link ${payload.path} from the base commit ${short}.`
+              : `Discarded the changes to ${payload.path}. It matches the base commit ${short}.`,
+    });
+    return { outcome: 'applied' };
+  }
+
+  /** The thread's title is its task's title. A paste can carry line breaks, so spaces collapse. */
+  renameThread(payload: Payload<'RenameChatThread'>): CommandResult {
+    const task = this.task(payload.taskId);
+    if (!task) return blocked('task-not-found');
+    const title = payload.title.replace(/\s+/g, ' ').trim();
+    if (!title) return blocked('title-empty', 'Type a title for the thread.');
+    if (title === task.title) return { outcome: 'applied', entity: task, revision: task.revision };
+    const renamed = TaskSchema.parse({ ...task, title, revision: task.revision + 1 });
+    this.deps.store.put('task', renamed.id, renamed.revision, renamed);
+    this.deps.emit('task.updated', renamed.id, renamed.revision, renamed);
+    return { outcome: 'applied', entity: renamed, revision: renamed.revision };
+  }
+
+  /**
+   * Remove the thread, its conversation and its events. Branches it accepted stay in the
+   * repository. The delete is journaled under `chat-deleted:<task>` in the same commit, and the
+   * thread's folder under the controller home goes after commit. Startup removes any folder a
+   * crash left behind, so nothing of the thread comes back.
+   */
+  deleteThread(payload: Payload<'DeleteChatThread'>, effects: Effects): CommandResult {
+    const task = this.task(payload.taskId);
+    if (!task) return blocked('task-not-found');
+    const { thread, left } = this.checkedThread(task);
+    if (thread.activeTurnId)
+      return blocked('turn-running', 'Stop the reply, then delete the thread.');
+    // A process that outlived its turn may still write to the scratch copy.
+    if (left.length) return ownershipUnknown(left, 'delete the thread');
+    // A large event keeps its output in an artifact that only its activity row names. The rows go
+    // with the task, and the artifacts go after commit.
+    const outputs = this.deps.store.db
+      .prepare(
+        'SELECT artifact_id FROM activity_output WHERE cursor IN (SELECT cursor FROM events WHERE task_id=?)',
+      )
+      .all(task.id)
+      .map((row) => row.artifact_id as string);
+    if (task.runId || !this.deps.store.removeTask(task.id))
+      return blocked(
+        'thread-has-runs',
+        'This task has runs outside the chat, so it stays. Only a chat thread can be deleted.',
+      );
+    const files = `chat-file:${task.id}:`;
+    this.deps.store.db
+      .prepare('DELETE FROM receipts WHERE substr(command_key,1,length(?))=?')
+      .run(files, files);
+    this.deps.store.saveReceipt(
+      `chat-deleted:${task.id}`,
+      hashCanonical({ taskId: task.id }),
+      'local-owner',
+      { outcome: 'applied', entity: task },
+    );
+    effects.push(() => {
+      this.removeOutputs(outputs);
+      this.removeFromDisk(task);
+    });
+    return { outcome: 'applied' };
+  }
+
+  /**
+   * Remove event output artifacts that no activity row names, and each file once no artifact names
+   * its hash. The file goes before the record, so a crash between the two leaves a record that
+   * startup finds and removes.
+   */
+  private removeOutputs(ids: readonly string[]) {
+    const db = this.deps.store.db;
+    for (const id of ids) {
+      try {
+        const artifact = this.deps.store.get<Artifact>('artifact', id);
+        if (!artifact || artifact.mediaType !== EVENT_OUTPUT) continue;
+        if (db.prepare('SELECT 1 FROM activity_output WHERE artifact_id=?').get(id)) continue;
+        const shared = db
+          .prepare(
+            "SELECT 1 FROM entities WHERE kind='artifact' AND id<>? AND json_extract(body,'$.hash')=?",
+          )
+          .get(id, artifact.hash);
+        if (!shared) this.deps.artifacts.remove(artifact.hash);
+        this.deps.store.transaction(() =>
+          db.prepare("DELETE FROM entities WHERE kind='artifact' AND id=?").run(id),
+        );
+      } catch {
+        // Startup tries again while the record is there.
+      }
+    }
   }
 
   private gitHost(): ChatGitHost {
@@ -616,6 +954,7 @@ export class ChatService {
    * them is present. Messages queued before the restart start once their thread is free.
    */
   recover() {
+    this.sweepDeleted();
     const rows = this.deps.store.db
       .prepare(
         "SELECT id,task_id FROM chat_turns WHERE json_extract(body,'$.state') IN ('queued','running','waiting-permission') OR json_array_length(body,'$.groups')>0 ORDER BY task_id,sequence",
@@ -864,10 +1203,22 @@ export class ChatService {
     const directory = this.scratchDirectory(task.id);
     const prompt = withAttachments(message.text, message.attachments ?? [], directory, root);
     const history = this.history(task.id, message.cursor);
+    const writer = writesScratch(turn.role);
+    // A review or an opinion starts a fresh native session, so its brief always reaches the model.
+    // So does a rerun of a message that already has a reply: the old session holds that reply.
+    const fresh = writer && this.answeredBefore(turn);
+    // Anthropic and Google read no history in a new session, so a rerun on the family that
+    // answered carries the conversation before the message in a packet, as a handoff does.
+    const rerun = fresh && !turn.handoffFrom;
+    const carries = !!turn.handoffFrom || rerun;
+    const session =
+      writer && !fresh
+        ? (thread.sessions.find((value) => value.family === turn.selection.family) ?? null)
+        : null;
+    const files = this.turnFiles(task.id, message, carries, session ? turn.selection.family : null);
     const work = join(this.deps.home, 'chat', task.id, 'turns', turn.id);
     mkdirSync(work, { recursive: true, mode: 0o700 });
     const handoff = turn.handoffFrom ? this.takeHandoff(task) : null;
-    const writer = writesScratch(turn.role);
     // Balanced mode answers the safe asks itself, so the adapter sends every ask here whatever
     // the thread allows.
     const balanced = writer && thread.flightMode === 'balanced';
@@ -876,23 +1227,22 @@ export class ChatService {
       taskId: task.id,
       role: turn.role,
       selection: turn.selection,
-      prompt: turn.handoffFrom
+      prompt: carries
         ? this.packet(turn, {
-            from: turn.handoffFrom,
-            reason: handoff?.reason ?? 'manual',
+            from: turn.handoffFrom ?? turn.selection.family,
+            reason: handoff?.reason ?? (rerun ? 'rerun' : 'manual'),
             root,
             base: thread.base,
             history,
             prompt,
+            files,
           })
         : prompt,
+      files,
       systemContext: this.context(turn, project.name, directory, root, thread, history),
-      // The packet carries the transcript, so a handoff turn sends no separate history.
-      history: turn.handoffFrom ? [] : history,
-      // A review or an opinion starts a fresh native session, so its brief always reaches the model.
-      session: writer
-        ? (thread.sessions.find((session) => session.family === turn.selection.family) ?? null)
-        : null,
+      // The packet carries the transcript, so a turn with a packet sends no separate history.
+      history: carries ? [] : history,
+      session,
       scratch: { directory, base: thread.base, projectName: project.name },
       work: { directory: work, home: this.deps.home },
       permissionPolicy: writer && !balanced ? thread.permissionPolicy : 'ask',
@@ -907,15 +1257,40 @@ export class ChatService {
 
   private ensureScratch(task: Task, root: string): ChatThread {
     const thread = this.thread(task.id);
-    if (thread.scratchReady) return thread;
     if (!thread.base) throw Error('The thread has no base commit.');
+    // A thread from before the ref existed gets one on its next turn.
+    if (thread.scratchReady) {
+      this.pinBase(task, root, thread.base);
+      return thread;
+    }
     const directory = this.scratchDirectory(task.id);
     // An interrupted copy leaves a partial directory that no turn has used yet.
     rmSync(directory, { recursive: true, force: true });
-    materialize(directory, committedFiles(root, thread.base));
+    const source = committedFiles(root, thread.base, { scratch: true });
+    materialize(directory, source.files, source.links);
+    this.pinBase(task, root, thread.base);
+    // The thread record travels in every chat.thread event, so it keeps the first 64 entries.
+    // shortcut: a longer list shows as 64 or more. Upgrade: a total count on the thread record.
+    const skipped = source.skipped.slice(0, 64);
     return this.deps.store.transaction(() =>
-      this.putThread(task, { ...this.thread(task.id), scratchReady: true }),
+      this.putThread(task, {
+        ...this.thread(task.id),
+        scratchReady: true,
+        ...(skipped.length ? { skipped } : {}),
+      }),
     );
+  }
+
+  /**
+   * Keep the thread's base reachable from a ref of its own. A failed write leaves the thread
+   * working, and the next turn or Accept writes it again.
+   */
+  private pinBase(task: Task, root: string, base: string) {
+    try {
+      writeThreadBaseRef(root, task.id, base);
+    } catch {
+      // The accepted branch or HEAD still holds the base until the person deletes it.
+    }
   }
 
   private record(turn: ChatTurn, live: LiveTurn, value: AgentEvent, settling = false) {
@@ -1301,7 +1676,7 @@ export class ChatService {
     const started = this.begin(
       task,
       saved,
-      { text, role: CREW_ROLES[step], selection, attachments: [] },
+      { text, role: CREW_ROLES[step], selection, attachments: [], files: [] },
       effects,
     );
     if (started.outcome !== 'applied')
@@ -1442,6 +1817,7 @@ export class ChatService {
         text: input.text,
         role: input.role,
         attachments: input.attachments,
+        files: input.files,
         ...(own ? { selection } : {}),
       },
     ];
@@ -1642,7 +2018,7 @@ export class ChatService {
         : history.findLast((entry) => entry.role === 'assistant')?.text) ?? null;
     if (role === 'advisor') return adviceContext(name, directory, answer);
     if (role === 'challenger') return challengeContext(name, directory, answer);
-    if (role !== 'reviewer') return systemContext(name, directory);
+    if (role !== 'reviewer') return systemContext(name, directory, turn.selection.family);
     const base = thread.base ?? '';
     let files: ChatChangesRead['files'] | null = null;
     try {
@@ -1687,6 +2063,7 @@ export class ChatService {
       base: string;
       history: readonly ChatHistoryEntry[];
       prompt: string;
+      files: NonNullable<ChatTurnRequest['files']>;
     },
   ): string {
     const changes = this.scratchDiff(turn.taskId, input.root, input.base);
@@ -1700,6 +2077,8 @@ export class ChatService {
         history,
         files: [...changeList(changes), ...stopped, ...patches, ...checks],
         prompt: input.prompt,
+        instructions: presentInstructions(this.scratchDirectory(turn.taskId)),
+        attachments: input.files.map((file) => file.attachment),
       });
     const room = PACKET_BYTES - Buffer.byteLength(build([], []));
     const patches = changes
@@ -1756,6 +2135,169 @@ export class ChatService {
 
   private scratchDirectory(taskId: string) {
     return join(this.deps.home, 'chat', taskId, 'scratch');
+  }
+
+  private filesFolder(taskId: string) {
+    return filesFolder(this.deps.home, taskId);
+  }
+
+  /**
+   * The files a turn sends. A turn with a packet also sends the files of the earlier messages the
+   * packet can quote, marked earlier, so the adapter names each one and never refuses the turn
+   * over it. A resumed session already holds the files of the messages it ran, so those stay out.
+   * The newest 32 earlier files go, and their lines in the packet stay under 8 KiB, so the
+   * transcript keeps its room. A file of the message itself that is gone fails the turn. An
+   * earlier one that is gone is left out.
+   */
+  private turnFiles(
+    taskId: string,
+    message: ConversationEntry,
+    carries: boolean,
+    resumed: ChatFamily | null,
+  ): NonNullable<ChatTurnRequest['files']> {
+    const own = message.kind === 'user-message' ? (message.files ?? []) : [];
+    const key = (attachment: ChatAttachment) => `${attachment.id}/${attachment.name}`;
+    const seen = new Set<string>();
+    const files: NonNullable<ChatTurnRequest['files']>[number][] = [];
+    for (const attachment of own) {
+      if (seen.has(key(attachment))) continue;
+      seen.add(key(attachment));
+      const stored = this.storedAttachment(taskId, attachment);
+      if (!stored) throw Error(`${attachment.name} is no longer stored. Attach it again and send.`);
+      files.push(stored);
+    }
+    if (!carries) return files;
+    const earlier: typeof files = [];
+    let listed = 0;
+    for (const attachment of this.earlierFiles(taskId, message.cursor, resumed)) {
+      if (earlier.length === EARLIER_FILES) break;
+      if (seen.has(key(attachment))) continue;
+      seen.add(key(attachment));
+      const stored = this.storedAttachment(taskId, attachment);
+      if (!stored) continue;
+      const { name, mimeType, bytes } = stored.attachment;
+      listed += Buffer.byteLength(`${name} (${mimeType}, ${byteSize(bytes)})\n`);
+      if (listed > EARLIER_FILE_LINE_BYTES) break;
+      earlier.push({ ...stored, earlier: true });
+    }
+    return [...earlier.reverse(), ...files];
+  }
+
+  /**
+   * A file as its import stored it, with the type the controller detected, and where it is. Null
+   * when this thread never imported that id under that name, or the copy is gone.
+   */
+  private storedAttachment(
+    taskId: string,
+    file: Pick<ChatAttachment, 'id' | 'name'>,
+  ): { attachment: ChatAttachment; path: string } | null {
+    const data = this.deps.store.receipt(fileKey(taskId, file))?.result.data;
+    if (data?.kind !== 'chat-attachment') return null;
+    const { kind: _kind, ...attachment } = data;
+    const path = storedFile(this.filesFolder(taskId), attachment);
+    return path ? { attachment, path } : null;
+  }
+
+  /**
+   * Files on the user messages inside the packet's transcript window, newest first. With a
+   * resumed session, the messages a writing turn on its family ran are left out.
+   */
+  private earlierFiles(
+    taskId: string,
+    beforeCursor: string,
+    resumed: ChatFamily | null,
+  ): ChatAttachment[] {
+    const ran = this.deps.store.db.prepare(
+      "SELECT 1 FROM chat_turns WHERE task_id=? AND json_extract(body,'$.userMessageId')=? AND json_extract(body,'$.selection.family')=? AND json_extract(body,'$.role') IN ('assistant','fixer')",
+    );
+    return this.deps.store.db
+      .prepare(
+        "SELECT body FROM conversation_entries WHERE task_id=? AND sequence<? AND json_extract(body,'$.kind') IN ('user-message','chat-assistant') ORDER BY sequence DESC LIMIT ?",
+      )
+      .all(taskId, BigInt(beforeCursor), HISTORY_LIMIT)
+      .flatMap((row) => {
+        const entry = ConversationEntrySchema.parse(JSON.parse(row.body as string));
+        if (entry.kind !== 'user-message') return [];
+        if (resumed && ran.get(taskId, entry.id, resumed)) return [];
+        return [...(entry.files ?? [])].reverse();
+      });
+  }
+
+  /** True when an earlier turn on the same message finished with a reply. */
+  private answeredBefore(turn: ChatTurn): boolean {
+    return !!this.deps.store.db
+      .prepare(
+        "SELECT 1 FROM chat_turns WHERE task_id=? AND sequence<? AND json_extract(body,'$.userMessageId')=? AND json_extract(body,'$.state')='done' AND json_extract(body,'$.assistantMessageId') IS NOT NULL",
+      )
+      .get(turn.taskId, turn.sequence, turn.userMessageId);
+  }
+
+  /**
+   * Move the thread for a rerun on another family. The builder takes the handoff path, which
+   * writes the line and leaves the packet for the turn. A fixer gets the packet and the line and
+   * leaves the thread's own pick alone, as a limit rerun does. A read-only role starts fresh with
+   * its own brief. Returns a refusal, or nothing when the turn can open.
+   */
+  private moveForRetry(
+    task: Task,
+    thread: ChatThread,
+    turn: ChatTurn,
+    selection: ChatModelSelection,
+  ): CommandResult | undefined {
+    if (!writesScratch(turn.role)) return;
+    const from = this.answeredOn(task.id) ?? thread.selection?.family;
+    if (!from || from === selection.family) return;
+    if (turn.role === 'assistant') {
+      const moved = this.handoff({ taskId: task.id, selection, reason: 'manual' });
+      return moved.outcome === 'applied' ? undefined : moved;
+    }
+    this.setHandoff(task.id, { from, reason: 'manual' });
+    this.appendEntry(task, {
+      kind: 'chat-system',
+      author: { kind: 'system', turnId: null },
+      text: `Continued on ${familyName[selection.family]} from ${familyName[from]}. Reason: ${handoffReason('manual')}.`,
+    });
+  }
+
+  /**
+   * The base ref in the project, then the thread's whole folder: scratch copy, files and per-turn
+   * work folders. The folder goes last, so a folder still present means the ref may be too.
+   */
+  private removeFromDisk(task: Task) {
+    const root = this.deps.projectPath(task.projectId);
+    try {
+      if (root) deleteThreadBaseRef(root, task.id);
+    } catch {
+      // A ref left behind keeps one commit alive and changes nothing else.
+    }
+    try {
+      rmSync(join(this.deps.home, 'chat', task.id), { recursive: true, force: true });
+    } catch {
+      // Startup tries again while the folder is there.
+    }
+  }
+
+  /** Finish a delete whose effect never ran because the controller stopped first. */
+  private sweepDeleted() {
+    const rows = this.deps.store.db
+      .prepare("SELECT command_key FROM receipts WHERE substr(command_key,1,13)='chat-deleted:'")
+      .all() as { command_key: string }[];
+    for (const { command_key: key } of rows) {
+      const task = this.deps.store.receipt(key)?.result.entity as Task | undefined;
+      if (task?.id === key.slice('chat-deleted:'.length) && /^tsk_[A-Za-z0-9]+$/.test(task.id))
+        if (existsSync(join(this.deps.home, 'chat', task.id))) this.removeFromDisk(task);
+    }
+    // An event output artifact and its activity row are written together, so one with no row is
+    // left from a delete.
+    if (rows.length)
+      this.removeOutputs(
+        this.deps.store.db
+          .prepare(
+            "SELECT id FROM entities WHERE kind='artifact' AND json_extract(body,'$.mediaType')=? AND id NOT IN (SELECT artifact_id FROM activity_output)",
+          )
+          .all(EVENT_OUTPUT)
+          .map((row) => row.id as string),
+      );
   }
 
   private task(taskId: string): Task | undefined {
@@ -1929,6 +2471,68 @@ export class ChatService {
 }
 
 const MAX_CURSOR = 9223372036854775807n;
+// A stored row carries the event envelope around the agent event, and the envelope is far
+// smaller than this margin. A longer row can never fit a page.
+const TURN_EVENT_ROW_MARGIN = 64 * 1024;
+const TURN_EVENT_PAGE_EVENTS = 5000;
+
+/**
+ * Null when the first event after the cursor alone exceeds the page. The size counts the kind tag
+ * and the longest continuation cursor, so the page fits whatever cursor it ends on.
+ */
+function turnEventPage(
+  store: Store,
+  taskId: string,
+  turnId: string,
+  afterCursor: string,
+): ChatTurnEventsRead | null {
+  const after = BigInt(afterCursor);
+  const rows = store.db
+    .prepare(
+      `SELECT CAST(cursor AS TEXT) AS cursor,
+      CASE WHEN length(CAST(body AS BLOB))<=? THEN body END AS body FROM events
+      WHERE task_id=? AND cursor>? AND json_extract(body,'$.type')='agent.event'
+      AND json_extract(body,'$.payload.turnId')=? ORDER BY cursor`,
+    )
+    .iterate(
+      MAX_CHAT_TURN_EVENTS_BYTES + TURN_EVENT_ROW_MARGIN,
+      taskId,
+      after > MAX_CURSOR ? MAX_CURSOR : after,
+      turnId,
+    );
+  const events: AgentEvent[] = [];
+  let bytes = size({
+    kind: 'chat-turn-events',
+    taskId,
+    turnId,
+    events: [],
+    nextAfterCursor: String(MAX_CURSOR),
+  });
+  let last: string | null = null;
+  let more = false;
+  for (const row of rows) {
+    const event =
+      row.body === null
+        ? null
+        : AgentEventSchema.parse((JSON.parse(row.body as string) as Event).payload);
+    // Every event after the first is preceded by a comma in the array.
+    const added = event ? size(event) + (events.length ? 1 : 0) : Number.POSITIVE_INFINITY;
+    if (events.length === TURN_EVENT_PAGE_EVENTS || bytes + added > MAX_CHAT_TURN_EVENTS_BYTES) {
+      if (!events.length) return null;
+      more = true;
+      break;
+    }
+    events.push(event as AgentEvent);
+    bytes += added;
+    last = row.cursor as string;
+  }
+  return ChatTurnEventsReadSchema.parse({
+    taskId,
+    turnId,
+    events,
+    nextAfterCursor: more ? last : null,
+  });
+}
 
 function chatMessage(entry: ConversationEntry): ChatMessage | undefined {
   const common = {
@@ -1939,9 +2543,14 @@ function chatMessage(entry: ConversationEntry): ChatMessage | undefined {
     text: entry.text,
   };
   if (entry.kind === 'user-message')
-    return { ...common, author: { kind: 'user' }, attachments: entry.attachments ?? [] };
+    return {
+      ...common,
+      author: { kind: 'user' },
+      attachments: entry.attachments ?? [],
+      files: entry.files ?? [],
+    };
   return entry.kind === 'chat-assistant' || entry.kind === 'chat-system'
-    ? { ...common, author: entry.author, attachments: [] }
+    ? { ...common, author: entry.author, attachments: [], files: [] }
     : undefined;
 }
 
@@ -1951,6 +2560,7 @@ function userEntry(input: Message): EntryDraft {
     author: { kind: 'user' },
     text: input.text,
     ...(input.attachments.length ? { attachments: input.attachments } : {}),
+    ...(input.files.length ? { files: input.files } : {}),
   };
 }
 

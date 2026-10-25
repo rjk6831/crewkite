@@ -14,7 +14,10 @@
 //   {"id":3,"method":"account/rateLimits/read","params":{"supportsLunaReserve":false,"excludeResetCreditDetails":true}}
 //   {"id":4,"method":"thread/start","params":{"model":M,"modelProvider":"openai","cwd":SCRATCH,"approvalPolicy":"untrusted"|"on-request","approvalsReviewer":"user","sandbox":"workspace-write","serviceTier":"default","ephemeral":false}}
 //   {"id":4,"method":"thread/resume","params":{"threadId":T, same settings without ephemeral,"excludeTurns":true}}
-//   {"id":5,"method":"turn/start","params":{"threadId":T,"input":[{"type":"text","text":TEXT}],"effort":E}}, effort left out for default
+//   {"id":4,"method":"model/list","params":{"limit":100,"includeHidden":true}}, before the thread
+//     only when the turn carries an image or audio file
+//   {"id":5,"method":"turn/start","params":{"threadId":T,"input":[{"type":"text","text":TEXT}],"effort":E}}, effort left out for default,
+//     with {"type":"localImage","path":P} or {"type":"localAudio","path":P} before the text for each such file
 //   {"id":R,"result":{"decision":"accept"|"acceptForSession"|"decline"}}, the answer to approval request R
 //   {"id":N,"method":"turn/interrupt","params":{"threadId":T,"turnId":U}}
 //
@@ -22,6 +25,7 @@
 //   {"id":n,"result":...} or {"id":n,"error":{"code":C,"message":S}}
 //   account/read result {"account":{"type":"chatgpt"}|null}
 //   account/rateLimits/read result {"ordinaryUsageAllowed":B,"rateLimits":{"limitId","primary":{"usedPercent","windowDurationMins","resetsAt"}}}
+//   model/list result {"data":[{"model","inputModalities":["text","image","audio"],...}],"nextCursor"}
 //   thread/start and thread/resume result {"thread":{"id":T},"reasoningEffort":E}, the effort a
 //     turn that sends none runs at; turn/start result {"turn":{"id":U}}
 //   {"id":R,"method":"item/commandExecution/requestApproval","params":{"threadId","turnId","itemId","reason","command","cwd"}},
@@ -57,6 +61,7 @@ import {
   type ChatSession,
   type ChatToolKind,
 } from '@crewkite/contracts';
+import type { ChatTurnRequest } from '../../chat/adapter.ts';
 import { spawnCheckChild as spawn } from '../../host/check-ownership.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
 import { openAiChatAdapter } from './chat.ts';
@@ -163,6 +168,7 @@ input.on('line', (line) => {
     result = { thread: { id: threadId } };
   }
   if (value.method === 'turn/start') result = { turn: running };
+  if (value.method === 'model/list') result = { data: [{ id: 'gpt-6.1-sol', model: 'gpt-6.1-sol', hidden: false, inputModalities: given.modalities ?? ['text', 'image'] }], nextCursor: null };
   if (value.method === 'turn/interrupt') result = {};
   send({ id: value.id, result });
   if (value.method === 'turn/start') play(scenario);
@@ -181,6 +187,17 @@ const turnId = 'trn_01M51M322B2AEBXD9MA74CBCFM';
 const prompt = 'What does this project do?';
 const systemContext = 'You are working in a scratch copy of demo.';
 const strip = (events: AgentEvent[]) => events.map(({ turnId: _turnId, ...rest }) => rest);
+// Stored files as the controller lays them out: <files folder>/<sha256>/<name>.
+function file(name: string, mimeType: string, bytes = Buffer.from(name)) {
+  const id = createHash('sha256').update(bytes).digest('hex');
+  const path = join(root, 'files', id, name);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, bytes);
+  return { attachment: { id, name, mimeType, bytes: bytes.length }, path };
+}
+type File = ReturnType<typeof file> & { earlier?: boolean };
+const png = file('screen.png', 'image/png');
+const pdf = file('spec.pdf', 'application/pdf');
 
 function turn(
   scenario: string,
@@ -202,7 +219,10 @@ function turn(
       grantRoot?: string;
       error?: { message: string; codexErrorInfo: string | null };
       silent?: boolean;
+      /** What model/list reports the selected model takes. Text and image when left out. */
+      modalities?: string[];
     };
+    files?: File[];
     /** Runs on the empty scratch copy before the turn starts. */
     prepare?: (scratch: string) => void;
     schedule?: Schedule;
@@ -230,29 +250,28 @@ function turn(
     },
     schedule: options.schedule,
   });
-  const handle = adapter.startTurn(
-    {
-      turnId,
-      taskId: 'tsk_01M51M322B2AEBXD9MA74CBCFM',
-      role: 'assistant',
-      selection: { family: 'openai', model: 'gpt-6.1-sol', effort: options.effort ?? 'low' },
-      prompt,
-      systemContext,
-      history: [],
-      session: options.session ?? null,
-      scratch: { directory: scratch, base: 'a'.repeat(40), projectName: 'demo' },
-      work: { directory: work, home },
-      permissionPolicy: options.permissionPolicy ?? 'ask',
-      permissionGrants: options.permissionGrants ?? [],
-      deadlineMs: 10_000,
-      environment,
-      now: () => Date.parse('2026-10-23T12:00:00.000Z'),
-    },
-    (event) => {
-      events.push(event);
-      for (const listener of listeners) listener(event);
-    },
-  );
+  const request: ChatTurnRequest & { files: File[] } = {
+    turnId,
+    taskId: 'tsk_01M51M322B2AEBXD9MA74CBCFM',
+    role: 'assistant',
+    selection: { family: 'openai', model: 'gpt-6.1-sol', effort: options.effort ?? 'low' },
+    prompt,
+    systemContext,
+    history: [],
+    session: options.session ?? null,
+    scratch: { directory: scratch, base: 'a'.repeat(40), projectName: 'demo' },
+    work: { directory: work, home },
+    permissionPolicy: options.permissionPolicy ?? 'ask',
+    permissionGrants: options.permissionGrants ?? [],
+    deadlineMs: 10_000,
+    environment,
+    now: () => Date.parse('2026-10-23T12:00:00.000Z'),
+    files: options.files ?? [],
+  };
+  const handle = adapter.startTurn(request, (event) => {
+    events.push(event);
+    for (const listener of listeners) listener(event);
+  });
   return {
     handle,
     events,
@@ -510,14 +529,16 @@ test('an unknown notification goes to the turn trace and never the thread, and t
   assert.equal(result.assistantText, 'Done.');
 });
 
-test('only a used-up plan ends the turn as a limit with the reset time', async () => {
+test('only a used-up plan ends the turn as a limit with the reset time, and only a turn that sent an image names it in a bad request', async () => {
   // The client's error code decides. The text decides only when the code is missing, and a
   // transient rate limit stays an ordinary error that a resend can finish.
   const resetsAt = new Date(1_793_000_000 * 1000).toISOString();
   const usage = "You've hit your usage limit. Try again later.";
   const rate = 'Rate limit reached. Please try again in 20s.';
+  const invalid = 'Invalid image: the file could not be decoded.';
   const rows: Array<{
     error?: { message: string; codexErrorInfo: string | null };
+    files?: File[];
     expected: [string, string | undefined, string | null];
   }> = [
     { expected: ['limit', 'usage-limit', resetsAt] },
@@ -530,9 +551,23 @@ test('only a used-up plan ends the turn as a limit with the reset time', async (
       expected: ['limit', 'usage-limit', resetsAt],
     },
     { error: { message: rate, codexErrorInfo: null }, expected: ['error', 'protocol', null] },
+    {
+      error: { message: invalid, codexErrorInfo: 'badRequest' },
+      files: [png],
+      expected: ['error', 'attachment-rejected', null],
+    },
+    // A path line sends the client nothing to refuse.
+    {
+      error: { message: invalid, codexErrorInfo: 'badRequest' },
+      files: [pdf],
+      expected: ['error', 'protocol', null],
+    },
   ];
   for (const row of rows) {
-    const run = turn('limit', row.error ? { detail: { error: row.error } } : {});
+    const run = turn('limit', {
+      ...(row.error ? { detail: { error: row.error } } : {}),
+      files: row.files,
+    });
     const { stopReason, failure } = await run.settled();
     assert.deepEqual(
       [stopReason, failure?.kind, failure?.resetsAt],
@@ -541,6 +576,94 @@ test('only a used-up plan ends the turn as a limit with the reset time', async (
     );
     assert.equal(failure?.providerMessage, row.error?.message ?? usage);
     assert.equal(run.usage.at(-1)?.windows[0].remaining?.value, 0);
+  }
+});
+
+test('an image or audio file goes as a local input only to a model that takes it, any other file as a path line, and a file the client would drop refuses the turn before it starts', async () => {
+  const opus = file('call.flac', 'audio/flac');
+  const voice = file('call.ogg', 'audio/ogg');
+  const missing = { ...png, path: join(root, 'files', 'gone', 'screen.png') };
+  const listing = { id: 4, method: 'model/list', params: { limit: 100, includeHidden: true } };
+  const rows: Array<{
+    files: File[];
+    modalities?: string[];
+    failure?: string;
+    spawned: boolean;
+    input?: unknown[];
+    listed?: boolean;
+  }> = [
+    {
+      // An earlier image goes as a path line, so a text-only model runs the turn and the model
+      // list is never read. A missing earlier file is named the same way.
+      files: [
+        { ...png, earlier: true },
+        { ...missing, earlier: true },
+      ],
+      modalities: ['text'],
+      spawned: true,
+      listed: false,
+      input: [
+        {
+          type: 'text',
+          text: `${systemContext}\n\n${prompt}\n\nAttached earlier: screen.png (image/png, 10 bytes) at ${png.path}\nAttached earlier: screen.png (image/png, 10 bytes) at ${missing.path}`,
+        },
+      ],
+    },
+    {
+      files: [png, pdf, voice],
+      modalities: ['text', 'image', 'audio'],
+      spawned: true,
+      input: [
+        { type: 'localImage', path: png.path },
+        { type: 'localAudio', path: voice.path },
+        {
+          type: 'text',
+          text: `${systemContext}\n\n${prompt}\n\nAttached file: spec.pdf (application/pdf, 8 bytes) at ${pdf.path}`,
+        },
+      ],
+    },
+    {
+      files: [png],
+      modalities: ['text'],
+      spawned: true,
+      failure: 'Codex does not report that gpt-6.1-sol takes images, so screen.png was not sent.',
+    },
+    {
+      files: [opus],
+      spawned: false,
+      failure: 'Codex takes audio as wav, mp3, m4a, webm or ogg, and call.flac is none.',
+    },
+    {
+      files: [missing],
+      spawned: false,
+      failure: 'CrewKite could not read the attached file screen.png.',
+    },
+  ];
+  for (const row of rows) {
+    const run = turn('reply', { files: row.files, detail: { modalities: row.modalities } });
+    const { stopReason, failure } = await run.settled();
+    assert.equal(run.args().length > 0, row.spawned, JSON.stringify(row.files));
+    if (row.failure) {
+      assert.equal(stopReason, 'error');
+      assert.equal(failure?.kind, 'attachment-rejected');
+      assert.equal(failure?.message, row.failure);
+      // No thread opened and no turn spent.
+      if (row.spawned) assert.deepEqual(run.frames().slice(4), [listing]);
+      continue;
+    }
+    assert.equal(stopReason, 'done');
+    const frames = run.frames();
+    const at = row.listed === false ? 4 : 5;
+    if (at === 5) assert.deepEqual(frames[4], listing);
+    assert.deepEqual(
+      frames.slice(at).map((frame) => frame.method),
+      ['thread/start', 'turn/start'],
+    );
+    assert.deepEqual(frames[at + 1].params, {
+      threadId: 'thread-1',
+      input: row.input,
+      effort: 'low',
+    });
   }
 });
 

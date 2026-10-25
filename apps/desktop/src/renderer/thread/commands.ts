@@ -1,5 +1,7 @@
 import {
   AcceptChatChangesPayloadSchema,
+  type ChatAttachment,
+  ChatAttachmentSchema,
   type ChatBranchStatus,
   ChatBranchStatusSchema,
   type ChatCatalogRead,
@@ -8,26 +10,35 @@ import {
   ChatChangesReadSchema,
   type ChatThreadRead,
   ChatThreadReadSchema,
+  type ChatTurnEventsRead,
+  ChatTurnEventsReadSchema,
   type CommandResult,
   ConfigureChatThreadPayloadSchema,
+  DeleteChatThreadPayloadSchema,
+  DiscardChatChangePayloadSchema,
   HandoffChatThreadPayloadSchema,
+  ImportChatAttachmentPayloadSchema,
   OpenChatPullRequestPayloadSchema,
   PushChatBranchPayloadSchema,
   ReadChatBranchStatusPayloadSchema,
   ReadChatCatalogPayloadSchema,
   ReadChatChangesPayloadSchema,
   ReadChatThreadPayloadSchema,
+  ReadChatTurnEventsPayloadSchema,
   RefreshChatModelsPayloadSchema,
+  RenameChatThreadPayloadSchema,
   ResolveChatPermissionPayloadSchema,
+  RetryChatTurnPayloadSchema,
   SendChatMessagePayloadSchema,
   SteerChatMessagePayloadSchema,
   StopChatTurnPayloadSchema,
 } from '@crewkite/contracts';
 import type { DesktopCommand, DesktopSource } from '../source.ts';
+import { THREAD_PAGE_SIZE } from './thread-state.ts';
 
 // The chat commands are listed in CommandSchema. The cast stays in this one file so the thread
 // view never spells a command name anywhere else.
-export type ThreadSource = Pick<DesktopSource, 'command' | 'subscribe'>;
+export type ThreadSource = Pick<DesktopSource, 'command' | 'subscribe' | 'attachFiles'>;
 // Mutations carry a revision by contract. The controller does not race chat commands on it, so
 // the thread sends zero and never has to chase the task revision while events stream.
 const CHAT_REVISION = 0;
@@ -67,12 +78,27 @@ async function read<T>(
   return schema.parse(rest);
 }
 
-export const readThread = (source: ThreadSource, taskId: string): Promise<ChatThreadRead> =>
+export const readThread = (
+  source: ThreadSource,
+  taskId: string,
+  beforeCursor?: string,
+): Promise<ChatThreadRead> =>
   read(
     source,
     'ReadChatThread',
-    ReadChatThreadPayloadSchema.parse({ taskId, limit: 200 }),
+    ReadChatThreadPayloadSchema.parse({ taskId, limit: THREAD_PAGE_SIZE, beforeCursor }),
     ChatThreadReadSchema,
+  );
+/** One page of a finished turn's stored events. Pass `nextAfterCursor` back to read on. */
+export const readTurnEvents = (
+  source: ThreadSource,
+  input: Input<typeof ReadChatTurnEventsPayloadSchema>,
+): Promise<ChatTurnEventsRead> =>
+  read(
+    source,
+    'ReadChatTurnEvents',
+    ReadChatTurnEventsPayloadSchema.parse(input),
+    ChatTurnEventsReadSchema,
   );
 export const readChanges = (source: ThreadSource, taskId: string): Promise<ChatChangesRead> =>
   read(
@@ -97,6 +123,20 @@ export const sendMessage = (
   source: ThreadSource,
   input: Input<typeof SendChatMessagePayloadSchema>,
 ) => run(source, 'SendChatMessage', SendChatMessagePayloadSchema.parse(input));
+// The controller copies the file into the thread's files folder and answers with what it stored.
+export const importAttachment = (
+  source: ThreadSource,
+  taskId: string,
+  path: string,
+): Promise<ChatAttachment> =>
+  read(
+    source,
+    'ImportChatAttachment',
+    ImportChatAttachmentPayloadSchema.parse({ taskId, source: { path } }),
+    ChatAttachmentSchema,
+  );
+export const retryTurn = (source: ThreadSource, input: Input<typeof RetryChatTurnPayloadSchema>) =>
+  run(source, 'RetryChatTurn', RetryChatTurnPayloadSchema.parse(input));
 export const resolvePermission = (
   source: ThreadSource,
   input: Input<typeof ResolveChatPermissionPayloadSchema>,
@@ -118,7 +158,7 @@ export const handoffThread = (
 ) => run(source, 'HandoffChatThread', HandoffChatThreadPayloadSchema.parse(input));
 
 export type Acceptance =
-  | { accepted: true; branch: string; commit: string; fileCount: number }
+  | { accepted: true; branch: string; commit: string; fileCount: number; note: string | null }
   | { accepted: false; reason: string; next: string | null };
 // Refusals come back as values so the Changes tab can name each reason on its own line.
 export async function acceptChanges(
@@ -130,9 +170,24 @@ export async function acceptChanges(
   const result = await dispatch(source, 'AcceptChatChanges', payload.data);
   if (result.outcome === 'applied' && result.data?.kind === 'chat-acceptance') {
     const { branch, commit, fileCount } = result.data;
-    return { accepted: true, branch, commit, fileCount };
+    return { accepted: true, branch, commit, fileCount, note: result.next ?? null };
   }
   return { accepted: false, reason: result.reason ?? 'not-accepted', next: result.next ?? null };
+}
+
+export type Discard =
+  | { discarded: true }
+  | { discarded: false; reason: string; next: string | null };
+// Refusals come back as values, like Accept, so the file row can say why on its own line.
+export async function discardChange(
+  source: ThreadSource,
+  input: Input<typeof DiscardChatChangePayloadSchema>,
+): Promise<Discard> {
+  const payload = DiscardChatChangePayloadSchema.safeParse(input);
+  if (!payload.success) return { discarded: false, reason: 'outside-copy', next: null };
+  const result = await dispatch(source, 'DiscardChatChange', payload.data);
+  if (result.outcome === 'applied') return { discarded: true };
+  return { discarded: false, reason: result.reason ?? 'not-discarded', next: result.next ?? null };
 }
 
 export type GitStep =
@@ -173,6 +228,12 @@ export const readBranchStatus = (
     ReadChatBranchStatusPayloadSchema.parse({ taskId, branch }),
     ChatBranchStatusSchema,
   );
+
+// A refusal throws with the controller's next step.
+export const renameThread = (source: ThreadSource, taskId: string, title: string) =>
+  run(source, 'RenameChatThread', RenameChatThreadPayloadSchema.parse({ taskId, title }));
+export const deleteThread = (source: ThreadSource, taskId: string) =>
+  run(source, 'DeleteChatThread', DeleteChatThreadPayloadSchema.parse({ taskId }));
 
 // The controller events the thread view folds. A conversation entry also reaches the workspace,
 // which still reads it. The other three are streamed output and thread state. They change many

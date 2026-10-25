@@ -10,7 +10,9 @@ import {
   TaskPageSchema,
   WorkspaceStateSchema,
 } from '@crewkite/contracts';
-import { contextBridge, ipcRenderer } from 'electron';
+import { contextBridge, ipcRenderer, webUtils } from 'electron';
+import { desktopFiles, droppedPaths, MAX_ATTACH_FILES } from '../shared/attach.ts';
+import { TASK_ID_PATTERN, threadAttention } from '../shared/thread-notice.ts';
 
 const events = new Set<Parameters<DesktopSource['subscribe']>[0]>();
 const notices = new Set<(notice: ReturnType<typeof DesktopNoticeSchema.parse>) => void>();
@@ -19,6 +21,11 @@ let subscribed = false;
 ipcRenderer.on('crewkite:event', (_event, value: unknown) => {
   const parsed = EventSchema.safeParse(value);
   if (parsed.success) for (const listener of events) listener(parsed.data);
+});
+const openThread = new Set<(taskId: string) => void>();
+ipcRenderer.on('crewkite:open-thread', (_event, value: unknown) => {
+  if (typeof value !== 'string' || !TASK_ID_PATTERN.test(value)) return;
+  for (const listener of openThread) listener(value);
 });
 ipcRenderer.on('crewkite:notice', (_event, value: unknown) => {
   const parsed = DesktopNoticeSchema.safeParse(value);
@@ -40,6 +47,38 @@ const readPage = async (
   if (result.outcome !== 'applied' || !result.data)
     throw new Error(result.reason ?? 'Workspace read unavailable.');
   return result.data;
+};
+// Main's own sentence, without the IPC wrapper text Electron puts in front of it.
+const plain = (failure: unknown) =>
+  new Error(
+    failure instanceof Error
+      ? failure.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '')
+      : 'The files could not be read.',
+  );
+const findFiles = async (input: unknown) => {
+  try {
+    return desktopFiles(await ipcRenderer.invoke('crewkite:attach', input));
+  } catch (failure) {
+    throw plain(failure);
+  }
+};
+// Anything that is not a file from the page has no path.
+const pathOf = (file: File) => {
+  try {
+    return webUtils.getPathForFile(file);
+  } catch {
+    return '';
+  }
+};
+// A dropped or pasted file carries its path only here. A pasted screenshot has none, so main
+// reads the clipboard image for it.
+const attachFiles: NonNullable<DesktopSource['attachFiles']> = async (input) => {
+  if (input.from === 'picker') return findFiles({ from: 'picker' });
+  const files: unknown[] = [...input.files].slice(0, MAX_ATTACH_FILES);
+  const paths = droppedPaths(files, pathOf);
+  const found = paths.length > 0 ? await findFiles({ from: 'paths', paths }) : [];
+  const unnamed = input.from === 'paste' && paths.length < files.length;
+  return unnamed ? [...found, ...(await findFiles({ from: 'clipboard' }))] : found;
 };
 const bridge: DesktopSource = {
   verifyArtifact: async (input) =>
@@ -82,11 +121,27 @@ const bridge: DesktopSource = {
       notices.delete(receive);
     };
   },
+  openLink: async (url) => {
+    const value: unknown = await ipcRenderer.invoke('crewkite:open-link', String(url));
+    return value === 'opened' || value === 'declined' ? value : 'refused';
+  },
+  attachFiles,
   pickProject: () => result('crewkite:pick-project'),
   reconnect: async () => {
     await ipcRenderer.invoke('crewkite:reconnect');
   },
   retryCommand: (expected) => result('crewkite:retry', expected),
+  threadAttention: async (input) => {
+    const attention = threadAttention(input);
+    if (!attention) throw new Error('The thread notice is invalid.');
+    await ipcRenderer.invoke('crewkite:thread-attention', attention);
+  },
+  onOpenThread(listener) {
+    openThread.add(listener);
+    return () => {
+      openThread.delete(listener);
+    };
+  },
   onNotice(listener) {
     for (const notice of recent.values()) listener(notice);
     notices.add(listener);

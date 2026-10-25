@@ -1,5 +1,6 @@
 import type {
   AgentEvent,
+  ChatAttachment,
   ChatFailure,
   ChatFamily,
   ChatModelSelection,
@@ -22,6 +23,19 @@ export type ChatTurnRequest = Readonly<{
   selection: ChatModelSelection;
   /** The user's text for this turn. A handoff packet is prepended by the controller. */
   prompt: string;
+  /**
+   * Files the person attached to this message, stored under the controller home. Each adapter
+   * sends them in its client's own content blocks or names the path. Absent means none.
+   */
+  files?: readonly Readonly<{
+    attachment: ChatAttachment;
+    path: string;
+    /**
+     * The file came with an earlier message and travels with a handoff. Adapters name it by path
+     * or link, and never refuse the turn over it.
+     */
+    earlier?: boolean;
+  }>[];
   /** CrewKite's framing for the model: project, scratch rules, what to do with results. */
   systemContext: string;
   /** Transcript so far, oldest first. Adapters with a resumable native session may ignore it. */
@@ -92,6 +106,7 @@ export function chatFailure(
       timeout: 'Send again with a smaller request, or raise the turn limit in Settings.',
       stopped: 'Send a new message to continue.',
       internal: 'Send again. If it repeats, report the details.',
+      'attachment-rejected': 'Try another provider for these files.',
     }[input.kind];
   return {
     stage: input.stage,

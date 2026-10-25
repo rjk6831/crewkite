@@ -613,11 +613,15 @@ export async function packageDesktop() {
   );
   const fromDesktop = createRequire(join(checkout, 'apps/desktop/package.json'));
   const reactDom = fromDesktop.resolve('react-dom/package.json');
-  for (const [name, locator] of [
+  const fromLowlight = createRequire(fromDesktop.resolve('lowlight/package.json'));
+  for (const [name, locator, file = 'LICENSE'] of [
     ['react', fromDesktop],
     ['react-dom', fromDesktop],
     ['scheduler', createRequire(reactDom)],
     ['lucide-react', fromDesktop],
+    ['lowlight', fromDesktop, 'license'],
+    ['highlight.js', fromLowlight],
+    ['devlop', fromLowlight, 'license'],
     ['@fontsource/inter', fromDesktop],
     ['@fontsource/jetbrains-mono', fromDesktop],
     ['tailwindcss', fromDesktop],
@@ -629,7 +633,7 @@ export async function packageDesktop() {
     notice(
       name,
       manifest.version,
-      join(dirname(manifestPath), 'LICENSE'),
+      join(dirname(manifestPath), file),
       `${name.replaceAll('@', '').replaceAll('/', '-')}-LICENSE`,
     );
   }

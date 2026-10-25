@@ -1,5 +1,14 @@
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname, join } from 'node:path';
 import type {
   AgentEvent,
@@ -11,6 +20,7 @@ import type {
   ChatInput,
   ChatMessage,
   ChatMessageInput,
+  FilesNamespace,
   LLMActionOpts,
   LLMPredictionStats,
   PredictionResult,
@@ -34,8 +44,8 @@ import {
   READ_LINES,
   RUN_SECONDS,
   RUN_TAIL_LINES,
+  readScratchFile,
   SEARCH_HITS,
-  scratchPath,
 } from '../../chat/local-tools.ts';
 import { cachedRepoMap } from '../../chat/repo-map.ts';
 
@@ -49,17 +59,124 @@ export type LoadedModelLike = {
   act(chat: ChatInput, tools: Tool[], options: LLMActionOpts): Promise<unknown>;
   countTokens(text: string): Promise<number>;
 };
+/** The part of the SDK client's file namespace this adapter uses. */
+export type LocalFiles = Pick<FilesNamespace, 'prepareImageBase64'>;
 /**
  * `fellBack` is true when the requested model is not loaded and `modelKey` names another one.
- * `dispose` closes the runtime client the connection opened. It is safe to call more than once.
+ * `vision` is what the runtime reports for that model. `files` belongs to the same client, so
+ * an image it prepares lives as long as the turn. `dispose` closes the runtime client the
+ * connection opened. It is safe to call more than once.
  */
 export type LocalConnect = (request: ChatTurnRequest) => Promise<{
   model: LoadedModelLike;
   contextLength: number;
   modelKey: string;
   fellBack: boolean;
+  vision: boolean;
+  files: LocalFiles;
   dispose: () => Promise<void>;
 }>;
+
+/**
+ * Types Local inlines into the message as text. The model reads them like the rest of the
+ * message, so they count toward its context. The catalog reports the same list.
+ */
+export const LOCAL_TEXT_TYPES = [
+  'text/*',
+  'application/json',
+  'application/xml',
+  'application/yaml',
+  'application/x-yaml',
+  'application/toml',
+  'application/javascript',
+  'application/sql',
+  'application/x-sh',
+] as const;
+const textType = (mimeType: string) => {
+  const base = mimeType.split(';')[0].trim().toLowerCase();
+  return base.startsWith('text/') || (LOCAL_TEXT_TYPES as readonly string[]).includes(base);
+};
+
+type TurnFile = NonNullable<ChatTurnRequest['files']>[number];
+
+// Text and code run about three to five bytes a token, so a text file larger than the token
+// budget times eight cannot fit. The prompt build still counts the tokens of what is read.
+const TEXT_BYTES_PER_TOKEN = 8;
+
+/**
+ * Sort the turn's files before any token is spent. Images go to a vision model as images, text
+ * goes into the message under its name, and anything else is refused with the reason. Each file
+ * is checked by its size on disk before any byte is read. Text files share `budgetTokens`, and
+ * one past what is left goes by name alone and shows in `skipped`. Local's tools reach only the
+ * scratch copy, so a file from an earlier message goes by name alone and never refuses the turn.
+ */
+function sortFiles(
+  files: readonly TurnFile[],
+  vision: boolean,
+  modelKey: string,
+  budgetTokens: number,
+) {
+  const texts: string[] = [];
+  const images: TurnFile[] = [];
+  const refused: string[] = [];
+  const skipped: string[] = [];
+  let room = Math.max(0, budgetTokens) * TEXT_BYTES_PER_TOKEN;
+  for (const file of files) {
+    const { name, mimeType } = file.attachment;
+    if (file.earlier) {
+      texts.push(
+        `Attached earlier: ${name} (${mimeType}, ${file.attachment.bytes} bytes). Its content is not in this message.`,
+      );
+      continue;
+    }
+    if (mimeType.startsWith('image/')) {
+      if (vision) {
+        closeSync(openStored(file.path).fd);
+        images.push(file);
+      } else refused.push(`${name}: the loaded model ${modelKey} does not take images`);
+      continue;
+    }
+    if (!textType(mimeType)) {
+      refused.push(`${name}: Local takes images and text files, and this file is ${mimeType}`);
+      continue;
+    }
+    const { fd, size } = openStored(file.path);
+    let raw: Buffer | null = null;
+    try {
+      if (size <= room) raw = readFileSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    if (raw === null) {
+      skipped.push(name);
+      texts.push(
+        `Attached file ${name} (${mimeType}, ${size} bytes) is too large for this model's context. Its content is not in this message.`,
+      );
+      continue;
+    }
+    const text = raw.toString('utf8');
+    if (raw.subarray(0, 8000).includes(0) || !Buffer.from(text).equals(raw))
+      refused.push(`${name}: it is not UTF-8 text`);
+    else {
+      room -= size;
+      texts.push(`Attached file ${name}:\n${text}`);
+    }
+  }
+  return { texts, images, refused, skipped };
+}
+
+/** An open regular file and its size. O_NONBLOCK keeps a FIFO from holding the turn. */
+function openStored(path: string) {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) throw new Error(`${path} is not a regular file`);
+    return { fd, size: stat.size };
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
 
 const MAX_TOOL_CALLS = 12;
 // Each round gets tools until the last one, which must answer in text.
@@ -154,8 +271,10 @@ type Prompt =
   | { kind: 'fits'; chat: ChatInput; summary: Summary | null; carried: boolean }
   | { kind: 'too-large' };
 
+/** `message` is the person's text with any text files inlined after it. */
 async function buildPrompt(
   request: ChatTurnRequest,
+  message: string,
   model: LoadedModelLike,
   contextLength: number,
   warn: (message: string) => void,
@@ -164,7 +283,7 @@ async function buildPrompt(
   const count = async (text: string) => (await model.countTokens(text)) + MESSAGE_TOKENS;
   let left = contextLength - outputTokens;
   let system = systemPrompt(request, outputTokens);
-  left -= (await count(system)) + (await count(request.prompt));
+  left -= (await count(system)) + (await count(message));
   if (left < 0) return { kind: 'too-large' };
 
   const mapBudget = Math.min(Math.floor(contextLength * MAP_SHARE), left);
@@ -177,7 +296,7 @@ async function buildPrompt(
         get files() {
           return listFiles(root, request.environment);
         },
-        read: (path) => readFileSync(scratchPath(root, path).full, 'utf8'),
+        read: (path) => readScratchFile(root, path),
         budgetTokens: mapBudget,
       });
       const section = `\n\nProject outline, most imported files first:\n${map.text}`;
@@ -220,7 +339,7 @@ async function buildPrompt(
     chat: [
       { role: 'system', content: system },
       ...kept.map((entry) => ({ role: entry.role, content: entry.text })),
-      { role: 'user', content: request.prompt },
+      { role: 'user', content: message },
     ],
   };
 }
@@ -881,10 +1000,53 @@ function startLocalTurn(
       updatedAt: new Date(now()).toISOString(),
     };
 
+    let files: ReturnType<typeof sortFiles>;
+    try {
+      files = sortFiles(
+        request.files ?? [],
+        connection.vision,
+        modelKey,
+        contextLength - Math.floor(contextLength * OUTPUT_SHARE),
+      );
+    } catch (error) {
+      return finish(
+        'error',
+        chatFailure({
+          stage: 'session',
+          kind: 'internal',
+          message: 'CrewKite could not read a stored file for this turn.',
+          providerMessage: describeError(error).slice(0, 16_384),
+        }),
+      );
+    }
+    if (files.refused.length)
+      return finish(
+        'error',
+        chatFailure({
+          stage: 'session',
+          kind: 'attachment-rejected',
+          message: `Local cannot take ${files.refused.join('; ')}.`.slice(0, 4096),
+        }),
+      );
+    if (files.skipped.length)
+      notice(
+        'warning',
+        `Local: too large for the model's context, sent by name only: ${files.skipped.join(', ')}.`.slice(
+          0,
+          4096,
+        ),
+      );
+
     let prompt: Prompt;
     try {
       prompt = await bounded(
-        buildPrompt(request, model, contextLength, (message) => notice('warning', message)),
+        buildPrompt(
+          request,
+          [request.prompt, ...files.texts].join('\n\n'),
+          model,
+          contextLength,
+          (message) => notice('warning', message),
+        ),
       );
     } catch (error) {
       return ending ? ended() : finish('error', connectFailure(error));
@@ -900,6 +1062,37 @@ function startLocalTurn(
     // `act` runs rounds until one ends without a native call. When that round wrote its calls as
     // text, they run here and `act` starts again with the results, inside the same round budget.
     let chat = prompt.chat;
+    if (files.images.length) {
+      try {
+        const images = await bounded(
+          Promise.all(
+            files.images.map(({ attachment, path }) =>
+              connection.files.prepareImageBase64(
+                attachment.name,
+                readFileSync(path).toString('base64'),
+              ),
+            ),
+          ),
+        );
+        // The person's message carries the images. Later `act` calls resend the same message,
+        // so the model keeps seeing them for the whole turn.
+        chat = [...chat.slice(0, -1), { ...chat[chat.length - 1], images }];
+      } catch (error) {
+        if (ending) return ended();
+        const failure = streamFailure(error);
+        return finish(
+          'error',
+          failure.kind === 'internal'
+            ? chatFailure({
+                stage: 'session',
+                kind: 'attachment-rejected',
+                message: 'LM Studio did not accept the attached images.',
+                providerMessage: failure.providerMessage,
+              })
+            : failure,
+        );
+      }
+    }
     try {
       for (;;) {
         const appended: ChatInput = [];

@@ -4,13 +4,28 @@
 //   and turn.completed { stopReason, failure } before the result settles.
 // On stop it reports only completed items, like a native client that drops the open item.
 import assert from 'node:assert/strict';
-import { appendFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+  appendFileSync,
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { type TestContext, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import type {
   AgentEvent,
+  ChatAttachment,
   ChatCatalogRead,
   ChatCrew,
   ChatFamily,
@@ -20,6 +35,7 @@ import type {
   ChatThreadRead,
   ChatToolKind,
   ChatTurn,
+  ChatTurnEventsRead,
   CommandResult,
   Event,
   Project,
@@ -43,6 +59,8 @@ import {
   type ChatTurnResult,
   chatFailure,
 } from './adapter.ts';
+import { deleteThreadBaseRef, threadBaseRef } from './changes.ts';
+import { detectType } from './files.ts';
 import { ChatService, type ChatServiceDeps } from './service.ts';
 
 const selection = { family: 'openai', model: 'fixture-model', effort: 'default' } as const;
@@ -60,7 +78,7 @@ async function open<Adapter extends ChatAdapter>(t: TestContext, adapter: Adapte
     run('SendChatMessage', { text, selection }, task.revision) as Promise<CommandResult>;
   const read = async (payload: object = {}) =>
     (await run('ReadChatThread', payload)).data as ChatThreadRead & { kind: 'chat-thread' };
-  return { controller, adapter, task, run, send, read, source };
+  return { controller, adapter, task, run, send, read, source, command, draft: context.draft };
 }
 
 const chat = (t: TestContext, turns: ChatScriptStep[][]) =>
@@ -147,6 +165,7 @@ test('a sent message streams agent events and saves the reply when the turn fini
   );
   assert.deepEqual(request.history, []);
   assert.match(request.systemContext, /demo-shop/);
+  assert.match(request.systemContext, /no `\.git` folder and no installed dependencies/);
   assert.ok(existsSync(join(request.scratch.directory, 'net.mjs')));
 });
 
@@ -289,6 +308,7 @@ function standalone(t: TestContext, deps: Partial<ChatServiceDeps> = {}) {
           text,
           role: 'assistant',
           attachments: [],
+          files: [],
           ...(choice ? { selection: choice } : {}),
         },
         effects,
@@ -298,7 +318,7 @@ function standalone(t: TestContext, deps: Partial<ChatServiceDeps> = {}) {
     return result;
   };
   const read = (on = service) => on.readThread({ taskId, limit: 100 });
-  return { clock, store, taskId, service, start, send, read };
+  return { clock, store, taskId, service, start, send, read, root: repository.directory };
 }
 
 /** A catalog entry with one model and one weekly window. */
@@ -317,6 +337,7 @@ function familyEntry(
     ],
     defaultModel: `${family}-model`,
     remaining: [{ windowId: 'weekly', label: 'weekly', percent, resetsAt, observedAt }],
+    accepts: null,
   };
 }
 
@@ -327,7 +348,14 @@ test('startup recovery fails a turn whose controller stopped before it finished'
   // The command commits, then the process ends before its launch effect runs.
   store.transaction(() =>
     start().sendMessage(
-      { taskId, text: 'Start the change.', selection, role: 'assistant', attachments: [] },
+      {
+        taskId,
+        text: 'Start the change.',
+        selection,
+        role: 'assistant',
+        attachments: [],
+        files: [],
+      },
       [],
     ),
   );
@@ -564,7 +592,7 @@ test('a message sent during a turn waits and starts when the turn ends', {
 test('a thread read returns messages in cursor order and the live events of the open turn', {
   timeout: 30000,
 }, async (t) => {
-  const { controller, send, read } = await chat(t, [
+  const { controller, send, read, run, command, draft } = await chat(t, [
     [{ kind: 'text', itemId: 'first', chunks: ['First reply.'] }],
     [{ kind: 'text', itemId: 'second', chunks: ['Working'], complete: false }, { kind: 'wait' }],
   ]);
@@ -607,6 +635,79 @@ test('a thread read returns messages in cursor order and the live events of the 
     earlier.messages.map((message) => message.text),
     ['First reply.'],
   );
+
+  // A turn's stored events read back whole, oldest first, a page at a time under the cap.
+  const [done, running] = thread.turns;
+  const turnEvents = (payload: object) => run('ReadChatTurnEvents', payload);
+  const pageOf = (result: CommandResult) => {
+    assert.equal(result.outcome, 'applied', result.next);
+    return result.data as ChatTurnEventsRead;
+  };
+  const stored = (turnId: string) =>
+    agentEvents(controller).filter((event) => event.turnId === turnId);
+  const whole = pageOf(await turnEvents({ turnId: done.id }));
+  assert.deepEqual(whole.events, stored(done.id));
+  assert.equal(whole.nextAfterCursor, null);
+  assert.deepEqual(pageOf(await turnEvents({ turnId: running.id })).events, stored(running.id));
+  let serial = 0;
+  const append = (event: AgentEvent) => {
+    serial += 1;
+    return controller.store.transaction(() =>
+      controller.store.append({
+        protocol: 1,
+        id: `evt_7${String(serial).padStart(25, '0')}`,
+        at: '2026-10-25T10:00:00.000Z',
+        taskId: done.taskId,
+        revision: 0,
+        type: 'agent.event',
+        payload: event,
+      }),
+    );
+  };
+  const large = Array.from({ length: 12 }, (_, index) =>
+    append({
+      type: 'text.delta',
+      turnId: done.id,
+      itemId: 'large',
+      text: 'abcdefghijkl'[index].repeat(60_000),
+    }),
+  );
+  // The cursor is exclusive, so the read starts after the last event the turn already had.
+  const pages = [pageOf(await turnEvents({ turnId: done.id, afterCursor: thread.cursor }))];
+  for (let after = pages[0].nextAfterCursor; after; after = pages.at(-1)?.nextAfterCursor ?? null)
+    pages.push(pageOf(await turnEvents({ turnId: done.id, afterCursor: after })));
+  assert.ok(pages.length > 1);
+  for (const page of pages)
+    assert.ok(Buffer.byteLength(JSON.stringify({ kind: 'chat-turn-events', ...page })) <= 524_288);
+  assert.deepEqual(
+    pages.flatMap((page) => page.events),
+    large.map((event) => event.payload),
+  );
+  // An event that alone exceeds the page is refused, and no later event is skipped past it.
+  const oversized = append({
+    type: 'tool.started',
+    turnId: done.id,
+    callId: 'call-1',
+    kind: 'read',
+    title: 'Read a large file',
+    input: 'x'.repeat(600_000),
+  });
+  const refused = await turnEvents({ turnId: done.id, afterCursor: large.at(-1)?.cursor });
+  assert.equal(refused.outcome, 'blocked');
+  assert.equal(refused.reason, 'turn-event-too-large');
+  assert.equal(
+    pageOf(await turnEvents({ turnId: done.id, afterCursor: oversized.cursor })).events.length,
+    0,
+  );
+  // A turn is read only through the thread it belongs to.
+  const other = (await controller.execute(command('CreateTask', draft.payload, 0), 'local-owner'))
+    .entity as Task;
+  const foreign = await controller.execute(
+    command('ReadChatTurnEvents', { taskId: other.id, turnId: done.id }),
+    'local-owner',
+  );
+  assert.equal(foreign.outcome, 'blocked');
+  assert.equal(foreign.reason, 'turn-not-found');
 });
 
 // A limit stop needs a second connected family, so these tests bring a catalog of their own.
@@ -1024,11 +1125,47 @@ test('accept commits the scratch edit on the base as a new branch and leaves the
   const { controller, adapter, task, run, send, read, source } = await chat(t, [
     [{ kind: 'text', itemId: 'reply', chunks: ['Edited.'] }],
   ]);
+  const repo = (...args: string[]) => git(source.directory, args).toString('utf8').trim();
+  const identity = {
+    name: 'Fixture',
+    email: 'fixture@example.invalid',
+    at: '2026-10-15T18:00:00Z',
+  };
+  // Commit a tree on main without touching the checkout or the index.
+  const advance = (tree: string) =>
+    repo(
+      'update-ref',
+      'refs/heads/main',
+      git(source.directory, ['commit-tree', tree, '-p', 'HEAD'], 'move\n', identity)
+        .toString()
+        .trim(),
+    );
+  // The base holds a link that stays inside and a submodule the copy skips.
+  const blob = git(source.directory, ['hash-object', '-w', '--stdin'], 'net.mjs').toString().trim();
+  const vendor = git(source.directory, ['mktree'], `160000 commit ${'c'.repeat(40)}\tlib\n`)
+    .toString()
+    .trim();
+  advance(
+    git(
+      source.directory,
+      ['mktree'],
+      `${repo('ls-tree', 'HEAD')}\n120000 blob ${blob}\tNOTES.md\n040000 tree ${vendor}\tvendor\n`,
+    )
+      .toString()
+      .trim(),
+  );
   const done = turnReaches(controller, 'done');
   await send('Fix the rounding.');
   await done;
-  appendFileSync(join(adapter.requests[0].scratch.directory, 'net.mjs'), '// accepted\n');
-  const repo = (...args: string[]) => git(source.directory, args).toString('utf8').trim();
+  const pinned = () => repo('rev-parse', threadBaseRef(task.id));
+  const started = await read();
+  assert.deepEqual(started.thread.skipped, [{ path: 'vendor/lib', reason: 'submodule' }]);
+  assert.equal(pinned(), started.thread.base);
+  const scratch = adapter.requests[0].scratch.directory;
+  // The edit goes through the link. The file under the skipped submodule is never accepted.
+  appendFileSync(join(scratch, 'NOTES.md'), '// accepted\n');
+  mkdirSync(join(scratch, 'vendor', 'lib'), { recursive: true });
+  writeFileSync(join(scratch, 'vendor', 'lib', 'extra.txt'), 'local only\n');
   const checkout = () => [
     repo('rev-parse', 'HEAD'),
     repo('symbolic-ref', 'HEAD'),
@@ -1053,10 +1190,15 @@ test('accept commits the scratch edit on the base as a new branch and leaves the
   assert.equal(repo('diff', '--name-only', base, branch), 'net.mjs');
   assert.match(repo('show', `${branch}:net.mjs`), /\/\/ accepted$/);
   assert.equal(
+    repo('ls-tree', '-r', branch, 'NOTES.md', 'vendor'),
+    repo('ls-tree', '-r', base, 'NOTES.md', 'vendor'),
+  );
+  assert.equal(
     repo('log', '-1', '--format=%s|%an <%ae>', branch),
     `CrewKite: ${task.title}|Fixture owner <owner@example.invalid>`,
   );
   assert.deepEqual(checkout(), before);
+  assert.equal(pinned(), commit);
   const thread = await read();
   assert.equal(thread.thread.lastAcceptance?.commit, commit);
   assert.equal(thread.messages.at(-1)?.text, 'Accepted 1 file to branch crewkite/fix-rounding.');
@@ -1078,9 +1220,39 @@ test('accept commits the scratch edit on the base as a new branch and leaves the
   const after = await read();
   assert.equal(after.thread.lastPush?.commit, commit);
   assert.equal(after.messages.at(-1)?.text, 'Pushed crewkite/fix-rounding to origin.');
+
+  // The base advanced to the accepted commit, so Changes is empty and the next Accept stacks on it.
+  // Every read loads the thread record from the store, so a restarted controller sees the same base.
+  assert.equal(after.thread.base, commit);
+  const changes = await run('ReadChatChanges', {});
+  assert.deepEqual(changes.data, {
+    kind: 'chat-changes',
+    taskId: task.id,
+    base: commit,
+    files: [],
+  });
+  // HEAD moves on. Accept still starts from the thread's base and leaves HEAD where it is.
+  advance(repo('rev-parse', 'HEAD^{tree}'));
+  const moved = checkout();
+  appendFileSync(join(scratch, 'net.mjs'), '// second\n');
+  const second = await run('AcceptChatChanges', { branch: 'crewkite/second' }, task.revision);
+  const note = `The branch starts at this thread's base commit ${commit.slice(0, 7)}. HEAD stays where it is.`;
+  assert.deepEqual([second.outcome, second.next], ['applied', note]);
+  const stacked = repo('rev-parse', 'refs/heads/crewkite/second');
+  assert.equal(repo('rev-parse', 'refs/heads/crewkite/second^'), commit);
+  assert.equal(repo('diff', '--name-only', commit, stacked), 'net.mjs');
+  assert.deepEqual(checkout(), moved);
+  const last = await read();
+  assert.equal(last.thread.base, stacked);
+  assert.equal(pinned(), stacked);
+  assert.equal(last.messages.at(-1)?.text, `Accepted 1 file to branch crewkite/second. ${note}`);
+  // Thread delete removes the ref and nothing else.
+  deleteThreadBaseRef(source.directory, task.id);
+  assert.equal(repo('for-each-ref', 'refs/crewkite/'), '');
+  assert.deepEqual(checkout(), moved);
 });
 
-test('accept is refused while a turn is running', { timeout: 30000 }, async (t) => {
+test('accept and discard are refused while a turn is running', { timeout: 30000 }, async (t) => {
   const { controller, task, run, send } = await chat(t, [
     [{ kind: 'text', itemId: 'reply', chunks: ['Working'], complete: false }, { kind: 'wait' }],
   ]);
@@ -1093,6 +1265,218 @@ test('accept is refused while a turn is running', { timeout: 30000 }, async (t) 
 
   const result = await run('AcceptChatChanges', { branch: 'crewkite/fix-rounding' }, task.revision);
   assert.deepEqual([result.outcome, result.reason], ['blocked', 'turn-running']);
+  const discard = await run('DiscardChatChange', { path: 'net.mjs' }, task.revision);
+  assert.deepEqual([discard.outcome, discard.reason], ['blocked', 'turn-running']);
+});
+
+test('discard restores, removes or recovers one path and refuses links and entries the copy never held', {
+  timeout: 30000,
+}, async (t) => {
+  const { controller, adapter, task, run, send, read, source, command } = await chat(t, [
+    [{ kind: 'text', itemId: 'reply', chunks: ['Edited.'] }],
+  ]);
+  const repo = (...args: string[]) => git(source.directory, args).toString('utf8').trim();
+  // The base gains a link that stays inside and a submodule the copy skips.
+  const blob = git(source.directory, ['hash-object', '-w', '--stdin'], 'net.mjs').toString().trim();
+  const vendor = git(source.directory, ['mktree'], `160000 commit ${'c'.repeat(40)}\tlib\n`)
+    .toString()
+    .trim();
+  const tree = git(
+    source.directory,
+    ['mktree'],
+    `${repo('ls-tree', 'HEAD')}\n120000 blob ${blob}\tNOTES.md\n040000 tree ${vendor}\tvendor\n`,
+  )
+    .toString()
+    .trim();
+  const identity = {
+    name: 'Fixture',
+    email: 'fixture@example.invalid',
+    at: '2026-10-15T18:00:00Z',
+  };
+  repo(
+    'update-ref',
+    'refs/heads/main',
+    git(source.directory, ['commit-tree', tree, '-p', 'HEAD'], 'link\n', identity)
+      .toString()
+      .trim(),
+  );
+  const done = turnReaches(controller, 'done');
+  await send('Fix the rounding.');
+  await done;
+  const scratch = adapter.requests[0].scratch.directory;
+  const outside = mkdtempSync(join(tmpdir(), 'crewkite-outside-'));
+  t.after(() => rmSync(outside, { recursive: true, force: true }));
+  const committed = (path: string) => git(source.directory, ['show', `HEAD:${path}`]);
+  appendFileSync(join(scratch, 'net.mjs'), '// changed\n');
+  appendFileSync(join(scratch, 'sentinels/executable.sh'), '# changed\n');
+  chmodSync(join(scratch, 'sentinels/executable.sh'), 0o644);
+  mkdirSync(join(scratch, 'notes/new'), { recursive: true });
+  writeFileSync(join(scratch, 'notes/new/added.txt'), 'added\n');
+  rmSync(join(scratch, 'index.html'));
+  const discard = (path: string) => run('DiscardChatChange', { path }, task.revision);
+  const changed = async () =>
+    ((await run('ReadChatChanges', {})).data as { files: { path: string }[] }).files.map(
+      (file) => file.path,
+    );
+  assert.deepEqual(await changed(), [
+    'index.html',
+    'net.mjs',
+    'notes/new/added.txt',
+    'sentinels/executable.sh',
+  ]);
+  const listed = async (path: string) =>
+    ((await run('ReadChatChanges', {})).data as { files: { path: string; patch: string }[] }).files
+      .find((file) => file.path === path)
+      ?.patch.split('\n')[0];
+  const relinked = () => assert.equal(readlinkSync(join(scratch, 'NOTES.md')), 'net.mjs');
+  const replaceLink = () => {
+    rmSync(join(scratch, 'NOTES.md'));
+    writeFileSync(join(scratch, 'NOTES.md'), 'a file now\n');
+  };
+  const rows: {
+    path: string;
+    reason?: string;
+    line?: string;
+    check?: () => void;
+    before?: () => void;
+    /** The first patch line Changes shows for the path before the discard. */
+    listed?: string;
+    /** Accept to this branch first. It takes the link from the base. */
+    accept?: string;
+    /** The receipt commit fails after the restore, and the same key runs again. */
+    crash?: boolean;
+  }[] = [
+    {
+      path: 'sentinels/executable.sh',
+      line: 'Discarded the changes to sentinels/executable.sh. It matches the base commit',
+      check: () => {
+        assert.deepEqual(
+          readFileSync(join(scratch, 'sentinels/executable.sh')),
+          committed('sentinels/executable.sh'),
+        );
+        assert.equal(statSync(join(scratch, 'sentinels/executable.sh')).mode & 0o777, 0o755);
+      },
+    },
+    {
+      path: 'notes/new/added.txt',
+      line: 'Discarded notes/new/added.txt, a file added in this thread.',
+      check: () => assert.equal(existsSync(join(scratch, 'notes')), false),
+    },
+    {
+      path: 'index.html',
+      line: 'Restored index.html from the base commit',
+      check: () =>
+        assert.deepEqual(readFileSync(join(scratch, 'index.html')), committed('index.html')),
+    },
+    { path: 'index.html', reason: 'not-changed' },
+    {
+      path: 'net.mjs',
+      line: 'Discarded the changes to net.mjs. It matches the base commit',
+      crash: true,
+      check: () => assert.deepEqual(readFileSync(join(scratch, 'net.mjs')), committed('net.mjs')),
+    },
+    { path: 'NOTES.md', reason: 'not-changed' },
+    {
+      path: 'NOTES.md',
+      before: replaceLink,
+      listed: 'Link replaced',
+      line: 'Restored the link NOTES.md from the base commit',
+      check: relinked,
+    },
+    {
+      path: 'NOTES.md',
+      before: () => rmSync(join(scratch, 'NOTES.md')),
+      listed: 'Link removed',
+      line: 'Restored the link NOTES.md from the base commit',
+      check: relinked,
+    },
+    {
+      path: 'NOTES.md',
+      before: () => {
+        replaceLink();
+        appendFileSync(join(scratch, 'net.mjs'), '// changed\n');
+      },
+      listed: 'Link replaced',
+      accept: 'crewkite/link-replaced',
+      line: 'Restored the link NOTES.md from the base commit',
+      check: relinked,
+    },
+    {
+      path: 'NOTES.md',
+      before: () => {
+        rmSync(join(scratch, 'NOTES.md'));
+        appendFileSync(join(scratch, 'net.mjs'), '// changed\n');
+      },
+      listed: 'Link removed',
+      accept: 'crewkite/link-removed',
+      line: 'Restored the link NOTES.md from the base commit',
+      check: relinked,
+    },
+    { path: 'vendor/lib', reason: 'skipped-path' },
+    {
+      path: 'vendor/lib/extra.txt',
+      reason: 'skipped-path',
+      before: () => {
+        mkdirSync(join(scratch, 'vendor/lib'), { recursive: true });
+        writeFileSync(join(scratch, 'vendor/lib/extra.txt'), 'local only\n');
+      },
+    },
+    {
+      path: 'linked.md',
+      reason: 'link-path',
+      before: () => symlinkSync('net.mjs', join(scratch, 'linked.md')),
+    },
+    {
+      path: 'away/secret.txt',
+      reason: 'outside-copy',
+      before: () => {
+        writeFileSync(join(outside, 'secret.txt'), 'keep\n');
+        symlinkSync(outside, join(scratch, 'away'));
+      },
+    },
+  ];
+  for (const row of rows) {
+    row.before?.();
+    if (row.listed) assert.equal(await listed(row.path), row.listed, row.path);
+    if (row.accept) {
+      const accepted = await run('AcceptChatChanges', { branch: row.accept }, task.revision);
+      assert.deepEqual(accepted.data, {
+        kind: 'chat-acceptance',
+        branch: row.accept,
+        commit: repo('rev-parse', row.accept),
+        fileCount: 1,
+      });
+      assert.equal(repo('ls-tree', row.accept, 'NOTES.md'), repo('ls-tree', 'HEAD', 'NOTES.md'));
+      // The copy's version is still there, and Changes still says it will not be accepted.
+      assert.equal(await listed(row.path), row.listed, row.accept);
+    }
+    let result: CommandResult;
+    if (row.crash) {
+      const once = command('DiscardChatChange', { taskId: task.id, path: row.path }, task.revision);
+      const save = controller.store.saveReceipt;
+      controller.store.saveReceipt = () => {
+        throw new Error('Crash before the receipt commits.');
+      };
+      await assert.rejects(controller.execute(once, 'local-owner'), /Crash/);
+      controller.store.saveReceipt = save;
+      result = await controller.execute(once, 'local-owner');
+      const lines = (await read()).messages.filter((message) =>
+        message.text.startsWith(row.line ?? ''),
+      );
+      assert.equal(lines.length, 1, row.path);
+    } else result = await discard(row.path);
+    if (row.reason) {
+      assert.deepEqual([result.outcome, result.reason], ['blocked', row.reason], row.path);
+      continue;
+    }
+    assert.equal(result.outcome, 'applied', row.path);
+    assert.ok((await read()).messages.at(-1)?.text.startsWith(row.line ?? ''), row.path);
+    row.check?.();
+    // Accept carries only what is left.
+    if (row.path === 'index.html') assert.deepEqual(await changed(), ['net.mjs']);
+  }
+  assert.equal(readFileSync(join(outside, 'secret.txt'), 'utf8'), 'keep\n');
+  assert.match(readFileSync(join(scratch, 'net.mjs'), 'utf8'), /\/\/ changed\n$/);
 });
 
 // Builder and fixer run on OpenAI, the reviewer on Anthropic, the challenger on Google. The crew
@@ -1480,4 +1864,351 @@ test('send now stops the running turn and starts the queued message with its pac
   assert.match(packet, /^OpenAI ended its last turn early\. Reason: stopped by the person\.$/m);
   assert.match(packet, /New message:\nThird\.$/);
   assert.equal(scripted.requests[2].prompt, 'Second.');
+});
+
+/** Run one service command in its own transaction, then its effects, as the controller does. */
+function act(store: Store, work: (effects: (() => void)[]) => CommandResult): CommandResult {
+  const effects: (() => void)[] = [];
+  const result = store.transaction(() => work(effects));
+  for (const effect of effects) effect();
+  return result;
+}
+
+test('a file is stored once by its hash, and its path reaches every turn that runs its message', {
+  timeout: 30000,
+}, async (t) => {
+  // Rows: the start of the bytes, the name, what a paste declared, and the type CrewKite names.
+  const zip = Buffer.from('PK\x03\x04', 'latin1');
+  const types = [
+    [Buffer.from('%PDF-1.7'), 'report', null, 'application/pdf'],
+    [Buffer.concat([zip, Buffer.alloc(26), Buffer.from('word/document.xml')]), 'a.bin', null],
+    [zip, 'sheet.xlsx', null, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
+    [zip, 'archive', null, 'application/zip'],
+    [Buffer.from('ID3\x04', 'latin1'), 'voice.bin', null, 'audio/mpeg'],
+    [Buffer.from('\x1a\x45\xdf\xa3....webm', 'latin1'), 'clip', null, 'video/webm'],
+    [Buffer.from('const a = 1;'), 'service.ts', null, 'text/x-typescript'],
+    [Buffer.from('hello'), 'paste', 'text/plain', 'text/plain'],
+    [Buffer.from('hello'), 'paste', null, 'application/octet-stream'],
+  ] as const;
+  for (const [head, name, declared, type] of types)
+    assert.equal(
+      detectType(head, name, declared),
+      type ?? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      name,
+    );
+
+  const rejected = chatFailure({
+    stage: 'stream',
+    kind: 'attachment-rejected',
+    message: 'The model cannot read this file.',
+  });
+  const reply = (text: string): ChatScriptStep[] => [
+    { kind: 'text', itemId: 'reply', chunks: [text] },
+  ];
+  const adapters = new Map([
+    [
+      'openai',
+      createScriptedChatAdapter({
+        family: 'openai',
+        turns: [[{ kind: 'fail', stopReason: 'error', failure: rejected }]],
+      }),
+    ],
+    [
+      'google',
+      createScriptedChatAdapter({
+        family: 'google',
+        turns: [reply('A bar chart.'), reply('A chart of sales.')],
+      }),
+    ],
+  ] as const);
+  const { store, service, taskId, read, root } = standalone(t, { adapters });
+  const outside = mkdtempSync(join(tmpdir(), 'crewkite-attach-'));
+  t.after(() => rmSync(outside, { recursive: true, force: true }));
+  const png = Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.alloc(32, 7)]);
+  writeFileSync(join(outside, 'chart.png'), png);
+  // The copy is whole before the transaction opens, and a partial one a crash left goes first.
+  const folder = join(dirname(root), 'chat', taskId, 'files');
+  const partials = () => readdirSync(folder).filter((name) => name.startsWith('.import-'));
+  mkdirSync(folder, { recursive: true });
+  writeFileSync(join(folder, '.import-0123456789ab-0123456789abcdef'), 'partial');
+  const staged: number[] = [];
+  const importing = (source: Parameters<ChatService['importAttachment']>[0]['source']) => {
+    const payload = { taskId, source };
+    return service.importing(payload, () => {
+      staged.push(...partials().map((name) => statSync(join(folder, name)).size));
+      return store.transaction(() => service.importAttachment(payload));
+    });
+  };
+  const first = await importing({ path: join(outside, 'chart.png') });
+  assert.deepEqual(staged, [png.length]);
+  assert.deepEqual(partials(), []);
+  assert.deepEqual(first.data, {
+    kind: 'chat-attachment',
+    id: createHash('sha256').update(png).digest('hex'),
+    name: 'chart.png',
+    mimeType: 'image/png',
+    bytes: png.length,
+  });
+  assert.deepEqual(await importing({ path: join(outside, 'chart.png') }), first);
+  const pasted = { name: 'chart.png', mimeType: 'image/png', base64: png.toString('base64') };
+  assert.deepEqual(await importing(pasted), first);
+  for (const path of [outside, join(outside, 'missing.png'), '/dev/null'])
+    assert.equal((await importing({ path })).reason, 'file-refused', path);
+  assert.deepEqual(partials(), []);
+
+  const { kind: _, ...file } = first.data as ChatAttachment & { kind: 'chat-attachment' };
+  const ask = (files: ChatAttachment[]) =>
+    act(store, (effects) =>
+      service.sendMessage(
+        {
+          taskId,
+          text: 'What is in this chart?',
+          selection,
+          role: 'assistant',
+          attachments: [],
+          files,
+        },
+        effects,
+      ),
+    );
+  // Rows: an unknown id or name is refused, and the type comes from the import, whatever the
+  // payload says.
+  assert.equal(ask([{ ...file, id: 'f'.repeat(64) }]).reason, 'file-not-found');
+  assert.equal(ask([{ ...file, name: 'other.png' }]).reason, 'file-not-found');
+  const failed = turnReaches({ store }, 'failed');
+  assert.equal(ask([{ ...file, mimeType: 'text/plain' }]).outcome, 'applied');
+  const turn = await failed;
+  const [sent] = (adapters.get('openai')?.requests ?? []) as ChatTurnRequest[];
+  const path = sent.files?.[0]?.path ?? '';
+  assert.deepEqual(sent.files, [{ attachment: file, path }]);
+  assert.deepEqual(readFileSync(path), png);
+  // One folder per hash, and one copy in it.
+  assert.deepEqual(readdirSync(dirname(dirname(path))), [file.id]);
+  assert.deepEqual(readdirSync(dirname(path)), ['chart.png']);
+
+  // Try with Google takes the handoff path, and the packet names the file it carries.
+  const google = { family: 'google', model: 'google-model', effort: 'default' } as const;
+  const retry = (mode: 'retry' | 'regenerate', turnId: string, choice?: ChatModelSelection) =>
+    act(store, (effects) =>
+      service.retryTurn(
+        { taskId, turnId, mode, ...(choice ? { selection: choice } : {}) },
+        effects,
+      ),
+    );
+  const moved = turnReaches({ store }, 'done');
+  assert.equal(retry('retry', turn.id, google).outcome, 'applied');
+  const answered = await moved;
+  const requests = (adapters.get('google')?.requests ?? []) as ChatTurnRequest[];
+  const [carried] = requests;
+  assert.match(carried.prompt, /^This thread moved from OpenAI to Google\./);
+  assert.match(carried.prompt, /^chart\.png \(image\/png, 40 bytes\)$/m);
+  assert.deepEqual(carried.files, sent.files);
+
+  // Regenerate keeps the first reply. The rerun starts a fresh session, since the old one holds
+  // the reply it replaces.
+  assert.equal(retry('retry', answered.id).reason, 'turn-not-retryable');
+  assert.equal(retry('regenerate', turn.id).reason, 'turn-not-latest');
+  const regenerated = turnReaches({ store }, 'done');
+  assert.equal(retry('regenerate', answered.id).outcome, 'applied');
+  await regenerated;
+  const again = requests[1];
+  assert.match(again.prompt, /^This message runs again on Google in a new session\./);
+  assert.match(again.prompt, /New message:\nWhat is in this chart\?$/);
+  assert.equal(again.session, null);
+  assert.deepEqual(again.files, sent.files);
+  const thread = read();
+  assert.deepEqual(
+    thread.messages.map((message) => message.text),
+    [
+      'What is in this chart?',
+      `${rejected.message} ${rejected.nextAction}`,
+      'Continued on Google from OpenAI. Reason: switched in the composer.',
+      'A bar chart.',
+      'Regenerated',
+      'A chart of sales.',
+    ],
+  );
+  assert.ok(thread.turns.every((value) => value.userMessageId === turn.userMessageId));
+
+  // Rows: Regenerate, then Retry after it fails, on the family that answered. Anthropic and Google
+  // read no history in a new session, so each rerun carries the conversation before the message.
+  const broke = chatFailure({ stage: 'stream', kind: 'internal', message: 'The reply broke.' });
+  for (const family of ['anthropic', 'google'] as const) {
+    const pick = { family, model: `${family}-model`, effort: 'default' } as const;
+    const scripted = createScriptedChatAdapter({
+      family,
+      turns: [
+        reply('One.'),
+        reply('Two.'),
+        [{ kind: 'fail', stopReason: 'error', failure: broke }],
+        reply('Three.'),
+      ],
+    });
+    const rerun = standalone(t, { adapters: new Map([[family, scripted]]) });
+    const again = (mode: 'retry' | 'regenerate', turnId: string, state: ChatTurn['state']) => {
+      const reached = turnReaches({ store: rerun.store }, state);
+      act(rerun.store, (effects) =>
+        rerun.service.retryTurn({ taskId: rerun.taskId, turnId, mode }, effects),
+      );
+      return reached;
+    };
+    for (const text of ['First.', 'Second.']) {
+      const done = turnReaches({ store: rerun.store }, 'done');
+      rerun.send(text, pick);
+      await done;
+    }
+    const answered = rerun.read().turns.at(-1) as ChatTurn;
+    const failed = await again('regenerate', answered.id, 'failed');
+    await again('retry', failed.id, 'done');
+    assert.equal(scripted.requests[1].session?.sessionId, `session-${scripted.requests[0].turnId}`);
+    for (const request of scripted.requests.slice(2)) {
+      assert.equal(request.session, null, family);
+      assert.deepEqual(request.history, [], family);
+      assert.match(request.prompt, /^This message runs again on .+ in a new session\./, family);
+      assert.match(request.prompt, /^Person:\nFirst\.\n\nAssistant:\nOne\.$/m, family);
+      assert.match(request.prompt, /New message:\nSecond\.$/, family);
+      assert.doesNotMatch(request.prompt, /Two\./, family);
+    }
+  }
+
+  // Rows: a handoff to Google carries the newest 32 earlier files marked earlier, and the file of
+  // the message itself unmarked. Back on OpenAI the resumed session already holds the files of the
+  // messages it ran, so only the one Google saw travels.
+  const families = new Map(
+    (['openai', 'google'] as const).map((family) => [
+      family,
+      createScriptedChatAdapter({ family, turns: [reply('Seen.')] }),
+    ]),
+  );
+  const carry = standalone(t, { adapters: families });
+  const notes: ChatAttachment[] = [];
+  for (let index = 0; index < 34; index++) {
+    const source = { name: `n${index}.txt`, mimeType: 'text/plain', base64: btoa(`note ${index}`) };
+    const payload = { taskId: carry.taskId, source };
+    const stored = await carry.service.importing(payload, () =>
+      carry.store.transaction(() => carry.service.importAttachment(payload)),
+    );
+    const { kind: _kind, ...attachment } = stored.data as ChatAttachment & {
+      kind: 'chat-attachment';
+    };
+    notes.push(attachment);
+  }
+  const message = async (files: ChatAttachment[], choice: ChatModelSelection) => {
+    const done = turnReaches({ store: carry.store }, 'done');
+    act(carry.store, (effects) =>
+      carry.service.sendMessage(
+        {
+          taskId: carry.taskId,
+          text: 'Read these.',
+          selection: choice,
+          role: 'assistant',
+          attachments: [],
+          files,
+        },
+        effects,
+      ),
+    );
+    await done;
+  };
+  await message(notes.slice(0, 32), selection);
+  await message(notes.slice(32), selection);
+  await message([notes[33]], google);
+  await message([], selection);
+  const names = (request: ScriptedChatRequest) =>
+    ((request as ChatTurnRequest).files ?? []).map(
+      (file) => `${file.attachment.name}${file.earlier ? ' earlier' : ''}`,
+    );
+  assert.deepEqual(names(families.get('google')?.requests[0] as ScriptedChatRequest), [
+    ...notes.slice(1, 33).map((note) => `${note.name} earlier`),
+    'n33.txt',
+  ]);
+  assert.deepEqual(names(families.get('openai')?.requests[2] as ScriptedChatRequest), [
+    'n33.txt earlier',
+  ]);
+});
+
+test('rename sets the thread title, and delete removes the thread, its scratch copy and files for good', {
+  timeout: 30000,
+}, async (t) => {
+  const scripted = createScriptedChatAdapter({ family: 'openai', turns: [[{ kind: 'wait' }]] });
+  const { store, service, taskId, start, send, root } = standalone(t, {
+    adapters: new Map([['openai', scripted]]),
+  });
+  const pasted = { name: 'note.txt', mimeType: 'text/plain', base64: 'aGVsbG8=' };
+  const imported = { taskId, source: pasted };
+  await service.importing(imported, () =>
+    store.transaction(() => service.importAttachment(imported)),
+  );
+  const running = turnReaches({ store }, 'running');
+  const launched = next(
+    { store },
+    (event) => event.type === 'agent.event' && event.payload.type === 'turn.started',
+  );
+  send('Read the note.');
+  const turn = await running;
+  await launched;
+  const remove = (on = service) => act(store, (effects) => on.deleteThread({ taskId }, effects));
+  assert.equal(remove().reason, 'turn-running');
+  const stopped = turnReaches({ store }, 'stopped');
+  act(store, (effects) => service.stopTurn({ taskId, turnId: turn.id }, effects));
+  await stopped;
+
+  const rename = (title: string) =>
+    store.transaction(() => service.renameThread({ taskId, title }));
+  assert.equal(rename(' \n ').reason, 'title-empty');
+  const renamed = rename('  Sales\n chart ').entity as Task;
+  assert.deepEqual([renamed.title, renamed.revision], ['Sales chart', 1]);
+  assert.deepEqual(store.get<Task>('task', taskId), renamed);
+
+  // A run that names the task keeps it.
+  store.transaction(() => store.put('run', 'run_held', 0, { id: 'run_held', taskId }));
+  assert.equal(remove().reason, 'thread-has-runs');
+  store.db.prepare("DELETE FROM entities WHERE id='run_held'").run();
+
+  // Rows: large events keep their output in artifacts. One holds a hash nothing else names, and
+  // its file goes. The other shares its hash with an artifact outside the thread, and the file stays.
+  const artifacts = new ArtifactFiles(join(dirname(root), 'artifacts'));
+  const cursors = store.db
+    .prepare('SELECT cursor,event_id FROM events WHERE task_id=? ORDER BY cursor LIMIT 2')
+    .all(taskId) as { cursor: number; event_id: string }[];
+  const outputs = ['alone', 'shared'].map((content, index) => ({
+    id: `art_output${index}`,
+    ...artifacts.publish(Buffer.from(content)),
+    mediaType: 'application/vnd.crewkite.event+json',
+  }));
+  const kept = { ...outputs[1], id: 'art_kept', mediaType: 'text/plain' };
+  store.transaction(() => {
+    for (const [index, artifact] of [...outputs, kept].entries()) {
+      store.put('artifact', artifact.id, 0, artifact);
+      if (artifact !== kept)
+        store.db
+          .prepare('INSERT INTO activity_output(cursor,event_id,artifact_id) VALUES (?,?,?)')
+          .run(cursors[index].cursor, cursors[index].event_id, artifact.id);
+    }
+  });
+
+  // The controller stops after the delete commits and before its folder goes. Startup finishes it.
+  const folder = dirname(scripted.requests[0].scratch.directory);
+  const ref = `refs/crewkite/threads/${taskId}`;
+  git(root, ['update-ref', ref, scripted.requests[0].scratch.base]);
+  assert.equal(store.transaction(() => service.deleteThread({ taskId }, [])).outcome, 'applied');
+  assert.ok(existsSync(join(folder, 'files')));
+  const restarted = start();
+  restarted.recover();
+  assert.equal(existsSync(folder), false);
+  assert.equal(git(root, ['for-each-ref', ref]).toString(), '');
+  assert.equal(store.get('task', taskId), undefined);
+  assert.deepEqual(
+    [...outputs, kept].map((artifact) => store.get('artifact', artifact.id) !== undefined),
+    [false, false, true],
+  );
+  assert.throws(() => artifacts.read(outputs[0].hash), /ENOENT/);
+  assert.equal(artifacts.read(kept.hash).toString(), 'shared');
+  for (const table of ['conversation_entries', 'chat_turns', 'chat_threads', 'events'])
+    assert.equal(
+      store.db.prepare(`SELECT count(*) AS rows FROM ${table} WHERE task_id=?`).get(taskId)?.rows,
+      0,
+      table,
+    );
+  assert.equal(remove(restarted).reason, 'task-not-found');
 });

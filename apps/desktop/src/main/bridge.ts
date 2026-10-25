@@ -19,9 +19,12 @@ import {
   SnapshotScopeSchema,
 } from '@crewkite/contracts';
 import { type BrowserWindow, dialog, ipcMain } from 'electron';
+import { attachRequest } from '../shared/attach.ts';
+import { ComposerFiles } from './attach.ts';
+import { PathGrants } from './grants.ts';
 import { CommandReceipts, syncDirectory } from './receipts.ts';
 import { type DesktopController, desktopActor } from './runtime.ts';
-import { assertSender } from './security.ts';
+import { assertSender, openExternalLink } from './security.ts';
 
 const verifications = new WeakMap<BrowserWindow, { requestId: string; abort: AbortController }>();
 const validVerificationId = (value: unknown): value is string =>
@@ -37,6 +40,7 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
   let activeCommand: Command | null = null;
   let cancelling = false;
   const receipts = new CommandReceipts(controller.paths.home, controller.paths.profile);
+  const grants = new PathGrants();
   let connection: DesktopNotice = {
     kind: 'connection',
     state: 'connecting',
@@ -157,6 +161,8 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
     'events',
     'verify-artifact',
     'cancel-artifact-verification',
+    'open-link',
+    'attach',
   ];
   for (const channel of handlers) ipcMain.removeHandler(`crewkite:${channel}`);
   ipcMain.handle('crewkite:verify-artifact', async (event, input: unknown) => {
@@ -230,6 +236,8 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       key: createCommandKey(),
       actor: desktopActor,
     });
+    const refused = grants.refusal(command);
+    if (refused) throw new Error(refused);
     if (
       [
         'GetWorkspaceState',
@@ -239,6 +247,7 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
         'GetArtifactRange',
         'GetTaskOperations',
         'ReadChatThread',
+        'ReadChatTurnEvents',
         'ReadChatChanges',
         'ReadChatCatalog',
         'RefreshChatModels',
@@ -410,6 +419,19 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       activeCommand = null;
     }
   });
+  ipcMain.handle('crewkite:open-link', (event, url: unknown) => {
+    assertSender(event, window);
+    return openExternalLink(window, url);
+  });
+  const files = new ComposerFiles(window, grants);
+  ipcMain.handle('crewkite:attach', async (event, input: unknown) => {
+    assertSender(event, window);
+    const request = attachRequest(input);
+    if (!request) throw new Error('The file request is invalid.');
+    const found = await files.find(request);
+    assertSender(event, window);
+    return found;
+  });
   ipcMain.handle('crewkite:events', (event) => {
     assertSender(event, window);
     listening = true;
@@ -429,6 +451,7 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
   });
   window.once('closed', () => {
     verifications.get(window)?.abort.abort();
+    files.close();
     for (const channel of handlers) ipcMain.removeHandler(`crewkite:${channel}`);
   });
   async function connect() {

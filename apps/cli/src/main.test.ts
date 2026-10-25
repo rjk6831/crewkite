@@ -41,6 +41,7 @@ test('CLI lists traverse empty pages and preserve incomplete output', async (con
     revision: 0,
     runId: null,
     next: null,
+    chatActivity: 'idle' as const,
   };
   const next = {
     version: 1 as const,

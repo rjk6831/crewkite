@@ -7,12 +7,15 @@ import {
   ApprovalBindingSchema,
   AttemptOutputSchema,
   CandidateEvaluationPreviewSchema,
+  ChatAttachmentSchema,
   ChatBranchStatusSchema,
   type ChatCatalogEntry,
   ChatCrewChainSchema,
   ChatCrewSchema,
   ChatFlightModeSchema,
   type ChatHandoffMode,
+  ChatQueuedMessageSchema,
+  ChatTurnEventsReadSchema,
   ChatTurnStatsSchema,
   CheckEventSchema,
   CheckResultSchema,
@@ -36,18 +39,21 @@ import {
   CursorSchema,
   canonicalJson,
   DesktopNoticeSchema,
+  DiscardChatChangePayloadSchema,
   FakeWorkerEventSchema,
   FakeWorkerInputSchema,
   formatReviewTarget,
   GitHubReadRequestSchema,
   GoogleAcpSetupSchema,
   GrantSchema,
+  ImportChatAttachmentPayloadSchema,
   LocalEndpointSchema,
   LocalModelBindingSchema,
   LocalModelObservationSchema,
   LocalObservedModelBindingSchema,
   LocalSetupReceiptSchema,
   LocalSetupSchema,
+  MAX_CHAT_PASTE_BYTES,
   MinorAmountSchema,
   NativeBillingAttestationSchema,
   NativeHandoffPreviewSchema,
@@ -3293,6 +3299,7 @@ test('each handoff mode ranks the families by its own rule', () => {
       percent === null
         ? []
         : [{ windowId: 'weekly', label: 'Weekly', percent, resetsAt, observedAt: null }],
+    accepts: null,
   });
   // OpenAI has the most left. Anthropic resets soonest. Google has the best pace: 60 percent over
   // five hours is 12 an hour, against 10 for Anthropic and under 2 for OpenAI. Local reports none.
@@ -3356,12 +3363,94 @@ test('the chat schemas accept the shapes the renderer sends and reject the ones 
     usedTokens: 6097,
     capacityTokens: 8192,
   };
+  const file = { id: 'a'.repeat(64), name: 'shot.png', mimeType: 'image/png', bytes: 2048 };
+  // A full last group with one pad character decodes to exactly the cap.
+  const pasteAtCap = `${'A'.repeat(Math.ceil(MAX_CHAT_PASTE_BYTES / 3) * 4 - 1)}=`;
+  const paste = (base64: string) => ({
+    taskId,
+    source: { name: 'paste.png', mimeType: 'image/png', base64 },
+  });
+  const delta = { type: 'text.delta', turnId, itemId: 'item-1', text: 'Done.' };
   const rows: [
     string,
     { safeParse: (input: unknown) => { success: boolean } },
     unknown,
     boolean,
   ][] = [
+    [
+      'a paste of exactly 32 MiB is accepted',
+      ImportChatAttachmentPayloadSchema,
+      paste(pasteAtCap),
+      true,
+    ],
+    [
+      'a paste one byte over 32 MiB is refused',
+      ImportChatAttachmentPayloadSchema,
+      paste(pasteAtCap.replace(/=$/, 'A')),
+      false,
+    ],
+    [
+      'a paste that is not base64 is refused',
+      ImportChatAttachmentPayloadSchema,
+      paste('ab$='),
+      false,
+    ],
+    [
+      'a relative path to attach is refused',
+      ImportChatAttachmentPayloadSchema,
+      { taskId, source: { path: 'docs/shot.png' } },
+      false,
+    ],
+    [
+      'a file name with a folder part is refused',
+      ChatAttachmentSchema,
+      { ...file, name: 'a/b.png' },
+      false,
+    ],
+    [
+      'a saved queued message with only path attachments still parses',
+      ChatQueuedMessageSchema,
+      {
+        id: `msg_${suffix}`,
+        at: '2026-10-25T10:00:00Z',
+        text: 'Look',
+        attachments: ['/tmp/a.png'],
+      },
+      true,
+    ],
+    [
+      'a saved user entry with only path attachments still parses',
+      ConversationEntrySchema,
+      {
+        id: `msg_${suffix}`,
+        taskId,
+        revision: 1,
+        cursor: '3',
+        at: '2026-10-25T10:00:00.000Z',
+        kind: 'user-message',
+        text: 'Look',
+        author: { kind: 'user' },
+        attachments: ['src/a.ts'],
+      },
+      true,
+    ],
+    [
+      'a turn event page holds only its own turn',
+      ChatTurnEventsReadSchema,
+      {
+        taskId,
+        turnId,
+        events: [{ ...delta, turnId: `trn_${'1'.repeat(26)}` }],
+        nextAfterCursor: null,
+      },
+      false,
+    ],
+    [
+      'a discard outside the repository is refused',
+      DiscardChatChangePayloadSchema,
+      { taskId, path: '../secrets.env' },
+      false,
+    ],
     ['glide is a flight mode', ChatFlightModeSchema, 'glide', true],
     ['autopilot is not a flight mode', ChatFlightModeSchema, 'autopilot', false],
     ['a chain on its first fix is valid', ChatCrewChainSchema, chain, true],

@@ -1,5 +1,16 @@
-import { isAbsolute, relative, resolve, sep } from 'node:path';
-import type { ChatFamily } from '@crewkite/contracts';
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+  statSync,
+} from 'node:fs';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import type { ChatAttachment, ChatFamily } from '@crewkite/contracts';
+import { anthropicInstructionFile } from '../providers/anthropic/instructions.ts';
+import { googleInstructionFile } from '../providers/google/instructions.ts';
 import type { ChatHistoryEntry } from './adapter.ts';
 
 export const familyName: Record<ChatFamily, string> = {
@@ -9,19 +20,112 @@ export const familyName: Record<ChatFamily, string> = {
   local: 'Local',
 };
 
-export type HandoffReason = 'manual' | 'limit' | 'steer';
+// rerun: Retry or Regenerate on the family that already answered the message, in a new session.
+export type HandoffReason = 'manual' | 'limit' | 'steer' | 'rerun';
 
 export function handoffReason(reason: HandoffReason): string {
+  if (reason === 'rerun') return 'the person asked for the reply again';
   if (reason === 'steer') return 'the person sent a new message during the reply';
   return reason === 'limit' ? 'usage limit reached' : 'switched in the composer';
 }
 
-export function systemContext(projectName: string, directory: string): string {
-  return [
+/**
+ * The framing for an assistant or fixer turn. The Anthropic client launches with no setting
+ * sources and Local has no instruction loader, so those two get the project's instruction files
+ * here. The OpenAI and Google clients read their own files from the working folder.
+ */
+export function systemContext(projectName: string, directory: string, family: ChatFamily): string {
+  const framing = [
     `You are working on the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
     'Read and edit files only inside that copy. The person reviews every change in Changes before it reaches their repository.',
     'When you change files, say which files you changed and why.',
+    'The scratch copy has no `.git` folder and no installed dependencies, so git commands and tests may fail there.',
   ].join('\n');
+  const instructions =
+    family === 'anthropic' || family === 'local' ? projectInstructions(directory) : [];
+  return [framing, ...instructions].join('\n\n');
+}
+
+/** Instruction files at the scratch root, in the order systemContext reads them. */
+export const instructionFiles = ['AGENTS.md', anthropicInstructionFile, googleInstructionFile];
+
+/** The instruction files the scratch copy holds, so the next provider knows where to look. */
+export function presentInstructions(directory: string): string[] {
+  return instructionFiles.filter((name) => {
+    try {
+      return statSync(join(directory, name)).isFile();
+    } catch {
+      return false;
+    }
+  });
+}
+const INSTRUCTION_BYTES = 64 * 1024;
+const INSTRUCTIONS_CUT = '[The project instructions stop here at the 64 KiB limit.]';
+
+/**
+ * One section per instruction file at the scratch root, in a fixed order. A link that resolves to a
+ * file inside the copy counts once, under the first name that reaches it. Headers and text share
+ * 64 KiB, and a cut ends on a whole line.
+ */
+function projectInstructions(directory: string): string[] {
+  let root: string;
+  try {
+    root = realpathSync.native(directory);
+  } catch {
+    return [];
+  }
+  const read = new Set<string>();
+  const sections: string[] = [];
+  let used = 0;
+  for (const name of instructionFiles) {
+    let file: string;
+    try {
+      file = realpathSync.native(join(root, name));
+    } catch {
+      continue;
+    }
+    if (!file.startsWith(`${root}${sep}`) || read.has(file)) continue;
+    read.add(file);
+    const header = `Project instructions from ${name}:\n\n`;
+    const room = INSTRUCTION_BYTES - used - Buffer.byteLength(header);
+    const bytes = readFileStart(file, Math.max(room, 0) + 1);
+    if (bytes === null || bytes.length === 0) continue;
+    if (bytes.length <= room) {
+      sections.push(`${header}${bytes.toString('utf8').trimEnd()}`);
+      used += Buffer.byteLength(header) + bytes.length;
+      continue;
+    }
+    const end = room > 0 ? bytes.lastIndexOf(10, room - 1) : -1;
+    const kept = end < 0 ? '' : bytes.subarray(0, end).toString('utf8').trimEnd();
+    sections.push(kept ? `${header}${kept}\n${INSTRUCTIONS_CUT}` : INSTRUCTIONS_CUT);
+    break;
+  }
+  return sections;
+}
+
+/** The first bytes of a regular file, or null for anything else. A FIFO never blocks the read. */
+function readFileStart(path: string, limit: number): Buffer | null {
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+  } catch {
+    return null;
+  }
+  try {
+    if (!fstatSync(fd).isFile()) return null;
+    const buffer = Buffer.alloc(limit);
+    let length = 0;
+    while (length < limit) {
+      const count = readSync(fd, buffer, length, limit - length, length);
+      if (count === 0) break;
+      length += count;
+    }
+    return buffer.subarray(0, length);
+  } catch {
+    return null;
+  } finally {
+    closeSync(fd);
+  }
 }
 
 // A review reads the changed files and their patches, so the patches get a fixed share of the prompt.
@@ -195,6 +299,10 @@ export function handoffPacket(input: {
   history: readonly ChatHistoryEntry[];
   files: readonly string[] | null;
   prompt: string;
+  /** Instruction files at the scratch root. The next provider reads them from the copy. */
+  instructions?: readonly string[];
+  /** Files the conversation carried. The request for the new message sends each of them again. */
+  attachments?: readonly Pick<ChatAttachment, 'name' | 'mimeType' | 'bytes'>[];
 }): string {
   const answers = input.history.flatMap((entry, index) =>
     entry.role === 'assistant' ? [index] : [],
@@ -214,16 +322,42 @@ export function handoffPacket(input: {
         ? input.files.join('\n')
         : 'No files changed yet.';
   // Send now stops a reply and starts the next message on the same family. The packet then tells
-  // the model what the stopped reply left behind.
+  // the model what the stopped reply left behind. A rerun starts a new session, since the old one
+  // holds the reply it replaces.
   const opening =
-    input.from === input.to
-      ? `The last reply on ${familyName[input.from]} was stopped before it finished. Reason: ${handoffReason(input.reason)}.`
-      : `This thread moved from ${familyName[input.from]} to ${familyName[input.to]}. Reason: ${handoffReason(input.reason)}.`;
+    input.reason === 'rerun'
+      ? `This message runs again on ${familyName[input.to]} in a new session. Reason: ${handoffReason(input.reason)}.`
+      : input.from === input.to
+        ? `The last reply on ${familyName[input.from]} was stopped before it finished. Reason: ${handoffReason(input.reason)}.`
+        : `This thread moved from ${familyName[input.from]} to ${familyName[input.to]}. Reason: ${handoffReason(input.reason)}.`;
   return [
     opening,
     'Earlier work is in the same scratch copy. Read files before you change them.',
     `Conversation so far, oldest first:\n\n${transcript.join('\n\n') || 'No earlier messages.'}`,
     `Files changed in the scratch copy against the base commit:\n${files}`,
+    ...(input.instructions?.length
+      ? [`Project instructions: ${input.instructions.join(', ')}`]
+      : []),
+    ...(input.attachments?.length
+      ? [
+          `Files the person attached in this thread. They come with the new message:\n${input.attachments
+            .map((file) => `${file.name} (${file.mimeType}, ${byteSize(file.bytes)})`)
+            .join('\n')}`,
+        ]
+      : []),
     `New message:\n${input.prompt}`,
   ].join('\n\n');
+}
+
+/** "812 bytes", "12.4 KiB", "3.0 MiB". */
+export function byteSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} ${bytes === 1 ? 'byte' : 'bytes'}`;
+  const units = ['KiB', 'MiB', 'GiB', 'TiB'];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${value.toFixed(1)} ${units[unit]}`;
 }

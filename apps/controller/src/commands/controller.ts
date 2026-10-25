@@ -60,7 +60,7 @@ import {
   validateAcpSetupProof,
 } from '../providers/google/acp/profile.ts';
 import type { AcpDependencies, startGoogleAcpSetup } from '../providers/google/acp/writer.ts';
-import { googleChatAdapter } from '../providers/google/chat.ts';
+import { type GooglePromptCapabilities, googleChatAdapter } from '../providers/google/chat.ts';
 import type { CapturedContext } from '../providers/google/native-extension/connector.ts';
 import type {
   googleUsageObservations,
@@ -388,13 +388,20 @@ export class Controller {
     return this.chatRuntime;
   }
 
+  // What the Google and Local clients last reported about the files they take. Memory only: the
+  // next turn on each family reports again.
+  private googlePrompt: GooglePromptCapabilities | null = null;
+  private localVision: { modelKey: string; vision: boolean } | null = null;
+
   private chatCatalog(): ChatCatalogRead {
     const profiles = this.resolveProfiles();
     return buildChatCatalog({
       profiles: profiles.map((profile) => profile.facts),
       openAiModels: this.latestOpenAiModels(profiles)?.models ?? null,
       anthropicModel: this.anthropicUsage().clientModel(),
+      googlePrompt: this.googlePrompt,
       local: this.localSetup(),
+      localVision: this.localVision,
       windows: [
         ...this.store.list<Observation>('window').map((observation) => ({
           family: this.store.get<Route>('route', observation.routeId)?.family,
@@ -671,6 +678,9 @@ export class Controller {
       onUsage: (reading) => this.anthropicUsage().recordTurnReading(reading),
     });
     const google = googleChatAdapter({
+      onPromptCapabilities: (capabilities) => {
+        this.googlePrompt = capabilities;
+      },
       launch: (request: ChatTurnRequest) => {
         const setup = this.store.googleAcpSetup();
         const resolution = this.acpResolution();
@@ -711,11 +721,13 @@ export class Controller {
           throw Error('Local is not connected. Open Settings, load a model and connect Local.');
         const secret = this.localSecret?.secret.toString('utf8') ?? null;
         if (control.authMode !== 'none' && !secret) throw Error('The Local token is unavailable.');
-        return connectLocalModel({
+        const connection = await connectLocalModel({
           endpoint: control.endpoint,
           token: control.authMode === 'none' ? null : secret,
           model: request.selection.model,
         });
+        this.localVision = { modelKey: connection.modelKey, vision: connection.vision };
+        return connection;
       },
     });
     return new Map<ChatFamily, ChatAdapter>([
@@ -795,6 +807,9 @@ export class Controller {
         return this.chat().openPullRequest(command.payload);
       return this.chat().branchStatus(command.payload);
     }
+    // The file copies before the command's transaction opens. A replay answers from its receipt.
+    if (command.command === 'ImportChatAttachment' && !this.store.receipt(command.key))
+      return this.chat().importing(command.payload, () => this.commitCommand(command, principal));
     const preparing = this.verificationPreparation;
     if (preparing?.key === command.key)
       return preparing.hash === hashCanonical(command) && preparing.principal === principal
@@ -1151,6 +1166,11 @@ export class Controller {
         'HandoffChatThread',
         'AcceptChatChanges',
         'SteerChatMessage',
+        'ImportChatAttachment',
+        'RetryChatTurn',
+        'DiscardChatChange',
+        'RenameChatThread',
+        'DeleteChatThread',
       ].includes(command.command)
     ) {
       // A thread streams events many times a second. Its commands serialize on the active turn,
@@ -1303,6 +1323,18 @@ export class Controller {
         return this.chat().handoff(command.payload, effects);
       case 'SteerChatMessage':
         return this.chat().steer(command.payload, effects);
+      case 'ImportChatAttachment':
+        return this.chat().importAttachment(command.payload);
+      case 'RetryChatTurn':
+        return this.chat().retryTurn(command.payload, effects);
+      case 'DiscardChatChange':
+        return this.chat().discardChange(command.payload, command.key);
+      case 'RenameChatThread':
+        return this.chat().renameThread(command.payload);
+      case 'DeleteChatThread':
+        return this.chat().deleteThread(command.payload, effects);
+      case 'ReadChatTurnEvents':
+        return this.chat().readTurnEvents(command.payload);
       case 'AcceptChatChanges':
         return this.chat().accept(
           command.payload,

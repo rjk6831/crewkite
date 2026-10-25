@@ -36,6 +36,8 @@ Each record states one decision, the context that forced it, why I chose it and 
 | [0036](0036-the-chat-thread-is-the-product-center.md) | Make the chat thread the product center | Proposed |
 | [0037](0037-push-and-pull-requests-from-the-changes-tab.md) | Push and open pull requests from the Changes tab | Proposed |
 | [0038](0038-crew-and-flight-modes.md) | Run a crew in a thread, with flight modes and four handoff modes | Accepted |
+| [0039](0039-attachments-follow-each-client.md) | Send each attached file the way its client takes it | Accepted |
+| [0040](0040-accept-from-the-thread-base.md) | Accept from the thread's base, whatever HEAD is | Accepted |
 
 ## Writing a new record
 

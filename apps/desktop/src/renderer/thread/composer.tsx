@@ -1,4 +1,6 @@
+import type { DesktopAttachInput, DesktopFile } from '@crewkite/client';
 import type {
+  ChatAttachment,
   ChatCatalogRead,
   ChatFamily,
   ChatModelSelection,
@@ -6,6 +8,8 @@ import type {
 } from '@crewkite/contracts';
 import { ArrowUp, Paperclip, Square } from 'lucide-react';
 import {
+  type ClipboardEvent,
+  type DragEvent,
   type FormEvent,
   type KeyboardEvent,
   type Ref,
@@ -15,25 +19,48 @@ import {
   useRef,
   useState,
 } from 'react';
+import { familyName } from '../components.tsx';
 import { ContextGauge } from '../context-gauge.tsx';
 import { flightModes, preferredSelection } from '../settings/preferences.ts';
-import { AttachmentChips, AttachRow } from './attach.tsx';
-import { configureThread, readCatalog, type ThreadSource } from './commands.ts';
+import { type ChipFile, chipOf, FileChips, keepThumbnail } from './attach.tsx';
+import { configureThread, importAttachment, readCatalog, type ThreadSource } from './commands.ts';
+import { acceptsType } from './file-fit.ts';
 import { defaultSelection, ModelPicker } from './model-picker.tsx';
 import { type RoleAction, roleActions, useRoleRun } from './role-row.tsx';
 
+/**
+ * A file in the composer. In a saved thread the controller stores it as soon as it is added, so
+ * `file` is set. A new thread has no task yet, and its files wait as paths until the first send.
+ */
+export type ComposerFile = ChipFile & { path: string | null; file: ChatAttachment | null };
+
 export type SendInput = {
   text: string;
-  attachments: string[];
+  files: ComposerFile[];
   selection: ChatModelSelection | null;
 };
 
 /** What the thread view can ask of the composer. */
 export type ComposerHandle = {
   fill: (text: string) => void;
-  /** Put text back, as after a stop clears the queue, unless the box already holds some. */
-  restore: (text: string) => void;
+  /** Put text and files back, as after a stop clears the queue, unless the box already holds some. */
+  restore: (text: string, files?: readonly ChatAttachment[]) => void;
 };
+
+const MAX_FILES = 32;
+const stored = (file: ChatAttachment): ComposerFile => ({ ...chipOf(file), path: null, file });
+const local = (found: DesktopFile, busy: boolean): ComposerFile => ({
+  key: `path:${found.path}`,
+  name: found.name,
+  bytes: found.bytes,
+  mimeType: null,
+  thumbnail: found.thumbnail,
+  busy,
+  path: found.path,
+  file: null,
+});
+const failureText = (failure: unknown, fallback: string) =>
+  failure instanceof Error ? failure.message : fallback;
 
 // Unsent text survives switching threads for as long as the window stays open.
 const drafts = new Map<string, string>();
@@ -53,6 +80,7 @@ export function Composer({
   onConfigured,
   onHandoff,
   onOpenCrew,
+  onCatalog,
 }: {
   ref?: Ref<ComposerHandle>;
   source: ThreadSource;
@@ -69,11 +97,13 @@ export function Composer({
   onHandoff: (selection: ChatModelSelection) => Promise<void>;
   /** Opens the inspector on the Crew tab. A new thread has no crew yet and leaves it out. */
   onOpenCrew?: () => void;
+  /** Each catalog the composer reads, so the thread can offer the same families. */
+  onCatalog?: (catalog: ChatCatalogRead) => void;
 }) {
   const draftKey = taskId ?? 'new';
   const [text, setText] = useState(() => drafts.get(draftKey) ?? '');
-  const [attachments, setAttachments] = useState<string[]>([]);
-  const [adding, setAdding] = useState<string | null>(null);
+  const [files, setFiles] = useState<ComposerFile[]>([]);
+  const [dropping, setDropping] = useState(false);
   const [catalog, setCatalog] = useState<ChatCatalogRead | null>(null);
   const [selection, setSelection] = useState<ChatModelSelection | null>(thread?.selection ?? null);
   const [note, setNote] = useState<string | null>(null);
@@ -89,8 +119,9 @@ export function Composer({
     };
     return {
       fill,
-      restore: (value) => {
+      restore: (value, back = []) => {
         if (!text.trim()) fill(value);
+        if (files.length === 0 && back.length > 0) setFiles(back.map(stored));
       },
     };
   });
@@ -106,6 +137,9 @@ export function Composer({
       );
   }, [source, taskId]);
   useEffect(loadCatalog, [loadCatalog]);
+  useEffect(() => {
+    if (catalog) onCatalog?.(catalog);
+  }, [catalog, onCatalog]);
   // A model read that ends sends chat.catalog, so the picker shows what it found.
   useEffect(
     () =>
@@ -148,54 +182,116 @@ export function Composer({
         setNote(failure instanceof Error ? failure.message : 'The choice was not saved.'),
     );
   }
+  const adding = files.some((file) => file.busy);
+  const canAttach = !!source.attachFiles && !blocked;
   async function submit(event?: FormEvent) {
     event?.preventDefault();
     // A message sent while a turn runs waits in the thread and starts when the turn ends.
     const body = text.trim();
-    if (!body || blocked) return;
-    const sent = { text: body, attachments };
+    if (!body || blocked || adding) return;
+    const sent = { text: body, files };
     setText('');
-    setAttachments([]);
+    setFiles([]);
     drafts.delete(draftKey);
     try {
       await onSend({ ...sent, selection: chosen });
       setNote(null);
     } catch (failure) {
-      // Nothing is lost when a send fails. The text and paths come back into the box.
+      // Nothing is lost when a send fails. The text and files come back into the box.
       setText((current) => current || sent.text);
-      setAttachments((current) => (current.length > 0 ? current : sent.attachments));
-      setNote(failure instanceof Error ? failure.message : 'The message was not sent.');
+      setFiles((current) => (current.length > 0 ? current : sent.files));
+      setNote(failureText(failure, 'The message was not sent.'));
     }
   }
+  // A saved thread stores each file right away, one at a time, since the desktop sends one
+  // command at a time. The controller reads the type from the bytes, and the chip shows it.
+  async function add(found: readonly DesktopFile[]) {
+    const known = new Set(files.map((file) => file.path));
+    const fresh = found
+      .filter((item) => !known.has(item.path))
+      .slice(0, Math.max(0, MAX_FILES - files.length))
+      .map((item) => local(item, taskId !== null));
+    if (found.length > 0 && fresh.length === 0 && files.length >= MAX_FILES)
+      setNote('A message holds up to 32 files.');
+    setFiles((current) => [...current, ...fresh]);
+    if (!taskId) return;
+    for (const item of fresh) {
+      try {
+        const file = await importAttachment(source, taskId, item.path ?? '');
+        keepThumbnail(file.id, item.thumbnail);
+        setFiles((current) =>
+          current.some((other) => other.file?.id === file.id)
+            ? current.filter((other) => other.key !== item.key)
+            : current.map((other) =>
+                other.key === item.key
+                  ? { ...other, key: file.id, file, mimeType: file.mimeType, busy: false }
+                  : other,
+              ),
+        );
+      } catch (failure) {
+        setFiles((current) => current.filter((other) => other.key !== item.key));
+        setNote(failureText(failure, 'The file was not added.'));
+      }
+    }
+  }
+  function attach(input: DesktopAttachInput) {
+    const find = source.attachFiles;
+    if (!find) return;
+    find(input).then(add, (failure: unknown) =>
+      setNote(failureText(failure, 'The files could not be read.')),
+    );
+  }
+  const hasFiles = (event: DragEvent) => event.dataTransfer.types.includes('Files');
+  function onDrop(event: DragEvent<HTMLFormElement>) {
+    setDropping(false);
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    if (!canAttach) return;
+    attach({ from: 'drop', files: [...event.dataTransfer.files] });
+  }
+  // A pasted file goes in as a chip. Pasted text goes in the box as usual.
+  function onPaste(event: ClipboardEvent<HTMLTextAreaElement>) {
+    const pasted = [...event.clipboardData.files];
+    if (pasted.length === 0 || !canAttach) return;
+    event.preventDefault();
+    attach({ from: 'paste', files: pasted });
+  }
+  const entry = catalog?.families.find(({ family }) => family === chosen?.family);
+  // Only what the selected family's client reported. A client that reported nothing gets no line.
+  const typeNote = (file: ChipFile) =>
+    entry && file.mimeType && acceptsType(entry.accepts, file.mimeType) === false
+      ? `${familyName(entry.family)} may not take this file type`
+      : null;
   function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return;
     event.preventDefault();
     void submit();
   }
-  function addPath() {
-    const path = adding?.trim();
-    if (path && !attachments.includes(path) && attachments.length < 32)
-      setAttachments([...attachments, path]);
-    closeAttach();
-  }
-  // The message box takes focus back, so the next key goes where the person was typing.
-  function closeAttach() {
-    setAdding(null);
-    field.current?.focus();
-  }
 
   return (
     <div className="th-composer-wrap">
-      <form className="th-composer" onSubmit={(event) => void submit(event)}>
-        {attachments.length > 0 && (
-          <AttachmentChips
-            paths={attachments}
-            onRemove={(path) => setAttachments(attachments.filter((value) => value !== path))}
-          />
-        )}
-        {adding !== null && (
-          <AttachRow value={adding} onChange={setAdding} onAdd={addPath} onClose={closeAttach} />
-        )}
+      <form
+        className={dropping ? 'th-composer is-dropping' : 'th-composer'}
+        onSubmit={(event) => void submit(event)}
+        onDragOver={(event) => {
+          if (!hasFiles(event) || !canAttach) return;
+          event.preventDefault();
+          event.dataTransfer.dropEffect = 'copy';
+          setDropping(true);
+        }}
+        onDragLeave={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropping(false);
+        }}
+        onDrop={onDrop}
+      >
+        <FileChips
+          files={files}
+          note={typeNote}
+          onRemove={(key) => {
+            setFiles(files.filter((file) => file.key !== key));
+            field.current?.focus();
+          }}
+        />
         <textarea
           ref={field}
           rows={1}
@@ -207,6 +303,7 @@ export function Composer({
             drafts.set(draftKey, event.target.value);
           }}
           onKeyDown={onKeyDown}
+          onPaste={onPaste}
         />
         {taskId && (
           <div className="th-roles">
@@ -234,9 +331,10 @@ export function Composer({
           <button
             type="button"
             className="th-icon"
-            aria-label="Attach a path"
-            title="Attach a path"
-            onClick={() => setAdding(adding === null ? '' : null)}
+            aria-label="Attach files"
+            title={source.attachFiles ? 'Attach files' : 'Files attach in the desktop app'}
+            disabled={!canAttach}
+            onClick={() => attach({ from: 'picker' })}
           >
             <Paperclip size={16} aria-hidden="true" />
           </button>
@@ -297,8 +395,11 @@ export function Composer({
               type="submit"
               className="th-send"
               aria-label="Send"
-              title={blocked ?? (running ? 'Send when this turn ends' : 'Send')}
-              disabled={!text.trim() || !!blocked}
+              title={
+                blocked ??
+                (adding ? 'Wait for the files' : running ? 'Send when this turn ends' : 'Send')
+              }
+              disabled={!text.trim() || !!blocked || adding}
             >
               <ArrowUp size={16} aria-hidden="true" />
             </button>

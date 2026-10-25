@@ -12,6 +12,7 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  realpathSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -36,6 +37,7 @@ import {
   git,
   inspectSource,
   inspectSourceDetails,
+  materialize,
   readCandidateFiles,
   readFiles,
   treeFromFiles,
@@ -1052,4 +1054,177 @@ test('single-file capture retains only the exact bounded target edit', (t) => {
     assert.equal(result.target.mode, '100755', example.name);
     assert.equal(lstatSync(join(root, 'net.mjs')).mode & 0o777, 0o751, example.name);
   }
+});
+
+test('a scratch copy holds links that stay inside, skips what it cannot hold and accepts neither', (t) => {
+  mkdirSync(resolve('internal'), { recursive: true });
+  const directory = mkdtempSync(join(resolve('internal'), 'scratch-source-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const repository = join(directory, 'repository');
+  mkdirSync(repository);
+  git(repository, ['init', '--quiet']);
+  const identity = {
+    name: 'Fixture',
+    email: 'fixture@example.invalid',
+    at: '2026-01-01T00:00:00Z',
+  };
+  const blob = (bytes: Buffer | string) =>
+    git(repository, ['hash-object', '-w', '--stdin'], bytes).toString().trim();
+  const link = (target: Buffer | string) => ['120000', blob(target)] as const;
+  // Each row is one tree entry and what the copy does with it.
+  const rows: [Buffer | string, readonly [string, string], string][] = [
+    ['GUIDE.md', ['100644', blob('guide\n')], 'file'],
+    ['README.md', ['100644', blob('readme\n')], 'file'],
+    ['LINKED.md', link('GUIDE.md'), 'link'],
+    ['docs/guide', link('../README.md'), 'link'],
+    ['same', link('.'), 'link'],
+    ['a/b/root', link('../..'), 'link'],
+    ['x/y/l1', link('../..'), 'link'],
+    // Spelled as text the target stays inside. The kernel leaves through a/b/root first.
+    ['escape', link('a/b/root/..'), 'link-outside'],
+    // A case-insensitive volume reaches x/y/l1 under this spelling.
+    ['fold', link('X/Y/L1/..'), 'link-outside'],
+    ['abs', link('/etc/passwd'), 'link-outside'],
+    ['parent', link('../outside'), 'link-outside'],
+    ['loop', link('loop'), 'link-outside'],
+    ['bad-target', link(Buffer.from([0x61, 0xff])), 'path-encoding'],
+    ['vendor/lib', ['160000', 'c'.repeat(40)], 'submodule'],
+    [Buffer.from([0xff, 0x2e, 0x74, 0x78, 0x74]), ['100644', blob('latin\n')], 'path-encoding'],
+  ];
+  git(
+    repository,
+    ['update-index', '-z', '--index-info'],
+    Buffer.concat(
+      rows.map(([path, [mode, oid]]) =>
+        Buffer.concat([Buffer.from(`${mode} ${oid}\t`), Buffer.from(path), Buffer.from([0])]),
+      ),
+    ),
+  );
+  const tree = git(repository, ['write-tree']).toString().trim();
+  const base = git(repository, ['commit-tree', tree], 'base\n', identity).toString().trim();
+
+  // The older task path keeps its refusal.
+  assert.throws(() => committedFiles(repository, base), /UTF-8|symlink, submodule/);
+  const source = committedFiles(repository, base, { scratch: true });
+  const named = (path: Buffer | string) => Buffer.from(path).toString('utf8');
+  const expect = (kind: string) =>
+    rows
+      .filter((row) => row[2] === kind)
+      .map(([path]) => named(path))
+      .sort();
+  assert.deepEqual(
+    source.files.map((file) => file.path),
+    expect('file'),
+  );
+  assert.deepEqual(source.links.map((entry) => entry.path).sort(), expect('link'));
+  assert.deepEqual(
+    source.skipped,
+    rows
+      .filter((row) => !['file', 'link'].includes(row[2]))
+      .map(([path, , reason]) => ({ path: named(path), reason }))
+      .sort((left, right) => (left.path < right.path ? -1 : 1)),
+  );
+  // The escape row is a real escape on disk. The native call resolves the way the kernel does.
+  const probe = join(directory, 'probe');
+  mkdirSync(join(probe, 'a/b'), { recursive: true });
+  symlinkSync('../..', join(probe, 'a/b/root'));
+  symlinkSync('a/b/root/..', join(probe, 'escape'));
+  assert.equal(realpathSync.native(join(probe, 'escape')), realpathSync.native(directory));
+
+  const empty = join(directory, 'refused');
+  assert.throws(
+    () =>
+      materialize(empty, source.files, [
+        { path: 'a/b/root', target: '../..' },
+        { path: 'escape', target: 'a/b/root/..' },
+      ]),
+    /outside/,
+  );
+  assert.deepEqual(readdirSync(empty), []);
+  const scratch = join(directory, 'scratch');
+  materialize(scratch, source.files, source.links);
+  const root = realpathSync.native(scratch);
+  for (const entry of source.links) {
+    assert.equal(readlinkSync(join(scratch, entry.path)), entry.target);
+    const resolved = realpathSync.native(join(scratch, entry.path));
+    assert.ok(resolved === root || resolved.startsWith(`${root}/`), entry.path);
+  }
+  for (const { path } of source.skipped) assert.equal(existsSync(join(scratch, path)), false, path);
+
+  // A write through an inside link lands on its target. Paths the base skips stay out.
+  writeFileSync(join(scratch, 'LINKED.md'), 'edited through the link\n');
+  mkdirSync(join(scratch, 'vendor/lib'), { recursive: true });
+  writeFileSync(join(scratch, 'vendor/lib/new.txt'), 'never accepted\n');
+  writeFileSync(join(scratch, 'parent'), 'never accepted\n');
+  const read = () => readCandidateFiles(scratch, repository, base, source);
+  const candidate = read();
+  assert.deepEqual(
+    candidate.map((file) => file.path),
+    ['GUIDE.md', 'README.md'],
+  );
+  assert.equal(candidate[0].content.toString(), 'edited through the link\n');
+  // The accepted tree is the copy's files plus every base entry it left out, byte for byte.
+  const listing = (at: string, oid: string) =>
+    git(at, ['ls-tree', '-rz', oid])
+      .toString('latin1')
+      .split('\0')
+      .filter((record) => record && !record.endsWith('\tGUIDE.md'));
+  const accepted = treeFromFiles(join(directory, 'accepted'), candidate, source.kept);
+  assert.deepEqual(listing(join(directory, 'accepted'), accepted), listing(repository, tree));
+  assert.notEqual(accepted, tree);
+  assert.equal(treeFromFiles(join(directory, 'round'), source.files, source.kept), tree);
+
+  // Accept takes held links from the base, so whatever the copy holds there stays out of the read.
+  const changes: [string, () => void, () => void][] = [
+    [
+      'replaced',
+      () => {
+        unlinkSync(join(scratch, 'LINKED.md'));
+        writeFileSync(join(scratch, 'LINKED.md'), 'a file now\n');
+      },
+      () => {
+        unlinkSync(join(scratch, 'LINKED.md'));
+        symlinkSync('GUIDE.md', join(scratch, 'LINKED.md'));
+      },
+    ],
+    [
+      'retargeted',
+      () => {
+        unlinkSync(join(scratch, 'same'));
+        symlinkSync('README.md', join(scratch, 'same'));
+      },
+      () => {
+        unlinkSync(join(scratch, 'same'));
+        symlinkSync('.', join(scratch, 'same'));
+      },
+    ],
+    [
+      'deleted',
+      () => unlinkSync(join(scratch, 'docs/guide')),
+      () => symlinkSync('../README.md', join(scratch, 'docs/guide')),
+    ],
+  ];
+  for (const [name, change, restore] of changes) {
+    change();
+    assert.deepEqual(read(), candidate, name);
+    assert.equal(treeFromFiles(join(directory, name), read(), source.kept), accepted, name);
+    restore();
+    assert.deepEqual(read(), candidate, name);
+  }
+
+  // Above the cap the message names the count and the cap.
+  const many = git(
+    repository,
+    ['mktree'],
+    Array.from({ length: 100_001 }, (_, index) => `100644 blob ${rows[0][1][1]}\tf${index}\n`).join(
+      '',
+    ),
+  )
+    .toString()
+    .trim();
+  const large = git(repository, ['commit-tree', many], 'large\n', identity).toString().trim();
+  assert.throws(
+    () => committedFiles(repository, large, { scratch: true }),
+    /has 100,001 files\. A scratch copy holds at most 100,000\./,
+  );
 });

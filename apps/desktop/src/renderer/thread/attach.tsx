@@ -1,67 +1,113 @@
-import { Paperclip, X } from 'lucide-react';
+import type { ChatAttachment } from '@crewkite/contracts';
+import { FileText, LoaderCircle, Paperclip, X } from 'lucide-react';
 
 export const basename = (path: string) => path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
 
-/** Attached paths as chips. Without `onRemove` they are read-only, as on a sent message. */
-export function AttachmentChips({
-  paths,
+/** One file as a chip shows it. The type is null until the controller has read the bytes. */
+export type ChipFile = {
+  key: string;
+  name: string;
+  bytes: number;
+  mimeType: string | null;
+  thumbnail: string | null;
+  busy?: boolean;
+};
+
+// The renderer cannot read a stored file, so a thumbnail lives only as long as the window. A file
+// sent in this window keeps its picture on the sent message; one from an earlier launch shows its
+// name.
+const thumbnails = new Map<string, string>();
+export const keepThumbnail = (id: string, url: string | null) => {
+  if (url) thumbnails.set(id, url);
+};
+
+export const chipOf = (file: ChatAttachment): ChipFile => ({
+  key: file.id,
+  name: file.name,
+  bytes: file.bytes,
+  mimeType: file.mimeType,
+  thumbnail: thumbnails.get(file.id) ?? null,
+});
+
+export function formatBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ['KB', 'MB', 'GB'];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
+}
+
+/**
+ * Files as chips: a thumbnail for a picture, otherwise the name, type and size. Without `onRemove`
+ * they are read-only, as on a sent or queued message. `note` adds one quiet line under a chip.
+ */
+export function FileChips({
+  files,
   onRemove,
+  note,
 }: {
-  paths: readonly string[];
-  onRemove?: (path: string) => void;
+  files: readonly ChipFile[];
+  onRemove?: (key: string) => void;
+  note?: (file: ChipFile) => string | null;
 }) {
+  if (files.length === 0) return null;
+  return (
+    <ul className="th-chips th-attachments" aria-label="Files">
+      {files.map((file) => {
+        const line = note?.(file) ?? null;
+        const facts = [file.mimeType, formatBytes(file.bytes)].filter(Boolean).join(' · ');
+        return (
+          <li
+            key={file.key}
+            className={file.thumbnail ? 'th-attachment is-image' : 'th-attachment'}
+          >
+            <span className="th-attachment-body" title={`${file.name}\n${facts}`}>
+              {file.thumbnail ? (
+                <img src={file.thumbnail} alt={file.name} />
+              ) : (
+                <>
+                  {file.busy ? (
+                    <LoaderCircle size={13} className="th-spin" aria-label="Adding" />
+                  ) : (
+                    <FileText size={13} aria-hidden="true" />
+                  )}
+                  <span className="th-attachment-name">{file.name}</span>
+                  <span className="th-attachment-facts">{facts}</span>
+                </>
+              )}
+              {onRemove && (
+                <button
+                  type="button"
+                  className="th-attachment-remove"
+                  aria-label={`Remove ${file.name}`}
+                  onClick={() => onRemove(file.key)}
+                >
+                  <X size={12} aria-hidden="true" />
+                </button>
+              )}
+            </span>
+            {line && <span className="th-attachment-note">{line}</span>}
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+/** Paths an older version of the thread saved on a message. They are shown as they were. */
+export function AttachmentChips({ paths }: { paths: readonly string[] }) {
   return (
     <ul className="th-chips" aria-label="Attachments">
       {paths.map((path) => (
         <li key={path} title={path}>
           <Paperclip size={12} aria-hidden="true" />
           {basename(path)}
-          {onRemove && (
-            <button type="button" aria-label={`Remove ${path}`} onClick={() => onRemove(path)}>
-              <X size={12} aria-hidden="true" />
-            </button>
-          )}
         </li>
       ))}
     </ul>
-  );
-}
-
-/** The one-line field that adds a path. Enter adds it and Escape closes the field. */
-export function AttachRow({
-  value,
-  onChange,
-  onAdd,
-  onClose,
-}: {
-  value: string;
-  onChange: (value: string) => void;
-  onAdd: () => void;
-  onClose: () => void;
-}) {
-  return (
-    <div className="th-attach-row">
-      <input
-        // biome-ignore lint/a11y/noAutofocus: the field opens on the person's own click
-        autoFocus
-        value={value}
-        placeholder="Path to a file or folder"
-        aria-label="Path to attach"
-        onChange={(event) => onChange(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key === 'Enter') {
-            event.preventDefault();
-            onAdd();
-          } else if (event.key === 'Escape') {
-            // Claimed here so the inspector stays open for this press.
-            event.preventDefault();
-            onClose();
-          }
-        }}
-      />
-      <button type="button" onClick={onAdd}>
-        Add
-      </button>
-    </div>
   );
 }

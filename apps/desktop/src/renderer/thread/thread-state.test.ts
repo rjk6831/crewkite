@@ -16,13 +16,18 @@ import type {
   ChatThreadRead,
   ChatTurn,
 } from '@crewkite/contracts';
+import { acceptsType, tryWithChoices } from './file-fit.ts';
 import { limitOffer, offerChoices } from './handoff-offer.ts';
 import {
+  earlierCursor,
   FIRST_READ_BACKOFF,
   initialThreadState,
   lastFamily,
+  lastReply,
+  newestTurnId,
   reduceThread,
   retryRead,
+  THREAD_PAGE_SIZE,
   type ThreadEvent,
   type ThreadItem,
   TRY_AGAIN_AFTER_MS,
@@ -60,6 +65,7 @@ const user = (cursor: number, text: string): ThreadEvent => {
     author: { kind: 'user' },
     text,
     attachments: [],
+    files: [],
   };
   return { type: 'conversation.entry', cursor: String(cursor), taskId: task, payload: message };
 };
@@ -328,9 +334,9 @@ test('a message the controller queued leaves no pending bubble', () => {
     crew: null,
     flightMode: 'manual',
     crewChain: null,
-    queued: [{ id: id('msg', 9), at: stamp, text, role: 'assistant', attachments: [] }],
+    queued: [{ id: id('msg', 9), at: stamp, text, role: 'assistant', attachments: [], files: [] }],
   };
-  const pending = { localId: 'local-1', text, attachments: [], at: stamp };
+  const pending = { localId: 'local-1', text, files: [], at: stamp };
   const sent = reduceThread(initialThreadState(task), { type: 'sending', pending });
   const event: ThreadEvent = { type: 'chat.thread', cursor: '20', taskId: task, payload: thread };
   const queued = reduceThread(sent, { type: 'events', events: [event] });
@@ -367,7 +373,7 @@ test('the limit offer shows only while the newest turn is the one that hit a lim
     if (pending)
       state = reduceThread(state, {
         type: 'sending',
-        pending: { localId: 'local-1', text: 'Add the guard', attachments: [], at: stamp },
+        pending: { localId: 'local-1', text: 'Add the guard', files: [], at: stamp },
       });
     return limitOffer(state);
   };
@@ -573,39 +579,58 @@ test('the thread moves away from the family of its newest assistant turn, even o
       handoffFrom: null,
     } satisfies ChatTurn,
   });
+  const fold = (events: ThreadEvent[]) =>
+    reduceThread(initialThreadState(task), { type: 'events', events });
   const family = (events: ThreadEvent[]) => {
-    const state = reduceThread(initialThreadState(task), { type: 'events', events });
+    const state = fold(events);
     return lastFamily(state, threadItems(state));
+  };
+  // The controller reruns only the newest turn. Retry and Try with show on it alone, and
+  // Regenerate shows only when it finished with a reply.
+  const rerun = (events: ThreadEvent[]) => {
+    const state = fold(events);
+    return { newest: newestTurnId(state), regenerate: lastReply(state, threadItems(state)) };
   };
 
   // Anthropic answered, then OpenAI hit its limit before any text. That turn has no row, and the
   // controller still counts it as the family the thread is on.
-  assert.equal(
-    family([
-      user(10, 'Add the guard'),
-      record(turn, 0, 'anthropic', 'done'),
-      opened(turn, 11, 'anthropic', 'assistant'),
-      agent(12, { type: 'text.completed', itemId: 'a', text: 'Done.' }),
-      done(turn, 13),
-      record(second, 1, 'openai', 'failed'),
-      opened(second, 14, 'openai', 'assistant'),
-      on(second, 15, { type: 'turn.completed', stopReason: 'limit', failure: limit }),
-    ]),
-    'openai',
+  const limited = [
+    user(10, 'Add the guard'),
+    record(turn, 0, 'anthropic', 'done'),
+    opened(turn, 11, 'anthropic', 'assistant'),
+    agent(12, { type: 'text.completed', itemId: 'a', text: 'Done.' }),
+    done(turn, 13),
+    record(second, 1, 'openai', 'failed'),
+    opened(second, 14, 'openai', 'assistant'),
+    on(second, 15, { type: 'turn.completed', stopReason: 'limit', failure: limit }),
+  ];
+  assert.equal(family(limited), 'openai');
+  assert.deepEqual(
+    rerun(limited),
+    { newest: second, regenerate: null },
+    'a failed turn after a reply leaves the reply without Regenerate',
   );
 
   // Before any record arrives the rows decide. A second opinion borrows another family for one
   // turn, so it is never the family the thread moves away from.
-  assert.equal(
-    family([
-      opened(turn, 11, 'openai', 'assistant'),
-      agent(12, { type: 'text.completed', itemId: 'a', text: 'Done.' }),
-      done(turn, 13),
-      opened(second, 14, 'local', 'advisor'),
-      on(second, 15, { type: 'text.completed', itemId: 'a', text: 'Looks right.' }),
-      done(second, 16),
-    ]),
-    'openai',
+  const opinion = [
+    opened(turn, 11, 'openai', 'assistant'),
+    agent(12, { type: 'text.completed', itemId: 'a', text: 'Done.' }),
+    done(turn, 13),
+    opened(second, 14, 'local', 'advisor'),
+    on(second, 15, { type: 'text.completed', itemId: 'a', text: 'Looks right.' }),
+    done(second, 16),
+  ];
+  assert.equal(family(opinion), 'openai');
+  assert.deepEqual(
+    rerun(opinion),
+    { newest: second, regenerate: second },
+    'Regenerate goes to the second opinion, the newest turn, and skips the reply before it',
+  );
+  assert.deepEqual(
+    rerun(opinion.slice(0, 5)),
+    { newest: second, regenerate: null },
+    'a newest turn still running offers no Regenerate',
   );
 });
 
@@ -659,6 +684,7 @@ test('a reply restored from a thread read keeps the role, effort and stats of it
         },
         text: 'Two findings.',
         attachments: [],
+        files: [],
       },
     ],
     liveEvents: [],
@@ -693,7 +719,7 @@ test('a reply restored from a thread read keeps the role, effort and stats of it
   }
 });
 
-test('stream events that a thread read already covers apply once', () => {
+test('events that a thread read or a stored turn read already covers apply once', () => {
   const thread: ChatThread = {
     taskId: task,
     scratchReady: true,
@@ -713,6 +739,8 @@ test('stream events that a thread read already covers apply once', () => {
     agent(cursor, { type: 'text.delta', itemId: 'a', text });
   const output = (cursor: number, chunk: string) =>
     agent(cursor, { type: 'tool.output', callId: 'c1', chunk });
+  const done = (cursor: number) =>
+    agent(cursor, { type: 'turn.completed', stopReason: 'done', failure: null });
   const shown = (state: ReturnType<typeof initialThreadState>) => {
     const { blocks } = turnOf(threadItems(state));
     const text = blocks.find((block) => block.kind === 'text');
@@ -751,8 +779,73 @@ test('stream events that a thread read already covers apply once', () => {
       after: [delta(14, '?')],
       want: { text: 'Hello!?', output: '' },
     },
+    // A finished turn after a reopen. Its stored events come from ReadChatTurnEvents, which carry
+    // no cursor of their own.
+    {
+      name: 'stored events rebuild a finished turn the view never streamed',
+      before: [],
+      live: [],
+      cursor: '20',
+      after: [],
+      stored: [[...fresh, done(13)]],
+      want: { text: 'Hello', output: 'line\n' },
+    },
+    {
+      name: 'stored events replace the tail the stream replayed before the read',
+      before: [delta(11, 'Hello'), output(12, 'line\n')],
+      live: [],
+      cursor: '20',
+      after: [],
+      stored: [[...fresh, done(13)]],
+      want: { text: 'Hello', output: 'line\n' },
+    },
+    {
+      name: 'a stored turn read that lands twice shows its events once',
+      before: [],
+      live: [],
+      cursor: '20',
+      after: [],
+      stored: [
+        [...fresh, done(13)],
+        [...fresh, done(13)],
+      ],
+      want: { text: 'Hello', output: 'line\n' },
+    },
+    {
+      name: 'a stream event replayed after the stored events adds nothing',
+      before: [],
+      live: [],
+      cursor: '10',
+      after: [],
+      stored: [[...fresh, done(13)]],
+      late: [delta(11, 'Hello'), output(12, 'line\n')],
+      want: { text: 'Hello', output: 'line\n' },
+    },
+    {
+      // A later page failed, or the page cap ended the read. The turn shows what was read.
+      name: 'a stored turn read that stopped early shows what it read and says so',
+      before: [],
+      live: [],
+      cursor: '20',
+      after: [],
+      stored: [[started(10), delta(11, 'Hello')]],
+      partial: true,
+      want: { text: 'Hello', output: '' },
+      note: "Part of this turn's history could not load.",
+    },
   ];
-  for (const { name, before, live, cursor, after, want } of cases) {
+  for (const {
+    name,
+    before,
+    live,
+    cursor,
+    after,
+    stored = [],
+    late = [],
+    partial = false,
+    want,
+    note,
+  } of cases) {
     let state = reduceThread(initialThreadState(task), { type: 'events', events: before });
     state = reduceThread(state, {
       type: 'loaded',
@@ -765,7 +858,16 @@ test('stream events that a thread read already covers apply once', () => {
       },
     });
     state = reduceThread(state, { type: 'events', events: after });
+    for (const events of stored)
+      state = reduceThread(state, {
+        type: 'history',
+        turnId: turn,
+        events: events.map((event) => event.payload as AgentEvent),
+        partial,
+      });
+    state = reduceThread(state, { type: 'events', events: late });
     assert.deepEqual(shown(state), want, name);
+    assert.equal(state.historyNotes[turn], note, `${name} (note)`);
   }
 });
 
@@ -780,6 +882,7 @@ const connected = (name: ChatFamily, percent: number | null) => ({
     percent === null
       ? []
       : [{ windowId: 'weekly', label: 'Weekly', percent, resetsAt: null, observedAt: null }],
+  accepts: null,
 });
 
 test('the offer ranks the other connected families by the thread mode and leaves out one at zero', () => {
@@ -846,6 +949,209 @@ test("an empty pool for another model does not hold back the family's default mo
       ['anthropic', 'm', 60],
     ],
   );
+});
+
+test('reported file types decide the chip note and lead the Try with order', () => {
+  // The chip note shows only on false. Null means the client reported nothing.
+  const matches: [readonly string[] | null, string, boolean | null][] = [
+    [null, 'image/png', null],
+    [['image/*'], 'image/png', true],
+    [['image/*'], 'application/pdf', false],
+    [['application/pdf'], 'Application/PDF; version=1.7', true],
+    [['*/*'], 'application/zip', true],
+    [[], 'text/plain', false],
+  ];
+  for (const [accepts, mimeType, want] of matches)
+    assert.equal(acceptsType(accepts, mimeType), want, `${accepts} ${mimeType}`);
+  const family = (name: ChatFamily, percent: number, accepts: string[] | null) => ({
+    ...connected(name, percent),
+    accepts,
+  });
+  const catalog: ChatCatalogRead = {
+    families: [
+      family('openai', 90, ['image/*']),
+      family('anthropic', 60, ['image/*', 'application/pdf']),
+      family('google', 80, null),
+      family('local', 70, ['text/*']),
+    ],
+  };
+  const order = (tried: ChatFamily[], types: string[], mode?: 'most-left' | 'local-first') =>
+    tryWithChoices(catalog, tried, types, mode, (entry) => entry.defaultModel, 0).map(
+      ({ family }) => family,
+    );
+  const rows: [string, ChatFamily[], string[], ChatFamily[], ('most-left' | 'local-first')?][] = [
+    // Anthropic reports both types, so it leads although it has the least left.
+    [
+      'a family that takes every file leads',
+      ['openai'],
+      ['image/png', 'application/pdf'],
+      ['anthropic', 'google', 'local'],
+    ],
+    [
+      'the rest keep the allowance order',
+      ['anthropic'],
+      ['application/zip'],
+      ['openai', 'google', 'local'],
+    ],
+    [
+      'two that take the file keep their own order',
+      ['google'],
+      ['image/png'],
+      ['openai', 'anthropic', 'local'],
+    ],
+    [
+      'the handoff mode orders the rest',
+      ['openai'],
+      ['application/zip'],
+      ['local', 'google', 'anthropic'],
+      'local-first',
+    ],
+    [
+      'every family tried leaves nothing',
+      ['openai', 'anthropic', 'google', 'local'],
+      ['image/png'],
+      [],
+    ],
+  ];
+  for (const [name, tried, types, want, mode] of rows)
+    assert.deepEqual(order(tried, types, mode), want, name);
+  // Each choice runs the family's default model.
+  assert.deepEqual(
+    tryWithChoices(
+      catalog,
+      ['openai', 'anthropic', 'google'],
+      [],
+      'most-left',
+      (entry) => entry.defaultModel,
+      0,
+    ),
+    [
+      {
+        family: 'local',
+        selection: { family: 'local', model: 'm', effort: 'default' },
+        label: 'M',
+      },
+    ],
+  );
+});
+
+test('Load earlier pages older messages in by the oldest cursor until a page says there are none', () => {
+  const message = (cursor: number): ChatMessage => ({
+    id: id('msg', cursor),
+    taskId: task,
+    at: stamp,
+    cursor: String(cursor),
+    author: { kind: 'user' },
+    text: `m${cursor}`,
+    attachments: [],
+    files: [],
+  });
+  const page = (from: number, count: number) =>
+    Array.from({ length: count }, (_, index) => message(from + index));
+  const thread: ChatThread = {
+    taskId: task,
+    scratchReady: true,
+    base: null,
+    selection: null,
+    permissionPolicy: 'ask',
+    sessions: [],
+    activeTurnId: null,
+    autoHandoff: false,
+    handoffMode: 'most-left',
+    crew: null,
+    flightMode: 'manual',
+    crewChain: null,
+    queued: [],
+  };
+  const asking = (turnId: string, cursor: number): ChatTurn => ({
+    id: turnId,
+    taskId: task,
+    sequence: 0,
+    role: 'assistant',
+    selection: { family: 'openai', model: 'large-1', effort: 'default' },
+    userMessageId: id('msg', cursor),
+    assistantMessageId: null,
+    state: 'done',
+    startedAt: stamp,
+    endedAt: stamp,
+    failure: null,
+    handoffFrom: null,
+  });
+  const read = (messages: ChatMessage[], turns: ChatTurn[] = []): ChatThreadRead => ({
+    thread,
+    turns,
+    messages,
+    liveEvents: [],
+    cursor: '9000',
+  });
+  const cursors = (state: ReturnType<typeof initialThreadState>) =>
+    state.messages.map((item) => Number(item.cursor));
+  const rows: {
+    name: string;
+    first: ChatThreadRead;
+    pages: ChatMessage[][];
+    want: string | null;
+    count: number;
+  }[] = [
+    {
+      name: 'a short thread has nothing older',
+      first: read(page(1, 3)),
+      pages: [],
+      want: null,
+      count: 3,
+    },
+    {
+      name: 'a full page may have more behind it',
+      first: read(page(500, THREAD_PAGE_SIZE)),
+      pages: [],
+      want: '500',
+      count: THREAD_PAGE_SIZE,
+    },
+    {
+      name: 'a turn whose message is not loaded says there is more',
+      first: read(page(500, 3), [asking(turn, 7)]),
+      pages: [],
+      want: '500',
+      count: 3,
+    },
+    {
+      name: 'a short older page ends the paging and merges in order',
+      first: read(page(500, THREAD_PAGE_SIZE)),
+      pages: [page(400, 5)],
+      want: null,
+      count: THREAD_PAGE_SIZE + 5,
+    },
+    {
+      name: 'a full older page asks from its own oldest cursor',
+      first: read(page(500, THREAD_PAGE_SIZE)),
+      pages: [page(100, THREAD_PAGE_SIZE)],
+      want: '100',
+      count: 2 * THREAD_PAGE_SIZE,
+    },
+    {
+      name: 'an empty older page ends the paging',
+      first: read(page(500, 3), [asking(turn, 7)]),
+      pages: [[]],
+      want: null,
+      count: 3,
+    },
+  ];
+  for (const { name, first, pages, want, count } of rows) {
+    let state = reduceThread(initialThreadState(task), { type: 'loaded', read: first });
+    for (const messages of pages)
+      state = reduceThread(state, { type: 'earlier', read: read(messages, first.turns) });
+    assert.equal(earlierCursor(state), want, name);
+    assert.equal(state.messages.length, count, name);
+    assert.deepEqual(
+      cursors(state),
+      cursors(state).toSorted((a, b) => a - b),
+      name,
+    );
+    // The reload after a turn ends reads the newest page again and keeps the older pages.
+    const reloaded = reduceThread(state, { type: 'loaded', read: first });
+    assert.equal(reloaded.messages.length, count, `${name}, after a reload`);
+    assert.equal(earlierCursor(reloaded), want, `${name}, after a reload`);
+  }
 });
 
 test('the first read retries on the backoff and offers Try again only after ten seconds', async () => {

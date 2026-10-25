@@ -3,14 +3,16 @@ import { createHash } from 'node:crypto';
 import {
   closeSync,
   constants,
+  copyFileSync,
   fstatSync,
   mkdirSync,
   openSync,
   readFileSync,
   realpathSync,
+  rmSync,
 } from 'node:fs';
 import { userInfo } from 'node:os';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import {
   type AgentEvent,
@@ -144,6 +146,7 @@ const assistant = z.object({
   }),
   error: z.string().optional(),
   api_error: z.string().optional(),
+  api_error_status: z.number().int().optional().catch(undefined),
   api_error_params: z.object({ rate_limit_info: rateInfo.optional() }).optional(),
 });
 const user = z.object({
@@ -315,7 +318,153 @@ export const anthropicChatModels = [
 export const anthropicDefaultChatModel = 'claude-sonnet-5-5';
 export const anthropicChatEfforts = ['default', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 
-function chatArguments(request: ChatTurnRequest, resume: string | null) {
+// The file types the stream-json user message takes as content blocks: base64 image blocks for
+// these four, a base64 document block for PDF, and a text document block, whose only media type
+// is text/plain, for any UTF-8 text file. The catalog reports this list, so the composer and the
+// adapter read the same fact.
+export const anthropicChatAccepts = [
+  'image/jpeg',
+  'image/png',
+  'image/gif',
+  'image/webp',
+  'application/pdf',
+  'text/*',
+] as const;
+
+type TurnFile = NonNullable<ChatTurnRequest['files']>[number];
+const turnFiles = (request: ChatTurnRequest): readonly TurnFile[] => request.files ?? [];
+const utf8 = new TextDecoder('utf-8', { fatal: true });
+// The blocks travel in one stdin frame with the text. The Messages API refuses a request over
+// 32 MB and base64 adds a third, so the raw bytes of all blocks stay under 24 MiB. A file past
+// what is left goes as a path line and is never read, which also keeps a large file from
+// reaching the string limit of the runtime.
+const NATIVE_BYTES = 24 * 1024 * 1024;
+
+class UnreadableFile extends Error {}
+class ChangedFile extends Error {}
+
+/** The block a file type goes as, or null for a path line. */
+function blockKind(type: string) {
+  if (type.startsWith('image/') && anthropicChatAccepts.some((value) => value === type))
+    return 'image';
+  if (type === 'application/pdf') return 'pdf';
+  if (type.startsWith('text/')) return 'text';
+  return null;
+}
+
+/** An open regular file and its size. O_NONBLOCK keeps a FIFO from holding the turn. */
+function openStored(path: string) {
+  if (!isAbsolute(path)) throw new Error('relative');
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) throw new Error('not a file');
+    return { fd, size: stat.size };
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
+/**
+ * The user message for this turn. Each file the protocol has a block for goes as that block, read
+ * now and checked against its hash so the bytes match what the person attached. Any other file
+ * goes as a line in the text naming a copy under `staging`, and only that folder joins the launch
+ * through --add-dir. Under allow-edits the client can write in an added folder, and a stored file
+ * is shared by every message that attached the same bytes, so the client never gets the store.
+ * A file from an earlier message always goes as a line and never refuses the turn. File blocks
+ * come before the text, which is the order the API documents for images.
+ */
+function userMessage(text: string, files: readonly TurnFile[], staging: string) {
+  const blocks: unknown[] = [];
+  const lines: string[] = [];
+  let room = NATIVE_BYTES;
+  let staged = false;
+  // A copy keeps the stored file out of reach of an in-place write, which a hard link would
+  // pass through. COPYFILE_FICLONE clones on APFS and falls back to a plain copy elsewhere.
+  const stage = ({ attachment, path }: TurnFile) => {
+    const target = join(staging, attachment.id, attachment.name);
+    mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
+    copyFileSync(path, target, constants.COPYFILE_FICLONE);
+    staged = true;
+    return target;
+  };
+  for (const file of files) {
+    const { attachment, path } = file;
+    const about = `${attachment.name} (${attachment.mimeType}, ${attachment.bytes} bytes)`;
+    if (file.earlier) {
+      let target: string | null = null;
+      try {
+        if (isAbsolute(path)) target = stage(file);
+      } catch {}
+      lines.push(target ? `Attached earlier: ${about} at ${target}` : `Attached earlier: ${about}`);
+      continue;
+    }
+    const type = attachment.mimeType.split(';')[0].trim().toLowerCase();
+    const kind = blockKind(type);
+    let opened: ReturnType<typeof openStored>;
+    try {
+      opened = openStored(path);
+    } catch {
+      throw new UnreadableFile(attachment.name);
+    }
+    let block: unknown = null;
+    try {
+      if (kind && opened.size <= room) {
+        let bytes: Buffer;
+        try {
+          bytes = readFileSync(opened.fd);
+        } catch {
+          throw new UnreadableFile(attachment.name);
+        }
+        if (createHash('sha256').update(bytes).digest('hex') !== attachment.id)
+          throw new ChangedFile(attachment.name);
+        const title = attachment.name;
+        if (kind === 'image')
+          block = {
+            type: 'image',
+            source: { type: 'base64', media_type: type, data: bytes.toString('base64') },
+          };
+        else if (kind === 'pdf')
+          block = {
+            type: 'document',
+            title,
+            source: { type: 'base64', media_type: type, data: bytes.toString('base64') },
+          };
+        else
+          try {
+            block = {
+              type: 'document',
+              title,
+              source: { type: 'text', media_type: 'text/plain', data: utf8.decode(bytes) },
+            };
+          } catch {}
+        if (block) room -= opened.size;
+      }
+    } finally {
+      closeSync(opened.fd);
+    }
+    if (block) {
+      blocks.push(block);
+      continue;
+    }
+    let target: string;
+    try {
+      target = stage(file);
+    } catch {
+      throw new UnreadableFile(attachment.name);
+    }
+    lines.push(`Attached file: ${about} at ${target}`);
+  }
+  const body = [text, lines.join('\n')].filter(Boolean).join('\n\n');
+  return {
+    content: [...blocks, { type: 'text', text: body }],
+    native: blocks.length > 0,
+    folders: staged ? [staging] : [],
+  };
+}
+
+function chatArguments(request: ChatTurnRequest, resume: string | null, folders: string[]) {
   const { effort, model } = request.selection;
   return [
     '--print',
@@ -343,6 +492,8 @@ function chatArguments(request: ChatTurnRequest, resume: string | null) {
     // The client documents low, medium, high, xhigh and max. It has no minimal level.
     ...(effort === 'default' || effort === 'minimal' ? [] : ['--effort', effort]),
     ...(resume ? ['--resume', resume] : []),
+    // The option takes several folders, so it goes last where no later flag can be read as one.
+    ...(folders.length ? ['--add-dir', ...folders] : []),
   ];
 }
 
@@ -371,12 +522,21 @@ function startTurn(
       // A failing sink must not take the native process handlers down with it.
     }
   };
+  // Copies of the files that go as path lines. The folder lives as long as the turn.
+  const staging = join(request.work.directory, 'files');
+  const unstage = () => {
+    if (!isAbsolute(staging)) return;
+    try {
+      rmSync(staging, { recursive: true, force: true });
+    } catch {}
+  };
   const refuse = (failure: ChatFailure): ChatTurnHandle => ({
     respondPermission() {},
     stop() {},
     groups: [],
     result: new Promise((resolve) =>
       queueMicrotask(() => {
+        unstage();
         send({ type: 'turn.completed', turnId, stopReason: 'error', failure });
         resolve({
           stopReason: 'error',
@@ -407,19 +567,7 @@ function startTurn(
         message: 'The selected model name cannot be passed to the Anthropic client.',
       }),
     );
-  let executable: string;
-  try {
-    const client = deps.launch(request);
-    executable = verifiedExecutable(client.executable, client.sha256);
-  } catch {
-    return refuse(
-      chatFailure({
-        stage: 'launch',
-        kind: 'client-missing',
-        message: 'The Anthropic client is missing or does not match the verified build.',
-      }),
-    );
-  }
+  // The work directory comes first because the path-line copies go in it.
   const scratch = request.scratch.directory;
   let environment: NodeJS.ProcessEnv;
   try {
@@ -436,9 +584,49 @@ function startTurn(
       }),
     );
   }
+  // A resumed session already holds CrewKite's framing from its first message.
+  const text = prior
+    ? request.prompt
+    : [request.systemContext, request.prompt].filter(Boolean).join('\n\n');
+  let message: ReturnType<typeof userMessage>;
+  try {
+    message = userMessage(text, turnFiles(request), staging);
+  } catch (error) {
+    if (error instanceof ChangedFile)
+      return refuse(
+        chatFailure({
+          stage: 'prompt',
+          kind: 'attachment-rejected',
+          message: `The stored file ${clip(error.message, 255)} changed after it was attached, so it was not sent.`,
+          nextAction: 'Attach the file again, then send.',
+        }),
+      );
+    if (!(error instanceof UnreadableFile)) throw error;
+    return refuse(
+      chatFailure({
+        stage: 'prompt',
+        kind: 'attachment-rejected',
+        message: `CrewKite could not read the attached file ${clip(error.message, 255)}.`,
+      }),
+    );
+  }
+  let executable: string;
+  try {
+    const client = deps.launch(request);
+    executable = verifiedExecutable(client.executable, client.sha256);
+  } catch {
+    return refuse(
+      chatFailure({
+        stage: 'launch',
+        kind: 'client-missing',
+        message: 'The Anthropic client is missing or does not match the verified build.',
+      }),
+    );
+  }
   let child: ChildProcessWithoutNullStreams;
   try {
-    child = (deps.spawn ?? (spawn as Spawn))(executable, chatArguments(request, prior), {
+    const args = chatArguments(request, prior, message.folders);
+    child = (deps.spawn ?? (spawn as Spawn))(executable, args, {
       cwd: scratch,
       env: environment,
       detached: true,
@@ -717,6 +905,10 @@ function startTurn(
       apiError = { kind: 'signed-out', resetsAt: null };
     else if (data.error === 'model_not_found')
       apiError = { kind: 'model-unavailable', resetsAt: null };
+    // A turn without file blocks gets the same answer for other reasons, such as a prompt over
+    // the context window, so only a turn that sent blocks names the files.
+    else if (message.native && (data.error === 'invalid_request' || data.api_error_status === 400))
+      apiError = { kind: 'attachment-rejected', resetsAt: null };
     // A streamed message arrives again as one assistant frame per content block. Match each
     // block to the first open streamed item of its kind, and treat a block whose text an item
     // already completed with as a repeat.
@@ -951,6 +1143,15 @@ function startTurn(
               resetsAt: apiError?.resetsAt ?? unixTime(Number(/\|(\d{9,12})\b/.exec(text)?.[1])),
             }),
           );
+        else if (apiError?.kind === 'attachment-rejected')
+          decide(
+            'error',
+            chatFailure({
+              ...base,
+              kind: 'attachment-rejected',
+              message: 'The Anthropic API refused the attached files.',
+            }),
+          );
         else if (apiError?.kind === 'signed-out' || SIGNED_OUT.test(text))
           decide(
             'error',
@@ -1033,6 +1234,7 @@ function startTurn(
     settled = true;
     for (const cancelTimer of timers) cancelTimer();
     trace.close();
+    unstage();
     // Items cut off by a stop or an exit still close, so the thread shows what arrived.
     for (const message of messages.values())
       for (const item of message.items)
@@ -1169,11 +1371,7 @@ function startTurn(
       ),
     );
 
-  // A resumed session already holds CrewKite's framing from its first message.
-  const text = prior
-    ? request.prompt
-    : [request.systemContext, request.prompt].filter(Boolean).join('\n\n');
-  write({ type: 'user', message: { role: 'user', content: [{ type: 'text', text }] } });
+  write({ type: 'user', message: { role: 'user', content: message.content } });
 
   return {
     respondPermission(requestId, choice) {

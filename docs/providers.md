@@ -18,6 +18,8 @@ Set up first: install the OpenAI client and sign in with a ChatGPT plan. The ada
 
 The composer lists the models the controller last observed from the client. It learns them from a separate app-server session that runs `model/list` with `includeHidden: true` and opens no thread. A catalog read starts one in the background when no list from the current client exists or the newest is a day old. After a failure the next background read waits a minute. Refresh models in Settings starts one by hand and shows why the last read failed, with the last line the client wrote to stderr. Models the client keeps out of its own picker come back flagged hidden, and the composer shows them under Legacy so a thread can stay on an older model. The client sorts hidden models among the listed ones, so a full first page of 20 leads to one more page, and listed models come first in the 20 CrewKite keeps. The default is the profile's model when the client lists it, otherwise the first model the client shows in its picker.
 
+Attachments: an image other than SVG goes as `localImage` and audio as `localAudio` (wav, mp3, m4a, webm or ogg), when the selected model's `inputModalities` from `model/list` lists image or audio. Any other file goes as a path line in the message. The client turns a local file it cannot use into placeholder text and runs the turn anyway, so the adapter ends the turn as `attachment-rejected` before it opens a thread when a file is unreadable, an audio file has another extension or the model does not list the modality. A `badRequest` error on a turn that sent images or audio maps to `attachment-rejected` as well. The check cannot tell whether the client decodes a given image, so a format it cannot decode, HEIC for example, can still reach the model as placeholder text. [ADR 0039](adr/0039-attachments-follow-each-client.md) records the rules.
+
 Live qualification pending.
 
 ### Anthropic
@@ -30,6 +32,8 @@ Set up first: install the Anthropic client and sign in with your own subscriptio
 
 The usage gauge has two sources. Every turn streams rate limit frames, and each one fills the five-hour and weekly windows while the turn runs. A frame replaces only the windows it names. The client's `/usage` command adds the per-model windows. It runs when the controller starts, after each turn and on Refresh in Settings, at most once a minute and never beside another read. Neither source asks for consent. The resolved, hash-pinned client is the native trust profile of [ADR 0009](adr/0009-native-client-trust-profile.md), and the Google reader already runs by default. A failed `/usage` read keeps what the client wrote, its reply text and the end of its error output, up to 2,048 characters.
 
+Attachments: files go in the stream-json user message, before the text. JPEG, PNG, GIF and WebP images go as base64 image blocks, a PDF as a base64 document block and a UTF-8 `text/` file as a text document block. Any other file goes as a path line. The adapter copies those files into the turn's own folder and passes only that folder through `--add-dir`, so the client's tools can read them and cannot change the stored copies. The blocks are checked against the file's hash before they are sent. An `invalid_request` error or status 400 on a turn that sent blocks ends the turn as `attachment-rejected`.
+
 Live qualification pending.
 
 ### Google
@@ -40,6 +44,8 @@ The transport is Google's published ACP agent, with CrewKite as the protocol cli
 
 Set up first: Connect Google in Settings installs and verifies the reviewed official client, initializes it, pauses for Sign in with Google in the browser and discovers the model choices. When the controller starts, and after an install, it runs the steps that need no click on its own: Initialize when no ready proof exists, and Discover when the proof already records a sign-in. Sign in with Google always waits for the person, because the agent may open a browser. The adapter needs that setup in its ready state, and the composer lists the models discovery advertised. The [pin and import details](#google-acp-writer) and the separate [quota read](#google-quota-read) are unchanged.
 
+Attachments: the adapter reads `promptCapabilities` from each `initialize` reply. An image goes as an image block when `image` is set, audio as an audio block when `audio` is set, and a file as an embedded resource when `embeddedContext` is set. Everything else goes as a `resource_link` to the stored file, which the protocol requires every agent to accept. A thread connection takes a prompt line of 20 MiB less a 16 KiB margin, and a file whose base64 form does not fit goes as a link with a notice. A JSON-RPC error on `session/prompt` for a prompt that held a block other than text ends the turn as `attachment-rejected`.
+
 Live qualification pending.
 
 ### Local
@@ -49,6 +55,8 @@ The transport is the LM Studio SDK over the loopback connection from Local setup
 The small context window sets the prompt budget. The reply gets a quarter of the window. A project outline of paths and exported symbols, most imported files first and cached per base commit, takes up to 18%. The newest turns fill what remains. When a turn leaves the conversation above 60% of the window, CrewKite writes a short summary of the earlier turns for later prompts. The thread keeps the raw turns. A request that cannot fit gets one line saying so and a smaller first step. After each turn a notice shows tokens in and out, time to first token, tokens per second and total time.
 
 Set up first: run LM Studio with its server on the loopback address, load one model and connect Local in Settings. The composer lists loaded models that pass the eligibility checks under [Local models](#local-models). Local has no usage gauge.
+
+Attachments: when the loaded model reports `vision`, images go through the SDK's `files.prepareImageBase64` and ride on the message. Text files (`text/*`, JSON, XML, YAML, TOML, JavaScript, SQL and shell) are inlined under their name and count toward the context window. Anything else, and any image sent to a model without vision, ends the turn as `attachment-rejected` before the model runs.
 
 Live qualification pending.
 

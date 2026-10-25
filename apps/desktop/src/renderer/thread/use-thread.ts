@@ -1,8 +1,11 @@
+import type { AgentEvent } from '@crewkite/contracts';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
-import { isThreadEvent, readThread, type ThreadSource } from './commands.ts';
+import { isThreadEvent, readThread, readTurnEvents, type ThreadSource } from './commands.ts';
 import {
   activeTurnId,
+  earlierCursor,
   FIRST_READ_BACKOFF,
+  historyWanted,
   initialThreadState,
   type ReadClock,
   reduceThread,
@@ -22,6 +25,8 @@ const isTurnEnd = (event: ThreadEvent) =>
   (event.payload as { type?: string } | null)?.type === 'turn.completed';
 const message = (failure: unknown) =>
   failure instanceof Error ? failure.message : 'The thread could not be loaded.';
+// 64 pages of 512 KiB. A turn past that shows what was read, and its stored reply.
+const MAX_EVENT_PAGES = 64;
 
 // Loads the thread once, then applies the live stream on top. Events are held until the read
 // returns and then applied on top of it, and the reducer drops the ones the read already covers. A
@@ -42,6 +47,8 @@ export function useThread(
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
   const reading = useRef(false);
+  const histories = useRef(new Set<string>());
+  const [earlierNote, setEarlierNote] = useState<string | null>(null);
 
   const reload = useCallback(async () => {
     if (reading.current) return;
@@ -118,6 +125,48 @@ export function useThread(
     };
   }, [source, taskId, connection, attempt, reload, clock]);
 
+  // A finished turn's cards come back from its stored events, read once per view. The pages are
+  // put together first, so the turn never shows half its events as if it were still running.
+  const loadHistory = useCallback(
+    async (turnId: string) => {
+      if (histories.current.has(turnId)) return;
+      histories.current.add(turnId);
+      const events: AgentEvent[] = [];
+      let afterCursor: string | undefined;
+      // Stays true when a page after the first fails or the page cap ends the loop.
+      let partial = true;
+      try {
+        for (let page = 0; page < MAX_EVENT_PAGES; page++) {
+          const read = await readTurnEvents(source, { taskId, turnId, afterCursor });
+          events.push(...read.events);
+          if (read.nextAfterCursor === null || read.nextAfterCursor === afterCursor) {
+            partial = false;
+            break;
+          }
+          afterCursor = read.nextAfterCursor;
+        }
+      } catch (failure) {
+        if (events.length === 0) {
+          dispatch({ type: 'history-note', turnId, note: message(failure) });
+          return;
+        }
+      }
+      dispatch({ type: 'history', turnId, events, partial });
+    },
+    [source, taskId],
+  );
+  const loadEarlier = useCallback(async () => {
+    const cursor = earlierCursor(state);
+    if (!cursor) return;
+    try {
+      const read = await readThread(source, taskId, cursor);
+      dispatch({ type: 'earlier', read });
+      setEarlierNote(null);
+    } catch (failure) {
+      setEarlierNote(message(failure));
+    }
+  }, [source, taskId, state]);
+
   const items = useMemo(() => threadItems(state), [state]);
   return {
     state,
@@ -125,6 +174,11 @@ export function useThread(
     dispatch,
     error,
     activeTurn: useMemo(() => activeTurnId(state), [state]),
+    wantsHistory: useMemo(() => historyWanted(state), [state]),
+    loadHistory,
+    hasEarlier: earlierCursor(state) !== null,
+    loadEarlier,
+    earlierNote,
     reload,
     retry: () => setAttempt((value) => value + 1),
   };

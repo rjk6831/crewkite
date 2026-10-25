@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { TimestampSchema } from '@crewkite/contracts';
-import { type FileContent, git, treeFromFiles } from './source.ts';
+import { type FileContent, git, type KeptEntry, treeFromFiles } from './source.ts';
 
 export type GitIdentity = { name: string; email: string };
 export function validateIdentity(identity: GitIdentity): GitIdentity {
@@ -43,6 +43,8 @@ export function preparePublication(input: {
   repository: string;
   base: string;
   files: FileContent[];
+  /** Base entries a chat scratch copy left out. They go into the tree unchanged. */
+  kept?: readonly KeptEntry[];
   identity: GitIdentity;
   at: string;
   /** Chat acceptance names the thread. Candidates keep the checked-candidate message. */
@@ -52,7 +54,7 @@ export function preparePublication(input: {
     throw new Error('Publication from this Git object format is unsupported in D0.');
   const identity = validateIdentity(input.identity);
   const at = TimestampSchema.parse(input.at);
-  const treeOid = treeFromFiles(input.repository, input.files);
+  const treeOid = treeFromFiles(input.repository, input.files, input.kept);
   const parent = git(input.source, ['cat-file', 'commit', input.base]);
   const copied = git(input.repository, ['hash-object', '-t', 'commit', '-w', '--stdin'], parent)
     .toString()
@@ -67,11 +69,19 @@ export function preparePublication(input: {
   )
     .toString()
     .trim();
-  const objects = git(input.repository, ['ls-tree', '-r', '-t', '--format=%(objectname)', treeOid])
+  // A submodule entry names a commit in another repository, so the pack leaves it out.
+  const objects = git(input.repository, [
+    'ls-tree',
+    '-r',
+    '-t',
+    '--format=%(objecttype) %(objectname)',
+    treeOid,
+  ])
     .toString()
     .trim()
     .split('\n')
-    .filter(Boolean);
+    .filter((line) => line && !line.startsWith('commit '))
+    .map((line) => line.slice(line.indexOf(' ') + 1));
   const pack = git(
     input.repository,
     ['pack-objects', '--stdout'],

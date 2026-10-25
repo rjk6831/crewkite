@@ -1,5 +1,6 @@
 import type { ChatQueuedMessage } from '@crewkite/contracts';
 import { useState } from 'react';
+import { chipOf, FileChips } from './attach.tsx';
 
 const SHOWN_CHARACTERS = 200;
 
@@ -42,6 +43,7 @@ export function QueuedList({
             <span className="th-queued-text" title={message.text}>
               {message.text.slice(0, SHOWN_CHARACTERS)}
             </span>
+            <FileChips files={message.files.map(chipOf)} />
             {running && (
               <button
                 type="button"
