@@ -1,4 +1,6 @@
 import {
+  type ChatThreadActivity,
+  type ChatTurnState,
   MAX_WORKSPACE_PAGE_BYTES,
   type ProjectPageRequest,
   ProjectPageRequestSchema,
@@ -13,6 +15,16 @@ import {
 import { hashCanonical } from '@crewkite/contracts/hash';
 import type { Store } from './index.ts';
 
+/**
+ * The rail state of a thread comes from its newest turn. A failed turn stays failed until another
+ * turn starts. The turn index makes this one lookup per summary, and the turn row is durable, so
+ * the state survives a restart.
+ */
+function chatActivity(state: ChatTurnState | null): ChatThreadActivity {
+  if (state === 'queued' || state === 'running') return 'running';
+  if (state === 'waiting-permission') return 'waiting';
+  return state === 'failed' ? 'failed' : 'idle';
+}
 const same = (left: WorkspaceStamp, right: WorkspaceStamp) =>
   left.epoch === right.epoch && left.revision === right.revision;
 const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
@@ -142,7 +154,9 @@ export function taskPage(store: Store, input: TaskPageRequest, now = () => perfo
       .prepare(`SELECT t.id,t.revision,
       json_extract(t.body,'$.projectId') AS projectId,json_extract(t.body,'$.title') AS title,
       json_extract(t.body,'$.state') AS state,json_extract(t.body,'$.waitingReason') AS waitingReason,
-      json_extract(t.body,'$.runId') AS runId,json_extract(t.body,'$.next') AS next
+      json_extract(t.body,'$.runId') AS runId,json_extract(t.body,'$.next') AS next,
+      (SELECT json_extract(c.body,'$.state') FROM chat_turns c WHERE c.task_id=t.id
+      ORDER BY c.sequence DESC LIMIT 1) AS turnState
       ${pattern ? ",json_extract(t.body,'$.outcome') AS outcome,json_extract(t.body,'$.criteria') AS criteria,json_extract(p.body,'$.name') AS projectName" : ''}
       FROM entities t ${pattern ? "LEFT JOIN entities p ON p.kind='project' AND p.id=json_extract(t.body,'$.projectId')" : ''}
       WHERE t.kind='task' AND t.id>? ${projectId ? "AND json_extract(t.body,'$.projectId')=?" : ''}
@@ -194,7 +208,7 @@ export function taskPage(store: Store, input: TaskPageRequest, now = () => perfo
         revision: row.revision as number,
         runId: row.runId as string | null,
         next: row.next as string | null,
-        chatActivity: 'idle',
+        chatActivity: chatActivity(row.turnState as ChatTurnState | null),
         ...(match ? { match } : {}),
       };
       if (

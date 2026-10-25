@@ -25,6 +25,8 @@ import {
   ChatThreadSchema,
   type ChatToolKind,
   type ChatTurn,
+  type ChatTurnEventsRead,
+  ChatTurnEventsReadSchema,
   ChatTurnSchema,
   type Command,
   type CommandResult,
@@ -33,6 +35,7 @@ import {
   canonicalJson,
   type Event,
   MAX_CHAT_ENTRY_BYTES,
+  MAX_CHAT_TURN_EVENTS_BYTES,
   type Project,
   rankFamilies,
   type Task,
@@ -566,9 +569,23 @@ export class ChatService {
     return unavailable(payload.mode === 'retry' ? 'Retry' : 'Regenerate');
   }
 
+  /** A turn's stored events after the cursor, oldest first, in whole events up to the page cap. */
   readTurnEvents(payload: Payload<'ReadChatTurnEvents'>): CommandResult {
     if (!this.task(payload.taskId)) return blocked('task-not-found');
-    return unavailable('Reading earlier turn events');
+    if (this.turn(payload.turnId)?.taskId !== payload.taskId)
+      return blocked('turn-not-found', 'Choose a turn of this thread.');
+    const page = turnEventPage(
+      this.deps.store,
+      payload.taskId,
+      payload.turnId,
+      payload.afterCursor ?? '0',
+    );
+    if (!page)
+      return blocked(
+        'turn-event-too-large',
+        'One stored event of this turn exceeds the page size. No events were skipped.',
+      );
+    return { outcome: 'applied', data: { kind: 'chat-turn-events', ...page } };
   }
 
   discardChange(payload: Payload<'DiscardChatChange'>): CommandResult {
@@ -1978,6 +1995,68 @@ export class ChatService {
 }
 
 const MAX_CURSOR = 9223372036854775807n;
+// A stored row carries the event envelope around the agent event, and the envelope is far
+// smaller than this margin. A longer row can never fit a page.
+const TURN_EVENT_ROW_MARGIN = 64 * 1024;
+const TURN_EVENT_PAGE_EVENTS = 5000;
+
+/**
+ * Null when the first event after the cursor alone exceeds the page. The size counts the kind tag
+ * and the longest continuation cursor, so the page fits whatever cursor it ends on.
+ */
+function turnEventPage(
+  store: Store,
+  taskId: string,
+  turnId: string,
+  afterCursor: string,
+): ChatTurnEventsRead | null {
+  const after = BigInt(afterCursor);
+  const rows = store.db
+    .prepare(
+      `SELECT CAST(cursor AS TEXT) AS cursor,
+      CASE WHEN length(CAST(body AS BLOB))<=? THEN body END AS body FROM events
+      WHERE task_id=? AND cursor>? AND json_extract(body,'$.type')='agent.event'
+      AND json_extract(body,'$.payload.turnId')=? ORDER BY cursor`,
+    )
+    .iterate(
+      MAX_CHAT_TURN_EVENTS_BYTES + TURN_EVENT_ROW_MARGIN,
+      taskId,
+      after > MAX_CURSOR ? MAX_CURSOR : after,
+      turnId,
+    );
+  const events: AgentEvent[] = [];
+  let bytes = size({
+    kind: 'chat-turn-events',
+    taskId,
+    turnId,
+    events: [],
+    nextAfterCursor: String(MAX_CURSOR),
+  });
+  let last: string | null = null;
+  let more = false;
+  for (const row of rows) {
+    const event =
+      row.body === null
+        ? null
+        : AgentEventSchema.parse((JSON.parse(row.body as string) as Event).payload);
+    // Every event after the first is preceded by a comma in the array.
+    const added = event ? size(event) + (events.length ? 1 : 0) : Number.POSITIVE_INFINITY;
+    if (events.length === TURN_EVENT_PAGE_EVENTS || bytes + added > MAX_CHAT_TURN_EVENTS_BYTES) {
+      if (!events.length) return null;
+      more = true;
+      break;
+    }
+    events.push(event as AgentEvent);
+    bytes += added;
+    last = row.cursor as string;
+  }
+  return ChatTurnEventsReadSchema.parse({
+    taskId,
+    turnId,
+    events,
+    nextAfterCursor: more ? last : null,
+  });
+}
 
 function chatMessage(entry: ConversationEntry): ChatMessage | undefined {
   const common = {

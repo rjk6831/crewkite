@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
-import { type Task, TaskPageSchema } from '@crewkite/contracts';
+import { type ChatTurn, type Task, TaskPageSchema, type TaskSummary } from '@crewkite/contracts';
 import { Store } from './index.ts';
 import { projectPage, taskPage } from './workspace.ts';
 
@@ -134,4 +134,60 @@ test('workspace pages traverse indexed summaries through status churn and bounde
   const lastByteTask = bytePage.tasks.at(-1);
   assert.ok(lastByteTask);
   assert.ok(afterBytePage.tasks[0].id > lastByteTask.id);
+});
+
+test('the rail state of each thread comes from its newest turn and survives a restart', (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'ck-activity-'));
+  const path = join(directory, 'state.db');
+  let store = new Store(path);
+  store.applyMigrations(resolve('apps/controller/migrations'));
+  t.after(() => {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const projectId = id('prj', 1);
+  // Turn states oldest first, and the state the rail shows.
+  const rows: [string, ChatTurn['state'][], TaskSummary['chatActivity']][] = [
+    ['a thread with no turn is idle', [], 'idle'],
+    ['a running turn shows running', ['done', 'running'], 'running'],
+    ['a turn that is queued to start shows running', ['failed', 'queued'], 'running'],
+    ['an open permission request shows waiting', ['waiting-permission'], 'waiting'],
+    ['a failed last turn shows failed', ['done', 'failed'], 'failed'],
+    ['a turn that finished after a failure clears it', ['failed', 'done'], 'idle'],
+    ['a stopped last turn is idle', ['stopped'], 'idle'],
+  ];
+  store.transaction(() => {
+    store.put('project', projectId, 0, { id: projectId, name: 'Rail', revision: 0 });
+    rows.forEach(([title, states], index) => {
+      const taskId = id('tsk', index + 1);
+      store.put('task', taskId, 0, {
+        id: taskId,
+        projectId,
+        title,
+        outcome: 'Keep the change',
+        criteria: [],
+        revision: 0,
+        state: 'draft',
+        waitingReason: null,
+        runId: null,
+        next: null,
+      } satisfies Task);
+      states.forEach((state, sequence) => {
+        const turnId = id('trn', (index + 1) * 10 + sequence);
+        store.db
+          .prepare('INSERT INTO chat_turns(id,task_id,sequence,body) VALUES (?,?,?,?)')
+          .run(turnId, taskId, sequence, JSON.stringify({ id: turnId, taskId, sequence, state }));
+      });
+    });
+  });
+  const activity = () =>
+    taskPage(store, { stamp: store.workspaceStamp(), projectId }).tasks.map((task) => [
+      task.title,
+      task.chatActivity,
+    ]);
+  const expected = rows.map(([title, , shown]) => [title, shown]);
+  assert.deepEqual(activity(), expected);
+  store.close();
+  store = new Store(path);
+  assert.deepEqual(activity(), expected);
 });
