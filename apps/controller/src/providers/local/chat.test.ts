@@ -17,6 +17,7 @@ import type {
   Tool,
 } from '@lmstudio/sdk';
 import type { ChatHistoryEntry, ChatTurnHandle, ChatTurnRequest } from '../../chat/adapter.ts';
+import { byteSize } from '../../chat/prompt.ts';
 import { type LoadedModelLike, localChatAdapter, parseTextToolCalls } from './chat.ts';
 
 // Frames assumed from @lmstudio/sdk 2.1.0, `LLMDynamicHandle.act` and `internalAct` in
@@ -36,22 +37,39 @@ import { type LoadedModelLike, localChatAdapter, parseTextToolCalls } from './ch
 const sdkModelFits: LLM extends LoadedModelLike ? true : false = true;
 
 const SUMMARY = 'Renaming n to count in src/a.ts was agreed.';
+// `tokens` is the fragment's token count as the runtime reports it, one when left out.
 type Step =
-  | { text: string }
-  | { reasoning: string }
+  | { text: string; tokens?: number }
+  | { reasoning: string; tokens?: number }
   | { call: string; args: Record<string, unknown> }
   | { wait: () => void };
 type Round = { steps: Step[]; stats: Partial<LLMPredictionStats> };
 
 // The scripted rounds run across `act` calls, the way one model keeps answering a growing chat.
-function fakeModel(rounds: Round[], clock: { now: number }) {
-  const calls: { chat: ChatInput; tools: Tool[]; signal?: AbortSignal }[] = [];
+function fakeModel(
+  rounds: Round[],
+  clock: { now: number },
+  countTokens: (text: string) => number = (text) => Math.ceil(text.length / 4),
+) {
+  const calls: {
+    chat: ChatInput;
+    tools: Tool[];
+    signal?: AbortSignal;
+    maxTokens?: number | false;
+    reasoningBudget?: number | false;
+  }[] = [];
   let next = 0;
   let callId = 0;
   const model: LoadedModelLike = {
-    countTokens: async (text) => Math.ceil(text.length / 4),
+    countTokens: async (text) => countTokens(text),
     async act(chat, tools, options) {
-      calls.push({ chat, tools, signal: options.signal });
+      calls.push({
+        chat,
+        tools,
+        signal: options.signal,
+        maxTokens: options.maxTokens,
+        reasoningBudget: options.reasoningBudget,
+      });
       if (!tools.length) {
         const stats = { stopReason: 'eosFound' };
         options.onPredictionCompleted?.({
@@ -73,7 +91,7 @@ function fakeModel(rounds: Round[], clock: { now: number }) {
               roundIndex,
               content: fragment,
               reasoningType: 'text' in step ? 'none' : 'reasoning',
-              tokensCount: 1,
+              tokensCount: step.tokens ?? 1,
               containsDrafted: false,
               isStructural: false,
             });
@@ -156,7 +174,12 @@ function start(
   model: LoadedModelLike,
   contextLength: number,
   request: ChatTurnRequest,
-  loaded: { modelKey?: string; fellBack?: boolean; vision?: boolean } = {},
+  loaded: {
+    modelKey?: string;
+    fellBack?: boolean;
+    vision?: boolean;
+    reasoningBudget?: boolean;
+  } = {},
 ) {
   const events: AgentEvent[] = [];
   let handle: ChatTurnHandle | undefined;
@@ -202,7 +225,7 @@ test('a local turn streams, reads freely, edits after permission and reports its
       [
         {
           steps: [
-            { reasoning: 'Find n first.' },
+            { reasoning: 'Find n first.', tokens: 90 },
             { text: 'Reading the file.' },
             { call: 'read_range', args: { path: 'src/a.ts', start: 1, end: 2 } },
           ],
@@ -283,6 +306,9 @@ test('a local turn streams, reads freely, edits after permission and reports its
         contextUsed: 6054,
         contextCapacity: 8192,
         summaries: 1,
+        // Reasoning from the streamed fragments, and the rest of the output is reply.
+        reasoningTokens: 90,
+        replyTokens: 322,
       },
     });
     assert.deepEqual(events.at(-3), {
@@ -639,31 +665,154 @@ test('a tool call written as text parses in each form small models use', () => {
   }
 });
 
-test('a prompt larger than the context gets one line asking for a smaller first step', async () => {
-  const { root, clock, request } = fixture();
+test('the reply budget follows the reported context: compact when short, refuse when still short, report a cut reply', async () => {
+  const roots: string[] = [];
   try {
-    const { model, calls } = fakeModel([], clock);
-    const turn = start(model, 1000, request(0, { prompt: 'x'.repeat(4000) }));
-    const result = await turn.handle.result;
-    const sentence =
-      "This request is too large for the Local model's 1,000 token context. Send a smaller first step, such as one file or one function.";
-
-    assert.equal(calls.length, 0);
-    assert.deepEqual(
-      turn.events.map((event) => event.type),
-      ['turn.started', 'text.delta', 'text.completed', 'turn.completed'],
-    );
-    assert.deepEqual(turn.events[2], {
-      type: 'text.completed',
-      turnId: turnIds[0],
-      itemId: `${turnIds[0]}:item-1`,
-      text: sentence,
-    });
-    assert.equal(result.stopReason, 'done');
-    assert.equal(result.failure, null);
-    assert.equal(result.assistantText, sentence);
+    // Every count below is an input. Under this tokenizer the framing and the project outline
+    // count one token each, a summary section one, and each message eight more for its role
+    // markers. R is the context less the prompt less a 256 token margin, and a turn needs R of at
+    // least the larger of 2,048 and 30% of the context.
+    const prompt = 'Rename n to count in src/a.ts.';
+    const floor = (context: number) => Math.max(2048, Math.ceil(context * 0.3));
+    const framing = 1 + 8 + 1;
+    const figure = (value: number) => value.toLocaleString('en-US');
+    type Row = {
+      label: string;
+      context: number;
+      message: number;
+      /** What the whole conversation would leave for the reply. Absent: no earlier turns. */
+      leaves?: number;
+      reasoningBudget?: boolean;
+      rounds?: Round[];
+      expect: 'compacts' | 'refuses' | 'cut';
+    };
+    const rows: Row[] = [
+      {
+        label: '8,192 leaving 1,500',
+        context: 8192,
+        message: 100,
+        leaves: 1500,
+        expect: 'compacts',
+      },
+      {
+        label: '8,192 with a message too large',
+        context: 8192,
+        message: 7000,
+        leaves: 1500,
+        expect: 'refuses',
+      },
+      {
+        label: '1,048,576 leaving 300,000',
+        context: 1_048_576,
+        message: 100,
+        leaves: 300_000,
+        reasoningBudget: true,
+        expect: 'compacts',
+      },
+      {
+        label: '1,048,576 with a message too large',
+        context: 1_048_576,
+        message: 900_000,
+        expect: 'refuses',
+      },
+      {
+        label: '8,192 cut at the output limit',
+        context: 8192,
+        message: 8192 - 256 - 4600 - framing - 8,
+        rounds: [
+          {
+            steps: [
+              { reasoning: 'Thinking.', tokens: 3900 },
+              { text: 'Partial reply.', tokens: 700 },
+            ],
+            stats: { stopReason: 'maxPredictedTokensReached', predictedTokensCount: 4600 },
+          },
+        ],
+        expect: 'cut',
+      },
+    ];
+    for (const row of rows) {
+      // A fresh thread per row, so no row starts from the summary another one wrote.
+      const { root, clock, request } = fixture();
+      roots.push(root);
+      const { context, message } = row;
+      // Two earlier turns of equal size that make the whole prompt leave `leaves` for the reply.
+      const turn =
+        row.leaves === undefined
+          ? 0
+          : (context - 256 - row.leaves - framing - (message + 8)) / 2 - 8;
+      const history: ChatHistoryEntry[] =
+        row.leaves === undefined
+          ? []
+          : [
+              { role: 'user', text: 'Earlier question.' },
+              { role: 'assistant', text: 'Earlier answer.' },
+            ];
+      const sizes = new Map([
+        [prompt, message],
+        ['Earlier question.', turn],
+        ['Earlier answer.', turn],
+      ]);
+      const { model, calls } = fakeModel(
+        row.rounds ?? [{ steps: [{ text: 'Done.' }], stats: {} }],
+        clock,
+        (text) => sizes.get(text) ?? 1,
+      );
+      const turnStart = start(model, context, request(0, { prompt, history }), {
+        reasoningBudget: row.reasoningBudget === true,
+      });
+      const result = await turnStart.handle.result;
+      const { events } = turnStart;
+      assert.equal(result.stopReason, 'done', row.label);
+      if (row.expect === 'refuses') {
+        // The framing and the message alone leave too little, so folding earlier turns cannot help
+        // and the model is never called.
+        const tokens = framing - 1 + message + 8;
+        const sentence = `This request takes ${figure(tokens)} tokens of the Local model's ${figure(context)} token context and leaves ${figure(Math.max(0, context - tokens - 256))} for the reply, short of the ${figure(floor(context))} it needs. Send a smaller first step, such as one file or one function.`;
+        assert.equal(calls.length, 0, row.label);
+        assert.equal(result.assistantText, sentence, row.label);
+        continue;
+      }
+      if (row.expect === 'compacts') {
+        // The summary call comes first, then the turn runs with the summary in place of the turns.
+        assert.equal(calls[0].tools.length, 0, row.label);
+        const compacted = events.findIndex((event) => event.type === 'context.compacted');
+        const answered = events.findIndex((event) => event.type === 'text.delta');
+        assert(compacted >= 0 && compacted < answered, row.label);
+        const turnCall = calls[1];
+        assert.ok(turnCall.chat[0].content?.includes(SUMMARY), row.label);
+        assert.deepEqual(
+          turnCall.chat.slice(1).map((entry) => entry.content),
+          [prompt],
+          row.label,
+        );
+        const replyTokens = context - 256 - (framing + 1 + message + 8);
+        assert.equal(turnCall.maxTokens, replyTokens, row.label);
+        assert(replyTokens >= floor(context), row.label);
+        assert.equal(
+          turnCall.reasoningBudget,
+          row.reasoningBudget ? Math.floor(replyTokens / 2) : undefined,
+          row.label,
+        );
+        assert.equal(result.outputLimit, undefined, row.label);
+        continue;
+      }
+      // The reply hit R. The counts go back so the service can say where the output went.
+      assert.equal(calls[0].maxTokens, 4600, row.label);
+      assert.equal(calls[0].reasoningBudget, undefined, row.label);
+      const limit = { reasoningTokens: 3900, replyTokens: 700, allowedTokens: 4600 };
+      assert.deepEqual(result.outputLimit, limit, row.label);
+      const completed = events.at(-1);
+      assert.deepEqual(
+        completed?.type === 'turn.completed' && completed.outputLimit,
+        limit,
+        row.label,
+      );
+      assert.equal(result.assistantText, 'Partial reply.', row.label);
+      assert(!events.some((event) => event.type === 'provider.notice'), row.label);
+    }
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -682,8 +831,12 @@ test('files reach a Local turn as images on a vision model and as inlined text, 
     const notes = store('notes.md', 'text/markdown', '# Notes\nn is the count.\n');
     const report = store('report.pdf', 'application/pdf', '%PDF-1.7 fixture');
     const latin = store('latin.txt', 'text/plain', Buffer.from([0x63, 0x61, 0x66, 0xe9]));
-    // 8192 tokens less the reply's quarter, at eight bytes a token, is 49,152 bytes.
-    const big = store('big.log', 'text/plain', 'x'.repeat(49_153));
+    // Text shares what the prompt may hold: the context less the margin and the reply floor, at
+    // eight bytes a token. One byte more goes by name alone.
+    const room = (8192 - 256 - Math.max(2048, Math.ceil(8192 * 0.3))) * 8;
+    const big = store('big.log', 'text/plain', 'x'.repeat(room + 1));
+    const inlined =
+      'Attached to this message: notes.md (text/markdown, 24 bytes). Its full content follows. It is not in the scratch copy, so do not read or search for it on disk.\n```\n# Notes\nn is the count.\n```';
     const notice = (event: AgentEvent) => (event.type === 'provider.notice' ? event.message : []);
     const rows: Array<{
       vision: boolean;
@@ -694,12 +847,11 @@ test('files reach a Local turn as images on a vision model and as inlined text, 
       notices?: string[];
     }> = [
       {
-        // Earlier files go by name alone, so an earlier PDF and an earlier image on a model
-        // without vision do not refuse the turn.
+        // The packet lists earlier files, so an earlier PDF and an earlier image on a model
+        // without vision are left out here and do not refuse the turn.
         vision: false,
         files: [{ ...shot, earlier: true }, { ...report, earlier: true }, notes],
-        message:
-          'Rename n to count in src/a.ts.\n\nAttached earlier: shot.png (image/png, 10 bytes). Its content is not in this message.\n\nAttached earlier: report.pdf (application/pdf, 16 bytes). Its content is not in this message.\n\nAttached file notes.md:\n# Notes\nn is the count.\n',
+        message: `Rename n to count in src/a.ts.\n\nFiles attached to this message:\n${inlined}`,
         prepared: [],
         failure: null,
       },
@@ -707,8 +859,7 @@ test('files reach a Local turn as images on a vision model and as inlined text, 
         // A text file larger than the context can hold is never read and goes by name alone.
         vision: false,
         files: [big],
-        message:
-          "Rename n to count in src/a.ts.\n\nAttached file big.log (text/plain, 49153 bytes) is too large for this model's context. Its content is not in this message.",
+        message: `Rename n to count in src/a.ts.\n\nFiles attached to this message:\nbig.log, text/plain, ${byteSize(room + 1)}, too large for this model's context, so its content is not in this message`,
         prepared: [],
         failure: null,
         notices: ["Local: too large for the model's context, sent by name only: big.log."],
@@ -720,8 +871,7 @@ test('files reach a Local turn as images on a vision model and as inlined text, 
         // The image rides on the person's message and the text file follows its words.
         vision: true,
         files: [shot, notes],
-        message:
-          'Rename n to count in src/a.ts.\n\nAttached file notes.md:\n# Notes\nn is the count.\n',
+        message: `Rename n to count in src/a.ts.\n\nFiles attached to this message:\nshot.png, image/png, 10 bytes, sent as an image with this message\n${inlined}`,
         prepared: [{ name: 'shot.png', base64: png.toString('base64') }],
         failure: null,
       },

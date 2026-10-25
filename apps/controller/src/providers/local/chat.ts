@@ -13,6 +13,7 @@ import { dirname, join } from 'node:path';
 import type {
   AgentEvent,
   ChatFailure,
+  ChatOutputLimit,
   ChatPermissionOption,
   ChatTurnStats,
 } from '@crewkite/contracts';
@@ -47,6 +48,7 @@ import {
   readScratchFile,
   SEARCH_HITS,
 } from '../../chat/local-tools.ts';
+import { attachedLine, attachedSection, byteSize } from '../../chat/prompt.ts';
 import { cachedRepoMap } from '../../chat/repo-map.ts';
 
 // Local chat over the LM Studio SDK. The model has no agent loop of its own, so CrewKite runs
@@ -69,7 +71,10 @@ export type LocalFiles = Pick<FilesNamespace, 'prepareImageBase64'>;
  */
 export type LocalConnect = (request: ChatTurnRequest) => Promise<{
   model: LoadedModelLike;
+  /** The context the loaded instance reports. Every budget in a turn is a function of it. */
   contextLength: number;
+  /** True when the runtime takes a reasoning budget for this model, not only a thinking toggle. */
+  reasoningBudget?: boolean;
   modelKey: string;
   fellBack: boolean;
   vision: boolean;
@@ -103,12 +108,21 @@ type TurnFile = NonNullable<ChatTurnRequest['files']>[number];
 // budget times eight cannot fit. The prompt build still counts the tokens of what is read.
 const TEXT_BYTES_PER_TOKEN = 8;
 
+/** A fence longer than any backtick run in the content, so the content cannot close it early. */
+const fenced = (content: string) => {
+  const ticks = '`'.repeat(
+    Math.max(3, ...[...content.matchAll(/`+/g)].map((run) => run[0].length + 1)),
+  );
+  return `${ticks}\n${content}${content.endsWith('\n') ? '' : '\n'}${ticks}`;
+};
+
 /**
  * Sort the turn's files before any token is spent. Images go to a vision model as images, text
- * goes into the message under its name, and anything else is refused with the reason. Each file
- * is checked by its size on disk before any byte is read. Text files share `budgetTokens`, and
- * one past what is left goes by name alone and shows in `skipped`. Local's tools reach only the
- * scratch copy, so a file from an earlier message goes by name alone and never refuses the turn.
+ * goes into the message in full, and anything else is refused with the reason. Each file is
+ * checked by its size on disk before any byte is read. Text files share `budgetTokens`, and one
+ * past what is left goes by name alone and shows in `skipped`. The packet lists files from earlier
+ * messages, so they are skipped here and never refuse the turn. `texts` are the lines of the
+ * message's own file section.
  */
 function sortFiles(
   files: readonly TurnFile[],
@@ -123,16 +137,12 @@ function sortFiles(
   let room = Math.max(0, budgetTokens) * TEXT_BYTES_PER_TOKEN;
   for (const file of files) {
     const { name, mimeType } = file.attachment;
-    if (file.earlier) {
-      texts.push(
-        `Attached earlier: ${name} (${mimeType}, ${file.attachment.bytes} bytes). Its content is not in this message.`,
-      );
-      continue;
-    }
+    if (file.earlier) continue;
     if (mimeType.startsWith('image/')) {
       if (vision) {
         closeSync(openStored(file.path).fd);
         images.push(file);
+        texts.push(attachedLine(file.attachment, 'sent as an image with this message'));
       } else refused.push(`${name}: the loaded model ${modelKey} does not take images`);
       continue;
     }
@@ -150,7 +160,10 @@ function sortFiles(
     if (raw === null) {
       skipped.push(name);
       texts.push(
-        `Attached file ${name} (${mimeType}, ${size} bytes) is too large for this model's context. Its content is not in this message.`,
+        attachedLine(
+          { name, mimeType, bytes: size },
+          "too large for this model's context, so its content is not in this message",
+        ),
       );
       continue;
     }
@@ -159,7 +172,11 @@ function sortFiles(
       refused.push(`${name}: it is not UTF-8 text`);
     else {
       room -= size;
-      texts.push(`Attached file ${name}:\n${text}`);
+      // The model's tools reach only the scratch copy. Without the last sentence a model tries to
+      // read the file there by name, fails, and searches before it uses the text it already has.
+      texts.push(
+        `Attached to this message: ${name} (${mimeType}, ${byteSize(size)}). Its full content follows. It is not in the scratch copy, so do not read or search for it on disk.\n${fenced(text)}`,
+      );
     }
   }
   return { texts, images, refused, skipped };
@@ -187,7 +204,14 @@ const offeredTools = (request: ChatTurnRequest) =>
   LOCAL_TOOLS.filter(
     ({ function: definition }) => !request.readOnly || !CHANGING_TOOLS.has(definition.name),
   );
-const OUTPUT_SHARE = 0.25;
+// The reply budget R is what the prompt leaves of the context C the instance reports, less a
+// margin for the chat template's own tokens. A turn starts only when R is at least the larger of
+// REPLY_FLOOR and REPLY_SHARE of C, so a small window still gets a usable reply and a large one a
+// reply in proportion. Reasoning counts inside R.
+const REPLY_MARGIN = 256;
+const REPLY_FLOOR = 2048;
+const REPLY_SHARE = 0.3;
+const replyFloor = (context: number) => Math.max(REPLY_FLOOR, Math.ceil(context * REPLY_SHARE));
 const MAP_SHARE = 0.18;
 const SUMMARY_SHARE = 0.6;
 const SUMMARY_TOKENS = 300;
@@ -206,7 +230,7 @@ const PERMISSION_OPTIONS: ChatPermissionOption[] = [
 const SETTINGS_ACTION = 'Open LM Studio, load a model and connect Local in Settings.';
 const SHORTEN_ACTION = 'Shorten the request or split it into smaller steps, then send again.';
 
-function systemPrompt(request: ChatTurnRequest, outputTokens: number) {
+function systemPrompt(request: ChatTurnRequest) {
   const names = offeredTools(request).map((tool) => tool.function.name);
   return [
     request.systemContext,
@@ -217,7 +241,7 @@ function systemPrompt(request: ChatTurnRequest, outputTokens: number) {
     `Tool results are bounded: read_range returns at most ${READ_LINES} lines, search at most ${SEARCH_HITS} hits, and run the last ${RUN_TAIL_LINES} lines of output within ${RUN_SECONDS} seconds.`,
     'Read narrow ranges. The context window is small and every result stays in it until the turn ends.',
     'Use edit for exact replacements in existing files and write only for new files. The person may decline an edit or a command; continue without it.',
-    `You can make at most ${MAX_TOOL_CALLS} tool calls in one turn. Each reply can use at most ${outputTokens} tokens, so keep answers short.`,
+    `You can make at most ${MAX_TOOL_CALLS} tool calls in one turn. Your reasoning and your reply share one token budget, so keep both short.`,
   ].join('\n');
 }
 
@@ -264,27 +288,37 @@ function saveSummary(request: ChatTurnRequest, summary: string, count: number) {
   mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
   writeFileSync(`${file}.tmp`, JSON.stringify(value), { mode: 0o600 });
   renameSync(`${file}.tmp`, file);
+  return value;
 }
 
-/** `carried` is true when the summary fit and went into the prompt. */
+/**
+ * `carried` is true when the summary fit and went into the prompt. `tokens` is the prompt's count
+ * P. `over` means the whole conversation leaves less than the reply needs, so earlier turns should
+ * fold into the summary first. `too-large` means the framing and the message alone do.
+ */
 type Prompt =
-  | { kind: 'fits'; chat: ChatInput; summary: Summary | null; carried: boolean }
-  | { kind: 'too-large' };
+  | { kind: 'fits'; chat: ChatInput; summary: Summary | null; carried: boolean; tokens: number }
+  | { kind: 'over'; tokens: number }
+  | { kind: 'too-large'; tokens: number };
 
-/** `message` is the person's text with any text files inlined after it. */
+/**
+ * `message` is the person's text with the message's own files after it. With `trim` false every
+ * turn since the summary must fit. With `trim` true the oldest turns drop until the rest fits.
+ */
 async function buildPrompt(
   request: ChatTurnRequest,
   message: string,
   model: LoadedModelLike,
   contextLength: number,
+  summary: Summary | null,
+  trim: boolean,
   warn: (message: string) => void,
 ): Promise<Prompt> {
-  const outputTokens = Math.floor(contextLength * OUTPUT_SHARE);
+  const room = contextLength - REPLY_MARGIN - replyFloor(contextLength);
   const count = async (text: string) => (await model.countTokens(text)) + MESSAGE_TOKENS;
-  let left = contextLength - outputTokens;
-  let system = systemPrompt(request, outputTokens);
-  left -= (await count(system)) + (await count(message));
-  if (left < 0) return { kind: 'too-large' };
+  let system = systemPrompt(request);
+  let left = room - (await count(system)) - (await count(message));
+  if (left < 0) return { kind: 'too-large', tokens: room - left };
 
   const mapBudget = Math.min(Math.floor(contextLength * MAP_SHARE), left);
   if (mapBudget >= 64) {
@@ -311,7 +345,6 @@ async function buildPrompt(
   }
 
   let history = request.history;
-  const summary = loadSummary(request);
   let carried = false;
   if (summary) {
     const section = `\n\nSummary of earlier turns in this thread:\n${summary.summary}`;
@@ -326,7 +359,10 @@ async function buildPrompt(
   const kept: ChatHistoryEntry[] = [];
   for (let index = history.length - 1; index >= 0; index--) {
     const tokens = await count(history[index].text);
-    if (tokens > left) break;
+    if (tokens > left) {
+      if (!trim) return { kind: 'over', tokens: room - left + tokens };
+      break;
+    }
     kept.unshift(history[index]);
     left -= tokens;
   }
@@ -336,6 +372,7 @@ async function buildPrompt(
     kind: 'fits',
     summary,
     carried,
+    tokens: room - left,
     chat: [
       { role: 'system', content: system },
       ...kept.map((entry) => ({ role: entry.role, content: entry.text })),
@@ -455,6 +492,7 @@ function turnStats(
   turnMs: number,
   context: { used: number; capacity: number | null },
   summaries: number,
+  reasoning: number,
 ): ChatTurnStats {
   const out = rounds.reduce((sum, stats) => sum + (stats.predictedTokensCount ?? 0), 0);
   const seconds = rounds.reduce(
@@ -477,6 +515,10 @@ function turnStats(
     contextUsed: tokensIn === null ? null : context.used,
     contextCapacity: context.capacity,
     summaries,
+    // Reasoning is counted from the streamed fragments, and the reply is the rest of the output.
+    ...(reported
+      ? { reasoningTokens: Math.min(reasoning, out), replyTokens: out - Math.min(reasoning, out) }
+      : {}),
   };
 }
 
@@ -650,6 +692,9 @@ function startLocalTurn(
   const grants = new Set<'edit' | 'command'>();
   const changed = new Set<string>();
   const rounds: LLMPredictionStats[] = [];
+  // Reasoning and reply tokens of each finished round, from the streamed fragments.
+  let counting = { reasoning: 0, reply: 0 };
+  const counted: (typeof counting)[] = [];
   const texts: string[] = [];
   const noticed = new Set<string>();
   let summaries = 0;
@@ -930,6 +975,7 @@ function startLocalTurn(
   const run = async (): Promise<ChatTurnResult> => {
     let usage: ChatTurnResult['usage'] = null;
     let session: ChatTurnResult['session'] = null;
+    let outputLimit: ChatOutputLimit | undefined;
     const finish = (stopReason: ChatTurnResult['stopReason'], failure: ChatFailure | null) => {
       closeText();
       closeThinking();
@@ -941,10 +987,22 @@ function startLocalTurn(
         emit({
           type: 'turn.stats',
           turnId,
-          stats: turnStats(rounds, now() - began, context, summaries),
+          stats: turnStats(
+            rounds,
+            now() - began,
+            context,
+            summaries,
+            counted.reduce((sum, round) => sum + round.reasoning, 0),
+          ),
         });
       }
-      emit({ type: 'turn.completed', turnId, stopReason, failure });
+      emit({
+        type: 'turn.completed',
+        turnId,
+        stopReason,
+        failure,
+        ...(outputLimit ? { outputLimit } : {}),
+      });
       return {
         stopReason,
         failure,
@@ -952,6 +1010,7 @@ function startLocalTurn(
         session,
         usage,
         changedPaths: [...changed],
+        ...(outputLimit ? { outputLimit } : {}),
       } satisfies ChatTurnResult;
     };
     const ended = () =>
@@ -1006,7 +1065,7 @@ function startLocalTurn(
         request.files ?? [],
         connection.vision,
         modelKey,
-        contextLength - Math.floor(contextLength * OUTPUT_SHARE),
+        contextLength - REPLY_MARGIN - replyFloor(contextLength),
       );
     } catch (error) {
       return finish(
@@ -1037,26 +1096,63 @@ function startLocalTurn(
         ),
       );
 
-    let prompt: Prompt;
-    try {
-      prompt = await bounded(
-        buildPrompt(
-          request,
-          [request.prompt, ...files.texts].join('\n\n'),
-          model,
-          contextLength,
-          (message) => notice('warning', message),
+    /** Fold the turns since `previous` into the summary. Null when nothing was written. */
+    const compact = async (previous: Summary | null) => {
+      try {
+        const text = await bounded(
+          summarize(request, model, contextLength, previous, abort.signal),
+        );
+        if (!text) return null;
+        summaries = (previous?.count ?? 0) + 1;
+        const saved = saveSummary(request, text, summaries);
+        emit({
+          type: 'context.compacted',
+          turnId,
+          summaries,
+          coveredTurns: Math.max(
+            1,
+            request.history.filter((entry) => entry.role === 'user').length,
+          ),
+          usedTokens: usedContext(),
+          capacityTokens: contextLength,
+        });
+        return saved;
+      } catch {
+        if (!ending) notice('warning', 'Local: the summary of earlier turns could not be updated.');
+        return null;
+      }
+    };
+    const message = [request.prompt, attachedSection(files.texts)].filter(Boolean).join('\n\n');
+    const build = (summary: Summary | null, trim: boolean) =>
+      bounded(
+        buildPrompt(request, message, model, contextLength, summary, trim, (text) =>
+          notice('warning', text),
         ),
       );
+    let prompt: Prompt;
+    try {
+      const saved = loadSummary(request);
+      prompt = await build(saved, false);
+      // The whole conversation leaves less than the reply needs. Earlier turns fold into the
+      // summary first, and the prompt is built again with the oldest turns dropping if needed.
+      if (prompt.kind === 'over') {
+        const folded = await compact(saved);
+        prompt = await build(folded ?? saved, true);
+      }
     } catch (error) {
       return ending ? ended() : finish('error', connectFailure(error));
     }
-    if (prompt.kind === 'too-large') {
+    if (ending) return ended();
+    if (prompt.kind !== 'fits') {
+      const left = contextLength - prompt.tokens - REPLY_MARGIN;
+      const figure = (value: number) => value.toLocaleString('en-US');
       say(
-        `This request is too large for the Local model's ${contextLength.toLocaleString('en-US')} token context. Send a smaller first step, such as one file or one function.`,
+        `This request takes ${figure(prompt.tokens)} tokens of the Local model's ${figure(contextLength)} token context and leaves ${figure(Math.max(0, left))} for the reply, short of the ${figure(replyFloor(contextLength))} it needs. Send a smaller first step, such as one file or one function.`,
       );
       return finish('done', null);
     }
+    // R, the reply budget. The rule above keeps it at or above the floor.
+    const replyTokens = contextLength - prompt.tokens - REPLY_MARGIN;
     if (prompt.carried && prompt.summary) summaries = prompt.summary.count;
 
     // `act` runs rounds until one ends without a native call. When that round wrote its calls as
@@ -1099,11 +1195,15 @@ function startLocalTurn(
         written = [];
         await bounded(
           model.act(chat, tools, {
-            maxTokens: Math.floor(contextLength * OUTPUT_SHARE),
+            maxTokens: replyTokens,
+            // A budget the runtime takes is capped at half of R. A thinking toggle stays as set.
+            ...(connection.reasoningBudget ? { reasoningBudget: Math.floor(replyTokens / 2) } : {}),
             contextOverflowPolicy: 'stopAtLimit',
             maxPredictionRounds: MAX_ROUNDS - rounds.length,
             signal: abort.signal,
             onPredictionFragment: (fragment) => {
+              if (fragment.reasoningType === 'none') counting.reply += fragment.tokensCount;
+              else counting.reasoning += fragment.tokensCount;
               if (ending || fragment.isStructural) return;
               if (fragment.reasoningType === 'reasoning') think(fragment.content);
               else if (fragment.reasoningType === 'none') speak(fragment.content);
@@ -1118,6 +1218,8 @@ function startLocalTurn(
             },
             onPredictionCompleted: (result) => {
               rounds.push(result.stats);
+              counted.push(counting);
+              counting = { reasoning: 0, reply: 0 };
             },
             guardToolCall,
             handleInvalidToolRequest: (error, call) => {
@@ -1160,36 +1262,25 @@ function startLocalTurn(
       );
     if (stops.has('modelUnloaded'))
       return finish('error', streamFailure(new Error('The model was unloaded.')));
-    if (rounds.at(-1)?.stopReason === 'maxPredictedTokensReached')
-      notice('warning', 'Local: the reply reached its output limit and was cut off.');
+    // The service turns these counts into the output limit line and offers Continue.
+    const last = rounds.at(-1);
+    if (last?.stopReason === 'maxPredictedTokensReached') {
+      const tokens = counted.at(-1) ?? counting;
+      const predicted = last.predictedTokensCount ?? tokens.reasoning + tokens.reply;
+      const reasoningTokens = Math.min(tokens.reasoning, predicted);
+      outputLimit = {
+        reasoningTokens,
+        replyTokens: predicted - reasoningTokens,
+        allowedTokens: replyTokens,
+      };
+    }
 
     // Measured on the first round, which carries the whole conversation without tool results.
     const carried =
       (rounds[0]?.promptTokensCount ?? 0) + Math.ceil(texts.join('').length / 4) + MESSAGE_TOKENS;
     if (carried > contextLength * SUMMARY_SHARE) {
-      try {
-        const summary = await bounded(
-          summarize(request, model, contextLength, prompt.summary, abort.signal),
-        );
-        if (summary) {
-          summaries = (prompt.summary?.count ?? 0) + 1;
-          saveSummary(request, summary, summaries);
-          emit({
-            type: 'context.compacted',
-            turnId,
-            summaries,
-            coveredTurns: Math.max(
-              1,
-              request.history.filter((entry) => entry.role === 'user').length,
-            ),
-            usedTokens: usedContext(),
-            capacityTokens: contextLength,
-          });
-        }
-      } catch {
-        if (ending) return ended();
-        notice('warning', 'Local: the summary of earlier turns could not be updated.');
-      }
+      await compact(prompt.summary);
+      if (ending) return ended();
     }
     return finish('done', null);
   };
