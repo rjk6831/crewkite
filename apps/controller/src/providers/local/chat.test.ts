@@ -682,7 +682,40 @@ test('files reach a Local turn as images on a vision model and as inlined text, 
     const notes = store('notes.md', 'text/markdown', '# Notes\nn is the count.\n');
     const report = store('report.pdf', 'application/pdf', '%PDF-1.7 fixture');
     const latin = store('latin.txt', 'text/plain', Buffer.from([0x63, 0x61, 0x66, 0xe9]));
+    // 8192 tokens less the reply's quarter, at eight bytes a token, is 49,152 bytes.
+    const big = store('big.log', 'text/plain', 'x'.repeat(49_153));
+    const notice = (event: AgentEvent) => (event.type === 'provider.notice' ? event.message : []);
+    const rows: Array<{
+      vision: boolean;
+      files: NonNullable<ChatTurnRequest['files']>;
+      message?: string;
+      prepared: { name: string; base64: string }[];
+      failure: string | null;
+      notices?: string[];
+    }> = [
+      {
+        // Earlier files go by name alone, so an earlier PDF and an earlier image on a model
+        // without vision do not refuse the turn.
+        vision: false,
+        files: [{ ...shot, earlier: true }, { ...report, earlier: true }, notes],
+        message:
+          'Rename n to count in src/a.ts.\n\nAttached earlier: shot.png (image/png, 10 bytes). Its content is not in this message.\n\nAttached earlier: report.pdf (application/pdf, 16 bytes). Its content is not in this message.\n\nAttached file notes.md:\n# Notes\nn is the count.\n',
+        prepared: [],
+        failure: null,
+      },
+      {
+        // A text file larger than the context can hold is never read and goes by name alone.
+        vision: false,
+        files: [big],
+        message:
+          "Rename n to count in src/a.ts.\n\nAttached file big.log (text/plain, 49153 bytes) is too large for this model's context. Its content is not in this message.",
+        prepared: [],
+        failure: null,
+        notices: ["Local: too large for the model's context, sent by name only: big.log."],
+      },
+    ];
     for (const row of [
+      ...rows,
       {
         // The image rides on the person's message and the text file follows its words.
         vision: true,
@@ -713,8 +746,11 @@ test('files reach a Local turn as images on a vision model and as inlined text, 
       if (row.failure === null) {
         const message = calls[0].chat.at(-1);
         assert.equal(message?.content, row.message);
-        assert.deepEqual(message?.images, row.prepared);
+        assert.deepEqual(message?.images ?? [], row.prepared);
         assert.equal(result.stopReason, 'done');
+        if ('notices' in row && row.notices)
+          for (const expected of row.notices)
+            assert(turn.events.flatMap(notice).includes(expected), expected);
         continue;
       }
       // Refused before the model ran, so no round and no stats.

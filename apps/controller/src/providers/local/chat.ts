@@ -1,5 +1,14 @@
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname, join } from 'node:path';
 import type {
   AgentEvent,
@@ -90,32 +99,83 @@ const textType = (mimeType: string) => {
 
 type TurnFile = NonNullable<ChatTurnRequest['files']>[number];
 
+// Text and code run about three to five bytes a token, so a text file larger than the token
+// budget times eight cannot fit. The prompt build still counts the tokens of what is read.
+const TEXT_BYTES_PER_TOKEN = 8;
+
 /**
  * Sort the turn's files before any token is spent. Images go to a vision model as images, text
- * goes into the message under its name, and anything else is refused with the reason.
+ * goes into the message under its name, and anything else is refused with the reason. Each file
+ * is checked by its size on disk before any byte is read. Text files share `budgetTokens`, and
+ * one past what is left goes by name alone and shows in `skipped`. Local's tools reach only the
+ * scratch copy, so a file from an earlier message goes by name alone and never refuses the turn.
  */
-function sortFiles(files: readonly TurnFile[], vision: boolean, modelKey: string) {
+function sortFiles(
+  files: readonly TurnFile[],
+  vision: boolean,
+  modelKey: string,
+  budgetTokens: number,
+) {
   const texts: string[] = [];
   const images: TurnFile[] = [];
   const refused: string[] = [];
+  const skipped: string[] = [];
+  let room = Math.max(0, budgetTokens) * TEXT_BYTES_PER_TOKEN;
   for (const file of files) {
     const { name, mimeType } = file.attachment;
+    if (file.earlier) {
+      texts.push(
+        `Attached earlier: ${name} (${mimeType}, ${file.attachment.bytes} bytes). Its content is not in this message.`,
+      );
+      continue;
+    }
     if (mimeType.startsWith('image/')) {
-      if (vision) images.push(file);
-      else refused.push(`${name}: the loaded model ${modelKey} does not take images`);
+      if (vision) {
+        closeSync(openStored(file.path).fd);
+        images.push(file);
+      } else refused.push(`${name}: the loaded model ${modelKey} does not take images`);
       continue;
     }
     if (!textType(mimeType)) {
       refused.push(`${name}: Local takes images and text files, and this file is ${mimeType}`);
       continue;
     }
-    const raw = readFileSync(file.path);
+    const { fd, size } = openStored(file.path);
+    let raw: Buffer | null = null;
+    try {
+      if (size <= room) raw = readFileSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    if (raw === null) {
+      skipped.push(name);
+      texts.push(
+        `Attached file ${name} (${mimeType}, ${size} bytes) is too large for this model's context. Its content is not in this message.`,
+      );
+      continue;
+    }
     const text = raw.toString('utf8');
     if (raw.subarray(0, 8000).includes(0) || !Buffer.from(text).equals(raw))
       refused.push(`${name}: it is not UTF-8 text`);
-    else texts.push(`Attached file ${name}:\n${text}`);
+    else {
+      room -= size;
+      texts.push(`Attached file ${name}:\n${text}`);
+    }
   }
-  return { texts, images, refused };
+  return { texts, images, refused, skipped };
+}
+
+/** An open regular file and its size. O_NONBLOCK keeps a FIFO from holding the turn. */
+function openStored(path: string) {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) throw new Error(`${path} is not a regular file`);
+    return { fd, size: stat.size };
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
 }
 
 const MAX_TOOL_CALLS = 12;
@@ -942,7 +1002,12 @@ function startLocalTurn(
 
     let files: ReturnType<typeof sortFiles>;
     try {
-      files = sortFiles(request.files ?? [], connection.vision, modelKey);
+      files = sortFiles(
+        request.files ?? [],
+        connection.vision,
+        modelKey,
+        contextLength - Math.floor(contextLength * OUTPUT_SHARE),
+      );
     } catch (error) {
       return finish(
         'error',
@@ -962,6 +1027,14 @@ function startLocalTurn(
           kind: 'attachment-rejected',
           message: `Local cannot take ${files.refused.join('; ')}.`.slice(0, 4096),
         }),
+      );
+    if (files.skipped.length)
+      notice(
+        'warning',
+        `Local: too large for the model's context, sent by name only: ${files.skipped.join(', ')}.`.slice(
+          0,
+          4096,
+        ),
       );
 
     let prompt: Prompt;
