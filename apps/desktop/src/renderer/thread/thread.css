@@ -1557,17 +1557,17 @@
   border-color: var(--accent);
   border-style: dashed;
 }
-.th-files {
+.th-attachments {
   margin-bottom: 8px;
 }
-.th-user .th-files,
-.th-queued-row .th-files {
+.th-user .th-attachments,
+.th-queued-row .th-attachments {
   margin-bottom: 0;
 }
-.th-user .th-files {
+.th-user .th-attachments {
   justify-content: flex-end;
 }
-.th-files li.th-file {
+.th-attachments li.th-attachment {
   flex-direction: column;
   align-items: flex-start;
   gap: 3px;
@@ -1578,7 +1578,7 @@
   border-radius: 0;
   background: transparent;
 }
-.th-file-body {
+.th-attachment-body {
   display: inline-flex;
   align-items: center;
   gap: 5px;
@@ -1588,31 +1588,31 @@
   border-radius: 999px;
   background: var(--surface);
 }
-.th-file-name,
-.th-file-facts {
+.th-attachment-name,
+.th-attachment-facts {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.th-file-name {
+.th-attachment-name {
   color: var(--text);
 }
-.th-file-facts {
+.th-attachment-facts {
   color: var(--text-dim);
 }
-.th-file.is-image .th-file-body {
+.th-attachment.is-image .th-attachment-body {
   position: relative;
   padding: 0;
   overflow: hidden;
   border-radius: 8px;
 }
-.th-file.is-image img {
+.th-attachment.is-image img {
   display: block;
   width: 56px;
   height: 56px;
   object-fit: cover;
 }
-.th-file.is-image .th-file-remove {
+.th-attachment.is-image .th-attachment-remove {
   position: absolute;
   top: 3px;
   right: 3px;
@@ -1621,7 +1621,7 @@
   border-radius: 50%;
   background: var(--surface-raised);
 }
-.th-file-note {
+.th-attachment-note {
   color: var(--amber);
   font-size: 11px;
   white-space: normal;

@@ -56,13 +56,16 @@ export function FileChips({
 }) {
   if (files.length === 0) return null;
   return (
-    <ul className="th-chips th-files" aria-label="Files">
+    <ul className="th-chips th-attachments" aria-label="Files">
       {files.map((file) => {
         const line = note?.(file) ?? null;
         const facts = [file.mimeType, formatBytes(file.bytes)].filter(Boolean).join(' · ');
         return (
-          <li key={file.key} className={file.thumbnail ? 'th-file is-image' : 'th-file'}>
-            <span className="th-file-body" title={`${file.name}\n${facts}`}>
+          <li
+            key={file.key}
+            className={file.thumbnail ? 'th-attachment is-image' : 'th-attachment'}
+          >
+            <span className="th-attachment-body" title={`${file.name}\n${facts}`}>
               {file.thumbnail ? (
                 <img src={file.thumbnail} alt={file.name} />
               ) : (
@@ -72,14 +75,14 @@ export function FileChips({
                   ) : (
                     <FileText size={13} aria-hidden="true" />
                   )}
-                  <span className="th-file-name">{file.name}</span>
-                  <span className="th-file-facts">{facts}</span>
+                  <span className="th-attachment-name">{file.name}</span>
+                  <span className="th-attachment-facts">{facts}</span>
                 </>
               )}
               {onRemove && (
                 <button
                   type="button"
-                  className="th-file-remove"
+                  className="th-attachment-remove"
                   aria-label={`Remove ${file.name}`}
                   onClick={() => onRemove(file.key)}
                 >
@@ -87,7 +90,7 @@ export function FileChips({
                 </button>
               )}
             </span>
-            {line && <span className="th-file-note">{line}</span>}
+            {line && <span className="th-attachment-note">{line}</span>}
           </li>
         );
       })}

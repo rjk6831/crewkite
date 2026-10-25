@@ -889,6 +889,7 @@ export function App() {
             projectId={newThread}
             onProject={setNewThread}
             onCreated={openThread}
+            onOpenSettings={() => setPage('settings')}
             onAddProject={
               workspace.canPickProject ? () => void workspace.pickProject().catch(() => {}) : null
             }
