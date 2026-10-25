@@ -10,11 +10,12 @@ import {
   realpathSync,
 } from 'node:fs';
 import { userInfo } from 'node:os';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import {
   type AgentEvent,
   type AnthropicUsageReadingSchema,
+  type ChatAttachment,
   ChatEffortSchema,
   type ChatFailure,
   type ChatPermissionOption,
@@ -144,6 +145,7 @@ const assistant = z.object({
   }),
   error: z.string().optional(),
   api_error: z.string().optional(),
+  api_error_status: z.number().int().optional().catch(undefined),
   api_error_params: z.object({ rate_limit_info: rateInfo.optional() }).optional(),
 });
 const user = z.object({
@@ -315,7 +317,89 @@ export const anthropicChatModels = [
 export const anthropicDefaultChatModel = 'claude-sonnet-5-5';
 export const anthropicChatEfforts = ['default', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 
-function chatArguments(request: ChatTurnRequest, resume: string | null) {
+// The file types the stream-json user message takes as content blocks: base64 image blocks for
+// these four, a base64 document block for PDF, and a text document block, whose only media type
+// is text/plain, for any UTF-8 text file. The catalog reports this list, so the composer and the
+// adapter read the same fact.
+export const anthropicChatAccepts = [
+  'image/jpeg',
+  'image/png',
+  'image/gif',
+  'image/webp',
+  'application/pdf',
+  'text/*',
+] as const;
+
+// shortcut: ChatTurnRequest has no files field yet, so the adapter reads it through this type.
+// Upgrade: read request.files directly once chat/adapter.ts declares it.
+type TurnFile = Readonly<{ attachment: ChatAttachment; path: string }>;
+const turnFiles = (request: ChatTurnRequest): readonly TurnFile[] =>
+  (request as { files?: readonly TurnFile[] }).files ?? [];
+const utf8 = new TextDecoder('utf-8', { fatal: true });
+
+class UnreadableFile extends Error {}
+
+/**
+ * The user message for this turn. Each file the protocol has a block for goes as that block, read
+ * now so the bytes match what the person attached. Any other file goes as a line in the text with
+ * its stored path, and its folder joins the launch through --add-dir so the model's tools can
+ * read it. File blocks come before the text, which is the order the API documents for images.
+ */
+function userMessage(text: string, files: readonly TurnFile[]) {
+  const blocks: unknown[] = [];
+  const lines: string[] = [];
+  const folders = new Set<string>();
+  for (const { attachment, path } of files) {
+    let bytes: Buffer;
+    try {
+      if (!isAbsolute(path)) throw new Error();
+      bytes = readFileSync(path);
+    } catch {
+      throw new UnreadableFile(attachment.name);
+    }
+    const type = attachment.mimeType.split(';')[0].trim().toLowerCase();
+    const title = attachment.name;
+    if (type.startsWith('image/') && anthropicChatAccepts.some((value) => value === type))
+      blocks.push({
+        type: 'image',
+        source: { type: 'base64', media_type: type, data: bytes.toString('base64') },
+      });
+    else if (type === 'application/pdf')
+      blocks.push({
+        type: 'document',
+        title,
+        source: { type: 'base64', media_type: type, data: bytes.toString('base64') },
+      });
+    else {
+      let content: string | null = null;
+      if (type.startsWith('text/'))
+        try {
+          content = utf8.decode(bytes);
+        } catch {}
+      if (content !== null)
+        blocks.push({
+          type: 'document',
+          title,
+          source: { type: 'text', media_type: 'text/plain', data: content },
+        });
+      else {
+        lines.push(
+          `Attached file: ${attachment.name} (${attachment.mimeType}, ${attachment.bytes} bytes) at ${path}`,
+        );
+        // Stored files sit at <files folder>/<sha256>/<name>, so one folder covers them all.
+        folders.add(dirname(dirname(path)));
+      }
+    }
+  }
+  const body = [text, lines.join('\n')].filter(Boolean).join('\n\n');
+  return {
+    content: [...blocks, { type: 'text', text: body }],
+    native: blocks.length > 0,
+    folders: [...folders],
+  };
+}
+
+function chatArguments(request: ChatTurnRequest, resume: string | null, folders: string[]) {
   const { effort, model } = request.selection;
   return [
     '--print',
@@ -343,6 +427,8 @@ function chatArguments(request: ChatTurnRequest, resume: string | null) {
     // The client documents low, medium, high, xhigh and max. It has no minimal level.
     ...(effort === 'default' || effort === 'minimal' ? [] : ['--effort', effort]),
     ...(resume ? ['--resume', resume] : []),
+    // The option takes several folders, so it goes last where no later flag can be read as one.
+    ...(folders.length ? ['--add-dir', ...folders] : []),
   ];
 }
 
@@ -407,6 +493,23 @@ function startTurn(
         message: 'The selected model name cannot be passed to the Anthropic client.',
       }),
     );
+  // A resumed session already holds CrewKite's framing from its first message.
+  const text = prior
+    ? request.prompt
+    : [request.systemContext, request.prompt].filter(Boolean).join('\n\n');
+  let message: ReturnType<typeof userMessage>;
+  try {
+    message = userMessage(text, turnFiles(request));
+  } catch (error) {
+    if (!(error instanceof UnreadableFile)) throw error;
+    return refuse(
+      chatFailure({
+        stage: 'prompt',
+        kind: 'attachment-rejected',
+        message: `CrewKite could not read the attached file ${clip(error.message, 255)}.`,
+      }),
+    );
+  }
   let executable: string;
   try {
     const client = deps.launch(request);
@@ -438,7 +541,8 @@ function startTurn(
   }
   let child: ChildProcessWithoutNullStreams;
   try {
-    child = (deps.spawn ?? (spawn as Spawn))(executable, chatArguments(request, prior), {
+    const args = chatArguments(request, prior, message.folders);
+    child = (deps.spawn ?? (spawn as Spawn))(executable, args, {
       cwd: scratch,
       env: environment,
       detached: true,
@@ -717,6 +821,10 @@ function startTurn(
       apiError = { kind: 'signed-out', resetsAt: null };
     else if (data.error === 'model_not_found')
       apiError = { kind: 'model-unavailable', resetsAt: null };
+    // A turn without file blocks gets the same answer for other reasons, such as a prompt over
+    // the context window, so only a turn that sent blocks names the files.
+    else if (message.native && (data.error === 'invalid_request' || data.api_error_status === 400))
+      apiError = { kind: 'attachment-rejected', resetsAt: null };
     // A streamed message arrives again as one assistant frame per content block. Match each
     // block to the first open streamed item of its kind, and treat a block whose text an item
     // already completed with as a repeat.
@@ -951,6 +1059,15 @@ function startTurn(
               resetsAt: apiError?.resetsAt ?? unixTime(Number(/\|(\d{9,12})\b/.exec(text)?.[1])),
             }),
           );
+        else if (apiError?.kind === 'attachment-rejected')
+          decide(
+            'error',
+            chatFailure({
+              ...base,
+              kind: 'attachment-rejected',
+              message: 'The Anthropic API refused the attached files.',
+            }),
+          );
         else if (apiError?.kind === 'signed-out' || SIGNED_OUT.test(text))
           decide(
             'error',
@@ -1169,11 +1286,7 @@ function startTurn(
       ),
     );
 
-  // A resumed session already holds CrewKite's framing from its first message.
-  const text = prior
-    ? request.prompt
-    : [request.systemContext, request.prompt].filter(Boolean).join('\n\n');
-  write({ type: 'user', message: { role: 'user', content: [{ type: 'text', text }] } });
+  write({ type: 'user', message: { role: 'user', content: message.content } });
 
   return {
     respondPermission(requestId, choice) {
