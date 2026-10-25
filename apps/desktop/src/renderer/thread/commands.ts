@@ -34,6 +34,7 @@ import {
   StopChatTurnPayloadSchema,
 } from '@crewkite/contracts';
 import type { DesktopCommand, DesktopSource } from '../source.ts';
+import { THREAD_PAGE_SIZE } from './thread-state.ts';
 
 // The chat commands are listed in CommandSchema. The cast stays in this one file so the thread
 // view never spells a command name anywhere else.
@@ -77,8 +78,6 @@ async function read<T>(
   return schema.parse(rest);
 }
 
-/** Messages per thread read. A read that fills it may have older messages behind it. */
-export const THREAD_PAGE = 200;
 export const readThread = (
   source: ThreadSource,
   taskId: string,
@@ -87,7 +86,7 @@ export const readThread = (
   read(
     source,
     'ReadChatThread',
-    ReadChatThreadPayloadSchema.parse({ taskId, limit: THREAD_PAGE, beforeCursor }),
+    ReadChatThreadPayloadSchema.parse({ taskId, limit: THREAD_PAGE_SIZE, beforeCursor }),
     ChatThreadReadSchema,
   );
 /** One page of a finished turn's stored events. Pass `nextAfterCursor` back to read on. */
@@ -230,7 +229,7 @@ export const readBranchStatus = (
     ChatBranchStatusSchema,
   );
 
-// A refusal throws with the controller's next step, such as "Rename is not available yet."
+// A refusal throws with the controller's next step.
 export const renameThread = (source: ThreadSource, taskId: string, title: string) =>
   run(source, 'RenameChatThread', RenameChatThreadPayloadSchema.parse({ taskId, title }));
 export const deleteThread = (source: ThreadSource, taskId: string) =>

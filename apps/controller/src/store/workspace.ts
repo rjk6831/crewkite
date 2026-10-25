@@ -18,7 +18,8 @@ import type { Store } from './index.ts';
 /**
  * The rail state of a thread comes from its newest turn. A failed turn stays failed until another
  * turn starts. The turn index makes this one lookup per summary, and the turn row is durable, so
- * the state survives a restart.
+ * the state survives a restart. The desktop folds chat.turn events with the same rule in
+ * turnActivity, apps/desktop/src/renderer/rail-activity.ts; change both together.
  */
 function chatActivity(state: ChatTurnState | null): ChatThreadActivity {
   if (state === 'queued' || state === 'running') return 'running';
