@@ -195,7 +195,7 @@ function file(name: string, mimeType: string, bytes = Buffer.from(name)) {
   writeFileSync(path, bytes);
   return { attachment: { id, name, mimeType, bytes: bytes.length }, path };
 }
-type File = ReturnType<typeof file>;
+type File = ReturnType<typeof file> & { earlier?: boolean };
 const png = file('screen.png', 'image/png');
 const pdf = file('spec.pdf', 'application/pdf');
 
@@ -590,7 +590,25 @@ test('an image or audio file goes as a local input only to a model that takes it
     failure?: string;
     spawned: boolean;
     input?: unknown[];
+    listed?: boolean;
   }> = [
+    {
+      // An earlier image goes as a path line, so a text-only model runs the turn and the model
+      // list is never read. A missing earlier file is named the same way.
+      files: [
+        { ...png, earlier: true },
+        { ...missing, earlier: true },
+      ],
+      modalities: ['text'],
+      spawned: true,
+      listed: false,
+      input: [
+        {
+          type: 'text',
+          text: `${systemContext}\n\n${prompt}\n\nAttached earlier: screen.png (image/png, 10 bytes) at ${png.path}\nAttached earlier: screen.png (image/png, 10 bytes) at ${missing.path}`,
+        },
+      ],
+    },
     {
       files: [png, pdf, voice],
       modalities: ['text', 'image', 'audio'],
@@ -635,12 +653,17 @@ test('an image or audio file goes as a local input only to a model that takes it
     }
     assert.equal(stopReason, 'done');
     const frames = run.frames();
-    assert.deepEqual(frames[4], listing);
+    const at = row.listed === false ? 4 : 5;
+    if (at === 5) assert.deepEqual(frames[4], listing);
     assert.deepEqual(
-      frames.slice(5).map((frame) => frame.method),
+      frames.slice(at).map((frame) => frame.method),
       ['thread/start', 'turn/start'],
     );
-    assert.deepEqual(frames[6].params, { threadId: 'thread-1', input: row.input, effort: 'low' });
+    assert.deepEqual(frames[at + 1].params, {
+      threadId: 'thread-1',
+      input: row.input,
+      effort: 'low',
+    });
   }
 });
 
