@@ -3305,7 +3305,7 @@ test('each handoff mode ranks the families by its own rule', () => {
   const rows: [ChatHandoffMode, string][] = [
     ['most-left', 'openai google anthropic local'],
     ['resets-first', 'anthropic google openai local'],
-    ['balanced', 'google anthropic openai local'],
+    ['even-spend', 'google anthropic openai local'],
     ['local-first', 'local google anthropic openai'],
   ];
   for (const [mode, order] of rows)

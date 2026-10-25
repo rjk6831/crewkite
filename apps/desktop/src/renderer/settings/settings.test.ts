@@ -56,8 +56,9 @@ test('saved thread defaults and crew presets survive bad storage and apply only 
   values.set('crewkite-thread-defaults-v1', '{not json');
   assert.deepEqual(readThreadDefaults(store), none);
   assert.deepEqual(readThreadDefaults(null), none);
+  // Even spend was first saved as balanced.
   values.set('crewkite-thread-defaults-v1', '{"handoffMode":"balanced"}');
-  assert.equal(readThreadDefaults(store).handoffMode, 'balanced');
+  assert.equal(readThreadDefaults(store).handoffMode, 'even-spend');
 
   writeThreadDefaults(
     {

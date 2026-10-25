@@ -7,11 +7,11 @@ import {
   ChatFamilySchema,
   type ChatFlightMode,
   type ChatHandoffMode,
-  ChatHandoffModeSchema,
   type ChatModelSelection,
   ChatModelSelectionSchema,
   type ChatPermissionPolicy,
   ChatPermissionPolicySchema,
+  ChatSavedHandoffModeSchema,
   rankFamilies,
   TaskSchema,
 } from '@crewkite/contracts';
@@ -48,15 +48,15 @@ export const handoffModes: { id: ChatHandoffMode; label: string; title: string }
       'The family whose allowance resets first, while it has any left; allowance that expires unused is lost.',
   },
   {
-    id: 'balanced',
-    label: 'Balanced',
+    id: 'even-spend',
+    label: 'Even spend',
     title:
-      'Allowance per hour until reset (percent remaining divided by hours to reset), highest first; this spends every window at the rate it can afford.',
+      'Percent remaining divided by hours until reset, highest first. Each window is spent at the rate it can afford.',
   },
   {
     id: 'local-first',
     label: 'Local first',
-    title: 'Local when it is connected, otherwise Balanced.',
+    title: 'Local when it is connected, otherwise Even spend.',
   },
 ];
 
@@ -96,7 +96,7 @@ export function readThreadDefaults(store: Store | null = browserStore()): Thread
     const saved = raw ? (JSON.parse(raw) as Record<string, unknown> | null) : null;
     const selection = ChatModelSelectionSchema.safeParse(saved?.selection);
     const policy = ChatPermissionPolicySchema.safeParse(saved?.permissionPolicy);
-    const mode = ChatHandoffModeSchema.safeParse(saved?.handoffMode);
+    const mode = ChatSavedHandoffModeSchema.safeParse(saved?.handoffMode);
     return {
       selection: selection.success ? selection.data : null,
       permissionPolicy: policy.success ? policy.data : builtIn.permissionPolicy,

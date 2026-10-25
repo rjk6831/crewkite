@@ -1,6 +1,6 @@
 # 0038. Run a crew in a thread, with flight modes and four handoff modes
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-10-25
 
 ## Context
@@ -22,8 +22,9 @@ A thread answers one message at a time with one model. After a reply I read the 
 - The thread keeps one of four handoff modes. `rankFamilies` in `packages/contracts/src/chat.ts` applies it when a limit stops a turn and automatic handoff is on. A family that is not connected never ranks. A family at zero percent never ranks, since a turn there ends on the limit it already hit. A family with no reading ranks after every family that has one, except Local under Local first.
   - Most allowance left takes the family with the highest percent remaining on its tightest window.
   - Resets soonest takes the family whose allowance resets first, while it has any left. Allowance that expires unused is lost, so I spend it first.
-  - Balanced divides percent remaining by hours until reset and takes the highest. A reset closer than fifteen minutes counts as fifteen, so a window about to refill does not win on a tiny divisor. A window with no reset time ranks after every timed one.
-  - Local first takes Local while it is connected, then ranks the rest as Balanced.
+  - Even spend divides percent remaining by hours until reset and takes the highest. A reset closer than fifteen minutes counts as fifteen, so a window about to refill does not win on a tiny divisor. A window with no reset time ranks after every timed one.
+  - Local first takes Local while it is connected, then ranks the rest as Even spend.
+- The handoff mode is called Even spend so it never shares a name with the Balanced flight mode. A thread or setting saved under the first name, balanced, reads as Even spend.
 - Settings holds the default handoff mode for new threads and three crew presets. Solo is the builder alone. Pair is a builder and a reviewer on another family. Full crew is builder, reviewer, challenger and fixer. A preset stores only the models and efforts I pin. A thread that starts from it picks the other roles from the connected families under the thread's handoff mode, so a preset still works after a family disconnects.
 - The composer shows the flight mode as a pill next to the model picker. The pill opens the Crew tab in the inspector, where I pick a preset and the flight mode. The Crew tab also lets me change each role's model and effort in place. The builder's choice also becomes the thread's selection for my messages.
 - Send now sits beside Remove on a queued message while a reply runs. It stops the running turn and starts that message first, with the stopped turn's packet, the same path a limit stop takes.
@@ -38,7 +39,7 @@ Glide turns automatic handoff on. Without it, the first usage limit ends the cha
 
 Balanced asks only for the actions that leave the scratch copy or cannot be undone from it. Reading files and running a read-only command cost nothing to allow. A delete, a network call or an edit outside the copy can lose work or send data out, so those go to me.
 
-The handoff modes differ in what they protect. Most allowance left keeps the largest buffer. Resets soonest uses allowance that is about to vanish. Balanced spends every window at the rate it can afford and is what I want most of the time. Local first is for work where a local model is good enough and the subscriptions should stay full. Most allowance left is the default for new threads because it needs no reset times to work.
+The handoff modes differ in what they protect. Most allowance left keeps the largest buffer. Resets soonest uses allowance that is about to vanish. Even spend uses every window at the rate it can afford and is what I want most of the time. Local first is for work where a local model is good enough and the subscriptions should stay full. Most allowance left is the default for new threads because it needs no reset times to work.
 
 I ruled out a Manager role this wave. A Manager would decide which role runs next and when to stop, and that makes model output the authority over the chain. The chain is a short fixed sequence the controller can run without one, and I want to see it work before I add a role that steers it.
 
@@ -48,7 +49,8 @@ I ruled out letting the model grant itself permissions. [ADR 0002](0002-authorit
 
 - A chain multiplies usage. A change with two fixes costs a build, three reviews, two fixes and a challenge, six or seven turns against one. Each counts against the provider's allowance. Solo and Manual are the settings that cost nothing extra.
 - The chain depends on the reviewer stating `Findings: N`. A reply without that line ends the chain and tells me to ask for a fix or review again. A reviewer that miscounts changes the outcome, and I have no check on its count.
-- The Balanced command rule reads the command text. It is a fixed list, and a command it cannot parse as read-only goes to me. A delete is recognized by its words or by a flag the OpenAI adapter sets, since the event carries no change type. A delete the words do not reveal can pass as an edit inside the copy. A flag on the event would close that gap, and I have not built it.
+- The Balanced command rule reads the command text. It is a fixed list, and a command it cannot parse as read-only goes to me.
+- A delete is known from the client's own change type. The permission event carries a deletes mark, set by the OpenAI adapter from the patch and by the Google adapter from the delete and move kinds. The Anthropic and Local clients delete only through shell commands, which Balanced already sends to me. A client that deleted through a file tool without naming it would pass as an edit inside the copy, and the removed file would still show in Changes before Accept.
 - Glide with automatic handoff on can move a step to a provider I did not pick. Every turn carries its provider badge and the handoff line, so the move is visible, and I find out afterward.
 - Send now ends the running reply early. The stopped turn's work stays in the scratch copy and travels in the packet, and the partial reply stays in the thread.
 - Presets live in the renderer's local storage, one set per machine. They are not part of the project or the controller's state.
