@@ -336,6 +336,46 @@
 .th-md li + li {
   margin-top: 0.25em;
 }
+.th-md li > :is(ul, ol, figure, .th-md-table, p) {
+  margin-top: 0.4em;
+}
+.th-md hr {
+  margin: 1em 0;
+  border: 0;
+  border-top: 1px solid var(--border-strong);
+}
+.th-md a {
+  color: var(--blue);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.th-md a:hover {
+  color: var(--text);
+}
+.th-md a:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+.th-md-table {
+  overflow-x: auto;
+}
+.th-md-table table {
+  border-collapse: collapse;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.th-md-table :is(th, td) {
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+.th-md-table th {
+  background: var(--surface-raised);
+  font-weight: 600;
+}
 .th-md blockquote {
   margin: 0;
   padding-left: 12px;
@@ -390,6 +430,49 @@
   padding: 10px 12px;
   overflow-x: auto;
   line-height: 1.55;
+}
+/* Highlight scopes use the same tokens as the rest of the app, so both themes stay readable. */
+.th-tok-keyword,
+.th-tok-literal,
+.th-tok-tag,
+.th-tok-selector-tag,
+.th-tok-doctag {
+  color: var(--blue);
+}
+.th-tok-string,
+.th-tok-regexp,
+.th-tok-addition,
+.th-tok-symbol,
+.th-tok-bullet {
+  color: var(--green);
+}
+.th-tok-number,
+.th-tok-type,
+.th-tok-built_in,
+.th-tok-attr,
+.th-tok-attribute,
+.th-tok-variable,
+.th-tok-params {
+  color: var(--amber);
+}
+.th-tok-title,
+.th-tok-section,
+.th-tok-name,
+.th-tok-property {
+  color: var(--accent);
+}
+.th-tok-meta,
+.th-tok-punctuation,
+.th-tok-operator {
+  color: var(--text-muted);
+}
+.th-tok-deletion {
+  color: var(--red);
+}
+.th-tok-comment,
+.th-tok-quote {
+  color: var(--text-dim);
+  font-style: italic;
 }
 .is-streaming > .th-md > :last-child::after {
   content: "";
