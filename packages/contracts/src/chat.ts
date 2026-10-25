@@ -201,6 +201,8 @@ export const AgentEventSchema = z.discriminatedUnion('type', [
     question: z.string().min(1).max(4096),
     detail: z.string().max(16_384).nullable().default(null),
     options: z.array(ChatPermissionOptionSchema).min(1).max(6),
+    /** The client said the change deletes or moves a file. Balanced sends these to the person. */
+    deletes: z.literal(true).optional(),
   }),
   z.strictObject({
     type: z.literal('permission.resolved'),

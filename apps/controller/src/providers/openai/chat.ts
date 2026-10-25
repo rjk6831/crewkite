@@ -354,6 +354,8 @@ class OpenAiChatTurn {
   private readonly tools = new Map<string, string>();
   // The paths each started file change reported, which its approval request does not repeat.
   private readonly edits = new Map<string, Array<{ path: string; inside: boolean }>>();
+  /** File change items whose patch deletes a file. Their approval carries the mark. */
+  private readonly deleting = new Set<string>();
   private readonly output = new Map<string, number>();
   private readonly changed = new Set<string>();
   private readonly approvals = new Map<string, RpcId>();
@@ -747,6 +749,7 @@ class OpenAiChatTurn {
           : 'Apply these file changes?',
       detail: detail ? clip(detail, 16_384) : null,
       options: OPTIONS,
+      ...(kind === 'edit' && callId && this.deleting.has(callId) ? { deletes: true as const } : {}),
     });
     const policy = this.request.permissionPolicy;
     // Review and advice turns read only.
@@ -889,15 +892,14 @@ class OpenAiChatTurn {
       const paths = entries.map((entry) => entry.path);
       detail = paths.join('\n');
       kind = 'edit';
-      // A delete says so in the title and the input, so no automatic answer mistakes it for an
-      // edit.
       const deletes = (changeItem.safeParse(raw).data?.changes ?? []).some(
         (change) => change.kind?.type === 'delete',
       );
+      if (deletes) this.deleting.add(head.id);
       title = paths.length
         ? `${deletes ? 'Delete or edit' : 'Edit'} ${paths.join(', ')}`
         : 'Edit files';
-      input = deletes ? { paths, deletes } : { paths };
+      input = { paths };
     } else if (head.type === 'mcpToolCall') {
       const value = mcpItem.safeParse(raw).data;
       detail = [value?.server, value?.tool].filter(Boolean).join(': ');

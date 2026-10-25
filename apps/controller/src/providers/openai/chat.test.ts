@@ -111,7 +111,7 @@ const scripts = {
     { id: 0, method: 'item/commandExecution/requestApproval', params: { ...ids(), itemId: 'command-1', reason: 'Runs the test suite.', ...(given.network ? { networkApprovalContext: { host: 'registry.npmjs.org', protocol: 'https' } } : { command: 'pnpm test', ...(given.cwd ? { cwd: here(given.cwd) } : {}) }) } },
   ],
   edit: () => [
-    ['item/started', { ...ids(), item: { id: 'change-1', type: 'fileChange', changes: [{ path: here(given.path), kind: given.movePath ? { type: 'update', move_path: here(given.movePath) } : { type: 'add' }, diff: 'x\n' }], status: 'inProgress' } }],
+    ['item/started', { ...ids(), item: { id: 'change-1', type: 'fileChange', changes: [{ path: here(given.path), kind: given.movePath ? { type: 'update', move_path: here(given.movePath) } : { type: given.delete ? 'delete' : 'add' }, diff: 'x\n' }], status: 'inProgress' } }],
     { id: 0, method: 'item/fileChange/requestApproval', params: { ...ids(), itemId: 'change-1', reason: null, grantRoot: given.grantRoot ? here(given.grantRoot) : null } },
   ],
   approved: () => [
@@ -417,10 +417,12 @@ test('a write outside the scratch copy still asks under allow-edits and allow-al
   // allow-edits unless they name a policy.
   const rows: Array<{
     policy?: ChatPermissionPolicy;
-    detail: { path: string; movePath?: string; grantRoot?: string };
+    detail: { path: string; movePath?: string; grantRoot?: string; delete?: boolean };
     answered: string[];
   }> = [
     { detail: { path: 'src/app.ts' }, answered: ['allow-once'] },
+    // The approval carries the client's delete, so Balanced can send it to the person.
+    { detail: { path: 'src/app.ts', delete: true }, answered: ['allow-once'] },
     { detail: { path: '../outside.txt' }, answered: [] },
     { detail: { path: 'link/outside.txt' }, answered: [] },
     { detail: { path: 'src/app.ts', movePath: '../outside.ts' }, answered: [] },
@@ -435,6 +437,7 @@ test('a write outside the scratch copy still asks under allow-edits and allow-al
       prepare: (scratch) => symlinkSync(dirname(scratch), join(scratch, 'link')),
     });
     const asked = await run.when('permission.requested');
+    assert.equal(asked.deletes, row.detail.delete, JSON.stringify(row));
     const answered = run.events.flatMap((event) =>
       event.type === 'permission.resolved' ? [event.choice] : [],
     );

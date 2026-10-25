@@ -961,6 +961,7 @@ function editingAdapter(asks: readonly (ChatToolKind | null)[], input?: unknown)
             callId: ask ? 'call-1' : null,
             question: 'Go ahead?',
             detail: null,
+            ...((input as { deletes?: boolean } | undefined)?.deletes ? { deletes: true } : {}),
             options: [
               { id: 'allow-once', label: 'Allow once', kind: 'allow-once' },
               { id: 'allow-thread', label: 'Allow for this thread', kind: 'allow-thread' },
@@ -1352,7 +1353,7 @@ test('a policy change acts on the running turn, and balanced answers only safe a
       policy: null,
       answered: true,
     },
-    // The OpenAI adapter flags a change the client tags as a delete.
+    // The adapter marks a change the client names a delete or a move. The title says nothing.
     {
       kind: 'edit',
       input: { paths: ['net.mjs'], deletes: true },

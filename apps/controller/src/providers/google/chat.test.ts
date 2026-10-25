@@ -636,6 +636,16 @@ test('a permission request parks the turn until answered, and the policy answers
       status: 'ok',
       changed: [],
     },
+    {
+      // The protocol's own delete kind marks the request, whatever the title says.
+      policy: 'ask',
+      scenario: 'chat-permission',
+      announced: 'delete',
+      answer: 'once',
+      selected: 'once',
+      status: 'ok',
+      changed: ['net.mjs'],
+    },
   ] as const) {
     const f = rig(row.scenario, 'announced' in row && row.announced ? announce(row.announced) : '');
     try {
@@ -664,6 +674,11 @@ test('a permission request parks the turn until answered, and the policy answers
         label,
       );
       assert.deepEqual(requested[0].options, options, label);
+      assert.equal(
+        requested[0].deletes,
+        'announced' in row && row.announced === 'delete' ? true : undefined,
+        label,
+      );
       assert.deepEqual(
         of(turn.events, 'permission.resolved').map((event) => event.choice),
         [row.selected],
